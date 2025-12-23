@@ -58,6 +58,16 @@ func SuccessWithMeta(c *gin.Context, data interface{}, pagination *entity.Pagina
 	})
 }
 
+// SuccessWithPagination is an alias for SuccessWithMeta
+func SuccessWithPagination(c *gin.Context, data interface{}, pagination *entity.Pagination) {
+	SuccessWithMeta(c, data, pagination)
+}
+
+// InternalError sends a 500 Internal Server Error response
+func InternalError(c *gin.Context, message string) {
+	InternalServerError(c, message)
+}
+
 // Created sends a 201 Created response
 func Created(c *gin.Context, data interface{}) {
 	c.JSON(http.StatusCreated, Response{
