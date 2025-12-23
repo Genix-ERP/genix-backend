@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 )
@@ -176,39 +175,10 @@ func (h *Handler) ListCurrencies(c *gin.Context)  { response.Success(c, []interf
 func (h *Handler) GetExchangeRate(c *gin.Context) { response.Success(c, gin.H{"rate": 1.0}) }
 
 // ========== EMPLOYEES ==========
-
-func (h *Handler) ListEmployees(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateEmployee(c *gin.Context) { response.Created(c, gin.H{"message": "Employee created"}) }
-func (h *Handler) GetEmployee(c *gin.Context)    { response.NotFound(c, "Employee") }
-func (h *Handler) UpdateEmployee(c *gin.Context) { response.Success(c, gin.H{"message": "Employee updated"}) }
-func (h *Handler) DeleteEmployee(c *gin.Context) { response.NoContent(c) }
+// Employee handlers are implemented in employee.go
 
 // ========== AI ASSISTANT ==========
-
-func (h *Handler) GetAICapabilities(c *gin.Context) {
-	response.Success(c, entity.GetAICapabilities())
-}
-func (h *Handler) AIChat(c *gin.Context) {
-	response.Success(c, gin.H{
-		"message": gin.H{
-			"role":    "assistant",
-			"content": "AI chat functionality will be implemented with OpenAI/Anthropic integration",
-		},
-	})
-}
-func (h *Handler) ListAIConversations(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateAIConversation(c *gin.Context) { response.Created(c, gin.H{"message": "Conversation created"}) }
-func (h *Handler) GetAIConversation(c *gin.Context)    { response.NotFound(c, "Conversation") }
-func (h *Handler) DeleteAIConversation(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) AddAIMessage(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Message added"})
-}
-
-func (h *Handler) ListAIPrompts(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateAIPrompt(c *gin.Context) { response.Created(c, gin.H{"message": "Prompt created"}) }
-func (h *Handler) GetAIPrompt(c *gin.Context)    { response.NotFound(c, "Prompt") }
-func (h *Handler) UpdateAIPrompt(c *gin.Context) { response.Success(c, gin.H{"message": "Prompt updated"}) }
-func (h *Handler) DeleteAIPrompt(c *gin.Context) { response.NoContent(c) }
+// AI handlers are implemented in ai.go
 
 // ========== REPORTS ==========
 
