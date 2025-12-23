@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates tzdata
@@ -37,7 +37,7 @@ WORKDIR /app
 COPY --from=builder /app/genix-backend .
 
 # Copy migrations
-COPY --from=builder /app/migrations ./migrations
+COPY --from=builder /app/internal/infrastructure/database/migrations ./migrations
 
 # Set ownership
 RUN chown -R genix:genix /app
