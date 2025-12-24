@@ -1,0 +1,17 @@
+stages:
+  - deploy
+
+deploy:
+  stage: deploy
+  tags:
+    - genix
+  only:
+    - main
+  script:
+    - cd /home/uz-user/genix-backend
+    - git pull origin main
+    - docker compose down
+    - docker compose up -d --build
+  environment:
+    name: production
+    url: https://api.genixerp.com
