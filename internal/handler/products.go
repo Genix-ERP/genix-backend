@@ -1,0 +1,965 @@
+package handler
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/genixerp/genix-backend/internal/domain/entity"
+	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/response"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// =====================================================
+// PRODUCT HANDLERS
+// =====================================================
+
+// ListProducts returns a paginated list of products
+func (h *Handler) ListProducts(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Parse pagination
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	offset := (page - 1) * limit
+
+	// Parse filters
+	search := c.Query("search")
+	categoryID := c.Query("category_id")
+	productType := c.Query("type")
+	includeInactive := c.Query("include_inactive") == "true"
+
+	// Build query
+	baseQuery := `
+		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode,
+			   p.name, p.description, p.short_description, p.unit_id,
+			   p.cost_price, p.list_price, p.min_price,
+			   p.is_stockable, p.track_inventory, p.min_stock_level,
+			   p.reorder_point, p.reorder_quantity, p.lead_time_days,
+			   p.is_purchasable, p.is_sellable, p.is_active, p.tags,
+			   p.created_at, p.updated_at,
+			   pc.code as category_code, pc.name as category_name
+		FROM products p
+		LEFT JOIN product_categories pc ON p.category_id = pc.id
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+	`
+	countQuery := `SELECT COUNT(*) FROM products p WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
+
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if !includeInactive {
+		baseQuery += " AND p.is_active = true"
+		countQuery += " AND p.is_active = true"
+	}
+
+	if categoryID != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND p.category_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.category_id = $%d", argCount)
+		args = append(args, categoryID)
+	}
+
+	if productType != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND p.type = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.type = $%d", argCount)
+		args = append(args, productType)
+	}
+
+	if search != "" {
+		argCount++
+		searchFilter := fmt.Sprintf(" AND (p.code ILIKE $%d OR p.name ILIKE $%d OR p.sku ILIKE $%d OR p.barcode ILIKE $%d)", argCount, argCount, argCount, argCount)
+		baseQuery += searchFilter
+		countQuery += searchFilter
+		args = append(args, "%"+search+"%")
+	}
+
+	// Get count
+	var total int
+	err := h.db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		h.log.Error("Failed to count products", "error", err)
+		response.InternalError(c, "Failed to list products")
+		return
+	}
+
+	// Add ordering and pagination
+	baseQuery += " ORDER BY p.code ASC"
+	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
+
+	rows, err := h.db.Query(baseQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to list products", "error", err)
+		response.InternalError(c, "Failed to list products")
+		return
+	}
+	defer rows.Close()
+
+	products := make([]*entity.ProductResponse, 0)
+	for rows.Next() {
+		var p entity.Product
+		var categoryID, sku, barcode, desc, shortDesc, unitID sql.NullString
+		var categoryCode, categoryName sql.NullString
+		var tags json.RawMessage
+
+		err := rows.Scan(
+			&p.ID, &p.TenantID, &categoryID, &p.Type, &p.Code, &sku, &barcode,
+			&p.Name, &desc, &shortDesc, &unitID,
+			&p.CostPrice, &p.ListPrice, &p.MinPrice,
+			&p.IsStockable, &p.TrackInventory, &p.MinStockLevel,
+			&p.ReorderPoint, &p.ReorderQuantity, &p.LeadTimeDays,
+			&p.IsPurchasable, &p.IsSellable, &p.IsActive, &tags,
+			&p.CreatedAt, &p.UpdatedAt,
+			&categoryCode, &categoryName,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan product", "error", err)
+			continue
+		}
+
+		if categoryID.Valid {
+			cid, _ := uuid.Parse(categoryID.String)
+			p.CategoryID = &cid
+		}
+		if sku.Valid {
+			p.SKU = &sku.String
+		}
+		if barcode.Valid {
+			p.Barcode = &barcode.String
+		}
+		if desc.Valid {
+			p.Description = &desc.String
+		}
+		if shortDesc.Valid {
+			p.ShortDescription = &shortDesc.String
+		}
+
+		resp := &entity.ProductResponse{
+			ID:             p.ID,
+			CategoryID:     p.CategoryID,
+			Type:           p.Type,
+			Code:           p.Code,
+			SKU:            p.SKU,
+			Barcode:        p.Barcode,
+			Name:           p.Name,
+			Description:    p.Description,
+			CostPrice:      p.CostPrice,
+			ListPrice:      p.ListPrice,
+			IsStockable:    p.IsStockable,
+			TrackInventory: p.TrackInventory,
+			MinStockLevel:  p.MinStockLevel,
+			IsPurchasable:  p.IsPurchasable,
+			IsSellable:     p.IsSellable,
+			IsActive:       p.IsActive,
+			CreatedAt:      p.CreatedAt,
+			UpdatedAt:      p.UpdatedAt,
+		}
+
+		if categoryCode.Valid && categoryName.Valid {
+			resp.Category = &entity.ProductCategory{
+				Code: categoryCode.String,
+				Name: categoryName.String,
+			}
+		}
+
+		// Parse tags
+		if len(tags) > 0 {
+			json.Unmarshal(tags, &resp.Tags)
+		}
+		if resp.Tags == nil {
+			resp.Tags = []string{}
+		}
+
+		products = append(products, resp)
+	}
+
+	pagination := entity.NewPagination(page, limit)
+	pagination.Calculate(total)
+
+	response.SuccessWithPagination(c, products, pagination)
+}
+
+// CreateProduct creates a new product
+func (h *Handler) CreateProduct(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.CreateProductInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Check for duplicate code
+	var codeExists bool
+	err := h.db.QueryRow(
+		"SELECT EXISTS(SELECT 1 FROM products WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
+		tenantID, input.Code,
+	).Scan(&codeExists)
+	if err != nil {
+		h.log.Error("Failed to check product code", "error", err)
+		response.InternalError(c, "Failed to create product")
+		return
+	}
+	if codeExists {
+		response.Conflict(c, "Product with this code already exists")
+		return
+	}
+
+	// Parse optional UUIDs
+	var categoryID, unitID, currencyID *uuid.UUID
+	if input.CategoryID != "" {
+		cid, err := uuid.Parse(input.CategoryID)
+		if err == nil {
+			categoryID = &cid
+		}
+	}
+	if input.UnitID != "" {
+		uid, err := uuid.Parse(input.UnitID)
+		if err == nil {
+			unitID = &uid
+		}
+	}
+	if input.CurrencyID != "" {
+		cuid, err := uuid.Parse(input.CurrencyID)
+		if err == nil {
+			currencyID = &cuid
+		}
+	}
+
+	// Set defaults
+	isStockable := true
+	if input.IsStockable != nil {
+		isStockable = *input.IsStockable
+	}
+	trackInventory := true
+	if input.TrackInventory != nil {
+		trackInventory = *input.TrackInventory
+	}
+	isPurchasable := true
+	if input.IsPurchasable != nil {
+		isPurchasable = *input.IsPurchasable
+	}
+	isSellable := true
+	if input.IsSellable != nil {
+		isSellable = *input.IsSellable
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	// Prepare optional strings
+	var sku, barcode, description, shortDescription *string
+	if input.SKU != "" {
+		sku = &input.SKU
+	}
+	if input.Barcode != "" {
+		barcode = &input.Barcode
+	}
+	if input.Description != "" {
+		description = &input.Description
+	}
+	if input.ShortDescription != "" {
+		shortDescription = &input.ShortDescription
+	}
+
+	// Serialize tags
+	var tagsJSON []byte
+	if len(input.Tags) > 0 {
+		tagsJSON, _ = json.Marshal(input.Tags)
+	} else {
+		tagsJSON = []byte("[]")
+	}
+
+	query := `
+		INSERT INTO products (
+			id, tenant_id, category_id, type, code, sku, barcode, name, description, short_description,
+			unit_id, cost_price, list_price, min_price, currency_id,
+			is_stockable, track_inventory, min_stock_level, reorder_point, reorder_quantity,
+			is_purchasable, is_sellable, is_active, tags, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		RETURNING id
+	`
+
+	err = h.db.QueryRow(query,
+		id, tenantID, categoryID, input.Type, input.Code, sku, barcode, input.Name, description, shortDescription,
+		unitID, input.CostPrice, input.ListPrice, input.MinPrice, currencyID,
+		isStockable, trackInventory, input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity,
+		isPurchasable, isSellable, true, tagsJSON, userID, now, now,
+	).Scan(&id)
+
+	if err != nil {
+		h.log.Error("Failed to create product", "error", err)
+		if strings.Contains(err.Error(), "duplicate") {
+			response.Conflict(c, "Product with this code already exists")
+			return
+		}
+		response.InternalError(c, "Failed to create product")
+		return
+	}
+
+	resp := &entity.ProductResponse{
+		ID:             id,
+		CategoryID:     categoryID,
+		Type:           input.Type,
+		Code:           input.Code,
+		SKU:            sku,
+		Barcode:        barcode,
+		Name:           input.Name,
+		Description:    description,
+		CostPrice:      input.CostPrice,
+		ListPrice:      input.ListPrice,
+		IsStockable:    isStockable,
+		TrackInventory: trackInventory,
+		MinStockLevel:  input.MinStockLevel,
+		IsPurchasable:  isPurchasable,
+		IsSellable:     isSellable,
+		IsActive:       true,
+		Tags:           input.Tags,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	response.Created(c, resp)
+}
+
+// GetProduct returns a single product by ID
+func (h *Handler) GetProduct(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid product ID")
+		return
+	}
+
+	query := `
+		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode,
+			   p.name, p.description, p.short_description, p.unit_id,
+			   p.cost_price, p.list_price, p.min_price,
+			   p.is_stockable, p.track_inventory, p.min_stock_level,
+			   p.reorder_point, p.reorder_quantity, p.lead_time_days,
+			   p.is_purchasable, p.is_sellable, p.is_active, p.tags,
+			   p.created_at, p.updated_at,
+			   pc.id as category_id_rel, pc.code as category_code, pc.name as category_name
+		FROM products p
+		LEFT JOIN product_categories pc ON p.category_id = pc.id
+		WHERE p.id = $1 AND p.tenant_id = $2 AND p.deleted_at IS NULL
+	`
+
+	var p entity.Product
+	var categoryIDStr, sku, barcode, desc, shortDesc, unitID sql.NullString
+	var categoryIDRel, categoryCode, categoryName sql.NullString
+	var tags json.RawMessage
+
+	err = h.db.QueryRow(query, id, tenantID).Scan(
+		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode,
+		&p.Name, &desc, &shortDesc, &unitID,
+		&p.CostPrice, &p.ListPrice, &p.MinPrice,
+		&p.IsStockable, &p.TrackInventory, &p.MinStockLevel,
+		&p.ReorderPoint, &p.ReorderQuantity, &p.LeadTimeDays,
+		&p.IsPurchasable, &p.IsSellable, &p.IsActive, &tags,
+		&p.CreatedAt, &p.UpdatedAt,
+		&categoryIDRel, &categoryCode, &categoryName,
+	)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Product")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get product", "error", err)
+		response.InternalError(c, "Failed to get product")
+		return
+	}
+
+	resp := &entity.ProductResponse{
+		ID:             p.ID,
+		Type:           p.Type,
+		Code:           p.Code,
+		Name:           p.Name,
+		CostPrice:      p.CostPrice,
+		ListPrice:      p.ListPrice,
+		IsStockable:    p.IsStockable,
+		TrackInventory: p.TrackInventory,
+		MinStockLevel:  p.MinStockLevel,
+		IsPurchasable:  p.IsPurchasable,
+		IsSellable:     p.IsSellable,
+		IsActive:       p.IsActive,
+		CreatedAt:      p.CreatedAt,
+		UpdatedAt:      p.UpdatedAt,
+	}
+
+	if categoryIDStr.Valid {
+		cid, _ := uuid.Parse(categoryIDStr.String)
+		resp.CategoryID = &cid
+	}
+	if sku.Valid {
+		resp.SKU = &sku.String
+	}
+	if barcode.Valid {
+		resp.Barcode = &barcode.String
+	}
+	if desc.Valid {
+		resp.Description = &desc.String
+	}
+	if shortDesc.Valid {
+		resp.ShortDescription = &shortDesc.String
+	}
+
+	if categoryIDRel.Valid && categoryCode.Valid && categoryName.Valid {
+		catID, _ := uuid.Parse(categoryIDRel.String)
+		resp.Category = &entity.ProductCategory{
+			ID:   catID,
+			Code: categoryCode.String,
+			Name: categoryName.String,
+		}
+	}
+
+	if len(tags) > 0 {
+		json.Unmarshal(tags, &resp.Tags)
+	}
+	if resp.Tags == nil {
+		resp.Tags = []string{}
+	}
+
+	response.Success(c, resp)
+}
+
+// UpdateProduct updates an existing product
+func (h *Handler) UpdateProduct(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid product ID")
+		return
+	}
+
+	var input entity.UpdateProductInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Build dynamic update
+	updates := make([]string, 0)
+	args := make([]interface{}, 0)
+	argCount := 0
+
+	addUpdate := func(field string, value interface{}) {
+		argCount++
+		updates = append(updates, fmt.Sprintf("%s = $%d", field, argCount))
+		args = append(args, value)
+	}
+
+	if input.CategoryID != nil {
+		if *input.CategoryID == "" {
+			addUpdate("category_id", nil)
+		} else {
+			cid, _ := uuid.Parse(*input.CategoryID)
+			addUpdate("category_id", cid)
+		}
+	}
+	if input.SKU != nil {
+		addUpdate("sku", *input.SKU)
+	}
+	if input.Barcode != nil {
+		addUpdate("barcode", *input.Barcode)
+	}
+	if input.Name != nil {
+		addUpdate("name", *input.Name)
+	}
+	if input.Description != nil {
+		addUpdate("description", *input.Description)
+	}
+	if input.ShortDescription != nil {
+		addUpdate("short_description", *input.ShortDescription)
+	}
+	if input.CostPrice != nil {
+		addUpdate("cost_price", *input.CostPrice)
+	}
+	if input.ListPrice != nil {
+		addUpdate("list_price", *input.ListPrice)
+	}
+	if input.MinPrice != nil {
+		addUpdate("min_price", *input.MinPrice)
+	}
+	if input.IsStockable != nil {
+		addUpdate("is_stockable", *input.IsStockable)
+	}
+	if input.TrackInventory != nil {
+		addUpdate("track_inventory", *input.TrackInventory)
+	}
+	if input.MinStockLevel != nil {
+		addUpdate("min_stock_level", *input.MinStockLevel)
+	}
+	if input.ReorderPoint != nil {
+		addUpdate("reorder_point", *input.ReorderPoint)
+	}
+	if input.ReorderQuantity != nil {
+		addUpdate("reorder_quantity", *input.ReorderQuantity)
+	}
+	if input.IsPurchasable != nil {
+		addUpdate("is_purchasable", *input.IsPurchasable)
+	}
+	if input.IsSellable != nil {
+		addUpdate("is_sellable", *input.IsSellable)
+	}
+	if input.IsActive != nil {
+		addUpdate("is_active", *input.IsActive)
+	}
+	if input.Tags != nil {
+		tagsJSON, _ := json.Marshal(input.Tags)
+		addUpdate("tags", tagsJSON)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	addUpdate("updated_at", time.Now())
+
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(`
+		UPDATE products SET %s
+		WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL
+		RETURNING id
+	`, strings.Join(updates, ", "), argCount-1, argCount)
+
+	var returnedID uuid.UUID
+	err = h.db.QueryRow(query, args...).Scan(&returnedID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Product")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to update product", "error", err)
+		response.InternalError(c, "Failed to update product")
+		return
+	}
+
+	// Return updated product
+	h.GetProduct(c)
+}
+
+// DeleteProduct soft-deletes a product
+func (h *Handler) DeleteProduct(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid product ID")
+		return
+	}
+
+	// Check for existing inventory
+	var hasInventory bool
+	h.db.QueryRow(`
+		SELECT EXISTS(SELECT 1 FROM inventory WHERE product_id = $1 AND quantity_on_hand > 0)
+	`, id).Scan(&hasInventory)
+
+	if hasInventory {
+		response.BadRequest(c, "Cannot delete product with existing inventory. Set to inactive instead.")
+		return
+	}
+
+	query := `
+		UPDATE products SET deleted_at = $1, updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+	`
+
+	result, err := h.db.Exec(query, time.Now(), id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete product", "error", err)
+		response.InternalError(c, "Failed to delete product")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Product")
+		return
+	}
+
+	response.NoContent(c)
+}
+
+// =====================================================
+// PRODUCT CATEGORY HANDLERS
+// =====================================================
+
+// ListProductCategories returns all product categories
+func (h *Handler) ListProductCategories(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	includeInactive := c.Query("include_inactive") == "true"
+	flat := c.Query("flat") == "true"
+
+	query := `
+		SELECT id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at
+		FROM product_categories
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`
+	args := []interface{}{tenantID}
+
+	if !includeInactive {
+		query += " AND is_active = true"
+	}
+
+	query += " ORDER BY code ASC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list product categories", "error", err)
+		response.InternalError(c, "Failed to list product categories")
+		return
+	}
+	defer rows.Close()
+
+	categories := make([]*entity.ProductCategory, 0)
+	categoryMap := make(map[uuid.UUID]*entity.ProductCategory)
+
+	for rows.Next() {
+		var cat entity.ProductCategory
+		var parentID, desc sql.NullString
+
+		err := rows.Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt)
+		if err != nil {
+			continue
+		}
+
+		if parentID.Valid {
+			pid, _ := uuid.Parse(parentID.String)
+			cat.ParentID = &pid
+		}
+		if desc.Valid {
+			cat.Description = &desc.String
+		}
+
+		cat.Children = []entity.ProductCategory{}
+		categories = append(categories, &cat)
+		categoryMap[cat.ID] = &cat
+	}
+
+	if flat {
+		response.Success(c, categories)
+		return
+	}
+
+	// Build tree structure
+	rootCategories := make([]*entity.ProductCategory, 0)
+	for _, cat := range categories {
+		if cat.ParentID == nil {
+			rootCategories = append(rootCategories, cat)
+		} else {
+			if parent, ok := categoryMap[*cat.ParentID]; ok {
+				parent.Children = append(parent.Children, *cat)
+			}
+		}
+	}
+
+	response.Success(c, rootCategories)
+}
+
+// CreateProductCategory creates a new product category
+func (h *Handler) CreateProductCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	type Input struct {
+		ParentID    string `json:"parent_id,omitempty"`
+		Code        string `json:"code" binding:"required,min=1,max=50"`
+		Name        string `json:"name" binding:"required,min=1,max=255"`
+		Description string `json:"description,omitempty"`
+	}
+
+	var input Input
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Check for duplicate code
+	var exists bool
+	h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM product_categories WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
+		tenantID, input.Code).Scan(&exists)
+	if exists {
+		response.Conflict(c, "Category with this code already exists")
+		return
+	}
+
+	var parentID *uuid.UUID
+	if input.ParentID != "" {
+		pid, err := uuid.Parse(input.ParentID)
+		if err == nil {
+			parentID = &pid
+		}
+	}
+
+	var description *string
+	if input.Description != "" {
+		description = &input.Description
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	_, err := h.db.Exec(`
+		INSERT INTO product_categories (id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, id, tenantID, parentID, input.Code, input.Name, description, true, now, now)
+
+	if err != nil {
+		h.log.Error("Failed to create category", "error", err)
+		response.InternalError(c, "Failed to create category")
+		return
+	}
+
+	cat := &entity.ProductCategory{
+		ID:          id,
+		TenantID:    tenantID,
+		ParentID:    parentID,
+		Code:        input.Code,
+		Name:        input.Name,
+		Description: description,
+		IsActive:    true,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+
+	response.Created(c, cat)
+}
+
+// GetProductCategory returns a single category
+func (h *Handler) GetProductCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid category ID")
+		return
+	}
+
+	var cat entity.ProductCategory
+	var parentID, desc sql.NullString
+
+	err = h.db.QueryRow(`
+		SELECT id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at
+		FROM product_categories
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Category")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get category", "error", err)
+		response.InternalError(c, "Failed to get category")
+		return
+	}
+
+	if parentID.Valid {
+		pid, _ := uuid.Parse(parentID.String)
+		cat.ParentID = &pid
+	}
+	if desc.Valid {
+		cat.Description = &desc.String
+	}
+
+	response.Success(c, cat)
+}
+
+// UpdateProductCategory updates a category
+func (h *Handler) UpdateProductCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid category ID")
+		return
+	}
+
+	type Input struct {
+		Name        *string `json:"name,omitempty"`
+		Description *string `json:"description,omitempty"`
+		ParentID    *string `json:"parent_id,omitempty"`
+		IsActive    *bool   `json:"is_active,omitempty"`
+	}
+
+	var input Input
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	updates := make([]string, 0)
+	args := make([]interface{}, 0)
+	argCount := 0
+
+	addUpdate := func(field string, value interface{}) {
+		argCount++
+		updates = append(updates, fmt.Sprintf("%s = $%d", field, argCount))
+		args = append(args, value)
+	}
+
+	if input.Name != nil {
+		addUpdate("name", *input.Name)
+	}
+	if input.Description != nil {
+		addUpdate("description", *input.Description)
+	}
+	if input.ParentID != nil {
+		if *input.ParentID == "" {
+			addUpdate("parent_id", nil)
+		} else {
+			pid, _ := uuid.Parse(*input.ParentID)
+			addUpdate("parent_id", pid)
+		}
+	}
+	if input.IsActive != nil {
+		addUpdate("is_active", *input.IsActive)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	addUpdate("updated_at", time.Now())
+
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(`
+		UPDATE product_categories SET %s
+		WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL
+		RETURNING id
+	`, strings.Join(updates, ", "), argCount-1, argCount)
+
+	var returnedID uuid.UUID
+	err = h.db.QueryRow(query, args...).Scan(&returnedID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Category")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to update category", "error", err)
+		response.InternalError(c, "Failed to update category")
+		return
+	}
+
+	h.GetProductCategory(c)
+}
+
+// DeleteProductCategory deletes a category
+func (h *Handler) DeleteProductCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid category ID")
+		return
+	}
+
+	// Check for products using this category
+	var hasProducts bool
+	h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM products WHERE category_id = $1 AND deleted_at IS NULL)", id).Scan(&hasProducts)
+	if hasProducts {
+		response.BadRequest(c, "Cannot delete category with associated products")
+		return
+	}
+
+	// Check for child categories
+	var hasChildren bool
+	h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM product_categories WHERE parent_id = $1 AND deleted_at IS NULL)", id).Scan(&hasChildren)
+	if hasChildren {
+		response.BadRequest(c, "Cannot delete category with child categories")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		UPDATE product_categories SET deleted_at = $1, updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+	`, time.Now(), id, tenantID)
+
+	if err != nil {
+		h.log.Error("Failed to delete category", "error", err)
+		response.InternalError(c, "Failed to delete category")
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Category")
+		return
+	}
+
+	response.NoContent(c)
+}

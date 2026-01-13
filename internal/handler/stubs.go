@@ -48,45 +48,16 @@ func (h *Handler) CreateContactPerson(c *gin.Context) {
 }
 
 // ========== PRODUCTS ==========
-
-func (h *Handler) ListProducts(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateProduct(c *gin.Context) { response.Created(c, gin.H{"message": "Product created"}) }
-func (h *Handler) GetProduct(c *gin.Context)    { response.NotFound(c, "Product") }
-func (h *Handler) UpdateProduct(c *gin.Context) { response.Success(c, gin.H{"message": "Product updated"}) }
-func (h *Handler) DeleteProduct(c *gin.Context) { response.NoContent(c) }
+// Product handlers are implemented in products.go
 
 // ========== PRODUCT CATEGORIES ==========
-
-func (h *Handler) ListProductCategories(c *gin.Context) { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateProductCategory(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Category created"})
-}
-func (h *Handler) GetProductCategory(c *gin.Context)    { response.NotFound(c, "Category") }
-func (h *Handler) UpdateProductCategory(c *gin.Context) { response.Success(c, gin.H{"message": "Category updated"}) }
-func (h *Handler) DeleteProductCategory(c *gin.Context) { response.NoContent(c) }
+// Product category handlers are implemented in products.go
 
 // ========== WAREHOUSES ==========
-
-func (h *Handler) ListWarehouses(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateWarehouse(c *gin.Context) { response.Created(c, gin.H{"message": "Warehouse created"}) }
-func (h *Handler) GetWarehouse(c *gin.Context)    { response.NotFound(c, "Warehouse") }
-func (h *Handler) UpdateWarehouse(c *gin.Context) { response.Success(c, gin.H{"message": "Warehouse updated"}) }
-func (h *Handler) DeleteWarehouse(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) ListWarehouseLocations(c *gin.Context) {
-	response.Success(c, []interface{}{})
-}
-func (h *Handler) CreateWarehouseLocation(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Location created"})
-}
+// Warehouse handlers are implemented in warehouses.go
 
 // ========== INVENTORY ==========
-
-func (h *Handler) ListInventory(c *gin.Context)        { response.Success(c, []interface{}{}) }
-func (h *Handler) GetInventorySummary(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) AdjustInventory(c *gin.Context)      { response.Success(c, gin.H{"message": "Inventory adjusted"}) }
-func (h *Handler) TransferInventory(c *gin.Context)    { response.Success(c, gin.H{"message": "Inventory transferred"}) }
-func (h *Handler) ListInventoryMovements(c *gin.Context) { response.Success(c, []interface{}{}) }
-func (h *Handler) GetInventoryValuation(c *gin.Context) { response.Success(c, []interface{}{}) }
+// Inventory handlers are implemented in inventory.go
 
 // ========== SALES ORDERS ==========
 
@@ -130,49 +101,19 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 }
 
 // ========== CHART OF ACCOUNTS ==========
-
-func (h *Handler) ListAccounts(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateAccount(c *gin.Context) { response.Created(c, gin.H{"message": "Account created"}) }
-func (h *Handler) GetAccount(c *gin.Context)    { response.NotFound(c, "Account") }
-func (h *Handler) UpdateAccount(c *gin.Context) { response.Success(c, gin.H{"message": "Account updated"}) }
-func (h *Handler) DeleteAccount(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) GetAccountTransactions(c *gin.Context) {
-	response.Success(c, []interface{}{})
-}
+// Account handlers are implemented in finance.go
 
 // ========== JOURNAL ENTRIES ==========
-
-func (h *Handler) ListJournalEntries(c *gin.Context) { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateJournalEntry(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Journal entry created"})
-}
-func (h *Handler) GetJournalEntry(c *gin.Context) { response.NotFound(c, "Journal entry") }
-func (h *Handler) PostJournalEntry(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Journal entry posted"})
-}
-func (h *Handler) ReverseJournalEntry(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Journal entry reversed"})
-}
+// Journal entry handlers are implemented in finance.go
 
 // ========== PAYMENTS ==========
-
-func (h *Handler) ListPayments(c *gin.Context)   { response.Success(c, []interface{}{}) }
-func (h *Handler) CreatePayment(c *gin.Context)  { response.Created(c, gin.H{"message": "Payment created"}) }
-func (h *Handler) GetPayment(c *gin.Context)     { response.NotFound(c, "Payment") }
-func (h *Handler) ConfirmPayment(c *gin.Context) { response.Success(c, gin.H{"message": "Payment confirmed"}) }
+// Payment handlers are implemented in finance.go
 
 // ========== TAX RATES ==========
-
-func (h *Handler) ListTaxRates(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateTaxRate(c *gin.Context) { response.Created(c, gin.H{"message": "Tax rate created"}) }
-func (h *Handler) GetTaxRate(c *gin.Context)    { response.NotFound(c, "Tax rate") }
-func (h *Handler) UpdateTaxRate(c *gin.Context) { response.Success(c, gin.H{"message": "Tax rate updated"}) }
-func (h *Handler) DeleteTaxRate(c *gin.Context) { response.NoContent(c) }
+// Tax rate handlers are implemented in finance.go
 
 // ========== CURRENCIES ==========
-
-func (h *Handler) ListCurrencies(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) GetExchangeRate(c *gin.Context) { response.Success(c, gin.H{"rate": 1.0}) }
+// Currency handlers are implemented in finance.go
 
 // ========== EMPLOYEES ==========
 // Employee handlers are implemented in employee.go
@@ -181,16 +122,7 @@ func (h *Handler) GetExchangeRate(c *gin.Context) { response.Success(c, gin.H{"r
 // AI handlers are implemented in ai.go
 
 // ========== REPORTS ==========
-
-func (h *Handler) GetBalanceSheet(c *gin.Context)      { response.Success(c, gin.H{"report": "balance_sheet"}) }
-func (h *Handler) GetIncomeStatement(c *gin.Context)   { response.Success(c, gin.H{"report": "income_statement"}) }
-func (h *Handler) GetCashFlow(c *gin.Context)          { response.Success(c, gin.H{"report": "cash_flow"}) }
-func (h *Handler) GetTrialBalance(c *gin.Context)      { response.Success(c, gin.H{"report": "trial_balance"}) }
-func (h *Handler) GetGeneralLedger(c *gin.Context)     { response.Success(c, gin.H{"report": "general_ledger"}) }
-func (h *Handler) GetAgingReceivables(c *gin.Context)  { response.Success(c, gin.H{"report": "aging_receivables"}) }
-func (h *Handler) GetAgingPayables(c *gin.Context)     { response.Success(c, gin.H{"report": "aging_payables"}) }
-func (h *Handler) GetSalesSummary(c *gin.Context)      { response.Success(c, gin.H{"report": "sales_summary"}) }
-func (h *Handler) GetInventoryReport(c *gin.Context)   { response.Success(c, gin.H{"report": "inventory"}) }
+// Report handlers are implemented in reports.go
 
 // ========== SETTINGS ==========
 
