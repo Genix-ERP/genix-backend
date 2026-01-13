@@ -77,7 +77,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	category := c.Query("category")
 	accountTypeID := c.Query("account_type_id")
 	includeInactive := c.Query("include_inactive") == "true"
-	flat := c.Query("flat") != "false" // Default to flat list
+	_ = c.Query("flat") // Reserved for future hierarchical view
 
 	// Build query
 	baseQuery := `

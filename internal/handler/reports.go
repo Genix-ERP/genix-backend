@@ -767,7 +767,7 @@ func (h *Handler) GetSalesSummary(c *gin.Context) {
 	}
 
 	// Get sales totals
-	var totalOrders, totalInvoiced, totalPaid int
+	var totalOrders, totalInvoiced int
 	var orderAmount, invoicedAmount, paidAmount float64
 
 	h.db.QueryRow(`
