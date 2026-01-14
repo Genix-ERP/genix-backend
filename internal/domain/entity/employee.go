@@ -37,6 +37,7 @@ type Employee struct {
 	SalaryCurrencyID *uuid.UUID      `json:"salary_currency_id,omitempty" db:"salary_currency_id"`
 	PayFrequency     *string         `json:"pay_frequency,omitempty" db:"pay_frequency"`
 	Status           string          `json:"status" db:"status"`
+	Permission       *string         `json:"permission,omitempty" db:"permission"`
 	Notes            *string         `json:"notes,omitempty" db:"notes"`
 	CreatedAt        time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt        time.Time       `json:"updated_at" db:"updated_at"`
@@ -74,6 +75,7 @@ type CreateEmployeeInput struct {
 	HireDate         string     `json:"hire_date,omitempty"`
 	BaseSalary       float64    `json:"salary,omitempty"`
 	Status           string     `json:"status,omitempty"`
+	Permission       string     `json:"permission,omitempty"`
 	Department       string     `json:"department,omitempty"`
 	PerformanceScore float64    `json:"performance_score,omitempty"`
 	TurnoverRisk     string     `json:"turnover_risk,omitempty"`
@@ -96,6 +98,7 @@ type UpdateEmployeeInput struct {
 	HireDate         *string  `json:"hire_date,omitempty"`
 	BaseSalary       *float64 `json:"salary,omitempty"`
 	Status           *string  `json:"status,omitempty"`
+	Permission       *string  `json:"permission,omitempty"`
 	Department       *string  `json:"department,omitempty"`
 	PerformanceScore *float64 `json:"performance_score,omitempty"`
 	TurnoverRisk     *string  `json:"turnover_risk,omitempty"`
@@ -123,6 +126,7 @@ type EmployeeResponse struct {
 	Department       string     `json:"department,omitempty"`
 	HireDate         string     `json:"hire_date"`
 	Status           string     `json:"status"`
+	Permission       string     `json:"permission,omitempty"`
 	BaseSalary       float64    `json:"salary,omitempty"`
 	PerformanceScore float64    `json:"performance_score"`
 	TurnoverRisk     string     `json:"turnover_risk"`
@@ -158,6 +162,9 @@ func (e *Employee) ToResponse() *EmployeeResponse {
 	}
 	if e.BaseSalary != nil {
 		resp.BaseSalary = *e.BaseSalary
+	}
+	if e.Permission != nil {
+		resp.Permission = *e.Permission
 	}
 
 	return resp
