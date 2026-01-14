@@ -320,7 +320,7 @@ func (h *Handler) CreateCallLog(c *gin.Context) {
 		Notes:          notes,
 		SentimentScore: input.SentimentScore,
 		Summary:        summary,
-		AgentID:        userID,
+		AgentID:        &userID,
 		CreatedAt:      now,
 	}
 
