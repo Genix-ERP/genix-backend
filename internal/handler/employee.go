@@ -43,7 +43,7 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 	// Build query
 	baseQuery := `
 		SELECT id, tenant_id, employee_number, first_name, last_name, middle_name,
-			   email, phone, mobile, job_title, hire_date, status, base_salary,
+			   email, phone, mobile, job_title, hire_date, status, base_salary, permission,
 			   notes, created_at, updated_at
 		FROM employees
 		WHERE tenant_id = $1 AND deleted_at IS NULL
@@ -116,13 +116,13 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 	employees := make([]*entity.EmployeeResponse, 0)
 	for rows.Next() {
 		var emp entity.Employee
-		var middleName, email, phone, mobile, jobTitle, notes sql.NullString
+		var middleName, email, phone, mobile, jobTitle, permission, notes sql.NullString
 		var baseSalary sql.NullFloat64
 
 		err := rows.Scan(
 			&emp.ID, &emp.TenantID, &emp.EmployeeNumber, &emp.FirstName, &emp.LastName,
 			&middleName, &email, &phone, &mobile, &jobTitle, &emp.HireDate, &emp.Status,
-			&baseSalary, &notes, &emp.CreatedAt, &emp.UpdatedAt,
+			&baseSalary, &permission, &notes, &emp.CreatedAt, &emp.UpdatedAt,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan employee", "error", err)
@@ -143,6 +143,9 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 		}
 		if baseSalary.Valid {
 			emp.BaseSalary = &baseSalary.Float64
+		}
+		if permission.Valid {
+			emp.Permission = &permission.String
 		}
 
 		// Parse department and performance from notes (temporary storage)
@@ -227,9 +230,9 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 	query := `
 		INSERT INTO employees (
 			id, tenant_id, employee_number, first_name, last_name, middle_name,
-			email, phone, job_title, hire_date, status, base_salary, notes,
+			email, phone, job_title, hire_date, status, base_salary, permission, notes,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING id, created_at
 	`
 
@@ -252,9 +255,14 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		baseSalary = &input.BaseSalary
 	}
 
+	var permission *string
+	if input.Permission != "" {
+		permission = &input.Permission
+	}
+
 	err := h.db.QueryRow(query,
 		id, tenantID, employeeNumber, firstName, lastName, middleName,
-		email, phone, jobTitle, hireDate, status, baseSalary, notes,
+		email, phone, jobTitle, hireDate, status, baseSalary, permission, notes,
 		now, now,
 	).Scan(&id, &now)
 
@@ -308,20 +316,20 @@ func (h *Handler) GetEmployee(c *gin.Context) {
 
 	query := `
 		SELECT id, tenant_id, employee_number, first_name, last_name, middle_name,
-			   email, phone, mobile, job_title, hire_date, status, base_salary,
+			   email, phone, mobile, job_title, hire_date, status, base_salary, permission,
 			   notes, created_at, updated_at
 		FROM employees
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`
 
 	var emp entity.Employee
-	var middleName, email, phone, mobile, jobTitle, notes sql.NullString
+	var middleName, email, phone, mobile, jobTitle, permission, notes sql.NullString
 	var baseSalary sql.NullFloat64
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&emp.ID, &emp.TenantID, &emp.EmployeeNumber, &emp.FirstName, &emp.LastName,
 		&middleName, &email, &phone, &mobile, &jobTitle, &emp.HireDate, &emp.Status,
-		&baseSalary, &notes, &emp.CreatedAt, &emp.UpdatedAt,
+		&baseSalary, &permission, &notes, &emp.CreatedAt, &emp.UpdatedAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -348,6 +356,9 @@ func (h *Handler) GetEmployee(c *gin.Context) {
 	}
 	if baseSalary.Valid {
 		emp.BaseSalary = &baseSalary.Float64
+	}
+	if permission.Valid {
+		emp.Permission = &permission.String
 	}
 	if notes.Valid {
 		emp.Notes = &notes.String
@@ -430,6 +441,9 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 		if parsed, err := time.Parse("2006-01-02", *input.HireDate); err == nil {
 			addUpdate("hire_date", parsed)
 		}
+	}
+	if input.Permission != nil {
+		addUpdate("permission", *input.Permission)
 	}
 
 	// Update notes with department/performance/turnover
