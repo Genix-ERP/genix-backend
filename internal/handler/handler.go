@@ -134,6 +134,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		contacts.POST("/:id/persons", h.CreateContactPerson)
 	}
 
+	// Call Logs (CRM PBX Integration)
+	callLogs := rg.Group("/call-logs")
+	{
+		callLogs.GET("", h.ListCallLogs)
+		callLogs.POST("", h.CreateCallLog)
+		callLogs.GET("/stats", h.GetCallLogStats)
+		callLogs.GET("/:id", h.GetCallLog)
+		callLogs.PUT("/:id", h.UpdateCallLog)
+		callLogs.DELETE("/:id", h.DeleteCallLog)
+	}
+
 	// Products
 	products := rg.Group("/products")
 	products.Use(middleware.RequirePermission("inventory", "product", "read"))
