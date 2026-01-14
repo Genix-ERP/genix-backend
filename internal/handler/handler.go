@@ -145,6 +145,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		callLogs.DELETE("/:id", h.DeleteCallLog)
 	}
 
+	// Leads (CRM Lead Management)
+	leads := rg.Group("/leads")
+	{
+		leads.GET("", h.ListLeads)
+		leads.POST("", h.CreateLead)
+		leads.GET("/stats", h.GetLeadStats)
+		leads.GET("/:id", h.GetLead)
+		leads.PUT("/:id", h.UpdateLead)
+		leads.DELETE("/:id", h.DeleteLead)
+	}
+
 	// Products
 	products := rg.Group("/products")
 	products.Use(middleware.RequirePermission("inventory", "product", "read"))
