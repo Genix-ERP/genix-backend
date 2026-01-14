@@ -43,8 +43,8 @@ CREATE INDEX IF NOT EXISTS idx_products_deleted_at ON products(deleted_at);
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
 CREATE INDEX IF NOT EXISTS idx_accounts_deleted_at ON accounts(deleted_at);
 
-ALTER TABLE invoices ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
-CREATE INDEX IF NOT EXISTS idx_invoices_deleted_at ON invoices(deleted_at);
+ALTER TABLE sales_invoices ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
+CREATE INDEX IF NOT EXISTS idx_sales_invoices_deleted_at ON sales_invoices(deleted_at);
 
 ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE;
 CREATE INDEX IF NOT EXISTS idx_purchase_orders_deleted_at ON purchase_orders(deleted_at);
