@@ -36,16 +36,7 @@ func (h *Handler) UpdateDepartment(c *gin.Context) { response.Success(c, gin.H{"
 func (h *Handler) DeleteDepartment(c *gin.Context) { response.NoContent(c) }
 
 // ========== CONTACTS ==========
-
-func (h *Handler) ListContacts(c *gin.Context)       { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateContact(c *gin.Context)      { response.Created(c, gin.H{"message": "Contact created"}) }
-func (h *Handler) GetContact(c *gin.Context)         { response.NotFound(c, "Contact") }
-func (h *Handler) UpdateContact(c *gin.Context)      { response.Success(c, gin.H{"message": "Contact updated"}) }
-func (h *Handler) DeleteContact(c *gin.Context)      { response.NoContent(c) }
-func (h *Handler) ListContactPersons(c *gin.Context) { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateContactPerson(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Contact person created"})
-}
+// Contact handlers are implemented in contacts.go
 
 // ========== PRODUCTS ==========
 // Product handlers are implemented in products.go
