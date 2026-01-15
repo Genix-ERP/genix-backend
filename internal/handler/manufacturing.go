@@ -1605,7 +1605,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 
 	baseQuery := `
 		SELECT wo.id, wo.production_order_id, po.code as production_order_code,
-			   wo.code, wo.name, wo.sequence, wo.operation_id, op.name as operation_name,
+			   wo.code, wo.name, wo.sequence, wo.operation_id, op.operation_name as operation_name,
 			   wo.work_center_id, wc.name as work_center_name,
 			   wo.quantity_to_produce, wo.quantity_produced, wo.quantity_scrapped, wo.uom,
 			   wo.planned_duration_hours, wo.actual_duration_hours, wo.setup_time_hours,
@@ -1773,7 +1773,7 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 
 	query := `
 		SELECT wo.id, wo.production_order_id, po.code as production_order_code,
-			   wo.code, wo.name, wo.sequence, wo.operation_id, op.name as operation_name,
+			   wo.code, wo.name, wo.sequence, wo.operation_id, op.operation_name as operation_name,
 			   wo.work_center_id, wc.name as work_center_name,
 			   wo.quantity_to_produce, wo.quantity_produced, wo.quantity_scrapped, wo.uom,
 			   wo.planned_duration_hours, wo.actual_duration_hours, wo.setup_time_hours,
