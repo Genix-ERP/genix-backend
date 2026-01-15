@@ -51,31 +51,10 @@ func (h *Handler) DeleteDepartment(c *gin.Context) { response.NoContent(c) }
 // Inventory handlers are implemented in inventory.go
 
 // ========== SALES ORDERS ==========
-
-func (h *Handler) ListSalesOrders(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateSalesOrder(c *gin.Context) { response.Created(c, gin.H{"message": "Sales order created"}) }
-func (h *Handler) GetSalesOrder(c *gin.Context)    { response.NotFound(c, "Sales order") }
-func (h *Handler) UpdateSalesOrder(c *gin.Context) { response.Success(c, gin.H{"message": "Sales order updated"}) }
-func (h *Handler) DeleteSalesOrder(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Sales order confirmed"})
-}
-func (h *Handler) CancelSalesOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Sales order cancelled"})
-}
-func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Invoice created from order"})
-}
+// Sales order handlers are implemented in sales.go
 
 // ========== SALES INVOICES ==========
-
-func (h *Handler) ListSalesInvoices(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateSalesInvoice(c *gin.Context) { response.Created(c, gin.H{"message": "Invoice created"}) }
-func (h *Handler) GetSalesInvoice(c *gin.Context)    { response.NotFound(c, "Invoice") }
-func (h *Handler) UpdateSalesInvoice(c *gin.Context) { response.Success(c, gin.H{"message": "Invoice updated"}) }
-func (h *Handler) DeleteSalesInvoice(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) SendInvoice(c *gin.Context)        { response.Success(c, gin.H{"message": "Invoice sent"}) }
-func (h *Handler) RecordPayment(c *gin.Context)      { response.Success(c, gin.H{"message": "Payment recorded"}) }
+// Sales invoice handlers are implemented in sales_invoices.go
 
 // ========== PURCHASE ORDERS ==========
 // Purchase order handlers are implemented in purchase_orders.go
