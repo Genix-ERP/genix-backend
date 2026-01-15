@@ -51,45 +51,13 @@ func (h *Handler) DeleteDepartment(c *gin.Context) { response.NoContent(c) }
 // Inventory handlers are implemented in inventory.go
 
 // ========== SALES ORDERS ==========
-
-func (h *Handler) ListSalesOrders(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateSalesOrder(c *gin.Context) { response.Created(c, gin.H{"message": "Sales order created"}) }
-func (h *Handler) GetSalesOrder(c *gin.Context)    { response.NotFound(c, "Sales order") }
-func (h *Handler) UpdateSalesOrder(c *gin.Context) { response.Success(c, gin.H{"message": "Sales order updated"}) }
-func (h *Handler) DeleteSalesOrder(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Sales order confirmed"})
-}
-func (h *Handler) CancelSalesOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Sales order cancelled"})
-}
-func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Invoice created from order"})
-}
+// Sales order handlers are implemented in sales.go
 
 // ========== SALES INVOICES ==========
-
-func (h *Handler) ListSalesInvoices(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateSalesInvoice(c *gin.Context) { response.Created(c, gin.H{"message": "Invoice created"}) }
-func (h *Handler) GetSalesInvoice(c *gin.Context)    { response.NotFound(c, "Invoice") }
-func (h *Handler) UpdateSalesInvoice(c *gin.Context) { response.Success(c, gin.H{"message": "Invoice updated"}) }
-func (h *Handler) DeleteSalesInvoice(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) SendInvoice(c *gin.Context)        { response.Success(c, gin.H{"message": "Invoice sent"}) }
-func (h *Handler) RecordPayment(c *gin.Context)      { response.Success(c, gin.H{"message": "Payment recorded"}) }
+// Sales invoice handlers are implemented in sales_invoices.go
 
 // ========== PURCHASE ORDERS ==========
-
-func (h *Handler) ListPurchaseOrders(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreatePurchaseOrder(c *gin.Context) { response.Created(c, gin.H{"message": "Purchase order created"}) }
-func (h *Handler) GetPurchaseOrder(c *gin.Context)    { response.NotFound(c, "Purchase order") }
-func (h *Handler) UpdatePurchaseOrder(c *gin.Context) { response.Success(c, gin.H{"message": "Purchase order updated"}) }
-func (h *Handler) DeletePurchaseOrder(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Purchase order approved"})
-}
-func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Purchase order received"})
-}
+// Purchase order handlers are implemented in purchase_orders.go
 
 // ========== CHART OF ACCOUNTS ==========
 // Account handlers are implemented in finance.go
