@@ -453,7 +453,7 @@ func (h *Handler) CreateTask(c *gin.Context) {
 		DueDate:           dueDate,
 		DueTime:           dueTime,
 		AssignedTo:        assignedTo,
-		AssignedBy:        userID,
+		AssignedBy:        &userID,
 		EstimatedHours:    input.EstimatedHours,
 		IsRecurring:       input.IsRecurring,
 		RecurrencePattern: recurrencePattern,
