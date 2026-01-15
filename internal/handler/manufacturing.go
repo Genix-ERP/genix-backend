@@ -10,8 +10,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
-	"github.com/genixerp/genix-backend/internal/handler/middleware"
-	"github.com/genixerp/genix-backend/internal/handler/response"
+	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/response"
 )
 
 // =====================================================
