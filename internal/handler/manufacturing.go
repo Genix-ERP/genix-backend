@@ -172,7 +172,9 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 		workCenters = append(workCenters, wc)
 	}
 
-	response.Paginated(c, workCenters, filter.Page, filter.Limit, total)
+	pagination := entity.NewPagination(filter.Page, filter.Limit)
+	pagination.Calculate(total)
+	response.SuccessWithPagination(c, workCenters, pagination)
 }
 
 // GetWorkCenter returns a single work center by ID
@@ -774,7 +776,9 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		orders = append(orders, po)
 	}
 
-	response.Paginated(c, orders, filter.Page, filter.Limit, total)
+	pagination := entity.NewPagination(filter.Page, filter.Limit)
+	pagination.Calculate(total)
+	response.SuccessWithPagination(c, orders, pagination)
 }
 
 // GetProductionOrder returns a single production order by ID
@@ -1747,7 +1751,9 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 		workOrders = append(workOrders, wo)
 	}
 
-	response.Paginated(c, workOrders, filter.Page, filter.Limit, total)
+	pagination := entity.NewPagination(filter.Page, filter.Limit)
+	pagination.Calculate(total)
+	response.SuccessWithPagination(c, workOrders, pagination)
 }
 
 // GetWorkOrder returns a single work order by ID
@@ -2294,7 +2300,9 @@ func (h *Handler) ListQualityChecks(c *gin.Context) {
 		qualityChecks = append(qualityChecks, qc)
 	}
 
-	response.Paginated(c, qualityChecks, filter.Page, filter.Limit, total)
+	pagination := entity.NewPagination(filter.Page, filter.Limit)
+	pagination.Calculate(total)
+	response.SuccessWithPagination(c, qualityChecks, pagination)
 }
 
 // GetQualityCheck returns a single quality check by ID
