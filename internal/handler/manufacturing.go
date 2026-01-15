@@ -1,0 +1,2663 @@
+package handler
+
+import (
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	"genix-erp/internal/domain/entity"
+	"genix-erp/internal/handler/middleware"
+	"genix-erp/internal/handler/response"
+)
+
+// =====================================================
+// WORK CENTER HANDLERS
+// =====================================================
+
+// ListWorkCenters returns all work centers with filtering
+func (h *Handler) ListWorkCenters(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var filter entity.WorkCenterFilter
+	if err := c.ShouldBindQuery(&filter); err != nil {
+		response.BadRequest(c, "Invalid query parameters")
+		return
+	}
+
+	// Set defaults
+	if filter.Page <= 0 {
+		filter.Page = 1
+	}
+	if filter.Limit <= 0 || filter.Limit > 100 {
+		filter.Limit = 20
+	}
+	if filter.SortBy == "" {
+		filter.SortBy = "name"
+	}
+	if filter.SortOrder == "" {
+		filter.SortOrder = "asc"
+	}
+
+	// Build query
+	baseQuery := `
+		SELECT wc.id, wc.code, wc.name, wc.description, wc.warehouse_id, w.name as warehouse_name,
+			   wc.department, wc.capacity_per_hour, wc.efficiency_factor, wc.oee_target,
+			   wc.working_hours_per_day, wc.hourly_cost, wc.setup_cost, wc.overhead_cost,
+			   wc.currency, wc.status, wc.is_available, wc.next_maintenance_date,
+			   wc.last_maintenance_date, wc.total_jobs_completed, wc.total_hours_worked,
+			   wc.current_utilization, wc.notes, wc.created_at, wc.updated_at
+		FROM work_centers wc
+		LEFT JOIN warehouses w ON wc.warehouse_id = w.id
+		WHERE wc.tenant_id = $1 AND wc.deleted_at IS NULL
+	`
+
+	countQuery := `SELECT COUNT(*) FROM work_centers wc WHERE wc.tenant_id = $1 AND wc.deleted_at IS NULL`
+	args := []interface{}{tenantID}
+	countArgs := []interface{}{tenantID}
+	argCount := 1
+
+	// Apply filters
+	if filter.Status != nil && *filter.Status != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wc.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wc.status = $%d", argCount)
+		args = append(args, *filter.Status)
+		countArgs = append(countArgs, *filter.Status)
+	}
+
+	if filter.IsAvailable != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wc.is_available = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wc.is_available = $%d", argCount)
+		args = append(args, *filter.IsAvailable)
+		countArgs = append(countArgs, *filter.IsAvailable)
+	}
+
+	if filter.WarehouseID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wc.warehouse_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wc.warehouse_id = $%d", argCount)
+		args = append(args, *filter.WarehouseID)
+		countArgs = append(countArgs, *filter.WarehouseID)
+	}
+
+	if filter.Search != nil && *filter.Search != "" {
+		argCount++
+		searchPattern := "%" + *filter.Search + "%"
+		baseQuery += fmt.Sprintf(" AND (wc.name ILIKE $%d OR wc.code ILIKE $%d)", argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (wc.name ILIKE $%d OR wc.code ILIKE $%d)", argCount, argCount)
+		args = append(args, searchPattern)
+		countArgs = append(countArgs, searchPattern)
+	}
+
+	// Get total count
+	var total int
+	err := h.db.QueryRow(countQuery, countArgs...).Scan(&total)
+	if err != nil {
+		h.log.Error("Failed to count work centers", "error", err)
+		response.InternalError(c, "Failed to retrieve work centers")
+		return
+	}
+
+	// Sorting
+	validSortColumns := map[string]string{
+		"name":         "wc.name",
+		"code":         "wc.code",
+		"status":       "wc.status",
+		"utilization":  "wc.current_utilization",
+		"created_at":   "wc.created_at",
+	}
+	sortColumn := validSortColumns[filter.SortBy]
+	if sortColumn == "" {
+		sortColumn = "wc.name"
+	}
+	sortOrder := "ASC"
+	if strings.ToLower(filter.SortOrder) == "desc" {
+		sortOrder = "DESC"
+	}
+	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortColumn, sortOrder)
+
+	// Pagination
+	offset := (filter.Page - 1) * filter.Limit
+	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", filter.Limit, offset)
+
+	// Execute query
+	rows, err := h.db.Query(baseQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to list work centers", "error", err)
+		response.InternalError(c, "Failed to retrieve work centers")
+		return
+	}
+	defer rows.Close()
+
+	workCenters := []entity.WorkCenterResponse{}
+	for rows.Next() {
+		var wc entity.WorkCenterResponse
+		var warehouseName sql.NullString
+		var nextMaint, lastMaint sql.NullTime
+
+		err := rows.Scan(
+			&wc.ID, &wc.Code, &wc.Name, &wc.Description, &wc.WarehouseID, &warehouseName,
+			&wc.Department, &wc.CapacityPerHour, &wc.EfficiencyFactor, &wc.OEETarget,
+			&wc.WorkingHoursPerDay, &wc.HourlyCost, &wc.SetupCost, &wc.OverheadCost,
+			&wc.Currency, &wc.Status, &wc.IsAvailable, &nextMaint,
+			&lastMaint, &wc.TotalJobsCompleted, &wc.TotalHoursWorked,
+			&wc.CurrentUtilization, &wc.Notes, &wc.CreatedAt, &wc.UpdatedAt,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan work center", "error", err)
+			continue
+		}
+
+		if warehouseName.Valid {
+			wc.WarehouseName = &warehouseName.String
+		}
+		if nextMaint.Valid {
+			s := nextMaint.Time.Format("2006-01-02")
+			wc.NextMaintenanceDate = &s
+		}
+		if lastMaint.Valid {
+			s := lastMaint.Time.Format("2006-01-02")
+			wc.LastMaintenanceDate = &s
+		}
+
+		workCenters = append(workCenters, wc)
+	}
+
+	response.Paginated(c, workCenters, filter.Page, filter.Limit, total)
+}
+
+// GetWorkCenter returns a single work center by ID
+func (h *Handler) GetWorkCenter(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid work center ID")
+		return
+	}
+
+	query := `
+		SELECT wc.id, wc.code, wc.name, wc.description, wc.warehouse_id, w.name as warehouse_name,
+			   wc.department, wc.capacity_per_hour, wc.efficiency_factor, wc.oee_target,
+			   wc.working_hours_per_day, wc.hourly_cost, wc.setup_cost, wc.overhead_cost,
+			   wc.currency, wc.status, wc.is_available, wc.next_maintenance_date,
+			   wc.last_maintenance_date, wc.total_jobs_completed, wc.total_hours_worked,
+			   wc.current_utilization, wc.notes, wc.created_at, wc.updated_at
+		FROM work_centers wc
+		LEFT JOIN warehouses w ON wc.warehouse_id = w.id
+		WHERE wc.id = $1 AND wc.tenant_id = $2 AND wc.deleted_at IS NULL
+	`
+
+	var wc entity.WorkCenterResponse
+	var warehouseName sql.NullString
+	var nextMaint, lastMaint sql.NullTime
+
+	err = h.db.QueryRow(query, id, tenantID).Scan(
+		&wc.ID, &wc.Code, &wc.Name, &wc.Description, &wc.WarehouseID, &warehouseName,
+		&wc.Department, &wc.CapacityPerHour, &wc.EfficiencyFactor, &wc.OEETarget,
+		&wc.WorkingHoursPerDay, &wc.HourlyCost, &wc.SetupCost, &wc.OverheadCost,
+		&wc.Currency, &wc.Status, &wc.IsAvailable, &nextMaint,
+		&lastMaint, &wc.TotalJobsCompleted, &wc.TotalHoursWorked,
+		&wc.CurrentUtilization, &wc.Notes, &wc.CreatedAt, &wc.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Work center not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get work center", "error", err)
+		response.InternalError(c, "Failed to retrieve work center")
+		return
+	}
+
+	if warehouseName.Valid {
+		wc.WarehouseName = &warehouseName.String
+	}
+	if nextMaint.Valid {
+		s := nextMaint.Time.Format("2006-01-02")
+		wc.NextMaintenanceDate = &s
+	}
+	if lastMaint.Valid {
+		s := lastMaint.Time.Format("2006-01-02")
+		wc.LastMaintenanceDate = &s
+	}
+
+	response.Success(c, wc)
+}
+
+// CreateWorkCenter creates a new work center
+func (h *Handler) CreateWorkCenter(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.WorkCenterInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Set defaults
+	capacityPerHour := 1.0
+	if input.CapacityPerHour != nil {
+		capacityPerHour = *input.CapacityPerHour
+	}
+	efficiencyFactor := 100.0
+	if input.EfficiencyFactor != nil {
+		efficiencyFactor = *input.EfficiencyFactor
+	}
+	oeeTarget := 85.0
+	if input.OEETarget != nil {
+		oeeTarget = *input.OEETarget
+	}
+	workingHours := 8.0
+	if input.WorkingHoursPerDay != nil {
+		workingHours = *input.WorkingHoursPerDay
+	}
+	hourlyCost := 0.0
+	if input.HourlyCost != nil {
+		hourlyCost = *input.HourlyCost
+	}
+	setupCost := 0.0
+	if input.SetupCost != nil {
+		setupCost = *input.SetupCost
+	}
+	overheadCost := 0.0
+	if input.OverheadCost != nil {
+		overheadCost = *input.OverheadCost
+	}
+	currency := "USD"
+	if input.Currency != nil {
+		currency = *input.Currency
+	}
+	status := "active"
+	if input.Status != nil {
+		status = *input.Status
+	}
+	isAvailable := true
+	if input.IsAvailable != nil {
+		isAvailable = *input.IsAvailable
+	}
+
+	var nextMaintDate *time.Time
+	if input.NextMaintenanceDate != nil {
+		t, err := time.Parse("2006-01-02", *input.NextMaintenanceDate)
+		if err == nil {
+			nextMaintDate = &t
+		}
+	}
+
+	now := time.Now()
+	id := uuid.New()
+
+	query := `
+		INSERT INTO work_centers (
+			id, tenant_id, code, name, description, warehouse_id, department,
+			capacity_per_hour, efficiency_factor, oee_target, working_hours_per_day,
+			hourly_cost, setup_cost, overhead_cost, currency, status, is_available,
+			next_maintenance_date, notes, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+		RETURNING id
+	`
+
+	err := h.db.QueryRow(query,
+		id, tenantID, input.Code, input.Name, input.Description, input.WarehouseID,
+		input.Department, capacityPerHour, efficiencyFactor, oeeTarget, workingHours,
+		hourlyCost, setupCost, overheadCost, currency, status, isAvailable,
+		nextMaintDate, input.Notes, userID, now, now,
+	).Scan(&id)
+
+	if err != nil {
+		h.log.Error("Failed to create work center", "error", err)
+		if strings.Contains(err.Error(), "unique") {
+			response.BadRequest(c, "Work center code already exists")
+			return
+		}
+		response.InternalError(c, "Failed to create work center")
+		return
+	}
+
+	resp := &entity.WorkCenterResponse{
+		ID:                 id,
+		Code:               input.Code,
+		Name:               input.Name,
+		Description:        input.Description,
+		WarehouseID:        input.WarehouseID,
+		Department:         input.Department,
+		CapacityPerHour:    capacityPerHour,
+		EfficiencyFactor:   efficiencyFactor,
+		OEETarget:          oeeTarget,
+		WorkingHoursPerDay: workingHours,
+		HourlyCost:         hourlyCost,
+		SetupCost:          setupCost,
+		OverheadCost:       overheadCost,
+		Currency:           currency,
+		Status:             status,
+		IsAvailable:        isAvailable,
+		Notes:              input.Notes,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+
+	if input.NextMaintenanceDate != nil {
+		resp.NextMaintenanceDate = input.NextMaintenanceDate
+	}
+
+	response.Created(c, resp)
+}
+
+// UpdateWorkCenter updates an existing work center
+func (h *Handler) UpdateWorkCenter(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid work center ID")
+		return
+	}
+
+	var input entity.WorkCenterInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Build dynamic update query
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if input.Code != "" {
+		argCount++
+		updates = append(updates, fmt.Sprintf("code = $%d", argCount))
+		args = append(args, input.Code)
+	}
+	if input.Name != "" {
+		argCount++
+		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
+		args = append(args, input.Name)
+	}
+	if input.Description != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, *input.Description)
+	}
+	if input.WarehouseID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+		args = append(args, *input.WarehouseID)
+	}
+	if input.Department != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("department = $%d", argCount))
+		args = append(args, *input.Department)
+	}
+	if input.CapacityPerHour != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("capacity_per_hour = $%d", argCount))
+		args = append(args, *input.CapacityPerHour)
+	}
+	if input.EfficiencyFactor != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("efficiency_factor = $%d", argCount))
+		args = append(args, *input.EfficiencyFactor)
+	}
+	if input.OEETarget != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("oee_target = $%d", argCount))
+		args = append(args, *input.OEETarget)
+	}
+	if input.WorkingHoursPerDay != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("working_hours_per_day = $%d", argCount))
+		args = append(args, *input.WorkingHoursPerDay)
+	}
+	if input.HourlyCost != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
+		args = append(args, *input.HourlyCost)
+	}
+	if input.SetupCost != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("setup_cost = $%d", argCount))
+		args = append(args, *input.SetupCost)
+	}
+	if input.OverheadCost != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("overhead_cost = $%d", argCount))
+		args = append(args, *input.OverheadCost)
+	}
+	if input.Currency != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("currency = $%d", argCount))
+		args = append(args, *input.Currency)
+	}
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+	}
+	if input.IsAvailable != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("is_available = $%d", argCount))
+		args = append(args, *input.IsAvailable)
+	}
+	if input.NextMaintenanceDate != nil {
+		argCount++
+		t, _ := time.Parse("2006-01-02", *input.NextMaintenanceDate)
+		updates = append(updates, fmt.Sprintf("next_maintenance_date = $%d", argCount))
+		args = append(args, t)
+	}
+	if input.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		args = append(args, *input.Notes)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	// Add updated_at
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+
+	// Add WHERE clause params
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(
+		"UPDATE work_centers SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
+		strings.Join(updates, ", "), argCount-1, argCount,
+	)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update work center", "error", err)
+		response.InternalError(c, "Failed to update work center")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Work center not found")
+		return
+	}
+
+	// Fetch and return updated work center
+	h.GetWorkCenter(c)
+}
+
+// DeleteWorkCenter soft deletes a work center
+func (h *Handler) DeleteWorkCenter(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid work center ID")
+		return
+	}
+
+	query := `UPDATE work_centers SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL`
+	result, err := h.db.Exec(query, time.Now(), id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete work center", "error", err)
+		response.InternalError(c, "Failed to delete work center")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Work center not found")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{"message": "Work center deleted successfully"})
+}
+
+// =====================================================
+// PRODUCTION ORDER HANDLERS
+// =====================================================
+
+// ListProductionOrders returns all production orders with filtering
+func (h *Handler) ListProductionOrders(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var filter entity.ProductionOrderFilter
+	if err := c.ShouldBindQuery(&filter); err != nil {
+		response.BadRequest(c, "Invalid query parameters")
+		return
+	}
+
+	// Set defaults
+	if filter.Page <= 0 {
+		filter.Page = 1
+	}
+	if filter.Limit <= 0 || filter.Limit > 100 {
+		filter.Limit = 20
+	}
+	if filter.SortBy == "" {
+		filter.SortBy = "created_at"
+	}
+	if filter.SortOrder == "" {
+		filter.SortOrder = "desc"
+	}
+
+	baseQuery := `
+		SELECT po.id, po.code, po.name, po.product_id, p.name as product_name, p.code as product_code,
+			   po.bom_id, b.name as bom_name, po.quantity_planned, po.quantity_produced, po.quantity_scrapped,
+			   po.uom, po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
+			   po.priority, po.status, po.progress_percent, po.source_type, po.warehouse_id,
+			   w.name as warehouse_name, po.planned_cost, po.actual_cost, po.material_cost,
+			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
+			   po.work_center_id, wc.name as work_center_name, po.requires_quality_check, po.quality_status,
+			   po.notes, po.tags, po.created_by, po.confirmed_at, po.completed_at, po.created_at, po.updated_at
+		FROM production_orders po
+		LEFT JOIN products p ON po.product_id = p.id
+		LEFT JOIN product_boms b ON po.bom_id = b.id
+		LEFT JOIN warehouses w ON po.warehouse_id = w.id
+		LEFT JOIN users u ON po.assigned_to = u.id
+		LEFT JOIN work_centers wc ON po.work_center_id = wc.id
+		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
+	`
+
+	countQuery := `SELECT COUNT(*) FROM production_orders po WHERE po.tenant_id = $1 AND po.deleted_at IS NULL`
+	args := []interface{}{tenantID}
+	countArgs := []interface{}{tenantID}
+	argCount := 1
+
+	// Apply filters
+	if filter.Status != nil && *filter.Status != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.status = $%d", argCount)
+		args = append(args, *filter.Status)
+		countArgs = append(countArgs, *filter.Status)
+	}
+
+	if filter.ProductID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.product_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.product_id = $%d", argCount)
+		args = append(args, *filter.ProductID)
+		countArgs = append(countArgs, *filter.ProductID)
+	}
+
+	if filter.WorkCenterID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.work_center_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.work_center_id = $%d", argCount)
+		args = append(args, *filter.WorkCenterID)
+		countArgs = append(countArgs, *filter.WorkCenterID)
+	}
+
+	if filter.AssignedTo != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.assigned_to = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.assigned_to = $%d", argCount)
+		args = append(args, *filter.AssignedTo)
+		countArgs = append(countArgs, *filter.AssignedTo)
+	}
+
+	if filter.Priority != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.priority = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.priority = $%d", argCount)
+		args = append(args, *filter.Priority)
+		countArgs = append(countArgs, *filter.Priority)
+	}
+
+	if filter.DateFrom != nil && *filter.DateFrom != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.scheduled_start >= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.scheduled_start >= $%d", argCount)
+		args = append(args, *filter.DateFrom)
+		countArgs = append(countArgs, *filter.DateFrom)
+	}
+
+	if filter.DateTo != nil && *filter.DateTo != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.scheduled_end <= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.scheduled_end <= $%d", argCount)
+		args = append(args, *filter.DateTo)
+		countArgs = append(countArgs, *filter.DateTo)
+	}
+
+	if filter.Search != nil && *filter.Search != "" {
+		argCount++
+		searchPattern := "%" + *filter.Search + "%"
+		baseQuery += fmt.Sprintf(" AND (po.code ILIKE $%d OR po.name ILIKE $%d OR p.name ILIKE $%d)", argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (po.code ILIKE $%d OR po.name ILIKE $%d)", argCount, argCount)
+		args = append(args, searchPattern)
+		countArgs = append(countArgs, searchPattern)
+	}
+
+	// Get total count
+	var total int
+	err := h.db.QueryRow(countQuery, countArgs...).Scan(&total)
+	if err != nil {
+		h.log.Error("Failed to count production orders", "error", err)
+		response.InternalError(c, "Failed to retrieve production orders")
+		return
+	}
+
+	// Sorting
+	validSortColumns := map[string]string{
+		"code":           "po.code",
+		"status":         "po.status",
+		"priority":       "po.priority",
+		"scheduled_start": "po.scheduled_start",
+		"created_at":     "po.created_at",
+	}
+	sortColumn := validSortColumns[filter.SortBy]
+	if sortColumn == "" {
+		sortColumn = "po.created_at"
+	}
+	sortOrder := "ASC"
+	if strings.ToLower(filter.SortOrder) == "desc" {
+		sortOrder = "DESC"
+	}
+	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortColumn, sortOrder)
+
+	// Pagination
+	offset := (filter.Page - 1) * filter.Limit
+	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", filter.Limit, offset)
+
+	// Execute query
+	rows, err := h.db.Query(baseQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to list production orders", "error", err)
+		response.InternalError(c, "Failed to retrieve production orders")
+		return
+	}
+	defer rows.Close()
+
+	orders := []entity.ProductionOrderResponse{}
+	for rows.Next() {
+		var po entity.ProductionOrderResponse
+		var bomName, warehouseName, assignedToName, workCenterName sql.NullString
+		var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
+		var tags []byte
+
+		err := rows.Scan(
+			&po.ID, &po.Code, &po.Name, &po.ProductID, &po.ProductName, &po.ProductCode,
+			&po.BOMID, &bomName, &po.QuantityPlanned, &po.QuantityProduced, &po.QuantityScrapped,
+			&po.UOM, &scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
+			&po.Priority, &po.Status, &po.ProgressPercent, &po.SourceType, &po.WarehouseID,
+			&warehouseName, &po.PlannedCost, &po.ActualCost, &po.MaterialCost,
+			&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
+			&po.WorkCenterID, &workCenterName, &po.RequiresQualityCheck, &po.QualityStatus,
+			&po.Notes, &tags, &po.CreatedBy, &confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan production order", "error", err)
+			continue
+		}
+
+		if bomName.Valid {
+			po.BOMName = &bomName.String
+		}
+		if warehouseName.Valid {
+			po.WarehouseName = &warehouseName.String
+		}
+		if assignedToName.Valid {
+			po.AssignedToName = &assignedToName.String
+		}
+		if workCenterName.Valid {
+			po.WorkCenterName = &workCenterName.String
+		}
+		if scheduledStart.Valid {
+			s := scheduledStart.Time.Format("2006-01-02")
+			po.ScheduledStart = &s
+		}
+		if scheduledEnd.Valid {
+			s := scheduledEnd.Time.Format("2006-01-02")
+			po.ScheduledEnd = &s
+		}
+		if actualStart.Valid {
+			s := actualStart.Time.Format(time.RFC3339)
+			po.ActualStart = &s
+		}
+		if actualEnd.Valid {
+			s := actualEnd.Time.Format(time.RFC3339)
+			po.ActualEnd = &s
+		}
+		if confirmedAt.Valid {
+			s := confirmedAt.Time.Format(time.RFC3339)
+			po.ConfirmedAt = &s
+		}
+		if completedAt.Valid {
+			s := completedAt.Time.Format(time.RFC3339)
+			po.CompletedAt = &s
+		}
+
+		po.QuantityRemaining = po.QuantityPlanned - po.QuantityProduced - po.QuantityScrapped
+		po.Tags = []string{}
+
+		orders = append(orders, po)
+	}
+
+	response.Paginated(c, orders, filter.Page, filter.Limit, total)
+}
+
+// GetProductionOrder returns a single production order by ID
+func (h *Handler) GetProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	query := `
+		SELECT po.id, po.code, po.name, po.product_id, p.name as product_name, p.code as product_code,
+			   po.bom_id, b.name as bom_name, po.quantity_planned, po.quantity_produced, po.quantity_scrapped,
+			   po.uom, po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
+			   po.priority, po.status, po.progress_percent, po.source_type, po.warehouse_id,
+			   w.name as warehouse_name, po.planned_cost, po.actual_cost, po.material_cost,
+			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
+			   po.work_center_id, wc.name as work_center_name, po.requires_quality_check, po.quality_status,
+			   po.notes, po.tags, po.created_by, cu.first_name || ' ' || cu.last_name as created_by_name,
+			   po.confirmed_at, po.completed_at, po.created_at, po.updated_at
+		FROM production_orders po
+		LEFT JOIN products p ON po.product_id = p.id
+		LEFT JOIN product_boms b ON po.bom_id = b.id
+		LEFT JOIN warehouses w ON po.warehouse_id = w.id
+		LEFT JOIN users u ON po.assigned_to = u.id
+		LEFT JOIN work_centers wc ON po.work_center_id = wc.id
+		LEFT JOIN users cu ON po.created_by = cu.id
+		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL
+	`
+
+	var po entity.ProductionOrderResponse
+	var bomName, warehouseName, assignedToName, workCenterName, createdByName sql.NullString
+	var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
+	var tags []byte
+
+	err = h.db.QueryRow(query, id, tenantID).Scan(
+		&po.ID, &po.Code, &po.Name, &po.ProductID, &po.ProductName, &po.ProductCode,
+		&po.BOMID, &bomName, &po.QuantityPlanned, &po.QuantityProduced, &po.QuantityScrapped,
+		&po.UOM, &scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
+		&po.Priority, &po.Status, &po.ProgressPercent, &po.SourceType, &po.WarehouseID,
+		&warehouseName, &po.PlannedCost, &po.ActualCost, &po.MaterialCost,
+		&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
+		&po.WorkCenterID, &workCenterName, &po.RequiresQualityCheck, &po.QualityStatus,
+		&po.Notes, &tags, &po.CreatedBy, &createdByName,
+		&confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Production order not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get production order", "error", err)
+		response.InternalError(c, "Failed to retrieve production order")
+		return
+	}
+
+	if bomName.Valid {
+		po.BOMName = &bomName.String
+	}
+	if warehouseName.Valid {
+		po.WarehouseName = &warehouseName.String
+	}
+	if assignedToName.Valid {
+		po.AssignedToName = &assignedToName.String
+	}
+	if workCenterName.Valid {
+		po.WorkCenterName = &workCenterName.String
+	}
+	if createdByName.Valid {
+		po.CreatedByName = &createdByName.String
+	}
+	if scheduledStart.Valid {
+		s := scheduledStart.Time.Format("2006-01-02")
+		po.ScheduledStart = &s
+	}
+	if scheduledEnd.Valid {
+		s := scheduledEnd.Time.Format("2006-01-02")
+		po.ScheduledEnd = &s
+	}
+	if actualStart.Valid {
+		s := actualStart.Time.Format(time.RFC3339)
+		po.ActualStart = &s
+	}
+	if actualEnd.Valid {
+		s := actualEnd.Time.Format(time.RFC3339)
+		po.ActualEnd = &s
+	}
+	if confirmedAt.Valid {
+		s := confirmedAt.Time.Format(time.RFC3339)
+		po.ConfirmedAt = &s
+	}
+	if completedAt.Valid {
+		s := completedAt.Time.Format(time.RFC3339)
+		po.CompletedAt = &s
+	}
+
+	po.QuantityRemaining = po.QuantityPlanned - po.QuantityProduced - po.QuantityScrapped
+	po.Tags = []string{}
+
+	response.Success(c, po)
+}
+
+// CreateProductionOrder creates a new production order
+func (h *Handler) CreateProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.ProductionOrderInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Generate code
+	now := time.Now()
+	id := uuid.New()
+	code := fmt.Sprintf("MO-%s", id.String()[:8])
+
+	// Set defaults
+	priority := 5
+	if input.Priority != nil {
+		priority = *input.Priority
+	}
+	requiresQC := false
+	if input.RequiresQualityCheck != nil {
+		requiresQC = *input.RequiresQualityCheck
+	}
+
+	var scheduledStart, scheduledEnd *time.Time
+	if input.ScheduledStart != nil {
+		t, err := time.Parse("2006-01-02", *input.ScheduledStart)
+		if err == nil {
+			scheduledStart = &t
+		}
+	}
+	if input.ScheduledEnd != nil {
+		t, err := time.Parse("2006-01-02", *input.ScheduledEnd)
+		if err == nil {
+			scheduledEnd = &t
+		}
+	}
+
+	query := `
+		INSERT INTO production_orders (
+			id, tenant_id, code, name, product_id, bom_id, quantity_planned, uom,
+			scheduled_start, scheduled_end, priority, status, source_type, source_id,
+			sales_order_id, customer_id, warehouse_id, location_id, assigned_to,
+			work_center_id, requires_quality_check, notes, tags, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+		RETURNING id
+	`
+
+	tags := []byte("[]")
+	if len(input.Tags) > 0 {
+		tags = []byte(fmt.Sprintf(`["%s"]`, strings.Join(input.Tags, `","`)))
+	}
+
+	err := h.db.QueryRow(query,
+		id, tenantID, code, input.Name, input.ProductID, input.BOMID, input.QuantityPlanned, input.UOM,
+		scheduledStart, scheduledEnd, priority, input.SourceType, input.SourceID,
+		input.SalesOrderID, input.CustomerID, input.WarehouseID, input.LocationID, input.AssignedTo,
+		input.WorkCenterID, requiresQC, input.Notes, tags, userID, now, now,
+	).Scan(&id)
+
+	if err != nil {
+		h.log.Error("Failed to create production order", "error", err)
+		response.InternalError(c, "Failed to create production order")
+		return
+	}
+
+	// Return created order
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: id.String()})
+	h.GetProductionOrder(c)
+}
+
+// UpdateProductionOrder updates an existing production order
+func (h *Handler) UpdateProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	var input entity.ProductionOrderUpdateInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Build dynamic update query
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if input.Name != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
+		args = append(args, *input.Name)
+	}
+	if input.BOMID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("bom_id = $%d", argCount))
+		args = append(args, *input.BOMID)
+	}
+	if input.QuantityPlanned != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("quantity_planned = $%d", argCount))
+		args = append(args, *input.QuantityPlanned)
+	}
+	if input.ScheduledStart != nil {
+		argCount++
+		t, _ := time.Parse("2006-01-02", *input.ScheduledStart)
+		updates = append(updates, fmt.Sprintf("scheduled_start = $%d", argCount))
+		args = append(args, t)
+	}
+	if input.ScheduledEnd != nil {
+		argCount++
+		t, _ := time.Parse("2006-01-02", *input.ScheduledEnd)
+		updates = append(updates, fmt.Sprintf("scheduled_end = $%d", argCount))
+		args = append(args, t)
+	}
+	if input.Priority != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("priority = $%d", argCount))
+		args = append(args, *input.Priority)
+	}
+	if input.AssignedTo != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("assigned_to = $%d", argCount))
+		args = append(args, *input.AssignedTo)
+	}
+	if input.WorkCenterID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount))
+		args = append(args, *input.WorkCenterID)
+	}
+	if input.RequiresQualityCheck != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("requires_quality_check = $%d", argCount))
+		args = append(args, *input.RequiresQualityCheck)
+	}
+	if input.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		args = append(args, *input.Notes)
+	}
+	if len(input.Tags) > 0 {
+		argCount++
+		tags := []byte(fmt.Sprintf(`["%s"]`, strings.Join(input.Tags, `","`)))
+		updates = append(updates, fmt.Sprintf("tags = $%d", argCount))
+		args = append(args, tags)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	// Add updated_at
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+
+	// Add WHERE clause params
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(
+		"UPDATE production_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status IN ('draft', 'confirmed')",
+		strings.Join(updates, ", "), argCount-1, argCount,
+	)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update production order", "error", err)
+		response.InternalError(c, "Failed to update production order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Production order not found or cannot be updated")
+		return
+	}
+
+	h.GetProductionOrder(c)
+}
+
+// DeleteProductionOrder soft deletes a production order
+func (h *Handler) DeleteProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	query := `UPDATE production_orders SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status = 'draft'`
+	result, err := h.db.Exec(query, time.Now(), id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete production order", "error", err)
+		response.InternalError(c, "Failed to delete production order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Production order not found or cannot be deleted")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{"message": "Production order deleted successfully"})
+}
+
+// ConfirmProductionOrder confirms a draft production order
+func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	now := time.Now()
+	query := `
+		UPDATE production_orders
+		SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2, updated_at = $2
+		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL AND status = 'draft'
+	`
+
+	result, err := h.db.Exec(query, userID, now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to confirm production order", "error", err)
+		response.InternalError(c, "Failed to confirm production order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Production order not found or not in draft status")
+		return
+	}
+
+	h.GetProductionOrder(c)
+}
+
+// StartProductionOrder starts a confirmed production order
+func (h *Handler) StartProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	now := time.Now()
+	query := `
+		UPDATE production_orders
+		SET status = 'in_progress', actual_start = $1, updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status IN ('confirmed', 'ready', 'paused')
+	`
+
+	result, err := h.db.Exec(query, now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to start production order", "error", err)
+		response.InternalError(c, "Failed to start production order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Production order not found or not in valid status")
+		return
+	}
+
+	h.GetProductionOrder(c)
+}
+
+// PauseProductionOrder pauses an in-progress production order
+func (h *Handler) PauseProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	now := time.Now()
+	query := `
+		UPDATE production_orders
+		SET status = 'paused', updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status = 'in_progress'
+	`
+
+	result, err := h.db.Exec(query, now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to pause production order", "error", err)
+		response.InternalError(c, "Failed to pause production order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Production order not found or not in progress")
+		return
+	}
+
+	h.GetProductionOrder(c)
+}
+
+// CompleteProductionOrder completes a production order
+func (h *Handler) CompleteProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	// Optional: accept quantity produced
+	var input struct {
+		QuantityProduced float64 `json:"quantity_produced"`
+		QuantityScrapped float64 `json:"quantity_scrapped"`
+	}
+	c.ShouldBindJSON(&input)
+
+	now := time.Now()
+
+	// Update production order
+	query := `
+		UPDATE production_orders
+		SET status = 'completed', actual_end = $1, completed_by = $2, completed_at = $1, updated_at = $1,
+			progress_percent = 100
+	`
+	args := []interface{}{now, userID}
+	argCount := 2
+
+	if input.QuantityProduced > 0 {
+		argCount++
+		query += fmt.Sprintf(", quantity_produced = $%d", argCount)
+		args = append(args, input.QuantityProduced)
+	}
+	if input.QuantityScrapped > 0 {
+		argCount++
+		query += fmt.Sprintf(", quantity_scrapped = $%d", argCount)
+		args = append(args, input.QuantityScrapped)
+	}
+
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query += fmt.Sprintf(" WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status = 'in_progress'", argCount-1, argCount)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to complete production order", "error", err)
+		response.InternalError(c, "Failed to complete production order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Production order not found or not in progress")
+		return
+	}
+
+	h.GetProductionOrder(c)
+}
+
+// CancelProductionOrder cancels a production order
+func (h *Handler) CancelProductionOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	now := time.Now()
+	query := `
+		UPDATE production_orders
+		SET status = 'cancelled', updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status NOT IN ('completed', 'closed', 'cancelled')
+	`
+
+	result, err := h.db.Exec(query, now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to cancel production order", "error", err)
+		response.InternalError(c, "Failed to cancel production order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Production order not found or cannot be cancelled")
+		return
+	}
+
+	h.GetProductionOrder(c)
+}
+
+// RecordProduction records production output for an order
+func (h *Handler) RecordProduction(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid production order ID")
+		return
+	}
+
+	var input struct {
+		QuantityProduced float64 `json:"quantity_produced" binding:"required,gt=0"`
+		QuantityScrapped float64 `json:"quantity_scrapped"`
+		Notes            string  `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	now := time.Now()
+
+	// Get current quantities and planned
+	var quantityPlanned, currentProduced, currentScrapped float64
+	checkQuery := `
+		SELECT quantity_planned, quantity_produced, quantity_scrapped
+		FROM production_orders
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status = 'in_progress'
+	`
+	err = h.db.QueryRow(checkQuery, id, tenantID).Scan(&quantityPlanned, &currentProduced, &currentScrapped)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Production order not found or not in progress")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get production order", "error", err)
+		response.InternalError(c, "Failed to record production")
+		return
+	}
+
+	newProduced := currentProduced + input.QuantityProduced
+	newScrapped := currentScrapped + input.QuantityScrapped
+	progressPercent := (newProduced / quantityPlanned) * 100
+	if progressPercent > 100 {
+		progressPercent = 100
+	}
+
+	updateQuery := `
+		UPDATE production_orders
+		SET quantity_produced = $1, quantity_scrapped = $2, progress_percent = $3, updated_at = $4
+		WHERE id = $5 AND tenant_id = $6
+	`
+
+	_, err = h.db.Exec(updateQuery, newProduced, newScrapped, progressPercent, now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to update production quantities", "error", err)
+		response.InternalError(c, "Failed to record production")
+		return
+	}
+
+	h.GetProductionOrder(c)
+}
+
+// GetProductionSchedule returns scheduled production orders for calendar view
+func (h *Handler) GetProductionSchedule(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	dateFrom := c.Query("date_from")
+	dateTo := c.Query("date_to")
+
+	if dateFrom == "" {
+		dateFrom = time.Now().AddDate(0, 0, -7).Format("2006-01-02")
+	}
+	if dateTo == "" {
+		dateTo = time.Now().AddDate(0, 0, 30).Format("2006-01-02")
+	}
+
+	query := `
+		SELECT po.id, po.code, p.name as product_name, wc.name as work_center_name,
+			   po.quantity_planned, po.status, po.scheduled_start, po.scheduled_end,
+			   po.priority, po.progress_percent
+		FROM production_orders po
+		LEFT JOIN products p ON po.product_id = p.id
+		LEFT JOIN work_centers wc ON po.work_center_id = wc.id
+		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
+		AND po.status NOT IN ('cancelled', 'closed')
+		AND (
+			(po.scheduled_start >= $2 AND po.scheduled_start <= $3)
+			OR (po.scheduled_end >= $2 AND po.scheduled_end <= $3)
+			OR (po.scheduled_start <= $2 AND po.scheduled_end >= $3)
+		)
+		ORDER BY po.scheduled_start ASC, po.priority ASC
+	`
+
+	rows, err := h.db.Query(query, tenantID, dateFrom, dateTo)
+	if err != nil {
+		h.log.Error("Failed to get production schedule", "error", err)
+		response.InternalError(c, "Failed to retrieve production schedule")
+		return
+	}
+	defer rows.Close()
+
+	schedule := []entity.ProductionScheduleItem{}
+	for rows.Next() {
+		var item entity.ProductionScheduleItem
+		var wcName sql.NullString
+		var scheduledStart, scheduledEnd sql.NullTime
+
+		err := rows.Scan(
+			&item.ID, &item.Code, &item.ProductName, &wcName,
+			&item.QuantityPlanned, &item.Status, &scheduledStart, &scheduledEnd,
+			&item.Priority, &item.ProgressPercent,
+		)
+		if err != nil {
+			continue
+		}
+
+		if wcName.Valid {
+			item.WorkCenterName = &wcName.String
+		}
+		if scheduledStart.Valid {
+			s := scheduledStart.Time.Format("2006-01-02")
+			item.ScheduledStart = &s
+		}
+		if scheduledEnd.Valid {
+			s := scheduledEnd.Time.Format("2006-01-02")
+			item.ScheduledEnd = &s
+		}
+
+		schedule = append(schedule, item)
+	}
+
+	response.Success(c, schedule)
+}
+
+// GetManufacturingStats returns manufacturing dashboard statistics
+func (h *Handler) GetManufacturingStats(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	stats := entity.ManufacturingStats{}
+
+	// Production order stats
+	orderStatsQuery := `
+		SELECT
+			COUNT(*) as total,
+			COUNT(*) FILTER (WHERE status = 'draft') as draft,
+			COUNT(*) FILTER (WHERE status = 'confirmed') as confirmed,
+			COUNT(*) FILTER (WHERE status = 'in_progress') as in_progress,
+			COUNT(*) FILTER (WHERE status = 'completed') as completed,
+			COUNT(*) FILTER (WHERE status NOT IN ('completed', 'cancelled', 'closed') AND scheduled_end < NOW()) as overdue,
+			COALESCE(SUM(quantity_produced), 0) as total_produced,
+			COALESCE(SUM(quantity_scrapped), 0) as total_scrapped
+		FROM production_orders
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`
+
+	var totalProduced, totalScrapped float64
+	err := h.db.QueryRow(orderStatsQuery, tenantID).Scan(
+		&stats.TotalProductionOrders, &stats.DraftOrders, &stats.ConfirmedOrders,
+		&stats.InProgressOrders, &stats.CompletedOrders, &stats.OverdueOrders,
+		&totalProduced, &totalScrapped,
+	)
+	if err != nil {
+		h.log.Error("Failed to get production order stats", "error", err)
+	}
+
+	stats.TotalUnitsProduced = totalProduced
+	stats.TotalUnitsScrapped = totalScrapped
+	if totalProduced+totalScrapped > 0 {
+		stats.ScrapRate = (totalScrapped / (totalProduced + totalScrapped)) * 100
+	}
+	if stats.TotalProductionOrders > 0 {
+		stats.CompletionRate = float64(stats.CompletedOrders) / float64(stats.TotalProductionOrders) * 100
+	}
+
+	// Work center stats
+	wcStatsQuery := `
+		SELECT
+			COUNT(*) as total,
+			COUNT(*) FILTER (WHERE status = 'active') as active,
+			COALESCE(AVG(current_utilization), 0) as avg_utilization
+		FROM work_centers
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`
+	err = h.db.QueryRow(wcStatsQuery, tenantID).Scan(
+		&stats.TotalWorkCenters, &stats.ActiveWorkCenters, &stats.AverageUtilization,
+	)
+	if err != nil {
+		h.log.Error("Failed to get work center stats", "error", err)
+	}
+
+	// Quality stats
+	qcStatsQuery := `
+		SELECT
+			COUNT(*) as total,
+			COUNT(*) FILTER (WHERE result = 'passed') as passed,
+			COUNT(*) FILTER (WHERE result = 'failed') as failed
+		FROM quality_checks
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`
+	err = h.db.QueryRow(qcStatsQuery, tenantID).Scan(
+		&stats.TotalQualityChecks, &stats.PassedChecks, &stats.FailedChecks,
+	)
+	if err != nil {
+		h.log.Error("Failed to get quality check stats", "error", err)
+	}
+
+	if stats.TotalQualityChecks > 0 {
+		stats.OverallPassRate = float64(stats.PassedChecks) / float64(stats.TotalQualityChecks) * 100
+	}
+
+	response.Success(c, stats)
+}
+
+// =====================================================
+// WORK ORDER HANDLERS
+// =====================================================
+
+// ListWorkOrders returns all work orders with filtering
+func (h *Handler) ListWorkOrders(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var filter entity.WorkOrderFilter
+	if err := c.ShouldBindQuery(&filter); err != nil {
+		response.BadRequest(c, "Invalid query parameters")
+		return
+	}
+
+	// Set defaults
+	if filter.Page <= 0 {
+		filter.Page = 1
+	}
+	if filter.Limit <= 0 || filter.Limit > 100 {
+		filter.Limit = 20
+	}
+	if filter.SortBy == "" {
+		filter.SortBy = "sequence"
+	}
+	if filter.SortOrder == "" {
+		filter.SortOrder = "asc"
+	}
+
+	baseQuery := `
+		SELECT wo.id, wo.production_order_id, po.code as production_order_code,
+			   wo.code, wo.name, wo.sequence, wo.operation_id, op.name as operation_name,
+			   wo.work_center_id, wc.name as work_center_name,
+			   wo.quantity_to_produce, wo.quantity_produced, wo.quantity_scrapped, wo.uom,
+			   wo.planned_duration_hours, wo.actual_duration_hours, wo.setup_time_hours,
+			   wo.scheduled_start, wo.scheduled_end, wo.actual_start, wo.actual_end,
+			   wo.status, wo.progress_percent, wo.planned_cost, wo.actual_cost,
+			   wo.labor_cost, wo.machine_cost, wo.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
+			   wo.instructions, wo.notes, wo.created_at, wo.updated_at
+		FROM work_orders wo
+		LEFT JOIN production_orders po ON wo.production_order_id = po.id
+		LEFT JOIN bom_operations op ON wo.operation_id = op.id
+		LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
+		LEFT JOIN users u ON wo.assigned_to = u.id
+		WHERE wo.tenant_id = $1 AND wo.deleted_at IS NULL
+	`
+
+	countQuery := `SELECT COUNT(*) FROM work_orders wo WHERE wo.tenant_id = $1 AND wo.deleted_at IS NULL`
+	args := []interface{}{tenantID}
+	countArgs := []interface{}{tenantID}
+	argCount := 1
+
+	// Apply filters
+	if filter.ProductionOrderID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wo.production_order_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wo.production_order_id = $%d", argCount)
+		args = append(args, *filter.ProductionOrderID)
+		countArgs = append(countArgs, *filter.ProductionOrderID)
+	}
+
+	if filter.WorkCenterID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wo.work_center_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wo.work_center_id = $%d", argCount)
+		args = append(args, *filter.WorkCenterID)
+		countArgs = append(countArgs, *filter.WorkCenterID)
+	}
+
+	if filter.Status != nil && *filter.Status != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wo.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wo.status = $%d", argCount)
+		args = append(args, *filter.Status)
+		countArgs = append(countArgs, *filter.Status)
+	}
+
+	if filter.AssignedTo != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wo.assigned_to = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wo.assigned_to = $%d", argCount)
+		args = append(args, *filter.AssignedTo)
+		countArgs = append(countArgs, *filter.AssignedTo)
+	}
+
+	// Get total count
+	var total int
+	err := h.db.QueryRow(countQuery, countArgs...).Scan(&total)
+	if err != nil {
+		h.log.Error("Failed to count work orders", "error", err)
+		response.InternalError(c, "Failed to retrieve work orders")
+		return
+	}
+
+	// Sorting
+	validSortColumns := map[string]string{
+		"sequence":   "wo.sequence",
+		"status":     "wo.status",
+		"created_at": "wo.created_at",
+	}
+	sortColumn := validSortColumns[filter.SortBy]
+	if sortColumn == "" {
+		sortColumn = "wo.sequence"
+	}
+	sortOrder := "ASC"
+	if strings.ToLower(filter.SortOrder) == "desc" {
+		sortOrder = "DESC"
+	}
+	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortColumn, sortOrder)
+
+	// Pagination
+	offset := (filter.Page - 1) * filter.Limit
+	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", filter.Limit, offset)
+
+	// Execute query
+	rows, err := h.db.Query(baseQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to list work orders", "error", err)
+		response.InternalError(c, "Failed to retrieve work orders")
+		return
+	}
+	defer rows.Close()
+
+	workOrders := []entity.WorkOrderResponse{}
+	for rows.Next() {
+		var wo entity.WorkOrderResponse
+		var poCode, opName, wcName, assignedToName sql.NullString
+		var scheduledStart, scheduledEnd, actualStart, actualEnd sql.NullTime
+
+		err := rows.Scan(
+			&wo.ID, &wo.ProductionOrderID, &poCode,
+			&wo.Code, &wo.Name, &wo.Sequence, &wo.OperationID, &opName,
+			&wo.WorkCenterID, &wcName,
+			&wo.QuantityToProduce, &wo.QuantityProduced, &wo.QuantityScrapped, &wo.UOM,
+			&wo.PlannedDurationHours, &wo.ActualDurationHours, &wo.SetupTimeHours,
+			&scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
+			&wo.Status, &wo.ProgressPercent, &wo.PlannedCost, &wo.ActualCost,
+			&wo.LaborCost, &wo.MachineCost, &wo.AssignedTo, &assignedToName,
+			&wo.Instructions, &wo.Notes, &wo.CreatedAt, &wo.UpdatedAt,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan work order", "error", err)
+			continue
+		}
+
+		wo.ProductionOrderCode = poCode.String
+		if opName.Valid {
+			wo.OperationName = &opName.String
+		}
+		if wcName.Valid {
+			wo.WorkCenterName = &wcName.String
+		}
+		if assignedToName.Valid {
+			wo.AssignedToName = &assignedToName.String
+		}
+		if scheduledStart.Valid {
+			s := scheduledStart.Time.Format(time.RFC3339)
+			wo.ScheduledStart = &s
+		}
+		if scheduledEnd.Valid {
+			s := scheduledEnd.Time.Format(time.RFC3339)
+			wo.ScheduledEnd = &s
+		}
+		if actualStart.Valid {
+			s := actualStart.Time.Format(time.RFC3339)
+			wo.ActualStart = &s
+		}
+		if actualEnd.Valid {
+			s := actualEnd.Time.Format(time.RFC3339)
+			wo.ActualEnd = &s
+		}
+
+		wo.QuantityRemaining = wo.QuantityToProduce - wo.QuantityProduced - wo.QuantityScrapped
+
+		workOrders = append(workOrders, wo)
+	}
+
+	response.Paginated(c, workOrders, filter.Page, filter.Limit, total)
+}
+
+// GetWorkOrder returns a single work order by ID
+func (h *Handler) GetWorkOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	query := `
+		SELECT wo.id, wo.production_order_id, po.code as production_order_code,
+			   wo.code, wo.name, wo.sequence, wo.operation_id, op.name as operation_name,
+			   wo.work_center_id, wc.name as work_center_name,
+			   wo.quantity_to_produce, wo.quantity_produced, wo.quantity_scrapped, wo.uom,
+			   wo.planned_duration_hours, wo.actual_duration_hours, wo.setup_time_hours,
+			   wo.scheduled_start, wo.scheduled_end, wo.actual_start, wo.actual_end,
+			   wo.status, wo.progress_percent, wo.planned_cost, wo.actual_cost,
+			   wo.labor_cost, wo.machine_cost, wo.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
+			   wo.instructions, wo.notes, wo.created_at, wo.updated_at
+		FROM work_orders wo
+		LEFT JOIN production_orders po ON wo.production_order_id = po.id
+		LEFT JOIN bom_operations op ON wo.operation_id = op.id
+		LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
+		LEFT JOIN users u ON wo.assigned_to = u.id
+		WHERE wo.id = $1 AND wo.tenant_id = $2 AND wo.deleted_at IS NULL
+	`
+
+	var wo entity.WorkOrderResponse
+	var poCode, opName, wcName, assignedToName sql.NullString
+	var scheduledStart, scheduledEnd, actualStart, actualEnd sql.NullTime
+
+	err = h.db.QueryRow(query, id, tenantID).Scan(
+		&wo.ID, &wo.ProductionOrderID, &poCode,
+		&wo.Code, &wo.Name, &wo.Sequence, &wo.OperationID, &opName,
+		&wo.WorkCenterID, &wcName,
+		&wo.QuantityToProduce, &wo.QuantityProduced, &wo.QuantityScrapped, &wo.UOM,
+		&wo.PlannedDurationHours, &wo.ActualDurationHours, &wo.SetupTimeHours,
+		&scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
+		&wo.Status, &wo.ProgressPercent, &wo.PlannedCost, &wo.ActualCost,
+		&wo.LaborCost, &wo.MachineCost, &wo.AssignedTo, &assignedToName,
+		&wo.Instructions, &wo.Notes, &wo.CreatedAt, &wo.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Work order not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get work order", "error", err)
+		response.InternalError(c, "Failed to retrieve work order")
+		return
+	}
+
+	wo.ProductionOrderCode = poCode.String
+	if opName.Valid {
+		wo.OperationName = &opName.String
+	}
+	if wcName.Valid {
+		wo.WorkCenterName = &wcName.String
+	}
+	if assignedToName.Valid {
+		wo.AssignedToName = &assignedToName.String
+	}
+	if scheduledStart.Valid {
+		s := scheduledStart.Time.Format(time.RFC3339)
+		wo.ScheduledStart = &s
+	}
+	if scheduledEnd.Valid {
+		s := scheduledEnd.Time.Format(time.RFC3339)
+		wo.ScheduledEnd = &s
+	}
+	if actualStart.Valid {
+		s := actualStart.Time.Format(time.RFC3339)
+		wo.ActualStart = &s
+	}
+	if actualEnd.Valid {
+		s := actualEnd.Time.Format(time.RFC3339)
+		wo.ActualEnd = &s
+	}
+
+	wo.QuantityRemaining = wo.QuantityToProduce - wo.QuantityProduced - wo.QuantityScrapped
+
+	response.Success(c, wo)
+}
+
+// CreateWorkOrder creates a new work order
+func (h *Handler) CreateWorkOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.WorkOrderInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Verify production order exists and get sequence
+	var maxSequence int
+	seqQuery := `
+		SELECT COALESCE(MAX(sequence), 0) FROM work_orders
+		WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`
+	h.db.QueryRow(seqQuery, input.ProductionOrderID, tenantID).Scan(&maxSequence)
+
+	sequence := maxSequence + 1
+	if input.Sequence != nil {
+		sequence = *input.Sequence
+	}
+
+	now := time.Now()
+	id := uuid.New()
+	code := fmt.Sprintf("WO-%s", id.String()[:8])
+
+	plannedDuration := 0.0
+	if input.PlannedDurationHrs != nil {
+		plannedDuration = *input.PlannedDurationHrs
+	}
+	setupTime := 0.0
+	if input.SetupTimeHrs != nil {
+		setupTime = *input.SetupTimeHrs
+	}
+
+	var scheduledStart, scheduledEnd *time.Time
+	if input.ScheduledStart != nil {
+		t, _ := time.Parse(time.RFC3339, *input.ScheduledStart)
+		scheduledStart = &t
+	}
+	if input.ScheduledEnd != nil {
+		t, _ := time.Parse(time.RFC3339, *input.ScheduledEnd)
+		scheduledEnd = &t
+	}
+
+	query := `
+		INSERT INTO work_orders (
+			id, tenant_id, production_order_id, code, name, sequence,
+			operation_id, work_center_id, quantity_to_produce, uom,
+			planned_duration_hours, setup_time_hours, scheduled_start, scheduled_end,
+			status, assigned_to, instructions, notes, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'pending', $15, $16, $17, $18, $19, $20)
+		RETURNING id
+	`
+
+	err := h.db.QueryRow(query,
+		id, tenantID, input.ProductionOrderID, code, input.Name, sequence,
+		input.OperationID, input.WorkCenterID, input.QuantityToProduce, input.UOM,
+		plannedDuration, setupTime, scheduledStart, scheduledEnd,
+		input.AssignedTo, input.Instructions, input.Notes, userID, now, now,
+	).Scan(&id)
+
+	if err != nil {
+		h.log.Error("Failed to create work order", "error", err)
+		response.InternalError(c, "Failed to create work order")
+		return
+	}
+
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: id.String()})
+	h.GetWorkOrder(c)
+}
+
+// StartWorkOrder starts a work order
+func (h *Handler) StartWorkOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	now := time.Now()
+	query := `
+		UPDATE work_orders
+		SET status = 'in_progress', actual_start = $1, started_by = $2, updated_at = $1
+		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL AND status IN ('pending', 'ready', 'paused')
+	`
+
+	result, err := h.db.Exec(query, now, userID, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to start work order", "error", err)
+		response.InternalError(c, "Failed to start work order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Work order not found or not in valid status")
+		return
+	}
+
+	h.GetWorkOrder(c)
+}
+
+// CompleteWorkOrder completes a work order
+func (h *Handler) CompleteWorkOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	var input struct {
+		QuantityProduced float64 `json:"quantity_produced"`
+		QuantityScrapped float64 `json:"quantity_scrapped"`
+		ActualDuration   float64 `json:"actual_duration_hours"`
+	}
+	c.ShouldBindJSON(&input)
+
+	now := time.Now()
+	query := `
+		UPDATE work_orders
+		SET status = 'completed', actual_end = $1, completed_by = $2, updated_at = $1, progress_percent = 100
+	`
+	args := []interface{}{now, userID}
+	argCount := 2
+
+	if input.QuantityProduced > 0 {
+		argCount++
+		query += fmt.Sprintf(", quantity_produced = $%d", argCount)
+		args = append(args, input.QuantityProduced)
+	}
+	if input.QuantityScrapped > 0 {
+		argCount++
+		query += fmt.Sprintf(", quantity_scrapped = $%d", argCount)
+		args = append(args, input.QuantityScrapped)
+	}
+	if input.ActualDuration > 0 {
+		argCount++
+		query += fmt.Sprintf(", actual_duration_hours = $%d", argCount)
+		args = append(args, input.ActualDuration)
+	}
+
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query += fmt.Sprintf(" WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status = 'in_progress'", argCount-1, argCount)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to complete work order", "error", err)
+		response.InternalError(c, "Failed to complete work order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Work order not found or not in progress")
+		return
+	}
+
+	h.GetWorkOrder(c)
+}
+
+// RecordWorkOrderTime records time spent on a work order
+func (h *Handler) RecordWorkOrderTime(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	workOrderID, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	var input struct {
+		StartTime     string  `json:"start_time" binding:"required"`
+		EndTime       string  `json:"end_time"`
+		DurationHours float64 `json:"duration_hours"`
+		LogType       string  `json:"log_type"`
+		Notes         string  `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	startTime, err := time.Parse(time.RFC3339, input.StartTime)
+	if err != nil {
+		response.BadRequest(c, "Invalid start time format")
+		return
+	}
+
+	var endTime *time.Time
+	var durationHours *float64
+	if input.EndTime != "" {
+		t, _ := time.Parse(time.RFC3339, input.EndTime)
+		endTime = &t
+		hours := t.Sub(startTime).Hours()
+		durationHours = &hours
+	} else if input.DurationHours > 0 {
+		durationHours = &input.DurationHours
+	}
+
+	logType := "work"
+	if input.LogType != "" {
+		logType = input.LogType
+	}
+
+	id := uuid.New()
+	query := `
+		INSERT INTO work_order_time_logs (
+			id, tenant_id, work_order_id, start_time, end_time, duration_hours,
+			log_type, worker_id, notes, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+	`
+
+	_, err = h.db.Exec(query, id, tenantID, workOrderID, startTime, endTime, durationHours, logType, userID, input.Notes)
+	if err != nil {
+		h.log.Error("Failed to record time log", "error", err)
+		response.InternalError(c, "Failed to record time")
+		return
+	}
+
+	// Update work order actual duration
+	if durationHours != nil {
+		updateQuery := `
+			UPDATE work_orders
+			SET actual_duration_hours = actual_duration_hours + $1, updated_at = NOW()
+			WHERE id = $2 AND tenant_id = $3
+		`
+		h.db.Exec(updateQuery, *durationHours, workOrderID, tenantID)
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":      id,
+		"message": "Time recorded successfully",
+	})
+}
+
+// =====================================================
+// QUALITY CHECK HANDLERS
+// =====================================================
+
+// ListQualityChecks returns all quality checks with filtering
+func (h *Handler) ListQualityChecks(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var filter entity.QualityCheckFilter
+	if err := c.ShouldBindQuery(&filter); err != nil {
+		response.BadRequest(c, "Invalid query parameters")
+		return
+	}
+
+	// Set defaults
+	if filter.Page <= 0 {
+		filter.Page = 1
+	}
+	if filter.Limit <= 0 || filter.Limit > 100 {
+		filter.Limit = 20
+	}
+	if filter.SortBy == "" {
+		filter.SortBy = "inspection_date"
+	}
+	if filter.SortOrder == "" {
+		filter.SortOrder = "desc"
+	}
+
+	baseQuery := `
+		SELECT qc.id, qc.code, qc.quality_control_point_id, qc.production_order_id, po.code as po_code,
+			   qc.work_order_id, wo.code as wo_code, qc.product_id, p.name as product_name, p.code as product_code,
+			   qc.lot_number, qc.inspection_date, qc.inspector_id, qc.inspector_name,
+			   qc.quantity_inspected, qc.quantity_passed, qc.quantity_failed, qc.result,
+			   qc.measured_value, qc.measurement_unit, qc.pass_rate, qc.defect_type, qc.defect_category,
+			   qc.action_taken, qc.notes, qc.failure_reason, qc.corrective_action, qc.attachments,
+			   qc.created_at, qc.updated_at
+		FROM quality_checks qc
+		LEFT JOIN production_orders po ON qc.production_order_id = po.id
+		LEFT JOIN work_orders wo ON qc.work_order_id = wo.id
+		LEFT JOIN products p ON qc.product_id = p.id
+		WHERE qc.tenant_id = $1 AND qc.deleted_at IS NULL
+	`
+
+	countQuery := `SELECT COUNT(*) FROM quality_checks qc WHERE qc.tenant_id = $1 AND qc.deleted_at IS NULL`
+	args := []interface{}{tenantID}
+	countArgs := []interface{}{tenantID}
+	argCount := 1
+
+	// Apply filters
+	if filter.ProductionOrderID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND qc.production_order_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND qc.production_order_id = $%d", argCount)
+		args = append(args, *filter.ProductionOrderID)
+		countArgs = append(countArgs, *filter.ProductionOrderID)
+	}
+
+	if filter.WorkOrderID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND qc.work_order_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND qc.work_order_id = $%d", argCount)
+		args = append(args, *filter.WorkOrderID)
+		countArgs = append(countArgs, *filter.WorkOrderID)
+	}
+
+	if filter.ProductID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND qc.product_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND qc.product_id = $%d", argCount)
+		args = append(args, *filter.ProductID)
+		countArgs = append(countArgs, *filter.ProductID)
+	}
+
+	if filter.Result != nil && *filter.Result != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND qc.result = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND qc.result = $%d", argCount)
+		args = append(args, *filter.Result)
+		countArgs = append(countArgs, *filter.Result)
+	}
+
+	if filter.DateFrom != nil && *filter.DateFrom != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND qc.inspection_date >= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND qc.inspection_date >= $%d", argCount)
+		args = append(args, *filter.DateFrom)
+		countArgs = append(countArgs, *filter.DateFrom)
+	}
+
+	if filter.DateTo != nil && *filter.DateTo != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND qc.inspection_date <= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND qc.inspection_date <= $%d", argCount)
+		args = append(args, *filter.DateTo)
+		countArgs = append(countArgs, *filter.DateTo)
+	}
+
+	// Get total count
+	var total int
+	err := h.db.QueryRow(countQuery, countArgs...).Scan(&total)
+	if err != nil {
+		h.log.Error("Failed to count quality checks", "error", err)
+		response.InternalError(c, "Failed to retrieve quality checks")
+		return
+	}
+
+	// Sorting and pagination
+	validSortColumns := map[string]string{
+		"inspection_date": "qc.inspection_date",
+		"result":          "qc.result",
+		"created_at":      "qc.created_at",
+	}
+	sortColumn := validSortColumns[filter.SortBy]
+	if sortColumn == "" {
+		sortColumn = "qc.inspection_date"
+	}
+	sortOrder := "ASC"
+	if strings.ToLower(filter.SortOrder) == "desc" {
+		sortOrder = "DESC"
+	}
+	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortColumn, sortOrder)
+
+	offset := (filter.Page - 1) * filter.Limit
+	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", filter.Limit, offset)
+
+	// Execute query
+	rows, err := h.db.Query(baseQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to list quality checks", "error", err)
+		response.InternalError(c, "Failed to retrieve quality checks")
+		return
+	}
+	defer rows.Close()
+
+	qualityChecks := []entity.QualityCheckResponse{}
+	for rows.Next() {
+		var qc entity.QualityCheckResponse
+		var poCode, woCode, productName, productCode sql.NullString
+		var passRate sql.NullFloat64
+		var attachments []byte
+
+		err := rows.Scan(
+			&qc.ID, &qc.Code, &qc.QualityControlPointID, &qc.ProductionOrderID, &poCode,
+			&qc.WorkOrderID, &woCode, &qc.ProductID, &productName, &productCode,
+			&qc.LotNumber, &qc.InspectionDate, &qc.InspectorID, &qc.InspectorName,
+			&qc.QuantityInspected, &qc.QuantityPassed, &qc.QuantityFailed, &qc.Result,
+			&qc.MeasuredValue, &qc.MeasurementUnit, &passRate, &qc.DefectType, &qc.DefectCategory,
+			&qc.ActionTaken, &qc.Notes, &qc.FailureReason, &qc.CorrectiveAction, &attachments,
+			&qc.CreatedAt, &qc.UpdatedAt,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan quality check", "error", err)
+			continue
+		}
+
+		if poCode.Valid {
+			qc.ProductionOrderCode = &poCode.String
+		}
+		if woCode.Valid {
+			qc.WorkOrderCode = &woCode.String
+		}
+		if productName.Valid {
+			qc.ProductName = &productName.String
+		}
+		if productCode.Valid {
+			qc.ProductCode = &productCode.String
+		}
+		if passRate.Valid {
+			qc.PassRate = passRate.Float64
+		} else if qc.QuantityInspected > 0 {
+			qc.PassRate = (qc.QuantityPassed / qc.QuantityInspected) * 100
+		}
+		qc.Attachments = []string{}
+
+		qualityChecks = append(qualityChecks, qc)
+	}
+
+	response.Paginated(c, qualityChecks, filter.Page, filter.Limit, total)
+}
+
+// GetQualityCheck returns a single quality check by ID
+func (h *Handler) GetQualityCheck(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid quality check ID")
+		return
+	}
+
+	query := `
+		SELECT qc.id, qc.code, qc.quality_control_point_id, qc.production_order_id, po.code as po_code,
+			   qc.work_order_id, wo.code as wo_code, qc.product_id, p.name as product_name, p.code as product_code,
+			   qc.lot_number, qc.inspection_date, qc.inspector_id, qc.inspector_name,
+			   qc.quantity_inspected, qc.quantity_passed, qc.quantity_failed, qc.result,
+			   qc.measured_value, qc.measurement_unit, qc.pass_rate, qc.defect_type, qc.defect_category,
+			   qc.action_taken, qc.notes, qc.failure_reason, qc.corrective_action, qc.attachments,
+			   qc.created_at, qc.updated_at
+		FROM quality_checks qc
+		LEFT JOIN production_orders po ON qc.production_order_id = po.id
+		LEFT JOIN work_orders wo ON qc.work_order_id = wo.id
+		LEFT JOIN products p ON qc.product_id = p.id
+		WHERE qc.id = $1 AND qc.tenant_id = $2 AND qc.deleted_at IS NULL
+	`
+
+	var qc entity.QualityCheckResponse
+	var poCode, woCode, productName, productCode sql.NullString
+	var passRate sql.NullFloat64
+	var attachments []byte
+
+	err = h.db.QueryRow(query, id, tenantID).Scan(
+		&qc.ID, &qc.Code, &qc.QualityControlPointID, &qc.ProductionOrderID, &poCode,
+		&qc.WorkOrderID, &woCode, &qc.ProductID, &productName, &productCode,
+		&qc.LotNumber, &qc.InspectionDate, &qc.InspectorID, &qc.InspectorName,
+		&qc.QuantityInspected, &qc.QuantityPassed, &qc.QuantityFailed, &qc.Result,
+		&qc.MeasuredValue, &qc.MeasurementUnit, &passRate, &qc.DefectType, &qc.DefectCategory,
+		&qc.ActionTaken, &qc.Notes, &qc.FailureReason, &qc.CorrectiveAction, &attachments,
+		&qc.CreatedAt, &qc.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Quality check not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get quality check", "error", err)
+		response.InternalError(c, "Failed to retrieve quality check")
+		return
+	}
+
+	if poCode.Valid {
+		qc.ProductionOrderCode = &poCode.String
+	}
+	if woCode.Valid {
+		qc.WorkOrderCode = &woCode.String
+	}
+	if productName.Valid {
+		qc.ProductName = &productName.String
+	}
+	if productCode.Valid {
+		qc.ProductCode = &productCode.String
+	}
+	if passRate.Valid {
+		qc.PassRate = passRate.Float64
+	} else if qc.QuantityInspected > 0 {
+		qc.PassRate = (qc.QuantityPassed / qc.QuantityInspected) * 100
+	}
+	qc.Attachments = []string{}
+
+	response.Success(c, qc)
+}
+
+// CreateQualityCheck creates a new quality check
+func (h *Handler) CreateQualityCheck(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.QualityCheckInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Calculate result and pass rate
+	result := "pending"
+	if input.Result != nil {
+		result = *input.Result
+	} else if input.QuantityFailed > 0 {
+		if input.QuantityPassed == 0 {
+			result = "failed"
+		} else {
+			result = "partial"
+		}
+	} else if input.QuantityPassed > 0 {
+		result = "passed"
+	}
+
+	passRate := 0.0
+	if input.QuantityInspected > 0 {
+		passRate = (input.QuantityPassed / input.QuantityInspected) * 100
+	}
+
+	now := time.Now()
+	inspectionDate := now
+	if input.InspectionDate != nil {
+		t, err := time.Parse(time.RFC3339, *input.InspectionDate)
+		if err == nil {
+			inspectionDate = t
+		}
+	}
+
+	id := uuid.New()
+	code := fmt.Sprintf("QC-%s", id.String()[:8])
+
+	// Get inspector name
+	var inspectorName *string
+	if userID != uuid.Nil {
+		var name string
+		h.db.QueryRow("SELECT first_name || ' ' || last_name FROM users WHERE id = $1", userID).Scan(&name)
+		if name != "" {
+			inspectorName = &name
+		}
+	}
+
+	query := `
+		INSERT INTO quality_checks (
+			id, tenant_id, code, quality_control_point_id, production_order_id, work_order_id,
+			product_id, lot_number, inspection_date, inspector_id, inspector_name,
+			quantity_inspected, quantity_passed, quantity_failed, result, measured_value,
+			measurement_unit, pass_rate, defect_type, defect_category, action_taken,
+			notes, failure_reason, corrective_action, attachments, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		RETURNING id
+	`
+
+	attachments := []byte("[]")
+
+	err := h.db.QueryRow(query,
+		id, tenantID, code, input.QualityControlPointID, input.ProductionOrderID, input.WorkOrderID,
+		input.ProductID, input.LotNumber, inspectionDate, userID, inspectorName,
+		input.QuantityInspected, input.QuantityPassed, input.QuantityFailed, result, input.MeasuredValue,
+		input.MeasurementUnit, passRate, input.DefectType, input.DefectCategory, input.ActionTaken,
+		input.Notes, input.FailureReason, input.CorrectiveAction, attachments, now, now,
+	).Scan(&id)
+
+	if err != nil {
+		h.log.Error("Failed to create quality check", "error", err)
+		response.InternalError(c, "Failed to create quality check")
+		return
+	}
+
+	// If linked to production order and failed, update quality status
+	if input.ProductionOrderID != nil && result == "failed" {
+		h.db.Exec(
+			"UPDATE production_orders SET quality_status = 'failed', updated_at = NOW() WHERE id = $1 AND tenant_id = $2",
+			*input.ProductionOrderID, tenantID,
+		)
+	} else if input.ProductionOrderID != nil && result == "passed" {
+		h.db.Exec(
+			"UPDATE production_orders SET quality_status = 'passed', updated_at = NOW() WHERE id = $1 AND tenant_id = $2 AND (quality_status IS NULL OR quality_status = 'pending')",
+			*input.ProductionOrderID, tenantID,
+		)
+	}
+
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: id.String()})
+	h.GetQualityCheck(c)
+}
+
+// GetQualityStats returns quality statistics
+func (h *Handler) GetQualityStats(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	dateFrom := c.Query("date_from")
+	dateTo := c.Query("date_to")
+
+	query := `
+		SELECT
+			COUNT(*) as total_checks,
+			COUNT(*) FILTER (WHERE result = 'passed') as passed,
+			COUNT(*) FILTER (WHERE result = 'failed') as failed,
+			COUNT(*) FILTER (WHERE result = 'partial') as partial,
+			COALESCE(SUM(quantity_inspected), 0) as total_inspected,
+			COALESCE(SUM(quantity_passed), 0) as total_passed,
+			COALESCE(SUM(quantity_failed), 0) as total_failed,
+			COALESCE(AVG(pass_rate), 0) as avg_pass_rate
+		FROM quality_checks
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`
+
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if dateFrom != "" {
+		argCount++
+		query += fmt.Sprintf(" AND inspection_date >= $%d", argCount)
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		argCount++
+		query += fmt.Sprintf(" AND inspection_date <= $%d", argCount)
+		args = append(args, dateTo)
+	}
+
+	var stats struct {
+		TotalChecks     int     `json:"total_checks"`
+		Passed          int     `json:"passed"`
+		Failed          int     `json:"failed"`
+		Partial         int     `json:"partial"`
+		TotalInspected  float64 `json:"total_inspected"`
+		TotalPassed     float64 `json:"total_passed"`
+		TotalFailed     float64 `json:"total_failed"`
+		AveragePassRate float64 `json:"average_pass_rate"`
+	}
+
+	err := h.db.QueryRow(query, args...).Scan(
+		&stats.TotalChecks, &stats.Passed, &stats.Failed, &stats.Partial,
+		&stats.TotalInspected, &stats.TotalPassed, &stats.TotalFailed, &stats.AveragePassRate,
+	)
+	if err != nil {
+		h.log.Error("Failed to get quality stats", "error", err)
+		response.InternalError(c, "Failed to retrieve quality statistics")
+		return
+	}
+
+	// Get top defects
+	defectsQuery := `
+		SELECT defect_type, COUNT(*) as count
+		FROM quality_checks
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND defect_type IS NOT NULL
+		GROUP BY defect_type
+		ORDER BY count DESC
+		LIMIT 5
+	`
+	rows, _ := h.db.Query(defectsQuery, tenantID)
+	defer rows.Close()
+
+	topDefects := []map[string]interface{}{}
+	for rows.Next() {
+		var defectType string
+		var count int
+		rows.Scan(&defectType, &count)
+		topDefects = append(topDefects, map[string]interface{}{
+			"defect_type": defectType,
+			"count":       count,
+		})
+	}
+
+	response.Success(c, map[string]interface{}{
+		"summary":     stats,
+		"top_defects": topDefects,
+	})
+}
+
+// ListQualityDefects returns all quality defect types
+func (h *Handler) ListQualityDefects(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	query := `
+		SELECT id, code, name, description, category, severity, default_action, is_active, created_at, updated_at
+		FROM quality_defects
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		ORDER BY name ASC
+	`
+
+	rows, err := h.db.Query(query, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list quality defects", "error", err)
+		response.InternalError(c, "Failed to retrieve quality defects")
+		return
+	}
+	defer rows.Close()
+
+	defects := []entity.QualityDefect{}
+	for rows.Next() {
+		var d entity.QualityDefect
+		err := rows.Scan(&d.ID, &d.Code, &d.Name, &d.Description, &d.Category, &d.Severity, &d.DefaultAction, &d.IsActive, &d.CreatedAt, &d.UpdatedAt)
+		if err != nil {
+			continue
+		}
+		d.TenantID = tenantID
+		defects = append(defects, d)
+	}
+
+	response.Success(c, defects)
+}
+
+// CreateQualityDefect creates a new quality defect type
+func (h *Handler) CreateQualityDefect(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var input entity.QualityDefectInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	severity := "minor"
+	if input.Severity != nil {
+		severity = *input.Severity
+	}
+	defaultAction := "rework"
+	if input.DefaultAction != nil {
+		defaultAction = *input.DefaultAction
+	}
+	isActive := true
+	if input.IsActive != nil {
+		isActive = *input.IsActive
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	query := `
+		INSERT INTO quality_defects (id, tenant_id, code, name, description, category, severity, default_action, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`
+
+	_, err := h.db.Exec(query, id, tenantID, input.Code, input.Name, input.Description, input.Category, severity, defaultAction, isActive, now, now)
+	if err != nil {
+		h.log.Error("Failed to create quality defect", "error", err)
+		if strings.Contains(err.Error(), "unique") {
+			response.BadRequest(c, "Defect code already exists")
+			return
+		}
+		response.InternalError(c, "Failed to create quality defect")
+		return
+	}
+
+	response.Created(c, entity.QualityDefect{
+		ID:            id,
+		TenantID:      tenantID,
+		Code:          input.Code,
+		Name:          input.Name,
+		Description:   input.Description,
+		Category:      input.Category,
+		Severity:      severity,
+		DefaultAction: defaultAction,
+		IsActive:      isActive,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	})
+}

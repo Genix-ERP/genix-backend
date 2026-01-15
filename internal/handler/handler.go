@@ -455,6 +455,64 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		files.GET("/:id", h.GetFile)
 		files.DELETE("/:id", h.DeleteFile)
 	}
+
+	// =====================================================
+	// MANUFACTURING MODULE ROUTES
+	// =====================================================
+
+	// Work Centers
+	workCenters := rg.Group("/work-centers")
+	workCenters.Use(middleware.RequirePermission("manufacturing", "work_centers", "read"))
+	{
+		workCenters.GET("", h.ListWorkCenters)
+		workCenters.POST("", middleware.RequirePermission("manufacturing", "work_centers", "create"), h.CreateWorkCenter)
+		workCenters.GET("/:id", h.GetWorkCenter)
+		workCenters.PUT("/:id", middleware.RequirePermission("manufacturing", "work_centers", "update"), h.UpdateWorkCenter)
+		workCenters.DELETE("/:id", middleware.RequirePermission("manufacturing", "work_centers", "delete"), h.DeleteWorkCenter)
+	}
+
+	// Production Orders
+	productionOrders := rg.Group("/production-orders")
+	productionOrders.Use(middleware.RequirePermission("manufacturing", "production_orders", "read"))
+	{
+		productionOrders.GET("", h.ListProductionOrders)
+		productionOrders.POST("", middleware.RequirePermission("manufacturing", "production_orders", "create"), h.CreateProductionOrder)
+		productionOrders.GET("/schedule", h.GetProductionSchedule)
+		productionOrders.GET("/stats", h.GetManufacturingStats)
+		productionOrders.GET("/:id", h.GetProductionOrder)
+		productionOrders.PUT("/:id", middleware.RequirePermission("manufacturing", "production_orders", "update"), h.UpdateProductionOrder)
+		productionOrders.DELETE("/:id", middleware.RequirePermission("manufacturing", "production_orders", "delete"), h.DeleteProductionOrder)
+		productionOrders.POST("/:id/confirm", middleware.RequirePermission("manufacturing", "production_orders", "approve"), h.ConfirmProductionOrder)
+		productionOrders.POST("/:id/start", h.StartProductionOrder)
+		productionOrders.POST("/:id/pause", h.PauseProductionOrder)
+		productionOrders.POST("/:id/complete", h.CompleteProductionOrder)
+		productionOrders.POST("/:id/cancel", h.CancelProductionOrder)
+		productionOrders.POST("/:id/record-production", h.RecordProduction)
+	}
+
+	// Work Orders
+	workOrders := rg.Group("/work-orders")
+	workOrders.Use(middleware.RequirePermission("manufacturing", "work_orders", "read"))
+	{
+		workOrders.GET("", h.ListWorkOrders)
+		workOrders.POST("", middleware.RequirePermission("manufacturing", "work_orders", "create"), h.CreateWorkOrder)
+		workOrders.GET("/:id", h.GetWorkOrder)
+		workOrders.POST("/:id/start", h.StartWorkOrder)
+		workOrders.POST("/:id/complete", h.CompleteWorkOrder)
+		workOrders.POST("/:id/time", h.RecordWorkOrderTime)
+	}
+
+	// Quality Control
+	qualityChecks := rg.Group("/quality-checks")
+	qualityChecks.Use(middleware.RequirePermission("manufacturing", "quality_checks", "read"))
+	{
+		qualityChecks.GET("", h.ListQualityChecks)
+		qualityChecks.POST("", middleware.RequirePermission("manufacturing", "quality_checks", "create"), h.CreateQualityCheck)
+		qualityChecks.GET("/stats", h.GetQualityStats)
+		qualityChecks.GET("/defects", h.ListQualityDefects)
+		qualityChecks.POST("/defects", middleware.RequirePermission("manufacturing", "quality_checks", "create"), h.CreateQualityDefect)
+		qualityChecks.GET("/:id", h.GetQualityCheck)
+	}
 }
 
 // GetAPIInfo returns API information
