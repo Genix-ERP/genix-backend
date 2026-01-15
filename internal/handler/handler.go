@@ -262,6 +262,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		bom.DELETE("/:id/lines/:lineId", middleware.RequirePermission("inventory", "bom", "update"), h.DeleteBOMLine)
 	}
 
+	// Alias route for /boms (plural) - frontend compatibility
+	boms := rg.Group("/boms")
+	boms.Use(middleware.RequirePermission("inventory", "bom", "read"))
+	{
+		boms.GET("", h.ListBOMs)
+		boms.POST("", middleware.RequirePermission("inventory", "bom", "create"), h.CreateBOM)
+		boms.GET("/:id", h.GetBOM)
+		boms.PUT("/:id", middleware.RequirePermission("inventory", "bom", "update"), h.UpdateBOM)
+		boms.DELETE("/:id", middleware.RequirePermission("inventory", "bom", "delete"), h.DeleteBOM)
+	}
+
 	// Scrap Management
 	scrap := rg.Group("/scrap")
 	scrap.Use(middleware.RequirePermission("inventory", "scrap", "read"))
@@ -584,6 +595,100 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		qualityChecks.GET("/defects", h.ListQualityDefects)
 		qualityChecks.POST("/defects", middleware.RequirePermission("manufacturing", "quality_checks", "create"), h.CreateQualityDefect)
 		qualityChecks.GET("/:id", h.GetQualityCheck)
+	}
+
+	// =====================================================
+	// ERP EXTENSIONS MODULE ROUTES
+	// =====================================================
+
+	// Contracts
+	contracts := rg.Group("/contracts")
+	contracts.Use(middleware.RequirePermission("procurement", "contract", "read"))
+	{
+		contracts.GET("", h.ListContracts)
+		contracts.POST("", middleware.RequirePermission("procurement", "contract", "create"), h.CreateContract)
+		contracts.GET("/:id", h.GetContract)
+		contracts.PUT("/:id", middleware.RequirePermission("procurement", "contract", "update"), h.UpdateContract)
+		contracts.DELETE("/:id", middleware.RequirePermission("procurement", "contract", "delete"), h.DeleteContract)
+	}
+
+	// Payroll Periods
+	payrollPeriods := rg.Group("/payroll-periods")
+	payrollPeriods.Use(middleware.RequirePermission("hr", "payroll", "read"))
+	{
+		payrollPeriods.GET("", h.ListPayrollPeriods)
+		payrollPeriods.POST("", middleware.RequirePermission("hr", "payroll", "create"), h.CreatePayrollPeriod)
+		payrollPeriods.GET("/:id", h.GetPayrollPeriod)
+		payrollPeriods.PUT("/:id", middleware.RequirePermission("hr", "payroll", "update"), h.UpdatePayrollPeriod)
+		payrollPeriods.DELETE("/:id", middleware.RequirePermission("hr", "payroll", "delete"), h.DeletePayrollPeriod)
+		payrollPeriods.POST("/:id/process", middleware.RequirePermission("hr", "payroll", "approve"), h.ProcessPayroll)
+		payrollPeriods.GET("/:id/entries", h.ListPayrollEntries)
+		payrollPeriods.POST("/:id/entries", middleware.RequirePermission("hr", "payroll", "create"), h.CreatePayrollEntry)
+	}
+
+	// Expense Categories
+	expenseCategories := rg.Group("/expense-categories")
+	{
+		expenseCategories.GET("", h.ListExpenseCategories)
+	}
+
+	// Expenses
+	expenses := rg.Group("/expenses")
+	expenses.Use(middleware.RequirePermission("finance", "expense", "read"))
+	{
+		expenses.GET("", h.ListExpenses)
+		expenses.POST("", middleware.RequirePermission("finance", "expense", "create"), h.CreateExpense)
+		expenses.GET("/:id", h.GetExpense)
+		expenses.PUT("/:id", middleware.RequirePermission("finance", "expense", "update"), h.UpdateExpense)
+		expenses.DELETE("/:id", middleware.RequirePermission("finance", "expense", "delete"), h.DeleteExpense)
+		expenses.POST("/:id/approve", middleware.RequirePermission("finance", "expense", "approve"), h.ApproveExpense)
+	}
+
+	// Asset Categories
+	assetCategories := rg.Group("/asset-categories")
+	{
+		assetCategories.GET("", h.ListAssetCategories)
+	}
+
+	// Fixed Assets
+	fixedAssets := rg.Group("/fixed-assets")
+	fixedAssets.Use(middleware.RequirePermission("finance", "asset", "read"))
+	{
+		fixedAssets.GET("", h.ListFixedAssets)
+		fixedAssets.POST("", middleware.RequirePermission("finance", "asset", "create"), h.CreateFixedAsset)
+		fixedAssets.GET("/:id", h.GetFixedAsset)
+		fixedAssets.PUT("/:id", middleware.RequirePermission("finance", "asset", "update"), h.UpdateFixedAsset)
+		fixedAssets.DELETE("/:id", middleware.RequirePermission("finance", "asset", "delete"), h.DeleteFixedAsset)
+		fixedAssets.POST("/:id/dispose", middleware.RequirePermission("finance", "asset", "approve"), h.DisposeFixedAsset)
+		fixedAssets.GET("/:id/depreciation", h.GetDepreciationEntries)
+	}
+
+	// Run Depreciation (batch operation)
+	rg.POST("/run-depreciation", middleware.RequirePermission("finance", "asset", "approve"), h.RunDepreciation)
+
+	// Projects
+	projects := rg.Group("/projects")
+	projects.Use(middleware.RequirePermission("projects", "project", "read"))
+	{
+		projects.GET("", h.ListProjects)
+		projects.POST("", middleware.RequirePermission("projects", "project", "create"), h.CreateProject)
+		projects.GET("/:id", h.GetProject)
+		projects.PUT("/:id", middleware.RequirePermission("projects", "project", "update"), h.UpdateProject)
+		projects.DELETE("/:id", middleware.RequirePermission("projects", "project", "delete"), h.DeleteProject)
+
+		// Project Tasks
+		projects.GET("/:id/tasks", h.ListProjectTasks)
+		projects.POST("/:id/tasks", middleware.RequirePermission("projects", "task", "create"), h.CreateProjectTask)
+		projects.PUT("/:id/tasks/:taskId", middleware.RequirePermission("projects", "task", "update"), h.UpdateProjectTask)
+		projects.DELETE("/:id/tasks/:taskId", middleware.RequirePermission("projects", "task", "delete"), h.DeleteProjectTask)
+
+		// Project Milestones
+		projects.GET("/:id/milestones", h.ListProjectMilestones)
+		projects.POST("/:id/milestones", middleware.RequirePermission("projects", "milestone", "create"), h.CreateProjectMilestone)
+
+		// Time Entries
+		projects.GET("/:id/time-entries", h.ListTimeEntries)
+		projects.POST("/:id/time-entries", middleware.RequirePermission("projects", "time_entry", "create"), h.CreateTimeEntry)
 	}
 }
 

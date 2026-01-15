@@ -63,6 +63,29 @@ func SuccessWithPagination(c *gin.Context, data interface{}, pagination *entity.
 	SuccessWithMeta(c, data, pagination)
 }
 
+// Paginated sends a successful response with pagination metadata from individual values
+func Paginated(c *gin.Context, data interface{}, page, limit, total int) {
+	totalPages := total / limit
+	if total%limit > 0 {
+		totalPages++
+	}
+
+	meta := &Meta{
+		Page:       page,
+		Limit:      limit,
+		Total:      total,
+		TotalPages: totalPages,
+		HasNext:    page < totalPages,
+		HasPrev:    page > 1,
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Data:    data,
+		Meta:    meta,
+	})
+}
+
 // InternalError sends a 500 Internal Server Error response
 func InternalError(c *gin.Context, message string) {
 	InternalServerError(c, message)
