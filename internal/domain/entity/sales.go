@@ -223,6 +223,8 @@ type UpdateSalesOrderInput struct {
 	InternalNotes   *string  `json:"internal_notes,omitempty"`
 	WarehouseID     *string  `json:"warehouse_id,omitempty"`
 	SalesRepID      *string  `json:"sales_rep_id,omitempty"`
+	Status          *string  `json:"status,omitempty"`
+	PaymentStatus   *string  `json:"payment_status,omitempty"`
 }
 
 // SalesOrderListFilter represents filters for listing sales orders
