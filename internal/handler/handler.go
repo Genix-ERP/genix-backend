@@ -328,6 +328,78 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseOrders.POST("/:id/receive", h.ReceivePurchaseOrder)
 	}
 
+	// Request for Quotations (RFQ)
+	rfqs := rg.Group("/rfqs")
+	rfqs.Use(middleware.RequirePermission("purchase", "rfq", "read"))
+	{
+		rfqs.GET("", h.ListRFQs)
+		rfqs.POST("", middleware.RequirePermission("purchase", "rfq", "create"), h.CreateRFQ)
+		rfqs.GET("/:id", h.GetRFQ)
+		rfqs.PUT("/:id", middleware.RequirePermission("purchase", "rfq", "update"), h.UpdateRFQ)
+		rfqs.DELETE("/:id", middleware.RequirePermission("purchase", "rfq", "delete"), h.DeleteRFQ)
+		rfqs.POST("/:id/open", middleware.RequirePermission("purchase", "rfq", "update"), h.OpenRFQ)
+		rfqs.POST("/:id/responses", h.SubmitRFQResponse)
+		rfqs.POST("/:id/select-winner", middleware.RequirePermission("purchase", "rfq", "update"), h.SelectRFQWinner)
+	}
+
+	// Procurement Contracts
+	contracts := rg.Group("/contracts")
+	contracts.Use(middleware.RequirePermission("purchase", "contract", "read"))
+	{
+		contracts.GET("", h.ListContracts)
+		contracts.POST("", middleware.RequirePermission("purchase", "contract", "create"), h.CreateContract)
+		contracts.GET("/:id", h.GetContract)
+		contracts.PUT("/:id", middleware.RequirePermission("purchase", "contract", "update"), h.UpdateContract)
+		contracts.DELETE("/:id", middleware.RequirePermission("purchase", "contract", "delete"), h.DeleteContract)
+		contracts.POST("/:id/activate", middleware.RequirePermission("purchase", "contract", "update"), h.ActivateContract)
+		contracts.POST("/:id/terminate", middleware.RequirePermission("purchase", "contract", "update"), h.TerminateContract)
+	}
+
+	// Purchase Requisitions
+	requisitions := rg.Group("/purchase-requisitions")
+	requisitions.Use(middleware.RequirePermission("purchase", "requisition", "read"))
+	{
+		requisitions.GET("", h.ListPurchaseRequisitions)
+		requisitions.POST("", middleware.RequirePermission("purchase", "requisition", "create"), h.CreatePurchaseRequisition)
+		requisitions.GET("/:id", h.GetPurchaseRequisition)
+		requisitions.PUT("/:id", middleware.RequirePermission("purchase", "requisition", "update"), h.UpdatePurchaseRequisition)
+		requisitions.DELETE("/:id", middleware.RequirePermission("purchase", "requisition", "delete"), h.DeletePurchaseRequisition)
+		requisitions.POST("/:id/submit", middleware.RequirePermission("purchase", "requisition", "update"), h.SubmitPurchaseRequisition)
+		requisitions.POST("/:id/approve", middleware.RequirePermission("purchase", "requisition", "approve"), h.ApprovePurchaseRequisition)
+		requisitions.POST("/:id/reject", middleware.RequirePermission("purchase", "requisition", "approve"), h.RejectPurchaseRequisition)
+		requisitions.POST("/:id/convert-to-po", middleware.RequirePermission("purchase", "order", "create"), h.ConvertPRToPO)
+	}
+
+	// Goods Receipts
+	goodsReceipts := rg.Group("/goods-receipts")
+	goodsReceipts.Use(middleware.RequirePermission("purchase", "receipt", "read"))
+	{
+		goodsReceipts.GET("", h.ListGoodsReceipts)
+		goodsReceipts.POST("", middleware.RequirePermission("purchase", "receipt", "create"), h.CreateGoodsReceipt)
+		goodsReceipts.GET("/:id", h.GetGoodsReceipt)
+		goodsReceipts.DELETE("/:id", middleware.RequirePermission("purchase", "receipt", "delete"), h.DeleteGoodsReceipt)
+		goodsReceipts.POST("/:id/inspect", middleware.RequirePermission("purchase", "receipt", "update"), h.InspectGoodsReceipt)
+		goodsReceipts.POST("/:id/complete", middleware.RequirePermission("purchase", "receipt", "update"), h.CompleteGoodsReceipt)
+		goodsReceipts.POST("/:id/cancel", middleware.RequirePermission("purchase", "receipt", "update"), h.CancelGoodsReceipt)
+	}
+
+	// Purchase Returns
+	purchaseReturns := rg.Group("/purchase-returns")
+	purchaseReturns.Use(middleware.RequirePermission("purchase", "return", "read"))
+	{
+		purchaseReturns.GET("", h.ListPurchaseReturns)
+		purchaseReturns.POST("", middleware.RequirePermission("purchase", "return", "create"), h.CreatePurchaseReturn)
+		purchaseReturns.GET("/:id", h.GetPurchaseReturn)
+		purchaseReturns.DELETE("/:id", middleware.RequirePermission("purchase", "return", "delete"), h.DeletePurchaseReturn)
+		purchaseReturns.POST("/:id/submit", middleware.RequirePermission("purchase", "return", "update"), h.SubmitPurchaseReturn)
+		purchaseReturns.POST("/:id/approve", middleware.RequirePermission("purchase", "return", "approve"), h.ApprovePurchaseReturn)
+		purchaseReturns.POST("/:id/reject", middleware.RequirePermission("purchase", "return", "approve"), h.RejectPurchaseReturn)
+		purchaseReturns.POST("/:id/ship", middleware.RequirePermission("purchase", "return", "update"), h.ShipPurchaseReturn)
+		purchaseReturns.POST("/:id/receive", middleware.RequirePermission("purchase", "return", "update"), h.ReceivePurchaseReturn)
+		purchaseReturns.POST("/:id/credit", middleware.RequirePermission("purchase", "return", "update"), h.ApplyCreditNote)
+		purchaseReturns.POST("/:id/cancel", middleware.RequirePermission("purchase", "return", "update"), h.CancelPurchaseReturn)
+	}
+
 	// Chart of Accounts
 	accounts := rg.Group("/accounts")
 	accounts.Use(middleware.RequirePermission("finance", "account", "read"))

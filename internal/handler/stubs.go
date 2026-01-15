@@ -78,18 +78,7 @@ func (h *Handler) SendInvoice(c *gin.Context)        { response.Success(c, gin.H
 func (h *Handler) RecordPayment(c *gin.Context)      { response.Success(c, gin.H{"message": "Payment recorded"}) }
 
 // ========== PURCHASE ORDERS ==========
-
-func (h *Handler) ListPurchaseOrders(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreatePurchaseOrder(c *gin.Context) { response.Created(c, gin.H{"message": "Purchase order created"}) }
-func (h *Handler) GetPurchaseOrder(c *gin.Context)    { response.NotFound(c, "Purchase order") }
-func (h *Handler) UpdatePurchaseOrder(c *gin.Context) { response.Success(c, gin.H{"message": "Purchase order updated"}) }
-func (h *Handler) DeletePurchaseOrder(c *gin.Context) { response.NoContent(c) }
-func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Purchase order approved"})
-}
-func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Purchase order received"})
-}
+// Purchase order handlers are implemented in purchase_orders.go
 
 // ========== CHART OF ACCOUNTS ==========
 // Account handlers are implemented in finance.go
