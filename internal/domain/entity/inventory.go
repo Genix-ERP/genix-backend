@@ -550,3 +550,418 @@ type ResolveAlertInput struct {
 	ResolutionNotes      string `json:"resolution_notes,omitempty"`
 	RelatedPurchaseOrderID string `json:"related_purchase_order_id,omitempty"`
 }
+
+// =====================================================
+// BILL OF MATERIALS (BOM)
+// =====================================================
+
+// BOMType represents the type of BOM
+type BOMType string
+
+const (
+	BOMTypeManufacturing BOMType = "manufacturing"
+	BOMTypeKit           BOMType = "kit"
+	BOMTypePhantom       BOMType = "phantom"
+)
+
+// ProductBOM represents a Bill of Materials header
+type ProductBOM struct {
+	ID            uuid.UUID  `json:"id" db:"id"`
+	TenantID      uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Code          string     `json:"code" db:"code"`
+	Name          string     `json:"name" db:"name"`
+	ProductID     uuid.UUID  `json:"product_id" db:"product_id"`
+	BOMType       BOMType    `json:"bom_type" db:"bom_type"`
+	Quantity      float64    `json:"quantity" db:"quantity"`
+	Version       int        `json:"version" db:"version"`
+	IsActive      bool       `json:"is_active" db:"is_active"`
+	IsDefault     bool       `json:"is_default" db:"is_default"`
+	EffectiveDate *time.Time `json:"effective_date,omitempty" db:"effective_date"`
+	ExpiryDate    *time.Time `json:"expiry_date,omitempty" db:"expiry_date"`
+	Notes         *string    `json:"notes,omitempty" db:"notes"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
+	DeletedAt     *time.Time `json:"-" db:"deleted_at"`
+
+	// Relationships
+	Product    *Product       `json:"product,omitempty"`
+	Lines      []BOMLine      `json:"lines,omitempty"`
+	Operations []BOMOperation `json:"operations,omitempty"`
+}
+
+// BOMLine represents a component in a BOM
+type BOMLine struct {
+	ID                   uuid.UUID  `json:"id" db:"id"`
+	BOMID                uuid.UUID  `json:"bom_id" db:"bom_id"`
+	LineNumber           int        `json:"line_number" db:"line_number"`
+	ComponentID          uuid.UUID  `json:"component_id" db:"component_id"`
+	Quantity             float64    `json:"quantity" db:"quantity"`
+	UnitID               *uuid.UUID `json:"unit_id,omitempty" db:"unit_id"`
+	UnitOfMeasure        string     `json:"unit_of_measure" db:"unit_of_measure"`
+	ScrapPercent         float64    `json:"scrap_percent" db:"scrap_percent"`
+	IsOptional           bool       `json:"is_optional" db:"is_optional"`
+	SubstituteComponentID *uuid.UUID `json:"substitute_component_id,omitempty" db:"substitute_component_id"`
+	OperationSequence    int        `json:"operation_sequence" db:"operation_sequence"`
+	Notes                *string    `json:"notes,omitempty" db:"notes"`
+	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at" db:"updated_at"`
+
+	// Relationships
+	Component           *Product `json:"component,omitempty"`
+	SubstituteComponent *Product `json:"substitute_component,omitempty"`
+}
+
+// BOMOperation represents a manufacturing operation in a BOM
+type BOMOperation struct {
+	ID               uuid.UUID `json:"id" db:"id"`
+	BOMID            uuid.UUID `json:"bom_id" db:"bom_id"`
+	Sequence         int       `json:"sequence" db:"sequence"`
+	OperationName    string    `json:"operation_name" db:"operation_name"`
+	WorkCenter       *string   `json:"work_center,omitempty" db:"work_center"`
+	SetupTimeMinutes float64   `json:"setup_time_minutes" db:"setup_time_minutes"`
+	RunTimeMinutes   float64   `json:"run_time_minutes" db:"run_time_minutes"`
+	LaborCost        float64   `json:"labor_cost" db:"labor_cost"`
+	OverheadCost     float64   `json:"overhead_cost" db:"overhead_cost"`
+	Notes            *string   `json:"notes,omitempty" db:"notes"`
+	CreatedAt        time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// CreateBOMInput represents input for creating a BOM
+type CreateBOMInput struct {
+	Code          string              `json:"code" binding:"required,min=1,max=50"`
+	Name          string              `json:"name" binding:"required,min=1,max=255"`
+	ProductID     string              `json:"product_id" binding:"required"`
+	BOMType       string              `json:"bom_type,omitempty"`
+	Quantity      float64             `json:"quantity,omitempty"`
+	IsDefault     bool                `json:"is_default,omitempty"`
+	EffectiveDate string              `json:"effective_date,omitempty"`
+	ExpiryDate    string              `json:"expiry_date,omitempty"`
+	Notes         string              `json:"notes,omitempty"`
+	Lines         []CreateBOMLineInput `json:"lines,omitempty"`
+}
+
+// UpdateBOMInput represents input for updating a BOM
+type UpdateBOMInput struct {
+	Name          *string `json:"name,omitempty"`
+	BOMType       *string `json:"bom_type,omitempty"`
+	Quantity      *float64 `json:"quantity,omitempty"`
+	IsActive      *bool   `json:"is_active,omitempty"`
+	IsDefault     *bool   `json:"is_default,omitempty"`
+	EffectiveDate *string `json:"effective_date,omitempty"`
+	ExpiryDate    *string `json:"expiry_date,omitempty"`
+	Notes         *string `json:"notes,omitempty"`
+}
+
+// CreateBOMLineInput represents input for creating a BOM line
+type CreateBOMLineInput struct {
+	ComponentID          string  `json:"component_id" binding:"required"`
+	Quantity             float64 `json:"quantity" binding:"required,gt=0"`
+	UnitOfMeasure        string  `json:"unit_of_measure,omitempty"`
+	ScrapPercent         float64 `json:"scrap_percent,omitempty"`
+	IsOptional           bool    `json:"is_optional,omitempty"`
+	SubstituteComponentID string  `json:"substitute_component_id,omitempty"`
+	OperationSequence    int     `json:"operation_sequence,omitempty"`
+	Notes                string  `json:"notes,omitempty"`
+}
+
+// UpdateBOMLineInput represents input for updating a BOM line
+type UpdateBOMLineInput struct {
+	Quantity             *float64 `json:"quantity,omitempty"`
+	UnitOfMeasure        *string  `json:"unit_of_measure,omitempty"`
+	ScrapPercent         *float64 `json:"scrap_percent,omitempty"`
+	IsOptional           *bool    `json:"is_optional,omitempty"`
+	SubstituteComponentID *string  `json:"substitute_component_id,omitempty"`
+	OperationSequence    *int     `json:"operation_sequence,omitempty"`
+	Notes                *string  `json:"notes,omitempty"`
+}
+
+// BOMListFilter represents filters for listing BOMs
+type BOMListFilter struct {
+	Search    string `form:"search"`
+	ProductID string `form:"product_id"`
+	BOMType   string `form:"bom_type"`
+	IsActive  *bool  `form:"is_active"`
+}
+
+// BOMResponse represents the API response for a BOM
+type BOMResponse struct {
+	ID            uuid.UUID           `json:"id"`
+	Code          string              `json:"code"`
+	Name          string              `json:"name"`
+	ProductID     uuid.UUID           `json:"product_id"`
+	ProductCode   string              `json:"product_code,omitempty"`
+	ProductName   string              `json:"product_name,omitempty"`
+	BOMType       string              `json:"bom_type"`
+	Quantity      float64             `json:"quantity"`
+	Version       int                 `json:"version"`
+	IsActive      bool                `json:"is_active"`
+	IsDefault     bool                `json:"is_default"`
+	EffectiveDate *string             `json:"effective_date,omitempty"`
+	ExpiryDate    *string             `json:"expiry_date,omitempty"`
+	TotalCost     float64             `json:"total_cost"`
+	Lines         []BOMLineResponse   `json:"lines,omitempty"`
+	CreatedAt     time.Time           `json:"created_at"`
+}
+
+// BOMLineResponse represents the API response for a BOM line
+type BOMLineResponse struct {
+	ID               uuid.UUID `json:"id"`
+	LineNumber       int       `json:"line_number"`
+	ComponentID      uuid.UUID `json:"component_id"`
+	ComponentCode    string    `json:"component_code,omitempty"`
+	ComponentName    string    `json:"component_name,omitempty"`
+	Quantity         float64   `json:"quantity"`
+	UnitOfMeasure    string    `json:"unit_of_measure"`
+	ScrapPercent     float64   `json:"scrap_percent"`
+	IsOptional       bool      `json:"is_optional"`
+	UnitCost         float64   `json:"unit_cost"`
+	TotalCost        float64   `json:"total_cost"`
+}
+
+// =====================================================
+// SCRAP MANAGEMENT
+// =====================================================
+
+// ScrapReason represents a predefined scrap reason
+type ScrapReason struct {
+	ID               uuid.UUID  `json:"id" db:"id"`
+	TenantID         uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Code             string     `json:"code" db:"code"`
+	Name             string     `json:"name" db:"name"`
+	Description      *string    `json:"description,omitempty" db:"description"`
+	IsActive         bool       `json:"is_active" db:"is_active"`
+	RequiresApproval bool       `json:"requires_approval" db:"requires_approval"`
+	AccountID        *uuid.UUID `json:"account_id,omitempty" db:"account_id"`
+	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// ScrapOrderStatus represents the status of a scrap order
+type ScrapOrderStatus string
+
+const (
+	ScrapOrderStatusDraft           ScrapOrderStatus = "draft"
+	ScrapOrderStatusPendingApproval ScrapOrderStatus = "pending_approval"
+	ScrapOrderStatusApproved        ScrapOrderStatus = "approved"
+	ScrapOrderStatusCompleted       ScrapOrderStatus = "completed"
+	ScrapOrderStatusCancelled       ScrapOrderStatus = "cancelled"
+)
+
+// ScrapOrder represents a scrap/write-off order
+type ScrapOrder struct {
+	ID                     uuid.UUID        `json:"id" db:"id"`
+	TenantID               uuid.UUID        `json:"tenant_id" db:"tenant_id"`
+	ScrapNumber            string           `json:"scrap_number" db:"scrap_number"`
+	ProductID              uuid.UUID        `json:"product_id" db:"product_id"`
+	WarehouseID            uuid.UUID        `json:"warehouse_id" db:"warehouse_id"`
+	LocationID             *uuid.UUID       `json:"location_id,omitempty" db:"location_id"`
+	LotID                  *uuid.UUID       `json:"lot_id,omitempty" db:"lot_id"`
+	Quantity               float64          `json:"quantity" db:"quantity"`
+	UnitCost               *float64         `json:"unit_cost,omitempty" db:"unit_cost"`
+	TotalCost              *float64         `json:"total_cost,omitempty" db:"total_cost"`
+	ScrapReasonID          *uuid.UUID       `json:"scrap_reason_id,omitempty" db:"scrap_reason_id"`
+	Reason                 *string          `json:"reason,omitempty" db:"reason"`
+	ReasonNotes            *string          `json:"reason_notes,omitempty" db:"reason_notes"`
+	ScrapDate              time.Time        `json:"scrap_date" db:"scrap_date"`
+	Status                 ScrapOrderStatus `json:"status" db:"status"`
+	ScrappedBy             *uuid.UUID       `json:"scrapped_by,omitempty" db:"scrapped_by"`
+	ApprovedBy             *uuid.UUID       `json:"approved_by,omitempty" db:"approved_by"`
+	ApprovedAt             *time.Time       `json:"approved_at,omitempty" db:"approved_at"`
+	CompletedAt            *time.Time       `json:"completed_at,omitempty" db:"completed_at"`
+	JournalEntryID         *uuid.UUID       `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
+	InventoryTransactionID *uuid.UUID       `json:"inventory_transaction_id,omitempty" db:"inventory_transaction_id"`
+	Notes                  *string          `json:"notes,omitempty" db:"notes"`
+	CreatedAt              time.Time        `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time        `json:"updated_at" db:"updated_at"`
+	DeletedAt              *time.Time       `json:"-" db:"deleted_at"`
+
+	// Relationships
+	Product     *Product     `json:"product,omitempty"`
+	Warehouse   *Warehouse   `json:"warehouse,omitempty"`
+	ScrapReason *ScrapReason `json:"scrap_reason,omitempty"`
+}
+
+// CreateScrapReasonInput represents input for creating a scrap reason
+type CreateScrapReasonInput struct {
+	Code             string `json:"code" binding:"required,min=1,max=50"`
+	Name             string `json:"name" binding:"required,min=1,max=255"`
+	Description      string `json:"description,omitempty"`
+	RequiresApproval bool   `json:"requires_approval,omitempty"`
+	AccountID        string `json:"account_id,omitempty"`
+}
+
+// UpdateScrapReasonInput represents input for updating a scrap reason
+type UpdateScrapReasonInput struct {
+	Name             *string `json:"name,omitempty"`
+	Description      *string `json:"description,omitempty"`
+	IsActive         *bool   `json:"is_active,omitempty"`
+	RequiresApproval *bool   `json:"requires_approval,omitempty"`
+	AccountID        *string `json:"account_id,omitempty"`
+}
+
+// CreateScrapOrderInput represents input for creating a scrap order
+type CreateScrapOrderInput struct {
+	ProductID     string  `json:"product_id" binding:"required"`
+	WarehouseID   string  `json:"warehouse_id" binding:"required"`
+	LocationID    string  `json:"location_id,omitempty"`
+	LotID         string  `json:"lot_id,omitempty"`
+	Quantity      float64 `json:"quantity" binding:"required,gt=0"`
+	UnitCost      float64 `json:"unit_cost,omitempty"`
+	ScrapReasonID string  `json:"scrap_reason_id,omitempty"`
+	Reason        string  `json:"reason,omitempty"`
+	ReasonNotes   string  `json:"reason_notes,omitempty"`
+	ScrapDate     string  `json:"scrap_date" binding:"required"`
+	Notes         string  `json:"notes,omitempty"`
+}
+
+// UpdateScrapOrderInput represents input for updating a scrap order
+type UpdateScrapOrderInput struct {
+	Quantity      *float64 `json:"quantity,omitempty"`
+	UnitCost      *float64 `json:"unit_cost,omitempty"`
+	ScrapReasonID *string  `json:"scrap_reason_id,omitempty"`
+	Reason        *string  `json:"reason,omitempty"`
+	ReasonNotes   *string  `json:"reason_notes,omitempty"`
+	Notes         *string  `json:"notes,omitempty"`
+}
+
+// ScrapOrderListFilter represents filters for listing scrap orders
+type ScrapOrderListFilter struct {
+	Search      string `form:"search"`
+	ProductID   string `form:"product_id"`
+	WarehouseID string `form:"warehouse_id"`
+	Status      string `form:"status"`
+	Reason      string `form:"reason"`
+	DateFrom    string `form:"date_from"`
+	DateTo      string `form:"date_to"`
+}
+
+// ScrapOrderResponse represents the API response for a scrap order
+type ScrapOrderResponse struct {
+	ID            uuid.UUID `json:"id"`
+	ScrapNumber   string    `json:"scrap_number"`
+	ProductID     uuid.UUID `json:"product_id"`
+	ProductCode   string    `json:"product_code,omitempty"`
+	ProductName   string    `json:"product_name,omitempty"`
+	WarehouseID   uuid.UUID `json:"warehouse_id"`
+	WarehouseName string    `json:"warehouse_name,omitempty"`
+	Quantity      float64   `json:"quantity"`
+	UnitCost      float64   `json:"unit_cost"`
+	TotalCost     float64   `json:"total_cost"`
+	Reason        string    `json:"reason,omitempty"`
+	ReasonNotes   string    `json:"reason_notes,omitempty"`
+	ScrapDate     string    `json:"scrap_date"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// ScrapSummary represents a summary of scrap activity
+type ScrapSummary struct {
+	TotalScrapOrders   int     `json:"total_scrap_orders"`
+	TotalQuantity      float64 `json:"total_quantity"`
+	TotalValue         float64 `json:"total_value"`
+	PendingApproval    int     `json:"pending_approval"`
+	ByReason           map[string]float64 `json:"by_reason"`
+}
+
+// =====================================================
+// REORDER RULES
+// =====================================================
+
+// ReorderTriggerType represents how reorder is triggered
+type ReorderTriggerType string
+
+const (
+	ReorderTriggerMinQty   ReorderTriggerType = "min_qty"
+	ReorderTriggerForecast ReorderTriggerType = "forecast"
+	ReorderTriggerSchedule ReorderTriggerType = "schedule"
+)
+
+// ReorderRule represents automated reorder configuration
+type ReorderRule struct {
+	ID                uuid.UUID          `json:"id" db:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id" db:"tenant_id"`
+	ProductID         uuid.UUID          `json:"product_id" db:"product_id"`
+	WarehouseID       *uuid.UUID         `json:"warehouse_id,omitempty" db:"warehouse_id"`
+	MinQty            float64            `json:"min_qty" db:"min_qty"`
+	MaxQty            *float64           `json:"max_qty,omitempty" db:"max_qty"`
+	ReorderQty        float64            `json:"reorder_qty" db:"reorder_qty"`
+	TriggerType       ReorderTriggerType `json:"trigger_type" db:"trigger_type"`
+	PreferredVendorID *uuid.UUID         `json:"preferred_vendor_id,omitempty" db:"preferred_vendor_id"`
+	LeadTimeDays      int                `json:"lead_time_days" db:"lead_time_days"`
+	SafetyStock       float64            `json:"safety_stock" db:"safety_stock"`
+	AutoCreatePO      bool               `json:"auto_create_po" db:"auto_create_po"`
+	IsActive          bool               `json:"is_active" db:"is_active"`
+	LastTriggeredAt   *time.Time         `json:"last_triggered_at,omitempty" db:"last_triggered_at"`
+	Notes             *string            `json:"notes,omitempty" db:"notes"`
+	CreatedBy         *uuid.UUID         `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt         time.Time          `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at" db:"updated_at"`
+
+	// Relationships
+	Product         *Product   `json:"product,omitempty"`
+	Warehouse       *Warehouse `json:"warehouse,omitempty"`
+	PreferredVendor *Contact   `json:"preferred_vendor,omitempty"`
+}
+
+// CreateReorderRuleInput represents input for creating a reorder rule
+type CreateReorderRuleInput struct {
+	ProductID         string  `json:"product_id" binding:"required"`
+	WarehouseID       string  `json:"warehouse_id,omitempty"`
+	MinQty            float64 `json:"min_qty" binding:"required,gte=0"`
+	MaxQty            float64 `json:"max_qty,omitempty"`
+	ReorderQty        float64 `json:"reorder_qty" binding:"required,gt=0"`
+	TriggerType       string  `json:"trigger_type,omitempty"`
+	PreferredVendorID string  `json:"preferred_vendor_id,omitempty"`
+	LeadTimeDays      int     `json:"lead_time_days,omitempty"`
+	SafetyStock       float64 `json:"safety_stock,omitempty"`
+	AutoCreatePO      bool    `json:"auto_create_po,omitempty"`
+	Notes             string  `json:"notes,omitempty"`
+}
+
+// UpdateReorderRuleInput represents input for updating a reorder rule
+type UpdateReorderRuleInput struct {
+	MinQty            *float64 `json:"min_qty,omitempty"`
+	MaxQty            *float64 `json:"max_qty,omitempty"`
+	ReorderQty        *float64 `json:"reorder_qty,omitempty"`
+	TriggerType       *string  `json:"trigger_type,omitempty"`
+	PreferredVendorID *string  `json:"preferred_vendor_id,omitempty"`
+	LeadTimeDays      *int     `json:"lead_time_days,omitempty"`
+	SafetyStock       *float64 `json:"safety_stock,omitempty"`
+	AutoCreatePO      *bool    `json:"auto_create_po,omitempty"`
+	IsActive          *bool    `json:"is_active,omitempty"`
+	Notes             *string  `json:"notes,omitempty"`
+}
+
+// ReorderRuleListFilter represents filters for listing reorder rules
+type ReorderRuleListFilter struct {
+	Search      string `form:"search"`
+	ProductID   string `form:"product_id"`
+	WarehouseID string `form:"warehouse_id"`
+	TriggerType string `form:"trigger_type"`
+	IsActive    *bool  `form:"is_active"`
+}
+
+// ReorderRuleResponse represents the API response for a reorder rule
+type ReorderRuleResponse struct {
+	ID                 uuid.UUID  `json:"id"`
+	ProductID          uuid.UUID  `json:"product_id"`
+	ProductCode        string     `json:"product_code,omitempty"`
+	ProductName        string     `json:"product_name,omitempty"`
+	WarehouseID        *uuid.UUID `json:"warehouse_id,omitempty"`
+	WarehouseName      string     `json:"warehouse_name,omitempty"`
+	MinQty             float64    `json:"min_qty"`
+	MaxQty             *float64   `json:"max_qty,omitempty"`
+	ReorderQty         float64    `json:"reorder_qty"`
+	TriggerType        string     `json:"trigger_type"`
+	PreferredVendorID  *uuid.UUID `json:"preferred_vendor_id,omitempty"`
+	PreferredVendorName string    `json:"preferred_vendor_name,omitempty"`
+	LeadTimeDays       int        `json:"lead_time_days"`
+	SafetyStock        float64    `json:"safety_stock"`
+	AutoCreatePO       bool       `json:"auto_create_po"`
+	IsActive           bool       `json:"is_active"`
+	CurrentStock       float64    `json:"current_stock,omitempty"`
+	NeedsReorder       bool       `json:"needs_reorder,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+}

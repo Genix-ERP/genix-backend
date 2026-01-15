@@ -154,6 +154,53 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		leads.GET("/:id", h.GetLead)
 		leads.PUT("/:id", h.UpdateLead)
 		leads.DELETE("/:id", h.DeleteLead)
+		leads.POST("/:id/convert", h.ConvertLead)
+	}
+
+	// Opportunities (CRM Sales Pipeline)
+	opportunities := rg.Group("/opportunities")
+	{
+		opportunities.GET("", h.ListOpportunities)
+		opportunities.POST("", h.CreateOpportunity)
+		opportunities.GET("/stats", h.GetOpportunityStats)
+		opportunities.GET("/by-stage", h.GetOpportunitiesByStage)
+		opportunities.GET("/:id", h.GetOpportunity)
+		opportunities.PUT("/:id", h.UpdateOpportunity)
+		opportunities.DELETE("/:id", h.DeleteOpportunity)
+	}
+
+	// Pipeline Stages
+	pipelineStages := rg.Group("/pipeline-stages")
+	{
+		pipelineStages.GET("", h.ListPipelineStages)
+		pipelineStages.POST("", h.CreatePipelineStage)
+		pipelineStages.PUT("/:id", h.UpdatePipelineStage)
+		pipelineStages.DELETE("/:id", h.DeletePipelineStage)
+	}
+
+	// Activities (CRM Activities)
+	activities := rg.Group("/activities")
+	{
+		activities.GET("", h.ListActivities)
+		activities.POST("", h.CreateActivity)
+		activities.GET("/stats", h.GetActivityStats)
+		activities.GET("/timeline", h.GetActivityTimeline)
+		activities.GET("/:id", h.GetActivity)
+		activities.PUT("/:id", h.UpdateActivity)
+		activities.DELETE("/:id", h.DeleteActivity)
+	}
+
+	// Tasks (CRM Tasks)
+	tasks := rg.Group("/tasks")
+	{
+		tasks.GET("", h.ListTasks)
+		tasks.POST("", h.CreateTask)
+		tasks.GET("/stats", h.GetTaskStats)
+		tasks.GET("/kanban", h.GetTasksKanban)
+		tasks.GET("/:id", h.GetTask)
+		tasks.PUT("/:id", h.UpdateTask)
+		tasks.DELETE("/:id", h.DeleteTask)
+		tasks.POST("/:id/complete", h.CompleteTask)
 	}
 
 	// Products
@@ -200,6 +247,45 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.POST("/transfer", middleware.RequirePermission("inventory", "stock", "transfer"), h.TransferInventory)
 		inventory.GET("/movements", h.ListInventoryMovements)
 		inventory.GET("/valuation", h.GetInventoryValuation)
+	}
+
+	// Bill of Materials (BOM)
+	bom := rg.Group("/bom")
+	bom.Use(middleware.RequirePermission("inventory", "bom", "read"))
+	{
+		bom.GET("", h.ListBOMs)
+		bom.POST("", middleware.RequirePermission("inventory", "bom", "create"), h.CreateBOM)
+		bom.GET("/:id", h.GetBOM)
+		bom.PUT("/:id", middleware.RequirePermission("inventory", "bom", "update"), h.UpdateBOM)
+		bom.DELETE("/:id", middleware.RequirePermission("inventory", "bom", "delete"), h.DeleteBOM)
+		bom.POST("/:id/lines", middleware.RequirePermission("inventory", "bom", "update"), h.CreateBOMLine)
+		bom.DELETE("/:id/lines/:lineId", middleware.RequirePermission("inventory", "bom", "update"), h.DeleteBOMLine)
+	}
+
+	// Scrap Management
+	scrap := rg.Group("/scrap")
+	scrap.Use(middleware.RequirePermission("inventory", "scrap", "read"))
+	{
+		scrap.GET("/reasons", h.ListScrapReasons)
+		scrap.POST("/reasons", middleware.RequirePermission("inventory", "scrap", "create"), h.CreateScrapReason)
+		scrap.GET("/orders", h.ListScrapOrders)
+		scrap.POST("/orders", middleware.RequirePermission("inventory", "scrap", "create"), h.CreateScrapOrder)
+		scrap.GET("/orders/:id", h.GetScrapOrder)
+		scrap.POST("/orders/:id/confirm", middleware.RequirePermission("inventory", "scrap", "approve"), h.ConfirmScrapOrder)
+		scrap.POST("/orders/:id/cancel", h.CancelScrapOrder)
+		scrap.GET("/summary", h.GetScrapSummary)
+	}
+
+	// Reorder Rules
+	reorder := rg.Group("/reorder-rules")
+	reorder.Use(middleware.RequirePermission("inventory", "reorder", "read"))
+	{
+		reorder.GET("", h.ListReorderRules)
+		reorder.POST("", middleware.RequirePermission("inventory", "reorder", "create"), h.CreateReorderRule)
+		reorder.GET("/alerts", h.GetReorderAlerts)
+		reorder.GET("/:id", h.GetReorderRule)
+		reorder.PUT("/:id", middleware.RequirePermission("inventory", "reorder", "update"), h.UpdateReorderRule)
+		reorder.DELETE("/:id", middleware.RequirePermission("inventory", "reorder", "delete"), h.DeleteReorderRule)
 	}
 
 	// Sales Orders
