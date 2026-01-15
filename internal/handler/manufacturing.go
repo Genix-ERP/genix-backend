@@ -9,9 +9,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
-	"genix-erp/internal/domain/entity"
-	"genix-erp/internal/handler/middleware"
-	"genix-erp/internal/handler/response"
+	"github.com/genixerp/genix-backend/internal/domain/entity"
+	"github.com/genixerp/genix-backend/internal/handler/middleware"
+	"github.com/genixerp/genix-backend/internal/handler/response"
 )
 
 // =====================================================
