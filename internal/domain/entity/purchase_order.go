@@ -21,15 +21,6 @@ const (
 	POStatusCancelled       PurchaseOrderStatus = "cancelled"
 )
 
-// PaymentStatus represents the payment status
-type PaymentStatus string
-
-const (
-	PaymentStatusUnpaid   PaymentStatus = "unpaid"
-	PaymentStatusPartial  PaymentStatus = "partial"
-	PaymentStatusPaid     PaymentStatus = "paid"
-)
-
 // PurchaseOrder represents a purchase order
 type PurchaseOrder struct {
 	ID              uuid.UUID           `json:"id" db:"id"`
