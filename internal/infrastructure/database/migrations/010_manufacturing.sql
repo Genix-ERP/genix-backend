@@ -806,35 +806,31 @@ CREATE INDEX idx_oee_date ON oee_metrics(metric_date);
 -- =====================================================
 -- Add permissions for manufacturing module
 -- =====================================================
-INSERT INTO permissions (id, tenant_id, code, name, description, module, action, resource)
-SELECT gen_random_uuid(), t.id,
-    'manufacturing.' || r.resource || '.' || a.action,
-    INITCAP(a.action) || ' ' || INITCAP(REPLACE(r.resource, '_', ' ')),
-    'Permission to ' || a.action || ' ' || REPLACE(r.resource, '_', ' '),
-    'manufacturing', a.action, r.resource
-FROM tenants t
-CROSS JOIN (VALUES
+INSERT INTO permissions (id, module, resource, action, description)
+SELECT gen_random_uuid(),
+    'manufacturing', r.resource, a.action,
+    'Permission to ' || a.action || ' ' || REPLACE(r.resource, '_', ' ')
+FROM (VALUES
     ('production_orders'), ('work_orders'), ('work_centers'),
     ('quality_checks'), ('equipment'), ('mrp')
 ) AS r(resource)
 CROSS JOIN (VALUES ('read'), ('create'), ('update'), ('delete')) AS a(action)
 WHERE NOT EXISTS (
     SELECT 1 FROM permissions p
-    WHERE p.tenant_id = t.id
-    AND p.code = 'manufacturing.' || r.resource || '.' || a.action
+    WHERE p.module = 'manufacturing'
+    AND p.resource = r.resource
+    AND p.action = a.action
 );
 
 -- Add approval permissions
-INSERT INTO permissions (id, tenant_id, code, name, description, module, action, resource)
-SELECT gen_random_uuid(), t.id,
-    'manufacturing.' || r.resource || '.approve',
-    'Approve ' || INITCAP(REPLACE(r.resource, '_', ' ')),
-    'Permission to approve ' || REPLACE(r.resource, '_', ' '),
-    'manufacturing', 'approve', r.resource
-FROM tenants t
-CROSS JOIN (VALUES ('production_orders'), ('quality_checks')) AS r(resource)
+INSERT INTO permissions (id, module, resource, action, description)
+SELECT gen_random_uuid(),
+    'manufacturing', r.resource, 'approve',
+    'Permission to approve ' || REPLACE(r.resource, '_', ' ')
+FROM (VALUES ('production_orders'), ('quality_checks')) AS r(resource)
 WHERE NOT EXISTS (
     SELECT 1 FROM permissions p
-    WHERE p.tenant_id = t.id
-    AND p.code = 'manufacturing.' || r.resource || '.approve'
+    WHERE p.module = 'manufacturing'
+    AND p.resource = r.resource
+    AND p.action = 'approve'
 );
