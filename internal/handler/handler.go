@@ -601,17 +601,6 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// ERP EXTENSIONS MODULE ROUTES
 	// =====================================================
 
-	// Contracts
-	contracts := rg.Group("/contracts")
-	contracts.Use(middleware.RequirePermission("procurement", "contract", "read"))
-	{
-		contracts.GET("", h.ListContracts)
-		contracts.POST("", middleware.RequirePermission("procurement", "contract", "create"), h.CreateContract)
-		contracts.GET("/:id", h.GetContract)
-		contracts.PUT("/:id", middleware.RequirePermission("procurement", "contract", "update"), h.UpdateContract)
-		contracts.DELETE("/:id", middleware.RequirePermission("procurement", "contract", "delete"), h.DeleteContract)
-	}
-
 	// Payroll Periods
 	payrollPeriods := rg.Group("/payroll-periods")
 	payrollPeriods.Use(middleware.RequirePermission("hr", "payroll", "read"))
