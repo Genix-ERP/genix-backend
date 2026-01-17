@@ -515,6 +515,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		settings.PUT("", middleware.RequirePermission("settings", "tenant", "update"), h.UpdateSettings)
 	}
 
+	// Admin Settings (alias for /settings to support frontend admin panel)
+	adminSettings := rg.Group("/admin/settings")
+	adminSettings.Use(middleware.RequirePermission("settings", "tenant", "read"))
+	{
+		adminSettings.GET("", h.GetAdminSettings)
+		adminSettings.PUT("", middleware.RequirePermission("settings", "tenant", "update"), h.UpdateAdminSettings)
+		adminSettings.PATCH("/:section", middleware.RequirePermission("settings", "tenant", "update"), h.UpdateAdminSettingsSection)
+		adminSettings.POST("/:section/reset", middleware.RequirePermission("settings", "tenant", "update"), h.ResetAdminSettingsSection)
+		adminSettings.POST("/reset", middleware.RequirePermission("settings", "tenant", "update"), h.ResetAllAdminSettings)
+	}
+
 	// Audit Logs
 	auditLogs := rg.Group("/audit-logs")
 	auditLogs.Use(middleware.RequirePermission("audit", "log", "read"))
