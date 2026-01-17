@@ -1,14 +1,14 @@
 -- GenixERP Procurement Contracts Module Schema Migration
 
 -- ============================================
--- PROCUREMENT CONTRACTS (Supplier/Vendor Contracts)
+-- PROCUREMENT CONTRACTS (Vendor Contracts)
 -- ============================================
 CREATE TABLE IF NOT EXISTS procurement_contracts (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     contract_number VARCHAR(50) NOT NULL,
-    supplier_id UUID REFERENCES contacts(id) ON DELETE SET NULL,
-    supplier_name VARCHAR(255) NOT NULL,
+    vendor_id UUID REFERENCES contacts(id) ON DELETE SET NULL,
+    vendor_name VARCHAR(255) NOT NULL,
     title VARCHAR(255) NOT NULL,
     description TEXT,
     contract_type VARCHAR(50) NOT NULL, -- annual, fixed, project, framework, blanket
@@ -22,9 +22,9 @@ CREATE TABLE IF NOT EXISTS procurement_contracts (
     auto_renew BOOLEAN DEFAULT false,
     renewal_notice_days INTEGER DEFAULT 30,
     status VARCHAR(20) DEFAULT 'draft', -- draft, active, expired, terminated, renewed
-    signed_by_supplier BOOLEAN DEFAULT false,
+    signed_by_vendor BOOLEAN DEFAULT false,
     signed_by_company BOOLEAN DEFAULT false,
-    supplier_signature_date DATE,
+    vendor_signature_date DATE,
     company_signature_date DATE,
     attachments JSONB DEFAULT '[]',
     performance_rating DECIMAL(3, 2), -- Rating out of 5.00
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS procurement_contracts (
 );
 
 CREATE INDEX idx_procurement_contracts_tenant ON procurement_contracts(tenant_id);
-CREATE INDEX idx_procurement_contracts_supplier ON procurement_contracts(supplier_id);
+CREATE INDEX idx_procurement_contracts_supplier ON procurement_contracts(vendor_id);
 CREATE INDEX idx_procurement_contracts_status ON procurement_contracts(tenant_id, status);
 CREATE INDEX idx_procurement_contracts_dates ON procurement_contracts(start_date, end_date);
 CREATE INDEX idx_procurement_contracts_type ON procurement_contracts(contract_type);
@@ -127,7 +127,7 @@ CREATE INDEX idx_contract_amendments_status ON contract_amendments(status);
 -- ============================================
 -- COMMENTS
 -- ============================================
-COMMENT ON TABLE procurement_contracts IS 'Supplier/Vendor procurement contracts';
+COMMENT ON TABLE procurement_contracts IS 'Vendor procurement contracts';
 COMMENT ON TABLE procurement_contract_items IS 'Line items for framework/blanket contracts';
 COMMENT ON TABLE contract_milestones IS 'Milestones for project-based contracts';
 COMMENT ON TABLE contract_amendments IS 'Contract amendments and change orders';
