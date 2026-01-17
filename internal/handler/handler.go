@@ -472,6 +472,61 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employees.DELETE("/:id", middleware.RequirePermission("hr", "employee", "delete"), h.DeleteEmployee)
 	}
 
+	// HR - Attendance Records
+	attendance := rg.Group("/attendance")
+	attendance.Use(middleware.RequirePermission("hr", "attendance", "read"))
+	{
+		attendance.GET("", h.ListAttendanceRecords)
+		attendance.POST("", middleware.RequirePermission("hr", "attendance", "create"), h.CreateAttendanceRecord)
+		attendance.GET("/:id", h.GetAttendanceRecord)
+		attendance.PUT("/:id", middleware.RequirePermission("hr", "attendance", "update"), h.UpdateAttendanceRecord)
+		attendance.DELETE("/:id", middleware.RequirePermission("hr", "attendance", "delete"), h.DeleteAttendanceRecord)
+	}
+
+	// HR - Leave Requests
+	leaveRequests := rg.Group("/leave-requests")
+	leaveRequests.Use(middleware.RequirePermission("hr", "leave", "read"))
+	{
+		leaveRequests.GET("", h.ListLeaveRequests)
+		leaveRequests.POST("", middleware.RequirePermission("hr", "leave", "create"), h.CreateLeaveRequest)
+		leaveRequests.GET("/:id", h.GetLeaveRequest)
+		leaveRequests.PUT("/:id", middleware.RequirePermission("hr", "leave", "update"), h.UpdateLeaveRequest)
+		leaveRequests.DELETE("/:id", middleware.RequirePermission("hr", "leave", "delete"), h.DeleteLeaveRequest)
+	}
+
+	// HR - Leave Balances
+	leaveBalances := rg.Group("/leave-balances")
+	leaveBalances.Use(middleware.RequirePermission("hr", "leave", "read"))
+	{
+		leaveBalances.GET("", h.ListLeaveBalances)
+		leaveBalances.POST("", middleware.RequirePermission("hr", "leave", "create"), h.CreateLeaveBalance)
+		leaveBalances.GET("/:id", h.GetLeaveBalance)
+		leaveBalances.PUT("/:id", middleware.RequirePermission("hr", "leave", "update"), h.UpdateLeaveBalance)
+		leaveBalances.DELETE("/:id", middleware.RequirePermission("hr", "leave", "delete"), h.DeleteLeaveBalance)
+	}
+
+	// HR - Employee Contracts
+	employeeContracts := rg.Group("/employee-contracts")
+	employeeContracts.Use(middleware.RequirePermission("hr", "contract", "read"))
+	{
+		employeeContracts.GET("", h.ListEmployeeContracts)
+		employeeContracts.POST("", middleware.RequirePermission("hr", "contract", "create"), h.CreateEmployeeContract)
+		employeeContracts.GET("/:id", h.GetEmployeeContract)
+		employeeContracts.PUT("/:id", middleware.RequirePermission("hr", "contract", "update"), h.UpdateEmployeeContract)
+		employeeContracts.DELETE("/:id", middleware.RequirePermission("hr", "contract", "delete"), h.DeleteEmployeeContract)
+	}
+
+	// Workflows
+	workflows := rg.Group("/workflows")
+	workflows.Use(middleware.RequirePermission("workflow", "workflow", "read"))
+	{
+		workflows.GET("", h.ListWorkflows)
+		workflows.POST("", middleware.RequirePermission("workflow", "workflow", "create"), h.CreateWorkflow)
+		workflows.GET("/:id", h.GetWorkflow)
+		workflows.PUT("/:id", middleware.RequirePermission("workflow", "workflow", "update"), h.UpdateWorkflow)
+		workflows.DELETE("/:id", middleware.RequirePermission("workflow", "workflow", "delete"), h.DeleteWorkflow)
+	}
+
 	// AI Assistant
 	ai := rg.Group("/ai")
 	ai.Use(middleware.RequirePermission("ai", "conversation", "create"))
