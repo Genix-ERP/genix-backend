@@ -10,6 +10,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // =====================================================
@@ -18,9 +19,9 @@ import (
 
 // ListCargoShipments returns a paginated list of cargo shipments
 func (h *Handler) ListCargoShipments(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -33,7 +34,6 @@ func (h *Handler) ListCargoShipments(c *gin.Context) {
 	if limit < 1 || limit > 100 {
 		limit = 50
 	}
-	offset := (page - 1) * limit
 
 	// Parse filters
 	status := c.Query("status")
@@ -50,7 +50,7 @@ func (h *Handler) ListCargoShipments(c *gin.Context) {
 	`
 	countQuery := `SELECT COUNT(*) FROM cargo_shipments WHERE company_id = $1`
 
-	args := []interface{}{companyID}
+	args := []interface{}{tenantID}
 	argCount := 1
 
 	if status != "" {
@@ -69,21 +69,23 @@ func (h *Handler) ListCargoShipments(c *gin.Context) {
 	}
 
 	// Get total count
-	var total int64
+	var total int
 	if err := h.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
 		h.log.Error("Failed to count shipments", "error", err)
-		response.InternalServerError(c, "Failed to count shipments")
+		response.InternalError(c, "Failed to count shipments")
 		return
 	}
 
-	// Get shipments
-	baseQuery += " ORDER BY created_date DESC LIMIT $" + strconv.Itoa(argCount+1) + " OFFSET $" + strconv.Itoa(argCount+2)
-	args = append(args, limit, offset)
+	// Add ordering and pagination
+	baseQuery += " ORDER BY created_date DESC"
+	pagination := entity.NewPagination(page, limit)
+	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", pagination.Limit, pagination.Offset())
 
+	// Get shipments
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
 		h.log.Error("Failed to query shipments", "error", err)
-		response.InternalServerError(c, "Failed to query shipments")
+		response.InternalError(c, "Failed to query shipments")
 		return
 	}
 	defer rows.Close()
@@ -110,14 +112,15 @@ func (h *Handler) ListCargoShipments(c *gin.Context) {
 		shipments = append(shipments, s)
 	}
 
-	response.SuccessWithPagination(c, shipments, total, page, limit)
+	pagination.Calculate(total)
+	response.SuccessWithPagination(c, shipments, pagination)
 }
 
 // GetCargoShipment returns a single cargo shipment by ID
 func (h *Handler) GetCargoShipment(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -137,7 +140,7 @@ func (h *Handler) GetCargoShipment(c *gin.Context) {
 	`
 
 	var shipment entity.CargoShipment
-	err = h.db.QueryRow(query, id, companyID).Scan(
+	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&shipment.ID, &shipment.CompanyID, &shipment.TrackingNumber, &shipment.SupplierCountry, &shipment.SupplierCompany,
 		&shipment.TransportType, &shipment.ExpectedDate, &shipment.ActualArrivalDate, &shipment.Status,
 		&shipment.TransportCost, &shipment.CustomsCost, &shipment.InsuranceCost, &shipment.OtherCost, &shipment.TotalCost,
@@ -149,7 +152,7 @@ func (h *Handler) GetCargoShipment(c *gin.Context) {
 	}
 	if err != nil {
 		h.log.Error("Failed to query shipment", "error", err)
-		response.InternalServerError(c, "Failed to query shipment")
+		response.InternalError(c, "Failed to query shipment")
 		return
 	}
 
@@ -164,9 +167,9 @@ func (h *Handler) GetCargoShipment(c *gin.Context) {
 
 // CreateCargoShipment creates a new cargo shipment
 func (h *Handler) CreateCargoShipment(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -178,14 +181,11 @@ func (h *Handler) CreateCargoShipment(c *gin.Context) {
 		return
 	}
 
-	// Calculate total cost
-	totalCost := req.TransportCost + req.CustomsCost + req.InsuranceCost + req.OtherCost
-
 	// Begin transaction
 	tx, err := h.db.Begin()
 	if err != nil {
 		h.log.Error("Failed to begin transaction", "error", err)
-		response.InternalServerError(c, "Failed to begin transaction")
+		response.InternalError(c, "Failed to begin transaction")
 		return
 	}
 	defer tx.Rollback()
@@ -202,15 +202,20 @@ func (h *Handler) CreateCargoShipment(c *gin.Context) {
 	`
 
 	var shipmentID int64
+	var createdByUUID *uuid.UUID
+	if userID != uuid.Nil {
+		createdByUUID = &userID
+	}
+
 	err = tx.QueryRow(
-		query, companyID, req.TrackingNumber, req.SupplierCountry, sql.NullString{String: req.SupplierCompany, Valid: req.SupplierCompany != ""},
+		query, tenantID, req.TrackingNumber, req.SupplierCountry, sql.NullString{String: req.SupplierCompany, Valid: req.SupplierCompany != ""},
 		req.TransportType, req.ExpectedDate, "ordered",
 		req.TransportCost, req.CustomsCost, req.InsuranceCost, req.OtherCost,
-		sql.NullString{String: req.Notes, Valid: req.Notes != ""}, sql.NullInt64{Int64: userID, Valid: userID != 0},
+		sql.NullString{String: req.Notes, Valid: req.Notes != ""}, createdByUUID,
 	).Scan(&shipmentID)
 	if err != nil {
 		h.log.Error("Failed to insert shipment", "error", err)
-		response.InternalServerError(c, "Failed to create shipment")
+		response.InternalError(c, "Failed to create shipment")
 		return
 	}
 
@@ -230,7 +235,7 @@ func (h *Handler) CreateCargoShipment(c *gin.Context) {
 		)
 		if err != nil {
 			h.log.Error("Failed to insert shipment item", "error", err)
-			response.InternalServerError(c, "Failed to create shipment items")
+			response.InternalError(c, "Failed to create shipment items")
 			return
 		}
 	}
@@ -240,16 +245,16 @@ func (h *Handler) CreateCargoShipment(c *gin.Context) {
 		INSERT INTO cargo_shipment_status_history (shipment_id, status, note, changed_by, changed_date)
 		VALUES ($1, $2, $3, $4, NOW())
 	`
-	_, err = tx.Exec(statusQuery, shipmentID, "ordered", "Shipment created", sql.NullInt64{Int64: userID, Valid: userID != 0})
+	_, err = tx.Exec(statusQuery, shipmentID, "ordered", "Shipment created", createdByUUID)
 	if err != nil {
 		h.log.Error("Failed to insert status history", "error", err)
-		response.InternalServerError(c, "Failed to create status history")
+		response.InternalError(c, "Failed to create status history")
 		return
 	}
 
 	if err = tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
-		response.InternalServerError(c, "Failed to commit transaction")
+		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
 
@@ -258,9 +263,9 @@ func (h *Handler) CreateCargoShipment(c *gin.Context) {
 
 // UpdateCargoShipmentStatus updates the status of a shipment
 func (h *Handler) UpdateCargoShipmentStatus(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -282,7 +287,7 @@ func (h *Handler) UpdateCargoShipmentStatus(c *gin.Context) {
 	tx, err := h.db.Begin()
 	if err != nil {
 		h.log.Error("Failed to begin transaction", "error", err)
-		response.InternalServerError(c, "Failed to begin transaction")
+		response.InternalError(c, "Failed to begin transaction")
 		return
 	}
 	defer tx.Rollback()
@@ -293,10 +298,10 @@ func (h *Handler) UpdateCargoShipmentStatus(c *gin.Context) {
 		SET status = $1, updated_date = NOW()
 		WHERE id = $2 AND company_id = $3
 	`
-	result, err := tx.Exec(query, req.Status, id, companyID)
+	result, err := tx.Exec(query, req.Status, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to update shipment status", "error", err)
-		response.InternalServerError(c, "Failed to update status")
+		response.InternalError(c, "Failed to update status")
 		return
 	}
 
@@ -307,6 +312,11 @@ func (h *Handler) UpdateCargoShipmentStatus(c *gin.Context) {
 	}
 
 	// Insert status history
+	var changedByUUID *uuid.UUID
+	if userID != uuid.Nil {
+		changedByUUID = &userID
+	}
+
 	statusQuery := `
 		INSERT INTO cargo_shipment_status_history (shipment_id, status, note, location, changed_by, changed_date)
 		VALUES ($1, $2, $3, $4, $5, NOW())
@@ -315,17 +325,17 @@ func (h *Handler) UpdateCargoShipmentStatus(c *gin.Context) {
 		statusQuery, id, req.Status,
 		sql.NullString{String: req.Note, Valid: req.Note != ""},
 		sql.NullString{String: req.Location, Valid: req.Location != ""},
-		sql.NullInt64{Int64: userID, Valid: userID != 0},
+		changedByUUID,
 	)
 	if err != nil {
 		h.log.Error("Failed to insert status history", "error", err)
-		response.InternalServerError(c, "Failed to create status history")
+		response.InternalError(c, "Failed to create status history")
 		return
 	}
 
 	if err = tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
-		response.InternalServerError(c, "Failed to commit transaction")
+		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
 
@@ -334,9 +344,9 @@ func (h *Handler) UpdateCargoShipmentStatus(c *gin.Context) {
 
 // DeleteCargoShipment deletes a cargo shipment
 func (h *Handler) DeleteCargoShipment(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -347,10 +357,10 @@ func (h *Handler) DeleteCargoShipment(c *gin.Context) {
 	}
 
 	query := `DELETE FROM cargo_shipments WHERE id = $1 AND company_id = $2`
-	result, err := h.db.Exec(query, id, companyID)
+	result, err := h.db.Exec(query, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete shipment", "error", err)
-		response.InternalServerError(c, "Failed to delete shipment")
+		response.InternalError(c, "Failed to delete shipment")
 		return
 	}
 
@@ -369,9 +379,9 @@ func (h *Handler) DeleteCargoShipment(c *gin.Context) {
 
 // CreateCargoDistribution creates a distribution for a shipment
 func (h *Handler) CreateCargoDistribution(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -390,7 +400,7 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 	}
 
 	// Calculate totals
-	var totalItemsCost, allocatedCosts float64
+	var totalItemsCost float64
 	for _, item := range req.Items {
 		totalItemsCost += item.Quantity * item.UnitCost
 	}
@@ -399,12 +409,17 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 	tx, err := h.db.Begin()
 	if err != nil {
 		h.log.Error("Failed to begin transaction", "error", err)
-		response.InternalServerError(c, "Failed to begin transaction")
+		response.InternalError(c, "Failed to begin transaction")
 		return
 	}
 	defer tx.Rollback()
 
 	// Insert distribution
+	var createdByUUID *uuid.UUID
+	if userID != uuid.Nil {
+		createdByUUID = &userID
+	}
+
 	query := `
 		INSERT INTO cargo_distributions (
 			shipment_id, recipient_company_id, recipient_company_name, recipient_company_type,
@@ -417,15 +432,15 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 	var distID int64
 	err = tx.QueryRow(
 		query, id, req.RecipientCompanyID, req.RecipientCompanyName, req.RecipientCompanyType,
-		totalItemsCost, allocatedCosts,
+		totalItemsCost, 0, // allocated_costs will be 0 for now
 		sql.NullString{String: req.InvoiceNumber, Valid: req.InvoiceNumber != ""},
 		sql.NullString{String: req.WaybillNumber, Valid: req.WaybillNumber != ""},
 		sql.NullString{String: req.Notes, Valid: req.Notes != ""},
-		sql.NullInt64{Int64: userID, Valid: userID != 0},
+		createdByUUID,
 	).Scan(&distID)
 	if err != nil {
 		h.log.Error("Failed to insert distribution", "error", err)
-		response.InternalServerError(c, "Failed to create distribution")
+		response.InternalError(c, "Failed to create distribution")
 		return
 	}
 
@@ -438,7 +453,7 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 		_, err = tx.Exec(itemQuery, distID, item.ShipmentItemID, item.Quantity, item.UnitCost)
 		if err != nil {
 			h.log.Error("Failed to insert distribution item", "error", err)
-			response.InternalServerError(c, "Failed to create distribution items")
+			response.InternalError(c, "Failed to create distribution items")
 			return
 		}
 	}
@@ -447,13 +462,13 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 	_, err = tx.Exec(`UPDATE cargo_shipments SET status = 'distributed', updated_date = NOW() WHERE id = $1`, id)
 	if err != nil {
 		h.log.Error("Failed to update shipment status", "error", err)
-		response.InternalServerError(c, "Failed to update shipment status")
+		response.InternalError(c, "Failed to update shipment status")
 		return
 	}
 
 	if err = tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
-		response.InternalServerError(c, "Failed to commit transaction")
+		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
 
@@ -466,9 +481,9 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 
 // ListCargoCashTransactions returns a list of cash transactions
 func (h *Handler) ListCargoCashTransactions(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -483,7 +498,7 @@ func (h *Handler) ListCargoCashTransactions(c *gin.Context) {
 		FROM cargo_cash_transactions
 		WHERE company_id = $1
 	`
-	args := []interface{}{companyID}
+	args := []interface{}{tenantID}
 	argCount := 1
 
 	if transactionType != "" {
@@ -503,7 +518,7 @@ func (h *Handler) ListCargoCashTransactions(c *gin.Context) {
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query cash transactions", "error", err)
-		response.InternalServerError(c, "Failed to query transactions")
+		response.InternalError(c, "Failed to query transactions")
 		return
 	}
 	defer rows.Close()
@@ -527,9 +542,9 @@ func (h *Handler) ListCargoCashTransactions(c *gin.Context) {
 
 // CreateCargoCashTransaction creates a new cash transaction
 func (h *Handler) CreateCargoCashTransaction(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -546,6 +561,11 @@ func (h *Handler) CreateCargoCashTransaction(c *gin.Context) {
 		transactionDate = *req.TransactionDate
 	}
 
+	var createdByUUID *uuid.UUID
+	if userID != uuid.Nil {
+		createdByUUID = &userID
+	}
+
 	query := `
 		INSERT INTO cargo_cash_transactions (
 			company_id, transaction_type, amount, currency, category,
@@ -557,15 +577,15 @@ func (h *Handler) CreateCargoCashTransaction(c *gin.Context) {
 
 	var transactionID int64
 	err := h.db.QueryRow(
-		query, companyID, req.TransactionType, req.Amount, req.Currency, req.Category,
+		query, tenantID, req.TransactionType, req.Amount, req.Currency, req.Category,
 		req.ShipmentID, req.DistributionID, req.RelatedCompanyID,
 		sql.NullString{String: req.Description, Valid: req.Description != ""},
 		sql.NullString{String: req.ReferenceNumber, Valid: req.ReferenceNumber != ""},
-		transactionDate, sql.NullInt64{Int64: userID, Valid: userID != 0},
+		transactionDate, createdByUUID,
 	).Scan(&transactionID)
 	if err != nil {
 		h.log.Error("Failed to insert cash transaction", "error", err)
-		response.InternalServerError(c, "Failed to create transaction")
+		response.InternalError(c, "Failed to create transaction")
 		return
 	}
 
@@ -574,9 +594,9 @@ func (h *Handler) CreateCargoCashTransaction(c *gin.Context) {
 
 // GetCargoCashSummary returns cash register summary
 func (h *Handler) GetCargoCashSummary(c *gin.Context) {
-	companyID, ok := middleware.GetCompanyID(c)
-	if !ok || companyID == 0 {
-		response.Unauthorized(c, "Company not found")
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
@@ -592,10 +612,10 @@ func (h *Handler) GetCargoCashSummary(c *gin.Context) {
 	`
 
 	var summary entity.CargoCashSummary
-	err := h.db.QueryRow(query, companyID).Scan(&summary.UZSBalance, &summary.USDBalance)
+	err := h.db.QueryRow(query, tenantID).Scan(&summary.UZSBalance, &summary.USDBalance)
 	if err != nil {
 		h.log.Error("Failed to calculate cash summary", "error", err)
-		response.InternalServerError(c, "Failed to calculate summary")
+		response.InternalError(c, "Failed to calculate summary")
 		return
 	}
 
@@ -610,10 +630,10 @@ func (h *Handler) GetCargoCashSummary(c *gin.Context) {
 		LIMIT 100
 	`
 
-	rows, err := h.db.Query(txQuery, companyID)
+	rows, err := h.db.Query(txQuery, tenantID)
 	if err != nil {
 		h.log.Error("Failed to query transactions", "error", err)
-		response.InternalServerError(c, "Failed to query transactions")
+		response.InternalError(c, "Failed to query transactions")
 		return
 	}
 	defer rows.Close()
