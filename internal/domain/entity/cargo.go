@@ -3,8 +3,6 @@ package entity
 import (
 	"database/sql"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // =====================================================
