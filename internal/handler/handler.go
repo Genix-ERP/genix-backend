@@ -745,6 +745,31 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		projects.GET("/:id/time-entries", h.ListTimeEntries)
 		projects.POST("/:id/time-entries", middleware.RequirePermission("projects", "time_entry", "create"), h.CreateTimeEntry)
 	}
+
+	// =====================================================
+	// CARGO MODULE ROUTES
+	// =====================================================
+
+	// Cargo Shipments
+	cargoShipments := rg.Group("/cargo/shipments")
+	cargoShipments.Use(middleware.RequirePermission("cargo", "shipment", "read"))
+	{
+		cargoShipments.GET("", h.ListCargoShipments)
+		cargoShipments.POST("", middleware.RequirePermission("cargo", "shipment", "create"), h.CreateCargoShipment)
+		cargoShipments.GET("/:id", h.GetCargoShipment)
+		cargoShipments.PUT("/:id/status", middleware.RequirePermission("cargo", "shipment", "update"), h.UpdateCargoShipmentStatus)
+		cargoShipments.DELETE("/:id", middleware.RequirePermission("cargo", "shipment", "delete"), h.DeleteCargoShipment)
+		cargoShipments.POST("/:id/distribution", middleware.RequirePermission("cargo", "distribution", "create"), h.CreateCargoDistribution)
+	}
+
+	// Cargo Cash Register
+	cargoCash := rg.Group("/cargo/cash")
+	cargoCash.Use(middleware.RequirePermission("cargo", "cash", "read"))
+	{
+		cargoCash.GET("", h.ListCargoCashTransactions)
+		cargoCash.POST("", middleware.RequirePermission("cargo", "cash", "create"), h.CreateCargoCashTransaction)
+		cargoCash.GET("/summary", h.GetCargoCashSummary)
+	}
 }
 
 // GetAPIInfo returns API information
