@@ -655,6 +655,214 @@ func (h *Handler) GetCargoCashSummary(c *gin.Context) {
 	response.Success(c, summary)
 }
 
+// UpdateCargoShipment updates an existing cargo shipment
+func (h *Handler) UpdateCargoShipment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid shipment ID")
+		return
+	}
+
+	var req entity.CreateCargoShipmentInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request body")
+		return
+	}
+
+	// Check if shipment exists and belongs to tenant
+	var existingTenantID uuid.UUID
+	checkQuery := `SELECT tenant_id FROM cargo_shipments WHERE id = $1`
+	err = h.db.QueryRow(checkQuery, id).Scan(&existingTenantID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Shipment not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to check shipment", "error", err)
+		response.InternalError(c, "Failed to check shipment")
+		return
+	}
+	if existingTenantID != tenantID {
+		response.Forbidden(c, "Access denied")
+		return
+	}
+
+	// Start transaction
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Calculate total cost
+	totalCost := req.TransportCost + req.CustomsCost + req.InsuranceCost + req.OtherCost
+
+	// Update shipment
+	updateQuery := `
+		UPDATE cargo_shipments
+		SET tracking_number = $1, supplier_country = $2, supplier_company = $3,
+		    expected_date = $4, transport_cost = $5, customs_cost = $6,
+		    insurance_cost = $7, other_cost = $8, total_cost = $9, notes = $10,
+		    updated_date = NOW()
+		WHERE id = $11 AND tenant_id = $12
+	`
+	_, err = tx.Exec(updateQuery,
+		req.TrackingNumber, req.SupplierCountry, req.SupplierCompany,
+		req.ExpectedDate, req.TransportCost, req.CustomsCost,
+		req.InsuranceCost, req.OtherCost, totalCost, req.Notes,
+		id, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to update shipment", "error", err)
+		response.InternalError(c, "Failed to update shipment")
+		return
+	}
+
+	// Delete existing items
+	_, err = tx.Exec(`DELETE FROM cargo_shipment_items WHERE shipment_id = $1`, id)
+	if err != nil {
+		h.log.Error("Failed to delete old items", "error", err)
+		response.InternalError(c, "Failed to update items")
+		return
+	}
+
+	// Insert new items
+	itemQuery := `
+		INSERT INTO cargo_shipment_items (shipment_id, item_name, quantity, unit_price, currency, total_price, hs_code, description, created_date, updated_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+	`
+	for _, item := range req.Items {
+		totalPrice := item.Quantity * item.UnitPrice
+		_, err = tx.Exec(itemQuery, id, item.ItemName, item.Quantity, item.UnitPrice, item.Currency, totalPrice, item.HSCode, item.Description)
+		if err != nil {
+			h.log.Error("Failed to insert shipment item", "error", err)
+			response.InternalError(c, "Failed to update shipment items")
+			return
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to commit transaction")
+		return
+	}
+
+	response.Success(c, gin.H{"id": id, "message": "Shipment updated successfully"})
+}
+
+// UpdateCargoCashTransaction updates an existing cash transaction
+func (h *Handler) UpdateCargoCashTransaction(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid transaction ID")
+		return
+	}
+
+	var req entity.CreateCargoCashTransactionInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request body")
+		return
+	}
+
+	// Check if transaction exists and belongs to tenant
+	var existingTenantID uuid.UUID
+	checkQuery := `SELECT tenant_id FROM cargo_cash_transactions WHERE id = $1`
+	err = h.db.QueryRow(checkQuery, id).Scan(&existingTenantID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Transaction not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to check transaction", "error", err)
+		response.InternalError(c, "Failed to check transaction")
+		return
+	}
+	if existingTenantID != tenantID {
+		response.Forbidden(c, "Access denied")
+		return
+	}
+
+	// Update transaction
+	updateQuery := `
+		UPDATE cargo_cash_transactions
+		SET transaction_type = $1, amount = $2, currency = $3, category = $4,
+		    description = $5, related_tenant_id = $6, transaction_date = COALESCE($7, transaction_date)
+		WHERE id = $8 AND tenant_id = $9
+	`
+	_, err = h.db.Exec(updateQuery,
+		req.TransactionType, req.Amount, req.Currency, req.Category,
+		req.Description, req.RelatedCompanyID, req.TransactionDate,
+		id, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to update transaction", "error", err)
+		response.InternalError(c, "Failed to update transaction")
+		return
+	}
+
+	response.Success(c, gin.H{"id": id, "message": "Transaction updated successfully"})
+}
+
+// DeleteCargoCashTransaction deletes a cash transaction
+func (h *Handler) DeleteCargoCashTransaction(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid transaction ID")
+		return
+	}
+
+	// Check if transaction exists and belongs to tenant
+	var existingTenantID uuid.UUID
+	checkQuery := `SELECT tenant_id FROM cargo_cash_transactions WHERE id = $1`
+	err = h.db.QueryRow(checkQuery, id).Scan(&existingTenantID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Transaction not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to check transaction", "error", err)
+		response.InternalError(c, "Failed to check transaction")
+		return
+	}
+	if existingTenantID != tenantID {
+		response.Forbidden(c, "Access denied")
+		return
+	}
+
+	// Delete transaction
+	deleteQuery := `DELETE FROM cargo_cash_transactions WHERE id = $1 AND tenant_id = $2`
+	_, err = h.db.Exec(deleteQuery, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete transaction", "error", err)
+		response.InternalError(c, "Failed to delete transaction")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Transaction deleted successfully"})
+}
+
 // =====================================================
 // HELPER FUNCTIONS
 // =====================================================
