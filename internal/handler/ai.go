@@ -18,6 +18,68 @@ type AIService struct {
 	rateLimiter *ai.RateLimiter
 }
 
+// detectLanguage detects the language of the message using simple heuristics
+func detectLanguage(message string) string {
+	msg := strings.ToLower(message)
+
+	// Uzbek detection - check for Uzbek-specific characters and words
+	uzbekWords := []string{"menga", "qanday", "ketayotgani", "muhim", "savdo", "ombor", "mahsulot",
+		"qaysi", "nima", "qachon", "qilish", "kerak", "uchun", "bilan", "ning", "dan", "ga"}
+	uzbekChars := []string{"o'", "g'", "sh", "ch"}
+
+	uzbekScore := 0
+	for _, word := range uzbekWords {
+		if strings.Contains(msg, word) {
+			uzbekScore += 2
+		}
+	}
+	for _, char := range uzbekChars {
+		if strings.Contains(msg, char) {
+			uzbekScore++
+		}
+	}
+
+	// Russian detection - check for Cyrillic characters
+	russianWords := []string{"как", "что", "когда", "почему", "продажи", "товары", "финансы"}
+	russianScore := 0
+	for _, word := range russianWords {
+		if strings.Contains(msg, word) {
+			russianScore += 2
+		}
+	}
+	// Check for Cyrillic characters
+	for _, r := range message {
+		if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') {
+			russianScore++
+			if russianScore > 3 {
+				break
+			}
+		}
+	}
+
+	// English detection
+	englishWords := []string{"what", "how", "when", "why", "sales", "inventory", "financial", "show", "tell"}
+	englishScore := 0
+	for _, word := range englishWords {
+		if strings.Contains(msg, word) {
+			englishScore += 2
+		}
+	}
+
+	// Return detected language
+	if uzbekScore > russianScore && uzbekScore > englishScore && uzbekScore > 2 {
+		return "Uzbek (O'zbek tili)"
+	}
+	if russianScore > uzbekScore && russianScore > englishScore && russianScore > 2 {
+		return "Russian (Русский)"
+	}
+	if englishScore > 2 {
+		return "English"
+	}
+
+	return "" // Could not detect with confidence
+}
+
 // NewAIService creates a new AI service
 func (h *Handler) getAIService() *AIService {
 	if h.config.AI.APIKey == "" {
@@ -84,6 +146,13 @@ func (h *Handler) AIChat(c *gin.Context) {
 	if systemPrompt == "" {
 		systemPrompt = h.getDefaultSystemPrompt(req.Context)
 	}
+
+	// Detect language from the actual message
+	detectedLang := detectLanguage(req.Message)
+	if detectedLang != "" {
+		systemPrompt += "\n\nIMPORTANT: The user just asked in " + detectedLang + ". Respond ONLY in " + detectedLang + "."
+	}
+
 	messages = append(messages, ai.Message{
 		Role:    "system",
 		Content: systemPrompt,
@@ -167,13 +236,19 @@ Guidelines:
 - Format responses with markdown for readability
 - When analyzing data, highlight key insights first
 - Always consider business impact in your suggestions
-- IMPORTANT: Respond in the same language as the user's question`
 
-	// Add language-specific instruction
+CRITICAL LANGUAGE RULE:
+- ALWAYS respond in the EXACT SAME LANGUAGE as the user's question
+- If user writes in Uzbek (O'zbek tili), respond ONLY in Uzbek
+- If user writes in Russian (Русский), respond ONLY in Russian
+- If user writes in English, respond ONLY in English
+- Never mix languages in your response`
+
+	// Add language-specific instruction based on detected preference
 	if userLang == "uz" {
-		prompt += "\n- User prefers Uzbek (O'zbek tili) - respond in Uzbek when user writes in Uzbek"
+		prompt += "\n- User's system language is Uzbek - expect most questions in O'zbek tili"
 	} else if userLang == "ru" {
-		prompt += "\n- User prefers Russian (Русский) - respond in Russian when user writes in Russian"
+		prompt += "\n- User's system language is Russian - expect most questions in Русский язык"
 	}
 
 	prompt += "\n\nCurrent context:\n- Date: " + time.Now().Format("2006-01-02")
