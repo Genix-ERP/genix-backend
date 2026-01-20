@@ -663,15 +663,13 @@ func (h *Handler) UpdateCargoShipment(c *gin.Context) {
 		return
 	}
 
-	userID, _ := middleware.GetUserID(c)
-
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid shipment ID")
 		return
 	}
 
-	var req entity.CreateCargoShipmentInput
+	var req entity.CreateCargoShipmentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid request body")
 		return
@@ -774,7 +772,7 @@ func (h *Handler) UpdateCargoCashTransaction(c *gin.Context) {
 		return
 	}
 
-	var req entity.CreateCargoCashTransactionInput
+	var req entity.CreateCashTransactionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid request body")
 		return
@@ -807,7 +805,7 @@ func (h *Handler) UpdateCargoCashTransaction(c *gin.Context) {
 	`
 	_, err = h.db.Exec(updateQuery,
 		req.TransactionType, req.Amount, req.Currency, req.Category,
-		req.Description, req.RelatedCompanyID, req.TransactionDate,
+		req.Description, req.RelatedTenantID, req.TransactionDate,
 		id, tenantID,
 	)
 	if err != nil {
