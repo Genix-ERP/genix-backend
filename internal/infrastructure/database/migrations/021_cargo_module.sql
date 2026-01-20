@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS cargo_shipment_status_history (
     status VARCHAR(50) NOT NULL,
     note TEXT,
     location VARCHAR(255),
-    changed_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    changed_by UUID REFERENCES users(id) ON DELETE SET NULL,
     changed_date TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
