@@ -712,9 +712,11 @@ func (h *Handler) UpdateCargoShipment(c *gin.Context) {
 		WHERE id = $10 AND tenant_id = $11
 	`
 	_, err = tx.Exec(updateQuery,
-		req.TrackingNumber, req.SupplierCountry, req.SupplierCompany,
+		req.TrackingNumber, req.SupplierCountry,
+		sql.NullString{String: req.SupplierCompany, Valid: req.SupplierCompany != ""},
 		req.ExpectedDate, req.TransportCost, req.CustomsCost,
-		req.InsuranceCost, req.OtherCost, req.Notes,
+		req.InsuranceCost, req.OtherCost,
+		sql.NullString{String: req.Notes, Valid: req.Notes != ""},
 		id, tenantID,
 	)
 	if err != nil {
