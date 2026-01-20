@@ -3,6 +3,8 @@ package entity
 import (
 	"database/sql"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // =====================================================
@@ -11,29 +13,28 @@ import (
 
 // CargoShipment represents a shipment in the cargo module
 type CargoShipment struct {
-	ID               int64          `json:"id" db:"id"`
-	CompanyID        int64          `json:"company_id" db:"company_id"`
-	TrackingNumber   string         `json:"tracking_number" db:"tracking_number"`
-	SupplierCountry  string         `json:"supplier_country" db:"supplier_country"`
-	SupplierCompany  sql.NullString `json:"supplier_company" db:"supplier_company"`
-	TransportType    string         `json:"transport_type" db:"transport_type"` // air, auto, rail, sea
-	ExpectedDate     sql.NullTime   `json:"expected_date" db:"expected_date"`
-	ActualArrivalDate sql.NullTime  `json:"actual_arrival_date" db:"actual_arrival_date"`
-	Status           string         `json:"status" db:"status"` // ordered, in_transit, in_customs, received, distributed
-	TransportCost    float64        `json:"transport_cost" db:"transport_cost"`
-	CustomsCost      float64        `json:"customs_cost" db:"customs_cost"`
-	InsuranceCost    float64        `json:"insurance_cost" db:"insurance_cost"`
-	OtherCost        float64        `json:"other_cost" db:"other_cost"`
-	TotalCost        float64        `json:"total_cost" db:"total_cost"`
-	Notes            sql.NullString `json:"notes" db:"notes"`
-	CreatedBy        sql.NullInt64  `json:"created_by" db:"created_by"`
-	CreatedDate      time.Time      `json:"created_date" db:"created_date"`
-	UpdatedDate      time.Time      `json:"updated_date" db:"updated_date"`
+	ID                int64          `json:"id" db:"id"`
+	TenantID          uuid.UUID      `json:"tenant_id" db:"tenant_id"`
+	TrackingNumber    string         `json:"tracking_number" db:"tracking_number"`
+	SupplierCountry   string         `json:"supplier_country" db:"supplier_country"`
+	SupplierCompany   sql.NullString `json:"supplier_company" db:"supplier_company"`
+	ExpectedDate      sql.NullTime   `json:"expected_date" db:"expected_date"`
+	ActualArrivalDate sql.NullTime   `json:"actual_arrival_date" db:"actual_arrival_date"`
+	Status            string         `json:"status" db:"status"` // ordered, in_transit, in_customs, received, distributed
+	TransportCost     float64        `json:"transport_cost" db:"transport_cost"`
+	CustomsCost       float64        `json:"customs_cost" db:"customs_cost"`
+	InsuranceCost     float64        `json:"insurance_cost" db:"insurance_cost"`
+	OtherCost         float64        `json:"other_cost" db:"other_cost"`
+	TotalCost         float64        `json:"total_cost" db:"total_cost"`
+	Notes             sql.NullString `json:"notes" db:"notes"`
+	CreatedBy         uuid.NullUUID  `json:"created_by" db:"created_by"`
+	CreatedDate       time.Time      `json:"created_date" db:"created_date"`
+	UpdatedDate       time.Time      `json:"updated_date" db:"updated_date"`
 
 	// Related entities (not in DB)
-	Items          []CargoShipmentItem         `json:"items,omitempty" db:"-"`
-	StatusHistory  []CargoShipmentStatusHistory `json:"status_history,omitempty" db:"-"`
-	Distributions  []CargoDistribution         `json:"distributions,omitempty" db:"-"`
+	Items         []CargoShipmentItem          `json:"items,omitempty" db:"-"`
+	StatusHistory []CargoShipmentStatusHistory `json:"status_history,omitempty" db:"-"`
+	Distributions []CargoDistribution          `json:"distributions,omitempty" db:"-"`
 }
 
 // CargoShipmentItem represents an item in a shipment
@@ -58,7 +59,7 @@ type CargoShipmentStatusHistory struct {
 	Status      string         `json:"status" db:"status"`
 	Note        sql.NullString `json:"note" db:"note"`
 	Location    sql.NullString `json:"location" db:"location"`
-	ChangedBy   sql.NullInt64  `json:"changed_by" db:"changed_by"`
+	ChangedBy   uuid.NullUUID  `json:"changed_by" db:"changed_by"`
 	ChangedDate time.Time      `json:"changed_date" db:"changed_date"`
 }
 
@@ -70,7 +71,7 @@ type CargoShipmentStatusHistory struct {
 type CargoDistribution struct {
 	ID                   int64          `json:"id" db:"id"`
 	ShipmentID           int64          `json:"shipment_id" db:"shipment_id"`
-	RecipientCompanyID   sql.NullInt64  `json:"recipient_company_id" db:"recipient_company_id"`
+	RecipientTenantID    uuid.NullUUID  `json:"recipient_tenant_id" db:"recipient_tenant_id"`
 	RecipientCompanyName string         `json:"recipient_company_name" db:"recipient_company_name"`
 	RecipientCompanyType string         `json:"recipient_company_type" db:"recipient_company_type"` // B2B, B2C
 	DistributionDate     time.Time      `json:"distribution_date" db:"distribution_date"`
@@ -80,7 +81,7 @@ type CargoDistribution struct {
 	InvoiceNumber        sql.NullString `json:"invoice_number" db:"invoice_number"`
 	WaybillNumber        sql.NullString `json:"waybill_number" db:"waybill_number"`
 	Notes                sql.NullString `json:"notes" db:"notes"`
-	CreatedBy            sql.NullInt64  `json:"created_by" db:"created_by"`
+	CreatedBy            uuid.NullUUID  `json:"created_by" db:"created_by"`
 	CreatedDate          time.Time      `json:"created_date" db:"created_date"`
 
 	// Related entities (not in DB)
@@ -104,20 +105,20 @@ type CargoDistributionItem struct {
 
 // CargoCashTransaction represents a cash transaction
 type CargoCashTransaction struct {
-	ID                int64          `json:"id" db:"id"`
-	CompanyID         int64          `json:"company_id" db:"company_id"`
-	TransactionType   string         `json:"transaction_type" db:"transaction_type"` // income, expense
-	Amount            float64        `json:"amount" db:"amount"`
-	Currency          string         `json:"currency" db:"currency"` // USD, UZS, EUR
-	Category          string         `json:"category" db:"category"` // transport, customs, insurance, payment_from_b2b, etc.
-	ShipmentID        sql.NullInt64  `json:"shipment_id" db:"shipment_id"`
-	DistributionID    sql.NullInt64  `json:"distribution_id" db:"distribution_id"`
-	RelatedCompanyID  sql.NullInt64  `json:"related_company_id" db:"related_company_id"`
-	Description       sql.NullString `json:"description" db:"description"`
-	ReferenceNumber   sql.NullString `json:"reference_number" db:"reference_number"`
-	TransactionDate   time.Time      `json:"transaction_date" db:"transaction_date"`
-	CreatedBy         sql.NullInt64  `json:"created_by" db:"created_by"`
-	CreatedDate       time.Time      `json:"created_date" db:"created_date"`
+	ID               int64          `json:"id" db:"id"`
+	TenantID         uuid.UUID      `json:"tenant_id" db:"tenant_id"`
+	TransactionType  string         `json:"transaction_type" db:"transaction_type"` // income, expense
+	Amount           float64        `json:"amount" db:"amount"`
+	Currency         string         `json:"currency" db:"currency"` // USD, UZS, EUR
+	Category         string         `json:"category" db:"category"`  // transport, customs, insurance, payment_from_b2b, etc.
+	ShipmentID       sql.NullInt64  `json:"shipment_id" db:"shipment_id"`
+	DistributionID   sql.NullInt64  `json:"distribution_id" db:"distribution_id"`
+	RelatedTenantID  uuid.NullUUID  `json:"related_tenant_id" db:"related_tenant_id"`
+	Description      sql.NullString `json:"description" db:"description"`
+	ReferenceNumber  sql.NullString `json:"reference_number" db:"reference_number"`
+	TransactionDate  time.Time      `json:"transaction_date" db:"transaction_date"`
+	CreatedBy        uuid.NullUUID  `json:"created_by" db:"created_by"`
+	CreatedDate      time.Time      `json:"created_date" db:"created_date"`
 }
 
 // CargoCompanyAccount represents B2B/B2C company account balances
@@ -141,16 +142,15 @@ type CargoCompanyAccount struct {
 
 // CreateCargoShipmentRequest represents request to create a shipment
 type CreateCargoShipmentRequest struct {
-	TrackingNumber  string                   `json:"tracking_number" binding:"required"`
-	SupplierCountry string                   `json:"supplier_country" binding:"required"`
-	SupplierCompany string                   `json:"supplier_company"`
-	TransportType   string                   `json:"transport_type" binding:"required,oneof=air auto rail sea"`
-	ExpectedDate    *time.Time               `json:"expected_date"`
-	TransportCost   float64                  `json:"transport_cost"`
-	CustomsCost     float64                  `json:"customs_cost"`
-	InsuranceCost   float64                  `json:"insurance_cost"`
-	OtherCost       float64                  `json:"other_cost"`
-	Notes           string                   `json:"notes"`
+	TrackingNumber  string                      `json:"tracking_number" binding:"required"`
+	SupplierCountry string                      `json:"supplier_country" binding:"required"`
+	SupplierCompany string                      `json:"supplier_company"`
+	ExpectedDate    *time.Time                  `json:"expected_date"`
+	TransportCost   float64                     `json:"transport_cost"`
+	CustomsCost     float64                     `json:"customs_cost"`
+	InsuranceCost   float64                     `json:"insurance_cost"`
+	OtherCost       float64                     `json:"other_cost"`
+	Notes           string                      `json:"notes"`
 	Items           []CreateShipmentItemRequest `json:"items" binding:"required,min=1"`
 }
 
@@ -173,12 +173,12 @@ type UpdateShipmentStatusRequest struct {
 
 // CreateDistributionRequest represents request to create a distribution
 type CreateDistributionRequest struct {
-	RecipientCompanyID   *int64                      `json:"recipient_company_id"`
-	RecipientCompanyName string                      `json:"recipient_company_name" binding:"required"`
-	RecipientCompanyType string                      `json:"recipient_company_type" binding:"required,oneof=B2B B2C"`
-	InvoiceNumber        string                      `json:"invoice_number"`
-	WaybillNumber        string                      `json:"waybill_number"`
-	Notes                string                      `json:"notes"`
+	RecipientTenantID    *uuid.UUID                      `json:"recipient_tenant_id"`
+	RecipientCompanyName string                          `json:"recipient_company_name" binding:"required"`
+	RecipientCompanyType string                          `json:"recipient_company_type" binding:"required,oneof=B2B B2C"`
+	InvoiceNumber        string                          `json:"invoice_number"`
+	WaybillNumber        string                          `json:"waybill_number"`
+	Notes                string                          `json:"notes"`
 	Items                []CreateDistributionItemRequest `json:"items" binding:"required,min=1"`
 }
 
@@ -191,16 +191,16 @@ type CreateDistributionItemRequest struct {
 
 // CreateCashTransactionRequest represents request to create a cash transaction
 type CreateCashTransactionRequest struct {
-	TransactionType  string     `json:"transaction_type" binding:"required,oneof=income expense"`
-	Amount           float64    `json:"amount" binding:"required,gt=0"`
-	Currency         string     `json:"currency" binding:"required,oneof=USD UZS EUR"`
-	Category         string     `json:"category" binding:"required"`
-	ShipmentID       *int64     `json:"shipment_id"`
-	DistributionID   *int64     `json:"distribution_id"`
-	RelatedCompanyID *int64     `json:"related_company_id"`
-	Description      string     `json:"description"`
-	ReferenceNumber  string     `json:"reference_number"`
-	TransactionDate  *time.Time `json:"transaction_date"`
+	TransactionType string     `json:"transaction_type" binding:"required,oneof=income expense"`
+	Amount          float64    `json:"amount" binding:"required,gt=0"`
+	Currency        string     `json:"currency" binding:"required,oneof=USD UZS EUR"`
+	Category        string     `json:"category" binding:"required"`
+	ShipmentID      *int64     `json:"shipment_id"`
+	DistributionID  *int64     `json:"distribution_id"`
+	RelatedTenantID *uuid.UUID `json:"related_tenant_id"`
+	Description     string     `json:"description"`
+	ReferenceNumber string     `json:"reference_number"`
+	TransactionDate *time.Time `json:"transaction_date"`
 }
 
 // CargoCashSummary represents cash register summary
