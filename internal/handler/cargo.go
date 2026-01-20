@@ -41,14 +41,14 @@ func (h *Handler) ListCargoShipments(c *gin.Context) {
 
 	// Build query
 	baseQuery := `
-		SELECT id, company_id, tracking_number, supplier_country, supplier_company,
-		       transport_type, expected_date, actual_arrival_date, status,
+		SELECT id, tenant_id, tracking_number, supplier_country, supplier_company,
+		       expected_date, actual_arrival_date, status,
 		       transport_cost, customs_cost, insurance_cost, other_cost, total_cost,
 		       notes, created_by, created_date, updated_date
 		FROM cargo_shipments
-		WHERE company_id = $1
+		WHERE tenant_id = $1
 	`
-	countQuery := `SELECT COUNT(*) FROM cargo_shipments WHERE company_id = $1`
+	countQuery := `SELECT COUNT(*) FROM cargo_shipments WHERE tenant_id = $1`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -94,8 +94,8 @@ func (h *Handler) ListCargoShipments(c *gin.Context) {
 	for rows.Next() {
 		var s entity.CargoShipment
 		if err := rows.Scan(
-			&s.ID, &s.CompanyID, &s.TrackingNumber, &s.SupplierCountry, &s.SupplierCompany,
-			&s.TransportType, &s.ExpectedDate, &s.ActualArrivalDate, &s.Status,
+			&s.ID, &s.TenantID, &s.TrackingNumber, &s.SupplierCountry, &s.SupplierCompany,
+			&s.ExpectedDate, &s.ActualArrivalDate, &s.Status,
 			&s.TransportCost, &s.CustomsCost, &s.InsuranceCost, &s.OtherCost, &s.TotalCost,
 			&s.Notes, &s.CreatedBy, &s.CreatedDate, &s.UpdatedDate,
 		); err != nil {
@@ -131,18 +131,18 @@ func (h *Handler) GetCargoShipment(c *gin.Context) {
 	}
 
 	query := `
-		SELECT id, company_id, tracking_number, supplier_country, supplier_company,
-		       transport_type, expected_date, actual_arrival_date, status,
+		SELECT id, tenant_id, tracking_number, supplier_country, supplier_company,
+		       expected_date, actual_arrival_date, status,
 		       transport_cost, customs_cost, insurance_cost, other_cost, total_cost,
 		       notes, created_by, created_date, updated_date
 		FROM cargo_shipments
-		WHERE id = $1 AND company_id = $2
+		WHERE id = $1 AND tenant_id = $2
 	`
 
 	var shipment entity.CargoShipment
 	err = h.db.QueryRow(query, id, tenantID).Scan(
-		&shipment.ID, &shipment.CompanyID, &shipment.TrackingNumber, &shipment.SupplierCountry, &shipment.SupplierCompany,
-		&shipment.TransportType, &shipment.ExpectedDate, &shipment.ActualArrivalDate, &shipment.Status,
+		&shipment.ID, &shipment.TenantID, &shipment.TrackingNumber, &shipment.SupplierCountry, &shipment.SupplierCompany,
+		&shipment.ExpectedDate, &shipment.ActualArrivalDate, &shipment.Status,
 		&shipment.TransportCost, &shipment.CustomsCost, &shipment.InsuranceCost, &shipment.OtherCost, &shipment.TotalCost,
 		&shipment.Notes, &shipment.CreatedBy, &shipment.CreatedDate, &shipment.UpdatedDate,
 	)
@@ -193,11 +193,11 @@ func (h *Handler) CreateCargoShipment(c *gin.Context) {
 	// Insert shipment
 	query := `
 		INSERT INTO cargo_shipments (
-			company_id, tracking_number, supplier_country, supplier_company,
-			transport_type, expected_date, status,
+			tenant_id, tracking_number, supplier_country, supplier_company,
+			expected_date, status,
 			transport_cost, customs_cost, insurance_cost, other_cost,
 			notes, created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
 		RETURNING id
 	`
 
@@ -209,7 +209,7 @@ func (h *Handler) CreateCargoShipment(c *gin.Context) {
 
 	err = tx.QueryRow(
 		query, tenantID, req.TrackingNumber, req.SupplierCountry, sql.NullString{String: req.SupplierCompany, Valid: req.SupplierCompany != ""},
-		req.TransportType, req.ExpectedDate, "ordered",
+		req.ExpectedDate, "ordered",
 		req.TransportCost, req.CustomsCost, req.InsuranceCost, req.OtherCost,
 		sql.NullString{String: req.Notes, Valid: req.Notes != ""}, createdByUUID,
 	).Scan(&shipmentID)
@@ -296,7 +296,7 @@ func (h *Handler) UpdateCargoShipmentStatus(c *gin.Context) {
 	query := `
 		UPDATE cargo_shipments
 		SET status = $1, updated_date = NOW()
-		WHERE id = $2 AND company_id = $3
+		WHERE id = $2 AND tenant_id = $3
 	`
 	result, err := tx.Exec(query, req.Status, id, tenantID)
 	if err != nil {
@@ -356,7 +356,7 @@ func (h *Handler) DeleteCargoShipment(c *gin.Context) {
 		return
 	}
 
-	query := `DELETE FROM cargo_shipments WHERE id = $1 AND company_id = $2`
+	query := `DELETE FROM cargo_shipments WHERE id = $1 AND tenant_id = $2`
 	result, err := h.db.Exec(query, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete shipment", "error", err)
@@ -422,7 +422,7 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 
 	query := `
 		INSERT INTO cargo_distributions (
-			shipment_id, recipient_company_id, recipient_company_name, recipient_company_type,
+			shipment_id, recipient_tenant_id, recipient_company_name, recipient_company_type,
 			distribution_date, total_items_cost, allocated_costs,
 			invoice_number, waybill_number, notes, created_by, created_date
 		) VALUES ($1, $2, $3, $4, NOW(), $5, $6, $7, $8, $9, $10, NOW())
@@ -431,7 +431,7 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 
 	var distID int64
 	err = tx.QueryRow(
-		query, id, req.RecipientCompanyID, req.RecipientCompanyName, req.RecipientCompanyType,
+		query, id, req.RecipientTenantID, req.RecipientCompanyName, req.RecipientCompanyType,
 		totalItemsCost, 0, // allocated_costs will be 0 for now
 		sql.NullString{String: req.InvoiceNumber, Valid: req.InvoiceNumber != ""},
 		sql.NullString{String: req.WaybillNumber, Valid: req.WaybillNumber != ""},
@@ -492,11 +492,11 @@ func (h *Handler) ListCargoCashTransactions(c *gin.Context) {
 	currency := c.Query("currency")
 
 	query := `
-		SELECT id, company_id, transaction_type, amount, currency, category,
-		       shipment_id, distribution_id, related_company_id, description, reference_number,
+		SELECT id, tenant_id, transaction_type, amount, currency, category,
+		       shipment_id, distribution_id, related_tenant_id, description, reference_number,
 		       transaction_date, created_by, created_date
 		FROM cargo_cash_transactions
-		WHERE company_id = $1
+		WHERE tenant_id = $1
 	`
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -527,8 +527,8 @@ func (h *Handler) ListCargoCashTransactions(c *gin.Context) {
 	for rows.Next() {
 		var t entity.CargoCashTransaction
 		if err := rows.Scan(
-			&t.ID, &t.CompanyID, &t.TransactionType, &t.Amount, &t.Currency, &t.Category,
-			&t.ShipmentID, &t.DistributionID, &t.RelatedCompanyID, &t.Description, &t.ReferenceNumber,
+			&t.ID, &t.TenantID, &t.TransactionType, &t.Amount, &t.Currency, &t.Category,
+			&t.ShipmentID, &t.DistributionID, &t.RelatedTenantID, &t.Description, &t.ReferenceNumber,
 			&t.TransactionDate, &t.CreatedBy, &t.CreatedDate,
 		); err != nil {
 			h.log.Error("Failed to scan transaction", "error", err)
@@ -568,8 +568,8 @@ func (h *Handler) CreateCargoCashTransaction(c *gin.Context) {
 
 	query := `
 		INSERT INTO cargo_cash_transactions (
-			company_id, transaction_type, amount, currency, category,
-			shipment_id, distribution_id, related_company_id, description, reference_number,
+			tenant_id, transaction_type, amount, currency, category,
+			shipment_id, distribution_id, related_tenant_id, description, reference_number,
 			transaction_date, created_by, created_date
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
 		RETURNING id
@@ -578,7 +578,7 @@ func (h *Handler) CreateCargoCashTransaction(c *gin.Context) {
 	var transactionID int64
 	err := h.db.QueryRow(
 		query, tenantID, req.TransactionType, req.Amount, req.Currency, req.Category,
-		req.ShipmentID, req.DistributionID, req.RelatedCompanyID,
+		req.ShipmentID, req.DistributionID, req.RelatedTenantID,
 		sql.NullString{String: req.Description, Valid: req.Description != ""},
 		sql.NullString{String: req.ReferenceNumber, Valid: req.ReferenceNumber != ""},
 		transactionDate, createdByUUID,
@@ -608,7 +608,7 @@ func (h *Handler) GetCargoCashSummary(c *gin.Context) {
 			COALESCE(SUM(CASE WHEN currency = 'USD' AND transaction_type = 'income' THEN amount ELSE 0 END), 0) -
 			COALESCE(SUM(CASE WHEN currency = 'USD' AND transaction_type = 'expense' THEN amount ELSE 0 END), 0) as usd_balance
 		FROM cargo_cash_transactions
-		WHERE company_id = $1
+		WHERE tenant_id = $1
 	`
 
 	var summary entity.CargoCashSummary
@@ -621,11 +621,11 @@ func (h *Handler) GetCargoCashSummary(c *gin.Context) {
 
 	// Get recent transactions
 	txQuery := `
-		SELECT id, company_id, transaction_type, amount, currency, category,
-		       shipment_id, distribution_id, related_company_id, description, reference_number,
+		SELECT id, tenant_id, transaction_type, amount, currency, category,
+		       shipment_id, distribution_id, related_tenant_id, description, reference_number,
 		       transaction_date, created_by, created_date
 		FROM cargo_cash_transactions
-		WHERE company_id = $1
+		WHERE tenant_id = $1
 		ORDER BY transaction_date DESC
 		LIMIT 100
 	`
@@ -642,8 +642,8 @@ func (h *Handler) GetCargoCashSummary(c *gin.Context) {
 	for rows.Next() {
 		var t entity.CargoCashTransaction
 		if err := rows.Scan(
-			&t.ID, &t.CompanyID, &t.TransactionType, &t.Amount, &t.Currency, &t.Category,
-			&t.ShipmentID, &t.DistributionID, &t.RelatedCompanyID, &t.Description, &t.ReferenceNumber,
+			&t.ID, &t.TenantID, &t.TransactionType, &t.Amount, &t.Currency, &t.Category,
+			&t.ShipmentID, &t.DistributionID, &t.RelatedTenantID, &t.Description, &t.ReferenceNumber,
 			&t.TransactionDate, &t.CreatedBy, &t.CreatedDate,
 		); err != nil {
 			h.log.Error("Failed to scan transaction", "error", err)
