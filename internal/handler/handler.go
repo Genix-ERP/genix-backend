@@ -757,6 +757,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		cargoShipments.GET("", h.ListCargoShipments)
 		cargoShipments.POST("", middleware.RequirePermission("cargo", "shipment", "create"), h.CreateCargoShipment)
 		cargoShipments.GET("/:id", h.GetCargoShipment)
+		cargoShipments.PUT("/:id", middleware.RequirePermission("cargo", "shipment", "update"), h.UpdateCargoShipment)
 		cargoShipments.PUT("/:id/status", middleware.RequirePermission("cargo", "shipment", "update"), h.UpdateCargoShipmentStatus)
 		cargoShipments.DELETE("/:id", middleware.RequirePermission("cargo", "shipment", "delete"), h.DeleteCargoShipment)
 		cargoShipments.POST("/:id/distribution", middleware.RequirePermission("cargo", "distribution", "create"), h.CreateCargoDistribution)
@@ -768,6 +769,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		cargoCash.GET("", h.ListCargoCashTransactions)
 		cargoCash.POST("", middleware.RequirePermission("cargo", "cash", "create"), h.CreateCargoCashTransaction)
+		cargoCash.PUT("/:id", middleware.RequirePermission("cargo", "cash", "update"), h.UpdateCargoCashTransaction)
+		cargoCash.DELETE("/:id", middleware.RequirePermission("cargo", "cash", "delete"), h.DeleteCargoCashTransaction)
 		cargoCash.GET("/summary", h.GetCargoCashSummary)
 	}
 }
