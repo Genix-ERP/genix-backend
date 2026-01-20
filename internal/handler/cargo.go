@@ -702,22 +702,19 @@ func (h *Handler) UpdateCargoShipment(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Calculate total cost
-	totalCost := req.TransportCost + req.CustomsCost + req.InsuranceCost + req.OtherCost
-
-	// Update shipment
+	// Update shipment (total_cost is a generated column, don't update it directly)
 	updateQuery := `
 		UPDATE cargo_shipments
 		SET tracking_number = $1, supplier_country = $2, supplier_company = $3,
 		    expected_date = $4, transport_cost = $5, customs_cost = $6,
-		    insurance_cost = $7, other_cost = $8, total_cost = $9, notes = $10,
+		    insurance_cost = $7, other_cost = $8, notes = $9,
 		    updated_date = NOW()
-		WHERE id = $11 AND tenant_id = $12
+		WHERE id = $10 AND tenant_id = $11
 	`
 	_, err = tx.Exec(updateQuery,
 		req.TrackingNumber, req.SupplierCountry, req.SupplierCompany,
 		req.ExpectedDate, req.TransportCost, req.CustomsCost,
-		req.InsuranceCost, req.OtherCost, totalCost, req.Notes,
+		req.InsuranceCost, req.OtherCost, req.Notes,
 		id, tenantID,
 	)
 	if err != nil {
