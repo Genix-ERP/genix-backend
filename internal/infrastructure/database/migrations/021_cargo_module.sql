@@ -4,11 +4,10 @@
 -- Shipments table
 CREATE TABLE IF NOT EXISTS cargo_shipments (
     id BIGSERIAL PRIMARY KEY,
-    company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     tracking_number VARCHAR(255) NOT NULL,
     supplier_country VARCHAR(100) NOT NULL,
     supplier_company VARCHAR(255),
-    transport_type VARCHAR(50) NOT NULL CHECK (transport_type IN ('air', 'auto', 'rail', 'sea')),
 
     -- Dates
     expected_date TIMESTAMP,
@@ -26,14 +25,14 @@ CREATE TABLE IF NOT EXISTS cargo_shipments (
 
     -- Metadata
     notes TEXT,
-    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
     created_date TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_date TIMESTAMP NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT unique_tracking_per_company UNIQUE (company_id, tracking_number)
+    CONSTRAINT unique_tracking_per_tenant UNIQUE (tenant_id, tracking_number)
 );
 
-CREATE INDEX idx_cargo_shipments_company ON cargo_shipments(company_id);
+CREATE INDEX idx_cargo_shipments_tenant ON cargo_shipments(tenant_id);
 CREATE INDEX idx_cargo_shipments_status ON cargo_shipments(status);
 CREATE INDEX idx_cargo_shipments_tracking ON cargo_shipments(tracking_number);
 CREATE INDEX idx_cargo_shipments_expected_date ON cargo_shipments(expected_date);
@@ -80,7 +79,7 @@ CREATE TABLE IF NOT EXISTS cargo_distributions (
     shipment_id BIGINT NOT NULL REFERENCES cargo_shipments(id) ON DELETE CASCADE,
 
     -- Recipient company
-    recipient_company_id BIGINT REFERENCES companies(id) ON DELETE SET NULL,
+    recipient_tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
     recipient_company_name VARCHAR(255) NOT NULL,
     recipient_company_type VARCHAR(10) NOT NULL CHECK (recipient_company_type IN ('B2B', 'B2C')),
 
@@ -95,12 +94,12 @@ CREATE TABLE IF NOT EXISTS cargo_distributions (
     waybill_number VARCHAR(100),
 
     notes TEXT,
-    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
     created_date TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_cargo_distributions_shipment ON cargo_distributions(shipment_id);
-CREATE INDEX idx_cargo_distributions_recipient ON cargo_distributions(recipient_company_id);
+CREATE INDEX idx_cargo_distributions_recipient ON cargo_distributions(recipient_tenant_id);
 CREATE INDEX idx_cargo_distributions_date ON cargo_distributions(distribution_date);
 
 -- Distribution items table
@@ -122,7 +121,7 @@ CREATE INDEX idx_cargo_dist_items_shipment_item ON cargo_distribution_items(ship
 -- Cargo cash register table
 CREATE TABLE IF NOT EXISTS cargo_cash_transactions (
     id BIGSERIAL PRIMARY KEY,
-    company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
 
     -- Transaction details
     transaction_type VARCHAR(20) NOT NULL CHECK (transaction_type IN ('income', 'expense')),
@@ -138,7 +137,7 @@ CREATE TABLE IF NOT EXISTS cargo_cash_transactions (
     -- References
     shipment_id BIGINT REFERENCES cargo_shipments(id) ON DELETE SET NULL,
     distribution_id BIGINT REFERENCES cargo_distributions(id) ON DELETE SET NULL,
-    related_company_id BIGINT REFERENCES companies(id) ON DELETE SET NULL,
+    related_tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
 
     -- Details
     description TEXT,
@@ -146,11 +145,11 @@ CREATE TABLE IF NOT EXISTS cargo_cash_transactions (
 
     -- Metadata
     transaction_date TIMESTAMP NOT NULL DEFAULT NOW(),
-    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
     created_date TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_cargo_cash_company ON cargo_cash_transactions(company_id);
+CREATE INDEX idx_cargo_cash_tenant ON cargo_cash_transactions(tenant_id);
 CREATE INDEX idx_cargo_cash_type ON cargo_cash_transactions(transaction_type);
 CREATE INDEX idx_cargo_cash_category ON cargo_cash_transactions(category);
 CREATE INDEX idx_cargo_cash_date ON cargo_cash_transactions(transaction_date);
@@ -159,8 +158,8 @@ CREATE INDEX idx_cargo_cash_shipment ON cargo_cash_transactions(shipment_id);
 -- Company accounts table (B2B/B2C accounts receivable/payable)
 CREATE TABLE IF NOT EXISTS cargo_company_accounts (
     id BIGSERIAL PRIMARY KEY,
-    cargo_company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
-    related_company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    cargo_tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    related_tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     company_type VARCHAR(10) NOT NULL CHECK (company_type IN ('B2B', 'B2C')),
 
     -- Balances
@@ -176,11 +175,11 @@ CREATE TABLE IF NOT EXISTS cargo_company_accounts (
     created_date TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_date TIMESTAMP NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT unique_cargo_company_account UNIQUE (cargo_company_id, related_company_id)
+    CONSTRAINT unique_cargo_tenant_account UNIQUE (cargo_tenant_id, related_tenant_id)
 );
 
-CREATE INDEX idx_cargo_accounts_cargo_company ON cargo_company_accounts(cargo_company_id);
-CREATE INDEX idx_cargo_accounts_related_company ON cargo_company_accounts(related_company_id);
+CREATE INDEX idx_cargo_accounts_cargo_tenant ON cargo_company_accounts(cargo_tenant_id);
+CREATE INDEX idx_cargo_accounts_related_tenant ON cargo_company_accounts(related_tenant_id);
 
 -- Triggers for updated_date
 CREATE OR REPLACE FUNCTION update_cargo_updated_date()
