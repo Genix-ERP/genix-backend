@@ -142,6 +142,14 @@ func (h *Handler) AIChat(c *gin.Context) {
 
 // getDefaultSystemPrompt returns the default system prompt for GenixERP
 func (h *Handler) getDefaultSystemPrompt(context map[string]interface{}) string {
+	// Detect user language from context
+	userLang := "en"
+	if context != nil {
+		if lang, ok := context["user_language"].(string); ok {
+			userLang = lang
+		}
+	}
+
 	prompt := `You are GenixERP AI Assistant, an intelligent business advisor integrated into an Enterprise Resource Planning system.
 
 Your capabilities include:
@@ -154,14 +162,21 @@ Your capabilities include:
 
 Guidelines:
 - Be concise but thorough in your responses
-- Use data and metrics when available
+- Use data and metrics when available from the business_data provided in context
 - Provide actionable recommendations
 - Format responses with markdown for readability
 - When analyzing data, highlight key insights first
 - Always consider business impact in your suggestions
+- IMPORTANT: Respond in the same language as the user's question`
 
-Current context:
-- Date: ` + time.Now().Format("2006-01-02")
+	// Add language-specific instruction
+	if userLang == "uz" {
+		prompt += "\n- User prefers Uzbek (O'zbek tili) - respond in Uzbek when user writes in Uzbek"
+	} else if userLang == "ru" {
+		prompt += "\n- User prefers Russian (Русский) - respond in Russian when user writes in Russian"
+	}
+
+	prompt += "\n\nCurrent context:\n- Date: " + time.Now().Format("2006-01-02")
 
 	if context != nil {
 		if module, ok := context["module"].(string); ok {
@@ -169,6 +184,9 @@ Current context:
 		}
 		if page, ok := context["page"].(string); ok {
 			prompt += "\n- Current page: " + page
+		}
+		if businessData, ok := context["business_data"].(map[string]interface{}); ok && businessData != nil {
+			prompt += "\n- Real business data is available in context - use it for accurate analysis"
 		}
 	}
 
