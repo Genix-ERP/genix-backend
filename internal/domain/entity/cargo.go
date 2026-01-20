@@ -142,7 +142,7 @@ type CargoCompanyAccount struct {
 
 // CreateCargoShipmentRequest represents request to create a shipment
 type CreateCargoShipmentRequest struct {
-	TrackingNumber  string                      `json:"tracking_number" binding:"required"`
+	TrackingNumber  string                      `json:"tracking_number"`
 	SupplierCountry string                      `json:"supplier_country"`
 	SupplierCompany string                      `json:"supplier_company"`
 	ExpectedDate    *time.Time                  `json:"expected_date"`
@@ -158,7 +158,7 @@ type CreateCargoShipmentRequest struct {
 type CreateShipmentItemRequest struct {
 	ItemName    string  `json:"item_name" binding:"required"`
 	Quantity    float64 `json:"quantity" binding:"required,gt=0"`
-	UnitPrice   float64 `json:"unit_price" binding:"required,gt=0"`
+	UnitPrice   float64 `json:"unit_price"`
 	Currency    string  `json:"currency" binding:"required,oneof=USD UZS EUR"`
 	HSCode      string  `json:"hs_code"`
 	Description string  `json:"description"`
