@@ -731,14 +731,15 @@ func (h *Handler) UpdateCargoShipment(c *gin.Context) {
 		return
 	}
 
-	// Insert new items
+	// Insert new items (total_price is a generated column)
 	itemQuery := `
-		INSERT INTO cargo_shipment_items (shipment_id, item_name, quantity, unit_price, currency, total_price, hs_code, description, created_date, updated_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+		INSERT INTO cargo_shipment_items (shipment_id, item_name, quantity, unit_price, currency, hs_code, description, created_date, updated_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
 	`
 	for _, item := range req.Items {
-		totalPrice := item.Quantity * item.UnitPrice
-		_, err = tx.Exec(itemQuery, id, item.ItemName, item.Quantity, item.UnitPrice, item.Currency, totalPrice, item.HSCode, item.Description)
+		_, err = tx.Exec(itemQuery, id, item.ItemName, item.Quantity, item.UnitPrice, item.Currency,
+			sql.NullString{String: item.HSCode, Valid: item.HSCode != ""},
+			sql.NullString{String: item.Description, Valid: item.Description != ""})
 		if err != nil {
 			h.log.Error("Failed to insert shipment item", "error", err)
 			response.InternalError(c, "Failed to update shipment items")
