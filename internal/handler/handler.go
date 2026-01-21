@@ -235,6 +235,26 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		warehouses.DELETE("/:id", h.DeleteWarehouse)
 		warehouses.GET("/:id/locations", h.ListWarehouseLocations)
 		warehouses.POST("/:id/locations", h.CreateWarehouseLocation)
+		warehouses.PUT("/:id/locations/:locationId", h.UpdateWarehouseLocation)
+		warehouses.DELETE("/:id/locations/:locationId", h.DeleteWarehouseLocation)
+		warehouses.GET("/:id/operation-types", h.GetWarehouseOperationTypes)
+	}
+
+	// Warehouse Locations (global - for cross-warehouse view like Odoo)
+	locations := rg.Group("/locations")
+	locations.Use(middleware.RequirePermission("inventory", "warehouse", "read"))
+	{
+		locations.GET("", h.ListAllLocations)
+	}
+
+	// Warehouse Operation Types
+	operationTypes := rg.Group("/operation-types")
+	operationTypes.Use(middleware.RequirePermission("inventory", "warehouse", "read"))
+	{
+		operationTypes.GET("", h.ListOperationTypes)
+		operationTypes.POST("", middleware.RequirePermission("inventory", "warehouse", "create"), h.CreateOperationType)
+		operationTypes.PUT("/:id", middleware.RequirePermission("inventory", "warehouse", "update"), h.UpdateOperationType)
+		operationTypes.DELETE("/:id", middleware.RequirePermission("inventory", "warehouse", "delete"), h.DeleteOperationType)
 	}
 
 	// Inventory
@@ -772,6 +792,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		cargoCash.PUT("/:id", middleware.RequirePermission("cargo", "cash", "update"), h.UpdateCargoCashTransaction)
 		cargoCash.DELETE("/:id", middleware.RequirePermission("cargo", "cash", "delete"), h.DeleteCargoCashTransaction)
 		cargoCash.GET("/summary", h.GetCargoCashSummary)
+	}
+
+	// =====================================================
+	// INSTALLED APPS ROUTES
+	// =====================================================
+	installedApps := rg.Group("/installed-apps")
+	{
+		installedApps.GET("", h.ListInstalledApps)
+		installedApps.POST("", h.InstallApp)
+		installedApps.GET("/:app_id", h.GetInstalledApp)
+		installedApps.PUT("/:app_id", h.UpdateInstalledApp)
+		installedApps.DELETE("/:app_id", h.UninstallApp)
 	}
 }
 

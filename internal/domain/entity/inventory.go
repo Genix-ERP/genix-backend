@@ -17,8 +17,12 @@ type Warehouse struct {
 	ManagerID      *uuid.UUID   `json:"manager_id,omitempty" db:"manager_id"`
 	IsDefault      bool         `json:"is_default" db:"is_default"`
 	IsActive       bool         `json:"is_active" db:"is_active"`
-	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
+	// Odoo-style warehouse operation steps
+	// 1 = Direct, 2 = 2-step, 3 = 3-step
+	ReceptionSteps int       `json:"reception_steps" db:"reception_steps"` // 1=Receive to stock, 2=Input+Stock, 3=Input+QC+Stock
+	DeliverySteps  int       `json:"delivery_steps" db:"delivery_steps"`   // 1=Deliver from stock, 2=Pick+Ship, 3=Pick+Pack+Ship
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
 
 	// Relationships
 	Locations []WarehouseLocation `json:"locations,omitempty"`
@@ -112,20 +116,24 @@ type InventoryTransaction struct {
 
 // CreateWarehouseInput represents input for creating a warehouse
 type CreateWarehouseInput struct {
-	Code      string   `json:"code" binding:"required,min=1,max=50"`
-	Name      string   `json:"name" binding:"required,min=1,max=255"`
-	Address   *Address `json:"address,omitempty"`
-	ManagerID string   `json:"manager_id,omitempty"`
-	IsDefault bool     `json:"is_default,omitempty"`
+	Code           string   `json:"code" binding:"required,min=1,max=50"`
+	Name           string   `json:"name" binding:"required,min=1,max=255"`
+	Address        *Address `json:"address,omitempty"`
+	ManagerID      string   `json:"manager_id,omitempty"`
+	IsDefault      bool     `json:"is_default,omitempty"`
+	ReceptionSteps int      `json:"reception_steps,omitempty"` // 1=Direct, 2=Input+Stock, 3=Input+QC+Stock
+	DeliverySteps  int      `json:"delivery_steps,omitempty"`  // 1=Direct, 2=Pick+Ship, 3=Pick+Pack+Ship
 }
 
 // UpdateWarehouseInput represents input for updating a warehouse
 type UpdateWarehouseInput struct {
-	Name      *string  `json:"name,omitempty"`
-	Address   *Address `json:"address,omitempty"`
-	ManagerID *string  `json:"manager_id,omitempty"`
-	IsDefault *bool    `json:"is_default,omitempty"`
-	IsActive  *bool    `json:"is_active,omitempty"`
+	Name           *string  `json:"name,omitempty"`
+	Address        *Address `json:"address,omitempty"`
+	ManagerID      *string  `json:"manager_id,omitempty"`
+	IsDefault      *bool    `json:"is_default,omitempty"`
+	IsActive       *bool    `json:"is_active,omitempty"`
+	ReceptionSteps *int     `json:"reception_steps,omitempty"` // 1=Direct, 2=Input+Stock, 3=Input+QC+Stock
+	DeliverySteps  *int     `json:"delivery_steps,omitempty"`  // 1=Direct, 2=Pick+Ship, 3=Pick+Pack+Ship
 }
 
 // CreateWarehouseLocationInput represents input for creating a warehouse location
@@ -214,6 +222,102 @@ type StockMovementReport struct {
 type WarehouseListFilter struct {
 	Search   string `form:"search"`
 	IsActive *bool  `form:"is_active"`
+}
+
+// =====================================================
+// WAREHOUSE OPERATION TYPES (Odoo-style)
+// =====================================================
+
+// OperationTypeCode represents the type of warehouse operation
+type OperationTypeCode string
+
+const (
+	OperationTypeReceipt  OperationTypeCode = "receipt"
+	OperationTypeInternal OperationTypeCode = "internal"
+	OperationTypeDelivery OperationTypeCode = "delivery"
+	OperationTypePOS      OperationTypeCode = "pos"
+	OperationTypeCustom   OperationTypeCode = "custom"
+)
+
+// WarehouseOperationType represents a type of warehouse operation
+type WarehouseOperationType struct {
+	ID                     uuid.UUID         `json:"id" db:"id"`
+	TenantID               uuid.UUID         `json:"tenant_id" db:"tenant_id"`
+	WarehouseID            uuid.UUID         `json:"warehouse_id" db:"warehouse_id"`
+	Code                   string            `json:"code" db:"code"`
+	Name                   string            `json:"name" db:"name"`
+	Type                   OperationTypeCode `json:"type" db:"type"`
+	Sequence               int               `json:"sequence" db:"sequence"`
+	DefaultLocationSrcID   *uuid.UUID        `json:"default_location_src_id,omitempty" db:"default_location_src_id"`
+	DefaultLocationDestID  *uuid.UUID        `json:"default_location_dest_id,omitempty" db:"default_location_dest_id"`
+	ShowOperations         bool              `json:"show_operations" db:"show_operations"`
+	ShowReserved           bool              `json:"show_reserved" db:"show_reserved"`
+	BarcodeEnabled         bool              `json:"barcode_enabled" db:"barcode_enabled"`
+	CreateBackorder        bool              `json:"create_backorder" db:"create_backorder"`
+	ReservationMethod      string            `json:"reservation_method" db:"reservation_method"`
+	ReturnPickingTypeID    *uuid.UUID        `json:"return_picking_type_id,omitempty" db:"return_picking_type_id"`
+	Color                  string            `json:"color" db:"color"`
+	CountPickingReady      int               `json:"count_picking_ready" db:"count_picking_ready"`
+	CountPickingLate       int               `json:"count_picking_late" db:"count_picking_late"`
+	CountPickingWaiting    int               `json:"count_picking_waiting" db:"count_picking_waiting"`
+	CountPickingBackorders int               `json:"count_picking_backorders" db:"count_picking_backorders"`
+	IsActive               bool              `json:"is_active" db:"is_active"`
+	CreatedAt              time.Time         `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time         `json:"updated_at" db:"updated_at"`
+
+	// Relationships
+	Warehouse *Warehouse `json:"warehouse,omitempty"`
+}
+
+// CreateOperationTypeInput represents input for creating an operation type
+type CreateOperationTypeInput struct {
+	WarehouseID           string `json:"warehouse_id" binding:"required"`
+	Code                  string `json:"code" binding:"required,min=1,max=50"`
+	Name                  string `json:"name" binding:"required,min=1,max=255"`
+	Type                  string `json:"type,omitempty"`
+	Sequence              int    `json:"sequence,omitempty"`
+	DefaultLocationSrcID  string `json:"default_location_src_id,omitempty"`
+	DefaultLocationDestID string `json:"default_location_dest_id,omitempty"`
+	ShowOperations        *bool  `json:"show_operations,omitempty"`
+	BarcodeEnabled        *bool  `json:"barcode_enabled,omitempty"`
+	CreateBackorder       *bool  `json:"create_backorder,omitempty"`
+	ReservationMethod     string `json:"reservation_method,omitempty"`
+	Color                 string `json:"color,omitempty"`
+}
+
+// UpdateOperationTypeInput represents input for updating an operation type
+type UpdateOperationTypeInput struct {
+	Name                  *string `json:"name,omitempty"`
+	Sequence              *int    `json:"sequence,omitempty"`
+	DefaultLocationSrcID  *string `json:"default_location_src_id,omitempty"`
+	DefaultLocationDestID *string `json:"default_location_dest_id,omitempty"`
+	ShowOperations        *bool   `json:"show_operations,omitempty"`
+	ShowReserved          *bool   `json:"show_reserved,omitempty"`
+	BarcodeEnabled        *bool   `json:"barcode_enabled,omitempty"`
+	CreateBackorder       *bool   `json:"create_backorder,omitempty"`
+	ReservationMethod     *string `json:"reservation_method,omitempty"`
+	ReturnPickingTypeID   *string `json:"return_picking_type_id,omitempty"`
+	Color                 *string `json:"color,omitempty"`
+	IsActive              *bool   `json:"is_active,omitempty"`
+}
+
+// OperationTypeResponse represents the API response for an operation type
+type OperationTypeResponse struct {
+	ID                     uuid.UUID `json:"id"`
+	WarehouseID            uuid.UUID `json:"warehouse_id"`
+	WarehouseName          string    `json:"warehouse_name,omitempty"`
+	Code                   string    `json:"code"`
+	Name                   string    `json:"name"`
+	Type                   string    `json:"type"`
+	Sequence               int       `json:"sequence"`
+	Color                  string    `json:"color"`
+	ShowOperations         bool      `json:"show_operations"`
+	CountPickingReady      int       `json:"count_picking_ready"`
+	CountPickingLate       int       `json:"count_picking_late"`
+	CountPickingWaiting    int       `json:"count_picking_waiting"`
+	CountPickingBackorders int       `json:"count_picking_backorders"`
+	IsActive               bool      `json:"is_active"`
+	CreatedAt              time.Time `json:"created_at"`
 }
 
 // InventoryValuationReport represents inventory valuation

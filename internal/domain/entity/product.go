@@ -92,6 +92,14 @@ type Product struct {
 	Notes              *string         `json:"notes,omitempty" db:"notes"`
 	IsPurchasable      bool            `json:"is_purchasable" db:"is_purchasable"`
 	IsSellable         bool            `json:"is_sellable" db:"is_sellable"`
+	// Module visibility fields (Odoo-style)
+	CanBeSold          bool            `json:"can_be_sold" db:"can_be_sold"`
+	CanBePurchased     bool            `json:"can_be_purchased" db:"can_be_purchased"`
+	AvailableInPOS     bool            `json:"available_in_pos" db:"available_in_pos"`
+	CanBeExpensed      bool            `json:"can_be_expensed" db:"can_be_expensed"`
+	CanBeRented        bool            `json:"can_be_rented" db:"can_be_rented"`
+	CanBeSubcontracted bool            `json:"can_be_subcontracted" db:"can_be_subcontracted"`
+	IsOverheadExpense  bool            `json:"is_overhead_expense" db:"is_overhead_expense"`
 	IsActive           bool            `json:"is_active" db:"is_active"`
 	CreatedBy          *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
@@ -125,9 +133,17 @@ type CreateProductInput struct {
 	MinStockLevel    float64     `json:"min_stock_level"`
 	ReorderPoint     float64     `json:"reorder_point"`
 	ReorderQuantity  float64     `json:"reorder_quantity"`
-	IsPurchasable    *bool       `json:"is_purchasable,omitempty"`
-	IsSellable       *bool       `json:"is_sellable,omitempty"`
-	Tags             []string    `json:"tags,omitempty"`
+	IsPurchasable      *bool    `json:"is_purchasable,omitempty"`
+	IsSellable         *bool    `json:"is_sellable,omitempty"`
+	// Module visibility fields
+	CanBeSold          *bool    `json:"can_be_sold,omitempty"`
+	CanBePurchased     *bool    `json:"can_be_purchased,omitempty"`
+	AvailableInPOS     *bool    `json:"available_in_pos,omitempty"`
+	CanBeExpensed      *bool    `json:"can_be_expensed,omitempty"`
+	CanBeRented        *bool    `json:"can_be_rented,omitempty"`
+	CanBeSubcontracted *bool    `json:"can_be_subcontracted,omitempty"`
+	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
+	Tags               []string `json:"tags,omitempty"`
 }
 
 // UpdateProductInput represents input for updating a product
@@ -147,10 +163,18 @@ type UpdateProductInput struct {
 	MinStockLevel    *float64    `json:"min_stock_level,omitempty"`
 	ReorderPoint     *float64    `json:"reorder_point,omitempty"`
 	ReorderQuantity  *float64    `json:"reorder_quantity,omitempty"`
-	IsPurchasable    *bool       `json:"is_purchasable,omitempty"`
-	IsSellable       *bool       `json:"is_sellable,omitempty"`
-	IsActive         *bool       `json:"is_active,omitempty"`
-	Tags             []string    `json:"tags,omitempty"`
+	IsPurchasable      *bool    `json:"is_purchasable,omitempty"`
+	IsSellable         *bool    `json:"is_sellable,omitempty"`
+	// Module visibility fields
+	CanBeSold          *bool    `json:"can_be_sold,omitempty"`
+	CanBePurchased     *bool    `json:"can_be_purchased,omitempty"`
+	AvailableInPOS     *bool    `json:"available_in_pos,omitempty"`
+	CanBeExpensed      *bool    `json:"can_be_expensed,omitempty"`
+	CanBeRented        *bool    `json:"can_be_rented,omitempty"`
+	CanBeSubcontracted *bool    `json:"can_be_subcontracted,omitempty"`
+	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
+	IsActive           *bool    `json:"is_active,omitempty"`
+	Tags               []string `json:"tags,omitempty"`
 }
 
 // ProductListFilter represents filters for listing products
@@ -181,10 +205,18 @@ type ProductResponse struct {
 	IsStockable      bool             `json:"is_stockable"`
 	TrackInventory   bool             `json:"track_inventory"`
 	MinStockLevel    float64          `json:"min_stock_level"`
-	IsPurchasable    bool             `json:"is_purchasable"`
-	IsSellable       bool             `json:"is_sellable"`
-	IsActive         bool             `json:"is_active"`
-	Tags             []string         `json:"tags"`
-	CreatedAt        time.Time        `json:"created_at"`
-	UpdatedAt        time.Time        `json:"updated_at"`
+	IsPurchasable      bool      `json:"is_purchasable"`
+	IsSellable         bool      `json:"is_sellable"`
+	// Module visibility fields
+	CanBeSold          bool      `json:"can_be_sold"`
+	CanBePurchased     bool      `json:"can_be_purchased"`
+	AvailableInPOS     bool      `json:"available_in_pos"`
+	CanBeExpensed      bool      `json:"can_be_expensed"`
+	CanBeRented        bool      `json:"can_be_rented"`
+	CanBeSubcontracted bool      `json:"can_be_subcontracted"`
+	IsOverheadExpense  bool      `json:"is_overhead_expense"`
+	IsActive           bool      `json:"is_active"`
+	Tags               []string  `json:"tags"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }

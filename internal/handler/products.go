@@ -51,7 +51,15 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   p.cost_price, p.list_price, p.min_price,
 			   p.is_stockable, p.track_inventory, p.min_stock_level,
 			   p.reorder_point, p.reorder_quantity, p.lead_time_days,
-			   p.is_purchasable, p.is_sellable, p.is_active, p.tags,
+			   p.is_purchasable, p.is_sellable,
+			   COALESCE(p.can_be_sold, p.is_sellable) as can_be_sold,
+			   COALESCE(p.can_be_purchased, p.is_purchasable) as can_be_purchased,
+			   COALESCE(p.available_in_pos, false) as available_in_pos,
+			   COALESCE(p.can_be_expensed, false) as can_be_expensed,
+			   COALESCE(p.can_be_rented, false) as can_be_rented,
+			   COALESCE(p.can_be_subcontracted, false) as can_be_subcontracted,
+			   COALESCE(p.is_overhead_expense, false) as is_overhead_expense,
+			   p.is_active, p.tags,
 			   p.created_at, p.updated_at,
 			   pc.code as category_code, pc.name as category_name
 		FROM products p
@@ -124,7 +132,10 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.CostPrice, &p.ListPrice, &p.MinPrice,
 			&p.IsStockable, &p.TrackInventory, &p.MinStockLevel,
 			&p.ReorderPoint, &p.ReorderQuantity, &p.LeadTimeDays,
-			&p.IsPurchasable, &p.IsSellable, &p.IsActive, &tags,
+			&p.IsPurchasable, &p.IsSellable,
+			&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
+			&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
+			&p.IsOverheadExpense, &p.IsActive, &tags,
 			&p.CreatedAt, &p.UpdatedAt,
 			&categoryCode, &categoryName,
 		)
@@ -151,24 +162,31 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		}
 
 		resp := &entity.ProductResponse{
-			ID:             p.ID,
-			CategoryID:     p.CategoryID,
-			Type:           p.Type,
-			Code:           p.Code,
-			SKU:            p.SKU,
-			Barcode:        p.Barcode,
-			Name:           p.Name,
-			Description:    p.Description,
-			CostPrice:      p.CostPrice,
-			ListPrice:      p.ListPrice,
-			IsStockable:    p.IsStockable,
-			TrackInventory: p.TrackInventory,
-			MinStockLevel:  p.MinStockLevel,
-			IsPurchasable:  p.IsPurchasable,
-			IsSellable:     p.IsSellable,
-			IsActive:       p.IsActive,
-			CreatedAt:      p.CreatedAt,
-			UpdatedAt:      p.UpdatedAt,
+			ID:                 p.ID,
+			CategoryID:        p.CategoryID,
+			Type:              p.Type,
+			Code:              p.Code,
+			SKU:               p.SKU,
+			Barcode:           p.Barcode,
+			Name:              p.Name,
+			Description:       p.Description,
+			CostPrice:         p.CostPrice,
+			ListPrice:         p.ListPrice,
+			IsStockable:       p.IsStockable,
+			TrackInventory:    p.TrackInventory,
+			MinStockLevel:     p.MinStockLevel,
+			IsPurchasable:     p.IsPurchasable,
+			IsSellable:        p.IsSellable,
+			CanBeSold:         p.CanBeSold,
+			CanBePurchased:    p.CanBePurchased,
+			AvailableInPOS:    p.AvailableInPOS,
+			CanBeExpensed:     p.CanBeExpensed,
+			CanBeRented:       p.CanBeRented,
+			CanBeSubcontracted: p.CanBeSubcontracted,
+			IsOverheadExpense: p.IsOverheadExpense,
+			IsActive:          p.IsActive,
+			CreatedAt:         p.CreatedAt,
+			UpdatedAt:         p.UpdatedAt,
 		}
 
 		if categoryCode.Valid && categoryName.Valid {
@@ -265,6 +283,35 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 	if input.IsSellable != nil {
 		isSellable = *input.IsSellable
 	}
+	// Module visibility defaults
+	canBeSold := isSellable
+	if input.CanBeSold != nil {
+		canBeSold = *input.CanBeSold
+	}
+	canBePurchased := isPurchasable
+	if input.CanBePurchased != nil {
+		canBePurchased = *input.CanBePurchased
+	}
+	availableInPOS := false
+	if input.AvailableInPOS != nil {
+		availableInPOS = *input.AvailableInPOS
+	}
+	canBeExpensed := false
+	if input.CanBeExpensed != nil {
+		canBeExpensed = *input.CanBeExpensed
+	}
+	canBeRented := false
+	if input.CanBeRented != nil {
+		canBeRented = *input.CanBeRented
+	}
+	canBeSubcontracted := false
+	if input.CanBeSubcontracted != nil {
+		canBeSubcontracted = *input.CanBeSubcontracted
+	}
+	isOverheadExpense := false
+	if input.IsOverheadExpense != nil {
+		isOverheadExpense = *input.IsOverheadExpense
+	}
 
 	id := uuid.New()
 	now := time.Now()
@@ -297,8 +344,10 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 			id, tenant_id, category_id, type, code, sku, barcode, name, description, short_description,
 			unit_id, cost_price, list_price, min_price, currency_id,
 			is_stockable, track_inventory, min_stock_level, reorder_point, reorder_quantity,
-			is_purchasable, is_sellable, is_active, tags, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
+			can_be_expensed, can_be_rented, can_be_subcontracted, is_overhead_expense,
+			is_active, tags, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)
 		RETURNING id
 	`
 
@@ -306,7 +355,9 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		id, tenantID, categoryID, input.Type, input.Code, sku, barcode, input.Name, description, shortDescription,
 		unitID, input.CostPrice, input.ListPrice, input.MinPrice, currencyID,
 		isStockable, trackInventory, input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity,
-		isPurchasable, isSellable, true, tagsJSON, userID, now, now,
+		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
+		canBeExpensed, canBeRented, canBeSubcontracted, isOverheadExpense,
+		true, tagsJSON, userID, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -320,25 +371,32 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 	}
 
 	resp := &entity.ProductResponse{
-		ID:             id,
-		CategoryID:     categoryID,
-		Type:           input.Type,
-		Code:           input.Code,
-		SKU:            sku,
-		Barcode:        barcode,
-		Name:           input.Name,
-		Description:    description,
-		CostPrice:      input.CostPrice,
-		ListPrice:      input.ListPrice,
-		IsStockable:    isStockable,
-		TrackInventory: trackInventory,
-		MinStockLevel:  input.MinStockLevel,
-		IsPurchasable:  isPurchasable,
-		IsSellable:     isSellable,
-		IsActive:       true,
-		Tags:           input.Tags,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		ID:                 id,
+		CategoryID:         categoryID,
+		Type:               input.Type,
+		Code:               input.Code,
+		SKU:                sku,
+		Barcode:            barcode,
+		Name:               input.Name,
+		Description:        description,
+		CostPrice:          input.CostPrice,
+		ListPrice:          input.ListPrice,
+		IsStockable:        isStockable,
+		TrackInventory:     trackInventory,
+		MinStockLevel:      input.MinStockLevel,
+		IsPurchasable:      isPurchasable,
+		IsSellable:         isSellable,
+		CanBeSold:          canBeSold,
+		CanBePurchased:     canBePurchased,
+		AvailableInPOS:     availableInPOS,
+		CanBeExpensed:      canBeExpensed,
+		CanBeRented:        canBeRented,
+		CanBeSubcontracted: canBeSubcontracted,
+		IsOverheadExpense:  isOverheadExpense,
+		IsActive:           true,
+		Tags:               input.Tags,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
 
 	response.Created(c, resp)
@@ -536,6 +594,27 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	}
 	if input.IsSellable != nil {
 		addUpdate("is_sellable", *input.IsSellable)
+	}
+	if input.CanBeSold != nil {
+		addUpdate("can_be_sold", *input.CanBeSold)
+	}
+	if input.CanBePurchased != nil {
+		addUpdate("can_be_purchased", *input.CanBePurchased)
+	}
+	if input.AvailableInPOS != nil {
+		addUpdate("available_in_pos", *input.AvailableInPOS)
+	}
+	if input.CanBeExpensed != nil {
+		addUpdate("can_be_expensed", *input.CanBeExpensed)
+	}
+	if input.CanBeRented != nil {
+		addUpdate("can_be_rented", *input.CanBeRented)
+	}
+	if input.CanBeSubcontracted != nil {
+		addUpdate("can_be_subcontracted", *input.CanBeSubcontracted)
+	}
+	if input.IsOverheadExpense != nil {
+		addUpdate("is_overhead_expense", *input.IsOverheadExpense)
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
