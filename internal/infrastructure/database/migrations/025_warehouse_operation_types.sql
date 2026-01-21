@@ -44,6 +44,18 @@ CREATE TABLE IF NOT EXISTS warehouse_operation_types (
     UNIQUE(tenant_id, warehouse_id, code)
 );
 
+-- Add the type column if it doesn't exist (for existing tables created without it)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'warehouse_operation_types' AND column_name = 'type'
+    ) THEN
+        ALTER TABLE warehouse_operation_types
+        ADD COLUMN type VARCHAR(20) NOT NULL DEFAULT 'custom';
+    END IF;
+END $$;
+
 -- Add comments
 COMMENT ON TABLE warehouse_operation_types IS 'Operation types for warehouse operations (Receipts, Internal Transfers, Delivery Orders, etc.)';
 COMMENT ON COLUMN warehouse_operation_types.type IS 'Type of operation: receipt, internal, delivery, pos, custom';
@@ -64,6 +76,17 @@ DO $$ BEGIN
 EXCEPTION
     WHEN undefined_table THEN null;
 END $$;
+
+-- Update existing rows to have proper type based on code pattern
+UPDATE warehouse_operation_types
+SET type = CASE
+    WHEN code LIKE '%/IN' OR code LIKE '%/IN/%' THEN 'receipt'
+    WHEN code LIKE '%/INT' OR code LIKE '%/INT/%' THEN 'internal'
+    WHEN code LIKE '%/OUT' OR code LIKE '%/OUT/%' THEN 'delivery'
+    WHEN code LIKE '%/POS' OR code LIKE '%/POS/%' THEN 'pos'
+    ELSE 'custom'
+END
+WHERE type = 'custom';
 
 -- Function to create default operation types for a new warehouse
 CREATE OR REPLACE FUNCTION create_default_operation_types(
