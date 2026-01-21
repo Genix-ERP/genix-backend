@@ -171,6 +171,30 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
+	// Create default warehouse for the tenant
+	warehouseID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouses (id, tenant_id, code, name, is_default, is_active, reception_steps, delivery_steps)
+		VALUES ($1, $2, 'WH-MAIN', 'Main Warehouse', true, true, 1, 1)
+	`, warehouseID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to create default warehouse", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create default warehouse locations (Stock, Input, Output)
+	stockLocationID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouse_locations (id, warehouse_id, code, name, type, is_active)
+		VALUES ($1, $2, 'STOCK', 'Stock', 'storage', true)
+	`, stockLocationID, warehouseID)
+	if err != nil {
+		h.log.Error("Failed to create stock location", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
