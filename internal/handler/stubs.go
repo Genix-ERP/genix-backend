@@ -20,12 +20,7 @@ func (h *Handler) ListPermissions(c *gin.Context) {
 }
 
 // ========== ORGANIZATIONS ==========
-
-func (h *Handler) ListOrganizations(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateOrganization(c *gin.Context) { response.Created(c, gin.H{"message": "Organization created"}) }
-func (h *Handler) GetOrganization(c *gin.Context)    { response.NotFound(c, "Organization") }
-func (h *Handler) UpdateOrganization(c *gin.Context) { response.Success(c, gin.H{"message": "Organization updated"}) }
-func (h *Handler) DeleteOrganization(c *gin.Context) { response.NoContent(c) }
+// Organization handlers are implemented in organizations.go
 
 // ========== DEPARTMENTS ==========
 
