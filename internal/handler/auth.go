@@ -52,13 +52,42 @@ type VerifyEmailInput struct {
 	Token string `json:"token" binding:"required"`
 }
 
+// SendInviteInput represents send invitation request
+type SendInviteInput struct {
+	UserID string `json:"user_id" binding:"required,uuid"`
+}
+
+// AcceptInviteInput represents accept invitation request
+type AcceptInviteInput struct {
+	Token    string `json:"token" binding:"required"`
+	Password string `json:"password" binding:"required,min=8"`
+}
+
+// ValidateInviteResponse represents the response when validating an invite token
+type ValidateInviteResponse struct {
+	Valid      bool   `json:"valid"`
+	Email      string `json:"email,omitempty"`
+	FirstName  string `json:"first_name,omitempty"`
+	LastName   string `json:"last_name,omitempty"`
+	TenantName string `json:"tenant_name,omitempty"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
+}
+
+// TenantInfo represents basic tenant information
+type TenantInfo struct {
+	ID   uuid.UUID `json:"id"`
+	Code string    `json:"code"`
+	Name string    `json:"name"`
+}
+
 // AuthResponse represents authentication response
 type AuthResponse struct {
-	User        *entity.UserResponse `json:"user"`
-	AccessToken string               `json:"access_token"`
-	RefreshToken string              `json:"refresh_token"`
-	ExpiresAt   time.Time            `json:"expires_at"`
-	TokenType   string               `json:"token_type"`
+	User         *entity.UserResponse `json:"user"`
+	Tenant       *TenantInfo          `json:"tenant,omitempty"`
+	AccessToken  string               `json:"access_token"`
+	RefreshToken string               `json:"refresh_token"`
+	ExpiresAt    time.Time            `json:"expires_at"`
+	TokenType    string               `json:"token_type"`
 }
 
 // Register handles user registration
@@ -212,20 +241,29 @@ func (h *Handler) Register(c *gin.Context) {
 
 	// Build response
 	user := &entity.UserResponse{
-		ID:        userID,
-		Email:     input.Email,
-		FirstName: input.FirstName,
-		LastName:  input.LastName,
-		FullName:  input.FirstName + " " + input.LastName,
-		Language:  "en",
-		Timezone:  "UTC",
-		IsActive:  true,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:            userID,
+		TenantID:      tenantID,
+		Email:         input.Email,
+		FirstName:     input.FirstName,
+		LastName:      input.LastName,
+		FullName:      input.FirstName + " " + input.LastName,
+		Language:      "en",
+		Timezone:      "UTC",
+		IsActive:      true,
+		IsSystemAdmin: true,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	tenant := &TenantInfo{
+		ID:   tenantID,
+		Code: input.TenantCode,
+		Name: input.TenantName,
 	}
 
 	response.Created(c, AuthResponse{
 		User:         user,
+		Tenant:       tenant,
 		AccessToken:  tokenPair.AccessToken,
 		RefreshToken: tokenPair.RefreshToken,
 		ExpiresAt:    tokenPair.ExpiresAt,
@@ -260,14 +298,66 @@ func (h *Handler) Login(c *gin.Context) {
 		`
 		args = []interface{}{tenantUUID, input.Email}
 	} else {
-		// Find first matching user by email
+		// Check if email exists in multiple tenants
+		var userCount int
+		err := h.db.QueryRow("SELECT COUNT(*) FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&userCount)
+		if err != nil {
+			h.log.Error("Failed to count users", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
+
+		if userCount > 1 {
+			// Multiple accounts with same email - return list of tenants for user to choose
+			rows, err := h.db.Query(`
+				SELECT t.id, t.name, t.code
+				FROM users u
+				JOIN tenants t ON u.tenant_id = t.id
+				WHERE u.email = $1 AND u.deleted_at IS NULL AND t.is_active = true
+			`, input.Email)
+			if err != nil {
+				h.log.Error("Failed to query tenants", "error", err)
+				response.InternalServerError(c, "")
+				return
+			}
+			defer rows.Close()
+
+			var tenants []map[string]interface{}
+			for rows.Next() {
+				var tenantID uuid.UUID
+				var tenantName, tenantCode string
+				if err := rows.Scan(&tenantID, &tenantName, &tenantCode); err != nil {
+					continue
+				}
+				tenants = append(tenants, map[string]interface{}{
+					"id":   tenantID,
+					"name": tenantName,
+					"code": tenantCode,
+				})
+			}
+
+			response.Error(c, http.StatusConflict, "TENANT_SELECTION_REQUIRED",
+				"This email is associated with multiple companies. Please select one.")
+			c.JSON(http.StatusConflict, gin.H{
+				"success": false,
+				"error": gin.H{
+					"code":    "TENANT_SELECTION_REQUIRED",
+					"message": "This email is associated with multiple companies. Please select one.",
+				},
+				"data": gin.H{
+					"tenants": tenants,
+				},
+			})
+			return
+		}
+
+		// Single user - proceed with login
 		query = `
 			SELECT id, tenant_id, email, password_hash, first_name, last_name,
 			       phone, avatar_url, language, timezone, is_active, is_verified,
 			       is_system_admin, failed_login_attempts, locked_until, created_at, updated_at
 			FROM users
 			WHERE email = $1 AND deleted_at IS NULL
-			LIMIT 1
 		`
 		args = []interface{}{input.Email}
 	}
@@ -362,8 +452,19 @@ func (h *Handler) Login(c *gin.Context) {
 
 	user.LastLoginAt = &now
 
+	// Get tenant info
+	var tenantCode, tenantName string
+	h.db.QueryRow("SELECT code, name FROM tenants WHERE id = $1", user.TenantID).Scan(&tenantCode, &tenantName)
+
+	tenant := &TenantInfo{
+		ID:   user.TenantID,
+		Code: tenantCode,
+		Name: tenantName,
+	}
+
 	response.Success(c, AuthResponse{
 		User:         user.ToResponse(),
+		Tenant:       tenant,
 		AccessToken:  tokenPair.AccessToken,
 		RefreshToken: tokenPair.RefreshToken,
 		ExpiresAt:    tokenPair.ExpiresAt,
@@ -641,6 +742,273 @@ func (h *Handler) VerifyEmail(c *gin.Context) {
 	// TODO: Validate verification token and mark email as verified
 
 	response.Success(c, gin.H{"message": "Email verified successfully"})
+}
+
+// SendInvite sends an invitation to a user to set their password
+func (h *Handler) SendInvite(c *gin.Context) {
+	claims, ok := middleware.GetClaims(c)
+	if !ok {
+		response.Unauthorized(c, "")
+		return
+	}
+
+	var input SendInviteInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	userID, err := uuid.Parse(input.UserID)
+	if err != nil {
+		response.BadRequest(c, "Invalid user ID")
+		return
+	}
+
+	// Check if the target user belongs to the same tenant
+	var targetTenantID uuid.UUID
+	var email, firstName, lastName string
+	var passwordHash sql.NullString
+	err = h.db.QueryRow(`
+		SELECT tenant_id, email, first_name, last_name, password_hash
+		FROM users WHERE id = $1 AND deleted_at IS NULL
+	`, userID).Scan(&targetTenantID, &email, &firstName, &lastName, &passwordHash)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "User")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to fetch user", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Ensure same tenant
+	if targetTenantID != claims.TenantID {
+		response.Forbidden(c, "Cannot invite users from other tenants")
+		return
+	}
+
+	// Check if user already has a password
+	if passwordHash.Valid && passwordHash.String != "" {
+		response.BadRequest(c, "User already has a password set")
+		return
+	}
+
+	// Generate invite token
+	inviteToken := uuid.New().String() + "-" + uuid.New().String()
+	expiresAt := time.Now().Add(48 * time.Hour) // 48 hours validity
+
+	// Update user with invite token
+	_, err = h.db.Exec(`
+		UPDATE users SET
+			invite_token = $1,
+			invite_token_expires = $2,
+			invited_by = $3,
+			invited_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $4
+	`, inviteToken, expiresAt, claims.UserID, userID)
+
+	if err != nil {
+		h.log.Error("Failed to set invite token", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Get tenant name for email
+	var tenantName string
+	h.db.QueryRow("SELECT name FROM tenants WHERE id = $1", claims.TenantID).Scan(&tenantName)
+
+	// Build invite link
+	inviteLink := h.config.App.FrontendURL + "/accept-invite?token=" + inviteToken
+
+	// Send invitation email
+	if err := h.emailService.SendInvite(email, firstName, lastName, tenantName, inviteLink); err != nil {
+		h.log.Error("Failed to send invitation email", "error", err, "email", email)
+		// Don't fail the request - the invite token is set, user can still use the link
+	}
+
+	response.Success(c, gin.H{
+		"message":     "Invitation sent successfully",
+		"invite_link": inviteLink, // For development/testing - copy to clipboard
+		"expires_at":  expiresAt,
+		"user": gin.H{
+			"id":         userID,
+			"email":      email,
+			"first_name": firstName,
+			"last_name":  lastName,
+		},
+	})
+}
+
+// ValidateInvite validates an invitation token without consuming it
+func (h *Handler) ValidateInvite(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		response.BadRequest(c, "Token is required")
+		return
+	}
+
+	var userID, tenantID uuid.UUID
+	var email, firstName, lastName string
+	var expiresAt time.Time
+
+	err := h.db.QueryRow(`
+		SELECT id, tenant_id, email, first_name, last_name, invite_token_expires
+		FROM users
+		WHERE invite_token = $1 AND deleted_at IS NULL
+	`, token).Scan(&userID, &tenantID, &email, &firstName, &lastName, &expiresAt)
+
+	if err == sql.ErrNoRows {
+		response.Success(c, ValidateInviteResponse{Valid: false})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to validate invite token", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if token has expired
+	if time.Now().After(expiresAt) {
+		response.Success(c, ValidateInviteResponse{Valid: false})
+		return
+	}
+
+	// Get tenant name
+	var tenantName string
+	h.db.QueryRow("SELECT name FROM tenants WHERE id = $1", tenantID).Scan(&tenantName)
+
+	response.Success(c, ValidateInviteResponse{
+		Valid:      true,
+		Email:      email,
+		FirstName:  firstName,
+		LastName:   lastName,
+		TenantName: tenantName,
+		ExpiresAt:  expiresAt.Format(time.RFC3339),
+	})
+}
+
+// AcceptInvite accepts an invitation and sets the user's password
+func (h *Handler) AcceptInvite(c *gin.Context) {
+	var input AcceptInviteInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Find user by invite token
+	var userID, tenantID uuid.UUID
+	var email, firstName, lastName string
+	var expiresAt time.Time
+
+	err := h.db.QueryRow(`
+		SELECT id, tenant_id, email, first_name, last_name, invite_token_expires
+		FROM users
+		WHERE invite_token = $1 AND deleted_at IS NULL
+	`, input.Token).Scan(&userID, &tenantID, &email, &firstName, &lastName, &expiresAt)
+
+	if err == sql.ErrNoRows {
+		response.BadRequest(c, "Invalid or expired invitation token")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to find user by invite token", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if token has expired
+	if time.Now().After(expiresAt) {
+		response.BadRequest(c, "Invitation has expired. Please request a new invitation.")
+		return
+	}
+
+	// Hash the new password
+	passwordHash, err := crypto.HashPassword(input.Password)
+	if err != nil {
+		h.log.Error("Failed to hash password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Update user: set password, clear invite token, mark as verified
+	now := time.Now()
+	_, err = h.db.Exec(`
+		UPDATE users SET
+			password_hash = $1,
+			invite_token = NULL,
+			invite_token_expires = NULL,
+			is_verified = true,
+			is_active = true,
+			updated_at = $2
+		WHERE id = $3
+	`, passwordHash, now, userID)
+
+	if err != nil {
+		h.log.Error("Failed to update user password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if user is admin
+	var isSystemAdmin bool
+	h.db.QueryRow("SELECT is_system_admin FROM users WHERE id = $1", userID).Scan(&isSystemAdmin)
+
+	// Generate tokens for auto-login
+	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, email, isSystemAdmin)
+	if err != nil {
+		h.log.Error("Failed to generate tokens", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Store refresh token
+	tokenHash := crypto.HashToken(tokenPair.RefreshToken)
+	deviceInfo, _ := json.Marshal(map[string]string{
+		"user_agent": c.GetHeader("User-Agent"),
+	})
+	h.db.Exec(`
+		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, userID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+
+	// Get tenant info
+	var tenantCode, tenantName string
+	h.db.QueryRow("SELECT code, name FROM tenants WHERE id = $1", tenantID).Scan(&tenantCode, &tenantName)
+
+	// Build user response
+	user := &entity.UserResponse{
+		ID:            userID,
+		TenantID:      tenantID,
+		Email:         email,
+		FirstName:     firstName,
+		LastName:      lastName,
+		FullName:      firstName + " " + lastName,
+		Language:      "en",
+		Timezone:      "UTC",
+		IsActive:      true,
+		IsVerified:    true,
+		IsSystemAdmin: isSystemAdmin,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	tenant := &TenantInfo{
+		ID:   tenantID,
+		Code: tenantCode,
+		Name: tenantName,
+	}
+
+	response.Success(c, AuthResponse{
+		User:         user,
+		Tenant:       tenant,
+		AccessToken:  tokenPair.AccessToken,
+		RefreshToken: tokenPair.RefreshToken,
+		ExpiresAt:    tokenPair.ExpiresAt,
+		TokenType:    tokenPair.TokenType,
+	})
 }
 
 // Helper function

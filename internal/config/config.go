@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 // Config holds all application configuration
@@ -29,6 +31,7 @@ type AppConfig struct {
 	Env            string
 	Port           int
 	BaseURL        string
+	FrontendURL    string
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
 	IdleTimeout    time.Duration
@@ -144,12 +147,16 @@ type QueueConfig struct {
 
 // Load loads configuration from environment variables
 func Load() (*Config, error) {
+	// Load .env file if it exists (ignore error if not found)
+	_ = godotenv.Load()
+
 	cfg := &Config{
 		App: AppConfig{
 			Name:           getEnv("APP_NAME", "GenixERP"),
 			Env:            getEnv("APP_ENV", "development"),
 			Port:           getEnvAsInt("APP_PORT", 8080),
 			BaseURL:        getEnv("APP_BASE_URL", "http://localhost:8080"),
+			FrontendURL:    getEnv("FRONTEND_URL", "http://localhost:5173"),
 			ReadTimeout:    getEnvAsDuration("APP_READ_TIMEOUT", 15*time.Second),
 			WriteTimeout:   getEnvAsDuration("APP_WRITE_TIMEOUT", 15*time.Second),
 			IdleTimeout:    getEnvAsDuration("APP_IDLE_TIMEOUT", 60*time.Second),
