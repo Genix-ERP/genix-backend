@@ -4,6 +4,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/config"
 	"github.com/genixerp/genix-backend/internal/infrastructure/cache"
 	"github.com/genixerp/genix-backend/internal/infrastructure/database"
+	"github.com/genixerp/genix-backend/internal/infrastructure/email"
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/crypto"
 	"github.com/genixerp/genix-backend/internal/pkg/logger"
@@ -12,21 +13,23 @@ import (
 
 // Handler holds all handler dependencies
 type Handler struct {
-	db         *database.DB
-	redis      *cache.RedisClient
-	config     *config.Config
-	log        logger.Logger
-	jwtManager *crypto.JWTManager
+	db           *database.DB
+	redis        *cache.RedisClient
+	config       *config.Config
+	log          logger.Logger
+	jwtManager   *crypto.JWTManager
+	emailService *email.Service
 }
 
 // NewHandler creates a new handler instance
 func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, log logger.Logger) *Handler {
 	return &Handler{
-		db:         db,
-		redis:      redis,
-		config:     cfg,
-		log:        log,
-		jwtManager: crypto.NewJWTManager(cfg.JWT),
+		db:           db,
+		redis:        redis,
+		config:       cfg,
+		log:          log,
+		jwtManager:   crypto.NewJWTManager(cfg.JWT),
+		emailService: email.NewService(&cfg.Email),
 	}
 }
 
@@ -57,6 +60,8 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 		auth.POST("/forgot-password", h.ForgotPassword)
 		auth.POST("/reset-password", h.ResetPassword)
 		auth.POST("/verify-email", h.VerifyEmail)
+		auth.GET("/validate-invite", h.ValidateInvite)  // Public - validate invite token
+		auth.POST("/accept-invite", h.AcceptInvite)     // Public - accept invite and set password
 	}
 
 	// Public info
@@ -72,6 +77,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		auth.GET("/me", h.GetCurrentUser)
 		auth.PUT("/me", h.UpdateCurrentUser)
 		auth.PUT("/me/password", h.ChangePassword)
+		auth.POST("/send-invite", h.SendInvite) // Send invitation to a user
 	}
 
 	// Users
@@ -109,6 +115,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		orgs.GET("/:id", h.GetOrganization)
 		orgs.PUT("/:id", middleware.RequirePermission("organization", "organization", "update"), h.UpdateOrganization)
 		orgs.DELETE("/:id", middleware.RequirePermission("organization", "organization", "delete"), h.DeleteOrganization)
+		// Organization employees
+		orgs.GET("/:id/employees", h.ListOrganizationEmployees)
 	}
 
 	// Departments
@@ -490,6 +498,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employees.GET("/:id", h.GetEmployee)
 		employees.PUT("/:id", middleware.RequirePermission("hr", "employee", "update"), h.UpdateEmployee)
 		employees.DELETE("/:id", middleware.RequirePermission("hr", "employee", "delete"), h.DeleteEmployee)
+		// Employee-Organization assignments
+		employees.GET("/:id/organizations", h.ListEmployeeOrganizations)
+	}
+
+	// Employee-Organization Assignments
+	employeeOrgs := rg.Group("/employee-organizations")
+	employeeOrgs.Use(middleware.RequirePermission("hr", "employee", "read"))
+	{
+		employeeOrgs.POST("", middleware.RequirePermission("hr", "employee", "update"), h.AssignEmployeeToOrganization)
+		employeeOrgs.PUT("/:id", middleware.RequirePermission("hr", "employee", "update"), h.UpdateEmployeeOrganization)
+		employeeOrgs.DELETE("/:id", middleware.RequirePermission("hr", "employee", "update"), h.RemoveEmployeeFromOrganization)
 	}
 
 	// HR - Attendance Records
@@ -599,6 +618,13 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		adminSettings.PATCH("/:section", middleware.RequirePermission("settings", "tenant", "update"), h.UpdateAdminSettingsSection)
 		adminSettings.POST("/:section/reset", middleware.RequirePermission("settings", "tenant", "update"), h.ResetAdminSettingsSection)
 		adminSettings.POST("/reset", middleware.RequirePermission("settings", "tenant", "update"), h.ResetAllAdminSettings)
+	}
+
+	// System Admin routes (cross-tenant access)
+	admin := rg.Group("/admin")
+	admin.Use(middleware.RequireSystemAdmin())
+	{
+		admin.GET("/users", h.ListAllSystemUsers)
 	}
 
 	// Audit Logs
