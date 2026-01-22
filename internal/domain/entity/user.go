@@ -28,6 +28,7 @@ type User struct {
 	PasswordChangedAt   *time.Time      `json:"password_changed_at,omitempty" db:"password_changed_at"`
 	FailedLoginAttempts int             `json:"-" db:"failed_login_attempts"`
 	LockedUntil         *time.Time      `json:"-" db:"locked_until"`
+	InviteTokenExpires  *time.Time      `json:"invite_token_expires,omitempty" db:"invite_token_expires"`
 	CreatedAt           time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt           time.Time       `json:"updated_at" db:"updated_at"`
 	DeletedAt           sql.NullTime    `json:"-" db:"deleted_at"`
@@ -152,13 +153,13 @@ type UserSettings struct {
 // CreateUserInput represents input for creating a user
 type CreateUserInput struct {
 	Email     string   `json:"email" binding:"required,email"`
-	Password  string   `json:"password" binding:"required,min=8"`
+	Password  string   `json:"password" binding:"-"` // Optional - if not provided, user must be invited
 	FirstName string   `json:"first_name" binding:"required,min=1,max=100"`
 	LastName  string   `json:"last_name" binding:"required,min=1,max=100"`
-	Phone     string   `json:"phone,omitempty"`
-	Language  string   `json:"language,omitempty"`
-	Timezone  string   `json:"timezone,omitempty"`
-	RoleIDs   []string `json:"role_ids,omitempty"`
+	Phone     string   `json:"phone" binding:"-"`
+	Language  string   `json:"language" binding:"-"`
+	Timezone  string   `json:"timezone" binding:"-"`
+	RoleIDs   []string `json:"role_ids" binding:"-"`
 }
 
 // UpdateUserInput represents input for updating a user
@@ -210,40 +211,53 @@ type UserListFilter struct {
 
 // UserResponse represents the API response for a user
 type UserResponse struct {
-	ID          uuid.UUID  `json:"id"`
-	Email       string     `json:"email"`
-	FirstName   string     `json:"first_name"`
-	LastName    string     `json:"last_name"`
-	FullName    string     `json:"full_name"`
-	Phone       *string    `json:"phone,omitempty"`
-	AvatarURL   *string    `json:"avatar_url,omitempty"`
-	Language    string     `json:"language"`
-	Timezone    string     `json:"timezone"`
-	IsActive    bool       `json:"is_active"`
-	IsVerified  bool       `json:"is_verified"`
-	LastLoginAt *time.Time `json:"last_login_at,omitempty"`
-	Roles       []Role     `json:"roles,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID                 uuid.UUID  `json:"id"`
+	TenantID           uuid.UUID  `json:"tenant_id"`
+	Email              string     `json:"email"`
+	FirstName          string     `json:"first_name"`
+	LastName           string     `json:"last_name"`
+	FullName           string     `json:"full_name"`
+	Phone              *string    `json:"phone,omitempty"`
+	AvatarURL          *string    `json:"avatar_url,omitempty"`
+	Language           string     `json:"language"`
+	Timezone           string     `json:"timezone"`
+	IsActive           bool       `json:"is_active"`
+	IsVerified         bool       `json:"is_verified"`
+	IsSystemAdmin      bool       `json:"is_system_admin"`
+	HasPassword        bool       `json:"has_password"`
+	InviteTokenExpires *time.Time `json:"invite_token_expires,omitempty"`
+	LastLoginAt        *time.Time `json:"last_login_at,omitempty"`
+	Roles              []Role     `json:"roles,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
+// HasPassword checks if the user has a password set
+func (u *User) HasPassword() bool {
+	return u.PasswordHash != ""
 }
 
 // ToResponse converts User to UserResponse
 func (u *User) ToResponse() *UserResponse {
 	return &UserResponse{
-		ID:          u.ID,
-		Email:       u.Email,
-		FirstName:   u.FirstName,
-		LastName:    u.LastName,
-		FullName:    u.FullName(),
-		Phone:       u.Phone,
-		AvatarURL:   u.AvatarURL,
-		Language:    u.Language,
-		Timezone:    u.Timezone,
-		IsActive:    u.IsActive,
-		IsVerified:  u.IsVerified,
-		LastLoginAt: u.LastLoginAt,
-		Roles:       u.Roles,
-		CreatedAt:   u.CreatedAt,
-		UpdatedAt:   u.UpdatedAt,
+		ID:                 u.ID,
+		TenantID:           u.TenantID,
+		Email:              u.Email,
+		FirstName:          u.FirstName,
+		LastName:           u.LastName,
+		FullName:           u.FullName(),
+		Phone:              u.Phone,
+		AvatarURL:          u.AvatarURL,
+		Language:           u.Language,
+		Timezone:           u.Timezone,
+		IsActive:           u.IsActive,
+		IsVerified:         u.IsVerified,
+		IsSystemAdmin:      u.IsSystemAdmin,
+		HasPassword:        u.HasPassword(),
+		InviteTokenExpires: u.InviteTokenExpires,
+		LastLoginAt:        u.LastLoginAt,
+		Roles:              u.Roles,
+		CreatedAt:          u.CreatedAt,
+		UpdatedAt:          u.UpdatedAt,
 	}
 }
