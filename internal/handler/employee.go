@@ -276,6 +276,17 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		return
 	}
 
+	// Link the user to this employee record (if user exists with same email)
+	if input.Email != "" {
+		_, linkErr := h.db.Exec(`
+			UPDATE users SET employee_id = $1, updated_at = $2
+			WHERE tenant_id = $3 AND email = $4 AND employee_id IS NULL
+		`, id, now, tenantID, input.Email)
+		if linkErr != nil {
+			h.log.Warn("Could not link user to employee", "error", linkErr, "email", input.Email)
+		}
+	}
+
 	emp := &entity.Employee{
 		ID:               id,
 		TenantID:         tenantID,
