@@ -78,6 +78,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		auth.PUT("/me", h.UpdateCurrentUser)
 		auth.PUT("/me/password", h.ChangePassword)
 		auth.POST("/send-invite", h.SendInvite) // Send invitation to a user
+		auth.GET("/me/permissions", h.GetCurrentUserPermissions) // Get current user's module permissions
 	}
 
 	// Users
@@ -500,6 +501,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employees.DELETE("/:id", middleware.RequirePermission("hr", "employee", "delete"), h.DeleteEmployee)
 		// Employee-Organization assignments
 		employees.GET("/:id/organizations", h.ListEmployeeOrganizations)
+		// Employee module permissions
+		employees.GET("/:id/permissions", h.GetEmployeePermissions)
+		employees.PUT("/:id/permissions", middleware.RequirePermission("hr", "employee", "update"), h.BulkUpdateEmployeePermissions)
+		employees.PUT("/:id/permissions/module", middleware.RequirePermission("hr", "employee", "update"), h.UpdateEmployeeModulePermission)
+		employees.DELETE("/:id/permissions", middleware.RequirePermission("hr", "employee", "delete"), h.DeleteEmployeePermissions)
 	}
 
 	// Employee-Organization Assignments
