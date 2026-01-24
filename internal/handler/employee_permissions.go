@@ -306,7 +306,8 @@ func (h *Handler) GetCurrentUserPermissions(c *gin.Context) {
 	}
 
 	// Site admins, owners, and system admins have full access
-	if role == "site_admin" || role == "owner" || role == "admin" || role == "system_admin" {
+	// Note: "admin" role is NOT included - they should have module-based permissions like regular users
+	if role == "site_admin" || role == "owner" || role == "system_admin" {
 		response.Success(c, gin.H{
 			"is_admin": true,
 			"permissions": nil,
