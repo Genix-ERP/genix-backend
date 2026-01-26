@@ -169,6 +169,34 @@ func (s *Service) SendPasswordReset(toEmail, firstName, resetLink string) error 
 	})
 }
 
+// SendOTP sends an OTP verification email
+func (s *Service) SendOTP(toEmail, otpCode, purpose string) error {
+	var subject string
+	switch purpose {
+	case "registration":
+		subject = "GenixERP - Email tasdiqlash kodi"
+	case "password_reset":
+		subject = "GenixERP - Parolni tiklash kodi"
+	default:
+		subject = "GenixERP - Tasdiqlash kodi"
+	}
+
+	body, err := s.renderTemplate(otpTemplate, map[string]string{
+		"OTPCode": otpCode,
+		"Purpose": purpose,
+	})
+	if err != nil {
+		return err
+	}
+
+	return s.Send(&Email{
+		To:      []string{toEmail},
+		Subject: subject,
+		Body:    body,
+		IsHTML:  true,
+	})
+}
+
 // SendWelcome sends a welcome email
 func (s *Service) SendWelcome(toEmail, firstName, tenantName string) error {
 	subject := fmt.Sprintf("%s ga xush kelibsiz!", tenantName)
@@ -249,6 +277,32 @@ const passwordResetTemplate = `<!DOCTYPE html>
         <p style="color: #666; font-size: 14px;">Agar siz bu so'rovni yubormagan bo'lsangiz, bu xabarni e'tiborsiz qoldiring.</p>
         <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 20px 0;">
         <p style="color: #999; font-size: 12px; margin-bottom: 0;">Bu havola 1 soat davomida amal qiladi.</p>
+    </div>
+</body>
+</html>`
+
+const otpTemplate = `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+        <h1 style="color: white; margin: 0; font-size: 24px;">GenixERP</h1>
+    </div>
+    <div style="background: #ffffff; padding: 30px; border: 1px solid #e0e0e0; border-top: none; border-radius: 0 0 10px 10px;">
+        <h2 style="color: #333; margin-top: 0;">Tasdiqlash kodi</h2>
+        <p>Sizning tasdiqlash kodingiz:</p>
+        <div style="text-align: center; margin: 30px 0;">
+            <div style="background: #f5f5f5; padding: 20px 40px; border-radius: 10px; display: inline-block;">
+                <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #667eea;">{{.OTPCode}}</span>
+            </div>
+        </div>
+        <p style="color: #666; font-size: 14px;">Bu kod 10 daqiqa davomida amal qiladi.</p>
+        <p style="color: #666; font-size: 14px;">Agar siz bu so'rovni yubormagan bo'lsangiz, bu xabarni e'tiborsiz qoldiring.</p>
+        <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 20px 0;">
+        <p style="color: #999; font-size: 12px; margin-bottom: 0;">GenixERP - Zamonaviy ERP tizimi</p>
     </div>
 </body>
 </html>`
