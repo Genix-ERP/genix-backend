@@ -107,6 +107,19 @@ func (h *Handler) Register(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
+	// Check if email already exists globally (across all tenants)
+	var existingUserID uuid.UUID
+	err = tx.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
+	if err == nil {
+		response.Conflict(c, "Email already registered. Please use a different email or login to your existing account.")
+		return
+	}
+	if err != sql.ErrNoRows {
+		h.log.Error("Failed to check email", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
 	// Check if tenant code exists
 	var existingTenantID uuid.UUID
 	err = tx.QueryRow("SELECT id FROM tenants WHERE code = $1", input.TenantCode).Scan(&existingTenantID)
@@ -149,27 +162,14 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	// Check if email exists within tenant
-	var existingUserID uuid.UUID
-	err = tx.QueryRow("SELECT id FROM users WHERE tenant_id = $1 AND email = $2", tenantID, input.Email).Scan(&existingUserID)
-	if err == nil {
-		response.Conflict(c, "Email already exists")
-		return
-	}
-	if err != sql.ErrNoRows {
-		h.log.Error("Failed to check user", "error", err)
-		response.InternalServerError(c, "")
-		return
-	}
-
-	// Create user
+	// Create user (email uniqueness already checked globally above)
 	userID := uuid.New()
 	now := time.Now()
 	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
 
 	_, err = tx.Exec(`
 		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, true, $8, $8)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, false, $8, $8)
 	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
@@ -177,11 +177,11 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	// Create default admin role
+	// Create owner role for tenant owner
 	roleID := uuid.New()
 	_, err = tx.Exec(`
 		INSERT INTO roles (id, tenant_id, name, code, description, is_system)
-		VALUES ($1, $2, 'Administrator', 'admin', 'Full system access', true)
+		VALUES ($1, $2, 'Owner', 'owner', 'Tenant owner with full access', true)
 	`, roleID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to create role", "error", err)
@@ -231,15 +231,16 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	// Generate tokens
-	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, input.Email, true)
+	// Generate tokens - new tenant owners are NOT system admins
+	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, input.Email, false)
 	if err != nil {
 		h.log.Error("Failed to generate tokens", "error", err)
 		response.InternalServerError(c, "")
 		return
 	}
 
-	// Build response
+	// Build response - tenant owners are NOT system admins but have owner role
+	ownerRoleDesc := "Tenant owner with full access"
 	user := &entity.UserResponse{
 		ID:            userID,
 		TenantID:      tenantID,
@@ -250,9 +251,21 @@ func (h *Handler) Register(c *gin.Context) {
 		Language:      "en",
 		Timezone:      "UTC",
 		IsActive:      true,
-		IsSystemAdmin: true,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		IsSystemAdmin: false,
+		Roles: []entity.Role{
+			{
+				ID:          roleID,
+				TenantID:    tenantID,
+				Name:        "Owner",
+				Code:        "owner",
+				Description: &ownerRoleDesc,
+				IsSystem:    true,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 
 	tenant := &TenantInfo{
