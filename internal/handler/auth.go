@@ -75,8 +75,9 @@ type ValidateInviteResponse struct {
 
 // SendOTPInput represents OTP request
 type SendOTPInput struct {
-	Email   string `json:"email" binding:"required,email"`
-	Purpose string `json:"purpose" binding:"required"` // registration, password_reset
+	Email    string `json:"email" binding:"required,email"`
+	Purpose  string `json:"purpose" binding:"required"` // registration, password_reset
+	Language string `json:"language"`                   // en, uz, ru - defaults to uz
 }
 
 // VerifyOTPInput represents OTP verification request
@@ -488,6 +489,22 @@ func (h *Handler) Login(c *gin.Context) {
 	`, user.ID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
 
 	user.LastLoginAt = &now
+
+	// Load user roles
+	rows, err := h.db.Query(`
+		SELECT r.id, r.name, r.code
+		FROM roles r
+		JOIN user_roles ur ON r.id = ur.role_id
+		WHERE ur.user_id = $1
+	`, user.ID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var role entity.Role
+			rows.Scan(&role.ID, &role.Name, &role.Code)
+			user.Roles = append(user.Roles, role)
+		}
+	}
 
 	// Get tenant info
 	var tenantCode, tenantName string
@@ -1121,8 +1138,8 @@ func (h *Handler) SendOTP(c *gin.Context) {
 		return
 	}
 
-	// Send OTP email
-	if err := h.emailService.SendOTP(input.Email, otpCode, input.Purpose); err != nil {
+	// Send OTP email with language support
+	if err := h.emailService.SendOTP(input.Email, otpCode, input.Purpose, input.Language); err != nil {
 		h.log.Error("Failed to send OTP email", "error", err, "email", input.Email)
 		// Don't fail the request - OTP is stored, user can request resend
 	}
