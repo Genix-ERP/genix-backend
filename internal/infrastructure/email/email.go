@@ -169,21 +169,81 @@ func (s *Service) SendPasswordReset(toEmail, firstName, resetLink string) error 
 	})
 }
 
-// SendOTP sends an OTP verification email
-func (s *Service) SendOTP(toEmail, otpCode, purpose string) error {
+// OTP email translations
+type otpTranslation struct {
+	SubjectRegistration  string
+	SubjectPasswordReset string
+	SubjectDefault       string
+	Title                string
+	Message              string
+	CodeValidFor         string
+	IgnoreMessage        string
+	Footer               string
+}
+
+var otpTranslations = map[string]otpTranslation{
+	"en": {
+		SubjectRegistration:  "GenixERP - Email verification code",
+		SubjectPasswordReset: "GenixERP - Password reset code",
+		SubjectDefault:       "GenixERP - Verification code",
+		Title:                "Verification Code",
+		Message:              "Your verification code is:",
+		CodeValidFor:         "This code is valid for 10 minutes.",
+		IgnoreMessage:        "If you did not request this code, please ignore this message.",
+		Footer:               "GenixERP - Modern ERP System",
+	},
+	"uz": {
+		SubjectRegistration:  "GenixERP - Email tasdiqlash kodi",
+		SubjectPasswordReset: "GenixERP - Parolni tiklash kodi",
+		SubjectDefault:       "GenixERP - Tasdiqlash kodi",
+		Title:                "Tasdiqlash kodi",
+		Message:              "Sizning tasdiqlash kodingiz:",
+		CodeValidFor:         "Bu kod 10 daqiqa davomida amal qiladi.",
+		IgnoreMessage:        "Agar siz bu so'rovni yubormagan bo'lsangiz, bu xabarni e'tiborsiz qoldiring.",
+		Footer:               "GenixERP - Zamonaviy ERP tizimi",
+	},
+	"ru": {
+		SubjectRegistration:  "GenixERP - Код подтверждения email",
+		SubjectPasswordReset: "GenixERP - Код сброса пароля",
+		SubjectDefault:       "GenixERP - Код подтверждения",
+		Title:                "Код подтверждения",
+		Message:              "Ваш код подтверждения:",
+		CodeValidFor:         "Этот код действителен в течение 10 минут.",
+		IgnoreMessage:        "Если вы не запрашивали этот код, проигнорируйте это сообщение.",
+		Footer:               "GenixERP - Современная ERP система",
+	},
+}
+
+// SendOTP sends an OTP verification email with language support
+func (s *Service) SendOTP(toEmail, otpCode, purpose, language string) error {
+	// Default to Uzbek if language not specified
+	if language == "" {
+		language = "uz"
+	}
+
+	// Get translations, fallback to English if language not found
+	trans, ok := otpTranslations[language]
+	if !ok {
+		trans = otpTranslations["en"]
+	}
+
 	var subject string
 	switch purpose {
 	case "registration":
-		subject = "GenixERP - Email tasdiqlash kodi"
+		subject = trans.SubjectRegistration
 	case "password_reset":
-		subject = "GenixERP - Parolni tiklash kodi"
+		subject = trans.SubjectPasswordReset
 	default:
-		subject = "GenixERP - Tasdiqlash kodi"
+		subject = trans.SubjectDefault
 	}
 
-	body, err := s.renderTemplate(otpTemplate, map[string]string{
-		"OTPCode": otpCode,
-		"Purpose": purpose,
+	body, err := s.renderTemplate(otpTemplateMultilang, map[string]string{
+		"OTPCode":       otpCode,
+		"Title":         trans.Title,
+		"Message":       trans.Message,
+		"CodeValidFor":  trans.CodeValidFor,
+		"IgnoreMessage": trans.IgnoreMessage,
+		"Footer":        trans.Footer,
 	})
 	if err != nil {
 		return err
@@ -281,7 +341,8 @@ const passwordResetTemplate = `<!DOCTYPE html>
 </body>
 </html>`
 
-const otpTemplate = `<!DOCTYPE html>
+// Multi-language OTP template
+const otpTemplateMultilang = `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -292,17 +353,17 @@ const otpTemplate = `<!DOCTYPE html>
         <h1 style="color: white; margin: 0; font-size: 24px;">GenixERP</h1>
     </div>
     <div style="background: #ffffff; padding: 30px; border: 1px solid #e0e0e0; border-top: none; border-radius: 0 0 10px 10px;">
-        <h2 style="color: #333; margin-top: 0;">Tasdiqlash kodi</h2>
-        <p>Sizning tasdiqlash kodingiz:</p>
+        <h2 style="color: #333; margin-top: 0;">{{.Title}}</h2>
+        <p>{{.Message}}</p>
         <div style="text-align: center; margin: 30px 0;">
             <div style="background: #f5f5f5; padding: 20px 40px; border-radius: 10px; display: inline-block;">
                 <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #667eea;">{{.OTPCode}}</span>
             </div>
         </div>
-        <p style="color: #666; font-size: 14px;">Bu kod 10 daqiqa davomida amal qiladi.</p>
-        <p style="color: #666; font-size: 14px;">Agar siz bu so'rovni yubormagan bo'lsangiz, bu xabarni e'tiborsiz qoldiring.</p>
+        <p style="color: #666; font-size: 14px;">{{.CodeValidFor}}</p>
+        <p style="color: #666; font-size: 14px;">{{.IgnoreMessage}}</p>
         <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 20px 0;">
-        <p style="color: #999; font-size: 12px; margin-bottom: 0;">GenixERP - Zamonaviy ERP tizimi</p>
+        <p style="color: #999; font-size: 12px; margin-bottom: 0;">{{.Footer}}</p>
     </div>
 </body>
 </html>`
