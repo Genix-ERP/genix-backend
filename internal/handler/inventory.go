@@ -412,15 +412,26 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		}
 	}
 
-	// Verify product exists and belongs to tenant
-	var productExists bool
-	h.db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM products WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)",
+	// Verify product exists and get cost_price for transaction records
+	var productCostPrice float64
+	err = h.db.QueryRow(
+		"SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
 		productID, tenantID,
-	).Scan(&productExists)
-	if !productExists {
+	).Scan(&productCostPrice)
+	if err == sql.ErrNoRows {
 		response.NotFound(c, "Product")
 		return
+	}
+	if err != nil {
+		h.log.Error("Failed to fetch product", "error", err)
+		response.InternalError(c, "Failed to adjust inventory")
+		return
+	}
+
+	// Use provided unit_cost or fall back to product's cost_price
+	unitCost := input.UnitCost
+	if unitCost == 0 {
+		unitCost = productCostPrice
 	}
 
 	// Verify warehouse belongs to tenant
@@ -473,11 +484,11 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		_, err = tx.Exec(`
 			INSERT INTO inventory (
 				id, tenant_id, product_id, warehouse_id, location_id,
-				lot_number, serial_number, quantity_on_hand, quantity_reserved, quantity_available,
-				unit_cost, total_value, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $8, $9, $10, $11, $11)
+				lot_number, serial_number, quantity_on_hand, quantity_reserved,
+				unit_cost, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, $10)
 		`, inventoryID, tenantID, productID, warehouseID, locationID,
-			lotNumber, serialNumber, input.Quantity, input.UnitCost, input.Quantity*input.UnitCost, now)
+			lotNumber, serialNumber, input.Quantity, unitCost, now)
 
 		if err != nil {
 			h.log.Error("Failed to create inventory record", "error", err)
@@ -499,13 +510,11 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		_, err = tx.Exec(`
 			UPDATE inventory SET
 				quantity_on_hand = quantity_on_hand + $1,
-				quantity_available = quantity_available + $1,
 				unit_cost = CASE WHEN $2 > 0 THEN $2 ELSE unit_cost END,
-				total_value = (quantity_on_hand + $1) * CASE WHEN $2 > 0 THEN $2 ELSE unit_cost END,
 				last_movement_date = $3,
 				updated_at = $3
 			WHERE id = $4
-		`, input.Quantity, input.UnitCost, now, inventoryID)
+		`, input.Quantity, unitCost, now, inventoryID)
 
 		if err != nil {
 			h.log.Error("Failed to update inventory", "error", err)
@@ -532,7 +541,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 			unit_cost, total_cost, reason, notes, transaction_date, created_by, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $10)
 	`, transactionID, tenantID, inventoryID, transactionType, input.Quantity,
-		input.UnitCost, input.Quantity*input.UnitCost, reason, notes, now, userID)
+		unitCost, input.Quantity*unitCost, reason, notes, now, userID)
 
 	if err != nil {
 		h.log.Error("Failed to create inventory transaction", "error", err)
@@ -658,12 +667,18 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 		return
 	}
 
+	// If unit_cost is 0, fall back to product's cost_price
+	if unitCost == 0 {
+		h.db.QueryRow(
+			"SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2",
+			productID, tenantID,
+		).Scan(&unitCost)
+	}
+
 	// Decrease source inventory
 	_, err = tx.Exec(`
 		UPDATE inventory SET
 			quantity_on_hand = quantity_on_hand - $1,
-			quantity_available = quantity_available - $1,
-			total_value = (quantity_on_hand - $1) * unit_cost,
 			last_movement_date = $2,
 			updated_at = $2
 		WHERE id = $3
@@ -691,11 +706,11 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 		_, err = tx.Exec(`
 			INSERT INTO inventory (
 				id, tenant_id, product_id, warehouse_id, location_id,
-				quantity_on_hand, quantity_reserved, quantity_available,
-				unit_cost, total_value, last_movement_date, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, 0, $6, $7, $8, $9, $9, $9)
+				quantity_on_hand, quantity_reserved,
+				unit_cost, last_movement_date, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8, $8)
 		`, destInventoryID, tenantID, productID, toWarehouseID, toLocationID,
-			input.Quantity, unitCost, input.Quantity*unitCost, now)
+			input.Quantity, unitCost, now)
 
 		if err != nil {
 			h.log.Error("Failed to create destination inventory", "error", err)
@@ -711,8 +726,6 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 		_, err = tx.Exec(`
 			UPDATE inventory SET
 				quantity_on_hand = quantity_on_hand + $1,
-				quantity_available = quantity_available + $1,
-				total_value = (quantity_on_hand + $1) * unit_cost,
 				last_movement_date = $2,
 				updated_at = $2
 			WHERE id = $3
@@ -815,13 +828,14 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 			   t.from_location_id, t.to_location_id, t.reason, t.notes, t.transaction_date,
 			   t.created_by, t.created_at,
 			   p.code as product_code, p.name as product_name,
-			   fw.name as from_warehouse_name, tw.name as to_warehouse_name,
+			   COALESCE(fw.name, iw.name) as from_warehouse_name, tw.name as to_warehouse_name,
 			   e.first_name as created_by_first_name, e.last_name as created_by_last_name
 		FROM inventory_transactions t
 		JOIN inventory i ON t.inventory_id = i.id
 		JOIN products p ON i.product_id = p.id
 		LEFT JOIN warehouses fw ON t.from_warehouse_id = fw.id
 		LEFT JOIN warehouses tw ON t.to_warehouse_id = tw.id
+		LEFT JOIN warehouses iw ON i.warehouse_id = iw.id
 		LEFT JOIN employees e ON t.created_by = e.id
 		WHERE t.tenant_id = $1
 	`

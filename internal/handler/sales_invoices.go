@@ -265,8 +265,8 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 
 	totalAmount := subtotal - discountAmount + taxAmount
 
-	// Marshal addresses to JSON
-	var billingAddressJSON, shippingAddressJSON []byte
+	// Marshal addresses to JSON - use null if not provided
+	var billingAddressJSON, shippingAddressJSON []byte = []byte("null"), []byte("null")
 	if input.BillingAddress != nil {
 		billingAddressJSON, _ = json.Marshal(input.BillingAddress)
 	}

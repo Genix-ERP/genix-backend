@@ -231,6 +231,18 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 		json.Unmarshal(settingsJSONOut, &org.Settings)
 	}
 
+	// Create default Chart of Accounts for the new organization
+	if err := h.createDefaultChartOfAccounts(tenantID.(uuid.UUID), orgID); err != nil {
+		h.log.Error("Failed to create default chart of accounts", "error", err, "org_id", orgID)
+		// Don't fail the organization creation, just log the error
+	}
+
+	// Create default Journals for the new organization
+	if err := h.createDefaultJournals(tenantID.(uuid.UUID), orgID); err != nil {
+		h.log.Error("Failed to create default journals", "error", err, "org_id", orgID)
+		// Don't fail the organization creation, just log the error
+	}
+
 	response.Created(c, org)
 }
 
@@ -495,4 +507,270 @@ func (h *Handler) DeleteOrganization(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusNoContent, nil)
+}
+
+// InitializeOrganizationAccounts creates default chart of accounts and journals for an existing organization
+// POST /api/v1/organizations/:id/initialize-accounts
+func (h *Handler) InitializeOrganizationAccounts(c *gin.Context) {
+	tenantID, exists := c.Get(middleware.ContextKeyTenantID)
+	if !exists {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	orgID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid organization ID")
+		return
+	}
+
+	// Check if organization exists
+	var orgExists bool
+	err = h.db.QueryRow(
+		"SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)",
+		orgID, tenantID,
+	).Scan(&orgExists)
+	if err != nil || !orgExists {
+		response.NotFound(c, "Organization")
+		return
+	}
+
+	// Check if accounts already exist
+	var accountCount int
+	err = h.db.QueryRow(
+		"SELECT COUNT(*) FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL",
+		tenantID, orgID,
+	).Scan(&accountCount)
+	if err != nil {
+		h.log.Error("Failed to count accounts", "error", err)
+		response.InternalServerError(c, "Failed to initialize accounts")
+		return
+	}
+
+	if accountCount > 0 {
+		response.BadRequest(c, fmt.Sprintf("Organization already has %d accounts. Delete existing accounts first or create accounts manually.", accountCount))
+		return
+	}
+
+	// Create default Chart of Accounts
+	if err := h.createDefaultChartOfAccounts(tenantID.(uuid.UUID), orgID); err != nil {
+		h.log.Error("Failed to create default chart of accounts", "error", err, "org_id", orgID)
+		response.InternalServerError(c, "Failed to create chart of accounts")
+		return
+	}
+
+	// Create default Journals
+	if err := h.createDefaultJournals(tenantID.(uuid.UUID), orgID); err != nil {
+		h.log.Error("Failed to create default journals", "error", err, "org_id", orgID)
+		response.InternalServerError(c, "Failed to create journals")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"message": "Default chart of accounts and journals created successfully",
+		"organization_id": orgID,
+	})
+}
+
+// createDefaultChartOfAccounts creates a standard chart of accounts for a new organization
+// This follows standard accounting practices similar to Odoo
+func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error {
+	now := time.Now()
+
+	// Get account type IDs
+	accountTypeIDs := make(map[string]uuid.UUID)
+	rows, err := h.db.Query("SELECT id, code FROM account_types")
+	if err != nil {
+		return fmt.Errorf("failed to get account types: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id uuid.UUID
+		var code string
+		if err := rows.Scan(&id, &code); err != nil {
+			continue
+		}
+		accountTypeIDs[code] = id
+	}
+
+	// Define default accounts - following standard Chart of Accounts
+	defaultAccounts := []struct {
+		code        string
+		name        string
+		typeCode    string
+		isBankAcc   bool
+		isControl   bool
+		isRecon     bool
+		description string
+	}{
+		// Assets (1xxx)
+		{"1000", "Cash", "CASH", false, false, true, "Cash on hand"},
+		{"1010", "Petty Cash", "CASH", false, false, true, "Petty cash fund"},
+		{"1100", "Bank Account", "CASH", true, false, true, "Main bank account"},
+		{"1200", "Accounts Receivable", "AR", false, true, true, "Trade receivables from customers"},
+		{"1210", "Allowance for Doubtful Accounts", "AR", false, false, false, "Reserve for bad debts"},
+		{"1300", "Inventory", "INV", false, true, false, "Goods held for sale"},
+		{"1310", "Raw Materials", "INV", false, false, false, "Raw materials inventory"},
+		{"1320", "Work in Progress", "INV", false, false, false, "Work in progress inventory"},
+		{"1330", "Finished Goods", "INV", false, false, false, "Finished goods inventory"},
+		{"1400", "Prepaid Expenses", "OA", false, false, false, "Prepaid expenses"},
+		{"1500", "Fixed Assets", "FA", false, false, false, "Property, plant and equipment"},
+		{"1510", "Accumulated Depreciation", "FA", false, false, false, "Accumulated depreciation"},
+		{"1600", "Intangible Assets", "OA", false, false, false, "Intangible assets"},
+
+		// Liabilities (2xxx)
+		{"2000", "Accounts Payable", "AP", false, true, true, "Trade payables to suppliers"},
+		{"2100", "Accrued Expenses", "ST_LIAB", false, false, false, "Accrued liabilities"},
+		{"2110", "Wages Payable", "ST_LIAB", false, false, false, "Wages and salaries payable"},
+		{"2120", "Interest Payable", "ST_LIAB", false, false, false, "Interest payable"},
+		{"2200", "Tax Payable", "ST_LIAB", false, false, false, "Tax liabilities"},
+		{"2210", "VAT Payable", "ST_LIAB", false, false, false, "VAT/Sales tax payable"},
+		{"2220", "Income Tax Payable", "ST_LIAB", false, false, false, "Income tax payable"},
+		{"2300", "Unearned Revenue", "ST_LIAB", false, false, false, "Deferred revenue"},
+		{"2400", "Short-term Loans", "ST_LIAB", false, false, true, "Short-term borrowings"},
+		{"2500", "Long-term Loans", "LT_LIAB", false, false, true, "Long-term borrowings"},
+
+		// Equity (3xxx)
+		{"3000", "Owner's Equity", "EQUITY", false, false, false, "Owner's capital"},
+		{"3100", "Share Capital", "EQUITY", false, false, false, "Issued share capital"},
+		{"3200", "Retained Earnings", "RETAIN", false, false, false, "Accumulated profits"},
+		{"3300", "Current Year Earnings", "RETAIN", false, false, false, "Current period profit/loss"},
+		{"3400", "Dividends", "EQUITY", false, false, false, "Dividends declared"},
+
+		// Revenue (4xxx)
+		{"4000", "Sales Revenue", "REVENUE", false, false, false, "Revenue from sales"},
+		{"4100", "Service Revenue", "REVENUE", false, false, false, "Revenue from services"},
+		{"4200", "Product Sales", "REVENUE", false, false, false, "Revenue from product sales"},
+		{"4900", "Other Income", "OTHER_INC", false, false, false, "Miscellaneous income"},
+		{"4910", "Interest Income", "OTHER_INC", false, false, false, "Interest earned"},
+		{"4920", "Foreign Exchange Gain", "OTHER_INC", false, false, false, "Gain on foreign exchange"},
+
+		// Cost of Goods Sold (5xxx)
+		{"5000", "Cost of Goods Sold", "COGS", false, false, false, "Direct cost of goods sold"},
+		{"5100", "Direct Materials", "COGS", false, false, false, "Cost of raw materials used"},
+		{"5200", "Direct Labor", "COGS", false, false, false, "Direct labor costs"},
+		{"5300", "Manufacturing Overhead", "COGS", false, false, false, "Manufacturing overhead"},
+
+		// Operating Expenses (6xxx)
+		{"6000", "Salaries & Wages", "OPEX", false, false, false, "Employee salaries and wages"},
+		{"6100", "Rent Expense", "OPEX", false, false, false, "Rent and lease payments"},
+		{"6200", "Utilities", "OPEX", false, false, false, "Electricity, water, gas"},
+		{"6300", "Office Supplies", "OPEX", false, false, false, "Office supplies expense"},
+		{"6400", "Insurance Expense", "OPEX", false, false, false, "Insurance premiums"},
+		{"6500", "Depreciation Expense", "OPEX", false, false, false, "Depreciation of assets"},
+		{"6600", "Advertising & Marketing", "OPEX", false, false, false, "Marketing expenses"},
+		{"6700", "Professional Fees", "OPEX", false, false, false, "Legal, accounting fees"},
+		{"6800", "Travel & Entertainment", "OPEX", false, false, false, "Business travel expenses"},
+		{"6900", "Miscellaneous Expense", "OPEX", false, false, false, "Other operating expenses"},
+
+		// Other Expenses (7xxx)
+		{"7000", "Interest Expense", "OTHER_EXP", false, false, false, "Interest on borrowings"},
+		{"7100", "Bank Charges", "OTHER_EXP", false, false, false, "Bank fees and charges"},
+		{"7200", "Foreign Exchange Loss", "OTHER_EXP", false, false, false, "Loss on foreign exchange"},
+		{"7900", "Other Expenses", "OTHER_EXP", false, false, false, "Miscellaneous expenses"},
+	}
+
+	for _, acc := range defaultAccounts {
+		typeID, ok := accountTypeIDs[acc.typeCode]
+		if !ok {
+			h.log.Warn("Account type not found", "type_code", acc.typeCode)
+			continue
+		}
+
+		id := uuid.New()
+		_, err := h.db.Exec(`
+			INSERT INTO accounts (
+				id, tenant_id, organization_id, account_type_id, code, name, description,
+				is_bank_account, is_control_account, is_reconcilable,
+				current_balance, opening_balance, is_active, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			ON CONFLICT (tenant_id, organization_id, code) DO NOTHING
+		`,
+			id, tenantID, orgID, typeID, acc.code, acc.name, acc.description,
+			acc.isBankAcc, acc.isControl, acc.isRecon,
+			0, 0, true, now, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create default account", "error", err, "code", acc.code)
+		}
+	}
+
+	h.log.Info("Created default chart of accounts", "tenant_id", tenantID, "org_id", orgID, "account_count", len(defaultAccounts))
+	return nil
+}
+
+// createDefaultJournals creates default accounting journals for a new organization
+func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
+	now := time.Now()
+
+	// Get some key account IDs for default debit/credit accounts
+	accountIDs := make(map[string]uuid.UUID)
+	rows, err := h.db.Query(`
+		SELECT id, code FROM accounts
+		WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+	`, tenantID, orgID)
+	if err != nil {
+		return fmt.Errorf("failed to get accounts: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id uuid.UUID
+		var code string
+		if err := rows.Scan(&id, &code); err != nil {
+			continue
+		}
+		accountIDs[code] = id
+	}
+
+	// Define default journals
+	defaultJournals := []struct {
+		code              string
+		name              string
+		journalType       string
+		defaultDebitCode  string
+		defaultCreditCode string
+	}{
+		{"GEN", "General Journal", "general", "", ""},
+		{"SAL", "Sales Journal", "sales", "1200", "4000"},         // AR debit, Sales Revenue credit
+		{"PUR", "Purchase Journal", "purchase", "5000", "2000"},   // COGS debit, AP credit
+		{"CASH", "Cash Journal", "cash", "1000", "1000"},          // Cash
+		{"BANK", "Bank Journal", "bank", "1100", "1100"},          // Bank
+	}
+
+	for _, j := range defaultJournals {
+		id := uuid.New()
+
+		var defaultDebitID, defaultCreditID *uuid.UUID
+		if j.defaultDebitCode != "" {
+			if accID, ok := accountIDs[j.defaultDebitCode]; ok {
+				defaultDebitID = &accID
+			}
+		}
+		if j.defaultCreditCode != "" {
+			if accID, ok := accountIDs[j.defaultCreditCode]; ok {
+				defaultCreditID = &accID
+			}
+		}
+
+		_, err := h.db.Exec(`
+			INSERT INTO journals (
+				id, tenant_id, code, name, type,
+				default_debit_account_id, default_credit_account_id,
+				is_active, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (tenant_id, code) DO NOTHING
+		`,
+			id, tenantID, j.code, j.name, j.journalType,
+			defaultDebitID, defaultCreditID,
+			true, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create default journal", "error", err, "code", j.code)
+		}
+	}
+
+	h.log.Info("Created default journals", "tenant_id", tenantID, "org_id", orgID, "journal_count", len(defaultJournals))
+	return nil
 }
