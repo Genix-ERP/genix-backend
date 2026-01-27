@@ -222,14 +222,14 @@ func (h *Handler) CreateContract(c *gin.Context) {
 
 	query := `
 		INSERT INTO procurement_contracts (
-			id, tenant_id, contract_number, title, vendor_id, contract_type, status,
+			id, tenant_id, contract_number, title, vendor_id, vendor_name, contract_type, status,
 			start_date, end_date, value, currency_id, terms, description,
 			auto_renewal, renewal_term_days, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 	`
 
 	_, err = h.db.Exec(query,
-		id, tenantID, contractNumber, input.Title, vendorID, input.ContractType, entity.ContractStatusDraft,
+		id, tenantID, contractNumber, input.Title, vendorID, vendorName, input.ContractType, entity.ContractStatusDraft,
 		startDate, endDate, input.Value, currencyID, terms, description,
 		input.AutoRenewal, input.RenewalTermDays, notes, userID, now, now,
 	)

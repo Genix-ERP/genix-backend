@@ -274,7 +274,8 @@ type CreateOperationTypeInput struct {
 	WarehouseID           string `json:"warehouse_id" binding:"required"`
 	Code                  string `json:"code" binding:"required,min=1,max=50"`
 	Name                  string `json:"name" binding:"required,min=1,max=255"`
-	Type                  string `json:"type,omitempty"`
+	OperationType         string `json:"operation_type,omitempty"` // incoming, outgoing, internal
+	Type                  string `json:"type,omitempty"`           // custom type name
 	Sequence              int    `json:"sequence,omitempty"`
 	DefaultLocationSrcID  string `json:"default_location_src_id,omitempty"`
 	DefaultLocationDestID string `json:"default_location_dest_id,omitempty"`

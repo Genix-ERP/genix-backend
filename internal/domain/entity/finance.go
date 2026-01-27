@@ -412,7 +412,8 @@ type TaxRate struct {
 	Name          string       `json:"name" db:"name"`
 	Description   *string      `json:"description,omitempty" db:"description"`
 	Rate          float64      `json:"rate" db:"rate"`
-	Type          string       `json:"type" db:"type"` // percentage, fixed
+	Type          string       `json:"type" db:"type"`         // percentage, fixed
+	TaxType       string       `json:"tax_type" db:"tax_type"` // sales, purchase
 	TaxAccountID  *uuid.UUID   `json:"tax_account_id,omitempty" db:"tax_account_id"`
 	IsCompound    bool         `json:"is_compound" db:"is_compound"`
 	IsRecoverable bool         `json:"is_recoverable" db:"is_recoverable"`
@@ -429,6 +430,7 @@ type CreateTaxRateInput struct {
 	Description   string  `json:"description"`
 	Rate          float64 `json:"rate" binding:"required,gte=0"`
 	Type          string  `json:"type" binding:"required,oneof=percentage fixed"`
+	TaxType       string  `json:"tax_type" binding:"omitempty,oneof=sales purchase"`
 	TaxAccountID  *string `json:"tax_account_id"`
 	IsCompound    bool    `json:"is_compound"`
 	IsRecoverable bool    `json:"is_recoverable"`
@@ -439,6 +441,7 @@ type UpdateTaxRateInput struct {
 	Name          *string  `json:"name"`
 	Description   *string  `json:"description"`
 	Rate          *float64 `json:"rate"`
+	TaxType       *string  `json:"tax_type"`
 	TaxAccountID  *string  `json:"tax_account_id"`
 	IsCompound    *bool    `json:"is_compound"`
 	IsRecoverable *bool    `json:"is_recoverable"`
@@ -451,13 +454,31 @@ type UpdateTaxRateInput struct {
 
 // Currency represents a currency (referenced from 001_core_schema.sql)
 type Currency struct {
-	ID           uuid.UUID `json:"id" db:"id"`
-	Code         string    `json:"code" db:"code"`
-	Name         string    `json:"name" db:"name"`
-	Symbol       string    `json:"symbol" db:"symbol"`
-	DecimalPlaces int      `json:"decimal_places" db:"decimal_places"`
-	IsBaseCurrency bool    `json:"is_base_currency" db:"is_base_currency"`
-	IsActive     bool      `json:"is_active" db:"is_active"`
+	ID             uuid.UUID `json:"id" db:"id"`
+	Code           string    `json:"code" db:"code"`
+	Name           string    `json:"name" db:"name"`
+	Symbol         string    `json:"symbol" db:"symbol"`
+	DecimalPlaces  int       `json:"decimal_places" db:"decimal_places"`
+	IsBaseCurrency bool      `json:"is_base_currency" db:"is_base_currency"`
+	IsActive       bool      `json:"is_active" db:"is_active"`
+}
+
+// CreateCurrencyInput is the input for creating a currency
+type CreateCurrencyInput struct {
+	Code           string `json:"code" binding:"required,min=3,max=3"`
+	Name           string `json:"name" binding:"required,min=1,max=100"`
+	Symbol         string `json:"symbol" binding:"required,min=1,max=10"`
+	DecimalPlaces  int    `json:"decimal_places"`
+	IsBaseCurrency bool   `json:"is_base_currency"`
+}
+
+// UpdateCurrencyInput is the input for updating a currency
+type UpdateCurrencyInput struct {
+	Name           *string `json:"name"`
+	Symbol         *string `json:"symbol"`
+	DecimalPlaces  *int    `json:"decimal_places"`
+	IsBaseCurrency *bool   `json:"is_base_currency"`
+	IsActive       *bool   `json:"is_active"`
 }
 
 // ExchangeRate represents an exchange rate
@@ -469,6 +490,156 @@ type ExchangeRate struct {
 	Rate           float64   `json:"rate" db:"rate"`
 	EffectiveDate  time.Time `json:"effective_date" db:"effective_date"`
 	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+}
+
+// =====================================================
+// BANK ACCOUNTS
+// =====================================================
+
+// BankAccount represents a bank account for the company
+type BankAccount struct {
+	ID              uuid.UUID    `json:"id" db:"id"`
+	TenantID        uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	OrganizationID  *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
+	Name            string       `json:"name" db:"name"`
+	BankName        string       `json:"bank_name" db:"bank_name"`
+	AccountNumber   string       `json:"account_number" db:"account_number"`
+	Currency        string       `json:"currency" db:"currency"`
+	AccountType     string       `json:"account_type" db:"account_type"` // checking, savings, etc.
+	Balance         float64      `json:"balance" db:"balance"`
+	IsActive        bool         `json:"is_active" db:"is_active"`
+	LastReconciled  *time.Time   `json:"last_reconciled,omitempty" db:"last_reconciled"`
+	AccountID       *uuid.UUID   `json:"account_id,omitempty" db:"account_id"` // Link to chart of accounts
+	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt       sql.NullTime `json:"-" db:"deleted_at"`
+}
+
+// CreateBankAccountInput is the input for creating a bank account
+type CreateBankAccountInput struct {
+	Name          string  `json:"name" binding:"required,min=1,max=255"`
+	BankName      string  `json:"bank_name" binding:"required,min=1,max=255"`
+	AccountNumber string  `json:"account_number" binding:"required,min=1,max=50"`
+	Currency      string  `json:"currency" binding:"required,min=1,max=10"`
+	AccountType   string  `json:"account_type" binding:"required,oneof=checking savings money_market certificate"`
+	Balance       float64 `json:"balance"`
+	AccountID     *string `json:"account_id"`
+}
+
+// UpdateBankAccountInput is the input for updating a bank account
+type UpdateBankAccountInput struct {
+	Name          *string  `json:"name"`
+	BankName      *string  `json:"bank_name"`
+	AccountNumber *string  `json:"account_number"`
+	Currency      *string  `json:"currency"`
+	AccountType   *string  `json:"account_type"`
+	Balance       *float64 `json:"balance"`
+	IsActive      *bool    `json:"is_active"`
+	AccountID     *string  `json:"account_id"`
+}
+
+// BankAccountListFilter is the filter for listing bank accounts
+type BankAccountListFilter struct {
+	Search      string `form:"search"`
+	Currency    string `form:"currency"`
+	AccountType string `form:"account_type"`
+	IsActive    *bool  `form:"is_active"`
+}
+
+// =====================================================
+// BANK TRANSACTIONS
+// =====================================================
+
+// BankTransaction represents a bank transaction for reconciliation
+type BankTransaction struct {
+	ID                    uuid.UUID  `json:"id" db:"id"`
+	TenantID              uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	BankAccountID         uuid.UUID  `json:"bank_account_id" db:"bank_account_id"`
+	TransactionDate       time.Time  `json:"transaction_date" db:"transaction_date"`
+	ValueDate             *time.Time `json:"value_date,omitempty" db:"value_date"`
+	Reference             string     `json:"reference" db:"reference"`
+	Description           string     `json:"description" db:"description"`
+	Amount                float64    `json:"amount" db:"amount"`
+	BalanceAfter          *float64   `json:"balance_after,omitempty" db:"balance_after"`
+	TransactionType       string     `json:"type" db:"transaction_type"` // debit, credit
+	Status                string     `json:"status" db:"status"`         // unmatched, matched, reconciled
+	MatchedJournalEntryID *uuid.UUID `json:"matched_journal_entry_id,omitempty" db:"matched_journal_entry_id"`
+	IsReconciled          bool       `json:"is_reconciled" db:"-"` // Computed from status
+	ReconciledDate        *time.Time `json:"reconciled_date,omitempty" db:"-"`
+	CreatedAt             time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// CreateBankTransactionInput is the input for creating a bank transaction
+type CreateBankTransactionInput struct {
+	TransactionDate string  `json:"transaction_date" binding:"required"`
+	Reference       string  `json:"reference"`
+	Description     string  `json:"description" binding:"required"`
+	Amount          float64 `json:"amount" binding:"required,gt=0"`
+	Type            string  `json:"type" binding:"required,oneof=debit credit"`
+}
+
+// BankTransactionListFilter is the filter for listing bank transactions
+type BankTransactionListFilter struct {
+	Search   string `form:"search"`
+	Type     string `form:"type"` // debit, credit
+	Status   string `form:"status"`
+	DateFrom string `form:"date_from"`
+	DateTo   string `form:"date_to"`
+}
+
+// =====================================================
+// CASH TRANSACTIONS (Kassa)
+// =====================================================
+
+// CashTransaction represents a cash register transaction
+type CashTransaction struct {
+	ID              uuid.UUID  `json:"id" db:"id"`
+	TenantID        uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	TransactionDate time.Time  `json:"transaction_date" db:"transaction_date"`
+	Type            string     `json:"type" db:"transaction_type"` // income, expense, transfer
+	Amount          float64    `json:"amount" db:"amount"`
+	Currency        string     `json:"currency" db:"currency"`
+	Description     string     `json:"description" db:"description"`
+	Category        string     `json:"category" db:"category"`
+	Reference       string     `json:"reference" db:"reference"`
+	Cashier         string     `json:"cashier" db:"cashier"`
+	Status          string     `json:"status" db:"status"` // draft, posted
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// CreateCashTransactionInput is the input for creating a cash transaction
+type CreateCashTransactionInput struct {
+	TransactionDate string  `json:"transaction_date" binding:"required"`
+	Type            string  `json:"type" binding:"required,oneof=income expense transfer"`
+	Amount          float64 `json:"amount" binding:"required,gt=0"`
+	Currency        string  `json:"currency"`
+	Description     string  `json:"description" binding:"required"`
+	Category        string  `json:"category"`
+	Reference       string  `json:"reference"`
+	Cashier         string  `json:"cashier"`
+}
+
+// UpdateCashTransactionInput is the input for updating a cash transaction
+type UpdateCashTransactionInput struct {
+	TransactionDate *string  `json:"transaction_date"`
+	Type            *string  `json:"type"`
+	Amount          *float64 `json:"amount"`
+	Currency        *string  `json:"currency"`
+	Description     *string  `json:"description"`
+	Category        *string  `json:"category"`
+	Reference       *string  `json:"reference"`
+	Cashier         *string  `json:"cashier"`
+}
+
+// CashTransactionListFilter is the filter for listing cash transactions
+type CashTransactionListFilter struct {
+	Search   string `form:"search"`
+	Type     string `form:"type"` // income, expense, transfer
+	Category string `form:"category"`
+	DateFrom string `form:"date_from"`
+	DateTo   string `form:"date_to"`
 }
 
 // =====================================================

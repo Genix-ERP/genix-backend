@@ -22,9 +22,9 @@ import (
 // ListAccountTypes returns all account types
 func (h *Handler) ListAccountTypes(c *gin.Context) {
 	query := `
-		SELECT id, code, name, category, normal_balance, is_system, display_order
+		SELECT id, code, name, category, normal_balance, COALESCE(is_system, true)
 		FROM account_types
-		ORDER BY display_order ASC, name ASC
+		ORDER BY code ASC
 	`
 
 	rows, err := h.db.Query(query)
@@ -35,15 +35,24 @@ func (h *Handler) ListAccountTypes(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	types := make([]*entity.AccountType, 0)
+	type AccountTypeResponse struct {
+		ID            uuid.UUID `json:"id"`
+		Code          string    `json:"code"`
+		Name          string    `json:"name"`
+		Category      string    `json:"category"`
+		NormalBalance string    `json:"normal_balance"`
+		IsSystem      bool      `json:"is_system"`
+	}
+
+	types := make([]AccountTypeResponse, 0)
 	for rows.Next() {
-		var at entity.AccountType
-		err := rows.Scan(&at.ID, &at.Code, &at.Name, &at.Category, &at.NormalBalance, &at.IsSystem, &at.DisplayOrder)
+		var at AccountTypeResponse
+		err := rows.Scan(&at.ID, &at.Code, &at.Name, &at.Category, &at.NormalBalance, &at.IsSystem)
 		if err != nil {
 			h.log.Error("Failed to scan account type", "error", err)
 			continue
 		}
-		types = append(types, &at)
+		types = append(types, at)
 	}
 
 	response.Success(c, types)
@@ -772,6 +781,63 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 	pagination.Calculate(total)
 
 	response.SuccessWithPagination(c, entries, pagination)
+}
+
+// ListJournals returns all journals for the tenant
+func (h *Handler) ListJournals(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	query := `
+		SELECT id, code, name, type,
+			COALESCE(description, ''),
+			COALESCE(auto_sequence, false),
+			COALESCE(next_number, 1),
+			COALESCE(number_prefix, ''),
+			COALESCE(is_active, true),
+			created_at,
+			COALESCE(updated_at, created_at)
+		FROM journals
+		WHERE tenant_id = $1
+		ORDER BY code ASC
+	`
+
+	rows, err := h.db.Query(query, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query journals", "error", err)
+		response.InternalError(c, "Failed to fetch journals")
+		return
+	}
+	defer rows.Close()
+
+	type JournalResponse struct {
+		ID           uuid.UUID `json:"id"`
+		Code         string    `json:"code"`
+		Name         string    `json:"name"`
+		Type         string    `json:"type"`
+		Description  string    `json:"description,omitempty"`
+		AutoSequence bool      `json:"auto_sequence"`
+		NextNumber   int       `json:"next_number"`
+		NumberPrefix string    `json:"number_prefix,omitempty"`
+		IsActive     bool      `json:"is_active"`
+		CreatedAt    time.Time `json:"created_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
+	}
+
+	journals := make([]JournalResponse, 0)
+	for rows.Next() {
+		var j JournalResponse
+		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.Description, &j.AutoSequence, &j.NextNumber, &j.NumberPrefix, &j.IsActive, &j.CreatedAt, &j.UpdatedAt); err != nil {
+			h.log.Error("Failed to scan journal", "error", err)
+			continue
+		}
+		journals = append(journals, j)
+	}
+
+	response.Success(c, journals)
 }
 
 // CreateJournalEntry creates a new journal entry
@@ -1637,6 +1703,10 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		}
 	}
 
+	// Fetch contact name for response
+	var contactName string
+	h.db.QueryRow("SELECT name FROM contacts WHERE id = $1", contactID).Scan(&contactName)
+
 	payment := &entity.Payment{
 		ID:            id,
 		TenantID:      tenantID,
@@ -1650,6 +1720,7 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		Status:        "draft",
 		CreatedAt:     now,
 		UpdatedAt:     now,
+		Contact:       &entity.Contact{Name: contactName},
 	}
 
 	response.Created(c, payment.ToResponse())
@@ -1813,7 +1884,7 @@ func (h *Handler) ListTaxRates(c *gin.Context) {
 	includeInactive := c.Query("include_inactive") == "true"
 
 	query := `
-		SELECT id, tenant_id, code, name, description, rate, type,
+		SELECT id, tenant_id, code, name, description, rate, type, tax_type,
 			   tax_account_id, is_compound, is_recoverable, is_active, created_at, updated_at
 		FROM tax_rates
 		WHERE tenant_id = $1 AND deleted_at IS NULL
@@ -1837,10 +1908,10 @@ func (h *Handler) ListTaxRates(c *gin.Context) {
 	rates := make([]*entity.TaxRate, 0)
 	for rows.Next() {
 		var tr entity.TaxRate
-		var desc, taxAccID sql.NullString
+		var desc, taxAccID, taxType sql.NullString
 
 		err := rows.Scan(
-			&tr.ID, &tr.TenantID, &tr.Code, &tr.Name, &desc, &tr.Rate, &tr.Type,
+			&tr.ID, &tr.TenantID, &tr.Code, &tr.Name, &desc, &tr.Rate, &tr.Type, &taxType,
 			&taxAccID, &tr.IsCompound, &tr.IsRecoverable, &tr.IsActive, &tr.CreatedAt, &tr.UpdatedAt,
 		)
 		if err != nil {
@@ -1849,6 +1920,11 @@ func (h *Handler) ListTaxRates(c *gin.Context) {
 
 		if desc.Valid {
 			tr.Description = &desc.String
+		}
+		if taxType.Valid {
+			tr.TaxType = taxType.String
+		} else {
+			tr.TaxType = "sales" // Default
 		}
 		if taxAccID.Valid {
 			tid, _ := uuid.Parse(taxAccID.String)
@@ -1898,11 +1974,17 @@ func (h *Handler) CreateTaxRate(c *gin.Context) {
 		taxAccountID = &tid
 	}
 
+	// Default tax_type to 'sales' if not provided
+	taxType := input.TaxType
+	if taxType == "" {
+		taxType = "sales"
+	}
+
 	_, err := h.db.Exec(`
-		INSERT INTO tax_rates (id, tenant_id, code, name, description, rate, type,
+		INSERT INTO tax_rates (id, tenant_id, code, name, description, rate, type, tax_type,
 			tax_account_id, is_compound, is_recoverable, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-	`, id, tenantID, input.Code, input.Name, description, input.Rate, input.Type,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+	`, id, tenantID, input.Code, input.Name, description, input.Rate, input.Type, taxType,
 		taxAccountID, input.IsCompound, input.IsRecoverable, true, now, now)
 
 	if err != nil {
@@ -1919,6 +2001,7 @@ func (h *Handler) CreateTaxRate(c *gin.Context) {
 		Description:   description,
 		Rate:          input.Rate,
 		Type:          input.Type,
+		TaxType:       taxType,
 		TaxAccountID:  taxAccountID,
 		IsCompound:    input.IsCompound,
 		IsRecoverable: input.IsRecoverable,
@@ -1946,15 +2029,15 @@ func (h *Handler) GetTaxRate(c *gin.Context) {
 	}
 
 	var tr entity.TaxRate
-	var desc, taxAccID sql.NullString
+	var desc, taxAccID, taxType sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT id, tenant_id, code, name, description, rate, type,
+		SELECT id, tenant_id, code, name, description, rate, type, tax_type,
 			   tax_account_id, is_compound, is_recoverable, is_active, created_at, updated_at
 		FROM tax_rates
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, id, tenantID).Scan(
-		&tr.ID, &tr.TenantID, &tr.Code, &tr.Name, &desc, &tr.Rate, &tr.Type,
+		&tr.ID, &tr.TenantID, &tr.Code, &tr.Name, &desc, &tr.Rate, &tr.Type, &taxType,
 		&taxAccID, &tr.IsCompound, &tr.IsRecoverable, &tr.IsActive, &tr.CreatedAt, &tr.UpdatedAt,
 	)
 
@@ -1970,6 +2053,11 @@ func (h *Handler) GetTaxRate(c *gin.Context) {
 
 	if desc.Valid {
 		tr.Description = &desc.String
+	}
+	if taxType.Valid {
+		tr.TaxType = taxType.String
+	} else {
+		tr.TaxType = "sales"
 	}
 	if taxAccID.Valid {
 		tid, _ := uuid.Parse(taxAccID.String)
@@ -2018,6 +2106,9 @@ func (h *Handler) UpdateTaxRate(c *gin.Context) {
 	}
 	if input.Rate != nil {
 		addUpdate("rate", *input.Rate)
+	}
+	if input.TaxType != nil {
+		addUpdate("tax_type", *input.TaxType)
 	}
 	if input.IsCompound != nil {
 		addUpdate("is_compound", *input.IsCompound)
@@ -2131,6 +2222,206 @@ func (h *Handler) ListCurrencies(c *gin.Context) {
 	response.Success(c, currencies)
 }
 
+// GetCurrency returns a single currency by code
+func (h *Handler) GetCurrency(c *gin.Context) {
+	code := c.Param("code")
+
+	var cur entity.Currency
+	err := h.db.QueryRow(`
+		SELECT id, code, name, symbol, decimal_places, is_base_currency, is_active
+		FROM currencies WHERE code = $1
+	`, code).Scan(&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces, &cur.IsBaseCurrency, &cur.IsActive)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Currency")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get currency", "error", err)
+		response.InternalError(c, "Failed to get currency")
+		return
+	}
+
+	response.Success(c, cur)
+}
+
+// CreateCurrency creates a new currency
+func (h *Handler) CreateCurrency(c *gin.Context) {
+	var input entity.CreateCurrencyInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Check if currency code already exists (including inactive ones)
+	var existingID uuid.UUID
+	var isActive bool
+	err := h.db.QueryRow("SELECT id, is_active FROM currencies WHERE code = $1", input.Code).Scan(&existingID, &isActive)
+
+	if err == nil {
+		// Currency exists
+		if isActive {
+			response.BadRequest(c, "Currency with this code already exists")
+			return
+		}
+
+		// Currency exists but is inactive - reactivate it with new data
+		if input.IsBaseCurrency {
+			h.db.Exec("UPDATE currencies SET is_base_currency = false WHERE is_base_currency = true")
+		}
+
+		_, err = h.db.Exec(`
+			UPDATE currencies
+			SET name = $1, symbol = $2, decimal_places = $3, is_base_currency = $4, is_active = true
+			WHERE id = $5
+		`, input.Name, input.Symbol, input.DecimalPlaces, input.IsBaseCurrency, existingID)
+
+		if err != nil {
+			h.log.Error("Failed to reactivate currency", "error", err)
+			response.InternalError(c, "Failed to create currency")
+			return
+		}
+
+		cur := entity.Currency{
+			ID:             existingID,
+			Code:           input.Code,
+			Name:           input.Name,
+			Symbol:         input.Symbol,
+			DecimalPlaces:  input.DecimalPlaces,
+			IsBaseCurrency: input.IsBaseCurrency,
+			IsActive:       true,
+		}
+
+		response.Created(c, cur)
+		return
+	}
+
+	// Currency doesn't exist - create new one
+	if input.IsBaseCurrency {
+		h.db.Exec("UPDATE currencies SET is_base_currency = false WHERE is_base_currency = true")
+	}
+
+	id := uuid.New()
+	_, err = h.db.Exec(`
+		INSERT INTO currencies (id, code, name, symbol, decimal_places, is_base_currency, is_active)
+		VALUES ($1, $2, $3, $4, $5, $6, true)
+	`, id, input.Code, input.Name, input.Symbol, input.DecimalPlaces, input.IsBaseCurrency)
+
+	if err != nil {
+		h.log.Error("Failed to create currency", "error", err)
+		response.InternalError(c, "Failed to create currency")
+		return
+	}
+
+	cur := entity.Currency{
+		ID:             id,
+		Code:           input.Code,
+		Name:           input.Name,
+		Symbol:         input.Symbol,
+		DecimalPlaces:  input.DecimalPlaces,
+		IsBaseCurrency: input.IsBaseCurrency,
+		IsActive:       true,
+	}
+
+	response.Created(c, cur)
+}
+
+// UpdateCurrency updates an existing currency
+func (h *Handler) UpdateCurrency(c *gin.Context) {
+	code := c.Param("code")
+
+	var input entity.UpdateCurrencyInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Check if currency exists
+	var cur entity.Currency
+	err := h.db.QueryRow(`
+		SELECT id, code, name, symbol, decimal_places, is_base_currency, is_active
+		FROM currencies WHERE code = $1
+	`, code).Scan(&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces, &cur.IsBaseCurrency, &cur.IsActive)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Currency")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get currency", "error", err)
+		response.InternalError(c, "Failed to update currency")
+		return
+	}
+
+	// If setting as base currency, unset other base currencies
+	if input.IsBaseCurrency != nil && *input.IsBaseCurrency {
+		h.db.Exec("UPDATE currencies SET is_base_currency = false WHERE is_base_currency = true AND code != $1", code)
+	}
+
+	// Update fields
+	if input.Name != nil {
+		cur.Name = *input.Name
+	}
+	if input.Symbol != nil {
+		cur.Symbol = *input.Symbol
+	}
+	if input.DecimalPlaces != nil {
+		cur.DecimalPlaces = *input.DecimalPlaces
+	}
+	if input.IsBaseCurrency != nil {
+		cur.IsBaseCurrency = *input.IsBaseCurrency
+	}
+	if input.IsActive != nil {
+		cur.IsActive = *input.IsActive
+	}
+
+	_, err = h.db.Exec(`
+		UPDATE currencies SET name = $1, symbol = $2, decimal_places = $3, is_base_currency = $4, is_active = $5
+		WHERE code = $6
+	`, cur.Name, cur.Symbol, cur.DecimalPlaces, cur.IsBaseCurrency, cur.IsActive, code)
+
+	if err != nil {
+		h.log.Error("Failed to update currency", "error", err)
+		response.InternalError(c, "Failed to update currency")
+		return
+	}
+
+	response.Success(c, cur)
+}
+
+// DeleteCurrency deletes a currency (soft delete by setting is_active = false)
+func (h *Handler) DeleteCurrency(c *gin.Context) {
+	code := c.Param("code")
+
+	// Check if currency is base currency
+	var isBase bool
+	err := h.db.QueryRow("SELECT is_base_currency FROM currencies WHERE code = $1", code).Scan(&isBase)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Currency")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get currency", "error", err)
+		response.InternalError(c, "Failed to delete currency")
+		return
+	}
+
+	if isBase {
+		response.BadRequest(c, "Cannot delete base currency")
+		return
+	}
+
+	// Soft delete by setting is_active = false
+	_, err = h.db.Exec("UPDATE currencies SET is_active = false WHERE code = $1", code)
+	if err != nil {
+		h.log.Error("Failed to delete currency", "error", err)
+		response.InternalError(c, "Failed to delete currency")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Currency deleted successfully"})
+}
+
 // GetExchangeRate returns the exchange rate for a currency
 func (h *Handler) GetExchangeRate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -2186,4 +2477,1175 @@ func (h *Handler) GetExchangeRate(c *gin.Context) {
 		"rate":           rate,
 		"effective_date": effectiveDate.Format("2006-01-02"),
 	})
+}
+
+// SetExchangeRate creates or updates an exchange rate for a currency
+func (h *Handler) SetExchangeRate(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	code := c.Param("code")
+
+	var input struct {
+		Rate   float64 `json:"rate" binding:"required,gt=0"`
+		Date   string  `json:"date"`
+		Source string  `json:"source"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Default date to today
+	date := input.Date
+	if date == "" {
+		date = time.Now().Format("2006-01-02")
+	}
+
+	// Default source to manual
+	source := input.Source
+	if source == "" {
+		source = "manual"
+	}
+
+	// Get currency ID
+	var currencyID uuid.UUID
+	err := h.db.QueryRow("SELECT id FROM currencies WHERE code = $1", code).Scan(&currencyID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Currency")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get currency", "error", err)
+		response.InternalError(c, "Failed to set exchange rate")
+		return
+	}
+
+	// Get base currency (or use a default like UZS)
+	var baseCurrencyID uuid.UUID
+	err = h.db.QueryRow("SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1").Scan(&baseCurrencyID)
+	if err == sql.ErrNoRows {
+		// If no base currency set, try to use UZS
+		err = h.db.QueryRow("SELECT id FROM currencies WHERE code = 'UZS' LIMIT 1").Scan(&baseCurrencyID)
+		if err != nil {
+			// Use first currency as base
+			err = h.db.QueryRow("SELECT id FROM currencies LIMIT 1").Scan(&baseCurrencyID)
+		}
+	}
+	if err != nil {
+		h.log.Error("Failed to get base currency", "error", err)
+		response.InternalError(c, "Failed to set exchange rate - no base currency")
+		return
+	}
+
+	// Check if rate exists for this date
+	var existingID uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT id FROM exchange_rates
+		WHERE tenant_id = $1 AND from_currency_id = $2 AND to_currency_id = $3 AND effective_date = $4
+	`, tenantID, currencyID, baseCurrencyID, date).Scan(&existingID)
+
+	if err == nil {
+		// Update existing rate
+		_, err = h.db.Exec(`
+			UPDATE exchange_rates SET rate = $1, source = $2 WHERE id = $3
+		`, input.Rate, source, existingID)
+		if err != nil {
+			h.log.Error("Failed to update exchange rate", "error", err)
+			response.InternalError(c, "Failed to update exchange rate")
+			return
+		}
+	} else if err == sql.ErrNoRows {
+		// Create new rate
+		id := uuid.New()
+		_, err = h.db.Exec(`
+			INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`, id, tenantID, currencyID, baseCurrencyID, input.Rate, date, source)
+		if err != nil {
+			h.log.Error("Failed to create exchange rate", "error", err)
+			response.InternalError(c, "Failed to create exchange rate")
+			return
+		}
+	} else {
+		h.log.Error("Failed to check existing rate", "error", err)
+		response.InternalError(c, "Failed to set exchange rate")
+		return
+	}
+
+	response.Created(c, gin.H{
+		"currency_code":  code,
+		"rate":           input.Rate,
+		"effective_date": date,
+		"source":         source,
+	})
+}
+
+// ListExchangeRates returns all exchange rates for the tenant
+func (h *Handler) ListExchangeRates(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	dateFrom := c.Query("date_from")
+	dateTo := c.Query("date_to")
+	currencyCode := c.Query("currency")
+
+	query := `
+		SELECT er.id, er.rate, er.effective_date, er.source, er.created_at,
+		       fc.code as from_currency, tc.code as to_currency
+		FROM exchange_rates er
+		JOIN currencies fc ON er.from_currency_id = fc.id
+		JOIN currencies tc ON er.to_currency_id = tc.id
+		WHERE er.tenant_id = $1
+	`
+	args := []interface{}{tenantID}
+	argIndex := 2
+
+	if dateFrom != "" {
+		query += fmt.Sprintf(" AND er.effective_date >= $%d", argIndex)
+		args = append(args, dateFrom)
+		argIndex++
+	}
+
+	if dateTo != "" {
+		query += fmt.Sprintf(" AND er.effective_date <= $%d", argIndex)
+		args = append(args, dateTo)
+		argIndex++
+	}
+
+	if currencyCode != "" {
+		query += fmt.Sprintf(" AND fc.code = $%d", argIndex)
+		args = append(args, currencyCode)
+		argIndex++
+	}
+
+	query += " ORDER BY er.effective_date DESC, fc.code ASC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list exchange rates", "error", err)
+		response.InternalError(c, "Failed to list exchange rates")
+		return
+	}
+	defer rows.Close()
+
+	type ExchangeRateResponse struct {
+		ID            uuid.UUID `json:"id"`
+		FromCurrency  string    `json:"from_currency"`
+		ToCurrency    string    `json:"to_currency"`
+		Rate          float64   `json:"rate"`
+		EffectiveDate string    `json:"effective_date"`
+		Source        string    `json:"source"`
+		CreatedAt     time.Time `json:"created_at"`
+	}
+
+	rates := make([]ExchangeRateResponse, 0)
+	for rows.Next() {
+		var r ExchangeRateResponse
+		var effectiveDate time.Time
+		var source sql.NullString
+		err := rows.Scan(&r.ID, &r.Rate, &effectiveDate, &source, &r.CreatedAt, &r.FromCurrency, &r.ToCurrency)
+		if err != nil {
+			continue
+		}
+		r.EffectiveDate = effectiveDate.Format("2006-01-02")
+		r.Source = source.String
+		if r.Source == "" {
+			r.Source = "manual"
+		}
+		rates = append(rates, r)
+	}
+
+	response.Success(c, rates)
+}
+
+// =====================================================
+// BANK ACCOUNTS
+// =====================================================
+
+// ListBankAccounts returns all bank accounts for the tenant
+func (h *Handler) ListBankAccounts(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	var filter entity.BankAccountListFilter
+	if err := c.ShouldBindQuery(&filter); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	query := `
+		SELECT id, tenant_id, organization_id, COALESCE(name, bank_name) as name, bank_name,
+		       COALESCE(account_number, '') as account_number,
+		       COALESCE(currency, 'UZS') as currency, COALESCE(account_type, 'checking') as account_type,
+		       COALESCE(balance, 0) as balance, COALESCE(is_active, true) as is_active,
+		       last_reconciled,
+		       account_id, created_at, updated_at
+		FROM bank_accounts
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`
+	args := []interface{}{tenantID}
+	argIndex := 2
+
+	if filter.Search != "" {
+		query += fmt.Sprintf(" AND (COALESCE(name, bank_name) ILIKE $%d OR bank_name ILIKE $%d OR account_number ILIKE $%d)", argIndex, argIndex, argIndex)
+		args = append(args, "%"+filter.Search+"%")
+		argIndex++
+	}
+
+	if filter.Currency != "" {
+		query += fmt.Sprintf(" AND COALESCE(currency, 'UZS') = $%d", argIndex)
+		args = append(args, filter.Currency)
+		argIndex++
+	}
+
+	if filter.AccountType != "" {
+		query += fmt.Sprintf(" AND COALESCE(account_type, 'checking') = $%d", argIndex)
+		args = append(args, filter.AccountType)
+		argIndex++
+	}
+
+	if filter.IsActive != nil {
+		query += fmt.Sprintf(" AND COALESCE(is_active, true) = $%d", argIndex)
+		args = append(args, *filter.IsActive)
+		argIndex++
+	}
+
+	query += " ORDER BY COALESCE(name, bank_name) ASC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list bank accounts", "error", err)
+		response.InternalError(c, "Failed to list bank accounts")
+		return
+	}
+	defer rows.Close()
+
+	var accounts []entity.BankAccount
+	for rows.Next() {
+		var acc entity.BankAccount
+		var organizationID, accountID sql.NullString
+		var lastReconciled sql.NullTime
+		var name, accountNumber sql.NullString
+
+		err := rows.Scan(
+			&acc.ID, &acc.TenantID, &organizationID, &name, &acc.BankName,
+			&accountNumber, &acc.Currency, &acc.AccountType, &acc.Balance,
+			&acc.IsActive, &lastReconciled, &accountID, &acc.CreatedAt, &acc.UpdatedAt,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan bank account", "error", err)
+			continue
+		}
+
+		if name.Valid {
+			acc.Name = name.String
+		} else {
+			acc.Name = acc.BankName
+		}
+		if accountNumber.Valid {
+			acc.AccountNumber = accountNumber.String
+		}
+		if organizationID.Valid {
+			orgID, _ := uuid.Parse(organizationID.String)
+			acc.OrganizationID = &orgID
+		}
+		if accountID.Valid {
+			accID, _ := uuid.Parse(accountID.String)
+			acc.AccountID = &accID
+		}
+		if lastReconciled.Valid {
+			acc.LastReconciled = &lastReconciled.Time
+		}
+
+		accounts = append(accounts, acc)
+	}
+
+	response.Success(c, accounts)
+}
+
+// GetBankAccount returns a single bank account by ID
+func (h *Handler) GetBankAccount(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	var acc entity.BankAccount
+	var organizationID, accountID sql.NullString
+	var lastReconciled sql.NullTime
+	var name, accountNumber sql.NullString
+
+	err := h.db.QueryRow(`
+		SELECT id, tenant_id, organization_id, COALESCE(name, bank_name) as name, bank_name,
+		       COALESCE(account_number, '') as account_number,
+		       COALESCE(currency, 'UZS') as currency, COALESCE(account_type, 'checking') as account_type,
+		       COALESCE(balance, 0) as balance, COALESCE(is_active, true) as is_active,
+		       COALESCE(last_reconciled, last_reconciled_date) as last_reconciled,
+		       account_id, created_at, updated_at
+		FROM bank_accounts
+		WHERE id = $1 AND tenant_id = $2 AND (deleted_at IS NULL OR deleted_at IS NULL)
+	`, id, tenantID).Scan(
+		&acc.ID, &acc.TenantID, &organizationID, &name, &acc.BankName,
+		&accountNumber, &acc.Currency, &acc.AccountType, &acc.Balance,
+		&acc.IsActive, &lastReconciled, &accountID, &acc.CreatedAt, &acc.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Bank account not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get bank account", "error", err)
+		response.InternalError(c, "Failed to get bank account")
+		return
+	}
+
+	if name.Valid {
+		acc.Name = name.String
+	} else {
+		acc.Name = acc.BankName
+	}
+	if accountNumber.Valid {
+		acc.AccountNumber = accountNumber.String
+	}
+	if organizationID.Valid {
+		orgID, _ := uuid.Parse(organizationID.String)
+		acc.OrganizationID = &orgID
+	}
+	if accountID.Valid {
+		accID, _ := uuid.Parse(accountID.String)
+		acc.AccountID = &accID
+	}
+	if lastReconciled.Valid {
+		acc.LastReconciled = &lastReconciled.Time
+	}
+
+	response.Success(c, acc)
+}
+
+// CreateBankAccount creates a new bank account
+func (h *Handler) CreateBankAccount(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	var input entity.CreateBankAccountInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Check for duplicate account number
+	var exists bool
+	err := h.db.QueryRow(`
+		SELECT EXISTS(SELECT 1 FROM bank_accounts WHERE tenant_id = $1 AND account_number = $2 AND deleted_at IS NULL)
+	`, tenantID, input.AccountNumber).Scan(&exists)
+	if err != nil {
+		h.log.Error("Failed to check duplicate account number", "error", err)
+		response.InternalError(c, "Failed to create bank account")
+		return
+	}
+	if exists {
+		response.BadRequest(c, "Account number already exists")
+		return
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	var accountID *uuid.UUID
+	if input.AccountID != nil && *input.AccountID != "" {
+		accID, err := uuid.Parse(*input.AccountID)
+		if err == nil {
+			accountID = &accID
+		}
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO bank_accounts (id, tenant_id, name, bank_name, account_number, currency,
+		                           account_type, balance, is_active, account_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $10)
+	`, id, tenantID, input.Name, input.BankName, input.AccountNumber, input.Currency,
+		input.AccountType, input.Balance, accountID, now)
+
+	if err != nil {
+		h.log.Error("Failed to create bank account", "error", err)
+		response.InternalError(c, "Failed to create bank account")
+		return
+	}
+
+	acc := entity.BankAccount{
+		ID:            id,
+		TenantID:      uuid.MustParse(tenantID),
+		Name:          input.Name,
+		BankName:      input.BankName,
+		AccountNumber: input.AccountNumber,
+		Currency:      input.Currency,
+		AccountType:   input.AccountType,
+		Balance:       input.Balance,
+		IsActive:      true,
+		AccountID:     accountID,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	response.Created(c, acc)
+}
+
+// UpdateBankAccount updates an existing bank account
+func (h *Handler) UpdateBankAccount(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	var input entity.UpdateBankAccountInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Check if bank account exists
+	var exists bool
+	err := h.db.QueryRow(`
+		SELECT EXISTS(SELECT 1 FROM bank_accounts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)
+	`, id, tenantID).Scan(&exists)
+	if err != nil {
+		h.log.Error("Failed to check bank account existence", "error", err)
+		response.InternalError(c, "Failed to update bank account")
+		return
+	}
+	if !exists {
+		response.NotFound(c, "Bank account not found")
+		return
+	}
+
+	// Build update query
+	updates := []string{}
+	args := []interface{}{}
+	argIndex := 1
+
+	if input.Name != nil {
+		updates = append(updates, fmt.Sprintf("name = $%d", argIndex))
+		args = append(args, *input.Name)
+		argIndex++
+	}
+	if input.BankName != nil {
+		updates = append(updates, fmt.Sprintf("bank_name = $%d", argIndex))
+		args = append(args, *input.BankName)
+		argIndex++
+	}
+	if input.AccountNumber != nil {
+		// Check for duplicate account number
+		var duplicateExists bool
+		err := h.db.QueryRow(`
+			SELECT EXISTS(SELECT 1 FROM bank_accounts WHERE tenant_id = $1 AND account_number = $2 AND id != $3 AND deleted_at IS NULL)
+		`, tenantID, *input.AccountNumber, id).Scan(&duplicateExists)
+		if err != nil {
+			h.log.Error("Failed to check duplicate account number", "error", err)
+			response.InternalError(c, "Failed to update bank account")
+			return
+		}
+		if duplicateExists {
+			response.BadRequest(c, "Account number already exists")
+			return
+		}
+		updates = append(updates, fmt.Sprintf("account_number = $%d", argIndex))
+		args = append(args, *input.AccountNumber)
+		argIndex++
+	}
+	if input.Currency != nil {
+		updates = append(updates, fmt.Sprintf("currency = $%d", argIndex))
+		args = append(args, *input.Currency)
+		argIndex++
+	}
+	if input.AccountType != nil {
+		updates = append(updates, fmt.Sprintf("account_type = $%d", argIndex))
+		args = append(args, *input.AccountType)
+		argIndex++
+	}
+	if input.Balance != nil {
+		updates = append(updates, fmt.Sprintf("balance = $%d", argIndex))
+		args = append(args, *input.Balance)
+		argIndex++
+	}
+	if input.IsActive != nil {
+		updates = append(updates, fmt.Sprintf("is_active = $%d", argIndex))
+		args = append(args, *input.IsActive)
+		argIndex++
+	}
+	if input.AccountID != nil {
+		if *input.AccountID == "" {
+			updates = append(updates, fmt.Sprintf("account_id = $%d", argIndex))
+			args = append(args, nil)
+		} else {
+			accID, err := uuid.Parse(*input.AccountID)
+			if err == nil {
+				updates = append(updates, fmt.Sprintf("account_id = $%d", argIndex))
+				args = append(args, accID)
+			}
+		}
+		argIndex++
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argIndex))
+	args = append(args, time.Now())
+	argIndex++
+
+	args = append(args, id, tenantID)
+	query := fmt.Sprintf(`
+		UPDATE bank_accounts SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL
+	`, strings.Join(updates, ", "), argIndex, argIndex+1)
+
+	_, err = h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update bank account", "error", err)
+		response.InternalError(c, "Failed to update bank account")
+		return
+	}
+
+	// Return updated bank account
+	h.GetBankAccount(c)
+}
+
+// DeleteBankAccount soft deletes a bank account
+func (h *Handler) DeleteBankAccount(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		UPDATE bank_accounts SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+	`, time.Now(), id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete bank account", "error", err)
+		response.InternalError(c, "Failed to delete bank account")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Bank account not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Bank account deleted successfully"})
+}
+
+// =====================================================
+// BANK TRANSACTIONS
+// =====================================================
+
+// ListBankTransactions returns all transactions for a bank account
+func (h *Handler) ListBankTransactions(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	bankAccountID := c.Param("id")
+	if bankAccountID == "" {
+		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	var filter entity.BankTransactionListFilter
+	if err := c.ShouldBindQuery(&filter); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	query := `
+		SELECT id, tenant_id, bank_account_id, transaction_date, value_date,
+		       COALESCE(reference, '') as reference, COALESCE(description, '') as description,
+		       amount, balance_after, transaction_type, COALESCE(status, 'unmatched') as status,
+		       matched_journal_entry_id, created_at, updated_at
+		FROM bank_transactions
+		WHERE tenant_id = $1 AND bank_account_id = $2
+	`
+	args := []interface{}{tenantID, bankAccountID}
+	argIndex := 3
+
+	if filter.Search != "" {
+		query += fmt.Sprintf(" AND (reference ILIKE $%d OR description ILIKE $%d)", argIndex, argIndex)
+		args = append(args, "%"+filter.Search+"%")
+		argIndex++
+	}
+
+	if filter.Type != "" {
+		query += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
+		args = append(args, filter.Type)
+		argIndex++
+	}
+
+	if filter.Status != "" {
+		query += fmt.Sprintf(" AND status = $%d", argIndex)
+		args = append(args, filter.Status)
+		argIndex++
+	}
+
+	if filter.DateFrom != "" {
+		query += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
+		args = append(args, filter.DateFrom)
+		argIndex++
+	}
+
+	if filter.DateTo != "" {
+		query += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
+		args = append(args, filter.DateTo)
+		argIndex++
+	}
+
+	query += " ORDER BY transaction_date DESC, created_at DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list bank transactions", "error", err)
+		response.InternalError(c, "Failed to list bank transactions")
+		return
+	}
+	defer rows.Close()
+
+	var transactions []entity.BankTransaction
+	for rows.Next() {
+		var t entity.BankTransaction
+		var valueDate sql.NullTime
+		var balanceAfter sql.NullFloat64
+		var matchedJournalEntryID sql.NullString
+
+		err := rows.Scan(
+			&t.ID, &t.TenantID, &t.BankAccountID, &t.TransactionDate, &valueDate,
+			&t.Reference, &t.Description, &t.Amount, &balanceAfter, &t.TransactionType,
+			&t.Status, &matchedJournalEntryID, &t.CreatedAt, &t.UpdatedAt,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan bank transaction", "error", err)
+			continue
+		}
+
+		if valueDate.Valid {
+			t.ValueDate = &valueDate.Time
+		}
+		if balanceAfter.Valid {
+			t.BalanceAfter = &balanceAfter.Float64
+		}
+		if matchedJournalEntryID.Valid {
+			entryID, _ := uuid.Parse(matchedJournalEntryID.String)
+			t.MatchedJournalEntryID = &entryID
+		}
+		t.IsReconciled = t.Status == "reconciled"
+
+		transactions = append(transactions, t)
+	}
+
+	response.Success(c, transactions)
+}
+
+// CreateBankTransaction creates a new bank transaction
+func (h *Handler) CreateBankTransaction(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	bankAccountID := c.Param("id")
+	if bankAccountID == "" {
+		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	var input entity.CreateBankTransactionInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Parse transaction date
+	transactionDate, err := time.Parse("2006-01-02", input.TransactionDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid transaction date format")
+		return
+	}
+
+	// Verify bank account exists
+	var exists bool
+	err = h.db.QueryRow(`
+		SELECT EXISTS(SELECT 1 FROM bank_accounts WHERE id = $1 AND tenant_id = $2 AND (deleted_at IS NULL OR deleted_at IS NULL))
+	`, bankAccountID, tenantID).Scan(&exists)
+	if err != nil || !exists {
+		response.NotFound(c, "Bank account not found")
+		return
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	_, err = h.db.Exec(`
+		INSERT INTO bank_transactions (id, tenant_id, bank_account_id, transaction_date, reference,
+		                               description, amount, transaction_type, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'unmatched', $9, $9)
+	`, id, tenantID, bankAccountID, transactionDate, input.Reference, input.Description,
+		input.Amount, input.Type, now)
+
+	if err != nil {
+		h.log.Error("Failed to create bank transaction", "error", err)
+		response.InternalError(c, "Failed to create bank transaction")
+		return
+	}
+
+	// Update bank account balance
+	balanceChange := input.Amount
+	if input.Type == "debit" {
+		balanceChange = -balanceChange
+	}
+	_, err = h.db.Exec(`
+		UPDATE bank_accounts SET balance = COALESCE(balance, 0) + $1, updated_at = $2
+		WHERE id = $3 AND tenant_id = $4
+	`, balanceChange, now, bankAccountID, tenantID)
+	if err != nil {
+		h.log.Warn("Failed to update bank account balance", "error", err)
+	}
+
+	bankAccID, _ := uuid.Parse(bankAccountID)
+	t := entity.BankTransaction{
+		ID:              id,
+		TenantID:        uuid.MustParse(tenantID),
+		BankAccountID:   bankAccID,
+		TransactionDate: transactionDate,
+		Reference:       input.Reference,
+		Description:     input.Description,
+		Amount:          input.Amount,
+		TransactionType: input.Type,
+		Status:          "unmatched",
+		IsReconciled:    false,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	response.Created(c, t)
+}
+
+// ReconcileBankTransaction marks a transaction as reconciled
+func (h *Handler) ReconcileBankTransaction(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	bankAccountID := c.Param("id")
+	transactionID := c.Param("transactionId")
+	if bankAccountID == "" || transactionID == "" {
+		response.BadRequest(c, "Bank account ID and transaction ID are required")
+		return
+	}
+
+	now := time.Now()
+	result, err := h.db.Exec(`
+		UPDATE bank_transactions SET status = 'reconciled', updated_at = $1
+		WHERE id = $2 AND bank_account_id = $3 AND tenant_id = $4
+	`, now, transactionID, bankAccountID, tenantID)
+
+	if err != nil {
+		h.log.Error("Failed to reconcile bank transaction", "error", err)
+		response.InternalError(c, "Failed to reconcile bank transaction")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Bank transaction not found")
+		return
+	}
+
+	// Update last reconciled date on bank account
+	h.db.Exec(`
+		UPDATE bank_accounts SET last_reconciled = $1, updated_at = $1 WHERE id = $2 AND tenant_id = $3
+	`, now, bankAccountID, tenantID)
+
+	response.Success(c, gin.H{"message": "Transaction reconciled successfully"})
+}
+
+// =====================================================
+// CASH TRANSACTIONS (Kassa)
+// =====================================================
+
+// ListCashTransactions lists all cash transactions
+func (h *Handler) ListCashTransactions(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	var filter entity.CashTransactionListFilter
+	if err := c.ShouldBindQuery(&filter); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	query := `
+		SELECT id, tenant_id, transaction_date, transaction_type, amount,
+		       COALESCE(currency, 'UZS') as currency, COALESCE(description, '') as description,
+		       COALESCE(category, '') as category, COALESCE(reference, '') as reference,
+		       COALESCE(cashier, '') as cashier, COALESCE(status, 'posted') as status,
+		       created_at, updated_at
+		FROM cash_transactions
+		WHERE tenant_id = $1
+	`
+	args := []interface{}{tenantID}
+	argIndex := 2
+
+	if filter.Search != "" {
+		query += fmt.Sprintf(" AND (description ILIKE $%d OR reference ILIKE $%d OR cashier ILIKE $%d)", argIndex, argIndex, argIndex)
+		args = append(args, "%"+filter.Search+"%")
+		argIndex++
+	}
+
+	if filter.Type != "" {
+		query += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
+		args = append(args, filter.Type)
+		argIndex++
+	}
+
+	if filter.Category != "" {
+		query += fmt.Sprintf(" AND category = $%d", argIndex)
+		args = append(args, filter.Category)
+		argIndex++
+	}
+
+	if filter.DateFrom != "" {
+		query += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
+		args = append(args, filter.DateFrom)
+		argIndex++
+	}
+
+	if filter.DateTo != "" {
+		query += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
+		args = append(args, filter.DateTo)
+		argIndex++
+	}
+
+	query += " ORDER BY transaction_date DESC, created_at DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list cash transactions", "error", err)
+		response.InternalError(c, "Failed to list cash transactions")
+		return
+	}
+	defer rows.Close()
+
+	var transactions []entity.CashTransaction
+	for rows.Next() {
+		var t entity.CashTransaction
+		err := rows.Scan(
+			&t.ID, &t.TenantID, &t.TransactionDate, &t.Type, &t.Amount,
+			&t.Currency, &t.Description, &t.Category, &t.Reference,
+			&t.Cashier, &t.Status, &t.CreatedAt, &t.UpdatedAt,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan cash transaction", "error", err)
+			continue
+		}
+		transactions = append(transactions, t)
+	}
+
+	response.Success(c, transactions)
+}
+
+// GetCashTransaction gets a single cash transaction
+func (h *Handler) GetCashTransaction(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		response.BadRequest(c, "Cash transaction ID is required")
+		return
+	}
+
+	var t entity.CashTransaction
+	err := h.db.QueryRow(`
+		SELECT id, tenant_id, transaction_date, transaction_type, amount,
+		       COALESCE(currency, 'UZS') as currency, COALESCE(description, '') as description,
+		       COALESCE(category, '') as category, COALESCE(reference, '') as reference,
+		       COALESCE(cashier, '') as cashier, COALESCE(status, 'posted') as status,
+		       created_at, updated_at
+		FROM cash_transactions
+		WHERE id = $1 AND tenant_id = $2
+	`, id, tenantID).Scan(
+		&t.ID, &t.TenantID, &t.TransactionDate, &t.Type, &t.Amount,
+		&t.Currency, &t.Description, &t.Category, &t.Reference,
+		&t.Cashier, &t.Status, &t.CreatedAt, &t.UpdatedAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Cash transaction not found")
+			return
+		}
+		h.log.Error("Failed to get cash transaction", "error", err)
+		response.InternalError(c, "Failed to get cash transaction")
+		return
+	}
+
+	response.Success(c, t)
+}
+
+// CreateCashTransaction creates a new cash transaction
+func (h *Handler) CreateCashTransaction(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	var input entity.CreateCashTransactionInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Parse transaction date
+	transactionDate, err := time.Parse("2006-01-02", input.TransactionDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid transaction date format. Use YYYY-MM-DD")
+		return
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	// Generate transaction number
+	var count int
+	h.db.QueryRow(`SELECT COUNT(*) FROM cash_transactions WHERE tenant_id = $1`, tenantID).Scan(&count)
+	transactionNumber := fmt.Sprintf("CASH-%s-%04d", time.Now().Format("2006"), count+1)
+
+	// Default currency if not provided
+	currency := input.Currency
+	if currency == "" {
+		currency = "UZS"
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO cash_transactions (id, tenant_id, transaction_number, transaction_date, transaction_type,
+		                               amount, currency, description, category, reference, cashier, status, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'posted', $12, $12)
+	`, id, tenantID, transactionNumber, transactionDate, input.Type, input.Amount, currency,
+		input.Description, input.Category, input.Reference, input.Cashier, now)
+
+	if err != nil {
+		h.log.Error("Failed to create cash transaction", "error", err)
+		response.InternalError(c, "Failed to create cash transaction")
+		return
+	}
+
+	t := entity.CashTransaction{
+		ID:              id,
+		TenantID:        uuid.MustParse(tenantID),
+		TransactionDate: transactionDate,
+		Type:            input.Type,
+		Amount:          input.Amount,
+		Currency:        currency,
+		Description:     input.Description,
+		Category:        input.Category,
+		Reference:       input.Reference,
+		Cashier:         input.Cashier,
+		Status:          "posted",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	response.Created(c, t)
+}
+
+// UpdateCashTransaction updates an existing cash transaction
+func (h *Handler) UpdateCashTransaction(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		response.BadRequest(c, "Cash transaction ID is required")
+		return
+	}
+
+	var input entity.UpdateCashTransactionInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Build update query dynamically
+	updates := []string{}
+	args := []interface{}{}
+	argIndex := 1
+
+	if input.TransactionDate != nil {
+		transactionDate, err := time.Parse("2006-01-02", *input.TransactionDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid transaction date format")
+			return
+		}
+		updates = append(updates, fmt.Sprintf("transaction_date = $%d", argIndex))
+		args = append(args, transactionDate)
+		argIndex++
+	}
+	if input.Type != nil {
+		updates = append(updates, fmt.Sprintf("transaction_type = $%d", argIndex))
+		args = append(args, *input.Type)
+		argIndex++
+	}
+	if input.Amount != nil {
+		updates = append(updates, fmt.Sprintf("amount = $%d", argIndex))
+		args = append(args, *input.Amount)
+		argIndex++
+	}
+	if input.Currency != nil {
+		updates = append(updates, fmt.Sprintf("currency = $%d", argIndex))
+		args = append(args, *input.Currency)
+		argIndex++
+	}
+	if input.Description != nil {
+		updates = append(updates, fmt.Sprintf("description = $%d", argIndex))
+		args = append(args, *input.Description)
+		argIndex++
+	}
+	if input.Category != nil {
+		updates = append(updates, fmt.Sprintf("category = $%d", argIndex))
+		args = append(args, *input.Category)
+		argIndex++
+	}
+	if input.Reference != nil {
+		updates = append(updates, fmt.Sprintf("reference = $%d", argIndex))
+		args = append(args, *input.Reference)
+		argIndex++
+	}
+	if input.Cashier != nil {
+		updates = append(updates, fmt.Sprintf("cashier = $%d", argIndex))
+		args = append(args, *input.Cashier)
+		argIndex++
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	now := time.Now()
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argIndex))
+	args = append(args, now)
+	argIndex++
+
+	args = append(args, id, tenantID)
+	query := fmt.Sprintf(`UPDATE cash_transactions SET %s WHERE id = $%d AND tenant_id = $%d`,
+		strings.Join(updates, ", "), argIndex, argIndex+1)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update cash transaction", "error", err)
+		response.InternalError(c, "Failed to update cash transaction")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Cash transaction not found")
+		return
+	}
+
+	// Fetch updated transaction
+	var t entity.CashTransaction
+	h.db.QueryRow(`
+		SELECT id, tenant_id, transaction_date, transaction_type, amount,
+		       COALESCE(currency, 'UZS') as currency, COALESCE(description, '') as description,
+		       COALESCE(category, '') as category, COALESCE(reference, '') as reference,
+		       COALESCE(cashier, '') as cashier, COALESCE(status, 'posted') as status,
+		       created_at, updated_at
+		FROM cash_transactions
+		WHERE id = $1 AND tenant_id = $2
+	`, id, tenantID).Scan(
+		&t.ID, &t.TenantID, &t.TransactionDate, &t.Type, &t.Amount,
+		&t.Currency, &t.Description, &t.Category, &t.Reference,
+		&t.Cashier, &t.Status, &t.CreatedAt, &t.UpdatedAt,
+	)
+
+	response.Success(c, t)
+}
+
+// DeleteCashTransaction deletes a cash transaction
+func (h *Handler) DeleteCashTransaction(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		response.BadRequest(c, "Cash transaction ID is required")
+		return
+	}
+
+	result, err := h.db.Exec(`DELETE FROM cash_transactions WHERE id = $1 AND tenant_id = $2`, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete cash transaction", "error", err)
+		response.InternalError(c, "Failed to delete cash transaction")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Cash transaction not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Cash transaction deleted successfully"})
 }
