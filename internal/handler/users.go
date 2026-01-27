@@ -410,11 +410,13 @@ func (h *Handler) ListAllSystemUsers(c *gin.Context) {
 
 	pagination := entity.NewPagination(page, limit)
 
-	// Count total tenant owners (first user created per tenant, identified by is_system_admin=true)
+	// Count total tenant owners (users with 'owner' role or is_system_admin=true for backwards compatibility)
 	countQuery := `SELECT COUNT(DISTINCT u.id) FROM users u
 		INNER JOIN tenants t ON u.tenant_id = t.id
+		LEFT JOIN user_roles ur ON u.id = ur.user_id
+		LEFT JOIN roles r ON ur.role_id = r.id
 		WHERE u.deleted_at IS NULL
-		AND u.is_system_admin = true`
+		AND (u.is_system_admin = true OR r.code = 'owner')`
 	args := []interface{}{}
 	argIdx := 1
 
@@ -435,8 +437,9 @@ func (h *Handler) ListAllSystemUsers(c *gin.Context) {
 	pagination.Calculate(total)
 
 	// Query tenant owners with tenant info and user count
+	// Find users with 'owner' role or is_system_admin=true for backwards compatibility
 	query := `
-		SELECT u.id, u.email, u.first_name, u.last_name, u.phone, u.avatar_url,
+		SELECT DISTINCT u.id, u.email, u.first_name, u.last_name, u.phone, u.avatar_url,
 		       u.language, u.timezone, u.is_active, u.is_verified, u.last_login_at,
 		       u.created_at, u.updated_at,
 		       t.id as tenant_id, t.name as tenant_name, t.code as tenant_code,
@@ -445,8 +448,10 @@ func (h *Handler) ListAllSystemUsers(c *gin.Context) {
 		       (SELECT COUNT(*) FROM users u2 WHERE u2.tenant_id = t.id AND u2.deleted_at IS NULL) as user_count
 		FROM users u
 		INNER JOIN tenants t ON u.tenant_id = t.id
+		LEFT JOIN user_roles ur ON u.id = ur.user_id
+		LEFT JOIN roles r ON ur.role_id = r.id
 		WHERE u.deleted_at IS NULL
-		AND u.is_system_admin = true
+		AND (u.is_system_admin = true OR r.code = 'owner')
 	`
 
 	// Reset args for main query
