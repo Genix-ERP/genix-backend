@@ -55,6 +55,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 	auth := rg.Group("/auth")
 	{
 		auth.POST("/register", h.Register)
+		auth.POST("/register-with-otp", h.RegisterWithOTP) // Registration with OTP verification
+		auth.POST("/send-otp", h.SendOTP)                  // Send OTP to email
+		auth.POST("/verify-otp", h.VerifyOTP)              // Verify OTP code
 		auth.POST("/login", h.Login)
 		auth.POST("/refresh", h.RefreshToken)
 		auth.POST("/forgot-password", h.ForgotPassword)
