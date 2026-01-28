@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -91,21 +92,39 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	type LocationResponse struct {
+		ID          uuid.UUID                    `json:"id"`
+		WarehouseID uuid.UUID                    `json:"warehouse_id"`
+		ParentID    *uuid.UUID                   `json:"parent_id,omitempty"`
+		Code        string                       `json:"code"`
+		Name        string                       `json:"name"`
+		Type        entity.WarehouseLocationType `json:"type"`
+		Aisle       *string                      `json:"aisle,omitempty"`
+		Rack        *string                      `json:"rack,omitempty"`
+		Shelf       *string                      `json:"shelf,omitempty"`
+		Bin         *string                      `json:"bin,omitempty"`
+		Capacity    *float64                     `json:"capacity,omitempty"`
+		IsActive    bool                         `json:"is_active"`
+		CreatedAt   time.Time                    `json:"created_at"`
+		UpdatedAt   time.Time                    `json:"updated_at"`
+	}
+
 	type WarehouseResponse struct {
-		ID             uuid.UUID       `json:"id"`
-		TenantID       uuid.UUID       `json:"tenant_id"`
-		OrganizationID *uuid.UUID      `json:"organization_id,omitempty"`
-		Code           string          `json:"code"`
-		Name           string          `json:"name"`
-		Address        *entity.Address `json:"address,omitempty"`
-		ManagerID      *uuid.UUID      `json:"manager_id,omitempty"`
-		ManagerName    string          `json:"manager_name,omitempty"`
-		IsDefault      bool            `json:"is_default"`
-		IsActive       bool            `json:"is_active"`
-		ReceptionSteps int             `json:"reception_steps"`
-		DeliverySteps  int             `json:"delivery_steps"`
-		CreatedAt      time.Time       `json:"created_at"`
-		UpdatedAt      time.Time       `json:"updated_at"`
+		ID             uuid.UUID           `json:"id"`
+		TenantID       uuid.UUID           `json:"tenant_id"`
+		OrganizationID *uuid.UUID          `json:"organization_id,omitempty"`
+		Code           string              `json:"code"`
+		Name           string              `json:"name"`
+		Address        *entity.Address     `json:"address,omitempty"`
+		ManagerID      *uuid.UUID          `json:"manager_id,omitempty"`
+		ManagerName    string              `json:"manager_name,omitempty"`
+		IsDefault      bool                `json:"is_default"`
+		IsActive       bool                `json:"is_active"`
+		ReceptionSteps int                 `json:"reception_steps"`
+		DeliverySteps  int                 `json:"delivery_steps"`
+		Locations      []*LocationResponse `json:"locations"`
+		CreatedAt      time.Time           `json:"created_at"`
+		UpdatedAt      time.Time           `json:"updated_at"`
 	}
 
 	warehouses := make([]*WarehouseResponse, 0)
@@ -136,6 +155,7 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 			IsActive:       w.IsActive,
 			ReceptionSteps: int(receptionSteps.Int64),
 			DeliverySteps:  int(deliverySteps.Int64),
+			Locations:      make([]*LocationResponse, 0),
 			CreatedAt:      w.CreatedAt,
 			UpdatedAt:      w.UpdatedAt,
 		}
@@ -166,6 +186,75 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 		}
 
 		warehouses = append(warehouses, resp)
+	}
+
+	// Fetch locations for all warehouses
+	if len(warehouses) > 0 {
+		warehouseIDs := make([]uuid.UUID, len(warehouses))
+		warehouseMap := make(map[uuid.UUID]*WarehouseResponse)
+		for i, w := range warehouses {
+			warehouseIDs[i] = w.ID
+			warehouseMap[w.ID] = w
+		}
+
+		locQuery := `
+			SELECT id, warehouse_id, parent_id, code, name, type, aisle, rack, shelf, bin, capacity, is_active, created_at, updated_at
+			FROM warehouse_locations
+			WHERE warehouse_id = ANY($1) AND deleted_at IS NULL
+			ORDER BY code ASC
+		`
+		locRows, err := h.db.Query(locQuery, pq.Array(warehouseIDs))
+		if err != nil {
+			h.log.Error("Failed to fetch warehouse locations", "error", err)
+		} else {
+			defer locRows.Close()
+			for locRows.Next() {
+				var loc LocationResponse
+				var parentID sql.NullString
+				var aisle, rack, shelf, bin sql.NullString
+				var capacity sql.NullFloat64
+
+				err := locRows.Scan(
+					&loc.ID, &loc.WarehouseID, &parentID, &loc.Code, &loc.Name, &loc.Type,
+					&aisle, &rack, &shelf, &bin, &capacity, &loc.IsActive,
+					&loc.CreatedAt, &loc.UpdatedAt,
+				)
+				if err != nil {
+					continue
+				}
+
+				if parentID.Valid {
+					pid, _ := uuid.Parse(parentID.String)
+					loc.ParentID = &pid
+				}
+				if aisle.Valid {
+					loc.Aisle = &aisle.String
+				}
+				if rack.Valid {
+					loc.Rack = &rack.String
+				}
+				if shelf.Valid {
+					loc.Shelf = &shelf.String
+				}
+				if bin.Valid {
+					loc.Bin = &bin.String
+				}
+				if capacity.Valid {
+					loc.Capacity = &capacity.Float64
+				}
+
+				if wh, ok := warehouseMap[loc.WarehouseID]; ok {
+					wh.Locations = append(wh.Locations, &loc)
+				}
+			}
+		}
+
+		// Log total locations found
+		totalLocs := 0
+		for _, w := range warehouses {
+			totalLocs += len(w.Locations)
+		}
+		h.log.Info("Warehouses with locations", "warehouse_count", len(warehouses), "total_locations", totalLocs)
 	}
 
 	pagination := entity.NewPagination(page, limit)
@@ -1446,7 +1535,11 @@ func (h *Handler) CreateOperationType(c *gin.Context) {
 	}
 
 	// Set defaults
-	opType := "custom"
+	operationType := "internal" // operation_type column: incoming, outgoing, internal
+	if input.OperationType != "" {
+		operationType = input.OperationType
+	}
+	opType := "custom" // type column: custom type name
 	if input.Type != "" {
 		opType = input.Type
 	}
@@ -1495,16 +1588,16 @@ func (h *Handler) CreateOperationType(c *gin.Context) {
 
 	query := `
 		INSERT INTO warehouse_operation_types (
-			id, tenant_id, warehouse_id, code, name, type, sequence,
+			id, tenant_id, warehouse_id, code, name, operation_type, type, sequence,
 			default_location_src_id, default_location_dest_id,
 			show_operations, barcode_enabled, create_backorder,
 			reservation_method, color, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING id
 	`
 
 	err = h.db.QueryRow(query,
-		id, tenantID, warehouseID, input.Code, input.Name, opType, sequence,
+		id, tenantID, warehouseID, input.Code, input.Name, operationType, opType, sequence,
 		srcLocationID, destLocationID,
 		showOperations, barcodeEnabled, createBackorder,
 		reservationMethod, color, true, now, now,
@@ -1712,30 +1805,32 @@ func (h *Handler) createDefaultOperationTypes(tenantID, warehouseID uuid.UUID, w
 	now := time.Now()
 
 	// Default operation types like Odoo
+	// operation_type must be one of: 'incoming', 'outgoing', 'internal'
 	defaults := []struct {
-		code     string
-		name     string
-		opType   string
-		sequence int
-		color    string
+		code          string
+		name          string
+		operationType string // incoming, outgoing, internal (for the operation_type column)
+		opType        string // custom type name (for the type column)
+		sequence      int
+		color         string
 	}{
-		{warehouseCode + "/IN", "Receipts", "receipt", 1, "#22c55e"},
-		{warehouseCode + "/INT", "Internal Transfers", "internal", 2, "#3b82f6"},
-		{warehouseCode + "/OUT", "Delivery Orders", "delivery", 3, "#f97316"},
-		{warehouseCode + "/POS", "PoS Orders", "pos", 4, "#a855f7"},
+		{warehouseCode + "/IN", "Receipts", "incoming", "receipt", 1, "#22c55e"},
+		{warehouseCode + "/INT", "Internal Transfers", "internal", "internal", 2, "#3b82f6"},
+		{warehouseCode + "/OUT", "Delivery Orders", "outgoing", "delivery", 3, "#f97316"},
+		{warehouseCode + "/POS", "PoS Orders", "outgoing", "pos", 4, "#a855f7"},
 	}
 
 	for _, d := range defaults {
 		id := uuid.New()
 		_, err := h.db.Exec(`
 			INSERT INTO warehouse_operation_types (
-				id, tenant_id, warehouse_id, code, name, type, sequence, color,
+				id, tenant_id, warehouse_id, code, name, operation_type, type, sequence, color,
 				show_operations, show_reserved, barcode_enabled, create_backorder,
 				reservation_method, is_active, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-			ON CONFLICT (tenant_id, warehouse_id, code) DO NOTHING
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			ON CONFLICT (warehouse_id, code) DO NOTHING
 		`,
-			id, tenantID, warehouseID, d.code, d.name, d.opType, d.sequence, d.color,
+			id, tenantID, warehouseID, d.code, d.name, d.operationType, d.opType, d.sequence, d.color,
 			true, true, true, true,
 			"at_confirm", true, now, now,
 		)

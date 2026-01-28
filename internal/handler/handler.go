@@ -119,6 +119,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		orgs.GET("/:id", h.GetOrganization)
 		orgs.PUT("/:id", middleware.RequirePermission("organization", "organization", "update"), h.UpdateOrganization)
 		orgs.DELETE("/:id", middleware.RequirePermission("organization", "organization", "delete"), h.DeleteOrganization)
+		// Initialize default accounts for organization
+		orgs.POST("/:id/initialize-accounts", middleware.RequirePermission("organization", "organization", "update"), h.InitializeOrganizationAccounts)
 		// Organization employees
 		orgs.GET("/:id/employees", h.ListOrganizationEmployees)
 	}
@@ -371,6 +373,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseOrders.POST("/:id/receive", h.ReceivePurchaseOrder)
 	}
 
+	// Purchase Invoices (Vendor Bills)
+	purchaseInvoices := rg.Group("/purchase-invoices")
+	purchaseInvoices.Use(middleware.RequirePermission("purchase", "invoice", "read"))
+	{
+		purchaseInvoices.GET("", h.ListPurchaseInvoices)
+		purchaseInvoices.POST("", middleware.RequirePermission("purchase", "invoice", "create"), h.CreatePurchaseInvoice)
+		purchaseInvoices.GET("/:id", h.GetPurchaseInvoice)
+		purchaseInvoices.PUT("/:id", middleware.RequirePermission("purchase", "invoice", "update"), h.UpdatePurchaseInvoice)
+		purchaseInvoices.DELETE("/:id", middleware.RequirePermission("purchase", "invoice", "delete"), h.DeletePurchaseInvoice)
+		purchaseInvoices.POST("/:id/confirm", middleware.RequirePermission("purchase", "invoice", "approve"), h.ConfirmPurchaseInvoice)
+		purchaseInvoices.POST("/:id/pay", h.PayPurchaseInvoice)
+	}
+
 	// Request for Quotations (RFQ)
 	rfqs := rg.Group("/rfqs")
 	rfqs.Use(middleware.RequirePermission("purchase", "rfq", "read"))
@@ -443,6 +458,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseReturns.POST("/:id/cancel", middleware.RequirePermission("purchase", "return", "update"), h.CancelPurchaseReturn)
 	}
 
+	// Account Types (reference data)
+	rg.GET("/account-types", h.ListAccountTypes)
+
 	// Chart of Accounts
 	accounts := rg.Group("/accounts")
 	accounts.Use(middleware.RequirePermission("finance", "account", "read"))
@@ -454,6 +472,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		accounts.DELETE("/:id", middleware.RequirePermission("finance", "account", "delete"), h.DeleteAccount)
 		accounts.GET("/:id/transactions", h.GetAccountTransactions)
 	}
+
+	// Journals (accounting journals like GEN, SAL, PUR)
+	rg.GET("/journals", middleware.RequirePermission("finance", "journal", "read"), h.ListJournals)
 
 	// Journal Entries
 	journals := rg.Group("/journal-entries")
@@ -490,7 +511,44 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	currencies := rg.Group("/currencies")
 	{
 		currencies.GET("", h.ListCurrencies)
+		currencies.POST("", h.CreateCurrency)
+		currencies.GET("/:code", h.GetCurrency)
+		currencies.PUT("/:code", h.UpdateCurrency)
+		currencies.DELETE("/:code", h.DeleteCurrency)
 		currencies.GET("/:code/rate", h.GetExchangeRate)
+		currencies.POST("/:code/rate", h.SetExchangeRate)
+	}
+
+	// Exchange Rates
+	exchangeRates := rg.Group("/exchange-rates")
+	{
+		exchangeRates.GET("", h.ListExchangeRates)
+	}
+
+	// Bank Accounts
+	bankAccounts := rg.Group("/bank-accounts")
+	bankAccounts.Use(middleware.RequirePermission("finance", "bank_account", "read"))
+	{
+		bankAccounts.GET("", h.ListBankAccounts)
+		bankAccounts.POST("", middleware.RequirePermission("finance", "bank_account", "create"), h.CreateBankAccount)
+		bankAccounts.GET("/:id", h.GetBankAccount)
+		bankAccounts.PUT("/:id", middleware.RequirePermission("finance", "bank_account", "update"), h.UpdateBankAccount)
+		bankAccounts.DELETE("/:id", middleware.RequirePermission("finance", "bank_account", "delete"), h.DeleteBankAccount)
+		// Bank Transactions (nested under bank accounts)
+		bankAccounts.GET("/:id/transactions", h.ListBankTransactions)
+		bankAccounts.POST("/:id/transactions", middleware.RequirePermission("finance", "bank_account", "update"), h.CreateBankTransaction)
+		bankAccounts.POST("/:id/transactions/:transactionId/reconcile", middleware.RequirePermission("finance", "bank_account", "update"), h.ReconcileBankTransaction)
+	}
+
+	// Cash Transactions (Kassa)
+	cashTransactions := rg.Group("/cash-transactions")
+	cashTransactions.Use(middleware.RequirePermission("finance", "cash_transaction", "read"))
+	{
+		cashTransactions.GET("", h.ListCashTransactions)
+		cashTransactions.POST("", middleware.RequirePermission("finance", "cash_transaction", "create"), h.CreateCashTransaction)
+		cashTransactions.GET("/:id", h.GetCashTransaction)
+		cashTransactions.PUT("/:id", middleware.RequirePermission("finance", "cash_transaction", "update"), h.UpdateCashTransaction)
+		cashTransactions.DELETE("/:id", middleware.RequirePermission("finance", "cash_transaction", "delete"), h.DeleteCashTransaction)
 	}
 
 	// HR - Employees
@@ -593,6 +651,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		ai.GET("/prompts/:id", h.GetAIPrompt)
 		ai.PUT("/prompts/:id", h.UpdateAIPrompt)
 		ai.DELETE("/prompts/:id", h.DeleteAIPrompt)
+
+		// Invoice Extraction
+		ai.POST("/extract-invoice", h.ExtractInvoice)
+
+		// Usage Stats
+		ai.GET("/usage", h.GetAIUsageStats)
 	}
 
 	// Reports
