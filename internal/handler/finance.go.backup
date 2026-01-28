@@ -4491,13 +4491,13 @@ func (h *Handler) GetBudget(c *gin.Context) {
 	var approvedAt sql.NullTime
 
 	err := h.db.QueryRow(`
-		SELECT id, tenant_id, organization_id, fiscal_year_id, code, name, description,
+		SELECT id, tenant_id, organization_id, fiscal_year_id, name, description,
 		       budget_type, total_amount, status, approved_by, approved_at,
 		       created_by, created_at, updated_at
 		FROM budgets
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, id, tenantID).Scan(
-		&b.ID, &b.TenantID, &orgID, &b.FiscalYearID, &b.Code, &b.Name, &desc,
+		&b.ID, &b.TenantID, &orgID, &b.FiscalYearID, &b.Name, &desc,
 		&b.BudgetType, &b.TotalAmount, &b.Status, &approvedBy, &approvedAt,
 		&createdBy, &b.CreatedAt, &b.UpdatedAt,
 	)
@@ -4616,10 +4616,10 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 	}
 
 	_, err = h.db.Exec(`
-		INSERT INTO budgets (id, tenant_id, organization_id, fiscal_year_id, code, name, description,
+		INSERT INTO budgets (id, tenant_id, organization_id, fiscal_year_id, name, description,
 		                    budget_type, total_amount, status, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-	`, id, tenantID, orgID, fiscalYearID, input.Code, input.Name, input.Description,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	`, id, tenantID, orgID, fiscalYearID, input.Name, input.Description,
 		budgetType, input.TotalAmount, status, userID, now, now)
 
 	if err != nil {
@@ -4662,12 +4662,12 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 	var orgIDStr, desc sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT id, tenant_id, organization_id, fiscal_year_id, code, name, description,
+		SELECT id, tenant_id, organization_id, fiscal_year_id, name, description,
 		       budget_type, total_amount, status, created_by, created_at, updated_at
 		FROM budgets
 		WHERE id = $1
 	`, id).Scan(
-		&b.ID, &b.TenantID, &orgIDStr, &b.FiscalYearID, &b.Code, &b.Name, &desc,
+		&b.ID, &b.TenantID, &orgIDStr, &b.FiscalYearID, &b.Name, &desc,
 		&b.BudgetType, &b.TotalAmount, &b.Status, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt,
 	)
 
@@ -4706,9 +4706,9 @@ func (h *Handler) UpdateBudget(c *gin.Context) {
 
 	result, err := h.db.Exec(`
 		UPDATE budgets
-		SET code = $1, name = $2, description = $3, budget_type = $4, total_amount = $5, updated_at = $6
-		WHERE id = $7 AND tenant_id = $8 AND deleted_at IS NULL
-	`, input.Code, input.Name, input.Description, input.BudgetType, input.TotalAmount, now, id, tenantID)
+		SET name = $1, description = $2, budget_type = $3, total_amount = $4, updated_at = $5
+		WHERE id = $6 AND tenant_id = $7 AND deleted_at IS NULL
+	`, input.Name, input.Description, input.BudgetType, input.TotalAmount, now, id, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to update budget", "error", err)
@@ -4727,12 +4727,12 @@ func (h *Handler) UpdateBudget(c *gin.Context) {
 	var orgIDStr, desc sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT id, tenant_id, organization_id, fiscal_year_id, code, name, description,
+		SELECT id, tenant_id, organization_id, fiscal_year_id, name, description,
 		       budget_type, total_amount, status, created_at, updated_at
 		FROM budgets
 		WHERE id = $1 AND tenant_id = $2
 	`, id, tenantID).Scan(
-		&b.ID, &b.TenantID, &orgIDStr, &b.FiscalYearID, &b.Code, &b.Name, &desc,
+		&b.ID, &b.TenantID, &orgIDStr, &b.FiscalYearID, &b.Name, &desc,
 		&b.BudgetType, &b.TotalAmount, &b.Status, &b.CreatedAt, &b.UpdatedAt,
 	)
 

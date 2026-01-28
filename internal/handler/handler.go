@@ -551,6 +551,47 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		cashTransactions.DELETE("/:id", middleware.RequirePermission("finance", "cash_transaction", "delete"), h.DeleteCashTransaction)
 	}
 
+	// Fiscal Years
+	fiscalYears := rg.Group("/fiscal-years")
+	{
+		fiscalYears.GET("", h.ListFiscalYears)
+		fiscalYears.POST("", h.CreateFiscalYear)
+		fiscalYears.GET("/:id", h.GetFiscalYear)
+		fiscalYears.PUT("/:id", h.UpdateFiscalYear)
+		fiscalYears.POST("/:id/close", h.CloseFiscalYear)
+		fiscalYears.DELETE("/:id", h.DeleteFiscalYear)
+	}
+
+	// Fiscal Periods
+	fiscalPeriods := rg.Group("/fiscal-periods")
+	{
+		fiscalPeriods.GET("", h.ListFiscalPeriods)
+		fiscalPeriods.POST("", h.CreateFiscalPeriod)
+		fiscalPeriods.POST("/batch", h.BatchCreateFiscalPeriods)
+		fiscalPeriods.POST("/:id/close", h.CloseFiscalPeriod)
+		fiscalPeriods.POST("/:id/reopen", h.ReopenFiscalPeriod)
+	}
+
+	// Budgets
+	budgets := rg.Group("/budgets")
+	{
+		budgets.GET("", h.ListBudgets)
+		budgets.POST("", h.CreateBudget)
+		budgets.GET("/:id", h.GetBudget)
+		budgets.PUT("/:id", h.UpdateBudget)
+		budgets.DELETE("/:id", h.DeleteBudget)
+		budgets.POST("/:id/activate", h.ActivateBudget)
+	}
+
+	// Budget Lines
+	budgetLines := rg.Group("/budget-lines")
+	{
+		budgetLines.GET("", h.ListBudgetLines)
+		budgetLines.POST("", h.CreateBudgetLine)
+		budgetLines.PUT("/:id", h.UpdateBudgetLine)
+		budgetLines.DELETE("/:id", h.DeleteBudgetLine)
+	}
+
 	// HR - Employees
 	employees := rg.Group("/employees")
 	employees.Use(middleware.RequirePermission("hr", "employee", "read"))
