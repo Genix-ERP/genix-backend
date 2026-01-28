@@ -96,6 +96,10 @@ func main() {
 	router.GET("/health", handler.HealthCheck(db, redisClient))
 	router.GET("/ready", handler.ReadinessCheck(db, redisClient))
 
+	// Serve favicon
+	router.StaticFile("/favicon.ico", "./static/favicon.png")
+	router.StaticFile("/favicon.png", "./static/favicon.png")
+
 	// Initialize and register all handlers
 	h := handler.NewHandler(db, redisClient, cfg, log)
 	h.RegisterRoutes(router)

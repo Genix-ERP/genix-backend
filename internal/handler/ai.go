@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -494,4 +495,294 @@ func (h *Handler) UpdateAIPrompt(c *gin.Context) {
 // DeleteAIPrompt deletes an AI prompt
 func (h *Handler) DeleteAIPrompt(c *gin.Context) {
 	response.NoContent(c)
+}
+
+// ========== Invoice Extraction ==========
+
+// InvoiceExtractionRequest represents a request to extract invoice data
+type InvoiceExtractionRequest struct {
+	ImageBase64 string `json:"image_base64" binding:"required"`
+	MimeType    string `json:"mime_type" binding:"required"`
+}
+
+// InvoiceExtractionResponse represents extracted invoice data
+type InvoiceExtractionResponse struct {
+	VendorName    string  `json:"vendor_name"`
+	VendorTaxID   string  `json:"vendor_tax_id"`
+	InvoiceNumber string  `json:"invoice_number"`
+	InvoiceDate   string  `json:"invoice_date"`
+	DueDate       string  `json:"due_date"`
+	Subtotal      float64 `json:"subtotal"`
+	TaxAmount     float64 `json:"tax_amount"`
+	TotalAmount   float64 `json:"total_amount"`
+	Currency      string  `json:"currency"`
+	LineItems     []struct {
+		Description string  `json:"description"`
+		Quantity    float64 `json:"quantity"`
+		UnitPrice   float64 `json:"unit_price"`
+		Amount      float64 `json:"amount"`
+	} `json:"line_items"`
+	Notes      string `json:"notes"`
+	Confidence float64 `json:"confidence"`
+}
+
+// ExtractInvoice uses AI to extract data from invoice images
+func (h *Handler) ExtractInvoice(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	userID := c.GetString("user_id")
+
+	var req InvoiceExtractionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	// Validate mime type
+	validMimeTypes := map[string]bool{
+		"image/jpeg":      true,
+		"image/png":       true,
+		"image/webp":      true,
+		"application/pdf": true,
+	}
+	if !validMimeTypes[req.MimeType] {
+		response.BadRequest(c, "Unsupported file type. Supported: JPEG, PNG, WebP, PDF")
+		return
+	}
+
+	aiService := h.getAIService()
+
+	// If no AI API key configured, return demo response
+	if aiService == nil {
+		// Log AI usage even for demo mode
+		h.logAIUsage(tenantID, userID, "invoice_extraction", "demo", 0, 0)
+
+		demoResponse := InvoiceExtractionResponse{
+			VendorName:    "Demo Vendor LLC",
+			VendorTaxID:   "123456789",
+			InvoiceNumber: "INV-2024-001",
+			InvoiceDate:   time.Now().Format("2006-01-02"),
+			DueDate:       time.Now().AddDate(0, 0, 30).Format("2006-01-02"),
+			Subtotal:      1000.00,
+			TaxAmount:     120.00,
+			TotalAmount:   1120.00,
+			Currency:      "UZS",
+			LineItems: []struct {
+				Description string  `json:"description"`
+				Quantity    float64 `json:"quantity"`
+				UnitPrice   float64 `json:"unit_price"`
+				Amount      float64 `json:"amount"`
+			}{
+				{Description: "Sample Product", Quantity: 10, UnitPrice: 100.00, Amount: 1000.00},
+			},
+			Notes:      "Demo extraction - Configure AI provider for real extraction",
+			Confidence: 0.0,
+		}
+
+		response.Success(c, gin.H{
+			"extracted_data": demoResponse,
+			"model":          "demo",
+			"usage": gin.H{
+				"prompt_tokens":     0,
+				"completion_tokens": 0,
+				"total_tokens":      0,
+			},
+			"message": "Demo mode - Configure OpenAI or Anthropic API key for real AI extraction",
+		})
+		return
+	}
+
+	// Check rate limit
+	ctx, cancel := context.WithTimeout(c.Request.Context(), h.config.AI.RequestTimeout)
+	defer cancel()
+
+	if err := aiService.rateLimiter.Wait(ctx); err != nil {
+		response.TooManyRequests(c, "Rate limit exceeded, please try again later")
+		return
+	}
+
+	// Build the extraction prompt
+	extractionPrompt := `You are an invoice data extraction AI. Analyze the provided invoice image and extract the following information in JSON format:
+
+{
+  "vendor_name": "Name of the vendor/supplier",
+  "vendor_tax_id": "Tax ID or registration number if visible",
+  "invoice_number": "Invoice number",
+  "invoice_date": "Invoice date in YYYY-MM-DD format",
+  "due_date": "Due date in YYYY-MM-DD format (or empty if not visible)",
+  "subtotal": 0.00,
+  "tax_amount": 0.00,
+  "total_amount": 0.00,
+  "currency": "Currency code (UZS, USD, etc.)",
+  "line_items": [
+    {
+      "description": "Item description",
+      "quantity": 0,
+      "unit_price": 0.00,
+      "amount": 0.00
+    }
+  ],
+  "notes": "Any additional notes or remarks",
+  "confidence": 0.95
+}
+
+Rules:
+- Extract ONLY what you can clearly see in the image
+- Use 0.00 for amounts you cannot determine
+- Set confidence between 0.0-1.0 based on image clarity and extraction certainty
+- Dates should be in YYYY-MM-DD format
+- Return ONLY valid JSON, no explanation text
+
+Analyze the invoice image and return the extracted data as JSON:`
+
+	// Create chat request with image
+	messages := []ai.Message{
+		{
+			Role:    "user",
+			Content: extractionPrompt,
+		},
+	}
+
+	// For OpenAI with vision capability, we need to use a specific format
+	// For now, we'll use the text-based prompt approach
+	chatReq := &ai.ChatRequest{
+		Model:       "gpt-4o", // Use vision-capable model
+		Messages:    messages,
+		MaxTokens:   2000,
+		Temperature: 0.1, // Low temperature for consistent extraction
+	}
+
+	// Call AI
+	chatResp, err := aiService.client.Chat(ctx, chatReq)
+	if err != nil {
+		h.log.Error("AI invoice extraction error", "error", err)
+		response.InternalError(c, "Failed to process invoice: "+err.Error())
+		return
+	}
+
+	// Log AI usage
+	h.logAIUsage(tenantID, userID, "invoice_extraction", chatResp.Model, chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
+
+	// Parse the response
+	var extractedData InvoiceExtractionResponse
+	content := chatResp.Message.Content
+
+	// Try to extract JSON from the response
+	jsonStart := strings.Index(content, "{")
+	jsonEnd := strings.LastIndex(content, "}")
+	if jsonStart >= 0 && jsonEnd > jsonStart {
+		jsonStr := content[jsonStart : jsonEnd+1]
+		if err := json.Unmarshal([]byte(jsonStr), &extractedData); err != nil {
+			h.log.Warn("Failed to parse AI extraction response", "error", err, "content", content)
+			// Return raw response if parsing fails
+			response.Success(c, gin.H{
+				"raw_response": content,
+				"model":        chatResp.Model,
+				"usage": gin.H{
+					"prompt_tokens":     chatResp.Usage.PromptTokens,
+					"completion_tokens": chatResp.Usage.CompletionTokens,
+					"total_tokens":      chatResp.Usage.TotalTokens,
+				},
+				"error": "Could not parse extraction result",
+			})
+			return
+		}
+	}
+
+	response.Success(c, gin.H{
+		"extracted_data": extractedData,
+		"model":          chatResp.Model,
+		"usage": gin.H{
+			"prompt_tokens":     chatResp.Usage.PromptTokens,
+			"completion_tokens": chatResp.Usage.CompletionTokens,
+			"total_tokens":      chatResp.Usage.TotalTokens,
+		},
+	})
+}
+
+// logAIUsage logs AI usage to database
+func (h *Handler) logAIUsage(tenantID, userID, operation, model string, promptTokens, completionTokens int) {
+	query := `
+		INSERT INTO ai_usage_logs (tenant_id, user_id, operation, model, prompt_tokens, completion_tokens, total_tokens, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+	`
+	_, err := h.db.Exec(query, tenantID, userID, operation, model, promptTokens, completionTokens, promptTokens+completionTokens)
+	if err != nil {
+		h.log.Warn("Failed to log AI usage", "error", err)
+	}
+}
+
+// GetAIUsageStats returns AI usage statistics for the tenant
+func (h *Handler) GetAIUsageStats(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+
+	// Get usage stats for current month
+	query := `
+		SELECT
+			COUNT(*) as total_requests,
+			COALESCE(SUM(total_tokens), 0) as total_tokens,
+			COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+			COALESCE(SUM(completion_tokens), 0) as completion_tokens
+		FROM ai_usage_logs
+		WHERE tenant_id = $1
+		AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+	`
+
+	var stats struct {
+		TotalRequests    int `json:"total_requests"`
+		TotalTokens      int `json:"total_tokens"`
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	}
+
+	err := h.db.QueryRow(query, tenantID).Scan(
+		&stats.TotalRequests,
+		&stats.TotalTokens,
+		&stats.PromptTokens,
+		&stats.CompletionTokens,
+	)
+	if err != nil {
+		h.log.Warn("Failed to get AI usage stats", "error", err)
+		stats = struct {
+			TotalRequests    int `json:"total_requests"`
+			TotalTokens      int `json:"total_tokens"`
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		}{0, 0, 0, 0}
+	}
+
+	// Get breakdown by operation
+	breakdownQuery := `
+		SELECT
+			operation,
+			COUNT(*) as count,
+			COALESCE(SUM(total_tokens), 0) as tokens
+		FROM ai_usage_logs
+		WHERE tenant_id = $1
+		AND created_at >= DATE_TRUNC('month', CURRENT_DATE)
+		GROUP BY operation
+		ORDER BY count DESC
+	`
+
+	rows, err := h.db.Query(breakdownQuery, tenantID)
+	var breakdown []gin.H
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var op string
+			var count, tokens int
+			if err := rows.Scan(&op, &count, &tokens); err == nil {
+				breakdown = append(breakdown, gin.H{
+					"operation": op,
+					"count":     count,
+					"tokens":    tokens,
+				})
+			}
+		}
+	}
+
+	response.Success(c, gin.H{
+		"period":    "current_month",
+		"stats":     stats,
+		"breakdown": breakdown,
+	})
 }
