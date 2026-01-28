@@ -31,12 +31,18 @@ type Email struct {
 
 // Send sends an email
 func (s *Service) Send(email *Email) error {
+	fmt.Printf("[EMAIL] Attempting to send email - Host: %s, Port: %d, To: %s\n",
+		s.config.SMTPHost, s.config.SMTPPort, strings.Join(email.To, ", "))
+
 	if s.config.SMTPHost == "" || s.config.SMTPHost == "localhost" {
 		// In development, just log the email
+		fmt.Printf("[EMAIL] Development mode - logging only\n")
 		fmt.Printf("[EMAIL] To: %s, Subject: %s\n", strings.Join(email.To, ", "), email.Subject)
 		fmt.Printf("[EMAIL] Body: %s\n", email.Body)
 		return nil
 	}
+
+	fmt.Printf("[EMAIL] Production mode - sending via SMTP\n")
 
 	from := s.config.FromEmail
 	if s.config.FromName != "" {
@@ -69,10 +75,24 @@ func (s *Service) Send(email *Email) error {
 
 	// Use TLS for port 465, STARTTLS for 587
 	if s.config.SMTPPort == 465 {
-		return s.sendWithTLS(addr, auth, s.config.FromEmail, email.To, msg.Bytes())
+		fmt.Printf("[EMAIL] Using TLS (port 465)\n")
+		err := s.sendWithTLS(addr, auth, s.config.FromEmail, email.To, msg.Bytes())
+		if err != nil {
+			fmt.Printf("[EMAIL] Failed to send via TLS: %v\n", err)
+		} else {
+			fmt.Printf("[EMAIL] Successfully sent via TLS\n")
+		}
+		return err
 	}
 
-	return smtp.SendMail(addr, auth, s.config.FromEmail, email.To, msg.Bytes())
+	fmt.Printf("[EMAIL] Using STARTTLS (port 587)\n")
+	err := smtp.SendMail(addr, auth, s.config.FromEmail, email.To, msg.Bytes())
+	if err != nil {
+		fmt.Printf("[EMAIL] Failed to send via STARTTLS: %v\n", err)
+	} else {
+		fmt.Printf("[EMAIL] Successfully sent via STARTTLS\n")
+	}
+	return err
 }
 
 // sendWithTLS sends email using implicit TLS (port 465)
