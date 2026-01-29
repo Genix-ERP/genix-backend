@@ -806,3 +806,80 @@ type CashFlowItem struct {
 	Description string  `json:"description"`
 	Amount      float64 `json:"amount"`
 }
+
+// =====================================================
+// FISCAL YEARS & PERIODS
+// =====================================================
+
+// FiscalYear represents a fiscal year
+type FiscalYear struct {
+	ID             uuid.UUID    `json:"id" db:"id"`
+	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
+	Code           string       `json:"code" db:"code"`
+	Name           string       `json:"name" db:"name"`
+	StartDate      time.Time    `json:"start_date" db:"start_date"`
+	EndDate        time.Time    `json:"end_date" db:"end_date"`
+	Status         string       `json:"status" db:"status"` // open, closed, locked
+	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
+
+	// Relationships (loaded separately)
+	Periods []FiscalPeriod `json:"periods,omitempty"`
+}
+
+// FiscalPeriod represents a fiscal period within a fiscal year
+type FiscalPeriod struct {
+	ID            uuid.UUID `json:"id" db:"id"`
+	FiscalYearID  uuid.UUID `json:"fiscal_year_id" db:"fiscal_year_id"`
+	Code          string    `json:"code" db:"code"`
+	Name          string    `json:"name" db:"name"`
+	PeriodNumber  int       `json:"period_number" db:"period_number"`
+	StartDate     time.Time `json:"start_date" db:"start_date"`
+	EndDate       time.Time `json:"end_date" db:"end_date"`
+	Status        string    `json:"status" db:"status"` // open, closed, locked
+	CreatedAt     time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// ==============================================
+// BUDGETS
+// ==============================================
+
+// Budget represents a financial budget
+type Budget struct {
+	ID             uuid.UUID    `json:"id" db:"id"`
+	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
+	FiscalYearID   uuid.UUID    `json:"fiscal_year_id" db:"fiscal_year_id"`
+	Code           string       `json:"code" db:"code"`
+	Name           string       `json:"name" db:"name"`
+	Description    *string      `json:"description,omitempty" db:"description"`
+	BudgetType     string       `json:"budget_type" db:"budget_type"` // expense, revenue, combined
+	TotalAmount    float64      `json:"total_amount" db:"total_amount"`
+	Status         string       `json:"status" db:"status"` // draft, active, closed
+	ApprovedBy     *uuid.UUID   `json:"approved_by,omitempty" db:"approved_by"`
+	ApprovedAt     *time.Time   `json:"approved_at,omitempty" db:"approved_at"`
+	CreatedBy      *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
+
+	// Relationships
+	Lines []BudgetLine `json:"lines,omitempty"`
+}
+
+// BudgetLine represents a line item in a budget
+type BudgetLine struct {
+	ID              uuid.UUID  `json:"id" db:"id"`
+	BudgetID        uuid.UUID  `json:"budget_id" db:"budget_id"`
+	AccountID       uuid.UUID  `json:"account_id" db:"account_id"`
+	FiscalPeriodID  *uuid.UUID `json:"fiscal_period_id,omitempty" db:"fiscal_period_id"`
+	DepartmentID    *uuid.UUID `json:"department_id,omitempty" db:"department_id"`
+	BudgetedAmount  float64    `json:"budgeted_amount" db:"budgeted_amount"`
+	ActualAmount    float64    `json:"actual_amount" db:"actual_amount"`
+	Variance        float64    `json:"variance" db:"variance"` // computed: budgeted - actual
+	Notes           *string    `json:"notes,omitempty" db:"notes"`
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+}
