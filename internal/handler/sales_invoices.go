@@ -1157,6 +1157,20 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		return
 	}
 
+	// Update related sales order's payment_status if invoice is linked to an order
+	var salesOrderID sql.NullString
+	tx.QueryRow(`SELECT sales_order_id FROM sales_invoices WHERE id = $1`, invoiceID).Scan(&salesOrderID)
+	if salesOrderID.Valid && salesOrderID.String != "" {
+		orderPaymentStatus := "partial"
+		if newStatus == entity.InvoiceStatusPaid {
+			orderPaymentStatus = "paid"
+		}
+		tx.Exec(
+			"UPDATE sales_orders SET payment_status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+			orderPaymentStatus, now, salesOrderID.String, tenantID,
+		)
+	}
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		response.InternalError(c, "Failed to commit transaction")

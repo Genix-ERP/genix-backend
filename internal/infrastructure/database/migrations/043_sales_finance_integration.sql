@@ -91,8 +91,8 @@ BEGIN
     -- Get account type IDs
     SELECT id INTO ar_type_id FROM account_types WHERE code = 'AR';
     SELECT id INTO cash_type_id FROM account_types WHERE code = 'CASH';
-    SELECT id INTO revenue_type_id FROM account_types WHERE code = 'REV';
-    SELECT id INTO tax_type_id FROM account_types WHERE code = 'TAX';
+    SELECT id INTO revenue_type_id FROM account_types WHERE code = 'REVENUE';
+    SELECT id INTO tax_type_id FROM account_types WHERE code = 'ST_LIAB'; -- Use short-term liability for tax payable
     SELECT id INTO cogs_type_id FROM account_types WHERE code = 'COGS';
     SELECT id INTO inv_type_id FROM account_types WHERE code = 'INV';
 

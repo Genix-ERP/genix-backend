@@ -714,6 +714,19 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 		return
 	}
 
+	// If invoice is fully paid, update linked project expense status to 'paid'
+	if newStatus == "paid" {
+		_, err = h.db.Exec(
+			"UPDATE project_expenses SET status = 'paid', updated_at = $1 WHERE purchase_invoice_id = $2 AND tenant_id = $3",
+			now, invoiceID, tenantID,
+		)
+		if err != nil {
+			h.log.Error("Failed to update project expense status", "error", err, "invoice_id", invoiceID)
+		} else {
+			h.log.Info("Project expense status updated to paid", "invoice_id", invoiceID)
+		}
+	}
+
 	// Create Payment record so it appears in Payments section
 	paymentID := uuid.New()
 	paymentNumber := fmt.Sprintf("PAY-%s", now.Format("20060102150405"))

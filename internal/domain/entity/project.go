@@ -36,6 +36,7 @@ type Project struct {
 
 	// Computed fields
 	TeamMembers []string `json:"team_members,omitempty"`
+	TotalHours  float64  `json:"total_hours"`
 }
 
 // ProjectTask represents a task within a project
@@ -97,6 +98,34 @@ type TimeEntry struct {
 	CreatedAt    time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt    time.Time    `json:"updated_at" db:"updated_at"`
 	DeletedAt    sql.NullTime `json:"-" db:"deleted_at"`
+}
+
+// ProjectExpense represents an expense logged against a project
+type ProjectExpense struct {
+	ID                uuid.UUID    `json:"id" db:"id"`
+	TenantID          uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	ProjectID         uuid.UUID    `json:"project_id" db:"project_id"`
+	ExpenseNumber     string       `json:"expense_number" db:"expense_number"`
+	Category          *string      `json:"category,omitempty" db:"category"`
+	Description       string       `json:"description" db:"description"`
+	Amount            float64      `json:"amount" db:"amount"`
+	Currency          string       `json:"currency" db:"currency"`
+	ExpenseDate       time.Time    `json:"expense_date" db:"expense_date"`
+	EmployeeID        *uuid.UUID   `json:"employee_id,omitempty" db:"employee_id"`
+	EmployeeName      *string      `json:"employee_name,omitempty" db:"employee_name"`
+	VendorID          *uuid.UUID   `json:"vendor_id,omitempty" db:"vendor_id"`
+	VendorName        *string      `json:"vendor_name,omitempty" db:"vendor_name"`
+	PurchaseInvoiceID *uuid.UUID   `json:"purchase_invoice_id,omitempty" db:"purchase_invoice_id"`
+	ReceiptURL        *string      `json:"receipt_url,omitempty" db:"receipt_url"`
+	Billable          bool         `json:"billable" db:"billable"`
+	Status            string       `json:"status" db:"status"`
+	ApprovedBy        *uuid.UUID   `json:"approved_by,omitempty" db:"approved_by"`
+	ApprovedAt        *time.Time   `json:"approved_at,omitempty" db:"approved_at"`
+	Notes             *string      `json:"notes,omitempty" db:"notes"`
+	CreatedBy         *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt         time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt         sql.NullTime `json:"-" db:"deleted_at"`
 }
 
 // CreateProjectInput represents input for creating a project
@@ -205,6 +234,38 @@ type UpdateTimeEntryInput struct {
 	Status      *string  `json:"status,omitempty"`
 }
 
+// CreateProjectExpenseInput represents input for creating a project expense
+type CreateProjectExpenseInput struct {
+	Category     string  `json:"category,omitempty"`
+	Description  string  `json:"description" binding:"required"`
+	Amount       float64 `json:"amount" binding:"required"`
+	Currency     string  `json:"currency,omitempty"`
+	ExpenseDate  string  `json:"expense_date" binding:"required"`
+	EmployeeID   string  `json:"employee_id,omitempty"`
+	EmployeeName string  `json:"employee_name,omitempty"`
+	VendorID     string  `json:"vendor_id,omitempty"`
+	VendorName   string  `json:"vendor_name,omitempty"`
+	ReceiptURL   string  `json:"receipt_url,omitempty"`
+	Billable     bool    `json:"billable"`
+	Notes        string  `json:"notes,omitempty"`
+}
+
+// UpdateProjectExpenseInput represents input for updating a project expense
+type UpdateProjectExpenseInput struct {
+	Category     *string  `json:"category,omitempty"`
+	Description  *string  `json:"description,omitempty"`
+	Amount       *float64 `json:"amount,omitempty"`
+	Currency     *string  `json:"currency,omitempty"`
+	ExpenseDate  *string  `json:"expense_date,omitempty"`
+	EmployeeID   *string  `json:"employee_id,omitempty"`
+	EmployeeName *string  `json:"employee_name,omitempty"`
+	VendorName   *string  `json:"vendor_name,omitempty"`
+	ReceiptURL   *string  `json:"receipt_url,omitempty"`
+	Billable     *bool    `json:"billable,omitempty"`
+	Status       *string  `json:"status,omitempty"`
+	Notes        *string  `json:"notes,omitempty"`
+}
+
 // ProjectResponse represents the API response for a project
 type ProjectResponse struct {
 	ID           uuid.UUID `json:"id"`
@@ -219,6 +280,7 @@ type ProjectResponse struct {
 	EndDate      string    `json:"end_date,omitempty"`
 	Budget       float64   `json:"budget"`
 	Spent        float64   `json:"spent"`
+	TotalHours   float64   `json:"total_hours"`
 	BillingType  string    `json:"billing_type"`
 	HourlyRate   float64   `json:"hourly_rate"`
 	Currency     string    `json:"currency"`
@@ -240,6 +302,7 @@ func (p *Project) ToResponse() *ProjectResponse {
 		StartDate:   p.StartDate.Format("2006-01-02"),
 		Budget:      p.Budget,
 		Spent:       p.Spent,
+		TotalHours:  p.TotalHours,
 		BillingType: p.BillingType,
 		HourlyRate:  p.HourlyRate,
 		Currency:    p.Currency,
@@ -400,6 +463,133 @@ func (e *TimeEntry) ToResponse() *TimeEntryResponse {
 	}
 	if e.Amount != nil {
 		resp.Amount = *e.Amount
+	}
+
+	return resp
+}
+
+// ProjectExpenseResponse represents the API response for a project expense
+type ProjectExpenseResponse struct {
+	ID                uuid.UUID `json:"id"`
+	ProjectID         uuid.UUID `json:"project_id"`
+	ExpenseNumber     string    `json:"expense_number"`
+	Category          string    `json:"category,omitempty"`
+	Description       string    `json:"description"`
+	Amount            float64   `json:"amount"`
+	Currency          string    `json:"currency"`
+	ExpenseDate       string    `json:"expense_date"`
+	EmployeeID        string    `json:"employee_id,omitempty"`
+	EmployeeName      string    `json:"employee_name,omitempty"`
+	VendorID          string    `json:"vendor_id,omitempty"`
+	VendorName        string    `json:"vendor_name,omitempty"`
+	PurchaseInvoiceID string    `json:"purchase_invoice_id,omitempty"`
+	ReceiptURL        string    `json:"receipt_url,omitempty"`
+	Billable          bool      `json:"billable"`
+	Status            string    `json:"status"`
+	Notes             string    `json:"notes,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// ToResponse converts ProjectExpense to ProjectExpenseResponse
+func (pe *ProjectExpense) ToResponse() *ProjectExpenseResponse {
+	resp := &ProjectExpenseResponse{
+		ID:            pe.ID,
+		ProjectID:     pe.ProjectID,
+		ExpenseNumber: pe.ExpenseNumber,
+		Description:   pe.Description,
+		Amount:        pe.Amount,
+		Currency:      pe.Currency,
+		ExpenseDate:   pe.ExpenseDate.Format("2006-01-02"),
+		Billable:      pe.Billable,
+		Status:        pe.Status,
+		CreatedAt:     pe.CreatedAt,
+	}
+
+	if pe.Category != nil {
+		resp.Category = *pe.Category
+	}
+	if pe.EmployeeID != nil {
+		resp.EmployeeID = pe.EmployeeID.String()
+	}
+	if pe.EmployeeName != nil {
+		resp.EmployeeName = *pe.EmployeeName
+	}
+	if pe.VendorID != nil {
+		resp.VendorID = pe.VendorID.String()
+	}
+	if pe.VendorName != nil {
+		resp.VendorName = *pe.VendorName
+	}
+	if pe.PurchaseInvoiceID != nil {
+		resp.PurchaseInvoiceID = pe.PurchaseInvoiceID.String()
+	}
+	if pe.ReceiptURL != nil {
+		resp.ReceiptURL = *pe.ReceiptURL
+	}
+	if pe.Notes != nil {
+		resp.Notes = *pe.Notes
+	}
+
+	return resp
+}
+
+// ProjectTeamMember represents a team member assigned to a project
+type ProjectTeamMember struct {
+	ID                uuid.UUID  `json:"id" db:"id"`
+	TenantID          uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	ProjectID         uuid.UUID  `json:"project_id" db:"project_id"`
+	EmployeeID        uuid.UUID  `json:"employee_id" db:"employee_id"`
+	EmployeeName      string     `json:"employee_name" db:"employee_name"`
+	Role              *string    `json:"role,omitempty" db:"role"`
+	AllocationPercent int        `json:"allocation_percent" db:"allocation_percent"`
+	StartDate         *time.Time `json:"start_date,omitempty" db:"start_date"`
+	EndDate           *time.Time `json:"end_date,omitempty" db:"end_date"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// CreateTeamMemberInput represents input for adding a team member
+type CreateTeamMemberInput struct {
+	EmployeeID        string `json:"employee_id" binding:"required"`
+	EmployeeName      string `json:"employee_name"`
+	Role              string `json:"role,omitempty"`
+	AllocationPercent int    `json:"allocation_percent"`
+	StartDate         string `json:"start_date,omitempty"`
+	EndDate           string `json:"end_date,omitempty"`
+}
+
+// ProjectTeamMemberResponse represents the API response for a team member
+type ProjectTeamMemberResponse struct {
+	ID                uuid.UUID `json:"id"`
+	ProjectID         uuid.UUID `json:"project_id"`
+	EmployeeID        string    `json:"employee_id"`
+	EmployeeName      string    `json:"employee_name"`
+	Role              string    `json:"role,omitempty"`
+	AllocationPercent int       `json:"allocation_percent"`
+	StartDate         string    `json:"start_date,omitempty"`
+	EndDate           string    `json:"end_date,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// ToResponse converts ProjectTeamMember to ProjectTeamMemberResponse
+func (tm *ProjectTeamMember) ToResponse() *ProjectTeamMemberResponse {
+	resp := &ProjectTeamMemberResponse{
+		ID:                tm.ID,
+		ProjectID:         tm.ProjectID,
+		EmployeeID:        tm.EmployeeID.String(),
+		EmployeeName:      tm.EmployeeName,
+		AllocationPercent: tm.AllocationPercent,
+		CreatedAt:         tm.CreatedAt,
+	}
+
+	if tm.Role != nil {
+		resp.Role = *tm.Role
+	}
+	if tm.StartDate != nil {
+		resp.StartDate = tm.StartDate.Format("2006-01-02")
+	}
+	if tm.EndDate != nil {
+		resp.EndDate = tm.EndDate.Format("2006-01-02")
 	}
 
 	return resp

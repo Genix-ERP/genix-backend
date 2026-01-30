@@ -344,6 +344,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reorder.DELETE("/:id", middleware.RequirePermission("inventory", "reorder", "delete"), h.DeleteReorderRule)
 	}
 
+	// Quotations
+	quotations := rg.Group("/quotations")
+	quotations.Use(middleware.RequirePermission("sales", "quotation", "read"))
+	{
+		quotations.GET("", h.ListQuotations)
+		quotations.POST("", middleware.RequirePermission("sales", "quotation", "create"), h.CreateQuotation)
+		quotations.GET("/:id", h.GetQuotation)
+		quotations.PUT("/:id", middleware.RequirePermission("sales", "quotation", "update"), h.UpdateQuotation)
+		quotations.DELETE("/:id", middleware.RequirePermission("sales", "quotation", "delete"), h.DeleteQuotation)
+		quotations.POST("/:id/convert", middleware.RequirePermission("sales", "quotation", "update"), h.ConvertQuotationToOrder)
+	}
+
 	// Sales Orders
 	salesOrders := rg.Group("/sales-orders")
 	salesOrders.Use(middleware.RequirePermission("sales", "order", "read"))
@@ -381,6 +393,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		invoices.DELETE("/:id", middleware.RequirePermission("sales", "invoice", "delete"), h.DeleteSalesInvoice)
 		invoices.POST("/:id/send", h.SendInvoice)
 		invoices.POST("/:id/record-payment", h.RecordPayment)
+	}
+
+	// Sales Returns
+	salesReturns := rg.Group("/sales-returns")
+	salesReturns.Use(middleware.RequirePermission("sales", "return", "read"))
+	{
+		salesReturns.GET("", h.ListSalesReturns)
+		salesReturns.POST("", middleware.RequirePermission("sales", "return", "create"), h.CreateSalesReturn)
+		salesReturns.GET("/:id", h.GetSalesReturn)
+		salesReturns.PUT("/:id", middleware.RequirePermission("sales", "return", "update"), h.UpdateSalesReturn)
+		salesReturns.DELETE("/:id", middleware.RequirePermission("sales", "return", "delete"), h.DeleteSalesReturn)
+		salesReturns.POST("/:id/approve", middleware.RequirePermission("sales", "return", "approve"), h.ApproveSalesReturn)
+		salesReturns.POST("/:id/reject", middleware.RequirePermission("sales", "return", "approve"), h.RejectSalesReturn)
+		salesReturns.POST("/:id/refund", middleware.RequirePermission("sales", "return", "update"), h.ProcessRefund)
 	}
 
 	// Purchase Orders
@@ -934,10 +960,22 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Project Milestones
 		projects.GET("/:id/milestones", h.ListProjectMilestones)
 		projects.POST("/:id/milestones", middleware.RequirePermission("projects", "milestone", "create"), h.CreateProjectMilestone)
+		projects.PUT("/:id/milestones/:milestoneId", middleware.RequirePermission("projects", "milestone", "update"), h.UpdateProjectMilestone)
+		projects.DELETE("/:id/milestones/:milestoneId", middleware.RequirePermission("projects", "milestone", "delete"), h.DeleteProjectMilestone)
 
 		// Time Entries
 		projects.GET("/:id/time-entries", h.ListTimeEntries)
 		projects.POST("/:id/time-entries", middleware.RequirePermission("projects", "time_entry", "create"), h.CreateTimeEntry)
+
+		// Project Expenses
+		projects.GET("/:id/expenses", h.ListProjectExpenses)
+		projects.POST("/:id/expenses", middleware.RequirePermission("projects", "expense", "create"), h.CreateProjectExpense)
+		projects.DELETE("/:id/expenses/:expenseId", middleware.RequirePermission("projects", "expense", "delete"), h.DeleteProjectExpense)
+
+		// Project Team Members
+		projects.GET("/:id/team-members", h.ListProjectTeamMembers)
+		projects.POST("/:id/team-members", middleware.RequirePermission("projects", "project", "update"), h.AddProjectTeamMember)
+		projects.DELETE("/:id/team-members/:memberId", middleware.RequirePermission("projects", "project", "update"), h.RemoveProjectTeamMember)
 	}
 
 	// =====================================================
