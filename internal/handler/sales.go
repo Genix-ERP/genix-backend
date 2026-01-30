@@ -643,14 +643,16 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		order["sales_rep_id"] = salesRepID.String
 	}
 
-	// Get order lines
+	// Get order lines with product name
 	linesQuery := `
-		SELECT id, line_number, product_id, description, quantity, unit_id, unit_price,
-			   discount_type, discount_value, discount_amount, tax_id, tax_amount, line_total,
-			   quantity_delivered, quantity_invoiced, warehouse_id, notes
-		FROM sales_order_lines
-		WHERE sales_order_id = $1
-		ORDER BY line_number`
+		SELECT sol.id, sol.line_number, sol.product_id, sol.description, sol.quantity, sol.unit_id, sol.unit_price,
+			   sol.discount_type, sol.discount_value, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total,
+			   sol.quantity_delivered, sol.quantity_invoiced, sol.warehouse_id, sol.notes,
+			   COALESCE(p.name, '') as product_name
+		FROM sales_order_lines sol
+		LEFT JOIN products p ON p.id = sol.product_id
+		WHERE sol.sales_order_id = $1
+		ORDER BY sol.line_number`
 
 	linesRows, err := h.db.Query(linesQuery, orderID)
 	if err == nil {
@@ -662,11 +664,13 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			var description, lineDiscountType, lineNotes sql.NullString
 			var quantity, unitPrice, lineDiscountValue, lineDiscountAmount, lineTaxAmount, lineTotal, qtyDelivered, qtyInvoiced float64
 			var unitID, taxID, lineWarehouseID sql.NullString
+			var productName string
 
 			err := linesRows.Scan(
 				&lineID, &lineNumber, &productID, &description, &quantity, &unitID, &unitPrice,
 				&lineDiscountType, &lineDiscountValue, &lineDiscountAmount, &taxID, &lineTaxAmount, &lineTotal,
 				&qtyDelivered, &qtyInvoiced, &lineWarehouseID, &lineNotes,
+				&productName,
 			)
 			if err != nil {
 				continue
@@ -676,6 +680,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 				"id":                 lineID.String(),
 				"line_number":        lineNumber,
 				"product_id":         productID.String(),
+				"product_name":       productName,
 				"quantity":           quantity,
 				"unit_price":         unitPrice,
 				"discount_value":     lineDiscountValue,
@@ -1150,8 +1155,26 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	}
 
 	h.log.Info("CreateInvoiceFromOrder: order status check", "status", currentStatus, "orderID", orderID)
-	if currentStatus != string(entity.OrderStatusConfirmed) && currentStatus != string(entity.OrderStatusProcessing) {
-		response.BadRequest(c, "Can only create invoice from confirmed or processing orders")
+	// Allow invoice creation from confirmed, processing, shipped, or delivered orders
+	allowedStatuses := map[string]bool{
+		string(entity.OrderStatusConfirmed):  true,
+		string(entity.OrderStatusProcessing): true,
+		string(entity.OrderStatusShipped):    true,
+		string(entity.OrderStatusDelivered):  true,
+	}
+	if !allowedStatuses[currentStatus] {
+		response.BadRequest(c, "Can only create invoice from confirmed, processing, shipped, or delivered orders")
+		return
+	}
+
+	// Check if an invoice already exists for this order (prevent duplicates)
+	var existingInvoiceCount int
+	h.db.QueryRow(`
+		SELECT COUNT(*) FROM sales_invoices
+		WHERE sales_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status != 'cancelled'`,
+		orderID, tenantID).Scan(&existingInvoiceCount)
+	if existingInvoiceCount > 0 {
+		response.BadRequest(c, "An invoice already exists for this order")
 		return
 	}
 
