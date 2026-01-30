@@ -271,6 +271,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		operationTypes.DELETE("/:id", middleware.RequirePermission("inventory", "warehouse", "delete"), h.DeleteOperationType)
 	}
 
+	// Carriers
+	carriers := rg.Group("/carriers")
+	carriers.Use(middleware.RequirePermission("inventory", "carrier", "read"))
+	{
+		carriers.GET("", h.ListCarriers)
+		carriers.POST("", middleware.RequirePermission("inventory", "carrier", "create"), h.CreateCarrier)
+		carriers.GET("/:id", h.GetCarrier)
+		carriers.PUT("/:id", middleware.RequirePermission("inventory", "carrier", "update"), h.UpdateCarrier)
+		carriers.DELETE("/:id", middleware.RequirePermission("inventory", "carrier", "delete"), h.DeleteCarrier)
+	}
+
 	// Inventory
 	inventory := rg.Group("/inventory")
 	inventory.Use(middleware.RequirePermission("inventory", "stock", "read"))
@@ -344,7 +355,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		salesOrders.DELETE("/:id", middleware.RequirePermission("sales", "order", "delete"), h.DeleteSalesOrder)
 		salesOrders.POST("/:id/confirm", middleware.RequirePermission("sales", "order", "approve"), h.ConfirmSalesOrder)
 		salesOrders.POST("/:id/cancel", h.CancelSalesOrder)
-		salesOrders.POST("/:id/invoice", h.CreateInvoiceFromOrder)
+		salesOrders.POST(":id/invoice", h.CreateInvoiceFromOrder)
+	}
+
+	// Sales Delivery Orders (outbound shipments from sales orders)
+	deliveryOrders := rg.Group("/sales/delivery-orders")
+	deliveryOrders.Use(middleware.RequirePermission("sales", "delivery", "read"))
+	{
+		deliveryOrders.GET("", h.ListDeliveryOrders)
+		deliveryOrders.POST("", middleware.RequirePermission("sales", "delivery", "create"), h.CreateDeliveryOrder)
+		deliveryOrders.GET("/:id", h.GetDeliveryOrder)
+		deliveryOrders.PUT("/:id", middleware.RequirePermission("sales", "delivery", "update"), h.UpdateDeliveryOrder)
+		deliveryOrders.POST("/:id/validate", middleware.RequirePermission("sales", "delivery", "update"), h.ValidateDeliveryOrder)
+		deliveryOrders.POST("/:id/cancel", middleware.RequirePermission("sales", "delivery", "update"), h.CancelDeliveryOrder)
 	}
 
 	// Sales Invoices
@@ -383,6 +406,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseInvoices.PUT("/:id", middleware.RequirePermission("purchase", "invoice", "update"), h.UpdatePurchaseInvoice)
 		purchaseInvoices.DELETE("/:id", middleware.RequirePermission("purchase", "invoice", "delete"), h.DeletePurchaseInvoice)
 		purchaseInvoices.POST("/:id/confirm", middleware.RequirePermission("purchase", "invoice", "approve"), h.ConfirmPurchaseInvoice)
+		purchaseInvoices.POST("/:id/post", middleware.RequirePermission("purchase", "invoice", "approve"), h.PostPurchaseInvoice)
 		purchaseInvoices.POST("/:id/pay", h.PayPurchaseInvoice)
 	}
 
@@ -411,6 +435,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		contracts.DELETE("/:id", middleware.RequirePermission("purchase", "contract", "delete"), h.DeleteContract)
 		contracts.POST("/:id/activate", middleware.RequirePermission("purchase", "contract", "update"), h.ActivateContract)
 		contracts.POST("/:id/terminate", middleware.RequirePermission("purchase", "contract", "update"), h.TerminateContract)
+	}
+
+	// Supplier Price History
+	priceHistory := rg.Group("/price-history")
+	priceHistory.Use(middleware.RequirePermission("purchase", "price_history", "read"))
+	{
+		priceHistory.GET("", h.ListPriceHistory)
+		priceHistory.POST("", middleware.RequirePermission("purchase", "price_history", "create"), h.CreatePriceHistory)
+		priceHistory.GET("/:id", h.GetPriceHistory)
+		priceHistory.DELETE("/:id", middleware.RequirePermission("purchase", "price_history", "delete"), h.DeletePriceHistory)
 	}
 
 	// Purchase Requisitions

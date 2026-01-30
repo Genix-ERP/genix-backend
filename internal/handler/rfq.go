@@ -42,6 +42,7 @@ func (h *Handler) ListRFQs(c *gin.Context) {
 		SELECT r.id, r.rfq_number, r.title, r.description, r.status,
 			   r.deadline, r.terms, r.notes, r.winner_id,
 			   COALESCE(c.name, '') as winner_name,
+			   (SELECT COUNT(*) FROM rfq_invitations WHERE rfq_id = r.id) as invitation_count,
 			   (SELECT COUNT(*) FROM rfq_responses WHERE rfq_id = r.id) as response_count,
 			   r.created_at, r.updated_at
 		FROM rfqs r
@@ -94,12 +95,14 @@ func (h *Handler) ListRFQs(c *gin.Context) {
 		var deadline sql.NullTime
 		var winnerID sql.NullString
 
+		var invitationCount int
 		err := rows.Scan(
 			&rfq.ID, &rfq.RFQNumber, &rfq.Title, &description, &rfq.Status,
 			&deadline, &terms, &notes, &winnerID,
-			&rfq.WinnerName, &rfq.ResponseCount,
+			&rfq.WinnerName, &invitationCount, &rfq.ResponseCount,
 			&rfq.CreatedAt, &rfq.UpdatedAt,
 		)
+		rfq.InvitationCount = invitationCount
 		if err != nil {
 			h.log.Error("Failed to scan RFQ", "error", err)
 			continue
@@ -156,12 +159,16 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 	h.db.QueryRow("SELECT COUNT(*) FROM rfqs WHERE tenant_id = $1", tenantID).Scan(&count)
 	rfqNumber := fmt.Sprintf("RFQ-%s-%04d", now.Format("2006"), count+1)
 
-	// Parse deadline
-	var deadline *time.Time
+	// Parse deadline - default to 30 days from now if not provided
+	var deadline time.Time
 	if input.Deadline != "" {
 		if dl, err := time.Parse("2006-01-02", input.Deadline); err == nil {
-			deadline = &dl
+			deadline = dl
+		} else {
+			deadline = now.AddDate(0, 0, 30) // default 30 days
 		}
+	} else {
+		deadline = now.AddDate(0, 0, 30) // default 30 days
 	}
 
 	// Prepare optional strings
@@ -186,13 +193,16 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 	defer tx.Rollback()
 
 	// Insert RFQ
+	// issue_date is the date RFQ was created, deadline is the response deadline
+	issueDate := now.Format("2006-01-02")
+
 	query := `
-		INSERT INTO rfqs (id, tenant_id, rfq_number, title, description, status, deadline, terms, notes, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		INSERT INTO rfqs (id, tenant_id, rfq_number, title, description, status, issue_date, deadline, terms, notes, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
 
 	_, err = tx.Exec(query,
-		id, tenantID, rfqNumber, input.Title, description, entity.RFQStatusDraft, deadline, terms, notes, userID, now, now,
+		id, tenantID, rfqNumber, input.Title, description, entity.RFQStatusDraft, issueDate, deadline, terms, notes, userID, now, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to insert RFQ", "error", err)
@@ -202,33 +212,32 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 
 	// Insert items
 	items := make([]entity.RFQItem, 0, len(input.Items))
-	for _, item := range input.Items {
+	for i, item := range input.Items {
 		itemID := uuid.New()
+		lineNumber := i + 1
 
-		var productID, unitID *uuid.UUID
+		var productID *uuid.UUID
 		if item.ProductID != "" {
 			if pid, err := uuid.Parse(item.ProductID); err == nil {
 				productID = &pid
 			}
 		}
-		if item.UnitID != "" {
-			if uid, err := uuid.Parse(item.UnitID); err == nil {
-				unitID = &uid
-			}
+
+		// unit is stored as string (not unit_id) in migration 015
+		unit := item.UnitID // Use unit_id as unit string if provided
+		if unit == "" {
+			unit = "pcs" // default
 		}
 
-		var specs, itemNotes *string
+		var specs *string
 		if item.Specs != "" {
 			specs = &item.Specs
 		}
-		if item.Notes != "" {
-			itemNotes = &item.Notes
-		}
 
 		_, err = tx.Exec(`
-			INSERT INTO rfq_items (id, rfq_id, product_id, description, quantity, unit_id, specs, notes, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		`, itemID, id, productID, item.Description, item.Quantity, unitID, specs, itemNotes, now, now)
+			INSERT INTO rfq_items (id, tenant_id, rfq_id, line_number, product_id, description, quantity, unit, specifications, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`, itemID, tenantID, id, lineNumber, productID, item.Description, item.Quantity, unit, specs, now, now)
 		if err != nil {
 			h.log.Error("Failed to insert RFQ item", "error", err)
 			response.InternalError(c, "Failed to create RFQ")
@@ -241,9 +250,7 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 			ProductID:   productID,
 			Description: item.Description,
 			Quantity:    item.Quantity,
-			UnitID:      unitID,
 			Specs:       specs,
-			Notes:       itemNotes,
 			CreatedAt:   now,
 			UpdatedAt:   now,
 		})
@@ -258,9 +265,9 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 
 		inviteID := uuid.New()
 		_, err = tx.Exec(`
-			INSERT INTO rfq_invitations (id, rfq_id, vendor_id, invited_at)
-			VALUES ($1, $2, $3, $4)
-		`, inviteID, id, vendorID, now)
+			INSERT INTO rfq_invitations (id, tenant_id, rfq_id, vendor_id, invited_at, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`, inviteID, tenantID, id, vendorID, now, now, now)
 		if err != nil {
 			h.log.Error("Failed to insert RFQ invitation", "error", err)
 		}
@@ -278,7 +285,7 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 		Title:       input.Title,
 		Description: description,
 		Status:      entity.RFQStatusDraft,
-		Deadline:    deadline,
+		Deadline:    &deadline,
 		Terms:       terms,
 		Notes:       notes,
 		Items:       items,
@@ -355,12 +362,11 @@ func (h *Handler) GetRFQ(c *gin.Context) {
 
 	// Get items
 	itemRows, err := h.db.Query(`
-		SELECT i.id, i.rfq_id, i.product_id, i.description, i.quantity, i.unit_id, i.specs, i.notes,
-			   COALESCE(p.name, '') as product_name, COALESCE(u.name, '') as unit_name,
+		SELECT i.id, i.rfq_id, i.product_id, i.description, i.quantity, i.unit, i.specifications,
+			   COALESCE(p.name, '') as product_name,
 			   i.created_at, i.updated_at
 		FROM rfq_items i
 		LEFT JOIN products p ON i.product_id = p.id
-		LEFT JOIN units_of_measure u ON i.unit_id = u.id
 		WHERE i.rfq_id = $1
 	`, id)
 	if err == nil {
@@ -368,12 +374,12 @@ func (h *Handler) GetRFQ(c *gin.Context) {
 		rfq.Items = make([]entity.RFQItem, 0)
 		for itemRows.Next() {
 			var item entity.RFQItem
-			var productID, unitID sql.NullString
-			var specs, itemNotes sql.NullString
+			var productID sql.NullString
+			var unit, specs sql.NullString
 
 			itemRows.Scan(
-				&item.ID, &item.RFQID, &productID, &item.Description, &item.Quantity, &unitID, &specs, &itemNotes,
-				&item.ProductName, &item.UnitName, &item.CreatedAt, &item.UpdatedAt,
+				&item.ID, &item.RFQID, &productID, &item.Description, &item.Quantity, &unit, &specs,
+				&item.ProductName, &item.CreatedAt, &item.UpdatedAt,
 			)
 
 			if productID.Valid {
@@ -381,16 +387,11 @@ func (h *Handler) GetRFQ(c *gin.Context) {
 					item.ProductID = &pid
 				}
 			}
-			if unitID.Valid {
-				if uid, err := uuid.Parse(unitID.String); err == nil {
-					item.UnitID = &uid
-				}
+			if unit.Valid {
+				item.UnitName = unit.String
 			}
 			if specs.Valid {
 				item.Specs = &specs.String
-			}
-			if itemNotes.Valid {
-				item.Notes = &itemNotes.String
 			}
 
 			rfq.Items = append(rfq.Items, item)

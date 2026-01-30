@@ -235,6 +235,7 @@ type SimpleSalesOrderInput struct {
 	Notes           string                              `json:"notes,omitempty"`
 	InternalNotes   string                              `json:"internal_notes,omitempty"`
 	WarehouseID     string                              `json:"warehouse_id,omitempty"`
+	Carrier         string                              `json:"carrier,omitempty"`
 	SalesRepID      string                              `json:"sales_rep_id,omitempty"`
 	Lines           []entity.CreateSalesOrderLineInput  `json:"lines,omitempty"`
 
@@ -418,16 +419,16 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			order_date, expected_date, billing_address, shipping_address,
 			currency_id, exchange_rate, subtotal, discount_type, discount_value, discount_amount,
 			tax_amount, shipping_amount, total_amount, status, payment_status, payment_terms,
-			reference, po_number, notes, internal_notes, warehouse_id, sales_rep_id,
+			reference, po_number, notes, internal_notes, warehouse_id, carrier, sales_rep_id,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)`
 
 	_, err = h.db.Exec(query,
 		orderID, tenantID, orderNumber, customerID, contactPersonID,
 		orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
 		currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount,
 		taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
-		input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, salesRepID,
+		input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, salesRepID,
 		createdBy, now, now,
 	)
 	if err != nil {
@@ -748,8 +749,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 	isStatusOnlyUpdate := input.Status != nil && input.ExpectedDate == nil && input.DiscountType == nil &&
 		input.DiscountValue == nil && input.ShippingAmount == nil && input.PaymentTerms == nil &&
 		input.Reference == nil && input.PONumber == nil && input.Notes == nil &&
-		input.InternalNotes == nil && input.WarehouseID == nil && input.SalesRepID == nil &&
-		input.PaymentStatus == nil
+		input.InternalNotes == nil && input.WarehouseID == nil && input.Carrier == nil &&
+		input.SalesRepID == nil && input.PaymentStatus == nil
 
 	if !isStatusOnlyUpdate && currentStatus != string(entity.OrderStatusDraft) {
 		response.BadRequest(c, "Can only update order details in draft status")
@@ -830,6 +831,11 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		} else {
 			args = append(args, nil)
 		}
+	}
+	if input.Carrier != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("carrier = $%d", argCount))
+		args = append(args, *input.Carrier)
 	}
 	if input.Status != nil {
 		argCount++
@@ -915,7 +921,7 @@ func (h *Handler) DeleteSalesOrder(c *gin.Context) {
 	response.NoContent(c)
 }
 
-// ConfirmSalesOrder confirms a draft sales order
+// ConfirmSalesOrder confirms a draft sales order and auto-creates a Delivery Order
 func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -931,11 +937,26 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		return
 	}
 
-	// Check current status
-	var currentStatus string
-	err = h.db.QueryRow("SELECT status FROM sales_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", orderID, tenantID).Scan(&currentStatus)
+	// Get order details including warehouse_id and carrier for the delivery order
+	var currentStatus, orderNumber string
+	var customerID uuid.UUID
+	var customerName sql.NullString
+	var warehouseID sql.NullString
+	var carrier sql.NullString
+	var expectedDate sql.NullTime
+
+	err = h.db.QueryRow(`
+		SELECT so.status, so.order_number, so.customer_id, c.name, so.warehouse_id, so.carrier, so.expected_date
+		FROM sales_orders so
+		LEFT JOIN contacts c ON so.customer_id = c.id
+		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`,
+		orderID, tenantID).Scan(&currentStatus, &orderNumber, &customerID, &customerName, &warehouseID, &carrier, &expectedDate)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales order")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
 		return
 	}
 	if currentStatus != string(entity.OrderStatusDraft) {
@@ -944,6 +965,8 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	}
 
 	now := time.Now()
+
+	// Update sales order status to confirmed
 	_, err = h.db.Exec(
 		"UPDATE sales_orders SET status = $1, approved_by = $2, approved_at = $3, updated_at = $4 WHERE id = $5 AND tenant_id = $6",
 		entity.OrderStatusConfirmed, userID, now, now, orderID, tenantID,
@@ -951,6 +974,87 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	if err != nil {
 		response.InternalError(c, "Failed to confirm sales order")
 		return
+	}
+
+	// Auto-create Delivery Order (Odoo-like behavior)
+	doID := uuid.New()
+	doNumber := "DO-" + time.Now().Format("20060102150405")
+
+	// Set delivery date to expected_date or today
+	deliveryDate := now
+	if expectedDate.Valid {
+		deliveryDate = expectedDate.Time
+	}
+
+	// Parse warehouse_id if valid, otherwise get default warehouse
+	var warehouseUUID *uuid.UUID
+	if warehouseID.Valid && warehouseID.String != "" {
+		wid, parseErr := uuid.Parse(warehouseID.String)
+		if parseErr == nil {
+			warehouseUUID = &wid
+		}
+	}
+
+	// If no warehouse specified, get the default warehouse for this tenant
+	if warehouseUUID == nil {
+		var defaultWarehouseID uuid.UUID
+		err := h.db.QueryRow(`
+			SELECT id FROM warehouses
+			WHERE tenant_id = $1 AND is_default = true AND deleted_at IS NULL
+			LIMIT 1
+		`, tenantID).Scan(&defaultWarehouseID)
+		if err == nil {
+			warehouseUUID = &defaultWarehouseID
+		} else {
+			// If no default, try to get any warehouse
+			err = h.db.QueryRow(`
+				SELECT id FROM warehouses
+				WHERE tenant_id = $1 AND deleted_at IS NULL
+				LIMIT 1
+			`, tenantID).Scan(&defaultWarehouseID)
+			if err == nil {
+				warehouseUUID = &defaultWarehouseID
+			}
+		}
+	}
+
+	// Insert delivery order
+	var carrierValue *string
+	if carrier.Valid && carrier.String != "" {
+		carrierValue = &carrier.String
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO sales_delivery_orders (
+			id, tenant_id, delivery_number, sales_order_id, so_number,
+			customer_id, customer_name, delivery_date, scheduled_date, warehouse_id, carrier,
+			status, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $13)`,
+		doID, tenantID, doNumber, orderID, orderNumber,
+		customerID, customerName.String, deliveryDate, expectedDate, warehouseUUID, carrierValue,
+		userID, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create delivery order", "error", err)
+		// Don't fail the confirmation, just log the error
+	} else {
+		// Copy SO lines to DO lines for remaining quantities
+		_, err = h.db.Exec(`
+			INSERT INTO sales_delivery_order_lines (
+				id, delivery_order_id, so_line_id, product_id, product_name,
+				quantity_ordered, quantity_to_deliver, unit_price, warehouse_id, created_at
+			)
+			SELECT uuid_generate_v4(), $1, sol.id, sol.product_id, COALESCE(p.name, 'Unknown'),
+				   sol.quantity, sol.quantity - COALESCE(sol.quantity_delivered, 0),
+				   sol.unit_price, $2, NOW()
+			FROM sales_order_lines sol
+			LEFT JOIN products p ON p.id = sol.product_id
+			WHERE sol.sales_order_id = $3 AND sol.quantity > COALESCE(sol.quantity_delivered, 0)`,
+			doID, warehouseUUID, orderID,
+		)
+		if err != nil {
+			h.log.Error("Failed to create delivery order lines", "error", err)
+		}
 	}
 
 	h.GetSalesOrder(c)
@@ -1015,31 +1119,37 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		return
 	}
 
-	// Get order details
+	// Get order details with customer name
 	var customerID uuid.UUID
 	var orderNumber string
 	var subtotal, discountAmount, taxAmount, shippingAmount, totalAmount float64
 	var paymentTerms int
-	var billingAddress, shippingAddress []byte
+	var billingAddress, shippingAddress string
 	var currentStatus string
+	var customerName string
 
 	err = h.db.QueryRow(`
-		SELECT customer_id, order_number, subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
-		       payment_terms, billing_address, shipping_address, status
-		FROM sales_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		SELECT so.customer_id, so.order_number, COALESCE(so.subtotal, 0), COALESCE(so.discount_amount, 0), COALESCE(so.tax_amount, 0), COALESCE(so.shipping_amount, 0), COALESCE(so.total_amount, 0),
+		       COALESCE(so.payment_terms, 30), COALESCE(so.billing_address::text, ''), COALESCE(so.shipping_address::text, ''), so.status,
+		       COALESCE(c.name, '')
+		FROM sales_orders so
+		LEFT JOIN contacts c ON so.customer_id = c.id
+		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`,
 		orderID, tenantID).Scan(
 		&customerID, &orderNumber, &subtotal, &discountAmount, &taxAmount, &shippingAmount, &totalAmount,
-		&paymentTerms, &billingAddress, &shippingAddress, &currentStatus,
+		&paymentTerms, &billingAddress, &shippingAddress, &currentStatus, &customerName,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales order")
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales order")
+		h.log.Error("Failed to fetch sales order", "error", err, "order_id", orderID)
+		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
 		return
 	}
 
+	h.log.Info("CreateInvoiceFromOrder: order status check", "status", currentStatus, "orderID", orderID)
 	if currentStatus != string(entity.OrderStatusConfirmed) && currentStatus != string(entity.OrderStatusProcessing) {
 		response.BadRequest(c, "Can only create invoice from confirmed or processing orders")
 		return
@@ -1055,29 +1165,49 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		createdBy = &userID
 	}
 
-	// Create invoice
+	// Convert addresses to interface{} for JSONB - nil for empty, otherwise the JSON string
+	var billingAddrParam, shippingAddrParam interface{}
+	if billingAddress != "" && billingAddress != "{}" {
+		billingAddrParam = []byte(billingAddress)
+	}
+	if shippingAddress != "" && shippingAddress != "{}" {
+		shippingAddrParam = []byte(shippingAddress)
+	}
+
+	// Create invoice (note: amount_due is a GENERATED column, don't insert into it)
+	h.log.Info("CreateInvoiceFromOrder: attempting INSERT",
+		"invoiceID", invoiceID,
+		"tenantID", tenantID,
+		"invoiceNumber", invoiceNumber,
+		"customerID", customerID,
+		"orderID", orderID)
+
 	_, err = h.db.Exec(`
 		INSERT INTO sales_invoices (
-			id, tenant_id, invoice_number, customer_id, sales_order_id,
+			id, tenant_id, invoice_number, customer_id, customer_name, sales_order_id,
 			invoice_date, due_date, billing_address, shipping_address,
 			exchange_rate, subtotal, discount_amount, tax_amount, total_amount,
-			amount_paid, amount_due, status, created_by, created_at, updated_at
+			amount_paid, status, created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
-		invoiceID, tenantID, invoiceNumber, customerID, orderID,
-		now, dueDate, billingAddress, shippingAddress,
+		invoiceID, tenantID, invoiceNumber, customerID, customerName, orderID,
+		now, dueDate, billingAddrParam, shippingAddrParam,
 		1.0, subtotal, discountAmount, taxAmount, totalAmount,
-		0, totalAmount, entity.InvoiceStatusDraft, createdBy, now, now,
+		0, entity.InvoiceStatusDraft, createdBy, now, now,
 	)
 	if err != nil {
+		h.log.Error("CreateInvoiceFromOrder: INSERT failed", "error", err)
 		response.InternalError(c, "Failed to create invoice: "+err.Error())
 		return
 	}
+	h.log.Info("CreateInvoiceFromOrder: INSERT succeeded")
 
-	// Copy order lines to invoice lines
+	// Copy order lines to invoice lines (join with products to get name if description is null)
 	linesRows, err := h.db.Query(`
-		SELECT id, line_number, product_id, description, quantity, unit_id, unit_price,
-		       discount_amount, tax_id, tax_amount, line_total
-		FROM sales_order_lines WHERE sales_order_id = $1`, orderID)
+		SELECT sol.id, sol.line_number, sol.product_id, COALESCE(NULLIF(sol.description, ''), p.name) as description,
+		       sol.quantity, sol.unit_id, sol.unit_price, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total
+		FROM sales_order_lines sol
+		LEFT JOIN products p ON p.id = sol.product_id
+		WHERE sol.sales_order_id = $1`, orderID)
 	if err == nil {
 		defer linesRows.Close()
 		for linesRows.Next() {
