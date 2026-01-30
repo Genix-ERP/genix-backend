@@ -148,20 +148,21 @@ type RFQListFilter struct {
 
 // RFQResponse represents the API response for an RFQ
 type RFQAPIResponse struct {
-	ID           uuid.UUID     `json:"id"`
-	RFQNumber    string        `json:"rfq_number"`
-	Title        string        `json:"title"`
-	Description  *string       `json:"description,omitempty"`
-	Status       RFQStatus     `json:"status"`
-	Deadline     *time.Time    `json:"deadline,omitempty"`
-	Terms        *string       `json:"terms,omitempty"`
-	Notes        *string       `json:"notes,omitempty"`
-	WinnerID     *uuid.UUID    `json:"winner_id,omitempty"`
-	WinnerName   string        `json:"winner_name,omitempty"`
-	Items        []RFQItem     `json:"items,omitempty"`
-	Invitations  []RFQInvite   `json:"invitations,omitempty"`
-	Responses    []RFQResponse `json:"responses,omitempty"`
-	ResponseCount int          `json:"response_count"`
-	CreatedAt    time.Time     `json:"created_at"`
-	UpdatedAt    time.Time     `json:"updated_at"`
+	ID              uuid.UUID     `json:"id"`
+	RFQNumber       string        `json:"rfq_number"`
+	Title           string        `json:"title"`
+	Description     *string       `json:"description,omitempty"`
+	Status          RFQStatus     `json:"status"`
+	Deadline        *time.Time    `json:"deadline,omitempty"`
+	Terms           *string       `json:"terms,omitempty"`
+	Notes           *string       `json:"notes,omitempty"`
+	WinnerID        *uuid.UUID    `json:"winner_id,omitempty"`
+	WinnerName      string        `json:"winner_name,omitempty"`
+	Items           []RFQItem     `json:"items,omitempty"`
+	Invitations     []RFQInvite   `json:"invitations,omitempty"`
+	Responses       []RFQResponse `json:"responses,omitempty"`
+	InvitationCount int           `json:"invitation_count"`
+	ResponseCount   int           `json:"response_count"`
+	CreatedAt       time.Time     `json:"created_at"`
+	UpdatedAt       time.Time     `json:"updated_at"`
 }

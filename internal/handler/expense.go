@@ -92,7 +92,7 @@ func (h *Handler) ListExpenses(c *gin.Context) {
 			   e.vendor_id, e.vendor_name, e.expense_date, e.description, e.amount, e.tax_amount,
 			   e.total_amount, e.currency, e.payment_method, e.reference, e.receipt_url,
 			   e.status, e.reimbursable, e.notes, e.created_at, e.updated_at,
-			   COALESCE(c.name, '') as category_name
+			   COALESCE(c.name, e.category_name, '') as category_name
 		FROM expenses e
 		LEFT JOIN expense_categories c ON e.category_id = c.id
 		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL
@@ -258,15 +258,18 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 
 	query := `
 		INSERT INTO expenses (
-			id, tenant_id, expense_number, category_id, employee_id, employee_name,
+			id, tenant_id, expense_number, category_id, category_name, employee_id, employee_name,
 			vendor_id, vendor_name, expense_date, description, amount, tax_amount,
 			total_amount, currency, payment_method, reference, receipt_url, status,
 			reimbursable, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 		RETURNING id
 	`
 
-	var employeeName, vendorName, paymentMethod, reference, receiptURL, notes *string
+	var employeeName, vendorName, paymentMethod, reference, receiptURL, notes, categoryName *string
+	if input.CategoryName != "" {
+		categoryName = &input.CategoryName
+	}
 	if input.EmployeeName != "" {
 		employeeName = &input.EmployeeName
 	}
@@ -287,7 +290,7 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 	}
 
 	if err := h.db.QueryRow(query,
-		id, tenantID, expenseNumber, categoryID, employeeID, employeeName,
+		id, tenantID, expenseNumber, categoryID, categoryName, employeeID, employeeName,
 		vendorID, vendorName, expenseDate, input.Description, input.Amount, input.TaxAmount,
 		totalAmount, currency, paymentMethod, reference, receiptURL, "pending",
 		input.Reimbursable, notes, userID, now, now,
@@ -302,6 +305,7 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 		TenantID:      tenantID,
 		ExpenseNumber: expenseNumber,
 		CategoryID:    categoryID,
+		CategoryName:  input.CategoryName,
 		EmployeeID:    employeeID,
 		EmployeeName:  employeeName,
 		VendorID:      vendorID,
@@ -443,6 +447,9 @@ func (h *Handler) UpdateExpense(c *gin.Context) {
 		if parsedID, err := uuid.Parse(*input.CategoryID); err == nil {
 			addUpdate("category_id", parsedID)
 		}
+	}
+	if input.CategoryName != nil {
+		addUpdate("category_name", *input.CategoryName)
 	}
 	if input.EmployeeID != nil && *input.EmployeeID != "" {
 		if parsedID, err := uuid.Parse(*input.EmployeeID); err == nil {

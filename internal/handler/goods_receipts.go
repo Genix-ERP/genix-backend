@@ -15,10 +15,11 @@ import (
 
 // GR Status constants
 const (
-	GRStatusDraft     = "draft"
-	GRStatusPending   = "pending"
-	GRStatusCompleted = "completed"
-	GRStatusCancelled = "cancelled"
+	GRStatusDraft      = "draft"
+	GRStatusPending    = "pending"
+	GRStatusInspecting = "inspecting"
+	GRStatusCompleted  = "completed"
+	GRStatusCancelled  = "cancelled"
 )
 
 // Quality Status constants
@@ -204,7 +205,7 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 	var input struct {
 		PurchaseOrderID string `json:"purchase_order_id" binding:"required"`
 		ReceiptDate     string `json:"receipt_date,omitempty"`
-		ReceivedBy      string `json:"received_by,omitempty"`
+		ReceivedBy      string `json:"received_by" binding:"required"`
 		WarehouseID     string `json:"warehouse_id,omitempty"`
 		WarehouseName   string `json:"warehouse_name,omitempty"`
 		DeliveryNote    string `json:"delivery_note,omitempty"`
@@ -229,9 +230,12 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
 	}
+
+	// Log input for debugging
+	fmt.Printf("CreateGoodsReceipt input: PO=%s, ReceivedBy=%s, Lines=%d\n", input.PurchaseOrderID, input.ReceivedBy, len(input.Lines))
 
 	poID, err := uuid.Parse(input.PurchaseOrderID)
 	if err != nil {
@@ -253,9 +257,11 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 		return
 	}
 	if err != nil {
+		fmt.Printf("Error fetching PO: %v\n", err)
 		response.InternalError(c, "Failed to fetch purchase order: "+err.Error())
 		return
 	}
+	fmt.Printf("PO found: number=%s, supplierID=%s, supplierName=%s\n", poNumber, supplierID, supplierName)
 
 	// Generate GR number
 	var count int
@@ -290,17 +296,20 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 			created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
 
+	fmt.Printf("Inserting GR: id=%s, warehouseID=%v, receivedBy=%s\n", grID, warehouseID, input.ReceivedBy)
 	_, err = h.db.Exec(query,
 		grID, tenantID, grNumber, poID, poNumber,
 		supplierID, supplierName, receiptDate, input.ReceivedBy,
-		warehouseID, input.WarehouseName, GRStatusDraft, QualityStatusPending,
+		warehouseID, input.WarehouseName, GRStatusPending, QualityStatusPending,
 		input.DeliveryNote, input.VehicleNumber, input.DriverName, input.Notes,
 		now, now,
 	)
 	if err != nil {
+		fmt.Printf("Error inserting GR: %v\n", err)
 		response.InternalError(c, "Failed to create goods receipt: "+err.Error())
 		return
 	}
+	fmt.Printf("GR created successfully: %s\n", grID)
 
 	// Insert lines
 	lineQuery := `
@@ -694,13 +703,13 @@ func (h *Handler) InspectGoodsReceipt(c *gin.Context) {
 		overallQuality = QualityStatusFailed
 	}
 
-	// Update receipt
+	// Update receipt - set status to "inspecting" (ready to be completed)
 	h.db.Exec(`
 		UPDATE goods_receipts
 		SET status = $1, quality_status = $2, inspected_by = $3, inspected_at = $4,
 			inspection_notes = $5, accepted_quantity = $6, rejected_quantity = $7, updated_at = $8
 		WHERE id = $9 AND tenant_id = $10`,
-		GRStatusPending, overallQuality, input.InspectedBy, now,
+		GRStatusInspecting, overallQuality, input.InspectedBy, now,
 		input.InspectionNotes, totalAccepted, totalRejected, now,
 		grID, tenantID,
 	)
@@ -805,6 +814,177 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 		newPOStatus = "received"
 	}
 	h.db.Exec("UPDATE purchase_orders SET status = $1, updated_at = $2 WHERE id = $3", newPOStatus, now, purchaseOrderID)
+
+	// ============================================
+	// UPDATE INVENTORY FROM GOODS RECEIPT
+	// ============================================
+
+	// Get warehouse ID from the goods receipt
+	var grWarehouseID sql.NullString
+	h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1", grID).Scan(&grWarehouseID)
+
+	// Get GR lines with product info for inventory update
+	grLinesForInventory, err := h.db.Query(`
+		SELECT grl.product_id, grl.accepted_quantity, grl.unit_price
+		FROM goods_receipt_lines grl
+		WHERE grl.goods_receipt_id = $1 AND grl.product_id IS NOT NULL AND grl.accepted_quantity > 0
+	`, grID)
+
+	if err == nil {
+		defer grLinesForInventory.Close()
+
+		for grLinesForInventory.Next() {
+			var productID uuid.UUID
+			var acceptedQty, unitPrice float64
+
+			if err := grLinesForInventory.Scan(&productID, &acceptedQty, &unitPrice); err != nil {
+				continue
+			}
+
+			// Skip if no warehouse specified
+			if !grWarehouseID.Valid || grWarehouseID.String == "" {
+				continue
+			}
+
+			warehouseID, err := uuid.Parse(grWarehouseID.String)
+			if err != nil {
+				continue
+			}
+
+			// 1. Get or create inventory record for this product+warehouse
+			var inventoryID uuid.UUID
+			err = h.db.QueryRow(`
+				SELECT id FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+			`, tenantID, productID, warehouseID).Scan(&inventoryID)
+
+			if err == sql.ErrNoRows {
+				// Create new inventory record
+				inventoryID = uuid.New()
+				h.db.Exec(`
+					INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, quantity_available, unit_cost, total_value, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, 0, 0, 0, $5, 0, $6, $6)
+				`, inventoryID, tenantID, productID, warehouseID, unitPrice, now)
+			}
+
+			// 2. Update inventory quantity
+			// Note: quantity_available and total_value are GENERATED columns - don't update them directly
+			_, err = h.db.Exec(`
+				UPDATE inventory
+				SET quantity_on_hand = quantity_on_hand + $1,
+					unit_cost = $2,
+					last_movement_date = $3,
+					updated_at = $3
+				WHERE id = $4
+			`, acceptedQty, unitPrice, now, inventoryID)
+			if err != nil {
+				h.log.Error("Failed to update inventory", "error", err, "inventory_id", inventoryID)
+			}
+
+			// 3. Create inventory transaction for audit trail
+			txID := uuid.New()
+			h.db.Exec(`
+				INSERT INTO inventory_transactions (
+					id, tenant_id, inventory_id, transaction_type, quantity,
+					unit_cost, total_cost, reference_type, reference_id,
+					reason, transaction_date, created_at
+				) VALUES ($1, $2, $3, 'receipt', $4, $5, $6, 'goods_receipt', $7, 'Goods Receipt', $8, $8)
+			`, txID, tenantID, inventoryID, acceptedQty, unitPrice, acceptedQty*unitPrice, grID, now)
+		}
+	}
+
+	// ============================================
+	// CREATE VENDOR BILL (PURCHASE INVOICE) FROM GR
+	// ============================================
+
+	// Get supplier info from GR (which has supplier_id and supplier_name)
+	var grSupplierID sql.NullString
+	var grSupplierName sql.NullString
+	err = h.db.QueryRow(`
+		SELECT supplier_id, supplier_name
+		FROM goods_receipts WHERE id = $1
+	`, grID).Scan(&grSupplierID, &grSupplierName)
+
+	if err == nil && grSupplierID.Valid {
+		// Calculate bill total from accepted GR lines
+		var billTotal float64
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(accepted_quantity * unit_price), 0)
+			FROM goods_receipt_lines WHERE goods_receipt_id = $1
+		`, grID).Scan(&billTotal)
+
+		if billTotal > 0 {
+			// Create purchase invoice (vendor bill)
+			invoiceID := uuid.New()
+			invoiceNumber := fmt.Sprintf("BILL-%s", now.Format("20060102150405"))
+			dueDate := now.AddDate(0, 0, 30) // 30 days payment term
+
+			supplierIDParsed, _ := uuid.Parse(grSupplierID.String)
+			supplierName := ""
+			if grSupplierName.Valid {
+				supplierName = grSupplierName.String
+			}
+
+			_, err = h.db.Exec(`
+				INSERT INTO purchase_invoices (
+					id, tenant_id, invoice_number, vendor_id, supplier_id, supplier_name,
+					purchase_order_id, goods_receipt_id, invoice_date, due_date,
+					subtotal, tax_amount, total_amount, status,
+					three_way_match_status, paid_amount, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'draft', 'matched', 0, $13, $13)
+			`, invoiceID, tenantID, invoiceNumber, supplierIDParsed, supplierName,
+				purchaseOrderID, grID, now, dueDate, billTotal, 0.0, billTotal, now)
+
+			if err != nil {
+				h.log.Error("Failed to create vendor bill from GR", "error", err, "gr_id", grID)
+			} else {
+				h.log.Info("Vendor bill created from GR", "invoice_id", invoiceID, "invoice_number", invoiceNumber, "amount", billTotal)
+
+				// Copy line items from GR to invoice lines
+				grInvoiceLines, err := h.db.Query(`
+					SELECT product_id, product_name, accepted_quantity, unit_price, unit
+					FROM goods_receipt_lines
+					WHERE goods_receipt_id = $1 AND accepted_quantity > 0
+				`, grID)
+
+				if err == nil {
+					defer grInvoiceLines.Close()
+					lineNumber := 1
+					for grInvoiceLines.Next() {
+						var productID sql.NullString
+						var productName sql.NullString
+						var qty, price float64
+						var unit sql.NullString
+
+						if err := grInvoiceLines.Scan(&productID, &productName, &qty, &price, &unit); err != nil {
+							continue
+						}
+
+						lineID := uuid.New()
+						description := ""
+						if productName.Valid {
+							description = productName.String
+						}
+
+						var prodID *uuid.UUID
+						if productID.Valid {
+							if parsed, err := uuid.Parse(productID.String); err == nil {
+								prodID = &parsed
+							}
+						}
+
+						h.db.Exec(`
+							INSERT INTO purchase_invoice_lines (
+								id, purchase_invoice_id, line_number, product_id, description,
+								quantity, unit_price, amount, created_at, updated_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+						`, lineID, invoiceID, lineNumber, prodID, description, qty, price, qty*price, now)
+						lineNumber++
+					}
+				}
+			}
+		}
+	}
 
 	h.GetGoodsReceipt(c)
 }
