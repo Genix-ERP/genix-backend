@@ -294,6 +294,34 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.GET("/valuation", h.GetInventoryValuation)
 	}
 
+	// Product Attributes
+	productAttributes := rg.Group("/product-attributes")
+	productAttributes.Use(middleware.RequirePermission("inventory", "product_attribute", "read"))
+	{
+		productAttributes.GET("", h.ListProductAttributes)
+		productAttributes.POST("", middleware.RequirePermission("inventory", "product_attribute", "create"), h.CreateProductAttribute)
+		productAttributes.PUT("/:id", middleware.RequirePermission("inventory", "product_attribute", "update"), h.UpdateProductAttribute)
+		productAttributes.DELETE("/:id", middleware.RequirePermission("inventory", "product_attribute", "delete"), h.DeleteProductAttribute)
+		productAttributes.POST("/:id/values", middleware.RequirePermission("inventory", "product_attribute", "update"), h.CreateAttributeValue)
+		productAttributes.DELETE("/:id/values/:valueId", middleware.RequirePermission("inventory", "product_attribute", "delete"), h.DeleteAttributeValue)
+	}
+
+	// Product Variants
+	productVariants := rg.Group("/product-variants")
+	productVariants.Use(middleware.RequirePermission("inventory", "product_variant", "read"))
+	{
+		productVariants.GET("", h.ListProductVariants)
+		productVariants.POST("", middleware.RequirePermission("inventory", "product_variant", "create"), h.CreateProductVariant)
+		productVariants.GET("/:id", h.GetProductVariant)
+		productVariants.PUT("/:id", middleware.RequirePermission("inventory", "product_variant", "update"), h.UpdateProductVariant)
+		productVariants.DELETE("/:id", middleware.RequirePermission("inventory", "product_variant", "delete"), h.DeleteProductVariant)
+		productVariants.POST("/generate", middleware.RequirePermission("inventory", "product_variant", "create"), h.GenerateProductVariants)
+	}
+
+	// Product Template Attributes (link attributes to products)
+	rg.POST("/products/:id/attributes", middleware.RequirePermission("inventory", "product", "update"), h.AddProductAttribute)
+	rg.GET("/products/:id/attributes", middleware.RequirePermission("inventory", "product", "read"), h.GetProductTemplateAttributes)
+
 	// Bill of Materials (BOM)
 	bom := rg.Group("/bom")
 	bom.Use(middleware.RequirePermission("inventory", "bom", "read"))

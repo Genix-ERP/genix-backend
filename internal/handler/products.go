@@ -59,6 +59,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.can_be_rented, false) as can_be_rented,
 			   COALESCE(p.can_be_subcontracted, false) as can_be_subcontracted,
 			   COALESCE(p.is_overhead_expense, false) as is_overhead_expense,
+			   COALESCE(p.has_variants, false) as has_variants,
 			   p.is_active, p.tags,
 			   p.created_at, p.updated_at,
 			   pc.code as category_code, pc.name as category_name
@@ -135,7 +136,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.IsPurchasable, &p.IsSellable,
 			&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 			&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
-			&p.IsOverheadExpense, &p.IsActive, &tags,
+			&p.IsOverheadExpense, &p.HasVariants, &p.IsActive, &tags,
 			&p.CreatedAt, &p.UpdatedAt,
 			&categoryCode, &categoryName,
 		)
@@ -184,6 +185,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			CanBeRented:       p.CanBeRented,
 			CanBeSubcontracted: p.CanBeSubcontracted,
 			IsOverheadExpense: p.IsOverheadExpense,
+			HasVariants:       p.HasVariants,
 			IsActive:          p.IsActive,
 			CreatedAt:         p.CreatedAt,
 			UpdatedAt:         p.UpdatedAt,
