@@ -116,6 +116,7 @@ type PayrollPeriodResponse struct {
 	ID              uuid.UUID `json:"id"`
 	PeriodCode      string    `json:"period_code"`
 	PeriodName      string    `json:"period_name"`
+	EmployeeName    string    `json:"employee_name,omitempty"` // Populated when there's only one employee
 	StartDate       string    `json:"start_date"`
 	EndDate         string    `json:"end_date"`
 	PayDate         string    `json:"pay_date"`

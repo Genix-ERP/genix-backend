@@ -584,6 +584,55 @@ func (h *Handler) ListAllSystemUsers(c *gin.Context) {
 	response.SuccessWithMeta(c, users, pagination)
 }
 
+// DeleteSystemUser soft-deletes a user (for system admin only)
+// This marks the user as deleted without removing data
+func (h *Handler) DeleteSystemUser(c *gin.Context) {
+	userID := c.Param("id")
+	if userID == "" {
+		response.BadRequest(c, "User ID is required")
+		return
+	}
+
+	parsedID, err := uuid.Parse(userID)
+	if err != nil {
+		response.BadRequest(c, "Invalid user ID format")
+		return
+	}
+
+	// Get the user's email before deletion for the response
+	var email string
+	err = h.db.QueryRow("SELECT email FROM users WHERE id = $1 AND deleted_at IS NULL", parsedID).Scan(&email)
+	if err != nil {
+		response.NotFound(c, "User not found")
+		return
+	}
+
+	// Soft delete the user (set deleted_at)
+	now := time.Now()
+	result, err := h.db.Exec(`
+		UPDATE users SET deleted_at = $1, updated_at = $1, is_active = false
+		WHERE id = $2 AND deleted_at IS NULL
+	`, now, parsedID)
+	if err != nil {
+		h.log.Error("Failed to delete user", "error", err, "user_id", parsedID)
+		response.InternalError(c, "Failed to delete user")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "User not found or already deleted")
+		return
+	}
+
+	h.log.Info("System admin deleted user", "deleted_user_id", parsedID, "email", email)
+
+	response.Success(c, map[string]interface{}{
+		"message": "User deleted successfully",
+		"email":   email,
+	})
+}
+
 // Helper functions
 func getIntParam(c *gin.Context, name string, defaultVal int) int {
 	val := c.Query(name)

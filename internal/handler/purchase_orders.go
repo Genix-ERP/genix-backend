@@ -127,7 +127,8 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 	for rows.Next() {
 		var po entity.PurchaseOrderResponse
 		var expectedDate sql.NullTime
-		var paymentTerms, vendorReference, notes sql.NullString
+		var paymentTerms sql.NullInt32
+		var vendorReference, notes sql.NullString
 		var approvedAt sql.NullTime
 
 		err := rows.Scan(
@@ -146,7 +147,8 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 			po.ExpectedDate = &expectedDate.Time
 		}
 		if paymentTerms.Valid {
-			po.PaymentTerms = &paymentTerms.String
+			pt := int(paymentTerms.Int32)
+			po.PaymentTerms = &pt
 		}
 		if vendorReference.Valid {
 			po.VendorReference = &vendorReference.String
@@ -267,9 +269,27 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	totalAmount := subtotal - discountTotal + taxTotal + input.ShippingAmount
 
 	// Prepare optional strings
-	var paymentTerms, vendorReference, notes, internalNotes *string
+	var vendorReference, notes, internalNotes *string
+	// Convert payment terms string to integer (database stores as INTEGER - days)
+	paymentTerms := 30 // default
 	if input.PaymentTerms != "" {
-		paymentTerms = &input.PaymentTerms
+		switch input.PaymentTerms {
+		case "prepaid", "due_on_receipt":
+			paymentTerms = 0
+		case "net_15":
+			paymentTerms = 15
+		case "net_30", "Net 30":
+			paymentTerms = 30
+		case "net_60", "Net 60":
+			paymentTerms = 60
+		case "net_90", "Net 90":
+			paymentTerms = 90
+		default:
+			// Try to parse as integer
+			if val, err := strconv.Atoi(input.PaymentTerms); err == nil {
+				paymentTerms = val
+			}
+		}
 	}
 	if input.VendorReference != "" {
 		vendorReference = &input.VendorReference
@@ -416,7 +436,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		TotalAmount:     totalAmount,
 		Status:          entity.POStatusDraft,
 		PaymentStatus:   entity.PaymentStatusUnpaid,
-		PaymentTerms:    paymentTerms,
+		PaymentTerms:    &paymentTerms,
 		VendorReference: vendorReference,
 		Notes:           notes,
 		Lines:           lines,
@@ -456,7 +476,8 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	var po entity.PurchaseOrderResponse
 	var expectedDate, approvedAt sql.NullTime
 	var contactPersonID sql.NullString
-	var paymentTerms, vendorReference, notes sql.NullString
+	var paymentTerms sql.NullInt32
+	var vendorReference, notes sql.NullString
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&po.ID, &po.OrderNumber, &po.VendorID, &po.VendorName,
@@ -485,7 +506,8 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 		}
 	}
 	if paymentTerms.Valid {
-		po.PaymentTerms = &paymentTerms.String
+		pt := int(paymentTerms.Int32)
+		po.PaymentTerms = &pt
 	}
 	if vendorReference.Valid {
 		po.VendorReference = &vendorReference.String
@@ -596,12 +618,6 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		return
 	}
 
-	// Only allow editing draft orders
-	if currentStatus != string(entity.POStatusDraft) {
-		response.BadRequest(c, "Only draft orders can be edited")
-		return
-	}
-
 	var input entity.UpdatePurchaseOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid input: "+err.Error())
@@ -628,9 +644,28 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		}
 	}
 	if input.PaymentTerms != nil {
+		// Convert payment terms string to integer (database stores as INTEGER - days)
+		paymentTerms := 30 // default
+		switch *input.PaymentTerms {
+		case "prepaid", "due_on_receipt":
+			paymentTerms = 0
+		case "net_15":
+			paymentTerms = 15
+		case "net_30", "Net 30":
+			paymentTerms = 30
+		case "net_60", "Net 60":
+			paymentTerms = 60
+		case "net_90", "Net 90":
+			paymentTerms = 90
+		default:
+			// Try to parse as integer
+			if val, err := strconv.Atoi(*input.PaymentTerms); err == nil {
+				paymentTerms = val
+			}
+		}
 		argCount++
 		updates = append(updates, fmt.Sprintf("payment_terms = $%d", argCount))
-		args = append(args, *input.PaymentTerms)
+		args = append(args, paymentTerms)
 	}
 	if input.VendorReference != nil {
 		argCount++
@@ -651,6 +686,11 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("shipping_amount = $%d", argCount))
 		args = append(args, *input.ShippingAmount)
+	}
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
 	}
 
 	if len(updates) == 0 && len(input.Lines) == 0 {

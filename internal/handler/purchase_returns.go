@@ -776,6 +776,7 @@ func (h *Handler) RejectPurchaseReturn(c *gin.Context) {
 }
 
 // ShipPurchaseReturn marks a return as shipped
+// This also DECREASES inventory (products leave warehouse to go back to supplier)
 func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -814,16 +815,176 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 		}
 	}
 
+	now := time.Now()
+
+	// Get return lines for inventory update
+	linesQuery := `
+		SELECT product_id, return_quantity, unit_price
+		FROM purchase_return_lines
+		WHERE return_id = $1`
+
+	rows, err := h.db.Query(linesQuery, returnID)
+	if err != nil {
+		h.log.Error("Failed to get purchase return lines", "error", err)
+	} else {
+		defer rows.Close()
+
+		for rows.Next() {
+			var productID sql.NullString
+			var returnQty, unitPrice float64
+
+			if err := rows.Scan(&productID, &returnQty, &unitPrice); err != nil {
+				continue
+			}
+
+			if !productID.Valid || returnQty <= 0 {
+				continue
+			}
+
+			pid, err := uuid.Parse(productID.String)
+			if err != nil {
+				continue
+			}
+
+			// Find inventory record for this product
+			var inventoryID uuid.UUID
+			var currentQty float64
+
+			err = h.db.QueryRow(`
+				SELECT id, quantity_on_hand FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2
+				LIMIT 1`,
+				tenantID, pid,
+			).Scan(&inventoryID, &currentQty)
+
+			if err == sql.ErrNoRows {
+				// No inventory record - can't decrease what doesn't exist
+				h.log.Warn("No inventory record found for purchase return item", "product_id", pid)
+				continue
+			} else if err != nil {
+				h.log.Error("Failed to get inventory for purchase return", "error", err)
+				continue
+			}
+
+			// Check if we have enough stock
+			if currentQty < returnQty {
+				h.log.Warn("Insufficient stock for purchase return", "product_id", pid, "current", currentQty, "return_qty", returnQty)
+				// Continue anyway - in practice returns should not be approved without stock
+			}
+
+			// Update inventory - DECREASE quantity (sending back to supplier)
+			// Note: quantity_available is a generated column, only update quantity_on_hand
+			_, err = h.db.Exec(`
+				UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, updated_at = $2
+				WHERE id = $3`,
+				returnQty, now, inventoryID,
+			)
+			if err != nil {
+				h.log.Error("Failed to update inventory for purchase return", "error", err, "inventory_id", inventoryID)
+				continue
+			}
+
+			// Create inventory transaction for audit trail
+			txID := uuid.New()
+			h.db.Exec(`
+				INSERT INTO inventory_transactions (
+					id, tenant_id, inventory_id, transaction_type, quantity,
+					unit_cost, total_cost, reference_type, reference_id,
+					reason, transaction_date, created_at
+				) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'purchase_return', $7, 'Purchase Return - Return to Supplier', $8, $8)
+			`, txID, tenantID, inventoryID, -returnQty, unitPrice, returnQty*unitPrice, returnID, now)
+		}
+	}
+
+	// Get return details for debit note
+	var returnNumber, supplierName string
+	var supplierID uuid.UUID
+	var totalValue float64
+	h.db.QueryRow(`
+		SELECT return_number, supplier_id, supplier_name, total_value
+		FROM purchase_returns WHERE id = $1 AND tenant_id = $2`,
+		returnID, tenantID,
+	).Scan(&returnNumber, &supplierID, &supplierName, &totalValue)
+
+	// Update return status
 	_, err = h.db.Exec(`
 		UPDATE purchase_returns
 		SET status = $1, shipping_method = $2, tracking_number = $3, shipped_date = $4, updated_at = $5
 		WHERE id = $6 AND tenant_id = $7`,
-		ReturnStatusShipped, input.ShippingMethod, input.TrackingNumber, shippedDate, time.Now(), returnID, tenantID,
+		ReturnStatusShipped, input.ShippingMethod, input.TrackingNumber, shippedDate, now, returnID, tenantID,
 	)
 	if err != nil {
 		response.InternalError(c, "Failed to ship purchase return")
 		return
 	}
+
+	// =====================================================
+	// CREATE DEBIT NOTE (Journal Entry) - Reduces AP
+	// When we return goods to supplier:
+	// Debit: Accounts Payable (reduce what we owe supplier)
+	// Credit: Inventory or Purchase Expense (reduce inventory value)
+	// =====================================================
+
+	// Get accounts
+	var apAccountID, inventoryAccountID uuid.UUID
+	h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2000' AND deleted_at IS NULL", tenantID).Scan(&apAccountID)
+	if apAccountID == uuid.Nil {
+		// Try alternative AP code
+		h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND name ILIKE '%payable%' AND deleted_at IS NULL LIMIT 1", tenantID).Scan(&apAccountID)
+	}
+	h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1200' AND deleted_at IS NULL", tenantID).Scan(&inventoryAccountID)
+
+	// Get journal (use GENERAL or PURCHASE journal)
+	var journalID uuid.UUID
+	h.db.QueryRow("SELECT id FROM journals WHERE tenant_id = $1 AND (code = 'PURCHASE' OR code = 'GENERAL') AND deleted_at IS NULL LIMIT 1", tenantID).Scan(&journalID)
+
+	if apAccountID != uuid.Nil && inventoryAccountID != uuid.Nil && journalID != uuid.Nil && totalValue > 0 {
+		// Generate entry number
+		entryNumber := fmt.Sprintf("DN-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
+
+		// Create journal entry (Debit Note)
+		entryID := uuid.New()
+		_, err = h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, total_debit, total_credit, status, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'posted', $12, $13)`,
+			entryID, tenantID, journalID, entryNumber, now, returnNumber,
+			fmt.Sprintf("Debit Note for Purchase Return %s - %s", returnNumber, supplierName),
+			"purchase_return", returnID, totalValue, totalValue, now, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create debit note journal entry", "error", err)
+		} else {
+			// Line 1: Debit Accounts Payable (reduce what we owe)
+			line1ID := uuid.New()
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, account_id, contact_id, description, debit_amount, credit_amount, line_number, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				line1ID, entryID, apAccountID, supplierID, "Purchase Return - AP Reduction", totalValue, 0, 1, now,
+			)
+
+			// Line 2: Credit Inventory (reduce inventory value)
+			line2ID := uuid.New()
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				line2ID, entryID, inventoryAccountID, "Purchase Return - Inventory Reduction", 0, totalValue, 2, now,
+			)
+
+			// Update account balances
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, apAccountID)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, inventoryAccountID)
+
+			h.log.Info("Debit Note created for purchase return", "return_id", returnID, "entry_number", entryNumber, "amount", totalValue)
+		}
+	} else {
+		h.log.Warn("Could not create debit note - missing accounts or journal", "ap_account", apAccountID, "inventory_account", inventoryAccountID, "journal", journalID)
+	}
+
+	h.log.Info("Purchase return shipped with inventory update", "return_id", returnID)
 
 	h.GetPurchaseReturn(c)
 }
