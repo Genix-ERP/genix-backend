@@ -132,9 +132,16 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 
 // CreateOrganization creates a new organization
 func (h *Handler) CreateOrganization(c *gin.Context) {
-	tenantID, exists := c.Get(middleware.ContextKeyTenantID)
+	tenantIDStr, exists := c.Get(middleware.ContextKeyTenantID)
 	if !exists {
 		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Parse tenant ID - it comes as string from middleware
+	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	if err != nil {
+		response.BadRequest(c, "Invalid tenant ID")
 		return
 	}
 
@@ -146,7 +153,7 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 
 	// Check for duplicate code within tenant
 	var existingCount int
-	err := h.db.QueryRow(
+	err = h.db.QueryRow(
 		"SELECT COUNT(*) FROM organizations WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL",
 		tenantID, input.Code,
 	).Scan(&existingCount)
@@ -232,13 +239,13 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 	}
 
 	// Create default Chart of Accounts for the new organization
-	if err := h.createDefaultChartOfAccounts(tenantID.(uuid.UUID), orgID); err != nil {
+	if err := h.createDefaultChartOfAccounts(tenantID, orgID); err != nil {
 		h.log.Error("Failed to create default chart of accounts", "error", err, "org_id", orgID)
 		// Don't fail the organization creation, just log the error
 	}
 
 	// Create default Journals for the new organization
-	if err := h.createDefaultJournals(tenantID.(uuid.UUID), orgID); err != nil {
+	if err := h.createDefaultJournals(tenantID, orgID); err != nil {
 		h.log.Error("Failed to create default journals", "error", err, "org_id", orgID)
 		// Don't fail the organization creation, just log the error
 	}
@@ -512,9 +519,16 @@ func (h *Handler) DeleteOrganization(c *gin.Context) {
 // InitializeOrganizationAccounts creates default chart of accounts and journals for an existing organization
 // POST /api/v1/organizations/:id/initialize-accounts
 func (h *Handler) InitializeOrganizationAccounts(c *gin.Context) {
-	tenantID, exists := c.Get(middleware.ContextKeyTenantID)
+	tenantIDStr, exists := c.Get(middleware.ContextKeyTenantID)
 	if !exists {
 		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Parse tenant ID - it comes as string from middleware
+	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	if err != nil {
+		response.BadRequest(c, "Invalid tenant ID")
 		return
 	}
 
@@ -553,14 +567,14 @@ func (h *Handler) InitializeOrganizationAccounts(c *gin.Context) {
 	}
 
 	// Create default Chart of Accounts
-	if err := h.createDefaultChartOfAccounts(tenantID.(uuid.UUID), orgID); err != nil {
+	if err := h.createDefaultChartOfAccounts(tenantID, orgID); err != nil {
 		h.log.Error("Failed to create default chart of accounts", "error", err, "org_id", orgID)
 		response.InternalServerError(c, "Failed to create chart of accounts")
 		return
 	}
 
 	// Create default Journals
-	if err := h.createDefaultJournals(tenantID.(uuid.UUID), orgID); err != nil {
+	if err := h.createDefaultJournals(tenantID, orgID); err != nil {
 		h.log.Error("Failed to create default journals", "error", err, "org_id", orgID)
 		response.InternalServerError(c, "Failed to create journals")
 		return
