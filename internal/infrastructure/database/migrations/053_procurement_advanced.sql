@@ -188,14 +188,20 @@ CREATE TABLE IF NOT EXISTS purchase_return_lines (
 
 CREATE INDEX IF NOT EXISTS idx_return_lines_return ON purchase_return_lines(return_id);
 
--- Add triggers for updated_at
-CREATE OR REPLACE FUNCTION update_procurement_advanced_timestamp()
-RETURNS TRIGGER AS $$
+-- Add triggers for updated_at (only create function if it doesn't exist)
+DO $$
 BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+    IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'update_procurement_advanced_timestamp') THEN
+        CREATE FUNCTION update_procurement_advanced_timestamp()
+        RETURNS TRIGGER AS $func$
+        BEGIN
+            NEW.updated_at = CURRENT_TIMESTAMP;
+            RETURN NEW;
+        END;
+        $func$ LANGUAGE plpgsql;
+    END IF;
+END
+$$;
 
 DROP TRIGGER IF EXISTS tr_pr_updated ON purchase_requisitions;
 CREATE TRIGGER tr_pr_updated BEFORE UPDATE ON purchase_requisitions

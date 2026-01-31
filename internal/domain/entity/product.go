@@ -100,6 +100,7 @@ type Product struct {
 	CanBeRented        bool            `json:"can_be_rented" db:"can_be_rented"`
 	CanBeSubcontracted bool            `json:"can_be_subcontracted" db:"can_be_subcontracted"`
 	IsOverheadExpense  bool            `json:"is_overhead_expense" db:"is_overhead_expense"`
+	HasVariants        bool            `json:"has_variants" db:"has_variants"`
 	IsActive           bool            `json:"is_active" db:"is_active"`
 	CreatedBy          *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
@@ -215,6 +216,7 @@ type ProductResponse struct {
 	CanBeRented        bool      `json:"can_be_rented"`
 	CanBeSubcontracted bool      `json:"can_be_subcontracted"`
 	IsOverheadExpense  bool      `json:"is_overhead_expense"`
+	HasVariants        bool      `json:"has_variants"`
 	IsActive           bool      `json:"is_active"`
 	Tags               []string  `json:"tags"`
 	CreatedAt          time.Time `json:"created_at"`
