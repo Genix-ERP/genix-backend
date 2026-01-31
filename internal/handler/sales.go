@@ -227,6 +227,8 @@ type SimpleSalesOrderInput struct {
 	CurrencyID      string                              `json:"currency_id,omitempty"`
 	DiscountType    string                              `json:"discount_type,omitempty"`
 	DiscountValue   float64                             `json:"discount_value,omitempty"`
+	DiscountAmount  float64                             `json:"discount_amount,omitempty"`
+	DiscountCode    string                              `json:"discount_code,omitempty"`
 	ShippingAmount  float64                             `json:"shipping_amount,omitempty"`
 	ShippingCost    float64                             `json:"shipping_cost,omitempty"`
 	PaymentTerms    int                                 `json:"payment_terms,omitempty"`
@@ -349,20 +351,28 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			}
 			subtotal += lineTotal - lineDiscount
 		}
-		// Apply order-level discount
-		if input.DiscountType == "percentage" && input.DiscountValue > 0 {
+		// Apply order-level discount - prefer frontend's calculated discount_amount
+		if input.DiscountAmount > 0 {
+			discountAmount = input.DiscountAmount
+		} else if input.DiscountType == "percentage" && input.DiscountValue > 0 {
 			discountAmount = subtotal * input.DiscountValue / 100
 		} else if input.DiscountType == "fixed" && input.DiscountValue > 0 {
 			discountAmount = input.DiscountValue
 		}
-		totalAmount = subtotal - discountAmount + taxAmount + shippingAmount
+		// Use frontend's total if provided, otherwise calculate
+		if input.TotalAmount > 0 {
+			totalAmount = input.TotalAmount
+		} else {
+			totalAmount = subtotal - discountAmount + taxAmount + shippingAmount
+		}
 	} else {
 		// Use provided totals from frontend
 		subtotal = input.Subtotal
 		taxAmount = input.TaxAmount
+		discountAmount = input.DiscountAmount // Use discount amount from frontend
 		totalAmount = input.TotalAmount
 		if totalAmount == 0 {
-			totalAmount = subtotal + taxAmount + shippingAmount
+			totalAmount = subtotal + taxAmount + shippingAmount - discountAmount
 		}
 	}
 
@@ -417,16 +427,22 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		INSERT INTO sales_orders (
 			id, tenant_id, order_number, customer_id, contact_person_id,
 			order_date, expected_date, billing_address, shipping_address,
-			currency_id, exchange_rate, subtotal, discount_type, discount_value, discount_amount,
+			currency_id, exchange_rate, subtotal, discount_type, discount_value, discount_amount, discount_code,
 			tax_amount, shipping_amount, total_amount, status, payment_status, payment_terms,
 			reference, po_number, notes, internal_notes, warehouse_id, carrier, sales_rep_id,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)`
+
+	// Handle discount code - use nil for empty string
+	var discountCode *string
+	if input.DiscountCode != "" {
+		discountCode = &input.DiscountCode
+	}
 
 	_, err = h.db.Exec(query,
 		orderID, tenantID, orderNumber, customerID, contactPersonID,
 		orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
-		currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount,
+		currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
 		taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
 		input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, salesRepID,
 		createdBy, now, now,
@@ -502,6 +518,7 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		"discount_type":   input.DiscountType,
 		"discount_value":  input.DiscountValue,
 		"discount_amount": discountAmount,
+		"discount_code":   input.DiscountCode,
 		"tax_amount":      taxAmount,
 		"shipping_amount": shippingAmount,
 		"shipping_cost":   shippingAmount, // Alias for frontend
