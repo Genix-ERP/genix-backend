@@ -85,6 +85,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	search := c.Query("search")
 	category := c.Query("category")
 	accountTypeID := c.Query("account_type_id")
+	organizationID := c.Query("organization_id")
 	includeInactive := c.Query("include_inactive") == "true"
 	_ = c.Query("flat") // Reserved for future hierarchical view
 
@@ -105,6 +106,17 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization_id if provided
+	if organizationID != "" {
+		orgID, err := uuid.Parse(organizationID)
+		if err == nil {
+			argCount++
+			baseQuery += fmt.Sprintf(" AND a.organization_id = $%d", argCount)
+			countQuery += fmt.Sprintf(" AND a.organization_id = $%d", argCount)
+			args = append(args, orgID)
+		}
+	}
 
 	if !includeInactive {
 		baseQuery += " AND a.is_active = true"
