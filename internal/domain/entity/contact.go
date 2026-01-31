@@ -94,31 +94,33 @@ type CreateContactInput struct {
 	PaymentTerms       int         `json:"payment_terms,omitempty"`
 	CreditLimit        float64     `json:"credit_limit,omitempty"`
 	CurrencyID         string      `json:"currency_id,omitempty"`
-	TaxExempt          bool        `json:"tax_exempt,omitempty"`
-	Tags               []string    `json:"tags,omitempty"`
-	Notes              string      `json:"notes,omitempty"`
+	TaxExempt          bool                   `json:"tax_exempt,omitempty"`
+	Tags               []string               `json:"tags,omitempty"`
+	Notes              string                 `json:"notes,omitempty"`
+	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
 	ContactPersons     []CreateContactPersonInput `json:"contact_persons,omitempty"`
 }
 
 // UpdateContactInput represents input for updating a contact
 type UpdateContactInput struct {
-	Name               *string   `json:"name,omitempty"`
-	LegalName          *string   `json:"legal_name,omitempty"`
-	TaxID              *string   `json:"tax_id,omitempty"`
-	RegistrationNumber *string   `json:"registration_number,omitempty"`
-	Industry           *string   `json:"industry,omitempty"`
-	Website            *string   `json:"website,omitempty"`
-	Email              *string   `json:"email,omitempty"`
-	Phone              *string   `json:"phone,omitempty"`
-	Fax                *string   `json:"fax,omitempty"`
-	BillingAddress     *Address  `json:"billing_address,omitempty"`
-	ShippingAddress    *Address  `json:"shipping_address,omitempty"`
-	PaymentTerms       *int      `json:"payment_terms,omitempty"`
-	CreditLimit        *float64  `json:"credit_limit,omitempty"`
-	TaxExempt          *bool     `json:"tax_exempt,omitempty"`
-	Tags               []string  `json:"tags,omitempty"`
-	Notes              *string   `json:"notes,omitempty"`
-	IsActive           *bool     `json:"is_active,omitempty"`
+	Name               *string                `json:"name,omitempty"`
+	LegalName          *string                `json:"legal_name,omitempty"`
+	TaxID              *string                `json:"tax_id,omitempty"`
+	RegistrationNumber *string                `json:"registration_number,omitempty"`
+	Industry           *string                `json:"industry,omitempty"`
+	Website            *string                `json:"website,omitempty"`
+	Email              *string                `json:"email,omitempty"`
+	Phone              *string                `json:"phone,omitempty"`
+	Fax                *string                `json:"fax,omitempty"`
+	BillingAddress     *Address               `json:"billing_address,omitempty"`
+	ShippingAddress    *Address               `json:"shipping_address,omitempty"`
+	PaymentTerms       *int                   `json:"payment_terms,omitempty"`
+	CreditLimit        *float64               `json:"credit_limit,omitempty"`
+	TaxExempt          *bool                  `json:"tax_exempt,omitempty"`
+	Tags               []string               `json:"tags,omitempty"`
+	Notes              *string                `json:"notes,omitempty"`
+	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
+	IsActive           *bool                  `json:"is_active,omitempty"`
 }
 
 // CreateContactPersonInput represents input for creating a contact person
@@ -147,23 +149,25 @@ type ContactListFilter struct {
 
 // ContactResponse represents the API response for a contact
 type ContactResponse struct {
-	ID                 uuid.UUID       `json:"id"`
-	Type               ContactType     `json:"type"`
-	Code               string          `json:"code"`
-	Name               string          `json:"name"`
-	LegalName          *string         `json:"legal_name,omitempty"`
-	TaxID              *string         `json:"tax_id,omitempty"`
-	Email              *string         `json:"email,omitempty"`
-	Phone              *string         `json:"phone,omitempty"`
-	BillingAddress     *Address        `json:"billing_address,omitempty"`
-	ShippingAddress    *Address        `json:"shipping_address,omitempty"`
-	PaymentTerms       int             `json:"payment_terms"`
-	CreditLimit        float64         `json:"credit_limit"`
-	CurrentBalance     float64         `json:"current_balance"`
-	TaxExempt          bool            `json:"tax_exempt"`
-	Tags               []string        `json:"tags"`
-	IsActive           bool            `json:"is_active"`
-	ContactPersons     []ContactPerson `json:"contact_persons,omitempty"`
-	CreatedAt          time.Time       `json:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at"`
+	ID                 uuid.UUID              `json:"id"`
+	Type               ContactType            `json:"type"`
+	Code               string                 `json:"code"`
+	Name               string                 `json:"name"`
+	LegalName          *string                `json:"legal_name,omitempty"`
+	TaxID              *string                `json:"tax_id,omitempty"`
+	Industry           *string                `json:"industry,omitempty"`
+	Email              *string                `json:"email,omitempty"`
+	Phone              *string                `json:"phone,omitempty"`
+	BillingAddress     *Address               `json:"billing_address,omitempty"`
+	ShippingAddress    *Address               `json:"shipping_address,omitempty"`
+	PaymentTerms       int                    `json:"payment_terms"`
+	CreditLimit        float64                `json:"credit_limit"`
+	CurrentBalance     float64                `json:"current_balance"`
+	TaxExempt          bool                   `json:"tax_exempt"`
+	Tags               []string               `json:"tags"`
+	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
+	IsActive           bool                   `json:"is_active"`
+	ContactPersons     []ContactPerson        `json:"contact_persons,omitempty"`
+	CreatedAt          time.Time              `json:"created_at"`
+	UpdatedAt          time.Time              `json:"updated_at"`
 }

@@ -175,6 +175,19 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			json.Unmarshal(tags, &resp.Tags)
 		}
 
+		// Parse custom_fields
+		if len(customFields) > 0 {
+			var cf map[string]interface{}
+			if json.Unmarshal(customFields, &cf) == nil {
+				resp.CustomFields = cf
+			}
+		}
+
+		// Set industry
+		if industry.Valid {
+			resp.Industry = &industry.String
+		}
+
 		contacts = append(contacts, resp)
 	}
 
@@ -264,6 +277,14 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		tags = []byte("[]")
 	}
 
+	// Marshal custom_fields
+	var customFields []byte
+	if input.CustomFields != nil && len(input.CustomFields) > 0 {
+		customFields, _ = json.Marshal(input.CustomFields)
+	} else {
+		customFields = []byte("{}")
+	}
+
 	query := `
 		INSERT INTO contacts (
 			id, tenant_id, type, code, name, legal_name, tax_id,
@@ -279,7 +300,7 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		id, tenantID, input.Type, input.Code, input.Name, legalName, taxID,
 		regNum, industry, website, email, phone, fax,
 		billingAddr, shippingAddr, input.PaymentTerms, input.CreditLimit,
-		0, input.TaxExempt, tags, notes, []byte("{}"),
+		0, input.TaxExempt, tags, notes, customFields,
 		true, userID, now, now,
 	).Scan(&id)
 
@@ -410,6 +431,19 @@ func (h *Handler) GetContact(c *gin.Context) {
 		json.Unmarshal(tags, &resp.Tags)
 	}
 
+	// Parse custom_fields
+	if len(customFields) > 0 {
+		var cf map[string]interface{}
+		if json.Unmarshal(customFields, &cf) == nil {
+			resp.CustomFields = cf
+		}
+	}
+
+	// Set industry
+	if industry.Valid {
+		resp.Industry = &industry.String
+	}
+
 	response.Success(c, resp)
 }
 
@@ -526,6 +560,12 @@ func (h *Handler) UpdateContact(c *gin.Context) {
 		tags, _ := json.Marshal(input.Tags)
 		updates = append(updates, fmt.Sprintf("tags = $%d", argCount))
 		args = append(args, tags)
+	}
+	if input.CustomFields != nil && len(input.CustomFields) > 0 {
+		argCount++
+		customFields, _ := json.Marshal(input.CustomFields)
+		updates = append(updates, fmt.Sprintf("custom_fields = $%d", argCount))
+		args = append(args, customFields)
 	}
 
 	if len(updates) == 0 {
