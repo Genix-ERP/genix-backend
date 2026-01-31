@@ -35,10 +35,16 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 	status := c.Query("status")
 
 	baseQuery := `
-		SELECT id, tenant_id, period_code, period_name, start_date, end_date, pay_date,
-			   status, total_gross, total_deductions, total_net, employee_count, notes, created_at
-		FROM payroll_periods
-		WHERE tenant_id = $1 AND deleted_at IS NULL
+		SELECT pp.id, pp.tenant_id, pp.period_code, pp.period_name, pp.start_date, pp.end_date, pp.pay_date,
+			   pp.status,
+			   COALESCE((SELECT SUM(pe.gross_salary) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.total_gross) as total_gross,
+			   COALESCE((SELECT SUM(pe.total_deductions) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.total_deductions) as total_deductions,
+			   COALESCE((SELECT SUM(pe.net_salary) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.total_net) as total_net,
+			   COALESCE((SELECT COUNT(*) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.employee_count) as employee_count,
+			   pp.notes, pp.created_at,
+			   (SELECT pe.employee_name FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_name
+		FROM payroll_periods pp
+		WHERE pp.tenant_id = $1 AND pp.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM payroll_periods WHERE tenant_id = $1 AND deleted_at IS NULL`
 
@@ -47,12 +53,12 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 
 	if status != "" && status != "all" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND status = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND pp.status = $%d", argCount)
 		countQuery += fmt.Sprintf(" AND status = $%d", argCount)
 		args = append(args, status)
 	}
 
-	baseQuery += " ORDER BY start_date DESC"
+	baseQuery += " ORDER BY pp.start_date DESC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	var total int
@@ -73,13 +79,13 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 	periods := make([]*entity.PayrollPeriodResponse, 0)
 	for rows.Next() {
 		var period entity.PayrollPeriod
-		var notes sql.NullString
+		var notes, firstEmployeeName sql.NullString
 
 		if err := rows.Scan(
 			&period.ID, &period.TenantID, &period.PeriodCode, &period.PeriodName,
 			&period.StartDate, &period.EndDate, &period.PayDate, &period.Status,
 			&period.TotalGross, &period.TotalDeductions, &period.TotalNet,
-			&period.EmployeeCount, &notes, &period.CreatedAt,
+			&period.EmployeeCount, &notes, &period.CreatedAt, &firstEmployeeName,
 		); err != nil {
 			h.log.Error("Failed to scan payroll period", "error", err)
 			continue
@@ -89,7 +95,12 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 			period.Notes = &notes.String
 		}
 
-		periods = append(periods, period.ToResponse())
+		resp := period.ToResponse()
+		// If there's only one employee, include their name
+		if firstEmployeeName.Valid && period.EmployeeCount == 1 {
+			resp.EmployeeName = firstEmployeeName.String
+		}
+		periods = append(periods, resp)
 	}
 
 	pagination := entity.NewPagination(page, limit)

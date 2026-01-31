@@ -409,6 +409,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		salesReturns.POST("/:id/refund", middleware.RequirePermission("sales", "return", "update"), h.ProcessRefund)
 	}
 
+	// Discounts
+	discounts := rg.Group("/discounts")
+	discounts.Use(middleware.RequirePermission("sales", "discount", "read"))
+	{
+		discounts.GET("", h.ListDiscounts)
+		discounts.POST("", middleware.RequirePermission("sales", "discount", "create"), h.CreateDiscount)
+		discounts.GET("/:id", h.GetDiscount)
+		discounts.PUT("/:id", middleware.RequirePermission("sales", "discount", "update"), h.UpdateDiscount)
+		discounts.DELETE("/:id", middleware.RequirePermission("sales", "discount", "delete"), h.DeleteDiscount)
+		discounts.POST("/validate", h.ValidateDiscountCode)
+		discounts.POST("/:id/use", h.UseDiscountCode)
+	}
+
 	// Purchase Orders
 	purchaseOrders := rg.Group("/purchase-orders")
 	purchaseOrders.Use(middleware.RequirePermission("purchase", "order", "read"))
@@ -799,6 +812,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	admin.Use(middleware.RequireSystemAdmin())
 	{
 		admin.GET("/users", h.ListAllSystemUsers)
+		admin.DELETE("/users/:id", h.DeleteSystemUser)
 	}
 
 	// Audit Logs
