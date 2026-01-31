@@ -78,6 +78,7 @@ type CreateExpenseInput struct {
 // UpdateExpenseInput represents input for updating an expense
 type UpdateExpenseInput struct {
 	CategoryID    *string  `json:"category_id,omitempty"`
+	CategoryName  *string  `json:"category,omitempty"`
 	EmployeeID    *string  `json:"employee_id,omitempty"`
 	EmployeeName  *string  `json:"employee_name,omitempty"`
 	VendorID      *string  `json:"vendor_id,omitempty"`

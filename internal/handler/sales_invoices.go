@@ -34,76 +34,78 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	// Build query with filters
+	// Build query with filters - join with contacts for customer_name
 	baseQuery := `
-		SELECT id, tenant_id, organization_id, invoice_number, customer_id, sales_order_id,
-			   invoice_date, due_date, billing_address, shipping_address,
-			   currency_id, exchange_rate, subtotal, discount_amount,
-			   tax_amount, total_amount, amount_paid, amount_due, status,
-			   reference, po_number, notes, terms_conditions,
-			   journal_entry_id, sent_at, viewed_at, created_by, created_at, updated_at
-		FROM sales_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL`
-	countQuery := `SELECT COUNT(*) FROM sales_invoices WHERE tenant_id = $1 AND deleted_at IS NULL`
+		SELECT si.id, si.tenant_id, si.organization_id, si.invoice_number, si.customer_id, si.sales_order_id,
+			   si.invoice_date, si.due_date, si.billing_address, si.shipping_address,
+			   si.currency_id, si.exchange_rate, si.subtotal, si.discount_amount,
+			   si.tax_amount, si.total_amount, si.amount_paid, si.amount_due, si.status,
+			   si.reference, si.po_number, si.notes, si.terms_conditions,
+			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
+			   COALESCE(c.name, si.customer_name, '') as customer_name
+		FROM sales_invoices si
+		LEFT JOIN contacts c ON si.customer_id = c.id
+		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM sales_invoices si WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
 	args := []interface{}{tenantID}
 	argCount := 1
 
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND status = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND si.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND si.status = $%d", argCount)
 		args = append(args, status)
 	}
 
 	// Filter by customer_id
 	if customerID := c.Query("customer_id"); customerID != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND customer_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND customer_id = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND si.customer_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND si.customer_id = $%d", argCount)
 		args = append(args, customerID)
 	}
 
 	// Filter by date range
 	if dateFrom := c.Query("date_from"); dateFrom != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND invoice_date >= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND invoice_date >= $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND si.invoice_date >= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND si.invoice_date >= $%d", argCount)
 		args = append(args, dateFrom)
 	}
 	if dateTo := c.Query("date_to"); dateTo != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND invoice_date <= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND invoice_date <= $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND si.invoice_date <= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND si.invoice_date <= $%d", argCount)
 		args = append(args, dateTo)
 	}
 
 	// Filter by due date range
 	if dueFrom := c.Query("due_from"); dueFrom != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND due_date >= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND due_date >= $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND si.due_date >= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND si.due_date >= $%d", argCount)
 		args = append(args, dueFrom)
 	}
 	if dueTo := c.Query("due_to"); dueTo != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND due_date <= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND due_date <= $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND si.due_date <= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND si.due_date <= $%d", argCount)
 		args = append(args, dueTo)
 	}
 
 	// Filter overdue invoices
 	if overdue := c.Query("overdue"); overdue == "true" {
-		baseQuery += " AND due_date < CURRENT_DATE AND status NOT IN ('paid', 'cancelled')"
-		countQuery += " AND due_date < CURRENT_DATE AND status NOT IN ('paid', 'cancelled')"
+		baseQuery += " AND si.due_date < CURRENT_DATE AND si.status NOT IN ('paid', 'cancelled')"
+		countQuery += " AND si.due_date < CURRENT_DATE AND si.status NOT IN ('paid', 'cancelled')"
 	}
 
-	// Search
+	// Search - also search by customer name
 	if search := c.Query("search"); search != "" {
 		argCount++
 		searchPattern := "%" + strings.ToLower(search) + "%"
-		baseQuery += fmt.Sprintf(" AND (LOWER(invoice_number) LIKE $%d OR LOWER(reference) LIKE $%d OR LOWER(po_number) LIKE $%d)", argCount, argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (LOWER(invoice_number) LIKE $%d OR LOWER(reference) LIKE $%d OR LOWER(po_number) LIKE $%d)", argCount, argCount, argCount)
+		baseQuery += fmt.Sprintf(" AND (LOWER(si.invoice_number) LIKE $%d OR LOWER(si.reference) LIKE $%d OR LOWER(si.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d)", argCount, argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(si.invoice_number) LIKE $%d OR LOWER(si.reference) LIKE $%d OR LOWER(si.po_number) LIKE $%d)", argCount, argCount, argCount)
 		args = append(args, searchPattern)
 	}
 
@@ -116,7 +118,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 	}
 
 	// Add sorting and pagination
-	baseQuery += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	baseQuery += fmt.Sprintf(" ORDER BY si.created_at DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
 	args = append(args, pageSize, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
@@ -137,6 +139,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		var exchangeRate, subtotal, discountAmount, taxAmount, totalAmount, amountPaid, amountDue float64
 		var reference, poNumber, notes, termsConditions sql.NullString
 		var createdAt, updatedAt time.Time
+		var customerName string
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -145,9 +148,18 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			&taxAmount, &totalAmount, &amountPaid, &amountDue, &status,
 			&reference, &poNumber, &notes, &termsConditions,
 			&journalEntryID, &sentAt, &viewedAt, &createdBy, &createdAt, &updatedAt,
+			&customerName,
 		)
 		if err != nil {
 			continue
+		}
+
+		// Determine payment status based on amounts
+		paymentStatus := "unpaid"
+		if amountPaid >= totalAmount && totalAmount > 0 {
+			paymentStatus = "paid"
+		} else if amountPaid > 0 {
+			paymentStatus = "partial"
 		}
 
 		invoice := map[string]interface{}{
@@ -155,6 +167,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			"tenant_id":       tenantIDScan.String(),
 			"invoice_number":  invoiceNumber,
 			"customer_id":     customerID.String(),
+			"customer_name":   customerName,
 			"invoice_date":    invoiceDate.Format("2006-01-02"),
 			"due_date":        dueDate.Format("2006-01-02"),
 			"exchange_rate":   exchangeRate,
@@ -164,7 +177,9 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			"total_amount":    totalAmount,
 			"amount_paid":     amountPaid,
 			"amount_due":      amountDue,
+			"balance":         amountDue, // Add balance as alias for amount_due for frontend compatibility
 			"status":          status,
+			"payment_status":  paymentStatus,
 			"created_at":      createdAt,
 			"updated_at":      updatedAt,
 		}
@@ -401,16 +416,18 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		return
 	}
 
-	// Get invoice
+	// Get invoice with customer name
 	query := `
-		SELECT id, tenant_id, organization_id, invoice_number, customer_id, sales_order_id,
-			   invoice_date, due_date, billing_address, shipping_address,
-			   currency_id, exchange_rate, subtotal, discount_amount,
-			   tax_amount, total_amount, amount_paid, amount_due, status,
-			   reference, po_number, notes, terms_conditions,
-			   journal_entry_id, sent_at, viewed_at, created_by, created_at, updated_at
-		FROM sales_invoices
-		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`
+		SELECT si.id, si.tenant_id, si.organization_id, si.invoice_number, si.customer_id, si.sales_order_id,
+			   si.invoice_date, si.due_date, si.billing_address, si.shipping_address,
+			   si.currency_id, si.exchange_rate, si.subtotal, si.discount_amount,
+			   si.tax_amount, si.total_amount, si.amount_paid, si.amount_due, si.status,
+			   si.reference, si.po_number, si.notes, si.terms_conditions,
+			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
+			   COALESCE(c.name, si.customer_name, '') as customer_name
+		FROM sales_invoices si
+		LEFT JOIN contacts c ON si.customer_id = c.id
+		WHERE si.id = $1 AND si.tenant_id = $2 AND si.deleted_at IS NULL`
 
 	var id, tenantIDScan, customerID uuid.UUID
 	var organizationID, salesOrderID, currencyID, journalEntryID, createdBy sql.NullString
@@ -421,6 +438,7 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	var exchangeRate, subtotal, discountAmount, taxAmount, totalAmount, amountPaid, amountDue float64
 	var reference, poNumber, notes, termsConditions sql.NullString
 	var createdAt, updatedAt time.Time
+	var customerName string
 
 	err = h.db.QueryRow(query, invoiceID, tenantID).Scan(
 		&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -429,6 +447,7 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		&taxAmount, &totalAmount, &amountPaid, &amountDue, &status,
 		&reference, &poNumber, &notes, &termsConditions,
 		&journalEntryID, &sentAt, &viewedAt, &createdBy, &createdAt, &updatedAt,
+		&customerName,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
@@ -439,11 +458,20 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		return
 	}
 
+	// Determine payment status based on amounts
+	paymentStatus := "unpaid"
+	if amountPaid >= totalAmount && totalAmount > 0 {
+		paymentStatus = "paid"
+	} else if amountPaid > 0 {
+		paymentStatus = "partial"
+	}
+
 	invoice := map[string]interface{}{
 		"id":              id.String(),
 		"tenant_id":       tenantIDScan.String(),
 		"invoice_number":  invoiceNumber,
 		"customer_id":     customerID.String(),
+		"customer_name":   customerName,
 		"invoice_date":    invoiceDate.Format("2006-01-02"),
 		"due_date":        dueDate.Format("2006-01-02"),
 		"exchange_rate":   exchangeRate,
@@ -453,7 +481,9 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		"total_amount":    totalAmount,
 		"amount_paid":     amountPaid,
 		"amount_due":      amountDue,
+		"balance":         amountDue, // Alias for frontend compatibility
 		"status":          status,
+		"payment_status":  paymentStatus,
 		"created_at":      createdAt,
 		"updated_at":      updatedAt,
 	}
@@ -503,13 +533,15 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		}
 	}
 
-	// Get invoice lines
+	// Get invoice lines (join with products to get name if description is null)
 	linesQuery := `
-		SELECT id, line_number, product_id, description, quantity, unit_id, unit_price,
-			   discount_amount, tax_id, tax_amount, line_total, account_id
-		FROM sales_invoice_lines
-		WHERE sales_invoice_id = $1
-		ORDER BY line_number`
+		SELECT sil.id, sil.line_number, sil.product_id, COALESCE(NULLIF(sil.description, ''), p.name) as description,
+			   sil.quantity, sil.unit_id, sil.unit_price, sil.discount_amount, sil.tax_id, sil.tax_amount,
+			   sil.line_total, sil.account_id
+		FROM sales_invoice_lines sil
+		LEFT JOIN products p ON p.id = sil.product_id
+		WHERE sil.sales_invoice_id = $1
+		ORDER BY sil.line_number`
 
 	linesRows, err := h.db.Query(linesQuery, invoiceID)
 	if err == nil {
@@ -577,25 +609,29 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 	}
 
 	var input struct {
-		DueDate         *string  `json:"due_date,omitempty"`
-		Reference       *string  `json:"reference,omitempty"`
-		PONumber        *string  `json:"po_number,omitempty"`
-		Notes           *string  `json:"notes,omitempty"`
-		TermsConditions *string  `json:"terms_conditions,omitempty"`
+		DueDate         *string `json:"due_date,omitempty"`
+		Reference       *string `json:"reference,omitempty"`
+		PONumber        *string `json:"po_number,omitempty"`
+		Notes           *string `json:"notes,omitempty"`
+		TermsConditions *string `json:"terms_conditions,omitempty"`
+		Status          *string `json:"status,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
 
-	// Check if invoice exists and is in draft status
+	// Check if invoice exists
 	var currentStatus string
 	err = h.db.QueryRow("SELECT status FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", invoiceID, tenantID).Scan(&currentStatus)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
 		return
 	}
-	if currentStatus != string(entity.InvoiceStatusDraft) {
+
+	// Only allow updating non-status fields if draft, but allow status changes from draft to sent
+	isStatusOnlyUpdate := input.Status != nil && input.DueDate == nil && input.Reference == nil && input.PONumber == nil && input.Notes == nil && input.TermsConditions == nil
+	if !isStatusOnlyUpdate && currentStatus != string(entity.InvoiceStatusDraft) {
 		response.BadRequest(c, "Can only update invoices in draft status")
 		return
 	}
@@ -630,6 +666,28 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("terms_conditions = $%d", argCount))
 		args = append(args, *input.TermsConditions)
+	}
+	if input.Status != nil {
+		// Validate status transition
+		validStatuses := map[string]bool{"draft": true, "sent": true, "paid": true, "cancelled": true}
+		if !validStatuses[*input.Status] {
+			response.BadRequest(c, "Invalid status")
+			return
+		}
+		// Only allow draft -> sent, or sent -> paid transitions
+		if currentStatus == "draft" && (*input.Status != "sent" && *input.Status != "cancelled") {
+			response.BadRequest(c, "Draft invoices can only be sent or cancelled")
+			return
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+		// If sending, record sent_at
+		if *input.Status == "sent" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("sent_at = $%d", argCount))
+			args = append(args, time.Now())
+		}
 	}
 
 	if len(updates) == 0 {
@@ -705,7 +763,7 @@ func (h *Handler) DeleteSalesInvoice(c *gin.Context) {
 	response.NoContent(c)
 }
 
-// SendInvoice marks an invoice as sent
+// SendInvoice marks an invoice as sent and creates GL journal entry
 func (h *Handler) SendInvoice(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -713,17 +771,30 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
+	userID, _ := middleware.GetUserID(c)
+
 	invoiceID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid invoice ID")
 		return
 	}
 
-	// Check current status
-	var currentStatus string
-	err = h.db.QueryRow("SELECT status FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", invoiceID, tenantID).Scan(&currentStatus)
+	// Get invoice details
+	var currentStatus, invoiceNumber string
+	var customerID uuid.UUID
+	var totalAmount, taxAmount, subtotal float64
+	var invoiceDate time.Time
+	err = h.db.QueryRow(`
+		SELECT status, invoice_number, customer_id, total_amount, tax_amount, subtotal, invoice_date
+		FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		invoiceID, tenantID,
+	).Scan(&currentStatus, &invoiceNumber, &customerID, &totalAmount, &taxAmount, &subtotal, &invoiceDate)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch invoice")
 		return
 	}
 	if currentStatus != string(entity.InvoiceStatusDraft) {
@@ -732,25 +803,186 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	}
 
 	now := time.Now()
-	_, err = h.db.Exec(
-		"UPDATE sales_invoices SET status = $1, sent_at = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
-		entity.InvoiceStatusSent, now, now, invoiceID, tenantID,
+
+	// Start transaction for GL posting
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Get Sales Journal ID
+	var salesJournalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	err = tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code = 'SALES' AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
+	if err != nil {
+		// Journal doesn't exist yet, skip GL posting but still send invoice
+		h.log.Warn("Sales journal not found, skipping GL posting", "tenant_id", tenantID)
+		_, err = tx.Exec(
+			"UPDATE sales_invoices SET status = $1, sent_at = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
+			entity.InvoiceStatusSent, now, now, invoiceID, tenantID,
+		)
+		if err != nil {
+			response.InternalError(c, "Failed to send invoice")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			response.InternalError(c, "Failed to commit transaction")
+			return
+		}
+		h.GetSalesInvoice(c)
+		return
+	}
+
+	// Get default account IDs
+	var arAccountID, revenueAccountID, taxAccountID uuid.UUID
+	err = tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1100' AND deleted_at IS NULL`, tenantID).Scan(&arAccountID)
+	if err != nil {
+		h.log.Warn("AR account not found, skipping GL posting", "tenant_id", tenantID)
+		_, err = tx.Exec(
+			"UPDATE sales_invoices SET status = $1, sent_at = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
+			entity.InvoiceStatusSent, now, now, invoiceID, tenantID,
+		)
+		if err != nil {
+			response.InternalError(c, "Failed to send invoice")
+			return
+		}
+		if err := tx.Commit(); err != nil {
+			response.InternalError(c, "Failed to commit transaction")
+			return
+		}
+		h.GetSalesInvoice(c)
+		return
+	}
+
+	tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '4000' AND deleted_at IS NULL`, tenantID).Scan(&revenueAccountID)
+	tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2100' AND deleted_at IS NULL`, tenantID).Scan(&taxAccountID)
+
+	// Generate entry number
+	prefix := ""
+	if numberPrefix.Valid {
+		prefix = numberPrefix.String
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+	// Create journal entry
+	journalEntryID := uuid.New()
+	description := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
+
+	_, err = tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+		journalEntryID, tenantID, salesJournalID, entryNumber, invoiceDate, invoiceNumber, description,
+		"sales_invoice", invoiceID.String(), 1.0, totalAmount, totalAmount, "posted", userID, now, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create journal entry", "error", err)
+		response.InternalError(c, "Failed to create journal entry")
+		return
+	}
+
+	// Create journal entry lines
+	lineNumber := 1
+
+	// Line 1: Debit AR for total amount
+	arLineID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO journal_entry_lines (
+			id, journal_entry_id, line_number, account_id, contact_id, description,
+			debit_amount, credit_amount, exchange_rate, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		arLineID, journalEntryID, lineNumber, arAccountID, customerID, "Accounts Receivable",
+		totalAmount, 0.0, 1.0, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create AR line", "error", err)
+		response.InternalError(c, "Failed to create journal entry")
+		return
+	}
+	lineNumber++
+
+	// Line 2: Credit Revenue (subtotal - discount)
+	revenueAmount := subtotal
+	if revenueAccountID != uuid.Nil && revenueAmount > 0 {
+		revenueLineID := uuid.New()
+		_, err = tx.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			revenueLineID, journalEntryID, lineNumber, revenueAccountID, "Sales Revenue",
+			0.0, revenueAmount, 1.0, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create revenue line", "error", err)
+			response.InternalError(c, "Failed to create journal entry")
+			return
+		}
+		lineNumber++
+	}
+
+	// Line 3: Credit Tax Payable (if tax > 0)
+	if taxAccountID != uuid.Nil && taxAmount > 0 {
+		taxLineID := uuid.New()
+		_, err = tx.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			taxLineID, journalEntryID, lineNumber, taxAccountID, "Sales Tax Payable",
+			0.0, taxAmount, 1.0, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create tax line", "error", err)
+			response.InternalError(c, "Failed to create journal entry")
+			return
+		}
+	}
+
+	// Update journal next number
+	_, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
+	if err != nil {
+		h.log.Error("Failed to update journal number", "error", err)
+		response.InternalError(c, "Failed to update journal")
+		return
+	}
+
+	// Update invoice with journal entry ID and status
+	_, err = tx.Exec(
+		"UPDATE sales_invoices SET status = $1, sent_at = $2, journal_entry_id = $3, updated_at = $4 WHERE id = $5 AND tenant_id = $6",
+		entity.InvoiceStatusSent, now, journalEntryID, now, invoiceID, tenantID,
 	)
 	if err != nil {
 		response.InternalError(c, "Failed to send invoice")
 		return
 	}
 
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit transaction")
+		return
+	}
+
 	h.GetSalesInvoice(c)
 }
 
-// RecordPayment records a payment against an invoice
+// RecordPayment records a payment against an invoice and creates GL journal entry
 func (h *Handler) RecordPayment(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
 		response.Unauthorized(c, "Invalid tenant")
 		return
 	}
+
+	userID, _ := middleware.GetUserID(c)
 
 	invoiceID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -769,13 +1001,22 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		return
 	}
 
+	// Parse payment date
+	paymentDate, err := time.Parse("2006-01-02", input.PaymentDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid payment_date format, expected YYYY-MM-DD")
+		return
+	}
+
 	// Get current invoice status and amounts
-	var currentStatus string
+	var currentStatus, invoiceNumber string
+	var customerID uuid.UUID
 	var amountPaid, totalAmount float64
-	err = h.db.QueryRow(
-		"SELECT status, amount_paid, total_amount FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+	err = h.db.QueryRow(`
+		SELECT status, invoice_number, customer_id, amount_paid, total_amount
+		FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &amountPaid, &totalAmount)
+	).Scan(&currentStatus, &invoiceNumber, &customerID, &amountPaid, &totalAmount)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
 		return
@@ -802,12 +1043,137 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	now := time.Now()
-	_, err = h.db.Exec(
+
+	// Start transaction for GL posting
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Get Cash Receipts Journal ID
+	var cashJournalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	err = tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code = 'CASH_RECEIPTS' AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&cashJournalID, &nextNumber, &numberPrefix)
+
+	// Get default account IDs
+	var arAccountID, cashAccountID uuid.UUID
+	tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1100' AND deleted_at IS NULL`, tenantID).Scan(&arAccountID)
+	tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1010' AND deleted_at IS NULL`, tenantID).Scan(&cashAccountID)
+
+	// Create GL entry if accounts exist
+	if cashJournalID != uuid.Nil && arAccountID != uuid.Nil && cashAccountID != uuid.Nil {
+		// Generate entry number
+		prefix := ""
+		if numberPrefix.Valid {
+			prefix = numberPrefix.String
+		}
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+		// Create journal entry
+		journalEntryID := uuid.New()
+		description := fmt.Sprintf("Payment received for Invoice %s", invoiceNumber)
+		reference := input.Reference
+		if reference == "" {
+			reference = invoiceNumber
+		}
+
+		_, err = tx.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+			journalEntryID, tenantID, cashJournalID, entryNumber, paymentDate, reference, description,
+			"payment_receipt", invoiceID.String(), 1.0, input.Amount, input.Amount, "posted", userID, now, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create payment journal entry", "error", err)
+			// Continue without GL posting
+		} else {
+			// Line 1: Debit Cash/Bank
+			cashLineID := uuid.New()
+			_, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, contact_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				cashLineID, journalEntryID, 1, cashAccountID, customerID, "Cash Receipt",
+				input.Amount, 0.0, 1.0, now,
+			)
+
+			// Line 2: Credit AR
+			arLineID := uuid.New()
+			_, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, contact_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				arLineID, journalEntryID, 2, arAccountID, customerID, "Accounts Receivable",
+				0.0, input.Amount, 1.0, now,
+			)
+
+			// Update journal next number
+			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", cashJournalID)
+
+			// Create payment record
+			paymentID := uuid.New()
+			_, err = tx.Exec(`
+				INSERT INTO payments (
+					id, tenant_id, type, payment_number, contact_id, payment_date, amount,
+					currency_id, exchange_rate, reference, notes, status, journal_entry_id,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+				paymentID, tenantID, "receipt", fmt.Sprintf("REC-%s", entryNumber), customerID, paymentDate, input.Amount,
+				nil, 1.0, input.Reference, input.Notes, "confirmed", journalEntryID,
+				userID, now, now,
+			)
+
+			// Create payment allocation
+			if err == nil {
+				allocationID := uuid.New()
+				tx.Exec(`
+					INSERT INTO payment_allocations (
+						id, payment_id, document_type, document_id, amount, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6)`,
+					allocationID, paymentID, "sales_invoice", invoiceID, input.Amount, now,
+				)
+			}
+		}
+	}
+
+	// Update invoice
+	_, err = tx.Exec(
 		"UPDATE sales_invoices SET amount_paid = $1, status = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
 		newAmountPaid, newStatus, now, invoiceID, tenantID,
 	)
 	if err != nil {
 		response.InternalError(c, "Failed to record payment")
+		return
+	}
+
+	// Update related sales order's payment_status if invoice is linked to an order
+	var salesOrderID sql.NullString
+	tx.QueryRow(`SELECT sales_order_id FROM sales_invoices WHERE id = $1`, invoiceID).Scan(&salesOrderID)
+	if salesOrderID.Valid && salesOrderID.String != "" {
+		orderPaymentStatus := "partial"
+		if newStatus == entity.InvoiceStatusPaid {
+			orderPaymentStatus = "paid"
+		}
+		tx.Exec(
+			"UPDATE sales_orders SET payment_status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+			orderPaymentStatus, now, salesOrderID.String, tenantID,
+		)
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
 

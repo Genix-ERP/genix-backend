@@ -39,7 +39,7 @@ type PurchaseOrder struct {
 	TotalAmount     float64             `json:"total_amount" db:"total_amount"`
 	Status          PurchaseOrderStatus `json:"status" db:"status"`
 	PaymentStatus   PaymentStatus       `json:"payment_status" db:"payment_status"`
-	PaymentTerms    *string             `json:"payment_terms,omitempty" db:"payment_terms"`
+	PaymentTerms    *int                `json:"payment_terms,omitempty" db:"payment_terms"`
 	References      json.RawMessage     `json:"references" db:"references"`
 	VendorReference *string             `json:"vendor_reference,omitempty" db:"vendor_reference"`
 	Notes           *string             `json:"notes,omitempty" db:"notes"`
@@ -126,6 +126,7 @@ type UpdatePurchaseOrderInput struct {
 	InternalNotes   *string                        `json:"internal_notes,omitempty"`
 	WarehouseID     *string                        `json:"warehouse_id,omitempty"`
 	ShippingAmount  *float64                       `json:"shipping_amount,omitempty"`
+	Status          *string                        `json:"status,omitempty"`
 	Lines           []CreatePurchaseOrderLineInput `json:"lines,omitempty"`
 }
 
@@ -167,7 +168,7 @@ type PurchaseOrderResponse struct {
 	TotalAmount     float64             `json:"total_amount"`
 	Status          PurchaseOrderStatus `json:"status"`
 	PaymentStatus   PaymentStatus       `json:"payment_status"`
-	PaymentTerms    *string             `json:"payment_terms,omitempty"`
+	PaymentTerms    *int                `json:"payment_terms,omitempty"`
 	VendorReference *string             `json:"vendor_reference,omitempty"`
 	Notes           *string             `json:"notes,omitempty"`
 	Lines           []PurchaseOrderLine `json:"lines,omitempty"`

@@ -33,39 +33,40 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	// Build query with filters
+	// Build query with filters - include calculated total_hours from time_entries
 	baseQuery := `
-		SELECT id, tenant_id, project_code, project_name, description, client_id, client_name,
-			   manager_id, manager_name, start_date, end_date, budget, spent,
-			   billing_type, hourly_rate, currency, priority, status, progress,
-			   notes, created_by, created_at, updated_at
-		FROM projects
-		WHERE tenant_id = $1 AND deleted_at IS NULL`
-	countQuery := `SELECT COUNT(*) FROM projects WHERE tenant_id = $1 AND deleted_at IS NULL`
+		SELECT p.id, p.tenant_id, p.project_code, p.project_name, p.description, p.client_id, p.client_name,
+			   p.manager_id, p.manager_name, p.start_date, p.end_date, p.budget, p.spent,
+			   p.billing_type, p.hourly_rate, p.currency, p.priority, p.status, p.progress,
+			   p.notes, p.created_by, p.created_at, p.updated_at,
+			   COALESCE((SELECT SUM(hours) FROM time_entries WHERE project_id = p.id AND deleted_at IS NULL), 0) as total_hours
+		FROM projects p
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM projects p WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
 	args := []interface{}{tenantID}
 	argCount := 1
 
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND status = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND p.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.status = $%d", argCount)
 		args = append(args, status)
 	}
 
 	// Filter by priority
 	if priority := c.Query("priority"); priority != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND priority = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND priority = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND p.priority = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.priority = $%d", argCount)
 		args = append(args, priority)
 	}
 
 	// Filter by client
 	if clientID := c.Query("client_id"); clientID != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND client_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND client_id = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND p.client_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.client_id = $%d", argCount)
 		args = append(args, clientID)
 	}
 
@@ -73,8 +74,8 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	if search := c.Query("search"); search != "" {
 		argCount++
 		searchPattern := "%" + strings.ToLower(search) + "%"
-		baseQuery += fmt.Sprintf(" AND (LOWER(project_name) LIKE $%d OR LOWER(project_code) LIKE $%d)", argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (LOWER(project_name) LIKE $%d OR LOWER(project_code) LIKE $%d)", argCount, argCount)
+		baseQuery += fmt.Sprintf(" AND (LOWER(p.project_name) LIKE $%d OR LOWER(p.project_code) LIKE $%d)", argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(p.project_name) LIKE $%d OR LOWER(p.project_code) LIKE $%d)", argCount, argCount)
 		args = append(args, searchPattern)
 	}
 
@@ -110,6 +111,7 @@ func (h *Handler) ListProjects(c *gin.Context) {
 			&p.StartDate, &endDate, &p.Budget, &p.Spent,
 			&p.BillingType, &p.HourlyRate, &p.Currency, &p.Priority, &p.Status, &p.Progress,
 			&notes, &createdBy, &p.CreatedAt, &updatedAt,
+			&p.TotalHours,
 		)
 		if err != nil {
 			continue
@@ -297,12 +299,13 @@ func (h *Handler) GetProject(c *gin.Context) {
 	}
 
 	query := `
-		SELECT id, tenant_id, project_code, project_name, description, client_id, client_name,
-			   manager_id, manager_name, start_date, end_date, budget, spent,
-			   billing_type, hourly_rate, currency, priority, status, progress,
-			   notes, created_by, created_at, updated_at
-		FROM projects
-		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`
+		SELECT p.id, p.tenant_id, p.project_code, p.project_name, p.description, p.client_id, p.client_name,
+			   p.manager_id, p.manager_name, p.start_date, p.end_date, p.budget, p.spent,
+			   p.billing_type, p.hourly_rate, p.currency, p.priority, p.status, p.progress,
+			   p.notes, p.created_by, p.created_at, p.updated_at,
+			   COALESCE((SELECT SUM(hours) FROM time_entries WHERE project_id = p.id AND deleted_at IS NULL), 0) as total_hours
+		FROM projects p
+		WHERE p.id = $1 AND p.tenant_id = $2 AND p.deleted_at IS NULL`
 
 	var p entity.Project
 	var clientID, managerID, createdBy sql.NullString
@@ -315,6 +318,7 @@ func (h *Handler) GetProject(c *gin.Context) {
 		&p.StartDate, &endDate, &p.Budget, &p.Spent,
 		&p.BillingType, &p.HourlyRate, &p.Currency, &p.Priority, &p.Status, &p.Progress,
 		&notes, &createdBy, &p.CreatedAt, &updatedAt,
+		&p.TotalHours,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Project")
@@ -995,6 +999,124 @@ func (h *Handler) CreateProjectMilestone(c *gin.Context) {
 	response.Created(c, milestone.ToResponse())
 }
 
+// UpdateProjectMilestone updates an existing milestone
+func (h *Handler) UpdateProjectMilestone(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	milestoneID, err := uuid.Parse(c.Param("milestoneId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid milestone ID")
+		return
+	}
+
+	var input entity.UpdateMilestoneInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Build update query
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if input.Title != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("title = $%d", argCount))
+		args = append(args, *input.Title)
+	}
+	if input.Description != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, *input.Description)
+	}
+	if input.DueDate != nil {
+		dueDate, err := time.Parse("2006-01-02", *input.DueDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid due_date format")
+			return
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("due_date = $%d", argCount))
+		args = append(args, dueDate)
+	}
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+
+	// Add milestone ID and tenant ID for WHERE clause
+	milestoneIDPlaceholder := argCount + 1
+	tenantIDPlaceholder := argCount + 2
+	args = append(args, milestoneID)
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(
+		"UPDATE project_milestones SET %s WHERE id = $%d AND tenant_id = $%d",
+		strings.Join(updates, ", "), milestoneIDPlaceholder, tenantIDPlaceholder,
+	)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		response.InternalError(c, "Failed to update milestone: "+err.Error())
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Milestone")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Milestone updated successfully"})
+}
+
+// DeleteProjectMilestone deletes a project milestone
+func (h *Handler) DeleteProjectMilestone(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	milestoneID, err := uuid.Parse(c.Param("milestoneId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid milestone ID")
+		return
+	}
+
+	result, err := h.db.Exec(
+		"DELETE FROM project_milestones WHERE id = $1 AND tenant_id = $2",
+		milestoneID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to delete milestone")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Milestone")
+		return
+	}
+
+	response.NoContent(c)
+}
+
 // ListTimeEntries returns time entries for a project
 func (h *Handler) ListTimeEntries(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -1177,4 +1299,503 @@ func (h *Handler) CreateTimeEntry(c *gin.Context) {
 	}
 
 	response.Created(c, entry.ToResponse())
+}
+
+// ListProjectExpenses returns expenses for a project
+func (h *Handler) ListProjectExpenses(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT pe.id, pe.tenant_id, pe.project_id, pe.expense_number, pe.category, pe.description,
+			   pe.amount, pe.currency, pe.expense_date, pe.employee_id, pe.employee_name,
+			   pe.vendor_id, pe.vendor_name, pe.purchase_invoice_id, pe.receipt_url, pe.billable, pe.status,
+			   pe.approved_by, pe.approved_at, pe.notes, pe.created_at, pe.updated_at,
+			   c.name as vendor_display_name
+		FROM project_expenses pe
+		LEFT JOIN contacts c ON pe.vendor_id = c.id
+		WHERE pe.project_id = $1 AND pe.tenant_id = $2 AND pe.deleted_at IS NULL
+		ORDER BY pe.expense_date DESC`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch project expenses")
+		return
+	}
+	defer rows.Close()
+
+	var expenses []*entity.ProjectExpenseResponse
+	for rows.Next() {
+		var e entity.ProjectExpense
+		var employeeID, vendorID, purchaseInvoiceID, approvedBy sql.NullString
+		var category, employeeName, vendorName, receiptURL, notes, vendorDisplayName sql.NullString
+		var approvedAt, updatedAt sql.NullTime
+
+		err := rows.Scan(
+			&e.ID, &e.TenantID, &e.ProjectID, &e.ExpenseNumber, &category, &e.Description,
+			&e.Amount, &e.Currency, &e.ExpenseDate, &employeeID, &employeeName,
+			&vendorID, &vendorName, &purchaseInvoiceID, &receiptURL, &e.Billable, &e.Status,
+			&approvedBy, &approvedAt, &notes, &e.CreatedAt, &updatedAt,
+			&vendorDisplayName,
+		)
+		if err != nil {
+			continue
+		}
+
+		if category.Valid {
+			e.Category = &category.String
+		}
+		if employeeID.Valid {
+			eid, _ := uuid.Parse(employeeID.String)
+			e.EmployeeID = &eid
+		}
+		if employeeName.Valid {
+			e.EmployeeName = &employeeName.String
+		}
+		if vendorID.Valid {
+			vid, _ := uuid.Parse(vendorID.String)
+			e.VendorID = &vid
+		}
+		// Use vendor display name from contacts if available, else fallback to stored vendor_name
+		if vendorDisplayName.Valid {
+			e.VendorName = &vendorDisplayName.String
+		} else if vendorName.Valid {
+			e.VendorName = &vendorName.String
+		}
+		if purchaseInvoiceID.Valid {
+			piid, _ := uuid.Parse(purchaseInvoiceID.String)
+			e.PurchaseInvoiceID = &piid
+		}
+		if receiptURL.Valid {
+			e.ReceiptURL = &receiptURL.String
+		}
+		if notes.Valid {
+			e.Notes = &notes.String
+		}
+		if approvedBy.Valid {
+			aid, _ := uuid.Parse(approvedBy.String)
+			e.ApprovedBy = &aid
+		}
+		if approvedAt.Valid {
+			e.ApprovedAt = &approvedAt.Time
+		}
+		if updatedAt.Valid {
+			e.UpdatedAt = updatedAt.Time
+		}
+
+		expenses = append(expenses, e.ToResponse())
+	}
+
+	response.Success(c, expenses)
+}
+
+// CreateProjectExpense creates a new expense for a project
+func (h *Handler) CreateProjectExpense(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.CreateProjectExpenseInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	expenseID := uuid.New()
+	now := time.Now()
+
+	// Generate expense number
+	expenseNumber := fmt.Sprintf("PEXP-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
+
+	// Parse expense date
+	expenseDate, err := time.Parse("2006-01-02", input.ExpenseDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid expense_date format, expected YYYY-MM-DD")
+		return
+	}
+
+	// Default currency
+	currency := input.Currency
+	if currency == "" {
+		currency = "UZS"
+	}
+
+	var employeeID *uuid.UUID
+	if input.EmployeeID != "" {
+		eid, _ := uuid.Parse(input.EmployeeID)
+		employeeID = &eid
+	}
+
+	var vendorID *uuid.UUID
+	if input.VendorID != "" {
+		vid, _ := uuid.Parse(input.VendorID)
+		vendorID = &vid
+	}
+
+	var category, employeeName, vendorName, receiptURL, notes *string
+	if input.Category != "" {
+		category = &input.Category
+	}
+	if input.EmployeeName != "" {
+		employeeName = &input.EmployeeName
+	}
+	if input.VendorName != "" {
+		vendorName = &input.VendorName
+	}
+	if input.ReceiptURL != "" {
+		receiptURL = &input.ReceiptURL
+	}
+	if input.Notes != "" {
+		notes = &input.Notes
+	}
+
+	var createdBy *uuid.UUID
+	if userID != uuid.Nil {
+		createdBy = &userID
+	}
+
+	// If vendor is provided, create a purchase invoice (payable)
+	var purchaseInvoiceID *uuid.UUID
+	if vendorID != nil {
+		invoiceID := uuid.New()
+		purchaseInvoiceID = &invoiceID
+		invoiceNumber := fmt.Sprintf("BILL-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
+
+		// Due date is 30 days from expense date
+		dueDate := expenseDate.AddDate(0, 0, 30)
+
+		// Get project name for invoice notes
+		var projectName string
+		h.db.QueryRow("SELECT project_name FROM projects WHERE id = $1", projectID).Scan(&projectName)
+
+		invoiceNotes := fmt.Sprintf("Project Expense: %s - %s", projectName, input.Description)
+
+		// Create purchase invoice
+		_, err = h.db.Exec(`
+			INSERT INTO purchase_invoices (
+				id, tenant_id, invoice_number, vendor_id, vendor_invoice_number,
+				invoice_date, due_date, subtotal, discount_amount,
+				tax_amount, total_amount, amount_paid, status,
+				three_way_match_status, notes, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+			invoiceID, tenantID, invoiceNumber, vendorID, expenseNumber,
+			expenseDate, dueDate, input.Amount, 0,
+			0, input.Amount, 0, "draft",
+			"pending", invoiceNotes, createdBy, now, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create purchase invoice for project expense", "error", err)
+			// Continue without purchase invoice - don't fail the expense creation
+			purchaseInvoiceID = nil
+		} else {
+			h.log.Info("Purchase invoice created for project expense", "invoice_id", invoiceID, "expense_id", expenseID)
+		}
+	}
+
+	query := `
+		INSERT INTO project_expenses (
+			id, tenant_id, project_id, expense_number, category, description,
+			amount, currency, expense_date, employee_id, employee_name,
+			vendor_id, vendor_name, purchase_invoice_id, receipt_url, billable, status, notes, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`
+
+	_, err = h.db.Exec(query,
+		expenseID, tenantID, projectID, expenseNumber, category, input.Description,
+		input.Amount, currency, expenseDate, employeeID, employeeName,
+		vendorID, vendorName, purchaseInvoiceID, receiptURL, input.Billable, "pending", notes, createdBy, now, now,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to create expense: "+err.Error())
+		return
+	}
+
+	// Update spent on project
+	if input.Billable {
+		h.db.Exec(
+			"UPDATE projects SET spent = spent + $1, updated_at = $2 WHERE id = $3",
+			input.Amount, now, projectID,
+		)
+	}
+
+	expense := &entity.ProjectExpense{
+		ID:                expenseID,
+		TenantID:          tenantID,
+		ProjectID:         projectID,
+		ExpenseNumber:     expenseNumber,
+		Category:          category,
+		Description:       input.Description,
+		Amount:            input.Amount,
+		Currency:          currency,
+		ExpenseDate:       expenseDate,
+		EmployeeID:        employeeID,
+		EmployeeName:      employeeName,
+		VendorID:          vendorID,
+		VendorName:        vendorName,
+		PurchaseInvoiceID: purchaseInvoiceID,
+		ReceiptURL:        receiptURL,
+		Billable:          input.Billable,
+		Status:            "pending",
+		Notes:             notes,
+		CreatedBy:         createdBy,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+
+	response.Created(c, expense.ToResponse())
+}
+
+// DeleteProjectExpense soft deletes a project expense
+func (h *Handler) DeleteProjectExpense(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	expenseID, err := uuid.Parse(c.Param("expenseId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid expense ID")
+		return
+	}
+
+	// Get the expense amount to deduct from project spent
+	var amount float64
+	var projectID uuid.UUID
+	var billable bool
+	err = h.db.QueryRow(
+		"SELECT project_id, amount, billable FROM project_expenses WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+		expenseID, tenantID,
+	).Scan(&projectID, &amount, &billable)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Expense")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch expense")
+		return
+	}
+
+	now := time.Now()
+	result, err := h.db.Exec(
+		"UPDATE project_expenses SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL",
+		now, expenseID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to delete expense")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Expense")
+		return
+	}
+
+	// Deduct from project spent if billable
+	if billable {
+		h.db.Exec(
+			"UPDATE projects SET spent = spent - $1, updated_at = $2 WHERE id = $3",
+			amount, now, projectID,
+		)
+	}
+
+	response.NoContent(c)
+}
+
+// ListProjectTeamMembers returns team members for a project
+func (h *Handler) ListProjectTeamMembers(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT id, tenant_id, project_id, employee_id, employee_name,
+			   role, allocation_percent, start_date, end_date, created_at, updated_at
+		FROM project_team_members
+		WHERE project_id = $1 AND tenant_id = $2
+		ORDER BY created_at ASC`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch team members")
+		return
+	}
+	defer rows.Close()
+
+	var members []*entity.ProjectTeamMemberResponse
+	for rows.Next() {
+		var m entity.ProjectTeamMember
+		var role sql.NullString
+		var startDate, endDate, updatedAt sql.NullTime
+
+		err := rows.Scan(
+			&m.ID, &m.TenantID, &m.ProjectID, &m.EmployeeID, &m.EmployeeName,
+			&role, &m.AllocationPercent, &startDate, &endDate, &m.CreatedAt, &updatedAt,
+		)
+		if err != nil {
+			continue
+		}
+
+		if role.Valid {
+			m.Role = &role.String
+		}
+		if startDate.Valid {
+			m.StartDate = &startDate.Time
+		}
+		if endDate.Valid {
+			m.EndDate = &endDate.Time
+		}
+		if updatedAt.Valid {
+			m.UpdatedAt = updatedAt.Time
+		}
+
+		members = append(members, m.ToResponse())
+	}
+
+	response.Success(c, members)
+}
+
+// AddProjectTeamMember adds a team member to a project
+func (h *Handler) AddProjectTeamMember(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var input entity.CreateTeamMemberInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	employeeID, err := uuid.Parse(input.EmployeeID)
+	if err != nil {
+		response.BadRequest(c, "Invalid employee_id")
+		return
+	}
+
+	memberID := uuid.New()
+	now := time.Now()
+
+	// Default allocation
+	allocationPercent := input.AllocationPercent
+	if allocationPercent <= 0 {
+		allocationPercent = 100
+	}
+
+	var role *string
+	if input.Role != "" {
+		role = &input.Role
+	}
+
+	var startDate, endDate *time.Time
+	if input.StartDate != "" {
+		sd, err := time.Parse("2006-01-02", input.StartDate)
+		if err == nil {
+			startDate = &sd
+		}
+	}
+	if input.EndDate != "" {
+		ed, err := time.Parse("2006-01-02", input.EndDate)
+		if err == nil {
+			endDate = &ed
+		}
+	}
+
+	query := `
+		INSERT INTO project_team_members (
+			id, tenant_id, project_id, employee_id, employee_name,
+			role, allocation_percent, start_date, end_date, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
+
+	_, err = h.db.Exec(query,
+		memberID, tenantID, projectID, employeeID, input.EmployeeName,
+		role, allocationPercent, startDate, endDate, now, now,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to add team member: "+err.Error())
+		return
+	}
+
+	member := &entity.ProjectTeamMember{
+		ID:                memberID,
+		TenantID:          tenantID,
+		ProjectID:         projectID,
+		EmployeeID:        employeeID,
+		EmployeeName:      input.EmployeeName,
+		Role:              role,
+		AllocationPercent: allocationPercent,
+		StartDate:         startDate,
+		EndDate:           endDate,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+
+	response.Created(c, member.ToResponse())
+}
+
+// RemoveProjectTeamMember removes a team member from a project
+func (h *Handler) RemoveProjectTeamMember(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	memberID, err := uuid.Parse(c.Param("memberId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid member ID")
+		return
+	}
+
+	result, err := h.db.Exec(
+		"DELETE FROM project_team_members WHERE id = $1 AND tenant_id = $2",
+		memberID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to remove team member")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Team member")
+		return
+	}
+
+	response.NoContent(c)
 }
