@@ -466,7 +466,7 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			lineDiscount = line.DiscountValue
 		}
 
-		var unitID, taxID, lineWarehouseID *uuid.UUID
+		var unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
 		if line.UnitID != "" {
 			id, _ := uuid.Parse(line.UnitID)
 			unitID = &id
@@ -479,20 +479,24 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			id, _ := uuid.Parse(line.WarehouseID)
 			lineWarehouseID = &id
 		}
+		if line.PackagingID != "" {
+			id, _ := uuid.Parse(line.PackagingID)
+			packagingID = &id
+		}
 
 		lineQuery := `
 			INSERT INTO sales_order_lines (
 				id, sales_order_id, line_number, product_id, description,
 				quantity, unit_id, unit_price, discount_type, discount_value, discount_amount,
 				tax_id, tax_amount, line_total, quantity_delivered, quantity_invoiced,
-				warehouse_id, notes, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`
+				warehouse_id, notes, packaging_id, packaging_qty, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`
 
 		h.db.Exec(lineQuery,
 			lineID, orderID, i+1, productID, line.Description,
 			line.Quantity, unitID, line.UnitPrice, line.DiscountType, line.DiscountValue, lineDiscount,
 			taxID, 0.0, lineTotal-lineDiscount, 0.0, 0.0,
-			lineWarehouseID, line.Notes, now, now,
+			lineWarehouseID, line.Notes, packagingID, line.PackagingQty, now, now,
 		)
 	}
 
@@ -660,14 +664,17 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		order["sales_rep_id"] = salesRepID.String
 	}
 
-	// Get order lines with product name
+	// Get order lines with product name and packaging info
 	linesQuery := `
 		SELECT sol.id, sol.line_number, sol.product_id, sol.description, sol.quantity, sol.unit_id, sol.unit_price,
 			   sol.discount_type, sol.discount_value, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total,
 			   sol.quantity_delivered, sol.quantity_invoiced, sol.warehouse_id, sol.notes,
-			   COALESCE(p.name, '') as product_name
+			   sol.packaging_id, sol.packaging_qty,
+			   COALESCE(p.name, '') as product_name,
+			   COALESCE(pp.name, '') as packaging_name, COALESCE(pp.qty, 0) as packaging_unit_qty
 		FROM sales_order_lines sol
 		LEFT JOIN products p ON p.id = sol.product_id
+		LEFT JOIN product_packagings pp ON pp.id = sol.packaging_id
 		WHERE sol.sales_order_id = $1
 		ORDER BY sol.line_number`
 
@@ -680,14 +687,17 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			var lineNumber int
 			var description, lineDiscountType, lineNotes sql.NullString
 			var quantity, unitPrice, lineDiscountValue, lineDiscountAmount, lineTaxAmount, lineTotal, qtyDelivered, qtyInvoiced float64
-			var unitID, taxID, lineWarehouseID sql.NullString
-			var productName string
+			var unitID, taxID, lineWarehouseID, packagingID sql.NullString
+			var packagingQty sql.NullFloat64
+			var productName, packagingName string
+			var packagingUnitQty float64
 
 			err := linesRows.Scan(
 				&lineID, &lineNumber, &productID, &description, &quantity, &unitID, &unitPrice,
 				&lineDiscountType, &lineDiscountValue, &lineDiscountAmount, &taxID, &lineTaxAmount, &lineTotal,
 				&qtyDelivered, &qtyInvoiced, &lineWarehouseID, &lineNotes,
-				&productName,
+				&packagingID, &packagingQty,
+				&productName, &packagingName, &packagingUnitQty,
 			)
 			if err != nil {
 				continue
@@ -725,6 +735,14 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			}
 			if lineNotes.Valid {
 				line["notes"] = lineNotes.String
+			}
+			if packagingID.Valid {
+				line["packaging_id"] = packagingID.String
+				line["packaging_name"] = packagingName
+				line["packaging_unit_qty"] = packagingUnitQty
+			}
+			if packagingQty.Valid {
+				line["packaging_qty"] = packagingQty.Float64
 			}
 
 			lines = append(lines, line)

@@ -342,15 +342,15 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			id, purchase_order_id, line_number, product_id, description,
 			quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount,
 			line_total, quantity_received, quantity_invoiced, warehouse_id, notes,
-			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			packaging_id, packaging_qty, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 	`
 
 	lines := make([]entity.PurchaseOrderLine, 0, len(input.Lines))
 	for i, line := range input.Lines {
 		lineID := uuid.New()
 
-		var productID, unitID, taxID, lineWarehouseID *uuid.UUID
+		var productID, unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
 		if line.ProductID != "" {
 			if pid, err := uuid.Parse(line.ProductID); err == nil {
 				productID = &pid
@@ -373,6 +373,11 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		} else if warehouseID != nil {
 			lineWarehouseID = warehouseID
 		}
+		if line.PackagingID != "" {
+			if pkgid, err := uuid.Parse(line.PackagingID); err == nil {
+				packagingID = &pkgid
+			}
+		}
 
 		lineSubtotal := line.Quantity * line.UnitPrice
 		lineTax := (lineSubtotal - line.DiscountAmount) * line.TaxPercent / 100
@@ -387,7 +392,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			lineID, id, i+1, productID, line.Description,
 			line.Quantity, unitID, line.UnitPrice, line.DiscountAmount, taxID, lineTax,
 			lineTotal, 0, 0, lineWarehouseID, lineNotes,
-			now, now,
+			packagingID, line.PackagingQty, now, now,
 		)
 		if err != nil {
 			h.log.Error("Failed to insert purchase order line", "error", err)
@@ -410,6 +415,8 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			LineTotal:       lineTotal,
 			WarehouseID:     lineWarehouseID,
 			Notes:           lineNotes,
+			PackagingID:     packagingID,
+			PackagingQty:    line.PackagingQty,
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		})
@@ -525,11 +532,14 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			   pol.description, pol.quantity, pol.unit_id, pol.unit_price,
 			   pol.discount_amount, pol.tax_id, pol.tax_amount, pol.line_total,
 			   pol.quantity_received, pol.quantity_invoiced, pol.warehouse_id, pol.notes,
+			   pol.packaging_id, pol.packaging_qty,
 			   COALESCE(p.name, '') as product_name, COALESCE(u.name, '') as unit_name,
+			   COALESCE(pkg.name, '') as packaging_name, COALESCE(pkg.qty, 0) as packaging_unit_qty,
 			   pol.created_at, pol.updated_at
 		FROM purchase_order_lines pol
 		LEFT JOIN products p ON pol.product_id = p.id
 		LEFT JOIN units_of_measure u ON pol.unit_id = u.id
+		LEFT JOIN product_packagings pkg ON pol.packaging_id = pkg.id
 		WHERE pol.purchase_order_id = $1
 		ORDER BY pol.line_number ASC
 	`
@@ -545,15 +555,20 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	po.Lines = make([]entity.PurchaseOrderLine, 0)
 	for rows.Next() {
 		var line entity.PurchaseOrderLine
-		var productID, unitID, taxID, warehouseID sql.NullString
+		var productID, unitID, taxID, warehouseID, packagingID sql.NullString
 		var lineNotes sql.NullString
+		var packagingQty sql.NullFloat64
+		var packagingName string
+		var packagingUnitQty float64
 
 		err := rows.Scan(
 			&line.ID, &line.PurchaseOrderID, &line.LineNumber, &productID,
 			&line.Description, &line.Quantity, &unitID, &line.UnitPrice,
 			&line.DiscountAmount, &taxID, &line.TaxAmount, &line.LineTotal,
 			&line.QuantityReceived, &line.QuantityInvoiced, &warehouseID, &lineNotes,
+			&packagingID, &packagingQty,
 			&line.ProductName, &line.UnitName,
+			&packagingName, &packagingUnitQty,
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
@@ -582,6 +597,19 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 		}
 		if lineNotes.Valid {
 			line.Notes = &lineNotes.String
+		}
+		if packagingID.Valid {
+			if pkgid, err := uuid.Parse(packagingID.String); err == nil {
+				line.PackagingID = &pkgid
+				line.Packaging = &entity.ProductPackaging{
+					ID:   pkgid,
+					Name: packagingName,
+					Qty:  packagingUnitQty,
+				}
+			}
+		}
+		if packagingQty.Valid {
+			line.PackagingQty = &packagingQty.Float64
 		}
 
 		po.Lines = append(po.Lines, line)

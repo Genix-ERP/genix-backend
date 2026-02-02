@@ -322,6 +322,45 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	rg.POST("/products/:id/attributes", middleware.RequirePermission("inventory", "product", "update"), h.AddProductAttribute)
 	rg.GET("/products/:id/attributes", middleware.RequirePermission("inventory", "product", "read"), h.GetProductTemplateAttributes)
 
+	// Product Packagings (Odoo-style - how products are sold/purchased in bulk)
+	productPackagings := rg.Group("/product-packagings")
+	productPackagings.Use(middleware.RequirePermission("inventory", "product", "read"))
+	{
+		productPackagings.GET("", h.ListProductPackagings)
+		productPackagings.POST("", middleware.RequirePermission("inventory", "product", "create"), h.CreateProductPackaging)
+		productPackagings.GET("/:id", h.GetProductPackaging)
+		productPackagings.PUT("/:id", middleware.RequirePermission("inventory", "product", "update"), h.UpdateProductPackaging)
+		productPackagings.DELETE("/:id", middleware.RequirePermission("inventory", "product", "delete"), h.DeleteProductPackaging)
+	}
+
+	// Product Packagings by Product
+	rg.GET("/products/:id/packagings", middleware.RequirePermission("inventory", "product", "read"), h.ListProductPackagingsByProduct)
+	rg.POST("/products/:id/packagings", middleware.RequirePermission("inventory", "product", "update"), h.CreateProductPackagingForProduct)
+
+	// Package Types (box sizes, pallets, containers)
+	packageTypes := rg.Group("/package-types")
+	packageTypes.Use(middleware.RequirePermission("inventory", "warehouse", "read"))
+	{
+		packageTypes.GET("", h.ListPackageTypes)
+		packageTypes.POST("", middleware.RequirePermission("inventory", "warehouse", "create"), h.CreatePackageType)
+		packageTypes.GET("/:id", h.GetPackageType)
+		packageTypes.PUT("/:id", middleware.RequirePermission("inventory", "warehouse", "update"), h.UpdatePackageType)
+		packageTypes.DELETE("/:id", middleware.RequirePermission("inventory", "warehouse", "delete"), h.DeletePackageType)
+	}
+
+	// Packages (physical packages in warehouse)
+	packages := rg.Group("/packages")
+	packages.Use(middleware.RequirePermission("inventory", "warehouse", "read"))
+	{
+		packages.GET("", h.ListPackages)
+		packages.POST("", middleware.RequirePermission("inventory", "warehouse", "create"), h.CreatePackage)
+		packages.GET("/:id", h.GetPackage)
+		packages.PUT("/:id", middleware.RequirePermission("inventory", "warehouse", "update"), h.UpdatePackage)
+		packages.DELETE("/:id", middleware.RequirePermission("inventory", "warehouse", "delete"), h.DeletePackage)
+		packages.POST("/:id/contents", middleware.RequirePermission("inventory", "warehouse", "update"), h.AddPackageContent)
+		packages.DELETE("/:id/contents/:contentId", middleware.RequirePermission("inventory", "warehouse", "update"), h.RemovePackageContent)
+	}
+
 	// Bill of Materials (BOM)
 	bom := rg.Group("/bom")
 	bom.Use(middleware.RequirePermission("inventory", "bom", "read"))
@@ -370,6 +409,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reorder.GET("/:id", h.GetReorderRule)
 		reorder.PUT("/:id", middleware.RequirePermission("inventory", "reorder", "update"), h.UpdateReorderRule)
 		reorder.DELETE("/:id", middleware.RequirePermission("inventory", "reorder", "delete"), h.DeleteReorderRule)
+	}
+
+	// Replenishment
+	replenishment := rg.Group("/replenishment")
+	replenishment.Use(middleware.RequirePermission("inventory", "reorder", "read"))
+	{
+		replenishment.GET("/preview", h.GetReplenishmentPreview)
+		replenishment.POST("/run", middleware.RequirePermission("purchase", "order", "create"), h.RunReplenishment)
 	}
 
 	// Quotations
