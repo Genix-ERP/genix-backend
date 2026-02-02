@@ -103,11 +103,14 @@ type SalesOrderLine struct {
 	QuantityInvoiced  float64    `json:"quantity_invoiced" db:"quantity_invoiced"`
 	WarehouseID       *uuid.UUID `json:"warehouse_id,omitempty" db:"warehouse_id"`
 	Notes             *string    `json:"notes,omitempty" db:"notes"`
+	PackagingID       *uuid.UUID `json:"packaging_id,omitempty" db:"packaging_id"`
+	PackagingQty      *float64   `json:"packaging_qty,omitempty" db:"packaging_qty"`
 	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
-	Product *Product `json:"product,omitempty"`
+	Product   *Product          `json:"product,omitempty"`
+	Packaging *ProductPackaging `json:"packaging,omitempty"`
 }
 
 // SalesInvoice represents a sales invoice
@@ -165,10 +168,13 @@ type SalesInvoiceLine struct {
 	TaxAmount        float64    `json:"tax_amount" db:"tax_amount"`
 	LineTotal        float64    `json:"line_total" db:"line_total"`
 	AccountID        *uuid.UUID `json:"account_id,omitempty" db:"account_id"`
+	PackagingID      *uuid.UUID `json:"packaging_id,omitempty" db:"packaging_id"`
+	PackagingQty     *float64   `json:"packaging_qty,omitempty" db:"packaging_qty"`
 	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
 
 	// Relationships
-	Product *Product `json:"product,omitempty"`
+	Product   *Product          `json:"product,omitempty"`
+	Packaging *ProductPackaging `json:"packaging,omitempty"`
 }
 
 // CreateSalesOrderInput represents input for creating a sales order
@@ -195,16 +201,18 @@ type CreateSalesOrderInput struct {
 
 // CreateSalesOrderLineInput represents input for creating a sales order line
 type CreateSalesOrderLineInput struct {
-	ProductID     string  `json:"product_id" binding:"required"`
-	Description   string  `json:"description,omitempty"`
-	Quantity      float64 `json:"quantity" binding:"required,gt=0"`
-	UnitID        string  `json:"unit_id,omitempty"`
-	UnitPrice     float64 `json:"unit_price" binding:"required,gte=0"`
-	DiscountType  string  `json:"discount_type,omitempty"`
-	DiscountValue float64 `json:"discount_value,omitempty"`
-	TaxID         string  `json:"tax_id,omitempty"`
-	WarehouseID   string  `json:"warehouse_id,omitempty"`
-	Notes         string  `json:"notes,omitempty"`
+	ProductID     string   `json:"product_id" binding:"required"`
+	Description   string   `json:"description,omitempty"`
+	Quantity      float64  `json:"quantity" binding:"required,gt=0"`
+	UnitID        string   `json:"unit_id,omitempty"`
+	UnitPrice     float64  `json:"unit_price" binding:"required,gte=0"`
+	DiscountType  string   `json:"discount_type,omitempty"`
+	DiscountValue float64  `json:"discount_value,omitempty"`
+	TaxID         string   `json:"tax_id,omitempty"`
+	WarehouseID   string   `json:"warehouse_id,omitempty"`
+	Notes         string   `json:"notes,omitempty"`
+	PackagingID   string   `json:"packaging_id,omitempty"`
+	PackagingQty  *float64 `json:"packaging_qty,omitempty"`
 }
 
 // UpdateSalesOrderInput represents input for updating a sales order
