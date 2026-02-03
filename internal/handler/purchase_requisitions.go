@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
@@ -644,14 +645,23 @@ func (h *Handler) SubmitPurchaseRequisition(c *gin.Context) {
 		return
 	}
 
+	userID, _ := middleware.GetUserID(c)
+
 	prID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid requisition ID")
 		return
 	}
 
+	// Get PR details
 	var currentStatus string
-	err = h.db.QueryRow("SELECT status FROM purchase_requisitions WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", prID, tenantID).Scan(&currentStatus)
+	var totalAmount float64
+	var prNumber string
+	err = h.db.QueryRow(`
+		SELECT status, COALESCE(total_amount, 0), pr_number
+		FROM purchase_requisitions
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, prID, tenantID).Scan(&currentStatus, &totalAmount, &prNumber)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase requisition")
 		return
@@ -661,16 +671,85 @@ func (h *Handler) SubmitPurchaseRequisition(c *gin.Context) {
 		return
 	}
 
-	_, err = h.db.Exec(
-		"UPDATE purchase_requisitions SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
-		PRStatusPendingApproval, time.Now(), prID, tenantID,
-	)
+	// Evaluate procurement rules
+	result, err := h.EvaluateRules(tenantID, entity.DocumentTypePurchaseRequisition, prID, totalAmount, nil, userID)
 	if err != nil {
-		response.InternalError(c, "Failed to submit requisition")
-		return
+		h.log.Error("Failed to evaluate rules", "error", err)
+		// Fall back to pending_approval
+		result = &entity.RuleEvaluationResult{Action: entity.ActionRoute}
 	}
 
-	h.GetPurchaseRequisition(c)
+	now := time.Now()
+
+	switch result.Action {
+	case entity.ActionAutoApprove:
+		// Auto-approve
+		_, err = h.db.Exec(
+			"UPDATE purchase_requisitions SET status = $1, approved_by = $2, approved_at = $3, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
+			PRStatusApproved, userID.String(), now, prID, tenantID,
+		)
+		if err != nil {
+			h.log.Error("Failed to auto-approve PR", "error", err)
+			response.InternalError(c, "Failed to approve requisition")
+			return
+		}
+		response.Success(c, gin.H{
+			"message":       "Requisition auto-approved",
+			"status":        PRStatusApproved,
+			"auto_approved": true,
+		})
+
+	case entity.ActionBlock:
+		response.BadRequest(c, result.Message)
+
+	default: // ActionRoute, ActionWarn, or any other
+		// Create approval workflow if approvers specified
+		if len(result.ApproverIDs) > 0 {
+			workflow, err := h.CreateApprovalWorkflow(tenantID, entity.DocumentTypePurchaseRequisition, prID, prNumber, result)
+			if err != nil {
+				h.log.Error("Failed to create approval workflow", "error", err)
+			}
+
+			_, err = h.db.Exec(
+				"UPDATE purchase_requisitions SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+				PRStatusPendingApproval, now, prID, tenantID,
+			)
+			if err != nil {
+				response.InternalError(c, "Failed to submit requisition")
+				return
+			}
+
+			resp := gin.H{
+				"message":     "Requisition submitted for approval",
+				"status":      PRStatusPendingApproval,
+				"workflow_id": workflow.ID,
+				"approvers":   result.ApproverIDs,
+			}
+			if result.Action == entity.ActionWarn {
+				resp["warning"] = result.Message
+			}
+			response.Success(c, resp)
+		} else {
+			// No specific approvers, just set to pending approval
+			_, err = h.db.Exec(
+				"UPDATE purchase_requisitions SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+				PRStatusPendingApproval, now, prID, tenantID,
+			)
+			if err != nil {
+				response.InternalError(c, "Failed to submit requisition")
+				return
+			}
+
+			resp := gin.H{
+				"message": "Requisition submitted for approval",
+				"status":  PRStatusPendingApproval,
+			}
+			if result.Action == entity.ActionWarn {
+				resp["warning"] = result.Message
+			}
+			response.Success(c, resp)
+		}
+	}
 }
 
 // ApprovePurchaseRequisition approves a PR
@@ -732,6 +811,13 @@ func (h *Handler) ApprovePurchaseRequisition(c *gin.Context) {
 		}
 		h.db.Exec("UPDATE purchase_requisition_lines SET approved_quantity = $1, updated_at = $2 WHERE id = $3", line.ApprovedQuantity, now, lineID)
 	}
+
+	// Cancel any pending workflow for this document
+	_, _ = h.db.Exec(`
+		UPDATE approval_workflow_instances
+		SET status = 'cancelled', completed_at = $1, updated_at = $1
+		WHERE document_type = 'purchase_requisition' AND document_id = $2 AND status = 'pending'
+	`, now, prID)
 
 	h.GetPurchaseRequisition(c)
 }

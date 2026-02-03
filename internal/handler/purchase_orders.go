@@ -813,7 +813,149 @@ func (h *Handler) DeletePurchaseOrder(c *gin.Context) {
 	response.NoContent(c)
 }
 
-// ApprovePurchaseOrder approves a purchase order
+// SubmitPOForApproval submits a purchase order for approval (evaluates procurement rules)
+func (h *Handler) SubmitPOForApproval(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid purchase order ID")
+		return
+	}
+
+	// Get order details
+	var currentStatus string
+	var totalAmount float64
+	var vendorID uuid.UUID
+	var orderNumber string
+	err = h.db.QueryRow(`
+		SELECT status, total_amount, vendor_id, order_number
+		FROM purchase_orders
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&currentStatus, &totalAmount, &vendorID, &orderNumber)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Purchase order")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get purchase order", "error", err)
+		response.InternalError(c, "Failed to submit purchase order")
+		return
+	}
+
+	if currentStatus != string(entity.POStatusDraft) {
+		response.BadRequest(c, "Only draft orders can be submitted for approval")
+		return
+	}
+
+	// Evaluate procurement rules
+	result, err := h.EvaluateRules(tenantID, entity.DocumentTypePurchaseOrder, id, totalAmount, &vendorID, userID)
+	if err != nil {
+		h.log.Error("Failed to evaluate rules", "error", err)
+		// Fall back to pending_approval
+		result = &entity.RuleEvaluationResult{Action: entity.ActionRoute}
+	}
+
+	now := time.Now()
+
+	switch result.Action {
+	case entity.ActionAutoApprove:
+		// Auto-approve
+		query := `
+			UPDATE purchase_orders
+			SET status = $1, approved_by = $2, approved_at = $3, updated_at = $3
+			WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
+		`
+		_, err = h.db.Exec(query, entity.POStatusApproved, userID, now, id, tenantID)
+		if err != nil {
+			h.log.Error("Failed to auto-approve purchase order", "error", err)
+			response.InternalError(c, "Failed to approve purchase order")
+			return
+		}
+		response.Success(c, gin.H{
+			"message":      "Purchase order auto-approved",
+			"status":       entity.POStatusApproved,
+			"auto_approved": true,
+		})
+
+	case entity.ActionBlock:
+		response.BadRequest(c, result.Message)
+
+	case entity.ActionWarn:
+		// Set to pending approval but include warning
+		query := `
+			UPDATE purchase_orders
+			SET status = $1, updated_at = $2
+			WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+		`
+		_, err = h.db.Exec(query, entity.POStatusPendingApproval, now, id, tenantID)
+		if err != nil {
+			h.log.Error("Failed to submit purchase order", "error", err)
+			response.InternalError(c, "Failed to submit purchase order")
+			return
+		}
+		response.Success(c, gin.H{
+			"message": "Purchase order submitted for approval",
+			"status":  entity.POStatusPendingApproval,
+			"warning": result.Message,
+		})
+
+	default: // ActionRoute or any other
+		// Create approval workflow if approvers specified
+		if len(result.ApproverIDs) > 0 {
+			workflow, err := h.CreateApprovalWorkflow(tenantID, entity.DocumentTypePurchaseOrder, id, orderNumber, result)
+			if err != nil {
+				h.log.Error("Failed to create approval workflow", "error", err)
+			}
+
+			// Set to pending approval
+			query := `
+				UPDATE purchase_orders
+				SET status = $1, updated_at = $2
+				WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+			`
+			_, err = h.db.Exec(query, entity.POStatusPendingApproval, now, id, tenantID)
+			if err != nil {
+				h.log.Error("Failed to submit purchase order", "error", err)
+				response.InternalError(c, "Failed to submit purchase order")
+				return
+			}
+
+			response.Success(c, gin.H{
+				"message":     "Purchase order submitted for approval",
+				"status":      entity.POStatusPendingApproval,
+				"workflow_id": workflow.ID,
+				"approvers":   result.ApproverIDs,
+			})
+		} else {
+			// No specific approvers, just set to pending approval
+			query := `
+				UPDATE purchase_orders
+				SET status = $1, updated_at = $2
+				WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+			`
+			_, err = h.db.Exec(query, entity.POStatusPendingApproval, now, id, tenantID)
+			if err != nil {
+				h.log.Error("Failed to submit purchase order", "error", err)
+				response.InternalError(c, "Failed to submit purchase order")
+				return
+			}
+			response.Success(c, gin.H{
+				"message": "Purchase order submitted for approval",
+				"status":  entity.POStatusPendingApproval,
+			})
+		}
+	}
+}
+
+// ApprovePurchaseOrder approves a purchase order (direct approval by authorized user)
 func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -861,6 +1003,13 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		response.InternalError(c, "Failed to approve purchase order")
 		return
 	}
+
+	// Cancel any pending workflow for this document
+	_, _ = h.db.Exec(`
+		UPDATE approval_workflow_instances
+		SET status = 'cancelled', completed_at = $1, updated_at = $1
+		WHERE document_type = 'purchase_order' AND document_id = $2 AND status = 'pending'
+	`, now, id)
 
 	response.Success(c, gin.H{"message": "Purchase order approved successfully", "status": entity.POStatusApproved})
 }
