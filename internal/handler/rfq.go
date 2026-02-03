@@ -781,3 +781,258 @@ func (h *Handler) OpenRFQ(c *gin.Context) {
 
 	response.Success(c, gin.H{"message": "RFQ opened successfully", "status": entity.RFQStatusOpen})
 }
+
+// ConvertRFQToPO creates a Purchase Order from a closed RFQ with a selected winner
+func (h *Handler) ConvertRFQToPO(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	rfqID, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid RFQ ID")
+		return
+	}
+
+	// Get RFQ details
+	var rfq struct {
+		ID          uuid.UUID
+		RFQNumber   string
+		Title       string
+		Status      string
+		WinnerID    sql.NullString
+		Description sql.NullString
+		Notes       sql.NullString
+	}
+
+	err = h.db.QueryRow(`
+		SELECT id, rfq_number, title, status, winner_id, description, notes
+		FROM rfqs
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, rfqID, tenantID).Scan(
+		&rfq.ID, &rfq.RFQNumber, &rfq.Title, &rfq.Status,
+		&rfq.WinnerID, &rfq.Description, &rfq.Notes,
+	)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "RFQ")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get RFQ", "error", err)
+		response.InternalError(c, "Failed to convert RFQ to PO")
+		return
+	}
+
+	// Validate RFQ status
+	if rfq.Status != string(entity.RFQStatusClosed) {
+		response.BadRequest(c, "Only closed RFQs with a selected winner can be converted to PO")
+		return
+	}
+
+	if !rfq.WinnerID.Valid {
+		response.BadRequest(c, "RFQ has no selected winner")
+		return
+	}
+
+	winnerID, err := uuid.Parse(rfq.WinnerID.String)
+	if err != nil {
+		response.BadRequest(c, "Invalid winner ID")
+		return
+	}
+
+	// Check if a PO already exists for this RFQ
+	var existingPOCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE rfq_id = $1 AND tenant_id = $2 AND deleted_at IS NULL", rfqID, tenantID).Scan(&existingPOCount)
+	if existingPOCount > 0 {
+		response.BadRequest(c, "A Purchase Order already exists for this RFQ")
+		return
+	}
+
+	// Get winning response details
+	var winningResponse struct {
+		ID           uuid.UUID
+		TotalAmount  float64
+		LeadTimeDays sql.NullInt64
+		Notes        sql.NullString
+	}
+
+	err = h.db.QueryRow(`
+		SELECT id, total_amount, lead_time_days, notes
+		FROM rfq_responses
+		WHERE rfq_id = $1 AND vendor_id = $2 AND is_winner = true
+	`, rfqID, winnerID).Scan(
+		&winningResponse.ID, &winningResponse.TotalAmount,
+		&winningResponse.LeadTimeDays, &winningResponse.Notes,
+	)
+	if err != nil && err != sql.ErrNoRows {
+		h.log.Error("Failed to get winning response", "error", err)
+	}
+
+	// Get RFQ items with response prices
+	type rfqItemWithPrice struct {
+		ProductID   sql.NullString
+		Description string
+		Quantity    float64
+		Unit        string
+		UnitPrice   float64
+	}
+
+	rows, err := h.db.Query(`
+		SELECT i.product_id, i.description, i.quantity, COALESCE(i.unit, 'pcs'),
+			   COALESCE(ri.unit_price, 0)
+		FROM rfq_items i
+		LEFT JOIN rfq_response_items ri ON ri.item_id = i.id AND ri.response_id = $2
+		WHERE i.rfq_id = $1
+		ORDER BY i.line_number
+	`, rfqID, winningResponse.ID)
+	if err != nil {
+		h.log.Error("Failed to get RFQ items", "error", err)
+		response.InternalError(c, "Failed to convert RFQ to PO")
+		return
+	}
+	defer rows.Close()
+
+	var items []rfqItemWithPrice
+	for rows.Next() {
+		var item rfqItemWithPrice
+		if err := rows.Scan(&item.ProductID, &item.Description, &item.Quantity, &item.Unit, &item.UnitPrice); err != nil {
+			h.log.Error("Failed to scan RFQ item", "error", err)
+			continue
+		}
+		items = append(items, item)
+	}
+
+	if len(items) == 0 {
+		response.BadRequest(c, "RFQ has no items")
+		return
+	}
+
+	// Get vendor name
+	var vendorName string
+	h.db.QueryRow("SELECT name FROM contacts WHERE id = $1", winnerID).Scan(&vendorName)
+
+	// Start transaction
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to convert RFQ to PO")
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	poID := uuid.New()
+
+	// Generate PO number
+	var poCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
+	poNumber := fmt.Sprintf("PO-%s-%04d", now.Format("2006"), poCount+1)
+
+	// Calculate expected delivery date based on lead time
+	expectedDate := now.AddDate(0, 0, 7) // default 7 days
+	if winningResponse.LeadTimeDays.Valid && winningResponse.LeadTimeDays.Int64 > 0 {
+		expectedDate = now.AddDate(0, 0, int(winningResponse.LeadTimeDays.Int64))
+	}
+
+	// Calculate totals
+	var subtotal float64
+	for _, item := range items {
+		subtotal += item.Quantity * item.UnitPrice
+	}
+
+	// Build notes for PO
+	poNotes := fmt.Sprintf("Created from RFQ: %s", rfq.RFQNumber)
+	if rfq.Notes.Valid && rfq.Notes.String != "" {
+		poNotes += "\n\nRFQ Notes: " + rfq.Notes.String
+	}
+	if winningResponse.Notes.Valid && winningResponse.Notes.String != "" {
+		poNotes += "\n\nVendor Notes: " + winningResponse.Notes.String
+	}
+
+	// Insert Purchase Order
+	_, err = tx.Exec(`
+		INSERT INTO purchase_orders (
+			id, tenant_id, order_number, vendor_id, vendor_name,
+			order_date, expected_date, subtotal, total_amount,
+			status, payment_status, notes, rfq_id,
+			requested_by, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9,
+			$10, $11, $12, $13,
+			$14, $15, $16
+		)
+	`, poID, tenantID, poNumber, winnerID, vendorName,
+		now, expectedDate, subtotal, subtotal,
+		"draft", "unpaid", poNotes, rfqID,
+		userID, now, now)
+	if err != nil {
+		h.log.Error("Failed to create PO", "error", err)
+		response.InternalError(c, "Failed to create Purchase Order")
+		return
+	}
+
+	// Insert PO lines
+	for i, item := range items {
+		lineID := uuid.New()
+		lineNumber := i + 1
+		lineTotal := item.Quantity * item.UnitPrice
+
+		var productID *uuid.UUID
+		if item.ProductID.Valid {
+			if pid, err := uuid.Parse(item.ProductID.String); err == nil {
+				productID = &pid
+			}
+		}
+
+		// Get product name if product_id exists
+		productName := item.Description
+		if productID != nil {
+			var pName string
+			if err := h.db.QueryRow("SELECT name FROM products WHERE id = $1", productID).Scan(&pName); err == nil && pName != "" {
+				productName = pName
+			}
+		}
+
+		_, err = tx.Exec(`
+			INSERT INTO purchase_order_lines (
+				id, tenant_id, purchase_order_id, line_number,
+				product_id, product_name, quantity, unit_price, total_price,
+				created_at, updated_at
+			) VALUES (
+				$1, $2, $3, $4,
+				$5, $6, $7, $8, $9,
+				$10, $11
+			)
+		`, lineID, tenantID, poID, lineNumber,
+			productID, productName, item.Quantity, item.UnitPrice, lineTotal,
+			now, now)
+		if err != nil {
+			h.log.Error("Failed to create PO line", "error", err)
+			response.InternalError(c, "Failed to create Purchase Order lines")
+			return
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to convert RFQ to PO")
+		return
+	}
+
+	response.Created(c, gin.H{
+		"message":          "Purchase Order created successfully from RFQ",
+		"purchase_order_id": poID,
+		"order_number":      poNumber,
+		"rfq_number":        rfq.RFQNumber,
+		"vendor_name":       vendorName,
+		"total_amount":      subtotal,
+		"expected_date":     expectedDate.Format("2006-01-02"),
+	})
+}
