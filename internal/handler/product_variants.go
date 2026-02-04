@@ -39,6 +39,7 @@ type AttributeValue struct {
 	Code        *string   `json:"code"`
 	HTMLColor   *string   `json:"html_color"`
 	SortOrder   int       `json:"sort_order"`
+	PriceExtra  float64   `json:"price_extra"`
 	IsActive    bool      `json:"is_active"`
 	CreatedAt   time.Time `json:"created_at"`
 }
@@ -74,7 +75,7 @@ func (h *Handler) ListProductAttributes(c *gin.Context) {
 
 		// Fetch values for this attribute
 		valueRows, err := h.db.Query(`
-			SELECT id, tenant_id, attribute_id, name, code, html_color, sort_order, is_active, created_at
+			SELECT id, tenant_id, attribute_id, name, code, html_color, sort_order, COALESCE(price_extra, 0), is_active, created_at
 			FROM product_attribute_values
 			WHERE attribute_id = $1 AND deleted_at IS NULL
 			ORDER BY sort_order, name
@@ -83,7 +84,7 @@ func (h *Handler) ListProductAttributes(c *gin.Context) {
 			for valueRows.Next() {
 				var val AttributeValue
 				if err := valueRows.Scan(&val.ID, &val.TenantID, &val.AttributeID, &val.Name, &val.Code,
-					&val.HTMLColor, &val.SortOrder, &val.IsActive, &val.CreatedAt); err == nil {
+					&val.HTMLColor, &val.SortOrder, &val.PriceExtra, &val.IsActive, &val.CreatedAt); err == nil {
 					attr.Values = append(attr.Values, val)
 				}
 			}
@@ -250,10 +251,11 @@ func (h *Handler) CreateAttributeValue(c *gin.Context) {
 	}
 
 	var input struct {
-		Name      string  `json:"name" binding:"required"`
-		Code      *string `json:"code"`
-		HTMLColor *string `json:"html_color"`
-		SortOrder int     `json:"sort_order"`
+		Name       string   `json:"name" binding:"required"`
+		Code       *string  `json:"code"`
+		HTMLColor  *string  `json:"html_color"`
+		SortOrder  int      `json:"sort_order"`
+		PriceExtra *float64 `json:"price_extra"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -264,10 +266,16 @@ func (h *Handler) CreateAttributeValue(c *gin.Context) {
 	now := time.Now()
 	valueID := uuid.New()
 
+	// Default price_extra to 0 if not provided
+	priceExtra := 0.0
+	if input.PriceExtra != nil {
+		priceExtra = *input.PriceExtra
+	}
+
 	_, err = h.db.Exec(`
-		INSERT INTO product_attribute_values (id, tenant_id, attribute_id, name, code, html_color, sort_order, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $8)
-	`, valueID, tenantID, attrID, input.Name, input.Code, input.HTMLColor, input.SortOrder, now)
+		INSERT INTO product_attribute_values (id, tenant_id, attribute_id, name, code, html_color, sort_order, price_extra, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)
+	`, valueID, tenantID, attrID, input.Name, input.Code, input.HTMLColor, input.SortOrder, priceExtra, now)
 	if err != nil {
 		response.InternalError(c, "Failed to create attribute value: "+err.Error())
 		return
@@ -863,17 +871,21 @@ func (h *Handler) AddProductAttribute(c *gin.Context) {
 		SELECT id FROM product_template_attributes WHERE product_id = $1 AND attribute_id = $2
 	`, productID, attributeID).Scan(&ptaID)
 
-	// Add product_template_attribute_values
+	// Add product_template_attribute_values with price_extra from attribute value
 	for _, valIDStr := range input.ValueIDs {
 		valID, err := uuid.Parse(valIDStr)
 		if err != nil {
 			continue
 		}
+		// Get default price_extra from the attribute value
+		var priceExtra float64
+		h.db.QueryRow(`SELECT COALESCE(price_extra, 0) FROM product_attribute_values WHERE id = $1`, valID).Scan(&priceExtra)
+
 		h.db.Exec(`
 			INSERT INTO product_template_attribute_values (id, tenant_id, product_template_attribute_id, attribute_value_id, price_extra, is_active, created_at)
-			VALUES ($1, $2, $3, $4, 0, true, $5)
+			VALUES ($1, $2, $3, $4, $5, true, $6)
 			ON CONFLICT (product_template_attribute_id, attribute_value_id) DO NOTHING
-		`, uuid.New(), tenantID, ptaID, valID, now)
+		`, uuid.New(), tenantID, ptaID, valID, priceExtra, now)
 	}
 
 	response.Success(c, map[string]interface{}{

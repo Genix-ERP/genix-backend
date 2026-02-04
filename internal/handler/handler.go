@@ -527,6 +527,43 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		quotationTemplates.POST("/:id/duplicate", middleware.RequirePermission("sales", "quotation_template", "create"), h.DuplicateQuotationTemplate)
 	}
 
+	// Customer Follow-ups (Dunning)
+	followups := rg.Group("/followups")
+	followups.Use(middleware.RequirePermission("finance", "followup", "read"))
+	{
+		followups.GET("/summary", h.GetFollowupSummary)
+		followups.GET("/customers", h.ListCustomerFollowups)
+		followups.GET("/customers/:customer_id", h.GetCustomerFollowupDetails)
+		followups.POST("/actions", middleware.RequirePermission("finance", "followup", "create"), h.CreateFollowupAction)
+		followups.POST("/send-reminder", middleware.RequirePermission("finance", "followup", "create"), h.SendFollowupReminder)
+		followups.POST("/promises", middleware.RequirePermission("finance", "followup", "create"), h.CreatePaymentPromise)
+		followups.PUT("/promises/:id/status", middleware.RequirePermission("finance", "followup", "update"), h.UpdatePaymentPromiseStatus)
+	}
+
+	// Follow-up Levels
+	followupLevels := rg.Group("/followup-levels")
+	followupLevels.Use(middleware.RequirePermission("finance", "followup_level", "read"))
+	{
+		followupLevels.GET("", h.ListFollowupLevels)
+		followupLevels.POST("", middleware.RequirePermission("finance", "followup_level", "create"), h.CreateFollowupLevel)
+		followupLevels.PUT("/:id", middleware.RequirePermission("finance", "followup_level", "update"), h.UpdateFollowupLevel)
+		followupLevels.DELETE("/:id", middleware.RequirePermission("finance", "followup_level", "delete"), h.DeleteFollowupLevel)
+	}
+
+	// Tax Reports
+	taxReports := rg.Group("/tax-reports")
+	taxReports.Use(middleware.RequirePermission("finance", "tax_report", "read"))
+	{
+		taxReports.GET("/summary", h.GetTaxReportSummary)
+		taxReports.GET("/transactions", h.GetTaxTransactions)
+		taxReports.GET("/periods", h.ListTaxReportPeriods)
+		taxReports.POST("/periods", middleware.RequirePermission("finance", "tax_report", "create"), h.CreateTaxReportPeriod)
+		taxReports.GET("/periods/:id", h.GetTaxReportPeriod)
+		taxReports.POST("/periods/:id/calculate", middleware.RequirePermission("finance", "tax_report", "update"), h.CalculateTaxReport)
+		taxReports.POST("/periods/:id/file", middleware.RequirePermission("finance", "tax_report", "file"), h.FileTaxReport)
+		taxReports.DELETE("/periods/:id", middleware.RequirePermission("finance", "tax_report", "delete"), h.DeleteTaxReportPeriod)
+	}
+
 	// Discounts
 	discounts := rg.Group("/discounts")
 	discounts.Use(middleware.RequirePermission("sales", "discount", "read"))
