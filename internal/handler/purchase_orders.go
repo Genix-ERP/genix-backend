@@ -342,15 +342,15 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			id, purchase_order_id, line_number, product_id, description,
 			quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount,
 			line_total, quantity_received, quantity_invoiced, warehouse_id, notes,
-			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			packaging_id, packaging_qty, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 	`
 
 	lines := make([]entity.PurchaseOrderLine, 0, len(input.Lines))
 	for i, line := range input.Lines {
 		lineID := uuid.New()
 
-		var productID, unitID, taxID, lineWarehouseID *uuid.UUID
+		var productID, unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
 		if line.ProductID != "" {
 			if pid, err := uuid.Parse(line.ProductID); err == nil {
 				productID = &pid
@@ -373,6 +373,11 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		} else if warehouseID != nil {
 			lineWarehouseID = warehouseID
 		}
+		if line.PackagingID != "" {
+			if pkgid, err := uuid.Parse(line.PackagingID); err == nil {
+				packagingID = &pkgid
+			}
+		}
 
 		lineSubtotal := line.Quantity * line.UnitPrice
 		lineTax := (lineSubtotal - line.DiscountAmount) * line.TaxPercent / 100
@@ -387,7 +392,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			lineID, id, i+1, productID, line.Description,
 			line.Quantity, unitID, line.UnitPrice, line.DiscountAmount, taxID, lineTax,
 			lineTotal, 0, 0, lineWarehouseID, lineNotes,
-			now, now,
+			packagingID, line.PackagingQty, now, now,
 		)
 		if err != nil {
 			h.log.Error("Failed to insert purchase order line", "error", err)
@@ -410,6 +415,8 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			LineTotal:       lineTotal,
 			WarehouseID:     lineWarehouseID,
 			Notes:           lineNotes,
+			PackagingID:     packagingID,
+			PackagingQty:    line.PackagingQty,
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		})
@@ -525,11 +532,14 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			   pol.description, pol.quantity, pol.unit_id, pol.unit_price,
 			   pol.discount_amount, pol.tax_id, pol.tax_amount, pol.line_total,
 			   pol.quantity_received, pol.quantity_invoiced, pol.warehouse_id, pol.notes,
+			   pol.packaging_id, pol.packaging_qty,
 			   COALESCE(p.name, '') as product_name, COALESCE(u.name, '') as unit_name,
+			   COALESCE(pkg.name, '') as packaging_name, COALESCE(pkg.qty, 0) as packaging_unit_qty,
 			   pol.created_at, pol.updated_at
 		FROM purchase_order_lines pol
 		LEFT JOIN products p ON pol.product_id = p.id
 		LEFT JOIN units_of_measure u ON pol.unit_id = u.id
+		LEFT JOIN product_packagings pkg ON pol.packaging_id = pkg.id
 		WHERE pol.purchase_order_id = $1
 		ORDER BY pol.line_number ASC
 	`
@@ -545,15 +555,20 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	po.Lines = make([]entity.PurchaseOrderLine, 0)
 	for rows.Next() {
 		var line entity.PurchaseOrderLine
-		var productID, unitID, taxID, warehouseID sql.NullString
+		var productID, unitID, taxID, warehouseID, packagingID sql.NullString
 		var lineNotes sql.NullString
+		var packagingQty sql.NullFloat64
+		var packagingName string
+		var packagingUnitQty float64
 
 		err := rows.Scan(
 			&line.ID, &line.PurchaseOrderID, &line.LineNumber, &productID,
 			&line.Description, &line.Quantity, &unitID, &line.UnitPrice,
 			&line.DiscountAmount, &taxID, &line.TaxAmount, &line.LineTotal,
 			&line.QuantityReceived, &line.QuantityInvoiced, &warehouseID, &lineNotes,
+			&packagingID, &packagingQty,
 			&line.ProductName, &line.UnitName,
+			&packagingName, &packagingUnitQty,
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
@@ -582,6 +597,19 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 		}
 		if lineNotes.Valid {
 			line.Notes = &lineNotes.String
+		}
+		if packagingID.Valid {
+			if pkgid, err := uuid.Parse(packagingID.String); err == nil {
+				line.PackagingID = &pkgid
+				line.Packaging = &entity.ProductPackaging{
+					ID:   pkgid,
+					Name: packagingName,
+					Qty:  packagingUnitQty,
+				}
+			}
+		}
+		if packagingQty.Valid {
+			line.PackagingQty = &packagingQty.Float64
 		}
 
 		po.Lines = append(po.Lines, line)
@@ -785,7 +813,149 @@ func (h *Handler) DeletePurchaseOrder(c *gin.Context) {
 	response.NoContent(c)
 }
 
-// ApprovePurchaseOrder approves a purchase order
+// SubmitPOForApproval submits a purchase order for approval (evaluates procurement rules)
+func (h *Handler) SubmitPOForApproval(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid purchase order ID")
+		return
+	}
+
+	// Get order details
+	var currentStatus string
+	var totalAmount float64
+	var vendorID uuid.UUID
+	var orderNumber string
+	err = h.db.QueryRow(`
+		SELECT status, total_amount, vendor_id, order_number
+		FROM purchase_orders
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&currentStatus, &totalAmount, &vendorID, &orderNumber)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Purchase order")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get purchase order", "error", err)
+		response.InternalError(c, "Failed to submit purchase order")
+		return
+	}
+
+	if currentStatus != string(entity.POStatusDraft) {
+		response.BadRequest(c, "Only draft orders can be submitted for approval")
+		return
+	}
+
+	// Evaluate procurement rules
+	result, err := h.EvaluateRules(tenantID, entity.DocumentTypePurchaseOrder, id, totalAmount, &vendorID, userID)
+	if err != nil {
+		h.log.Error("Failed to evaluate rules", "error", err)
+		// Fall back to pending_approval
+		result = &entity.RuleEvaluationResult{Action: entity.ActionRoute}
+	}
+
+	now := time.Now()
+
+	switch result.Action {
+	case entity.ActionAutoApprove:
+		// Auto-approve
+		query := `
+			UPDATE purchase_orders
+			SET status = $1, approved_by = $2, approved_at = $3, updated_at = $3
+			WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
+		`
+		_, err = h.db.Exec(query, entity.POStatusApproved, userID, now, id, tenantID)
+		if err != nil {
+			h.log.Error("Failed to auto-approve purchase order", "error", err)
+			response.InternalError(c, "Failed to approve purchase order")
+			return
+		}
+		response.Success(c, gin.H{
+			"message":      "Purchase order auto-approved",
+			"status":       entity.POStatusApproved,
+			"auto_approved": true,
+		})
+
+	case entity.ActionBlock:
+		response.BadRequest(c, result.Message)
+
+	case entity.ActionWarn:
+		// Set to pending approval but include warning
+		query := `
+			UPDATE purchase_orders
+			SET status = $1, updated_at = $2
+			WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+		`
+		_, err = h.db.Exec(query, entity.POStatusPendingApproval, now, id, tenantID)
+		if err != nil {
+			h.log.Error("Failed to submit purchase order", "error", err)
+			response.InternalError(c, "Failed to submit purchase order")
+			return
+		}
+		response.Success(c, gin.H{
+			"message": "Purchase order submitted for approval",
+			"status":  entity.POStatusPendingApproval,
+			"warning": result.Message,
+		})
+
+	default: // ActionRoute or any other
+		// Create approval workflow if approvers specified
+		if len(result.ApproverIDs) > 0 {
+			workflow, err := h.CreateApprovalWorkflow(tenantID, entity.DocumentTypePurchaseOrder, id, orderNumber, result)
+			if err != nil {
+				h.log.Error("Failed to create approval workflow", "error", err)
+			}
+
+			// Set to pending approval
+			query := `
+				UPDATE purchase_orders
+				SET status = $1, updated_at = $2
+				WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+			`
+			_, err = h.db.Exec(query, entity.POStatusPendingApproval, now, id, tenantID)
+			if err != nil {
+				h.log.Error("Failed to submit purchase order", "error", err)
+				response.InternalError(c, "Failed to submit purchase order")
+				return
+			}
+
+			response.Success(c, gin.H{
+				"message":     "Purchase order submitted for approval",
+				"status":      entity.POStatusPendingApproval,
+				"workflow_id": workflow.ID,
+				"approvers":   result.ApproverIDs,
+			})
+		} else {
+			// No specific approvers, just set to pending approval
+			query := `
+				UPDATE purchase_orders
+				SET status = $1, updated_at = $2
+				WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+			`
+			_, err = h.db.Exec(query, entity.POStatusPendingApproval, now, id, tenantID)
+			if err != nil {
+				h.log.Error("Failed to submit purchase order", "error", err)
+				response.InternalError(c, "Failed to submit purchase order")
+				return
+			}
+			response.Success(c, gin.H{
+				"message": "Purchase order submitted for approval",
+				"status":  entity.POStatusPendingApproval,
+			})
+		}
+	}
+}
+
+// ApprovePurchaseOrder approves a purchase order (direct approval by authorized user)
 func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -833,6 +1003,13 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		response.InternalError(c, "Failed to approve purchase order")
 		return
 	}
+
+	// Cancel any pending workflow for this document
+	_, _ = h.db.Exec(`
+		UPDATE approval_workflow_instances
+		SET status = 'cancelled', completed_at = $1, updated_at = $1
+		WHERE document_type = 'purchase_order' AND document_id = $2 AND status = 'pending'
+	`, now, id)
 
 	response.Success(c, gin.H{"message": "Purchase order approved successfully", "status": entity.POStatusApproved})
 }

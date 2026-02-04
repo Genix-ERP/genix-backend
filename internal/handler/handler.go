@@ -322,6 +322,45 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	rg.POST("/products/:id/attributes", middleware.RequirePermission("inventory", "product", "update"), h.AddProductAttribute)
 	rg.GET("/products/:id/attributes", middleware.RequirePermission("inventory", "product", "read"), h.GetProductTemplateAttributes)
 
+	// Product Packagings (Odoo-style - how products are sold/purchased in bulk)
+	productPackagings := rg.Group("/product-packagings")
+	productPackagings.Use(middleware.RequirePermission("inventory", "product", "read"))
+	{
+		productPackagings.GET("", h.ListProductPackagings)
+		productPackagings.POST("", middleware.RequirePermission("inventory", "product", "create"), h.CreateProductPackaging)
+		productPackagings.GET("/:id", h.GetProductPackaging)
+		productPackagings.PUT("/:id", middleware.RequirePermission("inventory", "product", "update"), h.UpdateProductPackaging)
+		productPackagings.DELETE("/:id", middleware.RequirePermission("inventory", "product", "delete"), h.DeleteProductPackaging)
+	}
+
+	// Product Packagings by Product
+	rg.GET("/products/:id/packagings", middleware.RequirePermission("inventory", "product", "read"), h.ListProductPackagingsByProduct)
+	rg.POST("/products/:id/packagings", middleware.RequirePermission("inventory", "product", "update"), h.CreateProductPackagingForProduct)
+
+	// Package Types (box sizes, pallets, containers)
+	packageTypes := rg.Group("/package-types")
+	packageTypes.Use(middleware.RequirePermission("inventory", "warehouse", "read"))
+	{
+		packageTypes.GET("", h.ListPackageTypes)
+		packageTypes.POST("", middleware.RequirePermission("inventory", "warehouse", "create"), h.CreatePackageType)
+		packageTypes.GET("/:id", h.GetPackageType)
+		packageTypes.PUT("/:id", middleware.RequirePermission("inventory", "warehouse", "update"), h.UpdatePackageType)
+		packageTypes.DELETE("/:id", middleware.RequirePermission("inventory", "warehouse", "delete"), h.DeletePackageType)
+	}
+
+	// Packages (physical packages in warehouse)
+	packages := rg.Group("/packages")
+	packages.Use(middleware.RequirePermission("inventory", "warehouse", "read"))
+	{
+		packages.GET("", h.ListPackages)
+		packages.POST("", middleware.RequirePermission("inventory", "warehouse", "create"), h.CreatePackage)
+		packages.GET("/:id", h.GetPackage)
+		packages.PUT("/:id", middleware.RequirePermission("inventory", "warehouse", "update"), h.UpdatePackage)
+		packages.DELETE("/:id", middleware.RequirePermission("inventory", "warehouse", "delete"), h.DeletePackage)
+		packages.POST("/:id/contents", middleware.RequirePermission("inventory", "warehouse", "update"), h.AddPackageContent)
+		packages.DELETE("/:id/contents/:contentId", middleware.RequirePermission("inventory", "warehouse", "update"), h.RemovePackageContent)
+	}
+
 	// Bill of Materials (BOM)
 	bom := rg.Group("/bom")
 	bom.Use(middleware.RequirePermission("inventory", "bom", "read"))
@@ -370,6 +409,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reorder.GET("/:id", h.GetReorderRule)
 		reorder.PUT("/:id", middleware.RequirePermission("inventory", "reorder", "update"), h.UpdateReorderRule)
 		reorder.DELETE("/:id", middleware.RequirePermission("inventory", "reorder", "delete"), h.DeleteReorderRule)
+	}
+
+	// Replenishment
+	replenishment := rg.Group("/replenishment")
+	replenishment.Use(middleware.RequirePermission("inventory", "reorder", "read"))
+	{
+		replenishment.GET("/preview", h.GetReplenishmentPreview)
+		replenishment.POST("/run", middleware.RequirePermission("purchase", "order", "create"), h.RunReplenishment)
 	}
 
 	// Quotations
@@ -437,6 +484,21 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		salesReturns.POST("/:id/refund", middleware.RequirePermission("sales", "return", "update"), h.ProcessRefund)
 	}
 
+	// Payment Terms
+	paymentTerms := rg.Group("/payment-terms")
+	paymentTerms.Use(middleware.RequirePermission("sales", "payment_term", "read"))
+	{
+		paymentTerms.GET("", h.ListPaymentTerms)
+		paymentTerms.POST("", middleware.RequirePermission("sales", "payment_term", "create"), h.CreatePaymentTerm)
+		paymentTerms.GET("/default", h.GetDefaultPaymentTerm)
+		paymentTerms.GET("/stats", h.GetPaymentTermStats)
+		paymentTerms.POST("/calculate-due-date", h.CalculateDueDate)
+		paymentTerms.GET("/:id", h.GetPaymentTerm)
+		paymentTerms.PUT("/:id", middleware.RequirePermission("sales", "payment_term", "update"), h.UpdatePaymentTerm)
+		paymentTerms.DELETE("/:id", middleware.RequirePermission("sales", "payment_term", "delete"), h.DeletePaymentTerm)
+		paymentTerms.POST("/:id/set-default", middleware.RequirePermission("sales", "payment_term", "update"), h.SetDefaultPaymentTerm)
+	}
+
 	// Discounts
 	discounts := rg.Group("/discounts")
 	discounts.Use(middleware.RequirePermission("sales", "discount", "read"))
@@ -459,6 +521,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseOrders.GET("/:id", h.GetPurchaseOrder)
 		purchaseOrders.PUT("/:id", middleware.RequirePermission("purchase", "order", "update"), h.UpdatePurchaseOrder)
 		purchaseOrders.DELETE("/:id", middleware.RequirePermission("purchase", "order", "delete"), h.DeletePurchaseOrder)
+		purchaseOrders.POST("/:id/submit", middleware.RequirePermission("purchase", "order", "update"), h.SubmitPOForApproval)
 		purchaseOrders.POST("/:id/approve", middleware.RequirePermission("purchase", "order", "approve"), h.ApprovePurchaseOrder)
 		purchaseOrders.POST("/:id/receive", h.ReceivePurchaseOrder)
 	}
@@ -489,6 +552,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		rfqs.POST("/:id/open", middleware.RequirePermission("purchase", "rfq", "update"), h.OpenRFQ)
 		rfqs.POST("/:id/responses", h.SubmitRFQResponse)
 		rfqs.POST("/:id/select-winner", middleware.RequirePermission("purchase", "rfq", "update"), h.SelectRFQWinner)
+		rfqs.POST("/:id/convert-to-po", middleware.RequirePermission("purchase", "purchase_order", "create"), h.ConvertRFQToPO)
 	}
 
 	// Procurement Contracts
@@ -512,6 +576,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		priceHistory.POST("", middleware.RequirePermission("purchase", "price_history", "create"), h.CreatePriceHistory)
 		priceHistory.GET("/:id", h.GetPriceHistory)
 		priceHistory.DELETE("/:id", middleware.RequirePermission("purchase", "price_history", "delete"), h.DeletePriceHistory)
+	}
+
+	// Vendor Prices (pricelist)
+	vendorPrices := rg.Group("/vendor-prices")
+	vendorPrices.Use(middleware.RequirePermission("purchase", "price_history", "read"))
+	{
+		vendorPrices.GET("", h.ListVendorPrices)
+		vendorPrices.GET("/lookup", h.LookupVendorPrice)
+		vendorPrices.POST("", middleware.RequirePermission("purchase", "price_history", "create"), h.CreateVendorPrice)
+		vendorPrices.GET("/:id", h.GetVendorPrice)
+		vendorPrices.PUT("/:id", middleware.RequirePermission("purchase", "price_history", "update"), h.UpdateVendorPrice)
+		vendorPrices.DELETE("/:id", middleware.RequirePermission("purchase", "price_history", "delete"), h.DeleteVendorPrice)
 	}
 
 	// Purchase Requisitions
@@ -540,6 +616,26 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		goodsReceipts.POST("/:id/inspect", middleware.RequirePermission("purchase", "receipt", "update"), h.InspectGoodsReceipt)
 		goodsReceipts.POST("/:id/complete", middleware.RequirePermission("purchase", "receipt", "update"), h.CompleteGoodsReceipt)
 		goodsReceipts.POST("/:id/cancel", middleware.RequirePermission("purchase", "receipt", "update"), h.CancelGoodsReceipt)
+		goodsReceipts.GET("/:id/landed-cost-data", h.GetGRForLandedCost)
+	}
+
+	// Landed Costs
+	landedCosts := rg.Group("/landed-costs")
+	landedCosts.Use(middleware.RequirePermission("purchase", "receipt", "read"))
+	{
+		landedCosts.GET("", h.ListLandedCosts)
+		landedCosts.POST("", middleware.RequirePermission("purchase", "receipt", "create"), h.CreateLandedCost)
+		landedCosts.GET("/:id", h.GetLandedCost)
+		landedCosts.POST("/:id/validate", middleware.RequirePermission("purchase", "receipt", "update"), h.ValidateLandedCost)
+		landedCosts.POST("/:id/cancel", middleware.RequirePermission("purchase", "receipt", "update"), h.CancelLandedCost)
+	}
+
+	// Landed Cost Types
+	landedCostTypes := rg.Group("/landed-cost-types")
+	landedCostTypes.Use(middleware.RequirePermission("purchase", "receipt", "read"))
+	{
+		landedCostTypes.GET("", h.ListLandedCostTypes)
+		landedCostTypes.POST("", middleware.RequirePermission("purchase", "receipt", "create"), h.CreateLandedCostType)
 	}
 
 	// Purchase Returns
@@ -557,6 +653,75 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseReturns.POST("/:id/receive", middleware.RequirePermission("purchase", "return", "update"), h.ReceivePurchaseReturn)
 		purchaseReturns.POST("/:id/credit", middleware.RequirePermission("purchase", "return", "update"), h.ApplyCreditNote)
 		purchaseReturns.POST("/:id/cancel", middleware.RequirePermission("purchase", "return", "update"), h.CancelPurchaseReturn)
+	}
+
+	// Blanket Orders (Standing Orders / Call-off Contracts)
+	blanketOrders := rg.Group("/blanket-orders")
+	blanketOrders.Use(middleware.RequirePermission("purchase", "contract", "read"))
+	{
+		blanketOrders.GET("", h.ListBlanketOrders)
+		blanketOrders.POST("", middleware.RequirePermission("purchase", "contract", "create"), h.CreateBlanketOrder)
+		blanketOrders.GET("/:id", h.GetBlanketOrder)
+		blanketOrders.PUT("/:id", middleware.RequirePermission("purchase", "contract", "update"), h.UpdateBlanketOrder)
+		blanketOrders.DELETE("/:id", middleware.RequirePermission("purchase", "contract", "delete"), h.DeleteBlanketOrder)
+		blanketOrders.POST("/:id/activate", middleware.RequirePermission("purchase", "contract", "update"), h.ActivateBlanketOrder)
+		blanketOrders.GET("/:id/releases", h.ListBlanketOrderReleases)
+		blanketOrders.POST("/:id/releases", middleware.RequirePermission("purchase", "order", "create"), h.CreateBlanketOrderRelease)
+		blanketOrders.POST("/:id/releases/:release_id/confirm", middleware.RequirePermission("purchase", "order", "approve"), h.ConfirmBlanketOrderRelease)
+		blanketOrders.POST("/:id/releases/:release_id/cancel", middleware.RequirePermission("purchase", "order", "update"), h.CancelBlanketOrderRelease)
+	}
+
+	// Procurement Rules Engine
+	procurementRules := rg.Group("/procurement-rules")
+	procurementRules.Use(middleware.RequirePermission("purchase", "rule", "read"))
+	{
+		procurementRules.GET("", h.ListProcurementRules)
+		procurementRules.POST("", middleware.RequirePermission("purchase", "rule", "create"), h.CreateProcurementRule)
+		procurementRules.GET("/:id", h.GetProcurementRule)
+		procurementRules.PUT("/:id", middleware.RequirePermission("purchase", "rule", "update"), h.UpdateProcurementRule)
+		procurementRules.DELETE("/:id", middleware.RequirePermission("purchase", "rule", "delete"), h.DeleteProcurementRule)
+	}
+
+	// Approval Workflows
+	approvalWorkflows := rg.Group("/approval-workflows")
+	{
+		approvalWorkflows.GET("/my-approvals", h.GetMyPendingApprovals)
+		approvalWorkflows.GET("/by-document", h.GetWorkflowByDocument)
+		approvalWorkflows.GET("/:id", h.GetApprovalWorkflow)
+		approvalWorkflows.POST("/:id/approve", h.ApproveWorkflowStep)
+		approvalWorkflows.POST("/:id/reject", h.RejectWorkflowStep)
+	}
+
+	// Dropshipping
+	dropship := rg.Group("/dropship")
+	dropship.Use(middleware.RequirePermission("sales", "dropship", "read"))
+	{
+		// Dropship Orders
+		dropship.GET("/orders", h.ListDropshipOrders)
+		dropship.POST("/orders", middleware.RequirePermission("sales", "dropship", "create"), h.CreateDropshipOrder)
+		dropship.GET("/orders/:id", h.GetDropshipOrder)
+		dropship.PUT("/orders/:id", middleware.RequirePermission("sales", "dropship", "update"), h.UpdateDropshipOrder)
+		dropship.POST("/orders/:id/ship", middleware.RequirePermission("sales", "dropship", "update"), h.MarkDropshipShipped)
+		dropship.POST("/orders/:id/deliver", middleware.RequirePermission("sales", "dropship", "update"), h.MarkDropshipDelivered)
+		dropship.POST("/orders/:id/cancel", middleware.RequirePermission("sales", "dropship", "update"), h.CancelDropshipOrder)
+
+		// Dropship Stats
+		dropship.GET("/stats", h.GetDropshipStats)
+
+		// Dropship Vendor Settings
+		dropship.GET("/vendors", h.ListDropshipVendors)
+		dropship.POST("/vendors", middleware.RequirePermission("sales", "dropship", "create"), h.CreateDropshipVendorSettings)
+		dropship.PUT("/vendors/:id", middleware.RequirePermission("sales", "dropship", "update"), h.UpdateDropshipVendorSettings)
+		dropship.DELETE("/vendors/:id", middleware.RequirePermission("sales", "dropship", "delete"), h.DeleteDropshipVendorSettings)
+
+		// Dropship Product-Vendor Links
+		dropship.GET("/product-vendors", h.ListDropshipProductVendors)
+		dropship.POST("/product-vendors", middleware.RequirePermission("sales", "dropship", "create"), h.CreateDropshipProductVendor)
+		dropship.PUT("/product-vendors/:id", middleware.RequirePermission("sales", "dropship", "update"), h.UpdateDropshipProductVendor)
+		dropship.DELETE("/product-vendors/:id", middleware.RequirePermission("sales", "dropship", "delete"), h.DeleteDropshipProductVendor)
+
+		// Dropshippable Products
+		dropship.GET("/products", h.GetDropshippableProducts)
 	}
 
 	// Account Types (reference data)
@@ -1058,6 +1223,33 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		installedApps.GET("/:app_id", h.GetInstalledApp)
 		installedApps.PUT("/:app_id", h.UpdateInstalledApp)
 		installedApps.DELETE("/:app_id", h.UninstallApp)
+	}
+
+	// =====================================================
+	// POINT OF SALE (POS) ROUTES
+	// =====================================================
+	pos := rg.Group("/pos")
+	pos.Use(middleware.RequirePermission("sales", "order", "read"))
+	{
+		// POS Configuration
+		pos.GET("/configs", h.ListPOSConfigs)
+		pos.POST("/configs", middleware.RequirePermission("sales", "order", "create"), h.CreatePOSConfig)
+		pos.PUT("/configs/:id", middleware.RequirePermission("sales", "order", "update"), h.UpdatePOSConfig)
+
+		// POS Sessions
+		pos.GET("/sessions", h.ListPOSSessions)
+		pos.POST("/sessions/open", h.OpenPOSSession)
+		pos.GET("/sessions/current", h.GetCurrentPOSSession)
+		pos.POST("/sessions/:id/close", h.ClosePOSSession)
+		pos.GET("/sessions/:id/summary", h.GetSessionSummary)
+
+		// POS Orders
+		pos.GET("/orders", h.ListPOSOrders)
+		pos.POST("/orders", middleware.RequirePermission("sales", "order", "create"), h.CreatePOSOrder)
+		pos.GET("/orders/:id", h.GetPOSOrder)
+
+		// POS Products (optimized search)
+		pos.GET("/products", h.SearchPOSProducts)
 	}
 }
 
