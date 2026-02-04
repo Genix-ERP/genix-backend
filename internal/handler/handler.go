@@ -515,6 +515,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		pricelists.POST("/:id/set-default", middleware.RequirePermission("sales", "pricelist", "update"), h.SetDefaultPricelist)
 	}
 
+	// Quotation Templates
+	quotationTemplates := rg.Group("/quotation-templates")
+	quotationTemplates.Use(middleware.RequirePermission("sales", "quotation_template", "read"))
+	{
+		quotationTemplates.GET("", h.ListQuotationTemplates)
+		quotationTemplates.POST("", middleware.RequirePermission("sales", "quotation_template", "create"), h.CreateQuotationTemplate)
+		quotationTemplates.GET("/:id", h.GetQuotationTemplate)
+		quotationTemplates.PUT("/:id", middleware.RequirePermission("sales", "quotation_template", "update"), h.UpdateQuotationTemplate)
+		quotationTemplates.DELETE("/:id", middleware.RequirePermission("sales", "quotation_template", "delete"), h.DeleteQuotationTemplate)
+		quotationTemplates.POST("/:id/duplicate", middleware.RequirePermission("sales", "quotation_template", "create"), h.DuplicateQuotationTemplate)
+	}
+
 	// Discounts
 	discounts := rg.Group("/discounts")
 	discounts.Use(middleware.RequirePermission("sales", "discount", "read"))
