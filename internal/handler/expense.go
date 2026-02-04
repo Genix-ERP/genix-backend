@@ -92,10 +92,10 @@ func (h *Handler) ListExpenses(c *gin.Context) {
 			   e.vendor_id, e.vendor_name, e.expense_date, e.description, e.amount, e.tax_amount,
 			   e.total_amount, e.currency, e.payment_method, e.reference, e.receipt_url,
 			   e.status, e.reimbursable, e.notes, e.created_at, e.updated_at,
-			   COALESCE(c.name, e.category_name, '') as category_name
+			   COALESCE(c.name, '') as category_name
 		FROM expenses e
 		LEFT JOIN expense_categories c ON e.category_id = c.id
-		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL
+		WHERE e.tenant_id = $1
 	`
 	countQuery := `SELECT COUNT(*) FROM expenses WHERE tenant_id = $1 AND deleted_at IS NULL`
 
