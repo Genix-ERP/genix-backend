@@ -499,6 +499,22 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		paymentTerms.POST("/:id/set-default", middleware.RequirePermission("sales", "payment_term", "update"), h.SetDefaultPaymentTerm)
 	}
 
+	// Pricelists
+	pricelists := rg.Group("/pricelists")
+	pricelists.Use(middleware.RequirePermission("sales", "pricelist", "read"))
+	{
+		pricelists.GET("", h.ListPricelists)
+		pricelists.POST("", middleware.RequirePermission("sales", "pricelist", "create"), h.CreatePricelist)
+		pricelists.GET("/default", h.GetDefaultPricelist)
+		pricelists.POST("/get-price", h.GetProductPrice)
+		pricelists.POST("/get-bulk-prices", h.GetBulkProductPrices)
+		pricelists.POST("/assign-customer", middleware.RequirePermission("sales", "pricelist", "update"), h.AssignCustomerPricelist)
+		pricelists.GET("/:id", h.GetPricelist)
+		pricelists.PUT("/:id", middleware.RequirePermission("sales", "pricelist", "update"), h.UpdatePricelist)
+		pricelists.DELETE("/:id", middleware.RequirePermission("sales", "pricelist", "delete"), h.DeletePricelist)
+		pricelists.POST("/:id/set-default", middleware.RequirePermission("sales", "pricelist", "update"), h.SetDefaultPricelist)
+	}
+
 	// Discounts
 	discounts := rg.Group("/discounts")
 	discounts.Use(middleware.RequirePermission("sales", "discount", "read"))
