@@ -2831,3 +2831,477 @@ func (h *Handler) GetReorderAlerts(c *gin.Context) {
 
 	response.Success(c, alerts)
 }
+
+// RunReplenishment creates purchase orders for products that need replenishment
+func (h *Handler) RunReplenishment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	// Parse input for optional filters
+	var input struct {
+		ProductIDs   []string `json:"product_ids"`
+		WarehouseID  string   `json:"warehouse_id"`
+		VendorID     string   `json:"vendor_id"`
+		RuleIDs      []string `json:"rule_ids"`
+	}
+	c.ShouldBindJSON(&input)
+
+	// Get all products that need replenishment
+	query := `
+		SELECT r.id, r.product_id, r.warehouse_id, r.min_qty, r.max_qty, r.reorder_qty,
+			   r.preferred_vendor_id, r.lead_time_days, r.auto_create_po,
+			   p.code as product_code, p.name as product_name,
+			   COALESCE(SUM(i.quantity_available), 0) as current_stock
+		FROM reorder_rules r
+		JOIN products p ON r.product_id = p.id
+		LEFT JOIN inventory i ON r.product_id = i.product_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
+		WHERE r.tenant_id = $1 AND r.is_active = true
+	`
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	// Apply filters
+	if len(input.RuleIDs) > 0 {
+		argCount++
+		placeholders := make([]string, len(input.RuleIDs))
+		for i := range input.RuleIDs {
+			placeholders[i] = fmt.Sprintf("$%d", argCount+i)
+		}
+		query += fmt.Sprintf(" AND r.id IN (%s)", strings.Join(placeholders, ","))
+		for _, id := range input.RuleIDs {
+			args = append(args, id)
+			argCount++
+		}
+		argCount-- // adjust for the loop
+	}
+
+	if len(input.ProductIDs) > 0 {
+		argCount++
+		placeholders := make([]string, len(input.ProductIDs))
+		for i := range input.ProductIDs {
+			placeholders[i] = fmt.Sprintf("$%d", argCount+i)
+		}
+		query += fmt.Sprintf(" AND r.product_id IN (%s)", strings.Join(placeholders, ","))
+		for _, id := range input.ProductIDs {
+			args = append(args, id)
+			argCount++
+		}
+		argCount--
+	}
+
+	if input.WarehouseID != "" {
+		argCount++
+		query += fmt.Sprintf(" AND r.warehouse_id = $%d", argCount)
+		args = append(args, input.WarehouseID)
+	}
+
+	if input.VendorID != "" {
+		argCount++
+		query += fmt.Sprintf(" AND r.preferred_vendor_id = $%d", argCount)
+		args = append(args, input.VendorID)
+	}
+
+	query += `
+		GROUP BY r.id, r.product_id, r.warehouse_id, r.min_qty, r.max_qty, r.reorder_qty,
+				 r.preferred_vendor_id, r.lead_time_days, r.auto_create_po, p.code, p.name
+		HAVING COALESCE(SUM(i.quantity_available), 0) <= r.min_qty
+		ORDER BY r.preferred_vendor_id NULLS LAST, p.name
+	`
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to get products needing replenishment", "error", err)
+		response.InternalError(c, "Failed to get products needing replenishment")
+		return
+	}
+	defer rows.Close()
+
+	type ReplenishmentItem struct {
+		RuleID          uuid.UUID
+		ProductID       uuid.UUID
+		ProductCode     string
+		ProductName     string
+		WarehouseID     *uuid.UUID
+		MinQty          float64
+		MaxQty          float64
+		ReorderQty      float64
+		CurrentStock    float64
+		VendorID        *uuid.UUID
+		LeadTimeDays    int
+		AutoCreatePO    bool
+		OrderQty        float64
+	}
+
+	items := make([]*ReplenishmentItem, 0)
+	for rows.Next() {
+		var item ReplenishmentItem
+		var warehouseID, vendorID sql.NullString
+		var maxQty sql.NullFloat64
+
+		err := rows.Scan(
+			&item.RuleID, &item.ProductID, &warehouseID, &item.MinQty, &maxQty, &item.ReorderQty,
+			&vendorID, &item.LeadTimeDays, &item.AutoCreatePO,
+			&item.ProductCode, &item.ProductName, &item.CurrentStock,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan replenishment item", "error", err)
+			continue
+		}
+
+		if warehouseID.Valid {
+			wid, _ := uuid.Parse(warehouseID.String)
+			item.WarehouseID = &wid
+		}
+		if vendorID.Valid {
+			vid, _ := uuid.Parse(vendorID.String)
+			item.VendorID = &vid
+		}
+		if maxQty.Valid {
+			item.MaxQty = maxQty.Float64
+		}
+
+		// Calculate order quantity: if max_qty is set, order up to max; otherwise use reorder_qty
+		if item.MaxQty > 0 {
+			item.OrderQty = item.MaxQty - item.CurrentStock
+		} else {
+			item.OrderQty = item.ReorderQty
+		}
+
+		// Ensure minimum order qty
+		if item.OrderQty < item.ReorderQty {
+			item.OrderQty = item.ReorderQty
+		}
+
+		items = append(items, &item)
+	}
+
+	if len(items) == 0 {
+		response.Success(c, gin.H{
+			"message": "No products need replenishment",
+			"orders_created": 0,
+		})
+		return
+	}
+
+	// Group items by vendor
+	vendorItems := make(map[string][]*ReplenishmentItem)
+	noVendorItems := make([]*ReplenishmentItem, 0)
+
+	for _, item := range items {
+		if item.VendorID != nil {
+			vendorID := item.VendorID.String()
+			vendorItems[vendorID] = append(vendorItems[vendorID], item)
+		} else {
+			noVendorItems = append(noVendorItems, item)
+		}
+	}
+
+	// Create purchase orders for each vendor
+	ordersCreated := 0
+	orderIDs := make([]uuid.UUID, 0)
+	skippedItems := make([]map[string]interface{}, 0)
+
+	for vendorID, items := range vendorItems {
+		vid, _ := uuid.Parse(vendorID)
+
+		// Generate order number
+		var orderNumber string
+		err := h.db.QueryRow(`
+			SELECT 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || LPAD((COALESCE(MAX(CAST(SUBSTRING(order_number FROM 'PO-[0-9]+-([0-9]+)') AS INTEGER)), 0) + 1)::TEXT, 4, '0')
+			FROM purchase_orders WHERE tenant_id = $1 AND order_number LIKE 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
+		`, tenantID).Scan(&orderNumber)
+		if err != nil {
+			orderNumber = fmt.Sprintf("PO-%s-%04d", time.Now().Format("20060102"), ordersCreated+1)
+		}
+
+		// Create purchase order
+		poID := uuid.New()
+		_, err = h.db.Exec(`
+			INSERT INTO purchase_orders (
+				id, tenant_id, order_number, vendor_id, order_date, status, payment_status,
+				subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
+				exchange_rate, requested_by, notes, is_auto_replenishment, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		`, poID, tenantID, orderNumber, vid, time.Now(), "draft", "unpaid",
+			0, 0, 0, 0, 0, 1.0, userID, "Auto-generated by replenishment", true, time.Now(), time.Now())
+
+		if err != nil {
+			h.log.Error("Failed to create purchase order", "error", err, "vendor_id", vendorID)
+			for _, item := range items {
+				skippedItems = append(skippedItems, map[string]interface{}{
+					"product_id":   item.ProductID,
+					"product_name": item.ProductName,
+					"reason":       "Failed to create purchase order",
+				})
+			}
+			continue
+		}
+
+		// Create purchase order lines
+		var subtotal float64
+		lineNumber := 1
+		for _, item := range items {
+			// Get product price from vendor (if available)
+			var unitPrice float64
+			err := h.db.QueryRow(`
+				SELECT price FROM vendor_prices
+				WHERE vendor_id = $1 AND product_id = $2 AND tenant_id = $3
+				ORDER BY created_at DESC LIMIT 1
+			`, vid, item.ProductID, tenantID).Scan(&unitPrice)
+			if err != nil {
+				// Try to get the product's purchase price
+				h.db.QueryRow(`SELECT COALESCE(purchase_price, 0) FROM products WHERE id = $1`, item.ProductID).Scan(&unitPrice)
+			}
+
+			lineTotal := item.OrderQty * unitPrice
+
+			_, err = h.db.Exec(`
+				INSERT INTO purchase_order_lines (
+					id, purchase_order_id, line_number, product_id, description, quantity,
+					unit_price, discount_amount, tax_amount, line_total, warehouse_id,
+					quantity_received, quantity_invoiced, reorder_rule_id, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			`, uuid.New(), poID, lineNumber, item.ProductID, item.ProductName, item.OrderQty,
+				unitPrice, 0, 0, lineTotal, item.WarehouseID, 0, 0, item.RuleID, time.Now(), time.Now())
+
+			if err != nil {
+				h.log.Error("Failed to create purchase order line", "error", err)
+				continue
+			}
+
+			subtotal += lineTotal
+			lineNumber++
+		}
+
+		// Update purchase order totals
+		h.db.Exec(`
+			UPDATE purchase_orders SET subtotal = $1, total_amount = $1, updated_at = $2
+			WHERE id = $3
+		`, subtotal, time.Now(), poID)
+
+		ordersCreated++
+		orderIDs = append(orderIDs, poID)
+	}
+
+	// Report items without vendors
+	for _, item := range noVendorItems {
+		skippedItems = append(skippedItems, map[string]interface{}{
+			"product_id":   item.ProductID,
+			"product_name": item.ProductName,
+			"reason":       "No preferred vendor set in reorder rule",
+		})
+	}
+
+	response.Success(c, gin.H{
+		"message":        fmt.Sprintf("Created %d purchase orders", ordersCreated),
+		"orders_created": ordersCreated,
+		"order_ids":      orderIDs,
+		"skipped_items":  skippedItems,
+		"total_items":    len(items),
+	})
+}
+
+// GetReplenishmentPreview returns a preview of what replenishment would create without actually creating orders
+func (h *Handler) GetReplenishmentPreview(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Get all products that need replenishment with vendor info
+	rows, err := h.db.Query(`
+		SELECT r.id, r.product_id, r.warehouse_id, r.min_qty, r.max_qty, r.reorder_qty,
+			   r.preferred_vendor_id, r.lead_time_days, r.auto_create_po, r.safety_stock,
+			   p.code as product_code, p.name as product_name, p.sku,
+			   w.name as warehouse_name,
+			   ct.name as vendor_name,
+			   COALESCE(SUM(i.quantity_available), 0) as current_stock,
+			   COALESCE(
+				   (SELECT price FROM vendor_prices vp WHERE vp.vendor_id = r.preferred_vendor_id AND vp.product_id = r.product_id AND vp.tenant_id = $1 ORDER BY vp.created_at DESC LIMIT 1),
+				   p.purchase_price
+			   ) as unit_price
+		FROM reorder_rules r
+		JOIN products p ON r.product_id = p.id
+		LEFT JOIN warehouses w ON r.warehouse_id = w.id
+		LEFT JOIN contacts ct ON r.preferred_vendor_id = ct.id
+		LEFT JOIN inventory i ON r.product_id = i.product_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
+		WHERE r.tenant_id = $1 AND r.is_active = true
+		GROUP BY r.id, r.product_id, r.warehouse_id, r.min_qty, r.max_qty, r.reorder_qty,
+				 r.preferred_vendor_id, r.lead_time_days, r.auto_create_po, r.safety_stock,
+				 p.code, p.name, p.sku, p.purchase_price, w.name, ct.name
+		HAVING COALESCE(SUM(i.quantity_available), 0) <= r.min_qty
+		ORDER BY ct.name NULLS LAST, p.name
+	`, tenantID)
+
+	if err != nil {
+		h.log.Error("Failed to get replenishment preview", "error", err)
+		response.InternalError(c, "Failed to get replenishment preview")
+		return
+	}
+	defer rows.Close()
+
+	type ReplenishmentPreviewItem struct {
+		RuleID         uuid.UUID  `json:"rule_id"`
+		ProductID      uuid.UUID  `json:"product_id"`
+		ProductCode    string     `json:"product_code"`
+		ProductName    string     `json:"product_name"`
+		SKU            string     `json:"sku,omitempty"`
+		WarehouseID    *uuid.UUID `json:"warehouse_id,omitempty"`
+		WarehouseName  string     `json:"warehouse_name,omitempty"`
+		VendorID       *uuid.UUID `json:"vendor_id,omitempty"`
+		VendorName     string     `json:"vendor_name,omitempty"`
+		CurrentStock   float64    `json:"current_stock"`
+		MinQty         float64    `json:"min_qty"`
+		MaxQty         float64    `json:"max_qty"`
+		ReorderQty     float64    `json:"reorder_qty"`
+		SafetyStock    float64    `json:"safety_stock"`
+		SuggestedQty   float64    `json:"suggested_qty"`
+		UnitPrice      float64    `json:"unit_price"`
+		EstimatedCost  float64    `json:"estimated_cost"`
+		LeadTimeDays   int        `json:"lead_time_days"`
+		Status         string     `json:"status"` // "critical", "low", "reorder"
+	}
+
+	items := make([]*ReplenishmentPreviewItem, 0)
+	vendorTotals := make(map[string]float64)
+	vendorNames := make(map[string]string)
+
+	for rows.Next() {
+		var item ReplenishmentPreviewItem
+		var warehouseID, vendorID sql.NullString
+		var warehouseName, vendorName, sku sql.NullString
+		var maxQty, safetyStock, unitPrice sql.NullFloat64
+
+		err := rows.Scan(
+			&item.RuleID, &item.ProductID, &warehouseID, &item.MinQty, &maxQty, &item.ReorderQty,
+			&vendorID, &item.LeadTimeDays, &item.RuleID, &safetyStock,
+			&item.ProductCode, &item.ProductName, &sku,
+			&warehouseName, &vendorName, &item.CurrentStock, &unitPrice,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan replenishment preview item", "error", err)
+			continue
+		}
+
+		if warehouseID.Valid {
+			wid, _ := uuid.Parse(warehouseID.String)
+			item.WarehouseID = &wid
+		}
+		if vendorID.Valid {
+			vid, _ := uuid.Parse(vendorID.String)
+			item.VendorID = &vid
+		}
+		if warehouseName.Valid {
+			item.WarehouseName = warehouseName.String
+		}
+		if vendorName.Valid {
+			item.VendorName = vendorName.String
+		}
+		if sku.Valid {
+			item.SKU = sku.String
+		}
+		if maxQty.Valid {
+			item.MaxQty = maxQty.Float64
+		}
+		if safetyStock.Valid {
+			item.SafetyStock = safetyStock.Float64
+		}
+		if unitPrice.Valid {
+			item.UnitPrice = unitPrice.Float64
+		}
+
+		// Calculate suggested order quantity
+		if item.MaxQty > 0 {
+			item.SuggestedQty = item.MaxQty - item.CurrentStock
+		} else {
+			item.SuggestedQty = item.ReorderQty
+		}
+		if item.SuggestedQty < item.ReorderQty {
+			item.SuggestedQty = item.ReorderQty
+		}
+
+		item.EstimatedCost = item.SuggestedQty * item.UnitPrice
+
+		// Determine status
+		if item.CurrentStock <= 0 {
+			item.Status = "critical"
+		} else if item.CurrentStock <= item.SafetyStock {
+			item.Status = "low"
+		} else {
+			item.Status = "reorder"
+		}
+
+		// Track vendor totals
+		if item.VendorID != nil {
+			vendorTotals[item.VendorID.String()] += item.EstimatedCost
+			vendorNames[item.VendorID.String()] = item.VendorName
+		}
+
+		items = append(items, &item)
+	}
+
+	// Build vendor summary
+	type VendorSummary struct {
+		VendorID   uuid.UUID `json:"vendor_id"`
+		VendorName string    `json:"vendor_name"`
+		ItemCount  int       `json:"item_count"`
+		TotalCost  float64   `json:"total_cost"`
+	}
+
+	vendorSummaries := make([]*VendorSummary, 0)
+	vendorItemCounts := make(map[string]int)
+	noVendorCount := 0
+
+	for _, item := range items {
+		if item.VendorID != nil {
+			vendorItemCounts[item.VendorID.String()]++
+		} else {
+			noVendorCount++
+		}
+	}
+
+	for vidStr, total := range vendorTotals {
+		vid, _ := uuid.Parse(vidStr)
+		vendorSummaries = append(vendorSummaries, &VendorSummary{
+			VendorID:   vid,
+			VendorName: vendorNames[vidStr],
+			ItemCount:  vendorItemCounts[vidStr],
+			TotalCost:  total,
+		})
+	}
+
+	// Calculate totals
+	var totalCost float64
+	criticalCount := 0
+	lowCount := 0
+	reorderCount := 0
+
+	for _, item := range items {
+		totalCost += item.EstimatedCost
+		switch item.Status {
+		case "critical":
+			criticalCount++
+		case "low":
+			lowCount++
+		case "reorder":
+			reorderCount++
+		}
+	}
+
+	response.Success(c, gin.H{
+		"items":            items,
+		"total_items":      len(items),
+		"critical_count":   criticalCount,
+		"low_count":        lowCount,
+		"reorder_count":    reorderCount,
+		"no_vendor_count":  noVendorCount,
+		"total_cost":       totalCost,
+		"vendor_summaries": vendorSummaries,
+	})
+}

@@ -75,12 +75,17 @@ type PurchaseOrderLine struct {
 	QuantityInvoiced float64    `json:"quantity_invoiced" db:"quantity_invoiced"`
 	WarehouseID      *uuid.UUID `json:"warehouse_id,omitempty" db:"warehouse_id"`
 	Notes            *string    `json:"notes,omitempty" db:"notes"`
+	PackagingID      *uuid.UUID `json:"packaging_id,omitempty" db:"packaging_id"`
+	PackagingQty     *float64   `json:"packaging_qty,omitempty" db:"packaging_qty"`
 	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Computed
 	ProductName string `json:"product_name,omitempty"`
 	UnitName    string `json:"unit_name,omitempty"`
+
+	// Relationships
+	Packaging *ProductPackaging `json:"packaging,omitempty"`
 }
 
 // CreatePurchaseOrderInput represents input for creating a purchase order
@@ -103,16 +108,18 @@ type CreatePurchaseOrderInput struct {
 
 // CreatePurchaseOrderLineInput represents input for a line item
 type CreatePurchaseOrderLineInput struct {
-	ProductID      string  `json:"product_id,omitempty"`
-	Description    string  `json:"description" binding:"required"`
-	Quantity       float64 `json:"quantity" binding:"required,gt=0"`
-	UnitID         string  `json:"unit_id,omitempty"`
-	UnitPrice      float64 `json:"unit_price" binding:"required,gte=0"`
-	DiscountAmount float64 `json:"discount_amount,omitempty"`
-	TaxID          string  `json:"tax_id,omitempty"`
-	TaxPercent     float64 `json:"tax_percent,omitempty"`
-	WarehouseID    string  `json:"warehouse_id,omitempty"`
-	Notes          string  `json:"notes,omitempty"`
+	ProductID      string   `json:"product_id,omitempty"`
+	Description    string   `json:"description" binding:"required"`
+	Quantity       float64  `json:"quantity" binding:"required,gt=0"`
+	UnitID         string   `json:"unit_id,omitempty"`
+	UnitPrice      float64  `json:"unit_price" binding:"required,gte=0"`
+	DiscountAmount float64  `json:"discount_amount,omitempty"`
+	TaxID          string   `json:"tax_id,omitempty"`
+	TaxPercent     float64  `json:"tax_percent,omitempty"`
+	WarehouseID    string   `json:"warehouse_id,omitempty"`
+	Notes          string   `json:"notes,omitempty"`
+	PackagingID    string   `json:"packaging_id,omitempty"`
+	PackagingQty   *float64 `json:"packaging_qty,omitempty"`
 }
 
 // UpdatePurchaseOrderInput represents input for updating a purchase order
