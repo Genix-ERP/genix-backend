@@ -154,7 +154,7 @@ type Journal struct {
 	TenantID     uuid.UUID `json:"tenant_id" db:"tenant_id"`
 	Code         string    `json:"code" db:"code"`
 	Name         string    `json:"name" db:"name"`
-	Type         string    `json:"type" db:"type"` // general, sales, purchase, cash, bank
+	Type         string    `json:"type" db:"type"` // general, sales, purchase, cash, bank, miscellaneous
 	Description  *string   `json:"description,omitempty" db:"description"`
 	AutoSequence bool      `json:"auto_sequence" db:"auto_sequence"`
 	NextNumber   int       `json:"next_number" db:"next_number"`
@@ -162,6 +162,29 @@ type Journal struct {
 	IsActive     bool      `json:"is_active" db:"is_active"`
 	CreatedAt    time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// CreateJournalInput is the input for creating a journal
+type CreateJournalInput struct {
+	Code                   string  `json:"code" binding:"required,min=1,max=20"`
+	Name                   string  `json:"name" binding:"required,min=1,max=100"`
+	Type                   string  `json:"type" binding:"required,oneof=general sales purchase cash bank miscellaneous"`
+	Description            string  `json:"description"`
+	DefaultDebitAccountID  *string `json:"default_debit_account_id"`
+	DefaultCreditAccountID *string `json:"default_credit_account_id"`
+	AutoSequence           bool    `json:"auto_sequence"`
+	NumberPrefix           string  `json:"number_prefix"`
+}
+
+// UpdateJournalInput is the input for updating a journal
+type UpdateJournalInput struct {
+	Name                   *string `json:"name"`
+	Description            *string `json:"description"`
+	DefaultDebitAccountID  *string `json:"default_debit_account_id"`
+	DefaultCreditAccountID *string `json:"default_credit_account_id"`
+	AutoSequence           *bool   `json:"auto_sequence"`
+	NumberPrefix           *string `json:"number_prefix"`
+	IsActive               *bool   `json:"is_active"`
 }
 
 // JournalEntry represents a journal entry header
