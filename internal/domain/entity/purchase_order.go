@@ -183,3 +183,19 @@ type PurchaseOrderResponse struct {
 	CreatedAt       time.Time           `json:"created_at"`
 	UpdatedAt       time.Time           `json:"updated_at"`
 }
+
+// CreateDebitNoteInput represents input for creating a debit note from a purchase invoice
+type CreateDebitNoteInput struct {
+	Reason        string               `json:"reason" binding:"required"`
+	DebitNoteDate string               `json:"debit_note_date"` // defaults to today
+	Lines         []DebitNoteLineInput `json:"lines"`           // optional: partial debit; if empty, full reversal
+}
+
+// DebitNoteLineInput represents a line in a partial debit note
+type DebitNoteLineInput struct {
+	ProductID   *string `json:"product_id"`
+	Description string  `json:"description"`
+	Quantity    float64 `json:"quantity" binding:"required,gt=0"`
+	UnitPrice   float64 `json:"unit_price" binding:"required,gte=0"`
+	TaxID       *string `json:"tax_id"`
+}
