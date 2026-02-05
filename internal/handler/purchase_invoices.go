@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
@@ -40,7 +41,8 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			   pi.three_way_match_status, pi.notes, pi.created_at, pi.updated_at,
 			   c.name as vendor_name,
 			   pi.purchase_order_id, po.order_number as po_number,
-			   pi.goods_receipt_id, gr.gr_number as gr_number
+			   pi.goods_receipt_id, gr.gr_number as gr_number,
+			   COALESCE(pi.invoice_type, 'invoice') as invoice_type, pi.original_invoice_id, pi.reason
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		LEFT JOIN purchase_orders po ON pi.purchase_order_id = po.id
@@ -86,6 +88,14 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 		countQuery += " AND due_date < CURRENT_DATE AND status NOT IN ('paid', 'cancelled')"
 	}
 
+	// Filter by invoice_type (invoice or debit_note)
+	if invoiceType := c.Query("invoice_type"); invoiceType != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND COALESCE(pi.invoice_type, 'invoice') = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND COALESCE(invoice_type, 'invoice') = $%d", argCount)
+		args = append(args, invoiceType)
+	}
+
 	// Search
 	if search := c.Query("search"); search != "" {
 		argCount++
@@ -124,6 +134,8 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 		var createdAt, updatedAt time.Time
 		var purchaseOrderID, goodsReceiptID sql.NullString
 		var poNumber, grNumber sql.NullString
+		var invoiceType string
+		var originalInvoiceID, reason sql.NullString
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &invoiceNumber, &vendorID, &vendorInvoiceNumber,
@@ -133,6 +145,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			&vendorName,
 			&purchaseOrderID, &poNumber,
 			&goodsReceiptID, &grNumber,
+			&invoiceType, &originalInvoiceID, &reason,
 		)
 		if err != nil {
 			continue
@@ -154,6 +167,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			"amount_due":            amountDue,
 			"status":                status,
 			"three_way_match_status": threeWayMatchStatus,
+			"invoice_type":          invoiceType,
 			"created_at":            createdAt,
 			"updated_at":            updatedAt,
 		}
@@ -179,6 +193,12 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 		}
 		if grNumber.Valid {
 			invoice["goods_receipt_number"] = grNumber.String
+		}
+		if originalInvoiceID.Valid {
+			invoice["original_invoice_id"] = originalInvoiceID.String
+		}
+		if reason.Valid {
+			invoice["reason"] = reason.String
 		}
 
 		invoices = append(invoices, invoice)
@@ -332,7 +352,8 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 			   pi.invoice_date, pi.due_date, pi.subtotal, pi.discount_amount,
 			   pi.tax_amount, pi.total_amount, pi.amount_paid, pi.amount_due, pi.status,
 			   pi.three_way_match_status, pi.notes, pi.created_at, pi.updated_at,
-			   c.name as vendor_name
+			   c.name as vendor_name,
+			   COALESCE(pi.invoice_type, 'invoice') as invoice_type, pi.original_invoice_id, pi.reason
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		WHERE pi.id = $1 AND pi.tenant_id = $2 AND pi.deleted_at IS NULL`
@@ -343,6 +364,8 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 	var invoiceDate, dueDate time.Time
 	var subtotal, discountAmount, taxAmount, totalAmount, amountPaid, amountDue float64
 	var createdAt, updatedAt time.Time
+	var invoiceType string
+	var originalInvoiceID, reason sql.NullString
 
 	err = h.db.QueryRow(query, invoiceID, tenantID).Scan(
 		&id, &tenantIDScan, &invoiceNumber, &vendorID, &vendorInvoiceNumber,
@@ -350,6 +373,7 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 		&taxAmount, &totalAmount, &amountPaid, &amountDue, &status,
 		&threeWayMatchStatus, &notes, &createdAt, &updatedAt,
 		&vendorName,
+		&invoiceType, &originalInvoiceID, &reason,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase invoice")
@@ -376,6 +400,7 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 		"amount_due":             amountDue,
 		"status":                 status,
 		"three_way_match_status": threeWayMatchStatus,
+		"invoice_type":           invoiceType,
 		"created_at":             createdAt,
 		"updated_at":             updatedAt,
 	}
@@ -389,6 +414,12 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 	if vendorName.Valid {
 		invoice["vendor_name"] = vendorName.String
 		invoice["partner_name"] = vendorName.String
+	}
+	if originalInvoiceID.Valid {
+		invoice["original_invoice_id"] = originalInvoiceID.String
+	}
+	if reason.Valid {
+		invoice["reason"] = reason.String
 	}
 
 	response.Success(c, invoice)
@@ -586,6 +617,12 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 		return
 	}
 
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, time.Now()); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	now := time.Now()
 
 	// Get account IDs for journal entry
@@ -704,6 +741,12 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 		newAmountPaid = totalAmount // Don't overpay
 	}
 
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, time.Now()); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	now := time.Now()
 	_, err = h.db.Exec(
 		"UPDATE purchase_invoices SET amount_paid = $1, status = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
@@ -809,6 +852,299 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 		} else {
 			h.log.Info("Journal entry created for payment", "entry_id", entryID, "invoice_id", invoiceID, "amount", paymentAmount)
 		}
+	}
+
+	h.GetPurchaseInvoice(c)
+}
+
+// CreateDebitNote creates a debit note from an existing purchase invoice (vendor bill)
+func (h *Handler) CreateDebitNote(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	invoiceID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid invoice ID")
+		return
+	}
+
+	var input entity.CreateDebitNoteInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Load original purchase invoice
+	var orgInvoiceNumber, currentStatus string
+	var vendorID uuid.UUID
+	var subtotal, taxAmount, totalAmount float64
+
+	err = h.db.QueryRow(`
+		SELECT invoice_number, status, vendor_id, subtotal, tax_amount, total_amount
+		FROM purchase_invoices
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND COALESCE(invoice_type, 'invoice') = 'invoice'`,
+		invoiceID, tenantID,
+	).Scan(&orgInvoiceNumber, &currentStatus, &vendorID, &subtotal, &taxAmount, &totalAmount)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Purchase invoice")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch purchase invoice")
+		return
+	}
+
+	if currentStatus != "posted" && currentStatus != "partial" && currentStatus != "paid" && currentStatus != "confirmed" {
+		response.BadRequest(c, "Can only create debit notes for posted, confirmed, partial, or paid bills")
+		return
+	}
+
+	dnDate := time.Now()
+	if input.DebitNoteDate != "" {
+		if parsed, err := time.Parse("2006-01-02", input.DebitNoteDate); err == nil {
+			dnDate = parsed
+		}
+	}
+
+	dnNumber := "DN-" + dnDate.Format("20060102") + "-" + uuid.New().String()[:6]
+	debitNoteID := uuid.New()
+	now := time.Now()
+
+	var dnSubtotal, dnTaxAmount, dnTotalAmount float64
+
+	if len(input.Lines) > 0 {
+		for _, line := range input.Lines {
+			dnSubtotal += line.Quantity * line.UnitPrice
+		}
+		if subtotal > 0 {
+			dnTaxAmount = dnSubtotal * (taxAmount / subtotal)
+		}
+		dnTotalAmount = dnSubtotal + dnTaxAmount
+	} else {
+		dnSubtotal = subtotal
+		dnTaxAmount = taxAmount
+		dnTotalAmount = totalAmount
+	}
+
+	var createdBy *uuid.UUID
+	if userID != uuid.Nil {
+		createdBy = &userID
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO purchase_invoices (
+			id, tenant_id, invoice_number, vendor_id, vendor_invoice_number,
+			invoice_date, due_date, invoice_type, original_invoice_id, reason,
+			subtotal, discount_amount, tax_amount, total_amount, amount_paid, status,
+			three_way_match_status, notes, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'debit_note', $8, $9, $10, 0, $11, $12, 0, 'draft', 'not_applicable', $13, $14, $15, $16)`,
+		debitNoteID, tenantID, dnNumber, vendorID, "",
+		dnDate, dnDate, invoiceID, input.Reason,
+		dnSubtotal, dnTaxAmount, dnTotalAmount,
+		orgInvoiceNumber, createdBy, now, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create debit note", "error", err)
+		response.InternalError(c, "Failed to create debit note: "+err.Error())
+		return
+	}
+
+	// Replace the id param so GetPurchaseInvoice returns the debit note
+	for i, p := range c.Params {
+		if p.Key == "id" {
+			c.Params[i].Value = debitNoteID.String()
+			break
+		}
+	}
+	h.GetPurchaseInvoice(c)
+}
+
+// ConfirmDebitNote confirms a debit note and creates reversed GL entries
+func (h *Handler) ConfirmDebitNote(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	debitNoteID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid debit note ID")
+		return
+	}
+
+	var currentStatus, dnNumber string
+	var vendorID uuid.UUID
+	var originalInvoiceID *uuid.UUID
+	var totalAmount, taxAmount, dnSubtotal float64
+	var dnDate time.Time
+
+	err = h.db.QueryRow(`
+		SELECT status, invoice_number, vendor_id, original_invoice_id, total_amount, tax_amount, subtotal, invoice_date
+		FROM purchase_invoices
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND invoice_type = 'debit_note'`,
+		debitNoteID, tenantID,
+	).Scan(&currentStatus, &dnNumber, &vendorID, &originalInvoiceID, &totalAmount, &taxAmount, &dnSubtotal, &dnDate)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Debit note")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch debit note")
+		return
+	}
+	if currentStatus != "draft" {
+		response.BadRequest(c, "Debit note is not in draft status")
+		return
+	}
+
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, dnDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
+	now := time.Now()
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Get Purchase Journal
+	var purchaseJournalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	err = tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code = 'PURCHASE' AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
+
+	if err == nil {
+		var apAccountID, expenseAccountID, taxAccountID uuid.UUID
+		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2000' AND deleted_at IS NULL`, tenantID).Scan(&apAccountID)
+		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '5000' AND deleted_at IS NULL`, tenantID).Scan(&expenseAccountID)
+		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2100' AND deleted_at IS NULL`, tenantID).Scan(&taxAccountID)
+
+		if apAccountID != uuid.Nil {
+			prefix := ""
+			if numberPrefix.Valid {
+				prefix = numberPrefix.String
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+			journalEntryID := uuid.New()
+			description := fmt.Sprintf("Debit Note %s", dnNumber)
+
+			_, err = tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
+				journalEntryID, tenantID, purchaseJournalID, entryNumber, dnDate, dnNumber, description,
+				"debit_note", debitNoteID.String(), 1.0, totalAmount, totalAmount, userID, now, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create debit note journal entry", "error", err)
+				response.InternalError(c, "Failed to create journal entry")
+				return
+			}
+
+			lineNumber := 1
+
+			// Debit AP (reduce payable — we owe the vendor less)
+			apLineID := uuid.New()
+			tx.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, contact_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				apLineID, journalEntryID, lineNumber, apAccountID, vendorID, "Accounts Payable (Debit Note)",
+				totalAmount, 0.0, 1.0, now,
+			)
+			lineNumber++
+
+			// Credit Expense/COGS (reversal)
+			if expenseAccountID != uuid.Nil && dnSubtotal > 0 {
+				lineID := uuid.New()
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					lineID, journalEntryID, lineNumber, expenseAccountID, "Expense Reversal (Debit Note)",
+					0.0, dnSubtotal, 1.0, now,
+				)
+				lineNumber++
+			}
+
+			// Credit Tax (reversal)
+			if taxAccountID != uuid.Nil && taxAmount > 0 {
+				lineID := uuid.New()
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					lineID, journalEntryID, lineNumber, taxAccountID, "Tax Reversal (Debit Note)",
+					0.0, taxAmount, 1.0, now,
+				)
+			}
+
+			// Update account balances
+			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
+			if expenseAccountID != uuid.Nil {
+				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", dnSubtotal, now, expenseAccountID)
+			}
+			if taxAccountID != uuid.Nil && taxAmount > 0 {
+				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+			}
+
+			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", purchaseJournalID)
+		}
+	}
+
+	// Update debit note status
+	_, err = tx.Exec(
+		"UPDATE purchase_invoices SET status = 'posted', updated_at = $1 WHERE id = $2 AND tenant_id = $3",
+		now, debitNoteID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to confirm debit note")
+		return
+	}
+
+	// Reduce the original bill balance
+	if originalInvoiceID != nil {
+		tx.Exec(`
+			UPDATE purchase_invoices SET amount_paid = amount_paid + $1, updated_at = $2
+			WHERE id = $3 AND tenant_id = $4`,
+			totalAmount, now, *originalInvoiceID, tenantID,
+		)
+		tx.Exec(`
+			UPDATE purchase_invoices SET status = CASE
+				WHEN amount_paid >= total_amount THEN 'paid'
+				WHEN amount_paid > 0 THEN 'partial'
+				ELSE status
+			END, updated_at = $1
+			WHERE id = $2 AND tenant_id = $3`,
+			now, *originalInvoiceID, tenantID,
+		)
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit transaction")
+		return
 	}
 
 	h.GetPurchaseInvoice(c)

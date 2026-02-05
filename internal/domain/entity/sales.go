@@ -138,8 +138,11 @@ type SalesInvoice struct {
 	PONumber        *string         `json:"po_number,omitempty" db:"po_number"`
 	Notes           *string         `json:"notes,omitempty" db:"notes"`
 	TermsConditions *string         `json:"terms_conditions,omitempty" db:"terms_conditions"`
-	JournalEntryID  *uuid.UUID      `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
-	SentAt          *time.Time      `json:"sent_at,omitempty" db:"sent_at"`
+	InvoiceType       string          `json:"invoice_type" db:"invoice_type"` // invoice, credit_note
+	OriginalInvoiceID *uuid.UUID      `json:"original_invoice_id,omitempty" db:"original_invoice_id"`
+	Reason            *string         `json:"reason,omitempty" db:"reason"`
+	JournalEntryID    *uuid.UUID      `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
+	SentAt            *time.Time      `json:"sent_at,omitempty" db:"sent_at"`
 	ViewedAt        *time.Time      `json:"viewed_at,omitempty" db:"viewed_at"`
 	CreatedBy       *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt       time.Time       `json:"created_at" db:"created_at"`
@@ -175,6 +178,22 @@ type SalesInvoiceLine struct {
 	// Relationships
 	Product   *Product          `json:"product,omitempty"`
 	Packaging *ProductPackaging `json:"packaging,omitempty"`
+}
+
+// CreateCreditNoteInput represents input for creating a credit note from an invoice
+type CreateCreditNoteInput struct {
+	Reason         string                  `json:"reason" binding:"required"`
+	CreditNoteDate string                  `json:"credit_note_date"` // defaults to today
+	Lines          []CreditNoteLineInput   `json:"lines"`            // optional: partial credit; if empty, full reversal
+}
+
+// CreditNoteLineInput represents a line in a partial credit note
+type CreditNoteLineInput struct {
+	ProductID   *string `json:"product_id"`
+	Description string  `json:"description"`
+	Quantity    float64 `json:"quantity" binding:"required,gt=0"`
+	UnitPrice   float64 `json:"unit_price" binding:"required,gte=0"`
+	TaxID       *string `json:"tax_id"`
 }
 
 // CreateSalesOrderInput represents input for creating a sales order

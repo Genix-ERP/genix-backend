@@ -468,6 +468,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		invoices.DELETE("/:id", middleware.RequirePermission("sales", "invoice", "delete"), h.DeleteSalesInvoice)
 		invoices.POST("/:id/send", h.SendInvoice)
 		invoices.POST("/:id/record-payment", h.RecordPayment)
+		invoices.POST("/:id/credit-note", middleware.RequirePermission("sales", "invoice", "create"), h.CreateCreditNote)
+		invoices.POST("/:id/confirm-credit-note", middleware.RequirePermission("sales", "invoice", "update"), h.ConfirmCreditNote)
 	}
 
 	// Sales Returns
@@ -603,6 +605,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseInvoices.POST("/:id/confirm", middleware.RequirePermission("purchase", "invoice", "approve"), h.ConfirmPurchaseInvoice)
 		purchaseInvoices.POST("/:id/post", middleware.RequirePermission("purchase", "invoice", "approve"), h.PostPurchaseInvoice)
 		purchaseInvoices.POST("/:id/pay", h.PayPurchaseInvoice)
+		purchaseInvoices.POST("/:id/debit-note", middleware.RequirePermission("purchase", "invoice", "create"), h.CreateDebitNote)
+		purchaseInvoices.POST("/:id/confirm-debit-note", middleware.RequirePermission("purchase", "invoice", "approve"), h.ConfirmDebitNote)
 	}
 
 	// Request for Quotations (RFQ)
@@ -804,8 +808,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		accounts.GET("/:id/transactions", h.GetAccountTransactions)
 	}
 
-	// Journals (accounting journals like GEN, SAL, PUR)
-	rg.GET("/journals", middleware.RequirePermission("finance", "journal", "read"), h.ListJournals)
+	// Journals (accounting journals like GEN, SAL, PUR, MISC)
+	journalGroup := rg.Group("/journals")
+	journalGroup.Use(middleware.RequirePermission("finance", "journal", "read"))
+	{
+		journalGroup.GET("", h.ListJournals)
+		journalGroup.POST("", middleware.RequirePermission("finance", "journal", "create"), h.CreateJournal)
+		journalGroup.GET("/:id", h.GetJournal)
+		journalGroup.PUT("/:id", middleware.RequirePermission("finance", "journal", "update"), h.UpdateJournal)
+		journalGroup.DELETE("/:id", middleware.RequirePermission("finance", "journal", "delete"), h.DeleteJournal)
+	}
 
 	// Journal Entries
 	journals := rg.Group("/journal-entries")

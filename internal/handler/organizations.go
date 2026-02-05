@@ -751,6 +751,7 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		{"PUR", "Purchase Journal", "purchase", "5000", "2000"},   // COGS debit, AP credit
 		{"CASH", "Cash Journal", "cash", "1000", "1000"},          // Cash
 		{"BANK", "Bank Journal", "bank", "1100", "1100"},          // Bank
+		{"MISC", "Miscellaneous Journal", "miscellaneous", "", ""},
 	}
 
 	for _, j := range defaultJournals {

@@ -813,7 +813,7 @@ func (h *Handler) ListJournals(c *gin.Context) {
 			created_at,
 			COALESCE(updated_at, created_at)
 		FROM journals
-		WHERE tenant_id = $1
+		WHERE tenant_id = $1 AND deleted_at IS NULL
 		ORDER BY code ASC
 	`
 
@@ -850,6 +850,274 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	}
 
 	response.Success(c, journals)
+}
+
+// GetJournal returns a single journal by ID
+func (h *Handler) GetJournal(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid journal ID")
+		return
+	}
+
+	type JournalResponse struct {
+		ID                     uuid.UUID  `json:"id"`
+		Code                   string     `json:"code"`
+		Name                   string     `json:"name"`
+		Type                   string     `json:"type"`
+		Description            string     `json:"description,omitempty"`
+		DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty"`
+		DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty"`
+		AutoSequence           bool       `json:"auto_sequence"`
+		NextNumber             int        `json:"next_number"`
+		NumberPrefix           string     `json:"number_prefix,omitempty"`
+		IsActive               bool       `json:"is_active"`
+		CreatedAt              time.Time  `json:"created_at"`
+		UpdatedAt              time.Time  `json:"updated_at"`
+	}
+
+	var j JournalResponse
+	err = h.db.QueryRow(`
+		SELECT id, code, name, type,
+			COALESCE(description, ''),
+			default_debit_account_id,
+			default_credit_account_id,
+			COALESCE(auto_sequence, false),
+			COALESCE(next_number, 1),
+			COALESCE(number_prefix, ''),
+			COALESCE(is_active, true),
+			created_at,
+			COALESCE(updated_at, created_at)
+		FROM journals
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.Description,
+		&j.DefaultDebitAccountID, &j.DefaultCreditAccountID,
+		&j.AutoSequence, &j.NextNumber, &j.NumberPrefix, &j.IsActive,
+		&j.CreatedAt, &j.UpdatedAt)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Journal")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get journal", "error", err)
+		response.InternalError(c, "Failed to fetch journal")
+		return
+	}
+
+	response.Success(c, j)
+}
+
+// CreateJournal creates a new journal
+func (h *Handler) CreateJournal(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var input entity.CreateJournalInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Check for duplicate code
+	var exists bool
+	err := h.db.QueryRow(`
+		SELECT EXISTS(SELECT 1 FROM journals WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)
+	`, tenantID, input.Code).Scan(&exists)
+	if err != nil {
+		h.log.Error("Failed to check journal code", "error", err)
+		response.InternalError(c, "Failed to create journal")
+		return
+	}
+	if exists {
+		response.Conflict(c, "A journal with this code already exists")
+		return
+	}
+
+	journalID := uuid.New()
+	now := time.Now()
+
+	// Convert empty string pointers to nil for nullable UUID columns
+	var debitAccID, creditAccID interface{}
+	if input.DefaultDebitAccountID != nil && *input.DefaultDebitAccountID != "" {
+		debitAccID = *input.DefaultDebitAccountID
+	}
+	if input.DefaultCreditAccountID != nil && *input.DefaultCreditAccountID != "" {
+		creditAccID = *input.DefaultCreditAccountID
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO journals (id, tenant_id, code, name, type, description,
+			default_debit_account_id, default_credit_account_id,
+			auto_sequence, next_number, number_prefix, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, true, $11, $11)
+	`, journalID, tenantID, input.Code, input.Name, input.Type, input.Description,
+		debitAccID, creditAccID,
+		input.AutoSequence, input.NumberPrefix, now)
+
+	if err != nil {
+		h.log.Error("Failed to create journal", "error", err)
+		response.InternalError(c, "Failed to create journal")
+		return
+	}
+
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: journalID.String()})
+	h.GetJournal(c)
+}
+
+// UpdateJournal updates an existing journal
+func (h *Handler) UpdateJournal(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid journal ID")
+		return
+	}
+
+	var input entity.UpdateJournalInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	updates := make([]string, 0)
+	args := make([]interface{}, 0)
+	argCount := 0
+
+	addUpdate := func(field string, value interface{}) {
+		argCount++
+		updates = append(updates, fmt.Sprintf("%s = $%d", field, argCount))
+		args = append(args, value)
+	}
+
+	if input.Name != nil {
+		addUpdate("name", *input.Name)
+	}
+	if input.Description != nil {
+		addUpdate("description", *input.Description)
+	}
+	if input.DefaultDebitAccountID != nil {
+		if *input.DefaultDebitAccountID == "" {
+			addUpdate("default_debit_account_id", nil)
+		} else {
+			addUpdate("default_debit_account_id", *input.DefaultDebitAccountID)
+		}
+	}
+	if input.DefaultCreditAccountID != nil {
+		if *input.DefaultCreditAccountID == "" {
+			addUpdate("default_credit_account_id", nil)
+		} else {
+			addUpdate("default_credit_account_id", *input.DefaultCreditAccountID)
+		}
+	}
+	if input.AutoSequence != nil {
+		addUpdate("auto_sequence", *input.AutoSequence)
+	}
+	if input.NumberPrefix != nil {
+		addUpdate("number_prefix", *input.NumberPrefix)
+	}
+	if input.IsActive != nil {
+		addUpdate("is_active", *input.IsActive)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	addUpdate("updated_at", time.Now())
+
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(`
+		UPDATE journals SET %s
+		WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL
+		RETURNING id
+	`, strings.Join(updates, ", "), argCount-1, argCount)
+
+	var returnedID uuid.UUID
+	err = h.db.QueryRow(query, args...).Scan(&returnedID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Journal")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to update journal", "error", err)
+		response.InternalError(c, "Failed to update journal")
+		return
+	}
+
+	h.GetJournal(c)
+}
+
+// DeleteJournal soft-deletes a journal (blocks if it has entries)
+func (h *Handler) DeleteJournal(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid journal ID")
+		return
+	}
+
+	// Check if journal has entries
+	var entryCount int
+	err = h.db.QueryRow(`
+		SELECT COUNT(*) FROM journal_entries
+		WHERE journal_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&entryCount)
+	if err != nil {
+		h.log.Error("Failed to check journal entries", "error", err)
+		response.InternalError(c, "Failed to delete journal")
+		return
+	}
+	if entryCount > 0 {
+		response.Conflict(c, "Cannot delete journal with existing entries")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		UPDATE journals SET deleted_at = $1, updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+	`, time.Now(), id, tenantID)
+
+	if err != nil {
+		h.log.Error("Failed to delete journal", "error", err)
+		response.InternalError(c, "Failed to delete journal")
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Journal")
+		return
+	}
+
+	response.NoContent(c)
 }
 
 // CreateJournalEntry creates a new journal entry
@@ -891,6 +1159,12 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 	entryDate, err := time.Parse("2006-01-02", input.EntryDate)
 	if err != nil {
 		response.BadRequest(c, "Invalid entry date format (use YYYY-MM-DD)")
+		return
+	}
+
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
 		return
 	}
 
@@ -1177,10 +1451,11 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	// Get entry and verify status
 	var status string
 	var totalDebit, totalCredit float64
+	var entryDate time.Time
 	err = h.db.QueryRow(`
-		SELECT status, total_debit, total_credit FROM journal_entries
+		SELECT status, total_debit, total_credit, entry_date FROM journal_entries
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&status, &totalDebit, &totalCredit)
+	`, id, tenantID).Scan(&status, &totalDebit, &totalCredit, &entryDate)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Journal entry")
@@ -1194,6 +1469,12 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 
 	if status != "draft" {
 		response.BadRequest(c, "Only draft entries can be posted")
+		return
+	}
+
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
 		return
 	}
 

@@ -42,7 +42,8 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			   si.tax_amount, si.total_amount, si.amount_paid, si.amount_due, si.status,
 			   si.reference, si.po_number, si.notes, si.terms_conditions,
 			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
-			   COALESCE(c.name, si.customer_name, '') as customer_name
+			   COALESCE(c.name, si.customer_name, '') as customer_name,
+			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
@@ -100,6 +101,14 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		countQuery += " AND si.due_date < CURRENT_DATE AND si.status NOT IN ('paid', 'cancelled')"
 	}
 
+	// Filter by invoice_type (invoice or credit_note)
+	if invoiceType := c.Query("invoice_type"); invoiceType != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND COALESCE(si.invoice_type, 'invoice') = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND COALESCE(si.invoice_type, 'invoice') = $%d", argCount)
+		args = append(args, invoiceType)
+	}
+
 	// Search - also search by customer name
 	if search := c.Query("search"); search != "" {
 		argCount++
@@ -140,6 +149,9 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		var reference, poNumber, notes, termsConditions sql.NullString
 		var createdAt, updatedAt time.Time
 		var customerName string
+		var invoiceType string
+		var originalInvoiceID sql.NullString
+		var reason sql.NullString
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -149,6 +161,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			&reference, &poNumber, &notes, &termsConditions,
 			&journalEntryID, &sentAt, &viewedAt, &createdBy, &createdAt, &updatedAt,
 			&customerName,
+			&invoiceType, &originalInvoiceID, &reason,
 		)
 		if err != nil {
 			continue
@@ -180,6 +193,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			"balance":         amountDue, // Add balance as alias for amount_due for frontend compatibility
 			"status":          status,
 			"payment_status":  paymentStatus,
+			"invoice_type":    invoiceType,
 			"created_at":      createdAt,
 			"updated_at":      updatedAt,
 		}
@@ -207,6 +221,12 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		}
 		if viewedAt.Valid {
 			invoice["viewed_at"] = viewedAt.Time
+		}
+		if originalInvoiceID.Valid {
+			invoice["original_invoice_id"] = originalInvoiceID.String
+		}
+		if reason.Valid {
+			invoice["reason"] = reason.String
 		}
 
 		// Parse addresses
@@ -424,7 +444,8 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 			   si.tax_amount, si.total_amount, si.amount_paid, si.amount_due, si.status,
 			   si.reference, si.po_number, si.notes, si.terms_conditions,
 			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
-			   COALESCE(c.name, si.customer_name, '') as customer_name
+			   COALESCE(c.name, si.customer_name, '') as customer_name,
+			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.id = $1 AND si.tenant_id = $2 AND si.deleted_at IS NULL`
@@ -439,6 +460,9 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	var reference, poNumber, notes, termsConditions sql.NullString
 	var createdAt, updatedAt time.Time
 	var customerName string
+	var invoiceType string
+	var originalInvoiceID sql.NullString
+	var reason sql.NullString
 
 	err = h.db.QueryRow(query, invoiceID, tenantID).Scan(
 		&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -448,6 +472,7 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		&reference, &poNumber, &notes, &termsConditions,
 		&journalEntryID, &sentAt, &viewedAt, &createdBy, &createdAt, &updatedAt,
 		&customerName,
+		&invoiceType, &originalInvoiceID, &reason,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
@@ -484,6 +509,7 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		"balance":         amountDue, // Alias for frontend compatibility
 		"status":          status,
 		"payment_status":  paymentStatus,
+		"invoice_type":    invoiceType,
 		"created_at":      createdAt,
 		"updated_at":      updatedAt,
 	}
@@ -517,6 +543,12 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	}
 	if viewedAt.Valid {
 		invoice["viewed_at"] = viewedAt.Time
+	}
+	if originalInvoiceID.Valid {
+		invoice["original_invoice_id"] = originalInvoiceID.String
+	}
+	if reason.Valid {
+		invoice["reason"] = reason.String
 	}
 
 	// Parse addresses
@@ -802,6 +834,12 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, invoiceDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	now := time.Now()
 
 	// Start transaction for GL posting
@@ -1042,6 +1080,12 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		newStatus = entity.InvoiceStatusPaid
 	}
 
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, paymentDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	now := time.Now()
 
 	// Start transaction for GL posting
@@ -1172,6 +1216,356 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit transaction")
+		return
+	}
+
+	h.GetSalesInvoice(c)
+}
+
+// CreateCreditNote creates a credit note from an existing sales invoice
+func (h *Handler) CreateCreditNote(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	invoiceID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid invoice ID")
+		return
+	}
+
+	var input entity.CreateCreditNoteInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Load original invoice
+	var orgInvoiceNumber, currentStatus string
+	var customerID uuid.UUID
+	var orgID *uuid.UUID
+	var subtotal, taxAmount, totalAmount float64
+	var currencyID *uuid.UUID
+
+	err = h.db.QueryRow(`
+		SELECT invoice_number, status, customer_id, organization_id, subtotal, tax_amount,
+			total_amount, currency_id
+		FROM sales_invoices
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND invoice_type = 'invoice'`,
+		invoiceID, tenantID,
+	).Scan(&orgInvoiceNumber, &currentStatus, &customerID, &orgID, &subtotal, &taxAmount,
+		&totalAmount, &currencyID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Sales invoice")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch invoice")
+		return
+	}
+
+	if currentStatus != string(entity.InvoiceStatusSent) && currentStatus != string(entity.InvoiceStatusPartial) && currentStatus != string(entity.InvoiceStatusPaid) {
+		response.BadRequest(c, "Can only create credit notes for sent, partial, or paid invoices")
+		return
+	}
+
+	cnDate := time.Now()
+	if input.CreditNoteDate != "" {
+		if parsed, err := time.Parse("2006-01-02", input.CreditNoteDate); err == nil {
+			cnDate = parsed
+		}
+	}
+
+	cnNumber := "CN-" + cnDate.Format("20060102") + "-" + uuid.New().String()[:6]
+	creditNoteID := uuid.New()
+	now := time.Now()
+
+	var cnSubtotal, cnTaxAmount, cnTotalAmount float64
+
+	if len(input.Lines) > 0 {
+		for _, line := range input.Lines {
+			cnSubtotal += line.Quantity * line.UnitPrice
+		}
+		if subtotal > 0 {
+			cnTaxAmount = cnSubtotal * (taxAmount / subtotal)
+		}
+		cnTotalAmount = cnSubtotal + cnTaxAmount
+	} else {
+		cnSubtotal = subtotal
+		cnTaxAmount = taxAmount
+		cnTotalAmount = totalAmount
+	}
+
+	var createdBy *uuid.UUID
+	if userID != uuid.Nil {
+		createdBy = &userID
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO sales_invoices (
+			id, tenant_id, organization_id, invoice_number, customer_id,
+			invoice_date, due_date, invoice_type, original_invoice_id, reason,
+			currency_id, exchange_rate, subtotal, discount_amount,
+			tax_amount, total_amount, amount_paid, status,
+			reference, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'credit_note', $8, $9, $10, 1.0, $11, 0, $12, $13, 0, 'draft', $14, $15, $16, $17)`,
+		creditNoteID, tenantID, orgID, cnNumber, customerID,
+		cnDate, cnDate, invoiceID, input.Reason,
+		currencyID, cnSubtotal, cnTaxAmount, cnTotalAmount,
+		orgInvoiceNumber, createdBy, now, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create credit note", "error", err)
+		response.InternalError(c, "Failed to create credit note: "+err.Error())
+		return
+	}
+
+	// Insert credit note lines
+	if len(input.Lines) > 0 {
+		for i, line := range input.Lines {
+			lineID := uuid.New()
+			lineTotal := line.Quantity * line.UnitPrice
+			var productID, taxID *uuid.UUID
+			if line.ProductID != nil && *line.ProductID != "" {
+				id, _ := uuid.Parse(*line.ProductID)
+				productID = &id
+			}
+			if line.TaxID != nil && *line.TaxID != "" {
+				id, _ := uuid.Parse(*line.TaxID)
+				taxID = &id
+			}
+			h.db.Exec(`
+				INSERT INTO sales_invoice_lines (
+					id, sales_invoice_id, line_number, product_id, description,
+					quantity, unit_price, discount_amount, tax_id, tax_amount, line_total, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, $9, $10)`,
+				lineID, creditNoteID, i+1, productID, line.Description,
+				line.Quantity, line.UnitPrice, taxID, lineTotal, now,
+			)
+		}
+	} else {
+		// Copy lines from original invoice
+		rows, err := h.db.Query(`
+			SELECT product_id, description, quantity, unit_id, unit_price, discount_amount,
+				tax_id, tax_amount, line_total, account_id
+			FROM sales_invoice_lines WHERE sales_invoice_id = $1 ORDER BY line_number`, invoiceID)
+		if err == nil {
+			defer rows.Close()
+			lineNum := 1
+			for rows.Next() {
+				var productID, unitID, taxID, accountID *uuid.UUID
+				var desc string
+				var qty, unitPrice, discAmt, taxAmt, lineTotal float64
+				rows.Scan(&productID, &desc, &qty, &unitID, &unitPrice, &discAmt, &taxID, &taxAmt, &lineTotal, &accountID)
+				lineID := uuid.New()
+				h.db.Exec(`
+					INSERT INTO sales_invoice_lines (
+						id, sales_invoice_id, line_number, product_id, description,
+						quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount, line_total, account_id, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+					lineID, creditNoteID, lineNum, productID, desc,
+					qty, unitID, unitPrice, discAmt, taxID, taxAmt, lineTotal, accountID, now,
+				)
+				lineNum++
+			}
+		}
+	}
+
+	// Replace the id param so GetSalesInvoice returns the credit note
+	for i, p := range c.Params {
+		if p.Key == "id" {
+			c.Params[i].Value = creditNoteID.String()
+			break
+		}
+	}
+	h.GetSalesInvoice(c)
+}
+
+// ConfirmCreditNote confirms a credit note and creates reversed GL entries
+func (h *Handler) ConfirmCreditNote(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	creditNoteID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid credit note ID")
+		return
+	}
+
+	var currentStatus, cnNumber string
+	var customerID uuid.UUID
+	var originalInvoiceID *uuid.UUID
+	var totalAmount, taxAmount, cnSubtotal float64
+	var cnDate time.Time
+
+	err = h.db.QueryRow(`
+		SELECT status, invoice_number, customer_id, original_invoice_id, total_amount, tax_amount, subtotal, invoice_date
+		FROM sales_invoices
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND invoice_type = 'credit_note'`,
+		creditNoteID, tenantID,
+	).Scan(&currentStatus, &cnNumber, &customerID, &originalInvoiceID, &totalAmount, &taxAmount, &cnSubtotal, &cnDate)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Credit note")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch credit note")
+		return
+	}
+	if currentStatus != string(entity.InvoiceStatusDraft) {
+		response.BadRequest(c, "Credit note is not in draft status")
+		return
+	}
+
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, cnDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
+	now := time.Now()
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Get Sales Journal
+	var salesJournalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	err = tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code = 'SALES' AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
+
+	if err == nil {
+		var arAccountID, revenueAccountID, taxAccountID uuid.UUID
+		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1100' AND deleted_at IS NULL`, tenantID).Scan(&arAccountID)
+		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '4000' AND deleted_at IS NULL`, tenantID).Scan(&revenueAccountID)
+		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2100' AND deleted_at IS NULL`, tenantID).Scan(&taxAccountID)
+
+		if arAccountID != uuid.Nil {
+			prefix := ""
+			if numberPrefix.Valid {
+				prefix = numberPrefix.String
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+			journalEntryID := uuid.New()
+			description := fmt.Sprintf("Credit Note %s", cnNumber)
+
+			_, err = tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
+				journalEntryID, tenantID, salesJournalID, entryNumber, cnDate, cnNumber, description,
+				"credit_note", creditNoteID.String(), 1.0, totalAmount, totalAmount, userID, now, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create credit note journal entry", "error", err)
+				response.InternalError(c, "Failed to create journal entry")
+				return
+			}
+
+			lineNumber := 1
+
+			// Debit Revenue (reversal)
+			if revenueAccountID != uuid.Nil && cnSubtotal > 0 {
+				lineID := uuid.New()
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					lineID, journalEntryID, lineNumber, revenueAccountID, "Revenue Reversal (Credit Note)",
+					cnSubtotal, 0.0, 1.0, now,
+				)
+				lineNumber++
+			}
+
+			// Debit Tax Payable (reversal)
+			if taxAccountID != uuid.Nil && taxAmount > 0 {
+				lineID := uuid.New()
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					lineID, journalEntryID, lineNumber, taxAccountID, "Tax Reversal (Credit Note)",
+					taxAmount, 0.0, 1.0, now,
+				)
+				lineNumber++
+			}
+
+			// Credit AR (reduce receivable)
+			arLineID := uuid.New()
+			tx.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, contact_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				arLineID, journalEntryID, lineNumber, arAccountID, customerID, "Accounts Receivable (Credit Note)",
+				0.0, totalAmount, 1.0, now,
+			)
+
+			// Update account balances
+			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
+			if revenueAccountID != uuid.Nil {
+				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", cnSubtotal, now, revenueAccountID)
+			}
+			if taxAccountID != uuid.Nil && taxAmount > 0 {
+				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+			}
+
+			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
+			tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1 WHERE id = $2", journalEntryID, creditNoteID)
+		}
+	}
+
+	// Update credit note status
+	_, err = tx.Exec(
+		"UPDATE sales_invoices SET status = 'sent', sent_at = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+		now, now, creditNoteID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to confirm credit note")
+		return
+	}
+
+	// Reduce the original invoice balance
+	if originalInvoiceID != nil {
+		tx.Exec(`
+			UPDATE sales_invoices SET amount_paid = amount_paid + $1, updated_at = $2
+			WHERE id = $3 AND tenant_id = $4`,
+			totalAmount, now, *originalInvoiceID, tenantID,
+		)
+		tx.Exec(`
+			UPDATE sales_invoices SET status = CASE
+				WHEN amount_paid >= total_amount THEN 'paid'
+				WHEN amount_paid > 0 THEN 'partial'
+				ELSE status
+			END, updated_at = $1
+			WHERE id = $2 AND tenant_id = $3`,
+			now, *originalInvoiceID, tenantID,
+		)
+	}
+
 	if err := tx.Commit(); err != nil {
 		response.InternalError(c, "Failed to commit transaction")
 		return

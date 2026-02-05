@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -140,6 +141,10 @@ func getDefaultAdminSettings() AdminSettingsResponse {
 				"payable_account":    "",
 				"revenue_account":    "",
 				"expense_account":    "",
+			},
+			"lock_date": map[string]interface{}{
+				"date":    nil,
+				"enabled": false,
 			},
 		},
 		Projects: map[string]interface{}{
@@ -431,4 +436,56 @@ func (h *Handler) ResetAllAdminSettings(c *gin.Context) {
 		"message":    "All settings reset to defaults",
 		"updated_at": now,
 	})
+}
+
+// checkLockDate reads the lock date from tenant_settings and returns an error message
+// if the given entryDate is on or before the lock date. Returns "" if allowed.
+func (h *Handler) checkLockDate(tenantID uuid.UUID, entryDate time.Time) string {
+	var settingsJSON []byte
+	err := h.db.QueryRow(
+		"SELECT settings FROM tenant_settings WHERE tenant_id = $1",
+		tenantID,
+	).Scan(&settingsJSON)
+	if err != nil {
+		return ""
+	}
+
+	var settings map[string]interface{}
+	if err := json.Unmarshal(settingsJSON, &settings); err != nil {
+		return ""
+	}
+
+	finance, ok := settings["finance"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	lockDateSection, ok := finance["lock_date"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+
+	enabled, _ := lockDateSection["enabled"].(bool)
+	if !enabled {
+		return ""
+	}
+
+	dateStr, ok := lockDateSection["date"].(string)
+	if !ok || dateStr == "" {
+		return ""
+	}
+
+	lockDate, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		return ""
+	}
+
+	entryDateOnly := time.Date(entryDate.Year(), entryDate.Month(), entryDate.Day(), 0, 0, 0, 0, time.UTC)
+	lockDateOnly := time.Date(lockDate.Year(), lockDate.Month(), lockDate.Day(), 0, 0, 0, 0, time.UTC)
+
+	if !entryDateOnly.After(lockDateOnly) {
+		return fmt.Sprintf("Cannot create or modify accounting entries on or before the lock date (%s)", lockDate.Format("2006-01-02"))
+	}
+
+	return ""
 }
