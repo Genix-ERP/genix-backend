@@ -153,6 +153,7 @@ type CreateWarehouseLocationInput struct {
 // InventoryAdjustmentInput represents input for inventory adjustment
 type InventoryAdjustmentInput struct {
 	ProductID    string  `json:"product_id" binding:"required"`
+	VariantID    string  `json:"variant_id,omitempty"`
 	WarehouseID  string  `json:"warehouse_id" binding:"required"`
 	LocationID   string  `json:"location_id,omitempty"`
 	LotNumber    string  `json:"lot_number,omitempty"`

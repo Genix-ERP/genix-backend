@@ -412,12 +412,21 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		}
 	}
 
-	// Verify product exists and get cost_price for transaction records
+	var variantID *uuid.UUID
+	if input.VariantID != "" {
+		vid, err := uuid.Parse(input.VariantID)
+		if err == nil {
+			variantID = &vid
+		}
+	}
+
+	// Verify product exists and get cost_price and has_variants flag
 	var productCostPrice float64
+	var hasVariants bool
 	err = h.db.QueryRow(
-		"SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+		"SELECT COALESCE(cost_price, 0), COALESCE(has_variants, false) FROM products WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
 		productID, tenantID,
-	).Scan(&productCostPrice)
+	).Scan(&productCostPrice, &hasVariants)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Product")
 		return
@@ -426,6 +435,25 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		h.log.Error("Failed to fetch product", "error", err)
 		response.InternalError(c, "Failed to adjust inventory")
 		return
+	}
+
+	// If product has variants, require variant_id
+	if hasVariants && variantID == nil {
+		response.BadRequest(c, "This product has variants. Please specify a variant to adjust stock.")
+		return
+	}
+
+	// If variant_id is provided, verify it belongs to this product
+	if variantID != nil {
+		var variantExists bool
+		h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM product_variants WHERE id = $1 AND product_id = $2 AND deleted_at IS NULL)",
+			variantID, productID,
+		).Scan(&variantExists)
+		if !variantExists {
+			response.BadRequest(c, "Invalid variant ID for this product")
+			return
+		}
 	}
 
 	// Use provided unit_cost or fall back to product's cost_price
@@ -466,7 +494,8 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		AND COALESCE(location_id::text, '') = COALESCE($4::text, '')
 		AND COALESCE(lot_number, '') = COALESCE($5, '')
 		AND COALESCE(serial_number, '') = COALESCE($6, '')
-	`, tenantID, productID, warehouseID, locationID, input.LotNumber, input.SerialNumber).Scan(&inventoryID, &currentQtyOnHand)
+		AND COALESCE(variant_id::text, '') = COALESCE($7::text, '')
+	`, tenantID, productID, warehouseID, locationID, input.LotNumber, input.SerialNumber, variantID).Scan(&inventoryID, &currentQtyOnHand)
 
 	if err == sql.ErrNoRows {
 		// Create new inventory record
@@ -484,11 +513,11 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		_, err = tx.Exec(`
 			INSERT INTO inventory (
 				id, tenant_id, product_id, warehouse_id, location_id,
-				lot_number, serial_number, quantity_on_hand, quantity_reserved,
+				lot_number, serial_number, variant_id, quantity_on_hand, quantity_reserved,
 				unit_cost, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, $10)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $11)
 		`, inventoryID, tenantID, productID, warehouseID, locationID,
-			lotNumber, serialNumber, input.Quantity, unitCost, now)
+			lotNumber, serialNumber, variantID, input.Quantity, unitCost, now)
 
 		if err != nil {
 			h.log.Error("Failed to create inventory record", "error", err)
