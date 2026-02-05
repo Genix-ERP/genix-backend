@@ -281,13 +281,14 @@ func (je *JournalEntry) ToResponse() *JournalEntryResponse {
 
 // CreateJournalEntryInput is the input for creating a journal entry
 type CreateJournalEntryInput struct {
-	JournalID   string                        `json:"journal_id" binding:"required"`
-	EntryDate   string                        `json:"entry_date" binding:"required"`
-	Reference   string                        `json:"reference"`
-	Description string                        `json:"description"`
-	CurrencyID  *string                       `json:"currency_id"`
-	ExchangeRate float64                      `json:"exchange_rate"`
-	Lines       []CreateJournalEntryLineInput `json:"lines" binding:"required,min=2"`
+	JournalID      string                        `json:"journal_id" binding:"required"`
+	OrganizationID string                        `json:"organization_id"`
+	EntryDate      string                        `json:"entry_date" binding:"required"`
+	Reference      string                        `json:"reference"`
+	Description    string                        `json:"description"`
+	CurrencyID     *string                       `json:"currency_id"`
+	ExchangeRate   float64                       `json:"exchange_rate"`
+	Lines          []CreateJournalEntryLineInput `json:"lines" binding:"required,min=2"`
 }
 
 // CreateJournalEntryLineInput is the input for a journal entry line

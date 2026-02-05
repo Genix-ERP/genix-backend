@@ -925,14 +925,15 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 	// Credit: Inventory or Purchase Expense (reduce inventory value)
 	// =====================================================
 
-	// Get accounts
-	var apAccountID, inventoryAccountID uuid.UUID
-	h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2000' AND deleted_at IS NULL", tenantID).Scan(&apAccountID)
-	if apAccountID == uuid.Nil {
-		// Try alternative AP code
-		h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND name ILIKE '%payable%' AND deleted_at IS NULL LIMIT 1", tenantID).Scan(&apAccountID)
-	}
-	h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1200' AND deleted_at IS NULL", tenantID).Scan(&inventoryAccountID)
+	// Get organization_id from linked PO for correct account lookup
+	var prOrgID *uuid.UUID
+	h.db.QueryRow(`SELECT po.organization_id FROM purchase_orders po
+		JOIN purchase_returns pr ON pr.purchase_order_id = po.id
+		WHERE pr.id = $1`, returnID).Scan(&prOrgID)
+
+	// Get accounts — lookup by name first, then code fallback
+	apAccountID := findAccount(h.db, tenantID, prOrgID, "accounts payable", "2000")
+	inventoryAccountID := findAccount(h.db, tenantID, prOrgID, "inventory", "1200")
 
 	// Get journal (use GENERAL or PURCHASE journal)
 	var journalID uuid.UUID
@@ -946,10 +947,10 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 		entryID := uuid.New()
 		_, err = h.db.Exec(`
 			INSERT INTO journal_entries (
-				id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, total_debit, total_credit, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'posted', $12, $13)`,
-			entryID, tenantID, journalID, entryNumber, now, returnNumber,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14)`,
+			entryID, tenantID, prOrgID, journalID, entryNumber, now, returnNumber,
 			fmt.Sprintf("Debit Note for Purchase Return %s - %s", returnNumber, supplierName),
 			"purchase_return", returnID, totalValue, totalValue, now, now,
 		)
