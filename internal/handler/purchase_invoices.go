@@ -220,6 +220,7 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 	var input struct {
 		VendorID            string  `json:"vendor_id" binding:"required"`
 		PartnerID           string  `json:"partner_id"` // Alias for vendor_id
+		OrganizationID      string  `json:"organization_id"`
 		VendorInvoiceNumber string  `json:"vendor_invoice_number"`
 		InvoiceDate         string  `json:"invoice_date" binding:"required"`
 		DueDate             string  `json:"due_date" binding:"required"`
@@ -277,17 +278,25 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		createdBy = &userID
 	}
 
+	var orgID *uuid.UUID
+	if input.OrganizationID != "" {
+		parsed, err := uuid.Parse(input.OrganizationID)
+		if err == nil {
+			orgID = &parsed
+		}
+	}
+
 	// Insert purchase invoice
 	query := `
 		INSERT INTO purchase_invoices (
-			id, tenant_id, invoice_number, vendor_id, vendor_invoice_number,
+			id, tenant_id, organization_id, invoice_number, vendor_id, vendor_invoice_number,
 			invoice_date, due_date, subtotal, discount_amount,
 			tax_amount, total_amount, amount_paid, status,
 			three_way_match_status, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
 
 	_, err = h.db.Exec(query,
-		invoiceID, tenantID, invoiceNumber, vendorID, input.VendorInvoiceNumber,
+		invoiceID, tenantID, orgID, invoiceNumber, vendorID, input.VendorInvoiceNumber,
 		invoiceDate, dueDate, subtotal, 0,
 		taxAmount, totalAmount, 0, "draft",
 		"pending", input.Notes, createdBy, now, now,
@@ -591,6 +600,8 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 		return
 	}
 
+	userID, _ := middleware.GetUserID(c)
+
 	invoiceID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid invoice ID")
@@ -599,15 +610,17 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 
 	// Get current invoice status and details
 	var currentStatus string
-	var totalAmount float64
+	var totalAmount, taxAmount, subtotal float64
+	var vendorID uuid.UUID
 	var vendorName sql.NullString
+	var organizationID *uuid.UUID
 	err = h.db.QueryRow(`
-		SELECT pi.status, pi.total_amount, c.name
+		SELECT pi.status, pi.total_amount, pi.tax_amount, pi.subtotal, pi.vendor_id, c.name, pi.organization_id
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		WHERE pi.id = $1 AND pi.tenant_id = $2 AND pi.deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &totalAmount, &vendorName)
+	).Scan(&currentStatus, &totalAmount, &taxAmount, &subtotal, &vendorID, &vendorName, &organizationID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase invoice")
 		return
@@ -625,64 +638,127 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 
 	now := time.Now()
 
-	// Get account IDs for journal entry
-	// Try to find Inventory or Stock account (asset)
-	var inventoryAccountID sql.NullString
-	h.db.QueryRow(`
-		SELECT id FROM chart_of_accounts
-		WHERE tenant_id = $1 AND account_type = 'asset'
-		AND (LOWER(name) LIKE '%inventory%' OR LOWER(name) LIKE '%stock%')
-		AND deleted_at IS NULL
-		LIMIT 1`, tenantID).Scan(&inventoryAccountID)
+	// Start transaction for GL posting
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
 
-	// Try to find Accounts Payable account (liability)
-	var apAccountID sql.NullString
-	h.db.QueryRow(`
-		SELECT id FROM chart_of_accounts
-		WHERE tenant_id = $1 AND account_type = 'liability'
-		AND LOWER(name) LIKE '%payable%'
-		AND deleted_at IS NULL
-		LIMIT 1`, tenantID).Scan(&apAccountID)
+	// Get Purchase Journal
+	var purchaseJournalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	err = tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code = 'PURCHASE' AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
 
-	// Create journal entry if we have both accounts
-	if inventoryAccountID.Valid && apAccountID.Valid {
-		entryID := uuid.New()
-		entryNumber := fmt.Sprintf("JE-%s", now.Format("20060102150405"))
-		description := "Bill Posted"
-		if vendorName.Valid {
-			description = fmt.Sprintf("Bill: %s", vendorName.String)
+	if err == nil {
+		// Get account IDs — lookup by name first, then code fallback
+		inventoryAccountID := findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
+		if inventoryAccountID == uuid.Nil {
+			inventoryAccountID = findAccount(tx, tenantID, organizationID, "inventory", "5000")
 		}
+		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
 
-		invAcctID, _ := uuid.Parse(inventoryAccountID.String)
-		apAcctID, _ := uuid.Parse(apAccountID.String)
+		if apAccountID != uuid.Nil && inventoryAccountID != uuid.Nil {
+			prefix := ""
+			if numberPrefix.Valid {
+				prefix = numberPrefix.String
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 
-		_, err = h.db.Exec(`
-			INSERT INTO journal_entries (
-				id, tenant_id, entry_number, entry_date, entry_type,
-				debit_account_id, credit_account_id, amount,
-				description, reference_type, reference_id, status,
-				created_at, updated_at
-			) VALUES ($1, $2, $3, $4, 'purchase', $5, $6, $7, $8, 'purchase_invoice', $9, 'posted', $10, $10)
-		`, entryID, tenantID, entryNumber, now, invAcctID, apAcctID,
-			totalAmount, description, invoiceID, now)
+			description := "Bill Posted"
+			if vendorName.Valid {
+				description = fmt.Sprintf("Bill: %s", vendorName.String)
+			}
 
-		if err != nil {
-			h.log.Error("Failed to create journal entry for posted invoice", "error", err)
+			journalEntryID := uuid.New()
+			_, err = tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+				journalEntryID, tenantID, organizationID, purchaseJournalID, entryNumber, now, invoiceID.String()[:8], description,
+				"purchase_invoice", invoiceID.String(), 1.0, totalAmount, totalAmount, userID, now, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create journal entry for posted invoice", "error", err)
+			} else {
+				lineNumber := 1
+
+				// Debit Inventory/COGS
+				invLineID := uuid.New()
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, contact_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					invLineID, journalEntryID, lineNumber, inventoryAccountID, vendorID, "Inventory/COGS",
+					subtotal, 0.0, 1.0, now,
+				)
+				lineNumber++
+
+				// Debit Tax (if applicable)
+				if taxAccountID != uuid.Nil && taxAmount > 0 {
+					taxLineID := uuid.New()
+					tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						taxLineID, journalEntryID, lineNumber, taxAccountID, "Input Tax",
+						taxAmount, 0.0, 1.0, now,
+					)
+					lineNumber++
+				}
+
+				// Credit AP
+				apLineID := uuid.New()
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, contact_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					apLineID, journalEntryID, lineNumber, apAccountID, vendorID, "Accounts Payable",
+					0.0, totalAmount, 1.0, now,
+				)
+
+				// Update journal next number
+				tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", purchaseJournalID)
+
+				// Update account balances
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", subtotal, now, inventoryAccountID)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
+				if taxAccountID != uuid.Nil && taxAmount > 0 {
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+				}
+
+				// Link journal entry to invoice
+				tx.Exec("UPDATE purchase_invoices SET journal_entry_id = $1 WHERE id = $2", journalEntryID, invoiceID)
+			}
 		} else {
-			h.log.Info("Journal entry created for posted invoice", "entry_id", entryID, "invoice_id", invoiceID)
+			h.log.Warn("Could not create journal entry: missing Inventory or Accounts Payable account",
+				"has_inventory", inventoryAccountID != uuid.Nil, "has_ap", apAccountID != uuid.Nil)
 		}
-	} else {
-		h.log.Warn("Could not create journal entry: missing Inventory or Accounts Payable account",
-			"has_inventory", inventoryAccountID.Valid, "has_ap", apAccountID.Valid)
 	}
 
 	// Update invoice status to posted
-	_, err = h.db.Exec(
+	_, err = tx.Exec(
 		"UPDATE purchase_invoices SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
 		"posted", now, invoiceID, tenantID,
 	)
 	if err != nil {
 		response.InternalError(c, "Failed to post invoice")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
 
@@ -711,10 +787,11 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	// Get current invoice status and amounts
 	var currentStatus string
 	var amountPaid, totalAmount float64
+	var organizationID *uuid.UUID
 	err = h.db.QueryRow(
-		"SELECT status, amount_paid, total_amount FROM purchase_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+		"SELECT status, amount_paid, total_amount, organization_id FROM purchase_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &amountPaid, &totalAmount)
+	).Scan(&currentStatus, &amountPaid, &totalAmount, &organizationID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase invoice")
 		return
@@ -810,47 +887,77 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	}
 
 	// Create journal entry for payment: Debit AP, Credit Cash/Bank
-	// Get account IDs
-	var apAccountID sql.NullString
-	h.db.QueryRow(`
-		SELECT id FROM chart_of_accounts
-		WHERE tenant_id = $1 AND account_type = 'liability'
-		AND LOWER(name) LIKE '%payable%'
-		AND deleted_at IS NULL
-		LIMIT 1`, tenantID).Scan(&apAccountID)
+	// Get CASH_DISBURSEMENTS or PURCHASE journal
+	var payJournalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	err = h.db.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND (code = 'CASH_DISBURSEMENTS' OR code = 'PURCHASE') AND deleted_at IS NULL LIMIT 1`,
+		tenantID,
+	).Scan(&payJournalID, &nextNumber, &numberPrefix)
 
-	var cashAccountID sql.NullString
-	h.db.QueryRow(`
-		SELECT id FROM chart_of_accounts
-		WHERE tenant_id = $1 AND account_type = 'asset'
-		AND (LOWER(name) LIKE '%cash%' OR LOWER(name) LIKE '%bank%')
-		AND deleted_at IS NULL
-		LIMIT 1`, tenantID).Scan(&cashAccountID)
+	if err == nil {
+		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "2000")
+		cashAcctID := findAccount(h.db, tenantID, organizationID, "bank account", "1010")
+		if cashAcctID == uuid.Nil {
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "petty cash", "1010")
+		}
 
-	// Create journal entry if we have both accounts
-	if apAccountID.Valid && cashAccountID.Valid {
-		entryID := uuid.New()
-		entryNumber := fmt.Sprintf("PAY-%s", now.Format("20060102150405"))
-		description := fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
+		if apAcctID != uuid.Nil && cashAcctID != uuid.Nil {
+			prefix := ""
+			if numberPrefix.Valid {
+				prefix = numberPrefix.String
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+			description := fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
 
-		apAcctID, _ := uuid.Parse(apAccountID.String)
-		cashAcctID, _ := uuid.Parse(cashAccountID.String)
+			var contactUUID uuid.UUID
+			if vendorID.Valid {
+				contactUUID, _ = uuid.Parse(vendorID.String)
+			}
 
-		// For payment: Debit AP (reduce liability), Credit Cash (reduce asset)
-		_, err = h.db.Exec(`
-			INSERT INTO journal_entries (
-				id, tenant_id, entry_number, entry_date, entry_type,
-				debit_account_id, credit_account_id, amount,
-				description, reference_type, reference_id, status,
-				created_at, updated_at
-			) VALUES ($1, $2, $3, $4, 'payment', $5, $6, $7, $8, 'purchase_invoice_payment', $9, 'posted', $10, $10)
-		`, entryID, tenantID, entryNumber, now, apAcctID, cashAcctID,
-			paymentAmount, description, invoiceID, now)
+			journalEntryID := uuid.New()
+			_, err = h.db.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15)`,
+				journalEntryID, tenantID, organizationID, payJournalID, entryNumber, now, invoiceID.String()[:8], description,
+				"purchase_invoice_payment", invoiceID.String(), 1.0, paymentAmount, paymentAmount, now, now,
+			)
 
-		if err != nil {
-			h.log.Error("Failed to create journal entry for payment", "error", err)
-		} else {
-			h.log.Info("Journal entry created for payment", "entry_id", entryID, "invoice_id", invoiceID, "amount", paymentAmount)
+			if err != nil {
+				h.log.Error("Failed to create journal entry for payment", "error", err)
+			} else {
+				// Debit AP
+				apLineID := uuid.New()
+				h.db.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, contact_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					apLineID, journalEntryID, 1, apAcctID, contactUUID, "Accounts Payable",
+					paymentAmount, 0.0, 1.0, now,
+				)
+				// Credit Cash
+				cashLineID := uuid.New()
+				h.db.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					cashLineID, journalEntryID, 2, cashAcctID, "Cash/Bank",
+					0.0, paymentAmount, 1.0, now,
+				)
+
+				// Update journal next number
+				h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", payJournalID)
+
+				// Update account balances
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, apAcctID)
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
+			}
 		}
 	}
 
@@ -983,15 +1090,16 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 	var currentStatus, dnNumber string
 	var vendorID uuid.UUID
 	var originalInvoiceID *uuid.UUID
+	var organizationID *uuid.UUID
 	var totalAmount, taxAmount, dnSubtotal float64
 	var dnDate time.Time
 
 	err = h.db.QueryRow(`
-		SELECT status, invoice_number, vendor_id, original_invoice_id, total_amount, tax_amount, subtotal, invoice_date
+		SELECT status, invoice_number, vendor_id, original_invoice_id, organization_id, total_amount, tax_amount, subtotal, invoice_date
 		FROM purchase_invoices
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND invoice_type = 'debit_note'`,
 		debitNoteID, tenantID,
-	).Scan(&currentStatus, &dnNumber, &vendorID, &originalInvoiceID, &totalAmount, &taxAmount, &dnSubtotal, &dnDate)
+	).Scan(&currentStatus, &dnNumber, &vendorID, &originalInvoiceID, &organizationID, &totalAmount, &taxAmount, &dnSubtotal, &dnDate)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Debit note")
 		return
@@ -1031,10 +1139,9 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
 
 	if err == nil {
-		var apAccountID, expenseAccountID, taxAccountID uuid.UUID
-		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2000' AND deleted_at IS NULL`, tenantID).Scan(&apAccountID)
-		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '5000' AND deleted_at IS NULL`, tenantID).Scan(&expenseAccountID)
-		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2100' AND deleted_at IS NULL`, tenantID).Scan(&taxAccountID)
+		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+		expenseAccountID := findAccount(tx, tenantID, organizationID, "expense", "5000")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
 
 		if apAccountID != uuid.Nil {
 			prefix := ""
@@ -1048,10 +1155,10 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 
 			_, err = tx.Exec(`
 				INSERT INTO journal_entries (
-					id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
-				journalEntryID, tenantID, purchaseJournalID, entryNumber, dnDate, dnNumber, description,
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+				journalEntryID, tenantID, organizationID, purchaseJournalID, entryNumber, dnDate, dnNumber, description,
 				"debit_note", debitNoteID.String(), 1.0, totalAmount, totalAmount, userID, now, now,
 			)
 			if err != nil {

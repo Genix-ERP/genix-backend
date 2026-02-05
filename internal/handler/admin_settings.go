@@ -489,3 +489,65 @@ func (h *Handler) checkLockDate(tenantID uuid.UUID, entryDate time.Time) string 
 
 	return ""
 }
+
+// dbQuerier is an interface satisfied by both *sql.DB and *sql.Tx
+type dbQuerier interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+// findAccount looks up an account by name pattern within an organization, falling back to
+// tenant-wide name match, then org-specific code match. This handles organizations where
+// account codes may be reassigned to different account types.
+// nameLike should be specific (e.g. "accounts receivable", "sales revenue") to avoid ambiguity.
+func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike string, code string) uuid.UUID {
+	var id uuid.UUID
+
+	// 1. Try org + exact name start match (most precise)
+	if orgID != nil {
+		_ = q.QueryRow(
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND LOWER(name) LIKE $3 AND deleted_at IS NULL LIMIT 1`,
+			tenantID, *orgID, nameLike+"%",
+		).Scan(&id)
+		if id != uuid.Nil {
+			return id
+		}
+	}
+
+	// 2. Try org + contains name match (broader)
+	if orgID != nil {
+		_ = q.QueryRow(
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND LOWER(name) LIKE $3 AND deleted_at IS NULL LIMIT 1`,
+			tenantID, *orgID, "%"+nameLike+"%",
+		).Scan(&id)
+		if id != uuid.Nil {
+			return id
+		}
+	}
+
+	// 3. Try org + code match
+	if orgID != nil {
+		_ = q.QueryRow(
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code = $3 AND deleted_at IS NULL LIMIT 1`,
+			tenantID, *orgID, code,
+		).Scan(&id)
+		if id != uuid.Nil {
+			return id
+		}
+	}
+
+	// 4. Fallback: tenant-wide name match (no org filter)
+	_ = q.QueryRow(
+		`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) LIKE $2 AND deleted_at IS NULL LIMIT 1`,
+		tenantID, nameLike+"%",
+	).Scan(&id)
+	if id != uuid.Nil {
+		return id
+	}
+
+	// 5. Last resort: tenant-wide code match
+	_ = q.QueryRow(
+		`SELECT id FROM accounts WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL LIMIT 1`,
+		tenantID, code,
+	).Scan(&id)
+	return id
+}

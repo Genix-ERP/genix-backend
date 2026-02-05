@@ -474,10 +474,15 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 	// Credit: Accounts Receivable (reduce what customer owes)
 	// =====================================================
 
-	// Get accounts
-	var arAccountID, revenueAccountID uuid.UUID
-	h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1100' AND deleted_at IS NULL", tenantID).Scan(&arAccountID)
-	h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND code = '4000' AND deleted_at IS NULL", tenantID).Scan(&revenueAccountID)
+	// Get organization_id from linked invoice for correct account lookup
+	var returnOrgID *uuid.UUID
+	h.db.QueryRow(`SELECT si.organization_id FROM sales_invoices si
+		JOIN sales_returns sr ON sr.sales_invoice_id = si.id
+		WHERE sr.id = $1`, returnID).Scan(&returnOrgID)
+
+	// Get accounts — lookup by name first, then code fallback
+	arAccountID := findAccount(h.db, tenantID, returnOrgID, "accounts receivable", "1100")
+	revenueAccountID := findAccount(h.db, tenantID, returnOrgID, "sales revenue", "4000")
 
 	// Get journal
 	var journalID uuid.UUID
@@ -491,10 +496,10 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 		entryID := uuid.New()
 		_, err = h.db.Exec(`
 			INSERT INTO journal_entries (
-				id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, total_debit, total_credit, status, created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'posted', $12, $13, $14)`,
-			entryID, tenantID, journalID, entryNumber, now, returnNumber,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
+			entryID, tenantID, returnOrgID, journalID, entryNumber, now, returnNumber,
 			fmt.Sprintf("Credit Note for Sales Return %s - %s", returnNumber, customerName),
 			"sales_return", returnID, totalAmount, totalAmount, approvedBy, now, now,
 		)
@@ -742,10 +747,15 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 	// =====================================================
 
 	if input.RefundMethod == "cash_refund" || input.RefundMethod == "cash" {
-		// Get accounts
-		var arAccountID, cashAccountID uuid.UUID
-		h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1100' AND deleted_at IS NULL", tenantID).Scan(&arAccountID)
-		h.db.QueryRow("SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1000' AND deleted_at IS NULL", tenantID).Scan(&cashAccountID)
+		// Get organization_id from linked invoice
+		var refundOrgID *uuid.UUID
+		h.db.QueryRow(`SELECT si.organization_id FROM sales_invoices si
+			JOIN sales_returns sr ON sr.sales_invoice_id = si.id
+			WHERE sr.id = $1`, returnID).Scan(&refundOrgID)
+
+		// Get accounts — lookup by name first, then code fallback
+		arAccountID := findAccount(h.db, tenantID, refundOrgID, "accounts receivable", "1100")
+		cashAccountID := findAccount(h.db, tenantID, refundOrgID, "cash", "1000")
 
 		// Get journal
 		var journalID uuid.UUID
@@ -759,10 +769,10 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 			entryID := uuid.New()
 			_, err = h.db.Exec(`
 				INSERT INTO journal_entries (
-					id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, total_debit, total_credit, status, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'posted', $12, $13)`,
-				entryID, tenantID, journalID, entryNumber, now, returnNumber,
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14)`,
+				entryID, tenantID, refundOrgID, journalID, entryNumber, now, returnNumber,
 				fmt.Sprintf("Cash Refund for Sales Return %s - %s", returnNumber, customerName),
 				"sales_return_refund", returnID, totalAmount, totalAmount, now, now,
 			)

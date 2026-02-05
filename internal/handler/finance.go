@@ -1226,12 +1226,20 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 
 	sourceType := "manual"
 
+	var orgID *uuid.UUID
+	if input.OrganizationID != "" {
+		parsed, parseErr := uuid.Parse(input.OrganizationID)
+		if parseErr == nil {
+			orgID = &parsed
+		}
+	}
+
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
-			id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 			source_type, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-	`, id, tenantID, journalID, entryNumber, entryDate, reference, description,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+	`, id, tenantID, orgID, journalID, entryNumber, entryDate, reference, description,
 		sourceType, exchangeRate, totalDebit, totalCredit, "draft", userID, now, now)
 
 	if err != nil {
@@ -1588,15 +1596,16 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	// Get original entry
 	var status, entryNumber string
 	var journalID uuid.UUID
+	var organizationID *uuid.UUID
 	var entryDate time.Time
 	var totalDebit, totalCredit float64
 	var ref, desc sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT status, journal_id, entry_number, entry_date, reference, description, total_debit, total_credit
+		SELECT status, journal_id, organization_id, entry_number, entry_date, reference, description, total_debit, total_credit
 		FROM journal_entries
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, originalID, tenantID).Scan(&status, &journalID, &entryNumber, &entryDate, &ref, &desc, &totalDebit, &totalCredit)
+	`, originalID, tenantID).Scan(&status, &journalID, &organizationID, &entryNumber, &entryDate, &ref, &desc, &totalDebit, &totalCredit)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Journal entry")
@@ -1642,11 +1651,11 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	// Create reversal entry (swap debit/credit)
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
-			id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 			source_type, total_debit, total_credit, status, posted_at, posted_by,
 			reversal_of, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-	`, reversalID, tenantID, journalID, reversalNumber, now, reference, description,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+	`, reversalID, tenantID, organizationID, journalID, reversalNumber, now, reference, description,
 		"reversal", totalCredit, totalDebit, "posted", now, userID,
 		originalID, userID, now, now)
 

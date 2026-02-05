@@ -310,7 +310,11 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	}
 
 	// Parse optional UUIDs
-	var salesOrderID, currencyID *uuid.UUID
+	var salesOrderID, currencyID, orgID *uuid.UUID
+	if input.OrganizationID != "" {
+		id, _ := uuid.Parse(input.OrganizationID)
+		orgID = &id
+	}
 	if input.SalesOrderID != "" {
 		id, _ := uuid.Parse(input.SalesOrderID)
 		salesOrderID = &id
@@ -328,16 +332,16 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	// Insert sales invoice
 	query := `
 		INSERT INTO sales_invoices (
-			id, tenant_id, invoice_number, customer_id, sales_order_id,
+			id, tenant_id, organization_id, invoice_number, customer_id, sales_order_id,
 			invoice_date, due_date, billing_address, shipping_address,
 			currency_id, exchange_rate, subtotal, discount_amount,
 			tax_amount, total_amount, amount_paid, status,
 			reference, po_number, notes, terms_conditions,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`
 
 	_, err = h.db.Exec(query,
-		invoiceID, tenantID, invoiceNumber, customerID, salesOrderID,
+		invoiceID, tenantID, orgID, invoiceNumber, customerID, salesOrderID,
 		invoiceDate, dueDate, billingAddressJSON, shippingAddressJSON,
 		currencyID, 1.0, subtotal, discountAmount,
 		taxAmount, totalAmount, 0, entity.InvoiceStatusDraft,
@@ -814,13 +818,14 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	// Get invoice details
 	var currentStatus, invoiceNumber string
 	var customerID uuid.UUID
+	var organizationID *uuid.UUID
 	var totalAmount, taxAmount, subtotal float64
 	var invoiceDate time.Time
 	err = h.db.QueryRow(`
-		SELECT status, invoice_number, customer_id, total_amount, tax_amount, subtotal, invoice_date
+		SELECT status, invoice_number, customer_id, organization_id, total_amount, tax_amount, subtotal, invoice_date
 		FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &invoiceNumber, &customerID, &totalAmount, &taxAmount, &subtotal, &invoiceDate)
+	).Scan(&currentStatus, &invoiceNumber, &customerID, &organizationID, &totalAmount, &taxAmount, &subtotal, &invoiceDate)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
 		return
@@ -878,10 +883,9 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
-	// Get default account IDs
-	var arAccountID, revenueAccountID, taxAccountID uuid.UUID
-	err = tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1100' AND deleted_at IS NULL`, tenantID).Scan(&arAccountID)
-	if err != nil {
+	// Get default account IDs — lookup by name first, then code fallback
+	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+	if arAccountID == uuid.Nil {
 		h.log.Warn("AR account not found, skipping GL posting", "tenant_id", tenantID)
 		_, err = tx.Exec(
 			"UPDATE sales_invoices SET status = $1, sent_at = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
@@ -899,8 +903,8 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
-	tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '4000' AND deleted_at IS NULL`, tenantID).Scan(&revenueAccountID)
-	tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2100' AND deleted_at IS NULL`, tenantID).Scan(&taxAccountID)
+	revenueAccountID := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+	taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
 
 	// Generate entry number
 	prefix := ""
@@ -915,10 +919,10 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
-			id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-		journalEntryID, tenantID, salesJournalID, entryNumber, invoiceDate, invoiceNumber, description,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+		journalEntryID, tenantID, organizationID, salesJournalID, entryNumber, invoiceDate, invoiceNumber, description,
 		"sales_invoice", invoiceID.String(), 1.0, totalAmount, totalAmount, "posted", userID, now, now,
 	)
 	if err != nil {
@@ -993,6 +997,18 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
+	// Update account balances
+	// AR is a debit-normal account, so debit increases balance
+	tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
+	if revenueAccountID != uuid.Nil && subtotal > 0 {
+		// Revenue is credit-normal, credit increases balance
+		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", subtotal, now, revenueAccountID)
+	}
+	if taxAccountID != uuid.Nil && taxAmount > 0 {
+		// Tax payable is credit-normal, credit increases balance
+		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+	}
+
 	// Update invoice with journal entry ID and status
 	_, err = tx.Exec(
 		"UPDATE sales_invoices SET status = $1, sent_at = $2, journal_entry_id = $3, updated_at = $4 WHERE id = $5 AND tenant_id = $6",
@@ -1029,10 +1045,11 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	var input struct {
-		Amount      float64 `json:"amount" binding:"required,gt=0"`
-		PaymentDate string  `json:"payment_date" binding:"required"`
-		Reference   string  `json:"reference,omitempty"`
-		Notes       string  `json:"notes,omitempty"`
+		Amount        float64 `json:"amount" binding:"required,gt=0"`
+		PaymentDate   string  `json:"payment_date" binding:"required"`
+		PaymentMethod string  `json:"payment_method,omitempty"`
+		Reference     string  `json:"reference,omitempty"`
+		Notes         string  `json:"notes,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, err.Error())
@@ -1049,12 +1066,13 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	// Get current invoice status and amounts
 	var currentStatus, invoiceNumber string
 	var customerID uuid.UUID
+	var organizationID *uuid.UUID
 	var amountPaid, totalAmount float64
 	err = h.db.QueryRow(`
-		SELECT status, invoice_number, customer_id, amount_paid, total_amount
+		SELECT status, invoice_number, customer_id, organization_id, amount_paid, total_amount
 		FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &invoiceNumber, &customerID, &amountPaid, &totalAmount)
+	).Scan(&currentStatus, &invoiceNumber, &customerID, &organizationID, &amountPaid, &totalAmount)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
 		return
@@ -1106,10 +1124,22 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		tenantID,
 	).Scan(&cashJournalID, &nextNumber, &numberPrefix)
 
-	// Get default account IDs
-	var arAccountID, cashAccountID uuid.UUID
-	tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1100' AND deleted_at IS NULL`, tenantID).Scan(&arAccountID)
-	tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1010' AND deleted_at IS NULL`, tenantID).Scan(&cashAccountID)
+	// Get default account IDs — lookup by name first, then code fallback
+	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
+	// Choose cash/bank account based on payment method
+	var cashAccountID uuid.UUID
+	if input.PaymentMethod == "cash" {
+		cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
+		if cashAccountID == uuid.Nil {
+			cashAccountID = findAccount(tx, tenantID, organizationID, "petty cash", "1010")
+		}
+	} else {
+		// Default to bank account for bank_transfer, check, etc.
+		cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1100")
+		if cashAccountID == uuid.Nil {
+			cashAccountID = findAccount(tx, tenantID, organizationID, "petty cash", "1010")
+		}
+	}
 
 	// Create GL entry if accounts exist
 	if cashJournalID != uuid.Nil && arAccountID != uuid.Nil && cashAccountID != uuid.Nil {
@@ -1130,10 +1160,10 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 		_, err = tx.Exec(`
 			INSERT INTO journal_entries (
-				id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-			journalEntryID, tenantID, cashJournalID, entryNumber, paymentDate, reference, description,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+			journalEntryID, tenantID, organizationID, cashJournalID, entryNumber, paymentDate, reference, description,
 			"payment_receipt", invoiceID.String(), 1.0, input.Amount, input.Amount, "posted", userID, now, now,
 		)
 		if err != nil {
@@ -1164,6 +1194,12 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 			// Update journal next number
 			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", cashJournalID)
+
+			// Update account balances
+			// Debit Cash (debit-normal: increases)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAccountID)
+			// Credit AR (debit-normal: credit decreases)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Amount, now, arAccountID)
 
 			// Create payment record
 			paymentID := uuid.New()
@@ -1406,15 +1442,16 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	var currentStatus, cnNumber string
 	var customerID uuid.UUID
 	var originalInvoiceID *uuid.UUID
+	var organizationID *uuid.UUID
 	var totalAmount, taxAmount, cnSubtotal float64
 	var cnDate time.Time
 
 	err = h.db.QueryRow(`
-		SELECT status, invoice_number, customer_id, original_invoice_id, total_amount, tax_amount, subtotal, invoice_date
+		SELECT status, invoice_number, customer_id, original_invoice_id, organization_id, total_amount, tax_amount, subtotal, invoice_date
 		FROM sales_invoices
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND invoice_type = 'credit_note'`,
 		creditNoteID, tenantID,
-	).Scan(&currentStatus, &cnNumber, &customerID, &originalInvoiceID, &totalAmount, &taxAmount, &cnSubtotal, &cnDate)
+	).Scan(&currentStatus, &cnNumber, &customerID, &originalInvoiceID, &organizationID, &totalAmount, &taxAmount, &cnSubtotal, &cnDate)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Credit note")
 		return
@@ -1454,10 +1491,9 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
 
 	if err == nil {
-		var arAccountID, revenueAccountID, taxAccountID uuid.UUID
-		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '1100' AND deleted_at IS NULL`, tenantID).Scan(&arAccountID)
-		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '4000' AND deleted_at IS NULL`, tenantID).Scan(&revenueAccountID)
-		tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '2100' AND deleted_at IS NULL`, tenantID).Scan(&taxAccountID)
+		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+		revenueAccountID := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
 
 		if arAccountID != uuid.Nil {
 			prefix := ""
@@ -1471,10 +1507,10 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 
 			_, err = tx.Exec(`
 				INSERT INTO journal_entries (
-					id, tenant_id, journal_id, entry_number, entry_date, reference, description,
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
-				journalEntryID, tenantID, salesJournalID, entryNumber, cnDate, cnNumber, description,
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+				journalEntryID, tenantID, organizationID, salesJournalID, entryNumber, cnDate, cnNumber, description,
 				"credit_note", creditNoteID.String(), 1.0, totalAmount, totalAmount, userID, now, now,
 			)
 			if err != nil {

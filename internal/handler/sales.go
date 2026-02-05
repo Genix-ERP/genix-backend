@@ -217,6 +217,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 // SimpleSalesOrderInput represents a simplified input for creating sales orders from frontend
 type SimpleSalesOrderInput struct {
 	// Standard API fields
+	OrganizationID  string                              `json:"organization_id,omitempty"`
 	CustomerID      string                              `json:"customer_id,omitempty"`
 	ContactPersonID string                              `json:"contact_person_id,omitempty"`
 	OrderDate       string                              `json:"order_date"`
@@ -422,16 +423,25 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		createdBy = &userID
 	}
 
+	// Parse organization ID
+	var orgID *uuid.UUID
+	if input.OrganizationID != "" {
+		parsed, parseErr := uuid.Parse(input.OrganizationID)
+		if parseErr == nil {
+			orgID = &parsed
+		}
+	}
+
 	// Insert sales order
 	query := `
 		INSERT INTO sales_orders (
-			id, tenant_id, order_number, customer_id, contact_person_id,
+			id, tenant_id, organization_id, order_number, customer_id, contact_person_id,
 			order_date, expected_date, billing_address, shipping_address,
 			currency_id, exchange_rate, subtotal, discount_type, discount_value, discount_amount, discount_code,
 			tax_amount, shipping_amount, total_amount, status, payment_status, payment_terms,
 			reference, po_number, notes, internal_notes, warehouse_id, carrier, sales_rep_id,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)`
 
 	// Handle discount code - use nil for empty string
 	var discountCode *string
@@ -440,7 +450,7 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 	}
 
 	_, err = h.db.Exec(query,
-		orderID, tenantID, orderNumber, customerID, contactPersonID,
+		orderID, tenantID, orgID, orderNumber, customerID, contactPersonID,
 		orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
 		currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
 		taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
@@ -1161,6 +1171,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	// Get order details with customer name
 	var customerID uuid.UUID
+	var organizationID *uuid.UUID
 	var orderNumber string
 	var subtotal, discountAmount, taxAmount, shippingAmount, totalAmount float64
 	var paymentTerms int
@@ -1169,14 +1180,14 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	var customerName string
 
 	err = h.db.QueryRow(`
-		SELECT so.customer_id, so.order_number, COALESCE(so.subtotal, 0), COALESCE(so.discount_amount, 0), COALESCE(so.tax_amount, 0), COALESCE(so.shipping_amount, 0), COALESCE(so.total_amount, 0),
+		SELECT so.customer_id, so.organization_id, so.order_number, COALESCE(so.subtotal, 0), COALESCE(so.discount_amount, 0), COALESCE(so.tax_amount, 0), COALESCE(so.shipping_amount, 0), COALESCE(so.total_amount, 0),
 		       COALESCE(so.payment_terms, 30), COALESCE(so.billing_address::text, ''), COALESCE(so.shipping_address::text, ''), so.status,
 		       COALESCE(c.name, '')
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`,
 		orderID, tenantID).Scan(
-		&customerID, &orderNumber, &subtotal, &discountAmount, &taxAmount, &shippingAmount, &totalAmount,
+		&customerID, &organizationID, &orderNumber, &subtotal, &discountAmount, &taxAmount, &shippingAmount, &totalAmount,
 		&paymentTerms, &billingAddress, &shippingAddress, &currentStatus, &customerName,
 	)
 	if err == sql.ErrNoRows {
@@ -1242,12 +1253,12 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	_, err = h.db.Exec(`
 		INSERT INTO sales_invoices (
-			id, tenant_id, invoice_number, customer_id, customer_name, sales_order_id,
+			id, tenant_id, organization_id, invoice_number, customer_id, customer_name, sales_order_id,
 			invoice_date, due_date, billing_address, shipping_address,
 			exchange_rate, subtotal, discount_amount, tax_amount, total_amount,
 			amount_paid, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
-		invoiceID, tenantID, invoiceNumber, customerID, customerName, orderID,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
+		invoiceID, tenantID, organizationID, invoiceNumber, customerID, customerName, orderID,
 		now, dueDate, billingAddrParam, shippingAddrParam,
 		1.0, subtotal, discountAmount, taxAmount, totalAmount,
 		0, entity.InvoiceStatusDraft, createdBy, now, now,
