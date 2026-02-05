@@ -617,6 +617,12 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 		return
 	}
 
+	// Check lock date
+	if errMsg := h.checkLockDate(tenantID, now); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	// Get return items for inventory update
 	items := h.loadSalesReturnItems(returnID)
 	h.log.Info("Processing refund inventory update", "return_id", returnID, "items_count", len(items))
@@ -703,12 +709,12 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 	// Get return details for payment entry
 	var returnNumber, customerName string
 	var customerID sql.NullString
-	var totalAmount float64
+	var totalAmount, returnTaxAmount float64
 	h.db.QueryRow(`
-		SELECT return_number, customer_id, customer_name, total_amount
+		SELECT return_number, customer_id, customer_name, total_amount, COALESCE(tax_amount, 0)
 		FROM sales_returns WHERE id = $1 AND tenant_id = $2`,
 		returnID, tenantID,
-	).Scan(&returnNumber, &customerID, &customerName, &totalAmount)
+	).Scan(&returnNumber, &customerID, &customerName, &totalAmount, &returnTaxAmount)
 
 	// Update return status
 	result, err := h.db.Exec(`
@@ -794,7 +800,49 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 			}
 		}
 	}
-	// Note: For "credit_note" refund method, the credit stays on AR until applied to future invoices
+	// For "credit_note" refund method, create an actual credit note document
+	if input.RefundMethod == "credit_note" {
+		// Find the original sales invoice linked to this return
+		var salesInvID sql.NullString
+		h.db.QueryRow("SELECT sales_invoice_id FROM sales_returns WHERE id = $1 AND tenant_id = $2", returnID, tenantID).Scan(&salesInvID)
+
+		if salesInvID.Valid {
+			// Create a credit note for the linked invoice
+			cnDate := now
+			cnNumber := "CN-" + cnDate.Format("20060102") + "-" + uuid.New().String()[:6]
+			creditNoteID := uuid.New()
+			reason := fmt.Sprintf("Sales Return %s - %s", returnNumber, customerName)
+
+			// Get original invoice details
+			var orgCustomerID uuid.UUID
+			var orgID *uuid.UUID
+			var currencyID *uuid.UUID
+			h.db.QueryRow(`
+				SELECT customer_id, organization_id, currency_id
+				FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+				salesInvID.String, tenantID,
+			).Scan(&orgCustomerID, &orgID, &currencyID)
+
+			_, err = h.db.Exec(`
+				INSERT INTO sales_invoices (
+					id, tenant_id, organization_id, invoice_number, customer_id,
+					invoice_date, due_date, invoice_type, original_invoice_id, reason,
+					currency_id, exchange_rate, subtotal, discount_amount,
+					tax_amount, total_amount, amount_paid, status,
+					reference, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'credit_note', $8, $9, $10, 1.0, $11, 0, $12, $13, 0, 'draft', $14, $15, $16)`,
+				creditNoteID, tenantID, orgID, cnNumber, orgCustomerID,
+				cnDate, cnDate, salesInvID.String, reason,
+				currencyID, totalAmount-returnTaxAmount, returnTaxAmount, totalAmount,
+				returnNumber, now, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create credit note for sales return", "error", err, "return_id", returnID)
+			} else {
+				h.log.Info("Credit note created for sales return", "credit_note_id", creditNoteID, "return_id", returnID)
+			}
+		}
+	}
 
 	h.log.Info("Sales return processed with inventory update", "return_id", returnID, "items_count", len(items))
 
