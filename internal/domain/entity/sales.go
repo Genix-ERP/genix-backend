@@ -271,6 +271,7 @@ type SalesOrderListFilter struct {
 // CreateSalesInvoiceInput represents input for creating a sales invoice
 type CreateSalesInvoiceInput struct {
 	CustomerID      string                        `json:"customer_id" binding:"required"`
+	OrganizationID  string                        `json:"organization_id,omitempty"`
 	SalesOrderID    string                        `json:"sales_order_id,omitempty"`
 	InvoiceDate     string                        `json:"invoice_date" binding:"required"`
 	DueDate         string                        `json:"due_date" binding:"required"`
