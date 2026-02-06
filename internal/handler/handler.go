@@ -881,6 +881,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		bankAccounts.GET("/:id/transactions", h.ListBankTransactions)
 		bankAccounts.POST("/:id/transactions", middleware.RequirePermission("finance", "bank_account", "update"), h.CreateBankTransaction)
 		bankAccounts.POST("/:id/transactions/:transactionId/reconcile", middleware.RequirePermission("finance", "bank_account", "update"), h.ReconcileBankTransaction)
+
+		// Bank Reconciliation
+		bankAccounts.GET("/:id/reconciliations", h.ListBankReconciliations)
+		bankAccounts.POST("/:id/reconciliations", middleware.RequirePermission("finance", "bank_account", "update"), h.CreateBankReconciliation)
+		bankAccounts.GET("/:id/reconciliations/:reconciliationId", h.GetBankReconciliation)
+		bankAccounts.PUT("/:id/reconciliations/:reconciliationId", middleware.RequirePermission("finance", "bank_account", "update"), h.UpdateBankReconciliation)
+		bankAccounts.POST("/:id/reconciliations/:reconciliationId/complete", middleware.RequirePermission("finance", "bank_account", "update"), h.CompleteBankReconciliation)
+		bankAccounts.DELETE("/:id/reconciliations/:reconciliationId", middleware.RequirePermission("finance", "bank_account", "delete"), h.DeleteBankReconciliation)
+
+		// Bank Statement Import
+		bankAccounts.POST("/:id/import", middleware.RequirePermission("finance", "bank_account", "update"), h.ImportBankStatement)
 	}
 
 	// Cash Transactions (Kassa)
@@ -933,6 +944,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		budgetLines.POST("", h.CreateBudgetLine)
 		budgetLines.PUT("/:id", h.UpdateBudgetLine)
 		budgetLines.DELETE("/:id", h.DeleteBudgetLine)
+	}
+
+	// Recurring Journal Entries
+	recurringJournals := rg.Group("/recurring-journals")
+	recurringJournals.Use(middleware.RequirePermission("finance", "journal_entry", "read"))
+	{
+		recurringJournals.GET("", h.ListRecurringJournalTemplates)
+		recurringJournals.POST("", middleware.RequirePermission("finance", "journal_entry", "create"), h.CreateRecurringJournalTemplate)
+		recurringJournals.GET("/pending", h.GetPendingRecurringEntries)
+		recurringJournals.GET("/:id", h.GetRecurringJournalTemplate)
+		recurringJournals.PUT("/:id", middleware.RequirePermission("finance", "journal_entry", "update"), h.UpdateRecurringJournalTemplate)
+		recurringJournals.DELETE("/:id", middleware.RequirePermission("finance", "journal_entry", "delete"), h.DeleteRecurringJournalTemplate)
+		recurringJournals.POST("/:id/generate", middleware.RequirePermission("finance", "journal_entry", "create"), h.GenerateRecurringJournalEntry)
 	}
 
 	// HR - Employees
