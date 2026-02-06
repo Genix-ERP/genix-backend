@@ -15,6 +15,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// nullIfEmpty returns nil for empty strings, otherwise returns the string pointer
+// This is used for optional nullable database columns
+func nullIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 // =====================================================
 // ACCOUNT TYPE HANDLERS
 // =====================================================
@@ -3610,6 +3619,652 @@ func (h *Handler) ReconcileBankTransaction(c *gin.Context) {
 }
 
 // =====================================================
+// BANK RECONCILIATION WORKFLOW
+// =====================================================
+
+// ListBankReconciliations returns all reconciliation sessions for a bank account
+func (h *Handler) ListBankReconciliations(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	bankAccountID := c.Param("id")
+	if bankAccountID == "" {
+		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	query := `
+		SELECT br.id, br.bank_account_id, br.statement_date, br.statement_ending_balance,
+		       br.book_balance, br.reconciled_balance, br.difference, br.status,
+		       br.completed_at, br.completed_by, br.notes, br.created_at,
+		       COALESCE(u.first_name || ' ' || u.last_name, '') as completed_by_name
+		FROM bank_reconciliations br
+		LEFT JOIN users u ON br.completed_by = u.id
+		WHERE br.tenant_id = $1 AND br.bank_account_id = $2
+		ORDER BY br.statement_date DESC, br.created_at DESC
+	`
+
+	rows, err := h.db.Query(query, tenantID, bankAccountID)
+	if err != nil {
+		h.log.Error("Failed to list bank reconciliations", "error", err)
+		response.InternalError(c, "Failed to list bank reconciliations")
+		return
+	}
+	defer rows.Close()
+
+	type Reconciliation struct {
+		ID                    uuid.UUID  `json:"id"`
+		BankAccountID         uuid.UUID  `json:"bank_account_id"`
+		StatementDate         string     `json:"statement_date"`
+		StatementEndingBalance float64   `json:"statement_ending_balance"`
+		BookBalance           float64    `json:"book_balance"`
+		ReconciledBalance     *float64   `json:"reconciled_balance"`
+		Difference            *float64   `json:"difference"`
+		Status                string     `json:"status"`
+		CompletedAt           *time.Time `json:"completed_at"`
+		CompletedBy           *uuid.UUID `json:"completed_by"`
+		CompletedByName       string     `json:"completed_by_name"`
+		Notes                 *string    `json:"notes"`
+		CreatedAt             time.Time  `json:"created_at"`
+	}
+
+	reconciliations := make([]Reconciliation, 0)
+	for rows.Next() {
+		var r Reconciliation
+		var statementDate time.Time
+		err := rows.Scan(&r.ID, &r.BankAccountID, &statementDate, &r.StatementEndingBalance,
+			&r.BookBalance, &r.ReconciledBalance, &r.Difference, &r.Status,
+			&r.CompletedAt, &r.CompletedBy, &r.Notes, &r.CreatedAt, &r.CompletedByName)
+		if err != nil {
+			continue
+		}
+		r.StatementDate = statementDate.Format("2006-01-02")
+		reconciliations = append(reconciliations, r)
+	}
+
+	response.Success(c, reconciliations)
+}
+
+// CreateBankReconciliation starts a new reconciliation session
+func (h *Handler) CreateBankReconciliation(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	bankAccountID := c.Param("id")
+	if bankAccountID == "" {
+		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	var input struct {
+		StatementDate          string  `json:"statement_date" binding:"required"`
+		StatementEndingBalance float64 `json:"statement_ending_balance" binding:"required"`
+		Notes                  string  `json:"notes"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Check for existing draft reconciliation
+	var existingID uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT id FROM bank_reconciliations
+		WHERE tenant_id = $1 AND bank_account_id = $2 AND status = 'draft'
+		LIMIT 1
+	`, tenantID, bankAccountID).Scan(&existingID)
+
+	if err == nil {
+		response.BadRequest(c, "A draft reconciliation already exists for this bank account. Please complete or delete it first.")
+		return
+	}
+
+	// Calculate book balance (sum of all journal entry lines for the linked account)
+	var bookBalance float64
+	err = h.db.QueryRow(`
+		SELECT COALESCE(SUM(jel.debit_amount) - SUM(jel.credit_amount), 0)
+		FROM journal_entry_lines jel
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+		JOIN bank_accounts ba ON jel.account_id = ba.account_id
+		WHERE ba.id = $1 AND ba.tenant_id = $2
+		  AND je.status = 'posted' AND je.deleted_at IS NULL
+		  AND je.entry_date <= $3
+	`, bankAccountID, tenantID, input.StatementDate).Scan(&bookBalance)
+
+	if err != nil {
+		// Fallback to bank account balance
+		h.db.QueryRow(`SELECT COALESCE(balance, 0) FROM bank_accounts WHERE id = $1 AND tenant_id = $2`,
+			bankAccountID, tenantID).Scan(&bookBalance)
+	}
+
+	// Create reconciliation
+	var reconciliationID uuid.UUID
+	err = h.db.QueryRow(`
+		INSERT INTO bank_reconciliations (tenant_id, bank_account_id, statement_date, statement_ending_balance, book_balance, status, notes)
+		VALUES ($1, $2, $3, $4, $5, 'draft', $6)
+		RETURNING id
+	`, tenantID, bankAccountID, input.StatementDate, input.StatementEndingBalance, bookBalance, input.Notes).Scan(&reconciliationID)
+
+	if err != nil {
+		h.log.Error("Failed to create bank reconciliation", "error", err)
+		response.InternalError(c, "Failed to create bank reconciliation")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"id":                       reconciliationID,
+		"bank_account_id":          bankAccountID,
+		"statement_date":           input.StatementDate,
+		"statement_ending_balance": input.StatementEndingBalance,
+		"book_balance":             bookBalance,
+		"status":                   "draft",
+	})
+}
+
+// GetBankReconciliation returns a specific reconciliation with its items
+func (h *Handler) GetBankReconciliation(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	reconciliationID := c.Param("reconciliationId")
+	if reconciliationID == "" {
+		response.BadRequest(c, "Reconciliation ID is required")
+		return
+	}
+
+	// Get reconciliation details
+	var r struct {
+		ID                     uuid.UUID  `json:"id"`
+		BankAccountID          uuid.UUID  `json:"bank_account_id"`
+		StatementDate          string     `json:"statement_date"`
+		StatementEndingBalance float64    `json:"statement_ending_balance"`
+		BookBalance            float64    `json:"book_balance"`
+		ReconciledBalance      *float64   `json:"reconciled_balance"`
+		Difference             *float64   `json:"difference"`
+		Status                 string     `json:"status"`
+		CompletedAt            *time.Time `json:"completed_at"`
+		Notes                  *string    `json:"notes"`
+		CreatedAt              time.Time  `json:"created_at"`
+	}
+
+	var statementDate time.Time
+	err := h.db.QueryRow(`
+		SELECT id, bank_account_id, statement_date, statement_ending_balance, book_balance,
+		       reconciled_balance, difference, status, completed_at, notes, created_at
+		FROM bank_reconciliations
+		WHERE id = $1 AND tenant_id = $2
+	`, reconciliationID, tenantID).Scan(&r.ID, &r.BankAccountID, &statementDate, &r.StatementEndingBalance,
+		&r.BookBalance, &r.ReconciledBalance, &r.Difference, &r.Status, &r.CompletedAt, &r.Notes, &r.CreatedAt)
+
+	if err != nil {
+		response.NotFound(c, "Reconciliation not found")
+		return
+	}
+	r.StatementDate = statementDate.Format("2006-01-02")
+
+	// Get unreconciled bank transactions
+	bankTxRows, err := h.db.Query(`
+		SELECT id, transaction_date, reference, description, amount, transaction_type,
+		       COALESCE(is_reconciled, false) as is_reconciled, status
+		FROM bank_transactions
+		WHERE bank_account_id = $1 AND tenant_id = $2
+		  AND transaction_date <= $3
+		  AND (is_reconciled = false OR is_reconciled IS NULL OR reconciliation_id = $4)
+		ORDER BY transaction_date, created_at
+	`, r.BankAccountID, tenantID, r.StatementDate, reconciliationID)
+
+	if err != nil {
+		h.log.Error("Failed to get bank transactions", "error", err)
+	}
+
+	type BankTransaction struct {
+		ID              uuid.UUID `json:"id"`
+		TransactionDate string    `json:"transaction_date"`
+		Reference       *string   `json:"reference"`
+		Description     *string   `json:"description"`
+		Amount          float64   `json:"amount"`
+		TransactionType string    `json:"transaction_type"`
+		IsReconciled    bool      `json:"is_reconciled"`
+		Status          string    `json:"status"`
+	}
+
+	bankTransactions := make([]BankTransaction, 0)
+	if bankTxRows != nil {
+		defer bankTxRows.Close()
+		for bankTxRows.Next() {
+			var tx BankTransaction
+			var txDate time.Time
+			bankTxRows.Scan(&tx.ID, &txDate, &tx.Reference, &tx.Description, &tx.Amount,
+				&tx.TransactionType, &tx.IsReconciled, &tx.Status)
+			tx.TransactionDate = txDate.Format("2006-01-02")
+			bankTransactions = append(bankTransactions, tx)
+		}
+	}
+
+	// Get unreconciled journal entries for the bank account
+	jeRows, err := h.db.Query(`
+		SELECT jel.id, je.entry_date, je.entry_number, je.description,
+		       jel.debit_amount, jel.credit_amount, jel.reconciled
+		FROM journal_entry_lines jel
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+		JOIN bank_accounts ba ON jel.account_id = ba.account_id
+		WHERE ba.id = $1 AND ba.tenant_id = $2
+		  AND je.status = 'posted' AND je.deleted_at IS NULL
+		  AND je.entry_date <= $3
+		  AND (jel.reconciled = false OR jel.reconciled IS NULL)
+		ORDER BY je.entry_date, je.entry_number
+	`, r.BankAccountID, tenantID, r.StatementDate)
+
+	if err != nil {
+		h.log.Error("Failed to get journal entries", "error", err)
+	}
+
+	type JournalEntryLine struct {
+		ID           uuid.UUID `json:"id"`
+		EntryDate    string    `json:"entry_date"`
+		EntryNumber  string    `json:"entry_number"`
+		Description  *string   `json:"description"`
+		DebitAmount  float64   `json:"debit_amount"`
+		CreditAmount float64   `json:"credit_amount"`
+		Amount       float64   `json:"amount"` // Net amount (debit - credit)
+		IsReconciled bool      `json:"is_reconciled"`
+	}
+
+	journalEntries := make([]JournalEntryLine, 0)
+	if jeRows != nil {
+		defer jeRows.Close()
+		for jeRows.Next() {
+			var je JournalEntryLine
+			var entryDate time.Time
+			jeRows.Scan(&je.ID, &entryDate, &je.EntryNumber, &je.Description,
+				&je.DebitAmount, &je.CreditAmount, &je.IsReconciled)
+			je.EntryDate = entryDate.Format("2006-01-02")
+			je.Amount = je.DebitAmount - je.CreditAmount
+			journalEntries = append(journalEntries, je)
+		}
+	}
+
+	// Calculate totals
+	var clearedBankTotal, clearedBookTotal float64
+	for _, tx := range bankTransactions {
+		if tx.IsReconciled || tx.Status == "reconciled" {
+			if tx.TransactionType == "credit" {
+				clearedBankTotal += tx.Amount
+			} else {
+				clearedBankTotal -= tx.Amount
+			}
+		}
+	}
+
+	response.Success(c, gin.H{
+		"reconciliation":    r,
+		"bank_transactions": bankTransactions,
+		"journal_entries":   journalEntries,
+		"summary": gin.H{
+			"statement_balance": r.StatementEndingBalance,
+			"book_balance":      r.BookBalance,
+			"cleared_bank":      clearedBankTotal,
+			"cleared_book":      clearedBookTotal,
+			"difference":        r.StatementEndingBalance - r.BookBalance,
+		},
+	})
+}
+
+// UpdateBankReconciliation updates reconciliation and marks items as cleared
+func (h *Handler) UpdateBankReconciliation(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	reconciliationID := c.Param("reconciliationId")
+	if reconciliationID == "" {
+		response.BadRequest(c, "Reconciliation ID is required")
+		return
+	}
+
+	var input struct {
+		ClearedBankTransactions []string `json:"cleared_bank_transactions"` // IDs of cleared bank transactions
+		ClearedJournalEntries   []string `json:"cleared_journal_entries"`   // IDs of cleared journal entry lines
+		Notes                   string   `json:"notes"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Check reconciliation exists and is draft
+	var status string
+	err := h.db.QueryRow(`SELECT status FROM bank_reconciliations WHERE id = $1 AND tenant_id = $2`,
+		reconciliationID, tenantID).Scan(&status)
+	if err != nil {
+		response.NotFound(c, "Reconciliation not found")
+		return
+	}
+	if status != "draft" {
+		response.BadRequest(c, "Cannot update a completed reconciliation")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+
+	// Reset all bank transactions for this reconciliation
+	_, err = tx.Exec(`
+		UPDATE bank_transactions
+		SET is_reconciled = false, reconciliation_id = NULL, reconciled_date = NULL, updated_at = $1
+		WHERE reconciliation_id = $2
+	`, now, reconciliationID)
+	if err != nil {
+		h.log.Error("Failed to reset bank transactions", "error", err)
+	}
+
+	// Mark selected bank transactions as cleared
+	for _, txID := range input.ClearedBankTransactions {
+		_, err = tx.Exec(`
+			UPDATE bank_transactions
+			SET is_reconciled = true, reconciliation_id = $1, reconciled_date = $2, status = 'reconciled', updated_at = $2
+			WHERE id = $3 AND tenant_id = $4
+		`, reconciliationID, now, txID, tenantID)
+		if err != nil {
+			h.log.Error("Failed to update bank transaction", "error", err, "txID", txID)
+		}
+	}
+
+	// Reset journal entry lines
+	_, err = tx.Exec(`
+		UPDATE journal_entry_lines jel
+		SET reconciled = false, reconciled_at = NULL
+		FROM bank_reconciliation_items bri
+		WHERE bri.journal_entry_line_id = jel.id AND bri.reconciliation_id = $1
+	`, reconciliationID)
+
+	// Mark selected journal entry lines as reconciled
+	for _, jelID := range input.ClearedJournalEntries {
+		_, err = tx.Exec(`
+			UPDATE journal_entry_lines
+			SET reconciled = true, reconciled_at = $1
+			WHERE id = $2
+		`, now, jelID)
+		if err != nil {
+			h.log.Error("Failed to update journal entry line", "error", err, "jelID", jelID)
+		}
+	}
+
+	// Calculate reconciled balance
+	var clearedBankTotal float64
+	err = tx.QueryRow(`
+		SELECT COALESCE(SUM(CASE WHEN transaction_type = 'credit' THEN amount ELSE -amount END), 0)
+		FROM bank_transactions
+		WHERE reconciliation_id = $1 AND is_reconciled = true
+	`, reconciliationID).Scan(&clearedBankTotal)
+
+	var clearedBookTotal float64
+	for _, jelID := range input.ClearedJournalEntries {
+		var debit, credit float64
+		tx.QueryRow(`SELECT COALESCE(debit_amount, 0), COALESCE(credit_amount, 0) FROM journal_entry_lines WHERE id = $1`, jelID).Scan(&debit, &credit)
+		clearedBookTotal += debit - credit
+	}
+
+	// Update reconciliation with calculated values
+	_, err = tx.Exec(`
+		UPDATE bank_reconciliations
+		SET reconciled_balance = $1, difference = statement_ending_balance - $1, notes = $2, updated_at = $3
+		WHERE id = $4
+	`, clearedBookTotal, input.Notes, now, reconciliationID)
+
+	if err != nil {
+		h.log.Error("Failed to update reconciliation", "error", err)
+		response.InternalError(c, "Failed to update reconciliation")
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to save changes")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"message":           "Reconciliation updated",
+		"cleared_bank":      len(input.ClearedBankTransactions),
+		"cleared_journal":   len(input.ClearedJournalEntries),
+		"reconciled_balance": clearedBookTotal,
+	})
+}
+
+// CompleteBankReconciliation finalizes the reconciliation
+func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	userID := c.GetString("user_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	reconciliationID := c.Param("reconciliationId")
+	if reconciliationID == "" {
+		response.BadRequest(c, "Reconciliation ID is required")
+		return
+	}
+
+	// Get reconciliation
+	var bankAccountID uuid.UUID
+	var statementDate time.Time
+	var statementBalance, bookBalance float64
+	var difference *float64
+	var status string
+
+	err := h.db.QueryRow(`
+		SELECT bank_account_id, statement_date, statement_ending_balance, book_balance, difference, status
+		FROM bank_reconciliations WHERE id = $1 AND tenant_id = $2
+	`, reconciliationID, tenantID).Scan(&bankAccountID, &statementDate, &statementBalance, &bookBalance, &difference, &status)
+
+	if err != nil {
+		response.NotFound(c, "Reconciliation not found")
+		return
+	}
+
+	if status != "draft" {
+		response.BadRequest(c, "Reconciliation is already completed")
+		return
+	}
+
+	// Check if reconciliation is balanced (difference should be 0 or within tolerance)
+	if difference != nil && *difference != 0 {
+		// Allow small tolerance (0.01)
+		if *difference > 0.01 || *difference < -0.01 {
+			response.BadRequest(c, fmt.Sprintf("Reconciliation has a difference of %.2f. Please resolve before completing.", *difference))
+			return
+		}
+	}
+
+	now := time.Now()
+
+	// Complete the reconciliation
+	_, err = h.db.Exec(`
+		UPDATE bank_reconciliations
+		SET status = 'completed', completed_at = $1, completed_by = $2, updated_at = $1
+		WHERE id = $3
+	`, now, userID, reconciliationID)
+
+	if err != nil {
+		h.log.Error("Failed to complete reconciliation", "error", err)
+		response.InternalError(c, "Failed to complete reconciliation")
+		return
+	}
+
+	// Update bank account last reconciled
+	h.db.Exec(`
+		UPDATE bank_accounts
+		SET last_reconciled = $1, last_reconciled_balance = $2, updated_at = $3
+		WHERE id = $4 AND tenant_id = $5
+	`, statementDate, statementBalance, now, bankAccountID, tenantID)
+
+	response.Success(c, gin.H{
+		"message":      "Reconciliation completed successfully",
+		"completed_at": now,
+	})
+}
+
+// DeleteBankReconciliation deletes a draft reconciliation
+func (h *Handler) DeleteBankReconciliation(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	reconciliationID := c.Param("reconciliationId")
+	if reconciliationID == "" {
+		response.BadRequest(c, "Reconciliation ID is required")
+		return
+	}
+
+	// Check if draft
+	var status string
+	err := h.db.QueryRow(`SELECT status FROM bank_reconciliations WHERE id = $1 AND tenant_id = $2`,
+		reconciliationID, tenantID).Scan(&status)
+	if err != nil {
+		response.NotFound(c, "Reconciliation not found")
+		return
+	}
+	if status != "draft" {
+		response.BadRequest(c, "Cannot delete a completed reconciliation")
+		return
+	}
+
+	// Reset related bank transactions
+	h.db.Exec(`
+		UPDATE bank_transactions
+		SET is_reconciled = false, reconciliation_id = NULL, reconciled_date = NULL, status = 'unmatched'
+		WHERE reconciliation_id = $1
+	`, reconciliationID)
+
+	// Delete reconciliation items
+	h.db.Exec(`DELETE FROM bank_reconciliation_items WHERE reconciliation_id = $1`, reconciliationID)
+
+	// Delete reconciliation
+	_, err = h.db.Exec(`DELETE FROM bank_reconciliations WHERE id = $1 AND tenant_id = $2`, reconciliationID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete reconciliation", "error", err)
+		response.InternalError(c, "Failed to delete reconciliation")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Reconciliation deleted"})
+}
+
+// ImportBankStatement imports bank transactions from CSV
+func (h *Handler) ImportBankStatement(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "tenant_id is required")
+		return
+	}
+
+	bankAccountID := c.Param("id")
+	if bankAccountID == "" {
+		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	var input struct {
+		Transactions []struct {
+			TransactionDate string  `json:"transaction_date" binding:"required"`
+			Reference       string  `json:"reference"`
+			Description     string  `json:"description"`
+			Amount          float64 `json:"amount" binding:"required"`
+			TransactionType string  `json:"transaction_type"` // credit or debit
+		} `json:"transactions" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	if len(input.Transactions) == 0 {
+		response.BadRequest(c, "No transactions provided")
+		return
+	}
+
+	importBatchID := uuid.New().String()
+	now := time.Now()
+	imported := 0
+	duplicates := 0
+
+	for _, t := range input.Transactions {
+		// Determine transaction type if not provided
+		txType := t.TransactionType
+		if txType == "" {
+			if t.Amount >= 0 {
+				txType = "credit"
+			} else {
+				txType = "debit"
+			}
+		}
+
+		amount := t.Amount
+		if amount < 0 {
+			amount = -amount
+		}
+
+		// Check for duplicate (same date, amount, reference)
+		var exists bool
+		h.db.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM bank_transactions
+				WHERE bank_account_id = $1 AND transaction_date = $2 AND amount = $3
+				  AND COALESCE(reference, '') = $4
+			)
+		`, bankAccountID, t.TransactionDate, amount, t.Reference).Scan(&exists)
+
+		if exists {
+			duplicates++
+			continue
+		}
+
+		// Insert transaction
+		_, err := h.db.Exec(`
+			INSERT INTO bank_transactions (tenant_id, bank_account_id, transaction_date, reference, description,
+			                               amount, transaction_type, status, import_batch_id, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 'unmatched', $8, $9, $9)
+		`, tenantID, bankAccountID, t.TransactionDate, t.Reference, t.Description, amount, txType, importBatchID, now)
+
+		if err != nil {
+			h.log.Error("Failed to import transaction", "error", err)
+			continue
+		}
+		imported++
+	}
+
+	response.Success(c, gin.H{
+		"message":         fmt.Sprintf("Imported %d transactions", imported),
+		"imported":        imported,
+		"duplicates":      duplicates,
+		"import_batch_id": importBatchID,
+	})
+}
+
+// =====================================================
 // CASH TRANSACTIONS (Kassa)
 // =====================================================
 
@@ -5400,4 +6055,730 @@ func (h *Handler) DeleteBudgetLine(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"message": "Budget line deleted successfully"})
+}
+
+// =====================================================
+// RECURRING JOURNAL ENTRIES
+// =====================================================
+
+// ListRecurringJournalTemplates returns all recurring journal templates
+func (h *Handler) ListRecurringJournalTemplates(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	query := `
+		SELECT rjt.id, rjt.name, rjt.description, rjt.frequency, rjt.interval_count,
+		       rjt.start_date, rjt.end_date, rjt.next_run_date, rjt.last_run_date,
+		       rjt.total_debit, rjt.total_credit, rjt.is_active, rjt.auto_post,
+		       rjt.created_at, j.name as journal_name,
+		       (SELECT COUNT(*) FROM recurring_journal_log WHERE template_id = rjt.id) as generated_count
+		FROM recurring_journal_templates rjt
+		JOIN journals j ON rjt.journal_id = j.id
+		WHERE rjt.tenant_id = $1 AND rjt.deleted_at IS NULL
+		ORDER BY rjt.name
+	`
+
+	rows, err := h.db.Query(query, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list recurring journal templates", "error", err)
+		response.InternalError(c, "Failed to list templates")
+		return
+	}
+	defer rows.Close()
+
+	type Template struct {
+		ID             uuid.UUID `json:"id"`
+		Name           string    `json:"name"`
+		Description    *string   `json:"description"`
+		Frequency      string    `json:"frequency"`
+		IntervalCount  int       `json:"interval_count"`
+		StartDate      string    `json:"start_date"`
+		EndDate        *string   `json:"end_date"`
+		NextRunDate    string    `json:"next_run_date"`
+		LastRunDate    *string   `json:"last_run_date"`
+		TotalDebit     float64   `json:"total_debit"`
+		TotalCredit    float64   `json:"total_credit"`
+		IsActive       bool      `json:"is_active"`
+		AutoPost       bool      `json:"auto_post"`
+		CreatedAt      time.Time `json:"created_at"`
+		JournalName    string    `json:"journal_name"`
+		GeneratedCount int       `json:"generated_count"`
+	}
+
+	templates := make([]Template, 0)
+	for rows.Next() {
+		var t Template
+		var startDate, nextRunDate time.Time
+		var endDate, lastRunDate *time.Time
+
+		err := rows.Scan(&t.ID, &t.Name, &t.Description, &t.Frequency, &t.IntervalCount,
+			&startDate, &endDate, &nextRunDate, &lastRunDate,
+			&t.TotalDebit, &t.TotalCredit, &t.IsActive, &t.AutoPost,
+			&t.CreatedAt, &t.JournalName, &t.GeneratedCount)
+		if err != nil {
+			continue
+		}
+
+		t.StartDate = startDate.Format("2006-01-02")
+		t.NextRunDate = nextRunDate.Format("2006-01-02")
+		if endDate != nil {
+			s := endDate.Format("2006-01-02")
+			t.EndDate = &s
+		}
+		if lastRunDate != nil {
+			s := lastRunDate.Format("2006-01-02")
+			t.LastRunDate = &s
+		}
+
+		templates = append(templates, t)
+	}
+
+	response.Success(c, templates)
+}
+
+// GetRecurringJournalTemplate returns a single template with lines
+func (h *Handler) GetRecurringJournalTemplate(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	templateID := c.Param("id")
+	if templateID == "" {
+		response.BadRequest(c, "Template ID is required")
+		return
+	}
+
+	// Get template
+	var t struct {
+		ID            uuid.UUID `json:"id"`
+		Name          string    `json:"name"`
+		Description   *string   `json:"description"`
+		Reference     *string   `json:"reference"`
+		JournalID     uuid.UUID `json:"journal_id"`
+		JournalName   string    `json:"journal_name"`
+		Frequency     string    `json:"frequency"`
+		IntervalCount int       `json:"interval_count"`
+		DayOfMonth    *int      `json:"day_of_month"`
+		DayOfWeek     *int      `json:"day_of_week"`
+		MonthOfYear   *int      `json:"month_of_year"`
+		StartDate     string    `json:"start_date"`
+		EndDate       *string   `json:"end_date"`
+		NextRunDate   string    `json:"next_run_date"`
+		LastRunDate   *string   `json:"last_run_date"`
+		TotalDebit    float64   `json:"total_debit"`
+		TotalCredit   float64   `json:"total_credit"`
+		IsActive      bool      `json:"is_active"`
+		AutoPost      bool      `json:"auto_post"`
+		CreatedAt     time.Time `json:"created_at"`
+	}
+
+	var startDate, nextRunDate time.Time
+	var endDate, lastRunDate *time.Time
+
+	err := h.db.QueryRow(`
+		SELECT rjt.id, rjt.name, rjt.description, rjt.reference, rjt.journal_id, j.name,
+		       rjt.frequency, rjt.interval_count, rjt.day_of_month, rjt.day_of_week, rjt.month_of_year,
+		       rjt.start_date, rjt.end_date, rjt.next_run_date, rjt.last_run_date,
+		       rjt.total_debit, rjt.total_credit, rjt.is_active, rjt.auto_post, rjt.created_at
+		FROM recurring_journal_templates rjt
+		JOIN journals j ON rjt.journal_id = j.id
+		WHERE rjt.id = $1 AND rjt.tenant_id = $2 AND rjt.deleted_at IS NULL
+	`, templateID, tenantID).Scan(&t.ID, &t.Name, &t.Description, &t.Reference, &t.JournalID, &t.JournalName,
+		&t.Frequency, &t.IntervalCount, &t.DayOfMonth, &t.DayOfWeek, &t.MonthOfYear,
+		&startDate, &endDate, &nextRunDate, &lastRunDate,
+		&t.TotalDebit, &t.TotalCredit, &t.IsActive, &t.AutoPost, &t.CreatedAt)
+
+	if err != nil {
+		response.NotFound(c, "Template not found")
+		return
+	}
+
+	t.StartDate = startDate.Format("2006-01-02")
+	t.NextRunDate = nextRunDate.Format("2006-01-02")
+	if endDate != nil {
+		s := endDate.Format("2006-01-02")
+		t.EndDate = &s
+	}
+	if lastRunDate != nil {
+		s := lastRunDate.Format("2006-01-02")
+		t.LastRunDate = &s
+	}
+
+	// Get lines
+	lineRows, err := h.db.Query(`
+		SELECT rjtl.id, rjtl.line_number, rjtl.account_id, a.code, a.name,
+		       rjtl.description, rjtl.debit_amount, rjtl.credit_amount, rjtl.contact_id
+		FROM recurring_journal_template_lines rjtl
+		JOIN accounts a ON rjtl.account_id = a.id
+		WHERE rjtl.template_id = $1
+		ORDER BY rjtl.line_number
+	`, templateID)
+
+	type Line struct {
+		ID           uuid.UUID  `json:"id"`
+		LineNumber   int        `json:"line_number"`
+		AccountID    uuid.UUID  `json:"account_id"`
+		AccountCode  string     `json:"account_code"`
+		AccountName  string     `json:"account_name"`
+		Description  *string    `json:"description"`
+		DebitAmount  float64    `json:"debit_amount"`
+		CreditAmount float64    `json:"credit_amount"`
+		ContactID    *uuid.UUID `json:"contact_id"`
+	}
+
+	lines := make([]Line, 0)
+	if err == nil {
+		defer lineRows.Close()
+		for lineRows.Next() {
+			var l Line
+			lineRows.Scan(&l.ID, &l.LineNumber, &l.AccountID, &l.AccountCode, &l.AccountName,
+				&l.Description, &l.DebitAmount, &l.CreditAmount, &l.ContactID)
+			lines = append(lines, l)
+		}
+	}
+
+	// Get generation log
+	logRows, err := h.db.Query(`
+		SELECT rjl.id, rjl.journal_entry_id, je.entry_number, rjl.generated_for_date, rjl.generated_at
+		FROM recurring_journal_log rjl
+		JOIN journal_entries je ON rjl.journal_entry_id = je.id
+		WHERE rjl.template_id = $1
+		ORDER BY rjl.generated_for_date DESC
+		LIMIT 20
+	`, templateID)
+
+	type LogEntry struct {
+		ID               uuid.UUID `json:"id"`
+		JournalEntryID   uuid.UUID `json:"journal_entry_id"`
+		EntryNumber      string    `json:"entry_number"`
+		GeneratedForDate string    `json:"generated_for_date"`
+		GeneratedAt      time.Time `json:"generated_at"`
+	}
+
+	logs := make([]LogEntry, 0)
+	if err == nil {
+		defer logRows.Close()
+		for logRows.Next() {
+			var l LogEntry
+			var genForDate time.Time
+			logRows.Scan(&l.ID, &l.JournalEntryID, &l.EntryNumber, &genForDate, &l.GeneratedAt)
+			l.GeneratedForDate = genForDate.Format("2006-01-02")
+			logs = append(logs, l)
+		}
+	}
+
+	response.Success(c, gin.H{
+		"template": t,
+		"lines":    lines,
+		"log":      logs,
+	})
+}
+
+// CreateRecurringJournalTemplate creates a new recurring template
+func (h *Handler) CreateRecurringJournalTemplate(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID := c.GetString("user_id")
+	orgID := c.GetString("organization_id")
+
+	var input struct {
+		Name          string `json:"name" binding:"required"`
+		Description   string `json:"description"`
+		Reference     string `json:"reference"`
+		JournalID     string `json:"journal_id" binding:"required"`
+		Frequency     string `json:"frequency" binding:"required"`
+		IntervalCount int    `json:"interval_count"`
+		DayOfMonth    *int   `json:"day_of_month"`
+		DayOfWeek     *int   `json:"day_of_week"`
+		MonthOfYear   *int   `json:"month_of_year"`
+		StartDate     string `json:"start_date" binding:"required"`
+		EndDate       string `json:"end_date"`
+		AutoPost      bool   `json:"auto_post"`
+		Lines         []struct {
+			AccountID    string  `json:"account_id" binding:"required"`
+			Description  string  `json:"description"`
+			DebitAmount  float64 `json:"debit_amount"`
+			CreditAmount float64 `json:"credit_amount"`
+			ContactID    string  `json:"contact_id"`
+		} `json:"lines" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	validFrequencies := map[string]bool{"daily": true, "weekly": true, "monthly": true, "quarterly": true, "yearly": true}
+	if !validFrequencies[input.Frequency] {
+		response.BadRequest(c, "Invalid frequency. Must be: daily, weekly, monthly, quarterly, yearly")
+		return
+	}
+
+	if len(input.Lines) == 0 {
+		response.BadRequest(c, "At least one line is required")
+		return
+	}
+
+	var totalDebit, totalCredit float64
+	for _, line := range input.Lines {
+		totalDebit += line.DebitAmount
+		totalCredit += line.CreditAmount
+	}
+	if math.Abs(totalDebit-totalCredit) > 0.01 {
+		response.BadRequest(c, "Debits and credits must be equal")
+		return
+	}
+
+	if input.IntervalCount <= 0 {
+		input.IntervalCount = 1
+	}
+
+	startDate, err := time.Parse("2006-01-02", input.StartDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid start date format")
+		return
+	}
+	nextRunDate := startDate
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	var templateID uuid.UUID
+	err = tx.QueryRow(`
+		INSERT INTO recurring_journal_templates (
+			tenant_id, organization_id, journal_id, name, description, reference,
+			frequency, interval_count, day_of_month, day_of_week, month_of_year,
+			start_date, end_date, next_run_date, total_debit, total_credit,
+			is_active, auto_post, created_by
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		RETURNING id
+	`, tenantID, nullIfEmpty(orgID), input.JournalID, input.Name, nullIfEmpty(input.Description), nullIfEmpty(input.Reference),
+		input.Frequency, input.IntervalCount, input.DayOfMonth, input.DayOfWeek, input.MonthOfYear,
+		input.StartDate, nullIfEmpty(input.EndDate), nextRunDate, totalDebit, totalCredit,
+		true, input.AutoPost, nullIfEmpty(userID)).Scan(&templateID)
+
+	if err != nil {
+		h.log.Error("Failed to create recurring template", "error", err)
+		response.InternalError(c, "Failed to create template")
+		return
+	}
+
+	for i, line := range input.Lines {
+		_, err = tx.Exec(`
+			INSERT INTO recurring_journal_template_lines (
+				template_id, line_number, account_id, description, debit_amount, credit_amount, contact_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`, templateID, i+1, line.AccountID, nullIfEmpty(line.Description), line.DebitAmount, line.CreditAmount, nullIfEmpty(line.ContactID))
+
+		if err != nil {
+			h.log.Error("Failed to create template line", "error", err)
+			response.InternalError(c, "Failed to create template line")
+			return
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to save template")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"id":      templateID,
+		"message": "Recurring template created successfully",
+	})
+}
+
+// UpdateRecurringJournalTemplate updates a template
+func (h *Handler) UpdateRecurringJournalTemplate(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	templateID := c.Param("id")
+	if templateID == "" {
+		response.BadRequest(c, "Template ID is required")
+		return
+	}
+
+	var input struct {
+		Name          string `json:"name"`
+		Description   string `json:"description"`
+		Frequency     string `json:"frequency"`
+		IntervalCount int    `json:"interval_count"`
+		IsActive      *bool  `json:"is_active"`
+		AutoPost      *bool  `json:"auto_post"`
+		Lines         []struct {
+			AccountID    string  `json:"account_id" binding:"required"`
+			Description  string  `json:"description"`
+			DebitAmount  float64 `json:"debit_amount"`
+			CreditAmount float64 `json:"credit_amount"`
+			ContactID    string  `json:"contact_id"`
+		} `json:"lines"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	var exists bool
+	h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM recurring_journal_templates WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)`,
+		templateID, tenantID).Scan(&exists)
+	if !exists {
+		response.NotFound(c, "Template not found")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	updates := []string{"updated_at = NOW()"}
+	args := []interface{}{}
+	argCount := 1
+
+	if input.Name != "" {
+		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
+		args = append(args, input.Name)
+		argCount++
+	}
+	if input.Description != "" {
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, input.Description)
+		argCount++
+	}
+	if input.Frequency != "" {
+		updates = append(updates, fmt.Sprintf("frequency = $%d", argCount))
+		args = append(args, input.Frequency)
+		argCount++
+	}
+	if input.IntervalCount > 0 {
+		updates = append(updates, fmt.Sprintf("interval_count = $%d", argCount))
+		args = append(args, input.IntervalCount)
+		argCount++
+	}
+	if input.IsActive != nil {
+		updates = append(updates, fmt.Sprintf("is_active = $%d", argCount))
+		args = append(args, *input.IsActive)
+		argCount++
+	}
+	if input.AutoPost != nil {
+		updates = append(updates, fmt.Sprintf("auto_post = $%d", argCount))
+		args = append(args, *input.AutoPost)
+		argCount++
+	}
+
+	args = append(args, templateID, tenantID)
+	query := fmt.Sprintf("UPDATE recurring_journal_templates SET %s WHERE id = $%d AND tenant_id = $%d",
+		strings.Join(updates, ", "), argCount, argCount+1)
+
+	_, err = tx.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update template", "error", err)
+		response.InternalError(c, "Failed to update template")
+		return
+	}
+
+	if len(input.Lines) > 0 {
+		var totalDebit, totalCredit float64
+		for _, line := range input.Lines {
+			totalDebit += line.DebitAmount
+			totalCredit += line.CreditAmount
+		}
+		if math.Abs(totalDebit-totalCredit) > 0.01 {
+			response.BadRequest(c, "Debits and credits must be equal")
+			return
+		}
+
+		tx.Exec("DELETE FROM recurring_journal_template_lines WHERE template_id = $1", templateID)
+
+		for i, line := range input.Lines {
+			_, err = tx.Exec(`
+				INSERT INTO recurring_journal_template_lines (
+					template_id, line_number, account_id, description, debit_amount, credit_amount, contact_id
+				) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			`, templateID, i+1, line.AccountID, nullIfEmpty(line.Description), line.DebitAmount, line.CreditAmount, nullIfEmpty(line.ContactID))
+
+			if err != nil {
+				h.log.Error("Failed to update template line", "error", err)
+				response.InternalError(c, "Failed to update template line")
+				return
+			}
+		}
+
+		tx.Exec("UPDATE recurring_journal_templates SET total_debit = $1, total_credit = $2 WHERE id = $3",
+			totalDebit, totalCredit, templateID)
+	}
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to save changes")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Template updated successfully"})
+}
+
+// DeleteRecurringJournalTemplate soft-deletes a template
+func (h *Handler) DeleteRecurringJournalTemplate(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	templateID := c.Param("id")
+	if templateID == "" {
+		response.BadRequest(c, "Template ID is required")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		UPDATE recurring_journal_templates SET deleted_at = NOW(), is_active = false
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, templateID, tenantID)
+
+	if err != nil {
+		h.log.Error("Failed to delete template", "error", err)
+		response.InternalError(c, "Failed to delete template")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Template not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Template deleted successfully"})
+}
+
+// GenerateRecurringJournalEntry manually generates an entry from a template
+func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID := c.GetString("user_id")
+	templateID := c.Param("id")
+	if templateID == "" {
+		response.BadRequest(c, "Template ID is required")
+		return
+	}
+
+	var input struct {
+		EntryDate string `json:"entry_date"`
+	}
+	c.ShouldBindJSON(&input)
+
+	entryDate := time.Now()
+	if input.EntryDate != "" {
+		var err error
+		entryDate, err = time.Parse("2006-01-02", input.EntryDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid entry date format")
+			return
+		}
+	}
+
+	var template struct {
+		ID          uuid.UUID
+		OrgID       *uuid.UUID
+		JournalID   uuid.UUID
+		Name        string
+		Description *string
+		Reference   *string
+		TotalDebit  float64
+		TotalCredit float64
+		AutoPost    bool
+	}
+
+	err := h.db.QueryRow(`
+		SELECT id, organization_id, journal_id, name, description, reference, total_debit, total_credit, auto_post
+		FROM recurring_journal_templates
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND is_active = true
+	`, templateID, tenantID).Scan(&template.ID, &template.OrgID, &template.JournalID, &template.Name,
+		&template.Description, &template.Reference, &template.TotalDebit, &template.TotalCredit, &template.AutoPost)
+
+	if err != nil {
+		response.NotFound(c, "Template not found or inactive")
+		return
+	}
+
+	var alreadyGenerated bool
+	h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM recurring_journal_log WHERE template_id = $1 AND generated_for_date = $2)`,
+		templateID, entryDate.Format("2006-01-02")).Scan(&alreadyGenerated)
+	if alreadyGenerated {
+		response.BadRequest(c, "Entry already generated for this date")
+		return
+	}
+
+	lineRows, err := h.db.Query(`
+		SELECT account_id, description, debit_amount, credit_amount, contact_id
+		FROM recurring_journal_template_lines
+		WHERE template_id = $1
+		ORDER BY line_number
+	`, templateID)
+	if err != nil {
+		response.InternalError(c, "Failed to get template lines")
+		return
+	}
+	defer lineRows.Close()
+
+	type Line struct {
+		AccountID    uuid.UUID
+		Description  *string
+		DebitAmount  float64
+		CreditAmount float64
+		ContactID    *uuid.UUID
+	}
+	lines := make([]Line, 0)
+	for lineRows.Next() {
+		var l Line
+		lineRows.Scan(&l.AccountID, &l.Description, &l.DebitAmount, &l.CreditAmount, &l.ContactID)
+		lines = append(lines, l)
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	var entryNumber string
+	var count int
+	tx.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND entry_date = $2`, tenantID, entryDate.Format("2006-01-02")).Scan(&count)
+	entryNumber = fmt.Sprintf("JE-%s-%04d", entryDate.Format("20060102"), count+1)
+
+	status := "draft"
+	if template.AutoPost {
+		status = "posted"
+	}
+
+	description := template.Name
+	if template.Description != nil {
+		description = *template.Description
+	}
+
+	var journalEntryID uuid.UUID
+	err = tx.QueryRow(`
+		INSERT INTO journal_entries (
+			tenant_id, organization_id, journal_id, entry_number, entry_date,
+			description, reference, status, total_debit, total_credit, created_by
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		RETURNING id
+	`, tenantID, template.OrgID, template.JournalID, entryNumber, entryDate.Format("2006-01-02"),
+		description, template.Reference, status, template.TotalDebit, template.TotalCredit, nullIfEmpty(userID)).Scan(&journalEntryID)
+
+	if err != nil {
+		h.log.Error("Failed to create journal entry", "error", err)
+		response.InternalError(c, "Failed to create journal entry")
+		return
+	}
+
+	for i, line := range lines {
+		_, err = tx.Exec(`
+			INSERT INTO journal_entry_lines (
+				journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, contact_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`, journalEntryID, i+1, line.AccountID, line.Description, line.DebitAmount, line.CreditAmount, line.ContactID)
+
+		if err != nil {
+			h.log.Error("Failed to create journal entry line", "error", err)
+			response.InternalError(c, "Failed to create journal entry line")
+			return
+		}
+	}
+
+	tx.Exec(`
+		INSERT INTO recurring_journal_log (template_id, journal_entry_id, generated_for_date)
+		VALUES ($1, $2, $3)
+	`, templateID, journalEntryID, entryDate.Format("2006-01-02"))
+
+	tx.Exec(`UPDATE recurring_journal_templates SET last_run_date = $1, updated_at = NOW() WHERE id = $2`,
+		entryDate.Format("2006-01-02"), templateID)
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to save entry")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"message":          "Journal entry generated successfully",
+		"journal_entry_id": journalEntryID,
+		"entry_number":     entryNumber,
+		"status":           status,
+	})
+}
+
+// GetPendingRecurringEntries returns templates that are due for generation
+func (h *Handler) GetPendingRecurringEntries(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	today := time.Now().Format("2006-01-02")
+
+	query := `
+		SELECT rjt.id, rjt.name, rjt.frequency, rjt.next_run_date, rjt.total_debit, j.name as journal_name
+		FROM recurring_journal_templates rjt
+		JOIN journals j ON rjt.journal_id = j.id
+		WHERE rjt.tenant_id = $1 AND rjt.deleted_at IS NULL AND rjt.is_active = true
+		  AND rjt.next_run_date <= $2
+		  AND (rjt.end_date IS NULL OR rjt.end_date >= $2)
+		ORDER BY rjt.next_run_date
+	`
+
+	rows, err := h.db.Query(query, tenantID, today)
+	if err != nil {
+		h.log.Error("Failed to get pending entries", "error", err)
+		response.InternalError(c, "Failed to get pending entries")
+		return
+	}
+	defer rows.Close()
+
+	type PendingEntry struct {
+		ID          uuid.UUID `json:"id"`
+		Name        string    `json:"name"`
+		Frequency   string    `json:"frequency"`
+		NextRunDate string    `json:"next_run_date"`
+		TotalDebit  float64   `json:"total_debit"`
+		JournalName string    `json:"journal_name"`
+	}
+
+	pending := make([]PendingEntry, 0)
+	for rows.Next() {
+		var p PendingEntry
+		var nextRunDate time.Time
+		rows.Scan(&p.ID, &p.Name, &p.Frequency, &nextRunDate, &p.TotalDebit, &p.JournalName)
+		p.NextRunDate = nextRunDate.Format("2006-01-02")
+		pending = append(pending, p)
+	}
+
+	response.Success(c, gin.H{
+		"pending": pending,
+		"count":   len(pending),
+	})
 }

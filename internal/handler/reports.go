@@ -523,7 +523,7 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		SELECT si.id, si.invoice_number, si.invoice_date, si.due_date, si.total_amount,
 			   si.total_amount - si.amount_paid as amount_due,
 			   c.id as contact_id, c.name as contact_name,
-			   EXTRACT(DAY FROM ($2::date - si.due_date)) as days_overdue
+			   ($2::date - si.due_date)::int as days_overdue
 		FROM sales_invoices si
 		JOIN contacts c ON si.customer_id = c.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
@@ -645,7 +645,7 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		SELECT pi.id, pi.invoice_number, pi.invoice_date, pi.due_date, pi.total_amount,
 			   pi.total_amount - pi.amount_paid as amount_due,
 			   c.id as contact_id, c.name as contact_name,
-			   EXTRACT(DAY FROM ($2::date - pi.due_date)) as days_overdue
+			   ($2::date - pi.due_date)::int as days_overdue
 		FROM purchase_invoices pi
 		JOIN contacts c ON pi.vendor_id = c.id
 		WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL
