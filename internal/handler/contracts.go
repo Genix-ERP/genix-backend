@@ -56,6 +56,14 @@ func (h *Handler) ListContracts(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND c.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND c.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND c.status = $%d", argCount)
@@ -220,16 +228,23 @@ func (h *Handler) CreateContract(c *gin.Context) {
 		notes = &input.Notes
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO procurement_contracts (
-			id, tenant_id, contract_number, title, vendor_id, vendor_name, contract_type, status,
+			id, tenant_id, organization_id, contract_number, title, vendor_id, vendor_name, contract_type, status,
 			start_date, end_date, value, currency_id, terms, description,
 			auto_renewal, renewal_term_days, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 	`
 
 	_, err = h.db.Exec(query,
-		id, tenantID, contractNumber, input.Title, vendorID, vendorName, input.ContractType, entity.ContractStatusDraft,
+		id, tenantID, orgIDPtr, contractNumber, input.Title, vendorID, vendorName, input.ContractType, entity.ContractStatusDraft,
 		startDate, endDate, input.Value, currencyID, terms, description,
 		input.AutoRenewal, input.RenewalTermDays, notes, userID, now, now,
 	)

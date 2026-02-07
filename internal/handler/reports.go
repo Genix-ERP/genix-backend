@@ -39,12 +39,19 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
 			AND je.status = 'posted' AND je.entry_date <= $2 AND je.deleted_at IS NULL
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
+	`
+	args := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND a.organization_id = $3"
+		args = append(args, orgID)
+	}
+	query += `
 		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance
 		HAVING COALESCE(SUM(jel.debit_amount), 0) > 0 OR COALESCE(SUM(jel.credit_amount), 0) > 0
 		ORDER BY a.code
 	`
 
-	rows, err := h.db.Query(query, tenantID, asOfDate)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to get trial balance", "error", err)
 		response.InternalError(c, "Failed to generate trial balance")
@@ -121,11 +128,18 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 			AND je.status = 'posted' AND je.entry_date <= $2 AND je.deleted_at IS NULL
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
 			AND at.category IN ('asset', 'liability', 'equity')
+	`
+	args := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND a.organization_id = $3"
+		args = append(args, orgID)
+	}
+	query += `
 		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance, a.opening_balance
 		ORDER BY at.category, a.code
 	`
 
-	rows, err := h.db.Query(query, tenantID, asOfDate)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to get balance sheet", "error", err)
 		response.InternalError(c, "Failed to generate balance sheet")
@@ -238,12 +252,19 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 			AND je.deleted_at IS NULL
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
 			AND at.category IN ('revenue', 'expense')
+	`
+	args := []interface{}{tenantID, periodFrom, periodTo}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND a.organization_id = $4"
+		args = append(args, orgID)
+	}
+	query += `
 		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance
 		HAVING COALESCE(SUM(jel.debit_amount), 0) > 0 OR COALESCE(SUM(jel.credit_amount), 0) > 0
 		ORDER BY at.category DESC, a.code
 	`
 
-	rows, err := h.db.Query(query, tenantID, periodFrom, periodTo)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to get income statement", "error", err)
 		response.InternalError(c, "Failed to generate income statement")
@@ -338,9 +359,17 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
 	`
 	args := []interface{}{tenantID}
+	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		accountQuery += fmt.Sprintf(" AND a.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if accountID != "" {
-		accountQuery += " AND a.id = $2"
+		argCount++
+		accountQuery += fmt.Sprintf(" AND a.id = $%d", argCount)
 		args = append(args, accountID)
 	}
 
@@ -469,9 +498,14 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
 			AND (a.is_bank_account = true OR at.code IN ('1010', '1020'))
 	`
+	cashArgs := []interface{}{tenantID, periodFrom, periodTo}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		cashQuery += " AND a.organization_id = $4"
+		cashArgs = append(cashArgs, orgID)
+	}
 
 	var openingCash, periodDebits, periodCredits float64
-	err := h.db.QueryRow(cashQuery, tenantID, periodFrom, periodTo).Scan(&openingCash, &periodDebits, &periodCredits)
+	err := h.db.QueryRow(cashQuery, cashArgs...).Scan(&openingCash, &periodDebits, &periodCredits)
 	if err != nil {
 		h.log.Error("Failed to get cash balances", "error", err)
 		// Continue with zeros
@@ -529,10 +563,15 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
 			AND si.status NOT IN ('cancelled', 'paid')
 			AND si.total_amount > si.amount_paid
-		ORDER BY c.name, si.due_date
 	`
+	arArgs := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND si.organization_id = $3"
+		arArgs = append(arArgs, orgID)
+	}
+	query += " ORDER BY c.name, si.due_date"
 
-	rows, err := h.db.Query(query, tenantID, asOfDate)
+	rows, err := h.db.Query(query, arArgs...)
 	if err != nil {
 		h.log.Error("Failed to get aging receivables", "error", err)
 		response.InternalError(c, "Failed to generate aging report")
@@ -651,10 +690,15 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL
 			AND pi.status NOT IN ('cancelled', 'paid')
 			AND pi.total_amount > pi.amount_paid
-		ORDER BY c.name, pi.due_date
 	`
+	apArgs := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND pi.organization_id = $3"
+		apArgs = append(apArgs, orgID)
+	}
+	query += " ORDER BY c.name, pi.due_date"
 
-	rows, err := h.db.Query(query, tenantID, asOfDate)
+	rows, err := h.db.Query(query, apArgs...)
 	if err != nil {
 		h.log.Error("Failed to get aging payables", "error", err)
 		response.InternalError(c, "Failed to generate aging report")
@@ -770,19 +814,35 @@ func (h *Handler) GetSalesSummary(c *gin.Context) {
 	var totalOrders, totalInvoiced int
 	var orderAmount, invoicedAmount, paidAmount float64
 
-	h.db.QueryRow(`
+	soQuery := `
 		SELECT COUNT(*), COALESCE(SUM(total_amount), 0)
 		FROM sales_orders
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 			AND order_date >= $2 AND order_date <= $3
-	`, tenantID, periodFrom, periodTo).Scan(&totalOrders, &orderAmount)
-
-	h.db.QueryRow(`
+	`
+	siQuery := `
 		SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COALESCE(SUM(amount_paid), 0)
 		FROM sales_invoices
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 			AND invoice_date >= $2 AND invoice_date <= $3
-	`, tenantID, periodFrom, periodTo).Scan(&totalInvoiced, &invoicedAmount, &paidAmount)
+	`
+	tcQuery := `
+		SELECT c.id, c.name, COUNT(si.id), COALESCE(SUM(si.total_amount), 0)
+		FROM sales_invoices si
+		JOIN contacts c ON si.customer_id = c.id
+		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
+			AND si.invoice_date >= $2 AND si.invoice_date <= $3
+	`
+	salesArgs := []interface{}{tenantID, periodFrom, periodTo}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		soQuery += " AND organization_id = $4"
+		siQuery += " AND organization_id = $4"
+		tcQuery += " AND si.organization_id = $4"
+		salesArgs = append(salesArgs, orgID)
+	}
+
+	h.db.QueryRow(soQuery, salesArgs...).Scan(&totalOrders, &orderAmount)
+	h.db.QueryRow(siQuery, salesArgs...).Scan(&totalInvoiced, &invoicedAmount, &paidAmount)
 
 	// Get top customers
 	type TopCustomer struct {
@@ -792,17 +852,13 @@ func (h *Handler) GetSalesSummary(c *gin.Context) {
 		TotalAmount  float64   `json:"total_amount"`
 	}
 
-	topCustomers := make([]TopCustomer, 0)
-	rows, err := h.db.Query(`
-		SELECT c.id, c.name, COUNT(si.id), COALESCE(SUM(si.total_amount), 0)
-		FROM sales_invoices si
-		JOIN contacts c ON si.customer_id = c.id
-		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
-			AND si.invoice_date >= $2 AND si.invoice_date <= $3
+	tcQuery += `
 		GROUP BY c.id, c.name
 		ORDER BY SUM(si.total_amount) DESC
 		LIMIT 10
-	`, tenantID, periodFrom, periodTo)
+	`
+	topCustomers := make([]TopCustomer, 0)
+	rows, err := h.db.Query(tcQuery, salesArgs...)
 
 	if err == nil {
 		defer rows.Close()
@@ -850,6 +906,13 @@ func (h *Handler) GetInventoryReport(c *gin.Context) {
 	`
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if warehouseID != "" {
 		argCount++

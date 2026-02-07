@@ -53,6 +53,15 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization - use employee_organizations to show all employees with access to this company
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		orgFilter := fmt.Sprintf(" AND (organization_id = $%d OR id IN (SELECT employee_id FROM employee_organizations WHERE organization_id = $%d))", argCount, argCount)
+		baseQuery += orgFilter
+		countQuery += orgFilter
+		args = append(args, orgID)
+	}
+
 	// Apply filters
 	if search != "" {
 		argCount++

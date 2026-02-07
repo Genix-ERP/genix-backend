@@ -34,6 +34,13 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		query += fmt.Sprintf(" AND status = $%d", argCount)
@@ -227,6 +234,13 @@ func (h *Handler) CreateDiscount(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Get organization ID from middleware header
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var input struct {
 		Code               string   `json:"code" binding:"required"`
 		Name               string   `json:"name" binding:"required"`
@@ -292,12 +306,12 @@ func (h *Handler) CreateDiscount(c *gin.Context) {
 
 	_, err = h.db.Exec(`
 		INSERT INTO discounts (
-			id, tenant_id, code, name, description, discount_type, discount_value,
+			id, tenant_id, organization_id, code, name, description, discount_type, discount_value,
 			min_order_amount, max_discount_amount, usage_limit, usage_per_customer,
 			applies_to, applicable_products, applicable_categories, applicable_customers,
 			new_customers_only, valid_from, valid_until, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`,
-		discountID, tenantID, input.Code, input.Name, input.Description, input.DiscountType, input.DiscountValue,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`,
+		discountID, tenantID, orgIDPtr, input.Code, input.Name, input.Description, input.DiscountType, input.DiscountValue,
 		input.MinOrderAmount, input.MaxDiscountAmount, input.UsageLimit, input.UsagePerCustomer,
 		input.AppliesTo, pq.Array(input.ApplicableProducts), pq.Array(input.ApplicableCategories), pq.Array(input.ApplicableCustomers),
 		input.NewCustomersOnly, validFrom, validUntil, input.Status, createdBy, now, now,

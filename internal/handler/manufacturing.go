@@ -64,6 +64,15 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 	countArgs := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wc.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wc.organization_id = $%d", argCount)
+		args = append(args, orgID)
+		countArgs = append(countArgs, orgID)
+	}
+
 	// Apply filters
 	if filter.Status != nil && *filter.Status != "" {
 		argCount++
@@ -311,18 +320,25 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	now := time.Now()
 	id := uuid.New()
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO work_centers (
-			id, tenant_id, code, name, description, warehouse_id, department,
+			id, tenant_id, organization_id, code, name, description, warehouse_id, department,
 			capacity_per_hour, efficiency_factor, oee_target, working_hours_per_day,
 			hourly_cost, setup_cost, overhead_cost, currency, status, is_available,
 			next_maintenance_date, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
-		id, tenantID, input.Code, input.Name, input.Description, input.WarehouseID,
+		id, tenantID, orgIDPtr, input.Code, input.Name, input.Description, input.WarehouseID,
 		input.Department, capacityPerHour, efficiencyFactor, oeeTarget, workingHours,
 		hourlyCost, setupCost, overheadCost, currency, status, isAvailable,
 		nextMaintDate, input.Notes, userID, now, now,
@@ -604,6 +620,15 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	countArgs := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.organization_id = $%d", argCount)
+		args = append(args, orgID)
+		countArgs = append(countArgs, orgID)
+	}
 
 	// Apply filters
 	if filter.Status != nil && *filter.Status != "" {
@@ -934,13 +959,20 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		}
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO production_orders (
-			id, tenant_id, code, name, product_id, bom_id, quantity_planned, uom,
+			id, tenant_id, organization_id, code, name, product_id, bom_id, quantity_planned, uom,
 			scheduled_start, scheduled_end, priority, status, source_type, source_id,
 			sales_order_id, customer_id, warehouse_id, location_id, assigned_to,
 			work_center_id, requires_quality_check, notes, tags, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'draft', $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
 		RETURNING id
 	`
 
@@ -950,7 +982,7 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	}
 
 	err := h.db.QueryRow(query,
-		id, tenantID, code, input.Name, input.ProductID, input.BOMID, input.QuantityPlanned, input.UOM,
+		id, tenantID, orgIDPtr, code, input.Name, input.ProductID, input.BOMID, input.QuantityPlanned, input.UOM,
 		scheduledStart, scheduledEnd, priority, input.SourceType, input.SourceID,
 		input.SalesOrderID, input.CustomerID, input.WarehouseID, input.LocationID, input.AssignedTo,
 		input.WorkCenterID, requiresQC, input.Notes, tags, userID, now, now,
@@ -1444,10 +1476,15 @@ func (h *Handler) GetProductionSchedule(c *gin.Context) {
 			OR (po.scheduled_end >= $2 AND po.scheduled_end <= $3)
 			OR (po.scheduled_start <= $2 AND po.scheduled_end >= $3)
 		)
-		ORDER BY po.scheduled_start ASC, po.priority ASC
 	`
+	schedArgs := []interface{}{tenantID, dateFrom, dateTo}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND po.organization_id = $4"
+		schedArgs = append(schedArgs, orgID)
+	}
+	query += " ORDER BY po.scheduled_start ASC, po.priority ASC"
 
-	rows, err := h.db.Query(query, tenantID, dateFrom, dateTo)
+	rows, err := h.db.Query(query, schedArgs...)
 	if err != nil {
 		h.log.Error("Failed to get production schedule", "error", err)
 		response.InternalError(c, "Failed to retrieve production schedule")
@@ -1498,6 +1535,14 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 
 	stats := entity.ManufacturingStats{}
 
+	// Build org filter
+	statsArgs := []interface{}{tenantID}
+	orgFilter := ""
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgFilter = " AND organization_id = $2"
+		statsArgs = append(statsArgs, orgID)
+	}
+
 	// Production order stats
 	orderStatsQuery := `
 		SELECT
@@ -1511,10 +1556,10 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 			COALESCE(SUM(quantity_scrapped), 0) as total_scrapped
 		FROM production_orders
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-	`
+	` + orgFilter
 
 	var totalProduced, totalScrapped float64
-	err := h.db.QueryRow(orderStatsQuery, tenantID).Scan(
+	err := h.db.QueryRow(orderStatsQuery, statsArgs...).Scan(
 		&stats.TotalProductionOrders, &stats.DraftOrders, &stats.ConfirmedOrders,
 		&stats.InProgressOrders, &stats.CompletedOrders, &stats.OverdueOrders,
 		&totalProduced, &totalScrapped,
@@ -1540,8 +1585,8 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 			COALESCE(AVG(current_utilization), 0) as avg_utilization
 		FROM work_centers
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-	`
-	err = h.db.QueryRow(wcStatsQuery, tenantID).Scan(
+	` + orgFilter
+	err = h.db.QueryRow(wcStatsQuery, statsArgs...).Scan(
 		&stats.TotalWorkCenters, &stats.ActiveWorkCenters, &stats.AverageUtilization,
 	)
 	if err != nil {
@@ -1556,8 +1601,8 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 			COUNT(*) FILTER (WHERE result = 'failed') as failed
 		FROM quality_checks
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-	`
-	err = h.db.QueryRow(qcStatsQuery, tenantID).Scan(
+	` + orgFilter
+	err = h.db.QueryRow(qcStatsQuery, statsArgs...).Scan(
 		&stats.TotalQualityChecks, &stats.PassedChecks, &stats.FailedChecks,
 	)
 	if err != nil {
@@ -1625,6 +1670,15 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	countArgs := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND wo.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND wo.organization_id = $%d", argCount)
+		args = append(args, orgID)
+		countArgs = append(countArgs, orgID)
+	}
 
 	// Apply filters
 	if filter.ProductionOrderID != nil {
@@ -1899,18 +1953,25 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 		scheduledEnd = &t
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO work_orders (
-			id, tenant_id, production_order_id, code, name, sequence,
+			id, tenant_id, organization_id, production_order_id, code, name, sequence,
 			operation_id, work_center_id, quantity_to_produce, uom,
 			planned_duration_hours, setup_time_hours, scheduled_start, scheduled_end,
 			status, assigned_to, instructions, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'pending', $15, $16, $17, $18, $19, $20)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $19, $20, $21)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
-		id, tenantID, input.ProductionOrderID, code, input.Name, sequence,
+		id, tenantID, orgIDPtr, input.ProductionOrderID, code, input.Name, sequence,
 		input.OperationID, input.WorkCenterID, input.QuantityToProduce, input.UOM,
 		plannedDuration, setupTime, scheduledStart, scheduledEnd,
 		input.AssignedTo, input.Instructions, input.Notes, userID, now, now,
@@ -2170,6 +2231,15 @@ func (h *Handler) ListQualityChecks(c *gin.Context) {
 	args := []interface{}{tenantID}
 	countArgs := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND qc.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND qc.organization_id = $%d", argCount)
+		args = append(args, orgID)
+		countArgs = append(countArgs, orgID)
+	}
 
 	// Apply filters
 	if filter.ProductionOrderID != nil {
@@ -2439,21 +2509,28 @@ func (h *Handler) CreateQualityCheck(c *gin.Context) {
 		}
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO quality_checks (
-			id, tenant_id, code, quality_control_point_id, production_order_id, work_order_id,
+			id, tenant_id, organization_id, code, quality_control_point_id, production_order_id, work_order_id,
 			product_id, lot_number, inspection_date, inspector_id, inspector_name,
 			quantity_inspected, quantity_passed, quantity_failed, result, measured_value,
 			measurement_unit, pass_rate, defect_type, defect_category, action_taken,
 			notes, failure_reason, corrective_action, attachments, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 		RETURNING id
 	`
 
 	attachments := []byte("[]")
 
 	err := h.db.QueryRow(query,
-		id, tenantID, code, input.QualityControlPointID, input.ProductionOrderID, input.WorkOrderID,
+		id, tenantID, orgIDPtr, code, input.QualityControlPointID, input.ProductionOrderID, input.WorkOrderID,
 		input.ProductID, input.LotNumber, inspectionDate, userID, inspectorName,
 		input.QuantityInspected, input.QuantityPassed, input.QuantityFailed, result, input.MeasuredValue,
 		input.MeasurementUnit, passRate, input.DefectType, input.DefectCategory, input.ActionTaken,

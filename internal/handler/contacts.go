@@ -59,6 +59,14 @@ func (h *Handler) ListContacts(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if contactType != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND type = $%d", argCount)
@@ -285,19 +293,26 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		customFields = []byte("{}")
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO contacts (
-			id, tenant_id, type, code, name, legal_name, tax_id,
+			id, tenant_id, organization_id, type, code, name, legal_name, tax_id,
 			registration_number, industry, website, email, phone, fax,
 			billing_address, shipping_address, payment_terms, credit_limit,
 			current_balance, tax_exempt, tags, notes, custom_fields,
 			is_active, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
-		id, tenantID, input.Type, input.Code, input.Name, legalName, taxID,
+		id, tenantID, orgIDPtr, input.Type, input.Code, input.Name, legalName, taxID,
 		regNum, industry, website, email, phone, fax,
 		billingAddr, shippingAddr, input.PaymentTerms, input.CreditLimit,
 		0, input.TaxExempt, tags, notes, customFields,

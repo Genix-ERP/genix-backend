@@ -889,6 +889,10 @@ type Budget struct {
 	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
 	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
 
+	// From fiscal_years JOIN
+	StartDate *string `json:"start_date,omitempty"`
+	EndDate   *string `json:"end_date,omitempty"`
+
 	// Relationships
 	Lines []BudgetLine `json:"lines,omitempty"`
 }
