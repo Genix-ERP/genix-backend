@@ -51,6 +51,13 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND pp.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" && status != "all" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND pp.status = $%d", argCount)
@@ -147,15 +154,21 @@ func (h *Handler) CreatePayrollPeriod(c *gin.Context) {
 		return
 	}
 
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	id := uuid.New()
 	now := time.Now()
 
 	query := `
 		INSERT INTO payroll_periods (
-			id, tenant_id, period_code, period_name, start_date, end_date, pay_date,
+			id, tenant_id, organization_id, period_code, period_name, start_date, end_date, pay_date,
 			status, total_gross, total_deductions, total_net, employee_count, notes,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		RETURNING id
 	`
 
@@ -165,7 +178,7 @@ func (h *Handler) CreatePayrollPeriod(c *gin.Context) {
 	}
 
 	if err := h.db.QueryRow(query,
-		id, tenantID, periodCode, input.PeriodName, startDate, endDate, payDate,
+		id, tenantID, orgIDPtr, periodCode, input.PeriodName, startDate, endDate, payDate,
 		"draft", 0, 0, 0, 0, notes, userID, now, now,
 	).Scan(&id); err != nil {
 		h.log.Error("Failed to create payroll period", "error", err)
@@ -463,6 +476,12 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 	totalDeductions := input.IncomeTax + input.SocialSecurity + input.Pension + input.OtherDeductions
 	netSalary := grossSalary - totalDeductions
 
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	id := uuid.New()
 	now := time.Now()
 
@@ -473,11 +492,11 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 
 	query := `
 		INSERT INTO payroll_entries (
-			id, tenant_id, payroll_period_id, employee_id, employee_name, base_salary,
+			id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name, base_salary,
 			overtime_hours, overtime_amount, bonus, allowances, gross_salary, income_tax,
 			social_security, pension, other_deductions, total_deductions, net_salary,
 			payment_method, bank_account, status, notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 		RETURNING id
 	`
 
@@ -490,7 +509,7 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 	}
 
 	if err := h.db.QueryRow(query,
-		id, tenantID, payrollPeriodID, employeeID, employeeName, input.BaseSalary,
+		id, tenantID, orgIDPtr, payrollPeriodID, employeeID, employeeName, input.BaseSalary,
 		input.OvertimeHours, input.OvertimeAmount, input.Bonus, input.Allowances, grossSalary,
 		input.IncomeTax, input.SocialSecurity, input.Pension, input.OtherDeductions, totalDeductions,
 		netSalary, paymentMethod, bankAccount, "pending", notes, now, now,

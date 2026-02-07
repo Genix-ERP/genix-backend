@@ -49,10 +49,19 @@ func (h *Handler) ListLandedCostTypes(c *gin.Context) {
 		SELECT id, tenant_id, name, code, description, default_allocation_method,
 			   expense_account_id, is_active, created_at, updated_at
 		FROM landed_cost_types
-		WHERE tenant_id = $1
-		ORDER BY name`
+		WHERE tenant_id = $1`
 
-	rows, err := h.db.Query(query, tenantID)
+	args := []interface{}{tenantID}
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND (organization_id = $2 OR organization_id IS NULL)"
+		args = append(args, orgID)
+	}
+
+	query += " ORDER BY name"
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		response.Error(c, 500, "Failed to fetch landed cost types", err.Error())
 		return
@@ -276,9 +285,18 @@ func (h *Handler) ListLandedCosts(c *gin.Context) {
 		WHERE tenant_id = $1 AND deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
+	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if grID != "" {
-		query += " AND goods_receipt_id = $2"
+		argCount++
+		query += fmt.Sprintf(" AND goods_receipt_id = $%d", argCount)
 		args = append(args, grID)
 	}
 
@@ -347,6 +365,13 @@ func (h *Handler) ListLandedCosts(c *gin.Context) {
 func (h *Handler) CreateLandedCost(c *gin.Context) {
 	tenantID, _ := middleware.GetTenantID(c)
 	userID, _ := middleware.GetUserID(c)
+
+	// Get organization ID from middleware header
+	lcOrgID, _ := middleware.GetOrganizationID(c)
+	var lcOrgIDPtr *uuid.UUID
+	if lcOrgID != uuid.Nil {
+		lcOrgIDPtr = &lcOrgID
+	}
 
 	var input LandedCostInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -423,12 +448,12 @@ func (h *Handler) CreateLandedCost(c *gin.Context) {
 
 	_, err = h.db.Exec(`
 		INSERT INTO landed_costs (
-			id, tenant_id, landed_cost_number, goods_receipt_id, gr_number,
+			id, tenant_id, organization_id, landed_cost_number, goods_receipt_id, gr_number,
 			purchase_order_id, po_number, supplier_id, supplier_name,
 			cost_date, product_value, total_landed_cost, total_cost,
 			status, allocation_method, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $18)`,
-		id, tenantID, lcNumber, grID, grNumber,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)`,
+		id, tenantID, lcOrgIDPtr, lcNumber, grID, grNumber,
 		poIDVal, poNumber, supplierIDVal, supplierName,
 		costDate, productValue, totalLandedCost, productValue+totalLandedCost,
 		"draft", allocMethod, input.Notes, userID, now,

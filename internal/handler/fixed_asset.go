@@ -26,10 +26,19 @@ func (h *Handler) ListAssetCategories(c *gin.Context) {
 		SELECT id, tenant_id, code, name, description, depreciation_method, default_useful_life_months, is_active
 		FROM asset_categories
 		WHERE tenant_id = $1
-		ORDER BY name
 	`
+	args := []interface{}{tenantID}
+	argCount := 1
 
-	rows, err := h.db.Query(query, tenantID)
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
+	query += " ORDER BY name"
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list asset categories", "error", err)
 		response.InternalError(c, "Failed to list asset categories")
@@ -94,6 +103,13 @@ func (h *Handler) ListFixedAssets(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if status != "" && status != "all" {
 		argCount++
@@ -234,6 +250,13 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	// Get organization ID
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var categoryID, custodianID *uuid.UUID
 	var categoryName *string
 	if input.CategoryID != "" {
@@ -256,12 +279,12 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 
 	query := `
 		INSERT INTO fixed_assets (
-			id, tenant_id, asset_code, name, description, category_id, category_name,
+			id, tenant_id, organization_id, asset_code, name, description, category_id, category_name,
 			serial_number, acquisition_date, acquisition_cost, salvage_value, useful_life_months,
 			depreciation_method, accumulated_depreciation, book_value, location,
 			custodian_id, custodian_name, warranty_expiry, status, notes,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 		RETURNING id
 	`
 
@@ -290,7 +313,7 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 	}
 
 	if err := h.db.QueryRow(query,
-		id, tenantID, assetCode, input.Name, description, categoryID, categoryName,
+		id, tenantID, orgIDPtr, assetCode, input.Name, description, categoryID, categoryName,
 		serialNumber, acquisitionDate, input.AcquisitionCost, input.SalvageValue, input.UsefulLifeMonths,
 		input.DepreciationMethod, 0, bookValue, location, custodianID, custodianName,
 		warrantyExpiry, "active", notes, userID, now, now,
@@ -656,8 +679,17 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 		FROM fixed_assets
 		WHERE tenant_id = $1 AND status = 'active' AND deleted_at IS NULL
 	`
+	assetsArgs := []interface{}{tenantID}
 
-	rows, err := h.db.Query(assetsQuery, tenantID)
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+		assetsQuery += " AND organization_id = $2"
+		assetsArgs = append(assetsArgs, orgID)
+	}
+
+	rows, err := h.db.Query(assetsQuery, assetsArgs...)
 	if err != nil {
 		h.log.Error("Failed to get assets for depreciation", "error", err)
 		response.InternalError(c, "Failed to run depreciation")
@@ -723,11 +755,11 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 		entryID := uuid.New()
 		insertQuery := `
 			INSERT INTO depreciation_entries (
-				id, tenant_id, asset_id, period, depreciation_date, depreciation_amount,
+				id, tenant_id, organization_id, asset_id, period, depreciation_date, depreciation_amount,
 				accumulated_total, book_value_after, depreciation_method, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		`
-		if _, err := h.db.Exec(insertQuery, entryID, tenantID, assetID, input.Period, deprecationDate, depAmount, newAccumulated, newBookValue, depreciationMethod, now); err != nil {
+		if _, err := h.db.Exec(insertQuery, entryID, tenantID, orgIDPtr, assetID, input.Period, deprecationDate, depAmount, newAccumulated, newBookValue, depreciationMethod, now); err != nil {
 			h.log.Error("Failed to insert depreciation entry", "error", err)
 			continue
 		}

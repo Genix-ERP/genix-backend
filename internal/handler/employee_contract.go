@@ -55,6 +55,14 @@ func (h *Handler) ListEmployeeContracts(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		filter := fmt.Sprintf(" AND organization_id = $%d", argCount)
+		baseQuery += filter
+		countQuery += filter
+		args = append(args, orgID)
+	}
+
 	// Apply filters
 	if employeeID != "" {
 		if empUUID, err := uuid.Parse(employeeID); err == nil {
@@ -232,16 +240,22 @@ func (h *Handler) CreateEmployeeContract(c *gin.Context) {
 		workingHours = 40
 	}
 
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	id := uuid.New()
 	now := time.Now()
 
 	query := `
 		INSERT INTO employee_contracts (
-			id, tenant_id, employee_id, employee_name, job_title, department,
+			id, tenant_id, organization_id, employee_id, employee_name, job_title, department,
 			contract_type, start_date, end_date, salary, currency,
 			working_hours, probation_period, notice_period, benefits, terms,
 			status, signed_date, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		RETURNING id, created_at
 	`
 
@@ -263,7 +277,7 @@ func (h *Handler) CreateEmployeeContract(c *gin.Context) {
 	}
 
 	err = h.db.QueryRow(query,
-		id, tenantID, employeeID, employeeName, jobTitle, department,
+		id, tenantID, orgIDPtr, employeeID, employeeName, jobTitle, department,
 		input.ContractType, startDate, endDate, input.Salary, currency,
 		workingHours, input.ProbationPeriod, input.NoticePeriod, benefits, terms,
 		status, signedDate, now, now,

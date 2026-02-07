@@ -45,6 +45,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		protected := v1.Group("")
 		protected.Use(middleware.Auth(h.jwtManager))
 		protected.Use(middleware.TenantResolver())
+		protected.Use(middleware.OrganizationResolver())
 		h.registerProtectedRoutes(protected)
 	}
 }
@@ -69,6 +70,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 
 	// Public info
 	rg.GET("/info", h.GetAPIInfo)
+
+	// Contact form (public - no auth needed)
+	rg.POST("/contact", h.SubmitContactForm)
 }
 
 // registerProtectedRoutes registers routes that require authentication

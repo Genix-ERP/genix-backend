@@ -34,6 +34,13 @@ func (h *Handler) ListQuotations(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		query += fmt.Sprintf(" AND status = $%d", argCount)
@@ -143,6 +150,13 @@ func (h *Handler) CreateQuotation(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Get organization ID from middleware header
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var input entity.CreateQuotationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid input: "+err.Error())
@@ -189,11 +203,11 @@ func (h *Handler) CreateQuotation(c *gin.Context) {
 	// Insert quotation
 	_, err := h.db.Exec(`
 		INSERT INTO sales_quotations (
-			id, tenant_id, quotation_number, customer_id, customer_name, contact_person, email,
+			id, tenant_id, organization_id, quotation_number, customer_id, customer_name, contact_person, email,
 			valid_until, subtotal, discount_percent, discount_amount, tax_percent, tax_amount,
 			total_amount, status, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
-		quotationID, tenantID, quotationNumber, customerID, input.CustomerName, input.ContactPerson, input.Email,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`,
+		quotationID, tenantID, orgIDPtr, quotationNumber, customerID, input.CustomerName, input.ContactPerson, input.Email,
 		validUntil, subtotal, input.DiscountPercent, discountAmount, input.TaxPercent, taxAmount,
 		totalAmount, "draft", input.Notes, createdBy, now, now,
 	)

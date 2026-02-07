@@ -35,6 +35,13 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND sr.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		query += fmt.Sprintf(" AND sr.status = $%d", argCount)
@@ -170,6 +177,13 @@ func (h *Handler) CreateSalesReturn(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Get organization ID from middleware header
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var input struct {
 		SalesInvoiceID string `json:"invoice_id"`
 		SalesOrderID   string `json:"sales_order_id"`
@@ -238,11 +252,11 @@ func (h *Handler) CreateSalesReturn(c *gin.Context) {
 	// Insert return
 	_, err := h.db.Exec(`
 		INSERT INTO sales_returns (
-			id, tenant_id, return_number, sales_invoice_id, sales_order_id, customer_id, customer_name,
+			id, tenant_id, organization_id, return_number, sales_invoice_id, sales_order_id, customer_id, customer_name,
 			return_date, reason, subtotal, tax_amount, total_amount, status, refund_status,
 			notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
-		returnID, tenantID, returnNumber, salesInvoiceID, salesOrderID, customerID, input.CustomerName,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
+		returnID, tenantID, orgIDPtr, returnNumber, salesInvoiceID, salesOrderID, customerID, input.CustomerName,
 		returnDate, input.Reason, subtotal, 0, totalAmount, "pending", "pending",
 		input.Notes, createdBy, now, now,
 	)

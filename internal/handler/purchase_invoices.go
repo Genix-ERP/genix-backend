@@ -52,6 +52,14 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND pi.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -283,6 +291,12 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		parsed, err := uuid.Parse(input.OrganizationID)
 		if err == nil {
 			orgID = &parsed
+		}
+	}
+	// Fallback to middleware header if not provided in body
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
 		}
 	}
 
@@ -871,10 +885,10 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 		if parseErr == nil {
 			_, err = h.db.Exec(`
 				INSERT INTO payments (
-					id, tenant_id, payment_number, type, contact_id, payment_date, amount,
+					id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
 					exchange_rate, reference, notes, status, created_at, updated_at
-				) VALUES ($1, $2, $3, 'payment', $4, $5, $6, 1, $7, $8, 'confirmed', $9, $9)
-			`, paymentID, tenantID, paymentNumber, contactUUID, now, paymentAmount, reference, fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8]), now)
+				) VALUES ($1, $2, $3, $4, 'payment', $5, $6, $7, 1, $8, $9, 'confirmed', $10, $10)
+			`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8]), now)
 
 			if err != nil {
 				h.log.Error("Failed to create payment record", "error", err)

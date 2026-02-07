@@ -97,6 +97,14 @@ func (h *Handler) ListVendorPrices(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND vp.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND vp.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if vendorID != "" {
 		if vid, err := uuid.Parse(vendorID); err == nil {
 			argCount++
@@ -314,14 +322,21 @@ func (h *Handler) CreateVendorPrice(c *gin.Context) {
 		notes = &input.Notes
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO vendor_prices
-		(id, tenant_id, vendor_id, product_id, price, currency, min_quantity, lead_time_days,
+		(id, tenant_id, organization_id, vendor_id, product_id, price, currency, min_quantity, lead_time_days,
 		 valid_from, valid_until, notes, is_active, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
 	`
 
-	_, err = h.db.Exec(query, id, tenantID, vendorID, productID, input.Price, currency,
+	_, err = h.db.Exec(query, id, tenantID, orgIDPtr, vendorID, productID, input.Price, currency,
 		minQuantity, input.LeadTimeDays, validFrom, validUntil, notes, isActive, userID, now)
 	if err != nil {
 		h.log.Error("Failed to create vendor price", "error", err)
