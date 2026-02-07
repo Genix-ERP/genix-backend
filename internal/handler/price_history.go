@@ -61,6 +61,14 @@ func (h *Handler) ListPriceHistory(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND ph.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND ph.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if productID != "" {
 		if pid, err := uuid.Parse(productID); err == nil {
 			argCount++
@@ -285,10 +293,17 @@ func (h *Handler) CreatePriceHistory(c *gin.Context) {
 		source = input.Source
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO supplier_price_history
-		(id, tenant_id, product_id, vendor_id, unit_price, currency_id, effective_date, min_quantity, notes, source, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		(id, tenant_id, organization_id, product_id, vendor_id, unit_price, currency_id, effective_date, min_quantity, notes, source, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 	`
 
 	var notes *string
@@ -296,7 +311,7 @@ func (h *Handler) CreatePriceHistory(c *gin.Context) {
 		notes = &input.Notes
 	}
 
-	_, err = h.db.Exec(query, id, tenantID, productID, vendorID, input.UnitPrice, currencyID, effectiveDate, minQuantity, notes, source, time.Now())
+	_, err = h.db.Exec(query, id, tenantID, orgIDPtr, productID, vendorID, input.UnitPrice, currencyID, effectiveDate, minQuantity, notes, source, time.Now())
 	if err != nil {
 		h.log.Error("Failed to create price history", "error", err)
 		response.InternalError(c, "Failed to create price history")

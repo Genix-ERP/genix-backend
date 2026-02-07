@@ -58,6 +58,14 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if !includeInactive {
 		baseQuery += " AND w.is_active = true"
 		countQuery += " AND w.is_active = true"
@@ -277,12 +285,23 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 		return
 	}
 
-	// Check for duplicate code
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+
+	// Check for duplicate code within same organization
 	var codeExists bool
-	err := h.db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM warehouses WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
-		tenantID, input.Code,
-	).Scan(&codeExists)
+	var err error
+	if orgID != uuid.Nil {
+		err = h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND code = $3 AND deleted_at IS NULL)",
+			tenantID, orgID, input.Code,
+		).Scan(&codeExists)
+	} else {
+		err = h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM warehouses WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
+			tenantID, input.Code,
+		).Scan(&codeExists)
+	}
 	if err != nil {
 		h.log.Error("Failed to check warehouse code", "error", err)
 		response.InternalError(c, "Failed to create warehouse")
@@ -332,14 +351,19 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 		deliverySteps = 1
 	}
 
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
-		INSERT INTO warehouses (id, tenant_id, code, name, address, manager_id, is_default, is_active, reception_steps, delivery_steps, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		INSERT INTO warehouses (id, tenant_id, organization_id, code, name, address, manager_id, is_default, is_active, reception_steps, delivery_steps, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id
 	`
 
 	err = h.db.QueryRow(query,
-		id, tenantID, input.Code, input.Name, addressJSON, managerID, input.IsDefault, true, receptionSteps, deliverySteps, now, now,
+		id, tenantID, orgIDPtr, input.Code, input.Name, addressJSON, managerID, input.IsDefault, true, receptionSteps, deliverySteps, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -1232,6 +1256,13 @@ func (h *Handler) ListAllLocations(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization (via warehouse)
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if !showInactive {
 		query += " AND wl.is_active = true"
 	}
@@ -1373,6 +1404,13 @@ func (h *Handler) ListOperationTypes(c *gin.Context) {
 	`
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND ot.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if !showInactive {
 		query += " AND ot.is_active = true"
@@ -1586,18 +1624,25 @@ func (h *Handler) CreateOperationType(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO warehouse_operation_types (
-			id, tenant_id, warehouse_id, code, name, operation_type, type, sequence,
+			id, tenant_id, organization_id, warehouse_id, code, name, operation_type, type, sequence,
 			default_location_src_id, default_location_dest_id,
 			show_operations, barcode_enabled, create_backorder,
 			reservation_method, color, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		RETURNING id
 	`
 
 	err = h.db.QueryRow(query,
-		id, tenantID, warehouseID, input.Code, input.Name, operationType, opType, sequence,
+		id, tenantID, orgIDPtr, warehouseID, input.Code, input.Name, operationType, opType, sequence,
 		srcLocationID, destLocationID,
 		showOperations, barcodeEnabled, createBackorder,
 		reservationMethod, color, true, now, now,

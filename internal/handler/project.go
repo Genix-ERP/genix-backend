@@ -46,6 +46,14 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -160,6 +168,13 @@ func (h *Handler) CreateProject(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Get organization ID from middleware header
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var input entity.CreateProjectInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, err.Error())
@@ -208,11 +223,11 @@ func (h *Handler) CreateProject(c *gin.Context) {
 
 	query := `
 		INSERT INTO projects (
-			id, tenant_id, project_code, project_name, description, client_id, client_name,
+			id, tenant_id, organization_id, project_code, project_name, description, client_id, client_name,
 			manager_id, manager_name, start_date, end_date, budget, spent,
 			billing_type, hourly_rate, currency, priority, status, progress,
 			notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`
 
 	var clientID, managerID *uuid.UUID
 	if input.ClientID != "" {
@@ -244,7 +259,7 @@ func (h *Handler) CreateProject(c *gin.Context) {
 	}
 
 	_, err = h.db.Exec(query,
-		projectID, tenantID, input.ProjectCode, input.ProjectName, description,
+		projectID, tenantID, orgIDPtr, input.ProjectCode, input.ProjectName, description,
 		clientID, clientName, managerID, managerName,
 		startDate, endDate, input.Budget, 0.0,
 		billingType, input.HourlyRate, currency, priority, "planning", 0,

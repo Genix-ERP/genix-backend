@@ -63,6 +63,14 @@ func (h *Handler) ListGoodsReceipts(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -286,19 +294,26 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 		}
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	// Insert goods receipt
 	query := `
 		INSERT INTO goods_receipts (
-			id, tenant_id, gr_number, purchase_order_id, po_number,
+			id, tenant_id, organization_id, gr_number, purchase_order_id, po_number,
 			supplier_id, supplier_name, receipt_date, received_by,
 			warehouse_id, warehouse_name, status, quality_status,
 			delivery_note, vehicle_number, driver_name, notes,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`
 
 	fmt.Printf("Inserting GR: id=%s, warehouseID=%v, receivedBy=%s\n", grID, warehouseID, input.ReceivedBy)
 	_, err = h.db.Exec(query,
-		grID, tenantID, grNumber, poID, poNumber,
+		grID, tenantID, orgIDPtr, grNumber, poID, poNumber,
 		supplierID, supplierName, receiptDate, input.ReceivedBy,
 		warehouseID, input.WarehouseName, GRStatusPending, QualityStatusPending,
 		input.DeliveryNote, input.VehicleNumber, input.DriverName, input.Notes,

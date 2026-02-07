@@ -51,6 +51,14 @@ func (h *Handler) ListDropshipOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argIndex := 2
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += fmt.Sprintf(" AND d.organization_id = $%d", argIndex)
+		countQuery += fmt.Sprintf(" AND d.organization_id = $%d", argIndex)
+		args = append(args, orgID)
+		argIndex++
+	}
+
 	// Apply filters
 	if filter.Status != "" {
 		query += fmt.Sprintf(" AND d.status = $%d", argIndex)
@@ -234,6 +242,13 @@ func (h *Handler) CreateDropshipOrder(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Get organization ID from middleware header
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var input entity.CreateDropshipOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid input: "+err.Error())
@@ -328,15 +343,15 @@ func (h *Handler) CreateDropshipOrder(c *gin.Context) {
 
 	_, err = tx.Exec(`
 		INSERT INTO dropship_orders (
-			id, tenant_id, sales_order_id, sales_order_number,
+			id, tenant_id, organization_id, sales_order_id, sales_order_number,
 			vendor_id, vendor_name, customer_id, customer_name,
 			shipping_address, status, shipping_method,
 			subtotal, shipping_cost, total_cost, margin, margin_percent,
 			vendor_notes, internal_notes,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 	`,
-		orderID, tenantID, salesOrderID, so.OrderNumber,
+		orderID, tenantID, orgIDPtr, salesOrderID, so.OrderNumber,
 		vendorID, vendorName, so.CustomerID, so.CustomerName,
 		so.ShippingAddress, entity.DropshipStatusPending, input.ShippingMethod,
 		subtotal, 0, totalCost, margin, marginPercent,

@@ -162,6 +162,13 @@ func (h *Handler) ListBlanketOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND bo.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -586,6 +593,13 @@ func (h *Handler) CreateBlanketOrder(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Get organization ID from middleware header
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var input struct {
 		Title               string  `json:"title" binding:"required"`
 		Description         string  `json:"description"`
@@ -680,7 +694,7 @@ func (h *Handler) CreateBlanketOrder(c *gin.Context) {
 
 	_, err = tx.Exec(`
 		INSERT INTO blanket_orders (
-			id, tenant_id, blanket_number, title, description,
+			id, tenant_id, organization_id, blanket_number, title, description,
 			vendor_id, vendor_name, start_date, end_date,
 			agreement_type, total_value, currency,
 			payment_terms, delivery_terms, incoterms,
@@ -690,17 +704,17 @@ func (h *Handler) CreateBlanketOrder(c *gin.Context) {
 			auto_release, expiry_alert_days, notes,
 			created_by, created_at, updated_at
 		) VALUES (
-			$1, $2, $3, $4, $5,
-			$6, $7, $8, $9,
-			$10, $11, $12,
-			$13, $14, $15,
-			$16, $17, $18,
-			$19, $20,
-			$21, $22, $23,
-			$24, $25, $26,
-			$27, $28, $29
+			$1, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10,
+			$11, $12, $13,
+			$14, $15, $16,
+			$17, $18, $19,
+			$20, $21,
+			$22, $23, $24,
+			$25, $26, $27,
+			$28, $29, $30
 		)
-	`, orderID, tenantID, blanketNumber, input.Title, input.Description,
+	`, orderID, tenantID, orgIDPtr, blanketNumber, input.Title, input.Description,
 		vendorID, input.VendorName, input.StartDate, input.EndDate,
 		input.AgreementType, input.TotalValue, input.Currency,
 		input.PaymentTerms, input.DeliveryTerms, input.Incoterms,
@@ -1004,6 +1018,13 @@ func (h *Handler) CreateBlanketOrderRelease(c *gin.Context) {
 		return
 	}
 
+	// Get organization ID from middleware header
+	releaseOrgID, _ := middleware.GetOrganizationID(c)
+	var releaseOrgIDPtr *uuid.UUID
+	if releaseOrgID != uuid.Nil {
+		releaseOrgIDPtr = &releaseOrgID
+	}
+
 	// Check blanket order status
 	var status string
 	var vendorID sql.NullString
@@ -1077,12 +1098,12 @@ func (h *Handler) CreateBlanketOrderRelease(c *gin.Context) {
 
 	_, err = tx.Exec(`
 		INSERT INTO blanket_order_releases (
-			id, tenant_id, blanket_order_id, release_number,
+			id, tenant_id, organization_id, blanket_order_id, release_number,
 			release_date, expected_date, status,
 			shipping_method, notes,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-	`, releaseID, tenantID, blanketOrderID, releaseNumber,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`, releaseID, tenantID, releaseOrgIDPtr, blanketOrderID, releaseNumber,
 		input.ReleaseDate, input.ExpectedDate, "draft",
 		input.ShippingMethod, input.Notes,
 		userID, now, now)

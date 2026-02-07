@@ -72,6 +72,14 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if !includeInactive {
 		baseQuery += " AND p.is_active = true"
 		countQuery += " AND p.is_active = true"
@@ -341,20 +349,27 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		tagsJSON = []byte("[]")
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO products (
-			id, tenant_id, category_id, type, code, sku, barcode, name, description, short_description,
+			id, tenant_id, organization_id, category_id, type, code, sku, barcode, name, description, short_description,
 			unit_id, cost_price, list_price, min_price, currency_id,
 			is_stockable, track_inventory, min_stock_level, reorder_point, reorder_quantity,
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
 			can_be_expensed, can_be_rented, can_be_subcontracted, is_overhead_expense,
 			is_active, tags, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
 		RETURNING id
 	`
 
 	err = h.db.QueryRow(query,
-		id, tenantID, categoryID, input.Type, input.Code, sku, barcode, input.Name, description, shortDescription,
+		id, tenantID, orgIDPtr, categoryID, input.Type, input.Code, sku, barcode, input.Name, description, shortDescription,
 		unitID, input.CostPrice, input.ListPrice, input.MinPrice, currencyID,
 		isStockable, trackInventory, input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity,
 		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
@@ -729,6 +744,12 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 	`
 	args := []interface{}{tenantID}
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += fmt.Sprintf(" AND organization_id = $%d", len(args)+1)
+		args = append(args, orgID)
+	}
+
 	if !includeInactive {
 		query += " AND is_active = true"
 	}
@@ -809,10 +830,16 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 		return
 	}
 
-	// Check for duplicate code
+	// Check for duplicate code within same organization
+	orgID, _ := middleware.GetOrganizationID(c)
 	var exists bool
-	h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM product_categories WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
-		tenantID, input.Code).Scan(&exists)
+	if orgID != uuid.Nil {
+		h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM product_categories WHERE tenant_id = $1 AND organization_id = $2 AND code = $3 AND deleted_at IS NULL)",
+			tenantID, orgID, input.Code).Scan(&exists)
+	} else {
+		h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM product_categories WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
+			tenantID, input.Code).Scan(&exists)
+	}
 	if exists {
 		response.Conflict(c, "Category with this code already exists")
 		return
@@ -834,10 +861,15 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	_, err := h.db.Exec(`
-		INSERT INTO product_categories (id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`, id, tenantID, parentID, input.Code, input.Name, description, true, now, now)
+		INSERT INTO product_categories (id, tenant_id, organization_id, parent_id, code, name, description, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, id, tenantID, orgIDPtr, parentID, input.Code, input.Name, description, true, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create category", "error", err)

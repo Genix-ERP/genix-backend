@@ -72,6 +72,14 @@ func (h *Handler) ListInventory(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND i.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND i.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if productID != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND i.product_id = $%d", argCount)
@@ -295,6 +303,14 @@ func (h *Handler) GetInventorySummary(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if categoryID != "" {
 		argCount++
@@ -877,6 +893,14 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND t.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND t.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if productID != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND i.product_id = $%d", argCount)
@@ -1083,6 +1107,14 @@ func (h *Handler) GetInventoryValuation(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if warehouseID != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND i.warehouse_id = $%d", argCount)
@@ -1188,6 +1220,13 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND b.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND b.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if productID != "" {
 		argCount++
@@ -1408,6 +1447,12 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 	now := time.Now()
 	bomID := uuid.New()
 
+	// Get organization ID from middleware header
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	bomType := "manufacturing"
 	if input.BOMType != "" {
 		bomType = input.BOMType
@@ -1448,11 +1493,11 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 
 	_, err = tx.Exec(`
 		INSERT INTO product_boms (
-			id, tenant_id, code, name, product_id, bom_type, quantity, version,
+			id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
 			is_active, is_default, effective_date, expiry_date, notes,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, 1, true, $8, $9, $10, $11, $12, $13, $13)
-	`, bomID, tenantID, input.Code, input.Name, productID, bomType, quantity,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $14)
+	`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
 		input.IsDefault, effectiveDate, expiryDate, notes, userID, now)
 
 	if err != nil {
@@ -1917,6 +1962,14 @@ func (h *Handler) ListScrapOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND s.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND s.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND s.status = $%d", argCount)
@@ -2136,13 +2189,20 @@ func (h *Handler) CreateScrapOrder(c *gin.Context) {
 
 	totalCost := input.Quantity * input.UnitCost
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	_, err = h.db.Exec(`
 		INSERT INTO scrap_orders (
-			id, tenant_id, scrap_number, product_id, warehouse_id, location_id, lot_id,
+			id, tenant_id, organization_id, scrap_number, product_id, warehouse_id, location_id, lot_id,
 			quantity, unit_cost, total_cost, scrap_reason_id, reason, reason_notes,
 			scrap_date, status, scrapped_by, notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'draft', $15, $16, $17, $17)
-	`, id, tenantID, scrapNumber, productID, warehouseID, locationID, lotID,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'draft', $16, $17, $18, $18)
+	`, id, tenantID, orgIDPtr, scrapNumber, productID, warehouseID, locationID, lotID,
 		input.Quantity, input.UnitCost, totalCost, scrapReasonID, reason, reasonNotes,
 		scrapDate, userID, notes, now)
 
@@ -2398,6 +2458,14 @@ func (h *Handler) ListReorderRules(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND r.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND r.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if productID != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND r.product_id = $%d", argCount)
@@ -2621,13 +2689,20 @@ func (h *Handler) CreateReorderRule(c *gin.Context) {
 		notes = &input.Notes
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	_, err = h.db.Exec(`
 		INSERT INTO reorder_rules (
-			id, tenant_id, product_id, warehouse_id, min_qty, max_qty, reorder_qty,
+			id, tenant_id, organization_id, product_id, warehouse_id, min_qty, max_qty, reorder_qty,
 			trigger_type, preferred_vendor_id, lead_time_days, safety_stock,
 			auto_create_po, is_active, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, true, $13, $14, $15, $15)
-	`, id, tenantID, productID, warehouseID, input.MinQty, maxQty, input.ReorderQty,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true, $14, $15, $16, $16)
+	`, id, tenantID, orgIDPtr, productID, warehouseID, input.MinQty, maxQty, input.ReorderQty,
 		triggerType, vendorID, input.LeadTimeDays, input.SafetyStock,
 		input.AutoCreatePO, notes, userID, now)
 
@@ -2777,7 +2852,7 @@ func (h *Handler) GetReorderAlerts(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	alertQuery := `
 		SELECT r.id, r.product_id, r.warehouse_id, r.min_qty, r.reorder_qty,
 			   r.preferred_vendor_id, r.lead_time_days,
 			   p.code as product_code, p.name as product_name,
@@ -2790,11 +2865,19 @@ func (h *Handler) GetReorderAlerts(c *gin.Context) {
 		LEFT JOIN contacts ct ON r.preferred_vendor_id = ct.id
 		LEFT JOIN inventory i ON r.product_id = i.product_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
 		WHERE r.tenant_id = $1 AND r.is_active = true
+	`
+	alertArgs := []interface{}{tenantID}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		alertQuery += " AND r.organization_id = $2"
+		alertArgs = append(alertArgs, orgID)
+	}
+	alertQuery += `
 		GROUP BY r.id, r.product_id, r.warehouse_id, r.min_qty, r.reorder_qty,
 				 r.preferred_vendor_id, r.lead_time_days, p.code, p.name, w.name, ct.name
 		HAVING COALESCE(SUM(i.quantity_available), 0) <= r.min_qty
 		ORDER BY COALESCE(SUM(i.quantity_available), 0) / NULLIF(r.min_qty, 0) ASC
-	`, tenantID)
+	`
+	rows, err := h.db.Query(alertQuery, alertArgs...)
 
 	if err != nil {
 		h.log.Error("Failed to get reorder alerts", "error", err)

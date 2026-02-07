@@ -102,6 +102,13 @@ func (h *Handler) ListExpenses(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND e.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" && status != "all" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND e.status = $%d", argCount)
@@ -231,6 +238,12 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 
 	totalAmount := input.Amount + input.TaxAmount
 
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	id := uuid.New()
 	now := time.Now()
 
@@ -258,11 +271,11 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 
 	query := `
 		INSERT INTO expenses (
-			id, tenant_id, expense_number, category_id, category_name, employee_id, employee_name,
+			id, tenant_id, organization_id, expense_number, category_id, category_name, employee_id, employee_name,
 			vendor_id, vendor_name, expense_date, description, amount, tax_amount,
 			total_amount, currency, payment_method, reference, receipt_url, status,
 			reimbursable, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 		RETURNING id
 	`
 
@@ -290,7 +303,7 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 	}
 
 	if err := h.db.QueryRow(query,
-		id, tenantID, expenseNumber, categoryID, categoryName, employeeID, employeeName,
+		id, tenantID, orgIDPtr, expenseNumber, categoryID, categoryName, employeeID, employeeName,
 		vendorID, vendorName, expenseDate, input.Description, input.Amount, input.TaxAmount,
 		totalAmount, currency, paymentMethod, reference, receiptURL, "pending",
 		input.Reimbursable, notes, userID, now, now,

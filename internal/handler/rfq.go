@@ -54,6 +54,14 @@ func (h *Handler) ListRFQs(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND r.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND r.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND r.status = $%d", argCount)
@@ -196,13 +204,20 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 	// issue_date is the date RFQ was created, deadline is the response deadline
 	issueDate := now.Format("2006-01-02")
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
-		INSERT INTO rfqs (id, tenant_id, rfq_number, title, description, status, issue_date, deadline, terms, notes, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		INSERT INTO rfqs (id, tenant_id, organization_id, rfq_number, title, description, status, issue_date, deadline, terms, notes, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`
 
 	_, err = tx.Exec(query,
-		id, tenantID, rfqNumber, input.Title, description, entity.RFQStatusDraft, issueDate, deadline, terms, notes, userID, now, now,
+		id, tenantID, orgIDPtr, rfqNumber, input.Title, description, entity.RFQStatusDraft, issueDate, deadline, terms, notes, userID, now, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to insert RFQ", "error", err)

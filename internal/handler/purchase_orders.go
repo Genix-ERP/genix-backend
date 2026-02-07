@@ -60,6 +60,14 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND po.status = $%d", argCount)
@@ -301,6 +309,13 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		internalNotes = &input.InternalNotes
 	}
 
+	// Get organization ID
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	// Start transaction
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -313,17 +328,17 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	// Insert purchase order
 	query := `
 		INSERT INTO purchase_orders (
-			id, tenant_id, order_number, vendor_id, contact_person_id,
+			id, tenant_id, organization_id, order_number, vendor_id, contact_person_id,
 			order_date, expected_date, currency_id, exchange_rate,
 			subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
 			status, payment_status, payment_terms, vendor_reference,
 			notes, internal_notes, warehouse_id, requested_by,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 	`
 
 	_, err = tx.Exec(query,
-		id, tenantID, orderNumber, vendorID, contactPersonID,
+		id, tenantID, orgIDPtr, orderNumber, vendorID, contactPersonID,
 		orderDate, expectedDate, currencyID, exchangeRate,
 		subtotal, discountTotal, taxTotal, input.ShippingAmount, totalAmount,
 		entity.POStatusDraft, entity.PaymentStatusUnpaid, paymentTerms, vendorReference,
