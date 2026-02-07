@@ -63,6 +63,14 @@ func (h *Handler) ListPurchaseRequisitions(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -255,16 +263,23 @@ func (h *Handler) CreatePurchaseRequisition(c *gin.Context) {
 		createdBy = &userID
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	// Insert requisition
 	query := `
 		INSERT INTO purchase_requisitions (
-			id, tenant_id, pr_number, requested_by, department, request_date,
+			id, tenant_id, organization_id, pr_number, requested_by, department, request_date,
 			required_date, status, priority, total_amount, purpose, notes,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`
 
 	_, err := h.db.Exec(query,
-		prID, tenantID, prNumber, input.RequestedBy, input.Department, requestDate,
+		prID, tenantID, orgIDPtr, prNumber, input.RequestedBy, input.Department, requestDate,
 		requiredDate, PRStatusDraft, priority, totalAmount, input.Purpose, input.Notes,
 		createdBy, now, now,
 	)

@@ -50,6 +50,14 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND so.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND so.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -429,6 +437,11 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		parsed, parseErr := uuid.Parse(input.OrganizationID)
 		if parseErr == nil {
 			orgID = &parsed
+		}
+	}
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
 		}
 	}
 

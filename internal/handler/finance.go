@@ -116,8 +116,13 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
-	// Filter by organization_id if provided
-	if organizationID != "" {
+	// Filter by organization - prefer middleware header, fallback to query param
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND a.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND a.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	} else if organizationID != "" {
 		orgID, err := uuid.Parse(organizationID)
 		if err == nil {
 			argCount++
@@ -232,6 +237,13 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 		return
 	}
 
+	// Get organization ID
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	// Validate account type exists
 	accountTypeID, err := uuid.Parse(input.AccountTypeID)
 	if err != nil {
@@ -246,11 +258,11 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 		return
 	}
 
-	// Check for duplicate code
+	// Check for duplicate code (org-scoped)
 	var codeExists bool
 	err = h.db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM accounts WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
-		tenantID, input.Code,
+		"SELECT EXISTS(SELECT 1 FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code = $3 AND deleted_at IS NULL)",
+		tenantID, orgIDPtr, input.Code,
 	).Scan(&codeExists)
 	if err != nil {
 		h.log.Error("Failed to check account code", "error", err)
@@ -278,10 +290,10 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 
 	query := `
 		INSERT INTO accounts (
-			id, tenant_id, parent_id, account_type_id, code, name, description,
+			id, tenant_id, organization_id, parent_id, account_type_id, code, name, description,
 			is_bank_account, is_control_account, is_reconcilable, budget_tracking,
 			opening_balance, current_balance, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		RETURNING id
 	`
 
@@ -291,7 +303,7 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 	}
 
 	err = h.db.QueryRow(query,
-		id, tenantID, parentID, accountTypeID, input.Code, input.Name, description,
+		id, tenantID, orgIDPtr, parentID, accountTypeID, input.Code, input.Name, description,
 		input.IsBankAccount, input.IsControlAccount, input.IsReconcilable, input.BudgetTracking,
 		input.OpeningBalance, input.OpeningBalance, true, now, now,
 	).Scan(&id)
@@ -702,6 +714,14 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND je.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND je.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if journalID != "" {
 		argCount++
@@ -1240,6 +1260,12 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		parsed, parseErr := uuid.Parse(input.OrganizationID)
 		if parseErr == nil {
 			orgID = &parsed
+		}
+	}
+	// Fallback to middleware header if not provided in body
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
 		}
 	}
 
@@ -1830,6 +1856,14 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if paymentType != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND p.type = $%d", argCount)
@@ -1925,6 +1959,11 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
 
 	var input entity.CreatePaymentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -1982,13 +2021,13 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 
 	query := `
 		INSERT INTO payments (
-			id, tenant_id, payment_number, type, contact_id, payment_date, amount,
+			id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
 			exchange_rate, reference, notes, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
 
 	_, err = h.db.Exec(query,
-		id, tenantID, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
+		id, tenantID, orgIDPtr, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
 		exchangeRate, reference, notes, "draft", userID, now, now)
 
 	if err != nil {
@@ -3007,6 +3046,13 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argIndex := 2
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += fmt.Sprintf(" AND organization_id = $%d", argIndex)
+		args = append(args, orgID)
+		argIndex++
+	}
+
 	if filter.Search != "" {
 		query += fmt.Sprintf(" AND (COALESCE(name, bank_name) ILIKE $%d OR bank_name ILIKE $%d OR account_number ILIKE $%d)", argIndex, argIndex, argIndex)
 		args = append(args, "%"+filter.Search+"%")
@@ -3183,6 +3229,12 @@ func (h *Handler) CreateBankAccount(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	// Get organization ID from middleware header
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var accountID *uuid.UUID
 	if input.AccountID != nil && *input.AccountID != "" {
 		accID, err := uuid.Parse(*input.AccountID)
@@ -3192,10 +3244,10 @@ func (h *Handler) CreateBankAccount(c *gin.Context) {
 	}
 
 	_, err = h.db.Exec(`
-		INSERT INTO bank_accounts (id, tenant_id, name, bank_name, account_number, currency,
+		INSERT INTO bank_accounts (id, tenant_id, organization_id, name, bank_name, account_number, currency,
 		                           account_type, balance, is_active, account_id, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $10)
-	`, id, tenantID, input.Name, input.BankName, input.AccountNumber, input.Currency,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $11)
+	`, id, tenantID, orgIDPtr, input.Name, input.BankName, input.AccountNumber, input.Currency,
 		input.AccountType, input.Balance, accountID, now)
 
 	if err != nil {
@@ -3417,6 +3469,13 @@ func (h *Handler) ListBankTransactions(c *gin.Context) {
 	args := []interface{}{tenantID, bankAccountID}
 	argIndex := 3
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += fmt.Sprintf(" AND organization_id = $%d", argIndex)
+		args = append(args, orgID)
+		argIndex++
+	}
+
 	if filter.Search != "" {
 		query += fmt.Sprintf(" AND (reference ILIKE $%d OR description ILIKE $%d)", argIndex, argIndex)
 		args = append(args, "%"+filter.Search+"%")
@@ -3532,11 +3591,17 @@ func (h *Handler) CreateBankTransaction(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	// Get organization ID from middleware header
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	_, err = h.db.Exec(`
-		INSERT INTO bank_transactions (id, tenant_id, bank_account_id, transaction_date, reference,
+		INSERT INTO bank_transactions (id, tenant_id, organization_id, bank_account_id, transaction_date, reference,
 		                               description, amount, transaction_type, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'unmatched', $9, $9)
-	`, id, tenantID, bankAccountID, transactionDate, input.Reference, input.Description,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'unmatched', $10, $10)
+	`, id, tenantID, orgIDPtr, bankAccountID, transactionDate, input.Reference, input.Description,
 		input.Amount, input.Type, now)
 
 	if err != nil {
@@ -3744,13 +3809,19 @@ func (h *Handler) CreateBankReconciliation(c *gin.Context) {
 			bankAccountID, tenantID).Scan(&bookBalance)
 	}
 
+	// Get organization ID from middleware header
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	// Create reconciliation
 	var reconciliationID uuid.UUID
 	err = h.db.QueryRow(`
-		INSERT INTO bank_reconciliations (tenant_id, bank_account_id, statement_date, statement_ending_balance, book_balance, status, notes)
-		VALUES ($1, $2, $3, $4, $5, 'draft', $6)
+		INSERT INTO bank_reconciliations (tenant_id, organization_id, bank_account_id, statement_date, statement_ending_balance, book_balance, status, notes)
+		VALUES ($1, $2, $3, $4, $5, $6, 'draft', $7)
 		RETURNING id
-	`, tenantID, bankAccountID, input.StatementDate, input.StatementEndingBalance, bookBalance, input.Notes).Scan(&reconciliationID)
+	`, tenantID, orgIDPtr, bankAccountID, input.StatementDate, input.StatementEndingBalance, bookBalance, input.Notes).Scan(&reconciliationID)
 
 	if err != nil {
 		h.log.Error("Failed to create bank reconciliation", "error", err)
@@ -4294,6 +4365,13 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argIndex := 2
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += fmt.Sprintf(" AND organization_id = $%d", argIndex)
+		args = append(args, orgID)
+		argIndex++
+	}
+
 	if filter.Search != "" {
 		query += fmt.Sprintf(" AND (description ILIKE $%d OR reference ILIKE $%d OR cashier ILIKE $%d)", argIndex, argIndex, argIndex)
 		args = append(args, "%"+filter.Search+"%")
@@ -4417,6 +4495,12 @@ func (h *Handler) CreateCashTransaction(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	// Get organization ID from middleware header
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	// Generate transaction number
 	var count int
 	h.db.QueryRow(`SELECT COUNT(*) FROM cash_transactions WHERE tenant_id = $1`, tenantID).Scan(&count)
@@ -4429,10 +4513,10 @@ func (h *Handler) CreateCashTransaction(c *gin.Context) {
 	}
 
 	_, err = h.db.Exec(`
-		INSERT INTO cash_transactions (id, tenant_id, transaction_number, transaction_date, transaction_type,
+		INSERT INTO cash_transactions (id, tenant_id, organization_id, transaction_number, transaction_date, transaction_type,
 		                               amount, currency, description, category, reference, cashier, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'posted', $12, $12)
-	`, id, tenantID, transactionNumber, transactionDate, input.Type, input.Amount, currency,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $13)
+	`, id, tenantID, orgIDPtr, transactionNumber, transactionDate, input.Type, input.Amount, currency,
 		input.Description, input.Category, input.Reference, input.Cashier, now)
 
 	if err != nil {
@@ -4623,10 +4707,18 @@ func (h *Handler) ListFiscalYears(c *gin.Context) {
 		SELECT id, tenant_id, organization_id, code, name, start_date, end_date, status, created_at, updated_at
 		FROM fiscal_years
 		WHERE tenant_id = $1
-		ORDER BY start_date DESC
 	`
 
-	rows, err := h.db.Query(query, tenantID)
+	args := []interface{}{tenantID}
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND organization_id = $2"
+		args = append(args, orgID)
+	}
+
+	query += " ORDER BY start_date DESC"
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list fiscal years", "error", err)
 		response.InternalError(c, "Failed to list fiscal years")
@@ -4801,6 +4893,12 @@ func (h *Handler) CreateFiscalYear(c *gin.Context) {
 	if input.OrganizationID != nil && *input.OrganizationID != "" {
 		oid, _ := uuid.Parse(*input.OrganizationID)
 		orgID = &oid
+	}
+	// Fallback to middleware header if not provided in body
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
+		}
 	}
 
 	// Use code from input or generate from name
@@ -5368,14 +5466,26 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 	query := `
 		SELECT b.id, b.tenant_id, b.organization_id, b.fiscal_year_id, b.code, b.name, b.description,
 		       b.budget_type, b.total_amount, b.status, b.approved_by, b.approved_at,
-		       b.created_by, b.created_at, b.updated_at
+		       b.created_by, b.created_at, b.updated_at,
+		       fy.start_date, fy.end_date
 		FROM budgets b
+		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
 		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
 	`
 
 	args := []interface{}{tenantID}
+	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND b.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if fiscalYearID != "" {
-		query += " AND b.fiscal_year_id = $2"
+		argCount++
+		query += fmt.Sprintf(" AND b.fiscal_year_id = $%d", argCount)
 		args = append(args, fiscalYearID)
 	}
 
@@ -5394,11 +5504,13 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		var b entity.Budget
 		var orgID, desc, approvedBy, createdBy sql.NullString
 		var approvedAt sql.NullTime
+		var startDate, endDate sql.NullString
 
 		err := rows.Scan(
 			&b.ID, &b.TenantID, &orgID, &b.FiscalYearID, &b.Code, &b.Name, &desc,
 			&b.BudgetType, &b.TotalAmount, &b.Status, &approvedBy, &approvedAt,
 			&createdBy, &b.CreatedAt, &b.UpdatedAt,
+			&startDate, &endDate,
 		)
 		if err != nil {
 			continue
@@ -5421,6 +5533,12 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		if createdBy.Valid {
 			cid, _ := uuid.Parse(createdBy.String)
 			b.CreatedBy = &cid
+		}
+		if startDate.Valid {
+			b.StartDate = &startDate.String
+		}
+		if endDate.Valid {
+			b.EndDate = &endDate.String
 		}
 
 		budgets = append(budgets, &b)
@@ -5554,6 +5672,12 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 	if input.OrganizationID != nil && *input.OrganizationID != "" {
 		oid, _ := uuid.Parse(*input.OrganizationID)
 		orgID = &oid
+	}
+	// Fallback to middleware header if not provided in body
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
+		}
 	}
 
 	fiscalYearID, err := uuid.Parse(input.FiscalYearID)
@@ -6078,10 +6202,18 @@ func (h *Handler) ListRecurringJournalTemplates(c *gin.Context) {
 		FROM recurring_journal_templates rjt
 		JOIN journals j ON rjt.journal_id = j.id
 		WHERE rjt.tenant_id = $1 AND rjt.deleted_at IS NULL
-		ORDER BY rjt.name
 	`
 
-	rows, err := h.db.Query(query, tenantID)
+	args := []interface{}{tenantID}
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND rjt.organization_id = $2"
+		args = append(args, orgID)
+	}
+
+	query += " ORDER BY rjt.name"
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list recurring journal templates", "error", err)
 		response.InternalError(c, "Failed to list templates")

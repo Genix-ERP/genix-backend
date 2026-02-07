@@ -17,11 +17,12 @@ import (
 
 // Context keys
 const (
-	ContextKeyRequestID = "request_id"
-	ContextKeyTenantID  = "tenant_id"
-	ContextKeyUserID    = "user_id"
-	ContextKeyUser      = "user"
-	ContextKeyClaims    = "claims"
+	ContextKeyRequestID      = "request_id"
+	ContextKeyTenantID       = "tenant_id"
+	ContextKeyOrganizationID = "organization_id"
+	ContextKeyUserID         = "user_id"
+	ContextKeyUser           = "user"
+	ContextKeyClaims         = "claims"
 )
 
 // RequestID middleware adds a unique request ID to each request
@@ -288,6 +289,19 @@ func TenantResolver() gin.HandlerFunc {
 	}
 }
 
+// OrganizationResolver middleware resolves organization from header
+func OrganizationResolver() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		orgID := c.GetHeader("X-Organization-ID")
+		if orgID != "" {
+			if _, err := uuid.Parse(orgID); err == nil {
+				c.Set(ContextKeyOrganizationID, orgID)
+			}
+		}
+		c.Next()
+	}
+}
+
 // RequireTenant middleware ensures a tenant is resolved
 func RequireTenant() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -365,6 +379,18 @@ func GetUserID(c *gin.Context) (uuid.UUID, bool) {
 // GetTenantID retrieves tenant ID from context
 func GetTenantID(c *gin.Context) (uuid.UUID, bool) {
 	if id, exists := c.Get(ContextKeyTenantID); exists {
+		if strID, ok := id.(string); ok {
+			if parsed, err := uuid.Parse(strID); err == nil {
+				return parsed, true
+			}
+		}
+	}
+	return uuid.UUID{}, false
+}
+
+// GetOrganizationID retrieves organization ID from context
+func GetOrganizationID(c *gin.Context) (uuid.UUID, bool) {
+	if id, exists := c.Get(ContextKeyOrganizationID); exists {
 		if strID, ok := id.(string); ok {
 			if parsed, err := uuid.Parse(strID); err == nil {
 				return parsed, true

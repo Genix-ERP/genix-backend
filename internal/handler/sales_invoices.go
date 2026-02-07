@@ -51,6 +51,14 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND si.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND si.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -314,6 +322,12 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	if input.OrganizationID != "" {
 		id, _ := uuid.Parse(input.OrganizationID)
 		orgID = &id
+	}
+	// Fallback to middleware header if not provided in body
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
+		}
 	}
 	if input.SalesOrderID != "" {
 		id, _ := uuid.Parse(input.SalesOrderID)
@@ -1205,11 +1219,11 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			paymentID := uuid.New()
 			_, err = tx.Exec(`
 				INSERT INTO payments (
-					id, tenant_id, type, payment_number, contact_id, payment_date, amount,
+					id, tenant_id, organization_id, type, payment_number, contact_id, payment_date, amount,
 					currency_id, exchange_rate, reference, notes, status, journal_entry_id,
 					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-				paymentID, tenantID, "receipt", fmt.Sprintf("REC-%s", entryNumber), customerID, paymentDate, input.Amount,
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+				paymentID, tenantID, organizationID, "receipt", fmt.Sprintf("REC-%s", entryNumber), customerID, paymentDate, input.Amount,
 				nil, 1.0, input.Reference, input.Notes, "confirmed", journalEntryID,
 				userID, now, now,
 			)

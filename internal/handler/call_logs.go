@@ -66,6 +66,14 @@ func (h *Handler) ListCallLogs(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND cl.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND cl.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if contactID != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND cl.contact_id = $%d", argCount)
@@ -598,6 +606,13 @@ func (h *Handler) GetCallLogStats(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
 
 	if dateFrom != "" {
 		if t, err := time.Parse(time.RFC3339, dateFrom); err == nil {

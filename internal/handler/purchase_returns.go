@@ -59,6 +59,14 @@ func (h *Handler) ListPurchaseReturns(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -216,6 +224,13 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 		return
 	}
 
+	// Get organization ID from middleware header
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var input struct {
 		SupplierID        string `json:"supplier_id" binding:"required"`
 		PurchaseOrderID   string `json:"purchase_order_id,omitempty"`
@@ -304,14 +319,14 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 	// Insert purchase return
 	query := `
 		INSERT INTO purchase_returns (
-			id, tenant_id, return_number, purchase_order_id, po_number,
+			id, tenant_id, organization_id, return_number, purchase_order_id, po_number,
 			goods_receipt_id, gr_number, supplier_id, supplier_name,
 			return_date, requested_by, status, return_reason, reason_description,
 			shipping_method, notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
 
 	_, err = h.db.Exec(query,
-		returnID, tenantID, returnNumber, poID, poNumber,
+		returnID, tenantID, orgIDPtr, returnNumber, poID, poNumber,
 		grID, grNumber, supplierID, supplierName,
 		returnDate, input.RequestedBy, ReturnStatusDraft, input.ReturnReason, input.ReasonDescription,
 		input.ShippingMethod, input.Notes, now, now,

@@ -70,6 +70,14 @@ func (h *Handler) ListOpportunities(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND o.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND o.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if !includeClosed {
 		baseQuery += " AND o.stage NOT IN ('closed_won', 'closed_lost')"
 		countQuery += " AND o.stage NOT IN ('closed_won', 'closed_lost')"
@@ -363,19 +371,26 @@ func (h *Handler) CreateOpportunity(c *gin.Context) {
 		nextStep = &input.NextStep
 	}
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO opportunities (
-			id, tenant_id, name, code, contact_id, lead_id,
+			id, tenant_id, organization_id, name, code, contact_id, lead_id,
 			stage_id, stage, probability, expected_revenue,
 			currency, expected_close_date, source, priority,
 			assigned_to, description, next_step, next_step_date,
 			tags, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
-		id, tenantID, input.Name, code, contactID, leadID,
+		id, tenantID, orgIDPtr, input.Name, code, contactID, leadID,
 		stageID, stage, input.Probability, input.ExpectedRevenue,
 		currency, expectedCloseDate, source, priority,
 		assignedTo, description, nextStep, nextStepDate,

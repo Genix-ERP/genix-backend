@@ -46,6 +46,14 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND sdo.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
@@ -189,6 +197,13 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Get organization ID from middleware header
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	var input struct {
 		SalesOrderID   string `json:"sales_order_id" binding:"required"`
 		DeliveryDate   string `json:"delivery_date"`
@@ -267,11 +282,11 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 
 	query := `
 		INSERT INTO sales_delivery_orders (
-			id, tenant_id, delivery_number, sales_order_id, so_number,
+			id, tenant_id, organization_id, delivery_number, sales_order_id, so_number,
 			customer_id, customer_name, delivery_date, scheduled_date,
 			warehouse_id, shipping_method, carrier, notes,
 			status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'draft', $14, $15, $15)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'draft', $15, $16, $16)`
 
 	var customerIDVal interface{}
 	if soCustomerID.Valid {
@@ -293,7 +308,7 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 	}
 
 	_, err = h.db.Exec(query,
-		doID, tenantID, deliveryNumber, salesOrderID, soNumber,
+		doID, tenantID, orgIDPtr, deliveryNumber, salesOrderID, soNumber,
 		customerIDVal, soCustomerName.String, deliveryDate, scheduledDateVal,
 		warehouseIDVal, input.ShippingMethod, input.Carrier, input.Notes,
 		createdBy, now,
@@ -322,6 +337,7 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 	}
 
 	// Return created delivery order
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: doID.String()})
 	h.GetDeliveryOrder(c)
 }
 

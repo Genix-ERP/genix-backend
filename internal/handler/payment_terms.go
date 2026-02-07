@@ -270,7 +270,7 @@ func (h *Handler) DeletePaymentTerm(c *gin.Context) {
 		FROM (
 			SELECT id FROM sales_orders WHERE payment_term_id = $1
 			UNION ALL
-			SELECT id FROM invoices WHERE payment_term_id = $1
+			SELECT id FROM sales_invoices WHERE payment_term_id = $1
 			UNION ALL
 			SELECT id FROM contacts WHERE payment_term_id = $1
 			UNION ALL
@@ -440,7 +440,7 @@ func (h *Handler) GetPaymentTermStats(c *gin.Context) {
 			(SELECT COUNT(*) FROM payment_terms WHERE tenant_id = $1 AND is_active = true) as active_terms,
 			(SELECT COUNT(DISTINCT pt.id) FROM payment_terms pt
 			 LEFT JOIN sales_orders so ON so.payment_term_id = pt.id
-			 LEFT JOIN invoices i ON i.payment_term_id = pt.id
+			 LEFT JOIN sales_invoices i ON i.payment_term_id = pt.id
 			 WHERE pt.tenant_id = $1 AND (so.id IS NOT NULL OR i.id IS NOT NULL)) as terms_with_orders
 	`, tenantID).Scan(&stats.TotalTerms, &stats.ActiveTerms, &stats.TermsWithOrders)
 	if err != nil {

@@ -357,33 +357,35 @@ func (h *Handler) ListProductVariants(c *gin.Context) {
 
 	productID := c.Query("product_id")
 
+	baseQuery := `
+		SELECT pv.id, pv.tenant_id, pv.product_id, p.name as product_name,
+			   pv.sku, pv.barcode, pv.internal_reference, pv.cost_price, pv.list_price,
+			   pv.weight, pv.volume, pv.is_active, pv.variant_name, pv.display_name,
+			   pv.created_at, pv.updated_at,
+			   COALESCE((SELECT SUM(i.quantity_on_hand) FROM inventory i WHERE i.variant_id = pv.id), 0) as stock_qty
+		FROM product_variants pv
+		JOIN products p ON p.id = pv.product_id
+		WHERE pv.tenant_id = $1 AND pv.deleted_at IS NULL
+	`
+	args := []interface{}{tenantID}
+
+	// Filter by organization via products table
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		args = append(args, orgID)
+		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", len(args))
+	}
+
+	if productID != "" {
+		args = append(args, productID)
+		baseQuery += fmt.Sprintf(" AND pv.product_id = $%d", len(args))
+		baseQuery += " ORDER BY pv.variant_name"
+	} else {
+		baseQuery += " ORDER BY p.name, pv.variant_name"
+	}
+
 	var rows *sql.Rows
 	var err error
-	if productID != "" {
-		rows, err = h.db.Query(`
-			SELECT pv.id, pv.tenant_id, pv.product_id, p.name as product_name,
-				   pv.sku, pv.barcode, pv.internal_reference, pv.cost_price, pv.list_price,
-				   pv.weight, pv.volume, pv.is_active, pv.variant_name, pv.display_name,
-				   pv.created_at, pv.updated_at,
-				   COALESCE((SELECT SUM(i.quantity_on_hand) FROM inventory i WHERE i.variant_id = pv.id), 0) as stock_qty
-			FROM product_variants pv
-			JOIN products p ON p.id = pv.product_id
-			WHERE pv.tenant_id = $1 AND pv.product_id = $2 AND pv.deleted_at IS NULL
-			ORDER BY pv.variant_name
-		`, tenantID, productID)
-	} else {
-		rows, err = h.db.Query(`
-			SELECT pv.id, pv.tenant_id, pv.product_id, p.name as product_name,
-				   pv.sku, pv.barcode, pv.internal_reference, pv.cost_price, pv.list_price,
-				   pv.weight, pv.volume, pv.is_active, pv.variant_name, pv.display_name,
-				   pv.created_at, pv.updated_at,
-				   COALESCE((SELECT SUM(i.quantity_on_hand) FROM inventory i WHERE i.variant_id = pv.id), 0) as stock_qty
-			FROM product_variants pv
-			JOIN products p ON p.id = pv.product_id
-			WHERE pv.tenant_id = $1 AND pv.deleted_at IS NULL
-			ORDER BY p.name, pv.variant_name
-		`, tenantID)
-	}
+	rows, err = h.db.Query(baseQuery, args...)
 	if err != nil {
 		response.InternalError(c, "Failed to fetch product variants")
 		return

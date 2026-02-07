@@ -61,6 +61,14 @@ func (h *Handler) ListLeads(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND l.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND l.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND l.status = $%d", argCount)
@@ -217,6 +225,13 @@ func (h *Handler) CreateLead(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	// Get organization ID
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	// Set defaults
 	status := entity.LeadStatusNew
 	if input.Status != "" {
@@ -242,16 +257,16 @@ func (h *Handler) CreateLead(c *gin.Context) {
 
 	query := `
 		INSERT INTO leads (
-			id, tenant_id, contact_name, company_name,
+			id, tenant_id, organization_id, contact_name, company_name,
 			email, phone, status, source, notes,
 			expected_value, assigned_to,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
-		id, tenantID, input.ContactName, companyName,
+		id, tenantID, orgIDPtr, input.ContactName, companyName,
 		input.Email, phone, status, source, notes,
 		input.ExpectedValue, assignedTo,
 		userID, now, now,
@@ -545,8 +560,14 @@ func (h *Handler) GetLeadStats(c *gin.Context) {
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 	`
 
+	args := []interface{}{tenantID}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		query += " AND organization_id = $2"
+		args = append(args, orgID)
+	}
+
 	var stats entity.LeadStats
-	err := h.db.QueryRow(query, tenantID).Scan(
+	err := h.db.QueryRow(query, args...).Scan(
 		&stats.TotalLeads,
 		&stats.NewLeads,
 		&stats.ContactedLeads,
@@ -637,6 +658,14 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 	}
 
 	now := time.Now()
+
+	// Get organization ID
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	result := map[string]interface{}{
 		"lead_id": id,
 		"message": "Lead converted successfully",
@@ -673,9 +702,9 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 
 		contactQuery := `
 			INSERT INTO contacts (
-				id, tenant_id, type, code, name, email, phone,
+				id, tenant_id, organization_id, type, code, name, email, phone,
 				is_active, created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9, $10)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11)
 			RETURNING id
 		`
 
@@ -685,7 +714,7 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 		}
 
 		err = tx.QueryRow(contactQuery,
-			newContactID, tenantID, contactType, contactCode, contactName,
+			newContactID, tenantID, orgIDPtr, contactType, contactCode, contactName,
 			lead.Email, phone, userID, now, now,
 		).Scan(&newContactID)
 
@@ -754,16 +783,16 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 
 		oppQuery := `
 			INSERT INTO opportunities (
-				id, tenant_id, name, code, contact_id, lead_id,
+				id, tenant_id, organization_id, name, code, contact_id, lead_id,
 				stage, probability, expected_revenue, currency,
 				expected_close_date, source, priority, assigned_to,
 				tags, created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 			RETURNING id
 		`
 
 		err = tx.QueryRow(oppQuery,
-			newOpportunityID, tenantID, oppName, oppCode, contactID, id,
+			newOpportunityID, tenantID, orgIDPtr, oppName, oppCode, contactID, id,
 			"qualification", 10.0, expectedRevenue, "USD",
 			expectedCloseDate, "lead_conversion", "medium", assignedTo,
 			[]byte("[]"), userID, now, now,
