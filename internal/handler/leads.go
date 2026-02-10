@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -197,6 +198,220 @@ func (h *Handler) ListLeads(c *gin.Context) {
 	response.SuccessWithPagination(c, leads, pagination)
 }
 
+// getDuplicateDetectionSettings reads CRM duplicate detection settings from tenant_settings
+func (h *Handler) getDuplicateDetectionSettings(tenantID uuid.UUID) (enabled bool, checkFields []string) {
+	var settingsJSON []byte
+	err := h.db.QueryRow("SELECT settings FROM tenant_settings WHERE tenant_id = $1", tenantID).Scan(&settingsJSON)
+	if err != nil {
+		return false, nil
+	}
+
+	var settings map[string]interface{}
+	if err := json.Unmarshal(settingsJSON, &settings); err != nil {
+		return false, nil
+	}
+
+	crm, ok := settings["crm"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+
+	dd, ok := crm["duplicate_detection"].(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+
+	isEnabled, _ := dd["enabled"].(bool)
+	if !isEnabled {
+		return false, nil
+	}
+
+	fields, ok := dd["check_fields"].([]interface{})
+	if !ok || len(fields) == 0 {
+		return true, []string{"email", "phone"}
+	}
+
+	var result []string
+	for _, f := range fields {
+		if s, ok := f.(string); ok {
+			result = append(result, s)
+		}
+	}
+	return true, result
+}
+
+// checkLeadDuplicates checks for duplicate leads based on configured fields
+func (h *Handler) checkLeadDuplicates(tenantID uuid.UUID, email, phone, companyName string, checkFields []string) []map[string]interface{} {
+	var conditions []string
+	var args []interface{}
+	args = append(args, tenantID)
+	argIdx := 1
+
+	for _, field := range checkFields {
+		switch field {
+		case "email":
+			if email != "" {
+				argIdx++
+				conditions = append(conditions, fmt.Sprintf("LOWER(email) = LOWER($%d)", argIdx))
+				args = append(args, email)
+			}
+		case "phone":
+			if phone != "" {
+				argIdx++
+				conditions = append(conditions, fmt.Sprintf("phone = $%d", argIdx))
+				args = append(args, phone)
+			}
+		case "company_name":
+			if companyName != "" {
+				argIdx++
+				conditions = append(conditions, fmt.Sprintf("LOWER(company_name) = LOWER($%d)", argIdx))
+				args = append(args, companyName)
+			}
+		}
+	}
+
+	if len(conditions) == 0 {
+		return nil
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, contact_name, COALESCE(email, '') as email, COALESCE(phone, '') as phone, COALESCE(company_name, '') as company_name
+		FROM leads
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND (%s)
+		LIMIT 5
+	`, strings.Join(conditions, " OR "))
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to check lead duplicates", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var duplicates []map[string]interface{}
+	for rows.Next() {
+		var id, name, eMail, ph, company string
+		if err := rows.Scan(&id, &name, &eMail, &ph, &company); err != nil {
+			continue
+		}
+
+		// Determine which fields matched
+		var matchedFields []string
+		for _, field := range checkFields {
+			switch field {
+			case "email":
+				if email != "" && strings.EqualFold(eMail, email) {
+					matchedFields = append(matchedFields, "email")
+				}
+			case "phone":
+				if phone != "" && ph == phone {
+					matchedFields = append(matchedFields, "phone")
+				}
+			case "company_name":
+				if companyName != "" && strings.EqualFold(company, companyName) {
+					matchedFields = append(matchedFields, "company_name")
+				}
+			}
+		}
+
+		duplicates = append(duplicates, map[string]interface{}{
+			"id":             id,
+			"name":           name,
+			"email":          eMail,
+			"phone":          ph,
+			"company_name":   company,
+			"matched_fields": matchedFields,
+		})
+	}
+
+	return duplicates
+}
+
+// checkContactDuplicates checks for duplicate contacts based on configured fields
+func (h *Handler) checkContactDuplicates(tenantID uuid.UUID, email, phone, name string, checkFields []string) []map[string]interface{} {
+	var conditions []string
+	var args []interface{}
+	args = append(args, tenantID)
+	argIdx := 1
+
+	for _, field := range checkFields {
+		switch field {
+		case "email":
+			if email != "" {
+				argIdx++
+				conditions = append(conditions, fmt.Sprintf("LOWER(email) = LOWER($%d)", argIdx))
+				args = append(args, email)
+			}
+		case "phone":
+			if phone != "" {
+				argIdx++
+				conditions = append(conditions, fmt.Sprintf("phone = $%d", argIdx))
+				args = append(args, phone)
+			}
+		case "company_name":
+			if name != "" {
+				argIdx++
+				conditions = append(conditions, fmt.Sprintf("LOWER(name) = LOWER($%d)", argIdx))
+				args = append(args, name)
+			}
+		}
+	}
+
+	if len(conditions) == 0 {
+		return nil
+	}
+
+	query := fmt.Sprintf(`
+		SELECT id, name, COALESCE(email, '') as email, COALESCE(phone, '') as phone
+		FROM contacts
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND (%s)
+		LIMIT 5
+	`, strings.Join(conditions, " OR "))
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to check contact duplicates", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	var duplicates []map[string]interface{}
+	for rows.Next() {
+		var id, cName, eMail, ph string
+		if err := rows.Scan(&id, &cName, &eMail, &ph); err != nil {
+			continue
+		}
+
+		var matchedFields []string
+		for _, field := range checkFields {
+			switch field {
+			case "email":
+				if email != "" && strings.EqualFold(eMail, email) {
+					matchedFields = append(matchedFields, "email")
+				}
+			case "phone":
+				if phone != "" && ph == phone {
+					matchedFields = append(matchedFields, "phone")
+				}
+			case "company_name":
+				if name != "" && strings.EqualFold(cName, name) {
+					matchedFields = append(matchedFields, "company_name")
+				}
+			}
+		}
+
+		duplicates = append(duplicates, map[string]interface{}{
+			"id":             id,
+			"name":           cName,
+			"email":          eMail,
+			"phone":          ph,
+			"matched_fields": matchedFields,
+		})
+	}
+
+	return duplicates
+}
+
 // CreateLead creates a new lead
 func (h *Handler) CreateLead(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -241,6 +456,17 @@ func (h *Handler) CreateLead(c *gin.Context) {
 	source := entity.LeadSourceWebsite
 	if input.Source != "" {
 		source = input.Source
+	}
+
+	// Check for duplicates before creating
+	if enabled, checkFields := h.getDuplicateDetectionSettings(tenantID); enabled {
+		duplicates := h.checkLeadDuplicates(tenantID, input.Email, input.Phone, input.CompanyName, checkFields)
+		if len(duplicates) > 0 {
+			response.ConflictWithData(c, "DUPLICATE_DETECTED", "Potential duplicate lead(s) found", map[string]interface{}{
+				"duplicates": duplicates,
+			})
+			return
+		}
 	}
 
 	// Prepare optional strings

@@ -400,6 +400,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+	organizationID, _ := middleware.GetOrganizationID(c)
 
 	var input entity.InventoryAdjustmentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -528,11 +529,11 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 
 		_, err = tx.Exec(`
 			INSERT INTO inventory (
-				id, tenant_id, product_id, warehouse_id, location_id,
+				id, tenant_id, organization_id, product_id, warehouse_id, location_id,
 				lot_number, serial_number, variant_id, quantity_on_hand, quantity_reserved,
 				unit_cost, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10, $11, $11)
-		`, inventoryID, tenantID, productID, warehouseID, locationID,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12, $12)
+		`, inventoryID, tenantID, organizationID, productID, warehouseID, locationID,
 			lotNumber, serialNumber, variantID, input.Quantity, unitCost, now)
 
 		if err != nil {
@@ -582,10 +583,10 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 
 	_, err = tx.Exec(`
 		INSERT INTO inventory_transactions (
-			id, tenant_id, inventory_id, transaction_type, quantity,
+			id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
 			unit_cost, total_cost, reason, notes, transaction_date, created_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $10)
-	`, transactionID, tenantID, inventoryID, transactionType, input.Quantity,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $11)
+	`, transactionID, tenantID, organizationID, inventoryID, transactionType, input.Quantity,
 		unitCost, input.Quantity*unitCost, reason, notes, now, userID)
 
 	if err != nil {
@@ -618,6 +619,7 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+	organizationID, _ := middleware.GetOrganizationID(c)
 
 	var input entity.InventoryTransferInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -750,11 +752,11 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 
 		_, err = tx.Exec(`
 			INSERT INTO inventory (
-				id, tenant_id, product_id, warehouse_id, location_id,
+				id, tenant_id, organization_id, product_id, warehouse_id, location_id,
 				quantity_on_hand, quantity_reserved,
 				unit_cost, last_movement_date, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8, $8)
-		`, destInventoryID, tenantID, productID, toWarehouseID, toLocationID,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, $9, $9)
+		`, destInventoryID, tenantID, organizationID, productID, toWarehouseID, toLocationID,
 			input.Quantity, unitCost, now)
 
 		if err != nil {
@@ -795,11 +797,11 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 	// Source (outbound) transaction
 	_, err = tx.Exec(`
 		INSERT INTO inventory_transactions (
-			id, tenant_id, inventory_id, transaction_type, quantity,
+			id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
 			unit_cost, total_cost, from_warehouse_id, to_warehouse_id,
 			from_location_id, to_location_id, notes, transaction_date, created_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
-	`, uuid.New(), tenantID, sourceInventoryID, transactionType, -input.Quantity,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $14)
+	`, uuid.New(), tenantID, organizationID, sourceInventoryID, transactionType, -input.Quantity,
 		unitCost, -input.Quantity*unitCost, fromWarehouseID, toWarehouseID,
 		fromLocationID, toLocationID, notes, now, userID)
 
@@ -812,11 +814,11 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 	// Destination (inbound) transaction
 	_, err = tx.Exec(`
 		INSERT INTO inventory_transactions (
-			id, tenant_id, inventory_id, transaction_type, quantity,
+			id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
 			unit_cost, total_cost, from_warehouse_id, to_warehouse_id,
 			from_location_id, to_location_id, notes, transaction_date, created_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
-	`, uuid.New(), tenantID, destInventoryID, transactionType, input.Quantity,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $14)
+	`, uuid.New(), tenantID, organizationID, destInventoryID, transactionType, input.Quantity,
 		unitCost, input.Quantity*unitCost, fromWarehouseID, toWarehouseID,
 		fromLocationID, toLocationID, notes, now, userID)
 

@@ -20,6 +20,7 @@ type ErrorInfo struct {
 	Code    string            `json:"code"`
 	Message string            `json:"message"`
 	Details map[string]string `json:"details,omitempty"`
+	Data    interface{}       `json:"data,omitempty"`
 }
 
 // Meta represents pagination and other metadata
@@ -170,6 +171,18 @@ func NotFound(c *gin.Context, resource string) {
 // Conflict sends a 409 Conflict response
 func Conflict(c *gin.Context, message string) {
 	Error(c, http.StatusConflict, "CONFLICT", message)
+}
+
+// ConflictWithData sends a 409 Conflict response with additional data
+func ConflictWithData(c *gin.Context, code, message string, data interface{}) {
+	c.JSON(http.StatusConflict, Response{
+		Success: false,
+		Error: &ErrorInfo{
+			Code:    code,
+			Message: message,
+			Data:    data,
+		},
+	})
 }
 
 // UnprocessableEntity sends a 422 Unprocessable Entity response
