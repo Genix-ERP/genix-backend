@@ -1,9 +1,13 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -12,6 +16,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"google.golang.org/api/idtoken"
 )
 
 // LoginInput represents login request
@@ -96,6 +101,27 @@ type RegisterWithOTPInput struct {
 	FirstName  string `json:"first_name" binding:"required,min=1,max=100"`
 	LastName   string `json:"last_name" binding:"required,min=1,max=100"`
 	OTPCode    string `json:"otp_code" binding:"required,len=6"`
+}
+
+// GoogleAuthInput represents Google authentication request
+type GoogleAuthInput struct {
+	Credential  string `json:"credential" binding:"required"`
+	TenantID    string `json:"tenant_id,omitempty"`
+	CompanyName string `json:"company_name,omitempty"`
+}
+
+// GoogleAuthNeedsCompletionResponse returned when a new Google user needs to provide company name
+type GoogleAuthNeedsCompletionResponse struct {
+	NeedsCompletion bool              `json:"needs_completion"`
+	GoogleUser      GoogleUserPreview `json:"google_user"`
+}
+
+// GoogleUserPreview holds Google profile info for the completion step
+type GoogleUserPreview struct {
+	Email     string `json:"email"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Picture   string `json:"picture,omitempty"`
 }
 
 // TenantInfo represents basic tenant information
@@ -401,11 +427,11 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	var user entity.User
-	var phone, avatarURL sql.NullString
+	var phone, avatarURL, passwordHash sql.NullString
 	var lockedUntil sql.NullTime
 
 	err := h.db.QueryRow(query, args...).Scan(
-		&user.ID, &user.TenantID, &user.Email, &user.PasswordHash,
+		&user.ID, &user.TenantID, &user.Email, &passwordHash,
 		&user.FirstName, &user.LastName, &phone, &avatarURL,
 		&user.Language, &user.Timezone, &user.IsActive, &user.IsVerified,
 		&user.IsSystemAdmin, &user.FailedLoginAttempts, &lockedUntil,
@@ -422,6 +448,9 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	if passwordHash.Valid {
+		user.PasswordHash = passwordHash.String
+	}
 	if phone.Valid {
 		user.Phone = &phone.String
 	}
@@ -430,6 +459,12 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 	if lockedUntil.Valid {
 		user.LockedUntil = &lockedUntil.Time
+	}
+
+	// Check if this is a Google-only account (no password)
+	if !passwordHash.Valid || passwordHash.String == "" {
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "This account uses Google Sign-In. Please sign in with Google.")
+		return
 	}
 
 	// Check if account is locked
@@ -1484,4 +1519,445 @@ func joinStrings(strs []string, sep string) string {
 		result += sep + s
 	}
 	return result
+}
+
+// GoogleAuth handles Google Sign-In and Sign-Up
+func (h *Handler) GoogleAuth(c *gin.Context) {
+	var input GoogleAuthInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Verify Google ID token
+	clientID := h.config.Google.ClientID
+	if clientID == "" {
+		response.Error(c, http.StatusServiceUnavailable, response.ErrCodeServiceUnavailable, "Google Sign-In is not configured")
+		return
+	}
+
+	payload, err := idtoken.Validate(context.Background(), input.Credential, clientID)
+	if err != nil {
+		h.log.Error("Failed to verify Google ID token", "error", err)
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "Invalid Google credential")
+		return
+	}
+
+	// Extract claims from verified token
+	googleEmail, _ := payload.Claims["email"].(string)
+	emailVerified, _ := payload.Claims["email_verified"].(bool)
+	firstName, _ := payload.Claims["given_name"].(string)
+	lastName, _ := payload.Claims["family_name"].(string)
+	googleSub := payload.Subject
+	picture, _ := payload.Claims["picture"].(string)
+
+	if googleEmail == "" || !emailVerified {
+		response.BadRequest(c, "Google account email is not verified")
+		return
+	}
+
+	// Check if user exists
+	if input.TenantID != "" {
+		// Tenant-specific lookup (multi-tenant selection)
+		tenantUUID, err := uuid.Parse(input.TenantID)
+		if err != nil {
+			response.BadRequest(c, "Invalid tenant ID")
+			return
+		}
+		h.googleLoginExistingUser(c, googleEmail, googleSub, picture, &tenantUUID)
+		return
+	}
+
+	// Count users with this email
+	var userCount int
+	err = h.db.QueryRow("SELECT COUNT(*) FROM users WHERE email = $1 AND deleted_at IS NULL", googleEmail).Scan(&userCount)
+	if err != nil {
+		h.log.Error("Failed to count users", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	if userCount > 1 {
+		// Multi-tenant: return tenant list for selection
+		rows, err := h.db.Query(`
+			SELECT t.id, t.name, t.code
+			FROM users u
+			JOIN tenants t ON u.tenant_id = t.id
+			WHERE u.email = $1 AND u.deleted_at IS NULL AND t.is_active = true
+		`, googleEmail)
+		if err != nil {
+			h.log.Error("Failed to query tenants", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
+		defer rows.Close()
+
+		var tenants []TenantInfo
+		for rows.Next() {
+			var t TenantInfo
+			rows.Scan(&t.ID, &t.Name, &t.Code)
+			tenants = append(tenants, t)
+		}
+
+		c.JSON(http.StatusConflict, gin.H{
+			"success": false,
+			"data": gin.H{
+				"tenants": tenants,
+				"message": "Please select a company to continue",
+			},
+		})
+		return
+	}
+
+	if userCount == 1 {
+		// Single user found — login
+		h.googleLoginExistingUser(c, googleEmail, googleSub, picture, nil)
+		return
+	}
+
+	// No user found — new registration
+	if input.CompanyName == "" {
+		// Need company name — return needs_completion
+		response.Success(c, GoogleAuthNeedsCompletionResponse{
+			NeedsCompletion: true,
+			GoogleUser: GoogleUserPreview{
+				Email:     googleEmail,
+				FirstName: firstName,
+				LastName:  lastName,
+				Picture:   picture,
+			},
+		})
+		return
+	}
+
+	// Complete registration with Google
+	h.googleRegisterNewUser(c, googleEmail, googleSub, firstName, lastName, picture, input.CompanyName)
+}
+
+// googleLoginExistingUser logs in an existing user via Google
+func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, picture string, tenantID *uuid.UUID) {
+	query := `
+		SELECT id, tenant_id, email, first_name, last_name,
+		       phone, avatar_url, language, timezone, is_active, is_verified,
+		       is_system_admin, COALESCE(auth_provider, 'local') as auth_provider, google_id,
+		       created_at, updated_at
+		FROM users
+		WHERE email = $1 AND deleted_at IS NULL
+	`
+	args := []interface{}{email}
+
+	if tenantID != nil {
+		query = `
+			SELECT id, tenant_id, email, first_name, last_name,
+			       phone, avatar_url, language, timezone, is_active, is_verified,
+			       is_system_admin, COALESCE(auth_provider, 'local') as auth_provider, google_id,
+			       created_at, updated_at
+			FROM users
+			WHERE tenant_id = $1 AND email = $2 AND deleted_at IS NULL
+		`
+		args = []interface{}{*tenantID, email}
+	}
+
+	var user entity.User
+	var phone, avatarURL, googleID sql.NullString
+
+	err := h.db.QueryRow(query, args...).Scan(
+		&user.ID, &user.TenantID, &user.Email, &user.FirstName, &user.LastName,
+		&phone, &avatarURL, &user.Language, &user.Timezone, &user.IsActive, &user.IsVerified,
+		&user.IsSystemAdmin, &user.AuthProvider, &googleID,
+		&user.CreatedAt, &user.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "Account not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to query user for Google auth", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	if phone.Valid {
+		user.Phone = &phone.String
+	}
+	if avatarURL.Valid {
+		user.AvatarURL = &avatarURL.String
+	}
+	if googleID.Valid {
+		user.GoogleID = &googleID.String
+	}
+
+	if !user.IsActive {
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeAccountDisabled, "Account is disabled")
+		return
+	}
+
+	// Link Google ID if not already linked, and update avatar if missing
+	if !googleID.Valid || googleID.String == "" {
+		h.db.Exec("UPDATE users SET google_id = $1, auth_provider = CASE WHEN auth_provider = 'local' AND password_hash IS NULL THEN 'google' ELSE auth_provider END WHERE id = $2", googleSub, user.ID)
+	}
+	if (user.AvatarURL == nil || *user.AvatarURL == "") && picture != "" {
+		h.db.Exec("UPDATE users SET avatar_url = $1 WHERE id = $2", picture, user.ID)
+		user.AvatarURL = &picture
+	}
+
+	// Update last login
+	now := time.Now()
+	h.db.Exec("UPDATE users SET last_login_at = $1 WHERE id = $2", now, user.ID)
+	user.LastLoginAt = &now
+
+	// Generate tokens
+	tokenPair, err := h.jwtManager.GenerateTokenPair(user.ID, user.TenantID, user.Email, user.IsSystemAdmin)
+	if err != nil {
+		h.log.Error("Failed to generate tokens", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Store refresh token
+	tokenHash := crypto.HashToken(tokenPair.RefreshToken)
+	deviceInfo, _ := json.Marshal(map[string]string{
+		"user_agent": c.GetHeader("User-Agent"),
+	})
+	h.db.Exec(`
+		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, user.ID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+
+	// Load roles
+	rows, err := h.db.Query(`
+		SELECT r.id, r.name, r.code
+		FROM roles r
+		JOIN user_roles ur ON r.id = ur.role_id
+		WHERE ur.user_id = $1
+	`, user.ID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var role entity.Role
+			rows.Scan(&role.ID, &role.Name, &role.Code)
+			user.Roles = append(user.Roles, role)
+		}
+	}
+
+	// Get tenant info
+	var tenantCode, tenantName string
+	h.db.QueryRow("SELECT code, name FROM tenants WHERE id = $1", user.TenantID).Scan(&tenantCode, &tenantName)
+
+	response.Success(c, AuthResponse{
+		User: user.ToResponse(),
+		Tenant: &TenantInfo{
+			ID:   user.TenantID,
+			Code: tenantCode,
+			Name: tenantName,
+		},
+		AccessToken:  tokenPair.AccessToken,
+		RefreshToken: tokenPair.RefreshToken,
+		ExpiresAt:    tokenPair.ExpiresAt,
+		TokenType:    tokenPair.TokenType,
+	})
+}
+
+// googleRegisterNewUser creates a new tenant and user from Google sign-up
+func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstName, lastName, picture, companyName string) {
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin transaction", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+	defer tx.Rollback()
+
+	// Double-check email doesn't exist
+	var existingID uuid.UUID
+	err = tx.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", email).Scan(&existingID)
+	if err == nil {
+		response.Conflict(c, "Email already registered")
+		return
+	}
+	if err != sql.ErrNoRows {
+		h.log.Error("Failed to check email", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Generate tenant code
+	baseCode := strings.ToLower(strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' {
+			return r
+		}
+		if r >= 'A' && r <= 'Z' {
+			return r + 32
+		}
+		return '_'
+	}, companyName))
+	if len(baseCode) > 40 {
+		baseCode = baseCode[:40]
+	}
+	tenantCode := fmt.Sprintf("%s_%s", baseCode, randomSuffix())
+
+	// Create tenant
+	tenantID := uuid.New()
+	defaultSettings, _ := json.Marshal(map[string]interface{}{
+		"locale": map[string]string{
+			"language":         "en",
+			"timezone":         "UTC",
+			"date_format":      "YYYY-MM-DD",
+			"default_currency": "USD",
+		},
+	})
+
+	_, err = tx.Exec(`
+		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status)
+		VALUES ($1, $2, $3, $4, 'free', 'active')
+	`, tenantID, tenantCode, companyName, defaultSettings)
+	if err != nil {
+		h.log.Error("Failed to create tenant", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create user (no password, Google auth)
+	userID := uuid.New()
+	now := time.Now()
+	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
+
+	_, err = tx.Exec(`
+		INSERT INTO users (id, tenant_id, email, first_name, last_name, settings,
+		                   is_active, is_verified, is_system_admin, auth_provider, google_id,
+		                   avatar_url, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, true, true, false, 'google', $7, $8, $9, $9)
+	`, userID, tenantID, email, firstName, lastName, defaultUserSettings, googleSub, picture, now)
+	if err != nil {
+		h.log.Error("Failed to create user", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create owner role
+	roleID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO roles (id, tenant_id, name, code, description, is_system)
+		VALUES ($1, $2, 'Owner', 'owner', 'Tenant owner with full access', true)
+	`, roleID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to create role", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	_, err = tx.Exec("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", userID, roleID)
+	if err != nil {
+		h.log.Error("Failed to assign role", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create default warehouse
+	warehouseID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouses (id, tenant_id, code, name, is_default, is_active, reception_steps, delivery_steps)
+		VALUES ($1, $2, 'WH-MAIN', 'Main Warehouse', true, true, 1, 1)
+	`, warehouseID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to create default warehouse", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	stockLocationID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouse_locations (id, warehouse_id, code, name, type, is_active)
+		VALUES ($1, $2, 'STOCK', 'Stock', 'storage', true)
+	`, stockLocationID, warehouseID)
+	if err != nil {
+		h.log.Error("Failed to create stock location", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Generate tokens
+	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, email, false)
+	if err != nil {
+		h.log.Error("Failed to generate tokens", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Store refresh token
+	tokenHash := crypto.HashToken(tokenPair.RefreshToken)
+	deviceInfo, _ := json.Marshal(map[string]string{
+		"user_agent": c.GetHeader("User-Agent"),
+	})
+	h.db.Exec(`
+		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, userID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+
+	ownerRoleDesc := "Tenant owner with full access"
+	var avatarPtr *string
+	if picture != "" {
+		avatarPtr = &picture
+	}
+
+	userResp := &entity.UserResponse{
+		ID:            userID,
+		TenantID:      tenantID,
+		Email:         email,
+		FirstName:     firstName,
+		LastName:      lastName,
+		FullName:      firstName + " " + lastName,
+		AvatarURL:     avatarPtr,
+		Language:      "en",
+		Timezone:      "UTC",
+		IsActive:      true,
+		IsVerified:    true,
+		IsSystemAdmin: false,
+		AuthProvider:  "google",
+		HasPassword:   false,
+		Roles: []entity.Role{
+			{
+				ID:          roleID,
+				TenantID:    tenantID,
+				Name:        "Owner",
+				Code:        "owner",
+				Description: &ownerRoleDesc,
+				IsSystem:    true,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	response.Created(c, gin.H{
+		"user": userResp,
+		"tenant": &TenantInfo{
+			ID:   tenantID,
+			Code: tenantCode,
+			Name: companyName,
+		},
+		"access_token":  tokenPair.AccessToken,
+		"refresh_token": tokenPair.RefreshToken,
+		"expires_at":    tokenPair.ExpiresAt,
+		"token_type":    tokenPair.TokenType,
+		"is_new_user":   true,
+	})
+}
+
+func randomSuffix() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(b)
 }

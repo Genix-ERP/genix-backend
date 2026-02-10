@@ -23,6 +23,12 @@ type Config struct {
 	Storage   StorageConfig
 	Email     EmailConfig
 	Queue     QueueConfig
+	Google    GoogleConfig
+}
+
+// GoogleConfig holds Google OAuth settings
+type GoogleConfig struct {
+	ClientID string
 }
 
 // AppConfig holds application settings
@@ -255,6 +261,9 @@ func Load() (*Config, error) {
 			Provider: getEnv("QUEUE_PROVIDER", "redis"),
 			URL:      getEnv("QUEUE_URL", "redis://localhost:6379/1"),
 			Workers:  getEnvAsInt("QUEUE_WORKERS", 10),
+		},
+		Google: GoogleConfig{
+			ClientID: getEnv("GOOGLE_CLIENT_ID", ""),
 		},
 	}
 
