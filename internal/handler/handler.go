@@ -60,6 +60,7 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 		auth.POST("/send-otp", h.SendOTP)                  // Send OTP to email
 		auth.POST("/verify-otp", h.VerifyOTP)              // Verify OTP code
 		auth.POST("/login", h.Login)
+		auth.POST("/google", h.GoogleAuth) // Google Sign-In/Sign-Up
 		auth.POST("/refresh", h.RefreshToken)
 		auth.POST("/forgot-password", h.ForgotPassword)
 		auth.POST("/reset-password", h.ResetPassword)
