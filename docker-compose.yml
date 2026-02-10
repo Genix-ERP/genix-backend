@@ -32,6 +32,7 @@ services:
       - EMAIL_PASSWORD=${EMAIL_PASSWORD}
       - EMAIL_FROM_EMAIL=${EMAIL_FROM_EMAIL}
       - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-GenixERP}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
     depends_on:
       postgres:
         condition: service_healthy

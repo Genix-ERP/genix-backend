@@ -26,6 +26,8 @@ type User struct {
 	IsSystemAdmin       bool            `json:"is_system_admin" db:"is_system_admin"`
 	LastLoginAt         *time.Time      `json:"last_login_at,omitempty" db:"last_login_at"`
 	PasswordChangedAt   *time.Time      `json:"password_changed_at,omitempty" db:"password_changed_at"`
+	AuthProvider        string          `json:"auth_provider" db:"auth_provider"`
+	GoogleID            *string         `json:"google_id,omitempty" db:"google_id"`
 	FailedLoginAttempts int             `json:"-" db:"failed_login_attempts"`
 	LockedUntil         *time.Time      `json:"-" db:"locked_until"`
 	InviteTokenExpires  *time.Time      `json:"invite_token_expires,omitempty" db:"invite_token_expires"`
@@ -224,6 +226,7 @@ type UserResponse struct {
 	IsActive           bool       `json:"is_active"`
 	IsVerified         bool       `json:"is_verified"`
 	IsSystemAdmin      bool       `json:"is_system_admin"`
+	AuthProvider       string     `json:"auth_provider"`
 	HasPassword        bool       `json:"has_password"`
 	InviteTokenExpires *time.Time `json:"invite_token_expires,omitempty"`
 	LastLoginAt        *time.Time `json:"last_login_at,omitempty"`
@@ -253,6 +256,7 @@ func (u *User) ToResponse() *UserResponse {
 		IsActive:           u.IsActive,
 		IsVerified:         u.IsVerified,
 		IsSystemAdmin:      u.IsSystemAdmin,
+		AuthProvider:       u.AuthProvider,
 		HasPassword:        u.HasPassword(),
 		InviteTokenExpires: u.InviteTokenExpires,
 		LastLoginAt:        u.LastLoginAt,
