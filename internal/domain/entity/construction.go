@@ -275,7 +275,7 @@ type SmetaResource struct {
 	Code         sql.NullString `json:"code" db:"code"`
 	Name         string         `json:"name" db:"name"`
 	NameUz       sql.NullString `json:"name_uz" db:"name_uz"`
-	ProductID    sql.NullInt64  `json:"product_id" db:"product_id"`
+	ProductID    uuid.NullUUID  `json:"product_id" db:"product_id"`
 	Unit         string         `json:"unit" db:"unit"`
 
 	QuantityPerUnit  sql.NullFloat64 `json:"quantity_per_unit" db:"quantity_per_unit"`
@@ -535,8 +535,8 @@ type ConstructionMaterialDelivery struct {
 
 	DeliveryNumber  string    `json:"delivery_number" db:"delivery_number"`
 	DeliveryDate    time.Time `json:"delivery_date" db:"delivery_date"`
-	PurchaseOrderID sql.NullInt64 `json:"purchase_order_id" db:"purchase_order_id"`
-	GoodsReceiptID  sql.NullInt64 `json:"goods_receipt_id" db:"goods_receipt_id"`
+	PurchaseOrderID uuid.NullUUID `json:"purchase_order_id" db:"purchase_order_id"`
+	GoodsReceiptID  uuid.NullUUID `json:"goods_receipt_id" db:"goods_receipt_id"`
 
 	VehicleNumber sql.NullString `json:"vehicle_number" db:"vehicle_number"`
 	DriverName    sql.NullString `json:"driver_name" db:"driver_name"`
@@ -587,7 +587,7 @@ type ConstructionSiteWarehouse struct {
 	ID          int64         `json:"id" db:"id"`
 	TenantID    uuid.UUID     `json:"tenant_id" db:"tenant_id"`
 	ProjectID   int64         `json:"project_id" db:"project_id"`
-	WarehouseID sql.NullInt64 `json:"warehouse_id" db:"warehouse_id"`
+	WarehouseID uuid.NullUUID `json:"warehouse_id" db:"warehouse_id"`
 
 	Name                string          `json:"name" db:"name"`
 	LocationDescription sql.NullString  `json:"location_description" db:"location_description"`

@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS smeta_resources (
     name_uz VARCHAR(500),
 
     -- Link to inventory product (if material)
-    product_id BIGINT REFERENCES products(id),
+    product_id UUID REFERENCES products(id),
 
     -- Quantities
     unit VARCHAR(50) NOT NULL,
@@ -305,7 +305,7 @@ CREATE TABLE IF NOT EXISTS construction_material_requests (
     fulfillment_notes TEXT,
 
     -- Link to purchase order if created
-    purchase_order_id BIGINT REFERENCES purchase_orders(id),
+    purchase_order_id UUID REFERENCES purchase_orders(id),
 
     notes TEXT,
     created_date TIMESTAMP DEFAULT NOW(),
@@ -316,7 +316,7 @@ CREATE TABLE IF NOT EXISTS construction_material_requests (
 CREATE TABLE IF NOT EXISTS construction_project_team (
     id BIGSERIAL PRIMARY KEY,
     project_id BIGINT NOT NULL REFERENCES construction_projects(id) ON DELETE CASCADE,
-    employee_id BIGINT NOT NULL REFERENCES employees(id),
+    employee_id UUID NOT NULL REFERENCES employees(id),
 
     role VARCHAR(100) NOT NULL,
     responsibilities TEXT,
@@ -368,7 +368,7 @@ CREATE TABLE IF NOT EXISTS construction_project_vendors (
     project_id BIGINT NOT NULL REFERENCES construction_projects(id) ON DELETE CASCADE,
 
     -- Link to existing organization (vendor/supplier)
-    vendor_id BIGINT NOT NULL REFERENCES organizations(id),
+    vendor_id UUID NOT NULL REFERENCES organizations(id),
 
     -- Contract details
     contract_number VARCHAR(100),
@@ -418,8 +418,8 @@ CREATE TABLE IF NOT EXISTS construction_material_deliveries (
     delivery_date DATE NOT NULL,
 
     -- Link to procurement system
-    purchase_order_id BIGINT REFERENCES purchase_orders(id),
-    goods_receipt_id BIGINT REFERENCES goods_receipts(id),
+    purchase_order_id UUID REFERENCES purchase_orders(id),
+    goods_receipt_id UUID REFERENCES goods_receipts(id),
 
     -- Delivery details
     vehicle_number VARCHAR(50),
@@ -504,7 +504,7 @@ CREATE TABLE IF NOT EXISTS construction_vendor_payments (
     actual_date DATE,
 
     -- Link to actual payment in Finance module
-    payment_id BIGINT REFERENCES payments(id),
+    payment_id UUID REFERENCES payments(id),
 
     -- Payment conditions
     condition_type VARCHAR(50),
@@ -527,7 +527,7 @@ CREATE TABLE IF NOT EXISTS construction_site_warehouses (
     project_id BIGINT NOT NULL REFERENCES construction_projects(id),
 
     -- Link to main Inventory warehouse system
-    warehouse_id BIGINT REFERENCES warehouses(id),
+    warehouse_id UUID REFERENCES warehouses(id),
 
     -- Site warehouse info
     name VARCHAR(255) NOT NULL,
