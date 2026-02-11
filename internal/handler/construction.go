@@ -1764,6 +1764,15 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 
 	reportDate, _ := time.Parse("2006-01-02", req.ReportDate)
 
+	// Convert photos to JSON
+	photosJSON := "[]"
+	if len(req.Photos) > 0 {
+		photosBytes, err := json.Marshal(req.Photos)
+		if err == nil {
+			photosJSON = string(photosBytes)
+		}
+	}
+
 	query := `
 		INSERT INTO construction_photo_reports (
 			tenant_id, project_id, smeta_item_id, section_id,
@@ -1779,7 +1788,7 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 		tenantID, projectID, nullInt64(req.SmetaItemID), nullInt64(req.SectionID),
 		reportDate, nullString(req.ReportType), nullString(req.Title), nullString(req.Description), nullString(req.LocationDescription),
 		nullFloat64(req.GpsLatitude), nullFloat64(req.GpsLongitude), nullString(req.Weather), nullFloat64(req.Temperature),
-		"[]", nil, // photos as empty array, reported_by
+		photosJSON, nil, // photos, reported_by
 	).Scan(&reportID)
 	if err != nil {
 		h.log.Error("Failed to create photo report", "error", err)

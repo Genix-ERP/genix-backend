@@ -794,21 +794,29 @@ type ConstructionPhotoReport struct {
 	ReviewerName string `json:"reviewer_name,omitempty" db:"reviewer_name"`
 }
 
+// PhotoItem represents a single photo in a photo report
+type PhotoItem struct {
+	URL      string `json:"url"`
+	Filename string `json:"filename"`
+	Size     int64  `json:"size"`
+	Type     string `json:"type"`
+}
+
 // CreatePhotoReportInput represents input for creating a photo report
 type CreatePhotoReportInput struct {
-	SmetaItemID         int64    `json:"smeta_item_id"`
-	SectionID           int64    `json:"section_id"`
-	ReportDate          string   `json:"report_date" binding:"required"`
-	ReportType          string   `json:"report_type"`
-	Title               string   `json:"title"`
-	Description         string   `json:"description"`
-	LocationDescription string   `json:"location_description"`
-	GpsLatitude         float64  `json:"gps_latitude"`
-	GpsLongitude        float64  `json:"gps_longitude"`
-	Weather             string   `json:"weather"`
-	Temperature         float64  `json:"temperature"`
-	Photos              []string `json:"photos"`
-	ReportedBy          int64    `json:"reported_by"`
+	SmetaItemID         int64       `json:"smeta_item_id"`
+	SectionID           int64       `json:"section_id"`
+	ReportDate          string      `json:"report_date" binding:"required"`
+	ReportType          string      `json:"report_type"`
+	Title               string      `json:"title"`
+	Description         string      `json:"description"`
+	LocationDescription string      `json:"location_description"`
+	GpsLatitude         float64     `json:"gps_latitude"`
+	GpsLongitude        float64     `json:"gps_longitude"`
+	Weather             string      `json:"weather"`
+	Temperature         float64     `json:"temperature"`
+	Photos              []PhotoItem `json:"photos"`
+	ReportedBy          int64       `json:"reported_by"`
 }
 
 // =====================================================
