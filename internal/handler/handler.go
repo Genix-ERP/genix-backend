@@ -1334,6 +1334,44 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// =====================================================
+	// CONSTRUCTION MODULE ROUTES
+	// =====================================================
+
+	// Construction Projects
+	constructionProjects := rg.Group("/construction/projects")
+	constructionProjects.Use(middleware.RequirePermission("construction", "project", "read"))
+	{
+		constructionProjects.GET("", h.ListConstructionProjects)
+		constructionProjects.POST("", middleware.RequirePermission("construction", "project", "create"), h.CreateConstructionProject)
+		constructionProjects.GET("/:id", h.GetConstructionProject)
+		constructionProjects.PUT("/:id", middleware.RequirePermission("construction", "project", "update"), h.UpdateConstructionProject)
+		constructionProjects.DELETE("/:id", middleware.RequirePermission("construction", "project", "delete"), h.DeleteConstructionProject)
+		constructionProjects.GET("/:id/dashboard", h.GetConstructionProjectDashboard)
+		// Smeta Sections
+		constructionProjects.GET("/:id/sections", h.ListSmetaSections)
+		constructionProjects.POST("/:id/sections", middleware.RequirePermission("construction", "smeta", "create"), h.CreateSmetaSection)
+	}
+
+	// Smeta Sections (direct access)
+	smetaSections := rg.Group("/construction/sections")
+	smetaSections.Use(middleware.RequirePermission("construction", "smeta", "read"))
+	{
+		smetaSections.PUT("/:id", middleware.RequirePermission("construction", "smeta", "update"), h.UpdateSmetaSection)
+		smetaSections.DELETE("/:id", middleware.RequirePermission("construction", "smeta", "delete"), h.DeleteSmetaSection)
+		// Smeta Items
+		smetaSections.GET("/:id/items", h.ListSmetaItems)
+		smetaSections.POST("/:id/items", middleware.RequirePermission("construction", "smeta", "create"), h.CreateSmetaItem)
+	}
+
+	// Smeta Items (direct access)
+	smetaItems := rg.Group("/construction/smeta-items")
+	smetaItems.Use(middleware.RequirePermission("construction", "smeta", "read"))
+	{
+		smetaItems.PUT("/:id", middleware.RequirePermission("construction", "smeta", "update"), h.UpdateSmetaItem)
+		smetaItems.DELETE("/:id", middleware.RequirePermission("construction", "smeta", "delete"), h.DeleteSmetaItem)
+	}
+
+	// =====================================================
 	// INSTALLED APPS ROUTES
 	// =====================================================
 	installedApps := rg.Group("/installed-apps")
