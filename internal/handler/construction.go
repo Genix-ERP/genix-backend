@@ -1817,7 +1817,7 @@ func (h *Handler) GetPhotoReport(c *gin.Context) {
 	}
 
 	query := `
-		SELECT pr.id, pr.tenant_id, pr.project_id, pr.smeta_item_id, pr.section_id, pr.building_id,
+		SELECT pr.id, pr.tenant_id, pr.project_id, pr.smeta_item_id, pr.section_id,
 		       pr.report_date, pr.report_type, pr.title, pr.description, pr.location_description,
 		       pr.gps_latitude, pr.gps_longitude, pr.weather, pr.temperature,
 		       pr.photos, pr.reported_by, pr.review_status, pr.reviewed_by, pr.review_date, pr.review_notes,
@@ -1831,7 +1831,7 @@ func (h *Handler) GetPhotoReport(c *gin.Context) {
 	var report entity.ConstructionPhotoReport
 	var photosJSON sql.NullString
 	err = h.db.QueryRow(query, reportID, tenantID).Scan(
-		&report.ID, &report.TenantID, &report.ProjectID, &report.SmetaItemID, &report.SectionID, &report.BuildingID,
+		&report.ID, &report.TenantID, &report.ProjectID, &report.SmetaItemID, &report.SectionID,
 		&report.ReportDate, &report.ReportType, &report.Title, &report.Description, &report.LocationDescription,
 		&report.GpsLatitude, &report.GpsLongitude, &report.Weather, &report.Temperature,
 		&photosJSON, &report.ReportedBy, &report.ReviewStatus, &report.ReviewedBy, &report.ReviewDate, &report.ReviewNotes,
