@@ -601,12 +601,41 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		return
 	}
 
+	newBalance := currentQtyOnHand + input.Quantity
+
+	// Trigger workflow rules for stock changes
+	go func() {
+		// Get product info for the trigger
+		var productName, productCode string
+		var reorderPoint float64
+		h.db.QueryRow(`SELECT name, code, COALESCE(reorder_point, 0) FROM products WHERE id = $1`, input.ProductID).
+			Scan(&productName, &productCode, &reorderPoint)
+
+		if reorderPoint > 0 && newBalance <= reorderPoint {
+			h.EvaluateWorkflowRules(tenantID, "inventory.low_stock", map[string]interface{}{
+				"product_id":    input.ProductID,
+				"product_name":  productName,
+				"product_code":  productCode,
+				"reorder_point": reorderPoint,
+				"available":     newBalance,
+			})
+		}
+
+		h.EvaluateWorkflowRules(tenantID, "inventory.adjusted", map[string]interface{}{
+			"product_id":   input.ProductID,
+			"product_name": productName,
+			"product_code": productCode,
+			"quantity":     input.Quantity,
+			"new_balance":  newBalance,
+		})
+	}()
+
 	response.Success(c, gin.H{
 		"message":        "Inventory adjusted successfully",
 		"inventory_id":   inventoryID,
 		"transaction_id": transactionID,
 		"quantity":       input.Quantity,
-		"new_balance":    currentQtyOnHand + input.Quantity,
+		"new_balance":    newBalance,
 	})
 }
 

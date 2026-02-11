@@ -1046,6 +1046,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workflows.DELETE("/:id", middleware.RequirePermission("workflow", "workflow", "delete"), h.DeleteWorkflow)
 	}
 
+	// Workflow Automation Rules
+	workflowRules := rg.Group("/workflow-rules")
+	workflowRules.Use(middleware.RequirePermission("workflow", "workflow", "read"))
+	{
+		workflowRules.GET("", h.ListWorkflowRules)
+		workflowRules.POST("", middleware.RequirePermission("workflow", "workflow", "create"), h.CreateWorkflowRule)
+		workflowRules.GET("/:id", h.GetWorkflowRule)
+		workflowRules.PUT("/:id", middleware.RequirePermission("workflow", "workflow", "update"), h.UpdateWorkflowRule)
+		workflowRules.DELETE("/:id", middleware.RequirePermission("workflow", "workflow", "delete"), h.DeleteWorkflowRule)
+	}
+
+	// Workflow Logs
+	rg.GET("/workflow-logs", middleware.RequirePermission("workflow", "workflow", "read"), h.ListWorkflowLogs)
+
 	// AI Assistant
 	ai := rg.Group("/ai")
 	ai.Use(middleware.RequirePermission("ai", "conversation", "create"))
