@@ -95,9 +95,4 @@ func (h *Handler) MarkNotificationRead(c *gin.Context)    { response.Success(c, 
 func (h *Handler) MarkAllNotificationsRead(c *gin.Context) { response.Success(c, gin.H{"message": "All marked as read"}) }
 
 // ========== FILES ==========
-
-func (h *Handler) UploadFile(c *gin.Context) {
-	response.Created(c, gin.H{"message": "File uploaded", "id": "file_id"})
-}
-func (h *Handler) GetFile(c *gin.Context)    { response.NotFound(c, "File") }
-func (h *Handler) DeleteFile(c *gin.Context) { response.NoContent(c) }
+// File handlers are implemented in files.go
