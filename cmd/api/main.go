@@ -104,6 +104,9 @@ func main() {
 	h := handler.NewHandler(db, redisClient, cfg, log)
 	h.RegisterRoutes(router)
 
+	// Start workflow automation scheduler (checks thresholds every 15 minutes)
+	h.RunWorkflowScheduler(15 * time.Minute)
+
 	// Create HTTP server
 	server := &http.Server{
 		Addr:           fmt.Sprintf(":%d", cfg.App.Port),

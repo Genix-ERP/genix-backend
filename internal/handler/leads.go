@@ -519,6 +519,16 @@ func (h *Handler) CreateLead(c *gin.Context) {
 		UpdatedAt:     now,
 	}
 
+	// Trigger workflow rules for new lead
+	go h.EvaluateWorkflowRules(tenantID, "lead.created", map[string]interface{}{
+		"record_id":      id.String(),
+		"contact_name":   input.ContactName,
+		"company_name":   input.CompanyName,
+		"email":          input.Email,
+		"source":         source,
+		"expected_value": input.ExpectedValue,
+	})
+
 	response.Created(c, resp)
 }
 
