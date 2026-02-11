@@ -807,6 +807,7 @@ type BOMResponse struct {
 	EffectiveDate *string             `json:"effective_date,omitempty"`
 	ExpiryDate    *string             `json:"expiry_date,omitempty"`
 	TotalCost     float64             `json:"total_cost"`
+	LineCount     int                 `json:"line_count"`
 	Lines         []BOMLineResponse   `json:"lines,omitempty"`
 	CreatedAt     time.Time           `json:"created_at"`
 }

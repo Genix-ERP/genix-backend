@@ -1335,6 +1335,155 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// --- Inventory integration: add produced goods & consume materials ---
+	var productID uuid.UUID
+	var bomID *uuid.UUID
+	var warehouseID *uuid.UUID
+	var organizationID *uuid.UUID
+	var qtyProduced, qtyPlanned float64
+
+	err = h.db.QueryRow(`
+		SELECT product_id, bom_id, warehouse_id, organization_id,
+		       COALESCE(quantity_produced, quantity_planned), quantity_planned
+		FROM production_orders WHERE id = $1 AND tenant_id = $2
+	`, id, tenantID).Scan(&productID, &bomID, &warehouseID, &organizationID, &qtyProduced, &qtyPlanned)
+	if err != nil {
+		h.log.Error("Failed to fetch production order for inventory", "error", err)
+		h.GetProductionOrder(c)
+		return
+	}
+
+	if warehouseID == nil {
+		h.log.Warn("Production order has no warehouse, skipping inventory update", "order_id", id)
+		h.GetProductionOrder(c)
+		return
+	}
+
+	producedQty := qtyProduced
+	if input.QuantityProduced > 0 {
+		producedQty = input.QuantityProduced
+	}
+
+	var unitCost float64
+	h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
+
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to start inventory transaction", "error", txErr)
+		h.GetProductionOrder(c)
+		return
+	}
+	defer tx.Rollback()
+
+	// Add finished product to inventory
+	var invID uuid.UUID
+	err = tx.QueryRow(`
+		SELECT id FROM inventory
+		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+		AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+	`, tenantID, productID, warehouseID).Scan(&invID)
+
+	if err == sql.ErrNoRows {
+		invID = uuid.New()
+		_, err = tx.Exec(`
+			INSERT INTO inventory (
+				id, tenant_id, organization_id, product_id, warehouse_id,
+				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8, $8)
+		`, invID, tenantID, organizationID, productID, warehouseID, producedQty, unitCost, now)
+	} else if err == nil {
+		_, err = tx.Exec(`
+			UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2
+			WHERE id = $3
+		`, producedQty, now, invID)
+	}
+	if err != nil {
+		h.log.Error("Failed to update finished product inventory", "error", err)
+		h.GetProductionOrder(c)
+		return
+	}
+
+	// Create receipt transaction for finished product
+	_, err = tx.Exec(`
+		INSERT INTO inventory_transactions (
+			id, tenant_id, organization_id, inventory_id, transaction_type,
+			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reason, notes, transaction_date, created_by, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
+	`, uuid.New(), tenantID, organizationID, invID, entity.TransactionTypeReceipt,
+		"production_order", id, producedQty, unitCost, producedQty*unitCost,
+		"production_complete", "Auto-generated from production order completion", now, userID)
+	if err != nil {
+		h.log.Error("Failed to create receipt transaction", "error", err)
+		h.GetProductionOrder(c)
+		return
+	}
+
+	// Consume BOM components
+	if bomID != nil {
+		type bomComponent struct {
+			ComponentID  uuid.UUID
+			Quantity     float64
+			ScrapPercent float64
+			BOMOutputQty float64
+		}
+
+		compRows, compErr := tx.Query(`
+			SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), pb.quantity
+			FROM bom_lines bl
+			JOIN product_boms pb ON pb.id = bl.bom_id
+			WHERE bl.bom_id = $1
+		`, bomID)
+		if compErr == nil {
+			var components []bomComponent
+			for compRows.Next() {
+				var comp bomComponent
+				if scanErr := compRows.Scan(&comp.ComponentID, &comp.Quantity, &comp.ScrapPercent, &comp.BOMOutputQty); scanErr == nil {
+					components = append(components, comp)
+				}
+			}
+			compRows.Close()
+
+			for _, comp := range components {
+				consumption := comp.Quantity * (producedQty / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
+
+				var compInvID uuid.UUID
+				compErr := tx.QueryRow(`
+					SELECT id FROM inventory
+					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+					AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
+
+				if compErr != nil {
+					h.log.Warn("Component not found in inventory, skipping consumption", "component_id", comp.ComponentID)
+					continue
+				}
+
+				_, _ = tx.Exec(`
+					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
+					WHERE id = $3
+				`, consumption, now, compInvID)
+
+				var compCost float64
+				h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
+
+				_, _ = tx.Exec(`
+					INSERT INTO inventory_transactions (
+						id, tenant_id, organization_id, inventory_id, transaction_type,
+						reference_type, reference_id, quantity, unit_cost, total_cost,
+						reason, notes, transaction_date, created_by, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
+				`, uuid.New(), tenantID, organizationID, compInvID, entity.TransactionTypeIssue,
+					"production_order", id, -consumption, compCost, consumption*compCost,
+					"material_consumption", "Auto-consumed for production order", now, userID)
+			}
+		}
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		h.log.Error("Failed to commit inventory transaction", "error", commitErr)
+	}
+
 	h.GetProductionOrder(c)
 }
 
