@@ -248,7 +248,11 @@ func (h *Handler) CreateComment(c *gin.Context) {
 		return
 	}
 
-	userID, _ := middleware.GetUserID(c)
+	userIDVal, userOk := middleware.GetUserID(c)
+	var userID *uuid.UUID
+	if userOk {
+		userID = &userIDVal
+	}
 	userName := c.GetString("user_name")
 	if userName == "" {
 		userName = "User"
@@ -407,7 +411,11 @@ func (h *Handler) CreateScheduledActivity(c *gin.Context) {
 		return
 	}
 
-	userID, _ := middleware.GetUserID(c)
+	userIDVal, userOk := middleware.GetUserID(c)
+	var userID *uuid.UUID
+	if userOk {
+		userID = &userIDVal
+	}
 
 	modelName := c.Param("model")
 	recordID, err := strconv.ParseInt(c.Param("record_id"), 10, 64)
@@ -480,7 +488,11 @@ func (h *Handler) CompleteScheduledActivity(c *gin.Context) {
 		return
 	}
 
-	userID, _ := middleware.GetUserID(c)
+	userIDVal, userOk := middleware.GetUserID(c)
+	var userID *uuid.UUID
+	if userOk {
+		userID = &userIDVal
+	}
 
 	activityID, err := strconv.ParseInt(c.Param("activity_id"), 10, 64)
 	if err != nil {
@@ -511,8 +523,8 @@ func (h *Handler) ListMyActivities(c *gin.Context) {
 		return
 	}
 
-	userID, _ := middleware.GetUserID(c)
-	if userID == nil {
+	userID, userOk := middleware.GetUserID(c)
+	if !userOk || userID == uuid.Nil {
 		response.Unauthorized(c, "User not found")
 		return
 	}
