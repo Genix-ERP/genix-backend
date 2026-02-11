@@ -544,6 +544,289 @@ func (h *Handler) GetConstructionProjectDashboard(c *gin.Context) {
 }
 
 // =====================================================
+// BUILDING HANDLERS
+// =====================================================
+
+// ListConstructionBuildings returns buildings for a project
+func (h *Handler) ListConstructionBuildings(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT b.id, b.tenant_id, b.project_id, b.code, b.name, b.description,
+		       b.building_type, b.building_purpose, b.floors_count, b.floors_underground,
+		       b.total_area, b.living_area, b.non_living_area,
+		       b.apartments_count, b.commercial_units_count, b.parking_spots,
+		       b.estimated_cost, b.actual_cost, COALESCE(b.currency, 'UZS'),
+		       b.planned_start_date, b.planned_end_date, b.actual_start_date, b.actual_end_date,
+		       b.status, b.progress_percent, b.gps_coordinates, b.location_description,
+		       b.sort_order, b.created_date, b.updated_date,
+		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE building_id = b.id), 0) as sections_count,
+		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE building_id = b.id), 0) as total_smeta
+		FROM construction_buildings b
+		WHERE b.project_id = $1 AND b.tenant_id = $2
+		ORDER BY b.sort_order, b.code
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query buildings", "error", err)
+		response.InternalError(c, "Failed to query buildings")
+		return
+	}
+	defer rows.Close()
+
+	buildings := []entity.ConstructionBuilding{}
+	for rows.Next() {
+		var b entity.ConstructionBuilding
+		if err := rows.Scan(
+			&b.ID, &b.TenantID, &b.ProjectID, &b.Code, &b.Name, &b.Description,
+			&b.BuildingType, &b.BuildingPurpose, &b.FloorsCount, &b.FloorsUnderground,
+			&b.TotalArea, &b.LivingArea, &b.NonLivingArea,
+			&b.ApartmentsCount, &b.CommercialUnitsCount, &b.ParkingSpots,
+			&b.EstimatedCost, &b.ActualCost, &b.Currency,
+			&b.PlannedStartDate, &b.PlannedEndDate, &b.ActualStartDate, &b.ActualEndDate,
+			&b.Status, &b.ProgressPercent, &b.GpsCoordinates, &b.LocationDescription,
+			&b.SortOrder, &b.CreatedDate, &b.UpdatedDate,
+			&b.SectionsCount, &b.TotalSmeta,
+		); err != nil {
+			h.log.Error("Failed to scan building", "error", err)
+			continue
+		}
+		buildings = append(buildings, b)
+	}
+
+	response.Success(c, buildings)
+}
+
+// CreateConstructionBuilding creates a new building
+func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req entity.CreateConstructionBuildingInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	var plannedStart, plannedEnd interface{}
+	if req.PlannedStartDate != "" {
+		t, _ := time.Parse("2006-01-02", req.PlannedStartDate)
+		plannedStart = t
+	}
+	if req.PlannedEndDate != "" {
+		t, _ := time.Parse("2006-01-02", req.PlannedEndDate)
+		plannedEnd = t
+	}
+
+	query := `
+		INSERT INTO construction_buildings (
+			tenant_id, project_id, code, name, description,
+			building_type, building_purpose, floors_count, floors_underground,
+			total_area, living_area, non_living_area,
+			apartments_count, commercial_units_count, parking_spots,
+			estimated_cost, currency,
+			planned_start_date, planned_end_date,
+			status, sort_order, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'UZS', $17, $18, 'draft', $19, NOW(), NOW())
+		RETURNING id, created_date
+	`
+
+	var buildingID int64
+	var createdDate time.Time
+	err = h.db.QueryRow(query,
+		tenantID, projectID, req.Code, req.Name, nullString(req.Description),
+		nullString(req.BuildingType), nullString(req.BuildingPurpose),
+		nullInt32(int32(req.FloorsCount)), nullInt32(int32(req.FloorsUnderground)),
+		nullFloat64(req.TotalArea), nullFloat64(req.LivingArea), nullFloat64(req.NonLivingArea),
+		nullInt32(int32(req.ApartmentsCount)), nullInt32(int32(req.CommercialUnitsCount)), nullInt32(int32(req.ParkingSpots)),
+		nullFloat64(req.EstimatedCost),
+		plannedStart, plannedEnd,
+		req.SortOrder,
+	).Scan(&buildingID, &createdDate)
+	if err != nil {
+		h.log.Error("Failed to create building", "error", err)
+		response.InternalError(c, "Failed to create building")
+		return
+	}
+
+	// Update project buildings count
+	h.db.Exec(`UPDATE construction_projects SET buildings_count = buildings_count + 1, updated_date = NOW() WHERE id = $1`, projectID)
+
+	response.Created(c, map[string]interface{}{
+		"id":           buildingID,
+		"code":         req.Code,
+		"name":         req.Name,
+		"created_date": createdDate,
+	})
+}
+
+// UpdateConstructionBuilding updates a building
+func (h *Handler) UpdateConstructionBuilding(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	buildingID, err := strconv.ParseInt(c.Param("building_id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid building ID")
+		return
+	}
+
+	var req entity.UpdateConstructionBuildingInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if req.Name != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
+		args = append(args, *req.Name)
+	}
+	if req.Description != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, *req.Description)
+	}
+	if req.BuildingType != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("building_type = $%d", argCount))
+		args = append(args, *req.BuildingType)
+	}
+	if req.BuildingPurpose != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("building_purpose = $%d", argCount))
+		args = append(args, *req.BuildingPurpose)
+	}
+	if req.FloorsCount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("floors_count = $%d", argCount))
+		args = append(args, *req.FloorsCount)
+	}
+	if req.TotalArea != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("total_area = $%d", argCount))
+		args = append(args, *req.TotalArea)
+	}
+	if req.ApartmentsCount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("apartments_count = $%d", argCount))
+		args = append(args, *req.ApartmentsCount)
+	}
+	if req.EstimatedCost != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("estimated_cost = $%d", argCount))
+		args = append(args, *req.EstimatedCost)
+	}
+	if req.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *req.Status)
+	}
+	if req.ProgressPercent != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("progress_percent = $%d", argCount))
+		args = append(args, *req.ProgressPercent)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_date = NOW()"))
+	args = append(args, buildingID)
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(`
+		UPDATE construction_buildings
+		SET %s
+		WHERE id = $%d AND tenant_id = $%d
+	`, strings.Join(updates, ", "), argCount, argCount+1)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update building", "error", err)
+		response.InternalError(c, "Failed to update building")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Building not found")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{"message": "Building updated successfully"})
+}
+
+// DeleteConstructionBuilding deletes a building
+func (h *Handler) DeleteConstructionBuilding(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	buildingID, err := strconv.ParseInt(c.Param("building_id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid building ID")
+		return
+	}
+
+	result, err := h.db.Exec(`DELETE FROM construction_buildings WHERE id = $1 AND tenant_id = $2`, buildingID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete building", "error", err)
+		response.InternalError(c, "Failed to delete building")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Building not found")
+		return
+	}
+
+	// Update project buildings count
+	h.db.Exec(`UPDATE construction_projects SET buildings_count = GREATEST(0, buildings_count - 1), updated_date = NOW() WHERE id = $1`, projectID)
+
+	response.Success(c, map[string]interface{}{"message": "Building deleted successfully"})
+}
+
+// =====================================================
 // SMETA SECTION HANDLERS
 // =====================================================
 

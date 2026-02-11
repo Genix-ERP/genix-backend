@@ -1347,6 +1347,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.PUT("/:id", middleware.RequirePermission("construction", "project", "update"), h.UpdateConstructionProject)
 		constructionProjects.DELETE("/:id", middleware.RequirePermission("construction", "project", "delete"), h.DeleteConstructionProject)
 		constructionProjects.GET("/:id/dashboard", h.GetConstructionProjectDashboard)
+		// Buildings/Blocks
+		constructionProjects.GET("/:id/buildings", h.ListConstructionBuildings)
+		constructionProjects.POST("/:id/buildings", middleware.RequirePermission("construction", "project", "create"), h.CreateConstructionBuilding)
+		constructionProjects.PUT("/:id/buildings/:building_id", middleware.RequirePermission("construction", "project", "update"), h.UpdateConstructionBuilding)
+		constructionProjects.DELETE("/:id/buildings/:building_id", middleware.RequirePermission("construction", "project", "delete"), h.DeleteConstructionBuilding)
 		// Smeta Sections
 		constructionProjects.GET("/:id/sections", h.ListSmetaSections)
 		constructionProjects.POST("/:id/sections", middleware.RequirePermission("construction", "smeta", "create"), h.CreateSmetaSection)
