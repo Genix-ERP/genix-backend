@@ -126,18 +126,122 @@ type UpdateConstructionProjectInput struct {
 }
 
 // =====================================================
+// CONSTRUCTION BUILDING/BLOCK
+// =====================================================
+
+// ConstructionBuilding represents a building/block within a construction project
+type ConstructionBuilding struct {
+	ID        int64     `json:"id" db:"id"`
+	TenantID  uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	ProjectID int64     `json:"project_id" db:"project_id"`
+
+	Code        string         `json:"code" db:"code"`
+	Name        string         `json:"name" db:"name"`
+	Description sql.NullString `json:"description" db:"description"`
+
+	// Building type
+	BuildingType    sql.NullString `json:"building_type" db:"building_type"`
+	BuildingPurpose sql.NullString `json:"building_purpose" db:"building_purpose"`
+
+	// Physical characteristics
+	FloorsCount       sql.NullInt32   `json:"floors_count" db:"floors_count"`
+	FloorsUnderground sql.NullInt32   `json:"floors_underground" db:"floors_underground"`
+	TotalArea         sql.NullFloat64 `json:"total_area" db:"total_area"`
+	LivingArea        sql.NullFloat64 `json:"living_area" db:"living_area"`
+	NonLivingArea     sql.NullFloat64 `json:"non_living_area" db:"non_living_area"`
+
+	// Units info
+	ApartmentsCount      sql.NullInt32 `json:"apartments_count" db:"apartments_count"`
+	CommercialUnitsCount sql.NullInt32 `json:"commercial_units_count" db:"commercial_units_count"`
+	ParkingSpots         sql.NullInt32 `json:"parking_spots" db:"parking_spots"`
+
+	// Financial
+	EstimatedCost sql.NullFloat64 `json:"estimated_cost" db:"estimated_cost"`
+	ActualCost    sql.NullFloat64 `json:"actual_cost" db:"actual_cost"`
+	Currency      string          `json:"currency" db:"currency"`
+
+	// Timeline
+	PlannedStartDate sql.NullTime `json:"planned_start_date" db:"planned_start_date"`
+	PlannedEndDate   sql.NullTime `json:"planned_end_date" db:"planned_end_date"`
+	ActualStartDate  sql.NullTime `json:"actual_start_date" db:"actual_start_date"`
+	ActualEndDate    sql.NullTime `json:"actual_end_date" db:"actual_end_date"`
+
+	// Status
+	Status          string          `json:"status" db:"status"`
+	ProgressPercent sql.NullFloat64 `json:"progress_percent" db:"progress_percent"`
+
+	// Location
+	GpsCoordinates      json.RawMessage `json:"gps_coordinates" db:"gps_coordinates"`
+	LocationDescription sql.NullString  `json:"location_description" db:"location_description"`
+
+	SortOrder   int       `json:"sort_order" db:"sort_order"`
+	CreatedDate time.Time `json:"created_date" db:"created_date"`
+	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
+
+	// Computed
+	SectionsCount int     `json:"sections_count,omitempty" db:"sections_count"`
+	TotalSmeta    float64 `json:"total_smeta,omitempty" db:"total_smeta"`
+}
+
+// CreateConstructionBuildingInput represents input for creating a building
+type CreateConstructionBuildingInput struct {
+	Code                 string  `json:"code" binding:"required"`
+	Name                 string  `json:"name" binding:"required"`
+	Description          string  `json:"description"`
+	BuildingType         string  `json:"building_type"`
+	BuildingPurpose      string  `json:"building_purpose"`
+	FloorsCount          int     `json:"floors_count"`
+	FloorsUnderground    int     `json:"floors_underground"`
+	TotalArea            float64 `json:"total_area"`
+	LivingArea           float64 `json:"living_area"`
+	NonLivingArea        float64 `json:"non_living_area"`
+	ApartmentsCount      int     `json:"apartments_count"`
+	CommercialUnitsCount int     `json:"commercial_units_count"`
+	ParkingSpots         int     `json:"parking_spots"`
+	EstimatedCost        float64 `json:"estimated_cost"`
+	PlannedStartDate     string  `json:"planned_start_date"`
+	PlannedEndDate       string  `json:"planned_end_date"`
+	SortOrder            int     `json:"sort_order"`
+}
+
+// UpdateConstructionBuildingInput represents input for updating a building
+type UpdateConstructionBuildingInput struct {
+	Name                 *string  `json:"name"`
+	Description          *string  `json:"description"`
+	BuildingType         *string  `json:"building_type"`
+	BuildingPurpose      *string  `json:"building_purpose"`
+	FloorsCount          *int     `json:"floors_count"`
+	FloorsUnderground    *int     `json:"floors_underground"`
+	TotalArea            *float64 `json:"total_area"`
+	LivingArea           *float64 `json:"living_area"`
+	NonLivingArea        *float64 `json:"non_living_area"`
+	ApartmentsCount      *int     `json:"apartments_count"`
+	CommercialUnitsCount *int     `json:"commercial_units_count"`
+	ParkingSpots         *int     `json:"parking_spots"`
+	EstimatedCost        *float64 `json:"estimated_cost"`
+	PlannedStartDate     *string  `json:"planned_start_date"`
+	PlannedEndDate       *string  `json:"planned_end_date"`
+	ActualStartDate      *string  `json:"actual_start_date"`
+	ActualEndDate        *string  `json:"actual_end_date"`
+	Status               *string  `json:"status"`
+	ProgressPercent      *float64 `json:"progress_percent"`
+	SortOrder            *int     `json:"sort_order"`
+}
+
+// =====================================================
 // SMETA SECTION
 // =====================================================
 
 // SmetaSection represents a section in smeta (estimate)
 type SmetaSection struct {
-	ID        int64          `json:"id" db:"id"`
-	TenantID  uuid.UUID      `json:"tenant_id" db:"tenant_id"`
-	ProjectID int64          `json:"project_id" db:"project_id"`
-	ParentID  sql.NullInt64  `json:"parent_id" db:"parent_id"`
-	Code      string         `json:"code" db:"code"`
-	Name      string         `json:"name" db:"name"`
-	NameUz    sql.NullString `json:"name_uz" db:"name_uz"`
+	ID         int64          `json:"id" db:"id"`
+	TenantID   uuid.UUID      `json:"tenant_id" db:"tenant_id"`
+	ProjectID  int64          `json:"project_id" db:"project_id"`
+	BuildingID sql.NullInt64  `json:"building_id" db:"building_id"`
+	ParentID   sql.NullInt64  `json:"parent_id" db:"parent_id"`
+	Code       string         `json:"code" db:"code"`
+	Name       string         `json:"name" db:"name"`
+	NameUz     sql.NullString `json:"name_uz" db:"name_uz"`
 	Description sql.NullString `json:"description" db:"description"`
 
 	// Calculated totals
