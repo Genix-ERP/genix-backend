@@ -16,7 +16,7 @@ import (
 type ConstructionProject struct {
 	ID             int64          `json:"id" db:"id"`
 	TenantID       uuid.UUID      `json:"tenant_id" db:"tenant_id"`
-	OrganizationID sql.NullInt64  `json:"organization_id" db:"organization_id"`
+	OrganizationID uuid.NullUUID  `json:"organization_id" db:"organization_id"`
 	Code           string         `json:"code" db:"code"`
 	Name           string         `json:"name" db:"name"`
 	Description    sql.NullString `json:"description" db:"description"`

@@ -7,7 +7,7 @@
 CREATE TABLE IF NOT EXISTS construction_projects (
     id BIGSERIAL PRIMARY KEY,
     tenant_id UUID NOT NULL REFERENCES tenants(id),
-    organization_id BIGINT REFERENCES organizations(id),
+    organization_id UUID REFERENCES organizations(id),
 
     -- Basic Info
     code VARCHAR(50) NOT NULL,
