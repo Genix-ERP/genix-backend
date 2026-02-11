@@ -2335,11 +2335,11 @@ func (h *Handler) CreateSiteWarehouse(c *gin.Context) {
 }
 
 // =====================================================
-// PROJECT TEAM MEMBER HANDLERS
+// CONSTRUCTION PROJECT TEAM MEMBER HANDLERS
 // =====================================================
 
-// ListProjectTeamMembers returns team members for a construction project
-func (h *Handler) ListProjectTeamMembers(c *gin.Context) {
+// ListConstructionTeamMembers returns team members for a construction project
+func (h *Handler) ListConstructionTeamMembers(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
 		response.Unauthorized(c, "Tenant not found")
@@ -2413,8 +2413,8 @@ func (h *Handler) ListProjectTeamMembers(c *gin.Context) {
 	response.Success(c, members)
 }
 
-// CreateProjectTeamMember adds a team member to a construction project
-func (h *Handler) CreateProjectTeamMember(c *gin.Context) {
+// CreateConstructionTeamMember adds a team member to a construction project
+func (h *Handler) CreateConstructionTeamMember(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
 		response.Unauthorized(c, "Tenant not found")
@@ -2435,7 +2435,7 @@ func (h *Handler) CreateProjectTeamMember(c *gin.Context) {
 		return
 	}
 
-	var req entity.CreateTeamMemberInput
+	var req entity.CreateConstructionTeamMemberInput
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
 		return
@@ -2496,8 +2496,8 @@ func (h *Handler) CreateProjectTeamMember(c *gin.Context) {
 	})
 }
 
-// DeleteProjectTeamMember removes a team member from a construction project
-func (h *Handler) DeleteProjectTeamMember(c *gin.Context) {
+// DeleteConstructionTeamMember removes a team member from a construction project
+func (h *Handler) DeleteConstructionTeamMember(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
 		response.Unauthorized(c, "Tenant not found")

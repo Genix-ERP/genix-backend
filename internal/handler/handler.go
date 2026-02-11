@@ -1380,9 +1380,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/warehouses", middleware.RequirePermission("construction", "projects", "update"), h.CreateSiteWarehouse)
 
 		// Team Members
-		constructionProjects.GET("/:id/team", h.ListProjectTeamMembers)
-		constructionProjects.POST("/:id/team", middleware.RequirePermission("construction", "project", "update"), h.CreateProjectTeamMember)
-		constructionProjects.DELETE("/:id/team/:memberId", middleware.RequirePermission("construction", "project", "update"), h.DeleteProjectTeamMember)
+		constructionProjects.GET("/:id/team", h.ListConstructionTeamMembers)
+		constructionProjects.POST("/:id/team", middleware.RequirePermission("construction", "project", "update"), h.CreateConstructionTeamMember)
+		constructionProjects.DELETE("/:id/team/:memberId", middleware.RequirePermission("construction", "project", "update"), h.DeleteConstructionTeamMember)
 	}
 
 	// Smeta Sections (direct access)
@@ -1414,6 +1414,28 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		installedApps.GET("/:app_id", h.GetInstalledApp)
 		installedApps.PUT("/:app_id", h.UpdateInstalledApp)
 		installedApps.DELETE("/:app_id", h.UninstallApp)
+	}
+
+	// =====================================================
+	// ACTIVITY LOG / CHATTER ROUTES
+	// =====================================================
+	activityLogs := rg.Group("/activity")
+	{
+		// Activity logs for any record
+		activityLogs.GET("/:model/:record_id/logs", h.ListActivityLogs)
+
+		// Comments (Chatter)
+		activityLogs.GET("/:model/:record_id/comments", h.ListComments)
+		activityLogs.POST("/:model/:record_id/comments", h.CreateComment)
+		activityLogs.DELETE("/comments/:comment_id", h.DeleteComment)
+
+		// Scheduled Activities
+		activityLogs.GET("/:model/:record_id/scheduled", h.ListScheduledActivities)
+		activityLogs.POST("/:model/:record_id/scheduled", h.CreateScheduledActivity)
+		activityLogs.PUT("/scheduled/:activity_id/complete", h.CompleteScheduledActivity)
+
+		// My Activities (all pending activities for current user)
+		activityLogs.GET("/my-activities", h.ListMyActivities)
 	}
 
 	// =====================================================

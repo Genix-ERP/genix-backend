@@ -1026,11 +1026,11 @@ type CreateSiteWarehouseInput struct {
 }
 
 // =====================================================
-// PROJECT TEAM MEMBER
+// CONSTRUCTION PROJECT TEAM MEMBER
 // =====================================================
 
-// ProjectTeamMember represents a team member assigned to a construction project
-type ProjectTeamMember struct {
+// ConstructionTeamMember represents a team member assigned to a construction project
+type ConstructionTeamMember struct {
 	ID               int64          `json:"id" db:"id"`
 	ProjectID        int64          `json:"project_id" db:"project_id"`
 	EmployeeID       uuid.UUID      `json:"employee_id" db:"employee_id"`
@@ -1048,8 +1048,8 @@ type ProjectTeamMember struct {
 	Email        string `json:"email,omitempty" db:"email"`
 }
 
-// CreateTeamMemberInput represents input for adding a team member to a project
-type CreateTeamMemberInput struct {
+// CreateConstructionTeamMemberInput represents input for adding a team member to a construction project
+type CreateConstructionTeamMemberInput struct {
 	EmployeeID       string `json:"employee_id" binding:"required"`
 	Role             string `json:"role" binding:"required"`
 	Responsibilities string `json:"responsibilities"`
