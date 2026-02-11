@@ -1404,6 +1404,23 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		smetaItems.DELETE("/:id", middleware.RequirePermission("construction", "smeta", "delete"), h.DeleteSmetaItem)
 	}
 
+	// Material Requests (direct access)
+	materialRequests := rg.Group("/construction/material-requests")
+	materialRequests.Use(middleware.RequirePermission("construction", "projects", "read"))
+	{
+		materialRequests.PUT("/:id", middleware.RequirePermission("construction", "projects", "update"), h.UpdateMaterialRequest)
+		materialRequests.DELETE("/:id", middleware.RequirePermission("construction", "projects", "delete"), h.DeleteMaterialRequest)
+	}
+
+	// Daily Reports (direct access)
+	dailyReports := rg.Group("/construction/daily-reports")
+	dailyReports.Use(middleware.RequirePermission("construction", "reports", "read"))
+	{
+		dailyReports.GET("/:id", h.GetDailyReport)
+		dailyReports.PUT("/:id", middleware.RequirePermission("construction", "reports", "submit"), h.UpdateDailyReport)
+		dailyReports.DELETE("/:id", middleware.RequirePermission("construction", "reports", "submit"), h.DeleteDailyReport)
+	}
+
 	// =====================================================
 	// INSTALLED APPS ROUTES
 	// =====================================================
