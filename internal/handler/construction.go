@@ -1377,3 +1377,37 @@ func nullUUID(s string) uuid.NullUUID {
 	}
 	return uuid.NullUUID{UUID: parsed, Valid: true}
 }
+
+// =====================================================
+// PLACEHOLDER HANDLERS (Return empty arrays for now)
+// =====================================================
+
+// ListProjectVendors returns vendors for a project (placeholder)
+func (h *Handler) ListProjectVendors(c *gin.Context) {
+	response.Success(c, []interface{}{})
+}
+
+// ListPhotoReports returns photo reports for a project (placeholder)
+func (h *Handler) ListPhotoReports(c *gin.Context) {
+	response.Success(c, []interface{}{})
+}
+
+// ListDailyReports returns daily reports for a project (placeholder)
+func (h *Handler) ListDailyReports(c *gin.Context) {
+	response.Success(c, []interface{}{})
+}
+
+// ListMaterialRequests returns material requests for a project (placeholder)
+func (h *Handler) ListMaterialRequests(c *gin.Context) {
+	response.Success(c, []interface{}{})
+}
+
+// ListDeliveries returns deliveries for a project (placeholder)
+func (h *Handler) ListDeliveries(c *gin.Context) {
+	response.Success(c, []interface{}{})
+}
+
+// ListSiteWarehouses returns site warehouses for a project (placeholder)
+func (h *Handler) ListSiteWarehouses(c *gin.Context) {
+	response.Success(c, []interface{}{})
+}
