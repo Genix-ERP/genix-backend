@@ -8,6 +8,49 @@ import (
 	"github.com/google/uuid"
 )
 
+// Helper functions for JSON serialization of sql.Null* types
+func nullStringValue(ns sql.NullString) interface{} {
+	if ns.Valid {
+		return ns.String
+	}
+	return nil
+}
+
+func nullFloat64Value(nf sql.NullFloat64) interface{} {
+	if nf.Valid {
+		return nf.Float64
+	}
+	return nil
+}
+
+func nullInt32Value(ni sql.NullInt32) interface{} {
+	if ni.Valid {
+		return ni.Int32
+	}
+	return nil
+}
+
+func nullInt64Value(ni sql.NullInt64) interface{} {
+	if ni.Valid {
+		return ni.Int64
+	}
+	return nil
+}
+
+func nullTimeValue(nt sql.NullTime) interface{} {
+	if nt.Valid {
+		return nt.Time
+	}
+	return nil
+}
+
+func nullUUIDValue(nu uuid.NullUUID) interface{} {
+	if nu.Valid {
+		return nu.UUID
+	}
+	return nil
+}
+
 // =====================================================
 // CONSTRUCTION PROJECT
 // =====================================================
@@ -69,6 +112,86 @@ type ConstructionProject struct {
 	ChiefEngineerName  string `json:"chief_engineer_name,omitempty" db:"chief_engineer_name"`
 	SectionsCount      int    `json:"sections_count,omitempty" db:"sections_count"`
 	TotalSmeta         float64 `json:"total_smeta,omitempty" db:"total_smeta"`
+}
+
+// MarshalJSON custom marshaler for ConstructionProject to handle sql.Null* types
+func (p ConstructionProject) MarshalJSON() ([]byte, error) {
+	type Alias ConstructionProject
+	return json.Marshal(&struct {
+		Description      interface{} `json:"description"`
+		Address          interface{} `json:"address"`
+		City             interface{} `json:"city"`
+		District         interface{} `json:"district"`
+		Region           interface{} `json:"region"`
+		ClientName       interface{} `json:"client_name"`
+		ClientContact    interface{} `json:"client_contact"`
+		ClientPhone      interface{} `json:"client_phone"`
+		ProjectType      interface{} `json:"project_type"`
+		BuildingType     interface{} `json:"building_type"`
+		TotalArea        interface{} `json:"total_area"`
+		FloorsCount      interface{} `json:"floors_count"`
+		ContractAmount   interface{} `json:"contract_amount"`
+		ContractDate     interface{} `json:"contract_date"`
+		PlannedStartDate interface{} `json:"planned_start_date"`
+		PlannedEndDate   interface{} `json:"planned_end_date"`
+		ActualStartDate  interface{} `json:"actual_start_date"`
+		ActualEndDate    interface{} `json:"actual_end_date"`
+		ProgressPercent  interface{} `json:"progress_percent"`
+		ProjectManagerID interface{} `json:"project_manager_id"`
+		ChiefEngineerID  interface{} `json:"chief_engineer_id"`
+		OrganizationID   interface{} `json:"organization_id"`
+		ID               int64       `json:"id"`
+		TenantID         uuid.UUID   `json:"tenant_id"`
+		Code             string      `json:"code"`
+		Name             string      `json:"name"`
+		Coordinates      json.RawMessage `json:"coordinates"`
+		Currency         string      `json:"currency"`
+		Status           string      `json:"status"`
+		CreatedBy        *uuid.UUID  `json:"created_by"`
+		CreatedDate      time.Time   `json:"created_date"`
+		UpdatedDate      time.Time   `json:"updated_date"`
+		ProjectManagerName string    `json:"project_manager_name,omitempty"`
+		ChiefEngineerName  string    `json:"chief_engineer_name,omitempty"`
+		SectionsCount      int       `json:"sections_count,omitempty"`
+		TotalSmeta         float64   `json:"total_smeta,omitempty"`
+	}{
+		Description:        nullStringValue(p.Description),
+		Address:            nullStringValue(p.Address),
+		City:               nullStringValue(p.City),
+		District:           nullStringValue(p.District),
+		Region:             nullStringValue(p.Region),
+		ClientName:         nullStringValue(p.ClientName),
+		ClientContact:      nullStringValue(p.ClientContact),
+		ClientPhone:        nullStringValue(p.ClientPhone),
+		ProjectType:        nullStringValue(p.ProjectType),
+		BuildingType:       nullStringValue(p.BuildingType),
+		TotalArea:          nullFloat64Value(p.TotalArea),
+		FloorsCount:        nullInt32Value(p.FloorsCount),
+		ContractAmount:     nullFloat64Value(p.ContractAmount),
+		ContractDate:       nullTimeValue(p.ContractDate),
+		PlannedStartDate:   nullTimeValue(p.PlannedStartDate),
+		PlannedEndDate:     nullTimeValue(p.PlannedEndDate),
+		ActualStartDate:    nullTimeValue(p.ActualStartDate),
+		ActualEndDate:      nullTimeValue(p.ActualEndDate),
+		ProgressPercent:    nullFloat64Value(p.ProgressPercent),
+		ProjectManagerID:   nullUUIDValue(p.ProjectManagerID),
+		ChiefEngineerID:    nullUUIDValue(p.ChiefEngineerID),
+		OrganizationID:     nullUUIDValue(p.OrganizationID),
+		ID:                 p.ID,
+		TenantID:           p.TenantID,
+		Code:               p.Code,
+		Name:               p.Name,
+		Coordinates:        p.Coordinates,
+		Currency:           p.Currency,
+		Status:             p.Status,
+		CreatedBy:          p.CreatedBy,
+		CreatedDate:        p.CreatedDate,
+		UpdatedDate:        p.UpdatedDate,
+		ProjectManagerName: p.ProjectManagerName,
+		ChiefEngineerName:  p.ChiefEngineerName,
+		SectionsCount:      p.SectionsCount,
+		TotalSmeta:         p.TotalSmeta,
+	})
 }
 
 // CreateConstructionProjectInput represents input for creating a construction project
@@ -183,6 +306,77 @@ type ConstructionBuilding struct {
 	TotalSmeta    float64 `json:"total_smeta,omitempty" db:"total_smeta"`
 }
 
+// MarshalJSON custom marshaler for ConstructionBuilding to handle sql.Null* types
+func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		ID                   int64           `json:"id"`
+		TenantID             uuid.UUID       `json:"tenant_id"`
+		ProjectID            int64           `json:"project_id"`
+		Code                 string          `json:"code"`
+		Name                 string          `json:"name"`
+		Description          interface{}     `json:"description"`
+		BuildingType         interface{}     `json:"building_type"`
+		BuildingPurpose      interface{}     `json:"building_purpose"`
+		FloorsCount          interface{}     `json:"floors_count"`
+		FloorsUnderground    interface{}     `json:"floors_underground"`
+		TotalArea            interface{}     `json:"total_area"`
+		LivingArea           interface{}     `json:"living_area"`
+		NonLivingArea        interface{}     `json:"non_living_area"`
+		ApartmentsCount      interface{}     `json:"apartments_count"`
+		CommercialUnitsCount interface{}     `json:"commercial_units_count"`
+		ParkingSpots         interface{}     `json:"parking_spots"`
+		EstimatedCost        interface{}     `json:"estimated_cost"`
+		ActualCost           interface{}     `json:"actual_cost"`
+		Currency             string          `json:"currency"`
+		PlannedStartDate     interface{}     `json:"planned_start_date"`
+		PlannedEndDate       interface{}     `json:"planned_end_date"`
+		ActualStartDate      interface{}     `json:"actual_start_date"`
+		ActualEndDate        interface{}     `json:"actual_end_date"`
+		Status               string          `json:"status"`
+		ProgressPercent      interface{}     `json:"progress_percent"`
+		GpsCoordinates       json.RawMessage `json:"gps_coordinates"`
+		LocationDescription  interface{}     `json:"location_description"`
+		SortOrder            int             `json:"sort_order"`
+		CreatedDate          time.Time       `json:"created_date"`
+		UpdatedDate          time.Time       `json:"updated_date"`
+		SectionsCount        int             `json:"sections_count,omitempty"`
+		TotalSmeta           float64         `json:"total_smeta,omitempty"`
+	}{
+		ID:                   b.ID,
+		TenantID:             b.TenantID,
+		ProjectID:            b.ProjectID,
+		Code:                 b.Code,
+		Name:                 b.Name,
+		Description:          nullStringValue(b.Description),
+		BuildingType:         nullStringValue(b.BuildingType),
+		BuildingPurpose:      nullStringValue(b.BuildingPurpose),
+		FloorsCount:          nullInt32Value(b.FloorsCount),
+		FloorsUnderground:    nullInt32Value(b.FloorsUnderground),
+		TotalArea:            nullFloat64Value(b.TotalArea),
+		LivingArea:           nullFloat64Value(b.LivingArea),
+		NonLivingArea:        nullFloat64Value(b.NonLivingArea),
+		ApartmentsCount:      nullInt32Value(b.ApartmentsCount),
+		CommercialUnitsCount: nullInt32Value(b.CommercialUnitsCount),
+		ParkingSpots:         nullInt32Value(b.ParkingSpots),
+		EstimatedCost:        nullFloat64Value(b.EstimatedCost),
+		ActualCost:           nullFloat64Value(b.ActualCost),
+		Currency:             b.Currency,
+		PlannedStartDate:     nullTimeValue(b.PlannedStartDate),
+		PlannedEndDate:       nullTimeValue(b.PlannedEndDate),
+		ActualStartDate:      nullTimeValue(b.ActualStartDate),
+		ActualEndDate:        nullTimeValue(b.ActualEndDate),
+		Status:               b.Status,
+		ProgressPercent:      nullFloat64Value(b.ProgressPercent),
+		GpsCoordinates:       b.GpsCoordinates,
+		LocationDescription:  nullStringValue(b.LocationDescription),
+		SortOrder:            b.SortOrder,
+		CreatedDate:          b.CreatedDate,
+		UpdatedDate:          b.UpdatedDate,
+		SectionsCount:        b.SectionsCount,
+		TotalSmeta:           b.TotalSmeta,
+	})
+}
+
 // CreateConstructionBuildingInput represents input for creating a building
 type CreateConstructionBuildingInput struct {
 	Code                 string  `json:"code" binding:"required"`
@@ -261,6 +455,53 @@ type SmetaSection struct {
 	ItemsCount int `json:"items_count,omitempty" db:"items_count"`
 }
 
+// MarshalJSON custom marshaler for SmetaSection to handle sql.Null* types
+func (s SmetaSection) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		ID                 int64       `json:"id"`
+		TenantID           uuid.UUID   `json:"tenant_id"`
+		ProjectID          int64       `json:"project_id"`
+		BuildingID         interface{} `json:"building_id"`
+		ParentID           interface{} `json:"parent_id"`
+		Code               string      `json:"code"`
+		Name               string      `json:"name"`
+		NameUz             interface{} `json:"name_uz"`
+		Description        interface{} `json:"description"`
+		TotalLaborHours    float64     `json:"total_labor_hours"`
+		TotalLaborCost     float64     `json:"total_labor_cost"`
+		TotalMaterialCost  float64     `json:"total_material_cost"`
+		TotalEquipmentCost float64     `json:"total_equipment_cost"`
+		TotalOverheadCost  float64     `json:"total_overhead_cost"`
+		TotalCost          float64     `json:"total_cost"`
+		SortOrder          int         `json:"sort_order"`
+		Status             string      `json:"status"`
+		CreatedDate        time.Time   `json:"created_date"`
+		UpdatedDate        time.Time   `json:"updated_date"`
+		ItemsCount         int         `json:"items_count,omitempty"`
+	}{
+		ID:                 s.ID,
+		TenantID:           s.TenantID,
+		ProjectID:          s.ProjectID,
+		BuildingID:         nullInt64Value(s.BuildingID),
+		ParentID:           nullInt64Value(s.ParentID),
+		Code:               s.Code,
+		Name:               s.Name,
+		NameUz:             nullStringValue(s.NameUz),
+		Description:        nullStringValue(s.Description),
+		TotalLaborHours:    s.TotalLaborHours,
+		TotalLaborCost:     s.TotalLaborCost,
+		TotalMaterialCost:  s.TotalMaterialCost,
+		TotalEquipmentCost: s.TotalEquipmentCost,
+		TotalOverheadCost:  s.TotalOverheadCost,
+		TotalCost:          s.TotalCost,
+		SortOrder:          s.SortOrder,
+		Status:             s.Status,
+		CreatedDate:        s.CreatedDate,
+		UpdatedDate:        s.UpdatedDate,
+		ItemsCount:         s.ItemsCount,
+	})
+}
+
 // CreateSmetaSectionInput represents input for creating a smeta section
 type CreateSmetaSectionInput struct {
 	Code        string `json:"code" binding:"required"`
@@ -323,6 +564,65 @@ type SmetaItem struct {
 
 	// Computed
 	SectionName string `json:"section_name,omitempty" db:"section_name"`
+}
+
+// MarshalJSON custom marshaler for SmetaItem to handle sql.Null* types
+func (i SmetaItem) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		ID                int64           `json:"id"`
+		TenantID          uuid.UUID       `json:"tenant_id"`
+		SectionID         int64           `json:"section_id"`
+		Code              interface{}     `json:"code"`
+		SnipCode          interface{}     `json:"snip_code"`
+		Name              string          `json:"name"`
+		NameUz            interface{}     `json:"name_uz"`
+		Unit              string          `json:"unit"`
+		Quantity          float64         `json:"quantity"`
+		CompletedQuantity float64         `json:"completed_quantity"`
+		UnitPrice         interface{}     `json:"unit_price"`
+		TotalPrice        interface{}     `json:"total_price"`
+		LaborHours        float64         `json:"labor_hours"`
+		LaborCost         float64         `json:"labor_cost"`
+		MaterialCost      float64         `json:"material_cost"`
+		EquipmentCost     float64         `json:"equipment_cost"`
+		TransportCost     float64         `json:"transport_cost"`
+		OverheadCost      float64         `json:"overhead_cost"`
+		Status            string          `json:"status"`
+		ProgressPercent   interface{}     `json:"progress_percent"`
+		Notes             interface{}     `json:"notes"`
+		TechnicalSpecs    json.RawMessage `json:"technical_specs"`
+		SortOrder         int             `json:"sort_order"`
+		CreatedDate       time.Time       `json:"created_date"`
+		UpdatedDate       time.Time       `json:"updated_date"`
+		SectionName       string          `json:"section_name,omitempty"`
+	}{
+		ID:                i.ID,
+		TenantID:          i.TenantID,
+		SectionID:         i.SectionID,
+		Code:              nullStringValue(i.Code),
+		SnipCode:          nullStringValue(i.SnipCode),
+		Name:              i.Name,
+		NameUz:            nullStringValue(i.NameUz),
+		Unit:              i.Unit,
+		Quantity:          i.Quantity,
+		CompletedQuantity: i.CompletedQuantity,
+		UnitPrice:         nullFloat64Value(i.UnitPrice),
+		TotalPrice:        nullFloat64Value(i.TotalPrice),
+		LaborHours:        i.LaborHours,
+		LaborCost:         i.LaborCost,
+		MaterialCost:      i.MaterialCost,
+		EquipmentCost:     i.EquipmentCost,
+		TransportCost:     i.TransportCost,
+		OverheadCost:      i.OverheadCost,
+		Status:            i.Status,
+		ProgressPercent:   nullFloat64Value(i.ProgressPercent),
+		Notes:             nullStringValue(i.Notes),
+		TechnicalSpecs:    i.TechnicalSpecs,
+		SortOrder:         i.SortOrder,
+		CreatedDate:       i.CreatedDate,
+		UpdatedDate:       i.UpdatedDate,
+		SectionName:       i.SectionName,
+	})
 }
 
 // CreateSmetaItemInput represents input for creating a smeta item

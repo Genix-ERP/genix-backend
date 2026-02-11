@@ -1356,13 +1356,28 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/sections", h.ListSmetaSections)
 		constructionProjects.POST("/:id/sections", middleware.RequirePermission("construction", "smeta", "create"), h.CreateSmetaSection)
 
-		// Placeholder routes (return empty arrays for now)
+		// Project Vendors
 		constructionProjects.GET("/:id/vendors", h.ListProjectVendors)
+		constructionProjects.POST("/:id/vendors", middleware.RequirePermission("construction", "projects", "update"), h.CreateProjectVendor)
+
+		// Photo Reports
 		constructionProjects.GET("/:id/photo-reports", h.ListPhotoReports)
+		constructionProjects.POST("/:id/photo-reports", middleware.RequirePermission("construction", "reports", "submit"), h.CreatePhotoReport)
+
+		// Daily Reports
 		constructionProjects.GET("/:id/daily-reports", h.ListDailyReports)
+		constructionProjects.POST("/:id/daily-reports", middleware.RequirePermission("construction", "reports", "submit"), h.CreateDailyReport)
+
+		// Material Requests
 		constructionProjects.GET("/:id/material-requests", h.ListMaterialRequests)
+		constructionProjects.POST("/:id/material-requests", middleware.RequirePermission("construction", "projects", "update"), h.CreateMaterialRequest)
+
+		// Deliveries
 		constructionProjects.GET("/:id/deliveries", h.ListDeliveries)
+
+		// Site Warehouses
 		constructionProjects.GET("/:id/warehouses", h.ListSiteWarehouses)
+		constructionProjects.POST("/:id/warehouses", middleware.RequirePermission("construction", "projects", "update"), h.CreateSiteWarehouse)
 	}
 
 	// Smeta Sections (direct access)
