@@ -1147,11 +1147,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		notifications.PUT("/read-all", h.MarkAllNotificationsRead)
 	}
 
-	// Attachments/Files
+	// Attachments/Files (upload and delete require auth, GET is public - see registerPublicRoutes)
 	files := rg.Group("/files")
 	{
 		files.POST("/upload", h.UploadFile)
-		files.GET("/:id", h.GetFile)
 		files.DELETE("/:id", h.DeleteFile)
 	}
 
