@@ -2029,7 +2029,7 @@ func (h *Handler) GetDailyReport(c *gin.Context) {
 		return
 	}
 
-	response.OK(c, map[string]interface{}{
+	response.Success(c, map[string]interface{}{
 		"id":                  report.ID,
 		"tenant_id":           report.TenantID,
 		"project_id":          report.ProjectID,
@@ -2135,7 +2135,7 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 		return
 	}
 
-	response.OK(c, map[string]interface{}{
+	response.Success(c, map[string]interface{}{
 		"message": "Daily report updated successfully",
 	})
 }
@@ -2168,7 +2168,7 @@ func (h *Handler) DeleteDailyReport(c *gin.Context) {
 		return
 	}
 
-	response.OK(c, map[string]interface{}{
+	response.Success(c, map[string]interface{}{
 		"message": "Daily report deleted successfully",
 	})
 }
@@ -2379,7 +2379,7 @@ func (h *Handler) UpdateMaterialRequest(c *gin.Context) {
 		return
 	}
 
-	response.OK(c, map[string]interface{}{
+	response.Success(c, map[string]interface{}{
 		"message": "Material request updated successfully",
 	})
 }
@@ -2412,7 +2412,7 @@ func (h *Handler) DeleteMaterialRequest(c *gin.Context) {
 		return
 	}
 
-	response.OK(c, map[string]interface{}{
+	response.Success(c, map[string]interface{}{
 		"message": "Material request deleted successfully",
 	})
 }
