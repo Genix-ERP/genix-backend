@@ -1962,6 +1962,217 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 	})
 }
 
+// GetDailyReport returns a single daily report
+func (h *Handler) GetDailyReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	reportID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid report ID")
+		return
+	}
+
+	query := `
+		SELECT id, tenant_id, project_id, report_date,
+		       weather_morning, weather_afternoon, temperature_min, temperature_max,
+		       work_summary, issues_encountered, safety_notes,
+		       workers_count, workers_details, equipment_used, materials_received,
+		       verification_status, verified_by, verified_at, verifier_notes,
+		       created_date, updated_date
+		FROM construction_daily_reports
+		WHERE id = $1 AND tenant_id = $2
+	`
+
+	var report struct {
+		ID                 int64          `json:"id"`
+		TenantID           uuid.UUID      `json:"tenant_id"`
+		ProjectID          int64          `json:"project_id"`
+		ReportDate         time.Time      `json:"report_date"`
+		WeatherMorning     sql.NullString `json:"weather_morning"`
+		WeatherAfternoon   sql.NullString `json:"weather_afternoon"`
+		TemperatureMin     sql.NullFloat64 `json:"temperature_min"`
+		TemperatureMax     sql.NullFloat64 `json:"temperature_max"`
+		WorkSummary        sql.NullString `json:"work_summary"`
+		IssuesEncountered  sql.NullString `json:"issues_encountered"`
+		SafetyNotes        sql.NullString `json:"safety_notes"`
+		WorkersCount       sql.NullInt64  `json:"workers_count"`
+		WorkersDetails     sql.NullString `json:"workers_details"`
+		EquipmentUsed      sql.NullString `json:"equipment_used"`
+		MaterialsReceived  sql.NullString `json:"materials_received"`
+		VerificationStatus sql.NullString `json:"verification_status"`
+		VerifiedBy         sql.NullInt64  `json:"verified_by"`
+		VerifiedAt         sql.NullTime   `json:"verified_at"`
+		VerifierNotes      sql.NullString `json:"verifier_notes"`
+		CreatedDate        time.Time      `json:"created_date"`
+		UpdatedDate        time.Time      `json:"updated_date"`
+	}
+
+	err = h.db.QueryRow(query, reportID, tenantID).Scan(
+		&report.ID, &report.TenantID, &report.ProjectID, &report.ReportDate,
+		&report.WeatherMorning, &report.WeatherAfternoon, &report.TemperatureMin, &report.TemperatureMax,
+		&report.WorkSummary, &report.IssuesEncountered, &report.SafetyNotes,
+		&report.WorkersCount, &report.WorkersDetails, &report.EquipmentUsed, &report.MaterialsReceived,
+		&report.VerificationStatus, &report.VerifiedBy, &report.VerifiedAt, &report.VerifierNotes,
+		&report.CreatedDate, &report.UpdatedDate,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Daily report not found")
+			return
+		}
+		h.log.Error("Failed to get daily report", "error", err)
+		response.InternalError(c, "Failed to get daily report")
+		return
+	}
+
+	response.OK(c, map[string]interface{}{
+		"id":                  report.ID,
+		"tenant_id":           report.TenantID,
+		"project_id":          report.ProjectID,
+		"report_date":         report.ReportDate.Format("2006-01-02"),
+		"weather_morning":     report.WeatherMorning.String,
+		"weather_afternoon":   report.WeatherAfternoon.String,
+		"temperature_min":     report.TemperatureMin.Float64,
+		"temperature_max":     report.TemperatureMax.Float64,
+		"work_summary":        report.WorkSummary.String,
+		"issues_encountered":  report.IssuesEncountered.String,
+		"safety_notes":        report.SafetyNotes.String,
+		"workers_count":       report.WorkersCount.Int64,
+		"workers_details":     report.WorkersDetails.String,
+		"equipment_used":      report.EquipmentUsed.String,
+		"materials_received":  report.MaterialsReceived.String,
+		"verification_status": report.VerificationStatus.String,
+		"created_date":        report.CreatedDate,
+		"updated_date":        report.UpdatedDate,
+	})
+}
+
+// UpdateDailyReport updates a daily report
+func (h *Handler) UpdateDailyReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	reportID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid report ID")
+		return
+	}
+
+	var req struct {
+		ReportDate        string  `json:"report_date"`
+		WeatherMorning    string  `json:"weather_morning"`
+		WeatherAfternoon  string  `json:"weather_afternoon"`
+		TemperatureMin    float64 `json:"temperature_min"`
+		TemperatureMax    float64 `json:"temperature_max"`
+		WorkSummary       string  `json:"work_summary"`
+		IssuesEncountered string  `json:"issues_encountered"`
+		SafetyNotes       string  `json:"safety_notes"`
+		WorkersCount      int     `json:"workers_count"`
+		WorkersDetails    string  `json:"workers_details"`
+		EquipmentUsed     string  `json:"equipment_used"`
+		MaterialsReceived string  `json:"materials_received"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	query := `
+		UPDATE construction_daily_reports
+		SET report_date = COALESCE(NULLIF($1, '')::date, report_date),
+		    weather_morning = $2,
+		    weather_afternoon = $3,
+		    temperature_min = $4,
+		    temperature_max = $5,
+		    work_summary = $6,
+		    issues_encountered = $7,
+		    safety_notes = $8,
+		    workers_count = $9,
+		    workers_details = COALESCE(NULLIF($10, ''), '[]')::jsonb,
+		    equipment_used = COALESCE(NULLIF($11, ''), '[]')::jsonb,
+		    materials_received = COALESCE(NULLIF($12, ''), '[]')::jsonb,
+		    updated_date = NOW()
+		WHERE id = $13 AND tenant_id = $14
+	`
+
+	// Convert string fields to JSON for JSONB columns
+	workersDetailsJSON := "[]"
+	if req.WorkersDetails != "" {
+		workersDetailsJSON = fmt.Sprintf(`[{"details": %q}]`, req.WorkersDetails)
+	}
+	equipmentUsedJSON := "[]"
+	if req.EquipmentUsed != "" {
+		equipmentUsedJSON = fmt.Sprintf(`[{"equipment": %q}]`, req.EquipmentUsed)
+	}
+	materialsReceivedJSON := "[]"
+	if req.MaterialsReceived != "" {
+		materialsReceivedJSON = fmt.Sprintf(`[{"materials": %q}]`, req.MaterialsReceived)
+	}
+
+	result, err := h.db.Exec(query,
+		req.ReportDate, nullString(req.WeatherMorning), nullString(req.WeatherAfternoon),
+		req.TemperatureMin, req.TemperatureMax,
+		nullString(req.WorkSummary), nullString(req.IssuesEncountered), nullString(req.SafetyNotes),
+		req.WorkersCount, workersDetailsJSON, equipmentUsedJSON, materialsReceivedJSON,
+		reportID, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to update daily report", "error", err)
+		response.InternalError(c, "Failed to update daily report")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Daily report not found")
+		return
+	}
+
+	response.OK(c, map[string]interface{}{
+		"message": "Daily report updated successfully",
+	})
+}
+
+// DeleteDailyReport deletes a daily report
+func (h *Handler) DeleteDailyReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	reportID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid report ID")
+		return
+	}
+
+	query := `DELETE FROM construction_daily_reports WHERE id = $1 AND tenant_id = $2`
+	result, err := h.db.Exec(query, reportID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete daily report", "error", err)
+		response.InternalError(c, "Failed to delete daily report")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Daily report not found")
+		return
+	}
+
+	response.OK(c, map[string]interface{}{
+		"message": "Daily report deleted successfully",
+	})
+}
+
 // =====================================================
 // MATERIAL REQUESTS HANDLERS
 // =====================================================
@@ -2113,6 +2324,96 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	response.Created(c, map[string]interface{}{
 		"id":      requestID,
 		"message": "Material request created successfully",
+	})
+}
+
+// UpdateMaterialRequest updates a material request
+func (h *Handler) UpdateMaterialRequest(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	requestID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid request ID")
+		return
+	}
+
+	var req struct {
+		RequestNumber string `json:"request_number"`
+		RequestDate   string `json:"request_date"`
+		RequiredDate  string `json:"required_date"`
+		Items         string `json:"items"`
+		Notes         string `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	query := `
+		UPDATE construction_material_requests
+		SET request_number = COALESCE(NULLIF($1, ''), request_number),
+		    request_date = COALESCE(NULLIF($2, '')::date, request_date),
+		    required_date = NULLIF($3, '')::date,
+		    notes = $4,
+		    updated_date = NOW()
+		WHERE id = $5 AND tenant_id = $6
+	`
+
+	result, err := h.db.Exec(query,
+		req.RequestNumber, req.RequestDate, req.RequiredDate,
+		nullString(req.Notes), requestID, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to update material request", "error", err)
+		response.InternalError(c, "Failed to update material request")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Material request not found")
+		return
+	}
+
+	response.OK(c, map[string]interface{}{
+		"message": "Material request updated successfully",
+	})
+}
+
+// DeleteMaterialRequest deletes a material request
+func (h *Handler) DeleteMaterialRequest(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	requestID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid request ID")
+		return
+	}
+
+	query := `DELETE FROM construction_material_requests WHERE id = $1 AND tenant_id = $2`
+	result, err := h.db.Exec(query, requestID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete material request", "error", err)
+		response.InternalError(c, "Failed to delete material request")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Material request not found")
+		return
+	}
+
+	response.OK(c, map[string]interface{}{
+		"message": "Material request deleted successfully",
 	})
 }
 
