@@ -570,13 +570,13 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		       b.apartments_count, b.commercial_units_count, b.parking_spots,
 		       b.estimated_cost, b.actual_cost, COALESCE(b.currency, 'UZS'),
 		       b.planned_start_date, b.planned_end_date, b.actual_start_date, b.actual_end_date,
-		       b.status, b.progress_percent, b.gps_coordinates, b.location_description,
-		       b.sort_order, b.created_date, b.updated_date,
-		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE building_id = b.id), 0) as sections_count,
-		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE building_id = b.id), 0) as total_smeta
+		       COALESCE(b.status, 'draft'), b.progress_percent, COALESCE(b.gps_coordinates::text, '{}')::text, b.location_description,
+		       COALESCE(b.sort_order, 0), b.created_date, b.updated_date,
+		       0 as sections_count,
+		       0.0 as total_smeta
 		FROM construction_buildings b
 		WHERE b.project_id = $1 AND b.tenant_id = $2
-		ORDER BY b.sort_order, b.code
+		ORDER BY COALESCE(b.sort_order, 0), b.code
 	`
 
 	rows, err := h.db.Query(query, projectID, tenantID)
@@ -590,6 +590,7 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 	buildings := []entity.ConstructionBuilding{}
 	for rows.Next() {
 		var b entity.ConstructionBuilding
+		var gpsCoordinates string
 		if err := rows.Scan(
 			&b.ID, &b.TenantID, &b.ProjectID, &b.Code, &b.Name, &b.Description,
 			&b.BuildingType, &b.BuildingPurpose, &b.FloorsCount, &b.FloorsUnderground,
@@ -597,13 +598,14 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 			&b.ApartmentsCount, &b.CommercialUnitsCount, &b.ParkingSpots,
 			&b.EstimatedCost, &b.ActualCost, &b.Currency,
 			&b.PlannedStartDate, &b.PlannedEndDate, &b.ActualStartDate, &b.ActualEndDate,
-			&b.Status, &b.ProgressPercent, &b.GpsCoordinates, &b.LocationDescription,
+			&b.Status, &b.ProgressPercent, &gpsCoordinates, &b.LocationDescription,
 			&b.SortOrder, &b.CreatedDate, &b.UpdatedDate,
 			&b.SectionsCount, &b.TotalSmeta,
 		); err != nil {
-			h.log.Error("Failed to scan building", "error", err)
+			h.log.Error("Failed to scan building", "error", err, "project_id", projectID)
 			continue
 		}
+		b.GpsCoordinates = json.RawMessage(gpsCoordinates)
 		buildings = append(buildings, b)
 	}
 
@@ -1922,12 +1924,30 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 		RETURNING id
 	`
 
+	// Convert string fields to JSON for JSONB columns (empty array if not provided)
+	workersDetailsJSON := "[]"
+	if req.WorkersDetails != "" {
+		workersDetailsJSON = fmt.Sprintf(`[{"details": %q}]`, req.WorkersDetails)
+	}
+	equipmentUsedJSON := "[]"
+	if req.EquipmentUsed != "" {
+		equipmentUsedJSON = fmt.Sprintf(`[{"equipment": %q}]`, req.EquipmentUsed)
+	}
+	materialsReceivedJSON := "[]"
+	if req.MaterialsReceived != "" {
+		materialsReceivedJSON = fmt.Sprintf(`[{"materials": %q}]`, req.MaterialsReceived)
+	}
+	visitorsJSON := "[]"
+	if req.Visitors != "" {
+		visitorsJSON = fmt.Sprintf(`[{"visitor": %q}]`, req.Visitors)
+	}
+
 	var reportID int64
 	err = h.db.QueryRow(query,
 		tenantID, projectID, reportDate,
 		nullString(req.WeatherMorning), nullString(req.WeatherAfternoon), nullFloat64(req.TemperatureMin), nullFloat64(req.TemperatureMax),
 		nullString(req.WorkSummary), nullString(req.IssuesEncountered), nullString(req.SafetyNotes),
-		req.WorkersCount, nullString(req.WorkersDetails), nullString(req.EquipmentUsed), nullString(req.MaterialsReceived), nullString(req.Visitors),
+		req.WorkersCount, workersDetailsJSON, equipmentUsedJSON, materialsReceivedJSON, visitorsJSON,
 		nil, // reported_by
 	).Scan(&reportID)
 	if err != nil {
