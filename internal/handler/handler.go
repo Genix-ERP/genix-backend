@@ -74,6 +74,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 
 	// Contact form (public - no auth needed)
 	rg.POST("/contact", h.SubmitContactForm)
+
+	// Public file access (for serving images in <img> tags)
+	rg.GET("/files/:id", h.GetFile)
 }
 
 // registerProtectedRoutes registers routes that require authentication
