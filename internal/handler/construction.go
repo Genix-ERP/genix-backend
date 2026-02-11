@@ -53,8 +53,8 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 		       cp.status, cp.progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
 		       cp.created_by, cp.created_date, cp.updated_date,
-		       COALESCE(pm.name, '') as project_manager_name,
-		       COALESCE(ce.name, '') as chief_engineer_name,
+		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
+		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
 		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta
 		FROM construction_projects cp
@@ -163,8 +163,8 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		       cp.status, cp.progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
 		       cp.created_by, cp.created_date, cp.updated_date,
-		       COALESCE(pm.name, '') as project_manager_name,
-		       COALESCE(ce.name, '') as chief_engineer_name,
+		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
+		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
 		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta
 		FROM construction_projects cp
