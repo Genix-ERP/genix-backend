@@ -578,14 +578,14 @@ CREATE INDEX IF NOT EXISTS idx_site_warehouses_project ON construction_site_ware
 -- PERMISSIONS
 -- =====================================================
 
-INSERT INTO permissions (name, description, module, action) VALUES
-('construction.view', 'View construction projects', 'construction', 'read'),
-('construction.create', 'Create construction projects', 'construction', 'create'),
-('construction.edit', 'Edit construction projects', 'construction', 'update'),
-('construction.delete', 'Delete construction projects', 'construction', 'delete'),
-('construction.approve_smeta', 'Approve smeta/estimates', 'construction', 'approve'),
-('construction.manage_team', 'Manage project team', 'construction', 'manage'),
-('construction.photo_reports', 'Submit photo reports', 'construction', 'report'),
-('construction.verify_progress', 'Verify work progress', 'construction', 'verify'),
-('construction.financial', 'Access financial data', 'construction', 'financial')
-ON CONFLICT (name) DO NOTHING;
+INSERT INTO permissions (module, resource, action, description) VALUES
+('construction', 'projects', 'read', 'View construction projects'),
+('construction', 'projects', 'create', 'Create construction projects'),
+('construction', 'projects', 'update', 'Edit construction projects'),
+('construction', 'projects', 'delete', 'Delete construction projects'),
+('construction', 'smeta', 'approve', 'Approve smeta/estimates'),
+('construction', 'team', 'manage', 'Manage project team'),
+('construction', 'reports', 'submit', 'Submit photo reports'),
+('construction', 'progress', 'verify', 'Verify work progress'),
+('construction', 'financial', 'access', 'Access financial data')
+ON CONFLICT (module, resource, action) DO NOTHING;
