@@ -613,15 +613,15 @@ func (h *Handler) SubmitRFQResponse(c *gin.Context) {
 
 	// Insert response
 	_, err = tx.Exec(`
-		INSERT INTO rfq_responses (id, rfq_id, vendor_id, total_amount, lead_time_days, valid_until, notes, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO rfq_responses (id, tenant_id, rfq_id, vendor_id, total_amount, lead_time_days, valid_until, notes, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (rfq_id, vendor_id) DO UPDATE SET
 			total_amount = EXCLUDED.total_amount,
 			lead_time_days = EXCLUDED.lead_time_days,
 			valid_until = EXCLUDED.valid_until,
 			notes = EXCLUDED.notes,
 			updated_at = EXCLUDED.updated_at
-	`, responseID, rfqID, vendorID, totalAmount, input.LeadTimeDays, validUntil, notes, now, now)
+	`, responseID, tenantID, rfqID, vendorID, totalAmount, input.LeadTimeDays, validUntil, notes, now, now)
 	if err != nil {
 		h.log.Error("Failed to insert response", "error", err)
 		response.InternalError(c, "Failed to submit response")
@@ -638,7 +638,6 @@ func (h *Handler) SubmitRFQResponse(c *gin.Context) {
 		// Get item quantity
 		var qty float64
 		h.db.QueryRow("SELECT quantity FROM rfq_items WHERE id = $1", itemID).Scan(&qty)
-		totalPrice := item.UnitPrice * qty
 
 		var itemNotes *string
 		if item.Notes != "" {
@@ -646,13 +645,14 @@ func (h *Handler) SubmitRFQResponse(c *gin.Context) {
 		}
 
 		_, err = tx.Exec(`
-			INSERT INTO rfq_response_items (id, response_id, item_id, unit_price, total_price, notes)
-			VALUES ($1, $2, $3, $4, $5, $6)
-			ON CONFLICT (response_id, item_id) DO UPDATE SET
+			INSERT INTO rfq_response_items (id, tenant_id, response_id, rfq_item_id, unit_price, quantity, notes, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (response_id, rfq_item_id) DO UPDATE SET
 				unit_price = EXCLUDED.unit_price,
-				total_price = EXCLUDED.total_price,
-				notes = EXCLUDED.notes
-		`, uuid.New(), responseID, itemID, item.UnitPrice, totalPrice, itemNotes)
+				quantity = EXCLUDED.quantity,
+				notes = EXCLUDED.notes,
+				updated_at = EXCLUDED.updated_at
+		`, uuid.New(), tenantID, responseID, itemID, item.UnitPrice, qty, itemNotes, now, now)
 		if err != nil {
 			h.log.Error("Failed to insert response item", "error", err)
 		}
