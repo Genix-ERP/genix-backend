@@ -1339,6 +1339,43 @@ func (h *Handler) updateSmetaSectionTotals(sectionID int64) {
 }
 
 
+// Helper functions for extracting values from sql.Null* types
+func nullStringValue(ns sql.NullString) interface{} {
+	if ns.Valid {
+		return ns.String
+	}
+	return nil
+}
+
+func nullFloat64Value(nf sql.NullFloat64) interface{} {
+	if nf.Valid {
+		return nf.Float64
+	}
+	return nil
+}
+
+func nullInt64Value(ni sql.NullInt64) interface{} {
+	if ni.Valid {
+		return ni.Int64
+	}
+	return nil
+}
+
+func nullTimeValue(nt sql.NullTime) interface{} {
+	if nt.Valid {
+		return nt.Time
+	}
+	return nil
+}
+
+func nullUUIDValue(nu uuid.NullUUID) interface{} {
+	if nu.Valid {
+		return nu.UUID
+	}
+	return nil
+}
+
+// Helper functions for creating sql.Null* types
 func nullString(s string) sql.NullString {
 	if s == "" {
 		return sql.NullString{}
@@ -1379,35 +1416,870 @@ func nullUUID(s string) uuid.NullUUID {
 }
 
 // =====================================================
-// PLACEHOLDER HANDLERS (Return empty arrays for now)
+// PROJECT VENDORS HANDLERS
 // =====================================================
 
-// ListProjectVendors returns vendors for a project (placeholder)
+// ListProjectVendors returns vendors for a project
 func (h *Handler) ListProjectVendors(c *gin.Context) {
-	response.Success(c, []interface{}{})
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT pv.id, pv.tenant_id, pv.project_id, pv.vendor_id,
+		       pv.contract_number, pv.contract_date, pv.contract_amount, COALESCE(pv.currency, 'UZS'),
+		       pv.vendor_type, pv.work_scope, pv.smeta_sections,
+		       pv.contact_person, pv.contact_phone, pv.contact_email,
+		       pv.status, pv.total_ordered, pv.total_received, pv.total_invoiced, pv.total_paid, pv.balance_due,
+		       pv.start_date, pv.end_date, pv.notes,
+		       pv.created_date, pv.updated_date,
+		       COALESCE(o.name, '') as vendor_name
+		FROM construction_project_vendors pv
+		LEFT JOIN organizations o ON o.id = pv.vendor_id
+		WHERE pv.project_id = $1 AND pv.tenant_id = $2
+		ORDER BY pv.created_date DESC
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query project vendors", "error", err)
+		response.InternalError(c, "Failed to query vendors")
+		return
+	}
+	defer rows.Close()
+
+	vendors := []map[string]interface{}{}
+	for rows.Next() {
+		var id, projectIDVal int64
+		var tenantIDVal, vendorID uuid.UUID
+		var contractNumber, workScope, contactPerson, contactPhone, contactEmail, status, notes, vendorName sql.NullString
+		var vendorType, currency string
+		var contractDate, startDate, endDate sql.NullTime
+		var contractAmount, totalOrdered, totalReceived, totalInvoiced, totalPaid, balanceDue sql.NullFloat64
+		var smetaSections []byte
+		var createdDate, updatedDate time.Time
+
+		if err := rows.Scan(
+			&id, &tenantIDVal, &projectIDVal, &vendorID,
+			&contractNumber, &contractDate, &contractAmount, &currency,
+			&vendorType, &workScope, &smetaSections,
+			&contactPerson, &contactPhone, &contactEmail,
+			&status, &totalOrdered, &totalReceived, &totalInvoiced, &totalPaid, &balanceDue,
+			&startDate, &endDate, &notes,
+			&createdDate, &updatedDate,
+			&vendorName,
+		); err != nil {
+			h.log.Error("Failed to scan vendor", "error", err)
+			continue
+		}
+
+		vendors = append(vendors, map[string]interface{}{
+			"id":              id,
+			"tenant_id":       tenantIDVal,
+			"project_id":      projectIDVal,
+			"vendor_id":       vendorID,
+			"contract_number": nullStringValue(contractNumber),
+			"contract_date":   nullTimeValue(contractDate),
+			"contract_amount": nullFloat64Value(contractAmount),
+			"currency":        currency,
+			"vendor_type":     vendorType,
+			"work_scope":      nullStringValue(workScope),
+			"contact_person":  nullStringValue(contactPerson),
+			"contact_phone":   nullStringValue(contactPhone),
+			"contact_email":   nullStringValue(contactEmail),
+			"status":          nullStringValue(status),
+			"total_ordered":   nullFloat64Value(totalOrdered),
+			"total_received":  nullFloat64Value(totalReceived),
+			"total_invoiced":  nullFloat64Value(totalInvoiced),
+			"total_paid":      nullFloat64Value(totalPaid),
+			"balance_due":     nullFloat64Value(balanceDue),
+			"start_date":      nullTimeValue(startDate),
+			"end_date":        nullTimeValue(endDate),
+			"notes":           nullStringValue(notes),
+			"created_date":    createdDate,
+			"updated_date":    updatedDate,
+			"vendor_name":     vendorName.String,
+		})
+	}
+
+	response.Success(c, vendors)
 }
 
-// ListPhotoReports returns photo reports for a project (placeholder)
+// CreateProjectVendor adds a vendor to a project
+func (h *Handler) CreateProjectVendor(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req entity.CreateProjectVendorInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Parse vendor_id as UUID
+	vendorUUID, err := uuid.Parse(fmt.Sprintf("%d", req.VendorID))
+	if err != nil {
+		// If it's not a UUID, try to get it from organizations table by ID
+		var orgUUID uuid.UUID
+		err = h.db.QueryRow("SELECT id FROM organizations WHERE id::text LIKE $1 OR name ILIKE $2 LIMIT 1",
+			fmt.Sprintf("%d%%", req.VendorID), fmt.Sprintf("%%%d%%", req.VendorID)).Scan(&orgUUID)
+		if err != nil {
+			response.BadRequest(c, "Invalid vendor ID")
+			return
+		}
+		vendorUUID = orgUUID
+	}
+
+	var contractDate interface{}
+	if req.ContractDate != "" {
+		t, _ := time.Parse("2006-01-02", req.ContractDate)
+		contractDate = t
+	}
+
+	var startDate, endDate interface{}
+	if req.StartDate != "" {
+		t, _ := time.Parse("2006-01-02", req.StartDate)
+		startDate = t
+	}
+	if req.EndDate != "" {
+		t, _ := time.Parse("2006-01-02", req.EndDate)
+		endDate = t
+	}
+
+	query := `
+		INSERT INTO construction_project_vendors (
+			tenant_id, project_id, vendor_id,
+			contract_number, contract_date, contract_amount, currency,
+			vendor_type, work_scope, contact_person, contact_phone, contact_email,
+			start_date, end_date, notes, status, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, COALESCE(NULLIF($7, ''), 'UZS'), $8, $9, $10, $11, $12, $13, $14, $15, 'active', NOW(), NOW())
+		RETURNING id
+	`
+
+	var vendorRecordID int64
+	err = h.db.QueryRow(query,
+		tenantID, projectID, vendorUUID,
+		nullString(req.ContractNumber), contractDate, nullFloat64(req.ContractAmount), req.Currency,
+		req.VendorType, nullString(req.WorkScope), nullString(req.ContactPerson), nullString(req.ContactPhone), nullString(req.ContactEmail),
+		startDate, endDate, nullString(req.Notes),
+	).Scan(&vendorRecordID)
+	if err != nil {
+		h.log.Error("Failed to create project vendor", "error", err)
+		response.InternalError(c, "Failed to add vendor to project")
+		return
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":      vendorRecordID,
+		"message": "Vendor added to project successfully",
+	})
+}
+
+// =====================================================
+// PHOTO REPORTS HANDLERS
+// =====================================================
+
+// ListPhotoReports returns photo reports for a project
 func (h *Handler) ListPhotoReports(c *gin.Context) {
-	response.Success(c, []interface{}{})
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT pr.id, pr.tenant_id, pr.project_id, pr.smeta_item_id, pr.section_id,
+		       pr.report_date, pr.report_type, pr.title, pr.description, pr.location_description,
+		       pr.gps_latitude, pr.gps_longitude, pr.weather, pr.temperature,
+		       pr.photos, pr.reported_by, pr.reviewed_by, pr.review_date, pr.review_status, pr.review_notes,
+		       pr.created_date, pr.updated_date,
+		       COALESCE(e.first_name || ' ' || e.last_name, '') as reporter_name,
+		       COALESCE(r.first_name || ' ' || r.last_name, '') as reviewer_name
+		FROM construction_photo_reports pr
+		LEFT JOIN employees e ON e.id = pr.reported_by
+		LEFT JOIN employees r ON r.id = pr.reviewed_by
+		WHERE pr.project_id = $1 AND pr.tenant_id = $2
+		ORDER BY pr.report_date DESC, pr.created_date DESC
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query photo reports", "error", err)
+		response.InternalError(c, "Failed to query photo reports")
+		return
+	}
+	defer rows.Close()
+
+	reports := []map[string]interface{}{}
+	for rows.Next() {
+		var id, projectIDVal int64
+		var tenantIDVal uuid.UUID
+		var smetaItemID, sectionID sql.NullInt64
+		var reportDate time.Time
+		var reportType, title, description, locationDescription, weather, reviewStatus, reviewNotes sql.NullString
+		var gpsLat, gpsLong, temperature sql.NullFloat64
+		var photos []byte
+		var reportedBy, reviewedBy uuid.NullUUID
+		var reviewDate sql.NullTime
+		var createdDate, updatedDate time.Time
+		var reporterName, reviewerName string
+
+		if err := rows.Scan(
+			&id, &tenantIDVal, &projectIDVal, &smetaItemID, &sectionID,
+			&reportDate, &reportType, &title, &description, &locationDescription,
+			&gpsLat, &gpsLong, &weather, &temperature,
+			&photos, &reportedBy, &reviewedBy, &reviewDate, &reviewStatus, &reviewNotes,
+			&createdDate, &updatedDate,
+			&reporterName, &reviewerName,
+		); err != nil {
+			h.log.Error("Failed to scan photo report", "error", err)
+			continue
+		}
+
+		reports = append(reports, map[string]interface{}{
+			"id":                   id,
+			"tenant_id":            tenantIDVal,
+			"project_id":           projectIDVal,
+			"smeta_item_id":        nullInt64Value(smetaItemID),
+			"section_id":           nullInt64Value(sectionID),
+			"report_date":          reportDate,
+			"report_type":          nullStringValue(reportType),
+			"title":                nullStringValue(title),
+			"description":          nullStringValue(description),
+			"location_description": nullStringValue(locationDescription),
+			"gps_latitude":         nullFloat64Value(gpsLat),
+			"gps_longitude":        nullFloat64Value(gpsLong),
+			"weather":              nullStringValue(weather),
+			"temperature":          nullFloat64Value(temperature),
+			"photos":               photos,
+			"reported_by":          nullUUIDValue(reportedBy),
+			"reviewed_by":          nullUUIDValue(reviewedBy),
+			"review_date":          nullTimeValue(reviewDate),
+			"review_status":        nullStringValue(reviewStatus),
+			"review_notes":         nullStringValue(reviewNotes),
+			"created_date":         createdDate,
+			"updated_date":         updatedDate,
+			"reporter_name":        reporterName,
+			"reviewer_name":        reviewerName,
+		})
+	}
+
+	response.Success(c, reports)
 }
 
-// ListDailyReports returns daily reports for a project (placeholder)
+// CreatePhotoReport creates a new photo report
+func (h *Handler) CreatePhotoReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req entity.CreatePhotoReportInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	reportDate, _ := time.Parse("2006-01-02", req.ReportDate)
+
+	query := `
+		INSERT INTO construction_photo_reports (
+			tenant_id, project_id, smeta_item_id, section_id,
+			report_date, report_type, title, description, location_description,
+			gps_latitude, gps_longitude, weather, temperature,
+			photos, reported_by, review_status, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', NOW(), NOW())
+		RETURNING id
+	`
+
+	var reportID int64
+	err = h.db.QueryRow(query,
+		tenantID, projectID, nullInt64(req.SmetaItemID), nullInt64(req.SectionID),
+		reportDate, nullString(req.ReportType), nullString(req.Title), nullString(req.Description), nullString(req.LocationDescription),
+		nullFloat64(req.GpsLatitude), nullFloat64(req.GpsLongitude), nullString(req.Weather), nullFloat64(req.Temperature),
+		"[]", nil, // photos as empty array, reported_by
+	).Scan(&reportID)
+	if err != nil {
+		h.log.Error("Failed to create photo report", "error", err)
+		response.InternalError(c, "Failed to create photo report")
+		return
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":      reportID,
+		"message": "Photo report created successfully",
+	})
+}
+
+// =====================================================
+// DAILY REPORTS HANDLERS
+// =====================================================
+
+// ListDailyReports returns daily reports for a project
 func (h *Handler) ListDailyReports(c *gin.Context) {
-	response.Success(c, []interface{}{})
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT dr.id, dr.tenant_id, dr.project_id, dr.report_date,
+		       dr.weather_morning, dr.weather_afternoon, dr.temperature_min, dr.temperature_max,
+		       dr.work_summary, dr.issues_encountered, dr.safety_notes,
+		       dr.workers_count, dr.workers_details, dr.equipment_used, dr.materials_received, dr.visitors,
+		       dr.reported_by, dr.verified_by, dr.verification_status,
+		       dr.created_date, dr.updated_date,
+		       COALESCE(e.first_name || ' ' || e.last_name, '') as reporter_name,
+		       COALESCE(v.first_name || ' ' || v.last_name, '') as verifier_name
+		FROM construction_daily_reports dr
+		LEFT JOIN employees e ON e.id = dr.reported_by
+		LEFT JOIN employees v ON v.id = dr.verified_by
+		WHERE dr.project_id = $1 AND dr.tenant_id = $2
+		ORDER BY dr.report_date DESC
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query daily reports", "error", err)
+		response.InternalError(c, "Failed to query daily reports")
+		return
+	}
+	defer rows.Close()
+
+	reports := []map[string]interface{}{}
+	for rows.Next() {
+		var id, projectIDVal int64
+		var tenantIDVal uuid.UUID
+		var reportDate time.Time
+		var weatherMorning, weatherAfternoon, workSummary, issuesEncountered, safetyNotes, verificationStatus sql.NullString
+		var tempMin, tempMax sql.NullFloat64
+		var workersCount int
+		var workersDetails, equipmentUsed, materialsReceived, visitors []byte
+		var reportedBy, verifiedBy uuid.NullUUID
+		var createdDate, updatedDate time.Time
+		var reporterName, verifierName string
+
+		if err := rows.Scan(
+			&id, &tenantIDVal, &projectIDVal, &reportDate,
+			&weatherMorning, &weatherAfternoon, &tempMin, &tempMax,
+			&workSummary, &issuesEncountered, &safetyNotes,
+			&workersCount, &workersDetails, &equipmentUsed, &materialsReceived, &visitors,
+			&reportedBy, &verifiedBy, &verificationStatus,
+			&createdDate, &updatedDate,
+			&reporterName, &verifierName,
+		); err != nil {
+			h.log.Error("Failed to scan daily report", "error", err)
+			continue
+		}
+
+		reports = append(reports, map[string]interface{}{
+			"id":                  id,
+			"tenant_id":           tenantIDVal,
+			"project_id":          projectIDVal,
+			"report_date":         reportDate,
+			"weather_morning":     nullStringValue(weatherMorning),
+			"weather_afternoon":   nullStringValue(weatherAfternoon),
+			"temperature_min":     nullFloat64Value(tempMin),
+			"temperature_max":     nullFloat64Value(tempMax),
+			"work_summary":        nullStringValue(workSummary),
+			"issues_encountered":  nullStringValue(issuesEncountered),
+			"safety_notes":        nullStringValue(safetyNotes),
+			"workers_count":       workersCount,
+			"workers_details":     workersDetails,
+			"equipment_used":      equipmentUsed,
+			"materials_received":  materialsReceived,
+			"visitors":            visitors,
+			"reported_by":         nullUUIDValue(reportedBy),
+			"verified_by":         nullUUIDValue(verifiedBy),
+			"verification_status": nullStringValue(verificationStatus),
+			"created_date":        createdDate,
+			"updated_date":        updatedDate,
+			"reporter_name":       reporterName,
+			"verifier_name":       verifierName,
+		})
+	}
+
+	response.Success(c, reports)
 }
 
-// ListMaterialRequests returns material requests for a project (placeholder)
+// CreateDailyReport creates a new daily report
+func (h *Handler) CreateDailyReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req entity.CreateDailyReportInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	reportDate, _ := time.Parse("2006-01-02", req.ReportDate)
+
+	query := `
+		INSERT INTO construction_daily_reports (
+			tenant_id, project_id, report_date,
+			weather_morning, weather_afternoon, temperature_min, temperature_max,
+			work_summary, issues_encountered, safety_notes,
+			workers_count, workers_details, equipment_used, materials_received, visitors,
+			reported_by, verification_status, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', NOW(), NOW())
+		RETURNING id
+	`
+
+	var reportID int64
+	err = h.db.QueryRow(query,
+		tenantID, projectID, reportDate,
+		nullString(req.WeatherMorning), nullString(req.WeatherAfternoon), nullFloat64(req.TemperatureMin), nullFloat64(req.TemperatureMax),
+		nullString(req.WorkSummary), nullString(req.IssuesEncountered), nullString(req.SafetyNotes),
+		req.WorkersCount, nullString(req.WorkersDetails), nullString(req.EquipmentUsed), nullString(req.MaterialsReceived), nullString(req.Visitors),
+		nil, // reported_by
+	).Scan(&reportID)
+	if err != nil {
+		h.log.Error("Failed to create daily report", "error", err)
+		response.InternalError(c, "Failed to create daily report")
+		return
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":      reportID,
+		"message": "Daily report created successfully",
+	})
+}
+
+// =====================================================
+// MATERIAL REQUESTS HANDLERS
+// =====================================================
+
+// ListMaterialRequests returns material requests for a project
 func (h *Handler) ListMaterialRequests(c *gin.Context) {
-	response.Success(c, []interface{}{})
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT mr.id, mr.tenant_id, mr.project_id,
+		       mr.request_number, mr.request_date, mr.required_date,
+		       mr.requested_by, mr.items, mr.status,
+		       mr.approved_by, mr.approval_date, mr.approval_notes,
+		       mr.fulfilled_date, mr.fulfillment_notes, mr.purchase_order_id,
+		       mr.notes, mr.created_date, mr.updated_date,
+		       COALESCE(e.first_name || ' ' || e.last_name, '') as requester_name,
+		       COALESCE(a.first_name || ' ' || a.last_name, '') as approver_name
+		FROM construction_material_requests mr
+		LEFT JOIN employees e ON e.id = mr.requested_by
+		LEFT JOIN employees a ON a.id = mr.approved_by
+		WHERE mr.project_id = $1 AND mr.tenant_id = $2
+		ORDER BY mr.request_date DESC
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query material requests", "error", err)
+		response.InternalError(c, "Failed to query material requests")
+		return
+	}
+	defer rows.Close()
+
+	requests := []map[string]interface{}{}
+	for rows.Next() {
+		var id, projectIDVal int64
+		var tenantIDVal uuid.UUID
+		var requestNumber, status, approvalNotes, fulfillmentNotes, notes sql.NullString
+		var requestDate time.Time
+		var requiredDate, fulfilledDate sql.NullTime
+		var requestedBy, approvedBy uuid.NullUUID
+		var purchaseOrderID uuid.NullUUID
+		var approvalDate sql.NullTime
+		var items []byte
+		var createdDate, updatedDate time.Time
+		var requesterName, approverName string
+
+		if err := rows.Scan(
+			&id, &tenantIDVal, &projectIDVal,
+			&requestNumber, &requestDate, &requiredDate,
+			&requestedBy, &items, &status,
+			&approvedBy, &approvalDate, &approvalNotes,
+			&fulfilledDate, &fulfillmentNotes, &purchaseOrderID,
+			&notes, &createdDate, &updatedDate,
+			&requesterName, &approverName,
+		); err != nil {
+			h.log.Error("Failed to scan material request", "error", err)
+			continue
+		}
+
+		requests = append(requests, map[string]interface{}{
+			"id":                id,
+			"tenant_id":         tenantIDVal,
+			"project_id":        projectIDVal,
+			"request_number":    nullStringValue(requestNumber),
+			"request_date":      requestDate,
+			"required_date":     nullTimeValue(requiredDate),
+			"requested_by":      nullUUIDValue(requestedBy),
+			"items":             items,
+			"status":            nullStringValue(status),
+			"approved_by":       nullUUIDValue(approvedBy),
+			"approval_date":     nullTimeValue(approvalDate),
+			"approval_notes":    nullStringValue(approvalNotes),
+			"fulfilled_date":    nullTimeValue(fulfilledDate),
+			"fulfillment_notes": nullStringValue(fulfillmentNotes),
+			"purchase_order_id": nullUUIDValue(purchaseOrderID),
+			"notes":             nullStringValue(notes),
+			"created_date":      createdDate,
+			"updated_date":      updatedDate,
+			"requester_name":    requesterName,
+			"approver_name":     approverName,
+		})
+	}
+
+	response.Success(c, requests)
 }
 
-// ListDeliveries returns deliveries for a project (placeholder)
+// CreateMaterialRequest creates a new material request
+func (h *Handler) CreateMaterialRequest(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req struct {
+		RequestNumber string `json:"request_number" binding:"required"`
+		RequestDate   string `json:"request_date" binding:"required"`
+		RequiredDate  string `json:"required_date"`
+		Items         string `json:"items"`
+		Notes         string `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	requestDate, _ := time.Parse("2006-01-02", req.RequestDate)
+	var requiredDate interface{}
+	if req.RequiredDate != "" {
+		t, _ := time.Parse("2006-01-02", req.RequiredDate)
+		requiredDate = t
+	}
+
+	query := `
+		INSERT INTO construction_material_requests (
+			tenant_id, project_id, request_number, request_date, required_date,
+			items, notes, status, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($6, ''), '[]')::jsonb, $7, 'draft', NOW(), NOW())
+		RETURNING id
+	`
+
+	var requestID int64
+	err = h.db.QueryRow(query,
+		tenantID, projectID, req.RequestNumber, requestDate, requiredDate,
+		req.Items, nullString(req.Notes),
+	).Scan(&requestID)
+	if err != nil {
+		h.log.Error("Failed to create material request", "error", err)
+		response.InternalError(c, "Failed to create material request")
+		return
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":      requestID,
+		"message": "Material request created successfully",
+	})
+}
+
+// =====================================================
+// DELIVERIES HANDLERS
+// =====================================================
+
+// ListDeliveries returns material deliveries for a project
 func (h *Handler) ListDeliveries(c *gin.Context) {
-	response.Success(c, []interface{}{})
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT d.id, d.tenant_id, d.project_id, d.vendor_id,
+		       d.delivery_number, d.delivery_date, d.purchase_order_id, d.goods_receipt_id,
+		       d.vehicle_number, d.driver_name, d.waybill_number,
+		       d.items, d.total_amount,
+		       d.received_by, d.received_date,
+		       d.quality_status, d.quality_notes, d.quality_checked_by,
+		       d.photos, d.status, d.notes,
+		       d.created_date, d.updated_date,
+		       COALESCE(o.name, '') as vendor_name,
+		       COALESCE(e.first_name || ' ' || e.last_name, '') as receiver_name
+		FROM construction_material_deliveries d
+		LEFT JOIN construction_project_vendors pv ON pv.id = d.vendor_id
+		LEFT JOIN organizations o ON o.id = pv.vendor_id
+		LEFT JOIN employees e ON e.id = d.received_by
+		WHERE d.project_id = $1 AND d.tenant_id = $2
+		ORDER BY d.delivery_date DESC
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query deliveries", "error", err)
+		response.InternalError(c, "Failed to query deliveries")
+		return
+	}
+	defer rows.Close()
+
+	deliveries := []map[string]interface{}{}
+	for rows.Next() {
+		var id, projectIDVal, vendorID int64
+		var tenantIDVal uuid.UUID
+		var deliveryNumber, vehicleNumber, driverName, waybillNumber, qualityStatus, qualityNotes, status, notes sql.NullString
+		var deliveryDate time.Time
+		var purchaseOrderID, goodsReceiptID, receivedBy, qualityCheckedBy uuid.NullUUID
+		var totalAmount sql.NullFloat64
+		var receivedDate sql.NullTime
+		var items, photos []byte
+		var createdDate, updatedDate time.Time
+		var vendorName, receiverName string
+
+		if err := rows.Scan(
+			&id, &tenantIDVal, &projectIDVal, &vendorID,
+			&deliveryNumber, &deliveryDate, &purchaseOrderID, &goodsReceiptID,
+			&vehicleNumber, &driverName, &waybillNumber,
+			&items, &totalAmount,
+			&receivedBy, &receivedDate,
+			&qualityStatus, &qualityNotes, &qualityCheckedBy,
+			&photos, &status, &notes,
+			&createdDate, &updatedDate,
+			&vendorName, &receiverName,
+		); err != nil {
+			h.log.Error("Failed to scan delivery", "error", err)
+			continue
+		}
+
+		deliveries = append(deliveries, map[string]interface{}{
+			"id":                 id,
+			"tenant_id":          tenantIDVal,
+			"project_id":         projectIDVal,
+			"vendor_id":          vendorID,
+			"delivery_number":    nullStringValue(deliveryNumber),
+			"delivery_date":      deliveryDate,
+			"purchase_order_id":  nullUUIDValue(purchaseOrderID),
+			"goods_receipt_id":   nullUUIDValue(goodsReceiptID),
+			"vehicle_number":     nullStringValue(vehicleNumber),
+			"driver_name":        nullStringValue(driverName),
+			"waybill_number":     nullStringValue(waybillNumber),
+			"items":              items,
+			"total_amount":       nullFloat64Value(totalAmount),
+			"received_by":        nullUUIDValue(receivedBy),
+			"received_date":      nullTimeValue(receivedDate),
+			"quality_status":     nullStringValue(qualityStatus),
+			"quality_notes":      nullStringValue(qualityNotes),
+			"quality_checked_by": nullUUIDValue(qualityCheckedBy),
+			"photos":             photos,
+			"status":             nullStringValue(status),
+			"notes":              nullStringValue(notes),
+			"created_date":       createdDate,
+			"updated_date":       updatedDate,
+			"vendor_name":        vendorName,
+			"receiver_name":      receiverName,
+		})
+	}
+
+	response.Success(c, deliveries)
 }
 
-// ListSiteWarehouses returns site warehouses for a project (placeholder)
+// =====================================================
+// SITE WAREHOUSES HANDLERS
+// =====================================================
+
+// ListSiteWarehouses returns site warehouses for a project
 func (h *Handler) ListSiteWarehouses(c *gin.Context) {
-	response.Success(c, []interface{}{})
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT sw.id, sw.tenant_id, sw.project_id, sw.warehouse_id,
+		       sw.name, sw.location_description, sw.gps_coordinates,
+		       sw.warehouse_keeper_id, sw.total_area, sw.covered_area,
+		       sw.is_active, sw.notes, sw.created_date, sw.updated_date,
+		       COALESCE(w.name, '') as warehouse_name,
+		       COALESCE(e.first_name || ' ' || e.last_name, '') as keeper_name
+		FROM construction_site_warehouses sw
+		LEFT JOIN warehouses w ON w.id = sw.warehouse_id
+		LEFT JOIN employees e ON e.id = sw.warehouse_keeper_id
+		WHERE sw.project_id = $1 AND sw.tenant_id = $2
+		ORDER BY sw.name
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query site warehouses", "error", err)
+		response.InternalError(c, "Failed to query site warehouses")
+		return
+	}
+	defer rows.Close()
+
+	warehouses := []map[string]interface{}{}
+	for rows.Next() {
+		var id, projectIDVal int64
+		var tenantIDVal uuid.UUID
+		var warehouseID uuid.NullUUID
+		var name string
+		var locationDescription, notes sql.NullString
+		var gpsCoordinates []byte
+		var warehouseKeeperID uuid.NullUUID
+		var totalArea, coveredArea sql.NullFloat64
+		var isActive bool
+		var createdDate, updatedDate time.Time
+		var warehouseName, keeperName string
+
+		if err := rows.Scan(
+			&id, &tenantIDVal, &projectIDVal, &warehouseID,
+			&name, &locationDescription, &gpsCoordinates,
+			&warehouseKeeperID, &totalArea, &coveredArea,
+			&isActive, &notes, &createdDate, &updatedDate,
+			&warehouseName, &keeperName,
+		); err != nil {
+			h.log.Error("Failed to scan site warehouse", "error", err)
+			continue
+		}
+
+		warehouses = append(warehouses, map[string]interface{}{
+			"id":                   id,
+			"tenant_id":            tenantIDVal,
+			"project_id":           projectIDVal,
+			"warehouse_id":         nullUUIDValue(warehouseID),
+			"name":                 name,
+			"location_description": nullStringValue(locationDescription),
+			"gps_coordinates":      gpsCoordinates,
+			"warehouse_keeper_id":  nullUUIDValue(warehouseKeeperID),
+			"total_area":           nullFloat64Value(totalArea),
+			"covered_area":         nullFloat64Value(coveredArea),
+			"is_active":            isActive,
+			"notes":                nullStringValue(notes),
+			"created_date":         createdDate,
+			"updated_date":         updatedDate,
+			"warehouse_name":       warehouseName,
+			"keeper_name":          keeperName,
+		})
+	}
+
+	response.Success(c, warehouses)
+}
+
+// CreateSiteWarehouse creates a new site warehouse
+func (h *Handler) CreateSiteWarehouse(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req entity.CreateSiteWarehouseInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	query := `
+		INSERT INTO construction_site_warehouses (
+			tenant_id, project_id, name, location_description, gps_coordinates,
+			warehouse_keeper_id, total_area, covered_area, notes, is_active, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, COALESCE(NULLIF($5, ''), '{}')::jsonb, $6, $7, $8, $9, true, NOW(), NOW())
+		RETURNING id
+	`
+
+	var warehouseID int64
+	err = h.db.QueryRow(query,
+		tenantID, projectID, req.Name, nullString(req.LocationDescription), req.GpsCoordinates,
+		nil, nullFloat64(req.TotalArea), nullFloat64(req.CoveredArea), nullString(req.Notes),
+	).Scan(&warehouseID)
+	if err != nil {
+		h.log.Error("Failed to create site warehouse", "error", err)
+		response.InternalError(c, "Failed to create site warehouse")
+		return
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":      warehouseID,
+		"message": "Site warehouse created successfully",
+	})
 }
