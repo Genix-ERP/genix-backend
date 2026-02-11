@@ -1802,6 +1802,155 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 	})
 }
 
+// GetPhotoReport returns a single photo report
+func (h *Handler) GetPhotoReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	reportID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid report ID")
+		return
+	}
+
+	query := `
+		SELECT pr.id, pr.tenant_id, pr.project_id, pr.smeta_item_id, pr.section_id, pr.building_id,
+		       pr.report_date, pr.report_type, pr.title, pr.description, pr.location_description,
+		       pr.gps_latitude, pr.gps_longitude, pr.weather, pr.temperature,
+		       pr.photos, pr.reported_by, pr.review_status, pr.reviewed_by, pr.review_date, pr.review_notes,
+		       pr.created_date, pr.updated_date,
+		       COALESCE(e.first_name || ' ' || e.last_name, '') as reporter_name
+		FROM construction_photo_reports pr
+		LEFT JOIN employees e ON e.id = pr.reported_by
+		WHERE pr.id = $1 AND pr.tenant_id = $2
+	`
+
+	var report entity.ConstructionPhotoReport
+	var photosJSON sql.NullString
+	err = h.db.QueryRow(query, reportID, tenantID).Scan(
+		&report.ID, &report.TenantID, &report.ProjectID, &report.SmetaItemID, &report.SectionID, &report.BuildingID,
+		&report.ReportDate, &report.ReportType, &report.Title, &report.Description, &report.LocationDescription,
+		&report.GpsLatitude, &report.GpsLongitude, &report.Weather, &report.Temperature,
+		&photosJSON, &report.ReportedBy, &report.ReviewStatus, &report.ReviewedBy, &report.ReviewDate, &report.ReviewNotes,
+		&report.CreatedDate, &report.UpdatedDate,
+		&report.ReporterName,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Photo report not found")
+			return
+		}
+		h.log.Error("Failed to get photo report", "error", err)
+		response.InternalError(c, "Failed to get photo report")
+		return
+	}
+
+	// Parse photos JSON
+	if photosJSON.Valid && photosJSON.String != "" {
+		json.Unmarshal([]byte(photosJSON.String), &report.Photos)
+	}
+
+	response.Success(c, report)
+}
+
+// UpdatePhotoReport updates a photo report
+func (h *Handler) UpdatePhotoReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	reportID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid report ID")
+		return
+	}
+
+	var req entity.CreatePhotoReportInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	reportDate, _ := time.Parse("2006-01-02", req.ReportDate)
+
+	// Convert photos to JSON
+	photosJSON := "[]"
+	if len(req.Photos) > 0 {
+		photosBytes, err := json.Marshal(req.Photos)
+		if err == nil {
+			photosJSON = string(photosBytes)
+		}
+	}
+
+	query := `
+		UPDATE construction_photo_reports SET
+			report_date = $1, report_type = $2, title = $3, description = $4,
+			location_description = $5, weather = $6, temperature = $7, photos = $8,
+			updated_date = NOW()
+		WHERE id = $9 AND tenant_id = $10
+	`
+
+	result, err := h.db.Exec(query,
+		reportDate, nullString(req.ReportType), nullString(req.Title), nullString(req.Description),
+		nullString(req.LocationDescription), nullString(req.Weather), nullFloat64(req.Temperature), photosJSON,
+		reportID, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to update photo report", "error", err)
+		response.InternalError(c, "Failed to update photo report")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Photo report not found")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"id":      reportID,
+		"message": "Photo report updated successfully",
+	})
+}
+
+// DeletePhotoReport deletes a photo report
+func (h *Handler) DeletePhotoReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	reportID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid report ID")
+		return
+	}
+
+	query := `DELETE FROM construction_photo_reports WHERE id = $1 AND tenant_id = $2`
+	result, err := h.db.Exec(query, reportID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete photo report", "error", err)
+		response.InternalError(c, "Failed to delete photo report")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Photo report not found")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"message": "Photo report deleted successfully",
+	})
+}
+
 // =====================================================
 // DAILY REPORTS HANDLERS
 // =====================================================

@@ -1421,6 +1421,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		dailyReports.DELETE("/:id", middleware.RequirePermission("construction", "reports", "submit"), h.DeleteDailyReport)
 	}
 
+	// Photo Reports (direct access)
+	photoReports := rg.Group("/construction/photo-reports")
+	photoReports.Use(middleware.RequirePermission("construction", "reports", "read"))
+	{
+		photoReports.GET("/:id", h.GetPhotoReport)
+		photoReports.PUT("/:id", middleware.RequirePermission("construction", "reports", "submit"), h.UpdatePhotoReport)
+		photoReports.DELETE("/:id", middleware.RequirePermission("construction", "reports", "submit"), h.DeletePhotoReport)
+	}
+
 	// =====================================================
 	// INSTALLED APPS ROUTES
 	// =====================================================
