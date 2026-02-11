@@ -39,6 +39,9 @@ COPY --from=builder /app/genix-backend .
 # Copy migrations
 COPY --from=builder /app/internal/infrastructure/database/migrations ./migrations
 
+# Create storage directory for file uploads
+RUN mkdir -p /app/storage/uploads
+
 # Set ownership
 RUN chown -R genix:genix /app
 
