@@ -911,12 +911,13 @@ type ConstructionProjectVendor struct {
 
 // CreateProjectVendorInput represents input for adding a vendor to a project
 type CreateProjectVendorInput struct {
-	VendorID       int64   `json:"vendor_id" binding:"required"`
+	VendorID       string  `json:"vendor_id"`       // UUID of existing organization (optional)
+	VendorName     string  `json:"vendor_name"`     // Name for new vendor organization (used if vendor_id is empty)
 	ContractNumber string  `json:"contract_number"`
 	ContractDate   string  `json:"contract_date"`
 	ContractAmount float64 `json:"contract_amount"`
 	Currency       string  `json:"currency"`
-	VendorType     string  `json:"vendor_type" binding:"required"`
+	VendorType     string  `json:"vendor_type"`
 	WorkScope      string  `json:"work_scope"`
 	ContactPerson  string  `json:"contact_person"`
 	ContactPhone   string  `json:"contact_phone"`
@@ -1022,4 +1023,36 @@ type CreateSiteWarehouseInput struct {
 	TotalArea           float64 `json:"total_area"`
 	CoveredArea         float64 `json:"covered_area"`
 	Notes               string  `json:"notes"`
+}
+
+// =====================================================
+// PROJECT TEAM MEMBER
+// =====================================================
+
+// ProjectTeamMember represents a team member assigned to a construction project
+type ProjectTeamMember struct {
+	ID               int64          `json:"id" db:"id"`
+	ProjectID        int64          `json:"project_id" db:"project_id"`
+	EmployeeID       uuid.UUID      `json:"employee_id" db:"employee_id"`
+	Role             string         `json:"role" db:"role"`
+	Responsibilities sql.NullString `json:"responsibilities" db:"responsibilities"`
+	StartDate        sql.NullTime   `json:"start_date" db:"start_date"`
+	EndDate          sql.NullTime   `json:"end_date" db:"end_date"`
+	IsActive         bool           `json:"is_active" db:"is_active"`
+	CreatedDate      time.Time      `json:"created_date" db:"created_date"`
+
+	// Computed from JOIN
+	EmployeeName string `json:"employee_name,omitempty" db:"employee_name"`
+	Position     string `json:"position,omitempty" db:"position"`
+	Phone        string `json:"phone,omitempty" db:"phone"`
+	Email        string `json:"email,omitempty" db:"email"`
+}
+
+// CreateTeamMemberInput represents input for adding a team member to a project
+type CreateTeamMemberInput struct {
+	EmployeeID       string `json:"employee_id" binding:"required"`
+	Role             string `json:"role" binding:"required"`
+	Responsibilities string `json:"responsibilities"`
+	StartDate        string `json:"start_date"`
+	EndDate          string `json:"end_date"`
 }

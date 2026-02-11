@@ -1378,6 +1378,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Site Warehouses
 		constructionProjects.GET("/:id/warehouses", h.ListSiteWarehouses)
 		constructionProjects.POST("/:id/warehouses", middleware.RequirePermission("construction", "projects", "update"), h.CreateSiteWarehouse)
+
+		// Team Members
+		constructionProjects.GET("/:id/team", h.ListProjectTeamMembers)
+		constructionProjects.POST("/:id/team", middleware.RequirePermission("construction", "project", "update"), h.CreateProjectTeamMember)
+		constructionProjects.DELETE("/:id/team/:memberId", middleware.RequirePermission("construction", "project", "update"), h.DeleteProjectTeamMember)
 	}
 
 	// Smeta Sections (direct access)

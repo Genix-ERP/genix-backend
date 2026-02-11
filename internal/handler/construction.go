@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -1533,18 +1534,66 @@ func (h *Handler) CreateProjectVendor(c *gin.Context) {
 		return
 	}
 
-	// Parse vendor_id as UUID
-	vendorUUID, err := uuid.Parse(fmt.Sprintf("%d", req.VendorID))
-	if err != nil {
-		// If it's not a UUID, try to get it from organizations table by ID
-		var orgUUID uuid.UUID
-		err = h.db.QueryRow("SELECT id FROM organizations WHERE id::text LIKE $1 OR name ILIKE $2 LIMIT 1",
-			fmt.Sprintf("%d%%", req.VendorID), fmt.Sprintf("%%%d%%", req.VendorID)).Scan(&orgUUID)
+	var vendorUUID uuid.UUID
+
+	// Check if vendor_id is provided (existing organization)
+	if req.VendorID != "" {
+		vendorUUID, err = uuid.Parse(req.VendorID)
 		if err != nil {
-			response.BadRequest(c, "Invalid vendor ID")
+			response.BadRequest(c, "Invalid vendor ID format")
 			return
 		}
-		vendorUUID = orgUUID
+		// Verify the organization exists
+		var exists bool
+		err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND tenant_id = $2)", vendorUUID, tenantID).Scan(&exists)
+		if err != nil || !exists {
+			response.BadRequest(c, "Vendor organization not found")
+			return
+		}
+	} else if req.VendorName != "" {
+		// Create a new organization for this vendor
+		vendorUUID = uuid.New()
+		now := time.Now()
+
+		// Determine organization type based on vendor type
+		orgType := "supplier"
+		if req.VendorType == "subcontractor" {
+			orgType = "subcontractor"
+		} else if req.VendorType == "consultant" {
+			orgType = "service_provider"
+		}
+
+		// Generate a unique code for the organization
+		vendorCode := fmt.Sprintf("VND-%s", strings.ToUpper(vendorUUID.String()[:8]))
+
+		// Build contact info JSON
+		contactInfo := map[string]string{}
+		if req.ContactPerson != "" {
+			contactInfo["contact_person"] = req.ContactPerson
+		}
+		if req.ContactPhone != "" {
+			contactInfo["phone"] = req.ContactPhone
+		}
+		if req.ContactEmail != "" {
+			contactInfo["email"] = req.ContactEmail
+		}
+		contactInfoJSON, _ := json.Marshal(contactInfo)
+
+		createOrgQuery := `
+			INSERT INTO organizations (
+				id, tenant_id, code, name, type, contact_info,
+				country, currency, is_active, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, 'UZ', 'UZS', true, $7, $8)
+		`
+		_, err = h.db.Exec(createOrgQuery, vendorUUID, tenantID, vendorCode, req.VendorName, orgType, contactInfoJSON, now, now)
+		if err != nil {
+			h.log.Error("Failed to create vendor organization", "error", err)
+			response.InternalError(c, "Failed to create vendor organization")
+			return
+		}
+	} else {
+		response.BadRequest(c, "Either vendor_id or vendor_name must be provided")
+		return
 	}
 
 	var contractDate interface{}
@@ -1587,8 +1636,9 @@ func (h *Handler) CreateProjectVendor(c *gin.Context) {
 	}
 
 	response.Created(c, map[string]interface{}{
-		"id":      vendorRecordID,
-		"message": "Vendor added to project successfully",
+		"id":         vendorRecordID,
+		"vendor_id":  vendorUUID,
+		"message":    "Vendor added to project successfully",
 	})
 }
 
@@ -2281,5 +2331,210 @@ func (h *Handler) CreateSiteWarehouse(c *gin.Context) {
 	response.Created(c, map[string]interface{}{
 		"id":      warehouseID,
 		"message": "Site warehouse created successfully",
+	})
+}
+
+// =====================================================
+// PROJECT TEAM MEMBER HANDLERS
+// =====================================================
+
+// ListProjectTeamMembers returns team members for a construction project
+func (h *Handler) ListProjectTeamMembers(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT pt.id, pt.project_id, pt.employee_id, pt.role, pt.responsibilities,
+		       pt.start_date, pt.end_date, pt.is_active, pt.created_date,
+		       COALESCE(e.first_name || ' ' || e.last_name, '') as employee_name,
+		       COALESCE(e.position, '') as position,
+		       COALESCE(e.phone, '') as phone,
+		       COALESCE(e.email, '') as email
+		FROM construction_project_team pt
+		JOIN employees e ON e.id = pt.employee_id
+		JOIN construction_projects cp ON cp.id = pt.project_id
+		WHERE pt.project_id = $1 AND cp.tenant_id = $2
+		ORDER BY pt.created_date DESC
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query project team members", "error", err)
+		response.InternalError(c, "Failed to query team members")
+		return
+	}
+	defer rows.Close()
+
+	members := []map[string]interface{}{}
+	for rows.Next() {
+		var id, projectIDVal int64
+		var employeeID uuid.UUID
+		var role, employeeName, position, phone, email string
+		var responsibilities sql.NullString
+		var startDate, endDate sql.NullTime
+		var isActive bool
+		var createdDate time.Time
+
+		if err := rows.Scan(
+			&id, &projectIDVal, &employeeID, &role, &responsibilities,
+			&startDate, &endDate, &isActive, &createdDate,
+			&employeeName, &position, &phone, &email,
+		); err != nil {
+			h.log.Error("Failed to scan team member", "error", err)
+			continue
+		}
+
+		members = append(members, map[string]interface{}{
+			"id":               id,
+			"project_id":       projectIDVal,
+			"employee_id":      employeeID,
+			"role":             role,
+			"responsibilities": nullStringValue(responsibilities),
+			"start_date":       nullTimeValue(startDate),
+			"end_date":         nullTimeValue(endDate),
+			"is_active":        isActive,
+			"created_date":     createdDate,
+			"employee_name":    employeeName,
+			"position":         position,
+			"phone":            phone,
+			"email":            email,
+		})
+	}
+
+	response.Success(c, members)
+}
+
+// CreateProjectTeamMember adds a team member to a construction project
+func (h *Handler) CreateProjectTeamMember(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Verify project belongs to tenant
+	var exists bool
+	err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM construction_projects WHERE id = $1 AND tenant_id = $2)", projectID, tenantID).Scan(&exists)
+	if err != nil || !exists {
+		response.NotFound(c, "Project not found")
+		return
+	}
+
+	var req entity.CreateTeamMemberInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Parse employee UUID
+	employeeUUID, err := uuid.Parse(req.EmployeeID)
+	if err != nil {
+		response.BadRequest(c, "Invalid employee ID")
+		return
+	}
+
+	// Verify employee exists
+	err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM employees WHERE id = $1)", employeeUUID).Scan(&exists)
+	if err != nil || !exists {
+		response.NotFound(c, "Employee not found")
+		return
+	}
+
+	// Parse dates
+	var startDate, endDate sql.NullTime
+	if req.StartDate != "" {
+		if t, err := time.Parse("2006-01-02", req.StartDate); err == nil {
+			startDate = sql.NullTime{Time: t, Valid: true}
+		}
+	}
+	if req.EndDate != "" {
+		if t, err := time.Parse("2006-01-02", req.EndDate); err == nil {
+			endDate = sql.NullTime{Time: t, Valid: true}
+		}
+	}
+
+	query := `
+		INSERT INTO construction_project_team (
+			project_id, employee_id, role, responsibilities, start_date, end_date, is_active, created_date
+		) VALUES ($1, $2, $3, $4, $5, $6, true, NOW())
+		ON CONFLICT (project_id, employee_id, role) DO UPDATE
+		SET responsibilities = EXCLUDED.responsibilities,
+		    start_date = EXCLUDED.start_date,
+		    end_date = EXCLUDED.end_date,
+		    is_active = true
+		RETURNING id
+	`
+
+	var memberID int64
+	err = h.db.QueryRow(query,
+		projectID, employeeUUID, req.Role, nullString(req.Responsibilities), startDate, endDate,
+	).Scan(&memberID)
+	if err != nil {
+		h.log.Error("Failed to create team member", "error", err)
+		response.InternalError(c, "Failed to add team member")
+		return
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":      memberID,
+		"message": "Team member added successfully",
+	})
+}
+
+// DeleteProjectTeamMember removes a team member from a construction project
+func (h *Handler) DeleteProjectTeamMember(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	memberID, err := strconv.ParseInt(c.Param("memberId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid member ID")
+		return
+	}
+
+	// Verify project belongs to tenant and delete
+	result, err := h.db.Exec(`
+		DELETE FROM construction_project_team
+		WHERE id = $1 AND project_id = $2
+		AND EXISTS (SELECT 1 FROM construction_projects WHERE id = $2 AND tenant_id = $3)
+	`, memberID, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete team member", "error", err)
+		response.InternalError(c, "Failed to remove team member")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Team member not found")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"message": "Team member removed successfully",
 	})
 }
