@@ -236,12 +236,19 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	query := `
 		INSERT INTO employees (
-			id, tenant_id, employee_number, first_name, last_name, middle_name,
+			id, tenant_id, organization_id, employee_number, first_name, last_name, middle_name,
 			email, phone, job_title, hire_date, status, base_salary, permission, notes,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		RETURNING id, created_at
 	`
 
@@ -270,7 +277,7 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 	}
 
 	err := h.db.QueryRow(query,
-		id, tenantID, employeeNumber, firstName, lastName, middleName,
+		id, tenantID, orgIDPtr, employeeNumber, firstName, lastName, middleName,
 		email, phone, jobTitle, hireDate, status, baseSalary, permission, notes,
 		now, now,
 	).Scan(&id, &now)
