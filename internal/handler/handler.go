@@ -1355,6 +1355,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Smeta Sections
 		constructionProjects.GET("/:id/sections", h.ListSmetaSections)
 		constructionProjects.POST("/:id/sections", middleware.RequirePermission("construction", "smeta", "create"), h.CreateSmetaSection)
+
+		// Placeholder routes (return empty arrays for now)
+		constructionProjects.GET("/:id/vendors", h.ListProjectVendors)
+		constructionProjects.GET("/:id/photo-reports", h.ListPhotoReports)
+		constructionProjects.GET("/:id/daily-reports", h.ListDailyReports)
+		constructionProjects.GET("/:id/material-requests", h.ListMaterialRequests)
+		constructionProjects.GET("/:id/deliveries", h.ListDeliveries)
+		constructionProjects.GET("/:id/warehouses", h.ListSiteWarehouses)
 	}
 
 	// Smeta Sections (direct access)
