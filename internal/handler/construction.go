@@ -260,7 +260,7 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 		nullString(req.ProjectType), nullString(req.BuildingType), nullFloat64(req.TotalArea), nullInt32(int32(req.FloorsCount)),
 		nullFloat64(req.ContractAmount), currency,
 		contractDate, plannedStart, plannedEnd,
-		"draft", nullInt64(req.ProjectManagerID), nullInt64(req.ChiefEngineerID),
+		"draft", nullUUID(req.ProjectManagerID), nullUUID(req.ChiefEngineerID),
 		userID,
 	).Scan(&projectID, &createdDate)
 	if err != nil {
@@ -348,15 +348,17 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("progress_percent = $%d", argCount))
 		args = append(args, *req.ProgressPercent)
 	}
-	if req.ProjectManagerID != nil {
+	if req.ProjectManagerID != nil && *req.ProjectManagerID != "" {
 		argCount++
 		updates = append(updates, fmt.Sprintf("project_manager_id = $%d", argCount))
-		args = append(args, *req.ProjectManagerID)
+		parsed, _ := uuid.Parse(*req.ProjectManagerID)
+		args = append(args, parsed)
 	}
-	if req.ChiefEngineerID != nil {
+	if req.ChiefEngineerID != nil && *req.ChiefEngineerID != "" {
 		argCount++
 		updates = append(updates, fmt.Sprintf("chief_engineer_id = $%d", argCount))
-		args = append(args, *req.ChiefEngineerID)
+		parsed, _ := uuid.Parse(*req.ChiefEngineerID)
+		args = append(args, parsed)
 	}
 	if req.PlannedStartDate != nil {
 		argCount++
@@ -1079,4 +1081,15 @@ func nullFloat64(f float64) sql.NullFloat64 {
 		return sql.NullFloat64{}
 	}
 	return sql.NullFloat64{Float64: f, Valid: true}
+}
+
+func nullUUID(s string) uuid.NullUUID {
+	if s == "" {
+		return uuid.NullUUID{}
+	}
+	parsed, err := uuid.Parse(s)
+	if err != nil {
+		return uuid.NullUUID{}
+	}
+	return uuid.NullUUID{UUID: parsed, Valid: true}
 }

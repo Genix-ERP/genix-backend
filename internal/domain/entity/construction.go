@@ -55,8 +55,8 @@ type ConstructionProject struct {
 	ProgressPercent sql.NullFloat64 `json:"progress_percent" db:"progress_percent"`
 
 	// Responsible persons
-	ProjectManagerID sql.NullInt64 `json:"project_manager_id" db:"project_manager_id"`
-	ChiefEngineerID  sql.NullInt64 `json:"chief_engineer_id" db:"chief_engineer_id"`
+	ProjectManagerID uuid.NullUUID `json:"project_manager_id" db:"project_manager_id"`
+	ChiefEngineerID  uuid.NullUUID `json:"chief_engineer_id" db:"chief_engineer_id"`
 
 	// Metadata
 	CreatedBy   *uuid.UUID   `json:"created_by" db:"created_by"`
@@ -93,8 +93,8 @@ type CreateConstructionProjectInput struct {
 	ContractDate     string  `json:"contract_date"`
 	PlannedStartDate string  `json:"planned_start_date"`
 	PlannedEndDate   string  `json:"planned_end_date"`
-	ProjectManagerID int64   `json:"project_manager_id"`
-	ChiefEngineerID  int64   `json:"chief_engineer_id"`
+	ProjectManagerID string  `json:"project_manager_id"`
+	ChiefEngineerID  string  `json:"chief_engineer_id"`
 }
 
 // UpdateConstructionProjectInput represents input for updating a construction project
@@ -121,8 +121,8 @@ type UpdateConstructionProjectInput struct {
 	ActualEndDate    *string  `json:"actual_end_date"`
 	Status           *string  `json:"status"`
 	ProgressPercent  *float64 `json:"progress_percent"`
-	ProjectManagerID *int64   `json:"project_manager_id"`
-	ChiefEngineerID  *int64   `json:"chief_engineer_id"`
+	ProjectManagerID *string  `json:"project_manager_id"`
+	ChiefEngineerID  *string  `json:"chief_engineer_id"`
 }
 
 // =====================================================
@@ -327,7 +327,7 @@ type ConstructionWorkProgress struct {
 	UnitPrice         sql.NullFloat64 `json:"unit_price" db:"unit_price"`
 	TotalAmount       sql.NullFloat64 `json:"total_amount" db:"total_amount"`
 
-	VerifiedBy        sql.NullInt64  `json:"verified_by" db:"verified_by"`
+	VerifiedBy        uuid.NullUUID  `json:"verified_by" db:"verified_by"`
 	VerificationDate  sql.NullTime   `json:"verification_date" db:"verification_date"`
 	VerificationNotes sql.NullString `json:"verification_notes" db:"verification_notes"`
 
@@ -376,8 +376,8 @@ type ConstructionPhotoReport struct {
 
 	Photos json.RawMessage `json:"photos" db:"photos"`
 
-	ReportedBy   sql.NullInt64  `json:"reported_by" db:"reported_by"`
-	ReviewedBy   sql.NullInt64  `json:"reviewed_by" db:"reviewed_by"`
+	ReportedBy   uuid.NullUUID  `json:"reported_by" db:"reported_by"`
+	ReviewedBy   uuid.NullUUID  `json:"reviewed_by" db:"reviewed_by"`
 	ReviewDate   sql.NullTime   `json:"review_date" db:"review_date"`
 	ReviewStatus string         `json:"review_status" db:"review_status"`
 	ReviewNotes  sql.NullString `json:"review_notes" db:"review_notes"`
@@ -433,8 +433,8 @@ type ConstructionDailyReport struct {
 	MaterialsReceived json.RawMessage `json:"materials_received" db:"materials_received"`
 	Visitors        json.RawMessage `json:"visitors" db:"visitors"`
 
-	ReportedBy         sql.NullInt64 `json:"reported_by" db:"reported_by"`
-	VerifiedBy         sql.NullInt64 `json:"verified_by" db:"verified_by"`
+	ReportedBy         uuid.NullUUID `json:"reported_by" db:"reported_by"`
+	VerifiedBy         uuid.NullUUID `json:"verified_by" db:"verified_by"`
 	VerificationStatus string        `json:"verification_status" db:"verification_status"`
 
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
@@ -545,12 +545,12 @@ type ConstructionMaterialDelivery struct {
 	Items       json.RawMessage `json:"items" db:"items"`
 	TotalAmount sql.NullFloat64 `json:"total_amount" db:"total_amount"`
 
-	ReceivedBy   sql.NullInt64 `json:"received_by" db:"received_by"`
+	ReceivedBy   uuid.NullUUID `json:"received_by" db:"received_by"`
 	ReceivedDate sql.NullTime  `json:"received_date" db:"received_date"`
 
 	QualityStatus    string         `json:"quality_status" db:"quality_status"`
 	QualityNotes     sql.NullString `json:"quality_notes" db:"quality_notes"`
-	QualityCheckedBy sql.NullInt64  `json:"quality_checked_by" db:"quality_checked_by"`
+	QualityCheckedBy uuid.NullUUID  `json:"quality_checked_by" db:"quality_checked_by"`
 
 	Photos json.RawMessage `json:"photos" db:"photos"`
 	Status string          `json:"status" db:"status"`
@@ -593,7 +593,7 @@ type ConstructionSiteWarehouse struct {
 	LocationDescription sql.NullString  `json:"location_description" db:"location_description"`
 	GpsCoordinates      json.RawMessage `json:"gps_coordinates" db:"gps_coordinates"`
 
-	WarehouseKeeperID sql.NullInt64   `json:"warehouse_keeper_id" db:"warehouse_keeper_id"`
+	WarehouseKeeperID uuid.NullUUID   `json:"warehouse_keeper_id" db:"warehouse_keeper_id"`
 	TotalArea         sql.NullFloat64 `json:"total_area" db:"total_area"`
 	CoveredArea       sql.NullFloat64 `json:"covered_area" db:"covered_area"`
 

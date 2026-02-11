@@ -48,8 +48,8 @@ CREATE TABLE IF NOT EXISTS construction_projects (
     progress_percent DECIMAL(5,2) DEFAULT 0,
 
     -- Responsible persons
-    project_manager_id BIGINT REFERENCES employees(id),
-    chief_engineer_id BIGINT REFERENCES employees(id),
+    project_manager_id UUID REFERENCES employees(id),
+    chief_engineer_id UUID REFERENCES employees(id),
 
     -- Metadata
     created_by UUID REFERENCES users(id),
@@ -183,7 +183,7 @@ CREATE TABLE IF NOT EXISTS construction_work_progress (
     total_amount DECIMAL(18,2),
 
     -- Verification
-    verified_by BIGINT REFERENCES employees(id),
+    verified_by UUID REFERENCES employees(id),
     verification_date TIMESTAMP,
     verification_notes TEXT,
 
@@ -221,10 +221,10 @@ CREATE TABLE IF NOT EXISTS construction_photo_reports (
     photos JSONB NOT NULL DEFAULT '[]',
 
     -- Prorab info
-    reported_by BIGINT REFERENCES employees(id),
+    reported_by UUID REFERENCES employees(id),
 
     -- Review
-    reviewed_by BIGINT REFERENCES employees(id),
+    reviewed_by UUID REFERENCES employees(id),
     review_date TIMESTAMP,
     review_status VARCHAR(50) DEFAULT 'pending',
     review_notes TEXT,
@@ -266,10 +266,10 @@ CREATE TABLE IF NOT EXISTS construction_daily_reports (
     visitors JSONB,
 
     -- Reported by prorab
-    reported_by BIGINT REFERENCES employees(id),
+    reported_by UUID REFERENCES employees(id),
 
     -- Verification
-    verified_by BIGINT REFERENCES employees(id),
+    verified_by UUID REFERENCES employees(id),
     verification_status VARCHAR(50) DEFAULT 'pending',
 
     created_date TIMESTAMP DEFAULT NOW(),
@@ -289,14 +289,14 @@ CREATE TABLE IF NOT EXISTS construction_material_requests (
     required_date DATE,
 
     -- Requestor
-    requested_by BIGINT REFERENCES employees(id),
+    requested_by UUID REFERENCES employees(id),
 
     -- Items
     items JSONB NOT NULL DEFAULT '[]',
 
     -- Approval
     status VARCHAR(50) DEFAULT 'draft',
-    approved_by BIGINT REFERENCES employees(id),
+    approved_by UUID REFERENCES employees(id),
     approval_date TIMESTAMP,
     approval_notes TEXT,
 
@@ -432,13 +432,13 @@ CREATE TABLE IF NOT EXISTS construction_material_deliveries (
     total_amount DECIMAL(18,2),
 
     -- Received at site by
-    received_by BIGINT REFERENCES employees(id),
+    received_by UUID REFERENCES employees(id),
     received_date TIMESTAMP,
 
     -- Quality inspection
     quality_status VARCHAR(50) DEFAULT 'pending',
     quality_notes TEXT,
-    quality_checked_by BIGINT REFERENCES employees(id),
+    quality_checked_by UUID REFERENCES employees(id),
 
     -- Photos of delivery
     photos JSONB DEFAULT '[]',
@@ -468,11 +468,11 @@ CREATE TABLE IF NOT EXISTS construction_material_issues (
     items JSONB NOT NULL DEFAULT '[]',
 
     -- Issued to which worker/team
-    issued_to BIGINT REFERENCES employees(id),
+    issued_to UUID REFERENCES employees(id),
     work_location VARCHAR(255),
 
     -- Approved by
-    approved_by BIGINT REFERENCES employees(id),
+    approved_by UUID REFERENCES employees(id),
 
     -- Return tracking
     returned_items JSONB DEFAULT '[]',
@@ -535,7 +535,7 @@ CREATE TABLE IF NOT EXISTS construction_site_warehouses (
     gps_coordinates JSONB,
 
     -- Responsible person
-    warehouse_keeper_id BIGINT REFERENCES employees(id),
+    warehouse_keeper_id UUID REFERENCES employees(id),
 
     -- Capacity info
     total_area DECIMAL(10,2),
