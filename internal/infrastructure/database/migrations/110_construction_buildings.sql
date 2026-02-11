@@ -58,12 +58,34 @@ CREATE TABLE IF NOT EXISTS construction_buildings (
 );
 
 -- Add building_id to smeta_sections to link sections to specific buildings
-ALTER TABLE smeta_sections ADD COLUMN IF NOT EXISTS building_id BIGINT REFERENCES construction_buildings(id);
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'smeta_sections') THEN
+        ALTER TABLE smeta_sections ADD COLUMN IF NOT EXISTS building_id BIGINT REFERENCES construction_buildings(id);
+    END IF;
+END $$;
 
--- Add building_id to other relevant tables
-ALTER TABLE construction_daily_logs ADD COLUMN IF NOT EXISTS building_id BIGINT REFERENCES construction_buildings(id);
-ALTER TABLE construction_photo_reports ADD COLUMN IF NOT EXISTS building_id BIGINT REFERENCES construction_buildings(id);
-ALTER TABLE construction_project_team ADD COLUMN IF NOT EXISTS building_id BIGINT REFERENCES construction_buildings(id);
+-- Add building_id to other relevant tables (only if they exist)
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'construction_daily_logs') THEN
+        ALTER TABLE construction_daily_logs ADD COLUMN IF NOT EXISTS building_id BIGINT REFERENCES construction_buildings(id);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'construction_photo_reports') THEN
+        ALTER TABLE construction_photo_reports ADD COLUMN IF NOT EXISTS building_id BIGINT REFERENCES construction_buildings(id);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'construction_project_team') THEN
+        ALTER TABLE construction_project_team ADD COLUMN IF NOT EXISTS building_id BIGINT REFERENCES construction_buildings(id);
+    END IF;
+END $$;
 
 -- Update project fields for complex projects
 ALTER TABLE construction_projects ADD COLUMN IF NOT EXISTS buildings_count INTEGER DEFAULT 0;
