@@ -212,12 +212,12 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 	}
 
 	query := `
-		INSERT INTO rfqs (id, tenant_id, organization_id, rfq_number, title, description, status, issue_date, deadline, terms, notes, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		INSERT INTO rfqs (id, tenant_id, organization_id, rfq_number, title, description, status, issue_date, response_deadline, deadline, terms, notes, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
 
 	_, err = tx.Exec(query,
-		id, tenantID, orgIDPtr, rfqNumber, input.Title, description, entity.RFQStatusDraft, issueDate, deadline, terms, notes, userID, now, now,
+		id, tenantID, orgIDPtr, rfqNumber, input.Title, description, entity.RFQStatusDraft, issueDate, deadline, deadline, terms, notes, userID, now, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to insert RFQ", "error", err)
