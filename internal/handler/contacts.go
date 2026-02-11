@@ -234,6 +234,17 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		input.Code = fmt.Sprintf("%s-%d", strings.ToUpper(string(input.Type)[:3]), now.Unix()%100000)
 	}
 
+	// Check for duplicates before creating
+	if enabled, checkFields := h.getDuplicateDetectionSettings(tenantID); enabled {
+		duplicates := h.checkContactDuplicates(tenantID, input.Email, input.Phone, input.Name, checkFields)
+		if len(duplicates) > 0 {
+			response.ConflictWithData(c, "DUPLICATE_DETECTED", "Potential duplicate contact(s) found", map[string]interface{}{
+				"duplicates": duplicates,
+			})
+			return
+		}
+	}
+
 	// Prepare optional strings
 	var legalName, taxID, regNum, industry, website, email, phone, fax, notes *string
 	if input.LegalName != "" {
