@@ -1241,8 +1241,12 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 	baseQuery := `
 		SELECT b.id, b.code, b.name, b.product_id, b.bom_type, b.quantity, b.version,
 			   b.is_active, b.is_default, b.effective_date, b.expiry_date, b.notes,
-			   b.created_at, b.updated_at,
-			   p.code as product_code, p.name as product_name
+			   b.created_at,
+			   p.code as product_code, p.name as product_name,
+			   (SELECT COUNT(*) FROM bom_lines bl WHERE bl.bom_id = b.id) as line_count,
+			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(cp.cost_price, 0) * (1 + bl2.scrap_percent/100))
+			     FROM bom_lines bl2 JOIN products cp ON bl2.component_id = cp.id
+			     WHERE bl2.bom_id = b.id), 0) as total_cost
 		FROM product_boms b
 		JOIN products p ON b.product_id = p.id
 		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
@@ -1316,8 +1320,8 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		err := rows.Scan(
 			&b.ID, &b.Code, &b.Name, &b.ProductID, &b.BOMType, &b.Quantity, &b.Version,
 			&b.IsActive, &b.IsDefault, &effectiveDate, &expiryDate, &notes,
-			&b.CreatedAt, &b.CreatedAt,
-			&b.ProductCode, &b.ProductName,
+			&b.CreatedAt,
+			&b.ProductCode, &b.ProductName, &b.LineCount, &b.TotalCost,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan BOM", "error", err)
@@ -1583,10 +1587,26 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		return
 	}
 
+	// Return full BOM data so frontend can display it immediately
+	var productCode, productName string
+	h.db.QueryRow("SELECT code, name FROM products WHERE id = $1", productID).Scan(&productCode, &productName)
+
+	lineCount := len(input.Lines)
+
 	response.Created(c, gin.H{
-		"id":      bomID,
-		"code":    input.Code,
-		"message": "BOM created successfully",
+		"id":           bomID,
+		"code":         input.Code,
+		"name":         input.Name,
+		"product_id":   productID,
+		"product_code": productCode,
+		"product_name": productName,
+		"bom_type":     bomType,
+		"quantity":     quantity,
+		"version":      1,
+		"is_active":    true,
+		"is_default":   input.IsDefault,
+		"line_count":   lineCount,
+		"message":      "BOM created successfully",
 	})
 }
 
