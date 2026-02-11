@@ -2356,7 +2356,7 @@ func (h *Handler) ListConstructionTeamMembers(c *gin.Context) {
 		SELECT pt.id, pt.project_id, pt.employee_id, pt.role, pt.responsibilities,
 		       pt.start_date, pt.end_date, pt.is_active, pt.created_date,
 		       COALESCE(e.first_name || ' ' || e.last_name, '') as employee_name,
-		       COALESCE(e.position, '') as position,
+		       COALESCE(e.job_title, '') as position,
 		       COALESCE(e.phone, '') as phone,
 		       COALESCE(e.email, '') as email
 		FROM construction_project_team pt
