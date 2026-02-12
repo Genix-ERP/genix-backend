@@ -33,6 +33,21 @@ type Organization struct {
 	IsActive           bool                   `json:"is_active"`
 	CreatedAt          time.Time              `json:"created_at"`
 	UpdatedAt          time.Time              `json:"updated_at"`
+	// Extended fields for Uzbekistan business requirements
+	STIR                  *string `json:"stir,omitempty"`
+	OKED                  *string `json:"oked,omitempty"`
+	BankAccount           *string `json:"bank_account,omitempty"`
+	BankMFO               *string `json:"bank_mfo,omitempty"`
+	BankName              *string `json:"bank_name,omitempty"`
+	IsVATPayer            bool    `json:"is_vat_payer"`
+	TaxRegime             *string `json:"tax_regime,omitempty"`
+	ActivityStatus        *string `json:"activity_status,omitempty"`
+	BusinessGroup         *string `json:"business_group,omitempty"`
+	IntercompanyRelations *string `json:"intercompany_relations,omitempty"`
+	DirectorName          *string `json:"director_name,omitempty"`
+	DirectorPhone         *string `json:"director_phone,omitempty"`
+	LegalAddress          *string `json:"legal_address,omitempty"`
+	Notes                 *string `json:"notes,omitempty"`
 }
 
 // CreateOrganizationInput represents the input for creating an organization
@@ -49,6 +64,21 @@ type CreateOrganizationInput struct {
 	Currency           *string                `json:"currency,omitempty"`
 	AccountingStandard *string                `json:"accounting_standard,omitempty"`
 	LogoURL            *string                `json:"logo_url,omitempty"`
+	// Extended fields
+	STIR                  *string `json:"stir,omitempty"`
+	OKED                  *string `json:"oked,omitempty"`
+	BankAccount           *string `json:"bank_account,omitempty"`
+	BankMFO               *string `json:"bank_mfo,omitempty"`
+	BankName              *string `json:"bank_name,omitempty"`
+	IsVATPayer            *bool   `json:"is_vat_payer,omitempty"`
+	TaxRegime             *string `json:"tax_regime,omitempty"`
+	ActivityStatus        *string `json:"activity_status,omitempty"`
+	BusinessGroup         *string `json:"business_group,omitempty"`
+	IntercompanyRelations *string `json:"intercompany_relations,omitempty"`
+	DirectorName          *string `json:"director_name,omitempty"`
+	DirectorPhone         *string `json:"director_phone,omitempty"`
+	LegalAddress          *string `json:"legal_address,omitempty"`
+	Notes                 *string `json:"notes,omitempty"`
 }
 
 // UpdateOrganizationInput represents the input for updating an organization
@@ -66,6 +96,21 @@ type UpdateOrganizationInput struct {
 	AccountingStandard *string                `json:"accounting_standard,omitempty"`
 	LogoURL            *string                `json:"logo_url,omitempty"`
 	IsActive           *bool                  `json:"is_active,omitempty"`
+	// Extended fields
+	STIR                  *string `json:"stir,omitempty"`
+	OKED                  *string `json:"oked,omitempty"`
+	BankAccount           *string `json:"bank_account,omitempty"`
+	BankMFO               *string `json:"bank_mfo,omitempty"`
+	BankName              *string `json:"bank_name,omitempty"`
+	IsVATPayer            *bool   `json:"is_vat_payer,omitempty"`
+	TaxRegime             *string `json:"tax_regime,omitempty"`
+	ActivityStatus        *string `json:"activity_status,omitempty"`
+	BusinessGroup         *string `json:"business_group,omitempty"`
+	IntercompanyRelations *string `json:"intercompany_relations,omitempty"`
+	DirectorName          *string `json:"director_name,omitempty"`
+	DirectorPhone         *string `json:"director_phone,omitempty"`
+	LegalAddress          *string `json:"legal_address,omitempty"`
+	Notes                 *string `json:"notes,omitempty"`
 }
 
 // ListOrganizations returns all organizations for the current tenant
@@ -79,7 +124,10 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 	query := `
 		SELECT id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 		       address, contact_info, country, currency, accounting_standard, logo_url,
-		       settings, is_active, created_at, updated_at
+		       settings, is_active, created_at, updated_at,
+		       stir, oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+		       tax_regime, activity_status, business_group, intercompany_relations,
+		       director_name, director_phone, legal_address, notes
 		FROM organizations
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 		ORDER BY name ASC
@@ -103,6 +151,9 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 			&org.TaxID, &org.RegistrationNumber, &addressJSON, &contactInfoJSON,
 			&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
 			&settingsJSON, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
+			&org.STIR, &org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+			&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
+			&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan organization", "error", err)
@@ -195,15 +246,28 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 	orgID := uuid.New()
 	now := time.Now()
 
+	// Set default VAT payer status
+	isVATPayer := false
+	if input.IsVATPayer != nil {
+		isVATPayer = *input.IsVATPayer
+	}
+
 	query := `
 		INSERT INTO organizations (
 			id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 			address, contact_info, country, currency, accounting_standard, logo_url,
-			settings, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			settings, is_active, created_at, updated_at,
+			stir, oked, bank_account, bank_mfo, bank_name, is_vat_payer,
+			tax_regime, activity_status, business_group, intercompany_relations,
+			director_name, director_phone, legal_address, notes
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+		          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
 		RETURNING id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 		          address, contact_info, country, currency, accounting_standard, logo_url,
-		          settings, is_active, created_at, updated_at
+		          settings, is_active, created_at, updated_at,
+		          stir, oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+		          tax_regime, activity_status, business_group, intercompany_relations,
+		          director_name, director_phone, legal_address, notes
 	`
 
 	var org Organization
@@ -215,11 +279,17 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 		input.TaxID, input.RegistrationNumber, addressJSON, contactInfoJSON,
 		input.Country, input.Currency, input.AccountingStandard, input.LogoURL,
 		[]byte("{}"), true, now, now,
+		input.STIR, input.OKED, input.BankAccount, input.BankMFO, input.BankName, isVATPayer,
+		input.TaxRegime, input.ActivityStatus, input.BusinessGroup, input.IntercompanyRelations,
+		input.DirectorName, input.DirectorPhone, input.LegalAddress, input.Notes,
 	).Scan(
 		&org.ID, &org.TenantID, &org.ParentID, &org.Code, &org.Name, &org.Type,
 		&org.TaxID, &org.RegistrationNumber, &addressJSONOut, &contactInfoJSONOut,
 		&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
 		&settingsJSONOut, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
+		&org.STIR, &org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
+		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
 	)
 	if err != nil {
 		h.log.Error("Failed to create organization", "error", err)
@@ -270,7 +340,10 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 	query := `
 		SELECT id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 		       address, contact_info, country, currency, accounting_standard, logo_url,
-		       settings, is_active, created_at, updated_at
+		       settings, is_active, created_at, updated_at,
+		       stir, oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+		       tax_regime, activity_status, business_group, intercompany_relations,
+		       director_name, director_phone, legal_address, notes
 		FROM organizations
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`
@@ -283,6 +356,9 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		&org.TaxID, &org.RegistrationNumber, &addressJSON, &contactInfoJSON,
 		&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
 		&settingsJSON, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
+		&org.STIR, &org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
+		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Organization")
@@ -429,13 +505,87 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		args = append(args, *input.IsActive)
 		argIndex++
 	}
+	// Extended fields
+	if input.STIR != nil {
+		query += fmt.Sprintf(", stir = $%d", argIndex)
+		args = append(args, *input.STIR)
+		argIndex++
+	}
+	if input.OKED != nil {
+		query += fmt.Sprintf(", oked = $%d", argIndex)
+		args = append(args, *input.OKED)
+		argIndex++
+	}
+	if input.BankAccount != nil {
+		query += fmt.Sprintf(", bank_account = $%d", argIndex)
+		args = append(args, *input.BankAccount)
+		argIndex++
+	}
+	if input.BankMFO != nil {
+		query += fmt.Sprintf(", bank_mfo = $%d", argIndex)
+		args = append(args, *input.BankMFO)
+		argIndex++
+	}
+	if input.BankName != nil {
+		query += fmt.Sprintf(", bank_name = $%d", argIndex)
+		args = append(args, *input.BankName)
+		argIndex++
+	}
+	if input.IsVATPayer != nil {
+		query += fmt.Sprintf(", is_vat_payer = $%d", argIndex)
+		args = append(args, *input.IsVATPayer)
+		argIndex++
+	}
+	if input.TaxRegime != nil {
+		query += fmt.Sprintf(", tax_regime = $%d", argIndex)
+		args = append(args, *input.TaxRegime)
+		argIndex++
+	}
+	if input.ActivityStatus != nil {
+		query += fmt.Sprintf(", activity_status = $%d", argIndex)
+		args = append(args, *input.ActivityStatus)
+		argIndex++
+	}
+	if input.BusinessGroup != nil {
+		query += fmt.Sprintf(", business_group = $%d", argIndex)
+		args = append(args, *input.BusinessGroup)
+		argIndex++
+	}
+	if input.IntercompanyRelations != nil {
+		query += fmt.Sprintf(", intercompany_relations = $%d", argIndex)
+		args = append(args, *input.IntercompanyRelations)
+		argIndex++
+	}
+	if input.DirectorName != nil {
+		query += fmt.Sprintf(", director_name = $%d", argIndex)
+		args = append(args, *input.DirectorName)
+		argIndex++
+	}
+	if input.DirectorPhone != nil {
+		query += fmt.Sprintf(", director_phone = $%d", argIndex)
+		args = append(args, *input.DirectorPhone)
+		argIndex++
+	}
+	if input.LegalAddress != nil {
+		query += fmt.Sprintf(", legal_address = $%d", argIndex)
+		args = append(args, *input.LegalAddress)
+		argIndex++
+	}
+	if input.Notes != nil {
+		query += fmt.Sprintf(", notes = $%d", argIndex)
+		args = append(args, *input.Notes)
+		argIndex++
+	}
 
 	query += fmt.Sprintf(" WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL", argIndex, argIndex+1)
 	args = append(args, orgID, tenantID)
 
 	query += ` RETURNING id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 	           address, contact_info, country, currency, accounting_standard, logo_url,
-	           settings, is_active, created_at, updated_at`
+	           settings, is_active, created_at, updated_at,
+	           stir, oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+	           tax_regime, activity_status, business_group, intercompany_relations,
+	           director_name, director_phone, legal_address, notes`
 
 	var org Organization
 	var addressJSON, contactInfoJSON, settingsJSON []byte
@@ -445,6 +595,9 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		&org.TaxID, &org.RegistrationNumber, &addressJSON, &contactInfoJSON,
 		&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
 		&settingsJSON, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
+		&org.STIR, &org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
+		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
 	)
 	if err != nil {
 		h.log.Error("Failed to update organization", "error", err)
@@ -788,4 +941,130 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 
 	h.log.Info("Created default journals", "tenant_id", tenantID, "org_id", orgID, "journal_count", len(defaultJournals))
 	return nil
+}
+
+// ImportOrganizationsInput represents the input for bulk importing organizations
+type ImportOrganizationsInput struct {
+	Organizations []CreateOrganizationInput `json:"organizations" binding:"required"`
+}
+
+// ImportOrganizations bulk imports organizations from JSON
+func (h *Handler) ImportOrganizations(c *gin.Context) {
+	tenantIDStr, exists := c.Get(middleware.ContextKeyTenantID)
+	if !exists {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	if err != nil {
+		response.BadRequest(c, "Invalid tenant ID")
+		return
+	}
+
+	var input ImportOrganizationsInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	if len(input.Organizations) == 0 {
+		response.BadRequest(c, "No organizations to import")
+		return
+	}
+
+	imported := 0
+	skipped := 0
+	errors := []string{}
+
+	for i, org := range input.Organizations {
+		// Check for duplicate code
+		var existingCount int
+		err = h.db.QueryRow(
+			"SELECT COUNT(*) FROM organizations WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL",
+			tenantID, org.Code,
+		).Scan(&existingCount)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("Row %d: failed to check duplicate", i+1))
+			continue
+		}
+		if existingCount > 0 {
+			skipped++
+			continue
+		}
+
+		// Set defaults
+		orgType := org.Type
+		if orgType == "" {
+			orgType = "company"
+		}
+
+		isVATPayer := false
+		if org.IsVATPayer != nil {
+			isVATPayer = *org.IsVATPayer
+		}
+
+		// Parse parent ID if provided
+		var parentID *uuid.UUID
+		if org.ParentID != nil && *org.ParentID != "" {
+			parsed, err := uuid.Parse(*org.ParentID)
+			if err == nil {
+				parentID = &parsed
+			}
+		}
+
+		// Convert maps to JSON
+		addressJSON := []byte("{}")
+		contactInfoJSON := []byte("{}")
+		if org.Address != nil {
+			addressJSON, _ = json.Marshal(org.Address)
+		}
+		if org.ContactInfo != nil {
+			contactInfoJSON, _ = json.Marshal(org.ContactInfo)
+		}
+
+		orgID := uuid.New()
+		now := time.Now()
+
+		_, err = h.db.Exec(`
+			INSERT INTO organizations (
+				id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
+				address, contact_info, country, currency, accounting_standard, logo_url,
+				settings, is_active, created_at, updated_at,
+				stir, oked, bank_account, bank_mfo, bank_name, is_vat_payer,
+				tax_regime, activity_status, business_group, intercompany_relations,
+				director_name, director_phone, legal_address, notes
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+			          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+		`,
+			orgID, tenantID, parentID, org.Code, org.Name, orgType,
+			org.TaxID, org.RegistrationNumber, addressJSON, contactInfoJSON,
+			org.Country, org.Currency, org.AccountingStandard, org.LogoURL,
+			[]byte("{}"), true, now, now,
+			org.STIR, org.OKED, org.BankAccount, org.BankMFO, org.BankName, isVATPayer,
+			org.TaxRegime, org.ActivityStatus, org.BusinessGroup, org.IntercompanyRelations,
+			org.DirectorName, org.DirectorPhone, org.LegalAddress, org.Notes,
+		)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("Row %d (%s): %v", i+1, org.Code, err))
+			continue
+		}
+
+		// Create default accounts and journals for new organization
+		if err := h.createDefaultChartOfAccounts(tenantID, orgID); err != nil {
+			h.log.Error("Failed to create default chart of accounts for imported org", "error", err, "org_id", orgID)
+		}
+		if err := h.createDefaultJournals(tenantID, orgID); err != nil {
+			h.log.Error("Failed to create default journals for imported org", "error", err, "org_id", orgID)
+		}
+
+		imported++
+	}
+
+	response.Success(c, map[string]interface{}{
+		"imported": imported,
+		"skipped":  skipped,
+		"errors":   errors,
+		"total":    len(input.Organizations),
+	})
 }

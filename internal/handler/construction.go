@@ -1693,7 +1693,7 @@ func (h *Handler) ListPhotoReports(c *gin.Context) {
 		var reportDate time.Time
 		var reportType, title, description, locationDescription, weather, reviewStatus, reviewNotes sql.NullString
 		var gpsLat, gpsLong, temperature sql.NullFloat64
-		var photos []byte
+		var photosBytes []byte
 		var reportedBy, reviewedBy uuid.NullUUID
 		var reviewDate sql.NullTime
 		var createdDate, updatedDate time.Time
@@ -1703,12 +1703,21 @@ func (h *Handler) ListPhotoReports(c *gin.Context) {
 			&id, &tenantIDVal, &projectIDVal, &smetaItemID, &sectionID,
 			&reportDate, &reportType, &title, &description, &locationDescription,
 			&gpsLat, &gpsLong, &weather, &temperature,
-			&photos, &reportedBy, &reviewedBy, &reviewDate, &reviewStatus, &reviewNotes,
+			&photosBytes, &reportedBy, &reviewedBy, &reviewDate, &reviewStatus, &reviewNotes,
 			&createdDate, &updatedDate,
 			&reporterName, &reviewerName,
 		); err != nil {
 			h.log.Error("Failed to scan photo report", "error", err)
 			continue
+		}
+
+		// Parse photos JSON bytes into proper array
+		var photos []map[string]interface{}
+		if len(photosBytes) > 0 {
+			json.Unmarshal(photosBytes, &photos)
+		}
+		if photos == nil {
+			photos = []map[string]interface{}{}
 		}
 
 		reports = append(reports, map[string]interface{}{
