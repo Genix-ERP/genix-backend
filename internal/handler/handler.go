@@ -124,6 +124,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		orgs.GET("", h.ListOrganizations)
 		orgs.POST("", middleware.RequirePermission("organization", "organization", "create"), h.CreateOrganization)
+		orgs.POST("/import", middleware.RequirePermission("organization", "organization", "create"), h.ImportOrganizations)
 		orgs.GET("/:id", h.GetOrganization)
 		orgs.PUT("/:id", middleware.RequirePermission("organization", "organization", "update"), h.UpdateOrganization)
 		orgs.DELETE("/:id", middleware.RequirePermission("organization", "organization", "delete"), h.DeleteOrganization)
