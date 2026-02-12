@@ -1484,6 +1484,92 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		h.log.Error("Failed to commit inventory transaction", "error", commitErr)
 	}
 
+	// ============================================
+	// CREATE JOURNAL ENTRY: Debit Finished Goods, Credit Raw Materials
+	// ============================================
+	totalCost := producedQty * unitCost
+	if totalCost > 0 {
+		// Find accounts
+		inventoryAccountID := findAccount(h.db, tenantID, organizationID, "inventory", "1300")
+		if inventoryAccountID == uuid.Nil {
+			inventoryAccountID = findAccount(h.db, tenantID, organizationID, "finished goods", "1300")
+		}
+		if inventoryAccountID == uuid.Nil {
+			inventoryAccountID = findAccount(h.db, tenantID, organizationID, "stock", "1300")
+		}
+
+		// Credit side: manufacturing expense / COGS
+		cogsAccountID := findAccount(h.db, tenantID, organizationID, "cost of goods", "5000")
+		if cogsAccountID == uuid.Nil {
+			cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
+		}
+		if cogsAccountID == uuid.Nil {
+			cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
+		}
+
+		if inventoryAccountID != uuid.Nil && cogsAccountID != uuid.Nil {
+			// Find manufacturing or general journal
+			var journalID uuid.UUID
+			var nextNumber int
+			err := h.db.QueryRow(`
+				SELECT id, next_number FROM journals
+				WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+				ORDER BY created_at ASC LIMIT 1
+			`, tenantID).Scan(&journalID, &nextNumber)
+
+			if err == nil && journalID != uuid.Nil {
+				// Get production order number
+				var poNumber string
+				h.db.QueryRow(`SELECT order_number FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
+
+				// Get product name
+				var productName string
+				h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, productID).Scan(&productName)
+
+				entryID := uuid.New()
+				entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+				description := fmt.Sprintf("Production Order %s completed - %s (qty: %.2f)", poNumber, productName, producedQty)
+
+				// Create journal entry
+				h.db.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number,
+						entry_date, description, status, total_debit, total_credit,
+						created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
+				`, entryID, tenantID, organizationID, journalID, entryNumber,
+					now, description, totalCost, now)
+
+				// Debit: Inventory (finished goods added)
+				debitLineID := uuid.New()
+				h.db.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, account_id, description,
+						debit_amount, credit_amount, line_number, created_at
+					) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+				`, debitLineID, entryID, inventoryAccountID, description, totalCost, now)
+
+				// Credit: COGS / Manufacturing Expense (cost of production)
+				creditLineID := uuid.New()
+				h.db.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, account_id, description,
+						debit_amount, credit_amount, line_number, created_at
+					) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+				`, creditLineID, entryID, cogsAccountID, description, totalCost, now)
+
+				// Update account balances
+				h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAccountID)
+				h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAccountID)
+
+				// Update journal next_number
+				h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+
+				h.log.Info("Journal entry created for production order completion", "entry_id", entryID, "amount", totalCost)
+			}
+		}
+	}
+
 	h.GetProductionOrder(c)
 }
 

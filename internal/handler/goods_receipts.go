@@ -874,11 +874,11 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 			`, tenantID, productID, warehouseID).Scan(&inventoryID)
 
 			if err == sql.ErrNoRows {
-				// Create new inventory record
+				// Create new inventory record (quantity_available and total_value are generated columns)
 				inventoryID = uuid.New()
 				h.db.Exec(`
-					INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, quantity_available, unit_cost, total_value, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, 0, 0, 0, $5, 0, $6, $6)
+					INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $6)
 				`, inventoryID, tenantID, productID, warehouseID, unitPrice, now)
 			}
 
