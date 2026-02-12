@@ -936,6 +936,209 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		return
 	}
 
+	// ============================================
+	// DECREASE INVENTORY WHEN SO STATUS → "shipped"
+	// ============================================
+	if input.Status != nil && *input.Status == "shipped" {
+		now := time.Now()
+
+		// Get SO warehouse_id and organization_id
+		var soWarehouseID sql.NullString
+		var soOrgID sql.NullString
+		h.db.QueryRow("SELECT warehouse_id, organization_id FROM sales_orders WHERE id = $1", orderID).Scan(&soWarehouseID, &soOrgID)
+
+		// Determine warehouse
+		var warehouseID uuid.UUID
+		if soWarehouseID.Valid && soWarehouseID.String != "" {
+			warehouseID, _ = uuid.Parse(soWarehouseID.String)
+		} else {
+			// Try delivery order's warehouse
+			h.db.QueryRow(`
+				SELECT warehouse_id FROM sales_delivery_orders
+				WHERE sales_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+				ORDER BY created_at DESC LIMIT 1
+			`, orderID, tenantID).Scan(&warehouseID)
+
+			if warehouseID == uuid.Nil {
+				// Fallback to org's first warehouse
+				if soOrgID.Valid && soOrgID.String != "" {
+					orgID, _ := uuid.Parse(soOrgID.String)
+					h.db.QueryRow(`
+						SELECT id FROM warehouses
+						WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID, orgID).Scan(&warehouseID)
+				}
+				if warehouseID == uuid.Nil {
+					h.db.QueryRow(`
+						SELECT id FROM warehouses
+						WHERE tenant_id = $1 AND deleted_at IS NULL
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID).Scan(&warehouseID)
+				}
+			}
+		}
+
+		if warehouseID != uuid.Nil {
+			// Get SO lines
+			soLines, err := h.db.Query(`
+				SELECT id, product_id, quantity, unit_price
+				FROM sales_order_lines
+				WHERE sales_order_id = $1 AND product_id IS NOT NULL
+			`, orderID)
+			if err == nil {
+				defer soLines.Close()
+				for soLines.Next() {
+					var lineID, productID uuid.UUID
+					var qty, unitPrice float64
+					if err := soLines.Scan(&lineID, &productID, &qty, &unitPrice); err != nil {
+						continue
+					}
+
+					// Update quantity_delivered on SO line
+					h.db.Exec(`
+						UPDATE sales_order_lines
+						SET quantity_delivered = quantity, updated_at = $1
+						WHERE id = $2
+					`, now, lineID)
+
+					// Find inventory record
+					var inventoryID uuid.UUID
+					err := h.db.QueryRow(`
+						SELECT id FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID, productID, warehouseID).Scan(&inventoryID)
+
+					if err != nil {
+						h.log.Error("No inventory record found for SO shipment", "product_id", productID, "warehouse_id", warehouseID)
+						continue
+					}
+
+					// Decrease inventory
+					h.db.Exec(`
+						UPDATE inventory
+						SET quantity_on_hand = quantity_on_hand - $1,
+							last_movement_date = $2,
+							updated_at = $2
+						WHERE id = $3
+					`, qty, now, inventoryID)
+
+					// Create inventory transaction
+					txID := uuid.New()
+					h.db.Exec(`
+						INSERT INTO inventory_transactions (
+							id, tenant_id, inventory_id, transaction_type, quantity,
+							unit_cost, total_cost, reference_type, reference_id,
+							reason, transaction_date, created_at
+						) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'sales_order', $7, 'Sales Order Shipped', $8, $8)
+					`, txID, tenantID, inventoryID, -qty, unitPrice, qty*unitPrice, orderID, now)
+				}
+			}
+
+			// Also update any draft delivery orders to shipped
+			h.db.Exec(`
+				UPDATE sales_delivery_orders
+				SET status = 'shipped', updated_at = $1
+				WHERE sales_order_id = $2 AND tenant_id = $3 AND status != 'shipped' AND deleted_at IS NULL
+			`, now, orderID, tenantID)
+
+			h.log.Info("Inventory decreased from SO shipped", "so_id", orderID)
+		}
+
+		// ============================================
+		// CREATE JOURNAL ENTRY: Debit AR, Credit Revenue
+		// ============================================
+		var soTotal float64
+		var soNumber string
+		var soCustomerName sql.NullString
+		var soOrgIDForJE sql.NullString
+		h.db.QueryRow(`
+			SELECT so.total_amount, so.order_number, c.name, so.organization_id
+			FROM sales_orders so
+			LEFT JOIN contacts c ON so.customer_id = c.id
+			WHERE so.id = $1
+		`, orderID).Scan(&soTotal, &soNumber, &soCustomerName, &soOrgIDForJE)
+
+		if soTotal > 0 {
+			var orgIDPtr *uuid.UUID
+			if soOrgIDForJE.Valid && soOrgIDForJE.String != "" {
+				parsed, _ := uuid.Parse(soOrgIDForJE.String)
+				if parsed != uuid.Nil {
+					orgIDPtr = &parsed
+				}
+			}
+
+			// Find accounts
+			arAccountID := findAccount(h.db, tenantID, orgIDPtr, "accounts receivable", "1200")
+			revenueAccountID := findAccount(h.db, tenantID, orgIDPtr, "sales revenue", "4000")
+
+			if arAccountID != uuid.Nil && revenueAccountID != uuid.Nil {
+				// Find sales journal
+				var journalID uuid.UUID
+				var nextNumber int
+				err := h.db.QueryRow(`
+					SELECT id, next_number FROM journals
+					WHERE tenant_id = $1 AND type = 'sales' AND is_active = true
+					ORDER BY created_at ASC LIMIT 1
+				`, tenantID).Scan(&journalID, &nextNumber)
+				if err != nil {
+					h.db.QueryRow(`
+						SELECT id, next_number FROM journals
+						WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID).Scan(&journalID, &nextNumber)
+				}
+
+				if journalID != uuid.Nil {
+					entryID := uuid.New()
+					entryNumber := fmt.Sprintf("SAL%06d", nextNumber)
+					customerName := ""
+					if soCustomerName.Valid {
+						customerName = soCustomerName.String
+					}
+					description := fmt.Sprintf("Sales Order %s shipped - %s", soNumber, customerName)
+
+					h.db.Exec(`
+						INSERT INTO journal_entries (
+							id, tenant_id, organization_id, journal_id, entry_number,
+							entry_date, description, status, total_debit, total_credit,
+							created_at, updated_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
+					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
+						now, description, soTotal, now)
+
+					// Debit: Accounts Receivable
+					debitLineID := uuid.New()
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+					`, debitLineID, entryID, arAccountID, description, soTotal, now)
+
+					// Credit: Sales Revenue
+					creditLineID := uuid.New()
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+					`, creditLineID, entryID, revenueAccountID, description, soTotal, now)
+
+					// Update account balances (AR is debit-normal: +debit; Revenue is credit-normal: -credit)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, soTotal, now, arAccountID)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, soTotal, now, revenueAccountID)
+
+					// Update journal next_number
+					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+
+					h.log.Info("Journal entry created for SO shipped", "entry_id", entryID, "amount", soTotal)
+				}
+			}
+		}
+	}
+
 	// Fetch and return updated order
 	h.GetSalesOrder(c)
 }

@@ -2019,16 +2019,24 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		exchangeRate = 1.0
 	}
 
+	var bankAccountID *uuid.UUID
+	if input.BankAccountID != nil && *input.BankAccountID != "" {
+		parsed, _ := uuid.Parse(*input.BankAccountID)
+		if parsed != uuid.Nil {
+			bankAccountID = &parsed
+		}
+	}
+
 	query := `
 		INSERT INTO payments (
 			id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
-			exchange_rate, reference, notes, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			exchange_rate, reference, notes, status, bank_account_id, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 	`
 
 	_, err = h.db.Exec(query,
 		id, tenantID, orgIDPtr, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
-		exchangeRate, reference, notes, "draft", userID, now, now)
+		exchangeRate, reference, notes, "draft", bankAccountID, userID, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create payment", "error", err)
@@ -2165,13 +2173,17 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		return
 	}
 
-	// Get payment
-	var status, paymentType string
+	// Get payment details
+	var status, paymentType, paymentNumber string
 	var amount float64
+	var contactID uuid.UUID
+	var orgID, paymentMethodID, bankAccountIDStr sql.NullString
+	var paymentDate time.Time
 	err = h.db.QueryRow(`
-		SELECT status, type, amount FROM payments
+		SELECT status, type, amount, contact_id, organization_id, payment_method_id, payment_date, payment_number, bank_account_id
+		FROM payments
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&status, &paymentType, &amount)
+	`, id, tenantID).Scan(&status, &paymentType, &amount, &contactID, &orgID, &paymentMethodID, &paymentDate, &paymentNumber, &bankAccountIDStr)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Payment")
@@ -2188,10 +2200,26 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		return
 	}
 
+	var orgIDPtr *uuid.UUID
+	if orgID.Valid {
+		parsed, _ := uuid.Parse(orgID.String)
+		if parsed != uuid.Nil {
+			orgIDPtr = &parsed
+		}
+	}
+
 	now := time.Now()
 
+	// Start transaction
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
 	// Update payment status
-	_, err = h.db.Exec(`
+	_, err = tx.Exec(`
 		UPDATE payments SET status = 'confirmed', approved_by = $1, approved_at = $2, updated_at = $2
 		WHERE id = $3
 	`, userID, now, id)
@@ -2202,8 +2230,8 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		return
 	}
 
-	// Update allocated invoices (if any)
-	_, err = h.db.Exec(`
+	// Update allocated sales invoices (if any)
+	_, err = tx.Exec(`
 		UPDATE sales_invoices SET
 			amount_paid = amount_paid + pa.amount,
 			status = CASE WHEN amount_paid + pa.amount >= total_amount THEN 'paid' ELSE 'partial' END,
@@ -2211,9 +2239,171 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		FROM payment_allocations pa
 		WHERE pa.payment_id = $2 AND pa.document_type = 'sales_invoice' AND sales_invoices.id = pa.document_id
 	`, now, id)
-
 	if err != nil {
-		h.log.Warn("Failed to update invoice amounts", "error", err)
+		h.log.Warn("Failed to update sales invoice amounts", "error", err)
+	}
+
+	// Update allocated purchase invoices (if any)
+	_, err = tx.Exec(`
+		UPDATE purchase_invoices SET
+			amount_paid = amount_paid + pa.amount,
+			status = CASE WHEN amount_paid + pa.amount >= total_amount THEN 'paid' ELSE 'partial' END,
+			updated_at = $1
+		FROM payment_allocations pa
+		WHERE pa.payment_id = $2 AND pa.document_type = 'purchase_invoice' AND purchase_invoices.id = pa.document_id
+	`, now, id)
+	if err != nil {
+		h.log.Warn("Failed to update purchase invoice amounts", "error", err)
+	}
+
+	// --- Create journal entry for the payment ---
+	// Determine cash/bank account: first try stored bank_account_id, then payment method, then fallback
+	var cashAccountID uuid.UUID
+	if bankAccountIDStr.Valid {
+		cashAccountID, _ = uuid.Parse(bankAccountIDStr.String)
+	}
+	if cashAccountID == uuid.Nil && paymentMethodID.Valid {
+		_ = tx.QueryRow(
+			`SELECT account_id FROM payment_methods WHERE id = $1 AND tenant_id = $2`,
+			paymentMethodID.String, tenantID,
+		).Scan(&cashAccountID)
+	}
+	if cashAccountID == uuid.Nil {
+		// Fallback: look up by name
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1100")
+		if cashAccountID == uuid.Nil {
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+		}
+	}
+
+	// Determine the counterpart account (AR or AP) based on payment type
+	var counterAccountID uuid.UUID
+	var journalCode, sourceType, debitDesc, creditDesc string
+
+	if paymentType == "receipt" {
+		// Inbound: customer pays us → Debit Cash, Credit AR
+		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1200")
+		journalCode = "CASH_RECEIPTS"
+		sourceType = "payment_receipt"
+		debitDesc = "Cash Receipt"
+		creditDesc = "Accounts Receivable"
+	} else {
+		// Outbound: we pay vendor → Debit AP, Credit Cash
+		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+		journalCode = "CASH_DISBURSEMENTS"
+		sourceType = "payment"
+		debitDesc = "Accounts Payable"
+		creditDesc = "Cash/Bank"
+	}
+
+	if cashAccountID != uuid.Nil && counterAccountID != uuid.Nil {
+		// Get journal
+		var journalID uuid.UUID
+		var nextNumber int
+		var numberPrefix sql.NullString
+		err = tx.QueryRow(`
+			SELECT id, COALESCE(next_number, 1), number_prefix
+			FROM journals WHERE tenant_id = $1 AND (code = $2 OR code = 'GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE WHEN code = $2 THEN 0 ELSE 1 END LIMIT 1`,
+			tenantID, journalCode,
+		).Scan(&journalID, &nextNumber, &numberPrefix)
+
+		if err == nil && journalID != uuid.Nil {
+			prefix := ""
+			if numberPrefix.Valid {
+				prefix = numberPrefix.String
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+			description := fmt.Sprintf("Payment %s confirmed", paymentNumber)
+			journalEntryID := uuid.New()
+
+			_, err = tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+				journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, paymentDate, paymentNumber, description,
+				sourceType, id.String(), 1.0, amount, amount, userID, now, now,
+			)
+
+			if err != nil {
+				h.log.Error("Failed to create payment journal entry", "error", err)
+			} else {
+				if paymentType == "receipt" {
+					// Receipt: Debit Cash, Credit AR
+					line1ID := uuid.New()
+					tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, contact_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						line1ID, journalEntryID, 1, cashAccountID, contactID, debitDesc,
+						amount, 0.0, 1.0, now,
+					)
+					line2ID := uuid.New()
+					tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, contact_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						line2ID, journalEntryID, 2, counterAccountID, contactID, creditDesc,
+						0.0, amount, 1.0, now,
+					)
+
+					// Update account balances
+					// Cash: debit-normal, debit increases balance
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID)
+					// AR: debit-normal, credit decreases balance
+					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID)
+				} else {
+					// Payment: Debit AP, Credit Cash
+					line1ID := uuid.New()
+					tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, contact_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						line1ID, journalEntryID, 1, counterAccountID, contactID, debitDesc,
+						amount, 0.0, 1.0, now,
+					)
+					line2ID := uuid.New()
+					tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, contact_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						line2ID, journalEntryID, 2, cashAccountID, contactID, creditDesc,
+						0.0, amount, 1.0, now,
+					)
+
+					// Update account balances
+					// AP: credit-normal, debit decreases balance (we're paying off liability)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID)
+					// Cash: debit-normal, credit decreases balance
+					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID)
+				}
+
+				// Update journal next number
+				tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
+
+				// Link journal entry to payment
+				tx.Exec("UPDATE payments SET journal_entry_id = $1 WHERE id = $2", journalEntryID, id)
+			}
+		} else {
+			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)
+		}
+	} else {
+		h.log.Warn("Cannot create payment journal entry: missing accounts",
+			"has_cash_account", cashAccountID != uuid.Nil,
+			"has_counter_account", counterAccountID != uuid.Nil,
+			"payment_type", paymentType)
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit payment confirmation", "error", err)
+		response.InternalError(c, "Failed to confirm payment")
+		return
 	}
 
 	response.Success(c, gin.H{"message": "Payment confirmed successfully", "confirmed_at": now})
