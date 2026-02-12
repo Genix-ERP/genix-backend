@@ -770,6 +770,306 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	// ============================================
+	// UPDATE INVENTORY WHEN PO STATUS → "received"
+	// ============================================
+	if input.Status != nil && *input.Status == "received" {
+		now := time.Now()
+
+		// Get PO warehouse_id and organization_id
+		var poWarehouseID sql.NullString
+		var poOrgID sql.NullString
+		h.db.QueryRow("SELECT warehouse_id, organization_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID, &poOrgID)
+
+		// Determine warehouse: PO warehouse → org's first warehouse → tenant's first warehouse
+		var warehouseID uuid.UUID
+		if poWarehouseID.Valid && poWarehouseID.String != "" {
+			warehouseID, _ = uuid.Parse(poWarehouseID.String)
+		} else if poOrgID.Valid && poOrgID.String != "" {
+			orgID, _ := uuid.Parse(poOrgID.String)
+			err := h.db.QueryRow(`
+				SELECT id FROM warehouses
+				WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+				ORDER BY created_at ASC LIMIT 1
+			`, tenantID, orgID).Scan(&warehouseID)
+			if err != nil {
+				// Fallback to any warehouse in the tenant
+				err = h.db.QueryRow(`
+					SELECT id FROM warehouses
+					WHERE tenant_id = $1 AND deleted_at IS NULL
+					ORDER BY created_at ASC LIMIT 1
+				`, tenantID).Scan(&warehouseID)
+				if err != nil {
+					h.log.Error("No warehouse found for inventory update", "error", err)
+					response.Success(c, gin.H{"message": "Purchase order updated but no warehouse for inventory"})
+					return
+				}
+			}
+		} else {
+			err := h.db.QueryRow(`
+				SELECT id FROM warehouses
+				WHERE tenant_id = $1 AND deleted_at IS NULL
+				ORDER BY created_at ASC LIMIT 1
+			`, tenantID).Scan(&warehouseID)
+			if err != nil {
+				h.log.Error("No warehouse found for inventory update", "error", err)
+				response.Success(c, gin.H{"message": "Purchase order updated but no warehouse for inventory"})
+				return
+			}
+		}
+
+		// Get PO lines with product info
+		poLines, err := h.db.Query(`
+			SELECT id, product_id, quantity, unit_price
+			FROM purchase_order_lines
+			WHERE purchase_order_id = $1 AND product_id IS NOT NULL
+		`, id)
+		if err == nil {
+			defer poLines.Close()
+			for poLines.Next() {
+				var lineID, productID uuid.UUID
+				var qty, unitPrice float64
+				if err := poLines.Scan(&lineID, &productID, &qty, &unitPrice); err != nil {
+					continue
+				}
+
+				// Update quantity_received on PO line
+				h.db.Exec(`
+					UPDATE purchase_order_lines
+					SET quantity_received = quantity, updated_at = $1
+					WHERE id = $2
+				`, now, lineID)
+
+				// Get or create inventory record
+				var inventoryID uuid.UUID
+				err := h.db.QueryRow(`
+					SELECT id FROM inventory
+					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+					ORDER BY created_at ASC LIMIT 1
+				`, tenantID, productID, warehouseID).Scan(&inventoryID)
+
+				if err == sql.ErrNoRows {
+					inventoryID = uuid.New()
+					h.db.Exec(`
+						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $6)
+					`, inventoryID, tenantID, productID, warehouseID, unitPrice, now)
+				}
+
+				// Update inventory quantity
+				h.db.Exec(`
+					UPDATE inventory
+					SET quantity_on_hand = quantity_on_hand + $1,
+						unit_cost = $2,
+						last_movement_date = $3,
+						updated_at = $3
+					WHERE id = $4
+				`, qty, unitPrice, now, inventoryID)
+
+				// Create inventory transaction for audit trail
+				txID := uuid.New()
+				h.db.Exec(`
+					INSERT INTO inventory_transactions (
+						id, tenant_id, inventory_id, transaction_type, quantity,
+						unit_cost, total_cost, reference_type, reference_id,
+						reason, transaction_date, created_at
+					) VALUES ($1, $2, $3, 'receipt', $4, $5, $6, 'purchase_order', $7, 'Purchase Order Received', $8, $8)
+				`, txID, tenantID, inventoryID, qty, unitPrice, qty*unitPrice, id, now)
+			}
+		}
+
+		h.log.Info("Inventory updated from PO received", "po_id", id)
+
+		// ============================================
+		// CREATE JOURNAL ENTRY: Debit Inventory, Credit AP
+		// ============================================
+		var poTotal float64
+		var poNumber string
+		var poVendorName sql.NullString
+		h.db.QueryRow(`
+			SELECT total_amount, order_number, c.name
+			FROM purchase_orders po
+			LEFT JOIN contacts c ON po.vendor_id = c.id
+			WHERE po.id = $1
+		`, id).Scan(&poTotal, &poNumber, &poVendorName)
+
+		var jeEntryID uuid.UUID // will be set if JE is created, used by vendor bill
+
+		if poTotal > 0 {
+			var orgIDPtr *uuid.UUID
+			if poOrgID.Valid && poOrgID.String != "" {
+				parsed, _ := uuid.Parse(poOrgID.String)
+				if parsed != uuid.Nil {
+					orgIDPtr = &parsed
+				}
+			}
+
+			// Find accounts
+			inventoryAccountID := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+			if inventoryAccountID == uuid.Nil {
+				inventoryAccountID = findAccount(h.db, tenantID, orgIDPtr, "stock", "1300")
+			}
+			apAccountID := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+
+			if inventoryAccountID != uuid.Nil && apAccountID != uuid.Nil {
+				// Find purchase journal
+				var journalID uuid.UUID
+				var nextNumber int
+				err := h.db.QueryRow(`
+					SELECT id, next_number FROM journals
+					WHERE tenant_id = $1 AND type = 'purchase' AND is_active = true
+					ORDER BY created_at ASC LIMIT 1
+				`, tenantID).Scan(&journalID, &nextNumber)
+				if err != nil {
+					// Fallback to general journal
+					h.db.QueryRow(`
+						SELECT id, next_number FROM journals
+						WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID).Scan(&journalID, &nextNumber)
+				}
+
+				if journalID != uuid.Nil {
+					entryID := uuid.New()
+					jeEntryID = entryID
+					entryNumber := fmt.Sprintf("PUR%06d", nextNumber)
+					vendorName := ""
+					if poVendorName.Valid {
+						vendorName = poVendorName.String
+					}
+					description := fmt.Sprintf("Purchase Order %s received - %s", poNumber, vendorName)
+
+					// Create journal entry
+					h.db.Exec(`
+						INSERT INTO journal_entries (
+							id, tenant_id, organization_id, journal_id, entry_number,
+							entry_date, description, status, total_debit, total_credit,
+							created_at, updated_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
+					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
+						now, description, poTotal, now)
+
+					// Debit: Inventory
+					debitLineID := uuid.New()
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+					`, debitLineID, entryID, inventoryAccountID, description, poTotal, now)
+
+					// Credit: Accounts Payable
+					creditLineID := uuid.New()
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+					`, creditLineID, entryID, apAccountID, description, poTotal, now)
+
+					// Update account balances
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, poTotal, now, inventoryAccountID)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, poTotal, now, apAccountID)
+
+					// Update journal next_number
+					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+
+					h.log.Info("Journal entry created for PO received", "entry_id", entryID, "amount", poTotal)
+				}
+			}
+		}
+
+		// ============================================
+		// CREATE VENDOR BILL (purchase_invoice) from PO
+		// ============================================
+		var vendorID uuid.UUID
+		var poSubtotal, poTaxAmt float64
+		h.db.QueryRow(`
+			SELECT vendor_id, COALESCE(subtotal, total_amount), COALESCE(tax_amount, 0)
+			FROM purchase_orders WHERE id = $1
+		`, id).Scan(&vendorID, &poSubtotal, &poTaxAmt)
+
+		if vendorID != uuid.Nil && poTotal > 0 {
+			// Check if a bill already exists for this PO
+			var existingBillID uuid.UUID
+			h.db.QueryRow(`
+				SELECT id FROM purchase_invoices
+				WHERE purchase_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+				LIMIT 1
+			`, id, tenantID).Scan(&existingBillID)
+
+			if existingBillID == uuid.Nil {
+				billID := uuid.New()
+				invoiceNumber := fmt.Sprintf("BILL-%s-%s", now.Format("20060102"), billID.String()[:6])
+
+				var orgIDForBill *uuid.UUID
+				if poOrgID.Valid && poOrgID.String != "" {
+					parsed, _ := uuid.Parse(poOrgID.String)
+					if parsed != uuid.Nil {
+						orgIDForBill = &parsed
+					}
+				}
+
+				dueDate := now.AddDate(0, 0, 30) // 30 days payment term
+
+				var jePtr *uuid.UUID
+				if jeEntryID != uuid.Nil {
+					jePtr = &jeEntryID
+				}
+				createdBy, _ := middleware.GetUserID(c)
+				var createdByPtr *uuid.UUID
+				if createdBy != uuid.Nil {
+					createdByPtr = &createdBy
+				}
+
+				h.db.Exec(`
+					INSERT INTO purchase_invoices (
+						id, tenant_id, organization_id, invoice_number, vendor_id,
+						purchase_order_id, invoice_date, due_date,
+						subtotal, tax_amount, total_amount, amount_paid,
+						status, payment_status, three_way_match_status,
+						journal_entry_id, notes, created_by, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'confirmed', 'unpaid', 'matched', $12, $13, $14, $15, $15)
+				`, billID, tenantID, orgIDForBill, invoiceNumber, vendorID,
+					id, now, dueDate,
+					poSubtotal, poTaxAmt, poTotal,
+					jePtr,
+					fmt.Sprintf("Auto-generated from PO %s", poNumber), createdByPtr, now)
+
+				// Create bill lines from PO lines
+				billLines, _ := h.db.Query(`
+					SELECT id, product_id, description, quantity, unit_price, COALESCE(tax_amount, 0), COALESCE(line_total, quantity * unit_price)
+					FROM purchase_order_lines
+					WHERE purchase_order_id = $1
+				`, id)
+				if billLines != nil {
+					lineNum := 0
+					for billLines.Next() {
+						var polID uuid.UUID
+						var productID *uuid.UUID
+						var desc string
+						var qty, unitPrice, lineTax, lineTotal float64
+						if err := billLines.Scan(&polID, &productID, &desc, &qty, &unitPrice, &lineTax, &lineTotal); err != nil {
+							continue
+						}
+						lineNum++
+						h.db.Exec(`
+							INSERT INTO purchase_invoice_lines (
+								id, purchase_invoice_id, purchase_order_line_id, line_number,
+								product_id, description, quantity, unit_price,
+								tax_amount, line_total, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+						`, uuid.New(), billID, polID, lineNum,
+							productID, desc, qty, unitPrice, lineTax, lineTotal, now)
+					}
+					billLines.Close()
+				}
+
+				h.log.Info("Vendor bill created from PO received", "bill_id", billID, "po_id", id)
+			}
+		}
+	}
+
 	response.Success(c, gin.H{"message": "Purchase order updated successfully"})
 }
 
