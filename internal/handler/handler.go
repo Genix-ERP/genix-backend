@@ -74,6 +74,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 
 	// Contact form (public - no auth needed)
 	rg.POST("/contact", h.SubmitContactForm)
+
+	// Public file access (for serving images in <img> tags)
+	rg.GET("/files/:id", h.GetFile)
 }
 
 // registerProtectedRoutes registers routes that require authentication
@@ -121,6 +124,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		orgs.GET("", h.ListOrganizations)
 		orgs.POST("", middleware.RequirePermission("organization", "organization", "create"), h.CreateOrganization)
+		orgs.POST("/import", middleware.RequirePermission("organization", "organization", "create"), h.ImportOrganizations)
 		orgs.GET("/:id", h.GetOrganization)
 		orgs.PUT("/:id", middleware.RequirePermission("organization", "organization", "update"), h.UpdateOrganization)
 		orgs.DELETE("/:id", middleware.RequirePermission("organization", "organization", "delete"), h.DeleteOrganization)
@@ -1144,11 +1148,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		notifications.PUT("/read-all", h.MarkAllNotificationsRead)
 	}
 
-	// Attachments/Files
+	// Attachments/Files (upload and delete require auth, GET is public - see registerPublicRoutes)
 	files := rg.Group("/files")
 	{
 		files.POST("/upload", h.UploadFile)
-		files.GET("/:id", h.GetFile)
 		files.DELETE("/:id", h.DeleteFile)
 	}
 
