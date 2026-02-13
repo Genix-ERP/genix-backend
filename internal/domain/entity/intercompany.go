@@ -104,11 +104,9 @@ type IntercompanyTransfer struct {
 	DeletedAt *time.Time `json:"-" db:"deleted_at"`
 
 	// Relationships
-	Lines            []IntercompanyTransferLine `json:"lines,omitempty"`
-	FromOrganization *Organization              `json:"from_organization,omitempty"`
-	ToOrganization   *Organization              `json:"to_organization,omitempty"`
-	FromWarehouse    *Warehouse                 `json:"from_warehouse,omitempty"`
-	ToWarehouse      *Warehouse                 `json:"to_warehouse,omitempty"`
+	Lines         []IntercompanyTransferLine `json:"lines,omitempty"`
+	FromWarehouse *Warehouse                 `json:"from_warehouse,omitempty"`
+	ToWarehouse   *Warehouse                 `json:"to_warehouse,omitempty"`
 }
 
 // IntercompanyTransferLine represents a line item in an IC transfer
@@ -225,9 +223,6 @@ type IntercompanyPayment struct {
 	UpdatedAt time.Time  `json:"updated_at" db:"updated_at"`
 	DeletedAt *time.Time `json:"-" db:"deleted_at"`
 
-	// Relationships
-	FromOrganization *Organization `json:"from_organization,omitempty"`
-	ToOrganization   *Organization `json:"to_organization,omitempty"`
 }
 
 // =====================================================
@@ -254,10 +249,6 @@ type IntercompanyAccount struct {
 	LastReconciledBy      *uuid.UUID              `json:"last_reconciled_by,omitempty" db:"last_reconciled_by"`
 	CreatedAt             time.Time               `json:"created_at" db:"created_at"`
 	UpdatedAt             time.Time               `json:"updated_at" db:"updated_at"`
-
-	// Relationships
-	Organization        *Organization `json:"organization,omitempty"`
-	PartnerOrganization *Organization `json:"partner_organization,omitempty"`
 }
 
 // IntercompanyAccountTransaction represents a transaction on an IC account
