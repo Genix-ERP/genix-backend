@@ -1208,8 +1208,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.POST("", middleware.RequirePermission("manufacturing", "work_orders", "create"), h.CreateWorkOrder)
 		workOrders.GET("/:id", h.GetWorkOrder)
 		workOrders.POST("/:id/start", h.StartWorkOrder)
+		workOrders.POST("/:id/pause", h.PauseWorkOrder)
 		workOrders.POST("/:id/complete", h.CompleteWorkOrder)
 		workOrders.POST("/:id/time", h.RecordWorkOrderTime)
+	}
+
+	// Manufacturing Transfers (Pick Components / Store Finished)
+	mfgTransfers := rg.Group("/manufacturing-transfers")
+	mfgTransfers.Use(middleware.RequirePermission("manufacturing", "transfers", "read"))
+	{
+		mfgTransfers.GET("", h.ListManufacturingTransfers)
+		mfgTransfers.GET("/:id", h.GetManufacturingTransfer)
+		mfgTransfers.POST("/:id/validate", middleware.RequirePermission("manufacturing", "transfers", "update"), h.ValidateManufacturingTransfer)
 	}
 
 	// Quality Control
@@ -1544,6 +1554,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 	// Intercompany Balances
 	rg.GET("/intercompany-balances", middleware.RequirePermission("finance", "account", "read"), h.GetIntercompanyBalances)
+
+	// Intercompany Rules (Odoo-like configuration)
+	icRules := rg.Group("/intercompany-rules")
+	icRules.Use(middleware.RequirePermission("settings", "organization", "read"))
+	{
+		icRules.GET("", h.ListIntercompanyRules)
+		icRules.POST("", middleware.RequirePermission("settings", "organization", "create"), h.CreateIntercompanyRule)
+		icRules.GET("/:id", h.GetIntercompanyRule)
+		icRules.PUT("/:id", middleware.RequirePermission("settings", "organization", "update"), h.UpdateIntercompanyRule)
+		icRules.DELETE("/:id", middleware.RequirePermission("settings", "organization", "delete"), h.DeleteIntercompanyRule)
+	}
+
+	// Intercompany Transaction Logs (Audit Trail)
+	rg.GET("/intercompany-logs", middleware.RequirePermission("settings", "organization", "read"), h.ListIntercompanyTransactionLogs)
 }
 
 // GetAPIInfo returns API information
