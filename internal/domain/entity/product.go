@@ -30,6 +30,13 @@ type ProductCategory struct {
 	CreatedAt   time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at" db:"updated_at"`
 
+	// Category GL accounts (Odoo-style)
+	IncomeAccountID         *uuid.UUID `json:"income_account_id,omitempty" db:"income_account_id"`
+	ExpenseAccountID        *uuid.UUID `json:"expense_account_id,omitempty" db:"expense_account_id"`
+	StockValuationAccountID *uuid.UUID `json:"stock_valuation_account_id,omitempty" db:"stock_valuation_account_id"`
+	StockInputAccountID     *uuid.UUID `json:"stock_input_account_id,omitempty" db:"stock_input_account_id"`
+	StockOutputAccountID    *uuid.UUID `json:"stock_output_account_id,omitempty" db:"stock_output_account_id"`
+
 	// Relationships
 	Parent   *ProductCategory  `json:"parent,omitempty"`
 	Children []ProductCategory `json:"children,omitempty"`
