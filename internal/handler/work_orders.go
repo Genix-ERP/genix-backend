@@ -59,7 +59,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 			   false as quality_check_required,
 			   NULL::boolean as quality_check_passed,
 			   wo.instructions, wo.notes, wo.created_at,
-			   COALESCE(po.order_number, '') as production_order_number,
+			   COALESCE(po.code, '') as production_order_number,
 			   COALESCE(p.name, '') as product_name
 		FROM work_orders wo
 		LEFT JOIN production_orders po ON wo.production_order_id = po.id
@@ -205,7 +205,7 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 			   false as quality_check_required,
 			   NULL::boolean as quality_check_passed,
 			   wo.instructions, wo.notes, wo.created_at,
-			   COALESCE(po.order_number, '') as production_order_number,
+			   COALESCE(po.code, '') as production_order_number,
 			   COALESCE(p.name, '') as product_name
 		FROM work_orders wo
 		LEFT JOIN production_orders po ON wo.production_order_id = po.id
@@ -643,7 +643,7 @@ func (h *Handler) ListManufacturingTransfers(c *gin.Context) {
 			   mt.transfer_number, mt.transfer_type,
 			   mt.source_location_id, mt.destination_location_id, mt.warehouse_id,
 			   mt.status, mt.scheduled_date, mt.done_date, mt.created_at,
-			   COALESCE(po.order_number, '') as po_number,
+			   COALESCE(po.code, '') as po_number,
 			   COALESCE(sl.name, '') as source_location_name,
 			   COALESCE(dl.name, '') as dest_location_name,
 			   COALESCE(w.name, '') as warehouse_name
@@ -753,7 +753,7 @@ func (h *Handler) GetManufacturingTransfer(c *gin.Context) {
 			   mt.transfer_number, mt.transfer_type,
 			   mt.source_location_id, mt.destination_location_id, mt.warehouse_id,
 			   mt.status, mt.scheduled_date, mt.done_date, mt.notes, mt.created_at,
-			   COALESCE(po.order_number, '') as po_number,
+			   COALESCE(po.code, '') as po_number,
 			   COALESCE(sl.name, '') as source_location_name,
 			   COALESCE(dl.name, '') as dest_location_name,
 			   COALESCE(w.name, '') as warehouse_name
@@ -941,7 +941,7 @@ func (h *Handler) CreateManufacturingTransfers(productionOrderID uuid.UUID, tena
 	var bomID uuid.UUID
 
 	err := h.db.QueryRow(`
-		SELECT po.organization_id, po.warehouse_id, po.order_number, po.bom_id
+		SELECT po.organization_id, po.warehouse_id, po.code, po.bom_id
 		FROM production_orders po
 		WHERE po.id = $1 AND po.tenant_id = $2
 	`, productionOrderID, tenantID).Scan(&orgID, &warehouseID, &orderNumber, &bomID)
