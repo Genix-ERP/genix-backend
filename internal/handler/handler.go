@@ -1389,6 +1389,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.DELETE("/:id/team/:memberId", middleware.RequirePermission("construction", "project", "update"), h.DeleteConstructionTeamMember)
 	}
 
+	// Project Vendors (direct access for update/delete)
+	projectVendors := rg.Group("/construction/project-vendors")
+	projectVendors.Use(middleware.RequirePermission("construction", "projects", "read"))
+	{
+		projectVendors.PUT("/:id", middleware.RequirePermission("construction", "projects", "update"), h.UpdateProjectVendor)
+		projectVendors.DELETE("/:id", middleware.RequirePermission("construction", "projects", "delete"), h.DeleteProjectVendor)
+	}
+
 	// Smeta Sections (direct access)
 	smetaSections := rg.Group("/construction/sections")
 	smetaSections.Use(middleware.RequirePermission("construction", "smeta", "read"))

@@ -1644,6 +1644,127 @@ func (h *Handler) CreateProjectVendor(c *gin.Context) {
 	})
 }
 
+// UpdateProjectVendor updates a vendor assignment
+func (h *Handler) UpdateProjectVendor(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	vendorRecordID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid vendor record ID")
+		return
+	}
+
+	var req entity.CreateProjectVendorInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Verify the vendor record exists and belongs to this tenant
+	var existingProjectID int64
+	err = h.db.QueryRow(
+		"SELECT project_id FROM construction_project_vendors WHERE id = $1 AND tenant_id = $2",
+		vendorRecordID, tenantID,
+	).Scan(&existingProjectID)
+	if err != nil {
+		response.NotFound(c, "Vendor record not found")
+		return
+	}
+
+	var contractDate interface{}
+	if req.ContractDate != "" {
+		t, _ := time.Parse("2006-01-02", req.ContractDate)
+		contractDate = t
+	}
+
+	var startDate, endDate interface{}
+	if req.StartDate != "" {
+		t, _ := time.Parse("2006-01-02", req.StartDate)
+		startDate = t
+	}
+	if req.EndDate != "" {
+		t, _ := time.Parse("2006-01-02", req.EndDate)
+		endDate = t
+	}
+
+	query := `
+		UPDATE construction_project_vendors SET
+			contract_number = COALESCE($1, contract_number),
+			contract_date = COALESCE($2, contract_date),
+			contract_amount = COALESCE($3, contract_amount),
+			currency = COALESCE(NULLIF($4, ''), currency),
+			vendor_type = COALESCE(NULLIF($5, ''), vendor_type),
+			work_scope = COALESCE($6, work_scope),
+			contact_person = COALESCE($7, contact_person),
+			contact_phone = COALESCE($8, contact_phone),
+			contact_email = COALESCE($9, contact_email),
+			start_date = $10,
+			end_date = $11,
+			notes = COALESCE($12, notes),
+			updated_date = NOW()
+		WHERE id = $13 AND tenant_id = $14
+	`
+
+	_, err = h.db.Exec(query,
+		nullString(req.ContractNumber), contractDate, nullFloat64(req.ContractAmount), req.Currency,
+		req.VendorType, nullString(req.WorkScope), nullString(req.ContactPerson),
+		nullString(req.ContactPhone), nullString(req.ContactEmail),
+		startDate, endDate, nullString(req.Notes),
+		vendorRecordID, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to update project vendor", "error", err)
+		response.InternalError(c, "Failed to update vendor")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"id":      vendorRecordID,
+		"message": "Vendor updated successfully",
+	})
+}
+
+// DeleteProjectVendor removes a vendor from a project
+func (h *Handler) DeleteProjectVendor(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	vendorRecordID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid vendor record ID")
+		return
+	}
+
+	// Verify the vendor record exists and belongs to this tenant
+	var exists bool
+	err = h.db.QueryRow(
+		"SELECT EXISTS(SELECT 1 FROM construction_project_vendors WHERE id = $1 AND tenant_id = $2)",
+		vendorRecordID, tenantID,
+	).Scan(&exists)
+	if err != nil || !exists {
+		response.NotFound(c, "Vendor record not found")
+		return
+	}
+
+	_, err = h.db.Exec("DELETE FROM construction_project_vendors WHERE id = $1 AND tenant_id = $2", vendorRecordID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete project vendor", "error", err)
+		response.InternalError(c, "Failed to remove vendor from project")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"message": "Vendor removed from project successfully",
+	})
+}
+
 // =====================================================
 // PHOTO REPORTS HANDLERS
 // =====================================================
