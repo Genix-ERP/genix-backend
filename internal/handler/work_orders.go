@@ -45,20 +45,25 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 
 	query := `
 		SELECT wo.id, wo.tenant_id, wo.organization_id, wo.production_order_id,
-			   wo.work_order_number, wo.name, wo.sequence,
-			   wo.bom_operation_id, wo.operation_name,
-			   wo.work_center_id, wo.work_center_name,
+			   COALESCE(wo.work_order_number, wo.code, '') as work_order_number,
+			   COALESCE(wo.name, '') as name, wo.sequence,
+			   wo.bom_operation_id, COALESCE(wo.operation_name, '') as operation_name,
+			   wo.work_center_id, COALESCE(wo.work_center_name, COALESCE(wc.name, '')) as work_center_name,
 			   wo.quantity_to_produce, wo.quantity_produced,
-			   wo.expected_duration_minutes, wo.setup_time_minutes, wo.actual_duration_minutes,
+			   COALESCE(wo.expected_duration_minutes, CAST(COALESCE(wo.planned_duration_hours, 0) * 60 AS INTEGER)) as expected_duration_minutes,
+			   COALESCE(wo.setup_time_minutes, CAST(COALESCE(wo.setup_time_hours, 0) * 60 AS INTEGER)) as setup_time_minutes,
+			   COALESCE(wo.actual_duration_minutes, CAST(COALESCE(wo.actual_duration_hours, 0) * 60 AS INTEGER)) as actual_duration_minutes,
 			   wo.scheduled_start, wo.scheduled_end, wo.actual_start, wo.actual_end,
-			   wo.status, wo.operator_id, wo.operator_name,
-			   wo.quality_check_required, wo.quality_check_passed,
+			   wo.status, COALESCE(wo.operator_id, wo.assigned_to) as operator_id, COALESCE(wo.operator_name, '') as operator_name,
+			   COALESCE(wo.quality_check_required, false) as quality_check_required,
+			   wo.quality_check_passed,
 			   wo.instructions, wo.notes, wo.created_at,
 			   COALESCE(po.order_number, '') as production_order_number,
 			   COALESCE(p.name, '') as product_name
 		FROM work_orders wo
 		LEFT JOIN production_orders po ON wo.production_order_id = po.id
 		LEFT JOIN products p ON po.product_id = p.id
+		LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
 		WHERE wo.tenant_id = $1 AND wo.deleted_at IS NULL
 	`
 
@@ -189,20 +194,25 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 
 	query := `
 		SELECT wo.id, wo.tenant_id, wo.organization_id, wo.production_order_id,
-			   wo.work_order_number, wo.name, wo.sequence,
-			   wo.bom_operation_id, wo.operation_name,
-			   wo.work_center_id, wo.work_center_name,
+			   COALESCE(wo.work_order_number, wo.code, '') as work_order_number,
+			   COALESCE(wo.name, '') as name, wo.sequence,
+			   wo.bom_operation_id, COALESCE(wo.operation_name, '') as operation_name,
+			   wo.work_center_id, COALESCE(wo.work_center_name, COALESCE(wc.name, '')) as work_center_name,
 			   wo.quantity_to_produce, wo.quantity_produced,
-			   wo.expected_duration_minutes, wo.setup_time_minutes, wo.actual_duration_minutes,
+			   COALESCE(wo.expected_duration_minutes, CAST(COALESCE(wo.planned_duration_hours, 0) * 60 AS INTEGER)) as expected_duration_minutes,
+			   COALESCE(wo.setup_time_minutes, CAST(COALESCE(wo.setup_time_hours, 0) * 60 AS INTEGER)) as setup_time_minutes,
+			   COALESCE(wo.actual_duration_minutes, CAST(COALESCE(wo.actual_duration_hours, 0) * 60 AS INTEGER)) as actual_duration_minutes,
 			   wo.scheduled_start, wo.scheduled_end, wo.actual_start, wo.actual_end,
-			   wo.status, wo.operator_id, wo.operator_name,
-			   wo.quality_check_required, wo.quality_check_passed,
+			   wo.status, COALESCE(wo.operator_id, wo.assigned_to) as operator_id, COALESCE(wo.operator_name, '') as operator_name,
+			   COALESCE(wo.quality_check_required, false) as quality_check_required,
+			   wo.quality_check_passed,
 			   wo.instructions, wo.notes, wo.created_at,
 			   COALESCE(po.order_number, '') as production_order_number,
 			   COALESCE(p.name, '') as product_name
 		FROM work_orders wo
 		LEFT JOIN production_orders po ON wo.production_order_id = po.id
 		LEFT JOIN products p ON po.product_id = p.id
+		LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
 		WHERE wo.id = $1 AND wo.tenant_id = $2 AND wo.deleted_at IS NULL
 	`
 
@@ -452,19 +462,25 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 		h.db.QueryRow("SELECT name FROM work_centers WHERE id = $1", wcID).Scan(&workCenterName)
 	}
 
+	// Use 'code' column which exists in migration 010, plus work_order_number for new schema
+	// Also use uom which is required in the old schema
 	_, err = h.db.Exec(`
 		INSERT INTO work_orders (
 			id, tenant_id, organization_id, production_order_id,
-			work_order_number, name, sequence,
+			code, work_order_number, name, sequence,
 			operation_name, work_center_id, work_center_name,
-			quantity_to_produce, expected_duration_minutes, setup_time_minutes,
+			quantity_to_produce, uom,
+			expected_duration_minutes, setup_time_minutes,
+			planned_duration_hours, setup_time_hours,
 			scheduled_start, scheduled_end,
 			status, instructions, notes, created_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'draft', $16, $17, $18)
+		) VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9, $10, $11, 'pcs', $12, $13, $14, $15, $16, $17, 'draft', $18, $19, $20)
 	`, woID, tenantID, orgID, productionOrderID,
 		woNumber, input.Name, input.Sequence,
 		input.OperationName, workCenterID, workCenterName,
-		input.QuantityToProduce, input.ExpectedDurationMinutes, input.SetupTimeMinutes,
+		input.QuantityToProduce,
+		input.ExpectedDurationMinutes, input.SetupTimeMinutes,
+		float64(input.ExpectedDurationMinutes)/60, float64(input.SetupTimeMinutes)/60,
 		input.ScheduledStart, input.ScheduledEnd,
 		input.Instructions, input.Notes, userID)
 	if err != nil {
@@ -1058,20 +1074,25 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 			notesVal = notes.String
 		}
 
+		// Use both code and work_order_number for compatibility with migration 010 schema
 		_, err := h.db.Exec(`
 			INSERT INTO work_orders (
 				id, tenant_id, organization_id, production_order_id,
-				work_order_number, name, sequence,
-				bom_operation_id, operation_name,
+				code, work_order_number, name, sequence,
+				operation_id, bom_operation_id, operation_name,
 				work_center_id, work_center_name,
-				quantity_to_produce, expected_duration_minutes, setup_time_minutes,
+				quantity_to_produce, uom,
+				expected_duration_minutes, setup_time_minutes,
+				planned_duration_hours, setup_time_hours,
 				status, instructions, created_by
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'draft', $15, $16)
+			) VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $8, $9, $10, $11, $12, 'pcs', $13, $14, $15, $16, 'draft', $17, $18)
 		`, woID, tenantID, orgID, productionOrderID,
 			woNumber, opName, sequence,
 			opID, opName,
 			workCenterID, wcName,
-			quantity, runTime, setupTime,
+			quantity,
+			runTime, setupTime,
+			float64(runTime)/60, float64(setupTime)/60,
 			notesVal, userID)
 		if err != nil {
 			return err
