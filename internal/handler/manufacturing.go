@@ -601,7 +601,8 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	baseQuery := `
 		SELECT po.id, po.code, po.name, po.product_id, p.name as product_name, p.code as product_code,
 			   po.bom_id, b.name as bom_name, po.quantity_planned, po.quantity_produced, po.quantity_scrapped,
-			   po.uom, po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
+			   po.uom, po.mold_count, po.shift, po.current_stage, po.package_count, po.good_quantity, po.reject_quantity,
+			   po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
 			   po.priority, po.status, po.progress_percent, po.source_type, po.warehouse_id,
 			   w.name as warehouse_name, po.planned_cost, po.actual_cost, po.material_cost,
 			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
@@ -739,14 +740,15 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	orders := []entity.ProductionOrderResponse{}
 	for rows.Next() {
 		var po entity.ProductionOrderResponse
-		var bomName, warehouseName, assignedToName, workCenterName sql.NullString
+		var bomName, warehouseName, assignedToName, workCenterName, shift sql.NullString
 		var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 		var tags []byte
 
 		err := rows.Scan(
 			&po.ID, &po.Code, &po.Name, &po.ProductID, &po.ProductName, &po.ProductCode,
 			&po.BOMID, &bomName, &po.QuantityPlanned, &po.QuantityProduced, &po.QuantityScrapped,
-			&po.UOM, &scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
+			&po.UOM, &po.MoldCount, &shift, &po.CurrentStage, &po.PackageCount, &po.GoodQuantity, &po.RejectQuantity,
+			&scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
 			&po.Priority, &po.Status, &po.ProgressPercent, &po.SourceType, &po.WarehouseID,
 			&warehouseName, &po.PlannedCost, &po.ActualCost, &po.MaterialCost,
 			&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
@@ -769,6 +771,9 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		}
 		if workCenterName.Valid {
 			po.WorkCenterName = &workCenterName.String
+		}
+		if shift.Valid {
+			po.Shift = &shift.String
 		}
 		if scheduledStart.Valid {
 			s := scheduledStart.Time.Format("2006-01-02")
@@ -824,7 +829,8 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	query := `
 		SELECT po.id, po.code, po.name, po.product_id, p.name as product_name, p.code as product_code,
 			   po.bom_id, b.name as bom_name, po.quantity_planned, po.quantity_produced, po.quantity_scrapped,
-			   po.uom, po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
+			   po.uom, po.mold_count, po.shift, po.current_stage, po.package_count, po.good_quantity, po.reject_quantity,
+			   po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
 			   po.priority, po.status, po.progress_percent, po.source_type, po.warehouse_id,
 			   w.name as warehouse_name, po.planned_cost, po.actual_cost, po.material_cost,
 			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
@@ -842,14 +848,15 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	`
 
 	var po entity.ProductionOrderResponse
-	var bomName, warehouseName, assignedToName, workCenterName, createdByName sql.NullString
+	var bomName, warehouseName, assignedToName, workCenterName, createdByName, shift sql.NullString
 	var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 	var tags []byte
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&po.ID, &po.Code, &po.Name, &po.ProductID, &po.ProductName, &po.ProductCode,
 		&po.BOMID, &bomName, &po.QuantityPlanned, &po.QuantityProduced, &po.QuantityScrapped,
-		&po.UOM, &scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
+		&po.UOM, &po.MoldCount, &shift, &po.CurrentStage, &po.PackageCount, &po.GoodQuantity, &po.RejectQuantity,
+		&scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
 		&po.Priority, &po.Status, &po.ProgressPercent, &po.SourceType, &po.WarehouseID,
 		&warehouseName, &po.PlannedCost, &po.ActualCost, &po.MaterialCost,
 		&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
@@ -882,6 +889,9 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	}
 	if createdByName.Valid {
 		po.CreatedByName = &createdByName.String
+	}
+	if shift.Valid {
+		po.Shift = &shift.String
 	}
 	if scheduledStart.Valid {
 		s := scheduledStart.Time.Format("2006-01-02")
@@ -1018,13 +1028,20 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
+	// Manufacturing-specific fields
+	moldCount := 0
+	if input.MoldCount != nil {
+		moldCount = *input.MoldCount
+	}
+
 	query := `
 		INSERT INTO production_orders (
 			id, tenant_id, organization_id, code, name, product_id, bom_id, quantity_planned, uom,
+			mold_count, shift, current_stage,
 			scheduled_start, scheduled_end, priority, status, source_type, source_id,
 			sales_order_id, customer_id, warehouse_id, location_id, assigned_to,
 			work_center_id, requires_quality_check, notes, tags, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'draft', $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, 'draft', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 		RETURNING id
 	`
 
@@ -1035,6 +1052,7 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, code, input.Name, input.ProductID, input.BOMID, input.QuantityPlanned, input.UOM,
+		moldCount, input.Shift,
 		scheduledStart, scheduledEnd, priority, input.SourceType, input.SourceID,
 		input.SalesOrderID, input.CustomerID, input.WarehouseID, input.LocationID, input.AssignedTo,
 		input.WorkCenterID, requiresQC, input.Notes, tags, userID, now, now,
@@ -1136,6 +1154,38 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 		args = append(args, tags)
 	}
 
+	// Manufacturing-specific fields
+	if input.MoldCount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("mold_count = $%d", argCount))
+		args = append(args, *input.MoldCount)
+	}
+	if input.Shift != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("shift = $%d", argCount))
+		args = append(args, *input.Shift)
+	}
+	if input.CurrentStage != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("current_stage = $%d", argCount))
+		args = append(args, *input.CurrentStage)
+	}
+	if input.PackageCount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("package_count = $%d", argCount))
+		args = append(args, *input.PackageCount)
+	}
+	if input.GoodQuantity != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("good_quantity = $%d", argCount))
+		args = append(args, *input.GoodQuantity)
+	}
+	if input.RejectQuantity != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("reject_quantity = $%d", argCount))
+		args = append(args, *input.RejectQuantity)
+	}
+
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")
 		return
@@ -1152,8 +1202,9 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 	argCount++
 	args = append(args, tenantID)
 
+	// Allow updates for draft, confirmed, and in_progress status (for manufacturing stage tracking)
 	query := fmt.Sprintf(
-		"UPDATE production_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status IN ('draft', 'confirmed')",
+		"UPDATE production_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status IN ('draft', 'confirmed', 'in_progress')",
 		strings.Join(updates, ", "), argCount-1, argCount,
 	)
 

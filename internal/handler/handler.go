@@ -1512,6 +1512,38 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// POS Products (optimized search)
 		pos.GET("/products", h.SearchPOSProducts)
 	}
+
+	// =====================================================
+	// INTERCOMPANY TRANSFERS MODULE ROUTES
+	// =====================================================
+
+	// Intercompany Transfers (Product)
+	icTransfers := rg.Group("/intercompany-transfers")
+	icTransfers.Use(middleware.RequirePermission("inventory", "stock", "read"))
+	{
+		icTransfers.GET("", h.ListIntercompanyTransfers)
+		icTransfers.POST("", middleware.RequirePermission("inventory", "stock", "create"), h.CreateIntercompanyTransfer)
+		icTransfers.GET("/:id", h.GetIntercompanyTransfer)
+		icTransfers.PUT("/:id", middleware.RequirePermission("inventory", "stock", "update"), h.UpdateIntercompanyTransfer)
+		icTransfers.DELETE("/:id", middleware.RequirePermission("inventory", "stock", "delete"), h.DeleteIntercompanyTransfer)
+		icTransfers.POST("/:id/approve", middleware.RequirePermission("inventory", "stock", "transfer"), h.ApproveIntercompanyTransfer)
+		icTransfers.POST("/:id/ship", middleware.RequirePermission("inventory", "stock", "transfer"), h.ShipIntercompanyTransfer)
+		icTransfers.POST("/:id/receive", middleware.RequirePermission("inventory", "stock", "transfer"), h.ReceiveIntercompanyTransfer)
+	}
+
+	// Intercompany Payments (Money)
+	icPayments := rg.Group("/intercompany-payments")
+	icPayments.Use(middleware.RequirePermission("finance", "payment", "read"))
+	{
+		icPayments.GET("", h.ListIntercompanyPayments)
+		icPayments.POST("", middleware.RequirePermission("finance", "payment", "create"), h.CreateIntercompanyPayment)
+		icPayments.GET("/:id", h.GetIntercompanyPayment)
+		icPayments.POST("/:id/approve", middleware.RequirePermission("finance", "payment", "approve"), h.ApproveIntercompanyPayment)
+		icPayments.DELETE("/:id", middleware.RequirePermission("finance", "payment", "delete"), h.DeleteIntercompanyPayment)
+	}
+
+	// Intercompany Balances
+	rg.GET("/intercompany-balances", middleware.RequirePermission("finance", "account", "read"), h.GetIntercompanyBalances)
 }
 
 // GetAPIInfo returns API information
