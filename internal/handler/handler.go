@@ -381,6 +381,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		bom.DELETE("/:id", middleware.RequirePermission("inventory", "bom", "delete"), h.DeleteBOM)
 		bom.POST("/:id/lines", middleware.RequirePermission("inventory", "bom", "update"), h.CreateBOMLine)
 		bom.DELETE("/:id/lines/:lineId", middleware.RequirePermission("inventory", "bom", "update"), h.DeleteBOMLine)
+		// BOM Operations (routing)
+		bom.GET("/:id/operations", h.ListBOMOperations)
+		bom.POST("/:id/operations", middleware.RequirePermission("inventory", "bom", "update"), h.CreateBOMOperation)
+		bom.PUT("/:id/operations/:operationId", middleware.RequirePermission("inventory", "bom", "update"), h.UpdateBOMOperation)
+		bom.DELETE("/:id/operations/:operationId", middleware.RequirePermission("inventory", "bom", "update"), h.DeleteBOMOperation)
 	}
 
 	// Alias route for /boms (plural) - frontend compatibility
@@ -392,6 +397,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		boms.GET("/:id", h.GetBOM)
 		boms.PUT("/:id", middleware.RequirePermission("inventory", "bom", "update"), h.UpdateBOM)
 		boms.DELETE("/:id", middleware.RequirePermission("inventory", "bom", "delete"), h.DeleteBOM)
+		// BOM Operations (routing)
+		boms.GET("/:id/operations", h.ListBOMOperations)
+		boms.POST("/:id/operations", middleware.RequirePermission("inventory", "bom", "update"), h.CreateBOMOperation)
+		boms.PUT("/:id/operations/:operationId", middleware.RequirePermission("inventory", "bom", "update"), h.UpdateBOMOperation)
+		boms.DELETE("/:id/operations/:operationId", middleware.RequirePermission("inventory", "bom", "update"), h.DeleteBOMOperation)
 	}
 
 	// Scrap Management

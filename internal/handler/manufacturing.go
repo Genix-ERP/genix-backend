@@ -911,6 +911,58 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	po.QuantityRemaining = po.QuantityPlanned - po.QuantityProduced - po.QuantityScrapped
 	po.Tags = []string{}
 
+	// If order is confirmed or beyond, fetch associated work orders
+	if po.Status != "draft" {
+		woQuery := `
+			SELECT wo.id, wo.code, wo.name, wo.sequence, wo.work_center_id, wc.name as work_center_name,
+				   wo.quantity_to_produce, wo.quantity_produced, wo.quantity_scrapped, wo.uom,
+				   wo.planned_duration_hours, wo.actual_duration_hours, wo.setup_time_hours,
+				   wo.planned_cost, wo.actual_cost, wo.labor_cost, wo.machine_cost,
+				   wo.status, wo.progress_percent, wo.instructions, wo.notes, wo.created_at
+			FROM work_orders wo
+			LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
+			WHERE wo.production_order_id = $1 AND wo.tenant_id = $2 AND wo.deleted_at IS NULL
+			ORDER BY wo.sequence ASC
+		`
+		woRows, err := h.db.Query(woQuery, id, tenantID)
+		if err == nil {
+			defer woRows.Close()
+			for woRows.Next() {
+				var wo entity.WorkOrder
+				var wcID *uuid.UUID
+				var wcName sql.NullString
+				var instructions, notes sql.NullString
+
+				err := woRows.Scan(
+					&wo.ID, &wo.Code, &wo.Name, &wo.Sequence, &wcID, &wcName,
+					&wo.QuantityToProduce, &wo.QuantityProduced, &wo.QuantityScrapped, &wo.UOM,
+					&wo.PlannedDurationHrs, &wo.ActualDurationHrs, &wo.SetupTimeHrs,
+					&wo.PlannedCost, &wo.ActualCost, &wo.LaborCost, &wo.MachineCost,
+					&wo.Status, &wo.ProgressPercent, &instructions, &notes, &wo.CreatedAt,
+				)
+				if err != nil {
+					h.log.Error("Failed to scan work order", "error", err)
+					continue
+				}
+				wo.ProductionOrderID = id
+				wo.TenantID = tenantID
+				if wcID != nil {
+					wo.WorkCenterID = wcID
+				}
+				if wcName.Valid {
+					wo.WorkCenterName = &wcName.String
+				}
+				if instructions.Valid {
+					wo.Instructions = &instructions.String
+				}
+				if notes.Valid {
+					wo.Notes = &notes.String
+				}
+				po.WorkOrders = append(po.WorkOrders, wo)
+			}
+		}
+	}
+
 	response.Success(c, po)
 }
 
@@ -1154,6 +1206,7 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 }
 
 // ConfirmProductionOrder confirms a draft production order
+// It calculates costs based on BOM operations and generates work orders
 func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1170,14 +1223,185 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// Start transaction
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to confirm production order")
+		return
+	}
+	defer tx.Rollback()
+
+	// Get the production order details (including BOM ID and quantity)
+	var bomID *uuid.UUID
+	var quantityPlanned float64
+	var workCenterID *uuid.UUID
+	var uom string
+	var productName string
+	var orgID *uuid.UUID
+
+	poQuery := `
+		SELECT po.bom_id, po.quantity_planned, po.work_center_id, po.uom, po.organization_id, p.name as product_name
+		FROM production_orders po
+		LEFT JOIN products p ON p.id = po.product_id
+		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL AND po.status = 'draft'
+	`
+	err = tx.QueryRow(poQuery, id, tenantID).Scan(&bomID, &quantityPlanned, &workCenterID, &uom, &orgID, &productName)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Production order not found or not in draft status")
+			return
+		}
+		h.log.Error("Failed to get production order", "error", err)
+		response.InternalError(c, "Failed to confirm production order")
+		return
+	}
+
+	var totalPlannedCost float64 = 0
+	var totalLaborCost float64 = 0
+	var totalOverheadCost float64 = 0
+
+	// If BOM exists, calculate costs and generate work orders from BOM operations
+	if bomID != nil {
+		// Get BOM operations with work center costs
+		opsQuery := `
+			SELECT
+				bo.id, bo.sequence, bo.operation_name, bo.work_center_id,
+				bo.setup_time_minutes, bo.run_time_minutes,
+				bo.labor_cost, bo.overhead_cost, bo.notes,
+				COALESCE(wc.hourly_cost, 0) as wc_hourly_cost,
+				COALESCE(wc.setup_cost, 0) as wc_setup_cost,
+				COALESCE(wc.overhead_cost, 0) as wc_overhead_cost
+			FROM bom_operations bo
+			LEFT JOIN work_centers wc ON wc.id = bo.work_center_id AND wc.deleted_at IS NULL
+			WHERE bo.bom_id = $1
+			ORDER BY bo.sequence ASC
+		`
+		rows, err := tx.Query(opsQuery, bomID)
+		if err != nil {
+			h.log.Error("Failed to get BOM operations", "error", err)
+			response.InternalError(c, "Failed to confirm production order")
+			return
+		}
+		defer rows.Close()
+
+		now := time.Now()
+
+		for rows.Next() {
+			var opID uuid.UUID
+			var sequence int
+			var operationName string
+			var opWorkCenterID *uuid.UUID
+			var setupTimeMinutes, runTimeMinutes float64
+			var laborCost, overheadCost float64
+			var notes *string
+			var wcHourlyCost, wcSetupCost, wcOverheadCost float64
+
+			err := rows.Scan(&opID, &sequence, &operationName, &opWorkCenterID,
+				&setupTimeMinutes, &runTimeMinutes,
+				&laborCost, &overheadCost, &notes,
+				&wcHourlyCost, &wcSetupCost, &wcOverheadCost)
+			if err != nil {
+				h.log.Error("Failed to scan BOM operation", "error", err)
+				continue
+			}
+
+			// Calculate time for this operation
+			// Total time = setup time + (run time per unit * quantity)
+			totalTimeMinutes := setupTimeMinutes + (runTimeMinutes * quantityPlanned)
+			totalTimeHours := totalTimeMinutes / 60.0
+
+			// Calculate costs for this operation
+			// Option 1: Use labor_cost and overhead_cost from bom_operations if set
+			// Option 2: Use work center hourly_cost if bom_operations costs are 0
+			var opLaborCost float64
+			var opOverheadCost float64
+
+			if laborCost > 0 {
+				opLaborCost = laborCost * quantityPlanned
+			} else if wcHourlyCost > 0 {
+				opLaborCost = totalTimeHours * wcHourlyCost
+			}
+
+			if overheadCost > 0 {
+				opOverheadCost = overheadCost * quantityPlanned
+			} else if wcOverheadCost > 0 {
+				opOverheadCost = totalTimeHours * wcOverheadCost
+			}
+
+			// Add setup cost from work center
+			machineCost := wcSetupCost + (totalTimeHours * wcHourlyCost)
+
+			totalLaborCost += opLaborCost
+			totalOverheadCost += opOverheadCost
+			totalPlannedCost += opLaborCost + opOverheadCost + machineCost
+
+			// Use operation's work center if available, otherwise fall back to PO's work center
+			effectiveWorkCenterID := opWorkCenterID
+			if effectiveWorkCenterID == nil {
+				effectiveWorkCenterID = workCenterID
+			}
+
+			// Generate work order for this operation
+			woID := uuid.New()
+			woCode := fmt.Sprintf("WO-%s-%d", id.String()[:8], sequence)
+			woName := fmt.Sprintf("%s - %s", productName, operationName)
+
+			woQuery := `
+				INSERT INTO work_orders (
+					id, tenant_id, production_order_id, code, name,
+					sequence, operation_id, work_center_id,
+					quantity_to_produce, uom,
+					planned_duration_hours, setup_time_hours,
+					planned_cost, labor_cost, machine_cost,
+					status, instructions, notes,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $19, $19)
+			`
+
+			var instructions *string
+			if notes != nil && *notes != "" {
+				instructions = notes
+			}
+
+			_, err = tx.Exec(woQuery,
+				woID, tenantID, id, woCode, woName,
+				sequence, opID, effectiveWorkCenterID,
+				quantityPlanned, uom,
+				totalTimeHours, setupTimeMinutes/60.0,
+				opLaborCost+machineCost, opLaborCost, machineCost,
+				instructions, notes,
+				userID, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create work order", "error", err, "operation", operationName)
+				response.InternalError(c, "Failed to create work orders")
+				return
+			}
+		}
+
+		if err := rows.Err(); err != nil {
+			h.log.Error("Error iterating BOM operations", "error", err)
+			response.InternalError(c, "Failed to confirm production order")
+			return
+		}
+	}
+
+	// Update production order with calculated costs and confirm
 	now := time.Now()
-	query := `
+	updateQuery := `
 		UPDATE production_orders
-		SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2, updated_at = $2
-		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL AND status = 'draft'
+		SET status = 'confirmed',
+			confirmed_by = $1,
+			confirmed_at = $2,
+			planned_cost = $3,
+			labor_cost = $4,
+			overhead_cost = $5,
+			updated_at = $2
+		WHERE id = $6 AND tenant_id = $7 AND deleted_at IS NULL AND status = 'draft'
 	`
 
-	result, err := h.db.Exec(query, userID, now, id, tenantID)
+	result, err := tx.Exec(updateQuery, userID, now, totalPlannedCost, totalLaborCost, totalOverheadCost, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to confirm production order", "error", err)
 		response.InternalError(c, "Failed to confirm production order")
@@ -1187,6 +1411,13 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
 		response.NotFound(c, "Production order not found or not in draft status")
+		return
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to confirm production order")
 		return
 	}
 
