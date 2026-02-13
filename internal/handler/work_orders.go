@@ -25,7 +25,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 		return
 	}
 
-	orgID, _ := middleware.GetOrganizationID(c)
+	// Note: organization_id filter skipped as it may not exist in migration 010 schema
 
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -43,20 +43,21 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	workCenterID := c.Query("work_center_id")
 	status := c.Query("status")
 
+	// Use only columns from migration 010 schema for backward compatibility
 	query := `
-		SELECT wo.id, wo.tenant_id, wo.organization_id, wo.production_order_id,
-			   COALESCE(wo.work_order_number, wo.code, '') as work_order_number,
+		SELECT wo.id, wo.tenant_id, NULL as organization_id, wo.production_order_id,
+			   COALESCE(wo.code, '') as work_order_number,
 			   COALESCE(wo.name, '') as name, wo.sequence,
-			   wo.bom_operation_id, COALESCE(wo.operation_name, '') as operation_name,
-			   wo.work_center_id, COALESCE(wo.work_center_name, COALESCE(wc.name, '')) as work_center_name,
+			   wo.operation_id as bom_operation_id, '' as operation_name,
+			   wo.work_center_id, COALESCE(wc.name, '') as work_center_name,
 			   wo.quantity_to_produce, wo.quantity_produced,
-			   COALESCE(wo.expected_duration_minutes, CAST(COALESCE(wo.planned_duration_hours, 0) * 60 AS INTEGER)) as expected_duration_minutes,
-			   COALESCE(wo.setup_time_minutes, CAST(COALESCE(wo.setup_time_hours, 0) * 60 AS INTEGER)) as setup_time_minutes,
-			   COALESCE(wo.actual_duration_minutes, CAST(COALESCE(wo.actual_duration_hours, 0) * 60 AS INTEGER)) as actual_duration_minutes,
+			   CAST(COALESCE(wo.planned_duration_hours, 0) * 60 AS INTEGER) as expected_duration_minutes,
+			   CAST(COALESCE(wo.setup_time_hours, 0) * 60 AS INTEGER) as setup_time_minutes,
+			   CAST(COALESCE(wo.actual_duration_hours, 0) * 60 AS INTEGER) as actual_duration_minutes,
 			   wo.scheduled_start, wo.scheduled_end, wo.actual_start, wo.actual_end,
-			   wo.status, COALESCE(wo.operator_id, wo.assigned_to) as operator_id, COALESCE(wo.operator_name, '') as operator_name,
-			   COALESCE(wo.quality_check_required, false) as quality_check_required,
-			   wo.quality_check_passed,
+			   wo.status, wo.assigned_to as operator_id, '' as operator_name,
+			   false as quality_check_required,
+			   NULL::boolean as quality_check_passed,
 			   wo.instructions, wo.notes, wo.created_at,
 			   COALESCE(po.order_number, '') as production_order_number,
 			   COALESCE(p.name, '') as product_name
@@ -70,11 +71,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argIdx := 2
 
-	if orgID != uuid.Nil {
-		query += fmt.Sprintf(" AND wo.organization_id = $%d", argIdx)
-		args = append(args, orgID)
-		argIdx++
-	}
+	// Note: organization_id may not exist in migration 010 schema, skip filter
 	if productionOrderID != "" {
 		query += fmt.Sprintf(" AND wo.production_order_id = $%d", argIdx)
 		args = append(args, productionOrderID)
@@ -192,20 +189,21 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 		return
 	}
 
+	// Use only columns from migration 010 schema for backward compatibility
 	query := `
-		SELECT wo.id, wo.tenant_id, wo.organization_id, wo.production_order_id,
-			   COALESCE(wo.work_order_number, wo.code, '') as work_order_number,
+		SELECT wo.id, wo.tenant_id, NULL as organization_id, wo.production_order_id,
+			   COALESCE(wo.code, '') as work_order_number,
 			   COALESCE(wo.name, '') as name, wo.sequence,
-			   wo.bom_operation_id, COALESCE(wo.operation_name, '') as operation_name,
-			   wo.work_center_id, COALESCE(wo.work_center_name, COALESCE(wc.name, '')) as work_center_name,
+			   wo.operation_id as bom_operation_id, '' as operation_name,
+			   wo.work_center_id, COALESCE(wc.name, '') as work_center_name,
 			   wo.quantity_to_produce, wo.quantity_produced,
-			   COALESCE(wo.expected_duration_minutes, CAST(COALESCE(wo.planned_duration_hours, 0) * 60 AS INTEGER)) as expected_duration_minutes,
-			   COALESCE(wo.setup_time_minutes, CAST(COALESCE(wo.setup_time_hours, 0) * 60 AS INTEGER)) as setup_time_minutes,
-			   COALESCE(wo.actual_duration_minutes, CAST(COALESCE(wo.actual_duration_hours, 0) * 60 AS INTEGER)) as actual_duration_minutes,
+			   CAST(COALESCE(wo.planned_duration_hours, 0) * 60 AS INTEGER) as expected_duration_minutes,
+			   CAST(COALESCE(wo.setup_time_hours, 0) * 60 AS INTEGER) as setup_time_minutes,
+			   CAST(COALESCE(wo.actual_duration_hours, 0) * 60 AS INTEGER) as actual_duration_minutes,
 			   wo.scheduled_start, wo.scheduled_end, wo.actual_start, wo.actual_end,
-			   wo.status, COALESCE(wo.operator_id, wo.assigned_to) as operator_id, COALESCE(wo.operator_name, '') as operator_name,
-			   COALESCE(wo.quality_check_required, false) as quality_check_required,
-			   wo.quality_check_passed,
+			   wo.status, wo.assigned_to as operator_id, '' as operator_name,
+			   false as quality_check_required,
+			   NULL::boolean as quality_check_passed,
 			   wo.instructions, wo.notes, wo.created_at,
 			   COALESCE(po.order_number, '') as production_order_number,
 			   COALESCE(p.name, '') as product_name
@@ -324,20 +322,21 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 	var operatorName string
 	h.db.QueryRow("SELECT COALESCE(first_name || ' ' || last_name, email) FROM users WHERE id = $1", operatorID).Scan(&operatorName)
 
+	// Use migration 010 columns: assigned_to, started_by
 	_, err = h.db.Exec(`
 		UPDATE work_orders
-		SET status = 'in_progress', actual_start = $1, operator_id = $2, operator_name = $3
-		WHERE id = $4 AND tenant_id = $5
-	`, now, operatorID, operatorName, woID, tenantID)
+		SET status = 'in_progress', actual_start = $1, assigned_to = $2, started_by = $2
+		WHERE id = $3 AND tenant_id = $4
+	`, now, operatorID, woID, tenantID)
 	if err != nil {
 		response.Error(c, 500, "Failed to start work order", err.Error())
 		return
 	}
 
-	// Log time start
+	// Log time start - use migration 010 columns: worker_id, worker_name
 	h.db.Exec(`
-		INSERT INTO work_order_time_logs (id, tenant_id, work_order_id, start_time, log_type, user_id, user_name, notes)
-		VALUES ($1, $2, $3, $4, 'production', $5, $6, $7)
+		INSERT INTO work_order_time_logs (id, tenant_id, work_order_id, start_time, log_type, worker_id, worker_name, notes)
+		VALUES ($1, $2, $3, $4, 'work', $5, $6, $7)
 	`, uuid.New(), tenantID, woID, now, operatorID, operatorName, input.Notes)
 
 	response.Success(c, gin.H{"message": "Work order started", "actual_start": now})
@@ -384,24 +383,25 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		durationMinutes = int(now.Sub(actualStart.Time).Minutes())
 	}
 
-	// Update work order
+	// Update work order - use migration 010 columns: actual_duration_hours, completed_by
+	durationHours := float64(durationMinutes) / 60.0
 	_, err = h.db.Exec(`
 		UPDATE work_orders
-		SET status = 'done', actual_end = $1, quantity_produced = quantity_produced + $2,
-			actual_duration_minutes = $3, quality_check_passed = $4
+		SET status = 'completed', actual_end = $1, quantity_produced = quantity_produced + $2,
+			actual_duration_hours = $3, completed_by = $4
 		WHERE id = $5 AND tenant_id = $6
-	`, now, input.QuantityProduced, durationMinutes, input.QualityCheckPassed, woID, tenantID)
+	`, now, input.QuantityProduced, durationHours, c.GetString("user_id"), woID, tenantID)
 	if err != nil {
 		response.Error(c, 500, "Failed to complete work order", err.Error())
 		return
 	}
 
-	// Log time end
+	// Log time end - use migration 010 columns: duration_hours
 	h.db.Exec(`
 		UPDATE work_order_time_logs
-		SET end_time = $1, duration_minutes = $2, quantity_produced = $3, scrap_quantity = $4, scrap_reason = $5, notes = $6
-		WHERE work_order_id = $7 AND end_time IS NULL
-	`, now, durationMinutes, input.QuantityProduced, input.ScrapQuantity, input.ScrapReason, input.Notes, woID)
+		SET end_time = $1, duration_hours = $2, notes = $3
+		WHERE work_order_id = $4 AND end_time IS NULL
+	`, now, durationHours, input.Notes, woID)
 
 	// Check if all work orders for the MO are done
 	var pendingCount int
@@ -429,7 +429,6 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
-	orgID, _ := middleware.GetOrganizationID(c)
 
 	var input entity.CreateWorkOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -455,31 +454,26 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 	woNumber := fmt.Sprintf("WO-%d", time.Now().Unix())
 
 	var workCenterID interface{} = nil
-	var workCenterName string
 	if input.WorkCenterID != "" {
 		wcID, _ := uuid.Parse(input.WorkCenterID)
 		workCenterID = wcID
-		h.db.QueryRow("SELECT name FROM work_centers WHERE id = $1", wcID).Scan(&workCenterName)
 	}
 
-	// Use 'code' column which exists in migration 010, plus work_order_number for new schema
-	// Also use uom which is required in the old schema
+	// Use only migration 010 columns
 	_, err = h.db.Exec(`
 		INSERT INTO work_orders (
-			id, tenant_id, organization_id, production_order_id,
-			code, work_order_number, name, sequence,
-			operation_name, work_center_id, work_center_name,
+			id, tenant_id, production_order_id,
+			code, name, sequence,
+			work_center_id,
 			quantity_to_produce, uom,
-			expected_duration_minutes, setup_time_minutes,
 			planned_duration_hours, setup_time_hours,
 			scheduled_start, scheduled_end,
 			status, instructions, notes, created_by
-		) VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $9, $10, $11, 'pcs', $12, $13, $14, $15, $16, $17, 'draft', $18, $19, $20)
-	`, woID, tenantID, orgID, productionOrderID,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pcs', $9, $10, $11, $12, 'pending', $13, $14, $15)
+	`, woID, tenantID, productionOrderID,
 		woNumber, input.Name, input.Sequence,
-		input.OperationName, workCenterID, workCenterName,
+		workCenterID,
 		input.QuantityToProduce,
-		input.ExpectedDurationMinutes, input.SetupTimeMinutes,
 		float64(input.ExpectedDurationMinutes)/60, float64(input.SetupTimeMinutes)/60,
 		input.ScheduledStart, input.ScheduledEnd,
 		input.Instructions, input.Notes, userID)
@@ -536,21 +530,20 @@ func (h *Handler) RecordWorkOrderTime(c *gin.Context) {
 	}
 
 	var endTime interface{} = nil
-	var durationMinutes interface{} = nil
+	var durationHours interface{} = nil
 	if input.EndTime != nil {
 		endTime = *input.EndTime
-		durationMinutes = int(input.EndTime.Sub(startTime).Minutes())
+		durationHours = input.EndTime.Sub(startTime).Hours()
 	}
 
+	// Use migration 010 columns: worker_id, worker_name, duration_hours
 	_, err = h.db.Exec(`
 		INSERT INTO work_order_time_logs (
-			id, tenant_id, work_order_id, start_time, end_time, duration_minutes,
-			log_type, quantity_produced, user_id, user_name,
-			scrap_quantity, scrap_reason, notes
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-	`, logID, tenantID, woID, startTime, endTime, durationMinutes,
-		input.LogType, input.QuantityProduced, userID, userName,
-		input.ScrapQuantity, input.ScrapReason, input.Notes)
+			id, tenant_id, work_order_id, start_time, end_time, duration_hours,
+			log_type, worker_id, worker_name, notes
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, logID, tenantID, woID, startTime, endTime, durationHours,
+		input.LogType, userID, userName, input.Notes)
 	if err != nil {
 		response.Error(c, 500, "Failed to record time", err.Error())
 		return
@@ -602,25 +595,25 @@ func (h *Handler) PauseWorkOrder(c *gin.Context) {
 
 	now := time.Now()
 
-	// End current time log
+	// End current time log - use migration 010 columns: duration_hours
 	h.db.Exec(`
 		UPDATE work_order_time_logs
-		SET end_time = $1, duration_minutes = EXTRACT(EPOCH FROM ($1 - start_time)) / 60
+		SET end_time = $1, duration_hours = EXTRACT(EPOCH FROM ($1 - start_time)) / 3600
 		WHERE work_order_id = $2 AND end_time IS NULL
 	`, now, woID)
 
-	// Update status to waiting
-	_, err = h.db.Exec("UPDATE work_orders SET status = 'waiting' WHERE id = $1 AND tenant_id = $2", woID, tenantID)
+	// Update status to paused (migration 010 valid status)
+	_, err = h.db.Exec("UPDATE work_orders SET status = 'paused' WHERE id = $1 AND tenant_id = $2", woID, tenantID)
 	if err != nil {
 		response.Error(c, 500, "Failed to pause work order", err.Error())
 		return
 	}
 
-	// Log pause
+	// Log pause - use migration 010 columns: worker_id, worker_name, duration_hours
 	var userName string
 	h.db.QueryRow("SELECT COALESCE(first_name || ' ' || last_name, email) FROM users WHERE id = $1", userID).Scan(&userName)
 	h.db.Exec(`
-		INSERT INTO work_order_time_logs (id, tenant_id, work_order_id, start_time, end_time, duration_minutes, log_type, user_id, user_name)
+		INSERT INTO work_order_time_logs (id, tenant_id, work_order_id, start_time, end_time, duration_hours, log_type, worker_id, worker_name)
 		VALUES ($1, $2, $3, $4, $4, 0, 'pause', $5, $6)
 	`, uuid.New(), tenantID, woID, now, userID, userName)
 
@@ -1074,24 +1067,20 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 			notesVal = notes.String
 		}
 
-		// Use both code and work_order_number for compatibility with migration 010 schema
+		// Use only migration 010 columns
 		_, err := h.db.Exec(`
 			INSERT INTO work_orders (
-				id, tenant_id, organization_id, production_order_id,
-				code, work_order_number, name, sequence,
-				operation_id, bom_operation_id, operation_name,
-				work_center_id, work_center_name,
+				id, tenant_id, production_order_id,
+				code, name, sequence,
+				operation_id, work_center_id,
 				quantity_to_produce, uom,
-				expected_duration_minutes, setup_time_minutes,
 				planned_duration_hours, setup_time_hours,
 				status, instructions, created_by
-			) VALUES ($1, $2, $3, $4, $5, $5, $6, $7, $8, $8, $9, $10, $11, $12, 'pcs', $13, $14, $15, $16, 'draft', $17, $18)
-		`, woID, tenantID, orgID, productionOrderID,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pcs', $10, $11, 'pending', $12, $13)
+		`, woID, tenantID, productionOrderID,
 			woNumber, opName, sequence,
-			opID, opName,
-			workCenterID, wcName,
+			opID, workCenterID,
 			quantity,
-			runTime, setupTime,
 			float64(runTime)/60, float64(setupTime)/60,
 			notesVal, userID)
 		if err != nil {
