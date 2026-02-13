@@ -1485,21 +1485,16 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	}
 
 	// ============================================
-	// CREATE JOURNAL ENTRY: Debit Finished Goods, Credit Raw Materials
+	// CREATE JOURNAL ENTRY: Debit Stock Valuation (per category), Credit Manufacturing Expense
 	// ============================================
 	totalCost := producedQty * unitCost
 	if totalCost > 0 {
-		// Find accounts
-		inventoryAccountID := findAccount(h.db, tenantID, organizationID, "inventory", "1300")
-		if inventoryAccountID == uuid.Nil {
-			inventoryAccountID = findAccount(h.db, tenantID, organizationID, "finished goods", "1300")
-		}
-		if inventoryAccountID == uuid.Nil {
-			inventoryAccountID = findAccount(h.db, tenantID, organizationID, "stock", "1300")
-		}
+		// Use category accounts for the finished product
+		ca := getCategoryAccounts(h.db, tenantID, organizationID, productID)
+		inventoryAccountID := ca.StockValuationAccountID
 
 		// Credit side: manufacturing expense / COGS
-		cogsAccountID := findAccount(h.db, tenantID, organizationID, "cost of goods", "5000")
+		cogsAccountID := ca.ExpenseAccountID
 		if cogsAccountID == uuid.Nil {
 			cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
 		}

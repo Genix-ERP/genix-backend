@@ -337,6 +337,73 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 	response.Created(c, acc.ToResponse())
 }
 
+// GetNextAccountCode returns the next available account code for a given account type
+func (h *Handler) GetNextAccountCode(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
+	accountTypeID := c.Query("account_type_id")
+	if accountTypeID == "" {
+		response.BadRequest(c, "account_type_id is required")
+		return
+	}
+
+	// Get category from account_type
+	var category string
+	err := h.db.QueryRow("SELECT category FROM account_types WHERE id = $1", accountTypeID).Scan(&category)
+	if err != nil {
+		response.BadRequest(c, "Invalid account type")
+		return
+	}
+
+	// Map category to code range
+	var rangeStart, rangeEnd int
+	switch category {
+	case "asset":
+		rangeStart, rangeEnd = 1000, 1999
+	case "liability":
+		rangeStart, rangeEnd = 2000, 2999
+	case "equity":
+		rangeStart, rangeEnd = 3000, 3999
+	case "revenue":
+		rangeStart, rangeEnd = 4000, 4999
+	case "expense":
+		rangeStart, rangeEnd = 5000, 6999
+	default:
+		rangeStart, rangeEnd = 1000, 9999
+	}
+
+	// Find max numeric code in range
+	var maxCode sql.NullInt64
+	h.db.QueryRow(`
+		SELECT MAX(CAST(code AS INTEGER))
+		FROM accounts
+		WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2
+			AND code ~ '^\d+$'
+			AND CAST(code AS INTEGER) BETWEEN $3 AND $4
+			AND deleted_at IS NULL
+	`, tenantID, orgIDPtr, rangeStart, rangeEnd).Scan(&maxCode)
+
+	nextCode := rangeStart
+	if maxCode.Valid {
+		nextCode = int(maxCode.Int64) + 10 // Odoo-style: increment by 10
+		if nextCode > rangeEnd {
+			nextCode = int(maxCode.Int64) + 1
+		}
+	}
+
+	response.Success(c, gin.H{"code": fmt.Sprintf("%d", nextCode)})
+}
+
 // GetAccount returns a single account by ID
 func (h *Handler) GetAccount(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
