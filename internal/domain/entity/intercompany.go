@@ -452,3 +452,192 @@ type IntercompanyBalanceSummary struct {
 	Payable                 float64   `json:"payable"`
 	NetBalance              float64   `json:"net_balance"` // Positive = they owe us
 }
+
+// =====================================================
+// INTER-COMPANY RULES (Odoo-like configuration)
+// =====================================================
+
+type IntercompanyRuleType string
+
+const (
+	ICRuleSaleToPurchase  IntercompanyRuleType = "sale_to_purchase"
+	ICRulePurchaseToSale  IntercompanyRuleType = "purchase_to_sale"
+	ICRuleInvoiceToBill   IntercompanyRuleType = "invoice_to_bill"
+	ICRuleBillToInvoice   IntercompanyRuleType = "bill_to_invoice"
+	ICRuleTransfer        IntercompanyRuleType = "transfer"
+)
+
+type IntercompanyPricingMethodType string
+
+const (
+	ICPricingSourcePrice  IntercompanyPricingMethodType = "source_price"
+	ICPricingPricelist    IntercompanyPricingMethodType = "pricelist"
+	ICPricingCostPlusMarkup IntercompanyPricingMethodType = "cost_plus_markup"
+)
+
+// IntercompanyRule defines automatic document sync rules between companies
+type IntercompanyRule struct {
+	ID                     uuid.UUID                     `json:"id" db:"id"`
+	TenantID               uuid.UUID                     `json:"tenant_id" db:"tenant_id"`
+	SourceOrganizationID   uuid.UUID                     `json:"source_organization_id" db:"source_organization_id"`
+	TargetOrganizationID   uuid.UUID                     `json:"target_organization_id" db:"target_organization_id"`
+	RuleType               IntercompanyRuleType          `json:"rule_type" db:"rule_type"`
+	IsActive               bool                          `json:"is_active" db:"is_active"`
+	AutoValidate           bool                          `json:"auto_validate" db:"auto_validate"`
+	SyncPrices             bool                          `json:"sync_prices" db:"sync_prices"`
+	DefaultWarehouseID     *uuid.UUID                    `json:"default_warehouse_id,omitempty" db:"default_warehouse_id"`
+	PricingMethod          IntercompanyPricingMethodType `json:"pricing_method" db:"pricing_method"`
+	MarkupPercent          float64                       `json:"markup_percent" db:"markup_percent"`
+	PricelistID            *uuid.UUID                    `json:"pricelist_id,omitempty" db:"pricelist_id"`
+	Notes                  *string                       `json:"notes,omitempty" db:"notes"`
+	CreatedBy              *uuid.UUID                    `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt              time.Time                     `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time                     `json:"updated_at" db:"updated_at"`
+
+	// Relationships (for display)
+	SourceOrganizationName string `json:"source_organization_name,omitempty"`
+	TargetOrganizationName string `json:"target_organization_name,omitempty"`
+	DefaultWarehouseName   string `json:"default_warehouse_name,omitempty"`
+}
+
+type IntercompanyTransactionLogStatus string
+
+const (
+	ICLogStatusPending   IntercompanyTransactionLogStatus = "pending"
+	ICLogStatusCreated   IntercompanyTransactionLogStatus = "created"
+	ICLogStatusValidated IntercompanyTransactionLogStatus = "validated"
+	ICLogStatusFailed    IntercompanyTransactionLogStatus = "failed"
+	ICLogStatusCancelled IntercompanyTransactionLogStatus = "cancelled"
+)
+
+// IntercompanyTransactionLog tracks automatic IC transactions
+type IntercompanyTransactionLog struct {
+	ID                     uuid.UUID                        `json:"id" db:"id"`
+	TenantID               uuid.UUID                        `json:"tenant_id" db:"tenant_id"`
+	RuleID                 *uuid.UUID                       `json:"rule_id,omitempty" db:"rule_id"`
+	SourceOrganizationID   uuid.UUID                        `json:"source_organization_id" db:"source_organization_id"`
+	SourceDocumentType     string                           `json:"source_document_type" db:"source_document_type"`
+	SourceDocumentID       uuid.UUID                        `json:"source_document_id" db:"source_document_id"`
+	SourceDocumentNumber   *string                          `json:"source_document_number,omitempty" db:"source_document_number"`
+	TargetOrganizationID   uuid.UUID                        `json:"target_organization_id" db:"target_organization_id"`
+	TargetDocumentType     string                           `json:"target_document_type" db:"target_document_type"`
+	TargetDocumentID       *uuid.UUID                       `json:"target_document_id,omitempty" db:"target_document_id"`
+	TargetDocumentNumber   *string                          `json:"target_document_number,omitempty" db:"target_document_number"`
+	Status                 IntercompanyTransactionLogStatus `json:"status" db:"status"`
+	ErrorMessage           *string                          `json:"error_message,omitempty" db:"error_message"`
+	SourceAmount           *float64                         `json:"source_amount,omitempty" db:"source_amount"`
+	TargetAmount           *float64                         `json:"target_amount,omitempty" db:"target_amount"`
+	CurrencyID             *uuid.UUID                       `json:"currency_id,omitempty" db:"currency_id"`
+	ProcessedAt            *time.Time                       `json:"processed_at,omitempty" db:"processed_at"`
+	CreatedAt              time.Time                        `json:"created_at" db:"created_at"`
+
+	// Relationships (for display)
+	SourceOrganizationName string `json:"source_organization_name,omitempty"`
+	TargetOrganizationName string `json:"target_organization_name,omitempty"`
+}
+
+// IntercompanyDocumentLink tracks linked documents between companies
+type IntercompanyDocumentLink struct {
+	ID                     uuid.UUID `json:"id" db:"id"`
+	TenantID               uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	SourceOrganizationID   uuid.UUID `json:"source_organization_id" db:"source_organization_id"`
+	SourceDocumentType     string    `json:"source_document_type" db:"source_document_type"`
+	SourceDocumentID       uuid.UUID `json:"source_document_id" db:"source_document_id"`
+	LinkedOrganizationID   uuid.UUID `json:"linked_organization_id" db:"linked_organization_id"`
+	LinkedDocumentType     string    `json:"linked_document_type" db:"linked_document_type"`
+	LinkedDocumentID       uuid.UUID `json:"linked_document_id" db:"linked_document_id"`
+	LinkType               string    `json:"link_type" db:"link_type"` // auto_created, manual, settlement
+	CreatedAt              time.Time `json:"created_at" db:"created_at"`
+}
+
+// =====================================================
+// INTER-COMPANY RULES INPUT/OUTPUT TYPES
+// =====================================================
+
+// CreateIntercompanyRuleInput for creating IC rules
+type CreateIntercompanyRuleInput struct {
+	SourceOrganizationID string  `json:"source_organization_id" binding:"required"`
+	TargetOrganizationID string  `json:"target_organization_id" binding:"required"`
+	RuleType             string  `json:"rule_type" binding:"required"`
+	IsActive             bool    `json:"is_active"`
+	AutoValidate         bool    `json:"auto_validate"`
+	SyncPrices           bool    `json:"sync_prices"`
+	DefaultWarehouseID   string  `json:"default_warehouse_id,omitempty"`
+	PricingMethod        string  `json:"pricing_method,omitempty"`
+	MarkupPercent        float64 `json:"markup_percent,omitempty"`
+	PricelistID          string  `json:"pricelist_id,omitempty"`
+	Notes                string  `json:"notes,omitempty"`
+}
+
+// UpdateIntercompanyRuleInput for updating IC rules
+type UpdateIntercompanyRuleInput struct {
+	IsActive           *bool    `json:"is_active,omitempty"`
+	AutoValidate       *bool    `json:"auto_validate,omitempty"`
+	SyncPrices         *bool    `json:"sync_prices,omitempty"`
+	DefaultWarehouseID *string  `json:"default_warehouse_id,omitempty"`
+	PricingMethod      *string  `json:"pricing_method,omitempty"`
+	MarkupPercent      *float64 `json:"markup_percent,omitempty"`
+	PricelistID        *string  `json:"pricelist_id,omitempty"`
+	Notes              *string  `json:"notes,omitempty"`
+}
+
+// IntercompanyRuleListFilter for filtering rules
+type IntercompanyRuleListFilter struct {
+	SourceOrganizationID string `form:"source_organization_id"`
+	TargetOrganizationID string `form:"target_organization_id"`
+	RuleType             string `form:"rule_type"`
+	IsActive             string `form:"is_active"`
+}
+
+// IntercompanyTransactionLogFilter for filtering logs
+type IntercompanyTransactionLogFilter struct {
+	SourceOrganizationID string `form:"source_organization_id"`
+	TargetOrganizationID string `form:"target_organization_id"`
+	SourceDocumentType   string `form:"source_document_type"`
+	Status               string `form:"status"`
+	DateFrom             string `form:"date_from"`
+	DateTo               string `form:"date_to"`
+}
+
+// IntercompanyRuleResponse for API responses
+type IntercompanyRuleResponse struct {
+	ID                     uuid.UUID `json:"id"`
+	SourceOrganizationID   uuid.UUID `json:"source_organization_id"`
+	SourceOrganizationName string    `json:"source_organization_name"`
+	TargetOrganizationID   uuid.UUID `json:"target_organization_id"`
+	TargetOrganizationName string    `json:"target_organization_name"`
+	RuleType               string    `json:"rule_type"`
+	RuleTypeLabel          string    `json:"rule_type_label"`
+	IsActive               bool      `json:"is_active"`
+	AutoValidate           bool      `json:"auto_validate"`
+	SyncPrices             bool      `json:"sync_prices"`
+	DefaultWarehouseID     *uuid.UUID `json:"default_warehouse_id,omitempty"`
+	DefaultWarehouseName   string    `json:"default_warehouse_name,omitempty"`
+	PricingMethod          string    `json:"pricing_method"`
+	MarkupPercent          float64   `json:"markup_percent"`
+	Notes                  *string   `json:"notes,omitempty"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
+}
+
+// IntercompanyTransactionLogResponse for API responses
+type IntercompanyTransactionLogResponse struct {
+	ID                     uuid.UUID  `json:"id"`
+	RuleID                 *uuid.UUID `json:"rule_id,omitempty"`
+	SourceOrganizationID   uuid.UUID  `json:"source_organization_id"`
+	SourceOrganizationName string     `json:"source_organization_name"`
+	SourceDocumentType     string     `json:"source_document_type"`
+	SourceDocumentID       uuid.UUID  `json:"source_document_id"`
+	SourceDocumentNumber   *string    `json:"source_document_number,omitempty"`
+	TargetOrganizationID   uuid.UUID  `json:"target_organization_id"`
+	TargetOrganizationName string     `json:"target_organization_name"`
+	TargetDocumentType     string     `json:"target_document_type"`
+	TargetDocumentID       *uuid.UUID `json:"target_document_id,omitempty"`
+	TargetDocumentNumber   *string    `json:"target_document_number,omitempty"`
+	Status                 string     `json:"status"`
+	ErrorMessage           *string    `json:"error_message,omitempty"`
+	SourceAmount           *float64   `json:"source_amount,omitempty"`
+	TargetAmount           *float64   `json:"target_amount,omitempty"`
+	ProcessedAt            *time.Time `json:"processed_at,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+}

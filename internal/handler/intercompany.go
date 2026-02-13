@@ -1556,3 +1556,535 @@ func nilIfEmpty(s string) interface{} {
 	}
 	return s
 }
+
+// =====================================================
+// INTER-COMPANY RULES HANDLERS (Odoo-like)
+// =====================================================
+
+// ListIntercompanyRules returns all IC rules for the tenant
+func (h *Handler) ListIntercompanyRules(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Parse filters
+	sourceOrgID := c.Query("source_organization_id")
+	targetOrgID := c.Query("target_organization_id")
+	ruleType := c.Query("rule_type")
+	isActive := c.Query("is_active")
+
+	query := `
+		SELECT r.id, r.tenant_id, r.source_organization_id, r.target_organization_id,
+			   r.rule_type, r.is_active, r.auto_validate, r.sync_prices,
+			   r.default_warehouse_id, r.pricing_method, r.markup_percent,
+			   r.pricelist_id, r.notes, r.created_at, r.updated_at,
+			   COALESCE(so.name, '') as source_org_name,
+			   COALESCE(to_org.name, '') as target_org_name,
+			   COALESCE(w.name, '') as warehouse_name
+		FROM intercompany_rules r
+		LEFT JOIN organizations so ON r.source_organization_id = so.id
+		LEFT JOIN organizations to_org ON r.target_organization_id = to_org.id
+		LEFT JOIN warehouses w ON r.default_warehouse_id = w.id
+		WHERE r.tenant_id = $1
+	`
+
+	args := []interface{}{tenantID}
+	argIdx := 2
+
+	if sourceOrgID != "" {
+		query += fmt.Sprintf(" AND r.source_organization_id = $%d", argIdx)
+		args = append(args, sourceOrgID)
+		argIdx++
+	}
+	if targetOrgID != "" {
+		query += fmt.Sprintf(" AND r.target_organization_id = $%d", argIdx)
+		args = append(args, targetOrgID)
+		argIdx++
+	}
+	if ruleType != "" {
+		query += fmt.Sprintf(" AND r.rule_type = $%d", argIdx)
+		args = append(args, ruleType)
+		argIdx++
+	}
+	if isActive != "" {
+		query += fmt.Sprintf(" AND r.is_active = $%d", argIdx)
+		args = append(args, isActive == "true")
+		argIdx++
+	}
+
+	query += " ORDER BY r.created_at DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		response.Error(c, 500, "Failed to list rules", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var rules []entity.IntercompanyRuleResponse
+	for rows.Next() {
+		var r entity.IntercompanyRuleResponse
+		var defaultWarehouseID sql.NullString
+		var pricelistID sql.NullString
+		var notes sql.NullString
+
+		err := rows.Scan(
+			&r.ID, &tenantID, &r.SourceOrganizationID, &r.TargetOrganizationID,
+			&r.RuleType, &r.IsActive, &r.AutoValidate, &r.SyncPrices,
+			&defaultWarehouseID, &r.PricingMethod, &r.MarkupPercent,
+			&pricelistID, &notes, &r.CreatedAt, &r.UpdatedAt,
+			&r.SourceOrganizationName, &r.TargetOrganizationName, &r.DefaultWarehouseName,
+		)
+		if err != nil {
+			continue
+		}
+
+		if defaultWarehouseID.Valid {
+			id, _ := uuid.Parse(defaultWarehouseID.String)
+			r.DefaultWarehouseID = &id
+		}
+		if notes.Valid {
+			r.Notes = &notes.String
+		}
+
+		// Set human-readable rule type label
+		r.RuleTypeLabel = getRuleTypeLabel(r.RuleType)
+
+		rules = append(rules, r)
+	}
+
+	response.Success(c, gin.H{"data": rules, "total": len(rules)})
+}
+
+// CreateIntercompanyRule creates a new IC rule
+func (h *Handler) CreateIntercompanyRule(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.CreateIntercompanyRuleInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input", err.Error())
+		return
+	}
+
+	// Validate organizations exist and are different
+	sourceOrgID, err := uuid.Parse(input.SourceOrganizationID)
+	if err != nil {
+		response.BadRequest(c, "Invalid source organization ID", "")
+		return
+	}
+	targetOrgID, err := uuid.Parse(input.TargetOrganizationID)
+	if err != nil {
+		response.BadRequest(c, "Invalid target organization ID", "")
+		return
+	}
+	if sourceOrgID == targetOrgID {
+		response.BadRequest(c, "Source and target organizations must be different", "")
+		return
+	}
+
+	// Check if rule already exists
+	var existingID string
+	checkQuery := `SELECT id FROM intercompany_rules WHERE tenant_id = $1 AND source_organization_id = $2 AND target_organization_id = $3 AND rule_type = $4`
+	h.db.QueryRow(checkQuery, tenantID, sourceOrgID, targetOrgID, input.RuleType).Scan(&existingID)
+	if existingID != "" {
+		response.BadRequest(c, "Rule already exists for this source-target-type combination", "")
+		return
+	}
+
+	// Set defaults
+	pricingMethod := input.PricingMethod
+	if pricingMethod == "" {
+		pricingMethod = "source_price"
+	}
+
+	id := uuid.New()
+	insertQuery := `
+		INSERT INTO intercompany_rules (
+			id, tenant_id, source_organization_id, target_organization_id,
+			rule_type, is_active, auto_validate, sync_prices,
+			default_warehouse_id, pricing_method, markup_percent,
+			pricelist_id, notes, created_by
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		RETURNING id, created_at, updated_at
+	`
+
+	var defaultWarehouseID, pricelistID interface{}
+	if input.DefaultWarehouseID != "" {
+		defaultWarehouseID, _ = uuid.Parse(input.DefaultWarehouseID)
+	}
+	if input.PricelistID != "" {
+		pricelistID, _ = uuid.Parse(input.PricelistID)
+	}
+
+	var createdAt, updatedAt time.Time
+	err = h.db.QueryRow(insertQuery,
+		id, tenantID, sourceOrgID, targetOrgID,
+		input.RuleType, input.IsActive, input.AutoValidate, input.SyncPrices,
+		defaultWarehouseID, pricingMethod, input.MarkupPercent,
+		pricelistID, nilIfEmpty(input.Notes), userID,
+	).Scan(&id, &createdAt, &updatedAt)
+
+	if err != nil {
+		response.Error(c, 500, "Failed to create rule", err.Error())
+		return
+	}
+
+	response.Created(c, gin.H{
+		"id":         id,
+		"created_at": createdAt,
+		"message":    "Inter-company rule created successfully",
+	})
+}
+
+// GetIntercompanyRule returns a single IC rule
+func (h *Handler) GetIntercompanyRule(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	ruleID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid rule ID", "")
+		return
+	}
+
+	query := `
+		SELECT r.id, r.tenant_id, r.source_organization_id, r.target_organization_id,
+			   r.rule_type, r.is_active, r.auto_validate, r.sync_prices,
+			   r.default_warehouse_id, r.pricing_method, r.markup_percent,
+			   r.pricelist_id, r.notes, r.created_at, r.updated_at,
+			   COALESCE(so.name, '') as source_org_name,
+			   COALESCE(to_org.name, '') as target_org_name,
+			   COALESCE(w.name, '') as warehouse_name
+		FROM intercompany_rules r
+		LEFT JOIN organizations so ON r.source_organization_id = so.id
+		LEFT JOIN organizations to_org ON r.target_organization_id = to_org.id
+		LEFT JOIN warehouses w ON r.default_warehouse_id = w.id
+		WHERE r.id = $1 AND r.tenant_id = $2
+	`
+
+	var r entity.IntercompanyRuleResponse
+	var defaultWarehouseID sql.NullString
+	var notes sql.NullString
+
+	err = h.db.QueryRow(query, ruleID, tenantID).Scan(
+		&r.ID, &tenantID, &r.SourceOrganizationID, &r.TargetOrganizationID,
+		&r.RuleType, &r.IsActive, &r.AutoValidate, &r.SyncPrices,
+		&defaultWarehouseID, &r.PricingMethod, &r.MarkupPercent,
+		&defaultWarehouseID, &notes, &r.CreatedAt, &r.UpdatedAt,
+		&r.SourceOrganizationName, &r.TargetOrganizationName, &r.DefaultWarehouseName,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Rule not found")
+		return
+	}
+	if err != nil {
+		response.Error(c, 500, "Failed to get rule", err.Error())
+		return
+	}
+
+	if defaultWarehouseID.Valid {
+		id, _ := uuid.Parse(defaultWarehouseID.String)
+		r.DefaultWarehouseID = &id
+	}
+	if notes.Valid {
+		r.Notes = &notes.String
+	}
+	r.RuleTypeLabel = getRuleTypeLabel(r.RuleType)
+
+	response.Success(c, gin.H{"data": r})
+}
+
+// UpdateIntercompanyRule updates an IC rule
+func (h *Handler) UpdateIntercompanyRule(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	ruleID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid rule ID", "")
+		return
+	}
+
+	var input entity.UpdateIntercompanyRuleInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input", err.Error())
+		return
+	}
+
+	// Build dynamic update query
+	updates := []string{}
+	args := []interface{}{}
+	argIdx := 1
+
+	if input.IsActive != nil {
+		updates = append(updates, fmt.Sprintf("is_active = $%d", argIdx))
+		args = append(args, *input.IsActive)
+		argIdx++
+	}
+	if input.AutoValidate != nil {
+		updates = append(updates, fmt.Sprintf("auto_validate = $%d", argIdx))
+		args = append(args, *input.AutoValidate)
+		argIdx++
+	}
+	if input.SyncPrices != nil {
+		updates = append(updates, fmt.Sprintf("sync_prices = $%d", argIdx))
+		args = append(args, *input.SyncPrices)
+		argIdx++
+	}
+	if input.DefaultWarehouseID != nil {
+		updates = append(updates, fmt.Sprintf("default_warehouse_id = $%d", argIdx))
+		if *input.DefaultWarehouseID == "" {
+			args = append(args, nil)
+		} else {
+			whID, _ := uuid.Parse(*input.DefaultWarehouseID)
+			args = append(args, whID)
+		}
+		argIdx++
+	}
+	if input.PricingMethod != nil {
+		updates = append(updates, fmt.Sprintf("pricing_method = $%d", argIdx))
+		args = append(args, *input.PricingMethod)
+		argIdx++
+	}
+	if input.MarkupPercent != nil {
+		updates = append(updates, fmt.Sprintf("markup_percent = $%d", argIdx))
+		args = append(args, *input.MarkupPercent)
+		argIdx++
+	}
+	if input.Notes != nil {
+		updates = append(updates, fmt.Sprintf("notes = $%d", argIdx))
+		args = append(args, nilIfEmpty(*input.Notes))
+		argIdx++
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update", "")
+		return
+	}
+
+	query := fmt.Sprintf("UPDATE intercompany_rules SET %s WHERE id = $%d AND tenant_id = $%d",
+		joinWithComma(updates), argIdx, argIdx+1)
+	args = append(args, ruleID, tenantID)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		response.Error(c, 500, "Failed to update rule", err.Error())
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Rule not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Rule updated successfully"})
+}
+
+// DeleteIntercompanyRule deletes an IC rule
+func (h *Handler) DeleteIntercompanyRule(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	ruleID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid rule ID", "")
+		return
+	}
+
+	result, err := h.db.Exec("DELETE FROM intercompany_rules WHERE id = $1 AND tenant_id = $2", ruleID, tenantID)
+	if err != nil {
+		response.Error(c, 500, "Failed to delete rule", err.Error())
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Rule not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Rule deleted successfully"})
+}
+
+// ListIntercompanyTransactionLogs returns IC transaction logs
+func (h *Handler) ListIntercompanyTransactionLogs(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Parse pagination
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	offset := (page - 1) * limit
+
+	// Parse filters
+	sourceOrgID := c.Query("source_organization_id")
+	targetOrgID := c.Query("target_organization_id")
+	status := c.Query("status")
+	docType := c.Query("source_document_type")
+
+	query := `
+		SELECT l.id, l.rule_id, l.source_organization_id, l.target_organization_id,
+			   l.source_document_type, l.source_document_id, l.source_document_number,
+			   l.target_document_type, l.target_document_id, l.target_document_number,
+			   l.status, l.error_message, l.source_amount, l.target_amount,
+			   l.processed_at, l.created_at,
+			   COALESCE(so.name, '') as source_org_name,
+			   COALESCE(to_org.name, '') as target_org_name
+		FROM intercompany_transaction_logs l
+		LEFT JOIN organizations so ON l.source_organization_id = so.id
+		LEFT JOIN organizations to_org ON l.target_organization_id = to_org.id
+		WHERE l.tenant_id = $1
+	`
+
+	args := []interface{}{tenantID}
+	argIdx := 2
+
+	if sourceOrgID != "" {
+		query += fmt.Sprintf(" AND l.source_organization_id = $%d", argIdx)
+		args = append(args, sourceOrgID)
+		argIdx++
+	}
+	if targetOrgID != "" {
+		query += fmt.Sprintf(" AND l.target_organization_id = $%d", argIdx)
+		args = append(args, targetOrgID)
+		argIdx++
+	}
+	if status != "" {
+		query += fmt.Sprintf(" AND l.status = $%d", argIdx)
+		args = append(args, status)
+		argIdx++
+	}
+	if docType != "" {
+		query += fmt.Sprintf(" AND l.source_document_type = $%d", argIdx)
+		args = append(args, docType)
+		argIdx++
+	}
+
+	query += fmt.Sprintf(" ORDER BY l.created_at DESC LIMIT $%d OFFSET $%d", argIdx, argIdx+1)
+	args = append(args, limit, offset)
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		response.Error(c, 500, "Failed to list logs", err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var logs []entity.IntercompanyTransactionLogResponse
+	for rows.Next() {
+		var l entity.IntercompanyTransactionLogResponse
+		var ruleID, targetDocID sql.NullString
+		var sourceDocNum, targetDocNum, errorMsg sql.NullString
+		var sourceAmount, targetAmount sql.NullFloat64
+		var processedAt sql.NullTime
+
+		err := rows.Scan(
+			&l.ID, &ruleID, &l.SourceOrganizationID, &l.TargetOrganizationID,
+			&l.SourceDocumentType, &l.SourceDocumentID, &sourceDocNum,
+			&l.TargetDocumentType, &targetDocID, &targetDocNum,
+			&l.Status, &errorMsg, &sourceAmount, &targetAmount,
+			&processedAt, &l.CreatedAt,
+			&l.SourceOrganizationName, &l.TargetOrganizationName,
+		)
+		if err != nil {
+			continue
+		}
+
+		if ruleID.Valid {
+			id, _ := uuid.Parse(ruleID.String)
+			l.RuleID = &id
+		}
+		if targetDocID.Valid {
+			id, _ := uuid.Parse(targetDocID.String)
+			l.TargetDocumentID = &id
+		}
+		if sourceDocNum.Valid {
+			l.SourceDocumentNumber = &sourceDocNum.String
+		}
+		if targetDocNum.Valid {
+			l.TargetDocumentNumber = &targetDocNum.String
+		}
+		if errorMsg.Valid {
+			l.ErrorMessage = &errorMsg.String
+		}
+		if sourceAmount.Valid {
+			l.SourceAmount = &sourceAmount.Float64
+		}
+		if targetAmount.Valid {
+			l.TargetAmount = &targetAmount.Float64
+		}
+		if processedAt.Valid {
+			l.ProcessedAt = &processedAt.Time
+		}
+
+		logs = append(logs, l)
+	}
+
+	// Get total count
+	var total int
+	countQuery := `SELECT COUNT(*) FROM intercompany_transaction_logs WHERE tenant_id = $1`
+	h.db.QueryRow(countQuery, tenantID).Scan(&total)
+
+	response.Success(c, gin.H{
+		"data":  logs,
+		"total": total,
+		"page":  page,
+		"limit": limit,
+	})
+}
+
+// Helper functions for IC rules
+func getRuleTypeLabel(ruleType string) string {
+	switch ruleType {
+	case "sale_to_purchase":
+		return "Sale Order → Purchase Order"
+	case "purchase_to_sale":
+		return "Purchase Order → Sale Order"
+	case "invoice_to_bill":
+		return "Invoice → Vendor Bill"
+	case "bill_to_invoice":
+		return "Vendor Bill → Invoice"
+	case "transfer":
+		return "Inventory Transfer"
+	default:
+		return ruleType
+	}
+}
+
+func joinWithComma(strs []string) string {
+	result := ""
+	for i, s := range strs {
+		if i > 0 {
+			result += ", "
+		}
+		result += s
+	}
+	return result
+}
