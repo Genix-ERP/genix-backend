@@ -881,17 +881,18 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		h.log.Info("Inventory updated from PO received", "po_id", id)
 
 		// ============================================
-		// CREATE JOURNAL ENTRY: Debit Inventory, Credit AP
+		// CREATE JOURNAL ENTRY: Debit Stock Valuation, Credit Stock Interim Receipt (per category, Odoo-style)
 		// ============================================
 		var poTotal float64
 		var poNumber string
 		var poVendorName sql.NullString
+		var poVendorID sql.NullString
 		h.db.QueryRow(`
-			SELECT total_amount, order_number, c.name
+			SELECT total_amount, order_number, c.name, po.vendor_id
 			FROM purchase_orders po
 			LEFT JOIN contacts c ON po.vendor_id = c.id
 			WHERE po.id = $1
-		`, id).Scan(&poTotal, &poNumber, &poVendorName)
+		`, id).Scan(&poTotal, &poNumber, &poVendorName, &poVendorID)
 
 		var jeEntryID uuid.UUID // will be set if JE is created, used by vendor bill
 
@@ -904,14 +905,63 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 				}
 			}
 
-			// Find accounts
-			inventoryAccountID := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
-			if inventoryAccountID == uuid.Nil {
-				inventoryAccountID = findAccount(h.db, tenantID, orgIDPtr, "stock", "1300")
+			// Get PO lines with product info for per-category accounting
+			type poLineAcct struct {
+				ProductID  uuid.UUID
+				LineTotal  float64
+				ValuationAcct uuid.UUID
+				InputAcct     uuid.UUID
 			}
-			apAccountID := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+			var poLines []poLineAcct
+			rows, err := h.db.Query(`
+				SELECT product_id, COALESCE(line_total, 0)
+				FROM purchase_order_lines
+				WHERE purchase_order_id = $1
+			`, id)
+			if err == nil {
+				for rows.Next() {
+					var pl poLineAcct
+					if err := rows.Scan(&pl.ProductID, &pl.LineTotal); err == nil && pl.LineTotal > 0 {
+						poLines = append(poLines, pl)
+					}
+				}
+				rows.Close()
+				// Resolve category accounts after closing rows
+				for i := range poLines {
+					ca := getCategoryAccounts(h.db, tenantID, orgIDPtr, poLines[i].ProductID)
+					poLines[i].ValuationAcct = ca.StockValuationAccountID
+					poLines[i].InputAcct = ca.StockInputAccountID
+				}
+			}
 
-			if inventoryAccountID != uuid.Nil && apAccountID != uuid.Nil {
+			// Group by account pair to minimize JE lines
+			type acctPair struct {
+				Debit  uuid.UUID
+				Credit uuid.UUID
+			}
+			grouped := make(map[acctPair]float64)
+			for _, pl := range poLines {
+				key := acctPair{Debit: pl.ValuationAcct, Credit: pl.InputAcct}
+				grouped[key] += pl.LineTotal
+			}
+
+			// If no lines found, fall back to total with default accounts
+			if len(grouped) == 0 && poTotal > 0 {
+				valAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+				if valAcct == uuid.Nil {
+					valAcct = findAccount(h.db, tenantID, orgIDPtr, "stock", "1300")
+				}
+				inputAcct := findAccount(h.db, tenantID, orgIDPtr, "stock interim receipt", "2200")
+				if inputAcct == uuid.Nil {
+					// If no interim account, fall back to AP directly (backward compat)
+					inputAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+				}
+				if valAcct != uuid.Nil && inputAcct != uuid.Nil {
+					grouped[acctPair{Debit: valAcct, Credit: inputAcct}] = poTotal
+				}
+			}
+
+			if len(grouped) > 0 {
 				// Find purchase journal
 				var journalID uuid.UUID
 				var nextNumber int
@@ -921,7 +971,6 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 					ORDER BY created_at ASC LIMIT 1
 				`, tenantID).Scan(&journalID, &nextNumber)
 				if err != nil {
-					// Fallback to general journal
 					h.db.QueryRow(`
 						SELECT id, next_number FROM journals
 						WHERE tenant_id = $1 AND type = 'general' AND is_active = true
@@ -939,42 +988,55 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 					}
 					description := fmt.Sprintf("Purchase Order %s received - %s", poNumber, vendorName)
 
-					// Create journal entry
+					var contactID *uuid.UUID
+					if poVendorID.Valid {
+						parsed, _ := uuid.Parse(poVendorID.String)
+						if parsed != uuid.Nil {
+							contactID = &parsed
+						}
+					}
+
+					// Create journal entry header
 					h.db.Exec(`
 						INSERT INTO journal_entries (
 							id, tenant_id, organization_id, journal_id, entry_number,
-							entry_date, description, status, total_debit, total_credit,
+							entry_date, description, source_type, source_id, status, total_debit, total_credit,
 							created_at, updated_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'purchase_order', $8, 'posted', $9, $9, $10, $10)
 					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
-						now, description, poTotal, now)
+						now, description, id.String(), poTotal, now)
 
-					// Debit: Inventory
-					debitLineID := uuid.New()
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
-					`, debitLineID, entryID, inventoryAccountID, description, poTotal, now)
+					lineNumber := 1
+					for pair, amount := range grouped {
+						// Debit: Stock Valuation
+						debitLineID := uuid.New()
+						h.db.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, account_id, contact_id, description,
+								debit_amount, credit_amount, line_number, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
+						`, debitLineID, entryID, pair.Debit, contactID, "Stock Valuation", amount, lineNumber, now)
+						lineNumber++
 
-					// Credit: Accounts Payable
-					creditLineID := uuid.New()
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
-					`, creditLineID, entryID, apAccountID, description, poTotal, now)
+						// Credit: Stock Interim Receipt
+						creditLineID := uuid.New()
+						h.db.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, account_id, contact_id, description,
+								debit_amount, credit_amount, line_number, created_at
+							) VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)
+						`, creditLineID, entryID, pair.Credit, contactID, "Stock Interim Receipt", amount, lineNumber, now)
+						lineNumber++
 
-					// Update account balances
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, poTotal, now, inventoryAccountID)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, poTotal, now, apAccountID)
+						// Update account balances
+						h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Debit)
+						h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Credit)
+					}
 
 					// Update journal next_number
 					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
 
-					h.log.Info("Journal entry created for PO received", "entry_id", entryID, "amount", poTotal)
+					h.log.Info("Journal entry created for PO received (Odoo-style)", "entry_id", entryID, "amount", poTotal)
 				}
 			}
 		}

@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -460,21 +461,24 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		return
 	}
 
-	// If variant_id is provided, verify it belongs to this product
+	// If variant_id is provided, verify it belongs to this product and get variant cost
+	var variantCostPrice float64
 	if variantID != nil {
-		var variantExists bool
-		h.db.QueryRow(
-			"SELECT EXISTS(SELECT 1 FROM product_variants WHERE id = $1 AND product_id = $2 AND deleted_at IS NULL)",
+		err = h.db.QueryRow(
+			"SELECT COALESCE(cost_price, 0) FROM product_variants WHERE id = $1 AND product_id = $2 AND deleted_at IS NULL",
 			variantID, productID,
-		).Scan(&variantExists)
-		if !variantExists {
+		).Scan(&variantCostPrice)
+		if err == sql.ErrNoRows {
 			response.BadRequest(c, "Invalid variant ID for this product")
 			return
 		}
 	}
 
-	// Use provided unit_cost or fall back to product's cost_price
+	// Use provided unit_cost → variant cost_price → product cost_price
 	unitCost := input.UnitCost
+	if unitCost == 0 && variantCostPrice > 0 {
+		unitCost = variantCostPrice
+	}
 	if unitCost == 0 {
 		unitCost = productCostPrice
 	}
@@ -593,6 +597,86 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		h.log.Error("Failed to create inventory transaction", "error", err)
 		response.InternalError(c, "Failed to adjust inventory")
 		return
+	}
+
+	// ===== Create Journal Entry for Inventory Adjustment (Odoo-style) =====
+	totalCost := math.Abs(input.Quantity) * unitCost
+	if totalCost > 0 {
+		var orgIDPtr *uuid.UUID
+		if organizationID != uuid.Nil {
+			orgIDPtr = &organizationID
+		}
+		ca := getCategoryAccounts(tx, tenantID, orgIDPtr, productID)
+		adjustAcct := findAccount(tx, tenantID, orgIDPtr, "stock adjustment", "6900")
+		if adjustAcct == uuid.Nil {
+			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "inventory adjustment", "6900")
+		}
+
+		if ca.StockValuationAccountID != uuid.Nil && adjustAcct != uuid.Nil {
+			// Find journal (MISC or GENERAL)
+			var journalID uuid.UUID
+			var nextNumber int
+			tx.QueryRow(`SELECT id, next_number FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+
+			if journalID != uuid.Nil {
+				entryID := uuid.New()
+				entryNumber := fmt.Sprintf("ADJ%06d", nextNumber)
+				description := fmt.Sprintf("Inventory Adjustment - %s", input.Reason)
+				if input.Reason == "" {
+					description = "Inventory Adjustment"
+				}
+
+				tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number,
+						entry_date, description, source_type, source_id, status, total_debit, total_credit,
+						created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'inventory_adjustment', $8, 'posted', $9, $9, $10, $10)
+				`, entryID, tenantID, organizationID, journalID, entryNumber,
+					now, description, inventoryID.String(), totalCost, now)
+
+				var debitAcct, creditAcct uuid.UUID
+				var debitDesc, creditDesc string
+				if input.Quantity > 0 {
+					// Adding stock: Debit Stock Valuation / Credit Adjustment Expense
+					debitAcct = ca.StockValuationAccountID
+					creditAcct = adjustAcct
+					debitDesc = "Stock Valuation (adjustment in)"
+					creditDesc = "Inventory Adjustment Expense"
+				} else {
+					// Removing stock: Debit Adjustment Expense / Credit Stock Valuation
+					debitAcct = adjustAcct
+					creditAcct = ca.StockValuationAccountID
+					debitDesc = "Inventory Adjustment Expense"
+					creditDesc = "Stock Valuation (adjustment out)"
+				}
+
+				debitLineID := uuid.New()
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, account_id, description,
+						debit_amount, credit_amount, line_number, created_at
+					) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+				`, debitLineID, entryID, debitAcct, debitDesc, totalCost, now)
+
+				creditLineID := uuid.New()
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, account_id, description,
+						debit_amount, credit_amount, line_number, created_at
+					) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+				`, creditLineID, entryID, creditAcct, creditDesc, totalCost, now)
+
+				// Update account balances
+				tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, debitAcct)
+				tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, creditAcct)
+
+				// Update journal next_number
+				tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+
+				h.log.Info("Journal entry created for inventory adjustment", "entry_id", entryID, "amount", totalCost)
+			}
+		}
 	}
 
 	if err = tx.Commit(); err != nil {

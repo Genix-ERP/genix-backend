@@ -897,8 +897,11 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
-	// Get default account IDs — lookup by name first, then code fallback
+	// Odoo-style: AR + per-category Income + COGS/Interim clearing
 	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+	if arAccountID == uuid.Nil {
+		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
+	}
 	if arAccountID == uuid.Nil {
 		h.log.Warn("AR account not found, skipping GL posting", "tenant_id", tenantID)
 		_, err = tx.Exec(
@@ -917,8 +920,68 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
-	revenueAccountID := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
 	taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+
+	// Get invoice lines for per-category accounting
+	type invoiceLineAcct struct {
+		ProductID    uuid.UUID
+		LineTotal    float64
+		Quantity     float64
+		CostPrice    float64
+		IncomeAcct   uuid.UUID
+		ExpenseAcct  uuid.UUID
+		OutputAcct   uuid.UUID
+	}
+	var invoiceLines []invoiceLineAcct
+	lineRows, lineErr := tx.Query(`
+		SELECT sil.product_id, COALESCE(sil.line_total, 0), COALESCE(sil.quantity, 0), COALESCE(p.cost_price, 0)
+		FROM sales_invoice_lines sil
+		JOIN products p ON sil.product_id = p.id
+		WHERE sil.sales_invoice_id = $1
+	`, invoiceID)
+	if lineErr == nil {
+		for lineRows.Next() {
+			var il invoiceLineAcct
+			if err := lineRows.Scan(&il.ProductID, &il.LineTotal, &il.Quantity, &il.CostPrice); err == nil {
+				invoiceLines = append(invoiceLines, il)
+			}
+		}
+		lineRows.Close()
+		// Resolve category accounts after closing rows
+		for i := range invoiceLines {
+			ca := getCategoryAccounts(tx, tenantID, organizationID, invoiceLines[i].ProductID)
+			invoiceLines[i].IncomeAcct = ca.IncomeAccountID
+			invoiceLines[i].ExpenseAcct = ca.ExpenseAccountID
+			invoiceLines[i].OutputAcct = ca.StockOutputAccountID
+		}
+	}
+
+	// Group revenue by income account
+	revenueGrouped := make(map[uuid.UUID]float64)
+	// Group COGS by expense/output account pair
+	type cogsPair struct {
+		Expense uuid.UUID
+		Output  uuid.UUID
+	}
+	cogsGrouped := make(map[cogsPair]float64)
+
+	for _, il := range invoiceLines {
+		if il.LineTotal > 0 {
+			revenueGrouped[il.IncomeAcct] += il.LineTotal
+		}
+		costAmount := il.Quantity * il.CostPrice
+		if costAmount > 0 {
+			cogsGrouped[cogsPair{Expense: il.ExpenseAcct, Output: il.OutputAcct}] += costAmount
+		}
+	}
+
+	// Fallback if no lines found
+	if len(revenueGrouped) == 0 && subtotal > 0 {
+		fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+		if fallbackRevenue != uuid.Nil {
+			revenueGrouped[fallbackRevenue] = subtotal
+		}
+	}
 
 	// Generate entry number
 	prefix := ""
@@ -926,6 +989,14 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		prefix = numberPrefix.String
 	}
 	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+	// Calculate total debit = AR total + COGS total
+	var totalCogs float64
+	for _, amt := range cogsGrouped {
+		totalCogs += amt
+	}
+	totalDebit := totalAmount + totalCogs
+	totalCredit := totalDebit // Must balance
 
 	// Create journal entry
 	journalEntryID := uuid.New()
@@ -935,9 +1006,9 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 		journalEntryID, tenantID, organizationID, salesJournalID, entryNumber, invoiceDate, invoiceNumber, description,
-		"sales_invoice", invoiceID.String(), 1.0, totalAmount, totalAmount, "posted", userID, now, now,
+		"sales_invoice", invoiceID.String(), 1.0, totalDebit, totalCredit, userID, now, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to create journal entry", "error", err)
@@ -945,10 +1016,9 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
-	// Create journal entry lines
 	lineNumber := 1
 
-	// Line 1: Debit AR for total amount
+	// Debit: Accounts Receivable (invoice total)
 	arLineID := uuid.New()
 	_, err = tx.Exec(`
 		INSERT INTO journal_entry_lines (
@@ -963,32 +1033,28 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		response.InternalError(c, "Failed to create journal entry")
 		return
 	}
+	tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
 	lineNumber++
 
-	// Line 2: Credit Revenue (subtotal - discount)
-	revenueAmount := subtotal
-	if revenueAccountID != uuid.Nil && revenueAmount > 0 {
+	// Credit: Income/Revenue (per category)
+	for incomeAcct, amount := range revenueGrouped {
 		revenueLineID := uuid.New()
-		_, err = tx.Exec(`
+		tx.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			revenueLineID, journalEntryID, lineNumber, revenueAccountID, "Sales Revenue",
-			0.0, revenueAmount, 1.0, now,
+			revenueLineID, journalEntryID, lineNumber, incomeAcct, "Sales Revenue",
+			0.0, amount, 1.0, now,
 		)
-		if err != nil {
-			h.log.Error("Failed to create revenue line", "error", err)
-			response.InternalError(c, "Failed to create journal entry")
-			return
-		}
+		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct)
 		lineNumber++
 	}
 
-	// Line 3: Credit Tax Payable (if tax > 0)
+	// Credit: Tax Payable (if tax > 0)
 	if taxAccountID != uuid.Nil && taxAmount > 0 {
 		taxLineID := uuid.New()
-		_, err = tx.Exec(`
+		tx.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
@@ -996,32 +1062,41 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 			taxLineID, journalEntryID, lineNumber, taxAccountID, "Sales Tax Payable",
 			0.0, taxAmount, 1.0, now,
 		)
-		if err != nil {
-			h.log.Error("Failed to create tax line", "error", err)
-			response.InternalError(c, "Failed to create journal entry")
-			return
-		}
+		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+		lineNumber++
+	}
+
+	// COGS entries: Debit Expense, Credit Stock Interim Delivery (clears interim from shipping)
+	for pair, costAmount := range cogsGrouped {
+		// Debit: COGS/Expense
+		cogsLineID := uuid.New()
+		tx.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			cogsLineID, journalEntryID, lineNumber, pair.Expense, "Cost of Goods Sold",
+			costAmount, 0.0, 1.0, now,
+		)
+		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Expense)
+		lineNumber++
+
+		// Credit: Stock Interim Delivery (clears interim)
+		outputLineID := uuid.New()
+		tx.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			outputLineID, journalEntryID, lineNumber, pair.Output, "Stock Interim Delivery",
+			0.0, costAmount, 1.0, now,
+		)
+		tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output)
+		lineNumber++
 	}
 
 	// Update journal next number
-	_, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
-	if err != nil {
-		h.log.Error("Failed to update journal number", "error", err)
-		response.InternalError(c, "Failed to update journal")
-		return
-	}
-
-	// Update account balances
-	// AR is a debit-normal account, so debit increases balance
-	tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
-	if revenueAccountID != uuid.Nil && subtotal > 0 {
-		// Revenue is credit-normal, credit increases balance
-		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", subtotal, now, revenueAccountID)
-	}
-	if taxAccountID != uuid.Nil && taxAmount > 0 {
-		// Tax payable is credit-normal, credit increases balance
-		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
-	}
+	tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
 
 	// Update invoice with journal entry ID and status
 	_, err = tx.Exec(
