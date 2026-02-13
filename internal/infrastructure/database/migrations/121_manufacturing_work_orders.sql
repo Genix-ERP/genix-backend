@@ -17,65 +17,38 @@ ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS production_location_id UUID REFE
 COMMENT ON COLUMN warehouses.production_location_id IS 'Default location for production/manufacturing';
 
 -- =====================================================
--- 2. WORK ORDERS TABLE
+-- 2. WORK ORDERS TABLE ENHANCEMENTS
 -- =====================================================
+-- Note: work_orders table is created in migration 010
+-- Here we add additional columns needed for the Odoo-like schema
 
-CREATE TABLE IF NOT EXISTS work_orders (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
+-- Add organization_id if not exists
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL;
 
-    -- Link to Manufacturing Order
-    production_order_id UUID NOT NULL REFERENCES production_orders(id) ON DELETE CASCADE,
+-- Add work_order_number (map from existing 'code' column or add new)
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS work_order_number VARCHAR(50);
+-- Update work_order_number from code if it's null
+UPDATE work_orders SET work_order_number = code WHERE work_order_number IS NULL AND code IS NOT NULL;
 
-    -- Work Order Info
-    work_order_number VARCHAR(50) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    sequence INTEGER NOT NULL DEFAULT 10,
+-- Add operation details
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS bom_operation_id UUID REFERENCES bom_operations(id) ON DELETE SET NULL;
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS operation_name VARCHAR(255);
 
-    -- Operation details (from BOM routing)
-    bom_operation_id UUID REFERENCES bom_operations(id) ON DELETE SET NULL,
-    operation_name VARCHAR(255),
+-- Add work center name
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS work_center_name VARCHAR(255);
 
-    -- Work Center
-    work_center_id UUID REFERENCES work_centers(id) ON DELETE SET NULL,
-    work_center_name VARCHAR(255),
+-- Add time tracking in minutes (convert from hours later)
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS expected_duration_minutes INTEGER DEFAULT 0;
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS setup_time_minutes INTEGER DEFAULT 0;
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS actual_duration_minutes INTEGER DEFAULT 0;
 
-    -- Quantity
-    quantity_to_produce DECIMAL(15,4) NOT NULL DEFAULT 1,
-    quantity_produced DECIMAL(15,4) DEFAULT 0,
+-- Add operator fields
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS operator_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS operator_name VARCHAR(255);
 
-    -- Time tracking
-    expected_duration_minutes INTEGER DEFAULT 0,
-    setup_time_minutes INTEGER DEFAULT 0,
-    actual_duration_minutes INTEGER DEFAULT 0,
-
-    -- Dates
-    scheduled_start TIMESTAMP WITH TIME ZONE,
-    scheduled_end TIMESTAMP WITH TIME ZONE,
-    actual_start TIMESTAMP WITH TIME ZONE,
-    actual_end TIMESTAMP WITH TIME ZONE,
-
-    -- Status: draft, waiting, ready, in_progress, done, cancelled
-    status VARCHAR(30) NOT NULL DEFAULT 'draft',
-
-    -- Operator
-    operator_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    operator_name VARCHAR(255),
-
-    -- Quality
-    quality_check_required BOOLEAN DEFAULT false,
-    quality_check_passed BOOLEAN,
-
-    -- Notes
-    instructions TEXT,
-    notes TEXT,
-
-    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    deleted_at TIMESTAMP WITH TIME ZONE
-);
+-- Add quality check fields
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS quality_check_required BOOLEAN DEFAULT false;
+ALTER TABLE work_orders ADD COLUMN IF NOT EXISTS quality_check_passed BOOLEAN;
 
 -- Work order sequence
 CREATE SEQUENCE IF NOT EXISTS work_order_seq START 1;
