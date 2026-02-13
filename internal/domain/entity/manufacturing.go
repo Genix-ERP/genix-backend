@@ -278,7 +278,7 @@ type ProductionOrderFilter struct {
 }
 
 // =====================================================
-// WORK ORDER ENTITIES
+// WORK ORDER ENTITIES (Old Schema from migration 010)
 // =====================================================
 
 type WorkOrder struct {
@@ -317,73 +317,6 @@ type WorkOrder struct {
 	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at" db:"updated_at"`
 	DeletedAt           *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
-}
-
-type WorkOrderInput struct {
-	ProductionOrderID  uuid.UUID  `json:"production_order_id" binding:"required"`
-	Name               *string    `json:"name,omitempty"`
-	Sequence           *int       `json:"sequence,omitempty"`
-	OperationID        *uuid.UUID `json:"operation_id,omitempty"`
-	WorkCenterID       *uuid.UUID `json:"work_center_id,omitempty"`
-	QuantityToProduce  float64    `json:"quantity_to_produce" binding:"required,gt=0"`
-	UOM                string     `json:"uom" binding:"required"`
-	PlannedDurationHrs *float64   `json:"planned_duration_hours,omitempty"`
-	SetupTimeHrs       *float64   `json:"setup_time_hours,omitempty"`
-	ScheduledStart     *string    `json:"scheduled_start,omitempty"`
-	ScheduledEnd       *string    `json:"scheduled_end,omitempty"`
-	AssignedTo         *uuid.UUID `json:"assigned_to,omitempty"`
-	Instructions       *string    `json:"instructions,omitempty"`
-	Notes              *string    `json:"notes,omitempty"`
-}
-
-type WorkOrderResponse struct {
-	ID                   uuid.UUID  `json:"id"`
-	ProductionOrderID    uuid.UUID  `json:"production_order_id"`
-	ProductionOrderCode  string     `json:"production_order_code"`
-	Code                 string     `json:"code"`
-	Name                 *string    `json:"name,omitempty"`
-	Sequence             int        `json:"sequence"`
-	OperationID          *uuid.UUID `json:"operation_id,omitempty"`
-	OperationName        *string    `json:"operation_name,omitempty"`
-	WorkCenterID         *uuid.UUID `json:"work_center_id,omitempty"`
-	WorkCenterName       *string    `json:"work_center_name,omitempty"`
-	QuantityToProduce    float64    `json:"quantity_to_produce"`
-	QuantityProduced     float64    `json:"quantity_produced"`
-	QuantityScrapped     float64    `json:"quantity_scrapped"`
-	QuantityRemaining    float64    `json:"quantity_remaining"`
-	UOM                  string     `json:"uom"`
-	PlannedDurationHours float64    `json:"planned_duration_hours"`
-	ActualDurationHours  float64    `json:"actual_duration_hours"`
-	SetupTimeHours       float64    `json:"setup_time_hours"`
-	ScheduledStart       *string    `json:"scheduled_start,omitempty"`
-	ScheduledEnd         *string    `json:"scheduled_end,omitempty"`
-	ActualStart          *string    `json:"actual_start,omitempty"`
-	ActualEnd            *string    `json:"actual_end,omitempty"`
-	Status               string     `json:"status"`
-	ProgressPercent      float64    `json:"progress_percent"`
-	PlannedCost          float64    `json:"planned_cost"`
-	ActualCost           float64    `json:"actual_cost"`
-	LaborCost            float64    `json:"labor_cost"`
-	MachineCost          float64    `json:"machine_cost"`
-	AssignedTo           *uuid.UUID `json:"assigned_to,omitempty"`
-	AssignedToName       *string    `json:"assigned_to_name,omitempty"`
-	Instructions         *string    `json:"instructions,omitempty"`
-	Notes                *string    `json:"notes,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at"`
-}
-
-type WorkOrderFilter struct {
-	ProductionOrderID *uuid.UUID `form:"production_order_id"`
-	WorkCenterID      *uuid.UUID `form:"work_center_id"`
-	Status            *string    `form:"status"`
-	AssignedTo        *uuid.UUID `form:"assigned_to"`
-	DateFrom          *string    `form:"date_from"`
-	DateTo            *string    `form:"date_to"`
-	Page              int        `form:"page"`
-	Limit             int        `form:"limit"`
-	SortBy            string     `form:"sort_by"`
-	SortOrder         string     `form:"sort_order"`
 }
 
 // =====================================================
