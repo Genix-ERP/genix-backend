@@ -1989,22 +1989,17 @@ func (h *Handler) ListBOMOperations(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
-		SELECT o.id, o.bom_id, o.sequence, o.operation_name, o.work_center, o.work_center_id,
-			   o.setup_time_minutes, o.run_time_minutes, o.labor_cost, o.overhead_cost, o.notes,
-			   o.created_at, o.updated_at,
-			   wc.name as work_center_name, wc.hourly_cost as work_center_hourly_cost
-		FROM bom_operations o
-		LEFT JOIN work_centers wc ON o.work_center_id = wc.id
-		WHERE o.bom_id = $1
-		ORDER BY o.sequence
-	`, bomID)
+	// Check if work_center_id column exists (migration 116)
+	var hasWorkCenterID bool
+	err = h.db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'bom_operations' AND column_name = 'work_center_id'
+		)
+	`).Scan(&hasWorkCenterID)
 	if err != nil {
-		h.log.Error("Failed to list BOM operations", "error", err)
-		response.InternalError(c, "Failed to list BOM operations")
-		return
+		hasWorkCenterID = false
 	}
-	defer rows.Close()
 
 	type BOMOperation struct {
 		ID                   uuid.UUID  `json:"id"`
@@ -2025,39 +2020,100 @@ func (h *Handler) ListBOMOperations(c *gin.Context) {
 	}
 
 	operations := make([]BOMOperation, 0)
-	for rows.Next() {
-		var op BOMOperation
-		var workCenter, notes, wcName sql.NullString
-		var wcID uuid.NullUUID
-		var wcHourlyCost sql.NullFloat64
 
-		err := rows.Scan(
-			&op.ID, &op.BOMID, &op.Sequence, &op.OperationName, &workCenter, &wcID,
-			&op.SetupTimeMinutes, &op.RunTimeMinutes, &op.LaborCost, &op.OverheadCost, &notes,
-			&op.CreatedAt, &op.UpdatedAt, &wcName, &wcHourlyCost,
-		)
+	if hasWorkCenterID {
+		// New schema with work_center_id FK
+		rows, err := h.db.Query(`
+			SELECT o.id, o.bom_id, o.sequence, o.operation_name, o.work_center, o.work_center_id,
+				   o.setup_time_minutes, o.run_time_minutes, o.labor_cost, o.overhead_cost, o.notes,
+				   o.created_at, o.updated_at,
+				   wc.name as work_center_name, wc.hourly_cost as work_center_hourly_cost
+			FROM bom_operations o
+			LEFT JOIN work_centers wc ON o.work_center_id = wc.id
+			WHERE o.bom_id = $1
+			ORDER BY o.sequence
+		`, bomID)
 		if err != nil {
-			h.log.Error("Failed to scan BOM operation", "error", err)
-			continue
+			h.log.Error("Failed to list BOM operations", "error", err)
+			response.InternalError(c, "Failed to list BOM operations")
+			return
 		}
+		defer rows.Close()
 
-		if workCenter.Valid {
-			op.WorkCenter = &workCenter.String
-		}
-		if wcID.Valid {
-			op.WorkCenterID = &wcID.UUID
-		}
-		if notes.Valid {
-			op.Notes = &notes.String
-		}
-		if wcName.Valid {
-			op.WorkCenterName = &wcName.String
-		}
-		if wcHourlyCost.Valid {
-			op.WorkCenterHourlyCost = &wcHourlyCost.Float64
-		}
+		for rows.Next() {
+			var op BOMOperation
+			var workCenter, notes, wcName sql.NullString
+			var wcID uuid.NullUUID
+			var wcHourlyCost sql.NullFloat64
 
-		operations = append(operations, op)
+			err := rows.Scan(
+				&op.ID, &op.BOMID, &op.Sequence, &op.OperationName, &workCenter, &wcID,
+				&op.SetupTimeMinutes, &op.RunTimeMinutes, &op.LaborCost, &op.OverheadCost, &notes,
+				&op.CreatedAt, &op.UpdatedAt, &wcName, &wcHourlyCost,
+			)
+			if err != nil {
+				h.log.Error("Failed to scan BOM operation", "error", err)
+				continue
+			}
+
+			if workCenter.Valid {
+				op.WorkCenter = &workCenter.String
+			}
+			if wcID.Valid {
+				op.WorkCenterID = &wcID.UUID
+			}
+			if notes.Valid {
+				op.Notes = &notes.String
+			}
+			if wcName.Valid {
+				op.WorkCenterName = &wcName.String
+			}
+			if wcHourlyCost.Valid {
+				op.WorkCenterHourlyCost = &wcHourlyCost.Float64
+			}
+
+			operations = append(operations, op)
+		}
+	} else {
+		// Legacy schema without work_center_id - use work_center string to join
+		rows, err := h.db.Query(`
+			SELECT o.id, o.bom_id, o.sequence, o.operation_name, o.work_center,
+				   o.setup_time_minutes, o.run_time_minutes, o.labor_cost, o.overhead_cost, o.notes,
+				   o.created_at, o.updated_at
+			FROM bom_operations o
+			WHERE o.bom_id = $1
+			ORDER BY o.sequence
+		`, bomID)
+		if err != nil {
+			h.log.Error("Failed to list BOM operations (legacy)", "error", err)
+			response.InternalError(c, "Failed to list BOM operations")
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var op BOMOperation
+			var workCenter, notes sql.NullString
+
+			err := rows.Scan(
+				&op.ID, &op.BOMID, &op.Sequence, &op.OperationName, &workCenter,
+				&op.SetupTimeMinutes, &op.RunTimeMinutes, &op.LaborCost, &op.OverheadCost, &notes,
+				&op.CreatedAt, &op.UpdatedAt,
+			)
+			if err != nil {
+				h.log.Error("Failed to scan BOM operation (legacy)", "error", err)
+				continue
+			}
+
+			if workCenter.Valid {
+				op.WorkCenter = &workCenter.String
+			}
+			if notes.Valid {
+				op.Notes = &notes.String
+			}
+
+			operations = append(operations, op)
+		}
 	}
 
 	response.Success(c, operations)
@@ -2138,14 +2194,34 @@ func (h *Handler) CreateBOMOperation(c *gin.Context) {
 		notes = &input.Notes
 	}
 
-	_, err = h.db.Exec(`
-		INSERT INTO bom_operations (
-			id, bom_id, sequence, operation_name, work_center, work_center_id,
-			setup_time_minutes, run_time_minutes, labor_cost, overhead_cost, notes,
-			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
-	`, id, bomID, input.Sequence, input.OperationName, workCenter, workCenterID,
-		input.SetupTimeMinutes, input.RunTimeMinutes, input.LaborCost, input.OverheadCost, notes, now)
+	// Check if work_center_id column exists
+	var hasWorkCenterID bool
+	h.db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'bom_operations' AND column_name = 'work_center_id'
+		)
+	`).Scan(&hasWorkCenterID)
+
+	if hasWorkCenterID {
+		_, err = h.db.Exec(`
+			INSERT INTO bom_operations (
+				id, bom_id, sequence, operation_name, work_center, work_center_id,
+				setup_time_minutes, run_time_minutes, labor_cost, overhead_cost, notes,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
+		`, id, bomID, input.Sequence, input.OperationName, workCenter, workCenterID,
+			input.SetupTimeMinutes, input.RunTimeMinutes, input.LaborCost, input.OverheadCost, notes, now)
+	} else {
+		_, err = h.db.Exec(`
+			INSERT INTO bom_operations (
+				id, bom_id, sequence, operation_name, work_center,
+				setup_time_minutes, run_time_minutes, labor_cost, overhead_cost, notes,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+		`, id, bomID, input.Sequence, input.OperationName, workCenter,
+			input.SetupTimeMinutes, input.RunTimeMinutes, input.LaborCost, input.OverheadCost, notes, now)
+	}
 
 	if err != nil {
 		h.log.Error("Failed to create BOM operation", "error", err)
@@ -2212,6 +2288,15 @@ func (h *Handler) UpdateBOMOperation(c *gin.Context) {
 		return
 	}
 
+	// Check if work_center_id column exists
+	var hasWorkCenterID bool
+	h.db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'bom_operations' AND column_name = 'work_center_id'
+		)
+	`).Scan(&hasWorkCenterID)
+
 	// Build dynamic update query
 	updates := []string{}
 	args := []interface{}{}
@@ -2232,7 +2317,7 @@ func (h *Handler) UpdateBOMOperation(c *gin.Context) {
 		args = append(args, *input.WorkCenter)
 		argIndex++
 	}
-	if input.WorkCenterID != nil {
+	if input.WorkCenterID != nil && hasWorkCenterID {
 		if *input.WorkCenterID == "" {
 			updates = append(updates, fmt.Sprintf("work_center_id = $%d", argIndex))
 			args = append(args, nil)
