@@ -183,7 +183,7 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 
 	woID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid work order ID", "")
+		response.BadRequest(c, "Invalid work order ID")
 		return
 	}
 
@@ -284,7 +284,7 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 
 	woID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid work order ID", "")
+		response.BadRequest(c, "Invalid work order ID")
 		return
 	}
 
@@ -300,7 +300,7 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 	}
 
 	if currentStatus != "draft" && currentStatus != "ready" && currentStatus != "waiting" {
-		response.BadRequest(c, "Work order cannot be started", "Current status: "+currentStatus)
+		response.BadRequest(c, "Work order cannot be started. Current status: "+currentStatus)
 		return
 	}
 
@@ -345,13 +345,13 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 
 	woID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid work order ID", "")
+		response.BadRequest(c, "Invalid work order ID")
 		return
 	}
 
 	var input entity.CompleteWorkOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input", err.Error())
+		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
 	}
 
@@ -365,7 +365,7 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	}
 
 	if currentStatus != "in_progress" {
-		response.BadRequest(c, "Work order is not in progress", "Current status: "+currentStatus)
+		response.BadRequest(c, "Work order is not in progress. Current status: "+currentStatus)
 		return
 	}
 
@@ -425,13 +425,13 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 
 	var input entity.CreateWorkOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input", err.Error())
+		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
 	}
 
 	productionOrderID, err := uuid.Parse(input.ProductionOrderID)
 	if err != nil {
-		response.BadRequest(c, "Invalid production order ID", "")
+		response.BadRequest(c, "Invalid production order ID")
 		return
 	}
 
@@ -493,13 +493,13 @@ func (h *Handler) RecordWorkOrderTime(c *gin.Context) {
 
 	woID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid work order ID", "")
+		response.BadRequest(c, "Invalid work order ID")
 		return
 	}
 
 	var input entity.RecordWorkOrderTimeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input", err.Error())
+		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
 	}
 
@@ -569,7 +569,7 @@ func (h *Handler) PauseWorkOrder(c *gin.Context) {
 
 	woID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid work order ID", "")
+		response.BadRequest(c, "Invalid work order ID")
 		return
 	}
 
@@ -582,7 +582,7 @@ func (h *Handler) PauseWorkOrder(c *gin.Context) {
 	}
 
 	if currentStatus != "in_progress" {
-		response.BadRequest(c, "Work order is not in progress", "")
+		response.BadRequest(c, "Work order is not in progress")
 		return
 	}
 
@@ -736,7 +736,7 @@ func (h *Handler) GetManufacturingTransfer(c *gin.Context) {
 
 	transferID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid transfer ID", "")
+		response.BadRequest(c, "Invalid transfer ID")
 		return
 	}
 
@@ -854,7 +854,7 @@ func (h *Handler) ValidateManufacturingTransfer(c *gin.Context) {
 
 	transferID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid transfer ID", "")
+		response.BadRequest(c, "Invalid transfer ID")
 		return
 	}
 
@@ -875,7 +875,7 @@ func (h *Handler) ValidateManufacturingTransfer(c *gin.Context) {
 	}
 
 	if status == "done" {
-		response.BadRequest(c, "Transfer already validated", "")
+		response.BadRequest(c, "Transfer already validated")
 		return
 	}
 
