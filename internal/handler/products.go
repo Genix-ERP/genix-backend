@@ -738,7 +738,8 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 	flat := c.Query("flat") == "true"
 
 	query := `
-		SELECT id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at
+		SELECT id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at,
+			income_account_id, expense_account_id, stock_valuation_account_id, stock_input_account_id, stock_output_account_id
 		FROM product_categories
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 	`
@@ -771,7 +772,8 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 		var cat entity.ProductCategory
 		var parentID, desc sql.NullString
 
-		err := rows.Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt)
+		err := rows.Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt,
+			&cat.IncomeAccountID, &cat.ExpenseAccountID, &cat.StockValuationAccountID, &cat.StockInputAccountID, &cat.StockOutputAccountID)
 		if err != nil {
 			continue
 		}
@@ -818,10 +820,15 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 	}
 
 	type Input struct {
-		ParentID    string `json:"parent_id,omitempty"`
-		Code        string `json:"code" binding:"required,min=1,max=50"`
-		Name        string `json:"name" binding:"required,min=1,max=255"`
-		Description string `json:"description,omitempty"`
+		ParentID               string  `json:"parent_id,omitempty"`
+		Code                   string  `json:"code" binding:"required,min=1,max=50"`
+		Name                   string  `json:"name" binding:"required,min=1,max=255"`
+		Description            string  `json:"description,omitempty"`
+		IncomeAccountID        *string `json:"income_account_id,omitempty"`
+		ExpenseAccountID       *string `json:"expense_account_id,omitempty"`
+		StockValuationAccountID *string `json:"stock_valuation_account_id,omitempty"`
+		StockInputAccountID    *string `json:"stock_input_account_id,omitempty"`
+		StockOutputAccountID   *string `json:"stock_output_account_id,omitempty"`
 	}
 
 	var input Input
@@ -858,6 +865,23 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 		description = &input.Description
 	}
 
+	// Parse account IDs
+	parseOptionalUUID := func(s *string) *uuid.UUID {
+		if s == nil || *s == "" {
+			return nil
+		}
+		parsed, err := uuid.Parse(*s)
+		if err != nil || parsed == uuid.Nil {
+			return nil
+		}
+		return &parsed
+	}
+	incomeAcctID := parseOptionalUUID(input.IncomeAccountID)
+	expenseAcctID := parseOptionalUUID(input.ExpenseAccountID)
+	stockValAcctID := parseOptionalUUID(input.StockValuationAccountID)
+	stockInAcctID := parseOptionalUUID(input.StockInputAccountID)
+	stockOutAcctID := parseOptionalUUID(input.StockOutputAccountID)
+
 	id := uuid.New()
 	now := time.Now()
 
@@ -867,9 +891,14 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 	}
 
 	_, err := h.db.Exec(`
-		INSERT INTO product_categories (id, tenant_id, organization_id, parent_id, code, name, description, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, id, tenantID, orgIDPtr, parentID, input.Code, input.Name, description, true, now, now)
+		INSERT INTO product_categories (
+			id, tenant_id, organization_id, parent_id, code, name, description, is_active,
+			income_account_id, expense_account_id, stock_valuation_account_id, stock_input_account_id, stock_output_account_id,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+	`, id, tenantID, orgIDPtr, parentID, input.Code, input.Name, description, true,
+		incomeAcctID, expenseAcctID, stockValAcctID, stockInAcctID, stockOutAcctID,
+		now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create category", "error", err)
@@ -878,15 +907,20 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 	}
 
 	cat := &entity.ProductCategory{
-		ID:          id,
-		TenantID:    tenantID,
-		ParentID:    parentID,
-		Code:        input.Code,
-		Name:        input.Name,
-		Description: description,
-		IsActive:    true,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:                      id,
+		TenantID:                tenantID,
+		ParentID:                parentID,
+		Code:                    input.Code,
+		Name:                    input.Name,
+		Description:             description,
+		IsActive:                true,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+		IncomeAccountID:         incomeAcctID,
+		ExpenseAccountID:        expenseAcctID,
+		StockValuationAccountID: stockValAcctID,
+		StockInputAccountID:     stockInAcctID,
+		StockOutputAccountID:    stockOutAcctID,
 	}
 
 	response.Created(c, cat)
@@ -911,10 +945,12 @@ func (h *Handler) GetProductCategory(c *gin.Context) {
 	var parentID, desc sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at
+		SELECT id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at,
+			income_account_id, expense_account_id, stock_valuation_account_id, stock_input_account_id, stock_output_account_id
 		FROM product_categories
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt)
+	`, id, tenantID).Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt,
+		&cat.IncomeAccountID, &cat.ExpenseAccountID, &cat.StockValuationAccountID, &cat.StockInputAccountID, &cat.StockOutputAccountID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Category")
@@ -953,10 +989,15 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 	}
 
 	type Input struct {
-		Name        *string `json:"name,omitempty"`
-		Description *string `json:"description,omitempty"`
-		ParentID    *string `json:"parent_id,omitempty"`
-		IsActive    *bool   `json:"is_active,omitempty"`
+		Name                    *string `json:"name,omitempty"`
+		Description             *string `json:"description,omitempty"`
+		ParentID                *string `json:"parent_id,omitempty"`
+		IsActive                *bool   `json:"is_active,omitempty"`
+		IncomeAccountID         *string `json:"income_account_id"`
+		ExpenseAccountID        *string `json:"expense_account_id"`
+		StockValuationAccountID *string `json:"stock_valuation_account_id"`
+		StockInputAccountID     *string `json:"stock_input_account_id"`
+		StockOutputAccountID    *string `json:"stock_output_account_id"`
 	}
 
 	var input Input
@@ -975,6 +1016,21 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 		args = append(args, value)
 	}
 
+	// Helper to parse optional UUID, empty string sets to NULL
+	parseOptionalUUID := func(s *string) (*uuid.UUID, bool) {
+		if s == nil {
+			return nil, false // field not provided
+		}
+		if *s == "" {
+			return nil, true // explicitly set to null
+		}
+		parsed, err := uuid.Parse(*s)
+		if err != nil || parsed == uuid.Nil {
+			return nil, true
+		}
+		return &parsed, true
+	}
+
 	if input.Name != nil {
 		addUpdate("name", *input.Name)
 	}
@@ -991,6 +1047,23 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
+	}
+
+	// Account fields
+	if val, provided := parseOptionalUUID(input.IncomeAccountID); provided {
+		addUpdate("income_account_id", val)
+	}
+	if val, provided := parseOptionalUUID(input.ExpenseAccountID); provided {
+		addUpdate("expense_account_id", val)
+	}
+	if val, provided := parseOptionalUUID(input.StockValuationAccountID); provided {
+		addUpdate("stock_valuation_account_id", val)
+	}
+	if val, provided := parseOptionalUUID(input.StockInputAccountID); provided {
+		addUpdate("stock_input_account_id", val)
+	}
+	if val, provided := parseOptionalUUID(input.StockOutputAccountID); provided {
+		addUpdate("stock_output_account_id", val)
 	}
 
 	if len(updates) == 0 {

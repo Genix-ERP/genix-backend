@@ -1047,20 +1047,21 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		}
 
 		// ============================================
-		// CREATE JOURNAL ENTRY: Debit AR, Credit Revenue
+		// CREATE JOURNAL ENTRY: Debit Stock Interim Delivery, Credit Stock Valuation (Odoo-style)
+		// Stock movement only — AR/Revenue entries created when invoice is sent
 		// ============================================
-		var soTotal float64
 		var soNumber string
 		var soCustomerName sql.NullString
+		var soCustomerID sql.NullString
 		var soOrgIDForJE sql.NullString
 		h.db.QueryRow(`
-			SELECT so.total_amount, so.order_number, c.name, so.organization_id
+			SELECT so.order_number, c.name, so.customer_id, so.organization_id
 			FROM sales_orders so
 			LEFT JOIN contacts c ON so.customer_id = c.id
 			WHERE so.id = $1
-		`, orderID).Scan(&soTotal, &soNumber, &soCustomerName, &soOrgIDForJE)
+		`, orderID).Scan(&soNumber, &soCustomerName, &soCustomerID, &soOrgIDForJE)
 
-		if soTotal > 0 {
+		{
 			var orgIDPtr *uuid.UUID
 			if soOrgIDForJE.Valid && soOrgIDForJE.String != "" {
 				parsed, _ := uuid.Parse(soOrgIDForJE.String)
@@ -1069,12 +1070,65 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 				}
 			}
 
-			// Find accounts
-			arAccountID := findAccount(h.db, tenantID, orgIDPtr, "accounts receivable", "1200")
-			revenueAccountID := findAccount(h.db, tenantID, orgIDPtr, "sales revenue", "4000")
+			// Get SO lines with cost price for stock movement JE
+			type soLineAcct struct {
+				ProductID  uuid.UUID
+				CostAmount float64
+				OutputAcct uuid.UUID
+				ValuationAcct uuid.UUID
+			}
+			var soLines []soLineAcct
+			rows, err := h.db.Query(`
+				SELECT sol.product_id, sol.quantity, COALESCE(p.cost_price, 0)
+				FROM sales_order_lines sol
+				JOIN products p ON sol.product_id = p.id
+				WHERE sol.sales_order_id = $1
+			`, orderID)
+			if err == nil {
+				type rawSOLine struct {
+					ProductID uuid.UUID
+					Qty       float64
+					CostPrice float64
+				}
+				var rawLines []rawSOLine
+				for rows.Next() {
+					var rl rawSOLine
+					if err := rows.Scan(&rl.ProductID, &rl.Qty, &rl.CostPrice); err == nil && rl.CostPrice > 0 && rl.Qty > 0 {
+						rawLines = append(rawLines, rl)
+					}
+				}
+				rows.Close()
+				// Resolve category accounts after closing rows
+				for _, rl := range rawLines {
+					ca := getCategoryAccounts(h.db, tenantID, orgIDPtr, rl.ProductID)
+					soLines = append(soLines, soLineAcct{
+						ProductID:     rl.ProductID,
+						CostAmount:    rl.Qty * rl.CostPrice,
+						OutputAcct:    ca.StockOutputAccountID,
+						ValuationAcct: ca.StockValuationAccountID,
+					})
+				}
+			}
 
-			if arAccountID != uuid.Nil && revenueAccountID != uuid.Nil {
-				// Find sales journal
+			// Group by account pair
+			type acctPair struct {
+				Debit  uuid.UUID
+				Credit uuid.UUID
+			}
+			grouped := make(map[acctPair]float64)
+			for _, sl := range soLines {
+				key := acctPair{Debit: sl.OutputAcct, Credit: sl.ValuationAcct}
+				grouped[key] += sl.CostAmount
+			}
+
+			if len(grouped) > 0 {
+				// Calculate total cost for JE header
+				var totalCost float64
+				for _, amt := range grouped {
+					totalCost += amt
+				}
+
+				// Find stock journal or general
 				var journalID uuid.UUID
 				var nextNumber int
 				err := h.db.QueryRow(`
@@ -1097,43 +1151,56 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 					if soCustomerName.Valid {
 						customerName = soCustomerName.String
 					}
-					description := fmt.Sprintf("Sales Order %s shipped - %s", soNumber, customerName)
+					description := fmt.Sprintf("Goods Delivery %s - %s", soNumber, customerName)
+
+					var contactID *uuid.UUID
+					if soCustomerID.Valid {
+						parsed, _ := uuid.Parse(soCustomerID.String)
+						if parsed != uuid.Nil {
+							contactID = &parsed
+						}
+					}
 
 					h.db.Exec(`
 						INSERT INTO journal_entries (
 							id, tenant_id, organization_id, journal_id, entry_number,
-							entry_date, description, status, total_debit, total_credit,
+							entry_date, description, source_type, source_id, status, total_debit, total_credit,
 							created_at, updated_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'sales_order', $8, 'posted', $9, $9, $10, $10)
 					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
-						now, description, soTotal, now)
+						now, description, orderID.String(), totalCost, now)
 
-					// Debit: Accounts Receivable
-					debitLineID := uuid.New()
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
-					`, debitLineID, entryID, arAccountID, description, soTotal, now)
+					lineNumber := 1
+					for pair, amount := range grouped {
+						// Debit: Stock Interim Delivery
+						debitLineID := uuid.New()
+						h.db.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, account_id, contact_id, description,
+								debit_amount, credit_amount, line_number, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
+						`, debitLineID, entryID, pair.Debit, contactID, "Stock Interim Delivery", amount, lineNumber, now)
+						lineNumber++
 
-					// Credit: Sales Revenue
-					creditLineID := uuid.New()
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
-					`, creditLineID, entryID, revenueAccountID, description, soTotal, now)
+						// Credit: Stock Valuation
+						creditLineID := uuid.New()
+						h.db.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, account_id, contact_id, description,
+								debit_amount, credit_amount, line_number, created_at
+							) VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)
+						`, creditLineID, entryID, pair.Credit, contactID, "Stock Valuation", amount, lineNumber, now)
+						lineNumber++
 
-					// Update account balances (AR is debit-normal: +debit; Revenue is credit-normal: -credit)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, soTotal, now, arAccountID)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, soTotal, now, revenueAccountID)
+						// Update account balances
+						h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Debit)
+						h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Credit)
+					}
 
 					// Update journal next_number
 					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
 
-					h.log.Info("Journal entry created for SO shipped", "entry_id", entryID, "amount", soTotal)
+					h.log.Info("Stock movement JE created for SO shipped (Odoo-style)", "entry_id", entryID, "cost", totalCost)
 				}
 			}
 		}
