@@ -21,69 +21,8 @@ const (
 	WorkOrderStatusCancelled  WorkOrderStatus = "cancelled"
 )
 
-// =====================================================
-// WORK ORDER
-// =====================================================
-
-// WorkOrder represents an individual work order for an operation in a manufacturing order
-type WorkOrder struct {
-	ID               uuid.UUID       `json:"id" db:"id"`
-	TenantID         uuid.UUID       `json:"tenant_id" db:"tenant_id"`
-	OrganizationID   *uuid.UUID      `json:"organization_id,omitempty" db:"organization_id"`
-	ProductionOrderID uuid.UUID      `json:"production_order_id" db:"production_order_id"`
-
-	// Work Order Info
-	WorkOrderNumber string `json:"work_order_number" db:"work_order_number"`
-	Name            string `json:"name" db:"name"`
-	Sequence        int    `json:"sequence" db:"sequence"`
-
-	// Operation details
-	BOMOperationID *uuid.UUID `json:"bom_operation_id,omitempty" db:"bom_operation_id"`
-	OperationName  string     `json:"operation_name,omitempty" db:"operation_name"`
-
-	// Work Center
-	WorkCenterID   *uuid.UUID `json:"work_center_id,omitempty" db:"work_center_id"`
-	WorkCenterName string     `json:"work_center_name,omitempty" db:"work_center_name"`
-
-	// Quantity
-	QuantityToProduce float64 `json:"quantity_to_produce" db:"quantity_to_produce"`
-	QuantityProduced  float64 `json:"quantity_produced" db:"quantity_produced"`
-
-	// Time tracking
-	ExpectedDurationMinutes int `json:"expected_duration_minutes" db:"expected_duration_minutes"`
-	SetupTimeMinutes        int `json:"setup_time_minutes" db:"setup_time_minutes"`
-	ActualDurationMinutes   int `json:"actual_duration_minutes" db:"actual_duration_minutes"`
-
-	// Dates
-	ScheduledStart *time.Time `json:"scheduled_start,omitempty" db:"scheduled_start"`
-	ScheduledEnd   *time.Time `json:"scheduled_end,omitempty" db:"scheduled_end"`
-	ActualStart    *time.Time `json:"actual_start,omitempty" db:"actual_start"`
-	ActualEnd      *time.Time `json:"actual_end,omitempty" db:"actual_end"`
-
-	// Status
-	Status WorkOrderStatus `json:"status" db:"status"`
-
-	// Operator
-	OperatorID   *uuid.UUID `json:"operator_id,omitempty" db:"operator_id"`
-	OperatorName string     `json:"operator_name,omitempty" db:"operator_name"`
-
-	// Quality
-	QualityCheckRequired bool  `json:"quality_check_required" db:"quality_check_required"`
-	QualityCheckPassed   *bool `json:"quality_check_passed,omitempty" db:"quality_check_passed"`
-
-	// Notes
-	Instructions *string `json:"instructions,omitempty" db:"instructions"`
-	Notes        *string `json:"notes,omitempty" db:"notes"`
-
-	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at" db:"updated_at"`
-	DeletedAt *time.Time `json:"-" db:"deleted_at"`
-
-	// Relationships for display
-	ProductionOrderNumber string `json:"production_order_number,omitempty"`
-	ProductName           string `json:"product_name,omitempty"`
-}
+// NOTE: WorkOrder struct is defined in manufacturing.go (old schema from migration 010)
+// This file contains supplementary types for the work_orders handler
 
 // WorkOrderTimeLog tracks time spent on work orders
 type WorkOrderTimeLog struct {
@@ -364,4 +303,40 @@ type ManufacturingTransferLineResponse struct {
 	SerialNumber            *string    `json:"serial_number,omitempty"`
 	SourceLocationName      string     `json:"source_location_name,omitempty"`
 	DestinationLocationName string     `json:"destination_location_name,omitempty"`
+}
+
+// =====================================================
+// LEGACY INPUT/FILTER TYPES (for manufacturing.go compatibility)
+// =====================================================
+
+// WorkOrderInput for creating work orders (legacy API)
+type WorkOrderInput struct {
+	ProductionOrderID  uuid.UUID  `json:"production_order_id" binding:"required"`
+	Name               *string    `json:"name,omitempty"`
+	Sequence           *int       `json:"sequence,omitempty"`
+	OperationID        *uuid.UUID `json:"operation_id,omitempty"`
+	WorkCenterID       *uuid.UUID `json:"work_center_id,omitempty"`
+	QuantityToProduce  float64    `json:"quantity_to_produce" binding:"required,gt=0"`
+	UOM                string     `json:"uom" binding:"required"`
+	PlannedDurationHrs *float64   `json:"planned_duration_hours,omitempty"`
+	SetupTimeHrs       *float64   `json:"setup_time_hours,omitempty"`
+	ScheduledStart     *string    `json:"scheduled_start,omitempty"`
+	ScheduledEnd       *string    `json:"scheduled_end,omitempty"`
+	AssignedTo         *uuid.UUID `json:"assigned_to,omitempty"`
+	Instructions       *string    `json:"instructions,omitempty"`
+	Notes              *string    `json:"notes,omitempty"`
+}
+
+// WorkOrderFilter for filtering work orders
+type WorkOrderFilter struct {
+	ProductionOrderID *uuid.UUID `form:"production_order_id"`
+	WorkCenterID      *uuid.UUID `form:"work_center_id"`
+	Status            *string    `form:"status"`
+	AssignedTo        *uuid.UUID `form:"assigned_to"`
+	DateFrom          *string    `form:"date_from"`
+	DateTo            *string    `form:"date_to"`
+	Page              int        `form:"page"`
+	Limit             int        `form:"limit"`
+	SortBy            string     `form:"sort_by"`
+	SortOrder         string     `form:"sort_order"`
 }
