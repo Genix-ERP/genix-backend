@@ -177,37 +177,20 @@ CREATE INDEX IF NOT EXISTS idx_mfg_transfer_lines_transfer ON manufacturing_tran
 CREATE INDEX IF NOT EXISTS idx_mfg_transfer_lines_product ON manufacturing_transfer_lines(product_id);
 
 -- =====================================================
--- 5. WORK ORDER TIME LOGS
+-- 5. WORK ORDER TIME LOGS ENHANCEMENTS
 -- =====================================================
+-- Note: work_order_time_logs table is created in migration 010
+-- Here we add additional columns needed for the new schema
 
-CREATE TABLE IF NOT EXISTS work_order_time_logs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    work_order_id UUID NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+-- Add missing columns to existing work_order_time_logs table
+ALTER TABLE work_order_time_logs ADD COLUMN IF NOT EXISTS duration_minutes INTEGER;
+ALTER TABLE work_order_time_logs ADD COLUMN IF NOT EXISTS quantity_produced DECIMAL(15,4) DEFAULT 0;
+ALTER TABLE work_order_time_logs ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE work_order_time_logs ADD COLUMN IF NOT EXISTS user_name VARCHAR(255);
+ALTER TABLE work_order_time_logs ADD COLUMN IF NOT EXISTS scrap_quantity DECIMAL(15,4) DEFAULT 0;
+ALTER TABLE work_order_time_logs ADD COLUMN IF NOT EXISTS scrap_reason TEXT;
 
-    -- Time tracking
-    start_time TIMESTAMP WITH TIME ZONE NOT NULL,
-    end_time TIMESTAMP WITH TIME ZONE,
-    duration_minutes INTEGER,
-
-    -- What was done
-    log_type VARCHAR(30) NOT NULL DEFAULT 'production', -- 'setup', 'production', 'pause', 'cleanup'
-    quantity_produced DECIMAL(15,4) DEFAULT 0,
-
-    -- Who
-    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    user_name VARCHAR(255),
-
-    -- Quality issues
-    scrap_quantity DECIMAL(15,4) DEFAULT 0,
-    scrap_reason TEXT,
-
-    notes TEXT,
-
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_wo_time_logs_work_order ON work_order_time_logs(work_order_id);
+-- Create index on user_id if it exists now
 CREATE INDEX IF NOT EXISTS idx_wo_time_logs_user ON work_order_time_logs(user_id);
 
 COMMENT ON TABLE work_order_time_logs IS 'Time tracking for work orders (start/stop/pause)';
