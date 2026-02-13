@@ -671,15 +671,58 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
 
 	if err == nil {
-		// Get account IDs — lookup by name first, then code fallback
-		inventoryAccountID := findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
-		if inventoryAccountID == uuid.Nil {
-			inventoryAccountID = findAccount(tx, tenantID, organizationID, "inventory", "5000")
-		}
+		// Odoo-style: Debit Stock Interim Receipt (per category), Credit AP
 		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
 		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
 
-		if apAccountID != uuid.Nil && inventoryAccountID != uuid.Nil {
+		// Get invoice lines for per-category accounting
+		type billLineAcct struct {
+			ProductID uuid.UUID
+			LineTotal float64
+			InputAcct uuid.UUID
+		}
+		var billLines []billLineAcct
+		lineRows, lineErr := tx.Query(`
+			SELECT product_id, COALESCE(line_total, 0)
+			FROM purchase_invoice_lines
+			WHERE purchase_invoice_id = $1 AND product_id IS NOT NULL
+		`, invoiceID)
+		if lineErr == nil {
+			for lineRows.Next() {
+				var bl billLineAcct
+				if err := lineRows.Scan(&bl.ProductID, &bl.LineTotal); err == nil && bl.LineTotal > 0 {
+					billLines = append(billLines, bl)
+				}
+			}
+			lineRows.Close()
+			// Resolve category accounts after closing rows
+			for i := range billLines {
+				ca := getCategoryAccounts(tx, tenantID, organizationID, billLines[i].ProductID)
+				billLines[i].InputAcct = ca.StockInputAccountID
+			}
+		}
+
+		// Group by stock input account
+		inputGrouped := make(map[uuid.UUID]float64)
+		for _, bl := range billLines {
+			inputGrouped[bl.InputAcct] += bl.LineTotal
+		}
+
+		// Fallback if no lines found
+		if len(inputGrouped) == 0 && subtotal > 0 {
+			fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "2200")
+			if fallbackInput == uuid.Nil {
+				fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
+				if fallbackInput == uuid.Nil {
+					fallbackInput = findAccount(tx, tenantID, organizationID, "inventory", "1300")
+				}
+			}
+			if fallbackInput != uuid.Nil {
+				inputGrouped[fallbackInput] = subtotal
+			}
+		}
+
+		if apAccountID != uuid.Nil && len(inputGrouped) > 0 {
 			prefix := ""
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
@@ -705,17 +748,20 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 			} else {
 				lineNumber := 1
 
-				// Debit Inventory/COGS
-				invLineID := uuid.New()
-				tx.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, contact_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-					invLineID, journalEntryID, lineNumber, inventoryAccountID, vendorID, "Inventory/COGS",
-					subtotal, 0.0, 1.0, now,
-				)
-				lineNumber++
+				// Debit: Stock Interim Receipt (per category) — clears the interim from goods receipt
+				for inputAcct, amount := range inputGrouped {
+					lineID := uuid.New()
+					tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, contact_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						lineID, journalEntryID, lineNumber, inputAcct, vendorID, "Stock Interim Receipt",
+						amount, 0.0, 1.0, now,
+					)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct)
+					lineNumber++
+				}
 
 				// Debit Tax (if applicable)
 				if taxAccountID != uuid.Nil && taxAmount > 0 {
@@ -728,10 +774,11 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 						taxLineID, journalEntryID, lineNumber, taxAccountID, "Input Tax",
 						taxAmount, 0.0, 1.0, now,
 					)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
 					lineNumber++
 				}
 
-				// Credit AP
+				// Credit: Accounts Payable (total amount)
 				apLineID := uuid.New()
 				tx.Exec(`
 					INSERT INTO journal_entry_lines (
@@ -741,23 +788,17 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 					apLineID, journalEntryID, lineNumber, apAccountID, vendorID, "Accounts Payable",
 					0.0, totalAmount, 1.0, now,
 				)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
 
 				// Update journal next number
 				tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", purchaseJournalID)
-
-				// Update account balances
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", subtotal, now, inventoryAccountID)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
-				if taxAccountID != uuid.Nil && taxAmount > 0 {
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
-				}
 
 				// Link journal entry to invoice
 				tx.Exec("UPDATE purchase_invoices SET journal_entry_id = $1 WHERE id = $2", journalEntryID, invoiceID)
 			}
 		} else {
-			h.log.Warn("Could not create journal entry: missing Inventory or Accounts Payable account",
-				"has_inventory", inventoryAccountID != uuid.Nil, "has_ap", apAccountID != uuid.Nil)
+			h.log.Warn("Could not create journal entry: missing AP or input accounts",
+				"has_ap", apAccountID != uuid.Nil, "input_groups", len(inputGrouped))
 		}
 	}
 

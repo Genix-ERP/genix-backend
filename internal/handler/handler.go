@@ -820,6 +820,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	accounts.Use(middleware.RequirePermission("finance", "account", "read"))
 	{
 		accounts.GET("", h.ListAccounts)
+		accounts.GET("/next-code", h.GetNextAccountCode)
 		accounts.POST("", middleware.RequirePermission("finance", "account", "create"), h.CreateAccount)
 		accounts.GET("/:id", h.GetAccount)
 		accounts.PUT("/:id", middleware.RequirePermission("finance", "account", "update"), h.UpdateAccount)
