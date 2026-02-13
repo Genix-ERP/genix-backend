@@ -1876,6 +1876,402 @@ func (h *Handler) DeleteBOMLine(c *gin.Context) {
 }
 
 // =====================================================
+// BOM OPERATIONS HANDLERS
+// =====================================================
+
+// ListBOMOperations returns all operations for a BOM
+func (h *Handler) ListBOMOperations(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	bomID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid BOM ID")
+		return
+	}
+
+	// Verify BOM exists and belongs to tenant
+	var bomTenantID uuid.UUID
+	err = h.db.QueryRow("SELECT tenant_id FROM product_boms WHERE id = $1 AND deleted_at IS NULL", bomID).Scan(&bomTenantID)
+	if err != nil {
+		response.NotFound(c, "BOM")
+		return
+	}
+	if bomTenantID != tenantID {
+		response.Forbidden(c, "Access denied")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT o.id, o.bom_id, o.sequence, o.operation_name, o.work_center, o.work_center_id,
+			   o.setup_time_minutes, o.run_time_minutes, o.labor_cost, o.overhead_cost, o.notes,
+			   o.created_at, o.updated_at,
+			   wc.name as work_center_name, wc.hourly_cost as work_center_hourly_cost
+		FROM bom_operations o
+		LEFT JOIN work_centers wc ON o.work_center_id = wc.id
+		WHERE o.bom_id = $1
+		ORDER BY o.sequence
+	`, bomID)
+	if err != nil {
+		h.log.Error("Failed to list BOM operations", "error", err)
+		response.InternalError(c, "Failed to list BOM operations")
+		return
+	}
+	defer rows.Close()
+
+	type BOMOperation struct {
+		ID                   uuid.UUID  `json:"id"`
+		BOMID                uuid.UUID  `json:"bom_id"`
+		Sequence             int        `json:"sequence"`
+		OperationName        string     `json:"operation_name"`
+		WorkCenter           *string    `json:"work_center"`
+		WorkCenterID         *uuid.UUID `json:"work_center_id"`
+		SetupTimeMinutes     float64    `json:"setup_time_minutes"`
+		RunTimeMinutes       float64    `json:"run_time_minutes"`
+		LaborCost            float64    `json:"labor_cost"`
+		OverheadCost         float64    `json:"overhead_cost"`
+		Notes                *string    `json:"notes"`
+		CreatedAt            time.Time  `json:"created_at"`
+		UpdatedAt            time.Time  `json:"updated_at"`
+		WorkCenterName       *string    `json:"work_center_name,omitempty"`
+		WorkCenterHourlyCost *float64   `json:"work_center_hourly_cost,omitempty"`
+	}
+
+	operations := make([]BOMOperation, 0)
+	for rows.Next() {
+		var op BOMOperation
+		var workCenter, notes, wcName sql.NullString
+		var wcID uuid.NullUUID
+		var wcHourlyCost sql.NullFloat64
+
+		err := rows.Scan(
+			&op.ID, &op.BOMID, &op.Sequence, &op.OperationName, &workCenter, &wcID,
+			&op.SetupTimeMinutes, &op.RunTimeMinutes, &op.LaborCost, &op.OverheadCost, &notes,
+			&op.CreatedAt, &op.UpdatedAt, &wcName, &wcHourlyCost,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan BOM operation", "error", err)
+			continue
+		}
+
+		if workCenter.Valid {
+			op.WorkCenter = &workCenter.String
+		}
+		if wcID.Valid {
+			op.WorkCenterID = &wcID.UUID
+		}
+		if notes.Valid {
+			op.Notes = &notes.String
+		}
+		if wcName.Valid {
+			op.WorkCenterName = &wcName.String
+		}
+		if wcHourlyCost.Valid {
+			op.WorkCenterHourlyCost = &wcHourlyCost.Float64
+		}
+
+		operations = append(operations, op)
+	}
+
+	response.Success(c, operations)
+}
+
+// CreateBOMOperation adds an operation to a BOM
+func (h *Handler) CreateBOMOperation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	bomID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid BOM ID")
+		return
+	}
+
+	// Verify BOM exists and belongs to tenant
+	var bomTenantID uuid.UUID
+	err = h.db.QueryRow("SELECT tenant_id FROM product_boms WHERE id = $1 AND deleted_at IS NULL", bomID).Scan(&bomTenantID)
+	if err != nil {
+		response.NotFound(c, "BOM")
+		return
+	}
+	if bomTenantID != tenantID {
+		response.Forbidden(c, "Access denied")
+		return
+	}
+
+	var input struct {
+		Sequence         int     `json:"sequence"`
+		OperationName    string  `json:"operation_name" binding:"required"`
+		WorkCenter       string  `json:"work_center"`
+		WorkCenterID     string  `json:"work_center_id"`
+		SetupTimeMinutes float64 `json:"setup_time_minutes"`
+		RunTimeMinutes   float64 `json:"run_time_minutes"`
+		LaborCost        float64 `json:"labor_cost"`
+		OverheadCost     float64 `json:"overhead_cost"`
+		Notes            string  `json:"notes"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Get next sequence if not provided
+	if input.Sequence == 0 {
+		var maxSequence int
+		h.db.QueryRow("SELECT COALESCE(MAX(sequence), 0) FROM bom_operations WHERE bom_id = $1", bomID).Scan(&maxSequence)
+		input.Sequence = maxSequence + 10
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	var workCenterID *uuid.UUID
+	if input.WorkCenterID != "" {
+		wcID, err := uuid.Parse(input.WorkCenterID)
+		if err == nil {
+			// Verify work center exists and belongs to tenant
+			var wcExists bool
+			h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM work_centers WHERE id = $1 AND tenant_id = $2)",
+				wcID, tenantID).Scan(&wcExists)
+			if wcExists {
+				workCenterID = &wcID
+			}
+		}
+	}
+
+	var workCenter, notes *string
+	if input.WorkCenter != "" {
+		workCenter = &input.WorkCenter
+	}
+	if input.Notes != "" {
+		notes = &input.Notes
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO bom_operations (
+			id, bom_id, sequence, operation_name, work_center, work_center_id,
+			setup_time_minutes, run_time_minutes, labor_cost, overhead_cost, notes,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
+	`, id, bomID, input.Sequence, input.OperationName, workCenter, workCenterID,
+		input.SetupTimeMinutes, input.RunTimeMinutes, input.LaborCost, input.OverheadCost, notes, now)
+
+	if err != nil {
+		h.log.Error("Failed to create BOM operation", "error", err)
+		response.InternalError(c, "Failed to create BOM operation")
+		return
+	}
+
+	// Update BOM timestamp
+	h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", now, bomID)
+
+	response.Created(c, gin.H{
+		"id":       id,
+		"sequence": input.Sequence,
+		"message":  "BOM operation created successfully",
+	})
+}
+
+// UpdateBOMOperation updates an operation in a BOM
+func (h *Handler) UpdateBOMOperation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	bomID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid BOM ID")
+		return
+	}
+
+	operationID, err := uuid.Parse(c.Param("operationId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid operation ID")
+		return
+	}
+
+	// Verify BOM exists and belongs to tenant
+	var bomTenantID uuid.UUID
+	err = h.db.QueryRow("SELECT tenant_id FROM product_boms WHERE id = $1 AND deleted_at IS NULL", bomID).Scan(&bomTenantID)
+	if err != nil {
+		response.NotFound(c, "BOM")
+		return
+	}
+	if bomTenantID != tenantID {
+		response.Forbidden(c, "Access denied")
+		return
+	}
+
+	var input struct {
+		Sequence         *int     `json:"sequence"`
+		OperationName    *string  `json:"operation_name"`
+		WorkCenter       *string  `json:"work_center"`
+		WorkCenterID     *string  `json:"work_center_id"`
+		SetupTimeMinutes *float64 `json:"setup_time_minutes"`
+		RunTimeMinutes   *float64 `json:"run_time_minutes"`
+		LaborCost        *float64 `json:"labor_cost"`
+		OverheadCost     *float64 `json:"overhead_cost"`
+		Notes            *string  `json:"notes"`
+	}
+
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Build dynamic update query
+	updates := []string{}
+	args := []interface{}{}
+	argIndex := 1
+
+	if input.Sequence != nil {
+		updates = append(updates, fmt.Sprintf("sequence = $%d", argIndex))
+		args = append(args, *input.Sequence)
+		argIndex++
+	}
+	if input.OperationName != nil {
+		updates = append(updates, fmt.Sprintf("operation_name = $%d", argIndex))
+		args = append(args, *input.OperationName)
+		argIndex++
+	}
+	if input.WorkCenter != nil {
+		updates = append(updates, fmt.Sprintf("work_center = $%d", argIndex))
+		args = append(args, *input.WorkCenter)
+		argIndex++
+	}
+	if input.WorkCenterID != nil {
+		if *input.WorkCenterID == "" {
+			updates = append(updates, fmt.Sprintf("work_center_id = $%d", argIndex))
+			args = append(args, nil)
+		} else {
+			wcID, err := uuid.Parse(*input.WorkCenterID)
+			if err == nil {
+				updates = append(updates, fmt.Sprintf("work_center_id = $%d", argIndex))
+				args = append(args, wcID)
+			}
+		}
+		argIndex++
+	}
+	if input.SetupTimeMinutes != nil {
+		updates = append(updates, fmt.Sprintf("setup_time_minutes = $%d", argIndex))
+		args = append(args, *input.SetupTimeMinutes)
+		argIndex++
+	}
+	if input.RunTimeMinutes != nil {
+		updates = append(updates, fmt.Sprintf("run_time_minutes = $%d", argIndex))
+		args = append(args, *input.RunTimeMinutes)
+		argIndex++
+	}
+	if input.LaborCost != nil {
+		updates = append(updates, fmt.Sprintf("labor_cost = $%d", argIndex))
+		args = append(args, *input.LaborCost)
+		argIndex++
+	}
+	if input.OverheadCost != nil {
+		updates = append(updates, fmt.Sprintf("overhead_cost = $%d", argIndex))
+		args = append(args, *input.OverheadCost)
+		argIndex++
+	}
+	if input.Notes != nil {
+		updates = append(updates, fmt.Sprintf("notes = $%d", argIndex))
+		args = append(args, *input.Notes)
+		argIndex++
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argIndex))
+	args = append(args, time.Now())
+	argIndex++
+
+	args = append(args, operationID, bomID)
+
+	query := fmt.Sprintf("UPDATE bom_operations SET %s WHERE id = $%d AND bom_id = $%d",
+		strings.Join(updates, ", "), argIndex, argIndex+1)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update BOM operation", "error", err)
+		response.InternalError(c, "Failed to update BOM operation")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "BOM operation")
+		return
+	}
+
+	// Update BOM timestamp
+	h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", time.Now(), bomID)
+
+	response.Success(c, gin.H{"message": "BOM operation updated successfully"})
+}
+
+// DeleteBOMOperation removes an operation from a BOM
+func (h *Handler) DeleteBOMOperation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	bomID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid BOM ID")
+		return
+	}
+
+	operationID, err := uuid.Parse(c.Param("operationId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid operation ID")
+		return
+	}
+
+	// Verify BOM exists and belongs to tenant
+	var bomTenantID uuid.UUID
+	err = h.db.QueryRow("SELECT tenant_id FROM product_boms WHERE id = $1 AND deleted_at IS NULL", bomID).Scan(&bomTenantID)
+	if err != nil {
+		response.NotFound(c, "BOM")
+		return
+	}
+	if bomTenantID != tenantID {
+		response.Forbidden(c, "Access denied")
+		return
+	}
+
+	result, err := h.db.Exec("DELETE FROM bom_operations WHERE id = $1 AND bom_id = $2", operationID, bomID)
+	if err != nil {
+		h.log.Error("Failed to delete BOM operation", "error", err)
+		response.InternalError(c, "Failed to delete BOM operation")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "BOM operation")
+		return
+	}
+
+	// Update BOM timestamp
+	h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", time.Now(), bomID)
+
+	response.Success(c, gin.H{"message": "BOM operation deleted successfully"})
+}
+
+// =====================================================
 // SCRAP MANAGEMENT HANDLERS
 // =====================================================
 

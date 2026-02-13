@@ -262,6 +262,7 @@ type WorkOrder struct {
 	Sequence            int        `json:"sequence" db:"sequence"`
 	OperationID         *uuid.UUID `json:"operation_id,omitempty" db:"operation_id"`
 	WorkCenterID        *uuid.UUID `json:"work_center_id,omitempty" db:"work_center_id"`
+	WorkCenterName      *string    `json:"work_center_name,omitempty" db:"-"` // Joined field
 	QuantityToProduce   float64    `json:"quantity_to_produce" db:"quantity_to_produce"`
 	QuantityProduced    float64    `json:"quantity_produced" db:"quantity_produced"`
 	QuantityScrapped    float64    `json:"quantity_scrapped" db:"quantity_scrapped"`
