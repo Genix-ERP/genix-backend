@@ -25,7 +25,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 		return
 	}
 
-	orgID := middleware.GetOrganizationID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
 
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -341,8 +341,6 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		return
 	}
 
-	userID, _ := middleware.GetUserID(c)
-
 	woID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid work order ID")
@@ -421,7 +419,7 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
-	orgID := middleware.GetOrganizationID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
 
 	var input entity.CreateWorkOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -625,7 +623,7 @@ func (h *Handler) ListManufacturingTransfers(c *gin.Context) {
 		return
 	}
 
-	orgID := middleware.GetOrganizationID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
 
 	productionOrderID := c.Query("production_order_id")
 	transferType := c.Query("transfer_type")
