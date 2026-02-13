@@ -1670,23 +1670,23 @@ func (h *Handler) CreateIntercompanyRule(c *gin.Context) {
 
 	var input entity.CreateIntercompanyRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input", err.Error())
+		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
 	}
 
 	// Validate organizations exist and are different
 	sourceOrgID, err := uuid.Parse(input.SourceOrganizationID)
 	if err != nil {
-		response.BadRequest(c, "Invalid source organization ID", "")
+		response.BadRequest(c, "Invalid source organization ID")
 		return
 	}
 	targetOrgID, err := uuid.Parse(input.TargetOrganizationID)
 	if err != nil {
-		response.BadRequest(c, "Invalid target organization ID", "")
+		response.BadRequest(c, "Invalid target organization ID")
 		return
 	}
 	if sourceOrgID == targetOrgID {
-		response.BadRequest(c, "Source and target organizations must be different", "")
+		response.BadRequest(c, "Source and target organizations must be different")
 		return
 	}
 
@@ -1695,7 +1695,7 @@ func (h *Handler) CreateIntercompanyRule(c *gin.Context) {
 	checkQuery := `SELECT id FROM intercompany_rules WHERE tenant_id = $1 AND source_organization_id = $2 AND target_organization_id = $3 AND rule_type = $4`
 	h.db.QueryRow(checkQuery, tenantID, sourceOrgID, targetOrgID, input.RuleType).Scan(&existingID)
 	if existingID != "" {
-		response.BadRequest(c, "Rule already exists for this source-target-type combination", "")
+		response.BadRequest(c, "Rule already exists for this source-target-type combination")
 		return
 	}
 
@@ -1754,7 +1754,7 @@ func (h *Handler) GetIntercompanyRule(c *gin.Context) {
 
 	ruleID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid rule ID", "")
+		response.BadRequest(c, "Invalid rule ID")
 		return
 	}
 
@@ -1815,13 +1815,13 @@ func (h *Handler) UpdateIntercompanyRule(c *gin.Context) {
 
 	ruleID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid rule ID", "")
+		response.BadRequest(c, "Invalid rule ID")
 		return
 	}
 
 	var input entity.UpdateIntercompanyRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input", err.Error())
+		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
 	}
 
@@ -1872,7 +1872,7 @@ func (h *Handler) UpdateIntercompanyRule(c *gin.Context) {
 	}
 
 	if len(updates) == 0 {
-		response.BadRequest(c, "No fields to update", "")
+		response.BadRequest(c, "No fields to update")
 		return
 	}
 
@@ -1905,7 +1905,7 @@ func (h *Handler) DeleteIntercompanyRule(c *gin.Context) {
 
 	ruleID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
-		response.BadRequest(c, "Invalid rule ID", "")
+		response.BadRequest(c, "Invalid rule ID")
 		return
 	}
 
