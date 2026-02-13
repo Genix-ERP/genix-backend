@@ -551,3 +551,51 @@ func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike str
 	).Scan(&id)
 	return id
 }
+
+// CategoryAccounts holds the GL accounts configured on a product category (Odoo-style).
+type CategoryAccounts struct {
+	IncomeAccountID         uuid.UUID
+	ExpenseAccountID        uuid.UUID
+	StockValuationAccountID uuid.UUID
+	StockInputAccountID     uuid.UUID
+	StockOutputAccountID    uuid.UUID
+}
+
+// getCategoryAccounts returns GL accounts for a product's category.
+// Falls back to findAccount() defaults if category accounts are not configured.
+func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, productID uuid.UUID) CategoryAccounts {
+	var ca CategoryAccounts
+	// Query: product → category → category's account fields
+	_ = q.QueryRow(`
+		SELECT COALESCE(pc.income_account_id, '00000000-0000-0000-0000-000000000000'),
+		       COALESCE(pc.expense_account_id, '00000000-0000-0000-0000-000000000000'),
+		       COALESCE(pc.stock_valuation_account_id, '00000000-0000-0000-0000-000000000000'),
+		       COALESCE(pc.stock_input_account_id, '00000000-0000-0000-0000-000000000000'),
+		       COALESCE(pc.stock_output_account_id, '00000000-0000-0000-0000-000000000000')
+		FROM products p
+		JOIN product_categories pc ON p.category_id = pc.id
+		WHERE p.id = $1
+	`, productID).Scan(&ca.IncomeAccountID, &ca.ExpenseAccountID,
+		&ca.StockValuationAccountID, &ca.StockInputAccountID, &ca.StockOutputAccountID)
+
+	// Fallbacks if category accounts not set
+	if ca.IncomeAccountID == uuid.Nil {
+		ca.IncomeAccountID = findAccount(q, tenantID, orgID, "sales revenue", "4000")
+	}
+	if ca.ExpenseAccountID == uuid.Nil {
+		ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cost of goods", "5000")
+		if ca.ExpenseAccountID == uuid.Nil {
+			ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cogs", "5000")
+		}
+	}
+	if ca.StockValuationAccountID == uuid.Nil {
+		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1300")
+	}
+	if ca.StockInputAccountID == uuid.Nil {
+		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2200")
+	}
+	if ca.StockOutputAccountID == uuid.Nil {
+		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2201")
+	}
+	return ca
+}
