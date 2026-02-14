@@ -4568,7 +4568,9 @@ func (h *Handler) ListBankReconciliations(c *gin.Context) {
 // @Tags Finance - Bank Reconciliations
 // @Accept json
 // @Produce json
-// @Param body body entity.CreateBankReconciliationInput true "Reconciliation creation data"
+// @Param statement_date body string true "Statement date"
+// @Param statement_ending_balance body number true "Statement ending balance"
+// @Param notes body string false "Notes"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 500 {object} response.Response
