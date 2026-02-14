@@ -304,11 +304,15 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		customFields = []byte("{}")
 	}
 
-	// Get organization ID from context
+	// Get organization ID from context and validate it exists
 	orgID, _ := middleware.GetOrganizationID(c)
 	var orgIDPtr *uuid.UUID
 	if orgID != uuid.Nil {
-		orgIDPtr = &orgID
+		var exists bool
+		_ = h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND tenant_id = $2)`, orgID, tenantID).Scan(&exists)
+		if exists {
+			orgIDPtr = &orgID
+		}
 	}
 
 	query := `
