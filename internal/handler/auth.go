@@ -1,9 +1,13 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -12,6 +16,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"google.golang.org/api/idtoken"
 )
 
 // LoginInput represents login request
@@ -52,16 +57,102 @@ type VerifyEmailInput struct {
 	Token string `json:"token" binding:"required"`
 }
 
+// SendInviteInput represents send invitation request
+type SendInviteInput struct {
+	UserID string `json:"user_id" binding:"required,uuid"`
+}
+
+// AcceptInviteInput represents accept invitation request
+type AcceptInviteInput struct {
+	Token    string `json:"token" binding:"required"`
+	Password string `json:"password" binding:"required,min=8"`
+}
+
+// ValidateInviteResponse represents the response when validating an invite token
+type ValidateInviteResponse struct {
+	Valid      bool   `json:"valid"`
+	Email      string `json:"email,omitempty"`
+	FirstName  string `json:"first_name,omitempty"`
+	LastName   string `json:"last_name,omitempty"`
+	TenantName string `json:"tenant_name,omitempty"`
+	ExpiresAt  string `json:"expires_at,omitempty"`
+}
+
+// SendOTPInput represents OTP request
+type SendOTPInput struct {
+	Email    string `json:"email" binding:"required,email"`
+	Purpose  string `json:"purpose" binding:"required"` // registration, password_reset
+	Language string `json:"language"`                   // en, uz, ru - defaults to uz
+}
+
+// VerifyOTPInput represents OTP verification request
+type VerifyOTPInput struct {
+	Email   string `json:"email" binding:"required,email"`
+	OTPCode string `json:"otp_code" binding:"required,len=6"`
+	Purpose string `json:"purpose" binding:"required"`
+}
+
+// RegisterWithOTPInput represents registration with OTP verification
+type RegisterWithOTPInput struct {
+	TenantCode string `json:"tenant_code" binding:"required,min=2,max=50"`
+	TenantName string `json:"tenant_name" binding:"required,min=2,max=255"`
+	Email      string `json:"email" binding:"required,email"`
+	Password   string `json:"password" binding:"required,min=8"`
+	FirstName  string `json:"first_name" binding:"required,min=1,max=100"`
+	LastName   string `json:"last_name" binding:"required,min=1,max=100"`
+	OTPCode    string `json:"otp_code" binding:"required,len=6"`
+}
+
+// GoogleAuthInput represents Google authentication request
+type GoogleAuthInput struct {
+	Credential  string `json:"credential" binding:"required"`
+	TenantID    string `json:"tenant_id,omitempty"`
+	CompanyName string `json:"company_name,omitempty"`
+}
+
+// GoogleAuthNeedsCompletionResponse returned when a new Google user needs to provide company name
+type GoogleAuthNeedsCompletionResponse struct {
+	NeedsCompletion bool              `json:"needs_completion"`
+	GoogleUser      GoogleUserPreview `json:"google_user"`
+}
+
+// GoogleUserPreview holds Google profile info for the completion step
+type GoogleUserPreview struct {
+	Email     string `json:"email"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+	Picture   string `json:"picture,omitempty"`
+}
+
+// TenantInfo represents basic tenant information
+type TenantInfo struct {
+	ID   uuid.UUID `json:"id"`
+	Code string    `json:"code"`
+	Name string    `json:"name"`
+}
+
 // AuthResponse represents authentication response
 type AuthResponse struct {
-	User        *entity.UserResponse `json:"user"`
-	AccessToken string               `json:"access_token"`
-	RefreshToken string              `json:"refresh_token"`
-	ExpiresAt   time.Time            `json:"expires_at"`
-	TokenType   string               `json:"token_type"`
+	User         *entity.UserResponse `json:"user"`
+	Tenant       *TenantInfo          `json:"tenant,omitempty"`
+	AccessToken  string               `json:"access_token"`
+	RefreshToken string               `json:"refresh_token"`
+	ExpiresAt    time.Time            `json:"expires_at"`
+	TokenType    string               `json:"token_type"`
 }
 
 // Register handles user registration
+// Register godoc
+// @Summary Register new user and tenant
+// @Description Create a new tenant and admin user account
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param register body RegisterInput true "Registration details"
+// @Success 201 {object} response.AuthResponse "Successfully registered"
+// @Failure 400 {object} response.ErrorResponse "Invalid input or user already exists"
+// @Failure 500 {object} response.ErrorResponse "Internal server error"
+// @Router /auth/register [post]
 func (h *Handler) Register(c *gin.Context) {
 	var input RegisterInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -77,6 +168,19 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
+
+	// Check if email already exists globally (across all tenants)
+	var existingUserID uuid.UUID
+	err = tx.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
+	if err == nil {
+		response.Conflict(c, "Email already registered. Please use a different email or login to your existing account.")
+		return
+	}
+	if err != sql.ErrNoRows {
+		h.log.Error("Failed to check email", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
 
 	// Check if tenant code exists
 	var existingTenantID uuid.UUID
@@ -120,27 +224,14 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	// Check if email exists within tenant
-	var existingUserID uuid.UUID
-	err = tx.QueryRow("SELECT id FROM users WHERE tenant_id = $1 AND email = $2", tenantID, input.Email).Scan(&existingUserID)
-	if err == nil {
-		response.Conflict(c, "Email already exists")
-		return
-	}
-	if err != sql.ErrNoRows {
-		h.log.Error("Failed to check user", "error", err)
-		response.InternalServerError(c, "")
-		return
-	}
-
-	// Create user
+	// Create user (email uniqueness already checked globally above)
 	userID := uuid.New()
 	now := time.Now()
 	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
 
 	_, err = tx.Exec(`
 		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, true, $8, $8)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, false, $8, $8)
 	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
@@ -148,11 +239,11 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	// Create default admin role
+	// Create owner role for tenant owner
 	roleID := uuid.New()
 	_, err = tx.Exec(`
 		INSERT INTO roles (id, tenant_id, name, code, description, is_system)
-		VALUES ($1, $2, 'Administrator', 'admin', 'Full system access', true)
+		VALUES ($1, $2, 'Owner', 'owner', 'Tenant owner with full access', true)
 	`, roleID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to create role", "error", err)
@@ -171,6 +262,30 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
+	// Create default warehouse for the tenant
+	warehouseID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouses (id, tenant_id, code, name, is_default, is_active, reception_steps, delivery_steps)
+		VALUES ($1, $2, 'WH-MAIN', 'Main Warehouse', true, true, 1, 1)
+	`, warehouseID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to create default warehouse", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create default warehouse locations (Stock, Input, Output)
+	stockLocationID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouse_locations (id, warehouse_id, code, name, type, is_active)
+		VALUES ($1, $2, 'STOCK', 'Stock', 'storage', true)
+	`, stockLocationID, warehouseID)
+	if err != nil {
+		h.log.Error("Failed to create stock location", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
@@ -178,30 +293,52 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	// Generate tokens
-	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, input.Email, true)
+	// Generate tokens - new tenant owners are NOT system admins
+	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, input.Email, false)
 	if err != nil {
 		h.log.Error("Failed to generate tokens", "error", err)
 		response.InternalServerError(c, "")
 		return
 	}
 
-	// Build response
+	// Build response - tenant owners are NOT system admins but have owner role
+	ownerRoleDesc := "Tenant owner with full access"
 	user := &entity.UserResponse{
-		ID:        userID,
-		Email:     input.Email,
-		FirstName: input.FirstName,
-		LastName:  input.LastName,
-		FullName:  input.FirstName + " " + input.LastName,
-		Language:  "en",
-		Timezone:  "UTC",
-		IsActive:  true,
+		ID:            userID,
+		TenantID:      tenantID,
+		Email:         input.Email,
+		FirstName:     input.FirstName,
+		LastName:      input.LastName,
+		FullName:      input.FirstName + " " + input.LastName,
+		Language:      "en",
+		Timezone:      "UTC",
+		IsActive:      true,
+		IsSystemAdmin: false,
+		Roles: []entity.Role{
+			{
+				ID:          roleID,
+				TenantID:    tenantID,
+				Name:        "Owner",
+				Code:        "owner",
+				Description: &ownerRoleDesc,
+				IsSystem:    true,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			},
+		},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
 
+	tenant := &TenantInfo{
+		ID:   tenantID,
+		Code: input.TenantCode,
+		Name: input.TenantName,
+	}
+
 	response.Created(c, AuthResponse{
 		User:         user,
+		Tenant:       tenant,
 		AccessToken:  tokenPair.AccessToken,
 		RefreshToken: tokenPair.RefreshToken,
 		ExpiresAt:    tokenPair.ExpiresAt,
@@ -210,6 +347,18 @@ func (h *Handler) Register(c *gin.Context) {
 }
 
 // Login handles user login
+// Login godoc
+// @Summary User login
+// @Description Authenticate user with email and password
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param login body LoginInput true "Login credentials"
+// @Success 200 {object} response.AuthResponse "Successfully authenticated"
+// @Failure 400 {object} response.ErrorResponse "Invalid input"
+// @Failure 401 {object} response.ErrorResponse "Invalid credentials"
+// @Failure 500 {object} response.ErrorResponse "Internal server error"
+// @Router /auth/login [post]
 func (h *Handler) Login(c *gin.Context) {
 	var input LoginInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -236,24 +385,76 @@ func (h *Handler) Login(c *gin.Context) {
 		`
 		args = []interface{}{tenantUUID, input.Email}
 	} else {
-		// Find first matching user by email
+		// Check if email exists in multiple tenants
+		var userCount int
+		err := h.db.QueryRow("SELECT COUNT(*) FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&userCount)
+		if err != nil {
+			h.log.Error("Failed to count users", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
+
+		if userCount > 1 {
+			// Multiple accounts with same email - return list of tenants for user to choose
+			rows, err := h.db.Query(`
+				SELECT t.id, t.name, t.code
+				FROM users u
+				JOIN tenants t ON u.tenant_id = t.id
+				WHERE u.email = $1 AND u.deleted_at IS NULL AND t.is_active = true
+			`, input.Email)
+			if err != nil {
+				h.log.Error("Failed to query tenants", "error", err)
+				response.InternalServerError(c, "")
+				return
+			}
+			defer rows.Close()
+
+			var tenants []map[string]interface{}
+			for rows.Next() {
+				var tenantID uuid.UUID
+				var tenantName, tenantCode string
+				if err := rows.Scan(&tenantID, &tenantName, &tenantCode); err != nil {
+					continue
+				}
+				tenants = append(tenants, map[string]interface{}{
+					"id":   tenantID,
+					"name": tenantName,
+					"code": tenantCode,
+				})
+			}
+
+			response.Error(c, http.StatusConflict, "TENANT_SELECTION_REQUIRED",
+				"This email is associated with multiple companies. Please select one.")
+			c.JSON(http.StatusConflict, gin.H{
+				"success": false,
+				"error": gin.H{
+					"code":    "TENANT_SELECTION_REQUIRED",
+					"message": "This email is associated with multiple companies. Please select one.",
+				},
+				"data": gin.H{
+					"tenants": tenants,
+				},
+			})
+			return
+		}
+
+		// Single user - proceed with login
 		query = `
 			SELECT id, tenant_id, email, password_hash, first_name, last_name,
 			       phone, avatar_url, language, timezone, is_active, is_verified,
 			       is_system_admin, failed_login_attempts, locked_until, created_at, updated_at
 			FROM users
 			WHERE email = $1 AND deleted_at IS NULL
-			LIMIT 1
 		`
 		args = []interface{}{input.Email}
 	}
 
 	var user entity.User
-	var phone, avatarURL sql.NullString
+	var phone, avatarURL, passwordHash sql.NullString
 	var lockedUntil sql.NullTime
 
 	err := h.db.QueryRow(query, args...).Scan(
-		&user.ID, &user.TenantID, &user.Email, &user.PasswordHash,
+		&user.ID, &user.TenantID, &user.Email, &passwordHash,
 		&user.FirstName, &user.LastName, &phone, &avatarURL,
 		&user.Language, &user.Timezone, &user.IsActive, &user.IsVerified,
 		&user.IsSystemAdmin, &user.FailedLoginAttempts, &lockedUntil,
@@ -270,6 +471,9 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	if passwordHash.Valid {
+		user.PasswordHash = passwordHash.String
+	}
 	if phone.Valid {
 		user.Phone = &phone.String
 	}
@@ -278,6 +482,12 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 	if lockedUntil.Valid {
 		user.LockedUntil = &lockedUntil.Time
+	}
+
+	// Check if this is a Google-only account (no password)
+	if !passwordHash.Valid || passwordHash.String == "" {
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "This account uses Google Sign-In. Please sign in with Google.")
+		return
 	}
 
 	// Check if account is locked
@@ -338,8 +548,35 @@ func (h *Handler) Login(c *gin.Context) {
 
 	user.LastLoginAt = &now
 
+	// Load user roles
+	rows, err := h.db.Query(`
+		SELECT r.id, r.name, r.code
+		FROM roles r
+		JOIN user_roles ur ON r.id = ur.role_id
+		WHERE ur.user_id = $1
+	`, user.ID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var role entity.Role
+			rows.Scan(&role.ID, &role.Name, &role.Code)
+			user.Roles = append(user.Roles, role)
+		}
+	}
+
+	// Get tenant info
+	var tenantCode, tenantName string
+	h.db.QueryRow("SELECT code, name FROM tenants WHERE id = $1", user.TenantID).Scan(&tenantCode, &tenantName)
+
+	tenant := &TenantInfo{
+		ID:   user.TenantID,
+		Code: tenantCode,
+		Name: tenantName,
+	}
+
 	response.Success(c, AuthResponse{
 		User:         user.ToResponse(),
+		Tenant:       tenant,
 		AccessToken:  tokenPair.AccessToken,
 		RefreshToken: tokenPair.RefreshToken,
 		ExpiresAt:    tokenPair.ExpiresAt,
@@ -348,6 +585,18 @@ func (h *Handler) Login(c *gin.Context) {
 }
 
 // RefreshToken handles token refresh
+// RefreshToken godoc
+// @Summary Refresh access token
+// @Description Get new access and refresh tokens using a valid refresh token
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param refresh body RefreshTokenInput true "Refresh token"
+// @Success 200 {object} response.AuthResponse "Successfully refreshed tokens"
+// @Failure 400 {object} response.ErrorResponse "Invalid input"
+// @Failure 401 {object} response.ErrorResponse "Invalid or expired refresh token"
+// @Failure 500 {object} response.ErrorResponse "Internal server error"
+// @Router /auth/refresh [post]
 func (h *Handler) RefreshToken(c *gin.Context) {
 	var input RefreshTokenInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -619,6 +868,682 @@ func (h *Handler) VerifyEmail(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Email verified successfully"})
 }
 
+// SendInvite sends an invitation to a user to set their password
+func (h *Handler) SendInvite(c *gin.Context) {
+	claims, ok := middleware.GetClaims(c)
+	if !ok {
+		response.Unauthorized(c, "")
+		return
+	}
+
+	var input SendInviteInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	userID, err := uuid.Parse(input.UserID)
+	if err != nil {
+		response.BadRequest(c, "Invalid user ID")
+		return
+	}
+
+	// Check if the target user belongs to the same tenant
+	var targetTenantID uuid.UUID
+	var email, firstName, lastName string
+	var passwordHash sql.NullString
+	err = h.db.QueryRow(`
+		SELECT tenant_id, email, first_name, last_name, password_hash
+		FROM users WHERE id = $1 AND deleted_at IS NULL
+	`, userID).Scan(&targetTenantID, &email, &firstName, &lastName, &passwordHash)
+
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "User")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to fetch user", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Ensure same tenant
+	if targetTenantID != claims.TenantID {
+		response.Forbidden(c, "Cannot invite users from other tenants")
+		return
+	}
+
+	// Check if user already has a password
+	if passwordHash.Valid && passwordHash.String != "" {
+		response.BadRequest(c, "User already has a password set")
+		return
+	}
+
+	// Generate invite token
+	inviteToken := uuid.New().String() + "-" + uuid.New().String()
+	expiresAt := time.Now().Add(48 * time.Hour) // 48 hours validity
+
+	// Update user with invite token
+	_, err = h.db.Exec(`
+		UPDATE users SET
+			invite_token = $1,
+			invite_token_expires = $2,
+			invited_by = $3,
+			invited_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $4
+	`, inviteToken, expiresAt, claims.UserID, userID)
+
+	if err != nil {
+		h.log.Error("Failed to set invite token", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Get tenant name for email
+	var tenantName string
+	h.db.QueryRow("SELECT name FROM tenants WHERE id = $1", claims.TenantID).Scan(&tenantName)
+
+	// Build invite link
+	inviteLink := h.config.App.FrontendURL + "/accept-invite?token=" + inviteToken
+
+	// Send invitation email
+	if err := h.emailService.SendInvite(email, firstName, lastName, tenantName, inviteLink); err != nil {
+		h.log.Error("Failed to send invitation email", "error", err, "email", email)
+		// Don't fail the request - the invite token is set, user can still use the link
+	}
+
+	response.Success(c, gin.H{
+		"message":     "Invitation sent successfully",
+		"invite_link": inviteLink, // For development/testing - copy to clipboard
+		"expires_at":  expiresAt,
+		"user": gin.H{
+			"id":         userID,
+			"email":      email,
+			"first_name": firstName,
+			"last_name":  lastName,
+		},
+	})
+}
+
+// ValidateInvite validates an invitation token without consuming it
+func (h *Handler) ValidateInvite(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		response.BadRequest(c, "Token is required")
+		return
+	}
+
+	var userID, tenantID uuid.UUID
+	var email, firstName, lastName string
+	var expiresAt time.Time
+
+	err := h.db.QueryRow(`
+		SELECT id, tenant_id, email, first_name, last_name, invite_token_expires
+		FROM users
+		WHERE invite_token = $1 AND deleted_at IS NULL
+	`, token).Scan(&userID, &tenantID, &email, &firstName, &lastName, &expiresAt)
+
+	if err == sql.ErrNoRows {
+		response.Success(c, ValidateInviteResponse{Valid: false})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to validate invite token", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if token has expired
+	if time.Now().After(expiresAt) {
+		response.Success(c, ValidateInviteResponse{Valid: false})
+		return
+	}
+
+	// Get tenant name
+	var tenantName string
+	h.db.QueryRow("SELECT name FROM tenants WHERE id = $1", tenantID).Scan(&tenantName)
+
+	response.Success(c, ValidateInviteResponse{
+		Valid:      true,
+		Email:      email,
+		FirstName:  firstName,
+		LastName:   lastName,
+		TenantName: tenantName,
+		ExpiresAt:  expiresAt.Format(time.RFC3339),
+	})
+}
+
+// AcceptInvite accepts an invitation and sets the user's password
+func (h *Handler) AcceptInvite(c *gin.Context) {
+	var input AcceptInviteInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Find user by invite token
+	var userID, tenantID uuid.UUID
+	var email, firstName, lastName string
+	var expiresAt time.Time
+
+	err := h.db.QueryRow(`
+		SELECT id, tenant_id, email, first_name, last_name, invite_token_expires
+		FROM users
+		WHERE invite_token = $1 AND deleted_at IS NULL
+	`, input.Token).Scan(&userID, &tenantID, &email, &firstName, &lastName, &expiresAt)
+
+	if err == sql.ErrNoRows {
+		response.BadRequest(c, "Invalid or expired invitation token")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to find user by invite token", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if token has expired
+	if time.Now().After(expiresAt) {
+		response.BadRequest(c, "Invitation has expired. Please request a new invitation.")
+		return
+	}
+
+	// Hash the new password
+	passwordHash, err := crypto.HashPassword(input.Password)
+	if err != nil {
+		h.log.Error("Failed to hash password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Update user: set password, clear invite token, mark as verified
+	now := time.Now()
+	_, err = h.db.Exec(`
+		UPDATE users SET
+			password_hash = $1,
+			invite_token = NULL,
+			invite_token_expires = NULL,
+			is_verified = true,
+			is_active = true,
+			updated_at = $2
+		WHERE id = $3
+	`, passwordHash, now, userID)
+
+	if err != nil {
+		h.log.Error("Failed to update user password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if user is admin
+	var isSystemAdmin bool
+	h.db.QueryRow("SELECT is_system_admin FROM users WHERE id = $1", userID).Scan(&isSystemAdmin)
+
+	// Generate tokens for auto-login
+	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, email, isSystemAdmin)
+	if err != nil {
+		h.log.Error("Failed to generate tokens", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Store refresh token
+	tokenHash := crypto.HashToken(tokenPair.RefreshToken)
+	deviceInfo, _ := json.Marshal(map[string]string{
+		"user_agent": c.GetHeader("User-Agent"),
+	})
+	h.db.Exec(`
+		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, userID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+
+	// Get tenant info
+	var tenantCode, tenantName string
+	h.db.QueryRow("SELECT code, name FROM tenants WHERE id = $1", tenantID).Scan(&tenantCode, &tenantName)
+
+	// Build user response
+	user := &entity.UserResponse{
+		ID:            userID,
+		TenantID:      tenantID,
+		Email:         email,
+		FirstName:     firstName,
+		LastName:      lastName,
+		FullName:      firstName + " " + lastName,
+		Language:      "en",
+		Timezone:      "UTC",
+		IsActive:      true,
+		IsVerified:    true,
+		IsSystemAdmin: isSystemAdmin,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+
+	tenant := &TenantInfo{
+		ID:   tenantID,
+		Code: tenantCode,
+		Name: tenantName,
+	}
+
+	response.Success(c, AuthResponse{
+		User:         user,
+		Tenant:       tenant,
+		AccessToken:  tokenPair.AccessToken,
+		RefreshToken: tokenPair.RefreshToken,
+		ExpiresAt:    tokenPair.ExpiresAt,
+		TokenType:    tokenPair.TokenType,
+	})
+}
+
+// SendOTP sends an OTP code to the specified email for verification
+func (h *Handler) SendOTP(c *gin.Context) {
+	var input SendOTPInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Validate purpose
+	if input.Purpose != "registration" && input.Purpose != "password_reset" {
+		response.BadRequest(c, "Invalid purpose. Must be 'registration' or 'password_reset'")
+		return
+	}
+
+	// For registration, check if email already exists
+	if input.Purpose == "registration" {
+		var existingUserID uuid.UUID
+		err := h.db.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
+		if err == nil {
+			response.Conflict(c, "Email already registered. Please use a different email or login to your existing account.")
+			return
+		}
+		if err != sql.ErrNoRows {
+			h.log.Error("Failed to check email", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
+	}
+
+	// For password_reset, check if email exists
+	if input.Purpose == "password_reset" {
+		var existingUserID uuid.UUID
+		err := h.db.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
+		if err == sql.ErrNoRows {
+			// Don't reveal if email exists or not for security
+			response.Success(c, gin.H{
+				"message": "If an account exists with this email, you will receive an OTP code",
+			})
+			return
+		}
+		if err != nil {
+			h.log.Error("Failed to check email", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
+	}
+
+	// Invalidate any existing OTPs for this email and purpose
+	_, err := h.db.Exec(`
+		UPDATE email_verification_otps
+		SET verified_at = NOW()
+		WHERE email = $1 AND purpose = $2 AND verified_at IS NULL
+	`, input.Email, input.Purpose)
+	if err != nil {
+		h.log.Error("Failed to invalidate existing OTPs", "error", err)
+		// Continue anyway
+	}
+
+	// Generate 6-digit OTP code
+	otpCode := generateOTPCode()
+	expiresAt := time.Now().Add(10 * time.Minute) // 10 minutes validity
+
+	// Store OTP in database
+	_, err = h.db.Exec(`
+		INSERT INTO email_verification_otps (email, otp_code, purpose, expires_at)
+		VALUES ($1, $2, $3, $4)
+	`, input.Email, otpCode, input.Purpose, expiresAt)
+	if err != nil {
+		h.log.Error("Failed to store OTP", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Send OTP email with language support
+	if err := h.emailService.SendOTP(input.Email, otpCode, input.Purpose, input.Language); err != nil {
+		h.log.Error("Failed to send OTP email", "error", err, "email", input.Email)
+		// Don't fail the request - OTP is stored, user can request resend
+	}
+
+	response.Success(c, gin.H{
+		"message":    "OTP code sent successfully",
+		"expires_at": expiresAt,
+	})
+}
+
+// VerifyOTP verifies an OTP code for the specified email
+func (h *Handler) VerifyOTP(c *gin.Context) {
+	var input VerifyOTPInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Find the OTP record
+	var otpID uuid.UUID
+	var storedCode string
+	var attempts, maxAttempts int
+	var expiresAt time.Time
+	var verifiedAt sql.NullTime
+
+	err := h.db.QueryRow(`
+		SELECT id, otp_code, attempts, max_attempts, expires_at, verified_at
+		FROM email_verification_otps
+		WHERE email = $1 AND purpose = $2
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, input.Email, input.Purpose).Scan(&otpID, &storedCode, &attempts, &maxAttempts, &expiresAt, &verifiedAt)
+
+	if err == sql.ErrNoRows {
+		response.BadRequest(c, "No OTP found. Please request a new one.")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to query OTP", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if already verified
+	if verifiedAt.Valid {
+		response.BadRequest(c, "OTP already used. Please request a new one.")
+		return
+	}
+
+	// Check if expired
+	if time.Now().After(expiresAt) {
+		response.BadRequest(c, "OTP has expired. Please request a new one.")
+		return
+	}
+
+	// Check attempts
+	if attempts >= maxAttempts {
+		response.BadRequest(c, "Too many failed attempts. Please request a new OTP.")
+		return
+	}
+
+	// Verify OTP code
+	if storedCode != input.OTPCode {
+		// Increment attempts
+		h.db.Exec("UPDATE email_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID)
+		response.BadRequest(c, "Invalid OTP code")
+		return
+	}
+
+	// Mark as verified
+	_, err = h.db.Exec("UPDATE email_verification_otps SET verified_at = NOW() WHERE id = $1", otpID)
+	if err != nil {
+		h.log.Error("Failed to mark OTP as verified", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"message":  "Email verified successfully",
+		"verified": true,
+	})
+}
+
+// RegisterWithOTP handles user registration with OTP verification
+func (h *Handler) RegisterWithOTP(c *gin.Context) {
+	var input RegisterWithOTPInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Verify OTP first
+	var otpID uuid.UUID
+	var storedCode string
+	var expiresAt time.Time
+	var verifiedAt sql.NullTime
+
+	err := h.db.QueryRow(`
+		SELECT id, otp_code, expires_at, verified_at
+		FROM email_verification_otps
+		WHERE email = $1 AND purpose = 'registration'
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, input.Email).Scan(&otpID, &storedCode, &expiresAt, &verifiedAt)
+
+	if err == sql.ErrNoRows {
+		response.BadRequest(c, "No OTP found. Please verify your email first.")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to query OTP", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if expired
+	if time.Now().After(expiresAt) {
+		response.BadRequest(c, "OTP has expired. Please request a new one.")
+		return
+	}
+
+	// Verify OTP code matches
+	if storedCode != input.OTPCode {
+		response.BadRequest(c, "Invalid OTP code")
+		return
+	}
+
+	// Start transaction
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin transaction", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+	defer tx.Rollback()
+
+	// Check if email already exists globally (across all tenants)
+	var existingUserID uuid.UUID
+	err = tx.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
+	if err == nil {
+		response.Conflict(c, "Email already registered. Please use a different email or login to your existing account.")
+		return
+	}
+	if err != sql.ErrNoRows {
+		h.log.Error("Failed to check email", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Check if tenant code exists
+	var existingTenantID uuid.UUID
+	err = tx.QueryRow("SELECT id FROM tenants WHERE code = $1", input.TenantCode).Scan(&existingTenantID)
+	if err == nil {
+		response.Conflict(c, "Tenant code already exists")
+		return
+	}
+	if err != sql.ErrNoRows {
+		h.log.Error("Failed to check tenant", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create tenant
+	tenantID := uuid.New()
+	defaultSettings, _ := json.Marshal(map[string]interface{}{
+		"locale": map[string]string{
+			"language":         "en",
+			"timezone":         "UTC",
+			"date_format":      "YYYY-MM-DD",
+			"default_currency": "USD",
+		},
+	})
+
+	_, err = tx.Exec(`
+		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status)
+		VALUES ($1, $2, $3, $4, 'free', 'active')
+	`, tenantID, input.TenantCode, input.TenantName, defaultSettings)
+	if err != nil {
+		h.log.Error("Failed to create tenant", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Hash password
+	passwordHash, err := crypto.HashPassword(input.Password)
+	if err != nil {
+		h.log.Error("Failed to hash password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create user - email is verified via OTP
+	userID := uuid.New()
+	now := time.Now()
+	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
+
+	_, err = tx.Exec(`
+		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, true, true, false, $8, $8)
+	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
+	if err != nil {
+		h.log.Error("Failed to create user", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create owner role for tenant owner
+	roleID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO roles (id, tenant_id, name, code, description, is_system)
+		VALUES ($1, $2, 'Owner', 'owner', 'Tenant owner with full access', true)
+	`, roleID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to create role", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Assign role to user
+	_, err = tx.Exec(`
+		INSERT INTO user_roles (user_id, role_id)
+		VALUES ($1, $2)
+	`, userID, roleID)
+	if err != nil {
+		h.log.Error("Failed to assign role", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create default warehouse for the tenant
+	warehouseID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouses (id, tenant_id, code, name, is_default, is_active, reception_steps, delivery_steps)
+		VALUES ($1, $2, 'WH-MAIN', 'Main Warehouse', true, true, 1, 1)
+	`, warehouseID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to create default warehouse", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create default warehouse locations
+	stockLocationID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouse_locations (id, warehouse_id, code, name, type, is_active)
+		VALUES ($1, $2, 'STOCK', 'Stock', 'storage', true)
+	`, stockLocationID, warehouseID)
+	if err != nil {
+		h.log.Error("Failed to create stock location", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Mark OTP as used
+	_, err = tx.Exec("UPDATE email_verification_otps SET verified_at = NOW() WHERE id = $1", otpID)
+	if err != nil {
+		h.log.Error("Failed to mark OTP as used", "error", err)
+		// Continue anyway - registration is more important
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Generate tokens
+	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, input.Email, false)
+	if err != nil {
+		h.log.Error("Failed to generate tokens", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Build response
+	ownerRoleDesc := "Tenant owner with full access"
+	user := &entity.UserResponse{
+		ID:            userID,
+		TenantID:      tenantID,
+		Email:         input.Email,
+		FirstName:     input.FirstName,
+		LastName:      input.LastName,
+		FullName:      input.FirstName + " " + input.LastName,
+		Language:      "en",
+		Timezone:      "UTC",
+		IsActive:      true,
+		IsVerified:    true,
+		IsSystemAdmin: false,
+		Roles: []entity.Role{
+			{
+				ID:          roleID,
+				TenantID:    tenantID,
+				Name:        "Owner",
+				Code:        "owner",
+				Description: &ownerRoleDesc,
+				IsSystem:    true,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	tenant := &TenantInfo{
+		ID:   tenantID,
+		Code: input.TenantCode,
+		Name: input.TenantName,
+	}
+
+	response.Created(c, AuthResponse{
+		User:         user,
+		Tenant:       tenant,
+		AccessToken:  tokenPair.AccessToken,
+		RefreshToken: tokenPair.RefreshToken,
+		ExpiresAt:    tokenPair.ExpiresAt,
+		TokenType:    tokenPair.TokenType,
+	})
+}
+
+// generateOTPCode generates a random 6-digit OTP code
+func generateOTPCode() string {
+	// Use crypto/rand for secure random generation
+	const digits = "0123456789"
+	code := make([]byte, 6)
+	for i := range code {
+		// Generate a random number between 0-9
+		num := uuid.New()[0] % 10
+		code[i] = digits[num]
+	}
+	return string(code)
+}
+
 // Helper function
 func joinStrings(strs []string, sep string) string {
 	if len(strs) == 0 {
@@ -629,4 +1554,445 @@ func joinStrings(strs []string, sep string) string {
 		result += sep + s
 	}
 	return result
+}
+
+// GoogleAuth handles Google Sign-In and Sign-Up
+func (h *Handler) GoogleAuth(c *gin.Context) {
+	var input GoogleAuthInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Verify Google ID token
+	clientID := h.config.Google.ClientID
+	if clientID == "" {
+		response.Error(c, http.StatusServiceUnavailable, response.ErrCodeServiceUnavailable, "Google Sign-In is not configured")
+		return
+	}
+
+	payload, err := idtoken.Validate(context.Background(), input.Credential, clientID)
+	if err != nil {
+		h.log.Error("Failed to verify Google ID token", "error", err)
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "Invalid Google credential")
+		return
+	}
+
+	// Extract claims from verified token
+	googleEmail, _ := payload.Claims["email"].(string)
+	emailVerified, _ := payload.Claims["email_verified"].(bool)
+	firstName, _ := payload.Claims["given_name"].(string)
+	lastName, _ := payload.Claims["family_name"].(string)
+	googleSub := payload.Subject
+	picture, _ := payload.Claims["picture"].(string)
+
+	if googleEmail == "" || !emailVerified {
+		response.BadRequest(c, "Google account email is not verified")
+		return
+	}
+
+	// Check if user exists
+	if input.TenantID != "" {
+		// Tenant-specific lookup (multi-tenant selection)
+		tenantUUID, err := uuid.Parse(input.TenantID)
+		if err != nil {
+			response.BadRequest(c, "Invalid tenant ID")
+			return
+		}
+		h.googleLoginExistingUser(c, googleEmail, googleSub, picture, &tenantUUID)
+		return
+	}
+
+	// Count users with this email
+	var userCount int
+	err = h.db.QueryRow("SELECT COUNT(*) FROM users WHERE email = $1 AND deleted_at IS NULL", googleEmail).Scan(&userCount)
+	if err != nil {
+		h.log.Error("Failed to count users", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	if userCount > 1 {
+		// Multi-tenant: return tenant list for selection
+		rows, err := h.db.Query(`
+			SELECT t.id, t.name, t.code
+			FROM users u
+			JOIN tenants t ON u.tenant_id = t.id
+			WHERE u.email = $1 AND u.deleted_at IS NULL AND t.is_active = true
+		`, googleEmail)
+		if err != nil {
+			h.log.Error("Failed to query tenants", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
+		defer rows.Close()
+
+		var tenants []TenantInfo
+		for rows.Next() {
+			var t TenantInfo
+			rows.Scan(&t.ID, &t.Name, &t.Code)
+			tenants = append(tenants, t)
+		}
+
+		c.JSON(http.StatusConflict, gin.H{
+			"success": false,
+			"data": gin.H{
+				"tenants": tenants,
+				"message": "Please select a company to continue",
+			},
+		})
+		return
+	}
+
+	if userCount == 1 {
+		// Single user found — login
+		h.googleLoginExistingUser(c, googleEmail, googleSub, picture, nil)
+		return
+	}
+
+	// No user found — new registration
+	if input.CompanyName == "" {
+		// Need company name — return needs_completion
+		response.Success(c, GoogleAuthNeedsCompletionResponse{
+			NeedsCompletion: true,
+			GoogleUser: GoogleUserPreview{
+				Email:     googleEmail,
+				FirstName: firstName,
+				LastName:  lastName,
+				Picture:   picture,
+			},
+		})
+		return
+	}
+
+	// Complete registration with Google
+	h.googleRegisterNewUser(c, googleEmail, googleSub, firstName, lastName, picture, input.CompanyName)
+}
+
+// googleLoginExistingUser logs in an existing user via Google
+func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, picture string, tenantID *uuid.UUID) {
+	query := `
+		SELECT id, tenant_id, email, first_name, last_name,
+		       phone, avatar_url, language, timezone, is_active, is_verified,
+		       is_system_admin, COALESCE(auth_provider, 'local') as auth_provider, google_id,
+		       created_at, updated_at
+		FROM users
+		WHERE email = $1 AND deleted_at IS NULL
+	`
+	args := []interface{}{email}
+
+	if tenantID != nil {
+		query = `
+			SELECT id, tenant_id, email, first_name, last_name,
+			       phone, avatar_url, language, timezone, is_active, is_verified,
+			       is_system_admin, COALESCE(auth_provider, 'local') as auth_provider, google_id,
+			       created_at, updated_at
+			FROM users
+			WHERE tenant_id = $1 AND email = $2 AND deleted_at IS NULL
+		`
+		args = []interface{}{*tenantID, email}
+	}
+
+	var user entity.User
+	var phone, avatarURL, googleID sql.NullString
+
+	err := h.db.QueryRow(query, args...).Scan(
+		&user.ID, &user.TenantID, &user.Email, &user.FirstName, &user.LastName,
+		&phone, &avatarURL, &user.Language, &user.Timezone, &user.IsActive, &user.IsVerified,
+		&user.IsSystemAdmin, &user.AuthProvider, &googleID,
+		&user.CreatedAt, &user.UpdatedAt,
+	)
+
+	if err == sql.ErrNoRows {
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "Account not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to query user for Google auth", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	if phone.Valid {
+		user.Phone = &phone.String
+	}
+	if avatarURL.Valid {
+		user.AvatarURL = &avatarURL.String
+	}
+	if googleID.Valid {
+		user.GoogleID = &googleID.String
+	}
+
+	if !user.IsActive {
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeAccountDisabled, "Account is disabled")
+		return
+	}
+
+	// Link Google ID if not already linked, and update avatar if missing
+	if !googleID.Valid || googleID.String == "" {
+		h.db.Exec("UPDATE users SET google_id = $1, auth_provider = CASE WHEN auth_provider = 'local' AND password_hash IS NULL THEN 'google' ELSE auth_provider END WHERE id = $2", googleSub, user.ID)
+	}
+	if (user.AvatarURL == nil || *user.AvatarURL == "") && picture != "" {
+		h.db.Exec("UPDATE users SET avatar_url = $1 WHERE id = $2", picture, user.ID)
+		user.AvatarURL = &picture
+	}
+
+	// Update last login
+	now := time.Now()
+	h.db.Exec("UPDATE users SET last_login_at = $1 WHERE id = $2", now, user.ID)
+	user.LastLoginAt = &now
+
+	// Generate tokens
+	tokenPair, err := h.jwtManager.GenerateTokenPair(user.ID, user.TenantID, user.Email, user.IsSystemAdmin)
+	if err != nil {
+		h.log.Error("Failed to generate tokens", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Store refresh token
+	tokenHash := crypto.HashToken(tokenPair.RefreshToken)
+	deviceInfo, _ := json.Marshal(map[string]string{
+		"user_agent": c.GetHeader("User-Agent"),
+	})
+	h.db.Exec(`
+		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, user.ID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+
+	// Load roles
+	rows, err := h.db.Query(`
+		SELECT r.id, r.name, r.code
+		FROM roles r
+		JOIN user_roles ur ON r.id = ur.role_id
+		WHERE ur.user_id = $1
+	`, user.ID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var role entity.Role
+			rows.Scan(&role.ID, &role.Name, &role.Code)
+			user.Roles = append(user.Roles, role)
+		}
+	}
+
+	// Get tenant info
+	var tenantCode, tenantName string
+	h.db.QueryRow("SELECT code, name FROM tenants WHERE id = $1", user.TenantID).Scan(&tenantCode, &tenantName)
+
+	response.Success(c, AuthResponse{
+		User: user.ToResponse(),
+		Tenant: &TenantInfo{
+			ID:   user.TenantID,
+			Code: tenantCode,
+			Name: tenantName,
+		},
+		AccessToken:  tokenPair.AccessToken,
+		RefreshToken: tokenPair.RefreshToken,
+		ExpiresAt:    tokenPair.ExpiresAt,
+		TokenType:    tokenPair.TokenType,
+	})
+}
+
+// googleRegisterNewUser creates a new tenant and user from Google sign-up
+func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstName, lastName, picture, companyName string) {
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin transaction", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+	defer tx.Rollback()
+
+	// Double-check email doesn't exist
+	var existingID uuid.UUID
+	err = tx.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", email).Scan(&existingID)
+	if err == nil {
+		response.Conflict(c, "Email already registered")
+		return
+	}
+	if err != sql.ErrNoRows {
+		h.log.Error("Failed to check email", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Generate tenant code
+	baseCode := strings.ToLower(strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' {
+			return r
+		}
+		if r >= 'A' && r <= 'Z' {
+			return r + 32
+		}
+		return '_'
+	}, companyName))
+	if len(baseCode) > 40 {
+		baseCode = baseCode[:40]
+	}
+	tenantCode := fmt.Sprintf("%s_%s", baseCode, randomSuffix())
+
+	// Create tenant
+	tenantID := uuid.New()
+	defaultSettings, _ := json.Marshal(map[string]interface{}{
+		"locale": map[string]string{
+			"language":         "en",
+			"timezone":         "UTC",
+			"date_format":      "YYYY-MM-DD",
+			"default_currency": "USD",
+		},
+	})
+
+	_, err = tx.Exec(`
+		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status)
+		VALUES ($1, $2, $3, $4, 'free', 'active')
+	`, tenantID, tenantCode, companyName, defaultSettings)
+	if err != nil {
+		h.log.Error("Failed to create tenant", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create user (no password, Google auth)
+	userID := uuid.New()
+	now := time.Now()
+	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
+
+	_, err = tx.Exec(`
+		INSERT INTO users (id, tenant_id, email, first_name, last_name, settings,
+		                   is_active, is_verified, is_system_admin, auth_provider, google_id,
+		                   avatar_url, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, true, true, false, 'google', $7, $8, $9, $9)
+	`, userID, tenantID, email, firstName, lastName, defaultUserSettings, googleSub, picture, now)
+	if err != nil {
+		h.log.Error("Failed to create user", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create owner role
+	roleID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO roles (id, tenant_id, name, code, description, is_system)
+		VALUES ($1, $2, 'Owner', 'owner', 'Tenant owner with full access', true)
+	`, roleID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to create role", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	_, err = tx.Exec("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", userID, roleID)
+	if err != nil {
+		h.log.Error("Failed to assign role", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Create default warehouse
+	warehouseID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouses (id, tenant_id, code, name, is_default, is_active, reception_steps, delivery_steps)
+		VALUES ($1, $2, 'WH-MAIN', 'Main Warehouse', true, true, 1, 1)
+	`, warehouseID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to create default warehouse", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	stockLocationID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO warehouse_locations (id, warehouse_id, code, name, type, is_active)
+		VALUES ($1, $2, 'STOCK', 'Stock', 'storage', true)
+	`, stockLocationID, warehouseID)
+	if err != nil {
+		h.log.Error("Failed to create stock location", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Generate tokens
+	tokenPair, err := h.jwtManager.GenerateTokenPair(userID, tenantID, email, false)
+	if err != nil {
+		h.log.Error("Failed to generate tokens", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Store refresh token
+	tokenHash := crypto.HashToken(tokenPair.RefreshToken)
+	deviceInfo, _ := json.Marshal(map[string]string{
+		"user_agent": c.GetHeader("User-Agent"),
+	})
+	h.db.Exec(`
+		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, userID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+
+	ownerRoleDesc := "Tenant owner with full access"
+	var avatarPtr *string
+	if picture != "" {
+		avatarPtr = &picture
+	}
+
+	userResp := &entity.UserResponse{
+		ID:            userID,
+		TenantID:      tenantID,
+		Email:         email,
+		FirstName:     firstName,
+		LastName:      lastName,
+		FullName:      firstName + " " + lastName,
+		AvatarURL:     avatarPtr,
+		Language:      "en",
+		Timezone:      "UTC",
+		IsActive:      true,
+		IsVerified:    true,
+		IsSystemAdmin: false,
+		AuthProvider:  "google",
+		HasPassword:   false,
+		Roles: []entity.Role{
+			{
+				ID:          roleID,
+				TenantID:    tenantID,
+				Name:        "Owner",
+				Code:        "owner",
+				Description: &ownerRoleDesc,
+				IsSystem:    true,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			},
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	response.Created(c, gin.H{
+		"user": userResp,
+		"tenant": &TenantInfo{
+			ID:   tenantID,
+			Code: tenantCode,
+			Name: companyName,
+		},
+		"access_token":  tokenPair.AccessToken,
+		"refresh_token": tokenPair.RefreshToken,
+		"expires_at":    tokenPair.ExpiresAt,
+		"token_type":    tokenPair.TokenType,
+		"is_new_user":   true,
+	})
+}
+
+func randomSuffix() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(b)
 }

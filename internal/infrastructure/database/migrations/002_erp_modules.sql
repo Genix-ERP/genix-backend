@@ -122,6 +122,7 @@ CREATE TABLE fiscal_years (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    code VARCHAR(20),
     name VARCHAR(100) NOT NULL,
     start_date DATE NOT NULL,
     end_date DATE NOT NULL,
@@ -134,6 +135,7 @@ CREATE TABLE fiscal_years (
 CREATE TABLE fiscal_periods (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     fiscal_year_id UUID NOT NULL REFERENCES fiscal_years(id) ON DELETE CASCADE,
+    code VARCHAR(20) NOT NULL,
     name VARCHAR(50) NOT NULL,
     period_number INTEGER NOT NULL,
     start_date DATE NOT NULL,

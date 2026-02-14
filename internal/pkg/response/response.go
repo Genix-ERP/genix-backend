@@ -20,6 +20,7 @@ type ErrorInfo struct {
 	Code    string            `json:"code"`
 	Message string            `json:"message"`
 	Details map[string]string `json:"details,omitempty"`
+	Data    interface{}       `json:"data,omitempty"`
 }
 
 // Meta represents pagination and other metadata
@@ -56,6 +57,39 @@ func SuccessWithMeta(c *gin.Context, data interface{}, pagination *entity.Pagina
 		Data:    data,
 		Meta:    meta,
 	})
+}
+
+// SuccessWithPagination is an alias for SuccessWithMeta
+func SuccessWithPagination(c *gin.Context, data interface{}, pagination *entity.Pagination) {
+	SuccessWithMeta(c, data, pagination)
+}
+
+// Paginated sends a successful response with pagination metadata from individual values
+func Paginated(c *gin.Context, data interface{}, page, limit, total int) {
+	totalPages := total / limit
+	if total%limit > 0 {
+		totalPages++
+	}
+
+	meta := &Meta{
+		Page:       page,
+		Limit:      limit,
+		Total:      total,
+		TotalPages: totalPages,
+		HasNext:    page < totalPages,
+		HasPrev:    page > 1,
+	}
+
+	c.JSON(http.StatusOK, Response{
+		Success: true,
+		Data:    data,
+		Meta:    meta,
+	})
+}
+
+// InternalError sends a 500 Internal Server Error response
+func InternalError(c *gin.Context, message string) {
+	InternalServerError(c, message)
 }
 
 // Created sends a 201 Created response
@@ -137,6 +171,18 @@ func NotFound(c *gin.Context, resource string) {
 // Conflict sends a 409 Conflict response
 func Conflict(c *gin.Context, message string) {
 	Error(c, http.StatusConflict, "CONFLICT", message)
+}
+
+// ConflictWithData sends a 409 Conflict response with additional data
+func ConflictWithData(c *gin.Context, code, message string, data interface{}) {
+	c.JSON(http.StatusConflict, Response{
+		Success: false,
+		Error: &ErrorInfo{
+			Code:    code,
+			Message: message,
+			Data:    data,
+		},
+	})
 }
 
 // UnprocessableEntity sends a 422 Unprocessable Entity response

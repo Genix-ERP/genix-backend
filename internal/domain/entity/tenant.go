@@ -122,3 +122,40 @@ type TenantStats struct {
 	ActiveSessions int       `json:"active_sessions"`
 	APICallsToday  int       `json:"api_calls_today"`
 }
+
+// =====================================================
+// INSTALLED APPS
+// =====================================================
+
+// TenantInstalledApp represents an installed app for a tenant
+type TenantInstalledApp struct {
+	ID             int64           `json:"id" db:"id"`
+	TenantID       uuid.UUID       `json:"tenant_id" db:"tenant_id"`
+	AppID          string          `json:"app_id" db:"app_id"`
+	AppName        string          `json:"app_name" db:"app_name"`
+	AppDescription sql.NullString  `json:"app_description" db:"app_description"`
+	AppVersion     string          `json:"app_version" db:"app_version"`
+	AppIcon        sql.NullString  `json:"app_icon" db:"app_icon"`
+	AppColor       sql.NullString  `json:"app_color" db:"app_color"`
+	Status         string          `json:"status" db:"status"` // active, inactive, suspended
+	InstalledBy    uuid.NullUUID   `json:"installed_by" db:"installed_by"`
+	InstalledDate  time.Time       `json:"installed_date" db:"installed_date"`
+	UpdatedDate    time.Time       `json:"updated_date" db:"updated_date"`
+	Settings       json.RawMessage `json:"settings" db:"settings"`
+}
+
+// InstallAppRequest represents request to install an app
+type InstallAppRequest struct {
+	AppID          string `json:"app_id" binding:"required"`
+	AppName        string `json:"app_name" binding:"required"`
+	AppDescription string `json:"app_description"`
+	AppVersion     string `json:"app_version"`
+	AppIcon        string `json:"app_icon"`
+	AppColor       string `json:"app_color"`
+}
+
+// UpdateInstalledAppRequest represents request to update an installed app
+type UpdateInstalledAppRequest struct {
+	Status   string                 `json:"status"`
+	Settings map[string]interface{} `json:"settings"`
+}
