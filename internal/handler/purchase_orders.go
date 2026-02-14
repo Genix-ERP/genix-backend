@@ -19,6 +19,20 @@ import (
 // =====================================================
 
 // ListPurchaseOrders returns a paginated list of purchase orders
+// ListPurchaseOrders godoc
+// @Summary List purchase orders
+// @Description Get a paginated list of purchase orders
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param status query string false "Filter by status (draft, confirmed, received)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase/orders [get]
 func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -178,6 +192,20 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 }
 
 // CreatePurchaseOrder creates a new purchase order
+// CreatePurchaseOrder godoc
+// @Summary Create a new purchase order
+// @Description Create a new purchase order with line items
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param input body entity.CreatePurchaseOrderInput true "Purchase order input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase/orders [post]
 func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -470,6 +498,20 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 }
 
 // GetPurchaseOrder returns a single purchase order by ID
+// GetPurchaseOrder godoc
+// @Summary Get purchase order by ID
+// @Description Get a single purchase order with line items by ID
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param id path string true "Purchase order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase/orders/{id} [get]
 func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -634,6 +676,21 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 }
 
 // UpdatePurchaseOrder updates an existing purchase order
+// UpdatePurchaseOrder godoc
+// @Summary Update purchase order
+// @Description Update an existing purchase order. Updates inventory when status changes to 'received'
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param id path string true "Purchase order ID"
+// @Param input body entity.UpdatePurchaseOrderInput true "Update input"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase/orders/{id} [put]
 func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1136,6 +1193,20 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 }
 
 // DeletePurchaseOrder soft deletes a purchase order
+// DeletePurchaseOrder godoc
+// @Summary Delete purchase order
+// @Description Soft delete a purchase order. Only draft or cancelled orders can be deleted
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param id path string true "Purchase order ID"
+// @Success 204 "No Content"
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase/orders/{id} [delete]
 func (h *Handler) DeletePurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1191,6 +1262,20 @@ func (h *Handler) DeletePurchaseOrder(c *gin.Context) {
 }
 
 // SubmitPOForApproval submits a purchase order for approval (evaluates procurement rules)
+// SubmitPOForApproval godoc
+// @Summary Submit purchase order for approval
+// @Description Submit a purchase order for approval. Evaluates procurement rules and may auto-approve, require approval, or block
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param id path string true "Purchase order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase/orders/{id}/submit [post]
 func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1333,6 +1418,20 @@ func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 }
 
 // ApprovePurchaseOrder approves a purchase order (direct approval by authorized user)
+// ApprovePurchaseOrder godoc
+// @Summary Approve purchase order
+// @Description Directly approve a purchase order. Only draft or pending approval orders can be approved
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param id path string true "Purchase order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase/orders/{id}/approve [post]
 func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1392,6 +1491,21 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 }
 
 // ReceivePurchaseOrder records goods receipt for a purchase order
+// ReceivePurchaseOrder godoc
+// @Summary Receive goods for purchase order
+// @Description Record goods receipt for a purchase order. Updates line item quantities received
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param id path string true "Purchase order ID"
+// @Param input body entity.ReceivePurchaseOrderInput true "Receive input"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase/orders/{id}/receive [post]
 func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {

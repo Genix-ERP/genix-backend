@@ -18,7 +18,26 @@ import (
 // WORK CENTER HANDLERS
 // =====================================================
 
-// ListWorkCenters returns all work centers with filtering
+// ListWorkCenters godoc
+// @Summary List work centers
+// @Description Get a paginated list of work centers with filtering options
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param status query string false "Filter by status"
+// @Param is_available query boolean false "Filter by availability"
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Param search query string false "Search by name or code"
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param sort_by query string false "Sort by field" default(name)
+// @Param sort_order query string false "Sort order (asc/desc)" default(asc)
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers [get]
 func (h *Handler) ListWorkCenters(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -186,7 +205,20 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 	response.SuccessWithPagination(c, workCenters, pagination)
 }
 
-// GetWorkCenter returns a single work center by ID
+// GetWorkCenter godoc
+// @Summary Get work center
+// @Description Get a single work center by ID
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Work Center ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers/{id} [get]
 func (h *Handler) GetWorkCenter(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -251,7 +283,19 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 	response.Success(c, wc)
 }
 
-// CreateWorkCenter creates a new work center
+// CreateWorkCenter godoc
+// @Summary Create work center
+// @Description Create a new work center
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param input body entity.WorkCenterInput true "Work center input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers [post]
 func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -383,7 +427,21 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	response.Created(c, resp)
 }
 
-// UpdateWorkCenter updates an existing work center
+// UpdateWorkCenter godoc
+// @Summary Update work center
+// @Description Update an existing work center
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Work Center ID"
+// @Param input body entity.WorkCenterInput true "Work center input"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers/{id} [put]
 func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -534,7 +592,20 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 	h.GetWorkCenter(c)
 }
 
-// DeleteWorkCenter soft deletes a work center
+// DeleteWorkCenter godoc
+// @Summary Delete work center
+// @Description Soft delete a work center
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Work Center ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers/{id} [delete]
 func (h *Handler) DeleteWorkCenter(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -571,6 +642,20 @@ func (h *Handler) DeleteWorkCenter(c *gin.Context) {
 // =====================================================
 
 // ListProductionOrders returns all production orders with filtering
+// ListProductionOrders godoc
+// @Summary List production orders
+// @Description Get a paginated list of production/manufacturing orders
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param status query string false "Filter by status"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders [get]
 func (h *Handler) ListProductionOrders(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -811,7 +896,20 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	response.SuccessWithPagination(c, orders, pagination)
 }
 
-// GetProductionOrder returns a single production order by ID
+// GetProductionOrder godoc
+// @Summary Get production order
+// @Description Get a single production order by ID
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id} [get]
 func (h *Handler) GetProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -976,7 +1074,19 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	response.Success(c, po)
 }
 
-// CreateProductionOrder creates a new production order
+// CreateProductionOrder godoc
+// @Summary Create production order
+// @Description Create a new production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param input body entity.ProductionOrderInput true "Production order input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders [post]
 func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1069,7 +1179,21 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// UpdateProductionOrder updates an existing production order
+// UpdateProductionOrder godoc
+// @Summary Update production order
+// @Description Update an existing production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Param input body entity.ProductionOrderInput true "Production order input"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id} [put]
 func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1224,7 +1348,20 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// DeleteProductionOrder soft deletes a production order
+// DeleteProductionOrder godoc
+// @Summary Delete production order
+// @Description Soft delete a production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id} [delete]
 func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1256,8 +1393,20 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 	response.Success(c, map[string]interface{}{"message": "Production order deleted successfully"})
 }
 
-// ConfirmProductionOrder confirms a draft production order
-// It calculates costs based on BOM operations and generates work orders
+// ConfirmProductionOrder godoc
+// @Summary Confirm production order
+// @Description Confirm a draft production order, calculate costs and generate work orders
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/confirm [post]
 func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1475,7 +1624,20 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// StartProductionOrder starts a confirmed production order
+// StartProductionOrder godoc
+// @Summary Start production order
+// @Description Start a confirmed production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/start [post]
 func (h *Handler) StartProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1513,7 +1675,20 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// PauseProductionOrder pauses an in-progress production order
+// PauseProductionOrder godoc
+// @Summary Pause production order
+// @Description Pause an in-progress production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/pause [post]
 func (h *Handler) PauseProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1551,7 +1726,20 @@ func (h *Handler) PauseProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// CompleteProductionOrder completes a production order
+// CompleteProductionOrder godoc
+// @Summary Complete production order
+// @Description Complete a production order and update inventory
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/complete [post]
 func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1850,7 +2038,20 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// CancelProductionOrder cancels a production order
+// CancelProductionOrder godoc
+// @Summary Cancel production order
+// @Description Cancel a production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/cancel [post]
 func (h *Handler) CancelProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1888,7 +2089,21 @@ func (h *Handler) CancelProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// RecordProduction records production output for an order
+// RecordProduction godoc
+// @Summary Record production
+// @Description Record production output for an order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Param input body entity.RecordProductionInput true "Production record input"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/record [post]
 func (h *Handler) RecordProduction(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1956,7 +2171,19 @@ func (h *Handler) RecordProduction(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// GetProductionSchedule returns scheduled production orders for calendar view
+// GetProductionSchedule godoc
+// @Summary Get production schedule
+// @Description Get scheduled production orders for calendar view
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param date_from query string false "Start date (YYYY-MM-DD)"
+// @Param date_to query string false "End date (YYYY-MM-DD)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/schedule [get]
 func (h *Handler) GetProductionSchedule(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2037,7 +2264,17 @@ func (h *Handler) GetProductionSchedule(c *gin.Context) {
 	response.Success(c, schedule)
 }
 
-// GetManufacturingStats returns manufacturing dashboard statistics
+// GetManufacturingStats godoc
+// @Summary Get manufacturing statistics
+// @Description Get manufacturing dashboard statistics
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/stats [get]
 func (h *Handler) GetManufacturingStats(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2135,7 +2372,28 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 // QUALITY CHECK HANDLERS
 // =====================================================
 
-// ListQualityChecks returns all quality checks with filtering
+// ListQualityChecks godoc
+// @Summary List quality checks
+// @Description Get a paginated list of quality checks with filtering options
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param result query string false "Filter by result"
+// @Param production_order_id query string false "Filter by production order ID"
+// @Param inspector_id query string false "Filter by inspector ID"
+// @Param date_from query string false "Filter by date from"
+// @Param date_to query string false "Filter by date to"
+// @Param search query string false "Search by reference number"
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param sort_by query string false "Sort by field" default(inspection_date)
+// @Param sort_order query string false "Sort order (asc/desc)" default(desc)
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-checks [get]
 func (h *Handler) ListQualityChecks(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2326,7 +2584,20 @@ func (h *Handler) ListQualityChecks(c *gin.Context) {
 	response.SuccessWithPagination(c, qualityChecks, pagination)
 }
 
-// GetQualityCheck returns a single quality check by ID
+// GetQualityCheck godoc
+// @Summary Get quality check
+// @Description Get a single quality check by ID
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Quality Check ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-checks/{id} [get]
 func (h *Handler) GetQualityCheck(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2403,7 +2674,19 @@ func (h *Handler) GetQualityCheck(c *gin.Context) {
 	response.Success(c, qc)
 }
 
-// CreateQualityCheck creates a new quality check
+// CreateQualityCheck godoc
+// @Summary Create quality check
+// @Description Create a new quality check
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param input body entity.QualityCheckInput true "Quality check input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-checks [post]
 func (h *Handler) CreateQualityCheck(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2511,7 +2794,19 @@ func (h *Handler) CreateQualityCheck(c *gin.Context) {
 	h.GetQualityCheck(c)
 }
 
-// GetQualityStats returns quality statistics
+// GetQualityStats godoc
+// @Summary Get quality statistics
+// @Description Get quality statistics for a date range
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param date_from query string false "Start date (YYYY-MM-DD)"
+// @Param date_to query string false "End date (YYYY-MM-DD)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-stats [get]
 func (h *Handler) GetQualityStats(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2600,7 +2895,17 @@ func (h *Handler) GetQualityStats(c *gin.Context) {
 	})
 }
 
-// ListQualityDefects returns all quality defect types
+// ListQualityDefects godoc
+// @Summary List quality defects
+// @Description Get all quality defect types
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-defects [get]
 func (h *Handler) ListQualityDefects(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2637,7 +2942,19 @@ func (h *Handler) ListQualityDefects(c *gin.Context) {
 	response.Success(c, defects)
 }
 
-// CreateQualityDefect creates a new quality defect type
+// CreateQualityDefect godoc
+// @Summary Create quality defect
+// @Description Create a new quality defect type
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param input body entity.QualityDefectInput true "Quality defect input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-defects [post]
 func (h *Handler) CreateQualityDefect(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {

@@ -20,6 +20,21 @@ import (
 // =====================================================
 
 // ListInventory returns a paginated list of inventory records
+// ListInventory godoc
+// @Summary List inventory levels
+// @Description Get a paginated list of inventory levels across all warehouses
+// @Tags Inventory
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Param product_id query string false "Filter by product ID"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory [get]
 func (h *Handler) ListInventory(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -259,6 +274,24 @@ func (h *Handler) ListInventory(c *gin.Context) {
 }
 
 // GetInventorySummary returns inventory summarized by product
+// GetInventorySummary godoc
+// @Summary Get inventory summary by product
+// @Description Get a summarized view of inventory grouped by product across all warehouses
+// @Tags Inventory
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param search query string false "Search by product code or name"
+// @Param category_id query string false "Filter by category ID"
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Param low_stock query boolean false "Filter low stock items"
+// @Param out_of_stock query boolean false "Filter out of stock items"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/summary [get]
 func (h *Handler) GetInventorySummary(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -393,6 +426,19 @@ func (h *Handler) GetInventorySummary(c *gin.Context) {
 }
 
 // AdjustInventory creates an inventory adjustment
+// AdjustInventory godoc
+// @Summary Create inventory adjustment
+// @Description Create an inventory adjustment to manually modify inventory quantities
+// @Tags Inventory
+// @Accept json
+// @Produce json
+// @Param adjustment body entity.InventoryAdjustmentInput true "Adjustment details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/adjustments [post]
 func (h *Handler) AdjustInventory(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -724,6 +770,19 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 }
 
 // TransferInventory transfers inventory between warehouses
+// TransferInventory godoc
+// @Summary Create inventory transfer
+// @Description Transfer inventory between warehouses or locations
+// @Tags Inventory
+// @Accept json
+// @Produce json
+// @Param transfer body entity.InventoryTransferInput true "Transfer details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/transfers [post]
 func (h *Handler) TransferInventory(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -957,6 +1016,24 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 }
 
 // ListInventoryMovements returns inventory movement history
+// ListInventoryMovements godoc
+// @Summary List inventory movements
+// @Description Get a paginated list of all inventory movements and transactions
+// @Tags Inventory
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param product_id query string false "Filter by product ID"
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Param movement_type query string false "Filter by movement type"
+// @Param start_date query string false "Start date (YYYY-MM-DD)"
+// @Param end_date query string false "End date (YYYY-MM-DD)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/movements [get]
 func (h *Handler) ListInventoryMovements(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1179,6 +1256,19 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 }
 
 // GetInventoryValuation returns inventory valuation report
+// GetInventoryValuation godoc
+// @Summary Get inventory valuation
+// @Description Get the total inventory valuation across all warehouses and products
+// @Tags Inventory
+// @Accept json
+// @Produce json
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Param category_id query string false "Filter by category ID"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/valuation [get]
 func (h *Handler) GetInventoryValuation(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1300,6 +1390,21 @@ func (h *Handler) GetInventoryValuation(c *gin.Context) {
 // =====================================================
 
 // ListBOMs returns a paginated list of BOMs
+// ListBOMs godoc
+// @Summary List bills of materials
+// @Description Get a paginated list of all bills of materials (BOMs)
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param search query string false "Search by product code or name"
+// @Param product_id query string false "Filter by product ID"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms [get]
 func (h *Handler) ListBOMs(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1431,6 +1536,20 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 }
 
 // GetBOM returns a single BOM with lines
+// GetBOM godoc
+// @Summary Get BOM details
+// @Description Get detailed information about a specific bill of materials including all lines
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param id path string true "BOM ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{id} [get]
 func (h *Handler) GetBOM(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1524,6 +1643,19 @@ func (h *Handler) GetBOM(c *gin.Context) {
 }
 
 // CreateBOM creates a new BOM
+// CreateBOM godoc
+// @Summary Create new bill of materials
+// @Description Create a new bill of materials for a product
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param bom body entity.BOMInput true "BOM details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms [post]
 func (h *Handler) CreateBOM(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1695,6 +1827,21 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 }
 
 // UpdateBOM updates a BOM
+// UpdateBOM godoc
+// @Summary Update bill of materials
+// @Description Update an existing bill of materials
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param id path string true "BOM ID"
+// @Param bom body entity.BOMInput true "BOM details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{id} [put]
 func (h *Handler) UpdateBOM(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1794,6 +1941,20 @@ func (h *Handler) UpdateBOM(c *gin.Context) {
 }
 
 // DeleteBOM soft deletes a BOM
+// DeleteBOM godoc
+// @Summary Delete bill of materials
+// @Description Soft delete a bill of materials
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param id path string true "BOM ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{id} [delete]
 func (h *Handler) DeleteBOM(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1827,6 +1988,20 @@ func (h *Handler) DeleteBOM(c *gin.Context) {
 }
 
 // CreateBOMLine adds a line to a BOM
+// CreateBOMLine godoc
+// @Summary Add BOM line
+// @Description Add a component line to a bill of materials
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param bom_id path string true "BOM ID"
+// @Param line body entity.BOMLineInput true "BOM line details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{bom_id}/lines [post]
 func (h *Handler) CreateBOMLine(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1912,6 +2087,21 @@ func (h *Handler) CreateBOMLine(c *gin.Context) {
 }
 
 // DeleteBOMLine removes a line from a BOM
+// DeleteBOMLine godoc
+// @Summary Delete BOM line
+// @Description Remove a component line from a bill of materials
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param bom_id path string true "BOM ID"
+// @Param line_id path string true "BOM Line ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{bom_id}/lines/{line_id} [delete]
 func (h *Handler) DeleteBOMLine(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1964,6 +2154,19 @@ func (h *Handler) DeleteBOMLine(c *gin.Context) {
 // =====================================================
 
 // ListBOMOperations returns all operations for a BOM
+// ListBOMOperations godoc
+// @Summary List BOM operations
+// @Description Get all manufacturing operations for a bill of materials
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param bom_id path string true "BOM ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{bom_id}/operations [get]
 func (h *Handler) ListBOMOperations(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2120,6 +2323,20 @@ func (h *Handler) ListBOMOperations(c *gin.Context) {
 }
 
 // CreateBOMOperation adds an operation to a BOM
+// CreateBOMOperation godoc
+// @Summary Create BOM operation
+// @Description Add a manufacturing operation to a bill of materials
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param bom_id path string true "BOM ID"
+// @Param operation body entity.BOMOperationInput true "Operation details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{bom_id}/operations [post]
 func (h *Handler) CreateBOMOperation(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2240,6 +2457,22 @@ func (h *Handler) CreateBOMOperation(c *gin.Context) {
 }
 
 // UpdateBOMOperation updates an operation in a BOM
+// UpdateBOMOperation godoc
+// @Summary Update BOM operation
+// @Description Update a manufacturing operation in a bill of materials
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param bom_id path string true "BOM ID"
+// @Param operation_id path string true "Operation ID"
+// @Param operation body entity.BOMOperationInput true "Operation details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{bom_id}/operations/{operation_id} [put]
 func (h *Handler) UpdateBOMOperation(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2390,6 +2623,21 @@ func (h *Handler) UpdateBOMOperation(c *gin.Context) {
 }
 
 // DeleteBOMOperation removes an operation from a BOM
+// DeleteBOMOperation godoc
+// @Summary Delete BOM operation
+// @Description Remove a manufacturing operation from a bill of materials
+// @Tags Inventory - BOM
+// @Accept json
+// @Produce json
+// @Param bom_id path string true "BOM ID"
+// @Param operation_id path string true "Operation ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/boms/{bom_id}/operations/{operation_id} [delete]
 func (h *Handler) DeleteBOMOperation(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2445,6 +2693,17 @@ func (h *Handler) DeleteBOMOperation(c *gin.Context) {
 // =====================================================
 
 // ListScrapReasons returns all scrap reasons
+// ListScrapReasons godoc
+// @Summary List scrap reasons
+// @Description Get all available scrap reasons for inventory write-offs
+// @Tags Inventory - Scrap
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/scrap/reasons [get]
 func (h *Handler) ListScrapReasons(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2491,6 +2750,19 @@ func (h *Handler) ListScrapReasons(c *gin.Context) {
 }
 
 // CreateScrapReason creates a new scrap reason
+// CreateScrapReason godoc
+// @Summary Create scrap reason
+// @Description Create a new scrap reason for categorizing inventory write-offs
+// @Tags Inventory - Scrap
+// @Accept json
+// @Produce json
+// @Param reason body entity.ScrapReasonInput true "Scrap reason details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/scrap/reasons [post]
 func (h *Handler) CreateScrapReason(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2539,6 +2811,22 @@ func (h *Handler) CreateScrapReason(c *gin.Context) {
 }
 
 // ListScrapOrders returns a paginated list of scrap orders
+// ListScrapOrders godoc
+// @Summary List scrap orders
+// @Description Get a paginated list of inventory scrap/write-off orders
+// @Tags Inventory - Scrap
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param search query string false "Search by reference"
+// @Param status query string false "Filter by status"
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/scrap/orders [get]
 func (h *Handler) ListScrapOrders(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2678,6 +2966,20 @@ func (h *Handler) ListScrapOrders(c *gin.Context) {
 }
 
 // GetScrapOrder returns a single scrap order
+// GetScrapOrder godoc
+// @Summary Get scrap order details
+// @Description Get detailed information about a specific scrap order
+// @Tags Inventory - Scrap
+// @Accept json
+// @Produce json
+// @Param id path string true "Scrap Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/scrap/orders/{id} [get]
 func (h *Handler) GetScrapOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2737,6 +3039,19 @@ func (h *Handler) GetScrapOrder(c *gin.Context) {
 }
 
 // CreateScrapOrder creates a new scrap order
+// CreateScrapOrder godoc
+// @Summary Create scrap order
+// @Description Create a new inventory scrap/write-off order
+// @Tags Inventory - Scrap
+// @Accept json
+// @Produce json
+// @Param order body entity.ScrapOrderInput true "Scrap order details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/scrap/orders [post]
 func (h *Handler) CreateScrapOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2836,6 +3151,20 @@ func (h *Handler) CreateScrapOrder(c *gin.Context) {
 }
 
 // ConfirmScrapOrder confirms and processes a scrap order
+// ConfirmScrapOrder godoc
+// @Summary Confirm scrap order
+// @Description Confirm and process a scrap order to write off inventory
+// @Tags Inventory - Scrap
+// @Accept json
+// @Produce json
+// @Param id path string true "Scrap Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/scrap/orders/{id}/confirm [post]
 func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2946,6 +3275,20 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 }
 
 // CancelScrapOrder cancels a scrap order
+// CancelScrapOrder godoc
+// @Summary Cancel scrap order
+// @Description Cancel a pending scrap order
+// @Tags Inventory - Scrap
+// @Accept json
+// @Produce json
+// @Param id path string true "Scrap Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/scrap/orders/{id}/cancel [post]
 func (h *Handler) CancelScrapOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2980,6 +3323,19 @@ func (h *Handler) CancelScrapOrder(c *gin.Context) {
 }
 
 // GetScrapSummary returns scrap statistics
+// GetScrapSummary godoc
+// @Summary Get scrap summary
+// @Description Get summary statistics of scrap orders and inventory write-offs
+// @Tags Inventory - Scrap
+// @Accept json
+// @Produce json
+// @Param start_date query string false "Start date (YYYY-MM-DD)"
+// @Param end_date query string false "End date (YYYY-MM-DD)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/scrap/summary [get]
 func (h *Handler) GetScrapSummary(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3033,6 +3389,22 @@ func (h *Handler) GetScrapSummary(c *gin.Context) {
 // =====================================================
 
 // ListReorderRules returns a paginated list of reorder rules
+// ListReorderRules godoc
+// @Summary List reorder rules
+// @Description Get a paginated list of automatic reorder rules
+// @Tags Inventory - Reorder
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param product_id query string false "Filter by product ID"
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Param active query boolean false "Filter by active status"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/reorder/rules [get]
 func (h *Handler) ListReorderRules(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3172,6 +3544,20 @@ func (h *Handler) ListReorderRules(c *gin.Context) {
 }
 
 // GetReorderRule returns a single reorder rule
+// GetReorderRule godoc
+// @Summary Get reorder rule details
+// @Description Get detailed information about a specific reorder rule
+// @Tags Inventory - Reorder
+// @Accept json
+// @Produce json
+// @Param id path string true "Reorder Rule ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/reorder/rules/{id} [get]
 func (h *Handler) GetReorderRule(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3242,6 +3628,19 @@ func (h *Handler) GetReorderRule(c *gin.Context) {
 }
 
 // CreateReorderRule creates a new reorder rule
+// CreateReorderRule godoc
+// @Summary Create reorder rule
+// @Description Create a new automatic reorder rule for a product
+// @Tags Inventory - Reorder
+// @Accept json
+// @Produce json
+// @Param rule body entity.ReorderRuleInput true "Reorder rule details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/reorder/rules [post]
 func (h *Handler) CreateReorderRule(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3332,6 +3731,21 @@ func (h *Handler) CreateReorderRule(c *gin.Context) {
 }
 
 // UpdateReorderRule updates a reorder rule
+// UpdateReorderRule godoc
+// @Summary Update reorder rule
+// @Description Update an existing reorder rule
+// @Tags Inventory - Reorder
+// @Accept json
+// @Produce json
+// @Param id path string true "Reorder Rule ID"
+// @Param rule body entity.ReorderRuleInput true "Reorder rule details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/reorder/rules/{id} [put]
 func (h *Handler) UpdateReorderRule(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3431,6 +3845,20 @@ func (h *Handler) UpdateReorderRule(c *gin.Context) {
 }
 
 // DeleteReorderRule deletes a reorder rule
+// DeleteReorderRule godoc
+// @Summary Delete reorder rule
+// @Description Delete a reorder rule
+// @Tags Inventory - Reorder
+// @Accept json
+// @Produce json
+// @Param id path string true "Reorder Rule ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/reorder/rules/{id} [delete]
 func (h *Handler) DeleteReorderRule(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3461,6 +3889,18 @@ func (h *Handler) DeleteReorderRule(c *gin.Context) {
 }
 
 // GetReorderAlerts returns products that need reordering based on rules
+// GetReorderAlerts godoc
+// @Summary Get reorder alerts
+// @Description Get a list of products that need reordering based on their reorder rules
+// @Tags Inventory - Reorder
+// @Accept json
+// @Produce json
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/reorder/alerts [get]
 func (h *Handler) GetReorderAlerts(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3561,6 +4001,19 @@ func (h *Handler) GetReorderAlerts(c *gin.Context) {
 }
 
 // RunReplenishment creates purchase orders for products that need replenishment
+// RunReplenishment godoc
+// @Summary Run inventory replenishment
+// @Description Automatically create purchase orders for products that need replenishment based on reorder rules
+// @Tags Inventory - Reorder
+// @Accept json
+// @Produce json
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Param confirm query boolean false "Confirm and create purchase orders" default(false)
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/replenishment/run [post]
 func (h *Handler) RunReplenishment(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3835,6 +4288,18 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 }
 
 // GetReplenishmentPreview returns a preview of what replenishment would create without actually creating orders
+// GetReplenishmentPreview godoc
+// @Summary Preview replenishment orders
+// @Description Get a preview of purchase orders that would be created by replenishment without actually creating them
+// @Tags Inventory - Reorder
+// @Accept json
+// @Produce json
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /inventory/replenishment/preview [get]
 func (h *Handler) GetReplenishmentPreview(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {

@@ -16,6 +16,20 @@ import (
 )
 
 // ListSalesOrders returns paginated list of sales orders
+// ListSalesOrders godoc
+// @Summary List sales orders
+// @Description Get a paginated list of sales orders
+// @Tags Sales
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param status query string false "Filter by status (draft, confirmed, invoiced)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /sales/orders [get]
 func (h *Handler) ListSalesOrders(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -261,6 +275,19 @@ type SimpleSalesOrderInput struct {
 }
 
 // CreateSalesOrder creates a new sales order
+// CreateSalesOrder godoc
+// @Summary Create a new sales order
+// @Description Create a new sales order with line items, customer info, and pricing details
+// @Tags Sales
+// @Accept json
+// @Produce json
+// @Param order body SimpleSalesOrderInput true "Sales order details"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /sales/orders [post]
 func (h *Handler) CreateSalesOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -577,6 +604,20 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 }
 
 // GetSalesOrder returns a single sales order by ID
+// GetSalesOrder godoc
+// @Summary Get a sales order by ID
+// @Description Retrieve detailed information about a specific sales order including line items
+// @Tags Sales
+// @Accept json
+// @Produce json
+// @Param id path string true "Sales Order ID (UUID)"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /sales/orders/{id} [get]
 func (h *Handler) GetSalesOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -777,6 +818,21 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 }
 
 // UpdateSalesOrder updates an existing sales order
+// UpdateSalesOrder godoc
+// @Summary Update a sales order
+// @Description Update sales order details. Only draft orders can have full updates. Status updates are allowed for any status. When status changes to 'shipped', inventory is automatically decreased and journal entries are created.
+// @Tags Sales
+// @Accept json
+// @Produce json
+// @Param id path string true "Sales Order ID (UUID)"
+// @Param order body entity.UpdateSalesOrderInput true "Updated sales order details"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /sales/orders/{id} [put]
 func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1211,6 +1267,20 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 }
 
 // DeleteSalesOrder soft deletes a sales order
+// DeleteSalesOrder godoc
+// @Summary Delete a sales order
+// @Description Soft delete a sales order. Only orders in draft status can be deleted.
+// @Tags Sales
+// @Accept json
+// @Produce json
+// @Param id path string true "Sales Order ID (UUID)"
+// @Success 204 "No Content"
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /sales/orders/{id} [delete]
 func (h *Handler) DeleteSalesOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1255,6 +1325,20 @@ func (h *Handler) DeleteSalesOrder(c *gin.Context) {
 }
 
 // ConfirmSalesOrder confirms a draft sales order and auto-creates a Delivery Order
+// ConfirmSalesOrder godoc
+// @Summary Confirm a sales order
+// @Description Confirm a draft sales order and automatically create a delivery order. Only draft orders can be confirmed.
+// @Tags Sales
+// @Accept json
+// @Produce json
+// @Param id path string true "Sales Order ID (UUID)"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /sales/orders/{id}/confirm [post]
 func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1394,6 +1478,20 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 }
 
 // CancelSalesOrder cancels a sales order
+// CancelSalesOrder godoc
+// @Summary Cancel a sales order
+// @Description Cancel a sales order. Draft and confirmed orders can be cancelled. Delivered orders cannot be cancelled.
+// @Tags Sales
+// @Accept json
+// @Produce json
+// @Param id path string true "Sales Order ID (UUID)"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /sales/orders/{id}/cancel [post]
 func (h *Handler) CancelSalesOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1437,6 +1535,20 @@ func (h *Handler) CancelSalesOrder(c *gin.Context) {
 }
 
 // CreateInvoiceFromOrder creates an invoice from a sales order
+// CreateInvoiceFromOrder godoc
+// @Summary Create invoice from sales order
+// @Description Generate a sales invoice from an existing sales order. The order must be in confirmed, processing, shipped, or delivered status. Automatically copies all order lines to the invoice.
+// @Tags Sales
+// @Accept json
+// @Produce json
+// @Param id path string true "Sales Order ID (UUID)"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /sales/orders/{id}/invoice [post]
 func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
