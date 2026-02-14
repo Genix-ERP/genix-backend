@@ -213,9 +213,10 @@ type ProductionOrderResponse struct {
 	ProductID            uuid.UUID   `json:"product_id"`
 	ProductName          string      `json:"product_name"`
 	ProductCode          string      `json:"product_code"`
-	BOMID                *uuid.UUID  `json:"bom_id,omitempty"`
-	BOMName              *string     `json:"bom_name,omitempty"`
-	QuantityPlanned      float64     `json:"quantity_planned"`
+	BOMID                *uuid.UUID                `json:"bom_id,omitempty"`
+	BOMName              *string                   `json:"bom_name,omitempty"`
+	BOMOperations        []map[string]interface{}  `json:"bom_operations,omitempty"`
+	QuantityPlanned      float64                   `json:"quantity_planned"`
 	QuantityProduced     float64     `json:"quantity_produced"`
 	QuantityScrapped     float64     `json:"quantity_scrapped"`
 	QuantityRemaining    float64     `json:"quantity_remaining"`
