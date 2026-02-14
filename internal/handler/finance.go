@@ -4832,7 +4832,7 @@ func (h *Handler) GetBankReconciliation(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Reconciliation ID"
-// @Param body body entity.UpdateBankReconciliationInput true "Reconciliation update data"
+// @Param notes body string false "Notes"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 404 {object} response.Response
