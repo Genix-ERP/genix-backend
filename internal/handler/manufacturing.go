@@ -1071,6 +1071,50 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 		}
 	}
 
+	// Fetch BOM operations if BOM exists
+	if po.BOMID != nil {
+		bomOpsQuery := `
+			SELECT id, sequence, operation_name, work_center_id, setup_time_minutes,
+				   run_time_minutes, labor_cost, overhead_cost, notes
+			FROM bom_operations
+			WHERE bom_id = $1
+			ORDER BY sequence ASC
+		`
+		bomOpsRows, err := h.db.Query(bomOpsQuery, *po.BOMID)
+		if err == nil {
+			defer bomOpsRows.Close()
+			po.BOMOperations = []map[string]interface{}{}
+			for bomOpsRows.Next() {
+				var opID uuid.UUID
+				var sequence int
+				var operationName string
+				var workCenterID *uuid.UUID
+				var setupTime, runTime, laborCost, overheadCost float64
+				var notes sql.NullString
+
+				err := bomOpsRows.Scan(&opID, &sequence, &operationName, &workCenterID,
+					&setupTime, &runTime, &laborCost, &overheadCost, &notes)
+				if err == nil {
+					op := map[string]interface{}{
+						"id":                 opID,
+						"sequence":           sequence,
+						"name":               operationName,
+						"operation_name":     operationName,
+						"work_center_id":     workCenterID,
+						"setup_time_minutes": setupTime,
+						"run_time_minutes":   runTime,
+						"labor_cost":         laborCost,
+						"overhead_cost":      overheadCost,
+					}
+					if notes.Valid {
+						op["notes"] = notes.String
+					}
+					po.BOMOperations = append(po.BOMOperations, op)
+				}
+			}
+		}
+	}
+
 	response.Success(c, po)
 }
 
