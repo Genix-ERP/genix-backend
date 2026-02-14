@@ -2536,7 +2536,8 @@ func (h *Handler) ListQualityChecks(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	qualityChecks := []entity.QualityCheckResponse{}
+	// Initialize as empty array (never nil) to ensure JSON marshals to [] not null
+	qualityChecks := make([]entity.QualityCheckResponse, 0)
 	for rows.Next() {
 		var qc entity.QualityCheckResponse
 		var poCode, woCode, productName, productCode sql.NullString
@@ -2577,6 +2578,11 @@ func (h *Handler) ListQualityChecks(c *gin.Context) {
 		qc.Attachments = []string{}
 
 		qualityChecks = append(qualityChecks, qc)
+	}
+
+	// Ensure we always return an array, never nil
+	if qualityChecks == nil {
+		qualityChecks = make([]entity.QualityCheckResponse, 0)
 	}
 
 	pagination := entity.NewPagination(filter.Page, filter.Limit)
@@ -2875,18 +2881,35 @@ func (h *Handler) GetQualityStats(c *gin.Context) {
 		ORDER BY count DESC
 		LIMIT 5
 	`
-	rows, _ := h.db.Query(defectsQuery, tenantID)
+	rows, err := h.db.Query(defectsQuery, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query top defects", "error", err)
+		// Continue with empty defects rather than failing the whole request
+		response.Success(c, map[string]interface{}{
+			"summary":     stats,
+			"top_defects": []map[string]interface{}{},
+		})
+		return
+	}
 	defer rows.Close()
 
-	topDefects := []map[string]interface{}{}
+	topDefects := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var defectType string
 		var count int
-		rows.Scan(&defectType, &count)
+		if err := rows.Scan(&defectType, &count); err != nil {
+			h.log.Error("Failed to scan defect", "error", err)
+			continue
+		}
 		topDefects = append(topDefects, map[string]interface{}{
 			"defect_type": defectType,
 			"count":       count,
 		})
+	}
+
+	// Ensure we always return an array, even if empty
+	if topDefects == nil {
+		topDefects = make([]map[string]interface{}, 0)
 	}
 
 	response.Success(c, map[string]interface{}{
@@ -2928,15 +2951,22 @@ func (h *Handler) ListQualityDefects(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	defects := []entity.QualityDefect{}
+	// Initialize as empty array to ensure JSON marshals to [] not null
+	defects := make([]entity.QualityDefect, 0)
 	for rows.Next() {
 		var d entity.QualityDefect
 		err := rows.Scan(&d.ID, &d.Code, &d.Name, &d.Description, &d.Category, &d.Severity, &d.DefaultAction, &d.IsActive, &d.CreatedAt, &d.UpdatedAt)
 		if err != nil {
+			h.log.Error("Failed to scan quality defect", "error", err)
 			continue
 		}
 		d.TenantID = tenantID
 		defects = append(defects, d)
+	}
+
+	// Ensure we always return an array, never nil
+	if defects == nil {
+		defects = make([]entity.QualityDefect, 0)
 	}
 
 	response.Success(c, defects)
