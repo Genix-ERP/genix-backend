@@ -1415,9 +1415,11 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 	}
 
 	userID, userIDExists := middleware.GetUserID(c)
-	var createdByID *uuid.UUID
+	var createdByID interface{}
 	if userIDExists && userID != uuid.Nil {
-		createdByID = &userID
+		createdByID = userID
+	} else {
+		createdByID = nil
 	}
 
 	idStr := c.Param("id")
