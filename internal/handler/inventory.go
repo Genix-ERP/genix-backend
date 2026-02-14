@@ -2330,7 +2330,6 @@ func (h *Handler) ListBOMOperations(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param bom_id path string true "BOM ID"
-// @Param operation body entity.CreateBOMOperationInput true "Operation details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -2465,7 +2464,6 @@ func (h *Handler) CreateBOMOperation(c *gin.Context) {
 // @Produce json
 // @Param bom_id path string true "BOM ID"
 // @Param operation_id path string true "Operation ID"
-// @Param operation body entity.CreateBOMOperationInput true "Operation details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response

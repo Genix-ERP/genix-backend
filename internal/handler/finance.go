@@ -5829,7 +5829,6 @@ type CreateFiscalYearInput struct {
 // @Tags Finance - Fiscal Years
 // @Accept json
 // @Produce json
-// @Param body body entity.CreateFiscalYearInput true "Fiscal year creation data"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -5924,7 +5923,6 @@ func (h *Handler) CreateFiscalYear(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Fiscal Year ID"
-// @Param body body entity.UpdateFiscalYearInput true "Fiscal year update data"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -6207,7 +6205,6 @@ type CreateFiscalPeriodInput struct {
 // @Tags Finance - Fiscal Periods
 // @Accept json
 // @Produce json
-// @Param body body entity.CreateFiscalPeriodInput true "Fiscal period creation data"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -6300,7 +6297,6 @@ type BatchCreateFiscalPeriodsInput struct {
 // @Tags Finance - Fiscal Periods
 // @Accept json
 // @Produce json
-// @Param body body entity.BatchCreateFiscalPeriodsInput true "Batch fiscal periods creation data"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -6763,7 +6759,6 @@ func (h *Handler) GetBudget(c *gin.Context) {
 // @Tags Finance - Budgets
 // @Accept json
 // @Produce json
-// @Param body body entity.CreateBudgetInput true "Budget creation data"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -6890,7 +6885,6 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Budget ID"
-// @Param body body entity.UpdateBudgetInput true "Budget update data"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -7147,7 +7141,6 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 // @Tags Finance - Budget Lines
 // @Accept json
 // @Produce json
-// @Param body body entity.CreateBudgetLineInput true "Budget line creation data"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -7244,7 +7237,6 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Budget Line ID"
-// @Param body body entity.UpdateBudgetLineInput true "Budget line update data"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -7651,7 +7643,6 @@ func (h *Handler) GetRecurringJournalTemplate(c *gin.Context) {
 // @Tags Finance - Recurring Journals
 // @Accept json
 // @Produce json
-// @Param body body entity.CreateRecurringJournalTemplateInput true "Template creation data"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -7786,7 +7777,6 @@ func (h *Handler) CreateRecurringJournalTemplate(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Template ID"
-// @Param body body entity.UpdateRecurringJournalTemplateInput true "Template update data"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
