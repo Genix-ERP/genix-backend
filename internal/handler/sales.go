@@ -1,0 +1,1605 @@
+package handler
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/genixerp/genix-backend/internal/domain/entity"
+	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/response"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// ListSalesOrders returns paginated list of sales orders
+func (h *Handler) ListSalesOrders(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	// Pagination
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
+
+	// Build query with filters - JOIN with contacts to get customer_name
+	baseQuery := `
+		SELECT so.id, so.tenant_id, so.organization_id, so.order_number, so.customer_id, so.contact_person_id,
+			   so.order_date, so.expected_date, so.billing_address, so.shipping_address,
+			   so.currency_id, so.exchange_rate, so.subtotal, so.discount_type, so.discount_value, so.discount_amount,
+			   so.tax_amount, so.shipping_amount, so.total_amount, so.status, so.payment_status, so.payment_terms,
+			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.sales_rep_id,
+			   so.approved_by, so.approved_at, so.created_by, so.created_at, so.updated_at,
+			   COALESCE(c.name, '') as customer_name
+		FROM sales_orders so
+		LEFT JOIN contacts c ON so.customer_id = c.id
+		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM sales_orders so WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND so.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND so.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
+	// Filter by status
+	if status := c.Query("status"); status != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND so.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND so.status = $%d", argCount)
+		args = append(args, status)
+	}
+
+	// Filter by payment_status
+	if paymentStatus := c.Query("payment_status"); paymentStatus != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND so.payment_status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND so.payment_status = $%d", argCount)
+		args = append(args, paymentStatus)
+	}
+
+	// Filter by customer_id
+	if customerID := c.Query("customer_id"); customerID != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND so.customer_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND so.customer_id = $%d", argCount)
+		args = append(args, customerID)
+	}
+
+	// Filter by date range
+	if dateFrom := c.Query("date_from"); dateFrom != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND so.order_date >= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND so.order_date >= $%d", argCount)
+		args = append(args, dateFrom)
+	}
+	if dateTo := c.Query("date_to"); dateTo != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND so.order_date <= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND so.order_date <= $%d", argCount)
+		args = append(args, dateTo)
+	}
+
+	// Search - also search by customer name
+	if search := c.Query("search"); search != "" {
+		argCount++
+		searchPattern := "%" + strings.ToLower(search) + "%"
+		baseQuery += fmt.Sprintf(" AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d)", argCount, argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d)", argCount, argCount, argCount)
+		args = append(args, searchPattern)
+	}
+
+	// Get total count
+	var total int
+	err := h.db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		response.InternalError(c, "Failed to count sales orders")
+		return
+	}
+
+	// Add sorting and pagination
+	baseQuery += fmt.Sprintf(" ORDER BY so.created_at DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	args = append(args, pageSize, offset)
+
+	rows, err := h.db.Query(baseQuery, args...)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch sales orders: "+err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var orders []map[string]interface{}
+	for rows.Next() {
+		var id, tenantIDScan, customerID uuid.UUID
+		var organizationID, contactPersonID, currencyID, warehouseID, salesRepID, approvedBy, createdBy sql.NullString
+		var orderNumber, customerName string
+		var orderDate time.Time
+		var expectedDate, approvedAt sql.NullTime
+		var billingAddress, shippingAddress []byte
+		var exchangeRate, subtotal, discountValue, discountAmount, taxAmount, shippingAmount, totalAmount float64
+		var discountType, status, paymentStatus, reference, poNumber, notes, internalNotes sql.NullString
+		var paymentTerms int
+		var createdAt, updatedAt time.Time
+
+		err := rows.Scan(
+			&id, &tenantIDScan, &organizationID, &orderNumber, &customerID, &contactPersonID,
+			&orderDate, &expectedDate, &billingAddress, &shippingAddress,
+			&currencyID, &exchangeRate, &subtotal, &discountType, &discountValue, &discountAmount,
+			&taxAmount, &shippingAmount, &totalAmount, &status, &paymentStatus, &paymentTerms,
+			&reference, &poNumber, &notes, &internalNotes, &warehouseID, &salesRepID,
+			&approvedBy, &approvedAt, &createdBy, &createdAt, &updatedAt,
+			&customerName,
+		)
+		if err != nil {
+			continue
+		}
+
+		order := map[string]interface{}{
+			"id":              id.String(),
+			"tenant_id":       tenantIDScan.String(),
+			"order_number":    orderNumber,
+			"customer_id":     customerID.String(),
+			"customer_name":   customerName,
+			"order_date":      orderDate.Format("2006-01-02"),
+			"exchange_rate":   exchangeRate,
+			"subtotal":        subtotal,
+			"discount_value":  discountValue,
+			"discount_amount": discountAmount,
+			"tax_amount":      taxAmount,
+			"shipping_amount": shippingAmount,
+			"total_amount":    totalAmount,
+			"status":          status.String,
+			"payment_status":  paymentStatus.String,
+			"payment_terms":   paymentTerms,
+			"created_at":      createdAt,
+			"updated_at":      updatedAt,
+		}
+
+		if organizationID.Valid {
+			order["organization_id"] = organizationID.String
+		}
+		if contactPersonID.Valid {
+			order["contact_person_id"] = contactPersonID.String
+		}
+		if expectedDate.Valid {
+			order["expected_date"] = expectedDate.Time.Format("2006-01-02")
+		}
+		if currencyID.Valid {
+			order["currency_id"] = currencyID.String
+		}
+		if discountType.Valid {
+			order["discount_type"] = discountType.String
+		}
+		if reference.Valid {
+			order["reference"] = reference.String
+		}
+		if poNumber.Valid {
+			order["po_number"] = poNumber.String
+		}
+		if notes.Valid {
+			order["notes"] = notes.String
+		}
+		if warehouseID.Valid {
+			order["warehouse_id"] = warehouseID.String
+		}
+		if salesRepID.Valid {
+			order["sales_rep_id"] = salesRepID.String
+		}
+
+		// Parse addresses
+		if len(billingAddress) > 0 {
+			var addr map[string]interface{}
+			if json.Unmarshal(billingAddress, &addr) == nil {
+				order["billing_address"] = addr
+			}
+		}
+		if len(shippingAddress) > 0 {
+			var addr map[string]interface{}
+			if json.Unmarshal(shippingAddress, &addr) == nil {
+				order["shipping_address"] = addr
+			}
+		}
+
+		orders = append(orders, order)
+	}
+
+	response.Paginated(c, orders, page, pageSize, total)
+}
+
+// SimpleSalesOrderInput represents a simplified input for creating sales orders from frontend
+type SimpleSalesOrderInput struct {
+	// Standard API fields
+	OrganizationID  string                              `json:"organization_id,omitempty"`
+	CustomerID      string                              `json:"customer_id,omitempty"`
+	ContactPersonID string                              `json:"contact_person_id,omitempty"`
+	OrderDate       string                              `json:"order_date"`
+	ExpectedDate    string                              `json:"expected_date,omitempty"`
+	DeliveryDate    string                              `json:"delivery_date,omitempty"`
+	BillingAddress  *entity.Address                     `json:"billing_address,omitempty"`
+	ShippingAddress *entity.Address                     `json:"shipping_address,omitempty"`
+	CurrencyID      string                              `json:"currency_id,omitempty"`
+	DiscountType    string                              `json:"discount_type,omitempty"`
+	DiscountValue   float64                             `json:"discount_value,omitempty"`
+	DiscountAmount  float64                             `json:"discount_amount,omitempty"`
+	DiscountCode    string                              `json:"discount_code,omitempty"`
+	ShippingAmount  float64                             `json:"shipping_amount,omitempty"`
+	ShippingCost    float64                             `json:"shipping_cost,omitempty"`
+	PaymentTerms    int                                 `json:"payment_terms,omitempty"`
+	Reference       string                              `json:"reference,omitempty"`
+	PONumber        string                              `json:"po_number,omitempty"`
+	Notes           string                              `json:"notes,omitempty"`
+	InternalNotes   string                              `json:"internal_notes,omitempty"`
+	WarehouseID     string                              `json:"warehouse_id,omitempty"`
+	Carrier         string                              `json:"carrier,omitempty"`
+	SalesRepID      string                              `json:"sales_rep_id,omitempty"`
+	Lines           []entity.CreateSalesOrderLineInput  `json:"lines,omitempty"`
+
+	// Simplified frontend fields
+	OrderNumber   string  `json:"order_number,omitempty"`
+	CustomerName  string  `json:"customer_name,omitempty"`
+	Subtotal      float64 `json:"subtotal,omitempty"`
+	TaxAmount     float64 `json:"tax_amount,omitempty"`
+	TotalAmount   float64 `json:"total_amount,omitempty"`
+	Status        string  `json:"status,omitempty"`
+	PaymentStatus string  `json:"payment_status,omitempty"`
+}
+
+// CreateSalesOrder creates a new sales order
+func (h *Handler) CreateSalesOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input SimpleSalesOrderInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Handle customer - either by ID or by name lookup
+	var customerID uuid.UUID
+	var customerName string
+	var err error
+
+	if input.CustomerID != "" {
+		customerID, err = uuid.Parse(input.CustomerID)
+		if err != nil {
+			response.BadRequest(c, "Invalid customer_id")
+			return
+		}
+		// Get customer name for response
+		h.db.QueryRow("SELECT name FROM contacts WHERE id = $1 AND tenant_id = $2", customerID, tenantID).Scan(&customerName)
+	} else if input.CustomerName != "" {
+		// Try to find customer by name, or create a placeholder contact
+		customerName = input.CustomerName
+		err = h.db.QueryRow(
+			"SELECT id FROM contacts WHERE tenant_id = $1 AND name ILIKE $2 LIMIT 1",
+			tenantID, input.CustomerName,
+		).Scan(&customerID)
+		if err == sql.ErrNoRows {
+			// Create a placeholder contact for this customer
+			customerID = uuid.New()
+			now := time.Now()
+			// Generate a unique code for the contact
+			contactCode := "CUST-" + uuid.New().String()[:8]
+			_, execErr := h.db.Exec(`
+				INSERT INTO contacts (id, tenant_id, type, code, name, created_at, updated_at)
+				VALUES ($1, $2, 'customer', $3, $4, $5, $6)`,
+				customerID, tenantID, contactCode, input.CustomerName, now, now,
+			)
+			if execErr != nil {
+				h.log.Error("Failed to create placeholder contact", "error", execErr)
+				response.InternalError(c, "Failed to create customer contact")
+				return
+			}
+		} else if err != nil {
+			response.InternalError(c, "Failed to lookup customer")
+			return
+		}
+	} else {
+		response.BadRequest(c, "Either customer_id or customer_name is required")
+		return
+	}
+
+	// Parse order date
+	orderDateStr := input.OrderDate
+	if orderDateStr == "" {
+		orderDateStr = time.Now().Format("2006-01-02")
+	}
+	orderDate, err := time.Parse("2006-01-02", orderDateStr[:10]) // Handle ISO format
+	if err != nil {
+		response.BadRequest(c, "Invalid order_date format, expected YYYY-MM-DD")
+		return
+	}
+
+	// Generate order number
+	orderNumber := input.OrderNumber
+	if orderNumber == "" {
+		orderNumber = "SO-" + time.Now().Format("20060102") + "-" + uuid.New().String()[:6]
+	}
+
+	orderID := uuid.New()
+	now := time.Now()
+
+	// Calculate totals - either from lines or from provided totals
+	var subtotal, taxAmount, discountAmount, totalAmount float64
+	shippingAmount := input.ShippingAmount
+	if shippingAmount == 0 {
+		shippingAmount = input.ShippingCost
+	}
+
+	if len(input.Lines) > 0 {
+		// Calculate from lines
+		for _, line := range input.Lines {
+			lineTotal := line.Quantity * line.UnitPrice
+			var lineDiscount float64
+			if line.DiscountType == "percentage" && line.DiscountValue > 0 {
+				lineDiscount = lineTotal * line.DiscountValue / 100
+			} else if line.DiscountType == "fixed" && line.DiscountValue > 0 {
+				lineDiscount = line.DiscountValue
+			}
+			subtotal += lineTotal - lineDiscount
+		}
+		// Apply order-level discount - prefer frontend's calculated discount_amount
+		if input.DiscountAmount > 0 {
+			discountAmount = input.DiscountAmount
+		} else if input.DiscountType == "percentage" && input.DiscountValue > 0 {
+			discountAmount = subtotal * input.DiscountValue / 100
+		} else if input.DiscountType == "fixed" && input.DiscountValue > 0 {
+			discountAmount = input.DiscountValue
+		}
+		// Use frontend's total if provided, otherwise calculate
+		if input.TotalAmount > 0 {
+			totalAmount = input.TotalAmount
+		} else {
+			totalAmount = subtotal - discountAmount + taxAmount + shippingAmount
+		}
+	} else {
+		// Use provided totals from frontend
+		subtotal = input.Subtotal
+		taxAmount = input.TaxAmount
+		discountAmount = input.DiscountAmount // Use discount amount from frontend
+		totalAmount = input.TotalAmount
+		if totalAmount == 0 {
+			totalAmount = subtotal + taxAmount + shippingAmount - discountAmount
+		}
+	}
+
+	// Marshal addresses to JSON - use nil for NULL in DB, or JSON string for value
+	var billingAddressJSON, shippingAddressJSON *string
+	if input.BillingAddress != nil {
+		b, _ := json.Marshal(input.BillingAddress)
+		s := string(b)
+		billingAddressJSON = &s
+	}
+	if input.ShippingAddress != nil {
+		b, _ := json.Marshal(input.ShippingAddress)
+		s := string(b)
+		shippingAddressJSON = &s
+	}
+
+	// Parse expected date if provided
+	var expectedDate *time.Time
+	if input.ExpectedDate != "" {
+		ed, err := time.Parse("2006-01-02", input.ExpectedDate)
+		if err == nil {
+			expectedDate = &ed
+		}
+	}
+
+	// Parse optional UUIDs
+	var contactPersonID, currencyID, warehouseID, salesRepID *uuid.UUID
+	if input.ContactPersonID != "" {
+		id, _ := uuid.Parse(input.ContactPersonID)
+		contactPersonID = &id
+	}
+	if input.CurrencyID != "" {
+		id, _ := uuid.Parse(input.CurrencyID)
+		currencyID = &id
+	}
+	if input.WarehouseID != "" {
+		id, _ := uuid.Parse(input.WarehouseID)
+		warehouseID = &id
+	}
+	if input.SalesRepID != "" {
+		id, _ := uuid.Parse(input.SalesRepID)
+		salesRepID = &id
+	}
+
+	var createdBy *uuid.UUID
+	if userID != uuid.Nil {
+		createdBy = &userID
+	}
+
+	// Parse organization ID
+	var orgID *uuid.UUID
+	if input.OrganizationID != "" {
+		parsed, parseErr := uuid.Parse(input.OrganizationID)
+		if parseErr == nil {
+			orgID = &parsed
+		}
+	}
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
+		}
+	}
+
+	// Insert sales order
+	query := `
+		INSERT INTO sales_orders (
+			id, tenant_id, organization_id, order_number, customer_id, contact_person_id,
+			order_date, expected_date, billing_address, shipping_address,
+			currency_id, exchange_rate, subtotal, discount_type, discount_value, discount_amount, discount_code,
+			tax_amount, shipping_amount, total_amount, status, payment_status, payment_terms,
+			reference, po_number, notes, internal_notes, warehouse_id, carrier, sales_rep_id,
+			created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)`
+
+	// Handle discount code - use nil for empty string
+	var discountCode *string
+	if input.DiscountCode != "" {
+		discountCode = &input.DiscountCode
+	}
+
+	_, err = h.db.Exec(query,
+		orderID, tenantID, orgID, orderNumber, customerID, contactPersonID,
+		orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
+		currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
+		taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
+		input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, salesRepID,
+		createdBy, now, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create sales order", "error", err, "customer_id", customerID, "order_number", orderNumber)
+		response.InternalError(c, "Failed to create sales order: "+err.Error())
+		return
+	}
+
+	// Insert order lines
+	for i, line := range input.Lines {
+		lineID := uuid.New()
+		productID, _ := uuid.Parse(line.ProductID)
+
+		lineTotal := line.Quantity * line.UnitPrice
+		var lineDiscount float64
+		if line.DiscountType == "percentage" && line.DiscountValue > 0 {
+			lineDiscount = lineTotal * line.DiscountValue / 100
+		} else if line.DiscountType == "fixed" && line.DiscountValue > 0 {
+			lineDiscount = line.DiscountValue
+		}
+
+		var unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
+		if line.UnitID != "" {
+			id, _ := uuid.Parse(line.UnitID)
+			unitID = &id
+		}
+		if line.TaxID != "" {
+			id, _ := uuid.Parse(line.TaxID)
+			taxID = &id
+		}
+		if line.WarehouseID != "" {
+			id, _ := uuid.Parse(line.WarehouseID)
+			lineWarehouseID = &id
+		}
+		if line.PackagingID != "" {
+			id, _ := uuid.Parse(line.PackagingID)
+			packagingID = &id
+		}
+
+		lineQuery := `
+			INSERT INTO sales_order_lines (
+				id, sales_order_id, line_number, product_id, description,
+				quantity, unit_id, unit_price, discount_type, discount_value, discount_amount,
+				tax_id, tax_amount, line_total, quantity_delivered, quantity_invoiced,
+				warehouse_id, notes, packaging_id, packaging_qty, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`
+
+		h.db.Exec(lineQuery,
+			lineID, orderID, i+1, productID, line.Description,
+			line.Quantity, unitID, line.UnitPrice, line.DiscountType, line.DiscountValue, lineDiscount,
+			taxID, 0.0, lineTotal-lineDiscount, 0.0, 0.0,
+			lineWarehouseID, line.Notes, packagingID, line.PackagingQty, now, now,
+		)
+	}
+
+	// Use frontend status/payment_status if provided, otherwise use defaults
+	orderStatus := input.Status
+	if orderStatus == "" {
+		orderStatus = string(entity.OrderStatusDraft)
+	}
+	paymentStatus := input.PaymentStatus
+	if paymentStatus == "" {
+		paymentStatus = string(entity.PaymentStatusUnpaid)
+	}
+
+	// Return created order with customer_name for frontend
+	orderResponse := map[string]interface{}{
+		"id":              orderID.String(),
+		"tenant_id":       tenantID.String(),
+		"order_number":    orderNumber,
+		"customer_id":     customerID.String(),
+		"customer_name":   customerName, // Include customer_name for frontend
+		"order_date":      orderDate.Format("2006-01-02"),
+		"subtotal":        subtotal,
+		"discount_type":   input.DiscountType,
+		"discount_value":  input.DiscountValue,
+		"discount_amount": discountAmount,
+		"discount_code":   input.DiscountCode,
+		"tax_amount":      taxAmount,
+		"shipping_amount": shippingAmount,
+		"shipping_cost":   shippingAmount, // Alias for frontend
+		"total_amount":    totalAmount,
+		"status":          orderStatus,
+		"payment_status":  paymentStatus,
+		"payment_terms":   input.PaymentTerms,
+		"created_at":      now,
+		"created_date":    now.Format(time.RFC3339), // Alias for frontend
+	}
+
+	if input.Reference != "" {
+		orderResponse["reference"] = input.Reference
+	}
+	if input.PONumber != "" {
+		orderResponse["po_number"] = input.PONumber
+	}
+	if input.Notes != "" {
+		orderResponse["notes"] = input.Notes
+	}
+	if expectedDate != nil {
+		orderResponse["expected_date"] = expectedDate.Format("2006-01-02")
+		orderResponse["delivery_date"] = expectedDate.Format("2006-01-02") // Alias for frontend
+	} else if input.DeliveryDate != "" {
+		orderResponse["delivery_date"] = input.DeliveryDate
+	}
+
+	response.Created(c, orderResponse)
+}
+
+// GetSalesOrder returns a single sales order by ID
+func (h *Handler) GetSalesOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	orderID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid order ID")
+		return
+	}
+
+	// Get order with customer name
+	query := `
+		SELECT so.id, so.tenant_id, so.organization_id, so.order_number, so.customer_id, so.contact_person_id,
+			   so.order_date, so.expected_date, so.billing_address, so.shipping_address,
+			   so.currency_id, so.exchange_rate, so.subtotal, so.discount_type, so.discount_value, so.discount_amount,
+			   so.tax_amount, so.shipping_amount, so.total_amount, so.status, so.payment_status, so.payment_terms,
+			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.sales_rep_id,
+			   so.approved_by, so.approved_at, so.created_by, so.created_at, so.updated_at,
+			   COALESCE(c.name, '') as customer_name
+		FROM sales_orders so
+		LEFT JOIN contacts c ON so.customer_id = c.id
+		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`
+
+	var id, tenantIDScan, customerID uuid.UUID
+	var organizationID, contactPersonID, currencyID, warehouseID, salesRepID, approvedBy, createdBy sql.NullString
+	var orderNumber, customerName string
+	var orderDate time.Time
+	var expectedDate, approvedAt sql.NullTime
+	var billingAddress, shippingAddress []byte
+	var exchangeRate, subtotal, discountValue, discountAmount, taxAmount, shippingAmount, totalAmount float64
+	var discountType, status, paymentStatus, reference, poNumber, notes, internalNotes sql.NullString
+	var paymentTerms int
+	var createdAt, updatedAt time.Time
+
+	err = h.db.QueryRow(query, orderID, tenantID).Scan(
+		&id, &tenantIDScan, &organizationID, &orderNumber, &customerID, &contactPersonID,
+		&orderDate, &expectedDate, &billingAddress, &shippingAddress,
+		&currencyID, &exchangeRate, &subtotal, &discountType, &discountValue, &discountAmount,
+		&taxAmount, &shippingAmount, &totalAmount, &status, &paymentStatus, &paymentTerms,
+		&reference, &poNumber, &notes, &internalNotes, &warehouseID, &salesRepID,
+		&approvedBy, &approvedAt, &createdBy, &createdAt, &updatedAt,
+		&customerName,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Sales order")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		return
+	}
+
+	order := map[string]interface{}{
+		"id":              id.String(),
+		"tenant_id":       tenantIDScan.String(),
+		"order_number":    orderNumber,
+		"customer_id":     customerID.String(),
+		"customer_name":   customerName,
+		"order_date":      orderDate.Format("2006-01-02"),
+		"exchange_rate":   exchangeRate,
+		"subtotal":        subtotal,
+		"discount_value":  discountValue,
+		"discount_amount": discountAmount,
+		"tax_amount":      taxAmount,
+		"shipping_amount": shippingAmount,
+		"total_amount":    totalAmount,
+		"status":          status.String,
+		"payment_status":  paymentStatus.String,
+		"payment_terms":   paymentTerms,
+		"created_at":      createdAt,
+		"updated_at":      updatedAt,
+	}
+
+	if organizationID.Valid {
+		order["organization_id"] = organizationID.String
+	}
+	if contactPersonID.Valid {
+		order["contact_person_id"] = contactPersonID.String
+	}
+	if expectedDate.Valid {
+		order["expected_date"] = expectedDate.Time.Format("2006-01-02")
+	}
+	if currencyID.Valid {
+		order["currency_id"] = currencyID.String
+	}
+	if discountType.Valid {
+		order["discount_type"] = discountType.String
+	}
+	if reference.Valid {
+		order["reference"] = reference.String
+	}
+	if poNumber.Valid {
+		order["po_number"] = poNumber.String
+	}
+	if notes.Valid {
+		order["notes"] = notes.String
+	}
+	if internalNotes.Valid {
+		order["internal_notes"] = internalNotes.String
+	}
+	if warehouseID.Valid {
+		order["warehouse_id"] = warehouseID.String
+	}
+	if salesRepID.Valid {
+		order["sales_rep_id"] = salesRepID.String
+	}
+
+	// Get order lines with product name and packaging info
+	linesQuery := `
+		SELECT sol.id, sol.line_number, sol.product_id, sol.description, sol.quantity, sol.unit_id, sol.unit_price,
+			   sol.discount_type, sol.discount_value, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total,
+			   sol.quantity_delivered, sol.quantity_invoiced, sol.warehouse_id, sol.notes,
+			   sol.packaging_id, sol.packaging_qty,
+			   COALESCE(p.name, '') as product_name,
+			   COALESCE(pp.name, '') as packaging_name, COALESCE(pp.qty, 0) as packaging_unit_qty
+		FROM sales_order_lines sol
+		LEFT JOIN products p ON p.id = sol.product_id
+		LEFT JOIN product_packagings pp ON pp.id = sol.packaging_id
+		WHERE sol.sales_order_id = $1
+		ORDER BY sol.line_number`
+
+	linesRows, err := h.db.Query(linesQuery, orderID)
+	if err == nil {
+		defer linesRows.Close()
+		var lines []map[string]interface{}
+		for linesRows.Next() {
+			var lineID, productID uuid.UUID
+			var lineNumber int
+			var description, lineDiscountType, lineNotes sql.NullString
+			var quantity, unitPrice, lineDiscountValue, lineDiscountAmount, lineTaxAmount, lineTotal, qtyDelivered, qtyInvoiced float64
+			var unitID, taxID, lineWarehouseID, packagingID sql.NullString
+			var packagingQty sql.NullFloat64
+			var productName, packagingName string
+			var packagingUnitQty float64
+
+			err := linesRows.Scan(
+				&lineID, &lineNumber, &productID, &description, &quantity, &unitID, &unitPrice,
+				&lineDiscountType, &lineDiscountValue, &lineDiscountAmount, &taxID, &lineTaxAmount, &lineTotal,
+				&qtyDelivered, &qtyInvoiced, &lineWarehouseID, &lineNotes,
+				&packagingID, &packagingQty,
+				&productName, &packagingName, &packagingUnitQty,
+			)
+			if err != nil {
+				continue
+			}
+
+			line := map[string]interface{}{
+				"id":                 lineID.String(),
+				"line_number":        lineNumber,
+				"product_id":         productID.String(),
+				"product_name":       productName,
+				"quantity":           quantity,
+				"unit_price":         unitPrice,
+				"discount_value":     lineDiscountValue,
+				"discount_amount":    lineDiscountAmount,
+				"tax_amount":         lineTaxAmount,
+				"line_total":         lineTotal,
+				"quantity_delivered": qtyDelivered,
+				"quantity_invoiced":  qtyInvoiced,
+			}
+
+			if description.Valid {
+				line["description"] = description.String
+			}
+			if unitID.Valid {
+				line["unit_id"] = unitID.String
+			}
+			if lineDiscountType.Valid {
+				line["discount_type"] = lineDiscountType.String
+			}
+			if taxID.Valid {
+				line["tax_id"] = taxID.String
+			}
+			if lineWarehouseID.Valid {
+				line["warehouse_id"] = lineWarehouseID.String
+			}
+			if lineNotes.Valid {
+				line["notes"] = lineNotes.String
+			}
+			if packagingID.Valid {
+				line["packaging_id"] = packagingID.String
+				line["packaging_name"] = packagingName
+				line["packaging_unit_qty"] = packagingUnitQty
+			}
+			if packagingQty.Valid {
+				line["packaging_qty"] = packagingQty.Float64
+			}
+
+			lines = append(lines, line)
+		}
+		order["lines"] = lines
+	}
+
+	response.Success(c, order)
+}
+
+// UpdateSalesOrder updates an existing sales order
+func (h *Handler) UpdateSalesOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	orderID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid order ID")
+		return
+	}
+
+	var input entity.UpdateSalesOrderInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Check if order exists
+	var currentStatus string
+	err = h.db.QueryRow("SELECT status FROM sales_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", orderID, tenantID).Scan(&currentStatus)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Sales order")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch sales order")
+		return
+	}
+
+	// Allow status updates from any status, but restrict other field updates to draft orders
+	isStatusOnlyUpdate := input.Status != nil && input.ExpectedDate == nil && input.DiscountType == nil &&
+		input.DiscountValue == nil && input.ShippingAmount == nil && input.PaymentTerms == nil &&
+		input.Reference == nil && input.PONumber == nil && input.Notes == nil &&
+		input.InternalNotes == nil && input.WarehouseID == nil && input.Carrier == nil &&
+		input.SalesRepID == nil && input.PaymentStatus == nil
+
+	if !isStatusOnlyUpdate && currentStatus != string(entity.OrderStatusDraft) {
+		response.BadRequest(c, "Can only update order details in draft status")
+		return
+	}
+
+	// Build dynamic update query
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if input.ExpectedDate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("expected_date = $%d", argCount))
+		if *input.ExpectedDate != "" {
+			ed, _ := time.Parse("2006-01-02", *input.ExpectedDate)
+			args = append(args, ed)
+		} else {
+			args = append(args, nil)
+		}
+	}
+	if input.DiscountType != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("discount_type = $%d", argCount))
+		args = append(args, *input.DiscountType)
+	}
+	if input.DiscountValue != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("discount_value = $%d", argCount))
+		args = append(args, *input.DiscountValue)
+	}
+	if input.ShippingAmount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("shipping_amount = $%d", argCount))
+		args = append(args, *input.ShippingAmount)
+	}
+	if input.PaymentTerms != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("payment_terms = $%d", argCount))
+		args = append(args, *input.PaymentTerms)
+	}
+	if input.Reference != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("reference = $%d", argCount))
+		args = append(args, *input.Reference)
+	}
+	if input.PONumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("po_number = $%d", argCount))
+		args = append(args, *input.PONumber)
+	}
+	if input.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		args = append(args, *input.Notes)
+	}
+	if input.InternalNotes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("internal_notes = $%d", argCount))
+		args = append(args, *input.InternalNotes)
+	}
+	if input.WarehouseID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+		if *input.WarehouseID != "" {
+			wid, _ := uuid.Parse(*input.WarehouseID)
+			args = append(args, wid)
+		} else {
+			args = append(args, nil)
+		}
+	}
+	if input.SalesRepID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("sales_rep_id = $%d", argCount))
+		if *input.SalesRepID != "" {
+			sid, _ := uuid.Parse(*input.SalesRepID)
+			args = append(args, sid)
+		} else {
+			args = append(args, nil)
+		}
+	}
+	if input.Carrier != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("carrier = $%d", argCount))
+		args = append(args, *input.Carrier)
+	}
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+	}
+	if input.PaymentStatus != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("payment_status = $%d", argCount))
+		args = append(args, *input.PaymentStatus)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	// Add updated_at
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+
+	// Add WHERE clause params
+	argCount++
+	args = append(args, orderID)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf("UPDATE sales_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
+		strings.Join(updates, ", "), argCount-1, argCount)
+
+	_, err = h.db.Exec(query, args...)
+	if err != nil {
+		response.InternalError(c, "Failed to update sales order: "+err.Error())
+		return
+	}
+
+	// ============================================
+	// DECREASE INVENTORY WHEN SO STATUS → "shipped"
+	// ============================================
+	if input.Status != nil && *input.Status == "shipped" {
+		now := time.Now()
+
+		// Get SO warehouse_id and organization_id
+		var soWarehouseID sql.NullString
+		var soOrgID sql.NullString
+		h.db.QueryRow("SELECT warehouse_id, organization_id FROM sales_orders WHERE id = $1", orderID).Scan(&soWarehouseID, &soOrgID)
+
+		// Determine warehouse
+		var warehouseID uuid.UUID
+		if soWarehouseID.Valid && soWarehouseID.String != "" {
+			warehouseID, _ = uuid.Parse(soWarehouseID.String)
+		} else {
+			// Try delivery order's warehouse
+			h.db.QueryRow(`
+				SELECT warehouse_id FROM sales_delivery_orders
+				WHERE sales_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+				ORDER BY created_at DESC LIMIT 1
+			`, orderID, tenantID).Scan(&warehouseID)
+
+			if warehouseID == uuid.Nil {
+				// Fallback to org's first warehouse
+				if soOrgID.Valid && soOrgID.String != "" {
+					orgID, _ := uuid.Parse(soOrgID.String)
+					h.db.QueryRow(`
+						SELECT id FROM warehouses
+						WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID, orgID).Scan(&warehouseID)
+				}
+				if warehouseID == uuid.Nil {
+					h.db.QueryRow(`
+						SELECT id FROM warehouses
+						WHERE tenant_id = $1 AND deleted_at IS NULL
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID).Scan(&warehouseID)
+				}
+			}
+		}
+
+		if warehouseID != uuid.Nil {
+			// Get SO lines
+			soLines, err := h.db.Query(`
+				SELECT id, product_id, quantity, unit_price
+				FROM sales_order_lines
+				WHERE sales_order_id = $1 AND product_id IS NOT NULL
+			`, orderID)
+			if err == nil {
+				defer soLines.Close()
+				for soLines.Next() {
+					var lineID, productID uuid.UUID
+					var qty, unitPrice float64
+					if err := soLines.Scan(&lineID, &productID, &qty, &unitPrice); err != nil {
+						continue
+					}
+
+					// Update quantity_delivered on SO line
+					h.db.Exec(`
+						UPDATE sales_order_lines
+						SET quantity_delivered = quantity, updated_at = $1
+						WHERE id = $2
+					`, now, lineID)
+
+					// Find inventory record
+					var inventoryID uuid.UUID
+					err := h.db.QueryRow(`
+						SELECT id FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID, productID, warehouseID).Scan(&inventoryID)
+
+					if err != nil {
+						h.log.Error("No inventory record found for SO shipment", "product_id", productID, "warehouse_id", warehouseID)
+						continue
+					}
+
+					// Decrease inventory
+					h.db.Exec(`
+						UPDATE inventory
+						SET quantity_on_hand = quantity_on_hand - $1,
+							last_movement_date = $2,
+							updated_at = $2
+						WHERE id = $3
+					`, qty, now, inventoryID)
+
+					// Create inventory transaction
+					txID := uuid.New()
+					h.db.Exec(`
+						INSERT INTO inventory_transactions (
+							id, tenant_id, inventory_id, transaction_type, quantity,
+							unit_cost, total_cost, reference_type, reference_id,
+							reason, transaction_date, created_at
+						) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'sales_order', $7, 'Sales Order Shipped', $8, $8)
+					`, txID, tenantID, inventoryID, -qty, unitPrice, qty*unitPrice, orderID, now)
+				}
+			}
+
+			// Also update any draft delivery orders to shipped
+			h.db.Exec(`
+				UPDATE sales_delivery_orders
+				SET status = 'shipped', updated_at = $1
+				WHERE sales_order_id = $2 AND tenant_id = $3 AND status != 'shipped' AND deleted_at IS NULL
+			`, now, orderID, tenantID)
+
+			h.log.Info("Inventory decreased from SO shipped", "so_id", orderID)
+		}
+
+		// ============================================
+		// CREATE JOURNAL ENTRY: Debit Stock Interim Delivery, Credit Stock Valuation (Odoo-style)
+		// Stock movement only — AR/Revenue entries created when invoice is sent
+		// ============================================
+		var soNumber string
+		var soCustomerName sql.NullString
+		var soCustomerID sql.NullString
+		var soOrgIDForJE sql.NullString
+		h.db.QueryRow(`
+			SELECT so.order_number, c.name, so.customer_id, so.organization_id
+			FROM sales_orders so
+			LEFT JOIN contacts c ON so.customer_id = c.id
+			WHERE so.id = $1
+		`, orderID).Scan(&soNumber, &soCustomerName, &soCustomerID, &soOrgIDForJE)
+
+		{
+			var orgIDPtr *uuid.UUID
+			if soOrgIDForJE.Valid && soOrgIDForJE.String != "" {
+				parsed, _ := uuid.Parse(soOrgIDForJE.String)
+				if parsed != uuid.Nil {
+					orgIDPtr = &parsed
+				}
+			}
+
+			// Get SO lines with cost price for stock movement JE
+			type soLineAcct struct {
+				ProductID  uuid.UUID
+				CostAmount float64
+				OutputAcct uuid.UUID
+				ValuationAcct uuid.UUID
+			}
+			var soLines []soLineAcct
+			rows, err := h.db.Query(`
+				SELECT sol.product_id, sol.quantity, COALESCE(p.cost_price, 0)
+				FROM sales_order_lines sol
+				JOIN products p ON sol.product_id = p.id
+				WHERE sol.sales_order_id = $1
+			`, orderID)
+			if err == nil {
+				type rawSOLine struct {
+					ProductID uuid.UUID
+					Qty       float64
+					CostPrice float64
+				}
+				var rawLines []rawSOLine
+				for rows.Next() {
+					var rl rawSOLine
+					if err := rows.Scan(&rl.ProductID, &rl.Qty, &rl.CostPrice); err == nil && rl.CostPrice > 0 && rl.Qty > 0 {
+						rawLines = append(rawLines, rl)
+					}
+				}
+				rows.Close()
+				// Resolve category accounts after closing rows
+				for _, rl := range rawLines {
+					ca := getCategoryAccounts(h.db, tenantID, orgIDPtr, rl.ProductID)
+					soLines = append(soLines, soLineAcct{
+						ProductID:     rl.ProductID,
+						CostAmount:    rl.Qty * rl.CostPrice,
+						OutputAcct:    ca.StockOutputAccountID,
+						ValuationAcct: ca.StockValuationAccountID,
+					})
+				}
+			}
+
+			// Group by account pair
+			type acctPair struct {
+				Debit  uuid.UUID
+				Credit uuid.UUID
+			}
+			grouped := make(map[acctPair]float64)
+			for _, sl := range soLines {
+				key := acctPair{Debit: sl.OutputAcct, Credit: sl.ValuationAcct}
+				grouped[key] += sl.CostAmount
+			}
+
+			if len(grouped) > 0 {
+				// Calculate total cost for JE header
+				var totalCost float64
+				for _, amt := range grouped {
+					totalCost += amt
+				}
+
+				// Find stock journal or general
+				var journalID uuid.UUID
+				var nextNumber int
+				err := h.db.QueryRow(`
+					SELECT id, next_number FROM journals
+					WHERE tenant_id = $1 AND type = 'sales' AND is_active = true
+					ORDER BY created_at ASC LIMIT 1
+				`, tenantID).Scan(&journalID, &nextNumber)
+				if err != nil {
+					h.db.QueryRow(`
+						SELECT id, next_number FROM journals
+						WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID).Scan(&journalID, &nextNumber)
+				}
+
+				if journalID != uuid.Nil {
+					entryID := uuid.New()
+					entryNumber := fmt.Sprintf("SAL%06d", nextNumber)
+					customerName := ""
+					if soCustomerName.Valid {
+						customerName = soCustomerName.String
+					}
+					description := fmt.Sprintf("Goods Delivery %s - %s", soNumber, customerName)
+
+					var contactID *uuid.UUID
+					if soCustomerID.Valid {
+						parsed, _ := uuid.Parse(soCustomerID.String)
+						if parsed != uuid.Nil {
+							contactID = &parsed
+						}
+					}
+
+					h.db.Exec(`
+						INSERT INTO journal_entries (
+							id, tenant_id, organization_id, journal_id, entry_number,
+							entry_date, description, source_type, source_id, status, total_debit, total_credit,
+							created_at, updated_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'sales_order', $8, 'posted', $9, $9, $10, $10)
+					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
+						now, description, orderID.String(), totalCost, now)
+
+					lineNumber := 1
+					for pair, amount := range grouped {
+						// Debit: Stock Interim Delivery
+						debitLineID := uuid.New()
+						h.db.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, account_id, contact_id, description,
+								debit_amount, credit_amount, line_number, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
+						`, debitLineID, entryID, pair.Debit, contactID, "Stock Interim Delivery", amount, lineNumber, now)
+						lineNumber++
+
+						// Credit: Stock Valuation
+						creditLineID := uuid.New()
+						h.db.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, account_id, contact_id, description,
+								debit_amount, credit_amount, line_number, created_at
+							) VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)
+						`, creditLineID, entryID, pair.Credit, contactID, "Stock Valuation", amount, lineNumber, now)
+						lineNumber++
+
+						// Update account balances
+						h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Debit)
+						h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Credit)
+					}
+
+					// Update journal next_number
+					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+
+					h.log.Info("Stock movement JE created for SO shipped (Odoo-style)", "entry_id", entryID, "cost", totalCost)
+				}
+			}
+		}
+	}
+
+	// Fetch and return updated order
+	h.GetSalesOrder(c)
+}
+
+// DeleteSalesOrder soft deletes a sales order
+func (h *Handler) DeleteSalesOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	orderID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid order ID")
+		return
+	}
+
+	// Check if order is in draft status
+	var currentStatus string
+	err = h.db.QueryRow("SELECT status FROM sales_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", orderID, tenantID).Scan(&currentStatus)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Sales order")
+		return
+	}
+	if currentStatus != string(entity.OrderStatusDraft) {
+		response.BadRequest(c, "Can only delete orders in draft status")
+		return
+	}
+
+	result, err := h.db.Exec(
+		"UPDATE sales_orders SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL",
+		time.Now(), orderID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to delete sales order")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Sales order")
+		return
+	}
+
+	response.NoContent(c)
+}
+
+// ConfirmSalesOrder confirms a draft sales order and auto-creates a Delivery Order
+func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	orderID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid order ID")
+		return
+	}
+
+	// Get order details including warehouse_id and carrier for the delivery order
+	var currentStatus, orderNumber string
+	var customerID uuid.UUID
+	var customerName sql.NullString
+	var warehouseID sql.NullString
+	var carrier sql.NullString
+	var expectedDate sql.NullTime
+
+	err = h.db.QueryRow(`
+		SELECT so.status, so.order_number, so.customer_id, c.name, so.warehouse_id, so.carrier, so.expected_date
+		FROM sales_orders so
+		LEFT JOIN contacts c ON so.customer_id = c.id
+		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`,
+		orderID, tenantID).Scan(&currentStatus, &orderNumber, &customerID, &customerName, &warehouseID, &carrier, &expectedDate)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Sales order")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		return
+	}
+	if currentStatus != string(entity.OrderStatusDraft) {
+		response.BadRequest(c, "Can only confirm orders in draft status")
+		return
+	}
+
+	now := time.Now()
+
+	// Update sales order status to confirmed
+	_, err = h.db.Exec(
+		"UPDATE sales_orders SET status = $1, approved_by = $2, approved_at = $3, updated_at = $4 WHERE id = $5 AND tenant_id = $6",
+		entity.OrderStatusConfirmed, userID, now, now, orderID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to confirm sales order")
+		return
+	}
+
+	// Auto-create Delivery Order (Odoo-like behavior)
+	doID := uuid.New()
+	doNumber := "DO-" + time.Now().Format("20060102150405")
+
+	// Set delivery date to expected_date or today
+	deliveryDate := now
+	if expectedDate.Valid {
+		deliveryDate = expectedDate.Time
+	}
+
+	// Parse warehouse_id if valid, otherwise get default warehouse
+	var warehouseUUID *uuid.UUID
+	if warehouseID.Valid && warehouseID.String != "" {
+		wid, parseErr := uuid.Parse(warehouseID.String)
+		if parseErr == nil {
+			warehouseUUID = &wid
+		}
+	}
+
+	// If no warehouse specified, get the default warehouse for this tenant
+	if warehouseUUID == nil {
+		var defaultWarehouseID uuid.UUID
+		err := h.db.QueryRow(`
+			SELECT id FROM warehouses
+			WHERE tenant_id = $1 AND is_default = true AND deleted_at IS NULL
+			LIMIT 1
+		`, tenantID).Scan(&defaultWarehouseID)
+		if err == nil {
+			warehouseUUID = &defaultWarehouseID
+		} else {
+			// If no default, try to get any warehouse
+			err = h.db.QueryRow(`
+				SELECT id FROM warehouses
+				WHERE tenant_id = $1 AND deleted_at IS NULL
+				LIMIT 1
+			`, tenantID).Scan(&defaultWarehouseID)
+			if err == nil {
+				warehouseUUID = &defaultWarehouseID
+			}
+		}
+	}
+
+	// Insert delivery order
+	var carrierValue *string
+	if carrier.Valid && carrier.String != "" {
+		carrierValue = &carrier.String
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO sales_delivery_orders (
+			id, tenant_id, delivery_number, sales_order_id, so_number,
+			customer_id, customer_name, delivery_date, scheduled_date, warehouse_id, carrier,
+			status, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $13)`,
+		doID, tenantID, doNumber, orderID, orderNumber,
+		customerID, customerName.String, deliveryDate, expectedDate, warehouseUUID, carrierValue,
+		userID, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create delivery order", "error", err)
+		// Don't fail the confirmation, just log the error
+	} else {
+		// Copy SO lines to DO lines for remaining quantities
+		_, err = h.db.Exec(`
+			INSERT INTO sales_delivery_order_lines (
+				id, delivery_order_id, so_line_id, product_id, product_name,
+				quantity_ordered, quantity_to_deliver, unit_price, warehouse_id, created_at
+			)
+			SELECT uuid_generate_v4(), $1, sol.id, sol.product_id, COALESCE(p.name, 'Unknown'),
+				   sol.quantity, sol.quantity - COALESCE(sol.quantity_delivered, 0),
+				   sol.unit_price, $2, NOW()
+			FROM sales_order_lines sol
+			LEFT JOIN products p ON p.id = sol.product_id
+			WHERE sol.sales_order_id = $3 AND sol.quantity > COALESCE(sol.quantity_delivered, 0)`,
+			doID, warehouseUUID, orderID,
+		)
+		if err != nil {
+			h.log.Error("Failed to create delivery order lines", "error", err)
+		}
+	}
+
+	h.GetSalesOrder(c)
+}
+
+// CancelSalesOrder cancels a sales order
+func (h *Handler) CancelSalesOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	orderID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid order ID")
+		return
+	}
+
+	// Check current status - can cancel draft or confirmed orders
+	var currentStatus string
+	err = h.db.QueryRow("SELECT status FROM sales_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", orderID, tenantID).Scan(&currentStatus)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Sales order")
+		return
+	}
+	if currentStatus == string(entity.OrderStatusCancelled) {
+		response.BadRequest(c, "Order is already cancelled")
+		return
+	}
+	if currentStatus == string(entity.OrderStatusDelivered) {
+		response.BadRequest(c, "Cannot cancel delivered orders")
+		return
+	}
+
+	now := time.Now()
+	_, err = h.db.Exec(
+		"UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+		entity.OrderStatusCancelled, now, orderID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to cancel sales order")
+		return
+	}
+
+	h.GetSalesOrder(c)
+}
+
+// CreateInvoiceFromOrder creates an invoice from a sales order
+func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	orderID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid order ID")
+		return
+	}
+
+	// Get order details with customer name
+	var customerID uuid.UUID
+	var organizationID *uuid.UUID
+	var orderNumber string
+	var subtotal, discountAmount, taxAmount, shippingAmount, totalAmount float64
+	var paymentTerms int
+	var billingAddress, shippingAddress string
+	var currentStatus string
+	var customerName string
+
+	err = h.db.QueryRow(`
+		SELECT so.customer_id, so.organization_id, so.order_number, COALESCE(so.subtotal, 0), COALESCE(so.discount_amount, 0), COALESCE(so.tax_amount, 0), COALESCE(so.shipping_amount, 0), COALESCE(so.total_amount, 0),
+		       COALESCE(so.payment_terms, 30), COALESCE(so.billing_address::text, ''), COALESCE(so.shipping_address::text, ''), so.status,
+		       COALESCE(c.name, '')
+		FROM sales_orders so
+		LEFT JOIN contacts c ON so.customer_id = c.id
+		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`,
+		orderID, tenantID).Scan(
+		&customerID, &organizationID, &orderNumber, &subtotal, &discountAmount, &taxAmount, &shippingAmount, &totalAmount,
+		&paymentTerms, &billingAddress, &shippingAddress, &currentStatus, &customerName,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Sales order")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to fetch sales order", "error", err, "order_id", orderID)
+		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		return
+	}
+
+	h.log.Info("CreateInvoiceFromOrder: order status check", "status", currentStatus, "orderID", orderID)
+	// Allow invoice creation from confirmed, processing, shipped, or delivered orders
+	allowedStatuses := map[string]bool{
+		string(entity.OrderStatusConfirmed):  true,
+		string(entity.OrderStatusProcessing): true,
+		string(entity.OrderStatusShipped):    true,
+		string(entity.OrderStatusDelivered):  true,
+	}
+	if !allowedStatuses[currentStatus] {
+		response.BadRequest(c, "Can only create invoice from confirmed, processing, shipped, or delivered orders")
+		return
+	}
+
+	// Check if an invoice already exists for this order (prevent duplicates)
+	var existingInvoiceCount int
+	h.db.QueryRow(`
+		SELECT COUNT(*) FROM sales_invoices
+		WHERE sales_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status != 'cancelled'`,
+		orderID, tenantID).Scan(&existingInvoiceCount)
+	if existingInvoiceCount > 0 {
+		response.BadRequest(c, "An invoice already exists for this order")
+		return
+	}
+
+	invoiceID := uuid.New()
+	invoiceNumber := "INV-" + time.Now().Format("20060102") + "-" + uuid.New().String()[:6]
+	now := time.Now()
+	dueDate := now.AddDate(0, 0, paymentTerms)
+
+	var createdBy *uuid.UUID
+	if userID != uuid.Nil {
+		createdBy = &userID
+	}
+
+	// Convert addresses to interface{} for JSONB - nil for empty, otherwise the JSON string
+	var billingAddrParam, shippingAddrParam interface{}
+	if billingAddress != "" && billingAddress != "{}" {
+		billingAddrParam = []byte(billingAddress)
+	}
+	if shippingAddress != "" && shippingAddress != "{}" {
+		shippingAddrParam = []byte(shippingAddress)
+	}
+
+	// Create invoice (note: amount_due is a GENERATED column, don't insert into it)
+	h.log.Info("CreateInvoiceFromOrder: attempting INSERT",
+		"invoiceID", invoiceID,
+		"tenantID", tenantID,
+		"invoiceNumber", invoiceNumber,
+		"customerID", customerID,
+		"orderID", orderID)
+
+	_, err = h.db.Exec(`
+		INSERT INTO sales_invoices (
+			id, tenant_id, organization_id, invoice_number, customer_id, customer_name, sales_order_id,
+			invoice_date, due_date, billing_address, shipping_address,
+			exchange_rate, subtotal, discount_amount, tax_amount, total_amount,
+			amount_paid, status, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
+		invoiceID, tenantID, organizationID, invoiceNumber, customerID, customerName, orderID,
+		now, dueDate, billingAddrParam, shippingAddrParam,
+		1.0, subtotal, discountAmount, taxAmount, totalAmount,
+		0, entity.InvoiceStatusDraft, createdBy, now, now,
+	)
+	if err != nil {
+		h.log.Error("CreateInvoiceFromOrder: INSERT failed", "error", err)
+		response.InternalError(c, "Failed to create invoice: "+err.Error())
+		return
+	}
+	h.log.Info("CreateInvoiceFromOrder: INSERT succeeded")
+
+	// Copy order lines to invoice lines (join with products to get name if description is null)
+	linesRows, err := h.db.Query(`
+		SELECT sol.id, sol.line_number, sol.product_id, COALESCE(NULLIF(sol.description, ''), p.name) as description,
+		       sol.quantity, sol.unit_id, sol.unit_price, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total
+		FROM sales_order_lines sol
+		LEFT JOIN products p ON p.id = sol.product_id
+		WHERE sol.sales_order_id = $1`, orderID)
+	if err == nil {
+		defer linesRows.Close()
+		for linesRows.Next() {
+			var orderLineID, productID uuid.UUID
+			var lineNumber int
+			var description sql.NullString
+			var quantity, unitPrice, lineDiscountAmount, lineTaxAmount, lineTotal float64
+			var unitID, taxID sql.NullString
+
+			if err := linesRows.Scan(&orderLineID, &lineNumber, &productID, &description, &quantity, &unitID, &unitPrice,
+				&lineDiscountAmount, &taxID, &lineTaxAmount, &lineTotal); err != nil {
+				continue
+			}
+
+			invoiceLineID := uuid.New()
+			h.db.Exec(`
+				INSERT INTO sales_invoice_lines (
+					id, sales_invoice_id, sales_order_line_id, line_number, product_id, description,
+					quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount, line_total, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+				invoiceLineID, invoiceID, orderLineID, lineNumber, productID, description,
+				quantity, unitID, unitPrice, lineDiscountAmount, taxID, lineTaxAmount, lineTotal, now,
+			)
+		}
+	}
+
+	// Update order status to processing
+	h.db.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3",
+		entity.OrderStatusProcessing, now, orderID)
+
+	response.Created(c, map[string]interface{}{
+		"id":             invoiceID.String(),
+		"invoice_number": invoiceNumber,
+		"customer_id":    customerID.String(),
+		"sales_order_id": orderID.String(),
+		"invoice_date":   now.Format("2006-01-02"),
+		"due_date":       dueDate.Format("2006-01-02"),
+		"total_amount":   totalAmount,
+		"amount_due":     totalAmount,
+		"status":         string(entity.InvoiceStatusDraft),
+		"created_at":     now,
+	})
+}

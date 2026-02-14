@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -42,6 +43,7 @@ func (h *Handler) ListUsers(c *gin.Context) {
 	query := `
 		SELECT id, email, first_name, last_name, phone, avatar_url,
 		       language, timezone, is_active, is_verified, last_login_at,
+		       password_hash, invite_token_expires,
 		       created_at, updated_at
 		FROM users
 		WHERE tenant_id = $1 AND deleted_at IS NULL
@@ -63,13 +65,14 @@ func (h *Handler) ListUsers(c *gin.Context) {
 	var users []entity.UserResponse
 	for rows.Next() {
 		var u entity.UserResponse
-		var phone, avatar sql.NullString
-		var lastLogin sql.NullTime
+		var phone, avatar, passwordHash sql.NullString
+		var lastLogin, inviteExpires sql.NullTime
 
 		err := rows.Scan(
 			&u.ID, &u.Email, &u.FirstName, &u.LastName,
 			&phone, &avatar, &u.Language, &u.Timezone,
 			&u.IsActive, &u.IsVerified, &lastLogin,
+			&passwordHash, &inviteExpires,
 			&u.CreatedAt, &u.UpdatedAt,
 		)
 		if err != nil {
@@ -85,7 +88,11 @@ func (h *Handler) ListUsers(c *gin.Context) {
 		if lastLogin.Valid {
 			u.LastLoginAt = &lastLogin.Time
 		}
+		if inviteExpires.Valid {
+			u.InviteTokenExpires = &inviteExpires.Time
+		}
 		u.FullName = u.FirstName + " " + u.LastName
+		u.HasPassword = passwordHash.Valid && passwordHash.String != ""
 
 		users = append(users, u)
 	}
@@ -118,12 +125,16 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		return
 	}
 
-	// Hash password
-	passwordHash, err := crypto.HashPassword(input.Password)
-	if err != nil {
-		h.log.Error("Failed to hash password", "error", err)
-		response.InternalServerError(c, "")
-		return
+	// Hash password if provided
+	var passwordHash string
+	if input.Password != "" {
+		var hashErr error
+		passwordHash, hashErr = crypto.HashPassword(input.Password)
+		if hashErr != nil {
+			h.log.Error("Failed to hash password", "error", hashErr)
+			response.InternalServerError(c, "")
+			return
+		}
 	}
 
 	// Set defaults
@@ -136,12 +147,12 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		timezone = "UTC"
 	}
 
-	// Create user
+	// Create user (password_hash can be empty for invite flow)
 	userID := uuid.New()
 	_, err = h.db.Exec(`
-		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, phone, language, timezone, settings, is_active)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}', true)
-	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, input.Phone, language, timezone)
+		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, phone, language, timezone, settings, is_active, is_verified)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}', true, $10)
+	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, input.Phone, language, timezone, passwordHash != "")
 
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
@@ -318,8 +329,13 @@ func (h *Handler) DeleteUser(c *gin.Context) {
 		return
 	}
 
+	// Hard delete user to free up the email for reuse
+	// First delete related records
+	h.db.Exec("DELETE FROM user_roles WHERE user_id = $1", userID)
+	h.db.Exec("DELETE FROM refresh_tokens WHERE user_id = $1", userID)
+
 	result, err := h.db.Exec(
-		"UPDATE users SET deleted_at = NOW() WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+		"DELETE FROM users WHERE id = $1 AND tenant_id = $2",
 		userID, tenantID,
 	)
 	if err != nil {
@@ -381,6 +397,240 @@ func (h *Handler) AssignRoles(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"message": "Roles assigned successfully"})
+}
+
+// ListAllSystemUsers lists tenant owners across all tenants (for system admin only)
+// This shows one owner per tenant - the primary user who manages the subscription
+func (h *Handler) ListAllSystemUsers(c *gin.Context) {
+	page := getIntParam(c, "page", 1)
+	limit := getIntParam(c, "limit", 50)
+	search := c.Query("search")
+	statusFilter := c.Query("status")
+	_ = c.Query("role") // roleFilter for future use
+
+	pagination := entity.NewPagination(page, limit)
+
+	// Count total tenant owners (users with 'owner' role or is_system_admin=true for backwards compatibility)
+	countQuery := `SELECT COUNT(DISTINCT u.id) FROM users u
+		INNER JOIN tenants t ON u.tenant_id = t.id
+		LEFT JOIN user_roles ur ON u.id = ur.user_id
+		LEFT JOIN roles r ON ur.role_id = r.id
+		WHERE u.deleted_at IS NULL
+		AND (u.is_system_admin = true OR r.code = 'owner')`
+	args := []interface{}{}
+	argIdx := 1
+
+	if search != "" {
+		countQuery += " AND (u.first_name ILIKE $" + itoa(argIdx) + " OR u.last_name ILIKE $" + itoa(argIdx) + " OR u.email ILIKE $" + itoa(argIdx) + " OR t.name ILIKE $" + itoa(argIdx) + ")"
+		args = append(args, "%"+search+"%")
+		argIdx++
+	}
+
+	if statusFilter == "blocked" {
+		countQuery += " AND u.is_active = false"
+	} else if statusFilter == "active" {
+		countQuery += " AND u.is_active = true"
+	}
+
+	var total int
+	h.db.QueryRow(countQuery, args...).Scan(&total)
+	pagination.Calculate(total)
+
+	// Query tenant owners with tenant info and user count
+	// Find users with 'owner' role or is_system_admin=true for backwards compatibility
+	query := `
+		SELECT DISTINCT u.id, u.email, u.first_name, u.last_name, u.phone, u.avatar_url,
+		       u.language, u.timezone, u.is_active, u.is_verified, u.last_login_at,
+		       u.created_at, u.updated_at,
+		       t.id as tenant_id, t.name as tenant_name, t.code as tenant_code,
+		       t.subscription_plan, t.subscription_status,
+		       COALESCE(u.is_system_admin, false) as is_system_admin,
+		       (SELECT COUNT(*) FROM users u2 WHERE u2.tenant_id = t.id AND u2.deleted_at IS NULL) as user_count
+		FROM users u
+		INNER JOIN tenants t ON u.tenant_id = t.id
+		LEFT JOIN user_roles ur ON u.id = ur.user_id
+		LEFT JOIN roles r ON ur.role_id = r.id
+		WHERE u.deleted_at IS NULL
+		AND (u.is_system_admin = true OR r.code = 'owner')
+	`
+
+	// Reset args for main query
+	args = []interface{}{}
+	argIdx = 1
+
+	if search != "" {
+		query += " AND (u.first_name ILIKE $" + itoa(argIdx) + " OR u.last_name ILIKE $" + itoa(argIdx) + " OR u.email ILIKE $" + itoa(argIdx) + " OR t.name ILIKE $" + itoa(argIdx) + ")"
+		args = append(args, "%"+search+"%")
+		argIdx++
+	}
+
+	if statusFilter == "blocked" {
+		query += " AND u.is_active = false"
+	} else if statusFilter == "active" {
+		query += " AND u.is_active = true"
+	}
+
+	query += " ORDER BY u.created_at DESC LIMIT $" + itoa(argIdx) + " OFFSET $" + itoa(argIdx+1)
+	args = append(args, pagination.Limit, pagination.Offset())
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list all system users", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+	defer rows.Close()
+
+	type TenantOwnerResponse struct {
+		ID            uuid.UUID  `json:"id"`
+		Email         string     `json:"email"`
+		FirstName     string     `json:"first_name"`
+		LastName      string     `json:"last_name"`
+		FullName      string     `json:"full_name"`
+		Phone         *string    `json:"phone,omitempty"`
+		AvatarURL     *string    `json:"avatar_url,omitempty"`
+		Language      string     `json:"language"`
+		Timezone      string     `json:"timezone"`
+		IsActive      bool       `json:"is_active"`
+		IsVerified    bool       `json:"is_verified"`
+		IsSystemAdmin bool       `json:"is_system_admin"`
+		LastLoginAt   *time.Time `json:"last_login_at,omitempty"`
+		CreatedAt     time.Time  `json:"created_at"`
+		UpdatedAt     time.Time  `json:"updated_at"`
+		// Tenant info
+		TenantID   *uuid.UUID `json:"tenant_id,omitempty"`
+		TenantName *string    `json:"tenant_name,omitempty"`
+		TenantCode *string    `json:"tenant_code,omitempty"`
+		UserCount  int        `json:"user_count"` // Number of users in tenant
+		// Subscription info from tenant
+		SubscriptionPlan   string `json:"subscription_plan"`
+		SubscriptionStatus string `json:"subscription_status"`
+		// Frontend compatibility
+		Status string `json:"status"`
+		Role   string `json:"role"`
+	}
+
+	var users []TenantOwnerResponse
+	for rows.Next() {
+		var u TenantOwnerResponse
+		var phone, avatar sql.NullString
+		var lastLogin sql.NullTime
+		var tenantID sql.NullString
+		var tenantName, tenantCode sql.NullString
+		var subscriptionPlan, subscriptionStatus sql.NullString
+
+		err := rows.Scan(
+			&u.ID, &u.Email, &u.FirstName, &u.LastName,
+			&phone, &avatar, &u.Language, &u.Timezone,
+			&u.IsActive, &u.IsVerified, &lastLogin,
+			&u.CreatedAt, &u.UpdatedAt,
+			&tenantID, &tenantName, &tenantCode,
+			&subscriptionPlan, &subscriptionStatus,
+			&u.IsSystemAdmin, &u.UserCount,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan tenant owner", "error", err)
+			continue
+		}
+
+		if phone.Valid {
+			u.Phone = &phone.String
+		}
+		if avatar.Valid {
+			u.AvatarURL = &avatar.String
+		}
+		if lastLogin.Valid {
+			u.LastLoginAt = &lastLogin.Time
+		}
+		if tenantID.Valid {
+			if parsed, err := uuid.Parse(tenantID.String); err == nil {
+				u.TenantID = &parsed
+			}
+		}
+		if tenantName.Valid {
+			u.TenantName = &tenantName.String
+		}
+		if tenantCode.Valid {
+			u.TenantCode = &tenantCode.String
+		}
+		if subscriptionPlan.Valid {
+			u.SubscriptionPlan = subscriptionPlan.String
+		} else {
+			u.SubscriptionPlan = "free"
+		}
+		if subscriptionStatus.Valid {
+			u.SubscriptionStatus = subscriptionStatus.String
+		} else {
+			u.SubscriptionStatus = "trial"
+		}
+
+		u.FullName = u.FirstName + " " + u.LastName
+
+		// Set status for frontend (based on user account status)
+		if !u.IsActive {
+			u.Status = "blocked"
+		} else if u.IsVerified {
+			u.Status = "active"
+		} else {
+			u.Status = "trial"
+		}
+
+		// Role is always owner for tenant owners
+		u.Role = "owner"
+
+		users = append(users, u)
+	}
+
+	response.SuccessWithMeta(c, users, pagination)
+}
+
+// DeleteSystemUser soft-deletes a user (for system admin only)
+// This marks the user as deleted without removing data
+func (h *Handler) DeleteSystemUser(c *gin.Context) {
+	userID := c.Param("id")
+	if userID == "" {
+		response.BadRequest(c, "User ID is required")
+		return
+	}
+
+	parsedID, err := uuid.Parse(userID)
+	if err != nil {
+		response.BadRequest(c, "Invalid user ID format")
+		return
+	}
+
+	// Get the user's email before deletion for the response
+	var email string
+	err = h.db.QueryRow("SELECT email FROM users WHERE id = $1 AND deleted_at IS NULL", parsedID).Scan(&email)
+	if err != nil {
+		response.NotFound(c, "User not found")
+		return
+	}
+
+	// Soft delete the user (set deleted_at)
+	now := time.Now()
+	result, err := h.db.Exec(`
+		UPDATE users SET deleted_at = $1, updated_at = $1, is_active = false
+		WHERE id = $2 AND deleted_at IS NULL
+	`, now, parsedID)
+	if err != nil {
+		h.log.Error("Failed to delete user", "error", err, "user_id", parsedID)
+		response.InternalError(c, "Failed to delete user")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "User not found or already deleted")
+		return
+	}
+
+	h.log.Info("System admin deleted user", "deleted_user_id", parsedID, "email", email)
+
+	response.Success(c, map[string]interface{}{
+		"message": "User deleted successfully",
+		"email":   email,
+	})
 }
 
 // Helper functions

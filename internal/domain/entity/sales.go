@@ -103,11 +103,14 @@ type SalesOrderLine struct {
 	QuantityInvoiced  float64    `json:"quantity_invoiced" db:"quantity_invoiced"`
 	WarehouseID       *uuid.UUID `json:"warehouse_id,omitempty" db:"warehouse_id"`
 	Notes             *string    `json:"notes,omitempty" db:"notes"`
+	PackagingID       *uuid.UUID `json:"packaging_id,omitempty" db:"packaging_id"`
+	PackagingQty      *float64   `json:"packaging_qty,omitempty" db:"packaging_qty"`
 	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
-	Product *Product `json:"product,omitempty"`
+	Product   *Product          `json:"product,omitempty"`
+	Packaging *ProductPackaging `json:"packaging,omitempty"`
 }
 
 // SalesInvoice represents a sales invoice
@@ -135,8 +138,11 @@ type SalesInvoice struct {
 	PONumber        *string         `json:"po_number,omitempty" db:"po_number"`
 	Notes           *string         `json:"notes,omitempty" db:"notes"`
 	TermsConditions *string         `json:"terms_conditions,omitempty" db:"terms_conditions"`
-	JournalEntryID  *uuid.UUID      `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
-	SentAt          *time.Time      `json:"sent_at,omitempty" db:"sent_at"`
+	InvoiceType       string          `json:"invoice_type" db:"invoice_type"` // invoice, credit_note
+	OriginalInvoiceID *uuid.UUID      `json:"original_invoice_id,omitempty" db:"original_invoice_id"`
+	Reason            *string         `json:"reason,omitempty" db:"reason"`
+	JournalEntryID    *uuid.UUID      `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
+	SentAt            *time.Time      `json:"sent_at,omitempty" db:"sent_at"`
 	ViewedAt        *time.Time      `json:"viewed_at,omitempty" db:"viewed_at"`
 	CreatedBy       *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt       time.Time       `json:"created_at" db:"created_at"`
@@ -165,10 +171,29 @@ type SalesInvoiceLine struct {
 	TaxAmount        float64    `json:"tax_amount" db:"tax_amount"`
 	LineTotal        float64    `json:"line_total" db:"line_total"`
 	AccountID        *uuid.UUID `json:"account_id,omitempty" db:"account_id"`
+	PackagingID      *uuid.UUID `json:"packaging_id,omitempty" db:"packaging_id"`
+	PackagingQty     *float64   `json:"packaging_qty,omitempty" db:"packaging_qty"`
 	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
 
 	// Relationships
-	Product *Product `json:"product,omitempty"`
+	Product   *Product          `json:"product,omitempty"`
+	Packaging *ProductPackaging `json:"packaging,omitempty"`
+}
+
+// CreateCreditNoteInput represents input for creating a credit note from an invoice
+type CreateCreditNoteInput struct {
+	Reason         string                  `json:"reason" binding:"required"`
+	CreditNoteDate string                  `json:"credit_note_date"` // defaults to today
+	Lines          []CreditNoteLineInput   `json:"lines"`            // optional: partial credit; if empty, full reversal
+}
+
+// CreditNoteLineInput represents a line in a partial credit note
+type CreditNoteLineInput struct {
+	ProductID   *string `json:"product_id"`
+	Description string  `json:"description"`
+	Quantity    float64 `json:"quantity" binding:"required,gt=0"`
+	UnitPrice   float64 `json:"unit_price" binding:"required,gte=0"`
+	TaxID       *string `json:"tax_id"`
 }
 
 // CreateSalesOrderInput represents input for creating a sales order
@@ -195,16 +220,18 @@ type CreateSalesOrderInput struct {
 
 // CreateSalesOrderLineInput represents input for creating a sales order line
 type CreateSalesOrderLineInput struct {
-	ProductID     string  `json:"product_id" binding:"required"`
-	Description   string  `json:"description,omitempty"`
-	Quantity      float64 `json:"quantity" binding:"required,gt=0"`
-	UnitID        string  `json:"unit_id,omitempty"`
-	UnitPrice     float64 `json:"unit_price" binding:"required,gte=0"`
-	DiscountType  string  `json:"discount_type,omitempty"`
-	DiscountValue float64 `json:"discount_value,omitempty"`
-	TaxID         string  `json:"tax_id,omitempty"`
-	WarehouseID   string  `json:"warehouse_id,omitempty"`
-	Notes         string  `json:"notes,omitempty"`
+	ProductID     string   `json:"product_id" binding:"required"`
+	Description   string   `json:"description,omitempty"`
+	Quantity      float64  `json:"quantity" binding:"required,gt=0"`
+	UnitID        string   `json:"unit_id,omitempty"`
+	UnitPrice     float64  `json:"unit_price" binding:"required,gte=0"`
+	DiscountType  string   `json:"discount_type,omitempty"`
+	DiscountValue float64  `json:"discount_value,omitempty"`
+	TaxID         string   `json:"tax_id,omitempty"`
+	WarehouseID   string   `json:"warehouse_id,omitempty"`
+	Notes         string   `json:"notes,omitempty"`
+	PackagingID   string   `json:"packaging_id,omitempty"`
+	PackagingQty  *float64 `json:"packaging_qty,omitempty"`
 }
 
 // UpdateSalesOrderInput represents input for updating a sales order
@@ -222,7 +249,10 @@ type UpdateSalesOrderInput struct {
 	Notes           *string  `json:"notes,omitempty"`
 	InternalNotes   *string  `json:"internal_notes,omitempty"`
 	WarehouseID     *string  `json:"warehouse_id,omitempty"`
+	Carrier         *string  `json:"carrier,omitempty"`
 	SalesRepID      *string  `json:"sales_rep_id,omitempty"`
+	Status          *string  `json:"status,omitempty"`
+	PaymentStatus   *string  `json:"payment_status,omitempty"`
 }
 
 // SalesOrderListFilter represents filters for listing sales orders
@@ -241,6 +271,7 @@ type SalesOrderListFilter struct {
 // CreateSalesInvoiceInput represents input for creating a sales invoice
 type CreateSalesInvoiceInput struct {
 	CustomerID      string                        `json:"customer_id" binding:"required"`
+	OrganizationID  string                        `json:"organization_id,omitempty"`
 	SalesOrderID    string                        `json:"sales_order_id,omitempty"`
 	InvoiceDate     string                        `json:"invoice_date" binding:"required"`
 	DueDate         string                        `json:"due_date" binding:"required"`

@@ -16,6 +16,10 @@ import (
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
+
+	swaggerFiles "github.com/swaggo/files"
+	ginSwagger "github.com/swaggo/gin-swagger"
+	_ "github.com/genixerp/genix-backend/docs" // swagger docs
 )
 
 // @title GenixERP API
@@ -96,9 +100,19 @@ func main() {
 	router.GET("/health", handler.HealthCheck(db, redisClient))
 	router.GET("/ready", handler.ReadinessCheck(db, redisClient))
 
+	// Swagger documentation endpoint
+	router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+
+	// Serve favicon
+	router.StaticFile("/favicon.ico", "./static/favicon.png")
+	router.StaticFile("/favicon.png", "./static/favicon.png")
+
 	// Initialize and register all handlers
 	h := handler.NewHandler(db, redisClient, cfg, log)
 	h.RegisterRoutes(router)
+
+	// Start workflow automation scheduler (checks thresholds every 15 minutes)
+	h.RunWorkflowScheduler(15 * time.Minute)
 
 	// Create HTTP server
 	server := &http.Server{

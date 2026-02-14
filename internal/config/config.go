@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 // Config holds all application configuration
@@ -21,6 +23,12 @@ type Config struct {
 	Storage   StorageConfig
 	Email     EmailConfig
 	Queue     QueueConfig
+	Google    GoogleConfig
+}
+
+// GoogleConfig holds Google OAuth settings
+type GoogleConfig struct {
+	ClientID string
 }
 
 // AppConfig holds application settings
@@ -29,6 +37,7 @@ type AppConfig struct {
 	Env            string
 	Port           int
 	BaseURL        string
+	FrontendURL    string
 	ReadTimeout    time.Duration
 	WriteTimeout   time.Duration
 	IdleTimeout    time.Duration
@@ -144,12 +153,16 @@ type QueueConfig struct {
 
 // Load loads configuration from environment variables
 func Load() (*Config, error) {
+	// Load .env file if it exists (ignore error if not found)
+	_ = godotenv.Load()
+
 	cfg := &Config{
 		App: AppConfig{
 			Name:           getEnv("APP_NAME", "GenixERP"),
 			Env:            getEnv("APP_ENV", "development"),
 			Port:           getEnvAsInt("APP_PORT", 8080),
 			BaseURL:        getEnv("APP_BASE_URL", "http://localhost:8080"),
+			FrontendURL:    getEnv("FRONTEND_URL", "http://localhost:5173"),
 			ReadTimeout:    getEnvAsDuration("APP_READ_TIMEOUT", 15*time.Second),
 			WriteTimeout:   getEnvAsDuration("APP_WRITE_TIMEOUT", 15*time.Second),
 			IdleTimeout:    getEnvAsDuration("APP_IDLE_TIMEOUT", 60*time.Second),
@@ -191,7 +204,7 @@ func Load() (*Config, error) {
 		CORS: CORSConfig{
 			AllowedOrigins:   getEnvAsSlice("CORS_ALLOWED_ORIGINS", []string{"*"}),
 			AllowedMethods:   getEnvAsSlice("CORS_ALLOWED_METHODS", []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}),
-			AllowedHeaders:   getEnvAsSlice("CORS_ALLOWED_HEADERS", []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Request-ID", "X-Tenant-ID"}),
+			AllowedHeaders:   getEnvAsSlice("CORS_ALLOWED_HEADERS", []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Request-ID", "X-Tenant-ID", "X-Organization-ID"}),
 			ExposedHeaders:   getEnvAsSlice("CORS_EXPOSED_HEADERS", []string{"Content-Length", "X-Request-ID"}),
 			AllowCredentials: getEnvAsBool("CORS_ALLOW_CREDENTIALS", true),
 			MaxAge:           getEnvAsInt("CORS_MAX_AGE", 86400),
@@ -248,6 +261,9 @@ func Load() (*Config, error) {
 			Provider: getEnv("QUEUE_PROVIDER", "redis"),
 			URL:      getEnv("QUEUE_URL", "redis://localhost:6379/1"),
 			Workers:  getEnvAsInt("QUEUE_WORKERS", 10),
+		},
+		Google: GoogleConfig{
+			ClientID: getEnv("GOOGLE_CLIENT_ID", ""),
 		},
 	}
 

@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates tzdata
@@ -15,6 +15,12 @@ RUN go mod download
 
 # Copy source code
 COPY . .
+
+# Install swag for Swagger documentation generation
+RUN go install github.com/swaggo/swag/cmd/swag@latest
+
+# Generate Swagger documentation
+RUN /go/bin/swag init -g cmd/api/main.go -o docs
 
 # Build the application
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
@@ -37,7 +43,13 @@ WORKDIR /app
 COPY --from=builder /app/genix-backend .
 
 # Copy migrations
-COPY --from=builder /app/migrations ./migrations
+COPY --from=builder /app/internal/infrastructure/database/migrations ./migrations
+
+# Copy swagger documentation
+COPY --from=builder /app/docs ./docs
+
+# Create storage directory for file uploads
+RUN mkdir -p /app/storage/uploads
 
 # Set ownership
 RUN chown -R genix:genix /app
