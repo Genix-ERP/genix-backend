@@ -132,7 +132,7 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID, sourceO
 			rows.Scan(&productID, &qty, &unitPrice, &discount, &taxAmt, &lineTotal)
 
 			lineID := uuid.New()
-			_, err = s.db.Exec(`
+			_, _ = s.db.Exec(`
 				INSERT INTO purchase_order_lines (
 					id, purchase_order_id, product_id, quantity, unit_price,
 					discount_percent, tax_amount, total_amount, created_at, updated_at
