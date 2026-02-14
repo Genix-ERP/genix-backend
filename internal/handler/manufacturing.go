@@ -289,7 +289,7 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 // @Tags Manufacturing
 // @Accept json
 // @Produce json
-// @Param input body entity.WorkCenterInput true "Work center input"
+// @Param input body entity.CreateWorkCenterInput true "Work center input"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -434,7 +434,7 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Work Center ID"
-// @Param input body entity.WorkCenterInput true "Work center input"
+// @Param input body entity.CreateWorkCenterInput true "Work center input"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -1080,7 +1080,7 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 // @Tags Manufacturing
 // @Accept json
 // @Produce json
-// @Param input body entity.ProductionOrderInput true "Production order input"
+// @Param input body entity.CreateProductionOrderInput true "Production order input"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -1186,7 +1186,7 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Production Order ID"
-// @Param input body entity.ProductionOrderInput true "Production order input"
+// @Param input body entity.CreateProductionOrderInput true "Production order input"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -2096,7 +2096,7 @@ func (h *Handler) CancelProductionOrder(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Production Order ID"
-// @Param input body entity.RecordProductionInput true "Production record input"
+// @Param input body entity.ProductionOutputInput true "Production record input"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -2680,7 +2680,7 @@ func (h *Handler) GetQualityCheck(c *gin.Context) {
 // @Tags Manufacturing
 // @Accept json
 // @Produce json
-// @Param input body entity.QualityCheckInput true "Quality check input"
+// @Param input body entity.CreateQualityCheckInput true "Quality check input"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -2948,7 +2948,7 @@ func (h *Handler) ListQualityDefects(c *gin.Context) {
 // @Tags Manufacturing
 // @Accept json
 // @Produce json
-// @Param input body entity.QualityDefectInput true "Quality defect input"
+// @Param input body entity.CreateQualityDefectInput true "Quality defect input"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response

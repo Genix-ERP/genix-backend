@@ -1405,7 +1405,7 @@ func (h *Handler) DeleteJournal(c *gin.Context) {
 // @Tags Finance - Journal Entries
 // @Accept json
 // @Produce json
-// @Param entry body entity.JournalEntryInput true "Journal entry details"
+// @Param entry body entity.CreateJournalEntryInput true "Journal entry details"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response

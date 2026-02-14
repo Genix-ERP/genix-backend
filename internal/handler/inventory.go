@@ -1649,7 +1649,7 @@ func (h *Handler) GetBOM(c *gin.Context) {
 // @Tags Inventory - BOM
 // @Accept json
 // @Produce json
-// @Param bom body entity.BOMInput true "BOM details"
+// @Param bom body entity.CreateBOMInput true "BOM details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -1834,7 +1834,7 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "BOM ID"
-// @Param bom body entity.BOMInput true "BOM details"
+// @Param bom body entity.CreateBOMInput true "BOM details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -1995,7 +1995,7 @@ func (h *Handler) DeleteBOM(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param bom_id path string true "BOM ID"
-// @Param line body entity.BOMLineInput true "BOM line details"
+// @Param line body entity.CreateBOMLineInput true "BOM line details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -2330,7 +2330,7 @@ func (h *Handler) ListBOMOperations(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param bom_id path string true "BOM ID"
-// @Param operation body entity.BOMOperationInput true "Operation details"
+// @Param operation body entity.CreateBOMOperationInput true "Operation details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -2465,7 +2465,7 @@ func (h *Handler) CreateBOMOperation(c *gin.Context) {
 // @Produce json
 // @Param bom_id path string true "BOM ID"
 // @Param operation_id path string true "Operation ID"
-// @Param operation body entity.BOMOperationInput true "Operation details"
+// @Param operation body entity.CreateBOMOperationInput true "Operation details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -2756,7 +2756,7 @@ func (h *Handler) ListScrapReasons(c *gin.Context) {
 // @Tags Inventory - Scrap
 // @Accept json
 // @Produce json
-// @Param reason body entity.ScrapReasonInput true "Scrap reason details"
+// @Param reason body entity.CreateScrapReasonInput true "Scrap reason details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -3045,7 +3045,7 @@ func (h *Handler) GetScrapOrder(c *gin.Context) {
 // @Tags Inventory - Scrap
 // @Accept json
 // @Produce json
-// @Param order body entity.ScrapOrderInput true "Scrap order details"
+// @Param order body entity.CreateScrapOrderInput true "Scrap order details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -3634,7 +3634,7 @@ func (h *Handler) GetReorderRule(c *gin.Context) {
 // @Tags Inventory - Reorder
 // @Accept json
 // @Produce json
-// @Param rule body entity.ReorderRuleInput true "Reorder rule details"
+// @Param rule body entity.CreateReorderRuleInput true "Reorder rule details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -3738,7 +3738,7 @@ func (h *Handler) CreateReorderRule(c *gin.Context) {
 // @Accept json
 // @Produce json
 // @Param id path string true "Reorder Rule ID"
-// @Param rule body entity.ReorderRuleInput true "Reorder rule details"
+// @Param rule body entity.CreateReorderRuleInput true "Reorder rule details"
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
