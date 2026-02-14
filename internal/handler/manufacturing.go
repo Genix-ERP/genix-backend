@@ -1560,7 +1560,7 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 					planned_cost, labor_cost, machine_cost,
 					status, instructions, notes,
 					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $19, $19)
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $19, $20)
 			`
 
 			var instructions *string
@@ -1575,7 +1575,7 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 				totalTimeHours, setupTimeMinutes/60.0,
 				opLaborCost+machineCost, opLaborCost, machineCost,
 				instructions, notes,
-				createdByID, now,
+				createdByID, now, now,
 			)
 			if err != nil {
 				h.log.Error("Failed to create work order", "error", err, "operation", operationName)
