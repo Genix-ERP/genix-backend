@@ -1414,7 +1414,11 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		return
 	}
 
-	userID, _ := middleware.GetUserID(c)
+	userID, userIDExists := middleware.GetUserID(c)
+	var createdByID *uuid.UUID
+	if userIDExists && userID != uuid.Nil {
+		createdByID = &userID
+	}
 
 	idStr := c.Param("id")
 	id, err := uuid.Parse(idStr)
@@ -1571,11 +1575,11 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 				totalTimeHours, setupTimeMinutes/60.0,
 				opLaborCost+machineCost, opLaborCost, machineCost,
 				instructions, notes,
-				userID, now,
+				createdByID, now,
 			)
 			if err != nil {
 				h.log.Error("Failed to create work order", "error", err, "operation", operationName)
-				response.InternalError(c, "Failed to create work orders")
+				response.InternalError(c, fmt.Sprintf("Failed to create work orders: %v", err))
 				return
 			}
 		}
@@ -1601,7 +1605,7 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		WHERE id = $6 AND tenant_id = $7 AND deleted_at IS NULL AND status = 'draft'
 	`
 
-	result, err := tx.Exec(updateQuery, userID, now, totalPlannedCost, totalLaborCost, totalOverheadCost, id, tenantID)
+	result, err := tx.Exec(updateQuery, createdByID, now, totalPlannedCost, totalLaborCost, totalOverheadCost, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to confirm production order", "error", err)
 		response.InternalError(c, "Failed to confirm production order")
