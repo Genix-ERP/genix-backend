@@ -254,7 +254,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 // @Tags Finance - Accounts
 // @Accept json
 // @Produce json
-// @Param account body entity.AccountInput true "Account details"
+// @Param account body entity.CreateAccountInput true "Account details"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
