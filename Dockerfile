@@ -20,7 +20,7 @@ COPY . .
 RUN go install github.com/swaggo/swag/cmd/swag@latest
 
 # Generate Swagger documentation
-RUN /go/bin/swag init -g cmd/api/main.go -o docs
+RUN /go/bin/swag init -g cmd/api/main.go -o docs --parseInternal --parseDependency
 
 # Build the application
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \

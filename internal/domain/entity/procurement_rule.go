@@ -80,8 +80,8 @@ type ProcurementRule struct {
 	RuleType     string          `json:"rule_type" db:"rule_type"`
 	DocumentType string          `json:"document_type" db:"document_type"`
 	Priority     int             `json:"priority" db:"priority"`
-	Conditions   json.RawMessage `json:"conditions" db:"conditions"`
-	Actions      json.RawMessage `json:"actions" db:"actions"`
+	Conditions   json.RawMessage `json:"conditions" db:"conditions" swaggertype:"object"`
+	Actions      json.RawMessage `json:"actions" db:"actions" swaggertype:"object"`
 	IsActive     bool            `json:"is_active" db:"is_active"`
 	CreatedBy    *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt    time.Time       `json:"created_at" db:"created_at"`
@@ -148,9 +148,9 @@ type RuleEvaluationLog struct {
 	DocumentType       string          `json:"document_type" db:"document_type"`
 	DocumentID         uuid.UUID       `json:"document_id" db:"document_id"`
 	DocumentNumber     *string         `json:"document_number,omitempty" db:"document_number"`
-	RulesEvaluated     json.RawMessage `json:"rules_evaluated" db:"rules_evaluated"`
+	RulesEvaluated     json.RawMessage `json:"rules_evaluated" db:"rules_evaluated" swaggertype:"object"`
 	FinalAction        string          `json:"final_action" db:"final_action"`
-	FinalActionDetails json.RawMessage `json:"final_action_details" db:"final_action_details"`
+	FinalActionDetails json.RawMessage `json:"final_action_details" db:"final_action_details" swaggertype:"object"`
 	EvaluatedBy        *uuid.UUID      `json:"evaluated_by,omitempty" db:"evaluated_by"`
 	EvaluatedAt        time.Time       `json:"evaluated_at" db:"evaluated_at"`
 }

@@ -38,7 +38,7 @@ type DropshipOrder struct {
 	VendorName          string          `json:"vendor_name" db:"vendor_name"`
 	CustomerID          uuid.UUID       `json:"customer_id" db:"customer_id"`
 	CustomerName        string          `json:"customer_name" db:"customer_name"`
-	ShippingAddress     json.RawMessage `json:"shipping_address" db:"shipping_address"`
+	ShippingAddress     json.RawMessage `json:"shipping_address" db:"shipping_address" swaggertype:"object"`
 	Status              string          `json:"status" db:"status"`
 	ShippingMethod      *string         `json:"shipping_method,omitempty" db:"shipping_method"`
 	TrackingNumber      *string         `json:"tracking_number,omitempty" db:"tracking_number"`

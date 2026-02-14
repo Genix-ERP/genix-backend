@@ -67,9 +67,9 @@ type Campaign struct {
 	Description       *string         `json:"description,omitempty" db:"description"`
 	MessageTemplate   *string         `json:"message_template,omitempty" db:"message_template"`
 	OwnerID           *uuid.UUID      `json:"owner_id,omitempty" db:"owner_id"`
-	TeamMembers       json.RawMessage `json:"team_members" db:"team_members"`
-	Tags              json.RawMessage `json:"tags" db:"tags"`
-	CustomFields      json.RawMessage `json:"custom_fields" db:"custom_fields"`
+	TeamMembers       json.RawMessage `json:"team_members" db:"team_members" swaggertype:"object"`
+	Tags              json.RawMessage `json:"tags" db:"tags" swaggertype:"object"`
+	CustomFields      json.RawMessage `json:"custom_fields" db:"custom_fields" swaggertype:"object"`
 	CreatedBy         *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt         time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt         time.Time       `json:"updated_at" db:"updated_at"`

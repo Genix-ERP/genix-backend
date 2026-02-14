@@ -17,8 +17,8 @@ type WorkflowRule struct {
 	Category        string          `json:"category" db:"category"`
 	TriggerType     string          `json:"trigger_type" db:"trigger_type"`
 	TriggerEvent    *string         `json:"trigger_event,omitempty" db:"trigger_event"`
-	Conditions      json.RawMessage `json:"conditions" db:"conditions"`
-	Actions         json.RawMessage `json:"actions" db:"actions"`
+	Conditions      json.RawMessage `json:"conditions" db:"conditions" swaggertype:"object"`
+	Actions         json.RawMessage `json:"actions" db:"actions" swaggertype:"object"`
 	IsActive        bool            `json:"is_active" db:"is_active"`
 	Priority        int             `json:"priority" db:"priority"`
 	LastTriggeredAt *time.Time      `json:"last_triggered_at,omitempty" db:"last_triggered_at"`

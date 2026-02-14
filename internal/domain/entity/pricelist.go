@@ -57,7 +57,7 @@ type Pricelist struct {
 	EndDate      *time.Time      `json:"end_date,omitempty" db:"end_date"`
 	Priority     int             `json:"priority" db:"priority"`
 	ShowDiscount bool            `json:"show_discount" db:"show_discount"`
-	CountryCodes json.RawMessage `json:"country_codes" db:"country_codes"`
+	CountryCodes json.RawMessage `json:"country_codes" db:"country_codes" swaggertype:"object"`
 	IsActive     bool            `json:"is_active" db:"is_active"`
 	IsDefault    bool            `json:"is_default" db:"is_default"`
 	CreatedBy    *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
