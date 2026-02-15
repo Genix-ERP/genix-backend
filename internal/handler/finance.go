@@ -1482,12 +1482,44 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		return
 	}
 
-	// Generate entry number
+	// Resolve organization ID early (needed for entry number generation)
+	var orgID *uuid.UUID
+	if input.OrganizationID != "" {
+		parsed, parseErr := uuid.Parse(input.OrganizationID)
+		if parseErr == nil {
+			orgID = &parsed
+		}
+	}
+	// Fallback to middleware header if not provided in body
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
+		}
+	}
+
+	// Generate entry number - use global max for this tenant+org to avoid unique constraint violations
 	prefix := ""
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
-	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+	var maxNumber int
+	if orgID != nil {
+		_ = h.db.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
+			tenantID, *orgID,
+		).Scan(&maxNumber)
+	} else {
+		_ = h.db.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
+			tenantID,
+		).Scan(&maxNumber)
+	}
+	actualNext := maxNumber + 1
+	if nextNumber > actualNext {
+		actualNext = nextNumber
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, actualNext)
 
 	id := uuid.New()
 	now := time.Now()
@@ -1516,20 +1548,6 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 	}
 
 	sourceType := "manual"
-
-	var orgID *uuid.UUID
-	if input.OrganizationID != "" {
-		parsed, parseErr := uuid.Parse(input.OrganizationID)
-		if parseErr == nil {
-			orgID = &parsed
-		}
-	}
-	// Fallback to middleware header if not provided in body
-	if orgID == nil {
-		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
-			orgID = &headerOrgID
-		}
-	}
 
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
@@ -1967,7 +1985,25 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
-	reversalNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+	// Use global max to avoid unique constraint violations across journals
+	var maxNumber int
+	if organizationID != nil {
+		_ = h.db.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
+			tenantID, *organizationID,
+		).Scan(&maxNumber)
+	} else {
+		_ = h.db.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
+			tenantID,
+		).Scan(&maxNumber)
+	}
+	actualNext := maxNumber + 1
+	if nextNumber > actualNext {
+		actualNext = nextNumber
+	}
+	reversalNumber := fmt.Sprintf("%s%06d", prefix, actualNext)
 
 	// Start transaction
 	tx, err := h.db.Begin()
@@ -1989,7 +2025,7 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 			source_type, total_debit, total_credit, status, posted_at, posted_by,
-			reversal_of, created_by, created_at, updated_at
+			reversed_entry_id, created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 	`, reversalID, tenantID, organizationID, journalID, reversalNumber, now, reference, description,
 		"reversal", totalCredit, totalDebit, "posted", now, userID,
@@ -2666,7 +2702,25 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
 			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+			// Use global max to avoid unique constraint violations across journals
+			var maxNum int
+			if orgIDPtr != nil {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
+					tenantID, *orgIDPtr,
+				).Scan(&maxNum)
+			} else {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
+					tenantID,
+				).Scan(&maxNum)
+			}
+			actualNum := maxNum + 1
+			if nextNumber > actualNum {
+				actualNum = nextNumber
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, actualNum)
 
 			description := fmt.Sprintf("Payment %s confirmed", paymentNumber)
 			journalEntryID := uuid.New()
