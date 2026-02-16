@@ -273,8 +273,11 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 	defer rows.Close()
 
 	revenue := make([]entity.IncomeStatementSection, 0)
-	expenses := make([]entity.IncomeStatementSection, 0)
-	var totalRevenue, totalExpenses float64
+	costOfSales := make([]entity.IncomeStatementSection, 0)
+	operatingExpenses := make([]entity.IncomeStatementSection, 0)
+	otherIncome := make([]entity.IncomeStatementSection, 0)
+	otherExpenses := make([]entity.IncomeStatementSection, 0)
+	var totalRevenue, totalCOGS, totalOpex, totalOtherIncome, totalOtherExpenses float64
 
 	for rows.Next() {
 		var accountID uuid.UUID
@@ -305,27 +308,61 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 			Amount:      math.Round(amount*100) / 100,
 		}
 
+		// Categorize by account code range (standard chart of accounts)
+		// 4000-4899: Revenue, 4900-4999: Other Income
+		// 5000-5999: Cost of Sales (COGS)
+		// 6000-6999: Operating Expenses
+		// 7000-7999: Other Expenses
+		codeNum := 0
+		for _, ch := range code {
+			if ch >= '0' && ch <= '9' {
+				codeNum = codeNum*10 + int(ch-'0')
+			} else {
+				break
+			}
+		}
+
 		if category == "revenue" {
-			revenue = append(revenue, section)
-			totalRevenue += amount
+			if codeNum >= 4900 && codeNum < 5000 {
+				otherIncome = append(otherIncome, section)
+				totalOtherIncome += amount
+			} else {
+				revenue = append(revenue, section)
+				totalRevenue += amount
+			}
 		} else {
-			expenses = append(expenses, section)
-			totalExpenses += amount
+			// expense category
+			if codeNum >= 5000 && codeNum < 6000 {
+				costOfSales = append(costOfSales, section)
+				totalCOGS += amount
+			} else if codeNum >= 7000 && codeNum < 8000 {
+				otherExpenses = append(otherExpenses, section)
+				totalOtherExpenses += amount
+			} else {
+				operatingExpenses = append(operatingExpenses, section)
+				totalOpex += amount
+			}
 		}
 	}
 
-	netIncome := totalRevenue - totalExpenses
+	grossProfit := totalRevenue - totalCOGS
+	operatingProfit := grossProfit - totalOpex
+	netIncome := operatingProfit + totalOtherIncome - totalOtherExpenses
+	totalExpenses := totalCOGS + totalOpex + totalOtherExpenses
 
 	report := entity.IncomeStatementReport{
 		PeriodFrom:        periodFrom,
 		PeriodTo:          periodTo,
 		TotalRevenue:      math.Round(totalRevenue*100) / 100,
 		TotalExpenses:     math.Round(totalExpenses*100) / 100,
-		GrossProfit:       math.Round(totalRevenue*100) / 100, // Simplified - no COGS separation
-		OperatingProfit:   math.Round(netIncome*100) / 100,
+		GrossProfit:       math.Round(grossProfit*100) / 100,
+		OperatingProfit:   math.Round(operatingProfit*100) / 100,
 		NetIncome:         math.Round(netIncome*100) / 100,
 		Revenue:           revenue,
-		OperatingExpenses: expenses,
+		CostOfSales:       costOfSales,
+		OperatingExpenses: operatingExpenses,
+		OtherIncome:       otherIncome,
+		OtherExpenses:     otherExpenses,
 	}
 
 	response.Success(c, report)
