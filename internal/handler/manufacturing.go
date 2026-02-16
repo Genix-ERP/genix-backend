@@ -1513,7 +1513,23 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 
 	// If BOM exists, calculate costs and generate work orders from BOM operations
 	if bomID != nil {
-		// Get BOM operations with work center costs
+		// Step 1: Read all BOM operations into a slice first
+		// (lib/pq doesn't support executing queries while iterating rows on the same transaction)
+		type bomOp struct {
+			ID              uuid.UUID
+			Sequence        int
+			OperationName   string
+			WorkCenterID    *uuid.UUID
+			SetupTime       float64
+			RunTime         float64
+			LaborCost       float64
+			OverheadCost    float64
+			Notes           *string
+			WCHourlyCost    float64
+			WCSetupCost     float64
+			WCOverheadCost  float64
+		}
+
 		opsQuery := `
 			SELECT
 				bo.id, bo.sequence, bo.operation_name, bo.work_center_id,
@@ -1533,69 +1549,63 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			response.InternalError(c, "Failed to confirm production order")
 			return
 		}
-		defer rows.Close()
 
-		now := time.Now()
-
+		var operations []bomOp
 		for rows.Next() {
-			var opID uuid.UUID
-			var sequence int
-			var operationName string
-			var opWorkCenterID *uuid.UUID
-			var setupTimeMinutes, runTimeMinutes float64
-			var laborCost, overheadCost float64
-			var notes *string
-			var wcHourlyCost, wcSetupCost, wcOverheadCost float64
-
-			err := rows.Scan(&opID, &sequence, &operationName, &opWorkCenterID,
-				&setupTimeMinutes, &runTimeMinutes,
-				&laborCost, &overheadCost, &notes,
-				&wcHourlyCost, &wcSetupCost, &wcOverheadCost)
+			var op bomOp
+			err := rows.Scan(&op.ID, &op.Sequence, &op.OperationName, &op.WorkCenterID,
+				&op.SetupTime, &op.RunTime,
+				&op.LaborCost, &op.OverheadCost, &op.Notes,
+				&op.WCHourlyCost, &op.WCSetupCost, &op.WCOverheadCost)
 			if err != nil {
 				h.log.Error("Failed to scan BOM operation", "error", err)
 				continue
 			}
+			operations = append(operations, op)
+		}
+		rows.Close()
 
-			// Calculate time for this operation
-			// Total time = setup time + (run time per unit * quantity)
-			totalTimeMinutes := setupTimeMinutes + (runTimeMinutes * quantityPlanned)
+		if err := rows.Err(); err != nil {
+			h.log.Error("Error iterating BOM operations", "error", err)
+			response.InternalError(c, "Failed to confirm production order")
+			return
+		}
+
+		// Step 2: Now create work orders from the collected operations
+		now := time.Now()
+		for _, op := range operations {
+			totalTimeMinutes := op.SetupTime + (op.RunTime * quantityPlanned)
 			totalTimeHours := totalTimeMinutes / 60.0
 
-			// Calculate costs for this operation
-			// Option 1: Use labor_cost and overhead_cost from bom_operations if set
-			// Option 2: Use work center hourly_cost if bom_operations costs are 0
 			var opLaborCost float64
 			var opOverheadCost float64
 
-			if laborCost > 0 {
-				opLaborCost = laborCost * quantityPlanned
-			} else if wcHourlyCost > 0 {
-				opLaborCost = totalTimeHours * wcHourlyCost
+			if op.LaborCost > 0 {
+				opLaborCost = op.LaborCost * quantityPlanned
+			} else if op.WCHourlyCost > 0 {
+				opLaborCost = totalTimeHours * op.WCHourlyCost
 			}
 
-			if overheadCost > 0 {
-				opOverheadCost = overheadCost * quantityPlanned
-			} else if wcOverheadCost > 0 {
-				opOverheadCost = totalTimeHours * wcOverheadCost
+			if op.OverheadCost > 0 {
+				opOverheadCost = op.OverheadCost * quantityPlanned
+			} else if op.WCOverheadCost > 0 {
+				opOverheadCost = totalTimeHours * op.WCOverheadCost
 			}
 
-			// Add setup cost from work center
-			machineCost := wcSetupCost + (totalTimeHours * wcHourlyCost)
+			machineCost := op.WCSetupCost + (totalTimeHours * op.WCHourlyCost)
 
 			totalLaborCost += opLaborCost
 			totalOverheadCost += opOverheadCost
 			totalPlannedCost += opLaborCost + opOverheadCost + machineCost
 
-			// Use operation's work center if available, otherwise fall back to PO's work center
-			effectiveWorkCenterID := opWorkCenterID
+			effectiveWorkCenterID := op.WorkCenterID
 			if effectiveWorkCenterID == nil {
 				effectiveWorkCenterID = workCenterID
 			}
 
-			// Generate work order for this operation
 			woID := uuid.New()
-			woCode := fmt.Sprintf("WO-%s-%d", id.String()[:8], sequence)
-			woName := fmt.Sprintf("%s - %s", productName, operationName)
+			woCode := fmt.Sprintf("WO-%s-%d", id.String()[:8], op.Sequence)
+			woName := fmt.Sprintf("%s - %s", productName, op.OperationName)
 
 			woQuery := `
 				INSERT INTO work_orders (
@@ -1610,30 +1620,24 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			`
 
 			var instructions *string
-			if notes != nil && *notes != "" {
-				instructions = notes
+			if op.Notes != nil && *op.Notes != "" {
+				instructions = op.Notes
 			}
 
 			_, err = tx.Exec(woQuery,
 				woID, tenantID, id, woCode, woName,
-				sequence, opID, effectiveWorkCenterID,
+				op.Sequence, op.ID, effectiveWorkCenterID,
 				quantityPlanned, uom,
-				totalTimeHours, setupTimeMinutes/60.0,
+				totalTimeHours, op.SetupTime/60.0,
 				opLaborCost+machineCost, opLaborCost, machineCost,
-				instructions, notes,
+				instructions, op.Notes,
 				createdByID, now, now,
 			)
 			if err != nil {
-				h.log.Error("Failed to create work order", "error", err, "operation", operationName)
+				h.log.Error("Failed to create work order", "error", err, "operation", op.OperationName)
 				response.InternalError(c, fmt.Sprintf("Failed to create work orders: %v", err))
 				return
 			}
-		}
-
-		if err := rows.Err(); err != nil {
-			h.log.Error("Error iterating BOM operations", "error", err)
-			response.InternalError(c, "Failed to confirm production order")
-			return
 		}
 	}
 
