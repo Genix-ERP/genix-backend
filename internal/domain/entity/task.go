@@ -66,8 +66,8 @@ type Task struct {
 	RecurrencePattern *string         `json:"recurrence_pattern,omitempty" db:"recurrence_pattern"`
 	RecurrenceEndDate *time.Time      `json:"recurrence_end_date,omitempty" db:"recurrence_end_date"`
 	ParentTaskID      *uuid.UUID      `json:"parent_task_id,omitempty" db:"parent_task_id"`
-	Tags              json.RawMessage `json:"tags" db:"tags"`
-	CustomFields      json.RawMessage `json:"custom_fields" db:"custom_fields"`
+	Tags              json.RawMessage `json:"tags" db:"tags" swaggertype:"object"`
+	CustomFields      json.RawMessage `json:"custom_fields" db:"custom_fields" swaggertype:"object"`
 	CreatedBy         *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt         time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt         time.Time       `json:"updated_at" db:"updated_at"`

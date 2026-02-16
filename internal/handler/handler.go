@@ -381,6 +381,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		bom.DELETE("/:id", middleware.RequirePermission("inventory", "bom", "delete"), h.DeleteBOM)
 		bom.POST("/:id/lines", middleware.RequirePermission("inventory", "bom", "update"), h.CreateBOMLine)
 		bom.DELETE("/:id/lines/:lineId", middleware.RequirePermission("inventory", "bom", "update"), h.DeleteBOMLine)
+		// BOM Operations (routing)
+		bom.GET("/:id/operations", h.ListBOMOperations)
+		bom.POST("/:id/operations", middleware.RequirePermission("inventory", "bom", "update"), h.CreateBOMOperation)
+		bom.PUT("/:id/operations/:operationId", middleware.RequirePermission("inventory", "bom", "update"), h.UpdateBOMOperation)
+		bom.DELETE("/:id/operations/:operationId", middleware.RequirePermission("inventory", "bom", "update"), h.DeleteBOMOperation)
 	}
 
 	// Alias route for /boms (plural) - frontend compatibility
@@ -392,6 +397,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		boms.GET("/:id", h.GetBOM)
 		boms.PUT("/:id", middleware.RequirePermission("inventory", "bom", "update"), h.UpdateBOM)
 		boms.DELETE("/:id", middleware.RequirePermission("inventory", "bom", "delete"), h.DeleteBOM)
+		// BOM Operations (routing)
+		boms.GET("/:id/operations", h.ListBOMOperations)
+		boms.POST("/:id/operations", middleware.RequirePermission("inventory", "bom", "update"), h.CreateBOMOperation)
+		boms.PUT("/:id/operations/:operationId", middleware.RequirePermission("inventory", "bom", "update"), h.UpdateBOMOperation)
+		boms.DELETE("/:id/operations/:operationId", middleware.RequirePermission("inventory", "bom", "update"), h.DeleteBOMOperation)
 	}
 
 	// Scrap Management
@@ -969,6 +979,67 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		recurringJournals.POST("/:id/generate", middleware.RequirePermission("finance", "journal_entry", "create"), h.GenerateRecurringJournalEntry)
 	}
 
+	// Cash Registers (Kassa)
+	cashRegisters := rg.Group("/cash/registers")
+	cashRegisters.Use(middleware.RequirePermission("finance", "cash", "read"))
+	{
+		cashRegisters.GET("", h.ListCashRegisters)
+		cashRegisters.POST("", middleware.RequirePermission("finance", "cash", "create"), h.CreateCashRegister)
+		cashRegisters.GET("/:id", h.GetCashRegister)
+		cashRegisters.PUT("/:id", middleware.RequirePermission("finance", "cash", "update"), h.UpdateCashRegister)
+	}
+
+	// Cash Orders (PKO/RKO)
+	cashOrders := rg.Group("/cash/orders")
+	cashOrders.Use(middleware.RequirePermission("finance", "cash", "read"))
+	{
+		cashOrders.GET("", h.ListCashOrders)
+		cashOrders.POST("", middleware.RequirePermission("finance", "cash", "create"), h.CreateCashOrder)
+		cashOrders.GET("/:id", h.GetCashOrder)
+		cashOrders.PUT("/:id", middleware.RequirePermission("finance", "cash", "update"), h.UpdateCashOrder)
+		cashOrders.POST("/:id/confirm", middleware.RequirePermission("finance", "cash", "approve"), h.ConfirmCashOrder)
+	}
+
+	// Cash Book (Kassa kitob)
+	rg.GET("/cash/book", middleware.RequirePermission("finance", "cash", "read"), h.GetCashBook)
+
+	// Currency Rates Sync & Revaluation
+	currencyOps := rg.Group("/currency")
+	currencyOps.Use(middleware.RequirePermission("finance", "currency", "read"))
+	{
+		currencyOps.GET("/rates", h.ListExchangeDiffs)
+		currencyOps.POST("/rates/sync", middleware.RequirePermission("finance", "currency", "create"), h.SyncCurrencyRates)
+		currencyOps.POST("/revalue", middleware.RequirePermission("finance", "currency", "create"), h.RevalueCurrency)
+	}
+
+	// Reconciliation Acts (Akt sverka)
+	reconciliation := rg.Group("/reconciliation")
+	reconciliation.Use(middleware.RequirePermission("finance", "reconciliation", "read"))
+	{
+		reconciliation.GET("", h.ListReconciliationActs)
+		reconciliation.POST("", middleware.RequirePermission("finance", "reconciliation", "create"), h.CreateReconciliationAct)
+		reconciliation.POST("/bulk-generate", middleware.RequirePermission("finance", "reconciliation", "create"), h.BulkGenerateReconciliation)
+		reconciliation.GET("/:id", h.GetReconciliationAct)
+		reconciliation.PUT("/:id", middleware.RequirePermission("finance", "reconciliation", "update"), h.UpdateReconciliationAct)
+		reconciliation.DELETE("/:id", middleware.RequirePermission("finance", "reconciliation", "delete"), h.DeleteReconciliationAct)
+		reconciliation.GET("/:id/export", h.ExportReconciliationAct)
+	}
+
+	// Budgets (Byudjetlashtirish)
+	budget := rg.Group("/budget")
+	budget.Use(middleware.RequirePermission("finance", "budget", "read"))
+	{
+		budget.GET("", h.ListBudgetsV2)
+		budget.POST("", middleware.RequirePermission("finance", "budget", "create"), h.CreateBudgetV2)
+		budget.GET("/consolidated", h.GetConsolidatedBudget)
+		budget.GET("/:id", h.GetBudgetV2)
+		budget.PUT("/:id", middleware.RequirePermission("finance", "budget", "update"), h.UpdateBudgetV2)
+		budget.DELETE("/:id", middleware.RequirePermission("finance", "budget", "delete"), h.DeleteBudgetV2)
+		budget.GET("/:id/lines", h.ListBudgetLines)
+		budget.POST("/:id/lines", middleware.RequirePermission("finance", "budget", "create"), h.CreateBudgetLine)
+		budget.PUT("/:id/lines/:lineId", middleware.RequirePermission("finance", "budget", "update"), h.UpdateBudgetLine)
+	}
+
 	// HR - Employees
 	employees := rg.Group("/employees")
 	employees.Use(middleware.RequirePermission("hr", "employee", "read"))
@@ -1198,8 +1269,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.POST("", middleware.RequirePermission("manufacturing", "work_orders", "create"), h.CreateWorkOrder)
 		workOrders.GET("/:id", h.GetWorkOrder)
 		workOrders.POST("/:id/start", h.StartWorkOrder)
+		workOrders.POST("/:id/pause", h.PauseWorkOrder)
 		workOrders.POST("/:id/complete", h.CompleteWorkOrder)
 		workOrders.POST("/:id/time", h.RecordWorkOrderTime)
+	}
+
+	// Manufacturing Transfers (Pick Components / Store Finished)
+	mfgTransfers := rg.Group("/manufacturing-transfers")
+	mfgTransfers.Use(middleware.RequirePermission("manufacturing", "transfers", "read"))
+	{
+		mfgTransfers.GET("", h.ListManufacturingTransfers)
+		mfgTransfers.GET("/:id", h.GetManufacturingTransfer)
+		mfgTransfers.POST("/:id/validate", middleware.RequirePermission("manufacturing", "transfers", "update"), h.ValidateManufacturingTransfer)
 	}
 
 	// Quality Control
@@ -1502,6 +1583,52 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// POS Products (optimized search)
 		pos.GET("/products", h.SearchPOSProducts)
 	}
+
+	// =====================================================
+	// INTERCOMPANY TRANSFERS MODULE ROUTES
+	// =====================================================
+
+	// Intercompany Transfers (Product)
+	icTransfers := rg.Group("/intercompany-transfers")
+	icTransfers.Use(middleware.RequirePermission("inventory", "stock", "read"))
+	{
+		icTransfers.GET("", h.ListIntercompanyTransfers)
+		icTransfers.POST("", middleware.RequirePermission("inventory", "stock", "create"), h.CreateIntercompanyTransfer)
+		icTransfers.GET("/:id", h.GetIntercompanyTransfer)
+		icTransfers.PUT("/:id", middleware.RequirePermission("inventory", "stock", "update"), h.UpdateIntercompanyTransfer)
+		icTransfers.DELETE("/:id", middleware.RequirePermission("inventory", "stock", "delete"), h.DeleteIntercompanyTransfer)
+		icTransfers.POST("/:id/approve", middleware.RequirePermission("inventory", "stock", "transfer"), h.ApproveIntercompanyTransfer)
+		icTransfers.POST("/:id/ship", middleware.RequirePermission("inventory", "stock", "transfer"), h.ShipIntercompanyTransfer)
+		icTransfers.POST("/:id/receive", middleware.RequirePermission("inventory", "stock", "transfer"), h.ReceiveIntercompanyTransfer)
+	}
+
+	// Intercompany Payments (Money)
+	icPayments := rg.Group("/intercompany-payments")
+	icPayments.Use(middleware.RequirePermission("finance", "payment", "read"))
+	{
+		icPayments.GET("", h.ListIntercompanyPayments)
+		icPayments.POST("", middleware.RequirePermission("finance", "payment", "create"), h.CreateIntercompanyPayment)
+		icPayments.GET("/:id", h.GetIntercompanyPayment)
+		icPayments.POST("/:id/approve", middleware.RequirePermission("finance", "payment", "approve"), h.ApproveIntercompanyPayment)
+		icPayments.DELETE("/:id", middleware.RequirePermission("finance", "payment", "delete"), h.DeleteIntercompanyPayment)
+	}
+
+	// Intercompany Balances
+	rg.GET("/intercompany-balances", middleware.RequirePermission("finance", "account", "read"), h.GetIntercompanyBalances)
+
+	// Intercompany Rules (Odoo-like configuration)
+	icRules := rg.Group("/intercompany-rules")
+	icRules.Use(middleware.RequirePermission("settings", "organization", "read"))
+	{
+		icRules.GET("", h.ListIntercompanyRules)
+		icRules.POST("", middleware.RequirePermission("settings", "organization", "create"), h.CreateIntercompanyRule)
+		icRules.GET("/:id", h.GetIntercompanyRule)
+		icRules.PUT("/:id", middleware.RequirePermission("settings", "organization", "update"), h.UpdateIntercompanyRule)
+		icRules.DELETE("/:id", middleware.RequirePermission("settings", "organization", "delete"), h.DeleteIntercompanyRule)
+	}
+
+	// Intercompany Transaction Logs (Audit Trail)
+	rg.GET("/intercompany-logs", middleware.RequirePermission("settings", "organization", "read"), h.ListIntercompanyTransactionLogs)
 }
 
 // GetAPIInfo returns API information

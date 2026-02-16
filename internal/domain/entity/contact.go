@@ -34,16 +34,16 @@ type Contact struct {
 	Email              *string         `json:"email,omitempty" db:"email"`
 	Phone              *string         `json:"phone,omitempty" db:"phone"`
 	Fax                *string         `json:"fax,omitempty" db:"fax"`
-	BillingAddress     json.RawMessage `json:"billing_address" db:"billing_address"`
-	ShippingAddress    json.RawMessage `json:"shipping_address" db:"shipping_address"`
+	BillingAddress     json.RawMessage `json:"billing_address" db:"billing_address" swaggertype:"object"`
+	ShippingAddress    json.RawMessage `json:"shipping_address" db:"shipping_address" swaggertype:"object"`
 	PaymentTerms       int             `json:"payment_terms" db:"payment_terms"`
 	CreditLimit        float64         `json:"credit_limit" db:"credit_limit"`
 	CurrentBalance     float64         `json:"current_balance" db:"current_balance"`
 	CurrencyID         *uuid.UUID      `json:"currency_id,omitempty" db:"currency_id"`
 	TaxExempt          bool            `json:"tax_exempt" db:"tax_exempt"`
-	Tags               json.RawMessage `json:"tags" db:"tags"`
+	Tags               json.RawMessage `json:"tags" db:"tags" swaggertype:"object"`
 	Notes              *string         `json:"notes,omitempty" db:"notes"`
-	CustomFields       json.RawMessage `json:"custom_fields" db:"custom_fields"`
+	CustomFields       json.RawMessage `json:"custom_fields" db:"custom_fields" swaggertype:"object"`
 	IsActive           bool            `json:"is_active" db:"is_active"`
 	CreatedBy          *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt          time.Time       `json:"created_at" db:"created_at"`

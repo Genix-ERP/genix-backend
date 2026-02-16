@@ -30,7 +30,7 @@ type RFQ struct {
 	Terms        *string         `json:"terms,omitempty" db:"terms"`
 	Notes        *string         `json:"notes,omitempty" db:"notes"`
 	WinnerID     *uuid.UUID      `json:"winner_id,omitempty" db:"winner_id"`
-	CustomFields json.RawMessage `json:"custom_fields" db:"custom_fields"`
+	CustomFields json.RawMessage `json:"custom_fields" db:"custom_fields" swaggertype:"object"`
 	CreatedBy    *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt    time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt    time.Time       `json:"updated_at" db:"updated_at"`

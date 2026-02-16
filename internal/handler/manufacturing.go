@@ -18,7 +18,26 @@ import (
 // WORK CENTER HANDLERS
 // =====================================================
 
-// ListWorkCenters returns all work centers with filtering
+// ListWorkCenters godoc
+// @Summary List work centers
+// @Description Get a paginated list of work centers with filtering options
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param status query string false "Filter by status"
+// @Param is_available query boolean false "Filter by availability"
+// @Param warehouse_id query string false "Filter by warehouse ID"
+// @Param search query string false "Search by name or code"
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param sort_by query string false "Sort by field" default(name)
+// @Param sort_order query string false "Sort order (asc/desc)" default(asc)
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers [get]
 func (h *Handler) ListWorkCenters(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -186,7 +205,20 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 	response.SuccessWithPagination(c, workCenters, pagination)
 }
 
-// GetWorkCenter returns a single work center by ID
+// GetWorkCenter godoc
+// @Summary Get work center
+// @Description Get a single work center by ID
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Work Center ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers/{id} [get]
 func (h *Handler) GetWorkCenter(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -251,7 +283,19 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 	response.Success(c, wc)
 }
 
-// CreateWorkCenter creates a new work center
+// CreateWorkCenter godoc
+// @Summary Create work center
+// @Description Create a new work center
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param input body entity.WorkCenterInput true "Work center input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers [post]
 func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -383,7 +427,21 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	response.Created(c, resp)
 }
 
-// UpdateWorkCenter updates an existing work center
+// UpdateWorkCenter godoc
+// @Summary Update work center
+// @Description Update an existing work center
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Work Center ID"
+// @Param input body entity.WorkCenterInput true "Work center input"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers/{id} [put]
 func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -534,7 +592,20 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 	h.GetWorkCenter(c)
 }
 
-// DeleteWorkCenter soft deletes a work center
+// DeleteWorkCenter godoc
+// @Summary Delete work center
+// @Description Soft delete a work center
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Work Center ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/work-centers/{id} [delete]
 func (h *Handler) DeleteWorkCenter(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -571,6 +642,20 @@ func (h *Handler) DeleteWorkCenter(c *gin.Context) {
 // =====================================================
 
 // ListProductionOrders returns all production orders with filtering
+// ListProductionOrders godoc
+// @Summary List production orders
+// @Description Get a paginated list of production/manufacturing orders
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param status query string false "Filter by status"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders [get]
 func (h *Handler) ListProductionOrders(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -601,7 +686,8 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	baseQuery := `
 		SELECT po.id, po.code, po.name, po.product_id, p.name as product_name, p.code as product_code,
 			   po.bom_id, b.name as bom_name, po.quantity_planned, po.quantity_produced, po.quantity_scrapped,
-			   po.uom, po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
+			   po.uom, po.mold_count, po.shift, po.current_stage, po.package_count, po.good_quantity, po.reject_quantity,
+			   po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
 			   po.priority, po.status, po.progress_percent, po.source_type, po.warehouse_id,
 			   w.name as warehouse_name, po.planned_cost, po.actual_cost, po.material_cost,
 			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
@@ -739,14 +825,15 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	orders := []entity.ProductionOrderResponse{}
 	for rows.Next() {
 		var po entity.ProductionOrderResponse
-		var bomName, warehouseName, assignedToName, workCenterName sql.NullString
+		var bomName, warehouseName, assignedToName, workCenterName, shift sql.NullString
 		var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 		var tags []byte
 
 		err := rows.Scan(
 			&po.ID, &po.Code, &po.Name, &po.ProductID, &po.ProductName, &po.ProductCode,
 			&po.BOMID, &bomName, &po.QuantityPlanned, &po.QuantityProduced, &po.QuantityScrapped,
-			&po.UOM, &scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
+			&po.UOM, &po.MoldCount, &shift, &po.CurrentStage, &po.PackageCount, &po.GoodQuantity, &po.RejectQuantity,
+			&scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
 			&po.Priority, &po.Status, &po.ProgressPercent, &po.SourceType, &po.WarehouseID,
 			&warehouseName, &po.PlannedCost, &po.ActualCost, &po.MaterialCost,
 			&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
@@ -769,6 +856,9 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		}
 		if workCenterName.Valid {
 			po.WorkCenterName = &workCenterName.String
+		}
+		if shift.Valid {
+			po.Shift = &shift.String
 		}
 		if scheduledStart.Valid {
 			s := scheduledStart.Time.Format("2006-01-02")
@@ -806,7 +896,20 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	response.SuccessWithPagination(c, orders, pagination)
 }
 
-// GetProductionOrder returns a single production order by ID
+// GetProductionOrder godoc
+// @Summary Get production order
+// @Description Get a single production order by ID
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id} [get]
 func (h *Handler) GetProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -824,7 +927,8 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	query := `
 		SELECT po.id, po.code, po.name, po.product_id, p.name as product_name, p.code as product_code,
 			   po.bom_id, b.name as bom_name, po.quantity_planned, po.quantity_produced, po.quantity_scrapped,
-			   po.uom, po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
+			   po.uom, po.mold_count, po.shift, po.current_stage, po.package_count, po.good_quantity, po.reject_quantity,
+			   po.scheduled_start, po.scheduled_end, po.actual_start, po.actual_end,
 			   po.priority, po.status, po.progress_percent, po.source_type, po.warehouse_id,
 			   w.name as warehouse_name, po.planned_cost, po.actual_cost, po.material_cost,
 			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
@@ -842,14 +946,15 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	`
 
 	var po entity.ProductionOrderResponse
-	var bomName, warehouseName, assignedToName, workCenterName, createdByName sql.NullString
+	var bomName, warehouseName, assignedToName, workCenterName, createdByName, shift sql.NullString
 	var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 	var tags []byte
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&po.ID, &po.Code, &po.Name, &po.ProductID, &po.ProductName, &po.ProductCode,
 		&po.BOMID, &bomName, &po.QuantityPlanned, &po.QuantityProduced, &po.QuantityScrapped,
-		&po.UOM, &scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
+		&po.UOM, &po.MoldCount, &shift, &po.CurrentStage, &po.PackageCount, &po.GoodQuantity, &po.RejectQuantity,
+		&scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
 		&po.Priority, &po.Status, &po.ProgressPercent, &po.SourceType, &po.WarehouseID,
 		&warehouseName, &po.PlannedCost, &po.ActualCost, &po.MaterialCost,
 		&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
@@ -883,6 +988,9 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	if createdByName.Valid {
 		po.CreatedByName = &createdByName.String
 	}
+	if shift.Valid {
+		po.Shift = &shift.String
+	}
 	if scheduledStart.Valid {
 		s := scheduledStart.Time.Format("2006-01-02")
 		po.ScheduledStart = &s
@@ -911,10 +1019,118 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	po.QuantityRemaining = po.QuantityPlanned - po.QuantityProduced - po.QuantityScrapped
 	po.Tags = []string{}
 
+	// If order is confirmed or beyond, fetch associated work orders
+	if po.Status != "draft" {
+		woQuery := `
+			SELECT wo.id, wo.code, wo.name, wo.sequence, wo.work_center_id, wc.name as work_center_name,
+				   wo.quantity_to_produce, wo.quantity_produced, wo.quantity_scrapped, wo.uom,
+				   wo.planned_duration_hours, wo.actual_duration_hours, wo.setup_time_hours,
+				   wo.planned_cost, wo.actual_cost, wo.labor_cost, wo.machine_cost,
+				   wo.status, wo.progress_percent, wo.instructions, wo.notes, wo.created_at
+			FROM work_orders wo
+			LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
+			WHERE wo.production_order_id = $1 AND wo.tenant_id = $2 AND wo.deleted_at IS NULL
+			ORDER BY wo.sequence ASC
+		`
+		woRows, err := h.db.Query(woQuery, id, tenantID)
+		if err == nil {
+			defer woRows.Close()
+			for woRows.Next() {
+				var wo entity.WorkOrder
+				var wcID *uuid.UUID
+				var wcName sql.NullString
+				var instructions, notes sql.NullString
+
+				err := woRows.Scan(
+					&wo.ID, &wo.Code, &wo.Name, &wo.Sequence, &wcID, &wcName,
+					&wo.QuantityToProduce, &wo.QuantityProduced, &wo.QuantityScrapped, &wo.UOM,
+					&wo.PlannedDurationHrs, &wo.ActualDurationHrs, &wo.SetupTimeHrs,
+					&wo.PlannedCost, &wo.ActualCost, &wo.LaborCost, &wo.MachineCost,
+					&wo.Status, &wo.ProgressPercent, &instructions, &notes, &wo.CreatedAt,
+				)
+				if err != nil {
+					h.log.Error("Failed to scan work order", "error", err)
+					continue
+				}
+				wo.ProductionOrderID = id
+				wo.TenantID = tenantID
+				if wcID != nil {
+					wo.WorkCenterID = wcID
+				}
+				if wcName.Valid {
+					wo.WorkCenterName = &wcName.String
+				}
+				if instructions.Valid {
+					wo.Instructions = &instructions.String
+				}
+				if notes.Valid {
+					wo.Notes = &notes.String
+				}
+				po.WorkOrders = append(po.WorkOrders, wo)
+			}
+		}
+	}
+
+	// Fetch BOM operations if BOM exists
+	if po.BOMID != nil {
+		bomOpsQuery := `
+			SELECT id, sequence, operation_name, work_center_id, setup_time_minutes,
+				   run_time_minutes, labor_cost, overhead_cost, notes
+			FROM bom_operations
+			WHERE bom_id = $1
+			ORDER BY sequence ASC
+		`
+		bomOpsRows, err := h.db.Query(bomOpsQuery, *po.BOMID)
+		if err == nil {
+			defer bomOpsRows.Close()
+			po.BOMOperations = []map[string]interface{}{}
+			for bomOpsRows.Next() {
+				var opID uuid.UUID
+				var sequence int
+				var operationName string
+				var workCenterID *uuid.UUID
+				var setupTime, runTime, laborCost, overheadCost float64
+				var notes sql.NullString
+
+				err := bomOpsRows.Scan(&opID, &sequence, &operationName, &workCenterID,
+					&setupTime, &runTime, &laborCost, &overheadCost, &notes)
+				if err == nil {
+					op := map[string]interface{}{
+						"id":                 opID,
+						"sequence":           sequence,
+						"name":               operationName,
+						"operation_name":     operationName,
+						"work_center_id":     workCenterID,
+						"setup_time_minutes": setupTime,
+						"run_time_minutes":   runTime,
+						"labor_cost":         laborCost,
+						"overhead_cost":      overheadCost,
+					}
+					if notes.Valid {
+						op["notes"] = notes.String
+					}
+					po.BOMOperations = append(po.BOMOperations, op)
+				}
+			}
+		}
+	}
+
 	response.Success(c, po)
 }
 
-// CreateProductionOrder creates a new production order
+// CreateProductionOrder godoc
+// @Summary Create production order
+// @Description Create a new production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param input body entity.ProductionOrderInput true "Production order input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders [post]
 func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -966,13 +1182,20 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
+	// Manufacturing-specific fields
+	moldCount := 0
+	if input.MoldCount != nil {
+		moldCount = *input.MoldCount
+	}
+
 	query := `
 		INSERT INTO production_orders (
 			id, tenant_id, organization_id, code, name, product_id, bom_id, quantity_planned, uom,
+			mold_count, shift, current_stage,
 			scheduled_start, scheduled_end, priority, status, source_type, source_id,
 			sales_order_id, customer_id, warehouse_id, location_id, assigned_to,
 			work_center_id, requires_quality_check, notes, tags, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'draft', $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, 'draft', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 		RETURNING id
 	`
 
@@ -983,6 +1206,7 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, code, input.Name, input.ProductID, input.BOMID, input.QuantityPlanned, input.UOM,
+		moldCount, input.Shift,
 		scheduledStart, scheduledEnd, priority, input.SourceType, input.SourceID,
 		input.SalesOrderID, input.CustomerID, input.WarehouseID, input.LocationID, input.AssignedTo,
 		input.WorkCenterID, requiresQC, input.Notes, tags, userID, now, now,
@@ -999,7 +1223,21 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// UpdateProductionOrder updates an existing production order
+// UpdateProductionOrder godoc
+// @Summary Update production order
+// @Description Update an existing production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Param input body entity.ProductionOrderInput true "Production order input"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id} [put]
 func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1084,6 +1322,38 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 		args = append(args, tags)
 	}
 
+	// Manufacturing-specific fields
+	if input.MoldCount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("mold_count = $%d", argCount))
+		args = append(args, *input.MoldCount)
+	}
+	if input.Shift != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("shift = $%d", argCount))
+		args = append(args, *input.Shift)
+	}
+	if input.CurrentStage != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("current_stage = $%d", argCount))
+		args = append(args, *input.CurrentStage)
+	}
+	if input.PackageCount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("package_count = $%d", argCount))
+		args = append(args, *input.PackageCount)
+	}
+	if input.GoodQuantity != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("good_quantity = $%d", argCount))
+		args = append(args, *input.GoodQuantity)
+	}
+	if input.RejectQuantity != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("reject_quantity = $%d", argCount))
+		args = append(args, *input.RejectQuantity)
+	}
+
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")
 		return
@@ -1100,8 +1370,9 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 	argCount++
 	args = append(args, tenantID)
 
+	// Allow updates for draft, confirmed, and in_progress status (for manufacturing stage tracking)
 	query := fmt.Sprintf(
-		"UPDATE production_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status IN ('draft', 'confirmed')",
+		"UPDATE production_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status IN ('draft', 'confirmed', 'in_progress')",
 		strings.Join(updates, ", "), argCount-1, argCount,
 	)
 
@@ -1121,7 +1392,20 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// DeleteProductionOrder soft deletes a production order
+// DeleteProductionOrder godoc
+// @Summary Delete production order
+// @Description Soft delete a production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id} [delete]
 func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1153,7 +1437,20 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 	response.Success(c, map[string]interface{}{"message": "Production order deleted successfully"})
 }
 
-// ConfirmProductionOrder confirms a draft production order
+// ConfirmProductionOrder godoc
+// @Summary Confirm production order
+// @Description Confirm a draft production order, calculate costs and generate work orders
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/confirm [post]
 func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1161,7 +1458,13 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		return
 	}
 
-	userID, _ := middleware.GetUserID(c)
+	userID, userIDExists := middleware.GetUserID(c)
+	var createdByID interface{}
+	if userIDExists && userID != uuid.Nil {
+		createdByID = userID
+	} else {
+		createdByID = nil
+	}
 
 	idStr := c.Param("id")
 	id, err := uuid.Parse(idStr)
@@ -1170,14 +1473,189 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// Start transaction
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to confirm production order")
+		return
+	}
+	defer tx.Rollback()
+
+	// Get the production order details (including BOM ID and quantity)
+	var bomID *uuid.UUID
+	var quantityPlanned float64
+	var workCenterID *uuid.UUID
+	var uom string
+	var productName string
+	var orgID *uuid.UUID
+
+	poQuery := `
+		SELECT po.bom_id, po.quantity_planned, po.work_center_id, po.uom, po.organization_id, p.name as product_name
+		FROM production_orders po
+		LEFT JOIN products p ON p.id = po.product_id
+		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL AND po.status = 'draft'
+	`
+	err = tx.QueryRow(poQuery, id, tenantID).Scan(&bomID, &quantityPlanned, &workCenterID, &uom, &orgID, &productName)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Production order not found or not in draft status")
+			return
+		}
+		h.log.Error("Failed to get production order", "error", err)
+		response.InternalError(c, "Failed to confirm production order")
+		return
+	}
+
+	var totalPlannedCost float64 = 0
+	var totalLaborCost float64 = 0
+	var totalOverheadCost float64 = 0
+
+	// If BOM exists, calculate costs and generate work orders from BOM operations
+	if bomID != nil {
+		// Step 1: Read all BOM operations into a slice first
+		// (lib/pq doesn't support executing queries while iterating rows on the same transaction)
+		type bomOp struct {
+			ID              uuid.UUID
+			Sequence        int
+			OperationName   string
+			WorkCenterID    *uuid.UUID
+			SetupTime       float64
+			RunTime         float64
+			LaborCost       float64
+			OverheadCost    float64
+			Notes           *string
+			WCHourlyCost    float64
+			WCSetupCost     float64
+			WCOverheadCost  float64
+		}
+
+		opsQuery := `
+			SELECT
+				bo.id, bo.sequence, bo.operation_name, bo.work_center_id,
+				bo.setup_time_minutes, bo.run_time_minutes,
+				bo.labor_cost, bo.overhead_cost, bo.notes,
+				COALESCE(wc.hourly_cost, 0) as wc_hourly_cost,
+				COALESCE(wc.setup_cost, 0) as wc_setup_cost,
+				COALESCE(wc.overhead_cost, 0) as wc_overhead_cost
+			FROM bom_operations bo
+			LEFT JOIN work_centers wc ON wc.id = bo.work_center_id AND wc.deleted_at IS NULL
+			WHERE bo.bom_id = $1
+			ORDER BY bo.sequence ASC
+		`
+		rows, err := tx.Query(opsQuery, bomID)
+		if err != nil {
+			h.log.Error("Failed to get BOM operations", "error", err)
+			response.InternalError(c, "Failed to confirm production order")
+			return
+		}
+
+		var operations []bomOp
+		for rows.Next() {
+			var op bomOp
+			err := rows.Scan(&op.ID, &op.Sequence, &op.OperationName, &op.WorkCenterID,
+				&op.SetupTime, &op.RunTime,
+				&op.LaborCost, &op.OverheadCost, &op.Notes,
+				&op.WCHourlyCost, &op.WCSetupCost, &op.WCOverheadCost)
+			if err != nil {
+				h.log.Error("Failed to scan BOM operation", "error", err)
+				continue
+			}
+			operations = append(operations, op)
+		}
+		rows.Close()
+
+		if err := rows.Err(); err != nil {
+			h.log.Error("Error iterating BOM operations", "error", err)
+			response.InternalError(c, "Failed to confirm production order")
+			return
+		}
+
+		// Step 2: Now create work orders from the collected operations
+		now := time.Now()
+		for _, op := range operations {
+			totalTimeMinutes := op.SetupTime + (op.RunTime * quantityPlanned)
+			totalTimeHours := totalTimeMinutes / 60.0
+
+			var opLaborCost float64
+			var opOverheadCost float64
+
+			if op.LaborCost > 0 {
+				opLaborCost = op.LaborCost * quantityPlanned
+			} else if op.WCHourlyCost > 0 {
+				opLaborCost = totalTimeHours * op.WCHourlyCost
+			}
+
+			if op.OverheadCost > 0 {
+				opOverheadCost = op.OverheadCost * quantityPlanned
+			} else if op.WCOverheadCost > 0 {
+				opOverheadCost = totalTimeHours * op.WCOverheadCost
+			}
+
+			machineCost := op.WCSetupCost + (totalTimeHours * op.WCHourlyCost)
+
+			totalLaborCost += opLaborCost
+			totalOverheadCost += opOverheadCost
+			totalPlannedCost += opLaborCost + opOverheadCost + machineCost
+
+			effectiveWorkCenterID := op.WorkCenterID
+			if effectiveWorkCenterID == nil {
+				effectiveWorkCenterID = workCenterID
+			}
+
+			woID := uuid.New()
+			woCode := fmt.Sprintf("WO-%s-%d", id.String()[:8], op.Sequence)
+			woName := fmt.Sprintf("%s - %s", productName, op.OperationName)
+
+			woQuery := `
+				INSERT INTO work_orders (
+					id, tenant_id, production_order_id, code, name,
+					sequence, operation_id, work_center_id,
+					quantity_to_produce, uom,
+					planned_duration_hours, setup_time_hours,
+					planned_cost, labor_cost, machine_cost,
+					status, instructions, notes,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $19, $20)
+			`
+
+			var instructions *string
+			if op.Notes != nil && *op.Notes != "" {
+				instructions = op.Notes
+			}
+
+			_, err = tx.Exec(woQuery,
+				woID, tenantID, id, woCode, woName,
+				op.Sequence, op.ID, effectiveWorkCenterID,
+				quantityPlanned, uom,
+				totalTimeHours, op.SetupTime/60.0,
+				opLaborCost+machineCost, opLaborCost, machineCost,
+				instructions, op.Notes,
+				createdByID, now, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create work order", "error", err, "operation", op.OperationName)
+				response.InternalError(c, fmt.Sprintf("Failed to create work orders: %v", err))
+				return
+			}
+		}
+	}
+
+	// Update production order with calculated costs and confirm
 	now := time.Now()
-	query := `
+	updateQuery := `
 		UPDATE production_orders
-		SET status = 'confirmed', confirmed_by = $1, confirmed_at = $2, updated_at = $2
-		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL AND status = 'draft'
+		SET status = 'confirmed',
+			confirmed_by = $1,
+			confirmed_at = $2,
+			planned_cost = $3,
+			labor_cost = $4,
+			overhead_cost = $5,
+			updated_at = $2
+		WHERE id = $6 AND tenant_id = $7 AND deleted_at IS NULL AND status = 'draft'
 	`
 
-	result, err := h.db.Exec(query, userID, now, id, tenantID)
+	result, err := tx.Exec(updateQuery, createdByID, now, totalPlannedCost, totalLaborCost, totalOverheadCost, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to confirm production order", "error", err)
 		response.InternalError(c, "Failed to confirm production order")
@@ -1190,10 +1668,30 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to confirm production order")
+		return
+	}
+
 	h.GetProductionOrder(c)
 }
 
-// StartProductionOrder starts a confirmed production order
+// StartProductionOrder godoc
+// @Summary Start production order
+// @Description Start a confirmed production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/start [post]
 func (h *Handler) StartProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1231,7 +1729,20 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// PauseProductionOrder pauses an in-progress production order
+// PauseProductionOrder godoc
+// @Summary Pause production order
+// @Description Pause an in-progress production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/pause [post]
 func (h *Handler) PauseProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1269,7 +1780,20 @@ func (h *Handler) PauseProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// CompleteProductionOrder completes a production order
+// CompleteProductionOrder godoc
+// @Summary Complete production order
+// @Description Complete a production order and update inventory
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/complete [post]
 func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1568,7 +2092,20 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// CancelProductionOrder cancels a production order
+// CancelProductionOrder godoc
+// @Summary Cancel production order
+// @Description Cancel a production order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/cancel [post]
 func (h *Handler) CancelProductionOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1606,7 +2143,21 @@ func (h *Handler) CancelProductionOrder(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// RecordProduction records production output for an order
+// RecordProduction godoc
+// @Summary Record production
+// @Description Record production output for an order
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Production Order ID"
+// @Param input body entity.ProductionOutputInput true "Production record input"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/production-orders/{id}/record [post]
 func (h *Handler) RecordProduction(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1674,7 +2225,19 @@ func (h *Handler) RecordProduction(c *gin.Context) {
 	h.GetProductionOrder(c)
 }
 
-// GetProductionSchedule returns scheduled production orders for calendar view
+// GetProductionSchedule godoc
+// @Summary Get production schedule
+// @Description Get scheduled production orders for calendar view
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param date_from query string false "Start date (YYYY-MM-DD)"
+// @Param date_to query string false "End date (YYYY-MM-DD)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/schedule [get]
 func (h *Handler) GetProductionSchedule(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1755,7 +2318,17 @@ func (h *Handler) GetProductionSchedule(c *gin.Context) {
 	response.Success(c, schedule)
 }
 
-// GetManufacturingStats returns manufacturing dashboard statistics
+// GetManufacturingStats godoc
+// @Summary Get manufacturing statistics
+// @Description Get manufacturing dashboard statistics
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/stats [get]
 func (h *Handler) GetManufacturingStats(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1846,575 +2419,35 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 	response.Success(c, stats)
 }
 
-// =====================================================
-// WORK ORDER HANDLERS
-// =====================================================
-
-// ListWorkOrders returns all work orders with filtering
-func (h *Handler) ListWorkOrders(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	var filter entity.WorkOrderFilter
-	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.BadRequest(c, "Invalid query parameters")
-		return
-	}
-
-	// Set defaults
-	if filter.Page <= 0 {
-		filter.Page = 1
-	}
-	if filter.Limit <= 0 || filter.Limit > 100 {
-		filter.Limit = 20
-	}
-	if filter.SortBy == "" {
-		filter.SortBy = "sequence"
-	}
-	if filter.SortOrder == "" {
-		filter.SortOrder = "asc"
-	}
-
-	baseQuery := `
-		SELECT wo.id, wo.production_order_id, po.code as production_order_code,
-			   wo.code, wo.name, wo.sequence, wo.operation_id, op.operation_name as operation_name,
-			   wo.work_center_id, wc.name as work_center_name,
-			   wo.quantity_to_produce, wo.quantity_produced, wo.quantity_scrapped, wo.uom,
-			   wo.planned_duration_hours, wo.actual_duration_hours, wo.setup_time_hours,
-			   wo.scheduled_start, wo.scheduled_end, wo.actual_start, wo.actual_end,
-			   wo.status, wo.progress_percent, wo.planned_cost, wo.actual_cost,
-			   wo.labor_cost, wo.machine_cost, wo.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
-			   wo.instructions, wo.notes, wo.created_at, wo.updated_at
-		FROM work_orders wo
-		LEFT JOIN production_orders po ON wo.production_order_id = po.id
-		LEFT JOIN bom_operations op ON wo.operation_id = op.id
-		LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
-		LEFT JOIN users u ON wo.assigned_to = u.id
-		WHERE wo.tenant_id = $1 AND wo.deleted_at IS NULL
-	`
-
-	countQuery := `SELECT COUNT(*) FROM work_orders wo WHERE wo.tenant_id = $1 AND wo.deleted_at IS NULL`
-	args := []interface{}{tenantID}
-	countArgs := []interface{}{tenantID}
-	argCount := 1
-
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND wo.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND wo.organization_id = $%d", argCount)
-		args = append(args, orgID)
-		countArgs = append(countArgs, orgID)
-	}
-
-	// Apply filters
-	if filter.ProductionOrderID != nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND wo.production_order_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND wo.production_order_id = $%d", argCount)
-		args = append(args, *filter.ProductionOrderID)
-		countArgs = append(countArgs, *filter.ProductionOrderID)
-	}
-
-	if filter.WorkCenterID != nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND wo.work_center_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND wo.work_center_id = $%d", argCount)
-		args = append(args, *filter.WorkCenterID)
-		countArgs = append(countArgs, *filter.WorkCenterID)
-	}
-
-	if filter.Status != nil && *filter.Status != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND wo.status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND wo.status = $%d", argCount)
-		args = append(args, *filter.Status)
-		countArgs = append(countArgs, *filter.Status)
-	}
-
-	if filter.AssignedTo != nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND wo.assigned_to = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND wo.assigned_to = $%d", argCount)
-		args = append(args, *filter.AssignedTo)
-		countArgs = append(countArgs, *filter.AssignedTo)
-	}
-
-	// Get total count
-	var total int
-	err := h.db.QueryRow(countQuery, countArgs...).Scan(&total)
-	if err != nil {
-		h.log.Error("Failed to count work orders", "error", err)
-		response.InternalError(c, "Failed to retrieve work orders")
-		return
-	}
-
-	// Sorting
-	validSortColumns := map[string]string{
-		"sequence":   "wo.sequence",
-		"status":     "wo.status",
-		"created_at": "wo.created_at",
-	}
-	sortColumn := validSortColumns[filter.SortBy]
-	if sortColumn == "" {
-		sortColumn = "wo.sequence"
-	}
-	sortOrder := "ASC"
-	if strings.ToLower(filter.SortOrder) == "desc" {
-		sortOrder = "DESC"
-	}
-	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortColumn, sortOrder)
-
-	// Pagination
-	offset := (filter.Page - 1) * filter.Limit
-	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", filter.Limit, offset)
-
-	// Execute query
-	rows, err := h.db.Query(baseQuery, args...)
-	if err != nil {
-		h.log.Error("Failed to list work orders", "error", err)
-		response.InternalError(c, "Failed to retrieve work orders")
-		return
-	}
-	defer rows.Close()
-
-	workOrders := []entity.WorkOrderResponse{}
-	for rows.Next() {
-		var wo entity.WorkOrderResponse
-		var poCode, opName, wcName, assignedToName sql.NullString
-		var scheduledStart, scheduledEnd, actualStart, actualEnd sql.NullTime
-
-		err := rows.Scan(
-			&wo.ID, &wo.ProductionOrderID, &poCode,
-			&wo.Code, &wo.Name, &wo.Sequence, &wo.OperationID, &opName,
-			&wo.WorkCenterID, &wcName,
-			&wo.QuantityToProduce, &wo.QuantityProduced, &wo.QuantityScrapped, &wo.UOM,
-			&wo.PlannedDurationHours, &wo.ActualDurationHours, &wo.SetupTimeHours,
-			&scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
-			&wo.Status, &wo.ProgressPercent, &wo.PlannedCost, &wo.ActualCost,
-			&wo.LaborCost, &wo.MachineCost, &wo.AssignedTo, &assignedToName,
-			&wo.Instructions, &wo.Notes, &wo.CreatedAt, &wo.UpdatedAt,
-		)
-		if err != nil {
-			h.log.Error("Failed to scan work order", "error", err)
-			continue
-		}
-
-		wo.ProductionOrderCode = poCode.String
-		if opName.Valid {
-			wo.OperationName = &opName.String
-		}
-		if wcName.Valid {
-			wo.WorkCenterName = &wcName.String
-		}
-		if assignedToName.Valid {
-			wo.AssignedToName = &assignedToName.String
-		}
-		if scheduledStart.Valid {
-			s := scheduledStart.Time.Format(time.RFC3339)
-			wo.ScheduledStart = &s
-		}
-		if scheduledEnd.Valid {
-			s := scheduledEnd.Time.Format(time.RFC3339)
-			wo.ScheduledEnd = &s
-		}
-		if actualStart.Valid {
-			s := actualStart.Time.Format(time.RFC3339)
-			wo.ActualStart = &s
-		}
-		if actualEnd.Valid {
-			s := actualEnd.Time.Format(time.RFC3339)
-			wo.ActualEnd = &s
-		}
-
-		wo.QuantityRemaining = wo.QuantityToProduce - wo.QuantityProduced - wo.QuantityScrapped
-
-		workOrders = append(workOrders, wo)
-	}
-
-	pagination := entity.NewPagination(filter.Page, filter.Limit)
-	pagination.Calculate(total)
-	response.SuccessWithPagination(c, workOrders, pagination)
-}
-
-// GetWorkOrder returns a single work order by ID
-func (h *Handler) GetWorkOrder(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	idStr := c.Param("id")
-	id, err := uuid.Parse(idStr)
-	if err != nil {
-		response.BadRequest(c, "Invalid work order ID")
-		return
-	}
-
-	query := `
-		SELECT wo.id, wo.production_order_id, po.code as production_order_code,
-			   wo.code, wo.name, wo.sequence, wo.operation_id, op.operation_name as operation_name,
-			   wo.work_center_id, wc.name as work_center_name,
-			   wo.quantity_to_produce, wo.quantity_produced, wo.quantity_scrapped, wo.uom,
-			   wo.planned_duration_hours, wo.actual_duration_hours, wo.setup_time_hours,
-			   wo.scheduled_start, wo.scheduled_end, wo.actual_start, wo.actual_end,
-			   wo.status, wo.progress_percent, wo.planned_cost, wo.actual_cost,
-			   wo.labor_cost, wo.machine_cost, wo.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
-			   wo.instructions, wo.notes, wo.created_at, wo.updated_at
-		FROM work_orders wo
-		LEFT JOIN production_orders po ON wo.production_order_id = po.id
-		LEFT JOIN bom_operations op ON wo.operation_id = op.id
-		LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
-		LEFT JOIN users u ON wo.assigned_to = u.id
-		WHERE wo.id = $1 AND wo.tenant_id = $2 AND wo.deleted_at IS NULL
-	`
-
-	var wo entity.WorkOrderResponse
-	var poCode, opName, wcName, assignedToName sql.NullString
-	var scheduledStart, scheduledEnd, actualStart, actualEnd sql.NullTime
-
-	err = h.db.QueryRow(query, id, tenantID).Scan(
-		&wo.ID, &wo.ProductionOrderID, &poCode,
-		&wo.Code, &wo.Name, &wo.Sequence, &wo.OperationID, &opName,
-		&wo.WorkCenterID, &wcName,
-		&wo.QuantityToProduce, &wo.QuantityProduced, &wo.QuantityScrapped, &wo.UOM,
-		&wo.PlannedDurationHours, &wo.ActualDurationHours, &wo.SetupTimeHours,
-		&scheduledStart, &scheduledEnd, &actualStart, &actualEnd,
-		&wo.Status, &wo.ProgressPercent, &wo.PlannedCost, &wo.ActualCost,
-		&wo.LaborCost, &wo.MachineCost, &wo.AssignedTo, &assignedToName,
-		&wo.Instructions, &wo.Notes, &wo.CreatedAt, &wo.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		response.NotFound(c, "Work order not found")
-		return
-	}
-	if err != nil {
-		h.log.Error("Failed to get work order", "error", err)
-		response.InternalError(c, "Failed to retrieve work order")
-		return
-	}
-
-	wo.ProductionOrderCode = poCode.String
-	if opName.Valid {
-		wo.OperationName = &opName.String
-	}
-	if wcName.Valid {
-		wo.WorkCenterName = &wcName.String
-	}
-	if assignedToName.Valid {
-		wo.AssignedToName = &assignedToName.String
-	}
-	if scheduledStart.Valid {
-		s := scheduledStart.Time.Format(time.RFC3339)
-		wo.ScheduledStart = &s
-	}
-	if scheduledEnd.Valid {
-		s := scheduledEnd.Time.Format(time.RFC3339)
-		wo.ScheduledEnd = &s
-	}
-	if actualStart.Valid {
-		s := actualStart.Time.Format(time.RFC3339)
-		wo.ActualStart = &s
-	}
-	if actualEnd.Valid {
-		s := actualEnd.Time.Format(time.RFC3339)
-		wo.ActualEnd = &s
-	}
-
-	wo.QuantityRemaining = wo.QuantityToProduce - wo.QuantityProduced - wo.QuantityScrapped
-
-	response.Success(c, wo)
-}
-
-// CreateWorkOrder creates a new work order
-func (h *Handler) CreateWorkOrder(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	userID, _ := middleware.GetUserID(c)
-
-	var input entity.WorkOrderInput
-	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
-		return
-	}
-
-	// Verify production order exists and get sequence
-	var maxSequence int
-	seqQuery := `
-		SELECT COALESCE(MAX(sequence), 0) FROM work_orders
-		WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`
-	h.db.QueryRow(seqQuery, input.ProductionOrderID, tenantID).Scan(&maxSequence)
-
-	sequence := maxSequence + 1
-	if input.Sequence != nil {
-		sequence = *input.Sequence
-	}
-
-	now := time.Now()
-	id := uuid.New()
-	code := fmt.Sprintf("WO-%s", id.String()[:8])
-
-	plannedDuration := 0.0
-	if input.PlannedDurationHrs != nil {
-		plannedDuration = *input.PlannedDurationHrs
-	}
-	setupTime := 0.0
-	if input.SetupTimeHrs != nil {
-		setupTime = *input.SetupTimeHrs
-	}
-
-	var scheduledStart, scheduledEnd *time.Time
-	if input.ScheduledStart != nil {
-		t, _ := time.Parse(time.RFC3339, *input.ScheduledStart)
-		scheduledStart = &t
-	}
-	if input.ScheduledEnd != nil {
-		t, _ := time.Parse(time.RFC3339, *input.ScheduledEnd)
-		scheduledEnd = &t
-	}
-
-	// Get organization ID from context
-	orgID, _ := middleware.GetOrganizationID(c)
-	var orgIDPtr *uuid.UUID
-	if orgID != uuid.Nil {
-		orgIDPtr = &orgID
-	}
-
-	query := `
-		INSERT INTO work_orders (
-			id, tenant_id, organization_id, production_order_id, code, name, sequence,
-			operation_id, work_center_id, quantity_to_produce, uom,
-			planned_duration_hours, setup_time_hours, scheduled_start, scheduled_end,
-			status, assigned_to, instructions, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $19, $20, $21)
-		RETURNING id
-	`
-
-	err := h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, input.ProductionOrderID, code, input.Name, sequence,
-		input.OperationID, input.WorkCenterID, input.QuantityToProduce, input.UOM,
-		plannedDuration, setupTime, scheduledStart, scheduledEnd,
-		input.AssignedTo, input.Instructions, input.Notes, userID, now, now,
-	).Scan(&id)
-
-	if err != nil {
-		h.log.Error("Failed to create work order", "error", err)
-		response.InternalError(c, "Failed to create work order")
-		return
-	}
-
-	c.Params = append(c.Params, gin.Param{Key: "id", Value: id.String()})
-	h.GetWorkOrder(c)
-}
-
-// StartWorkOrder starts a work order
-func (h *Handler) StartWorkOrder(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	userID, _ := middleware.GetUserID(c)
-
-	idStr := c.Param("id")
-	id, err := uuid.Parse(idStr)
-	if err != nil {
-		response.BadRequest(c, "Invalid work order ID")
-		return
-	}
-
-	now := time.Now()
-	query := `
-		UPDATE work_orders
-		SET status = 'in_progress', actual_start = $1, started_by = $2, updated_at = $1
-		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL AND status IN ('pending', 'ready', 'paused')
-	`
-
-	result, err := h.db.Exec(query, now, userID, id, tenantID)
-	if err != nil {
-		h.log.Error("Failed to start work order", "error", err)
-		response.InternalError(c, "Failed to start work order")
-		return
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		response.NotFound(c, "Work order not found or not in valid status")
-		return
-	}
-
-	h.GetWorkOrder(c)
-}
-
-// CompleteWorkOrder completes a work order
-func (h *Handler) CompleteWorkOrder(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	userID, _ := middleware.GetUserID(c)
-
-	idStr := c.Param("id")
-	id, err := uuid.Parse(idStr)
-	if err != nil {
-		response.BadRequest(c, "Invalid work order ID")
-		return
-	}
-
-	var input struct {
-		QuantityProduced float64 `json:"quantity_produced"`
-		QuantityScrapped float64 `json:"quantity_scrapped"`
-		ActualDuration   float64 `json:"actual_duration_hours"`
-	}
-	c.ShouldBindJSON(&input)
-
-	now := time.Now()
-	query := `
-		UPDATE work_orders
-		SET status = 'completed', actual_end = $1, completed_by = $2, updated_at = $1, progress_percent = 100
-	`
-	args := []interface{}{now, userID}
-	argCount := 2
-
-	if input.QuantityProduced > 0 {
-		argCount++
-		query += fmt.Sprintf(", quantity_produced = $%d", argCount)
-		args = append(args, input.QuantityProduced)
-	}
-	if input.QuantityScrapped > 0 {
-		argCount++
-		query += fmt.Sprintf(", quantity_scrapped = $%d", argCount)
-		args = append(args, input.QuantityScrapped)
-	}
-	if input.ActualDuration > 0 {
-		argCount++
-		query += fmt.Sprintf(", actual_duration_hours = $%d", argCount)
-		args = append(args, input.ActualDuration)
-	}
-
-	argCount++
-	args = append(args, id)
-	argCount++
-	args = append(args, tenantID)
-
-	query += fmt.Sprintf(" WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status = 'in_progress'", argCount-1, argCount)
-
-	result, err := h.db.Exec(query, args...)
-	if err != nil {
-		h.log.Error("Failed to complete work order", "error", err)
-		response.InternalError(c, "Failed to complete work order")
-		return
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		response.NotFound(c, "Work order not found or not in progress")
-		return
-	}
-
-	h.GetWorkOrder(c)
-}
-
-// RecordWorkOrderTime records time spent on a work order
-func (h *Handler) RecordWorkOrderTime(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	userID, _ := middleware.GetUserID(c)
-
-	idStr := c.Param("id")
-	workOrderID, err := uuid.Parse(idStr)
-	if err != nil {
-		response.BadRequest(c, "Invalid work order ID")
-		return
-	}
-
-	var input struct {
-		StartTime     string  `json:"start_time" binding:"required"`
-		EndTime       string  `json:"end_time"`
-		DurationHours float64 `json:"duration_hours"`
-		LogType       string  `json:"log_type"`
-		Notes         string  `json:"notes"`
-	}
-	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
-		return
-	}
-
-	startTime, err := time.Parse(time.RFC3339, input.StartTime)
-	if err != nil {
-		response.BadRequest(c, "Invalid start time format")
-		return
-	}
-
-	var endTime *time.Time
-	var durationHours *float64
-	if input.EndTime != "" {
-		t, _ := time.Parse(time.RFC3339, input.EndTime)
-		endTime = &t
-		hours := t.Sub(startTime).Hours()
-		durationHours = &hours
-	} else if input.DurationHours > 0 {
-		durationHours = &input.DurationHours
-	}
-
-	logType := "work"
-	if input.LogType != "" {
-		logType = input.LogType
-	}
-
-	id := uuid.New()
-	query := `
-		INSERT INTO work_order_time_logs (
-			id, tenant_id, work_order_id, start_time, end_time, duration_hours,
-			log_type, worker_id, notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
-	`
-
-	_, err = h.db.Exec(query, id, tenantID, workOrderID, startTime, endTime, durationHours, logType, userID, input.Notes)
-	if err != nil {
-		h.log.Error("Failed to record time log", "error", err)
-		response.InternalError(c, "Failed to record time")
-		return
-	}
-
-	// Update work order actual duration
-	if durationHours != nil {
-		updateQuery := `
-			UPDATE work_orders
-			SET actual_duration_hours = actual_duration_hours + $1, updated_at = NOW()
-			WHERE id = $2 AND tenant_id = $3
-		`
-		h.db.Exec(updateQuery, *durationHours, workOrderID, tenantID)
-	}
-
-	response.Created(c, map[string]interface{}{
-		"id":      id,
-		"message": "Time recorded successfully",
-	})
-}
+// NOTE: Work Order handlers (ListWorkOrders, GetWorkOrder, CreateWorkOrder, StartWorkOrder,
+// CompleteWorkOrder, RecordWorkOrderTime, PauseWorkOrder) are defined in work_orders.go
 
 // =====================================================
 // QUALITY CHECK HANDLERS
 // =====================================================
 
-// ListQualityChecks returns all quality checks with filtering
+// ListQualityChecks godoc
+// @Summary List quality checks
+// @Description Get a paginated list of quality checks with filtering options
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param result query string false "Filter by result"
+// @Param production_order_id query string false "Filter by production order ID"
+// @Param inspector_id query string false "Filter by inspector ID"
+// @Param date_from query string false "Filter by date from"
+// @Param date_to query string false "Filter by date to"
+// @Param search query string false "Search by reference number"
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param sort_by query string false "Sort by field" default(inspection_date)
+// @Param sort_order query string false "Sort order (asc/desc)" default(desc)
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-checks [get]
 func (h *Handler) ListQualityChecks(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2557,7 +2590,8 @@ func (h *Handler) ListQualityChecks(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	qualityChecks := []entity.QualityCheckResponse{}
+	// Initialize as empty array (never nil) to ensure JSON marshals to [] not null
+	qualityChecks := make([]entity.QualityCheckResponse, 0)
 	for rows.Next() {
 		var qc entity.QualityCheckResponse
 		var poCode, woCode, productName, productCode sql.NullString
@@ -2600,12 +2634,30 @@ func (h *Handler) ListQualityChecks(c *gin.Context) {
 		qualityChecks = append(qualityChecks, qc)
 	}
 
+	// Ensure we always return an array, never nil
+	if qualityChecks == nil {
+		qualityChecks = make([]entity.QualityCheckResponse, 0)
+	}
+
 	pagination := entity.NewPagination(filter.Page, filter.Limit)
 	pagination.Calculate(total)
 	response.SuccessWithPagination(c, qualityChecks, pagination)
 }
 
-// GetQualityCheck returns a single quality check by ID
+// GetQualityCheck godoc
+// @Summary Get quality check
+// @Description Get a single quality check by ID
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param id path string true "Quality Check ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-checks/{id} [get]
 func (h *Handler) GetQualityCheck(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2682,7 +2734,19 @@ func (h *Handler) GetQualityCheck(c *gin.Context) {
 	response.Success(c, qc)
 }
 
-// CreateQualityCheck creates a new quality check
+// CreateQualityCheck godoc
+// @Summary Create quality check
+// @Description Create a new quality check
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param input body entity.QualityCheckInput true "Quality check input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-checks [post]
 func (h *Handler) CreateQualityCheck(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2790,7 +2854,19 @@ func (h *Handler) CreateQualityCheck(c *gin.Context) {
 	h.GetQualityCheck(c)
 }
 
-// GetQualityStats returns quality statistics
+// GetQualityStats godoc
+// @Summary Get quality statistics
+// @Description Get quality statistics for a date range
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param date_from query string false "Start date (YYYY-MM-DD)"
+// @Param date_to query string false "End date (YYYY-MM-DD)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-stats [get]
 func (h *Handler) GetQualityStats(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2859,18 +2935,35 @@ func (h *Handler) GetQualityStats(c *gin.Context) {
 		ORDER BY count DESC
 		LIMIT 5
 	`
-	rows, _ := h.db.Query(defectsQuery, tenantID)
+	rows, err := h.db.Query(defectsQuery, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query top defects", "error", err)
+		// Continue with empty defects rather than failing the whole request
+		response.Success(c, map[string]interface{}{
+			"summary":     stats,
+			"top_defects": []map[string]interface{}{},
+		})
+		return
+	}
 	defer rows.Close()
 
-	topDefects := []map[string]interface{}{}
+	topDefects := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var defectType string
 		var count int
-		rows.Scan(&defectType, &count)
+		if err := rows.Scan(&defectType, &count); err != nil {
+			h.log.Error("Failed to scan defect", "error", err)
+			continue
+		}
 		topDefects = append(topDefects, map[string]interface{}{
 			"defect_type": defectType,
 			"count":       count,
 		})
+	}
+
+	// Ensure we always return an array, even if empty
+	if topDefects == nil {
+		topDefects = make([]map[string]interface{}, 0)
 	}
 
 	response.Success(c, map[string]interface{}{
@@ -2879,7 +2972,17 @@ func (h *Handler) GetQualityStats(c *gin.Context) {
 	})
 }
 
-// ListQualityDefects returns all quality defect types
+// ListQualityDefects godoc
+// @Summary List quality defects
+// @Description Get all quality defect types
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-defects [get]
 func (h *Handler) ListQualityDefects(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2902,21 +3005,40 @@ func (h *Handler) ListQualityDefects(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	defects := []entity.QualityDefect{}
+	// Initialize as empty array to ensure JSON marshals to [] not null
+	defects := make([]entity.QualityDefect, 0)
 	for rows.Next() {
 		var d entity.QualityDefect
 		err := rows.Scan(&d.ID, &d.Code, &d.Name, &d.Description, &d.Category, &d.Severity, &d.DefaultAction, &d.IsActive, &d.CreatedAt, &d.UpdatedAt)
 		if err != nil {
+			h.log.Error("Failed to scan quality defect", "error", err)
 			continue
 		}
 		d.TenantID = tenantID
 		defects = append(defects, d)
 	}
 
+	// Ensure we always return an array, never nil
+	if defects == nil {
+		defects = make([]entity.QualityDefect, 0)
+	}
+
 	response.Success(c, defects)
 }
 
-// CreateQualityDefect creates a new quality defect type
+// CreateQualityDefect godoc
+// @Summary Create quality defect
+// @Description Create a new quality defect type
+// @Tags Manufacturing
+// @Accept json
+// @Produce json
+// @Param input body entity.QualityDefectInput true "Quality defect input"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /manufacturing/quality-defects [post]
 func (h *Handler) CreateQualityDefect(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {

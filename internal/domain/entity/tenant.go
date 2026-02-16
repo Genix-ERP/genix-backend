@@ -15,12 +15,12 @@ type Tenant struct {
 	Name               string          `json:"name" db:"name"`
 	Domain             *string         `json:"domain,omitempty" db:"domain"`
 	LogoURL            *string         `json:"logo_url,omitempty" db:"logo_url"`
-	Settings           json.RawMessage `json:"settings" db:"settings"`
+	Settings           json.RawMessage `json:"settings" db:"settings" swaggertype:"object"`
 	SubscriptionPlan   string          `json:"subscription_plan" db:"subscription_plan"`
 	SubscriptionStatus string          `json:"subscription_status" db:"subscription_status"`
 	MaxUsers           int             `json:"max_users" db:"max_users"`
 	MaxStorageGB       int             `json:"max_storage_gb" db:"max_storage_gb"`
-	Features           json.RawMessage `json:"features" db:"features"`
+	Features           json.RawMessage `json:"features" db:"features" swaggertype:"object"`
 	IsActive           bool            `json:"is_active" db:"is_active"`
 	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at" db:"updated_at"`
@@ -141,7 +141,7 @@ type TenantInstalledApp struct {
 	InstalledBy    uuid.NullUUID   `json:"installed_by" db:"installed_by"`
 	InstalledDate  time.Time       `json:"installed_date" db:"installed_date"`
 	UpdatedDate    time.Time       `json:"updated_date" db:"updated_date"`
-	Settings       json.RawMessage `json:"settings" db:"settings"`
+	Settings       json.RawMessage `json:"settings" db:"settings" swaggertype:"object"`
 }
 
 // InstallAppRequest represents request to install an app

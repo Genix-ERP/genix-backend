@@ -25,7 +25,7 @@ type ProductCategory struct {
 	Code        string          `json:"code" db:"code"`
 	Name        string          `json:"name" db:"name"`
 	Description *string         `json:"description,omitempty" db:"description"`
-	Attributes  json.RawMessage `json:"attributes" db:"attributes"`
+	Attributes  json.RawMessage `json:"attributes" db:"attributes" swaggertype:"object"`
 	IsActive    bool            `json:"is_active" db:"is_active"`
 	CreatedAt   time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at" db:"updated_at"`
@@ -93,9 +93,9 @@ type Product struct {
 	Width              *float64        `json:"width,omitempty" db:"width"`
 	Height             *float64        `json:"height,omitempty" db:"height"`
 	DimensionUnit      *string         `json:"dimension_unit,omitempty" db:"dimension_unit"`
-	Images             json.RawMessage `json:"images" db:"images"`
-	Attributes         json.RawMessage `json:"attributes" db:"attributes"`
-	Tags               json.RawMessage `json:"tags" db:"tags"`
+	Images             json.RawMessage `json:"images" db:"images" swaggertype:"object"`
+	Attributes         json.RawMessage `json:"attributes" db:"attributes" swaggertype:"object"`
+	Tags               json.RawMessage `json:"tags" db:"tags" swaggertype:"object"`
 	Notes              *string         `json:"notes,omitempty" db:"notes"`
 	IsPurchasable      bool            `json:"is_purchasable" db:"is_purchasable"`
 	IsSellable         bool            `json:"is_sellable" db:"is_sellable"`

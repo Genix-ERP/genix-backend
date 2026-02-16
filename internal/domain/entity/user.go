@@ -20,7 +20,7 @@ type User struct {
 	AvatarURL           *string         `json:"avatar_url,omitempty" db:"avatar_url"`
 	Language            string          `json:"language" db:"language"`
 	Timezone            string          `json:"timezone" db:"timezone"`
-	Settings            json.RawMessage `json:"settings" db:"settings"`
+	Settings            json.RawMessage `json:"settings" db:"settings" swaggertype:"object"`
 	IsActive            bool            `json:"is_active" db:"is_active"`
 	IsVerified          bool            `json:"is_verified" db:"is_verified"`
 	IsSystemAdmin       bool            `json:"is_system_admin" db:"is_system_admin"`
@@ -89,7 +89,7 @@ type Role struct {
 	Code        string          `json:"code" db:"code"`
 	Description *string         `json:"description,omitempty" db:"description"`
 	IsSystem    bool            `json:"is_system" db:"is_system"`
-	Permissions json.RawMessage `json:"permissions" db:"permissions"`
+	Permissions json.RawMessage `json:"permissions" db:"permissions" swaggertype:"object"`
 	CreatedAt   time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at" db:"updated_at"`
 }
@@ -114,7 +114,7 @@ type RefreshToken struct {
 	ID         uuid.UUID       `json:"id" db:"id"`
 	UserID     uuid.UUID       `json:"user_id" db:"user_id"`
 	TokenHash  string          `json:"-" db:"token_hash"`
-	DeviceInfo json.RawMessage `json:"device_info,omitempty" db:"device_info"`
+	DeviceInfo json.RawMessage `json:"device_info,omitempty" db:"device_info" swaggertype:"object"`
 	IPAddress  *string         `json:"ip_address,omitempty" db:"ip_address"`
 	ExpiresAt  time.Time       `json:"expires_at" db:"expires_at"`
 	CreatedAt  time.Time       `json:"created_at" db:"created_at"`
@@ -134,7 +134,7 @@ type APIKey struct {
 	Name       string          `json:"name" db:"name"`
 	KeyHash    string          `json:"-" db:"key_hash"`
 	KeyPrefix  string          `json:"key_prefix" db:"key_prefix"`
-	Scopes     json.RawMessage `json:"scopes" db:"scopes"`
+	Scopes     json.RawMessage `json:"scopes" db:"scopes" swaggertype:"object"`
 	RateLimit  int             `json:"rate_limit" db:"rate_limit"`
 	ExpiresAt  *time.Time      `json:"expires_at,omitempty" db:"expires_at"`
 	LastUsedAt *time.Time      `json:"last_used_at,omitempty" db:"last_used_at"`

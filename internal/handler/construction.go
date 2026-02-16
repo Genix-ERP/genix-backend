@@ -20,6 +20,20 @@ import (
 // =====================================================
 
 // ListConstructionProjects returns a paginated list of construction projects
+// ListConstructionProjects godoc
+// @Summary List construction projects
+// @Description Get a paginated list of construction projects
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param status query string false "Filter by status"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects [get]
 func (h *Handler) ListConstructionProjects(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -140,6 +154,20 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 }
 
 // GetConstructionProject returns a single construction project by ID
+// GetConstructionProject godoc
+// @Summary Get construction project by ID
+// @Description Get detailed information about a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id} [get]
 func (h *Handler) GetConstructionProject(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -203,6 +231,19 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 }
 
 // CreateConstructionProject creates a new construction project
+// CreateConstructionProject godoc
+// @Summary Create construction project
+// @Description Create a new construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param project body entity.CreateConstructionProjectInput true "Project data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects [post]
 func (h *Handler) CreateConstructionProject(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -281,6 +322,21 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 }
 
 // UpdateConstructionProject updates a construction project
+// UpdateConstructionProject godoc
+// @Summary Update construction project
+// @Description Update an existing construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param project body entity.UpdateConstructionProjectInput true "Project data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id} [put]
 func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -426,6 +482,20 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 }
 
 // DeleteConstructionProject soft deletes a construction project
+// DeleteConstructionProject godoc
+// @Summary Delete construction project
+// @Description Soft delete a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id} [delete]
 func (h *Handler) DeleteConstructionProject(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -459,6 +529,20 @@ func (h *Handler) DeleteConstructionProject(c *gin.Context) {
 }
 
 // GetConstructionProjectDashboard returns dashboard statistics for a project
+// GetConstructionProjectDashboard godoc
+// @Summary Get project dashboard
+// @Description Get dashboard statistics and summary for a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/dashboard [get]
 func (h *Handler) GetConstructionProjectDashboard(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -550,6 +634,19 @@ func (h *Handler) GetConstructionProjectDashboard(c *gin.Context) {
 // =====================================================
 
 // ListConstructionBuildings returns buildings for a project
+// ListConstructionBuildings godoc
+// @Summary List construction buildings
+// @Description Get a list of buildings for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/buildings [get]
 func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -613,6 +710,20 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 }
 
 // CreateConstructionBuilding creates a new building
+// CreateConstructionBuilding godoc
+// @Summary Create construction building
+// @Description Create a new building for a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param building body entity.CreateConstructionBuildingInput true "Building data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/buildings [post]
 func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -685,6 +796,21 @@ func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 }
 
 // UpdateConstructionBuilding updates a building
+// UpdateConstructionBuilding godoc
+// @Summary Update construction building
+// @Description Update an existing building in a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param building_id path int true "Building ID"
+// @Param building body entity.UpdateConstructionBuildingInput true "Building data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/buildings/{building_id} [put]
 func (h *Handler) UpdateConstructionBuilding(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -792,6 +918,21 @@ func (h *Handler) UpdateConstructionBuilding(c *gin.Context) {
 }
 
 // DeleteConstructionBuilding deletes a building
+// DeleteConstructionBuilding godoc
+// @Summary Delete construction building
+// @Description Delete a building from a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param building_id path int true "Building ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/buildings/{building_id} [delete]
 func (h *Handler) DeleteConstructionBuilding(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -835,6 +976,19 @@ func (h *Handler) DeleteConstructionBuilding(c *gin.Context) {
 // =====================================================
 
 // ListSmetaSections returns smeta sections for a project
+// ListSmetaSections godoc
+// @Summary List smeta sections
+// @Description Get a list of smeta sections for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/smeta/sections [get]
 func (h *Handler) ListSmetaSections(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -887,6 +1041,20 @@ func (h *Handler) ListSmetaSections(c *gin.Context) {
 }
 
 // CreateSmetaSection creates a new smeta section
+// CreateSmetaSection godoc
+// @Summary Create smeta section
+// @Description Create a new smeta section for a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param section body entity.CreateSmetaSectionInput true "Section data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/smeta/sections [post]
 func (h *Handler) CreateSmetaSection(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -935,6 +1103,21 @@ func (h *Handler) CreateSmetaSection(c *gin.Context) {
 }
 
 // UpdateSmetaSection updates a smeta section
+// UpdateSmetaSection godoc
+// @Summary Update smeta section
+// @Description Update an existing smeta section
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Section ID"
+// @Param section body entity.UpdateSmetaSectionInput true "Section data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/smeta/sections/{id} [put]
 func (h *Handler) UpdateSmetaSection(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1021,6 +1204,20 @@ func (h *Handler) UpdateSmetaSection(c *gin.Context) {
 }
 
 // DeleteSmetaSection deletes a smeta section
+// DeleteSmetaSection godoc
+// @Summary Delete smeta section
+// @Description Delete a smeta section
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Section ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/smeta/sections/{id} [delete]
 func (h *Handler) DeleteSmetaSection(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1058,6 +1255,19 @@ func (h *Handler) DeleteSmetaSection(c *gin.Context) {
 // =====================================================
 
 // ListSmetaItems returns smeta items for a section
+// ListSmetaItems godoc
+// @Summary List smeta items
+// @Description Get a list of smeta items for a specific section
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Section ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/smeta/sections/{id}/items [get]
 func (h *Handler) ListSmetaItems(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1115,6 +1325,20 @@ func (h *Handler) ListSmetaItems(c *gin.Context) {
 }
 
 // CreateSmetaItem creates a new smeta item
+// CreateSmetaItem godoc
+// @Summary Create smeta item
+// @Description Create a new smeta item for a section
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Section ID"
+// @Param item body entity.CreateSmetaItemInput true "Item data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/smeta/sections/{id}/items [post]
 func (h *Handler) CreateSmetaItem(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1174,6 +1398,21 @@ func (h *Handler) CreateSmetaItem(c *gin.Context) {
 }
 
 // UpdateSmetaItem updates a smeta item
+// UpdateSmetaItem godoc
+// @Summary Update smeta item
+// @Description Update an existing smeta item
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Item ID"
+// @Param item body entity.UpdateSmetaItemInput true "Item data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/smeta/items/{id} [put]
 func (h *Handler) UpdateSmetaItem(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1284,6 +1523,20 @@ func (h *Handler) UpdateSmetaItem(c *gin.Context) {
 }
 
 // DeleteSmetaItem deletes a smeta item
+// DeleteSmetaItem godoc
+// @Summary Delete smeta item
+// @Description Delete a smeta item
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Item ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/smeta/items/{id} [delete]
 func (h *Handler) DeleteSmetaItem(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1423,6 +1676,19 @@ func nullUUID(s string) uuid.NullUUID {
 // =====================================================
 
 // ListProjectVendors returns vendors for a project
+// ListProjectVendors godoc
+// @Summary List project vendors
+// @Description Get a list of vendors for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/vendors [get]
 func (h *Handler) ListProjectVendors(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1517,6 +1783,20 @@ func (h *Handler) ListProjectVendors(c *gin.Context) {
 }
 
 // CreateProjectVendor adds a vendor to a project
+// CreateProjectVendor godoc
+// @Summary Create project vendor
+// @Description Add a vendor to a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param vendor body entity.CreateProjectVendorInput true "Vendor data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/vendors [post]
 func (h *Handler) CreateProjectVendor(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1645,6 +1925,21 @@ func (h *Handler) CreateProjectVendor(c *gin.Context) {
 }
 
 // UpdateProjectVendor updates a vendor assignment
+// UpdateProjectVendor godoc
+// @Summary Update project vendor
+// @Description Update a vendor assignment in a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Vendor Record ID"
+// @Param vendor body entity.CreateProjectVendorInput true "Vendor data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/vendors/{id} [put]
 func (h *Handler) UpdateProjectVendor(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1729,6 +2024,20 @@ func (h *Handler) UpdateProjectVendor(c *gin.Context) {
 }
 
 // DeleteProjectVendor removes a vendor from a project
+// DeleteProjectVendor godoc
+// @Summary Delete project vendor
+// @Description Remove a vendor from a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Vendor Record ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/vendors/{id} [delete]
 func (h *Handler) DeleteProjectVendor(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1770,6 +2079,19 @@ func (h *Handler) DeleteProjectVendor(c *gin.Context) {
 // =====================================================
 
 // ListPhotoReports returns photo reports for a project
+// ListPhotoReports godoc
+// @Summary List photo reports
+// @Description Get a list of photo reports for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/photo-reports [get]
 func (h *Handler) ListPhotoReports(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1873,6 +2195,20 @@ func (h *Handler) ListPhotoReports(c *gin.Context) {
 }
 
 // CreatePhotoReport creates a new photo report
+// CreatePhotoReport godoc
+// @Summary Create photo report
+// @Description Create a new photo report for a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param report body entity.CreatePhotoReportInput true "Photo report data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/photo-reports [post]
 func (h *Handler) CreatePhotoReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1933,6 +2269,20 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 }
 
 // GetPhotoReport returns a single photo report
+// GetPhotoReport godoc
+// @Summary Get photo report
+// @Description Get detailed information about a specific photo report
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Report ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/photo-reports/{id} [get]
 func (h *Handler) GetPhotoReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1987,6 +2337,21 @@ func (h *Handler) GetPhotoReport(c *gin.Context) {
 }
 
 // UpdatePhotoReport updates a photo report
+// UpdatePhotoReport godoc
+// @Summary Update photo report
+// @Description Update an existing photo report
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Report ID"
+// @Param report body entity.CreatePhotoReportInput true "Photo report data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/photo-reports/{id} [put]
 func (h *Handler) UpdatePhotoReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2049,6 +2414,20 @@ func (h *Handler) UpdatePhotoReport(c *gin.Context) {
 }
 
 // DeletePhotoReport deletes a photo report
+// DeletePhotoReport godoc
+// @Summary Delete photo report
+// @Description Delete a photo report
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Report ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/photo-reports/{id} [delete]
 func (h *Handler) DeletePhotoReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2086,6 +2465,19 @@ func (h *Handler) DeletePhotoReport(c *gin.Context) {
 // =====================================================
 
 // ListDailyReports returns daily reports for a project
+// ListDailyReports godoc
+// @Summary List daily reports
+// @Description Get a list of daily reports for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/daily-reports [get]
 func (h *Handler) ListDailyReports(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2180,6 +2572,20 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 }
 
 // CreateDailyReport creates a new daily report
+// CreateDailyReport godoc
+// @Summary Create daily report
+// @Description Create a new daily report for a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param report body entity.CreateDailyReportInput true "Daily report data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/daily-reports [post]
 func (h *Handler) CreateDailyReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2251,6 +2657,20 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 }
 
 // GetDailyReport returns a single daily report
+// GetDailyReport godoc
+// @Summary Get daily report
+// @Description Get detailed information about a specific daily report
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Report ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/daily-reports/{id} [get]
 func (h *Handler) GetDailyReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2340,6 +2760,21 @@ func (h *Handler) GetDailyReport(c *gin.Context) {
 }
 
 // UpdateDailyReport updates a daily report
+// UpdateDailyReport godoc
+// @Summary Update daily report
+// @Description Update an existing daily report
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Report ID"
+// @Param report body object true "Daily report data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/daily-reports/{id} [put]
 func (h *Handler) UpdateDailyReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2429,6 +2864,20 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 }
 
 // DeleteDailyReport deletes a daily report
+// DeleteDailyReport godoc
+// @Summary Delete daily report
+// @Description Delete a daily report
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Report ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/daily-reports/{id} [delete]
 func (h *Handler) DeleteDailyReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2466,6 +2915,19 @@ func (h *Handler) DeleteDailyReport(c *gin.Context) {
 // =====================================================
 
 // ListMaterialRequests returns material requests for a project
+// ListMaterialRequests godoc
+// @Summary List material requests
+// @Description Get a list of material requests for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/material-requests [get]
 func (h *Handler) ListMaterialRequests(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2558,6 +3020,20 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 }
 
 // CreateMaterialRequest creates a new material request
+// CreateMaterialRequest godoc
+// @Summary Create material request
+// @Description Create a new material request for a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param request body object true "Material request data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/material-requests [post]
 func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2616,6 +3092,21 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 }
 
 // UpdateMaterialRequest updates a material request
+// UpdateMaterialRequest godoc
+// @Summary Update material request
+// @Description Update an existing material request
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Request ID"
+// @Param request body object true "Material request data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/material-requests/{id} [put]
 func (h *Handler) UpdateMaterialRequest(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2673,6 +3164,20 @@ func (h *Handler) UpdateMaterialRequest(c *gin.Context) {
 }
 
 // DeleteMaterialRequest deletes a material request
+// DeleteMaterialRequest godoc
+// @Summary Delete material request
+// @Description Delete a material request
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Request ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/material-requests/{id} [delete]
 func (h *Handler) DeleteMaterialRequest(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2710,6 +3215,19 @@ func (h *Handler) DeleteMaterialRequest(c *gin.Context) {
 // =====================================================
 
 // ListDeliveries returns material deliveries for a project
+// ListDeliveries godoc
+// @Summary List deliveries
+// @Description Get a list of material deliveries for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/deliveries [get]
 func (h *Handler) ListDeliveries(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2815,6 +3333,19 @@ func (h *Handler) ListDeliveries(c *gin.Context) {
 // =====================================================
 
 // ListSiteWarehouses returns site warehouses for a project
+// ListSiteWarehouses godoc
+// @Summary List site warehouses
+// @Description Get a list of site warehouses for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/site-warehouses [get]
 func (h *Handler) ListSiteWarehouses(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2899,6 +3430,20 @@ func (h *Handler) ListSiteWarehouses(c *gin.Context) {
 }
 
 // CreateSiteWarehouse creates a new site warehouse
+// CreateSiteWarehouse godoc
+// @Summary Create site warehouse
+// @Description Create a new site warehouse for a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param warehouse body entity.CreateSiteWarehouseInput true "Site warehouse data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/site-warehouses [post]
 func (h *Handler) CreateSiteWarehouse(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2948,6 +3493,19 @@ func (h *Handler) CreateSiteWarehouse(c *gin.Context) {
 // =====================================================
 
 // ListConstructionTeamMembers returns team members for a construction project
+// ListConstructionTeamMembers godoc
+// @Summary List construction team members
+// @Description Get a list of team members for a specific construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/team-members [get]
 func (h *Handler) ListConstructionTeamMembers(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3023,6 +3581,21 @@ func (h *Handler) ListConstructionTeamMembers(c *gin.Context) {
 }
 
 // CreateConstructionTeamMember adds a team member to a construction project
+// CreateConstructionTeamMember godoc
+// @Summary Create construction team member
+// @Description Add a team member to a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param member body entity.CreateConstructionTeamMemberInput true "Team member data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/team-members [post]
 func (h *Handler) CreateConstructionTeamMember(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3106,6 +3679,21 @@ func (h *Handler) CreateConstructionTeamMember(c *gin.Context) {
 }
 
 // DeleteConstructionTeamMember removes a team member from a construction project
+// DeleteConstructionTeamMember godoc
+// @Summary Delete construction team member
+// @Description Remove a team member from a construction project
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Project ID"
+// @Param memberId path int true "Member ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/projects/{id}/team-members/{memberId} [delete]
 func (h *Handler) DeleteConstructionTeamMember(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {

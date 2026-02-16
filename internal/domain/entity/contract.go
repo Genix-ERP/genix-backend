@@ -47,7 +47,7 @@ type Contract struct {
 	RenewalTermDays int             `json:"renewal_term_days" db:"renewal_term_days"`
 	Notes           *string         `json:"notes,omitempty" db:"notes"`
 	DocumentURL     *string         `json:"document_url,omitempty" db:"document_url"`
-	CustomFields    json.RawMessage `json:"custom_fields" db:"custom_fields"`
+	CustomFields    json.RawMessage `json:"custom_fields" db:"custom_fields" swaggertype:"object"`
 	CreatedBy       *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt       time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at" db:"updated_at"`
