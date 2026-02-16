@@ -36,8 +36,13 @@ BEGIN
     DELETE FROM fixed_assets WHERE tenant_id = v_tid;
     DELETE FROM journal_entry_lines WHERE journal_entry_id IN (SELECT id FROM journal_entries WHERE tenant_id = v_tid);
     DELETE FROM journal_entries WHERE tenant_id = v_tid;
-    DELETE FROM bom_lines WHERE bom_id IN (SELECT id FROM boms WHERE tenant_id = v_tid);
-    DELETE FROM boms WHERE tenant_id = v_tid;
+    -- Delete product dependencies safely (tables may not exist on all deployments)
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bom_lines') THEN
+        EXECUTE 'DELETE FROM bom_lines WHERE bom_id IN (SELECT id FROM boms WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'boms') THEN
+        EXECUTE 'DELETE FROM boms WHERE tenant_id = $1' USING v_tid;
+    END IF;
     DELETE FROM products WHERE tenant_id = v_tid;
     DELETE FROM product_categories WHERE tenant_id = v_tid;
     DELETE FROM bank_accounts WHERE tenant_id = v_tid;
