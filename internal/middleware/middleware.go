@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -180,21 +181,42 @@ func RateLimiter(cfg config.RateLimitConfig, redis *cache.RedisClient) gin.Handl
 			return
 		}
 
-		// Set expiration on first request
+		// Ensure TTL is always set - fixes race condition where
+		// Expire fails on first request, causing key to persist forever
 		if count == 1 {
-			redis.Expire(ctx, key, cfg.WindowSize)
+			if expErr := redis.Expire(ctx, key, cfg.WindowSize); expErr != nil {
+				// If we can't set TTL, delete the key to prevent permanent rate limiting
+				redis.Delete(ctx, key)
+				c.Next()
+				return
+			}
+		} else {
+			// Safety check: if key has no TTL (from previous failed Expire), fix it
+			ttl, ttlErr := redis.TTL(ctx, key)
+			if ttlErr == nil && ttl < 0 {
+				redis.Expire(ctx, key, cfg.WindowSize)
+			}
 		}
 
 		// Check if over limit
 		if int(count) > cfg.RequestsLimit {
+			retryAfter := int(cfg.WindowSize.Seconds())
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
 			response.TooManyRequests(c, "Rate limit exceeded. Please try again later.")
 			c.Abort()
 			return
 		}
 
 		// Add rate limit headers
-		c.Header("X-RateLimit-Limit", string(rune(cfg.RequestsLimit)))
-		c.Header("X-RateLimit-Remaining", string(rune(cfg.RequestsLimit-int(count))))
+		c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", cfg.RequestsLimit))
+		remaining := cfg.RequestsLimit - int(count)
+		if remaining < 0 {
+			remaining = 0
+		}
+		c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
 
 		c.Next()
 	}
