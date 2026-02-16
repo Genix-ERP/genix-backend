@@ -36,6 +36,8 @@ BEGIN
     DELETE FROM fixed_assets WHERE tenant_id = v_tid;
     DELETE FROM journal_entry_lines WHERE journal_entry_id IN (SELECT id FROM journal_entries WHERE tenant_id = v_tid);
     DELETE FROM journal_entries WHERE tenant_id = v_tid;
+    DELETE FROM bom_lines WHERE bom_id IN (SELECT id FROM boms WHERE tenant_id = v_tid);
+    DELETE FROM boms WHERE tenant_id = v_tid;
     DELETE FROM products WHERE tenant_id = v_tid;
     DELETE FROM product_categories WHERE tenant_id = v_tid;
     DELETE FROM bank_accounts WHERE tenant_id = v_tid;
