@@ -34,7 +34,6 @@ type Organization struct {
 	CreatedAt          time.Time              `json:"created_at"`
 	UpdatedAt          time.Time              `json:"updated_at"`
 	// Extended fields for Uzbekistan business requirements
-	STIR                  *string `json:"stir,omitempty"`
 	OKED                  *string `json:"oked,omitempty"`
 	BankAccount           *string `json:"bank_account,omitempty"`
 	BankMFO               *string `json:"bank_mfo,omitempty"`
@@ -65,7 +64,6 @@ type CreateOrganizationInput struct {
 	AccountingStandard *string                `json:"accounting_standard,omitempty"`
 	LogoURL            *string                `json:"logo_url,omitempty"`
 	// Extended fields
-	STIR                  *string `json:"stir,omitempty"`
 	OKED                  *string `json:"oked,omitempty"`
 	BankAccount           *string `json:"bank_account,omitempty"`
 	BankMFO               *string `json:"bank_mfo,omitempty"`
@@ -97,7 +95,6 @@ type UpdateOrganizationInput struct {
 	LogoURL            *string                `json:"logo_url,omitempty"`
 	IsActive           *bool                  `json:"is_active,omitempty"`
 	// Extended fields
-	STIR                  *string `json:"stir,omitempty"`
 	OKED                  *string `json:"oked,omitempty"`
 	BankAccount           *string `json:"bank_account,omitempty"`
 	BankMFO               *string `json:"bank_mfo,omitempty"`
@@ -125,7 +122,7 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 		SELECT id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 		       address, contact_info, country, currency, accounting_standard, logo_url,
 		       settings, is_active, created_at, updated_at,
-		       stir, oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+		       oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 		       tax_regime, activity_status, business_group, intercompany_relations,
 		       director_name, director_phone, legal_address, notes
 		FROM organizations
@@ -151,7 +148,7 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 			&org.TaxID, &org.RegistrationNumber, &addressJSON, &contactInfoJSON,
 			&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
 			&settingsJSON, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
-			&org.STIR, &org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+			&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 			&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 			&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
 		)
@@ -257,15 +254,15 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 			id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 			address, contact_info, country, currency, accounting_standard, logo_url,
 			settings, is_active, created_at, updated_at,
-			stir, oked, bank_account, bank_mfo, bank_name, is_vat_payer,
+			oked, bank_account, bank_mfo, bank_name, is_vat_payer,
 			tax_regime, activity_status, business_group, intercompany_relations,
 			director_name, director_phone, legal_address, notes
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-		          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+		          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 		RETURNING id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 		          address, contact_info, country, currency, accounting_standard, logo_url,
 		          settings, is_active, created_at, updated_at,
-		          stir, oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+		          oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 		          tax_regime, activity_status, business_group, intercompany_relations,
 		          director_name, director_phone, legal_address, notes
 	`
@@ -279,7 +276,7 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 		input.TaxID, input.RegistrationNumber, addressJSON, contactInfoJSON,
 		input.Country, input.Currency, input.AccountingStandard, input.LogoURL,
 		[]byte("{}"), true, now, now,
-		input.STIR, input.OKED, input.BankAccount, input.BankMFO, input.BankName, isVATPayer,
+		input.OKED, input.BankAccount, input.BankMFO, input.BankName, isVATPayer,
 		input.TaxRegime, input.ActivityStatus, input.BusinessGroup, input.IntercompanyRelations,
 		input.DirectorName, input.DirectorPhone, input.LegalAddress, input.Notes,
 	).Scan(
@@ -287,7 +284,7 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 		&org.TaxID, &org.RegistrationNumber, &addressJSONOut, &contactInfoJSONOut,
 		&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
 		&settingsJSONOut, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
-		&org.STIR, &org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+		&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
 	)
@@ -341,7 +338,7 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		SELECT id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 		       address, contact_info, country, currency, accounting_standard, logo_url,
 		       settings, is_active, created_at, updated_at,
-		       stir, oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+		       oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 		       tax_regime, activity_status, business_group, intercompany_relations,
 		       director_name, director_phone, legal_address, notes
 		FROM organizations
@@ -356,7 +353,7 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		&org.TaxID, &org.RegistrationNumber, &addressJSON, &contactInfoJSON,
 		&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
 		&settingsJSON, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
-		&org.STIR, &org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+		&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
 	)
@@ -506,11 +503,6 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		argIndex++
 	}
 	// Extended fields
-	if input.STIR != nil {
-		query += fmt.Sprintf(", stir = $%d", argIndex)
-		args = append(args, *input.STIR)
-		argIndex++
-	}
 	if input.OKED != nil {
 		query += fmt.Sprintf(", oked = $%d", argIndex)
 		args = append(args, *input.OKED)
@@ -583,7 +575,7 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 	query += ` RETURNING id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 	           address, contact_info, country, currency, accounting_standard, logo_url,
 	           settings, is_active, created_at, updated_at,
-	           stir, oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+	           oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 	           tax_regime, activity_status, business_group, intercompany_relations,
 	           director_name, director_phone, legal_address, notes`
 
@@ -595,7 +587,7 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		&org.TaxID, &org.RegistrationNumber, &addressJSON, &contactInfoJSON,
 		&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
 		&settingsJSON, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
-		&org.STIR, &org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+		&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
 	)
@@ -1031,17 +1023,17 @@ func (h *Handler) ImportOrganizations(c *gin.Context) {
 				id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
 				address, contact_info, country, currency, accounting_standard, logo_url,
 				settings, is_active, created_at, updated_at,
-				stir, oked, bank_account, bank_mfo, bank_name, is_vat_payer,
+				oked, bank_account, bank_mfo, bank_name, is_vat_payer,
 				tax_regime, activity_status, business_group, intercompany_relations,
 				director_name, director_phone, legal_address, notes
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-			          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+			          $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 		`,
 			orgID, tenantID, parentID, org.Code, org.Name, orgType,
 			org.TaxID, org.RegistrationNumber, addressJSON, contactInfoJSON,
 			org.Country, org.Currency, org.AccountingStandard, org.LogoURL,
 			[]byte("{}"), true, now, now,
-			org.STIR, org.OKED, org.BankAccount, org.BankMFO, org.BankName, isVATPayer,
+			org.OKED, org.BankAccount, org.BankMFO, org.BankName, isVATPayer,
 			org.TaxRegime, org.ActivityStatus, org.BusinessGroup, org.IntercompanyRelations,
 			org.DirectorName, org.DirectorPhone, org.LegalAddress, org.Notes,
 		)
