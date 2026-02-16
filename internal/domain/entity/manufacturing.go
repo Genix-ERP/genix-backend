@@ -115,6 +115,14 @@ type ProductionOrder struct {
 	QuantityProduced     float64    `json:"quantity_produced" db:"quantity_produced"`
 	QuantityScrapped     float64    `json:"quantity_scrapped" db:"quantity_scrapped"`
 	UOM                  string     `json:"uom" db:"uom"`
+	// Manufacturing-specific fields
+	MoldCount            int        `json:"mold_count" db:"mold_count"`
+	Shift                *string    `json:"shift,omitempty" db:"shift"`
+	CurrentStage         string     `json:"current_stage" db:"current_stage"`
+	PackageCount         int        `json:"package_count" db:"package_count"`
+	GoodQuantity         float64    `json:"good_quantity" db:"good_quantity"`
+	RejectQuantity       float64    `json:"reject_quantity" db:"reject_quantity"`
+	// Schedule fields
 	ScheduledStart       *time.Time `json:"scheduled_start,omitempty" db:"scheduled_start"`
 	ScheduledEnd         *time.Time `json:"scheduled_end,omitempty" db:"scheduled_end"`
 	ActualStart          *time.Time `json:"actual_start,omitempty" db:"actual_start"`
@@ -157,6 +165,10 @@ type ProductionOrderInput struct {
 	BOMID                *uuid.UUID `json:"bom_id,omitempty"`
 	QuantityPlanned      float64    `json:"quantity_planned" binding:"required,gt=0"`
 	UOM                  string     `json:"uom" binding:"required"`
+	// Manufacturing-specific fields
+	MoldCount            *int       `json:"mold_count,omitempty"`
+	Shift                *string    `json:"shift,omitempty"`
+	// Schedule fields
 	ScheduledStart       *string    `json:"scheduled_start,omitempty"`
 	ScheduledEnd         *string    `json:"scheduled_end,omitempty"`
 	Priority             *int       `json:"priority,omitempty"`
@@ -185,6 +197,13 @@ type ProductionOrderUpdateInput struct {
 	RequiresQualityCheck *bool      `json:"requires_quality_check,omitempty"`
 	Notes                *string    `json:"notes,omitempty"`
 	Tags                 []string   `json:"tags,omitempty"`
+	// Manufacturing-specific fields
+	MoldCount            *int       `json:"mold_count,omitempty"`
+	Shift                *string    `json:"shift,omitempty"`
+	CurrentStage         *string    `json:"current_stage,omitempty"`
+	PackageCount         *int       `json:"package_count,omitempty"`
+	GoodQuantity         *float64   `json:"good_quantity,omitempty"`
+	RejectQuantity       *float64   `json:"reject_quantity,omitempty"`
 }
 
 type ProductionOrderResponse struct {
@@ -194,13 +213,22 @@ type ProductionOrderResponse struct {
 	ProductID            uuid.UUID   `json:"product_id"`
 	ProductName          string      `json:"product_name"`
 	ProductCode          string      `json:"product_code"`
-	BOMID                *uuid.UUID  `json:"bom_id,omitempty"`
-	BOMName              *string     `json:"bom_name,omitempty"`
-	QuantityPlanned      float64     `json:"quantity_planned"`
+	BOMID                *uuid.UUID                `json:"bom_id,omitempty"`
+	BOMName              *string                   `json:"bom_name,omitempty"`
+	BOMOperations        []map[string]interface{}  `json:"bom_operations,omitempty"`
+	QuantityPlanned      float64                   `json:"quantity_planned"`
 	QuantityProduced     float64     `json:"quantity_produced"`
 	QuantityScrapped     float64     `json:"quantity_scrapped"`
 	QuantityRemaining    float64     `json:"quantity_remaining"`
 	UOM                  string      `json:"uom"`
+	// Manufacturing-specific fields
+	MoldCount            int         `json:"mold_count"`
+	Shift                *string     `json:"shift,omitempty"`
+	CurrentStage         string      `json:"current_stage"`
+	PackageCount         int         `json:"package_count"`
+	GoodQuantity         float64     `json:"good_quantity"`
+	RejectQuantity       float64     `json:"reject_quantity"`
+	// Schedule fields
 	ScheduledStart       *string     `json:"scheduled_start,omitempty"`
 	ScheduledEnd         *string     `json:"scheduled_end,omitempty"`
 	ActualStart          *string     `json:"actual_start,omitempty"`
@@ -226,6 +254,7 @@ type ProductionOrderResponse struct {
 	Notes                *string     `json:"notes,omitempty"`
 	Tags                 []string    `json:"tags"`
 	WorkOrders           []WorkOrder `json:"work_orders,omitempty"`
+	Stages               []ProductionOrderStageResponse `json:"stages,omitempty"`
 	CreatedBy            *uuid.UUID  `json:"created_by,omitempty"`
 	CreatedByName        *string     `json:"created_by_name,omitempty"`
 	ConfirmedAt          *string     `json:"confirmed_at,omitempty"`
@@ -250,7 +279,7 @@ type ProductionOrderFilter struct {
 }
 
 // =====================================================
-// WORK ORDER ENTITIES
+// WORK ORDER ENTITIES (Old Schema from migration 010)
 // =====================================================
 
 type WorkOrder struct {
@@ -262,6 +291,7 @@ type WorkOrder struct {
 	Sequence            int        `json:"sequence" db:"sequence"`
 	OperationID         *uuid.UUID `json:"operation_id,omitempty" db:"operation_id"`
 	WorkCenterID        *uuid.UUID `json:"work_center_id,omitempty" db:"work_center_id"`
+	WorkCenterName      *string    `json:"work_center_name,omitempty" db:"-"` // Joined field
 	QuantityToProduce   float64    `json:"quantity_to_produce" db:"quantity_to_produce"`
 	QuantityProduced    float64    `json:"quantity_produced" db:"quantity_produced"`
 	QuantityScrapped    float64    `json:"quantity_scrapped" db:"quantity_scrapped"`
@@ -288,73 +318,6 @@ type WorkOrder struct {
 	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at" db:"updated_at"`
 	DeletedAt           *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
-}
-
-type WorkOrderInput struct {
-	ProductionOrderID  uuid.UUID  `json:"production_order_id" binding:"required"`
-	Name               *string    `json:"name,omitempty"`
-	Sequence           *int       `json:"sequence,omitempty"`
-	OperationID        *uuid.UUID `json:"operation_id,omitempty"`
-	WorkCenterID       *uuid.UUID `json:"work_center_id,omitempty"`
-	QuantityToProduce  float64    `json:"quantity_to_produce" binding:"required,gt=0"`
-	UOM                string     `json:"uom" binding:"required"`
-	PlannedDurationHrs *float64   `json:"planned_duration_hours,omitempty"`
-	SetupTimeHrs       *float64   `json:"setup_time_hours,omitempty"`
-	ScheduledStart     *string    `json:"scheduled_start,omitempty"`
-	ScheduledEnd       *string    `json:"scheduled_end,omitempty"`
-	AssignedTo         *uuid.UUID `json:"assigned_to,omitempty"`
-	Instructions       *string    `json:"instructions,omitempty"`
-	Notes              *string    `json:"notes,omitempty"`
-}
-
-type WorkOrderResponse struct {
-	ID                   uuid.UUID  `json:"id"`
-	ProductionOrderID    uuid.UUID  `json:"production_order_id"`
-	ProductionOrderCode  string     `json:"production_order_code"`
-	Code                 string     `json:"code"`
-	Name                 *string    `json:"name,omitempty"`
-	Sequence             int        `json:"sequence"`
-	OperationID          *uuid.UUID `json:"operation_id,omitempty"`
-	OperationName        *string    `json:"operation_name,omitempty"`
-	WorkCenterID         *uuid.UUID `json:"work_center_id,omitempty"`
-	WorkCenterName       *string    `json:"work_center_name,omitempty"`
-	QuantityToProduce    float64    `json:"quantity_to_produce"`
-	QuantityProduced     float64    `json:"quantity_produced"`
-	QuantityScrapped     float64    `json:"quantity_scrapped"`
-	QuantityRemaining    float64    `json:"quantity_remaining"`
-	UOM                  string     `json:"uom"`
-	PlannedDurationHours float64    `json:"planned_duration_hours"`
-	ActualDurationHours  float64    `json:"actual_duration_hours"`
-	SetupTimeHours       float64    `json:"setup_time_hours"`
-	ScheduledStart       *string    `json:"scheduled_start,omitempty"`
-	ScheduledEnd         *string    `json:"scheduled_end,omitempty"`
-	ActualStart          *string    `json:"actual_start,omitempty"`
-	ActualEnd            *string    `json:"actual_end,omitempty"`
-	Status               string     `json:"status"`
-	ProgressPercent      float64    `json:"progress_percent"`
-	PlannedCost          float64    `json:"planned_cost"`
-	ActualCost           float64    `json:"actual_cost"`
-	LaborCost            float64    `json:"labor_cost"`
-	MachineCost          float64    `json:"machine_cost"`
-	AssignedTo           *uuid.UUID `json:"assigned_to,omitempty"`
-	AssignedToName       *string    `json:"assigned_to_name,omitempty"`
-	Instructions         *string    `json:"instructions,omitempty"`
-	Notes                *string    `json:"notes,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at"`
-}
-
-type WorkOrderFilter struct {
-	ProductionOrderID *uuid.UUID `form:"production_order_id"`
-	WorkCenterID      *uuid.UUID `form:"work_center_id"`
-	Status            *string    `form:"status"`
-	AssignedTo        *uuid.UUID `form:"assigned_to"`
-	DateFrom          *string    `form:"date_from"`
-	DateTo            *string    `form:"date_to"`
-	Page              int        `form:"page"`
-	Limit             int        `form:"limit"`
-	SortBy            string     `form:"sort_by"`
-	SortOrder         string     `form:"sort_order"`
 }
 
 // =====================================================
@@ -621,3 +584,120 @@ type ProductionScheduleItem struct {
 	Priority        int       `json:"priority"`
 	ProgressPercent float64   `json:"progress_percent"`
 }
+
+// =====================================================
+// PRODUCTION ORDER STAGE ENTITIES
+// =====================================================
+
+// ProductionOrderStage tracks individual manufacturing stages
+type ProductionOrderStage struct {
+	ID                uuid.UUID  `json:"id" db:"id"`
+	TenantID          uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	OrganizationID    *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	ProductionOrderID uuid.UUID  `json:"production_order_id" db:"production_order_id"`
+	StageName         string     `json:"stage_name" db:"stage_name"`
+	Sequence          int        `json:"sequence" db:"sequence"`
+	Status            string     `json:"status" db:"status"`
+	StartedAt         *time.Time `json:"started_at,omitempty" db:"started_at"`
+	CompletedAt       *time.Time `json:"completed_at,omitempty" db:"completed_at"`
+	OperatorID        *uuid.UUID `json:"operator_id,omitempty" db:"operator_id"`
+	OperatorName      *string    `json:"operator_name,omitempty" db:"operator_name"`
+	DurationMinutes   int        `json:"duration_minutes" db:"duration_minutes"`
+	Notes             *string    `json:"notes,omitempty" db:"notes"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at" db:"updated_at"`
+	DeletedAt         *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
+}
+
+type ProductionOrderStageInput struct {
+	StageName    string     `json:"stage_name" binding:"required"`
+	Sequence     *int       `json:"sequence,omitempty"`
+	Status       *string    `json:"status,omitempty"`
+	OperatorID   *uuid.UUID `json:"operator_id,omitempty"`
+	OperatorName *string    `json:"operator_name,omitempty"`
+	Notes        *string    `json:"notes,omitempty"`
+}
+
+type ProductionOrderStageResponse struct {
+	ID                uuid.UUID `json:"id"`
+	ProductionOrderID uuid.UUID `json:"production_order_id"`
+	StageName         string    `json:"stage_name"`
+	Sequence          int       `json:"sequence"`
+	Status            string    `json:"status"`
+	StartedAt         *string   `json:"started_at,omitempty"`
+	CompletedAt       *string   `json:"completed_at,omitempty"`
+	OperatorID        *uuid.UUID `json:"operator_id,omitempty"`
+	OperatorName      *string   `json:"operator_name,omitempty"`
+	DurationMinutes   int       `json:"duration_minutes"`
+	Notes             *string   `json:"notes,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// ProductionOutput tracks output quantities at each stage
+type ProductionOutput struct {
+	ID                uuid.UUID  `json:"id" db:"id"`
+	TenantID          uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	OrganizationID    *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	ProductionOrderID uuid.UUID  `json:"production_order_id" db:"production_order_id"`
+	StageID           *uuid.UUID `json:"stage_id,omitempty" db:"stage_id"`
+	OutputType        string     `json:"output_type" db:"output_type"`
+	Quantity          float64    `json:"quantity" db:"quantity"`
+	UOM               string     `json:"uom" db:"uom"`
+	PackageCount      int        `json:"package_count" db:"package_count"`
+	Notes             *string    `json:"notes,omitempty" db:"notes"`
+	RecordedBy        *uuid.UUID `json:"recorded_by,omitempty" db:"recorded_by"`
+	RecordedAt        time.Time  `json:"recorded_at" db:"recorded_at"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at" db:"updated_at"`
+	DeletedAt         *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
+}
+
+type ProductionOutputInput struct {
+	StageID      *uuid.UUID `json:"stage_id,omitempty"`
+	OutputType   string     `json:"output_type" binding:"required"`
+	Quantity     float64    `json:"quantity" binding:"required,gt=0"`
+	UOM          *string    `json:"uom,omitempty"`
+	PackageCount *int       `json:"package_count,omitempty"`
+	Notes        *string    `json:"notes,omitempty"`
+}
+
+type ProductionOutputResponse struct {
+	ID                uuid.UUID `json:"id"`
+	ProductionOrderID uuid.UUID `json:"production_order_id"`
+	StageID           *uuid.UUID `json:"stage_id,omitempty"`
+	StageName         *string   `json:"stage_name,omitempty"`
+	OutputType        string    `json:"output_type"`
+	Quantity          float64   `json:"quantity"`
+	UOM               string    `json:"uom"`
+	PackageCount      int       `json:"package_count"`
+	Notes             *string   `json:"notes,omitempty"`
+	RecordedBy        *uuid.UUID `json:"recorded_by,omitempty"`
+	RecordedByName    *string   `json:"recorded_by_name,omitempty"`
+	RecordedAt        string    `json:"recorded_at"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// Manufacturing stage constants
+const (
+	StageDraft    = "draft"
+	StageMixing   = "mixing"
+	StageRising   = "rising"
+	StageDrying   = "drying"
+	StageCutting  = "cutting"
+	StagePacking  = "packing"
+	StageDone     = "done"
+)
+
+// Shift constants
+const (
+	ShiftDay   = "day"
+	ShiftNight = "night"
+)
+
+// Output type constants
+const (
+	OutputTypeGood   = "good"
+	OutputTypeReject = "reject"
+	OutputTypeScrap  = "scrap"
+	OutputTypeRework = "rework"
+)

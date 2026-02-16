@@ -13,7 +13,7 @@ type AIConversation struct {
 	TenantID    uuid.UUID       `json:"tenant_id" db:"tenant_id"`
 	UserID      uuid.UUID       `json:"user_id" db:"user_id"`
 	Title       *string         `json:"title,omitempty" db:"title"`
-	Context     json.RawMessage `json:"context" db:"context"`
+	Context     json.RawMessage `json:"context" db:"context" swaggertype:"object"`
 	Model       *string         `json:"model,omitempty" db:"model"`
 	TotalTokens int             `json:"total_tokens" db:"total_tokens"`
 	IsArchived  bool            `json:"is_archived" db:"is_archived"`
@@ -41,7 +41,7 @@ type AIMessage struct {
 	Role           AIMessageRole   `json:"role" db:"role"`
 	Content        string          `json:"content" db:"content"`
 	Tokens         int             `json:"tokens" db:"tokens"`
-	Metadata       json.RawMessage `json:"metadata" db:"metadata"`
+	Metadata       json.RawMessage `json:"metadata" db:"metadata" swaggertype:"object"`
 	CreatedAt      time.Time       `json:"created_at" db:"created_at"`
 }
 
@@ -53,7 +53,7 @@ type AIPrompt struct {
 	Description    *string         `json:"description,omitempty" db:"description"`
 	Category       string          `json:"category" db:"category"`
 	PromptTemplate string          `json:"prompt_template" db:"prompt_template"`
-	Variables      json.RawMessage `json:"variables" db:"variables"`
+	Variables      json.RawMessage `json:"variables" db:"variables" swaggertype:"object"`
 	IsSystem       bool            `json:"is_system" db:"is_system"`
 	IsActive       bool            `json:"is_active" db:"is_active"`
 	UsageCount     int             `json:"usage_count" db:"usage_count"`

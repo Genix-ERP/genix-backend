@@ -403,16 +403,9 @@ CREATE TRIGGER update_settings_updated_at BEFORE UPDATE ON settings FOR EACH ROW
 
 -- Insert default currencies
 INSERT INTO currencies (code, name, symbol, decimal_places) VALUES
+('UZS', 'Uzbek Som', 'so''m', 0),
 ('USD', 'US Dollar', '$', 2),
-('EUR', 'Euro', '€', 2),
-('GBP', 'British Pound', '£', 2),
-('JPY', 'Japanese Yen', '¥', 0),
-('CNY', 'Chinese Yuan', '¥', 2),
-('INR', 'Indian Rupee', '₹', 2),
-('AUD', 'Australian Dollar', 'A$', 2),
-('CAD', 'Canadian Dollar', 'C$', 2),
-('CHF', 'Swiss Franc', 'CHF', 2),
-('AED', 'UAE Dirham', 'د.إ', 2);
+('RUB', 'Russian Ruble', '₽', 2);
 
 -- Insert default permissions
 INSERT INTO permissions (module, resource, action, description) VALUES

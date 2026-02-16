@@ -29,6 +29,16 @@ func nullIfEmpty(s string) interface{} {
 // =====================================================
 
 // ListAccountTypes returns all account types
+// ListAccountTypes godoc
+// @Summary List all account types
+// @Description Get a list of all available account types
+// @Tags Finance - Accounts
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/account-types [get]
 func (h *Handler) ListAccountTypes(c *gin.Context) {
 	query := `
 		SELECT id, code, name, category, normal_balance, COALESCE(is_system, true)
@@ -72,6 +82,20 @@ func (h *Handler) ListAccountTypes(c *gin.Context) {
 // =====================================================
 
 // ListAccounts returns a paginated list of accounts
+// ListAccounts godoc
+// @Summary List all chart of accounts
+// @Description Get a paginated list of all accounts in the chart of accounts
+// @Tags Finance - Accounts
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param account_type query string false "Filter by account type"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/accounts [get]
 func (h *Handler) ListAccounts(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -224,6 +248,19 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 }
 
 // CreateAccount creates a new account
+// CreateAccount godoc
+// @Summary Create a new account
+// @Description Create a new account in the chart of accounts
+// @Tags Finance - Accounts
+// @Accept json
+// @Produce json
+// @Param account body entity.CreateAccountInput true "Account details"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/accounts [post]
 func (h *Handler) CreateAccount(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -337,7 +374,18 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 	response.Created(c, acc.ToResponse())
 }
 
-// GetNextAccountCode returns the next available account code for a given account type
+// GetNextAccountCode godoc
+// @Summary Get next available account code
+// @Description Returns the next available account code for a given account type
+// @Tags Finance - Accounts
+// @Accept json
+// @Produce json
+// @Param account_type_id query string true "Account Type ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/accounts/next-code [get]
 func (h *Handler) GetNextAccountCode(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -404,7 +452,20 @@ func (h *Handler) GetNextAccountCode(c *gin.Context) {
 	response.Success(c, gin.H{"code": fmt.Sprintf("%d", nextCode)})
 }
 
-// GetAccount returns a single account by ID
+// GetAccount godoc
+// @Summary Get account by ID
+// @Description Get detailed information about a specific account
+// @Tags Finance - Accounts
+// @Accept json
+// @Produce json
+// @Param id path string true "Account ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/accounts/{id} [get]
 func (h *Handler) GetAccount(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -473,7 +534,21 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	response.Success(c, acc.ToResponse())
 }
 
-// UpdateAccount updates an existing account
+// UpdateAccount godoc
+// @Summary Update an account
+// @Description Update an existing account's information
+// @Tags Finance - Accounts
+// @Accept json
+// @Produce json
+// @Param id path string true "Account ID"
+// @Param body body entity.UpdateAccountInput true "Account update data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/accounts/{id} [put]
 func (h *Handler) UpdateAccount(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -561,7 +636,20 @@ func (h *Handler) UpdateAccount(c *gin.Context) {
 	h.GetAccount(c)
 }
 
-// DeleteAccount soft-deletes an account
+// DeleteAccount godoc
+// @Summary Delete an account
+// @Description Soft-delete an account from the chart of accounts
+// @Tags Finance - Accounts
+// @Accept json
+// @Produce json
+// @Param id path string true "Account ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/accounts/{id} [delete]
 func (h *Handler) DeleteAccount(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -616,7 +704,24 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 	response.NoContent(c)
 }
 
-// GetAccountTransactions returns transactions for an account
+// GetAccountTransactions godoc
+// @Summary Get account transactions
+// @Description Get a paginated list of all transactions for a specific account
+// @Tags Finance - Accounts
+// @Accept json
+// @Produce json
+// @Param id path string true "Account ID"
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param start_date query string false "Start date filter (YYYY-MM-DD)"
+// @Param end_date query string false "End date filter (YYYY-MM-DD)"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/accounts/{id}/transactions [get]
 func (h *Handler) GetAccountTransactions(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -741,7 +846,22 @@ func (h *Handler) GetAccountTransactions(c *gin.Context) {
 // JOURNAL ENTRY HANDLERS
 // =====================================================
 
-// ListJournalEntries returns a paginated list of journal entries
+// ListJournalEntries godoc
+// @Summary List journal entries
+// @Description Get a paginated list of all journal entries
+// @Tags Finance - Journal Entries
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param status query string false "Filter by status (draft, posted, reversed)"
+// @Param start_date query string false "Start date filter (YYYY-MM-DD)"
+// @Param end_date query string false "End date filter (YYYY-MM-DD)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journal-entries [get]
 func (h *Handler) ListJournalEntries(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -891,7 +1011,17 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 	response.SuccessWithPagination(c, entries, pagination)
 }
 
-// ListJournals returns all journals for the tenant
+// ListJournals godoc
+// @Summary List all journals
+// @Description Get a list of all journals for the tenant
+// @Tags Finance - Journals
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journals [get]
 func (h *Handler) ListJournals(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -948,7 +1078,20 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	response.Success(c, journals)
 }
 
-// GetJournal returns a single journal by ID
+// GetJournal godoc
+// @Summary Get journal by ID
+// @Description Get detailed information about a specific journal
+// @Tags Finance - Journals
+// @Accept json
+// @Produce json
+// @Param id path string true "Journal ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journals/{id} [get]
 func (h *Handler) GetJournal(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1011,7 +1154,19 @@ func (h *Handler) GetJournal(c *gin.Context) {
 	response.Success(c, j)
 }
 
-// CreateJournal creates a new journal
+// CreateJournal godoc
+// @Summary Create a new journal
+// @Description Create a new journal for organizing entries
+// @Tags Finance - Journals
+// @Accept json
+// @Produce json
+// @Param body body entity.CreateJournalInput true "Journal creation data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journals [post]
 func (h *Handler) CreateJournal(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1071,7 +1226,21 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 	h.GetJournal(c)
 }
 
-// UpdateJournal updates an existing journal
+// UpdateJournal godoc
+// @Summary Update a journal
+// @Description Update an existing journal's information
+// @Tags Finance - Journals
+// @Accept json
+// @Produce json
+// @Param id path string true "Journal ID"
+// @Param body body entity.UpdateJournalInput true "Journal update data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journals/{id} [put]
 func (h *Handler) UpdateJournal(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1165,7 +1334,20 @@ func (h *Handler) UpdateJournal(c *gin.Context) {
 	h.GetJournal(c)
 }
 
-// DeleteJournal soft-deletes a journal (blocks if it has entries)
+// DeleteJournal godoc
+// @Summary Delete a journal
+// @Description Soft-delete a journal (blocked if it has existing entries)
+// @Tags Finance - Journals
+// @Accept json
+// @Produce json
+// @Param id path string true "Journal ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journals/{id} [delete]
 func (h *Handler) DeleteJournal(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1217,6 +1399,19 @@ func (h *Handler) DeleteJournal(c *gin.Context) {
 }
 
 // CreateJournalEntry creates a new journal entry
+// CreateJournalEntry godoc
+// @Summary Create a new journal entry
+// @Description Create a new journal entry with debit and credit lines
+// @Tags Finance - Journal Entries
+// @Accept json
+// @Produce json
+// @Param entry body entity.CreateJournalEntryInput true "Journal entry details"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journal-entries [post]
 func (h *Handler) CreateJournalEntry(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1287,12 +1482,44 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		return
 	}
 
-	// Generate entry number
+	// Resolve organization ID early (needed for entry number generation)
+	var orgID *uuid.UUID
+	if input.OrganizationID != "" {
+		parsed, parseErr := uuid.Parse(input.OrganizationID)
+		if parseErr == nil {
+			orgID = &parsed
+		}
+	}
+	// Fallback to middleware header if not provided in body
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
+		}
+	}
+
+	// Generate entry number - use global max for this tenant+org to avoid unique constraint violations
 	prefix := ""
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
-	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+	var maxNumber int
+	if orgID != nil {
+		_ = h.db.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
+			tenantID, *orgID,
+		).Scan(&maxNumber)
+	} else {
+		_ = h.db.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
+			tenantID,
+		).Scan(&maxNumber)
+	}
+	actualNext := maxNumber + 1
+	if nextNumber > actualNext {
+		actualNext = nextNumber
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, actualNext)
 
 	id := uuid.New()
 	now := time.Now()
@@ -1321,20 +1548,6 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 	}
 
 	sourceType := "manual"
-
-	var orgID *uuid.UUID
-	if input.OrganizationID != "" {
-		parsed, parseErr := uuid.Parse(input.OrganizationID)
-		if parseErr == nil {
-			orgID = &parsed
-		}
-	}
-	// Fallback to middleware header if not provided in body
-	if orgID == nil {
-		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
-			orgID = &headerOrgID
-		}
-	}
 
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
@@ -1419,7 +1632,20 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 	response.Created(c, entry.ToResponse())
 }
 
-// GetJournalEntry returns a single journal entry with lines
+// GetJournalEntry godoc
+// @Summary Get journal entry by ID
+// @Description Get detailed information about a specific journal entry including all lines
+// @Tags Finance - Journal Entries
+// @Accept json
+// @Produce json
+// @Param id path string true "Journal Entry ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journal-entries/{id} [get]
 func (h *Handler) GetJournalEntry(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1541,7 +1767,20 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 	response.Success(c, je.ToResponse())
 }
 
-// PostJournalEntry posts a journal entry (updates account balances)
+// PostJournalEntry godoc
+// @Summary Post a journal entry
+// @Description Post a journal entry to update account balances
+// @Tags Finance - Journal Entries
+// @Accept json
+// @Produce json
+// @Param id path string true "Journal Entry ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journal-entries/{id}/post [post]
 func (h *Handler) PostJournalEntry(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1678,7 +1917,20 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Journal entry posted successfully", "posted_at": now})
 }
 
-// ReverseJournalEntry creates a reversal entry
+// ReverseJournalEntry godoc
+// @Summary Reverse a journal entry
+// @Description Create a reversal entry for a posted journal entry
+// @Tags Finance - Journal Entries
+// @Accept json
+// @Produce json
+// @Param id path string true "Journal Entry ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/journal-entries/{id}/reverse [post]
 func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1733,7 +1985,25 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
-	reversalNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+	// Use global max to avoid unique constraint violations across journals
+	var maxNumber int
+	if organizationID != nil {
+		_ = h.db.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
+			tenantID, *organizationID,
+		).Scan(&maxNumber)
+	} else {
+		_ = h.db.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
+			tenantID,
+		).Scan(&maxNumber)
+	}
+	actualNext := maxNumber + 1
+	if nextNumber > actualNext {
+		actualNext = nextNumber
+	}
+	reversalNumber := fmt.Sprintf("%s%06d", prefix, actualNext)
 
 	// Start transaction
 	tx, err := h.db.Begin()
@@ -1755,7 +2025,7 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 			source_type, total_debit, total_credit, status, posted_at, posted_by,
-			reversal_of, created_by, created_at, updated_at
+			reversed_entry_id, created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 	`, reversalID, tenantID, organizationID, journalID, reversalNumber, now, reference, description,
 		"reversal", totalCredit, totalDebit, "posted", now, userID,
@@ -1884,7 +2154,21 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 // PAYMENT HANDLERS
 // =====================================================
 
-// ListPayments returns a paginated list of payments
+// ListPayments godoc
+// @Summary List payments
+// @Description Get a paginated list of all payments
+// @Tags Finance - Payments
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Param status query string false "Filter by status (pending, confirmed, cancelled)"
+// @Param payment_type query string false "Filter by payment type (customer, vendor)"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/payments [get]
 func (h *Handler) ListPayments(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2017,7 +2301,19 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	response.SuccessWithPagination(c, payments, pagination)
 }
 
-// CreatePayment creates a new payment
+// CreatePayment godoc
+// @Summary Create a new payment
+// @Description Create a new payment record
+// @Tags Finance - Payments
+// @Accept json
+// @Produce json
+// @Param body body entity.CreatePaymentInput true "Payment creation data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/payments [post]
 func (h *Handler) CreatePayment(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2151,7 +2447,20 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	response.Created(c, payment.ToResponse())
 }
 
-// GetPayment returns a single payment
+// GetPayment godoc
+// @Summary Get payment by ID
+// @Description Get detailed information about a specific payment
+// @Tags Finance - Payments
+// @Accept json
+// @Produce json
+// @Param id path string true "Payment ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/payments/{id} [get]
 func (h *Handler) GetPayment(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2223,7 +2532,20 @@ func (h *Handler) GetPayment(c *gin.Context) {
 	response.Success(c, resp)
 }
 
-// ConfirmPayment confirms a payment and creates journal entry
+// ConfirmPayment godoc
+// @Summary Confirm a payment
+// @Description Confirm a payment and create corresponding journal entry
+// @Tags Finance - Payments
+// @Accept json
+// @Produce json
+// @Param id path string true "Payment ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/payments/{id}/confirm [post]
 func (h *Handler) ConfirmPayment(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2380,7 +2702,25 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
 			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+			// Use global max to avoid unique constraint violations across journals
+			var maxNum int
+			if orgIDPtr != nil {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
+					tenantID, *orgIDPtr,
+				).Scan(&maxNum)
+			} else {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
+					tenantID,
+				).Scan(&maxNum)
+			}
+			actualNum := maxNum + 1
+			if nextNumber > actualNum {
+				actualNum = nextNumber
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, actualNum)
 
 			description := fmt.Sprintf("Payment %s confirmed", paymentNumber)
 			journalEntryID := uuid.New()
@@ -2480,7 +2820,18 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 // TAX RATE HANDLERS
 // =====================================================
 
-// ListTaxRates returns all tax rates
+// ListTaxRates godoc
+// @Summary List tax rates
+// @Description Get a list of all tax rates
+// @Tags Finance - Tax Rates
+// @Accept json
+// @Produce json
+// @Param include_inactive query bool false "Include inactive tax rates"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/tax-rates [get]
 func (h *Handler) ListTaxRates(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2544,7 +2895,20 @@ func (h *Handler) ListTaxRates(c *gin.Context) {
 	response.Success(c, rates)
 }
 
-// CreateTaxRate creates a new tax rate
+// CreateTaxRate godoc
+// @Summary Create a new tax rate
+// @Description Create a new tax rate configuration
+// @Tags Finance - Tax Rates
+// @Accept json
+// @Produce json
+// @Param body body entity.CreateTaxRateInput true "Tax rate creation data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 409 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/tax-rates [post]
 func (h *Handler) CreateTaxRate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2620,7 +2984,20 @@ func (h *Handler) CreateTaxRate(c *gin.Context) {
 	response.Created(c, tr)
 }
 
-// GetTaxRate returns a single tax rate
+// GetTaxRate godoc
+// @Summary Get tax rate by ID
+// @Description Get detailed information about a specific tax rate
+// @Tags Finance - Tax Rates
+// @Accept json
+// @Produce json
+// @Param id path string true "Tax Rate ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/tax-rates/{id} [get]
 func (h *Handler) GetTaxRate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2674,7 +3051,21 @@ func (h *Handler) GetTaxRate(c *gin.Context) {
 	response.Success(c, tr)
 }
 
-// UpdateTaxRate updates a tax rate
+// UpdateTaxRate godoc
+// @Summary Update a tax rate
+// @Description Update an existing tax rate's information
+// @Tags Finance - Tax Rates
+// @Accept json
+// @Produce json
+// @Param id path string true "Tax Rate ID"
+// @Param body body entity.UpdateTaxRateInput true "Tax rate update data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/tax-rates/{id} [put]
 func (h *Handler) UpdateTaxRate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2760,7 +3151,20 @@ func (h *Handler) UpdateTaxRate(c *gin.Context) {
 	h.GetTaxRate(c)
 }
 
-// DeleteTaxRate deletes a tax rate
+// DeleteTaxRate godoc
+// @Summary Delete a tax rate
+// @Description Soft-delete a tax rate
+// @Tags Finance - Tax Rates
+// @Accept json
+// @Produce json
+// @Param id path string true "Tax Rate ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/tax-rates/{id} [delete]
 func (h *Handler) DeleteTaxRate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2799,7 +3203,16 @@ func (h *Handler) DeleteTaxRate(c *gin.Context) {
 // CURRENCY HANDLERS
 // =====================================================
 
-// ListCurrencies returns all currencies
+// ListCurrencies godoc
+// @Summary List all currencies
+// @Description Get a list of all active currencies
+// @Tags Finance - Currencies
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/currencies [get]
 func (h *Handler) ListCurrencies(c *gin.Context) {
 	query := `
 		SELECT id, code, name, symbol, decimal_places, is_base_currency, is_active
@@ -2829,7 +3242,18 @@ func (h *Handler) ListCurrencies(c *gin.Context) {
 	response.Success(c, currencies)
 }
 
-// GetCurrency returns a single currency by code
+// GetCurrency godoc
+// @Summary Get currency by code
+// @Description Get detailed information about a specific currency
+// @Tags Finance - Currencies
+// @Accept json
+// @Produce json
+// @Param code path string true "Currency Code (e.g., USD, EUR)"
+// @Success 200 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/currencies/{code} [get]
 func (h *Handler) GetCurrency(c *gin.Context) {
 	code := c.Param("code")
 
@@ -2852,7 +3276,19 @@ func (h *Handler) GetCurrency(c *gin.Context) {
 	response.Success(c, cur)
 }
 
-// CreateCurrency creates a new currency
+// CreateCurrency godoc
+// @Summary Create a new currency
+// @Description Create a new currency configuration
+// @Tags Finance - Currencies
+// @Accept json
+// @Produce json
+// @Param body body entity.CreateCurrencyInput true "Currency creation data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 409 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/currencies [post]
 func (h *Handler) CreateCurrency(c *gin.Context) {
 	var input entity.CreateCurrencyInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -2933,7 +3369,20 @@ func (h *Handler) CreateCurrency(c *gin.Context) {
 	response.Created(c, cur)
 }
 
-// UpdateCurrency updates an existing currency
+// UpdateCurrency godoc
+// @Summary Update a currency
+// @Description Update an existing currency's information
+// @Tags Finance - Currencies
+// @Accept json
+// @Produce json
+// @Param code path string true "Currency Code"
+// @Param body body entity.UpdateCurrencyInput true "Currency update data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/currencies/{code} [put]
 func (h *Handler) UpdateCurrency(c *gin.Context) {
 	code := c.Param("code")
 
@@ -2996,7 +3445,18 @@ func (h *Handler) UpdateCurrency(c *gin.Context) {
 	response.Success(c, cur)
 }
 
-// DeleteCurrency deletes a currency (soft delete by setting is_active = false)
+// DeleteCurrency godoc
+// @Summary Delete a currency
+// @Description Soft-delete a currency by setting is_active to false
+// @Tags Finance - Currencies
+// @Accept json
+// @Produce json
+// @Param code path string true "Currency Code"
+// @Success 200 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/currencies/{code} [delete]
 func (h *Handler) DeleteCurrency(c *gin.Context) {
 	code := c.Param("code")
 
@@ -3029,7 +3489,19 @@ func (h *Handler) DeleteCurrency(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Currency deleted successfully"})
 }
 
-// GetExchangeRate returns the exchange rate for a currency
+// GetExchangeRate godoc
+// @Summary Get exchange rate
+// @Description Get the current exchange rate for a specific currency
+// @Tags Finance - Exchange Rates
+// @Accept json
+// @Produce json
+// @Param code path string true "Currency Code"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/exchange-rates/{code} [get]
 func (h *Handler) GetExchangeRate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3086,7 +3558,20 @@ func (h *Handler) GetExchangeRate(c *gin.Context) {
 	})
 }
 
-// SetExchangeRate creates or updates an exchange rate for a currency
+// SetExchangeRate godoc
+// @Summary Set exchange rate
+// @Description Create or update an exchange rate for a specific currency
+// @Tags Finance - Exchange Rates
+// @Accept json
+// @Produce json
+// @Param code path string true "Currency Code"
+// @Param body body object true "Exchange rate data with rate and effective_date fields"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/exchange-rates/{code} [post]
 func (h *Handler) SetExchangeRate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3191,7 +3676,20 @@ func (h *Handler) SetExchangeRate(c *gin.Context) {
 	})
 }
 
-// ListExchangeRates returns all exchange rates for the tenant
+// ListExchangeRates godoc
+// @Summary List exchange rates
+// @Description Get a list of all exchange rates for the tenant
+// @Tags Finance - Exchange Rates
+// @Accept json
+// @Produce json
+// @Param date_from query string false "Date from (YYYY-MM-DD)"
+// @Param date_to query string false "Date to (YYYY-MM-DD)"
+// @Param currency query string false "Filter by currency code"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/exchange-rates [get]
 func (h *Handler) ListExchangeRates(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -3276,7 +3774,18 @@ func (h *Handler) ListExchangeRates(c *gin.Context) {
 // BANK ACCOUNTS
 // =====================================================
 
-// ListBankAccounts returns all bank accounts for the tenant
+// ListBankAccounts godoc
+// @Summary List bank accounts
+// @Description Get a list of all bank accounts for the tenant
+// @Tags Finance - Bank Accounts
+// @Accept json
+// @Produce json
+// @Param is_active query bool false "Filter by active status"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-accounts [get]
 func (h *Handler) ListBankAccounts(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -3387,7 +3896,19 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 	response.Success(c, accounts)
 }
 
-// GetBankAccount returns a single bank account by ID
+// GetBankAccount godoc
+// @Summary Get bank account by ID
+// @Description Get detailed information about a specific bank account
+// @Tags Finance - Bank Accounts
+// @Accept json
+// @Produce json
+// @Param id path string true "Bank Account ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-accounts/{id} [get]
 func (h *Handler) GetBankAccount(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -3454,7 +3975,19 @@ func (h *Handler) GetBankAccount(c *gin.Context) {
 	response.Success(c, acc)
 }
 
-// CreateBankAccount creates a new bank account
+// CreateBankAccount godoc
+// @Summary Create a new bank account
+// @Description Create a new bank account record
+// @Tags Finance - Bank Accounts
+// @Accept json
+// @Produce json
+// @Param body body entity.CreateBankAccountInput true "Bank account creation data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 409 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-accounts [post]
 func (h *Handler) CreateBankAccount(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -3531,7 +4064,20 @@ func (h *Handler) CreateBankAccount(c *gin.Context) {
 	response.Created(c, acc)
 }
 
-// UpdateBankAccount updates an existing bank account
+// UpdateBankAccount godoc
+// @Summary Update a bank account
+// @Description Update an existing bank account's information
+// @Tags Finance - Bank Accounts
+// @Accept json
+// @Produce json
+// @Param id path string true "Bank Account ID"
+// @Param body body entity.UpdateBankAccountInput true "Bank account update data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-accounts/{id} [put]
 func (h *Handler) UpdateBankAccount(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -3659,7 +4205,19 @@ func (h *Handler) UpdateBankAccount(c *gin.Context) {
 	h.GetBankAccount(c)
 }
 
-// DeleteBankAccount soft deletes a bank account
+// DeleteBankAccount godoc
+// @Summary Delete a bank account
+// @Description Soft-delete a bank account
+// @Tags Finance - Bank Accounts
+// @Accept json
+// @Produce json
+// @Param id path string true "Bank Account ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-accounts/{id} [delete]
 func (h *Handler) DeleteBankAccount(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -3695,7 +4253,19 @@ func (h *Handler) DeleteBankAccount(c *gin.Context) {
 // BANK TRANSACTIONS
 // =====================================================
 
-// ListBankTransactions returns all transactions for a bank account
+// ListBankTransactions godoc
+// @Summary List bank transactions
+// @Description Get a list of all transactions for bank accounts
+// @Tags Finance - Bank Transactions
+// @Accept json
+// @Produce json
+// @Param bank_account_id query string false "Filter by bank account ID"
+// @Param status query string false "Filter by reconciliation status"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-transactions [get]
 func (h *Handler) ListBankTransactions(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -3808,7 +4378,19 @@ func (h *Handler) ListBankTransactions(c *gin.Context) {
 	response.Success(c, transactions)
 }
 
-// CreateBankTransaction creates a new bank transaction
+// CreateBankTransaction godoc
+// @Summary Create a new bank transaction
+// @Description Create a new bank transaction record
+// @Tags Finance - Bank Transactions
+// @Accept json
+// @Produce json
+// @Param id path string true "Bank Account ID"
+// @Param body body entity.CreateBankTransactionInput true "Bank transaction creation data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-accounts/{id}/transactions [post]
 func (h *Handler) CreateBankTransaction(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -3899,7 +4481,20 @@ func (h *Handler) CreateBankTransaction(c *gin.Context) {
 	response.Created(c, t)
 }
 
-// ReconcileBankTransaction marks a transaction as reconciled
+// ReconcileBankTransaction godoc
+// @Summary Reconcile a bank transaction
+// @Description Mark a bank transaction as reconciled
+// @Tags Finance - Bank Transactions
+// @Accept json
+// @Produce json
+// @Param id path string true "Bank Account ID"
+// @Param transactionId path string true "Transaction ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-accounts/{id}/transactions/{transactionId}/reconcile [post]
 func (h *Handler) ReconcileBankTransaction(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -3944,7 +4539,18 @@ func (h *Handler) ReconcileBankTransaction(c *gin.Context) {
 // BANK RECONCILIATION WORKFLOW
 // =====================================================
 
-// ListBankReconciliations returns all reconciliation sessions for a bank account
+// ListBankReconciliations godoc
+// @Summary List bank reconciliations
+// @Description Get a list of all bank reconciliation sessions
+// @Tags Finance - Bank Reconciliations
+// @Accept json
+// @Produce json
+// @Param bank_account_id query string false "Filter by bank account ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-reconciliations [get]
 func (h *Handler) ListBankReconciliations(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4010,7 +4616,20 @@ func (h *Handler) ListBankReconciliations(c *gin.Context) {
 	response.Success(c, reconciliations)
 }
 
-// CreateBankReconciliation starts a new reconciliation session
+// CreateBankReconciliation godoc
+// @Summary Create a bank reconciliation
+// @Description Start a new bank reconciliation session
+// @Tags Finance - Bank Reconciliations
+// @Accept json
+// @Produce json
+// @Param statement_date body string true "Statement date"
+// @Param statement_ending_balance body number true "Statement ending balance"
+// @Param notes body string false "Notes"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-reconciliations [post]
 func (h *Handler) CreateBankReconciliation(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4096,7 +4715,19 @@ func (h *Handler) CreateBankReconciliation(c *gin.Context) {
 	})
 }
 
-// GetBankReconciliation returns a specific reconciliation with its items
+// GetBankReconciliation godoc
+// @Summary Get bank reconciliation by ID
+// @Description Get detailed information about a specific bank reconciliation with its items
+// @Tags Finance - Bank Reconciliations
+// @Accept json
+// @Produce json
+// @Param id path string true "Reconciliation ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-reconciliations/{id} [get]
 func (h *Handler) GetBankReconciliation(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4248,7 +4879,20 @@ func (h *Handler) GetBankReconciliation(c *gin.Context) {
 	})
 }
 
-// UpdateBankReconciliation updates reconciliation and marks items as cleared
+// UpdateBankReconciliation godoc
+// @Summary Update bank reconciliation
+// @Description Update a bank reconciliation session and mark items as cleared
+// @Tags Finance - Bank Reconciliations
+// @Accept json
+// @Produce json
+// @Param id path string true "Reconciliation ID"
+// @Param notes body string false "Notes"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-reconciliations/{id} [put]
 func (h *Handler) UpdateBankReconciliation(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4378,7 +5022,19 @@ func (h *Handler) UpdateBankReconciliation(c *gin.Context) {
 	})
 }
 
-// CompleteBankReconciliation finalizes the reconciliation
+// CompleteBankReconciliation godoc
+// @Summary Complete bank reconciliation
+// @Description Finalize and complete a bank reconciliation session
+// @Tags Finance - Bank Reconciliations
+// @Accept json
+// @Produce json
+// @Param id path string true "Reconciliation ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-reconciliations/{id}/complete [post]
 func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	userID := c.GetString("user_id")
@@ -4452,7 +5108,19 @@ func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 	})
 }
 
-// DeleteBankReconciliation deletes a draft reconciliation
+// DeleteBankReconciliation godoc
+// @Summary Delete bank reconciliation
+// @Description Delete a draft bank reconciliation session
+// @Tags Finance - Bank Reconciliations
+// @Accept json
+// @Produce json
+// @Param id path string true "Reconciliation ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-reconciliations/{id} [delete]
 func (h *Handler) DeleteBankReconciliation(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4500,7 +5168,19 @@ func (h *Handler) DeleteBankReconciliation(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Reconciliation deleted"})
 }
 
-// ImportBankStatement imports bank transactions from CSV
+// ImportBankStatement godoc
+// @Summary Import bank statement
+// @Description Import bank transactions from a CSV file
+// @Tags Finance - Bank Transactions
+// @Accept multipart/form-data
+// @Produce json
+// @Param file formData file true "CSV file containing bank statement"
+// @Param bank_account_id formData string true "Bank Account ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/bank-statements/import [post]
 func (h *Handler) ImportBankStatement(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4596,7 +5276,19 @@ func (h *Handler) ImportBankStatement(c *gin.Context) {
 // CASH TRANSACTIONS (Kassa)
 // =====================================================
 
-// ListCashTransactions lists all cash transactions
+// ListCashTransactions godoc
+// @Summary List cash transactions
+// @Description Get a list of all cash transactions
+// @Tags Finance - Cash Transactions
+// @Accept json
+// @Produce json
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(20)
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/cash-transactions [get]
 func (h *Handler) ListCashTransactions(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4687,7 +5379,20 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 	response.Success(c, transactions)
 }
 
-// GetCashTransaction gets a single cash transaction
+// GetCashTransaction godoc
+// @Summary Get cash transaction by ID
+// @Description Get detailed information about a specific cash transaction
+// @Tags Finance - Cash Transactions
+// @Accept json
+// @Produce json
+// @Param id path string true "Cash Transaction ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/cash-transactions/{id} [get]
 func (h *Handler) GetCashTransaction(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4728,7 +5433,19 @@ func (h *Handler) GetCashTransaction(c *gin.Context) {
 	response.Success(c, t)
 }
 
-// CreateCashTransaction creates a new cash transaction
+// CreateCashTransaction godoc
+// @Summary Create a new cash transaction
+// @Description Create a new cash transaction record
+// @Tags Finance - Cash Transactions
+// @Accept json
+// @Produce json
+// @Param body body entity.CreateCashTransactionInput true "Cash transaction creation data"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/cash-transactions [post]
 func (h *Handler) CreateCashTransaction(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4801,7 +5518,21 @@ func (h *Handler) CreateCashTransaction(c *gin.Context) {
 	response.Created(c, t)
 }
 
-// UpdateCashTransaction updates an existing cash transaction
+// UpdateCashTransaction godoc
+// @Summary Update a cash transaction
+// @Description Update an existing cash transaction's information
+// @Tags Finance - Cash Transactions
+// @Accept json
+// @Produce json
+// @Param id path string true "Cash Transaction ID"
+// @Param body body entity.UpdateCashTransactionInput true "Cash transaction update data"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/cash-transactions/{id} [put]
 func (h *Handler) UpdateCashTransaction(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4918,7 +5649,20 @@ func (h *Handler) UpdateCashTransaction(c *gin.Context) {
 	response.Success(c, t)
 }
 
-// DeleteCashTransaction deletes a cash transaction
+// DeleteCashTransaction godoc
+// @Summary Delete a cash transaction
+// @Description Soft-delete a cash transaction
+// @Tags Finance - Cash Transactions
+// @Accept json
+// @Produce json
+// @Param id path string true "Cash Transaction ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/cash-transactions/{id} [delete]
 func (h *Handler) DeleteCashTransaction(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -4952,7 +5696,17 @@ func (h *Handler) DeleteCashTransaction(c *gin.Context) {
 // FISCAL YEARS
 // =====================================================
 
-// ListFiscalYears lists all fiscal years
+// ListFiscalYears godoc
+// @Summary List fiscal years
+// @Description Get a list of all fiscal years for the tenant
+// @Tags Finance - Fiscal Years
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-years [get]
 func (h *Handler) ListFiscalYears(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5031,7 +5785,20 @@ func (h *Handler) ListFiscalYears(c *gin.Context) {
 	response.Success(c, fiscalYears)
 }
 
-// GetFiscalYear gets a fiscal year by ID
+// GetFiscalYear godoc
+// @Summary Get fiscal year by ID
+// @Description Get detailed information about a specific fiscal year
+// @Tags Finance - Fiscal Years
+// @Accept json
+// @Produce json
+// @Param id path string true "Fiscal Year ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-years/{id} [get]
 func (h *Handler) GetFiscalYear(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5110,7 +5877,18 @@ type CreateFiscalYearInput struct {
 	PeriodType     string    `json:"period_type"` // monthly, quarterly
 }
 
-// CreateFiscalYear creates a new fiscal year
+// CreateFiscalYear godoc
+// @Summary Create a new fiscal year
+// @Description Create a new fiscal year for the organization
+// @Tags Finance - Fiscal Years
+// @Accept json
+// @Produce json
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-years [post]
 func (h *Handler) CreateFiscalYear(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5192,7 +5970,20 @@ func (h *Handler) CreateFiscalYear(c *gin.Context) {
 	response.Success(c, fy)
 }
 
-// UpdateFiscalYear updates a fiscal year
+// UpdateFiscalYear godoc
+// @Summary Update a fiscal year
+// @Description Update an existing fiscal year's information
+// @Tags Finance - Fiscal Years
+// @Accept json
+// @Produce json
+// @Param id path string true "Fiscal Year ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-years/{id} [put]
 func (h *Handler) UpdateFiscalYear(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5278,7 +6069,20 @@ func (h *Handler) UpdateFiscalYear(c *gin.Context) {
 	response.Success(c, fy)
 }
 
-// CloseFiscalYear closes a fiscal year
+// CloseFiscalYear godoc
+// @Summary Close a fiscal year
+// @Description Close a fiscal year and prevent further modifications
+// @Tags Finance - Fiscal Years
+// @Accept json
+// @Produce json
+// @Param id path string true "Fiscal Year ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-years/{id}/close [post]
 func (h *Handler) CloseFiscalYear(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5321,7 +6125,20 @@ func (h *Handler) CloseFiscalYear(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Fiscal year closed successfully"})
 }
 
-// DeleteFiscalYear deletes a fiscal year
+// DeleteFiscalYear godoc
+// @Summary Delete a fiscal year
+// @Description Soft-delete a fiscal year
+// @Tags Finance - Fiscal Years
+// @Accept json
+// @Produce json
+// @Param id path string true "Fiscal Year ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-years/{id} [delete]
 func (h *Handler) DeleteFiscalYear(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5364,7 +6181,18 @@ func (h *Handler) DeleteFiscalYear(c *gin.Context) {
 // FISCAL PERIODS
 // =====================================================
 
-// ListFiscalPeriods lists all fiscal periods
+// ListFiscalPeriods godoc
+// @Summary List fiscal periods
+// @Description Get a list of all fiscal periods for a fiscal year
+// @Tags Finance - Fiscal Periods
+// @Accept json
+// @Produce json
+// @Param fiscal_year_id query string false "Filter by fiscal year ID"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-periods [get]
 func (h *Handler) ListFiscalPeriods(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5425,7 +6253,18 @@ type CreateFiscalPeriodInput struct {
 	EndDate      string `json:"end_date" binding:"required"`
 }
 
-// CreateFiscalPeriod creates a new fiscal period
+// CreateFiscalPeriod godoc
+// @Summary Create a new fiscal period
+// @Description Create a new fiscal period within a fiscal year
+// @Tags Finance - Fiscal Periods
+// @Accept json
+// @Produce json
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-periods [post]
 func (h *Handler) CreateFiscalPeriod(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5506,7 +6345,18 @@ type BatchCreateFiscalPeriodsInput struct {
 	Periods []CreateFiscalPeriodInput `json:"periods" binding:"required"`
 }
 
-// BatchCreateFiscalPeriods creates multiple fiscal periods at once
+// BatchCreateFiscalPeriods godoc
+// @Summary Batch create fiscal periods
+// @Description Create multiple fiscal periods at once for a fiscal year
+// @Tags Finance - Fiscal Periods
+// @Accept json
+// @Produce json
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-periods/batch [post]
 func (h *Handler) BatchCreateFiscalPeriods(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5579,7 +6429,20 @@ func (h *Handler) BatchCreateFiscalPeriods(c *gin.Context) {
 	response.Success(c, createdPeriods)
 }
 
-// CloseFiscalPeriod closes a fiscal period
+// CloseFiscalPeriod godoc
+// @Summary Close a fiscal period
+// @Description Close a fiscal period and prevent further modifications
+// @Tags Finance - Fiscal Periods
+// @Accept json
+// @Produce json
+// @Param id path string true "Fiscal Period ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-periods/{id}/close [post]
 func (h *Handler) CloseFiscalPeriod(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5633,7 +6496,20 @@ func (h *Handler) CloseFiscalPeriod(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Fiscal period closed successfully"})
 }
 
-// ReopenFiscalPeriod reopens a fiscal period
+// ReopenFiscalPeriod godoc
+// @Summary Reopen a fiscal period
+// @Description Reopen a closed fiscal period to allow modifications
+// @Tags Finance - Fiscal Periods
+// @Accept json
+// @Produce json
+// @Param id path string true "Fiscal Period ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/fiscal-periods/{id}/reopen [post]
 func (h *Handler) ReopenFiscalPeriod(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5710,7 +6586,19 @@ type CreateBudgetLineInput struct {
 	Notes          *string  `json:"notes"`
 }
 
-// ListBudgets retrieves all budgets for the tenant
+// ListBudgets godoc
+// @Summary List budgets
+// @Description Get a list of all budgets for the tenant
+// @Tags Finance - Budgets
+// @Accept json
+// @Produce json
+// @Param fiscal_year_id query string false "Filter by fiscal year ID"
+// @Param is_active query bool false "Filter by active status"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budgets [get]
 func (h *Handler) ListBudgets(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5804,7 +6692,20 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 	response.Success(c, budgets)
 }
 
-// GetBudget retrieves a single budget by ID
+// GetBudget godoc
+// @Summary Get budget by ID
+// @Description Get detailed information about a specific budget including its lines
+// @Tags Finance - Budgets
+// @Accept json
+// @Produce json
+// @Param id path string true "Budget ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budgets/{id} [get]
 func (h *Handler) GetBudget(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5906,7 +6807,18 @@ func (h *Handler) GetBudget(c *gin.Context) {
 	response.Success(c, b)
 }
 
-// CreateBudget creates a new budget
+// CreateBudget godoc
+// @Summary Create a new budget
+// @Description Create a new budget for a fiscal year
+// @Tags Finance - Budgets
+// @Accept json
+// @Produce json
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budgets [post]
 func (h *Handler) CreateBudget(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6020,7 +6932,20 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 	response.Success(c, b)
 }
 
-// UpdateBudget updates an existing budget
+// UpdateBudget godoc
+// @Summary Update a budget
+// @Description Update an existing budget's information
+// @Tags Finance - Budgets
+// @Accept json
+// @Produce json
+// @Param id path string true "Budget ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budgets/{id} [put]
 func (h *Handler) UpdateBudget(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6085,7 +7010,20 @@ func (h *Handler) UpdateBudget(c *gin.Context) {
 	response.Success(c, b)
 }
 
-// DeleteBudget soft deletes a budget
+// DeleteBudget godoc
+// @Summary Delete a budget
+// @Description Soft-delete a budget
+// @Tags Finance - Budgets
+// @Accept json
+// @Produce json
+// @Param id path string true "Budget ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budgets/{id} [delete]
 func (h *Handler) DeleteBudget(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6120,7 +7058,20 @@ func (h *Handler) DeleteBudget(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Budget deleted successfully"})
 }
 
-// ActivateBudget activates a budget
+// ActivateBudget godoc
+// @Summary Activate a budget
+// @Description Activate a budget to make it the active budget for the fiscal year
+// @Tags Finance - Budgets
+// @Accept json
+// @Produce json
+// @Param id path string true "Budget ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budgets/{id}/activate [post]
 func (h *Handler) ActivateBudget(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6161,7 +7112,18 @@ func (h *Handler) ActivateBudget(c *gin.Context) {
 
 // ==================== BUDGET LINES ====================
 
-// ListBudgetLines retrieves budget lines
+// ListBudgetLines godoc
+// @Summary List budget lines
+// @Description Get a list of budget lines for a specific budget
+// @Tags Finance - Budget Lines
+// @Accept json
+// @Produce json
+// @Param budget_id query string true "Budget ID"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budget-lines [get]
 func (h *Handler) ListBudgetLines(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6227,7 +7189,18 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 	response.Success(c, lines)
 }
 
-// CreateBudgetLine creates a new budget line
+// CreateBudgetLine godoc
+// @Summary Create a new budget line
+// @Description Create a new budget line for a budget
+// @Tags Finance - Budget Lines
+// @Accept json
+// @Produce json
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budget-lines [post]
 func (h *Handler) CreateBudgetLine(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6311,7 +7284,20 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 	response.Success(c, line)
 }
 
-// UpdateBudgetLine updates an existing budget line
+// UpdateBudgetLine godoc
+// @Summary Update a budget line
+// @Description Update an existing budget line's information
+// @Tags Finance - Budget Lines
+// @Accept json
+// @Produce json
+// @Param id path string true "Budget Line ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budget-lines/{id} [put]
 func (h *Handler) UpdateBudgetLine(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6394,7 +7380,20 @@ func (h *Handler) UpdateBudgetLine(c *gin.Context) {
 	response.Success(c, line)
 }
 
-// DeleteBudgetLine deletes a budget line
+// DeleteBudgetLine godoc
+// @Summary Delete a budget line
+// @Description Soft-delete a budget line
+// @Tags Finance - Budget Lines
+// @Accept json
+// @Produce json
+// @Param id path string true "Budget Line ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/budget-lines/{id} [delete]
 func (h *Handler) DeleteBudgetLine(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6442,7 +7441,18 @@ func (h *Handler) DeleteBudgetLine(c *gin.Context) {
 // RECURRING JOURNAL ENTRIES
 // =====================================================
 
-// ListRecurringJournalTemplates returns all recurring journal templates
+// ListRecurringJournalTemplates godoc
+// @Summary List recurring journal templates
+// @Description Get a list of all recurring journal entry templates
+// @Tags Finance - Recurring Journals
+// @Accept json
+// @Produce json
+// @Param is_active query bool false "Filter by active status"
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/recurring-journal-templates [get]
 func (h *Handler) ListRecurringJournalTemplates(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6528,7 +7538,20 @@ func (h *Handler) ListRecurringJournalTemplates(c *gin.Context) {
 	response.Success(c, templates)
 }
 
-// GetRecurringJournalTemplate returns a single template with lines
+// GetRecurringJournalTemplate godoc
+// @Summary Get recurring journal template by ID
+// @Description Get detailed information about a specific recurring journal template with its lines
+// @Tags Finance - Recurring Journals
+// @Accept json
+// @Produce json
+// @Param id path string true "Template ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/recurring-journal-templates/{id} [get]
 func (h *Handler) GetRecurringJournalTemplate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6668,7 +7691,18 @@ func (h *Handler) GetRecurringJournalTemplate(c *gin.Context) {
 	})
 }
 
-// CreateRecurringJournalTemplate creates a new recurring template
+// CreateRecurringJournalTemplate godoc
+// @Summary Create a recurring journal template
+// @Description Create a new recurring journal entry template
+// @Tags Finance - Recurring Journals
+// @Accept json
+// @Produce json
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/recurring-journal-templates [post]
 func (h *Handler) CreateRecurringJournalTemplate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6790,7 +7824,20 @@ func (h *Handler) CreateRecurringJournalTemplate(c *gin.Context) {
 	})
 }
 
-// UpdateRecurringJournalTemplate updates a template
+// UpdateRecurringJournalTemplate godoc
+// @Summary Update a recurring journal template
+// @Description Update an existing recurring journal entry template
+// @Tags Finance - Recurring Journals
+// @Accept json
+// @Produce json
+// @Param id path string true "Template ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/recurring-journal-templates/{id} [put]
 func (h *Handler) UpdateRecurringJournalTemplate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6925,7 +7972,20 @@ func (h *Handler) UpdateRecurringJournalTemplate(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Template updated successfully"})
 }
 
-// DeleteRecurringJournalTemplate soft-deletes a template
+// DeleteRecurringJournalTemplate godoc
+// @Summary Delete a recurring journal template
+// @Description Soft-delete a recurring journal entry template
+// @Tags Finance - Recurring Journals
+// @Accept json
+// @Produce json
+// @Param id path string true "Template ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/recurring-journal-templates/{id} [delete]
 func (h *Handler) DeleteRecurringJournalTemplate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -6959,7 +8019,20 @@ func (h *Handler) DeleteRecurringJournalTemplate(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Template deleted successfully"})
 }
 
-// GenerateRecurringJournalEntry manually generates an entry from a template
+// GenerateRecurringJournalEntry godoc
+// @Summary Generate journal entry from template
+// @Description Manually generate a journal entry from a recurring journal template
+// @Tags Finance - Recurring Journals
+// @Accept json
+// @Produce json
+// @Param id path string true "Template ID"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/recurring-journal-templates/{id}/generate [post]
 func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -7120,7 +8193,17 @@ func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 	})
 }
 
-// GetPendingRecurringEntries returns templates that are due for generation
+// GetPendingRecurringEntries godoc
+// @Summary Get pending recurring entries
+// @Description Get a list of recurring journal templates that are due for generation
+// @Tags Finance - Recurring Journals
+// @Accept json
+// @Produce json
+// @Success 200 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /finance/recurring-journal-templates/pending [get]
 func (h *Handler) GetPendingRecurringEntries(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {

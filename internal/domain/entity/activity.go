@@ -69,13 +69,13 @@ type Activity struct {
 	Outcome         *ActivityOutcome `json:"outcome,omitempty" db:"outcome"`
 	OutcomeNotes    *string         `json:"outcome_notes,omitempty" db:"outcome_notes"`
 	AssignedTo      *uuid.UUID      `json:"assigned_to,omitempty" db:"assigned_to"`
-	Attendees       json.RawMessage `json:"attendees" db:"attendees"`
+	Attendees       json.RawMessage `json:"attendees" db:"attendees" swaggertype:"object"`
 	ReminderDatetime *time.Time     `json:"reminder_datetime,omitempty" db:"reminder_datetime"`
 	ReminderSent    bool            `json:"reminder_sent" db:"reminder_sent"`
 	Priority        string          `json:"priority" db:"priority"`
 	IsPrivate       bool            `json:"is_private" db:"is_private"`
-	Tags            json.RawMessage `json:"tags" db:"tags"`
-	CustomFields    json.RawMessage `json:"custom_fields" db:"custom_fields"`
+	Tags            json.RawMessage `json:"tags" db:"tags" swaggertype:"object"`
+	CustomFields    json.RawMessage `json:"custom_fields" db:"custom_fields" swaggertype:"object"`
 	CreatedBy       *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt       time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at" db:"updated_at"`

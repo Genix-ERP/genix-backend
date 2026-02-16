@@ -51,8 +51,8 @@ type SalesOrder struct {
 	ContactPersonID *uuid.UUID      `json:"contact_person_id,omitempty" db:"contact_person_id"`
 	OrderDate       time.Time       `json:"order_date" db:"order_date"`
 	ExpectedDate    *time.Time      `json:"expected_date,omitempty" db:"expected_date"`
-	BillingAddress  json.RawMessage `json:"billing_address" db:"billing_address"`
-	ShippingAddress json.RawMessage `json:"shipping_address" db:"shipping_address"`
+	BillingAddress  json.RawMessage `json:"billing_address" db:"billing_address" swaggertype:"object"`
+	ShippingAddress json.RawMessage `json:"shipping_address" db:"shipping_address" swaggertype:"object"`
 	CurrencyID      *uuid.UUID      `json:"currency_id,omitempty" db:"currency_id"`
 	ExchangeRate    float64         `json:"exchange_rate" db:"exchange_rate"`
 	Subtotal        float64         `json:"subtotal" db:"subtotal"`
@@ -123,8 +123,8 @@ type SalesInvoice struct {
 	SalesOrderID    *uuid.UUID      `json:"sales_order_id,omitempty" db:"sales_order_id"`
 	InvoiceDate     time.Time       `json:"invoice_date" db:"invoice_date"`
 	DueDate         time.Time       `json:"due_date" db:"due_date"`
-	BillingAddress  json.RawMessage `json:"billing_address" db:"billing_address"`
-	ShippingAddress json.RawMessage `json:"shipping_address" db:"shipping_address"`
+	BillingAddress  json.RawMessage `json:"billing_address" db:"billing_address" swaggertype:"object"`
+	ShippingAddress json.RawMessage `json:"shipping_address" db:"shipping_address" swaggertype:"object"`
 	CurrencyID      *uuid.UUID      `json:"currency_id,omitempty" db:"currency_id"`
 	ExchangeRate    float64         `json:"exchange_rate" db:"exchange_rate"`
 	Subtotal        float64         `json:"subtotal" db:"subtotal"`

@@ -69,7 +69,7 @@ type ConstructionProject struct {
 	City        sql.NullString `json:"city" db:"city"`
 	District    sql.NullString `json:"district" db:"district"`
 	Region      sql.NullString `json:"region" db:"region"`
-	Coordinates json.RawMessage `json:"coordinates" db:"coordinates"`
+	Coordinates json.RawMessage `json:"coordinates" db:"coordinates" swaggertype:"object"`
 
 	// Client Info
 	ClientName    sql.NullString `json:"client_name" db:"client_name"`
@@ -294,7 +294,7 @@ type ConstructionBuilding struct {
 	ProgressPercent sql.NullFloat64 `json:"progress_percent" db:"progress_percent"`
 
 	// Location
-	GpsCoordinates      json.RawMessage `json:"gps_coordinates" db:"gps_coordinates"`
+	GpsCoordinates      json.RawMessage `json:"gps_coordinates" db:"gps_coordinates" swaggertype:"object"`
 	LocationDescription sql.NullString  `json:"location_description" db:"location_description"`
 
 	SortOrder   int       `json:"sort_order" db:"sort_order"`
@@ -557,7 +557,7 @@ type SmetaItem struct {
 	ProgressPercent sql.NullFloat64 `json:"progress_percent" db:"progress_percent"`
 
 	Notes         sql.NullString  `json:"notes" db:"notes"`
-	TechnicalSpecs json.RawMessage `json:"technical_specs" db:"technical_specs"`
+	TechnicalSpecs json.RawMessage `json:"technical_specs" db:"technical_specs" swaggertype:"object"`
 	SortOrder     int             `json:"sort_order" db:"sort_order"`
 	CreatedDate   time.Time       `json:"created_date" db:"created_date"`
 	UpdatedDate   time.Time       `json:"updated_date" db:"updated_date"`
@@ -778,7 +778,7 @@ type ConstructionPhotoReport struct {
 	Weather             sql.NullString  `json:"weather" db:"weather"`
 	Temperature         sql.NullFloat64 `json:"temperature" db:"temperature"`
 
-	Photos json.RawMessage `json:"photos" db:"photos"`
+	Photos json.RawMessage `json:"photos" db:"photos" swaggertype:"object"`
 
 	ReportedBy   uuid.NullUUID  `json:"reported_by" db:"reported_by"`
 	ReviewedBy   uuid.NullUUID  `json:"reviewed_by" db:"reviewed_by"`
@@ -840,10 +840,10 @@ type ConstructionDailyReport struct {
 	SafetyNotes       sql.NullString `json:"safety_notes" db:"safety_notes"`
 
 	WorkersCount    int             `json:"workers_count" db:"workers_count"`
-	WorkersDetails  json.RawMessage `json:"workers_details" db:"workers_details"`
-	EquipmentUsed   json.RawMessage `json:"equipment_used" db:"equipment_used"`
-	MaterialsReceived json.RawMessage `json:"materials_received" db:"materials_received"`
-	Visitors        json.RawMessage `json:"visitors" db:"visitors"`
+	WorkersDetails  json.RawMessage `json:"workers_details" db:"workers_details" swaggertype:"object"`
+	EquipmentUsed   json.RawMessage `json:"equipment_used" db:"equipment_used" swaggertype:"object"`
+	MaterialsReceived json.RawMessage `json:"materials_received" db:"materials_received" swaggertype:"object"`
+	Visitors        json.RawMessage `json:"visitors" db:"visitors" swaggertype:"object"`
 
 	ReportedBy         uuid.NullUUID `json:"reported_by" db:"reported_by"`
 	VerifiedBy         uuid.NullUUID `json:"verified_by" db:"verified_by"`
@@ -893,7 +893,7 @@ type ConstructionProjectVendor struct {
 
 	VendorType    string          `json:"vendor_type" db:"vendor_type"`
 	WorkScope     sql.NullString  `json:"work_scope" db:"work_scope"`
-	SmetaSections json.RawMessage `json:"smeta_sections" db:"smeta_sections"`
+	SmetaSections json.RawMessage `json:"smeta_sections" db:"smeta_sections" swaggertype:"object"`
 
 	ContactPerson sql.NullString `json:"contact_person" db:"contact_person"`
 	ContactPhone  sql.NullString `json:"contact_phone" db:"contact_phone"`
@@ -955,7 +955,7 @@ type ConstructionMaterialDelivery struct {
 	DriverName    sql.NullString `json:"driver_name" db:"driver_name"`
 	WaybillNumber sql.NullString `json:"waybill_number" db:"waybill_number"`
 
-	Items       json.RawMessage `json:"items" db:"items"`
+	Items       json.RawMessage `json:"items" db:"items" swaggertype:"object"`
 	TotalAmount sql.NullFloat64 `json:"total_amount" db:"total_amount"`
 
 	ReceivedBy   uuid.NullUUID `json:"received_by" db:"received_by"`
@@ -965,7 +965,7 @@ type ConstructionMaterialDelivery struct {
 	QualityNotes     sql.NullString `json:"quality_notes" db:"quality_notes"`
 	QualityCheckedBy uuid.NullUUID  `json:"quality_checked_by" db:"quality_checked_by"`
 
-	Photos json.RawMessage `json:"photos" db:"photos"`
+	Photos json.RawMessage `json:"photos" db:"photos" swaggertype:"object"`
 	Status string          `json:"status" db:"status"`
 	Notes  sql.NullString  `json:"notes" db:"notes"`
 
@@ -1004,7 +1004,7 @@ type ConstructionSiteWarehouse struct {
 
 	Name                string          `json:"name" db:"name"`
 	LocationDescription sql.NullString  `json:"location_description" db:"location_description"`
-	GpsCoordinates      json.RawMessage `json:"gps_coordinates" db:"gps_coordinates"`
+	GpsCoordinates      json.RawMessage `json:"gps_coordinates" db:"gps_coordinates" swaggertype:"object"`
 
 	WarehouseKeeperID uuid.NullUUID   `json:"warehouse_keeper_id" db:"warehouse_keeper_id"`
 	TotalArea         sql.NullFloat64 `json:"total_area" db:"total_area"`

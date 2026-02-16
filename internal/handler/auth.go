@@ -142,6 +142,17 @@ type AuthResponse struct {
 }
 
 // Register handles user registration
+// Register godoc
+// @Summary Register new user and tenant
+// @Description Create a new tenant and admin user account
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param register body RegisterInput true "Registration details"
+// @Success 201 {object} response.Response{data=AuthResponse} "Successfully registered"
+// @Failure 400 {object} response.Response "Invalid input or user already exists"
+// @Failure 500 {object} response.Response "Internal server error"
+// @Router /auth/register [post]
 func (h *Handler) Register(c *gin.Context) {
 	var input RegisterInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -336,6 +347,18 @@ func (h *Handler) Register(c *gin.Context) {
 }
 
 // Login handles user login
+// Login godoc
+// @Summary User login
+// @Description Authenticate user with email and password
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param login body LoginInput true "Login credentials"
+// @Success 200 {object} response.Response{data=AuthResponse} "Successfully authenticated"
+// @Failure 400 {object} response.Response "Invalid input"
+// @Failure 401 {object} response.Response "Invalid credentials"
+// @Failure 500 {object} response.Response "Internal server error"
+// @Router /auth/login [post]
 func (h *Handler) Login(c *gin.Context) {
 	var input LoginInput
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -562,6 +585,18 @@ func (h *Handler) Login(c *gin.Context) {
 }
 
 // RefreshToken handles token refresh
+// RefreshToken godoc
+// @Summary Refresh access token
+// @Description Get new access and refresh tokens using a valid refresh token
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param refresh body RefreshTokenInput true "Refresh token"
+// @Success 200 {object} response.Response{data=AuthResponse} "Successfully refreshed tokens"
+// @Failure 400 {object} response.Response "Invalid input"
+// @Failure 401 {object} response.Response "Invalid or expired refresh token"
+// @Failure 500 {object} response.Response "Internal server error"
+// @Router /auth/refresh [post]
 func (h *Handler) RefreshToken(c *gin.Context) {
 	var input RefreshTokenInput
 	if err := c.ShouldBindJSON(&input); err != nil {
