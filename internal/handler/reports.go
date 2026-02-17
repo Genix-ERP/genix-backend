@@ -240,7 +240,7 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 	}
 
 	query := `
-		SELECT a.id, a.code, a.name, at.category, at.normal_balance,
+		SELECT a.id, a.code, a.name, at.category, at.normal_balance, at.code as type_code,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
 			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
 		FROM accounts a
@@ -259,7 +259,7 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance
+		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance, at.code
 		HAVING COALESCE(SUM(jel.debit_amount), 0) > 0 OR COALESCE(SUM(jel.credit_amount), 0) > 0
 		ORDER BY at.category DESC, a.code
 	`
@@ -281,10 +281,10 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 
 	for rows.Next() {
 		var accountID uuid.UUID
-		var code, name, category, normalBalance string
+		var code, name, category, normalBalance, typeCode string
 		var debitSum, creditSum float64
 
-		err := rows.Scan(&accountID, &code, &name, &category, &normalBalance, &debitSum, &creditSum)
+		err := rows.Scan(&accountID, &code, &name, &category, &normalBalance, &typeCode, &debitSum, &creditSum)
 		if err != nil {
 			continue
 		}
@@ -308,40 +308,24 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 			Amount:      math.Round(amount*100) / 100,
 		}
 
-		// Categorize by account code range (standard chart of accounts)
-		// 4000-4899: Revenue, 4900-4999: Other Income
-		// 5000-5999: Cost of Sales (COGS)
-		// 6000-6999: Operating Expenses
-		// 7000-7999: Other Expenses
-		codeNum := 0
-		for _, ch := range code {
-			if ch >= '0' && ch <= '9' {
-				codeNum = codeNum*10 + int(ch-'0')
-			} else {
-				break
-			}
-		}
-
-		if category == "revenue" {
-			if codeNum >= 4900 && codeNum < 5000 {
-				otherIncome = append(otherIncome, section)
-				totalOtherIncome += amount
-			} else {
-				revenue = append(revenue, section)
-				totalRevenue += amount
-			}
-		} else {
-			// expense category
-			if codeNum >= 5000 && codeNum < 6000 {
-				costOfSales = append(costOfSales, section)
-				totalCOGS += amount
-			} else if codeNum >= 7000 && codeNum < 8000 {
-				otherExpenses = append(otherExpenses, section)
-				totalOtherExpenses += amount
-			} else {
-				operatingExpenses = append(operatingExpenses, section)
-				totalOpex += amount
-			}
+		// Categorize by account_type code (REVENUE, COGS, OPEX, OTHER_INC, OTHER_EXP)
+		switch typeCode {
+		case "REVENUE":
+			revenue = append(revenue, section)
+			totalRevenue += amount
+		case "OTHER_INC":
+			otherIncome = append(otherIncome, section)
+			totalOtherIncome += amount
+		case "COGS":
+			costOfSales = append(costOfSales, section)
+			totalCOGS += amount
+		case "OTHER_EXP":
+			otherExpenses = append(otherExpenses, section)
+			totalOtherExpenses += amount
+		default:
+			// OPEX and any other expense types
+			operatingExpenses = append(operatingExpenses, section)
+			totalOpex += amount
 		}
 	}
 
