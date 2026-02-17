@@ -16,7 +16,336 @@ DO $$
 DECLARE
     v_tid UUID := '554423dd-5013-40a5-b3cf-1c800c2b139c';
 BEGIN
-    -- Delete in reverse dependency order
+    -- ========================================================================
+    -- COMPREHENSIVE CLEANUP in reverse FK dependency order
+    -- Uses IF EXISTS guards for tables that may not exist on all deployments
+    -- ========================================================================
+
+    -- === Manufacturing / Production (references products, contacts, warehouses) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'manufacturing_transfer_lines') THEN
+        EXECUTE 'DELETE FROM manufacturing_transfer_lines WHERE transfer_id IN (SELECT id FROM manufacturing_transfers WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'manufacturing_transfers') THEN
+        EXECUTE 'DELETE FROM manufacturing_transfers WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'manufacturing_work_orders') THEN
+        EXECUTE 'DELETE FROM manufacturing_work_orders WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'production_material_consumption') THEN
+        EXECUTE 'DELETE FROM production_material_consumption WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'quality_checks') THEN
+        EXECUTE 'DELETE FROM quality_checks WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'quality_control_points') THEN
+        EXECUTE 'DELETE FROM quality_control_points WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'mrp_recommendations') THEN
+        EXECUTE 'DELETE FROM mrp_recommendations WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'mrp_supply') THEN
+        EXECUTE 'DELETE FROM mrp_supply WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'mrp_demand') THEN
+        EXECUTE 'DELETE FROM mrp_demand WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'production_orders') THEN
+        EXECUTE 'DELETE FROM production_orders WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'manufacturing_equipment') THEN
+        EXECUTE 'DELETE FROM manufacturing_equipment WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'work_centers') THEN
+        EXECUTE 'DELETE FROM work_centers WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Intercompany (references warehouses, bank_accounts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'intercompany_transfer_lines') THEN
+        EXECUTE 'DELETE FROM intercompany_transfer_lines WHERE transfer_id IN (SELECT id FROM intercompany_transfers WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'intercompany_payments') THEN
+        EXECUTE 'DELETE FROM intercompany_payments WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'intercompany_transfers') THEN
+        EXECUTE 'DELETE FROM intercompany_transfers WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'intercompany_rules') THEN
+        EXECUTE 'DELETE FROM intercompany_rules WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Construction (references products, warehouses) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'smeta_resources') THEN
+        EXECUTE 'DELETE FROM smeta_resources WHERE smeta_id IN (SELECT id FROM smetas WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'construction_site_warehouses') THEN
+        EXECUTE 'DELETE FROM construction_site_warehouses WHERE site_id IN (SELECT id FROM construction_sites WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+
+    -- === POS (references products, contacts, warehouses, payment_methods) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'pos_payments') THEN
+        EXECUTE 'DELETE FROM pos_payments WHERE order_id IN (SELECT id FROM pos_orders WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'pos_order_lines') THEN
+        EXECUTE 'DELETE FROM pos_order_lines WHERE order_id IN (SELECT id FROM pos_orders WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'pos_orders') THEN
+        EXECUTE 'DELETE FROM pos_orders WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'pos_configs') THEN
+        EXECUTE 'DELETE FROM pos_configs WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'pos_product_categories') THEN
+        EXECUTE 'DELETE FROM pos_product_categories WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Dropshipping (references products, contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'dropship_order_lines') THEN
+        EXECUTE 'DELETE FROM dropship_order_lines WHERE order_id IN (SELECT id FROM dropship_orders WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'dropship_orders') THEN
+        EXECUTE 'DELETE FROM dropship_orders WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'dropship_product_vendors') THEN
+        EXECUTE 'DELETE FROM dropship_product_vendors WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'dropship_vendor_settings') THEN
+        EXECUTE 'DELETE FROM dropship_vendor_settings WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Pricelists (references products, contacts, product_categories) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'customer_pricelists') THEN
+        EXECUTE 'DELETE FROM customer_pricelists WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'pricelist_items') THEN
+        EXECUTE 'DELETE FROM pricelist_items WHERE pricelist_id IN (SELECT id FROM pricelists WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'pricelists') THEN
+        EXECUTE 'DELETE FROM pricelists WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Quotation Templates (references products, units_of_measure) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'quotation_template_optionals') THEN
+        EXECUTE 'DELETE FROM quotation_template_optionals WHERE template_id IN (SELECT id FROM quotation_templates WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'quotation_template_lines') THEN
+        EXECUTE 'DELETE FROM quotation_template_lines WHERE template_id IN (SELECT id FROM quotation_templates WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'quotation_templates') THEN
+        EXECUTE 'DELETE FROM quotation_templates WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Sales Quotations (references products, contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'sales_quotation_items') THEN
+        EXECUTE 'DELETE FROM sales_quotation_items WHERE quotation_id IN (SELECT id FROM sales_quotations WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'sales_quotations') THEN
+        EXECUTE 'DELETE FROM sales_quotations WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Sales Returns (references products, contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'sales_return_items') THEN
+        EXECUTE 'DELETE FROM sales_return_items WHERE return_id IN (SELECT id FROM sales_returns WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'sales_returns') THEN
+        EXECUTE 'DELETE FROM sales_returns WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Discounts (references contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'discount_usage') THEN
+        EXECUTE 'DELETE FROM discount_usage WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Customer Followups (references contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'payment_promises') THEN
+        EXECUTE 'DELETE FROM payment_promises WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'followup_actions') THEN
+        EXECUTE 'DELETE FROM followup_actions WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'customer_followup_status') THEN
+        EXECUTE 'DELETE FROM customer_followup_status WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Reconciliation Acts (references contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'reconciliation_act_lines') THEN
+        EXECUTE 'DELETE FROM reconciliation_act_lines WHERE act_id IN (SELECT id FROM reconciliation_acts WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'reconciliation_acts') THEN
+        EXECUTE 'DELETE FROM reconciliation_acts WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Landed Costs (references products, contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'landed_cost_allocations') THEN
+        EXECUTE 'DELETE FROM landed_cost_allocations WHERE landed_cost_id IN (SELECT id FROM landed_costs WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'landed_cost_lines') THEN
+        EXECUTE 'DELETE FROM landed_cost_lines WHERE landed_cost_id IN (SELECT id FROM landed_costs WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'landed_costs') THEN
+        EXECUTE 'DELETE FROM landed_costs WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Blanket Orders (references products, contacts, warehouses) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'blanket_order_release_lines') THEN
+        EXECUTE 'DELETE FROM blanket_order_release_lines WHERE release_id IN (SELECT id FROM blanket_order_releases WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'blanket_order_releases') THEN
+        EXECUTE 'DELETE FROM blanket_order_releases WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'blanket_order_lines') THEN
+        EXECUTE 'DELETE FROM blanket_order_lines WHERE order_id IN (SELECT id FROM blanket_orders WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'blanket_orders') THEN
+        EXECUTE 'DELETE FROM blanket_orders WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === RFQs / Procurement (references products, contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'rfq_responses') THEN
+        EXECUTE 'DELETE FROM rfq_responses WHERE rfq_id IN (SELECT id FROM rfqs WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'rfq_invitations') THEN
+        EXECUTE 'DELETE FROM rfq_invitations WHERE rfq_id IN (SELECT id FROM rfqs WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'rfq_items') THEN
+        EXECUTE 'DELETE FROM rfq_items WHERE rfq_id IN (SELECT id FROM rfqs WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'rfqs') THEN
+        EXECUTE 'DELETE FROM rfqs WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'procurement_contract_items') THEN
+        EXECUTE 'DELETE FROM procurement_contract_items WHERE contract_id IN (SELECT id FROM procurement_contracts WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'procurement_contracts') THEN
+        EXECUTE 'DELETE FROM procurement_contracts WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Supplier / Vendor (references products, contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'vendor_prices') THEN
+        EXECUTE 'DELETE FROM vendor_prices WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'supplier_price_history') THEN
+        EXECUTE 'DELETE FROM supplier_price_history WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'supplier_performance') THEN
+        EXECUTE 'DELETE FROM supplier_performance WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Product Variants & Packagings (references products) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'product_variants') THEN
+        EXECUTE 'DELETE FROM product_variants WHERE product_id IN (SELECT id FROM products WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'product_template_attributes') THEN
+        EXECUTE 'DELETE FROM product_template_attributes WHERE product_id IN (SELECT id FROM products WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'product_packagings') THEN
+        EXECUTE 'DELETE FROM product_packagings WHERE product_id IN (SELECT id FROM products WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'package_contents') THEN
+        EXECUTE 'DELETE FROM package_contents WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === CRM (references contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'quotation_lines') THEN
+        EXECUTE 'DELETE FROM quotation_lines WHERE quotation_id IN (SELECT id FROM quotations WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'quotations') THEN
+        EXECUTE 'DELETE FROM quotations WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'email_messages') THEN
+        EXECUTE 'DELETE FROM email_messages WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'segment_members') THEN
+        EXECUTE 'DELETE FROM segment_members WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'campaign_members') THEN
+        EXECUTE 'DELETE FROM campaign_members WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'crm_tasks') THEN
+        EXECUTE 'DELETE FROM crm_tasks WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'activities') THEN
+        EXECUTE 'DELETE FROM activities WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'opportunities') THEN
+        EXECUTE 'DELETE FROM opportunities WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'call_logs') THEN
+        EXECUTE 'DELETE FROM call_logs WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'leads') THEN
+        EXECUTE 'DELETE FROM leads WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Projects / Expenses (references contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'project_expenses') THEN
+        EXECUTE 'DELETE FROM project_expenses WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'projects') THEN
+        EXECUTE 'DELETE FROM projects WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'expenses') THEN
+        EXECUTE 'DELETE FROM expenses WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'contracts') THEN
+        EXECUTE 'DELETE FROM contracts WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Stock moves / Warehouse operations (references products, warehouses) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'stock_moves') THEN
+        EXECUTE 'DELETE FROM stock_moves WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'warehouse_steps') THEN
+        EXECUTE 'DELETE FROM warehouse_steps WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === BOM (references products) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bom_operations') THEN
+        EXECUTE 'DELETE FROM bom_operations WHERE bom_id IN (SELECT id FROM product_boms WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bom_lines') THEN
+        EXECUTE 'DELETE FROM bom_lines WHERE bom_id IN (SELECT id FROM product_boms WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'product_boms') THEN
+        EXECUTE 'DELETE FROM product_boms WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Scrap / Reorder (references products, warehouses) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'scrap_orders') THEN
+        EXECUTE 'DELETE FROM scrap_orders WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'reorder_rules') THEN
+        EXECUTE 'DELETE FROM reorder_rules WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'reorder_alerts') THEN
+        EXECUTE 'DELETE FROM reorder_alerts WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Inventory (references products, warehouses) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'stock_count_lines') THEN
+        EXECUTE 'DELETE FROM stock_count_lines WHERE stock_count_id IN (SELECT id FROM stock_counts WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'stock_counts') THEN
+        EXECUTE 'DELETE FROM stock_counts WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'transfer_order_lines') THEN
+        EXECUTE 'DELETE FROM transfer_order_lines WHERE transfer_order_id IN (SELECT id FROM transfer_orders WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'transfer_orders') THEN
+        EXECUTE 'DELETE FROM transfer_orders WHERE tenant_id = $1' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'inventory_lots') THEN
+        EXECUTE 'DELETE FROM inventory_lots WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Recurring Journal Templates (references journals, accounts, contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'recurring_journal_template_lines') THEN
+        EXECUTE 'DELETE FROM recurring_journal_template_lines WHERE template_id IN (SELECT id FROM recurring_journal_templates WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'recurring_journal_templates') THEN
+        EXECUTE 'DELETE FROM recurring_journal_templates WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Core financial / order tables (always exist) ===
     DELETE FROM payment_allocations WHERE payment_id IN (SELECT id FROM payments WHERE tenant_id = v_tid);
     DELETE FROM payments WHERE tenant_id = v_tid;
     DELETE FROM sales_invoice_lines WHERE sales_invoice_id IN (SELECT id FROM sales_invoices WHERE tenant_id = v_tid);
@@ -36,13 +365,38 @@ BEGIN
     DELETE FROM fixed_assets WHERE tenant_id = v_tid;
     DELETE FROM journal_entry_lines WHERE journal_entry_id IN (SELECT id FROM journal_entries WHERE tenant_id = v_tid);
     DELETE FROM journal_entries WHERE tenant_id = v_tid;
-    -- Delete product dependencies safely (tables may not exist on all deployments)
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bom_lines') THEN
-        EXECUTE 'DELETE FROM bom_lines WHERE bom_id IN (SELECT id FROM product_boms WHERE tenant_id = $1)' USING v_tid;
+
+    -- === Cash (references accounts, contacts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'cash_transactions') THEN
+        EXECUTE 'DELETE FROM cash_transactions WHERE tenant_id = $1' USING v_tid;
     END IF;
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'product_boms') THEN
-        EXECUTE 'DELETE FROM product_boms WHERE tenant_id = $1' USING v_tid;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'cash_orders') THEN
+        EXECUTE 'DELETE FROM cash_orders WHERE tenant_id = $1' USING v_tid;
     END IF;
+
+    -- === Bank (references bank_accounts → accounts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bank_reconciliation_lines') THEN
+        EXECUTE 'DELETE FROM bank_reconciliation_lines WHERE reconciliation_id IN (SELECT id FROM bank_reconciliations WHERE bank_account_id IN (SELECT id FROM bank_accounts WHERE tenant_id = $1))' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bank_reconciliations') THEN
+        EXECUTE 'DELETE FROM bank_reconciliations WHERE bank_account_id IN (SELECT id FROM bank_accounts WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'bank_transactions') THEN
+        EXECUTE 'DELETE FROM bank_transactions WHERE bank_account_id IN (SELECT id FROM bank_accounts WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+
+    -- === Budget (references accounts) ===
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'budget_lines') THEN
+        EXECUTE 'DELETE FROM budget_lines WHERE budget_id IN (SELECT id FROM budgets WHERE tenant_id = $1)' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'budgets') THEN
+        EXECUTE 'DELETE FROM budgets WHERE tenant_id = $1' USING v_tid;
+    END IF;
+
+    -- === Contact persons (references contacts) ===
+    DELETE FROM contact_persons WHERE contact_id IN (SELECT id FROM contacts WHERE tenant_id = v_tid);
+
+    -- === Base tables ===
     DELETE FROM products WHERE tenant_id = v_tid;
     DELETE FROM product_categories WHERE tenant_id = v_tid;
     DELETE FROM bank_accounts WHERE tenant_id = v_tid;
@@ -50,6 +404,7 @@ BEGIN
     DELETE FROM contacts WHERE tenant_id = v_tid;
     DELETE FROM units_of_measure WHERE tenant_id = v_tid;
     DELETE FROM journals WHERE tenant_id = v_tid AND code IN ('GEN', 'SAL', 'PUR', 'CSH', 'BNK');
+
     -- Reset account balances
     UPDATE accounts SET current_balance = 0, updated_at = NOW() WHERE tenant_id = v_tid;
     RAISE NOTICE 'Cleanup complete - existing demo data removed.';
