@@ -784,6 +784,93 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 		}
 	}
 
+	// ============================================
+	// CREATE JOURNAL ENTRY FOR LANDED COST
+	// ============================================
+	func() {
+		// Get total landed cost amount
+		var totalLandedCost float64
+		h.db.QueryRow(`SELECT COALESCE(SUM(amount), 0) FROM landed_cost_lines WHERE landed_cost_id = $1`, id).Scan(&totalLandedCost)
+
+		if totalLandedCost <= 0 {
+			return
+		}
+
+		// Get organization_id from landed cost
+		var lcOrgID sql.NullString
+		h.db.QueryRow(`SELECT organization_id FROM landed_costs WHERE id = $1`, id).Scan(&lcOrgID)
+
+		var orgIDPtr *uuid.UUID
+		if lcOrgID.Valid {
+			if parsedOrgID, err := uuid.Parse(lcOrgID.String); err == nil {
+				orgIDPtr = &parsedOrgID
+			}
+		}
+
+		// Look up journal
+		var journalID uuid.UUID
+		var nextNumber int
+		err := h.db.QueryRow(`
+			SELECT id, COALESCE(next_number, 1)
+			FROM journals WHERE tenant_id = $1 AND code IN ('INVENTORY','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE WHEN code='INVENTORY' THEN 0 ELSE 1 END LIMIT 1`,
+			tenantID).Scan(&journalID, &nextNumber)
+		if err != nil {
+			return
+		}
+
+		// Debit: Stock Valuation (inventory)
+		invAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+		if invAcct == uuid.Nil {
+			invAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1300")
+		}
+		// Credit: Accounts Payable
+		apAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+
+		if invAcct == uuid.Nil || apAcct == uuid.Nil {
+			return
+		}
+
+		entryNumber := fmt.Sprintf("LC%06d", nextNumber)
+		journalEntryID := uuid.New()
+		description := fmt.Sprintf("Landed Cost Allocation: LC-%s", id.String()[:8])
+
+		_, err = h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'landed_cost', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
+			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, now, entryNumber, description,
+			id.String(), totalLandedCost, userID, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create landed cost journal entry", "error", err)
+			return
+		}
+
+		// Debit: Inventory / Stock Valuation
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
+			uuid.New(), journalEntryID, invAcct, "Stock Valuation (Landed Cost)", totalLandedCost, now,
+		)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalLandedCost, now, invAcct)
+
+		// Credit: Accounts Payable
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
+			uuid.New(), journalEntryID, apAcct, "Accounts Payable (Landed Cost)", totalLandedCost, now,
+		)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalLandedCost, now, apAcct)
+
+		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	}()
+
 	// Update status
 	_, err = h.db.Exec(`
 		UPDATE landed_costs

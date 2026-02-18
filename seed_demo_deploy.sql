@@ -23,7 +23,7 @@ BEGIN
 
     -- === Manufacturing / Production (references products, contacts, warehouses) ===
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'manufacturing_transfer_lines') THEN
-        EXECUTE 'DELETE FROM manufacturing_transfer_lines WHERE transfer_id IN (SELECT id FROM manufacturing_transfers WHERE tenant_id = $1)' USING v_tid;
+        EXECUTE 'DELETE FROM manufacturing_transfer_lines WHERE manufacturing_transfer_id IN (SELECT id FROM manufacturing_transfers WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'manufacturing_transfers') THEN
         EXECUTE 'DELETE FROM manufacturing_transfers WHERE tenant_id = $1' USING v_tid;
@@ -61,7 +61,7 @@ BEGIN
 
     -- === Intercompany (references warehouses, bank_accounts) ===
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'intercompany_transfer_lines') THEN
-        EXECUTE 'DELETE FROM intercompany_transfer_lines WHERE transfer_id IN (SELECT id FROM intercompany_transfers WHERE tenant_id = $1)' USING v_tid;
+        EXECUTE 'DELETE FROM intercompany_transfer_lines WHERE intercompany_transfer_id IN (SELECT id FROM intercompany_transfers WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'intercompany_payments') THEN
         EXECUTE 'DELETE FROM intercompany_payments WHERE tenant_id = $1' USING v_tid;
@@ -75,10 +75,10 @@ BEGIN
 
     -- === Construction (references products, warehouses) ===
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'smeta_resources') THEN
-        EXECUTE 'DELETE FROM smeta_resources WHERE smeta_id IN (SELECT id FROM smetas WHERE tenant_id = $1)' USING v_tid;
+        EXECUTE 'DELETE FROM smeta_resources WHERE smeta_item_id IN (SELECT id FROM smeta_items WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'construction_site_warehouses') THEN
-        EXECUTE 'DELETE FROM construction_site_warehouses WHERE site_id IN (SELECT id FROM construction_sites WHERE tenant_id = $1)' USING v_tid;
+        EXECUTE 'DELETE FROM construction_site_warehouses WHERE project_id IN (SELECT id FROM construction_projects WHERE tenant_id = $1)' USING v_tid;
     END IF;
 
     -- === POS (references products, contacts, warehouses, payment_methods) ===

@@ -617,5 +617,101 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 		return
 	}
 
+	// ============================================
+	// CREATE JOURNAL ENTRY FOR EXPENSE
+	// ============================================
+	func() {
+		var expenseNumber, description string
+		var totalAmount float64
+		var reimbursable bool
+		var orgID sql.NullString
+		var expenseDate time.Time
+
+		err := h.db.QueryRow(`
+			SELECT expense_number, description, total_amount, reimbursable, organization_id, expense_date
+			FROM expenses WHERE id = $1 AND tenant_id = $2`,
+			id, tenantID).Scan(&expenseNumber, &description, &totalAmount, &reimbursable, &orgID, &expenseDate)
+		if err != nil || totalAmount <= 0 {
+			return
+		}
+
+		var orgIDPtr *uuid.UUID
+		if orgID.Valid {
+			if parsedOrgID, err := uuid.Parse(orgID.String); err == nil {
+				orgIDPtr = &parsedOrgID
+			}
+		}
+
+		// Look up expense account
+		expenseAccountID := findAccount(h.db, tenantID, orgIDPtr, "operating expense", "6900")
+		if expenseAccountID == uuid.Nil {
+			expenseAccountID = findAccount(h.db, tenantID, orgIDPtr, "miscellaneous expense", "6900")
+		}
+
+		// Credit account: AP if reimbursable, Cash otherwise
+		var creditAccountID uuid.UUID
+		if reimbursable {
+			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+		} else {
+			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+		}
+
+		if expenseAccountID == uuid.Nil || creditAccountID == uuid.Nil {
+			h.log.Error("Cannot find accounts for expense JE")
+			return
+		}
+
+		// Look up journal
+		var journalID uuid.UUID
+		var nextNumber int
+		err = h.db.QueryRow(`
+			SELECT id, COALESCE(next_number, 1)
+			FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`,
+			tenantID).Scan(&journalID, &nextNumber)
+		if err != nil {
+			return
+		}
+
+		entryNumber := fmt.Sprintf("EXP%06d", nextNumber)
+		journalEntryID := uuid.New()
+		jeDescription := "Expense: " + expenseNumber + " - " + description
+
+		_, err = h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'expense', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
+			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, expenseDate, expenseNumber, jeDescription,
+			id.String(), totalAmount, userID, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create expense journal entry", "error", err)
+			return
+		}
+
+		// Debit: Expense account
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
+			uuid.New(), journalEntryID, expenseAccountID, "Expense", totalAmount, now,
+		)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, expenseAccountID)
+
+		// Credit: Cash or AP
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
+			uuid.New(), journalEntryID, creditAccountID, "Cash/Payable", totalAmount, now,
+		)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, creditAccountID)
+
+		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	}()
+
 	h.GetExpense(c)
 }
