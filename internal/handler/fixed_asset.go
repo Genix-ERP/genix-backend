@@ -327,6 +327,81 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 		return
 	}
 
+	// ============================================
+	// CREATE JOURNAL ENTRY FOR FIXED ASSET ACQUISITION
+	// ============================================
+	func() {
+		if input.AcquisitionCost <= 0 {
+			return
+		}
+
+		// Look up journal
+		var journalID uuid.UUID
+		var nextNumber int
+		err := h.db.QueryRow(`
+			SELECT id, COALESCE(next_number, 1)
+			FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`,
+			tenantID).Scan(&journalID, &nextNumber)
+		if err != nil {
+			return
+		}
+
+		// Debit: Fixed Asset account
+		faAcct := findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
+		if faAcct == uuid.Nil {
+			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
+		}
+		// Credit: Cash or AP
+		cashAcct := findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+		if cashAcct == uuid.Nil {
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+		}
+
+		if faAcct == uuid.Nil || cashAcct == uuid.Nil {
+			return
+		}
+
+		entryNumber := fmt.Sprintf("FA%06d", nextNumber)
+		journalEntryID := uuid.New()
+		jeDescription := "Fixed Asset Acquisition: " + assetCode + " - " + input.Name
+
+		_, err = h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'fixed_asset', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
+			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, acquisitionDate, assetCode, jeDescription,
+			id.String(), input.AcquisitionCost, userID, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create fixed asset journal entry", "error", err)
+			return
+		}
+
+		// Debit: Fixed Asset
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
+			uuid.New(), journalEntryID, faAcct, "Fixed Asset", input.AcquisitionCost, now,
+		)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, faAcct)
+
+		// Credit: Cash/Bank
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
+			uuid.New(), journalEntryID, cashAcct, "Cash/Bank", input.AcquisitionCost, now,
+		)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, cashAcct)
+
+		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	}()
+
 	asset := &entity.FixedAsset{
 		ID:                      id,
 		TenantID:                tenantID,
