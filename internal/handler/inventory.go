@@ -653,9 +653,12 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 			orgIDPtr = &organizationID
 		}
 		ca := getCategoryAccounts(tx, tenantID, orgIDPtr, productID)
-		adjustAcct := findAccount(tx, tenantID, orgIDPtr, "stock adjustment", "6900")
+		adjustAcct := findAccount(tx, tenantID, orgIDPtr, "stock adjustment", "6910")
 		if adjustAcct == uuid.Nil {
-			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "inventory adjustment", "6900")
+			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "inventory adjustment", "6910")
+		}
+		if adjustAcct == uuid.Nil {
+			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "miscellaneous expense", "6900")
 		}
 
 		if ca.StockValuationAccountID != uuid.Nil && adjustAcct != uuid.Nil {
@@ -684,11 +687,14 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 				var debitAcct, creditAcct uuid.UUID
 				var debitDesc, creditDesc string
 				if input.Quantity > 0 {
-					// Adding stock: Debit Stock Valuation / Credit Adjustment Expense
+					// Adding stock: Debit Stock Valuation / Credit Stock Input (liability, not expense)
 					debitAcct = ca.StockValuationAccountID
-					creditAcct = adjustAcct
+					creditAcct = ca.StockInputAccountID
+					if creditAcct == uuid.Nil {
+						creditAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+					}
 					debitDesc = "Stock Valuation (adjustment in)"
-					creditDesc = "Inventory Adjustment Expense"
+					creditDesc = "Stock Input (adjustment in)"
 				} else {
 					// Removing stock: Debit Adjustment Expense / Credit Stock Valuation
 					debitAcct = adjustAcct

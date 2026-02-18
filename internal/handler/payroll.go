@@ -609,5 +609,98 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		return
 	}
 
+	// ============================================
+	// CREATE JOURNAL ENTRY FOR PAYROLL
+	// ============================================
+	func() {
+		// Get period details and total gross salary
+		var periodName string
+		var orgID sql.NullString
+		h.db.QueryRow(`SELECT name, organization_id FROM payroll_periods WHERE id = $1`, id).Scan(&periodName, &orgID)
+
+		var totalGross float64
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(gross_salary), 0)
+			FROM payroll_entries WHERE payroll_period_id = $1 AND tenant_id = $2`,
+			id, tenantID).Scan(&totalGross)
+
+		if totalGross <= 0 {
+			return
+		}
+
+		var orgIDPtr *uuid.UUID
+		if orgID.Valid {
+			if parsedOrgID, err := uuid.Parse(orgID.String); err == nil {
+				orgIDPtr = &parsedOrgID
+			}
+		}
+
+		// Look up journal
+		var journalID uuid.UUID
+		var nextNumber int
+		err := h.db.QueryRow(`
+			SELECT id, COALESCE(next_number, 1)
+			FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`,
+			tenantID).Scan(&journalID, &nextNumber)
+		if err != nil {
+			return
+		}
+
+		entryNumber := fmt.Sprintf("PAY%06d", nextNumber)
+		journalEntryID := uuid.New()
+		description := "Payroll: " + periodName
+
+		// Debit: Salary Expense
+		salaryAcct := findAccount(h.db, tenantID, orgIDPtr, "salaries", "6000")
+		if salaryAcct == uuid.Nil {
+			salaryAcct = findAccount(h.db, tenantID, orgIDPtr, "salary", "6000")
+		}
+		// Credit: AP / Wages Payable
+		payableAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+		if payableAcct == uuid.Nil {
+			payableAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+		}
+
+		if salaryAcct == uuid.Nil || payableAcct == uuid.Nil {
+			return
+		}
+
+		_, err = h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'payroll', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
+			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, now, periodName, description,
+			id.String(), totalGross, userID, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to create payroll journal entry", "error", err)
+			return
+		}
+
+		// Debit: Salary Expense
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
+			uuid.New(), journalEntryID, salaryAcct, "Salary Expense", totalGross, now,
+		)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalGross, now, salaryAcct)
+
+		// Credit: Wages Payable
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
+			uuid.New(), journalEntryID, payableAcct, "Wages Payable", totalGross, now,
+		)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalGross, now, payableAcct)
+
+		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	}()
+
 	response.Success(c, gin.H{"message": "Payroll processed successfully"})
 }
