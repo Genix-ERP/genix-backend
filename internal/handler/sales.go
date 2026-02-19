@@ -395,6 +395,10 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		} else if input.DiscountType == "fixed" && input.DiscountValue > 0 {
 			discountAmount = input.DiscountValue
 		}
+		// Use frontend's tax_amount if provided
+		if input.TaxAmount > 0 {
+			taxAmount = input.TaxAmount
+		}
 		// Use frontend's total if provided, otherwise calculate
 		if input.TotalAmount > 0 {
 			totalAmount = input.TotalAmount
@@ -1638,6 +1642,14 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		shippingAddrParam = []byte(shippingAddress)
 	}
 
+	// Use a transaction for invoice creation + GL posting
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
 	// Create invoice (note: amount_due is a GENERATED column, don't insert into it)
 	h.log.Info("CreateInvoiceFromOrder: attempting INSERT",
 		"invoiceID", invoiceID,
@@ -1646,7 +1658,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		"customerID", customerID,
 		"orderID", orderID)
 
-	_, err = h.db.Exec(`
+	_, err = tx.Exec(`
 		INSERT INTO sales_invoices (
 			id, tenant_id, organization_id, invoice_number, customer_id, customer_name, sales_order_id,
 			invoice_date, due_date, billing_address, shipping_address,
@@ -1656,7 +1668,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		invoiceID, tenantID, organizationID, invoiceNumber, customerID, customerName, orderID,
 		now, dueDate, billingAddrParam, shippingAddrParam,
 		1.0, subtotal, discountAmount, taxAmount, totalAmount,
-		0, entity.InvoiceStatusDraft, createdBy, now, now,
+		0, entity.InvoiceStatusSent, createdBy, now, now,
 	)
 	if err != nil {
 		h.log.Error("CreateInvoiceFromOrder: INSERT failed", "error", err)
@@ -1666,52 +1678,262 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	h.log.Info("CreateInvoiceFromOrder: INSERT succeeded")
 
 	// Copy order lines to invoice lines (join with products to get name if description is null)
-	linesRows, err := h.db.Query(`
+	type invoiceLineInfo struct {
+		OrderLineID uuid.UUID
+		LineNumber  int
+		ProductID   uuid.UUID
+		Description sql.NullString
+		Quantity    float64
+		UnitID      sql.NullString
+		UnitPrice   float64
+		Discount    float64
+		TaxID       sql.NullString
+		TaxAmount   float64
+		LineTotal   float64
+	}
+	var invoiceLineInfos []invoiceLineInfo
+
+	linesRows, err := tx.Query(`
 		SELECT sol.id, sol.line_number, sol.product_id, COALESCE(NULLIF(sol.description, ''), p.name) as description,
 		       sol.quantity, sol.unit_id, sol.unit_price, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total
 		FROM sales_order_lines sol
 		LEFT JOIN products p ON p.id = sol.product_id
 		WHERE sol.sales_order_id = $1`, orderID)
 	if err == nil {
-		defer linesRows.Close()
 		for linesRows.Next() {
-			var orderLineID, productID uuid.UUID
-			var lineNumber int
-			var description sql.NullString
-			var quantity, unitPrice, lineDiscountAmount, lineTaxAmount, lineTotal float64
-			var unitID, taxID sql.NullString
-
-			if err := linesRows.Scan(&orderLineID, &lineNumber, &productID, &description, &quantity, &unitID, &unitPrice,
-				&lineDiscountAmount, &taxID, &lineTaxAmount, &lineTotal); err != nil {
+			var li invoiceLineInfo
+			if err := linesRows.Scan(&li.OrderLineID, &li.LineNumber, &li.ProductID, &li.Description, &li.Quantity, &li.UnitID, &li.UnitPrice,
+				&li.Discount, &li.TaxID, &li.TaxAmount, &li.LineTotal); err != nil {
 				continue
 			}
+			invoiceLineInfos = append(invoiceLineInfos, li)
+		}
+		linesRows.Close()
+	}
 
-			invoiceLineID := uuid.New()
-			h.db.Exec(`
-				INSERT INTO sales_invoice_lines (
-					id, sales_invoice_id, sales_order_line_id, line_number, product_id, description,
-					quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount, line_total, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-				invoiceLineID, invoiceID, orderLineID, lineNumber, productID, description,
-				quantity, unitID, unitPrice, lineDiscountAmount, taxID, lineTaxAmount, lineTotal, now,
+	for _, li := range invoiceLineInfos {
+		invoiceLineID := uuid.New()
+		tx.Exec(`
+			INSERT INTO sales_invoice_lines (
+				id, sales_invoice_id, sales_order_line_id, line_number, product_id, description,
+				quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount, line_total, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+			invoiceLineID, invoiceID, li.OrderLineID, li.LineNumber, li.ProductID, li.Description,
+			li.Quantity, li.UnitID, li.UnitPrice, li.Discount, li.TaxID, li.TaxAmount, li.LineTotal, now,
+		)
+	}
+
+	// ========== GL JOURNAL ENTRY POSTING (auto-post on creation) ==========
+	var journalEntryID *uuid.UUID
+
+	// Get Sales Journal
+	var salesJournalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	journalErr := tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
+
+	if journalErr == nil {
+		// Find AR account
+		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+		if arAccountID == uuid.Nil {
+			arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
+		}
+
+		if arAccountID != uuid.Nil {
+			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+
+			// Get invoice lines for per-category accounting
+			type invoiceLineAcct struct {
+				ProductID  uuid.UUID
+				LineTotal  float64
+				Quantity   float64
+				CostPrice  float64
+				IncomeAcct uuid.UUID
+				ExpenseAcct uuid.UUID
+				OutputAcct uuid.UUID
+			}
+			var acctLines []invoiceLineAcct
+			acctRows, acctErr := tx.Query(`
+				SELECT sil.product_id, COALESCE(sil.line_total, 0), COALESCE(sil.quantity, 0), COALESCE(p.cost_price, 0)
+				FROM sales_invoice_lines sil
+				JOIN products p ON sil.product_id = p.id
+				WHERE sil.sales_invoice_id = $1
+			`, invoiceID)
+			if acctErr == nil {
+				for acctRows.Next() {
+					var al invoiceLineAcct
+					if err := acctRows.Scan(&al.ProductID, &al.LineTotal, &al.Quantity, &al.CostPrice); err == nil {
+						acctLines = append(acctLines, al)
+					}
+				}
+				acctRows.Close()
+				for i := range acctLines {
+					ca := getCategoryAccounts(tx, tenantID, organizationID, acctLines[i].ProductID)
+					acctLines[i].IncomeAcct = ca.IncomeAccountID
+					acctLines[i].ExpenseAcct = ca.ExpenseAccountID
+					acctLines[i].OutputAcct = ca.StockOutputAccountID
+				}
+			}
+
+			// Group revenue by income account
+			revenueGrouped := make(map[uuid.UUID]float64)
+			type cogsPair struct {
+				Expense uuid.UUID
+				Output  uuid.UUID
+			}
+			cogsGrouped := make(map[cogsPair]float64)
+
+			for _, al := range acctLines {
+				if al.LineTotal > 0 {
+					revenueGrouped[al.IncomeAcct] += al.LineTotal
+				}
+				costAmount := al.Quantity * al.CostPrice
+				if costAmount > 0 {
+					cogsGrouped[cogsPair{Expense: al.ExpenseAcct, Output: al.OutputAcct}] += costAmount
+				}
+			}
+
+			// Fallback revenue account
+			if len(revenueGrouped) == 0 && subtotal > 0 {
+				fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+				if fallbackRevenue != uuid.Nil {
+					revenueGrouped[fallbackRevenue] = subtotal
+				}
+			}
+
+			// Generate entry number
+			prefix := ""
+			if numberPrefix.Valid {
+				prefix = numberPrefix.String
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+			// Total COGS
+			var totalCogs float64
+			for _, amt := range cogsGrouped {
+				totalCogs += amt
+			}
+			totalDebit := totalAmount + totalCogs
+			totalCredit := totalDebit
+
+			// Create journal entry
+			jeID := uuid.New()
+			journalEntryID = &jeID
+			jeDescription := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
+
+			tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+				jeID, tenantID, organizationID, salesJournalID, entryNumber, now, invoiceNumber, jeDescription,
+				"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, userID, now, now,
 			)
+
+			jeLineNumber := 1
+
+			// Debit: Accounts Receivable
+			tx.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, contact_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				uuid.New(), jeID, jeLineNumber, arAccountID, customerID, "Accounts Receivable",
+				totalAmount, 0.0, 1.0, now,
+			)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
+			jeLineNumber++
+
+			// Credit: Revenue per category
+			for incomeAcct, amount := range revenueGrouped {
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					uuid.New(), jeID, jeLineNumber, incomeAcct, "Sales Revenue",
+					0.0, amount, 1.0, now,
+				)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct)
+				jeLineNumber++
+			}
+
+			// Credit: Tax Payable
+			if taxAccountID != uuid.Nil && taxAmount > 0 {
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					uuid.New(), jeID, jeLineNumber, taxAccountID, "Sales Tax Payable",
+					0.0, taxAmount, 1.0, now,
+				)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+				jeLineNumber++
+			}
+
+			// COGS entries
+			for pair, costAmount := range cogsGrouped {
+				// Debit: COGS
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					uuid.New(), jeID, jeLineNumber, pair.Expense, "Cost of Goods Sold",
+					costAmount, 0.0, 1.0, now,
+				)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Expense)
+				jeLineNumber++
+
+				// Credit: Stock Interim Delivery
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					uuid.New(), jeID, jeLineNumber, pair.Output, "Stock Interim Delivery",
+					0.0, costAmount, 1.0, now,
+				)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output)
+				jeLineNumber++
+			}
+
+			// Update journal next number
+			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
+
+			// Link JE to invoice
+			tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, sent_at = $2 WHERE id = $3", jeID, now, invoiceID)
 		}
 	}
 
 	// Update order status to processing
-	h.db.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3",
+	tx.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3",
 		entity.OrderStatusProcessing, now, orderID)
 
+	// Commit
+	if err := tx.Commit(); err != nil {
+		h.log.Error("CreateInvoiceFromOrder: commit failed", "error", err)
+		response.InternalError(c, "Failed to commit transaction")
+		return
+	}
+
+	invoiceStatus := string(entity.InvoiceStatusSent)
 	response.Created(c, map[string]interface{}{
-		"id":             invoiceID.String(),
-		"invoice_number": invoiceNumber,
-		"customer_id":    customerID.String(),
-		"sales_order_id": orderID.String(),
-		"invoice_date":   now.Format("2006-01-02"),
-		"due_date":       dueDate.Format("2006-01-02"),
-		"total_amount":   totalAmount,
-		"amount_due":     totalAmount,
-		"status":         string(entity.InvoiceStatusDraft),
-		"created_at":     now,
+		"id":               invoiceID.String(),
+		"invoice_number":   invoiceNumber,
+		"customer_id":      customerID.String(),
+		"sales_order_id":   orderID.String(),
+		"invoice_date":     now.Format("2006-01-02"),
+		"due_date":         dueDate.Format("2006-01-02"),
+		"total_amount":     totalAmount,
+		"amount_due":       totalAmount,
+		"status":           invoiceStatus,
+		"journal_entry_id": journalEntryID,
+		"created_at":       now,
 	})
 }

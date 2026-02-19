@@ -461,7 +461,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		salesOrders.DELETE("/:id", middleware.RequirePermission("sales", "order", "delete"), h.DeleteSalesOrder)
 		salesOrders.POST("/:id/confirm", middleware.RequirePermission("sales", "order", "approve"), h.ConfirmSalesOrder)
 		salesOrders.POST("/:id/cancel", h.CancelSalesOrder)
-		salesOrders.POST(":id/invoice", h.CreateInvoiceFromOrder)
+		salesOrders.POST("/:id/invoice", h.CreateInvoiceFromOrder)
 	}
 
 	// Sales Delivery Orders (outbound shipments from sales orders)
