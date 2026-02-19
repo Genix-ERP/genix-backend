@@ -666,7 +666,7 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code = 'PURCHASE' AND deleted_at IS NULL`,
+		FROM journals WHERE tenant_id = $1 AND code IN ('PURCHASE', 'PUR') AND deleted_at IS NULL`,
 		tenantID,
 	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
 
@@ -948,7 +948,7 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	var numberPrefix sql.NullString
 	err = h.db.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND (code = 'CASH_DISBURSEMENTS' OR code = 'PURCHASE') AND deleted_at IS NULL LIMIT 1`,
+		FROM journals WHERE tenant_id = $1 AND (code IN ('CASH_DISBURSEMENTS', 'CASH', 'PURCHASE', 'PUR')) AND deleted_at IS NULL LIMIT 1`,
 		tenantID,
 	).Scan(&payJournalID, &nextNumber, &numberPrefix)
 
@@ -1189,7 +1189,7 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code = 'PURCHASE' AND deleted_at IS NULL`,
+		FROM journals WHERE tenant_id = $1 AND code IN ('PURCHASE', 'PUR') AND deleted_at IS NULL`,
 		tenantID,
 	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
 

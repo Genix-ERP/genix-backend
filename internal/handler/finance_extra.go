@@ -70,7 +70,7 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 			   ra.period_start, ra.period_end, ra.opening_balance,
 			   ra.our_debit_total, ra.our_credit_total, ra.our_balance,
 			   ra.partner_debit_total, ra.partner_credit_total, ra.partner_balance,
-			   ra.difference, ra.status, ra.notes, ra.created_at
+			   ra.discrepancy, ra.status, ra.notes, ra.created_at
 		FROM reconciliation_acts ra
 		LEFT JOIN contacts ct ON ra.partner_id = ct.id
 		WHERE ra.tenant_id = $1 AND ra.deleted_at IS NULL
@@ -222,7 +222,7 @@ func (h *Handler) CreateReconciliationAct(c *gin.Context) {
 			   ra.period_start, ra.period_end, ra.opening_balance,
 			   ra.our_debit_total, ra.our_credit_total, ra.our_balance,
 			   ra.partner_debit_total, ra.partner_credit_total, ra.partner_balance,
-			   ra.difference, ra.status, ra.notes, ra.created_at
+			   ra.discrepancy, ra.status, ra.notes, ra.created_at
 		FROM reconciliation_acts ra
 		LEFT JOIN contacts ct ON ra.partner_id = ct.id
 		WHERE ra.id = $1
@@ -270,7 +270,7 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 			   ra.period_start, ra.period_end, ra.opening_balance,
 			   ra.our_debit_total, ra.our_credit_total, ra.our_balance,
 			   ra.partner_debit_total, ra.partner_credit_total, ra.partner_balance,
-			   ra.difference, ra.status, ra.notes, ra.created_at
+			   ra.discrepancy, ra.status, ra.notes, ra.created_at
 		FROM reconciliation_acts ra
 		LEFT JOIN contacts ct ON ra.partner_id = ct.id
 		WHERE ra.id = $1 AND ra.tenant_id = $2 AND ra.deleted_at IS NULL

@@ -875,7 +875,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code = 'SALES' AND deleted_at IS NULL`,
+		FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
 		tenantID,
 	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
 	if err != nil {
@@ -1008,7 +1008,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 		journalEntryID, tenantID, organizationID, salesJournalID, entryNumber, invoiceDate, invoiceNumber, description,
-		"sales_invoice", invoiceID.String(), 1.0, totalDebit, totalCredit, userID, now, now,
+		"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, userID, now, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to create journal entry", "error", err)
@@ -1209,7 +1209,7 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code = 'CASH_RECEIPTS' AND deleted_at IS NULL`,
+		FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL`,
 		tenantID,
 	).Scan(&cashJournalID, &nextNumber, &numberPrefix)
 
@@ -1253,7 +1253,7 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
 			journalEntryID, tenantID, organizationID, cashJournalID, entryNumber, paymentDate, reference, description,
-			"payment_receipt", invoiceID.String(), 1.0, input.Amount, input.Amount, "posted", userID, now, now,
+			"payment_receipt", invoiceID, 1.0, input.Amount, input.Amount, "posted", userID, now, now,
 		)
 		if err != nil {
 			h.log.Error("Failed to create payment journal entry", "error", err)
@@ -1575,7 +1575,7 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code = 'SALES' AND deleted_at IS NULL`,
+		FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
 		tenantID,
 	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
 

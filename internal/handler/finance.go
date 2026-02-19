@@ -6578,10 +6578,12 @@ type CreateBudgetInput struct {
 }
 
 type CreateBudgetLineInput struct {
+	BudgetID       string   `json:"budget_id" binding:"required"`
 	AccountID      string   `json:"account_id" binding:"required"`
 	FiscalPeriodID *string  `json:"fiscal_period_id"`
 	DepartmentID   *string  `json:"department_id"`
-	BudgetedAmount float64  `json:"budgeted_amount" binding:"required"`
+	BudgetedAmount float64  `json:"budgeted_amount"`
+	PlannedAmount  float64  `json:"planned_amount"` // alias from frontend
 	ActualAmount   float64  `json:"actual_amount"`
 	Notes          *string  `json:"notes"`
 }
@@ -7214,6 +7216,12 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 		return
 	}
 
+	budgetID, err := uuid.Parse(input.BudgetID)
+	if err != nil {
+		response.BadRequest(c, "Invalid budget ID")
+		return
+	}
+
 	accountID, err := uuid.Parse(input.AccountID)
 	if err != nil {
 		response.BadRequest(c, "Invalid account ID")
@@ -7235,18 +7243,24 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 
 	// Verify budget exists and belongs to tenant
 	var budgetTenantID uuid.UUID
-	err = h.db.QueryRow("SELECT tenant_id FROM budgets WHERE id = $1", input.AccountID).Scan(&budgetTenantID)
+	err = h.db.QueryRow("SELECT tenant_id FROM budgets WHERE id = $1", budgetID).Scan(&budgetTenantID)
 	if err != nil || budgetTenantID != tenantID {
 		response.BadRequest(c, "Invalid budget")
 		return
+	}
+
+	// Accept either budgeted_amount or planned_amount from frontend
+	budgetedAmount := input.BudgetedAmount
+	if budgetedAmount == 0 && input.PlannedAmount > 0 {
+		budgetedAmount = input.PlannedAmount
 	}
 
 	_, err = h.db.Exec(`
 		INSERT INTO budget_lines (id, budget_id, account_id, fiscal_period_id, department_id,
 		                         budgeted_amount, actual_amount, notes, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, id, input.AccountID, accountID, fiscalPeriodID, deptID,
-		input.BudgetedAmount, input.ActualAmount, input.Notes, now, now)
+	`, id, budgetID, accountID, fiscalPeriodID, deptID,
+		budgetedAmount, input.ActualAmount, input.Notes, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create budget line", "error", err)
