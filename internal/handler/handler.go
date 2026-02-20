@@ -303,6 +303,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.GET("/valuation", h.GetInventoryValuation)
 	}
 
+	// Stock Counts (Inventarizatsiya)
+	stockCounts := rg.Group("/stock-counts")
+	stockCounts.Use(middleware.RequirePermission("inventory", "stock", "read"))
+	{
+		stockCounts.GET("", h.ListStockCounts)
+		stockCounts.POST("", middleware.RequirePermission("inventory", "stock", "create"), h.CreateStockCount)
+		stockCounts.GET("/:id", h.GetStockCount)
+		stockCounts.POST("/:id/record", middleware.RequirePermission("inventory", "stock", "adjust"), h.RecordCountLine)
+		stockCounts.POST("/:id/complete", middleware.RequirePermission("inventory", "stock", "adjust"), h.CompleteStockCount)
+		stockCounts.DELETE("/:id", middleware.RequirePermission("inventory", "stock", "delete"), h.DeleteStockCount)
+	}
+
 	// Product Attributes
 	productAttributes := rg.Group("/product-attributes")
 	productAttributes.Use(middleware.RequirePermission("inventory", "product_attribute", "read"))

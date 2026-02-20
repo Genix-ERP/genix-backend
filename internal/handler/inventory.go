@@ -4502,3 +4502,620 @@ func (h *Handler) GetReplenishmentPreview(c *gin.Context) {
 		"vendor_summaries": vendorSummaries,
 	})
 }
+
+// =====================================================
+// STOCK COUNT HANDLERS
+// =====================================================
+
+func (h *Handler) ListStockCounts(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	query := `
+		SELECT sc.id, sc.tenant_id, sc.warehouse_id, w.name as warehouse_name,
+			sc.count_number, sc.count_type, sc.count_date, sc.status, sc.notes,
+			sc.started_at, sc.completed_at, sc.approved_at,
+			sc.total_system_value, sc.total_counted_value, sc.total_variance_value,
+			sc.created_at, sc.updated_at,
+			(SELECT COUNT(*) FROM stock_count_lines WHERE stock_count_id = sc.id) as line_count,
+			(SELECT COUNT(*) FROM stock_count_lines WHERE stock_count_id = sc.id AND counted_quantity IS NOT NULL) as counted_count
+		FROM stock_counts sc
+		LEFT JOIN warehouses w ON sc.warehouse_id = w.id
+		WHERE sc.tenant_id = $1
+	`
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND sc.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+	if status := c.Query("status"); status != "" {
+		argCount++
+		query += fmt.Sprintf(" AND sc.status = $%d", argCount)
+		args = append(args, status)
+	}
+	if warehouseID := c.Query("warehouse_id"); warehouseID != "" {
+		argCount++
+		query += fmt.Sprintf(" AND sc.warehouse_id = $%d", argCount)
+		args = append(args, warehouseID)
+	}
+
+	query += " ORDER BY sc.created_at DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list stock counts", "error", err)
+		response.InternalError(c, "Failed to list stock counts")
+		return
+	}
+	defer rows.Close()
+
+	type StockCountResponse struct {
+		ID                 uuid.UUID  `json:"id"`
+		TenantID           uuid.UUID  `json:"tenant_id"`
+		WarehouseID        uuid.UUID  `json:"warehouse_id"`
+		WarehouseName      string     `json:"warehouse_name"`
+		CountNumber        string     `json:"count_number"`
+		CountType          string     `json:"count_type"`
+		CountDate          time.Time  `json:"count_date"`
+		Status             string     `json:"status"`
+		Notes              *string    `json:"notes,omitempty"`
+		StartedAt          *time.Time `json:"started_at,omitempty"`
+		CompletedAt        *time.Time `json:"completed_at,omitempty"`
+		ApprovedAt         *time.Time `json:"approved_at,omitempty"`
+		TotalSystemValue   float64    `json:"total_system_value"`
+		TotalCountedValue  float64    `json:"total_counted_value"`
+		TotalVarianceValue float64    `json:"total_variance_value"`
+		CreatedAt          time.Time  `json:"created_at"`
+		UpdatedAt          time.Time  `json:"updated_at"`
+		LineCount          int        `json:"line_count"`
+		CountedCount       int        `json:"counted_count"`
+	}
+
+	counts := make([]StockCountResponse, 0)
+	for rows.Next() {
+		var sc StockCountResponse
+		var notes sql.NullString
+		var startedAt, completedAt, approvedAt sql.NullTime
+		if err := rows.Scan(
+			&sc.ID, &sc.TenantID, &sc.WarehouseID, &sc.WarehouseName,
+			&sc.CountNumber, &sc.CountType, &sc.CountDate, &sc.Status, &notes,
+			&startedAt, &completedAt, &approvedAt,
+			&sc.TotalSystemValue, &sc.TotalCountedValue, &sc.TotalVarianceValue,
+			&sc.CreatedAt, &sc.UpdatedAt, &sc.LineCount, &sc.CountedCount,
+		); err != nil {
+			h.log.Error("Failed to scan stock count", "error", err)
+			continue
+		}
+		if notes.Valid {
+			sc.Notes = &notes.String
+		}
+		if startedAt.Valid {
+			sc.StartedAt = &startedAt.Time
+		}
+		if completedAt.Valid {
+			sc.CompletedAt = &completedAt.Time
+		}
+		if approvedAt.Valid {
+			sc.ApprovedAt = &approvedAt.Time
+		}
+		counts = append(counts, sc)
+	}
+
+	response.Success(c, counts)
+}
+
+func (h *Handler) GetStockCount(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid stock count ID")
+		return
+	}
+
+	// Get header
+	type StockCountResponse struct {
+		ID                 uuid.UUID   `json:"id"`
+		WarehouseID        uuid.UUID   `json:"warehouse_id"`
+		WarehouseName      string      `json:"warehouse_name"`
+		CountNumber        string      `json:"count_number"`
+		CountType          string      `json:"count_type"`
+		CountDate          time.Time   `json:"count_date"`
+		Status             string      `json:"status"`
+		Notes              *string     `json:"notes,omitempty"`
+		StartedAt          *time.Time  `json:"started_at,omitempty"`
+		CompletedAt        *time.Time  `json:"completed_at,omitempty"`
+		TotalSystemValue   float64     `json:"total_system_value"`
+		TotalCountedValue  float64     `json:"total_counted_value"`
+		TotalVarianceValue float64     `json:"total_variance_value"`
+		CreatedAt          time.Time   `json:"created_at"`
+		Lines              interface{} `json:"lines"`
+	}
+
+	var sc StockCountResponse
+	var notes sql.NullString
+	var startedAt, completedAt sql.NullTime
+
+	err = h.db.QueryRow(`
+		SELECT sc.id, sc.warehouse_id, w.name, sc.count_number, sc.count_type, sc.count_date,
+			sc.status, sc.notes, sc.started_at, sc.completed_at,
+			sc.total_system_value, sc.total_counted_value, sc.total_variance_value, sc.created_at
+		FROM stock_counts sc
+		LEFT JOIN warehouses w ON sc.warehouse_id = w.id
+		WHERE sc.id = $1 AND sc.tenant_id = $2
+	`, id, tenantID).Scan(
+		&sc.ID, &sc.WarehouseID, &sc.WarehouseName, &sc.CountNumber, &sc.CountType, &sc.CountDate,
+		&sc.Status, &notes, &startedAt, &completedAt,
+		&sc.TotalSystemValue, &sc.TotalCountedValue, &sc.TotalVarianceValue, &sc.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock count")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get stock count", "error", err)
+		response.InternalError(c, "Failed to get stock count")
+		return
+	}
+	if notes.Valid {
+		sc.Notes = &notes.String
+	}
+	if startedAt.Valid {
+		sc.StartedAt = &startedAt.Time
+	}
+	if completedAt.Valid {
+		sc.CompletedAt = &completedAt.Time
+	}
+
+	// Get lines
+	type LineResponse struct {
+		ID               uuid.UUID  `json:"id"`
+		ProductID        uuid.UUID  `json:"product_id"`
+		ProductName      string     `json:"product_name"`
+		ProductCode      string     `json:"product_code"`
+		SystemQuantity   float64    `json:"system_quantity"`
+		CountedQuantity  *float64   `json:"counted_quantity"`
+		VarianceQuantity float64    `json:"variance_quantity"`
+		UnitCost         *float64   `json:"unit_cost,omitempty"`
+		Status           string     `json:"status"`
+		Notes            *string    `json:"notes,omitempty"`
+	}
+
+	lineRows, err := h.db.Query(`
+		SELECT scl.id, scl.product_id, COALESCE(p.name,''), COALESCE(p.code,''),
+			scl.system_quantity, scl.counted_quantity, scl.variance_quantity,
+			scl.unit_cost, scl.status, scl.notes
+		FROM stock_count_lines scl
+		LEFT JOIN products p ON scl.product_id = p.id
+		WHERE scl.stock_count_id = $1
+		ORDER BY COALESCE(p.name,'')
+	`, id)
+	if err != nil {
+		h.log.Error("Failed to get stock count lines", "error", err)
+		sc.Lines = []LineResponse{}
+	} else {
+		defer lineRows.Close()
+		lines := make([]LineResponse, 0)
+		for lineRows.Next() {
+			var l LineResponse
+			var countedQty, unitCost sql.NullFloat64
+			var lineNotes sql.NullString
+			if err := lineRows.Scan(
+				&l.ID, &l.ProductID, &l.ProductName, &l.ProductCode,
+				&l.SystemQuantity, &countedQty, &l.VarianceQuantity,
+				&unitCost, &l.Status, &lineNotes,
+			); err != nil {
+				continue
+			}
+			if countedQty.Valid {
+				l.CountedQuantity = &countedQty.Float64
+			}
+			if unitCost.Valid {
+				l.UnitCost = &unitCost.Float64
+			}
+			if lineNotes.Valid {
+				l.Notes = &lineNotes.String
+			}
+			lines = append(lines, l)
+		}
+		sc.Lines = lines
+	}
+
+	response.Success(c, sc)
+}
+
+func (h *Handler) CreateStockCount(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
+
+	var input entity.CreateStockCountInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	warehouseID, err := uuid.Parse(input.WarehouseID)
+	if err != nil {
+		response.BadRequest(c, "Invalid warehouse ID")
+		return
+	}
+
+	countDate, err := time.Parse("2006-01-02", input.CountDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid count_date format")
+		return
+	}
+
+	countType := input.CountType
+	if countType == "" {
+		countType = "full"
+	}
+
+	// Generate count number
+	var nextNum int
+	h.db.QueryRow("SELECT COALESCE(MAX(CAST(SUBSTRING(count_number FROM 'INV-[0-9]+-([0-9]+)') AS INTEGER)),0)+1 FROM stock_counts WHERE tenant_id=$1", tenantID).Scan(&nextNum)
+	if nextNum == 0 {
+		nextNum = 1
+	}
+	countNumber := fmt.Sprintf("INV-%d-%03d", countDate.Year(), nextNum)
+
+	id := uuid.New()
+	now := time.Now()
+
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+	var notes *string
+	if input.Notes != "" {
+		notes = &input.Notes
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to create stock count")
+		return
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
+		INSERT INTO stock_counts (id, tenant_id, organization_id, warehouse_id, count_number, count_type, count_date, status, notes, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', $8, $9, $10, $10)
+	`, id, tenantID, orgIDPtr, warehouseID, countNumber, countType, countDate, notes, userID, now)
+	if err != nil {
+		h.log.Error("Failed to create stock count", "error", err)
+		response.InternalError(c, "Failed to create stock count")
+		return
+	}
+
+	// Auto-populate lines from current inventory for this warehouse
+	invRows, err := tx.Query(`
+		SELECT i.product_id, i.quantity_on_hand, COALESCE(i.unit_cost, 0)
+		FROM inventory i
+		JOIN products p ON i.product_id = p.id AND p.deleted_at IS NULL
+		WHERE i.tenant_id = $1 AND i.warehouse_id = $2 AND i.quantity_on_hand != 0
+		ORDER BY p.name
+	`, tenantID, warehouseID)
+	if err != nil {
+		h.log.Error("Failed to query inventory for stock count", "error", err)
+	} else {
+		defer invRows.Close()
+		for invRows.Next() {
+			var productID uuid.UUID
+			var qty, cost float64
+			if err := invRows.Scan(&productID, &qty, &cost); err != nil {
+				continue
+			}
+			sysValue := qty * cost
+			lineID := uuid.New()
+			tx.Exec(`
+				INSERT INTO stock_count_lines (id, stock_count_id, product_id, system_quantity, unit_cost, system_value, status, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $7)
+			`, lineID, id, productID, qty, cost, sysValue, now)
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to create stock count")
+		return
+	}
+
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: id.String()})
+	h.GetStockCount(c)
+}
+
+func (h *Handler) RecordCountLine(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	countID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid stock count ID")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.RecordCountLineInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Verify the stock count exists and is not completed
+	var status string
+	err = h.db.QueryRow("SELECT status FROM stock_counts WHERE id=$1 AND tenant_id=$2", countID, tenantID).Scan(&status)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock count")
+		return
+	}
+	if status == "completed" || status == "cancelled" {
+		response.BadRequest(c, "Cannot update a "+status+" stock count")
+		return
+	}
+
+	productID, err := uuid.Parse(input.ProductID)
+	if err != nil {
+		response.BadRequest(c, "Invalid product ID")
+		return
+	}
+
+	now := time.Now()
+	var notes *string
+	if input.Notes != "" {
+		notes = &input.Notes
+	}
+
+	// Try to update existing line
+	result, err := h.db.Exec(`
+		UPDATE stock_count_lines SET
+			counted_quantity = $1, status = 'counted', counted_by = $2, counted_at = $3, notes = $4, updated_at = $3
+		WHERE stock_count_id = $5 AND product_id = $6
+	`, input.CountedQuantity, userID, now, notes, countID, productID)
+
+	if err != nil {
+		h.log.Error("Failed to record count line", "error", err)
+		response.InternalError(c, "Failed to record count line")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// Line doesn't exist — create it
+		lineID := uuid.New()
+		_, err = h.db.Exec(`
+			INSERT INTO stock_count_lines (id, stock_count_id, product_id, system_quantity, counted_quantity, unit_cost, status, counted_by, counted_at, notes, created_at, updated_at)
+			VALUES ($1, $2, $3, 0, $4, 0, 'counted', $5, $6, $7, $6, $6)
+		`, lineID, countID, productID, input.CountedQuantity, userID, now, notes)
+		if err != nil {
+			h.log.Error("Failed to insert count line", "error", err)
+			response.InternalError(c, "Failed to record count line")
+			return
+		}
+	}
+
+	// Update count status to in_progress if still draft
+	h.db.Exec("UPDATE stock_counts SET status = 'in_progress', started_at = COALESCE(started_at, $1), started_by = COALESCE(started_by, $2), updated_at = $1 WHERE id = $3 AND status = 'draft'", now, userID, countID)
+
+	response.Success(c, gin.H{"message": "Count recorded"})
+}
+
+func (h *Handler) CompleteStockCount(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	countID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid stock count ID")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
+
+	// Get stock count
+	var warehouseID uuid.UUID
+	var countNumber, status string
+	err = h.db.QueryRow("SELECT warehouse_id, count_number, status FROM stock_counts WHERE id=$1 AND tenant_id=$2", countID, tenantID).Scan(&warehouseID, &countNumber, &status)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock count")
+		return
+	}
+	if status == "completed" || status == "cancelled" {
+		response.BadRequest(c, "Stock count already "+status)
+		return
+	}
+
+	// Get lines with variance
+	type varianceLine struct {
+		ProductID  uuid.UUID
+		Variance   float64
+		UnitCost   float64
+	}
+
+	rows, err := h.db.Query(`
+		SELECT product_id, variance_quantity, COALESCE(unit_cost, 0)
+		FROM stock_count_lines
+		WHERE stock_count_id = $1 AND counted_quantity IS NOT NULL AND variance_quantity != 0
+	`, countID)
+	if err != nil {
+		h.log.Error("Failed to get variance lines", "error", err)
+		response.InternalError(c, "Failed to complete stock count")
+		return
+	}
+	defer rows.Close()
+
+	var lines []varianceLine
+	for rows.Next() {
+		var l varianceLine
+		if err := rows.Scan(&l.ProductID, &l.Variance, &l.UnitCost); err != nil {
+			continue
+		}
+		lines = append(lines, l)
+	}
+
+	now := time.Now()
+
+	// Create inventory adjustments for each variance line
+	for _, line := range lines {
+		var orgIDPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgIDPtr = &orgID
+		}
+
+		// Find or create inventory record
+		var inventoryID uuid.UUID
+		err = h.db.QueryRow(`
+			SELECT id FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+		`, tenantID, line.ProductID, warehouseID).Scan(&inventoryID)
+
+		if err == sql.ErrNoRows {
+			inventoryID = uuid.New()
+			h.db.Exec(`
+				INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8)
+			`, inventoryID, tenantID, orgIDPtr, line.ProductID, warehouseID, line.Variance, line.UnitCost, now)
+		} else if err == nil {
+			h.db.Exec(`
+				UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
+			`, line.Variance, now, inventoryID)
+		}
+
+		// Create inventory transaction
+		transactionID := uuid.New()
+		reason := fmt.Sprintf("Stock count %s", countNumber)
+		h.db.Exec(`
+			INSERT INTO inventory_transactions (
+				id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
+				unit_cost, total_cost, reason, notes, transaction_date, created_by, created_at
+			) VALUES ($1, $2, $3, $4, 'adjustment', $5, $6, $7, $8, $9, $10, $11, $10)
+		`, transactionID, tenantID, orgIDPtr, inventoryID, line.Variance,
+			line.UnitCost, math.Abs(line.Variance)*line.UnitCost, reason,
+			"Inventory count adjustment: "+countNumber, now, userID)
+	}
+
+	// Create journal entry for total variance
+	totalVarianceValue := 0.0
+	for _, line := range lines {
+		totalVarianceValue += math.Abs(line.Variance) * line.UnitCost
+	}
+	if totalVarianceValue > 0 {
+		var orgIDPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgIDPtr = &orgID
+		}
+
+		var journalID uuid.UUID
+		var nextNumber int
+		h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE WHEN code='INVENTORY' THEN 0 WHEN code='MISC' THEN 1 ELSE 2 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+
+		if journalID != uuid.Nil {
+			entryID := uuid.New()
+			entryNumber := fmt.Sprintf("ADJ%06d", nextNumber)
+			description := fmt.Sprintf("Inventory Count Adjustment: %s", countNumber)
+
+			h.db.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+					description, source_type, source_id, status, total_debit, total_credit,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_count', $8, 'posted', $9, $9, $10, $11, $11)
+			`, entryID, tenantID, orgIDPtr, journalID, entryNumber, now,
+				description, countID.String(), totalVarianceValue, userID, now)
+
+			// Debit: Stock Adjustment Expense
+			adjustAcct := findAccount(h.db, tenantID, orgIDPtr, "stock adjustment", "6910")
+			if adjustAcct == uuid.Nil {
+				adjustAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory adjustment", "6910")
+			}
+			// Credit: Stock Valuation
+			stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+			if stockAcct == uuid.Nil {
+				stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1300")
+			}
+
+			if adjustAcct != uuid.Nil && stockAcct != uuid.Nil {
+				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Count Adjustment', $4, 0, 1, $5)`,
+					uuid.New(), entryID, adjustAcct, totalVarianceValue, now)
+				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Valuation', 0, $4, 2, $5)`,
+					uuid.New(), entryID, stockAcct, totalVarianceValue, now)
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalVarianceValue, now, adjustAcct)
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalVarianceValue, now, stockAcct)
+			}
+
+			h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+			h.db.Exec("UPDATE stock_counts SET adjustment_journal_id = $1 WHERE id = $2", entryID, countID)
+		}
+	}
+
+	// Update totals on stock count
+	h.db.Exec(`
+		UPDATE stock_counts SET
+			status = 'completed', completed_at = $1, completed_by = $2,
+			total_system_value = COALESCE((SELECT SUM(COALESCE(system_value,0)) FROM stock_count_lines WHERE stock_count_id = $3), 0),
+			total_counted_value = COALESCE((SELECT SUM(COALESCE(counted_value, counted_quantity * COALESCE(unit_cost,0), 0)) FROM stock_count_lines WHERE stock_count_id = $3), 0),
+			total_variance_value = COALESCE((SELECT SUM(ABS(variance_quantity) * COALESCE(unit_cost,0)) FROM stock_count_lines WHERE stock_count_id = $3 AND variance_quantity != 0), 0),
+			updated_at = $1
+		WHERE id = $3
+	`, now, userID, countID)
+
+	// Update line statuses
+	h.db.Exec("UPDATE stock_count_lines SET status = 'adjusted' WHERE stock_count_id = $1 AND variance_quantity != 0 AND counted_quantity IS NOT NULL", countID)
+
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: countID.String()})
+	h.GetStockCount(c)
+}
+
+func (h *Handler) DeleteStockCount(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid stock count ID")
+		return
+	}
+
+	var status string
+	err = h.db.QueryRow("SELECT status FROM stock_counts WHERE id=$1 AND tenant_id=$2", id, tenantID).Scan(&status)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock count")
+		return
+	}
+	if status == "completed" {
+		response.BadRequest(c, "Cannot delete a completed stock count")
+		return
+	}
+
+	// Delete lines first, then header
+	h.db.Exec("DELETE FROM stock_count_lines WHERE stock_count_id = $1", id)
+	h.db.Exec("DELETE FROM stock_counts WHERE id = $1 AND tenant_id = $2", id, tenantID)
+
+	response.NoContent(c)
+}
