@@ -500,7 +500,7 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 
 	// Get journal
 	var journalID uuid.UUID
-	h.db.QueryRow("SELECT id FROM journals WHERE tenant_id = $1 AND code = 'SALES' AND deleted_at IS NULL", tenantID).Scan(&journalID)
+	h.db.QueryRow("SELECT id FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL", tenantID).Scan(&journalID)
 
 	if arAccountID != uuid.Nil && revenueAccountID != uuid.Nil && journalID != uuid.Nil {
 		// Generate entry number
@@ -773,7 +773,7 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 
 		// Get journal
 		var journalID uuid.UUID
-		h.db.QueryRow("SELECT id FROM journals WHERE tenant_id = $1 AND code = 'CASH_RECEIPTS' AND deleted_at IS NULL", tenantID).Scan(&journalID)
+		h.db.QueryRow("SELECT id FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL", tenantID).Scan(&journalID)
 
 		if arAccountID != uuid.Nil && cashAccountID != uuid.Nil && journalID != uuid.Nil {
 			// Generate entry number

@@ -1032,6 +1032,8 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	query := `
 		SELECT id, code, name, type,
 			COALESCE(description, ''),
+			default_debit_account_id,
+			default_credit_account_id,
 			COALESCE(auto_sequence, false),
 			COALESCE(next_number, 1),
 			COALESCE(number_prefix, ''),
@@ -1052,23 +1054,25 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	defer rows.Close()
 
 	type JournalResponse struct {
-		ID           uuid.UUID `json:"id"`
-		Code         string    `json:"code"`
-		Name         string    `json:"name"`
-		Type         string    `json:"type"`
-		Description  string    `json:"description,omitempty"`
-		AutoSequence bool      `json:"auto_sequence"`
-		NextNumber   int       `json:"next_number"`
-		NumberPrefix string    `json:"number_prefix,omitempty"`
-		IsActive     bool      `json:"is_active"`
-		CreatedAt    time.Time `json:"created_at"`
-		UpdatedAt    time.Time `json:"updated_at"`
+		ID                     uuid.UUID  `json:"id"`
+		Code                   string     `json:"code"`
+		Name                   string     `json:"name"`
+		Type                   string     `json:"type"`
+		Description            string     `json:"description,omitempty"`
+		DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty"`
+		DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty"`
+		AutoSequence           bool       `json:"auto_sequence"`
+		NextNumber             int        `json:"next_number"`
+		NumberPrefix           string     `json:"number_prefix,omitempty"`
+		IsActive               bool       `json:"is_active"`
+		CreatedAt              time.Time  `json:"created_at"`
+		UpdatedAt              time.Time  `json:"updated_at"`
 	}
 
 	journals := make([]JournalResponse, 0)
 	for rows.Next() {
 		var j JournalResponse
-		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.Description, &j.AutoSequence, &j.NextNumber, &j.NumberPrefix, &j.IsActive, &j.CreatedAt, &j.UpdatedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.Description, &j.DefaultDebitAccountID, &j.DefaultCreditAccountID, &j.AutoSequence, &j.NextNumber, &j.NumberPrefix, &j.IsActive, &j.CreatedAt, &j.UpdatedAt); err != nil {
 			h.log.Error("Failed to scan journal", "error", err)
 			continue
 		}
@@ -6578,10 +6582,12 @@ type CreateBudgetInput struct {
 }
 
 type CreateBudgetLineInput struct {
+	BudgetID       string   `json:"budget_id" binding:"required"`
 	AccountID      string   `json:"account_id" binding:"required"`
 	FiscalPeriodID *string  `json:"fiscal_period_id"`
 	DepartmentID   *string  `json:"department_id"`
-	BudgetedAmount float64  `json:"budgeted_amount" binding:"required"`
+	BudgetedAmount float64  `json:"budgeted_amount"`
+	PlannedAmount  float64  `json:"planned_amount"` // alias from frontend
 	ActualAmount   float64  `json:"actual_amount"`
 	Notes          *string  `json:"notes"`
 }
@@ -7214,6 +7220,12 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 		return
 	}
 
+	budgetID, err := uuid.Parse(input.BudgetID)
+	if err != nil {
+		response.BadRequest(c, "Invalid budget ID")
+		return
+	}
+
 	accountID, err := uuid.Parse(input.AccountID)
 	if err != nil {
 		response.BadRequest(c, "Invalid account ID")
@@ -7235,18 +7247,24 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 
 	// Verify budget exists and belongs to tenant
 	var budgetTenantID uuid.UUID
-	err = h.db.QueryRow("SELECT tenant_id FROM budgets WHERE id = $1", input.AccountID).Scan(&budgetTenantID)
+	err = h.db.QueryRow("SELECT tenant_id FROM budgets WHERE id = $1", budgetID).Scan(&budgetTenantID)
 	if err != nil || budgetTenantID != tenantID {
 		response.BadRequest(c, "Invalid budget")
 		return
+	}
+
+	// Accept either budgeted_amount or planned_amount from frontend
+	budgetedAmount := input.BudgetedAmount
+	if budgetedAmount == 0 && input.PlannedAmount > 0 {
+		budgetedAmount = input.PlannedAmount
 	}
 
 	_, err = h.db.Exec(`
 		INSERT INTO budget_lines (id, budget_id, account_id, fiscal_period_id, department_id,
 		                         budgeted_amount, actual_amount, notes, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, id, input.AccountID, accountID, fiscalPeriodID, deptID,
-		input.BudgetedAmount, input.ActualAmount, input.Notes, now, now)
+	`, id, budgetID, accountID, fiscalPeriodID, deptID,
+		budgetedAmount, input.ActualAmount, input.Notes, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create budget line", "error", err)
@@ -7856,6 +7874,12 @@ func (h *Handler) UpdateRecurringJournalTemplate(c *gin.Context) {
 		Description   string `json:"description"`
 		Frequency     string `json:"frequency"`
 		IntervalCount int    `json:"interval_count"`
+		StartDate     string `json:"start_date"`
+		EndDate       string `json:"end_date"`
+		NextRunDate   string `json:"next_run_date"`
+		DayOfMonth    *int   `json:"day_of_month"`
+		DayOfWeek     *int   `json:"day_of_week"`
+		MonthOfYear   *int   `json:"month_of_year"`
 		IsActive      *bool  `json:"is_active"`
 		AutoPost      *bool  `json:"auto_post"`
 		Lines         []struct {
@@ -7919,6 +7943,57 @@ func (h *Handler) UpdateRecurringJournalTemplate(c *gin.Context) {
 	if input.AutoPost != nil {
 		updates = append(updates, fmt.Sprintf("auto_post = $%d", argCount))
 		args = append(args, *input.AutoPost)
+		argCount++
+	}
+	if input.StartDate != "" {
+		startDate, err := time.Parse("2006-01-02", input.StartDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid start_date format, use YYYY-MM-DD")
+			return
+		}
+		updates = append(updates, fmt.Sprintf("start_date = $%d", argCount))
+		args = append(args, startDate)
+		argCount++
+		// If next_run_date is not explicitly provided, update it to the new start_date
+		if input.NextRunDate == "" {
+			updates = append(updates, fmt.Sprintf("next_run_date = $%d", argCount))
+			args = append(args, startDate)
+			argCount++
+		}
+	}
+	if input.NextRunDate != "" {
+		nextRunDate, err := time.Parse("2006-01-02", input.NextRunDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid next_run_date format, use YYYY-MM-DD")
+			return
+		}
+		updates = append(updates, fmt.Sprintf("next_run_date = $%d", argCount))
+		args = append(args, nextRunDate)
+		argCount++
+	}
+	if input.EndDate != "" {
+		endDate, err := time.Parse("2006-01-02", input.EndDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid end_date format, use YYYY-MM-DD")
+			return
+		}
+		updates = append(updates, fmt.Sprintf("end_date = $%d", argCount))
+		args = append(args, endDate)
+		argCount++
+	}
+	if input.DayOfMonth != nil {
+		updates = append(updates, fmt.Sprintf("day_of_month = $%d", argCount))
+		args = append(args, *input.DayOfMonth)
+		argCount++
+	}
+	if input.DayOfWeek != nil {
+		updates = append(updates, fmt.Sprintf("day_of_week = $%d", argCount))
+		args = append(args, *input.DayOfWeek)
+		argCount++
+	}
+	if input.MonthOfYear != nil {
+		updates = append(updates, fmt.Sprintf("month_of_year = $%d", argCount))
+		args = append(args, *input.MonthOfYear)
 		argCount++
 	}
 
