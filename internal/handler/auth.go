@@ -834,11 +834,51 @@ func (h *Handler) ForgotPassword(c *gin.Context) {
 	}
 
 	// Always return success to prevent email enumeration
-	// In production, send email with reset link
+	successMsg := "If an account exists with this email, you will receive a password reset link"
 
-	response.Success(c, gin.H{
-		"message": "If an account exists with this email, you will receive a password reset link",
-	})
+	// Look up user by email
+	var userID uuid.UUID
+	var firstName string
+	err := h.db.QueryRow(`
+		SELECT id, first_name FROM users
+		WHERE email = $1 AND deleted_at IS NULL
+		LIMIT 1
+	`, strings.ToLower(strings.TrimSpace(input.Email))).Scan(&userID, &firstName)
+
+	if err != nil {
+		// User not found — return success anyway to prevent enumeration
+		response.Success(c, gin.H{"message": successMsg})
+		return
+	}
+
+	// Generate reset token
+	resetToken := uuid.New().String() + "-" + uuid.New().String()
+	expiresAt := time.Now().Add(1 * time.Hour)
+
+	// Store token in DB
+	_, err = h.db.Exec(`
+		UPDATE users SET
+			password_reset_token = $1,
+			password_reset_token_expires = $2,
+			updated_at = NOW()
+		WHERE id = $3
+	`, resetToken, expiresAt, userID)
+
+	if err != nil {
+		h.log.Error("Failed to store password reset token", "error", err)
+		response.Success(c, gin.H{"message": successMsg})
+		return
+	}
+
+	// Build reset link and send email
+	resetLink := h.config.App.FrontendURL + "/reset-password?token=" + resetToken
+
+	if err := h.emailService.SendPasswordReset(input.Email, firstName, resetLink); err != nil {
+		h.log.Error("Failed to send password reset email", "error", err, "email", input.Email)
+		// Don't fail — token is stored, could be resent
+	}
+
+	response.Success(c, gin.H{"message": successMsg})
 }
 
 // ResetPassword handles password reset
@@ -849,8 +889,47 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 		return
 	}
 
-	// TODO: Validate reset token and update password
-	// This requires a password_reset_tokens table
+	// Look up user by valid, non-expired token
+	var userID uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT id FROM users
+		WHERE password_reset_token = $1
+		  AND password_reset_token_expires > NOW()
+		  AND deleted_at IS NULL
+	`, input.Token).Scan(&userID)
+
+	if err != nil {
+		response.BadRequest(c, "Invalid or expired reset token")
+		return
+	}
+
+	// Hash the new password
+	hashedPassword, err := crypto.HashPassword(input.NewPassword)
+	if err != nil {
+		h.log.Error("Failed to hash password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Update password and clear reset token
+	_, err = h.db.Exec(`
+		UPDATE users SET
+			password_hash = $1,
+			password_reset_token = NULL,
+			password_reset_token_expires = NULL,
+			password_changed_at = NOW(),
+			updated_at = NOW()
+		WHERE id = $2
+	`, hashedPassword, userID)
+
+	if err != nil {
+		h.log.Error("Failed to reset password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Revoke all refresh tokens for security
+	h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", userID)
 
 	response.Success(c, gin.H{"message": "Password reset successfully"})
 }
