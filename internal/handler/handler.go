@@ -622,6 +622,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseOrders.POST("/:id/submit", middleware.RequirePermission("purchase", "order", "update"), h.SubmitPOForApproval)
 		purchaseOrders.POST("/:id/approve", middleware.RequirePermission("purchase", "order", "approve"), h.ApprovePurchaseOrder)
 		purchaseOrders.POST("/:id/receive", h.ReceivePurchaseOrder)
+		purchaseOrders.POST("/:id/bill", middleware.RequirePermission("purchase", "invoice", "create"), h.CreateBillFromPO)
 	}
 
 	// Purchase Invoices (Vendor Bills)

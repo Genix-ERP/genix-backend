@@ -951,8 +951,6 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 			WHERE po.id = $1
 		`, id).Scan(&poTotal, &poNumber, &poVendorName, &poVendorID)
 
-		var jeEntryID uuid.UUID // will be set if JE is created, used by vendor bill
-
 		if poTotal > 0 {
 			var orgIDPtr *uuid.UUID
 			if poOrgID.Valid && poOrgID.String != "" {
@@ -1037,7 +1035,6 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 
 				if journalID != uuid.Nil {
 					entryID := uuid.New()
-					jeEntryID = entryID
 					entryNumber := fmt.Sprintf("PUR%06d", nextNumber)
 					vendorName := ""
 					if poVendorName.Valid {
@@ -1098,96 +1095,7 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 			}
 		}
 
-		// ============================================
-		// CREATE VENDOR BILL (purchase_invoice) from PO
-		// ============================================
-		var vendorID uuid.UUID
-		var poSubtotal, poTaxAmt float64
-		h.db.QueryRow(`
-			SELECT vendor_id, COALESCE(subtotal, total_amount), COALESCE(tax_amount, 0)
-			FROM purchase_orders WHERE id = $1
-		`, id).Scan(&vendorID, &poSubtotal, &poTaxAmt)
-
-		if vendorID != uuid.Nil && poTotal > 0 {
-			// Check if a bill already exists for this PO
-			var existingBillID uuid.UUID
-			h.db.QueryRow(`
-				SELECT id FROM purchase_invoices
-				WHERE purchase_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-				LIMIT 1
-			`, id, tenantID).Scan(&existingBillID)
-
-			if existingBillID == uuid.Nil {
-				billID := uuid.New()
-				invoiceNumber := fmt.Sprintf("BILL-%s-%s", now.Format("20060102"), billID.String()[:6])
-
-				var orgIDForBill *uuid.UUID
-				if poOrgID.Valid && poOrgID.String != "" {
-					parsed, _ := uuid.Parse(poOrgID.String)
-					if parsed != uuid.Nil {
-						orgIDForBill = &parsed
-					}
-				}
-
-				dueDate := now.AddDate(0, 0, 30) // 30 days payment term
-
-				var jePtr *uuid.UUID
-				if jeEntryID != uuid.Nil {
-					jePtr = &jeEntryID
-				}
-				createdBy, _ := middleware.GetUserID(c)
-				var createdByPtr *uuid.UUID
-				if createdBy != uuid.Nil {
-					createdByPtr = &createdBy
-				}
-
-				h.db.Exec(`
-					INSERT INTO purchase_invoices (
-						id, tenant_id, organization_id, invoice_number, vendor_id,
-						purchase_order_id, invoice_date, due_date,
-						subtotal, tax_amount, total_amount, amount_paid,
-						status, payment_status, three_way_match_status,
-						journal_entry_id, notes, created_by, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'confirmed', 'unpaid', 'matched', $12, $13, $14, $15, $15)
-				`, billID, tenantID, orgIDForBill, invoiceNumber, vendorID,
-					id, now, dueDate,
-					poSubtotal, poTaxAmt, poTotal,
-					jePtr,
-					fmt.Sprintf("Auto-generated from PO %s", poNumber), createdByPtr, now)
-
-				// Create bill lines from PO lines
-				billLines, _ := h.db.Query(`
-					SELECT id, product_id, description, quantity, unit_price, COALESCE(tax_amount, 0), COALESCE(line_total, quantity * unit_price)
-					FROM purchase_order_lines
-					WHERE purchase_order_id = $1
-				`, id)
-				if billLines != nil {
-					lineNum := 0
-					for billLines.Next() {
-						var polID uuid.UUID
-						var productID *uuid.UUID
-						var desc string
-						var qty, unitPrice, lineTax, lineTotal float64
-						if err := billLines.Scan(&polID, &productID, &desc, &qty, &unitPrice, &lineTax, &lineTotal); err != nil {
-							continue
-						}
-						lineNum++
-						h.db.Exec(`
-							INSERT INTO purchase_invoice_lines (
-								id, purchase_invoice_id, purchase_order_line_id, line_number,
-								product_id, description, quantity, unit_price,
-								tax_amount, line_total, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-						`, uuid.New(), billID, polID, lineNum,
-							productID, desc, qty, unitPrice, lineTax, lineTotal, now)
-					}
-					billLines.Close()
-				}
-
-				h.log.Info("Vendor bill created from PO received", "bill_id", billID, "po_id", id)
-			}
 		}
-	}
 
 	response.Success(c, gin.H{"message": "Purchase order updated successfully"})
 }
@@ -1609,5 +1517,288 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 	response.Success(c, gin.H{
 		"message": "Goods received successfully",
 		"status":  newStatus,
+	})
+}
+
+// CreateBillFromPO creates a vendor bill (purchase invoice) from a purchase order
+// @Summary Create vendor bill from purchase order
+// @Description Create a new vendor bill from an existing purchase order
+// @Tags Purchase
+// @Accept json
+// @Produce json
+// @Param id path string true "Purchase order ID"
+// @Success 201 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /purchase-orders/{id}/bill [post]
+func (h *Handler) CreateBillFromPO(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	poID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid purchase order ID")
+		return
+	}
+
+	// Get PO details
+	var vendorID uuid.UUID
+	var organizationID *uuid.UUID
+	var poNumber string
+	var subtotal, taxAmount, totalAmount float64
+	var currentStatus string
+	var orgIDStr sql.NullString
+
+	err = h.db.QueryRow(`
+		SELECT po.vendor_id, po.organization_id, po.order_number,
+		       COALESCE(po.subtotal, po.total_amount), COALESCE(po.tax_amount, 0), COALESCE(po.total_amount, 0),
+		       po.status
+		FROM purchase_orders po
+		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL`,
+		poID, tenantID).Scan(
+		&vendorID, &orgIDStr, &poNumber, &subtotal, &taxAmount, &totalAmount, &currentStatus,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Purchase order")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to fetch purchase order", "error", err, "po_id", poID)
+		response.InternalError(c, "Failed to fetch purchase order")
+		return
+	}
+
+	// Only allow bill creation from confirmed or received orders
+	if currentStatus != "confirmed" && currentStatus != "received" && currentStatus != "partial" {
+		response.BadRequest(c, "Can only create bill from confirmed, partially received, or received orders")
+		return
+	}
+
+	// Check if a bill already exists for this PO (prevent duplicates)
+	var existingBillCount int
+	h.db.QueryRow(`
+		SELECT COUNT(*) FROM purchase_invoices
+		WHERE purchase_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status != 'cancelled'`,
+		poID, tenantID).Scan(&existingBillCount)
+	if existingBillCount > 0 {
+		response.BadRequest(c, "A bill already exists for this purchase order")
+		return
+	}
+
+	// Parse organization ID
+	if orgIDStr.Valid && orgIDStr.String != "" {
+		parsed, _ := uuid.Parse(orgIDStr.String)
+		if parsed != uuid.Nil {
+			organizationID = &parsed
+		}
+	}
+
+	billID := uuid.New()
+	invoiceNumber := fmt.Sprintf("BILL-%s-%s", time.Now().Format("20060102"), uuid.New().String()[:6])
+	now := time.Now()
+	dueDate := now.AddDate(0, 0, 30) // 30 days payment term
+
+	var createdBy *uuid.UUID
+	if userID != uuid.Nil {
+		createdBy = &userID
+	}
+
+	// Use a transaction for bill creation + GL posting
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Create vendor bill
+	_, err = tx.Exec(`
+		INSERT INTO purchase_invoices (
+			id, tenant_id, organization_id, invoice_number, vendor_id,
+			purchase_order_id, invoice_date, due_date,
+			subtotal, tax_amount, total_amount, amount_paid,
+			status, payment_status, three_way_match_status,
+			notes, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'confirmed', 'unpaid', 'matched', $12, $13, $14, $14)`,
+		billID, tenantID, organizationID, invoiceNumber, vendorID,
+		poID, now, dueDate,
+		subtotal, taxAmount, totalAmount,
+		fmt.Sprintf("Created from PO %s", poNumber), createdBy, now)
+	if err != nil {
+		h.log.Error("Failed to create vendor bill", "error", err)
+		response.InternalError(c, "Failed to create vendor bill")
+		return
+	}
+
+	// Copy PO lines to bill lines — collect first, then insert
+	type poLine struct {
+		ID        uuid.UUID
+		ProductID *uuid.UUID
+		Desc      string
+		Qty       float64
+		UnitPrice float64
+		TaxAmt    float64
+		LineTotal float64
+	}
+	var poLines []poLine
+
+	linesRows, err := tx.Query(`
+		SELECT id, product_id, description, quantity, unit_price, COALESCE(tax_amount, 0), COALESCE(line_total, quantity * unit_price)
+		FROM purchase_order_lines
+		WHERE purchase_order_id = $1`, poID)
+	if err == nil {
+		for linesRows.Next() {
+			var pl poLine
+			if err := linesRows.Scan(&pl.ID, &pl.ProductID, &pl.Desc, &pl.Qty, &pl.UnitPrice, &pl.TaxAmt, &pl.LineTotal); err != nil {
+				continue
+			}
+			poLines = append(poLines, pl)
+		}
+		linesRows.Close()
+	}
+
+	for i, pl := range poLines {
+		tx.Exec(`
+			INSERT INTO purchase_invoice_lines (
+				id, purchase_invoice_id, purchase_order_line_id, line_number,
+				product_id, description, quantity, unit_price,
+				tax_amount, line_total, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			uuid.New(), billID, pl.ID, i+1,
+			pl.ProductID, pl.Desc, pl.Qty, pl.UnitPrice, pl.TaxAmt, pl.LineTotal, now)
+	}
+
+	// ========== GL JOURNAL ENTRY POSTING ==========
+	var journalEntryID *uuid.UUID
+
+	// Get Purchase Journal
+	var purchaseJournalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	journalErr := tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code IN ('PURCHASE', 'PUR', 'PURCH') AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
+
+	if journalErr == nil {
+		// Find AP account
+		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+		if apAccountID == uuid.Nil {
+			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "2100")
+		}
+
+		if apAccountID != uuid.Nil {
+			// Find expense account
+			expenseAccountID := findAccount(tx, tenantID, organizationID, "purchase", "5000")
+			if expenseAccountID == uuid.Nil {
+				expenseAccountID = findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
+			}
+			if expenseAccountID == uuid.Nil {
+				expenseAccountID = findAccount(tx, tenantID, organizationID, "expense", "5000")
+			}
+
+			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+
+			// Generate entry number
+			prefix := ""
+			if numberPrefix.Valid {
+				prefix = numberPrefix.String
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+			totalDebit := totalAmount
+			totalCredit := totalAmount
+
+			// Create journal entry
+			jeID := uuid.New()
+			journalEntryID = &jeID
+			jeDescription := fmt.Sprintf("Vendor Bill %s", invoiceNumber)
+
+			tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+				jeID, tenantID, organizationID, purchaseJournalID, entryNumber, now, invoiceNumber, jeDescription,
+				"purchase_invoice", billID, 1.0, totalDebit, totalCredit, userID, now, now,
+			)
+
+			jeLineNumber := 1
+
+			// Debit: Expense/Purchase account
+			if expenseAccountID != uuid.Nil {
+				debitAmt := subtotal
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, contact_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					uuid.New(), jeID, jeLineNumber, expenseAccountID, vendorID, "Purchase Expense",
+					debitAmt, 0.0, 1.0, now,
+				)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", debitAmt, now, expenseAccountID)
+				jeLineNumber++
+			}
+
+			// Debit: Tax
+			if taxAccountID != uuid.Nil && taxAmount > 0 {
+				tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					uuid.New(), jeID, jeLineNumber, taxAccountID, "Input Tax",
+					taxAmount, 0.0, 1.0, now,
+				)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+				jeLineNumber++
+			}
+
+			// Credit: Accounts Payable
+			tx.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, contact_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				uuid.New(), jeID, jeLineNumber, apAccountID, vendorID, "Accounts Payable",
+				0.0, totalAmount, 1.0, now,
+			)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
+
+			// Update journal next number
+			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", purchaseJournalID)
+
+			// Link JE to bill
+			tx.Exec("UPDATE purchase_invoices SET journal_entry_id = $1 WHERE id = $2", jeID, billID)
+		}
+	}
+
+	// Commit
+	if err := tx.Commit(); err != nil {
+		h.log.Error("CreateBillFromPO: commit failed", "error", err)
+		response.InternalError(c, "Failed to commit transaction")
+		return
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":                billID.String(),
+		"invoice_number":    invoiceNumber,
+		"vendor_id":         vendorID.String(),
+		"purchase_order_id": poID.String(),
+		"invoice_date":      now.Format("2006-01-02"),
+		"due_date":          dueDate.Format("2006-01-02"),
+		"total_amount":      totalAmount,
+		"status":            "confirmed",
+		"journal_entry_id":  journalEntryID,
+		"created_at":        now,
 	})
 }
