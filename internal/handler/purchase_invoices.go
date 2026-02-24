@@ -954,9 +954,14 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 
 	if err == nil {
 		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "2000")
-		cashAcctID := findAccount(h.db, tenantID, organizationID, "bank account", "1010")
+		// Use Outstanding Payments account for 2-step payment posting
+		cashAcctID := findAccount(h.db, tenantID, organizationID, "outstanding payments", "1160")
 		if cashAcctID == uuid.Nil {
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "petty cash", "1010")
+			// Fallback to direct bank posting if outstanding account doesn't exist
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "1010")
+			if cashAcctID == uuid.Nil {
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "petty cash", "1010")
+			}
 		}
 
 		if apAcctID != uuid.Nil && cashAcctID != uuid.Nil {
@@ -1002,7 +1007,7 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-					cashLineID, journalEntryID, 2, cashAcctID, "Cash/Bank",
+					cashLineID, journalEntryID, 2, cashAcctID, "Outstanding Payment",
 					0.0, paymentAmount, 1.0, now,
 				)
 
@@ -1010,7 +1015,9 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 				h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", payJournalID)
 
 				// Update account balances
+				// Debit AP (credit-normal: debit decreases)
 				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, apAcctID)
+				// Credit Outstanding Payments (debit-normal: credit decreases)
 				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
 			}
 		}

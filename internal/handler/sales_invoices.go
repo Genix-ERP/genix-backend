@@ -1215,18 +1215,22 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 	// Get default account IDs — lookup by name first, then code fallback
 	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
-	// Choose cash/bank account based on payment method
+	// Use Outstanding Receipts account for 2-step payment posting
+	// Payment first goes to outstanding account, then cleared to bank during reconciliation
 	var cashAccountID uuid.UUID
-	if input.PaymentMethod == "cash" {
-		cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
-		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "petty cash", "1010")
-		}
-	} else {
-		// Default to bank account for bank_transfer, check, etc.
-		cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1100")
-		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "petty cash", "1010")
+	cashAccountID = findAccount(tx, tenantID, organizationID, "outstanding receipts", "1150")
+	if cashAccountID == uuid.Nil {
+		// Fallback to direct bank/cash posting if outstanding account doesn't exist
+		if input.PaymentMethod == "cash" {
+			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
+			if cashAccountID == uuid.Nil {
+				cashAccountID = findAccount(tx, tenantID, organizationID, "petty cash", "1010")
+			}
+		} else {
+			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1100")
+			if cashAccountID == uuid.Nil {
+				cashAccountID = findAccount(tx, tenantID, organizationID, "petty cash", "1010")
+			}
 		}
 	}
 
@@ -1266,7 +1270,7 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-				cashLineID, journalEntryID, 1, cashAccountID, customerID, "Cash Receipt",
+				cashLineID, journalEntryID, 1, cashAccountID, customerID, "Outstanding Receipt",
 				input.Amount, 0.0, 1.0, now,
 			)
 
@@ -1285,7 +1289,7 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", cashJournalID)
 
 			// Update account balances
-			// Debit Cash (debit-normal: increases)
+			// Debit Outstanding Receipts / Cash (debit-normal: increases)
 			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAccountID)
 			// Credit AR (debit-normal: credit decreases)
 			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Amount, now, arAccountID)
