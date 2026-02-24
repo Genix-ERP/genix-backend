@@ -441,6 +441,7 @@ type TaxRate struct {
 	TaxAccountID  *uuid.UUID   `json:"tax_account_id,omitempty" db:"tax_account_id"`
 	IsCompound    bool         `json:"is_compound" db:"is_compound"`
 	IsRecoverable bool         `json:"is_recoverable" db:"is_recoverable"`
+	PriceInclude  bool         `json:"price_include" db:"price_include"`
 	IsActive      bool         `json:"is_active" db:"is_active"`
 	CreatedAt     time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt     time.Time    `json:"updated_at" db:"updated_at"`
@@ -458,6 +459,7 @@ type CreateTaxRateInput struct {
 	TaxAccountID  *string `json:"tax_account_id"`
 	IsCompound    bool    `json:"is_compound"`
 	IsRecoverable bool    `json:"is_recoverable"`
+	PriceInclude  bool    `json:"price_include"`
 }
 
 // UpdateTaxRateInput is the input for updating a tax rate
@@ -469,6 +471,7 @@ type UpdateTaxRateInput struct {
 	TaxAccountID  *string  `json:"tax_account_id"`
 	IsCompound    *bool    `json:"is_compound"`
 	IsRecoverable *bool    `json:"is_recoverable"`
+	PriceInclude  *bool    `json:"price_include"`
 	IsActive      *bool    `json:"is_active"`
 }
 
