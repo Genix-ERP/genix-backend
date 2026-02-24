@@ -2847,7 +2847,7 @@ func (h *Handler) ListTaxRates(c *gin.Context) {
 
 	query := `
 		SELECT id, tenant_id, code, name, description, rate, type, tax_type,
-			   tax_account_id, is_compound, is_recoverable, is_active, created_at, updated_at
+			   tax_account_id, is_compound, is_recoverable, COALESCE(price_include, false), is_active, created_at, updated_at
 		FROM tax_rates
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 	`
@@ -2874,7 +2874,7 @@ func (h *Handler) ListTaxRates(c *gin.Context) {
 
 		err := rows.Scan(
 			&tr.ID, &tr.TenantID, &tr.Code, &tr.Name, &desc, &tr.Rate, &tr.Type, &taxType,
-			&taxAccID, &tr.IsCompound, &tr.IsRecoverable, &tr.IsActive, &tr.CreatedAt, &tr.UpdatedAt,
+			&taxAccID, &tr.IsCompound, &tr.IsRecoverable, &tr.PriceInclude, &tr.IsActive, &tr.CreatedAt, &tr.UpdatedAt,
 		)
 		if err != nil {
 			continue
@@ -2957,10 +2957,10 @@ func (h *Handler) CreateTaxRate(c *gin.Context) {
 
 	_, err := h.db.Exec(`
 		INSERT INTO tax_rates (id, tenant_id, code, name, description, rate, type, tax_type,
-			tax_account_id, is_compound, is_recoverable, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			tax_account_id, is_compound, is_recoverable, price_include, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`, id, tenantID, input.Code, input.Name, description, input.Rate, input.Type, taxType,
-		taxAccountID, input.IsCompound, input.IsRecoverable, true, now, now)
+		taxAccountID, input.IsCompound, input.IsRecoverable, input.PriceInclude, true, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create tax rate", "error", err)
@@ -2980,6 +2980,7 @@ func (h *Handler) CreateTaxRate(c *gin.Context) {
 		TaxAccountID:  taxAccountID,
 		IsCompound:    input.IsCompound,
 		IsRecoverable: input.IsRecoverable,
+		PriceInclude:  input.PriceInclude,
 		IsActive:      true,
 		CreatedAt:     now,
 		UpdatedAt:     now,
@@ -3021,12 +3022,12 @@ func (h *Handler) GetTaxRate(c *gin.Context) {
 
 	err = h.db.QueryRow(`
 		SELECT id, tenant_id, code, name, description, rate, type, tax_type,
-			   tax_account_id, is_compound, is_recoverable, is_active, created_at, updated_at
+			   tax_account_id, is_compound, is_recoverable, COALESCE(price_include, false), is_active, created_at, updated_at
 		FROM tax_rates
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, id, tenantID).Scan(
 		&tr.ID, &tr.TenantID, &tr.Code, &tr.Name, &desc, &tr.Rate, &tr.Type, &taxType,
-		&taxAccID, &tr.IsCompound, &tr.IsRecoverable, &tr.IsActive, &tr.CreatedAt, &tr.UpdatedAt,
+		&taxAccID, &tr.IsCompound, &tr.IsRecoverable, &tr.PriceInclude, &tr.IsActive, &tr.CreatedAt, &tr.UpdatedAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -3117,6 +3118,9 @@ func (h *Handler) UpdateTaxRate(c *gin.Context) {
 	}
 	if input.IsRecoverable != nil {
 		addUpdate("is_recoverable", *input.IsRecoverable)
+	}
+	if input.PriceInclude != nil {
+		addUpdate("price_include", *input.PriceInclude)
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
@@ -5106,10 +5110,178 @@ func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 		WHERE id = $4 AND tenant_id = $5
 	`, statementDate, statementBalance, now, bankAccountID, tenantID)
 
+	// Create clearing entries for outstanding accounts (2-step payment posting)
+	// When payments go through Outstanding Receipts/Payments, reconciliation clears them to bank
+	h.createOutstandingClearingEntries(tenantID, userID, bankAccountID, reconciliationID, statementDate, now)
+
 	response.Success(c, gin.H{
 		"message":      "Reconciliation completed successfully",
 		"completed_at": now,
 	})
+}
+
+// createOutstandingClearingEntries creates GL entries to clear outstanding receipt/payment
+// accounts to the actual bank account when a bank reconciliation is completed.
+// This is the second step of the 2-step payment posting:
+// Step 1 (on payment): DR Outstanding Receipts / CR AR (or DR AP / CR Outstanding Payments)
+// Step 2 (on reconciliation): DR Bank / CR Outstanding Receipts (or DR Outstanding Payments / CR Bank)
+//
+// On completion, the current balance of the outstanding accounts is transferred to the bank.
+func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bankAccountID uuid.UUID, reconciliationID string, statementDate time.Time, now time.Time) {
+	tenantUUID, err := uuid.Parse(tenantID)
+	if err != nil {
+		h.log.Error("Invalid tenant ID for clearing entries", "error", err)
+		return
+	}
+
+	// Get the bank account's linked GL account and organization
+	var bankGLAccountID uuid.UUID
+	var orgID *uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT account_id, organization_id FROM bank_accounts WHERE id = $1 AND tenant_id = $2
+	`, bankAccountID, tenantID).Scan(&bankGLAccountID, &orgID)
+	if err != nil || bankGLAccountID == uuid.Nil {
+		h.log.Debug("Bank account has no linked GL account, skipping clearing entries")
+		return
+	}
+
+	// Find outstanding accounts
+	outReceiptsID := findAccount(h.db, tenantUUID, orgID, "outstanding receipts", "1150")
+	outPaymentsID := findAccount(h.db, tenantUUID, orgID, "outstanding payments", "1160")
+
+	if outReceiptsID == uuid.Nil && outPaymentsID == uuid.Nil {
+		return // No outstanding accounts configured, nothing to clear
+	}
+
+	// Get the current balance of outstanding accounts
+	// Outstanding Receipts: debit-normal, positive balance = payments awaiting clearing
+	// Outstanding Payments: debit-normal, negative balance (credit) = payments awaiting clearing
+	var receiptsBalance, paymentsBalance float64
+
+	if outReceiptsID != uuid.Nil {
+		h.db.QueryRow(`SELECT COALESCE(current_balance, 0) FROM accounts WHERE id = $1`, outReceiptsID).Scan(&receiptsBalance)
+	}
+	if outPaymentsID != uuid.Nil {
+		h.db.QueryRow(`SELECT COALESCE(current_balance, 0) FROM accounts WHERE id = $1`, outPaymentsID).Scan(&paymentsBalance)
+	}
+
+	// Nothing to clear if both balances are zero
+	if receiptsBalance < 0.01 && paymentsBalance > -0.01 {
+		return
+	}
+
+	// Get a journal for the clearing entry
+	var journalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	err = h.db.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH', 'GENERAL') AND deleted_at IS NULL LIMIT 1
+	`, tenantID).Scan(&journalID, &nextNumber, &numberPrefix)
+	if err != nil || journalID == uuid.Nil {
+		h.log.Error("No journal found for clearing entries", "error", err)
+		return
+	}
+
+	prefix := ""
+	if numberPrefix.Valid {
+		prefix = numberPrefix.String
+	}
+
+	// Create clearing entry for Outstanding Receipts → Bank
+	// DR Bank, CR Outstanding Receipts
+	if receiptsBalance > 0.01 {
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+		journalEntryID := uuid.New()
+		description := fmt.Sprintf("Bank reconciliation clearing - receipts (%s)", statementDate.Format("2006-01-02"))
+
+		_, err = h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+			journalEntryID, tenantID, orgID, journalID, entryNumber, statementDate, reconciliationID, description,
+			"bank_reconciliation", reconciliationID, 1.0, receiptsBalance, receiptsBalance, userID, now, now,
+		)
+
+		if err != nil {
+			h.log.Error("Failed to create receipts clearing journal entry", "error", err)
+		} else {
+			// Line 1: Debit Bank
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), journalEntryID, 1, bankGLAccountID, "Bank - Cleared Receipts",
+				receiptsBalance, 0.0, 1.0, now,
+			)
+			// Line 2: Credit Outstanding Receipts
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), journalEntryID, 2, outReceiptsID, "Outstanding Receipts - Cleared",
+				0.0, receiptsBalance, 1.0, now,
+			)
+
+			// Update account balances
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", receiptsBalance, now, bankGLAccountID)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", receiptsBalance, now, outReceiptsID)
+
+			nextNumber++
+			h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
+		}
+	}
+
+	// Create clearing entry for Outstanding Payments → Bank
+	// DR Outstanding Payments, CR Bank
+	// Outstanding Payments has a negative current_balance (credit balance) when payments are pending
+	absPayments := -paymentsBalance // Make positive for the entry amounts
+	if absPayments > 0.01 {
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+		journalEntryID := uuid.New()
+		description := fmt.Sprintf("Bank reconciliation clearing - payments (%s)", statementDate.Format("2006-01-02"))
+
+		_, err = h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+			journalEntryID, tenantID, orgID, journalID, entryNumber, statementDate, reconciliationID, description,
+			"bank_reconciliation", reconciliationID, 1.0, absPayments, absPayments, userID, now, now,
+		)
+
+		if err != nil {
+			h.log.Error("Failed to create payments clearing journal entry", "error", err)
+		} else {
+			// Line 1: Debit Outstanding Payments (clears the credit balance)
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), journalEntryID, 1, outPaymentsID, "Outstanding Payments - Cleared",
+				absPayments, 0.0, 1.0, now,
+			)
+			// Line 2: Credit Bank
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), journalEntryID, 2, bankGLAccountID, "Bank - Cleared Payments",
+				0.0, absPayments, 1.0, now,
+			)
+
+			// Update account balances
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absPayments, now, outPaymentsID)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", absPayments, now, bankGLAccountID)
+
+			h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
+		}
+	}
 }
 
 // DeleteBankReconciliation godoc
