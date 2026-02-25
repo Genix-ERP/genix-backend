@@ -180,30 +180,38 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 		organizations = []Organization{}
 	}
 
-	// Build org name -> org ID map for intercompany vendor lookup
+	// Build intercompany vendor lookup using source_organization_id (with name fallback for old data)
 	if len(organizations) > 1 {
 		orgNameToID := make(map[string]string)
 		for _, org := range organizations {
 			orgNameToID[org.Name] = org.ID.String()
 		}
 
-		// For each org, find vendor contacts whose name matches another org
 		for i, org := range organizations {
 			vendorRows, err := h.db.Query(
-				`SELECT name FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND type = 'vendor' AND deleted_at IS NULL`,
+				`SELECT source_organization_id, name FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND type = 'vendor' AND deleted_at IS NULL`,
 				tenantID, org.ID,
 			)
 			if err != nil {
 				continue
 			}
+			seen := make(map[string]bool)
 			var vendorIDs []string
 			for vendorRows.Next() {
+				var sourceOrgID *uuid.UUID
 				var vendorName string
-				if err := vendorRows.Scan(&vendorName); err != nil {
+				if err := vendorRows.Scan(&sourceOrgID, &vendorName); err != nil {
 					continue
 				}
-				if matchedOrgID, ok := orgNameToID[vendorName]; ok && matchedOrgID != org.ID.String() {
-					vendorIDs = append(vendorIDs, matchedOrgID)
+				var matchedID string
+				if sourceOrgID != nil {
+					matchedID = sourceOrgID.String()
+				} else if id, ok := orgNameToID[vendorName]; ok && id != org.ID.String() {
+					matchedID = id
+				}
+				if matchedID != "" && !seen[matchedID] {
+					seen[matchedID] = true
+					vendorIDs = append(vendorIDs, matchedID)
 				}
 			}
 			vendorRows.Close()
@@ -651,10 +659,69 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		json.Unmarshal(settingsJSON, &org.Settings)
 	}
 
-	// Create intercompany vendor/customer contacts if requested
-	if len(input.IntercompanyVendorIDs) > 0 {
+	// Sync intercompany vendor/customer contacts
+	if input.IntercompanyVendorIDs != nil {
 		if parsedTenantID, err := uuid.Parse(tenantID.(string)); err == nil {
-			h.createIntercompanyContacts(parsedTenantID, orgID, org.Name, org.TaxID, input.IntercompanyVendorIDs)
+			// Create or update contacts for selected companies
+			if len(input.IntercompanyVendorIDs) > 0 {
+				h.createIntercompanyContacts(parsedTenantID, orgID, org.Name, org.TaxID, input.IntercompanyVendorIDs)
+			}
+
+			// Remove contacts for unselected companies
+			// Build set of selected org IDs and their names for matching
+			selectedSet := make(map[string]bool)
+			selectedNames := make(map[string]bool)
+			for _, id := range input.IntercompanyVendorIDs {
+				selectedSet[id] = true
+				// Get org name for this ID
+				var name string
+				if err := h.db.QueryRow(`SELECT name FROM organizations WHERE id = $1 AND tenant_id = $2`, id, parsedTenantID).Scan(&name); err == nil {
+					selectedNames[name] = true
+				}
+			}
+
+			// Get all vendor contacts for this org
+			rows, err := h.db.Query(`SELECT id, source_organization_id, name FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND type = 'vendor' AND deleted_at IS NULL`,
+				parsedTenantID, orgID)
+			if err == nil {
+				for rows.Next() {
+					var contactID uuid.UUID
+					var sourceOrgID *uuid.UUID
+					var contactName string
+					if err := rows.Scan(&contactID, &sourceOrgID, &contactName); err != nil {
+						continue
+					}
+
+					shouldKeep := false
+					var matchedSourceOrgID *uuid.UUID
+
+					if sourceOrgID != nil {
+						// New-style: check by source_organization_id
+						if selectedSet[sourceOrgID.String()] {
+							shouldKeep = true
+						}
+						matchedSourceOrgID = sourceOrgID
+					} else if selectedNames[contactName] {
+						// Old-style (no source_organization_id): check by name match
+						shouldKeep = true
+					}
+
+					if !shouldKeep {
+						// Soft-delete this vendor contact
+						h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE id = $1`, contactID)
+						// Also soft-delete the corresponding customer contact
+						if matchedSourceOrgID != nil {
+							h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE tenant_id = $1 AND organization_id = $2 AND type = 'customer' AND source_organization_id = $3 AND deleted_at IS NULL`,
+								parsedTenantID, *matchedSourceOrgID, orgID)
+						} else {
+							// Old-style: delete customer by name match
+							h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE tenant_id = $1 AND type = 'customer' AND name = $2 AND source_organization_id IS NULL AND deleted_at IS NULL`,
+								parsedTenantID, org.Name)
+						}
+					}
+				}
+				rows.Close()
+			}
 		}
 	}
 
