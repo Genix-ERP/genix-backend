@@ -3177,6 +3177,7 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
 
 	orderID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -3186,15 +3187,19 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 
 	// Get scrap order details
 	var productID, warehouseID uuid.UUID
-	var locationID sql.NullString
-	var quantity float64
-	var status string
+	var locationID, scrapOrgID sql.NullString
+	var quantity, unitCost, totalCost float64
+	var status, scrapNumber string
+	var reason sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT product_id, warehouse_id, location_id, quantity, status
+		SELECT product_id, warehouse_id, location_id, quantity,
+			COALESCE(unit_cost, 0), COALESCE(total_cost, 0),
+			status, scrap_number, reason, organization_id
 		FROM scrap_orders
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, orderID, tenantID).Scan(&productID, &warehouseID, &locationID, &quantity, &status)
+	`, orderID, tenantID).Scan(&productID, &warehouseID, &locationID, &quantity,
+		&unitCost, &totalCost, &status, &scrapNumber, &reason, &scrapOrgID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Scrap order")
@@ -3221,35 +3226,51 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Reduce inventory
+	// Reduce inventory and get inventory ID
 	var locID *uuid.UUID
 	if locationID.Valid {
 		lid, _ := uuid.Parse(locationID.String)
 		locID = &lid
 	}
 
-	result, err := tx.Exec(`
+	var inventoryID uuid.UUID
+	err = tx.QueryRow(`
 		UPDATE inventory SET
 			quantity_on_hand = quantity_on_hand - $1,
-			quantity_available = quantity_available - $1,
-			total_value = (quantity_on_hand - $1) * unit_cost,
 			last_movement_date = $2,
 			updated_at = $2
 		WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5
 		AND COALESCE(location_id::text, '') = COALESCE($6::text, '')
-		AND quantity_available >= $1
-	`, quantity, now, tenantID, productID, warehouseID, locID)
+		AND quantity_on_hand >= $1
+		RETURNING id
+	`, quantity, now, tenantID, productID, warehouseID, locID).Scan(&inventoryID)
 
+	if err == sql.ErrNoRows {
+		response.BadRequest(c, "Insufficient inventory to scrap")
+		return
+	}
 	if err != nil {
 		h.log.Error("Failed to reduce inventory", "error", err)
 		response.InternalError(c, "Failed to confirm scrap order")
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		response.BadRequest(c, "Insufficient inventory to scrap")
-		return
+	// Create inventory transaction
+	txnID := uuid.New()
+	var reasonStr *string
+	if reason.Valid {
+		reasonStr = &reason.String
+	}
+	_, err = tx.Exec(`
+		INSERT INTO inventory_transactions (id, tenant_id, inventory_id, transaction_type,
+			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reason, notes, created_by, created_at)
+		VALUES ($1, $2, $3, 'scrap', 'scrap_order', $4, $5, $6, $7, $8, $9, $10, $11)
+	`, txnID, tenantID, inventoryID, orderID.String(),
+		-quantity, unitCost, totalCost, reasonStr,
+		fmt.Sprintf("Scrap Order: %s", scrapNumber), userID, now)
+	if err != nil {
+		h.log.Error("Failed to create inventory transaction", "error", err)
 	}
 
 	// Update scrap order status
@@ -3259,14 +3280,78 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 			approved_by = $1,
 			approved_at = $2,
 			completed_at = $2,
+			inventory_transaction_id = $3,
 			updated_at = $2
-		WHERE id = $3
-	`, userID, now, orderID)
+		WHERE id = $4
+	`, userID, now, txnID, orderID)
 
 	if err != nil {
 		h.log.Error("Failed to update scrap order", "error", err)
 		response.InternalError(c, "Failed to confirm scrap order")
 		return
+	}
+
+	// Create journal entry for the scrap loss
+	if totalCost > 0 {
+		var orgIDPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgIDPtr = &orgID
+		} else if scrapOrgID.Valid {
+			parsed, _ := uuid.Parse(scrapOrgID.String)
+			if parsed != uuid.Nil {
+				orgIDPtr = &parsed
+			}
+		}
+
+		var journalID uuid.UUID
+		var nextNumber int
+		tx.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE WHEN code='INVENTORY' THEN 0 WHEN code='MISC' THEN 1 ELSE 2 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+
+		if journalID != uuid.Nil {
+			entryID := uuid.New()
+			entryNumber := fmt.Sprintf("SCP%06d", nextNumber)
+			description := fmt.Sprintf("Scrap Order: %s", scrapNumber)
+
+			_, err = tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+					description, source_type, source_id, status, total_debit, total_credit,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'scrap', $8, 'posted', $9, $9, $10, $11, $11)
+			`, entryID, tenantID, orgIDPtr, journalID, entryNumber, now,
+				description, orderID.String(), totalCost, userID, now)
+
+			if err != nil {
+				h.log.Error("Failed to create scrap journal entry", "error", err)
+			} else {
+				// Debit: Scrap/Inventory Loss Expense
+				scrapAcct := findAccount(tx, tenantID, orgIDPtr, "scrap", "6920")
+				if scrapAcct == uuid.Nil {
+					scrapAcct = findAccount(tx, tenantID, orgIDPtr, "inventory loss", "6910")
+				}
+				if scrapAcct == uuid.Nil {
+					scrapAcct = findAccount(tx, tenantID, orgIDPtr, "stock adjustment", "6910")
+				}
+
+				// Credit: Inventory Asset
+				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1300")
+				if inventoryAcct == uuid.Nil {
+					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1300")
+				}
+
+				if scrapAcct != uuid.Nil && inventoryAcct != uuid.Nil {
+					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Scrap Loss', $4, 0, 1, $5)`,
+						uuid.New(), entryID, scrapAcct, totalCost, now)
+					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Inventory Reduction', 0, $4, 2, $5)`,
+						uuid.New(), entryID, inventoryAcct, totalCost, now)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCost, now, scrapAcct)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCost, now, inventoryAcct)
+				}
+
+				tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+				tx.Exec("UPDATE scrap_orders SET journal_entry_id = $1 WHERE id = $2", entryID, orderID)
+			}
+		}
 	}
 
 	if err = tx.Commit(); err != nil {
@@ -3275,7 +3360,7 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, gin.H{"message": "Scrap order confirmed and inventory reduced"})
+	response.Success(c, gin.H{"message": "Scrap order confirmed, inventory reduced, and journal entry created"})
 }
 
 // CancelScrapOrder cancels a scrap order
@@ -4521,7 +4606,8 @@ func (h *Handler) ListStockCounts(c *gin.Context) {
 			sc.total_system_value, sc.total_counted_value, sc.total_variance_value,
 			sc.created_at, sc.updated_at,
 			(SELECT COUNT(*) FROM stock_count_lines WHERE stock_count_id = sc.id) as line_count,
-			(SELECT COUNT(*) FROM stock_count_lines WHERE stock_count_id = sc.id AND counted_quantity IS NOT NULL) as counted_count
+			(SELECT COUNT(*) FROM stock_count_lines WHERE stock_count_id = sc.id AND counted_quantity IS NOT NULL) as counted_count,
+			sc.counted_by_name
 		FROM stock_counts sc
 		LEFT JOIN warehouses w ON sc.warehouse_id = w.id
 		WHERE sc.tenant_id = $1
@@ -4575,12 +4661,13 @@ func (h *Handler) ListStockCounts(c *gin.Context) {
 		UpdatedAt          time.Time  `json:"updated_at"`
 		LineCount          int        `json:"line_count"`
 		CountedCount       int        `json:"counted_count"`
+		CountedByName      *string    `json:"counted_by,omitempty"`
 	}
 
 	counts := make([]StockCountResponse, 0)
 	for rows.Next() {
 		var sc StockCountResponse
-		var notes sql.NullString
+		var notes, countedByName sql.NullString
 		var startedAt, completedAt, approvedAt sql.NullTime
 		if err := rows.Scan(
 			&sc.ID, &sc.TenantID, &sc.WarehouseID, &sc.WarehouseName,
@@ -4588,6 +4675,7 @@ func (h *Handler) ListStockCounts(c *gin.Context) {
 			&startedAt, &completedAt, &approvedAt,
 			&sc.TotalSystemValue, &sc.TotalCountedValue, &sc.TotalVarianceValue,
 			&sc.CreatedAt, &sc.UpdatedAt, &sc.LineCount, &sc.CountedCount,
+			&countedByName,
 		); err != nil {
 			h.log.Error("Failed to scan stock count", "error", err)
 			continue
@@ -4603,6 +4691,9 @@ func (h *Handler) ListStockCounts(c *gin.Context) {
 		}
 		if approvedAt.Valid {
 			sc.ApprovedAt = &approvedAt.Time
+		}
+		if countedByName.Valid {
+			sc.CountedByName = &countedByName.String
 		}
 		counts = append(counts, sc)
 	}
@@ -4782,9 +4873,17 @@ func (h *Handler) CreateStockCount(c *gin.Context) {
 	if orgID != uuid.Nil {
 		orgIDPtr = &orgID
 	}
+	var userIDPtr *uuid.UUID
+	if userID != uuid.Nil {
+		userIDPtr = &userID
+	}
 	var notes *string
 	if input.Notes != "" {
 		notes = &input.Notes
+	}
+	var countedByName *string
+	if input.CountedByName != "" {
+		countedByName = &input.CountedByName
 	}
 
 	tx, err := h.db.Begin()
@@ -4795,44 +4894,80 @@ func (h *Handler) CreateStockCount(c *gin.Context) {
 	defer tx.Rollback()
 
 	_, err = tx.Exec(`
-		INSERT INTO stock_counts (id, tenant_id, organization_id, warehouse_id, count_number, count_type, count_date, status, notes, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', $8, $9, $10, $10)
-	`, id, tenantID, orgIDPtr, warehouseID, countNumber, countType, countDate, notes, userID, now)
+		INSERT INTO stock_counts (id, tenant_id, organization_id, warehouse_id, count_number, count_type, count_date, status, notes, counted_by_name, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', $8, $9, $10, $11, $11)
+	`, id, tenantID, orgIDPtr, warehouseID, countNumber, countType, countDate, notes, countedByName, userIDPtr, now)
 	if err != nil {
-		h.log.Error("Failed to create stock count", "error", err)
-		response.InternalError(c, "Failed to create stock count")
+		h.log.Error("Failed to create stock count", "error", err, "count_number", countNumber, "warehouse_id", warehouseID, "org_id", orgIDPtr)
+		response.InternalError(c, "Failed to create stock count: "+err.Error())
 		return
 	}
 
 	// Auto-populate lines from current inventory for this warehouse
-	invRows, err := tx.Query(`
+	// First collect all inventory items, then insert lines (can't exec inside open rows cursor)
+	type invItem struct {
+		ProductID uuid.UUID
+		Qty       float64
+		Cost      float64
+	}
+	var invItems []invItem
+
+	invQuery := `
 		SELECT i.product_id, i.quantity_on_hand, COALESCE(i.unit_cost, 0)
 		FROM inventory i
 		JOIN products p ON i.product_id = p.id AND p.deleted_at IS NULL
 		WHERE i.tenant_id = $1 AND i.warehouse_id = $2 AND i.quantity_on_hand != 0
-		ORDER BY p.name
-	`, tenantID, warehouseID)
+	`
+	invArgs := []interface{}{tenantID, warehouseID}
+
+	// Filter by selected products if specified
+	if len(input.SelectedProducts) > 0 {
+		productUUIDs := make([]uuid.UUID, 0, len(input.SelectedProducts))
+		for _, pid := range input.SelectedProducts {
+			if parsed, parseErr := uuid.Parse(pid); parseErr == nil {
+				productUUIDs = append(productUUIDs, parsed)
+			}
+		}
+		if len(productUUIDs) > 0 {
+			placeholders := make([]string, len(productUUIDs))
+			for i, pid := range productUUIDs {
+				placeholders[i] = fmt.Sprintf("$%d", i+3)
+				invArgs = append(invArgs, pid)
+			}
+			invQuery += " AND i.product_id IN (" + strings.Join(placeholders, ",") + ")"
+		}
+	}
+
+	invQuery += " ORDER BY p.name"
+	invRows, err := tx.Query(invQuery, invArgs...)
 	if err != nil {
 		h.log.Error("Failed to query inventory for stock count", "error", err)
 	} else {
-		defer invRows.Close()
 		for invRows.Next() {
-			var productID uuid.UUID
-			var qty, cost float64
-			if err := invRows.Scan(&productID, &qty, &cost); err != nil {
+			var item invItem
+			if err := invRows.Scan(&item.ProductID, &item.Qty, &item.Cost); err != nil {
 				continue
 			}
-			sysValue := qty * cost
-			lineID := uuid.New()
-			tx.Exec(`
-				INSERT INTO stock_count_lines (id, stock_count_id, product_id, system_quantity, unit_cost, system_value, status, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $7)
-			`, lineID, id, productID, qty, cost, sysValue, now)
+			invItems = append(invItems, item)
+		}
+		invRows.Close()
+	}
+
+	for _, item := range invItems {
+		sysValue := item.Qty * item.Cost
+		lineID := uuid.New()
+		_, err := tx.Exec(`
+			INSERT INTO stock_count_lines (id, stock_count_id, product_id, system_quantity, unit_cost, system_value, status, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $7)
+		`, lineID, id, item.ProductID, item.Qty, item.Cost, sysValue, now)
+		if err != nil {
+			h.log.Error("Failed to insert stock count line", "error", err, "product_id", item.ProductID)
 		}
 	}
 
 	if err = tx.Commit(); err != nil {
-		response.InternalError(c, "Failed to create stock count")
+		h.log.Error("Failed to commit stock count transaction", "error", err)
+		response.InternalError(c, "Failed to create stock count: "+err.Error())
 		return
 	}
 

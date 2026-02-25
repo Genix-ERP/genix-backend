@@ -5079,16 +5079,19 @@ func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 		return
 	}
 
-	// Check if reconciliation is balanced (difference should be 0 or within tolerance)
-	if difference != nil && *difference != 0 {
-		// Allow small tolerance (0.01)
-		if *difference > 0.01 || *difference < -0.01 {
-			response.BadRequest(c, fmt.Sprintf("Reconciliation has a difference of %.2f. Please resolve before completing.", *difference))
-			return
-		}
+	// Check if reconciliation is balanced (difference should be 0 or within write-off tolerance)
+	const writeOffTolerance = 1000.0 // Maximum auto write-off amount (1,000 UZS)
+	var reconDifference float64
+	if difference != nil {
+		reconDifference = *difference
+	}
+	if reconDifference > writeOffTolerance || reconDifference < -writeOffTolerance {
+		response.BadRequest(c, fmt.Sprintf("Reconciliation has a difference of %.2f which exceeds the write-off tolerance (%.0f). Please resolve before completing.", reconDifference, writeOffTolerance))
+		return
 	}
 
 	now := time.Now()
+	tenantUUID, _ := uuid.Parse(tenantID)
 
 	// Complete the reconciliation
 	_, err = h.db.Exec(`
@@ -5111,12 +5114,17 @@ func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 	`, statementDate, statementBalance, now, bankAccountID, tenantID)
 
 	// Create clearing entries for outstanding accounts (2-step payment posting)
-	// When payments go through Outstanding Receipts/Payments, reconciliation clears them to bank
 	h.createOutstandingClearingEntries(tenantID, userID, bankAccountID, reconciliationID, statementDate, now)
+
+	// Auto write-off small reconciliation difference
+	if reconDifference != 0 && (reconDifference <= writeOffTolerance && reconDifference >= -writeOffTolerance) {
+		h.createReconciliationWriteOff(tenantID, tenantUUID, userID, bankAccountID, reconciliationID, reconDifference, statementDate, now)
+	}
 
 	response.Success(c, gin.H{
 		"message":      "Reconciliation completed successfully",
 		"completed_at": now,
+		"write_off":    reconDifference,
 	})
 }
 
@@ -5282,6 +5290,103 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 			h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
 		}
 	}
+}
+
+// createReconciliationWriteOff posts a GL entry to write off small reconciliation differences.
+// Positive difference (statement > book): DR Bank, CR Other Income (bank has more)
+// Negative difference (book > statement): DR Bank Charges, CR Bank (bank has less)
+func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.UUID, userID string, bankAccountID uuid.UUID, reconciliationID string, difference float64, statementDate time.Time, now time.Time) {
+	// Get the bank account's linked GL account and organization
+	var bankGLAccountID uuid.UUID
+	var orgID *uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT account_id, organization_id FROM bank_accounts WHERE id = $1 AND tenant_id = $2
+	`, bankAccountID, tenantID).Scan(&bankGLAccountID, &orgID)
+	if err != nil || bankGLAccountID == uuid.Nil {
+		return
+	}
+
+	// Get a journal
+	var journalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	err = h.db.QueryRow(`
+		SELECT id, COALESCE(next_number, 1), number_prefix
+		FROM journals WHERE tenant_id = $1 AND code IN ('GENERAL', 'CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL LIMIT 1
+	`, tenantID).Scan(&journalID, &nextNumber, &numberPrefix)
+	if err != nil || journalID == uuid.Nil {
+		return
+	}
+
+	prefix := ""
+	if numberPrefix.Valid {
+		prefix = numberPrefix.String
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+	absDiff := difference
+	if absDiff < 0 {
+		absDiff = -absDiff
+	}
+
+	journalEntryID := uuid.New()
+	description := fmt.Sprintf("Reconciliation write-off (%.2f) - %s", difference, statementDate.Format("2006-01-02"))
+
+	_, err = h.db.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
+		journalEntryID, tenantID, orgID, journalID, entryNumber, statementDate, reconciliationID, description,
+		"bank_reconciliation_writeoff", reconciliationID, 1.0, absDiff, absDiff, userID, now, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create reconciliation write-off entry", "error", err)
+		return
+	}
+
+	if difference > 0 {
+		// Statement > book: bank has more than expected (e.g., interest earned)
+		// DR Bank, CR Other Income
+		otherIncomeID := findAccount(h.db, tenantUUID, orgID, "other income", "4900")
+		if otherIncomeID == uuid.Nil {
+			return
+		}
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1, $2, 1, $3, 'Bank - Reconciliation Adjustment', $4, 0, 1.0, $5)`,
+			uuid.New(), journalEntryID, bankGLAccountID, absDiff, now)
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1, $2, 2, $3, 'Reconciliation Write-off', 0, $4, 1.0, $5)`,
+			uuid.New(), journalEntryID, otherIncomeID, absDiff, now)
+		// Update balances
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, bankGLAccountID)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, otherIncomeID)
+	} else {
+		// Book > statement: bank has less than expected (e.g., bank charges)
+		// DR Bank Charges, CR Bank
+		bankChargesID := findAccount(h.db, tenantUUID, orgID, "bank charges", "7100")
+		if bankChargesID == uuid.Nil {
+			bankChargesID = findAccount(h.db, tenantUUID, orgID, "payment difference write-off", "6950")
+		}
+		if bankChargesID == uuid.Nil {
+			return
+		}
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1, $2, 1, $3, 'Bank Charges - Reconciliation', $4, 0, 1.0, $5)`,
+			uuid.New(), journalEntryID, bankChargesID, absDiff, now)
+		h.db.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1, $2, 2, $3, 'Bank - Reconciliation Adjustment', 0, $4, 1.0, $5)`,
+			uuid.New(), journalEntryID, bankGLAccountID, absDiff, now)
+		// Update balances
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, bankChargesID)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", absDiff, now, bankGLAccountID)
+	}
+
+	h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
 }
 
 // DeleteBankReconciliation godoc
