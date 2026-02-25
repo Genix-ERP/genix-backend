@@ -2,9 +2,12 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
+	"github.com/genixerp/genix-backend/internal/infrastructure/email"
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/crypto"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
@@ -170,6 +173,167 @@ func (h *Handler) CreateUser(c *gin.Context) {
 	}
 
 	response.Created(c, gin.H{"id": userID})
+}
+
+// credentialsTranslation holds translated credential message templates
+type credentialsTranslation struct {
+	SMSTemplate   string // %s = password
+	EmailSubject  string // %s = tenant name
+	EmailTitle    string
+	EmailBody     string // %s = tenant name, %s = email, %s = password
+	EmailWarning  string
+}
+
+var credentialsTranslations = map[string]credentialsTranslation{
+	"uz": {
+		SMSTemplate:  "Sizning Genix Admin paneliga kirish kodingiz: %s",
+		EmailSubject: "%s - Kirish ma'lumotlari",
+		EmailTitle:   "Kirish ma'lumotlari",
+		EmailBody:    "Sizning <strong>%s</strong> tizimiga kirish ma'lumotlaringiz:",
+		EmailWarning: "Iltimos, tizimga kirganingizdan so'ng parolni o'zgartiring.",
+	},
+	"en": {
+		SMSTemplate:  "Your Genix Admin panel login code: %s",
+		EmailSubject: "%s - Login Credentials",
+		EmailTitle:   "Login Credentials",
+		EmailBody:    "Your login credentials for <strong>%s</strong>:",
+		EmailWarning: "Please change your password after logging in.",
+	},
+	"ru": {
+		SMSTemplate:  "Ваш код для входа в панель Genix Admin: %s",
+		EmailSubject: "%s - Данные для входа",
+		EmailTitle:   "Данные для входа",
+		EmailBody:    "Ваши данные для входа в <strong>%s</strong>:",
+		EmailWarning: "Пожалуйста, смените пароль после входа в систему.",
+	},
+}
+
+// getTenantLanguage reads the company language from tenant_settings
+func (h *Handler) getTenantLanguage(tenantID string) string {
+	var settingsJSON []byte
+	err := h.db.QueryRow("SELECT settings FROM tenant_settings WHERE tenant_id = $1", tenantID).Scan(&settingsJSON)
+	if err != nil {
+		return "en"
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(settingsJSON, &settings); err != nil {
+		return "en"
+	}
+	if general, ok := settings["general"].(map[string]interface{}); ok {
+		if loc, ok := general["localization"].(map[string]interface{}); ok {
+			if lang, ok := loc["language"].(string); ok && lang != "" {
+				return lang
+			}
+		}
+	}
+	return "en"
+}
+
+// SendCredentials generates a new password, updates the user, and sends credentials via email
+func (h *Handler) SendCredentials(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.BadRequest(c, "Tenant ID required")
+		return
+	}
+
+	var input struct {
+		Email    string `json:"email" binding:"required"`
+		Password string `json:"password" binding:"required"`
+		Method   string `json:"method"` // "email" or "sms"
+		Phone    string `json:"phone"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	if input.Method == "" {
+		input.Method = "email"
+	}
+
+	// Hash and update the user's password
+	passwordHash, err := crypto.HashPassword(input.Password)
+	if err != nil {
+		h.log.Error("Failed to hash password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	result, err := h.db.Exec(
+		"UPDATE users SET password_hash = $1, updated_at = NOW() WHERE tenant_id = $2 AND email = $3 AND deleted_at IS NULL",
+		passwordHash, tenantID, input.Email,
+	)
+	if err != nil {
+		h.log.Error("Failed to update user password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "User not found")
+		return
+	}
+
+	// Get tenant language and name
+	lang := h.getTenantLanguage(tenantID.String())
+	trans, ok2 := credentialsTranslations[lang]
+	if !ok2 {
+		trans = credentialsTranslations["en"]
+	}
+
+	var tenantName string
+	_ = h.db.QueryRow("SELECT name FROM tenants WHERE id = $1", tenantID).Scan(&tenantName)
+	if tenantName == "" {
+		tenantName = "GenixERP"
+	}
+
+	if input.Method == "sms" {
+		if input.Phone == "" {
+			response.BadRequest(c, "Phone number is required for SMS")
+			return
+		}
+		smsMessage := fmt.Sprintf(trans.SMSTemplate, input.Password)
+		if err := h.smsService.Send(input.Phone, smsMessage); err != nil {
+			h.log.Error("Failed to send credentials SMS", "error", err)
+			response.InternalServerError(c, "Failed to send SMS")
+			return
+		}
+		response.Success(c, gin.H{"message": "Credentials sent via SMS"})
+		return
+	}
+
+	// Send via email
+	err = h.emailService.Send(&email.Email{
+		To:      []string{input.Email},
+		Subject: fmt.Sprintf(trans.EmailSubject, tenantName),
+		Body: fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <div style="background: linear-gradient(135deg, #667eea 0%%, #764ba2 100%%); padding: 30px; border-radius: 10px 10px 0 0; text-align: center;">
+    <h1 style="color: white; margin: 0;">GenixERP</h1>
+  </div>
+  <div style="background: #fff; padding: 30px; border: 1px solid #e0e0e0; border-top: none; border-radius: 0 0 10px 10px;">
+    <h2 style="margin-top: 0;">%s</h2>
+    <p>%s</p>
+    <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
+      <p style="margin: 5px 0;"><strong>Email:</strong> %s</p>
+      <p style="margin: 5px 0;"><strong>Password:</strong> <code style="font-size: 18px; letter-spacing: 2px;">%s</code></p>
+    </div>
+    <p style="color: #666; font-size: 14px;">%s</p>
+  </div>
+</body>
+</html>`, trans.EmailTitle, fmt.Sprintf(trans.EmailBody, tenantName), input.Email, input.Password, trans.EmailWarning),
+		IsHTML: true,
+	})
+	if err != nil {
+		h.log.Error("Failed to send credentials email", "error", err)
+		response.InternalServerError(c, "Failed to send email")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Credentials sent via email"})
 }
 
 // GetUser gets a user by ID

@@ -22,6 +22,7 @@ type Config struct {
 	Log       LogConfig
 	Storage   StorageConfig
 	Email     EmailConfig
+	SMS       SMSConfig
 	Queue     QueueConfig
 	Google    GoogleConfig
 }
@@ -144,6 +145,15 @@ type EmailConfig struct {
 	APIKey     string
 }
 
+// SMSConfig holds SMS provider settings
+type SMSConfig struct {
+	Provider string // eskiz, twilio
+	APIEmail string
+	APIKey   string
+	BaseURL  string
+	From     string
+}
+
 // QueueConfig holds message queue settings
 type QueueConfig struct {
 	Provider string // redis, rabbitmq, kafka
@@ -256,6 +266,13 @@ func Load() (*Config, error) {
 			FromEmail: getEnv("EMAIL_FROM_EMAIL", "noreply@genixerp.io"),
 			FromName:  getEnv("EMAIL_FROM_NAME", "GenixERP"),
 			APIKey:    getEnv("EMAIL_API_KEY", ""),
+		},
+		SMS: SMSConfig{
+			Provider: getEnv("SMS_PROVIDER", "eskiz"),
+			APIEmail: getEnv("SMS_API_EMAIL", ""),
+			APIKey:   getEnv("SMS_API_KEY", ""),
+			BaseURL:  getEnv("SMS_BASE_URL", "https://notify.eskiz.uz/api"),
+			From:     getEnv("SMS_FROM", "4546"),
 		},
 		Queue: QueueConfig{
 			Provider: getEnv("QUEUE_PROVIDER", "redis"),

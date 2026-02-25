@@ -23,12 +23,7 @@ func (h *Handler) ListPermissions(c *gin.Context) {
 // Organization handlers are implemented in organizations.go
 
 // ========== DEPARTMENTS ==========
-
-func (h *Handler) ListDepartments(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateDepartment(c *gin.Context) { response.Created(c, gin.H{"message": "Department created"}) }
-func (h *Handler) GetDepartment(c *gin.Context)    { response.NotFound(c, "Department") }
-func (h *Handler) UpdateDepartment(c *gin.Context) { response.Success(c, gin.H{"message": "Department updated"}) }
-func (h *Handler) DeleteDepartment(c *gin.Context) { response.NoContent(c) }
+// Department handlers are implemented in departments.go
 
 // ========== CONTACTS ==========
 // Contact handlers are implemented in contacts.go
