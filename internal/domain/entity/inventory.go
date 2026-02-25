@@ -562,10 +562,12 @@ type StockCountLine struct {
 
 // CreateStockCountInput represents input for creating a stock count
 type CreateStockCountInput struct {
-	WarehouseID string `json:"warehouse_id" binding:"required"`
-	CountType   string `json:"count_type,omitempty"` // full, cycle, spot
-	CountDate   string `json:"count_date" binding:"required"`
-	Notes       string `json:"notes,omitempty"`
+	WarehouseID      string   `json:"warehouse_id" binding:"required"`
+	CountType        string   `json:"count_type,omitempty"` // full, cycle, spot
+	CountDate        string   `json:"count_date" binding:"required"`
+	Notes            string   `json:"notes,omitempty"`
+	CountedByName    string   `json:"counted_by,omitempty"`
+	SelectedProducts []string `json:"selected_products,omitempty"`
 }
 
 // RecordCountLineInput represents input for recording a count
