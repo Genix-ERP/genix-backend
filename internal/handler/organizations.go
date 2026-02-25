@@ -1054,19 +1054,32 @@ func (h *Handler) createIntercompanyContacts(tenantID, newOrgID uuid.UUID, newOr
 			}
 		}
 
-		// 1) Create target org (A) as vendor in the new org (B)
-		vendorID := uuid.New()
-		vendorCode := fmt.Sprintf("VEN-%s", vendorID.String()[:8])
-		_, err = h.db.Exec(`
-			INSERT INTO contacts (id, tenant_id, organization_id, type, code, name, tax_id,
-				email, phone, billing_address, shipping_address, tags, custom_fields,
-				is_active, created_at, updated_at)
-			VALUES ($1, $2, $3, 'vendor', $4, $5, $6, $7, $8, $9, '{}', '[]', '{}', true, $10, $10)
-			ON CONFLICT (tenant_id, organization_id, code) DO NOTHING
-		`, vendorID, tenantID, newOrgID, vendorCode, targetInfo.Name, targetInfo.TaxID,
-			targetInfo.Email, targetInfo.Phone, targetBillingAddr, now)
-		if err != nil {
-			h.log.Error("Failed to create vendor contact", "error", err, "org", newOrgID, "vendor", targetInfo.Name)
+		// 1) Create or update target org (A) as vendor in the new org (B)
+		var existingVendorID uuid.UUID
+		err = h.db.QueryRow(`SELECT id FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND type = 'vendor' AND source_organization_id = $3 AND deleted_at IS NULL`,
+			tenantID, newOrgID, targetOrgID).Scan(&existingVendorID)
+
+		if err == nil {
+			// Update existing vendor contact
+			_, err = h.db.Exec(`UPDATE contacts SET name = $1, tax_id = $2, email = $3, phone = $4, billing_address = $5, updated_at = $6 WHERE id = $7`,
+				targetInfo.Name, targetInfo.TaxID, targetInfo.Email, targetInfo.Phone, targetBillingAddr, now, existingVendorID)
+			if err != nil {
+				h.log.Error("Failed to update vendor contact", "error", err)
+			}
+		} else {
+			// Create new vendor contact
+			vendorID := uuid.New()
+			vendorCode := fmt.Sprintf("VEN-%s", vendorID.String()[:8])
+			_, err = h.db.Exec(`
+				INSERT INTO contacts (id, tenant_id, organization_id, type, code, name, tax_id,
+					email, phone, billing_address, shipping_address, tags, custom_fields,
+					source_organization_id, is_active, created_at, updated_at)
+				VALUES ($1, $2, $3, 'vendor', $4, $5, $6, $7, $8, $9, '{}', '[]', '{}', $10, true, $11, $11)
+			`, vendorID, tenantID, newOrgID, vendorCode, targetInfo.Name, targetInfo.TaxID,
+				targetInfo.Email, targetInfo.Phone, targetBillingAddr, targetOrgID, now)
+			if err != nil {
+				h.log.Error("Failed to create vendor contact", "error", err, "org", newOrgID, "vendor", targetInfo.Name)
+			}
 		}
 
 		// Build new org billing address
@@ -1077,24 +1090,38 @@ func (h *Handler) createIntercompanyContacts(tenantID, newOrgID uuid.UUID, newOr
 			}
 		}
 
-		// 2) Create the new org (B) as customer in target org (A)
-		customerID := uuid.New()
-		customerCode := fmt.Sprintf("CUS-%s", customerID.String()[:8])
+		// 2) Create or update the new org (B) as customer in target org (A)
+		var existingCustomerID uuid.UUID
+		err = h.db.QueryRow(`SELECT id FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND type = 'customer' AND source_organization_id = $3 AND deleted_at IS NULL`,
+			tenantID, targetOrgID, newOrgID).Scan(&existingCustomerID)
+
 		var newEmail, newPhone *string
 		if newOrgInfo != nil {
 			newEmail = newOrgInfo.Email
 			newPhone = newOrgInfo.Phone
 		}
-		_, err = h.db.Exec(`
-			INSERT INTO contacts (id, tenant_id, organization_id, type, code, name, tax_id,
-				email, phone, billing_address, shipping_address, tags, custom_fields,
-				is_active, created_at, updated_at)
-			VALUES ($1, $2, $3, 'customer', $4, $5, $6, $7, $8, $9, '{}', '[]', '{}', true, $10, $10)
-			ON CONFLICT (tenant_id, organization_id, code) DO NOTHING
-		`, customerID, tenantID, targetOrgID, customerCode, newOrgName, newOrgTaxID,
-			newEmail, newPhone, newOrgBillingAddr, now)
-		if err != nil {
-			h.log.Error("Failed to create customer contact", "error", err, "org", targetOrgID, "customer", newOrgName)
+
+		if err == nil {
+			// Update existing customer contact
+			_, err = h.db.Exec(`UPDATE contacts SET name = $1, tax_id = $2, email = $3, phone = $4, billing_address = $5, updated_at = $6 WHERE id = $7`,
+				newOrgName, newOrgTaxID, newEmail, newPhone, newOrgBillingAddr, now, existingCustomerID)
+			if err != nil {
+				h.log.Error("Failed to update customer contact", "error", err)
+			}
+		} else {
+			// Create new customer contact
+			customerID := uuid.New()
+			customerCode := fmt.Sprintf("CUS-%s", customerID.String()[:8])
+			_, err = h.db.Exec(`
+				INSERT INTO contacts (id, tenant_id, organization_id, type, code, name, tax_id,
+					email, phone, billing_address, shipping_address, tags, custom_fields,
+					source_organization_id, is_active, created_at, updated_at)
+				VALUES ($1, $2, $3, 'customer', $4, $5, $6, $7, $8, $9, '{}', '[]', '{}', $10, true, $11, $11)
+			`, customerID, tenantID, targetOrgID, customerCode, newOrgName, newOrgTaxID,
+				newEmail, newPhone, newOrgBillingAddr, newOrgID, now)
+			if err != nil {
+				h.log.Error("Failed to create customer contact", "error", err, "org", targetOrgID, "customer", newOrgName)
+			}
 		}
 	}
 }
