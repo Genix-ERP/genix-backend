@@ -34,7 +34,7 @@ func (s *Service) Send(email *Email) error {
 	fmt.Printf("[EMAIL] Attempting to send email - Host: %s, Port: %d, To: %s\n",
 		s.config.SMTPHost, s.config.SMTPPort, strings.Join(email.To, ", "))
 
-	if s.config.SMTPHost == "" || s.config.SMTPHost == "localhost" {
+	if s.config.Provider == "console" || s.config.SMTPHost == "" || s.config.SMTPHost == "localhost" {
 		// In development, just log the email
 		fmt.Printf("[EMAIL] Development mode - logging only\n")
 		fmt.Printf("[EMAIL] To: %s, Subject: %s\n", strings.Join(email.To, ", "), email.Subject)

@@ -835,7 +835,8 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	}
 
 	var input struct {
-		Amount float64 `json:"amount"`
+		Amount         float64 `json:"amount"`
+		WriteOffAmount float64 `json:"write_off_amount,omitempty"`
 	}
 	c.ShouldBindJSON(&input)
 
@@ -863,10 +864,10 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	// If no amount specified, pay in full
 	paymentAmount := input.Amount
 	if paymentAmount == 0 {
-		paymentAmount = totalAmount - amountPaid
+		paymentAmount = totalAmount - amountPaid - input.WriteOffAmount
 	}
 
-	newAmountPaid := amountPaid + paymentAmount
+	newAmountPaid := amountPaid + paymentAmount + input.WriteOffAmount
 	newStatus := "partial"
 	if newAmountPaid >= totalAmount {
 		newStatus = "paid"
@@ -978,19 +979,21 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			}
 
 			journalEntryID := uuid.New()
+			jeTotal := paymentAmount + input.WriteOffAmount
 			_, err = h.db.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15)`,
 				journalEntryID, tenantID, organizationID, payJournalID, entryNumber, now, invoiceID.String()[:8], description,
-				"purchase_invoice_payment", invoiceID.String(), 1.0, paymentAmount, paymentAmount, now, now,
+				"purchase_invoice_payment", invoiceID.String(), 1.0, jeTotal, jeTotal, now, now,
 			)
 
 			if err != nil {
 				h.log.Error("Failed to create journal entry for payment", "error", err)
 			} else {
-				// Debit AP
+				// Debit AP (payment + write-off reduces AP)
+				apDebitAmount := paymentAmount + input.WriteOffAmount
 				apLineID := uuid.New()
 				h.db.Exec(`
 					INSERT INTO journal_entry_lines (
@@ -998,9 +1001,9 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 					apLineID, journalEntryID, 1, apAcctID, contactUUID, "Accounts Payable",
-					paymentAmount, 0.0, 1.0, now,
+					apDebitAmount, 0.0, 1.0, now,
 				)
-				// Credit Cash
+				// Credit Cash/Outstanding Payments
 				cashLineID := uuid.New()
 				h.db.Exec(`
 					INSERT INTO journal_entry_lines (
@@ -1011,12 +1014,33 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 					0.0, paymentAmount, 1.0, now,
 				)
 
+				// Write-off line: CR Other Income (vendor owes less = gain for us)
+				if input.WriteOffAmount > 0 {
+					otherIncomeID := findAccount(h.db, tenantID, organizationID, "other income", "4900")
+					if otherIncomeID == uuid.Nil {
+						otherIncomeID = findAccount(h.db, tenantID, organizationID, "payment difference write-off", "6950")
+					}
+					if otherIncomeID != uuid.Nil {
+						writeOffLineID := uuid.New()
+						h.db.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, line_number, account_id, description,
+								debit_amount, credit_amount, exchange_rate, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+							writeOffLineID, journalEntryID, 3, otherIncomeID, "Payment Difference Write-off",
+							0.0, input.WriteOffAmount, 1.0, now,
+						)
+						// Update write-off account balance (credit-normal income: credit increases)
+						h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.WriteOffAmount, now, otherIncomeID)
+					}
+				}
+
 				// Update journal next number
 				h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", payJournalID)
 
 				// Update account balances
-				// Debit AP (credit-normal: debit decreases)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, apAcctID)
+				// Debit AP (credit-normal: debit decreases) — includes write-off
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID)
 				// Credit Outstanding Payments (debit-normal: credit decreases)
 				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
 			}

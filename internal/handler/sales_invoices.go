@@ -1134,11 +1134,12 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	var input struct {
-		Amount        float64 `json:"amount" binding:"required,gt=0"`
-		PaymentDate   string  `json:"payment_date" binding:"required"`
-		PaymentMethod string  `json:"payment_method,omitempty"`
-		Reference     string  `json:"reference,omitempty"`
-		Notes         string  `json:"notes,omitempty"`
+		Amount         float64 `json:"amount" binding:"required,gt=0"`
+		PaymentDate    string  `json:"payment_date" binding:"required"`
+		PaymentMethod  string  `json:"payment_method,omitempty"`
+		Reference      string  `json:"reference,omitempty"`
+		Notes          string  `json:"notes,omitempty"`
+		WriteOffAmount float64 `json:"write_off_amount,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, err.Error())
@@ -1176,12 +1177,12 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	amountDue := totalAmount - amountPaid
-	if input.Amount > amountDue {
-		response.BadRequest(c, fmt.Sprintf("Payment amount exceeds amount due (%.2f)", amountDue))
+	if input.Amount+input.WriteOffAmount > amountDue+0.01 {
+		response.BadRequest(c, fmt.Sprintf("Payment + write-off exceeds amount due (%.2f)", amountDue))
 		return
 	}
 
-	newAmountPaid := amountPaid + input.Amount
+	newAmountPaid := amountPaid + input.Amount + input.WriteOffAmount
 	newStatus := entity.InvoiceStatusPartial
 	if newAmountPaid >= totalAmount {
 		newStatus = entity.InvoiceStatusPaid
@@ -1251,13 +1252,14 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			reference = invoiceNumber
 		}
 
+		jeTotal := input.Amount + input.WriteOffAmount
 		_, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
 			journalEntryID, tenantID, organizationID, cashJournalID, entryNumber, paymentDate, reference, description,
-			"payment_receipt", invoiceID, 1.0, input.Amount, input.Amount, "posted", userID, now, now,
+			"payment_receipt", invoiceID, 1.0, jeTotal, jeTotal, "posted", userID, now, now,
 		)
 		if err != nil {
 			h.log.Error("Failed to create payment journal entry", "error", err)
@@ -1274,7 +1276,8 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				input.Amount, 0.0, 1.0, now,
 			)
 
-			// Line 2: Credit AR
+			// Line 2: Credit AR (payment + write-off reduces AR)
+			arCreditAmount := input.Amount + input.WriteOffAmount
 			arLineID := uuid.New()
 			_, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
@@ -1282,8 +1285,31 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 					debit_amount, credit_amount, exchange_rate, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 				arLineID, journalEntryID, 2, arAccountID, customerID, "Accounts Receivable",
-				0.0, input.Amount, 1.0, now,
+				0.0, arCreditAmount, 1.0, now,
 			)
+
+			lineNumber := 3
+			// Line 3: Write-off (DR Write-off Expense, already credited AR above)
+			if input.WriteOffAmount > 0 {
+				writeOffAccountID := findAccount(tx, tenantID, organizationID, "payment difference write-off", "6950")
+				if writeOffAccountID == uuid.Nil {
+					writeOffAccountID = findAccount(tx, tenantID, organizationID, "miscellaneous expense", "6900")
+				}
+				if writeOffAccountID != uuid.Nil {
+					writeOffLineID := uuid.New()
+					tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, contact_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						writeOffLineID, journalEntryID, lineNumber, writeOffAccountID, customerID, "Payment Difference Write-off",
+						input.WriteOffAmount, 0.0, 1.0, now,
+					)
+					lineNumber++
+					// Update write-off account balance (debit-normal expense: debit increases)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.WriteOffAmount, now, writeOffAccountID)
+				}
+			}
 
 			// Update journal next number
 			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", cashJournalID)
@@ -1291,8 +1317,8 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			// Update account balances
 			// Debit Outstanding Receipts / Cash (debit-normal: increases)
 			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAccountID)
-			// Credit AR (debit-normal: credit decreases)
-			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Amount, now, arAccountID)
+			// Credit AR (debit-normal: credit decreases) — includes write-off amount
+			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", arCreditAmount, now, arAccountID)
 
 			// Create payment record
 			paymentID := uuid.New()

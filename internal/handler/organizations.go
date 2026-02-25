@@ -43,10 +43,11 @@ type Organization struct {
 	ActivityStatus        *string `json:"activity_status,omitempty"`
 	BusinessGroup         *string `json:"business_group,omitempty"`
 	IntercompanyRelations *string `json:"intercompany_relations,omitempty"`
-	DirectorName          *string `json:"director_name,omitempty"`
-	DirectorPhone         *string `json:"director_phone,omitempty"`
-	LegalAddress          *string `json:"legal_address,omitempty"`
-	Notes                 *string `json:"notes,omitempty"`
+	DirectorName          *string  `json:"director_name,omitempty"`
+	DirectorPhone         *string  `json:"director_phone,omitempty"`
+	LegalAddress          *string  `json:"legal_address,omitempty"`
+	Notes                 *string  `json:"notes,omitempty"`
+	IntercompanyVendorIDs []string `json:"intercompany_vendor_ids,omitempty"`
 }
 
 // CreateOrganizationInput represents the input for creating an organization
@@ -77,6 +78,8 @@ type CreateOrganizationInput struct {
 	DirectorPhone         *string `json:"director_phone,omitempty"`
 	LegalAddress          *string `json:"legal_address,omitempty"`
 	Notes                 *string `json:"notes,omitempty"`
+	// Intercompany vendoring: create vendor+customer contacts in these org IDs
+	IntercompanyVendorIDs []string `json:"intercompany_vendor_ids,omitempty"`
 }
 
 // UpdateOrganizationInput represents the input for updating an organization
@@ -108,6 +111,8 @@ type UpdateOrganizationInput struct {
 	DirectorPhone         *string `json:"director_phone,omitempty"`
 	LegalAddress          *string `json:"legal_address,omitempty"`
 	Notes                 *string `json:"notes,omitempty"`
+	// Intercompany vendoring: create vendor+customer contacts in these org IDs
+	IntercompanyVendorIDs []string `json:"intercompany_vendor_ids,omitempty"`
 }
 
 // ListOrganizations returns all organizations for the current tenant
@@ -173,6 +178,39 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 
 	if organizations == nil {
 		organizations = []Organization{}
+	}
+
+	// Build org name -> org ID map for intercompany vendor lookup
+	if len(organizations) > 1 {
+		orgNameToID := make(map[string]string)
+		for _, org := range organizations {
+			orgNameToID[org.Name] = org.ID.String()
+		}
+
+		// For each org, find vendor contacts whose name matches another org
+		for i, org := range organizations {
+			vendorRows, err := h.db.Query(
+				`SELECT name FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND type = 'vendor' AND deleted_at IS NULL`,
+				tenantID, org.ID,
+			)
+			if err != nil {
+				continue
+			}
+			var vendorIDs []string
+			for vendorRows.Next() {
+				var vendorName string
+				if err := vendorRows.Scan(&vendorName); err != nil {
+					continue
+				}
+				if matchedOrgID, ok := orgNameToID[vendorName]; ok && matchedOrgID != org.ID.String() {
+					vendorIDs = append(vendorIDs, matchedOrgID)
+				}
+			}
+			vendorRows.Close()
+			if len(vendorIDs) > 0 {
+				organizations[i].IntercompanyVendorIDs = vendorIDs
+			}
+		}
 	}
 
 	response.Success(c, organizations)
@@ -315,6 +353,11 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 	if err := h.createDefaultJournals(tenantID, orgID); err != nil {
 		h.log.Error("Failed to create default journals", "error", err, "org_id", orgID)
 		// Don't fail the organization creation, just log the error
+	}
+
+	// Create intercompany vendor/customer contacts in selected organizations
+	if len(input.IntercompanyVendorIDs) > 0 {
+		h.createIntercompanyContacts(tenantID, orgID, input.Name, input.TaxID, input.IntercompanyVendorIDs)
 	}
 
 	response.Created(c, org)
@@ -606,6 +649,13 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 	}
 	if len(settingsJSON) > 0 {
 		json.Unmarshal(settingsJSON, &org.Settings)
+	}
+
+	// Create intercompany vendor/customer contacts if requested
+	if len(input.IntercompanyVendorIDs) > 0 {
+		if parsedTenantID, err := uuid.Parse(tenantID.(string)); err == nil {
+			h.createIntercompanyContacts(parsedTenantID, orgID, org.Name, org.TaxID, input.IntercompanyVendorIDs)
+		}
 	}
 
 	response.Success(c, org)
@@ -920,7 +970,7 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 				default_debit_account_id, default_credit_account_id,
 				is_active, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (tenant_id, code) DO NOTHING
+			ON CONFLICT (tenant_id, organization_id, code) DO NOTHING
 		`,
 			id, tenantID, j.code, j.name, j.journalType,
 			defaultDebitID, defaultCreditID,
@@ -933,6 +983,120 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 
 	h.log.Info("Created default journals", "tenant_id", tenantID, "org_id", orgID, "journal_count", len(defaultJournals))
 	return nil
+}
+
+// createIntercompanyContacts sets up intercompany vendor/client relationships.
+// When creating Company B and selecting Company A:
+//   - A becomes a vendor (supplier) in B
+//   - B becomes a customer (client) in A
+// intercompanyOrgInfo holds organization fields needed for creating intercompany contacts
+type intercompanyOrgInfo struct {
+	Name         string
+	TaxID        *string
+	Email        *string
+	Phone        *string
+	LegalAddress *string
+	BankAccount  *string
+	BankMFO      *string
+	BankName     *string
+}
+
+func (h *Handler) getOrgInfoForIntercompany(tenantID, orgID uuid.UUID) (*intercompanyOrgInfo, error) {
+	var info intercompanyOrgInfo
+	var contactInfoJSON []byte
+	err := h.db.QueryRow(
+		`SELECT name, tax_id, contact_info, legal_address, bank_account, bank_mfo, bank_name
+		 FROM organizations WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		orgID, tenantID,
+	).Scan(&info.Name, &info.TaxID, &contactInfoJSON, &info.LegalAddress, &info.BankAccount, &info.BankMFO, &info.BankName)
+	if err != nil {
+		return nil, err
+	}
+	if len(contactInfoJSON) > 0 {
+		var ci map[string]interface{}
+		if json.Unmarshal(contactInfoJSON, &ci) == nil {
+			if e, ok := ci["email"].(string); ok && e != "" {
+				info.Email = &e
+			}
+			if p, ok := ci["phone"].(string); ok && p != "" {
+				info.Phone = &p
+			}
+		}
+	}
+	return &info, nil
+}
+
+func (h *Handler) createIntercompanyContacts(tenantID, newOrgID uuid.UUID, newOrgName string, newOrgTaxID *string, targetOrgIDs []string) {
+	now := time.Now()
+
+	// Get new org's full info for customer contacts
+	newOrgInfo, _ := h.getOrgInfoForIntercompany(tenantID, newOrgID)
+
+	for _, targetIDStr := range targetOrgIDs {
+		targetOrgID, err := uuid.Parse(targetIDStr)
+		if err != nil {
+			h.log.Error("Invalid intercompany target org ID", "error", err, "target_id", targetIDStr)
+			continue
+		}
+
+		// Get target org full info for vendor contacts
+		targetInfo, err := h.getOrgInfoForIntercompany(tenantID, targetOrgID)
+		if err != nil {
+			h.log.Error("Intercompany target org not found", "target_id", targetOrgID, "tenant_id", tenantID)
+			continue
+		}
+
+		// Build billing address JSON from legal_address
+		targetBillingAddr := "{}"
+		if targetInfo.LegalAddress != nil && *targetInfo.LegalAddress != "" {
+			if addrJSON, err := json.Marshal(map[string]string{"street": *targetInfo.LegalAddress}); err == nil {
+				targetBillingAddr = string(addrJSON)
+			}
+		}
+
+		// 1) Create target org (A) as vendor in the new org (B)
+		vendorID := uuid.New()
+		vendorCode := fmt.Sprintf("VEN-%s", vendorID.String()[:8])
+		_, err = h.db.Exec(`
+			INSERT INTO contacts (id, tenant_id, organization_id, type, code, name, tax_id,
+				email, phone, billing_address, shipping_address, tags, custom_fields,
+				is_active, created_at, updated_at)
+			VALUES ($1, $2, $3, 'vendor', $4, $5, $6, $7, $8, $9, '{}', '[]', '{}', true, $10, $10)
+			ON CONFLICT (tenant_id, organization_id, code) DO NOTHING
+		`, vendorID, tenantID, newOrgID, vendorCode, targetInfo.Name, targetInfo.TaxID,
+			targetInfo.Email, targetInfo.Phone, targetBillingAddr, now)
+		if err != nil {
+			h.log.Error("Failed to create vendor contact", "error", err, "org", newOrgID, "vendor", targetInfo.Name)
+		}
+
+		// Build new org billing address
+		newOrgBillingAddr := "{}"
+		if newOrgInfo != nil && newOrgInfo.LegalAddress != nil && *newOrgInfo.LegalAddress != "" {
+			if addrJSON, err := json.Marshal(map[string]string{"street": *newOrgInfo.LegalAddress}); err == nil {
+				newOrgBillingAddr = string(addrJSON)
+			}
+		}
+
+		// 2) Create the new org (B) as customer in target org (A)
+		customerID := uuid.New()
+		customerCode := fmt.Sprintf("CUS-%s", customerID.String()[:8])
+		var newEmail, newPhone *string
+		if newOrgInfo != nil {
+			newEmail = newOrgInfo.Email
+			newPhone = newOrgInfo.Phone
+		}
+		_, err = h.db.Exec(`
+			INSERT INTO contacts (id, tenant_id, organization_id, type, code, name, tax_id,
+				email, phone, billing_address, shipping_address, tags, custom_fields,
+				is_active, created_at, updated_at)
+			VALUES ($1, $2, $3, 'customer', $4, $5, $6, $7, $8, $9, '{}', '[]', '{}', true, $10, $10)
+			ON CONFLICT (tenant_id, organization_id, code) DO NOTHING
+		`, customerID, tenantID, targetOrgID, customerCode, newOrgName, newOrgTaxID,
+			newEmail, newPhone, newOrgBillingAddr, now)
+		if err != nil {
+			h.log.Error("Failed to create customer contact", "error", err, "org", targetOrgID, "customer", newOrgName)
+		}
+	}
 }
 
 // ImportOrganizationsInput represents the input for bulk importing organizations

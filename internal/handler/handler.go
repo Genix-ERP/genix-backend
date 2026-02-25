@@ -5,6 +5,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/infrastructure/cache"
 	"github.com/genixerp/genix-backend/internal/infrastructure/database"
 	"github.com/genixerp/genix-backend/internal/infrastructure/email"
+	"github.com/genixerp/genix-backend/internal/infrastructure/sms"
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/crypto"
 	"github.com/genixerp/genix-backend/internal/pkg/logger"
@@ -19,6 +20,7 @@ type Handler struct {
 	log          logger.Logger
 	jwtManager   *crypto.JWTManager
 	emailService *email.Service
+	smsService   *sms.Service
 }
 
 // NewHandler creates a new handler instance
@@ -30,6 +32,7 @@ func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, l
 		log:          log,
 		jwtManager:   crypto.NewJWTManager(cfg.JWT),
 		emailService: email.NewService(&cfg.Email),
+		smsService:   sms.NewService(&cfg.SMS),
 	}
 }
 
@@ -98,6 +101,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		users.GET("", h.ListUsers)
 		users.POST("", middleware.RequirePermission("users", "user", "create"), h.CreateUser)
+		users.POST("/send-credentials", middleware.RequirePermission("users", "user", "create"), h.SendCredentials)
 		users.GET("/:id", h.GetUser)
 		users.PUT("/:id", middleware.RequirePermission("users", "user", "update"), h.UpdateUser)
 		users.DELETE("/:id", middleware.RequirePermission("users", "user", "delete"), h.DeleteUser)
