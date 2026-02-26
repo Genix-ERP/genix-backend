@@ -1030,22 +1030,38 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	}
 
 	query := `
-		SELECT id, code, name, type,
-			COALESCE(description, ''),
-			default_debit_account_id,
-			default_credit_account_id,
-			COALESCE(auto_sequence, false),
-			COALESCE(next_number, 1),
-			COALESCE(number_prefix, ''),
-			COALESCE(is_active, true),
-			created_at,
-			COALESCE(updated_at, created_at)
-		FROM journals
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-		ORDER BY code ASC
+		SELECT j.id, j.code, j.name, j.type,
+			COALESCE(j.description, ''),
+			j.default_debit_account_id,
+			j.default_credit_account_id,
+			COALESCE(j.auto_sequence, false),
+			COALESCE(j.next_number, 1),
+			COALESCE(j.number_prefix, ''),
+			COALESCE(j.short_code, ''),
+			COALESCE(j.currency, ''),
+			j.bank_account_id,
+			j.suspense_account_id,
+			j.profit_account_id,
+			j.loss_account_id,
+			COALESCE(j.is_active, true),
+			j.created_at,
+			COALESCE(j.updated_at, j.created_at)
+		FROM journals j
+		WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
+		ORDER BY j.code ASC
 	`
 
-	rows, err := h.db.Query(query, tenantID)
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND j.organization_id = $%d ORDER BY", argCount), 1)
+		args = append(args, orgID)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query journals", "error", err)
 		response.InternalError(c, "Failed to fetch journals")
@@ -1064,6 +1080,12 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		AutoSequence           bool       `json:"auto_sequence"`
 		NextNumber             int        `json:"next_number"`
 		NumberPrefix           string     `json:"number_prefix,omitempty"`
+		ShortCode              string     `json:"short_code"`
+		Currency               string     `json:"currency"`
+		BankAccountID          *uuid.UUID `json:"bank_account_id,omitempty"`
+		SuspenseAccountID      *uuid.UUID `json:"suspense_account_id,omitempty"`
+		ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty"`
+		LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty"`
 		IsActive               bool       `json:"is_active"`
 		CreatedAt              time.Time  `json:"created_at"`
 		UpdatedAt              time.Time  `json:"updated_at"`
@@ -1072,7 +1094,12 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	journals := make([]JournalResponse, 0)
 	for rows.Next() {
 		var j JournalResponse
-		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.Description, &j.DefaultDebitAccountID, &j.DefaultCreditAccountID, &j.AutoSequence, &j.NextNumber, &j.NumberPrefix, &j.IsActive, &j.CreatedAt, &j.UpdatedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.Description,
+			&j.DefaultDebitAccountID, &j.DefaultCreditAccountID,
+			&j.AutoSequence, &j.NextNumber, &j.NumberPrefix,
+			&j.ShortCode, &j.Currency,
+			&j.BankAccountID, &j.SuspenseAccountID, &j.ProfitAccountID, &j.LossAccountID,
+			&j.IsActive, &j.CreatedAt, &j.UpdatedAt); err != nil {
 			h.log.Error("Failed to scan journal", "error", err)
 			continue
 		}
@@ -1110,40 +1137,77 @@ func (h *Handler) GetJournal(c *gin.Context) {
 		return
 	}
 
-	type JournalResponse struct {
+	var j struct {
 		ID                     uuid.UUID  `json:"id"`
 		Code                   string     `json:"code"`
 		Name                   string     `json:"name"`
 		Type                   string     `json:"type"`
-		Description            string     `json:"description,omitempty"`
+		Description            string     `json:"description"`
 		DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty"`
 		DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty"`
 		AutoSequence           bool       `json:"auto_sequence"`
 		NextNumber             int        `json:"next_number"`
-		NumberPrefix           string     `json:"number_prefix,omitempty"`
+		NumberPrefix           string     `json:"number_prefix"`
+		ShortCode              string     `json:"short_code"`
+		Currency               string     `json:"currency"`
+		BankAccountID          *uuid.UUID `json:"bank_account_id,omitempty"`
+		SuspenseAccountID      *uuid.UUID `json:"suspense_account_id,omitempty"`
+		ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty"`
+		LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty"`
 		IsActive               bool       `json:"is_active"`
 		CreatedAt              time.Time  `json:"created_at"`
 		UpdatedAt              time.Time  `json:"updated_at"`
+		// Enriched names from JOINs
+		BankAccountName     string `json:"bank_account_name"`
+		SuspenseAccountName string `json:"suspense_account_name"`
+		ProfitAccountName   string `json:"profit_account_name"`
+		LossAccountName     string `json:"loss_account_name"`
+		DebitAccountName    string `json:"debit_account_name"`
+		CreditAccountName   string `json:"credit_account_name"`
+		EntryCount          int    `json:"entry_count"`
 	}
 
-	var j JournalResponse
 	err = h.db.QueryRow(`
-		SELECT id, code, name, type,
-			COALESCE(description, ''),
-			default_debit_account_id,
-			default_credit_account_id,
-			COALESCE(auto_sequence, false),
-			COALESCE(next_number, 1),
-			COALESCE(number_prefix, ''),
-			COALESCE(is_active, true),
-			created_at,
-			COALESCE(updated_at, created_at)
-		FROM journals
-		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		SELECT j.id, j.code, j.name, j.type,
+			COALESCE(j.description, ''),
+			j.default_debit_account_id,
+			j.default_credit_account_id,
+			COALESCE(j.auto_sequence, false),
+			COALESCE(j.next_number, 1),
+			COALESCE(j.number_prefix, ''),
+			COALESCE(j.short_code, ''),
+			COALESCE(j.currency, ''),
+			j.bank_account_id,
+			j.suspense_account_id,
+			j.profit_account_id,
+			j.loss_account_id,
+			COALESCE(j.is_active, true),
+			j.created_at,
+			COALESCE(j.updated_at, j.created_at),
+			COALESCE(ba.bank_name || ' - ' || ba.account_number, ''),
+			COALESCE(sa.code || ' ' || sa.name, ''),
+			COALESCE(pa.code || ' ' || pa.name, ''),
+			COALESCE(la.code || ' ' || la.name, ''),
+			COALESCE(da.code || ' ' || da.name, ''),
+			COALESCE(ca.code || ' ' || ca.name, ''),
+			(SELECT COUNT(*) FROM journal_entries WHERE journal_id = j.id AND deleted_at IS NULL)
+		FROM journals j
+		LEFT JOIN bank_accounts ba ON j.bank_account_id = ba.id
+		LEFT JOIN accounts sa ON j.suspense_account_id = sa.id
+		LEFT JOIN accounts pa ON j.profit_account_id = pa.id
+		LEFT JOIN accounts la ON j.loss_account_id = la.id
+		LEFT JOIN accounts da ON j.default_debit_account_id = da.id
+		LEFT JOIN accounts ca ON j.default_credit_account_id = ca.id
+		WHERE j.id = $1 AND j.tenant_id = $2 AND j.deleted_at IS NULL
 	`, id, tenantID).Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.Description,
 		&j.DefaultDebitAccountID, &j.DefaultCreditAccountID,
-		&j.AutoSequence, &j.NextNumber, &j.NumberPrefix, &j.IsActive,
-		&j.CreatedAt, &j.UpdatedAt)
+		&j.AutoSequence, &j.NextNumber, &j.NumberPrefix,
+		&j.ShortCode, &j.Currency,
+		&j.BankAccountID, &j.SuspenseAccountID, &j.ProfitAccountID, &j.LossAccountID,
+		&j.IsActive, &j.CreatedAt, &j.UpdatedAt,
+		&j.BankAccountName, &j.SuspenseAccountName, &j.ProfitAccountName, &j.LossAccountName,
+		&j.DebitAccountName, &j.CreditAccountName,
+		&j.EntryCount)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Journal")
@@ -1202,7 +1266,13 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 	journalID := uuid.New()
 	now := time.Now()
 
-	// Convert empty string pointers to nil for nullable UUID columns
+	nullIfEmpty := func(s *string) interface{} {
+		if s == nil || *s == "" {
+			return nil
+		}
+		return *s
+	}
+
 	var debitAccID, creditAccID interface{}
 	if input.DefaultDebitAccountID != nil && *input.DefaultDebitAccountID != "" {
 		debitAccID = *input.DefaultDebitAccountID
@@ -1211,14 +1281,32 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 		creditAccID = *input.DefaultCreditAccountID
 	}
 
+	// Get organization ID from context
+	var orgID interface{}
+	if oid, oidOk := middleware.GetOrganizationID(c); oidOk && oid != uuid.Nil {
+		orgID = oid
+	}
+
+	shortCode := input.ShortCode
+	if shortCode == "" && len(input.Code) >= 3 {
+		shortCode = input.Code[:3]
+	}
+
 	_, err = h.db.Exec(`
 		INSERT INTO journals (id, tenant_id, code, name, type, description,
 			default_debit_account_id, default_credit_account_id,
-			auto_sequence, next_number, number_prefix, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, true, $11, $11)
+			auto_sequence, next_number, number_prefix,
+			short_code, currency,
+			bank_account_id, suspense_account_id, profit_account_id, loss_account_id,
+			organization_id, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14, $15, $16, $17, true, $18, $18)
 	`, journalID, tenantID, input.Code, input.Name, input.Type, input.Description,
 		debitAccID, creditAccID,
-		input.AutoSequence, input.NumberPrefix, now)
+		input.AutoSequence, input.NumberPrefix,
+		shortCode, input.Currency,
+		nullIfEmpty(input.BankAccountID), nullIfEmpty(input.SuspenseAccountID),
+		nullIfEmpty(input.ProfitAccountID), nullIfEmpty(input.LossAccountID),
+		orgID, now)
 
 	if err != nil {
 		h.log.Error("Failed to create journal", "error", err)
@@ -1303,6 +1391,40 @@ func (h *Handler) UpdateJournal(c *gin.Context) {
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
+	}
+	if input.ShortCode != nil {
+		addUpdate("short_code", *input.ShortCode)
+	}
+	if input.Currency != nil {
+		addUpdate("currency", *input.Currency)
+	}
+	if input.BankAccountID != nil {
+		if *input.BankAccountID == "" {
+			addUpdate("bank_account_id", nil)
+		} else {
+			addUpdate("bank_account_id", *input.BankAccountID)
+		}
+	}
+	if input.SuspenseAccountID != nil {
+		if *input.SuspenseAccountID == "" {
+			addUpdate("suspense_account_id", nil)
+		} else {
+			addUpdate("suspense_account_id", *input.SuspenseAccountID)
+		}
+	}
+	if input.ProfitAccountID != nil {
+		if *input.ProfitAccountID == "" {
+			addUpdate("profit_account_id", nil)
+		} else {
+			addUpdate("profit_account_id", *input.ProfitAccountID)
+		}
+	}
+	if input.LossAccountID != nil {
+		if *input.LossAccountID == "" {
+			addUpdate("loss_account_id", nil)
+		} else {
+			addUpdate("loss_account_id", *input.LossAccountID)
+		}
 	}
 
 	if len(updates) == 0 {
@@ -1396,6 +1518,180 @@ func (h *Handler) DeleteJournal(c *gin.Context) {
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
 		response.NotFound(c, "Journal")
+		return
+	}
+
+	response.NoContent(c)
+}
+
+// ListPaymentMethods returns all payment methods for the tenant
+func (h *Handler) ListPaymentMethods(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, code, name, type, COALESCE(is_active, true)
+		FROM payment_methods
+		WHERE tenant_id = $1
+		ORDER BY name ASC
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list payment methods", "error", err)
+		response.InternalError(c, "Failed to fetch payment methods")
+		return
+	}
+	defer rows.Close()
+
+	type PM struct {
+		ID       uuid.UUID `json:"id"`
+		Code     string    `json:"code"`
+		Name     string    `json:"name"`
+		Type     string    `json:"type"`
+		IsActive bool      `json:"is_active"`
+	}
+	result := make([]PM, 0)
+	for rows.Next() {
+		var pm PM
+		if err := rows.Scan(&pm.ID, &pm.Code, &pm.Name, &pm.Type, &pm.IsActive); err != nil {
+			continue
+		}
+		result = append(result, pm)
+	}
+	response.Success(c, result)
+}
+
+// ListJournalPaymentMethods returns payment methods linked to a journal
+func (h *Handler) ListJournalPaymentMethods(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	journalID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid journal ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT jpm.id, jpm.payment_method_id, jpm.direction, jpm.name,
+			jpm.outstanding_account_id, COALESCE(jpm.is_active, true), jpm.created_at,
+			pm.code as pm_code, pm.name as pm_name,
+			COALESCE(a.code || ' ' || a.name, '') as account_name
+		FROM journal_payment_methods jpm
+		JOIN payment_methods pm ON jpm.payment_method_id = pm.id
+		LEFT JOIN accounts a ON jpm.outstanding_account_id = a.id
+		WHERE jpm.journal_id = $1 AND jpm.tenant_id = $2
+		ORDER BY jpm.direction, jpm.created_at
+	`, journalID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list journal payment methods", "error", err)
+		response.InternalError(c, "Failed to fetch journal payment methods")
+		return
+	}
+	defer rows.Close()
+
+	type JPM struct {
+		ID                   uuid.UUID  `json:"id"`
+		PaymentMethodID      uuid.UUID  `json:"payment_method_id"`
+		Direction            string     `json:"direction"`
+		Name                 string     `json:"name"`
+		OutstandingAccountID *uuid.UUID `json:"outstanding_account_id,omitempty"`
+		IsActive             bool       `json:"is_active"`
+		CreatedAt            time.Time  `json:"created_at"`
+		PMCode               string     `json:"pm_code"`
+		PMName               string     `json:"pm_name"`
+		AccountName          string     `json:"account_name"`
+	}
+	result := make([]JPM, 0)
+	for rows.Next() {
+		var jpm JPM
+		if err := rows.Scan(&jpm.ID, &jpm.PaymentMethodID, &jpm.Direction, &jpm.Name,
+			&jpm.OutstandingAccountID, &jpm.IsActive, &jpm.CreatedAt,
+			&jpm.PMCode, &jpm.PMName, &jpm.AccountName); err != nil {
+			continue
+		}
+		result = append(result, jpm)
+	}
+	response.Success(c, result)
+}
+
+// AddJournalPaymentMethod links a payment method to a journal
+func (h *Handler) AddJournalPaymentMethod(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	journalID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid journal ID")
+		return
+	}
+
+	var input struct {
+		PaymentMethodID      string `json:"payment_method_id" binding:"required"`
+		Direction            string `json:"direction" binding:"required,oneof=inbound outbound"`
+		Name                 string `json:"name"`
+		OutstandingAccountID string `json:"outstanding_account_id"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	id := uuid.New()
+	var outAccID interface{}
+	if input.OutstandingAccountID != "" {
+		outAccID = input.OutstandingAccountID
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO journal_payment_methods (id, tenant_id, journal_id, payment_method_id, direction, name, outstanding_account_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (journal_id, payment_method_id, direction) DO UPDATE SET
+			name = EXCLUDED.name, outstanding_account_id = EXCLUDED.outstanding_account_id, is_active = true
+	`, id, tenantID, journalID, input.PaymentMethodID, input.Direction, input.Name, outAccID)
+	if err != nil {
+		h.log.Error("Failed to add journal payment method", "error", err)
+		response.InternalError(c, "Failed to add payment method")
+		return
+	}
+
+	h.ListJournalPaymentMethods(c)
+}
+
+// RemoveJournalPaymentMethod removes a payment method from a journal
+func (h *Handler) RemoveJournalPaymentMethod(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	pmID, err := uuid.Parse(c.Param("pmId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid payment method ID")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		DELETE FROM journal_payment_methods WHERE id = $1 AND tenant_id = $2
+	`, pmID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to remove journal payment method", "error", err)
+		response.InternalError(c, "Failed to remove payment method")
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Journal payment method")
 		return
 	}
 
@@ -1501,22 +1797,22 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		}
 	}
 
-	// Generate entry number - use global max for this tenant+org to avoid unique constraint violations
+	// Generate entry number scoped to this journal, filtered by prefix to avoid date-embedded numbers
 	prefix := ""
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
 
 	var maxNumber int
-	if orgID != nil {
+	if prefix != "" {
 		_ = h.db.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
-			tenantID, *orgID,
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
+			tenantID, journalID, prefix+"%",
 		).Scan(&maxNumber)
 	} else {
 		_ = h.db.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
-			tenantID,
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
+			tenantID, journalID,
 		).Scan(&maxNumber)
 	}
 	actualNext := maxNumber + 1
@@ -1990,17 +2286,17 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 		prefix = numberPrefix.String
 	}
 
-	// Use global max to avoid unique constraint violations across journals
+	// Use journal-scoped max filtered by prefix to avoid date-embedded entry numbers
 	var maxNumber int
-	if organizationID != nil {
+	if prefix != "" {
 		_ = h.db.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
-			tenantID, *organizationID,
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
+			tenantID, journalID, prefix+"%",
 		).Scan(&maxNumber)
 	} else {
 		_ = h.db.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
-			tenantID,
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
+			tenantID, journalID,
 		).Scan(&maxNumber)
 	}
 	actualNext := maxNumber + 1
@@ -2201,9 +2497,10 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	baseQuery := `
 		SELECT p.id, p.payment_number, p.type, p.contact_id, p.payment_date, p.amount,
 			   p.status, p.reference, p.notes, p.created_at,
-			   c.name as contact_name
+			   c.name as contact_name, p.journal_id, COALESCE(j.name, '') as journal_name
 		FROM payments p
 		JOIN contacts c ON p.contact_id = c.id
+		LEFT JOIN journals j ON p.journal_id = j.id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM payments p WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
@@ -2276,12 +2573,12 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	payments := make([]*entity.PaymentResponse, 0)
 	for rows.Next() {
 		var p entity.Payment
-		var ref, notes sql.NullString
-		var contactName string
+		var ref, notes, journalIDStr sql.NullString
+		var contactName, journalName string
 
 		err := rows.Scan(
 			&p.ID, &p.PaymentNumber, &p.Type, &p.ContactID, &p.PaymentDate, &p.Amount,
-			&p.Status, &ref, &notes, &p.CreatedAt, &contactName,
+			&p.Status, &ref, &notes, &p.CreatedAt, &contactName, &journalIDStr, &journalName,
 		)
 		if err != nil {
 			continue
@@ -2296,6 +2593,10 @@ func (h *Handler) ListPayments(c *gin.Context) {
 
 		resp := p.ToResponse()
 		resp.ContactName = contactName
+		resp.JournalName = journalName
+		if journalIDStr.Valid {
+			resp.JournalID = journalIDStr.String
+		}
 		payments = append(payments, resp)
 	}
 
@@ -2394,16 +2695,24 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		}
 	}
 
+	var journalIDPtr *uuid.UUID
+	if input.JournalID != nil && *input.JournalID != "" {
+		parsed, _ := uuid.Parse(*input.JournalID)
+		if parsed != uuid.Nil {
+			journalIDPtr = &parsed
+		}
+	}
+
 	query := `
 		INSERT INTO payments (
 			id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
-			exchange_rate, reference, notes, status, bank_account_id, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			exchange_rate, reference, notes, status, bank_account_id, journal_id, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 	`
 
 	_, err = h.db.Exec(query,
 		id, tenantID, orgIDPtr, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
-		exchangeRate, reference, notes, "draft", bankAccountID, userID, now, now)
+		exchangeRate, reference, notes, "draft", bankAccountID, journalIDPtr, userID, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create payment", "error", err)
@@ -2570,13 +2879,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	var status, paymentType, paymentNumber string
 	var amount float64
 	var contactID uuid.UUID
-	var orgID, paymentMethodID, bankAccountIDStr sql.NullString
+	var orgID, paymentMethodID, bankAccountIDStr, storedJournalID sql.NullString
 	var paymentDate time.Time
 	err = h.db.QueryRow(`
-		SELECT status, type, amount, contact_id, organization_id, payment_method_id, payment_date, payment_number, bank_account_id
+		SELECT status, type, amount, contact_id, organization_id, payment_method_id, payment_date, payment_number, bank_account_id, journal_id
 		FROM payments
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&status, &paymentType, &amount, &contactID, &orgID, &paymentMethodID, &paymentDate, &paymentNumber, &bankAccountIDStr)
+	`, id, tenantID).Scan(&status, &paymentType, &amount, &contactID, &orgID, &paymentMethodID, &paymentDate, &paymentNumber, &bankAccountIDStr, &storedJournalID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Payment")
@@ -2623,37 +2932,73 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		return
 	}
 
-	// Update allocated sales invoices (if any)
-	_, err = tx.Exec(`
-		UPDATE sales_invoices SET
-			amount_paid = amount_paid + pa.amount,
-			status = CASE WHEN amount_paid + pa.amount >= total_amount THEN 'paid' ELSE 'partial' END,
-			updated_at = $1
-		FROM payment_allocations pa
-		WHERE pa.payment_id = $2 AND pa.document_type = 'sales_invoice' AND sales_invoices.id = pa.document_id
-	`, now, id)
-	if err != nil {
-		h.log.Warn("Failed to update sales invoice amounts", "error", err)
-	}
+	// Update allocated invoices/bills from payment_allocations
+	// Query allocations for this payment and update each document individually
+	allocRows, allocErr := tx.Query(
+		`SELECT id, document_type, document_id, amount FROM payment_allocations WHERE payment_id = $1`,
+		id,
+	)
+	if allocErr != nil {
+		h.log.Error("Failed to query payment allocations", "error", allocErr, "payment_id", id)
+	} else {
+		defer allocRows.Close()
+		for allocRows.Next() {
+			var allocID, docID uuid.UUID
+			var docType string
+			var allocAmount float64
+			if scanErr := allocRows.Scan(&allocID, &docType, &docID, &allocAmount); scanErr != nil {
+				h.log.Error("Failed to scan payment allocation", "error", scanErr)
+				continue
+			}
+			h.log.Info("Processing payment allocation", "alloc_id", allocID, "doc_type", docType, "doc_id", docID, "amount", allocAmount)
 
-	// Update allocated purchase invoices (if any)
-	_, err = tx.Exec(`
-		UPDATE purchase_invoices SET
-			amount_paid = amount_paid + pa.amount,
-			status = CASE WHEN amount_paid + pa.amount >= total_amount THEN 'paid' ELSE 'partial' END,
-			updated_at = $1
-		FROM payment_allocations pa
-		WHERE pa.payment_id = $2 AND pa.document_type = 'purchase_invoice' AND purchase_invoices.id = pa.document_id
-	`, now, id)
-	if err != nil {
-		h.log.Warn("Failed to update purchase invoice amounts", "error", err)
+			if docType == "sales_invoice" {
+				res, updErr := tx.Exec(`
+					UPDATE sales_invoices SET
+						amount_paid = amount_paid + $1,
+						status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
+						updated_at = $2
+					WHERE id = $3
+				`, allocAmount, now, docID)
+				if updErr != nil {
+					h.log.Error("Failed to update sales invoice amount_paid", "error", updErr, "invoice_id", docID, "amount", allocAmount)
+				} else if rows, _ := res.RowsAffected(); rows == 0 {
+					h.log.Warn("Sales invoice not found for allocation", "invoice_id", docID)
+				} else {
+					h.log.Info("Updated sales invoice amount_paid", "invoice_id", docID, "added", allocAmount, "rows", rows)
+				}
+			} else if docType == "purchase_invoice" {
+				res, updErr := tx.Exec(`
+					UPDATE purchase_invoices SET
+						amount_paid = amount_paid + $1,
+						status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
+						payment_status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
+						updated_at = $2
+					WHERE id = $3
+				`, allocAmount, now, docID)
+				if updErr != nil {
+					h.log.Error("Failed to update purchase invoice amount_paid", "error", updErr, "invoice_id", docID, "amount", allocAmount)
+				} else if rows, _ := res.RowsAffected(); rows == 0 {
+					h.log.Warn("Purchase invoice not found for allocation", "invoice_id", docID)
+				} else {
+					h.log.Info("Updated purchase invoice amount_paid", "invoice_id", docID, "added", allocAmount, "rows", rows)
+				}
+			}
+		}
 	}
 
 	// --- Create journal entry for the payment ---
-	// Determine cash/bank account: first try stored bank_account_id, then payment method, then fallback
+	// Determine cash/bank account: stored bank_account_id → journal default account → payment method → name fallback
 	var cashAccountID uuid.UUID
 	if bankAccountIDStr.Valid {
 		cashAccountID, _ = uuid.Parse(bankAccountIDStr.String)
+	}
+	if cashAccountID == uuid.Nil && storedJournalID.Valid {
+		// Try the selected journal's default debit account (bank/cash journals typically use a single default account)
+		_ = tx.QueryRow(
+			`SELECT COALESCE(default_debit_account_id, default_credit_account_id) FROM journals WHERE id = $1 AND tenant_id = $2`,
+			storedJournalID.String, tenantID,
+		).Scan(&cashAccountID)
 	}
 	if cashAccountID == uuid.Nil && paymentMethodID.Valid {
 		_ = tx.QueryRow(
@@ -2690,16 +3035,26 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	}
 
 	if cashAccountID != uuid.Nil && counterAccountID != uuid.Nil {
-		// Get journal
+		// Get journal — prefer stored journal_id from payment, fall back to code-based lookup
 		var journalID uuid.UUID
 		var nextNumber int
 		var numberPrefix sql.NullString
-		err = tx.QueryRow(`
-			SELECT id, COALESCE(next_number, 1), number_prefix
-			FROM journals WHERE tenant_id = $1 AND (code = $2 OR code = 'GENERAL') AND deleted_at IS NULL
-			ORDER BY CASE WHEN code = $2 THEN 0 ELSE 1 END LIMIT 1`,
-			tenantID, journalCode,
-		).Scan(&journalID, &nextNumber, &numberPrefix)
+
+		if storedJournalID.Valid {
+			_ = tx.QueryRow(`
+				SELECT id, COALESCE(next_number, 1), number_prefix
+				FROM journals WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+				storedJournalID.String, tenantID,
+			).Scan(&journalID, &nextNumber, &numberPrefix)
+		}
+		if journalID == uuid.Nil {
+			_ = tx.QueryRow(`
+				SELECT id, COALESCE(next_number, 1), number_prefix
+				FROM journals WHERE tenant_id = $1 AND (code = $2 OR code = 'GENERAL') AND deleted_at IS NULL
+				ORDER BY CASE WHEN code = $2 THEN 0 ELSE 1 END LIMIT 1`,
+				tenantID, journalCode,
+			).Scan(&journalID, &nextNumber, &numberPrefix)
+		}
 
 		if err == nil && journalID != uuid.Nil {
 			prefix := ""
@@ -2707,17 +3062,17 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				prefix = numberPrefix.String
 			}
 
-			// Use global max to avoid unique constraint violations across journals
+			// Use journal-scoped max filtered by prefix to avoid date-embedded entry numbers
 			var maxNum int
-			if orgIDPtr != nil {
+			if prefix != "" {
 				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2",
-					tenantID, *orgIDPtr,
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
+					tenantID, journalID, prefix+"%",
 				).Scan(&maxNum)
 			} else {
 				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS INTEGER)), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL",
-					tenantID,
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
+					tenantID, journalID,
 				).Scan(&maxNum)
 			}
 			actualNum := maxNum + 1
@@ -6847,15 +7202,18 @@ func (h *Handler) ReopenFiscalPeriod(c *gin.Context) {
 // ==================== BUDGETS ====================
 
 type CreateBudgetInput struct {
-	OrganizationID *string  `json:"organization_id"`
-	FiscalYearID   string   `json:"fiscal_year_id" binding:"required"`
-	Code           string   `json:"code" binding:"required"`
-	Name           string   `json:"name" binding:"required"`
-	Description    *string  `json:"description"`
-	BudgetType     string   `json:"budget_type"` // expense, revenue, combined
-	TotalAmount    float64  `json:"total_amount"`
-	Status         string   `json:"status"`
-	Lines          []CreateBudgetLineInput `json:"lines"`
+	OrganizationID   *string  `json:"organization_id"`
+	FiscalYearID     string   `json:"fiscal_year_id" binding:"required"`
+	Code             string   `json:"code" binding:"required"`
+	Name             string   `json:"name" binding:"required"`
+	Description      *string  `json:"description"`
+	BudgetType       string   `json:"budget_type"` // expense, revenue, combined
+	TotalAmount      float64  `json:"total_amount"`
+	Status           string   `json:"status"`
+	StartDate        *string  `json:"start_date"`
+	EndDate          *string  `json:"end_date"`
+	WarningThreshold *float64 `json:"warning_threshold"`
+	Lines            []CreateBudgetLineInput `json:"lines"`
 }
 
 type CreateBudgetLineInput struct {
@@ -6895,7 +7253,8 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		SELECT b.id, b.tenant_id, b.organization_id, b.fiscal_year_id, b.code, b.name, b.description,
 		       b.budget_type, b.total_amount, b.status, b.approved_by, b.approved_at,
 		       b.created_by, b.created_at, b.updated_at,
-		       fy.start_date, fy.end_date
+		       COALESCE(b.start_date, fy.start_date), COALESCE(b.end_date, fy.end_date),
+		       COALESCE(b.warning_threshold, 80)
 		FROM budgets b
 		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
 		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
@@ -6933,12 +7292,13 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		var orgID, desc, approvedBy, createdBy sql.NullString
 		var approvedAt sql.NullTime
 		var startDate, endDate sql.NullString
+		var warningThreshold float64
 
 		err := rows.Scan(
 			&b.ID, &b.TenantID, &orgID, &b.FiscalYearID, &b.Code, &b.Name, &desc,
 			&b.BudgetType, &b.TotalAmount, &b.Status, &approvedBy, &approvedAt,
 			&createdBy, &b.CreatedAt, &b.UpdatedAt,
-			&startDate, &endDate,
+			&startDate, &endDate, &warningThreshold,
 		)
 		if err != nil {
 			continue
@@ -6968,6 +7328,7 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		if endDate.Valid {
 			b.EndDate = &endDate.String
 		}
+		b.WarningThreshold = warningThreshold
 
 		budgets = append(budgets, &b)
 	}
@@ -7005,17 +7366,22 @@ func (h *Handler) GetBudget(c *gin.Context) {
 	var b entity.Budget
 	var orgID, desc, approvedBy, createdBy sql.NullString
 	var approvedAt sql.NullTime
+	var startDate, endDate sql.NullString
 
 	err := h.db.QueryRow(`
-		SELECT id, tenant_id, organization_id, fiscal_year_id, code, name, description,
-		       budget_type, total_amount, status, approved_by, approved_at,
-		       created_by, created_at, updated_at
-		FROM budgets
-		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		SELECT b.id, b.tenant_id, b.organization_id, b.fiscal_year_id, b.code, b.name, b.description,
+		       b.budget_type, b.total_amount, b.status, b.approved_by, b.approved_at,
+		       b.created_by, b.created_at, b.updated_at,
+		       COALESCE(b.start_date, fy.start_date), COALESCE(b.end_date, fy.end_date),
+		       COALESCE(b.warning_threshold, 80)
+		FROM budgets b
+		LEFT JOIN fiscal_years fy ON b.fiscal_year_id = fy.id
+		WHERE b.id = $1 AND b.tenant_id = $2 AND b.deleted_at IS NULL
 	`, id, tenantID).Scan(
 		&b.ID, &b.TenantID, &orgID, &b.FiscalYearID, &b.Code, &b.Name, &desc,
 		&b.BudgetType, &b.TotalAmount, &b.Status, &approvedBy, &approvedAt,
 		&createdBy, &b.CreatedAt, &b.UpdatedAt,
+		&startDate, &endDate, &b.WarningThreshold,
 	)
 
 	if err != nil {
@@ -7046,15 +7412,38 @@ func (h *Handler) GetBudget(c *gin.Context) {
 		cid, _ := uuid.Parse(createdBy.String)
 		b.CreatedBy = &cid
 	}
+	if startDate.Valid {
+		b.StartDate = &startDate.String
+	}
+	if endDate.Valid {
+		b.EndDate = &endDate.String
+	}
 
-	// Load budget lines
+	// Load budget lines with computed actual amounts from journal entries
 	lineRows, err := h.db.Query(`
-		SELECT id, budget_id, account_id, fiscal_period_id, department_id,
-		       budgeted_amount, actual_amount, variance, notes, created_at, updated_at
-		FROM budget_lines
-		WHERE budget_id = $1
-		ORDER BY created_at
-	`, b.ID)
+		SELECT bl.id, bl.budget_id, bl.account_id, COALESCE(a.name, '') as account_name, COALESCE(a.code, '') as account_code,
+		       bl.fiscal_period_id, bl.department_id,
+		       bl.budgeted_amount,
+		       COALESCE((
+		           SELECT CASE
+		               WHEN $2 = 'revenue' THEN SUM(jel.credit_amount) - SUM(jel.debit_amount)
+		               ELSE SUM(jel.debit_amount) - SUM(jel.credit_amount)
+		           END
+		           FROM journal_entry_lines jel
+		           JOIN journal_entries je ON jel.journal_entry_id = je.id
+		           WHERE jel.account_id = bl.account_id
+		             AND je.tenant_id = $3
+		             AND je.status = 'posted'
+		             AND je.deleted_at IS NULL
+		             AND je.entry_date >= COALESCE($4::date, '1900-01-01')
+		             AND je.entry_date <= COALESCE($5::date, '2999-12-31')
+		       ), 0) as computed_actual,
+		       bl.notes, bl.created_at, bl.updated_at
+		FROM budget_lines bl
+		LEFT JOIN accounts a ON bl.account_id = a.id
+		WHERE bl.budget_id = $1
+		ORDER BY bl.created_at
+	`, b.ID, b.BudgetType, tenantID, b.StartDate, b.EndDate)
 
 	if err == nil {
 		defer lineRows.Close()
@@ -7063,13 +7452,17 @@ func (h *Handler) GetBudget(c *gin.Context) {
 		for lineRows.Next() {
 			var line entity.BudgetLine
 			var fiscalPeriodID, deptID, notes sql.NullString
+			var computedActual float64
 
 			err := lineRows.Scan(
-				&line.ID, &line.BudgetID, &line.AccountID, &fiscalPeriodID, &deptID,
-				&line.BudgetedAmount, &line.ActualAmount, &line.Variance, &notes,
-				&line.CreatedAt, &line.UpdatedAt,
+				&line.ID, &line.BudgetID, &line.AccountID, &line.AccountName, &line.AccountCode,
+				&fiscalPeriodID, &deptID,
+				&line.BudgetedAmount, &computedActual,
+				&notes, &line.CreatedAt, &line.UpdatedAt,
 			)
 			if err == nil {
+				line.ActualAmount = computedActual
+				line.Variance = line.BudgetedAmount - line.ActualAmount
 				if fiscalPeriodID.Valid {
 					fpid, _ := uuid.Parse(fiscalPeriodID.String)
 					line.FiscalPeriodID = &fpid
@@ -7148,12 +7541,38 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 		status = "draft"
 	}
 
+	// Parse start/end dates — fall back to fiscal year dates
+	var startDate, endDate *string
+	if input.StartDate != nil && *input.StartDate != "" {
+		startDate = input.StartDate
+	}
+	if input.EndDate != nil && *input.EndDate != "" {
+		endDate = input.EndDate
+	}
+	// If no dates provided, fill from fiscal year
+	if startDate == nil || endDate == nil {
+		var fyStart, fyEnd sql.NullString
+		h.db.QueryRow("SELECT start_date, end_date FROM fiscal_years WHERE id = $1", fiscalYearID).Scan(&fyStart, &fyEnd)
+		if startDate == nil && fyStart.Valid {
+			startDate = &fyStart.String
+		}
+		if endDate == nil && fyEnd.Valid {
+			endDate = &fyEnd.String
+		}
+	}
+
+	warningThreshold := 80.0
+	if input.WarningThreshold != nil {
+		warningThreshold = *input.WarningThreshold
+	}
+
 	_, err = h.db.Exec(`
 		INSERT INTO budgets (id, tenant_id, organization_id, fiscal_year_id, code, name, description,
-		                    budget_type, total_amount, status, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		                    budget_type, total_amount, status, start_date, end_date, warning_threshold,
+		                    created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 	`, id, tenantID, orgID, fiscalYearID, input.Code, input.Name, input.Description,
-		budgetType, input.TotalAmount, status, userID, now, now)
+		budgetType, input.TotalAmount, status, startDate, endDate, warningThreshold, userID, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create budget", "error", err)
@@ -7190,18 +7609,24 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 		}
 	}
 
-	// Fetch created budget
+	// Fetch created budget with start_date, end_date, warning_threshold
 	var b entity.Budget
 	var orgIDStr, desc sql.NullString
+	var fetchStartDate, fetchEndDate sql.NullString
+	var fetchWarningThreshold float64
 
 	err = h.db.QueryRow(`
-		SELECT id, tenant_id, organization_id, fiscal_year_id, code, name, description,
-		       budget_type, total_amount, status, created_by, created_at, updated_at
-		FROM budgets
-		WHERE id = $1
+		SELECT b.id, b.tenant_id, b.organization_id, b.fiscal_year_id, b.code, b.name, b.description,
+		       b.budget_type, b.total_amount, b.status, b.created_by, b.created_at, b.updated_at,
+		       COALESCE(b.start_date, fy.start_date), COALESCE(b.end_date, fy.end_date),
+		       COALESCE(b.warning_threshold, 80)
+		FROM budgets b
+		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
+		WHERE b.id = $1
 	`, id).Scan(
 		&b.ID, &b.TenantID, &orgIDStr, &b.FiscalYearID, &b.Code, &b.Name, &desc,
 		&b.BudgetType, &b.TotalAmount, &b.Status, &b.CreatedBy, &b.CreatedAt, &b.UpdatedAt,
+		&fetchStartDate, &fetchEndDate, &fetchWarningThreshold,
 	)
 
 	if orgIDStr.Valid {
@@ -7211,6 +7636,13 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 	if desc.Valid {
 		b.Description = &desc.String
 	}
+	if fetchStartDate.Valid {
+		b.StartDate = &fetchStartDate.String
+	}
+	if fetchEndDate.Valid {
+		b.EndDate = &fetchEndDate.String
+	}
+	b.WarningThreshold = fetchWarningThreshold
 
 	response.Success(c, b)
 }
@@ -7250,11 +7682,32 @@ func (h *Handler) UpdateBudget(c *gin.Context) {
 
 	now := time.Now()
 
+	// Determine status - keep existing if not provided
+	status := input.Status
+	if status == "" {
+		status = "draft"
+	}
+
+	// Convert empty string dates to nil so COALESCE keeps existing values
+	var startDate, endDate *string
+	if input.StartDate != nil && *input.StartDate != "" {
+		startDate = input.StartDate
+	}
+	if input.EndDate != nil && *input.EndDate != "" {
+		endDate = input.EndDate
+	}
+
 	result, err := h.db.Exec(`
 		UPDATE budgets
-		SET code = $1, name = $2, description = $3, budget_type = $4, total_amount = $5, updated_at = $6
-		WHERE id = $7 AND tenant_id = $8 AND deleted_at IS NULL
-	`, input.Code, input.Name, input.Description, input.BudgetType, input.TotalAmount, now, id, tenantID)
+		SET code = $1, name = $2, description = $3, budget_type = $4, total_amount = $5,
+		    start_date = COALESCE($6, start_date), end_date = COALESCE($7, end_date),
+		    warning_threshold = COALESCE($8, warning_threshold),
+		    status = $9, fiscal_year_id = $10,
+		    updated_at = $11
+		WHERE id = $12 AND tenant_id = $13 AND deleted_at IS NULL
+	`, input.Code, input.Name, input.Description, input.BudgetType, input.TotalAmount,
+		startDate, endDate, input.WarningThreshold,
+		status, input.FiscalYearID, now, id, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to update budget", "error", err)
@@ -7268,19 +7721,31 @@ func (h *Handler) UpdateBudget(c *gin.Context) {
 		return
 	}
 
-	// Fetch updated budget
+	// Fetch updated budget with start_date, end_date, warning_threshold
 	var b entity.Budget
 	var orgIDStr, desc sql.NullString
+	var fetchedStart, fetchedEnd sql.NullString
+	var fetchedThreshold float64
 
 	err = h.db.QueryRow(`
-		SELECT id, tenant_id, organization_id, fiscal_year_id, code, name, description,
-		       budget_type, total_amount, status, created_at, updated_at
-		FROM budgets
-		WHERE id = $1 AND tenant_id = $2
+		SELECT b.id, b.tenant_id, b.organization_id, b.fiscal_year_id, b.code, b.name, b.description,
+		       b.budget_type, b.total_amount, b.status, b.created_at, b.updated_at,
+		       COALESCE(b.start_date, fy.start_date), COALESCE(b.end_date, fy.end_date),
+		       COALESCE(b.warning_threshold, 80)
+		FROM budgets b
+		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
+		WHERE b.id = $1 AND b.tenant_id = $2
 	`, id, tenantID).Scan(
 		&b.ID, &b.TenantID, &orgIDStr, &b.FiscalYearID, &b.Code, &b.Name, &desc,
 		&b.BudgetType, &b.TotalAmount, &b.Status, &b.CreatedAt, &b.UpdatedAt,
+		&fetchedStart, &fetchedEnd, &fetchedThreshold,
 	)
+
+	if err != nil {
+		h.log.Error("Failed to fetch updated budget", "error", err)
+		response.InternalError(c, "Failed to fetch updated budget")
+		return
+	}
 
 	if orgIDStr.Valid {
 		oid, _ := uuid.Parse(orgIDStr.String)
@@ -7289,6 +7754,13 @@ func (h *Handler) UpdateBudget(c *gin.Context) {
 	if desc.Valid {
 		b.Description = &desc.String
 	}
+	if fetchedStart.Valid {
+		b.StartDate = &fetchedStart.String
+	}
+	if fetchedEnd.Valid {
+		b.EndDate = &fetchedEnd.String
+	}
+	b.WarningThreshold = fetchedThreshold
 
 	response.Success(c, b)
 }
@@ -7416,11 +7888,32 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 
 	budgetID := c.Query("budget_id")
 
+	// Query budget lines with account info and computed actual amounts from journal entries
+	// actual_amount = SUM of debit for expense accounts, SUM of credit for revenue accounts
+	// within the budget's date range
 	query := `
-		SELECT bl.id, bl.budget_id, bl.account_id, bl.fiscal_period_id, bl.department_id,
-		       bl.budgeted_amount, bl.actual_amount, bl.variance, bl.notes, bl.created_at, bl.updated_at
+		SELECT bl.id, bl.budget_id, bl.account_id, COALESCE(a.name, '') as account_name, COALESCE(a.code, '') as account_code,
+		       bl.fiscal_period_id, bl.department_id,
+		       bl.budgeted_amount,
+		       COALESCE((
+		           SELECT CASE
+		               WHEN b.budget_type = 'revenue' THEN SUM(jel.credit_amount) - SUM(jel.debit_amount)
+		               ELSE SUM(jel.debit_amount) - SUM(jel.credit_amount)
+		           END
+		           FROM journal_entry_lines jel
+		           JOIN journal_entries je ON jel.journal_entry_id = je.id
+		           WHERE jel.account_id = bl.account_id
+		             AND je.tenant_id = b.tenant_id
+		             AND je.status = 'posted'
+		             AND je.deleted_at IS NULL
+		             AND je.entry_date >= COALESCE(b.start_date, fy.start_date)
+		             AND je.entry_date <= COALESCE(b.end_date, fy.end_date)
+		       ), 0) as computed_actual,
+		       bl.notes, bl.created_at, bl.updated_at
 		FROM budget_lines bl
 		JOIN budgets b ON bl.budget_id = b.id
+		LEFT JOIN accounts a ON bl.account_id = a.id
+		LEFT JOIN fiscal_years fy ON b.fiscal_year_id = fy.id
 		WHERE b.tenant_id = $1
 	`
 
@@ -7444,15 +7937,22 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 	for rows.Next() {
 		var line entity.BudgetLine
 		var fiscalPeriodID, deptID, notes sql.NullString
+		var computedActual float64
 
 		err := rows.Scan(
-			&line.ID, &line.BudgetID, &line.AccountID, &fiscalPeriodID, &deptID,
-			&line.BudgetedAmount, &line.ActualAmount, &line.Variance, &notes,
-			&line.CreatedAt, &line.UpdatedAt,
+			&line.ID, &line.BudgetID, &line.AccountID, &line.AccountName, &line.AccountCode,
+			&fiscalPeriodID, &deptID,
+			&line.BudgetedAmount, &computedActual,
+			&notes, &line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
+			h.log.Error("Failed to scan budget line", "error", err)
 			continue
 		}
+
+		// Use computed actual from journal entries
+		line.ActualAmount = computedActual
+		line.Variance = line.BudgetedAmount - line.ActualAmount
 
 		if fiscalPeriodID.Valid {
 			fpid, _ := uuid.Parse(fiscalPeriodID.String)

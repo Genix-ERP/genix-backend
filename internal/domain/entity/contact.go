@@ -167,6 +167,8 @@ type ContactResponse struct {
 	Tags               []string               `json:"tags"`
 	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
 	IsActive           bool                   `json:"is_active"`
+	Rating             *float64               `json:"rating,omitempty"`
+	RatingCount        *int                   `json:"rating_count,omitempty"`
 	ContactPersons     []ContactPerson        `json:"contact_persons,omitempty"`
 	CreatedAt          time.Time              `json:"created_at"`
 	UpdatedAt          time.Time              `json:"updated_at"`
