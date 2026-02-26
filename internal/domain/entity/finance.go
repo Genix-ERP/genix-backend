@@ -150,18 +150,40 @@ type AccountListFilter struct {
 
 // Journal represents a journal type
 type Journal struct {
-	ID           uuid.UUID `json:"id" db:"id"`
-	TenantID     uuid.UUID `json:"tenant_id" db:"tenant_id"`
-	Code         string    `json:"code" db:"code"`
-	Name         string    `json:"name" db:"name"`
-	Type         string    `json:"type" db:"type"` // general, sales, purchase, cash, bank, miscellaneous
-	Description  *string   `json:"description,omitempty" db:"description"`
-	AutoSequence bool      `json:"auto_sequence" db:"auto_sequence"`
-	NextNumber   int       `json:"next_number" db:"next_number"`
-	NumberPrefix *string   `json:"number_prefix,omitempty" db:"number_prefix"`
-	IsActive     bool      `json:"is_active" db:"is_active"`
-	CreatedAt    time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+	ID                     uuid.UUID  `json:"id" db:"id"`
+	TenantID               uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Code                   string     `json:"code" db:"code"`
+	Name                   string     `json:"name" db:"name"`
+	Type                   string     `json:"type" db:"type"` // general, sales, purchase, cash, bank, miscellaneous
+	Description            *string    `json:"description,omitempty" db:"description"`
+	AutoSequence           bool       `json:"auto_sequence" db:"auto_sequence"`
+	NextNumber             int        `json:"next_number" db:"next_number"`
+	NumberPrefix           *string    `json:"number_prefix,omitempty" db:"number_prefix"`
+	ShortCode              string     `json:"short_code" db:"short_code"`
+	Currency               string     `json:"currency" db:"currency"`
+	BankAccountID          *uuid.UUID `json:"bank_account_id,omitempty" db:"bank_account_id"`
+	SuspenseAccountID      *uuid.UUID `json:"suspense_account_id,omitempty" db:"suspense_account_id"`
+	ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty" db:"profit_account_id"`
+	LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty" db:"loss_account_id"`
+	OrganizationID         *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty" db:"default_debit_account_id"`
+	DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty" db:"default_credit_account_id"`
+	IsActive               bool       `json:"is_active" db:"is_active"`
+	CreatedAt              time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at" db:"updated_at"`
+}
+
+// JournalPaymentMethod links a payment method to a journal with direction
+type JournalPaymentMethod struct {
+	ID                   uuid.UUID  `json:"id" db:"id"`
+	TenantID             uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	JournalID            uuid.UUID  `json:"journal_id" db:"journal_id"`
+	PaymentMethodID      uuid.UUID  `json:"payment_method_id" db:"payment_method_id"`
+	Direction            string     `json:"direction" db:"direction"` // inbound, outbound
+	Name                 string     `json:"name" db:"name"`
+	OutstandingAccountID *uuid.UUID `json:"outstanding_account_id,omitempty" db:"outstanding_account_id"`
+	IsActive             bool       `json:"is_active" db:"is_active"`
+	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
 }
 
 // CreateJournalInput is the input for creating a journal
@@ -174,6 +196,12 @@ type CreateJournalInput struct {
 	DefaultCreditAccountID *string `json:"default_credit_account_id"`
 	AutoSequence           bool    `json:"auto_sequence"`
 	NumberPrefix           string  `json:"number_prefix"`
+	ShortCode              string  `json:"short_code"`
+	Currency               string  `json:"currency"`
+	BankAccountID          *string `json:"bank_account_id"`
+	SuspenseAccountID      *string `json:"suspense_account_id"`
+	ProfitAccountID        *string `json:"profit_account_id"`
+	LossAccountID          *string `json:"loss_account_id"`
 }
 
 // UpdateJournalInput is the input for updating a journal
@@ -185,6 +213,12 @@ type UpdateJournalInput struct {
 	AutoSequence           *bool   `json:"auto_sequence"`
 	NumberPrefix           *string `json:"number_prefix"`
 	IsActive               *bool   `json:"is_active"`
+	ShortCode              *string `json:"short_code"`
+	Currency               *string `json:"currency"`
+	BankAccountID          *string `json:"bank_account_id"`
+	SuspenseAccountID      *string `json:"suspense_account_id"`
+	ProfitAccountID        *string `json:"profit_account_id"`
+	LossAccountID          *string `json:"loss_account_id"`
 }
 
 // JournalEntry represents a journal entry header
@@ -367,6 +401,8 @@ type PaymentResponse struct {
 	Status          string              `json:"status"`
 	Reference       *string             `json:"reference,omitempty"`
 	Notes           *string             `json:"notes,omitempty"`
+	JournalID       string              `json:"journal_id,omitempty"`
+	JournalName     string              `json:"journal_name,omitempty"`
 	CreatedAt       time.Time           `json:"created_at"`
 	Allocations     []PaymentAllocation `json:"allocations,omitempty"`
 }
@@ -398,6 +434,7 @@ type CreatePaymentInput struct {
 	ContactID       string                   `json:"contact_id" binding:"required"`
 	PaymentMethodID *string                  `json:"payment_method_id"`
 	BankAccountID   *string                  `json:"bank_account_id"`
+	JournalID       *string                  `json:"journal_id"`
 	PaymentDate     string                   `json:"payment_date" binding:"required"`
 	Amount          float64                  `json:"amount" binding:"required,gt=0"`
 	CurrencyID      *string                  `json:"currency_id"`
@@ -892,9 +929,9 @@ type Budget struct {
 	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
 	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
 
-	// From fiscal_years JOIN
-	StartDate *string `json:"start_date,omitempty"`
-	EndDate   *string `json:"end_date,omitempty"`
+	StartDate        *string  `json:"start_date,omitempty"`
+	EndDate          *string  `json:"end_date,omitempty"`
+	WarningThreshold float64  `json:"warning_threshold"`
 
 	// Relationships
 	Lines []BudgetLine `json:"lines,omitempty"`
@@ -905,6 +942,8 @@ type BudgetLine struct {
 	ID              uuid.UUID  `json:"id" db:"id"`
 	BudgetID        uuid.UUID  `json:"budget_id" db:"budget_id"`
 	AccountID       uuid.UUID  `json:"account_id" db:"account_id"`
+	AccountName     string     `json:"account_name,omitempty"`
+	AccountCode     string     `json:"account_code,omitempty"`
 	FiscalPeriodID  *uuid.UUID `json:"fiscal_period_id,omitempty" db:"fiscal_period_id"`
 	DepartmentID    *uuid.UUID `json:"department_id,omitempty" db:"department_id"`
 	BudgetedAmount  float64    `json:"budgeted_amount" db:"budgeted_amount"`

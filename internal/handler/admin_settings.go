@@ -592,10 +592,16 @@ func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, prod
 		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1300")
 	}
 	if ca.StockInputAccountID == uuid.Nil {
-		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2200")
+		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2230")
+		if ca.StockInputAccountID == uuid.Nil {
+			ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2200")
+		}
 	}
 	if ca.StockOutputAccountID == uuid.Nil {
-		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2201")
+		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2231")
+		if ca.StockOutputAccountID == uuid.Nil {
+			ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2201")
+		}
 	}
 	return ca
 }

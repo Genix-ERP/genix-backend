@@ -161,6 +161,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		contacts.DELETE("/:id", h.DeleteContact)
 		contacts.GET("/:id/persons", h.ListContactPersons)
 		contacts.POST("/:id/persons", h.CreateContactPerson)
+		contacts.POST("/:id/rate", h.RateSupplier)
 	}
 
 	// Call Logs (CRM PBX Integration)
@@ -281,6 +282,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	operationTypes.Use(middleware.RequirePermission("inventory", "warehouse", "read"))
 	{
 		operationTypes.GET("", h.ListOperationTypes)
+		operationTypes.GET("/:id", h.GetOperationType)
 		operationTypes.POST("", middleware.RequirePermission("inventory", "warehouse", "create"), h.CreateOperationType)
 		operationTypes.PUT("/:id", middleware.RequirePermission("inventory", "warehouse", "update"), h.UpdateOperationType)
 		operationTypes.DELETE("/:id", middleware.RequirePermission("inventory", "warehouse", "delete"), h.DeleteOperationType)
@@ -856,6 +858,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		journalGroup.GET("/:id", h.GetJournal)
 		journalGroup.PUT("/:id", middleware.RequirePermission("finance", "journal", "update"), h.UpdateJournal)
 		journalGroup.DELETE("/:id", middleware.RequirePermission("finance", "journal", "delete"), h.DeleteJournal)
+		journalGroup.GET("/:id/payment-methods", h.ListJournalPaymentMethods)
+		journalGroup.POST("/:id/payment-methods", middleware.RequirePermission("finance", "journal", "update"), h.AddJournalPaymentMethod)
+		journalGroup.DELETE("/:id/payment-methods/:pmId", middleware.RequirePermission("finance", "journal", "update"), h.RemoveJournalPaymentMethod)
+	}
+
+	// Payment Methods
+	paymentMethodsGroup := rg.Group("/payment-methods")
+	paymentMethodsGroup.Use(middleware.RequirePermission("finance", "payment", "read"))
+	{
+		paymentMethodsGroup.GET("", h.ListPaymentMethods)
 	}
 
 	// Journal Entries
@@ -1039,6 +1051,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reconciliation.POST("", middleware.RequirePermission("finance", "reconciliation", "create"), h.CreateReconciliationAct)
 		reconciliation.POST("/bulk-generate", middleware.RequirePermission("finance", "reconciliation", "create"), h.BulkGenerateReconciliation)
 		reconciliation.GET("/:id", h.GetReconciliationAct)
+		reconciliation.POST("/:id/refresh", middleware.RequirePermission("finance", "reconciliation", "update"), h.RefreshReconciliationAct)
 		reconciliation.PUT("/:id", middleware.RequirePermission("finance", "reconciliation", "update"), h.UpdateReconciliationAct)
 		reconciliation.DELETE("/:id", middleware.RequirePermission("finance", "reconciliation", "delete"), h.DeleteReconciliationAct)
 		reconciliation.GET("/:id/export", h.ExportReconciliationAct)
