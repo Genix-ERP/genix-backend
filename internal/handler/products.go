@@ -60,7 +60,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.can_be_subcontracted, false) as can_be_subcontracted,
 			   COALESCE(p.is_overhead_expense, false) as is_overhead_expense,
 			   COALESCE(p.has_variants, false) as has_variants,
-			   p.is_active, p.tags,
+			   p.is_active, p.tags, COALESCE(p.image_url, '') as image_url,
 			   p.created_at, p.updated_at,
 			   pc.code as category_code, pc.name as category_name
 		FROM products p
@@ -134,6 +134,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var categoryID, sku, barcode, desc, shortDesc, unitID sql.NullString
 		var categoryCode, categoryName sql.NullString
 		var tags json.RawMessage
+		var imageURL string
 
 		err := rows.Scan(
 			&p.ID, &p.TenantID, &categoryID, &p.Type, &p.Code, &sku, &barcode,
@@ -144,7 +145,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.IsPurchasable, &p.IsSellable,
 			&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 			&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
-			&p.IsOverheadExpense, &p.HasVariants, &p.IsActive, &tags,
+			&p.IsOverheadExpense, &p.HasVariants, &p.IsActive, &tags, &imageURL,
 			&p.CreatedAt, &p.UpdatedAt,
 			&categoryCode, &categoryName,
 		)
@@ -195,6 +196,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			IsOverheadExpense: p.IsOverheadExpense,
 			HasVariants:       p.HasVariants,
 			IsActive:          p.IsActive,
+			ImageURL:          imageURL,
 			CreatedAt:         p.CreatedAt,
 			UpdatedAt:         p.UpdatedAt,
 		}
@@ -356,6 +358,11 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
+	var imageURL *string
+	if input.ImageURL != "" {
+		imageURL = &input.ImageURL
+	}
+
 	query := `
 		INSERT INTO products (
 			id, tenant_id, organization_id, category_id, type, code, sku, barcode, name, description, short_description,
@@ -363,8 +370,8 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 			is_stockable, track_inventory, min_stock_level, reorder_point, reorder_quantity,
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
 			can_be_expensed, can_be_rented, can_be_subcontracted, is_overhead_expense,
-			is_active, tags, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
+			is_active, tags, image_url, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)
 		RETURNING id
 	`
 
@@ -374,7 +381,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		isStockable, trackInventory, input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity,
 		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
 		canBeExpensed, canBeRented, canBeSubcontracted, isOverheadExpense,
-		true, tagsJSON, userID, now, now,
+		true, tagsJSON, imageURL, userID, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -412,6 +419,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		IsOverheadExpense:  isOverheadExpense,
 		IsActive:           true,
 		Tags:               input.Tags,
+		ImageURL:           input.ImageURL,
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
@@ -441,6 +449,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			   p.is_stockable, p.track_inventory, p.min_stock_level,
 			   p.reorder_point, p.reorder_quantity, p.lead_time_days,
 			   p.is_purchasable, p.is_sellable, p.is_active, p.tags,
+			   COALESCE(p.image_url, '') as image_url,
 			   p.created_at, p.updated_at,
 			   pc.id as category_id_rel, pc.code as category_code, pc.name as category_name
 		FROM products p
@@ -452,6 +461,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	var categoryIDStr, sku, barcode, desc, shortDesc, unitID sql.NullString
 	var categoryIDRel, categoryCode, categoryName sql.NullString
 	var tags json.RawMessage
+	var imageURL string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode,
@@ -459,7 +469,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		&p.CostPrice, &p.ListPrice, &p.MinPrice,
 		&p.IsStockable, &p.TrackInventory, &p.MinStockLevel,
 		&p.ReorderPoint, &p.ReorderQuantity, &p.LeadTimeDays,
-		&p.IsPurchasable, &p.IsSellable, &p.IsActive, &tags,
+		&p.IsPurchasable, &p.IsSellable, &p.IsActive, &tags, &imageURL,
 		&p.CreatedAt, &p.UpdatedAt,
 		&categoryIDRel, &categoryCode, &categoryName,
 	)
@@ -487,6 +497,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		IsPurchasable:  p.IsPurchasable,
 		IsSellable:     p.IsSellable,
 		IsActive:       p.IsActive,
+		ImageURL:       imageURL,
 		CreatedAt:      p.CreatedAt,
 		UpdatedAt:      p.UpdatedAt,
 	}
@@ -639,6 +650,9 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	if input.Tags != nil {
 		tagsJSON, _ := json.Marshal(input.Tags)
 		addUpdate("tags", tagsJSON)
+	}
+	if input.ImageURL != nil {
+		addUpdate("image_url", *input.ImageURL)
 	}
 
 	if len(updates) == 0 {

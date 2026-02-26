@@ -1713,7 +1713,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	for _, li := range invoiceLineInfos {
 		invoiceLineID := uuid.New()
-		tx.Exec(`
+		_, lineErr := tx.Exec(`
 			INSERT INTO sales_invoice_lines (
 				id, sales_invoice_id, sales_order_line_id, line_number, product_id, description,
 				quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount, line_total, created_at
@@ -1721,6 +1721,9 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			invoiceLineID, invoiceID, li.OrderLineID, li.LineNumber, li.ProductID, li.Description,
 			li.Quantity, li.UnitID, li.UnitPrice, li.Discount, li.TaxID, li.TaxAmount, li.LineTotal, now,
 		)
+		if lineErr != nil {
+			h.log.Error("CreateInvoiceFromOrder: invoice line INSERT failed", "error", lineErr, "line_number", li.LineNumber, "product_id", li.ProductID)
+		}
 	}
 
 	// ========== GL JOURNAL ENTRY POSTING (auto-post on creation) ==========
@@ -1825,7 +1828,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			journalEntryID = &jeID
 			jeDescription := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
 
-			tx.Exec(`
+			_, jeErr := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
@@ -1833,11 +1836,14 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				jeID, tenantID, organizationID, salesJournalID, entryNumber, now, invoiceNumber, jeDescription,
 				"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, userID, now, now,
 			)
+			if jeErr != nil {
+				h.log.Error("CreateInvoiceFromOrder: journal entry INSERT failed", "error", jeErr)
+			}
 
 			jeLineNumber := 1
 
 			// Debit: Accounts Receivable
-			tx.Exec(`
+			_, arErr := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
@@ -1845,6 +1851,9 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				uuid.New(), jeID, jeLineNumber, arAccountID, customerID, "Accounts Receivable",
 				totalAmount, 0.0, 1.0, now,
 			)
+			if arErr != nil {
+				h.log.Error("CreateInvoiceFromOrder: AR journal line failed", "error", arErr, "arAccountID", arAccountID)
+			}
 			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
 			jeLineNumber++
 

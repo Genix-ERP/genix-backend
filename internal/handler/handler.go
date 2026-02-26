@@ -117,6 +117,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		roles.GET("/:id", h.GetRole)
 		roles.PUT("/:id", middleware.RequirePermission("users", "role", "update"), h.UpdateRole)
 		roles.DELETE("/:id", middleware.RequirePermission("users", "role", "delete"), h.DeleteRole)
+		roles.POST("/:id/assign", middleware.RequirePermission("users", "role", "update"), h.AssignRole)
+		roles.POST("/:id/unassign", middleware.RequirePermission("users", "role", "update"), h.UnassignRole)
 	}
 
 	// Permissions
