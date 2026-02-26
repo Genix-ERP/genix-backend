@@ -260,6 +260,11 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 		return
 	}
 
+	// Auto-generate code if not provided
+	if req.Code == "" {
+		req.Code = fmt.Sprintf("PRJ-%d", time.Now().UnixMilli())
+	}
+
 	// Set default currency if not provided
 	currency := req.Currency
 	if currency == "" {
@@ -1074,6 +1079,11 @@ func (h *Handler) CreateSmetaSection(c *gin.Context) {
 		return
 	}
 
+	// Auto-generate code if not provided
+	if req.Code == "" {
+		req.Code = fmt.Sprintf("SEC-%d", time.Now().UnixMilli())
+	}
+
 	query := `
 		INSERT INTO smeta_sections (
 			tenant_id, project_id, parent_id, code, name, name_uz, description,
@@ -1710,8 +1720,9 @@ func (h *Handler) ListProjectVendors(c *gin.Context) {
 		       pv.status, pv.total_ordered, pv.total_received, pv.total_invoiced, pv.total_paid, pv.balance_due,
 		       pv.start_date, pv.end_date, pv.notes,
 		       pv.created_date, pv.updated_date,
-		       COALESCE(o.name, '') as vendor_name
+		       COALESCE(c.name, o.name, '') as vendor_name
 		FROM construction_project_vendors pv
+		LEFT JOIN contacts c ON c.id = pv.vendor_id
 		LEFT JOIN organizations o ON o.id = pv.vendor_id
 		WHERE pv.project_id = $1 AND pv.tenant_id = $2
 		ORDER BY pv.created_date DESC
@@ -1818,64 +1829,27 @@ func (h *Handler) CreateProjectVendor(c *gin.Context) {
 
 	var vendorUUID uuid.UUID
 
-	// Check if vendor_id is provided (existing organization)
-	if req.VendorID != "" {
-		vendorUUID, err = uuid.Parse(req.VendorID)
-		if err != nil {
-			response.BadRequest(c, "Invalid vendor ID format")
-			return
-		}
-		// Verify the organization exists
-		var exists bool
+	// vendor_id is required — must reference an existing supplier (contact) or organization
+	if req.VendorID == "" {
+		response.BadRequest(c, "vendor_id is required")
+		return
+	}
+
+	vendorUUID, err = uuid.Parse(req.VendorID)
+	if err != nil {
+		response.BadRequest(c, "Invalid vendor ID format")
+		return
+	}
+
+	// Check contacts table first (Procurement suppliers), then organizations as fallback
+	var exists bool
+	err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM contacts WHERE id = $1 AND tenant_id = $2)", vendorUUID, tenantID).Scan(&exists)
+	if err != nil || !exists {
 		err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND tenant_id = $2)", vendorUUID, tenantID).Scan(&exists)
 		if err != nil || !exists {
-			response.BadRequest(c, "Vendor organization not found")
+			response.BadRequest(c, "Supplier not found")
 			return
 		}
-	} else if req.VendorName != "" {
-		// Create a new organization for this vendor
-		vendorUUID = uuid.New()
-		now := time.Now()
-
-		// Determine organization type based on vendor type
-		orgType := "supplier"
-		if req.VendorType == "subcontractor" {
-			orgType = "subcontractor"
-		} else if req.VendorType == "consultant" {
-			orgType = "service_provider"
-		}
-
-		// Generate a unique code for the organization
-		vendorCode := fmt.Sprintf("VND-%s", strings.ToUpper(vendorUUID.String()[:8]))
-
-		// Build contact info JSON
-		contactInfo := map[string]string{}
-		if req.ContactPerson != "" {
-			contactInfo["contact_person"] = req.ContactPerson
-		}
-		if req.ContactPhone != "" {
-			contactInfo["phone"] = req.ContactPhone
-		}
-		if req.ContactEmail != "" {
-			contactInfo["email"] = req.ContactEmail
-		}
-		contactInfoJSON, _ := json.Marshal(contactInfo)
-
-		createOrgQuery := `
-			INSERT INTO organizations (
-				id, tenant_id, code, name, type, contact_info,
-				country, currency, is_active, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, 'UZ', 'UZS', true, $7, $8)
-		`
-		_, err = h.db.Exec(createOrgQuery, vendorUUID, tenantID, vendorCode, req.VendorName, orgType, contactInfoJSON, now, now)
-		if err != nil {
-			h.log.Error("Failed to create vendor organization", "error", err)
-			response.InternalError(c, "Failed to create vendor organization")
-			return
-		}
-	} else {
-		response.BadRequest(c, "Either vendor_id or vendor_name must be provided")
-		return
 	}
 
 	var contractDate interface{}
