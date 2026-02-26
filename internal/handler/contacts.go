@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -44,15 +45,23 @@ func (h *Handler) ListContacts(c *gin.Context) {
 	industry := c.Query("industry")
 	isActiveStr := c.Query("is_active")
 
-	// Build query
+	// Build query - LEFT JOIN supplier_performance to get average rating for vendors
 	baseQuery := `
-		SELECT id, tenant_id, type, code, name, legal_name, tax_id,
-			   registration_number, industry, website, email, phone, fax,
-			   billing_address, shipping_address, payment_terms, credit_limit,
-			   current_balance, currency_id, tax_exempt, tags, notes,
-			   custom_fields, is_active, created_by, created_at, updated_at
-		FROM contacts
-		WHERE tenant_id = $1 AND deleted_at IS NULL
+		SELECT c.id, c.tenant_id, c.type, c.code, c.name, c.legal_name, c.tax_id,
+			   c.registration_number, c.industry, c.website, c.email, c.phone, c.fax,
+			   c.billing_address, c.shipping_address, c.payment_terms, c.credit_limit,
+			   c.current_balance, c.currency_id, c.tax_exempt, c.tags, c.notes,
+			   c.custom_fields, c.is_active, c.created_by, c.created_at, c.updated_at,
+			   COALESCE(sp.avg_rating, 0) AS avg_rating,
+			   COALESCE(sp.rating_count, 0) AS rating_count
+		FROM contacts c
+		LEFT JOIN (
+			SELECT vendor_id, AVG(overall_rating) AS avg_rating, COUNT(*) AS rating_count
+			FROM supplier_performance
+			WHERE overall_rating > 0
+			GROUP BY vendor_id
+		) sp ON sp.vendor_id = c.id
+		WHERE c.tenant_id = $1 AND c.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM contacts WHERE tenant_id = $1 AND deleted_at IS NULL`
 
@@ -62,21 +71,21 @@ func (h *Handler) ListContacts(c *gin.Context) {
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND c.organization_id = $%d", argCount)
 		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	if contactType != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND type = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND c.type = $%d", argCount)
 		countQuery += fmt.Sprintf(" AND type = $%d", argCount)
 		args = append(args, contactType)
 	}
 
 	if industry != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND industry = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND c.industry = $%d", argCount)
 		countQuery += fmt.Sprintf(" AND industry = $%d", argCount)
 		args = append(args, industry)
 	}
@@ -84,14 +93,14 @@ func (h *Handler) ListContacts(c *gin.Context) {
 	if isActiveStr != "" {
 		isActive := isActiveStr == "true"
 		argCount++
-		baseQuery += fmt.Sprintf(" AND is_active = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND c.is_active = $%d", argCount)
 		countQuery += fmt.Sprintf(" AND is_active = $%d", argCount)
 		args = append(args, isActive)
 	}
 
 	if search != "" {
 		argCount++
-		searchFilter := fmt.Sprintf(" AND (name ILIKE $%d OR code ILIKE $%d OR email ILIKE $%d OR phone ILIKE $%d)", argCount, argCount, argCount, argCount)
+		searchFilter := fmt.Sprintf(" AND (c.name ILIKE $%d OR c.code ILIKE $%d OR c.email ILIKE $%d OR c.phone ILIKE $%d)", argCount, argCount, argCount, argCount)
 		baseQuery += searchFilter
 		countQuery += searchFilter
 		args = append(args, "%"+search+"%")
@@ -107,7 +116,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 	}
 
 	// Add ordering and pagination
-	baseQuery += " ORDER BY created_at DESC"
+	baseQuery += " ORDER BY c.created_at DESC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
@@ -124,6 +133,8 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		var legalName, taxID, regNum, industry, website, email, phone, fax, notes sql.NullString
 		var currencyID, createdBy sql.NullString
 		var billingAddr, shippingAddr, tags, customFields []byte
+		var avgRating float64
+		var ratingCount int
 
 		err := rows.Scan(
 			&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
@@ -131,6 +142,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			&billingAddr, &shippingAddr, &ct.PaymentTerms, &ct.CreditLimit,
 			&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes,
 			&customFields, &ct.IsActive, &createdBy, &ct.CreatedAt, &ct.UpdatedAt,
+			&avgRating, &ratingCount,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan contact", "error", err)
@@ -149,6 +161,13 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			IsActive:       ct.IsActive,
 			CreatedAt:      ct.CreatedAt,
 			UpdatedAt:      ct.UpdatedAt,
+		}
+
+		// Set rating if available
+		if avgRating > 0 {
+			r := math.Round(avgRating*10) / 10
+			resp.Rating = &r
+			resp.RatingCount = &ratingCount
 		}
 
 		if legalName.Valid {
@@ -832,4 +851,77 @@ func (h *Handler) CreateContactPerson(c *gin.Context) {
 	}
 
 	response.Created(c, resp)
+}
+
+// RateSupplier adds a performance rating for a supplier/vendor
+func (h *Handler) RateSupplier(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	contactIDStr := c.Param("id")
+	contactID, err := uuid.Parse(contactIDStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid contact ID")
+		return
+	}
+
+	// Verify contact is a vendor and belongs to tenant
+	var exists bool
+	err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM contacts WHERE id = $1 AND tenant_id = $2 AND type IN ('vendor', 'both') AND deleted_at IS NULL)", contactID, tenantID).Scan(&exists)
+	if err != nil || !exists {
+		response.NotFound(c, "Vendor")
+		return
+	}
+
+	var input struct {
+		Rating  float64 `json:"rating" binding:"required,min=0,max=5"`
+		Comment string  `json:"comment"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	now := time.Now()
+	id := uuid.New()
+
+	query := `
+		INSERT INTO supplier_performance (id, tenant_id, vendor_id, period_start, period_end, overall_rating, notes, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id
+	`
+
+	err = h.db.QueryRow(query,
+		id, tenantID, contactID, now, now, input.Rating, input.Comment, now, now,
+	).Scan(&id)
+
+	if err != nil {
+		h.log.Error("Failed to rate supplier", "error", err)
+		response.InternalError(c, "Failed to rate supplier")
+		return
+	}
+
+	// Fetch updated average rating
+	var avgRating float64
+	var ratingCount int
+	err = h.db.QueryRow(`
+		SELECT COALESCE(AVG(overall_rating), 0), COUNT(*)
+		FROM supplier_performance
+		WHERE vendor_id = $1 AND tenant_id = $2 AND overall_rating > 0
+	`, contactID, tenantID).Scan(&avgRating, &ratingCount)
+	if err != nil {
+		avgRating = input.Rating
+		ratingCount = 1
+	}
+
+	roundedRating := math.Round(avgRating*10) / 10
+
+	response.Created(c, gin.H{
+		"id":           id,
+		"rating":       roundedRating,
+		"rating_count": ratingCount,
+	})
 }

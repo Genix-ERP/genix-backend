@@ -1576,9 +1576,10 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 		return
 	}
 
-	// Only allow bill creation from confirmed or received orders
-	if currentStatus != "confirmed" && currentStatus != "received" && currentStatus != "partial" {
-		response.BadRequest(c, "Can only create bill from confirmed, partially received, or received orders")
+	// Only allow bill creation from approved, ordered, or received orders
+	allowedStatuses := map[string]bool{"approved": true, "ordered": true, "confirmed": true, "received": true, "partial": true}
+	if !allowedStatuses[currentStatus] {
+		response.BadRequest(c, "Can only create bill from approved, ordered, or received orders")
 		return
 	}
 
