@@ -152,6 +152,7 @@ type CreateProductInput struct {
 	CanBeSubcontracted *bool    `json:"can_be_subcontracted,omitempty"`
 	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
 	Tags               []string `json:"tags,omitempty"`
+	ImageURL           string   `json:"image_url,omitempty"`
 }
 
 // UpdateProductInput represents input for updating a product
@@ -183,6 +184,7 @@ type UpdateProductInput struct {
 	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
 	IsActive           *bool    `json:"is_active,omitempty"`
 	Tags               []string `json:"tags,omitempty"`
+	ImageURL           *string  `json:"image_url,omitempty"`
 }
 
 // ProductListFilter represents filters for listing products
@@ -226,6 +228,7 @@ type ProductResponse struct {
 	HasVariants        bool      `json:"has_variants"`
 	IsActive           bool      `json:"is_active"`
 	Tags               []string  `json:"tags"`
+	ImageURL           string    `json:"image_url"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }

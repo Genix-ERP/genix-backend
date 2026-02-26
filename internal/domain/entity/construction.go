@@ -196,7 +196,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 
 // CreateConstructionProjectInput represents input for creating a construction project
 type CreateConstructionProjectInput struct {
-	Code             string  `json:"code" binding:"required"`
+	Code             string  `json:"code"`
 	Name             string  `json:"name" binding:"required"`
 	Description      string  `json:"description"`
 	Address          string  `json:"address"`
@@ -504,7 +504,7 @@ func (s SmetaSection) MarshalJSON() ([]byte, error) {
 
 // CreateSmetaSectionInput represents input for creating a smeta section
 type CreateSmetaSectionInput struct {
-	Code        string `json:"code" binding:"required"`
+	Code        string `json:"code"`
 	Name        string `json:"name" binding:"required"`
 	NameUz      string `json:"name_uz"`
 	Description string `json:"description"`
