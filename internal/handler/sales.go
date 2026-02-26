@@ -1699,17 +1699,21 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		FROM sales_order_lines sol
 		LEFT JOIN products p ON p.id = sol.product_id
 		WHERE sol.sales_order_id = $1`, orderID)
-	if err == nil {
+	if err != nil {
+		h.log.Error("CreateInvoiceFromOrder: query order lines failed", "error", err)
+	} else {
 		for linesRows.Next() {
 			var li invoiceLineInfo
-			if err := linesRows.Scan(&li.OrderLineID, &li.LineNumber, &li.ProductID, &li.Description, &li.Quantity, &li.UnitID, &li.UnitPrice,
-				&li.Discount, &li.TaxID, &li.TaxAmount, &li.LineTotal); err != nil {
+			if scanErr := linesRows.Scan(&li.OrderLineID, &li.LineNumber, &li.ProductID, &li.Description, &li.Quantity, &li.UnitID, &li.UnitPrice,
+				&li.Discount, &li.TaxID, &li.TaxAmount, &li.LineTotal); scanErr != nil {
+				h.log.Error("CreateInvoiceFromOrder: scan order line failed", "error", scanErr)
 				continue
 			}
 			invoiceLineInfos = append(invoiceLineInfos, li)
 		}
 		linesRows.Close()
 	}
+	h.log.Info("CreateInvoiceFromOrder: order lines fetched", "count", len(invoiceLineInfos))
 
 	for _, li := range invoiceLineInfos {
 		invoiceLineID := uuid.New()
@@ -1766,6 +1770,9 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				JOIN products p ON sil.product_id = p.id
 				WHERE sil.sales_invoice_id = $1
 			`, invoiceID)
+			if acctErr != nil {
+				h.log.Error("CreateInvoiceFromOrder: query invoice lines for acct failed", "error", acctErr)
+			}
 			if acctErr == nil {
 				for acctRows.Next() {
 					var al invoiceLineAcct
@@ -1791,11 +1798,11 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			cogsGrouped := make(map[cogsPair]float64)
 
 			for _, al := range acctLines {
-				if al.LineTotal > 0 {
+				if al.LineTotal > 0 && al.IncomeAcct != uuid.Nil {
 					revenueGrouped[al.IncomeAcct] += al.LineTotal
 				}
 				costAmount := al.Quantity * al.CostPrice
-				if costAmount > 0 {
+				if costAmount > 0 && al.ExpenseAcct != uuid.Nil && al.OutputAcct != uuid.Nil {
 					cogsGrouped[cogsPair{Expense: al.ExpenseAcct, Output: al.OutputAcct}] += costAmount
 				}
 			}
@@ -1854,75 +1861,99 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			if arErr != nil {
 				h.log.Error("CreateInvoiceFromOrder: AR journal line failed", "error", arErr, "arAccountID", arAccountID)
 			}
-			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID); err != nil {
+				h.log.Error("CreateInvoiceFromOrder: update AR account balance failed", "error", err, "arAccountID", arAccountID)
+			}
 			jeLineNumber++
 
 			// Credit: Revenue per category
 			for incomeAcct, amount := range revenueGrouped {
-				tx.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 					uuid.New(), jeID, jeLineNumber, incomeAcct, "Sales Revenue",
 					0.0, amount, 1.0, now,
-				)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct)
+				); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: revenue journal line failed", "error", err, "incomeAcct", incomeAcct, "amount", amount)
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: update revenue account balance failed", "error", err, "incomeAcct", incomeAcct)
+				}
 				jeLineNumber++
 			}
 
 			// Credit: Tax Payable
 			if taxAccountID != uuid.Nil && taxAmount > 0 {
-				tx.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 					uuid.New(), jeID, jeLineNumber, taxAccountID, "Sales Tax Payable",
 					0.0, taxAmount, 1.0, now,
-				)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+				); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: tax payable journal line failed", "error", err, "taxAccountID", taxAccountID)
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: update tax account balance failed", "error", err, "taxAccountID", taxAccountID)
+				}
 				jeLineNumber++
 			}
 
 			// COGS entries
 			for pair, costAmount := range cogsGrouped {
 				// Debit: COGS
-				tx.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 					uuid.New(), jeID, jeLineNumber, pair.Expense, "Cost of Goods Sold",
 					costAmount, 0.0, 1.0, now,
-				)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Expense)
+				); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: COGS journal line failed", "error", err, "expenseAcct", pair.Expense)
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Expense); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: update COGS account balance failed", "error", err, "expenseAcct", pair.Expense)
+				}
 				jeLineNumber++
 
 				// Credit: Stock Interim Delivery
-				tx.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 					uuid.New(), jeID, jeLineNumber, pair.Output, "Stock Interim Delivery",
 					0.0, costAmount, 1.0, now,
-				)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output)
+				); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: stock output journal line failed", "error", err, "outputAcct", pair.Output)
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: update stock output balance failed", "error", err, "outputAcct", pair.Output)
+				}
 				jeLineNumber++
 			}
 
 			// Update journal next number
-			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
+			if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID); err != nil {
+				h.log.Error("CreateInvoiceFromOrder: update journal next_number failed", "error", err)
+			}
 
 			// Link JE to invoice
-			tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, sent_at = $2 WHERE id = $3", jeID, now, invoiceID)
+			if _, err := tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, sent_at = $2 WHERE id = $3", jeID, now, invoiceID); err != nil {
+				h.log.Error("CreateInvoiceFromOrder: link JE to invoice failed", "error", err)
+			}
 		}
 	}
 
 	// Update order status to processing
-	tx.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3",
-		entity.OrderStatusProcessing, now, orderID)
+	if _, err := tx.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3",
+		entity.OrderStatusProcessing, now, orderID); err != nil {
+		h.log.Error("CreateInvoiceFromOrder: update order status failed", "error", err)
+	}
 
 	// Commit
 	if err := tx.Commit(); err != nil {

@@ -903,6 +903,8 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		{"2200", "Tax Payable", "ST_LIAB", false, false, false, "Tax liabilities"},
 		{"2210", "VAT Payable", "ST_LIAB", false, false, false, "VAT/Sales tax payable"},
 		{"2220", "Income Tax Payable", "ST_LIAB", false, false, false, "Income tax payable"},
+		{"2230", "Stock Interim Receipt", "ST_LIAB", false, false, false, "Interim account for goods received not yet invoiced"},
+		{"2231", "Stock Interim Delivery", "ST_LIAB", false, false, false, "Interim account for goods delivered not yet invoiced"},
 		{"2300", "Unearned Revenue", "ST_LIAB", false, false, false, "Deferred revenue"},
 		{"2400", "Short-term Loans", "ST_LIAB", false, false, true, "Short-term borrowings"},
 		{"2500", "Long-term Loans", "LT_LIAB", false, false, true, "Long-term borrowings"},

@@ -4860,11 +4860,15 @@ func (h *Handler) CreateStockCount(c *gin.Context) {
 
 	// Generate count number
 	var nextNum int
-	h.db.QueryRow("SELECT COALESCE(MAX(CAST(SUBSTRING(count_number FROM 'INV-[0-9]+-([0-9]+)') AS INTEGER)),0)+1 FROM stock_counts WHERE tenant_id=$1", tenantID).Scan(&nextNum)
+	h.db.QueryRow("SELECT COALESCE(MAX(CAST(SUBSTRING(count_number FROM 'WS-[0-9]+-([0-9]+)') AS INTEGER)),0)+1 FROM stock_counts WHERE tenant_id=$1 AND count_number LIKE 'WS-%'", tenantID).Scan(&nextNum)
+	if nextNum == 0 {
+		// Also check old INV- prefix for continuity
+		h.db.QueryRow("SELECT COALESCE(MAX(CAST(SUBSTRING(count_number FROM 'INV-[0-9]+-([0-9]+)') AS INTEGER)),0)+1 FROM stock_counts WHERE tenant_id=$1 AND count_number LIKE 'INV-%'", tenantID).Scan(&nextNum)
+	}
 	if nextNum == 0 {
 		nextNum = 1
 	}
-	countNumber := fmt.Sprintf("INV-%d-%03d", countDate.Year(), nextNum)
+	countNumber := fmt.Sprintf("WS-%d-%03d", countDate.Year(), nextNum)
 
 	id := uuid.New()
 	now := time.Now()

@@ -1463,6 +1463,114 @@ func (h *Handler) ListOperationTypes(c *gin.Context) {
 	response.Success(c, operationTypes)
 }
 
+// GetOperationType returns a single operation type by ID with its stock pickings
+func (h *Handler) GetOperationType(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid operation type ID")
+		return
+	}
+
+	// Get the operation type
+	var ot entity.OperationTypeResponse
+	var warehouseName sql.NullString
+
+	err = h.db.QueryRow(`
+		SELECT ot.id, ot.warehouse_id, ot.code, ot.name, ot.type, ot.sequence,
+			   ot.color, ot.show_operations,
+			   ot.count_picking_ready, ot.count_picking_late,
+			   ot.count_picking_waiting, ot.count_picking_backorders,
+			   ot.is_active, ot.created_at,
+			   w.name as warehouse_name
+		FROM warehouse_operation_types ot
+		JOIN warehouses w ON ot.warehouse_id = w.id
+		WHERE ot.id = $1 AND ot.tenant_id = $2 AND ot.deleted_at IS NULL
+	`, id, tenantID).Scan(
+		&ot.ID, &ot.WarehouseID, &ot.Code, &ot.Name, &ot.Type, &ot.Sequence,
+		&ot.Color, &ot.ShowOperations,
+		&ot.CountPickingReady, &ot.CountPickingLate,
+		&ot.CountPickingWaiting, &ot.CountPickingBackorders,
+		&ot.IsActive, &ot.CreatedAt,
+		&warehouseName,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Operation type")
+			return
+		}
+		h.log.Error("Failed to get operation type", "error", err)
+		response.InternalError(c, "Failed to get operation type")
+		return
+	}
+
+	if warehouseName.Valid {
+		ot.WarehouseName = warehouseName.String
+	}
+
+	// Get stock pickings for this operation type
+	pickingRows, err := h.db.Query(`
+		SELECT sp.id, sp.name, sp.origin, sp.state, sp.priority,
+			   sp.scheduled_date, sp.date_done, sp.note,
+			   sp.user_id, sp.created_at,
+			   COALESCE(u.email, '') as user_email,
+			   COALESCE(e.first_name || ' ' || e.last_name, u.email, '') as user_name
+		FROM stock_pickings sp
+		LEFT JOIN users u ON sp.user_id = u.id
+		LEFT JOIN employees e ON e.user_id = sp.user_id AND e.tenant_id = sp.tenant_id
+		WHERE sp.operation_type_id = $1 AND sp.tenant_id = $2
+			AND (sp.deleted_at IS NULL)
+		ORDER BY sp.scheduled_date DESC NULLS LAST, sp.created_at DESC
+		LIMIT 100
+	`, id, tenantID)
+
+	type StockPickingResponse struct {
+		ID            uuid.UUID  `json:"id"`
+		Name          string     `json:"name"`
+		Origin        *string    `json:"origin,omitempty"`
+		State         string     `json:"state"`
+		Priority      string     `json:"priority"`
+		ScheduledDate *time.Time `json:"scheduled_date,omitempty"`
+		DateDone      *time.Time `json:"date_done,omitempty"`
+		Note          *string    `json:"note,omitempty"`
+		UserID        *uuid.UUID `json:"user_id,omitempty"`
+		UserEmail     string     `json:"user_email,omitempty"`
+		UserName      string     `json:"user_name,omitempty"`
+		CreatedAt     time.Time  `json:"created_at"`
+	}
+
+	pickings := make([]StockPickingResponse, 0)
+	if err == nil {
+		defer pickingRows.Close()
+		for pickingRows.Next() {
+			var p StockPickingResponse
+			if scanErr := pickingRows.Scan(
+				&p.ID, &p.Name, &p.Origin, &p.State, &p.Priority,
+				&p.ScheduledDate, &p.DateDone, &p.Note,
+				&p.UserID, &p.CreatedAt,
+				&p.UserEmail, &p.UserName,
+			); scanErr != nil {
+				h.log.Error("Failed to scan stock picking", "error", scanErr)
+				continue
+			}
+			pickings = append(pickings, p)
+		}
+	}
+
+	result := map[string]interface{}{
+		"operation_type": ot,
+		"pickings":       pickings,
+	}
+
+	response.Success(c, result)
+}
+
 // GetWarehouseOperationTypes returns operation types for a specific warehouse
 func (h *Handler) GetWarehouseOperationTypes(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
