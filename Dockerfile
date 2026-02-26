@@ -17,9 +17,9 @@ RUN go mod download
 COPY . .
 
 # Add Swagger dependencies to go.mod
-RUN go get -u github.com/swaggo/swag && \
-    go get -u github.com/swaggo/gin-swagger && \
-    go get -u github.com/swaggo/files
+RUN go get github.com/swaggo/swag && \
+    go get github.com/swaggo/gin-swagger && \
+    go get github.com/swaggo/files
 
 # Install swag for Swagger documentation generation
 RUN go install github.com/swaggo/swag/cmd/swag@latest
