@@ -9,12 +9,8 @@ import (
 // They return placeholder responses for now
 
 // ========== ROLES ==========
+// Role handlers are implemented in roles.go
 
-func (h *Handler) ListRoles(c *gin.Context)   { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateRole(c *gin.Context)  { response.Created(c, gin.H{"message": "Role created"}) }
-func (h *Handler) GetRole(c *gin.Context)     { response.NotFound(c, "Role") }
-func (h *Handler) UpdateRole(c *gin.Context)  { response.Success(c, gin.H{"message": "Role updated"}) }
-func (h *Handler) DeleteRole(c *gin.Context)  { response.NoContent(c) }
 func (h *Handler) ListPermissions(c *gin.Context) {
 	response.Success(c, []interface{}{})
 }
