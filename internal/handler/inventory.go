@@ -5258,3 +5258,736 @@ func (h *Handler) DeleteStockCount(c *gin.Context) {
 
 	response.NoContent(c)
 }
+
+// ─── Stock Operations TT Handlers ─────────────────────────────────────────────
+
+// ListStockOperations returns stock operations filtered by direction and state
+func (h *Handler) ListStockOperations(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	direction := c.Query("direction")   // receipt, delivery, internal, write_off
+	state := c.Query("state")           // draft, in_progress, waiting, done, cancelled
+	partnerID := c.Query("partner_id")
+	limit := 50
+
+	query := `
+		SELECT so.id, so.name, so.direction, so.date, so.scheduled_date,
+		       so.state, so.current_step, so.total_steps, so.priority,
+		       so.source_document, so.note, so.write_off_reason,
+		       so.operation_type_id, wot.name as operation_type_name,
+		       so.partner_id, c.name as partner_name,
+		       so.created_at, so.updated_at
+		FROM stock_operations so
+		LEFT JOIN warehouse_operation_types wot ON so.operation_type_id = wot.id
+		LEFT JOIN contacts c ON so.partner_id = c.id
+		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL
+	`
+	args := []interface{}{tenantID}
+	argN := 1
+
+	if direction != "" {
+		argN++
+		query += fmt.Sprintf(" AND so.direction = $%d", argN)
+		args = append(args, direction)
+	}
+	if state != "" {
+		argN++
+		query += fmt.Sprintf(" AND so.state = $%d", argN)
+		args = append(args, state)
+	}
+	if partnerID != "" {
+		pid, err := uuid.Parse(partnerID)
+		if err == nil {
+			argN++
+			query += fmt.Sprintf(" AND so.partner_id = $%d", argN)
+			args = append(args, pid)
+		}
+	}
+
+	query += fmt.Sprintf(" ORDER BY so.created_at DESC LIMIT %d", limit)
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list stock operations", "error", err)
+		response.InternalError(c, "Failed to list stock operations")
+		return
+	}
+	defer rows.Close()
+
+	ops := make([]*entity.StockOperation, 0)
+	for rows.Next() {
+		var op entity.StockOperation
+		var scheduledDate sql.NullTime
+		var partnerIDNull, opTypeIDNull sql.NullString
+		var partnerName, opTypeName, sourceDoc, note, writeOffReason sql.NullString
+
+		err := rows.Scan(
+			&op.ID, &op.Name, &op.Direction, &op.Date, &scheduledDate,
+			&op.State, &op.CurrentStep, &op.TotalSteps, &op.Priority,
+			&sourceDoc, &note, &writeOffReason,
+			&opTypeIDNull, &opTypeName,
+			&partnerIDNull, &partnerName,
+			&op.CreatedAt, &op.UpdatedAt,
+		)
+		if err != nil {
+			continue
+		}
+		if scheduledDate.Valid {
+			t := scheduledDate.Time
+			op.ScheduledDate = &t
+		}
+		if partnerName.Valid {
+			op.PartnerName = partnerName.String
+		}
+		if sourceDoc.Valid {
+			op.SourceDocument = sourceDoc.String
+		}
+		if note.Valid {
+			op.Note = note.String
+		}
+		if writeOffReason.Valid {
+			op.WriteOffReason = writeOffReason.String
+		}
+		ops = append(ops, &op)
+	}
+
+	response.Success(c, ops)
+}
+
+// GetStockOperation returns a single stock operation with lines and step logs
+func (h *Handler) GetStockOperation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var op entity.StockOperation
+	var scheduledDate sql.NullTime
+	var partnerName, sourceDoc, note, writeOffReason, opTypeName sql.NullString
+
+	err = h.db.QueryRow(`
+		SELECT so.id, so.name, so.direction, so.date, so.scheduled_date,
+		       so.state, so.current_step, so.total_steps, so.priority,
+		       so.source_document, so.note, so.write_off_reason,
+		       so.operation_type_id, wot.name,
+		       so.partner_id,
+		       c.name as partner_name,
+		       so.created_at, so.updated_at
+		FROM stock_operations so
+		LEFT JOIN warehouse_operation_types wot ON so.operation_type_id = wot.id
+		LEFT JOIN contacts c ON so.partner_id = c.id
+		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL
+	`, id, tenantID).Scan(
+		&op.ID, &op.Name, &op.Direction, &op.Date, &scheduledDate,
+		&op.State, &op.CurrentStep, &op.TotalSteps, &op.Priority,
+		&sourceDoc, &note, &writeOffReason,
+		&op.OperationTypeID, &opTypeName,
+		&op.PartnerID,
+		&partnerName,
+		&op.CreatedAt, &op.UpdatedAt,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to get stock operation")
+		return
+	}
+	if scheduledDate.Valid {
+		t := scheduledDate.Time
+		op.ScheduledDate = &t
+	}
+	if partnerName.Valid {
+		op.PartnerName = partnerName.String
+	}
+	if sourceDoc.Valid {
+		op.SourceDocument = sourceDoc.String
+	}
+	if note.Valid {
+		op.Note = note.String
+	}
+	if writeOffReason.Valid {
+		op.WriteOffReason = writeOffReason.String
+	}
+
+	// Load lines
+	lineRows, err := h.db.Query(`
+		SELECT sol.id, sol.product_id, p.name, p.sku,
+		       sol.expected_qty, sol.done_qty, sol.uom,
+		       sol.unit_price, sol.lot_number, sol.expiry_date,
+		       sol.quality_status, sol.write_off_reason, sol.note, sol.created_at
+		FROM stock_operation_lines sol
+		LEFT JOIN products p ON sol.product_id = p.id
+		WHERE sol.operation_id = $1 AND sol.tenant_id = $2
+		ORDER BY sol.created_at
+	`, id, tenantID)
+	if err == nil {
+		defer lineRows.Close()
+		for lineRows.Next() {
+			var line entity.StockOperationLine
+			var productName, productCode, lotNum, expiryDate, writeOffR, lineNote sql.NullString
+			var unitPrice sql.NullFloat64
+			var expiryStr sql.NullString
+			_ = expiryStr
+			err := lineRows.Scan(
+				&line.ID, &line.ProductID, &productName, &productCode,
+				&line.ExpectedQty, &line.DoneQty, &line.UOM,
+				&unitPrice, &lotNum, &expiryDate,
+				&line.QualityStatus, &writeOffR, &lineNote, &line.CreatedAt,
+			)
+			if err != nil {
+				continue
+			}
+			if productName.Valid {
+				line.ProductName = productName.String
+			}
+			if productCode.Valid {
+				line.ProductCode = productCode.String
+			}
+			if lotNum.Valid {
+				line.LotNumber = lotNum.String
+			}
+			if expiryDate.Valid {
+				s := expiryDate.String
+				line.ExpiryDate = &s
+			}
+			if unitPrice.Valid {
+				line.UnitPrice = &unitPrice.Float64
+			}
+			if writeOffR.Valid {
+				line.WriteOffReason = writeOffR.String
+			}
+			if lineNote.Valid {
+				line.Note = lineNote.String
+			}
+			line.TenantID = tenantID
+			line.OperationID = id
+			op.Lines = append(op.Lines, line)
+		}
+	}
+
+	// Load step logs
+	logRows, err := h.db.Query(`
+		SELECT id, step_id, step_sequence, step_name, state,
+		       started_at, completed_at, started_by, completed_by,
+		       approved_by, rejection_reason, note, created_at
+		FROM stock_operation_step_log
+		WHERE operation_id = $1 AND tenant_id = $2
+		ORDER BY step_sequence
+	`, id, tenantID)
+	if err == nil {
+		defer logRows.Close()
+		for logRows.Next() {
+			var sl entity.StockOperationStepLog
+			var stepID sql.NullString
+			var startedAt, completedAt sql.NullTime
+			var startedBy, completedBy, approvedBy sql.NullString
+			var rejReason, slNote, stepName sql.NullString
+			err := logRows.Scan(
+				&sl.ID, &stepID, &sl.StepSequence, &stepName, &sl.State,
+				&startedAt, &completedAt, &startedBy, &completedBy,
+				&approvedBy, &rejReason, &slNote, &sl.CreatedAt,
+			)
+			if err != nil {
+				continue
+			}
+			if stepName.Valid {
+				sl.StepName = stepName.String
+			}
+			if startedAt.Valid {
+				t := startedAt.Time
+				sl.StartedAt = &t
+			}
+			if completedAt.Valid {
+				t := completedAt.Time
+				sl.CompletedAt = &t
+			}
+			if rejReason.Valid {
+				sl.RejectionReason = rejReason.String
+			}
+			if slNote.Valid {
+				sl.Note = slNote.String
+			}
+			sl.Documents = []string{}
+			sl.TenantID = tenantID
+			sl.OperationID = id
+			op.StepLogs = append(op.StepLogs, sl)
+		}
+	}
+
+	response.Success(c, op)
+}
+
+// nextStockOperationName generates the next sequential operation name
+func (h *Handler) nextStockOperationName(tenantID uuid.UUID, direction string) string {
+	year := time.Now().Year()
+	prefix := map[string]string{
+		"receipt":   "REC",
+		"delivery":  "DEL",
+		"internal":  "INT",
+		"write_off": "WO",
+	}[direction]
+	if prefix == "" {
+		prefix = "OP"
+	}
+
+	var lastNum int
+	h.db.QueryRow(`
+		INSERT INTO stock_operation_sequences (tenant_id, direction, year, last_number)
+		VALUES ($1, $2, $3, 1)
+		ON CONFLICT (tenant_id, direction, year)
+		DO UPDATE SET last_number = stock_operation_sequences.last_number + 1
+		RETURNING last_number
+	`, tenantID, direction, year).Scan(&lastNum)
+
+	return fmt.Sprintf("%s-%d-%05d", prefix, year, lastNum)
+}
+
+// CreateStockOperation creates a new stock operation with optional lines
+func (h *Handler) CreateStockOperation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var input entity.CreateStockOperationInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	opTypeID, err := uuid.Parse(input.OperationTypeID)
+	if err != nil {
+		response.BadRequest(c, "Invalid operation_type_id")
+		return
+	}
+
+	// Count steps configured for this operation type
+	var totalSteps int
+	h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2", opTypeID, tenantID).Scan(&totalSteps)
+	if totalSteps == 0 {
+		totalSteps = 1
+	}
+
+	id := uuid.New()
+	name := h.nextStockOperationName(tenantID, input.Direction)
+	now := time.Now()
+	priority := input.Priority
+	if priority == "" {
+		priority = "normal"
+	}
+
+	var partnerID *uuid.UUID
+	if input.PartnerID != "" {
+		pid, err := uuid.Parse(input.PartnerID)
+		if err == nil {
+			partnerID = &pid
+		}
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO stock_operations (
+			id, tenant_id, name, operation_type_id, direction,
+			date, partner_id, source_document,
+			state, current_step, total_steps, priority,
+			note, write_off_reason,
+			created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'draft',1,$9,$10,$11,$12,$13,$13)
+	`,
+		id, tenantID, name, opTypeID, input.Direction,
+		now, partnerID, input.SourceDocument,
+		totalSteps, priority,
+		input.Note, input.WriteOffReason,
+		now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create stock operation", "error", err)
+		response.InternalError(c, "Failed to create stock operation")
+		return
+	}
+
+	// Create lines
+	for _, l := range input.Lines {
+		productID, err := uuid.Parse(l.ProductID)
+		if err != nil {
+			continue
+		}
+		uom := l.UOM
+		if uom == "" {
+			uom = "unit"
+		}
+		qs := l.QualityStatus
+		if qs == "" {
+			qs = "good"
+		}
+		h.db.Exec(`
+			INSERT INTO stock_operation_lines (
+				id, tenant_id, operation_id, product_id,
+				expected_qty, done_qty, uom, unit_price,
+				lot_number, expiry_date, quality_status,
+				write_off_reason, note, created_at, updated_at
+			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$5,$6,$7,$8,
+			  NULLIF($9,'')::date,$10,$11,$12,$13,$13)
+		`,
+			tenantID, id, productID,
+			l.ExpectedQty, l.DoneQty, uom, l.UnitPrice,
+			l.LotNumber, l.ExpiryDate, qs,
+			l.WriteOffReason, l.Note, now,
+		)
+	}
+
+	// Create initial step log for step 1
+	firstStepName := "Step 1"
+	var firstStep struct {
+		ID   uuid.UUID
+		Name string
+	}
+	err = h.db.QueryRow(`
+		SELECT id, name FROM operation_type_steps
+		WHERE operation_type_id = $1 AND tenant_id = $2
+		ORDER BY sequence LIMIT 1
+	`, opTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name)
+	if err == nil {
+		firstStepName = firstStep.Name
+	}
+
+	h.db.Exec(`
+		INSERT INTO stock_operation_step_log (
+			id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
+		) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
+	`, tenantID, id, firstStep.ID, firstStepName, now)
+
+	response.Created(c, map[string]interface{}{
+		"id":   id,
+		"name": name,
+	})
+}
+
+// AdvanceStockOperationStep marks current step as done and moves to next step
+func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var op struct {
+		CurrentStep int
+		TotalSteps  int
+		State       string
+		OpTypeID    uuid.UUID
+	}
+	err = h.db.QueryRow(`
+		SELECT current_step, total_steps, state, operation_type_id
+		FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&op.CurrentStep, &op.TotalSteps, &op.State, &op.OpTypeID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if op.State == "done" || op.State == "cancelled" {
+		response.BadRequest(c, "Operation is already "+op.State)
+		return
+	}
+
+	now := time.Now()
+
+	// Mark current step as completed
+	h.db.Exec(`
+		UPDATE stock_operation_step_log
+		SET state='completed', completed_at=$1, completed_by=$2
+		WHERE operation_id=$3 AND step_sequence=$4 AND tenant_id=$5
+	`, now, userID, id, op.CurrentStep, tenantID)
+
+	nextStep := op.CurrentStep + 1
+	var newState string
+	if nextStep > op.TotalSteps {
+		// All steps done — mark operation as done
+		newState = "done"
+		h.db.Exec(`
+			UPDATE stock_operations
+			SET state='done', done_at=$1, updated_at=$1
+			WHERE id=$2 AND tenant_id=$3
+		`, now, id, tenantID)
+	} else {
+		newState = "in_progress"
+		// Find next step definition
+		nextStepName := fmt.Sprintf("Step %d", nextStep)
+		var nextStepDef struct {
+			ID   uuid.UUID
+			Name string
+		}
+		err = h.db.QueryRow(`
+			SELECT id, name FROM operation_type_steps
+			WHERE operation_type_id=$1 AND tenant_id=$2 AND sequence=$3
+		`, op.OpTypeID, tenantID, nextStep).Scan(&nextStepDef.ID, &nextStepDef.Name)
+		if err == nil {
+			nextStepName = nextStepDef.Name
+		}
+
+		// Create next step log entry
+		h.db.Exec(`
+			INSERT INTO stock_operation_step_log (
+				id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
+			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$5,'ready',$6)
+		`, tenantID, id, nextStepDef.ID, nextStep, nextStepName, now)
+
+		h.db.Exec(`
+			UPDATE stock_operations
+			SET current_step=$1, state=$2, updated_at=$3
+			WHERE id=$4 AND tenant_id=$5
+		`, nextStep, newState, now, id, tenantID)
+	}
+
+	response.Success(c, map[string]interface{}{
+		"state":        newState,
+		"current_step": nextStep,
+		"total_steps":  op.TotalSteps,
+	})
+}
+
+// CancelStockOperation cancels a stock operation
+func (h *Handler) CancelStockOperation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var state string
+	err = h.db.QueryRow("SELECT state FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", id, tenantID).Scan(&state)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if state == "done" {
+		response.BadRequest(c, "Cannot cancel a completed operation")
+		return
+	}
+
+	now := time.Now()
+	h.db.Exec("UPDATE stock_operations SET state='cancelled', updated_at=$1 WHERE id=$2 AND tenant_id=$3", now, id, tenantID)
+
+	response.Success(c, map[string]string{"state": "cancelled"})
+}
+
+// ValidateStockOperation confirms a draft stock operation (sets to in_progress)
+func (h *Handler) ValidateStockOperation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var state string
+	err = h.db.QueryRow("SELECT state FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", id, tenantID).Scan(&state)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if state != "draft" {
+		response.BadRequest(c, "Only draft operations can be validated")
+		return
+	}
+
+	now := time.Now()
+	h.db.Exec("UPDATE stock_operations SET state='in_progress', updated_at=$1 WHERE id=$2 AND tenant_id=$3", now, id, tenantID)
+
+	response.Success(c, map[string]string{"state": "in_progress"})
+}
+
+// ListOperationTypeSteps returns the steps configured for an operation type
+func (h *Handler) ListOperationTypeSteps(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	opTypeID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid operation type ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, sequence, name, responsible_role,
+		       requires_approval, approval_role, auto_proceed,
+		       max_duration_hours, on_timeout, instructions,
+		       created_at, updated_at
+		FROM operation_type_steps
+		WHERE operation_type_id=$1 AND tenant_id=$2
+		ORDER BY sequence
+	`, opTypeID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to list steps")
+		return
+	}
+	defer rows.Close()
+
+	steps := make([]*entity.OperationTypeStep, 0)
+	for rows.Next() {
+		var s entity.OperationTypeStep
+		var maxDur sql.NullFloat64
+		var instrNote sql.NullString
+		var respRole, apprRole sql.NullString
+		err := rows.Scan(
+			&s.ID, &s.Sequence, &s.Name, &respRole,
+			&s.RequiresApproval, &apprRole, &s.AutoProceed,
+			&maxDur, &s.OnTimeout, &instrNote,
+			&s.CreatedAt, &s.UpdatedAt,
+		)
+		if err != nil {
+			continue
+		}
+		if maxDur.Valid {
+			s.MaxDurationHours = &maxDur.Float64
+		}
+		if instrNote.Valid {
+			s.Instructions = instrNote.String
+		}
+		if respRole.Valid {
+			s.ResponsibleRole = respRole.String
+		}
+		if apprRole.Valid {
+			s.ApprovalRole = apprRole.String
+		}
+		s.NotifyUsers = []string{}
+		s.RequiredDocuments = []string{}
+		s.TenantID = tenantID
+		s.OperationTypeID = opTypeID
+		steps = append(steps, &s)
+	}
+
+	response.Success(c, steps)
+}
+
+// SaveOperationTypeSteps replaces all steps for an operation type
+func (h *Handler) SaveOperationTypeSteps(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	opTypeID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid operation type ID")
+		return
+	}
+
+	var steps []struct {
+		Sequence         int     `json:"sequence"`
+		Name             string  `json:"name"`
+		ResponsibleRole  string  `json:"responsible_role"`
+		RequiresApproval bool    `json:"requires_approval"`
+		ApprovalRole     string  `json:"approval_role"`
+		AutoProceed      bool    `json:"auto_proceed"`
+		MaxDurationHours *float64 `json:"max_duration_hours"`
+		OnTimeout        string  `json:"on_timeout"`
+		Instructions     string  `json:"instructions"`
+	}
+	if err := c.ShouldBindJSON(&steps); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	now := time.Now()
+
+	// Delete old steps
+	h.db.Exec("DELETE FROM operation_type_steps WHERE operation_type_id=$1 AND tenant_id=$2", opTypeID, tenantID)
+
+	for i, s := range steps {
+		seq := s.Sequence
+		if seq == 0 {
+			seq = i + 1
+		}
+		onTimeout := s.OnTimeout
+		if onTimeout == "" {
+			onTimeout = "warn"
+		}
+		h.db.Exec(`
+			INSERT INTO operation_type_steps (
+				id, tenant_id, operation_type_id, sequence, name,
+				responsible_role, requires_approval, approval_role,
+				auto_proceed, max_duration_hours, on_timeout, instructions,
+				created_at, updated_at
+			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
+		`,
+			tenantID, opTypeID, seq, s.Name,
+			s.ResponsibleRole, s.RequiresApproval, s.ApprovalRole,
+			s.AutoProceed, s.MaxDurationHours, onTimeout, s.Instructions,
+			now,
+		)
+	}
+
+	response.Success(c, map[string]interface{}{"saved": len(steps)})
+}
+
+// GetStockOperationSummary returns counts by direction and state
+func (h *Handler) GetStockOperationSummary(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT direction, state, COUNT(*) as cnt
+		FROM stock_operations
+		WHERE tenant_id=$1 AND deleted_at IS NULL
+		GROUP BY direction, state
+	`, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to get summary")
+		return
+	}
+	defer rows.Close()
+
+	type entry struct {
+		Direction string `json:"direction"`
+		State     string `json:"state"`
+		Count     int    `json:"count"`
+	}
+	result := make([]entry, 0)
+	for rows.Next() {
+		var e entry
+		rows.Scan(&e.Direction, &e.State, &e.Count)
+		result = append(result, e)
+	}
+
+	response.Success(c, result)
+}

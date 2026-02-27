@@ -1054,10 +1054,10 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
-	// Filter by organization
+	// Filter by organization (also include journals with NULL organization_id as they belong to all orgs in the tenant)
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND j.organization_id = $%d ORDER BY", argCount), 1)
+		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND (j.organization_id = $%d OR j.organization_id IS NULL) ORDER BY", argCount), 1)
 		args = append(args, orgID)
 	}
 
@@ -9105,4 +9105,457 @@ func (h *Handler) GetPendingRecurringEntries(c *gin.Context) {
 		"pending": pending,
 		"count":   len(pending),
 	})
+}
+
+// =====================================================
+// BUDGET CASH FLOW (BDDS) ENDPOINTS
+// =====================================================
+
+// GetBudgetCashFlow returns real-time cash position and 30-day forecast
+func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// 1. Current cash balances per account
+	accountRows, err := h.db.Query(`
+		SELECT a.id, a.code, a.name, a.currency_code,
+		       COALESCE(SUM(CASE WHEN je.debit_credit = 'debit' THEN jl.amount ELSE -jl.amount END), 0) as balance
+		FROM accounts a
+		LEFT JOIN journal_lines jl ON jl.account_id = a.id
+		LEFT JOIN journal_entries je ON je.id = jl.journal_entry_id AND je.status = 'posted' AND je.tenant_id = $1
+		WHERE a.tenant_id = $1 AND a.account_type IN ('asset', 'cash', 'bank')
+		  AND a.code LIKE '1%'
+		  AND a.is_active = true
+		GROUP BY a.id, a.code, a.name, a.currency_code
+		HAVING COALESCE(SUM(CASE WHEN je.debit_credit = 'debit' THEN jl.amount ELSE -jl.amount END), 0) != 0
+		   OR a.code LIKE '101%' OR a.code LIKE '102%'
+		ORDER BY a.code
+	`, tenantID)
+
+	type AccountBalance struct {
+		ID           string  `json:"id"`
+		Code         string  `json:"code"`
+		Name         string  `json:"name"`
+		Currency     string  `json:"currency"`
+		Balance      float64 `json:"balance"`
+		IsNegative   bool    `json:"is_negative"`
+	}
+
+	accountBalances := make([]AccountBalance, 0)
+	var totalCash float64
+
+	if err == nil {
+		defer accountRows.Close()
+		for accountRows.Next() {
+			var ab AccountBalance
+			var currency sql.NullString
+			accountRows.Scan(&ab.ID, &ab.Code, &ab.Name, &currency, &ab.Balance)
+			if currency.Valid {
+				ab.Currency = currency.String
+			} else {
+				ab.Currency = "UZS"
+			}
+			ab.IsNegative = ab.Balance < 0
+			totalCash += ab.Balance
+			accountBalances = append(accountBalances, ab)
+		}
+	}
+
+	// 2. Expected receipts (unpaid customer invoices due in next 30 days)
+	receiptRows, err := h.db.Query(`
+		SELECT ci.id, ci.invoice_number, c.name as counterparty,
+		       (ci.total_amount - COALESCE(ci.amount_paid, 0)) as amount,
+		       ci.due_date,
+		       CASE WHEN ci.due_date < CURRENT_DATE THEN 'overdue'
+		            WHEN ci.due_date <= CURRENT_DATE + 7 THEN 'due_soon'
+		            ELSE 'upcoming' END as urgency
+		FROM customer_invoices ci
+		JOIN contacts c ON c.id = ci.customer_id
+		WHERE ci.tenant_id = $1
+		  AND ci.status IN ('sent', 'partial')
+		  AND ci.due_date <= CURRENT_DATE + 30
+		ORDER BY ci.due_date ASC
+		LIMIT 50
+	`, tenantID)
+
+	type ReceivableItem struct {
+		ID           string  `json:"id"`
+		Reference    string  `json:"reference"`
+		Counterparty string  `json:"counterparty"`
+		Amount       float64 `json:"amount"`
+		DueDate      string  `json:"due_date"`
+		Urgency      string  `json:"urgency"`
+		Type         string  `json:"type"`
+	}
+
+	receivables := make([]ReceivableItem, 0)
+	var totalReceivables float64
+
+	if err == nil {
+		defer receiptRows.Close()
+		for receiptRows.Next() {
+			var r ReceivableItem
+			var dueDate time.Time
+			receiptRows.Scan(&r.ID, &r.Reference, &r.Counterparty, &r.Amount, &dueDate, &r.Urgency)
+			r.DueDate = dueDate.Format("2006-01-02")
+			r.Type = "invoice"
+			totalReceivables += r.Amount
+			receivables = append(receivables, r)
+		}
+	}
+
+	// 3. Expected payments (unpaid vendor bills due in next 30 days)
+	payableRows, err := h.db.Query(`
+		SELECT vb.id, vb.bill_number, c.name as counterparty,
+		       (vb.total_amount - COALESCE(vb.amount_paid, 0)) as amount,
+		       vb.due_date,
+		       CASE WHEN vb.due_date < CURRENT_DATE THEN 'overdue'
+		            WHEN vb.due_date <= CURRENT_DATE + 7 THEN 'due_soon'
+		            ELSE 'upcoming' END as urgency
+		FROM vendor_bills vb
+		JOIN contacts c ON c.id = vb.vendor_id
+		WHERE vb.tenant_id = $1
+		  AND vb.status IN ('received', 'partial')
+		  AND vb.due_date <= CURRENT_DATE + 30
+		ORDER BY vb.due_date ASC
+		LIMIT 50
+	`, tenantID)
+
+	type PayableItem struct {
+		ID           string  `json:"id"`
+		Reference    string  `json:"reference"`
+		Counterparty string  `json:"counterparty"`
+		Amount       float64 `json:"amount"`
+		DueDate      string  `json:"due_date"`
+		Urgency      string  `json:"urgency"`
+		CanPostpone  bool    `json:"can_postpone"`
+		Priority     string  `json:"priority"`
+	}
+
+	payables := make([]PayableItem, 0)
+	var totalPayables float64
+
+	if err == nil {
+		defer payableRows.Close()
+		for payableRows.Next() {
+			var p PayableItem
+			var dueDate time.Time
+			payableRows.Scan(&p.ID, &p.Reference, &p.Counterparty, &p.Amount, &dueDate, &p.Urgency)
+			p.DueDate = dueDate.Format("2006-01-02")
+			p.CanPostpone = true // Vendor bills can typically be negotiated
+			p.Priority = "medium"
+			totalPayables += p.Amount
+			payables = append(payables, p)
+		}
+	}
+
+	// 4. Build 30-day payment calendar
+	type CalendarDay struct {
+		Date           string  `json:"date"`
+		Inflows        float64 `json:"inflows"`
+		Outflows       float64 `json:"outflows"`
+		RunningBalance float64 `json:"running_balance"`
+		IsNegative     bool    `json:"is_negative"`
+		Events         []map[string]interface{} `json:"events,omitempty"`
+	}
+
+	calendarMap := make(map[string]*CalendarDay)
+	runningBalance := totalCash
+
+	// Add receivables to calendar
+	for _, r := range receivables {
+		if _, exists := calendarMap[r.DueDate]; !exists {
+			calendarMap[r.DueDate] = &CalendarDay{Date: r.DueDate}
+		}
+		calendarMap[r.DueDate].Inflows += r.Amount
+		calendarMap[r.DueDate].Events = append(calendarMap[r.DueDate].Events, map[string]interface{}{
+			"type":         "inflow",
+			"description":  r.Counterparty + ": " + r.Reference,
+			"amount":       r.Amount,
+			"counterparty": r.Counterparty,
+		})
+	}
+
+	// Add payables to calendar
+	for _, p := range payables {
+		if _, exists := calendarMap[p.DueDate]; !exists {
+			calendarMap[p.DueDate] = &CalendarDay{Date: p.DueDate}
+		}
+		calendarMap[p.DueDate].Outflows += p.Amount
+		calendarMap[p.DueDate].Events = append(calendarMap[p.DueDate].Events, map[string]interface{}{
+			"type":         "outflow",
+			"description":  p.Counterparty + ": " + p.Reference,
+			"amount":       p.Amount,
+			"counterparty": p.Counterparty,
+		})
+	}
+
+	// Build sorted calendar for next 30 days
+	calendar := make([]CalendarDay, 0)
+	for i := 0; i <= 30; i++ {
+		date := time.Now().AddDate(0, 0, i).Format("2006-01-02")
+		day := CalendarDay{Date: date, RunningBalance: runningBalance}
+		if d, exists := calendarMap[date]; exists {
+			day.Inflows = d.Inflows
+			day.Outflows = d.Outflows
+			day.Events = d.Events
+		}
+		runningBalance = runningBalance + day.Inflows - day.Outflows
+		day.RunningBalance = runningBalance
+		day.IsNegative = runningBalance < 0
+		calendar = append(calendar, day)
+	}
+
+	response.Success(c, gin.H{
+		"account_balances": accountBalances,
+		"total_cash":       totalCash,
+		"receivables":      receivables,
+		"payables":         payables,
+		"total_receivables": totalReceivables,
+		"total_payables":    totalPayables,
+		"net_position":     totalCash + totalReceivables - totalPayables,
+		"calendar":         calendar,
+		"summary": gin.H{
+			"current_balance":     totalCash,
+			"expected_inflows":    totalReceivables,
+			"expected_outflows":   totalPayables,
+			"forecast_30d":        totalCash + totalReceivables - totalPayables,
+			"has_negative_accounts": func() bool {
+				for _, ab := range accountBalances {
+					if ab.IsNegative {
+						return true
+					}
+				}
+				return false
+			}(),
+		},
+	})
+}
+
+// GetBudgetPlanVsActual returns plan vs actual comparison for a budget
+func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	budgetID := c.Query("budget_id")
+	groupBy := c.DefaultQuery("group_by", "category") // category, department, month
+
+	if budgetID == "" {
+		response.BadRequest(c, "budget_id is required")
+		return
+	}
+
+	// Get budget details
+	var budget struct {
+		ID        string  `json:"id"`
+		Name      string  `json:"name"`
+		StartDate string  `json:"start_date"`
+		EndDate   string  `json:"end_date"`
+		Type      string  `json:"type"`
+	}
+	h.db.QueryRow(`
+		SELECT b.id::text, b.name,
+		       COALESCE(b.start_date, fy.start_date::text),
+		       COALESCE(b.end_date, fy.end_date::text),
+		       b.budget_type
+		FROM budgets b
+		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
+		WHERE b.id = $1 AND b.tenant_id = $2
+	`, budgetID, tenantID).Scan(&budget.ID, &budget.Name, &budget.StartDate, &budget.EndDate, &budget.Type)
+
+	// Get budget lines with actual amounts from journal entries
+	rows, err := h.db.Query(`
+		SELECT
+			bl.id,
+			COALESCE(bl.category_name, a.name) as category,
+			a.code as account_code,
+			a.name as account_name,
+			COALESCE(bl.line_type, 'expense') as line_type,
+			COALESCE(bl.budgeted_amount, 0) as planned,
+			COALESCE(
+				(SELECT SUM(CASE WHEN je.debit_credit = 'debit' THEN jl.amount ELSE -jl.amount END)
+				 FROM journal_lines jl
+				 JOIN journal_entries je ON je.id = jl.journal_entry_id
+				 WHERE jl.account_id = bl.account_id
+				   AND je.tenant_id = $2
+				   AND je.status = 'posted'
+				   AND je.entry_date >= $3::date
+				   AND je.entry_date <= $4::date), 0
+			) as actual
+		FROM budget_lines bl
+		JOIN accounts a ON a.id = bl.account_id
+		WHERE bl.budget_id = $1
+		ORDER BY bl.line_type DESC, a.code
+	`, budgetID, tenantID, budget.StartDate, budget.EndDate)
+
+	if err != nil {
+		h.log.Error("Failed to get plan vs actual", "error", err)
+		response.InternalError(c, "Failed to get plan vs actual")
+		return
+	}
+	defer rows.Close()
+
+	type LineItem struct {
+		ID          string  `json:"id"`
+		Category    string  `json:"category"`
+		AccountCode string  `json:"account_code"`
+		AccountName string  `json:"account_name"`
+		LineType    string  `json:"line_type"`
+		Planned     float64 `json:"planned"`
+		Actual      float64 `json:"actual"`
+		Variance    float64 `json:"variance"`
+		VariancePct float64 `json:"variance_pct"`
+		Status      string  `json:"status"` // ok, warning, overspent
+	}
+
+	items := make([]LineItem, 0)
+	var totalPlannedRevenue, totalActualRevenue float64
+	var totalPlannedExpense, totalActualExpense float64
+
+	for rows.Next() {
+		var item LineItem
+		rows.Scan(&item.ID, &item.Category, &item.AccountCode, &item.AccountName,
+			&item.LineType, &item.Planned, &item.Actual)
+
+		item.Variance = item.Planned - item.Actual
+		if item.Planned != 0 {
+			item.VariancePct = (item.Variance / item.Planned) * 100
+		}
+
+		usagePct := 0.0
+		if item.Planned > 0 {
+			usagePct = (item.Actual / item.Planned) * 100
+		}
+
+		if item.LineType == "revenue" {
+			totalPlannedRevenue += item.Planned
+			totalActualRevenue += item.Actual
+			if usagePct >= 90 {
+				item.Status = "ok"
+			} else if usagePct >= 70 {
+				item.Status = "warning"
+			} else {
+				item.Status = "critical"
+			}
+		} else {
+			totalPlannedExpense += item.Planned
+			totalActualExpense += item.Actual
+			if usagePct > 100 {
+				item.Status = "overspent"
+			} else if usagePct >= 80 {
+				item.Status = "warning"
+			} else {
+				item.Status = "ok"
+			}
+		}
+
+		items = append(items, item)
+	}
+
+	_ = groupBy // TODO: implement groupBy logic
+
+	response.Success(c, gin.H{
+		"budget":    budget,
+		"items":     items,
+		"totals": gin.H{
+			"planned_revenue":  totalPlannedRevenue,
+			"actual_revenue":   totalActualRevenue,
+			"planned_expense":  totalPlannedExpense,
+			"actual_expense":   totalActualExpense,
+			"planned_profit":   totalPlannedRevenue - totalPlannedExpense,
+			"actual_profit":    totalActualRevenue - totalActualExpense,
+			"revenue_variance": totalPlannedRevenue - totalActualRevenue,
+			"expense_variance": totalPlannedExpense - totalActualExpense,
+		},
+	})
+}
+
+// SubmitBudgetForApproval submits a budget for approval
+func (h *Handler) SubmitBudgetForApproval(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	budgetID := c.Param("id")
+	userID, _ := middleware.GetUserID(c)
+
+	_, err := h.db.Exec(`
+		UPDATE budgets
+		SET approval_status = 'pending', submitted_by = $1, submitted_at = NOW(), updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND status = 'draft'
+	`, userID, budgetID, tenantID)
+
+	if err != nil {
+		h.log.Error("Failed to submit budget for approval", "error", err)
+		response.InternalError(c, "Failed to submit budget for approval")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Budget submitted for approval"})
+}
+
+// ApproveBudget approves a budget
+func (h *Handler) ApproveBudget(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	budgetID := c.Param("id")
+	userID, _ := middleware.GetUserID(c)
+
+	_, err := h.db.Exec(`
+		UPDATE budgets
+		SET approval_status = 'approved', status = 'active',
+		    approved_by = $1, approved_at = NOW(), updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND approval_status = 'pending'
+	`, userID, budgetID, tenantID)
+
+	if err != nil {
+		h.log.Error("Failed to approve budget", "error", err)
+		response.InternalError(c, "Failed to approve budget")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Budget approved and activated"})
+}
+
+// RejectBudget rejects a budget with a reason
+func (h *Handler) RejectBudget(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	budgetID := c.Param("id")
+
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	c.ShouldBindJSON(&input)
+
+	_, err := h.db.Exec(`
+		UPDATE budgets
+		SET approval_status = 'rejected', rejection_reason = $1,
+		    status = 'draft', updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND approval_status = 'pending'
+	`, input.Reason, budgetID, tenantID)
+
+	if err != nil {
+		h.log.Error("Failed to reject budget", "error", err)
+		response.InternalError(c, "Failed to reject budget")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Budget rejected"})
 }

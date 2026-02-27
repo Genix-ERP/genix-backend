@@ -1035,13 +1035,16 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 
 		_, err := h.db.Exec(`
 			INSERT INTO journals (
-				id, tenant_id, code, name, type,
+				id, tenant_id, organization_id, code, name, type,
 				default_debit_account_id, default_credit_account_id,
 				is_active, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (tenant_id, organization_id, code) DO NOTHING
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (tenant_id, code) DO UPDATE
+				SET organization_id = EXCLUDED.organization_id,
+				    updated_at = NOW()
+			WHERE journals.organization_id IS NULL
 		`,
-			id, tenantID, j.code, j.name, j.journalType,
+			id, tenantID, orgID, j.code, j.name, j.journalType,
 			defaultDebitID, defaultCreditID,
 			true, now,
 		)

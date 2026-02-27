@@ -323,6 +323,23 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		stockCounts.DELETE("/:id", middleware.RequirePermission("inventory", "stock", "delete"), h.DeleteStockCount)
 	}
 
+	// Stock Operations (TT: Receipt, Delivery, Internal Transfer, Write-off)
+	stockOps := rg.Group("/stock-operations")
+	stockOps.Use(middleware.RequirePermission("inventory", "stock", "read"))
+	{
+		stockOps.GET("", h.ListStockOperations)
+		stockOps.GET("/summary", h.GetStockOperationSummary)
+		stockOps.POST("", middleware.RequirePermission("inventory", "stock", "create"), h.CreateStockOperation)
+		stockOps.GET("/:id", h.GetStockOperation)
+		stockOps.POST("/:id/validate", middleware.RequirePermission("inventory", "stock", "update"), h.ValidateStockOperation)
+		stockOps.POST("/:id/advance", middleware.RequirePermission("inventory", "stock", "update"), h.AdvanceStockOperationStep)
+		stockOps.POST("/:id/cancel", middleware.RequirePermission("inventory", "stock", "update"), h.CancelStockOperation)
+	}
+
+	// Operation Type Steps (per operation type configuration)
+	operationTypes.GET("/:id/steps", h.ListOperationTypeSteps)
+	operationTypes.PUT("/:id/steps", middleware.RequirePermission("inventory", "warehouse", "update"), h.SaveOperationTypeSteps)
+
 	// Product Attributes
 	productAttributes := rg.Group("/product-attributes")
 	productAttributes.Use(middleware.RequirePermission("inventory", "product_attribute", "read"))
@@ -1064,9 +1081,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		budget.GET("", h.ListBudgetsV2)
 		budget.POST("", middleware.RequirePermission("finance", "budget", "create"), h.CreateBudgetV2)
 		budget.GET("/consolidated", h.GetConsolidatedBudget)
+		budget.GET("/cash-flow", h.GetBudgetCashFlow)
+		budget.GET("/plan-vs-actual", h.GetBudgetPlanVsActual)
 		budget.GET("/:id", h.GetBudgetV2)
 		budget.PUT("/:id", middleware.RequirePermission("finance", "budget", "update"), h.UpdateBudgetV2)
 		budget.DELETE("/:id", middleware.RequirePermission("finance", "budget", "delete"), h.DeleteBudgetV2)
+		budget.POST("/:id/submit", middleware.RequirePermission("finance", "budget", "update"), h.SubmitBudgetForApproval)
+		budget.POST("/:id/approve", middleware.RequirePermission("finance", "budget", "update"), h.ApproveBudget)
+		budget.POST("/:id/reject", middleware.RequirePermission("finance", "budget", "update"), h.RejectBudget)
 		budget.GET("/:id/lines", h.ListBudgetLines)
 		budget.POST("/:id/lines", middleware.RequirePermission("finance", "budget", "create"), h.CreateBudgetLine)
 		budget.PUT("/:id/lines/:lineId", middleware.RequirePermission("finance", "budget", "update"), h.UpdateBudgetLine)
