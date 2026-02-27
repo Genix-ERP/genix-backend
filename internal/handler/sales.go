@@ -1967,6 +1967,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		"id":               invoiceID.String(),
 		"invoice_number":   invoiceNumber,
 		"customer_id":      customerID.String(),
+		"customer_name":    customerName,
 		"sales_order_id":   orderID.String(),
 		"invoice_date":     now.Format("2006-01-02"),
 		"due_date":         dueDate.Format("2006-01-02"),
