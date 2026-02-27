@@ -322,6 +322,132 @@ type OperationTypeResponse struct {
 	CreatedAt              time.Time `json:"created_at"`
 }
 
+// ─── Stock Operations TT entities ─────────────────────────────────────────────
+
+// OperationTypeStep represents a step within a configurable operation type
+type OperationTypeStep struct {
+	ID                uuid.UUID  `json:"id"`
+	TenantID          uuid.UUID  `json:"tenant_id"`
+	OperationTypeID   uuid.UUID  `json:"operation_type_id"`
+	Sequence          int        `json:"sequence"`
+	Name              string     `json:"name"`
+	SourceLocationID  *uuid.UUID `json:"source_location_id,omitempty"`
+	DestLocationID    *uuid.UUID `json:"dest_location_id,omitempty"`
+	ResponsibleRole   string     `json:"responsible_role,omitempty"`
+	RequiresApproval  bool       `json:"requires_approval"`
+	ApprovalRole      string     `json:"approval_role,omitempty"`
+	AutoProceed       bool       `json:"auto_proceed"`
+	MaxDurationHours  *float64   `json:"max_duration_hours,omitempty"`
+	OnTimeout         string     `json:"on_timeout"`
+	NotifyUsers       []string   `json:"notify_users"`
+	RequiredDocuments []string   `json:"required_documents"`
+	Instructions      string     `json:"instructions,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+// StockOperation represents a stock operation (receipt, delivery, internal transfer, write-off)
+type StockOperation struct {
+	ID              uuid.UUID  `json:"id"`
+	TenantID        uuid.UUID  `json:"tenant_id"`
+	Name            string     `json:"name"`
+	OperationTypeID uuid.UUID  `json:"operation_type_id"`
+	Direction       string     `json:"direction"` // receipt, delivery, internal, write_off
+	Date            time.Time  `json:"date"`
+	ScheduledDate   *time.Time `json:"scheduled_date,omitempty"`
+	PartnerID       *uuid.UUID `json:"partner_id,omitempty"`
+	PartnerName     string     `json:"partner_name,omitempty"`
+	SourceDocument  string     `json:"source_document,omitempty"`
+	SourceLocationID *uuid.UUID `json:"source_location_id,omitempty"`
+	DestLocationID  *uuid.UUID `json:"dest_location_id,omitempty"`
+	State           string     `json:"state"` // draft, in_progress, waiting, done, cancelled
+	CurrentStep     int        `json:"current_step"`
+	TotalSteps      int        `json:"total_steps"`
+	Priority        string     `json:"priority"`
+	BackorderID     *uuid.UUID `json:"backorder_id,omitempty"`
+	ResponsibleID   *uuid.UUID `json:"responsible_id,omitempty"`
+	Note            string     `json:"note,omitempty"`
+	WriteOffReason  string     `json:"write_off_reason,omitempty"`
+	Lines           []StockOperationLine    `json:"lines,omitempty"`
+	StepLogs        []StockOperationStepLog `json:"step_logs,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+// StockOperationLine represents a product row in a stock operation
+type StockOperationLine struct {
+	ID               uuid.UUID  `json:"id"`
+	TenantID         uuid.UUID  `json:"tenant_id"`
+	OperationID      uuid.UUID  `json:"operation_id"`
+	ProductID        uuid.UUID  `json:"product_id"`
+	ProductName      string     `json:"product_name,omitempty"`
+	ProductCode      string     `json:"product_code,omitempty"`
+	ExpectedQty      float64    `json:"expected_qty"`
+	DoneQty          float64    `json:"done_qty"`
+	UOM              string     `json:"uom"`
+	UnitPrice        *float64   `json:"unit_price,omitempty"`
+	LotID            *uuid.UUID `json:"lot_id,omitempty"`
+	LotNumber        string     `json:"lot_number,omitempty"`
+	ExpiryDate       *string    `json:"expiry_date,omitempty"`
+	QualityStatus    string     `json:"quality_status"` // good, defective, rejected
+	SourceLocationID *uuid.UUID `json:"source_location_id,omitempty"`
+	DestLocationID   *uuid.UUID `json:"dest_location_id,omitempty"`
+	WriteOffReason   string     `json:"write_off_reason,omitempty"`
+	Note             string     `json:"note,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+}
+
+// StockOperationStepLog records the execution of each step
+type StockOperationStepLog struct {
+	ID              uuid.UUID  `json:"id"`
+	TenantID        uuid.UUID  `json:"tenant_id"`
+	OperationID     uuid.UUID  `json:"operation_id"`
+	StepID          *uuid.UUID `json:"step_id,omitempty"`
+	StepSequence    int        `json:"step_sequence"`
+	StepName        string     `json:"step_name"`
+	State           string     `json:"state"` // pending, ready, in_progress, awaiting_approval, completed, rejected
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
+	StartedBy       *uuid.UUID `json:"started_by,omitempty"`
+	CompletedBy     *uuid.UUID `json:"completed_by,omitempty"`
+	ApprovedBy      *uuid.UUID `json:"approved_by,omitempty"`
+	RejectionReason string     `json:"rejection_reason,omitempty"`
+	Documents       []string   `json:"documents"`
+	Note            string     `json:"note,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+}
+
+// CreateStockOperationInput is the input for creating a stock operation
+type CreateStockOperationInput struct {
+	OperationTypeID  string                       `json:"operation_type_id" binding:"required"`
+	Direction        string                       `json:"direction" binding:"required"`
+	ScheduledDate    *string                      `json:"scheduled_date,omitempty"`
+	PartnerID        string                       `json:"partner_id,omitempty"`
+	SourceDocument   string                       `json:"source_document,omitempty"`
+	SourceLocationID string                       `json:"source_location_id,omitempty"`
+	DestLocationID   string                       `json:"dest_location_id,omitempty"`
+	Priority         string                       `json:"priority,omitempty"`
+	Note             string                       `json:"note,omitempty"`
+	WriteOffReason   string                       `json:"write_off_reason,omitempty"`
+	Lines            []CreateStockOperationLine   `json:"lines,omitempty"`
+}
+
+// CreateStockOperationLine is the input for a single product line
+type CreateStockOperationLine struct {
+	ProductID        string   `json:"product_id" binding:"required"`
+	ExpectedQty      float64  `json:"expected_qty"`
+	DoneQty          float64  `json:"done_qty"`
+	UOM              string   `json:"uom,omitempty"`
+	UnitPrice        *float64 `json:"unit_price,omitempty"`
+	LotNumber        string   `json:"lot_number,omitempty"`
+	ExpiryDate       string   `json:"expiry_date,omitempty"`
+	QualityStatus    string   `json:"quality_status,omitempty"`
+	SourceLocationID string   `json:"source_location_id,omitempty"`
+	DestLocationID   string   `json:"dest_location_id,omitempty"`
+	WriteOffReason   string   `json:"write_off_reason,omitempty"`
+	Note             string   `json:"note,omitempty"`
+}
+
 // InventoryValuationReport represents inventory valuation
 type InventoryValuationReport struct {
 	ProductID         uuid.UUID  `json:"product_id"`
