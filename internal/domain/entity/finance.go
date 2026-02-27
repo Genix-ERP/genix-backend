@@ -919,7 +919,7 @@ type Budget struct {
 	Code           string       `json:"code" db:"code"`
 	Name           string       `json:"name" db:"name"`
 	Description    *string      `json:"description,omitempty" db:"description"`
-	BudgetType     string       `json:"budget_type" db:"budget_type"` // expense, revenue, combined
+	BudgetType     string       `json:"budget_type" db:"budget_type"` // expense, revenue, combined, cashflow, investment
 	TotalAmount    float64      `json:"total_amount" db:"total_amount"`
 	Status         string       `json:"status" db:"status"` // draft, active, closed
 	ApprovedBy     *uuid.UUID   `json:"approved_by,omitempty" db:"approved_by"`
@@ -932,6 +932,19 @@ type Budget struct {
 	StartDate        *string  `json:"start_date,omitempty"`
 	EndDate          *string  `json:"end_date,omitempty"`
 	WarningThreshold float64  `json:"warning_threshold"`
+
+	// New spec fields
+	Approach              string     `json:"approach" db:"approach"`                               // fixed, flexible, zero_based, rolling
+	Breakdown             string     `json:"breakdown" db:"breakdown"`                             // monthly, weekly, none
+	OverspendPolicy       string     `json:"overspend_policy" db:"overspend_policy"`               // warn, require_approval, block
+	ApprovalStatus        *string    `json:"approval_status,omitempty" db:"approval_status"`       // pending, approved, rejected
+	RollingHorizonMonths  int        `json:"rolling_horizon_months" db:"rolling_horizon_months"`
+	AutoExtend            bool       `json:"auto_extend" db:"auto_extend"`
+	ResponsibleUserID     *uuid.UUID `json:"responsible_user_id,omitempty" db:"responsible_user_id"`
+	DepartmentID          *uuid.UUID `json:"department_id,omitempty" db:"department_id"`
+	SubmittedBy           *uuid.UUID `json:"submitted_by,omitempty" db:"submitted_by"`
+	SubmittedAt           *time.Time `json:"submitted_at,omitempty" db:"submitted_at"`
+	RejectionReason       *string    `json:"rejection_reason,omitempty" db:"rejection_reason"`
 
 	// Relationships
 	Lines []BudgetLine `json:"lines,omitempty"`
@@ -952,4 +965,45 @@ type BudgetLine struct {
 	Notes           *string    `json:"notes,omitempty" db:"notes"`
 	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+
+	// Monthly period breakdown
+	Period1  float64 `json:"period_1" db:"period_1"`
+	Period2  float64 `json:"period_2" db:"period_2"`
+	Period3  float64 `json:"period_3" db:"period_3"`
+	Period4  float64 `json:"period_4" db:"period_4"`
+	Period5  float64 `json:"period_5" db:"period_5"`
+	Period6  float64 `json:"period_6" db:"period_6"`
+	Period7  float64 `json:"period_7" db:"period_7"`
+	Period8  float64 `json:"period_8" db:"period_8"`
+	Period9  float64 `json:"period_9" db:"period_9"`
+	Period10 float64 `json:"period_10" db:"period_10"`
+	Period11 float64 `json:"period_11" db:"period_11"`
+	Period12 float64 `json:"period_12" db:"period_12"`
+
+	// Flexible budget formula
+	FormulaType  *string  `json:"formula_type,omitempty" db:"formula_type"`
+	FormulaValue *float64 `json:"formula_value,omitempty" db:"formula_value"`
+	FormulaCap   *float64 `json:"formula_cap,omitempty" db:"formula_cap"`
+
+	// Zero-based justification
+	Justification *string `json:"justification,omitempty" db:"justification"`
+
+	// Line grouping
+	LineType     string  `json:"line_type" db:"line_type"`       // revenue, expense, investment
+	CategoryName *string `json:"category_name,omitempty" db:"category_name"`
+}
+
+// BudgetCategory represents a user-visible budget category linked to accounts
+type BudgetCategory struct {
+	ID            uuid.UUID  `json:"id" db:"id"`
+	TenantID      uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Name          string     `json:"name" db:"name"`
+	ParentID      *uuid.UUID `json:"parent_id,omitempty" db:"parent_id"`
+	LineType      string     `json:"line_type" db:"line_type"` // revenue, expense, investment
+	IsActive      bool       `json:"is_active" db:"is_active"`
+	SortOrder     int        `json:"sort_order" db:"sort_order"`
+	DefaultFormula *string   `json:"default_formula,omitempty" db:"default_formula"`
+	AccountIDs    []string   `json:"account_ids,omitempty"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
 }
