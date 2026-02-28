@@ -132,6 +132,9 @@ type CreateProductInput struct {
 	Description      string      `json:"description,omitempty"`
 	ShortDescription string      `json:"short_description,omitempty"`
 	UnitID           string      `json:"unit_id,omitempty"`
+	InventoryUOM     string      `json:"inventory_uom,omitempty"` // string UOM code from frontend (e.g. "kg", "unit")
+	SalesUOM         string      `json:"sales_uom,omitempty"`     // string UOM code for sales
+	PurchaseUOM      string      `json:"purchase_uom,omitempty"`  // string UOM code for purchase
 	CostPrice        float64     `json:"cost_price"`
 	ListPrice        float64     `json:"list_price"`
 	MinPrice         float64     `json:"min_price"`
@@ -164,6 +167,9 @@ type UpdateProductInput struct {
 	Description      *string     `json:"description,omitempty"`
 	ShortDescription *string     `json:"short_description,omitempty"`
 	UnitID           *string     `json:"unit_id,omitempty"`
+	InventoryUOM     *string     `json:"inventory_uom,omitempty"`
+	SalesUOM         *string     `json:"sales_uom,omitempty"`
+	PurchaseUOM      *string     `json:"purchase_uom,omitempty"`
 	CostPrice        *float64    `json:"cost_price,omitempty"`
 	ListPrice        *float64    `json:"list_price,omitempty"`
 	MinPrice         *float64    `json:"min_price,omitempty"`
@@ -210,6 +216,12 @@ type ProductResponse struct {
 	Name             string           `json:"name"`
 	Description      *string          `json:"description,omitempty"`
 	ShortDescription *string          `json:"short_description,omitempty"`
+	UnitID           *uuid.UUID       `json:"unit_id,omitempty"`
+	UnitName         string           `json:"unit_name,omitempty"`
+	PurchaseUnitID   *uuid.UUID       `json:"purchase_unit_id,omitempty"`
+	PurchaseUnitName string           `json:"purchase_unit_name,omitempty"`
+	SalesUnitID      *uuid.UUID       `json:"sales_unit_id,omitempty"`
+	SalesUnitName    string           `json:"sales_unit_name,omitempty"`
 	CostPrice        float64          `json:"cost_price"`
 	ListPrice        float64          `json:"list_price"`
 	IsStockable      bool             `json:"is_stockable"`

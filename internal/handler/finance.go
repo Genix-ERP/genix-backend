@@ -9122,15 +9122,15 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	// 1. Current cash balances per account
 	accountRows, err := h.db.Query(`
 		SELECT a.id, a.code, a.name, a.currency_code,
-		       COALESCE(SUM(CASE WHEN je.debit_credit = 'debit' THEN jl.amount ELSE -jl.amount END), 0) as balance
+		       COALESCE(SUM(jl.debit_amount - jl.credit_amount), 0) as balance
 		FROM accounts a
-		LEFT JOIN journal_lines jl ON jl.account_id = a.id
+		LEFT JOIN journal_entry_lines jl ON jl.account_id = a.id
 		LEFT JOIN journal_entries je ON je.id = jl.journal_entry_id AND je.status = 'posted' AND je.tenant_id = $1
 		WHERE a.tenant_id = $1 AND a.account_type IN ('asset', 'cash', 'bank')
 		  AND a.code LIKE '1%'
 		  AND a.is_active = true
 		GROUP BY a.id, a.code, a.name, a.currency_code
-		HAVING COALESCE(SUM(CASE WHEN je.debit_credit = 'debit' THEN jl.amount ELSE -jl.amount END), 0) != 0
+		HAVING COALESCE(SUM(jl.debit_amount - jl.credit_amount), 0) != 0
 		   OR a.code LIKE '101%' OR a.code LIKE '102%'
 		ORDER BY a.code
 	`, tenantID)
@@ -9379,8 +9379,8 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 			COALESCE(bl.line_type, 'expense') as line_type,
 			COALESCE(bl.budgeted_amount, 0) as planned,
 			COALESCE(
-				(SELECT SUM(CASE WHEN je.debit_credit = 'debit' THEN jl.amount ELSE -jl.amount END)
-				 FROM journal_lines jl
+				(SELECT SUM(jl.debit_amount - jl.credit_amount)
+				 FROM journal_entry_lines jl
 				 JOIN journal_entries je ON je.id = jl.journal_entry_id
 				 WHERE jl.account_id = bl.account_id
 				   AND je.tenant_id = $2
