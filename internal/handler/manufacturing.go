@@ -1810,10 +1810,13 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		return
 	}
 
-	// Optional: accept quantity produced
+	// Optional: accept quantity produced and output details
 	var input struct {
-		QuantityProduced float64 `json:"quantity_produced"`
-		QuantityScrapped float64 `json:"quantity_scrapped"`
+		QuantityProduced float64  `json:"quantity_produced"`
+		QuantityScrapped float64  `json:"quantity_scrapped"`
+		GoodQuantity     *float64 `json:"good_quantity"`
+		RejectQuantity   *float64 `json:"reject_quantity"`
+		PackageCount     *int     `json:"package_count"`
 	}
 	c.ShouldBindJSON(&input)
 
@@ -1838,13 +1841,34 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		query += fmt.Sprintf(", quantity_scrapped = $%d", argCount)
 		args = append(args, input.QuantityScrapped)
 	}
+	if input.GoodQuantity != nil {
+		argCount++
+		query += fmt.Sprintf(", good_quantity = $%d", argCount)
+		args = append(args, *input.GoodQuantity)
+		// Also set quantity_produced from good_quantity if not explicitly provided
+		if input.QuantityProduced == 0 {
+			argCount++
+			query += fmt.Sprintf(", quantity_produced = $%d", argCount)
+			args = append(args, *input.GoodQuantity)
+		}
+	}
+	if input.RejectQuantity != nil {
+		argCount++
+		query += fmt.Sprintf(", reject_quantity = $%d", argCount)
+		args = append(args, *input.RejectQuantity)
+	}
+	if input.PackageCount != nil {
+		argCount++
+		query += fmt.Sprintf(", package_count = $%d", argCount)
+		args = append(args, *input.PackageCount)
+	}
 
 	argCount++
 	args = append(args, id)
 	argCount++
 	args = append(args, tenantID)
 
-	query += fmt.Sprintf(" WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status = 'in_progress'", argCount-1, argCount)
+	query += fmt.Sprintf(" WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status IN ('in_progress', 'completed')", argCount-1, argCount)
 
 	result, err := h.db.Exec(query, args...)
 	if err != nil {
@@ -1855,11 +1879,23 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		response.NotFound(c, "Production order not found or not in progress")
+		response.NotFound(c, "Production order not found or not in valid state")
 		return
 	}
 
 	// --- Inventory integration: add produced goods & consume materials ---
+	// Skip if inventory was already updated for this production order (prevent double-add)
+	var existingTxCount int
+	h.db.QueryRow(`
+		SELECT COUNT(*) FROM inventory_transactions
+		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2
+	`, tenantID, id).Scan(&existingTxCount)
+	if existingTxCount > 0 {
+		h.log.Info("Inventory already updated for production order, skipping", "order_id", id)
+		h.GetProductionOrder(c)
+		return
+	}
+
 	var productID uuid.UUID
 	var bomID *uuid.UUID
 	var warehouseID *uuid.UUID

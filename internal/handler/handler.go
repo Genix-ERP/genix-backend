@@ -254,6 +254,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		categories.DELETE("/:id", h.DeleteProductCategory)
 	}
 
+	// Units of Measure
+	uom := rg.Group("/units-of-measure")
+	{
+		uom.GET("", h.ListUnitsOfMeasure)
+		uom.POST("", h.CreateUnitOfMeasure)
+		uom.PUT("/:id", h.UpdateUnitOfMeasure)
+		uom.DELETE("/:id", h.DeleteUnitOfMeasure)
+	}
+
 	// Warehouses
 	warehouses := rg.Group("/warehouses")
 	warehouses.Use(middleware.RequirePermission("inventory", "warehouse", "manage"))
