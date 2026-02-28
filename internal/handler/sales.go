@@ -54,6 +54,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			   so.order_date, so.expected_date, so.billing_address, so.shipping_address,
 			   so.currency_id, so.exchange_rate, so.subtotal, so.discount_type, so.discount_value, so.discount_amount,
 			   so.tax_amount, so.shipping_amount, so.total_amount, so.status, so.payment_status, so.payment_terms,
+			   so.payment_term_id,
 			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.sales_rep_id,
 			   so.approved_by, so.approved_at, so.created_by, so.created_at, so.updated_at,
 			   COALESCE(c.name, '') as customer_name
@@ -149,6 +150,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		var exchangeRate, subtotal, discountValue, discountAmount, taxAmount, shippingAmount, totalAmount float64
 		var discountType, status, paymentStatus, reference, poNumber, notes, internalNotes sql.NullString
 		var paymentTerms int
+		var paymentTermID sql.NullString
 		var createdAt, updatedAt time.Time
 
 		err := rows.Scan(
@@ -156,6 +158,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			&orderDate, &expectedDate, &billingAddress, &shippingAddress,
 			&currencyID, &exchangeRate, &subtotal, &discountType, &discountValue, &discountAmount,
 			&taxAmount, &shippingAmount, &totalAmount, &status, &paymentStatus, &paymentTerms,
+			&paymentTermID,
 			&reference, &poNumber, &notes, &internalNotes, &warehouseID, &salesRepID,
 			&approvedBy, &approvedAt, &createdBy, &createdAt, &updatedAt,
 			&customerName,
@@ -185,6 +188,9 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			"updated_at":      updatedAt,
 		}
 
+		if paymentTermID.Valid {
+			order["payment_term_id"] = paymentTermID.String
+		}
 		if organizationID.Valid {
 			order["organization_id"] = organizationID.String
 		}
@@ -732,17 +738,19 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		order["sales_rep_id"] = salesRepID.String
 	}
 
-	// Get order lines with product name and packaging info
+	// Get order lines with product name, unit name and packaging info
 	linesQuery := `
 		SELECT sol.id, sol.line_number, sol.product_id, sol.description, sol.quantity, sol.unit_id, sol.unit_price,
 			   sol.discount_type, sol.discount_value, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total,
 			   sol.quantity_delivered, sol.quantity_invoiced, sol.warehouse_id, sol.notes,
 			   sol.packaging_id, sol.packaging_qty,
 			   COALESCE(p.name, '') as product_name,
-			   COALESCE(pp.name, '') as packaging_name, COALESCE(pp.qty, 0) as packaging_unit_qty
+			   COALESCE(pp.name, '') as packaging_name, COALESCE(pp.qty, 0) as packaging_unit_qty,
+			   COALESCE(u.name, '') as unit_name
 		FROM sales_order_lines sol
 		LEFT JOIN products p ON p.id = sol.product_id
 		LEFT JOIN product_packagings pp ON pp.id = sol.packaging_id
+		LEFT JOIN units_of_measure u ON sol.unit_id = u.id
 		WHERE sol.sales_order_id = $1
 		ORDER BY sol.line_number`
 
@@ -759,6 +767,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			var packagingQty sql.NullFloat64
 			var productName, packagingName string
 			var packagingUnitQty float64
+			var unitName string
 
 			err := linesRows.Scan(
 				&lineID, &lineNumber, &productID, &description, &quantity, &unitID, &unitPrice,
@@ -766,6 +775,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 				&qtyDelivered, &qtyInvoiced, &lineWarehouseID, &lineNotes,
 				&packagingID, &packagingQty,
 				&productName, &packagingName, &packagingUnitQty,
+				&unitName,
 			)
 			if err != nil {
 				continue
@@ -791,6 +801,9 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			}
 			if unitID.Valid {
 				line["unit_id"] = unitID.String
+			}
+			if unitName != "" {
+				line["unit_name"] = unitName
 			}
 			if lineDiscountType.Valid {
 				line["discount_type"] = lineDiscountType.String
@@ -1365,13 +1378,14 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	var warehouseID sql.NullString
 	var carrier sql.NullString
 	var expectedDate sql.NullTime
+	var organizationID *uuid.UUID
 
 	err = h.db.QueryRow(`
-		SELECT so.status, so.order_number, so.customer_id, c.name, so.warehouse_id, so.carrier, so.expected_date
+		SELECT so.status, so.order_number, so.customer_id, c.name, so.warehouse_id, so.carrier, so.expected_date, so.organization_id
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`,
-		orderID, tenantID).Scan(&currentStatus, &orderNumber, &customerID, &customerName, &warehouseID, &carrier, &expectedDate)
+		orderID, tenantID).Scan(&currentStatus, &orderNumber, &customerID, &customerName, &warehouseID, &carrier, &expectedDate, &organizationID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales order")
 		return
@@ -1478,7 +1492,104 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		}
 	}
 
+	// Auto-create Production Orders for products with insufficient stock
+	h.autoCreateProductionOrders(tenantID, orderID, customerID, warehouseUUID, organizationID, userID, now)
+
 	h.GetSalesOrder(c)
+}
+
+// autoCreateProductionOrders checks stock levels for each SO line and creates
+// production orders for products where the ordered quantity exceeds available inventory.
+func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.UUID, warehouseID, organizationID *uuid.UUID, userID uuid.UUID, now time.Time) {
+	// Fetch SO lines with product info and UOM
+	rows, err := h.db.Query(`
+		SELECT sol.product_id, sol.quantity, p.name, COALESCE(u.code, 'unit') as uom_code
+		FROM sales_order_lines sol
+		JOIN products p ON p.id = sol.product_id
+		LEFT JOIN units_of_measure u ON sol.unit_id = u.id
+		WHERE sol.sales_order_id = $1
+	`, orderID)
+	if err != nil {
+		h.log.Error("Auto MO: failed to fetch SO lines", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	type soLine struct {
+		ProductID uuid.UUID
+		Quantity  float64
+		Name      string
+		UOM       string
+	}
+
+	var lines []soLine
+	for rows.Next() {
+		var l soLine
+		if err := rows.Scan(&l.ProductID, &l.Quantity, &l.Name, &l.UOM); err != nil {
+			h.log.Error("Auto MO: failed to scan SO line", "error", err)
+			continue
+		}
+		lines = append(lines, l)
+	}
+
+	for _, line := range lines {
+		// Check total available stock for this product across all warehouses
+		var totalAvailable float64
+		stockQuery := `
+			SELECT COALESCE(SUM(quantity_available), 0)
+			FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2
+		`
+		stockArgs := []interface{}{tenantID, line.ProductID}
+
+		// If a specific warehouse is set, check only that warehouse
+		if warehouseID != nil {
+			stockQuery += " AND warehouse_id = $3"
+			stockArgs = append(stockArgs, *warehouseID)
+		}
+
+		err := h.db.QueryRow(stockQuery, stockArgs...).Scan(&totalAvailable)
+		if err != nil {
+			h.log.Error("Auto MO: failed to check stock", "error", err, "product_id", line.ProductID)
+			continue
+		}
+
+		deficit := line.Quantity - totalAvailable
+		if deficit <= 0 {
+			continue // Sufficient stock, no MO needed
+		}
+
+		// Create a production order for the deficit
+		moID := uuid.New()
+		moCode := fmt.Sprintf("MO-%s", moID.String()[:8])
+		moName := fmt.Sprintf("Auto: %s (SO)", line.Name)
+		sourceType := "sales_order"
+
+		_, err = h.db.Exec(`
+			INSERT INTO production_orders (
+				id, tenant_id, organization_id, code, name, product_id, quantity_planned, uom,
+				current_stage, status, priority,
+				source_type, source_id, sales_order_id, customer_id, warehouse_id,
+				tags, created_by, created_at, updated_at
+			) VALUES (
+				$1, $2, $3, $4, $5, $6, $7, $8,
+				'draft', 'draft', 5,
+				$9, $10, $10, $11, $12,
+				'[]'::jsonb, $13, $14, $14
+			)`,
+			moID, tenantID, organizationID, moCode, moName, line.ProductID, deficit, line.UOM,
+			sourceType, orderID, customerID, warehouseID,
+			userID, now,
+		)
+		if err != nil {
+			h.log.Error("Auto MO: failed to create production order",
+				"error", err, "product_id", line.ProductID, "deficit", deficit)
+			continue
+		}
+
+		h.log.Info("Auto MO: created production order",
+			"mo_code", moCode, "product", line.Name, "deficit", deficit, "sales_order_id", orderID)
+	}
 }
 
 // CancelSalesOrder cancels a sales order
@@ -1574,20 +1685,21 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	var orderNumber string
 	var subtotal, discountAmount, taxAmount, shippingAmount, totalAmount float64
 	var paymentTerms int
+	var orderPaymentTermID sql.NullString
 	var billingAddress, shippingAddress string
 	var currentStatus string
 	var customerName string
 
 	err = h.db.QueryRow(`
 		SELECT so.customer_id, so.organization_id, so.order_number, COALESCE(so.subtotal, 0), COALESCE(so.discount_amount, 0), COALESCE(so.tax_amount, 0), COALESCE(so.shipping_amount, 0), COALESCE(so.total_amount, 0),
-		       COALESCE(so.payment_terms, 30), COALESCE(so.billing_address::text, ''), COALESCE(so.shipping_address::text, ''), so.status,
+		       COALESCE(so.payment_terms, 30), so.payment_term_id, COALESCE(so.billing_address::text, ''), COALESCE(so.shipping_address::text, ''), so.status,
 		       COALESCE(c.name, '')
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`,
 		orderID, tenantID).Scan(
 		&customerID, &organizationID, &orderNumber, &subtotal, &discountAmount, &taxAmount, &shippingAmount, &totalAmount,
-		&paymentTerms, &billingAddress, &shippingAddress, &currentStatus, &customerName,
+		&paymentTerms, &orderPaymentTermID, &billingAddress, &shippingAddress, &currentStatus, &customerName,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales order")
@@ -1626,7 +1738,95 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	invoiceID := uuid.New()
 	invoiceNumber := "INV-" + time.Now().Format("20060102") + "-" + uuid.New().String()[:6]
 	now := time.Now()
-	dueDate := now.AddDate(0, 0, paymentTerms)
+
+	// Resolve payment term and calculate due date
+	// Priority: order's payment_term_id > tenant settings default > fallback to integer days
+	var dueDate time.Time
+	var invoicePaymentTermID *uuid.UUID
+	var earlyDiscountAmount float64
+	var earlyDiscountDate *time.Time
+
+	// Helper to apply a found payment term
+	applyPaymentTerm := func(pt *entity.PaymentTerm) {
+		dueDate = pt.CalculateDueDate(now)
+		invoicePaymentTermID = &pt.ID
+		earlyDiscountDate = pt.CalculateEarlyDiscountDate(now)
+		earlyDiscountAmount = pt.CalculateDiscountAmount(totalAmount)
+	}
+
+	ptResolved := false
+
+	// 1. Try order's payment_term_id
+	if orderPaymentTermID.Valid {
+		ptID, ptErr := uuid.Parse(orderPaymentTermID.String)
+		if ptErr == nil {
+			var pt entity.PaymentTerm
+			ptQueryErr := h.db.QueryRow(`
+				SELECT id, tenant_id, code, name, description, term_type, due_days,
+				       has_early_discount, discount_percentage, discount_days,
+				       end_of_month_day, display_order, is_default, is_active,
+				       created_by, created_at, updated_at
+				FROM payment_terms
+				WHERE id = $1 AND tenant_id = $2
+			`, ptID, tenantID).Scan(
+				&pt.ID, &pt.TenantID, &pt.Code, &pt.Name, &pt.Description,
+				&pt.TermType, &pt.DueDays, &pt.HasEarlyDiscount, &pt.DiscountPercentage,
+				&pt.DiscountDays, &pt.EndOfMonthDay, &pt.DisplayOrder, &pt.IsDefault,
+				&pt.IsActive, &pt.CreatedBy, &pt.CreatedAt, &pt.UpdatedAt,
+			)
+			if ptQueryErr == nil {
+				applyPaymentTerm(&pt)
+				ptResolved = true
+			}
+		}
+	}
+
+	// 2. Try default payment term from tenant settings (e.g. "Net 30")
+	if !ptResolved {
+		var settingsJSON []byte
+		settingsErr := h.db.QueryRow(
+			`SELECT settings FROM tenant_settings WHERE tenant_id = $1`, tenantID,
+		).Scan(&settingsJSON)
+		if settingsErr == nil && len(settingsJSON) > 0 {
+			var settings map[string]interface{}
+			if json.Unmarshal(settingsJSON, &settings) == nil {
+				// Navigate: sales -> payment -> default_terms
+				if salesMap, ok := settings["sales"].(map[string]interface{}); ok {
+					if paymentMap, ok := salesMap["payment"].(map[string]interface{}); ok {
+						if defaultTermName, ok := paymentMap["default_terms"].(string); ok && defaultTermName != "" {
+							// Look up payment term by name (case-insensitive)
+							var pt entity.PaymentTerm
+							ptQueryErr := h.db.QueryRow(`
+								SELECT id, tenant_id, code, name, description, term_type, due_days,
+								       has_early_discount, discount_percentage, discount_days,
+								       end_of_month_day, display_order, is_default, is_active,
+								       created_by, created_at, updated_at
+								FROM payment_terms
+								WHERE tenant_id = $1 AND LOWER(name) = LOWER($2) AND is_active = true
+								LIMIT 1
+							`, tenantID, defaultTermName).Scan(
+								&pt.ID, &pt.TenantID, &pt.Code, &pt.Name, &pt.Description,
+								&pt.TermType, &pt.DueDays, &pt.HasEarlyDiscount, &pt.DiscountPercentage,
+								&pt.DiscountDays, &pt.EndOfMonthDay, &pt.DisplayOrder, &pt.IsDefault,
+								&pt.IsActive, &pt.CreatedBy, &pt.CreatedAt, &pt.UpdatedAt,
+							)
+							if ptQueryErr == nil {
+								applyPaymentTerm(&pt)
+								ptResolved = true
+							} else {
+								h.log.Info("CreateInvoiceFromOrder: default payment term from settings not found", "name", defaultTermName)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Fallback: use the old integer payment_terms field from the order
+	if !ptResolved {
+		dueDate = now.AddDate(0, 0, paymentTerms)
+	}
 
 	var createdBy *uuid.UUID
 	if userID != uuid.Nil {
@@ -1663,12 +1863,14 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			id, tenant_id, organization_id, invoice_number, customer_id, customer_name, sales_order_id,
 			invoice_date, due_date, billing_address, shipping_address,
 			exchange_rate, subtotal, discount_amount, tax_amount, total_amount,
-			amount_paid, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
+			amount_paid, status, payment_term_id, early_discount_amount, early_discount_date,
+			created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
 		invoiceID, tenantID, organizationID, invoiceNumber, customerID, customerName, orderID,
 		now, dueDate, billingAddrParam, shippingAddrParam,
 		1.0, subtotal, discountAmount, taxAmount, totalAmount,
-		0, entity.InvoiceStatusSent, createdBy, now, now,
+		0, entity.InvoiceStatusSent, invoicePaymentTermID, earlyDiscountAmount, earlyDiscountDate,
+		createdBy, now, now,
 	)
 	if err != nil {
 		h.log.Error("CreateInvoiceFromOrder: INSERT failed", "error", err)
@@ -1963,18 +2165,24 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	}
 
 	invoiceStatus := string(entity.InvoiceStatusSent)
-	response.Created(c, map[string]interface{}{
-		"id":               invoiceID.String(),
-		"invoice_number":   invoiceNumber,
-		"customer_id":      customerID.String(),
-		"customer_name":    customerName,
-		"sales_order_id":   orderID.String(),
-		"invoice_date":     now.Format("2006-01-02"),
-		"due_date":         dueDate.Format("2006-01-02"),
-		"total_amount":     totalAmount,
-		"amount_due":       totalAmount,
-		"status":           invoiceStatus,
-		"journal_entry_id": journalEntryID,
-		"created_at":       now,
-	})
+	resp := map[string]interface{}{
+		"id":                    invoiceID.String(),
+		"invoice_number":        invoiceNumber,
+		"customer_id":           customerID.String(),
+		"customer_name":         customerName,
+		"sales_order_id":        orderID.String(),
+		"invoice_date":          now.Format("2006-01-02"),
+		"due_date":              dueDate.Format("2006-01-02"),
+		"total_amount":          totalAmount,
+		"amount_due":            totalAmount,
+		"status":                invoiceStatus,
+		"journal_entry_id":      journalEntryID,
+		"payment_term_id":       invoicePaymentTermID,
+		"early_discount_amount": earlyDiscountAmount,
+		"created_at":            now,
+	}
+	if earlyDiscountDate != nil {
+		resp["early_discount_date"] = earlyDiscountDate.Format("2006-01-02")
+	}
+	response.Created(c, resp)
 }

@@ -43,7 +43,8 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			   si.reference, si.po_number, si.notes, si.terms_conditions,
 			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
 			   COALESCE(c.name, si.customer_name, '') as customer_name,
-			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason
+			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason,
+			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
@@ -160,6 +161,9 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		var invoiceType string
 		var originalInvoiceID sql.NullString
 		var reason sql.NullString
+		var paymentTermID sql.NullString
+		var earlyDiscountAmount float64
+		var earlyDiscountDate sql.NullTime
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -170,6 +174,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			&journalEntryID, &sentAt, &viewedAt, &createdBy, &createdAt, &updatedAt,
 			&customerName,
 			&invoiceType, &originalInvoiceID, &reason,
+			&paymentTermID, &earlyDiscountAmount, &earlyDiscountDate,
 		)
 		if err != nil {
 			continue
@@ -235,6 +240,15 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		}
 		if reason.Valid {
 			invoice["reason"] = reason.String
+		}
+		if paymentTermID.Valid {
+			invoice["payment_term_id"] = paymentTermID.String
+		}
+		if earlyDiscountAmount > 0 {
+			invoice["early_discount_amount"] = earlyDiscountAmount
+		}
+		if earlyDiscountDate.Valid {
+			invoice["early_discount_date"] = earlyDiscountDate.Time.Format("2006-01-02")
 		}
 
 		// Parse addresses
@@ -463,7 +477,8 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 			   si.reference, si.po_number, si.notes, si.terms_conditions,
 			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
 			   COALESCE(c.name, si.customer_name, '') as customer_name,
-			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason
+			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason,
+			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.id = $1 AND si.tenant_id = $2 AND si.deleted_at IS NULL`
@@ -481,6 +496,9 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	var invoiceType string
 	var originalInvoiceID sql.NullString
 	var reason sql.NullString
+	var getPaymentTermID sql.NullString
+	var getEarlyDiscountAmount float64
+	var getEarlyDiscountDate sql.NullTime
 
 	err = h.db.QueryRow(query, invoiceID, tenantID).Scan(
 		&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -491,6 +509,7 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		&journalEntryID, &sentAt, &viewedAt, &createdBy, &createdAt, &updatedAt,
 		&customerName,
 		&invoiceType, &originalInvoiceID, &reason,
+		&getPaymentTermID, &getEarlyDiscountAmount, &getEarlyDiscountDate,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
@@ -567,6 +586,15 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	}
 	if reason.Valid {
 		invoice["reason"] = reason.String
+	}
+	if getPaymentTermID.Valid {
+		invoice["payment_term_id"] = getPaymentTermID.String
+	}
+	if getEarlyDiscountAmount > 0 {
+		invoice["early_discount_amount"] = getEarlyDiscountAmount
+	}
+	if getEarlyDiscountDate.Valid {
+		invoice["early_discount_date"] = getEarlyDiscountDate.Time.Format("2006-01-02")
 	}
 
 	// Parse addresses
@@ -871,13 +899,12 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 
 	// Get Sales Journal ID
 	var salesJournalID uuid.UUID
-	var nextNumber int
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
-		SELECT id, COALESCE(next_number, 1), number_prefix
+		SELECT id, number_prefix
 		FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
 		tenantID,
-	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
+	).Scan(&salesJournalID, &numberPrefix)
 	if err != nil {
 		// Journal doesn't exist yet, skip GL posting but still send invoice
 		h.log.Warn("Sales journal not found, skipping GL posting", "tenant_id", tenantID)
@@ -983,10 +1010,25 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		}
 	}
 
-	// Generate entry number
+	// Generate entry number from actual max to avoid duplicate key conflicts
 	prefix := ""
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
+	}
+	var nextNumber int
+	if prefix != "" {
+		_ = tx.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
+			tenantID, salesJournalID, prefix+"%",
+		).Scan(&nextNumber)
+	} else {
+		_ = tx.QueryRow(
+			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
+			tenantID, salesJournalID,
+		).Scan(&nextNumber)
+	}
+	if nextNumber < 1 {
+		nextNumber = 1
 	}
 	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 
@@ -1153,16 +1195,20 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		return
 	}
 
-	// Get current invoice status and amounts
+	// Get current invoice status and amounts (including early discount info)
 	var currentStatus, invoiceNumber string
 	var customerID uuid.UUID
 	var organizationID *uuid.UUID
 	var amountPaid, totalAmount float64
+	var invEarlyDiscountAmount float64
+	var invEarlyDiscountDate sql.NullTime
 	err = h.db.QueryRow(`
-		SELECT status, invoice_number, customer_id, organization_id, amount_paid, total_amount
+		SELECT status, invoice_number, customer_id, organization_id, amount_paid, total_amount,
+		       COALESCE(early_discount_amount, 0), early_discount_date
 		FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &invoiceNumber, &customerID, &organizationID, &amountPaid, &totalAmount)
+	).Scan(&currentStatus, &invoiceNumber, &customerID, &organizationID, &amountPaid, &totalAmount,
+		&invEarlyDiscountAmount, &invEarlyDiscountDate)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
 		return
@@ -1176,13 +1222,34 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		return
 	}
 
+	// Apply early payment discount if payment is before the discount deadline
+	earlyDiscountApplied := 0.0
+	if invEarlyDiscountAmount > 0 && invEarlyDiscountDate.Valid && amountPaid == 0 {
+		// Discount applies only if paying before or on the discount date and no prior payments
+		if !paymentDate.After(invEarlyDiscountDate.Time) {
+			earlyDiscountApplied = invEarlyDiscountAmount
+			h.log.Info("RecordPayment: applying early payment discount",
+				"invoice_id", invoiceID, "discount", earlyDiscountApplied,
+				"discount_deadline", invEarlyDiscountDate.Time.Format("2006-01-02"),
+				"payment_date", input.PaymentDate)
+		}
+	}
+
 	amountDue := totalAmount - amountPaid
+	// With early discount, the effective amount needed to fully pay is reduced
+	effectiveAmountDue := amountDue - earlyDiscountApplied
+	if effectiveAmountDue < 0 {
+		effectiveAmountDue = 0
+	}
+
 	if input.Amount+input.WriteOffAmount > amountDue+0.01 {
 		response.BadRequest(c, fmt.Sprintf("Payment + write-off exceeds amount due (%.2f)", amountDue))
 		return
 	}
 
-	newAmountPaid := amountPaid + input.Amount + input.WriteOffAmount
+	// Total credited: payment + write-off + early discount
+	totalCredited := input.Amount + input.WriteOffAmount + earlyDiscountApplied
+	newAmountPaid := amountPaid + totalCredited
 	newStatus := entity.InvoiceStatusPartial
 	if newAmountPaid >= totalAmount {
 		newStatus = entity.InvoiceStatusPaid
@@ -1206,13 +1273,50 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 	// Get Cash Receipts Journal ID
 	var cashJournalID uuid.UUID
-	var nextNumber int
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
-		SELECT id, COALESCE(next_number, 1), number_prefix
+		SELECT id, number_prefix
 		FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL`,
 		tenantID,
-	).Scan(&cashJournalID, &nextNumber, &numberPrefix)
+	).Scan(&cashJournalID, &numberPrefix)
+
+	// Derive next number from actual max across ALL journals for this tenant+org
+	// to avoid duplicate key on unique constraint (tenant_id, organization_id, entry_number)
+	var nextNumber int
+	if cashJournalID != uuid.Nil {
+		prefix := ""
+		if numberPrefix.Valid {
+			prefix = numberPrefix.String
+		}
+		if prefix != "" {
+			if organizationID != nil {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g'), '') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
+					tenantID, *organizationID, prefix+"%",
+				).Scan(&nextNumber)
+			} else {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g'), '') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL AND entry_number LIKE $2 AND deleted_at IS NULL",
+					tenantID, prefix+"%",
+				).Scan(&nextNumber)
+			}
+		} else {
+			if organizationID != nil {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g'), '') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL",
+					tenantID, *organizationID,
+				).Scan(&nextNumber)
+			} else {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g'), '') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NULL AND deleted_at IS NULL",
+					tenantID,
+				).Scan(&nextNumber)
+			}
+		}
+		if nextNumber < 1 {
+			nextNumber = 1
+		}
+	}
 
 	// Get default account IDs — lookup by name first, then code fallback
 	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
@@ -1252,7 +1356,10 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			reference = invoiceNumber
 		}
 
-		jeTotal := input.Amount + input.WriteOffAmount
+		// Use savepoint so a GL failure doesn't abort the whole transaction
+		tx.Exec("SAVEPOINT gl_posting")
+
+		jeTotal := input.Amount + input.WriteOffAmount + earlyDiscountApplied
 		_, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
@@ -1263,7 +1370,8 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		)
 		if err != nil {
 			h.log.Error("Failed to create payment journal entry", "error", err)
-			// Continue without GL posting
+			// Rollback to savepoint so the transaction stays usable
+			tx.Exec("ROLLBACK TO SAVEPOINT gl_posting")
 		} else {
 			// Line 1: Debit Cash/Bank
 			cashLineID := uuid.New()
@@ -1276,8 +1384,8 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				input.Amount, 0.0, 1.0, now,
 			)
 
-			// Line 2: Credit AR (payment + write-off reduces AR)
-			arCreditAmount := input.Amount + input.WriteOffAmount
+			// Line 2: Credit AR (payment + write-off + early discount reduces AR)
+			arCreditAmount := input.Amount + input.WriteOffAmount + earlyDiscountApplied
 			arLineID := uuid.New()
 			_, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
@@ -1311,13 +1419,37 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				}
 			}
 
+			// Line for early payment discount (DR Sales Discount)
+			if earlyDiscountApplied > 0 {
+				discountAccountID := findAccount(tx, tenantID, organizationID, "sales discount", "4900")
+				if discountAccountID == uuid.Nil {
+					discountAccountID = findAccount(tx, tenantID, organizationID, "cash discount", "4900")
+				}
+				if discountAccountID == uuid.Nil {
+					discountAccountID = findAccount(tx, tenantID, organizationID, "discount", "4900")
+				}
+				if discountAccountID != uuid.Nil {
+					discountLineID := uuid.New()
+					tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, contact_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						discountLineID, journalEntryID, lineNumber, discountAccountID, customerID, "Early Payment Discount",
+						earlyDiscountApplied, 0.0, 1.0, now,
+					)
+					lineNumber++
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", earlyDiscountApplied, now, discountAccountID)
+				}
+			}
+
 			// Update journal next number
 			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", cashJournalID)
 
 			// Update account balances
 			// Debit Outstanding Receipts / Cash (debit-normal: increases)
 			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAccountID)
-			// Credit AR (debit-normal: credit decreases) — includes write-off amount
+			// Credit AR (debit-normal: credit decreases) — includes write-off + early discount
 			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", arCreditAmount, now, arAccountID)
 
 			// Create payment record
@@ -1343,6 +1475,8 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 					allocationID, paymentID, "sales_invoice", invoiceID, input.Amount, now,
 				)
 			}
+			// Release savepoint on success
+			tx.Exec("RELEASE SAVEPOINT gl_posting")
 		}
 	}
 
@@ -1601,13 +1735,12 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 
 	// Get Sales Journal
 	var salesJournalID uuid.UUID
-	var nextNumber int
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
-		SELECT id, COALESCE(next_number, 1), number_prefix
+		SELECT id, number_prefix
 		FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
 		tenantID,
-	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
+	).Scan(&salesJournalID, &numberPrefix)
 
 	if err == nil {
 		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
@@ -1618,6 +1751,21 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 			prefix := ""
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
+			}
+			var nextNumber int
+			if prefix != "" {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
+					tenantID, salesJournalID, prefix+"%",
+				).Scan(&nextNumber)
+			} else {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
+					tenantID, salesJournalID,
+				).Scan(&nextNumber)
+			}
+			if nextNumber < 1 {
+				nextNumber = 1
 			}
 			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 

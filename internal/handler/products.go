@@ -19,6 +19,23 @@ import (
 // PRODUCT HANDLERS
 // =====================================================
 
+// resolveUOMCode looks up a units_of_measure UUID by code string (e.g. "kg", "unit", "m").
+// The frontend stores UOM as string codes; this resolves them to proper FK UUIDs.
+func (h *Handler) resolveUOMCode(tenantID uuid.UUID, code string) *uuid.UUID {
+	if code == "" {
+		return nil
+	}
+	var id uuid.UUID
+	err := h.db.QueryRow(
+		"SELECT id FROM units_of_measure WHERE tenant_id = $1 AND (code ILIKE $2 OR name ILIKE $2) AND is_active = true LIMIT 1",
+		tenantID, code,
+	).Scan(&id)
+	if err != nil {
+		return nil
+	}
+	return &id
+}
+
 // ListProducts returns a paginated list of products
 func (h *Handler) ListProducts(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -62,9 +79,15 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.has_variants, false) as has_variants,
 			   p.is_active, p.tags, COALESCE(p.image_url, '') as image_url,
 			   p.created_at, p.updated_at,
-			   pc.code as category_code, pc.name as category_name
+			   pc.code as category_code, pc.name as category_name,
+			   COALESCE(u.name, '') as unit_name,
+			   p.purchase_unit_id, COALESCE(pu.name, '') as purchase_unit_name,
+			   p.sales_unit_id, COALESCE(su.name, '') as sales_unit_name
 		FROM products p
 		LEFT JOIN product_categories pc ON p.category_id = pc.id
+		LEFT JOIN units_of_measure u ON p.unit_id = u.id
+		LEFT JOIN units_of_measure pu ON p.purchase_unit_id = pu.id
+		LEFT JOIN units_of_measure su ON p.sales_unit_id = su.id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM products p WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
@@ -135,6 +158,11 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var categoryCode, categoryName sql.NullString
 		var tags json.RawMessage
 		var imageURL string
+		var unitName string
+		var purchaseUnitID sql.NullString
+		var purchaseUnitName string
+		var salesUnitID sql.NullString
+		var salesUnitName string
 
 		err := rows.Scan(
 			&p.ID, &p.TenantID, &categoryID, &p.Type, &p.Code, &sku, &barcode,
@@ -148,6 +176,9 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.IsOverheadExpense, &p.HasVariants, &p.IsActive, &tags, &imageURL,
 			&p.CreatedAt, &p.UpdatedAt,
 			&categoryCode, &categoryName,
+			&unitName,
+			&purchaseUnitID, &purchaseUnitName,
+			&salesUnitID, &salesUnitName,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan product", "error", err)
@@ -171,6 +202,20 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			p.ShortDescription = &shortDesc.String
 		}
 
+		var parsedUnitID, parsedPurchaseUnitID, parsedSalesUnitID *uuid.UUID
+		if unitID.Valid {
+			uid, _ := uuid.Parse(unitID.String)
+			parsedUnitID = &uid
+		}
+		if purchaseUnitID.Valid {
+			puid, _ := uuid.Parse(purchaseUnitID.String)
+			parsedPurchaseUnitID = &puid
+		}
+		if salesUnitID.Valid {
+			suid, _ := uuid.Parse(salesUnitID.String)
+			parsedSalesUnitID = &suid
+		}
+
 		resp := &entity.ProductResponse{
 			ID:                 p.ID,
 			CategoryID:        p.CategoryID,
@@ -180,6 +225,12 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			Barcode:           p.Barcode,
 			Name:              p.Name,
 			Description:       p.Description,
+			UnitID:            parsedUnitID,
+			UnitName:          unitName,
+			PurchaseUnitID:    parsedPurchaseUnitID,
+			PurchaseUnitName:  purchaseUnitName,
+			SalesUnitID:       parsedSalesUnitID,
+			SalesUnitName:     salesUnitName,
 			CostPrice:         p.CostPrice,
 			ListPrice:         p.ListPrice,
 			IsStockable:       p.IsStockable,
@@ -259,6 +310,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 
 	// Parse optional UUIDs
 	var categoryID, unitID, currencyID *uuid.UUID
+	var purchaseUnitID, salesUnitID *uuid.UUID
 	if input.CategoryID != "" {
 		cid, err := uuid.Parse(input.CategoryID)
 		if err == nil {
@@ -276,6 +328,17 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		if err == nil {
 			currencyID = &cuid
 		}
+	}
+
+	// Resolve UOM string codes (e.g. "kg", "unit") to UUID from units_of_measure table
+	if input.InventoryUOM != "" && unitID == nil {
+		unitID = h.resolveUOMCode(tenantID, input.InventoryUOM)
+	}
+	if input.PurchaseUOM != "" {
+		purchaseUnitID = h.resolveUOMCode(tenantID, input.PurchaseUOM)
+	}
+	if input.SalesUOM != "" {
+		salesUnitID = h.resolveUOMCode(tenantID, input.SalesUOM)
 	}
 
 	// Set defaults
@@ -366,18 +429,18 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 	query := `
 		INSERT INTO products (
 			id, tenant_id, organization_id, category_id, type, code, sku, barcode, name, description, short_description,
-			unit_id, cost_price, list_price, min_price, currency_id,
+			unit_id, purchase_unit_id, sales_unit_id, cost_price, list_price, min_price, currency_id,
 			is_stockable, track_inventory, min_stock_level, reorder_point, reorder_quantity,
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
 			can_be_expensed, can_be_rented, can_be_subcontracted, is_overhead_expense,
 			is_active, tags, image_url, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
 		RETURNING id
 	`
 
 	err = h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, categoryID, input.Type, input.Code, sku, barcode, input.Name, description, shortDescription,
-		unitID, input.CostPrice, input.ListPrice, input.MinPrice, currencyID,
+		unitID, purchaseUnitID, salesUnitID, input.CostPrice, input.ListPrice, input.MinPrice, currencyID,
 		isStockable, trackInventory, input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity,
 		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
 		canBeExpensed, canBeRented, canBeSubcontracted, isOverheadExpense,
@@ -653,6 +716,23 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	}
 	if input.ImageURL != nil {
 		addUpdate("image_url", *input.ImageURL)
+	}
+
+	// Resolve UOM string codes to UUID references
+	if input.InventoryUOM != nil && *input.InventoryUOM != "" {
+		if resolved := h.resolveUOMCode(tenantID, *input.InventoryUOM); resolved != nil {
+			addUpdate("unit_id", *resolved)
+		}
+	}
+	if input.PurchaseUOM != nil && *input.PurchaseUOM != "" {
+		if resolved := h.resolveUOMCode(tenantID, *input.PurchaseUOM); resolved != nil {
+			addUpdate("purchase_unit_id", *resolved)
+		}
+	}
+	if input.SalesUOM != nil && *input.SalesUOM != "" {
+		if resolved := h.resolveUOMCode(tenantID, *input.SalesUOM); resolved != nil {
+			addUpdate("sales_unit_id", *resolved)
+		}
 	}
 
 	if len(updates) == 0 {
