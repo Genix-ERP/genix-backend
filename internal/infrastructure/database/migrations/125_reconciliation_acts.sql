@@ -30,10 +30,10 @@ CREATE TABLE IF NOT EXISTS reconciliation_acts (
     deleted_at TIMESTAMP WITH TIME ZONE
 );
 
-CREATE INDEX idx_reconciliation_acts_tenant ON reconciliation_acts(tenant_id, deleted_at);
-CREATE INDEX idx_reconciliation_acts_partner ON reconciliation_acts(partner_id, deleted_at);
-CREATE INDEX idx_reconciliation_acts_period ON reconciliation_acts(tenant_id, period_start, period_end);
-CREATE INDEX idx_reconciliation_acts_status ON reconciliation_acts(tenant_id, status);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_acts_tenant ON reconciliation_acts(tenant_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_acts_partner ON reconciliation_acts(partner_id, deleted_at);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_acts_period ON reconciliation_acts(tenant_id, period_start, period_end);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_acts_status ON reconciliation_acts(tenant_id, status);
 
 -- ============================================
 -- RECONCILIATION LINES (Akt sverka qatorlari)
@@ -56,5 +56,5 @@ CREATE TABLE IF NOT EXISTS reconciliation_lines (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_reconciliation_lines_act ON reconciliation_lines(act_id);
-CREATE INDEX idx_reconciliation_lines_date ON reconciliation_lines(act_id, line_date);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_lines_act ON reconciliation_lines(act_id);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_lines_date ON reconciliation_lines(act_id, line_date);
