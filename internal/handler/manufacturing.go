@@ -1651,6 +1651,7 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			planned_cost = $3,
 			labor_cost = $4,
 			overhead_cost = $5,
+			current_stage = 'draft',
 			updated_at = $2
 		WHERE id = $6 AND tenant_id = $7 AND deleted_at IS NULL AND status = 'draft'
 	`
@@ -1699,6 +1700,8 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 		return
 	}
 
+	userID, _ := middleware.GetUserID(c)
+
 	idStr := c.Param("id")
 	id, err := uuid.Parse(idStr)
 	if err != nil {
@@ -1707,13 +1710,28 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 	}
 
 	now := time.Now()
+
+	// Get the first BOM operation stage name for current_stage
+	firstStage := "in_progress"
+	var stageBomID *uuid.UUID
+	h.db.QueryRow(`SELECT bom_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&stageBomID)
+	if stageBomID != nil {
+		var firstSeq int
+		seqErr := h.db.QueryRow(`
+			SELECT sequence FROM bom_operations WHERE bom_id = $1 ORDER BY sequence ASC LIMIT 1
+		`, stageBomID).Scan(&firstSeq)
+		if seqErr == nil {
+			firstStage = fmt.Sprintf("op_%d", firstSeq)
+		}
+	}
+
 	query := `
 		UPDATE production_orders
-		SET status = 'in_progress', actual_start = $1, updated_at = $1
-		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status IN ('confirmed', 'ready', 'paused')
+		SET status = 'in_progress', actual_start = $1, current_stage = $2, updated_at = $1
+		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL AND status IN ('confirmed', 'ready', 'paused')
 	`
 
-	result, err := h.db.Exec(query, now, id, tenantID)
+	result, err := h.db.Exec(query, now, firstStage, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to start production order", "error", err)
 		response.InternalError(c, "Failed to start production order")
@@ -1724,6 +1742,114 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 	if rowsAffected == 0 {
 		response.NotFound(c, "Production order not found or not in valid status")
 		return
+	}
+
+	// --- Consume BOM components from inventory when production starts ---
+	var productID uuid.UUID
+	var bomID *uuid.UUID
+	var warehouseID *uuid.UUID
+	var organizationID *uuid.UUID
+	var qtyPlanned float64
+
+	err = h.db.QueryRow(`
+		SELECT product_id, bom_id, warehouse_id, organization_id, quantity_planned
+		FROM production_orders WHERE id = $1 AND tenant_id = $2
+	`, id, tenantID).Scan(&productID, &bomID, &warehouseID, &organizationID, &qtyPlanned)
+	if err != nil {
+		h.log.Error("Failed to fetch production order for material consumption", "error", err)
+		h.GetProductionOrder(c)
+		return
+	}
+
+	// Only consume if we have a BOM and warehouse
+	if bomID != nil && warehouseID != nil {
+		// Check if materials were already consumed (prevent double-deduction on pause/resume)
+		var existingConsumption int
+		h.db.QueryRow(`
+			SELECT COUNT(*) FROM inventory_transactions
+			WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2
+			AND transaction_type = $3
+		`, tenantID, id, entity.TransactionTypeIssue).Scan(&existingConsumption)
+
+		if existingConsumption == 0 {
+			tx, txErr := h.db.Begin()
+			if txErr != nil {
+				h.log.Error("Failed to start material consumption transaction", "error", txErr)
+				h.GetProductionOrder(c)
+				return
+			}
+			defer tx.Rollback()
+
+			// Read all BOM components first
+			type bomComponent struct {
+				ComponentID  uuid.UUID
+				Quantity     float64
+				ScrapPercent float64
+				BOMOutputQty float64
+			}
+
+			compRows, compErr := tx.Query(`
+				SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), pb.quantity
+				FROM bom_lines bl
+				JOIN product_boms pb ON pb.id = bl.bom_id
+				WHERE bl.bom_id = $1
+			`, bomID)
+			if compErr != nil {
+				h.log.Error("Failed to fetch BOM components", "error", compErr)
+				h.GetProductionOrder(c)
+				return
+			}
+
+			var components []bomComponent
+			for compRows.Next() {
+				var comp bomComponent
+				if scanErr := compRows.Scan(&comp.ComponentID, &comp.Quantity, &comp.ScrapPercent, &comp.BOMOutputQty); scanErr == nil {
+					components = append(components, comp)
+				}
+			}
+			compRows.Close()
+
+			// Deduct each component from inventory
+			for _, comp := range components {
+				consumption := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
+
+				var compInvID uuid.UUID
+				compErr := tx.QueryRow(`
+					SELECT id FROM inventory
+					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+					AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
+
+				if compErr != nil {
+					h.log.Warn("Component not found in inventory, skipping consumption", "component_id", comp.ComponentID)
+					continue
+				}
+
+				_, _ = tx.Exec(`
+					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
+					WHERE id = $3
+				`, consumption, now, compInvID)
+
+				var compCost float64
+				h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
+
+				_, _ = tx.Exec(`
+					INSERT INTO inventory_transactions (
+						id, tenant_id, organization_id, inventory_id, transaction_type,
+						reference_type, reference_id, quantity, unit_cost, total_cost,
+						reason, notes, transaction_date, created_by, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
+				`, uuid.New(), tenantID, organizationID, compInvID, entity.TransactionTypeIssue,
+					"production_order", id, -consumption, compCost, consumption*compCost,
+					"material_consumption", "Materials consumed at production start", now, userID)
+			}
+
+			if commitErr := tx.Commit(); commitErr != nil {
+				h.log.Error("Failed to commit material consumption", "error", commitErr)
+			} else {
+				h.log.Info("Materials consumed for production order start", "order_id", id, "components", len(components))
+			}
+		}
 	}
 
 	h.GetProductionOrder(c)
@@ -1826,7 +1952,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	query := `
 		UPDATE production_orders
 		SET status = 'completed', actual_end = $1, completed_by = $2, completed_at = $1, updated_at = $1,
-			progress_percent = 100
+			progress_percent = 100, current_stage = 'done'
 	`
 	args := []interface{}{now, userID}
 	argCount := 2
@@ -1885,13 +2011,16 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 
 	// --- Inventory integration: add produced goods & consume materials ---
 	// Skip if inventory was already updated for this production order (prevent double-add)
-	var existingTxCount int
+	// Check if finished goods were already added (prevent double-add on re-completion)
+	// Only check for Receipt transactions - Issue transactions are from material consumption at start
+	var existingReceiptCount int
 	h.db.QueryRow(`
 		SELECT COUNT(*) FROM inventory_transactions
 		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2
-	`, tenantID, id).Scan(&existingTxCount)
-	if existingTxCount > 0 {
-		h.log.Info("Inventory already updated for production order, skipping", "order_id", id)
+		AND transaction_type = $3
+	`, tenantID, id, entity.TransactionTypeReceipt).Scan(&existingReceiptCount)
+	if existingReceiptCount > 0 {
+		h.log.Info("Finished goods already added for production order, skipping", "order_id", id)
 		h.GetProductionOrder(c)
 		return
 	}
@@ -1904,7 +2033,8 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 
 	err = h.db.QueryRow(`
 		SELECT product_id, bom_id, warehouse_id, organization_id,
-		       COALESCE(quantity_produced, quantity_planned), quantity_planned
+		       CASE WHEN COALESCE(quantity_produced, 0) > 0 THEN quantity_produced ELSE quantity_planned END,
+		       quantity_planned
 		FROM production_orders WHERE id = $1 AND tenant_id = $2
 	`, id, tenantID).Scan(&productID, &bomID, &warehouseID, &organizationID, &qtyProduced, &qtyPlanned)
 	if err != nil {
@@ -1979,69 +2109,48 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		return
 	}
 
-	// Consume BOM components
-	if bomID != nil {
-		type bomComponent struct {
-			ComponentID  uuid.UUID
-			Quantity     float64
-			ScrapPercent float64
-			BOMOutputQty float64
-		}
-
-		compRows, compErr := tx.Query(`
-			SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), pb.quantity
-			FROM bom_lines bl
-			JOIN product_boms pb ON pb.id = bl.bom_id
-			WHERE bl.bom_id = $1
-		`, bomID)
-		if compErr == nil {
-			var components []bomComponent
-			for compRows.Next() {
-				var comp bomComponent
-				if scanErr := compRows.Scan(&comp.ComponentID, &comp.Quantity, &comp.ScrapPercent, &comp.BOMOutputQty); scanErr == nil {
-					components = append(components, comp)
-				}
-			}
-			compRows.Close()
-
-			for _, comp := range components {
-				consumption := comp.Quantity * (producedQty / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
-
-				var compInvID uuid.UUID
-				compErr := tx.QueryRow(`
-					SELECT id FROM inventory
-					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-					AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
-				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
-
-				if compErr != nil {
-					h.log.Warn("Component not found in inventory, skipping consumption", "component_id", comp.ComponentID)
-					continue
-				}
-
-				_, _ = tx.Exec(`
-					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
-					WHERE id = $3
-				`, consumption, now, compInvID)
-
-				var compCost float64
-				h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
-
-				_, _ = tx.Exec(`
-					INSERT INTO inventory_transactions (
-						id, tenant_id, organization_id, inventory_id, transaction_type,
-						reference_type, reference_id, quantity, unit_cost, total_cost,
-						reason, notes, transaction_date, created_by, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
-				`, uuid.New(), tenantID, organizationID, compInvID, entity.TransactionTypeIssue,
-					"production_order", id, -consumption, compCost, consumption*compCost,
-					"material_consumption", "Auto-consumed for production order", now, userID)
-			}
-		}
-	}
+	// Note: BOM component consumption is handled in StartProductionOrder (when production begins)
 
 	if commitErr := tx.Commit(); commitErr != nil {
 		h.log.Error("Failed to commit inventory transaction", "error", commitErr)
+	}
+
+	// ============================================
+	// AUTO-CREATE QUALITY CHECK for completed production order
+	// ============================================
+	qcID := uuid.New()
+	qcCode := fmt.Sprintf("QC-%s", id.String()[:8])
+
+	// Get product name for the quality check
+	var qcProductName string
+	h.db.QueryRow("SELECT name FROM products WHERE id = $1", productID).Scan(&qcProductName)
+
+	// Get inspector name
+	var inspectorName string
+	h.db.QueryRow("SELECT first_name || ' ' || last_name FROM users WHERE id = $1", userID).Scan(&inspectorName)
+
+	_, qcErr := h.db.Exec(`
+		INSERT INTO quality_checks (
+			id, tenant_id, organization_id, code, production_order_id, product_id,
+			inspection_date, inspector_id, inspector_name,
+			quantity_inspected, quantity_passed, quantity_failed,
+			result, pass_rate, action_taken, notes,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $7, $7)
+	`,
+		qcID, tenantID, organizationID, qcCode, id, productID,
+		now, userID, inspectorName,
+		producedQty, producedQty, float64(0),
+		"passed", float64(100), "released",
+		fmt.Sprintf("Auto-created quality check for production order completion. Product: %s, Quantity: %.0f", qcProductName, producedQty),
+	)
+	if qcErr != nil {
+		h.log.Error("Failed to auto-create quality check", "error", qcErr)
+		// Don't fail the whole operation, just log the error
+	} else {
+		// Update production order quality status
+		h.db.Exec(`UPDATE production_orders SET quality_status = 'passed', requires_quality_check = true, updated_at = $1 WHERE id = $2`, now, id)
+		h.log.Info("Auto-created quality check for production order", "qc_id", qcID, "order_id", id)
 	}
 
 	// ============================================
@@ -2075,7 +2184,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 			if err == nil && journalID != uuid.Nil {
 				// Get production order number
 				var poNumber string
-				h.db.QueryRow(`SELECT order_number FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
+				h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
 
 				// Get product name
 				var productName string
