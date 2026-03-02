@@ -301,6 +301,10 @@ type UpdateOperationTypeInput struct {
 	ReturnPickingTypeID   *string `json:"return_picking_type_id,omitempty"`
 	Color                 *string `json:"color,omitempty"`
 	IsActive              *bool   `json:"is_active,omitempty"`
+	JournalID             *string `json:"journal_id,omitempty"`
+	DebitAccountID        *string `json:"debit_account_id,omitempty"`
+	CreditAccountID       *string `json:"credit_account_id,omitempty"`
+	AutoPostAccounting    *bool   `json:"auto_post_accounting,omitempty"`
 }
 
 // OperationTypeResponse represents the API response for an operation type
@@ -311,15 +315,20 @@ type OperationTypeResponse struct {
 	Code                   string    `json:"code"`
 	Name                   string    `json:"name"`
 	Type                   string    `json:"type"`
+	OperationType          string    `json:"operation_type"`
 	Sequence               int       `json:"sequence"`
 	Color                  string    `json:"color"`
 	ShowOperations         bool      `json:"show_operations"`
 	CountPickingReady      int       `json:"count_picking_ready"`
 	CountPickingLate       int       `json:"count_picking_late"`
 	CountPickingWaiting    int       `json:"count_picking_waiting"`
-	CountPickingBackorders int       `json:"count_picking_backorders"`
-	IsActive               bool      `json:"is_active"`
-	CreatedAt              time.Time `json:"created_at"`
+	CountPickingBackorders int        `json:"count_picking_backorders"`
+	IsActive               bool       `json:"is_active"`
+	CreatedAt              time.Time  `json:"created_at"`
+	JournalID              *uuid.UUID `json:"journal_id,omitempty"`
+	DebitAccountID         *uuid.UUID `json:"debit_account_id,omitempty"`
+	CreditAccountID        *uuid.UUID `json:"credit_account_id,omitempty"`
+	AutoPostAccounting     bool       `json:"auto_post_accounting"`
 }
 
 // ─── Stock Operations TT entities ─────────────────────────────────────────────

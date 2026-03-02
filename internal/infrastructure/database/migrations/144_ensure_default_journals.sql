@@ -1,14 +1,15 @@
--- Migration 143: Fix journals missing organization_id + ensure default journals exist
--- Problem: createDefaultJournals inserted without organization_id, so ListJournals (which filters by org) returned 0.
--- Also: migration 128 soft-deleted some journals, and UNIQUE(tenant_id, code) blocks re-creation.
+-- Migration 144: Ensure default journals exist for all organizations
+-- Previous migration 143 may have run but failed to create journals due to:
+-- 1. Soft-deleted journals blocking UNIQUE(tenant_id, code) constraint
+-- 2. organization_id still NULL after update
 
--- Step 1: Restore soft-deleted default journals (they were incorrectly deleted by merge migration)
+-- Step 1: Restore any soft-deleted default journals
 UPDATE journals
-SET deleted_at = NULL, updated_at = NOW()
+SET deleted_at = NULL, is_active = true, updated_at = NOW()
 WHERE deleted_at IS NOT NULL
   AND code IN ('GEN', 'SAL', 'PUR', 'CASH', 'BANK', 'MISC', 'GENERAL', 'SALES', 'PURCHASE', 'CASH_RECEIPTS');
 
--- Step 2: Set organization_id on journals that have NULL org
+-- Step 2: Set organization_id on journals that still have NULL
 DO $$
 DECLARE
     r RECORD;
@@ -27,31 +28,7 @@ BEGIN
     END LOOP;
 END $$;
 
--- Step 3: For every org that still has no journals, create the 6 defaults
--- First drop the old unique and create a new one that includes organization_id
--- so each org can have its own set of journals
-DO $$
-BEGIN
-    -- Add unique constraint that includes organization_id if not exists
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'journals_tenant_org_code_unique'
-    ) THEN
-        -- We can't drop the old unique easily if there are duplicates,
-        -- so we just add the new one alongside
-        BEGIN
-            ALTER TABLE journals ADD CONSTRAINT journals_tenant_org_code_unique
-                UNIQUE (tenant_id, organization_id, code);
-        EXCEPTION WHEN duplicate_table THEN
-            -- Already exists
-            NULL;
-        WHEN unique_violation THEN
-            -- There are duplicates, skip this
-            NULL;
-        END;
-    END IF;
-END $$;
-
--- Step 4: Seed default journals per org
+-- Step 3: For orgs with 0 active journals, force-create them using upsert
 DO $$
 DECLARE
     r RECORD;
@@ -69,7 +46,6 @@ BEGIN
           AND deleted_at IS NULL;
 
         IF j_count = 0 THEN
-            -- No journals at all for this tenant/org, create fresh ones
             INSERT INTO journals (id, tenant_id, organization_id, code, name, type, is_active, created_at)
             VALUES
                 (gen_random_uuid(), r.tenant_id, r.org_id, 'GEN',  'General Journal',      'general',       true, NOW()),
