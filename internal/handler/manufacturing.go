@@ -1744,6 +1744,28 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// --- Create work orders from BOM if none exist (for orders confirmed before the fix) ---
+	var woCount int
+	h.db.QueryRow(`SELECT COUNT(*) FROM work_orders WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&woCount)
+	if woCount == 0 {
+		// Fetch BOM info and create work orders
+		var poBomID *uuid.UUID
+		var poOrgID *uuid.UUID
+		var poQty float64
+		fetchErr := h.db.QueryRow(`SELECT bom_id, organization_id, quantity_planned FROM production_orders WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&poBomID, &poOrgID, &poQty)
+		if fetchErr == nil && poBomID != nil {
+			orgVal := uuid.Nil
+			if poOrgID != nil {
+				orgVal = *poOrgID
+			}
+			if woErr := h.CreateWorkOrdersFromBOM(id, *poBomID, tenantID, orgVal, poQty, userID); woErr != nil {
+				h.log.Error("Failed to create work orders on start", "error", woErr)
+			} else {
+				h.log.Info("Created work orders for production order on start", "order_id", id)
+			}
+		}
+	}
+
 	// --- Consume BOM components from inventory when production starts ---
 	var productID uuid.UUID
 	var bomID *uuid.UUID
