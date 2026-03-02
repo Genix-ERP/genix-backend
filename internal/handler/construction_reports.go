@@ -1,0 +1,430 @@
+package handler
+
+import (
+	"strconv"
+
+	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/response"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// =====================================================
+// CONSTRUCTION REPORTS
+// =====================================================
+
+// GetProjectSummaryReport returns summary report for a project
+// GET /construction/projects/:id/reports/summary
+func (h *Handler) GetProjectSummaryReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Total costs
+	var totalActual float64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(amount), 0)
+		FROM construction_expense_lines
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'approved' AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&totalActual)
+
+	// By category
+	byCatRows, _ := h.db.Query(`
+		SELECT COALESCE(cat.name, 'Uncategorized'), COALESCE(cat.code, ''), COALESCE(SUM(el.amount), 0)
+		FROM construction_expense_lines el
+		LEFT JOIN construction_cost_categories cat ON cat.id = el.cost_category_id
+		WHERE el.project_id = $1 AND el.tenant_id = $2 AND el.status = 'approved' AND el.deleted_at IS NULL
+		GROUP BY cat.name, cat.code
+		ORDER BY SUM(el.amount) DESC
+	`, projectID, tenantID)
+	type CategoryTotal struct {
+		Name  string  `json:"name"`
+		Code  string  `json:"code"`
+		Total float64 `json:"total"`
+	}
+	byCategory := []CategoryTotal{}
+	if byCatRows != nil {
+		defer byCatRows.Close()
+		for byCatRows.Next() {
+			var ct CategoryTotal
+			if err := byCatRows.Scan(&ct.Name, &ct.Code, &ct.Total); err == nil {
+				byCategory = append(byCategory, ct)
+			}
+		}
+	}
+
+	// By stage
+	byStageRows, _ := h.db.Query(`
+		SELECT COALESCE(s.name, 'No Stage'), COALESCE(SUM(el.amount), 0)
+		FROM construction_expense_lines el
+		LEFT JOIN construction_stages s ON s.id = el.stage_id
+		WHERE el.project_id = $1 AND el.tenant_id = $2 AND el.status = 'approved' AND el.deleted_at IS NULL
+		GROUP BY s.name
+		ORDER BY SUM(el.amount) DESC
+	`, projectID, tenantID)
+	type StageTotal struct {
+		Stage string  `json:"stage"`
+		Total float64 `json:"total"`
+	}
+	byStage := []StageTotal{}
+	if byStageRows != nil {
+		defer byStageRows.Close()
+		for byStageRows.Next() {
+			var st StageTotal
+			if err := byStageRows.Scan(&st.Stage, &st.Total); err == nil {
+				byStage = append(byStage, st)
+			}
+		}
+	}
+
+	// Monthly dynamics (last 24 months)
+	monthlyRows, _ := h.db.Query(`
+		SELECT TO_CHAR(DATE_TRUNC('month', expense_date), 'YYYY-MM'),
+		       COALESCE(SUM(amount), 0)
+		FROM construction_expense_lines
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'approved' AND deleted_at IS NULL
+		GROUP BY DATE_TRUNC('month', expense_date)
+		ORDER BY DATE_TRUNC('month', expense_date) ASC
+	`, projectID, tenantID)
+	type MonthlyTotal struct {
+		Month string  `json:"month"`
+		Total float64 `json:"total"`
+	}
+	monthly := []MonthlyTotal{}
+	if monthlyRows != nil {
+		defer monthlyRows.Close()
+		for monthlyRows.Next() {
+			var mt MonthlyTotal
+			if err := monthlyRows.Scan(&mt.Month, &mt.Total); err == nil {
+				monthly = append(monthly, mt)
+			}
+		}
+	}
+
+	// Top-10 materials
+	top10MatRows, _ := h.db.Query(`
+		SELECT COALESCE(p.name, el.description), SUM(el.quantity), AVG(el.unit_price), SUM(el.amount)
+		FROM construction_expense_lines el
+		LEFT JOIN products p ON p.id = el.product_id
+		WHERE el.project_id = $1 AND el.tenant_id = $2 AND el.status = 'approved'
+		  AND el.deleted_at IS NULL AND el.product_id IS NOT NULL
+		GROUP BY p.name, el.description
+		ORDER BY SUM(el.amount) DESC
+		LIMIT 10
+	`, projectID, tenantID)
+	type MaterialLine struct {
+		Name      string   `json:"name"`
+		Quantity  *float64 `json:"quantity"`
+		AvgPrice  *float64 `json:"avg_price"`
+		Total     float64  `json:"total"`
+	}
+	top10Materials := []MaterialLine{}
+	if top10MatRows != nil {
+		defer top10MatRows.Close()
+		for top10MatRows.Next() {
+			var ml MaterialLine
+			if err := top10MatRows.Scan(&ml.Name, &ml.Quantity, &ml.AvgPrice, &ml.Total); err == nil {
+				top10Materials = append(top10Materials, ml)
+			}
+		}
+	}
+
+	// Top-10 vendors
+	top10VendorRows, _ := h.db.Query(`
+		SELECT COALESCE(v.name, 'Unknown'), SUM(el.amount)
+		FROM construction_expense_lines el
+		LEFT JOIN contacts v ON v.id = el.vendor_id
+		WHERE el.project_id = $1 AND el.tenant_id = $2 AND el.status = 'approved'
+		  AND el.deleted_at IS NULL AND el.vendor_id IS NOT NULL
+		GROUP BY v.name
+		ORDER BY SUM(el.amount) DESC
+		LIMIT 10
+	`, projectID, tenantID)
+	type VendorTotal struct {
+		Vendor string  `json:"vendor"`
+		Total  float64 `json:"total"`
+	}
+	top10Vendors := []VendorTotal{}
+	if top10VendorRows != nil {
+		defer top10VendorRows.Close()
+		for top10VendorRows.Next() {
+			var vt VendorTotal
+			if err := top10VendorRows.Scan(&vt.Vendor, &vt.Total); err == nil {
+				top10Vendors = append(top10Vendors, vt)
+			}
+		}
+	}
+
+	response.Success(c, map[string]interface{}{
+		"total_actual":    totalActual,
+		"by_category":     byCategory,
+		"by_stage":        byStage,
+		"monthly":         monthly,
+		"top10_materials": top10Materials,
+		"top10_vendors":   top10Vendors,
+	})
+}
+
+// GetStageBudgetReport returns plan vs actual by stage × category
+// GET /construction/projects/:id/reports/budget
+func (h *Handler) GetStageBudgetReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Stages with planned budgets and actual totals
+	rows, err := h.db.Query(`
+		SELECT
+			s.id, s.name, s.planned_budget,
+			COALESCE(cat.id, 0), COALESCE(cat.name, 'Uncategorized'), COALESCE(cat.code, ''),
+			COALESCE(SUM(CASE WHEN el.status='approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual
+		FROM construction_stages s
+		LEFT JOIN construction_expense_lines el ON el.stage_id = s.id AND el.project_id = s.project_id
+		LEFT JOIN construction_cost_categories cat ON cat.id = el.cost_category_id
+		WHERE s.project_id = $1 AND s.tenant_id = $2
+		GROUP BY s.id, s.name, s.planned_budget, cat.id, cat.name, cat.code
+		ORDER BY s.stage_order ASC, s.id ASC, cat.name ASC
+	`, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query stage budget", "error", err)
+		response.InternalError(c, "Failed to get budget report")
+		return
+	}
+	defer rows.Close()
+
+	type BudgetRow struct {
+		StageID       int64   `json:"stage_id"`
+		StageName     string  `json:"stage_name"`
+		PlannedBudget float64 `json:"planned_budget"`
+		CategoryID    int64   `json:"category_id"`
+		CategoryName  string  `json:"category_name"`
+		CategoryCode  string  `json:"category_code"`
+		Actual        float64 `json:"actual"`
+		Variance      float64 `json:"variance"`
+		VariancePct   float64 `json:"variance_pct"`
+	}
+
+	budgetRows := []BudgetRow{}
+	for rows.Next() {
+		var br BudgetRow
+		if err := rows.Scan(
+			&br.StageID, &br.StageName, &br.PlannedBudget,
+			&br.CategoryID, &br.CategoryName, &br.CategoryCode,
+			&br.Actual,
+		); err != nil {
+			continue
+		}
+		br.Variance = br.PlannedBudget - br.Actual
+		if br.PlannedBudget > 0 {
+			br.VariancePct = (br.Actual / br.PlannedBudget) * 100
+		}
+		budgetRows = append(budgetRows, br)
+	}
+
+	// Also compute total actual for project (including non-stage expenses)
+	var totalActual float64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(amount), 0)
+		FROM construction_expense_lines
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'approved' AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&totalActual)
+
+	var totalPlanned float64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(planned_budget), 0) FROM construction_stages WHERE project_id = $1 AND tenant_id = $2
+	`, projectID, tenantID).Scan(&totalPlanned)
+
+	response.Success(c, map[string]interface{}{
+		"rows":          budgetRows,
+		"total_planned": totalPlanned,
+		"total_actual":  totalActual,
+		"total_variance": totalPlanned - totalActual,
+	})
+}
+
+// GetMaterialsReport returns materials summary for a project
+// GET /construction/projects/:id/reports/materials
+func (h *Handler) GetMaterialsReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT COALESCE(p.name, el.description),
+		       COALESCE(el.uom, ''),
+		       COALESCE(SUM(el.quantity), 0),
+		       CASE WHEN SUM(el.quantity) > 0 THEN SUM(el.amount) / SUM(el.quantity) ELSE 0 END,
+		       COALESCE(SUM(el.amount), 0)
+		FROM construction_expense_lines el
+		LEFT JOIN products p ON p.id = el.product_id
+		WHERE el.project_id = $1 AND el.tenant_id = $2
+		  AND el.status = 'approved' AND el.deleted_at IS NULL
+		  AND el.product_id IS NOT NULL
+	`
+	args := []interface{}{projectID, tenantID}
+	argCount := 2
+
+	if stageIDStr := c.Query("stage_id"); stageIDStr != "" {
+		argCount++
+		stageID, _ := strconv.ParseInt(stageIDStr, 10, 64)
+		query += " AND el.stage_id = $" + strconv.Itoa(argCount)
+		args = append(args, stageID)
+	}
+	if dateFrom := c.Query("date_from"); dateFrom != "" {
+		argCount++
+		query += " AND el.expense_date >= $" + strconv.Itoa(argCount)
+		args = append(args, dateFrom)
+	}
+	if dateTo := c.Query("date_to"); dateTo != "" {
+		argCount++
+		query += " AND el.expense_date <= $" + strconv.Itoa(argCount)
+		args = append(args, dateTo)
+	}
+	if vendorIDStr := c.Query("vendor_id"); vendorIDStr != "" {
+		argCount++
+		vendorID, _ := uuid.Parse(vendorIDStr)
+		query += " AND el.vendor_id = $" + strconv.Itoa(argCount)
+		args = append(args, vendorID)
+	}
+
+	query += " GROUP BY p.name, el.description, el.uom ORDER BY SUM(el.amount) DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to query materials report", "error", err)
+		response.InternalError(c, "Failed to get materials report")
+		return
+	}
+	defer rows.Close()
+
+	type MaterialRow struct {
+		Name     string  `json:"name"`
+		Uom      string  `json:"uom"`
+		Quantity float64 `json:"quantity"`
+		AvgPrice float64 `json:"avg_price"`
+		Total    float64 `json:"total"`
+	}
+
+	materials := []MaterialRow{}
+	var grandTotal float64
+	for rows.Next() {
+		var mr MaterialRow
+		if err := rows.Scan(&mr.Name, &mr.Uom, &mr.Quantity, &mr.AvgPrice, &mr.Total); err == nil {
+			materials = append(materials, mr)
+			grandTotal += mr.Total
+		}
+	}
+
+	response.Success(c, map[string]interface{}{
+		"items":       materials,
+		"grand_total": grandTotal,
+	})
+}
+
+// GetJournalEntriesReport returns all construction journal entries for a project
+// GET /construction/projects/:id/reports/journal-entries
+func (h *Handler) GetJournalEntriesReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Collect journal entry IDs linked to expense lines for this project
+	query := `
+		SELECT je.id, je.entry_number, je.entry_date, je.description,
+		       je.source_type, je.total_debit, je.total_credit, je.status,
+		       je.created_at
+		FROM journal_entries je
+		WHERE je.tenant_id = $1
+		  AND je.source_type IN ('construction_expense','construction_expense_reversal','project_commission','material_request')
+		  AND je.id IN (
+		      SELECT journal_entry_id FROM construction_expense_lines
+		      WHERE project_id = $2 AND tenant_id = $1 AND deleted_at IS NULL AND journal_entry_id IS NOT NULL
+		      UNION ALL
+		      SELECT commission_journal_entry_id FROM construction_projects
+		      WHERE id = $2 AND tenant_id = $1 AND commission_journal_entry_id IS NOT NULL
+		  )
+	`
+	args := []interface{}{tenantID, projectID}
+	argCount := 2
+
+	if dateFrom := c.Query("date_from"); dateFrom != "" {
+		argCount++
+		query += " AND je.entry_date >= $" + strconv.Itoa(argCount)
+		args = append(args, dateFrom)
+	}
+	if dateTo := c.Query("date_to"); dateTo != "" {
+		argCount++
+		query += " AND je.entry_date <= $" + strconv.Itoa(argCount)
+		args = append(args, dateTo)
+	}
+
+	query += " ORDER BY je.entry_date DESC, je.created_at DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to query journal entries report", "error", err)
+		response.InternalError(c, "Failed to get journal entries")
+		return
+	}
+	defer rows.Close()
+
+	type JERow struct {
+		ID          string  `json:"id"`
+		EntryNumber string  `json:"entry_number"`
+		EntryDate   string  `json:"entry_date"`
+		Description string  `json:"description"`
+		SourceType  string  `json:"source_type"`
+		TotalDebit  float64 `json:"total_debit"`
+		TotalCredit float64 `json:"total_credit"`
+		Status      string  `json:"status"`
+		CreatedAt   string  `json:"created_at"`
+	}
+
+	entries := []JERow{}
+	for rows.Next() {
+		var jr JERow
+		if err := rows.Scan(
+			&jr.ID, &jr.EntryNumber, &jr.EntryDate, &jr.Description,
+			&jr.SourceType, &jr.TotalDebit, &jr.TotalCredit, &jr.Status, &jr.CreatedAt,
+		); err == nil {
+			entries = append(entries, jr)
+		}
+	}
+
+	response.Success(c, map[string]interface{}{
+		"items": entries,
+		"count": len(entries),
+	})
+}
