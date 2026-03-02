@@ -151,6 +151,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		depts.DELETE("/:id", middleware.RequirePermission("organization", "department", "delete"), h.DeleteDepartment)
 	}
 
+	// Job Positions
+	jobPositions := rg.Group("/job-positions")
+	jobPositions.Use(middleware.RequirePermission("organization", "department", "read"))
+	{
+		jobPositions.GET("", h.ListJobPositions)
+		jobPositions.POST("", middleware.RequirePermission("organization", "department", "create"), h.CreateJobPosition)
+		jobPositions.GET("/:id", h.GetJobPosition)
+		jobPositions.PUT("/:id", middleware.RequirePermission("organization", "department", "update"), h.UpdateJobPosition)
+		jobPositions.DELETE("/:id", middleware.RequirePermission("organization", "department", "delete"), h.DeleteJobPosition)
+	}
+
 	// Contacts (Customers & Vendors)
 	contacts := rg.Group("/contacts")
 	{
@@ -1554,6 +1565,23 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Daily Logs (WBS-linked)
 		constructionProjects.GET("/:id/daily-logs", h.ListConstructionDailyLogs)
 		constructionProjects.POST("/:id/daily-logs", middleware.RequirePermission("construction", "daily_log", "create"), h.CreateConstructionDailyLog)
+
+		// Stages
+		constructionProjects.GET("/:id/stages", h.ListConstructionStages)
+		constructionProjects.POST("/:id/stages", middleware.RequirePermission("construction", "project", "update"), h.CreateConstructionStage)
+
+		// Expense Lines (Xarajat operatsiyalari)
+		constructionProjects.GET("/:id/expenses", h.ListExpenseLines)
+		constructionProjects.POST("/:id/expenses", middleware.RequirePermission("construction", "project", "update"), h.CreateExpenseLine)
+
+		// Reports
+		constructionProjects.GET("/:id/reports/summary", h.GetProjectSummaryReport)
+		constructionProjects.GET("/:id/reports/budget", h.GetStageBudgetReport)
+		constructionProjects.GET("/:id/reports/materials", h.GetMaterialsReport)
+		constructionProjects.GET("/:id/reports/journal-entries", h.GetJournalEntriesReport)
+
+		// Commission (complete project)
+		constructionProjects.PUT("/:id/commission", middleware.RequirePermission("construction", "project", "update"), h.CommissionProject)
 	}
 
 	// Project Vendors (direct access for update/delete)
@@ -1588,6 +1616,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	materialRequests.Use(middleware.RequirePermission("construction", "projects", "read"))
 	{
 		materialRequests.PUT("/:id", middleware.RequirePermission("construction", "projects", "update"), h.UpdateMaterialRequest)
+		materialRequests.PUT("/:id/approve", middleware.RequirePermission("construction", "projects", "update"), h.ApproveMaterialRequest)
 		materialRequests.DELETE("/:id", middleware.RequirePermission("construction", "projects", "delete"), h.DeleteMaterialRequest)
 	}
 
@@ -1631,6 +1660,37 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		constructionDailyLogs.PUT("/:id", middleware.RequirePermission("construction", "daily_log", "update"), h.UpdateConstructionDailyLog)
 		constructionDailyLogs.DELETE("/:id", middleware.RequirePermission("construction", "daily_log", "delete"), h.DeleteConstructionDailyLog)
+	}
+
+	// Construction Stages (direct access for update/delete)
+	constructionStages := rg.Group("/construction/stages")
+	constructionStages.Use(middleware.RequirePermission("construction", "project", "read"))
+	{
+		constructionStages.PUT("/:id", middleware.RequirePermission("construction", "project", "update"), h.UpdateConstructionStage)
+		constructionStages.DELETE("/:id", middleware.RequirePermission("construction", "project", "delete"), h.DeleteConstructionStage)
+	}
+
+	// Expense Lines (direct access for update/delete/approve/cancel)
+	constructionExpenses := rg.Group("/construction/expenses")
+	constructionExpenses.Use(middleware.RequirePermission("construction", "project", "read"))
+	{
+		constructionExpenses.PUT("/:id", middleware.RequirePermission("construction", "project", "update"), h.UpdateExpenseLine)
+		constructionExpenses.DELETE("/:id", middleware.RequirePermission("construction", "project", "update"), h.DeleteExpenseLine)
+		constructionExpenses.PUT("/:id/approve", middleware.RequirePermission("construction", "project", "update"), h.ApproveExpenseLine)
+		constructionExpenses.PUT("/:id/cancel", middleware.RequirePermission("construction", "project", "update"), h.CancelExpenseLine)
+	}
+
+	// Cost Categories & Account Mapping (settings)
+	constructionSettings := rg.Group("/construction")
+	constructionSettings.Use(middleware.RequirePermission("construction", "project", "read"))
+	{
+		constructionSettings.GET("/cost-categories", h.ListCostCategories)
+		constructionSettings.POST("/cost-categories", middleware.RequirePermission("construction", "project", "update"), h.CreateCostCategory)
+		constructionSettings.PUT("/cost-categories/:id", middleware.RequirePermission("construction", "project", "update"), h.UpdateCostCategory)
+		constructionSettings.GET("/account-mapping", h.GetAccountMapping)
+		constructionSettings.PUT("/account-mapping", middleware.RequirePermission("construction", "project", "update"), h.UpsertAccountMapping)
+		// Portfolio dashboard (cross-project)
+		constructionSettings.GET("/dashboard", h.GetConstructionPortfolioDashboard)
 	}
 
 	// Photo Reports (direct access)
