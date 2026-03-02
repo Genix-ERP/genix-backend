@@ -307,7 +307,7 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 		return
 	}
 
-	if currentStatus != "draft" && currentStatus != "ready" && currentStatus != "waiting" {
+	if currentStatus != "draft" && currentStatus != "ready" && currentStatus != "waiting" && currentStatus != "pending" {
 		response.BadRequest(c, "Work order cannot be started. Current status: "+currentStatus)
 		return
 	}
