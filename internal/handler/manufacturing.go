@@ -2162,9 +2162,9 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	`,
 		qcID, tenantID, organizationID, qcCode, id, productID,
 		now, userID, inspectorName,
-		producedQty, producedQty, float64(0),
-		"passed", float64(100), "released",
-		fmt.Sprintf("Auto-created quality check for production order completion. Product: %s, Quantity: %.0f", qcProductName, producedQty),
+		producedQty, float64(0), float64(0),
+		"pending", float64(0), "",
+		fmt.Sprintf("Quality inspection required for completed production. Product: %s, Quantity: %.0f", qcProductName, producedQty),
 	)
 	if qcErr != nil {
 		h.log.Error("Failed to auto-create quality check", "error", qcErr)
