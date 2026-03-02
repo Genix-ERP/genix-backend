@@ -1461,11 +1461,11 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 
 	_, err = h.db.Exec(`
 		INSERT INTO sales_delivery_orders (
-			id, tenant_id, delivery_number, sales_order_id, so_number,
+			id, tenant_id, organization_id, delivery_number, sales_order_id, so_number,
 			customer_id, customer_name, delivery_date, scheduled_date, warehouse_id, carrier,
 			status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $13)`,
-		doID, tenantID, doNumber, orderID, orderNumber,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'draft', $13, $14, $14)`,
+		doID, tenantID, organizationID, doNumber, orderID, orderNumber,
 		customerID, customerName.String, deliveryDate, expectedDate, warehouseUUID, carrierValue,
 		userID, now,
 	)
@@ -1489,6 +1489,101 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		)
 		if err != nil {
 			h.log.Error("Failed to create delivery order lines", "error", err)
+		}
+	}
+
+	// Auto-create stock operation (delivery) — TT 12.3: SO → delivery via stock_operations
+	var deliveryOpTypeID uuid.UUID
+	var deliverySrcLocID, deliveryDestLocID *uuid.UUID
+
+	opTypeQuery := `
+		SELECT id, default_location_src_id, default_location_dest_id
+		FROM warehouse_operation_types
+		WHERE tenant_id = $1 AND direction = 'delivery' AND is_active = true
+	`
+	opTypeArgs := []interface{}{tenantID}
+	if warehouseUUID != nil {
+		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
+		opTypeArgs = append(opTypeArgs, *warehouseUUID)
+	} else {
+		opTypeQuery += " ORDER BY sequence LIMIT 1"
+	}
+
+	opTypeErr := h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&deliveryOpTypeID, &deliverySrcLocID, &deliveryDestLocID)
+	if opTypeErr != nil {
+		h.log.Warn("No delivery operation type found for SO stock operation", "error", opTypeErr, "tenant_id", tenantID)
+	} else {
+		stockOpID := uuid.New()
+		stockOpName := h.nextStockOperationName(tenantID, "delivery")
+
+		var totalSteps int
+		h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2",
+			deliveryOpTypeID, tenantID).Scan(&totalSteps)
+		if totalSteps == 0 {
+			totalSteps = 1
+		}
+
+		_, stockOpErr := h.db.Exec(`
+			INSERT INTO stock_operations (
+				id, tenant_id, organization_id, name, operation_type_id, direction,
+				date, scheduled_date, partner_id, source_document,
+				source_location_id, dest_location_id,
+				state, current_step, total_steps, priority,
+				responsible_id, created_by, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,'delivery',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal',$13,$13,$14,$14)
+		`,
+			stockOpID, tenantID, organizationID, stockOpName, deliveryOpTypeID,
+			now, expectedDate, customerID, orderNumber,
+			deliverySrcLocID, deliveryDestLocID,
+			totalSteps, userID, now,
+		)
+		if stockOpErr != nil {
+			h.log.Error("Failed to create stock operation for SO delivery", "error", stockOpErr, "so_id", orderID)
+		} else {
+			// Create stock operation lines from SO lines
+			soLineRows, soLineErr := h.db.Query(`
+				SELECT sol.product_id, sol.quantity, sol.unit_price,
+				       COALESCE(u.name, 'unit') as uom
+				FROM sales_order_lines sol
+				LEFT JOIN units_of_measure u ON u.id = sol.unit_id
+				WHERE sol.sales_order_id = $1 AND sol.product_id IS NOT NULL
+				  AND sol.quantity > COALESCE(sol.quantity_delivered, 0)
+			`, orderID)
+			if soLineErr == nil {
+				defer soLineRows.Close()
+				for soLineRows.Next() {
+					var productID uuid.UUID
+					var qty, unitPrice float64
+					var uom string
+					if scanErr := soLineRows.Scan(&productID, &qty, &unitPrice, &uom); scanErr != nil {
+						continue
+					}
+					h.db.Exec(`
+						INSERT INTO stock_operation_lines (
+							id, tenant_id, operation_id, product_id,
+							expected_qty, done_qty, uom, unit_price,
+							quality_status, created_at, updated_at
+						) VALUES (uuid_generate_v4(),$1,$2,$3,$4,0,$5,$6,'good',$7,$7)
+					`, tenantID, stockOpID, productID, qty, uom, unitPrice, now)
+				}
+			}
+
+			// Create initial step log entry if steps exist
+			var firstStep struct {
+				ID   uuid.UUID
+				Name string
+			}
+			if stepErr := h.db.QueryRow(`
+				SELECT id, name FROM operation_type_steps
+				WHERE operation_type_id = $1 AND tenant_id = $2
+				ORDER BY sequence LIMIT 1
+			`, deliveryOpTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name); stepErr == nil {
+				h.db.Exec(`
+					INSERT INTO stock_operation_step_log (
+						id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
+					) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
+				`, tenantID, stockOpID, firstStep.ID, firstStep.Name, now)
+			}
 		}
 	}
 

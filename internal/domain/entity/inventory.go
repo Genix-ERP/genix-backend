@@ -457,6 +457,44 @@ type CreateStockOperationLine struct {
 	Note             string   `json:"note,omitempty"`
 }
 
+// UpdateStockOperationInput is the input for editing a draft stock operation
+type UpdateStockOperationInput struct {
+	PartnerID      *string `json:"partner_id,omitempty"`
+	SourceDocument *string `json:"source_document,omitempty"`
+	ScheduledDate  *string `json:"scheduled_date,omitempty"`
+	Priority       *string `json:"priority,omitempty"`
+	Note           *string `json:"note,omitempty"`
+	WriteOffReason *string `json:"write_off_reason,omitempty"`
+}
+
+// UpdateStockOperationLinesInput is the input for batch updating operation lines
+type UpdateStockOperationLinesInput struct {
+	Lines []UpdateStockOperationLineItem `json:"lines" binding:"required"`
+}
+
+// UpdateStockOperationLineItem represents a single line update
+type UpdateStockOperationLineItem struct {
+	ID            string   `json:"id" binding:"required"`
+	DoneQty       *float64 `json:"done_qty,omitempty"`
+	LotNumber     *string  `json:"lot_number,omitempty"`
+	QualityStatus *string  `json:"quality_status,omitempty"`
+	UnitPrice     *float64 `json:"unit_price,omitempty"`
+	Note          *string  `json:"note,omitempty"`
+}
+
+// AddStockOperationLineInput is the input for adding a line to an existing operation
+type AddStockOperationLineInput struct {
+	ProductID     string   `json:"product_id" binding:"required"`
+	ExpectedQty   float64  `json:"expected_qty"`
+	DoneQty       float64  `json:"done_qty"`
+	UOM           string   `json:"uom,omitempty"`
+	UnitPrice     *float64 `json:"unit_price,omitempty"`
+	LotNumber     string   `json:"lot_number,omitempty"`
+	ExpiryDate    string   `json:"expiry_date,omitempty"`
+	QualityStatus string   `json:"quality_status,omitempty"`
+	Note          string   `json:"note,omitempty"`
+}
+
 // InventoryValuationReport represents inventory valuation
 type InventoryValuationReport struct {
 	ProductID         uuid.UUID  `json:"product_id"`
