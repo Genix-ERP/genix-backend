@@ -992,22 +992,26 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	}
 	cogsGrouped := make(map[cogsPair]float64)
 
+	// Resolve fallback revenue account for products without category income account
+	fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+
 	for _, il := range invoiceLines {
 		if il.LineTotal > 0 {
-			revenueGrouped[il.IncomeAcct] += il.LineTotal
+			if il.IncomeAcct != uuid.Nil {
+				revenueGrouped[il.IncomeAcct] += il.LineTotal
+			} else if fallbackRevenue != uuid.Nil {
+				revenueGrouped[fallbackRevenue] += il.LineTotal
+			}
 		}
 		costAmount := il.Quantity * il.CostPrice
-		if costAmount > 0 {
+		if costAmount > 0 && il.ExpenseAcct != uuid.Nil && il.OutputAcct != uuid.Nil {
 			cogsGrouped[cogsPair{Expense: il.ExpenseAcct, Output: il.OutputAcct}] += costAmount
 		}
 	}
 
-	// Fallback if no lines found
-	if len(revenueGrouped) == 0 && subtotal > 0 {
-		fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
-		if fallbackRevenue != uuid.Nil {
-			revenueGrouped[fallbackRevenue] = subtotal
-		}
+	// Fallback if no lines at all but subtotal exists
+	if len(revenueGrouped) == 0 && subtotal > 0 && fallbackRevenue != uuid.Nil {
+		revenueGrouped[fallbackRevenue] = subtotal
 	}
 
 	// Generate entry number from actual max to avoid duplicate key conflicts

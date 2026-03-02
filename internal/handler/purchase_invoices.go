@@ -463,9 +463,10 @@ func (h *Handler) UpdatePurchaseInvoice(c *gin.Context) {
 	}
 
 	var input struct {
-		Status  string `json:"status"`
-		Notes   string `json:"notes"`
-		DueDate string `json:"due_date"`
+		Status      string   `json:"status"`
+		Notes       string   `json:"notes"`
+		DueDate     string   `json:"due_date"`
+		AmountPaid  *float64 `json:"amount_paid"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, err.Error())
@@ -477,11 +478,39 @@ func (h *Handler) UpdatePurchaseInvoice(c *gin.Context) {
 	args := []interface{}{}
 	argCount := 0
 
-	if input.Status != "" {
+	// Handle payment amount - auto-determine status based on amount
+	if input.AmountPaid != nil {
+		// Get total_amount to determine correct status
+		var totalAmount, currentAmountPaid float64
+		err = h.db.QueryRow(
+			"SELECT COALESCE(total_amount, 0), COALESCE(amount_paid, 0) FROM purchase_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+			invoiceID, tenantID,
+		).Scan(&totalAmount, &currentAmountPaid)
+		if err != nil {
+			response.InternalError(c, "Failed to fetch invoice details")
+			return
+		}
+
+		newAmountPaid := currentAmountPaid + *input.AmountPaid
+		argCount++
+		updates = append(updates, fmt.Sprintf("amount_paid = $%d", argCount))
+		args = append(args, newAmountPaid)
+
+		// Auto-set status based on payment
+		argCount++
+		if newAmountPaid >= totalAmount {
+			updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+			args = append(args, "paid")
+		} else {
+			updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+			args = append(args, "partial")
+		}
+	} else if input.Status != "" {
 		argCount++
 		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
 		args = append(args, input.Status)
 	}
+
 	if input.Notes != "" {
 		argCount++
 		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))

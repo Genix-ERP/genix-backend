@@ -1392,10 +1392,14 @@ func (h *Handler) ListOperationTypes(c *gin.Context) {
 	showInactive := c.Query("include_inactive") == "true"
 
 	query := `
-		SELECT ot.id, ot.warehouse_id, ot.code, ot.name, ot.type, ot.sequence,
+		SELECT ot.id, ot.warehouse_id, ot.code, ot.name, ot.type,
+			   COALESCE(ot.operation_type, '') as operation_type,
+			   ot.sequence,
 			   ot.color, ot.show_operations,
-			   ot.count_picking_ready, ot.count_picking_late,
-			   ot.count_picking_waiting, ot.count_picking_backorders,
+			   COALESCE((SELECT COUNT(*) FROM stock_operations so WHERE so.operation_type_id = ot.id AND so.deleted_at IS NULL AND so.state = 'in_progress'), 0) as count_ready,
+			   COALESCE((SELECT COUNT(*) FROM stock_operations so WHERE so.operation_type_id = ot.id AND so.deleted_at IS NULL AND so.state NOT IN ('done','cancelled') AND so.scheduled_date < NOW()), 0) as count_late,
+			   COALESCE((SELECT COUNT(*) FROM stock_operations so WHERE so.operation_type_id = ot.id AND so.deleted_at IS NULL AND so.state IN ('draft','waiting')), 0) as count_waiting,
+			   COALESCE((SELECT COUNT(*) FROM stock_operations so WHERE so.operation_type_id = ot.id AND so.deleted_at IS NULL AND so.state = 'done'), 0) as count_done,
 			   ot.is_active, ot.created_at,
 			   w.name as warehouse_name
 		FROM warehouse_operation_types ot
@@ -1441,7 +1445,9 @@ func (h *Handler) ListOperationTypes(c *gin.Context) {
 		var warehouseName sql.NullString
 
 		err := rows.Scan(
-			&ot.ID, &ot.WarehouseID, &ot.Code, &ot.Name, &ot.Type, &ot.Sequence,
+			&ot.ID, &ot.WarehouseID, &ot.Code, &ot.Name, &ot.Type,
+			&ot.OperationType,
+			&ot.Sequence,
 			&ot.Color, &ot.ShowOperations,
 			&ot.CountPickingReady, &ot.CountPickingLate,
 			&ot.CountPickingWaiting, &ot.CountPickingBackorders,
@@ -1483,22 +1489,30 @@ func (h *Handler) GetOperationType(c *gin.Context) {
 	var warehouseName sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT ot.id, ot.warehouse_id, ot.code, ot.name, ot.type, ot.sequence,
+		SELECT ot.id, ot.warehouse_id, ot.code, ot.name, ot.type,
+			   COALESCE(ot.operation_type, '') as operation_type,
+			   ot.sequence,
 			   ot.color, ot.show_operations,
 			   ot.count_picking_ready, ot.count_picking_late,
 			   ot.count_picking_waiting, ot.count_picking_backorders,
 			   ot.is_active, ot.created_at,
-			   w.name as warehouse_name
+			   w.name as warehouse_name,
+			   ot.journal_id, ot.debit_account_id, ot.credit_account_id,
+			   COALESCE(ot.auto_post_accounting, false)
 		FROM warehouse_operation_types ot
 		JOIN warehouses w ON ot.warehouse_id = w.id
 		WHERE ot.id = $1 AND ot.tenant_id = $2 AND ot.deleted_at IS NULL
 	`, id, tenantID).Scan(
-		&ot.ID, &ot.WarehouseID, &ot.Code, &ot.Name, &ot.Type, &ot.Sequence,
+		&ot.ID, &ot.WarehouseID, &ot.Code, &ot.Name, &ot.Type,
+		&ot.OperationType,
+		&ot.Sequence,
 		&ot.Color, &ot.ShowOperations,
 		&ot.CountPickingReady, &ot.CountPickingLate,
 		&ot.CountPickingWaiting, &ot.CountPickingBackorders,
 		&ot.IsActive, &ot.CreatedAt,
 		&warehouseName,
+		&ot.JournalID, &ot.DebitAccountID, &ot.CreditAccountID,
+		&ot.AutoPostAccounting,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -1864,6 +1878,33 @@ func (h *Handler) UpdateOperationType(c *gin.Context) {
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
+	}
+	if input.JournalID != nil {
+		if *input.JournalID == "" {
+			addUpdate("journal_id", nil)
+		} else {
+			jid, _ := uuid.Parse(*input.JournalID)
+			addUpdate("journal_id", jid)
+		}
+	}
+	if input.DebitAccountID != nil {
+		if *input.DebitAccountID == "" {
+			addUpdate("debit_account_id", nil)
+		} else {
+			did, _ := uuid.Parse(*input.DebitAccountID)
+			addUpdate("debit_account_id", did)
+		}
+	}
+	if input.CreditAccountID != nil {
+		if *input.CreditAccountID == "" {
+			addUpdate("credit_account_id", nil)
+		} else {
+			cid, _ := uuid.Parse(*input.CreditAccountID)
+			addUpdate("credit_account_id", cid)
+		}
+	}
+	if input.AutoPostAccounting != nil {
+		addUpdate("auto_post_accounting", *input.AutoPostAccounting)
 	}
 
 	if len(updates) == 0 {
