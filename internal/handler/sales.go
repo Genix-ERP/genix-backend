@@ -1286,7 +1286,7 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 // DeleteSalesOrder soft deletes a sales order
 // DeleteSalesOrder godoc
 // @Summary Delete a sales order
-// @Description Soft delete a sales order. Only orders in draft status can be deleted.
+// @Description Soft delete a sales order. Only orders in draft or cancelled status can be deleted.
 // @Tags Sales
 // @Accept json
 // @Produce json
@@ -1318,8 +1318,8 @@ func (h *Handler) DeleteSalesOrder(c *gin.Context) {
 		response.NotFound(c, "Sales order")
 		return
 	}
-	if currentStatus != string(entity.OrderStatusDraft) {
-		response.BadRequest(c, "Can only delete orders in draft status")
+	if currentStatus != string(entity.OrderStatusDraft) && currentStatus != string(entity.OrderStatusCancelled) {
+		response.BadRequest(c, "Can only delete orders in draft or cancelled status")
 		return
 	}
 
@@ -1999,9 +1999,16 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			}
 			cogsGrouped := make(map[cogsPair]float64)
 
+			// Resolve fallback revenue account for products without category income account
+			fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+
 			for _, al := range acctLines {
-				if al.LineTotal > 0 && al.IncomeAcct != uuid.Nil {
-					revenueGrouped[al.IncomeAcct] += al.LineTotal
+				if al.LineTotal > 0 {
+					if al.IncomeAcct != uuid.Nil {
+						revenueGrouped[al.IncomeAcct] += al.LineTotal
+					} else if fallbackRevenue != uuid.Nil {
+						revenueGrouped[fallbackRevenue] += al.LineTotal
+					}
 				}
 				costAmount := al.Quantity * al.CostPrice
 				if costAmount > 0 && al.ExpenseAcct != uuid.Nil && al.OutputAcct != uuid.Nil {
@@ -2009,12 +2016,9 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				}
 			}
 
-			// Fallback revenue account
-			if len(revenueGrouped) == 0 && subtotal > 0 {
-				fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
-				if fallbackRevenue != uuid.Nil {
-					revenueGrouped[fallbackRevenue] = subtotal
-				}
+			// Fallback if no lines at all but subtotal exists
+			if len(revenueGrouped) == 0 && subtotal > 0 && fallbackRevenue != uuid.Nil {
+				revenueGrouped[fallbackRevenue] = subtotal
 			}
 
 			// Generate entry number

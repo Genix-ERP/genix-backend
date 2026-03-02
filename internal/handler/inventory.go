@@ -5598,6 +5598,11 @@ func (h *Handler) CreateStockOperation(c *gin.Context) {
 		}
 	}
 
+	var writeOffReason *string
+	if input.WriteOffReason != "" {
+		writeOffReason = &input.WriteOffReason
+	}
+
 	_, err = h.db.Exec(`
 		INSERT INTO stock_operations (
 			id, tenant_id, name, operation_type_id, direction,
@@ -5610,7 +5615,7 @@ func (h *Handler) CreateStockOperation(c *gin.Context) {
 		id, tenantID, name, opTypeID, input.Direction,
 		now, partnerID, input.SourceDocument,
 		totalSteps, priority,
-		input.Note, input.WriteOffReason,
+		input.Note, writeOffReason,
 		now,
 	)
 	if err != nil {
@@ -5730,6 +5735,121 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			SET state='done', done_at=$1, updated_at=$1
 			WHERE id=$2 AND tenant_id=$3
 		`, now, id, tenantID)
+
+		// Create journal entry if auto_post_accounting is enabled
+		var autoPost bool
+		var direction string
+		var cfgJournalID, cfgDebitAcct, cfgCreditAcct *uuid.UUID
+		var opOrgID *uuid.UUID
+		h.db.QueryRow(`
+			SELECT wot.auto_post_accounting, wot.journal_id, wot.debit_account_id, wot.credit_account_id,
+			       so.direction, so.organization_id
+			FROM warehouse_operation_types wot
+			JOIN stock_operations so ON so.operation_type_id = wot.id
+			WHERE so.id=$1 AND so.tenant_id=$2
+		`, id, tenantID).Scan(&autoPost, &cfgJournalID, &cfgDebitAcct, &cfgCreditAcct, &direction, &opOrgID)
+
+		if autoPost && direction != "internal" {
+			// Calculate total value from operation lines
+			var totalValue float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(done_qty * unit_price), 0)
+				FROM stock_operation_lines
+				WHERE operation_id=$1 AND tenant_id=$2
+			`, id, tenantID).Scan(&totalValue)
+
+			if totalValue > 0 {
+				// Find journal
+				var journalID uuid.UUID
+				var nextNumber int
+				if cfgJournalID != nil && *cfgJournalID != uuid.Nil {
+					h.db.QueryRow("SELECT id, COALESCE(next_number,1) FROM journals WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", *cfgJournalID, tenantID).Scan(&journalID, &nextNumber)
+				}
+				if journalID == uuid.Nil {
+					h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE WHEN code='INVENTORY' THEN 0 WHEN code='MISC' THEN 1 ELSE 2 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+				}
+
+				if journalID != uuid.Nil {
+					// Find accounts based on direction or configured values
+					var debitAcct, creditAcct uuid.UUID
+					if cfgDebitAcct != nil && *cfgDebitAcct != uuid.Nil {
+						debitAcct = *cfgDebitAcct
+					}
+					if cfgCreditAcct != nil && *cfgCreditAcct != uuid.Nil {
+						creditAcct = *cfgCreditAcct
+					}
+
+					// Fallback: auto-detect accounts by direction
+					if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
+						switch direction {
+						case "receipt":
+							if debitAcct == uuid.Nil {
+								debitAcct = findAccount(h.db, tenantID, opOrgID, "inventory", "1300")
+							}
+							if creditAcct == uuid.Nil {
+								creditAcct = findAccount(h.db, tenantID, opOrgID, "accounts payable", "2100")
+								if creditAcct == uuid.Nil {
+									creditAcct = findAccount(h.db, tenantID, opOrgID, "vendor", "2100")
+								}
+							}
+						case "delivery":
+							if debitAcct == uuid.Nil {
+								debitAcct = findAccount(h.db, tenantID, opOrgID, "cost of goods", "5100")
+								if debitAcct == uuid.Nil {
+									debitAcct = findAccount(h.db, tenantID, opOrgID, "cogs", "5100")
+								}
+							}
+							if creditAcct == uuid.Nil {
+								creditAcct = findAccount(h.db, tenantID, opOrgID, "inventory", "1300")
+							}
+						case "write_off":
+							if debitAcct == uuid.Nil {
+								debitAcct = findAccount(h.db, tenantID, opOrgID, "scrap", "6920")
+								if debitAcct == uuid.Nil {
+									debitAcct = findAccount(h.db, tenantID, opOrgID, "inventory loss", "6910")
+								}
+							}
+							if creditAcct == uuid.Nil {
+								creditAcct = findAccount(h.db, tenantID, opOrgID, "inventory", "1300")
+							}
+						}
+					}
+
+					if debitAcct != uuid.Nil && creditAcct != uuid.Nil {
+						entryID := uuid.New()
+						prefixMap := map[string]string{"receipt": "REC", "delivery": "DEL", "write_off": "WO"}
+						prefix := prefixMap[direction]
+						if prefix == "" {
+							prefix = "STK"
+						}
+						entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+						var opName string
+						h.db.QueryRow("SELECT name FROM stock_operations WHERE id=$1", id).Scan(&opName)
+						description := fmt.Sprintf("Stock Operation: %s", opName)
+
+						h.db.Exec(`
+							INSERT INTO journal_entries (
+								id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+								description, source_type, source_id, status, total_debit, total_credit,
+								created_by, created_at, updated_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_operation', $8, 'posted', $9, $9, $10, $11, $11)
+						`, entryID, tenantID, opOrgID, journalID, entryNumber, now,
+							description, id.String(), totalValue, userID, now)
+
+						h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
+							uuid.New(), entryID, debitAcct, description, totalValue, now)
+						h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
+							uuid.New(), entryID, creditAcct, description, totalValue, now)
+
+						h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalValue, now, debitAcct)
+						h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, creditAcct)
+						h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+						h.db.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, id)
+					}
+				}
+			}
+		}
 	} else {
 		newState = "in_progress"
 		// Find next step definition
@@ -5847,6 +5967,7 @@ func (h *Handler) ListOperationTypeSteps(c *gin.Context) {
 		SELECT id, sequence, name, responsible_role,
 		       requires_approval, approval_role, auto_proceed,
 		       max_duration_hours, on_timeout, instructions,
+		       source_location_id, dest_location_id,
 		       created_at, updated_at
 		FROM operation_type_steps
 		WHERE operation_type_id=$1 AND tenant_id=$2
@@ -5864,10 +5985,12 @@ func (h *Handler) ListOperationTypeSteps(c *gin.Context) {
 		var maxDur sql.NullFloat64
 		var instrNote sql.NullString
 		var respRole, apprRole sql.NullString
+		var srcLoc, destLoc *uuid.UUID
 		err := rows.Scan(
 			&s.ID, &s.Sequence, &s.Name, &respRole,
 			&s.RequiresApproval, &apprRole, &s.AutoProceed,
 			&maxDur, &s.OnTimeout, &instrNote,
+			&srcLoc, &destLoc,
 			&s.CreatedAt, &s.UpdatedAt,
 		)
 		if err != nil {
@@ -5885,6 +6008,8 @@ func (h *Handler) ListOperationTypeSteps(c *gin.Context) {
 		if apprRole.Valid {
 			s.ApprovalRole = apprRole.String
 		}
+		s.SourceLocationID = srcLoc
+		s.DestLocationID = destLoc
 		s.NotifyUsers = []string{}
 		s.RequiredDocuments = []string{}
 		s.TenantID = tenantID
@@ -5910,15 +6035,17 @@ func (h *Handler) SaveOperationTypeSteps(c *gin.Context) {
 	}
 
 	var steps []struct {
-		Sequence         int     `json:"sequence"`
-		Name             string  `json:"name"`
-		ResponsibleRole  string  `json:"responsible_role"`
-		RequiresApproval bool    `json:"requires_approval"`
-		ApprovalRole     string  `json:"approval_role"`
-		AutoProceed      bool    `json:"auto_proceed"`
+		Sequence         int      `json:"sequence"`
+		Name             string   `json:"name"`
+		SourceLocationID *string  `json:"source_location_id"`
+		DestLocationID   *string  `json:"dest_location_id"`
+		ResponsibleRole  string   `json:"responsible_role"`
+		RequiresApproval bool     `json:"requires_approval"`
+		ApprovalRole     string   `json:"approval_role"`
+		AutoProceed      bool     `json:"auto_proceed"`
 		MaxDurationHours *float64 `json:"max_duration_hours"`
-		OnTimeout        string  `json:"on_timeout"`
-		Instructions     string  `json:"instructions"`
+		OnTimeout        string   `json:"on_timeout"`
+		Instructions     string   `json:"instructions"`
 	}
 	if err := c.ShouldBindJSON(&steps); err != nil {
 		response.BadRequest(c, "Invalid input: "+err.Error())
@@ -5939,15 +6066,30 @@ func (h *Handler) SaveOperationTypeSteps(c *gin.Context) {
 		if onTimeout == "" {
 			onTimeout = "warn"
 		}
+		var srcLoc, destLoc *uuid.UUID
+		if s.SourceLocationID != nil && *s.SourceLocationID != "" {
+			parsed, _ := uuid.Parse(*s.SourceLocationID)
+			if parsed != uuid.Nil {
+				srcLoc = &parsed
+			}
+		}
+		if s.DestLocationID != nil && *s.DestLocationID != "" {
+			parsed, _ := uuid.Parse(*s.DestLocationID)
+			if parsed != uuid.Nil {
+				destLoc = &parsed
+			}
+		}
 		h.db.Exec(`
 			INSERT INTO operation_type_steps (
 				id, tenant_id, operation_type_id, sequence, name,
+				source_location_id, dest_location_id,
 				responsible_role, requires_approval, approval_role,
 				auto_proceed, max_duration_hours, on_timeout, instructions,
 				created_at, updated_at
-			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
+			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$14)
 		`,
 			tenantID, opTypeID, seq, s.Name,
+			srcLoc, destLoc,
 			s.ResponsibleRole, s.RequiresApproval, s.ApprovalRole,
 			s.AutoProceed, s.MaxDurationHours, onTimeout, s.Instructions,
 			now,

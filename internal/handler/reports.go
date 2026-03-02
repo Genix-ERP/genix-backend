@@ -667,6 +667,87 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		totalAmount += amountDue
 	}
 
+	// Also include payments (receipts) as negative entries — like Odoo
+	payQuery := `
+		SELECT p.id, p.payment_number, p.payment_date, p.amount,
+		       c.id as contact_id, c.name as contact_name,
+		       ($2::date - p.payment_date)::int as days_since
+		FROM payments p
+		JOIN contacts c ON p.contact_id = c.id
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+		  AND p.type = 'receipt' AND p.status = 'confirmed'
+		  AND p.payment_date <= $2::date
+	`
+	payArgs := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		payQuery += " AND p.organization_id = $3"
+		payArgs = append(payArgs, orgID)
+	}
+	payQuery += " ORDER BY c.name, p.payment_date"
+
+	// Check which payments are already fully allocated to invoices in this report
+	payRows, payErr := h.db.Query(payQuery, payArgs...)
+	if payErr == nil {
+		defer payRows.Close()
+		for payRows.Next() {
+			var payID, contactID uuid.UUID
+			var payNumber, contactName string
+			var payDate time.Time
+			var amount float64
+			var daysSince int
+
+			if err := payRows.Scan(&payID, &payNumber, &payDate, &amount, &contactID, &contactName, &daysSince); err != nil {
+				continue
+			}
+
+			// Check how much of this payment is allocated to unpaid invoices
+			var allocatedAmount float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(pa.amount), 0)
+				FROM payment_allocations pa
+				JOIN sales_invoices si ON pa.document_id = si.id AND pa.document_type = 'sales_invoice'
+				WHERE pa.payment_id = $1 AND si.status NOT IN ('cancelled', 'paid')
+				  AND si.total_amount > si.amount_paid
+			`, payID).Scan(&allocatedAmount)
+
+			// Unallocated payment amount (overpayment/advance) shows as negative
+			unallocated := amount - allocatedAmount
+			if unallocated <= 0 {
+				continue
+			}
+			negativeAmount := -unallocated
+
+			contact, exists := contactMap[contactID]
+			if !exists {
+				contact = &entity.AgingContact{
+					ContactID:   contactID,
+					ContactName: contactName,
+					Invoices:    make([]entity.AgingInvoice, 0),
+				}
+				contactMap[contactID] = contact
+			}
+
+			// Payments go into "current" bucket as negative
+			contact.Current += negativeAmount
+			currentTotal += negativeAmount
+
+			payEntry := entity.AgingInvoice{
+				InvoiceID:     payID,
+				InvoiceNumber: payNumber,
+				InvoiceDate:   payDate.Format("2006-01-02"),
+				DueDate:       payDate.Format("2006-01-02"),
+				TotalAmount:   -amount,
+				AmountDue:     negativeAmount,
+				DaysOverdue:   0,
+				AgingBucket:   "current",
+			}
+
+			contact.Invoices = append(contact.Invoices, payEntry)
+			contact.TotalAmount += negativeAmount
+			totalAmount += negativeAmount
+		}
+	}
+
 	// Convert map to slice
 	contacts := make([]entity.AgingContact, 0, len(contactMap))
 	for _, c := range contactMap {
