@@ -29,7 +29,7 @@ type Department struct {
 
 // CreateDepartmentInput represents input for creating a department
 type CreateDepartmentInput struct {
-	Code       string  `json:"code" binding:"required"`
+	Code       string  `json:"code"`
 	Name       string  `json:"name" binding:"required"`
 	ParentID   *string `json:"parent_id,omitempty"`
 	ManagerID  *string `json:"manager_id,omitempty"`
@@ -136,6 +136,14 @@ func (h *Handler) CreateDepartment(c *gin.Context) {
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
+	}
+
+	// Auto-generate code from name if not provided
+	if strings.TrimSpace(input.Code) == "" {
+		input.Code = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(input.Name), " ", "_"))
+		if len(input.Code) > 20 {
+			input.Code = input.Code[:20]
+		}
 	}
 
 	id := uuid.New()
