@@ -1843,16 +1843,47 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 		}
 
 		if apAccountID != uuid.Nil {
-			// Find expense account
-			expenseAccountID := findAccount(tx, tenantID, organizationID, "purchase", "5000")
-			if expenseAccountID == uuid.Nil {
-				expenseAccountID = findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
+			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+
+			// Per-category accounting: resolve Stock Interim Receipt per product
+			type billLineAcct struct {
+				ProductID uuid.UUID
+				LineTotal float64
+				InputAcct uuid.UUID
 			}
-			if expenseAccountID == uuid.Nil {
-				expenseAccountID = findAccount(tx, tenantID, organizationID, "expense", "5000")
+			var billLines []billLineAcct
+			for _, pl := range poLines {
+				if pl.ProductID != nil && pl.LineTotal > 0 {
+					billLines = append(billLines, billLineAcct{
+						ProductID: *pl.ProductID,
+						LineTotal: pl.LineTotal,
+					})
+				}
+			}
+			for i := range billLines {
+				ca := getCategoryAccounts(tx, tenantID, organizationID, billLines[i].ProductID)
+				billLines[i].InputAcct = ca.StockInputAccountID
 			}
 
-			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+			// Group by stock input account
+			inputGrouped := make(map[uuid.UUID]float64)
+			for _, bl := range billLines {
+				inputGrouped[bl.InputAcct] += bl.LineTotal
+			}
+
+			// Fallback if no product lines matched
+			if len(inputGrouped) == 0 && subtotal > 0 {
+				fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "2230")
+				if fallbackInput == uuid.Nil {
+					fallbackInput = findAccount(tx, tenantID, organizationID, "stock interim receipt", "2200")
+				}
+				if fallbackInput == uuid.Nil {
+					fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
+				}
+				if fallbackInput != uuid.Nil {
+					inputGrouped[fallbackInput] = subtotal
+				}
+			}
 
 			// Generate entry number
 			prefix := ""
@@ -1880,18 +1911,17 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 			jeLineNumber := 1
 
-			// Debit: Expense/Purchase account
-			if expenseAccountID != uuid.Nil {
-				debitAmt := subtotal
+			// Debit: Stock Interim Receipt (per category)
+			for inputAcct, amount := range inputGrouped {
 				tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, contact_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-					uuid.New(), jeID, jeLineNumber, expenseAccountID, vendorID, "Purchase Expense",
-					debitAmt, 0.0, 1.0, now,
+					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, "Stock Interim Receipt",
+					amount, 0.0, 1.0, now,
 				)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", debitAmt, now, expenseAccountID)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct)
 				jeLineNumber++
 			}
 
