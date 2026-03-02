@@ -167,12 +167,10 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	countQuery := `SELECT COUNT(*) FROM work_orders WHERE tenant_id = $1 AND deleted_at IS NULL`
 	h.db.QueryRow(countQuery, tenantID).Scan(&total)
 
-	response.Success(c, gin.H{
-		"data":  workOrders,
-		"total": total,
-		"page":  page,
-		"limit": limit,
-	})
+	pagination := entity.NewPagination(page, limit)
+	pagination.Total = total
+	pagination.Calculate(total)
+	response.SuccessWithPagination(c, workOrders, pagination)
 }
 
 // GetWorkOrder returns a single work order
