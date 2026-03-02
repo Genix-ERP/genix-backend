@@ -1531,6 +1531,22 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/team", h.ListConstructionTeamMembers)
 		constructionProjects.POST("/:id/team", middleware.RequirePermission("construction", "project", "update"), h.CreateConstructionTeamMember)
 		constructionProjects.DELETE("/:id/team/:memberId", middleware.RequirePermission("construction", "project", "update"), h.DeleteConstructionTeamMember)
+
+		// WBS (Work Breakdown Structure)
+		constructionProjects.GET("/:id/wbs", h.ListWBSItems)
+		constructionProjects.GET("/:id/wbs/tree", h.GetWBSTree)
+		constructionProjects.POST("/:id/wbs", middleware.RequirePermission("construction", "wbs", "create"), h.CreateWBSItem)
+
+		// Activity Log
+		constructionProjects.GET("/:id/activity-log", h.ListConstructionActivityLog)
+
+		// Estimates
+		constructionProjects.GET("/:id/estimates", h.ListEstimates)
+		constructionProjects.POST("/:id/estimates", middleware.RequirePermission("construction", "estimate", "create"), h.CreateEstimate)
+
+		// Daily Logs (WBS-linked)
+		constructionProjects.GET("/:id/daily-logs", h.ListConstructionDailyLogs)
+		constructionProjects.POST("/:id/daily-logs", middleware.RequirePermission("construction", "daily_log", "create"), h.CreateConstructionDailyLog)
 	}
 
 	// Project Vendors (direct access for update/delete)
@@ -1575,6 +1591,39 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		dailyReports.GET("/:id", h.GetDailyReport)
 		dailyReports.PUT("/:id", middleware.RequirePermission("construction", "reports", "submit"), h.UpdateDailyReport)
 		dailyReports.DELETE("/:id", middleware.RequirePermission("construction", "reports", "submit"), h.DeleteDailyReport)
+	}
+
+	// WBS Items (direct access for update/delete)
+	wbsItems := rg.Group("/construction/wbs")
+	wbsItems.Use(middleware.RequirePermission("construction", "wbs", "read"))
+	{
+		wbsItems.PUT("/:id", middleware.RequirePermission("construction", "wbs", "update"), h.UpdateWBSItem)
+		wbsItems.DELETE("/:id", middleware.RequirePermission("construction", "wbs", "delete"), h.DeleteWBSItem)
+		wbsItems.POST("/reorder", middleware.RequirePermission("construction", "wbs", "update"), h.ReorderWBSItems)
+	}
+
+	// Estimates (direct access)
+	estimates := rg.Group("/construction/estimates")
+	estimates.Use(middleware.RequirePermission("construction", "estimate", "read"))
+	{
+		estimates.GET("/:id", h.GetEstimate)
+		estimates.PUT("/:id", middleware.RequirePermission("construction", "estimate", "update"), h.UpdateEstimate)
+		estimates.DELETE("/:id", middleware.RequirePermission("construction", "estimate", "delete"), h.DeleteEstimate)
+		estimates.POST("/:id/approve", middleware.RequirePermission("construction", "estimate", "update"), h.ApproveEstimate)
+		estimates.POST("/:id/duplicate", middleware.RequirePermission("construction", "estimate", "create"), h.DuplicateEstimate)
+		// Estimate Lines
+		estimates.GET("/:id/lines", h.ListEstimateLines)
+		estimates.POST("/:id/lines", middleware.RequirePermission("construction", "estimate", "update"), h.CreateEstimateLine)
+		estimates.PUT("/:id/lines/:line_id", middleware.RequirePermission("construction", "estimate", "update"), h.UpdateEstimateLine)
+		estimates.DELETE("/:id/lines/:line_id", middleware.RequirePermission("construction", "estimate", "update"), h.DeleteEstimateLine)
+	}
+
+	// Construction Daily Logs (direct access)
+	constructionDailyLogs := rg.Group("/construction/daily-logs")
+	constructionDailyLogs.Use(middleware.RequirePermission("construction", "daily_log", "read"))
+	{
+		constructionDailyLogs.PUT("/:id", middleware.RequirePermission("construction", "daily_log", "update"), h.UpdateConstructionDailyLog)
+		constructionDailyLogs.DELETE("/:id", middleware.RequirePermission("construction", "daily_log", "delete"), h.DeleteConstructionDailyLog)
 	}
 
 	// Photo Reports (direct access)

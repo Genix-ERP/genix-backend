@@ -1248,19 +1248,51 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 		return
 	}
 
-	// Check for duplicate code
-	var exists bool
-	err := h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM journals WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)
-	`, tenantID, input.Code).Scan(&exists)
-	if err != nil {
-		h.log.Error("Failed to check journal code", "error", err)
-		response.InternalError(c, "Failed to create journal")
-		return
+	// Auto-generate code from name if empty
+	if strings.TrimSpace(input.Code) == "" && strings.TrimSpace(input.Name) != "" {
+		input.Code = strings.ToUpper(strings.TrimSpace(input.Name))
+		// Keep only A-Z, 0-9, spaces; replace spaces with underscore
+		var cleaned []rune
+		for _, r := range input.Code {
+			if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' {
+				cleaned = append(cleaned, r)
+			}
+		}
+		input.Code = strings.ReplaceAll(strings.TrimSpace(string(cleaned)), " ", "_")
+		if len(input.Code) > 20 {
+			input.Code = input.Code[:20]
+		}
+		if input.Code == "" {
+			input.Code = "JRN"
+		}
 	}
-	if exists {
-		response.Conflict(c, "A journal with this code already exists")
-		return
+
+	// Check for duplicate code and auto-suffix if needed
+	var err error
+	baseCode := input.Code
+	for attempt := 0; attempt < 100; attempt++ {
+		var exists bool
+		err = h.db.QueryRow(`
+			SELECT EXISTS(SELECT 1 FROM journals WHERE tenant_id = $1 AND code = $2)
+		`, tenantID, input.Code).Scan(&exists)
+		if err != nil {
+			h.log.Error("Failed to check journal code", "error", err)
+			response.InternalError(c, "Failed to create journal")
+			return
+		}
+		if !exists {
+			break
+		}
+		suffix := fmt.Sprintf("_%d", attempt+1)
+		maxBase := 20 - len(suffix)
+		if maxBase < 0 {
+			maxBase = 0
+		}
+		bc := baseCode
+		if len(bc) > maxBase {
+			bc = bc[:maxBase]
+		}
+		input.Code = bc + suffix
 	}
 
 	journalID := uuid.New()
@@ -7528,6 +7560,11 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 	fiscalYearID, err := uuid.Parse(input.FiscalYearID)
 	if err != nil {
 		response.BadRequest(c, "Invalid fiscal year ID")
+		return
+	}
+
+	if input.TotalAmount <= 0 {
+		response.BadRequest(c, "Budget total amount must be greater than zero")
 		return
 	}
 
