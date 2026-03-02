@@ -906,21 +906,8 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		tenantID,
 	).Scan(&salesJournalID, &numberPrefix)
 	if err != nil {
-		// Journal doesn't exist yet, skip GL posting but still send invoice
-		h.log.Warn("Sales journal not found, skipping GL posting", "tenant_id", tenantID)
-		_, err = tx.Exec(
-			"UPDATE sales_invoices SET status = $1, sent_at = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
-			entity.InvoiceStatusSent, now, now, invoiceID, tenantID,
-		)
-		if err != nil {
-			response.InternalError(c, "Failed to send invoice")
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			response.InternalError(c, "Failed to commit transaction")
-			return
-		}
-		h.GetSalesInvoice(c)
+		h.log.Error("Sales journal not found", "tenant_id", tenantID)
+		response.InternalError(c, "Sales journal not configured. Please create a journal with code SALES or SAL.")
 		return
 	}
 
@@ -930,20 +917,8 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
 	}
 	if arAccountID == uuid.Nil {
-		h.log.Warn("AR account not found, skipping GL posting", "tenant_id", tenantID)
-		_, err = tx.Exec(
-			"UPDATE sales_invoices SET status = $1, sent_at = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
-			entity.InvoiceStatusSent, now, now, invoiceID, tenantID,
-		)
-		if err != nil {
-			response.InternalError(c, "Failed to send invoice")
-			return
-		}
-		if err := tx.Commit(); err != nil {
-			response.InternalError(c, "Failed to commit transaction")
-			return
-		}
-		h.GetSalesInvoice(c)
+		h.log.Error("AR account not found", "tenant_id", tenantID)
+		response.InternalError(c, "Accounts Receivable account (1100) not found. Please configure chart of accounts.")
 		return
 	}
 
@@ -1879,4 +1854,361 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	}
 
 	h.GetSalesInvoice(c)
+}
+
+// RepairRevenueJournalEntries creates missing journal entries for invoices that
+// don't have them, and fixes existing entries that are missing revenue lines.
+func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	var organizationID *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		organizationID = &orgID
+	}
+
+	now := time.Now()
+	var created, repaired int
+	var details []map[string]interface{}
+
+	// ===== PART 1: Create journal entries for invoices that have none =====
+	missingRows, err := h.db.Query(`
+		SELECT si.id, si.invoice_number, si.total_amount, si.subtotal, si.tax_amount,
+			   si.customer_id, si.organization_id, si.invoice_date
+		FROM sales_invoices si
+		WHERE si.tenant_id = $1
+			AND si.journal_entry_id IS NULL
+			AND si.invoice_number NOT LIKE 'CN-%'
+			AND si.status IN ('sent', 'paid', 'partial', 'partially_paid', 'overdue')
+			AND si.deleted_at IS NULL
+		ORDER BY si.created_at
+	`, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to query invoices: "+err.Error())
+		return
+	}
+	defer missingRows.Close()
+
+	// Get Sales Journal
+	var salesJournalID uuid.UUID
+	var numberPrefix sql.NullString
+	_ = h.db.QueryRow(`
+		SELECT id, number_prefix FROM journals
+		WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&salesJournalID, &numberPrefix)
+
+	if salesJournalID == uuid.Nil {
+		response.InternalError(c, "Sales journal not found")
+		return
+	}
+
+	type missingInvoice struct {
+		ID             uuid.UUID
+		InvoiceNumber  string
+		TotalAmount    float64
+		Subtotal       float64
+		TaxAmount      float64
+		CustomerID     uuid.UUID
+		OrganizationID uuid.UUID
+		InvoiceDate    time.Time
+	}
+
+	var missing []missingInvoice
+	for missingRows.Next() {
+		var mi missingInvoice
+		var invoiceDate sql.NullTime
+		if err := missingRows.Scan(&mi.ID, &mi.InvoiceNumber, &mi.TotalAmount, &mi.Subtotal,
+			&mi.TaxAmount, &mi.CustomerID, &mi.OrganizationID, &invoiceDate); err != nil {
+			continue
+		}
+		if invoiceDate.Valid {
+			mi.InvoiceDate = invoiceDate.Time
+		} else {
+			mi.InvoiceDate = now
+		}
+		missing = append(missing, mi)
+	}
+
+	for _, mi := range missing {
+		orgID := mi.OrganizationID
+		var orgPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgPtr = &orgID
+		}
+
+		arAccountID := findAccount(h.db, tenantID, orgPtr, "accounts receivable", "1100")
+		if arAccountID == uuid.Nil {
+			arAccountID = findAccount(h.db, tenantID, orgPtr, "accounts receivable", "1200")
+		}
+		taxAccountID := findAccount(h.db, tenantID, orgPtr, "tax", "2100")
+		revenueAccountID := findAccount(h.db, tenantID, orgPtr, "sales revenue", "4000")
+
+		if arAccountID == uuid.Nil || revenueAccountID == uuid.Nil {
+			continue
+		}
+
+		// Get invoice lines for COGS
+		type lineAcct struct {
+			ProductID  uuid.UUID
+			LineTotal  float64
+			Quantity   float64
+			CostPrice  float64
+			IncomeAcct uuid.UUID
+			ExpenseAcct uuid.UUID
+			OutputAcct uuid.UUID
+		}
+		var acctLines []lineAcct
+		lineRows, err := h.db.Query(`
+			SELECT sil.product_id, COALESCE(sil.line_total, 0), COALESCE(sil.quantity, 0), COALESCE(p.cost_price, 0)
+			FROM sales_invoice_lines sil
+			JOIN products p ON sil.product_id = p.id
+			WHERE sil.sales_invoice_id = $1
+		`, mi.ID)
+		if err == nil {
+			for lineRows.Next() {
+				var al lineAcct
+				if err := lineRows.Scan(&al.ProductID, &al.LineTotal, &al.Quantity, &al.CostPrice); err == nil {
+					acctLines = append(acctLines, al)
+				}
+			}
+			lineRows.Close()
+			for i := range acctLines {
+				ca := getCategoryAccounts(h.db, tenantID, orgPtr, acctLines[i].ProductID)
+				acctLines[i].IncomeAcct = ca.IncomeAccountID
+				acctLines[i].ExpenseAcct = ca.ExpenseAccountID
+				acctLines[i].OutputAcct = ca.StockOutputAccountID
+			}
+		}
+
+		// Group revenue by income account
+		revenueGrouped := make(map[uuid.UUID]float64)
+		type cogsPair struct {
+			Expense uuid.UUID
+			Output  uuid.UUID
+		}
+		cogsGrouped := make(map[cogsPair]float64)
+
+		for _, al := range acctLines {
+			if al.LineTotal > 0 {
+				if al.IncomeAcct != uuid.Nil {
+					revenueGrouped[al.IncomeAcct] += al.LineTotal
+				} else {
+					revenueGrouped[revenueAccountID] += al.LineTotal
+				}
+			}
+			costAmount := al.Quantity * al.CostPrice
+			if costAmount > 0 && al.ExpenseAcct != uuid.Nil && al.OutputAcct != uuid.Nil {
+				cogsGrouped[cogsPair{Expense: al.ExpenseAcct, Output: al.OutputAcct}] += costAmount
+			}
+		}
+
+		subtotal := mi.Subtotal
+		if len(revenueGrouped) == 0 && subtotal > 0 {
+			revenueGrouped[revenueAccountID] = subtotal
+		}
+
+		taxAmount := mi.TaxAmount
+		totalAmount := mi.TotalAmount
+
+		var totalCogs float64
+		for _, amt := range cogsGrouped {
+			totalCogs += amt
+		}
+		totalDebit := totalAmount + totalCogs
+		totalCredit := totalDebit
+
+		tx, err := h.db.Begin()
+		if err != nil {
+			continue
+		}
+
+		// Generate entry number
+		prefix := ""
+		if numberPrefix.Valid {
+			prefix = numberPrefix.String
+		}
+		var nextNumber int
+		if prefix != "" {
+			_ = tx.QueryRow(
+				"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
+				tenantID, salesJournalID, prefix+"%",
+			).Scan(&nextNumber)
+		} else {
+			_ = tx.QueryRow(
+				"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
+				tenantID, salesJournalID,
+			).Scan(&nextNumber)
+		}
+		if nextNumber < 1 {
+			nextNumber = 1
+		}
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+		jeID := uuid.New()
+		description := fmt.Sprintf("Sales Invoice %s (repair)", mi.InvoiceNumber)
+
+		_, err = tx.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15)`,
+			jeID, tenantID, mi.OrganizationID, salesJournalID, entryNumber, mi.InvoiceDate, mi.InvoiceNumber, description,
+			"sales_invoice", mi.ID, 1.0, totalDebit, totalCredit, now, now,
+		)
+		if err != nil {
+			tx.Rollback()
+			h.log.Error("RepairRevenue: failed to create JE", "error", err, "invoice", mi.InvoiceNumber)
+			continue
+		}
+
+		lineNumber := 1
+
+		// Debit: AR
+		tx.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			uuid.New(), jeID, lineNumber, arAccountID, mi.CustomerID, "Accounts Receivable",
+			totalAmount, 0.0, 1.0, now,
+		)
+		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
+		lineNumber++
+
+		// Credit: Revenue
+		for incomeAcct, amount := range revenueGrouped {
+			tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), jeID, lineNumber, incomeAcct, "Sales Revenue",
+				0.0, amount, 1.0, now,
+			)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct)
+			lineNumber++
+		}
+
+		// Credit: Tax
+		if taxAccountID != uuid.Nil && taxAmount > 0 {
+			tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), jeID, lineNumber, taxAccountID, "Sales Tax Payable",
+				0.0, taxAmount, 1.0, now,
+			)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+			lineNumber++
+		}
+
+		// COGS entries
+		for pair, costAmount := range cogsGrouped {
+			tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), jeID, lineNumber, pair.Expense, "Cost of Goods Sold",
+				costAmount, 0.0, 1.0, now,
+			)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Expense)
+			lineNumber++
+
+			tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), jeID, lineNumber, pair.Output, "Stock Interim Delivery",
+				0.0, costAmount, 1.0, now,
+			)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output)
+			lineNumber++
+		}
+
+		// Update invoice with journal entry ID
+		tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, updated_at = $2 WHERE id = $3", jeID, now, mi.ID)
+		tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
+
+		if err := tx.Commit(); err != nil {
+			continue
+		}
+
+		created++
+		details = append(details, map[string]interface{}{
+			"type":           "created",
+			"invoice_number": mi.InvoiceNumber,
+			"entry_number":   entryNumber,
+			"total_amount":   totalAmount,
+			"revenue":        subtotal,
+		})
+	}
+
+	// ===== PART 2: Fix existing entries with missing revenue lines =====
+	brokenRows, err := h.db.Query(`
+		SELECT je.id, je.source_id, je.entry_number,
+			COALESCE(SUM(CASE WHEN jel.description = 'Accounts Receivable' THEN jel.debit_amount ELSE 0 END), 0) as ar_debit,
+			COALESCE(SUM(CASE WHEN jel.description = 'Sales Revenue' THEN jel.credit_amount ELSE 0 END), 0) as revenue_credit,
+			COALESCE(SUM(CASE WHEN jel.description = 'Sales Tax Payable' THEN jel.credit_amount ELSE 0 END), 0) as tax_credit
+		FROM journal_entries je
+		JOIN journal_entry_lines jel ON jel.journal_entry_id = je.id
+		WHERE je.tenant_id = $1
+			AND je.source_type = 'sales_invoice'
+			AND je.status = 'posted'
+			AND je.deleted_at IS NULL
+		GROUP BY je.id, je.source_id, je.entry_number
+		HAVING COALESCE(SUM(CASE WHEN jel.description = 'Sales Revenue' THEN jel.credit_amount ELSE 0 END), 0) <
+			   COALESCE(SUM(CASE WHEN jel.description = 'Accounts Receivable' THEN jel.debit_amount ELSE 0 END), 0) -
+			   COALESCE(SUM(CASE WHEN jel.description = 'Sales Tax Payable' THEN jel.credit_amount ELSE 0 END), 0) - 1
+		ORDER BY je.entry_number
+	`, tenantID)
+	if err == nil {
+		defer brokenRows.Close()
+		for brokenRows.Next() {
+			var jeID, invoiceID uuid.UUID
+			var entryNumber string
+			var arDebit, revCredit, taxCredit float64
+			if err := brokenRows.Scan(&jeID, &invoiceID, &entryNumber, &arDebit, &revCredit, &taxCredit); err != nil {
+				continue
+			}
+			missingRevenue := arDebit - taxCredit - revCredit
+			if missingRevenue <= 0 {
+				continue
+			}
+
+			revenueAccountID := findAccount(h.db, tenantID, organizationID, "sales revenue", "4000")
+			if revenueAccountID == uuid.Nil {
+				continue
+			}
+
+			tx, err := h.db.Begin()
+			if err != nil {
+				continue
+			}
+			var maxLine int
+			_ = tx.QueryRow("SELECT COALESCE(MAX(line_number), 0) FROM journal_entry_lines WHERE journal_entry_id = $1", jeID).Scan(&maxLine)
+			_, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				uuid.New(), jeID, maxLine+1, revenueAccountID, "Sales Revenue",
+				0.0, missingRevenue, 1.0, now,
+			)
+			if err != nil {
+				tx.Rollback()
+				continue
+			}
+			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", missingRevenue, now, revenueAccountID)
+			if err := tx.Commit(); err != nil {
+				continue
+			}
+			repaired++
+			details = append(details, map[string]interface{}{
+				"type":            "repaired",
+				"entry_number":    entryNumber,
+				"missing_revenue": missingRevenue,
+			})
+		}
+	}
+
+	response.Success(c, gin.H{
+		"message":  fmt.Sprintf("Created %d new journal entries, repaired %d existing entries", created, repaired),
+		"created":  created,
+		"repaired": repaired,
+		"details":  details,
+	})
 }

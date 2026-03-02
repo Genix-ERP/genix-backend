@@ -528,6 +528,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		invoices.GET("", h.ListSalesInvoices)
 		invoices.POST("", middleware.RequirePermission("sales", "invoice", "create"), h.CreateSalesInvoice)
+		invoices.POST("/repair-revenue", middleware.RequirePermission("sales", "invoice", "update"), h.RepairRevenueJournalEntries)
 		invoices.GET("/:id", h.GetSalesInvoice)
 		invoices.PUT("/:id", middleware.RequirePermission("sales", "invoice", "update"), h.UpdateSalesInvoice)
 		invoices.DELETE("/:id", middleware.RequirePermission("sales", "invoice", "delete"), h.DeleteSalesInvoice)
