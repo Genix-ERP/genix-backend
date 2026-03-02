@@ -2965,7 +2965,16 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	}
 
 	// Update allocated invoices/bills from payment_allocations
-	// Query allocations for this payment and update each document individually
+	// Collect allocations first, then close rows before executing updates
+	// (lib/pq does not support interleaved queries on the same connection)
+	type allocation struct {
+		ID     uuid.UUID
+		DocType string
+		DocID  uuid.UUID
+		Amount float64
+	}
+	var allocations []allocation
+
 	allocRows, allocErr := tx.Query(
 		`SELECT id, document_type, document_id, amount FROM payment_allocations WHERE payment_id = $1`,
 		id,
@@ -2973,48 +2982,50 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	if allocErr != nil {
 		h.log.Error("Failed to query payment allocations", "error", allocErr, "payment_id", id)
 	} else {
-		defer allocRows.Close()
 		for allocRows.Next() {
-			var allocID, docID uuid.UUID
-			var docType string
-			var allocAmount float64
-			if scanErr := allocRows.Scan(&allocID, &docType, &docID, &allocAmount); scanErr != nil {
+			var a allocation
+			if scanErr := allocRows.Scan(&a.ID, &a.DocType, &a.DocID, &a.Amount); scanErr != nil {
 				h.log.Error("Failed to scan payment allocation", "error", scanErr)
 				continue
 			}
-			h.log.Info("Processing payment allocation", "alloc_id", allocID, "doc_type", docType, "doc_id", docID, "amount", allocAmount)
+			allocations = append(allocations, a)
+		}
+		allocRows.Close()
+	}
 
-			if docType == "sales_invoice" {
-				res, updErr := tx.Exec(`
-					UPDATE sales_invoices SET
-						amount_paid = amount_paid + $1,
-						status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
-						updated_at = $2
-					WHERE id = $3
-				`, allocAmount, now, docID)
-				if updErr != nil {
-					h.log.Error("Failed to update sales invoice amount_paid", "error", updErr, "invoice_id", docID, "amount", allocAmount)
-				} else if rows, _ := res.RowsAffected(); rows == 0 {
-					h.log.Warn("Sales invoice not found for allocation", "invoice_id", docID)
-				} else {
-					h.log.Info("Updated sales invoice amount_paid", "invoice_id", docID, "added", allocAmount, "rows", rows)
-				}
-			} else if docType == "purchase_invoice" {
-				res, updErr := tx.Exec(`
-					UPDATE purchase_invoices SET
-						amount_paid = amount_paid + $1,
-						status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
-						payment_status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
-						updated_at = $2
-					WHERE id = $3
-				`, allocAmount, now, docID)
-				if updErr != nil {
-					h.log.Error("Failed to update purchase invoice amount_paid", "error", updErr, "invoice_id", docID, "amount", allocAmount)
-				} else if rows, _ := res.RowsAffected(); rows == 0 {
-					h.log.Warn("Purchase invoice not found for allocation", "invoice_id", docID)
-				} else {
-					h.log.Info("Updated purchase invoice amount_paid", "invoice_id", docID, "added", allocAmount, "rows", rows)
-				}
+	for _, a := range allocations {
+		h.log.Info("Processing payment allocation", "alloc_id", a.ID, "doc_type", a.DocType, "doc_id", a.DocID, "amount", a.Amount)
+
+		if a.DocType == "sales_invoice" {
+			res, updErr := tx.Exec(`
+				UPDATE sales_invoices SET
+					amount_paid = amount_paid + $1,
+					status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
+					updated_at = $2
+				WHERE id = $3
+			`, a.Amount, now, a.DocID)
+			if updErr != nil {
+				h.log.Error("Failed to update sales invoice amount_paid", "error", updErr, "invoice_id", a.DocID, "amount", a.Amount)
+			} else if rows, _ := res.RowsAffected(); rows == 0 {
+				h.log.Warn("Sales invoice not found for allocation", "invoice_id", a.DocID)
+			} else {
+				h.log.Info("Updated sales invoice amount_paid", "invoice_id", a.DocID, "added", a.Amount, "rows", rows)
+			}
+		} else if a.DocType == "purchase_invoice" {
+			res, updErr := tx.Exec(`
+				UPDATE purchase_invoices SET
+					amount_paid = amount_paid + $1,
+					status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
+					payment_status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
+					updated_at = $2
+				WHERE id = $3
+			`, a.Amount, now, a.DocID)
+			if updErr != nil {
+				h.log.Error("Failed to update purchase invoice amount_paid", "error", updErr, "invoice_id", a.DocID, "amount", a.Amount)
+			} else if rows, _ := res.RowsAffected(); rows == 0 {
+				h.log.Warn("Purchase invoice not found for allocation", "invoice_id", a.DocID)
+			} else {
+				h.log.Info("Updated purchase invoice amount_paid", "invoice_id", a.DocID, "added", a.Amount, "rows", rows)
 			}
 		}
 	}
@@ -3066,6 +3077,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		creditDesc = "Cash/Bank"
 	}
 
+	// --- Create journal entry for the payment (inside a SAVEPOINT so failures don't abort the tx) ---
 	if cashAccountID != uuid.Nil && counterAccountID != uuid.Nil {
 		// Get journal — prefer stored journal_id from payment, fall back to code-based lookup
 		var journalID uuid.UUID
@@ -3088,7 +3100,10 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			).Scan(&journalID, &nextNumber, &numberPrefix)
 		}
 
-		if err == nil && journalID != uuid.Nil {
+		if journalID != uuid.Nil {
+			// Use a SAVEPOINT so that a JE failure doesn't poison the entire transaction
+			tx.Exec("SAVEPOINT create_payment_je")
+
 			prefix := ""
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
@@ -3116,7 +3131,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			description := fmt.Sprintf("Payment %s confirmed", paymentNumber)
 			journalEntryID := uuid.New()
 
-			_, err = tx.Exec(`
+			_, jeErr := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
@@ -3125,8 +3140,9 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				sourceType, id.String(), 1.0, amount, amount, userID, now, now,
 			)
 
-			if err != nil {
-				h.log.Error("Failed to create payment journal entry", "error", err)
+			if jeErr != nil {
+				h.log.Error("Failed to create payment journal entry, rolling back savepoint", "error", jeErr)
+				tx.Exec("ROLLBACK TO SAVEPOINT create_payment_je")
 			} else {
 				if paymentType == "receipt" {
 					// Receipt: Debit Cash, Credit AR
@@ -3187,6 +3203,8 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 				// Link journal entry to payment
 				tx.Exec("UPDATE payments SET journal_entry_id = $1 WHERE id = $2", journalEntryID, id)
+
+				tx.Exec("RELEASE SAVEPOINT create_payment_je")
 			}
 		} else {
 			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)
