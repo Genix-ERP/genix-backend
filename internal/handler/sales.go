@@ -1529,13 +1529,14 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 				date, scheduled_date, partner_id, source_document,
 				source_location_id, dest_location_id,
 				state, current_step, total_steps, priority,
+				source_type, source_id,
 				responsible_id, created_by, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,'delivery',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal',$13,$13,$14,$14)
+			) VALUES ($1,$2,$3,$4,$5,'delivery',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal','sales_order',$15,$13,$13,$14,$14)
 		`,
 			stockOpID, tenantID, organizationID, stockOpName, deliveryOpTypeID,
 			now, expectedDate, customerID, orderNumber,
 			deliverySrcLocID, deliveryDestLocID,
-			totalSteps, userID, now,
+			totalSteps, userID, now, orderID,
 		)
 		if stockOpErr != nil {
 			h.log.Error("Failed to create stock operation for SO delivery", "error", stockOpErr, "so_id", orderID)
