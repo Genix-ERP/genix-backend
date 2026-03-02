@@ -788,6 +788,17 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		args = append(args, *input.ShippingAmount)
 	}
 	if input.Status != nil {
+		// Block statuses that must go through dedicated endpoints
+		// approved → POST /:id/approve (creates stock operations)
+		// received → POST /:id/receive (updates inventory)
+		if *input.Status == "approved" {
+			response.BadRequest(c, "Use the approve endpoint to approve a purchase order")
+			return
+		}
+		if *input.Status == "received" {
+			response.BadRequest(c, "Use the receive endpoint to receive a purchase order")
+			return
+		}
 		argCount++
 		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
 		args = append(args, *input.Status)
@@ -826,276 +837,6 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		response.NotFound(c, "Purchase order")
 		return
 	}
-
-	// ============================================
-	// UPDATE INVENTORY WHEN PO STATUS → "received"
-	// ============================================
-	if input.Status != nil && *input.Status == "received" {
-		now := time.Now()
-
-		// Get PO warehouse_id and organization_id
-		var poWarehouseID sql.NullString
-		var poOrgID sql.NullString
-		h.db.QueryRow("SELECT warehouse_id, organization_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID, &poOrgID)
-
-		// Determine warehouse: PO warehouse → org's first warehouse → tenant's first warehouse
-		var warehouseID uuid.UUID
-		if poWarehouseID.Valid && poWarehouseID.String != "" {
-			warehouseID, _ = uuid.Parse(poWarehouseID.String)
-		} else if poOrgID.Valid && poOrgID.String != "" {
-			orgID, _ := uuid.Parse(poOrgID.String)
-			err := h.db.QueryRow(`
-				SELECT id FROM warehouses
-				WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
-				ORDER BY created_at ASC LIMIT 1
-			`, tenantID, orgID).Scan(&warehouseID)
-			if err != nil {
-				// Fallback to any warehouse in the tenant
-				err = h.db.QueryRow(`
-					SELECT id FROM warehouses
-					WHERE tenant_id = $1 AND deleted_at IS NULL
-					ORDER BY created_at ASC LIMIT 1
-				`, tenantID).Scan(&warehouseID)
-				if err != nil {
-					h.log.Error("No warehouse found for inventory update", "error", err)
-					response.Success(c, gin.H{"message": "Purchase order updated but no warehouse for inventory"})
-					return
-				}
-			}
-		} else {
-			err := h.db.QueryRow(`
-				SELECT id FROM warehouses
-				WHERE tenant_id = $1 AND deleted_at IS NULL
-				ORDER BY created_at ASC LIMIT 1
-			`, tenantID).Scan(&warehouseID)
-			if err != nil {
-				h.log.Error("No warehouse found for inventory update", "error", err)
-				response.Success(c, gin.H{"message": "Purchase order updated but no warehouse for inventory"})
-				return
-			}
-		}
-
-		// Get PO lines with product info
-		poLines, err := h.db.Query(`
-			SELECT id, product_id, quantity, unit_price
-			FROM purchase_order_lines
-			WHERE purchase_order_id = $1 AND product_id IS NOT NULL
-		`, id)
-		if err == nil {
-			defer poLines.Close()
-			for poLines.Next() {
-				var lineID, productID uuid.UUID
-				var qty, unitPrice float64
-				if err := poLines.Scan(&lineID, &productID, &qty, &unitPrice); err != nil {
-					continue
-				}
-
-				// Update quantity_received on PO line
-				h.db.Exec(`
-					UPDATE purchase_order_lines
-					SET quantity_received = quantity, updated_at = $1
-					WHERE id = $2
-				`, now, lineID)
-
-				// Get or create inventory record
-				var inventoryID uuid.UUID
-				err := h.db.QueryRow(`
-					SELECT id FROM inventory
-					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-					ORDER BY created_at ASC LIMIT 1
-				`, tenantID, productID, warehouseID).Scan(&inventoryID)
-
-				if err == sql.ErrNoRows {
-					inventoryID = uuid.New()
-					h.db.Exec(`
-						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-						VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $6)
-					`, inventoryID, tenantID, productID, warehouseID, unitPrice, now)
-				}
-
-				// Update inventory quantity
-				h.db.Exec(`
-					UPDATE inventory
-					SET quantity_on_hand = quantity_on_hand + $1,
-						unit_cost = $2,
-						last_movement_date = $3,
-						updated_at = $3
-					WHERE id = $4
-				`, qty, unitPrice, now, inventoryID)
-
-				// Create inventory transaction for audit trail
-				txID := uuid.New()
-				h.db.Exec(`
-					INSERT INTO inventory_transactions (
-						id, tenant_id, inventory_id, transaction_type, quantity,
-						unit_cost, total_cost, reference_type, reference_id,
-						reason, transaction_date, created_at
-					) VALUES ($1, $2, $3, 'receipt', $4, $5, $6, 'purchase_order', $7, 'Purchase Order Received', $8, $8)
-				`, txID, tenantID, inventoryID, qty, unitPrice, qty*unitPrice, id, now)
-			}
-		}
-
-		h.log.Info("Inventory updated from PO received", "po_id", id)
-
-		// ============================================
-		// CREATE JOURNAL ENTRY: Debit Stock Valuation, Credit Stock Interim Receipt (per category, Odoo-style)
-		// ============================================
-		var poTotal float64
-		var poNumber string
-		var poVendorName sql.NullString
-		var poVendorID sql.NullString
-		h.db.QueryRow(`
-			SELECT total_amount, order_number, c.name, po.vendor_id
-			FROM purchase_orders po
-			LEFT JOIN contacts c ON po.vendor_id = c.id
-			WHERE po.id = $1
-		`, id).Scan(&poTotal, &poNumber, &poVendorName, &poVendorID)
-
-		if poTotal > 0 {
-			var orgIDPtr *uuid.UUID
-			if poOrgID.Valid && poOrgID.String != "" {
-				parsed, _ := uuid.Parse(poOrgID.String)
-				if parsed != uuid.Nil {
-					orgIDPtr = &parsed
-				}
-			}
-
-			// Get PO lines with product info for per-category accounting
-			type poLineAcct struct {
-				ProductID  uuid.UUID
-				LineTotal  float64
-				ValuationAcct uuid.UUID
-				InputAcct     uuid.UUID
-			}
-			var poLines []poLineAcct
-			rows, err := h.db.Query(`
-				SELECT product_id, COALESCE(line_total, 0)
-				FROM purchase_order_lines
-				WHERE purchase_order_id = $1
-			`, id)
-			if err == nil {
-				for rows.Next() {
-					var pl poLineAcct
-					if err := rows.Scan(&pl.ProductID, &pl.LineTotal); err == nil && pl.LineTotal > 0 {
-						poLines = append(poLines, pl)
-					}
-				}
-				rows.Close()
-				// Resolve category accounts after closing rows
-				for i := range poLines {
-					ca := getCategoryAccounts(h.db, tenantID, orgIDPtr, poLines[i].ProductID)
-					poLines[i].ValuationAcct = ca.StockValuationAccountID
-					poLines[i].InputAcct = ca.StockInputAccountID
-				}
-			}
-
-			// Group by account pair to minimize JE lines
-			type acctPair struct {
-				Debit  uuid.UUID
-				Credit uuid.UUID
-			}
-			grouped := make(map[acctPair]float64)
-			for _, pl := range poLines {
-				key := acctPair{Debit: pl.ValuationAcct, Credit: pl.InputAcct}
-				grouped[key] += pl.LineTotal
-			}
-
-			// If no lines found, fall back to total with default accounts
-			if len(grouped) == 0 && poTotal > 0 {
-				valAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
-				if valAcct == uuid.Nil {
-					valAcct = findAccount(h.db, tenantID, orgIDPtr, "stock", "1300")
-				}
-				inputAcct := findAccount(h.db, tenantID, orgIDPtr, "stock interim receipt", "2200")
-				if inputAcct == uuid.Nil {
-					// If no interim account, fall back to AP directly (backward compat)
-					inputAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
-				}
-				if valAcct != uuid.Nil && inputAcct != uuid.Nil {
-					grouped[acctPair{Debit: valAcct, Credit: inputAcct}] = poTotal
-				}
-			}
-
-			if len(grouped) > 0 {
-				// Find purchase journal
-				var journalID uuid.UUID
-				var nextNumber int
-				err := h.db.QueryRow(`
-					SELECT id, next_number FROM journals
-					WHERE tenant_id = $1 AND type = 'purchase' AND is_active = true
-					ORDER BY created_at ASC LIMIT 1
-				`, tenantID).Scan(&journalID, &nextNumber)
-				if err != nil {
-					h.db.QueryRow(`
-						SELECT id, next_number FROM journals
-						WHERE tenant_id = $1 AND type = 'general' AND is_active = true
-						ORDER BY created_at ASC LIMIT 1
-					`, tenantID).Scan(&journalID, &nextNumber)
-				}
-
-				if journalID != uuid.Nil {
-					entryID := uuid.New()
-					entryNumber := fmt.Sprintf("PUR%06d", nextNumber)
-					vendorName := ""
-					if poVendorName.Valid {
-						vendorName = poVendorName.String
-					}
-					description := fmt.Sprintf("Purchase Order %s received - %s", poNumber, vendorName)
-
-					var contactID *uuid.UUID
-					if poVendorID.Valid {
-						parsed, _ := uuid.Parse(poVendorID.String)
-						if parsed != uuid.Nil {
-							contactID = &parsed
-						}
-					}
-
-					// Create journal entry header
-					h.db.Exec(`
-						INSERT INTO journal_entries (
-							id, tenant_id, organization_id, journal_id, entry_number,
-							entry_date, description, source_type, source_id, status, total_debit, total_credit,
-							created_at, updated_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'purchase_order', $8, 'posted', $9, $9, $10, $10)
-					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
-						now, description, id.String(), poTotal, now)
-
-					lineNumber := 1
-					for pair, amount := range grouped {
-						// Debit: Stock Valuation
-						debitLineID := uuid.New()
-						h.db.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, account_id, contact_id, description,
-								debit_amount, credit_amount, line_number, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
-						`, debitLineID, entryID, pair.Debit, contactID, "Stock Valuation", amount, lineNumber, now)
-						lineNumber++
-
-						// Credit: Stock Interim Receipt
-						creditLineID := uuid.New()
-						h.db.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, account_id, contact_id, description,
-								debit_amount, credit_amount, line_number, created_at
-							) VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)
-						`, creditLineID, entryID, pair.Credit, contactID, "Stock Interim Receipt", amount, lineNumber, now)
-						lineNumber++
-
-						// Update account balances
-						h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Debit)
-						h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Credit)
-					}
-
-					// Update journal next_number
-					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
-
-					h.log.Info("Journal entry created for PO received (Odoo-style)", "entry_id", entryID, "amount", poTotal)
-				}
-			}
-		}
-
-		}
 
 	response.Success(c, gin.H{"message": "Purchase order updated successfully"})
 }
@@ -1237,21 +978,15 @@ func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 
 	switch result.Action {
 	case entity.ActionAutoApprove:
-		// Auto-approve
-		query := `
-			UPDATE purchase_orders
-			SET status = $1, approved_by = $2, approved_at = $3, updated_at = $3
-			WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-		`
-		_, err = h.db.Exec(query, entity.POStatusApproved, userID, now, id, tenantID)
-		if err != nil {
+		// Auto-approve with stock operation creation
+		if err := h.approvePOAndCreateReceipt(tenantID, userID, id); err != nil {
 			h.log.Error("Failed to auto-approve purchase order", "error", err)
 			response.InternalError(c, "Failed to approve purchase order")
 			return
 		}
 		response.Success(c, gin.H{
-			"message":      "Purchase order auto-approved",
-			"status":       entity.POStatusApproved,
+			"message":       "Purchase order auto-approved",
+			"status":        entity.POStatusApproved,
 			"auto_approved": true,
 		})
 
@@ -1325,6 +1060,168 @@ func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 	}
 }
 
+// approvePOAndCreateReceipt is a shared helper that approves a PO and creates the stock receipt
+// operation in a single transaction. Used by both ApprovePurchaseOrder and SubmitPOForApproval (auto-approve).
+func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) error {
+	var orderNumber string
+	var vendorID uuid.UUID
+	var warehouseID *uuid.UUID
+	var orgID *uuid.UUID
+	var expectedDate *time.Time
+
+	err := h.db.QueryRow(`
+		SELECT order_number, vendor_id, warehouse_id, organization_id, expected_date
+		FROM purchase_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, poID, tenantID).Scan(&orderNumber, &vendorID, &warehouseID, &orgID, &expectedDate)
+	if err != nil {
+		return fmt.Errorf("failed to fetch PO details: %w", err)
+	}
+
+	now := time.Now()
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to start transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Update PO status to approved
+	_, err = tx.Exec(`
+		UPDATE purchase_orders
+		SET status = $1, approved_by = $2, approved_at = $3, updated_at = $3
+		WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
+	`, entity.POStatusApproved, userID, now, poID, tenantID)
+	if err != nil {
+		return fmt.Errorf("failed to approve PO: %w", err)
+	}
+
+	// Cancel any pending workflow for this document (non-critical, log errors)
+	if _, wfErr := tx.Exec(`
+		UPDATE approval_workflow_instances
+		SET status = 'cancelled', completed_at = $1, updated_at = $1
+		WHERE document_type = 'purchase_order' AND document_id = $2 AND status = 'pending'
+	`, now, poID); wfErr != nil {
+		h.log.Warn("Failed to cancel pending workflows", "error", wfErr)
+	}
+
+	// 2. Create stock operation (warehouse receipt) — like Odoo's _create_picking()
+	var opTypeID uuid.UUID
+	var srcLocID, destLocID *uuid.UUID
+
+	opTypeQuery := `
+		SELECT id, default_location_src_id, default_location_dest_id
+		FROM warehouse_operation_types
+		WHERE tenant_id = $1 AND direction = 'receipt' AND is_active = true
+	`
+	opTypeArgs := []interface{}{tenantID}
+
+	if warehouseID != nil {
+		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
+		opTypeArgs = append(opTypeArgs, *warehouseID)
+	} else {
+		opTypeQuery += " ORDER BY sequence LIMIT 1"
+	}
+
+	err = h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&opTypeID, &srcLocID, &destLocID)
+	if err != nil {
+		// No receipt operation type found — log warning but don't block approval
+		h.log.Warn("No receipt operation type found for stock operation creation",
+			"error", err, "tenant_id", tenantID, "warehouse_id", warehouseID)
+	}
+
+	if err == nil {
+		opID := uuid.New()
+		opName := h.nextStockOperationName(tenantID, "receipt")
+
+		var totalSteps int
+		h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2", opTypeID, tenantID).Scan(&totalSteps)
+		if totalSteps == 0 {
+			totalSteps = 1
+		}
+
+		_, err = tx.Exec(`
+			INSERT INTO stock_operations (
+				id, tenant_id, organization_id, name, operation_type_id, direction,
+				date, scheduled_date, partner_id, source_document,
+				source_location_id, dest_location_id,
+				state, current_step, total_steps, priority,
+				responsible_id, created_by, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,'receipt',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal',$13,$13,$14,$14)
+		`,
+			opID, tenantID, orgID, opName, opTypeID,
+			now, expectedDate, vendorID, orderNumber,
+			srcLocID, destLocID,
+			totalSteps, userID, now,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create stock operation: %w", err)
+		}
+
+		// 3. Create stock operation lines from PO lines
+		rows, err := h.db.Query(`
+			SELECT pol.product_id, pol.quantity, pol.unit_price,
+			       COALESCE(u.name, 'unit') as uom
+			FROM purchase_order_lines pol
+			LEFT JOIN units_of_measure u ON u.id = pol.unit_id
+			WHERE pol.purchase_order_id = $1 AND pol.product_id IS NOT NULL
+		`, poID)
+		if err != nil {
+			return fmt.Errorf("failed to fetch PO lines: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var productID uuid.UUID
+			var qty float64
+			var unitPrice float64
+			var uom string
+
+			if err := rows.Scan(&productID, &qty, &unitPrice, &uom); err != nil {
+				h.log.Error("Failed to scan PO line", "error", err)
+				continue
+			}
+
+			_, err = tx.Exec(`
+				INSERT INTO stock_operation_lines (
+					id, tenant_id, operation_id, product_id,
+					expected_qty, done_qty, uom, unit_price,
+					quality_status, created_at, updated_at
+				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,0,$5,$6,'good',$7,$7)
+			`,
+				tenantID, opID, productID,
+				qty, uom, unitPrice, now,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to create stock operation line for product %s: %w", productID, err)
+			}
+		}
+
+		// 4. Create initial step log entry (only if steps are configured)
+		var firstStep struct {
+			ID   uuid.UUID
+			Name string
+		}
+		stepErr := h.db.QueryRow(`
+			SELECT id, name FROM operation_type_steps
+			WHERE operation_type_id = $1 AND tenant_id = $2
+			ORDER BY sequence LIMIT 1
+		`, opTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name)
+		if stepErr == nil {
+			_, _ = tx.Exec(`
+				INSERT INTO stock_operation_step_log (
+					id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
+				) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
+			`, tenantID, opID, firstStep.ID, firstStep.Name, now)
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
 // ApprovePurchaseOrder approves a purchase order (direct approval by authorized user)
 // ApprovePurchaseOrder godoc
 // @Summary Approve purchase order
@@ -1356,18 +1253,11 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		return
 	}
 
-	// Fetch PO details needed for stock operation creation
+	// Check PO status
 	var currentStatus string
-	var orderNumber string
-	var vendorID uuid.UUID
-	var warehouseID *uuid.UUID
-	var orgID *uuid.UUID
-	var expectedDate *time.Time
-
 	err = h.db.QueryRow(`
-		SELECT status, order_number, vendor_id, warehouse_id, organization_id, expected_date
-		FROM purchase_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&currentStatus, &orderNumber, &vendorID, &warehouseID, &orgID, &expectedDate)
+		SELECT status FROM purchase_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&currentStatus)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase order")
 		return
@@ -1378,164 +1268,15 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		return
 	}
 
-	if currentStatus != string(entity.POStatusDraft) && currentStatus != string(entity.POStatusPendingApproval) {
+	if currentStatus != string(entity.POStatusDraft) &&
+		currentStatus != string(entity.POStatusPendingApproval) &&
+		currentStatus != string(entity.POStatusOrdered) {
 		response.BadRequest(c, "Order cannot be approved in current status")
 		return
 	}
 
-	now := time.Now()
-
-	// Start transaction — approval + stock operation creation must be atomic
-	tx, err := h.db.Begin()
-	if err != nil {
-		h.log.Error("Failed to start transaction", "error", err)
-		response.InternalError(c, "Failed to approve purchase order")
-		return
-	}
-	defer tx.Rollback()
-
-	// 1. Update PO status to approved
-	_, err = tx.Exec(`
-		UPDATE purchase_orders
-		SET status = $1, approved_by = $2, approved_at = $3, updated_at = $3
-		WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-	`, entity.POStatusApproved, userID, now, id, tenantID)
-	if err != nil {
+	if err := h.approvePOAndCreateReceipt(tenantID, userID, id); err != nil {
 		h.log.Error("Failed to approve purchase order", "error", err)
-		response.InternalError(c, "Failed to approve purchase order")
-		return
-	}
-
-	// Cancel any pending workflow for this document
-	_, _ = tx.Exec(`
-		UPDATE approval_workflow_instances
-		SET status = 'cancelled', completed_at = $1, updated_at = $1
-		WHERE document_type = 'purchase_order' AND document_id = $2 AND status = 'pending'
-	`, now, id)
-
-	// 2. Create stock operation (warehouse receipt) — like Odoo's _create_picking()
-	// Find the receipt operation type for the warehouse
-	var opTypeID uuid.UUID
-	var srcLocID, destLocID *uuid.UUID
-
-	opTypeQuery := `
-		SELECT id, default_location_src_id, default_location_dest_id
-		FROM warehouse_operation_types
-		WHERE tenant_id = $1 AND direction = 'receipt' AND is_active = true
-	`
-	opTypeArgs := []interface{}{tenantID}
-
-	if warehouseID != nil {
-		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
-		opTypeArgs = append(opTypeArgs, *warehouseID)
-	} else {
-		opTypeQuery += " ORDER BY sequence LIMIT 1"
-	}
-
-	err = h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&opTypeID, &srcLocID, &destLocID)
-	if err != nil {
-		// No receipt operation type found — log warning but don't block approval
-		h.log.Warn("No receipt operation type found for stock operation creation",
-			"error", err, "tenant_id", tenantID, "warehouse_id", warehouseID)
-	}
-
-	if err == nil {
-		// Operation type found — create the stock operation
-		opID := uuid.New()
-		opName := h.nextStockOperationName(tenantID, "receipt")
-
-		// Count steps configured for this operation type
-		var totalSteps int
-		h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2", opTypeID, tenantID).Scan(&totalSteps)
-		if totalSteps == 0 {
-			totalSteps = 1
-		}
-
-		_, err = tx.Exec(`
-			INSERT INTO stock_operations (
-				id, tenant_id, organization_id, name, operation_type_id, direction,
-				date, scheduled_date, partner_id, source_document,
-				source_location_id, dest_location_id,
-				state, current_step, total_steps, priority,
-				responsible_id, created_by, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,'receipt',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal',$13,$13,$14,$14)
-		`,
-			opID, tenantID, orgID, opName, opTypeID,
-			now, expectedDate, vendorID, orderNumber,
-			srcLocID, destLocID,
-			totalSteps, userID, now,
-		)
-		if err != nil {
-			h.log.Error("Failed to create stock operation for PO", "error", err, "po_id", id)
-			response.InternalError(c, "Failed to create warehouse receipt")
-			return
-		}
-
-		// 3. Create stock operation lines from PO lines
-		rows, err := h.db.Query(`
-			SELECT pol.product_id, pol.quantity, pol.unit_price,
-			       COALESCE(u.name, 'unit') as uom
-			FROM purchase_order_lines pol
-			LEFT JOIN units u ON u.id = pol.unit_id
-			WHERE pol.purchase_order_id = $1 AND pol.product_id IS NOT NULL
-		`, id)
-		if err != nil {
-			h.log.Error("Failed to fetch PO lines for stock operation", "error", err)
-			response.InternalError(c, "Failed to create warehouse receipt lines")
-			return
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var productID uuid.UUID
-			var qty float64
-			var unitPrice float64
-			var uom string
-
-			if err := rows.Scan(&productID, &qty, &unitPrice, &uom); err != nil {
-				h.log.Error("Failed to scan PO line", "error", err)
-				continue
-			}
-
-			_, err = tx.Exec(`
-				INSERT INTO stock_operation_lines (
-					id, tenant_id, operation_id, product_id,
-					expected_qty, done_qty, uom, unit_price,
-					quality_status, created_at, updated_at
-				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,0,$5,$6,'good',$7,$7)
-			`,
-				tenantID, opID, productID,
-				qty, uom, unitPrice, now,
-			)
-			if err != nil {
-				h.log.Error("Failed to create stock operation line", "error", err, "product_id", productID)
-			}
-		}
-
-		// 4. Create initial step log entry
-		firstStepName := "Step 1"
-		var firstStep struct {
-			ID   uuid.UUID
-			Name string
-		}
-		stepErr := h.db.QueryRow(`
-			SELECT id, name FROM operation_type_steps
-			WHERE operation_type_id = $1 AND tenant_id = $2
-			ORDER BY sequence LIMIT 1
-		`, opTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name)
-		if stepErr == nil {
-			firstStepName = firstStep.Name
-		}
-
-		_, _ = tx.Exec(`
-			INSERT INTO stock_operation_step_log (
-				id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
-			) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
-		`, tenantID, opID, firstStep.ID, firstStepName, now)
-	}
-
-	if err = tx.Commit(); err != nil {
-		h.log.Error("Failed to commit transaction", "error", err)
 		response.InternalError(c, "Failed to approve purchase order")
 		return
 	}

@@ -340,8 +340,13 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		stockOps.GET("/summary", h.GetStockOperationSummary)
 		stockOps.POST("", middleware.RequirePermission("inventory", "stock", "create"), h.CreateStockOperation)
 		stockOps.GET("/:id", h.GetStockOperation)
+		stockOps.PUT("/:id", middleware.RequirePermission("inventory", "stock", "update"), h.UpdateStockOperation)
+		stockOps.PUT("/:id/lines", middleware.RequirePermission("inventory", "stock", "update"), h.UpdateStockOperationLines)
+		stockOps.POST("/:id/lines", middleware.RequirePermission("inventory", "stock", "update"), h.AddStockOperationLine)
+		stockOps.DELETE("/:id/lines/:lineId", middleware.RequirePermission("inventory", "stock", "update"), h.DeleteStockOperationLine)
 		stockOps.POST("/:id/validate", middleware.RequirePermission("inventory", "stock", "update"), h.ValidateStockOperation)
 		stockOps.POST("/:id/advance", middleware.RequirePermission("inventory", "stock", "update"), h.AdvanceStockOperationStep)
+		stockOps.POST("/:id/backorder", middleware.RequirePermission("inventory", "stock", "create"), h.CreateBackorder)
 		stockOps.POST("/:id/cancel", middleware.RequirePermission("inventory", "stock", "update"), h.CancelStockOperation)
 	}
 

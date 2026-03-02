@@ -3350,6 +3350,22 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 
 				tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
 				tx.Exec("UPDATE scrap_orders SET journal_entry_id = $1 WHERE id = $2", entryID, orderID)
+
+				// TT 12.3: Scrap/write-offs affect budget
+				if scrapAcct != uuid.Nil && totalCost > 0 {
+					tx.Exec(`
+						UPDATE budget_lines bl
+						SET actual_amount = actual_amount + $1, updated_at = NOW()
+						FROM budgets b
+						WHERE bl.budget_id = b.id
+						  AND b.tenant_id = $2
+						  AND b.status = 'approved'
+						  AND b.deleted_at IS NULL
+						  AND bl.account_id = $3
+						  AND (b.start_date IS NULL OR b.start_date <= $4)
+						  AND (b.end_date IS NULL OR b.end_date >= $4)
+					`, totalCost, tenantID, scrapAcct, now)
+				}
 			}
 		}
 	}
@@ -5711,6 +5727,11 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		response.NotFound(c, "Stock operation")
 		return
 	}
+	if err != nil {
+		h.log.Error("Failed to query stock operation", "error", err)
+		response.InternalError(c, "Failed to query stock operation")
+		return
+	}
 	if op.State == "done" || op.State == "cancelled" {
 		response.BadRequest(c, "Operation is already "+op.State)
 		return
@@ -5846,6 +5867,23 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, creditAcct)
 						h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
 						h.db.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, id)
+
+						// TT 12.3: Write-offs affect budget — update budget_lines.actual_amount
+						// for the debit account (expense account) if tracked in an active budget
+						if direction == "write_off" && totalValue > 0 {
+							h.db.Exec(`
+								UPDATE budget_lines bl
+								SET actual_amount = actual_amount + $1, updated_at = NOW()
+								FROM budgets b
+								WHERE bl.budget_id = b.id
+								  AND b.tenant_id = $2
+								  AND b.status = 'approved'
+								  AND b.deleted_at IS NULL
+								  AND bl.account_id = $3
+								  AND (b.start_date IS NULL OR b.start_date <= $4)
+								  AND (b.end_date IS NULL OR b.end_date >= $4)
+							`, totalValue, tenantID, debitAcct, now)
+						}
 					}
 				}
 			}
@@ -5947,6 +5985,449 @@ func (h *Handler) ValidateStockOperation(c *gin.Context) {
 	h.db.Exec("UPDATE stock_operations SET state='in_progress', updated_at=$1 WHERE id=$2 AND tenant_id=$3", now, id, tenantID)
 
 	response.Success(c, map[string]string{"state": "in_progress"})
+}
+
+// UpdateStockOperation edits header fields of a draft stock operation
+func (h *Handler) UpdateStockOperation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var state string
+	err = h.db.QueryRow("SELECT state FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", id, tenantID).Scan(&state)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if state != "draft" {
+		response.BadRequest(c, "Only draft operations can be edited")
+		return
+	}
+
+	var input entity.UpdateStockOperationInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	now := time.Now()
+	sets := []string{"updated_at = $1"}
+	args := []interface{}{now}
+	idx := 2
+
+	if input.PartnerID != nil {
+		if *input.PartnerID == "" {
+			sets = append(sets, fmt.Sprintf("partner_id = NULL"))
+		} else {
+			pid, err := uuid.Parse(*input.PartnerID)
+			if err == nil {
+				sets = append(sets, fmt.Sprintf("partner_id = $%d", idx))
+				args = append(args, pid)
+				idx++
+			}
+		}
+	}
+	if input.SourceDocument != nil {
+		sets = append(sets, fmt.Sprintf("source_document = $%d", idx))
+		args = append(args, *input.SourceDocument)
+		idx++
+	}
+	if input.ScheduledDate != nil {
+		if *input.ScheduledDate == "" {
+			sets = append(sets, "scheduled_date = NULL")
+		} else {
+			sets = append(sets, fmt.Sprintf("scheduled_date = $%d", idx))
+			args = append(args, *input.ScheduledDate)
+			idx++
+		}
+	}
+	if input.Priority != nil {
+		sets = append(sets, fmt.Sprintf("priority = $%d", idx))
+		args = append(args, *input.Priority)
+		idx++
+	}
+	if input.Note != nil {
+		sets = append(sets, fmt.Sprintf("note = $%d", idx))
+		args = append(args, *input.Note)
+		idx++
+	}
+	if input.WriteOffReason != nil {
+		if *input.WriteOffReason == "" {
+			sets = append(sets, "write_off_reason = NULL")
+		} else {
+			sets = append(sets, fmt.Sprintf("write_off_reason = $%d", idx))
+			args = append(args, *input.WriteOffReason)
+			idx++
+		}
+	}
+
+	args = append(args, id, tenantID)
+	query := fmt.Sprintf("UPDATE stock_operations SET %s WHERE id=$%d AND tenant_id=$%d",
+		strings.Join(sets, ", "), idx, idx+1)
+
+	_, err = h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update stock operation", "error", err)
+		response.InternalError(c, "Failed to update stock operation")
+		return
+	}
+
+	response.Success(c, map[string]string{"status": "updated"})
+}
+
+// UpdateStockOperationLines batch updates done_qty and other fields on operation lines
+func (h *Handler) UpdateStockOperationLines(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	opID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var state string
+	err = h.db.QueryRow("SELECT state FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", opID, tenantID).Scan(&state)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if state == "done" || state == "cancelled" {
+		response.BadRequest(c, "Cannot update lines of a "+state+" operation")
+		return
+	}
+
+	var input entity.UpdateStockOperationLinesInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	now := time.Now()
+	for _, line := range input.Lines {
+		lineID, err := uuid.Parse(line.ID)
+		if err != nil {
+			continue
+		}
+
+		sets := []string{"updated_at = $1"}
+		args := []interface{}{now}
+		idx := 2
+
+		if line.DoneQty != nil {
+			sets = append(sets, fmt.Sprintf("done_qty = $%d", idx))
+			args = append(args, *line.DoneQty)
+			idx++
+		}
+		if line.LotNumber != nil {
+			sets = append(sets, fmt.Sprintf("lot_number = $%d", idx))
+			args = append(args, *line.LotNumber)
+			idx++
+		}
+		if line.QualityStatus != nil {
+			sets = append(sets, fmt.Sprintf("quality_status = $%d", idx))
+			args = append(args, *line.QualityStatus)
+			idx++
+		}
+		if line.UnitPrice != nil {
+			sets = append(sets, fmt.Sprintf("unit_price = $%d", idx))
+			args = append(args, *line.UnitPrice)
+			idx++
+		}
+		if line.Note != nil {
+			sets = append(sets, fmt.Sprintf("note = $%d", idx))
+			args = append(args, *line.Note)
+			idx++
+		}
+
+		if len(sets) <= 1 {
+			continue // nothing to update
+		}
+
+		args = append(args, lineID, opID, tenantID)
+		query := fmt.Sprintf("UPDATE stock_operation_lines SET %s WHERE id=$%d AND operation_id=$%d AND tenant_id=$%d",
+			strings.Join(sets, ", "), idx, idx+1, idx+2)
+		h.db.Exec(query, args...)
+	}
+
+	response.Success(c, map[string]string{"status": "updated"})
+}
+
+// AddStockOperationLine adds a new line to an existing stock operation
+func (h *Handler) AddStockOperationLine(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	opID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var state string
+	err = h.db.QueryRow("SELECT state FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", opID, tenantID).Scan(&state)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if state == "done" || state == "cancelled" {
+		response.BadRequest(c, "Cannot add lines to a "+state+" operation")
+		return
+	}
+
+	var input entity.AddStockOperationLineInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	productID, err := uuid.Parse(input.ProductID)
+	if err != nil {
+		response.BadRequest(c, "Invalid product_id")
+		return
+	}
+
+	uom := input.UOM
+	if uom == "" {
+		uom = "unit"
+	}
+	qs := input.QualityStatus
+	if qs == "" {
+		qs = "good"
+	}
+
+	now := time.Now()
+	lineID := uuid.New()
+	_, err = h.db.Exec(`
+		INSERT INTO stock_operation_lines (
+			id, tenant_id, operation_id, product_id,
+			expected_qty, done_qty, uom, unit_price,
+			lot_number, expiry_date, quality_status,
+			note, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,'')::date,$11,$12,$13,$13)
+	`,
+		lineID, tenantID, opID, productID,
+		input.ExpectedQty, input.DoneQty, uom, input.UnitPrice,
+		input.LotNumber, input.ExpiryDate, qs,
+		input.Note, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to add stock operation line", "error", err)
+		response.InternalError(c, "Failed to add line")
+		return
+	}
+
+	response.Created(c, map[string]interface{}{"id": lineID})
+}
+
+// DeleteStockOperationLine removes a line from a stock operation
+func (h *Handler) DeleteStockOperationLine(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	opID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid operation ID")
+		return
+	}
+
+	lineID, err := uuid.Parse(c.Param("lineId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid line ID")
+		return
+	}
+
+	var state string
+	err = h.db.QueryRow("SELECT state FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", opID, tenantID).Scan(&state)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if state == "done" || state == "cancelled" {
+		response.BadRequest(c, "Cannot delete lines from a "+state+" operation")
+		return
+	}
+
+	result, err := h.db.Exec("DELETE FROM stock_operation_lines WHERE id=$1 AND operation_id=$2 AND tenant_id=$3", lineID, opID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to delete line")
+		return
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Stock operation line")
+		return
+	}
+
+	response.Success(c, map[string]string{"status": "deleted"})
+}
+
+// CreateBackorder creates a new operation from unfulfilled lines (done_qty < expected_qty)
+func (h *Handler) CreateBackorder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	// Fetch the original operation
+	var op struct {
+		OperationTypeID uuid.UUID
+		Direction       string
+		PartnerID       *uuid.UUID
+		SourceDocument  string
+		Priority        string
+		Note            string
+		TotalSteps      int
+	}
+	err = h.db.QueryRow(`
+		SELECT operation_type_id, direction, partner_id, COALESCE(source_document,''),
+		       COALESCE(priority,'normal'), COALESCE(note,''), total_steps
+		FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&op.OperationTypeID, &op.Direction, &op.PartnerID,
+		&op.SourceDocument, &op.Priority, &op.Note, &op.TotalSteps)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+
+	// Find lines with remaining quantities
+	rows, err := h.db.Query(`
+		SELECT id, product_id, expected_qty, done_qty, uom, unit_price,
+		       COALESCE(lot_number,''), quality_status, COALESCE(note,'')
+		FROM stock_operation_lines
+		WHERE operation_id=$1 AND tenant_id=$2 AND expected_qty > done_qty
+	`, id, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch lines")
+		return
+	}
+	defer rows.Close()
+
+	type backorderLine struct {
+		ProductID     uuid.UUID
+		RemainingQty  float64
+		UOM           string
+		UnitPrice     *float64
+		LotNumber     string
+		QualityStatus string
+		Note          string
+	}
+	var lines []backorderLine
+	for rows.Next() {
+		var l backorderLine
+		var origID uuid.UUID
+		var expectedQty, doneQty float64
+		err = rows.Scan(&origID, &l.ProductID, &expectedQty, &doneQty, &l.UOM, &l.UnitPrice,
+			&l.LotNumber, &l.QualityStatus, &l.Note)
+		if err != nil {
+			continue
+		}
+		l.RemainingQty = expectedQty - doneQty
+		if l.RemainingQty > 0 {
+			lines = append(lines, l)
+		}
+	}
+
+	if len(lines) == 0 {
+		response.BadRequest(c, "No remaining quantities for backorder")
+		return
+	}
+
+	// Create backorder
+	backorderID := uuid.New()
+	name := h.nextStockOperationName(tenantID, op.Direction)
+	now := time.Now()
+
+	_, err = h.db.Exec(`
+		INSERT INTO stock_operations (
+			id, tenant_id, name, operation_type_id, direction,
+			date, partner_id, source_document,
+			state, current_step, total_steps, priority,
+			note, backorder_id, responsible_id,
+			created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'draft',1,$9,$10,$11,$12,$13,$14,$14)
+	`,
+		backorderID, tenantID, name, op.OperationTypeID, op.Direction,
+		now, op.PartnerID, op.SourceDocument,
+		op.TotalSteps, op.Priority,
+		op.Note, id, userID,
+		now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create backorder", "error", err)
+		response.InternalError(c, "Failed to create backorder")
+		return
+	}
+
+	// Create backorder lines
+	for _, l := range lines {
+		h.db.Exec(`
+			INSERT INTO stock_operation_lines (
+				id, tenant_id, operation_id, product_id,
+				expected_qty, done_qty, uom, unit_price,
+				lot_number, quality_status, note, created_at, updated_at
+			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,0,$5,$6,$7,$8,$9,$10,$10)
+		`,
+			tenantID, backorderID, l.ProductID,
+			l.RemainingQty, l.UOM, l.UnitPrice,
+			l.LotNumber, l.QualityStatus, l.Note, now,
+		)
+	}
+
+	// Create initial step log
+	firstStepName := "Step 1"
+	var firstStep struct {
+		ID   uuid.UUID
+		Name string
+	}
+	err = h.db.QueryRow(`
+		SELECT id, name FROM operation_type_steps
+		WHERE operation_type_id = $1 AND tenant_id = $2
+		ORDER BY sequence LIMIT 1
+	`, op.OperationTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name)
+	if err == nil {
+		firstStepName = firstStep.Name
+	}
+	h.db.Exec(`
+		INSERT INTO stock_operation_step_log (
+			id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
+		) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
+	`, tenantID, backorderID, firstStep.ID, firstStepName, now)
+
+	// Mark the original as having a backorder
+	h.db.Exec("UPDATE stock_operations SET backorder_id=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+		backorderID, now, id, tenantID)
+
+	response.Created(c, map[string]interface{}{
+		"id":   backorderID,
+		"name": name,
+	})
 }
 
 // ListOperationTypeSteps returns the steps configured for an operation type
