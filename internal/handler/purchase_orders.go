@@ -1145,13 +1145,14 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 				date, scheduled_date, partner_id, source_document,
 				source_location_id, dest_location_id,
 				state, current_step, total_steps, priority,
+				source_type, source_id,
 				responsible_id, created_by, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,'receipt',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal',$13,$13,$14,$14)
+			) VALUES ($1,$2,$3,$4,$5,'receipt',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal','purchase_order',$15,$13,$13,$14,$14)
 		`,
 			opID, tenantID, orgID, opName, opTypeID,
 			now, expectedDate, vendorID, orderNumber,
 			srcLocID, destLocID,
-			totalSteps, userID, now,
+			totalSteps, userID, now, poID,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to create stock operation: %w", err)
@@ -1398,6 +1399,34 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		h.log.Error("Failed to commit transaction", "error", err)
 		response.InternalError(c, "Failed to receive purchase order")
 		return
+	}
+
+	// Sync: mark linked stock operation as done when PO is fully received
+	if newStatus == entity.POStatusReceived {
+		var opID uuid.UUID
+		err := h.db.QueryRow(`
+			SELECT id FROM stock_operations
+			WHERE source_type = 'purchase_order' AND source_id = $1
+			  AND tenant_id = $2 AND state != 'done' AND state != 'cancelled'
+			  AND deleted_at IS NULL
+			ORDER BY created_at DESC LIMIT 1
+		`, id, tenantID).Scan(&opID)
+		if err == nil {
+			// Update operation lines done_qty from PO lines
+			h.db.Exec(`
+				UPDATE stock_operation_lines sol
+				SET done_qty = pol.quantity_received, updated_at = $1
+				FROM purchase_order_lines pol
+				WHERE sol.operation_id = $2 AND sol.tenant_id = $3
+				  AND sol.product_id = pol.product_id AND pol.purchase_order_id = $4
+			`, now, opID, tenantID, id)
+
+			h.db.Exec(`
+				UPDATE stock_operations
+				SET state = 'done', done_at = $1, updated_at = $1
+				WHERE id = $2 AND tenant_id = $3
+			`, now, opID, tenantID)
+		}
 	}
 
 	response.Success(c, gin.H{

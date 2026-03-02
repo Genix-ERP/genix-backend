@@ -1730,6 +1730,46 @@ func (h *Handler) RemoveJournalPaymentMethod(c *gin.Context) {
 	response.NoContent(c)
 }
 
+// UpdateJournalPaymentMethod updates the outstanding account on a journal payment method
+func (h *Handler) UpdateJournalPaymentMethod(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	pmID, err := uuid.Parse(c.Param("pmId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid payment method ID")
+		return
+	}
+
+	var input struct {
+		OutstandingAccountID *string `json:"outstanding_account_id"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	var outAccID interface{}
+	if input.OutstandingAccountID != nil && *input.OutstandingAccountID != "" {
+		outAccID = *input.OutstandingAccountID
+	}
+
+	_, err = h.db.Exec(`
+		UPDATE journal_payment_methods SET outstanding_account_id = $1
+		WHERE id = $2 AND tenant_id = $3
+	`, outAccID, pmID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to update journal payment method", "error", err)
+		response.InternalError(c, "Failed to update payment method")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Updated"})
+}
+
 // CreateJournalEntry creates a new journal entry
 // CreateJournalEntry godoc
 // @Summary Create a new journal entry
