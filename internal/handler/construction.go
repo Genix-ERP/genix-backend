@@ -323,6 +323,30 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 		return
 	}
 
+	// Auto-create analytic account for the project (best-effort)
+	go func() {
+		analyticID := uuid.New()
+		var orgVal interface{}
+		if orgID != uuid.Nil {
+			orgVal = orgID
+		}
+		_, insErr := h.db.Exec(`
+			INSERT INTO accounts (id, tenant_id, organization_id, code, name, description,
+			                      is_active, current_balance, opening_balance, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, true, 0, 0, NOW(), NOW())
+			ON CONFLICT DO NOTHING
+		`, analyticID, tenantID, orgVal,
+			fmt.Sprintf("CONST-%s", req.Code),
+			fmt.Sprintf("Qurilish: %s", req.Name),
+			fmt.Sprintf("Analytic account for construction project %s", req.Code),
+		)
+		if insErr != nil {
+			h.log.Error("Failed to create analytic account for project", "error", insErr, "project_id", projectID)
+			return
+		}
+		_, _ = h.db.Exec(`UPDATE construction_projects SET analytic_account_id = $1 WHERE id = $2`, analyticID, projectID)
+	}()
+
 	response.Success(c, map[string]interface{}{
 		"id":           projectID,
 		"code":         req.Code,
@@ -2955,7 +2979,7 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		var requestedBy, approvedBy uuid.NullUUID
 		var purchaseOrderID uuid.NullUUID
 		var approvalDate sql.NullTime
-		var items []byte
+		var items json.RawMessage
 		var createdDate, updatedDate time.Time
 		var requesterName, approverName string
 
@@ -3028,16 +3052,20 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	}
 
 	var req struct {
-		RequestNumber string `json:"request_number" binding:"required"`
-		RequestDate   string `json:"request_date" binding:"required"`
-		RequiredDate  string `json:"required_date"`
-		Items         string `json:"items"`
-		Notes         string `json:"notes"`
+		RequestDate  string      `json:"request_date" binding:"required"`
+		RequiredDate string      `json:"required_date"`
+		Items        interface{} `json:"items"`
+		Notes        string      `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
+
+	// Auto-generate request number: MR-{projectID}-{sequence}
+	var seqNum int64
+	h.db.QueryRow(`SELECT nextval('construction_material_request_seq')`).Scan(&seqNum)
+	requestNumber := fmt.Sprintf("MR-%d-%04d", projectID, seqNum)
 
 	requestDate, _ := time.Parse("2006-01-02", req.RequestDate)
 	var requiredDate interface{}
@@ -3046,18 +3074,26 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 		requiredDate = t
 	}
 
+	// Serialize items to JSON
+	itemsJSON := "[]"
+	if req.Items != nil {
+		if b, err := json.Marshal(req.Items); err == nil {
+			itemsJSON = string(b)
+		}
+	}
+
 	query := `
 		INSERT INTO construction_material_requests (
 			tenant_id, project_id, request_number, request_date, required_date,
 			items, notes, status, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($6, ''), '[]')::jsonb, $7, 'draft', NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft', NOW(), NOW())
 		RETURNING id
 	`
 
 	var requestID int64
 	err = h.db.QueryRow(query,
-		tenantID, projectID, req.RequestNumber, requestDate, requiredDate,
-		req.Items, nullString(req.Notes),
+		tenantID, projectID, requestNumber, requestDate, requiredDate,
+		itemsJSON, nullString(req.Notes),
 	).Scan(&requestID)
 	if err != nil {
 		h.log.Error("Failed to create material request", "error", err)
@@ -3066,8 +3102,9 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	}
 
 	response.Created(c, map[string]interface{}{
-		"id":      requestID,
-		"message": "Material request created successfully",
+		"id":             requestID,
+		"request_number": requestNumber,
+		"message":        "Material request created successfully",
 	})
 }
 
@@ -3101,30 +3138,37 @@ func (h *Handler) UpdateMaterialRequest(c *gin.Context) {
 	}
 
 	var req struct {
-		RequestNumber string `json:"request_number"`
-		RequestDate   string `json:"request_date"`
-		RequiredDate  string `json:"required_date"`
-		Items         string `json:"items"`
-		Notes         string `json:"notes"`
+		RequestDate  string      `json:"request_date"`
+		RequiredDate string      `json:"required_date"`
+		Items        interface{} `json:"items"`
+		Notes        string      `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
 		return
 	}
 
+	// Serialize items to JSON
+	itemsJSON := "[]"
+	if req.Items != nil {
+		if b, err := json.Marshal(req.Items); err == nil {
+			itemsJSON = string(b)
+		}
+	}
+
 	query := `
 		UPDATE construction_material_requests
-		SET request_number = COALESCE(NULLIF($1, ''), request_number),
-		    request_date = COALESCE(NULLIF($2, '')::date, request_date),
-		    required_date = NULLIF($3, '')::date,
+		SET request_date = COALESCE(NULLIF($1, '')::date, request_date),
+		    required_date = NULLIF($2, '')::date,
+		    items = $3::jsonb,
 		    notes = $4,
 		    updated_date = NOW()
 		WHERE id = $5 AND tenant_id = $6
 	`
 
 	result, err := h.db.Exec(query,
-		req.RequestNumber, req.RequestDate, req.RequiredDate,
-		nullString(req.Notes), requestID, tenantID,
+		req.RequestDate, req.RequiredDate,
+		itemsJSON, nullString(req.Notes), requestID, tenantID,
 	)
 	if err != nil {
 		h.log.Error("Failed to update material request", "error", err)
@@ -3187,6 +3231,332 @@ func (h *Handler) DeleteMaterialRequest(c *gin.Context) {
 
 	response.Success(c, map[string]interface{}{
 		"message": "Material request deleted successfully",
+	})
+}
+
+// ApproveMaterialRequest confirms a material request, decreases inventory, and records a construction expense
+// ApproveMaterialRequest godoc
+// @Summary Approve material request
+// @Description Approve a material request: decreases inventory quantities and records an expense in the construction budget
+// @Tags Construction
+// @Accept json
+// @Produce json
+// @Param id path int true "Request ID"
+// @Success 200 {object} response.Response
+// @Failure 400 {object} response.Response
+// @Failure 401 {object} response.Response
+// @Failure 404 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Security BearerAuth
+// @Router /construction/material-requests/{id}/approve [put]
+func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	organizationID, _ := middleware.GetOrganizationID(c)
+	userID, _ := middleware.GetUserID(c)
+
+	// Resolve employee ID for approved_by (FK references employees, not users)
+	var approverEmployeeID *uuid.UUID
+	if userID != uuid.Nil {
+		var empID uuid.UUID
+		if err := h.db.QueryRow(`SELECT id FROM employees WHERE user_id = $1 AND tenant_id = $2 LIMIT 1`, userID, tenantID).Scan(&empID); err == nil {
+			approverEmployeeID = &empID
+		}
+	}
+
+	requestID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid request ID")
+		return
+	}
+
+	// Load the material request
+	var projectID int64
+	var itemsRaw []byte
+	var status string
+	var expenseRecorded bool
+	err = h.db.QueryRow(`
+		SELECT project_id, items, status, COALESCE(expense_recorded, false)
+		FROM construction_material_requests
+		WHERE id = $1 AND tenant_id = $2
+	`, requestID, tenantID).Scan(&projectID, &itemsRaw, &status, &expenseRecorded)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Material request not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to load material request", "error", err)
+		response.InternalError(c, "Failed to load material request")
+		return
+	}
+
+	if status == "approved" {
+		response.BadRequest(c, "Material request is already approved")
+		return
+	}
+
+	// Parse items JSON
+	var items []map[string]interface{}
+	if err := json.Unmarshal(itemsRaw, &items); err != nil || len(items) == 0 {
+		response.BadRequest(c, "Material request has no items")
+		return
+	}
+
+	now := time.Now()
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to approve material request")
+		return
+	}
+	defer tx.Rollback()
+
+	var orgIDPtr *uuid.UUID
+	if organizationID != uuid.Nil {
+		orgIDPtr = &organizationID
+	}
+
+	// Find expense/COGS account and inventory journal
+	expenseAcct := findAccount(tx, tenantID, orgIDPtr, "construction expense", "7000")
+	if expenseAcct == uuid.Nil {
+		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "cost of goods", "5000")
+	}
+	if expenseAcct == uuid.Nil {
+		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "expense", "6000")
+	}
+
+	var journalID uuid.UUID
+	var nextNumber int
+	tx.QueryRow(`SELECT id, next_number FROM journals WHERE tenant_id = $1 AND code IN ('STOCK','INV','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INV' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+
+	var totalExpense float64
+
+	for index, item := range items {
+		// Extract fields from item
+		productIDStr, _ := item["product_id"].(string)
+		variantIDStr, _ := item["variant_id"].(string)
+		warehouseIDStr, _ := item["warehouse_id"].(string)
+
+		var qty float64
+		switch v := item["quantity"].(type) {
+		case float64:
+			qty = v
+		case json.Number:
+			qty, _ = v.Float64()
+		}
+		var unitCost float64
+		switch v := item["unit_cost"].(type) {
+		case float64:
+			unitCost = v
+		case json.Number:
+			unitCost, _ = v.Float64()
+		}
+
+		if productIDStr == "" || qty <= 0 {
+			continue
+		}
+
+		productID, err := uuid.Parse(productIDStr)
+		if err != nil {
+			continue
+		}
+
+		var variantID *uuid.UUID
+		if variantIDStr != "" {
+			vid, err := uuid.Parse(variantIDStr)
+			if err == nil {
+				variantID = &vid
+			}
+		}
+
+		var warehouseID uuid.UUID
+		if warehouseIDStr != "" {
+			warehouseID, _ = uuid.Parse(warehouseIDStr)
+		}
+		// If no warehouse specified, find best warehouse for this product/variant
+		if warehouseID == uuid.Nil {
+			if variantID != nil {
+				tx.QueryRow(`SELECT warehouse_id FROM inventory WHERE tenant_id = $1 AND product_id = $2 AND variant_id = $3 AND quantity_on_hand > 0 ORDER BY quantity_on_hand DESC LIMIT 1`, tenantID, productID, variantID).Scan(&warehouseID)
+			}
+			if warehouseID == uuid.Nil {
+				tx.QueryRow(`SELECT warehouse_id FROM inventory WHERE tenant_id = $1 AND product_id = $2 AND quantity_on_hand > 0 ORDER BY quantity_on_hand DESC LIMIT 1`, tenantID, productID).Scan(&warehouseID)
+			}
+		}
+
+		// Get unit_cost: prefer item value, then variant cost_price, then inventory unit_cost, then product cost_price
+		if unitCost == 0 && variantID != nil {
+			tx.QueryRow(`SELECT COALESCE(cost_price, 0) FROM product_variants WHERE id = $1`, variantID).Scan(&unitCost)
+		}
+		if unitCost == 0 {
+			if variantID != nil {
+				tx.QueryRow(`SELECT COALESCE(unit_cost, 0) FROM inventory WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3 AND variant_id = $4 LIMIT 1`, tenantID, productID, warehouseID, variantID).Scan(&unitCost)
+			} else {
+				tx.QueryRow(`SELECT COALESCE(unit_cost, 0) FROM inventory WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3 LIMIT 1`, tenantID, productID, warehouseID).Scan(&unitCost)
+			}
+		}
+		if unitCost == 0 {
+			tx.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, productID).Scan(&unitCost)
+		}
+
+		lineCost := qty * unitCost
+		totalExpense += lineCost
+
+		if warehouseID == uuid.Nil {
+			continue
+		}
+
+		// Decrease inventory quantity_on_hand (variant-aware)
+		if variantID != nil {
+			_, err = tx.Exec(`
+				UPDATE inventory
+				SET quantity_on_hand = quantity_on_hand - $1,
+				    last_movement_date = $2,
+				    updated_at = $2
+				WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5 AND variant_id = $6
+				  AND quantity_on_hand >= $1
+			`, qty, now, tenantID, productID, warehouseID, variantID)
+		} else {
+			_, err = tx.Exec(`
+				UPDATE inventory
+				SET quantity_on_hand = quantity_on_hand - $1,
+				    last_movement_date = $2,
+				    updated_at = $2
+				WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5
+				  AND COALESCE(variant_id::text,'') = ''
+				  AND quantity_on_hand >= $1
+			`, qty, now, tenantID, productID, warehouseID)
+		}
+		if err != nil {
+			h.log.Error("Failed to decrease inventory", "error", err, "product_id", productIDStr)
+		}
+
+		// Record inventory transaction (best-effort, use savepoint)
+		savepointName := fmt.Sprintf("sp_inv_%d", index)
+		tx.Exec(`SAVEPOINT ` + savepointName)
+		invTxID := uuid.New()
+		var invErr error
+		if variantID != nil {
+			_, invErr = tx.Exec(`
+				INSERT INTO inventory_transactions (
+					id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
+					unit_cost, total_cost, reason, notes, transaction_date, created_by, created_at, variant_id
+				)
+				SELECT $1, $2, $3, i.id, 'issue', $4, $5, $6,
+				       'construction_material_request', $7, $8, $9, $8, $10
+				FROM inventory i
+				WHERE i.tenant_id = $2 AND i.product_id = $11 AND i.warehouse_id = $12 AND i.variant_id = $10
+				LIMIT 1
+			`, invTxID, tenantID, organizationID, -qty, unitCost, lineCost,
+				fmt.Sprintf("Material Request #%d", requestID), now, userID, variantID, productID, warehouseID)
+		} else {
+			_, invErr = tx.Exec(`
+				INSERT INTO inventory_transactions (
+					id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
+					unit_cost, total_cost, reason, notes, transaction_date, created_by, created_at
+				)
+				SELECT $1, $2, $3, i.id, 'issue', $4, $5, $6,
+				       'construction_material_request', $7, $8, $9, $8
+				FROM inventory i
+				WHERE i.tenant_id = $2 AND i.product_id = $10 AND i.warehouse_id = $11
+				  AND COALESCE(i.variant_id::text,'') = ''
+				LIMIT 1
+			`, invTxID, tenantID, organizationID, -qty, unitCost, lineCost,
+				fmt.Sprintf("Material Request #%d", requestID), now, userID, productID, warehouseID)
+		}
+		if invErr != nil {
+			h.log.Error("inventory_transaction insert failed (rolled back to savepoint)", "error", invErr)
+			tx.Exec(`ROLLBACK TO SAVEPOINT ` + savepointName)
+		} else {
+			tx.Exec(`RELEASE SAVEPOINT ` + savepointName)
+		}
+
+		// Create journal entries (best-effort, use savepoint)
+		if expenseAcct != uuid.Nil && journalID != uuid.Nil && lineCost > 0 {
+			ca := getCategoryAccounts(tx, tenantID, orgIDPtr, productID)
+			if ca.StockValuationAccountID != uuid.Nil {
+				jSavepoint := fmt.Sprintf("sp_je_%d", index)
+				tx.Exec(`SAVEPOINT ` + jSavepoint)
+
+				entryID := uuid.New()
+				entryNumber := fmt.Sprintf("MR%06d", nextNumber)
+				nextNumber++
+
+				_, jeErr := tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number,
+						entry_date, description, source_type, source_id, status, total_debit, total_credit,
+						created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'material_request', $8, 'posted', $9, $9, $10, $10)
+				`, entryID, tenantID, organizationID, journalID, entryNumber,
+					now, fmt.Sprintf("Construction Material Request #%d", requestID),
+					nil, lineCost, now)
+
+				if jeErr != nil {
+					h.log.Error("journal_entry insert failed (rolled back to savepoint)", "error", jeErr)
+					tx.Exec(`ROLLBACK TO SAVEPOINT ` + jSavepoint)
+				} else {
+					debitLineID := uuid.New()
+					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
+						debitLineID, entryID, expenseAcct, "Construction Material Expense", lineCost, now)
+					creditLineID := uuid.New()
+					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
+						creditLineID, entryID, ca.StockValuationAccountID, "Stock Issued for Construction", lineCost, now)
+					tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, lineCost, now, expenseAcct)
+					tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, lineCost, now, ca.StockValuationAccountID)
+					tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+					tx.Exec(`RELEASE SAVEPOINT ` + jSavepoint)
+				}
+			}
+		}
+	}
+
+	// Record construction cost tracking entry (best-effort)
+	if totalExpense > 0 {
+		tx.Exec(`SAVEPOINT sp_cost`)
+		_, ctErr := tx.Exec(`
+			INSERT INTO construction_cost_tracking (
+				tenant_id, project_id, tracking_date, actual_cost, notes, created_date
+			) VALUES ($1, $2, $3, $4, $5, NOW())
+		`, tenantID, projectID, now.Format("2006-01-02"), totalExpense,
+			fmt.Sprintf("Material Request #%d approved", requestID))
+		if ctErr != nil {
+			h.log.Error("cost_tracking insert failed (rolled back to savepoint)", "error", ctErr)
+			tx.Exec(`ROLLBACK TO SAVEPOINT sp_cost`)
+		} else {
+			tx.Exec(`RELEASE SAVEPOINT sp_cost`)
+		}
+	}
+
+	// Mark request as approved
+	_, err = tx.Exec(`
+		UPDATE construction_material_requests
+		SET status = 'approved',
+		    approved_by = $1,
+		    approval_date = $2,
+		    expense_recorded = true,
+		    updated_date = $2
+		WHERE id = $3 AND tenant_id = $4
+	`, approverEmployeeID, now, requestID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to approve material request", "error", err)
+		response.InternalError(c, "Failed to approve material request")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to approve material request")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"message":       "Material request approved successfully",
+		"total_expense": totalExpense,
 	})
 }
 
@@ -3713,5 +4083,294 @@ func (h *Handler) DeleteConstructionTeamMember(c *gin.Context) {
 
 	response.Success(c, map[string]interface{}{
 		"message": "Team member removed successfully",
+	})
+}
+
+// =====================================================
+// PROJECT COMPLETION (COMMISSION) HANDLER
+// =====================================================
+
+// CommissionProject marks a project as completed and creates Dt 0100 / Kt 0810 journal entry
+func (h *Handler) CommissionProject(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	organizationID, _ := middleware.GetOrganizationID(c)
+	userID, _ := middleware.GetUserID(c)
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req struct {
+		CommissionDate      string `json:"commission_date"`
+		FixedAssetAccountID string `json:"fixed_asset_account_id"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
+	// Load project
+	var projStatus string
+	var analyticAccID *uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT COALESCE(status,'draft'), analytic_account_id
+		FROM construction_projects WHERE id = $1 AND tenant_id = $2
+	`, projectID, tenantID).Scan(&projStatus, &analyticAccID)
+	if err != nil {
+		response.NotFound(c, "Project not found")
+		return
+	}
+	if projStatus == "completed" {
+		response.BadRequest(c, "Project is already completed")
+		return
+	}
+
+	var orgIDPtr *uuid.UUID
+	if organizationID != uuid.Nil {
+		orgIDPtr = &organizationID
+	}
+
+	// Calculate total approved WIP expenses
+	var totalWIP float64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(amount), 0)
+		FROM construction_expense_lines
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'approved' AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&totalWIP)
+
+	// Resolve accounts
+	wipAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "wip_0810", "tugallanmagan qurilish", "0810")
+	faAcct := uuid.Nil
+	if req.FixedAssetAccountID != "" {
+		faAcct, _ = uuid.Parse(req.FixedAssetAccountID)
+	}
+	if faAcct == uuid.Nil {
+		faAcct = h.getConstructionMappedAccount(tenantID, orgIDPtr, "fixed_assets_0100", "asosiy vositalar", "0100")
+	}
+
+	commissionDate := req.CommissionDate
+	if commissionDate == "" {
+		commissionDate = time.Now().Format("2006-01-02")
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to commission project")
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	var commissionJEID *uuid.UUID
+
+	// Create Dt Fixed Assets / Kt WIP journal entry (best-effort)
+	if totalWIP > 0 && faAcct != uuid.Nil && wipAcct != uuid.Nil {
+		journalID := h.ensureConstructionJournal(tenantID, orgIDPtr)
+		if journalID != uuid.Nil {
+			tx.Exec(`SAVEPOINT sp_commission_je`)
+			nextNum := h.getNextJournalNumber(tx, journalID)
+			entryID := uuid.New()
+			entryNumber := fmt.Sprintf("COMM%06d", nextNum)
+			_, jeErr := tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number,
+					entry_date, description, source_type, source_id,
+					status, total_debit, total_credit, created_at, updated_at
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,'project_commission',NULL,'posted',$8,$8,$9,$9)
+			`, entryID, tenantID, organizationID, journalID, entryNumber,
+				now, fmt.Sprintf("Foydalanishga topshirish: project #%d", projectID),
+				totalWIP, now)
+			if jeErr != nil {
+				h.log.Error("Commission journal entry failed", "error", jeErr)
+				tx.Exec(`ROLLBACK TO SAVEPOINT sp_commission_je`)
+			} else {
+				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,$5,0,1,$6)`,
+					uuid.New(), entryID, faAcct, "Asset capitalization", totalWIP, now)
+				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
+					uuid.New(), entryID, wipAcct, "WIP cleared", totalWIP, now)
+				tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalWIP, now, faAcct)
+				tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalWIP, now, wipAcct)
+				tx.Exec(`RELEASE SAVEPOINT sp_commission_je`)
+				commissionJEID = &entryID
+			}
+		}
+	}
+
+	// Mark project as completed
+	faAcctVal := interface{}(nil)
+	if faAcct != uuid.Nil {
+		faAcctVal = faAcct
+	}
+	_, err = tx.Exec(`
+		UPDATE construction_projects
+		SET status = 'completed',
+		    commission_date = $1,
+		    fixed_asset_account_id = $2,
+		    commission_journal_entry_id = $3,
+		    updated_date = NOW()
+		WHERE id = $4 AND tenant_id = $5
+	`, commissionDate, faAcctVal, commissionJEID, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to update project status", "error", err)
+		response.InternalError(c, "Failed to commission project")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commission project")
+		return
+	}
+
+	h.logConstructionActivity(tenantID, projectID, userID, "project", fmt.Sprintf("Loyiha foydalanishga topshirildi (WIP: %.2f)", totalWIP), "Project", projectID)
+
+	result := map[string]interface{}{
+		"message":         "Project commissioned successfully",
+		"total_wip":       totalWIP,
+		"commission_date": commissionDate,
+	}
+	if commissionJEID != nil {
+		result["journal_entry_id"] = commissionJEID.String()
+	}
+	response.Success(c, result)
+}
+
+// =====================================================
+// PORTFOLIO DASHBOARD
+// =====================================================
+
+// GetConstructionPortfolioDashboard returns cross-project KPIs and chart data
+func (h *Handler) GetConstructionPortfolioDashboard(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// KPIs
+	var totalProjects, activeProjects, completedProjects int
+	var totalBudget, totalActual float64
+	_ = h.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status NOT IN ('completed','cancelled')),
+			COUNT(*) FILTER (WHERE status = 'completed'),
+			COALESCE(SUM(contract_amount), 0)
+		FROM construction_projects
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`, tenantID).Scan(&totalProjects, &activeProjects, &completedProjects, &totalBudget)
+
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(el.amount), 0)
+		FROM construction_expense_lines el
+		WHERE el.tenant_id = $1 AND el.status = 'approved' AND el.deleted_at IS NULL
+	`, tenantID).Scan(&totalActual)
+
+	var expensesThisMonth int
+	_ = h.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM construction_expense_lines
+		WHERE tenant_id = $1 AND status = 'approved' AND deleted_at IS NULL
+		  AND DATE_TRUNC('month', expense_date) = DATE_TRUNC('month', CURRENT_DATE)
+	`, tenantID).Scan(&expensesThisMonth)
+
+	// Chart data: budget vs actual per project
+	perProjectRows, err := h.db.Query(`
+		SELECT p.id, p.name, COALESCE(p.contract_amount, 0),
+		       COALESCE(SUM(CASE WHEN el.status='approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0)
+		FROM construction_projects p
+		LEFT JOIN construction_expense_lines el ON el.project_id = p.id AND el.tenant_id = p.tenant_id
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+		GROUP BY p.id, p.name, p.contract_amount
+		ORDER BY p.id DESC
+		LIMIT 20
+	`, tenantID)
+
+	type ProjectBar struct {
+		ID      int64   `json:"id"`
+		Name    string  `json:"name"`
+		Budget  float64 `json:"budget"`
+		Actual  float64 `json:"actual"`
+	}
+	perProject := []ProjectBar{}
+	if err == nil {
+		defer perProjectRows.Close()
+		for perProjectRows.Next() {
+			var pb ProjectBar
+			if err := perProjectRows.Scan(&pb.ID, &pb.Name, &pb.Budget, &pb.Actual); err == nil {
+				perProject = append(perProject, pb)
+			}
+		}
+	}
+
+	// Chart data: expenses by category
+	byCategoryRows, _ := h.db.Query(`
+		SELECT COALESCE(cat.name, 'Uncategorized'), COALESCE(SUM(el.amount), 0)
+		FROM construction_expense_lines el
+		LEFT JOIN construction_cost_categories cat ON cat.id = el.cost_category_id
+		WHERE el.tenant_id = $1 AND el.status = 'approved' AND el.deleted_at IS NULL
+		GROUP BY cat.name
+		ORDER BY SUM(el.amount) DESC
+	`, tenantID)
+
+	type CategorySlice struct {
+		Category string  `json:"category"`
+		Total    float64 `json:"total"`
+	}
+	byCategory := []CategorySlice{}
+	if byCategoryRows != nil {
+		defer byCategoryRows.Close()
+		for byCategoryRows.Next() {
+			var cs CategorySlice
+			if err := byCategoryRows.Scan(&cs.Category, &cs.Total); err == nil {
+				byCategory = append(byCategory, cs)
+			}
+		}
+	}
+
+	// Chart data: monthly expense dynamics (last 12 months)
+	monthlyRows, _ := h.db.Query(`
+		SELECT TO_CHAR(DATE_TRUNC('month', expense_date), 'YYYY-MM') AS month,
+		       COALESCE(SUM(amount), 0)
+		FROM construction_expense_lines
+		WHERE tenant_id = $1 AND status = 'approved' AND deleted_at IS NULL
+		  AND expense_date >= CURRENT_DATE - INTERVAL '12 months'
+		GROUP BY DATE_TRUNC('month', expense_date)
+		ORDER BY DATE_TRUNC('month', expense_date) ASC
+	`, tenantID)
+
+	type MonthlyData struct {
+		Month string  `json:"month"`
+		Total float64 `json:"total"`
+	}
+	monthly := []MonthlyData{}
+	if monthlyRows != nil {
+		defer monthlyRows.Close()
+		for monthlyRows.Next() {
+			var md MonthlyData
+			if err := monthlyRows.Scan(&md.Month, &md.Total); err == nil {
+				monthly = append(monthly, md)
+			}
+		}
+	}
+
+	response.Success(c, map[string]interface{}{
+		"kpis": map[string]interface{}{
+			"total_projects":      totalProjects,
+			"active_projects":     activeProjects,
+			"completed_projects":  completedProjects,
+			"total_budget":        totalBudget,
+			"total_actual":        totalActual,
+			"total_variance":      totalBudget - totalActual,
+			"expenses_this_month": expensesThisMonth,
+		},
+		"charts": map[string]interface{}{
+			"per_project": perProject,
+			"by_category": byCategory,
+			"monthly":     monthly,
+		},
 	})
 }
