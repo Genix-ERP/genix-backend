@@ -1391,6 +1391,198 @@ func (h *Handler) GetInventoryValuation(c *gin.Context) {
 	}, pagination)
 }
 
+// GetCOGSData returns real COGS data per product using actual sale quantities and purchase cost layers
+func (h *Handler) GetCOGSData(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// 1. Get sale quantities per product (from sales orders + POS orders)
+	type productCOGS struct {
+		ProductID   string  `json:"product_id"`
+		ProductCode string  `json:"product_code"`
+		ProductName string  `json:"product_name"`
+		CostPrice   float64 `json:"cost_price"`
+		SaleQty     float64 `json:"sale_qty"`
+		CostMethod  string  `json:"costing_method"`
+	}
+
+	rows, err := h.db.Query(`
+		SELECT p.id, COALESCE(p.code, ''), p.name, COALESCE(p.cost_price, 0),
+		       COALESCE(p.costing_method, 'fifo'),
+		       COALESCE(sales.qty, 0) + COALESCE(pos.qty, 0) as total_sold
+		FROM products p
+		LEFT JOIN (
+			SELECT sol.product_id, SUM(sol.quantity) as qty
+			FROM sales_order_lines sol
+			JOIN sales_orders so ON sol.sales_order_id = so.id
+			WHERE so.tenant_id = $1 AND so.deleted_at IS NULL
+			  AND so.status IN ('confirmed', 'processing', 'shipped', 'delivered')
+			GROUP BY sol.product_id
+		) sales ON sales.product_id = p.id
+		LEFT JOIN (
+			SELECT pol.product_id, SUM(pol.quantity) as qty
+			FROM pos_order_lines pol
+			JOIN pos_orders po ON pol.order_id = po.id
+			WHERE po.tenant_id = $1 AND po.status = 'completed'
+			GROUP BY pol.product_id
+		) pos ON pos.product_id = p.id
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL AND p.is_active = true
+		  AND (COALESCE(sales.qty, 0) + COALESCE(pos.qty, 0)) > 0
+		ORDER BY total_sold DESC
+		LIMIT 50
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to get COGS data", "error", err)
+		response.InternalError(c, "Failed to get COGS data")
+		return
+	}
+	defer rows.Close()
+
+	var products []productCOGS
+	var productIDs []uuid.UUID
+	for rows.Next() {
+		var p productCOGS
+		if err := rows.Scan(&p.ProductID, &p.ProductCode, &p.ProductName, &p.CostPrice, &p.CostMethod, &p.SaleQty); err != nil {
+			continue
+		}
+		products = append(products, p)
+		pid, _ := uuid.Parse(p.ProductID)
+		productIDs = append(productIDs, pid)
+	}
+
+	// 2. Get purchase cost layers per product (ordered by date for FIFO/LIFO)
+	type costLayer struct {
+		Qty       float64
+		UnitPrice float64
+	}
+	costLayers := make(map[string][]costLayer)
+
+	if len(productIDs) > 0 {
+		layerRows, err := h.db.Query(`
+			SELECT pol.product_id, pol.quantity, pol.unit_price
+			FROM purchase_order_lines pol
+			JOIN purchase_orders po ON pol.purchase_order_id = po.id
+			WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
+			  AND po.status IN ('approved', 'ordered', 'partial', 'received')
+			  AND pol.product_id IS NOT NULL
+			ORDER BY po.created_at ASC
+		`, tenantID)
+		if err == nil {
+			defer layerRows.Close()
+			for layerRows.Next() {
+				var prodID string
+				var qty, price float64
+				if err := layerRows.Scan(&prodID, &qty, &price); err == nil {
+					costLayers[prodID] = append(costLayers[prodID], costLayer{Qty: qty, UnitPrice: price})
+				}
+			}
+		}
+	}
+
+	// 3. Calculate FIFO, WAC, LIFO COGS per product
+	type cogsResult struct {
+		ProductID   string  `json:"product_id"`
+		ProductCode string  `json:"product_code"`
+		ProductName string  `json:"product_name"`
+		SaleQty     float64 `json:"sale_qty"`
+		CostMethod  string  `json:"costing_method"`
+		FIFOTotal   float64 `json:"fifo_total"`
+		FIFOUnit    float64 `json:"fifo_unit"`
+		WACTotal    float64 `json:"wac_total"`
+		WACUnit     float64 `json:"wac_unit"`
+		LIFOTotal   float64 `json:"lifo_total"`
+		LIFOUnit    float64 `json:"lifo_unit"`
+	}
+
+	results := make([]cogsResult, 0, len(products))
+	for _, p := range products {
+		layers := costLayers[p.ProductID]
+		r := cogsResult{
+			ProductID:   p.ProductID,
+			ProductCode: p.ProductCode,
+			ProductName: p.ProductName,
+			SaleQty:     p.SaleQty,
+			CostMethod:  p.CostMethod,
+		}
+
+		if len(layers) == 0 {
+			// No purchase layers — use product cost_price
+			r.FIFOTotal = p.CostPrice * p.SaleQty
+			r.FIFOUnit = p.CostPrice
+			r.WACTotal = p.CostPrice * p.SaleQty
+			r.WACUnit = p.CostPrice
+			r.LIFOTotal = p.CostPrice * p.SaleQty
+			r.LIFOUnit = p.CostPrice
+		} else {
+			// FIFO: consume from oldest layers first
+			remaining := p.SaleQty
+			fifoTotal := 0.0
+			for _, l := range layers {
+				if remaining <= 0 {
+					break
+				}
+				take := l.Qty
+				if take > remaining {
+					take = remaining
+				}
+				fifoTotal += take * l.UnitPrice
+				remaining -= take
+			}
+			// If sale qty exceeds all layers, use last known price for remainder
+			if remaining > 0 {
+				fifoTotal += remaining * layers[len(layers)-1].UnitPrice
+			}
+			r.FIFOTotal = fifoTotal
+			if p.SaleQty > 0 {
+				r.FIFOUnit = fifoTotal / p.SaleQty
+			}
+
+			// WAC: weighted average of all layers
+			totalQty := 0.0
+			totalCost := 0.0
+			for _, l := range layers {
+				totalQty += l.Qty
+				totalCost += l.Qty * l.UnitPrice
+			}
+			wacUnit := 0.0
+			if totalQty > 0 {
+				wacUnit = totalCost / totalQty
+			}
+			r.WACUnit = wacUnit
+			r.WACTotal = wacUnit * p.SaleQty
+
+			// LIFO: consume from newest layers first
+			remaining = p.SaleQty
+			lifoTotal := 0.0
+			for i := len(layers) - 1; i >= 0; i-- {
+				if remaining <= 0 {
+					break
+				}
+				take := layers[i].Qty
+				if take > remaining {
+					take = remaining
+				}
+				lifoTotal += take * layers[i].UnitPrice
+				remaining -= take
+			}
+			if remaining > 0 {
+				lifoTotal += remaining * layers[0].UnitPrice
+			}
+			r.LIFOTotal = lifoTotal
+			if p.SaleQty > 0 {
+				r.LIFOUnit = lifoTotal / p.SaleQty
+			}
+		}
+
+		results = append(results, r)
+	}
+
+	response.Success(c, results)
+}
+
 // =====================================================
 // BILL OF MATERIALS (BOM) HANDLERS
 // =====================================================
@@ -5718,11 +5910,13 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		TotalSteps  int
 		State       string
 		OpTypeID    uuid.UUID
+		SourceType  *string
+		SourceID    *uuid.UUID
 	}
 	err = h.db.QueryRow(`
-		SELECT current_step, total_steps, state, operation_type_id
+		SELECT current_step, total_steps, state, operation_type_id, source_type, source_id
 		FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&op.CurrentStep, &op.TotalSteps, &op.State, &op.OpTypeID)
+	`, id, tenantID).Scan(&op.CurrentStep, &op.TotalSteps, &op.State, &op.OpTypeID, &op.SourceType, &op.SourceID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Stock operation")
 		return
@@ -5887,6 +6081,54 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					}
 				}
 			}
+		}
+
+		// Sync: when a receipt operation from a PO completes, mark PO as received
+		if op.SourceType != nil && *op.SourceType == "purchase_order" && op.SourceID != nil && *op.SourceID != uuid.Nil {
+			// Update PO line quantities from operation lines
+			opLines, _ := h.db.Query(`
+				SELECT sol.product_id, sol.done_qty
+				FROM stock_operation_lines sol
+				WHERE sol.operation_id = $1 AND sol.tenant_id = $2 AND sol.done_qty > 0
+			`, id, tenantID)
+			if opLines != nil {
+				defer opLines.Close()
+				for opLines.Next() {
+					var prodID uuid.UUID
+					var doneQty float64
+					if err := opLines.Scan(&prodID, &doneQty); err == nil {
+						h.db.Exec(`
+							UPDATE purchase_order_lines
+							SET quantity_received = $1, updated_at = $2
+							WHERE purchase_order_id = $3 AND product_id = $4
+						`, doneQty, now, *op.SourceID, prodID)
+					}
+				}
+			}
+
+			// Check if PO is fully received
+			var totalQty, totalReceived float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(quantity), 0), COALESCE(SUM(quantity_received), 0)
+				FROM purchase_order_lines WHERE purchase_order_id = $1
+			`, *op.SourceID).Scan(&totalQty, &totalReceived)
+
+			poStatus := "partial"
+			if totalReceived >= totalQty {
+				poStatus = "received"
+			}
+			h.db.Exec(`
+				UPDATE purchase_orders SET status = $1, updated_at = $2
+				WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+			`, poStatus, now, *op.SourceID, tenantID)
+		}
+
+		// Sync: when a delivery operation from a SO completes, mark SO as delivered
+		if op.SourceType != nil && *op.SourceType == "sales_order" && op.SourceID != nil && *op.SourceID != uuid.Nil {
+			h.db.Exec(`
+				UPDATE sales_orders SET status = 'delivered', updated_at = $1
+				WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status != 'delivered'
+			`, now, *op.SourceID, tenantID)
 		}
 	} else {
 		newState = "in_progress"

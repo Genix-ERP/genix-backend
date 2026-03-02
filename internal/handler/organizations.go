@@ -1054,7 +1054,91 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 	}
 
 	h.log.Info("Created default journals", "tenant_id", tenantID, "org_id", orgID, "journal_count", len(defaultJournals))
+
+	// Seed default payment methods and link to cash/bank journals
+	h.createDefaultPaymentMethods(tenantID, orgID)
+
 	return nil
+}
+
+// createDefaultPaymentMethods seeds payment methods and links them to cash/bank journals
+func (h *Handler) createDefaultPaymentMethods(tenantID, orgID uuid.UUID) {
+	now := time.Now()
+
+	defaultPMs := []struct {
+		code    string
+		name    string
+		pmType  string
+	}{
+		{"CASH", "Cash", "cash"},
+		{"BANK", "Bank Transfer", "bank_transfer"},
+		{"CARD", "Credit Card", "credit_card"},
+		{"CHECK", "Check", "check"},
+	}
+
+	// Find a default account for payment methods (cash account 1000)
+	var cashAccountID *uuid.UUID
+	var acctID uuid.UUID
+	if err := h.db.QueryRow(`
+		SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code = '1000' AND deleted_at IS NULL
+	`, tenantID, orgID).Scan(&acctID); err == nil {
+		cashAccountID = &acctID
+	}
+
+	pmIDs := make(map[string]uuid.UUID)
+	for _, pm := range defaultPMs {
+		id := uuid.New()
+		_, err := h.db.Exec(`
+			INSERT INTO payment_methods (id, tenant_id, code, name, type, account_id, is_active, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, true, $7)
+			ON CONFLICT (tenant_id, code) DO UPDATE SET name = EXCLUDED.name
+			RETURNING id
+		`, id, tenantID, pm.code, pm.name, pm.pmType, cashAccountID, now)
+		if err != nil {
+			h.log.Error("Failed to create payment method", "error", err, "code", pm.code)
+			continue
+		}
+		// Get the actual ID (in case of conflict/update)
+		h.db.QueryRow("SELECT id FROM payment_methods WHERE tenant_id = $1 AND code = $2", tenantID, pm.code).Scan(&id)
+		pmIDs[pm.code] = id
+	}
+
+	// Link payment methods to cash and bank journals
+	type journalPMLink struct {
+		journalCode string
+		pmCode      string
+		direction   string
+	}
+	links := []journalPMLink{
+		{"CASH", "CASH", "inbound"},
+		{"CASH", "CASH", "outbound"},
+		{"BANK", "BANK", "inbound"},
+		{"BANK", "BANK", "outbound"},
+		{"BANK", "CARD", "inbound"},
+		{"BANK", "CHECK", "inbound"},
+		{"BANK", "CHECK", "outbound"},
+	}
+
+	for _, link := range links {
+		pmID, ok := pmIDs[link.pmCode]
+		if !ok {
+			continue
+		}
+		var journalID uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT id FROM journals WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL
+		`, tenantID, link.journalCode).Scan(&journalID); err != nil {
+			continue
+		}
+
+		h.db.Exec(`
+			INSERT INTO journal_payment_methods (id, tenant_id, journal_id, payment_method_id, direction, name, is_active, created_at)
+			VALUES (gen_random_uuid(), $1, $2, $3, $4, '', true, $5)
+			ON CONFLICT (journal_id, payment_method_id, direction) DO NOTHING
+		`, tenantID, journalID, pmID, link.direction, now)
+	}
+
+	h.log.Info("Created default payment methods", "tenant_id", tenantID, "count", len(defaultPMs))
 }
 
 // createIntercompanyContacts sets up intercompany vendor/client relationships.

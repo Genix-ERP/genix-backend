@@ -318,6 +318,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.POST("/transfer", middleware.RequirePermission("inventory", "stock", "transfer"), h.TransferInventory)
 		inventory.GET("/movements", h.ListInventoryMovements)
 		inventory.GET("/valuation", h.GetInventoryValuation)
+		inventory.GET("/cogs", h.GetCOGSData)
 	}
 
 	// Stock Counts (Inventarizatsiya)
@@ -892,12 +893,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		journalGroup.DELETE("/:id", middleware.RequirePermission("finance", "journal", "delete"), h.DeleteJournal)
 		journalGroup.GET("/:id/payment-methods", h.ListJournalPaymentMethods)
 		journalGroup.POST("/:id/payment-methods", middleware.RequirePermission("finance", "journal", "update"), h.AddJournalPaymentMethod)
+		journalGroup.PUT("/:id/payment-methods/:pmId", middleware.RequirePermission("finance", "journal", "update"), h.UpdateJournalPaymentMethod)
 		journalGroup.DELETE("/:id/payment-methods/:pmId", middleware.RequirePermission("finance", "journal", "update"), h.RemoveJournalPaymentMethod)
 	}
 
 	// Payment Methods
 	paymentMethodsGroup := rg.Group("/payment-methods")
-	paymentMethodsGroup.Use(middleware.RequirePermission("finance", "payment", "read"))
 	{
 		paymentMethodsGroup.GET("", h.ListPaymentMethods)
 	}
