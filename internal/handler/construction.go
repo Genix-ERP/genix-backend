@@ -82,6 +82,13 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND cp.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if status != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND cp.status = $%d", argCount)

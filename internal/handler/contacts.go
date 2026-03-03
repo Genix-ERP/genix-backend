@@ -50,7 +50,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		SELECT c.id, c.tenant_id, c.type, c.code, c.name, c.legal_name, c.tax_id,
 			   c.registration_number, c.industry, c.website, c.email, c.phone, c.fax,
 			   c.billing_address, c.shipping_address, c.payment_terms, c.credit_limit,
-			   c.current_balance, c.currency_id, c.tax_exempt, c.tags, c.notes,
+			   c.current_balance, c.currency_id, c.tax_exempt, c.tags, c.notes, c.expected_revenue,
 			   c.custom_fields, c.is_active, c.created_by, c.created_at, c.updated_at,
 			   COALESCE(sp.avg_rating, 0) AS avg_rating,
 			   COALESCE(sp.rating_count, 0) AS rating_count
@@ -135,12 +135,13 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		var billingAddr, shippingAddr, tags, customFields []byte
 		var avgRating float64
 		var ratingCount int
+		var expectedRevenue sql.NullFloat64
 
 		err := rows.Scan(
 			&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
 			&regNum, &industry, &website, &email, &phone, &fax,
 			&billingAddr, &shippingAddr, &ct.PaymentTerms, &ct.CreditLimit,
-			&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes,
+			&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes, &expectedRevenue,
 			&customFields, &ct.IsActive, &createdBy, &ct.CreatedAt, &ct.UpdatedAt,
 			&avgRating, &ratingCount,
 		)
@@ -213,6 +214,12 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		// Set industry
 		if industry.Valid {
 			resp.Industry = &industry.String
+		}
+		if notes.Valid {
+			resp.Notes = &notes.String
+		}
+		if expectedRevenue.Valid {
+			resp.ExpectedRevenue = &expectedRevenue.Float64
 		}
 
 		contacts = append(contacts, resp)
@@ -339,9 +346,9 @@ func (h *Handler) CreateContact(c *gin.Context) {
 			id, tenant_id, organization_id, type, code, name, legal_name, tax_id,
 			registration_number, industry, website, email, phone, fax,
 			billing_address, shipping_address, payment_terms, credit_limit,
-			current_balance, tax_exempt, tags, notes, custom_fields,
+			current_balance, tax_exempt, tags, notes, expected_revenue, custom_fields,
 			is_active, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 		RETURNING id
 	`
 
@@ -349,7 +356,7 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		id, tenantID, orgIDPtr, input.Type, input.Code, input.Name, legalName, taxID,
 		regNum, industry, website, email, phone, fax,
 		billingAddr, shippingAddr, input.PaymentTerms, input.CreditLimit,
-		0, input.TaxExempt, tags, notes, customFields,
+		0, input.TaxExempt, tags, notes, input.ExpectedRevenue, customFields,
 		true, userID, now, now,
 	).Scan(&id)
 
@@ -385,6 +392,10 @@ func (h *Handler) CreateContact(c *gin.Context) {
 	if len(input.Tags) > 0 {
 		resp.Tags = input.Tags
 	}
+	resp.Notes = notes
+	if input.ExpectedRevenue != nil {
+		resp.ExpectedRevenue = input.ExpectedRevenue
+	}
 
 	response.Created(c, resp)
 }
@@ -408,7 +419,7 @@ func (h *Handler) GetContact(c *gin.Context) {
 		SELECT id, tenant_id, type, code, name, legal_name, tax_id,
 			   registration_number, industry, website, email, phone, fax,
 			   billing_address, shipping_address, payment_terms, credit_limit,
-			   current_balance, currency_id, tax_exempt, tags, notes,
+			   current_balance, currency_id, tax_exempt, tags, notes, expected_revenue,
 			   custom_fields, is_active, created_by, created_at, updated_at
 		FROM contacts
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
@@ -418,12 +429,13 @@ func (h *Handler) GetContact(c *gin.Context) {
 	var legalName, taxID, regNum, industry, website, email, phone, fax, notes sql.NullString
 	var currencyID, createdBy sql.NullString
 	var billingAddr, shippingAddr, tags, customFields []byte
+	var expectedRevenue sql.NullFloat64
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
 		&regNum, &industry, &website, &email, &phone, &fax,
 		&billingAddr, &shippingAddr, &ct.PaymentTerms, &ct.CreditLimit,
-		&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes,
+		&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes, &expectedRevenue,
 		&customFields, &ct.IsActive, &createdBy, &ct.CreatedAt, &ct.UpdatedAt,
 	)
 
@@ -491,6 +503,12 @@ func (h *Handler) GetContact(c *gin.Context) {
 	// Set industry
 	if industry.Valid {
 		resp.Industry = &industry.String
+	}
+	if notes.Valid {
+		resp.Notes = &notes.String
+	}
+	if expectedRevenue.Valid {
+		resp.ExpectedRevenue = &expectedRevenue.Float64
 	}
 
 	response.Success(c, resp)
@@ -598,6 +616,11 @@ func (h *Handler) UpdateContact(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
 		args = append(args, *input.Notes)
+	}
+	if input.ExpectedRevenue != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("expected_revenue = $%d", argCount))
+		args = append(args, *input.ExpectedRevenue)
 	}
 	if input.IsActive != nil {
 		argCount++
