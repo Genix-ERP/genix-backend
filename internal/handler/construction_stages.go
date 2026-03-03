@@ -263,6 +263,224 @@ func (h *Handler) UpdateConstructionStage(c *gin.Context) {
 	response.Success(c, map[string]interface{}{"id": id, "message": "Stage updated successfully"})
 }
 
+// =====================================================
+// CONSTRUCTION SUB-STAGES HANDLERS
+// =====================================================
+
+// ListConstructionSubStages returns all sub-stages for a stage
+func (h *Handler) ListConstructionSubStages(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	stageID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid stage ID")
+		return
+	}
+
+	type SubStage struct {
+		ID       int64     `json:"id"`
+		StageID  int64     `json:"stage_id"`
+		Name     string    `json:"name"`
+		SubOrder int       `json:"sub_order"`
+		Status   string    `json:"status"`
+		Notes    *string   `json:"notes"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, stage_id, name, sub_order, status, notes, created_at, updated_at
+		FROM construction_sub_stages
+		WHERE stage_id = $1 AND tenant_id = $2
+		ORDER BY sub_order ASC, id ASC
+	`, stageID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list sub-stages", "error", err)
+		response.InternalError(c, "Failed to list sub-stages")
+		return
+	}
+	defer rows.Close()
+
+	subStages := []SubStage{}
+	for rows.Next() {
+		var s SubStage
+		if err := rows.Scan(&s.ID, &s.StageID, &s.Name, &s.SubOrder, &s.Status, &s.Notes, &s.CreatedAt, &s.UpdatedAt); err != nil {
+			continue
+		}
+		subStages = append(subStages, s)
+	}
+
+	response.Success(c, subStages)
+}
+
+// CreateConstructionSubStage creates a new sub-stage for a stage
+func (h *Handler) CreateConstructionSubStage(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	stageID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid stage ID")
+		return
+	}
+
+	var req struct {
+		Name     string `json:"name" binding:"required"`
+		SubOrder int    `json:"sub_order"`
+		Status   string `json:"status"`
+		Notes    string `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	if req.Status == "" {
+		req.Status = "not_started"
+	}
+
+	var id int64
+	err = h.db.QueryRow(`
+		INSERT INTO construction_sub_stages (tenant_id, stage_id, name, sub_order, status, notes, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+		RETURNING id
+	`, tenantID, stageID, req.Name, req.SubOrder, req.Status, nullStringFromVal(req.Notes)).Scan(&id)
+	if err != nil {
+		h.log.Error("Failed to create sub-stage", "error", err)
+		response.InternalError(c, "Failed to create sub-stage")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{"id": id, "message": "Sub-stage created successfully"})
+}
+
+// UpdateConstructionSubStage updates an existing sub-stage
+func (h *Handler) UpdateConstructionSubStage(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var req struct {
+		Name     *string `json:"name"`
+		SubOrder *int    `json:"sub_order"`
+		Status   *string `json:"status"`
+		Notes    *string `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	addField := func(col string, val interface{}) {
+		argCount++
+		updates = append(updates, fmt.Sprintf("%s = $%d", col, argCount))
+		args = append(args, val)
+	}
+
+	if req.Name != nil {
+		addField("name", *req.Name)
+	}
+	if req.SubOrder != nil {
+		addField("sub_order", *req.SubOrder)
+	}
+	if req.Status != nil {
+		addField("status", *req.Status)
+	}
+	if req.Notes != nil {
+		if *req.Notes == "" {
+			addField("notes", nil)
+		} else {
+			addField("notes", *req.Notes)
+		}
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(
+		"UPDATE construction_sub_stages SET %s WHERE id = $%d AND tenant_id = $%d",
+		strings.Join(updates, ", "), argCount-1, argCount,
+	)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update sub-stage", "error", err)
+		response.InternalError(c, "Failed to update sub-stage")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Sub-stage not found")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{"id": id, "message": "Sub-stage updated successfully"})
+}
+
+// DeleteConstructionSubStage deletes a sub-stage
+func (h *Handler) DeleteConstructionSubStage(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	result, err := h.db.Exec(
+		`DELETE FROM construction_sub_stages WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to delete sub-stage", "error", err)
+		response.InternalError(c, "Failed to delete sub-stage")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Sub-stage not found")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{"message": "Sub-stage deleted successfully"})
+}
+
 // DeleteConstructionStage deletes a stage (only if no expense lines linked)
 func (h *Handler) DeleteConstructionStage(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
