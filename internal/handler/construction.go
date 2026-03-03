@@ -1671,6 +1671,14 @@ func nullUUIDValue(nu uuid.NullUUID) interface{} {
 	return nil
 }
 
+// bytesToRawJSON returns nil if bytes is empty/nil, otherwise json.RawMessage to embed as JSON
+func bytesToRawJSON(b []byte) interface{} {
+	if len(b) == 0 {
+		return nil
+	}
+	return json.RawMessage(b)
+}
+
 // Helper functions for creating sql.Null* types
 func nullString(s string) sql.NullString {
 	if s == "" {
@@ -2500,6 +2508,7 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		       dr.weather_morning, dr.weather_afternoon, dr.temperature_min, dr.temperature_max,
 		       dr.work_summary, dr.issues_encountered, dr.safety_notes,
 		       dr.workers_count, dr.workers_details, dr.equipment_used, dr.materials_received, dr.visitors,
+		       COALESCE(dr.photos, '[]'::jsonb),
 		       dr.reported_by, dr.verified_by, dr.verification_status,
 		       dr.created_date, dr.updated_date,
 		       COALESCE(e.first_name || ' ' || e.last_name, '') as reporter_name,
@@ -2527,8 +2536,8 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		var weatherMorning, weatherAfternoon, workSummary, issuesEncountered, safetyNotes, verificationStatus sql.NullString
 		var tempMin, tempMax sql.NullFloat64
 		var workersCount int
-		var workersDetails, equipmentUsed, materialsReceived, visitors []byte
-		var reportedBy, verifiedBy uuid.NullUUID
+		var workersDetails, equipmentUsed, materialsReceived, visitors, photos []byte
+		var reportedBy, verifiedBy sql.NullString
 		var createdDate, updatedDate time.Time
 		var reporterName, verifierName string
 
@@ -2537,13 +2546,15 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 			&weatherMorning, &weatherAfternoon, &tempMin, &tempMax,
 			&workSummary, &issuesEncountered, &safetyNotes,
 			&workersCount, &workersDetails, &equipmentUsed, &materialsReceived, &visitors,
+			&photos,
 			&reportedBy, &verifiedBy, &verificationStatus,
 			&createdDate, &updatedDate,
 			&reporterName, &verifierName,
 		); err != nil {
-			h.log.Error("Failed to scan daily report", "error", err)
+			h.log.Error("Failed to scan daily report", "error", err, "id", id)
 			continue
 		}
+		h.log.Info("Scanned daily report", "id", id, "date", reportDate)
 
 		reports = append(reports, map[string]interface{}{
 			"id":                  id,
@@ -2558,12 +2569,13 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 			"issues_encountered":  nullStringValue(issuesEncountered),
 			"safety_notes":        nullStringValue(safetyNotes),
 			"workers_count":       workersCount,
-			"workers_details":     workersDetails,
-			"equipment_used":      equipmentUsed,
-			"materials_received":  materialsReceived,
-			"visitors":            visitors,
-			"reported_by":         nullUUIDValue(reportedBy),
-			"verified_by":         nullUUIDValue(verifiedBy),
+			"workers_details":     bytesToRawJSON(workersDetails),
+			"equipment_used":      bytesToRawJSON(equipmentUsed),
+			"materials_received":  bytesToRawJSON(materialsReceived),
+			"visitors":            bytesToRawJSON(visitors),
+			"photos":              bytesToRawJSON(photos),
+			"reported_by":         nullStringValue(reportedBy),
+			"verified_by":         nullStringValue(verifiedBy),
 			"verification_status": nullStringValue(verificationStatus),
 			"created_date":        createdDate,
 			"updated_date":        updatedDate,
@@ -2572,6 +2584,7 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		})
 	}
 
+	h.log.Info("Daily reports result", "project_id", projectID, "count", len(reports))
 	response.Success(c, reports)
 }
 
@@ -2617,8 +2630,8 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 			weather_morning, weather_afternoon, temperature_min, temperature_max,
 			work_summary, issues_encountered, safety_notes,
 			workers_count, workers_details, equipment_used, materials_received, visitors,
-			reported_by, verification_status, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', NOW(), NOW())
+			photos, reported_by, verification_status, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', NOW(), NOW())
 		RETURNING id
 	`
 
@@ -2639,6 +2652,11 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 	if req.Visitors != "" {
 		visitorsJSON = fmt.Sprintf(`[{"visitor": %q}]`, req.Visitors)
 	}
+	photosJSON := "[]"
+	if len(req.Photos) > 0 {
+		photosBytes, _ := json.Marshal(req.Photos)
+		photosJSON = string(photosBytes)
+	}
 
 	var reportID int64
 	err = h.db.QueryRow(query,
@@ -2646,6 +2664,7 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 		nullString(req.WeatherMorning), nullString(req.WeatherAfternoon), nullFloat64(req.TemperatureMin), nullFloat64(req.TemperatureMax),
 		nullString(req.WorkSummary), nullString(req.IssuesEncountered), nullString(req.SafetyNotes),
 		req.WorkersCount, workersDetailsJSON, equipmentUsedJSON, materialsReceivedJSON, visitorsJSON,
+		photosJSON,
 		nil, // reported_by
 	).Scan(&reportID)
 	if err != nil {
@@ -2793,18 +2812,19 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 	}
 
 	var req struct {
-		ReportDate        string  `json:"report_date"`
-		WeatherMorning    string  `json:"weather_morning"`
-		WeatherAfternoon  string  `json:"weather_afternoon"`
-		TemperatureMin    float64 `json:"temperature_min"`
-		TemperatureMax    float64 `json:"temperature_max"`
-		WorkSummary       string  `json:"work_summary"`
-		IssuesEncountered string  `json:"issues_encountered"`
-		SafetyNotes       string  `json:"safety_notes"`
-		WorkersCount      int     `json:"workers_count"`
-		WorkersDetails    string  `json:"workers_details"`
-		EquipmentUsed     string  `json:"equipment_used"`
-		MaterialsReceived string  `json:"materials_received"`
+		ReportDate        string                   `json:"report_date"`
+		WeatherMorning    string                   `json:"weather_morning"`
+		WeatherAfternoon  string                   `json:"weather_afternoon"`
+		TemperatureMin    float64                  `json:"temperature_min"`
+		TemperatureMax    float64                  `json:"temperature_max"`
+		WorkSummary       string                   `json:"work_summary"`
+		IssuesEncountered string                   `json:"issues_encountered"`
+		SafetyNotes       string                   `json:"safety_notes"`
+		WorkersCount      int                      `json:"workers_count"`
+		WorkersDetails    string                   `json:"workers_details"`
+		EquipmentUsed     string                   `json:"equipment_used"`
+		MaterialsReceived string                   `json:"materials_received"`
+		Photos            []map[string]interface{} `json:"photos"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
@@ -2825,8 +2845,9 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 		    workers_details = COALESCE(NULLIF($10, ''), '[]')::jsonb,
 		    equipment_used = COALESCE(NULLIF($11, ''), '[]')::jsonb,
 		    materials_received = COALESCE(NULLIF($12, ''), '[]')::jsonb,
+		    photos = $13::jsonb,
 		    updated_date = NOW()
-		WHERE id = $13 AND tenant_id = $14
+		WHERE id = $14 AND tenant_id = $15
 	`
 
 	// Convert string fields to JSON for JSONB columns
@@ -2842,13 +2863,20 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 	if req.MaterialsReceived != "" {
 		materialsReceivedJSON = fmt.Sprintf(`[{"materials": %q}]`, req.MaterialsReceived)
 	}
+	photosJSON := "[]"
+	if len(req.Photos) > 0 {
+		photosBytes, err := json.Marshal(req.Photos)
+		if err == nil {
+			photosJSON = string(photosBytes)
+		}
+	}
 
 	result, err := h.db.Exec(query,
 		req.ReportDate, nullString(req.WeatherMorning), nullString(req.WeatherAfternoon),
 		req.TemperatureMin, req.TemperatureMax,
 		nullString(req.WorkSummary), nullString(req.IssuesEncountered), nullString(req.SafetyNotes),
 		req.WorkersCount, workersDetailsJSON, equipmentUsedJSON, materialsReceivedJSON,
-		reportID, tenantID,
+		photosJSON, reportID, tenantID,
 	)
 	if err != nil {
 		h.log.Error("Failed to update daily report", "error", err)

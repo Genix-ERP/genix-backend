@@ -86,17 +86,24 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 
 	// Data query
 	query := `
-		SELECT d.id, d.tenant_id, d.project_id, d.building_id, d.wbs_id,
+		SELECT d.id, d.tenant_id, d.project_id, d.building_id, d.stage_id, d.wbs_id,
 		       d.date, d.quantity_done, d.uom, d.cumulative_qty,
-		       d.workers_count, d.weather, d.description, d.issues,
+		       d.workers_count, d.expected_budget, d.weather, d.description, d.issues,
 		       d.reported_by, d.created_date, d.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name,
 		       COALESCE(b.name, '') as building_name,
+		       COALESCE(s.name, '') as stage_name,
+		       COALESCE(
+		           (SELECT ROUND(COUNT(*) FILTER (WHERE ss.status = 'completed') * 100.0 / NULLIF(COUNT(*), 0), 1)
+		            FROM construction_sub_stages ss WHERE ss.stage_id = d.stage_id AND ss.tenant_id = d.tenant_id),
+		           CASE WHEN s.status = 'completed' THEN 100 ELSE 0 END
+		       ) as stage_progress,
 		       COALESCE(u.first_name || ' ' || u.last_name, '') as reported_name
 		FROM construction_daily_log d
 		LEFT JOIN construction_wbs w ON w.id = d.wbs_id
 		LEFT JOIN construction_buildings b ON b.id = d.building_id
+		LEFT JOIN construction_stages s ON s.id = d.stage_id
 		LEFT JOIN users u ON u.id = d.reported_by
 		WHERE d.project_id = $1 AND d.tenant_id = $2
 	`
@@ -141,11 +148,11 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 	for rows.Next() {
 		var item entity.ConstructionDailyLog
 		if err := rows.Scan(
-			&item.ID, &item.TenantID, &item.ProjectID, &item.BuildingID, &item.WBSID,
+			&item.ID, &item.TenantID, &item.ProjectID, &item.BuildingID, &item.StageID, &item.WBSID,
 			&item.Date, &item.QuantityDone, &item.UOM, &item.CumulativeQty,
-			&item.WorkersCount, &item.Weather, &item.Description, &item.Issues,
+			&item.WorkersCount, &item.ExpectedBudget, &item.Weather, &item.Description, &item.Issues,
 			&item.ReportedBy, &item.CreatedDate, &item.UpdatedDate,
-			&item.WBSCode, &item.WBSName, &item.BuildingName, &item.ReportedName,
+			&item.WBSCode, &item.WBSName, &item.BuildingName, &item.StageName, &item.StageProgress, &item.ReportedName,
 		); err != nil {
 			h.log.Error("Failed to scan daily log", "error", err)
 			continue
@@ -197,15 +204,15 @@ func (h *Handler) CreateConstructionDailyLog(c *gin.Context) {
 	var logID int64
 	err = h.db.QueryRow(`
 		INSERT INTO construction_daily_log (
-			tenant_id, project_id, building_id, wbs_id,
-			date, quantity_done, uom, workers_count,
+			tenant_id, project_id, building_id, stage_id, wbs_id,
+			date, quantity_done, uom, workers_count, expected_budget,
 			weather, description, issues,
 			reported_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
 		RETURNING id
-	`, tenantID, projectID, nullInt64FromVal(req.BuildingID),
+	`, tenantID, projectID, nullInt64FromVal(req.BuildingID), nullInt64FromVal(req.StageID),
 		req.WBSID, req.Date, req.QuantityDone, uom,
-		req.WorkersCount, nullStringFromVal(req.Weather),
+		req.WorkersCount, req.ExpectedBudget, nullStringFromVal(req.Weather),
 		nullStringFromVal(req.Description), nullStringFromVal(req.Issues),
 		userID,
 	).Scan(&logID)
@@ -271,6 +278,15 @@ func (h *Handler) UpdateConstructionDailyLog(c *gin.Context) {
 			args = append(args, *req.BuildingID)
 		}
 	}
+	if req.StageID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("stage_id = $%d", argCount))
+		if *req.StageID == 0 {
+			args = append(args, nil)
+		} else {
+			args = append(args, *req.StageID)
+		}
+	}
 	if req.WBSID != nil {
 		argCount++
 		updates = append(updates, fmt.Sprintf("wbs_id = $%d", argCount))
@@ -295,6 +311,11 @@ func (h *Handler) UpdateConstructionDailyLog(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("workers_count = $%d", argCount))
 		args = append(args, *req.WorkersCount)
+	}
+	if req.ExpectedBudget != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("expected_budget = $%d", argCount))
+		args = append(args, *req.ExpectedBudget)
 	}
 	if req.Weather != nil {
 		argCount++

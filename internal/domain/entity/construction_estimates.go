@@ -206,6 +206,7 @@ type ConstructionDailyLog struct {
 	TenantID   uuid.UUID     `json:"tenant_id" db:"tenant_id"`
 	ProjectID  int64         `json:"project_id" db:"project_id"`
 	BuildingID sql.NullInt64 `json:"building_id" db:"building_id"`
+	StageID    sql.NullInt64 `json:"stage_id" db:"stage_id"`
 	WBSID      int64         `json:"wbs_id" db:"wbs_id"`
 
 	Date          time.Time `json:"date" db:"date"`
@@ -213,10 +214,11 @@ type ConstructionDailyLog struct {
 	UOM           string    `json:"uom" db:"uom"`
 	CumulativeQty float64   `json:"cumulative_qty" db:"cumulative_qty"`
 
-	WorkersCount int            `json:"workers_count" db:"workers_count"`
-	Weather      sql.NullString `json:"weather" db:"weather"`
-	Description  sql.NullString `json:"description" db:"description"`
-	Issues       sql.NullString `json:"issues" db:"issues"`
+	WorkersCount   int            `json:"workers_count" db:"workers_count"`
+	ExpectedBudget float64        `json:"expected_budget" db:"expected_budget"`
+	Weather        sql.NullString `json:"weather" db:"weather"`
+	Description    sql.NullString `json:"description" db:"description"`
+	Issues         sql.NullString `json:"issues" db:"issues"`
 
 	ReportedBy uuid.NullUUID `json:"reported_by" db:"reported_by"`
 
@@ -224,10 +226,12 @@ type ConstructionDailyLog struct {
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
 
 	// Computed
-	WBSCode      string `json:"wbs_code,omitempty" db:"wbs_code"`
-	WBSName      string `json:"wbs_name,omitempty" db:"wbs_name"`
-	BuildingName string `json:"building_name,omitempty" db:"building_name"`
-	ReportedName string `json:"reported_name,omitempty" db:"reported_name"`
+	WBSCode       string  `json:"wbs_code,omitempty" db:"wbs_code"`
+	WBSName       string  `json:"wbs_name,omitempty" db:"wbs_name"`
+	BuildingName  string  `json:"building_name,omitempty" db:"building_name"`
+	StageName     string  `json:"stage_name,omitempty" db:"stage_name"`
+	StageProgress float64 `json:"stage_progress" db:"stage_progress"`
+	ReportedName  string  `json:"reported_name,omitempty" db:"reported_name"`
 }
 
 func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
@@ -236,13 +240,15 @@ func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
 		TenantID      uuid.UUID   `json:"tenant_id"`
 		ProjectID     int64       `json:"project_id"`
 		BuildingID    interface{} `json:"building_id"`
+		StageID       interface{} `json:"stage_id"`
 		WBSID         int64       `json:"wbs_id"`
 		Date          time.Time   `json:"date"`
 		QuantityDone  float64     `json:"quantity_done"`
 		UOM           string      `json:"uom"`
 		CumulativeQty float64     `json:"cumulative_qty"`
-		WorkersCount  int         `json:"workers_count"`
-		Weather       interface{} `json:"weather"`
+		WorkersCount   int         `json:"workers_count"`
+		ExpectedBudget float64     `json:"expected_budget"`
+		Weather        interface{} `json:"weather"`
 		Description   interface{} `json:"description"`
 		Issues        interface{} `json:"issues"`
 		ReportedBy    interface{} `json:"reported_by"`
@@ -251,19 +257,23 @@ func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
 		WBSCode       string      `json:"wbs_code,omitempty"`
 		WBSName       string      `json:"wbs_name,omitempty"`
 		BuildingName  string      `json:"building_name,omitempty"`
+		StageName     string      `json:"stage_name,omitempty"`
+		StageProgress float64     `json:"stage_progress"`
 		ReportedName  string      `json:"reported_name,omitempty"`
 	}{
 		ID:            d.ID,
 		TenantID:      d.TenantID,
 		ProjectID:     d.ProjectID,
 		BuildingID:    nullInt64Value(d.BuildingID),
+		StageID:       nullInt64Value(d.StageID),
 		WBSID:         d.WBSID,
 		Date:          d.Date,
 		QuantityDone:  d.QuantityDone,
 		UOM:           d.UOM,
 		CumulativeQty: d.CumulativeQty,
-		WorkersCount:  d.WorkersCount,
-		Weather:       nullStringValue(d.Weather),
+		WorkersCount:   d.WorkersCount,
+		ExpectedBudget: d.ExpectedBudget,
+		Weather:        nullStringValue(d.Weather),
 		Description:   nullStringValue(d.Description),
 		Issues:        nullStringValue(d.Issues),
 		ReportedBy:    nullUUIDValue(d.ReportedBy),
@@ -272,30 +282,36 @@ func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
 		WBSCode:       d.WBSCode,
 		WBSName:       d.WBSName,
 		BuildingName:  d.BuildingName,
+		StageName:     d.StageName,
+		StageProgress: d.StageProgress,
 		ReportedName:  d.ReportedName,
 	})
 }
 
 type CreateDailyLogInput struct {
-	BuildingID   int64   `json:"building_id"`
-	WBSID        int64   `json:"wbs_id" binding:"required"`
-	Date         string  `json:"date" binding:"required"`
-	QuantityDone float64 `json:"quantity_done" binding:"required"`
-	UOM          string  `json:"uom"`
-	WorkersCount int     `json:"workers_count"`
-	Weather      string  `json:"weather"`
-	Description  string  `json:"description"`
-	Issues       string  `json:"issues"`
+	BuildingID     int64   `json:"building_id"`
+	StageID        int64   `json:"stage_id"`
+	WBSID          int64   `json:"wbs_id" binding:"required"`
+	Date           string  `json:"date" binding:"required"`
+	QuantityDone   float64 `json:"quantity_done" binding:"required"`
+	UOM            string  `json:"uom"`
+	WorkersCount   int     `json:"workers_count"`
+	ExpectedBudget float64 `json:"expected_budget"`
+	Weather        string  `json:"weather"`
+	Description    string  `json:"description"`
+	Issues         string  `json:"issues"`
 }
 
 type UpdateDailyLogInput struct {
-	BuildingID   *int64   `json:"building_id"`
-	WBSID        *int64   `json:"wbs_id"`
-	Date         *string  `json:"date"`
-	QuantityDone *float64 `json:"quantity_done"`
-	UOM          *string  `json:"uom"`
-	WorkersCount *int     `json:"workers_count"`
-	Weather      *string  `json:"weather"`
-	Description  *string  `json:"description"`
-	Issues       *string  `json:"issues"`
+	BuildingID     *int64   `json:"building_id"`
+	StageID        *int64   `json:"stage_id"`
+	WBSID          *int64   `json:"wbs_id"`
+	Date           *string  `json:"date"`
+	QuantityDone   *float64 `json:"quantity_done"`
+	UOM            *string  `json:"uom"`
+	WorkersCount   *int     `json:"workers_count"`
+	ExpectedBudget *float64 `json:"expected_budget"`
+	Weather        *string  `json:"weather"`
+	Description    *string  `json:"description"`
+	Issues         *string  `json:"issues"`
 }

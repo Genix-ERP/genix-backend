@@ -871,8 +871,9 @@ type CreateDailyReportInput struct {
 	WorkersDetails    string `json:"workers_details"`
 	EquipmentUsed     string `json:"equipment_used"`
 	MaterialsReceived string `json:"materials_received"`
-	Visitors          string `json:"visitors"`
-	ReportedBy        int64  `json:"reported_by"`
+	Visitors          string                   `json:"visitors"`
+	ReportedBy        int64                    `json:"reported_by"`
+	Photos            []map[string]interface{} `json:"photos"`
 }
 
 // =====================================================
