@@ -86,12 +86,10 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 
 	// Data query
 	query := `
-		SELECT d.id, d.tenant_id, d.project_id, d.building_id, d.stage_id, d.wbs_id,
-		       d.date, d.quantity_done, d.uom, d.cumulative_qty,
+		SELECT d.id, d.tenant_id, d.project_id, d.building_id, d.stage_id,
+		       d.date, d.end_date,
 		       d.workers_count, d.expected_budget, d.weather, d.description, d.issues,
 		       d.reported_by, d.created_date, d.updated_date,
-		       COALESCE(w.code, '') as wbs_code,
-		       COALESCE(w.name, '') as wbs_name,
 		       COALESCE(b.name, '') as building_name,
 		       COALESCE(s.name, '') as stage_name,
 		       COALESCE(
@@ -101,7 +99,6 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 		       ) as stage_progress,
 		       COALESCE(u.first_name || ' ' || u.last_name, '') as reported_name
 		FROM construction_daily_log d
-		LEFT JOIN construction_wbs w ON w.id = d.wbs_id
 		LEFT JOIN construction_buildings b ON b.id = d.building_id
 		LEFT JOIN construction_stages s ON s.id = d.stage_id
 		LEFT JOIN users u ON u.id = d.reported_by
@@ -148,11 +145,11 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 	for rows.Next() {
 		var item entity.ConstructionDailyLog
 		if err := rows.Scan(
-			&item.ID, &item.TenantID, &item.ProjectID, &item.BuildingID, &item.StageID, &item.WBSID,
-			&item.Date, &item.QuantityDone, &item.UOM, &item.CumulativeQty,
+			&item.ID, &item.TenantID, &item.ProjectID, &item.BuildingID, &item.StageID,
+			&item.Date, &item.EndDate,
 			&item.WorkersCount, &item.ExpectedBudget, &item.Weather, &item.Description, &item.Issues,
 			&item.ReportedBy, &item.CreatedDate, &item.UpdatedDate,
-			&item.WBSCode, &item.WBSName, &item.BuildingName, &item.StageName, &item.StageProgress, &item.ReportedName,
+			&item.BuildingName, &item.StageName, &item.StageProgress, &item.ReportedName,
 		); err != nil {
 			h.log.Error("Failed to scan daily log", "error", err)
 			continue
@@ -183,35 +180,19 @@ func (h *Handler) CreateConstructionDailyLog(c *gin.Context) {
 		return
 	}
 
-	// Validate WBS exists and belongs to this project
-	var wbsExists bool
-	err = h.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM construction_wbs WHERE id = $1 AND project_id = $2 AND tenant_id = $3 AND is_active = true)`,
-		req.WBSID, projectID, tenantID,
-	).Scan(&wbsExists)
-	if err != nil || !wbsExists {
-		response.BadRequest(c, "Invalid WBS item")
-		return
-	}
-
 	userID, _ := middleware.GetUserID(c)
-
-	uom := req.UOM
-	if uom == "" {
-		uom = "шт"
-	}
 
 	var logID int64
 	err = h.db.QueryRow(`
 		INSERT INTO construction_daily_log (
-			tenant_id, project_id, building_id, stage_id, wbs_id,
-			date, quantity_done, uom, workers_count, expected_budget,
+			tenant_id, project_id, building_id, stage_id,
+			date, end_date, workers_count, expected_budget,
 			weather, description, issues,
 			reported_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
 		RETURNING id
 	`, tenantID, projectID, nullInt64FromVal(req.BuildingID), nullInt64FromVal(req.StageID),
-		req.WBSID, req.Date, req.QuantityDone, uom,
+		req.Date, nullStringFromVal(req.EndDate),
 		req.WorkersCount, req.ExpectedBudget, nullStringFromVal(req.Weather),
 		nullStringFromVal(req.Description), nullStringFromVal(req.Issues),
 		userID,
@@ -223,11 +204,8 @@ func (h *Handler) CreateConstructionDailyLog(c *gin.Context) {
 		return
 	}
 
-	// CRITICAL: Recalculate cumulative quantities and progress chain
-	h.recalculateCumulativeAndProgress(projectID, req.WBSID, tenantID)
-
 	h.logConstructionActivity(tenantID, projectID, userID, "progress",
-		fmt.Sprintf("Kunlik yozuv: %.2f %s bajarildi", req.QuantityDone, uom), "DailyLog", logID)
+		"Qurilish jarayoni yozuvi qo'shildi", "DailyLog", logID)
 
 	response.Success(c, map[string]interface{}{
 		"id": logID,
@@ -248,13 +226,13 @@ func (h *Handler) UpdateConstructionDailyLog(c *gin.Context) {
 		return
 	}
 
-	// Get existing log to know the WBS and project for recalculation
-	var existingWBSID, projectID int64
+	// Verify log exists and belongs to this tenant
+	var exists bool
 	err = h.db.QueryRow(
-		`SELECT wbs_id, project_id FROM construction_daily_log WHERE id = $1 AND tenant_id = $2`,
+		`SELECT EXISTS(SELECT 1 FROM construction_daily_log WHERE id = $1 AND tenant_id = $2)`,
 		logID, tenantID,
-	).Scan(&existingWBSID, &projectID)
-	if err != nil {
+	).Scan(&exists)
+	if err != nil || !exists {
 		response.NotFound(c, "Daily log not found")
 		return
 	}
@@ -287,25 +265,15 @@ func (h *Handler) UpdateConstructionDailyLog(c *gin.Context) {
 			args = append(args, *req.StageID)
 		}
 	}
-	if req.WBSID != nil {
-		argCount++
-		updates = append(updates, fmt.Sprintf("wbs_id = $%d", argCount))
-		args = append(args, *req.WBSID)
-	}
 	if req.Date != nil {
 		argCount++
 		updates = append(updates, fmt.Sprintf("date = $%d", argCount))
 		args = append(args, *req.Date)
 	}
-	if req.QuantityDone != nil {
+	if req.EndDate != nil {
 		argCount++
-		updates = append(updates, fmt.Sprintf("quantity_done = $%d", argCount))
-		args = append(args, *req.QuantityDone)
-	}
-	if req.UOM != nil {
-		argCount++
-		updates = append(updates, fmt.Sprintf("uom = $%d", argCount))
-		args = append(args, *req.UOM)
+		updates = append(updates, fmt.Sprintf("end_date = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.EndDate))
 	}
 	if req.WorkersCount != nil {
 		argCount++
@@ -365,12 +333,6 @@ func (h *Handler) UpdateConstructionDailyLog(c *gin.Context) {
 		return
 	}
 
-	// Recalculate for both old and new WBS if changed
-	h.recalculateCumulativeAndProgress(projectID, existingWBSID, tenantID)
-	if req.WBSID != nil && *req.WBSID != existingWBSID {
-		h.recalculateCumulativeAndProgress(projectID, *req.WBSID, tenantID)
-	}
-
 	response.Success(c, map[string]interface{}{
 		"id":      logID,
 		"message": "Daily log updated successfully",
@@ -391,12 +353,11 @@ func (h *Handler) DeleteConstructionDailyLog(c *gin.Context) {
 		return
 	}
 
-	// Get WBS and project for recalculation
-	var wbsID, projectID int64
+	var projectID int64
 	err = h.db.QueryRow(
-		`SELECT wbs_id, project_id FROM construction_daily_log WHERE id = $1 AND tenant_id = $2`,
+		`SELECT project_id FROM construction_daily_log WHERE id = $1 AND tenant_id = $2`,
 		logID, tenantID,
-	).Scan(&wbsID, &projectID)
+	).Scan(&projectID)
 	if err != nil {
 		response.NotFound(c, "Daily log not found")
 		return
@@ -409,11 +370,8 @@ func (h *Handler) DeleteConstructionDailyLog(c *gin.Context) {
 		return
 	}
 
-	// Recalculate after deletion
-	h.recalculateCumulativeAndProgress(projectID, wbsID, tenantID)
-
 	userID, _ := middleware.GetUserID(c)
-	h.logConstructionActivity(tenantID, projectID, userID, "progress", "Kunlik yozuv o'chirildi", "DailyLog", logID)
+	h.logConstructionActivity(tenantID, projectID, userID, "progress", "Qurilish jarayoni yozuvi o'chirildi", "DailyLog", logID)
 
 	response.Success(c, map[string]interface{}{
 		"message": "Daily log deleted successfully",
