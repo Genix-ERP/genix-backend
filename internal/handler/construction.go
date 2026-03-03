@@ -3550,6 +3550,62 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 		}
 	}
 
+	// Upsert project materials list — track what has been approved for this project (best-effort)
+	for _, item := range items {
+		productIDStr, _ := item["product_id"].(string)
+		if productIDStr == "" {
+			continue
+		}
+		var qty float64
+		switch v := item["quantity"].(type) {
+		case float64:
+			qty = v
+		case json.Number:
+			qty, _ = v.Float64()
+		}
+		var unitCost float64
+		switch v := item["unit_cost"].(type) {
+		case float64:
+			unitCost = v
+		case json.Number:
+			unitCost, _ = v.Float64()
+		}
+		productName, _ := item["product_name"].(string)
+		uom, _ := item["unit_name"].(string)
+		// Fallback: look up product name and uom from products table
+		if productName == "" {
+			productID2, parseErr := uuid.Parse(productIDStr)
+			if parseErr == nil {
+				var dbName, dbUom string
+				tx.QueryRow(`SELECT COALESCE(name,''), COALESCE(unit_name,'') FROM products WHERE id = $1 LIMIT 1`, productID2).Scan(&dbName, &dbUom)
+				if dbName != "" {
+					productName = dbName
+				}
+				if uom == "" && dbUom != "" {
+					uom = dbUom
+				}
+			}
+		}
+		tx.Exec(`SAVEPOINT sp_pm`)
+		_, pmErr := tx.Exec(`
+			INSERT INTO construction_project_materials
+				(tenant_id, project_id, product_id, product_name, uom, approved_quantity, unit_cost, created_date, updated_date)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+			ON CONFLICT (tenant_id, project_id, product_id) DO UPDATE
+				SET approved_quantity = construction_project_materials.approved_quantity + EXCLUDED.approved_quantity,
+				    unit_cost = EXCLUDED.unit_cost,
+				    product_name = CASE WHEN EXCLUDED.product_name != '' THEN EXCLUDED.product_name ELSE construction_project_materials.product_name END,
+				    uom = CASE WHEN EXCLUDED.uom != '' THEN EXCLUDED.uom ELSE construction_project_materials.uom END,
+				    updated_date = EXCLUDED.updated_date
+		`, tenantID, projectID, productIDStr, productName, uom, qty, unitCost, now)
+		if pmErr != nil {
+			h.log.Error("project_materials upsert failed (rolled back to savepoint)", "error", pmErr)
+			tx.Exec(`ROLLBACK TO SAVEPOINT sp_pm`)
+		} else {
+			tx.Exec(`RELEASE SAVEPOINT sp_pm`)
+		}
+	}
+
 	// Record construction cost tracking entry (best-effort)
 	if totalExpense > 0 {
 		tx.Exec(`SAVEPOINT sp_cost`)
