@@ -1420,8 +1420,9 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 		return
 	}
 
-	query := `UPDATE production_orders SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status = 'draft'`
-	result, err := h.db.Exec(query, time.Now(), id, tenantID)
+	now := time.Now()
+	query := `UPDATE production_orders SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status IN ('draft', 'cancelled', 'completed')`
+	result, err := h.db.Exec(query, now, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete production order", "error", err)
 		response.InternalError(c, "Failed to delete production order")
@@ -1433,6 +1434,9 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 		response.NotFound(c, "Production order not found or cannot be deleted")
 		return
 	}
+
+	// Cascade soft-delete all work orders so they disappear from Shop Floor Control
+	h.db.Exec(`UPDATE work_orders SET deleted_at = $1 WHERE production_order_id = $2 AND tenant_id = $3 AND deleted_at IS NULL`, now, id, tenantID)
 
 	response.Success(c, map[string]interface{}{"message": "Production order deleted successfully"})
 }
