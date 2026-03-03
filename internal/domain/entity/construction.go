@@ -69,7 +69,7 @@ type ConstructionProject struct {
 	City        sql.NullString `json:"city" db:"city"`
 	District    sql.NullString `json:"district" db:"district"`
 	Region      sql.NullString `json:"region" db:"region"`
-	Coordinates json.RawMessage `json:"coordinates" db:"coordinates" swaggertype:"object"`
+	Coordinates []byte `json:"coordinates" db:"coordinates" swaggertype:"object"`
 
 	// Client Info
 	ClientName    sql.NullString `json:"client_name" db:"client_name"`
@@ -144,7 +144,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		TenantID         uuid.UUID   `json:"tenant_id"`
 		Code             string      `json:"code"`
 		Name             string      `json:"name"`
-		Coordinates      json.RawMessage `json:"coordinates"`
+		Coordinates      json.RawMessage `json:"coordinates,omitempty"`
 		Currency         string      `json:"currency"`
 		Status           string      `json:"status"`
 		CreatedBy        *uuid.UUID  `json:"created_by"`
@@ -181,7 +181,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		TenantID:           p.TenantID,
 		Code:               p.Code,
 		Name:               p.Name,
-		Coordinates:        p.Coordinates,
+		Coordinates:        json.RawMessage(p.Coordinates),
 		Currency:           p.Currency,
 		Status:             p.Status,
 		CreatedBy:          p.CreatedBy,

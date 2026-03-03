@@ -43,6 +43,7 @@ type Contact struct {
 	TaxExempt          bool            `json:"tax_exempt" db:"tax_exempt"`
 	Tags               json.RawMessage `json:"tags" db:"tags" swaggertype:"object"`
 	Notes              *string         `json:"notes,omitempty" db:"notes"`
+	ExpectedRevenue    *float64        `json:"expected_revenue,omitempty" db:"expected_revenue"`
 	CustomFields       json.RawMessage `json:"custom_fields" db:"custom_fields" swaggertype:"object"`
 	IsActive           bool            `json:"is_active" db:"is_active"`
 	CreatedBy          *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
@@ -97,6 +98,7 @@ type CreateContactInput struct {
 	TaxExempt          bool                   `json:"tax_exempt,omitempty"`
 	Tags               []string               `json:"tags,omitempty"`
 	Notes              string                 `json:"notes,omitempty"`
+	ExpectedRevenue    *float64               `json:"expected_revenue,omitempty"`
 	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
 	ContactPersons     []CreateContactPersonInput `json:"contact_persons,omitempty"`
 }
@@ -119,6 +121,7 @@ type UpdateContactInput struct {
 	TaxExempt          *bool                  `json:"tax_exempt,omitempty"`
 	Tags               []string               `json:"tags,omitempty"`
 	Notes              *string                `json:"notes,omitempty"`
+	ExpectedRevenue    *float64               `json:"expected_revenue,omitempty"`
 	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
 	IsActive           *bool                  `json:"is_active,omitempty"`
 }
@@ -165,6 +168,8 @@ type ContactResponse struct {
 	CurrentBalance     float64                `json:"current_balance"`
 	TaxExempt          bool                   `json:"tax_exempt"`
 	Tags               []string               `json:"tags"`
+	Notes              *string                `json:"notes,omitempty"`
+	ExpectedRevenue    *float64               `json:"expected_revenue,omitempty"`
 	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
 	IsActive           bool                   `json:"is_active"`
 	Rating             *float64               `json:"rating,omitempty"`
