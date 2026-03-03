@@ -1766,6 +1766,18 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 		}
 	}
 
+	// --- Auto-start the first pending work order ---
+	_, _ = h.db.Exec(`
+		UPDATE work_orders
+		SET status = 'in_progress', actual_start = $1, started_by = $2
+		WHERE id = (
+			SELECT id FROM work_orders
+			WHERE production_order_id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+				AND status IN ('pending', 'ready')
+			ORDER BY sequence ASC LIMIT 1
+		)
+	`, now, userID, id, tenantID)
+
 	// --- Consume BOM components from inventory when production starts ---
 	var productID uuid.UUID
 	var bomID *uuid.UUID
@@ -1925,6 +1937,14 @@ func (h *Handler) PauseProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// --- Pause all in-progress work orders for this production order ---
+	h.db.Exec(`
+		UPDATE work_orders
+		SET status = 'paused', updated_at = $1
+		WHERE production_order_id = $2 AND tenant_id = $3
+			AND deleted_at IS NULL AND status = 'in_progress'
+	`, now, id, tenantID)
+
 	h.GetProductionOrder(c)
 }
 
@@ -2030,6 +2050,14 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		response.NotFound(c, "Production order not found or not in valid state")
 		return
 	}
+
+	// --- Complete all remaining work orders for this production order ---
+	h.db.Exec(`
+		UPDATE work_orders
+		SET status = 'completed', actual_end = $1
+		WHERE production_order_id = $2 AND tenant_id = $3
+			AND deleted_at IS NULL AND status NOT IN ('completed', 'done', 'cancelled')
+	`, now, id, tenantID)
 
 	// --- Inventory integration: add produced goods & consume materials ---
 	// Skip if inventory was already updated for this production order (prevent double-add)
@@ -2171,7 +2199,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		// Don't fail the whole operation, just log the error
 	} else {
 		// Update production order quality status
-		h.db.Exec(`UPDATE production_orders SET quality_status = 'passed', requires_quality_check = true, updated_at = $1 WHERE id = $2`, now, id)
+		h.db.Exec(`UPDATE production_orders SET quality_status = 'pending', requires_quality_check = true, updated_at = $1 WHERE id = $2`, now, id)
 		h.log.Info("Auto-created quality check for production order", "qc_id", qcID, "order_id", id)
 	}
 
@@ -2306,6 +2334,14 @@ func (h *Handler) CancelProductionOrder(c *gin.Context) {
 		response.NotFound(c, "Production order not found or cannot be cancelled")
 		return
 	}
+
+	// --- Cancel all remaining work orders for this production order ---
+	h.db.Exec(`
+		UPDATE work_orders
+		SET status = 'cancelled', updated_at = $1
+		WHERE production_order_id = $2 AND tenant_id = $3
+			AND deleted_at IS NULL AND status NOT IN ('completed', 'done', 'cancelled')
+	`, now, id, tenantID)
 
 	h.GetProductionOrder(c)
 }

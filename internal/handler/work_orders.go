@@ -275,7 +275,7 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 	}
 	wo.StatusLabel = getWorkOrderStatusLabel(wo.Status)
 
-	response.Success(c, gin.H{"data": wo})
+	response.Success(c, wo)
 }
 
 // StartWorkOrder starts a work order
@@ -348,6 +348,8 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		return
 	}
 
+	userID, _ := middleware.GetUserID(c)
+
 	woID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid work order ID")
@@ -388,7 +390,7 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		SET status = 'completed', actual_end = $1, quantity_produced = quantity_produced + $2,
 			actual_duration_hours = $3, completed_by = $4
 		WHERE id = $5 AND tenant_id = $6
-	`, now, input.QuantityProduced, durationHours, c.GetString("user_id"), woID, tenantID)
+	`, now, input.QuantityProduced, durationHours, userID, woID, tenantID)
 	if err != nil {
 		response.Error(c, 500, "Failed to complete work order", err.Error())
 		return
@@ -401,20 +403,62 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		WHERE work_order_id = $4 AND end_time IS NULL
 	`, now, durationHours, input.Notes, woID)
 
-	// Check if all work orders for the MO are done
-	var pendingCount int
+	// Get the production order ID and current work order sequence
+	var productionOrderID uuid.UUID
+	var currentSequence int
 	h.db.QueryRow(`
-		SELECT COUNT(*) FROM work_orders wo
-		JOIN work_orders wo2 ON wo.production_order_id = wo2.production_order_id
-		WHERE wo2.id = $1 AND wo.status NOT IN ('done', 'cancelled') AND wo.deleted_at IS NULL
-	`, woID).Scan(&pendingCount)
+		SELECT production_order_id, COALESCE(sequence, 0)
+		FROM work_orders WHERE id = $1 AND tenant_id = $2
+	`, woID, tenantID).Scan(&productionOrderID, &currentSequence)
+
+	// Find the next work order in sequence
+	var nextWoID uuid.UUID
+	var nextSequence int
+	nextErr := h.db.QueryRow(`
+		SELECT id, sequence FROM work_orders
+		WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+			AND sequence > $3 AND status IN ('pending', 'ready', 'draft', 'waiting')
+		ORDER BY sequence ASC LIMIT 1
+	`, productionOrderID, tenantID, currentSequence).Scan(&nextWoID, &nextSequence)
+
+	if nextErr == nil {
+		// Auto-start next work order
+		h.db.Exec(`
+			UPDATE work_orders
+			SET status = 'in_progress', actual_start = $1, started_by = $2
+			WHERE id = $3 AND tenant_id = $4
+		`, now, userID, nextWoID, tenantID)
+
+		// Advance production order stage to next operation
+		nextStage := fmt.Sprintf("op_%d", nextSequence)
+		h.db.Exec(`
+			UPDATE production_orders
+			SET current_stage = $1, updated_at = $2
+			WHERE id = $3 AND tenant_id = $4
+		`, nextStage, now, productionOrderID, tenantID)
+	} else {
+		// No more work orders — check if all completed
+		var incompleteCount int
+		h.db.QueryRow(`
+			SELECT COUNT(*) FROM work_orders
+			WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+				AND status NOT IN ('completed', 'done', 'cancelled')
+		`, productionOrderID, tenantID).Scan(&incompleteCount)
+
+		if incompleteCount == 0 {
+			// All work orders done — mark production order as completed
+			h.db.Exec(`
+				UPDATE production_orders
+				SET status = 'completed', current_stage = 'done', actual_end = $1, updated_at = $1
+				WHERE id = $2 AND tenant_id = $3
+			`, now, productionOrderID, tenantID)
+		}
+	}
 
 	response.Success(c, gin.H{
-		"message":             "Work order completed",
-		"actual_end":          now,
-		"duration_minutes":    durationMinutes,
-		"all_wo_completed":    pendingCount == 0,
-		"pending_work_orders": pendingCount,
+		"message":          "Work order completed",
+		"actual_end":       now,
+		"duration_minutes": durationMinutes,
 	})
 }
 
