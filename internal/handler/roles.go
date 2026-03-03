@@ -580,6 +580,52 @@ func (h *Handler) UnassignRole(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Role unassigned successfully"})
 }
 
+// GetRoleEmployees returns all employees assigned to a role
+func (h *Handler) GetRoleEmployees(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	roleID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid role ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, TRIM(CONCAT(COALESCE(first_name, ''), ' ', COALESCE(last_name, ''))) AS full_name,
+		       COALESCE(job_title, '') AS job_title, COALESCE(email, '') AS email
+		FROM employees
+		WHERE tenant_id = $1 AND role_id = $2 AND deleted_at IS NULL
+		ORDER BY first_name ASC, last_name ASC
+	`, tenantID, roleID)
+	if err != nil {
+		h.log.Error("Failed to list role employees", "error", err)
+		response.InternalError(c, "Failed to list role employees")
+		return
+	}
+	defer rows.Close()
+
+	type EmpRow struct {
+		ID       uuid.UUID `json:"id"`
+		FullName string    `json:"full_name"`
+		JobTitle string    `json:"job_title"`
+		Email    string    `json:"email"`
+	}
+	employees := []EmpRow{}
+	for rows.Next() {
+		var e EmpRow
+		if err := rows.Scan(&e.ID, &e.FullName, &e.JobTitle, &e.Email); err != nil {
+			continue
+		}
+		employees = append(employees, e)
+	}
+
+	response.Success(c, employees)
+}
+
 // syncRolePermissionsToEmployees syncs role permissions to all employees with this role
 func (h *Handler) syncRolePermissionsToEmployees(tx *sql.Tx, tenantID, roleID uuid.UUID, perms RolePermissions, now time.Time) error {
 	// Find all employees with this role

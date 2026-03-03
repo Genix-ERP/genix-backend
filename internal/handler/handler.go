@@ -117,6 +117,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		roles.GET("/:id", h.GetRole)
 		roles.PUT("/:id", middleware.RequirePermission("users", "role", "update"), h.UpdateRole)
 		roles.DELETE("/:id", middleware.RequirePermission("users", "role", "delete"), h.DeleteRole)
+		roles.GET("/:id/employees", h.GetRoleEmployees)
 		roles.POST("/:id/assign", middleware.RequirePermission("users", "role", "update"), h.AssignRole)
 		roles.POST("/:id/unassign", middleware.RequirePermission("users", "role", "update"), h.UnassignRole)
 	}
@@ -1668,6 +1669,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		constructionStages.PUT("/:id", middleware.RequirePermission("construction", "project", "update"), h.UpdateConstructionStage)
 		constructionStages.DELETE("/:id", middleware.RequirePermission("construction", "project", "delete"), h.DeleteConstructionStage)
+		constructionStages.GET("/:id/sub-stages", h.ListConstructionSubStages)
+		constructionStages.POST("/:id/sub-stages", middleware.RequirePermission("construction", "project", "update"), h.CreateConstructionSubStage)
+	}
+
+	// Construction Sub-Stages (direct access for update/delete)
+	constructionSubStages := rg.Group("/construction/sub-stages")
+	constructionSubStages.Use(middleware.RequirePermission("construction", "project", "read"))
+	{
+		constructionSubStages.PUT("/:id", middleware.RequirePermission("construction", "project", "update"), h.UpdateConstructionSubStage)
+		constructionSubStages.DELETE("/:id", middleware.RequirePermission("construction", "project", "delete"), h.DeleteConstructionSubStage)
 	}
 
 	// Expense Lines (direct access for update/delete/approve/cancel)
