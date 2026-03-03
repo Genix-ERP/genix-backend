@@ -1365,16 +1365,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		mfgTransfers.POST("/:id/validate", middleware.RequirePermission("manufacturing", "transfers", "update"), h.ValidateManufacturingTransfer)
 	}
 
-	// Quality Control
-	qualityChecks := rg.Group("/quality-checks")
-	qualityChecks.Use(middleware.RequirePermission("manufacturing", "quality_checks", "read"))
+	// Equipment & Maintenance
+	equipment := rg.Group("/equipment")
+	equipment.Use(middleware.RequirePermission("manufacturing", "work_centers", "read"))
 	{
-		qualityChecks.GET("", h.ListQualityChecks)
-		qualityChecks.POST("", middleware.RequirePermission("manufacturing", "quality_checks", "create"), h.CreateQualityCheck)
-		qualityChecks.GET("/stats", h.GetQualityStats)
-		qualityChecks.GET("/defects", h.ListQualityDefects)
-		qualityChecks.POST("/defects", middleware.RequirePermission("manufacturing", "quality_checks", "create"), h.CreateQualityDefect)
-		qualityChecks.GET("/:id", h.GetQualityCheck)
+		equipment.GET("", h.ListEquipment)
+		equipment.POST("", middleware.RequirePermission("manufacturing", "work_centers", "create"), h.CreateEquipment)
+		equipment.PUT("/:id", middleware.RequirePermission("manufacturing", "work_centers", "update"), h.UpdateEquipment)
+		equipment.DELETE("/:id", middleware.RequirePermission("manufacturing", "work_centers", "delete"), h.DeleteEquipment)
+		equipment.GET("/:id/maintenance", h.ListMaintenanceTasks)
+		equipment.POST("/:id/maintenance", middleware.RequirePermission("manufacturing", "work_centers", "create"), h.CreateMaintenanceTask)
+		equipment.PUT("/:id/maintenance/:task_id", middleware.RequirePermission("manufacturing", "work_centers", "update"), h.CompleteMaintenanceTask)
+		equipment.PATCH("/:id/maintenance/:task_id", middleware.RequirePermission("manufacturing", "work_centers", "update"), h.UpdateMaintenanceTask)
 	}
 
 	// =====================================================
