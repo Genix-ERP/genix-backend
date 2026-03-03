@@ -2170,44 +2170,6 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	}
 
 	// ============================================
-	// AUTO-CREATE QUALITY CHECK for completed production order
-	// ============================================
-	qcID := uuid.New()
-	qcCode := fmt.Sprintf("QC-%s", id.String()[:8])
-
-	// Get product name for the quality check
-	var qcProductName string
-	h.db.QueryRow("SELECT name FROM products WHERE id = $1", productID).Scan(&qcProductName)
-
-	// Get inspector name
-	var inspectorName string
-	h.db.QueryRow("SELECT first_name || ' ' || last_name FROM users WHERE id = $1", userID).Scan(&inspectorName)
-
-	_, qcErr := h.db.Exec(`
-		INSERT INTO quality_checks (
-			id, tenant_id, organization_id, code, production_order_id, product_id,
-			inspection_date, inspector_id, inspector_name,
-			quantity_inspected, quantity_passed, quantity_failed,
-			result, pass_rate, action_taken, notes,
-			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $7, $7)
-	`,
-		qcID, tenantID, organizationID, qcCode, id, productID,
-		now, userID, inspectorName,
-		producedQty, float64(0), float64(0),
-		"pending", float64(0), "",
-		fmt.Sprintf("Quality inspection required for completed production. Product: %s, Quantity: %.0f", qcProductName, producedQty),
-	)
-	if qcErr != nil {
-		h.log.Error("Failed to auto-create quality check", "error", qcErr)
-		// Don't fail the whole operation, just log the error
-	} else {
-		// Update production order quality status
-		h.db.Exec(`UPDATE production_orders SET quality_status = 'pending', requires_quality_check = true, updated_at = $1 WHERE id = $2`, now, id)
-		h.log.Info("Auto-created quality check for production order", "qc_id", qcID, "order_id", id)
-	}
-
-	// ============================================
 	// CREATE JOURNAL ENTRY: Debit Stock Valuation (per category), Credit Manufacturing Expense
 	// ============================================
 	totalCost := producedQty * unitCost
@@ -2630,678 +2592,575 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 // CompleteWorkOrder, RecordWorkOrderTime, PauseWorkOrder) are defined in work_orders.go
 
 // =====================================================
-// QUALITY CHECK HANDLERS
+// EQUIPMENT HANDLERS
 // =====================================================
 
-// ListQualityChecks godoc
-// @Summary List quality checks
-// @Description Get a paginated list of quality checks with filtering options
-// @Tags Manufacturing
-// @Accept json
-// @Produce json
-// @Param result query string false "Filter by result"
-// @Param production_order_id query string false "Filter by production order ID"
-// @Param inspector_id query string false "Filter by inspector ID"
-// @Param date_from query string false "Filter by date from"
-// @Param date_to query string false "Filter by date to"
-// @Param search query string false "Search by reference number"
-// @Param page query int false "Page number" default(1)
-// @Param limit query int false "Items per page" default(20)
-// @Param sort_by query string false "Sort by field" default(inspection_date)
-// @Param sort_order query string false "Sort order (asc/desc)" default(desc)
-// @Success 200 {object} response.Response
-// @Failure 400 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 500 {object} response.Response
-// @Security BearerAuth
-// @Router /manufacturing/quality-checks [get]
-func (h *Handler) ListQualityChecks(c *gin.Context) {
+func (h *Handler) ListEquipment(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
 		response.Unauthorized(c, "Tenant not found")
 		return
 	}
 
-	var filter entity.QualityCheckFilter
-	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.BadRequest(c, "Invalid query parameters")
-		return
-	}
+	search := c.Query("search")
+	status := c.Query("status")
+	workCenterID := c.Query("work_center_id")
 
-	// Set defaults
-	if filter.Page <= 0 {
-		filter.Page = 1
-	}
-	if filter.Limit <= 0 || filter.Limit > 100 {
-		filter.Limit = 20
-	}
-	if filter.SortBy == "" {
-		filter.SortBy = "inspection_date"
-	}
-	if filter.SortOrder == "" {
-		filter.SortOrder = "desc"
-	}
-
-	baseQuery := `
-		SELECT qc.id, qc.code, qc.quality_control_point_id, qc.production_order_id, po.code as po_code,
-			   qc.work_order_id, wo.code as wo_code, qc.product_id, p.name as product_name, p.code as product_code,
-			   qc.lot_number, qc.inspection_date, qc.inspector_id, qc.inspector_name,
-			   qc.quantity_inspected, qc.quantity_passed, qc.quantity_failed, qc.result,
-			   qc.measured_value, qc.measurement_unit, qc.pass_rate, qc.defect_type, qc.defect_category,
-			   qc.action_taken, qc.notes, qc.failure_reason, qc.corrective_action, qc.attachments,
-			   qc.created_at, qc.updated_at
-		FROM quality_checks qc
-		LEFT JOIN production_orders po ON qc.production_order_id = po.id
-		LEFT JOIN work_orders wo ON qc.work_order_id = wo.id
-		LEFT JOIN products p ON qc.product_id = p.id
-		WHERE qc.tenant_id = $1 AND qc.deleted_at IS NULL
+	query := `
+		SELECT e.id, e.code, e.name, e.description, e.equipment_type, e.category,
+			   e.work_center_id, wc.name as work_center_name,
+			   e.manufacturer, e.model, e.serial_number,
+			   e.purchase_date, e.warranty_expiry, e.status,
+			   e.last_maintenance_date, e.next_maintenance_date, e.maintenance_interval_days,
+			   e.purchase_cost, e.current_value, e.hourly_rate, e.notes,
+			   e.created_at, e.updated_at
+		FROM manufacturing_equipment e
+		LEFT JOIN work_centers wc ON wc.id = e.work_center_id AND wc.deleted_at IS NULL
+		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL
 	`
-
-	countQuery := `SELECT COUNT(*) FROM quality_checks qc WHERE qc.tenant_id = $1 AND qc.deleted_at IS NULL`
 	args := []interface{}{tenantID}
-	countArgs := []interface{}{tenantID}
 	argCount := 1
 
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+	if search != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND qc.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND qc.organization_id = $%d", argCount)
-		args = append(args, orgID)
-		countArgs = append(countArgs, orgID)
+		query += fmt.Sprintf(" AND (e.name ILIKE $%d OR e.code ILIKE $%d OR e.serial_number ILIKE $%d)", argCount, argCount, argCount)
+		args = append(args, "%"+search+"%")
 	}
-
-	// Apply filters
-	if filter.ProductionOrderID != nil {
+	if status != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND qc.production_order_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND qc.production_order_id = $%d", argCount)
-		args = append(args, *filter.ProductionOrderID)
-		countArgs = append(countArgs, *filter.ProductionOrderID)
+		query += fmt.Sprintf(" AND e.status = $%d", argCount)
+		args = append(args, status)
 	}
-
-	if filter.WorkOrderID != nil {
+	if workCenterID != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND qc.work_order_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND qc.work_order_id = $%d", argCount)
-		args = append(args, *filter.WorkOrderID)
-		countArgs = append(countArgs, *filter.WorkOrderID)
+		query += fmt.Sprintf(" AND e.work_center_id = $%d", argCount)
+		args = append(args, workCenterID)
 	}
+	query += " ORDER BY e.name ASC"
 
-	if filter.ProductID != nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND qc.product_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND qc.product_id = $%d", argCount)
-		args = append(args, *filter.ProductID)
-		countArgs = append(countArgs, *filter.ProductID)
-	}
-
-	if filter.Result != nil && *filter.Result != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND qc.result = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND qc.result = $%d", argCount)
-		args = append(args, *filter.Result)
-		countArgs = append(countArgs, *filter.Result)
-	}
-
-	if filter.DateFrom != nil && *filter.DateFrom != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND qc.inspection_date >= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND qc.inspection_date >= $%d", argCount)
-		args = append(args, *filter.DateFrom)
-		countArgs = append(countArgs, *filter.DateFrom)
-	}
-
-	if filter.DateTo != nil && *filter.DateTo != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND qc.inspection_date <= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND qc.inspection_date <= $%d", argCount)
-		args = append(args, *filter.DateTo)
-		countArgs = append(countArgs, *filter.DateTo)
-	}
-
-	// Get total count
-	var total int
-	err := h.db.QueryRow(countQuery, countArgs...).Scan(&total)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		h.log.Error("Failed to count quality checks", "error", err)
-		response.InternalError(c, "Failed to retrieve quality checks")
-		return
-	}
-
-	// Sorting and pagination
-	validSortColumns := map[string]string{
-		"inspection_date": "qc.inspection_date",
-		"result":          "qc.result",
-		"created_at":      "qc.created_at",
-	}
-	sortColumn := validSortColumns[filter.SortBy]
-	if sortColumn == "" {
-		sortColumn = "qc.inspection_date"
-	}
-	sortOrder := "ASC"
-	if strings.ToLower(filter.SortOrder) == "desc" {
-		sortOrder = "DESC"
-	}
-	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortColumn, sortOrder)
-
-	offset := (filter.Page - 1) * filter.Limit
-	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", filter.Limit, offset)
-
-	// Execute query
-	rows, err := h.db.Query(baseQuery, args...)
-	if err != nil {
-		h.log.Error("Failed to list quality checks", "error", err)
-		response.InternalError(c, "Failed to retrieve quality checks")
+		h.log.Error("Failed to list equipment", "error", err)
+		response.InternalError(c, "Failed to list equipment")
 		return
 	}
 	defer rows.Close()
 
-	// Initialize as empty array (never nil) to ensure JSON marshals to [] not null
-	qualityChecks := make([]entity.QualityCheckResponse, 0)
+	type EquipmentItem struct {
+		ID                     uuid.UUID  `json:"id"`
+		Code                   string     `json:"code"`
+		Name                   string     `json:"name"`
+		Description            *string    `json:"description,omitempty"`
+		EquipmentType          string     `json:"equipment_type"`
+		Category               *string    `json:"category,omitempty"`
+		WorkCenterID           *uuid.UUID `json:"work_center_id,omitempty"`
+		WorkCenterName         *string    `json:"work_center_name,omitempty"`
+		Manufacturer           *string    `json:"manufacturer,omitempty"`
+		Model                  *string    `json:"model,omitempty"`
+		SerialNumber           *string    `json:"serial_number,omitempty"`
+		PurchaseDate           *string    `json:"purchase_date,omitempty"`
+		WarrantyExpiry         *string    `json:"warranty_expiry,omitempty"`
+		Status                 string     `json:"status"`
+		LastMaintenanceDate    *string    `json:"last_maintenance_date,omitempty"`
+		NextMaintenanceDate    *string    `json:"next_maintenance_date,omitempty"`
+		MaintenanceIntervalDays *int      `json:"maintenance_interval_days,omitempty"`
+		PurchaseCost           float64    `json:"purchase_cost"`
+		CurrentValue           float64    `json:"current_value"`
+		HourlyRate             float64    `json:"hourly_rate"`
+		Notes                  *string    `json:"notes,omitempty"`
+		CreatedAt              time.Time  `json:"created_at"`
+		UpdatedAt              time.Time  `json:"updated_at"`
+	}
+
+	equipment := []EquipmentItem{}
 	for rows.Next() {
-		var qc entity.QualityCheckResponse
-		var poCode, woCode, productName, productCode sql.NullString
-		var passRate sql.NullFloat64
-		var attachments []byte
+		var e EquipmentItem
+		var description, category, manufacturer, model, serialNumber, notes, workCenterName sql.NullString
+		var workCenterID sql.NullString
+		var purchaseDate, warrantyExpiry, lastMaint, nextMaint sql.NullTime
+		var maintInterval sql.NullInt64
 
 		err := rows.Scan(
-			&qc.ID, &qc.Code, &qc.QualityControlPointID, &qc.ProductionOrderID, &poCode,
-			&qc.WorkOrderID, &woCode, &qc.ProductID, &productName, &productCode,
-			&qc.LotNumber, &qc.InspectionDate, &qc.InspectorID, &qc.InspectorName,
-			&qc.QuantityInspected, &qc.QuantityPassed, &qc.QuantityFailed, &qc.Result,
-			&qc.MeasuredValue, &qc.MeasurementUnit, &passRate, &qc.DefectType, &qc.DefectCategory,
-			&qc.ActionTaken, &qc.Notes, &qc.FailureReason, &qc.CorrectiveAction, &attachments,
-			&qc.CreatedAt, &qc.UpdatedAt,
+			&e.ID, &e.Code, &e.Name, &description, &e.EquipmentType, &category,
+			&workCenterID, &workCenterName,
+			&manufacturer, &model, &serialNumber,
+			&purchaseDate, &warrantyExpiry, &e.Status,
+			&lastMaint, &nextMaint, &maintInterval,
+			&e.PurchaseCost, &e.CurrentValue, &e.HourlyRate, &notes,
+			&e.CreatedAt, &e.UpdatedAt,
 		)
 		if err != nil {
-			h.log.Error("Failed to scan quality check", "error", err)
+			h.log.Error("Failed to scan equipment", "error", err)
 			continue
 		}
-
-		if poCode.Valid {
-			qc.ProductionOrderCode = &poCode.String
+		if description.Valid { e.Description = &description.String }
+		if category.Valid { e.Category = &category.String }
+		if workCenterID.Valid {
+			id, _ := uuid.Parse(workCenterID.String)
+			e.WorkCenterID = &id
 		}
-		if woCode.Valid {
-			qc.WorkOrderCode = &woCode.String
-		}
-		if productName.Valid {
-			qc.ProductName = &productName.String
-		}
-		if productCode.Valid {
-			qc.ProductCode = &productCode.String
-		}
-		if passRate.Valid {
-			qc.PassRate = passRate.Float64
-		} else if qc.QuantityInspected > 0 {
-			qc.PassRate = (qc.QuantityPassed / qc.QuantityInspected) * 100
-		}
-		qc.Attachments = []string{}
-
-		qualityChecks = append(qualityChecks, qc)
+		if workCenterName.Valid { e.WorkCenterName = &workCenterName.String }
+		if manufacturer.Valid { e.Manufacturer = &manufacturer.String }
+		if model.Valid { e.Model = &model.String }
+		if serialNumber.Valid { e.SerialNumber = &serialNumber.String }
+		if notes.Valid { e.Notes = &notes.String }
+		if purchaseDate.Valid { s := purchaseDate.Time.Format("2006-01-02"); e.PurchaseDate = &s }
+		if warrantyExpiry.Valid { s := warrantyExpiry.Time.Format("2006-01-02"); e.WarrantyExpiry = &s }
+		if lastMaint.Valid { s := lastMaint.Time.Format("2006-01-02"); e.LastMaintenanceDate = &s }
+		if nextMaint.Valid { s := nextMaint.Time.Format("2006-01-02"); e.NextMaintenanceDate = &s }
+		if maintInterval.Valid { v := int(maintInterval.Int64); e.MaintenanceIntervalDays = &v }
+		equipment = append(equipment, e)
 	}
 
-	// Ensure we always return an array, never nil
-	if qualityChecks == nil {
-		qualityChecks = make([]entity.QualityCheckResponse, 0)
-	}
-
-	pagination := entity.NewPagination(filter.Page, filter.Limit)
-	pagination.Calculate(total)
-	response.SuccessWithPagination(c, qualityChecks, pagination)
+	response.Success(c, equipment)
 }
 
-// GetQualityCheck godoc
-// @Summary Get quality check
-// @Description Get a single quality check by ID
-// @Tags Manufacturing
-// @Accept json
-// @Produce json
-// @Param id path string true "Quality Check ID"
-// @Success 200 {object} response.Response
-// @Failure 400 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 404 {object} response.Response
-// @Failure 500 {object} response.Response
-// @Security BearerAuth
-// @Router /manufacturing/quality-checks/{id} [get]
-func (h *Handler) GetQualityCheck(c *gin.Context) {
+func (h *Handler) CreateEquipment(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
 		response.Unauthorized(c, "Tenant not found")
 		return
 	}
-
-	idStr := c.Param("id")
-	id, err := uuid.Parse(idStr)
-	if err != nil {
-		response.BadRequest(c, "Invalid quality check ID")
-		return
-	}
-
-	query := `
-		SELECT qc.id, qc.code, qc.quality_control_point_id, qc.production_order_id, po.code as po_code,
-			   qc.work_order_id, wo.code as wo_code, qc.product_id, p.name as product_name, p.code as product_code,
-			   qc.lot_number, qc.inspection_date, qc.inspector_id, qc.inspector_name,
-			   qc.quantity_inspected, qc.quantity_passed, qc.quantity_failed, qc.result,
-			   qc.measured_value, qc.measurement_unit, qc.pass_rate, qc.defect_type, qc.defect_category,
-			   qc.action_taken, qc.notes, qc.failure_reason, qc.corrective_action, qc.attachments,
-			   qc.created_at, qc.updated_at
-		FROM quality_checks qc
-		LEFT JOIN production_orders po ON qc.production_order_id = po.id
-		LEFT JOIN work_orders wo ON qc.work_order_id = wo.id
-		LEFT JOIN products p ON qc.product_id = p.id
-		WHERE qc.id = $1 AND qc.tenant_id = $2 AND qc.deleted_at IS NULL
-	`
-
-	var qc entity.QualityCheckResponse
-	var poCode, woCode, productName, productCode sql.NullString
-	var passRate sql.NullFloat64
-	var attachments []byte
-
-	err = h.db.QueryRow(query, id, tenantID).Scan(
-		&qc.ID, &qc.Code, &qc.QualityControlPointID, &qc.ProductionOrderID, &poCode,
-		&qc.WorkOrderID, &woCode, &qc.ProductID, &productName, &productCode,
-		&qc.LotNumber, &qc.InspectionDate, &qc.InspectorID, &qc.InspectorName,
-		&qc.QuantityInspected, &qc.QuantityPassed, &qc.QuantityFailed, &qc.Result,
-		&qc.MeasuredValue, &qc.MeasurementUnit, &passRate, &qc.DefectType, &qc.DefectCategory,
-		&qc.ActionTaken, &qc.Notes, &qc.FailureReason, &qc.CorrectiveAction, &attachments,
-		&qc.CreatedAt, &qc.UpdatedAt,
-	)
-
-	if err == sql.ErrNoRows {
-		response.NotFound(c, "Quality check not found")
-		return
-	}
-	if err != nil {
-		h.log.Error("Failed to get quality check", "error", err)
-		response.InternalError(c, "Failed to retrieve quality check")
-		return
-	}
-
-	if poCode.Valid {
-		qc.ProductionOrderCode = &poCode.String
-	}
-	if woCode.Valid {
-		qc.WorkOrderCode = &woCode.String
-	}
-	if productName.Valid {
-		qc.ProductName = &productName.String
-	}
-	if productCode.Valid {
-		qc.ProductCode = &productCode.String
-	}
-	if passRate.Valid {
-		qc.PassRate = passRate.Float64
-	} else if qc.QuantityInspected > 0 {
-		qc.PassRate = (qc.QuantityPassed / qc.QuantityInspected) * 100
-	}
-	qc.Attachments = []string{}
-
-	response.Success(c, qc)
-}
-
-// CreateQualityCheck godoc
-// @Summary Create quality check
-// @Description Create a new quality check
-// @Tags Manufacturing
-// @Accept json
-// @Produce json
-// @Param input body entity.QualityCheckInput true "Quality check input"
-// @Success 201 {object} response.Response
-// @Failure 400 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 500 {object} response.Response
-// @Security BearerAuth
-// @Router /manufacturing/quality-checks [post]
-func (h *Handler) CreateQualityCheck(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
 	userID, _ := middleware.GetUserID(c)
 
-	var input entity.QualityCheckInput
+	var input struct {
+		Code                    string  `json:"code"`
+		Name                    string  `json:"name" binding:"required"`
+		Description             *string `json:"description"`
+		EquipmentType           string  `json:"equipment_type"`
+		Category                *string `json:"category"`
+		WorkCenterID            *string `json:"work_center_id"`
+		Manufacturer            *string `json:"manufacturer"`
+		Model                   *string `json:"model"`
+		SerialNumber            *string `json:"serial_number"`
+		PurchaseDate            *string `json:"purchase_date"`
+		WarrantyExpiry          *string `json:"warranty_expiry"`
+		Status                  string  `json:"status"`
+		MaintenanceIntervalDays *int    `json:"maintenance_interval_days"`
+		PurchaseCost            float64 `json:"purchase_cost"`
+		CurrentValue            float64 `json:"current_value"`
+		HourlyRate              float64 `json:"hourly_rate"`
+		Notes                   *string `json:"notes"`
+	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
 	}
 
-	// Calculate result and pass rate
-	result := "pending"
-	if input.Result != nil {
-		result = *input.Result
-	} else if input.QuantityFailed > 0 {
-		if input.QuantityPassed == 0 {
-			result = "failed"
-		} else {
-			result = "partial"
-		}
-	} else if input.QuantityPassed > 0 {
-		result = "passed"
+	if input.Code == "" {
+		input.Code = fmt.Sprintf("EQ-%d", time.Now().UnixMilli())
+	}
+	if input.EquipmentType == "" {
+		input.EquipmentType = "machine"
+	}
+	if input.Status == "" {
+		input.Status = "operational"
 	}
 
-	passRate := 0.0
-	if input.QuantityInspected > 0 {
-		passRate = (input.QuantityPassed / input.QuantityInspected) * 100
-	}
-
-	now := time.Now()
-	inspectionDate := now
-	if input.InspectionDate != nil {
-		t, err := time.Parse(time.RFC3339, *input.InspectionDate)
+	var workCenterID *uuid.UUID
+	if input.WorkCenterID != nil && *input.WorkCenterID != "" {
+		id, err := uuid.Parse(*input.WorkCenterID)
 		if err == nil {
-			inspectionDate = t
+			workCenterID = &id
 		}
 	}
 
-	id := uuid.New()
-	code := fmt.Sprintf("QC-%s", id.String()[:8])
-
-	// Get inspector name
-	var inspectorName *string
-	if userID != uuid.Nil {
-		var name string
-		h.db.QueryRow("SELECT first_name || ' ' || last_name FROM users WHERE id = $1", userID).Scan(&name)
-		if name != "" {
-			inspectorName = &name
-		}
+	var purchaseDate, warrantyExpiry interface{}
+	if input.PurchaseDate != nil && *input.PurchaseDate != "" {
+		purchaseDate = *input.PurchaseDate
 	}
-
-	// Get organization ID from context
-	orgID, _ := middleware.GetOrganizationID(c)
-	var orgIDPtr *uuid.UUID
-	if orgID != uuid.Nil {
-		orgIDPtr = &orgID
-	}
-
-	query := `
-		INSERT INTO quality_checks (
-			id, tenant_id, organization_id, code, quality_control_point_id, production_order_id, work_order_id,
-			product_id, lot_number, inspection_date, inspector_id, inspector_name,
-			quantity_inspected, quantity_passed, quantity_failed, result, measured_value,
-			measurement_unit, pass_rate, defect_type, defect_category, action_taken,
-			notes, failure_reason, corrective_action, attachments, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
-		RETURNING id
-	`
-
-	attachments := []byte("[]")
-
-	err := h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, code, input.QualityControlPointID, input.ProductionOrderID, input.WorkOrderID,
-		input.ProductID, input.LotNumber, inspectionDate, userID, inspectorName,
-		input.QuantityInspected, input.QuantityPassed, input.QuantityFailed, result, input.MeasuredValue,
-		input.MeasurementUnit, passRate, input.DefectType, input.DefectCategory, input.ActionTaken,
-		input.Notes, input.FailureReason, input.CorrectiveAction, attachments, now, now,
-	).Scan(&id)
-
-	if err != nil {
-		h.log.Error("Failed to create quality check", "error", err)
-		response.InternalError(c, "Failed to create quality check")
-		return
-	}
-
-	// If linked to production order and failed, update quality status
-	if input.ProductionOrderID != nil && result == "failed" {
-		h.db.Exec(
-			"UPDATE production_orders SET quality_status = 'failed', updated_at = NOW() WHERE id = $1 AND tenant_id = $2",
-			*input.ProductionOrderID, tenantID,
-		)
-	} else if input.ProductionOrderID != nil && result == "passed" {
-		h.db.Exec(
-			"UPDATE production_orders SET quality_status = 'passed', updated_at = NOW() WHERE id = $1 AND tenant_id = $2 AND (quality_status IS NULL OR quality_status = 'pending')",
-			*input.ProductionOrderID, tenantID,
-		)
-	}
-
-	c.Params = append(c.Params, gin.Param{Key: "id", Value: id.String()})
-	h.GetQualityCheck(c)
-}
-
-// GetQualityStats godoc
-// @Summary Get quality statistics
-// @Description Get quality statistics for a date range
-// @Tags Manufacturing
-// @Accept json
-// @Produce json
-// @Param date_from query string false "Start date (YYYY-MM-DD)"
-// @Param date_to query string false "End date (YYYY-MM-DD)"
-// @Success 200 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 500 {object} response.Response
-// @Security BearerAuth
-// @Router /manufacturing/quality-stats [get]
-func (h *Handler) GetQualityStats(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	dateFrom := c.Query("date_from")
-	dateTo := c.Query("date_to")
-
-	query := `
-		SELECT
-			COUNT(*) as total_checks,
-			COUNT(*) FILTER (WHERE result = 'passed') as passed,
-			COUNT(*) FILTER (WHERE result = 'failed') as failed,
-			COUNT(*) FILTER (WHERE result = 'partial') as partial,
-			COALESCE(SUM(quantity_inspected), 0) as total_inspected,
-			COALESCE(SUM(quantity_passed), 0) as total_passed,
-			COALESCE(SUM(quantity_failed), 0) as total_failed,
-			COALESCE(AVG(pass_rate), 0) as avg_pass_rate
-		FROM quality_checks
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-	`
-
-	args := []interface{}{tenantID}
-	argCount := 1
-
-	if dateFrom != "" {
-		argCount++
-		query += fmt.Sprintf(" AND inspection_date >= $%d", argCount)
-		args = append(args, dateFrom)
-	}
-	if dateTo != "" {
-		argCount++
-		query += fmt.Sprintf(" AND inspection_date <= $%d", argCount)
-		args = append(args, dateTo)
-	}
-
-	var stats struct {
-		TotalChecks     int     `json:"total_checks"`
-		Passed          int     `json:"passed"`
-		Failed          int     `json:"failed"`
-		Partial         int     `json:"partial"`
-		TotalInspected  float64 `json:"total_inspected"`
-		TotalPassed     float64 `json:"total_passed"`
-		TotalFailed     float64 `json:"total_failed"`
-		AveragePassRate float64 `json:"average_pass_rate"`
-	}
-
-	err := h.db.QueryRow(query, args...).Scan(
-		&stats.TotalChecks, &stats.Passed, &stats.Failed, &stats.Partial,
-		&stats.TotalInspected, &stats.TotalPassed, &stats.TotalFailed, &stats.AveragePassRate,
-	)
-	if err != nil {
-		h.log.Error("Failed to get quality stats", "error", err)
-		response.InternalError(c, "Failed to retrieve quality statistics")
-		return
-	}
-
-	// Get top defects
-	defectsQuery := `
-		SELECT defect_type, COUNT(*) as count
-		FROM quality_checks
-		WHERE tenant_id = $1 AND deleted_at IS NULL AND defect_type IS NOT NULL
-		GROUP BY defect_type
-		ORDER BY count DESC
-		LIMIT 5
-	`
-	rows, err := h.db.Query(defectsQuery, tenantID)
-	if err != nil {
-		h.log.Error("Failed to query top defects", "error", err)
-		// Continue with empty defects rather than failing the whole request
-		response.Success(c, map[string]interface{}{
-			"summary":     stats,
-			"top_defects": []map[string]interface{}{},
-		})
-		return
-	}
-	defer rows.Close()
-
-	topDefects := make([]map[string]interface{}, 0)
-	for rows.Next() {
-		var defectType string
-		var count int
-		if err := rows.Scan(&defectType, &count); err != nil {
-			h.log.Error("Failed to scan defect", "error", err)
-			continue
-		}
-		topDefects = append(topDefects, map[string]interface{}{
-			"defect_type": defectType,
-			"count":       count,
-		})
-	}
-
-	// Ensure we always return an array, even if empty
-	if topDefects == nil {
-		topDefects = make([]map[string]interface{}, 0)
-	}
-
-	response.Success(c, map[string]interface{}{
-		"summary":     stats,
-		"top_defects": topDefects,
-	})
-}
-
-// ListQualityDefects godoc
-// @Summary List quality defects
-// @Description Get all quality defect types
-// @Tags Manufacturing
-// @Accept json
-// @Produce json
-// @Success 200 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 500 {object} response.Response
-// @Security BearerAuth
-// @Router /manufacturing/quality-defects [get]
-func (h *Handler) ListQualityDefects(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	query := `
-		SELECT id, code, name, description, category, severity, default_action, is_active, created_at, updated_at
-		FROM quality_defects
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-		ORDER BY name ASC
-	`
-
-	rows, err := h.db.Query(query, tenantID)
-	if err != nil {
-		h.log.Error("Failed to list quality defects", "error", err)
-		response.InternalError(c, "Failed to retrieve quality defects")
-		return
-	}
-	defer rows.Close()
-
-	// Initialize as empty array to ensure JSON marshals to [] not null
-	defects := make([]entity.QualityDefect, 0)
-	for rows.Next() {
-		var d entity.QualityDefect
-		err := rows.Scan(&d.ID, &d.Code, &d.Name, &d.Description, &d.Category, &d.Severity, &d.DefaultAction, &d.IsActive, &d.CreatedAt, &d.UpdatedAt)
-		if err != nil {
-			h.log.Error("Failed to scan quality defect", "error", err)
-			continue
-		}
-		d.TenantID = tenantID
-		defects = append(defects, d)
-	}
-
-	// Ensure we always return an array, never nil
-	if defects == nil {
-		defects = make([]entity.QualityDefect, 0)
-	}
-
-	response.Success(c, defects)
-}
-
-// CreateQualityDefect godoc
-// @Summary Create quality defect
-// @Description Create a new quality defect type
-// @Tags Manufacturing
-// @Accept json
-// @Produce json
-// @Param input body entity.QualityDefectInput true "Quality defect input"
-// @Success 201 {object} response.Response
-// @Failure 400 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 500 {object} response.Response
-// @Security BearerAuth
-// @Router /manufacturing/quality-defects [post]
-func (h *Handler) CreateQualityDefect(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-
-	var input entity.QualityDefectInput
-	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
-		return
-	}
-
-	severity := "minor"
-	if input.Severity != nil {
-		severity = *input.Severity
-	}
-	defaultAction := "rework"
-	if input.DefaultAction != nil {
-		defaultAction = *input.DefaultAction
-	}
-	isActive := true
-	if input.IsActive != nil {
-		isActive = *input.IsActive
+	if input.WarrantyExpiry != nil && *input.WarrantyExpiry != "" {
+		warrantyExpiry = *input.WarrantyExpiry
 	}
 
 	id := uuid.New()
 	now := time.Now()
 
-	query := `
-		INSERT INTO quality_defects (id, tenant_id, code, name, description, category, severity, default_action, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-	`
-
-	_, err := h.db.Exec(query, id, tenantID, input.Code, input.Name, input.Description, input.Category, severity, defaultAction, isActive, now, now)
+	_, err := h.db.Exec(`
+		INSERT INTO manufacturing_equipment (
+			id, tenant_id, code, name, description, equipment_type, category,
+			work_center_id, manufacturer, model, serial_number,
+			purchase_date, warranty_expiry, status,
+			maintenance_interval_days, purchase_cost, current_value, hourly_rate,
+			notes, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	`, id, tenantID, input.Code, input.Name, input.Description, input.EquipmentType, input.Category,
+		workCenterID, input.Manufacturer, input.Model, input.SerialNumber,
+		purchaseDate, warrantyExpiry, input.Status,
+		input.MaintenanceIntervalDays, input.PurchaseCost, input.CurrentValue, input.HourlyRate,
+		input.Notes, userID, now, now)
 	if err != nil {
-		h.log.Error("Failed to create quality defect", "error", err)
+		h.log.Error("Failed to create equipment", "error", err)
 		if strings.Contains(err.Error(), "unique") {
-			response.BadRequest(c, "Defect code already exists")
+			response.BadRequest(c, "Equipment code already exists")
 			return
 		}
-		response.InternalError(c, "Failed to create quality defect")
+		response.InternalError(c, "Failed to create equipment")
 		return
 	}
 
-	response.Created(c, entity.QualityDefect{
-		ID:            id,
-		TenantID:      tenantID,
-		Code:          input.Code,
-		Name:          input.Name,
-		Description:   input.Description,
-		Category:      input.Category,
-		Severity:      severity,
-		DefaultAction: defaultAction,
-		IsActive:      isActive,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	})
+	response.Created(c, gin.H{"id": id, "code": input.Code, "name": input.Name, "status": input.Status})
+}
+
+func (h *Handler) UpdateEquipment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	equipID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid equipment ID")
+		return
+	}
+
+	var input struct {
+		Name                    *string  `json:"name"`
+		Description             *string  `json:"description"`
+		EquipmentType           *string  `json:"equipment_type"`
+		Category                *string  `json:"category"`
+		WorkCenterID            *string  `json:"work_center_id"`
+		Manufacturer            *string  `json:"manufacturer"`
+		Model                   *string  `json:"model"`
+		SerialNumber            *string  `json:"serial_number"`
+		PurchaseDate            *string  `json:"purchase_date"`
+		WarrantyExpiry          *string  `json:"warranty_expiry"`
+		Status                  *string  `json:"status"`
+		MaintenanceIntervalDays *int     `json:"maintenance_interval_days"`
+		PurchaseCost            *float64 `json:"purchase_cost"`
+		CurrentValue            *float64 `json:"current_value"`
+		HourlyRate              *float64 `json:"hourly_rate"`
+		Notes                   *string  `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if input.Name != nil { argCount++; updates = append(updates, fmt.Sprintf("name = $%d", argCount)); args = append(args, *input.Name) }
+	if input.Description != nil { argCount++; updates = append(updates, fmt.Sprintf("description = $%d", argCount)); args = append(args, *input.Description) }
+	if input.EquipmentType != nil { argCount++; updates = append(updates, fmt.Sprintf("equipment_type = $%d", argCount)); args = append(args, *input.EquipmentType) }
+	if input.Category != nil { argCount++; updates = append(updates, fmt.Sprintf("category = $%d", argCount)); args = append(args, *input.Category) }
+	if input.WorkCenterID != nil {
+		if *input.WorkCenterID == "" {
+			argCount++; updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount)); args = append(args, nil)
+		} else if id, err := uuid.Parse(*input.WorkCenterID); err == nil {
+			argCount++; updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount)); args = append(args, id)
+		}
+	}
+	if input.Manufacturer != nil { argCount++; updates = append(updates, fmt.Sprintf("manufacturer = $%d", argCount)); args = append(args, *input.Manufacturer) }
+	if input.Model != nil { argCount++; updates = append(updates, fmt.Sprintf("model = $%d", argCount)); args = append(args, *input.Model) }
+	if input.SerialNumber != nil { argCount++; updates = append(updates, fmt.Sprintf("serial_number = $%d", argCount)); args = append(args, *input.SerialNumber) }
+	if input.Status != nil { argCount++; updates = append(updates, fmt.Sprintf("status = $%d", argCount)); args = append(args, *input.Status) }
+	if input.PurchaseCost != nil { argCount++; updates = append(updates, fmt.Sprintf("purchase_cost = $%d", argCount)); args = append(args, *input.PurchaseCost) }
+	if input.CurrentValue != nil { argCount++; updates = append(updates, fmt.Sprintf("current_value = $%d", argCount)); args = append(args, *input.CurrentValue) }
+	if input.HourlyRate != nil { argCount++; updates = append(updates, fmt.Sprintf("hourly_rate = $%d", argCount)); args = append(args, *input.HourlyRate) }
+	if input.MaintenanceIntervalDays != nil { argCount++; updates = append(updates, fmt.Sprintf("maintenance_interval_days = $%d", argCount)); args = append(args, *input.MaintenanceIntervalDays) }
+	if input.Notes != nil { argCount++; updates = append(updates, fmt.Sprintf("notes = $%d", argCount)); args = append(args, *input.Notes) }
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	argCount++; updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount)); args = append(args, time.Now())
+	argCount++; args = append(args, equipID)
+	argCount++; args = append(args, tenantID)
+
+	query := fmt.Sprintf("UPDATE manufacturing_equipment SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
+		strings.Join(updates, ", "), argCount-1, argCount)
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update equipment", "error", err)
+		response.InternalError(c, "Failed to update equipment")
+		return
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Equipment not found")
+		return
+	}
+	response.Success(c, gin.H{"message": "Equipment updated successfully"})
+}
+
+func (h *Handler) DeleteEquipment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	equipID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid equipment ID")
+		return
+	}
+
+	result, err := h.db.Exec(
+		"UPDATE manufacturing_equipment SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL",
+		time.Now(), equipID, tenantID,
+	)
+	if err != nil {
+		response.InternalError(c, "Failed to delete equipment")
+		return
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Equipment not found")
+		return
+	}
+	response.Success(c, gin.H{"message": "Equipment deleted"})
+}
+
+func (h *Handler) ListMaintenanceTasks(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	equipID := c.Param("id")
+
+	rows, err := h.db.Query(`
+		SELECT m.id, m.equipment_id, m.work_center_id, m.maintenance_type,
+			   m.scheduled_date, m.actual_date, m.duration_hours,
+			   m.description, m.work_performed, m.status,
+			   m.labor_cost, m.parts_cost, m.total_cost, m.notes,
+			   m.created_at, m.updated_at
+		FROM equipment_maintenance m
+		WHERE m.tenant_id = $1 AND m.equipment_id = $2
+		ORDER BY m.scheduled_date DESC
+	`, tenantID, equipID)
+	if err != nil {
+		h.log.Error("Failed to list maintenance tasks", "error", err)
+		response.InternalError(c, "Failed to list maintenance tasks")
+		return
+	}
+	defer rows.Close()
+
+	type MaintenanceTask struct {
+		ID              uuid.UUID  `json:"id"`
+		EquipmentID     uuid.UUID  `json:"equipment_id"`
+		WorkCenterID    *uuid.UUID `json:"work_center_id,omitempty"`
+		MaintenanceType string     `json:"maintenance_type"`
+		ScheduledDate   *string    `json:"scheduled_date,omitempty"`
+		ActualDate      *string    `json:"actual_date,omitempty"`
+		DurationHours   float64    `json:"duration_hours"`
+		Description     *string    `json:"description,omitempty"`
+		WorkPerformed   *string    `json:"work_performed,omitempty"`
+		Status          string     `json:"status"`
+		LaborCost       float64    `json:"labor_cost"`
+		PartsCost       float64    `json:"parts_cost"`
+		TotalCost       float64    `json:"total_cost"`
+		Notes           *string    `json:"notes,omitempty"`
+		CreatedAt       time.Time  `json:"created_at"`
+		UpdatedAt       time.Time  `json:"updated_at"`
+	}
+
+	tasks := []MaintenanceTask{}
+	for rows.Next() {
+		var t MaintenanceTask
+		var workCenterID sql.NullString
+		var scheduledDate, actualDate sql.NullTime
+		var description, workPerformed, notes sql.NullString
+
+		err := rows.Scan(
+			&t.ID, &t.EquipmentID, &workCenterID, &t.MaintenanceType,
+			&scheduledDate, &actualDate, &t.DurationHours,
+			&description, &workPerformed, &t.Status,
+			&t.LaborCost, &t.PartsCost, &t.TotalCost, &notes,
+			&t.CreatedAt, &t.UpdatedAt,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan maintenance task", "error", err)
+			continue
+		}
+		if workCenterID.Valid { id, _ := uuid.Parse(workCenterID.String); t.WorkCenterID = &id }
+		if scheduledDate.Valid { s := scheduledDate.Time.Format("2006-01-02"); t.ScheduledDate = &s }
+		if actualDate.Valid { s := actualDate.Time.Format("2006-01-02"); t.ActualDate = &s }
+		if description.Valid { t.Description = &description.String }
+		if workPerformed.Valid { t.WorkPerformed = &workPerformed.String }
+		if notes.Valid { t.Notes = &notes.String }
+		tasks = append(tasks, t)
+	}
+
+	response.Success(c, tasks)
+}
+
+func (h *Handler) CreateMaintenanceTask(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	equipIDStr := c.Param("id")
+	equipID, err := uuid.Parse(equipIDStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid equipment ID")
+		return
+	}
+
+	var input struct {
+		MaintenanceType string  `json:"maintenance_type" binding:"required"`
+		ScheduledDate   string  `json:"scheduled_date" binding:"required"`
+		Description     *string `json:"description"`
+		DurationHours   float64 `json:"duration_hours"`
+		LaborCost       float64 `json:"labor_cost"`
+		PartsCost       float64 `json:"parts_cost"`
+		Notes           *string `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	id := uuid.New()
+	now := time.Now()
+	totalCost := input.LaborCost + input.PartsCost
+
+	_, err = h.db.Exec(`
+		INSERT INTO equipment_maintenance (
+			id, tenant_id, equipment_id, maintenance_type,
+			scheduled_date, duration_hours, description,
+			status, labor_cost, parts_cost, total_cost, notes,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'scheduled', $8, $9, $10, $11, $12, $12)
+	`, id, tenantID, equipID, input.MaintenanceType,
+		input.ScheduledDate, input.DurationHours, input.Description,
+		input.LaborCost, input.PartsCost, totalCost, input.Notes, now)
+	if err != nil {
+		h.log.Error("Failed to create maintenance task", "error", err)
+		response.InternalError(c, "Failed to create maintenance task")
+		return
+	}
+
+	// Update next_maintenance_date on the equipment
+	h.db.Exec("UPDATE manufacturing_equipment SET next_maintenance_date = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+		input.ScheduledDate, now, equipID, tenantID)
+
+	response.Created(c, gin.H{"id": id, "status": "scheduled"})
+}
+
+func (h *Handler) CompleteMaintenanceTask(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	equipID := c.Param("id")
+	taskID, err := uuid.Parse(c.Param("task_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid task ID")
+		return
+	}
+
+	var input struct {
+		WorkPerformed string  `json:"work_performed"`
+		DurationHours float64 `json:"duration_hours"`
+		LaborCost     float64 `json:"labor_cost"`
+		PartsCost     float64 `json:"parts_cost"`
+		Notes         *string `json:"notes"`
+	}
+	c.ShouldBindJSON(&input)
+
+	now := time.Now()
+	totalCost := input.LaborCost + input.PartsCost
+	today := now.Format("2006-01-02")
+
+	result, err := h.db.Exec(`
+		UPDATE equipment_maintenance
+		SET status = 'completed', actual_date = $1, work_performed = $2,
+			duration_hours = $3, labor_cost = $4, parts_cost = $5, total_cost = $6,
+			notes = $7, updated_at = $8
+		WHERE id = $9 AND tenant_id = $10 AND equipment_id = $11
+	`, today, input.WorkPerformed, input.DurationHours,
+		input.LaborCost, input.PartsCost, totalCost, input.Notes, now,
+		taskID, tenantID, equipID)
+	if err != nil {
+		h.log.Error("Failed to complete maintenance task", "error", err)
+		response.InternalError(c, "Failed to complete maintenance task")
+		return
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Maintenance task not found")
+		return
+	}
+
+	// Update last_maintenance_date on equipment
+	h.db.Exec("UPDATE manufacturing_equipment SET last_maintenance_date = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+		today, now, equipID, tenantID)
+
+	response.Success(c, gin.H{"message": "Maintenance task completed"})
+}
+
+func (h *Handler) UpdateMaintenanceTask(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	equipID := c.Param("id")
+	taskID, err := uuid.Parse(c.Param("task_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid task ID")
+		return
+	}
+
+	var input struct {
+		MaintenanceType *string  `json:"maintenance_type"`
+		ScheduledDate   *string  `json:"scheduled_date"`
+		DurationHours   *float64 `json:"duration_hours"`
+		Description     *string  `json:"description"`
+		Notes           *string  `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if input.MaintenanceType != nil { argCount++; updates = append(updates, fmt.Sprintf("maintenance_type = $%d", argCount)); args = append(args, *input.MaintenanceType) }
+	if input.ScheduledDate != nil { argCount++; updates = append(updates, fmt.Sprintf("scheduled_date = $%d", argCount)); args = append(args, *input.ScheduledDate) }
+	if input.DurationHours != nil { argCount++; updates = append(updates, fmt.Sprintf("duration_hours = $%d", argCount)); args = append(args, *input.DurationHours) }
+	if input.Description != nil { argCount++; updates = append(updates, fmt.Sprintf("description = $%d", argCount)); args = append(args, *input.Description) }
+	if input.Notes != nil { argCount++; updates = append(updates, fmt.Sprintf("notes = $%d", argCount)); args = append(args, *input.Notes) }
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	argCount++; updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount)); args = append(args, time.Now())
+	argCount++; args = append(args, taskID)
+	argCount++; args = append(args, tenantID)
+	argCount++; args = append(args, equipID)
+
+	query := fmt.Sprintf(
+		"UPDATE equipment_maintenance SET %s WHERE id = $%d AND tenant_id = $%d AND equipment_id = $%d",
+		strings.Join(updates, ", "), argCount-2, argCount-1, argCount,
+	)
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update maintenance task", "error", err)
+		response.InternalError(c, "Failed to update maintenance task")
+		return
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Maintenance task not found")
+		return
+	}
+	response.Success(c, gin.H{"message": "Maintenance task updated"})
 }

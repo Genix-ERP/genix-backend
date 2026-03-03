@@ -1631,7 +1631,7 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			   b.created_at,
 			   p.code as product_code, p.name as product_name,
 			   (SELECT COUNT(*) FROM bom_lines bl WHERE bl.bom_id = b.id) as line_count,
-			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(cp.cost_price, 0) * (1 + bl2.scrap_percent/100))
+			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(NULLIF(cp.cost_price, 0), cp.list_price, 0) * (1 + bl2.scrap_percent/100))
 			     FROM bom_lines bl2 JOIN products cp ON bl2.component_id = cp.id
 			     WHERE bl2.bom_id = b.id), 0) as total_cost
 		FROM product_boms b
@@ -1803,7 +1803,7 @@ func (h *Handler) GetBOM(c *gin.Context) {
 	rows, err := h.db.Query(`
 		SELECT l.id, l.line_number, l.component_id, l.quantity, l.unit_of_measure,
 			   l.scrap_percent, l.is_optional,
-			   p.code as component_code, p.name as component_name, COALESCE(p.cost_price, 0) as unit_cost
+			   p.code as component_code, p.name as component_name, COALESCE(NULLIF(p.cost_price, 0), p.list_price, 0) as unit_cost
 		FROM bom_lines l
 		JOIN products p ON l.component_id = p.id
 		WHERE l.bom_id = $1
