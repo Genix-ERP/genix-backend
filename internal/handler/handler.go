@@ -1544,6 +1544,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/material-requests", h.ListMaterialRequests)
 		constructionProjects.POST("/:id/material-requests", middleware.RequirePermission("construction", "projects", "update"), h.CreateMaterialRequest)
 
+		// Project Materials (tracked approved materials per project)
+		constructionProjects.GET("/:id/project-materials", h.ListProjectMaterials)
+
 		// Deliveries
 		constructionProjects.GET("/:id/deliveries", h.ListDeliveries)
 
