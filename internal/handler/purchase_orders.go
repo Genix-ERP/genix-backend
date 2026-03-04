@@ -1187,7 +1187,7 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 					id, tenant_id, operation_id, product_id,
 					expected_qty, done_qty, uom, unit_price,
 					quality_status, created_at, updated_at
-				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,0,$5,$6,'good',$7,$7)
+				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
 			`,
 				tenantID, opID, productID,
 				qty, uom, unitPrice, now,
@@ -1427,6 +1427,79 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 				WHERE id = $2 AND tenant_id = $3
 			`, now, opID, tenantID)
 		}
+	}
+
+	// Update inventory for received line items
+	var poWarehouseID sql.NullString
+	h.db.QueryRow("SELECT warehouse_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID)
+
+	for _, line := range input.Lines {
+		lineID, err := uuid.Parse(line.LineID)
+		if err != nil {
+			continue
+		}
+
+		var productID uuid.UUID
+		var unitPrice float64
+		var lineWarehouseID sql.NullString
+		err = h.db.QueryRow(`
+			SELECT product_id, unit_price, warehouse_id
+			FROM purchase_order_lines WHERE id = $1 AND purchase_order_id = $2
+		`, lineID, id).Scan(&productID, &unitPrice, &lineWarehouseID)
+		if err != nil {
+			continue
+		}
+
+		// Use line warehouse, fall back to PO warehouse
+		whStr := lineWarehouseID
+		if !whStr.Valid || whStr.String == "" {
+			whStr = poWarehouseID
+		}
+		if !whStr.Valid || whStr.String == "" {
+			continue
+		}
+		warehouseID, err := uuid.Parse(whStr.String)
+		if err != nil {
+			continue
+		}
+
+		// Get or create inventory record
+		var inventoryID uuid.UUID
+		err = h.db.QueryRow(`
+			SELECT id FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+		`, tenantID, productID, warehouseID).Scan(&inventoryID)
+
+		if err == sql.ErrNoRows {
+			inventoryID = uuid.New()
+			h.db.Exec(`
+				INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $6)
+			`, inventoryID, tenantID, productID, warehouseID, unitPrice, now)
+		}
+
+		// Update inventory quantity
+		_, err = h.db.Exec(`
+			UPDATE inventory
+			SET quantity_on_hand = quantity_on_hand + $1,
+				unit_cost = $2,
+				last_movement_date = $3,
+				updated_at = $3
+			WHERE id = $4
+		`, line.QuantityReceived, unitPrice, now, inventoryID)
+		if err != nil {
+			h.log.Error("Failed to update inventory from PO receive", "error", err, "inventory_id", inventoryID)
+		}
+
+		// Create inventory transaction for audit trail
+		txnID := uuid.New()
+		h.db.Exec(`
+			INSERT INTO inventory_transactions (
+				id, tenant_id, inventory_id, transaction_type, quantity,
+				unit_cost, total_cost, reference_type, reference_id,
+				reason, transaction_date, created_at
+			) VALUES ($1, $2, $3, 'receipt', $4, $5, $6, 'purchase_order', $7, 'PO Goods Receipt', $8, $8)
+		`, txnID, tenantID, inventoryID, line.QuantityReceived, unitPrice, line.QuantityReceived*unitPrice, id, now)
 	}
 
 	response.Success(c, gin.H{
