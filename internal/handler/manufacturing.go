@@ -2123,8 +2123,26 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		producedQty = input.QuantityProduced
 	}
 
+	// Calculate unit cost from BOM components
 	var unitCost float64
-	h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
+	if bomID != nil {
+		var bomOutputQty float64
+		if h.db.QueryRow(`SELECT COALESCE(quantity, 1) FROM product_boms WHERE id = $1`, bomID).Scan(&bomOutputQty) == nil && bomOutputQty > 0 {
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(bl.quantity * COALESCE(p.cost_price, 0) * (1 + COALESCE(bl.scrap_percent, 0) / 100.0)), 0) / $1
+				FROM bom_lines bl
+				JOIN products p ON p.id = bl.component_id
+				WHERE bl.bom_id = $2
+			`, bomOutputQty, bomID).Scan(&unitCost)
+		}
+	}
+	if unitCost <= 0 {
+		h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
+	}
+	// Update product's cost_price
+	if unitCost > 0 {
+		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
+	}
 
 	tx, txErr := h.db.Begin()
 	if txErr != nil {
