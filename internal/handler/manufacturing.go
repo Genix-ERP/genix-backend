@@ -1864,7 +1864,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				compErr := tx.QueryRow(`
 					SELECT id FROM inventory
 					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-					AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+					AND lot_number IS NULL AND serial_number IS NULL
 				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
 
 				if compErr != nil {
@@ -2139,7 +2139,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	err = tx.QueryRow(`
 		SELECT id FROM inventory
 		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-		AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+		AND lot_number IS NULL AND serial_number IS NULL
 	`, tenantID, productID, warehouseID).Scan(&invID)
 
 	if err == sql.ErrNoRows {
