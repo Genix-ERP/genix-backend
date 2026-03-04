@@ -1799,6 +1799,15 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// Auto-assign first warehouse if none set on the production order
+	if warehouseID == nil {
+		var firstWH uuid.UUID
+		if h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
+			warehouseID = &firstWH
+			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, id, tenantID)
+		}
+	}
+
 	// Only consume if we have a BOM and warehouse
 	if bomID != nil && warehouseID != nil {
 		// Check if materials were already consumed (prevent double-deduction on pause/resume)
@@ -2098,9 +2107,15 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	}
 
 	if warehouseID == nil {
-		h.log.Warn("Production order has no warehouse, skipping inventory update", "order_id", id)
-		h.GetProductionOrder(c)
-		return
+		var firstWH uuid.UUID
+		if h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
+			warehouseID = &firstWH
+			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, id, tenantID)
+		} else {
+			h.log.Warn("Production order has no warehouse and no warehouses exist, skipping inventory update", "order_id", id)
+			h.GetProductionOrder(c)
+			return
+		}
 	}
 
 	producedQty := qtyProduced

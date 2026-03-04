@@ -337,6 +337,21 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 		VALUES ($1, $2, $3, $4, 'work', $5, $6, $7)
 	`, uuid.New(), tenantID, woID, now, operatorID, operatorName, input.Notes)
 
+	// Get production_order_id for this work order
+	var poID uuid.UUID
+	h.db.QueryRow(`SELECT production_order_id FROM work_orders WHERE id = $1 AND tenant_id = $2`, woID, tenantID).Scan(&poID)
+
+	if poID != uuid.Nil {
+		// If PO is not yet in_progress, start it (consumes materials)
+		var poStatus string
+		h.db.QueryRow(`SELECT status FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&poStatus)
+		if poStatus != "in_progress" {
+			h.db.Exec(`UPDATE production_orders SET status = 'in_progress', actual_start = $1, updated_at = $1 WHERE id = $2 AND tenant_id = $3`, now, poID, tenantID)
+			// Consume BOM materials if not already consumed
+			h.consumeBOMComponents(poID, tenantID, operatorID, now)
+		}
+	}
+
 	response.Success(c, gin.H{"message": "Work order started", "actual_start": now})
 }
 
@@ -421,6 +436,22 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		ORDER BY sequence ASC LIMIT 1
 	`, productionOrderID, tenantID, currentSequence).Scan(&nextWoID, &nextSequence)
 
+	// Recalculate production order progress_percent from completed work orders
+	var totalWOs, completedWOs int
+	h.db.QueryRow(`
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE status IN ('completed', 'done'))
+		FROM work_orders
+		WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, productionOrderID, tenantID).Scan(&totalWOs, &completedWOs)
+	progressPct := 0.0
+	if totalWOs > 0 {
+		progressPct = float64(completedWOs) / float64(totalWOs) * 100.0
+	}
+	h.db.Exec(`
+		UPDATE production_orders SET progress_percent = $1, updated_at = $2
+		WHERE id = $3 AND tenant_id = $4
+	`, progressPct, now, productionOrderID, tenantID)
+
 	if nextErr == nil {
 		// Auto-start next work order
 		h.db.Exec(`
@@ -446,12 +477,23 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		`, productionOrderID, tenantID).Scan(&incompleteCount)
 
 		if incompleteCount == 0 {
-			// All work orders done — mark production order as completed
+			// All work orders done — mark production order as completed at 100%
+			// Sum quantity_produced from all work orders
+			var totalProduced float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(quantity_produced), 0) FROM work_orders
+				WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+			`, productionOrderID, tenantID).Scan(&totalProduced)
+
 			h.db.Exec(`
 				UPDATE production_orders
-				SET status = 'completed', current_stage = 'done', actual_end = $1, updated_at = $1
-				WHERE id = $2 AND tenant_id = $3
-			`, now, productionOrderID, tenantID)
+				SET status = 'completed', current_stage = 'done', progress_percent = 100,
+				    quantity_produced = $1, actual_end = $2, updated_at = $2
+				WHERE id = $3 AND tenant_id = $4
+			`, totalProduced, now, productionOrderID, tenantID)
+
+			// Add finished goods to inventory
+			h.receiveFinishedGoods(productionOrderID, tenantID, userID, totalProduced, now)
 		}
 	}
 
@@ -1192,4 +1234,164 @@ func getNextStepMessage(transferType string) string {
 	default:
 		return ""
 	}
+}
+
+// consumeBOMComponents deducts BOM component quantities from inventory for a production order.
+// It is idempotent — if Issue transactions already exist for this PO it does nothing.
+func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now time.Time) {
+	// Guard: skip if already consumed
+	var existing int
+	h.db.QueryRow(`
+		SELECT COUNT(*) FROM inventory_transactions
+		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2 AND transaction_type = 'issue'
+	`, tenantID, poID).Scan(&existing)
+	if existing > 0 {
+		return
+	}
+
+	var bomID *uuid.UUID
+	var warehouseID *uuid.UUID
+	var organizationID *uuid.UUID
+	var qtyPlanned float64
+	err := h.db.QueryRow(`
+		SELECT bom_id, warehouse_id, organization_id, quantity_planned
+		FROM production_orders WHERE id = $1 AND tenant_id = $2
+	`, poID, tenantID).Scan(&bomID, &warehouseID, &organizationID, &qtyPlanned)
+	if err != nil || bomID == nil || warehouseID == nil {
+		return
+	}
+
+	type bomComponent struct {
+		ComponentID  uuid.UUID
+		Quantity     float64
+		ScrapPercent float64
+		BOMOutputQty float64
+	}
+	rows, err := h.db.Query(`
+		SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), pb.quantity
+		FROM bom_lines bl
+		JOIN product_boms pb ON pb.id = bl.bom_id
+		WHERE bl.bom_id = $1
+	`, bomID)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	var components []bomComponent
+	for rows.Next() {
+		var c bomComponent
+		if rows.Scan(&c.ComponentID, &c.Quantity, &c.ScrapPercent, &c.BOMOutputQty) == nil {
+			components = append(components, c)
+		}
+	}
+	rows.Close()
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	for _, comp := range components {
+		bomOutputQty := comp.BOMOutputQty
+		if bomOutputQty <= 0 {
+			bomOutputQty = 1
+		}
+		totalNeeded := comp.Quantity * (1 + comp.ScrapPercent/100) * (qtyPlanned / bomOutputQty)
+
+		var invID uuid.UUID
+		var unitCost float64
+		err = tx.QueryRow(`
+			SELECT id, COALESCE(unit_cost, 0) FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+			AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+		`, tenantID, comp.ComponentID, warehouseID).Scan(&invID, &unitCost)
+		if err != nil {
+			continue
+		}
+
+		tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+			totalNeeded, now, invID)
+
+		tx.Exec(`
+			INSERT INTO inventory_transactions (
+				id, tenant_id, organization_id, inventory_id, transaction_type,
+				reference_type, reference_id, quantity, unit_cost, total_cost,
+				reason, notes, transaction_date, created_by, created_at
+			) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Materials consumed for production',  $9,$10,$9)
+		`, uuid.New(), tenantID, organizationID, invID, poID, totalNeeded, unitCost, totalNeeded*unitCost, now, userID)
+	}
+
+	tx.Commit()
+}
+
+// receiveFinishedGoods adds the produced quantity of the finished product to inventory.
+// It is idempotent — if Receipt transactions already exist for this PO it does nothing.
+func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, producedQty float64, now time.Time) {
+	// Guard: skip if already received
+	var existing int
+	h.db.QueryRow(`
+		SELECT COUNT(*) FROM inventory_transactions
+		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2 AND transaction_type = 'receipt'
+	`, tenantID, poID).Scan(&existing)
+	if existing > 0 {
+		return
+	}
+
+	var productID uuid.UUID
+	var warehouseID *uuid.UUID
+	var organizationID *uuid.UUID
+	var qtyPlanned float64
+	err := h.db.QueryRow(`
+		SELECT product_id, warehouse_id, organization_id, quantity_planned
+		FROM production_orders WHERE id = $1 AND tenant_id = $2
+	`, poID, tenantID).Scan(&productID, &warehouseID, &organizationID, &qtyPlanned)
+	if err != nil || warehouseID == nil {
+		return
+	}
+
+	if producedQty <= 0 {
+		producedQty = qtyPlanned
+	}
+
+	var unitCost float64
+	h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	var invID uuid.UUID
+	err = tx.QueryRow(`
+		SELECT id FROM inventory
+		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+		AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+	`, tenantID, productID, warehouseID).Scan(&invID)
+
+	if err == sql.ErrNoRows {
+		invID = uuid.New()
+		tx.Exec(`
+			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id,
+				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$8,$8)
+		`, invID, tenantID, organizationID, productID, warehouseID, producedQty, unitCost, now)
+	} else if err == nil {
+		tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+			producedQty, now, invID)
+	} else {
+		return
+	}
+
+	tx.Exec(`
+		INSERT INTO inventory_transactions (
+			id, tenant_id, organization_id, inventory_id, transaction_type,
+			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reason, notes, transaction_date, created_by, created_at
+		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'production_complete','Finished goods from production order',$9,$10,$9)
+	`, uuid.New(), tenantID, organizationID, invID, poID, producedQty, unitCost, producedQty*unitCost, now, userID)
+
+	tx.Commit()
 }
