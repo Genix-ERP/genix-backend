@@ -1355,8 +1355,29 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		producedQty = qtyPlanned
 	}
 
+	// Calculate unit cost from BOM components (sum of component costs / bom output qty)
+	var bomID *uuid.UUID
+	h.db.QueryRow(`SELECT bom_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&bomID)
+
 	var unitCost float64
-	h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
+	if bomID != nil {
+		var bomOutputQty float64
+		if h.db.QueryRow(`SELECT COALESCE(quantity, 1) FROM product_boms WHERE id = $1`, bomID).Scan(&bomOutputQty) == nil && bomOutputQty > 0 {
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(bl.quantity * COALESCE(p.cost_price, 0) * (1 + COALESCE(bl.scrap_percent, 0) / 100.0)), 0) / $1
+				FROM bom_lines bl
+				JOIN products p ON p.id = bl.component_id
+				WHERE bl.bom_id = $2
+			`, bomOutputQty, bomID).Scan(&unitCost)
+		}
+	}
+	if unitCost <= 0 {
+		h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
+	}
+	// Update product's cost_price with the calculated manufacturing cost
+	if unitCost > 0 {
+		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
+	}
 
 	tx, err := h.db.Begin()
 	if err != nil {
