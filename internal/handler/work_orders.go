@@ -1305,7 +1305,7 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 		err = tx.QueryRow(`
 			SELECT id, COALESCE(unit_cost, 0) FROM inventory
 			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-			AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+			AND lot_number IS NULL AND serial_number IS NULL
 		`, tenantID, comp.ComponentID, warehouseID).Scan(&invID, &unitCost)
 		if err != nil {
 			continue
@@ -1368,7 +1368,7 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 	err = tx.QueryRow(`
 		SELECT id FROM inventory
 		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-		AND lot_number IS NULL AND serial_number IS NULL AND variant_id IS NULL
+		AND lot_number IS NULL AND serial_number IS NULL
 	`, tenantID, productID, warehouseID).Scan(&invID)
 
 	if err == sql.ErrNoRows {
