@@ -1373,25 +1373,39 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 
 	if err == sql.ErrNoRows {
 		invID = uuid.New()
-		tx.Exec(`
+		if _, insertErr := tx.Exec(`
 			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id,
 				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at)
 			VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$8,$8)
-		`, invID, tenantID, organizationID, productID, warehouseID, producedQty, unitCost, now)
+		`, invID, tenantID, organizationID, productID, warehouseID, producedQty, unitCost, now); insertErr != nil {
+			h.log.Error("receiveFinishedGoods: failed to insert inventory record", "error", insertErr, "po_id", poID)
+			return
+		}
 	} else if err == nil {
-		tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-			producedQty, now, invID)
+		if _, updateErr := tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+			producedQty, now, invID); updateErr != nil {
+			h.log.Error("receiveFinishedGoods: failed to update inventory", "error", updateErr, "inv_id", invID)
+			return
+		}
 	} else {
+		h.log.Error("receiveFinishedGoods: failed to query inventory", "error", err, "po_id", poID)
 		return
 	}
 
-	tx.Exec(`
+	if _, txErr := tx.Exec(`
 		INSERT INTO inventory_transactions (
 			id, tenant_id, organization_id, inventory_id, transaction_type,
 			reference_type, reference_id, quantity, unit_cost, total_cost,
 			reason, notes, transaction_date, created_by, created_at
 		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'production_complete','Finished goods from production order',$9,$10,$9)
-	`, uuid.New(), tenantID, organizationID, invID, poID, producedQty, unitCost, producedQty*unitCost, now, userID)
+	`, uuid.New(), tenantID, organizationID, invID, poID, producedQty, unitCost, producedQty*unitCost, now, userID); txErr != nil {
+		h.log.Error("receiveFinishedGoods: failed to insert inventory_transaction", "error", txErr, "po_id", poID)
+		return
+	}
 
-	tx.Commit()
+	if commitErr := tx.Commit(); commitErr != nil {
+		h.log.Error("receiveFinishedGoods: failed to commit transaction", "error", commitErr, "po_id", poID)
+	} else {
+		h.log.Info("receiveFinishedGoods: finished goods added to inventory", "po_id", poID, "qty", producedQty)
+	}
 }
