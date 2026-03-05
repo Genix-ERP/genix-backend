@@ -183,6 +183,7 @@ type ProductionOrderInput struct {
 	RequiresQualityCheck *bool      `json:"requires_quality_check,omitempty"`
 	Notes                *string    `json:"notes,omitempty"`
 	Tags                 []string   `json:"tags,omitempty"`
+	ManufacturingCategoryID *uuid.UUID `json:"manufacturing_category_id,omitempty"`
 }
 
 type ProductionOrderUpdateInput struct {
@@ -204,6 +205,7 @@ type ProductionOrderUpdateInput struct {
 	PackageCount         *int       `json:"package_count,omitempty"`
 	GoodQuantity         *float64   `json:"good_quantity,omitempty"`
 	RejectQuantity       *float64   `json:"reject_quantity,omitempty"`
+	ManufacturingCategoryID *uuid.UUID `json:"manufacturing_category_id,omitempty"`
 }
 
 type ProductionOrderResponse struct {
@@ -255,6 +257,8 @@ type ProductionOrderResponse struct {
 	Tags                 []string    `json:"tags"`
 	WorkOrders           []WorkOrder `json:"work_orders,omitempty"`
 	Stages               []ProductionOrderStageResponse `json:"stages,omitempty"`
+	ManufacturingCategoryID   *uuid.UUID `json:"manufacturing_category_id,omitempty"`
+	ManufacturingCategoryName *string    `json:"manufacturing_category_name,omitempty"`
 	CreatedBy            *uuid.UUID  `json:"created_by,omitempty"`
 	CreatedByName        *string     `json:"created_by_name,omitempty"`
 	ConfirmedAt          *string     `json:"confirmed_at,omitempty"`
@@ -269,6 +273,7 @@ type ProductionOrderFilter struct {
 	WorkCenterID *uuid.UUID `form:"work_center_id"`
 	AssignedTo   *uuid.UUID `form:"assigned_to"`
 	Priority     *int       `form:"priority"`
+	CategoryID   *uuid.UUID `form:"category_id"`
 	DateFrom     *string    `form:"date_from"`
 	DateTo       *string    `form:"date_to"`
 	Search       *string    `form:"search"`
