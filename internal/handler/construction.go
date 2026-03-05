@@ -3623,6 +3623,123 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 		}
 	}
 
+	// Auto-create expense lines for each material item + journal entries for category account
+	if totalExpense > 0 {
+		// Find "materials" cost category and its assigned account
+		var materialsCatID sql.NullInt64
+		var catDebitAccountID uuid.UUID
+		tx.QueryRow(`SELECT id, COALESCE(default_debit_account_id, '00000000-0000-0000-0000-000000000000') FROM construction_cost_categories WHERE tenant_id = $1 AND code = 'materials' AND is_active = true LIMIT 1`, tenantID).Scan(&materialsCatID, &catDebitAccountID)
+
+		// Resolve credit account (cash/bank fallback)
+		var creditAccountID uuid.UUID
+		creditAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
+		if creditAccountID == uuid.Nil {
+			creditAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+		}
+
+		// Get construction journal for journal entries
+		constJournalID := h.ensureConstructionJournal(tenantID, orgIDPtr)
+
+		for _, item := range items {
+			productIDStr, _ := item["product_id"].(string)
+			if productIDStr == "" {
+				continue
+			}
+			var qty float64
+			switch v := item["quantity"].(type) {
+			case float64:
+				qty = v
+			case json.Number:
+				qty, _ = v.Float64()
+			}
+			var unitCost float64
+			switch v := item["unit_cost"].(type) {
+			case float64:
+				unitCost = v
+			case json.Number:
+				unitCost, _ = v.Float64()
+			}
+			if unitCost == 0 {
+				pid, _ := uuid.Parse(productIDStr)
+				tx.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, pid).Scan(&unitCost)
+			}
+			lineCost := qty * unitCost
+			if lineCost <= 0 {
+				continue
+			}
+
+			productName, _ := item["product_name"].(string)
+			uom, _ := item["unit_name"].(string)
+			if productName == "" {
+				pid, _ := uuid.Parse(productIDStr)
+				tx.QueryRow(`SELECT COALESCE(name,''), COALESCE(unit_name,'') FROM products WHERE id = $1`, pid).Scan(&productName, &uom)
+			}
+
+			description := fmt.Sprintf("Material Request #%d: %s", requestID, productName)
+
+			expLineID := uuid.New()
+			tx.Exec(`SAVEPOINT sp_exp_line`)
+			_, elErr := tx.Exec(`
+				INSERT INTO construction_expense_lines (
+					id, tenant_id, organization_id, project_id, cost_category_id,
+					expense_date, description, product_id, quantity, uom, unit_price,
+					amount, currency_code,
+					document_url, status, created_by, created_at, updated_at
+				) VALUES (
+					$1, $2, $3, $4, $5,
+					$6, $7, $8, $9, $10, $11,
+					$12, 'UZS',
+					'', 'approved', $13, $14, $14
+				)
+			`,
+				expLineID, tenantID, orgIDPtr, projectID, materialsCatID,
+				now.Format("2006-01-02"), description,
+				nullUUIDFromVal(productIDStr), qty, uom, unitCost,
+				lineCost, userID, now,
+			)
+			if elErr != nil {
+				h.log.Error("expense_line insert failed", "error", elErr)
+				tx.Exec(`ROLLBACK TO SAVEPOINT sp_exp_line`)
+			} else {
+				tx.Exec(`RELEASE SAVEPOINT sp_exp_line`)
+			}
+
+			// Create journal entry to record in category's account
+			if catDebitAccountID != uuid.Nil && creditAccountID != uuid.Nil && constJournalID != uuid.Nil && lineCost > 0 {
+				tx.Exec(`SAVEPOINT sp_je_cat`)
+				jeNum := h.getNextJournalNumber(tx, constJournalID)
+				entryID := uuid.New()
+				entryNumber := fmt.Sprintf("CE%06d", jeNum)
+
+				_, jeErr := tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number,
+						entry_date, description, source_type, source_id,
+						status, total_debit, total_credit, created_at, updated_at
+					) VALUES ($1,$2,$3,$4,$5,$6,$7,'construction_expense',NULL,'posted',$8,$8,$9,$9)
+				`, entryID, tenantID, organizationID, constJournalID, entryNumber,
+					now, fmt.Sprintf("Construction Expense: %s", description),
+					lineCost, now)
+
+				if jeErr != nil {
+					h.log.Error("category journal entry failed", "error", jeErr)
+					tx.Exec(`ROLLBACK TO SAVEPOINT sp_je_cat`)
+				} else {
+					// Debit: category's expense account
+					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,$5,0,1,$6)`,
+						uuid.New(), entryID, catDebitAccountID, description, lineCost, now)
+					// Credit: cash/bank account
+					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
+						uuid.New(), entryID, creditAccountID, description, lineCost, now)
+					// Update account balances
+					tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, lineCost, now, catDebitAccountID)
+					tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, lineCost, now, creditAccountID)
+					tx.Exec(`RELEASE SAVEPOINT sp_je_cat`)
+				}
+			}
+		}
+	}
+
 	// Mark request as approved
 	_, err = tx.Exec(`
 		UPDATE construction_material_requests

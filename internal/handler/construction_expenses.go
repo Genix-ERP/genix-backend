@@ -511,6 +511,7 @@ func (h *Handler) ApproveExpenseLine(c *gin.Context) {
 	type lineData struct {
 		ProjectID       int64
 		StageID         *int64
+		CostCategoryID  *int64
 		Amount          float64
 		Description     string
 		ExpenseDate     string
@@ -522,12 +523,12 @@ func (h *Handler) ApproveExpenseLine(c *gin.Context) {
 	}
 	var ld lineData
 	err = h.db.QueryRow(`
-		SELECT project_id, stage_id, amount, description, expense_date::text, currency_code,
+		SELECT project_id, stage_id, cost_category_id, amount, description, expense_date::text, currency_code,
 		       debit_account_id, credit_account_id, analytic_account_id, status
 		FROM construction_expense_lines
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, lineID, tenantID).Scan(
-		&ld.ProjectID, &ld.StageID, &ld.Amount, &ld.Description, &ld.ExpenseDate, &ld.CurrencyCode,
+		&ld.ProjectID, &ld.StageID, &ld.CostCategoryID, &ld.Amount, &ld.Description, &ld.ExpenseDate, &ld.CurrencyCode,
 		&ld.DebitAccountID, &ld.CreditAccountID, &ld.AnalyticAccID, &ld.Status,
 	)
 	if err != nil {
@@ -553,8 +554,15 @@ func (h *Handler) ApproveExpenseLine(c *gin.Context) {
 		orgIDPtr = &organizationID
 	}
 
-	// Resolve debit account (WIP)
+	// Resolve debit account: expense line → category's default account → WIP mapping
 	debitAccID := ld.DebitAccountID
+	if (debitAccID == nil || *debitAccID == uuid.Nil) && ld.CostCategoryID != nil {
+		var catAccID uuid.UUID
+		h.db.QueryRow(`SELECT default_debit_account_id FROM construction_cost_categories WHERE id = $1 AND tenant_id = $2 AND default_debit_account_id IS NOT NULL`, *ld.CostCategoryID, tenantID).Scan(&catAccID)
+		if catAccID != uuid.Nil {
+			debitAccID = &catAccID
+		}
+	}
 	if debitAccID == nil || *debitAccID == uuid.Nil {
 		wipAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "wip_0810", "tugallanmagan qurilish", "0810")
 		if wipAcct != uuid.Nil {
@@ -572,9 +580,21 @@ func (h *Handler) ApproveExpenseLine(c *gin.Context) {
 
 	now := time.Now()
 
+	// Resolve credit account: explicit → cash/bank fallback
+	creditAccID := ld.CreditAccountID
+	if creditAccID == nil || *creditAccID == uuid.Nil {
+		cashAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "cash_5010", "kassa", "5010")
+		if cashAcct == uuid.Nil {
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+		}
+		if cashAcct != uuid.Nil {
+			creditAccID = &cashAcct
+		}
+	}
+
 	// Create journal entry (best-effort with savepoint)
 	var journalEntryID *uuid.UUID
-	if debitAccID != nil && ld.CreditAccountID != nil && *ld.CreditAccountID != uuid.Nil {
+	if debitAccID != nil && creditAccID != nil && *creditAccID != uuid.Nil {
 		journalID := h.ensureConstructionJournal(tenantID, orgIDPtr)
 		if journalID != uuid.Nil {
 			tx.Exec(`SAVEPOINT sp_je_expense`)
@@ -602,10 +622,10 @@ func (h *Handler) ApproveExpenseLine(c *gin.Context) {
 					uuid.New(), entryID, *debitAccID, ld.Description, ld.Amount, now)
 				// Credit line
 				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
-					uuid.New(), entryID, *ld.CreditAccountID, ld.Description, ld.Amount, now)
+					uuid.New(), entryID, *creditAccID, ld.Description, ld.Amount, now)
 				// Update account balances
 				tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *debitAccID)
-				tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *ld.CreditAccountID)
+				tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *creditAccID)
 				tx.Exec(`RELEASE SAVEPOINT sp_je_expense`)
 				journalEntryID = &entryID
 			}
