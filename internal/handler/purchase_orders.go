@@ -1433,6 +1433,15 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 	var poWarehouseID sql.NullString
 	h.db.QueryRow("SELECT warehouse_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID)
 
+	// Auto-assign first warehouse if PO has none
+	if !poWarehouseID.Valid || poWarehouseID.String == "" {
+		var firstWH string
+		if h.db.QueryRow(`SELECT id::text FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
+			poWarehouseID = sql.NullString{String: firstWH, Valid: true}
+			h.db.Exec(`UPDATE purchase_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, id, tenantID)
+		}
+	}
+
 	for _, line := range input.Lines {
 		lineID, err := uuid.Parse(line.LineID)
 		if err != nil {
