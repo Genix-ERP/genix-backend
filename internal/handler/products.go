@@ -61,13 +61,20 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	productType := c.Query("type")
 	includeInactive := c.Query("include_inactive") == "true"
 
-	// Build query
+	// Build query - products are shared across orgs, org-specific data comes from product_organization_settings
+	orgID, _ := middleware.GetOrganizationID(c)
+
 	baseQuery := `
 		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode,
 			   p.name, p.description, p.short_description, p.unit_id,
-			   p.cost_price, p.list_price, p.min_price,
-			   p.is_stockable, p.track_inventory, p.min_stock_level,
-			   p.reorder_point, p.reorder_quantity, p.lead_time_days,
+			   COALESCE(pos.cost_price, p.cost_price) as cost_price,
+			   COALESCE(pos.list_price, p.list_price) as list_price,
+			   COALESCE(pos.min_price, p.min_price) as min_price,
+			   p.is_stockable, p.track_inventory,
+			   COALESCE(pos.min_stock_level, p.min_stock_level) as min_stock_level,
+			   COALESCE(pos.reorder_point, p.reorder_point) as reorder_point,
+			   COALESCE(pos.reorder_quantity, p.reorder_quantity) as reorder_quantity,
+			   p.lead_time_days,
 			   p.is_purchasable, p.is_sellable,
 			   COALESCE(p.can_be_sold, p.is_sellable) as can_be_sold,
 			   COALESCE(p.can_be_purchased, p.is_purchasable) as can_be_purchased,
@@ -88,20 +95,27 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		LEFT JOIN units_of_measure u ON p.unit_id = u.id
 		LEFT JOIN units_of_measure pu ON p.purchase_unit_id = pu.id
 		LEFT JOIN units_of_measure su ON p.sales_unit_id = su.id
-		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM products p WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
+	countArgs := []interface{}{tenantID}
 	argCount := 1
+	countArgCount := 1
 
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+	// LEFT JOIN org-specific settings if org context exists
+	if orgID != uuid.Nil {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
+		baseQuery += fmt.Sprintf(`
+		LEFT JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d`, argCount)
 		args = append(args, orgID)
+	} else {
+		baseQuery += `
+		LEFT JOIN product_organization_settings pos ON false`
 	}
+	baseQuery += `
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+	`
 
 	if !includeInactive {
 		baseQuery += " AND p.is_active = true"
@@ -110,29 +124,34 @@ func (h *Handler) ListProducts(c *gin.Context) {
 
 	if categoryID != "" {
 		argCount++
+		countArgCount++
 		baseQuery += fmt.Sprintf(" AND p.category_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.category_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.category_id = $%d", countArgCount)
 		args = append(args, categoryID)
+		countArgs = append(countArgs, categoryID)
 	}
 
 	if productType != "" {
 		argCount++
+		countArgCount++
 		baseQuery += fmt.Sprintf(" AND p.type = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.type = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND p.type = $%d", countArgCount)
 		args = append(args, productType)
+		countArgs = append(countArgs, productType)
 	}
 
 	if search != "" {
 		argCount++
-		searchFilter := fmt.Sprintf(" AND (p.code ILIKE $%d OR p.name ILIKE $%d OR p.sku ILIKE $%d OR p.barcode ILIKE $%d)", argCount, argCount, argCount, argCount)
-		baseQuery += searchFilter
-		countQuery += searchFilter
+		countArgCount++
+		baseQuery += fmt.Sprintf(" AND (p.code ILIKE $%d OR p.name ILIKE $%d OR p.sku ILIKE $%d OR p.barcode ILIKE $%d)", argCount, argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (p.code ILIKE $%d OR p.name ILIKE $%d OR p.sku ILIKE $%d OR p.barcode ILIKE $%d)", countArgCount, countArgCount, countArgCount, countArgCount)
 		args = append(args, "%"+search+"%")
+		countArgs = append(countArgs, "%"+search+"%")
 	}
 
 	// Get count
 	var total int
-	err := h.db.QueryRow(countQuery, args...).Scan(&total)
+	err := h.db.QueryRow(countQuery, countArgs...).Scan(&total)
 	if err != nil {
 		h.log.Error("Failed to count products", "error", err)
 		response.InternalError(c, "Failed to list products")
@@ -428,7 +447,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 
 	query := `
 		INSERT INTO products (
-			id, tenant_id, organization_id, category_id, type, code, sku, barcode, name, description, short_description,
+			id, tenant_id, origin_organization_id, category_id, type, code, sku, barcode, name, description, short_description,
 			unit_id, purchase_unit_id, sales_unit_id, cost_price, list_price, min_price, currency_id,
 			is_stockable, track_inventory, min_stock_level, reorder_point, reorder_quantity,
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
@@ -455,6 +474,23 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		}
 		response.InternalError(c, "Failed to create product")
 		return
+	}
+
+	// Create org-specific settings for the creating organization
+	if orgID != uuid.Nil {
+		_, err = h.db.Exec(`
+			INSERT INTO product_organization_settings (
+				tenant_id, product_id, organization_id,
+				cost_price, list_price, min_price,
+				min_stock_level, reorder_point, reorder_quantity
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (product_id, organization_id) DO NOTHING
+		`, tenantID, id, orgID,
+			input.CostPrice, input.ListPrice, input.MinPrice,
+			input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity)
+		if err != nil {
+			h.log.Error("Failed to create product org settings", "error", err)
+		}
 	}
 
 	resp := &entity.ProductResponse{
@@ -505,18 +541,35 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		return
 	}
 
+	// Get org-specific settings overlay
+	orgID, _ := middleware.GetOrganizationID(c)
+
 	query := `
 		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode,
 			   p.name, p.description, p.short_description, p.unit_id,
-			   p.cost_price, p.list_price, p.min_price,
-			   p.is_stockable, p.track_inventory, p.min_stock_level,
-			   p.reorder_point, p.reorder_quantity, p.lead_time_days,
+			   COALESCE(pos.cost_price, p.cost_price) as cost_price,
+			   COALESCE(pos.list_price, p.list_price) as list_price,
+			   COALESCE(pos.min_price, p.min_price) as min_price,
+			   p.is_stockable, p.track_inventory,
+			   COALESCE(pos.min_stock_level, p.min_stock_level) as min_stock_level,
+			   COALESCE(pos.reorder_point, p.reorder_point) as reorder_point,
+			   COALESCE(pos.reorder_quantity, p.reorder_quantity) as reorder_quantity,
+			   p.lead_time_days,
 			   p.is_purchasable, p.is_sellable, p.is_active, p.tags,
 			   COALESCE(p.image_url, '') as image_url,
 			   p.created_at, p.updated_at,
 			   pc.id as category_id_rel, pc.code as category_code, pc.name as category_name
 		FROM products p
 		LEFT JOIN product_categories pc ON p.category_id = pc.id
+	`
+	queryArgs := []interface{}{id, tenantID}
+	if orgID != uuid.Nil {
+		query += ` LEFT JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $3`
+		queryArgs = append(queryArgs, orgID)
+	} else {
+		query += ` LEFT JOIN product_organization_settings pos ON false`
+	}
+	query += `
 		WHERE p.id = $1 AND p.tenant_id = $2 AND p.deleted_at IS NULL
 	`
 
@@ -526,7 +579,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	var tags json.RawMessage
 	var imageURL string
 
-	err = h.db.QueryRow(query, id, tenantID).Scan(
+	err = h.db.QueryRow(query, queryArgs...).Scan(
 		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode,
 		&p.Name, &desc, &shortDesc, &unitID,
 		&p.CostPrice, &p.ListPrice, &p.MinPrice,
@@ -622,7 +675,9 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		return
 	}
 
-	// Build dynamic update
+	orgID, _ := middleware.GetOrganizationID(c)
+
+	// Build dynamic update for shared product fields
 	updates := make([]string, 0)
 	args := make([]interface{}, 0)
 	argCount := 0
@@ -632,6 +687,18 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("%s = $%d", field, argCount))
 		args = append(args, value)
 	}
+
+	// Org-specific fields to upsert into product_organization_settings
+	type orgSettings struct {
+		costPrice       *float64
+		listPrice       *float64
+		minPrice        *float64
+		minStockLevel   *float64
+		reorderPoint    *float64
+		reorderQuantity *float64
+	}
+	var orgUpdates orgSettings
+	hasOrgUpdates := false
 
 	if input.CategoryID != nil {
 		if *input.CategoryID == "" {
@@ -656,14 +723,21 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	if input.ShortDescription != nil {
 		addUpdate("short_description", *input.ShortDescription)
 	}
+	// Pricing → org-specific + fallback on products table
 	if input.CostPrice != nil {
 		addUpdate("cost_price", *input.CostPrice)
+		orgUpdates.costPrice = input.CostPrice
+		hasOrgUpdates = true
 	}
 	if input.ListPrice != nil {
 		addUpdate("list_price", *input.ListPrice)
+		orgUpdates.listPrice = input.ListPrice
+		hasOrgUpdates = true
 	}
 	if input.MinPrice != nil {
 		addUpdate("min_price", *input.MinPrice)
+		orgUpdates.minPrice = input.MinPrice
+		hasOrgUpdates = true
 	}
 	if input.IsStockable != nil {
 		addUpdate("is_stockable", *input.IsStockable)
@@ -671,14 +745,21 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	if input.TrackInventory != nil {
 		addUpdate("track_inventory", *input.TrackInventory)
 	}
+	// Inventory settings → org-specific + fallback on products table
 	if input.MinStockLevel != nil {
 		addUpdate("min_stock_level", *input.MinStockLevel)
+		orgUpdates.minStockLevel = input.MinStockLevel
+		hasOrgUpdates = true
 	}
 	if input.ReorderPoint != nil {
 		addUpdate("reorder_point", *input.ReorderPoint)
+		orgUpdates.reorderPoint = input.ReorderPoint
+		hasOrgUpdates = true
 	}
 	if input.ReorderQuantity != nil {
 		addUpdate("reorder_quantity", *input.ReorderQuantity)
+		orgUpdates.reorderQuantity = input.ReorderQuantity
+		hasOrgUpdates = true
 	}
 	if input.IsPurchasable != nil {
 		addUpdate("is_purchasable", *input.IsPurchasable)
@@ -735,34 +816,61 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		}
 	}
 
-	if len(updates) == 0 {
+	if len(updates) == 0 && !hasOrgUpdates {
 		response.BadRequest(c, "No fields to update")
 		return
 	}
 
-	addUpdate("updated_at", time.Now())
+	// Update shared product fields
+	if len(updates) > 0 {
+		addUpdate("updated_at", time.Now())
 
-	argCount++
-	args = append(args, id)
-	argCount++
-	args = append(args, tenantID)
+		argCount++
+		args = append(args, id)
+		argCount++
+		args = append(args, tenantID)
 
-	query := fmt.Sprintf(`
-		UPDATE products SET %s
-		WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL
-		RETURNING id
-	`, strings.Join(updates, ", "), argCount-1, argCount)
+		query := fmt.Sprintf(`
+			UPDATE products SET %s
+			WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL
+			RETURNING id
+		`, strings.Join(updates, ", "), argCount-1, argCount)
 
-	var returnedID uuid.UUID
-	err = h.db.QueryRow(query, args...).Scan(&returnedID)
-	if err == sql.ErrNoRows {
-		response.NotFound(c, "Product")
-		return
+		var returnedID uuid.UUID
+		err = h.db.QueryRow(query, args...).Scan(&returnedID)
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Product")
+			return
+		}
+		if err != nil {
+			h.log.Error("Failed to update product", "error", err)
+			response.InternalError(c, "Failed to update product")
+			return
+		}
 	}
-	if err != nil {
-		h.log.Error("Failed to update product", "error", err)
-		response.InternalError(c, "Failed to update product")
-		return
+
+	// Upsert org-specific settings
+	if hasOrgUpdates && orgID != uuid.Nil {
+		_, err = h.db.Exec(`
+			INSERT INTO product_organization_settings (tenant_id, product_id, organization_id,
+				cost_price, list_price, min_price, min_stock_level, reorder_point, reorder_quantity)
+			VALUES ($1, $2, $3,
+				COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
+				COALESCE($7, 0), COALESCE($8, 0), COALESCE($9, 0))
+			ON CONFLICT (product_id, organization_id) DO UPDATE SET
+				cost_price = COALESCE($4, product_organization_settings.cost_price),
+				list_price = COALESCE($5, product_organization_settings.list_price),
+				min_price = COALESCE($6, product_organization_settings.min_price),
+				min_stock_level = COALESCE($7, product_organization_settings.min_stock_level),
+				reorder_point = COALESCE($8, product_organization_settings.reorder_point),
+				reorder_quantity = COALESCE($9, product_organization_settings.reorder_quantity),
+				updated_at = NOW()
+		`, tenantID, id, orgID,
+			orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice,
+			orgUpdates.minStockLevel, orgUpdates.reorderPoint, orgUpdates.reorderQuantity)
+		if err != nil {
+			h.log.Error("Failed to upsert product org settings", "error", err)
+		}
 	}
 
 	// Return updated product
@@ -831,25 +939,36 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 	includeInactive := c.Query("include_inactive") == "true"
 	flat := c.Query("flat") == "true"
 
+	// Categories are shared across orgs; account mappings come from category_organization_settings
+	orgID, _ := middleware.GetOrganizationID(c)
+
 	query := `
-		SELECT id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at,
-			income_account_id, expense_account_id, stock_valuation_account_id, stock_input_account_id, stock_output_account_id
-		FROM product_categories
-		WHERE tenant_id = $1 AND deleted_at IS NULL
+		SELECT pc.id, pc.tenant_id, pc.parent_id, pc.code, pc.name, pc.description, pc.is_active, pc.created_at, pc.updated_at,
+			COALESCE(cos.income_account_id, pc.income_account_id) as income_account_id,
+			COALESCE(cos.expense_account_id, pc.expense_account_id) as expense_account_id,
+			COALESCE(cos.stock_valuation_account_id, pc.stock_valuation_account_id) as stock_valuation_account_id,
+			COALESCE(cos.stock_input_account_id, pc.stock_input_account_id) as stock_input_account_id,
+			COALESCE(cos.stock_output_account_id, pc.stock_output_account_id) as stock_output_account_id
+		FROM product_categories pc
 	`
 	args := []interface{}{tenantID}
 
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		query += fmt.Sprintf(" AND organization_id = $%d", len(args)+1)
+	if orgID != uuid.Nil {
+		query += fmt.Sprintf(` LEFT JOIN category_organization_settings cos ON cos.category_id = pc.id AND cos.organization_id = $%d`, len(args)+1)
 		args = append(args, orgID)
+	} else {
+		query += ` LEFT JOIN category_organization_settings cos ON false`
 	}
+
+	query += `
+		WHERE pc.tenant_id = $1 AND pc.deleted_at IS NULL
+	`
 
 	if !includeInactive {
-		query += " AND is_active = true"
+		query += " AND pc.is_active = true"
 	}
 
-	query += " ORDER BY code ASC"
+	query += " ORDER BY pc.code ASC"
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -931,16 +1050,11 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 		return
 	}
 
-	// Check for duplicate code within same organization
+	// Check for duplicate code within tenant (categories are shared)
 	orgID, _ := middleware.GetOrganizationID(c)
 	var exists bool
-	if orgID != uuid.Nil {
-		h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM product_categories WHERE tenant_id = $1 AND organization_id = $2 AND code = $3 AND deleted_at IS NULL)",
-			tenantID, orgID, input.Code).Scan(&exists)
-	} else {
-		h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM product_categories WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
-			tenantID, input.Code).Scan(&exists)
-	}
+	h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM product_categories WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
+		tenantID, input.Code).Scan(&exists)
 	if exists {
 		response.Conflict(c, "Category with this code already exists")
 		return
@@ -986,7 +1100,7 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 
 	_, err := h.db.Exec(`
 		INSERT INTO product_categories (
-			id, tenant_id, organization_id, parent_id, code, name, description, is_active,
+			id, tenant_id, origin_organization_id, parent_id, code, name, description, is_active,
 			income_account_id, expense_account_id, stock_valuation_account_id, stock_input_account_id, stock_output_account_id,
 			created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
@@ -998,6 +1112,22 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 		h.log.Error("Failed to create category", "error", err)
 		response.InternalError(c, "Failed to create category")
 		return
+	}
+
+	// Create org-specific account settings
+	if orgID != uuid.Nil && (incomeAcctID != nil || expenseAcctID != nil || stockValAcctID != nil || stockInAcctID != nil || stockOutAcctID != nil) {
+		_, err = h.db.Exec(`
+			INSERT INTO category_organization_settings (
+				tenant_id, category_id, organization_id,
+				income_account_id, expense_account_id,
+				stock_valuation_account_id, stock_input_account_id, stock_output_account_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (category_id, organization_id) DO NOTHING
+		`, tenantID, id, orgID,
+			incomeAcctID, expenseAcctID, stockValAcctID, stockInAcctID, stockOutAcctID)
+		if err != nil {
+			h.log.Error("Failed to create category org settings", "error", err)
+		}
 	}
 
 	cat := &entity.ProductCategory{
@@ -1038,12 +1168,28 @@ func (h *Handler) GetProductCategory(c *gin.Context) {
 	var cat entity.ProductCategory
 	var parentID, desc sql.NullString
 
-	err = h.db.QueryRow(`
-		SELECT id, tenant_id, parent_id, code, name, description, is_active, created_at, updated_at,
-			income_account_id, expense_account_id, stock_valuation_account_id, stock_input_account_id, stock_output_account_id
-		FROM product_categories
-		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt,
+	// Get org-specific account settings overlay
+	orgID, _ := middleware.GetOrganizationID(c)
+
+	getCatQuery := `
+		SELECT pc.id, pc.tenant_id, pc.parent_id, pc.code, pc.name, pc.description, pc.is_active, pc.created_at, pc.updated_at,
+			COALESCE(cos.income_account_id, pc.income_account_id) as income_account_id,
+			COALESCE(cos.expense_account_id, pc.expense_account_id) as expense_account_id,
+			COALESCE(cos.stock_valuation_account_id, pc.stock_valuation_account_id) as stock_valuation_account_id,
+			COALESCE(cos.stock_input_account_id, pc.stock_input_account_id) as stock_input_account_id,
+			COALESCE(cos.stock_output_account_id, pc.stock_output_account_id) as stock_output_account_id
+		FROM product_categories pc
+	`
+	getCatArgs := []interface{}{id, tenantID}
+	if orgID != uuid.Nil {
+		getCatQuery += ` LEFT JOIN category_organization_settings cos ON cos.category_id = pc.id AND cos.organization_id = $3`
+		getCatArgs = append(getCatArgs, orgID)
+	} else {
+		getCatQuery += ` LEFT JOIN category_organization_settings cos ON false`
+	}
+	getCatQuery += ` WHERE pc.id = $1 AND pc.tenant_id = $2 AND pc.deleted_at IS NULL`
+
+	err = h.db.QueryRow(getCatQuery, getCatArgs...).Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt,
 		&cat.IncomeAccountID, &cat.ExpenseAccountID, &cat.StockValuationAccountID, &cat.StockInputAccountID, &cat.StockOutputAccountID)
 
 	if err == sql.ErrNoRows {
@@ -1143,21 +1289,35 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 		addUpdate("is_active", *input.IsActive)
 	}
 
-	// Account fields
+	// Account fields - update both on category (fallback) and org settings
+	orgID, _ := middleware.GetOrganizationID(c)
+	hasAccountUpdates := false
+	var incomeAcct, expenseAcct, stockValAcct, stockInAcct, stockOutAcct *uuid.UUID
+
 	if val, provided := parseOptionalUUID(input.IncomeAccountID); provided {
 		addUpdate("income_account_id", val)
+		incomeAcct = val
+		hasAccountUpdates = true
 	}
 	if val, provided := parseOptionalUUID(input.ExpenseAccountID); provided {
 		addUpdate("expense_account_id", val)
+		expenseAcct = val
+		hasAccountUpdates = true
 	}
 	if val, provided := parseOptionalUUID(input.StockValuationAccountID); provided {
 		addUpdate("stock_valuation_account_id", val)
+		stockValAcct = val
+		hasAccountUpdates = true
 	}
 	if val, provided := parseOptionalUUID(input.StockInputAccountID); provided {
 		addUpdate("stock_input_account_id", val)
+		stockInAcct = val
+		hasAccountUpdates = true
 	}
 	if val, provided := parseOptionalUUID(input.StockOutputAccountID); provided {
 		addUpdate("stock_output_account_id", val)
+		stockOutAcct = val
+		hasAccountUpdates = true
 	}
 
 	if len(updates) == 0 {
@@ -1188,6 +1348,27 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 		h.log.Error("Failed to update category", "error", err)
 		response.InternalError(c, "Failed to update category")
 		return
+	}
+
+	// Upsert org-specific account settings
+	if hasAccountUpdates && orgID != uuid.Nil {
+		_, err = h.db.Exec(`
+			INSERT INTO category_organization_settings (
+				tenant_id, category_id, organization_id,
+				income_account_id, expense_account_id,
+				stock_valuation_account_id, stock_input_account_id, stock_output_account_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (category_id, organization_id) DO UPDATE SET
+				income_account_id = COALESCE($4, category_organization_settings.income_account_id),
+				expense_account_id = COALESCE($5, category_organization_settings.expense_account_id),
+				stock_valuation_account_id = COALESCE($6, category_organization_settings.stock_valuation_account_id),
+				stock_input_account_id = COALESCE($7, category_organization_settings.stock_input_account_id),
+				stock_output_account_id = COALESCE($8, category_organization_settings.stock_output_account_id),
+				updated_at = NOW()
+		`, tenantID, id, orgID, incomeAcct, expenseAcct, stockValAcct, stockInAcct, stockOutAcct)
+		if err != nil {
+			h.log.Error("Failed to upsert category org settings", "error", err)
+		}
 	}
 
 	h.GetProductCategory(c)

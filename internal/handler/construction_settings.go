@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -27,12 +28,14 @@ func (h *Handler) ListCostCategories(c *gin.Context) {
 	h.seedDefaultCostCategories(tenantID)
 
 	rows, err := h.db.Query(`
-		SELECT id, tenant_id, code, name,
-		       default_debit_account_id, default_credit_account_id,
-		       is_active, created_at
-		FROM construction_cost_categories
-		WHERE tenant_id = $1 AND is_active = true
-		ORDER BY id ASC
+		SELECT cc.id, cc.tenant_id, cc.code, cc.name,
+		       cc.default_debit_account_id, cc.default_credit_account_id,
+		       cc.is_active, cc.created_at,
+		       COALESCE(a.code || ' — ' || a.name, '') as debit_account_name
+		FROM construction_cost_categories cc
+		LEFT JOIN accounts a ON a.id = cc.default_debit_account_id
+		WHERE cc.tenant_id = $1 AND cc.is_active = true
+		ORDER BY cc.id ASC
 	`, tenantID)
 	if err != nil {
 		h.log.Error("Failed to list cost categories", "error", err)
@@ -42,14 +45,15 @@ func (h *Handler) ListCostCategories(c *gin.Context) {
 	defer rows.Close()
 
 	type CostCategory struct {
-		ID                    int64      `json:"id"`
-		TenantID              string     `json:"tenant_id"`
-		Code                  string     `json:"code"`
-		Name                  string     `json:"name"`
-		DefaultDebitAccountID *uuid.UUID `json:"default_debit_account_id"`
+		ID                     int64      `json:"id"`
+		TenantID               string     `json:"tenant_id"`
+		Code                   string     `json:"code"`
+		Name                   string     `json:"name"`
+		DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id"`
 		DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id"`
-		IsActive              bool       `json:"is_active"`
-		CreatedAt             time.Time  `json:"created_at"`
+		IsActive               bool       `json:"is_active"`
+		CreatedAt              time.Time  `json:"created_at"`
+		DebitAccountName       string     `json:"debit_account_name"`
 	}
 
 	cats := []CostCategory{}
@@ -58,7 +62,7 @@ func (h *Handler) ListCostCategories(c *gin.Context) {
 		if err := rows.Scan(
 			&cat.ID, &cat.TenantID, &cat.Code, &cat.Name,
 			&cat.DefaultDebitAccountID, &cat.DefaultCreditAccountID,
-			&cat.IsActive, &cat.CreatedAt,
+			&cat.IsActive, &cat.CreatedAt, &cat.DebitAccountName,
 		); err != nil {
 			continue
 		}
@@ -77,7 +81,6 @@ func (h *Handler) CreateCostCategory(c *gin.Context) {
 	}
 
 	var req struct {
-		Code                   string `json:"code" binding:"required"`
 		Name                   string `json:"name" binding:"required"`
 		DefaultDebitAccountID  string `json:"default_debit_account_id"`
 		DefaultCreditAccountID string `json:"default_credit_account_id"`
@@ -87,6 +90,11 @@ func (h *Handler) CreateCostCategory(c *gin.Context) {
 		return
 	}
 
+	// Auto-generate code: CAT-001, CAT-002, ...
+	var maxID int
+	_ = h.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM construction_cost_categories WHERE tenant_id = $1`, tenantID).Scan(&maxID)
+	code := "CAT-" + fmt.Sprintf("%03d", maxID+1)
+
 	var id int64
 	err := h.db.QueryRow(`
 		INSERT INTO construction_cost_categories
@@ -94,7 +102,7 @@ func (h *Handler) CreateCostCategory(c *gin.Context) {
 		VALUES ($1, $2, $3, $4, $5, true, NOW())
 		RETURNING id
 	`,
-		tenantID, req.Code, req.Name,
+		tenantID, code, req.Name,
 		nullUUIDFromVal(req.DefaultDebitAccountID),
 		nullUUIDFromVal(req.DefaultCreditAccountID),
 	).Scan(&id)
