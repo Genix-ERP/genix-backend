@@ -107,6 +107,8 @@ type Product struct {
 	CanBeRented        bool            `json:"can_be_rented" db:"can_be_rented"`
 	CanBeSubcontracted bool            `json:"can_be_subcontracted" db:"can_be_subcontracted"`
 	IsOverheadExpense  bool            `json:"is_overhead_expense" db:"is_overhead_expense"`
+	IsManufacturable   bool            `json:"is_manufacturable" db:"is_manufacturable"`
+	AutoManufacture    bool            `json:"auto_manufacture" db:"auto_manufacture"`
 	HasVariants        bool            `json:"has_variants" db:"has_variants"`
 	IsActive           bool            `json:"is_active" db:"is_active"`
 	CreatedBy          *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
@@ -154,6 +156,9 @@ type CreateProductInput struct {
 	CanBeRented        *bool    `json:"can_be_rented,omitempty"`
 	CanBeSubcontracted *bool    `json:"can_be_subcontracted,omitempty"`
 	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
+	IsManufacturable   *bool    `json:"is_manufacturable,omitempty"`
+	AutoManufacture    *bool    `json:"auto_manufacture,omitempty"`
+	OrganizationIDs    []string `json:"organization_ids,omitempty"`
 	Tags               []string `json:"tags,omitempty"`
 	ImageURL           string   `json:"image_url,omitempty"`
 }
@@ -188,6 +193,9 @@ type UpdateProductInput struct {
 	CanBeRented        *bool    `json:"can_be_rented,omitempty"`
 	CanBeSubcontracted *bool    `json:"can_be_subcontracted,omitempty"`
 	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
+	IsManufacturable   *bool    `json:"is_manufacturable,omitempty"`
+	AutoManufacture    *bool    `json:"auto_manufacture,omitempty"`
+	OrganizationIDs    []string `json:"organization_ids,omitempty"`
 	IsActive           *bool    `json:"is_active,omitempty"`
 	Tags               []string `json:"tags,omitempty"`
 	ImageURL           *string  `json:"image_url,omitempty"`
@@ -238,9 +246,10 @@ type ProductResponse struct {
 	CanBeSubcontracted bool      `json:"can_be_subcontracted"`
 	IsOverheadExpense  bool      `json:"is_overhead_expense"`
 	HasVariants        bool      `json:"has_variants"`
-	IsActive           bool      `json:"is_active"`
-	Tags               []string  `json:"tags"`
-	ImageURL           string    `json:"image_url"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	IsActive           bool        `json:"is_active"`
+	Tags               []string    `json:"tags"`
+	ImageURL           string      `json:"image_url"`
+	OrganizationIDs    []uuid.UUID `json:"organization_ids"`
+	CreatedAt          time.Time   `json:"created_at"`
+	UpdatedAt          time.Time   `json:"updated_at"`
 }

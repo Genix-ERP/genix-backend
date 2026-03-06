@@ -640,14 +640,18 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 		response.NotFound(c, "Estimate line not found")
 		return
 	}
-	if state != "draft" {
-		response.BadRequest(c, "Only draft estimates can be modified")
-		return
-	}
-
 	var req entity.UpdateEstimateLineInput
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, err.Error())
+		return
+	}
+
+	// Only actual_amount can be updated on non-draft estimates
+	isActualAmountOnly := req.ActualAmount != nil && req.WBSID == nil && req.Name == nil && req.UOM == nil &&
+		req.Quantity == nil && req.MaterialRate == nil && req.LaborRate == nil && req.EquipmentRate == nil && req.SortOrder == nil
+
+	if state != "draft" && !isActualAmountOnly {
+		response.BadRequest(c, "Only draft estimates can be modified")
 		return
 	}
 
@@ -698,6 +702,11 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("sort_order = $%d", argCount))
 		args = append(args, *req.SortOrder)
+	}
+	if req.ActualAmount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("actual_amount = $%d", argCount))
+		args = append(args, *req.ActualAmount)
 	}
 
 	if len(updates) == 0 {

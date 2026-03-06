@@ -195,6 +195,7 @@ type UpdateEstimateLineInput struct {
 	LaborRate     *float64 `json:"labor_rate"`
 	EquipmentRate *float64 `json:"equipment_rate"`
 	SortOrder     *int     `json:"sort_order"`
+	ActualAmount  *float64 `json:"actual_amount"`
 }
 
 // =====================================================
