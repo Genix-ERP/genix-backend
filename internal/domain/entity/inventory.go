@@ -17,6 +17,7 @@ type Warehouse struct {
 	ManagerID      *uuid.UUID   `json:"manager_id,omitempty" db:"manager_id"`
 	IsDefault      bool         `json:"is_default" db:"is_default"`
 	IsActive       bool         `json:"is_active" db:"is_active"`
+	WarehouseType  string       `json:"warehouse_type" db:"warehouse_type"` // regular, scrap
 	// Odoo-style warehouse operation steps
 	// 1 = Direct, 2 = 2-step, 3 = 3-step
 	ReceptionSteps int       `json:"reception_steps" db:"reception_steps"` // 1=Receive to stock, 2=Input+Stock, 3=Input+QC+Stock
@@ -121,6 +122,7 @@ type CreateWarehouseInput struct {
 	Address        *Address `json:"address,omitempty"`
 	ManagerID      string   `json:"manager_id,omitempty"`
 	IsDefault      bool     `json:"is_default,omitempty"`
+	WarehouseType  string   `json:"warehouse_type,omitempty"` // regular, scrap
 	ReceptionSteps int      `json:"reception_steps,omitempty"` // 1=Direct, 2=Input+Stock, 3=Input+QC+Stock
 	DeliverySteps  int      `json:"delivery_steps,omitempty"`  // 1=Direct, 2=Pick+Ship, 3=Pick+Pack+Ship
 }
@@ -132,6 +134,7 @@ type UpdateWarehouseInput struct {
 	ManagerID      *string  `json:"manager_id,omitempty"`
 	IsDefault      *bool    `json:"is_default,omitempty"`
 	IsActive       *bool    `json:"is_active,omitempty"`
+	WarehouseType  *string  `json:"warehouse_type,omitempty"` // regular, scrap
 	ReceptionSteps *int     `json:"reception_steps,omitempty"` // 1=Direct, 2=Input+Stock, 3=Input+QC+Stock
 	DeliverySteps  *int     `json:"delivery_steps,omitempty"`  // 1=Direct, 2=Pick+Ship, 3=Pick+Pack+Ship
 }
