@@ -584,6 +584,8 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
 			AND si.status NOT IN ('cancelled', 'paid')
 			AND si.total_amount > si.amount_paid
+			AND si.total_amount > 0
+			AND COALESCE(si.invoice_type, 'invoice') = 'invoice'
 	`
 	arArgs := []interface{}{tenantID, asOfDate}
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
