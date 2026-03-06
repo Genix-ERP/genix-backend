@@ -19,141 +19,332 @@ func NewIntercompanySyncService(db *sql.DB) *IntercompanySyncService {
 	return &IntercompanySyncService{db: db}
 }
 
-// SyncSaleOrderToPurchaseOrder creates a PO in target company when SO is created/confirmed
-func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID, sourceOrgID uuid.UUID, saleOrderID uuid.UUID) error {
-	// Find applicable rule
-	rule, err := s.findActiveRule(tenantID, sourceOrgID, "sale_to_purchase")
-	if err != nil || rule == nil {
-		return nil // No rule configured, skip
-	}
-
+// SyncSaleOrderToPurchaseOrder creates a PO in the customer's company when SO is created.
+// When company A creates an SO for intercompany customer B, this creates a PO in company B
+// with company A as the vendor.
+func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUID, saleOrderID uuid.UUID) error {
 	// Get sale order details
 	var so struct {
 		ID             uuid.UUID
 		OrderNumber    string
 		CustomerID     uuid.UUID
-		OrganizationID uuid.UUID
+		OrganizationID *uuid.UUID
 		CurrencyID     *uuid.UUID
+		ExchangeRate   float64
+		Subtotal       float64
+		DiscountAmount float64
+		TaxAmount      float64
+		ShippingAmount float64
 		TotalAmount    float64
 		Notes          *string
+		WarehouseID    *uuid.UUID
+		PaymentTerms   int
 	}
 
 	soQuery := `
-		SELECT id, order_number, customer_id, organization_id, currency_id, total_amount, notes
+		SELECT id, order_number, customer_id, organization_id, currency_id,
+		       COALESCE(exchange_rate, 1), COALESCE(subtotal, 0), COALESCE(discount_amount, 0),
+		       COALESCE(tax_amount, 0), COALESCE(shipping_amount, 0), COALESCE(total_amount, 0),
+		       notes, warehouse_id, COALESCE(payment_terms, 30)
 		FROM sales_orders
-		WHERE id = $1 AND tenant_id = $2
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`
-	err = s.db.QueryRow(soQuery, saleOrderID, tenantID).Scan(
-		&so.ID, &so.OrderNumber, &so.CustomerID, &so.OrganizationID, &so.CurrencyID, &so.TotalAmount, &so.Notes,
+	err := s.db.QueryRow(soQuery, saleOrderID, tenantID).Scan(
+		&so.ID, &so.OrderNumber, &so.CustomerID, &so.OrganizationID, &so.CurrencyID,
+		&so.ExchangeRate, &so.Subtotal, &so.DiscountAmount,
+		&so.TaxAmount, &so.ShippingAmount, &so.TotalAmount,
+		&so.Notes, &so.WarehouseID, &so.PaymentTerms,
 	)
 	if err != nil {
-		return s.logTransaction(tenantID, rule.ID, sourceOrgID, rule.TargetOrganizationID,
-			"sale_order", saleOrderID, so.OrderNumber,
-			"purchase_order", nil, "",
-			"failed", fmt.Sprintf("Failed to get sale order: %v", err), so.TotalAmount)
+		return fmt.Errorf("failed to get sale order: %w", err)
 	}
 
-	// Check if target org matches customer (inter-company sale)
-	if so.CustomerID != rule.TargetOrganizationID {
-		return nil // Not an inter-company sale to configured target
+	// Derive sourceOrgID from the SO itself
+	if so.OrganizationID == nil {
+		return nil // SO has no organization, cannot determine source org
+	}
+	sourceOrgID := *so.OrganizationID
+
+	// Check if the customer is an intercompany contact by looking at source_organization_id
+	var targetOrgID uuid.UUID
+	err = s.db.QueryRow(`
+		SELECT source_organization_id FROM contacts
+		WHERE id = $1 AND tenant_id = $2 AND source_organization_id IS NOT NULL AND deleted_at IS NULL
+	`, so.CustomerID, tenantID).Scan(&targetOrgID)
+	if err != nil {
+		// Customer is not an intercompany contact, nothing to do
+		return nil
+	}
+
+	// Find the vendor contact for source org in target org's context
+	var vendorID uuid.UUID
+	err = s.db.QueryRow(`
+		SELECT id FROM contacts
+		WHERE tenant_id = $1 AND organization_id = $2 AND source_organization_id = $3
+		  AND type IN ('vendor', 'both') AND deleted_at IS NULL
+		LIMIT 1
+	`, tenantID, targetOrgID, sourceOrgID).Scan(&vendorID)
+	if err != nil {
+		// No vendor contact exists in target org for source org - skip
+		return fmt.Errorf("no vendor contact found in target org %s for source org %s", targetOrgID, sourceOrgID)
+	}
+
+	// Check if a PO was already created for this SO (prevent duplicates)
+	var existingLink int
+	s.db.QueryRow(`
+		SELECT COUNT(*) FROM intercompany_document_links
+		WHERE tenant_id = $1 AND source_document_type = 'sale_order' AND source_document_id = $2
+	`, tenantID, saleOrderID).Scan(&existingLink)
+	if existingLink > 0 {
+		return nil // Already synced
 	}
 
 	// Create purchase order in target organization
 	poID := uuid.New()
 	poNumber := fmt.Sprintf("PO-IC-%s", time.Now().Format("20060102150405"))
+	now := time.Now()
 
-	// Get the vendor ID for source org in target org's context
-	var vendorID uuid.UUID
-	vendorQuery := `SELECT id FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND name = (SELECT name FROM organizations WHERE id = $3)`
-	err = s.db.QueryRow(vendorQuery, tenantID, rule.TargetOrganizationID, sourceOrgID).Scan(&vendorID)
-	if err != nil {
-		// Create vendor if doesn't exist
-		vendorID = uuid.New()
-		var orgName string
-		s.db.QueryRow("SELECT name FROM organizations WHERE id = $1", sourceOrgID).Scan(&orgName)
-		_, err = s.db.Exec(`
-			INSERT INTO contacts (id, tenant_id, organization_id, name, contact_type, is_vendor)
-			VALUES ($1, $2, $3, $4, 'company', true)
-		`, vendorID, tenantID, rule.TargetOrganizationID, orgName)
-		if err != nil {
-			return s.logTransaction(tenantID, rule.ID, sourceOrgID, rule.TargetOrganizationID,
-				"sale_order", saleOrderID, so.OrderNumber,
-				"purchase_order", nil, "",
-				"failed", fmt.Sprintf("Failed to create vendor: %v", err), so.TotalAmount)
-		}
-	}
+	notes := fmt.Sprintf("Auto-created from intercompany SO: %s", so.OrderNumber)
 
-	// Calculate target amount based on pricing method
-	targetAmount := so.TotalAmount
-	if rule.PricingMethod == entity.ICPricingCostPlusMarkup {
-		targetAmount = so.TotalAmount * (1 + rule.MarkupPercent/100)
-	}
-
-	// Insert purchase order
 	poInsertQuery := `
 		INSERT INTO purchase_orders (
 			id, tenant_id, organization_id, order_number, vendor_id,
-			order_date, expected_date, status, total_amount, currency_id,
-			notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
-		RETURNING id
+			order_date, expected_date, currency_id, exchange_rate,
+			subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
+			status, payment_status, payment_terms,
+			vendor_reference, notes, warehouse_id,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 	`
 
-	status := "draft"
-	if rule.AutoValidate {
-		status = "confirmed"
-	}
-
-	notes := fmt.Sprintf("Auto-created from inter-company SO: %s", so.OrderNumber)
 	_, err = s.db.Exec(poInsertQuery,
-		poID, tenantID, rule.TargetOrganizationID, poNumber, vendorID,
-		time.Now(), time.Now().AddDate(0, 0, 7), status, targetAmount, so.CurrencyID,
-		notes,
+		poID, tenantID, targetOrgID, poNumber, vendorID,
+		now, now.AddDate(0, 0, 7), so.CurrencyID, so.ExchangeRate,
+		so.Subtotal, so.DiscountAmount, so.TaxAmount, so.ShippingAmount, so.TotalAmount,
+		entity.POStatusDraft, entity.PaymentStatusUnpaid, so.PaymentTerms,
+		so.OrderNumber, notes, so.WarehouseID,
+		now, now,
 	)
 	if err != nil {
-		return s.logTransaction(tenantID, rule.ID, sourceOrgID, rule.TargetOrganizationID,
-			"sale_order", saleOrderID, so.OrderNumber,
-			"purchase_order", nil, "",
-			"failed", fmt.Sprintf("Failed to create PO: %v", err), so.TotalAmount)
+		return fmt.Errorf("failed to create intercompany PO: %w", err)
 	}
 
-	// Copy order lines
-	linesQuery := `
-		SELECT product_id, quantity, unit_price, discount_percent, tax_amount, total_amount
+	// Copy SO lines to PO lines
+	soLinesQuery := `
+		SELECT product_id, description, quantity, unit_id, unit_price,
+		       COALESCE(discount_amount, 0), tax_id, COALESCE(tax_amount, 0),
+		       COALESCE(line_total, 0), warehouse_id, notes,
+		       packaging_id, packaging_qty
 		FROM sales_order_lines
 		WHERE sales_order_id = $1
+		ORDER BY line_number
 	`
-	rows, err := s.db.Query(linesQuery, saleOrderID)
+	rows, err := s.db.Query(soLinesQuery, saleOrderID)
 	if err == nil {
 		defer rows.Close()
+		lineNum := 0
 		for rows.Next() {
+			lineNum++
 			var productID uuid.UUID
-			var qty, unitPrice, discount, taxAmt, lineTotal float64
-			rows.Scan(&productID, &qty, &unitPrice, &discount, &taxAmt, &lineTotal)
+			var description sql.NullString
+			var qty, unitPrice, discountAmt, taxAmt, lineTotal float64
+			var unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
+			var lineNotes sql.NullString
+			var packagingQty *float64
+
+			rows.Scan(&productID, &description, &qty, &unitID, &unitPrice,
+				&discountAmt, &taxID, &taxAmt, &lineTotal,
+				&lineWarehouseID, &lineNotes, &packagingID, &packagingQty)
 
 			lineID := uuid.New()
-			_, _ = s.db.Exec(`
+			s.db.Exec(`
 				INSERT INTO purchase_order_lines (
-					id, purchase_order_id, product_id, quantity, unit_price,
-					discount_percent, tax_amount, total_amount, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-			`, lineID, poID, productID, qty, unitPrice, discount, taxAmt, lineTotal)
+					id, purchase_order_id, line_number, product_id, description,
+					quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount,
+					line_total, quantity_received, quantity_invoiced,
+					warehouse_id, notes, packaging_id, packaging_qty,
+					created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			`, lineID, poID, lineNum, productID, description,
+				qty, unitID, unitPrice, discountAmt, taxID, taxAmt,
+				lineTotal, 0.0, 0.0,
+				lineWarehouseID, lineNotes, packagingID, packagingQty,
+				now, now)
 		}
 	}
 
-	// Create document link
+	// Create document link for traceability
 	s.createDocumentLink(tenantID, sourceOrgID, "sale_order", saleOrderID,
-		rule.TargetOrganizationID, "purchase_order", poID, "auto_created")
+		targetOrgID, "purchase_order", poID, "auto_created")
 
-	// Log successful transaction
-	logStatus := "created"
-	if rule.AutoValidate {
-		logStatus = "validated"
+	return nil
+}
+
+// SyncPurchaseOrderToSaleOrder creates an SO in the vendor's company when PO is created.
+// When company A creates a PO for intercompany vendor B, this creates an SO in company B
+// with company A as the customer.
+func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUID, purchaseOrderID uuid.UUID) error {
+	// Get purchase order details
+	var po struct {
+		ID             uuid.UUID
+		OrderNumber    string
+		VendorID       uuid.UUID
+		OrganizationID *uuid.UUID
+		CurrencyID     *uuid.UUID
+		ExchangeRate   float64
+		Subtotal       float64
+		DiscountAmount float64
+		TaxAmount      float64
+		ShippingAmount float64
+		TotalAmount    float64
+		Notes          *string
+		WarehouseID    *uuid.UUID
+		PaymentTerms   *int
 	}
-	return s.logTransaction(tenantID, rule.ID, sourceOrgID, rule.TargetOrganizationID,
-		"sale_order", saleOrderID, so.OrderNumber,
-		"purchase_order", &poID, poNumber,
-		logStatus, "", so.TotalAmount)
+
+	poQuery := `
+		SELECT id, order_number, vendor_id, organization_id, currency_id,
+		       COALESCE(exchange_rate, 1), COALESCE(subtotal, 0), COALESCE(discount_amount, 0),
+		       COALESCE(tax_amount, 0), COALESCE(shipping_amount, 0), COALESCE(total_amount, 0),
+		       notes, warehouse_id, payment_terms
+		FROM purchase_orders
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`
+	err := s.db.QueryRow(poQuery, purchaseOrderID, tenantID).Scan(
+		&po.ID, &po.OrderNumber, &po.VendorID, &po.OrganizationID, &po.CurrencyID,
+		&po.ExchangeRate, &po.Subtotal, &po.DiscountAmount,
+		&po.TaxAmount, &po.ShippingAmount, &po.TotalAmount,
+		&po.Notes, &po.WarehouseID, &po.PaymentTerms,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to get purchase order: %w", err)
+	}
+
+	// Derive sourceOrgID from the PO itself
+	if po.OrganizationID == nil {
+		return nil // PO has no organization, cannot determine source org
+	}
+	sourceOrgID := *po.OrganizationID
+
+	// Check if the vendor is an intercompany contact
+	var targetOrgID uuid.UUID
+	err = s.db.QueryRow(`
+		SELECT source_organization_id FROM contacts
+		WHERE id = $1 AND tenant_id = $2 AND source_organization_id IS NOT NULL AND deleted_at IS NULL
+	`, po.VendorID, tenantID).Scan(&targetOrgID)
+	if err != nil {
+		// Vendor is not an intercompany contact, nothing to do
+		return nil
+	}
+
+	// Find the customer contact for source org in target org's context
+	var customerID uuid.UUID
+	err = s.db.QueryRow(`
+		SELECT id FROM contacts
+		WHERE tenant_id = $1 AND organization_id = $2 AND source_organization_id = $3
+		  AND type IN ('customer', 'both') AND deleted_at IS NULL
+		LIMIT 1
+	`, tenantID, targetOrgID, sourceOrgID).Scan(&customerID)
+	if err != nil {
+		// No customer contact exists in target org for source org - skip
+		return fmt.Errorf("no customer contact found in target org %s for source org %s", targetOrgID, sourceOrgID)
+	}
+
+	// Check if an SO was already created for this PO (prevent duplicates)
+	var existingLink int
+	s.db.QueryRow(`
+		SELECT COUNT(*) FROM intercompany_document_links
+		WHERE tenant_id = $1 AND source_document_type = 'purchase_order' AND source_document_id = $2
+	`, tenantID, purchaseOrderID).Scan(&existingLink)
+	if existingLink > 0 {
+		return nil // Already synced
+	}
+
+	// Create sales order in target organization
+	soID := uuid.New()
+	soNumber := fmt.Sprintf("SO-IC-%s", time.Now().Format("20060102150405"))
+	now := time.Now()
+
+	notes := fmt.Sprintf("Auto-created from intercompany PO: %s", po.OrderNumber)
+	paymentTerms := 30
+	if po.PaymentTerms != nil {
+		paymentTerms = *po.PaymentTerms
+	}
+
+	soInsertQuery := `
+		INSERT INTO sales_orders (
+			id, tenant_id, organization_id, order_number, customer_id,
+			order_date, expected_date, currency_id, exchange_rate,
+			subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
+			status, payment_status, payment_terms,
+			po_number, notes, warehouse_id,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	`
+
+	_, err = s.db.Exec(soInsertQuery,
+		soID, tenantID, targetOrgID, soNumber, customerID,
+		now, now.AddDate(0, 0, 7), po.CurrencyID, po.ExchangeRate,
+		po.Subtotal, po.DiscountAmount, po.TaxAmount, po.ShippingAmount, po.TotalAmount,
+		entity.OrderStatusDraft, entity.PaymentStatusUnpaid, paymentTerms,
+		po.OrderNumber, notes, po.WarehouseID,
+		now, now,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create intercompany SO: %w", err)
+	}
+
+	// Copy PO lines to SO lines
+	poLinesQuery := `
+		SELECT product_id, description, quantity, unit_id, unit_price,
+		       COALESCE(discount_amount, 0), tax_id, COALESCE(tax_amount, 0),
+		       COALESCE(line_total, 0), warehouse_id, notes,
+		       packaging_id, packaging_qty
+		FROM purchase_order_lines
+		WHERE purchase_order_id = $1
+		ORDER BY line_number
+	`
+	rows, err := s.db.Query(poLinesQuery, purchaseOrderID)
+	if err == nil {
+		defer rows.Close()
+		lineNum := 0
+		for rows.Next() {
+			lineNum++
+			var productID *uuid.UUID
+			var description sql.NullString
+			var qty, unitPrice, discountAmt, taxAmt, lineTotal float64
+			var unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
+			var lineNotes sql.NullString
+			var packagingQty *float64
+
+			rows.Scan(&productID, &description, &qty, &unitID, &unitPrice,
+				&discountAmt, &taxID, &taxAmt, &lineTotal,
+				&lineWarehouseID, &lineNotes, &packagingID, &packagingQty)
+
+			lineID := uuid.New()
+			s.db.Exec(`
+				INSERT INTO sales_order_lines (
+					id, sales_order_id, line_number, product_id, description,
+					quantity, unit_id, unit_price, discount_amount,
+					tax_id, tax_amount, line_total,
+					quantity_delivered, quantity_invoiced,
+					warehouse_id, notes, packaging_id, packaging_qty,
+					created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			`, lineID, soID, lineNum, productID, description,
+				qty, unitID, unitPrice, discountAmt,
+				taxID, taxAmt, lineTotal,
+				0.0, 0.0,
+				lineWarehouseID, lineNotes, packagingID, packagingQty,
+				now, now)
+		}
+	}
+
+	// Create document link for traceability
+	s.createDocumentLink(tenantID, sourceOrgID, "purchase_order", purchaseOrderID,
+		targetOrgID, "sale_order", soID, "auto_created")
+
+	return nil
 }
 
 // SyncInvoiceToBill creates a vendor bill in target company when invoice is created
@@ -201,16 +392,13 @@ func (s *IntercompanySyncService) SyncInvoiceToBill(tenantID, sourceOrgID uuid.U
 
 	// Get or create vendor
 	var vendorID uuid.UUID
-	vendorQuery := `SELECT id FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND name = (SELECT name FROM organizations WHERE id = $3) LIMIT 1`
+	vendorQuery := `SELECT id FROM contacts WHERE tenant_id = $1 AND organization_id = $2 AND source_organization_id = $3 AND type IN ('vendor', 'both') AND deleted_at IS NULL LIMIT 1`
 	err = s.db.QueryRow(vendorQuery, tenantID, rule.TargetOrganizationID, sourceOrgID).Scan(&vendorID)
 	if err != nil {
-		vendorID = uuid.New()
-		var orgName string
-		s.db.QueryRow("SELECT name FROM organizations WHERE id = $1", sourceOrgID).Scan(&orgName)
-		s.db.Exec(`
-			INSERT INTO contacts (id, tenant_id, organization_id, name, contact_type, is_vendor)
-			VALUES ($1, $2, $3, $4, 'company', true)
-		`, vendorID, tenantID, rule.TargetOrganizationID, orgName)
+		return s.logTransaction(tenantID, rule.ID, sourceOrgID, rule.TargetOrganizationID,
+			"invoice", invoiceID, inv.InvoiceNumber,
+			"bill", nil, "",
+			"failed", "No vendor contact found for intercompany billing", inv.TotalAmount)
 	}
 
 	// Insert vendor bill
@@ -227,11 +415,11 @@ func (s *IntercompanySyncService) SyncInvoiceToBill(tenantID, sourceOrgID uuid.U
 		) VALUES ($1, $2, $3, $4, 'vendor_bill', $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
 	`
 
-	notes := fmt.Sprintf("Auto-created from inter-company invoice: %s", inv.InvoiceNumber)
+	invNotes := fmt.Sprintf("Auto-created from inter-company invoice: %s", inv.InvoiceNumber)
 	_, err = s.db.Exec(billInsertQuery,
 		billID, tenantID, rule.TargetOrganizationID, billNumber, vendorID,
 		time.Now(), inv.DueDate, status, inv.TotalAmount, inv.CurrencyID,
-		notes,
+		invNotes,
 	)
 	if err != nil {
 		return s.logTransaction(tenantID, rule.ID, sourceOrgID, rule.TargetOrganizationID,
@@ -320,7 +508,7 @@ func (s *IntercompanySyncService) logTransaction(
 		uuid.New(), tenantID, ruleID,
 		sourceOrgID, sourceDocType, sourceDocID, sourceDocNumber,
 		targetOrgID, targetDocType, targetDocID, targetDocNumberPtr,
-		status, errMsgPtr, amount, time.Now(),
+		status, errMsgPtr, amount,
 	)
 	return err
 }

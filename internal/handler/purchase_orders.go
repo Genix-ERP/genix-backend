@@ -471,6 +471,11 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	// Trigger intercompany sync: if vendor is an intercompany contact, create SO in their company
+	if err := h.icSync.SyncPurchaseOrderToSaleOrder(tenantID, id); err != nil {
+		h.log.Error("Intercompany PO->SO sync failed", "error", err, "order_id", id)
+	}
+
 	resp := &entity.PurchaseOrderResponse{
 		ID:              id,
 		OrderNumber:     orderNumber,
@@ -1431,7 +1436,14 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 
 	// Update inventory for received line items
 	var poWarehouseID sql.NullString
-	h.db.QueryRow("SELECT warehouse_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID)
+	var poOrgID *uuid.UUID
+	h.db.QueryRow("SELECT warehouse_id, organization_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID, &poOrgID)
+
+	// Fall back to the first warehouse for this tenant if PO has no warehouse
+	var defaultWarehouseID sql.NullString
+	if !poWarehouseID.Valid || poWarehouseID.String == "" {
+		h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1", tenantID).Scan(&defaultWarehouseID)
+	}
 
 	for _, line := range input.Lines {
 		lineID, err := uuid.Parse(line.LineID)
@@ -1450,12 +1462,16 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 			continue
 		}
 
-		// Use line warehouse, fall back to PO warehouse
+		// Use line warehouse, fall back to PO warehouse, then default warehouse
 		whStr := lineWarehouseID
 		if !whStr.Valid || whStr.String == "" {
 			whStr = poWarehouseID
 		}
 		if !whStr.Valid || whStr.String == "" {
+			whStr = defaultWarehouseID
+		}
+		if !whStr.Valid || whStr.String == "" {
+			h.log.Warn("Skipping inventory update: no warehouse found for PO receive", "po_id", id, "line_id", lineID)
 			continue
 		}
 		warehouseID, err := uuid.Parse(whStr.String)
@@ -1473,9 +1489,9 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		if err == sql.ErrNoRows {
 			inventoryID = uuid.New()
 			h.db.Exec(`
-				INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $6)
-			`, inventoryID, tenantID, productID, warehouseID, unitPrice, now)
+				INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+			`, inventoryID, tenantID, productID, warehouseID, poOrgID, unitPrice, now)
 		}
 
 		// Update inventory quantity
@@ -1495,11 +1511,11 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		txnID := uuid.New()
 		h.db.Exec(`
 			INSERT INTO inventory_transactions (
-				id, tenant_id, inventory_id, transaction_type, quantity,
+				id, tenant_id, inventory_id, organization_id, transaction_type, quantity,
 				unit_cost, total_cost, reference_type, reference_id,
 				reason, transaction_date, created_at
-			) VALUES ($1, $2, $3, 'receipt', $4, $5, $6, 'purchase_order', $7, 'PO Goods Receipt', $8, $8)
-		`, txnID, tenantID, inventoryID, line.QuantityReceived, unitPrice, line.QuantityReceived*unitPrice, id, now)
+			) VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, 'purchase_order', $8, 'PO Goods Receipt', $9, $9)
+		`, txnID, tenantID, inventoryID, poOrgID, line.QuantityReceived, unitPrice, line.QuantityReceived*unitPrice, id, now)
 	}
 
 	response.Success(c, gin.H{
