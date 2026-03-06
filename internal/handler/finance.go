@@ -2732,16 +2732,10 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	}
 
 	// Generate payment number
-	var lastNum int
 	prefix := "PAY"
 	if input.Type == "receipt" {
 		prefix = "REC"
 	}
-	h.db.QueryRow(`
-		SELECT COALESCE(MAX(CAST(SUBSTRING(payment_number FROM '[0-9]+$') AS INTEGER)), 0)
-		FROM payments WHERE tenant_id = $1 AND type = $2
-	`, tenantID, input.Type).Scan(&lastNum)
-	paymentNumber := fmt.Sprintf("%s-%06d", prefix, lastNum+1)
 
 	id := uuid.New()
 	now := time.Now()
@@ -2782,9 +2776,34 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 	`
 
-	_, err = h.db.Exec(query,
-		id, tenantID, orgIDPtr, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
-		exchangeRate, reference, notes, "draft", bankAccountID, journalIDPtr, userID, now, now)
+	// Try inserting with incrementing payment number, retry on duplicate
+	var paymentNumber string
+	for attempt := 0; attempt < 5; attempt++ {
+		var lastNum int
+		if orgIDPtr != nil {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(SUBSTRING(payment_number FROM '[0-9]+$') AS INTEGER)), 0)
+				FROM payments WHERE tenant_id = $1 AND type = $2 AND organization_id = $3 AND payment_number ~ ('^' || $4 || '-[0-9]+$')
+			`, tenantID, input.Type, *orgIDPtr, prefix).Scan(&lastNum)
+		} else {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(SUBSTRING(payment_number FROM '[0-9]+$') AS INTEGER)), 0)
+				FROM payments WHERE tenant_id = $1 AND type = $2 AND organization_id IS NULL AND payment_number ~ ('^' || $3 || '-[0-9]+$')
+			`, tenantID, input.Type, prefix).Scan(&lastNum)
+		}
+		paymentNumber = fmt.Sprintf("%s-%06d", prefix, lastNum+1+attempt)
+
+		_, err = h.db.Exec(query,
+			id, tenantID, orgIDPtr, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
+			exchangeRate, reference, notes, "draft", bankAccountID, journalIDPtr, userID, now, now)
+
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "duplicate key") {
+			break
+		}
+	}
 
 	if err != nil {
 		h.log.Error("Failed to create payment", "error", err)
