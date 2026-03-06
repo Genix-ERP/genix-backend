@@ -103,12 +103,16 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	argCount := 1
 	countArgCount := 1
 
-	// LEFT JOIN org-specific settings if org context exists
+	// JOIN org-specific settings - INNER JOIN to only show products assigned to current org
 	if orgID != uuid.Nil {
 		argCount++
 		baseQuery += fmt.Sprintf(`
-		LEFT JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d`, argCount)
+		INNER JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d`, argCount)
 		args = append(args, orgID)
+
+		countArgCount++
+		countQuery = `SELECT COUNT(*) FROM products p INNER JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $` + fmt.Sprintf("%d", countArgCount) + ` WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
+		countArgs = append(countArgs, orgID)
 	} else {
 		baseQuery += `
 		LEFT JOIN product_organization_settings pos ON false`
@@ -406,6 +410,14 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 	if input.IsOverheadExpense != nil {
 		isOverheadExpense = *input.IsOverheadExpense
 	}
+	isManufacturable := false
+	if input.IsManufacturable != nil {
+		isManufacturable = *input.IsManufacturable
+	}
+	autoManufacture := false
+	if input.AutoManufacture != nil {
+		autoManufacture = *input.AutoManufacture
+	}
 
 	id := uuid.New()
 	now := time.Now()
@@ -452,8 +464,9 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 			is_stockable, track_inventory, min_stock_level, reorder_point, reorder_quantity,
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
 			can_be_expensed, can_be_rented, can_be_subcontracted, is_overhead_expense,
+			is_manufacturable, auto_manufacture,
 			is_active, tags, image_url, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
 		RETURNING id
 	`
 
@@ -463,6 +476,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		isStockable, trackInventory, input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity,
 		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
 		canBeExpensed, canBeRented, canBeSubcontracted, isOverheadExpense,
+		isManufacturable, autoManufacture,
 		true, tagsJSON, imageURL, userID, now, now,
 	).Scan(&id)
 
@@ -476,8 +490,29 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		return
 	}
 
-	// Create org-specific settings for the creating organization
-	if orgID != uuid.Nil {
+	// Create org-specific settings for selected organizations
+	if len(input.OrganizationIDs) > 0 {
+		for _, oid := range input.OrganizationIDs {
+			parsedOrgID, parseErr := uuid.Parse(oid)
+			if parseErr != nil {
+				continue
+			}
+			_, err = h.db.Exec(`
+				INSERT INTO product_organization_settings (
+					tenant_id, product_id, organization_id,
+					cost_price, list_price, min_price,
+					min_stock_level, reorder_point, reorder_quantity
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				ON CONFLICT (product_id, organization_id) DO NOTHING
+			`, tenantID, id, parsedOrgID,
+				input.CostPrice, input.ListPrice, input.MinPrice,
+				input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity)
+			if err != nil {
+				h.log.Error("Failed to create product org settings", "error", err, "org_id", oid)
+			}
+		}
+	} else if orgID != uuid.Nil {
+		// Fallback: if no orgs selected, use the creating organization
 		_, err = h.db.Exec(`
 			INSERT INTO product_organization_settings (
 				tenant_id, product_id, organization_id,
@@ -651,6 +686,24 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		resp.Tags = []string{}
 	}
 
+	// Load organization IDs for this product
+	orgRows, orgErr := h.db.Query(`
+		SELECT organization_id FROM product_organization_settings
+		WHERE product_id = $1 AND tenant_id = $2
+	`, id, tenantID)
+	if orgErr == nil {
+		defer orgRows.Close()
+		for orgRows.Next() {
+			var oid uuid.UUID
+			if orgRows.Scan(&oid) == nil {
+				resp.OrganizationIDs = append(resp.OrganizationIDs, oid)
+			}
+		}
+	}
+	if resp.OrganizationIDs == nil {
+		resp.OrganizationIDs = []uuid.UUID{}
+	}
+
 	response.Success(c, resp)
 }
 
@@ -788,6 +841,12 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	if input.IsOverheadExpense != nil {
 		addUpdate("is_overhead_expense", *input.IsOverheadExpense)
 	}
+	if input.IsManufacturable != nil {
+		addUpdate("is_manufacturable", *input.IsManufacturable)
+	}
+	if input.AutoManufacture != nil {
+		addUpdate("auto_manufacture", *input.AutoManufacture)
+	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
 	}
@@ -870,6 +929,28 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 			orgUpdates.minStockLevel, orgUpdates.reorderPoint, orgUpdates.reorderQuantity)
 		if err != nil {
 			h.log.Error("Failed to upsert product org settings", "error", err)
+		}
+	}
+
+	// Update organization assignments if provided
+	if len(input.OrganizationIDs) > 0 {
+		// Delete existing org assignments
+		h.db.Exec(`DELETE FROM product_organization_settings WHERE product_id = $1 AND tenant_id = $2`, id, tenantID)
+
+		// Re-create for selected orgs
+		for _, oid := range input.OrganizationIDs {
+			parsedOrgID, parseErr := uuid.Parse(oid)
+			if parseErr != nil {
+				continue
+			}
+			h.db.Exec(`
+				INSERT INTO product_organization_settings (
+					tenant_id, product_id, organization_id,
+					cost_price, list_price, min_price,
+					min_stock_level, reorder_point, reorder_quantity
+				) VALUES ($1, $2, $3, 0, 0, 0, 0, 0, 0)
+				ON CONFLICT (product_id, organization_id) DO NOTHING
+			`, tenantID, id, parsedOrgID)
 		}
 	}
 
