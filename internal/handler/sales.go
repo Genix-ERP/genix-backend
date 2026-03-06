@@ -560,6 +560,11 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		)
 	}
 
+	// Trigger intercompany sync: if customer is an intercompany contact, create PO in their company
+	if err := h.icSync.SyncSaleOrderToPurchaseOrder(tenantID, orderID); err != nil {
+		h.log.Error("Intercompany SO->PO sync failed", "error", err, "order_id", orderID)
+	}
+
 	// Use frontend status/payment_status if provided, otherwise use defaults
 	orderStatus := input.Status
 	if orderStatus == "" {
@@ -1075,7 +1080,7 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						WHERE id = $2
 					`, now, lineID)
 
-					// Find inventory record
+					// Find or create inventory record
 					var inventoryID uuid.UUID
 					err := h.db.QueryRow(`
 						SELECT id FROM inventory
@@ -1083,8 +1088,18 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						ORDER BY created_at ASC LIMIT 1
 					`, tenantID, productID, warehouseID).Scan(&inventoryID)
 
-					if err != nil {
-						h.log.Error("No inventory record found for SO shipment", "product_id", productID, "warehouse_id", warehouseID)
+					if err == sql.ErrNoRows {
+						inventoryID = uuid.New()
+						var orgID interface{}
+						if soOrgID.Valid && soOrgID.String != "" {
+							orgID, _ = uuid.Parse(soOrgID.String)
+						}
+						h.db.Exec(`
+							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+							VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+						`, inventoryID, tenantID, productID, warehouseID, orgID, unitPrice, now)
+					} else if err != nil {
+						h.log.Error("Failed to query inventory for SO shipment", "product_id", productID, "warehouse_id", warehouseID, "error", err)
 						continue
 					}
 
@@ -1597,13 +1612,15 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 // autoCreateProductionOrders checks stock levels for each SO line and creates
 // production orders for products where the ordered quantity exceeds available inventory.
 func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.UUID, warehouseID, organizationID *uuid.UUID, userID uuid.UUID, now time.Time) {
-	// Fetch SO lines with product info and UOM
+	// Fetch SO lines with product info and UOM, only for products with auto_manufacture enabled
 	rows, err := h.db.Query(`
 		SELECT sol.product_id, sol.quantity, p.name, COALESCE(u.code, 'unit') as uom_code
 		FROM sales_order_lines sol
 		JOIN products p ON p.id = sol.product_id
 		LEFT JOIN units_of_measure u ON sol.unit_id = u.id
 		WHERE sol.sales_order_id = $1
+		  AND p.is_manufacturable = true
+		  AND p.auto_manufacture = true
 	`, orderID)
 	if err != nil {
 		h.log.Error("Auto MO: failed to fetch SO lines", "error", err)

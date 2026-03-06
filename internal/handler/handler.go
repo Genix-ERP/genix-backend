@@ -9,6 +9,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/crypto"
 	"github.com/genixerp/genix-backend/internal/pkg/logger"
+	"github.com/genixerp/genix-backend/internal/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,6 +22,7 @@ type Handler struct {
 	jwtManager   *crypto.JWTManager
 	emailService *email.Service
 	smsService   *sms.Service
+	icSync       *service.IntercompanySyncService
 }
 
 // NewHandler creates a new handler instance
@@ -33,6 +35,7 @@ func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, l
 		jwtManager:   crypto.NewJWTManager(cfg.JWT),
 		emailService: email.NewService(&cfg.Email),
 		smsService:   sms.NewService(&cfg.SMS),
+		icSync:       service.NewIntercompanySyncService(db.DB),
 	}
 }
 
