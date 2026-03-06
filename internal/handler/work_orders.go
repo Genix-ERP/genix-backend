@@ -402,10 +402,10 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	durationHours := float64(durationMinutes) / 60.0
 	_, err = h.db.Exec(`
 		UPDATE work_orders
-		SET status = 'completed', actual_end = $1, quantity_produced = quantity_produced + $2,
-			actual_duration_hours = $3, completed_by = $4
-		WHERE id = $5 AND tenant_id = $6
-	`, now, input.QuantityProduced, durationHours, userID, woID, tenantID)
+		SET status = 'completed', actual_end = $1, quantity_produced = $2,
+			quantity_scrapped = $3, actual_duration_hours = $4, completed_by = $5
+		WHERE id = $6 AND tenant_id = $7
+	`, now, input.QuantityProduced, input.ScrapQuantity, durationHours, userID, woID, tenantID)
 	if err != nil {
 		response.Error(c, 500, "Failed to complete work order", err.Error())
 		return
@@ -456,9 +456,10 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		// Auto-start next work order
 		h.db.Exec(`
 			UPDATE work_orders
-			SET status = 'in_progress', actual_start = $1, started_by = $2
-			WHERE id = $3 AND tenant_id = $4
-		`, now, userID, nextWoID, tenantID)
+			SET status = 'in_progress', actual_start = $1, started_by = $2,
+				quantity_to_produce = $3
+			WHERE id = $4 AND tenant_id = $5
+		`, now, userID, input.QuantityProduced, nextWoID, tenantID)
 
 		// Advance production order stage to next operation
 		nextStage := fmt.Sprintf("op_%d", nextSequence)
@@ -477,23 +478,53 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		`, productionOrderID, tenantID).Scan(&incompleteCount)
 
 		if incompleteCount == 0 {
-			// All work orders done — mark production order as completed at 100%
-			// Sum quantity_produced from all work orders
-			var totalProduced float64
+			// All work orders done — use last step's output as final quantity
+			var lastWoProduced float64
 			h.db.QueryRow(`
-				SELECT COALESCE(SUM(quantity_produced), 0) FROM work_orders
+				SELECT COALESCE(quantity_produced, 0) FROM work_orders
 				WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-			`, productionOrderID, tenantID).Scan(&totalProduced)
+					AND status IN ('completed', 'done')
+				ORDER BY sequence DESC LIMIT 1
+			`, productionOrderID, tenantID).Scan(&lastWoProduced)
+
+			// Total scrap across all steps
+			var totalScrapped float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(quantity_scrapped), 0) FROM work_orders
+				WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+			`, productionOrderID, tenantID).Scan(&totalScrapped)
 
 			h.db.Exec(`
 				UPDATE production_orders
 				SET status = 'completed', current_stage = 'done', progress_percent = 100,
-				    quantity_produced = $1, actual_end = $2, updated_at = $2
-				WHERE id = $3 AND tenant_id = $4
-			`, totalProduced, now, productionOrderID, tenantID)
+				    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
+				    actual_end = $3, updated_at = $3
+				WHERE id = $4 AND tenant_id = $5
+			`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
 
-			// Add finished goods to inventory
-			h.receiveFinishedGoods(productionOrderID, tenantID, userID, totalProduced, now)
+			// Add finished goods to inventory (last step's good output)
+			unitCost := h.receiveFinishedGoods(productionOrderID, tenantID, userID, lastWoProduced, now)
+
+			// Set material_cost and actual_cost on the production order
+			totalCost := unitCost * (lastWoProduced + totalScrapped)
+			if totalCost > 0 {
+				h.db.Exec(`
+					UPDATE production_orders
+					SET material_cost = $1, actual_cost = $1, updated_at = $2
+					WHERE id = $3 AND tenant_id = $4
+				`, totalCost, now, productionOrderID, tenantID)
+			}
+
+			// Move scrapped items to scrap warehouse
+			if totalScrapped > 0 {
+				var productID uuid.UUID
+				var organizationID *uuid.UUID
+				h.db.QueryRow(`
+					SELECT product_id, organization_id FROM production_orders
+					WHERE id = $1 AND tenant_id = $2
+				`, productionOrderID, tenantID).Scan(&productID, &organizationID)
+				h.receiveScrapGoods(productionOrderID, tenantID, userID, productID, organizationID, totalScrapped, unitCost, now)
+			}
 		}
 	}
 
@@ -1328,7 +1359,7 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 
 // receiveFinishedGoods adds the produced quantity of the finished product to inventory.
 // It is idempotent — if Receipt transactions already exist for this PO it does nothing.
-func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, producedQty float64, now time.Time) {
+func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, producedQty float64, now time.Time) float64 {
 	// Guard: skip if already received
 	var existing int
 	h.db.QueryRow(`
@@ -1336,7 +1367,7 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2 AND transaction_type = 'receipt'
 	`, tenantID, poID).Scan(&existing)
 	if existing > 0 {
-		return
+		return 0
 	}
 
 	var productID uuid.UUID
@@ -1348,7 +1379,7 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		FROM production_orders WHERE id = $1 AND tenant_id = $2
 	`, poID, tenantID).Scan(&productID, &warehouseID, &organizationID, &qtyPlanned)
 	if err != nil || warehouseID == nil {
-		return
+		return 0
 	}
 
 	if producedQty <= 0 {
@@ -1381,7 +1412,7 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 
 	tx, err := h.db.Begin()
 	if err != nil {
-		return
+		return 0
 	}
 	defer tx.Rollback()
 
@@ -1400,17 +1431,17 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 			VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$8,$8)
 		`, invID, tenantID, organizationID, productID, warehouseID, producedQty, unitCost, now); insertErr != nil {
 			h.log.Error("receiveFinishedGoods: failed to insert inventory record", "error", insertErr, "po_id", poID)
-			return
+			return 0
 		}
 	} else if err == nil {
 		if _, updateErr := tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
 			producedQty, now, invID); updateErr != nil {
 			h.log.Error("receiveFinishedGoods: failed to update inventory", "error", updateErr, "inv_id", invID)
-			return
+			return 0
 		}
 	} else {
 		h.log.Error("receiveFinishedGoods: failed to query inventory", "error", err, "po_id", poID)
-		return
+		return 0
 	}
 
 	if _, txErr := tx.Exec(`
@@ -1421,12 +1452,95 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'production_complete','Finished goods from production order',$9,$10,$9)
 	`, uuid.New(), tenantID, organizationID, invID, poID, producedQty, unitCost, producedQty*unitCost, now, userID); txErr != nil {
 		h.log.Error("receiveFinishedGoods: failed to insert inventory_transaction", "error", txErr, "po_id", poID)
-		return
+		return 0
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
 		h.log.Error("receiveFinishedGoods: failed to commit transaction", "error", commitErr, "po_id", poID)
 	} else {
 		h.log.Info("receiveFinishedGoods: finished goods added to inventory", "po_id", poID, "qty", producedQty)
+	}
+	return unitCost
+}
+
+// receiveScrapGoods moves scrapped quantity to a dedicated scrap warehouse.
+// Auto-creates the scrap warehouse if one doesn't exist for this tenant.
+func (h *Handler) receiveScrapGoods(poID, tenantID, userID uuid.UUID, productID uuid.UUID, organizationID *uuid.UUID, scrapQty float64, unitCost float64, now time.Time) {
+	if scrapQty <= 0 {
+		return
+	}
+
+	// Find scrap warehouse for this tenant
+	var scrapWarehouseID uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT id FROM warehouses
+		WHERE tenant_id = $1 AND warehouse_type = 'scrap' AND is_active = true
+		LIMIT 1
+	`, tenantID).Scan(&scrapWarehouseID)
+
+	if err != nil {
+		// Auto-create scrap warehouse
+		scrapWarehouseID = uuid.New()
+		_, createErr := h.db.Exec(`
+			INSERT INTO warehouses (id, tenant_id, organization_id, code, name, warehouse_type, is_active, created_at, updated_at)
+			VALUES ($1, $2, $3, 'SCRAP', 'Scrap', 'scrap', true, $4, $4)
+		`, scrapWarehouseID, tenantID, organizationID, now)
+		if createErr != nil {
+			h.log.Error("receiveScrapGoods: failed to create scrap warehouse", "error", createErr)
+			return
+		}
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	// Find or create inventory record in scrap warehouse
+	var invID uuid.UUID
+	err = tx.QueryRow(`
+		SELECT id FROM inventory
+		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+		AND lot_number IS NULL AND serial_number IS NULL
+	`, tenantID, productID, scrapWarehouseID).Scan(&invID)
+
+	if err == sql.ErrNoRows {
+		invID = uuid.New()
+		if _, insertErr := tx.Exec(`
+			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id,
+				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$8,$8)
+		`, invID, tenantID, organizationID, productID, scrapWarehouseID, scrapQty, unitCost, now); insertErr != nil {
+			h.log.Error("receiveScrapGoods: failed to insert inventory", "error", insertErr)
+			return
+		}
+	} else if err == nil {
+		if _, updateErr := tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+			scrapQty, now, invID); updateErr != nil {
+			h.log.Error("receiveScrapGoods: failed to update inventory", "error", updateErr)
+			return
+		}
+	} else {
+		h.log.Error("receiveScrapGoods: failed to query inventory", "error", err)
+		return
+	}
+
+	// Create inventory transaction for scrap
+	if _, txErr := tx.Exec(`
+		INSERT INTO inventory_transactions (
+			id, tenant_id, organization_id, inventory_id, transaction_type,
+			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reason, notes, transaction_date, created_by, created_at
+		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'production_scrap','Scrapped items from production',$9,$10,$9)
+	`, uuid.New(), tenantID, organizationID, invID, poID, scrapQty, unitCost, scrapQty*unitCost, now, userID); txErr != nil {
+		h.log.Error("receiveScrapGoods: failed to insert transaction", "error", txErr)
+		return
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		h.log.Error("receiveScrapGoods: failed to commit", "error", commitErr)
+	} else {
+		h.log.Info("receiveScrapGoods: scrap added to scrap warehouse", "po_id", poID, "qty", scrapQty)
 	}
 }
