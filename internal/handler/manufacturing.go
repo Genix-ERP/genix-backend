@@ -692,13 +692,15 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 			   w.name as warehouse_name, po.planned_cost, po.actual_cost, po.material_cost,
 			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
 			   po.work_center_id, wc.name as work_center_name, po.requires_quality_check, po.quality_status,
-			   po.notes, po.tags, po.created_by, po.confirmed_at, po.completed_at, po.created_at, po.updated_at
+			   po.notes, po.tags, po.created_by, po.confirmed_at, po.completed_at, po.created_at, po.updated_at,
+			   po.manufacturing_category_id, mc.name as manufacturing_category_name
 		FROM production_orders po
 		LEFT JOIN products p ON po.product_id = p.id
 		LEFT JOIN product_boms b ON po.bom_id = b.id
 		LEFT JOIN warehouses w ON po.warehouse_id = w.id
 		LEFT JOIN users u ON po.assigned_to = u.id
 		LEFT JOIN work_centers wc ON po.work_center_id = wc.id
+		LEFT JOIN manufacturing_categories mc ON po.manufacturing_category_id = mc.id
 		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
 	`
 
@@ -755,6 +757,14 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		countQuery += fmt.Sprintf(" AND po.priority = $%d", argCount)
 		args = append(args, *filter.Priority)
 		countArgs = append(countArgs, *filter.Priority)
+	}
+
+	if filter.CategoryID != nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND po.manufacturing_category_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND po.manufacturing_category_id = $%d", argCount)
+		args = append(args, *filter.CategoryID)
+		countArgs = append(countArgs, *filter.CategoryID)
 	}
 
 	if filter.DateFrom != nil && *filter.DateFrom != "" {
@@ -825,7 +835,7 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	orders := []entity.ProductionOrderResponse{}
 	for rows.Next() {
 		var po entity.ProductionOrderResponse
-		var bomName, warehouseName, assignedToName, workCenterName, shift sql.NullString
+		var bomName, warehouseName, assignedToName, workCenterName, shift, categoryName sql.NullString
 		var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 		var tags []byte
 
@@ -839,6 +849,7 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 			&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
 			&po.WorkCenterID, &workCenterName, &po.RequiresQualityCheck, &po.QualityStatus,
 			&po.Notes, &tags, &po.CreatedBy, &confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
+			&po.ManufacturingCategoryID, &categoryName,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan production order", "error", err)
@@ -859,6 +870,9 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		}
 		if shift.Valid {
 			po.Shift = &shift.String
+		}
+		if categoryName.Valid {
+			po.ManufacturingCategoryName = &categoryName.String
 		}
 		if scheduledStart.Valid {
 			s := scheduledStart.Time.Format("2006-01-02")
@@ -934,7 +948,8 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
 			   po.work_center_id, wc.name as work_center_name, po.requires_quality_check, po.quality_status,
 			   po.notes, po.tags, po.created_by, cu.first_name || ' ' || cu.last_name as created_by_name,
-			   po.confirmed_at, po.completed_at, po.created_at, po.updated_at
+			   po.confirmed_at, po.completed_at, po.created_at, po.updated_at,
+			   po.manufacturing_category_id, mc.name as manufacturing_category_name
 		FROM production_orders po
 		LEFT JOIN products p ON po.product_id = p.id
 		LEFT JOIN product_boms b ON po.bom_id = b.id
@@ -942,11 +957,12 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 		LEFT JOIN users u ON po.assigned_to = u.id
 		LEFT JOIN work_centers wc ON po.work_center_id = wc.id
 		LEFT JOIN users cu ON po.created_by = cu.id
+		LEFT JOIN manufacturing_categories mc ON po.manufacturing_category_id = mc.id
 		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL
 	`
 
 	var po entity.ProductionOrderResponse
-	var bomName, warehouseName, assignedToName, workCenterName, createdByName, shift sql.NullString
+	var bomName, warehouseName, assignedToName, workCenterName, createdByName, shift, categoryName sql.NullString
 	var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 	var tags []byte
 
@@ -961,6 +977,7 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 		&po.WorkCenterID, &workCenterName, &po.RequiresQualityCheck, &po.QualityStatus,
 		&po.Notes, &tags, &po.CreatedBy, &createdByName,
 		&confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
+		&po.ManufacturingCategoryID, &categoryName,
 	)
 
 	if err == sql.ErrNoRows {
@@ -990,6 +1007,9 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	}
 	if shift.Valid {
 		po.Shift = &shift.String
+	}
+	if categoryName.Valid {
+		po.ManufacturingCategoryName = &categoryName.String
 	}
 	if scheduledStart.Valid {
 		s := scheduledStart.Time.Format("2006-01-02")
@@ -1194,8 +1214,9 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 			mold_count, shift, current_stage,
 			scheduled_start, scheduled_end, priority, status, source_type, source_id,
 			sales_order_id, customer_id, warehouse_id, location_id, assigned_to,
-			work_center_id, requires_quality_check, notes, tags, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, 'draft', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+			work_center_id, requires_quality_check, notes, tags, created_by, created_at, updated_at,
+			manufacturing_category_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, 'draft', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
 		RETURNING id
 	`
 
@@ -1210,6 +1231,7 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		scheduledStart, scheduledEnd, priority, input.SourceType, input.SourceID,
 		input.SalesOrderID, input.CustomerID, input.WarehouseID, input.LocationID, input.AssignedTo,
 		input.WorkCenterID, requiresQC, input.Notes, tags, userID, now, now,
+		input.ManufacturingCategoryID,
 	).Scan(&id)
 
 	if err != nil {
@@ -1352,6 +1374,11 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("reject_quantity = $%d", argCount))
 		args = append(args, *input.RejectQuantity)
+	}
+	if input.ManufacturingCategoryID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("manufacturing_category_id = $%d", argCount))
+		args = append(args, *input.ManufacturingCategoryID)
 	}
 
 	if len(updates) == 0 {
@@ -3196,4 +3223,246 @@ func (h *Handler) UpdateMaintenanceTask(c *gin.Context) {
 		return
 	}
 	response.Success(c, gin.H{"message": "Maintenance task updated"})
+}
+
+// =====================================================
+// MANUFACTURING CATEGORY HANDLERS
+// =====================================================
+
+func (h *Handler) ListManufacturingCategories(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	baseQuery := `
+		SELECT id, name, description, color, is_active, sort_order, created_at, updated_at
+		FROM manufacturing_categories
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
+	baseQuery += " ORDER BY sort_order ASC, name ASC"
+
+	rows, err := h.db.Query(baseQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to list manufacturing categories", "error", err)
+		response.InternalError(c, "Failed to retrieve manufacturing categories")
+		return
+	}
+	defer rows.Close()
+
+	type CategoryResponse struct {
+		ID          uuid.UUID  `json:"id"`
+		Name        string     `json:"name"`
+		Description *string    `json:"description"`
+		Color       *string    `json:"color"`
+		IsActive    bool       `json:"is_active"`
+		SortOrder   int        `json:"sort_order"`
+		CreatedAt   time.Time  `json:"created_at"`
+		UpdatedAt   time.Time  `json:"updated_at"`
+	}
+
+	categories := []CategoryResponse{}
+	for rows.Next() {
+		var cat CategoryResponse
+		if err := rows.Scan(&cat.ID, &cat.Name, &cat.Description, &cat.Color, &cat.IsActive, &cat.SortOrder, &cat.CreatedAt, &cat.UpdatedAt); err != nil {
+			h.log.Error("Failed to scan manufacturing category", "error", err)
+			continue
+		}
+		categories = append(categories, cat)
+	}
+
+	response.Success(c, categories)
+}
+
+func (h *Handler) CreateManufacturingCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var input struct {
+		Name        string  `json:"name" binding:"required"`
+		Description *string `json:"description"`
+		Color       *string `json:"color"`
+		SortOrder   *int    `json:"sort_order"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	id := uuid.New()
+	now := time.Now()
+	sortOrder := 0
+	if input.SortOrder != nil {
+		sortOrder = *input.SortOrder
+	}
+
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
+	query := `
+		INSERT INTO manufacturing_categories (id, tenant_id, organization_id, name, description, color, is_active, sort_order, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8, $9)
+		RETURNING id
+	`
+	err := h.db.QueryRow(query, id, tenantID, orgIDPtr, input.Name, input.Description, input.Color, sortOrder, now, now).Scan(&id)
+	if err != nil {
+		h.log.Error("Failed to create manufacturing category", "error", err)
+		if strings.Contains(err.Error(), "unique") {
+			response.BadRequest(c, "Category name already exists")
+			return
+		}
+		response.InternalError(c, "Failed to create manufacturing category")
+		return
+	}
+
+	response.Created(c, gin.H{
+		"id":          id,
+		"name":        input.Name,
+		"description": input.Description,
+		"color":       input.Color,
+		"is_active":   true,
+		"sort_order":  sortOrder,
+		"created_at":  now,
+		"updated_at":  now,
+	})
+}
+
+func (h *Handler) UpdateManufacturingCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid category ID")
+		return
+	}
+
+	var input struct {
+		Name        *string `json:"name"`
+		Description *string `json:"description"`
+		Color       *string `json:"color"`
+		IsActive    *bool   `json:"is_active"`
+		SortOrder   *int    `json:"sort_order"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if input.Name != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
+		args = append(args, *input.Name)
+	}
+	if input.Description != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, *input.Description)
+	}
+	if input.Color != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("color = $%d", argCount))
+		args = append(args, *input.Color)
+	}
+	if input.IsActive != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("is_active = $%d", argCount))
+		args = append(args, *input.IsActive)
+	}
+	if input.SortOrder != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("sort_order = $%d", argCount))
+		args = append(args, *input.SortOrder)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+
+	argCount++
+	args = append(args, id)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf("UPDATE manufacturing_categories SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
+		strings.Join(updates, ", "), argCount-1, argCount)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update manufacturing category", "error", err)
+		if strings.Contains(err.Error(), "unique") {
+			response.BadRequest(c, "Category name already exists")
+			return
+		}
+		response.InternalError(c, "Failed to update manufacturing category")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Manufacturing category not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Manufacturing category updated"})
+}
+
+func (h *Handler) DeleteManufacturingCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid category ID")
+		return
+	}
+
+	query := `UPDATE manufacturing_categories SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL`
+	result, err := h.db.Exec(query, time.Now(), id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete manufacturing category", "error", err)
+		response.InternalError(c, "Failed to delete manufacturing category")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Manufacturing category not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Manufacturing category deleted"})
 }
