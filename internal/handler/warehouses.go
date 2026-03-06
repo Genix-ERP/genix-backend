@@ -46,7 +46,8 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 	// Build query
 	baseQuery := `
 		SELECT w.id, w.tenant_id, w.organization_id, w.code, w.name, w.address,
-			   w.manager_id, w.is_default, w.is_active, w.reception_steps, w.delivery_steps,
+			   w.manager_id, w.is_default, w.is_active, COALESCE(w.warehouse_type, 'regular'),
+			   w.reception_steps, w.delivery_steps,
 			   w.created_at, w.updated_at,
 			   e.first_name as manager_first_name, e.last_name as manager_last_name
 		FROM warehouses w
@@ -128,6 +129,7 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 		ManagerName    string              `json:"manager_name,omitempty"`
 		IsDefault      bool                `json:"is_default"`
 		IsActive       bool                `json:"is_active"`
+		WarehouseType  string              `json:"warehouse_type"`
 		ReceptionSteps int                 `json:"reception_steps"`
 		DeliverySteps  int                 `json:"delivery_steps"`
 		Locations      []*LocationResponse `json:"locations"`
@@ -145,7 +147,8 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 
 		err := rows.Scan(
 			&w.ID, &w.TenantID, &orgID, &w.Code, &w.Name, &addressJSON,
-			&managerID, &w.IsDefault, &w.IsActive, &receptionSteps, &deliverySteps,
+			&managerID, &w.IsDefault, &w.IsActive, &w.WarehouseType,
+			&receptionSteps, &deliverySteps,
 			&w.CreatedAt, &w.UpdatedAt,
 			&managerFirstName, &managerLastName,
 		)
@@ -161,6 +164,7 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 			Name:           w.Name,
 			IsDefault:      w.IsDefault,
 			IsActive:       w.IsActive,
+			WarehouseType:  w.WarehouseType,
 			ReceptionSteps: int(receptionSteps.Int64),
 			DeliverySteps:  int(deliverySteps.Int64),
 			Locations:      make([]*LocationResponse, 0),
@@ -356,14 +360,19 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
+	warehouseType := input.WarehouseType
+	if warehouseType == "" {
+		warehouseType = "regular"
+	}
+
 	query := `
-		INSERT INTO warehouses (id, tenant_id, organization_id, code, name, address, manager_id, is_default, is_active, reception_steps, delivery_steps, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		INSERT INTO warehouses (id, tenant_id, organization_id, code, name, address, manager_id, is_default, is_active, warehouse_type, reception_steps, delivery_steps, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id
 	`
 
 	err = h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, input.Code, input.Name, addressJSON, managerID, input.IsDefault, true, receptionSteps, deliverySteps, now, now,
+		id, tenantID, orgIDPtr, input.Code, input.Name, addressJSON, managerID, input.IsDefault, true, warehouseType, receptionSteps, deliverySteps, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -388,6 +397,7 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 		ManagerID:      managerID,
 		IsDefault:      input.IsDefault,
 		IsActive:       true,
+		WarehouseType:  warehouseType,
 		ReceptionSteps: receptionSteps,
 		DeliverySteps:  deliverySteps,
 		CreatedAt:      now,
@@ -414,7 +424,8 @@ func (h *Handler) GetWarehouse(c *gin.Context) {
 
 	query := `
 		SELECT w.id, w.tenant_id, w.organization_id, w.code, w.name, w.address,
-			   w.manager_id, w.is_default, w.is_active, w.reception_steps, w.delivery_steps,
+			   w.manager_id, w.is_default, w.is_active, COALESCE(w.warehouse_type, 'regular'),
+			   w.reception_steps, w.delivery_steps,
 			   w.created_at, w.updated_at,
 			   e.first_name as manager_first_name, e.last_name as manager_last_name
 		FROM warehouses w
@@ -430,7 +441,8 @@ func (h *Handler) GetWarehouse(c *gin.Context) {
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&w.ID, &w.TenantID, &orgID, &w.Code, &w.Name, &addressJSON,
-		&managerID, &w.IsDefault, &w.IsActive, &receptionSteps, &deliverySteps,
+		&managerID, &w.IsDefault, &w.IsActive, &w.WarehouseType,
+		&receptionSteps, &deliverySteps,
 		&w.CreatedAt, &w.UpdatedAt,
 		&managerFirstName, &managerLastName,
 	)
@@ -456,6 +468,7 @@ func (h *Handler) GetWarehouse(c *gin.Context) {
 		ManagerName    string                     `json:"manager_name,omitempty"`
 		IsDefault      bool                       `json:"is_default"`
 		IsActive       bool                       `json:"is_active"`
+		WarehouseType  string                     `json:"warehouse_type"`
 		ReceptionSteps int                        `json:"reception_steps"`
 		DeliverySteps  int                        `json:"delivery_steps"`
 		CreatedAt      time.Time                  `json:"created_at"`
@@ -480,6 +493,7 @@ func (h *Handler) GetWarehouse(c *gin.Context) {
 		Name:           w.Name,
 		IsDefault:      w.IsDefault,
 		IsActive:       w.IsActive,
+		WarehouseType:  w.WarehouseType,
 		ReceptionSteps: respReceptionSteps,
 		DeliverySteps:  respDeliverySteps,
 		CreatedAt:      w.CreatedAt,
@@ -615,6 +629,9 @@ func (h *Handler) UpdateWarehouse(c *gin.Context) {
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
+	}
+	if input.WarehouseType != nil {
+		addUpdate("warehouse_type", *input.WarehouseType)
 	}
 	if input.ReceptionSteps != nil {
 		steps := *input.ReceptionSteps

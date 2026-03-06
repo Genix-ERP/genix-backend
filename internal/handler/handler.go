@@ -1385,6 +1385,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		equipment.PATCH("/:id/maintenance/:task_id", middleware.RequirePermission("manufacturing", "work_centers", "update"), h.UpdateMaintenanceTask)
 	}
 
+	// Manufacturing Categories
+	mfgCategories := rg.Group("/manufacturing-categories")
+	mfgCategories.Use(middleware.RequirePermission("manufacturing", "work_centers", "read"))
+	{
+		mfgCategories.GET("", h.ListManufacturingCategories)
+		mfgCategories.POST("", middleware.RequirePermission("manufacturing", "work_centers", "create"), h.CreateManufacturingCategory)
+		mfgCategories.PUT("/:id", middleware.RequirePermission("manufacturing", "work_centers", "update"), h.UpdateManufacturingCategory)
+		mfgCategories.DELETE("/:id", middleware.RequirePermission("manufacturing", "work_centers", "delete"), h.DeleteManufacturingCategory)
+	}
+
 	// =====================================================
 	// ERP EXTENSIONS MODULE ROUTES
 	// =====================================================
