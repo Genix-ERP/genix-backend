@@ -728,12 +728,15 @@ type StockCountLine struct {
 	CountedAt       *time.Time `json:"counted_at,omitempty" db:"counted_at"`
 	VerifiedBy      *uuid.UUID `json:"verified_by,omitempty" db:"verified_by"`
 	VerifiedAt      *time.Time `json:"verified_at,omitempty" db:"verified_at"`
+	Resolution      string     `json:"resolution" db:"resolution"`                    // pending, employee, company, cash
+	ResponsibleEmpID *uuid.UUID `json:"responsible_emp_id,omitempty" db:"responsible_emp_id"`
 	Notes           *string    `json:"notes,omitempty" db:"notes"`
 	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
-	Product *Product `json:"product,omitempty"`
+	Product          *Product  `json:"product,omitempty"`
+	ResponsibleName  string    `json:"responsible_name,omitempty" db:"responsible_name"`
 }
 
 // CreateStockCountInput represents input for creating a stock count
@@ -1249,4 +1252,44 @@ type ReorderRuleResponse struct {
 	CurrentStock       float64    `json:"current_stock,omitempty"`
 	NeedsReorder       bool       `json:"needs_reorder,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
+}
+
+// =====================================================
+// EMPLOYEE DEDUCTIONS (Inventory shortage → Payroll bridge)
+// =====================================================
+
+// EmployeeDeduction represents a deduction to be applied to employee salary
+type EmployeeDeduction struct {
+	ID              uuid.UUID  `json:"id" db:"id"`
+	TenantID        uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	OrganizationID  *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	EmployeeID      uuid.UUID  `json:"employee_id" db:"employee_id"`
+	Amount          float64    `json:"amount" db:"amount"`
+	Reason          string     `json:"reason" db:"reason"`
+	SourceType      string     `json:"source_type" db:"source_type"` // inventory_shortage, penalty, advance, other
+	SourceID        *uuid.UUID `json:"source_id,omitempty" db:"source_id"`
+	Status          string     `json:"status" db:"status"` // pending, deducted, paid_cash, cancelled
+	PayrollEntryID  *uuid.UUID `json:"payroll_entry_id,omitempty" db:"payroll_entry_id"`
+	DeductedAt      *time.Time `json:"deducted_at,omitempty" db:"deducted_at"`
+	CancelledReason *string    `json:"cancelled_reason,omitempty" db:"cancelled_reason"`
+	CancelledBy     *uuid.UUID `json:"cancelled_by,omitempty" db:"cancelled_by"`
+	CancelledAt     *time.Time `json:"cancelled_at,omitempty" db:"cancelled_at"`
+	CreatedBy       uuid.UUID  `json:"created_by" db:"created_by"`
+	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+
+	// Populated fields
+	EmployeeName string `json:"employee_name,omitempty" db:"employee_name"`
+}
+
+// AssignResponsibleInput represents input for assigning responsible employee to a shortage line
+type AssignResponsibleInput struct {
+	EmployeeID string `json:"employee_id" binding:"required"`
+	Resolution string `json:"resolution" binding:"required"` // employee, company, cash
+	Note       string `json:"note,omitempty"`
+}
+
+// CancelDeductionInput represents input for cancelling a deduction
+type CancelDeductionInput struct {
+	Reason string `json:"reason" binding:"required"`
 }
