@@ -948,7 +948,7 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 
 	// Get accounts — lookup by name first, then code fallback
 	apAccountID := findAccount(h.db, tenantID, prOrgID, "accounts payable", "2000")
-	inventoryAccountID := findAccount(h.db, tenantID, prOrgID, "inventory", "1200")
+	inventoryAccountID := findAccount(h.db, tenantID, prOrgID, "inventory", "1300")
 
 	// Get journal (use GENERAL or PURCHASE journal)
 	var journalID uuid.UUID

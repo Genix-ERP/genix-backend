@@ -348,6 +348,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		stockCounts.DELETE("/:id", middleware.RequirePermission("inventory", "stock", "delete"), h.DeleteStockCount)
 	}
 
+	// Stock Count Lines — shortage assignment
+	stockCountLines := rg.Group("/stock-count-lines")
+	stockCountLines.Use(middleware.RequirePermission("inventory", "stock", "read"))
+	{
+		stockCountLines.POST("/:id/assign", middleware.RequirePermission("inventory", "stock", "adjust"), h.AssignResponsible)
+	}
+
+	// Employee Deductions (inventory shortage → payroll bridge)
+	edDeductions := rg.Group("/employee-deductions")
+	edDeductions.Use(middleware.RequirePermission("hr", "employee", "read"))
+	{
+		edDeductions.GET("", h.ListAllDeductions)
+	}
+
 	// Stock Operations (TT: Receipt, Delivery, Internal Transfer, Write-off)
 	stockOps := rg.Group("/stock-operations")
 	stockOps.Use(middleware.RequirePermission("inventory", "stock", "read"))
@@ -928,7 +942,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		journals.GET("", h.ListJournalEntries)
 		journals.POST("", middleware.RequirePermission("finance", "journal", "create"), h.CreateJournalEntry)
 		journals.GET("/:id", h.GetJournalEntry)
+		journals.PUT("/:id", middleware.RequirePermission("finance", "journal", "create"), h.UpdateJournalEntry)
+		journals.DELETE("/:id", middleware.RequirePermission("finance", "journal", "delete"), h.DeleteJournalEntry)
 		journals.POST("/:id/post", middleware.RequirePermission("finance", "journal", "post"), h.PostJournalEntry)
+		journals.POST("/:id/cancel", middleware.RequirePermission("finance", "journal", "create"), h.CancelJournalEntry)
 		journals.POST("/:id/reverse", middleware.RequirePermission("finance", "journal", "reverse"), h.ReverseJournalEntry)
 	}
 
@@ -1026,6 +1043,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		fiscalPeriods.POST("/batch", h.BatchCreateFiscalPeriods)
 		fiscalPeriods.POST("/:id/close", h.CloseFiscalPeriod)
 		fiscalPeriods.POST("/:id/reopen", h.ReopenFiscalPeriod)
+		fiscalPeriods.POST("/:id/lock", h.LockFiscalPeriod)
+		fiscalPeriods.POST("/:id/unlock", h.UnlockFiscalPeriod)
 	}
 
 	// Budgets
@@ -1144,6 +1163,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employees.PUT("/:id/permissions", middleware.RequirePermission("hr", "employee", "update"), h.BulkUpdateEmployeePermissions)
 		employees.PUT("/:id/permissions/module", middleware.RequirePermission("hr", "employee", "update"), h.UpdateEmployeeModulePermission)
 		employees.DELETE("/:id/permissions", middleware.RequirePermission("hr", "employee", "delete"), h.DeleteEmployeePermissions)
+		// Employee deductions
+		employees.GET("/:id/deductions", h.ListEmployeeDeductions)
+		employees.POST("/:id/deductions/:did/cancel", middleware.RequirePermission("hr", "employee", "update"), h.CancelDeduction)
+		// Salary calculation with deductions
+		employees.GET("/:id/salary-calculate", h.CalculateSalaryWithDeductions)
 	}
 
 	// Employee-Organization Assignments
@@ -1411,6 +1435,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payrollPeriods.POST("/:id/process", middleware.RequirePermission("hr", "payroll", "approve"), h.ProcessPayroll)
 		payrollPeriods.GET("/:id/entries", h.ListPayrollEntries)
 		payrollPeriods.POST("/:id/entries", middleware.RequirePermission("hr", "payroll", "create"), h.CreatePayrollEntry)
+		payrollPeriods.POST("/:id/entries/:eid/confirm", middleware.RequirePermission("hr", "payroll", "approve"), h.ConfirmSalaryPaymentByEntry)
 	}
 
 	// Expense Categories

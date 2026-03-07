@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // nullIfEmpty returns nil for empty strings, otherwise returns the string pointer
@@ -125,7 +126,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	// Build query
 	baseQuery := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
-			   a.code, a.name, a.description, a.currency_id, a.is_bank_account,
+			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.current_balance, a.opening_balance, a.is_active,
@@ -177,7 +178,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	if search != "" {
 		argCount++
-		searchFilter := fmt.Sprintf(" AND (a.code ILIKE $%d OR a.name ILIKE $%d)", argCount, argCount)
+		searchFilter := fmt.Sprintf(" AND (a.code ILIKE $%d OR a.name ILIKE $%d OR a.name_uz ILIKE $%d)", argCount, argCount, argCount)
 		baseQuery += searchFilter
 		countQuery += searchFilter
 		args = append(args, "%"+search+"%")
@@ -207,12 +208,12 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	accounts := make([]*entity.AccountResponse, 0)
 	for rows.Next() {
 		var acc entity.Account
-		var orgID, parentID, currencyID, description sql.NullString
+		var orgID, parentID, currencyID, description, nameUz, nameEn sql.NullString
 		var typeCode, typeName, typeCategory, normalBalance string
 
 		err := rows.Scan(
 			&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
-			&acc.Code, &acc.Name, &description, &currencyID, &acc.IsBankAccount,
+			&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
 			&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 			&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 			&acc.CreatedAt, &acc.UpdatedAt,
@@ -229,6 +230,12 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		}
 		if description.Valid {
 			acc.Description = &description.String
+		}
+		if nameUz.Valid {
+			acc.NameUz = &nameUz.String
+		}
+		if nameEn.Valid {
+			acc.NameEn = &nameEn.String
 		}
 
 		acc.AccountType = &entity.AccountType{
@@ -482,7 +489,7 @@ func (h *Handler) GetAccount(c *gin.Context) {
 
 	query := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
-			   a.code, a.name, a.description, a.currency_id, a.is_bank_account,
+			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.current_balance, a.opening_balance, a.is_active,
@@ -494,12 +501,12 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	`
 
 	var acc entity.Account
-	var orgID, parentID, currencyID, description sql.NullString
+	var orgID, parentID, currencyID, description, nameUz, nameEn sql.NullString
 	var typeCode, typeName, typeCategory, normalBalance string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
-		&acc.Code, &acc.Name, &description, &currencyID, &acc.IsBankAccount,
+		&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
 		&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 		&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 		&acc.CreatedAt, &acc.UpdatedAt,
@@ -522,6 +529,12 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	}
 	if description.Valid {
 		acc.Description = &description.String
+	}
+	if nameUz.Valid {
+		acc.NameUz = &nameUz.String
+	}
+	if nameEn.Valid {
+		acc.NameEn = &nameEn.String
 	}
 
 	acc.AccountType = &entity.AccountType{
@@ -1799,6 +1812,12 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// Validate description is required
+	if strings.TrimSpace(input.Description) == "" {
+		response.BadRequest(c, "Description is required")
+		return
+	}
+
 	// Validate journal exists
 	journalID, err := uuid.Parse(input.JournalID)
 	if err != nil {
@@ -1825,8 +1844,12 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		return
 	}
 
-	// Check lock date
+	// Check lock date and period lock
 	if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	if errMsg := h.checkPeriodLock(tenantID, entryDate); errMsg != "" {
 		response.BadRequest(c, errMsg)
 		return
 	}
@@ -1869,29 +1892,28 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		}
 	}
 
-	// Generate entry number scoped to this journal, filtered by prefix to avoid date-embedded numbers
+	// Generate entry number: PREFIX-YYYY-NNNN format
 	prefix := ""
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
 
+	year := entryDate.Year()
+	yearPrefix := fmt.Sprintf("%s-%d-", prefix, year)
+
 	var maxNumber int
-	if prefix != "" {
-		_ = h.db.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
-			tenantID, journalID, prefix+"%",
-		).Scan(&maxNumber)
-	} else {
-		_ = h.db.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
-			tenantID, journalID,
-		).Scan(&maxNumber)
-	}
+	_ = h.db.QueryRow(
+		`SELECT COALESCE(MAX(
+			CAST(SUBSTRING(entry_number FROM '[0-9]+$') AS INTEGER)
+		), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
+		tenantID, journalID, yearPrefix+"%",
+	).Scan(&maxNumber)
+
 	actualNext := maxNumber + 1
 	if nextNumber > actualNext {
 		actualNext = nextNumber
 	}
-	entryNumber := fmt.Sprintf("%s%06d", prefix, actualNext)
+	entryNumber := fmt.Sprintf("%s%04d", yearPrefix, actualNext)
 
 	id := uuid.New()
 	now := time.Now()
@@ -1921,13 +1943,19 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 
 	sourceType := "manual"
 
+	// Convert tags to PostgreSQL array
+	var tags []string
+	if len(input.Tags) > 0 {
+		tags = input.Tags
+	}
+
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-			source_type, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			tags, source_type, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 	`, id, tenantID, orgID, journalID, entryNumber, entryDate, reference, description,
-		sourceType, exchangeRate, totalDebit, totalCredit, "draft", userID, now, now)
+		pq.Array(tags), sourceType, exchangeRate, totalDebit, totalCredit, "draft", userID, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create journal entry", "error", err)
@@ -2036,7 +2064,8 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 	query := `
 		SELECT je.id, je.tenant_id, je.journal_id, je.entry_number, je.entry_date,
 			   je.reference, je.description, je.source_type, je.total_debit, je.total_credit,
-			   je.status, je.posted_at, je.created_at, je.updated_at,
+			   je.status, je.posted_at, je.reversed_entry_id, je.is_reversal, je.reversal_of_id,
+			   je.reversal_reason, je.tags, je.created_at, je.updated_at,
 			   j.code as journal_code, j.name as journal_name
 		FROM journal_entries je
 		JOIN journals j ON je.journal_id = j.id
@@ -2044,14 +2073,16 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 	`
 
 	var je entity.JournalEntry
-	var ref, desc, sourceType sql.NullString
+	var ref, desc, sourceType, reversalReason sql.NullString
 	var postedAt sql.NullTime
 	var journalCode, journalName string
+	var tags []string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&je.ID, &je.TenantID, &je.JournalID, &je.EntryNumber, &je.EntryDate,
 		&ref, &desc, &sourceType, &je.TotalDebit, &je.TotalCredit,
-		&je.Status, &postedAt, &je.CreatedAt, &je.UpdatedAt,
+		&je.Status, &postedAt, &je.ReversedEntryID, &je.IsReversal, &je.ReversalOfID,
+		&reversalReason, pq.Array(&tags), &je.CreatedAt, &je.UpdatedAt,
 		&journalCode, &journalName,
 	)
 
@@ -2077,6 +2108,10 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 	if postedAt.Valid {
 		je.PostedAt = &postedAt.Time
 	}
+	if reversalReason.Valid {
+		je.ReversalReason = &reversalReason.String
+	}
+	je.Tags = tags
 
 	je.Journal = &entity.Journal{
 		Code: journalCode,
@@ -2193,8 +2228,12 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 		return
 	}
 
-	// Check lock date
+	// Check lock date and period lock
 	if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	if errMsg := h.checkPeriodLock(tenantID, entryDate); errMsg != "" {
 		response.BadRequest(c, errMsg)
 		return
 	}
@@ -2266,6 +2305,21 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 		}
 	}
 
+	// Validate: Cash and Bank accounts must not go negative after posting
+	for _, line := range lines {
+		var newBalance float64
+		var accountCode string
+		err = tx.QueryRow(`SELECT current_balance, code FROM accounts WHERE id = $1`, line.accountID).Scan(&newBalance, &accountCode)
+		if err != nil {
+			continue
+		}
+		// Block negative balances for cash (1000) and bank (1010, 1100) accounts
+		if (accountCode == "1000" || accountCode == "1010" || accountCode == "1100") && newBalance < -0.001 {
+			response.BadRequest(c, fmt.Sprintf("Account %s balance cannot be negative (would be %.2f)", accountCode, newBalance))
+			return
+		}
+	}
+
 	// Update entry status
 	now := time.Now()
 	_, err = tx.Exec(`
@@ -2319,6 +2373,10 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// Parse optional reversal input (date, reason)
+	var reverseInput entity.ReverseJournalEntryInput
+	_ = c.ShouldBindJSON(&reverseInput) // optional body
+
 	// Get original entry
 	var status, entryNumber string
 	var journalID uuid.UUID
@@ -2326,12 +2384,13 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	var entryDate time.Time
 	var totalDebit, totalCredit float64
 	var ref, desc sql.NullString
+	var reversedEntryID *uuid.UUID
 
 	err = h.db.QueryRow(`
-		SELECT status, journal_id, organization_id, entry_number, entry_date, reference, description, total_debit, total_credit
+		SELECT status, journal_id, organization_id, entry_number, entry_date, reference, description, total_debit, total_credit, reversed_entry_id
 		FROM journal_entries
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, originalID, tenantID).Scan(&status, &journalID, &organizationID, &entryNumber, &entryDate, &ref, &desc, &totalDebit, &totalCredit)
+	`, originalID, tenantID).Scan(&status, &journalID, &organizationID, &entryNumber, &entryDate, &ref, &desc, &totalDebit, &totalCredit, &reversedEntryID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Journal entry")
@@ -2348,6 +2407,33 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// Check if already reversed
+	if reversedEntryID != nil {
+		response.BadRequest(c, "This entry has already been reversed")
+		return
+	}
+
+	// Determine reversal date
+	reversalDate := time.Now()
+	if reverseInput.Date != "" {
+		parsed, parseErr := time.Parse("2006-01-02", reverseInput.Date)
+		if parseErr != nil {
+			response.BadRequest(c, "Invalid reversal date format (use YYYY-MM-DD)")
+			return
+		}
+		reversalDate = parsed
+	}
+
+	// Check lock date and period lock for reversal date
+	if errMsg := h.checkLockDate(tenantID, reversalDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	if errMsg := h.checkPeriodLock(tenantID, reversalDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	// Get next entry number
 	var nextNumber int
 	var numberPrefix sql.NullString
@@ -2358,24 +2444,23 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 		prefix = numberPrefix.String
 	}
 
-	// Use journal-scoped max filtered by prefix to avoid date-embedded entry numbers
+	// Generate reversal number: PREFIX-YYYY-NNNN format
+	reversalYear := time.Now().Year()
+	yearPrefix := fmt.Sprintf("%s-%d-", prefix, reversalYear)
+
 	var maxNumber int
-	if prefix != "" {
-		_ = h.db.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
-			tenantID, journalID, prefix+"%",
-		).Scan(&maxNumber)
-	} else {
-		_ = h.db.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
-			tenantID, journalID,
-		).Scan(&maxNumber)
-	}
+	_ = h.db.QueryRow(
+		`SELECT COALESCE(MAX(
+			CAST(SUBSTRING(entry_number FROM '[0-9]+$') AS INTEGER)
+		), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
+		tenantID, journalID, yearPrefix+"%",
+	).Scan(&maxNumber)
+
 	actualNext := maxNumber + 1
 	if nextNumber > actualNext {
 		actualNext = nextNumber
 	}
-	reversalNumber := fmt.Sprintf("%s%06d", prefix, actualNext)
+	reversalNumber := fmt.Sprintf("%s%04d", yearPrefix, actualNext)
 
 	// Start transaction
 	tx, err := h.db.Begin()
@@ -2389,19 +2474,26 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	reversalID := uuid.New()
 	now := time.Now()
 
-	description := fmt.Sprintf("Reversal of %s", entryNumber)
+	description := fmt.Sprintf("Teskari: %s", entryNumber)
 	reference := "REV-" + entryNumber
 
-	// Create reversal entry (swap debit/credit)
+	var reversalReason *string
+	if reverseInput.Reason != "" {
+		reversalReason = &reverseInput.Reason
+	}
+
+	// Create reversal entry as draft (swap debit/credit)
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-			source_type, total_debit, total_credit, status, posted_at, posted_by,
-			reversed_entry_id, created_by, created_at, updated_at
+			source_type, total_debit, total_credit, status,
+			is_reversal, reversal_of_id, reversal_reason,
+			created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-	`, reversalID, tenantID, organizationID, journalID, reversalNumber, now, reference, description,
-		"reversal", totalCredit, totalDebit, "posted", now, userID,
-		originalID, userID, now, now)
+	`, reversalID, tenantID, organizationID, journalID, reversalNumber, reversalDate, reference, description,
+		"reversal", totalCredit, totalDebit, "draft",
+		true, originalID, reversalReason,
+		userID, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create reversal entry", "error", err)
@@ -2467,33 +2559,7 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 		lineNum++
 	}
 
-	// Update account balances (reverse the original posting)
-	for _, ol := range origLines {
-		// Get normal balance
-		var normalBalance string
-		tx.QueryRow(`
-			SELECT at.normal_balance FROM accounts a
-			JOIN account_types at ON a.account_type_id = at.id
-			WHERE a.id = $1
-		`, ol.accountID).Scan(&normalBalance)
-
-		var balanceChange float64
-		if normalBalance == "debit" {
-			balanceChange = ol.creditAmount - ol.debitAmount // Reverse
-		} else {
-			balanceChange = ol.debitAmount - ol.creditAmount // Reverse
-		}
-
-		_, err = tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`,
-			balanceChange, now, ol.accountID)
-		if err != nil {
-			h.log.Error("Failed to update account balance", "error", err)
-			response.InternalError(c, "Failed to reverse journal entry")
-			return
-		}
-	}
-
-	// Mark original entry as reversed
+	// Mark original entry as reversed (balance changes happen when reversal is posted)
 	_, err = tx.Exec(`UPDATE journal_entries SET reversed_entry_id = $1, updated_at = $2 WHERE id = $3`,
 		reversalID, now, originalID)
 	if err != nil {
@@ -2520,6 +2586,265 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 		"reversal_entry_id": reversalID,
 		"reversal_number":   reversalNumber,
 	})
+}
+
+// UpdateJournalEntry updates a draft journal entry
+// @Summary Update a draft journal entry
+// @Tags Finance - Journal Entries
+// @Param id path string true "Journal Entry ID"
+// @Router /finance/journal-entries/{id} [put]
+func (h *Handler) UpdateJournalEntry(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid journal entry ID")
+		return
+	}
+
+	// Check entry exists and is draft
+	var status string
+	err = h.db.QueryRow(`SELECT status FROM journal_entries WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&status)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Journal entry")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get journal entry", "error", err)
+		response.InternalError(c, "Failed to update journal entry")
+		return
+	}
+	if status != "draft" {
+		response.BadRequest(c, "Only draft entries can be edited")
+		return
+	}
+
+	var input entity.CreateJournalEntryInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	if strings.TrimSpace(input.Description) == "" {
+		response.BadRequest(c, "Description is required")
+		return
+	}
+
+	entryDate, err := time.Parse("2006-01-02", input.EntryDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid entry date format (use YYYY-MM-DD)")
+		return
+	}
+
+	if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	if errMsg := h.checkPeriodLock(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
+	// Validate lines
+	var totalDebit, totalCredit float64
+	for _, line := range input.Lines {
+		totalDebit += line.DebitAmount
+		totalCredit += line.CreditAmount
+		if line.DebitAmount > 0 && line.CreditAmount > 0 {
+			response.BadRequest(c, "A line cannot have both debit and credit amounts")
+			return
+		}
+		if line.DebitAmount <= 0 && line.CreditAmount <= 0 {
+			response.BadRequest(c, "Each line must have either a debit or credit amount")
+			return
+		}
+	}
+	if math.Abs(totalDebit-totalCredit) > 0.001 {
+		response.BadRequest(c, fmt.Sprintf("Journal entry is not balanced. Debits: %.2f, Credits: %.2f", totalDebit, totalCredit))
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to update journal entry")
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	var description, reference *string
+	if input.Description != "" {
+		description = &input.Description
+	}
+	if input.Reference != "" {
+		reference = &input.Reference
+	}
+
+	exchangeRate := input.ExchangeRate
+	if exchangeRate <= 0 {
+		exchangeRate = 1.0
+	}
+
+	var tags []string
+	if len(input.Tags) > 0 {
+		tags = input.Tags
+	}
+
+	// Update header
+	_, err = tx.Exec(`
+		UPDATE journal_entries SET entry_date = $1, reference = $2, description = $3,
+		exchange_rate = $4, total_debit = $5, total_credit = $6, tags = $7, updated_at = $8
+		WHERE id = $9 AND tenant_id = $10
+	`, entryDate, reference, description, exchangeRate, totalDebit, totalCredit, pq.Array(tags), now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to update journal entry", "error", err)
+		response.InternalError(c, "Failed to update journal entry")
+		return
+	}
+
+	// Delete old lines and insert new ones
+	_, err = tx.Exec(`DELETE FROM journal_entry_lines WHERE journal_entry_id = $1`, id)
+	if err != nil {
+		h.log.Error("Failed to delete old lines", "error", err)
+		response.InternalError(c, "Failed to update journal entry")
+		return
+	}
+
+	for i, line := range input.Lines {
+		lineID := uuid.New()
+		accountID, err := uuid.Parse(line.AccountID)
+		if err != nil {
+			response.BadRequest(c, fmt.Sprintf("Invalid account ID in line %d", i+1))
+			return
+		}
+		var lineDesc *string
+		if line.Description != "" {
+			lineDesc = &line.Description
+		}
+		var contactID *uuid.UUID
+		if line.ContactID != nil && *line.ContactID != "" {
+			cid, _ := uuid.Parse(*line.ContactID)
+			contactID = &cid
+		}
+		_, err = tx.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`, lineID, id, i+1, accountID, contactID, lineDesc, line.DebitAmount, line.CreditAmount, exchangeRate, now)
+		if err != nil {
+			h.log.Error("Failed to create journal entry line", "error", err)
+			response.InternalError(c, "Failed to update journal entry")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to update journal entry")
+		return
+	}
+
+	_ = userID
+	response.Success(c, gin.H{"message": "Journal entry updated successfully"})
+}
+
+// DeleteJournalEntry deletes a draft journal entry
+// @Summary Delete a draft journal entry
+// @Tags Finance - Journal Entries
+// @Param id path string true "Journal Entry ID"
+// @Router /finance/journal-entries/{id} [delete]
+func (h *Handler) DeleteJournalEntry(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid journal entry ID")
+		return
+	}
+
+	var status string
+	err = h.db.QueryRow(`SELECT status FROM journal_entries WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&status)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Journal entry")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get journal entry", "error", err)
+		response.InternalError(c, "Failed to delete journal entry")
+		return
+	}
+	if status != "draft" {
+		response.BadRequest(c, "Only draft entries can be deleted")
+		return
+	}
+
+	now := time.Now()
+	_, err = h.db.Exec(`UPDATE journal_entries SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3`, now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete journal entry", "error", err)
+		response.InternalError(c, "Failed to delete journal entry")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Journal entry deleted successfully"})
+}
+
+// CancelJournalEntry cancels a draft journal entry
+// @Summary Cancel a draft journal entry
+// @Tags Finance - Journal Entries
+// @Param id path string true "Journal Entry ID"
+// @Router /finance/journal-entries/{id}/cancel [post]
+func (h *Handler) CancelJournalEntry(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid journal entry ID")
+		return
+	}
+
+	var status string
+	err = h.db.QueryRow(`SELECT status FROM journal_entries WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&status)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Journal entry")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get journal entry", "error", err)
+		response.InternalError(c, "Failed to cancel journal entry")
+		return
+	}
+	if status != "draft" {
+		response.BadRequest(c, "Only draft entries can be cancelled")
+		return
+	}
+
+	now := time.Now()
+	_, err = h.db.Exec(`UPDATE journal_entries SET status = 'cancelled', cancelled_at = $1, updated_at = $1 WHERE id = $2 AND tenant_id = $3`, now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to cancel journal entry", "error", err)
+		response.InternalError(c, "Failed to cancel journal entry")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Journal entry cancelled successfully"})
 }
 
 // =====================================================
@@ -3110,7 +3435,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	}
 	if cashAccountID == uuid.Nil {
 		// Fallback: look up by name
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1100")
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1010")
 		if cashAccountID == uuid.Nil {
 			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
 		}
@@ -3122,7 +3447,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 	if paymentType == "receipt" {
 		// Inbound: customer pays us → Debit Cash, Credit AR
-		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1200")
+		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
 		journalCode = "CASH_RECEIPTS"
 		sourceType = "payment_receipt"
 		debitDesc = "Cash Receipt"
@@ -7306,6 +7631,105 @@ func (h *Handler) ReopenFiscalPeriod(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"message": "Fiscal period reopened successfully"})
+}
+
+// LockFiscalPeriod locks a fiscal period (prevents journal entries)
+// @Summary Lock a fiscal period
+// @Tags Finance - Fiscal Periods
+// @Param id path string true "Fiscal Period ID"
+// @Router /finance/fiscal-periods/{id}/lock [post]
+func (h *Handler) LockFiscalPeriod(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	id := c.Param("id")
+	if id == "" {
+		response.BadRequest(c, "Fiscal period ID is required")
+		return
+	}
+
+	var fyTenantID uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT fy.tenant_id FROM fiscal_periods fp
+		JOIN fiscal_years fy ON fp.fiscal_year_id = fy.id WHERE fp.id = $1
+	`, id).Scan(&fyTenantID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Fiscal period not found")
+		} else {
+			response.InternalError(c, "Failed to verify fiscal period")
+		}
+		return
+	}
+	if fyTenantID != tenantID {
+		response.Unauthorized(c, "Fiscal period does not belong to your tenant")
+		return
+	}
+
+	now := time.Now()
+	_, err = h.db.Exec(`
+		UPDATE fiscal_periods SET status = 'locked', locked_by = $1, locked_at = $2, updated_at = $2 WHERE id = $3
+	`, userID, now, id)
+	if err != nil {
+		h.log.Error("Failed to lock fiscal period", "error", err)
+		response.InternalError(c, "Failed to lock fiscal period")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Fiscal period locked successfully"})
+}
+
+// UnlockFiscalPeriod unlocks a locked fiscal period
+// @Summary Unlock a fiscal period
+// @Tags Finance - Fiscal Periods
+// @Param id path string true "Fiscal Period ID"
+// @Router /finance/fiscal-periods/{id}/unlock [post]
+func (h *Handler) UnlockFiscalPeriod(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		response.BadRequest(c, "Fiscal period ID is required")
+		return
+	}
+
+	var fyTenantID uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT fy.tenant_id FROM fiscal_periods fp
+		JOIN fiscal_years fy ON fp.fiscal_year_id = fy.id WHERE fp.id = $1
+	`, id).Scan(&fyTenantID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Fiscal period not found")
+		} else {
+			response.InternalError(c, "Failed to verify fiscal period")
+		}
+		return
+	}
+	if fyTenantID != tenantID {
+		response.Unauthorized(c, "Fiscal period does not belong to your tenant")
+		return
+	}
+
+	now := time.Now()
+	_, err = h.db.Exec(`
+		UPDATE fiscal_periods SET status = 'open', locked_by = NULL, locked_at = NULL, updated_at = $1 WHERE id = $2
+	`, now, id)
+	if err != nil {
+		h.log.Error("Failed to unlock fiscal period", "error", err)
+		response.InternalError(c, "Failed to unlock fiscal period")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Fiscal period unlocked successfully"})
 }
 
 // ==================== BUDGETS ====================
