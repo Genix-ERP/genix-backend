@@ -44,6 +44,7 @@ type Account struct {
 	IsControlAccount bool         `json:"is_control_account" db:"is_control_account"`
 	IsReconcilable   bool         `json:"is_reconcilable" db:"is_reconcilable"`
 	BudgetTracking   bool         `json:"budget_tracking" db:"budget_tracking"`
+	InternalType     *string      `json:"internal_type,omitempty" db:"internal_type"`
 	CurrentBalance   float64      `json:"current_balance" db:"current_balance"`
 	OpeningBalance   float64      `json:"opening_balance" db:"opening_balance"`
 	IsActive         bool         `json:"is_active" db:"is_active"`
@@ -73,6 +74,7 @@ type AccountResponse struct {
 	IsControlAccount bool             `json:"is_control_account"`
 	IsReconcilable   bool             `json:"is_reconcilable"`
 	BudgetTracking   bool             `json:"budget_tracking"`
+	InternalType     *string          `json:"internal_type,omitempty"`
 	CurrentBalance   float64          `json:"current_balance"`
 	OpeningBalance   float64          `json:"opening_balance"`
 	IsActive         bool             `json:"is_active"`
@@ -97,6 +99,7 @@ func (a *Account) ToResponse() *AccountResponse {
 		IsControlAccount: a.IsControlAccount,
 		IsReconcilable:   a.IsReconcilable,
 		BudgetTracking:   a.BudgetTracking,
+		InternalType:     a.InternalType,
 		CurrentBalance:   a.CurrentBalance,
 		OpeningBalance:   a.OpeningBalance,
 		IsActive:         a.IsActive,
@@ -118,6 +121,7 @@ type CreateAccountInput struct {
 	Code             string  `json:"code" binding:"required,min=1,max=50"`
 	Name             string  `json:"name" binding:"required,min=1,max=255"`
 	Description      string  `json:"description"`
+	InternalType     string  `json:"internal_type"`
 	CurrencyID       *string `json:"currency_id"`
 	IsBankAccount    bool    `json:"is_bank_account"`
 	IsReconcilable   bool    `json:"is_reconcilable"`
@@ -131,6 +135,7 @@ type UpdateAccountInput struct {
 	ParentID         *string  `json:"parent_id"`
 	Name             *string  `json:"name"`
 	Description      *string  `json:"description"`
+	InternalType     *string  `json:"internal_type"`
 	IsBankAccount    *bool    `json:"is_bank_account"`
 	IsReconcilable   *bool    `json:"is_reconcilable"`
 	IsControlAccount *bool    `json:"is_control_account"`

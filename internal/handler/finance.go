@@ -129,6 +129,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
+			   a.internal_type,
 			   a.current_balance, a.opening_balance, a.is_active,
 			   a.created_at, a.updated_at,
 			   at.code as type_code, at.name as type_name, at.category, at.normal_balance
@@ -208,13 +209,14 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	accounts := make([]*entity.AccountResponse, 0)
 	for rows.Next() {
 		var acc entity.Account
-		var orgID, parentID, currencyID, description, nameUz, nameEn sql.NullString
+		var orgID, parentID, currencyID, description, nameUz, nameEn, internalType sql.NullString
 		var typeCode, typeName, typeCategory, normalBalance string
 
 		err := rows.Scan(
 			&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
 			&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
 			&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
+			&internalType,
 			&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 			&acc.CreatedAt, &acc.UpdatedAt,
 			&typeCode, &typeName, &typeCategory, &normalBalance,
@@ -236,6 +238,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		}
 		if nameEn.Valid {
 			acc.NameEn = &nameEn.String
+		}
+		if internalType.Valid {
+			acc.InternalType = &internalType.String
 		}
 
 		acc.AccountType = &entity.AccountType{
@@ -336,8 +341,8 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 		INSERT INTO accounts (
 			id, tenant_id, organization_id, parent_id, account_type_id, code, name, description,
 			is_bank_account, is_control_account, is_reconcilable, budget_tracking,
-			opening_balance, current_balance, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			opening_balance, current_balance, is_active, internal_type, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING id
 	`
 
@@ -346,10 +351,15 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 		description = &input.Description
 	}
 
+	var internalType *string
+	if input.InternalType != "" {
+		internalType = &input.InternalType
+	}
+
 	err = h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, parentID, accountTypeID, input.Code, input.Name, description,
 		input.IsBankAccount, input.IsControlAccount, input.IsReconcilable, input.BudgetTracking,
-		input.OpeningBalance, input.OpeningBalance, true, now, now,
+		input.OpeningBalance, input.OpeningBalance, true, internalType, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -492,6 +502,7 @@ func (h *Handler) GetAccount(c *gin.Context) {
 			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
+			   a.internal_type,
 			   a.current_balance, a.opening_balance, a.is_active,
 			   a.created_at, a.updated_at,
 			   at.code as type_code, at.name as type_name, at.category, at.normal_balance
@@ -501,13 +512,14 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	`
 
 	var acc entity.Account
-	var orgID, parentID, currencyID, description, nameUz, nameEn sql.NullString
+	var orgID, parentID, currencyID, description, nameUz, nameEn, internalType sql.NullString
 	var typeCode, typeName, typeCategory, normalBalance string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
 		&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
 		&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
+		&internalType,
 		&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 		&acc.CreatedAt, &acc.UpdatedAt,
 		&typeCode, &typeName, &typeCategory, &normalBalance,
@@ -535,6 +547,9 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	}
 	if nameEn.Valid {
 		acc.NameEn = &nameEn.String
+	}
+	if internalType.Valid {
+		acc.InternalType = &internalType.String
 	}
 
 	acc.AccountType = &entity.AccountType{
@@ -610,6 +625,9 @@ func (h *Handler) UpdateAccount(c *gin.Context) {
 	}
 	if input.BudgetTracking != nil {
 		addUpdate("budget_tracking", *input.BudgetTracking)
+	}
+	if input.InternalType != nil {
+		addUpdate("internal_type", *input.InternalType)
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
@@ -2308,14 +2326,14 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	// Validate: Cash and Bank accounts must not go negative after posting
 	for _, line := range lines {
 		var newBalance float64
-		var accountCode string
-		err = tx.QueryRow(`SELECT current_balance, code FROM accounts WHERE id = $1`, line.accountID).Scan(&newBalance, &accountCode)
+		var accountCode, accountName string
+		err = tx.QueryRow(`SELECT current_balance, code, name FROM accounts WHERE id = $1`, line.accountID).Scan(&newBalance, &accountCode, &accountName)
 		if err != nil {
 			continue
 		}
-		// Block negative balances for cash (1000) and bank (1010, 1100) accounts
-		if (accountCode == "1000" || accountCode == "1010" || accountCode == "1100") && newBalance < -0.001 {
-			response.BadRequest(c, fmt.Sprintf("Account %s balance cannot be negative (would be %.2f)", accountCode, newBalance))
+		isCashOrBank := strings.HasPrefix(accountCode, "1000") || strings.HasPrefix(accountCode, "1010") || strings.HasPrefix(accountCode, "1100")
+		if isCashOrBank && newBalance < -0.001 {
+			response.BadRequest(c, fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas (balans: %.2f)", accountName, accountCode, newBalance))
 			return
 		}
 	}
