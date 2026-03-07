@@ -6088,6 +6088,88 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			}
 		}
 
+		// ── Inventory movement: adjust quantity_on_hand based on direction ──
+		// Skip if source SO already shipped (Sales page already deducted inventory)
+		skipInventory := false
+		if op.SourceType != nil && *op.SourceType == "sales_order" && op.SourceID != nil {
+			var soStatus string
+			if err := h.db.QueryRow("SELECT status FROM sales_orders WHERE id = $1 AND tenant_id = $2", *op.SourceID, tenantID).Scan(&soStatus); err == nil {
+				if soStatus == "shipped" || soStatus == "delivered" {
+					skipInventory = true
+				}
+			}
+		}
+
+		var warehouseID uuid.UUID
+		h.db.QueryRow(`
+			SELECT wot.warehouse_id FROM warehouse_operation_types wot
+			WHERE wot.id = $1 AND wot.tenant_id = $2
+		`, op.OpTypeID, tenantID).Scan(&warehouseID)
+
+		if !skipInventory && warehouseID != uuid.Nil && (direction == "delivery" || direction == "receipt" || direction == "write_off") {
+			invLines, _ := h.db.Query(`
+				SELECT product_id, done_qty, COALESCE(unit_price, 0)
+				FROM stock_operation_lines
+				WHERE operation_id = $1 AND tenant_id = $2 AND done_qty > 0
+			`, id, tenantID)
+			if invLines != nil {
+				defer invLines.Close()
+				for invLines.Next() {
+					var prodID uuid.UUID
+					var doneQty, unitPrice float64
+					if scanErr := invLines.Scan(&prodID, &doneQty, &unitPrice); scanErr != nil {
+						continue
+					}
+
+					// Find or create inventory record
+					var invID uuid.UUID
+					err := h.db.QueryRow(`
+						SELECT id FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID, prodID, warehouseID).Scan(&invID)
+
+					if err == sql.ErrNoRows {
+						invID = uuid.New()
+						h.db.Exec(`
+							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+							VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+						`, invID, tenantID, prodID, warehouseID, opOrgID, unitPrice, now)
+					} else if err != nil {
+						continue
+					}
+
+					if direction == "receipt" {
+						// Receipt: increase inventory
+						h.db.Exec(`
+							UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
+						`, doneQty, now, invID)
+					} else {
+						// Delivery or write-off: decrease inventory
+						h.db.Exec(`
+							UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
+						`, doneQty, now, invID)
+					}
+
+					// Create inventory transaction
+					txType := "stock_out"
+					if direction == "receipt" {
+						txType = "stock_in"
+					}
+					txQty := doneQty
+					if direction != "receipt" {
+						txQty = -doneQty
+					}
+					h.db.Exec(`
+						INSERT INTO inventory_transactions (
+							id, tenant_id, inventory_id, transaction_type, quantity,
+							unit_cost, reference_type, reference_id, notes, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, 'stock_operation', $7, $8, $9)
+					`, uuid.New(), tenantID, invID, txType, txQty, unitPrice, id.String(), "Stock operation completed", now)
+				}
+			}
+		}
+
 		// Sync: when a receipt operation from a PO completes, mark PO as received
 		if op.SourceType != nil && *op.SourceType == "purchase_order" && op.SourceID != nil && *op.SourceID != uuid.Nil {
 			// Update PO line quantities from operation lines
