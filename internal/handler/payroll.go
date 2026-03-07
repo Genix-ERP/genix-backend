@@ -640,8 +640,8 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		var nextNumber int
 		err := h.db.QueryRow(`
 			SELECT id, COALESCE(next_number, 1)
-			FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
-			ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`,
+			FROM journals WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
 			tenantID).Scan(&journalID, &nextNumber)
 		if err != nil {
 			return

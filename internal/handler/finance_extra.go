@@ -2,7 +2,10 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -33,7 +36,92 @@ func (h *Handler) GetCashBook(c *gin.Context) { response.Success(c, []interface{
 
 // ========== CURRENCY RATES SYNC ==========
 
-func (h *Handler) SyncCurrencyRates(c *gin.Context) { response.Success(c, gin.H{"message": "Exchange rates synced from CBU"}) }
+func (h *Handler) SyncCurrencyRates(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Fetch rates from CBU (Central Bank of Uzbekistan)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("https://cbu.uz/uz/arkhiv-kursov-valyut/json/")
+	if err != nil {
+		h.log.Error("Failed to fetch CBU rates", "error", err)
+		response.InternalError(c, "Failed to connect to Central Bank API")
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.log.Error("Failed to read CBU response", "error", err)
+		response.InternalError(c, "Failed to read Central Bank response")
+		return
+	}
+
+	var cbuRates []struct {
+		Code  string `json:"Ccy"`
+		Rate  string `json:"Rate"`
+		Date  string `json:"Date"`
+		Title string `json:"CcyNm_UZ"`
+	}
+	if err := json.Unmarshal(body, &cbuRates); err != nil {
+		h.log.Error("Failed to parse CBU rates", "error", err)
+		response.InternalError(c, "Failed to parse Central Bank data")
+		return
+	}
+
+	// Get base currency (UZS)
+	var baseCurrencyID uuid.UUID
+	err = h.db.QueryRow("SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1").Scan(&baseCurrencyID)
+	if err != nil {
+		err = h.db.QueryRow("SELECT id FROM currencies WHERE code = 'UZS' LIMIT 1").Scan(&baseCurrencyID)
+	}
+	if err != nil {
+		h.log.Error("No base currency found", "error", err)
+		response.InternalError(c, "No base currency (UZS) found. Please create UZS currency first.")
+		return
+	}
+
+	today := time.Now().Format("2006-01-02")
+	synced := 0
+
+	for _, cbuRate := range cbuRates {
+		// Check if we have this currency
+		var currencyID uuid.UUID
+		err := h.db.QueryRow("SELECT id FROM currencies WHERE code = $1", cbuRate.Code).Scan(&currencyID)
+		if err != nil {
+			continue // Skip currencies we don't track
+		}
+
+		// Parse rate
+		var rate float64
+		if _, err := fmt.Sscanf(cbuRate.Rate, "%f", &rate); err != nil || rate <= 0 {
+			continue
+		}
+
+		// Upsert exchange rate for today
+		_, err = h.db.Exec(`
+			INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
+			VALUES ($1, $2, $3, $4, $5, $6, 'CBU')
+			ON CONFLICT (tenant_id, from_currency_id, to_currency_id, effective_date)
+			DO UPDATE SET rate = $5, source = 'CBU'
+		`, uuid.New(), tenantID, currencyID, baseCurrencyID, rate, today)
+		if err != nil {
+			h.log.Error("Failed to upsert rate", "currency", cbuRate.Code, "error", err)
+			continue
+		}
+		synced++
+	}
+
+	response.Success(c, gin.H{
+		"message":      fmt.Sprintf("Synced %d exchange rates from CBU", synced),
+		"synced_count": synced,
+		"date":         today,
+		"source":       "CBU",
+	})
+}
 func (h *Handler) RevalueCurrency(c *gin.Context)   { response.Success(c, gin.H{"message": "Currency revaluation completed"}) }
 func (h *Handler) ListExchangeDiffs(c *gin.Context) { response.Success(c, []interface{}{}) }
 
