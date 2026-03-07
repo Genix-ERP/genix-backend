@@ -882,18 +882,22 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 	}{
 		// Assets (1xxx)
 		{"1000", "Cash", "CASH", false, false, true, "Cash on hand"},
-		{"1010", "Petty Cash", "CASH", false, false, true, "Petty cash fund"},
-		{"1100", "Bank Account", "CASH", true, false, true, "Main bank account"},
-		{"1200", "Accounts Receivable", "AR", false, true, true, "Trade receivables from customers"},
-		{"1210", "Allowance for Doubtful Accounts", "AR", false, false, false, "Reserve for bad debts"},
+		{"1010", "Bank Account", "CASH", true, false, true, "Main bank account"},
+		{"1100", "Accounts Receivable", "AR", false, true, true, "Trade receivables from customers"},
+		{"1210", "Allowance for Doubtful Accounts", "CONTRA_ASSET", false, false, false, "Reserve for bad debts"},
 		{"1300", "Inventory", "INV", false, true, false, "Goods held for sale"},
 		{"1310", "Raw Materials", "INV", false, false, false, "Raw materials inventory"},
 		{"1320", "Work in Progress", "INV", false, false, false, "Work in progress inventory"},
 		{"1330", "Finished Goods", "INV", false, false, false, "Finished goods inventory"},
 		{"1400", "Prepaid Expenses", "OA", false, false, false, "Prepaid expenses"},
 		{"1500", "Fixed Assets", "FA", false, false, false, "Property, plant and equipment"},
-		{"1510", "Accumulated Depreciation", "FA", false, false, false, "Accumulated depreciation"},
+		{"1510", "Accumulated Depreciation", "CONTRA_ASSET", false, false, false, "Accumulated depreciation"},
 		{"1600", "Intangible Assets", "OA", false, false, false, "Intangible assets"},
+		{"1020", "Foreign Currency Account", "CASH", false, false, true, "Foreign currency bank account"},
+		{"1340", "Goods for Resale", "INV", false, false, false, "Goods purchased for resale"},
+		{"1410", "Input VAT", "OA", false, false, false, "VAT on purchases (receivable)"},
+		{"1700", "Construction Costs", "OA", false, false, false, "Construction work in progress costs"},
+		{"1730", "Employee Advances", "OA", false, false, false, "Advances paid to employees"},
 
 		// Liabilities (2xxx)
 		{"2000", "Accounts Payable", "AP", false, true, true, "Trade payables to suppliers"},
@@ -919,7 +923,7 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		// Revenue (4xxx)
 		{"4000", "Sales Revenue", "REVENUE", false, false, false, "Revenue from sales"},
 		{"4100", "Service Revenue", "REVENUE", false, false, false, "Revenue from services"},
-		{"4200", "Product Sales", "REVENUE", false, false, false, "Revenue from product sales"},
+		{"4300", "Construction Revenue", "REVENUE", false, false, false, "Revenue from construction projects"},
 		{"4900", "Other Income", "OTHER_INC", false, false, false, "Miscellaneous income"},
 		{"4910", "Interest Income", "OTHER_INC", false, false, false, "Interest earned"},
 		{"4920", "Foreign Exchange Gain", "OTHER_INC", false, false, false, "Gain on foreign exchange"},
@@ -1011,10 +1015,10 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		defaultCreditCode string
 	}{
 		{"GEN", "General Journal", "general", "", ""},
-		{"SAL", "Sales Journal", "sales", "1200", "4000"},         // AR debit, Sales Revenue credit
+		{"SAL", "Sales Journal", "sales", "1100", "4000"},         // AR debit, Sales Revenue credit
 		{"PUR", "Purchase Journal", "purchase", "5000", "2000"},   // COGS debit, AP credit
 		{"CASH", "Cash Journal", "cash", "1000", "1000"},          // Cash
-		{"BANK", "Bank Journal", "bank", "1100", "1100"},          // Bank
+		{"BANK", "Bank Journal", "bank", "1010", "1010"},          // Bank
 		{"MISC", "Miscellaneous Journal", "miscellaneous", "", ""},
 	}
 

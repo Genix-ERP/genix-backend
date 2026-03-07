@@ -914,9 +914,6 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	// Odoo-style: AR + per-category Income + COGS/Interim clearing
 	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
 	if arAccountID == uuid.Nil {
-		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
-	}
-	if arAccountID == uuid.Nil {
 		h.log.Error("AR account not found", "tenant_id", tenantID)
 		response.InternalError(c, "Accounts Receivable account (1100) not found. Please configure chart of accounts.")
 		return
@@ -1298,7 +1295,7 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	// Get default account IDs — lookup by name first, then code fallback
-	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
+	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
 	// Use Outstanding Receipts account for 2-step payment posting
 	// Payment first goes to outstanding account, then cleared to bank during reconciliation
 	var cashAccountID uuid.UUID
@@ -1308,12 +1305,12 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		if input.PaymentMethod == "cash" {
 			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
 			if cashAccountID == uuid.Nil {
-				cashAccountID = findAccount(tx, tenantID, organizationID, "petty cash", "1010")
+				cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
 			}
 		} else {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1100")
+			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
 			if cashAccountID == uuid.Nil {
-				cashAccountID = findAccount(tx, tenantID, organizationID, "petty cash", "1010")
+				cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
 			}
 		}
 	}
@@ -1940,9 +1937,6 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 		}
 
 		arAccountID := findAccount(h.db, tenantID, orgPtr, "accounts receivable", "1100")
-		if arAccountID == uuid.Nil {
-			arAccountID = findAccount(h.db, tenantID, orgPtr, "accounts receivable", "1200")
-		}
 		taxAccountID := findAccount(h.db, tenantID, orgPtr, "tax", "2100")
 		revenueAccountID := findAccount(h.db, tenantID, orgPtr, "sales revenue", "4000")
 
