@@ -1460,6 +1460,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	assetCategories := rg.Group("/asset-categories")
 	{
 		assetCategories.GET("", h.ListAssetCategories)
+		assetCategories.POST("", middleware.RequirePermission("finance", "asset", "create"), h.CreateAssetCategory)
 	}
 
 	// Fixed Assets
@@ -1467,12 +1468,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	fixedAssets.Use(middleware.RequirePermission("finance", "asset", "read"))
 	{
 		fixedAssets.GET("", h.ListFixedAssets)
+		fixedAssets.GET("/dashboard", h.GetAssetDashboard)
 		fixedAssets.POST("", middleware.RequirePermission("finance", "asset", "create"), h.CreateFixedAsset)
 		fixedAssets.GET("/:id", h.GetFixedAsset)
 		fixedAssets.PUT("/:id", middleware.RequirePermission("finance", "asset", "update"), h.UpdateFixedAsset)
 		fixedAssets.DELETE("/:id", middleware.RequirePermission("finance", "asset", "delete"), h.DeleteFixedAsset)
 		fixedAssets.POST("/:id/dispose", middleware.RequirePermission("finance", "asset", "approve"), h.DisposeFixedAsset)
 		fixedAssets.GET("/:id/depreciation", h.GetDepreciationEntries)
+		fixedAssets.POST("/:id/maintenance", middleware.RequirePermission("finance", "asset", "create"), h.RecordMaintenance)
+		fixedAssets.GET("/:id/maintenance", h.ListMaintenanceHistory)
+		fixedAssets.POST("/:id/payments", middleware.RequirePermission("finance", "asset", "create"), h.RecordAssetPayment)
+		fixedAssets.GET("/:id/payments", h.ListAssetPayments)
 	}
 
 	// Run Depreciation (batch operation)

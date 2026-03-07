@@ -960,8 +960,8 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 		var nextNumber int
 		err = h.db.QueryRow(`
 			SELECT id, COALESCE(next_number, 1)
-			FROM journals WHERE tenant_id = $1 AND code IN ('INVENTORY','GENERAL') AND deleted_at IS NULL
-			ORDER BY CASE WHEN code='INVENTORY' THEN 0 ELSE 1 END LIMIT 1`,
+			FROM journals WHERE tenant_id = $1 AND code IN ('STOCK','INVENTORY','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 ELSE 2 END LIMIT 1`,
 			tenantID).Scan(&journalID, &nextNumber)
 		if err != nil {
 			h.log.Error("No journal found for goods receipt JE", "error", err)

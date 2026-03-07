@@ -952,7 +952,7 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 
 	// Get journal (use GENERAL or PURCHASE journal)
 	var journalID uuid.UUID
-	h.db.QueryRow("SELECT id FROM journals WHERE tenant_id = $1 AND (code IN ('PURCHASE', 'PUR', 'GENERAL', 'GEN')) AND deleted_at IS NULL LIMIT 1", tenantID).Scan(&journalID)
+	h.db.QueryRow("SELECT id FROM journals WHERE tenant_id = $1 AND code IN ('PURCH', 'PURCHASE', 'PUR', 'GENERAL', 'GEN') AND deleted_at IS NULL ORDER BY CASE code WHEN 'PURCH' THEN 0 WHEN 'PURCHASE' THEN 1 WHEN 'PUR' THEN 2 ELSE 3 END LIMIT 1", tenantID).Scan(&journalID)
 
 	if apAccountID != uuid.Nil && inventoryAccountID != uuid.Nil && journalID != uuid.Nil && totalValue > 0 {
 		// Generate entry number

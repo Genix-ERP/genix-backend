@@ -229,7 +229,7 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		VendorID            string  `json:"vendor_id" binding:"required"`
 		PartnerID           string  `json:"partner_id"` // Alias for vendor_id
 		OrganizationID      string  `json:"organization_id"`
-		VendorInvoiceNumber string  `json:"vendor_invoice_number"`
+		VendorInvoiceNumber string  `json:"vendor_invoice_number" binding:"required"`
 		InvoiceDate         string  `json:"invoice_date" binding:"required"`
 		DueDate             string  `json:"due_date" binding:"required"`
 		Subtotal            float64 `json:"subtotal"`
@@ -695,7 +695,7 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code IN ('PURCHASE', 'PUR') AND deleted_at IS NULL`,
+		FROM journals WHERE tenant_id = $1 AND code IN ('PURCH', 'PURCHASE', 'PUR') AND deleted_at IS NULL ORDER BY CASE code WHEN 'PURCH' THEN 0 WHEN 'PURCHASE' THEN 1 ELSE 2 END LIMIT 1`,
 		tenantID,
 	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
 
@@ -866,6 +866,7 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	var input struct {
 		Amount         float64 `json:"amount"`
 		WriteOffAmount float64 `json:"write_off_amount,omitempty"`
+		PaymentMethod  string  `json:"payment_method"` // cash, bank, card
 	}
 	c.ShouldBindJSON(&input)
 
@@ -972,26 +973,41 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	}
 
 	// Create journal entry for payment: Debit AP, Credit Cash/Bank
-	// Get CASH_DISBURSEMENTS or PURCHASE journal
+	// Select journal based on payment method
 	var payJournalID uuid.UUID
 	var nextNumber int
 	var numberPrefix sql.NullString
-	err = h.db.QueryRow(`
-		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND (code IN ('CASH_DISBURSEMENTS', 'CASH', 'PURCHASE', 'PUR')) AND deleted_at IS NULL LIMIT 1`,
-		tenantID,
-	).Scan(&payJournalID, &nextNumber, &numberPrefix)
+
+	var journalQuery string
+	switch input.PaymentMethod {
+	case "cash":
+		journalQuery = `SELECT id, COALESCE(next_number, 1), number_prefix FROM journals WHERE tenant_id = $1 AND code IN ('CASH','CASH_DISBURSEMENTS') AND deleted_at IS NULL ORDER BY CASE code WHEN 'CASH' THEN 0 ELSE 1 END LIMIT 1`
+	case "card":
+		journalQuery = `SELECT id, COALESCE(next_number, 1), number_prefix FROM journals WHERE tenant_id = $1 AND code IN ('BANK','CASH_DISBURSEMENTS') AND deleted_at IS NULL ORDER BY CASE code WHEN 'BANK' THEN 0 ELSE 1 END LIMIT 1`
+	default: // bank
+		journalQuery = `SELECT id, COALESCE(next_number, 1), number_prefix FROM journals WHERE tenant_id = $1 AND code IN ('BANK','CASH_DISBURSEMENTS','PURCH','PURCHASE','PUR') AND deleted_at IS NULL ORDER BY CASE code WHEN 'BANK' THEN 0 WHEN 'CASH_DISBURSEMENTS' THEN 1 WHEN 'PURCH' THEN 2 ELSE 3 END LIMIT 1`
+	}
+	err = h.db.QueryRow(journalQuery, tenantID).Scan(&payJournalID, &nextNumber, &numberPrefix)
 
 	if err == nil {
 		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "2000")
-		// Use Outstanding Payments account for 2-step payment posting
-		cashAcctID := findAccount(h.db, tenantID, organizationID, "outstanding payments", "1160")
-		if cashAcctID == uuid.Nil {
-			// Fallback to direct bank posting if outstanding account doesn't exist
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "1010")
+		// Select credit account based on payment method
+		var cashAcctID uuid.UUID
+		switch input.PaymentMethod {
+		case "cash":
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "cash", "1000")
 			if cashAcctID == uuid.Nil {
-				cashAcctID = findAccount(h.db, tenantID, organizationID, "cash", "1000")
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "kassa", "1000")
 			}
+		default: // bank, card
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank", "1010")
+			if cashAcctID == uuid.Nil {
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "1010")
+			}
+		}
+		if cashAcctID == uuid.Nil {
+			// Final fallback
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "outstanding payments", "1160")
 		}
 
 		if apAcctID != uuid.Nil && cashAcctID != uuid.Nil {
@@ -1249,7 +1265,7 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 	var numberPrefix sql.NullString
 	err = tx.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code IN ('PURCHASE', 'PUR') AND deleted_at IS NULL`,
+		FROM journals WHERE tenant_id = $1 AND code IN ('PURCH', 'PURCHASE', 'PUR') AND deleted_at IS NULL ORDER BY CASE code WHEN 'PURCH' THEN 0 WHEN 'PURCHASE' THEN 1 ELSE 2 END LIMIT 1`,
 		tenantID,
 	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
 
