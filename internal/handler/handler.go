@@ -928,7 +928,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		journals.GET("", h.ListJournalEntries)
 		journals.POST("", middleware.RequirePermission("finance", "journal", "create"), h.CreateJournalEntry)
 		journals.GET("/:id", h.GetJournalEntry)
+		journals.PUT("/:id", middleware.RequirePermission("finance", "journal", "create"), h.UpdateJournalEntry)
+		journals.DELETE("/:id", middleware.RequirePermission("finance", "journal", "delete"), h.DeleteJournalEntry)
 		journals.POST("/:id/post", middleware.RequirePermission("finance", "journal", "post"), h.PostJournalEntry)
+		journals.POST("/:id/cancel", middleware.RequirePermission("finance", "journal", "create"), h.CancelJournalEntry)
 		journals.POST("/:id/reverse", middleware.RequirePermission("finance", "journal", "reverse"), h.ReverseJournalEntry)
 	}
 
@@ -1026,6 +1029,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		fiscalPeriods.POST("/batch", h.BatchCreateFiscalPeriods)
 		fiscalPeriods.POST("/:id/close", h.CloseFiscalPeriod)
 		fiscalPeriods.POST("/:id/reopen", h.ReopenFiscalPeriod)
+		fiscalPeriods.POST("/:id/lock", h.LockFiscalPeriod)
+		fiscalPeriods.POST("/:id/unlock", h.UnlockFiscalPeriod)
 	}
 
 	// Budgets
