@@ -35,6 +35,8 @@ type Account struct {
 	AccountTypeID    uuid.UUID    `json:"account_type_id" db:"account_type_id"`
 	Code             string       `json:"code" db:"code"`
 	Name             string       `json:"name" db:"name"`
+	NameUz           *string      `json:"name_uz,omitempty" db:"name_uz"`
+	NameEn           *string      `json:"name_en,omitempty" db:"name_en"`
 	Description      *string      `json:"description,omitempty" db:"description"`
 	CurrencyID       *uuid.UUID   `json:"currency_id,omitempty" db:"currency_id"`
 	IsBankAccount    bool         `json:"is_bank_account" db:"is_bank_account"`
@@ -62,6 +64,8 @@ type AccountResponse struct {
 	AccountTypeID    uuid.UUID        `json:"account_type_id"`
 	Code             string           `json:"code"`
 	Name             string           `json:"name"`
+	NameUz           *string          `json:"name_uz,omitempty"`
+	NameEn           *string          `json:"name_en,omitempty"`
 	Description      *string          `json:"description,omitempty"`
 	Category         string           `json:"category,omitempty"`
 	NormalBalance    string           `json:"normal_balance,omitempty"`
@@ -86,6 +90,8 @@ func (a *Account) ToResponse() *AccountResponse {
 		AccountTypeID:    a.AccountTypeID,
 		Code:             a.Code,
 		Name:             a.Name,
+		NameUz:           a.NameUz,
+		NameEn:           a.NameEn,
 		Description:      a.Description,
 		IsBankAccount:    a.IsBankAccount,
 		IsControlAccount: a.IsControlAccount,

@@ -990,7 +990,7 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			// Fallback to direct bank posting if outstanding account doesn't exist
 			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "1010")
 			if cashAcctID == uuid.Nil {
-				cashAcctID = findAccount(h.db, tenantID, organizationID, "petty cash", "1010")
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "cash", "1000")
 			}
 		}
 
