@@ -343,14 +343,6 @@ func (h *Handler) GetInventorySummary(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
-		args = append(args, orgID)
-	}
-
 	if categoryID != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND p.category_id = $%d", argCount)
@@ -1322,14 +1314,6 @@ func (h *Handler) GetInventoryValuation(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
-
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
-		args = append(args, orgID)
-	}
 
 	if warehouseID != "" {
 		argCount++
