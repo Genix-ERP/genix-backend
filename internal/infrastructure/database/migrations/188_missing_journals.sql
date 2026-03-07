@@ -22,7 +22,7 @@ BEGIN
         UPDATE journal_entries SET journal_id = r.cash_id WHERE journal_id = r.cash1_id;
         UPDATE payments SET journal_id = r.cash_id WHERE journal_id = r.cash1_id;
         DELETE FROM journal_payment_methods WHERE journal_id = r.cash1_id;
-        DELETE FROM recurring_journal_entries WHERE journal_id = r.cash1_id;
+        DELETE FROM recurring_journal_templates WHERE journal_id = r.cash1_id;
         DELETE FROM journals WHERE id = r.cash1_id;
     END LOOP;
 END $$;
