@@ -1020,6 +1020,19 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 	if input.Status != nil && *input.Status == "shipped" {
 		now := time.Now()
 
+		// Skip inventory deduction if stock operation already completed it
+		var stockOpDone bool
+		{
+			var stockOpState string
+			if err := h.db.QueryRow(`
+				SELECT state FROM stock_operations
+				WHERE source_type = 'sales_order' AND source_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+				ORDER BY created_at DESC LIMIT 1
+			`, orderID, tenantID).Scan(&stockOpState); err == nil && stockOpState == "done" {
+				stockOpDone = true
+			}
+		}
+
 		// Get SO warehouse_id and organization_id
 		var soWarehouseID sql.NullString
 		var soOrgID sql.NullString
@@ -1057,7 +1070,7 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 			}
 		}
 
-		if warehouseID != uuid.Nil {
+		if warehouseID != uuid.Nil && !stockOpDone {
 			// Get SO lines
 			soLines, err := h.db.Query(`
 				SELECT id, product_id, quantity, unit_price
@@ -1132,6 +1145,15 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 			`, now, orderID, tenantID)
 
 			h.log.Info("Inventory decreased from SO shipped", "so_id", orderID)
+		}
+
+		// Also mark related stock operation as done
+		if !stockOpDone {
+			h.db.Exec(`
+				UPDATE stock_operations SET state = 'done', done_at = $1, updated_at = $1
+				WHERE source_type = 'sales_order' AND source_id = $2 AND tenant_id = $3
+				  AND state != 'done' AND state != 'cancelled' AND deleted_at IS NULL
+			`, now, orderID, tenantID)
 		}
 
 		// ============================================
@@ -1579,7 +1601,7 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 							id, tenant_id, operation_id, product_id,
 							expected_qty, done_qty, uom, unit_price,
 							quality_status, created_at, updated_at
-						) VALUES (uuid_generate_v4(),$1,$2,$3,$4,0,$5,$6,'good',$7,$7)
+						) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
 					`, tenantID, stockOpID, productID, qty, uom, unitPrice, now)
 				}
 			}
