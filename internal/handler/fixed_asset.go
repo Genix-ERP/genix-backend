@@ -3,6 +3,8 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +15,119 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+// scanner is an interface for both sql.Row and sql.Rows
+type scanner interface {
+	Scan(dest ...interface{}) error
+}
+
+// scanFixedAsset scans a fixed asset row into an entity
+func scanFixedAsset(row scanner, h *Handler) *entity.FixedAsset {
+	var asset entity.FixedAsset
+	var description, categoryID, categoryName, serialNumber, location, custodianID, custodianName sql.NullString
+	var supplierID, supplierName, documentNumber, paymentMethod sql.NullString
+	var warrantyExpiry, disposalDate, lastDeprDate, documentDate sql.NullTime
+	var bookValue, disposalAmount, currentValue, monthlyDepr, totalPaid sql.NullFloat64
+	var remainingMonths sql.NullInt32
+	var disposalReason, notes sql.NullString
+
+	if err := row.Scan(
+		&asset.ID, &asset.TenantID, &asset.AssetCode, &asset.Name, &description,
+		&categoryID, &categoryName, &serialNumber, &asset.AcquisitionDate,
+		&asset.AcquisitionCost, &asset.SalvageValue, &asset.UsefulLifeMonths,
+		&asset.DepreciationMethod, &asset.AccumulatedDepreciation, &bookValue,
+		&currentValue, &remainingMonths, &monthlyDepr, &lastDeprDate,
+		&location, &custodianID, &custodianName,
+		&supplierID, &supplierName, &documentNumber, &documentDate, &paymentMethod, &totalPaid,
+		&warrantyExpiry, &asset.Status,
+		&disposalDate, &disposalAmount, &disposalReason, &notes,
+		&asset.CreatedAt, &asset.UpdatedAt,
+	); err != nil {
+		if h != nil {
+			h.log.Error("Failed to scan fixed asset", "error", err)
+		}
+		return nil
+	}
+
+	if description.Valid {
+		asset.Description = &description.String
+	}
+	if categoryID.Valid {
+		if id, err := uuid.Parse(categoryID.String); err == nil {
+			asset.CategoryID = &id
+		}
+	}
+	if categoryName.Valid {
+		asset.CategoryName = &categoryName.String
+	}
+	if serialNumber.Valid {
+		asset.SerialNumber = &serialNumber.String
+	}
+	if location.Valid {
+		asset.Location = &location.String
+	}
+	if custodianID.Valid {
+		if id, err := uuid.Parse(custodianID.String); err == nil {
+			asset.CustodianID = &id
+		}
+	}
+	if custodianName.Valid {
+		asset.CustodianName = &custodianName.String
+	}
+	if supplierID.Valid {
+		if id, err := uuid.Parse(supplierID.String); err == nil {
+			asset.SupplierID = &id
+		}
+	}
+	if supplierName.Valid {
+		asset.SupplierName = &supplierName.String
+	}
+	if documentNumber.Valid {
+		asset.DocumentNumber = &documentNumber.String
+	}
+	if documentDate.Valid {
+		asset.DocumentDate = &documentDate.Time
+	}
+	if paymentMethod.Valid {
+		asset.PaymentMethod = &paymentMethod.String
+	}
+	if totalPaid.Valid {
+		asset.TotalPaid = &totalPaid.Float64
+	}
+	if warrantyExpiry.Valid {
+		asset.WarrantyExpiry = &warrantyExpiry.Time
+	}
+	if bookValue.Valid {
+		asset.BookValue = &bookValue.Float64
+	}
+	if currentValue.Valid {
+		asset.CurrentValue = &currentValue.Float64
+	}
+	if remainingMonths.Valid {
+		rm := int(remainingMonths.Int32)
+		asset.RemainingMonths = &rm
+	}
+	if monthlyDepr.Valid {
+		asset.MonthlyDepr = &monthlyDepr.Float64
+	}
+	if lastDeprDate.Valid {
+		asset.LastDeprDate = &lastDeprDate.Time
+	}
+	if disposalDate.Valid {
+		asset.DisposalDate = &disposalDate.Time
+	}
+	if disposalAmount.Valid {
+		asset.DisposalAmount = &disposalAmount.Float64
+	}
+	if disposalReason.Valid {
+		asset.DisposalReason = &disposalReason.String
+	}
+	if notes.Valid {
+		asset.Notes = &notes.String
+	}
+
+	return &asset
+}
 
 // ListAssetCategories returns all asset categories
 func (h *Handler) ListAssetCategories(c *gin.Context) {
@@ -93,8 +208,11 @@ func (h *Handler) ListFixedAssets(c *gin.Context) {
 	baseQuery := `
 		SELECT id, tenant_id, asset_code, name, description, category_id, category_name,
 			   serial_number, acquisition_date, acquisition_cost, salvage_value, useful_life_months,
-			   depreciation_method, accumulated_depreciation, book_value, location,
-			   custodian_id, custodian_name, warranty_expiry, status,
+			   depreciation_method, accumulated_depreciation, book_value,
+			   current_value, remaining_months, monthly_depr, last_depr_date,
+			   location, custodian_id, custodian_name,
+			   supplier_id, supplier_name, document_number, document_date, payment_method, total_paid,
+			   warranty_expiry, status,
 			   disposal_date, disposal_amount, disposal_reason, notes, created_at, updated_at
 		FROM fixed_assets
 		WHERE tenant_id = $1 AND deleted_at IS NULL
@@ -147,70 +265,10 @@ func (h *Handler) ListFixedAssets(c *gin.Context) {
 
 	assets := make([]*entity.FixedAssetResponse, 0)
 	for rows.Next() {
-		var asset entity.FixedAsset
-		var description, categoryID, categoryName, serialNumber, location, custodianID, custodianName sql.NullString
-		var warrantyExpiry, disposalDate sql.NullTime
-		var bookValue, disposalAmount sql.NullFloat64
-		var disposalReason, notes sql.NullString
-
-		if err := rows.Scan(
-			&asset.ID, &asset.TenantID, &asset.AssetCode, &asset.Name, &description,
-			&categoryID, &categoryName, &serialNumber, &asset.AcquisitionDate,
-			&asset.AcquisitionCost, &asset.SalvageValue, &asset.UsefulLifeMonths,
-			&asset.DepreciationMethod, &asset.AccumulatedDepreciation, &bookValue, &location,
-			&custodianID, &custodianName, &warrantyExpiry, &asset.Status,
-			&disposalDate, &disposalAmount, &disposalReason, &notes,
-			&asset.CreatedAt, &asset.UpdatedAt,
-		); err != nil {
-			h.log.Error("Failed to scan fixed asset", "error", err)
-			continue
+		asset := scanFixedAsset(rows, h)
+		if asset != nil {
+			assets = append(assets, asset.ToResponse())
 		}
-
-		if description.Valid {
-			asset.Description = &description.String
-		}
-		if categoryID.Valid {
-			if id, err := uuid.Parse(categoryID.String); err == nil {
-				asset.CategoryID = &id
-			}
-		}
-		if categoryName.Valid {
-			asset.CategoryName = &categoryName.String
-		}
-		if serialNumber.Valid {
-			asset.SerialNumber = &serialNumber.String
-		}
-		if location.Valid {
-			asset.Location = &location.String
-		}
-		if custodianID.Valid {
-			if id, err := uuid.Parse(custodianID.String); err == nil {
-				asset.CustodianID = &id
-			}
-		}
-		if custodianName.Valid {
-			asset.CustodianName = &custodianName.String
-		}
-		if warrantyExpiry.Valid {
-			asset.WarrantyExpiry = &warrantyExpiry.Time
-		}
-		if bookValue.Valid {
-			asset.BookValue = &bookValue.Float64
-		}
-		if disposalDate.Valid {
-			asset.DisposalDate = &disposalDate.Time
-		}
-		if disposalAmount.Valid {
-			asset.DisposalAmount = &disposalAmount.Float64
-		}
-		if disposalReason.Valid {
-			asset.DisposalReason = &disposalReason.String
-		}
-		if notes.Valid {
-			asset.Notes = &notes.String
-		}
-
-		assets = append(assets, asset.ToResponse())
 	}
 
 	pagination := entity.NewPagination(page, limit)
@@ -246,6 +304,12 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 	}
 
 	bookValue := input.AcquisitionCost - input.SalvageValue
+	currentValue := bookValue
+	remainingMonths := input.UsefulLifeMonths
+	var monthlyDepr float64
+	if remainingMonths > 0 {
+		monthlyDepr = (input.AcquisitionCost - input.SalvageValue) / float64(remainingMonths)
+	}
 
 	id := uuid.New()
 	now := time.Now()
@@ -281,15 +345,21 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 		INSERT INTO fixed_assets (
 			id, tenant_id, organization_id, asset_code, name, description, category_id, category_name,
 			serial_number, acquisition_date, acquisition_cost, salvage_value, useful_life_months,
-			depreciation_method, accumulated_depreciation, book_value, location,
-			custodian_id, custodian_name, warranty_expiry, status, notes,
+			depreciation_method, accumulated_depreciation, book_value,
+			current_value, remaining_months, monthly_depr,
+			location, custodian_id, custodian_name,
+			supplier_id, supplier_name, document_number, document_date, payment_method, total_paid,
+			warranty_expiry, status, notes,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
 		RETURNING id
 	`
 
 	var description, serialNumber, location, custodianName, notes *string
-	var warrantyExpiry *time.Time
+	var supplierNamePtr, documentNumber *string
+	var warrantyExpiry, documentDate *time.Time
+	var paymentMethod *string
+	var totalPaid float64
 
 	if input.Description != "" {
 		description = &input.Description
@@ -311,11 +381,40 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 	if input.Notes != "" {
 		notes = &input.Notes
 	}
+	var supplierID *uuid.UUID
+	if input.SupplierID != "" {
+		if parsedID, err := uuid.Parse(input.SupplierID); err == nil {
+			supplierID = &parsedID
+		}
+	}
+	if input.SupplierName != "" {
+		supplierNamePtr = &input.SupplierName
+	}
+	if input.DocumentNumber != "" {
+		documentNumber = &input.DocumentNumber
+	}
+	if input.DocumentDate != "" {
+		if parsed, err := time.Parse("2006-01-02", input.DocumentDate); err == nil {
+			documentDate = &parsed
+		}
+	}
+	pm := input.PaymentMethod
+	if pm == "" {
+		pm = "cash"
+	}
+	paymentMethod = &pm
+	// For cash/bank, total_paid = acquisition_cost; for credit, total_paid = 0
+	if pm != "credit" {
+		totalPaid = input.AcquisitionCost
+	}
 
 	if err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, assetCode, input.Name, description, categoryID, categoryName,
 		serialNumber, acquisitionDate, input.AcquisitionCost, input.SalvageValue, input.UsefulLifeMonths,
-		input.DepreciationMethod, 0, bookValue, location, custodianID, custodianName,
+		input.DepreciationMethod, 0, bookValue,
+		currentValue, remainingMonths, monthlyDepr,
+		location, custodianID, custodianName,
+		supplierID, supplierNamePtr, documentNumber, documentDate, paymentMethod, totalPaid,
 		warrantyExpiry, "active", notes, userID, now, now,
 	).Scan(&id); err != nil {
 		h.log.Error("Failed to create fixed asset", "error", err)
@@ -335,30 +434,48 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 			return
 		}
 
-		// Look up journal
 		var journalID uuid.UUID
 		var nextNumber int
 		err := h.db.QueryRow(`
 			SELECT id, COALESCE(next_number, 1)
-			FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
-			ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`,
+			FROM journals WHERE tenant_id = $1 AND code IN ('ASSET','MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'ASSET' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
 			tenantID).Scan(&journalID, &nextNumber)
 		if err != nil {
 			return
 		}
 
-		// Debit: Fixed Asset account
+		// Debit: Fixed Asset account (1500)
 		faAcct := findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
 		if faAcct == uuid.Nil {
 			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
 		}
-		// Credit: Cash or AP
-		cashAcct := findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
-		if cashAcct == uuid.Nil {
-			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+		if faAcct == uuid.Nil {
+			return
 		}
 
-		if faAcct == uuid.Nil || cashAcct == uuid.Nil {
+		// Credit account depends on payment method
+		var creditAcct uuid.UUID
+		var creditDesc string
+		switch pm {
+		case "credit":
+			// Dt 1500 Fixed Assets / Kt 2000 Accounts Payable
+			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+			if creditAcct == uuid.Nil {
+				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "payable", "2010")
+			}
+			creditDesc = "Accounts Payable"
+		case "bank":
+			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+			creditDesc = "Bank"
+		default: // cash
+			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			if creditAcct == uuid.Nil {
+				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+			}
+			creditDesc = "Cash"
+		}
+		if creditAcct == uuid.Nil {
 			return
 		}
 
@@ -389,15 +506,15 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 		)
 		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, faAcct)
 
-		// Credit: Cash/Bank
+		// Credit: Cash/Bank/AP
 		h.db.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
 			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
-			uuid.New(), journalEntryID, cashAcct, "Cash/Bank", input.AcquisitionCost, now,
+			uuid.New(), journalEntryID, creditAcct, creditDesc, input.AcquisitionCost, now,
 		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, cashAcct)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, creditAcct)
 
 		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
 	}()
@@ -418,9 +535,18 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 		DepreciationMethod:      input.DepreciationMethod,
 		AccumulatedDepreciation: 0,
 		BookValue:               &bookValue,
+		CurrentValue:            &currentValue,
+		RemainingMonths:         &remainingMonths,
+		MonthlyDepr:             &monthlyDepr,
 		Location:                location,
 		CustodianID:             custodianID,
 		CustodianName:           custodianName,
+		SupplierID:              supplierID,
+		SupplierName:            supplierNamePtr,
+		DocumentNumber:          documentNumber,
+		DocumentDate:            documentDate,
+		PaymentMethod:           paymentMethod,
+		TotalPaid:               &totalPaid,
 		WarrantyExpiry:          warrantyExpiry,
 		Status:                  "active",
 		Notes:                   notes,
@@ -449,78 +575,21 @@ func (h *Handler) GetFixedAsset(c *gin.Context) {
 	query := `
 		SELECT id, tenant_id, asset_code, name, description, category_id, category_name,
 			   serial_number, acquisition_date, acquisition_cost, salvage_value, useful_life_months,
-			   depreciation_method, accumulated_depreciation, book_value, location,
-			   custodian_id, custodian_name, warranty_expiry, status,
+			   depreciation_method, accumulated_depreciation, book_value,
+			   current_value, remaining_months, monthly_depr, last_depr_date,
+			   location, custodian_id, custodian_name,
+			   supplier_id, supplier_name, document_number, document_date, payment_method, total_paid,
+			   warranty_expiry, status,
 			   disposal_date, disposal_amount, disposal_reason, notes, created_at, updated_at
 		FROM fixed_assets
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`
 
-	var asset entity.FixedAsset
-	var description, categoryID, categoryName, serialNumber, location, custodianID, custodianName sql.NullString
-	var warrantyExpiry, disposalDate sql.NullTime
-	var bookValue, disposalAmount sql.NullFloat64
-	var disposalReason, notes sql.NullString
-
-	if err := h.db.QueryRow(query, id, tenantID).Scan(
-		&asset.ID, &asset.TenantID, &asset.AssetCode, &asset.Name, &description,
-		&categoryID, &categoryName, &serialNumber, &asset.AcquisitionDate,
-		&asset.AcquisitionCost, &asset.SalvageValue, &asset.UsefulLifeMonths,
-		&asset.DepreciationMethod, &asset.AccumulatedDepreciation, &bookValue, &location,
-		&custodianID, &custodianName, &warrantyExpiry, &asset.Status,
-		&disposalDate, &disposalAmount, &disposalReason, &notes,
-		&asset.CreatedAt, &asset.UpdatedAt,
-	); err == sql.ErrNoRows {
+	row := h.db.QueryRow(query, id, tenantID)
+	asset := scanFixedAsset(row, h)
+	if asset == nil {
 		response.NotFound(c, "Fixed asset")
 		return
-	} else if err != nil {
-		h.log.Error("Failed to get fixed asset", "error", err)
-		response.InternalError(c, "Failed to get fixed asset")
-		return
-	}
-
-	if description.Valid {
-		asset.Description = &description.String
-	}
-	if categoryID.Valid {
-		if id, err := uuid.Parse(categoryID.String); err == nil {
-			asset.CategoryID = &id
-		}
-	}
-	if categoryName.Valid {
-		asset.CategoryName = &categoryName.String
-	}
-	if serialNumber.Valid {
-		asset.SerialNumber = &serialNumber.String
-	}
-	if location.Valid {
-		asset.Location = &location.String
-	}
-	if custodianID.Valid {
-		if id, err := uuid.Parse(custodianID.String); err == nil {
-			asset.CustodianID = &id
-		}
-	}
-	if custodianName.Valid {
-		asset.CustodianName = &custodianName.String
-	}
-	if warrantyExpiry.Valid {
-		asset.WarrantyExpiry = &warrantyExpiry.Time
-	}
-	if bookValue.Valid {
-		asset.BookValue = &bookValue.Float64
-	}
-	if disposalDate.Valid {
-		asset.DisposalDate = &disposalDate.Time
-	}
-	if disposalAmount.Valid {
-		asset.DisposalAmount = &disposalAmount.Float64
-	}
-	if disposalReason.Valid {
-		asset.DisposalReason = &disposalReason.String
-	}
-	if notes.Valid {
-		asset.Notes = &notes.String
 	}
 
 	response.Success(c, asset.ToResponse())
@@ -678,16 +747,16 @@ func (h *Handler) DeleteFixedAsset(c *gin.Context) {
 	response.NoContent(c)
 }
 
-// DisposeFixedAsset disposes a fixed asset
+// DisposeFixedAsset disposes a fixed asset with proper journal entries
 func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
 		response.Unauthorized(c, "Tenant not found")
 		return
 	}
+	userID, _ := middleware.GetUserID(c)
 
-	idStr := c.Param("id")
-	id, err := uuid.Parse(idStr)
+	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid asset ID")
 		return
@@ -699,37 +768,171 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 		return
 	}
 
+	validReasons := map[string]bool{"sold": true, "destroyed": true, "expired": true, "stolen": true}
+	if !validReasons[input.DisposalReason] {
+		response.BadRequest(c, "Reason must be: sold, destroyed, expired, stolen")
+		return
+	}
+
 	disposalDate, err := time.Parse("2006-01-02", input.DisposalDate)
 	if err != nil {
 		response.BadRequest(c, "Invalid disposal_date format")
 		return
 	}
 
-	query := `
-		UPDATE fixed_assets SET
-			status = 'disposed',
-			disposal_date = $1,
-			disposal_amount = $2,
-			disposal_reason = $3,
-			updated_at = $4
-		WHERE id = $5 AND tenant_id = $6 AND deleted_at IS NULL
-		RETURNING id
-	`
-
-	var disposalReason *string
-	if input.DisposalReason != "" {
-		disposalReason = &input.DisposalReason
-	}
-
-	var returnedID uuid.UUID
-	if err := h.db.QueryRow(query, disposalDate, input.DisposalAmount, disposalReason, time.Now(), id, tenantID).Scan(&returnedID); err == sql.ErrNoRows {
-		response.NotFound(c, "Fixed asset")
+	// Get asset details for journal entries
+	var assetName string
+	var acquisitionCost, accumDepr, curValue float64
+	err = h.db.QueryRow(`
+		SELECT name, acquisition_cost, accumulated_depreciation,
+			   COALESCE(current_value, acquisition_cost - accumulated_depreciation)
+		FROM fixed_assets WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status = 'active'`,
+		id, tenantID).Scan(&assetName, &acquisitionCost, &accumDepr, &curValue)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Active fixed asset")
 		return
 	} else if err != nil {
+		h.log.Error("Failed to get asset for disposal", "error", err)
+		response.InternalError(c, "Failed to get asset")
+		return
+	}
+
+	now := time.Now()
+	disposalReason := &input.DisposalReason
+
+	// Update asset status
+	_, err = h.db.Exec(`
+		UPDATE fixed_assets SET
+			status = 'disposed', disposal_date = $1, disposal_amount = $2,
+			disposal_reason = $3, remaining_months = 0, updated_at = $4
+		WHERE id = $5 AND tenant_id = $6`,
+		disposalDate, input.DisposalAmount, disposalReason, now, id, tenantID)
+	if err != nil {
 		h.log.Error("Failed to dispose fixed asset", "error", err)
 		response.InternalError(c, "Failed to dispose fixed asset")
 		return
 	}
+
+	// Create journal entries for disposal
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
+	func() {
+		var journalID uuid.UUID
+		var nextNum int
+		if err := h.db.QueryRow(`
+			SELECT id, COALESCE(next_number, 1)
+			FROM journals WHERE tenant_id = $1 AND code IN ('ASSET','MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'ASSET' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
+			tenantID).Scan(&journalID, &nextNum); err != nil {
+			return
+		}
+
+		faAcct := findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
+		if faAcct == uuid.Nil {
+			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
+		}
+		accumDeprAcct := findAccount(h.db, tenantID, orgIDPtr, "accumulated depreciation", "1510")
+
+		if faAcct == uuid.Nil {
+			return
+		}
+
+		jeID := uuid.New()
+		entryNumber := fmt.Sprintf("DSP%06d", nextNum)
+		desc := fmt.Sprintf("Asset Disposal (%s): %s", input.DisposalReason, assetName)
+		lineNum := 0
+
+		_, err := h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'disposal',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
+			jeID, tenantID, orgIDPtr, journalID, entryNumber, disposalDate, id.String(), desc,
+			id.String(), acquisitionCost, userID, now,
+		)
+		if err != nil {
+			return
+		}
+
+		// Dt: Accumulated Depreciation (clear it out)
+		if accumDeprAcct != uuid.Nil && accumDepr > 0 {
+			lineNum++
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1,$2,$3,$4,'Accumulated Depreciation',$5,0,1.0,$6)`, uuid.New(), jeID, lineNum, accumDeprAcct, accumDepr, now)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", accumDepr, now, accumDeprAcct)
+		}
+
+		if input.DisposalReason == "sold" && input.DisposalAmount > 0 {
+			// Dt: Cash/Bank for sale proceeds
+			var cashAcct uuid.UUID
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			if cashAcct == uuid.Nil {
+				cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+			}
+			if cashAcct != uuid.Nil {
+				lineNum++
+				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+					VALUES ($1,$2,$3,$4,'Sale Proceeds',$5,0,1.0,$6)`, uuid.New(), jeID, lineNum, cashAcct, input.DisposalAmount, now)
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.DisposalAmount, now, cashAcct)
+			}
+
+			// If sold at loss, debit loss account
+			bookVal := acquisitionCost - accumDepr
+			if input.DisposalAmount < bookVal {
+				lossAmt := bookVal - input.DisposalAmount
+				lossAcct := findAccount(h.db, tenantID, orgIDPtr, "loss on disposal", "9500")
+				if lossAcct == uuid.Nil {
+					lossAcct = findAccount(h.db, tenantID, orgIDPtr, "other expense", "9400")
+				}
+				if lossAcct != uuid.Nil {
+					lineNum++
+					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+						VALUES ($1,$2,$3,$4,'Loss on Disposal',$5,0,1.0,$6)`, uuid.New(), jeID, lineNum, lossAcct, lossAmt, now)
+					h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", lossAmt, now, lossAcct)
+				}
+			} else if input.DisposalAmount > bookVal {
+				// Gain on disposal
+				gainAmt := input.DisposalAmount - bookVal
+				gainAcct := findAccount(h.db, tenantID, orgIDPtr, "gain on disposal", "9100")
+				if gainAcct == uuid.Nil {
+					gainAcct = findAccount(h.db, tenantID, orgIDPtr, "other income", "9000")
+				}
+				if gainAcct != uuid.Nil {
+					lineNum++
+					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+						VALUES ($1,$2,$3,$4,'Gain on Disposal',0,$5,1.0,$6)`, uuid.New(), jeID, lineNum, gainAcct, gainAmt, now)
+					h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", gainAmt, now, gainAcct)
+				}
+			}
+		} else {
+			// destroyed/expired/stolen — write off remaining book value as loss
+			bookVal := acquisitionCost - accumDepr
+			if bookVal > 0 {
+				lossAcct := findAccount(h.db, tenantID, orgIDPtr, "loss on disposal", "9500")
+				if lossAcct == uuid.Nil {
+					lossAcct = findAccount(h.db, tenantID, orgIDPtr, "other expense", "9400")
+				}
+				if lossAcct != uuid.Nil {
+					lineNum++
+					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+						VALUES ($1,$2,$3,$4,'Write-off Loss',$5,0,1.0,$6)`, uuid.New(), jeID, lineNum, lossAcct, bookVal, now)
+					h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", bookVal, now, lossAcct)
+				}
+			}
+		}
+
+		// Kt: Fixed Asset (remove from books)
+		lineNum++
+		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1,$2,$3,$4,'Fixed Asset',0,$5,1.0,$6)`, uuid.New(), jeID, lineNum, faAcct, acquisitionCost, now)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", acquisitionCost, now, faAcct)
+
+		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	}()
 
 	h.GetFixedAsset(c)
 }
@@ -750,7 +953,9 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 
 	// Get all active assets
 	assetsQuery := `
-		SELECT id, acquisition_cost, salvage_value, useful_life_months, depreciation_method, accumulated_depreciation
+		SELECT id, acquisition_cost, salvage_value, useful_life_months, depreciation_method,
+			   accumulated_depreciation, COALESCE(current_value, acquisition_cost - accumulated_depreciation),
+			   COALESCE(remaining_months, useful_life_months), COALESCE(monthly_depr, 0)
 		FROM fixed_assets
 		WHERE tenant_id = $1 AND status = 'active' AND deleted_at IS NULL
 	`
@@ -776,14 +981,31 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 	deprecationDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	newEntries := make([]*entity.DepreciationEntryResponse, 0)
 
+	// Look up accounts for journal entries: Dt 6500 Depr Expense / Kt 1510 Accum Depr
+	deprExpenseAcct := findAccount(h.db, tenantID, orgIDPtr, "depreciation expense", "6500")
+	accumDeprAcct := findAccount(h.db, tenantID, orgIDPtr, "accumulated depreciation", "1510")
+	var journalID uuid.UUID
+	var nextNumber int
+	_ = h.db.QueryRow(`
+		SELECT id, COALESCE(next_number, 1)
+		FROM journals WHERE tenant_id = $1 AND code IN ('ASSET','MISC','GENERAL') AND deleted_at IS NULL
+		ORDER BY CASE code WHEN 'ASSET' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
+		tenantID).Scan(&journalID, &nextNumber)
+
 	for rows.Next() {
 		var assetID uuid.UUID
-		var acquisitionCost, salvageValue, accumulatedDepreciation float64
-		var usefulLifeMonths int
+		var acquisitionCost, salvageValue, accumulatedDepreciation, curValue, monthlyDeprAmt float64
+		var usefulLifeMonths, remMonths int
 		var depreciationMethod string
 
-		if err := rows.Scan(&assetID, &acquisitionCost, &salvageValue, &usefulLifeMonths, &depreciationMethod, &accumulatedDepreciation); err != nil {
+		if err := rows.Scan(&assetID, &acquisitionCost, &salvageValue, &usefulLifeMonths,
+			&depreciationMethod, &accumulatedDepreciation, &curValue, &remMonths, &monthlyDeprAmt); err != nil {
 			h.log.Error("Failed to scan asset", "error", err)
+			continue
+		}
+
+		// Skip if no remaining months
+		if remMonths <= 0 {
 			continue
 		}
 
@@ -791,11 +1013,10 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 		var existingID uuid.UUID
 		checkQuery := "SELECT id FROM depreciation_entries WHERE asset_id = $1 AND period = $2"
 		if err := h.db.QueryRow(checkQuery, assetID, input.Period).Scan(&existingID); err == nil {
-			// Already exists, skip
 			continue
 		}
 
-		// Calculate depreciation
+		// Calculate depreciation using stored monthly_depr or recalculate
 		depreciableAmount := acquisitionCost - salvageValue
 		remainingValue := depreciableAmount - accumulatedDepreciation
 		if remainingValue <= 0 {
@@ -803,19 +1024,21 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 		}
 
 		var depAmount float64
-		switch depreciationMethod {
-		case "straight_line":
-			depAmount = depreciableAmount / float64(usefulLifeMonths)
-		case "declining_balance":
-			rate := 1.0 / float64(usefulLifeMonths)
-			currentValue := acquisitionCost - accumulatedDepreciation
-			depAmount = currentValue * rate
-		case "double_declining":
-			rate := 2.0 / float64(usefulLifeMonths)
-			currentValue := acquisitionCost - accumulatedDepreciation
-			depAmount = currentValue * rate
-		default:
-			depAmount = depreciableAmount / float64(usefulLifeMonths)
+		if monthlyDeprAmt > 0 {
+			depAmount = monthlyDeprAmt
+		} else {
+			switch depreciationMethod {
+			case "straight_line":
+				depAmount = depreciableAmount / float64(usefulLifeMonths)
+			case "declining_balance":
+				rate := 1.0 / float64(usefulLifeMonths)
+				depAmount = curValue * rate
+			case "double_declining":
+				rate := 2.0 / float64(usefulLifeMonths)
+				depAmount = curValue * rate
+			default:
+				depAmount = depreciableAmount / float64(usefulLifeMonths)
+			}
 		}
 
 		// Cap depreciation at remaining value
@@ -825,6 +1048,7 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 
 		newAccumulated := accumulatedDepreciation + depAmount
 		newBookValue := acquisitionCost - newAccumulated
+		newRemaining := remMonths - 1
 
 		// Insert depreciation entry
 		entryID := uuid.New()
@@ -839,13 +1063,48 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 			continue
 		}
 
-		// Update asset accumulated depreciation
+		// Update asset: accumulated_depreciation, book_value, current_value, remaining_months, last_depr_date
+		newCurrentValue := curValue - depAmount
+		var newMonthlyDepr float64
+		if newRemaining > 0 {
+			newMonthlyDepr = newCurrentValue / float64(newRemaining)
+		}
+
 		updateQuery := `
-			UPDATE fixed_assets SET accumulated_depreciation = $1, book_value = $2, updated_at = $3
-			WHERE id = $4
+			UPDATE fixed_assets SET
+				accumulated_depreciation = $1, book_value = $2,
+				current_value = $3, remaining_months = $4, monthly_depr = $5, last_depr_date = $6,
+				updated_at = $7
+			WHERE id = $8
 		`
-		if _, err := h.db.Exec(updateQuery, newAccumulated, newBookValue, now, assetID); err != nil {
+		if _, err := h.db.Exec(updateQuery, newAccumulated, newBookValue, newCurrentValue, newRemaining, newMonthlyDepr, deprecationDate, now, assetID); err != nil {
 			h.log.Error("Failed to update asset depreciation", "error", err)
+		}
+
+		// Create journal entry: Dt 6500 Depreciation Expense / Kt 1510 Accumulated Depreciation
+		if deprExpenseAcct != uuid.Nil && accumDeprAcct != uuid.Nil && journalID != uuid.Nil {
+			jeID := uuid.New()
+			entryNumber := fmt.Sprintf("DEP%06d", nextNumber)
+			nextNumber++
+
+			h.db.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'depreciation', $9, 1.0, $10, $10, 'posted', $11, $11)`,
+				jeID, tenantID, orgIDPtr, journalID, entryNumber, deprecationDate,
+				input.Period, fmt.Sprintf("Depreciation %s", input.Period),
+				assetID.String(), depAmount, now,
+			)
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, 1, $3, 'Depreciation Expense', $4, 0, 1.0, $5)`, uuid.New(), jeID, deprExpenseAcct, depAmount, now)
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, 2, $3, 'Accumulated Depreciation', 0, $4, 1.0, $5)`, uuid.New(), jeID, accumDeprAcct, depAmount, now)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, deprExpenseAcct)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, accumDeprAcct)
+
+			// Update depreciation entry with journal reference
+			h.db.Exec("UPDATE depreciation_entries SET journal_entry_id = $1 WHERE id = $2", jeID, entryID)
 		}
 
 		entry := &entity.DepreciationEntry{
@@ -861,6 +1120,11 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 			CreatedAt:          now,
 		}
 		newEntries = append(newEntries, entry.ToResponse())
+	}
+
+	// Update journal next_number
+	if journalID != uuid.Nil {
+		h.db.Exec("UPDATE journals SET next_number = $1, updated_at = $2 WHERE id = $3", nextNumber, now, journalID)
 	}
 
 	response.Success(c, gin.H{
@@ -922,4 +1186,597 @@ func (h *Handler) GetDepreciationEntries(c *gin.Context) {
 	}
 
 	response.Success(c, entries)
+}
+
+// RecordMaintenance records a maintenance event for a fixed asset
+func (h *Handler) RecordMaintenance(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	assetIDStr := c.Param("id")
+	assetID, err := uuid.Parse(assetIDStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid asset ID")
+		return
+	}
+
+	var input entity.RecordMaintenanceInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	serviceDate, err := time.Parse("2006-01-02", input.ServiceDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid service_date format")
+		return
+	}
+
+	// Validate maintenance_type
+	validTypes := map[string]bool{"regular_to": true, "capital_repair": true, "modernization": true, "minor_repair": true}
+	if !validTypes[input.MaintenanceType] {
+		response.BadRequest(c, "Invalid maintenance_type. Must be: regular_to, capital_repair, modernization, minor_repair")
+		return
+	}
+
+	// Get current asset state
+	var curValue float64
+	var remMonths, usefulLifeMonths int
+	var monthlyDeprAmt float64
+	err = h.db.QueryRow(`
+		SELECT COALESCE(current_value, acquisition_cost - accumulated_depreciation),
+			   COALESCE(remaining_months, useful_life_months),
+			   useful_life_months,
+			   COALESCE(monthly_depr, 0)
+		FROM fixed_assets WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status = 'active'`,
+		assetID, tenantID).Scan(&curValue, &remMonths, &usefulLifeMonths, &monthlyDeprAmt)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Active fixed asset")
+		return
+	} else if err != nil {
+		h.log.Error("Failed to get asset for maintenance", "error", err)
+		response.InternalError(c, "Failed to get asset")
+		return
+	}
+
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
+	// Build maintenance record
+	m := &entity.AssetMaintenance{
+		ID:                uuid.New(),
+		TenantID:          tenantID,
+		OrganizationID:    orgIDPtr,
+		AssetID:           assetID,
+		MaintenanceType:   input.MaintenanceType,
+		ServiceDate:       serviceDate,
+		Cost:              input.Cost,
+		ValueBefore:       curValue,
+		UsefulLifeBefore:  remMonths,
+		MonthlyDeprBefore: monthlyDeprAmt,
+		CreatedBy:         &userID,
+	}
+
+	if input.Description != "" {
+		m.Description = &input.Description
+	}
+	if input.PerformedBy != "" {
+		m.PerformedBy = &input.PerformedBy
+	}
+	if input.DocumentNumber != "" {
+		m.DocumentNumber = &input.DocumentNumber
+	}
+
+	// Calculate after-values based on maintenance type
+	newValue := curValue
+	newRemaining := remMonths
+	newUsefulLife := usefulLifeMonths
+
+	switch input.MaintenanceType {
+	case "regular_to":
+		// Muddat uzayadi — oylik amortizatsiya kamayadi
+		m.LifeExtensionMonths = input.ExtensionMonths
+		m.ValueIncrease = 0
+		newRemaining += input.ExtensionMonths
+		newUsefulLife += input.ExtensionMonths
+
+	case "capital_repair":
+		// Qiymat ortadi — oylik amortizatsiya ortadi
+		m.LifeExtensionMonths = 0
+		m.ValueIncrease = input.Cost
+		newValue += input.Cost
+
+	case "modernization":
+		// Ikkalasi ham o'zgaradi
+		m.LifeExtensionMonths = input.ExtensionMonths
+		m.ValueIncrease = input.Cost
+		newValue += input.Cost
+		newRemaining += input.ExtensionMonths
+		newUsefulLife += input.ExtensionMonths
+
+	case "minor_repair":
+		// Hech narsa o'zgarmaydi — faqat xarajat
+		m.LifeExtensionMonths = 0
+		m.ValueIncrease = 0
+	}
+
+	// Calculate new monthly depreciation
+	var newMonthly float64
+	if newRemaining > 0 {
+		newMonthly = newValue / float64(newRemaining)
+	}
+
+	m.ValueAfter = newValue
+	m.UsefulLifeAfter = newRemaining
+	m.MonthlyDeprAfter = math.Round(newMonthly*100) / 100
+
+	now := time.Now()
+	m.CreatedAt = now
+
+	// Insert maintenance record
+	_, err = h.db.Exec(`
+		INSERT INTO asset_maintenance (
+			id, tenant_id, organization_id, asset_id, maintenance_type, service_date, cost,
+			value_before, useful_life_before, monthly_depr_before,
+			value_after, useful_life_after, monthly_depr_after,
+			life_extension_months, value_increase,
+			description, performed_by, document_number, created_by, created_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+		m.ID, m.TenantID, m.OrganizationID, m.AssetID, m.MaintenanceType, m.ServiceDate, m.Cost,
+		m.ValueBefore, m.UsefulLifeBefore, m.MonthlyDeprBefore,
+		m.ValueAfter, m.UsefulLifeAfter, m.MonthlyDeprAfter,
+		m.LifeExtensionMonths, m.ValueIncrease,
+		m.Description, m.PerformedBy, m.DocumentNumber, m.CreatedBy, m.CreatedAt,
+	)
+	if err != nil {
+		h.log.Error("Failed to insert maintenance record", "error", err)
+		response.InternalError(c, "Failed to record maintenance")
+		return
+	}
+
+	// Update asset with new values (skip for minor_repair)
+	if input.MaintenanceType != "minor_repair" {
+		_, err = h.db.Exec(`
+			UPDATE fixed_assets SET
+				current_value = $1, remaining_months = $2, monthly_depr = $3,
+				useful_life_months = $4, updated_at = $5
+			WHERE id = $6`,
+			newValue, newRemaining, m.MonthlyDeprAfter, newUsefulLife, now, assetID)
+		if err != nil {
+			h.log.Error("Failed to update asset after maintenance", "error", err)
+		}
+	}
+
+	// Create journal entry for maintenance cost
+	if input.Cost > 0 {
+		func() {
+			var journalID uuid.UUID
+			var nextNum int
+			if err := h.db.QueryRow(`
+				SELECT id, COALESCE(next_number, 1)
+				FROM journals WHERE tenant_id = $1 AND code IN ('ASSET','MISC','GENERAL') AND deleted_at IS NULL
+				ORDER BY CASE code WHEN 'ASSET' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
+				tenantID).Scan(&journalID, &nextNum); err != nil {
+				return
+			}
+
+			// Payment account (cash/bank)
+			payAcct := findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			if input.PaymentAccountCode == "1010" {
+				payAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+			}
+			if payAcct == uuid.Nil {
+				return
+			}
+
+			var debitAcct uuid.UUID
+			var debitDesc string
+			switch input.MaintenanceType {
+			case "capital_repair", "modernization":
+				// Dt 1500 Fixed Assets (capitalized)
+				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
+				if debitAcct == uuid.Nil {
+					debitAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
+				}
+				debitDesc = "Capital Repair / Modernization"
+			default:
+				// Dt 6900 Misc Expense (or 7110)
+				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "repair", "6900")
+				if debitAcct == uuid.Nil {
+					debitAcct = findAccount(h.db, tenantID, orgIDPtr, "misc expense", "7110")
+				}
+				debitDesc = "Maintenance Expense"
+			}
+			if debitAcct == uuid.Nil {
+				return
+			}
+
+			jeID := uuid.New()
+			entryNumber := fmt.Sprintf("MNT%06d", nextNum)
+			_, err := h.db.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'maintenance',$9,1.0,$10,$10,'posted',$11,$11)`,
+				jeID, tenantID, orgIDPtr, journalID, entryNumber, serviceDate,
+				m.DocumentNumber, fmt.Sprintf("Maintenance: %s", input.MaintenanceType),
+				assetID.String(), input.Cost, now,
+			)
+			if err != nil {
+				return
+			}
+
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1,$2,1,$3,$4,$5,0,1.0,$6)`, uuid.New(), jeID, debitAcct, debitDesc, input.Cost, now)
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1,$2,2,$3,'Cash/Bank',0,$4,1.0,$5)`, uuid.New(), jeID, payAcct, input.Cost, now)
+
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Cost, now, debitAcct)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Cost, now, payAcct)
+			h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+		}()
+	}
+
+	response.Created(c, m.ToMaintenanceResponse())
+}
+
+// ListMaintenanceHistory returns maintenance history for a fixed asset
+func (h *Handler) ListMaintenanceHistory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	assetIDStr := c.Param("id")
+	assetID, err := uuid.Parse(assetIDStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid asset ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, tenant_id, organization_id, asset_id, maintenance_type, service_date, cost,
+			   value_before, useful_life_before, monthly_depr_before,
+			   value_after, useful_life_after, monthly_depr_after,
+			   life_extension_months, value_increase,
+			   description, performed_by, document_number, created_by, created_at
+		FROM asset_maintenance
+		WHERE asset_id = $1 AND tenant_id = $2
+		ORDER BY service_date DESC`, assetID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list maintenance history", "error", err)
+		response.InternalError(c, "Failed to list maintenance history")
+		return
+	}
+	defer rows.Close()
+
+	records := make([]*entity.AssetMaintenanceResponse, 0)
+	for rows.Next() {
+		var m entity.AssetMaintenance
+		var orgID, createdBy sql.NullString
+		var description, performedBy, documentNumber sql.NullString
+
+		if err := rows.Scan(
+			&m.ID, &m.TenantID, &orgID, &m.AssetID, &m.MaintenanceType, &m.ServiceDate, &m.Cost,
+			&m.ValueBefore, &m.UsefulLifeBefore, &m.MonthlyDeprBefore,
+			&m.ValueAfter, &m.UsefulLifeAfter, &m.MonthlyDeprAfter,
+			&m.LifeExtensionMonths, &m.ValueIncrease,
+			&description, &performedBy, &documentNumber, &createdBy, &m.CreatedAt,
+		); err != nil {
+			h.log.Error("Failed to scan maintenance record", "error", err)
+			continue
+		}
+
+		if description.Valid {
+			m.Description = &description.String
+		}
+		if performedBy.Valid {
+			m.PerformedBy = &performedBy.String
+		}
+		if documentNumber.Valid {
+			m.DocumentNumber = &documentNumber.String
+		}
+
+		records = append(records, m.ToMaintenanceResponse())
+	}
+
+	response.Success(c, records)
+}
+
+// RecordAssetPayment records a credit installment payment for a fixed asset
+func (h *Handler) RecordAssetPayment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	assetID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid asset ID")
+		return
+	}
+
+	var input entity.RecordAssetPaymentInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	if input.Method != "cash" && input.Method != "bank" {
+		response.BadRequest(c, "Method must be 'cash' or 'bank'")
+		return
+	}
+
+	paidAt, err := time.Parse("2006-01-02", input.PaidAt)
+	if err != nil {
+		response.BadRequest(c, "Invalid paid_at format")
+		return
+	}
+
+	// Verify asset exists and is credit
+	var assetName, pmMethod string
+	var acqCost, curTotalPaid float64
+	err = h.db.QueryRow(`
+		SELECT name, COALESCE(payment_method,'cash'), acquisition_cost, COALESCE(total_paid,0)
+		FROM fixed_assets WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		assetID, tenantID).Scan(&assetName, &pmMethod, &acqCost, &curTotalPaid)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Fixed asset")
+		return
+	} else if err != nil {
+		h.log.Error("Failed to get asset for payment", "error", err)
+		response.InternalError(c, "Failed to get asset")
+		return
+	}
+	if pmMethod != "credit" {
+		response.BadRequest(c, "Asset is not purchased on credit")
+		return
+	}
+	remaining := acqCost - curTotalPaid
+	if input.Amount > remaining+0.01 {
+		response.BadRequest(c, fmt.Sprintf("Payment amount %.2f exceeds remaining debt %.2f", input.Amount, remaining))
+		return
+	}
+
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
+	now := time.Now()
+	paymentID := uuid.New()
+	var note *string
+	if input.Note != "" {
+		note = &input.Note
+	}
+
+	// Journal entry: Dt 2000 AP / Kt 1000 or 1010 Cash/Bank
+	var journalEntryID *uuid.UUID
+	func() {
+		var journalID uuid.UUID
+		var nextNum int
+		if err := h.db.QueryRow(`
+			SELECT id, COALESCE(next_number, 1)
+			FROM journals WHERE tenant_id = $1 AND code IN ('ASSET','MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'ASSET' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
+			tenantID).Scan(&journalID, &nextNum); err != nil {
+			return
+		}
+
+		apAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+		if apAcct == uuid.Nil {
+			apAcct = findAccount(h.db, tenantID, orgIDPtr, "payable", "2010")
+		}
+		var cashAcct uuid.UUID
+		if input.Method == "bank" {
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+		} else {
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+		}
+		if apAcct == uuid.Nil || cashAcct == uuid.Nil {
+			return
+		}
+
+		jeID := uuid.New()
+		journalEntryID = &jeID
+		entryNumber := fmt.Sprintf("APY%06d", nextNum)
+		desc := fmt.Sprintf("Asset Payment: %s", assetName)
+
+		h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'asset_payment',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
+			jeID, tenantID, orgIDPtr, journalID, entryNumber, paidAt, assetID.String(), desc,
+			paymentID.String(), input.Amount, userID, now,
+		)
+		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1,$2,1,$3,'Accounts Payable',$4,0,1.0,$5)`, uuid.New(), jeID, apAcct, input.Amount, now)
+		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1,$2,2,$3,'Cash/Bank',0,$4,1.0,$5)`, uuid.New(), jeID, cashAcct, input.Amount, now)
+
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, apAcct)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAcct)
+		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	}()
+
+	// Insert payment record
+	_, err = h.db.Exec(`
+		INSERT INTO asset_payments (id, tenant_id, organization_id, asset_id, amount, method, paid_at, note, journal_entry_id, created_by, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		paymentID, tenantID, orgIDPtr, assetID, input.Amount, input.Method, paidAt, note, journalEntryID, userID, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to insert asset payment", "error", err)
+		response.InternalError(c, "Failed to record payment")
+		return
+	}
+
+	// Update total_paid on asset
+	h.db.Exec("UPDATE fixed_assets SET total_paid = COALESCE(total_paid,0) + $1, updated_at = $2 WHERE id = $3", input.Amount, now, assetID)
+
+	payment := &entity.AssetPayment{
+		ID:        paymentID,
+		TenantID:  tenantID,
+		AssetID:   assetID,
+		Amount:    input.Amount,
+		Method:    input.Method,
+		PaidAt:    paidAt,
+		Note:      note,
+		CreatedAt: now,
+	}
+	response.Created(c, payment.ToPaymentResponse())
+}
+
+// ListAssetPayments returns payment history for a credit-purchased asset
+func (h *Handler) ListAssetPayments(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	assetID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid asset ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, tenant_id, organization_id, asset_id, amount, method, paid_at, note, journal_entry_id, created_by, created_at
+		FROM asset_payments
+		WHERE asset_id = $1 AND tenant_id = $2
+		ORDER BY paid_at DESC`, assetID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list asset payments", "error", err)
+		response.InternalError(c, "Failed to list payments")
+		return
+	}
+	defer rows.Close()
+
+	payments := make([]*entity.AssetPaymentResponse, 0)
+	for rows.Next() {
+		var p entity.AssetPayment
+		var orgID, journalEntryID, createdBy, noteStr sql.NullString
+
+		if err := rows.Scan(&p.ID, &p.TenantID, &orgID, &p.AssetID, &p.Amount, &p.Method, &p.PaidAt, &noteStr, &journalEntryID, &createdBy, &p.CreatedAt); err != nil {
+			h.log.Error("Failed to scan asset payment", "error", err)
+			continue
+		}
+		if noteStr.Valid {
+			p.Note = &noteStr.String
+		}
+		payments = append(payments, p.ToPaymentResponse())
+	}
+
+	response.Success(c, payments)
+}
+
+// CreateAssetCategory creates a new asset category
+func (h *Handler) CreateAssetCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var input entity.CreateAssetCategoryInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	var description *string
+	if input.Description != "" {
+		description = &input.Description
+	}
+
+	_, err := h.db.Exec(`
+		INSERT INTO asset_categories (id, tenant_id, organization_id, code, name, description, depreciation_method, default_useful_life_months, is_active, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true,$9,$9)`,
+		id, tenantID, orgIDPtr, input.Code, input.Name, description, input.DepreciationMethod, input.DefaultUsefulLifeMonths, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create asset category", "error", err)
+		if strings.Contains(err.Error(), "duplicate") {
+			response.Conflict(c, "Category with this code already exists")
+			return
+		}
+		response.InternalError(c, "Failed to create asset category")
+		return
+	}
+
+	cat := &entity.AssetCategory{
+		ID:                      id,
+		TenantID:                tenantID,
+		Code:                    input.Code,
+		Name:                    input.Name,
+		Description:             description,
+		DepreciationMethod:      input.DepreciationMethod,
+		DefaultUsefulLifeMonths: input.DefaultUsefulLifeMonths,
+		IsActive:                true,
+	}
+	response.Created(c, cat.ToResponse())
+}
+
+// GetAssetDashboard returns summary statistics for fixed assets
+func (h *Handler) GetAssetDashboard(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	args := []interface{}{tenantID}
+	orgFilter := ""
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgFilter = " AND organization_id = $2"
+		args = append(args, orgID)
+	}
+
+	var totalAssets, activeAssets, disposedAssets int
+	var totalAcquisitionCost, totalCurrentValue, totalAccumDepr float64
+	var creditAssetsDebt float64
+
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'active'),
+			COUNT(*) FILTER (WHERE status = 'disposed'),
+			COALESCE(SUM(acquisition_cost),0),
+			COALESCE(SUM(CASE WHEN status='active' THEN COALESCE(current_value, acquisition_cost - accumulated_depreciation) ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN status='active' THEN accumulated_depreciation ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN payment_method='credit' AND status='active' THEN acquisition_cost - COALESCE(total_paid,0) ELSE 0 END),0)
+		FROM fixed_assets WHERE tenant_id = $1 AND deleted_at IS NULL%s`, orgFilter),
+		args...).Scan(&totalAssets, &activeAssets, &disposedAssets, &totalAcquisitionCost, &totalCurrentValue, &totalAccumDepr, &creditAssetsDebt)
+
+	response.Success(c, gin.H{
+		"total_assets":           totalAssets,
+		"active_assets":          activeAssets,
+		"disposed_assets":        disposedAssets,
+		"total_acquisition_cost": totalAcquisitionCost,
+		"total_current_value":    totalCurrentValue,
+		"total_accum_depreciation": totalAccumDepr,
+		"credit_remaining_debt":  creditAssetsDebt,
+	})
 }

@@ -3367,7 +3367,7 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 
 	var journalID uuid.UUID
 	var nextNumber int
-	tx.QueryRow(`SELECT id, next_number FROM journals WHERE tenant_id = $1 AND code IN ('STOCK','INV','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INV' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+	tx.QueryRow(`SELECT id, next_number FROM journals WHERE tenant_id = $1 AND code IN ('CONST','STOCK','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'CONST' THEN 0 WHEN 'STOCK' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 	var totalExpense float64
 
