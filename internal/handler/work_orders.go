@@ -418,6 +418,31 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		WHERE work_order_id = $4 AND end_time IS NULL
 	`, now, durationHours, input.Notes, woID)
 
+	// Update work center utilization
+	var workCenterID uuid.UUID
+	if h.db.QueryRow(`SELECT work_center_id FROM work_orders WHERE id = $1`, woID).Scan(&workCenterID) == nil && workCenterID != uuid.Nil {
+		var totalHours float64
+		var operatingHours float64
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(wo.actual_duration_hours), 0)
+			FROM work_orders wo
+			WHERE wo.work_center_id = $1 AND wo.tenant_id = $2 AND wo.status IN ('completed', 'done')
+				AND wo.deleted_at IS NULL
+		`, workCenterID, tenantID).Scan(&totalHours)
+		h.db.QueryRow(`
+			SELECT COALESCE(operating_hours, 8) FROM work_centers WHERE id = $1 AND tenant_id = $2
+		`, workCenterID, tenantID).Scan(&operatingHours)
+		if operatingHours > 0 {
+			// Utilization = total hours worked / (operating hours per day × 30 days) × 100
+			utilization := (totalHours / (operatingHours * 30)) * 100
+			if utilization > 100 {
+				utilization = 100
+			}
+			h.db.Exec(`UPDATE work_centers SET current_utilization = $1 WHERE id = $2 AND tenant_id = $3`,
+				utilization, workCenterID, tenantID)
+		}
+	}
+
 	// Get the production order ID and current work order sequence
 	var productionOrderID uuid.UUID
 	var currentSequence int
