@@ -1437,7 +1437,7 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 			h.db.QueryRow(`
 				SELECT COALESCE(SUM(
 					(COALESCE(bo.setup_time_minutes, 0) + COALESCE(bo.run_time_minutes, 0)) / 60.0
-					* COALESCE(wc.cost_per_hour, 0)
+					* COALESCE(wc.hourly_cost, 0)
 				), 0)
 				FROM bom_operations bo
 				LEFT JOIN work_centers wc ON bo.work_center_id = wc.id

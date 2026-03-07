@@ -1639,7 +1639,7 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(NULLIF(cp.cost_price, 0), cp.list_price, 0) * (1 + bl2.scrap_percent/100))
 			     FROM bom_lines bl2 JOIN products cp ON bl2.component_id = cp.id
 			     WHERE bl2.bom_id = b.id), 0)
-			   + COALESCE((SELECT SUM((COALESCE(bo.setup_time_minutes, 0) + COALESCE(bo.run_time_minutes, 0)) / 60.0 * COALESCE(wc.cost_per_hour, 0))
+			   + COALESCE((SELECT SUM((COALESCE(bo.setup_time_minutes, 0) + COALESCE(bo.run_time_minutes, 0)) / 60.0 * COALESCE(wc.hourly_cost, 0))
 			     FROM bom_operations bo LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
 			     WHERE bo.bom_id = b.id), 0) as total_cost
 		FROM product_boms b
