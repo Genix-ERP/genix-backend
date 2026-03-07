@@ -4996,14 +4996,20 @@ func (h *Handler) GetStockCount(c *gin.Context) {
 		UnitCost         *float64   `json:"unit_cost,omitempty"`
 		Status           string     `json:"status"`
 		Notes            *string    `json:"notes,omitempty"`
+		Resolution       string     `json:"resolution"`
+		ResponsibleEmpID *uuid.UUID `json:"responsible_emp_id,omitempty"`
+		ResponsibleName  string     `json:"responsible_name,omitempty"`
 	}
 
 	lineRows, err := h.db.Query(`
 		SELECT scl.id, scl.product_id, COALESCE(p.name,''), COALESCE(p.code,''),
 			scl.system_quantity, scl.counted_quantity, scl.variance_quantity,
-			scl.unit_cost, scl.status, scl.notes
+			scl.unit_cost, scl.status, scl.notes,
+			COALESCE(scl.resolution, 'pending'), scl.responsible_emp_id,
+			COALESCE(e.first_name || ' ' || e.last_name, '')
 		FROM stock_count_lines scl
 		LEFT JOIN products p ON scl.product_id = p.id
+		LEFT JOIN employees e ON scl.responsible_emp_id = e.id
 		WHERE scl.stock_count_id = $1
 		ORDER BY COALESCE(p.name,'')
 	`, id)
@@ -5017,10 +5023,12 @@ func (h *Handler) GetStockCount(c *gin.Context) {
 			var l LineResponse
 			var countedQty, unitCost sql.NullFloat64
 			var lineNotes sql.NullString
+			var respEmpID *uuid.UUID
 			if err := lineRows.Scan(
 				&l.ID, &l.ProductID, &l.ProductName, &l.ProductCode,
 				&l.SystemQuantity, &countedQty, &l.VarianceQuantity,
 				&unitCost, &l.Status, &lineNotes,
+				&l.Resolution, &respEmpID, &l.ResponsibleName,
 			); err != nil {
 				continue
 			}
@@ -5033,6 +5041,7 @@ func (h *Handler) GetStockCount(c *gin.Context) {
 			if lineNotes.Valid {
 				l.Notes = &lineNotes.String
 			}
+			l.ResponsibleEmpID = respEmpID
 			lines = append(lines, l)
 		}
 		sc.Lines = lines
@@ -6945,4 +6954,369 @@ func (h *Handler) GetStockOperationSummary(c *gin.Context) {
 	}
 
 	response.Success(c, result)
+}
+
+// =====================================================
+// EMPLOYEE DEDUCTIONS — Inventory shortage → Payroll bridge
+// =====================================================
+
+// AssignResponsible assigns a responsible employee to a shortage line and optionally creates a deduction
+func (h *Handler) AssignResponsible(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	lineID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid line ID")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
+
+	var input entity.AssignResponsibleInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	if input.Resolution != "employee" && input.Resolution != "company" && input.Resolution != "cash" {
+		response.BadRequest(c, "Resolution must be 'employee', 'company', or 'cash'")
+		return
+	}
+
+	employeeID, err := uuid.Parse(input.EmployeeID)
+	if err != nil {
+		response.BadRequest(c, "Invalid employee ID")
+		return
+	}
+
+	// Verify line exists, belongs to tenant, and has shortage
+	var stockCountID uuid.UUID
+	var productID uuid.UUID
+	var varianceQty float64
+	var unitCost float64
+	var currentResolution string
+	err = h.db.QueryRow(`
+		SELECT scl.stock_count_id, scl.product_id, scl.variance_quantity, COALESCE(scl.unit_cost, 0), COALESCE(scl.resolution, 'pending')
+		FROM stock_count_lines scl
+		JOIN stock_counts sc ON sc.id = scl.stock_count_id
+		WHERE scl.id = $1 AND sc.tenant_id = $2
+	`, lineID, tenantID).Scan(&stockCountID, &productID, &varianceQty, &unitCost, &currentResolution)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock count line")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to query line")
+		return
+	}
+
+	// variance_quantity is negative when there's a shortage (counted - system)
+	if varianceQty >= 0 {
+		response.BadRequest(c, "Bu satrda kamomad yo'q (no shortage on this line)")
+		return
+	}
+	if currentResolution != "pending" {
+		response.BadRequest(c, "Bu satr uchun mas'ul allaqachon tayinlangan")
+		return
+	}
+
+	shortageQty := -varianceQty // make positive
+	shortageAmount := shortageQty * unitCost
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to begin transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+
+	// 1. Update stock_count_line with resolution and responsible
+	_, err = tx.Exec(`
+		UPDATE stock_count_lines SET resolution = $1, responsible_emp_id = $2, updated_at = $3 WHERE id = $4
+	`, input.Resolution, employeeID, now, lineID)
+	if err != nil {
+		response.InternalError(c, "Failed to update line")
+		return
+	}
+
+	var deductionResp *entity.EmployeeDeduction
+
+	// 2. If resolution is "employee", create a deduction record
+	if input.Resolution == "employee" {
+		// Get product name for reason text
+		var productName, productUnit string
+		h.db.QueryRow("SELECT name, COALESCE(unit_of_measure, 'шт') FROM products WHERE id=$1", productID).Scan(&productName, &productUnit)
+
+		reason := fmt.Sprintf("Inventarizatsiya kamomad: %s %.2f %s x %.0f = %.0f so'm",
+			productName, shortageQty, productUnit, unitCost, shortageAmount)
+
+		deductionID := uuid.New()
+		var orgIDPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgIDPtr = &orgID
+		}
+
+		_, err = tx.Exec(`
+			INSERT INTO employee_deductions (id, tenant_id, organization_id, employee_id, amount, reason, source_type, source_id, status, created_by, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, 'inventory_shortage', $7, 'pending', $8, $9, $9)
+		`, deductionID, tenantID, orgIDPtr, employeeID, shortageAmount, reason, lineID, userID, now)
+		if err != nil {
+			response.InternalError(c, "Failed to create deduction: "+err.Error())
+			return
+		}
+
+		// Get employee name
+		var empName string
+		h.db.QueryRow("SELECT COALESCE(first_name || ' ' || last_name, first_name, '') FROM employees WHERE id=$1", employeeID).Scan(&empName)
+
+		deductionResp = &entity.EmployeeDeduction{
+			ID:         deductionID,
+			TenantID:   tenantID,
+			EmployeeID: employeeID,
+			Amount:     shortageAmount,
+			Reason:     reason,
+			SourceType: "inventory_shortage",
+			SourceID:   &lineID,
+			Status:     "pending",
+			CreatedBy:  userID,
+			CreatedAt:  now,
+			UpdatedAt:  now,
+			EmployeeName: empName,
+		}
+		if orgIDPtr != nil {
+			deductionResp.OrganizationID = orgIDPtr
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit: "+err.Error())
+		return
+	}
+
+	result := gin.H{
+		"success":           true,
+		"resolution":        input.Resolution,
+		"deduction_created": input.Resolution == "employee",
+	}
+	if deductionResp != nil {
+		result["deduction"] = deductionResp
+	}
+	response.Success(c, result)
+}
+
+// ListEmployeeDeductions lists deductions for an employee
+func (h *Handler) ListEmployeeDeductions(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	employeeID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid employee ID")
+		return
+	}
+
+	status := c.Query("status") // optional filter
+
+	query := `
+		SELECT ed.id, ed.tenant_id, ed.organization_id, ed.employee_id, ed.amount, ed.reason,
+			   ed.source_type, ed.source_id, ed.status, ed.payroll_entry_id, ed.deducted_at,
+			   ed.cancelled_reason, ed.cancelled_by, ed.cancelled_at,
+			   ed.created_by, ed.created_at, ed.updated_at,
+			   COALESCE(e.first_name || ' ' || e.last_name, e.first_name, '') as employee_name
+		FROM employee_deductions ed
+		JOIN employees e ON e.id = ed.employee_id
+		WHERE ed.tenant_id = $1 AND ed.employee_id = $2
+	`
+	args := []interface{}{tenantID, employeeID}
+
+	if status != "" {
+		query += " AND ed.status = $3"
+		args = append(args, status)
+	}
+	query += " ORDER BY ed.created_at DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		response.InternalError(c, "Failed to query deductions")
+		return
+	}
+	defer rows.Close()
+
+	deductions := make([]entity.EmployeeDeduction, 0)
+	for rows.Next() {
+		var d entity.EmployeeDeduction
+		err := rows.Scan(
+			&d.ID, &d.TenantID, &d.OrganizationID, &d.EmployeeID, &d.Amount, &d.Reason,
+			&d.SourceType, &d.SourceID, &d.Status, &d.PayrollEntryID, &d.DeductedAt,
+			&d.CancelledReason, &d.CancelledBy, &d.CancelledAt,
+			&d.CreatedBy, &d.CreatedAt, &d.UpdatedAt, &d.EmployeeName,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan deduction", "error", err)
+			continue
+		}
+		deductions = append(deductions, d)
+	}
+
+	response.Success(c, deductions)
+}
+
+// CancelDeduction cancels an employee deduction
+func (h *Handler) CancelDeduction(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	deductionID, err := uuid.Parse(c.Param("did"))
+	if err != nil {
+		response.BadRequest(c, "Invalid deduction ID")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	var input entity.CancelDeductionInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	// Verify deduction exists and is pending
+	var status string
+	var sourceID *uuid.UUID
+	err = h.db.QueryRow(
+		"SELECT status, source_id FROM employee_deductions WHERE id=$1 AND tenant_id=$2",
+		deductionID, tenantID,
+	).Scan(&status, &sourceID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Deduction")
+		return
+	}
+	if status != "pending" {
+		response.BadRequest(c, "Faqat 'pending' holatidagi kamomadni bekor qilish mumkin")
+		return
+	}
+
+	now := time.Now()
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to begin transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Cancel the deduction
+	_, err = tx.Exec(`
+		UPDATE employee_deductions SET status='cancelled', cancelled_reason=$1, cancelled_by=$2, cancelled_at=$3, updated_at=$3
+		WHERE id=$4
+	`, input.Reason, userID, now, deductionID)
+	if err != nil {
+		response.InternalError(c, "Failed to cancel deduction")
+		return
+	}
+
+	// Reset the stock count line resolution back to pending
+	if sourceID != nil {
+		tx.Exec("UPDATE stock_count_lines SET resolution='pending', responsible_emp_id=NULL, updated_at=$1 WHERE id=$2", now, *sourceID)
+	}
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit")
+		return
+	}
+
+	response.Success(c, gin.H{"success": true, "message": "Kamomad bekor qilindi"})
+}
+
+// ListAllDeductions lists all deductions for the tenant (admin view)
+func (h *Handler) ListAllDeductions(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	status := c.Query("status")
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	if page < 1 { page = 1 }
+	if limit < 1 || limit > 100 { limit = 50 }
+	offset := (page - 1) * limit
+
+	query := `
+		SELECT ed.id, ed.tenant_id, ed.organization_id, ed.employee_id, ed.amount, ed.reason,
+			   ed.source_type, ed.source_id, ed.status, ed.payroll_entry_id, ed.deducted_at,
+			   ed.cancelled_reason, ed.cancelled_by, ed.cancelled_at,
+			   ed.created_by, ed.created_at, ed.updated_at,
+			   COALESCE(e.first_name || ' ' || e.last_name, e.first_name, '') as employee_name
+		FROM employee_deductions ed
+		JOIN employees e ON e.id = ed.employee_id
+		WHERE ed.tenant_id = $1
+	`
+	countQuery := "SELECT COUNT(*) FROM employee_deductions WHERE tenant_id = $1"
+	args := []interface{}{tenantID}
+	countArgs := []interface{}{tenantID}
+	argIdx := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argIdx++
+		query += fmt.Sprintf(" AND ed.organization_id = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argIdx)
+		args = append(args, orgID)
+		countArgs = append(countArgs, orgID)
+	}
+
+	if status != "" {
+		argIdx++
+		query += fmt.Sprintf(" AND ed.status = $%d", argIdx)
+		countQuery += fmt.Sprintf(" AND status = $%d", argIdx)
+		args = append(args, status)
+		countArgs = append(countArgs, status)
+	}
+
+	var total int
+	h.db.QueryRow(countQuery, countArgs...).Scan(&total)
+
+	query += fmt.Sprintf(" ORDER BY ed.created_at DESC LIMIT $%d OFFSET $%d", argIdx+1, argIdx+2)
+	args = append(args, limit, offset)
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		response.InternalError(c, "Failed to query deductions")
+		return
+	}
+	defer rows.Close()
+
+	deductions := make([]entity.EmployeeDeduction, 0)
+	for rows.Next() {
+		var d entity.EmployeeDeduction
+		err := rows.Scan(
+			&d.ID, &d.TenantID, &d.OrganizationID, &d.EmployeeID, &d.Amount, &d.Reason,
+			&d.SourceType, &d.SourceID, &d.Status, &d.PayrollEntryID, &d.DeductedAt,
+			&d.CancelledReason, &d.CancelledBy, &d.CancelledAt,
+			&d.CreatedBy, &d.CreatedAt, &d.UpdatedAt, &d.EmployeeName,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan deduction", "error", err)
+			continue
+		}
+		deductions = append(deductions, d)
+	}
+
+	pagination := entity.NewPagination(page, limit)
+	pagination.Calculate(total)
+	response.SuccessWithPagination(c, deductions, pagination)
 }

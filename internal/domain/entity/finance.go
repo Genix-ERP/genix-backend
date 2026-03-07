@@ -35,6 +35,8 @@ type Account struct {
 	AccountTypeID    uuid.UUID    `json:"account_type_id" db:"account_type_id"`
 	Code             string       `json:"code" db:"code"`
 	Name             string       `json:"name" db:"name"`
+	NameUz           *string      `json:"name_uz,omitempty" db:"name_uz"`
+	NameEn           *string      `json:"name_en,omitempty" db:"name_en"`
 	Description      *string      `json:"description,omitempty" db:"description"`
 	CurrencyID       *uuid.UUID   `json:"currency_id,omitempty" db:"currency_id"`
 	IsBankAccount    bool         `json:"is_bank_account" db:"is_bank_account"`
@@ -62,6 +64,8 @@ type AccountResponse struct {
 	AccountTypeID    uuid.UUID        `json:"account_type_id"`
 	Code             string           `json:"code"`
 	Name             string           `json:"name"`
+	NameUz           *string          `json:"name_uz,omitempty"`
+	NameEn           *string          `json:"name_en,omitempty"`
 	Description      *string          `json:"description,omitempty"`
 	Category         string           `json:"category,omitempty"`
 	NormalBalance    string           `json:"normal_balance,omitempty"`
@@ -86,6 +90,8 @@ func (a *Account) ToResponse() *AccountResponse {
 		AccountTypeID:    a.AccountTypeID,
 		Code:             a.Code,
 		Name:             a.Name,
+		NameUz:           a.NameUz,
+		NameEn:           a.NameEn,
 		Description:      a.Description,
 		IsBankAccount:    a.IsBankAccount,
 		IsControlAccount: a.IsControlAccount,
@@ -242,7 +248,11 @@ type JournalEntry struct {
 	PostedAt        *time.Time   `json:"posted_at,omitempty" db:"posted_at"`
 	PostedBy        *uuid.UUID   `json:"posted_by,omitempty" db:"posted_by"`
 	ReversedEntryID *uuid.UUID   `json:"reversed_entry_id,omitempty" db:"reversed_entry_id"`
-	ReversalOf      *uuid.UUID   `json:"reversal_of,omitempty" db:"reversal_of"`
+	IsReversal      bool         `json:"is_reversal" db:"is_reversal"`
+	ReversalOfID    *uuid.UUID   `json:"reversal_of_id,omitempty" db:"reversal_of_id"`
+	ReversalReason  *string      `json:"reversal_reason,omitempty" db:"reversal_reason"`
+	CancelledAt     *time.Time   `json:"cancelled_at,omitempty" db:"cancelled_at"`
+	Tags            []string     `json:"tags,omitempty" db:"tags"`
 	CreatedBy       *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
@@ -288,6 +298,11 @@ type JournalEntryResponse struct {
 	TotalCredit     float64              `json:"total_credit"`
 	Status          string               `json:"status"`
 	PostedAt        *time.Time           `json:"posted_at,omitempty"`
+	ReversedEntryID *uuid.UUID           `json:"reversed_entry_id,omitempty"`
+	IsReversal      bool                 `json:"is_reversal"`
+	ReversalOfID    *uuid.UUID           `json:"reversal_of_id,omitempty"`
+	ReversalReason  *string              `json:"reversal_reason,omitempty"`
+	Tags            []string             `json:"tags,omitempty"`
 	CreatedAt       time.Time            `json:"created_at"`
 	Lines           []JournalEntryLine   `json:"lines,omitempty"`
 	Journal         *Journal             `json:"journal,omitempty"`
@@ -296,20 +311,25 @@ type JournalEntryResponse struct {
 // ToResponse converts JournalEntry to JournalEntryResponse
 func (je *JournalEntry) ToResponse() *JournalEntryResponse {
 	return &JournalEntryResponse{
-		ID:          je.ID,
-		JournalID:   je.JournalID,
-		EntryNumber: je.EntryNumber,
-		EntryDate:   je.EntryDate.Format("2006-01-02"),
-		Reference:   je.Reference,
-		Description: je.Description,
-		SourceType:  je.SourceType,
-		TotalDebit:  je.TotalDebit,
-		TotalCredit: je.TotalCredit,
-		Status:      je.Status,
-		PostedAt:    je.PostedAt,
-		CreatedAt:   je.CreatedAt,
-		Lines:       je.Lines,
-		Journal:     je.Journal,
+		ID:              je.ID,
+		JournalID:       je.JournalID,
+		EntryNumber:     je.EntryNumber,
+		EntryDate:       je.EntryDate.Format("2006-01-02"),
+		Reference:       je.Reference,
+		Description:     je.Description,
+		SourceType:      je.SourceType,
+		TotalDebit:      je.TotalDebit,
+		TotalCredit:     je.TotalCredit,
+		Status:          je.Status,
+		PostedAt:        je.PostedAt,
+		ReversedEntryID: je.ReversedEntryID,
+		IsReversal:      je.IsReversal,
+		ReversalOfID:    je.ReversalOfID,
+		ReversalReason:  je.ReversalReason,
+		Tags:            je.Tags,
+		CreatedAt:       je.CreatedAt,
+		Lines:           je.Lines,
+		Journal:         je.Journal,
 	}
 }
 
@@ -320,6 +340,7 @@ type CreateJournalEntryInput struct {
 	EntryDate      string                        `json:"entry_date" binding:"required"`
 	Reference      string                        `json:"reference"`
 	Description    string                        `json:"description"`
+	Tags           []string                      `json:"tags"`
 	CurrencyID     *string                       `json:"currency_id"`
 	ExchangeRate   float64                       `json:"exchange_rate"`
 	Lines          []CreateJournalEntryLineInput `json:"lines" binding:"required,min=2"`
@@ -333,6 +354,12 @@ type CreateJournalEntryLineInput struct {
 	DebitAmount  float64 `json:"debit_amount"`
 	CreditAmount float64 `json:"credit_amount"`
 	TaxID        *string `json:"tax_id"`
+}
+
+// ReverseJournalEntryInput is the input for reversing a journal entry
+type ReverseJournalEntryInput struct {
+	Date   string `json:"date"`   // optional reversal date (YYYY-MM-DD), defaults to today
+	Reason string `json:"reason"` // reason for reversal
 }
 
 // JournalEntryListFilter is the filter for listing journal entries
