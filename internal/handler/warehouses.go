@@ -385,8 +385,8 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 		return
 	}
 
-	// Create default operation types for the warehouse
-	h.createDefaultOperationTypes(tenantID, id, input.Code)
+	// Create default operation types for the warehouse based on steps
+	h.createDefaultOperationTypes(tenantID, id, input.Code, receptionSteps, deliverySteps)
 
 	resp := &entity.Warehouse{
 		ID:             id,
@@ -678,6 +678,24 @@ func (h *Handler) UpdateWarehouse(c *gin.Context) {
 		h.log.Error("Failed to update warehouse", "error", err)
 		response.InternalError(c, "Failed to update warehouse")
 		return
+	}
+
+	// If steps changed, recreate operation types
+	if input.ReceptionSteps != nil || input.DeliverySteps != nil {
+		// Get current warehouse code and steps
+		var whCode string
+		var recSteps, delSteps int
+		h.db.QueryRow(
+			"SELECT code, reception_steps, delivery_steps FROM warehouses WHERE id = $1 AND tenant_id = $2",
+			id, tenantID,
+		).Scan(&whCode, &recSteps, &delSteps)
+
+		// Soft-delete old auto-generated operation types and recreate
+		h.db.Exec(
+			"DELETE FROM warehouse_operation_types WHERE warehouse_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+			id, tenantID,
+		)
+		h.createDefaultOperationTypes(tenantID, id, whCode, recSteps, delSteps)
 	}
 
 	// Return updated warehouse
@@ -2011,25 +2029,72 @@ func (h *Handler) DeleteOperationType(c *gin.Context) {
 	response.NoContent(c)
 }
 
-// createDefaultOperationTypes creates default operation types for a warehouse
-func (h *Handler) createDefaultOperationTypes(tenantID, warehouseID uuid.UUID, warehouseCode string) error {
+// createDefaultOperationTypes creates default operation types for a warehouse based on reception/delivery steps (like Odoo)
+func (h *Handler) createDefaultOperationTypes(tenantID, warehouseID uuid.UUID, warehouseCode string, receptionSteps, deliverySteps int) error {
 	now := time.Now()
 
-	// Default operation types like Odoo
-	// operation_type must be one of: 'incoming', 'outgoing', 'internal'
-	defaults := []struct {
+	type opTypeDef struct {
 		code          string
 		name          string
-		operationType string // incoming, outgoing, internal (for the operation_type column)
-		opType        string // custom type name (for the type column)
+		operationType string // incoming, outgoing, internal
+		opType        string // receipt, delivery, internal, pos, input, qc, pick, pack
 		sequence      int
 		color         string
-	}{
-		{warehouseCode + "/IN", "Receipts", "incoming", "receipt", 1, "#22c55e"},
-		{warehouseCode + "/INT", "Internal Transfers", "internal", "internal", 2, "#3b82f6"},
-		{warehouseCode + "/OUT", "Delivery Orders", "outgoing", "delivery", 3, "#f97316"},
-		{warehouseCode + "/POS", "PoS Orders", "outgoing", "pos", 4, "#a855f7"},
 	}
+
+	seq := 1
+	var defaults []opTypeDef
+
+	// Reception operation types based on steps
+	switch receptionSteps {
+	case 1:
+		// 1-step: Direct receipt to stock
+		defaults = append(defaults, opTypeDef{warehouseCode + "/IN", "Qabul qilish", "incoming", "receipt", seq, "#22c55e"})
+		seq++
+	case 2:
+		// 2-step: Input zone → Stock
+		defaults = append(defaults, opTypeDef{warehouseCode + "/IN", "Qabul qilish", "incoming", "receipt", seq, "#22c55e"})
+		seq++
+		defaults = append(defaults, opTypeDef{warehouseCode + "/INPUT", "Kirish zonasidan omborga", "internal", "input", seq, "#06b6d4"})
+		seq++
+	case 3:
+		// 3-step: Input → Quality Control → Stock
+		defaults = append(defaults, opTypeDef{warehouseCode + "/IN", "Qabul qilish", "incoming", "receipt", seq, "#22c55e"})
+		seq++
+		defaults = append(defaults, opTypeDef{warehouseCode + "/INPUT", "Kirish zonasidan sifat nazoratiga", "internal", "input", seq, "#06b6d4"})
+		seq++
+		defaults = append(defaults, opTypeDef{warehouseCode + "/QC", "Sifat nazoratidan omborga", "internal", "qc", seq, "#8b5cf6"})
+		seq++
+	}
+
+	// Internal transfers (always present)
+	defaults = append(defaults, opTypeDef{warehouseCode + "/INT", "Ichki o'tkazmalar", "internal", "internal", seq, "#3b82f6"})
+	seq++
+
+	// Delivery operation types based on steps
+	switch deliverySteps {
+	case 1:
+		// 1-step: Direct from stock
+		defaults = append(defaults, opTypeDef{warehouseCode + "/OUT", "Yetkazib berish", "outgoing", "delivery", seq, "#f97316"})
+		seq++
+	case 2:
+		// 2-step: Pick → Ship
+		defaults = append(defaults, opTypeDef{warehouseCode + "/PICK", "Yig'ish", "internal", "pick", seq, "#eab308"})
+		seq++
+		defaults = append(defaults, opTypeDef{warehouseCode + "/OUT", "Yetkazib berish", "outgoing", "delivery", seq, "#f97316"})
+		seq++
+	case 3:
+		// 3-step: Pick → Pack → Ship
+		defaults = append(defaults, opTypeDef{warehouseCode + "/PICK", "Yig'ish", "internal", "pick", seq, "#eab308"})
+		seq++
+		defaults = append(defaults, opTypeDef{warehouseCode + "/PACK", "Qadoqlash", "internal", "pack", seq, "#ec4899"})
+		seq++
+		defaults = append(defaults, opTypeDef{warehouseCode + "/OUT", "Yetkazib berish", "outgoing", "delivery", seq, "#f97316"})
+		seq++
+	}
+
+	// PoS Orders (always present)
+	defaults = append(defaults, opTypeDef{warehouseCode + "/POS", "Savdo nuqtasi", "outgoing", "pos", seq, "#a855f7"})
 
 	for _, d := range defaults {
 		id := uuid.New()

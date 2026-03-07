@@ -292,10 +292,10 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 		return
 	}
 
-	assetCode := input.AssetCode
-	if assetCode == "" {
-		assetCode = fmt.Sprintf("FA-%d", time.Now().UnixNano()%100000)
-	}
+	// Auto-generate sequential asset code: AV-001, AV-002, ...
+	var maxCode int
+	h.db.QueryRow("SELECT COALESCE(MAX(CAST(SUBSTRING(asset_code FROM 4) AS INTEGER)), 0) FROM fixed_assets WHERE tenant_id = $1 AND asset_code ~ '^AV-[0-9]+$'", tenantID).Scan(&maxCode)
+	assetCode := fmt.Sprintf("AV-%03d", maxCode+1)
 
 	acquisitionDate, err := time.Parse("2006-01-02", input.AcquisitionDate)
 	if err != nil {
