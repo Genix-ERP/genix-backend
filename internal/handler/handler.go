@@ -348,6 +348,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		stockCounts.DELETE("/:id", middleware.RequirePermission("inventory", "stock", "delete"), h.DeleteStockCount)
 	}
 
+	// Stock Count Lines — shortage assignment
+	stockCountLines := rg.Group("/stock-count-lines")
+	stockCountLines.Use(middleware.RequirePermission("inventory", "stock", "read"))
+	{
+		stockCountLines.POST("/:id/assign", middleware.RequirePermission("inventory", "stock", "adjust"), h.AssignResponsible)
+	}
+
+	// Employee Deductions (inventory shortage → payroll bridge)
+	edDeductions := rg.Group("/employee-deductions")
+	edDeductions.Use(middleware.RequirePermission("hr", "employee", "read"))
+	{
+		edDeductions.GET("", h.ListAllDeductions)
+	}
+
 	// Stock Operations (TT: Receipt, Delivery, Internal Transfer, Write-off)
 	stockOps := rg.Group("/stock-operations")
 	stockOps.Use(middleware.RequirePermission("inventory", "stock", "read"))
@@ -1149,6 +1163,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employees.PUT("/:id/permissions", middleware.RequirePermission("hr", "employee", "update"), h.BulkUpdateEmployeePermissions)
 		employees.PUT("/:id/permissions/module", middleware.RequirePermission("hr", "employee", "update"), h.UpdateEmployeeModulePermission)
 		employees.DELETE("/:id/permissions", middleware.RequirePermission("hr", "employee", "delete"), h.DeleteEmployeePermissions)
+		// Employee deductions
+		employees.GET("/:id/deductions", h.ListEmployeeDeductions)
+		employees.POST("/:id/deductions/:did/cancel", middleware.RequirePermission("hr", "employee", "update"), h.CancelDeduction)
+		// Salary calculation with deductions
+		employees.GET("/:id/salary-calculate", h.CalculateSalaryWithDeductions)
 	}
 
 	// Employee-Organization Assignments
@@ -1416,6 +1435,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payrollPeriods.POST("/:id/process", middleware.RequirePermission("hr", "payroll", "approve"), h.ProcessPayroll)
 		payrollPeriods.GET("/:id/entries", h.ListPayrollEntries)
 		payrollPeriods.POST("/:id/entries", middleware.RequirePermission("hr", "payroll", "create"), h.CreatePayrollEntry)
+		payrollPeriods.POST("/:id/entries/:eid/confirm", middleware.RequirePermission("hr", "payroll", "approve"), h.ConfirmSalaryPaymentByEntry)
 	}
 
 	// Expense Categories
