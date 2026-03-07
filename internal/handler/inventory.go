@@ -667,10 +667,10 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		}
 
 		if ca.StockValuationAccountID != uuid.Nil && adjustAcct != uuid.Nil {
-			// Find journal (MISC or GENERAL)
+			// Find journal (STOCK preferred, fallback to MISC/GENERAL)
 			var journalID uuid.UUID
 			var nextNumber int
-			tx.QueryRow(`SELECT id, next_number FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+			tx.QueryRow(`SELECT id, next_number FROM journals WHERE tenant_id = $1 AND code IN ('STOCK','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 			if journalID != uuid.Nil {
 				entryID := uuid.New()
@@ -3505,7 +3505,7 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 
 		var journalID uuid.UUID
 		var nextNumber int
-		tx.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE WHEN code='INVENTORY' THEN 0 WHEN code='MISC' THEN 1 ELSE 2 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+		tx.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 		if journalID != uuid.Nil {
 			entryID := uuid.New()
@@ -5394,7 +5394,7 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 
 		var journalID uuid.UUID
 		var nextNumber int
-		h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE WHEN code='INVENTORY' THEN 0 WHEN code='MISC' THEN 1 ELSE 2 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+		h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 		if journalID != uuid.Nil {
 			entryID := uuid.New()
@@ -5998,7 +5998,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					h.db.QueryRow("SELECT id, COALESCE(next_number,1) FROM journals WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", *cfgJournalID, tenantID).Scan(&journalID, &nextNumber)
 				}
 				if journalID == uuid.Nil {
-					h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE WHEN code='INVENTORY' THEN 0 WHEN code='MISC' THEN 1 ELSE 2 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+					h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 				}
 
 				if journalID != uuid.Nil {

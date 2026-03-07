@@ -318,7 +318,7 @@ func (h *Handler) ensureConstructionJournal(tenantID uuid.UUID, orgIDPtr *uuid.U
 	newID := uuid.New()
 	insertErr := h.db.QueryRow(`
 		INSERT INTO journals (id, tenant_id, organization_id, code, name, type, next_number, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, 'CONST', 'Construction Journal', 'general', $4, true, NOW(), NOW())
+		VALUES ($1, $2, $3, 'CONST', 'Qurilish jurnali', 'construction', $4, true, NOW(), NOW())
 		ON CONFLICT DO NOTHING
 		RETURNING id
 	`, newID, tenantID, orgVal, nextNum).Scan(&journalID)
