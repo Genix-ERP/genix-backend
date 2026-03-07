@@ -490,6 +490,24 @@ func (h *Handler) checkLockDate(tenantID uuid.UUID, entryDate time.Time) string 
 	return ""
 }
 
+// checkPeriodLock checks if the entry date falls in a locked or closed fiscal period
+func (h *Handler) checkPeriodLock(tenantID uuid.UUID, entryDate time.Time) string {
+	var periodStatus sql.NullString
+	err := h.db.QueryRow(`
+		SELECT fp.status FROM fiscal_periods fp
+		JOIN fiscal_years fy ON fp.fiscal_year_id = fy.id
+		WHERE fy.tenant_id = $1 AND $2 BETWEEN fp.start_date AND fp.end_date
+		LIMIT 1
+	`, tenantID, entryDate).Scan(&periodStatus)
+	if err != nil || !periodStatus.Valid {
+		return "" // no period found — allow
+	}
+	if periodStatus.String == "locked" || periodStatus.String == "closed" {
+		return fmt.Sprintf("This period is %s. Contact admin to unlock.", periodStatus.String)
+	}
+	return ""
+}
+
 // dbQuerier is an interface satisfied by both *sql.DB and *sql.Tx
 type dbQuerier interface {
 	QueryRow(query string, args ...interface{}) *sql.Row
