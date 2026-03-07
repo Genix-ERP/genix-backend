@@ -83,6 +83,10 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 
 	// Public file access (for serving images in <img> tags)
 	rg.GET("/files/:id", h.GetFile)
+
+	// Public shared reconciliation act (no auth — accessed via share token)
+	rg.GET("/shared/reconciliation/:token", h.GetPublicReconciliationAct)
+	rg.POST("/shared/reconciliation/:token/respond", h.RespondReconciliationAct)
 }
 
 // registerProtectedRoutes registers routes that require authentication
@@ -1125,6 +1129,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reconciliation.PUT("/:id", middleware.RequirePermission("finance", "reconciliation", "update"), h.UpdateReconciliationAct)
 		reconciliation.DELETE("/:id", middleware.RequirePermission("finance", "reconciliation", "delete"), h.DeleteReconciliationAct)
 		reconciliation.GET("/:id/export", h.ExportReconciliationAct)
+		reconciliation.POST("/:id/send", middleware.RequirePermission("finance", "reconciliation", "update"), h.SendReconciliationAct)
 	}
 
 	// Budgets (Byudjetlashtirish)
