@@ -72,6 +72,7 @@ func (h *Handler) ListInventory(c *gin.Context) {
 			   i.created_at, i.updated_at,
 			   p.code as product_code, p.name as product_name, p.min_stock_level, p.reorder_point,
 			   w.code as warehouse_code, w.name as warehouse_name,
+			   COALESCE(w.warehouse_type, 'regular') as warehouse_type,
 			   wl.code as location_code, wl.name as location_name
 		FROM inventory i
 		JOIN products p ON i.product_id = p.id
@@ -171,6 +172,7 @@ func (h *Handler) ListInventory(c *gin.Context) {
 		WarehouseID       uuid.UUID  `json:"warehouse_id"`
 		WarehouseCode     string     `json:"warehouse_code"`
 		WarehouseName     string     `json:"warehouse_name"`
+		WarehouseType     string     `json:"warehouse_type"`
 		LocationID        *uuid.UUID `json:"location_id,omitempty"`
 		LocationCode      string     `json:"location_code,omitempty"`
 		LocationName      string     `json:"location_name,omitempty"`
@@ -199,7 +201,7 @@ func (h *Handler) ListInventory(c *gin.Context) {
 		var expiryDate, lastCountDate, lastMovementDate sql.NullTime
 		var productCode, productName string
 		var minStockLevel, reorderPoint float64
-		var warehouseCode, warehouseName string
+		var warehouseCode, warehouseName, warehouseType string
 		var locationCode, locationName sql.NullString
 
 		err := rows.Scan(
@@ -209,7 +211,7 @@ func (h *Handler) ListInventory(c *gin.Context) {
 			&i.UnitCost, &i.TotalValue, &lastCountDate, &lastMovementDate,
 			&i.CreatedAt, &i.UpdatedAt,
 			&productCode, &productName, &minStockLevel, &reorderPoint,
-			&warehouseCode, &warehouseName,
+			&warehouseCode, &warehouseName, &warehouseType,
 			&locationCode, &locationName,
 		)
 		if err != nil {
@@ -226,6 +228,7 @@ func (h *Handler) ListInventory(c *gin.Context) {
 			WarehouseID:       i.WarehouseID,
 			WarehouseCode:     warehouseCode,
 			WarehouseName:     warehouseName,
+			WarehouseType:     warehouseType,
 			QuantityOnHand:    i.QuantityOnHand,
 			QuantityReserved:  i.QuantityReserved,
 			QuantityAvailable: i.QuantityAvailable,
@@ -326,12 +329,14 @@ func (h *Handler) GetInventorySummary(c *gin.Context) {
 			   COUNT(DISTINCT i.warehouse_id) as warehouse_count
 		FROM products p
 		LEFT JOIN inventory i ON p.id = i.product_id
+			AND NOT EXISTS (SELECT 1 FROM warehouses ws WHERE ws.id = i.warehouse_id AND ws.warehouse_type = 'scrap')
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL AND p.is_active = true
 	`
 	countQuery := `
 		SELECT COUNT(DISTINCT p.id)
 		FROM products p
 		LEFT JOIN inventory i ON p.id = i.product_id
+			AND NOT EXISTS (SELECT 1 FROM warehouses ws WHERE ws.id = i.warehouse_id AND ws.warehouse_type = 'scrap')
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL AND p.is_active = true
 	`
 
