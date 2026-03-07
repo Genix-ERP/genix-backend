@@ -125,7 +125,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	// Build query
 	baseQuery := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
-			   a.code, a.name, a.description, a.currency_id, a.is_bank_account,
+			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.current_balance, a.opening_balance, a.is_active,
@@ -177,7 +177,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	if search != "" {
 		argCount++
-		searchFilter := fmt.Sprintf(" AND (a.code ILIKE $%d OR a.name ILIKE $%d)", argCount, argCount)
+		searchFilter := fmt.Sprintf(" AND (a.code ILIKE $%d OR a.name ILIKE $%d OR a.name_uz ILIKE $%d)", argCount, argCount, argCount)
 		baseQuery += searchFilter
 		countQuery += searchFilter
 		args = append(args, "%"+search+"%")
@@ -207,12 +207,12 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	accounts := make([]*entity.AccountResponse, 0)
 	for rows.Next() {
 		var acc entity.Account
-		var orgID, parentID, currencyID, description sql.NullString
+		var orgID, parentID, currencyID, description, nameUz, nameEn sql.NullString
 		var typeCode, typeName, typeCategory, normalBalance string
 
 		err := rows.Scan(
 			&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
-			&acc.Code, &acc.Name, &description, &currencyID, &acc.IsBankAccount,
+			&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
 			&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 			&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 			&acc.CreatedAt, &acc.UpdatedAt,
@@ -229,6 +229,12 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		}
 		if description.Valid {
 			acc.Description = &description.String
+		}
+		if nameUz.Valid {
+			acc.NameUz = &nameUz.String
+		}
+		if nameEn.Valid {
+			acc.NameEn = &nameEn.String
 		}
 
 		acc.AccountType = &entity.AccountType{
@@ -482,7 +488,7 @@ func (h *Handler) GetAccount(c *gin.Context) {
 
 	query := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
-			   a.code, a.name, a.description, a.currency_id, a.is_bank_account,
+			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.current_balance, a.opening_balance, a.is_active,
@@ -494,12 +500,12 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	`
 
 	var acc entity.Account
-	var orgID, parentID, currencyID, description sql.NullString
+	var orgID, parentID, currencyID, description, nameUz, nameEn sql.NullString
 	var typeCode, typeName, typeCategory, normalBalance string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
-		&acc.Code, &acc.Name, &description, &currencyID, &acc.IsBankAccount,
+		&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
 		&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 		&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 		&acc.CreatedAt, &acc.UpdatedAt,
@@ -522,6 +528,12 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	}
 	if description.Valid {
 		acc.Description = &description.String
+	}
+	if nameUz.Valid {
+		acc.NameUz = &nameUz.String
+	}
+	if nameEn.Valid {
+		acc.NameEn = &nameEn.String
 	}
 
 	acc.AccountType = &entity.AccountType{
@@ -2266,6 +2278,21 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 		}
 	}
 
+	// Validate: Cash and Bank accounts must not go negative after posting
+	for _, line := range lines {
+		var newBalance float64
+		var accountCode string
+		err = tx.QueryRow(`SELECT current_balance, code FROM accounts WHERE id = $1`, line.accountID).Scan(&newBalance, &accountCode)
+		if err != nil {
+			continue
+		}
+		// Block negative balances for cash (1000) and bank (1010, 1100) accounts
+		if (accountCode == "1000" || accountCode == "1010" || accountCode == "1100") && newBalance < -0.001 {
+			response.BadRequest(c, fmt.Sprintf("Account %s balance cannot be negative (would be %.2f)", accountCode, newBalance))
+			return
+		}
+	}
+
 	// Update entry status
 	now := time.Now()
 	_, err = tx.Exec(`
@@ -3110,7 +3137,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	}
 	if cashAccountID == uuid.Nil {
 		// Fallback: look up by name
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1100")
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1010")
 		if cashAccountID == uuid.Nil {
 			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
 		}
@@ -3122,7 +3149,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 	if paymentType == "receipt" {
 		// Inbound: customer pays us → Debit Cash, Credit AR
-		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1200")
+		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
 		journalCode = "CASH_RECEIPTS"
 		sourceType = "payment_receipt"
 		debitDesc = "Cash Receipt"

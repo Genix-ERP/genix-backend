@@ -2083,9 +2083,6 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	if journalErr == nil {
 		// Find AR account
 		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
-		if arAccountID == uuid.Nil {
-			arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1200")
-		}
 
 		if arAccountID != uuid.Nil {
 			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
