@@ -704,3 +704,225 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 
 	response.Success(c, gin.H{"message": "Payroll processed successfully"})
 }
+
+// CalculateSalaryWithDeductions calculates salary for an employee including pending deductions
+func (h *Handler) CalculateSalaryWithDeductions(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	employeeID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid employee ID")
+		return
+	}
+
+	// Get employee info
+	var firstName, lastName string
+	var baseSalary float64
+	err = h.db.QueryRow(`
+		SELECT first_name, COALESCE(last_name, ''), COALESCE(base_salary, 0)
+		FROM employees WHERE id=$1 AND tenant_id=$2
+	`, employeeID, tenantID).Scan(&firstName, &lastName, &baseSalary)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Employee")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to query employee")
+		return
+	}
+
+	employeeName := strings.TrimSpace(firstName + " " + lastName)
+
+	// Get pending deductions
+	rows, err := h.db.Query(`
+		SELECT id, amount, reason, source_type
+		FROM employee_deductions
+		WHERE employee_id=$1 AND tenant_id=$2 AND status='pending'
+		ORDER BY created_at
+	`, employeeID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to query deductions")
+		return
+	}
+	defer rows.Close()
+
+	type deductionItem struct {
+		ID         uuid.UUID `json:"id"`
+		Amount     float64   `json:"amount"`
+		Reason     string    `json:"reason"`
+		SourceType string    `json:"source_type"`
+	}
+
+	deductions := make([]deductionItem, 0)
+	totalDeduction := 0.0
+	for rows.Next() {
+		var d deductionItem
+		if err := rows.Scan(&d.ID, &d.Amount, &d.Reason, &d.SourceType); err != nil {
+			continue
+		}
+		deductions = append(deductions, d)
+		totalDeduction += d.Amount
+	}
+
+	netSalary := baseSalary - totalDeduction
+	if netSalary < 0 {
+		netSalary = 0
+	}
+
+	response.Success(c, gin.H{
+		"employee_id":     employeeID,
+		"employee_name":   employeeName,
+		"base_salary":     baseSalary,
+		"deductions":      deductions,
+		"total_deduction": totalDeduction,
+		"net_salary":      netSalary,
+	})
+}
+
+// ConfirmSalaryPayment confirms payment and marks deductions as deducted
+func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	entryID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid payroll entry ID")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
+
+	// Get the payroll entry
+	var employeeID uuid.UUID
+	var status string
+	var netSalary float64
+	err = h.db.QueryRow(`
+		SELECT employee_id, status, net_salary FROM payroll_entries
+		WHERE id=$1 AND tenant_id=$2
+	`, entryID, tenantID).Scan(&employeeID, &status, &netSalary)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Payroll entry")
+		return
+	}
+	if status == "paid" {
+		response.BadRequest(c, "Bu to'lov allaqachon tasdiqlangan")
+		return
+	}
+
+	now := time.Now()
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to begin transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Mark payroll entry as paid
+	_, err = tx.Exec(`
+		UPDATE payroll_entries SET status='paid', updated_at=$1 WHERE id=$2
+	`, now, entryID)
+	if err != nil {
+		response.InternalError(c, "Failed to update entry")
+		return
+	}
+
+	// Mark all pending deductions for this employee as deducted
+	_, err = tx.Exec(`
+		UPDATE employee_deductions SET status='deducted', payroll_entry_id=$1, deducted_at=$2, updated_at=$2
+		WHERE employee_id=$3 AND tenant_id=$4 AND status='pending'
+	`, entryID, now, employeeID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to update deductions")
+		return
+	}
+
+	// Create accounting entry: Dt 6710 (Salary expense) / Kt 4730 (Employee deduction receivable)
+	var totalDeducted float64
+	tx.QueryRow(`
+		SELECT COALESCE(SUM(amount), 0) FROM employee_deductions
+		WHERE payroll_entry_id=$1 AND status='deducted'
+	`, entryID).Scan(&totalDeducted)
+
+	if totalDeducted > 0 {
+		var orgIDPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgIDPtr = &orgID
+		}
+
+		// Find journal
+		var journalID uuid.UUID
+		var nextNumber int
+		err := h.db.QueryRow(`
+			SELECT id, COALESCE(next_number, 1) FROM journals
+			WHERE tenant_id=$1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1
+		`, tenantID).Scan(&journalID, &nextNumber)
+
+		if err == nil && journalID != uuid.Nil {
+			jeID := uuid.New()
+			entryNumber := fmt.Sprintf("DED%06d", nextNumber)
+			description := fmt.Sprintf("Ish haqi kamomad ushlab qolish: %s", entryID.String()[:8])
+
+			tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+					description, source_type, source_id, status, total_debit, total_credit,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'salary_deduction', $8, 'posted', $9, $9, $10, $11, $11)
+			`, jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+				description, entryID.String(), totalDeducted, userID, now)
+
+			// Dt 6710 — Salary expense
+			salaryAcct := findAccount(h.db, tenantID, orgIDPtr, "ish haqi", "6710")
+			if salaryAcct == uuid.Nil {
+				salaryAcct = findAccount(h.db, tenantID, orgIDPtr, "salary", "6710")
+			}
+			// Kt 4730 — Employee receivable (deduction)
+			deductAcct := findAccount(h.db, tenantID, orgIDPtr, "xodimdan undirish", "4730")
+			if deductAcct == uuid.Nil {
+				deductAcct = findAccount(h.db, tenantID, orgIDPtr, "employee receivable", "4730")
+			}
+
+			if salaryAcct != uuid.Nil && deductAcct != uuid.Nil {
+				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+					VALUES ($1, $2, $3, 'Ish haqi xarajat', $4, 0, 1, $5)`,
+					uuid.New(), jeID, salaryAcct, totalDeducted, now)
+				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+					VALUES ($1, $2, $3, 'Kamomad ushlab qolish', 0, $4, 2, $5)`,
+					uuid.New(), jeID, deductAcct, totalDeducted, now)
+
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalDeducted, now, salaryAcct)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalDeducted, now, deductAcct)
+			}
+
+			h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"success":        true,
+		"message":        "To'lov tasdiqlandi",
+		"total_deducted": totalDeducted,
+	})
+}
+
+// ConfirmSalaryPaymentByEntry is a route adapter that reads :eid param instead of :id
+func (h *Handler) ConfirmSalaryPaymentByEntry(c *gin.Context) {
+	eid := c.Param("eid")
+	c.Params = append(c.Params, gin.Param{Key: "id", Value: eid})
+	h.ConfirmSalaryPayment(c)
+}
