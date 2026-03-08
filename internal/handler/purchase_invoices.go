@@ -376,9 +376,12 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 			   pi.tax_amount, pi.total_amount, pi.amount_paid, pi.amount_due, pi.status,
 			   pi.three_way_match_status, pi.notes, pi.created_at, pi.updated_at,
 			   c.name as vendor_name,
-			   COALESCE(pi.invoice_type, 'invoice') as invoice_type, pi.original_invoice_id, pi.reason
+			   COALESCE(pi.invoice_type, 'invoice') as invoice_type, pi.original_invoice_id, pi.reason,
+			   pi.currency_id, COALESCE(pi.exchange_rate, 1) as exchange_rate,
+			   COALESCE(cur.code, '') as currency_code
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
+		LEFT JOIN currencies cur ON pi.currency_id = cur.id
 		WHERE pi.id = $1 AND pi.tenant_id = $2 AND pi.deleted_at IS NULL`
 
 	var id, tenantIDScan, vendorID uuid.UUID
@@ -389,6 +392,9 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 	var createdAt, updatedAt time.Time
 	var invoiceType string
 	var originalInvoiceID, reason sql.NullString
+	var piCurrencyID sql.NullString
+	var piExchangeRate float64
+	var piCurrencyCode string
 
 	err = h.db.QueryRow(query, invoiceID, tenantID).Scan(
 		&id, &tenantIDScan, &invoiceNumber, &vendorID, &vendorInvoiceNumber,
@@ -397,6 +403,7 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 		&threeWayMatchStatus, &notes, &createdAt, &updatedAt,
 		&vendorName,
 		&invoiceType, &originalInvoiceID, &reason,
+		&piCurrencyID, &piExchangeRate, &piCurrencyCode,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase invoice")
@@ -428,6 +435,14 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 		"updated_at":             updatedAt,
 	}
 
+	if piCurrencyID.Valid {
+		invoice["currency_id"] = piCurrencyID.String
+	}
+	invoice["exchange_rate"] = piExchangeRate
+	if piCurrencyCode != "" {
+		invoice["currency_code"] = piCurrencyCode
+	}
+
 	if vendorInvoiceNumber.Valid {
 		invoice["vendor_invoice_number"] = vendorInvoiceNumber.String
 	}
@@ -443,6 +458,126 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 	}
 	if reason.Valid {
 		invoice["reason"] = reason.String
+	}
+
+	// Get invoice lines
+	linesQuery := `
+		SELECT pil.id, pil.line_number, pil.product_id, COALESCE(NULLIF(pil.description, ''), COALESCE(p.name, '')) as description,
+			   pil.quantity, pil.unit_price, COALESCE(pil.discount_amount, 0), COALESCE(pil.tax_amount, 0),
+			   pil.line_total
+		FROM purchase_invoice_lines pil
+		LEFT JOIN products p ON p.id = pil.product_id
+		WHERE pil.purchase_invoice_id = $1
+		ORDER BY pil.line_number`
+
+	linesRows, lErr := h.db.Query(linesQuery, invoiceID)
+	if lErr == nil {
+		defer linesRows.Close()
+		var lines []map[string]interface{}
+		for linesRows.Next() {
+			var lineID uuid.UUID
+			var lineNumber int
+			var description string
+			var quantity, unitPrice, lineDiscountAmount, lineTaxAmount, lineTotal float64
+			var productID sql.NullString
+
+			if err := linesRows.Scan(&lineID, &lineNumber, &productID, &description, &quantity, &unitPrice, &lineDiscountAmount, &lineTaxAmount, &lineTotal); err != nil {
+				continue
+			}
+
+			line := map[string]interface{}{
+				"id":              lineID.String(),
+				"line_number":     lineNumber,
+				"description":     description,
+				"quantity":        quantity,
+				"unit_price":      unitPrice,
+				"discount_amount": lineDiscountAmount,
+				"tax_amount":      lineTaxAmount,
+				"line_total":      lineTotal,
+			}
+			if productID.Valid {
+				line["product_id"] = productID.String
+			}
+			lines = append(lines, line)
+		}
+		invoice["lines"] = lines
+	}
+
+	// Get payment allocations with payment details
+	paQuery := `
+		SELECT pa.id, pa.payment_id, pa.amount, p.payment_number, p.status, p.payment_date,
+			   COALESCE(p.reference, '') as reference, COALESCE(j.name, '') as journal_name
+		FROM payment_allocations pa
+		JOIN payments p ON p.id = pa.payment_id
+		LEFT JOIN journals j ON p.journal_id = j.id
+		WHERE pa.document_type = 'purchase_invoice'
+		  AND pa.document_id = $1
+		  AND p.deleted_at IS NULL
+		ORDER BY p.payment_date DESC`
+
+	paRows, paErr := h.db.Query(paQuery, invoiceID)
+	if paErr == nil {
+		defer paRows.Close()
+		var paymentAllocations []map[string]interface{}
+		for paRows.Next() {
+			var paID, paymentID uuid.UUID
+			var paAmount float64
+			var paymentNumber, pStatus, pReference, journalName string
+			var paymentDate time.Time
+
+			if err := paRows.Scan(&paID, &paymentID, &paAmount, &paymentNumber, &pStatus, &paymentDate, &pReference, &journalName); err != nil {
+				continue
+			}
+			paymentAllocations = append(paymentAllocations, map[string]interface{}{
+				"id":             paID.String(),
+				"payment_id":     paymentID.String(),
+				"amount":         paAmount,
+				"payment_number": paymentNumber,
+				"status":         pStatus,
+				"payment_date":   paymentDate.Format("2006-01-02"),
+				"reference":      pReference,
+				"journal_name":   journalName,
+			})
+		}
+		invoice["payment_allocations"] = paymentAllocations
+
+		// Query exchange diffs linked to this invoice's payments
+		if piExchangeRate != 1 {
+			var exchangeDiffs []map[string]interface{}
+			edQuery := `
+				SELECT ed.id, ed.amount_uzs, ed.diff_type, ed.period_start, ed.description
+				FROM exchange_diffs ed
+				WHERE ed.tenant_id = $1 AND ed.deleted_at IS NULL
+				  AND ed.journal_entry_id IN (
+				    SELECT p.journal_entry_id FROM payments p
+				    JOIN payment_allocations pa ON pa.payment_id = p.id
+				    WHERE pa.document_type = 'purchase_invoice' AND pa.document_id = $2 AND p.deleted_at IS NULL
+				  )
+				ORDER BY ed.period_start DESC`
+			edRows, edErr := h.db.Query(edQuery, tenantID, invoiceID)
+			if edErr == nil {
+				defer edRows.Close()
+				for edRows.Next() {
+					var edID uuid.UUID
+					var edAmount float64
+					var edType, edDesc string
+					var edDate time.Time
+					if err := edRows.Scan(&edID, &edAmount, &edType, &edDate, &edDesc); err != nil {
+						continue
+					}
+					exchangeDiffs = append(exchangeDiffs, map[string]interface{}{
+						"id":          edID.String(),
+						"amount":      edAmount,
+						"type":        edType,
+						"date":        edDate.Format("2006-01-02"),
+						"description": edDesc,
+					})
+				}
+			}
+			if len(exchangeDiffs) > 0 {
+				invoice["exchange_diffs"] = exchangeDiffs
+			}
+		}
 	}
 
 	response.Success(c, invoice)
