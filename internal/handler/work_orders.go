@@ -1432,12 +1432,11 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 				WHERE bl.bom_id = $1
 			`, bomID).Scan(&materialCost)
 
-			// Machine cost from BOM operations (setup + run time × hourly cost / capacity_per_hour)
+			// Machine cost from BOM operations (hourly_cost / capacity_per_hour per operation)
 			var machineCost float64
 			h.db.QueryRow(`
 				SELECT COALESCE(SUM(
-					(COALESCE(bo.setup_time_minutes, 0) + COALESCE(bo.run_time_minutes, 0)) / 60.0
-					* COALESCE(wc.hourly_cost, 0)
+					COALESCE(wc.hourly_cost, 0)
 					/ GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
 				), 0)
 				FROM bom_operations bo
