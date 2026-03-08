@@ -59,7 +59,7 @@ type Lead struct {
 type CreateLeadInput struct {
 	ContactName   string     `json:"contact_name" binding:"required,min=1,max=255"`
 	CompanyName   string     `json:"company_name,omitempty"`
-	Email         string     `json:"email" binding:"required,email"`
+	Email         string     `json:"email,omitempty" binding:"omitempty,email"`
 	Phone         string     `json:"phone,omitempty"`
 	Status        LeadStatus `json:"status,omitempty"`
 	Source        LeadSource `json:"source,omitempty"`

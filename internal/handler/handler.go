@@ -87,6 +87,10 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 	// Public shared reconciliation act (no auth — accessed via share token)
 	rg.GET("/shared/reconciliation/:token", h.GetPublicReconciliationAct)
 	rg.POST("/shared/reconciliation/:token/respond", h.RespondReconciliationAct)
+
+	// PBX Webhook (public - called by OnlinePBX)
+	rg.GET("/webhooks/pbx", h.PBXWebhook)
+	rg.POST("/webhooks/pbx", h.PBXWebhook)
 }
 
 // registerProtectedRoutes registers routes that require authentication
@@ -192,6 +196,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		callLogs.GET("/:id", h.GetCallLog)
 		callLogs.PUT("/:id", h.UpdateCallLog)
 		callLogs.DELETE("/:id", h.DeleteCallLog)
+	}
+
+	// PBX Integration (OnlinePBX)
+	pbx := rg.Group("/pbx")
+	{
+		pbx.GET("/config", h.GetPBXConfig)
+		pbx.POST("/config", h.SavePBXConfig)
+		pbx.POST("/test-connection", h.TestPBXConnection)
+		pbx.POST("/call", h.InitiateCall)
 	}
 
 	// Leads (CRM Lead Management)
