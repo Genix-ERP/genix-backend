@@ -152,9 +152,11 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 		var paymentTerms sql.NullInt32
 		var vendorReference, notes sql.NullString
 		var approvedAt sql.NullTime
+		var vendorID sql.NullString
+		var vendorName sql.NullString
 
 		err := rows.Scan(
-			&po.ID, &po.OrderNumber, &po.VendorID, &po.VendorName,
+			&po.ID, &po.OrderNumber, &vendorID, &vendorName,
 			&po.OrderDate, &expectedDate, &po.Subtotal, &po.DiscountAmount,
 			&po.TaxAmount, &po.ShippingAmount, &po.TotalAmount, &po.Status,
 			&po.PaymentStatus, &paymentTerms, &vendorReference, &notes,
@@ -165,6 +167,12 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 			continue
 		}
 
+		if vendorID.Valid {
+			po.VendorID, _ = uuid.Parse(vendorID.String)
+		}
+		if vendorName.Valid {
+			po.VendorName = vendorName.String
+		}
 		if expectedDate.Valid {
 			po.ExpectedDate = &expectedDate.Time
 		}
