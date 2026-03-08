@@ -428,13 +428,16 @@ func (h *Handler) CreateLead(c *gin.Context) {
 		return
 	}
 
-	// Parse optional UUID for assigned_to
+	// Parse optional UUID for assigned_to; default to current user
 	var assignedTo *uuid.UUID
 	if input.AssignedTo != "" {
 		aid, err := uuid.Parse(input.AssignedTo)
 		if err == nil {
 			assignedTo = &aid
 		}
+	}
+	if assignedTo == nil && userID != uuid.Nil {
+		assignedTo = &userID
 	}
 
 	id := uuid.New()
