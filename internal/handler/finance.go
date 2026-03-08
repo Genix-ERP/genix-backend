@@ -2908,6 +2908,8 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	contactID := c.Query("contact_id")
 	dateFrom := c.Query("date_from")
 	dateTo := c.Query("date_to")
+	method := c.Query("method")
+	search := c.Query("search")
 
 	baseQuery := `
 		SELECT p.id, p.payment_number, p.type, p.contact_id, p.payment_date, p.amount,
@@ -2918,7 +2920,7 @@ func (h *Handler) ListPayments(c *gin.Context) {
 		LEFT JOIN journals j ON p.journal_id = j.id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
 	`
-	countQuery := `SELECT COUNT(*) FROM payments p WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM payments p JOIN contacts c ON p.contact_id = c.id LEFT JOIN journals j ON p.journal_id = j.id WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -2964,6 +2966,26 @@ func (h *Handler) ListPayments(c *gin.Context) {
 		baseQuery += fmt.Sprintf(" AND p.payment_date <= $%d", argCount)
 		countQuery += fmt.Sprintf(" AND p.payment_date <= $%d", argCount)
 		args = append(args, dateTo)
+	}
+
+	// Filter by payment method (journal type: cash or bank)
+	if method != "" {
+		if method == "cash" {
+			baseQuery += " AND j.type = 'cash'"
+			countQuery += " AND j.type = 'cash'"
+		} else if method == "bank_transfer" {
+			baseQuery += " AND j.type = 'bank'"
+			countQuery += " AND j.type = 'bank'"
+		}
+	}
+
+	// Search by reference, payment number, or contact name
+	if search != "" {
+		argCount++
+		searchClause := fmt.Sprintf(" AND (p.reference ILIKE $%d OR p.payment_number ILIKE $%d OR c.name ILIKE $%d)", argCount, argCount, argCount)
+		baseQuery += searchClause
+		countQuery += searchClause
+		args = append(args, "%"+search+"%")
 	}
 
 	var total int
@@ -3027,6 +3049,25 @@ func (h *Handler) ListPayments(c *gin.Context) {
 // @Tags Finance - Payments
 // @Accept json
 // @Produce json
+// GeneratePaymentReference generates a standardized Uzbek reference string for payments
+func GeneratePaymentReference(docType, docNumber, partnerName string) string {
+	switch docType {
+	case "sales_invoice":
+		return fmt.Sprintf("%s uchun to'lov", docNumber)
+	case "purchase_invoice":
+		return fmt.Sprintf("%s uchun to'lov", docNumber)
+	case "credit_note":
+		return fmt.Sprintf("%s bo'yicha qaytarish", docNumber)
+	case "advance":
+		return fmt.Sprintf("%s — avans to'lovi", partnerName)
+	default:
+		if docNumber != "" {
+			return fmt.Sprintf("%s bo'yicha to'lov", docNumber)
+		}
+		return fmt.Sprintf("%s — to'lov", partnerName)
+	}
+}
+
 // @Param body body entity.CreatePaymentInput true "Payment creation data"
 // @Success 201 {object} response.Response
 // @Failure 400 {object} response.Response
@@ -3086,6 +3127,21 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	var reference, notes *string
 	if input.Reference != "" {
 		reference = &input.Reference
+	} else if len(input.Allocations) > 0 {
+		// Auto-generate Uzbek reference from allocation
+		alloc := input.Allocations[0]
+		var docNumber string
+		h.db.QueryRow(
+			`SELECT COALESCE(
+				(SELECT invoice_number FROM sales_invoices WHERE id = $1),
+				(SELECT invoice_number FROM purchase_invoices WHERE id = $1),
+				''
+			)`, alloc.DocumentID,
+		).Scan(&docNumber)
+		if docNumber != "" {
+			ref := GeneratePaymentReference(alloc.DocumentType, docNumber, "")
+			reference = &ref
+		}
 	}
 	if input.Notes != "" {
 		notes = &input.Notes
@@ -3112,11 +3168,19 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		}
 	}
 
+	var currencyIDPtr *uuid.UUID
+	if input.CurrencyID != nil && *input.CurrencyID != "" {
+		parsed, _ := uuid.Parse(*input.CurrencyID)
+		if parsed != uuid.Nil {
+			currencyIDPtr = &parsed
+		}
+	}
+
 	query := `
 		INSERT INTO payments (
 			id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
-			exchange_rate, reference, notes, status, bank_account_id, journal_id, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			currency_id, exchange_rate, reference, notes, status, bank_account_id, journal_id, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 	`
 
 	// Try inserting with incrementing payment number, retry on duplicate
@@ -3138,7 +3202,7 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 
 		_, err = h.db.Exec(query,
 			id, tenantID, orgIDPtr, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
-			exchangeRate, reference, notes, "draft", bankAccountID, journalIDPtr, userID, now, now)
+			currencyIDPtr, exchangeRate, reference, notes, "draft", bankAccountID, journalIDPtr, userID, now, now)
 
 		if err == nil {
 			break
@@ -3311,15 +3375,18 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 	// Get payment details
 	var status, paymentType, paymentNumber string
-	var amount float64
+	var amount, paymentExchangeRate float64
 	var contactID uuid.UUID
 	var orgID, paymentMethodID, bankAccountIDStr, storedJournalID sql.NullString
 	var paymentDate time.Time
+	var paymentCurrencyID sql.NullString
 	err = h.db.QueryRow(`
-		SELECT status, type, amount, contact_id, organization_id, payment_method_id, payment_date, payment_number, bank_account_id, journal_id
+		SELECT status, type, amount, contact_id, organization_id, payment_method_id, payment_date, payment_number, bank_account_id, journal_id,
+			COALESCE(exchange_rate, 1), currency_id
 		FROM payments
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&status, &paymentType, &amount, &contactID, &orgID, &paymentMethodID, &paymentDate, &paymentNumber, &bankAccountIDStr, &storedJournalID)
+	`, id, tenantID).Scan(&status, &paymentType, &amount, &contactID, &orgID, &paymentMethodID, &paymentDate, &paymentNumber, &bankAccountIDStr, &storedJournalID,
+		&paymentExchangeRate, &paymentCurrencyID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Payment")
@@ -3530,7 +3597,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			}
 			entryNumber := fmt.Sprintf("%s%06d", prefix, actualNum)
 
-			description := fmt.Sprintf("Payment %s confirmed", paymentNumber)
+			description := fmt.Sprintf("%s to'lov tasdiqlandi", paymentNumber)
 			journalEntryID := uuid.New()
 
 			_, jeErr := tx.Exec(`
@@ -3606,7 +3673,114 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				// Link journal entry to payment
 				tx.Exec("UPDATE payments SET journal_entry_id = $1 WHERE id = $2", journalEntryID, id)
 
-				tx.Exec("RELEASE SAVEPOINT create_payment_je")
+				// --- Exchange difference calculation ---
+			// For each allocation, check if invoice has a foreign currency rate
+			// diff = allocation_amount_foreign * (invoice_rate - payment_rate)
+			var totalExchangeDiff float64
+			for _, a := range allocations {
+				var invoiceRate float64
+				var invoiceCurrencyID sql.NullString
+				if a.DocType == "sales_invoice" {
+					_ = tx.QueryRow(
+						`SELECT COALESCE(exchange_rate, 1), currency_id FROM sales_invoices WHERE id = $1`,
+						a.DocID,
+					).Scan(&invoiceRate, &invoiceCurrencyID)
+				} else if a.DocType == "purchase_invoice" {
+					_ = tx.QueryRow(
+						`SELECT COALESCE(exchange_rate, 1), currency_id FROM purchase_invoices WHERE id = $1`,
+						a.DocID,
+					).Scan(&invoiceRate, &invoiceCurrencyID)
+				}
+				if invoiceRate > 1 && paymentExchangeRate > 1 && invoiceRate != paymentExchangeRate {
+					// allocation amount is in foreign currency; diff in base currency (UZS)
+					diff := a.Amount * (paymentExchangeRate - invoiceRate)
+					totalExchangeDiff += diff
+				}
+			}
+
+			if totalExchangeDiff != 0 {
+				// Find exchange gain/loss accounts
+				var exchangeAccountID uuid.UUID
+				var exchangeDiffDesc string
+				var exchangeDiffType string
+				if (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0) {
+					// Exchange gain
+					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "4920")
+					exchangeDiffDesc = "Valyuta kursi bo'yicha foyda"
+					exchangeDiffType = "positive"
+				} else {
+					// Exchange loss
+					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "7200")
+					exchangeDiffDesc = "Valyuta kursi bo'yicha zarar"
+					exchangeDiffType = "negative"
+				}
+
+				absDiff := totalExchangeDiff
+				if absDiff < 0 {
+					absDiff = -absDiff
+				}
+
+				if exchangeAccountID != uuid.Nil {
+					lineNum := 3
+					exchangeLineID := uuid.New()
+					if totalExchangeDiff > 0 {
+						// Positive diff: credit exchange gain account
+						tx.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, line_number, account_id, description,
+								debit_amount, credit_amount, exchange_rate, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+							exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
+							0.0, absDiff, 1.0, now,
+						)
+						// Also adjust the debit side (cash got more in base currency)
+						tx.Exec("UPDATE journal_entry_lines SET debit_amount = debit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 1", absDiff, journalEntryID)
+						tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
+					} else {
+						// Negative diff: debit exchange loss account
+						tx.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, line_number, account_id, description,
+								debit_amount, credit_amount, exchange_rate, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+							exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
+							absDiff, 0.0, 1.0, now,
+						)
+						// Adjust credit side (cash received less in base currency)
+						tx.Exec("UPDATE journal_entry_lines SET credit_amount = credit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 2", absDiff, journalEntryID)
+						tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
+					}
+					// Update exchange account balance
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3",
+						func() float64 {
+							if totalExchangeDiff > 0 {
+								return -absDiff // credit-normal income
+							}
+							return absDiff // debit-normal expense
+						}(), now, exchangeAccountID)
+
+					// Record in exchange_diffs table
+					if paymentCurrencyID.Valid {
+						currencyUUID, _ := uuid.Parse(paymentCurrencyID.String)
+						if currencyUUID != uuid.Nil {
+							tx.Exec(`
+								INSERT INTO exchange_diffs (id, tenant_id, organization_id, currency_id, amount_uzs, diff_type, period_start, period_end, journal_entry_id, description, created_by, created_at, updated_at)
+								VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+								uuid.New(), tenantID, orgIDPtr, currencyUUID, absDiff, exchangeDiffType,
+								paymentDate, paymentDate, journalEntryID,
+								fmt.Sprintf("%s — %s", paymentNumber, exchangeDiffDesc),
+								userID, now, now,
+							)
+						}
+					}
+
+					h.log.Info("Exchange difference recorded",
+						"payment_id", id, "diff", totalExchangeDiff, "type", exchangeDiffType,
+						"invoice_rate_sample", "varies", "payment_rate", paymentExchangeRate)
+				}
+			}
+
+			tx.Exec("RELEASE SAVEPOINT create_payment_je")
 			}
 		} else {
 			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)

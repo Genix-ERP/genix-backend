@@ -124,7 +124,76 @@ func (h *Handler) SyncCurrencyRates(c *gin.Context) {
 	})
 }
 func (h *Handler) RevalueCurrency(c *gin.Context)   { response.Success(c, gin.H{"message": "Currency revaluation completed"}) }
-func (h *Handler) ListExchangeDiffs(c *gin.Context) { response.Success(c, []interface{}{}) }
+func (h *Handler) ListExchangeDiffs(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	dateFrom := c.DefaultQuery("date_from", "2020-01-01")
+	dateTo := c.DefaultQuery("date_to", time.Now().Format("2006-01-02"))
+
+	query := `
+		SELECT ed.id, ed.currency_id, COALESCE(cur.code, '') as currency_code,
+			   ed.amount_uzs, ed.diff_type, ed.period_start, ed.description,
+			   ed.journal_entry_id, ed.created_at
+		FROM exchange_diffs ed
+		LEFT JOIN currencies cur ON ed.currency_id = cur.id
+		WHERE ed.tenant_id = $1 AND ed.deleted_at IS NULL
+		  AND ed.period_start >= $2 AND ed.period_start <= $3
+		ORDER BY ed.period_start DESC`
+
+	rows, err := h.db.Query(query, tenantID, dateFrom, dateTo)
+	if err != nil {
+		h.log.Error("Failed to list exchange diffs", "error", err)
+		response.InternalError(c, "Failed to list exchange diffs")
+		return
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	var totalGain, totalLoss float64
+
+	for rows.Next() {
+		var edID, currencyID uuid.UUID
+		var currencyCode, diffType, description string
+		var amount float64
+		var periodStart, createdAt time.Time
+		var journalEntryID sql.NullString
+
+		if err := rows.Scan(&edID, &currencyID, &currencyCode, &amount, &diffType, &periodStart, &description, &journalEntryID, &createdAt); err != nil {
+			continue
+		}
+
+		item := map[string]interface{}{
+			"id":            edID.String(),
+			"currency_code": currencyCode,
+			"amount":        amount,
+			"type":          diffType,
+			"date":          periodStart.Format("2006-01-02"),
+			"description":   description,
+			"created_at":    createdAt,
+		}
+		if journalEntryID.Valid {
+			item["journal_entry_id"] = journalEntryID.String
+		}
+		results = append(results, item)
+
+		if diffType == "positive" {
+			totalGain += amount
+		} else {
+			totalLoss += amount
+		}
+	}
+
+	response.Success(c, gin.H{
+		"items":      results,
+		"total_gain": totalGain,
+		"total_loss": totalLoss,
+		"net":        totalGain - totalLoss,
+	})
+}
 
 // ========== RECONCILIATION ACTS (Akt sverka) ==========
 
