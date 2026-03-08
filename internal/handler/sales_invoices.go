@@ -669,6 +669,83 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		invoice["lines"] = lines
 	}
 
+	// Get payment allocations with payment details
+	paQuery := `
+		SELECT pa.id, pa.payment_id, pa.amount, p.payment_number, p.status, p.payment_date,
+			   COALESCE(p.reference, '') as reference, COALESCE(j.name, '') as journal_name
+		FROM payment_allocations pa
+		JOIN payments p ON p.id = pa.payment_id
+		LEFT JOIN journals j ON p.journal_id = j.id
+		WHERE pa.document_type = 'sales_invoice'
+		  AND pa.document_id = $1
+		  AND p.deleted_at IS NULL
+		ORDER BY p.payment_date DESC`
+
+	paRows, paErr := h.db.Query(paQuery, invoiceID)
+	if paErr == nil {
+		defer paRows.Close()
+		var paymentAllocations []map[string]interface{}
+		for paRows.Next() {
+			var paID, paymentID uuid.UUID
+			var paAmount float64
+			var paymentNumber, pStatus, pReference, journalName string
+			var paymentDate time.Time
+
+			if err := paRows.Scan(&paID, &paymentID, &paAmount, &paymentNumber, &pStatus, &paymentDate, &pReference, &journalName); err != nil {
+				continue
+			}
+			paymentAllocations = append(paymentAllocations, map[string]interface{}{
+				"id":             paID.String(),
+				"payment_id":     paymentID.String(),
+				"amount":         paAmount,
+				"payment_number": paymentNumber,
+				"status":         pStatus,
+				"payment_date":   paymentDate.Format("2006-01-02"),
+				"reference":      pReference,
+				"journal_name":   journalName,
+			})
+		}
+		invoice["payment_allocations"] = paymentAllocations
+
+		// Query exchange diffs linked to this invoice's payments
+		if exchangeRate != 1 {
+			var exchangeDiffs []map[string]interface{}
+			edQuery := `
+				SELECT ed.id, ed.amount_uzs, ed.diff_type, ed.period_start, ed.description
+				FROM exchange_diffs ed
+				WHERE ed.tenant_id = $1 AND ed.deleted_at IS NULL
+				  AND ed.journal_entry_id IN (
+				    SELECT p.journal_entry_id FROM payments p
+				    JOIN payment_allocations pa ON pa.payment_id = p.id
+				    WHERE pa.document_type = 'sales_invoice' AND pa.document_id = $2 AND p.deleted_at IS NULL
+				  )
+				ORDER BY ed.period_start DESC`
+			edRows, edErr := h.db.Query(edQuery, tenantID, invoiceID)
+			if edErr == nil {
+				defer edRows.Close()
+				for edRows.Next() {
+					var edID uuid.UUID
+					var edAmount float64
+					var edType, edDesc string
+					var edDate time.Time
+					if err := edRows.Scan(&edID, &edAmount, &edType, &edDate, &edDesc); err != nil {
+						continue
+					}
+					exchangeDiffs = append(exchangeDiffs, map[string]interface{}{
+						"id":          edID.String(),
+						"amount":      edAmount,
+						"type":        edType,
+						"date":        edDate.Format("2006-01-02"),
+						"description": edDesc,
+					})
+				}
+			}
+			if len(exchangeDiffs) > 0 {
+				invoice["exchange_diffs"] = exchangeDiffs
+			}
+		}
+	}
+
 	response.Success(c, invoice)
 }
 
@@ -1326,10 +1403,10 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 		// Create journal entry
 		journalEntryID := uuid.New()
-		description := fmt.Sprintf("Payment received for Invoice %s", invoiceNumber)
+		description := fmt.Sprintf("%s uchun to'lov qabul qilindi", invoiceNumber)
 		reference := input.Reference
 		if reference == "" {
-			reference = invoiceNumber
+			reference = GeneratePaymentReference("sales_invoice", invoiceNumber, "")
 		}
 
 		// Use savepoint so a GL failure doesn't abort the whole transaction
@@ -1430,6 +1507,10 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 			// Create payment record
 			paymentID := uuid.New()
+			paymentRef := input.Reference
+			if paymentRef == "" {
+				paymentRef = GeneratePaymentReference("sales_invoice", invoiceNumber, "")
+			}
 			_, err = tx.Exec(`
 				INSERT INTO payments (
 					id, tenant_id, organization_id, type, payment_number, contact_id, payment_date, amount,
@@ -1437,7 +1518,7 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 					created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
 				paymentID, tenantID, organizationID, "receipt", fmt.Sprintf("REC-%s", entryNumber), customerID, paymentDate, input.Amount,
-				nil, 1.0, input.Reference, input.Notes, "confirmed", journalEntryID,
+				nil, 1.0, paymentRef, input.Notes, "confirmed", journalEntryID,
 				userID, now, now,
 			)
 
