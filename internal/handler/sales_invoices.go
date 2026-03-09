@@ -1108,13 +1108,17 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	journalEntryID := uuid.New()
 	description := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
 
+	var createdBy *uuid.UUID
+	if userID != uuid.Nil {
+		createdBy = &userID
+	}
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 		journalEntryID, tenantID, organizationID, salesJournalID, entryNumber, invoiceDate, invoiceNumber, description,
-		"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, userID, now, now,
+		"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, createdBy, now, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to create journal entry", "error", err)
@@ -1200,9 +1204,6 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output)
 		lineNumber++
 	}
-
-	// Update journal next number
-	tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
 
 	// Update invoice with journal entry ID and status
 	_, err = tx.Exec(
@@ -1424,6 +1425,10 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		// Use savepoint so a GL failure doesn't abort the whole transaction
 		tx.Exec("SAVEPOINT gl_posting")
 
+		var paymentCreatedBy *uuid.UUID
+		if userID != uuid.Nil {
+			paymentCreatedBy = &userID
+		}
 		jeTotal := input.Amount + input.WriteOffAmount + earlyDiscountApplied
 		_, err = tx.Exec(`
 			INSERT INTO journal_entries (
@@ -1431,7 +1436,7 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
 			journalEntryID, tenantID, organizationID, cashJournalID, entryNumber, paymentDate, reference, description,
-			"payment_receipt", invoiceID, 1.0, jeTotal, jeTotal, "posted", userID, now, now,
+			"payment_receipt", invoiceID, 1.0, jeTotal, jeTotal, "posted", paymentCreatedBy, now, now,
 		)
 		if err != nil {
 			h.log.Error("Failed to create payment journal entry", "error", err)
@@ -1507,9 +1512,6 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", earlyDiscountApplied, now, discountAccountID)
 				}
 			}
-
-			// Update journal next number
-			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", cashJournalID)
 
 			// Update account balances
 			// Debit Outstanding Receipts / Cash (debit-normal: increases)
@@ -1843,13 +1845,17 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 			journalEntryID := uuid.New()
 			description := fmt.Sprintf("Credit Note %s", cnNumber)
 
+			var cnCreatedBy *uuid.UUID
+			if userID != uuid.Nil {
+				cnCreatedBy = &userID
+			}
 			_, err = tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 				journalEntryID, tenantID, organizationID, salesJournalID, entryNumber, cnDate, cnNumber, description,
-				"credit_note", creditNoteID.String(), 1.0, totalAmount, totalAmount, userID, now, now,
+				"credit_note", creditNoteID.String(), 1.0, totalAmount, totalAmount, cnCreatedBy, now, now,
 			)
 			if err != nil {
 				h.log.Error("Failed to create credit note journal entry", "error", err)
@@ -1907,7 +1913,6 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
 			}
 
-			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
 			tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1 WHERE id = $2", journalEntryID, creditNoteID)
 		}
 	}
@@ -2218,7 +2223,6 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 
 		// Update invoice with journal entry ID
 		tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, updated_at = $2 WHERE id = $3", jeID, now, mi.ID)
-		tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID)
 
 		if err := tx.Commit(); err != nil {
 			continue
