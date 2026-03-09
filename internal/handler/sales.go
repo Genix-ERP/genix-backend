@@ -1303,23 +1303,36 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 				// Find stock journal or general
 				var journalID uuid.UUID
-				var nextNumber int
+				var numberPrefix sql.NullString
 				err := h.db.QueryRow(`
-					SELECT id, next_number FROM journals
+					SELECT id, number_prefix FROM journals
 					WHERE tenant_id = $1 AND type = 'sales' AND is_active = true
 					ORDER BY created_at ASC LIMIT 1
-				`, tenantID).Scan(&journalID, &nextNumber)
+				`, tenantID).Scan(&journalID, &numberPrefix)
 				if err != nil {
 					h.db.QueryRow(`
-						SELECT id, next_number FROM journals
+						SELECT id, number_prefix FROM journals
 						WHERE tenant_id = $1 AND type = 'general' AND is_active = true
 						ORDER BY created_at ASC LIMIT 1
-					`, tenantID).Scan(&journalID, &nextNumber)
+					`, tenantID).Scan(&journalID, &numberPrefix)
 				}
 
 				if journalID != uuid.Nil {
 					entryID := uuid.New()
-					entryNumber := fmt.Sprintf("SAL%06d", nextNumber)
+					prefix := "SAL"
+					if numberPrefix.Valid && numberPrefix.String != "" {
+						prefix = numberPrefix.String
+					}
+					var maxNum int
+					h.db.QueryRow(`
+						SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1
+						FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL`,
+						tenantID, journalID,
+					).Scan(&maxNum)
+					if maxNum == 0 {
+						maxNum = 1
+					}
+					entryNumber := fmt.Sprintf("%s%06d", prefix, maxNum)
 					customerName := ""
 					if soCustomerName.Valid {
 						customerName = soCustomerName.String
@@ -1334,35 +1347,40 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						}
 					}
 
-					h.db.Exec(`
+					if _, err := h.db.Exec(`
 						INSERT INTO journal_entries (
 							id, tenant_id, organization_id, journal_id, entry_number,
 							entry_date, description, source_type, source_id, status, total_debit, total_credit,
 							created_at, updated_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'sales_order', $8, 'posted', $9, $9, $10, $10)
 					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
-						now, description, orderID.String(), totalCost, now)
-
+						now, description, orderID.String(), totalCost, now); err != nil {
+						h.log.Error("Stock movement JE INSERT failed", "error", err, "entry_number", entryNumber)
+					} else {
 					lineNumber := 1
 					for pair, amount := range grouped {
 						// Debit: Stock Interim Delivery
 						debitLineID := uuid.New()
-						h.db.Exec(`
+						if _, err := h.db.Exec(`
 							INSERT INTO journal_entry_lines (
 								id, journal_entry_id, account_id, contact_id, description,
 								debit_amount, credit_amount, line_number, created_at
 							) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
-						`, debitLineID, entryID, pair.Debit, contactID, "Stock Interim Delivery", amount, lineNumber, now)
+						`, debitLineID, entryID, pair.Debit, contactID, "Stock Interim Delivery", amount, lineNumber, now); err != nil {
+							h.log.Error("Stock movement JE debit line INSERT failed", "error", err)
+						}
 						lineNumber++
 
 						// Credit: Stock Valuation
 						creditLineID := uuid.New()
-						h.db.Exec(`
+						if _, err := h.db.Exec(`
 							INSERT INTO journal_entry_lines (
 								id, journal_entry_id, account_id, contact_id, description,
 								debit_amount, credit_amount, line_number, created_at
 							) VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)
-						`, creditLineID, entryID, pair.Credit, contactID, "Stock Valuation", amount, lineNumber, now)
+						`, creditLineID, entryID, pair.Credit, contactID, "Stock Valuation", amount, lineNumber, now); err != nil {
+							h.log.Error("Stock movement JE credit line INSERT failed", "error", err)
+						}
 						lineNumber++
 
 						// Update account balances
@@ -1370,10 +1388,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Credit)
 					}
 
-					// Update journal next_number
-					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
-
 					h.log.Info("Stock movement JE created for SO shipped (Odoo-style)", "entry_id", entryID, "cost", totalCost)
+					}
 				}
 			}
 		}
@@ -2138,13 +2154,12 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	// Get Sales Journal
 	var salesJournalID uuid.UUID
-	var nextNumber int
 	var numberPrefix sql.NullString
 	journalErr := tx.QueryRow(`
-		SELECT id, COALESCE(next_number, 1), number_prefix
+		SELECT id, number_prefix
 		FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
 		tenantID,
-	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
+	).Scan(&salesJournalID, &numberPrefix)
 
 	if journalErr == nil {
 		// Find AR account
@@ -2219,12 +2234,27 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				revenueGrouped[fallbackRevenue] = subtotal
 			}
 
-			// Generate entry number
+			// Generate entry number using MAX-based approach to avoid duplicate constraint violations
 			prefix := ""
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
 			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+			var maxNum int
+			if prefix != "" {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
+					tenantID, salesJournalID, prefix+"%",
+				).Scan(&maxNum)
+			} else {
+				_ = tx.QueryRow(
+					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
+					tenantID, salesJournalID,
+				).Scan(&maxNum)
+			}
+			if maxNum == 0 {
+				maxNum = 1
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, maxNum)
 
 			// Total COGS
 			var totalCogs float64
@@ -2239,13 +2269,17 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			journalEntryID = &jeID
 			jeDescription := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
 
+			var createdBy *uuid.UUID
+			if userID != uuid.Nil {
+				createdBy = &userID
+			}
 			_, jeErr := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 				jeID, tenantID, organizationID, salesJournalID, entryNumber, now, invoiceNumber, jeDescription,
-				"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, userID, now, now,
+				"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, createdBy, now, now,
 			)
 			if jeErr != nil {
 				h.log.Error("CreateInvoiceFromOrder: journal entry INSERT failed", "error", jeErr)
@@ -2339,11 +2373,6 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 					h.log.Error("CreateInvoiceFromOrder: update stock output balance failed", "error", err, "outputAcct", pair.Output)
 				}
 				jeLineNumber++
-			}
-
-			// Update journal next number
-			if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID); err != nil {
-				h.log.Error("CreateInvoiceFromOrder: update journal next_number failed", "error", err)
 			}
 
 			// Link JE to invoice
