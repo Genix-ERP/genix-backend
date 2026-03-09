@@ -252,7 +252,12 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 	query := `
 		SELECT ed.id, ed.currency_id, COALESCE(cur.code, '') as currency_code,
 			   ed.amount_uzs, ed.diff_type, ed.period_start, ed.description,
-			   ed.journal_entry_id, ed.created_at
+			   ed.journal_entry_id, ed.created_at,
+			   COALESCE(ed.document_number, '') as document_number,
+			   COALESCE(ed.counterparty_name, '') as counterparty_name,
+			   COALESCE(ed.foreign_amount, 0) as foreign_amount,
+			   COALESCE(ed.initial_rate, 0) as initial_rate,
+			   COALESCE(ed.final_rate, 0) as final_rate
 		FROM exchange_diffs ed
 		LEFT JOIN currencies cur ON ed.currency_id = cur.id
 		WHERE ed.tenant_id = $1 AND ed.deleted_at IS NULL
@@ -273,22 +278,29 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 	for rows.Next() {
 		var edID, currencyID uuid.UUID
 		var currencyCode, diffType, description string
-		var amount float64
+		var documentNumber, counterpartyName string
+		var amount, foreignAmount, initialRate, finalRate float64
 		var periodStart, createdAt time.Time
 		var journalEntryID sql.NullString
 
-		if err := rows.Scan(&edID, &currencyID, &currencyCode, &amount, &diffType, &periodStart, &description, &journalEntryID, &createdAt); err != nil {
+		if err := rows.Scan(&edID, &currencyID, &currencyCode, &amount, &diffType, &periodStart, &description, &journalEntryID, &createdAt,
+			&documentNumber, &counterpartyName, &foreignAmount, &initialRate, &finalRate); err != nil {
 			continue
 		}
 
 		item := map[string]interface{}{
-			"id":            edID.String(),
-			"currency_code": currencyCode,
-			"amount":        amount,
-			"type":          diffType,
-			"date":          periodStart.Format("2006-01-02"),
-			"description":   description,
-			"created_at":    createdAt,
+			"id":                edID.String(),
+			"currency_code":    currencyCode,
+			"amount":           amount,
+			"type":             diffType,
+			"date":             periodStart.Format("2006-01-02"),
+			"description":      description,
+			"created_at":       createdAt,
+			"document_number":  documentNumber,
+			"counterparty":     counterpartyName,
+			"foreign_amount":   foreignAmount,
+			"initial_rate":     initialRate,
+			"final_rate":       finalRate,
 		}
 		if journalEntryID.Valid {
 			item["journal_entry_id"] = journalEntryID.String
