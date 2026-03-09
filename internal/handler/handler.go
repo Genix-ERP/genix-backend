@@ -1128,6 +1128,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		currencyOps.GET("/rates", h.ListExchangeDiffs)
 		currencyOps.POST("/rates/sync", middleware.RequirePermission("finance", "currency", "create"), h.SyncCurrencyRates)
 		currencyOps.POST("/revalue", middleware.RequirePermission("finance", "currency", "create"), h.RevalueCurrency)
+		currencyOps.GET("/debt-report", h.CurrencyDebtReport)
 	}
 
 	// Reconciliation Acts (Akt sverka)

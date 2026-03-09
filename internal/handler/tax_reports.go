@@ -20,6 +20,7 @@ type TaxReportPeriod struct {
 	PeriodType         string     `json:"period_type"`
 	StartDate          string     `json:"start_date"`
 	EndDate            string     `json:"end_date"`
+	Deadline           *string    `json:"deadline,omitempty"`
 	Status             string     `json:"status"`
 	TotalSales         float64    `json:"total_sales"`
 	TotalSalesTax      float64    `json:"total_sales_tax"`
@@ -76,6 +77,37 @@ type TaxTransaction struct {
 	CreatedAt             time.Time  `json:"created_at"`
 }
 
+// autoCreateTaxPeriods creates quarterly + yearly tax periods for the given year if they don't exist
+func (h *Handler) autoCreateTaxPeriods(tenantID uuid.UUID, year int) {
+	type periodDef struct {
+		name      string
+		pType     string
+		startDate string
+		endDate   string
+		deadline  string
+	}
+
+	periods := []periodDef{
+		{fmt.Sprintf("I Chorak %d", year), "quarterly", fmt.Sprintf("%d-01-01", year), fmt.Sprintf("%d-03-31", year), fmt.Sprintf("%d-04-25", year)},
+		{fmt.Sprintf("II Chorak %d", year), "quarterly", fmt.Sprintf("%d-04-01", year), fmt.Sprintf("%d-06-30", year), fmt.Sprintf("%d-07-25", year)},
+		{fmt.Sprintf("III Chorak %d", year), "quarterly", fmt.Sprintf("%d-07-01", year), fmt.Sprintf("%d-09-30", year), fmt.Sprintf("%d-10-25", year)},
+		{fmt.Sprintf("IV Chorak %d", year), "quarterly", fmt.Sprintf("%d-10-01", year), fmt.Sprintf("%d-12-31", year), fmt.Sprintf("%d-01-25", year+1)},
+		{fmt.Sprintf("Yillik %d", year), "yearly", fmt.Sprintf("%d-01-01", year), fmt.Sprintf("%d-12-31", year), fmt.Sprintf("%d-04-01", year+1)},
+	}
+
+	for _, p := range periods {
+		// Only insert if not already exists (UNIQUE constraint on tenant_id, period_type, start_date)
+		_, err := h.db.Exec(`
+			INSERT INTO tax_report_periods (id, tenant_id, name, period_type, start_date, end_date, deadline, status, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft', NOW(), NOW())
+			ON CONFLICT (tenant_id, period_type, start_date) DO NOTHING
+		`, uuid.New(), tenantID, p.name, p.pType, p.startDate, p.endDate, p.deadline)
+		if err != nil {
+			h.log.Error("Failed to auto-create tax period", "error", err, "name", p.name)
+		}
+	}
+}
+
 // ListTaxReportPeriods returns all tax report periods for the tenant
 func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -84,6 +116,10 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 		return
 	}
 
+	// Auto-create quarterly + yearly periods for current year
+	currentYear := time.Now().Year()
+	h.autoCreateTaxPeriods(tenantID, currentYear)
+
 	periodType := c.Query("period_type")
 	status := c.Query("status")
 	year := c.Query("year")
@@ -91,7 +127,7 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 	query := `
 		SELECT
 			trp.id, trp.tenant_id, trp.name, trp.period_type, trp.start_date, trp.end_date,
-			trp.status, trp.total_sales, trp.total_sales_tax, trp.total_purchases, trp.total_purchase_tax,
+			trp.deadline, trp.status, trp.total_sales, trp.total_sales_tax, trp.total_purchases, trp.total_purchase_tax,
 			trp.net_tax_liability, trp.filing_reference, trp.filed_date, trp.filed_by,
 			uf.first_name || ' ' || uf.last_name as filed_by_name,
 			trp.notes, trp.created_by,
@@ -137,6 +173,7 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 	for rows.Next() {
 		var p TaxReportPeriod
 		var startDate, endDate time.Time
+		var deadline sql.NullTime
 		var filingRef, notes sql.NullString
 		var filedDate sql.NullTime
 		var filedByID, createdByID sql.NullString
@@ -144,7 +181,7 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 
 		err := rows.Scan(
 			&p.ID, &p.TenantID, &p.Name, &p.PeriodType, &startDate, &endDate,
-			&p.Status, &p.TotalSales, &p.TotalSalesTax, &p.TotalPurchases, &p.TotalPurchaseTax,
+			&deadline, &p.Status, &p.TotalSales, &p.TotalSalesTax, &p.TotalPurchases, &p.TotalPurchaseTax,
 			&p.NetTaxLiability, &filingRef, &filedDate, &filedByID,
 			&filedByName, &notes, &createdByID, &createdByName,
 			&p.CreatedAt, &p.UpdatedAt,
@@ -156,6 +193,10 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 
 		p.StartDate = startDate.Format("2006-01-02")
 		p.EndDate = endDate.Format("2006-01-02")
+		if deadline.Valid {
+			dl := deadline.Time.Format("2006-01-02")
+			p.Deadline = &dl
+		}
 
 		if filingRef.Valid {
 			p.FilingReference = &filingRef.String
@@ -205,6 +246,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 	// Get period
 	var p TaxReportPeriod
 	var startDate, endDate time.Time
+	var deadline sql.NullTime
 	var filingRef, notes sql.NullString
 	var filedDate sql.NullTime
 	var filedByID, createdByID sql.NullString
@@ -213,7 +255,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 	err = h.db.QueryRow(`
 		SELECT
 			trp.id, trp.tenant_id, trp.name, trp.period_type, trp.start_date, trp.end_date,
-			trp.status, trp.total_sales, trp.total_sales_tax, trp.total_purchases, trp.total_purchase_tax,
+			trp.deadline, trp.status, trp.total_sales, trp.total_sales_tax, trp.total_purchases, trp.total_purchase_tax,
 			trp.net_tax_liability, trp.filing_reference, trp.filed_date, trp.filed_by,
 			uf.first_name || ' ' || uf.last_name,
 			trp.notes, trp.created_by,
@@ -225,7 +267,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 		WHERE trp.id = $1 AND trp.tenant_id = $2
 	`, periodID, tenantID).Scan(
 		&p.ID, &p.TenantID, &p.Name, &p.PeriodType, &startDate, &endDate,
-		&p.Status, &p.TotalSales, &p.TotalSalesTax, &p.TotalPurchases, &p.TotalPurchaseTax,
+		&deadline, &p.Status, &p.TotalSales, &p.TotalSalesTax, &p.TotalPurchases, &p.TotalPurchaseTax,
 		&p.NetTaxLiability, &filingRef, &filedDate, &filedByID,
 		&filedByName, &notes, &createdByID, &createdByName,
 		&p.CreatedAt, &p.UpdatedAt,
@@ -242,6 +284,10 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 
 	p.StartDate = startDate.Format("2006-01-02")
 	p.EndDate = endDate.Format("2006-01-02")
+	if deadline.Valid {
+		dl := deadline.Time.Format("2006-01-02")
+		p.Deadline = &dl
+	}
 
 	if filingRef.Valid {
 		p.FilingReference = &filingRef.String
@@ -665,33 +711,45 @@ func (h *Handler) GetTaxReportSummary(c *gin.Context) {
 
 	startDate := c.Query("start_date")
 	endDate := c.Query("end_date")
-
-	if startDate == "" || endDate == "" {
-		// Default to current month
-		now := time.Now()
-		startDate = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
-		endDate = time.Date(now.Year(), now.Month()+1, 0, 0, 0, 0, 0, time.UTC).Format("2006-01-02")
-	}
+	hasDates := startDate != "" && endDate != ""
 
 	// Get sales tax summary
 	var totalSales, totalSalesTax float64
 	var salesCount int
-	h.db.QueryRow(`
-		SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
-		FROM sales_invoices
-		WHERE tenant_id = $1 AND invoice_date >= $2 AND invoice_date <= $3
-			AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
-	`, tenantID, startDate, endDate).Scan(&totalSales, &totalSalesTax, &salesCount)
+	if hasDates {
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
+			FROM sales_invoices
+			WHERE tenant_id = $1 AND invoice_date >= $2 AND invoice_date <= $3
+				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
+		`, tenantID, startDate, endDate).Scan(&totalSales, &totalSalesTax, &salesCount)
+	} else {
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
+			FROM sales_invoices
+			WHERE tenant_id = $1
+				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
+		`, tenantID).Scan(&totalSales, &totalSalesTax, &salesCount)
+	}
 
 	// Get purchase tax summary
 	var totalPurchases, totalPurchaseTax float64
 	var purchaseCount int
-	h.db.QueryRow(`
-		SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
-		FROM purchase_invoices
-		WHERE tenant_id = $1 AND invoice_date >= $2 AND invoice_date <= $3
-			AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
-	`, tenantID, startDate, endDate).Scan(&totalPurchases, &totalPurchaseTax, &purchaseCount)
+	if hasDates {
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
+			FROM purchase_invoices
+			WHERE tenant_id = $1 AND invoice_date >= $2 AND invoice_date <= $3
+				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
+		`, tenantID, startDate, endDate).Scan(&totalPurchases, &totalPurchaseTax, &purchaseCount)
+	} else {
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
+			FROM purchase_invoices
+			WHERE tenant_id = $1
+				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
+		`, tenantID).Scan(&totalPurchases, &totalPurchaseTax, &purchaseCount)
+	}
 
 	// Get filed periods count
 	var filedCount int
@@ -742,16 +800,14 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 	endDate := c.Query("end_date")
 	txType := c.Query("type") // sales, purchases
 
-	if startDate == "" || endDate == "" {
-		response.BadRequest(c, "start_date and end_date are required")
-		return
-	}
+	// Build date filter clause and args dynamically
+	hasDates := startDate != "" && endDate != ""
 
 	transactions := make([]map[string]interface{}, 0)
 
 	if txType == "" || txType == "sales" {
 		// Get sales invoices
-		salesRows, err := h.db.Query(`
+		salesQuery := `
 			SELECT
 				si.id, 'sales_invoice' as type, si.invoice_number, si.invoice_date,
 				'customer' as party_type, si.customer_id, si.customer_name,
@@ -761,10 +817,15 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 			FROM sales_invoices si
 			LEFT JOIN contacts c ON c.id = si.customer_id
 			LEFT JOIN tax_rates tr ON tr.id = si.tax_rate_id
-			WHERE si.tenant_id = $1 AND si.invoice_date >= $2 AND si.invoice_date <= $3
-				AND si.status NOT IN ('draft', 'cancelled') AND si.deleted_at IS NULL
-			ORDER BY si.invoice_date DESC
-		`, tenantID, startDate, endDate)
+			WHERE si.tenant_id = $1
+				AND si.status NOT IN ('draft', 'cancelled') AND si.deleted_at IS NULL`
+		salesArgs := []interface{}{tenantID}
+		if hasDates {
+			salesQuery += ` AND si.invoice_date >= $2 AND si.invoice_date <= $3`
+			salesArgs = append(salesArgs, startDate, endDate)
+		}
+		salesQuery += ` ORDER BY si.invoice_date DESC`
+		salesRows, err := h.db.Query(salesQuery, salesArgs...)
 
 		if err == nil {
 			defer salesRows.Close()
@@ -811,7 +872,7 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 
 	if txType == "" || txType == "purchases" {
 		// Get purchase invoices
-		purchaseRows, err := h.db.Query(`
+		purchaseQuery := `
 			SELECT
 				pi.id, 'purchase_invoice' as type, pi.invoice_number, pi.invoice_date,
 				'vendor' as party_type, pi.vendor_id, pi.vendor_name,
@@ -821,10 +882,15 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 			FROM purchase_invoices pi
 			LEFT JOIN contacts c ON c.id = pi.vendor_id
 			LEFT JOIN tax_rates tr ON tr.id = pi.tax_rate_id
-			WHERE pi.tenant_id = $1 AND pi.invoice_date >= $2 AND pi.invoice_date <= $3
-				AND pi.status NOT IN ('draft', 'cancelled') AND pi.deleted_at IS NULL
-			ORDER BY pi.invoice_date DESC
-		`, tenantID, startDate, endDate)
+			WHERE pi.tenant_id = $1
+				AND pi.status NOT IN ('draft', 'cancelled') AND pi.deleted_at IS NULL`
+		purchaseArgs := []interface{}{tenantID}
+		if hasDates {
+			purchaseQuery += ` AND pi.invoice_date >= $2 AND pi.invoice_date <= $3`
+			purchaseArgs = append(purchaseArgs, startDate, endDate)
+		}
+		purchaseQuery += ` ORDER BY pi.invoice_date DESC`
+		purchaseRows, err := h.db.Query(purchaseQuery, purchaseArgs...)
 
 		if err == nil {
 			defer purchaseRows.Close()
