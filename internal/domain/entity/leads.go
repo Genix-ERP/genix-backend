@@ -106,6 +106,8 @@ type LeadResponse struct {
 	AssignedToName *string    `json:"assigned_to_name,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
+	LastModifiedBy *string    `json:"last_modified_by,omitempty"`
+	LastModifiedAt *time.Time `json:"last_modified_at,omitempty"`
 }
 
 // LeadStats represents aggregated lead statistics
