@@ -553,11 +553,12 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	var po entity.PurchaseOrderResponse
 	var expectedDate, approvedAt sql.NullTime
 	var contactPersonID sql.NullString
+	var vendorID, vendorName sql.NullString
 	var paymentTerms sql.NullInt32
 	var vendorReference, notes sql.NullString
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
-		&po.ID, &po.OrderNumber, &po.VendorID, &po.VendorName,
+		&po.ID, &po.OrderNumber, &vendorID, &vendorName,
 		&contactPersonID, &po.OrderDate, &expectedDate,
 		&po.Subtotal, &po.DiscountAmount, &po.TaxAmount, &po.ShippingAmount,
 		&po.TotalAmount, &po.Status, &po.PaymentStatus, &paymentTerms,
@@ -574,6 +575,14 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	if vendorID.Valid {
+		if vid, err := uuid.Parse(vendorID.String); err == nil {
+			po.VendorID = vid
+		}
+	}
+	if vendorName.Valid {
+		po.VendorName = vendorName.String
+	}
 	if expectedDate.Valid {
 		po.ExpectedDate = &expectedDate.Time
 	}
@@ -642,6 +651,7 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
+			h.log.Error("Failed to scan PO line", "error", err, "po_id", id)
 			continue
 		}
 

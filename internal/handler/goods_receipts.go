@@ -990,7 +990,14 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 		lineNumber := 1
 		for _, line := range jeLines {
 			ca := getCategoryAccounts(h.db, tenantID, orgIDPtr, line.productID)
-			debitAcct := ca.StockValuationAccountID
+			// Prefer inventory-type account (1310/1330/1340), fallback to category valuation, then generic 1300
+			invAcct := getInventoryAccountByType(h.db, tenantID, orgIDPtr, line.productID)
+			var debitAcct uuid.UUID
+			if invAcct != uuid.Nil {
+				debitAcct = invAcct
+			} else {
+				debitAcct = ca.StockValuationAccountID
+			}
 			creditAcct := ca.StockInputAccountID
 
 			if debitAcct == uuid.Nil {

@@ -25,6 +25,18 @@ type WorkCenter struct {
 	HourlyCost          float64    `json:"hourly_cost" db:"hourly_cost"`
 	SetupCost           float64    `json:"setup_cost" db:"setup_cost"`
 	OverheadCost        float64    `json:"overhead_cost" db:"overhead_cost"`
+	// Cost breakdown input fields
+	AssetValue            float64  `json:"asset_value" db:"asset_value"`
+	UsefulLifeYears       float64  `json:"useful_life_years" db:"useful_life_years"`
+	PowerKW               float64  `json:"power_kw" db:"power_kw"`
+	ElectricityRate       float64  `json:"electricity_rate" db:"electricity_rate"`
+	AnnualMaintenance     float64  `json:"annual_maintenance" db:"annual_maintenance"`
+	OperatorMonthlySalary float64  `json:"operator_monthly_salary" db:"operator_monthly_salary"`
+	// Calculated per-hour components
+	DepreciationPerHour   float64  `json:"depreciation_per_hour" db:"depreciation_per_hour"`
+	ElectricityPerHour    float64  `json:"electricity_per_hour" db:"electricity_per_hour"`
+	MaintenancePerHour    float64  `json:"maintenance_per_hour" db:"maintenance_per_hour"`
+	LaborPerHour          float64  `json:"labor_per_hour" db:"labor_per_hour"`
 	Currency            string     `json:"currency" db:"currency"`
 	Status              string     `json:"status" db:"status"`
 	IsAvailable         bool       `json:"is_available" db:"is_available"`
@@ -53,6 +65,13 @@ type WorkCenterInput struct {
 	HourlyCost          *float64   `json:"hourly_cost,omitempty"`
 	SetupCost           *float64   `json:"setup_cost,omitempty"`
 	OverheadCost        *float64   `json:"overhead_cost,omitempty"`
+	// Cost breakdown input fields
+	AssetValue            *float64 `json:"asset_value,omitempty"`
+	UsefulLifeYears       *float64 `json:"useful_life_years,omitempty"`
+	PowerKW               *float64 `json:"power_kw,omitempty"`
+	ElectricityRate       *float64 `json:"electricity_rate,omitempty"`
+	AnnualMaintenance     *float64 `json:"annual_maintenance,omitempty"`
+	OperatorMonthlySalary *float64 `json:"operator_monthly_salary,omitempty"`
 	Currency            *string    `json:"currency,omitempty"`
 	Status              *string    `json:"status,omitempty"`
 	IsAvailable         *bool      `json:"is_available,omitempty"`
@@ -75,6 +94,17 @@ type WorkCenterResponse struct {
 	HourlyCost          float64    `json:"hourly_cost"`
 	SetupCost           float64    `json:"setup_cost"`
 	OverheadCost        float64    `json:"overhead_cost"`
+	// Cost breakdown fields
+	AssetValue            float64  `json:"asset_value"`
+	UsefulLifeYears       float64  `json:"useful_life_years"`
+	PowerKW               float64  `json:"power_kw"`
+	ElectricityRate       float64  `json:"electricity_rate"`
+	AnnualMaintenance     float64  `json:"annual_maintenance"`
+	OperatorMonthlySalary float64  `json:"operator_monthly_salary"`
+	DepreciationPerHour   float64  `json:"depreciation_per_hour"`
+	ElectricityPerHour    float64  `json:"electricity_per_hour"`
+	MaintenancePerHour    float64  `json:"maintenance_per_hour"`
+	LaborPerHour          float64  `json:"labor_per_hour"`
 	Currency            string     `json:"currency"`
 	Status              string     `json:"status"`
 	IsAvailable         bool       `json:"is_available"`

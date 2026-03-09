@@ -753,12 +753,15 @@ type TrialBalanceReport struct {
 
 // TrialBalanceAccount represents a single account in trial balance
 type TrialBalanceAccount struct {
-	AccountID     uuid.UUID `json:"account_id"`
-	AccountCode   string    `json:"account_code"`
-	AccountName   string    `json:"account_name"`
-	Category      string    `json:"category"`
-	DebitBalance  float64   `json:"debit_balance"`
-	CreditBalance float64   `json:"credit_balance"`
+	AccountID     uuid.UUID              `json:"account_id"`
+	AccountCode   string                 `json:"account_code"`
+	AccountName   string                 `json:"account_name"`
+	Category      string                 `json:"category"`
+	DebitBalance  float64                `json:"debit_balance"`
+	CreditBalance float64                `json:"credit_balance"`
+	ParentID      *uuid.UUID             `json:"parent_id,omitempty"`
+	IsParent      bool                   `json:"is_parent,omitempty"`
+	Children      []TrialBalanceAccount  `json:"children,omitempty"`
 }
 
 // BalanceSheetReport represents balance sheet data
@@ -789,18 +792,20 @@ type BalanceSheetAccount struct {
 
 // IncomeStatementReport represents income statement (P&L) data
 type IncomeStatementReport struct {
-	PeriodFrom       string                    `json:"period_from"`
-	PeriodTo         string                    `json:"period_to"`
-	TotalRevenue     float64                   `json:"total_revenue"`
-	TotalExpenses    float64                   `json:"total_expenses"`
-	GrossProfit      float64                   `json:"gross_profit"`
-	OperatingProfit  float64                   `json:"operating_profit"`
-	NetIncome        float64                   `json:"net_income"`
-	Revenue          []IncomeStatementSection  `json:"revenue"`
-	CostOfSales      []IncomeStatementSection  `json:"cost_of_sales"`
+	PeriodFrom        string                   `json:"period_from"`
+	PeriodTo          string                   `json:"period_to"`
+	TotalRevenue      float64                  `json:"total_revenue"`
+	TotalExpenses     float64                  `json:"total_expenses"`
+	GrossProfit       float64                  `json:"gross_profit"`
+	OperatingProfit   float64                  `json:"operating_profit"`
+	PreTaxProfit      float64                  `json:"pre_tax_profit"`
+	IncomeTax         float64                  `json:"income_tax"`
+	NetIncome         float64                  `json:"net_income"`
+	Revenue           []IncomeStatementSection `json:"revenue"`
+	CostOfSales       []IncomeStatementSection `json:"cost_of_sales"`
 	OperatingExpenses []IncomeStatementSection `json:"operating_expenses"`
-	OtherIncome      []IncomeStatementSection  `json:"other_income"`
-	OtherExpenses    []IncomeStatementSection  `json:"other_expenses"`
+	OtherIncome       []IncomeStatementSection `json:"other_income"`
+	OtherExpenses     []IncomeStatementSection `json:"other_expenses"`
 }
 
 // IncomeStatementSection represents a section in income statement

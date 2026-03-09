@@ -909,6 +909,7 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		{"2220", "Income Tax Payable", "ST_LIAB", false, false, false, "Income tax payable"},
 		{"2230", "Stock Interim Receipt", "ST_LIAB", false, false, false, "Interim account for goods received not yet invoiced"},
 		{"2231", "Stock Interim Delivery", "ST_LIAB", false, false, false, "Interim account for goods delivered not yet invoiced"},
+		{"2590", "Accrued Machine Costs", "ST_LIAB", false, false, false, "Accrued liabilities for machine hour costs in production"},
 		{"2300", "Unearned Revenue", "ST_LIAB", false, false, false, "Deferred revenue"},
 		{"2400", "Short-term Loans", "ST_LIAB", false, false, true, "Short-term borrowings"},
 		{"2500", "Long-term Loans", "LT_LIAB", false, false, true, "Long-term borrowings"},
@@ -977,6 +978,17 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 			h.log.Error("Failed to create default account", "error", err, "code", acc.code)
 		}
 	}
+
+	// Set parent_id for inventory sub-accounts (1310/1320/1330/1340 → parent 1300)
+	h.db.Exec(`
+		UPDATE accounts SET parent_id = (
+			SELECT id FROM accounts a2
+			WHERE a2.tenant_id = accounts.tenant_id AND a2.organization_id = accounts.organization_id
+			AND a2.code = '1300' AND a2.deleted_at IS NULL LIMIT 1
+		)
+		WHERE tenant_id = $1 AND organization_id = $2
+		AND code IN ('1310', '1320', '1330', '1340') AND parent_id IS NULL
+	`, tenantID, orgID)
 
 	h.log.Info("Created default chart of accounts", "tenant_id", tenantID, "org_id", orgID, "account_count", len(defaultAccounts))
 	return nil
