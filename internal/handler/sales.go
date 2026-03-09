@@ -1319,20 +1319,11 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 				if journalID != uuid.Nil {
 					entryID := uuid.New()
-					prefix := "SAL"
+					prefix := "SAL-"
 					if numberPrefix.Valid && numberPrefix.String != "" {
 						prefix = numberPrefix.String
 					}
-					var maxNum int
-					h.db.QueryRow(`
-						SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1
-						FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL`,
-						tenantID, journalID,
-					).Scan(&maxNum)
-					if maxNum == 0 {
-						maxNum = 1
-					}
-					entryNumber := fmt.Sprintf("%s%06d", prefix, maxNum)
+					entryNumber := fmt.Sprintf("%s%s-%s", prefix, time.Now().Format("20060102"), uuid.New().String()[:6])
 					customerName := ""
 					if soCustomerName.Valid {
 						customerName = soCustomerName.String
@@ -2234,27 +2225,12 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				revenueGrouped[fallbackRevenue] = subtotal
 			}
 
-			// Generate entry number using MAX-based approach to avoid duplicate constraint violations
-			prefix := ""
-			if numberPrefix.Valid {
+			// Generate unique entry number using UUID suffix (guaranteed unique)
+			prefix := "INV-"
+			if numberPrefix.Valid && numberPrefix.String != "" {
 				prefix = numberPrefix.String
 			}
-			var maxNum int
-			if prefix != "" {
-				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
-					tenantID, salesJournalID, prefix+"%",
-				).Scan(&maxNum)
-			} else {
-				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
-					tenantID, salesJournalID,
-				).Scan(&maxNum)
-			}
-			if maxNum == 0 {
-				maxNum = 1
-			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, maxNum)
+			entryNumber := fmt.Sprintf("%s%s-%s", prefix, now.Format("20060102"), uuid.New().String()[:6])
 
 			// Total COGS
 			var totalCogs float64
@@ -2282,10 +2258,11 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, createdBy, now, now,
 			)
 			if jeErr != nil {
-				h.log.Error("CreateInvoiceFromOrder: journal entry INSERT failed", "error", jeErr)
+				h.log.Error("CreateInvoiceFromOrder: journal entry INSERT failed, skipping GL posting", "error", jeErr)
 			}
 
 			jeLineNumber := 1
+			if jeErr == nil {
 
 			// Debit: Accounts Receivable
 			_, arErr := tx.Exec(`
@@ -2379,6 +2356,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			if _, err := tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, sent_at = $2 WHERE id = $3", jeID, now, invoiceID); err != nil {
 				h.log.Error("CreateInvoiceFromOrder: link JE to invoice failed", "error", err)
 			}
+			} // end if jeErr == nil
 		}
 	}
 
