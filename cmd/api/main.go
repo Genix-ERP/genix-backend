@@ -114,6 +114,9 @@ func main() {
 	// Start workflow automation scheduler (checks thresholds every 15 minutes)
 	h.RunWorkflowScheduler(15 * time.Minute)
 
+	// Start daily currency sync from CBU at 09:00 Tashkent time
+	h.RunCurrencySyncScheduler()
+
 	// Create HTTP server
 	server := &http.Server{
 		Addr:           fmt.Sprintf(":%d", cfg.App.Port),
