@@ -100,8 +100,10 @@ func main() {
 	router.GET("/health", handler.HealthCheck(db, redisClient))
 	router.GET("/ready", handler.ReadinessCheck(db, redisClient))
 
-	// Swagger documentation endpoint
-	router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	// Swagger documentation endpoint (disabled in production)
+	if cfg.App.Env != "production" {
+		router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	}
 
 	// Serve favicon
 	router.StaticFile("/favicon.ico", "./static/favicon.png")
@@ -111,11 +113,14 @@ func main() {
 	h := handler.NewHandler(db, redisClient, cfg, log)
 	h.RegisterRoutes(router)
 
+	// Create a context that cancels on shutdown signal
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+
 	// Start workflow automation scheduler (checks thresholds every 15 minutes)
-	h.RunWorkflowScheduler(15 * time.Minute)
+	h.RunWorkflowScheduler(shutdownCtx, 15*time.Minute)
 
 	// Start daily currency sync from CBU at 09:00 Tashkent time
-	h.RunCurrencySyncScheduler()
+	h.RunCurrencySyncScheduler(shutdownCtx)
 
 	// Create HTTP server
 	server := &http.Server{
@@ -141,6 +146,9 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Info("Shutting down server...")
+
+	// Cancel scheduler context to stop background goroutines
+	shutdownCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

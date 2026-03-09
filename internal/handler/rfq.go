@@ -155,7 +155,8 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 
 	var input entity.CreateRFQInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -486,7 +487,8 @@ func (h *Handler) UpdateRFQ(c *gin.Context) {
 
 	var input map[string]interface{}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -555,7 +557,8 @@ func (h *Handler) SubmitRFQResponse(c *gin.Context) {
 
 	var input entity.SubmitRFQResponseInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -692,7 +695,8 @@ func (h *Handler) SelectRFQWinner(c *gin.Context) {
 		ResponseID string `json:"response_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

@@ -134,7 +134,8 @@ func (h *Handler) CreateDepartment(c *gin.Context) {
 
 	var input CreateDepartmentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -276,7 +277,8 @@ func (h *Handler) UpdateDepartment(c *gin.Context) {
 
 	var input UpdateDepartmentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

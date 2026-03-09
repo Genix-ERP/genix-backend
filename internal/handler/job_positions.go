@@ -111,7 +111,8 @@ func (h *Handler) CreateJobPosition(c *gin.Context) {
 
 	var input CreateJobPositionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -230,7 +231,8 @@ func (h *Handler) UpdateJobPosition(c *gin.Context) {
 
 	var input UpdateJobPositionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

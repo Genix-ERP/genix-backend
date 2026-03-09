@@ -241,7 +241,8 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 
 	var input CreateOrganizationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -448,7 +449,8 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 
 	var input UpdateOrganizationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1319,7 +1321,8 @@ func (h *Handler) ImportOrganizations(c *gin.Context) {
 
 	var input ImportOrganizationsInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

@@ -151,7 +151,8 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 
 	var input entity.CreateWorkflowInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -299,7 +300,8 @@ func (h *Handler) UpdateWorkflow(c *gin.Context) {
 
 	var input entity.UpdateWorkflowInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

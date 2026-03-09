@@ -271,7 +271,8 @@ func (h *Handler) CreateComment(c *gin.Context) {
 		Mentions  []string `json:"mentions"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -433,7 +434,8 @@ func (h *Handler) CreateScheduledActivity(c *gin.Context) {
 		AssignedTo   string `json:"assigned_to"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

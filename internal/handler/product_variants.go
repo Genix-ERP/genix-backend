@@ -120,7 +120,8 @@ func (h *Handler) CreateProductAttribute(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -136,7 +137,8 @@ func (h *Handler) CreateProductAttribute(c *gin.Context) {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $8)
 	`, attrID, tenantID, input.Name, input.Code, input.DisplayType, input.CreateVariant, input.SortOrder, now)
 	if err != nil {
-		response.InternalError(c, "Failed to create product attribute: "+err.Error())
+		h.log.Error("Failed to create product attribute", "error", err)
+		response.InternalError(c, "Failed to create product attribute")
 		return
 	}
 
@@ -182,7 +184,8 @@ func (h *Handler) UpdateProductAttribute(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -259,7 +262,8 @@ func (h *Handler) CreateAttributeValue(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -277,7 +281,8 @@ func (h *Handler) CreateAttributeValue(c *gin.Context) {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)
 	`, valueID, tenantID, attrID, input.Name, input.Code, input.HTMLColor, input.SortOrder, priceExtra, now)
 	if err != nil {
-		response.InternalError(c, "Failed to create attribute value: "+err.Error())
+		h.log.Error("Failed to create attribute value", "error", err)
+		response.InternalError(c, "Failed to create attribute value")
 		return
 	}
 
@@ -487,7 +492,8 @@ func (h *Handler) CreateProductVariant(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -540,7 +546,8 @@ func (h *Handler) CreateProductVariant(c *gin.Context) {
 	`, variantID, tenantID, productID, input.SKU, input.Barcode, input.InternalReference,
 		input.CostPrice, input.ListPrice, input.Weight, input.Volume, variantName, displayName, now)
 	if err != nil {
-		response.InternalError(c, "Failed to create product variant: "+err.Error())
+		h.log.Error("Failed to create product variant", "error", err)
+		response.InternalError(c, "Failed to create product variant")
 		return
 	}
 
@@ -593,7 +600,8 @@ func (h *Handler) UpdateProductVariant(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -663,7 +671,8 @@ func (h *Handler) GenerateProductVariants(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -838,7 +847,8 @@ func (h *Handler) AddProductAttribute(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -864,7 +874,8 @@ func (h *Handler) AddProductAttribute(c *gin.Context) {
 		ON CONFLICT (product_id, attribute_id) DO NOTHING
 	`, ptaID, tenantID, productID, attributeID, now)
 	if err != nil {
-		response.InternalError(c, "Failed to add attribute to product: "+err.Error())
+		h.log.Error("Failed to add attribute to product", "error", err)
+		response.InternalError(c, "Failed to add attribute to product")
 		return
 	}
 

@@ -159,7 +159,8 @@ func (h *Handler) CreateQuotation(c *gin.Context) {
 
 	var input entity.CreateQuotationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -266,7 +267,8 @@ func (h *Handler) UpdateQuotation(c *gin.Context) {
 
 	var input entity.UpdateQuotationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

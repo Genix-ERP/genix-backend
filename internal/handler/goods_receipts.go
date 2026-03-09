@@ -118,7 +118,8 @@ func (h *Handler) ListGoodsReceipts(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch goods receipts: "+err.Error())
+		h.log.Error("Failed to fetch goods receipts", "error", err)
+		response.InternalError(c, "Failed to fetch goods receipts")
 		return
 	}
 	defer rows.Close()
@@ -238,7 +239,8 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input for goods receipt", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -266,7 +268,8 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 	}
 	if err != nil {
 		fmt.Printf("Error fetching PO: %v\n", err)
-		response.InternalError(c, "Failed to fetch purchase order: "+err.Error())
+		h.log.Error("Failed to fetch purchase order", "error", err)
+		response.InternalError(c, "Failed to fetch purchase order")
 		return
 	}
 	fmt.Printf("PO found: number=%s, supplierID=%s, supplierName=%s\n", poNumber, supplierID, supplierName)
@@ -321,7 +324,8 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 	)
 	if err != nil {
 		fmt.Printf("Error inserting GR: %v\n", err)
-		response.InternalError(c, "Failed to create goods receipt: "+err.Error())
+		h.log.Error("Failed to create goods receipt", "error", err)
+		response.InternalError(c, "Failed to create goods receipt")
 		return
 	}
 	fmt.Printf("GR created successfully: %s\n", grID)
@@ -453,7 +457,8 @@ func (h *Handler) GetGoodsReceipt(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch goods receipt: "+err.Error())
+		h.log.Error("Failed to fetch goods receipt", "error", err)
+		response.InternalError(c, "Failed to fetch goods receipt")
 		return
 	}
 
@@ -670,7 +675,8 @@ func (h *Handler) InspectGoodsReceipt(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input for quality inspection", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

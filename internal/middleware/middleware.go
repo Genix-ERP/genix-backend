@@ -2,13 +2,17 @@ package middleware
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/config"
 	"github.com/genixerp/genix-backend/internal/infrastructure/cache"
+	"github.com/genixerp/genix-backend/internal/infrastructure/database"
 	"github.com/genixerp/genix-backend/internal/pkg/crypto"
 	"github.com/genixerp/genix-backend/internal/pkg/logger"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
@@ -25,6 +29,9 @@ const (
 	ContextKeyUser           = "user"
 	ContextKeyClaims         = "claims"
 )
+
+// Permission cache TTL
+const permissionCacheTTL = 5 * time.Minute
 
 // RequestID middleware adds a unique request ID to each request
 func RequestID() gin.HandlerFunc {
@@ -77,6 +84,15 @@ func Logger(log logger.Logger) gin.HandlerFunc {
 
 // CORS middleware handles Cross-Origin Resource Sharing
 func CORS(cfg config.CORSConfig) gin.HandlerFunc {
+	// Pre-compute whether wildcard is in the allowed origins
+	hasWildcard := false
+	for _, o := range cfg.AllowedOrigins {
+		if o == "*" {
+			hasWildcard = true
+			break
+		}
+	}
+
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
 
@@ -90,18 +106,27 @@ func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 		}
 
 		if allowed {
-			c.Header("Access-Control-Allow-Origin", origin)
+			if hasWildcard {
+				// When wildcard is configured, reflect the requesting origin
+				// but do NOT set credentials header (credentials + wildcard is
+				// insecure and browsers reject it).
+				c.Header("Access-Control-Allow-Origin", origin)
+			} else {
+				// Specific origins configured — safe to echo origin and allow credentials.
+				c.Header("Access-Control-Allow-Origin", origin)
+			}
 		}
 
 		c.Header("Access-Control-Allow-Methods", strings.Join(cfg.AllowedMethods, ", "))
 		c.Header("Access-Control-Allow-Headers", strings.Join(cfg.AllowedHeaders, ", "))
 		c.Header("Access-Control-Expose-Headers", strings.Join(cfg.ExposedHeaders, ", "))
 
-		if cfg.AllowCredentials {
+		// Only allow credentials when specific origins are configured (not wildcard).
+		if cfg.AllowCredentials && !hasWildcard {
 			c.Header("Access-Control-Allow-Credentials", "true")
 		}
 
-		c.Header("Access-Control-Max-Age", string(rune(cfg.MaxAge)))
+		c.Header("Access-Control-Max-Age", strconv.Itoa(cfg.MaxAge))
 
 		// Handle preflight requests
 		if c.Request.Method == "OPTIONS" {
@@ -134,17 +159,14 @@ func Timeout(timeout time.Duration) gin.HandlerFunc {
 
 		c.Request = c.Request.WithContext(ctx)
 
-		finished := make(chan struct{})
+		// Just call c.Next() directly. The context deadline will propagate
+		// to database queries and other context-aware operations, causing
+		// them to return context.DeadlineExceeded naturally.
+		c.Next()
 
-		go func() {
-			c.Next()
-			close(finished)
-		}()
-
-		select {
-		case <-finished:
-			// Request completed normally
-		case <-ctx.Done():
+		// If the context expired during processing, set a timeout response
+		// (only if a response hasn't already been written).
+		if ctx.Err() == context.DeadlineExceeded && !c.Writer.Written() {
 			c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{
 				"success": false,
 				"error": gin.H{
@@ -155,6 +177,18 @@ func Timeout(timeout time.Duration) gin.HandlerFunc {
 		}
 	}
 }
+
+// rateLimitScript is a Lua script that atomically increments a counter and sets
+// its TTL. It returns the current count after incrementing.
+var rateLimitScript = `
+local key = KEYS[1]
+local window = tonumber(ARGV[1])
+local count = redis.call("INCR", key)
+if count == 1 then
+    redis.call("EXPIRE", key, window)
+end
+return count
+`
 
 // RateLimiter middleware implements rate limiting
 func RateLimiter(cfg config.RateLimitConfig, redis *cache.RedisClient) gin.HandlerFunc {
@@ -173,38 +207,23 @@ func RateLimiter(cfg config.RateLimitConfig, redis *cache.RedisClient) gin.Handl
 		key := "ratelimit:" + identifier
 		ctx := c.Request.Context()
 
-		// Increment counter
-		count, err := redis.Incr(ctx, key)
+		// Atomic increment + expire using Lua script
+		windowSeconds := int(cfg.WindowSize.Seconds())
+		if windowSeconds < 1 {
+			windowSeconds = 1
+		}
+
+		result, err := redis.Client().Eval(ctx, rateLimitScript, []string{key}, windowSeconds).Int64()
 		if err != nil {
 			// If Redis fails, allow the request
 			c.Next()
 			return
 		}
-
-		// Ensure TTL is always set - fixes race condition where
-		// Expire fails on first request, causing key to persist forever
-		if count == 1 {
-			if expErr := redis.Expire(ctx, key, cfg.WindowSize); expErr != nil {
-				// If we can't set TTL, delete the key to prevent permanent rate limiting
-				redis.Delete(ctx, key)
-				c.Next()
-				return
-			}
-		} else {
-			// Safety check: if key has no TTL (from previous failed Expire), fix it
-			ttl, ttlErr := redis.TTL(ctx, key)
-			if ttlErr == nil && ttl < 0 {
-				redis.Expire(ctx, key, cfg.WindowSize)
-			}
-		}
+		count := result
 
 		// Check if over limit
 		if int(count) > cfg.RequestsLimit {
-			retryAfter := int(cfg.WindowSize.Seconds())
-			if retryAfter < 1 {
-				retryAfter = 1
-			}
-			c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
+			c.Header("Retry-After", fmt.Sprintf("%d", windowSeconds))
 			response.TooManyRequests(c, "Rate limit exceeded. Please try again later.")
 			c.Abort()
 			return
@@ -336,8 +355,136 @@ func RequireTenant() gin.HandlerFunc {
 	}
 }
 
-// RequirePermission middleware checks if user has required permission
-func RequirePermission(module, resource, action string) gin.HandlerFunc {
+// PermissionChecker holds the dependencies needed for permission checking.
+type PermissionChecker struct {
+	db    *database.DB
+	redis *cache.RedisClient
+	log   logger.Logger
+}
+
+// NewPermissionChecker creates a new PermissionChecker.
+func NewPermissionChecker(db *database.DB, redis *cache.RedisClient, log logger.Logger) *PermissionChecker {
+	return &PermissionChecker{
+		db:    db,
+		redis: redis,
+		log:   log,
+	}
+}
+
+// permissionCacheKey builds the Redis key for a user's permission set.
+func permissionCacheKey(tenantID, userID string) string {
+	return fmt.Sprintf("permissions:%s:%s", tenantID, userID)
+}
+
+// loadPermissions queries the database for all permissions granted to the user
+// through their assigned roles within the given tenant. The result is a set of
+// permission strings in the form "module:resource:action".
+func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, userID string) (map[string]bool, error) {
+	query := `
+		SELECT DISTINCT p.module, p.resource, p.action
+		FROM permissions p
+		INNER JOIN role_permissions rp ON rp.permission_id = p.id
+		INNER JOIN user_roles ur ON ur.role_id = rp.role_id
+		INNER JOIN roles r ON r.id = ur.role_id AND r.tenant_id = $1
+		WHERE ur.user_id = $2
+	`
+
+	rows, err := pc.db.QueryContext(ctx, query, tenantID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query user permissions: %w", err)
+	}
+	defer rows.Close()
+
+	perms := make(map[string]bool)
+	for rows.Next() {
+		var module, resource, action string
+		if err := rows.Scan(&module, &resource, &action); err != nil {
+			return nil, fmt.Errorf("failed to scan permission row: %w", err)
+		}
+		perms[module+":"+resource+":"+action] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	return perms, nil
+}
+
+// getUserPermissions returns the set of permissions for the user, using Redis
+// cache when available.
+func (pc *PermissionChecker) getUserPermissions(ctx context.Context, tenantID, userID string) (map[string]bool, error) {
+	cacheKey := permissionCacheKey(tenantID, userID)
+
+	// Try cache first
+	if pc.redis != nil {
+		data, err := pc.redis.Get(ctx, cacheKey)
+		if err == nil && data != "" {
+			var perms map[string]bool
+			if jsonErr := json.Unmarshal([]byte(data), &perms); jsonErr == nil {
+				return perms, nil
+			}
+		}
+	}
+
+	// Cache miss — load from database
+	perms, err := pc.loadPermissions(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store in cache
+	if pc.redis != nil {
+		if encoded, err := json.Marshal(perms); err == nil {
+			_ = pc.redis.Set(ctx, cacheKey, string(encoded), permissionCacheTTL)
+		}
+	}
+
+	return perms, nil
+}
+
+// isUserSiteAdminOrOwner checks the users table role column for elevated roles
+// that should bypass permission checks (owner, site_admin).
+func (pc *PermissionChecker) isUserSiteAdminOrOwner(ctx context.Context, tenantID, userID string) (bool, error) {
+	cacheKey := fmt.Sprintf("userrole:%s:%s", tenantID, userID)
+
+	// Try cache first
+	if pc.redis != nil {
+		data, err := pc.redis.Get(ctx, cacheKey)
+		if err == nil && data != "" {
+			return data == "1", nil
+		}
+	}
+
+	var role sql.NullString
+	err := pc.db.QueryRowContext(ctx,
+		`SELECT role FROM users WHERE id = $1 AND tenant_id = $2`,
+		userID, tenantID,
+	).Scan(&role)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+
+	bypass := role.Valid && (role.String == "owner" || role.String == "site_admin")
+
+	// Cache the result
+	if pc.redis != nil {
+		val := "0"
+		if bypass {
+			val = "1"
+		}
+		_ = pc.redis.Set(ctx, cacheKey, val, permissionCacheTTL)
+	}
+
+	return bypass, nil
+}
+
+// Require returns a Gin middleware that checks whether the authenticated user
+// has the specified permission (module:resource:action). System admins and
+// site admins/owners bypass the check.
+func (pc *PermissionChecker) Require(module, resource, action string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		claims, exists := c.Get(ContextKeyClaims)
 		if !exists {
@@ -359,8 +506,78 @@ func RequirePermission(module, resource, action string) gin.HandlerFunc {
 			return
 		}
 
-		// TODO: Check user permissions from database/cache
-		// For now, allow all authenticated users
+		ctx := c.Request.Context()
+		userID := jwtClaims.UserID.String()
+		tenantID := jwtClaims.TenantID.String()
+
+		// Site admins and owners bypass permission checks
+		bypass, err := pc.isUserSiteAdminOrOwner(ctx, tenantID, userID)
+		if err != nil {
+			pc.log.Error("failed to check user role", "error", err, "user_id", userID)
+			response.Forbidden(c, "Permission check failed")
+			c.Abort()
+			return
+		}
+		if bypass {
+			c.Next()
+			return
+		}
+
+		// Check user permissions
+		perms, err := pc.getUserPermissions(ctx, tenantID, userID)
+		if err != nil {
+			pc.log.Error("failed to load user permissions", "error", err, "user_id", userID)
+			response.Forbidden(c, "Permission check failed")
+			c.Abort()
+			return
+		}
+
+		permKey := module + ":" + resource + ":" + action
+		if !perms[permKey] {
+			response.Forbidden(c, fmt.Sprintf("Missing required permission: %s", permKey))
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// InvalidatePermissionCache removes cached permissions for a user so that
+// changes (e.g., role assignment) take effect immediately.
+func (pc *PermissionChecker) InvalidatePermissionCache(ctx context.Context, tenantID, userID string) {
+	if pc.redis == nil {
+		return
+	}
+	_ = pc.redis.Delete(ctx, permissionCacheKey(tenantID, userID))
+	_ = pc.redis.Delete(ctx, fmt.Sprintf("userrole:%s:%s", tenantID, userID))
+}
+
+// RequirePermission is kept as a backward-compatible package-level function.
+// It creates a PermissionChecker-less middleware that allows all authenticated
+// users through. Callers should migrate to PermissionChecker.Require() for
+// actual enforcement.
+//
+// Deprecated: Use PermissionChecker.Require() instead.
+func RequirePermission(module, resource, action string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		claims, exists := c.Get(ContextKeyClaims)
+		if !exists {
+			response.Unauthorized(c, "Authentication required")
+			c.Abort()
+			return
+		}
+
+		_, ok := claims.(*crypto.Claims)
+		if !ok {
+			response.Unauthorized(c, "Invalid authentication")
+			c.Abort()
+			return
+		}
+
+		// Without a PermissionChecker (no DB/Redis), we can only verify
+		// that the user is authenticated. Use PermissionChecker.Require()
+		// for full enforcement.
 		c.Next()
 	}
 }
