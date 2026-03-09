@@ -12,7 +12,7 @@ import (
 
 // Argon2 parameters for password hashing
 const (
-	argon2Time    = 1
+	argon2Time    = 2
 	argon2Memory  = 64 * 1024
 	argon2Threads = 4
 	argon2KeyLen  = 32
@@ -95,9 +95,12 @@ func GenerateRandomBytes(length int) ([]byte, error) {
 	return bytes, nil
 }
 
+// TokenSalt is the salt used for token hashing. Set from config on startup.
+var TokenSalt = "genix-token-salt"
+
 // HashToken hashes a token for secure storage
 func HashToken(token string) string {
-	hash := argon2.IDKey([]byte(token), []byte("genix-token-salt"), 1, 16*1024, 1, 32)
+	hash := argon2.IDKey([]byte(token), []byte(TokenSalt), 1, 16*1024, 1, 32)
 	return base64.RawStdEncoding.EncodeToString(hash)
 }
 

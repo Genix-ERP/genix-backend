@@ -263,7 +263,8 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 
 	var req entity.CreateConstructionProjectInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -394,7 +395,8 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 
 	var req entity.UpdateConstructionProjectInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -781,7 +783,8 @@ func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 
 	var req entity.CreateConstructionBuildingInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -868,7 +871,8 @@ func (h *Handler) UpdateConstructionBuilding(c *gin.Context) {
 
 	var req entity.UpdateConstructionBuildingInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1112,7 +1116,8 @@ func (h *Handler) CreateSmetaSection(c *gin.Context) {
 
 	var req entity.CreateSmetaSectionInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1180,7 +1185,8 @@ func (h *Handler) UpdateSmetaSection(c *gin.Context) {
 
 	var req entity.UpdateSmetaSectionInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1401,7 +1407,8 @@ func (h *Handler) CreateSmetaItem(c *gin.Context) {
 
 	var req entity.CreateSmetaItemInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1475,7 +1482,8 @@ func (h *Handler) UpdateSmetaItem(c *gin.Context) {
 
 	var req entity.UpdateSmetaItemInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1868,7 +1876,8 @@ func (h *Handler) CreateProjectVendor(c *gin.Context) {
 
 	var req entity.CreateProjectVendorInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1974,7 +1983,8 @@ func (h *Handler) UpdateProjectVendor(c *gin.Context) {
 
 	var req entity.CreateProjectVendorInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2243,7 +2253,8 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 
 	var req entity.CreatePhotoReportInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2386,7 +2397,8 @@ func (h *Handler) UpdatePhotoReport(c *gin.Context) {
 
 	var req entity.CreatePhotoReportInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2625,7 +2637,8 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 
 	var req entity.CreateDailyReportInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2834,7 +2847,8 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 		Photos            []map[string]interface{} `json:"photos"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3093,7 +3107,8 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 		Notes        string      `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3179,7 +3194,8 @@ func (h *Handler) UpdateMaterialRequest(c *gin.Context) {
 		Notes        string      `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4017,7 +4033,8 @@ func (h *Handler) CreateSiteWarehouse(c *gin.Context) {
 
 	var req entity.CreateSiteWarehouseInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4177,7 +4194,8 @@ func (h *Handler) CreateConstructionTeamMember(c *gin.Context) {
 
 	var req entity.CreateConstructionTeamMemberInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

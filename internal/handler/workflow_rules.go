@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // ===== CRUD Endpoints =====
@@ -104,7 +106,8 @@ func (h *Handler) CreateWorkflowRule(c *gin.Context) {
 
 	var input entity.CreateWorkflowRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -251,7 +254,8 @@ func (h *Handler) UpdateWorkflowRule(c *gin.Context) {
 
 	var input entity.UpdateWorkflowRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -789,13 +793,20 @@ func (h *Handler) checkOverdueInvoices(tenantID uuid.UUID) {
 }
 
 // RunWorkflowScheduler starts a background ticker for periodic checks
-func (h *Handler) RunWorkflowScheduler(interval time.Duration) {
+func (h *Handler) RunWorkflowScheduler(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	go func() {
-		for range ticker.C {
-			h.log.Debug("Running workflow threshold checks")
-			h.CheckThresholdRules()
-			h.autoRunReplenishment()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				h.log.Debug("Running workflow threshold checks")
+				h.CheckThresholdRules()
+				h.autoRunReplenishment()
+			case <-ctx.Done():
+				h.log.Info("Workflow scheduler stopped")
+				return
+			}
 		}
 	}()
 	h.log.Info("Workflow scheduler started", "interval", interval)
@@ -962,28 +973,85 @@ func (h *Handler) autoReplenishForTenant(tenantID uuid.UUID) {
 			continue
 		}
 
-		var subtotal float64
-		for lineNum, item := range group {
-			var unitPrice float64
-			if err := h.db.QueryRow(`SELECT price FROM vendor_prices WHERE vendor_id=$1 AND product_id=$2 AND tenant_id=$3 ORDER BY created_at DESC LIMIT 1`,
-				vid, item.ProductID, tenantID).Scan(&unitPrice); err != nil {
-				h.db.QueryRow(`SELECT COALESCE(purchase_price, 0) FROM products WHERE id=$1`, item.ProductID).Scan(&unitPrice)
-			}
+		// Batch: collect all product IDs for this vendor group
+		productIDs := make([]uuid.UUID, len(group))
+		for i, item := range group {
+			productIDs[i] = item.ProductID
+		}
 
+		// ONE query: get all vendor prices for these products
+		priceMap := make(map[uuid.UUID]float64)
+		vpRows, vpErr := h.db.Query(
+			`SELECT product_id, price FROM vendor_prices WHERE vendor_id = $1 AND product_id = ANY($2) AND tenant_id = $3
+			 ORDER BY product_id, created_at DESC`,
+			vid, pq.Array(productIDs), tenantID)
+		if vpErr == nil {
+			for vpRows.Next() {
+				var pid uuid.UUID
+				var price float64
+				if err := vpRows.Scan(&pid, &price); err == nil {
+					if _, exists := priceMap[pid]; !exists {
+						priceMap[pid] = price
+					}
+				}
+			}
+			vpRows.Close()
+		}
+
+		// ONE query: get fallback purchase prices for products missing from vendor_prices
+		var missingPIDs []uuid.UUID
+		for _, pid := range productIDs {
+			if _, ok := priceMap[pid]; !ok {
+				missingPIDs = append(missingPIDs, pid)
+			}
+		}
+		if len(missingPIDs) > 0 {
+			ppRows, ppErr := h.db.Query(`SELECT id, COALESCE(purchase_price, 0) FROM products WHERE id = ANY($1)`, pq.Array(missingPIDs))
+			if ppErr == nil {
+				for ppRows.Next() {
+					var pid uuid.UUID
+					var price float64
+					if err := ppRows.Scan(&pid, &price); err == nil {
+						priceMap[pid] = price
+					}
+				}
+				ppRows.Close()
+			}
+		}
+
+		// Build bulk INSERT for purchase_order_lines and collect rule IDs
+		var subtotal float64
+		var lineValues []string
+		var lineArgs []interface{}
+		var ruleIDs []uuid.UUID
+		argIdx := 0
+		for lineNum, item := range group {
+			unitPrice := priceMap[item.ProductID]
 			lineTotal := item.OrderQty * unitPrice
+			subtotal += lineTotal
+			ruleIDs = append(ruleIDs, item.RuleID)
+
+			lineID := uuid.New()
+			lineValues = append(lineValues, fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,0,0,$%d,$%d,0,0,$%d,$%d,$%d)",
+				argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9, argIdx+10, argIdx+11, argIdx+12))
+			lineArgs = append(lineArgs, lineID, poID, lineNum+1, item.ProductID, item.ProductName, item.OrderQty,
+				unitPrice, lineTotal, item.WarehouseID, item.RuleID, now, now)
+			argIdx += 12
+		}
+
+		// ONE INSERT for all purchase_order_lines
+		if len(lineValues) > 0 {
 			h.db.Exec(`
 				INSERT INTO purchase_order_lines (
 					id, purchase_order_id, line_number, product_id, description, quantity,
 					unit_price, discount_amount, tax_amount, line_total, warehouse_id,
 					quantity_received, quantity_invoiced, reorder_rule_id, created_at, updated_at
-				) VALUES ($1,$2,$3,$4,$5,$6,$7,0,0,$8,$9,0,0,$10,$11,$11)
-			`, uuid.New(), poID, lineNum+1, item.ProductID, item.ProductName, item.OrderQty,
-				unitPrice, lineTotal, item.WarehouseID, item.RuleID, now)
+				) VALUES `+strings.Join(lineValues, ","), lineArgs...)
+		}
 
-			subtotal += lineTotal
-
-			// Mark rule as triggered
-			h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id=$2`, now, item.RuleID)
+		// ONE UPDATE for all reorder_rules
+		if len(ruleIDs) > 0 {
+			h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id = ANY($2)`, now, pq.Array(ruleIDs))
 		}
 
 		h.db.Exec(`UPDATE purchase_orders SET subtotal=$1, total_amount=$1, updated_at=$2 WHERE id=$3`, subtotal, now, poID)
@@ -1011,23 +1079,57 @@ func (h *Handler) autoReplenishForTenant(tenantID uuid.UUID) {
 		if err != nil {
 			h.log.Error("Auto replenishment: failed to create no-vendor PO", "error", err)
 		} else {
-			var subtotal float64
-			for lineNum, item := range noVendorItems {
-				var unitPrice float64
-				h.db.QueryRow(`SELECT COALESCE(purchase_price, 0) FROM products WHERE id=$1`, item.ProductID).Scan(&unitPrice)
+			// ONE query: get all purchase prices for no-vendor products
+			nvProductIDs := make([]uuid.UUID, len(noVendorItems))
+			for i, item := range noVendorItems {
+				nvProductIDs[i] = item.ProductID
+			}
+			nvPriceMap := make(map[uuid.UUID]float64)
+			nvPPRows, nvPPErr := h.db.Query(`SELECT id, COALESCE(purchase_price, 0) FROM products WHERE id = ANY($1)`, pq.Array(nvProductIDs))
+			if nvPPErr == nil {
+				for nvPPRows.Next() {
+					var pid uuid.UUID
+					var price float64
+					if err := nvPPRows.Scan(&pid, &price); err == nil {
+						nvPriceMap[pid] = price
+					}
+				}
+				nvPPRows.Close()
+			}
 
+			// Build bulk INSERT for purchase_order_lines
+			var subtotal float64
+			var nvLineValues []string
+			var nvLineArgs []interface{}
+			var nvRuleIDs []uuid.UUID
+			nvArgIdx := 0
+			for lineNum, item := range noVendorItems {
+				unitPrice := nvPriceMap[item.ProductID]
 				lineTotal := item.OrderQty * unitPrice
+				subtotal += lineTotal
+				nvRuleIDs = append(nvRuleIDs, item.RuleID)
+
+				lineID := uuid.New()
+				nvLineValues = append(nvLineValues, fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,0,0,$%d,$%d,0,0,$%d,$%d,$%d)",
+					nvArgIdx+1, nvArgIdx+2, nvArgIdx+3, nvArgIdx+4, nvArgIdx+5, nvArgIdx+6, nvArgIdx+7, nvArgIdx+8, nvArgIdx+9, nvArgIdx+10, nvArgIdx+11, nvArgIdx+12))
+				nvLineArgs = append(nvLineArgs, lineID, poID, lineNum+1, item.ProductID, item.ProductName, item.OrderQty,
+					unitPrice, lineTotal, item.WarehouseID, item.RuleID, now, now)
+				nvArgIdx += 12
+			}
+
+			// ONE INSERT for all purchase_order_lines
+			if len(nvLineValues) > 0 {
 				h.db.Exec(`
 					INSERT INTO purchase_order_lines (
 						id, purchase_order_id, line_number, product_id, description, quantity,
 						unit_price, discount_amount, tax_amount, line_total, warehouse_id,
 						quantity_received, quantity_invoiced, reorder_rule_id, created_at, updated_at
-					) VALUES ($1,$2,$3,$4,$5,$6,$7,0,0,$8,$9,0,0,$10,$11,$11)
-				`, uuid.New(), poID, lineNum+1, item.ProductID, item.ProductName, item.OrderQty,
-					unitPrice, lineTotal, item.WarehouseID, item.RuleID, now)
+					) VALUES `+strings.Join(nvLineValues, ","), nvLineArgs...)
+			}
 
-				subtotal += lineTotal
-				h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id=$2`, now, item.RuleID)
+			// ONE UPDATE for all reorder_rules
+			if len(nvRuleIDs) > 0 {
+				h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id = ANY($2)`, now, pq.Array(nvRuleIDs))
 			}
 
 			h.db.Exec(`UPDATE purchase_orders SET subtotal=$1, total_amount=$1, updated_at=$2 WHERE id=$3`, subtotal, now, poID)

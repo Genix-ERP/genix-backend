@@ -115,7 +115,8 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch delivery orders: "+err.Error())
+		h.log.Error("Failed to fetch delivery orders", "error", err)
+		response.InternalError(c, "Failed to fetch delivery orders")
 		return
 	}
 	defer rows.Close()
@@ -214,7 +215,8 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		Notes          string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -244,7 +246,8 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		h.log.Error("Failed to fetch sales order", "error", err)
+		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
 
@@ -314,7 +317,8 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		createdBy, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create delivery order: "+err.Error())
+		h.log.Error("Failed to create delivery order", "error", err)
+		response.InternalError(c, "Failed to create delivery order")
 		return
 	}
 
@@ -386,7 +390,8 @@ func (h *Handler) GetDeliveryOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch delivery order: "+err.Error())
+		h.log.Error("Failed to fetch delivery order", "error", err)
+		response.InternalError(c, "Failed to fetch delivery order")
 		return
 	}
 
@@ -515,7 +520,8 @@ func (h *Handler) UpdateDeliveryOrder(c *gin.Context) {
 		Notes          string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -592,7 +598,8 @@ func (h *Handler) UpdateDeliveryOrder(c *gin.Context) {
 
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update delivery order: "+err.Error())
+		h.log.Error("Failed to update delivery order", "error", err)
+		response.InternalError(c, "Failed to update delivery order")
 		return
 	}
 
@@ -644,7 +651,8 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		WHERE delivery_order_id = $1 AND quantity_to_deliver > 0
 	`, doID)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch delivery order lines: "+err.Error())
+		h.log.Error("Failed to fetch delivery order lines", "error", err)
+		response.InternalError(c, "Failed to fetch delivery order lines")
 		return
 	}
 	defer rows.Close()

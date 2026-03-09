@@ -282,7 +282,8 @@ func (h *Handler) CreateAccount(c *gin.Context) {
 
 	var input entity.CreateAccountInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -593,7 +594,8 @@ func (h *Handler) UpdateAccount(c *gin.Context) {
 
 	var input entity.UpdateAccountInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1275,7 +1277,8 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 
 	var input entity.CreateJournalInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1412,7 +1415,8 @@ func (h *Handler) UpdateJournal(c *gin.Context) {
 
 	var input entity.UpdateJournalInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1704,7 +1708,8 @@ func (h *Handler) AddJournalPaymentMethod(c *gin.Context) {
 		OutstandingAccountID string `json:"outstanding_account_id"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1779,7 +1784,8 @@ func (h *Handler) UpdateJournalPaymentMethod(c *gin.Context) {
 		OutstandingAccountID *string `json:"outstanding_account_id"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1826,7 +1832,8 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 
 	var input entity.CreateJournalEntryInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2646,7 +2653,8 @@ func (h *Handler) UpdateJournalEntry(c *gin.Context) {
 
 	var input entity.CreateJournalEntryInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3091,7 +3099,8 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 
 	var input entity.CreatePaymentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3916,7 +3925,8 @@ func (h *Handler) CreateTaxRate(c *gin.Context) {
 
 	var input entity.CreateTaxRateInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4081,7 +4091,8 @@ func (h *Handler) UpdateTaxRate(c *gin.Context) {
 
 	var input entity.UpdateTaxRateInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4294,7 +4305,8 @@ func (h *Handler) GetCurrency(c *gin.Context) {
 func (h *Handler) CreateCurrency(c *gin.Context) {
 	var input entity.CreateCurrencyInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4390,7 +4402,8 @@ func (h *Handler) UpdateCurrency(c *gin.Context) {
 
 	var input entity.UpdateCurrencyInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4589,7 +4602,8 @@ func (h *Handler) SetExchangeRate(c *gin.Context) {
 		Source string  `json:"source"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4797,7 +4811,8 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 
 	var filter entity.BankAccountListFilter
 	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4999,7 +5014,8 @@ func (h *Handler) CreateBankAccount(c *gin.Context) {
 
 	var input entity.CreateBankAccountInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -5095,7 +5111,8 @@ func (h *Handler) UpdateBankAccount(c *gin.Context) {
 
 	var input entity.UpdateBankAccountInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -5283,7 +5300,8 @@ func (h *Handler) ListBankTransactions(c *gin.Context) {
 
 	var filter entity.BankTransactionListFilter
 	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -5408,7 +5426,8 @@ func (h *Handler) CreateBankTransaction(c *gin.Context) {
 
 	var input entity.CreateBankTransactionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -5662,7 +5681,8 @@ func (h *Handler) CreateBankReconciliation(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -5925,7 +5945,8 @@ func (h *Handler) UpdateBankReconciliation(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -6490,7 +6511,8 @@ func (h *Handler) ImportBankStatement(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -6583,7 +6605,8 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 
 	var filter entity.CashTransactionListFilter
 	if err := c.ShouldBindQuery(&filter); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -6740,7 +6763,8 @@ func (h *Handler) CreateCashTransaction(c *gin.Context) {
 
 	var input entity.CreateCashTransactionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -6846,7 +6870,8 @@ func (h *Handler) UpdateCashTransaction(c *gin.Context) {
 
 	var input entity.UpdateCashTransactionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -7196,7 +7221,8 @@ func (h *Handler) CreateFiscalYear(c *gin.Context) {
 
 	var input CreateFiscalYearInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -7297,7 +7323,8 @@ func (h *Handler) UpdateFiscalYear(c *gin.Context) {
 
 	var input CreateFiscalYearInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -7572,7 +7599,8 @@ func (h *Handler) CreateFiscalPeriod(c *gin.Context) {
 
 	var input CreateFiscalPeriodInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -7664,7 +7692,8 @@ func (h *Handler) BatchCreateFiscalPeriods(c *gin.Context) {
 
 	var input BatchCreateFiscalPeriodsInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -8267,7 +8296,8 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 
 	var input CreateBudgetInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -8442,7 +8472,8 @@ func (h *Handler) UpdateBudget(c *gin.Context) {
 
 	var input CreateBudgetInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -8759,7 +8790,8 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 
 	var input CreateBudgetLineInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -8874,7 +8906,8 @@ func (h *Handler) UpdateBudgetLine(c *gin.Context) {
 
 	var input CreateBudgetLineInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -9297,7 +9330,8 @@ func (h *Handler) CreateRecurringJournalTemplate(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -9435,7 +9469,8 @@ func (h *Handler) UpdateRecurringJournalTemplate(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

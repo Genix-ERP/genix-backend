@@ -214,7 +214,8 @@ func (h *Handler) CreateProductPackaging(c *gin.Context) {
 
 	var input entity.CreateProductPackagingInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -295,7 +296,8 @@ func (h *Handler) CreateProductPackagingForProduct(c *gin.Context) {
 
 	var input entity.CreateProductPackagingInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -440,7 +442,8 @@ func (h *Handler) UpdateProductPackaging(c *gin.Context) {
 
 	var input entity.UpdateProductPackagingInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -696,7 +699,8 @@ func (h *Handler) CreatePackageType(c *gin.Context) {
 
 	var input entity.CreatePackageTypeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -858,7 +862,8 @@ func (h *Handler) UpdatePackageType(c *gin.Context) {
 
 	var input entity.UpdatePackageTypeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1321,7 +1326,8 @@ func (h *Handler) UpdatePackage(c *gin.Context) {
 
 	var input entity.UpdatePackageInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1435,7 +1441,8 @@ func (h *Handler) AddPackageContent(c *gin.Context) {
 
 	var input entity.AddPackageContentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

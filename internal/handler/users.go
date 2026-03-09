@@ -113,7 +113,8 @@ func (h *Handler) CreateUser(c *gin.Context) {
 
 	var input entity.CreateUserInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -244,7 +245,8 @@ func (h *Handler) SendCredentials(c *gin.Context) {
 		Phone    string `json:"phone"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -423,7 +425,8 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 
 	var input entity.UpdateUserInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -535,7 +538,8 @@ func (h *Handler) AssignRoles(c *gin.Context) {
 		RoleIDs []string `json:"role_ids" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

@@ -118,7 +118,8 @@ func (h *Handler) ListPurchaseRequisitions(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch requisitions: "+err.Error())
+		h.log.Error("Failed to fetch requisitions", "error", err)
+		response.InternalError(c, "Failed to fetch requisitions")
 		return
 	}
 	defer rows.Close()
@@ -221,7 +222,8 @@ func (h *Handler) CreatePurchaseRequisition(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -284,7 +286,8 @@ func (h *Handler) CreatePurchaseRequisition(c *gin.Context) {
 		createdBy, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create requisition: "+err.Error())
+		h.log.Error("Failed to create requisition", "error", err)
+		response.InternalError(c, "Failed to create requisition")
 		return
 	}
 
@@ -394,7 +397,8 @@ func (h *Handler) GetPurchaseRequisition(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch requisition: "+err.Error())
+		h.log.Error("Failed to fetch requisition", "error", err)
+		response.InternalError(c, "Failed to fetch requisition")
 		return
 	}
 
@@ -537,7 +541,8 @@ func (h *Handler) UpdatePurchaseRequisition(c *gin.Context) {
 		Notes        *string `json:"notes,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -601,7 +606,8 @@ func (h *Handler) UpdatePurchaseRequisition(c *gin.Context) {
 
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update requisition: "+err.Error())
+		h.log.Error("Failed to update requisition", "error", err)
+		response.InternalError(c, "Failed to update requisition")
 		return
 	}
 
@@ -866,7 +872,8 @@ func (h *Handler) RejectPurchaseRequisition(c *gin.Context) {
 		Reason string `json:"reason" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -916,7 +923,8 @@ func (h *Handler) ConvertPRToPO(c *gin.Context) {
 		PaymentTerms string `json:"payment_terms,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -958,7 +966,8 @@ func (h *Handler) ConvertPRToPO(c *gin.Context) {
 		userID, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create purchase order: "+err.Error())
+		h.log.Error("Failed to create purchase order", "error", err)
+		response.InternalError(c, "Failed to create purchase order")
 		return
 	}
 

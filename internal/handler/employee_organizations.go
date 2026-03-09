@@ -168,7 +168,8 @@ func (h *Handler) AssignEmployeeToOrganization(c *gin.Context) {
 
 	var input AssignEmployeeToOrgInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -267,7 +268,8 @@ func (h *Handler) UpdateEmployeeOrganization(c *gin.Context) {
 
 	var input UpdateEmployeeOrgInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

@@ -118,7 +118,8 @@ func (h *Handler) UpdateEmployeeModulePermission(c *gin.Context) {
 
 	var input UpdateModulePermissionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -172,7 +173,8 @@ func (h *Handler) BulkUpdateEmployeePermissions(c *gin.Context) {
 
 	var input BulkUpdatePermissionsInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

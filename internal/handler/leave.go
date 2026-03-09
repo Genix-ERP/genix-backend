@@ -173,7 +173,8 @@ func (h *Handler) CreateLeaveRequest(c *gin.Context) {
 
 	var input entity.CreateLeaveRequestInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -335,7 +336,8 @@ func (h *Handler) UpdateLeaveRequest(c *gin.Context) {
 
 	var input entity.UpdateLeaveRequestInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -571,7 +573,8 @@ func (h *Handler) CreateLeaveBalance(c *gin.Context) {
 
 	var input entity.CreateLeaveBalanceInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -704,7 +707,8 @@ func (h *Handler) UpdateLeaveBalance(c *gin.Context) {
 
 	var input entity.UpdateLeaveBalanceInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

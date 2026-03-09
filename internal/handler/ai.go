@@ -106,7 +106,8 @@ type AIChatRequest struct {
 func (h *Handler) AIChat(c *gin.Context) {
 	var req AIChatRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Invalid request: "+err.Error())
+		h.log.Error("Invalid request", "error", err)
+		response.BadRequest(c, "Invalid request")
 		return
 	}
 
@@ -533,7 +534,8 @@ func (h *Handler) ExtractInvoice(c *gin.Context) {
 
 	var req InvoiceExtractionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Invalid request: "+err.Error())
+		h.log.Error("Invalid request", "error", err)
+		response.BadRequest(c, "Invalid request")
 		return
 	}
 
@@ -655,7 +657,8 @@ Analyze the invoice image and return the extracted data as JSON:`
 	chatResp, err := aiService.client.Chat(ctx, chatReq)
 	if err != nil {
 		h.log.Error("AI invoice extraction error", "error", err)
-		response.InternalError(c, "Failed to process invoice: "+err.Error())
+		h.log.Error("Failed to process invoice", "error", err)
+		response.InternalError(c, "Failed to process invoice")
 		return
 	}
 

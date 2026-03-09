@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -124,7 +125,7 @@ func (h *Handler) SyncCurrencyRates(c *gin.Context) {
 	})
 }
 // RunCurrencySyncScheduler starts a background goroutine that syncs CBU rates daily at 09:00 Tashkent time
-func (h *Handler) RunCurrencySyncScheduler() {
+func (h *Handler) RunCurrencySyncScheduler(ctx context.Context) {
 	go func() {
 		loc, err := time.LoadLocation("Asia/Tashkent")
 		if err != nil {
@@ -142,8 +143,13 @@ func (h *Handler) RunCurrencySyncScheduler() {
 			sleepDuration := next.Sub(now)
 			h.log.Info("Currency sync scheduled", "next_run", next.Format("2006-01-02 15:04"), "sleep", sleepDuration.Round(time.Minute))
 
-			time.Sleep(sleepDuration)
-			h.syncCBURatesForAllTenants()
+			select {
+			case <-time.After(sleepDuration):
+				h.syncCBURatesForAllTenants()
+			case <-ctx.Done():
+				h.log.Info("Currency sync scheduler stopped")
+				return
+			}
 		}
 	}()
 	h.log.Info("Currency sync scheduler started (daily at 09:00 Tashkent time)")
@@ -198,6 +204,20 @@ func (h *Handler) syncCBURatesForAllTenants() {
 	today := time.Now().Format("2006-01-02")
 	totalSynced := 0
 
+	// Pre-parse all CBU rates into a usable slice
+	type parsedRate struct {
+		Code string
+		Rate float64
+	}
+	var validRates []parsedRate
+	for _, cbuRate := range cbuRates {
+		var rate float64
+		if _, err := fmt.Sscanf(cbuRate.Rate, "%f", &rate); err != nil || rate <= 0 {
+			continue
+		}
+		validRates = append(validRates, parsedRate{Code: cbuRate.Code, Rate: rate})
+	}
+
 	for _, tenantID := range tenantIDs {
 		// Get base currency for this tenant
 		var baseCurrencyID uuid.UUID
@@ -209,28 +229,46 @@ func (h *Handler) syncCBURatesForAllTenants() {
 			continue
 		}
 
+		// ONE query: get all currencies for this tenant
+		currencyMap := make(map[string]uuid.UUID)
+		curRows, curErr := h.db.Query("SELECT id, code FROM currencies WHERE tenant_id = $1", tenantID)
+		if curErr != nil {
+			continue
+		}
+		for curRows.Next() {
+			var cid uuid.UUID
+			var code string
+			if err := curRows.Scan(&cid, &code); err == nil {
+				currencyMap[code] = cid
+			}
+		}
+		curRows.Close()
+
+		// Build batch INSERT with ON CONFLICT for exchange rates
+		var erValues []string
+		var erArgs []interface{}
+		argIdx := 0
 		synced := 0
-		for _, cbuRate := range cbuRates {
-			var currencyID uuid.UUID
-			if err := h.db.QueryRow("SELECT id FROM currencies WHERE tenant_id = $1 AND code = $2", tenantID, cbuRate.Code).Scan(&currencyID); err != nil {
+		for _, vr := range validRates {
+			currencyID, ok := currencyMap[vr.Code]
+			if !ok {
 				continue
 			}
-
-			var rate float64
-			if _, err := fmt.Sscanf(cbuRate.Rate, "%f", &rate); err != nil || rate <= 0 {
-				continue
-			}
-
-			_, err := h.db.Exec(`
-				INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
-				VALUES ($1, $2, $3, $4, $5, $6, 'CBU')
-				ON CONFLICT (tenant_id, from_currency_id, to_currency_id, effective_date)
-				DO UPDATE SET rate = $5, source = 'CBU'
-			`, uuid.New(), tenantID, currencyID, baseCurrencyID, rate, today)
-			if err != nil {
-				continue
-			}
+			erValues = append(erValues, fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,'CBU')",
+				argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6))
+			erArgs = append(erArgs, uuid.New(), tenantID, currencyID, baseCurrencyID, vr.Rate, today)
+			argIdx += 6
 			synced++
+		}
+
+		// ONE INSERT for all exchange rates
+		if len(erValues) > 0 {
+			h.db.Exec(`
+				INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
+				VALUES `+strings.Join(erValues, ",")+`
+				ON CONFLICT (tenant_id, from_currency_id, to_currency_id, effective_date)
+				DO UPDATE SET rate = EXCLUDED.rate, source = 'CBU'
+			`, erArgs...)
 		}
 		totalSynced += synced
 	}
@@ -788,7 +826,8 @@ func (h *Handler) CreateReconciliationAct(c *gin.Context) {
 
 	var input createReconciliationActInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -995,7 +1034,8 @@ func (h *Handler) UpdateReconciliationAct(c *gin.Context) {
 		Notes  *string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1192,7 +1232,8 @@ func (h *Handler) BulkGenerateReconciliation(c *gin.Context) {
 		PeriodEnd   string `json:"period_end"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1319,7 +1360,8 @@ func (h *Handler) SendReconciliationAct(c *gin.Context) {
 		Phone string `json:"phone"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1489,7 +1531,8 @@ func (h *Handler) RespondReconciliationAct(c *gin.Context) {
 		Note    string `json:"note"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

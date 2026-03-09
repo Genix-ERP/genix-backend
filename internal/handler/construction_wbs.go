@@ -234,7 +234,8 @@ func (h *Handler) CreateWBSItem(c *gin.Context) {
 
 	var req entity.CreateWBSInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -348,7 +349,8 @@ func (h *Handler) UpdateWBSItem(c *gin.Context) {
 
 	var req entity.UpdateWBSInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -573,7 +575,8 @@ func (h *Handler) ReorderWBSItems(c *gin.Context) {
 
 	var req entity.ReorderWBSInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

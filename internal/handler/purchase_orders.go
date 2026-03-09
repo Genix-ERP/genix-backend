@@ -225,7 +225,8 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 
 	var input entity.CreatePurchaseOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -743,7 +744,8 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 
 	var input entity.UpdatePurchaseOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1340,7 +1342,8 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 
 	var input entity.ReceivePurchaseOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
