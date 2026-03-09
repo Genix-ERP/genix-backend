@@ -30,7 +30,7 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 	}
 
 	query := `
-		SELECT a.id, a.code, a.name, at.category, at.normal_balance,
+		SELECT a.id, a.code, a.name, at.category, at.normal_balance, a.parent_id,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
 			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
 		FROM accounts a
@@ -46,8 +46,7 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance
-		HAVING COALESCE(SUM(jel.debit_amount), 0) > 0 OR COALESCE(SUM(jel.credit_amount), 0) > 0
+		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance, a.parent_id
 		ORDER BY a.code
 	`
 
@@ -59,18 +58,21 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	accounts := make([]entity.TrialBalanceAccount, 0)
+	allAccounts := make([]entity.TrialBalanceAccount, 0)
 	var totalDebit, totalCredit float64
 
 	for rows.Next() {
 		var acc entity.TrialBalanceAccount
 		var normalBalance string
 		var debitSum, creditSum float64
+		var parentID *uuid.UUID
 
-		err := rows.Scan(&acc.AccountID, &acc.AccountCode, &acc.AccountName, &acc.Category, &normalBalance, &debitSum, &creditSum)
+		err := rows.Scan(&acc.AccountID, &acc.AccountCode, &acc.AccountName, &acc.Category, &normalBalance, &parentID, &debitSum, &creditSum)
 		if err != nil {
 			continue
 		}
+
+		acc.ParentID = parentID
 
 		// Calculate balance based on normal balance
 		if normalBalance == "debit" {
@@ -87,6 +89,49 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 			}
 		}
 
+		allAccounts = append(allAccounts, acc)
+	}
+
+	// Build parent-child hierarchy (e.g., 1300 = sum of 1310+1320+1330+1340)
+	parentMap := make(map[uuid.UUID]*entity.TrialBalanceAccount)
+	childMap := make(map[uuid.UUID][]entity.TrialBalanceAccount)
+	for i := range allAccounts {
+		parentMap[allAccounts[i].AccountID] = &allAccounts[i]
+		if allAccounts[i].ParentID != nil {
+			childMap[*allAccounts[i].ParentID] = append(childMap[*allAccounts[i].ParentID], allAccounts[i])
+		}
+	}
+
+	// Build final list: parent accounts get children nested, children are excluded from top level
+	accounts := make([]entity.TrialBalanceAccount, 0)
+	childIDs := make(map[uuid.UUID]bool)
+	for parentID, children := range childMap {
+		if parent, ok := parentMap[parentID]; ok {
+			parent.IsParent = true
+			parent.Children = children
+			// Recalculate parent balance as sum of children
+			var childDebit, childCredit float64
+			for _, ch := range children {
+				childDebit += ch.DebitBalance
+				childCredit += ch.CreditBalance
+			}
+			if childDebit > 0 || childCredit > 0 {
+				parent.DebitBalance = childDebit
+				parent.CreditBalance = childCredit
+			}
+		}
+		for _, ch := range children {
+			childIDs[ch.AccountID] = true
+		}
+	}
+
+	for _, acc := range allAccounts {
+		if childIDs[acc.AccountID] {
+			continue // Skip children at top level (they're nested)
+		}
+		if acc.DebitBalance == 0 && acc.CreditBalance == 0 && !acc.IsParent {
+			continue // Skip zero-balance non-parent accounts
+		}
 		totalDebit += acc.DebitBalance
 		totalCredit += acc.CreditBalance
 		accounts = append(accounts, acc)

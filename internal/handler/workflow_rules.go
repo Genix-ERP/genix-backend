@@ -795,7 +795,248 @@ func (h *Handler) RunWorkflowScheduler(interval time.Duration) {
 		for range ticker.C {
 			h.log.Debug("Running workflow threshold checks")
 			h.CheckThresholdRules()
+			h.autoRunReplenishment()
 		}
 	}()
 	h.log.Info("Workflow scheduler started", "interval", interval)
+}
+
+// autoRunReplenishment checks all tenants for active reorder rules with auto_create_po=true
+// and creates draft purchase orders when stock falls below min_qty.
+func (h *Handler) autoRunReplenishment() {
+	// Find all tenants with active auto-PO reorder rules
+	tenantRows, err := h.db.Query(`
+		SELECT DISTINCT tenant_id FROM reorder_rules
+		WHERE is_active = true AND auto_create_po = true
+	`)
+	if err != nil {
+		h.log.Error("Auto replenishment: failed to query tenants", "error", err)
+		return
+	}
+	defer tenantRows.Close()
+
+	var tenantIDs []uuid.UUID
+	for tenantRows.Next() {
+		var tid uuid.UUID
+		if err := tenantRows.Scan(&tid); err == nil {
+			tenantIDs = append(tenantIDs, tid)
+		}
+	}
+
+	for _, tenantID := range tenantIDs {
+		h.autoReplenishForTenant(tenantID)
+	}
+}
+
+// autoReplenishForTenant creates purchase orders for a single tenant's auto reorder rules.
+func (h *Handler) autoReplenishForTenant(tenantID uuid.UUID) {
+	now := time.Now()
+
+	// Query rules where stock <= min_qty, auto_create_po=true,
+	// and not triggered within the last hour (dedup)
+	rows, err := h.db.Query(`
+		SELECT r.id, r.product_id, r.warehouse_id, r.min_qty, r.max_qty, r.reorder_qty,
+			   r.preferred_vendor_id, r.lead_time_days,
+			   p.name as product_name,
+			   COALESCE(SUM(i.quantity_available), 0) as current_stock
+		FROM reorder_rules r
+		JOIN products p ON r.product_id = p.id
+		LEFT JOIN inventory i ON r.product_id = i.product_id
+			AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
+		WHERE r.tenant_id = $1
+			AND r.is_active = true
+			AND r.auto_create_po = true
+			AND (r.last_triggered_at IS NULL OR r.last_triggered_at < NOW() - INTERVAL '1 hour')
+		GROUP BY r.id, r.product_id, r.warehouse_id, r.min_qty, r.max_qty, r.reorder_qty,
+				 r.preferred_vendor_id, r.lead_time_days, p.name
+		HAVING COALESCE(SUM(i.quantity_available), 0) <= r.min_qty
+		ORDER BY r.preferred_vendor_id NULLS LAST, p.name
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Auto replenishment: failed to query rules", "error", err, "tenant_id", tenantID)
+		return
+	}
+	defer rows.Close()
+
+	type reorderItem struct {
+		RuleID      uuid.UUID
+		ProductID   uuid.UUID
+		ProductName string
+		WarehouseID *uuid.UUID
+		MinQty      float64
+		MaxQty      float64
+		ReorderQty  float64
+		VendorID    *uuid.UUID
+		LeadDays    int
+		Stock       float64
+		OrderQty    float64
+	}
+
+	var items []reorderItem
+	for rows.Next() {
+		var item reorderItem
+		var warehouseID, vendorID sql.NullString
+		var maxQty sql.NullFloat64
+
+		if err := rows.Scan(&item.RuleID, &item.ProductID, &warehouseID, &item.MinQty, &maxQty,
+			&item.ReorderQty, &vendorID, &item.LeadDays, &item.ProductName, &item.Stock); err != nil {
+			h.log.Error("Auto replenishment: scan error", "error", err)
+			continue
+		}
+
+		if warehouseID.Valid {
+			wid, _ := uuid.Parse(warehouseID.String)
+			item.WarehouseID = &wid
+		}
+		if vendorID.Valid {
+			vid, _ := uuid.Parse(vendorID.String)
+			item.VendorID = &vid
+		}
+		if maxQty.Valid {
+			item.MaxQty = maxQty.Float64
+		}
+
+		// Calculate order quantity
+		if item.MaxQty > 0 {
+			item.OrderQty = item.MaxQty - item.Stock
+		} else {
+			item.OrderQty = item.ReorderQty
+		}
+		if item.OrderQty < item.ReorderQty {
+			item.OrderQty = item.ReorderQty
+		}
+
+		items = append(items, item)
+	}
+
+	if len(items) == 0 {
+		return
+	}
+
+	// Get organization_id for this tenant
+	var orgID *uuid.UUID
+	var oid uuid.UUID
+	if err := h.db.QueryRow(`SELECT id FROM organizations WHERE tenant_id = $1 LIMIT 1`, tenantID).Scan(&oid); err == nil {
+		orgID = &oid
+	}
+
+	// Get a system user (first admin) for requested_by
+	var systemUserID uuid.UUID
+	h.db.QueryRow(`SELECT id FROM users WHERE tenant_id = $1 AND is_active = true ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&systemUserID)
+
+	// Group items by vendor
+	vendorGroups := make(map[string][]reorderItem)
+	var noVendorItems []reorderItem
+	for _, item := range items {
+		if item.VendorID != nil {
+			vendorGroups[item.VendorID.String()] = append(vendorGroups[item.VendorID.String()], item)
+		} else {
+			noVendorItems = append(noVendorItems, item)
+		}
+	}
+
+	ordersCreated := 0
+
+	// Create PO per vendor
+	for vidStr, group := range vendorGroups {
+		vid, _ := uuid.Parse(vidStr)
+		poID := uuid.New()
+		orderNumber := fmt.Sprintf("PO-%s-%04d", now.Format("20060102"), ordersCreated+1)
+
+		// Try to get a proper sequential number
+		h.db.QueryRow(`
+			SELECT 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || LPAD(
+				(COALESCE(MAX(CAST(SUBSTRING(order_number FROM 'PO-[0-9]+-([0-9]+)') AS INTEGER)), 0) + 1)::TEXT, 4, '0')
+			FROM purchase_orders WHERE tenant_id = $1 AND order_number LIKE 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
+		`, tenantID).Scan(&orderNumber)
+
+		_, err := h.db.Exec(`
+			INSERT INTO purchase_orders (
+				id, tenant_id, organization_id, order_number, vendor_id, order_date, status, payment_status,
+				subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
+				exchange_rate, requested_by, notes, is_auto_replenishment, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,'draft','unpaid',0,0,0,0,0,1.0,$7,'Avtomatik qayta buyurtma',true,$8,$8)
+		`, poID, tenantID, orgID, orderNumber, vid, now, systemUserID, now)
+		if err != nil {
+			h.log.Error("Auto replenishment: failed to create PO", "error", err, "vendor_id", vidStr)
+			continue
+		}
+
+		var subtotal float64
+		for lineNum, item := range group {
+			var unitPrice float64
+			if err := h.db.QueryRow(`SELECT price FROM vendor_prices WHERE vendor_id=$1 AND product_id=$2 AND tenant_id=$3 ORDER BY created_at DESC LIMIT 1`,
+				vid, item.ProductID, tenantID).Scan(&unitPrice); err != nil {
+				h.db.QueryRow(`SELECT COALESCE(purchase_price, 0) FROM products WHERE id=$1`, item.ProductID).Scan(&unitPrice)
+			}
+
+			lineTotal := item.OrderQty * unitPrice
+			h.db.Exec(`
+				INSERT INTO purchase_order_lines (
+					id, purchase_order_id, line_number, product_id, description, quantity,
+					unit_price, discount_amount, tax_amount, line_total, warehouse_id,
+					quantity_received, quantity_invoiced, reorder_rule_id, created_at, updated_at
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,0,0,$8,$9,0,0,$10,$11,$11)
+			`, uuid.New(), poID, lineNum+1, item.ProductID, item.ProductName, item.OrderQty,
+				unitPrice, lineTotal, item.WarehouseID, item.RuleID, now)
+
+			subtotal += lineTotal
+
+			// Mark rule as triggered
+			h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id=$2`, now, item.RuleID)
+		}
+
+		h.db.Exec(`UPDATE purchase_orders SET subtotal=$1, total_amount=$1, updated_at=$2 WHERE id=$3`, subtotal, now, poID)
+		ordersCreated++
+		h.log.Info("Auto replenishment: created PO", "order_number", orderNumber, "vendor_id", vidStr, "lines", len(group), "tenant_id", tenantID)
+	}
+
+	// Items without vendor — create a single PO
+	if len(noVendorItems) > 0 {
+		poID := uuid.New()
+		orderNumber := fmt.Sprintf("PO-%s-%04d", now.Format("20060102"), ordersCreated+1)
+		h.db.QueryRow(`
+			SELECT 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || LPAD(
+				(COALESCE(MAX(CAST(SUBSTRING(order_number FROM 'PO-[0-9]+-([0-9]+)') AS INTEGER)), 0) + 1)::TEXT, 4, '0')
+			FROM purchase_orders WHERE tenant_id = $1 AND order_number LIKE 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
+		`, tenantID).Scan(&orderNumber)
+
+		_, err := h.db.Exec(`
+			INSERT INTO purchase_orders (
+				id, tenant_id, organization_id, order_number, vendor_id, order_date, status, payment_status,
+				subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
+				exchange_rate, requested_by, notes, is_auto_replenishment, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,NULL,$5,'draft','unpaid',0,0,0,0,0,1.0,$6,'Avtomatik qayta buyurtma (yetkazuvchisiz)',true,$7,$7)
+		`, poID, tenantID, orgID, orderNumber, now, systemUserID, now)
+		if err != nil {
+			h.log.Error("Auto replenishment: failed to create no-vendor PO", "error", err)
+		} else {
+			var subtotal float64
+			for lineNum, item := range noVendorItems {
+				var unitPrice float64
+				h.db.QueryRow(`SELECT COALESCE(purchase_price, 0) FROM products WHERE id=$1`, item.ProductID).Scan(&unitPrice)
+
+				lineTotal := item.OrderQty * unitPrice
+				h.db.Exec(`
+					INSERT INTO purchase_order_lines (
+						id, purchase_order_id, line_number, product_id, description, quantity,
+						unit_price, discount_amount, tax_amount, line_total, warehouse_id,
+						quantity_received, quantity_invoiced, reorder_rule_id, created_at, updated_at
+					) VALUES ($1,$2,$3,$4,$5,$6,$7,0,0,$8,$9,0,0,$10,$11,$11)
+				`, uuid.New(), poID, lineNum+1, item.ProductID, item.ProductName, item.OrderQty,
+					unitPrice, lineTotal, item.WarehouseID, item.RuleID, now)
+
+				subtotal += lineTotal
+				h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id=$2`, now, item.RuleID)
+			}
+
+			h.db.Exec(`UPDATE purchase_orders SET subtotal=$1, total_amount=$1, updated_at=$2 WHERE id=$3`, subtotal, now, poID)
+			ordersCreated++
+			h.log.Info("Auto replenishment: created no-vendor PO", "order_number", orderNumber, "lines", len(noVendorItems), "tenant_id", tenantID)
+		}
+	}
+
+	if ordersCreated > 0 {
+		h.log.Info("Auto replenishment: completed", "tenant_id", tenantID, "orders_created", ordersCreated, "total_items", len(items))
+	}
 }

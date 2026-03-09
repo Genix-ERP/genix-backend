@@ -61,6 +61,7 @@ type Product struct {
 	TenantID           uuid.UUID       `json:"tenant_id" db:"tenant_id"`
 	CategoryID         *uuid.UUID      `json:"category_id,omitempty" db:"category_id"`
 	Type               ProductType     `json:"type" db:"type"`
+	InventoryType      string          `json:"inventory_type" db:"inventory_type"`
 	Code               string          `json:"code" db:"code"`
 	SKU                *string         `json:"sku,omitempty" db:"sku"`
 	Barcode            *string         `json:"barcode,omitempty" db:"barcode"`
@@ -127,6 +128,7 @@ type Product struct {
 type CreateProductInput struct {
 	CategoryID       string      `json:"category_id,omitempty"`
 	Type             ProductType `json:"type" binding:"required,oneof=product service bundle"`
+	InventoryType    string      `json:"inventory_type,omitempty"`
 	Code             string      `json:"code" binding:"required,min=1,max=50"`
 	SKU              string      `json:"sku,omitempty"`
 	Barcode          string      `json:"barcode,omitempty"`
@@ -195,6 +197,7 @@ type UpdateProductInput struct {
 	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
 	IsManufacturable   *bool    `json:"is_manufacturable,omitempty"`
 	AutoManufacture    *bool    `json:"auto_manufacture,omitempty"`
+	InventoryType      *string  `json:"inventory_type,omitempty"`
 	OrganizationIDs    []string `json:"organization_ids,omitempty"`
 	IsActive           *bool    `json:"is_active,omitempty"`
 	Tags               []string `json:"tags,omitempty"`
@@ -218,6 +221,7 @@ type ProductResponse struct {
 	CategoryID       *uuid.UUID       `json:"category_id,omitempty"`
 	Category         *ProductCategory `json:"category,omitempty"`
 	Type             ProductType      `json:"type"`
+	InventoryType    string           `json:"inventory_type"`
 	Code             string           `json:"code"`
 	SKU              *string          `json:"sku,omitempty"`
 	Barcode          *string          `json:"barcode,omitempty"`

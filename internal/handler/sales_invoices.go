@@ -1023,12 +1023,17 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 			}
 		}
 		lineRows.Close()
-		// Resolve category accounts after closing rows
+		// Resolve accounts after closing rows: prefer inventory-type account for COGS credit, fallback to category
 		for i := range invoiceLines {
 			ca := getCategoryAccounts(tx, tenantID, organizationID, invoiceLines[i].ProductID)
 			invoiceLines[i].IncomeAcct = ca.IncomeAccountID
 			invoiceLines[i].ExpenseAcct = ca.ExpenseAccountID
-			invoiceLines[i].OutputAcct = ca.StockOutputAccountID
+			invAcct := getInventoryAccountByType(tx, tenantID, organizationID, invoiceLines[i].ProductID)
+			if invAcct != uuid.Nil {
+				invoiceLines[i].OutputAcct = invAcct
+			} else {
+				invoiceLines[i].OutputAcct = ca.StockOutputAccountID
+			}
 		}
 	}
 
@@ -2054,7 +2059,12 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 				ca := getCategoryAccounts(h.db, tenantID, orgPtr, acctLines[i].ProductID)
 				acctLines[i].IncomeAcct = ca.IncomeAccountID
 				acctLines[i].ExpenseAcct = ca.ExpenseAccountID
-				acctLines[i].OutputAcct = ca.StockOutputAccountID
+				invAcct := getInventoryAccountByType(h.db, tenantID, orgPtr, acctLines[i].ProductID)
+				if invAcct != uuid.Nil {
+					acctLines[i].OutputAcct = invAcct
+				} else {
+					acctLines[i].OutputAcct = ca.StockOutputAccountID
+				}
 			}
 		}
 
