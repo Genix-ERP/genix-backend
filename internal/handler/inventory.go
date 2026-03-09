@@ -448,7 +448,8 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 
 	var input entity.InventoryAdjustmentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -798,7 +799,8 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 
 	var input entity.InventoryTransferInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1857,7 +1859,8 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 
 	var input entity.CreateBOMInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2047,7 +2050,8 @@ func (h *Handler) UpdateBOM(c *gin.Context) {
 
 	var input entity.UpdateBOMInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2207,7 +2211,8 @@ func (h *Handler) CreateBOMLine(c *gin.Context) {
 
 	var input entity.CreateBOMLineInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2564,7 +2569,8 @@ func (h *Handler) CreateBOMOperation(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2705,7 +2711,8 @@ func (h *Handler) UpdateBOMOperation(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2960,7 +2967,8 @@ func (h *Handler) CreateScrapReason(c *gin.Context) {
 
 	var input entity.CreateScrapReasonInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3251,7 +3259,8 @@ func (h *Handler) CreateScrapOrder(c *gin.Context) {
 
 	var input entity.CreateScrapOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3941,7 +3950,8 @@ func (h *Handler) CreateReorderRule(c *gin.Context) {
 
 	var input entity.CreateReorderRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -4050,7 +4060,8 @@ func (h *Handler) UpdateReorderRule(c *gin.Context) {
 
 	var input entity.UpdateReorderRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -5123,7 +5134,8 @@ func (h *Handler) CreateStockCount(c *gin.Context) {
 
 	var input entity.CreateStockCountInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -5189,7 +5201,8 @@ func (h *Handler) CreateStockCount(c *gin.Context) {
 	`, id, tenantID, orgIDPtr, warehouseID, countNumber, countType, countDate, notes, countedByName, userIDPtr, now)
 	if err != nil {
 		h.log.Error("Failed to create stock count", "error", err, "count_number", countNumber, "warehouse_id", warehouseID, "org_id", orgIDPtr)
-		response.InternalError(c, "Failed to create stock count: "+err.Error())
+		h.log.Error("Failed to create stock count", "error", err)
+		response.InternalError(c, "Failed to create stock count")
 		return
 	}
 
@@ -5257,7 +5270,8 @@ func (h *Handler) CreateStockCount(c *gin.Context) {
 
 	if err = tx.Commit(); err != nil {
 		h.log.Error("Failed to commit stock count transaction", "error", err)
-		response.InternalError(c, "Failed to create stock count: "+err.Error())
+		h.log.Error("Failed to create stock count", "error", err)
+		response.InternalError(c, "Failed to create stock count")
 		return
 	}
 
@@ -5282,7 +5296,8 @@ func (h *Handler) RecordCountLine(c *gin.Context) {
 
 	var input entity.RecordCountLineInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -5851,7 +5866,8 @@ func (h *Handler) CreateStockOperation(c *gin.Context) {
 
 	var input entity.CreateStockOperationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -6427,7 +6443,8 @@ func (h *Handler) UpdateStockOperation(c *gin.Context) {
 
 	var input entity.UpdateStockOperationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -6523,7 +6540,8 @@ func (h *Handler) UpdateStockOperationLines(c *gin.Context) {
 
 	var input entity.UpdateStockOperationLinesInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -6604,7 +6622,8 @@ func (h *Handler) AddStockOperationLine(c *gin.Context) {
 
 	var input entity.AddStockOperationLineInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -6942,7 +6961,8 @@ func (h *Handler) SaveOperationTypeSteps(c *gin.Context) {
 		Instructions     string   `json:"instructions"`
 	}
 	if err := c.ShouldBindJSON(&steps); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -7051,7 +7071,8 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 
 	var input entity.AssignResponsibleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -7140,7 +7161,8 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 			VALUES ($1, $2, $3, $4, $5, $6, 'inventory_shortage', $7, 'pending', $8, $9, $9)
 		`, deductionID, tenantID, orgIDPtr, employeeID, shortageAmount, reason, lineID, userID, now)
 		if err != nil {
-			response.InternalError(c, "Failed to create deduction: "+err.Error())
+			h.log.Error("Failed to create deduction", "error", err)
+			response.InternalError(c, "Failed to create deduction")
 			return
 		}
 
@@ -7168,7 +7190,8 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 	}
 
 	if err = tx.Commit(); err != nil {
-		response.InternalError(c, "Failed to commit: "+err.Error())
+		h.log.Error("Failed to commit", "error", err)
+		response.InternalError(c, "Failed to commit")
 		return
 	}
 
@@ -7261,7 +7284,8 @@ func (h *Handler) CancelDeduction(c *gin.Context) {
 
 	var input entity.CancelDeductionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

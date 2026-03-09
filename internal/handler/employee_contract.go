@@ -188,7 +188,8 @@ func (h *Handler) CreateEmployeeContract(c *gin.Context) {
 
 	var input entity.CreateEmployeeContractInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -410,7 +411,8 @@ func (h *Handler) UpdateEmployeeContract(c *gin.Context) {
 
 	var input entity.UpdateEmployeeContractInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

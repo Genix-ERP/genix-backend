@@ -108,7 +108,8 @@ func (h *Handler) SavePBXConfig(c *gin.Context) {
 
 	var config PBXConfig
 	if err := c.ShouldBindJSON(&config); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -167,7 +168,8 @@ func (h *Handler) TestPBXConnection(c *gin.Context) {
 
 	auth, err := h.authenticateOnlinePBX(input.Domain, input.APIKey)
 	if err != nil {
-		response.Success(c, gin.H{"connected": false, "error": err.Error()})
+		h.log.Error("PBX authentication failed", "error", err)
+		response.Success(c, gin.H{"connected": false, "error": "Authentication failed"})
 		return
 	}
 
@@ -190,7 +192,8 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 		ContactID  string `json:"contact_id"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -318,7 +321,7 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 	}
 
 	// POST requests are actual webhook events
-	bodyBytes, _ := io.ReadAll(c.Request.Body)
+	bodyBytes, _ := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20)) // 1MB limit
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	var data map[string]interface{}

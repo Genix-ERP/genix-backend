@@ -86,7 +86,8 @@ func (h *Handler) CreateCostCategory(c *gin.Context) {
 		DefaultCreditAccountID string `json:"default_credit_account_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -136,7 +137,8 @@ func (h *Handler) UpdateCostCategory(c *gin.Context) {
 		IsActive               *bool  `json:"is_active"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -211,7 +213,8 @@ func (h *Handler) UpsertAccountMapping(c *gin.Context) {
 		AccountID string `json:"account_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

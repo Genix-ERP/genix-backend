@@ -128,7 +128,8 @@ func (h *Handler) CreateProcurementRule(c *gin.Context) {
 
 	var input entity.CreateProcurementRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -266,7 +267,8 @@ func (h *Handler) UpdateProcurementRule(c *gin.Context) {
 
 	var input entity.UpdateProcurementRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

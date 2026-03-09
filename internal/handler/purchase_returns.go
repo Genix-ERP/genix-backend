@@ -114,7 +114,8 @@ func (h *Handler) ListPurchaseReturns(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch purchase returns: "+err.Error())
+		h.log.Error("Failed to fetch purchase returns", "error", err)
+		response.InternalError(c, "Failed to fetch purchase returns")
 		return
 	}
 	defer rows.Close()
@@ -260,7 +261,8 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -332,7 +334,8 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 		input.ShippingMethod, input.Notes, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create purchase return: "+err.Error())
+		h.log.Error("Failed to create purchase return", "error", err)
+		response.InternalError(c, "Failed to create purchase return")
 		return
 	}
 
@@ -472,7 +475,8 @@ func (h *Handler) GetPurchaseReturn(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch purchase return: "+err.Error())
+		h.log.Error("Failed to fetch purchase return", "error", err)
+		response.InternalError(c, "Failed to fetch purchase return")
 		return
 	}
 
@@ -774,7 +778,8 @@ func (h *Handler) RejectPurchaseReturn(c *gin.Context) {
 		Reason string `json:"reason" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1091,7 +1096,8 @@ func (h *Handler) ApplyCreditNote(c *gin.Context) {
 		CreditAmount     float64 `json:"credit_amount" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

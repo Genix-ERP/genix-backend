@@ -342,7 +342,8 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 
 	var input entity.WorkCenterInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -543,7 +544,8 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 
 	var input entity.WorkCenterInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1331,7 +1333,8 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 
 	var input entity.ProductionOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1445,7 +1448,8 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 
 	var input entity.ProductionOrderUpdateInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -2820,7 +2824,8 @@ func (h *Handler) RecordProduction(c *gin.Context) {
 		Notes            string  `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3216,7 +3221,8 @@ func (h *Handler) CreateEquipment(c *gin.Context) {
 		Notes                   *string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3307,7 +3313,8 @@ func (h *Handler) UpdateEquipment(c *gin.Context) {
 		Notes                   *string  `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3489,7 +3496,8 @@ func (h *Handler) CreateMaintenanceTask(c *gin.Context) {
 		Notes           *string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3596,7 +3604,8 @@ func (h *Handler) UpdateMaintenanceTask(c *gin.Context) {
 		Notes           *string  `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3711,7 +3720,8 @@ func (h *Handler) CreateManufacturingCategory(c *gin.Context) {
 		SortOrder   *int    `json:"sort_order"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -3778,7 +3788,8 @@ func (h *Handler) UpdateManufacturingCategory(c *gin.Context) {
 		SortOrder   *int    `json:"sort_order"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

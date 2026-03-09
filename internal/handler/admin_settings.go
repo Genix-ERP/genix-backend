@@ -221,7 +221,8 @@ func (h *Handler) UpdateAdminSettings(c *gin.Context) {
 
 	var input map[string]interface{}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -281,7 +282,8 @@ func (h *Handler) UpdateAdminSettingsSection(c *gin.Context) {
 		Data map[string]interface{} `json:"data"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

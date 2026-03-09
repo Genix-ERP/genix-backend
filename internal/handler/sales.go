@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // ListSalesOrders returns paginated list of sales orders
@@ -135,7 +136,8 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales orders: "+err.Error())
+		h.log.Error("Failed to fetch sales orders", "error", err)
+		response.InternalError(c, "Failed to fetch sales orders")
 		return
 	}
 	defer rows.Close()
@@ -308,7 +310,8 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 
 	var input SimpleSalesOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -512,7 +515,8 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 	)
 	if err != nil {
 		h.log.Error("Failed to create sales order", "error", err, "customer_id", customerID, "order_number", orderNumber)
-		response.InternalError(c, "Failed to create sales order: "+err.Error())
+		h.log.Error("Failed to create sales order", "error", err)
+		response.InternalError(c, "Failed to create sales order")
 		return
 	}
 
@@ -687,7 +691,8 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		h.log.Error("Failed to fetch sales order", "error", err)
+		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
 
@@ -873,7 +878,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 	var input entity.UpdateSalesOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1013,7 +1019,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update sales order: "+err.Error())
+		h.log.Error("Failed to update sales order", "error", err)
+		response.InternalError(c, "Failed to update sales order")
 		return
 	}
 
@@ -1081,62 +1088,115 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 				WHERE sales_order_id = $1 AND product_id IS NOT NULL
 			`, orderID)
 			if err == nil {
-				defer soLines.Close()
+				// Collect all SO lines first
+				type soLine struct {
+					LineID    uuid.UUID
+					ProductID uuid.UUID
+					Qty       float64
+					UnitPrice float64
+				}
+				var lines []soLine
+				var allProductIDs []uuid.UUID
 				for soLines.Next() {
-					var lineID, productID uuid.UUID
-					var qty, unitPrice float64
-					if err := soLines.Scan(&lineID, &productID, &qty, &unitPrice); err != nil {
+					var l soLine
+					if err := soLines.Scan(&l.LineID, &l.ProductID, &l.Qty, &l.UnitPrice); err != nil {
 						continue
 					}
+					lines = append(lines, l)
+					allProductIDs = append(allProductIDs, l.ProductID)
+				}
+				soLines.Close()
 
-					// Update quantity_delivered on SO line
+				if len(lines) > 0 {
+					// Batch UPDATE quantity_delivered on all SO lines
+					solIDs := make([]uuid.UUID, len(lines))
+					for i, l := range lines {
+						solIDs[i] = l.LineID
+					}
 					h.db.Exec(`
 						UPDATE sales_order_lines
 						SET quantity_delivered = quantity, updated_at = $1
-						WHERE id = $2
-					`, now, lineID)
+						WHERE id = ANY($2)
+					`, now, pq.Array(solIDs))
 
-					// Find or create inventory record
-					var inventoryID uuid.UUID
-					err := h.db.QueryRow(`
-						SELECT id FROM inventory
-						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-						ORDER BY created_at ASC LIMIT 1
-					`, tenantID, productID, warehouseID).Scan(&inventoryID)
-
-					if err == sql.ErrNoRows {
-						inventoryID = uuid.New()
-						var orgID interface{}
-						if soOrgID.Valid && soOrgID.String != "" {
-							orgID, _ = uuid.Parse(soOrgID.String)
+					// ONE query: get all existing inventory records for these products
+					invMap := make(map[uuid.UUID]uuid.UUID) // productID -> inventoryID
+					invRows, invErr := h.db.Query(`
+						SELECT DISTINCT ON (product_id) id, product_id FROM inventory
+						WHERE tenant_id = $1 AND product_id = ANY($2) AND warehouse_id = $3
+						ORDER BY product_id, created_at ASC
+					`, tenantID, pq.Array(allProductIDs), warehouseID)
+					if invErr == nil {
+						for invRows.Next() {
+							var invID, pid uuid.UUID
+							if err := invRows.Scan(&invID, &pid); err == nil {
+								invMap[pid] = invID
+							}
 						}
-						h.db.Exec(`
-							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-							VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-						`, inventoryID, tenantID, productID, warehouseID, orgID, unitPrice, now)
-					} else if err != nil {
-						h.log.Error("Failed to query inventory for SO shipment", "product_id", productID, "warehouse_id", warehouseID, "error", err)
-						continue
+						invRows.Close()
 					}
 
-					// Decrease inventory
-					h.db.Exec(`
-						UPDATE inventory
-						SET quantity_on_hand = quantity_on_hand - $1,
-							last_movement_date = $2,
-							updated_at = $2
-						WHERE id = $3
-					`, qty, now, inventoryID)
+					// Determine orgID once for potential inserts
+					var orgIDVal interface{}
+					if soOrgID.Valid && soOrgID.String != "" {
+						orgIDVal, _ = uuid.Parse(soOrgID.String)
+					}
 
-					// Create inventory transaction
-					txID := uuid.New()
-					h.db.Exec(`
-						INSERT INTO inventory_transactions (
-							id, tenant_id, inventory_id, transaction_type, quantity,
-							unit_cost, total_cost, reference_type, reference_id,
-							reason, transaction_date, created_at
-						) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'sales_order', $7, 'Sales Order Shipped', $8, $8)
-					`, txID, tenantID, inventoryID, -qty, unitPrice, qty*unitPrice, orderID, now)
+					// Batch INSERT for missing inventory records
+					var newInvValues []string
+					var newInvArgs []interface{}
+					newInvArgIdx := 0
+					for _, l := range lines {
+						if _, ok := invMap[l.ProductID]; !ok {
+							newID := uuid.New()
+							invMap[l.ProductID] = newID
+							newInvValues = append(newInvValues, fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,0,0,$%d,$%d,$%d)",
+								newInvArgIdx+1, newInvArgIdx+2, newInvArgIdx+3, newInvArgIdx+4, newInvArgIdx+5, newInvArgIdx+6, newInvArgIdx+7, newInvArgIdx+8))
+							newInvArgs = append(newInvArgs, newID, tenantID, l.ProductID, warehouseID, orgIDVal, l.UnitPrice, now, now)
+							newInvArgIdx += 8
+						}
+					}
+					if len(newInvValues) > 0 {
+						h.db.Exec(`
+							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+							VALUES `+strings.Join(newInvValues, ","), newInvArgs...)
+					}
+
+					// Batch UPDATE inventory quantities and batch INSERT inventory transactions
+					var txValues []string
+					var txArgs []interface{}
+					txArgIdx := 0
+					for _, l := range lines {
+						inventoryID, ok := invMap[l.ProductID]
+						if !ok {
+							continue
+						}
+
+						// Individual UPDATE for inventory (each has different qty)
+						h.db.Exec(`
+							UPDATE inventory
+							SET quantity_on_hand = quantity_on_hand - $1,
+								last_movement_date = $2,
+								updated_at = $2
+							WHERE id = $3
+						`, l.Qty, now, inventoryID)
+
+						txID := uuid.New()
+						txValues = append(txValues, fmt.Sprintf("($%d,$%d,$%d,'issue',$%d,$%d,$%d,'sales_order',$%d,'Sales Order Shipped',$%d,$%d)",
+							txArgIdx+1, txArgIdx+2, txArgIdx+3, txArgIdx+4, txArgIdx+5, txArgIdx+6, txArgIdx+7, txArgIdx+8, txArgIdx+9))
+						txArgs = append(txArgs, txID, tenantID, inventoryID, -l.Qty, l.UnitPrice, l.Qty*l.UnitPrice, orderID, now, now)
+						txArgIdx += 9
+					}
+
+					// ONE INSERT for all inventory transactions
+					if len(txValues) > 0 {
+						h.db.Exec(`
+							INSERT INTO inventory_transactions (
+								id, tenant_id, inventory_id, transaction_type, quantity,
+								unit_cost, total_cost, reference_type, reference_id,
+								reason, transaction_date, created_at
+							) VALUES `+strings.Join(txValues, ","), txArgs...)
+					}
 				}
 			}
 
@@ -1431,7 +1491,8 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		h.log.Error("Failed to fetch sales order", "error", err)
+		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
 	if currentStatus != string(entity.OrderStatusDraft) {
@@ -1845,7 +1906,8 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	}
 	if err != nil {
 		h.log.Error("Failed to fetch sales order", "error", err, "order_id", orderID)
-		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		h.log.Error("Failed to fetch sales order", "error", err)
+		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
 
@@ -2012,7 +2074,8 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	)
 	if err != nil {
 		h.log.Error("CreateInvoiceFromOrder: INSERT failed", "error", err)
-		response.InternalError(c, "Failed to create invoice: "+err.Error())
+		h.log.Error("Failed to create invoice", "error", err)
+		response.InternalError(c, "Failed to create invoice")
 		return
 	}
 	h.log.Info("CreateInvoiceFromOrder: INSERT succeeded")
