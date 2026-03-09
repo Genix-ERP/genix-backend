@@ -418,6 +418,35 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		WHERE work_order_id = $4 AND end_time IS NULL
 	`, now, durationHours, input.Notes, woID)
 
+	// Update work center utilization
+	var wcIDStr sql.NullString
+	h.db.QueryRow(`SELECT work_center_id::text FROM work_orders WHERE id = $1`, woID).Scan(&wcIDStr)
+	if wcIDStr.Valid && wcIDStr.String != "" {
+		workCenterID, parseErr := uuid.Parse(wcIDStr.String)
+		if parseErr == nil && workCenterID != uuid.Nil {
+			var totalHours float64
+			var operatingHours float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(wo.actual_duration_hours), 0)
+				FROM work_orders wo
+				WHERE wo.work_center_id = $1 AND wo.tenant_id = $2 AND wo.status IN ('completed', 'done')
+					AND wo.deleted_at IS NULL
+			`, workCenterID, tenantID).Scan(&totalHours)
+			h.db.QueryRow(`
+				SELECT COALESCE(working_hours_per_day, 8) FROM work_centers WHERE id = $1 AND tenant_id = $2
+			`, workCenterID, tenantID).Scan(&operatingHours)
+			if operatingHours > 0 {
+				// Utilization = total hours worked / (operating hours per day × 30 days) × 100
+				utilization := (totalHours / (operatingHours * 30)) * 100
+				if utilization > 100 {
+					utilization = 100
+				}
+				h.db.Exec(`UPDATE work_centers SET current_utilization = $1 WHERE id = $2 AND tenant_id = $3`,
+					utilization, workCenterID, tenantID)
+			}
+		}
+	}
+
 	// Get the production order ID and current work order sequence
 	var productionOrderID uuid.UUID
 	var currentSequence int
@@ -1378,7 +1407,7 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		SELECT product_id, warehouse_id, organization_id, quantity_planned
 		FROM production_orders WHERE id = $1 AND tenant_id = $2
 	`, poID, tenantID).Scan(&productID, &warehouseID, &organizationID, &qtyPlanned)
-	if err != nil || warehouseID == nil {
+	if err != nil {
 		return 0
 	}
 
@@ -1386,7 +1415,7 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		producedQty = qtyPlanned
 	}
 
-	// Calculate unit cost from BOM components (sum of component costs / bom output qty)
+	// Calculate unit cost from BOM components + operations (machine costs)
 	var bomID *uuid.UUID
 	h.db.QueryRow(`SELECT bom_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&bomID)
 
@@ -1394,12 +1423,28 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 	if bomID != nil {
 		var bomOutputQty float64
 		if h.db.QueryRow(`SELECT COALESCE(quantity, 1) FROM product_boms WHERE id = $1`, bomID).Scan(&bomOutputQty) == nil && bomOutputQty > 0 {
+			// Material cost from BOM components
+			var materialCost float64
 			h.db.QueryRow(`
-				SELECT COALESCE(SUM(bl.quantity * COALESCE(p.cost_price, 0) * (1 + COALESCE(bl.scrap_percent, 0) / 100.0)), 0) / $1
+				SELECT COALESCE(SUM(bl.quantity * COALESCE(p.cost_price, 0) * (1 + COALESCE(bl.scrap_percent, 0) / 100.0)), 0)
 				FROM bom_lines bl
 				JOIN products p ON p.id = bl.component_id
-				WHERE bl.bom_id = $2
-			`, bomOutputQty, bomID).Scan(&unitCost)
+				WHERE bl.bom_id = $1
+			`, bomID).Scan(&materialCost)
+
+			// Machine cost from BOM operations (hourly_cost / capacity_per_hour per operation)
+			var machineCost float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(
+					COALESCE(wc.hourly_cost, 0)
+					/ GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
+				), 0)
+				FROM bom_operations bo
+				LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
+				WHERE bo.bom_id = $1
+			`, bomID).Scan(&machineCost)
+
+			unitCost = (materialCost + machineCost) / bomOutputQty
 		}
 	}
 	if unitCost <= 0 {
@@ -1408,6 +1453,11 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 	// Update product's cost_price with the calculated manufacturing cost
 	if unitCost > 0 {
 		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
+	}
+
+	// If no warehouse set, just return the unitCost (for cost calculation) without inventory changes
+	if warehouseID == nil {
+		return unitCost
 	}
 
 	tx, err := h.db.Begin()
