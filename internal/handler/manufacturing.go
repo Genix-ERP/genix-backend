@@ -2091,6 +2091,76 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				h.log.Error("Failed to commit material consumption", "error", commitErr)
 			} else {
 				h.log.Info("Materials consumed for production order start", "order_id", id, "components", len(components))
+
+				// --- Create journal entry: Dt 1320 WIP / Kt 1310 Raw Materials ---
+				var totalMaterialCost float64
+				for _, comp := range components {
+					consumption := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
+					var compCost float64
+					h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
+					totalMaterialCost += consumption * compCost
+				}
+
+				if totalMaterialCost > 0 {
+					wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
+					rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+					// Fallback: try goods for resale (1340) if raw materials not found
+					if rawAcct == uuid.Nil {
+						rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "1340")
+					}
+					if rawAcct == uuid.Nil {
+						rawAcct = findAccount(h.db, tenantID, organizationID, "inventory", "1300")
+					}
+
+					if wipAcct != uuid.Nil && rawAcct != uuid.Nil {
+						var journalID uuid.UUID
+						var nextNumber int
+						err := h.db.QueryRow(`
+							SELECT id, next_number FROM journals
+							WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+							ORDER BY created_at ASC LIMIT 1
+						`, tenantID).Scan(&journalID, &nextNumber)
+
+						if err == nil && journalID != uuid.Nil {
+							var poNumber string
+							h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
+
+							entryID := uuid.New()
+							entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+							description := fmt.Sprintf("Production Order %s started - materials consumed", poNumber)
+
+							h.db.Exec(`
+								INSERT INTO journal_entries (
+									id, tenant_id, organization_id, journal_id, entry_number,
+									entry_date, description, status, total_debit, total_credit,
+									created_at, updated_at
+								) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $6, $6)
+							`, entryID, tenantID, organizationID, journalID, entryNumber,
+								now, description, totalMaterialCost)
+
+							// Dt 1320 WIP
+							h.db.Exec(`
+								INSERT INTO journal_entry_lines (
+									id, journal_entry_id, account_id, description,
+									debit_amount, credit_amount, line_number, created_at
+								) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+							`, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, now)
+
+							// Kt 1310 Raw Materials
+							h.db.Exec(`
+								INSERT INTO journal_entry_lines (
+									id, journal_entry_id, account_id, description,
+									debit_amount, credit_amount, line_number, created_at
+								) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+							`, uuid.New(), entryID, rawAcct, "Raw materials issued to production", totalMaterialCost, now)
+
+							// Increment journal number
+							h.db.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID)
+
+							h.log.Info("Created material consumption journal entry", "order_id", id, "amount", totalMaterialCost)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -2482,11 +2552,24 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 			description := fmt.Sprintf("Production Order %s completed - %s (qty: %.2f)", poNumber, productName, producedQty)
 
 			if useDetailedFlow {
-				// ---- Detailed WIP journal entry (4 pairs of lines) ----
+				// ---- Detailed WIP journal entry ----
+
+				// Check if material consumption JE was already created at production start
+				var materialJEExists int
+				h.db.QueryRow(`
+					SELECT COUNT(*) FROM journal_entries
+					WHERE tenant_id = $1 AND organization_id = $2
+					AND description LIKE '%' || $3 || '%started - materials consumed%'
+					AND status = 'posted'
+				`, tenantID, organizationID, poNumber).Scan(&materialJEExists)
+				materialAlreadyJournalized := materialJEExists > 0
 
 				// Compute actual entry total: sum of all debit amounts that will be posted
 				// Lines 1-3 flow into WIP, Line 4 transfers WIP to Finished Goods
-				wipInflow := totalMaterialCost // always included when > 0
+				wipInflow := float64(0)
+				if totalMaterialCost > 0 && !materialAlreadyJournalized {
+					wipInflow += totalMaterialCost
+				}
 				if totalMachineCost > 0 && machineAcct != uuid.Nil {
 					wipInflow += totalMachineCost
 				}
@@ -2506,8 +2589,8 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 
 				lineNum := 1
 
-				// Line 1: Dt WIP / Kt Raw Materials = materialCost
-				if totalMaterialCost > 0 {
+				// Line 1: Dt WIP / Kt Raw Materials = materialCost (skip if already journalized at start)
+				if totalMaterialCost > 0 && !materialAlreadyJournalized {
 					h.db.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, account_id, description,
