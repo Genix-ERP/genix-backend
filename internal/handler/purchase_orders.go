@@ -1773,21 +1773,12 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 				}
 			}
 
-			// Generate entry number from actual MAX in journal_entries (avoids stale counter issues)
+			// Generate unique entry number using UUID suffix (guaranteed unique)
 			prefix := "BILL-"
 			if numberPrefix.Valid && numberPrefix.String != "" {
 				prefix = numberPrefix.String
 			}
-			var maxNum int
-			tx.QueryRow(`
-				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1
-				FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2`,
-				tenantID, purchaseJournalID,
-			).Scan(&maxNum)
-			if maxNum == 0 {
-				maxNum = 1
-			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, maxNum)
+			entryNumber := fmt.Sprintf("%s%s-%s", prefix, now.Format("20060102"), uuid.New().String()[:6])
 
 			totalDebit := totalAmount
 			totalCredit := totalAmount
