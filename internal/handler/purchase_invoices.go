@@ -859,10 +859,15 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 				}
 			}
 			lineRows.Close()
-			// Resolve category accounts after closing rows
+			// Resolve accounts after closing rows: prefer inventory-type account, fallback to category
 			for i := range billLines {
-				ca := getCategoryAccounts(tx, tenantID, organizationID, billLines[i].ProductID)
-				billLines[i].InputAcct = ca.StockInputAccountID
+				invAcct := getInventoryAccountByType(tx, tenantID, organizationID, billLines[i].ProductID)
+				if invAcct != uuid.Nil {
+					billLines[i].InputAcct = invAcct
+				} else {
+					ca := getCategoryAccounts(tx, tenantID, organizationID, billLines[i].ProductID)
+					billLines[i].InputAcct = ca.StockInputAccountID
+				}
 			}
 		}
 

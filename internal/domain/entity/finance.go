@@ -753,12 +753,15 @@ type TrialBalanceReport struct {
 
 // TrialBalanceAccount represents a single account in trial balance
 type TrialBalanceAccount struct {
-	AccountID     uuid.UUID `json:"account_id"`
-	AccountCode   string    `json:"account_code"`
-	AccountName   string    `json:"account_name"`
-	Category      string    `json:"category"`
-	DebitBalance  float64   `json:"debit_balance"`
-	CreditBalance float64   `json:"credit_balance"`
+	AccountID     uuid.UUID              `json:"account_id"`
+	AccountCode   string                 `json:"account_code"`
+	AccountName   string                 `json:"account_name"`
+	Category      string                 `json:"category"`
+	DebitBalance  float64                `json:"debit_balance"`
+	CreditBalance float64                `json:"credit_balance"`
+	ParentID      *uuid.UUID             `json:"parent_id,omitempty"`
+	IsParent      bool                   `json:"is_parent,omitempty"`
+	Children      []TrialBalanceAccount  `json:"children,omitempty"`
 }
 
 // BalanceSheetReport represents balance sheet data

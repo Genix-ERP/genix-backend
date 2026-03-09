@@ -623,3 +623,26 @@ func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, prod
 	}
 	return ca
 }
+
+// getInventoryAccountByType returns the GL account based on a product's inventory_type.
+// raw → 1310, trade → 1340, finished → 1330, service → uuid.Nil
+func getInventoryAccountByType(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, productID uuid.UUID) uuid.UUID {
+	var inventoryType string
+	_ = q.QueryRow(
+		`SELECT COALESCE(inventory_type, 'trade') FROM products WHERE id = $1`,
+		productID,
+	).Scan(&inventoryType)
+
+	switch inventoryType {
+	case "raw":
+		return findAccount(q, tenantID, orgID, "raw materials", "1310")
+	case "finished":
+		return findAccount(q, tenantID, orgID, "finished goods", "1330")
+	case "trade":
+		return findAccount(q, tenantID, orgID, "goods for resale", "1340")
+	case "service":
+		return uuid.Nil
+	default:
+		return findAccount(q, tenantID, orgID, "goods for resale", "1340")
+	}
+}
