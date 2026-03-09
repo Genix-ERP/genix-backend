@@ -288,7 +288,8 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 
 	var input entity.CreateFixedAssetInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -612,7 +613,8 @@ func (h *Handler) UpdateFixedAsset(c *gin.Context) {
 
 	var input entity.UpdateFixedAssetInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -764,7 +766,8 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 
 	var input entity.DisposeAssetInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -947,7 +950,8 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 
 	var input entity.CreateDepreciationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1206,7 +1210,8 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 
 	var input entity.RecordMaintenanceInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1508,7 +1513,8 @@ func (h *Handler) RecordAssetPayment(c *gin.Context) {
 
 	var input entity.RecordAssetPaymentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1693,7 +1699,8 @@ func (h *Handler) CreateAssetCategory(c *gin.Context) {
 
 	var input entity.CreateAssetCategoryInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

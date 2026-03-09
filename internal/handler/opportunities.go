@@ -284,7 +284,8 @@ func (h *Handler) CreateOpportunity(c *gin.Context) {
 
 	var input entity.CreateOpportunityInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -578,7 +579,8 @@ func (h *Handler) UpdateOpportunity(c *gin.Context) {
 
 	var input entity.UpdateOpportunityInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -964,7 +966,8 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 
 	var input entity.CreatePipelineStageInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1034,7 +1037,8 @@ func (h *Handler) UpdatePipelineStage(c *gin.Context) {
 
 	var input entity.UpdatePipelineStageInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

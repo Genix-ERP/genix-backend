@@ -177,7 +177,8 @@ func (h *Handler) CreateProject(c *gin.Context) {
 
 	var input entity.CreateProjectInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -266,7 +267,8 @@ func (h *Handler) CreateProject(c *gin.Context) {
 		notes, createdBy, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create project: "+err.Error())
+		h.log.Error("Failed to create project", "error", err)
+		response.InternalError(c, "Failed to create project")
 		return
 	}
 
@@ -390,7 +392,8 @@ func (h *Handler) UpdateProject(c *gin.Context) {
 
 	var input entity.UpdateProjectInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -530,7 +533,8 @@ func (h *Handler) UpdateProject(c *gin.Context) {
 
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update project: "+err.Error())
+		h.log.Error("Failed to update project", "error", err)
+		response.InternalError(c, "Failed to update project")
 		return
 	}
 
@@ -660,7 +664,8 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 
 	var input entity.CreateProjectTaskInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -722,7 +727,8 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 		input.EstimatedHours, 0.0, createdBy, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create task: "+err.Error())
+		h.log.Error("Failed to create task", "error", err)
+		response.InternalError(c, "Failed to create task")
 		return
 	}
 
@@ -764,7 +770,8 @@ func (h *Handler) UpdateProjectTask(c *gin.Context) {
 
 	var input entity.UpdateProjectTaskInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -968,7 +975,8 @@ func (h *Handler) CreateProjectMilestone(c *gin.Context) {
 
 	var input entity.CreateMilestoneInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -995,7 +1003,8 @@ func (h *Handler) CreateProjectMilestone(c *gin.Context) {
 		milestoneID, tenantID, projectID, input.Title, description, dueDate, "pending", now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create milestone: "+err.Error())
+		h.log.Error("Failed to create milestone", "error", err)
+		response.InternalError(c, "Failed to create milestone")
 		return
 	}
 
@@ -1030,7 +1039,8 @@ func (h *Handler) UpdateProjectMilestone(c *gin.Context) {
 
 	var input entity.UpdateMilestoneInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1087,7 +1097,8 @@ func (h *Handler) UpdateProjectMilestone(c *gin.Context) {
 
 	result, err := h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update milestone: "+err.Error())
+		h.log.Error("Failed to update milestone", "error", err)
+		response.InternalError(c, "Failed to update milestone")
 		return
 	}
 
@@ -1224,7 +1235,8 @@ func (h *Handler) CreateTimeEntry(c *gin.Context) {
 
 	var input entity.CreateTimeEntryInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1275,7 +1287,8 @@ func (h *Handler) CreateTimeEntry(c *gin.Context) {
 		entryDate, input.Hours, description, input.Billable, hourlyRate, amount, "pending", now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create time entry: "+err.Error())
+		h.log.Error("Failed to create time entry", "error", err)
+		response.InternalError(c, "Failed to create time entry")
 		return
 	}
 
@@ -1431,7 +1444,8 @@ func (h *Handler) CreateProjectExpense(c *gin.Context) {
 
 	var input entity.CreateProjectExpenseInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1539,7 +1553,8 @@ func (h *Handler) CreateProjectExpense(c *gin.Context) {
 		vendorID, vendorName, purchaseInvoiceID, receiptURL, input.Billable, "pending", notes, createdBy, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create expense: "+err.Error())
+		h.log.Error("Failed to create expense", "error", err)
+		response.InternalError(c, "Failed to create expense")
 		return
 	}
 
@@ -1713,7 +1728,8 @@ func (h *Handler) AddProjectTeamMember(c *gin.Context) {
 
 	var input entity.CreateTeamMemberInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1762,7 +1778,8 @@ func (h *Handler) AddProjectTeamMember(c *gin.Context) {
 		role, allocationPercent, startDate, endDate, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to add team member: "+err.Error())
+		h.log.Error("Failed to add team member", "error", err)
+		response.InternalError(c, "Failed to add team member")
 		return
 	}
 

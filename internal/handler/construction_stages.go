@@ -108,7 +108,8 @@ func (h *Handler) CreateConstructionStage(c *gin.Context) {
 		Notes         string  `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -166,7 +167,8 @@ func (h *Handler) UpdateConstructionStage(c *gin.Context) {
 		Notes         *string  `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -338,7 +340,8 @@ func (h *Handler) CreateConstructionSubStage(c *gin.Context) {
 		Notes    string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -382,7 +385,8 @@ func (h *Handler) UpdateConstructionSubStage(c *gin.Context) {
 		Notes    *string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

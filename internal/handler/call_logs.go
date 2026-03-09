@@ -236,7 +236,8 @@ func (h *Handler) CreateCallLog(c *gin.Context) {
 
 	var input entity.CreateCallLogInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -455,7 +456,8 @@ func (h *Handler) UpdateCallLog(c *gin.Context) {
 
 	var input entity.UpdateCallLogInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

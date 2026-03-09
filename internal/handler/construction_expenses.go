@@ -221,7 +221,8 @@ func (h *Handler) CreateExpenseLine(c *gin.Context) {
 		DocumentURL    string  `json:"document_url"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 	if req.Amount <= 0 {
@@ -350,7 +351,8 @@ func (h *Handler) UpdateExpenseLine(c *gin.Context) {
 		DocumentURL     *string  `json:"document_url"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

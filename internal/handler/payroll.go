@@ -127,7 +127,8 @@ func (h *Handler) CreatePayrollPeriod(c *gin.Context) {
 
 	var input entity.CreatePayrollPeriodInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -269,7 +270,8 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 
 	var input entity.UpdatePayrollPeriodInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -454,7 +456,8 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 
 	var input entity.CreatePayrollEntryInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

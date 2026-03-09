@@ -141,7 +141,8 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales invoices: "+err.Error())
+		h.log.Error("Failed to fetch sales invoices", "error", err)
+		response.InternalError(c, "Failed to fetch sales invoices")
 		return
 	}
 	defer rows.Close()
@@ -283,7 +284,8 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 
 	var input entity.CreateSalesInvoiceInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -377,7 +379,8 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 		createdBy, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create sales invoice: "+err.Error())
+		h.log.Error("Failed to create sales invoice", "error", err)
+		response.InternalError(c, "Failed to create sales invoice")
 		return
 	}
 
@@ -516,7 +519,8 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales invoice: "+err.Error())
+		h.log.Error("Failed to fetch sales invoice", "error", err)
+		response.InternalError(c, "Failed to fetch sales invoice")
 		return
 	}
 
@@ -772,7 +776,8 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		Status          *string `json:"status,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -866,7 +871,8 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update sales invoice: "+err.Error())
+		h.log.Error("Failed to update sales invoice", "error", err)
+		response.InternalError(c, "Failed to update sales invoice")
 		return
 	}
 
@@ -1242,7 +1248,8 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		WriteOffAmount float64 `json:"write_off_amount,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1593,7 +1600,8 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 
 	var input entity.CreateCreditNoteInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1673,7 +1681,8 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 	)
 	if err != nil {
 		h.log.Error("Failed to create credit note", "error", err)
-		response.InternalError(c, "Failed to create credit note: "+err.Error())
+		h.log.Error("Failed to create credit note", "error", err)
+		response.InternalError(c, "Failed to create credit note")
 		return
 	}
 
@@ -1969,7 +1978,8 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 		ORDER BY si.created_at
 	`, tenantID)
 	if err != nil {
-		response.InternalError(c, "Failed to query invoices: "+err.Error())
+		h.log.Error("Failed to query invoices", "error", err)
+		response.InternalError(c, "Failed to query invoices")
 		return
 	}
 	defer missingRows.Close()

@@ -176,7 +176,8 @@ func (h *Handler) CreateConstructionDailyLog(c *gin.Context) {
 
 	var req entity.CreateDailyLogInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -239,7 +240,8 @@ func (h *Handler) UpdateConstructionDailyLog(c *gin.Context) {
 
 	var req entity.UpdateDailyLogInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

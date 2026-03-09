@@ -283,7 +283,8 @@ func (h *Handler) CreateActivity(c *gin.Context) {
 
 	var input entity.CreateActivityInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -584,7 +585,8 @@ func (h *Handler) UpdateActivity(c *gin.Context) {
 
 	var input entity.UpdateActivityInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

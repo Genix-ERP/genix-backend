@@ -217,7 +217,8 @@ func (h *Handler) CreateIntercompanyTransfer(c *gin.Context) {
 
 	var input entity.CreateIntercompanyTransferInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -562,7 +563,8 @@ func (h *Handler) UpdateIntercompanyTransfer(c *gin.Context) {
 
 	var input entity.UpdateIntercompanyTransferInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1187,7 +1189,8 @@ func (h *Handler) CreateIntercompanyPayment(c *gin.Context) {
 
 	var input entity.CreateIntercompanyPaymentInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1618,7 +1621,8 @@ func (h *Handler) ListIntercompanyRules(c *gin.Context) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to list rules", err.Error())
+		h.log.Error("Failed to list rules", "error", err)
+		response.InternalError(c, "Failed to list rules")
 		return
 	}
 	defer rows.Close()
@@ -1670,7 +1674,8 @@ func (h *Handler) CreateIntercompanyRule(c *gin.Context) {
 
 	var input entity.CreateIntercompanyRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1733,7 +1738,8 @@ func (h *Handler) CreateIntercompanyRule(c *gin.Context) {
 	).Scan(&id, &createdAt, &updatedAt)
 
 	if err != nil {
-		response.Error(c, 500, "Failed to create rule", err.Error())
+		h.log.Error("Failed to create rule", "error", err)
+		response.InternalError(c, "Failed to create rule")
 		return
 	}
 
@@ -1789,7 +1795,8 @@ func (h *Handler) GetIntercompanyRule(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to get rule", err.Error())
+		h.log.Error("Failed to get rule", "error", err)
+		response.InternalError(c, "Failed to get rule")
 		return
 	}
 
@@ -1821,7 +1828,8 @@ func (h *Handler) UpdateIntercompanyRule(c *gin.Context) {
 
 	var input entity.UpdateIntercompanyRuleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1882,7 +1890,8 @@ func (h *Handler) UpdateIntercompanyRule(c *gin.Context) {
 
 	result, err := h.db.Exec(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to update rule", err.Error())
+		h.log.Error("Failed to update rule", "error", err)
+		response.InternalError(c, "Failed to update rule")
 		return
 	}
 
@@ -1911,7 +1920,8 @@ func (h *Handler) DeleteIntercompanyRule(c *gin.Context) {
 
 	result, err := h.db.Exec("DELETE FROM intercompany_rules WHERE id = $1 AND tenant_id = $2", ruleID, tenantID)
 	if err != nil {
-		response.Error(c, 500, "Failed to delete rule", err.Error())
+		h.log.Error("Failed to delete rule", "error", err)
+		response.InternalError(c, "Failed to delete rule")
 		return
 	}
 
@@ -1992,7 +2002,8 @@ func (h *Handler) ListIntercompanyTransactionLogs(c *gin.Context) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to list logs", err.Error())
+		h.log.Error("Failed to list logs", "error", err)
+		response.InternalError(c, "Failed to list logs")
 		return
 	}
 	defer rows.Close()

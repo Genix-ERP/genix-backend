@@ -251,7 +251,8 @@ func (h *Handler) CreateDropshipOrder(c *gin.Context) {
 
 	var input entity.CreateDropshipOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -564,7 +565,8 @@ func (h *Handler) UpdateDropshipOrder(c *gin.Context) {
 
 	var input entity.UpdateDropshipOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -916,7 +918,8 @@ func (h *Handler) CreateDropshipVendorSettings(c *gin.Context) {
 
 	var input entity.CreateDropshipVendorSettingsInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1029,7 +1032,8 @@ func (h *Handler) UpdateDropshipVendorSettings(c *gin.Context) {
 
 	var input entity.UpdateDropshipVendorSettingsInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1255,7 +1259,8 @@ func (h *Handler) CreateDropshipProductVendor(c *gin.Context) {
 
 	var input entity.CreateDropshipProductVendorInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1345,7 +1350,8 @@ func (h *Handler) UpdateDropshipProductVendor(c *gin.Context) {
 
 	var input entity.UpdateDropshipProductVendorInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

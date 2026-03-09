@@ -315,7 +315,8 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 
 	var input entity.CreateProductInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -741,7 +742,8 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 
 	var input entity.UpdateProductInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1147,7 +1149,8 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 
 	var input Input
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1343,7 +1346,8 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 
 	var input Input
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

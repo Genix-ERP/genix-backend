@@ -285,7 +285,8 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 
 	var input entity.CreateWarehouseInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -587,7 +588,8 @@ func (h *Handler) UpdateWarehouse(c *gin.Context) {
 
 	var input entity.UpdateWarehouseInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -942,7 +944,8 @@ func (h *Handler) CreateWarehouseLocation(c *gin.Context) {
 
 	var input Input
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1077,7 +1080,8 @@ func (h *Handler) UpdateWarehouseLocation(c *gin.Context) {
 
 	var input Input
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1697,7 +1701,8 @@ func (h *Handler) CreateOperationType(c *gin.Context) {
 
 	var input entity.CreateOperationTypeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1848,7 +1853,8 @@ func (h *Handler) UpdateOperationType(c *gin.Context) {
 
 	var input entity.UpdateOperationTypeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
