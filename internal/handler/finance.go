@@ -3677,6 +3677,8 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			// For each allocation, check if invoice has a foreign currency rate
 			// diff = allocation_amount_foreign * (invoice_rate - payment_rate)
 			var totalExchangeDiff float64
+			var totalForeignAmount float64
+			var weightedInvoiceRate float64
 			for _, a := range allocations {
 				var invoiceRate float64
 				var invoiceCurrencyID sql.NullString
@@ -3695,7 +3697,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					// allocation amount is in foreign currency; diff in base currency (UZS)
 					diff := a.Amount * (paymentExchangeRate - invoiceRate)
 					totalExchangeDiff += diff
+					totalForeignAmount += a.Amount
+					weightedInvoiceRate += a.Amount * invoiceRate
 				}
+			}
+			// Calculate weighted average initial rate
+			if totalForeignAmount > 0 {
+				weightedInvoiceRate = weightedInvoiceRate / totalForeignAmount
 			}
 
 			if totalExchangeDiff != 0 {
@@ -3763,13 +3771,18 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					if paymentCurrencyID.Valid {
 						currencyUUID, _ := uuid.Parse(paymentCurrencyID.String)
 						if currencyUUID != uuid.Nil {
+							var edContactName string
+							tx.QueryRow("SELECT name FROM contacts WHERE id = $1", contactID).Scan(&edContactName)
 							tx.Exec(`
-								INSERT INTO exchange_diffs (id, tenant_id, organization_id, currency_id, amount_uzs, diff_type, period_start, period_end, journal_entry_id, description, created_by, created_at, updated_at)
-								VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+								INSERT INTO exchange_diffs (id, tenant_id, organization_id, currency_id, amount_uzs, diff_type, period_start, period_end, journal_entry_id, description, created_by, created_at, updated_at,
+									document_number, counterparty_id, counterparty_name, foreign_amount, initial_rate, final_rate)
+								VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+									$14, $15, $16, $17, $18, $19)`,
 								uuid.New(), tenantID, orgIDPtr, currencyUUID, absDiff, exchangeDiffType,
 								paymentDate, paymentDate, journalEntryID,
 								fmt.Sprintf("%s — %s", paymentNumber, exchangeDiffDesc),
 								userID, now, now,
+								paymentNumber, contactID, edContactName, totalForeignAmount, weightedInvoiceRate, paymentExchangeRate,
 							)
 						}
 					}

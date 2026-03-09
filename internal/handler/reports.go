@@ -162,7 +162,8 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 	}
 
 	query := `
-		SELECT a.id, a.code, a.name, at.category, at.normal_balance,
+		SELECT a.id, a.code, COALESCE(NULLIF(a.name_uz, ''), a.name) as display_name,
+			   at.category, at.normal_balance,
 			   a.opening_balance,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
 			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
@@ -215,8 +216,9 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 			balance = openingBalance + creditSum - debitSum
 		}
 
-		if math.Abs(balance) < 0.01 {
-			continue // Skip zero balances
+		// Skip zero balances for assets/liabilities, but always show equity accounts
+		if math.Abs(balance) < 0.01 && category != "equity" {
+			continue
 		}
 
 		acc := entity.BalanceSheetAccount{
@@ -376,7 +378,14 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 
 	grossProfit := totalRevenue - totalCOGS
 	operatingProfit := grossProfit - totalOpex
-	netIncome := operatingProfit + totalOtherIncome - totalOtherExpenses
+	preTaxProfit := operatingProfit + totalOtherIncome - totalOtherExpenses
+
+	// Income tax at 15% (Uzbekistan standard rate) — only if profit is positive
+	var incomeTax float64
+	if preTaxProfit > 0 {
+		incomeTax = preTaxProfit * 0.15
+	}
+	netIncome := preTaxProfit - incomeTax
 	totalExpenses := totalCOGS + totalOpex + totalOtherExpenses
 
 	report := entity.IncomeStatementReport{
@@ -386,6 +395,8 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 		TotalExpenses:     math.Round(totalExpenses*100) / 100,
 		GrossProfit:       math.Round(grossProfit*100) / 100,
 		OperatingProfit:   math.Round(operatingProfit*100) / 100,
+		PreTaxProfit:      math.Round(preTaxProfit*100) / 100,
+		IncomeTax:         math.Round(incomeTax*100) / 100,
 		NetIncome:         math.Round(netIncome*100) / 100,
 		Revenue:           revenue,
 		CostOfSales:       costOfSales,
@@ -548,7 +559,7 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 		periodTo = now.Format("2006-01-02")
 	}
 
-	// Get cash/bank account balances
+	// Get cash/bank account balances (opening balance)
 	cashQuery := `
 		SELECT
 			COALESCE(SUM(CASE WHEN je.entry_date < $2 THEN
@@ -562,11 +573,13 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 		LEFT JOIN journal_entry_lines jel ON a.id = jel.account_id
 		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id AND je.status = 'posted' AND je.deleted_at IS NULL
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
-			AND (a.is_bank_account = true OR at.code IN ('1010', '1020'))
+			AND (a.is_bank_account = true OR at.code IN ('CASH'))
 	`
 	cashArgs := []interface{}{tenantID, periodFrom, periodTo}
+	orgFilter := ""
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		cashQuery += " AND a.organization_id = $4"
+		orgFilter = fmt.Sprintf(" AND a.organization_id = $%d", len(cashArgs)+1)
+		cashQuery += orgFilter
 		cashArgs = append(cashArgs, orgID)
 	}
 
@@ -574,13 +587,101 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 	err := h.db.QueryRow(cashQuery, cashArgs...).Scan(&openingCash, &periodDebits, &periodCredits)
 	if err != nil {
 		h.log.Error("Failed to get cash balances", "error", err)
-		// Continue with zeros
+	}
+
+	// Cash flow mapping by account code prefix
+	// Operating: 1100 (AR), 2000 (AP), 4xxx (Revenue), 5xxx (COGS), 6xxx (OpEx), 7900 (Other)
+	// Investing: 1500 (Fixed Assets), 1510 (Depreciation), 1600 (Intangible/Investments)
+	// Financing: 2100-2500 (Loans), 3xxx (Equity), 7000 (Interest)
+	cfQuery := `
+		SELECT
+			a.code,
+			COALESCE(NULLIF(a.name_uz, ''), a.name) as display_name,
+			COALESCE(SUM(jel.debit_amount), 0) as total_debit,
+			COALESCE(SUM(jel.credit_amount), 0) as total_credit,
+			at.normal_balance
+		FROM accounts a
+		JOIN account_types at ON a.account_type_id = at.id
+		JOIN journal_entry_lines jel ON a.id = jel.account_id
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+			AND je.status = 'posted' AND je.entry_date BETWEEN $2 AND $3 AND je.deleted_at IS NULL
+		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
+			AND at.code NOT IN ('CASH')
+			AND a.is_bank_account = false
+	`
+	cfArgs := []interface{}{tenantID, periodFrom, periodTo}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		cfQuery += fmt.Sprintf(" AND a.organization_id = $%d", len(cfArgs)+1)
+		cfArgs = append(cfArgs, orgID)
+	}
+	cfQuery += " GROUP BY a.code, a.name, a.name_uz, at.normal_balance ORDER BY a.code"
+
+	rows, err := h.db.Query(cfQuery, cfArgs...)
+	if err != nil {
+		h.log.Error("Failed to get cash flow details", "error", err)
+	}
+
+	operatingItems := make([]entity.CashFlowItem, 0)
+	investingItems := make([]entity.CashFlowItem, 0)
+	financingItems := make([]entity.CashFlowItem, 0)
+	var operatingTotal, investingTotal, financingTotal float64
+
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var code, name, normalBalance string
+			var debit, credit float64
+			if err := rows.Scan(&code, &name, &debit, &credit, &normalBalance); err != nil {
+				continue
+			}
+
+			// Calculate net cash impact
+			var amount float64
+			if normalBalance == "debit" {
+				amount = debit - credit
+			} else {
+				amount = credit - debit
+			}
+
+			if math.Abs(amount) < 0.01 {
+				continue
+			}
+
+			item := entity.CashFlowItem{
+				Description: name,
+				Amount:      math.Round(amount*100) / 100,
+			}
+
+			// Categorize by account code
+			codePrefix := code[:2]
+			switch {
+			case code >= "1500" && code <= "1699":
+				// Fixed assets, depreciation, intangible assets → investing
+				investingItems = append(investingItems, item)
+				investingTotal += amount
+			case code >= "2100" && code <= "2599":
+				// Loans (short/long term) → financing
+				financingItems = append(financingItems, item)
+				financingTotal += amount
+			case codePrefix == "31" || codePrefix == "32" || codePrefix == "33" || codePrefix == "34" || codePrefix == "35" || codePrefix == "36":
+				// Equity accounts → financing
+				financingItems = append(financingItems, item)
+				financingTotal += amount
+			case code == "7000":
+				// Interest expense → financing
+				financingItems = append(financingItems, item)
+				financingTotal += amount
+			default:
+				// Everything else → operating (AR, AP, revenue, COGS, OpEx, etc.)
+				operatingItems = append(operatingItems, item)
+				operatingTotal += amount
+			}
+		}
 	}
 
 	netCashChange := periodDebits - periodCredits
 	closingCash := openingCash + netCashChange
 
-	// Simplified cash flow - in real implementation, categorize by account types
 	report := entity.CashFlowReport{
 		PeriodFrom:         periodFrom,
 		PeriodTo:           periodTo,
@@ -588,18 +689,16 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 		ClosingCashBalance: math.Round(closingCash*100) / 100,
 		NetCashChange:      math.Round(netCashChange*100) / 100,
 		OperatingActivities: entity.CashFlowSection{
-			Total: math.Round(netCashChange*100) / 100,
-			Items: []entity.CashFlowItem{
-				{Description: "Net cash from operations", Amount: math.Round(netCashChange*100) / 100},
-			},
+			Total: math.Round(operatingTotal*100) / 100,
+			Items: operatingItems,
 		},
 		InvestingActivities: entity.CashFlowSection{
-			Total: 0,
-			Items: []entity.CashFlowItem{},
+			Total: math.Round(investingTotal*100) / 100,
+			Items: investingItems,
 		},
 		FinancingActivities: entity.CashFlowSection{
-			Total: 0,
-			Items: []entity.CashFlowItem{},
+			Total: math.Round(financingTotal*100) / 100,
+			Items: financingItems,
 		},
 	}
 
