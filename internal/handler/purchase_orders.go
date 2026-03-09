@@ -1716,13 +1716,12 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 	// Get Purchase Journal
 	var purchaseJournalID uuid.UUID
-	var nextNumber int
 	var numberPrefix sql.NullString
 	journalErr := tx.QueryRow(`
-		SELECT id, COALESCE(next_number, 1), number_prefix
+		SELECT id, number_prefix
 		FROM journals WHERE tenant_id = $1 AND code IN ('PURCHASE', 'PUR', 'PURCH') AND deleted_at IS NULL`,
 		tenantID,
-	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
+	).Scan(&purchaseJournalID, &numberPrefix)
 
 	if journalErr == nil {
 		// Find AP account
@@ -1774,12 +1773,21 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 				}
 			}
 
-			// Generate entry number
-			prefix := ""
-			if numberPrefix.Valid {
+			// Generate entry number from actual MAX in journal_entries (avoids stale counter issues)
+			prefix := "BILL-"
+			if numberPrefix.Valid && numberPrefix.String != "" {
 				prefix = numberPrefix.String
 			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+			var maxNum int
+			tx.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1
+				FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2`,
+				tenantID, purchaseJournalID,
+			).Scan(&maxNum)
+			if maxNum == 0 {
+				maxNum = 1
+			}
+			entryNumber := fmt.Sprintf("%s%06d", prefix, maxNum)
 
 			totalDebit := totalAmount
 			totalCredit := totalAmount
@@ -1789,58 +1797,71 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			journalEntryID = &jeID
 			jeDescription := fmt.Sprintf("Vendor Bill %s", invoiceNumber)
 
-			tx.Exec(`
+			if _, jeErr := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 				jeID, tenantID, organizationID, purchaseJournalID, entryNumber, now, invoiceNumber, jeDescription,
-				"purchase_invoice", billID, 1.0, totalDebit, totalCredit, userID, now, now,
-			)
+				"purchase_invoice", billID, 1.0, totalDebit, totalCredit, createdBy, now, now,
+			); jeErr != nil {
+				h.log.Error("CreateBillFromPO: failed to insert journal entry", "error", jeErr)
+				response.InternalError(c, "Failed to create journal entry")
+				return
+			}
 
 			jeLineNumber := 1
 
 			// Debit: Stock Interim Receipt (per category)
 			for inputAcct, amount := range inputGrouped {
-				tx.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, contact_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, "Stock Interim Receipt",
 					amount, 0.0, 1.0, now,
-				)
+				); err != nil {
+					h.log.Error("CreateBillFromPO: failed to insert debit JE line", "error", err, "account", inputAcct)
+					response.InternalError(c, "Failed to create journal entry")
+					return
+				}
 				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct)
 				jeLineNumber++
 			}
 
 			// Debit: Tax
 			if taxAccountID != uuid.Nil && taxAmount > 0 {
-				tx.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 					uuid.New(), jeID, jeLineNumber, taxAccountID, "Input Tax",
 					taxAmount, 0.0, 1.0, now,
-				)
+				); err != nil {
+					h.log.Error("CreateBillFromPO: failed to insert tax JE line", "error", err)
+					response.InternalError(c, "Failed to create journal entry")
+					return
+				}
 				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
 				jeLineNumber++
 			}
 
 			// Credit: Accounts Payable
-			tx.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 				uuid.New(), jeID, jeLineNumber, apAccountID, vendorID, "Accounts Payable",
 				0.0, totalAmount, 1.0, now,
-			)
+			); err != nil {
+				h.log.Error("CreateBillFromPO: failed to insert credit JE line", "error", err)
+				response.InternalError(c, "Failed to create journal entry")
+				return
+			}
 			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
-
-			// Update journal next number
-			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", purchaseJournalID)
 
 			// Link JE to bill
 			tx.Exec("UPDATE purchase_invoices SET journal_entry_id = $1 WHERE id = $2", jeID, billID)
