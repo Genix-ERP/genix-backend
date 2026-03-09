@@ -32,6 +32,26 @@ import (
 // @Param limit query int false "Items per page" default(20)
 // @Param sort_by query string false "Sort by field" default(name)
 // @Param sort_order query string false "Sort order (asc/desc)" default(asc)
+// calculateWorkCenterCosts computes per-hour cost components from input parameters.
+func calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHoursPerDay, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, overheadCost float64) (depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour, totalHourlyCost float64) {
+	annualWorkingHours := workingHoursPerDay * 250
+	if annualWorkingHours <= 0 {
+		annualWorkingHours = 2000
+	}
+	if assetValue > 0 && usefulLifeYears > 0 {
+		depreciationPerHour = assetValue / usefulLifeYears / annualWorkingHours
+	}
+	electricityPerHour = powerKW * electricityRate
+	if annualMaintenance > 0 {
+		maintenancePerHour = annualMaintenance / annualWorkingHours
+	}
+	if operatorMonthlySalary > 0 {
+		laborPerHour = operatorMonthlySalary / 176
+	}
+	totalHourlyCost = depreciationPerHour + electricityPerHour + maintenancePerHour + laborPerHour + overheadCost
+	return
+}
+
 // @Success 200 {object} response.Response
 // @Failure 400 {object} response.Response
 // @Failure 401 {object} response.Response
@@ -70,6 +90,11 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 		SELECT wc.id, wc.code, wc.name, wc.description, wc.warehouse_id, w.name as warehouse_name,
 			   wc.department, wc.capacity_per_hour, wc.efficiency_factor, wc.oee_target,
 			   wc.working_hours_per_day, wc.hourly_cost, wc.setup_cost, wc.overhead_cost,
+			   COALESCE(wc.asset_value,0), COALESCE(wc.useful_life_years,10),
+			   COALESCE(wc.power_kw,0), COALESCE(wc.electricity_rate,0),
+			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0),
+			   COALESCE(wc.depreciation_per_hour,0), COALESCE(wc.electricity_per_hour,0),
+			   COALESCE(wc.maintenance_per_hour,0), COALESCE(wc.labor_per_hour,0),
 			   wc.currency, wc.status, wc.is_available, wc.next_maintenance_date,
 			   wc.last_maintenance_date, wc.total_jobs_completed, wc.total_hours_worked,
 			   wc.current_utilization, wc.notes, wc.created_at, wc.updated_at
@@ -176,6 +201,11 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 			&wc.ID, &wc.Code, &wc.Name, &wc.Description, &wc.WarehouseID, &warehouseName,
 			&wc.Department, &wc.CapacityPerHour, &wc.EfficiencyFactor, &wc.OEETarget,
 			&wc.WorkingHoursPerDay, &wc.HourlyCost, &wc.SetupCost, &wc.OverheadCost,
+			&wc.AssetValue, &wc.UsefulLifeYears,
+			&wc.PowerKW, &wc.ElectricityRate,
+			&wc.AnnualMaintenance, &wc.OperatorMonthlySalary,
+			&wc.DepreciationPerHour, &wc.ElectricityPerHour,
+			&wc.MaintenancePerHour, &wc.LaborPerHour,
 			&wc.Currency, &wc.Status, &wc.IsAvailable, &nextMaint,
 			&lastMaint, &wc.TotalJobsCompleted, &wc.TotalHoursWorked,
 			&wc.CurrentUtilization, &wc.Notes, &wc.CreatedAt, &wc.UpdatedAt,
@@ -237,6 +267,11 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 		SELECT wc.id, wc.code, wc.name, wc.description, wc.warehouse_id, w.name as warehouse_name,
 			   wc.department, wc.capacity_per_hour, wc.efficiency_factor, wc.oee_target,
 			   wc.working_hours_per_day, wc.hourly_cost, wc.setup_cost, wc.overhead_cost,
+			   COALESCE(wc.asset_value,0), COALESCE(wc.useful_life_years,10),
+			   COALESCE(wc.power_kw,0), COALESCE(wc.electricity_rate,0),
+			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0),
+			   COALESCE(wc.depreciation_per_hour,0), COALESCE(wc.electricity_per_hour,0),
+			   COALESCE(wc.maintenance_per_hour,0), COALESCE(wc.labor_per_hour,0),
 			   wc.currency, wc.status, wc.is_available, wc.next_maintenance_date,
 			   wc.last_maintenance_date, wc.total_jobs_completed, wc.total_hours_worked,
 			   wc.current_utilization, wc.notes, wc.created_at, wc.updated_at
@@ -340,6 +375,39 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	if input.OverheadCost != nil {
 		overheadCost = *input.OverheadCost
 	}
+	assetValue := 0.0
+	if input.AssetValue != nil {
+		assetValue = *input.AssetValue
+	}
+	usefulLifeYears := 10.0
+	if input.UsefulLifeYears != nil {
+		usefulLifeYears = *input.UsefulLifeYears
+	}
+	powerKW := 0.0
+	if input.PowerKW != nil {
+		powerKW = *input.PowerKW
+	}
+	electricityRate := 0.0
+	if input.ElectricityRate != nil {
+		electricityRate = *input.ElectricityRate
+	}
+	annualMaintenance := 0.0
+	if input.AnnualMaintenance != nil {
+		annualMaintenance = *input.AnnualMaintenance
+	}
+	operatorMonthlySalary := 0.0
+	if input.OperatorMonthlySalary != nil {
+		operatorMonthlySalary = *input.OperatorMonthlySalary
+	}
+
+	// Auto-calculate cost breakdown if any detailed input is provided
+	var depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour float64
+	hasDetailedCosts := assetValue > 0 || powerKW > 0 || annualMaintenance > 0 || operatorMonthlySalary > 0
+	if hasDetailedCosts {
+		depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour, hourlyCost =
+			calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHours, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, overheadCost)
+	}
+
 	currency := "USD"
 	if input.Currency != nil {
 		currency = *input.Currency
@@ -375,16 +443,23 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 		INSERT INTO work_centers (
 			id, tenant_id, organization_id, code, name, description, warehouse_id, department,
 			capacity_per_hour, efficiency_factor, oee_target, working_hours_per_day,
-			hourly_cost, setup_cost, overhead_cost, currency, status, is_available,
+			hourly_cost, setup_cost, overhead_cost,
+			asset_value, useful_life_years, power_kw, electricity_rate, annual_maintenance, operator_monthly_salary,
+			depreciation_per_hour, electricity_per_hour, maintenance_per_hour, labor_per_hour,
+			currency, status, is_available,
 			next_maintenance_date, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+			$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, input.Code, input.Name, input.Description, input.WarehouseID,
 		input.Department, capacityPerHour, efficiencyFactor, oeeTarget, workingHours,
-		hourlyCost, setupCost, overheadCost, currency, status, isAvailable,
+		hourlyCost, setupCost, overheadCost,
+		assetValue, usefulLifeYears, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary,
+		depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour,
+		currency, status, isAvailable,
 		nextMaintDate, input.Notes, userID, now, now,
 	).Scan(&id)
 
@@ -399,25 +474,35 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	}
 
 	resp := &entity.WorkCenterResponse{
-		ID:                 id,
-		Code:               input.Code,
-		Name:               input.Name,
-		Description:        input.Description,
-		WarehouseID:        input.WarehouseID,
-		Department:         input.Department,
-		CapacityPerHour:    capacityPerHour,
-		EfficiencyFactor:   efficiencyFactor,
-		OEETarget:          oeeTarget,
-		WorkingHoursPerDay: workingHours,
-		HourlyCost:         hourlyCost,
-		SetupCost:          setupCost,
-		OverheadCost:       overheadCost,
-		Currency:           currency,
-		Status:             status,
-		IsAvailable:        isAvailable,
-		Notes:              input.Notes,
-		CreatedAt:          now,
-		UpdatedAt:          now,
+		ID:                    id,
+		Code:                  input.Code,
+		Name:                  input.Name,
+		Description:           input.Description,
+		WarehouseID:           input.WarehouseID,
+		Department:            input.Department,
+		CapacityPerHour:       capacityPerHour,
+		EfficiencyFactor:      efficiencyFactor,
+		OEETarget:             oeeTarget,
+		WorkingHoursPerDay:    workingHours,
+		HourlyCost:            hourlyCost,
+		SetupCost:             setupCost,
+		OverheadCost:          overheadCost,
+		AssetValue:            assetValue,
+		UsefulLifeYears:       usefulLifeYears,
+		PowerKW:               powerKW,
+		ElectricityRate:       electricityRate,
+		AnnualMaintenance:     annualMaintenance,
+		OperatorMonthlySalary: operatorMonthlySalary,
+		DepreciationPerHour:   depreciationPerHour,
+		ElectricityPerHour:    electricityPerHour,
+		MaintenancePerHour:    maintenancePerHour,
+		LaborPerHour:          laborPerHour,
+		Currency:              currency,
+		Status:                status,
+		IsAvailable:           isAvailable,
+		Notes:                 input.Notes,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 
 	if input.NextMaintenanceDate != nil {
@@ -527,6 +612,90 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("overhead_cost = $%d", argCount))
 		args = append(args, *input.OverheadCost)
 	}
+	if input.AssetValue != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("asset_value = $%d", argCount))
+		args = append(args, *input.AssetValue)
+	}
+	if input.UsefulLifeYears != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("useful_life_years = $%d", argCount))
+		args = append(args, *input.UsefulLifeYears)
+	}
+	if input.PowerKW != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("power_kw = $%d", argCount))
+		args = append(args, *input.PowerKW)
+	}
+	if input.ElectricityRate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("electricity_rate = $%d", argCount))
+		args = append(args, *input.ElectricityRate)
+	}
+	if input.AnnualMaintenance != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("annual_maintenance = $%d", argCount))
+		args = append(args, *input.AnnualMaintenance)
+	}
+	if input.OperatorMonthlySalary != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("operator_monthly_salary = $%d", argCount))
+		args = append(args, *input.OperatorMonthlySalary)
+	}
+
+	// Recalculate cost breakdown if any cost-related field changed
+	costFieldChanged := input.AssetValue != nil || input.UsefulLifeYears != nil ||
+		input.PowerKW != nil || input.ElectricityRate != nil ||
+		input.AnnualMaintenance != nil || input.OperatorMonthlySalary != nil ||
+		input.OverheadCost != nil || input.WorkingHoursPerDay != nil
+	if costFieldChanged {
+		var cur struct {
+			AssetValue, UsefulLifeYears, WorkingHoursPerDay float64
+			PowerKW, ElectricityRate, AnnualMaintenance     float64
+			OperatorMonthlySalary, OverheadCost             float64
+		}
+		h.db.QueryRow(`
+			SELECT COALESCE(asset_value,0), COALESCE(useful_life_years,10), COALESCE(working_hours_per_day,8),
+				COALESCE(power_kw,0), COALESCE(electricity_rate,0), COALESCE(annual_maintenance,0),
+				COALESCE(operator_monthly_salary,0), COALESCE(overhead_cost,0)
+			FROM work_centers WHERE id = $1 AND tenant_id = $2
+		`, id, tenantID).Scan(&cur.AssetValue, &cur.UsefulLifeYears, &cur.WorkingHoursPerDay,
+			&cur.PowerKW, &cur.ElectricityRate, &cur.AnnualMaintenance,
+			&cur.OperatorMonthlySalary, &cur.OverheadCost)
+
+		if input.AssetValue != nil { cur.AssetValue = *input.AssetValue }
+		if input.UsefulLifeYears != nil { cur.UsefulLifeYears = *input.UsefulLifeYears }
+		if input.WorkingHoursPerDay != nil { cur.WorkingHoursPerDay = *input.WorkingHoursPerDay }
+		if input.PowerKW != nil { cur.PowerKW = *input.PowerKW }
+		if input.ElectricityRate != nil { cur.ElectricityRate = *input.ElectricityRate }
+		if input.AnnualMaintenance != nil { cur.AnnualMaintenance = *input.AnnualMaintenance }
+		if input.OperatorMonthlySalary != nil { cur.OperatorMonthlySalary = *input.OperatorMonthlySalary }
+		if input.OverheadCost != nil { cur.OverheadCost = *input.OverheadCost }
+
+		hasDetailed := cur.AssetValue > 0 || cur.PowerKW > 0 || cur.AnnualMaintenance > 0 || cur.OperatorMonthlySalary > 0
+		if hasDetailed {
+			dep, elec, maint, labor, total := calculateWorkCenterCosts(
+				cur.AssetValue, cur.UsefulLifeYears, cur.WorkingHoursPerDay,
+				cur.PowerKW, cur.ElectricityRate, cur.AnnualMaintenance,
+				cur.OperatorMonthlySalary, cur.OverheadCost)
+			argCount++
+			updates = append(updates, fmt.Sprintf("depreciation_per_hour = $%d", argCount))
+			args = append(args, dep)
+			argCount++
+			updates = append(updates, fmt.Sprintf("electricity_per_hour = $%d", argCount))
+			args = append(args, elec)
+			argCount++
+			updates = append(updates, fmt.Sprintf("maintenance_per_hour = $%d", argCount))
+			args = append(args, maint)
+			argCount++
+			updates = append(updates, fmt.Sprintf("labor_per_hour = $%d", argCount))
+			args = append(args, labor)
+			argCount++
+			updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
+			args = append(args, total)
+		}
+	}
+
 	if input.Currency != nil {
 		argCount++
 		updates = append(updates, fmt.Sprintf("currency = $%d", argCount))
@@ -1922,6 +2091,76 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				h.log.Error("Failed to commit material consumption", "error", commitErr)
 			} else {
 				h.log.Info("Materials consumed for production order start", "order_id", id, "components", len(components))
+
+				// --- Create journal entry: Dt 1320 WIP / Kt 1310 Raw Materials ---
+				var totalMaterialCost float64
+				for _, comp := range components {
+					consumption := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
+					var compCost float64
+					h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
+					totalMaterialCost += consumption * compCost
+				}
+
+				if totalMaterialCost > 0 {
+					wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
+					rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+					// Fallback: try goods for resale (1340) if raw materials not found
+					if rawAcct == uuid.Nil {
+						rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "1340")
+					}
+					if rawAcct == uuid.Nil {
+						rawAcct = findAccount(h.db, tenantID, organizationID, "inventory", "1300")
+					}
+
+					if wipAcct != uuid.Nil && rawAcct != uuid.Nil {
+						var journalID uuid.UUID
+						var nextNumber int
+						err := h.db.QueryRow(`
+							SELECT id, next_number FROM journals
+							WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+							ORDER BY created_at ASC LIMIT 1
+						`, tenantID).Scan(&journalID, &nextNumber)
+
+						if err == nil && journalID != uuid.Nil {
+							var poNumber string
+							h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
+
+							entryID := uuid.New()
+							entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+							description := fmt.Sprintf("Production Order %s started - materials consumed", poNumber)
+
+							h.db.Exec(`
+								INSERT INTO journal_entries (
+									id, tenant_id, organization_id, journal_id, entry_number,
+									entry_date, description, status, total_debit, total_credit,
+									created_at, updated_at
+								) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $6, $6)
+							`, entryID, tenantID, organizationID, journalID, entryNumber,
+								now, description, totalMaterialCost)
+
+							// Dt 1320 WIP
+							h.db.Exec(`
+								INSERT INTO journal_entry_lines (
+									id, journal_entry_id, account_id, description,
+									debit_amount, credit_amount, line_number, created_at
+								) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+							`, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, now)
+
+							// Kt 1310 Raw Materials
+							h.db.Exec(`
+								INSERT INTO journal_entry_lines (
+									id, journal_entry_id, account_id, description,
+									debit_amount, credit_amount, line_number, created_at
+								) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+							`, uuid.New(), entryID, rawAcct, "Raw materials issued to production", totalMaterialCost, now)
+
+							// Increment journal number
+							h.db.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID)
+
+							h.log.Info("Created material consumption journal entry", "order_id", id, "amount", totalMaterialCost)
+						}
+					}
+				}
 			}
 		}
 	}
@@ -2150,21 +2389,61 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		producedQty = input.QuantityProduced
 	}
 
-	// Calculate unit cost from BOM components
-	var unitCost float64
+	// Calculate cost breakdown from BOM: material, machine, labor (per unit of BOM output)
+	var materialCost, machineCost, laborCost, unitCost float64
 	if bomID != nil {
 		var bomOutputQty float64
 		if h.db.QueryRow(`SELECT COALESCE(quantity, 1) FROM product_boms WHERE id = $1`, bomID).Scan(&bomOutputQty) == nil && bomOutputQty > 0 {
+			// Material cost from BOM components
 			h.db.QueryRow(`
 				SELECT COALESCE(SUM(bl.quantity * COALESCE(p.cost_price, 0) * (1 + COALESCE(bl.scrap_percent, 0) / 100.0)), 0) / $1
 				FROM bom_lines bl
 				JOIN products p ON p.id = bl.component_id
 				WHERE bl.bom_id = $2
-			`, bomOutputQty, bomID).Scan(&unitCost)
+			`, bomOutputQty, bomID).Scan(&materialCost)
+
+			// Machine cost = (depreciation + electricity + maintenance) / capacity_per_hour, summed per BOM operation
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(
+					(COALESCE(wc.depreciation_per_hour, 0) + COALESCE(wc.electricity_per_hour, 0) + COALESCE(wc.maintenance_per_hour, 0))
+					/ GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
+				), 0) / $1
+				FROM bom_operations bo
+				LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
+				WHERE bo.bom_id = $2
+			`, bomOutputQty, bomID).Scan(&machineCost)
+
+			// Labor cost = labor_per_hour / capacity_per_hour, summed per BOM operation
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(
+					COALESCE(wc.labor_per_hour, 0)
+					/ GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
+				), 0) / $1
+				FROM bom_operations bo
+				LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
+				WHERE bo.bom_id = $2
+			`, bomOutputQty, bomID).Scan(&laborCost)
+
+			// If detailed cost fields are all zero (old work centers), fall back to hourly_cost as machineCost
+			if machineCost == 0 && laborCost == 0 {
+				h.db.QueryRow(`
+					SELECT COALESCE(SUM(
+						COALESCE(wc.hourly_cost, 0)
+						/ GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
+					), 0) / $1
+					FROM bom_operations bo
+					LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
+					WHERE bo.bom_id = $2
+				`, bomOutputQty, bomID).Scan(&machineCost)
+			}
+
+			unitCost = materialCost + machineCost + laborCost
 		}
 	}
 	if unitCost <= 0 {
 		h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
+		// When falling back to product cost_price, treat entire cost as material
+		materialCost = unitCost
 	}
 	// Update product's cost_price
 	if unitCost > 0 {
@@ -2230,47 +2509,75 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	}
 
 	// ============================================
-	// CREATE JOURNAL ENTRY: Debit Stock Valuation (per category), Credit Manufacturing Expense
+	// CREATE JOURNAL ENTRIES: WIP-based manufacturing cost flow
+	// Line 1: Dt 1320 WIP         / Kt 1310 Raw Materials    = materialCost
+	// Line 2: Dt 1320 WIP         / Kt 2590 Accrued Machine  = machineCost
+	// Line 3: Dt 1320 WIP         / Kt 6720 Accrued Salary   = laborCost
+	// Line 4: Dt 1330 Finished    / Kt 1320 WIP              = totalCost
 	// ============================================
+	totalMaterialCost := producedQty * materialCost
+	totalMachineCost := producedQty * machineCost
+	totalLaborCost := producedQty * laborCost
 	totalCost := producedQty * unitCost
+
 	if totalCost > 0 {
-		// Use category accounts for the finished product
-		ca := getCategoryAccounts(h.db, tenantID, organizationID, productID)
-		inventoryAccountID := ca.StockValuationAccountID
+		// Look up WIP-based accounts
+		wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
+		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+		finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "1330")
+		machineAcct := findAccount(h.db, tenantID, organizationID, "accrued machine", "2590")
+		salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6720")
 
-		// Credit side: manufacturing expense / COGS
-		cogsAccountID := ca.ExpenseAccountID
-		if cogsAccountID == uuid.Nil {
-			cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
-		}
-		if cogsAccountID == uuid.Nil {
-			cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
-		}
+		// Determine whether we can use the detailed WIP flow
+		useDetailedFlow := wipAcct != uuid.Nil && rawAcct != uuid.Nil && finishedAcct != uuid.Nil
 
-		if inventoryAccountID != uuid.Nil && cogsAccountID != uuid.Nil {
-			// Find manufacturing or general journal
-			var journalID uuid.UUID
-			var nextNumber int
-			err := h.db.QueryRow(`
-				SELECT id, next_number FROM journals
-				WHERE tenant_id = $1 AND type = 'general' AND is_active = true
-				ORDER BY created_at ASC LIMIT 1
-			`, tenantID).Scan(&journalID, &nextNumber)
+		// Find manufacturing or general journal
+		var journalID uuid.UUID
+		var nextNumber int
+		err := h.db.QueryRow(`
+			SELECT id, next_number FROM journals
+			WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+			ORDER BY created_at ASC LIMIT 1
+		`, tenantID).Scan(&journalID, &nextNumber)
 
-			if err == nil && journalID != uuid.Nil {
-				// Get production order number
-				var poNumber string
-				h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
+		if err == nil && journalID != uuid.Nil {
+			// Get production order number & product name
+			var poNumber string
+			h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
+			var productName string
+			h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, productID).Scan(&productName)
 
-				// Get product name
-				var productName string
-				h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, productID).Scan(&productName)
+			entryID := uuid.New()
+			entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+			description := fmt.Sprintf("Production Order %s completed - %s (qty: %.2f)", poNumber, productName, producedQty)
 
-				entryID := uuid.New()
-				entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
-				description := fmt.Sprintf("Production Order %s completed - %s (qty: %.2f)", poNumber, productName, producedQty)
+			if useDetailedFlow {
+				// ---- Detailed WIP journal entry ----
 
-				// Create journal entry
+				// Check if material consumption JE was already created at production start
+				var materialJEExists int
+				h.db.QueryRow(`
+					SELECT COUNT(*) FROM journal_entries
+					WHERE tenant_id = $1 AND organization_id = $2
+					AND description LIKE '%' || $3 || '%started - materials consumed%'
+					AND status = 'posted'
+				`, tenantID, organizationID, poNumber).Scan(&materialJEExists)
+				materialAlreadyJournalized := materialJEExists > 0
+
+				// Compute actual entry total: sum of all debit amounts that will be posted
+				// Lines 1-3 flow into WIP, Line 4 transfers WIP to Finished Goods
+				wipInflow := float64(0)
+				if totalMaterialCost > 0 && !materialAlreadyJournalized {
+					wipInflow += totalMaterialCost
+				}
+				if totalMachineCost > 0 && machineAcct != uuid.Nil {
+					wipInflow += totalMachineCost
+				}
+				if totalLaborCost > 0 && salaryAcct != uuid.Nil {
+					wipInflow += totalLaborCost
+				}
+				entryTotal := wipInflow + totalCost // WIP debits + Finished Goods debit
+
 				h.db.Exec(`
 					INSERT INTO journal_entries (
 						id, tenant_id, organization_id, journal_id, entry_number,
@@ -2278,35 +2585,141 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 						created_at, updated_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
 				`, entryID, tenantID, organizationID, journalID, entryNumber,
-					now, description, totalCost, now)
+					now, description, entryTotal, now)
 
-				// Debit: Inventory (finished goods added)
-				debitLineID := uuid.New()
+				lineNum := 1
+
+				// Line 1: Dt WIP / Kt Raw Materials = materialCost (skip if already journalized at start)
+				if totalMaterialCost > 0 && !materialAlreadyJournalized {
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+					`, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, lineNum, now)
+					lineNum++
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
+					`, uuid.New(), entryID, rawAcct, "WIP: raw materials consumed", totalMaterialCost, lineNum, now)
+					lineNum++
+
+					// Update account balances
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct)
+				}
+
+				// Line 2: Dt WIP / Kt Accrued Machine = machineCost
+				if totalMachineCost > 0 && machineAcct != uuid.Nil {
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+					`, uuid.New(), entryID, wipAcct, "WIP: machine costs accrued", totalMachineCost, lineNum, now)
+					lineNum++
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
+					`, uuid.New(), entryID, machineAcct, "WIP: machine costs accrued", totalMachineCost, lineNum, now)
+					lineNum++
+
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, wipAcct)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, machineAcct)
+				}
+
+				// Line 3: Dt WIP / Kt Accrued Salary = laborCost
+				if totalLaborCost > 0 && salaryAcct != uuid.Nil {
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+					`, uuid.New(), entryID, wipAcct, "WIP: labor costs accrued", totalLaborCost, lineNum, now)
+					lineNum++
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
+					`, uuid.New(), entryID, salaryAcct, "WIP: labor costs accrued", totalLaborCost, lineNum, now)
+					lineNum++
+
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, wipAcct)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, salaryAcct)
+				}
+
+				// Line 4: Dt Finished Goods / Kt WIP = totalCost
 				h.db.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, account_id, description,
 						debit_amount, credit_amount, line_number, created_at
-					) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
-				`, debitLineID, entryID, inventoryAccountID, description, totalCost, now)
-
-				// Credit: COGS / Manufacturing Expense (cost of production)
-				creditLineID := uuid.New()
+					) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+				`, uuid.New(), entryID, finishedAcct, "Finished goods from production", totalCost, lineNum, now)
+				lineNum++
 				h.db.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, account_id, description,
 						debit_amount, credit_amount, line_number, created_at
-					) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
-				`, creditLineID, entryID, cogsAccountID, description, totalCost, now)
+					) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
+				`, uuid.New(), entryID, wipAcct, "Finished goods from production", totalCost, lineNum, now)
 
-				// Update account balances
-				h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAccountID)
-				h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAccountID)
+				// Update account balances for the WIP→Finished transfer
+				h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, finishedAcct)
+				h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, wipAcct)
 
-				// Update journal next_number
-				h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+			} else {
+				// ---- Fallback: simplified Dt Inventory / Kt COGS (original behaviour) ----
+				ca := getCategoryAccounts(h.db, tenantID, organizationID, productID)
+				inventoryAccountID := ca.StockValuationAccountID
+				cogsAccountID := ca.ExpenseAccountID
+				if cogsAccountID == uuid.Nil {
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
+				}
+				if cogsAccountID == uuid.Nil {
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
+				}
 
-				h.log.Info("Journal entry created for production order completion", "entry_id", entryID, "amount", totalCost)
+				if inventoryAccountID != uuid.Nil && cogsAccountID != uuid.Nil {
+					h.db.Exec(`
+						INSERT INTO journal_entries (
+							id, tenant_id, organization_id, journal_id, entry_number,
+							entry_date, description, status, total_debit, total_credit,
+							created_at, updated_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
+					`, entryID, tenantID, organizationID, journalID, entryNumber,
+						now, description, totalCost, now)
+
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+					`, uuid.New(), entryID, inventoryAccountID, description, totalCost, now)
+
+					h.db.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, account_id, description,
+							debit_amount, credit_amount, line_number, created_at
+						) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+					`, uuid.New(), entryID, cogsAccountID, description, totalCost, now)
+
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAccountID)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAccountID)
+				}
 			}
+
+			// Update journal next_number
+			h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+
+			h.log.Info("Journal entry created for production order completion",
+				"entry_id", entryID, "total_cost", totalCost,
+				"material_cost", totalMaterialCost, "machine_cost", totalMachineCost, "labor_cost", totalLaborCost,
+				"detailed_flow", useDetailedFlow)
 		}
 	}
 

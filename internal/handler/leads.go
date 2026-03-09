@@ -52,9 +52,18 @@ func (h *Handler) ListLeads(c *gin.Context) {
 			   l.email, l.phone, l.status, l.source, l.notes,
 			   l.expected_value, l.assigned_to, l.converted_to,
 			   l.converted_at, l.created_at, l.updated_at,
-			   u.first_name || ' ' || u.last_name as assigned_to_name
+			   u.first_name || ' ' || u.last_name as assigned_to_name,
+			   al.modifier_name, al.modified_at
 		FROM leads l
 		LEFT JOIN users u ON l.assigned_to = u.id
+		LEFT JOIN LATERAL (
+			SELECT au.first_name || ' ' || au.last_name as modifier_name, a.created_at as modified_at
+			FROM audit_logs a
+			LEFT JOIN users au ON a.user_id = au.id
+			WHERE a.entity_type = 'lead' AND a.entity_id = l.id AND a.action = 'update'
+			ORDER BY a.created_at DESC
+			LIMIT 1
+		) al ON true
 		WHERE l.tenant_id = $1 AND l.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM leads l WHERE l.tenant_id = $1 AND l.deleted_at IS NULL`
@@ -146,6 +155,8 @@ func (h *Handler) ListLeads(c *gin.Context) {
 		var assignedTo, convertedTo sql.NullString
 		var convertedAt sql.NullTime
 		var assignedToName sql.NullString
+		var lastModifiedBy sql.NullString
+		var lastModifiedAt sql.NullTime
 
 		err := rows.Scan(
 			&l.ID, &l.TenantID, &l.ContactName, &companyName,
@@ -153,6 +164,7 @@ func (h *Handler) ListLeads(c *gin.Context) {
 			&expectedValue, &assignedTo, &convertedTo,
 			&convertedAt, &l.CreatedAt, &l.UpdatedAt,
 			&assignedToName,
+			&lastModifiedBy, &lastModifiedAt,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan lead", "error", err)
@@ -187,6 +199,13 @@ func (h *Handler) ListLeads(c *gin.Context) {
 		}
 		if assignedToName.Valid {
 			resp.AssignedToName = &assignedToName.String
+		}
+		if lastModifiedBy.Valid {
+			resp.LastModifiedBy = &lastModifiedBy.String
+		}
+		if lastModifiedAt.Valid {
+			t := lastModifiedAt.Time
+			resp.LastModifiedAt = &t
 		}
 
 		leads = append(leads, resp)
@@ -640,6 +659,15 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 		return
 	}
 
+	// Fetch old values for audit log
+	var oldContactName, oldCompanyName, oldEmail, oldPhone, oldStatus, oldSource, oldNotes sql.NullString
+	var oldAssignedTo sql.NullString
+	var oldExpectedValue sql.NullFloat64
+	h.db.QueryRow(`
+		SELECT contact_name, company_name, email, phone, status, source, notes, assigned_to, expected_value
+		FROM leads WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&oldContactName, &oldCompanyName, &oldEmail, &oldPhone, &oldStatus, &oldSource, &oldNotes, &oldAssignedTo, &oldExpectedValue)
+
 	// Build update query dynamically
 	updates := []string{}
 	args := []interface{}{}
@@ -731,6 +759,63 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 	if rowsAffected == 0 {
 		response.NotFound(c, "Lead")
 		return
+	}
+
+	// Write audit log for changed fields
+	oldValues := map[string]interface{}{}
+	newValues := map[string]interface{}{}
+
+	if input.ContactName != nil && oldContactName.String != *input.ContactName {
+		oldValues["contact_name"] = oldContactName.String
+		newValues["contact_name"] = *input.ContactName
+	}
+	if input.CompanyName != nil && oldCompanyName.String != *input.CompanyName {
+		oldValues["company_name"] = oldCompanyName.String
+		newValues["company_name"] = *input.CompanyName
+	}
+	if input.Email != nil && oldEmail.String != *input.Email {
+		oldValues["email"] = oldEmail.String
+		newValues["email"] = *input.Email
+	}
+	if input.Phone != nil && oldPhone.String != *input.Phone {
+		oldValues["phone"] = oldPhone.String
+		newValues["phone"] = *input.Phone
+	}
+	if input.Status != nil && oldStatus.String != string(*input.Status) {
+		oldValues["status"] = oldStatus.String
+		newValues["status"] = *input.Status
+	}
+	if input.Source != nil && oldSource.String != string(*input.Source) {
+		oldValues["source"] = oldSource.String
+		newValues["source"] = *input.Source
+	}
+	if input.Notes != nil && oldNotes.String != *input.Notes {
+		oldValues["notes"] = oldNotes.String
+		newValues["notes"] = *input.Notes
+	}
+	if input.AssignedTo != nil && oldAssignedTo.String != *input.AssignedTo {
+		oldValues["assigned_to"] = oldAssignedTo.String
+		newValues["assigned_to"] = *input.AssignedTo
+	}
+	if input.ExpectedValue != nil {
+		oldVal := float64(0)
+		if oldExpectedValue.Valid {
+			oldVal = oldExpectedValue.Float64
+		}
+		if oldVal != *input.ExpectedValue {
+			oldValues["expected_value"] = oldVal
+			newValues["expected_value"] = *input.ExpectedValue
+		}
+	}
+
+	if len(oldValues) > 0 {
+		userID, _ := middleware.GetUserID(c)
+		oldJSON, _ := json.Marshal(oldValues)
+		newJSON, _ := json.Marshal(newValues)
+		h.db.Exec(`
+			INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
+			VALUES ($1, $2, $3, 'update', 'lead', $4, $5, $6, $7)
+		`, uuid.New(), tenantID, userID, id, oldJSON, newJSON, time.Now())
 	}
 
 	response.Success(c, gin.H{"message": "Lead updated successfully"})
@@ -1074,4 +1159,58 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 	}
 
 	response.Success(c, result)
+}
+
+// GetLeadAuditLogs returns audit logs for a specific lead
+func (h *Handler) GetLeadAuditLogs(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid lead ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT al.id, al.user_id, COALESCE(u.email, '') as user_email, al.action,
+		       al.old_values, al.new_values, al.created_at
+		FROM audit_logs al
+		LEFT JOIN users u ON al.user_id = u.id
+		WHERE al.tenant_id = $1 AND al.entity_type = 'lead' AND al.entity_id = $2
+		ORDER BY al.created_at DESC
+	`, tenantID, id)
+	if err != nil {
+		h.log.Error("Failed to get lead audit logs", "error", err)
+		response.InternalError(c, "Failed to get audit logs")
+		return
+	}
+	defer rows.Close()
+
+	logs := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var logID, userID uuid.UUID
+		var userEmail, action string
+		var oldValues, newValues sql.NullString
+		var createdAt time.Time
+
+		if err := rows.Scan(&logID, &userID, &userEmail, &action, &oldValues, &newValues, &createdAt); err != nil {
+			continue
+		}
+		logs = append(logs, map[string]interface{}{
+			"id":         logID,
+			"user_id":    userID,
+			"user_email": userEmail,
+			"action":     action,
+			"old_values": oldValues.String,
+			"new_values": newValues.String,
+			"created_at": createdAt,
+		})
+	}
+
+	response.Success(c, logs)
 }

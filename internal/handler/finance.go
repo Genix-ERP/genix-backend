@@ -3677,6 +3677,8 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			// For each allocation, check if invoice has a foreign currency rate
 			// diff = allocation_amount_foreign * (invoice_rate - payment_rate)
 			var totalExchangeDiff float64
+			var totalForeignAmount float64
+			var weightedInvoiceRate float64
 			for _, a := range allocations {
 				var invoiceRate float64
 				var invoiceCurrencyID sql.NullString
@@ -3695,7 +3697,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					// allocation amount is in foreign currency; diff in base currency (UZS)
 					diff := a.Amount * (paymentExchangeRate - invoiceRate)
 					totalExchangeDiff += diff
+					totalForeignAmount += a.Amount
+					weightedInvoiceRate += a.Amount * invoiceRate
 				}
+			}
+			// Calculate weighted average initial rate
+			if totalForeignAmount > 0 {
+				weightedInvoiceRate = weightedInvoiceRate / totalForeignAmount
 			}
 
 			if totalExchangeDiff != 0 {
@@ -3763,13 +3771,18 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					if paymentCurrencyID.Valid {
 						currencyUUID, _ := uuid.Parse(paymentCurrencyID.String)
 						if currencyUUID != uuid.Nil {
+							var edContactName string
+							tx.QueryRow("SELECT name FROM contacts WHERE id = $1", contactID).Scan(&edContactName)
 							tx.Exec(`
-								INSERT INTO exchange_diffs (id, tenant_id, organization_id, currency_id, amount_uzs, diff_type, period_start, period_end, journal_entry_id, description, created_by, created_at, updated_at)
-								VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+								INSERT INTO exchange_diffs (id, tenant_id, organization_id, currency_id, amount_uzs, diff_type, period_start, period_end, journal_entry_id, description, created_by, created_at, updated_at,
+									document_number, counterparty_id, counterparty_name, foreign_amount, initial_rate, final_rate)
+								VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+									$14, $15, $16, $17, $18, $19)`,
 								uuid.New(), tenantID, orgIDPtr, currencyUUID, absDiff, exchangeDiffType,
 								paymentDate, paymentDate, journalEntryID,
 								fmt.Sprintf("%s — %s", paymentNumber, exchangeDiffDesc),
 								userID, now, now,
+								paymentNumber, contactID, edContactName, totalForeignAmount, weightedInvoiceRate, paymentExchangeRate,
 							)
 						}
 					}
@@ -5419,6 +5432,16 @@ func (h *Handler) CreateBankTransaction(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
+	// Prevent negative balance on debit (withdrawal)
+	if input.Type == "debit" {
+		var currentBalance float64
+		h.db.QueryRow(`SELECT COALESCE(balance, 0) FROM bank_accounts WHERE id = $1 AND tenant_id = $2`, bankAccountID, tenantID).Scan(&currentBalance)
+		if currentBalance < input.Amount {
+			response.BadRequest(c, fmt.Sprintf("Bank hisobida mablag' yetarli emas (balans: %.2f, so'ralgan: %.2f)", currentBalance, input.Amount))
+			return
+		}
+	}
+
 	// Get organization ID from middleware header
 	var orgIDPtr *uuid.UUID
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
@@ -6735,6 +6758,19 @@ func (h *Handler) CreateCashTransaction(c *gin.Context) {
 	var orgIDPtr *uuid.UUID
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		orgIDPtr = &orgID
+	}
+
+	// Prevent negative cash balance on expense
+	if input.Type == "expense" {
+		var cashBalance float64
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(CASE WHEN transaction_type = 'income' THEN amount ELSE -amount END), 0)
+			FROM cash_transactions WHERE tenant_id = $1 AND status != 'cancelled' AND deleted_at IS NULL
+		`, tenantID).Scan(&cashBalance)
+		if cashBalance < input.Amount {
+			response.BadRequest(c, fmt.Sprintf("Kassada mablag' yetarli emas (balans: %.2f, so'ralgan: %.2f)", cashBalance, input.Amount))
+			return
+		}
 	}
 
 	// Generate transaction number

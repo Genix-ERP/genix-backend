@@ -123,6 +123,121 @@ func (h *Handler) SyncCurrencyRates(c *gin.Context) {
 		"source":       "CBU",
 	})
 }
+// RunCurrencySyncScheduler starts a background goroutine that syncs CBU rates daily at 09:00 Tashkent time
+func (h *Handler) RunCurrencySyncScheduler() {
+	go func() {
+		loc, err := time.LoadLocation("Asia/Tashkent")
+		if err != nil {
+			h.log.Error("Failed to load Asia/Tashkent timezone, using UTC+5 offset", "error", err)
+			loc = time.FixedZone("UZT", 5*60*60)
+		}
+
+		for {
+			now := time.Now().In(loc)
+			// Next 09:00 Tashkent time
+			next := time.Date(now.Year(), now.Month(), now.Day(), 9, 0, 0, 0, loc)
+			if now.After(next) {
+				next = next.Add(24 * time.Hour)
+			}
+			sleepDuration := next.Sub(now)
+			h.log.Info("Currency sync scheduled", "next_run", next.Format("2006-01-02 15:04"), "sleep", sleepDuration.Round(time.Minute))
+
+			time.Sleep(sleepDuration)
+			h.syncCBURatesForAllTenants()
+		}
+	}()
+	h.log.Info("Currency sync scheduler started (daily at 09:00 Tashkent time)")
+}
+
+// syncCBURatesForAllTenants fetches CBU rates and applies them to all tenants
+func (h *Handler) syncCBURatesForAllTenants() {
+	h.log.Info("Starting daily CBU currency sync for all tenants")
+
+	// Fetch rates from CBU
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("https://cbu.uz/uz/arkhiv-kursov-valyut/json/")
+	if err != nil {
+		h.log.Error("Daily sync: failed to fetch CBU rates", "error", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.log.Error("Daily sync: failed to read CBU response", "error", err)
+		return
+	}
+
+	var cbuRates []struct {
+		Code  string `json:"Ccy"`
+		Rate  string `json:"Rate"`
+		Date  string `json:"Date"`
+		Title string `json:"CcyNm_UZ"`
+	}
+	if err := json.Unmarshal(body, &cbuRates); err != nil {
+		h.log.Error("Daily sync: failed to parse CBU rates", "error", err)
+		return
+	}
+
+	// Get all tenant IDs
+	rows, err := h.db.Query("SELECT id FROM tenants WHERE deleted_at IS NULL")
+	if err != nil {
+		h.log.Error("Daily sync: failed to query tenants", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	var tenantIDs []uuid.UUID
+	for rows.Next() {
+		var tid uuid.UUID
+		if err := rows.Scan(&tid); err == nil {
+			tenantIDs = append(tenantIDs, tid)
+		}
+	}
+
+	today := time.Now().Format("2006-01-02")
+	totalSynced := 0
+
+	for _, tenantID := range tenantIDs {
+		// Get base currency for this tenant
+		var baseCurrencyID uuid.UUID
+		err := h.db.QueryRow("SELECT id FROM currencies WHERE tenant_id = $1 AND is_base_currency = true LIMIT 1", tenantID).Scan(&baseCurrencyID)
+		if err != nil {
+			h.db.QueryRow("SELECT id FROM currencies WHERE tenant_id = $1 AND code = 'UZS' LIMIT 1", tenantID).Scan(&baseCurrencyID)
+		}
+		if baseCurrencyID == uuid.Nil {
+			continue
+		}
+
+		synced := 0
+		for _, cbuRate := range cbuRates {
+			var currencyID uuid.UUID
+			if err := h.db.QueryRow("SELECT id FROM currencies WHERE tenant_id = $1 AND code = $2", tenantID, cbuRate.Code).Scan(&currencyID); err != nil {
+				continue
+			}
+
+			var rate float64
+			if _, err := fmt.Sscanf(cbuRate.Rate, "%f", &rate); err != nil || rate <= 0 {
+				continue
+			}
+
+			_, err := h.db.Exec(`
+				INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
+				VALUES ($1, $2, $3, $4, $5, $6, 'CBU')
+				ON CONFLICT (tenant_id, from_currency_id, to_currency_id, effective_date)
+				DO UPDATE SET rate = $5, source = 'CBU'
+			`, uuid.New(), tenantID, currencyID, baseCurrencyID, rate, today)
+			if err != nil {
+				continue
+			}
+			synced++
+		}
+		totalSynced += synced
+	}
+
+	h.log.Info("Daily CBU sync completed", "tenants", len(tenantIDs), "total_rates_synced", totalSynced)
+}
+
 func (h *Handler) RevalueCurrency(c *gin.Context)   { response.Success(c, gin.H{"message": "Currency revaluation completed"}) }
 func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -137,7 +252,12 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 	query := `
 		SELECT ed.id, ed.currency_id, COALESCE(cur.code, '') as currency_code,
 			   ed.amount_uzs, ed.diff_type, ed.period_start, ed.description,
-			   ed.journal_entry_id, ed.created_at
+			   ed.journal_entry_id, ed.created_at,
+			   COALESCE(ed.document_number, '') as document_number,
+			   COALESCE(ed.counterparty_name, '') as counterparty_name,
+			   COALESCE(ed.foreign_amount, 0) as foreign_amount,
+			   COALESCE(ed.initial_rate, 0) as initial_rate,
+			   COALESCE(ed.final_rate, 0) as final_rate
 		FROM exchange_diffs ed
 		LEFT JOIN currencies cur ON ed.currency_id = cur.id
 		WHERE ed.tenant_id = $1 AND ed.deleted_at IS NULL
@@ -158,22 +278,29 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 	for rows.Next() {
 		var edID, currencyID uuid.UUID
 		var currencyCode, diffType, description string
-		var amount float64
+		var documentNumber, counterpartyName string
+		var amount, foreignAmount, initialRate, finalRate float64
 		var periodStart, createdAt time.Time
 		var journalEntryID sql.NullString
 
-		if err := rows.Scan(&edID, &currencyID, &currencyCode, &amount, &diffType, &periodStart, &description, &journalEntryID, &createdAt); err != nil {
+		if err := rows.Scan(&edID, &currencyID, &currencyCode, &amount, &diffType, &periodStart, &description, &journalEntryID, &createdAt,
+			&documentNumber, &counterpartyName, &foreignAmount, &initialRate, &finalRate); err != nil {
 			continue
 		}
 
 		item := map[string]interface{}{
-			"id":            edID.String(),
-			"currency_code": currencyCode,
-			"amount":        amount,
-			"type":          diffType,
-			"date":          periodStart.Format("2006-01-02"),
-			"description":   description,
-			"created_at":    createdAt,
+			"id":                edID.String(),
+			"currency_code":    currencyCode,
+			"amount":           amount,
+			"type":             diffType,
+			"date":             periodStart.Format("2006-01-02"),
+			"description":      description,
+			"created_at":       createdAt,
+			"document_number":  documentNumber,
+			"counterparty":     counterpartyName,
+			"foreign_amount":   foreignAmount,
+			"initial_rate":     initialRate,
+			"final_rate":       finalRate,
 		}
 		if journalEntryID.Valid {
 			item["journal_entry_id"] = journalEntryID.String
@@ -192,6 +319,194 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 		"total_gain": totalGain,
 		"total_loss": totalLoss,
 		"net":        totalGain - totalLoss,
+	})
+}
+
+// ========== CURRENCY DEBT REPORT (Valyutadagi qarzdorlik) ==========
+
+func (h *Handler) CurrencyDebtReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgFilter string
+	var args []interface{}
+	args = append(args, tenantID) // $1
+
+	if orgID != uuid.Nil {
+		orgFilter = " AND organization_id = $2"
+		args = append(args, orgID)
+	}
+
+	nextParam := len(args) + 1
+
+	// Get current exchange rates for each foreign currency
+	type currentRate struct {
+		CurrencyID uuid.UUID
+		Code       string
+		Rate       float64
+	}
+	rateRows, err := h.db.Query(`
+		SELECT DISTINCT ON (c.id) c.id, c.code, er.rate
+		FROM currencies c
+		JOIN exchange_rates er ON er.from_currency_id = c.id AND er.tenant_id = $1
+		WHERE c.tenant_id = $1 AND c.is_base_currency = false AND c.deleted_at IS NULL
+		ORDER BY c.id, er.effective_date DESC
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to get current rates", "error", err)
+		response.InternalError(c, "Failed to get current rates")
+		return
+	}
+	defer rateRows.Close()
+
+	currentRates := map[uuid.UUID]currentRate{}
+	for rateRows.Next() {
+		var cr currentRate
+		if err := rateRows.Scan(&cr.CurrencyID, &cr.Code, &cr.Rate); err == nil {
+			currentRates[cr.CurrencyID] = cr
+		}
+	}
+
+	var items []map[string]interface{}
+	var totalInvoiceUZS, totalCurrentUZS, totalDiff float64
+
+	// Sales invoices with foreign currency and amount_due > 0
+	salesQuery := fmt.Sprintf(`
+		SELECT si.id, si.invoice_number, 'sales' as type,
+			COALESCE(c.code, '') as currency_code, si.currency_id,
+			si.exchange_rate, si.total_amount, (si.total_amount - si.amount_paid) as amount_due,
+			COALESCE(cu.name, '') as partner_name, si.invoice_date
+		FROM sales_invoices si
+		LEFT JOIN currencies c ON si.currency_id = c.id
+		LEFT JOIN customers cu ON si.customer_id = cu.id
+		WHERE si.tenant_id = $1 %s
+			AND si.currency_id IS NOT NULL
+			AND si.exchange_rate > 1
+			AND (si.total_amount - si.amount_paid) > 0.01
+			AND si.status NOT IN ('cancelled', 'draft')
+			AND si.deleted_at IS NULL
+	`, orgFilter)
+
+	salesRows, err := h.db.Query(salesQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to query sales invoices for currency debt", "error", err)
+	} else {
+		defer salesRows.Close()
+		for salesRows.Next() {
+			var id uuid.UUID
+			var invoiceNumber, invType, currencyCode, partnerName string
+			var currencyID uuid.UUID
+			var exchangeRate, totalAmount, amountDue float64
+			var invoiceDate time.Time
+
+			if err := salesRows.Scan(&id, &invoiceNumber, &invType, &currencyCode, &currencyID, &exchangeRate, &totalAmount, &amountDue, &partnerName, &invoiceDate); err != nil {
+				continue
+			}
+
+			invoiceUZS := amountDue * exchangeRate
+			cr := currentRates[currencyID]
+			currentUZS := amountDue * cr.Rate
+			if cr.Rate == 0 {
+				currentUZS = invoiceUZS
+			}
+			diff := currentUZS - invoiceUZS
+
+			items = append(items, map[string]interface{}{
+				"id":             id.String(),
+				"invoice_number": invoiceNumber,
+				"type":           "sales",
+				"currency_code":  currencyCode,
+				"partner_name":   partnerName,
+				"invoice_date":   invoiceDate.Format("2006-01-02"),
+				"amount_due":     amountDue,
+				"invoice_rate":   exchangeRate,
+				"current_rate":   cr.Rate,
+				"invoice_uzs":    invoiceUZS,
+				"current_uzs":    currentUZS,
+				"diff":           diff,
+			})
+			totalInvoiceUZS += invoiceUZS
+			totalCurrentUZS += currentUZS
+			totalDiff += diff
+		}
+	}
+
+	// Purchase invoices with foreign currency and amount_due > 0
+	purchaseQuery := fmt.Sprintf(`
+		SELECT pi.id, pi.bill_number, 'purchase' as type,
+			COALESCE(c.code, '') as currency_code, pi.currency_id,
+			COALESCE(pi.exchange_rate, 1) as exchange_rate, pi.total_amount, (pi.total_amount - pi.amount_paid) as amount_due,
+			COALESCE(s.name, '') as partner_name, pi.bill_date
+		FROM purchase_invoices pi
+		LEFT JOIN currencies c ON pi.currency_id = c.id
+		LEFT JOIN suppliers s ON pi.supplier_id = s.id
+		WHERE pi.tenant_id = $1 %s
+			AND pi.currency_id IS NOT NULL
+			AND COALESCE(pi.exchange_rate, 1) > 1
+			AND (pi.total_amount - pi.amount_paid) > 0.01
+			AND pi.status NOT IN ('cancelled', 'draft')
+			AND pi.deleted_at IS NULL
+	`, orgFilter)
+
+	_ = nextParam // args already set
+
+	purchaseRows, err := h.db.Query(purchaseQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to query purchase invoices for currency debt", "error", err)
+	} else {
+		defer purchaseRows.Close()
+		for purchaseRows.Next() {
+			var id uuid.UUID
+			var invoiceNumber, invType, currencyCode, partnerName string
+			var currencyID uuid.UUID
+			var exchangeRate, totalAmount, amountDue float64
+			var invoiceDate time.Time
+
+			if err := purchaseRows.Scan(&id, &invoiceNumber, &invType, &currencyCode, &currencyID, &exchangeRate, &totalAmount, &amountDue, &partnerName, &invoiceDate); err != nil {
+				continue
+			}
+
+			invoiceUZS := amountDue * exchangeRate
+			cr := currentRates[currencyID]
+			currentUZS := amountDue * cr.Rate
+			if cr.Rate == 0 {
+				currentUZS = invoiceUZS
+			}
+			diff := currentUZS - invoiceUZS
+
+			items = append(items, map[string]interface{}{
+				"id":             id.String(),
+				"invoice_number": invoiceNumber,
+				"type":           "purchase",
+				"currency_code":  currencyCode,
+				"partner_name":   partnerName,
+				"invoice_date":   invoiceDate.Format("2006-01-02"),
+				"amount_due":     amountDue,
+				"invoice_rate":   exchangeRate,
+				"current_rate":   cr.Rate,
+				"invoice_uzs":    invoiceUZS,
+				"current_uzs":    currentUZS,
+				"diff":           diff,
+			})
+			totalInvoiceUZS += invoiceUZS
+			totalCurrentUZS += currentUZS
+			totalDiff += diff
+		}
+	}
+
+	if items == nil {
+		items = []map[string]interface{}{}
+	}
+
+	response.Success(c, gin.H{
+		"items":           items,
+		"total_invoice_uzs": totalInvoiceUZS,
+		"total_current_uzs": totalCurrentUZS,
+		"total_diff":        totalDiff,
 	})
 }
 

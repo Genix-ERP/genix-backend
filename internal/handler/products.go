@@ -85,6 +85,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.is_overhead_expense, false) as is_overhead_expense,
 			   COALESCE(p.has_variants, false) as has_variants,
 			   p.is_active, p.tags, COALESCE(p.image_url, '') as image_url,
+			   COALESCE(p.inventory_type, 'trade') as inventory_type,
 			   p.created_at, p.updated_at,
 			   pc.code as category_code, pc.name as category_name,
 			   COALESCE(u.name, '') as unit_name,
@@ -181,6 +182,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var categoryCode, categoryName sql.NullString
 		var tags json.RawMessage
 		var imageURL string
+		var inventoryType string
 		var unitName string
 		var purchaseUnitID sql.NullString
 		var purchaseUnitName string
@@ -197,6 +199,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 			&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
 			&p.IsOverheadExpense, &p.HasVariants, &p.IsActive, &tags, &imageURL,
+			&inventoryType,
 			&p.CreatedAt, &p.UpdatedAt,
 			&categoryCode, &categoryName,
 			&unitName,
@@ -271,6 +274,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			HasVariants:       p.HasVariants,
 			IsActive:          p.IsActive,
 			ImageURL:          imageURL,
+			InventoryType:     inventoryType,
 			CreatedAt:         p.CreatedAt,
 			UpdatedAt:         p.UpdatedAt,
 		}
@@ -419,6 +423,14 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		autoManufacture = *input.AutoManufacture
 	}
 
+	// Default inventory_type to 'trade', or 'service' if type is 'service'
+	inventoryType := "trade"
+	if input.InventoryType != "" {
+		inventoryType = input.InventoryType
+	} else if input.Type == "service" {
+		inventoryType = "service"
+	}
+
 	id := uuid.New()
 	now := time.Now()
 
@@ -465,8 +477,8 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
 			can_be_expensed, can_be_rented, can_be_subcontracted, is_overhead_expense,
 			is_manufacturable, auto_manufacture,
-			is_active, tags, image_url, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
+			is_active, tags, image_url, inventory_type, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
 		RETURNING id
 	`
 
@@ -477,7 +489,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
 		canBeExpensed, canBeRented, canBeSubcontracted, isOverheadExpense,
 		isManufacturable, autoManufacture,
-		true, tagsJSON, imageURL, userID, now, now,
+		true, tagsJSON, imageURL, inventoryType, userID, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -554,6 +566,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		IsActive:           true,
 		Tags:               input.Tags,
 		ImageURL:           input.ImageURL,
+		InventoryType:      inventoryType,
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
@@ -592,6 +605,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			   p.lead_time_days,
 			   p.is_purchasable, p.is_sellable, p.is_active, p.tags,
 			   COALESCE(p.image_url, '') as image_url,
+			   COALESCE(p.inventory_type, 'trade') as inventory_type,
 			   p.created_at, p.updated_at,
 			   pc.id as category_id_rel, pc.code as category_code, pc.name as category_name
 		FROM products p
@@ -613,6 +627,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	var categoryIDRel, categoryCode, categoryName sql.NullString
 	var tags json.RawMessage
 	var imageURL string
+	var inventoryType string
 
 	err = h.db.QueryRow(query, queryArgs...).Scan(
 		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode,
@@ -621,6 +636,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		&p.IsStockable, &p.TrackInventory, &p.MinStockLevel,
 		&p.ReorderPoint, &p.ReorderQuantity, &p.LeadTimeDays,
 		&p.IsPurchasable, &p.IsSellable, &p.IsActive, &tags, &imageURL,
+		&inventoryType,
 		&p.CreatedAt, &p.UpdatedAt,
 		&categoryIDRel, &categoryCode, &categoryName,
 	)
@@ -649,6 +665,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		IsSellable:     p.IsSellable,
 		IsActive:       p.IsActive,
 		ImageURL:       imageURL,
+		InventoryType:  inventoryType,
 		CreatedAt:      p.CreatedAt,
 		UpdatedAt:      p.UpdatedAt,
 	}
@@ -856,6 +873,9 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	}
 	if input.ImageURL != nil {
 		addUpdate("image_url", *input.ImageURL)
+	}
+	if input.InventoryType != nil {
+		addUpdate("inventory_type", *input.InventoryType)
 	}
 
 	// Resolve UOM string codes to UUID references

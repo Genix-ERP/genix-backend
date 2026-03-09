@@ -37,7 +37,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 	baseQuery := `
 		SELECT pi.id, pi.tenant_id, pi.invoice_number, pi.vendor_id, pi.vendor_invoice_number,
 			   pi.invoice_date, pi.due_date, pi.subtotal, pi.discount_amount,
-			   pi.tax_amount, pi.total_amount, pi.amount_paid, pi.amount_due, pi.status,
+			   pi.tax_rate_id, pi.tax_amount, pi.total_amount, pi.amount_paid, pi.amount_due, pi.status,
 			   pi.three_way_match_status, pi.notes, pi.created_at, pi.updated_at,
 			   c.name as vendor_name,
 			   pi.purchase_order_id, po.order_number as po_number,
@@ -140,6 +140,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 		var invoiceDate, dueDate time.Time
 		var subtotal, discountAmount, taxAmount, totalAmount, amountPaid, amountDue float64
 		var createdAt, updatedAt time.Time
+		var taxRateIDStr sql.NullString
 		var purchaseOrderID, goodsReceiptID sql.NullString
 		var poNumber, grNumber sql.NullString
 		var invoiceType string
@@ -148,7 +149,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 		err := rows.Scan(
 			&id, &tenantIDScan, &invoiceNumber, &vendorID, &vendorInvoiceNumber,
 			&invoiceDate, &dueDate, &subtotal, &discountAmount,
-			&taxAmount, &totalAmount, &amountPaid, &amountDue, &status,
+			&taxRateIDStr, &taxAmount, &totalAmount, &amountPaid, &amountDue, &status,
 			&threeWayMatchStatus, &notes, &createdAt, &updatedAt,
 			&vendorName,
 			&purchaseOrderID, &poNumber,
@@ -180,6 +181,9 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			"updated_at":            updatedAt,
 		}
 
+		if taxRateIDStr.Valid {
+			invoice["tax_rate_id"] = taxRateIDStr.String
+		}
 		if vendorInvoiceNumber.Valid {
 			invoice["vendor_invoice_number"] = vendorInvoiceNumber.String
 		}
@@ -233,6 +237,7 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		InvoiceDate         string  `json:"invoice_date" binding:"required"`
 		DueDate             string  `json:"due_date" binding:"required"`
 		Subtotal            float64 `json:"subtotal"`
+		TaxRateID           string  `json:"tax_rate_id"`
 		TaxAmount           float64 `json:"tax_amount"`
 		TotalAmount         float64 `json:"total_amount"`
 		Notes               string  `json:"notes"`
@@ -300,19 +305,28 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		}
 	}
 
+	// Parse tax_rate_id if provided
+	var taxRateID *uuid.UUID
+	if input.TaxRateID != "" {
+		parsed, err := uuid.Parse(input.TaxRateID)
+		if err == nil {
+			taxRateID = &parsed
+		}
+	}
+
 	// Insert purchase invoice
 	query := `
 		INSERT INTO purchase_invoices (
 			id, tenant_id, organization_id, invoice_number, vendor_id, vendor_invoice_number,
 			invoice_date, due_date, subtotal, discount_amount,
-			tax_amount, total_amount, amount_paid, status,
+			tax_rate_id, tax_amount, total_amount, amount_paid, status,
 			three_way_match_status, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`
 
 	_, err = h.db.Exec(query,
 		invoiceID, tenantID, orgID, invoiceNumber, vendorID, input.VendorInvoiceNumber,
 		invoiceDate, dueDate, subtotal, 0,
-		taxAmount, totalAmount, 0, "draft",
+		taxRateID, taxAmount, totalAmount, 0, "draft",
 		"pending", input.Notes, createdBy, now, now,
 	)
 	if err != nil {
@@ -337,6 +351,7 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		"due_date":               dueDate.Format("2006-01-02"),
 		"subtotal":               subtotal,
 		"discount_amount":        0.0,
+		"tax_rate_id":            taxRateID,
 		"tax_amount":             taxAmount,
 		"total_amount":           totalAmount,
 		"amount_paid":            0.0,
@@ -859,10 +874,15 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 				}
 			}
 			lineRows.Close()
-			// Resolve category accounts after closing rows
+			// Resolve accounts after closing rows: prefer inventory-type account, fallback to category
 			for i := range billLines {
-				ca := getCategoryAccounts(tx, tenantID, organizationID, billLines[i].ProductID)
-				billLines[i].InputAcct = ca.StockInputAccountID
+				invAcct := getInventoryAccountByType(tx, tenantID, organizationID, billLines[i].ProductID)
+				if invAcct != uuid.Nil {
+					billLines[i].InputAcct = invAcct
+				} else {
+					ca := getCategoryAccounts(tx, tenantID, organizationID, billLines[i].ProductID)
+					billLines[i].InputAcct = ca.StockInputAccountID
+				}
 			}
 		}
 
