@@ -206,7 +206,7 @@ func Load() (*Config, error) {
 		},
 		JWT: JWTConfig{
 			SecretKey:          getEnv("JWT_SECRET_KEY", "your-super-secret-key-change-in-production"),
-			AccessTokenExpiry:  getEnvAsDuration("JWT_ACCESS_TOKEN_EXPIRY", 15*time.Minute),
+			AccessTokenExpiry:  getEnvAsDuration("JWT_ACCESS_TOKEN_EXPIRY", 24*time.Hour),
 			RefreshTokenExpiry: getEnvAsDuration("JWT_REFRESH_TOKEN_EXPIRY", 7*24*time.Hour),
 			Issuer:             getEnv("JWT_ISSUER", "genixerp"),
 			Audience:           getEnv("JWT_AUDIENCE", "genixerp-api"),
