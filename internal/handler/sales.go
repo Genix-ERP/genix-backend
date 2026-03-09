@@ -43,7 +43,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 100 {
+	if pageSize < 1 || pageSize > 10000 {
 		pageSize = 20
 	}
 	offset := (page - 1) * pageSize
@@ -57,7 +57,8 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			   so.payment_term_id,
 			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.sales_rep_id,
 			   so.approved_by, so.approved_at, so.created_by, so.created_at, so.updated_at,
-			   COALESCE(c.name, '') as customer_name
+			   COALESCE(c.name, '') as customer_name,
+			   EXISTS(SELECT 1 FROM sales_invoices si WHERE si.sales_order_id = so.id AND si.tenant_id = so.tenant_id AND si.deleted_at IS NULL AND si.status != 'cancelled') as has_invoice
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
@@ -152,6 +153,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		var paymentTerms int
 		var paymentTermID sql.NullString
 		var createdAt, updatedAt time.Time
+		var hasInvoice bool
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &orderNumber, &customerID, &contactPersonID,
@@ -161,7 +163,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			&paymentTermID,
 			&reference, &poNumber, &notes, &internalNotes, &warehouseID, &salesRepID,
 			&approvedBy, &approvedAt, &createdBy, &createdAt, &updatedAt,
-			&customerName,
+			&customerName, &hasInvoice,
 		)
 		if err != nil {
 			continue
@@ -184,6 +186,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			"status":          status.String,
 			"payment_status":  paymentStatus.String,
 			"payment_terms":   paymentTerms,
+			"has_invoice":     hasInvoice,
 			"created_at":      createdAt,
 			"updated_at":      updatedAt,
 		}
