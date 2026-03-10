@@ -355,8 +355,40 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 			Amount:      math.Round(amount*100) / 100,
 		}
 
-		// Categorize by account_type code (REVENUE, COGS, OPEX, OTHER_INC, OTHER_EXP)
-		switch typeCode {
+		// Categorize by account_type code, with account code range fallback
+		// Account code ranges (Uzbekistan chart of accounts):
+		//   4xxx = Revenue, 5xxx = COGS, 6xxx = Operating Expenses,
+		//   7xxx = Other Expenses, 8xxx = Other Income, 9xxx = Other Expenses
+		effectiveType := typeCode
+		if category == "expense" && typeCode != "COGS" && typeCode != "OPEX" && typeCode != "OTHER_EXP" {
+			// Fallback to account code range
+			if len(code) > 0 {
+				switch code[0] {
+				case '5':
+					effectiveType = "COGS"
+				case '6':
+					effectiveType = "OPEX"
+				case '7', '9':
+					effectiveType = "OTHER_EXP"
+				}
+			}
+		}
+		if category == "revenue" && typeCode != "REVENUE" && typeCode != "OTHER_INC" {
+			if len(code) > 0 && (code[0] == '8') {
+				effectiveType = "OTHER_INC"
+			}
+		}
+		// For expense accounts coded 5xxx-6xxx assigned to OTHER_EXP, override to correct type
+		if effectiveType == "OTHER_EXP" && len(code) > 0 {
+			switch code[0] {
+			case '5':
+				effectiveType = "COGS"
+			case '6':
+				effectiveType = "OPEX"
+			}
+		}
+
+		switch effectiveType {
 		case "REVENUE":
 			revenue = append(revenue, section)
 			totalRevenue += amount
