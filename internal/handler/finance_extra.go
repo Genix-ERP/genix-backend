@@ -1049,10 +1049,11 @@ func (h *Handler) UpdateReconciliationAct(c *gin.Context) {
 		}
 
 		allowed := map[string][]string{
-			"draft":     {"sent", "confirmed"},
-			"sent":      {"confirmed", "disputed", "draft"},
-			"confirmed": {"draft"},
-			"disputed":  {"draft", "confirmed"},
+			"draft":       {"sent", "confirmed", "discrepancy"},
+			"sent":        {"confirmed", "disputed", "discrepancy", "draft"},
+			"confirmed":   {"draft"},
+			"disputed":    {"draft", "confirmed"},
+			"discrepancy": {"draft", "confirmed"},
 		}
 
 		valid := false

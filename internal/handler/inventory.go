@@ -3737,7 +3737,7 @@ func (h *Handler) ListReorderRules(c *gin.Context) {
 		JOIN products p ON r.product_id = p.id
 		LEFT JOIN warehouses w ON r.warehouse_id = w.id
 		LEFT JOIN contacts ct ON r.preferred_vendor_id = ct.id
-		LEFT JOIN inventory i ON r.product_id = i.product_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
+		LEFT JOIN inventory i ON r.product_id = i.product_id AND i.tenant_id = r.tenant_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
 		WHERE r.tenant_id = $1
 	`
 	countQuery := `SELECT COUNT(*) FROM reorder_rules r WHERE r.tenant_id = $1`
@@ -4229,7 +4229,7 @@ func (h *Handler) GetReorderAlerts(c *gin.Context) {
 		JOIN products p ON r.product_id = p.id
 		LEFT JOIN warehouses w ON r.warehouse_id = w.id
 		LEFT JOIN contacts ct ON r.preferred_vendor_id = ct.id
-		LEFT JOIN inventory i ON r.product_id = i.product_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
+		LEFT JOIN inventory i ON r.product_id = i.product_id AND i.tenant_id = r.tenant_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
 		WHERE r.tenant_id = $1 AND r.is_active = true
 	`
 	alertArgs := []interface{}{tenantID}
@@ -4351,7 +4351,7 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 			   COALESCE(SUM(i.quantity_available), 0) as current_stock
 		FROM reorder_rules r
 		JOIN products p ON r.product_id = p.id
-		LEFT JOIN inventory i ON r.product_id = i.product_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
+		LEFT JOIN inventory i ON r.product_id = i.product_id AND i.tenant_id = r.tenant_id AND (r.warehouse_id IS NULL OR r.warehouse_id = i.warehouse_id)
 		WHERE r.tenant_id = $1 AND r.is_active = true
 	`
 	args := []interface{}{tenantID}
@@ -4457,15 +4457,15 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 			item.MaxQty = maxQty.Float64
 		}
 
-		// Order up to max_qty: order_qty = max_qty - current_stock
-		// This ensures stock never exceeds max after receiving the order
-		if item.MaxQty > 0 {
+		// Use reorder_qty if explicitly set, otherwise calculate from max_qty
+		if item.ReorderQty > 0 {
+			item.OrderQty = item.ReorderQty
+		} else if item.MaxQty > 0 {
 			item.OrderQty = item.MaxQty - item.CurrentStock
 			if item.OrderQty <= 0 {
-				continue // stock is already at or above max, skip
+				continue
 			}
 		} else {
-			// No max_qty set: use min_qty as target
 			item.OrderQty = item.MinQty - item.CurrentStock
 			if item.OrderQty <= 0 {
 				continue
@@ -4504,15 +4504,10 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 	for vendorID, items := range vendorItems {
 		vid, _ := uuid.Parse(vendorID)
 
-		// Generate order number
-		var orderNumber string
-		err := h.db.QueryRow(`
-			SELECT 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || LPAD((COALESCE(MAX(CAST(SUBSTRING(order_number FROM 'PO-[0-9]+-([0-9]+)') AS INTEGER)), 0) + 1)::TEXT, 4, '0')
-			FROM purchase_orders WHERE tenant_id = $1 AND order_number LIKE 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
-		`, tenantID).Scan(&orderNumber)
-		if err != nil {
-			orderNumber = fmt.Sprintf("PO-%s-%04d", time.Now().Format("20060102"), ordersCreated+1)
-		}
+		// Generate sequential order number
+		var poCount int
+		h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
+		orderNumber := fmt.Sprintf("P%05d", poCount+1+ordersCreated)
 
 		// Calculate expected delivery date from max lead time of items
 		maxLeadDays := 0
@@ -4593,14 +4588,9 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 
 	// Create PO for items without vendors (vendor_id = NULL)
 	if len(noVendorItems) > 0 {
-		var orderNumber string
-		err := h.db.QueryRow(`
-			SELECT 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-' || LPAD((COALESCE(MAX(CAST(SUBSTRING(order_number FROM 'PO-[0-9]+-([0-9]+)') AS INTEGER)), 0) + 1)::TEXT, 4, '0')
-			FROM purchase_orders WHERE tenant_id = $1 AND order_number LIKE 'PO-' || TO_CHAR(NOW(), 'YYYYMMDD') || '-%'
-		`, tenantID).Scan(&orderNumber)
-		if err != nil {
-			orderNumber = fmt.Sprintf("PO-%s-%04d", time.Now().Format("20060102"), ordersCreated+1)
-		}
+		var poCount2 int
+		h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount2)
+		orderNumber := fmt.Sprintf("P%05d", poCount2+1)
 
 		// Calculate expected delivery date from max lead time
 		maxLeadDays := 0
