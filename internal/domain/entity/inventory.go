@@ -250,6 +250,7 @@ type WarehouseOperationType struct {
 	WarehouseID            uuid.UUID         `json:"warehouse_id" db:"warehouse_id"`
 	Code                   string            `json:"code" db:"code"`
 	Name                   string            `json:"name" db:"name"`
+	OperationType          string            `json:"operation_type" db:"operation_type"` // incoming, outgoing, internal
 	Type                   OperationTypeCode `json:"type" db:"type"`
 	Sequence               int               `json:"sequence" db:"sequence"`
 	DefaultLocationSrcID   *uuid.UUID        `json:"default_location_src_id,omitempty" db:"default_location_src_id"`
