@@ -944,13 +944,14 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	var currentStatus, invoiceNumber string
 	var customerID uuid.UUID
 	var organizationID *uuid.UUID
+	var salesOrderID sql.NullString
 	var totalAmount, taxAmount, subtotal float64
 	var invoiceDate time.Time
 	err = h.db.QueryRow(`
-		SELECT status, invoice_number, customer_id, organization_id, total_amount, tax_amount, subtotal, invoice_date
+		SELECT status, invoice_number, customer_id, organization_id, total_amount, tax_amount, subtotal, invoice_date, sales_order_id
 		FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &invoiceNumber, &customerID, &organizationID, &totalAmount, &taxAmount, &subtotal, &invoiceDate)
+	).Scan(&currentStatus, &invoiceNumber, &customerID, &organizationID, &totalAmount, &taxAmount, &subtotal, &invoiceDate, &salesOrderID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
 		return
@@ -1055,6 +1056,21 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	// Resolve fallback revenue account for products without category income account
 	fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
 
+	// Check if a delivery stock operation already posted COGS for this sales order
+	// to avoid double-counting COGS (once from stock operation, once from invoice)
+	deliveryAlreadyPostedCOGS := false
+	if salesOrderID.Valid {
+		var cogsPosted int
+		tx.QueryRow(`
+			SELECT COUNT(*) FROM journal_entries je
+			JOIN stock_operations so ON so.id::text = je.source_id
+			WHERE je.source_type = 'stock_operation' AND je.status = 'posted' AND je.deleted_at IS NULL
+			  AND so.source_type = 'sales_order' AND so.source_id = $1
+			  AND so.direction = 'delivery' AND so.state = 'done'
+		`, salesOrderID.String).Scan(&cogsPosted)
+		deliveryAlreadyPostedCOGS = cogsPosted > 0
+	}
+
 	for _, il := range invoiceLines {
 		if il.LineTotal > 0 {
 			if il.IncomeAcct != uuid.Nil {
@@ -1063,9 +1079,12 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 				revenueGrouped[fallbackRevenue] += il.LineTotal
 			}
 		}
-		costAmount := il.Quantity * il.CostPrice
-		if costAmount > 0 && il.ExpenseAcct != uuid.Nil && il.OutputAcct != uuid.Nil {
-			cogsGrouped[cogsPair{Expense: il.ExpenseAcct, Output: il.OutputAcct}] += costAmount
+		// Only post COGS if no delivery stock operation already did
+		if !deliveryAlreadyPostedCOGS {
+			costAmount := il.Quantity * il.CostPrice
+			if costAmount > 0 && il.ExpenseAcct != uuid.Nil && il.OutputAcct != uuid.Nil {
+				cogsGrouped[cogsPair{Expense: il.ExpenseAcct, Output: il.OutputAcct}] += costAmount
+			}
 		}
 	}
 
@@ -1337,14 +1356,25 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Get Cash Receipts Journal ID
+	// Get Cash Receipts Journal ID — prefer org-specific, then tenant-wide
 	var cashJournalID uuid.UUID
 	var numberPrefix sql.NullString
-	err = tx.QueryRow(`
-		SELECT id, number_prefix
-		FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL`,
-		tenantID,
-	).Scan(&cashJournalID, &numberPrefix)
+	if organizationID != nil {
+		_ = tx.QueryRow(`
+			SELECT id, number_prefix
+			FROM journals WHERE tenant_id = $1 AND organization_id = $2 AND code IN ('CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL
+			ORDER BY CASE WHEN code = 'CASH_RECEIPTS' THEN 0 ELSE 1 END LIMIT 1`,
+			tenantID, *organizationID,
+		).Scan(&cashJournalID, &numberPrefix)
+	}
+	if cashJournalID == uuid.Nil {
+		_ = tx.QueryRow(`
+			SELECT id, number_prefix
+			FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL
+			ORDER BY CASE WHEN code = 'CASH_RECEIPTS' THEN 0 ELSE 1 END LIMIT 1`,
+			tenantID,
+		).Scan(&cashJournalID, &numberPrefix)
+	}
 
 	// Derive next number from actual max across ALL journals for this tenant+org
 	// to avoid duplicate key on unique constraint (tenant_id, organization_id, entry_number)
@@ -1425,12 +1455,13 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		// Use savepoint so a GL failure doesn't abort the whole transaction
 		tx.Exec("SAVEPOINT gl_posting")
 
+		var glErr error
 		var paymentCreatedBy *uuid.UUID
 		if userID != uuid.Nil {
 			paymentCreatedBy = &userID
 		}
 		jeTotal := input.Amount + input.WriteOffAmount + earlyDiscountApplied
-		_, err = tx.Exec(`
+		_, glErr = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
@@ -1438,14 +1469,11 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			journalEntryID, tenantID, organizationID, cashJournalID, entryNumber, paymentDate, reference, description,
 			"payment_receipt", invoiceID, 1.0, jeTotal, jeTotal, "posted", paymentCreatedBy, now, now,
 		)
-		if err != nil {
-			h.log.Error("Failed to create payment journal entry", "error", err)
-			// Rollback to savepoint so the transaction stays usable
-			tx.Exec("ROLLBACK TO SAVEPOINT gl_posting")
-		} else {
+
+		if glErr == nil {
 			// Line 1: Debit Cash/Bank
 			cashLineID := uuid.New()
-			_, err = tx.Exec(`
+			_, glErr = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
@@ -1453,11 +1481,13 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				cashLineID, journalEntryID, 1, cashAccountID, customerID, "Outstanding Receipt",
 				input.Amount, 0.0, 1.0, now,
 			)
+		}
 
+		if glErr == nil {
 			// Line 2: Credit AR (payment + write-off + early discount reduces AR)
 			arCreditAmount := input.Amount + input.WriteOffAmount + earlyDiscountApplied
 			arLineID := uuid.New()
-			_, err = tx.Exec(`
+			_, glErr = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
@@ -1465,67 +1495,75 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				arLineID, journalEntryID, 2, arAccountID, customerID, "Accounts Receivable",
 				0.0, arCreditAmount, 1.0, now,
 			)
+		}
 
-			lineNumber := 3
-			// Line 3: Write-off (DR Write-off Expense, already credited AR above)
-			if input.WriteOffAmount > 0 {
-				writeOffAccountID := findAccount(tx, tenantID, organizationID, "payment difference write-off", "6950")
-				if writeOffAccountID == uuid.Nil {
-					writeOffAccountID = findAccount(tx, tenantID, organizationID, "miscellaneous expense", "6900")
-				}
-				if writeOffAccountID != uuid.Nil {
-					writeOffLineID := uuid.New()
-					tx.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, line_number, account_id, contact_id, description,
-							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						writeOffLineID, journalEntryID, lineNumber, writeOffAccountID, customerID, "Payment Difference Write-off",
-						input.WriteOffAmount, 0.0, 1.0, now,
-					)
-					lineNumber++
-					// Update write-off account balance (debit-normal expense: debit increases)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.WriteOffAmount, now, writeOffAccountID)
+		lineNumber := 3
+		// Line 3: Write-off (DR Write-off Expense, already credited AR above)
+		if glErr == nil && input.WriteOffAmount > 0 {
+			writeOffAccountID := findAccount(tx, tenantID, organizationID, "payment difference write-off", "6950")
+			if writeOffAccountID == uuid.Nil {
+				writeOffAccountID = findAccount(tx, tenantID, organizationID, "miscellaneous expense", "6900")
+			}
+			if writeOffAccountID != uuid.Nil {
+				writeOffLineID := uuid.New()
+				_, glErr = tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, contact_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					writeOffLineID, journalEntryID, lineNumber, writeOffAccountID, customerID, "Payment Difference Write-off",
+					input.WriteOffAmount, 0.0, 1.0, now,
+				)
+				lineNumber++
+				if glErr == nil {
+					_, glErr = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.WriteOffAmount, now, writeOffAccountID)
 				}
 			}
+		}
 
-			// Line for early payment discount (DR Sales Discount)
-			if earlyDiscountApplied > 0 {
-				discountAccountID := findAccount(tx, tenantID, organizationID, "sales discount", "4900")
-				if discountAccountID == uuid.Nil {
-					discountAccountID = findAccount(tx, tenantID, organizationID, "cash discount", "4900")
-				}
-				if discountAccountID == uuid.Nil {
-					discountAccountID = findAccount(tx, tenantID, organizationID, "discount", "4900")
-				}
-				if discountAccountID != uuid.Nil {
-					discountLineID := uuid.New()
-					tx.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, line_number, account_id, contact_id, description,
-							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						discountLineID, journalEntryID, lineNumber, discountAccountID, customerID, "Early Payment Discount",
-						earlyDiscountApplied, 0.0, 1.0, now,
-					)
-					lineNumber++
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", earlyDiscountApplied, now, discountAccountID)
+		// Line for early payment discount (DR Sales Discount)
+		if glErr == nil && earlyDiscountApplied > 0 {
+			discountAccountID := findAccount(tx, tenantID, organizationID, "sales discount", "4900")
+			if discountAccountID == uuid.Nil {
+				discountAccountID = findAccount(tx, tenantID, organizationID, "cash discount", "4900")
+			}
+			if discountAccountID == uuid.Nil {
+				discountAccountID = findAccount(tx, tenantID, organizationID, "discount", "4900")
+			}
+			if discountAccountID != uuid.Nil {
+				discountLineID := uuid.New()
+				_, glErr = tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, contact_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					discountLineID, journalEntryID, lineNumber, discountAccountID, customerID, "Early Payment Discount",
+					earlyDiscountApplied, 0.0, 1.0, now,
+				)
+				lineNumber++
+				if glErr == nil {
+					_, glErr = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", earlyDiscountApplied, now, discountAccountID)
 				}
 			}
+		}
 
+		if glErr == nil {
 			// Update account balances
-			// Debit Outstanding Receipts / Cash (debit-normal: increases)
-			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAccountID)
-			// Credit AR (debit-normal: credit decreases) — includes write-off + early discount
-			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", arCreditAmount, now, arAccountID)
+			arCreditAmount := input.Amount + input.WriteOffAmount + earlyDiscountApplied
+			_, glErr = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAccountID)
+			if glErr == nil {
+				_, glErr = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", arCreditAmount, now, arAccountID)
+			}
+		}
 
+		if glErr == nil {
 			// Create payment record
 			paymentID := uuid.New()
 			paymentRef := input.Reference
 			if paymentRef == "" {
 				paymentRef = GeneratePaymentReference("sales_invoice", invoiceNumber, "")
 			}
-			_, err = tx.Exec(`
+			_, glErr = tx.Exec(`
 				INSERT INTO payments (
 					id, tenant_id, organization_id, type, payment_number, contact_id, payment_date, amount,
 					currency_id, exchange_rate, reference, notes, status, journal_entry_id,
@@ -1536,17 +1574,22 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				userID, now, now,
 			)
 
-			// Create payment allocation
-			if err == nil {
+			if glErr == nil {
+				// Create payment allocation
 				allocationID := uuid.New()
-				tx.Exec(`
+				_, glErr = tx.Exec(`
 					INSERT INTO payment_allocations (
 						id, payment_id, document_type, document_id, amount, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6)`,
 					allocationID, paymentID, "sales_invoice", invoiceID, input.Amount, now,
 				)
 			}
-			// Release savepoint on success
+		}
+
+		if glErr != nil {
+			h.log.Error("GL posting failed in RecordPayment, rolling back GL only", "error", glErr, "invoice_id", invoiceID)
+			tx.Exec("ROLLBACK TO SAVEPOINT gl_posting")
+		} else {
 			tx.Exec("RELEASE SAVEPOINT gl_posting")
 		}
 	}
