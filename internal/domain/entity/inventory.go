@@ -547,7 +547,7 @@ type CreateInventoryLotInput struct {
 	ProductID       string  `json:"product_id" binding:"required"`
 	WarehouseID     string  `json:"warehouse_id" binding:"required"`
 	LocationID      string  `json:"location_id,omitempty"`
-	LotNumber       string  `json:"lot_number" binding:"required"`
+	LotNumber       string  `json:"lot_number"`
 	SerialNumber    string  `json:"serial_number,omitempty"`
 	ReceivedDate    string  `json:"received_date" binding:"required"`
 	ExpiryDate      string  `json:"expiry_date,omitempty"`
@@ -1199,7 +1199,7 @@ type CreateReorderRuleInput struct {
 	WarehouseID       string  `json:"warehouse_id,omitempty"`
 	MinQty            float64 `json:"min_qty" binding:"required,gte=0"`
 	MaxQty            float64 `json:"max_qty,omitempty"`
-	ReorderQty        float64 `json:"reorder_qty" binding:"required,gt=0"`
+	ReorderQty        float64 `json:"reorder_qty,omitempty"`
 	TriggerType       string  `json:"trigger_type,omitempty"`
 	PreferredVendorID string  `json:"preferred_vendor_id,omitempty"`
 	LeadTimeDays      int     `json:"lead_time_days,omitempty"`

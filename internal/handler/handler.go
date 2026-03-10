@@ -353,6 +353,13 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.GET("/movements", h.ListInventoryMovements)
 		inventory.GET("/valuation", h.GetInventoryValuation)
 		inventory.GET("/cogs", h.GetCOGSData)
+
+		// Inventory Lots (Partiyalar)
+		inventory.GET("/lots", h.ListInventoryLots)
+		inventory.POST("/lots", h.perm.Require("inventory", "stock", "create"), h.CreateInventoryLot)
+		inventory.GET("/lots/:id", h.GetInventoryLot)
+		inventory.PUT("/lots/:id", h.perm.Require("inventory", "stock", "update"), h.UpdateInventoryLot)
+		inventory.DELETE("/lots/:id", h.perm.Require("inventory", "stock", "delete"), h.DeleteInventoryLot)
 	}
 
 	// Stock Counts (Inventarizatsiya)

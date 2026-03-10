@@ -844,9 +844,10 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 	var grWarehouseID sql.NullString
 	h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1", grID).Scan(&grWarehouseID)
 
-	// Get GR lines with product info for inventory update
+	// Get GR lines with product info for inventory update (including batch/expiry for lot creation)
 	grLinesForInventory, err := h.db.Query(`
-		SELECT grl.product_id, grl.accepted_quantity, grl.unit_price
+		SELECT grl.product_id, grl.accepted_quantity, grl.unit_price,
+		       COALESCE(grl.batch_number, ''), grl.expiry_date
 		FROM goods_receipt_lines grl
 		WHERE grl.goods_receipt_id = $1 AND grl.product_id IS NOT NULL AND grl.accepted_quantity > 0
 	`, grID)
@@ -857,8 +858,10 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 		for grLinesForInventory.Next() {
 			var productID uuid.UUID
 			var acceptedQty, unitPrice float64
+			var batchNumber string
+			var expiryDate sql.NullTime
 
-			if err := grLinesForInventory.Scan(&productID, &acceptedQty, &unitPrice); err != nil {
+			if err := grLinesForInventory.Scan(&productID, &acceptedQty, &unitPrice, &batchNumber, &expiryDate); err != nil {
 				continue
 			}
 
@@ -911,6 +914,35 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 					reason, transaction_date, created_at
 				) VALUES ($1, $2, $3, 'receipt', $4, $5, $6, 'goods_receipt', $7, 'Goods Receipt', $8, $8)
 			`, txID, tenantID, inventoryID, acceptedQty, unitPrice, acceptedQty*unitPrice, grID, now)
+
+			// 4. Auto-create inventory lot record
+			lotNumber := batchNumber
+			if lotNumber == "" {
+				lotNumber = h.generateLotNumber(tenantID)
+			}
+			lotID := uuid.New()
+			var expDate *time.Time
+			if expiryDate.Valid {
+				expDate = &expiryDate.Time
+			}
+			// Get vendor from PO
+			var vendorID *uuid.UUID
+			var poID *uuid.UUID
+			if purchaseOrderID != uuid.Nil {
+				poID = &purchaseOrderID
+				var vid uuid.UUID
+				if err := h.db.QueryRow("SELECT vendor_id FROM purchase_orders WHERE id = $1", purchaseOrderID).Scan(&vid); err == nil {
+					vendorID = &vid
+				}
+			}
+			h.db.Exec(`
+				INSERT INTO inventory_lots (
+					id, tenant_id, product_id, warehouse_id, lot_number,
+					received_date, expiry_date, initial_quantity, remaining_quantity,
+					unit_cost, vendor_id, purchase_order_id, status, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
+			`, lotID, tenantID, productID, warehouseID, lotNumber,
+				now, expDate, acceptedQty, unitPrice, vendorID, poID, now)
 		}
 	}
 
