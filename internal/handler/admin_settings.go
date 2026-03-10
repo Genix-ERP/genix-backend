@@ -547,7 +547,7 @@ func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike str
 	// 3. Try org + code match
 	if orgID != nil {
 		_ = q.QueryRow(
-			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code = $3 AND deleted_at IS NULL LIMIT 1`,
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND (organization_id = $2 OR organization_id IS NULL) AND code = $3 AND deleted_at IS NULL LIMIT 1`,
 			tenantID, *orgID, code,
 		).Scan(&id)
 		if id != uuid.Nil {
@@ -568,6 +568,24 @@ func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike str
 	_ = q.QueryRow(
 		`SELECT id FROM accounts WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL LIMIT 1`,
 		tenantID, code,
+	).Scan(&id)
+	if id != uuid.Nil {
+		return id
+	}
+
+	// 6. Code prefix match (org-scoped, then tenant-wide)
+	if orgID != nil {
+		_ = q.QueryRow(
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code LIKE $3 AND deleted_at IS NULL ORDER BY code ASC LIMIT 1`,
+			tenantID, *orgID, code+"%",
+		).Scan(&id)
+		if id != uuid.Nil {
+			return id
+		}
+	}
+	_ = q.QueryRow(
+		`SELECT id FROM accounts WHERE tenant_id = $1 AND code LIKE $2 AND deleted_at IS NULL ORDER BY code ASC LIMIT 1`,
+		tenantID, code+"%",
 	).Scan(&id)
 	return id
 }
