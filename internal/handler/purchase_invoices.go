@@ -127,7 +127,8 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch purchase invoices: "+err.Error())
+		h.log.Error("Failed to fetch purchase invoices", "error", err)
+		response.InternalError(c, "Failed to fetch purchase invoices")
 		return
 	}
 	defer rows.Close()
@@ -243,7 +244,8 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		Notes               string  `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -330,7 +332,8 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		"pending", input.Notes, createdBy, now, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create purchase invoice: "+err.Error())
+		h.log.Error("Failed to create purchase invoice", "error", err)
+		response.InternalError(c, "Failed to create purchase invoice")
 		return
 	}
 
@@ -425,7 +428,8 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch purchase invoice: "+err.Error())
+		h.log.Error("Failed to fetch purchase invoice", "error", err)
+		response.InternalError(c, "Failed to fetch purchase invoice")
 		return
 	}
 
@@ -619,7 +623,8 @@ func (h *Handler) UpdatePurchaseInvoice(c *gin.Context) {
 		AmountPaid  *float64 `json:"amount_paid"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -694,7 +699,8 @@ func (h *Handler) UpdatePurchaseInvoice(c *gin.Context) {
 
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update purchase invoice: "+err.Error())
+		h.log.Error("Failed to update purchase invoice", "error", err)
+		response.InternalError(c, "Failed to update purchase invoice")
 		return
 	}
 
@@ -1268,7 +1274,8 @@ func (h *Handler) CreateDebitNote(c *gin.Context) {
 
 	var input entity.CreateDebitNoteInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1343,7 +1350,8 @@ func (h *Handler) CreateDebitNote(c *gin.Context) {
 	)
 	if err != nil {
 		h.log.Error("Failed to create debit note", "error", err)
-		response.InternalError(c, "Failed to create debit note: "+err.Error())
+		h.log.Error("Failed to create debit note", "error", err)
+		response.InternalError(c, "Failed to create debit note")
 		return
 	}
 

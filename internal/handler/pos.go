@@ -202,7 +202,8 @@ func (h *Handler) ListPOSConfigs(c *gin.Context) {
 
 	rows, err := h.db.Query(query, tenantID)
 	if err != nil {
-		response.Error(c, 500, "Failed to fetch POS configs", err.Error())
+		h.log.Error("Failed to fetch POS configs", "error", err)
+		response.InternalError(c, "Failed to fetch POS configs")
 		return
 	}
 	defer rows.Close()
@@ -219,7 +220,8 @@ func (h *Handler) ListPOSConfigs(c *gin.Context) {
 			&config.CreatedAt, &config.UpdatedAt,
 		)
 		if err != nil {
-			response.Error(c, 500, "Failed to scan POS config", err.Error())
+			h.log.Error("Failed to scan POS config", "error", err)
+			response.InternalError(c, "Failed to scan POS config")
 			return
 		}
 		if warehouseName.Valid {
@@ -238,7 +240,8 @@ func (h *Handler) CreatePOSConfig(c *gin.Context) {
 
 	var input POSConfigInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, 400, "Invalid input", err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -304,7 +307,8 @@ func (h *Handler) CreatePOSConfig(c *gin.Context) {
 	).Scan(&config.CreatedAt, &config.UpdatedAt)
 
 	if err != nil {
-		response.Error(c, 500, "Failed to create POS config", err.Error())
+		h.log.Error("Failed to create POS config", "error", err)
+		response.InternalError(c, "Failed to create POS config")
 		return
 	}
 
@@ -318,7 +322,8 @@ func (h *Handler) UpdatePOSConfig(c *gin.Context) {
 
 	var input POSConfigInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, 400, "Invalid input", err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -347,7 +352,8 @@ func (h *Handler) UpdatePOSConfig(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to update POS config", err.Error())
+		h.log.Error("Failed to update POS config", "error", err)
+		response.InternalError(c, "Failed to update POS config")
 		return
 	}
 
@@ -365,7 +371,8 @@ func (h *Handler) OpenPOSSession(c *gin.Context) {
 
 	var input OpenSessionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, 400, "Invalid input", err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -381,7 +388,8 @@ func (h *Handler) OpenPOSSession(c *gin.Context) {
 		return
 	}
 	if err != sql.ErrNoRows {
-		response.Error(c, 500, "Failed to check existing session", err.Error())
+		h.log.Error("Failed to check existing session", "error", err)
+		response.InternalError(c, "Failed to check existing session")
 		return
 	}
 
@@ -425,7 +433,8 @@ func (h *Handler) OpenPOSSession(c *gin.Context) {
 	).Scan(&session.OpenedAt, &session.CreatedAt)
 
 	if err != nil {
-		response.Error(c, 500, "Failed to open session", err.Error())
+		h.log.Error("Failed to open session", "error", err)
+		response.InternalError(c, "Failed to open session")
 		return
 	}
 
@@ -469,7 +478,8 @@ func (h *Handler) GetCurrentPOSSession(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to get session", err.Error())
+		h.log.Error("Failed to get session", "error", err)
+		response.InternalError(c, "Failed to get session")
 		return
 	}
 
@@ -503,7 +513,8 @@ func (h *Handler) ClosePOSSession(c *gin.Context) {
 
 	var input CloseSessionInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, 400, "Invalid input", err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -522,7 +533,8 @@ func (h *Handler) ClosePOSSession(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to get session", err.Error())
+		h.log.Error("Failed to get session", "error", err)
+		response.InternalError(c, "Failed to get session")
 		return
 	}
 
@@ -558,7 +570,8 @@ func (h *Handler) ClosePOSSession(c *gin.Context) {
 
 	_, err = h.db.Exec(query, input.ClosingBalance, expectedBalance, difference, input.Notes, sessionID)
 	if err != nil {
-		response.Error(c, 500, "Failed to close session", err.Error())
+		h.log.Error("Failed to close session", "error", err)
+		response.InternalError(c, "Failed to close session")
 		return
 	}
 
@@ -596,7 +609,8 @@ func (h *Handler) ListPOSSessions(c *gin.Context) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to fetch sessions", err.Error())
+		h.log.Error("Failed to fetch sessions", "error", err)
+		response.InternalError(c, "Failed to fetch sessions")
 		return
 	}
 	defer rows.Close()
@@ -655,7 +669,8 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 
 	var input POSOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, 400, "Invalid input", err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -676,14 +691,16 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to get session", err.Error())
+		h.log.Error("Failed to get session", "error", err)
+		response.InternalError(c, "Failed to get session")
 		return
 	}
 
 	// Start transaction
 	tx, err := h.db.Begin()
 	if err != nil {
-		response.Error(c, 500, "Failed to start transaction", err.Error())
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to start transaction")
 		return
 	}
 	defer tx.Rollback()
@@ -736,7 +753,8 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 		amountPaid, amountReturn, warehouseID, input.Notes, userID)
 
 	if err != nil {
-		response.Error(c, 500, "Failed to create order", err.Error())
+		h.log.Error("Failed to create order", "error", err)
+		response.InternalError(c, "Failed to create order")
 		return
 	}
 
@@ -778,7 +796,8 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 			lineTotal, unitCost, line.Notes)
 
 		if err != nil {
-			response.Error(c, 500, "Failed to create order line", err.Error())
+			h.log.Error("Failed to create order line", "error", err)
+			response.InternalError(c, "Failed to create order line")
 			return
 		}
 
@@ -793,7 +812,8 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 			`, line.Quantity, line.ProductID, warehouseID, tenantID)
 
 			if err != nil {
-				response.Error(c, 500, "Failed to update inventory", err.Error())
+				h.log.Error("Failed to update inventory", "error", err)
+				response.InternalError(c, "Failed to update inventory")
 				return
 			}
 
@@ -806,7 +826,8 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 			`, uuid.New(), tenantID, line.ProductID, warehouseID, -line.Quantity, orderID, "POS Sale: "+orderNumber)
 
 			if err != nil {
-				response.Error(c, 500, "Failed to create inventory transaction", err.Error())
+				h.log.Error("Failed to create inventory transaction", "error", err)
+				response.InternalError(c, "Failed to create inventory transaction")
 				return
 			}
 		}
@@ -824,7 +845,8 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 			payment.PaymentType, payment.Amount, payment.TransactionID, payment.CardLastFour)
 
 		if err != nil {
-			response.Error(c, 500, "Failed to create payment", err.Error())
+			h.log.Error("Failed to create payment", "error", err)
+			response.InternalError(c, "Failed to create payment")
 			return
 		}
 
@@ -851,13 +873,15 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 	`, totalAmount, totalCash, totalCard, totalOther, sessionID)
 
 	if err != nil {
-		response.Error(c, 500, "Failed to update session", err.Error())
+		h.log.Error("Failed to update session", "error", err)
+		response.InternalError(c, "Failed to update session")
 		return
 	}
 
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
-		response.Error(c, 500, "Failed to commit transaction", err.Error())
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
 
@@ -917,7 +941,8 @@ func (h *Handler) GetPOSOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to get order", err.Error())
+		h.log.Error("Failed to get order", "error", err)
+		response.InternalError(c, "Failed to get order")
 		return
 	}
 
@@ -1023,7 +1048,8 @@ func (h *Handler) ListPOSOrders(c *gin.Context) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to fetch orders", err.Error())
+		h.log.Error("Failed to fetch orders", "error", err)
+		response.InternalError(c, "Failed to fetch orders")
 		return
 	}
 	defer rows.Close()
@@ -1096,7 +1122,8 @@ func (h *Handler) SearchPOSProducts(c *gin.Context) {
 
 	rows, err := h.db.Query(sqlQuery, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to search products", err.Error())
+		h.log.Error("Failed to search products", "error", err)
+		response.InternalError(c, "Failed to search products")
 		return
 	}
 	defer rows.Close()
@@ -1183,7 +1210,8 @@ func (h *Handler) GetSessionSummary(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to get session summary", err.Error())
+		h.log.Error("Failed to get session summary", "error", err)
+		response.InternalError(c, "Failed to get session summary")
 		return
 	}
 

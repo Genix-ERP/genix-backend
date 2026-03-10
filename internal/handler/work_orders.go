@@ -93,7 +93,8 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to list work orders", err.Error())
+		h.log.Error("Failed to list work orders", "error", err)
+		response.InternalError(c, "Failed to list work orders")
 		return
 	}
 	defer rows.Close()
@@ -236,7 +237,8 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to get work order", err.Error())
+		h.log.Error("Failed to get work order", "error", err)
+		response.InternalError(c, "Failed to get work order")
 		return
 	}
 
@@ -327,7 +329,8 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 		WHERE id = $3 AND tenant_id = $4
 	`, now, operatorID, woID, tenantID)
 	if err != nil {
-		response.Error(c, 500, "Failed to start work order", err.Error())
+		h.log.Error("Failed to start work order", "error", err)
+		response.InternalError(c, "Failed to start work order")
 		return
 	}
 
@@ -373,7 +376,8 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 
 	var input entity.CompleteWorkOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -407,7 +411,8 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		WHERE id = $6 AND tenant_id = $7
 	`, now, input.QuantityProduced, input.ScrapQuantity, durationHours, userID, woID, tenantID)
 	if err != nil {
-		response.Error(c, 500, "Failed to complete work order", err.Error())
+		h.log.Error("Failed to complete work order", "error", err)
+		response.InternalError(c, "Failed to complete work order")
 		return
 	}
 
@@ -586,7 +591,8 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 
 	var input entity.CreateWorkOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -632,7 +638,8 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 		input.ScheduledStart, input.ScheduledEnd,
 		input.Instructions, input.Notes, userID)
 	if err != nil {
-		response.Error(c, 500, "Failed to create work order", err.Error())
+		h.log.Error("Failed to create work order", "error", err)
+		response.InternalError(c, "Failed to create work order")
 		return
 	}
 
@@ -661,7 +668,8 @@ func (h *Handler) RecordWorkOrderTime(c *gin.Context) {
 
 	var input entity.RecordWorkOrderTimeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -699,7 +707,8 @@ func (h *Handler) RecordWorkOrderTime(c *gin.Context) {
 	`, logID, tenantID, woID, startTime, endTime, durationHours,
 		input.LogType, userID, userName, input.Notes)
 	if err != nil {
-		response.Error(c, 500, "Failed to record time", err.Error())
+		h.log.Error("Failed to record time", "error", err)
+		response.InternalError(c, "Failed to record time")
 		return
 	}
 
@@ -759,7 +768,8 @@ func (h *Handler) PauseWorkOrder(c *gin.Context) {
 	// Update status to paused (migration 010 valid status)
 	_, err = h.db.Exec("UPDATE work_orders SET status = 'paused' WHERE id = $1 AND tenant_id = $2", woID, tenantID)
 	if err != nil {
-		response.Error(c, 500, "Failed to pause work order", err.Error())
+		h.log.Error("Failed to pause work order", "error", err)
+		response.InternalError(c, "Failed to pause work order")
 		return
 	}
 
@@ -837,7 +847,8 @@ func (h *Handler) ListManufacturingTransfers(c *gin.Context) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to list transfers", err.Error())
+		h.log.Error("Failed to list transfers", "error", err)
+		response.InternalError(c, "Failed to list transfers")
 		return
 	}
 	defer rows.Close()
@@ -936,7 +947,8 @@ func (h *Handler) GetManufacturingTransfer(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to get transfer", err.Error())
+		h.log.Error("Failed to get transfer", "error", err)
+		response.InternalError(c, "Failed to get transfer")
 		return
 	}
 
@@ -1068,7 +1080,8 @@ func (h *Handler) ValidateManufacturingTransfer(c *gin.Context) {
 		WHERE id = $3 AND tenant_id = $4
 	`, now, userID, transferID, tenantID)
 	if err != nil {
-		response.Error(c, 500, "Failed to validate transfer", err.Error())
+		h.log.Error("Failed to validate transfer", "error", err)
+		response.InternalError(c, "Failed to validate transfer")
 		return
 	}
 

@@ -443,7 +443,8 @@ func (h *Handler) CreateLead(c *gin.Context) {
 
 	var input entity.CreateLeadInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -655,7 +656,8 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 
 	var input entity.UpdateLeadInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -940,7 +942,8 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 
 	var input ConvertLeadInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

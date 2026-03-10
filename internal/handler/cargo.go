@@ -177,7 +177,8 @@ func (h *Handler) CreateCargoShipment(c *gin.Context) {
 
 	var req entity.CreateCargoShipmentRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -279,7 +280,8 @@ func (h *Handler) UpdateCargoShipmentStatus(c *gin.Context) {
 
 	var req entity.UpdateShipmentStatusRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -395,7 +397,8 @@ func (h *Handler) CreateCargoDistribution(c *gin.Context) {
 
 	var req entity.CreateDistributionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -552,7 +555,8 @@ func (h *Handler) CreateCargoCashTransaction(c *gin.Context) {
 
 	var req entity.CreateCashTransactionRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

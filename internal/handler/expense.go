@@ -224,7 +224,8 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 
 	var input entity.CreateExpenseInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -442,7 +443,8 @@ func (h *Handler) UpdateExpense(c *gin.Context) {
 
 	var input entity.UpdateExpenseInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

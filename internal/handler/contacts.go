@@ -243,7 +243,8 @@ func (h *Handler) CreateContact(c *gin.Context) {
 
 	var input entity.CreateContactInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -531,7 +532,8 @@ func (h *Handler) UpdateContact(c *gin.Context) {
 
 	var input entity.UpdateContactInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -814,7 +816,8 @@ func (h *Handler) CreateContactPerson(c *gin.Context) {
 
 	var input entity.CreateContactPersonInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -904,7 +907,8 @@ func (h *Handler) RateSupplier(c *gin.Context) {
 		Comment string  `json:"comment"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
