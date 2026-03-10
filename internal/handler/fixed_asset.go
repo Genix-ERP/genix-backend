@@ -1222,9 +1222,9 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 	}
 
 	// Validate maintenance_type
-	validTypes := map[string]bool{"regular_to": true, "capital_repair": true, "modernization": true, "minor_repair": true}
+	validTypes := map[string]bool{"regular_to": true, "capital_repair": true, "modernization": true, "minor_repair": true, "transfer": true}
 	if !validTypes[input.MaintenanceType] {
-		response.BadRequest(c, "Invalid maintenance_type. Must be: regular_to, capital_repair, modernization, minor_repair")
+		response.BadRequest(c, "Invalid maintenance_type. Must be: regular_to, capital_repair, modernization, minor_repair, transfer")
 		return
 	}
 
@@ -1306,7 +1306,7 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 		newRemaining += input.ExtensionMonths
 		newUsefulLife += input.ExtensionMonths
 
-	case "minor_repair":
+	case "minor_repair", "transfer":
 		// Hech narsa o'zgarmaydi — faqat xarajat
 		m.LifeExtensionMonths = 0
 		m.ValueIncrease = 0
@@ -1347,7 +1347,7 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 	}
 
 	// Update asset with new values (skip for minor_repair)
-	if input.MaintenanceType != "minor_repair" {
+	if input.MaintenanceType != "minor_repair" && input.MaintenanceType != "transfer" {
 		_, err = h.db.Exec(`
 			UPDATE fixed_assets SET
 				current_value = $1, remaining_months = $2, monthly_depr = $3,
