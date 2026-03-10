@@ -56,7 +56,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			   so.currency_id, so.exchange_rate, so.subtotal, so.discount_type, so.discount_value, so.discount_amount,
 			   so.tax_amount, so.shipping_amount, so.total_amount, so.status, so.payment_status, so.payment_terms,
 			   so.payment_term_id,
-			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.sales_rep_id,
+			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.vehicle_number, so.sales_rep_id,
 			   so.approved_by, so.approved_at, so.created_by, so.created_at, so.updated_at,
 			   COALESCE(c.name, '') as customer_name,
 			   EXISTS(SELECT 1 FROM sales_invoices si WHERE si.sales_order_id = so.id AND si.tenant_id = so.tenant_id AND si.deleted_at IS NULL AND si.status != 'cancelled') as has_invoice
@@ -145,7 +145,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 	var orders []map[string]interface{}
 	for rows.Next() {
 		var id, tenantIDScan, customerID uuid.UUID
-		var organizationID, contactPersonID, currencyID, warehouseID, salesRepID, approvedBy, createdBy sql.NullString
+		var organizationID, contactPersonID, currencyID, warehouseID, vehicleNumber, salesRepID, approvedBy, createdBy sql.NullString
 		var orderNumber, customerName string
 		var orderDate time.Time
 		var expectedDate, approvedAt sql.NullTime
@@ -163,7 +163,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			&currencyID, &exchangeRate, &subtotal, &discountType, &discountValue, &discountAmount,
 			&taxAmount, &shippingAmount, &totalAmount, &status, &paymentStatus, &paymentTerms,
 			&paymentTermID,
-			&reference, &poNumber, &notes, &internalNotes, &warehouseID, &salesRepID,
+			&reference, &poNumber, &notes, &internalNotes, &warehouseID, &vehicleNumber, &salesRepID,
 			&approvedBy, &approvedAt, &createdBy, &createdAt, &updatedAt,
 			&customerName, &hasInvoice,
 		)
@@ -223,6 +223,9 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		if warehouseID.Valid {
 			order["warehouse_id"] = warehouseID.String
 		}
+		if vehicleNumber.Valid {
+			order["vehicle_number"] = vehicleNumber.String
+		}
 		if salesRepID.Valid {
 			order["sales_rep_id"] = salesRepID.String
 		}
@@ -272,6 +275,7 @@ type SimpleSalesOrderInput struct {
 	InternalNotes   string                              `json:"internal_notes,omitempty"`
 	WarehouseID     string                              `json:"warehouse_id,omitempty"`
 	Carrier         string                              `json:"carrier,omitempty"`
+	VehicleNumber   string                              `json:"vehicle_number,omitempty"`
 	SalesRepID      string                              `json:"sales_rep_id,omitempty"`
 	Lines           []entity.CreateSalesOrderLineInput  `json:"lines,omitempty"`
 
@@ -374,7 +378,9 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 	// Generate order number
 	orderNumber := input.OrderNumber
 	if orderNumber == "" {
-		orderNumber = "SO-" + time.Now().Format("20060102") + "-" + uuid.New().String()[:6]
+		var count int
+		h.db.QueryRow("SELECT COUNT(*) FROM sales_orders WHERE tenant_id = $1", tenantID).Scan(&count)
+		orderNumber = fmt.Sprintf("S%05d", count+1)
 	}
 
 	orderID := uuid.New()
@@ -495,9 +501,9 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			order_date, expected_date, billing_address, shipping_address,
 			currency_id, exchange_rate, subtotal, discount_type, discount_value, discount_amount, discount_code,
 			tax_amount, shipping_amount, total_amount, status, payment_status, payment_terms,
-			reference, po_number, notes, internal_notes, warehouse_id, carrier, sales_rep_id,
+			reference, po_number, notes, internal_notes, warehouse_id, carrier, vehicle_number, sales_rep_id,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)`
 
 	// Handle discount code - use nil for empty string
 	var discountCode *string
@@ -510,7 +516,7 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
 		currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
 		taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
-		input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, salesRepID,
+		input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, input.VehicleNumber, salesRepID,
 		createdBy, now, now,
 	)
 	if err != nil {
@@ -656,7 +662,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			   so.order_date, so.expected_date, so.billing_address, so.shipping_address,
 			   so.currency_id, so.exchange_rate, so.subtotal, so.discount_type, so.discount_value, so.discount_amount,
 			   so.tax_amount, so.shipping_amount, so.total_amount, so.status, so.payment_status, so.payment_terms,
-			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.sales_rep_id,
+			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.vehicle_number, so.sales_rep_id,
 			   so.approved_by, so.approved_at, so.created_by, so.created_at, so.updated_at,
 			   COALESCE(c.name, '') as customer_name
 		FROM sales_orders so
@@ -664,7 +670,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`
 
 	var id, tenantIDScan, customerID uuid.UUID
-	var organizationID, contactPersonID, currencyID, warehouseID, salesRepID, approvedBy, createdBy sql.NullString
+	var organizationID, contactPersonID, currencyID, warehouseID, vehicleNumber, salesRepID, approvedBy, createdBy sql.NullString
 	var orderNumber, customerName string
 	var orderDate time.Time
 	var expectedDate, approvedAt sql.NullTime
@@ -679,7 +685,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		&orderDate, &expectedDate, &billingAddress, &shippingAddress,
 		&currencyID, &exchangeRate, &subtotal, &discountType, &discountValue, &discountAmount,
 		&taxAmount, &shippingAmount, &totalAmount, &status, &paymentStatus, &paymentTerms,
-		&reference, &poNumber, &notes, &internalNotes, &warehouseID, &salesRepID,
+		&reference, &poNumber, &notes, &internalNotes, &warehouseID, &vehicleNumber, &salesRepID,
 		&approvedBy, &approvedAt, &createdBy, &createdAt, &updatedAt,
 		&customerName,
 	)
@@ -743,6 +749,9 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 	}
 	if warehouseID.Valid {
 		order["warehouse_id"] = warehouseID.String
+	}
+	if vehicleNumber.Valid {
+		order["vehicle_number"] = vehicleNumber.String
 	}
 	if salesRepID.Valid {
 		order["sales_rep_id"] = salesRepID.String
@@ -983,6 +992,11 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("carrier = $%d", argCount))
 		args = append(args, *input.Carrier)
+	}
+	if input.VehicleNumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("vehicle_number = $%d", argCount))
+		args = append(args, *input.VehicleNumber)
 	}
 	if input.Status != nil {
 		argCount++

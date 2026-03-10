@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -480,6 +481,7 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 	netSalary := grossSalary - totalDeductions
 
 	orgID, _ := middleware.GetOrganizationID(c)
+	userID, _ := middleware.GetUserID(c)
 	var orgIDPtr *uuid.UUID
 	if orgID != uuid.Nil {
 		orgIDPtr = &orgID
@@ -524,6 +526,56 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 		}
 		response.InternalError(c, "Failed to create payroll entry")
 		return
+	}
+
+	// Process partial deductions if deduction_percent is specified
+	if input.DeductionPercent > 0 && input.DeductionPercent < 100 && input.OtherDeductions > 0 {
+		// Split pending deductions: mark percentage portion as linked to this payroll
+		dedRows, dedErr := h.db.Query(`
+			SELECT id, amount, reason, source_type, source_id
+			FROM employee_deductions
+			WHERE employee_id=$1 AND tenant_id=$2 AND status='pending'
+			ORDER BY created_at
+		`, employeeID, tenantID)
+		if dedErr == nil {
+			type dedItem struct {
+				ID         uuid.UUID
+				Amount     float64
+				Reason     string
+				SourceType string
+				SourceID   *uuid.UUID
+			}
+			var deds []dedItem
+			for dedRows.Next() {
+				var d dedItem
+				var sourceID sql.NullString
+				if err := dedRows.Scan(&d.ID, &d.Amount, &d.Reason, &d.SourceType, &sourceID); err != nil {
+					continue
+				}
+				if sourceID.Valid {
+					sid, _ := uuid.Parse(sourceID.String)
+					d.SourceID = &sid
+				}
+				deds = append(deds, d)
+			}
+			dedRows.Close()
+
+			for _, d := range deds {
+				deductedAmount := math.Round(d.Amount * input.DeductionPercent / 100)
+				remainingAmount := d.Amount - deductedAmount
+
+				if remainingAmount > 0 {
+					// Reduce original deduction to the portion that will be deducted
+					h.db.Exec(`UPDATE employee_deductions SET amount=$1, updated_at=$2 WHERE id=$3`, deductedAmount, now, d.ID)
+
+					// Create new pending deduction for the remainder
+					h.db.Exec(`
+						INSERT INTO employee_deductions (id, tenant_id, organization_id, employee_id, amount, reason, source_type, source_id, status, created_by, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $10)
+					`, uuid.New(), tenantID, orgIDPtr, employeeID, remainingAmount, d.Reason+" (qoldiq)", d.SourceType, d.SourceID, userID, now)
+				}
+			}
+		}
 	}
 
 	// Update period totals
@@ -800,6 +852,16 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 		return
 	}
 
+	// Parse optional deduction_percent from body
+	var body struct {
+		DeductionPercent *float64 `json:"deduction_percent"`
+	}
+	c.ShouldBindJSON(&body)
+	deductionPercent := 100.0
+	if body.DeductionPercent != nil && *body.DeductionPercent >= 0 && *body.DeductionPercent <= 100 {
+		deductionPercent = *body.DeductionPercent
+	}
+
 	userID, _ := middleware.GetUserID(c)
 	orgID, _ := middleware.GetOrganizationID(c)
 
@@ -838,22 +900,92 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 		return
 	}
 
-	// Mark all pending deductions for this employee as deducted
-	_, err = tx.Exec(`
-		UPDATE employee_deductions SET status='deducted', payroll_entry_id=$1, deducted_at=$2, updated_at=$2
-		WHERE employee_id=$3 AND tenant_id=$4 AND status='pending'
-	`, entryID, now, employeeID, tenantID)
-	if err != nil {
-		response.InternalError(c, "Failed to update deductions")
-		return
-	}
+	// Handle deductions with percentage support
+	totalDeducted := 0.0
+	if deductionPercent >= 100 {
+		// Full deduction: mark all pending as deducted
+		_, err = tx.Exec(`
+			UPDATE employee_deductions SET status='deducted', payroll_entry_id=$1, deducted_at=$2, updated_at=$2
+			WHERE employee_id=$3 AND tenant_id=$4 AND status='pending'
+		`, entryID, now, employeeID, tenantID)
+		if err != nil {
+			response.InternalError(c, "Failed to update deductions")
+			return
+		}
+		tx.QueryRow(`
+			SELECT COALESCE(SUM(amount), 0) FROM employee_deductions
+			WHERE payroll_entry_id=$1 AND status='deducted'
+		`, entryID).Scan(&totalDeducted)
+	} else if deductionPercent > 0 {
+		// Partial deduction: split each pending deduction
+		rows, err := tx.Query(`
+			SELECT id, amount, reason, source_type, source_id
+			FROM employee_deductions
+			WHERE employee_id=$1 AND tenant_id=$2 AND status='pending'
+			ORDER BY created_at
+		`, employeeID, tenantID)
+		if err != nil {
+			response.InternalError(c, "Failed to query deductions")
+			return
+		}
+		type pendingDed struct {
+			ID         uuid.UUID
+			Amount     float64
+			Reason     string
+			SourceType string
+			SourceID   *uuid.UUID
+		}
+		var pending []pendingDed
+		for rows.Next() {
+			var d pendingDed
+			var sourceID sql.NullString
+			if err := rows.Scan(&d.ID, &d.Amount, &d.Reason, &d.SourceType, &sourceID); err != nil {
+				continue
+			}
+			if sourceID.Valid {
+				sid, _ := uuid.Parse(sourceID.String)
+				d.SourceID = &sid
+			}
+			pending = append(pending, d)
+		}
+		rows.Close()
 
-	// Create accounting entry: Dt 6710 (Salary expense) / Kt 4730 (Employee deduction receivable)
-	var totalDeducted float64
-	tx.QueryRow(`
-		SELECT COALESCE(SUM(amount), 0) FROM employee_deductions
-		WHERE payroll_entry_id=$1 AND status='deducted'
-	`, entryID).Scan(&totalDeducted)
+		for _, d := range pending {
+			deductedAmount := math.Round(d.Amount * deductionPercent / 100)
+			remainingAmount := d.Amount - deductedAmount
+			totalDeducted += deductedAmount
+
+			// Update original: reduce amount to deducted portion and mark as deducted
+			_, err = tx.Exec(`
+				UPDATE employee_deductions SET amount=$1, status='deducted', payroll_entry_id=$2, deducted_at=$3, updated_at=$3
+				WHERE id=$4
+			`, deductedAmount, entryID, now, d.ID)
+			if err != nil {
+				response.InternalError(c, "Failed to update deduction")
+				return
+			}
+
+			// Create new pending deduction for the remaining amount
+			if remainingAmount > 0 {
+				var sourceIDPtr *uuid.UUID
+				if d.SourceID != nil {
+					sourceIDPtr = d.SourceID
+				}
+				var orgIDPtr *uuid.UUID
+				if orgID != uuid.Nil {
+					orgIDPtr = &orgID
+				}
+				_, err = tx.Exec(`
+					INSERT INTO employee_deductions (id, tenant_id, organization_id, employee_id, amount, reason, source_type, source_id, status, created_by, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $10)
+				`, uuid.New(), tenantID, orgIDPtr, employeeID, remainingAmount, d.Reason+" (qoldiq)", d.SourceType, sourceIDPtr, userID, now)
+				if err != nil {
+					h.log.Error("Failed to create remaining deduction", "error", err)
+				}
+			}
+		}
+	}
+	// else deductionPercent == 0: no deductions applied
 
 	if totalDeducted > 0 {
 		var orgIDPtr *uuid.UUID

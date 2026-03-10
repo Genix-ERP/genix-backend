@@ -550,14 +550,24 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 			}
 
 			// Move scrapped items to scrap warehouse
+			var productID uuid.UUID
+			var organizationID *uuid.UUID
+			var warehouseID *uuid.UUID
+			h.db.QueryRow(`
+				SELECT product_id, organization_id, warehouse_id FROM production_orders
+				WHERE id = $1 AND tenant_id = $2
+			`, productionOrderID, tenantID).Scan(&productID, &organizationID, &warehouseID)
+
 			if totalScrapped > 0 {
-				var productID uuid.UUID
-				var organizationID *uuid.UUID
-				h.db.QueryRow(`
-					SELECT product_id, organization_id FROM production_orders
-					WHERE id = $1 AND tenant_id = $2
-				`, productionOrderID, tenantID).Scan(&productID, &organizationID)
 				h.receiveScrapGoods(productionOrderID, tenantID, userID, productID, organizationID, totalScrapped, unitCost, now)
+			}
+
+			// Create journal entries for finished goods (WIP → Finished Goods)
+			h.createFinishedGoodsJournalEntry(productionOrderID, tenantID, organizationID, productID, userID, lastWoProduced, unitCost, now)
+
+			// Transfer finished goods to dedicated finished goods warehouse if one exists
+			if warehouseID != nil {
+				h.transferToFinishedGoodsWarehouse(productionOrderID, tenantID, organizationID, productID, *warehouseID, userID, lastWoProduced, unitCost, now)
 			}
 		}
 	}
@@ -601,7 +611,9 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 	}
 
 	woID := uuid.New()
-	woNumber := fmt.Sprintf("WO-%d", time.Now().Unix())
+	var woCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM work_orders WHERE tenant_id = $1", tenantID).Scan(&woCount)
+	woNumber := fmt.Sprintf("WO%05d", woCount+1)
 
 	var workCenterID interface{} = nil
 	if input.WorkCenterID != "" {
@@ -1199,6 +1211,9 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 	}
 	defer rows.Close()
 
+	var woCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM work_orders WHERE tenant_id = $1", tenantID).Scan(&woCount)
+
 	seq := 1
 	for rows.Next() {
 		var opID uuid.UUID
@@ -1212,7 +1227,7 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 		rows.Scan(&opID, &opName, &sequence, &wcID, &setupTime, &runTime, &notes, &wcName)
 
 		woID := uuid.New()
-		woNumber := fmt.Sprintf("WO-%d-%d", time.Now().Unix(), seq)
+		woNumber := fmt.Sprintf("WO%05d", woCount+seq)
 
 		var workCenterID interface{} = nil
 		if wcID.Valid {
@@ -1605,5 +1620,305 @@ func (h *Handler) receiveScrapGoods(poID, tenantID, userID uuid.UUID, productID 
 		h.log.Error("receiveScrapGoods: failed to commit", "error", commitErr)
 	} else {
 		h.log.Info("receiveScrapGoods: scrap added to scrap warehouse", "po_id", poID, "qty", scrapQty)
+	}
+}
+
+// createFinishedGoodsJournalEntry creates the WIP → Finished Goods journal entry
+// when production is completed via work orders.
+// Flow: Dt 1320 WIP (machine+labor) / Ct 2590,6720
+//       Dt 1330 Finished Goods    / Ct 1320 WIP = totalCost
+func (h *Handler) createFinishedGoodsJournalEntry(
+	poID, tenantID uuid.UUID, organizationID *uuid.UUID, productID, userID uuid.UUID,
+	producedQty, unitCost float64, now time.Time,
+) {
+	totalCost := producedQty * unitCost
+	if totalCost <= 0 {
+		return
+	}
+
+	// Prevent duplicate: check if a completion JE already exists for this PO
+	var existingJE int
+	h.db.QueryRow(`
+		SELECT COUNT(*) FROM journal_entries
+		WHERE tenant_id = $1 AND source_type = 'production_complete' AND source_id = $2
+	`, tenantID, poID.String()).Scan(&existingJE)
+	if existingJE > 0 {
+		return
+	}
+
+	// Calculate cost breakdown from BOM
+	var bomID *uuid.UUID
+	h.db.QueryRow(`SELECT bom_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&bomID)
+
+	var materialCost, machineCost, laborCost float64
+	if bomID != nil {
+		var bomOutputQty float64
+		if h.db.QueryRow(`SELECT COALESCE(quantity, 1) FROM product_boms WHERE id = $1`, bomID).Scan(&bomOutputQty) == nil && bomOutputQty > 0 {
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(bl.quantity * COALESCE(p.cost_price, 0) * (1 + COALESCE(bl.scrap_percent, 0) / 100.0)), 0)
+				FROM bom_lines bl JOIN products p ON p.id = bl.component_id WHERE bl.bom_id = $1
+			`, bomID).Scan(&materialCost)
+			materialCost = materialCost / bomOutputQty
+
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(COALESCE(wc.hourly_cost, 0) / GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)), 0)
+				FROM bom_operations bo LEFT JOIN work_centers wc ON bo.work_center_id = wc.id WHERE bo.bom_id = $1
+			`, bomID).Scan(&machineCost)
+			machineCost = machineCost / bomOutputQty
+
+			// Labor cost = total - material - machine
+			laborCost = unitCost - materialCost - machineCost
+			if laborCost < 0 {
+				laborCost = 0
+			}
+		}
+	}
+
+	totalMaterialCost := producedQty * materialCost
+	totalMachineCost := producedQty * machineCost
+	totalLaborCost := producedQty * laborCost
+
+	// Look up accounts
+	wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
+	rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+	finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "1330")
+	machineAcct := findAccount(h.db, tenantID, organizationID, "accrued machine", "2590")
+	salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6720")
+
+	useDetailedFlow := wipAcct != uuid.Nil && rawAcct != uuid.Nil && finishedAcct != uuid.Nil
+
+	// Find journal
+	var journalID uuid.UUID
+	var nextNumber int
+	err := h.db.QueryRow(`
+		SELECT id, next_number FROM journals
+		WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+		ORDER BY created_at ASC LIMIT 1
+	`, tenantID).Scan(&journalID, &nextNumber)
+	if err != nil || journalID == uuid.Nil {
+		h.log.Error("createFinishedGoodsJE: no general journal found", "tenant_id", tenantID)
+		return
+	}
+
+	// Get PO details for description
+	var poNumber, productName string
+	h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, poID).Scan(&poNumber)
+	h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, productID).Scan(&productName)
+
+	entryID := uuid.New()
+	entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+	description := fmt.Sprintf("Ishlab chiqarish yakunlandi: %s - %s (soni: %.0f)", poNumber, productName, producedQty)
+
+	if useDetailedFlow {
+		// Check if material consumption JE was already created at production start
+		var materialJEExists int
+		h.db.QueryRow(`
+			SELECT COUNT(*) FROM journal_entries
+			WHERE tenant_id = $1 AND organization_id = $2
+			AND description LIKE '%' || $3 || '%started - materials consumed%'
+			AND status = 'posted'
+		`, tenantID, organizationID, poNumber).Scan(&materialJEExists)
+		materialAlreadyJournalized := materialJEExists > 0
+
+		// Calculate entry total
+		wipInflow := float64(0)
+		if totalMaterialCost > 0 && !materialAlreadyJournalized {
+			wipInflow += totalMaterialCost
+		}
+		if totalMachineCost > 0 && machineAcct != uuid.Nil {
+			wipInflow += totalMachineCost
+		}
+		if totalLaborCost > 0 && salaryAcct != uuid.Nil {
+			wipInflow += totalLaborCost
+		}
+		entryTotal := wipInflow + totalCost
+
+		h.db.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number,
+				entry_date, description, source_type, source_id, status, total_debit, total_credit,
+				created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'production_complete', $8, 'posted', $9, $9, $10, $11, $11)
+		`, entryID, tenantID, organizationID, journalID, entryNumber,
+			now, description, poID.String(), entryTotal, userID, now)
+
+		lineNum := 1
+
+		// Line 1: Dt WIP / Kt Raw Materials (skip if already done at start)
+		if totalMaterialCost > 0 && !materialAlreadyJournalized {
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, 'NJI: xom ashyo sarflandi', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalMaterialCost, lineNum, now)
+			lineNum++
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, 'NJI: xom ashyo sarflandi', 0, $4, $5, $6)`, uuid.New(), entryID, rawAcct, totalMaterialCost, lineNum, now)
+			lineNum++
+			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct)
+			h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct)
+		}
+
+		// Line 2: Dt WIP / Kt Accrued Machine
+		if totalMachineCost > 0 && machineAcct != uuid.Nil {
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, 'NJI: stanok xarajatlari', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalMachineCost, lineNum, now)
+			lineNum++
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, 'NJI: stanok xarajatlari', 0, $4, $5, $6)`, uuid.New(), entryID, machineAcct, totalMachineCost, lineNum, now)
+			lineNum++
+			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, wipAcct)
+			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, machineAcct)
+		}
+
+		// Line 3: Dt WIP / Kt Accrued Salary
+		if totalLaborCost > 0 && salaryAcct != uuid.Nil {
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, 'NJI: ish haqi xarajatlari', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalLaborCost, lineNum, now)
+			lineNum++
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, 'NJI: ish haqi xarajatlari', 0, $4, $5, $6)`, uuid.New(), entryID, salaryAcct, totalLaborCost, lineNum, now)
+			lineNum++
+			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, wipAcct)
+			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, salaryAcct)
+		}
+
+		// Line 4: Dt 1330 Finished Goods / Kt 1320 WIP = totalCost
+		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+			VALUES ($1, $2, $3, 'Tayyor mahsulot ishlab chiqarishdan', $4, 0, $5, $6)`, uuid.New(), entryID, finishedAcct, totalCost, lineNum, now)
+		lineNum++
+		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+			VALUES ($1, $2, $3, 'Tayyor mahsulot ishlab chiqarishdan', 0, $4, $5, $6)`, uuid.New(), entryID, wipAcct, totalCost, lineNum, now)
+
+		// Update balances: Finished Goods up, WIP down
+		h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, finishedAcct)
+		h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, wipAcct)
+
+	} else {
+		// Fallback: Dt Inventory / Kt COGS
+		ca := getCategoryAccounts(h.db, tenantID, organizationID, productID)
+		inventoryAcct := ca.StockValuationAccountID
+		cogsAcct := ca.ExpenseAccountID
+		if cogsAcct == uuid.Nil {
+			cogsAcct = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
+		}
+		if cogsAcct == uuid.Nil {
+			cogsAcct = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
+		}
+
+		if inventoryAcct != uuid.Nil && cogsAcct != uuid.Nil {
+			h.db.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number,
+					entry_date, description, source_type, source_id, status, total_debit, total_credit,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'production_complete', $8, 'posted', $9, $9, $10, $11, $11)
+			`, entryID, tenantID, organizationID, journalID, entryNumber,
+				now, description, poID.String(), totalCost, userID, now)
+
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`, uuid.New(), entryID, inventoryAcct, description, totalCost, now)
+			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`, uuid.New(), entryID, cogsAcct, description, totalCost, now)
+
+			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAcct)
+			h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAcct)
+		}
+	}
+
+	// Update journal next_number
+	h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+	h.log.Info("createFinishedGoodsJE: journal entry created", "po_id", poID, "entry_id", entryID, "total_cost", totalCost)
+}
+
+// transferToFinishedGoodsWarehouse moves finished goods from the production warehouse
+// to a dedicated finished goods warehouse (warehouse_type = 'finished_goods').
+func (h *Handler) transferToFinishedGoodsWarehouse(
+	poID, tenantID uuid.UUID, organizationID *uuid.UUID, productID uuid.UUID,
+	productionWarehouseID uuid.UUID, userID uuid.UUID,
+	qty, unitCost float64, now time.Time,
+) {
+	// Find finished goods warehouse
+	var fgWarehouseID uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT id FROM warehouses
+		WHERE tenant_id = $1 AND warehouse_type = 'finished_goods' AND is_active = true
+		LIMIT 1
+	`, tenantID).Scan(&fgWarehouseID)
+
+	if err != nil {
+		// Auto-create finished goods warehouse
+		fgWarehouseID = uuid.New()
+		_, createErr := h.db.Exec(`
+			INSERT INTO warehouses (id, tenant_id, organization_id, code, name, warehouse_type, is_active, created_at, updated_at)
+			VALUES ($1, $2, $3, 'FG', 'Tayyor mahsulot ombori', 'finished_goods', true, $4, $4)
+		`, fgWarehouseID, tenantID, organizationID, now)
+		if createErr != nil {
+			h.log.Error("transferToFG: failed to create FG warehouse", "error", createErr)
+			return
+		}
+		h.log.Info("transferToFG: auto-created finished goods warehouse", "id", fgWarehouseID)
+	}
+
+	// Don't transfer if production warehouse IS the finished goods warehouse
+	if fgWarehouseID == productionWarehouseID {
+		return
+	}
+
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		return
+	}
+	defer tx.Rollback()
+
+	// 1. Deduct from production warehouse
+	tx.Exec(`
+		UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
+		WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5
+	`, qty, now, tenantID, productID, productionWarehouseID)
+
+	// Create issue transaction from production warehouse
+	var srcInvID uuid.UUID
+	h.db.QueryRow(`SELECT id FROM inventory WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3 LIMIT 1`,
+		tenantID, productID, productionWarehouseID).Scan(&srcInvID)
+
+	tx.Exec(`
+		INSERT INTO inventory_transactions (
+			id, tenant_id, organization_id, inventory_id, transaction_type,
+			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reason, notes, transaction_date, created_by, created_at
+		) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'fg_transfer','Tayyor mahsulot omboriga o''tkazildi',$9,$10,$9)
+	`, uuid.New(), tenantID, organizationID, srcInvID, poID, qty, unitCost, qty*unitCost, now, userID)
+
+	// 2. Add to finished goods warehouse
+	var fgInvID uuid.UUID
+	err = tx.QueryRow(`
+		SELECT id FROM inventory
+		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+		AND lot_number IS NULL AND serial_number IS NULL
+	`, tenantID, productID, fgWarehouseID).Scan(&fgInvID)
+
+	if err == sql.ErrNoRows {
+		fgInvID = uuid.New()
+		tx.Exec(`
+			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id,
+				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$8,$8)
+		`, fgInvID, tenantID, organizationID, productID, fgWarehouseID, qty, unitCost, now)
+	} else if err == nil {
+		tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+			qty, now, fgInvID)
+	}
+
+	// Create receipt transaction in FG warehouse
+	tx.Exec(`
+		INSERT INTO inventory_transactions (
+			id, tenant_id, organization_id, inventory_id, transaction_type,
+			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reason, notes, transaction_date, created_by, created_at
+		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'fg_transfer','Ishlab chiqarishdan tayyor mahsulot qabul qilindi',$9,$10,$9)
+	`, uuid.New(), tenantID, organizationID, fgInvID, poID, qty, unitCost, qty*unitCost, now, userID)
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		h.log.Error("transferToFG: commit failed", "error", commitErr)
+	} else {
+		h.log.Info("transferToFG: finished goods transferred", "po_id", poID, "qty", qty, "from", productionWarehouseID, "to", fgWarehouseID)
 	}
 }

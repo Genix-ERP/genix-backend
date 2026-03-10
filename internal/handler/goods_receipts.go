@@ -277,7 +277,7 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 	// Generate GR number
 	var count int
 	h.db.QueryRow("SELECT COUNT(*) FROM goods_receipts WHERE tenant_id = $1", tenantID).Scan(&count)
-	grNumber := fmt.Sprintf("GR-%s-%04d", time.Now().Format("200601"), count+1)
+	grNumber := fmt.Sprintf("GR%05d", count+1)
 
 	grID := uuid.New()
 	now := time.Now()
