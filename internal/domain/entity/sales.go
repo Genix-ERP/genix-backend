@@ -250,6 +250,7 @@ type UpdateSalesOrderInput struct {
 	InternalNotes   *string  `json:"internal_notes,omitempty"`
 	WarehouseID     *string  `json:"warehouse_id,omitempty"`
 	Carrier         *string  `json:"carrier,omitempty"`
+	VehicleNumber   *string  `json:"vehicle_number,omitempty"`
 	SalesRepID      *string  `json:"sales_rep_id,omitempty"`
 	Status          *string  `json:"status,omitempty"`
 	PaymentStatus   *string  `json:"payment_status,omitempty"`
