@@ -3002,10 +3002,14 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		       mr.fulfilled_date, mr.fulfillment_notes, mr.purchase_order_id,
 		       mr.notes, mr.created_date, mr.updated_date,
 		       COALESCE(e.first_name || ' ' || e.last_name, '') as requester_name,
-		       COALESCE(a.first_name || ' ' || a.last_name, '') as approver_name
+		       COALESCE(a.first_name || ' ' || a.last_name, '') as approver_name,
+		       mr.stock_operation_id,
+		       COALESCE(so.name, '') as delivery_name,
+		       COALESCE(so.state, '') as delivery_state
 		FROM construction_material_requests mr
 		LEFT JOIN employees e ON e.id = mr.requested_by
 		LEFT JOIN employees a ON a.id = mr.approved_by
+		LEFT JOIN stock_operations so ON so.id = mr.stock_operation_id
 		WHERE mr.project_id = $1 AND mr.tenant_id = $2
 		ORDER BY mr.request_date DESC
 	`
@@ -3031,6 +3035,8 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		var items json.RawMessage
 		var createdDate, updatedDate time.Time
 		var requesterName, approverName string
+		var stockOperationID uuid.NullUUID
+		var deliveryName, deliveryState string
 
 		if err := rows.Scan(
 			&id, &tenantIDVal, &projectIDVal,
@@ -3040,32 +3046,36 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 			&fulfilledDate, &fulfillmentNotes, &purchaseOrderID,
 			&notes, &createdDate, &updatedDate,
 			&requesterName, &approverName,
+			&stockOperationID, &deliveryName, &deliveryState,
 		); err != nil {
 			h.log.Error("Failed to scan material request", "error", err)
 			continue
 		}
 
 		requests = append(requests, map[string]interface{}{
-			"id":                id,
-			"tenant_id":         tenantIDVal,
-			"project_id":        projectIDVal,
-			"request_number":    nullStringValue(requestNumber),
-			"request_date":      requestDate,
-			"required_date":     nullTimeValue(requiredDate),
-			"requested_by":      nullUUIDValue(requestedBy),
-			"items":             items,
-			"status":            nullStringValue(status),
-			"approved_by":       nullUUIDValue(approvedBy),
-			"approval_date":     nullTimeValue(approvalDate),
-			"approval_notes":    nullStringValue(approvalNotes),
-			"fulfilled_date":    nullTimeValue(fulfilledDate),
-			"fulfillment_notes": nullStringValue(fulfillmentNotes),
-			"purchase_order_id": nullUUIDValue(purchaseOrderID),
-			"notes":             nullStringValue(notes),
-			"created_date":      createdDate,
-			"updated_date":      updatedDate,
-			"requester_name":    requesterName,
-			"approver_name":     approverName,
+			"id":                 id,
+			"tenant_id":          tenantIDVal,
+			"project_id":         projectIDVal,
+			"request_number":     nullStringValue(requestNumber),
+			"request_date":       requestDate,
+			"required_date":      nullTimeValue(requiredDate),
+			"requested_by":       nullUUIDValue(requestedBy),
+			"items":              items,
+			"status":             nullStringValue(status),
+			"approved_by":        nullUUIDValue(approvedBy),
+			"approval_date":      nullTimeValue(approvalDate),
+			"approval_notes":     nullStringValue(approvalNotes),
+			"fulfilled_date":     nullTimeValue(fulfilledDate),
+			"fulfillment_notes":  nullStringValue(fulfillmentNotes),
+			"purchase_order_id":  nullUUIDValue(purchaseOrderID),
+			"notes":              nullStringValue(notes),
+			"created_date":       createdDate,
+			"updated_date":       updatedDate,
+			"requester_name":     requesterName,
+			"approver_name":      approverName,
+			"stock_operation_id": nullUUIDValue(stockOperationID),
+			"delivery_name":      deliveryName,
+			"delivery_state":     deliveryState,
 		})
 	}
 
@@ -3093,6 +3103,8 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 		response.Unauthorized(c, "Tenant not found")
 		return
 	}
+
+	organizationID, _ := middleware.GetOrganizationID(c)
 
 	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -3151,11 +3163,141 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 		return
 	}
 
+	// Auto-create a delivery stock operation for this material request
+	var stockOpID *uuid.UUID
+	stockOpID = h.createDeliveryForMaterialRequest(tenantID, organizationID, requestID, requestNumber, itemsJSON)
+	if stockOpID != nil {
+		h.db.Exec(`UPDATE construction_material_requests SET stock_operation_id = $1 WHERE id = $2 AND tenant_id = $3`,
+			stockOpID, requestID, tenantID)
+	}
+
 	response.Created(c, map[string]interface{}{
-		"id":             requestID,
-		"request_number": requestNumber,
-		"message":        "Material request created successfully",
+		"id":                requestID,
+		"request_number":    requestNumber,
+		"stock_operation_id": stockOpID,
+		"message":           "Material request created successfully",
 	})
+}
+
+// createDeliveryForMaterialRequest auto-creates a delivery stock operation for a material request.
+// Returns the stock operation UUID or nil on failure.
+func (h *Handler) createDeliveryForMaterialRequest(tenantID uuid.UUID, organizationID uuid.UUID, requestID int64, requestNumber string, itemsJSON string) *uuid.UUID {
+	// Find the first delivery operation type for this tenant
+	var opTypeID uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT id FROM warehouse_operation_types
+		WHERE tenant_id = $1 AND operation_type = 'outgoing' AND is_active = true
+		ORDER BY sequence LIMIT 1
+	`, tenantID).Scan(&opTypeID)
+	if err != nil {
+		h.log.Error("No delivery operation type found for tenant", "error", err, "tenant_id", tenantID)
+		return nil
+	}
+
+	// Count steps for this operation type
+	var totalSteps int
+	h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2", opTypeID, tenantID).Scan(&totalSteps)
+	if totalSteps == 0 {
+		totalSteps = 1
+	}
+
+	opID := uuid.New()
+	name := h.nextStockOperationName(tenantID, "delivery")
+	now := time.Now()
+
+	var orgIDPtr *uuid.UUID
+	if organizationID != uuid.Nil {
+		orgIDPtr = &organizationID
+	}
+
+	_, err = h.db.Exec(`
+		INSERT INTO stock_operations (
+			id, tenant_id, organization_id, name, operation_type_id, direction,
+			date, source_document, source_type,
+			state, current_step, total_steps, priority,
+			note, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,'delivery',$6,$7,'material_request','draft',1,$8,'normal',$9,$10,$10)
+	`,
+		opID, tenantID, orgIDPtr, name, opTypeID,
+		now, requestNumber, totalSteps,
+		fmt.Sprintf("Auto-created from Material Request %s", requestNumber), now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create delivery stock operation for material request", "error", err)
+		return nil
+	}
+
+	// Parse items and create operation lines
+	var items []map[string]interface{}
+	if err := json.Unmarshal([]byte(itemsJSON), &items); err == nil {
+		for _, item := range items {
+			productIDStr, _ := item["product_id"].(string)
+			if productIDStr == "" {
+				continue
+			}
+			productID, err := uuid.Parse(productIDStr)
+			if err != nil {
+				continue
+			}
+
+			var qty float64
+			switch v := item["quantity"].(type) {
+			case float64:
+				qty = v
+			case json.Number:
+				qty, _ = v.Float64()
+			}
+			var unitCost float64
+			switch v := item["unit_cost"].(type) {
+			case float64:
+				unitCost = v
+			case json.Number:
+				unitCost, _ = v.Float64()
+			}
+			if unitCost == 0 {
+				h.db.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, productID).Scan(&unitCost)
+			}
+
+			uom, _ := item["unit_name"].(string)
+			if uom == "" {
+				h.db.QueryRow(`SELECT COALESCE(unit_name, 'unit') FROM products WHERE id = $1`, productID).Scan(&uom)
+			}
+			if uom == "" {
+				uom = "unit"
+			}
+
+			h.db.Exec(`
+				INSERT INTO stock_operation_lines (
+					id, tenant_id, operation_id, product_id,
+					expected_qty, done_qty, uom, unit_price,
+					quality_status, created_at, updated_at
+				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
+			`, tenantID, opID, productID, qty, uom, unitCost, now)
+		}
+	}
+
+	// Create initial step log
+	firstStepName := "Step 1"
+	var firstStep struct {
+		ID   uuid.UUID
+		Name string
+	}
+	err = h.db.QueryRow(`
+		SELECT id, name FROM operation_type_steps
+		WHERE operation_type_id = $1 AND tenant_id = $2
+		ORDER BY sequence LIMIT 1
+	`, opTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name)
+	if err == nil {
+		firstStepName = firstStep.Name
+	}
+
+	h.db.Exec(`
+		INSERT INTO stock_operation_step_log (
+			id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
+		) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
+	`, tenantID, opID, firstStep.ID, firstStepName, now)
+
+	return &opID
 }
 
 // UpdateMaterialRequest updates a material request
@@ -3322,6 +3464,14 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 	requestID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid request ID")
+		return
+	}
+
+	// Check if material request has a linked stock operation — approval must go through Stock Operations
+	var stockOpID uuid.NullUUID
+	h.db.QueryRow(`SELECT stock_operation_id FROM construction_material_requests WHERE id = $1 AND tenant_id = $2`, requestID, tenantID).Scan(&stockOpID)
+	if stockOpID.Valid && stockOpID.UUID != uuid.Nil {
+		response.BadRequest(c, "This material request has a linked delivery. Please confirm it through Stock Operations.")
 		return
 	}
 
