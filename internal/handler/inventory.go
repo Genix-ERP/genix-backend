@@ -6026,6 +6026,70 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 	}
 
 	now := time.Now()
+	nextStep := op.CurrentStep + 1
+	isLastStep := nextStep > op.TotalSteps
+
+	// Pre-validate stock availability for delivery operations on the final step
+	if isLastStep {
+		var direction string
+		var warehouseIDCheck uuid.UUID
+		h.db.QueryRow(`
+			SELECT wot.warehouse_id, so.direction
+			FROM warehouse_operation_types wot
+			JOIN stock_operations so ON so.operation_type_id = wot.id
+			WHERE so.id=$1 AND so.tenant_id=$2
+		`, id, tenantID).Scan(&warehouseIDCheck, &direction)
+
+		if (direction == "delivery" || direction == "write_off") && warehouseIDCheck != uuid.Nil {
+			type insufficientItem struct {
+				ProductName string  `json:"product_name"`
+				Available   float64 `json:"available"`
+				Requested   float64 `json:"requested"`
+			}
+			var insufficientItems []insufficientItem
+
+			checkLines, _ := h.db.Query(`
+				SELECT sol.product_id, sol.done_qty, COALESCE(p.name, 'Unknown')
+				FROM stock_operation_lines sol
+				JOIN products p ON p.id = sol.product_id AND p.tenant_id = sol.tenant_id
+				WHERE sol.operation_id = $1 AND sol.tenant_id = $2 AND sol.done_qty > 0
+			`, id, tenantID)
+			if checkLines != nil {
+				defer checkLines.Close()
+				for checkLines.Next() {
+					var prodID uuid.UUID
+					var doneQty float64
+					var productName string
+					if err := checkLines.Scan(&prodID, &doneQty, &productName); err != nil {
+						continue
+					}
+					var qtyAvailable float64
+					h.db.QueryRow(`
+						SELECT COALESCE(quantity_on_hand, 0)
+						FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+					`, tenantID, prodID, warehouseIDCheck).Scan(&qtyAvailable)
+
+					if qtyAvailable < doneQty {
+						insufficientItems = append(insufficientItems, insufficientItem{
+							ProductName: productName,
+							Available:   qtyAvailable,
+							Requested:   doneQty,
+						})
+					}
+				}
+			}
+
+			if len(insufficientItems) > 0 {
+				c.JSON(422, gin.H{
+					"success": false,
+					"message": "Insufficient stock for delivery",
+					"errors":  insufficientItems,
+				})
+				return
+			}
+		}
+	}
 
 	// Mark current step as completed
 	h.db.Exec(`
@@ -6034,9 +6098,8 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		WHERE operation_id=$3 AND step_sequence=$4 AND tenant_id=$5
 	`, now, userID, id, op.CurrentStep, tenantID)
 
-	nextStep := op.CurrentStep + 1
 	var newState string
-	if nextStep > op.TotalSteps {
+	if isLastStep {
 		// All steps done — mark operation as done
 		newState = "done"
 		h.db.Exec(`

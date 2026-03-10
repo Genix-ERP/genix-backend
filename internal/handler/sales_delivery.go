@@ -679,6 +679,54 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		return
 	}
 
+	// Pre-validate stock availability for all lines before making any changes
+	type insufficientItem struct {
+		ProductName string  `json:"product_name"`
+		Available   float64 `json:"available"`
+		Requested   float64 `json:"requested"`
+	}
+	var insufficientItems []insufficientItem
+
+	for _, line := range lines {
+		effectiveWarehouseID := warehouseID.String
+		if line.LineWarehouseID.Valid {
+			effectiveWarehouseID = line.LineWarehouseID.String
+		}
+		if effectiveWarehouseID == "" {
+			continue
+		}
+
+		var qtyAvailable float64
+		var productName string
+		err := h.db.QueryRow(`
+			SELECT COALESCE(i.quantity_available, 0), COALESCE(p.name, 'Unknown')
+			FROM products p
+			LEFT JOIN inventory i ON i.product_id = p.id AND i.tenant_id = p.tenant_id AND i.warehouse_id = $3
+			WHERE p.id = $1 AND p.tenant_id = $2
+		`, line.ProductID, tenantID, effectiveWarehouseID).Scan(&qtyAvailable, &productName)
+		if err != nil {
+			qtyAvailable = 0
+			productName = line.ProductID.String()
+		}
+
+		if qtyAvailable < line.QtyToDeliver {
+			insufficientItems = append(insufficientItems, insufficientItem{
+				ProductName: productName,
+				Available:   qtyAvailable,
+				Requested:   line.QtyToDeliver,
+			})
+		}
+	}
+
+	if len(insufficientItems) > 0 {
+		c.JSON(422, gin.H{
+			"success": false,
+			"message": "Insufficient stock for delivery",
+			"errors":  insufficientItems,
+		})
+		return
+	}
+
 	// Process each line - update inventory
 	for _, line := range lines {
 		// Use line warehouse or DO warehouse
@@ -710,12 +758,6 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		if err != nil {
 			h.log.Error("Failed to fetch inventory", "error", err)
 			continue
-		}
-
-		// Check available quantity (allow negative stock for now, can add validation later)
-		if qtyAvailable < line.QtyToDeliver {
-			h.log.Warn("Insufficient stock", "product_id", line.ProductID, "available", qtyAvailable, "requested", line.QtyToDeliver)
-			// Continue anyway - some businesses allow negative stock
 		}
 
 		// Decrease inventory
