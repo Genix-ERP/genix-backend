@@ -1715,7 +1715,37 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		h.log.Error("Intercompany SO->PO sync failed", "error", err, "order_id", orderID)
 	}
 
+	// Intercompany: if this SO was created from a PO (vendor confirms SO),
+	// update the linked PO to confirmed and create a receipt op for it.
+	h.syncIntercompanySOConfirmToPO(tenantID, orderID, now)
+
 	h.GetSalesOrder(c)
+}
+
+// syncIntercompanySOConfirmToPO handles the case where a vendor confirms an intercompany SO.
+// It finds the linked PO (that created this SO), updates it to confirmed, and creates
+// a receipt stock op for the PO side (buyer).
+func (h *Handler) syncIntercompanySOConfirmToPO(tenantID uuid.UUID, soID uuid.UUID, now time.Time) {
+	// Check if this SO was created from a PO via intercompany link.
+	// Link direction: source=purchase_order, linked=sale_order
+	link, err := h.icSync.GetLinkedDocumentReverse(tenantID, "sale_order", soID)
+	if err != nil || link == nil || link.SourceDocumentType != "purchase_order" {
+		return // Not an intercompany SO created from a PO
+	}
+
+	linkedPOID := link.SourceDocumentID
+
+	// Update the linked PO status to approved (shown as "Confirmed" in UI)
+	h.db.Exec(`
+		UPDATE purchase_orders SET status = 'approved', updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status = 'ordered'
+	`, now, linkedPOID, tenantID)
+
+	// Create receipt stock op for the linked PO (buyer side)
+	h.createReceiptStockOpForPO(tenantID, linkedPOID, now)
+
+	h.log.Info("Intercompany SO confirmed: updated linked PO to confirmed and created receipt op",
+		"so_id", soID, "po_id", linkedPOID)
 }
 
 // autoCreateProductionOrders checks stock levels for each SO line and creates
