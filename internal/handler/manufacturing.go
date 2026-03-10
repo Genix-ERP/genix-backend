@@ -1341,7 +1341,9 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	// Generate code
 	now := time.Now()
 	id := uuid.New()
-	code := fmt.Sprintf("MO-%s", id.String()[:8])
+	var moCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM production_orders WHERE tenant_id = $1", tenantID).Scan(&moCount)
+	code := fmt.Sprintf("MO%05d", moCount+1)
 
 	// Set defaults
 	priority := 5

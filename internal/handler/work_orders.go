@@ -611,7 +611,9 @@ func (h *Handler) CreateWorkOrder(c *gin.Context) {
 	}
 
 	woID := uuid.New()
-	woNumber := fmt.Sprintf("WO-%d", time.Now().Unix())
+	var woCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM work_orders WHERE tenant_id = $1", tenantID).Scan(&woCount)
+	woNumber := fmt.Sprintf("WO%05d", woCount+1)
 
 	var workCenterID interface{} = nil
 	if input.WorkCenterID != "" {
@@ -1209,6 +1211,9 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 	}
 	defer rows.Close()
 
+	var woCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM work_orders WHERE tenant_id = $1", tenantID).Scan(&woCount)
+
 	seq := 1
 	for rows.Next() {
 		var opID uuid.UUID
@@ -1222,7 +1227,7 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 		rows.Scan(&opID, &opName, &sequence, &wcID, &setupTime, &runTime, &notes, &wcName)
 
 		woID := uuid.New()
-		woNumber := fmt.Sprintf("WO-%d-%d", time.Now().Unix(), seq)
+		woNumber := fmt.Sprintf("WO%05d", woCount+seq)
 
 		var workCenterID interface{} = nil
 		if wcID.Valid {

@@ -287,7 +287,7 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 	// Generate return number
 	var count int
 	h.db.QueryRow("SELECT COUNT(*) FROM purchase_returns WHERE tenant_id = $1", tenantID).Scan(&count)
-	returnNumber := fmt.Sprintf("RET-%s-%04d", time.Now().Format("200601"), count+1)
+	returnNumber := fmt.Sprintf("PR%05d", count+1)
 
 	returnID := uuid.New()
 	now := time.Now()

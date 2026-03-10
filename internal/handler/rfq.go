@@ -166,7 +166,7 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 	// Generate RFQ number
 	var count int
 	h.db.QueryRow("SELECT COUNT(*) FROM rfqs WHERE tenant_id = $1", tenantID).Scan(&count)
-	rfqNumber := fmt.Sprintf("RFQ-%s-%04d", now.Format("2006"), count+1)
+	rfqNumber := fmt.Sprintf("RFQ%05d", count+1)
 
 	// Parse deadline - default to 30 days from now if not provided
 	var deadline time.Time
