@@ -99,6 +99,16 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 		return nil // Already synced
 	}
 
+	// Also check reverse: this SO might have been created FROM a PO (intercompany PO→SO)
+	var reverseLink int
+	s.db.QueryRow(`
+		SELECT COUNT(*) FROM intercompany_document_links
+		WHERE tenant_id = $1 AND linked_document_type = 'sale_order' AND linked_document_id = $2
+	`, tenantID, saleOrderID).Scan(&reverseLink)
+	if reverseLink > 0 {
+		return nil // This SO was created from a PO, don't create another PO
+	}
+
 	// Create purchase order in target organization
 	poID := uuid.New()
 	poNumber := fmt.Sprintf("PO-IC-%s", time.Now().Format("20060102150405"))
