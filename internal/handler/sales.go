@@ -567,10 +567,7 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		)
 	}
 
-	// Trigger intercompany sync: if customer is an intercompany contact, create PO in their company
-	if err := h.icSync.SyncSaleOrderToPurchaseOrder(tenantID, orderID); err != nil {
-		h.log.Error("Intercompany SO->PO sync failed", "error", err, "order_id", orderID)
-	}
+	// Intercompany: PO will be created when SO is confirmed, not at creation time
 
 	// Use frontend status/payment_status if provided, otherwise use defaults
 	orderStatus := input.Status
@@ -1699,22 +1696,9 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	// Auto-create Production Orders for products with insufficient stock
 	h.autoCreateProductionOrders(tenantID, orderID, customerID, warehouseUUID, organizationID, userID, now)
 
-	// Intercompany: auto-approve linked Purchase Order in the buying company
-	if link, linkErr := h.icSync.GetLinkedDocument(tenantID, "sale_order", orderID); linkErr == nil && link != nil && link.LinkedDocumentType == "purchase_order" {
-		// Only auto-approve if the PO is still in draft/pending status
-		var poStatus string
-		if statusErr := h.db.QueryRow("SELECT status FROM purchase_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
-			link.LinkedDocumentID, tenantID).Scan(&poStatus); statusErr == nil {
-			if poStatus == string(entity.POStatusDraft) || poStatus == string(entity.POStatusPendingApproval) {
-				if approveErr := h.approvePOAndCreateReceipt(tenantID, userID, link.LinkedDocumentID); approveErr != nil {
-					h.log.Error("Intercompany: failed to auto-approve linked PO", "error", approveErr, "so_id", orderID, "po_id", link.LinkedDocumentID)
-				} else {
-					h.log.Info("Intercompany: auto-approved linked PO", "so_id", orderID, "po_id", link.LinkedDocumentID)
-					// Auto-complete the receipt stock op to process inventory in buying org
-					h.completeLinkedReceiptOp(tenantID, link.LinkedDocumentID, now)
-				}
-			}
-		}
+	// Intercompany: create PO in draft in the buying company when SO is confirmed
+	if err := h.icSync.SyncSaleOrderToPurchaseOrder(tenantID, orderID); err != nil {
+		h.log.Error("Intercompany SO->PO sync failed", "error", err, "order_id", orderID)
 	}
 
 	h.GetSalesOrder(c)
