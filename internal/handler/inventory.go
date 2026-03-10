@@ -5583,11 +5583,13 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 		       so.state, so.current_step, so.total_steps, so.priority,
 		       so.source_document, so.note, so.write_off_reason,
 		       so.operation_type_id, wot.name as operation_type_name,
-		       so.partner_id, c.name as partner_name,
+		       so.partner_id, COALESCE(c.name, cp.name) as partner_name,
 		       so.created_at, so.updated_at
 		FROM stock_operations so
 		LEFT JOIN warehouse_operation_types wot ON so.operation_type_id = wot.id
 		LEFT JOIN contacts c ON so.partner_id = c.id
+		LEFT JOIN construction_material_requests cmr ON so.source_type = 'material_request' AND cmr.request_number = so.source_document
+		LEFT JOIN construction_projects cp ON cp.id = cmr.project_id
 		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL
 	`
 	args := []interface{}{tenantID}
@@ -5692,11 +5694,13 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 		       so.source_document, so.note, so.write_off_reason,
 		       so.operation_type_id, wot.name,
 		       so.partner_id,
-		       c.name as partner_name,
+		       COALESCE(c.name, cp.name) as partner_name,
 		       so.created_at, so.updated_at
 		FROM stock_operations so
 		LEFT JOIN warehouse_operation_types wot ON so.operation_type_id = wot.id
 		LEFT JOIN contacts c ON so.partner_id = c.id
+		LEFT JOIN construction_material_requests cmr ON so.source_type = 'material_request' AND cmr.request_number = so.source_document
+		LEFT JOIN construction_projects cp ON cp.id = cmr.project_id
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL
 	`, id, tenantID).Scan(
 		&op.ID, &op.Name, &op.Direction, &op.Date, &scheduledDate,
