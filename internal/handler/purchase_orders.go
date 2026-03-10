@@ -1136,7 +1136,7 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 	opTypeQuery := `
 		SELECT id, default_location_src_id, default_location_dest_id
 		FROM warehouse_operation_types
-		WHERE tenant_id = $1 AND direction = 'receipt' AND is_active = true
+		WHERE tenant_id = $1 AND type = 'receipt' AND is_active = true
 	`
 	opTypeArgs := []interface{}{tenantID}
 

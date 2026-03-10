@@ -1607,7 +1607,7 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	opTypeQuery := `
 		SELECT id, default_location_src_id, default_location_dest_id
 		FROM warehouse_operation_types
-		WHERE tenant_id = $1 AND direction = 'delivery' AND is_active = true
+		WHERE tenant_id = $1 AND type = 'delivery' AND is_active = true
 	`
 	opTypeArgs := []interface{}{tenantID}
 	if warehouseUUID != nil {
