@@ -2716,12 +2716,39 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		"organizationID", organizationID, "tenantID", tenantID)
 
 	if totalCost > 0 {
-		// Look up WIP-based accounts
+		// Look up WIP-based accounts (try English, then Uzbek, then Russian names)
 		wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
+		if wipAcct == uuid.Nil {
+			wipAcct = findAccount(h.db, tenantID, organizationID, "tugallanmagan ishlab chiqarish", "1320")
+		}
+		if wipAcct == uuid.Nil {
+			wipAcct = findAccount(h.db, tenantID, organizationID, "незавершенное производство", "1320")
+		}
+
 		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+		if rawAcct == uuid.Nil {
+			rawAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1310")
+		}
+		if rawAcct == uuid.Nil {
+			rawAcct = findAccount(h.db, tenantID, organizationID, "материал", "1310")
+		}
+
 		finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "1330")
+		if finishedAcct == uuid.Nil {
+			finishedAcct = findAccount(h.db, tenantID, organizationID, "tayyor mahsulot", "1330")
+		}
+		if finishedAcct == uuid.Nil {
+			finishedAcct = findAccount(h.db, tenantID, organizationID, "готовая продукция", "1330")
+		}
+		if finishedAcct == uuid.Nil {
+			finishedAcct = getInventoryAccountByType(h.db, tenantID, organizationID, productID)
+		}
+
 		machineAcct := findAccount(h.db, tenantID, organizationID, "accrued machine", "2590")
 		salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6720")
+		if salaryAcct == uuid.Nil {
+			salaryAcct = findAccount(h.db, tenantID, organizationID, "ish haqi", "6720")
+		}
 
 		h.log.Info("CompleteProductionOrder: account lookup",
 			"wipAcct", wipAcct, "rawAcct", rawAcct, "finishedAcct", finishedAcct,
@@ -2733,13 +2760,21 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		// Find manufacturing or general journal
 		var journalID uuid.UUID
 		var nextNumber int
-		err := h.db.QueryRow(`
+		// Try general journal first, then any active journal
+		h.db.QueryRow(`
 			SELECT id, next_number FROM journals
 			WHERE tenant_id = $1 AND type = 'general' AND is_active = true
 			ORDER BY created_at ASC LIMIT 1
 		`, tenantID).Scan(&journalID, &nextNumber)
+		if journalID == uuid.Nil {
+			h.db.QueryRow(`
+				SELECT id, next_number FROM journals
+				WHERE tenant_id = $1 AND is_active = true
+				ORDER BY created_at ASC LIMIT 1
+			`, tenantID).Scan(&journalID, &nextNumber)
+		}
 
-		if err == nil && journalID != uuid.Nil {
+		if journalID != uuid.Nil {
 			// Get production order number & product name
 			var poNumber string
 			h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
@@ -2886,6 +2921,24 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 				if cogsAccountID == uuid.Nil {
 					cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
 				}
+				if cogsAccountID == uuid.Nil {
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "ishlab chiqarish", "5100")
+				}
+				if cogsAccountID == uuid.Nil {
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "tannarx", "5000")
+				}
+				if inventoryAccountID == uuid.Nil {
+					inventoryAccountID = getInventoryAccountByType(h.db, tenantID, organizationID, productID)
+				}
+				if inventoryAccountID == uuid.Nil {
+					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "inventory", "1300")
+				}
+				if inventoryAccountID == uuid.Nil {
+					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "tovar-moddiy", "1300")
+				}
+
+				h.log.Info("CompleteProductionOrder: fallback accounting",
+					"inventoryAccountID", inventoryAccountID, "cogsAccountID", cogsAccountID)
 
 				if inventoryAccountID != uuid.Nil && cogsAccountID != uuid.Nil {
 					h.db.Exec(`
@@ -2913,6 +2966,10 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 
 					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAccountID)
 					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAccountID)
+				} else {
+					h.log.Warn("CompleteProductionOrder: SKIPPED journal entry - missing accounts in fallback",
+						"inventoryAccountID", inventoryAccountID, "cogsAccountID", cogsAccountID,
+						"productID", productID, "totalCost", totalCost)
 				}
 			}
 
@@ -2923,7 +2980,13 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 				"entry_id", entryID, "total_cost", totalCost,
 				"material_cost", totalMaterialCost, "machine_cost", totalMachineCost, "labor_cost", totalLaborCost,
 				"detailed_flow", useDetailedFlow)
+		} else {
+			h.log.Warn("CompleteProductionOrder: SKIPPED journal entry - no active general journal found",
+				"tenantID", tenantID, "totalCost", totalCost)
 		}
+	} else {
+		h.log.Warn("CompleteProductionOrder: SKIPPED journal entry - totalCost is zero",
+			"unitCost", unitCost, "producedQty", producedQty, "productID", productID)
 	}
 
 	h.GetProductionOrder(c)
