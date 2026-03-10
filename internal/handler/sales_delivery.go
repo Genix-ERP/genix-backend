@@ -721,12 +721,16 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 	}
 
 	if len(insufficientItems) > 0 {
-		c.JSON(422, gin.H{
-			"success": false,
-			"message": "Insufficient stock for delivery",
-			"errors":  insufficientItems,
-		})
-		return
+		// Allow force validation via ?force=true query param
+		if c.Query("force") != "true" {
+			c.JSON(422, gin.H{
+				"success": false,
+				"message": "Insufficient stock for delivery",
+				"errors":  insufficientItems,
+			})
+			return
+		}
+		h.log.Warn("Force validating delivery order with insufficient stock", "do_id", doID, "insufficient_items", len(insufficientItems))
 	}
 
 	// Process each line - update inventory
