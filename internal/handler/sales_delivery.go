@@ -259,7 +259,9 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 
 	// Generate delivery number
 	now := time.Now()
-	deliveryNumber := fmt.Sprintf("DO-%s", now.Format("20060102150405"))
+	var doCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM sales_delivery_orders WHERE tenant_id = $1", tenantID).Scan(&doCount)
+	deliveryNumber := fmt.Sprintf("DO%05d", doCount+1)
 
 	// Use provided warehouse or SO warehouse
 	warehouseID := input.WarehouseID

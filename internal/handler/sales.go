@@ -374,7 +374,9 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 	// Generate order number
 	orderNumber := input.OrderNumber
 	if orderNumber == "" {
-		orderNumber = "SO-" + time.Now().Format("20060102") + "-" + uuid.New().String()[:6]
+		var count int
+		h.db.QueryRow("SELECT COUNT(*) FROM sales_orders WHERE tenant_id = $1", tenantID).Scan(&count)
+		orderNumber = fmt.Sprintf("S%05d", count+1)
 	}
 
 	orderID := uuid.New()

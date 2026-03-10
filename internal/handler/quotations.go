@@ -166,7 +166,9 @@ func (h *Handler) CreateQuotation(c *gin.Context) {
 
 	now := time.Now()
 	quotationID := uuid.New()
-	quotationNumber := fmt.Sprintf("QT-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
+	var qtCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM quotations WHERE tenant_id = $1", tenantID).Scan(&qtCount)
+	quotationNumber := fmt.Sprintf("QT%05d", qtCount+1)
 
 	// Calculate totals
 	subtotal := 0.0

@@ -406,7 +406,9 @@ func (h *Handler) OpenPOSSession(c *gin.Context) {
 	}
 
 	// Generate session number
-	sessionNumber := fmt.Sprintf("POS-%s-%06d", time.Now().Format("20060102"), time.Now().UnixNano()%1000000)
+	var posSessionCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM pos_sessions WHERE tenant_id = $1", tenantID).Scan(&posSessionCount)
+	sessionNumber := fmt.Sprintf("POS%05d", posSessionCount+1)
 
 	id := uuid.New()
 	query := `
@@ -706,7 +708,9 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 	defer tx.Rollback()
 
 	// Generate order number
-	orderNumber := fmt.Sprintf("POS-%s-%06d", time.Now().Format("20060102"), time.Now().UnixNano()%1000000)
+	var posOrderCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM pos_orders WHERE tenant_id = $1", tenantID).Scan(&posOrderCount)
+	orderNumber := fmt.Sprintf("POS%05d", posOrderCount+1)
 
 	// Calculate totals
 	var subtotal float64
