@@ -6617,6 +6617,107 @@ func (h *Handler) completeLinkedDeliveryOp(tenantID uuid.UUID, salesOrderID uuid
 	h.log.Info("Intercompany: auto-completed delivery stock operation", "op_id", opID, "so_id", salesOrderID)
 }
 
+// createReceiptStockOpForPO creates a receipt stock op for a PO if one doesn't exist.
+func (h *Handler) createReceiptStockOpForPO(tenantID uuid.UUID, purchaseOrderID uuid.UUID, now time.Time) (uuid.UUID, uuid.UUID, *uuid.UUID) {
+	// Check if one already exists (including done)
+	var existingID uuid.UUID
+	h.db.QueryRow(`
+		SELECT id FROM stock_operations
+		WHERE source_type = 'purchase_order' AND source_id = $1 AND tenant_id = $2
+		  AND direction = 'receipt' AND deleted_at IS NULL AND state != 'cancelled'
+	`, purchaseOrderID, tenantID).Scan(&existingID)
+	if existingID != uuid.Nil {
+		return uuid.Nil, uuid.Nil, nil // Already exists
+	}
+
+	var orderNumber string
+	var vendorID uuid.UUID
+	var warehouseID, poOrgID *uuid.UUID
+	var expectedDate *time.Time
+	err := h.db.QueryRow(`
+		SELECT order_number, vendor_id, warehouse_id, organization_id, expected_date
+		FROM purchase_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, purchaseOrderID, tenantID).Scan(&orderNumber, &vendorID, &warehouseID, &poOrgID, &expectedDate)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, nil
+	}
+
+	var opTypeID uuid.UUID
+	var srcLocID, destLocID *uuid.UUID
+	opTypeQuery := `
+		SELECT id, default_location_src_id, default_location_dest_id
+		FROM warehouse_operation_types
+		WHERE tenant_id = $1 AND type = 'receipt' AND is_active = true
+	`
+	opTypeArgs := []interface{}{tenantID}
+	if warehouseID != nil {
+		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
+		opTypeArgs = append(opTypeArgs, *warehouseID)
+	} else {
+		opTypeQuery += " ORDER BY sequence LIMIT 1"
+	}
+	if err := h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&opTypeID, &srcLocID, &destLocID); err != nil {
+		return uuid.Nil, uuid.Nil, nil
+	}
+
+	opID := uuid.New()
+	opName := h.nextStockOperationName(tenantID, "receipt")
+
+	var totalSteps int
+	h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2", opTypeID, tenantID).Scan(&totalSteps)
+	if totalSteps == 0 {
+		totalSteps = 1
+	}
+
+	_, opErr := h.db.Exec(`
+		INSERT INTO stock_operations (
+			id, tenant_id, organization_id, name, operation_type_id, direction,
+			date, scheduled_date, partner_id, source_document,
+			source_location_id, dest_location_id,
+			state, current_step, total_steps, priority,
+			source_type, source_id,
+			created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,'receipt',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal','purchase_order',$13,$14,$14)
+	`,
+		opID, tenantID, poOrgID, opName, opTypeID,
+		now, expectedDate, vendorID, orderNumber,
+		srcLocID, destLocID,
+		totalSteps, purchaseOrderID, now,
+	)
+	if opErr != nil {
+		h.log.Error("Intercompany: failed to create receipt stock op", "error", opErr, "po_id", purchaseOrderID)
+		return uuid.Nil, uuid.Nil, nil
+	}
+
+	// Create lines from PO lines
+	rows, _ := h.db.Query(`
+		SELECT pol.product_id, pol.quantity, pol.unit_price, COALESCE(u.name, 'unit')
+		FROM purchase_order_lines pol
+		LEFT JOIN units_of_measure u ON u.id = pol.unit_id
+		WHERE pol.purchase_order_id = $1 AND pol.product_id IS NOT NULL
+	`, purchaseOrderID)
+	if rows != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var productID uuid.UUID
+			var qty, unitPrice float64
+			var uom string
+			if rows.Scan(&productID, &qty, &unitPrice, &uom) == nil {
+				h.db.Exec(`
+					INSERT INTO stock_operation_lines (
+						id, tenant_id, operation_id, product_id,
+						expected_qty, done_qty, uom, unit_price,
+						quality_status, created_at, updated_at
+					) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
+				`, tenantID, opID, productID, qty, uom, unitPrice, now)
+			}
+		}
+	}
+
+	h.log.Info("Intercompany: created receipt stock op for PO", "op_id", opID, "po_id", purchaseOrderID)
+	return opID, opTypeID, poOrgID
+}
+
 // completeLinkedReceiptOp completes the receipt stock operation linked to a purchase order.
 // Used in intercompany flow: when selling org confirms SO, buying org's receipt is auto-completed.
 // Also increases inventory in the buying org's warehouse.
@@ -6633,6 +6734,16 @@ func (h *Handler) completeLinkedReceiptOp(tenantID uuid.UUID, purchaseOrderID uu
 		ORDER BY created_at DESC LIMIT 1
 	`, purchaseOrderID, tenantID).Scan(&opID, &opTypeID, &orgID)
 	if err != nil {
+		// No receipt stock op — create one via the same logic as PO approval
+		opID, opTypeID, orgID = h.createReceiptStockOpForPO(tenantID, purchaseOrderID, now)
+		if opID == uuid.Nil {
+			return
+		}
+	}
+	// Also check if already done
+	var opState string
+	h.db.QueryRow("SELECT state FROM stock_operations WHERE id = $1", opID).Scan(&opState)
+	if opState == "done" {
 		return
 	}
 
