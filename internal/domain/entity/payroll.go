@@ -79,19 +79,20 @@ type UpdatePayrollPeriodInput struct {
 
 // CreatePayrollEntryInput represents input for creating a payroll entry
 type CreatePayrollEntryInput struct {
-	EmployeeID      string  `json:"employee_id" binding:"required"`
-	BaseSalary      float64 `json:"base_salary"`
-	OvertimeHours   float64 `json:"overtime_hours"`
-	OvertimeAmount  float64 `json:"overtime_amount"`
-	Bonus           float64 `json:"bonus"`
-	Allowances      float64 `json:"allowances"`
-	IncomeTax       float64 `json:"income_tax"`
-	SocialSecurity  float64 `json:"social_security"`
-	Pension         float64 `json:"pension"`
-	OtherDeductions float64 `json:"other_deductions"`
-	PaymentMethod   string  `json:"payment_method"`
-	BankAccount     string  `json:"bank_account,omitempty"`
-	Notes           string  `json:"notes,omitempty"`
+	EmployeeID       string  `json:"employee_id" binding:"required"`
+	BaseSalary       float64 `json:"base_salary"`
+	OvertimeHours    float64 `json:"overtime_hours"`
+	OvertimeAmount   float64 `json:"overtime_amount"`
+	Bonus            float64 `json:"bonus"`
+	Allowances       float64 `json:"allowances"`
+	IncomeTax        float64 `json:"income_tax"`
+	SocialSecurity   float64 `json:"social_security"`
+	Pension          float64 `json:"pension"`
+	OtherDeductions  float64 `json:"other_deductions"`
+	DeductionPercent float64 `json:"deduction_percent"`
+	PaymentMethod    string  `json:"payment_method"`
+	BankAccount      string  `json:"bank_account,omitempty"`
+	Notes            string  `json:"notes,omitempty"`
 }
 
 // UpdatePayrollEntryInput represents input for updating a payroll entry

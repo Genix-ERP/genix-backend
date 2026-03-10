@@ -1698,14 +1698,18 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	}
 
 	for i, pl := range poLines {
-		tx.Exec(`
+		if _, err := tx.Exec(`
 			INSERT INTO purchase_invoice_lines (
 				id, purchase_invoice_id, purchase_order_line_id, line_number,
 				product_id, description, quantity, unit_price,
 				tax_amount, line_total, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 			uuid.New(), billID, pl.ID, i+1,
-			pl.ProductID, pl.Desc, pl.Qty, pl.UnitPrice, pl.TaxAmt, pl.LineTotal, now)
+			pl.ProductID, pl.Desc, pl.Qty, pl.UnitPrice, pl.TaxAmt, pl.LineTotal, now); err != nil {
+			h.log.Error("CreateBillFromPO: failed to insert bill line", "error", err, "line", i+1)
+			response.InternalError(c, "Failed to create bill line: "+err.Error())
+			return
+		}
 	}
 
 	// ========== GL JOURNAL ENTRY POSTING ==========
@@ -1786,61 +1790,97 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			journalEntryID = &jeID
 			jeDescription := fmt.Sprintf("Vendor Bill %s", invoiceNumber)
 
-			tx.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 				jeID, tenantID, organizationID, purchaseJournalID, entryNumber, now, invoiceNumber, jeDescription,
 				"purchase_invoice", billID, 1.0, totalDebit, totalCredit, userID, now, now,
-			)
+			); err != nil {
+				h.log.Error("CreateBillFromPO: failed to create journal entry", "error", err)
+				response.InternalError(c, "Failed to create journal entry: "+err.Error())
+				return
+			}
 
 			jeLineNumber := 1
 
 			// Debit: Stock Interim Receipt (per category)
 			for inputAcct, amount := range inputGrouped {
-				tx.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, contact_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, "Stock Interim Receipt",
 					amount, 0.0, 1.0, now,
-				)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct)
+				); err != nil {
+					h.log.Error("CreateBillFromPO: failed to insert JE debit line", "error", err, "account", inputAcct)
+					response.InternalError(c, "Failed to create journal entry line: "+err.Error())
+					return
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct); err != nil {
+					h.log.Error("CreateBillFromPO: failed to update account balance", "error", err, "account", inputAcct)
+					response.InternalError(c, "Failed to update account balance: "+err.Error())
+					return
+				}
 				jeLineNumber++
 			}
 
 			// Debit: Tax
 			if taxAccountID != uuid.Nil && taxAmount > 0 {
-				tx.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 					uuid.New(), jeID, jeLineNumber, taxAccountID, "Input Tax",
 					taxAmount, 0.0, 1.0, now,
-				)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+				); err != nil {
+					h.log.Error("CreateBillFromPO: failed to insert JE tax line", "error", err)
+					response.InternalError(c, "Failed to create tax journal entry line: "+err.Error())
+					return
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID); err != nil {
+					h.log.Error("CreateBillFromPO: failed to update tax account balance", "error", err)
+					response.InternalError(c, "Failed to update tax account balance: "+err.Error())
+					return
+				}
 				jeLineNumber++
 			}
 
 			// Credit: Accounts Payable
-			tx.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 				uuid.New(), jeID, jeLineNumber, apAccountID, vendorID, "Accounts Payable",
 				0.0, totalAmount, 1.0, now,
-			)
-			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
+			); err != nil {
+				h.log.Error("CreateBillFromPO: failed to insert JE AP credit line", "error", err)
+				response.InternalError(c, "Failed to create AP journal entry line: "+err.Error())
+				return
+			}
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID); err != nil {
+				h.log.Error("CreateBillFromPO: failed to update AP account balance", "error", err)
+				response.InternalError(c, "Failed to update AP account balance: "+err.Error())
+				return
+			}
 
 			// Update journal next number
-			tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", purchaseJournalID)
+			if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", purchaseJournalID); err != nil {
+				h.log.Error("CreateBillFromPO: failed to update journal next number", "error", err)
+				response.InternalError(c, "Failed to update journal number: "+err.Error())
+				return
+			}
 
 			// Link JE to bill
-			tx.Exec("UPDATE purchase_invoices SET journal_entry_id = $1 WHERE id = $2", jeID, billID)
+			if _, err := tx.Exec("UPDATE purchase_invoices SET journal_entry_id = $1 WHERE id = $2", jeID, billID); err != nil {
+				h.log.Error("CreateBillFromPO: failed to link JE to bill", "error", err)
+				response.InternalError(c, "Failed to link journal entry to bill: "+err.Error())
+				return
+			}
 		}
 	}
 
