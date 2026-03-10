@@ -718,18 +718,18 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		asOfDate = time.Now().Format("2006-01-02")
 	}
 
+	// ── Step 1: Fetch ALL invoices (full total_amount, not net) ──
 	query := `
 		SELECT si.id, si.invoice_number, si.invoice_date, si.due_date, si.total_amount,
-			   si.total_amount - si.amount_paid as amount_due,
 			   c.id as contact_id, c.name as contact_name,
 			   ($2::date - si.due_date)::int as days_overdue
 		FROM sales_invoices si
 		JOIN contacts c ON si.customer_id = c.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
-			AND si.status NOT IN ('cancelled', 'paid')
-			AND si.total_amount > si.amount_paid
+			AND si.status NOT IN ('cancelled')
 			AND si.total_amount > 0
 			AND COALESCE(si.invoice_type, 'invoice') = 'invoice'
+			AND si.invoice_date <= $2::date
 	`
 	arArgs := []interface{}{tenantID, asOfDate}
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
@@ -747,20 +747,24 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 	defer rows.Close()
 
 	contactMap := make(map[uuid.UUID]*entity.AgingContact)
+	// Track which contacts have invoices so we can include their payments
+	contactHasInvoices := make(map[uuid.UUID]bool)
 	var totalAmount, currentTotal, days1To30, days31To60, days61To90, over90Days float64
 
 	for rows.Next() {
 		var invoiceID, contactID uuid.UUID
 		var invoiceNumber, contactName string
 		var invoiceDate, dueDate time.Time
-		var total, amountDue float64
+		var total float64
 		var daysOverdue int
 
-		err := rows.Scan(&invoiceID, &invoiceNumber, &invoiceDate, &dueDate, &total, &amountDue,
+		err := rows.Scan(&invoiceID, &invoiceNumber, &invoiceDate, &dueDate, &total,
 			&contactID, &contactName, &daysOverdue)
 		if err != nil {
 			continue
 		}
+
+		contactHasInvoices[contactID] = true
 
 		// Get or create contact entry
 		contact, exists := contactMap[contactID]
@@ -773,28 +777,28 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 			contactMap[contactID] = contact
 		}
 
-		// Determine aging bucket
+		// Determine aging bucket based on due date
 		var bucket string
 		if daysOverdue <= 0 {
 			bucket = "current"
-			contact.Current += amountDue
-			currentTotal += amountDue
+			contact.Current += total
+			currentTotal += total
 		} else if daysOverdue <= 30 {
 			bucket = "1-30"
-			contact.Days1To30 += amountDue
-			days1To30 += amountDue
+			contact.Days1To30 += total
+			days1To30 += total
 		} else if daysOverdue <= 60 {
 			bucket = "31-60"
-			contact.Days31To60 += amountDue
-			days31To60 += amountDue
+			contact.Days31To60 += total
+			days31To60 += total
 		} else if daysOverdue <= 90 {
 			bucket = "61-90"
-			contact.Days61To90 += amountDue
-			days61To90 += amountDue
+			contact.Days61To90 += total
+			days61To90 += total
 		} else {
 			bucket = "90+"
-			contact.Over90Days += amountDue
-			over90Days += amountDue
+			contact.Over90Days += total
+			over90Days += total
 		}
 
 		invoice := entity.AgingInvoice{
@@ -803,17 +807,17 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 			InvoiceDate:   invoiceDate.Format("2006-01-02"),
 			DueDate:       dueDate.Format("2006-01-02"),
 			TotalAmount:   total,
-			AmountDue:     amountDue,
+			AmountDue:     total,
 			DaysOverdue:   daysOverdue,
 			AgingBucket:   bucket,
 		}
 
 		contact.Invoices = append(contact.Invoices, invoice)
-		contact.TotalAmount += amountDue
-		totalAmount += amountDue
+		contact.TotalAmount += total
+		totalAmount += total
 	}
 
-	// Also include payments (receipts) as negative entries — like Odoo
+	// ── Step 2: Fetch ALL confirmed payments as negative entries (like Odoo) ──
 	payQuery := `
 		SELECT p.id, p.payment_number, p.payment_date, p.amount,
 		       c.id as contact_id, c.name as contact_name,
@@ -831,7 +835,6 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 	}
 	payQuery += " ORDER BY c.name, p.payment_date"
 
-	// Check which payments are already fully allocated to invoices in this report
 	payRows, payErr := h.db.Query(payQuery, payArgs...)
 	if payErr == nil {
 		defer payRows.Close()
@@ -846,25 +849,14 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 				continue
 			}
 
-			// Check how much of this payment is allocated to unpaid invoices
-			var allocatedAmount float64
-			h.db.QueryRow(`
-				SELECT COALESCE(SUM(pa.amount), 0)
-				FROM payment_allocations pa
-				JOIN sales_invoices si ON pa.document_id = si.id AND pa.document_type = 'sales_invoice'
-				WHERE pa.payment_id = $1 AND si.status NOT IN ('cancelled', 'paid')
-				  AND si.total_amount > si.amount_paid
-			`, payID).Scan(&allocatedAmount)
-
-			// Unallocated payment amount (overpayment/advance) shows as negative
-			unallocated := amount - allocatedAmount
-			if unallocated <= 0 {
-				continue
-			}
-			negativeAmount := -unallocated
+			negativeAmount := -amount
 
 			contact, exists := contactMap[contactID]
 			if !exists {
+				// Only include payments for contacts that also have invoices
+				if !contactHasInvoices[contactID] {
+					continue
+				}
 				contact = &entity.AgingContact{
 					ContactID:   contactID,
 					ContactName: contactName,
@@ -873,24 +865,58 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 				contactMap[contactID] = contact
 			}
 
-			// Payments go into "current" bucket as negative
-			contact.Current += negativeAmount
-			currentTotal += negativeAmount
+			// Place payment in aging bucket based on payment date
+			var bucket string
+			if daysSince <= 0 {
+				bucket = "current"
+				contact.Current += negativeAmount
+				currentTotal += negativeAmount
+			} else if daysSince <= 30 {
+				bucket = "1-30"
+				contact.Days1To30 += negativeAmount
+				days1To30 += negativeAmount
+			} else if daysSince <= 60 {
+				bucket = "31-60"
+				contact.Days31To60 += negativeAmount
+				days31To60 += negativeAmount
+			} else if daysSince <= 90 {
+				bucket = "61-90"
+				contact.Days61To90 += negativeAmount
+				days61To90 += negativeAmount
+			} else {
+				bucket = "90+"
+				contact.Over90Days += negativeAmount
+				over90Days += negativeAmount
+			}
 
 			payEntry := entity.AgingInvoice{
 				InvoiceID:     payID,
 				InvoiceNumber: payNumber,
 				InvoiceDate:   payDate.Format("2006-01-02"),
 				DueDate:       payDate.Format("2006-01-02"),
-				TotalAmount:   -amount,
+				TotalAmount:   negativeAmount,
 				AmountDue:     negativeAmount,
 				DaysOverdue:   0,
-				AgingBucket:   "current",
+				AgingBucket:   bucket,
 			}
 
 			contact.Invoices = append(contact.Invoices, payEntry)
 			contact.TotalAmount += negativeAmount
 			totalAmount += negativeAmount
+		}
+	}
+
+	// Remove contacts with zero or negative net balance (fully paid)
+	for id, contact := range contactMap {
+		if contact.TotalAmount <= 0 {
+			// Subtract their bucket amounts from totals
+			currentTotal -= contact.Current
+			days1To30 -= contact.Days1To30
+			days31To60 -= contact.Days31To60
+			days61To90 -= contact.Days61To90
+			over90Days -= contact.Over90Days
+			totalAmount -= contact.TotalAmount
+			delete(contactMap, id)
 		}
 	}
 
@@ -928,16 +954,17 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		asOfDate = time.Now().Format("2006-01-02")
 	}
 
+	// ── Step 1: Fetch ALL vendor invoices (full total_amount) ──
 	query := `
 		SELECT pi.id, pi.invoice_number, pi.invoice_date, pi.due_date, pi.total_amount,
-			   pi.total_amount - pi.amount_paid as amount_due,
 			   c.id as contact_id, c.name as contact_name,
 			   ($2::date - pi.due_date)::int as days_overdue
 		FROM purchase_invoices pi
 		JOIN contacts c ON pi.vendor_id = c.id
 		WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL
-			AND pi.status NOT IN ('cancelled', 'paid')
-			AND pi.total_amount > pi.amount_paid
+			AND pi.status NOT IN ('cancelled')
+			AND pi.total_amount > 0
+			AND pi.invoice_date <= $2::date
 	`
 	apArgs := []interface{}{tenantID, asOfDate}
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
@@ -955,20 +982,23 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 	defer rows.Close()
 
 	contactMap := make(map[uuid.UUID]*entity.AgingContact)
+	contactHasInvoices := make(map[uuid.UUID]bool)
 	var totalAmount, currentTotal, days1To30, days31To60, days61To90, over90Days float64
 
 	for rows.Next() {
 		var invoiceID, contactID uuid.UUID
 		var invoiceNumber, contactName string
 		var invoiceDate, dueDate time.Time
-		var total, amountDue float64
+		var total float64
 		var daysOverdue int
 
-		err := rows.Scan(&invoiceID, &invoiceNumber, &invoiceDate, &dueDate, &total, &amountDue,
+		err := rows.Scan(&invoiceID, &invoiceNumber, &invoiceDate, &dueDate, &total,
 			&contactID, &contactName, &daysOverdue)
 		if err != nil {
 			continue
 		}
+
+		contactHasInvoices[contactID] = true
 
 		contact, exists := contactMap[contactID]
 		if !exists {
@@ -983,24 +1013,24 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		var bucket string
 		if daysOverdue <= 0 {
 			bucket = "current"
-			contact.Current += amountDue
-			currentTotal += amountDue
+			contact.Current += total
+			currentTotal += total
 		} else if daysOverdue <= 30 {
 			bucket = "1-30"
-			contact.Days1To30 += amountDue
-			days1To30 += amountDue
+			contact.Days1To30 += total
+			days1To30 += total
 		} else if daysOverdue <= 60 {
 			bucket = "31-60"
-			contact.Days31To60 += amountDue
-			days31To60 += amountDue
+			contact.Days31To60 += total
+			days31To60 += total
 		} else if daysOverdue <= 90 {
 			bucket = "61-90"
-			contact.Days61To90 += amountDue
-			days61To90 += amountDue
+			contact.Days61To90 += total
+			days61To90 += total
 		} else {
 			bucket = "90+"
-			contact.Over90Days += amountDue
-			over90Days += amountDue
+			contact.Over90Days += total
+			over90Days += total
 		}
 
 		invoice := entity.AgingInvoice{
@@ -1009,14 +1039,114 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 			InvoiceDate:   invoiceDate.Format("2006-01-02"),
 			DueDate:       dueDate.Format("2006-01-02"),
 			TotalAmount:   total,
-			AmountDue:     amountDue,
+			AmountDue:     total,
 			DaysOverdue:   daysOverdue,
 			AgingBucket:   bucket,
 		}
 
 		contact.Invoices = append(contact.Invoices, invoice)
-		contact.TotalAmount += amountDue
-		totalAmount += amountDue
+		contact.TotalAmount += total
+		totalAmount += total
+	}
+
+	// ── Step 2: Fetch ALL confirmed vendor payments as negative entries ──
+	payQuery := `
+		SELECT p.id, p.payment_number, p.payment_date, p.amount,
+		       c.id as contact_id, c.name as contact_name,
+		       ($2::date - p.payment_date)::int as days_since
+		FROM payments p
+		JOIN contacts c ON p.contact_id = c.id
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+		  AND p.type = 'payment' AND p.status = 'confirmed'
+		  AND p.payment_date <= $2::date
+	`
+	payArgs := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		payQuery += " AND p.organization_id = $3"
+		payArgs = append(payArgs, orgID)
+	}
+	payQuery += " ORDER BY c.name, p.payment_date"
+
+	payRows, payErr := h.db.Query(payQuery, payArgs...)
+	if payErr == nil {
+		defer payRows.Close()
+		for payRows.Next() {
+			var payID, contactID uuid.UUID
+			var payNumber, contactName string
+			var payDate time.Time
+			var amount float64
+			var daysSince int
+
+			if err := payRows.Scan(&payID, &payNumber, &payDate, &amount, &contactID, &contactName, &daysSince); err != nil {
+				continue
+			}
+
+			negativeAmount := -amount
+
+			contact, exists := contactMap[contactID]
+			if !exists {
+				if !contactHasInvoices[contactID] {
+					continue
+				}
+				contact = &entity.AgingContact{
+					ContactID:   contactID,
+					ContactName: contactName,
+					Invoices:    make([]entity.AgingInvoice, 0),
+				}
+				contactMap[contactID] = contact
+			}
+
+			var bucket string
+			if daysSince <= 0 {
+				bucket = "current"
+				contact.Current += negativeAmount
+				currentTotal += negativeAmount
+			} else if daysSince <= 30 {
+				bucket = "1-30"
+				contact.Days1To30 += negativeAmount
+				days1To30 += negativeAmount
+			} else if daysSince <= 60 {
+				bucket = "31-60"
+				contact.Days31To60 += negativeAmount
+				days31To60 += negativeAmount
+			} else if daysSince <= 90 {
+				bucket = "61-90"
+				contact.Days61To90 += negativeAmount
+				days61To90 += negativeAmount
+			} else {
+				bucket = "90+"
+				contact.Over90Days += negativeAmount
+				over90Days += negativeAmount
+			}
+
+			payEntry := entity.AgingInvoice{
+				InvoiceID:     payID,
+				InvoiceNumber: payNumber,
+				InvoiceDate:   payDate.Format("2006-01-02"),
+				DueDate:       payDate.Format("2006-01-02"),
+				TotalAmount:   negativeAmount,
+				AmountDue:     negativeAmount,
+				DaysOverdue:   0,
+				AgingBucket:   bucket,
+			}
+
+			contact.Invoices = append(contact.Invoices, payEntry)
+			contact.TotalAmount += negativeAmount
+			totalAmount += negativeAmount
+		}
+	}
+
+	// Remove contacts with zero or negative net balance (fully paid)
+	for id, contact := range contactMap {
+		if contact.TotalAmount <= 0 {
+			currentTotal -= contact.Current
+			days1To30 -= contact.Days1To30
+			days31To60 -= contact.Days31To60
+			days61To90 -= contact.Days61To90
+			over90Days -= contact.Over90Days
+			totalAmount -= contact.TotalAmount
+			delete(contactMap, id)
+		}
 	}
 
 	contacts := make([]entity.AgingContact, 0, len(contactMap))
