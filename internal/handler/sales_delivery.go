@@ -720,61 +720,115 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		}
 	}
 
-	if len(insufficientItems) > 0 {
-		// Allow force validation via ?force=true query param
-		if c.Query("force") != "true" {
-			c.JSON(422, gin.H{
-				"success": false,
-				"message": "Insufficient stock for delivery",
-				"errors":  insufficientItems,
-			})
-			return
-		}
-		h.log.Warn("Force validating delivery order with insufficient stock", "do_id", doID, "insufficient_items", len(insufficientItems))
+	isPartial := c.Query("partial") == "true"
+
+	if len(insufficientItems) > 0 && !isPartial {
+		c.JSON(422, gin.H{
+			"success": false,
+			"message": "Insufficient stock for delivery",
+			"errors":  insufficientItems,
+		})
+		return
 	}
 
-	// Process each line - update inventory
+	// Build availability map for partial delivery
+	type stockInfo struct {
+		InventoryID  uuid.UUID
+		Available    float64
+		UnitCost     float64
+		WarehouseID  string
+		ProductName  string
+	}
+	stockMap := make(map[uuid.UUID]stockInfo) // keyed by product_id
+
 	for _, line := range lines {
-		// Use line warehouse or DO warehouse
 		effectiveWarehouseID := warehouseID.String
 		if line.LineWarehouseID.Valid {
 			effectiveWarehouseID = line.LineWarehouseID.String
 		}
-
 		if effectiveWarehouseID == "" {
-			h.log.Warn("No warehouse specified for delivery line", "line_id", line.ID)
 			continue
 		}
 
-		// Find inventory record
 		var inventoryID uuid.UUID
-		var qtyOnHand, qtyAvailable float64
-		var unitCost float64
+		var qtyOnHand, qtyAvailable, unitCost float64
+		var productName string
 
 		err := h.db.QueryRow(`
-			SELECT id, quantity_on_hand, quantity_available, unit_cost
-			FROM inventory
-			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-		`, tenantID, line.ProductID, effectiveWarehouseID).Scan(&inventoryID, &qtyOnHand, &qtyAvailable, &unitCost)
+			SELECT i.id, i.quantity_on_hand, COALESCE(i.quantity_available, i.quantity_on_hand), i.unit_cost, COALESCE(p.name, 'Unknown')
+			FROM inventory i
+			JOIN products p ON p.id = i.product_id AND p.tenant_id = i.tenant_id
+			WHERE i.tenant_id = $1 AND i.product_id = $2 AND i.warehouse_id = $3
+		`, tenantID, line.ProductID, effectiveWarehouseID).Scan(&inventoryID, &qtyOnHand, &qtyAvailable, &unitCost, &productName)
 
-		if err == sql.ErrNoRows {
-			h.log.Warn("No inventory found for product", "product_id", line.ProductID, "warehouse_id", effectiveWarehouseID)
+		if err != nil {
+			stockMap[line.ProductID] = stockInfo{WarehouseID: effectiveWarehouseID, ProductName: line.ProductID.String()}
 			continue
 		}
-		if err != nil {
-			h.log.Error("Failed to fetch inventory", "error", err)
+		stockMap[line.ProductID] = stockInfo{
+			InventoryID: inventoryID,
+			Available:   qtyAvailable,
+			UnitCost:    unitCost,
+			WarehouseID: effectiveWarehouseID,
+			ProductName: productName,
+		}
+	}
+
+	// Determine actual delivery quantities per line
+	type deliveryAction struct {
+		Line         doLine
+		QtyToShip    float64
+		QtyBackorder float64
+	}
+	var actions []deliveryAction
+	var hasBackorder bool
+
+	for _, line := range lines {
+		stock := stockMap[line.ProductID]
+		if isPartial && stock.Available < line.QtyToDeliver {
+			qtyToShip := stock.Available
+			if qtyToShip < 0 {
+				qtyToShip = 0
+			}
+			actions = append(actions, deliveryAction{
+				Line:         line,
+				QtyToShip:    qtyToShip,
+				QtyBackorder: line.QtyToDeliver - qtyToShip,
+			})
+			hasBackorder = true
+		} else {
+			actions = append(actions, deliveryAction{
+				Line:      line,
+				QtyToShip: line.QtyToDeliver,
+			})
+		}
+	}
+
+	// Process each line - update inventory for shipped quantities
+	var createdBy *uuid.UUID
+	if userID != uuid.Nil {
+		createdBy = &userID
+	}
+
+	for _, action := range actions {
+		if action.QtyToShip <= 0 {
+			continue
+		}
+
+		stock := stockMap[action.Line.ProductID]
+		if stock.InventoryID == uuid.Nil {
+			h.log.Warn("No inventory found for product", "product_id", action.Line.ProductID)
 			continue
 		}
 
 		// Decrease inventory
-		_, err = h.db.Exec(`
+		_, err := h.db.Exec(`
 			UPDATE inventory
 			SET quantity_on_hand = quantity_on_hand - $1,
 				last_movement_date = $2,
 				updated_at = $2
 			WHERE id = $3
-		`, line.QtyToDeliver, now, inventoryID)
-
+		`, action.QtyToShip, now, stock.InventoryID)
 		if err != nil {
 			h.log.Error("Failed to update inventory", "error", err)
 			continue
@@ -782,45 +836,56 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 
 		// Create inventory transaction (outbound)
 		transactionID := uuid.New()
-		var createdBy *uuid.UUID
-		if userID != uuid.Nil {
-			createdBy = &userID
-		}
-
 		_, err = h.db.Exec(`
 			INSERT INTO inventory_transactions (
 				id, tenant_id, inventory_id, transaction_type, quantity,
 				unit_cost, total_cost, reference_type, reference_id,
 				reason, transaction_date, created_by, created_at
 			) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'sales_delivery', $7, 'Sales Delivery', $8, $9, $8)
-		`, transactionID, tenantID, inventoryID, -line.QtyToDeliver, unitCost, line.QtyToDeliver*unitCost, doID, now, createdBy)
-
+		`, transactionID, tenantID, stock.InventoryID, -action.QtyToShip, stock.UnitCost, action.QtyToShip*stock.UnitCost, doID, now, createdBy)
 		if err != nil {
 			h.log.Error("Failed to create inventory transaction", "error", err)
 		}
 
-		// Update DO line quantity_delivered
-		_, err = h.db.Exec(`
-			UPDATE sales_delivery_order_lines
-			SET quantity_delivered = quantity_to_deliver
-			WHERE id = $1
-		`, line.ID)
-
+		// Update DO line: set quantity_delivered to what was actually shipped
+		if isPartial && action.QtyBackorder > 0 {
+			// Partial: update qty_to_deliver to what was shipped, set delivered
+			_, err = h.db.Exec(`
+				UPDATE sales_delivery_order_lines
+				SET quantity_to_deliver = $1, quantity_delivered = $1
+				WHERE id = $2
+			`, action.QtyToShip, action.Line.ID)
+		} else {
+			_, err = h.db.Exec(`
+				UPDATE sales_delivery_order_lines
+				SET quantity_delivered = quantity_to_deliver
+				WHERE id = $1
+			`, action.Line.ID)
+		}
 		if err != nil {
 			h.log.Error("Failed to update DO line", "error", err)
 		}
 
 		// Update SO line quantity_delivered
-		if line.SOLineID.Valid {
+		if action.Line.SOLineID.Valid {
 			_, err = h.db.Exec(`
 				UPDATE sales_order_lines
 				SET quantity_delivered = COALESCE(quantity_delivered, 0) + $1,
 					updated_at = $2
 				WHERE id = $3
-			`, line.QtyToDeliver, now, line.SOLineID.String)
-
+			`, action.QtyToShip, now, action.Line.SOLineID.String)
 			if err != nil {
 				h.log.Error("Failed to update SO line", "error", err)
+			}
+		}
+	}
+
+	// For lines with 0 qty to ship in partial mode, remove them from this DO
+	if isPartial {
+		for _, action := range actions {
+			if action.QtyToShip <= 0 && action.QtyBackorder > 0 {
+				// Remove line from current DO (it will be in backorder DO)
+				_, _ = h.db.Exec(`DELETE FROM sales_delivery_order_lines WHERE id = $1`, action.Line.ID)
 			}
 		}
 	}
@@ -831,10 +896,71 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		SET status = 'shipped', updated_at = $1
 		WHERE id = $2
 	`, now, doID)
-
 	if err != nil {
 		response.InternalError(c, "Failed to update delivery order status")
 		return
+	}
+
+	// Create backorder DO if partial delivery
+	var backorderNumber string
+	if isPartial && hasBackorder {
+		var doCount int
+		h.db.QueryRow("SELECT COUNT(*) FROM sales_delivery_orders WHERE tenant_id = $1", tenantID).Scan(&doCount)
+		backorderNumber = fmt.Sprintf("DO%05d", doCount+1)
+
+		backorderID := uuid.New()
+
+		// Get original DO details for backorder
+		var orgID, customerID, customerName, soNumber, shippingMethod, carrier, notes sql.NullString
+		h.db.QueryRow(`
+			SELECT organization_id, customer_id, customer_name, so_number, shipping_method, carrier, notes
+			FROM sales_delivery_orders WHERE id = $1
+		`, doID).Scan(&orgID, &customerID, &customerName, &soNumber, &shippingMethod, &carrier, &notes)
+
+		_, err = h.db.Exec(`
+			INSERT INTO sales_delivery_orders (
+				id, tenant_id, organization_id, delivery_number, sales_order_id, so_number,
+				customer_id, customer_name, delivery_date, scheduled_date,
+				warehouse_id, shipping_method, carrier, notes,
+				status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $12, $13, 'draft', $14, $9, $9)
+		`, backorderID, tenantID, orgID, backorderNumber, salesOrderID, soNumber,
+			customerID, customerName, now, warehouseID, shippingMethod, carrier,
+			sql.NullString{String: "Kutilmoqda: qoldiq yetkazma / Backorder from " + fmt.Sprintf("DO%05d", doCount), Valid: true},
+			createdBy)
+
+		if err != nil {
+			h.log.Error("Failed to create backorder DO", "error", err)
+		} else {
+			// Create backorder lines
+			for _, action := range actions {
+				if action.QtyBackorder <= 0 {
+					continue
+				}
+				lineID := uuid.New()
+				var productName string
+				h.db.QueryRow("SELECT COALESCE(name, '') FROM products WHERE id = $1 AND tenant_id = $2", action.Line.ProductID, tenantID).Scan(&productName)
+
+				var unitPrice float64
+				if action.Line.SOLineID.Valid {
+					h.db.QueryRow("SELECT COALESCE(unit_price, 0) FROM sales_order_lines WHERE id = $1", action.Line.SOLineID.String).Scan(&unitPrice)
+				}
+
+				_, err = h.db.Exec(`
+					INSERT INTO sales_delivery_order_lines (
+						id, delivery_order_id, so_line_id, product_id, product_name,
+						quantity_ordered, quantity_to_deliver, quantity_delivered,
+						unit_price, warehouse_id, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, $9, $10)
+				`, lineID, backorderID, action.Line.SOLineID, action.Line.ProductID, productName,
+					action.QtyBackorder, action.QtyBackorder, unitPrice, action.Line.LineWarehouseID, now)
+
+				if err != nil {
+					h.log.Error("Failed to create backorder line", "error", err)
+				}
+			}
+			h.log.Info("Backorder DO created", "backorder_id", backorderID, "backorder_number", backorderNumber)
+		}
 	}
 
 	// Check if SO is fully delivered and update SO status
@@ -857,7 +983,17 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		`, newSOStatus, now, salesOrderID)
 	}
 
-	h.log.Info("Delivery order validated", "do_id", doID, "so_id", salesOrderID)
+	h.log.Info("Delivery order validated", "do_id", doID, "so_id", salesOrderID, "partial", isPartial)
+
+	if isPartial && hasBackorder {
+		// Return both shipped DO info and backorder info
+		c.JSON(200, gin.H{
+			"success":          true,
+			"message":          "Partial delivery completed. Backorder created for remaining items.",
+			"backorder_number": backorderNumber,
+		})
+		return
+	}
 
 	h.GetDeliveryOrder(c)
 }

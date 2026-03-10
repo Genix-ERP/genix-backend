@@ -1070,7 +1070,7 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 			   t.quantity, t.unit_cost, t.total_cost, t.from_warehouse_id, t.to_warehouse_id,
 			   t.from_location_id, t.to_location_id, t.reason, t.notes, t.transaction_date,
 			   t.created_by, t.created_at,
-			   p.code as product_code, p.name as product_name,
+			   i.product_id, p.code as product_code, p.name as product_name,
 			   COALESCE(fw.name, iw.name) as from_warehouse_name, tw.name as to_warehouse_name,
 			   e.first_name as created_by_first_name, e.last_name as created_by_last_name
 		FROM inventory_transactions t
@@ -1174,6 +1174,7 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 		Reason            *string                `json:"reason,omitempty"`
 		Notes             *string                `json:"notes,omitempty"`
 		TransactionDate   time.Time              `json:"transaction_date"`
+		ProductID         uuid.UUID              `json:"product_id"`
 		ProductCode       string                 `json:"product_code"`
 		ProductName       string                 `json:"product_name"`
 		CreatedBy         *uuid.UUID             `json:"created_by,omitempty"`
@@ -1194,7 +1195,7 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 			&m.Quantity, &unitCost, &totalCost, &fromWH, &toWH,
 			&fromLoc, &toLoc, &reason, &notes, &m.TransactionDate,
 			&createdBy, &m.CreatedAt,
-			&m.ProductCode, &m.ProductName,
+			&m.ProductID, &m.ProductCode, &m.ProductName,
 			&fromWHName, &toWHName,
 			&createdFirstName, &createdLastName,
 		)

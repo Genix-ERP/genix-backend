@@ -1180,12 +1180,14 @@ func (h *Handler) GetLeadAuditLogs(c *gin.Context) {
 	}
 
 	rows, err := h.db.Query(`
-		SELECT al.id, al.user_id, COALESCE(u.email, '') as user_email, al.action,
-		       al.old_values, al.new_values, al.created_at
+		SELECT al.id, al.user_id, COALESCE(u.email, '') as user_email,
+		       COALESCE(u.first_name || ' ' || u.last_name, u.email, '') as user_name,
+		       al.action, al.old_values, al.new_values, al.created_at
 		FROM audit_logs al
 		LEFT JOIN users u ON al.user_id = u.id
 		WHERE al.tenant_id = $1 AND al.entity_type = 'lead' AND al.entity_id = $2
 		ORDER BY al.created_at DESC
+		LIMIT 50
 	`, tenantID, id)
 	if err != nil {
 		h.log.Error("Failed to get lead audit logs", "error", err)
@@ -1197,17 +1199,18 @@ func (h *Handler) GetLeadAuditLogs(c *gin.Context) {
 	logs := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var logID, userID uuid.UUID
-		var userEmail, action string
+		var userEmail, userName, action string
 		var oldValues, newValues sql.NullString
 		var createdAt time.Time
 
-		if err := rows.Scan(&logID, &userID, &userEmail, &action, &oldValues, &newValues, &createdAt); err != nil {
+		if err := rows.Scan(&logID, &userID, &userEmail, &userName, &action, &oldValues, &newValues, &createdAt); err != nil {
 			continue
 		}
 		logs = append(logs, map[string]interface{}{
 			"id":         logID,
 			"user_id":    userID,
 			"user_email": userEmail,
+			"user_name":  strings.TrimSpace(userName),
 			"action":     action,
 			"old_values": oldValues.String,
 			"new_values": newValues.String,

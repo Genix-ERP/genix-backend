@@ -216,6 +216,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		leads.POST("", h.CreateLead)
 		leads.GET("/stats", h.GetLeadStats)
 		leads.GET("/:id", h.GetLead)
+		leads.GET("/:id/audit-logs", h.GetLeadAuditLogs)
 		leads.PUT("/:id", h.UpdateLead)
 		leads.DELETE("/:id", h.DeleteLead)
 		leads.POST("/:id/convert", h.ConvertLead)
