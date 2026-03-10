@@ -115,7 +115,8 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch delivery orders: "+err.Error())
+		h.log.Error("Failed to fetch delivery orders", "error", err)
+		response.InternalError(c, "Failed to fetch delivery orders")
 		return
 	}
 	defer rows.Close()
@@ -214,7 +215,8 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		Notes          string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -244,7 +246,8 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		h.log.Error("Failed to fetch sales order", "error", err)
+		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
 
@@ -314,7 +317,8 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		createdBy, now,
 	)
 	if err != nil {
-		response.InternalError(c, "Failed to create delivery order: "+err.Error())
+		h.log.Error("Failed to create delivery order", "error", err)
+		response.InternalError(c, "Failed to create delivery order")
 		return
 	}
 
@@ -386,7 +390,8 @@ func (h *Handler) GetDeliveryOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch delivery order: "+err.Error())
+		h.log.Error("Failed to fetch delivery order", "error", err)
+		response.InternalError(c, "Failed to fetch delivery order")
 		return
 	}
 
@@ -515,7 +520,8 @@ func (h *Handler) UpdateDeliveryOrder(c *gin.Context) {
 		Notes          string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -592,7 +598,8 @@ func (h *Handler) UpdateDeliveryOrder(c *gin.Context) {
 
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update delivery order: "+err.Error())
+		h.log.Error("Failed to update delivery order", "error", err)
+		response.InternalError(c, "Failed to update delivery order")
 		return
 	}
 
@@ -644,7 +651,8 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		WHERE delivery_order_id = $1 AND quantity_to_deliver > 0
 	`, doID)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch delivery order lines: "+err.Error())
+		h.log.Error("Failed to fetch delivery order lines", "error", err)
+		response.InternalError(c, "Failed to fetch delivery order lines")
 		return
 	}
 	defer rows.Close()
@@ -668,6 +676,54 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 
 	if len(lines) == 0 {
 		response.BadRequest(c, "No items to deliver")
+		return
+	}
+
+	// Pre-validate stock availability for all lines before making any changes
+	type insufficientItem struct {
+		ProductName string  `json:"product_name"`
+		Available   float64 `json:"available"`
+		Requested   float64 `json:"requested"`
+	}
+	var insufficientItems []insufficientItem
+
+	for _, line := range lines {
+		effectiveWarehouseID := warehouseID.String
+		if line.LineWarehouseID.Valid {
+			effectiveWarehouseID = line.LineWarehouseID.String
+		}
+		if effectiveWarehouseID == "" {
+			continue
+		}
+
+		var qtyAvailable float64
+		var productName string
+		err := h.db.QueryRow(`
+			SELECT COALESCE(i.quantity_available, 0), COALESCE(p.name, 'Unknown')
+			FROM products p
+			LEFT JOIN inventory i ON i.product_id = p.id AND i.tenant_id = p.tenant_id AND i.warehouse_id = $3
+			WHERE p.id = $1 AND p.tenant_id = $2
+		`, line.ProductID, tenantID, effectiveWarehouseID).Scan(&qtyAvailable, &productName)
+		if err != nil {
+			qtyAvailable = 0
+			productName = line.ProductID.String()
+		}
+
+		if qtyAvailable < line.QtyToDeliver {
+			insufficientItems = append(insufficientItems, insufficientItem{
+				ProductName: productName,
+				Available:   qtyAvailable,
+				Requested:   line.QtyToDeliver,
+			})
+		}
+	}
+
+	if len(insufficientItems) > 0 {
+		c.JSON(422, gin.H{
+			"success": false,
+			"message": "Insufficient stock for delivery",
+			"errors":  insufficientItems,
+		})
 		return
 	}
 
@@ -702,12 +758,6 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		if err != nil {
 			h.log.Error("Failed to fetch inventory", "error", err)
 			continue
-		}
-
-		// Check available quantity (allow negative stock for now, can add validation later)
-		if qtyAvailable < line.QtyToDeliver {
-			h.log.Warn("Insufficient stock", "product_id", line.ProductID, "available", qtyAvailable, "requested", line.QtyToDeliver)
-			// Continue anyway - some businesses allow negative stock
 		}
 
 		// Decrease inventory

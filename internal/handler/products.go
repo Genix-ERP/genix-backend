@@ -104,16 +104,12 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	argCount := 1
 	countArgCount := 1
 
-	// JOIN org-specific settings - INNER JOIN to only show products assigned to current org
+	// LEFT JOIN org-specific settings (products are shared across orgs per migration 173)
 	if orgID != uuid.Nil {
 		argCount++
 		baseQuery += fmt.Sprintf(`
-		INNER JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d`, argCount)
+		LEFT JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d`, argCount)
 		args = append(args, orgID)
-
-		countArgCount++
-		countQuery = `SELECT COUNT(*) FROM products p INNER JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $` + fmt.Sprintf("%d", countArgCount) + ` WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
-		countArgs = append(countArgs, orgID)
 	} else {
 		baseQuery += `
 		LEFT JOIN product_organization_settings pos ON false`
@@ -315,24 +311,43 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 
 	var input entity.CreateProductInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
-	// Check for duplicate code
-	var codeExists bool
-	err := h.db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM products WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)",
-		tenantID, input.Code,
-	).Scan(&codeExists)
-	if err != nil {
-		h.log.Error("Failed to check product code", "error", err)
-		response.InternalError(c, "Failed to create product")
-		return
+	// Check barcode uniqueness (global standard for product identification)
+	if input.Barcode != "" {
+		var barcodeExists bool
+		if err := h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM products WHERE tenant_id = $1 AND barcode = $2 AND deleted_at IS NULL)",
+			tenantID, input.Barcode,
+		).Scan(&barcodeExists); err != nil {
+			h.log.Error("Failed to check barcode", "error", err)
+			response.InternalError(c, "Failed to create product")
+			return
+		}
+		if barcodeExists {
+			response.Conflict(c, "Product with this barcode already exists")
+			return
+		}
 	}
-	if codeExists {
-		response.Conflict(c, "Product with this code already exists")
-		return
+
+	// Check SKU uniqueness (company-internal identifier)
+	if input.SKU != "" {
+		var skuExists bool
+		if err := h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM products WHERE tenant_id = $1 AND sku = $2 AND deleted_at IS NULL)",
+			tenantID, input.SKU,
+		).Scan(&skuExists); err != nil {
+			h.log.Error("Failed to check SKU", "error", err)
+			response.InternalError(c, "Failed to create product")
+			return
+		}
+		if skuExists {
+			response.Conflict(c, "Product with this SKU already exists")
+			return
+		}
 	}
 
 	// Parse optional UUIDs
@@ -482,7 +497,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		RETURNING id
 	`
 
-	err = h.db.QueryRow(query,
+	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, categoryID, input.Type, input.Code, sku, barcode, input.Name, description, shortDescription,
 		unitID, purchaseUnitID, salesUnitID, input.CostPrice, input.ListPrice, input.MinPrice, currencyID,
 		isStockable, trackInventory, input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity,
@@ -495,7 +510,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 	if err != nil {
 		h.log.Error("Failed to create product", "error", err)
 		if strings.Contains(err.Error(), "duplicate") {
-			response.Conflict(c, "Product with this code already exists")
+			response.Conflict(c, "Product with duplicate barcode or SKU already exists")
 			return
 		}
 		response.InternalError(c, "Failed to create product")
@@ -741,7 +756,8 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 
 	var input entity.UpdateProductInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1147,7 +1163,8 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 
 	var input Input
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1343,7 +1360,8 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 
 	var input Input
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

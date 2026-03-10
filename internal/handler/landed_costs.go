@@ -63,7 +63,8 @@ func (h *Handler) ListLandedCostTypes(c *gin.Context) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to fetch landed cost types", err.Error())
+		h.log.Error("Failed to fetch landed cost types", "error", err)
+		response.InternalError(c, "Failed to fetch landed cost types")
 		return
 	}
 	defer rows.Close()
@@ -104,7 +105,8 @@ func (h *Handler) CreateLandedCostType(c *gin.Context) {
 
 	var input LandedCostTypeInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, 400, "Invalid input", err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -130,7 +132,8 @@ func (h *Handler) CreateLandedCostType(c *gin.Context) {
 		allocMethod, input.ExpenseAccountID, isActive, now,
 	)
 	if err != nil {
-		response.Error(c, 500, "Failed to create landed cost type", err.Error())
+		h.log.Error("Failed to create landed cost type", "error", err)
+		response.InternalError(c, "Failed to create landed cost type")
 		return
 	}
 
@@ -304,7 +307,8 @@ func (h *Handler) ListLandedCosts(c *gin.Context) {
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
-		response.Error(c, 500, "Failed to fetch landed costs", err.Error())
+		h.log.Error("Failed to fetch landed costs", "error", err)
+		response.InternalError(c, "Failed to fetch landed costs")
 		return
 	}
 	defer rows.Close()
@@ -375,7 +379,8 @@ func (h *Handler) CreateLandedCost(c *gin.Context) {
 
 	var input LandedCostInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.Error(c, 400, "Invalid input", err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -403,7 +408,8 @@ func (h *Handler) CreateLandedCost(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to fetch goods receipt", err.Error())
+		h.log.Error("Failed to fetch goods receipt", "error", err)
+		response.InternalError(c, "Failed to fetch goods receipt")
 		return
 	}
 
@@ -459,7 +465,8 @@ func (h *Handler) CreateLandedCost(c *gin.Context) {
 		"draft", allocMethod, input.Notes, userID, now,
 	)
 	if err != nil {
-		response.Error(c, 500, "Failed to create landed cost", err.Error())
+		h.log.Error("Failed to create landed cost", "error", err)
+		response.InternalError(c, "Failed to create landed cost")
 		return
 	}
 
@@ -560,7 +567,8 @@ func (h *Handler) GetLandedCost(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to fetch landed cost", err.Error())
+		h.log.Error("Failed to fetch landed cost", "error", err)
+		response.InternalError(c, "Failed to fetch landed cost")
 		return
 	}
 
@@ -879,7 +887,8 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 		userID, now, id,
 	)
 	if err != nil {
-		response.Error(c, 500, "Failed to validate landed cost", err.Error())
+		h.log.Error("Failed to validate landed cost", "error", err)
+		response.InternalError(c, "Failed to validate landed cost")
 		return
 	}
 
@@ -918,7 +927,8 @@ func (h *Handler) CancelLandedCost(c *gin.Context) {
 		time.Now(), id,
 	)
 	if err != nil {
-		response.Error(c, 500, "Failed to cancel landed cost", err.Error())
+		h.log.Error("Failed to cancel landed cost", "error", err)
+		response.InternalError(c, "Failed to cancel landed cost")
 		return
 	}
 
@@ -1076,7 +1086,8 @@ func (h *Handler) GetGRForLandedCost(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.Error(c, 500, "Failed to fetch goods receipt", err.Error())
+		h.log.Error("Failed to fetch goods receipt", "error", err)
+		response.InternalError(c, "Failed to fetch goods receipt")
 		return
 	}
 

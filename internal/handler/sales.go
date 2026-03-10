@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // ListSalesOrders returns paginated list of sales orders
@@ -135,7 +136,8 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales orders: "+err.Error())
+		h.log.Error("Failed to fetch sales orders", "error", err)
+		response.InternalError(c, "Failed to fetch sales orders")
 		return
 	}
 	defer rows.Close()
@@ -308,7 +310,8 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 
 	var input SimpleSalesOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -512,7 +515,8 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 	)
 	if err != nil {
 		h.log.Error("Failed to create sales order", "error", err, "customer_id", customerID, "order_number", orderNumber)
-		response.InternalError(c, "Failed to create sales order: "+err.Error())
+		h.log.Error("Failed to create sales order", "error", err)
+		response.InternalError(c, "Failed to create sales order")
 		return
 	}
 
@@ -687,7 +691,8 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		h.log.Error("Failed to fetch sales order", "error", err)
+		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
 
@@ -873,7 +878,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 	var input entity.UpdateSalesOrderInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -1013,7 +1019,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
-		response.InternalError(c, "Failed to update sales order: "+err.Error())
+		h.log.Error("Failed to update sales order", "error", err)
+		response.InternalError(c, "Failed to update sales order")
 		return
 	}
 
@@ -1081,62 +1088,115 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 				WHERE sales_order_id = $1 AND product_id IS NOT NULL
 			`, orderID)
 			if err == nil {
-				defer soLines.Close()
+				// Collect all SO lines first
+				type soLine struct {
+					LineID    uuid.UUID
+					ProductID uuid.UUID
+					Qty       float64
+					UnitPrice float64
+				}
+				var lines []soLine
+				var allProductIDs []uuid.UUID
 				for soLines.Next() {
-					var lineID, productID uuid.UUID
-					var qty, unitPrice float64
-					if err := soLines.Scan(&lineID, &productID, &qty, &unitPrice); err != nil {
+					var l soLine
+					if err := soLines.Scan(&l.LineID, &l.ProductID, &l.Qty, &l.UnitPrice); err != nil {
 						continue
 					}
+					lines = append(lines, l)
+					allProductIDs = append(allProductIDs, l.ProductID)
+				}
+				soLines.Close()
 
-					// Update quantity_delivered on SO line
+				if len(lines) > 0 {
+					// Batch UPDATE quantity_delivered on all SO lines
+					solIDs := make([]uuid.UUID, len(lines))
+					for i, l := range lines {
+						solIDs[i] = l.LineID
+					}
 					h.db.Exec(`
 						UPDATE sales_order_lines
 						SET quantity_delivered = quantity, updated_at = $1
-						WHERE id = $2
-					`, now, lineID)
+						WHERE id = ANY($2)
+					`, now, pq.Array(solIDs))
 
-					// Find or create inventory record
-					var inventoryID uuid.UUID
-					err := h.db.QueryRow(`
-						SELECT id FROM inventory
-						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-						ORDER BY created_at ASC LIMIT 1
-					`, tenantID, productID, warehouseID).Scan(&inventoryID)
-
-					if err == sql.ErrNoRows {
-						inventoryID = uuid.New()
-						var orgID interface{}
-						if soOrgID.Valid && soOrgID.String != "" {
-							orgID, _ = uuid.Parse(soOrgID.String)
+					// ONE query: get all existing inventory records for these products
+					invMap := make(map[uuid.UUID]uuid.UUID) // productID -> inventoryID
+					invRows, invErr := h.db.Query(`
+						SELECT DISTINCT ON (product_id) id, product_id FROM inventory
+						WHERE tenant_id = $1 AND product_id = ANY($2) AND warehouse_id = $3
+						ORDER BY product_id, created_at ASC
+					`, tenantID, pq.Array(allProductIDs), warehouseID)
+					if invErr == nil {
+						for invRows.Next() {
+							var invID, pid uuid.UUID
+							if err := invRows.Scan(&invID, &pid); err == nil {
+								invMap[pid] = invID
+							}
 						}
-						h.db.Exec(`
-							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-							VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-						`, inventoryID, tenantID, productID, warehouseID, orgID, unitPrice, now)
-					} else if err != nil {
-						h.log.Error("Failed to query inventory for SO shipment", "product_id", productID, "warehouse_id", warehouseID, "error", err)
-						continue
+						invRows.Close()
 					}
 
-					// Decrease inventory
-					h.db.Exec(`
-						UPDATE inventory
-						SET quantity_on_hand = quantity_on_hand - $1,
-							last_movement_date = $2,
-							updated_at = $2
-						WHERE id = $3
-					`, qty, now, inventoryID)
+					// Determine orgID once for potential inserts
+					var orgIDVal interface{}
+					if soOrgID.Valid && soOrgID.String != "" {
+						orgIDVal, _ = uuid.Parse(soOrgID.String)
+					}
 
-					// Create inventory transaction
-					txID := uuid.New()
-					h.db.Exec(`
-						INSERT INTO inventory_transactions (
-							id, tenant_id, inventory_id, transaction_type, quantity,
-							unit_cost, total_cost, reference_type, reference_id,
-							reason, transaction_date, created_at
-						) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'sales_order', $7, 'Sales Order Shipped', $8, $8)
-					`, txID, tenantID, inventoryID, -qty, unitPrice, qty*unitPrice, orderID, now)
+					// Batch INSERT for missing inventory records
+					var newInvValues []string
+					var newInvArgs []interface{}
+					newInvArgIdx := 0
+					for _, l := range lines {
+						if _, ok := invMap[l.ProductID]; !ok {
+							newID := uuid.New()
+							invMap[l.ProductID] = newID
+							newInvValues = append(newInvValues, fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,0,0,$%d,$%d,$%d)",
+								newInvArgIdx+1, newInvArgIdx+2, newInvArgIdx+3, newInvArgIdx+4, newInvArgIdx+5, newInvArgIdx+6, newInvArgIdx+7, newInvArgIdx+8))
+							newInvArgs = append(newInvArgs, newID, tenantID, l.ProductID, warehouseID, orgIDVal, l.UnitPrice, now, now)
+							newInvArgIdx += 8
+						}
+					}
+					if len(newInvValues) > 0 {
+						h.db.Exec(`
+							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+							VALUES `+strings.Join(newInvValues, ","), newInvArgs...)
+					}
+
+					// Batch UPDATE inventory quantities and batch INSERT inventory transactions
+					var txValues []string
+					var txArgs []interface{}
+					txArgIdx := 0
+					for _, l := range lines {
+						inventoryID, ok := invMap[l.ProductID]
+						if !ok {
+							continue
+						}
+
+						// Individual UPDATE for inventory (each has different qty)
+						h.db.Exec(`
+							UPDATE inventory
+							SET quantity_on_hand = quantity_on_hand - $1,
+								last_movement_date = $2,
+								updated_at = $2
+							WHERE id = $3
+						`, l.Qty, now, inventoryID)
+
+						txID := uuid.New()
+						txValues = append(txValues, fmt.Sprintf("($%d,$%d,$%d,'issue',$%d,$%d,$%d,'sales_order',$%d,'Sales Order Shipped',$%d,$%d)",
+							txArgIdx+1, txArgIdx+2, txArgIdx+3, txArgIdx+4, txArgIdx+5, txArgIdx+6, txArgIdx+7, txArgIdx+8, txArgIdx+9))
+						txArgs = append(txArgs, txID, tenantID, inventoryID, -l.Qty, l.UnitPrice, l.Qty*l.UnitPrice, orderID, now, now)
+						txArgIdx += 9
+					}
+
+					// ONE INSERT for all inventory transactions
+					if len(txValues) > 0 {
+						h.db.Exec(`
+							INSERT INTO inventory_transactions (
+								id, tenant_id, inventory_id, transaction_type, quantity,
+								unit_cost, total_cost, reference_type, reference_id,
+								reason, transaction_date, created_at
+							) VALUES `+strings.Join(txValues, ","), txArgs...)
+					}
 				}
 			}
 
@@ -1243,23 +1303,27 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 				// Find stock journal or general
 				var journalID uuid.UUID
-				var nextNumber int
+				var numberPrefix sql.NullString
 				err := h.db.QueryRow(`
-					SELECT id, next_number FROM journals
+					SELECT id, number_prefix FROM journals
 					WHERE tenant_id = $1 AND type = 'sales' AND is_active = true
 					ORDER BY created_at ASC LIMIT 1
-				`, tenantID).Scan(&journalID, &nextNumber)
+				`, tenantID).Scan(&journalID, &numberPrefix)
 				if err != nil {
 					h.db.QueryRow(`
-						SELECT id, next_number FROM journals
+						SELECT id, number_prefix FROM journals
 						WHERE tenant_id = $1 AND type = 'general' AND is_active = true
 						ORDER BY created_at ASC LIMIT 1
-					`, tenantID).Scan(&journalID, &nextNumber)
+					`, tenantID).Scan(&journalID, &numberPrefix)
 				}
 
 				if journalID != uuid.Nil {
 					entryID := uuid.New()
-					entryNumber := fmt.Sprintf("SAL%06d", nextNumber)
+					prefix := "SAL-"
+					if numberPrefix.Valid && numberPrefix.String != "" {
+						prefix = numberPrefix.String
+					}
+					entryNumber := fmt.Sprintf("%s%s-%s", prefix, time.Now().Format("20060102"), uuid.New().String()[:6])
 					customerName := ""
 					if soCustomerName.Valid {
 						customerName = soCustomerName.String
@@ -1274,35 +1338,40 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						}
 					}
 
-					h.db.Exec(`
+					if _, err := h.db.Exec(`
 						INSERT INTO journal_entries (
 							id, tenant_id, organization_id, journal_id, entry_number,
 							entry_date, description, source_type, source_id, status, total_debit, total_credit,
 							created_at, updated_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'sales_order', $8, 'posted', $9, $9, $10, $10)
 					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
-						now, description, orderID.String(), totalCost, now)
-
+						now, description, orderID.String(), totalCost, now); err != nil {
+						h.log.Error("Stock movement JE INSERT failed", "error", err, "entry_number", entryNumber)
+					} else {
 					lineNumber := 1
 					for pair, amount := range grouped {
 						// Debit: Stock Interim Delivery
 						debitLineID := uuid.New()
-						h.db.Exec(`
+						if _, err := h.db.Exec(`
 							INSERT INTO journal_entry_lines (
 								id, journal_entry_id, account_id, contact_id, description,
 								debit_amount, credit_amount, line_number, created_at
 							) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
-						`, debitLineID, entryID, pair.Debit, contactID, "Stock Interim Delivery", amount, lineNumber, now)
+						`, debitLineID, entryID, pair.Debit, contactID, "Stock Interim Delivery", amount, lineNumber, now); err != nil {
+							h.log.Error("Stock movement JE debit line INSERT failed", "error", err)
+						}
 						lineNumber++
 
 						// Credit: Stock Valuation
 						creditLineID := uuid.New()
-						h.db.Exec(`
+						if _, err := h.db.Exec(`
 							INSERT INTO journal_entry_lines (
 								id, journal_entry_id, account_id, contact_id, description,
 								debit_amount, credit_amount, line_number, created_at
 							) VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)
-						`, creditLineID, entryID, pair.Credit, contactID, "Stock Valuation", amount, lineNumber, now)
+						`, creditLineID, entryID, pair.Credit, contactID, "Stock Valuation", amount, lineNumber, now); err != nil {
+							h.log.Error("Stock movement JE credit line INSERT failed", "error", err)
+						}
 						lineNumber++
 
 						// Update account balances
@@ -1310,10 +1379,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Credit)
 					}
 
-					// Update journal next_number
-					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
-
 					h.log.Info("Stock movement JE created for SO shipped (Odoo-style)", "entry_id", entryID, "cost", totalCost)
+					}
 				}
 			}
 		}
@@ -1431,7 +1498,8 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		h.log.Error("Failed to fetch sales order", "error", err)
+		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
 	if currentStatus != string(entity.OrderStatusDraft) {
@@ -1539,7 +1607,7 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	opTypeQuery := `
 		SELECT id, default_location_src_id, default_location_dest_id
 		FROM warehouse_operation_types
-		WHERE tenant_id = $1 AND direction = 'delivery' AND is_active = true
+		WHERE tenant_id = $1 AND type = 'delivery' AND is_active = true
 	`
 	opTypeArgs := []interface{}{tenantID}
 	if warehouseUUID != nil {
@@ -1845,7 +1913,8 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	}
 	if err != nil {
 		h.log.Error("Failed to fetch sales order", "error", err, "order_id", orderID)
-		response.InternalError(c, "Failed to fetch sales order: "+err.Error())
+		h.log.Error("Failed to fetch sales order", "error", err)
+		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
 
@@ -2012,7 +2081,8 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	)
 	if err != nil {
 		h.log.Error("CreateInvoiceFromOrder: INSERT failed", "error", err)
-		response.InternalError(c, "Failed to create invoice: "+err.Error())
+		h.log.Error("Failed to create invoice", "error", err)
+		response.InternalError(c, "Failed to create invoice")
 		return
 	}
 	h.log.Info("CreateInvoiceFromOrder: INSERT succeeded")
@@ -2075,13 +2145,12 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	// Get Sales Journal
 	var salesJournalID uuid.UUID
-	var nextNumber int
 	var numberPrefix sql.NullString
 	journalErr := tx.QueryRow(`
-		SELECT id, COALESCE(next_number, 1), number_prefix
+		SELECT id, number_prefix
 		FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
 		tenantID,
-	).Scan(&salesJournalID, &nextNumber, &numberPrefix)
+	).Scan(&salesJournalID, &numberPrefix)
 
 	if journalErr == nil {
 		// Find AR account
@@ -2156,12 +2225,12 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				revenueGrouped[fallbackRevenue] = subtotal
 			}
 
-			// Generate entry number
-			prefix := ""
-			if numberPrefix.Valid {
+			// Generate unique entry number using UUID suffix (guaranteed unique)
+			prefix := "INV-"
+			if numberPrefix.Valid && numberPrefix.String != "" {
 				prefix = numberPrefix.String
 			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+			entryNumber := fmt.Sprintf("%s%s-%s", prefix, now.Format("20060102"), uuid.New().String()[:6])
 
 			// Total COGS
 			var totalCogs float64
@@ -2176,19 +2245,24 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			journalEntryID = &jeID
 			jeDescription := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
 
+			var createdBy *uuid.UUID
+			if userID != uuid.Nil {
+				createdBy = &userID
+			}
 			_, jeErr := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 				jeID, tenantID, organizationID, salesJournalID, entryNumber, now, invoiceNumber, jeDescription,
-				"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, userID, now, now,
+				"sales_invoice", invoiceID, 1.0, totalDebit, totalCredit, createdBy, now, now,
 			)
 			if jeErr != nil {
-				h.log.Error("CreateInvoiceFromOrder: journal entry INSERT failed", "error", jeErr)
+				h.log.Error("CreateInvoiceFromOrder: journal entry INSERT failed, skipping GL posting", "error", jeErr)
 			}
 
 			jeLineNumber := 1
+			if jeErr == nil {
 
 			// Debit: Accounts Receivable
 			_, arErr := tx.Exec(`
@@ -2278,15 +2352,11 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				jeLineNumber++
 			}
 
-			// Update journal next number
-			if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", salesJournalID); err != nil {
-				h.log.Error("CreateInvoiceFromOrder: update journal next_number failed", "error", err)
-			}
-
 			// Link JE to invoice
 			if _, err := tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, sent_at = $2 WHERE id = $3", jeID, now, invoiceID); err != nil {
 				h.log.Error("CreateInvoiceFromOrder: link JE to invoice failed", "error", err)
 			}
+			} // end if jeErr == nil
 		}
 	}
 

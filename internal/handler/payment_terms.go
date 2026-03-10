@@ -134,7 +134,8 @@ func (h *Handler) CreatePaymentTerm(c *gin.Context) {
 
 	var input entity.PaymentTermInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -197,7 +198,8 @@ func (h *Handler) UpdatePaymentTerm(c *gin.Context) {
 
 	var input entity.PaymentTermInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -373,7 +375,8 @@ func (h *Handler) CalculateDueDate(c *gin.Context) {
 		InvoiceDate   string    `json:"invoice_date" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

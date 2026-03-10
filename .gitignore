@@ -51,3 +51,6 @@ dist/
 # Debug
 debug
 __debug_bin*
+
+# Agents
+.agents

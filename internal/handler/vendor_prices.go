@@ -255,7 +255,8 @@ func (h *Handler) CreateVendorPrice(c *gin.Context) {
 
 	var input CreateVendorPriceInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -404,7 +405,8 @@ func (h *Handler) UpdateVendorPrice(c *gin.Context) {
 
 	var input UpdateVendorPriceInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

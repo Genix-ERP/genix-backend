@@ -142,7 +142,8 @@ func (h *Handler) CreateEstimate(c *gin.Context) {
 
 	var req entity.CreateEstimateInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -224,7 +225,8 @@ func (h *Handler) UpdateEstimate(c *gin.Context) {
 
 	var req entity.UpdateEstimateInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -571,7 +573,8 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 
 	var req entity.CreateEstimateLineInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -642,7 +645,8 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 	}
 	var req entity.UpdateEstimateLineInput
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

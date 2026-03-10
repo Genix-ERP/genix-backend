@@ -135,7 +135,8 @@ func (h *Handler) CreateUnitOfMeasure(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -239,7 +240,8 @@ func (h *Handler) UpdateUnitOfMeasure(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 

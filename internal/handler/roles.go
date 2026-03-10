@@ -108,7 +108,8 @@ func (h *Handler) CreateRole(c *gin.Context) {
 
 	var input CreateRoleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -235,7 +236,8 @@ func (h *Handler) UpdateRole(c *gin.Context) {
 
 	var input UpdateRoleInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -440,7 +442,8 @@ func (h *Handler) AssignRole(c *gin.Context) {
 		EmployeeID string `json:"employee_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
@@ -532,7 +535,8 @@ func (h *Handler) UnassignRole(c *gin.Context) {
 		EmployeeID string `json:"employee_id" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Invalid input: "+err.Error())
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
 		return
 	}
 
