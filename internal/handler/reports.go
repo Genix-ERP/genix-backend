@@ -865,29 +865,9 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 				contactMap[contactID] = contact
 			}
 
-			// Place payment in aging bucket based on payment date
-			var bucket string
-			if daysSince <= 0 {
-				bucket = "current"
-				contact.Current += negativeAmount
-				currentTotal += negativeAmount
-			} else if daysSince <= 30 {
-				bucket = "1-30"
-				contact.Days1To30 += negativeAmount
-				days1To30 += negativeAmount
-			} else if daysSince <= 60 {
-				bucket = "31-60"
-				contact.Days31To60 += negativeAmount
-				days31To60 += negativeAmount
-			} else if daysSince <= 90 {
-				bucket = "61-90"
-				contact.Days61To90 += negativeAmount
-				days61To90 += negativeAmount
-			} else {
-				bucket = "90+"
-				contact.Over90Days += negativeAmount
-				over90Days += negativeAmount
-			}
+			// All payments go into "current" (Not Due) bucket as negative
+			contact.Current += negativeAmount
+			currentTotal += negativeAmount
 
 			payEntry := entity.AgingInvoice{
 				InvoiceID:     payID,
@@ -897,7 +877,7 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 				TotalAmount:   negativeAmount,
 				AmountDue:     negativeAmount,
 				DaysOverdue:   0,
-				AgingBucket:   bucket,
+				AgingBucket:   "current",
 			}
 
 			contact.Invoices = append(contact.Invoices, payEntry)
@@ -1096,28 +1076,9 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 				contactMap[contactID] = contact
 			}
 
-			var bucket string
-			if daysSince <= 0 {
-				bucket = "current"
-				contact.Current += negativeAmount
-				currentTotal += negativeAmount
-			} else if daysSince <= 30 {
-				bucket = "1-30"
-				contact.Days1To30 += negativeAmount
-				days1To30 += negativeAmount
-			} else if daysSince <= 60 {
-				bucket = "31-60"
-				contact.Days31To60 += negativeAmount
-				days31To60 += negativeAmount
-			} else if daysSince <= 90 {
-				bucket = "61-90"
-				contact.Days61To90 += negativeAmount
-				days61To90 += negativeAmount
-			} else {
-				bucket = "90+"
-				contact.Over90Days += negativeAmount
-				over90Days += negativeAmount
-			}
+			// All payments go into "current" (Not Due) bucket as negative
+			contact.Current += negativeAmount
+			currentTotal += negativeAmount
 
 			payEntry := entity.AgingInvoice{
 				InvoiceID:     payID,
@@ -1127,7 +1088,7 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 				TotalAmount:   negativeAmount,
 				AmountDue:     negativeAmount,
 				DaysOverdue:   0,
-				AgingBucket:   bucket,
+				AgingBucket:   "current",
 			}
 
 			contact.Invoices = append(contact.Invoices, payEntry)
