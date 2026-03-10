@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -4005,6 +4006,15 @@ func (h *Handler) CreateReorderRule(c *gin.Context) {
 		maxQty = &input.MaxQty
 	}
 
+	// Auto-calculate reorder_qty if not provided: max_qty - min_qty
+	reorderQty := input.ReorderQty
+	if reorderQty <= 0 && input.MaxQty > 0 {
+		reorderQty = input.MaxQty - input.MinQty
+		if reorderQty <= 0 {
+			reorderQty = input.MaxQty
+		}
+	}
+
 	var notes *string
 	if input.Notes != "" {
 		notes = &input.Notes
@@ -4016,7 +4026,7 @@ func (h *Handler) CreateReorderRule(c *gin.Context) {
 			trigger_type, preferred_vendor_id, lead_time_days, safety_stock,
 			auto_create_po, is_active, notes, created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true, $14, $15, $16, $16)
-	`, id, tenantID, orgIDPtr, productID, warehouseID, input.MinQty, maxQty, input.ReorderQty,
+	`, id, tenantID, orgIDPtr, productID, warehouseID, input.MinQty, maxQty, reorderQty,
 		triggerType, vendorID, input.LeadTimeDays, input.SafetyStock,
 		input.AutoCreatePO, notes, userID, now)
 
@@ -5570,6 +5580,8 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 		return
 	}
 
+	organizationID, hasOrg := middleware.GetOrganizationID(c)
+
 	direction := c.Query("direction")   // receipt, delivery, internal, write_off
 	state := c.Query("state")           // draft, in_progress, waiting, done, cancelled
 	partnerID := c.Query("partner_id")
@@ -5589,6 +5601,12 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 	`
 	args := []interface{}{tenantID}
 	argN := 1
+
+	if hasOrg && organizationID != uuid.Nil {
+		argN++
+		query += fmt.Sprintf(" AND so.organization_id = $%d", argN)
+		args = append(args, organizationID)
+	}
 
 	if direction != "" {
 		argN++
@@ -6065,10 +6083,18 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					}
 					var qtyAvailable float64
 					h.db.QueryRow(`
-						SELECT COALESCE(quantity_on_hand, 0)
+						SELECT COALESCE(SUM(quantity_on_hand), 0)
 						FROM inventory
 						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
 					`, tenantID, prodID, warehouseIDCheck).Scan(&qtyAvailable)
+					// If no stock found in the specific warehouse, check total across all warehouses
+					if qtyAvailable <= 0 {
+						h.db.QueryRow(`
+							SELECT COALESCE(SUM(quantity_on_hand), 0)
+							FROM inventory
+							WHERE tenant_id = $1 AND product_id = $2
+						`, tenantID, prodID).Scan(&qtyAvailable)
+					}
 
 					if qtyAvailable < doneQty {
 						insufficientItems = append(insufficientItems, insufficientItem{
@@ -6260,7 +6286,8 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 		if !skipInventory && warehouseID != uuid.Nil && (direction == "delivery" || direction == "receipt" || direction == "write_off") {
 			invLines, _ := h.db.Query(`
-				SELECT product_id, done_qty, COALESCE(unit_price, 0)
+				SELECT product_id, done_qty, COALESCE(unit_price, 0),
+				       COALESCE(lot_number, ''), expiry_date
 				FROM stock_operation_lines
 				WHERE operation_id = $1 AND tenant_id = $2 AND done_qty > 0
 			`, id, tenantID)
@@ -6269,7 +6296,9 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 				for invLines.Next() {
 					var prodID uuid.UUID
 					var doneQty, unitPrice float64
-					if scanErr := invLines.Scan(&prodID, &doneQty, &unitPrice); scanErr != nil {
+					var lotNumber string
+					var expiryDate sql.NullTime
+					if scanErr := invLines.Scan(&prodID, &doneQty, &unitPrice, &lotNumber, &expiryDate); scanErr != nil {
 						continue
 					}
 
@@ -6296,6 +6325,32 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						h.db.Exec(`
 							UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
 						`, doneQty, now, invID)
+
+						// Auto-create inventory lot record for receipt operations
+						if lotNumber == "" {
+							lotNumber = h.generateLotNumber(tenantID)
+						}
+						lotID := uuid.New()
+						var expDate *time.Time
+						if expiryDate.Valid {
+							expDate = &expiryDate.Time
+						}
+						// Get vendor from stock operation
+						var vendorID *uuid.UUID
+						if op.SourceType != nil && *op.SourceType == "purchase_order" && op.SourceID != nil {
+							var vid uuid.UUID
+							if err := h.db.QueryRow("SELECT vendor_id FROM purchase_orders WHERE id = $1", *op.SourceID).Scan(&vid); err == nil {
+								vendorID = &vid
+							}
+						}
+						h.db.Exec(`
+							INSERT INTO inventory_lots (
+								id, tenant_id, product_id, warehouse_id, lot_number,
+								received_date, expiry_date, initial_quantity, remaining_quantity,
+								unit_cost, vendor_id, purchase_order_id, status, created_at, updated_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
+						`, lotID, tenantID, prodID, warehouseID, lotNumber,
+							now, expDate, doneQty, unitPrice, vendorID, op.SourceID, now)
 					} else {
 						// Delivery or write-off: decrease inventory
 						h.db.Exec(`
@@ -6371,6 +6426,26 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 				UPDATE purchase_orders SET status = $1, updated_at = $2
 				WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
 			`, poStatus, now, *op.SourceID, tenantID)
+
+			// Intercompany: update linked SO to "delivered" when PO is fully received
+			if poStatus == "received" {
+				var linkedSOID *uuid.UUID
+				if link, linkErr := h.icSync.GetLinkedDocumentReverse(tenantID, "purchase_order", *op.SourceID); linkErr == nil && link != nil && link.SourceDocumentType == "sale_order" {
+					linkedSOID = &link.SourceDocumentID
+				} else if link, linkErr := h.icSync.GetLinkedDocument(tenantID, "purchase_order", *op.SourceID); linkErr == nil && link != nil && link.LinkedDocumentType == "sale_order" {
+					linkedSOID = &link.LinkedDocumentID
+				}
+				if linkedSOID != nil {
+					h.db.Exec(`
+						UPDATE sales_orders SET status = 'delivered', updated_at = $1
+						WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status != 'delivered'
+					`, now, *linkedSOID, tenantID)
+
+					// Also complete the delivery stock operation linked to this SO
+					h.completeLinkedDeliveryOp(tenantID, *linkedSOID, now)
+					h.log.Info("Intercompany: updated linked SO to delivered", "po_id", *op.SourceID, "so_id", *linkedSOID)
+				}
+			}
 		}
 
 		// Sync: when a delivery operation from a SO completes, mark SO as delivered
@@ -6379,6 +6454,36 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 				UPDATE sales_orders SET status = 'delivered', updated_at = $1
 				WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status != 'delivered'
 			`, now, *op.SourceID, tenantID)
+
+			// Intercompany: when SO delivery completes, update linked PO and its receipt
+			var linkedPOID *uuid.UUID
+			if link, linkErr := h.icSync.GetLinkedDocument(tenantID, "sale_order", *op.SourceID); linkErr == nil && link != nil && link.LinkedDocumentType == "purchase_order" {
+				linkedPOID = &link.LinkedDocumentID
+			} else if link, linkErr := h.icSync.GetLinkedDocumentReverse(tenantID, "sale_order", *op.SourceID); linkErr == nil && link != nil && link.SourceDocumentType == "purchase_order" {
+				linkedPOID = &link.SourceDocumentID
+			}
+			if linkedPOID != nil {
+				// Always update PO status to received
+				h.db.Exec(`
+					UPDATE purchase_orders SET status = 'received', updated_at = $1
+					WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+				`, now, *linkedPOID, tenantID)
+				// Try to complete receipt stock op + inventory if it exists
+				h.completeLinkedReceiptOp(tenantID, *linkedPOID, now)
+				h.log.Info("Intercompany: SO delivery done, updated linked PO", "so_id", *op.SourceID, "po_id", *linkedPOID)
+			}
+		}
+
+		// Sync: when a delivery linked to a material_request completes, update the MR status and record construction expenses
+		if op.SourceType != nil && *op.SourceType == "material_request" {
+			h.completeMaterialRequestFromStockOp(tenantID, id, userID, now)
+		} else {
+			// Also check by stock_operation_id link (in case source_type was not set)
+			var mrExists bool
+			h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM construction_material_requests WHERE stock_operation_id = $1 AND tenant_id = $2)`, id, tenantID).Scan(&mrExists)
+			if mrExists {
+				h.completeMaterialRequestFromStockOp(tenantID, id, userID, now)
+			}
 		}
 	} else {
 		newState = "in_progress"
@@ -6415,6 +6520,438 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		"current_step": nextStep,
 		"total_steps":  op.TotalSteps,
 	})
+}
+
+// completeLinkedDeliveryOp completes the delivery stock operation linked to a sales order.
+// Used in intercompany flow: when buying org receives goods, selling org's delivery op is auto-completed.
+// Also deducts inventory from the selling org's warehouse.
+func (h *Handler) completeLinkedDeliveryOp(tenantID uuid.UUID, salesOrderID uuid.UUID, now time.Time) {
+	var opID uuid.UUID
+	var opTypeID uuid.UUID
+	var orgID *uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT id, operation_type_id, organization_id FROM stock_operations
+		WHERE source_type = 'sales_order' AND source_id = $1
+		  AND tenant_id = $2 AND direction = 'delivery'
+		  AND state NOT IN ('done', 'cancelled')
+		  AND deleted_at IS NULL
+		ORDER BY created_at DESC LIMIT 1
+	`, salesOrderID, tenantID).Scan(&opID, &opTypeID, &orgID)
+	if err != nil {
+		return // No pending delivery op found
+	}
+
+	// Set done_qty = expected_qty for all lines
+	h.db.Exec(`
+		UPDATE stock_operation_lines
+		SET done_qty = expected_qty, updated_at = $1
+		WHERE operation_id = $2 AND tenant_id = $3
+	`, now, opID, tenantID)
+
+	// Mark operation as done
+	h.db.Exec(`
+		UPDATE stock_operations
+		SET state = 'done', done_at = $1, updated_at = $1
+		WHERE id = $2 AND tenant_id = $3
+	`, now, opID, tenantID)
+
+	// Deduct inventory from selling org's warehouse
+	var warehouseID uuid.UUID
+	h.db.QueryRow(`
+		SELECT wot.warehouse_id FROM warehouse_operation_types wot
+		WHERE wot.id = $1 AND wot.tenant_id = $2
+	`, opTypeID, tenantID).Scan(&warehouseID)
+
+	if warehouseID != uuid.Nil {
+		lines, _ := h.db.Query(`
+			SELECT product_id, done_qty, COALESCE(unit_price, 0)
+			FROM stock_operation_lines
+			WHERE operation_id = $1 AND tenant_id = $2 AND done_qty > 0
+		`, opID, tenantID)
+		if lines != nil {
+			defer lines.Close()
+			for lines.Next() {
+				var prodID uuid.UUID
+				var doneQty, unitPrice float64
+				if scanErr := lines.Scan(&prodID, &doneQty, &unitPrice); scanErr != nil {
+					continue
+				}
+
+				// Find or create inventory record
+				var invID uuid.UUID
+				err := h.db.QueryRow(`
+					SELECT id FROM inventory
+					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+					ORDER BY created_at ASC LIMIT 1
+				`, tenantID, prodID, warehouseID).Scan(&invID)
+
+				if err == sql.ErrNoRows && orgID != nil {
+					invID = uuid.New()
+					h.db.Exec(`
+						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+					`, invID, tenantID, prodID, warehouseID, *orgID, unitPrice, now)
+				} else if err != nil {
+					continue
+				}
+
+				// Decrease inventory
+				h.db.Exec(`
+					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
+				`, doneQty, now, invID)
+
+				// Create inventory movement record
+				h.db.Exec(`
+					INSERT INTO inventory_movements (
+						id, tenant_id, product_id, warehouse_id, movement_type, quantity,
+						reference_type, reference_id, notes, created_at
+					) VALUES ($1, $2, $3, $4, 'issue', $5, 'stock_operation', $6, 'Intercompany delivery', $7)
+				`, uuid.New(), tenantID, prodID, warehouseID, -doneQty, opID, now)
+			}
+		}
+	}
+
+	// Post accounting: Debit COGS (5100), Credit Inventory (1300)
+	h.postIntercompanyStockAccounting(tenantID, opID, orgID, "delivery", now)
+
+	h.log.Info("Intercompany: auto-completed delivery stock operation", "op_id", opID, "so_id", salesOrderID)
+}
+
+// completeLinkedReceiptOp completes the receipt stock operation linked to a purchase order.
+// Used in intercompany flow: when selling org confirms SO, buying org's receipt is auto-completed.
+// Also increases inventory in the buying org's warehouse.
+func (h *Handler) completeLinkedReceiptOp(tenantID uuid.UUID, purchaseOrderID uuid.UUID, now time.Time) {
+	var opID uuid.UUID
+	var opTypeID uuid.UUID
+	var orgID *uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT id, operation_type_id, organization_id FROM stock_operations
+		WHERE source_type = 'purchase_order' AND source_id = $1
+		  AND tenant_id = $2 AND direction = 'receipt'
+		  AND state NOT IN ('done', 'cancelled')
+		  AND deleted_at IS NULL
+		ORDER BY created_at DESC LIMIT 1
+	`, purchaseOrderID, tenantID).Scan(&opID, &opTypeID, &orgID)
+	if err != nil {
+		return
+	}
+
+	// Set done_qty = expected_qty for all lines
+	h.db.Exec(`
+		UPDATE stock_operation_lines
+		SET done_qty = expected_qty, updated_at = $1
+		WHERE operation_id = $2 AND tenant_id = $3
+	`, now, opID, tenantID)
+
+	// Mark operation as done
+	h.db.Exec(`
+		UPDATE stock_operations
+		SET state = 'done', done_at = $1, updated_at = $1
+		WHERE id = $2 AND tenant_id = $3
+	`, now, opID, tenantID)
+
+	// Update PO status to received
+	h.db.Exec(`
+		UPDATE purchase_orders SET status = 'received', updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+	`, now, purchaseOrderID, tenantID)
+
+	// Increase inventory in buying org's warehouse
+	var warehouseID uuid.UUID
+	h.db.QueryRow(`
+		SELECT wot.warehouse_id FROM warehouse_operation_types wot
+		WHERE wot.id = $1 AND wot.tenant_id = $2
+	`, opTypeID, tenantID).Scan(&warehouseID)
+
+	if warehouseID != uuid.Nil {
+		lines, _ := h.db.Query(`
+			SELECT product_id, done_qty, COALESCE(unit_price, 0)
+			FROM stock_operation_lines
+			WHERE operation_id = $1 AND tenant_id = $2 AND done_qty > 0
+		`, opID, tenantID)
+		if lines != nil {
+			defer lines.Close()
+			for lines.Next() {
+				var prodID uuid.UUID
+				var doneQty, unitPrice float64
+				if scanErr := lines.Scan(&prodID, &doneQty, &unitPrice); scanErr != nil {
+					continue
+				}
+
+				var invID uuid.UUID
+				err := h.db.QueryRow(`
+					SELECT id FROM inventory
+					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+					ORDER BY created_at ASC LIMIT 1
+				`, tenantID, prodID, warehouseID).Scan(&invID)
+
+				if err == sql.ErrNoRows && orgID != nil {
+					invID = uuid.New()
+					h.db.Exec(`
+						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+					`, invID, tenantID, prodID, warehouseID, *orgID, unitPrice, now)
+				} else if err != nil {
+					continue
+				}
+
+				// Increase inventory
+				h.db.Exec(`
+					UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, unit_cost = $4, last_movement_date = $2, updated_at = $2 WHERE id = $3
+				`, doneQty, now, invID, unitPrice)
+
+				// Create inventory movement record
+				h.db.Exec(`
+					INSERT INTO inventory_movements (
+						id, tenant_id, product_id, warehouse_id, movement_type, quantity,
+						reference_type, reference_id, notes, created_at
+					) VALUES ($1, $2, $3, $4, 'receipt', $5, 'stock_operation', $6, 'Intercompany receipt', $7)
+				`, uuid.New(), tenantID, prodID, warehouseID, doneQty, opID, now)
+			}
+		}
+	}
+
+	// Post accounting: Debit Inventory (1300), Credit Accounts Payable (2100)
+	h.postIntercompanyStockAccounting(tenantID, opID, orgID, "receipt", now)
+
+	h.log.Info("Intercompany: auto-completed receipt stock operation", "op_id", opID, "po_id", purchaseOrderID)
+}
+
+// postIntercompanyStockAccounting creates journal entries for intercompany stock operations.
+// Uses product category accounts per line:
+//   receipt → Debit StockValuation, Credit StockInput
+//   delivery → Debit ExpenseAccount(COGS), Credit StockValuation
+func (h *Handler) postIntercompanyStockAccounting(tenantID uuid.UUID, opID uuid.UUID, orgID *uuid.UUID, direction string, now time.Time) {
+	// Get operation lines with product IDs
+	lineRows, _ := h.db.Query(`
+		SELECT product_id, done_qty, COALESCE(unit_price, 0)
+		FROM stock_operation_lines WHERE operation_id=$1 AND tenant_id=$2 AND done_qty > 0
+	`, opID, tenantID)
+	if lineRows == nil {
+		return
+	}
+	defer lineRows.Close()
+
+	type lineEntry struct {
+		debitAcct  uuid.UUID
+		creditAcct uuid.UUID
+		amount     float64
+		prodName   string
+	}
+	var entries []lineEntry
+	var totalValue float64
+
+	for lineRows.Next() {
+		var prodID uuid.UUID
+		var doneQty, unitPrice float64
+		if err := lineRows.Scan(&prodID, &doneQty, &unitPrice); err != nil {
+			continue
+		}
+		lineValue := doneQty * unitPrice
+		if lineValue <= 0 {
+			continue
+		}
+
+		ca := getCategoryAccounts(h.db, tenantID, orgID, prodID)
+
+		var debitAcct, creditAcct uuid.UUID
+		switch direction {
+		case "receipt":
+			debitAcct = ca.StockValuationAccountID
+			creditAcct = ca.StockInputAccountID
+			if creditAcct == uuid.Nil {
+				creditAcct = findAccount(h.db, tenantID, orgID, "accounts payable", "2100")
+			}
+		case "delivery":
+			debitAcct = ca.ExpenseAccountID
+			creditAcct = ca.StockValuationAccountID
+		}
+
+		if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
+			continue
+		}
+
+		var pName string
+		h.db.QueryRow("SELECT COALESCE(name,'') FROM products WHERE id=$1", prodID).Scan(&pName)
+
+		entries = append(entries, lineEntry{debitAcct: debitAcct, creditAcct: creditAcct, amount: lineValue, prodName: pName})
+		totalValue += lineValue
+	}
+
+	if totalValue <= 0 || len(entries) == 0 {
+		return
+	}
+
+	// Find journal
+	var journalID uuid.UUID
+	var nextNumber int
+	h.db.QueryRow(`
+		SELECT id, COALESCE(next_number,1) FROM journals
+		WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL
+		ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1
+	`, tenantID).Scan(&journalID, &nextNumber)
+
+	if journalID == uuid.Nil {
+		return
+	}
+
+	entryID := uuid.New()
+	prefixMap := map[string]string{"receipt": "REC", "delivery": "DEL"}
+	prefix := prefixMap[direction]
+	if prefix == "" {
+		prefix = "STK"
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+	var opName string
+	h.db.QueryRow("SELECT name FROM stock_operations WHERE id=$1", opID).Scan(&opName)
+	description := fmt.Sprintf("Intercompany Stock: %s", opName)
+
+	h.db.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+			description, source_type, source_id, status, total_debit, total_credit,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_operation', $8, 'posted', $9, $9, $10, $10)
+	`, entryID, tenantID, orgID, journalID, entryNumber, now,
+		description, opID.String(), totalValue, now)
+
+	lineNum := 0
+	for _, e := range entries {
+		lineDesc := fmt.Sprintf("%s: %s", description, e.prodName)
+		lineNum++
+		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)`,
+			uuid.New(), entryID, e.debitAcct, lineDesc, e.amount, lineNum, now)
+		lineNum++
+		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)`,
+			uuid.New(), entryID, e.creditAcct, lineDesc, e.amount, lineNum, now)
+
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", e.amount, now, e.debitAcct)
+		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", e.amount, now, e.creditAcct)
+	}
+
+	h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	h.db.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, opID)
+
+	h.log.Info("Intercompany: posted GL entry", "direction", direction, "entry_id", entryID, "amount", totalValue)
+}
+
+// completeMaterialRequestFromStockOp updates a material request to 'approved' status
+// and records construction expenses when the linked delivery stock operation completes.
+func (h *Handler) completeMaterialRequestFromStockOp(tenantID uuid.UUID, stockOpID uuid.UUID, userID uuid.UUID, now time.Time) {
+	// Find the linked material request
+	var requestID, projectID int64
+	var itemsRaw []byte
+	var status string
+	err := h.db.QueryRow(`
+		SELECT id, project_id, items, status
+		FROM construction_material_requests
+		WHERE stock_operation_id = $1 AND tenant_id = $2
+	`, stockOpID, tenantID).Scan(&requestID, &projectID, &itemsRaw, &status)
+	if err != nil {
+		return // No linked material request
+	}
+	if status == "approved" || status == "fulfilled" {
+		return // Already processed
+	}
+
+	// Resolve approver employee ID
+	var approverEmployeeID *uuid.UUID
+	if userID != uuid.Nil {
+		var empID uuid.UUID
+		if err := h.db.QueryRow(`SELECT id FROM employees WHERE user_id = $1 AND tenant_id = $2 LIMIT 1`, userID, tenantID).Scan(&empID); err == nil {
+			approverEmployeeID = &empID
+		}
+	}
+
+	// Update material request status to approved
+	h.db.Exec(`
+		UPDATE construction_material_requests
+		SET status = 'approved', approved_by = $1, approval_date = $2, updated_date = $2
+		WHERE id = $3 AND tenant_id = $4
+	`, approverEmployeeID, now, requestID, tenantID)
+
+	// Parse items for expense tracking
+	var items []map[string]interface{}
+	if err := json.Unmarshal(itemsRaw, &items); err != nil || len(items) == 0 {
+		return
+	}
+
+	// Get organization ID from stock operation
+	var organizationID *uuid.UUID
+	h.db.QueryRow(`SELECT organization_id FROM stock_operations WHERE id = $1`, stockOpID).Scan(&organizationID)
+
+	var orgIDPtr *uuid.UUID
+	if organizationID != nil {
+		orgIDPtr = organizationID
+	}
+
+	// Find expense account
+	expenseAcct := findAccount(h.db, tenantID, orgIDPtr, "construction expense", "7000")
+	if expenseAcct == uuid.Nil {
+		expenseAcct = findAccount(h.db, tenantID, orgIDPtr, "cost of goods", "5000")
+	}
+
+	var totalExpense float64
+
+	// Upsert project materials and calculate totals
+	for _, item := range items {
+		productIDStr, _ := item["product_id"].(string)
+		if productIDStr == "" {
+			continue
+		}
+		var qty float64
+		switch v := item["quantity"].(type) {
+		case float64:
+			qty = v
+		case json.Number:
+			qty, _ = v.Float64()
+		}
+		var unitCost float64
+		switch v := item["unit_cost"].(type) {
+		case float64:
+			unitCost = v
+		case json.Number:
+			unitCost, _ = v.Float64()
+		}
+		if unitCost == 0 {
+			pid, _ := uuid.Parse(productIDStr)
+			h.db.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, pid).Scan(&unitCost)
+		}
+
+		lineCost := qty * unitCost
+		totalExpense += lineCost
+
+		productName, _ := item["product_name"].(string)
+		uom, _ := item["unit_name"].(string)
+		if productName == "" {
+			pid, _ := uuid.Parse(productIDStr)
+			h.db.QueryRow(`SELECT COALESCE(name,''), COALESCE(unit_name,'') FROM products WHERE id = $1`, pid).Scan(&productName, &uom)
+		}
+
+		// Upsert project materials
+		h.db.Exec(`
+			INSERT INTO construction_project_materials
+				(tenant_id, project_id, product_id, product_name, uom, approved_quantity, unit_cost, created_date, updated_date)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+			ON CONFLICT (tenant_id, project_id, product_id) DO UPDATE
+				SET approved_quantity = construction_project_materials.approved_quantity + EXCLUDED.approved_quantity,
+				    unit_cost = EXCLUDED.unit_cost,
+				    product_name = CASE WHEN EXCLUDED.product_name != '' THEN EXCLUDED.product_name ELSE construction_project_materials.product_name END,
+				    uom = CASE WHEN EXCLUDED.uom != '' THEN EXCLUDED.uom ELSE construction_project_materials.uom END,
+				    updated_date = EXCLUDED.updated_date
+		`, tenantID, projectID, productIDStr, productName, uom, qty, unitCost, now)
+	}
+
+	// Record construction cost tracking
+	if totalExpense > 0 {
+		h.db.Exec(`
+			INSERT INTO construction_cost_tracking (
+				tenant_id, project_id, tracking_date, actual_cost, notes, created_date
+			) VALUES ($1, $2, $3, $4, $5, NOW())
+		`, tenantID, projectID, now.Format("2006-01-02"), totalExpense,
+			fmt.Sprintf("Material Request #%d delivered via stock operation", requestID))
+	}
 }
 
 // CancelStockOperation cancels a stock operation
@@ -7083,13 +7620,21 @@ func (h *Handler) GetStockOperationSummary(c *gin.Context) {
 		response.Unauthorized(c, "Tenant not found")
 		return
 	}
+	organizationID, hasOrg := middleware.GetOrganizationID(c)
 
-	rows, err := h.db.Query(`
+	query := `
 		SELECT direction, state, COUNT(*) as cnt
 		FROM stock_operations
 		WHERE tenant_id=$1 AND deleted_at IS NULL
-		GROUP BY direction, state
-	`, tenantID)
+	`
+	args := []interface{}{tenantID}
+	if hasOrg && organizationID != uuid.Nil {
+		query += " AND organization_id = $2"
+		args = append(args, organizationID)
+	}
+	query += " GROUP BY direction, state"
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		response.InternalError(c, "Failed to get summary")
 		return
@@ -7478,4 +8023,517 @@ func (h *Handler) ListAllDeductions(c *gin.Context) {
 	pagination := entity.NewPagination(page, limit)
 	pagination.Calculate(total)
 	response.SuccessWithPagination(c, deductions, pagination)
+}
+
+// =====================================================
+// INVENTORY LOT HANDLERS
+// =====================================================
+
+// generateLotNumber generates a lot number in format LOT-YYYY-NNN
+func (h *Handler) generateLotNumber(tenantID uuid.UUID) string {
+	year := time.Now().Year()
+	prefix := fmt.Sprintf("LOT-%d-", year)
+
+	var count int
+	h.db.QueryRow(
+		"SELECT COUNT(*) FROM inventory_lots WHERE tenant_id = $1 AND lot_number LIKE $2",
+		tenantID, prefix+"%",
+	).Scan(&count)
+
+	return fmt.Sprintf("LOT-%d-%03d", year, count+1)
+}
+
+// ListInventoryLots returns a paginated list of inventory lots
+func (h *Handler) ListInventoryLots(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Parse pagination
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	offset := (page - 1) * limit
+
+	// Parse filters
+	search := c.Query("search")
+	productID := c.Query("product_id")
+	warehouseID := c.Query("warehouse_id")
+	status := c.Query("status")
+	expiring := c.Query("expiring") == "true"
+	expiryDays, _ := strconv.Atoi(c.DefaultQuery("expiry_days", "30"))
+
+	// Build query
+	baseQuery := `
+		SELECT il.id, il.tenant_id, il.product_id, il.warehouse_id, il.location_id,
+			   il.lot_number, il.serial_number, il.received_date, il.expiry_date,
+			   il.manufacture_date, il.initial_quantity, il.remaining_quantity,
+			   il.unit_cost, il.vendor_id, il.purchase_order_id, il.status,
+			   il.notes, il.created_at, il.updated_at,
+			   p.name as product_name, p.code as product_code,
+			   w.name as warehouse_name
+		FROM inventory_lots il
+		JOIN products p ON il.product_id = p.id
+		JOIN warehouses w ON il.warehouse_id = w.id
+		WHERE il.tenant_id = $1
+	`
+	countQuery := `
+		SELECT COUNT(*) FROM inventory_lots il
+		JOIN products p ON il.product_id = p.id
+		JOIN warehouses w ON il.warehouse_id = w.id
+		WHERE il.tenant_id = $1
+	`
+
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if productID != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND il.product_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND il.product_id = $%d", argCount)
+		args = append(args, productID)
+	}
+
+	if warehouseID != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND il.warehouse_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND il.warehouse_id = $%d", argCount)
+		args = append(args, warehouseID)
+	}
+
+	if status != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND il.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND il.status = $%d", argCount)
+		args = append(args, status)
+	}
+
+	if expiring {
+		baseQuery += fmt.Sprintf(" AND il.expiry_date IS NOT NULL AND il.expiry_date <= NOW() + INTERVAL '%d days'", expiryDays)
+		countQuery += fmt.Sprintf(" AND il.expiry_date IS NOT NULL AND il.expiry_date <= NOW() + INTERVAL '%d days'", expiryDays)
+	}
+
+	if search != "" {
+		argCount++
+		searchFilter := fmt.Sprintf(" AND (il.lot_number ILIKE $%d OR il.serial_number ILIKE $%d)", argCount, argCount)
+		baseQuery += searchFilter
+		countQuery += searchFilter
+		args = append(args, "%"+search+"%")
+	}
+
+	// Get count
+	var total int
+	err := h.db.QueryRow(countQuery, args...).Scan(&total)
+	if err != nil {
+		h.log.Error("Failed to count inventory lots", "error", err)
+		response.InternalError(c, "Failed to list inventory lots")
+		return
+	}
+
+	// Add ordering and pagination
+	baseQuery += " ORDER BY il.created_at DESC"
+	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
+
+	rows, err := h.db.Query(baseQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to list inventory lots", "error", err)
+		response.InternalError(c, "Failed to list inventory lots")
+		return
+	}
+	defer rows.Close()
+
+	type LotResponse struct {
+		entity.InventoryLot
+		ProductName   string `json:"product_name"`
+		ProductCode   string `json:"product_code"`
+		WarehouseName string `json:"warehouse_name"`
+	}
+
+	lots := make([]LotResponse, 0)
+	for rows.Next() {
+		var lot LotResponse
+		err := rows.Scan(
+			&lot.ID, &lot.TenantID, &lot.ProductID, &lot.WarehouseID, &lot.LocationID,
+			&lot.LotNumber, &lot.SerialNumber, &lot.ReceivedDate, &lot.ExpiryDate,
+			&lot.ManufactureDate, &lot.InitialQuantity, &lot.RemainingQuantity,
+			&lot.UnitCost, &lot.VendorID, &lot.PurchaseOrderID, &lot.Status,
+			&lot.Notes, &lot.CreatedAt, &lot.UpdatedAt,
+			&lot.ProductName, &lot.ProductCode, &lot.WarehouseName,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan inventory lot", "error", err)
+			continue
+		}
+		lots = append(lots, lot)
+	}
+
+	pagination := entity.NewPagination(page, limit)
+	pagination.Calculate(total)
+	response.SuccessWithPagination(c, lots, pagination)
+}
+
+// GetInventoryLot returns a single inventory lot by ID
+func (h *Handler) GetInventoryLot(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	lotID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid lot ID")
+		return
+	}
+
+	type LotResponse struct {
+		entity.InventoryLot
+		ProductName   string `json:"product_name"`
+		ProductCode   string `json:"product_code"`
+		WarehouseName string `json:"warehouse_name"`
+	}
+
+	var lot LotResponse
+	err = h.db.QueryRow(`
+		SELECT il.id, il.tenant_id, il.product_id, il.warehouse_id, il.location_id,
+			   il.lot_number, il.serial_number, il.received_date, il.expiry_date,
+			   il.manufacture_date, il.initial_quantity, il.remaining_quantity,
+			   il.unit_cost, il.vendor_id, il.purchase_order_id, il.status,
+			   il.notes, il.created_at, il.updated_at,
+			   p.name as product_name, p.code as product_code,
+			   w.name as warehouse_name
+		FROM inventory_lots il
+		JOIN products p ON il.product_id = p.id
+		JOIN warehouses w ON il.warehouse_id = w.id
+		WHERE il.id = $1 AND il.tenant_id = $2
+	`, lotID, tenantID).Scan(
+		&lot.ID, &lot.TenantID, &lot.ProductID, &lot.WarehouseID, &lot.LocationID,
+		&lot.LotNumber, &lot.SerialNumber, &lot.ReceivedDate, &lot.ExpiryDate,
+		&lot.ManufactureDate, &lot.InitialQuantity, &lot.RemainingQuantity,
+		&lot.UnitCost, &lot.VendorID, &lot.PurchaseOrderID, &lot.Status,
+		&lot.Notes, &lot.CreatedAt, &lot.UpdatedAt,
+		&lot.ProductName, &lot.ProductCode, &lot.WarehouseName,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Inventory lot")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get inventory lot", "error", err)
+		response.InternalError(c, "Failed to get inventory lot")
+		return
+	}
+
+	response.Success(c, lot)
+}
+
+// CreateInventoryLot creates a new inventory lot
+func (h *Handler) CreateInventoryLot(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var input entity.CreateInventoryLotInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	productID, err := uuid.Parse(input.ProductID)
+	if err != nil {
+		response.BadRequest(c, "Invalid product ID")
+		return
+	}
+
+	warehouseID, err := uuid.Parse(input.WarehouseID)
+	if err != nil {
+		response.BadRequest(c, "Invalid warehouse ID")
+		return
+	}
+
+	var locationID *uuid.UUID
+	if input.LocationID != "" {
+		lid, err := uuid.Parse(input.LocationID)
+		if err != nil {
+			response.BadRequest(c, "Invalid location ID")
+			return
+		}
+		locationID = &lid
+	}
+
+	// Parse received date
+	receivedDate, err := time.Parse("2006-01-02", input.ReceivedDate)
+	if err != nil {
+		response.BadRequest(c, "Invalid received date format, expected YYYY-MM-DD")
+		return
+	}
+
+	var expiryDate *time.Time
+	if input.ExpiryDate != "" {
+		ed, err := time.Parse("2006-01-02", input.ExpiryDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid expiry date format, expected YYYY-MM-DD")
+			return
+		}
+		expiryDate = &ed
+	}
+
+	var manufactureDate *time.Time
+	if input.ManufactureDate != "" {
+		md, err := time.Parse("2006-01-02", input.ManufactureDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid manufacture date format, expected YYYY-MM-DD")
+			return
+		}
+		manufactureDate = &md
+	}
+
+	var vendorID *uuid.UUID
+	if input.VendorID != "" {
+		vid, err := uuid.Parse(input.VendorID)
+		if err != nil {
+			response.BadRequest(c, "Invalid vendor ID")
+			return
+		}
+		vendorID = &vid
+	}
+
+	var purchaseOrderID *uuid.UUID
+	if input.PurchaseOrderID != "" {
+		poid, err := uuid.Parse(input.PurchaseOrderID)
+		if err != nil {
+			response.BadRequest(c, "Invalid purchase order ID")
+			return
+		}
+		purchaseOrderID = &poid
+	}
+
+	var serialNumber *string
+	if input.SerialNumber != "" {
+		serialNumber = &input.SerialNumber
+	}
+
+	var notes *string
+	if input.Notes != "" {
+		notes = &input.Notes
+	}
+
+	// Auto-generate lot number if not provided
+	lotNumber := input.LotNumber
+	if lotNumber == "" {
+		lotNumber = h.generateLotNumber(tenantID)
+	}
+
+	id := uuid.New()
+	now := time.Now()
+
+	_, err = h.db.Exec(`
+		INSERT INTO inventory_lots (
+			id, tenant_id, product_id, warehouse_id, location_id,
+			lot_number, serial_number, received_date, expiry_date, manufacture_date,
+			initial_quantity, remaining_quantity, unit_cost,
+			vendor_id, purchase_order_id, status, notes,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+	`, id, tenantID, productID, warehouseID, locationID,
+		lotNumber, serialNumber, receivedDate, expiryDate, manufactureDate,
+		input.Quantity, input.Quantity, input.UnitCost,
+		vendorID, purchaseOrderID, "available", notes,
+		now, now)
+
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(err.Error(), "unique constraint") {
+			response.Conflict(c, "A lot with this number already exists for this product and warehouse")
+			return
+		}
+		h.log.Error("Failed to create inventory lot", "error", err)
+		response.InternalError(c, "Failed to create inventory lot")
+		return
+	}
+
+	response.Created(c, gin.H{"id": id, "lot_number": lotNumber, "message": "Inventory lot created successfully"})
+}
+
+// UpdateInventoryLot updates an existing inventory lot
+func (h *Handler) UpdateInventoryLot(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	lotID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid lot ID")
+		return
+	}
+
+	var input struct {
+		ExpiryDate      *string `json:"expiry_date"`
+		ManufactureDate *string `json:"manufacture_date"`
+		Notes           *string `json:"notes"`
+		Status          *string `json:"status"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	// Build update query
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if input.ExpiryDate != nil {
+		if *input.ExpiryDate == "" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("expiry_date = $%d", argCount))
+			args = append(args, nil)
+		} else {
+			ed, err := time.Parse("2006-01-02", *input.ExpiryDate)
+			if err != nil {
+				response.BadRequest(c, "Invalid expiry date format, expected YYYY-MM-DD")
+				return
+			}
+			argCount++
+			updates = append(updates, fmt.Sprintf("expiry_date = $%d", argCount))
+			args = append(args, ed)
+		}
+	}
+
+	if input.ManufactureDate != nil {
+		if *input.ManufactureDate == "" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("manufacture_date = $%d", argCount))
+			args = append(args, nil)
+		} else {
+			md, err := time.Parse("2006-01-02", *input.ManufactureDate)
+			if err != nil {
+				response.BadRequest(c, "Invalid manufacture date format, expected YYYY-MM-DD")
+				return
+			}
+			argCount++
+			updates = append(updates, fmt.Sprintf("manufacture_date = $%d", argCount))
+			args = append(args, md)
+		}
+	}
+
+	if input.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		if *input.Notes == "" {
+			args = append(args, nil)
+		} else {
+			args = append(args, *input.Notes)
+		}
+	}
+
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+
+	argCount++
+	args = append(args, lotID)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf("UPDATE inventory_lots SET %s WHERE id = $%d AND tenant_id = $%d",
+		strings.Join(updates, ", "), argCount-1, argCount)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update inventory lot", "error", err)
+		response.InternalError(c, "Failed to update inventory lot")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Inventory lot")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Inventory lot updated successfully"})
+}
+
+// DeleteInventoryLot deletes an inventory lot
+func (h *Handler) DeleteInventoryLot(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	lotID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid lot ID")
+		return
+	}
+
+	// Check that the lot is available and nothing has been consumed
+	var status string
+	var initialQuantity, remainingQuantity float64
+	err = h.db.QueryRow(
+		"SELECT status, initial_quantity, remaining_quantity FROM inventory_lots WHERE id = $1 AND tenant_id = $2",
+		lotID, tenantID,
+	).Scan(&status, &initialQuantity, &remainingQuantity)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Inventory lot")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get inventory lot", "error", err)
+		response.InternalError(c, "Failed to delete inventory lot")
+		return
+	}
+
+	if status != "available" {
+		response.BadRequest(c, "Cannot delete lot with status '"+status+"', only 'available' lots can be deleted")
+		return
+	}
+
+	if math.Abs(remainingQuantity-initialQuantity) > 0.0001 {
+		response.BadRequest(c, "Cannot delete lot that has been partially consumed")
+		return
+	}
+
+	result, err := h.db.Exec(
+		"DELETE FROM inventory_lots WHERE id = $1 AND tenant_id = $2",
+		lotID, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to delete inventory lot", "error", err)
+		response.InternalError(c, "Failed to delete inventory lot")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Inventory lot")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Inventory lot deleted successfully"})
 }

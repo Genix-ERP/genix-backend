@@ -1245,6 +1245,25 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
+	// Intercompany: update linked SO status to "processing" when PO is approved
+	// Check both link directions: SO→PO (reverse lookup) and PO→SO (forward lookup)
+	var linkedSOID *uuid.UUID
+	if link, linkErr := h.icSync.GetLinkedDocumentReverse(tenantID, "purchase_order", poID); linkErr == nil && link != nil && link.SourceDocumentType == "sale_order" {
+		linkedSOID = &link.SourceDocumentID
+	} else if link, linkErr := h.icSync.GetLinkedDocument(tenantID, "purchase_order", poID); linkErr == nil && link != nil && link.LinkedDocumentType == "sale_order" {
+		linkedSOID = &link.LinkedDocumentID
+	}
+	if linkedSOID != nil {
+		if _, updErr := h.db.Exec(`
+			UPDATE sales_orders SET status = 'processing', updated_at = $1
+			WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status IN ('confirmed', 'draft')
+		`, now, *linkedSOID, tenantID); updErr != nil {
+			h.log.Error("Intercompany: failed to update linked SO to processing", "error", updErr, "po_id", poID, "so_id", *linkedSOID)
+		} else {
+			h.log.Info("Intercompany: updated linked SO to processing", "po_id", poID, "so_id", *linkedSOID)
+		}
+	}
+
 	return nil
 }
 

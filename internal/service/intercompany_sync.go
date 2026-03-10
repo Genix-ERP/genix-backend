@@ -566,3 +566,33 @@ func (s *IntercompanySyncService) GetLinkedDocument(tenantID uuid.UUID, sourceDo
 
 	return &link, nil
 }
+
+// GetLinkedDocumentReverse returns the source document for a linked document (reverse lookup).
+// E.g., given a PO (linked side), find the SO (source side) that created it.
+func (s *IntercompanySyncService) GetLinkedDocumentReverse(tenantID uuid.UUID, linkedDocType string, linkedDocID uuid.UUID) (*entity.IntercompanyDocumentLink, error) {
+	query := `
+		SELECT id, tenant_id,
+			   source_organization_id, source_document_type, source_document_id,
+			   linked_organization_id, linked_document_type, linked_document_id,
+			   link_type, created_at
+		FROM intercompany_document_links
+		WHERE tenant_id = $1 AND linked_document_type = $2 AND linked_document_id = $3
+		LIMIT 1
+	`
+
+	var link entity.IntercompanyDocumentLink
+	err := s.db.QueryRow(query, tenantID, linkedDocType, linkedDocID).Scan(
+		&link.ID, &link.TenantID,
+		&link.SourceOrganizationID, &link.SourceDocumentType, &link.SourceDocumentID,
+		&link.LinkedOrganizationID, &link.LinkedDocumentType, &link.LinkedDocumentID,
+		&link.LinkType, &link.CreatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return &link, nil
+}
