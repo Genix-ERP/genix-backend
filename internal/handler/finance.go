@@ -16,6 +16,32 @@ import (
 	"github.com/lib/pq"
 )
 
+// formatAmount formats a number with space thousand separators (e.g. 1 000 000)
+func formatAmount(amount float64) string {
+	isNegative := amount < 0
+	if isNegative {
+		amount = -amount
+	}
+	whole := int64(amount)
+	s := fmt.Sprintf("%d", whole)
+	// Insert space separators from right
+	n := len(s)
+	if n > 3 {
+		var result []byte
+		for i, c := range s {
+			if i > 0 && (n-i)%3 == 0 {
+				result = append(result, ' ')
+			}
+			result = append(result, byte(c))
+		}
+		s = string(result)
+	}
+	if isNegative {
+		s = "-" + s
+	}
+	return s
+}
+
 // nullIfEmpty returns nil for empty strings, otherwise returns the string pointer
 // This is used for optional nullable database columns
 func nullIfEmpty(s string) interface{} {
@@ -2324,6 +2350,20 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 		`, balanceChange, time.Now(), line.accountID)
 
 		if err != nil {
+			// Check if this is a cash/bank negative balance trigger error
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23514" {
+				// Transaction is aborted after trigger error, query outside tx
+				var accountName, accountCode string
+				var currentBalance float64
+				if scanErr := h.db.QueryRow(`SELECT name, code, current_balance FROM accounts WHERE id = $1`, line.accountID).Scan(&accountName, &accountCode, &currentBalance); scanErr == nil {
+					msg := fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas. Joriy balans: %s so'm",
+						accountName, accountCode, formatAmount(currentBalance))
+					response.BadRequest(c, msg)
+				} else {
+					response.BadRequest(c, pqErr.Message)
+				}
+				return
+			}
 			h.log.Error("Failed to update account balance", "error", err, "account_id", line.accountID)
 			response.InternalError(c, "Failed to post journal entry")
 			return
@@ -8832,6 +8872,11 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 	budgetedAmount := input.BudgetedAmount
 	if budgetedAmount == 0 && input.PlannedAmount > 0 {
 		budgetedAmount = input.PlannedAmount
+	}
+
+	if budgetedAmount <= 0 {
+		response.BadRequest(c, "Budget line amount must be greater than zero")
+		return
 	}
 
 	_, err = h.db.Exec(`
