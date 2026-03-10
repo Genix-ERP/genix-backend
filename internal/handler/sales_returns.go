@@ -209,7 +209,9 @@ func (h *Handler) CreateSalesReturn(c *gin.Context) {
 
 	now := time.Now()
 	returnID := uuid.New()
-	returnNumber := fmt.Sprintf("RET-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
+	var srCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM sales_returns WHERE tenant_id = $1", tenantID).Scan(&srCount)
+	returnNumber := fmt.Sprintf("SR%05d", srCount+1)
 
 	// Calculate totals
 	subtotal := 0.0
