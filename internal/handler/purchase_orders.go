@@ -860,6 +860,13 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	// Intercompany: when PO is sent (status → ordered), create SO in vendor company
+	if input.Status != nil && *input.Status == "ordered" {
+		if err := h.icSync.SyncPurchaseOrderToSaleOrder(tenantID, id); err != nil {
+			h.log.Error("Intercompany PO->SO sync failed on send", "error", err, "po_id", id)
+		}
+	}
+
 	response.Success(c, gin.H{"message": "Purchase order updated successfully"})
 }
 
@@ -1101,6 +1108,17 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 
 	now := time.Now()
 
+	// Check if vendor is an intercompany contact — if so, skip receipt op creation.
+	// The receipt op will be created when the vendor confirms the linked SO.
+	var isIntercompany bool
+	var icCheck int
+	if icErr := h.db.QueryRow(`
+		SELECT 1 FROM contacts
+		WHERE id = $1 AND tenant_id = $2 AND source_organization_id IS NOT NULL AND deleted_at IS NULL
+	`, vendorID, tenantID).Scan(&icCheck); icErr == nil {
+		isIntercompany = true
+	}
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
@@ -1126,125 +1144,122 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		h.log.Warn("Failed to cancel pending workflows", "error", wfErr)
 	}
 
-	// 2. Create stock operation (warehouse receipt) — like Odoo's _create_picking()
-	var opTypeID uuid.UUID
-	var srcLocID, destLocID *uuid.UUID
+	// 2. Create stock operation (warehouse receipt) — skip for intercompany POs.
+	// For intercompany POs, the receipt op is created when the vendor confirms the linked SO.
+	if !isIntercompany {
+		var opTypeID uuid.UUID
+		var srcLocID, destLocID *uuid.UUID
 
-	opTypeQuery := `
-		SELECT id, default_location_src_id, default_location_dest_id
-		FROM warehouse_operation_types
-		WHERE tenant_id = $1 AND type = 'receipt' AND is_active = true
-	`
-	opTypeArgs := []interface{}{tenantID}
+		opTypeQuery := `
+			SELECT id, default_location_src_id, default_location_dest_id
+			FROM warehouse_operation_types
+			WHERE tenant_id = $1 AND type = 'receipt' AND is_active = true
+		`
+		opTypeArgs := []interface{}{tenantID}
 
-	if warehouseID != nil {
-		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
-		opTypeArgs = append(opTypeArgs, *warehouseID)
-	} else {
-		opTypeQuery += " ORDER BY sequence LIMIT 1"
-	}
-
-	err = h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&opTypeID, &srcLocID, &destLocID)
-	if err != nil {
-		// No receipt operation type found — log warning but don't block approval
-		h.log.Warn("No receipt operation type found for stock operation creation",
-			"error", err, "tenant_id", tenantID, "warehouse_id", warehouseID)
-	}
-
-	if err == nil {
-		opID := uuid.New()
-		opName := h.nextStockOperationName(tenantID, "receipt")
-
-		var totalSteps int
-		h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2", opTypeID, tenantID).Scan(&totalSteps)
-		if totalSteps == 0 {
-			totalSteps = 1
+		if warehouseID != nil {
+			opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
+			opTypeArgs = append(opTypeArgs, *warehouseID)
+		} else {
+			opTypeQuery += " ORDER BY sequence LIMIT 1"
 		}
 
-		_, err = tx.Exec(`
-			INSERT INTO stock_operations (
-				id, tenant_id, organization_id, name, operation_type_id, direction,
-				date, scheduled_date, partner_id, source_document,
-				source_location_id, dest_location_id,
-				state, current_step, total_steps, priority,
-				source_type, source_id,
-				responsible_id, created_by, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,'receipt',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal','purchase_order',$15,$13,$13,$14,$14)
-		`,
-			opID, tenantID, orgID, opName, opTypeID,
-			now, expectedDate, vendorID, orderNumber,
-			srcLocID, destLocID,
-			totalSteps, userID, now, poID,
-		)
+		err = h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&opTypeID, &srcLocID, &destLocID)
 		if err != nil {
-			return fmt.Errorf("failed to create stock operation: %w", err)
+			h.log.Warn("No receipt operation type found for stock operation creation",
+				"error", err, "tenant_id", tenantID, "warehouse_id", warehouseID)
 		}
 
-		// 3. Create stock operation lines from PO lines
-		rows, err := h.db.Query(`
-			SELECT pol.product_id, pol.quantity, pol.unit_price,
-			       COALESCE(u.name, 'unit') as uom
-			FROM purchase_order_lines pol
-			LEFT JOIN units_of_measure u ON u.id = pol.unit_id
-			WHERE pol.purchase_order_id = $1 AND pol.product_id IS NOT NULL
-		`, poID)
-		if err != nil {
-			return fmt.Errorf("failed to fetch PO lines: %w", err)
-		}
-		defer rows.Close()
+		if err == nil {
+			opID := uuid.New()
+			opName := h.nextStockOperationName(tenantID, "receipt")
 
-		for rows.Next() {
-			var productID uuid.UUID
-			var qty float64
-			var unitPrice float64
-			var uom string
-
-			if err := rows.Scan(&productID, &qty, &unitPrice, &uom); err != nil {
-				h.log.Error("Failed to scan PO line", "error", err)
-				continue
+			var totalSteps int
+			h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2", opTypeID, tenantID).Scan(&totalSteps)
+			if totalSteps == 0 {
+				totalSteps = 1
 			}
 
 			_, err = tx.Exec(`
-				INSERT INTO stock_operation_lines (
-					id, tenant_id, operation_id, product_id,
-					expected_qty, done_qty, uom, unit_price,
-					quality_status, created_at, updated_at
-				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
+				INSERT INTO stock_operations (
+					id, tenant_id, organization_id, name, operation_type_id, direction,
+					date, scheduled_date, partner_id, source_document,
+					source_location_id, dest_location_id,
+					state, current_step, total_steps, priority,
+					source_type, source_id,
+					responsible_id, created_by, created_at, updated_at
+				) VALUES ($1,$2,$3,$4,$5,'receipt',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal','purchase_order',$15,$13,$13,$14,$14)
 			`,
-				tenantID, opID, productID,
-				qty, uom, unitPrice, now,
+				opID, tenantID, orgID, opName, opTypeID,
+				now, expectedDate, vendorID, orderNumber,
+				srcLocID, destLocID,
+				totalSteps, userID, now, poID,
 			)
 			if err != nil {
-				return fmt.Errorf("failed to create stock operation line for product %s: %w", productID, err)
+				return fmt.Errorf("failed to create stock operation: %w", err)
 			}
-		}
 
-		// 4. Create initial step log entry (only if steps are configured)
-		var firstStep struct {
-			ID   uuid.UUID
-			Name string
-		}
-		stepErr := h.db.QueryRow(`
-			SELECT id, name FROM operation_type_steps
-			WHERE operation_type_id = $1 AND tenant_id = $2
-			ORDER BY sequence LIMIT 1
-		`, opTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name)
-		if stepErr == nil {
-			_, _ = tx.Exec(`
-				INSERT INTO stock_operation_step_log (
-					id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
-				) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
-			`, tenantID, opID, firstStep.ID, firstStep.Name, now)
+			// 3. Create stock operation lines from PO lines
+			rows, err := h.db.Query(`
+				SELECT pol.product_id, pol.quantity, pol.unit_price,
+				       COALESCE(u.name, 'unit') as uom
+				FROM purchase_order_lines pol
+				LEFT JOIN units_of_measure u ON u.id = pol.unit_id
+				WHERE pol.purchase_order_id = $1 AND pol.product_id IS NOT NULL
+			`, poID)
+			if err != nil {
+				return fmt.Errorf("failed to fetch PO lines: %w", err)
+			}
+			defer rows.Close()
+
+			for rows.Next() {
+				var productID uuid.UUID
+				var qty float64
+				var unitPrice float64
+				var uom string
+
+				if err := rows.Scan(&productID, &qty, &unitPrice, &uom); err != nil {
+					h.log.Error("Failed to scan PO line", "error", err)
+					continue
+				}
+
+				_, err = tx.Exec(`
+					INSERT INTO stock_operation_lines (
+						id, tenant_id, operation_id, product_id,
+						expected_qty, done_qty, uom, unit_price,
+						quality_status, created_at, updated_at
+					) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
+				`,
+					tenantID, opID, productID,
+					qty, uom, unitPrice, now,
+				)
+				if err != nil {
+					return fmt.Errorf("failed to create stock operation line for product %s: %w", productID, err)
+				}
+			}
+
+			// 4. Create initial step log entry (only if steps are configured)
+			var firstStep struct {
+				ID   uuid.UUID
+				Name string
+			}
+			stepErr := h.db.QueryRow(`
+				SELECT id, name FROM operation_type_steps
+				WHERE operation_type_id = $1 AND tenant_id = $2
+				ORDER BY sequence LIMIT 1
+			`, opTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name)
+			if stepErr == nil {
+				_, _ = tx.Exec(`
+					INSERT INTO stock_operation_step_log (
+						id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
+					) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
+				`, tenantID, opID, firstStep.ID, firstStep.Name, now)
+			}
 		}
 	}
 
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	// Intercompany: create SO in draft in the selling company when PO is confirmed
-	if err := h.icSync.SyncPurchaseOrderToSaleOrder(tenantID, poID); err != nil {
-		h.log.Error("Intercompany PO->SO sync failed", "error", err, "po_id", poID)
 	}
 
 	return nil
