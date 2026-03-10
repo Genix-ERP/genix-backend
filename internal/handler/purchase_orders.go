@@ -1792,7 +1792,6 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			journalEntryID = &jeID
 			jeDescription := fmt.Sprintf("Vendor Bill %s", invoiceNumber)
 
-			if _, jeErr := tx.Exec(`
 			if _, err := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
@@ -1800,12 +1799,6 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 				jeID, tenantID, organizationID, purchaseJournalID, entryNumber, now, invoiceNumber, jeDescription,
 				"purchase_invoice", billID, 1.0, totalDebit, totalCredit, createdBy, now, now,
-			); jeErr != nil {
-				h.log.Error("CreateBillFromPO: failed to insert journal entry", "error", jeErr)
-				response.InternalError(c, "Failed to create journal entry")
-				return
-			}
-				"purchase_invoice", billID, 1.0, totalDebit, totalCredit, userID, now, now,
 			); err != nil {
 				h.log.Error("CreateBillFromPO: failed to create journal entry", "error", err)
 				response.InternalError(c, "Failed to create journal entry: "+err.Error())
@@ -1817,19 +1810,12 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			// Debit: Stock Interim Receipt (per category)
 			for inputAcct, amount := range inputGrouped {
 				if _, err := tx.Exec(`
-				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, contact_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, "Stock Interim Receipt",
 					amount, 0.0, 1.0, now,
-				); err != nil {
-					h.log.Error("CreateBillFromPO: failed to insert debit JE line", "error", err, "account", inputAcct)
-					response.InternalError(c, "Failed to create journal entry")
-					return
-				}
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct)
 				); err != nil {
 					h.log.Error("CreateBillFromPO: failed to insert JE debit line", "error", err, "account", inputAcct)
 					response.InternalError(c, "Failed to create journal entry line: "+err.Error())
@@ -1853,12 +1839,6 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 					uuid.New(), jeID, jeLineNumber, taxAccountID, "Input Tax",
 					taxAmount, 0.0, 1.0, now,
 				); err != nil {
-					h.log.Error("CreateBillFromPO: failed to insert tax JE line", "error", err)
-					response.InternalError(c, "Failed to create journal entry")
-					return
-				}
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
-				); err != nil {
 					h.log.Error("CreateBillFromPO: failed to insert JE tax line", "error", err)
 					response.InternalError(c, "Failed to create tax journal entry line: "+err.Error())
 					return
@@ -1873,19 +1853,12 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 			// Credit: Accounts Payable
 			if _, err := tx.Exec(`
-			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 				uuid.New(), jeID, jeLineNumber, apAccountID, vendorID, "Accounts Payable",
 				0.0, totalAmount, 1.0, now,
-			); err != nil {
-				h.log.Error("CreateBillFromPO: failed to insert credit JE line", "error", err)
-				response.InternalError(c, "Failed to create journal entry")
-				return
-			}
-			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
 			); err != nil {
 				h.log.Error("CreateBillFromPO: failed to insert JE AP credit line", "error", err)
 				response.InternalError(c, "Failed to create AP journal entry line: "+err.Error())
