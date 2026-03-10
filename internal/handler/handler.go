@@ -973,6 +973,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		journals.POST("/:id/post", h.perm.Require("finance", "journal", "post"), h.PostJournalEntry)
 		journals.POST("/:id/cancel", h.perm.Require("finance", "journal", "create"), h.CancelJournalEntry)
 		journals.POST("/:id/reverse", h.perm.Require("finance", "journal", "reverse"), h.ReverseJournalEntry)
+		journals.GET("/:id/audit-logs", h.GetJournalEntryAuditLogs)
 	}
 
 	// Payments

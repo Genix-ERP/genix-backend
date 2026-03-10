@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -40,6 +41,22 @@ func formatAmount(amount float64) string {
 		s = "-" + s
 	}
 	return s
+}
+
+// logJournalEntryAction logs journal entry actions to audit_logs
+func (h *Handler) logJournalEntryAction(tenantID, userID, entryID uuid.UUID, action, oldStatus, newStatus string, extra map[string]interface{}) {
+	newValues := map[string]interface{}{"status": newStatus}
+	if extra != nil {
+		for k, v := range extra {
+			newValues[k] = v
+		}
+	}
+	oldJSON, _ := json.Marshal(map[string]interface{}{"status": oldStatus})
+	newJSON, _ := json.Marshal(newValues)
+	h.db.Exec(`
+		INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
+		VALUES ($1, $2, $3, $4, 'journal_entry', $5, $6, $7, $8)
+	`, uuid.New(), tenantID, userID, action, entryID, oldJSON, newJSON, time.Now())
 }
 
 // nullIfEmpty returns nil for empty strings, otherwise returns the string pointer
@@ -2405,6 +2422,12 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// Audit log
+	h.logJournalEntryAction(tenantID, userID, id, "post", "draft", "posted", map[string]interface{}{
+		"total_debit":  totalDebit,
+		"total_credit": totalCredit,
+	})
+
 	response.Success(c, gin.H{"message": "Journal entry posted successfully", "posted_at": now})
 }
 
@@ -2851,11 +2874,12 @@ func (h *Handler) DeleteJournalEntry(c *gin.Context) {
 		response.InternalError(c, "Failed to delete journal entry")
 		return
 	}
-	if status != "draft" {
-		response.BadRequest(c, "Only draft entries can be deleted")
+	if status != "cancelled" {
+		response.BadRequest(c, "Only cancelled entries can be deleted. Please cancel the entry first.")
 		return
 	}
 
+	userID, _ := middleware.GetUserID(c)
 	now := time.Now()
 	_, err = h.db.Exec(`UPDATE journal_entries SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3`, now, id, tenantID)
 	if err != nil {
@@ -2863,6 +2887,9 @@ func (h *Handler) DeleteJournalEntry(c *gin.Context) {
 		response.InternalError(c, "Failed to delete journal entry")
 		return
 	}
+
+	// Audit log
+	h.logJournalEntryAction(tenantID, userID, id, "delete", status, "deleted", nil)
 
 	response.Success(c, gin.H{"message": "Journal entry deleted successfully"})
 }
@@ -2902,6 +2929,7 @@ func (h *Handler) CancelJournalEntry(c *gin.Context) {
 		return
 	}
 
+	userID, _ := middleware.GetUserID(c)
 	now := time.Now()
 	_, err = h.db.Exec(`UPDATE journal_entries SET status = 'cancelled', cancelled_at = $1, updated_at = $1 WHERE id = $2 AND tenant_id = $3`, now, id, tenantID)
 	if err != nil {
@@ -2910,7 +2938,61 @@ func (h *Handler) CancelJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// Audit log
+	h.logJournalEntryAction(tenantID, userID, id, "cancel", "draft", "cancelled", nil)
+
 	response.Success(c, gin.H{"message": "Journal entry cancelled successfully"})
+}
+
+// GetJournalEntryAuditLogs returns audit logs for a journal entry
+func (h *Handler) GetJournalEntryAuditLogs(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid journal entry ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT al.id, al.action, al.old_values, al.new_values, al.created_at,
+		       COALESCE(u.first_name || ' ' || u.last_name, 'System') as user_name
+		FROM audit_logs al
+		LEFT JOIN users u ON al.user_id = u.id
+		WHERE al.tenant_id = $1 AND al.entity_type = 'journal_entry' AND al.entity_id = $2
+		ORDER BY al.created_at DESC
+	`, tenantID, id)
+	if err != nil {
+		h.log.Error("Failed to get audit logs", "error", err)
+		response.InternalError(c, "Failed to get audit logs")
+		return
+	}
+	defer rows.Close()
+
+	type AuditLog struct {
+		ID        uuid.UUID       `json:"id"`
+		Action    string          `json:"action"`
+		OldValues json.RawMessage `json:"old_values"`
+		NewValues json.RawMessage `json:"new_values"`
+		CreatedAt time.Time       `json:"created_at"`
+		UserName  string          `json:"user_name"`
+	}
+
+	logs := make([]AuditLog, 0)
+	for rows.Next() {
+		var log AuditLog
+		if err := rows.Scan(&log.ID, &log.Action, &log.OldValues, &log.NewValues, &log.CreatedAt, &log.UserName); err != nil {
+			continue
+		}
+		logs = append(logs, log)
+	}
+
+	response.Success(c, logs)
 }
 
 // =====================================================
