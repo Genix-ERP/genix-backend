@@ -1621,12 +1621,18 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		WHERE tenant_id = $1 AND type = 'delivery' AND is_active = true
 	`
 	opTypeArgs := []interface{}{tenantID}
-	if warehouseUUID != nil {
-		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
-		opTypeArgs = append(opTypeArgs, *warehouseUUID)
-	} else {
-		opTypeQuery += " ORDER BY sequence LIMIT 1"
+	argIdx := 1
+	if organizationID != nil {
+		argIdx++
+		opTypeQuery += fmt.Sprintf(" AND organization_id = $%d", argIdx)
+		opTypeArgs = append(opTypeArgs, *organizationID)
 	}
+	if warehouseUUID != nil {
+		argIdx++
+		opTypeQuery += fmt.Sprintf(" AND warehouse_id = $%d", argIdx)
+		opTypeArgs = append(opTypeArgs, *warehouseUUID)
+	}
+	opTypeQuery += " ORDER BY sequence LIMIT 1"
 
 	opTypeErr := h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&deliveryOpTypeID, &deliverySrcLocID, &deliveryDestLocID)
 	if opTypeErr != nil {
