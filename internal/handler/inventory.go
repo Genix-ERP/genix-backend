@@ -49,8 +49,8 @@ func (h *Handler) ListInventory(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
-		limit = 20
+	if limit < 1 || limit > 10000 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -1053,8 +1053,8 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
-		limit = 20
+	if limit < 1 || limit > 10000 {
+		limit = 1000
 	}
 	offset := (page - 1) * limit
 
@@ -5622,9 +5622,17 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 	}
 
 	if direction != "" {
-		argN++
-		query += fmt.Sprintf(" AND so.direction = $%d", argN)
-		args = append(args, direction)
+		if direction == "delivery" {
+			// Include pick/pack (internal) operations that belong to the delivery chain
+			argN++
+			query += fmt.Sprintf(` AND (so.direction = $%d OR (so.direction = 'internal' AND so.source_type = 'sales_order'
+				AND EXISTS (SELECT 1 FROM warehouse_operation_types wt WHERE wt.id = so.operation_type_id AND wt.type IN ('pick','pack'))))`, argN)
+			args = append(args, direction)
+		} else {
+			argN++
+			query += fmt.Sprintf(" AND so.direction = $%d", argN)
+			args = append(args, direction)
+		}
 	}
 	if state != "" {
 		argN++
@@ -6518,6 +6526,27 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 				// Try to complete receipt stock op + inventory if it exists
 				h.completeLinkedReceiptOp(tenantID, *linkedPOID, now)
 				h.log.Info("Intercompany: SO delivery done, updated linked PO", "so_id", *op.SourceID, "po_id", *linkedPOID)
+			}
+		}
+
+		// Chain: when a pick/pack/delivery op for a SO completes, activate the next waiting operation in the chain
+		if op.SourceType != nil && *op.SourceType == "sales_order" && op.SourceID != nil && *op.SourceID != uuid.Nil {
+			// Find the next waiting operation for this SO (ordered by operation type sequence)
+			var nextOpID uuid.UUID
+			err := h.db.QueryRow(`
+				SELECT so2.id FROM stock_operations so2
+				JOIN warehouse_operation_types wot ON so2.operation_type_id = wot.id
+				WHERE so2.source_type = 'sales_order' AND so2.source_id = $1
+				  AND so2.tenant_id = $2 AND so2.state = 'waiting'
+				  AND so2.deleted_at IS NULL
+				ORDER BY wot.sequence ASC LIMIT 1
+			`, *op.SourceID, tenantID).Scan(&nextOpID)
+			if err == nil && nextOpID != uuid.Nil {
+				h.db.Exec(`
+					UPDATE stock_operations SET state = 'draft', updated_at = $1
+					WHERE id = $2 AND tenant_id = $3
+				`, now, nextOpID, tenantID)
+				h.log.Info("Delivery chain: activated next operation", "completed_op", id, "next_op", nextOpID, "so_id", *op.SourceID)
 			}
 		}
 
