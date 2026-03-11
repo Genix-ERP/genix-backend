@@ -5389,6 +5389,16 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 		return
 	}
 
+	// Verify at least one line has been counted
+	var uncountedLines int
+	h.db.QueryRow("SELECT COUNT(*) FROM stock_count_lines WHERE stock_count_id = $1 AND counted_quantity IS NULL", countID).Scan(&uncountedLines)
+	var totalLines int
+	h.db.QueryRow("SELECT COUNT(*) FROM stock_count_lines WHERE stock_count_id = $1", countID).Scan(&totalLines)
+	if totalLines > 0 && uncountedLines == totalLines {
+		response.BadRequest(c, "All lines must be counted before completing")
+		return
+	}
+
 	// Get lines with variance
 	type varianceLine struct {
 		ProductID  uuid.UUID
@@ -5435,14 +5445,22 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 
 		if err == sql.ErrNoRows {
 			inventoryID = uuid.New()
-			h.db.Exec(`
+			_, insErr := h.db.Exec(`
 				INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
 				VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8)
 			`, inventoryID, tenantID, orgIDPtr, line.ProductID, warehouseID, line.Variance, line.UnitCost, now)
+			if insErr != nil {
+				h.log.Error("Failed to insert inventory record for stock count adjustment", "error", insErr, "product_id", line.ProductID)
+			}
 		} else if err == nil {
-			h.db.Exec(`
+			_, updErr := h.db.Exec(`
 				UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
 			`, line.Variance, now, inventoryID)
+			if updErr != nil {
+				h.log.Error("Failed to update inventory for stock count adjustment", "error", updErr, "inventory_id", inventoryID, "variance", line.Variance)
+			}
+		} else {
+			h.log.Error("Failed to find inventory record for stock count adjustment", "error", err, "product_id", line.ProductID)
 		}
 
 		// Create inventory transaction
@@ -5584,9 +5602,11 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 		       so.source_document, so.note, so.write_off_reason,
 		       so.operation_type_id, wot.name as operation_type_name,
 		       so.partner_id, COALESCE(c.name, cp.name) as partner_name,
+		       COALESCE(w.name, '') as warehouse_name,
 		       so.created_at, so.updated_at
 		FROM stock_operations so
 		LEFT JOIN warehouse_operation_types wot ON so.operation_type_id = wot.id
+		LEFT JOIN warehouses w ON wot.warehouse_id = w.id
 		LEFT JOIN contacts c ON so.partner_id = c.id
 		LEFT JOIN construction_material_requests cmr ON so.source_type = 'material_request' AND cmr.request_number = so.source_document
 		LEFT JOIN construction_projects cp ON cp.id = cmr.project_id
@@ -5635,7 +5655,7 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 		var op entity.StockOperation
 		var scheduledDate sql.NullTime
 		var partnerIDNull, opTypeIDNull sql.NullString
-		var partnerName, opTypeName, sourceDoc, note, writeOffReason sql.NullString
+		var partnerName, opTypeName, sourceDoc, note, writeOffReason, whName sql.NullString
 
 		err := rows.Scan(
 			&op.ID, &op.Name, &op.Direction, &op.Date, &scheduledDate,
@@ -5643,6 +5663,7 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 			&sourceDoc, &note, &writeOffReason,
 			&opTypeIDNull, &opTypeName,
 			&partnerIDNull, &partnerName,
+			&whName,
 			&op.CreatedAt, &op.UpdatedAt,
 		)
 		if err != nil {
@@ -5654,6 +5675,9 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 		}
 		if partnerName.Valid {
 			op.PartnerName = partnerName.String
+		}
+		if whName.Valid {
+			op.WarehouseName = whName.String
 		}
 		if sourceDoc.Valid {
 			op.SourceDocument = sourceDoc.String
@@ -5688,6 +5712,7 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 	var scheduledDate sql.NullTime
 	var partnerName, sourceDoc, note, writeOffReason, opTypeName sql.NullString
 
+	var warehouseName sql.NullString
 	err = h.db.QueryRow(`
 		SELECT so.id, so.name, so.direction, so.date, so.scheduled_date,
 		       so.state, so.current_step, so.total_steps, so.priority,
@@ -5695,9 +5720,11 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 		       so.operation_type_id, wot.name,
 		       so.partner_id,
 		       COALESCE(c.name, cp.name) as partner_name,
+		       COALESCE(w.name, '') as warehouse_name,
 		       so.created_at, so.updated_at
 		FROM stock_operations so
 		LEFT JOIN warehouse_operation_types wot ON so.operation_type_id = wot.id
+		LEFT JOIN warehouses w ON wot.warehouse_id = w.id
 		LEFT JOIN contacts c ON so.partner_id = c.id
 		LEFT JOIN construction_material_requests cmr ON so.source_type = 'material_request' AND cmr.request_number = so.source_document
 		LEFT JOIN construction_projects cp ON cp.id = cmr.project_id
@@ -5709,6 +5736,7 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 		&op.OperationTypeID, &opTypeName,
 		&op.PartnerID,
 		&partnerName,
+		&warehouseName,
 		&op.CreatedAt, &op.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -5725,6 +5753,9 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 	}
 	if partnerName.Valid {
 		op.PartnerName = partnerName.String
+	}
+	if warehouseName.Valid {
+		op.WarehouseName = warehouseName.String
 	}
 	if sourceDoc.Valid {
 		op.SourceDocument = sourceDoc.String
