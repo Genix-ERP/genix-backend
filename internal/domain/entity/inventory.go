@@ -373,6 +373,7 @@ type StockOperation struct {
 	SourceDocument  string     `json:"source_document,omitempty"`
 	SourceLocationID *uuid.UUID `json:"source_location_id,omitempty"`
 	DestLocationID  *uuid.UUID `json:"dest_location_id,omitempty"`
+	WarehouseName   string     `json:"warehouse_name,omitempty"`
 	State           string     `json:"state"` // draft, in_progress, waiting, done, cancelled
 	CurrentStep     int        `json:"current_step"`
 	TotalSteps      int        `json:"total_steps"`
