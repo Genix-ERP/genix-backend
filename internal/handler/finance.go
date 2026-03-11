@@ -8816,7 +8816,7 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		       bl.budgeted_amount,
 		       COALESCE((
 		           SELECT CASE
-		               WHEN b.budget_type = 'revenue' THEN SUM(jel.credit_amount) - SUM(jel.debit_amount)
+		               WHEN COALESCE(bl.line_type, b.budget_type) = 'revenue' THEN SUM(jel.credit_amount) - SUM(jel.debit_amount)
 		               ELSE SUM(jel.debit_amount) - SUM(jel.credit_amount)
 		           END
 		           FROM journal_entry_lines jel
@@ -8828,7 +8828,8 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		             AND je.entry_date >= COALESCE(b.start_date, fy.start_date)
 		             AND je.entry_date <= COALESCE(b.end_date, fy.end_date)
 		       ), 0) as computed_actual,
-		       bl.notes, bl.created_at, bl.updated_at
+		       bl.notes, COALESCE(bl.line_type, 'expense') as line_type, COALESCE(bl.category_name, '') as category_name,
+		       bl.created_at, bl.updated_at
 		FROM budget_lines bl
 		JOIN budgets b ON bl.budget_id = b.id
 		LEFT JOIN accounts a ON bl.account_id = a.id
@@ -8857,12 +8858,14 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		var line entity.BudgetLine
 		var fiscalPeriodID, deptID, notes sql.NullString
 		var computedActual float64
+		var categoryName string
 
 		err := rows.Scan(
 			&line.ID, &line.BudgetID, &line.AccountID, &line.AccountName, &line.AccountCode,
 			&fiscalPeriodID, &deptID,
 			&line.BudgetedAmount, &computedActual,
-			&notes, &line.CreatedAt, &line.UpdatedAt,
+			&notes, &line.LineType, &categoryName,
+			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan budget line", "error", err)
@@ -8872,6 +8875,9 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		// Use computed actual from journal entries
 		line.ActualAmount = computedActual
 		line.Variance = line.BudgetedAmount - line.ActualAmount
+		if categoryName != "" {
+			line.CategoryName = &categoryName
+		}
 
 		if fiscalPeriodID.Valid {
 			fpid, _ := uuid.Parse(fiscalPeriodID.String)
