@@ -387,7 +387,7 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 	}
 
 	// Create default operation types for the warehouse based on steps
-	h.createDefaultOperationTypes(tenantID, id, input.Code, receptionSteps, deliverySteps)
+	h.createDefaultOperationTypes(tenantID, id, input.Code, receptionSteps, deliverySteps, orgIDPtr)
 
 	resp := &entity.Warehouse{
 		ID:             id,
@@ -684,20 +684,21 @@ func (h *Handler) UpdateWarehouse(c *gin.Context) {
 
 	// If steps changed, recreate operation types
 	if input.ReceptionSteps != nil || input.DeliverySteps != nil {
-		// Get current warehouse code and steps
+		// Get current warehouse code, steps and org
 		var whCode string
 		var recSteps, delSteps int
+		var whOrgID *uuid.UUID
 		h.db.QueryRow(
-			"SELECT code, reception_steps, delivery_steps FROM warehouses WHERE id = $1 AND tenant_id = $2",
+			"SELECT code, reception_steps, delivery_steps, organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2",
 			id, tenantID,
-		).Scan(&whCode, &recSteps, &delSteps)
+		).Scan(&whCode, &recSteps, &delSteps, &whOrgID)
 
 		// Soft-delete old auto-generated operation types and recreate
 		h.db.Exec(
 			"DELETE FROM warehouse_operation_types WHERE warehouse_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
 			id, tenantID,
 		)
-		h.createDefaultOperationTypes(tenantID, id, whCode, recSteps, delSteps)
+		h.createDefaultOperationTypes(tenantID, id, whCode, recSteps, delSteps, whOrgID)
 	}
 
 	// Return updated warehouse
@@ -2036,7 +2037,7 @@ func (h *Handler) DeleteOperationType(c *gin.Context) {
 }
 
 // createDefaultOperationTypes creates default operation types for a warehouse based on reception/delivery steps (like Odoo)
-func (h *Handler) createDefaultOperationTypes(tenantID, warehouseID uuid.UUID, warehouseCode string, receptionSteps, deliverySteps int) error {
+func (h *Handler) createDefaultOperationTypes(tenantID, warehouseID uuid.UUID, warehouseCode string, receptionSteps, deliverySteps int, orgID ...*uuid.UUID) error {
 	now := time.Now()
 
 	type opTypeDef struct {
@@ -2102,17 +2103,22 @@ func (h *Handler) createDefaultOperationTypes(tenantID, warehouseID uuid.UUID, w
 	// PoS Orders (always present)
 	defaults = append(defaults, opTypeDef{warehouseCode + "/POS", "Savdo nuqtasi", "outgoing", "pos", seq, "#a855f7"})
 
+	var orgIDPtr *uuid.UUID
+	if len(orgID) > 0 && orgID[0] != nil {
+		orgIDPtr = orgID[0]
+	}
+
 	for _, d := range defaults {
 		id := uuid.New()
 		_, err := h.db.Exec(`
 			INSERT INTO warehouse_operation_types (
-				id, tenant_id, warehouse_id, code, name, operation_type, type, sequence, color,
+				id, tenant_id, organization_id, warehouse_id, code, name, operation_type, type, sequence, color,
 				show_operations, show_reserved, barcode_enabled, create_backorder,
 				reservation_method, is_active, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 			ON CONFLICT (warehouse_id, code) DO NOTHING
 		`,
-			id, tenantID, warehouseID, d.code, d.name, d.operationType, d.opType, d.sequence, d.color,
+			id, tenantID, orgIDPtr, warehouseID, d.code, d.name, d.operationType, d.opType, d.sequence, d.color,
 			true, true, true, true,
 			"at_confirm", true, now, now,
 		)
