@@ -374,10 +374,12 @@ func (h *Handler) ListProductVariants(c *gin.Context) {
 	`
 	args := []interface{}{tenantID}
 
-	// Filter by organization via products table
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		args = append(args, orgID)
-		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", len(args))
+	// Filter by organization via products table (skip when filtering by specific product)
+	if productID == "" {
+		if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+			args = append(args, orgID)
+			baseQuery += fmt.Sprintf(" AND p.origin_organization_id = $%d", len(args))
+		}
 	}
 
 	if productID != "" {

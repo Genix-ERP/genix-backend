@@ -6055,14 +6055,16 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		CurrentStep int
 		TotalSteps  int
 		State       string
+		Direction   string
 		OpTypeID    uuid.UUID
+		OrgID       *uuid.UUID
 		SourceType  *string
 		SourceID    *uuid.UUID
 	}
 	err = h.db.QueryRow(`
-		SELECT current_step, total_steps, state, operation_type_id, source_type, source_id
+		SELECT current_step, total_steps, state, direction, operation_type_id, organization_id, source_type, source_id
 		FROM stock_operations WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&op.CurrentStep, &op.TotalSteps, &op.State, &op.OpTypeID, &op.SourceType, &op.SourceID)
+	`, id, tenantID).Scan(&op.CurrentStep, &op.TotalSteps, &op.State, &op.Direction, &op.OpTypeID, &op.OrgID, &op.SourceType, &op.SourceID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Stock operation")
 		return
@@ -6083,16 +6085,15 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 	// Pre-validate stock availability for delivery operations on the final step
 	if isLastStep {
-		var direction string
 		var warehouseIDCheck uuid.UUID
 		h.db.QueryRow(`
-			SELECT wot.warehouse_id, so.direction
+			SELECT wot.warehouse_id
 			FROM warehouse_operation_types wot
 			JOIN stock_operations so ON so.operation_type_id = wot.id
 			WHERE so.id=$1 AND so.tenant_id=$2
-		`, id, tenantID).Scan(&warehouseIDCheck, &direction)
+		`, id, tenantID).Scan(&warehouseIDCheck)
 
-		if (direction == "delivery" || direction == "write_off") && warehouseIDCheck != uuid.Nil {
+		if (op.Direction == "delivery" || op.Direction == "write_off") && warehouseIDCheck != uuid.Nil {
 			type insufficientItem struct {
 				ProductName string  `json:"product_name"`
 				Available   float64 `json:"available"`
@@ -6170,18 +6171,14 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 		// Create journal entry if auto_post_accounting is enabled
 		var autoPost bool
-		var direction string
 		var cfgJournalID, cfgDebitAcct, cfgCreditAcct *uuid.UUID
-		var opOrgID *uuid.UUID
 		h.db.QueryRow(`
-			SELECT wot.auto_post_accounting, wot.journal_id, wot.debit_account_id, wot.credit_account_id,
-			       so.direction, so.organization_id
+			SELECT wot.auto_post_accounting, wot.journal_id, wot.debit_account_id, wot.credit_account_id
 			FROM warehouse_operation_types wot
-			JOIN stock_operations so ON so.operation_type_id = wot.id
-			WHERE so.id=$1 AND so.tenant_id=$2
-		`, id, tenantID).Scan(&autoPost, &cfgJournalID, &cfgDebitAcct, &cfgCreditAcct, &direction, &opOrgID)
+			WHERE wot.id = $1 AND wot.tenant_id = $2
+		`, op.OpTypeID, tenantID).Scan(&autoPost, &cfgJournalID, &cfgDebitAcct, &cfgCreditAcct)
 
-		if autoPost && direction != "internal" {
+		if autoPost && op.Direction != "internal" {
 			// Calculate total value from operation lines
 			var totalValue float64
 			h.db.QueryRow(`
@@ -6213,36 +6210,36 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 					// Fallback: auto-detect accounts by direction
 					if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
-						switch direction {
+						switch op.Direction {
 						case "receipt":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, opOrgID, "inventory", "1300")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, opOrgID, "accounts payable", "2100")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "2100")
 								if creditAcct == uuid.Nil {
-									creditAcct = findAccount(h.db, tenantID, opOrgID, "vendor", "2100")
+									creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "2100")
 								}
 							}
 						case "delivery":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, opOrgID, "cost of goods", "5100")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "5100")
 								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, opOrgID, "cogs", "5100")
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "5100")
 								}
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, opOrgID, "inventory", "1300")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
 							}
 						case "write_off":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, opOrgID, "scrap", "6920")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "6920")
 								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, opOrgID, "inventory loss", "6910")
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "6910")
 								}
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, opOrgID, "inventory", "1300")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
 							}
 						}
 					}
@@ -6250,7 +6247,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					if debitAcct != uuid.Nil && creditAcct != uuid.Nil {
 						entryID := uuid.New()
 						prefixMap := map[string]string{"receipt": "REC", "delivery": "DEL", "write_off": "WO"}
-						prefix := prefixMap[direction]
+						prefix := prefixMap[op.Direction]
 						if prefix == "" {
 							prefix = "STK"
 						}
@@ -6266,7 +6263,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 								description, source_type, source_id, status, total_debit, total_credit,
 								created_by, created_at, updated_at
 							) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_operation', $8, 'posted', $9, $9, $10, $11, $11)
-						`, entryID, tenantID, opOrgID, journalID, entryNumber, now,
+						`, entryID, tenantID, op.OrgID, journalID, entryNumber, now,
 							description, id.String(), totalValue, userID, now)
 
 						h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
@@ -6281,7 +6278,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 						// TT 12.3: Write-offs affect budget — update budget_lines.actual_amount
 						// for the debit account (expense account) if tracked in an active budget
-						if direction == "write_off" && totalValue > 0 {
+						if op.Direction == "write_off" && totalValue > 0 {
 							h.db.Exec(`
 								UPDATE budget_lines bl
 								SET actual_amount = actual_amount + $1, updated_at = NOW()
@@ -6313,12 +6310,25 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		}
 
 		var warehouseID uuid.UUID
-		h.db.QueryRow(`
+		whErr := h.db.QueryRow(`
 			SELECT wot.warehouse_id FROM warehouse_operation_types wot
 			WHERE wot.id = $1 AND wot.tenant_id = $2
 		`, op.OpTypeID, tenantID).Scan(&warehouseID)
 
-		if !skipInventory && warehouseID != uuid.Nil && (direction == "delivery" || direction == "receipt" || direction == "write_off") {
+		// Fallback: if op.OrgID is nil, get it from the warehouse
+		if op.OrgID == nil && warehouseID != uuid.Nil {
+			var whOrgID uuid.UUID
+			if err := h.db.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", warehouseID, tenantID).Scan(&whOrgID); err == nil && whOrgID != uuid.Nil {
+				op.OrgID = &whOrgID
+			}
+		}
+
+		h.log.Info("Stock op inventory check",
+			"op_id", id, "direction", op.Direction, "op_type_id", op.OpTypeID,
+			"warehouse_id", warehouseID, "warehouse_query_err", whErr,
+			"skip_inventory", skipInventory, "org_id", op.OrgID)
+
+		if !skipInventory && warehouseID != uuid.Nil && (op.Direction == "delivery" || op.Direction == "receipt" || op.Direction == "write_off") {
 			invLines, _ := h.db.Query(`
 				SELECT product_id, done_qty, COALESCE(unit_price, 0),
 				       COALESCE(lot_number, ''), expiry_date
@@ -6335,6 +6345,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					if scanErr := invLines.Scan(&prodID, &doneQty, &unitPrice, &lotNumber, &expiryDate); scanErr != nil {
 						continue
 					}
+					h.log.Info("Processing inventory line", "product_id", prodID, "done_qty", doneQty, "direction", op.Direction, "warehouse_id", warehouseID)
 
 					// Find or create inventory record
 					var invID uuid.UUID
@@ -6346,19 +6357,29 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 					if err == sql.ErrNoRows {
 						invID = uuid.New()
-						h.db.Exec(`
+						_, insErr := h.db.Exec(`
 							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
 							VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-						`, invID, tenantID, prodID, warehouseID, opOrgID, unitPrice, now)
+						`, invID, tenantID, prodID, warehouseID, op.OrgID, unitPrice, now)
+						if insErr != nil {
+							h.log.Error("Failed to create inventory record", "error", insErr, "product_id", prodID, "warehouse_id", warehouseID)
+							continue
+						}
 					} else if err != nil {
+						h.log.Error("Failed to query inventory", "error", err, "product_id", prodID)
 						continue
 					}
+					// Backfill organization_id if missing
+					if op.OrgID != nil {
+						h.db.Exec("UPDATE inventory SET organization_id = $1 WHERE id = $2 AND organization_id IS NULL", *op.OrgID, invID)
+					}
 
-					if direction == "receipt" {
+					if op.Direction == "receipt" {
 						// Receipt: increase inventory
-						h.db.Exec(`
+						_, updErr := h.db.Exec(`
 							UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
 						`, doneQty, now, invID)
+						h.log.Info("Inventory receipt update", "inv_id", invID, "product_id", prodID, "done_qty", doneQty, "error", updErr)
 
 						// Auto-create inventory lot record for receipt operations
 						if lotNumber == "" {
@@ -6396,11 +6417,11 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					txType := "issue"
 					txNotes := "Yetkazib berish"
 					var fromWH, toWH *uuid.UUID
-					if direction == "receipt" {
+					if op.Direction == "receipt" {
 						txType = "receipt"
 						txNotes = "Qabul qilish"
 						toWH = &warehouseID
-					} else if direction == "write_off" {
+					} else if op.Direction == "write_off" {
 						txType = "adjustment"
 						txNotes = "Hisobdan chiqarish"
 						fromWH = &warehouseID
@@ -6408,7 +6429,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						fromWH = &warehouseID
 					}
 					txQty := doneQty
-					if direction != "receipt" {
+					if op.Direction != "receipt" {
 						txQty = -doneQty
 					}
 					h.db.Exec(`
@@ -6417,7 +6438,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 							unit_cost, total_cost, from_warehouse_id, to_warehouse_id,
 							reference_type, reference_id, notes, transaction_date, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'stock_operation', $11, $12, $13, $13)
-					`, uuid.New(), tenantID, opOrgID, invID, txType, txQty, unitPrice, math.Abs(txQty)*unitPrice, fromWH, toWH, id.String(), txNotes, now)
+					`, uuid.New(), tenantID, op.OrgID, invID, txType, txQty, unitPrice, math.Abs(txQty)*unitPrice, fromWH, toWH, id.String(), txNotes, now)
 				}
 			}
 		}
@@ -6655,13 +6676,14 @@ func (h *Handler) completeLinkedDeliveryOp(tenantID uuid.UUID, salesOrderID uuid
 					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
 				`, doneQty, now, invID)
 
-				// Create inventory movement record
+				// Create inventory transaction record
 				h.db.Exec(`
-					INSERT INTO inventory_movements (
-						id, tenant_id, product_id, warehouse_id, movement_type, quantity,
-						reference_type, reference_id, notes, created_at
-					) VALUES ($1, $2, $3, $4, 'issue', $5, 'stock_operation', $6, 'Intercompany delivery', $7)
-				`, uuid.New(), tenantID, prodID, warehouseID, -doneQty, opID, now)
+					INSERT INTO inventory_transactions (
+						id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
+						unit_cost, total_cost, from_warehouse_id,
+						reference_type, reference_id, notes, transaction_date, created_at
+					) VALUES ($1, $2, $3, $4, 'issue', $5, $6, $7, $8, 'stock_operation', $9, 'Intercompany delivery', $10, $10)
+				`, uuid.New(), tenantID, orgID, invID, -doneQty, unitPrice, math.Abs(doneQty)*unitPrice, warehouseID, opID.String(), now)
 			}
 		}
 	}
@@ -6705,14 +6727,34 @@ func (h *Handler) createReceiptStockOpForPO(tenantID uuid.UUID, purchaseOrderID 
 		WHERE tenant_id = $1 AND type = 'receipt' AND is_active = true
 	`
 	opTypeArgs := []interface{}{tenantID}
-	if warehouseID != nil {
-		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
-		opTypeArgs = append(opTypeArgs, *warehouseID)
-	} else {
-		opTypeQuery += " ORDER BY sequence LIMIT 1"
+	argIdx := 1
+	if poOrgID != nil {
+		argIdx++
+		opTypeQuery += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argIdx)
+		opTypeArgs = append(opTypeArgs, *poOrgID)
 	}
+	if warehouseID != nil {
+		argIdx++
+		opTypeQuery += fmt.Sprintf(" AND warehouse_id = $%d", argIdx)
+		opTypeArgs = append(opTypeArgs, *warehouseID)
+	}
+	opTypeQuery += " ORDER BY organization_id IS NULL, sequence LIMIT 1"
 	if err := h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&opTypeID, &srcLocID, &destLocID); err != nil {
-		return uuid.Nil, uuid.Nil, nil
+		// Fallback: try without warehouse filter (warehouse on PO may not match any op type)
+		if warehouseID != nil && poOrgID != nil {
+			fallbackQuery := `
+				SELECT id, default_location_src_id, default_location_dest_id
+				FROM warehouse_operation_types
+				WHERE tenant_id = $1 AND type = 'receipt' AND is_active = true
+				  AND (organization_id = $2 OR organization_id IS NULL)
+				ORDER BY organization_id IS NULL, sequence LIMIT 1
+			`
+			if err2 := h.db.QueryRow(fallbackQuery, tenantID, *poOrgID).Scan(&opTypeID, &srcLocID, &destLocID); err2 != nil {
+				return uuid.Nil, uuid.Nil, nil
+			}
+		} else {
+			return uuid.Nil, uuid.Nil, nil
+		}
 	}
 
 	opID := uuid.New()
@@ -6866,13 +6908,14 @@ func (h *Handler) completeLinkedReceiptOp(tenantID uuid.UUID, purchaseOrderID uu
 					UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, unit_cost = $4, last_movement_date = $2, updated_at = $2 WHERE id = $3
 				`, doneQty, now, invID, unitPrice)
 
-				// Create inventory movement record
+				// Create inventory transaction record
 				h.db.Exec(`
-					INSERT INTO inventory_movements (
-						id, tenant_id, product_id, warehouse_id, movement_type, quantity,
-						reference_type, reference_id, notes, created_at
-					) VALUES ($1, $2, $3, $4, 'receipt', $5, 'stock_operation', $6, 'Intercompany receipt', $7)
-				`, uuid.New(), tenantID, prodID, warehouseID, doneQty, opID, now)
+					INSERT INTO inventory_transactions (
+						id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
+						unit_cost, total_cost, to_warehouse_id,
+						reference_type, reference_id, notes, transaction_date, created_at
+					) VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, $8, 'stock_operation', $9, 'Intercompany receipt', $10, $10)
+				`, uuid.New(), tenantID, orgID, invID, doneQty, unitPrice, doneQty*unitPrice, warehouseID, opID.String(), now)
 			}
 		}
 	}
