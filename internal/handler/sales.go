@@ -1611,101 +1611,9 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		}
 	}
 
-	// Auto-create stock operation (delivery) — TT 12.3: SO → delivery via stock_operations
-	var deliveryOpTypeID uuid.UUID
-	var deliverySrcLocID, deliveryDestLocID *uuid.UUID
-
-	opTypeQuery := `
-		SELECT id, default_location_src_id, default_location_dest_id
-		FROM warehouse_operation_types
-		WHERE tenant_id = $1 AND type = 'delivery' AND is_active = true
-	`
-	opTypeArgs := []interface{}{tenantID}
-	if warehouseUUID != nil {
-		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
-		opTypeArgs = append(opTypeArgs, *warehouseUUID)
-	} else {
-		opTypeQuery += " ORDER BY sequence LIMIT 1"
-	}
-
-	opTypeErr := h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&deliveryOpTypeID, &deliverySrcLocID, &deliveryDestLocID)
-	if opTypeErr != nil {
-		h.log.Warn("No delivery operation type found for SO stock operation", "error", opTypeErr, "tenant_id", tenantID)
-	} else {
-		stockOpID := uuid.New()
-		stockOpName := h.nextStockOperationName(tenantID, "delivery")
-
-		var totalSteps int
-		h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2",
-			deliveryOpTypeID, tenantID).Scan(&totalSteps)
-		if totalSteps == 0 {
-			totalSteps = 1
-		}
-
-		_, stockOpErr := h.db.Exec(`
-			INSERT INTO stock_operations (
-				id, tenant_id, organization_id, name, operation_type_id, direction,
-				date, scheduled_date, partner_id, source_document,
-				source_location_id, dest_location_id,
-				state, current_step, total_steps, priority,
-				source_type, source_id,
-				responsible_id, created_by, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,'delivery',$6,$7,$8,$9,$10,$11,'draft',1,$12,'normal','sales_order',$15,$13,$13,$14,$14)
-		`,
-			stockOpID, tenantID, organizationID, stockOpName, deliveryOpTypeID,
-			now, expectedDate, customerID, orderNumber,
-			deliverySrcLocID, deliveryDestLocID,
-			totalSteps, userID, now, orderID,
-		)
-		if stockOpErr != nil {
-			h.log.Error("Failed to create stock operation for SO delivery", "error", stockOpErr, "so_id", orderID)
-		} else {
-			// Create stock operation lines from SO lines
-			soLineRows, soLineErr := h.db.Query(`
-				SELECT sol.product_id, sol.quantity, sol.unit_price,
-				       COALESCE(u.name, 'unit') as uom
-				FROM sales_order_lines sol
-				LEFT JOIN units_of_measure u ON u.id = sol.unit_id
-				WHERE sol.sales_order_id = $1 AND sol.product_id IS NOT NULL
-				  AND sol.quantity > COALESCE(sol.quantity_delivered, 0)
-			`, orderID)
-			if soLineErr == nil {
-				defer soLineRows.Close()
-				for soLineRows.Next() {
-					var productID uuid.UUID
-					var qty, unitPrice float64
-					var uom string
-					if scanErr := soLineRows.Scan(&productID, &qty, &unitPrice, &uom); scanErr != nil {
-						continue
-					}
-					h.db.Exec(`
-						INSERT INTO stock_operation_lines (
-							id, tenant_id, operation_id, product_id,
-							expected_qty, done_qty, uom, unit_price,
-							quality_status, created_at, updated_at
-						) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
-					`, tenantID, stockOpID, productID, qty, uom, unitPrice, now)
-				}
-			}
-
-			// Create initial step log entry if steps exist
-			var firstStep struct {
-				ID   uuid.UUID
-				Name string
-			}
-			if stepErr := h.db.QueryRow(`
-				SELECT id, name FROM operation_type_steps
-				WHERE operation_type_id = $1 AND tenant_id = $2
-				ORDER BY sequence LIMIT 1
-			`, deliveryOpTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name); stepErr == nil {
-				h.db.Exec(`
-					INSERT INTO stock_operation_step_log (
-						id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
-					) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
-				`, tenantID, stockOpID, firstStep.ID, firstStep.Name, now)
-			}
-		}
-	}
+	// Auto-create stock operations (delivery chain) — TT 12.3: SO → delivery via stock_operations
+	// For multi-step delivery: Pick → Pack → Ship (3-step) or Pick → Ship (2-step)
+	h.createDeliveryChainForSO(tenantID, orderID, organizationID, warehouseUUID, customerID, orderNumber, expectedDate, userID, now)
 
 	// Auto-create Production Orders for products with insufficient stock
 	h.autoCreateProductionOrders(tenantID, orderID, customerID, warehouseUUID, organizationID, userID, now)
@@ -1720,6 +1628,180 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	h.syncIntercompanySOConfirmToPO(tenantID, orderID, now)
 
 	h.GetSalesOrder(c)
+}
+
+// createDeliveryChainForSO creates stock operations for SO delivery.
+// For multi-step warehouses it creates the full chain: Pick → Pack → Ship.
+func (h *Handler) createDeliveryChainForSO(
+	tenantID, orderID uuid.UUID,
+	organizationID *uuid.UUID,
+	warehouseUUID *uuid.UUID,
+	customerID uuid.UUID,
+	orderNumber string,
+	expectedDate sql.NullTime,
+	userID uuid.UUID,
+	now time.Time,
+) {
+	// Determine delivery steps from warehouse config
+	deliverySteps := 1
+	if warehouseUUID != nil {
+		h.db.QueryRow("SELECT COALESCE(delivery_steps, 1) FROM warehouses WHERE id = $1 AND tenant_id = $2",
+			*warehouseUUID, tenantID).Scan(&deliverySteps)
+	}
+
+	// Collect SO lines once for reuse
+	type soLine struct {
+		ProductID uuid.UUID
+		Qty       float64
+		UnitPrice float64
+		UOM       string
+	}
+	var soLines []soLine
+	rows, err := h.db.Query(`
+		SELECT sol.product_id, sol.quantity, sol.unit_price, COALESCE(u.name, 'unit') as uom
+		FROM sales_order_lines sol
+		LEFT JOIN units_of_measure u ON u.id = sol.unit_id
+		WHERE sol.sales_order_id = $1 AND sol.product_id IS NOT NULL
+		  AND sol.quantity > COALESCE(sol.quantity_delivered, 0)
+	`, orderID)
+	if err != nil {
+		h.log.Error("Failed to fetch SO lines for delivery chain", "error", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var l soLine
+		if err := rows.Scan(&l.ProductID, &l.Qty, &l.UnitPrice, &l.UOM); err == nil {
+			soLines = append(soLines, l)
+		}
+	}
+	if len(soLines) == 0 {
+		return
+	}
+
+	// Helper: find operation type by warehouse + type code
+	findOpType := func(typeCode string) (uuid.UUID, *uuid.UUID, *uuid.UUID) {
+		var id uuid.UUID
+		var srcLoc, destLoc *uuid.UUID
+		q := `SELECT id, default_location_src_id, default_location_dest_id
+		      FROM warehouse_operation_types
+		      WHERE tenant_id = $1 AND type = $2 AND is_active = true`
+		args := []interface{}{tenantID, typeCode}
+		if warehouseUUID != nil {
+			q += " AND warehouse_id = $3 ORDER BY sequence LIMIT 1"
+			args = append(args, *warehouseUUID)
+		} else {
+			q += " ORDER BY sequence LIMIT 1"
+		}
+		h.db.QueryRow(q, args...).Scan(&id, &srcLoc, &destLoc)
+		return id, srcLoc, destLoc
+	}
+
+	// Convert NullTime to *time.Time for SQL
+	var schedDate *time.Time
+	if expectedDate.Valid {
+		schedDate = &expectedDate.Time
+	}
+
+	// Helper: create a stock operation with its lines
+	createOp := func(opTypeID uuid.UUID, direction, initialState string, srcLoc, destLoc *uuid.UUID) uuid.UUID {
+		if opTypeID == uuid.Nil {
+			return uuid.Nil
+		}
+		var totalSteps int
+		h.db.QueryRow("SELECT COUNT(*) FROM operation_type_steps WHERE operation_type_id = $1 AND tenant_id = $2",
+			opTypeID, tenantID).Scan(&totalSteps)
+		if totalSteps == 0 {
+			totalSteps = 1
+		}
+
+		opID := uuid.New()
+		opName := h.nextStockOperationName(tenantID, direction)
+		_, opErr := h.db.Exec(`
+			INSERT INTO stock_operations (
+				id, tenant_id, organization_id, name, operation_type_id, direction,
+				date, scheduled_date, partner_id, source_document,
+				source_location_id, dest_location_id,
+				state, current_step, total_steps, priority,
+				source_type, source_id,
+				responsible_id, created_by, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,1,$14,'normal','sales_order',$17,$15,$15,$16,$16)
+		`,
+			opID, tenantID, organizationID, opName, opTypeID, direction,
+			now, schedDate, customerID, orderNumber,
+			srcLoc, destLoc,
+			initialState, totalSteps, userID, now, orderID,
+		)
+		if opErr != nil {
+			h.log.Error("Failed to create stock operation in delivery chain", "error", opErr, "direction", direction)
+			return uuid.Nil
+		}
+
+		// Create lines
+		for _, l := range soLines {
+			h.db.Exec(`
+				INSERT INTO stock_operation_lines (
+					id, tenant_id, operation_id, product_id,
+					expected_qty, done_qty, uom, unit_price,
+					quality_status, created_at, updated_at
+				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
+			`, tenantID, opID, l.ProductID, l.Qty, l.UOM, l.UnitPrice, now)
+		}
+
+		// Create initial step log
+		var firstStep struct {
+			ID   uuid.UUID
+			Name string
+		}
+		if stepErr := h.db.QueryRow(`
+			SELECT id, name FROM operation_type_steps
+			WHERE operation_type_id = $1 AND tenant_id = $2 ORDER BY sequence LIMIT 1
+		`, opTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name); stepErr == nil {
+			h.db.Exec(`
+				INSERT INTO stock_operation_step_log (
+					id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
+				) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
+			`, tenantID, opID, firstStep.ID, firstStep.Name, now)
+		}
+		return opID
+	}
+
+	// Build the chain based on delivery_steps
+	switch deliverySteps {
+	case 3:
+		// 3-step: Pick → Pack → Ship
+		pickTypeID, pickSrc, pickDest := findOpType("pick")
+		packTypeID, packSrc, packDest := findOpType("pack")
+		deliveryTypeID, delSrc, delDest := findOpType("delivery")
+
+		pickID := createOp(pickTypeID, "internal", "draft", pickSrc, pickDest)
+		packID := createOp(packTypeID, "internal", "waiting", packSrc, packDest)
+		deliveryID := createOp(deliveryTypeID, "delivery", "waiting", delSrc, delDest)
+
+		h.log.Info("Created 3-step delivery chain for SO",
+			"so_id", orderID, "pick", pickID, "pack", packID, "delivery", deliveryID)
+
+	case 2:
+		// 2-step: Pick → Ship
+		pickTypeID, pickSrc, pickDest := findOpType("pick")
+		deliveryTypeID, delSrc, delDest := findOpType("delivery")
+
+		pickID := createOp(pickTypeID, "internal", "draft", pickSrc, pickDest)
+		deliveryID := createOp(deliveryTypeID, "delivery", "waiting", delSrc, delDest)
+
+		h.log.Info("Created 2-step delivery chain for SO",
+			"so_id", orderID, "pick", pickID, "delivery", deliveryID)
+
+	default:
+		// 1-step: Direct delivery
+		deliveryTypeID, delSrc, delDest := findOpType("delivery")
+		if deliveryTypeID == uuid.Nil {
+			h.log.Warn("No delivery operation type found for SO", "tenant_id", tenantID)
+			return
+		}
+		deliveryID := createOp(deliveryTypeID, "delivery", "draft", delSrc, delDest)
+		h.log.Info("Created 1-step delivery for SO", "so_id", orderID, "delivery", deliveryID)
+	}
 }
 
 // syncIntercompanySOConfirmToPO handles the case where a vendor confirms an intercompany SO.
