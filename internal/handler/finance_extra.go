@@ -103,13 +103,28 @@ func (h *Handler) SyncCurrencyRates(c *gin.Context) {
 			continue
 		}
 
-		// Upsert exchange rate for today
+		// Get previous rate before updating
+		var previousRate sql.NullFloat64
+		h.db.QueryRow(`
+			SELECT rate FROM exchange_rates
+			WHERE tenant_id = $1 AND from_currency_id = $2 AND to_currency_id = $3
+			ORDER BY effective_date DESC LIMIT 1
+		`, tenantID, currencyID, baseCurrencyID).Scan(&previousRate)
+
+		var prevRate, rateChange, rateChangePct float64
+		if previousRate.Valid && previousRate.Float64 > 0 {
+			prevRate = previousRate.Float64
+			rateChange = rate - prevRate
+			rateChangePct = (rateChange / prevRate) * 100
+		}
+
+		// Upsert exchange rate for today with previous rate tracking
 		_, err = h.db.Exec(`
-			INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
-			VALUES ($1, $2, $3, $4, $5, $6, 'CBU')
+			INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source, previous_rate, rate_change, rate_change_percent)
+			VALUES ($1, $2, $3, $4, $5, $6, 'CBU', $7, $8, $9)
 			ON CONFLICT (tenant_id, from_currency_id, to_currency_id, effective_date)
-			DO UPDATE SET rate = $5, source = 'CBU'
-		`, uuid.New(), tenantID, currencyID, baseCurrencyID, rate, today)
+			DO UPDATE SET rate = $5, source = 'CBU', previous_rate = $7, rate_change = $8, rate_change_percent = $9
+		`, uuid.New(), tenantID, currencyID, baseCurrencyID, rate, today, prevRate, rateChange, rateChangePct)
 		if err != nil {
 			h.log.Error("Failed to upsert rate", "currency", cbuRate.Code, "error", err)
 			continue
@@ -261,13 +276,18 @@ func (h *Handler) syncCBURatesForAllTenants() {
 			synced++
 		}
 
-		// ONE INSERT for all exchange rates
+		// ONE INSERT for all exchange rates with previous_rate tracking
 		if len(erValues) > 0 {
 			h.db.Exec(`
 				INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
 				VALUES `+strings.Join(erValues, ",")+`
 				ON CONFLICT (tenant_id, from_currency_id, to_currency_id, effective_date)
-				DO UPDATE SET rate = EXCLUDED.rate, source = 'CBU'
+				DO UPDATE SET
+					previous_rate = exchange_rates.rate,
+					rate_change = EXCLUDED.rate - exchange_rates.rate,
+					rate_change_percent = CASE WHEN exchange_rates.rate > 0 THEN ((EXCLUDED.rate - exchange_rates.rate) / exchange_rates.rate) * 100 ELSE 0 END,
+					rate = EXCLUDED.rate,
+					source = 'CBU'
 			`, erArgs...)
 		}
 		totalSynced += synced
