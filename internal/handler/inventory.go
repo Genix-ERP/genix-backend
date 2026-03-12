@@ -5720,7 +5720,7 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 	var scheduledDate sql.NullTime
 	var partnerName, sourceDoc, note, writeOffReason, opTypeName sql.NullString
 
-	var warehouseName sql.NullString
+	var warehouseName, carrierName, deliveryAddress, trackingNumber sql.NullString
 	err = h.db.QueryRow(`
 		SELECT so.id, so.name, so.direction, so.date, so.scheduled_date,
 		       so.state, so.current_step, so.total_steps, so.priority,
@@ -5729,11 +5729,14 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 		       so.partner_id,
 		       COALESCE(c.name, cp.name) as partner_name,
 		       COALESCE(w.name, '') as warehouse_name,
+		       so.carrier_id, COALESCE(cr.name, '') as carrier_name,
+		       so.delivery_address, so.tracking_number,
 		       so.created_at, so.updated_at
 		FROM stock_operations so
 		LEFT JOIN warehouse_operation_types wot ON so.operation_type_id = wot.id
 		LEFT JOIN warehouses w ON wot.warehouse_id = w.id
 		LEFT JOIN contacts c ON so.partner_id = c.id
+		LEFT JOIN carriers cr ON so.carrier_id = cr.id
 		LEFT JOIN construction_material_requests cmr ON so.source_type = 'material_request' AND cmr.request_number = so.source_document
 		LEFT JOIN construction_projects cp ON cp.id = cmr.project_id
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL
@@ -5745,6 +5748,8 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 		&op.PartnerID,
 		&partnerName,
 		&warehouseName,
+		&op.CarrierID, &carrierName,
+		&deliveryAddress, &trackingNumber,
 		&op.CreatedAt, &op.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -5773,6 +5778,12 @@ func (h *Handler) GetStockOperation(c *gin.Context) {
 	}
 	if writeOffReason.Valid {
 		op.WriteOffReason = writeOffReason.String
+	}
+	if deliveryAddress.Valid {
+		op.DeliveryAddress = deliveryAddress.String
+	}
+	if trackingNumber.Valid {
+		op.TrackingNumber = trackingNumber.String
 	}
 
 	// Load lines
@@ -5957,19 +5968,29 @@ func (h *Handler) CreateStockOperation(c *gin.Context) {
 		writeOffReason = &input.WriteOffReason
 	}
 
+	var carrierID *uuid.UUID
+	if input.CarrierID != "" {
+		cid, err := uuid.Parse(input.CarrierID)
+		if err == nil {
+			carrierID = &cid
+		}
+	}
+
 	_, err = h.db.Exec(`
 		INSERT INTO stock_operations (
 			id, tenant_id, name, operation_type_id, direction,
 			date, partner_id, source_document,
 			state, current_step, total_steps, priority,
 			note, write_off_reason,
+			carrier_id, delivery_address, tracking_number,
 			created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'draft',1,$9,$10,$11,$12,$13,$13)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'draft',1,$9,$10,$11,$12,$13,$14,$15,$16,$16)
 	`,
 		id, tenantID, name, opTypeID, input.Direction,
 		now, partnerID, input.SourceDocument,
 		totalSteps, priority,
 		input.Note, writeOffReason,
+		carrierID, input.DeliveryAddress, input.TrackingNumber,
 		now,
 	)
 	if err != nil {
@@ -6048,6 +6069,12 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		response.BadRequest(c, "Invalid ID")
 		return
 	}
+
+	// Parse optional force flag for over-receipt confirmation
+	var advanceInput struct {
+		Force bool `json:"force"`
+	}
+	c.ShouldBindJSON(&advanceInput)
 
 	userID, _ := middleware.GetUserID(c)
 
@@ -6152,6 +6179,147 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		}
 	}
 
+	// Check quantity discrepancies on the last step (over-receipt / under-receipt warnings)
+	if isLastStep && (op.Direction == "receipt" || op.Direction == "internal") {
+		type discrepancyItem struct {
+			ProductName string  `json:"product_name"`
+			ExpectedQty float64 `json:"expected_qty"`
+			DoneQty     float64 `json:"done_qty"`
+			Difference  float64 `json:"difference"`
+		}
+		var overReceiptItems []discrepancyItem
+		var underReceiptItems []discrepancyItem
+
+		discLines, _ := h.db.Query(`
+			SELECT COALESCE(p.name, 'Unknown'), sol.expected_qty, sol.done_qty
+			FROM stock_operation_lines sol
+			LEFT JOIN products p ON p.id = sol.product_id AND p.tenant_id = sol.tenant_id
+			WHERE sol.operation_id = $1 AND sol.tenant_id = $2 AND sol.expected_qty > 0
+		`, id, tenantID)
+		if discLines != nil {
+			defer discLines.Close()
+			for discLines.Next() {
+				var productName string
+				var expectedQty, doneQty float64
+				if err := discLines.Scan(&productName, &expectedQty, &doneQty); err != nil {
+					continue
+				}
+				if doneQty > expectedQty {
+					overReceiptItems = append(overReceiptItems, discrepancyItem{
+						ProductName: productName,
+						ExpectedQty: expectedQty,
+						DoneQty:     doneQty,
+						Difference:  doneQty - expectedQty,
+					})
+				} else if doneQty < expectedQty {
+					underReceiptItems = append(underReceiptItems, discrepancyItem{
+						ProductName: productName,
+						ExpectedQty: expectedQty,
+						DoneQty:     doneQty,
+						Difference:  expectedQty - doneQty,
+					})
+				}
+			}
+		}
+
+		// Over-receipt requires explicit force confirmation
+		if len(overReceiptItems) > 0 && !advanceInput.Force {
+			c.JSON(422, gin.H{
+				"success":              false,
+				"message":              "Over-receipt detected. Confirm to proceed.",
+				"over_receipt_warning":  true,
+				"over_receipt_items":    overReceiptItems,
+				"under_receipt_items":   underReceiptItems,
+			})
+			return
+		}
+	}
+
+	// Check if step is timeout-blocked (GAP 3)
+	var timeoutBlocked bool
+	h.db.QueryRow(`
+		SELECT COALESCE(timeout_blocked, false)
+		FROM stock_operation_step_log
+		WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
+	`, id, op.CurrentStep, tenantID).Scan(&timeoutBlocked)
+	if timeoutBlocked {
+		c.JSON(403, gin.H{
+			"success": false,
+			"message": "Step timed out and is blocked. Manager override required.",
+		})
+		return
+	}
+
+	// Check step configuration for required documents and approval
+	var stepRequiresApproval bool
+	var stepApprovalRole string
+	var requiredDocsJSON []byte
+	h.db.QueryRow(`
+		SELECT COALESCE(requires_approval, false), COALESCE(approval_role, ''),
+		       COALESCE(required_documents, '[]'::jsonb)
+		FROM operation_type_steps
+		WHERE operation_type_id = $1 AND sequence = $2 AND tenant_id = $3
+	`, op.OpTypeID, op.CurrentStep, tenantID).Scan(&stepRequiresApproval, &stepApprovalRole, &requiredDocsJSON)
+
+	// Enforce required documents before allowing step completion
+	if len(requiredDocsJSON) > 0 && string(requiredDocsJSON) != "[]" && op.State != "awaiting_approval" {
+		var requiredDocs []string
+		if err := json.Unmarshal(requiredDocsJSON, &requiredDocs); err == nil && len(requiredDocs) > 0 {
+			var attachedDocsJSON []byte
+			h.db.QueryRow(`
+				SELECT COALESCE(documents, '[]'::jsonb)
+				FROM stock_operation_step_log
+				WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
+			`, id, op.CurrentStep, tenantID).Scan(&attachedDocsJSON)
+
+			var attachedDocs []map[string]interface{}
+			json.Unmarshal(attachedDocsJSON, &attachedDocs)
+
+			attachedTypes := make(map[string]bool)
+			for _, doc := range attachedDocs {
+				if t, ok := doc["type"].(string); ok {
+					attachedTypes[t] = true
+				}
+			}
+
+			var missingDocs []string
+			for _, req := range requiredDocs {
+				if !attachedTypes[req] {
+					missingDocs = append(missingDocs, req)
+				}
+			}
+			if len(missingDocs) > 0 {
+				c.JSON(422, gin.H{
+					"success":          false,
+					"message":          "Required documents are missing",
+					"missing_documents": missingDocs,
+				})
+				return
+			}
+		}
+	}
+
+	if stepRequiresApproval && op.State != "awaiting_approval" {
+		// Set step to awaiting_approval instead of completed
+		h.db.Exec(`
+			UPDATE stock_operation_step_log
+			SET state='awaiting_approval', completed_at=NULL, completed_by=NULL
+			WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
+		`, id, op.CurrentStep, tenantID)
+		h.db.Exec(`
+			UPDATE stock_operations
+			SET state='awaiting_approval', updated_at=$1
+			WHERE id=$2 AND tenant_id=$3
+		`, now, id, tenantID)
+		response.Success(c, gin.H{
+			"state":            "awaiting_approval",
+			"current_step":     op.CurrentStep,
+			"approval_required": true,
+			"approval_role":    stepApprovalRole,
+		})
+		return
+	}
+
 	// Mark current step as completed
 	h.db.Exec(`
 		UPDATE stock_operation_step_log
@@ -6161,6 +6329,62 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 	var newState string
 	if isLastStep {
+		// Write-off approval rules check (TT §5.3)
+		if op.Direction == "write_off" && op.State != "awaiting_approval" {
+			var approvalRule string
+			var amountThreshold, quantityThreshold *float64
+			h.db.QueryRow(`
+				SELECT COALESCE(approval_rule, 'never'),
+				       approval_amount_threshold, approval_quantity_threshold
+				FROM warehouse_operation_types
+				WHERE id = $1 AND tenant_id = $2
+			`, op.OpTypeID, tenantID).Scan(&approvalRule, &amountThreshold, &quantityThreshold)
+
+			needsApproval := false
+			switch approvalRule {
+			case "always":
+				needsApproval = true
+			case "by_amount":
+				if amountThreshold != nil {
+					var totalAmount float64
+					h.db.QueryRow(`
+						SELECT COALESCE(SUM(done_qty * COALESCE(unit_price, 0)), 0)
+						FROM stock_operation_lines WHERE operation_id=$1 AND tenant_id=$2
+					`, id, tenantID).Scan(&totalAmount)
+					needsApproval = totalAmount > *amountThreshold
+				}
+			case "by_quantity":
+				if quantityThreshold != nil {
+					var totalQty float64
+					h.db.QueryRow(`
+						SELECT COALESCE(SUM(done_qty), 0)
+						FROM stock_operation_lines WHERE operation_id=$1 AND tenant_id=$2
+					`, id, tenantID).Scan(&totalQty)
+					needsApproval = totalQty > *quantityThreshold
+				}
+			}
+
+			if needsApproval {
+				h.db.Exec(`
+					UPDATE stock_operation_step_log
+					SET state='awaiting_approval', completed_at=NULL
+					WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
+				`, id, op.CurrentStep, tenantID)
+				h.db.Exec(`
+					UPDATE stock_operations
+					SET state='awaiting_approval', updated_at=$1
+					WHERE id=$2 AND tenant_id=$3
+				`, now, id, tenantID)
+				response.Success(c, gin.H{
+					"state":            "awaiting_approval",
+					"current_step":     op.CurrentStep,
+					"approval_required": true,
+					"reason":           "write_off_threshold_exceeded",
+				})
+				return
+			}
+		}
+
 		// All steps done — mark operation as done
 		newState = "done"
 		h.db.Exec(`
@@ -6577,12 +6801,23 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			nextStepName = nextStepDef.Name
 		}
 
-		// Create next step log entry
+		// Check if next step has auto_proceed enabled
+		var nextStepAutoProced bool
+		h.db.QueryRow(`
+			SELECT COALESCE(auto_proceed, false) FROM operation_type_steps
+			WHERE operation_type_id=$1 AND tenant_id=$2 AND sequence=$3
+		`, op.OpTypeID, tenantID, nextStep).Scan(&nextStepAutoProced)
+
+		// Create next step log entry — auto-start if auto_proceed
+		nextStepState := "ready"
+		if nextStepAutoProced {
+			nextStepState = "in_progress"
+		}
 		h.db.Exec(`
 			INSERT INTO stock_operation_step_log (
-				id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
-			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$5,'ready',$6)
-		`, tenantID, id, nextStepDef.ID, nextStep, nextStepName, now)
+				id, tenant_id, operation_id, step_id, step_sequence, step_name, state, started_at, created_at
+			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$5,$6,$7,$7)
+		`, tenantID, id, nextStepDef.ID, nextStep, nextStepName, nextStepState, now)
 
 		h.db.Exec(`
 			UPDATE stock_operations
@@ -7161,6 +7396,153 @@ func (h *Handler) completeMaterialRequestFromStockOp(tenantID uuid.UUID, stockOp
 		`, tenantID, projectID, now.Format("2006-01-02"), totalExpense,
 			fmt.Sprintf("Material Request #%d delivered via stock operation", requestID))
 	}
+}
+
+// ApproveStockOperationStep approves a step that is awaiting approval, then advances the operation
+func (h *Handler) ApproveStockOperationStep(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	// Verify operation is in awaiting_approval state
+	var opState string
+	var currentStep int
+	err = h.db.QueryRow(`
+		SELECT state, current_step FROM stock_operations
+		WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&opState, &currentStep)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to query stock operation")
+		return
+	}
+	if opState != "awaiting_approval" {
+		response.BadRequest(c, "Operation is not awaiting approval")
+		return
+	}
+
+	// Mark step as approved
+	h.db.Exec(`
+		UPDATE stock_operation_step_log
+		SET approved_by=$1
+		WHERE operation_id=$2 AND step_sequence=$3 AND tenant_id=$4
+	`, userID, id, currentStep, tenantID)
+
+	// Now advance the operation — since state is 'awaiting_approval',
+	// the advance handler will skip the approval check and proceed to completion
+	h.AdvanceStockOperationStep(c)
+}
+
+// RejectStockOperationStep rejects a step that is awaiting approval
+func (h *Handler) RejectStockOperationStep(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil || input.Reason == "" {
+		response.BadRequest(c, "Rejection reason is required")
+		return
+	}
+
+	// Verify operation is in awaiting_approval state
+	var opState string
+	var currentStep int
+	err = h.db.QueryRow(`
+		SELECT state, current_step FROM stock_operations
+		WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&opState, &currentStep)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stock operation")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to query stock operation")
+		return
+	}
+	if opState != "awaiting_approval" {
+		response.BadRequest(c, "Operation is not awaiting approval")
+		return
+	}
+
+	now := time.Now()
+
+	// Set step_log to rejected with reason, then back to ready for re-work
+	h.db.Exec(`
+		UPDATE stock_operation_step_log
+		SET state='ready', rejection_reason=$1, approved_by=NULL, completed_by=$2
+		WHERE operation_id=$3 AND step_sequence=$4 AND tenant_id=$5
+	`, input.Reason, userID, id, currentStep, tenantID)
+
+	// Return operation to in_progress state
+	h.db.Exec(`
+		UPDATE stock_operations
+		SET state='in_progress', updated_at=$1
+		WHERE id=$2 AND tenant_id=$3
+	`, now, id, tenantID)
+
+	response.Success(c, map[string]interface{}{
+		"state":        "in_progress",
+		"current_step": currentStep,
+		"rejected":     true,
+		"reason":       input.Reason,
+	})
+}
+
+// AddStepDocument attaches a document reference to a step log
+func (h *Handler) AddStepDocument(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid operation ID")
+		return
+	}
+	stepSeq := c.Param("step")
+
+	var input struct {
+		DocumentType string `json:"document_type"`
+		DocumentURL  string `json:"document_url"`
+		FileName     string `json:"file_name"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	// Append document to the step_log's documents JSONB array
+	h.db.Exec(`
+		UPDATE stock_operation_step_log
+		SET documents = COALESCE(documents, '[]'::jsonb) || $1::jsonb
+		WHERE operation_id=$2 AND step_sequence=$3 AND tenant_id=$4
+	`, fmt.Sprintf(`[{"type":"%s","url":"%s","name":"%s"}]`, input.DocumentType, input.DocumentURL, input.FileName),
+		id, stepSeq, tenantID)
+
+	response.Success(c, gin.H{"message": "Document attached"})
 }
 
 // CancelStockOperation cancels a stock operation

@@ -670,6 +670,95 @@ func (h *Handler) GetConstructionProjectDashboard(c *gin.Context) {
 
 	dashboard["photo_reports_30d"] = photoReportsCount
 
+	// Cost breakdown from current estimate
+	var materialCost, laborCost, equipmentCost float64
+	h.db.QueryRow(`
+		SELECT COALESCE(SUM(el.material_rate * el.quantity), 0),
+		       COALESCE(SUM(el.labor_rate * el.quantity), 0),
+		       COALESCE(SUM(el.equipment_rate * el.quantity), 0)
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id
+		WHERE e.project_id = $1 AND e.tenant_id = $2 AND e.is_current = true
+	`, id, tenantID).Scan(&materialCost, &laborCost, &equipmentCost)
+
+	var subcontractCost, otherCost float64
+	h.db.QueryRow(`
+		SELECT COALESCE(SUM(CASE WHEN cc.name ILIKE '%pudrat%' OR cc.name ILIKE '%subcontract%' THEN el.amount ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN cc.name NOT ILIKE '%pudrat%' AND cc.name NOT ILIKE '%subcontract%' AND cc.name NOT ILIKE '%material%' AND cc.name NOT ILIKE '%ish haqi%' AND cc.name NOT ILIKE '%texnika%' THEN el.amount ELSE 0 END), 0)
+		FROM construction_expense_lines el
+		LEFT JOIN construction_cost_categories cc ON cc.id = el.cost_category_id
+		WHERE el.project_id = $1 AND el.tenant_id = $2 AND el.status = 'approved' AND el.deleted_at IS NULL
+	`, id, tenantID).Scan(&subcontractCost, &otherCost)
+
+	dashboard["cost_breakdown"] = map[string]interface{}{
+		"material":    materialCost,
+		"labor":       laborCost,
+		"equipment":   equipmentCost,
+		"subcontract": subcontractCost,
+		"other":       otherCost,
+	}
+
+	// Recent activity
+	activityRows, err := h.db.Query(`
+		SELECT a.action_type, a.description, a.created_at,
+		       COALESCE(u.first_name || ' ' || u.last_name, '') as user_name
+		FROM construction_activity_log a
+		LEFT JOIN users u ON u.id = a.user_id
+		WHERE a.project_id = $1 AND a.tenant_id = $2
+		ORDER BY a.created_at DESC LIMIT 5
+	`, id, tenantID)
+	recentActivity := []map[string]interface{}{}
+	if err == nil {
+		defer activityRows.Close()
+		for activityRows.Next() {
+			var actionType, description, userName string
+			var createdAt time.Time
+			if err := activityRows.Scan(&actionType, &description, &createdAt, &userName); err == nil {
+				recentActivity = append(recentActivity, map[string]interface{}{
+					"type":     actionType,
+					"text":     description,
+					"user":     userName,
+					"date":     createdAt,
+				})
+			}
+		}
+	}
+	dashboard["recent_activity"] = recentActivity
+
+	// WBS stats
+	var wbsTotal, wbsCompleted int
+	h.db.QueryRow(`
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE progress >= 100)
+		FROM construction_wbs
+		WHERE project_id = $1 AND tenant_id = $2 AND is_active = true
+	`, id, tenantID).Scan(&wbsTotal, &wbsCompleted)
+	dashboard["wbs_total"] = wbsTotal
+	dashboard["wbs_completed"] = wbsCompleted
+
+	// Plan progress (time-based)
+	var plannedStart, plannedEnd sql.NullTime
+	h.db.QueryRow(`
+		SELECT planned_start_date, planned_end_date
+		FROM construction_projects WHERE id = $1 AND tenant_id = $2
+	`, id, tenantID).Scan(&plannedStart, &plannedEnd)
+
+	var progressPlan float64
+	if plannedStart.Valid && plannedEnd.Valid {
+		totalDays := plannedEnd.Time.Sub(plannedStart.Time).Hours() / 24
+		elapsedDays := time.Since(plannedStart.Time).Hours() / 24
+		if totalDays > 0 {
+			progressPlan = (elapsedDays / totalDays) * 100
+			if progressPlan > 100 {
+				progressPlan = 100
+			}
+			if progressPlan < 0 {
+				progressPlan = 0
+			}
+		}
+	}
+	dashboard["progress_plan"] = progressPlan
+	dashboard["behind_schedule"] = progressPlan - progressPercent.Float64
+
 	response.Success(c, dashboard)
 }
 
@@ -4459,6 +4548,134 @@ func (h *Handler) DeleteConstructionTeamMember(c *gin.Context) {
 
 	response.Success(c, map[string]interface{}{
 		"message": "Team member removed successfully",
+	})
+}
+
+// UpdateConstructionTeamMember updates a team member's role, WBS, or building assignment
+func (h *Handler) UpdateConstructionTeamMember(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	memberID, err := strconv.ParseInt(c.Param("memberId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid member ID")
+		return
+	}
+
+	var req struct {
+		Role             *string `json:"role"`
+		Responsibilities *string `json:"responsibilities"`
+		WbsID            *int64  `json:"wbs_id"`
+		BuildingID       *int64  `json:"building_id"`
+		StartDate        *string `json:"start_date"`
+		EndDate          *string `json:"end_date"`
+		IsActive         *bool   `json:"is_active"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if req.Role != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("role = $%d", argCount))
+		args = append(args, *req.Role)
+	}
+	if req.Responsibilities != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("responsibilities = $%d", argCount))
+		args = append(args, nullString(*req.Responsibilities))
+	}
+	if req.WbsID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("wbs_id = $%d", argCount))
+		if *req.WbsID == 0 {
+			args = append(args, nil)
+		} else {
+			args = append(args, *req.WbsID)
+		}
+	}
+	if req.BuildingID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("building_id = $%d", argCount))
+		if *req.BuildingID == 0 {
+			args = append(args, nil)
+		} else {
+			args = append(args, *req.BuildingID)
+		}
+	}
+	if req.StartDate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("start_date = $%d", argCount))
+		if *req.StartDate == "" {
+			args = append(args, nil)
+		} else {
+			t, _ := time.Parse("2006-01-02", *req.StartDate)
+			args = append(args, t)
+		}
+	}
+	if req.EndDate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("end_date = $%d", argCount))
+		if *req.EndDate == "" {
+			args = append(args, nil)
+		} else {
+			t, _ := time.Parse("2006-01-02", *req.EndDate)
+			args = append(args, t)
+		}
+	}
+	if req.IsActive != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("is_active = $%d", argCount))
+		args = append(args, *req.IsActive)
+	}
+
+	if len(updates) == 0 {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	argCount++
+	args = append(args, memberID)
+	argCount++
+	args = append(args, projectID)
+	argCount++
+	args = append(args, tenantID)
+
+	query := fmt.Sprintf(
+		`UPDATE construction_project_team SET %s WHERE id = $%d AND project_id = $%d AND EXISTS (SELECT 1 FROM construction_projects WHERE id = $%d AND tenant_id = $%d)`,
+		strings.Join(updates, ", "), argCount-2, argCount-1, argCount-1, argCount,
+	)
+
+	result, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update team member", "error", err)
+		response.InternalError(c, "Failed to update team member")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Team member not found")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"id":      memberID,
+		"message": "Team member updated successfully",
 	})
 }
 

@@ -119,6 +119,9 @@ func main() {
 	// Start workflow automation scheduler (checks thresholds every 15 minutes)
 	h.RunWorkflowScheduler(shutdownCtx, 15*time.Minute)
 
+	// Start warehouse step timeout checker (runs every 15 minutes)
+	handler.StartBackgroundJobs(db, log)
+
 	// Start daily currency sync from CBU at 09:00 Tashkent time
 	h.RunCurrencySyncScheduler(shutdownCtx)
 
