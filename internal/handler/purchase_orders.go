@@ -1583,7 +1583,8 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 	// Update inventory for received line items
 	var poWarehouseID sql.NullString
 	var poOrgID *uuid.UUID
-	h.db.QueryRow("SELECT warehouse_id, organization_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID, &poOrgID)
+	var poVendorID *uuid.UUID
+	h.db.QueryRow("SELECT warehouse_id, organization_id, vendor_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID, &poOrgID, &poVendorID)
 
 	// Fall back to the first warehouse for this tenant if PO has no warehouse
 	var defaultWarehouseID sql.NullString
@@ -1671,6 +1672,18 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 				reason, transaction_date, created_at
 			) VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, 'purchase_order', $8, 'PO Goods Receipt', $9, $9)
 		`, txnID, tenantID, inventoryID, poOrgID, line.QuantityReceived, unitPrice, line.QuantityReceived*unitPrice, id, now)
+
+		// Auto-create inventory lot for received goods
+		lotNumber := h.generateLotNumber(tenantID)
+		lotID := uuid.New()
+		h.db.Exec(`
+			INSERT INTO inventory_lots (
+				id, tenant_id, product_id, warehouse_id, lot_number,
+				received_date, initial_quantity, remaining_quantity,
+				unit_cost, vendor_id, purchase_order_id, status, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, 'available', $11, $11)
+		`, lotID, tenantID, productID, warehouseID, lotNumber,
+			now, line.QuantityReceived, unitPrice, poVendorID, id, now)
 	}
 
 	response.Success(c, gin.H{
