@@ -116,6 +116,17 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 
 	notes := fmt.Sprintf("Auto-created from intercompany SO: %s", so.OrderNumber)
 
+	// Use target org's default warehouse, not source org's
+	var targetWarehouseID *uuid.UUID
+	var twID uuid.UUID
+	if err := s.db.QueryRow(`
+		SELECT id FROM warehouses
+		WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+		ORDER BY created_at ASC LIMIT 1
+	`, tenantID, targetOrgID).Scan(&twID); err == nil {
+		targetWarehouseID = &twID
+	}
+
 	poInsertQuery := `
 		INSERT INTO purchase_orders (
 			id, tenant_id, organization_id, order_number, vendor_id,
@@ -131,8 +142,8 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 		poID, tenantID, targetOrgID, poNumber, vendorID,
 		now, now.AddDate(0, 0, 7), so.CurrencyID, so.ExchangeRate,
 		so.Subtotal, so.DiscountAmount, so.TaxAmount, so.ShippingAmount, so.TotalAmount,
-		entity.POStatusDraft, entity.PaymentStatusUnpaid, so.PaymentTerms,
-		so.OrderNumber, notes, so.WarehouseID,
+		entity.POStatusOrdered, entity.PaymentStatusUnpaid, so.PaymentTerms,
+		so.OrderNumber, notes, targetWarehouseID,
 		now, now,
 	)
 	if err != nil {
@@ -270,6 +281,16 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 		return nil // Already synced
 	}
 
+	// Also check reverse: this PO might have been created FROM an SO (intercompany SO→PO)
+	var reverseLink int
+	s.db.QueryRow(`
+		SELECT COUNT(*) FROM intercompany_document_links
+		WHERE tenant_id = $1 AND linked_document_type = 'purchase_order' AND linked_document_id = $2
+	`, tenantID, purchaseOrderID).Scan(&reverseLink)
+	if reverseLink > 0 {
+		return nil // This PO was created from an SO, don't create another SO
+	}
+
 	// Create sales order in target organization
 	soID := uuid.New()
 	soNumber := fmt.Sprintf("SO-IC-%s", time.Now().Format("20060102150405"))
@@ -279,6 +300,17 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 	paymentTerms := 30
 	if po.PaymentTerms != nil {
 		paymentTerms = *po.PaymentTerms
+	}
+
+	// Use target org's default warehouse, not source org's
+	var targetWarehouseID *uuid.UUID
+	var twID uuid.UUID
+	if err := s.db.QueryRow(`
+		SELECT id FROM warehouses
+		WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+		ORDER BY created_at ASC LIMIT 1
+	`, tenantID, targetOrgID).Scan(&twID); err == nil {
+		targetWarehouseID = &twID
 	}
 
 	soInsertQuery := `
@@ -297,7 +329,7 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 		now, now.AddDate(0, 0, 7), po.CurrencyID, po.ExchangeRate,
 		po.Subtotal, po.DiscountAmount, po.TaxAmount, po.ShippingAmount, po.TotalAmount,
 		entity.OrderStatusDraft, entity.PaymentStatusUnpaid, paymentTerms,
-		po.OrderNumber, notes, po.WarehouseID,
+		po.OrderNumber, notes, targetWarehouseID,
 		now, now,
 	)
 	if err != nil {
