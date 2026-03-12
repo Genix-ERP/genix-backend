@@ -32,17 +32,19 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 	}
 
 	query := `
-		SELECT e.id, e.tenant_id, e.project_id, e.version, e.name, e.state, e.is_current,
+		SELECT e.id, e.tenant_id, e.project_id, e.building_id, e.version, e.name, e.state, e.is_current,
 		       e.overhead_pct, e.profit_pct, e.vat_pct,
 		       e.amount_direct, e.amount_total,
 		       e.approved_by, e.approved_date, e.created_by,
 		       e.created_date, e.updated_date,
 		       COALESCE((SELECT COUNT(*) FROM construction_estimate_line l WHERE l.estimate_id = e.id), 0) as lines_count,
 		       COALESCE(ua.first_name || ' ' || ua.last_name, '') as approved_name,
-		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name
+		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name,
+		       COALESCE(b.name, '') as building_name
 		FROM construction_estimate e
 		LEFT JOIN users ua ON ua.id = e.approved_by
 		LEFT JOIN users uc ON uc.id = e.created_by
+		LEFT JOIN construction_buildings b ON b.id = e.building_id
 		WHERE e.project_id = $1 AND e.tenant_id = $2
 		ORDER BY e.version DESC
 	`
@@ -59,12 +61,13 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 	for rows.Next() {
 		var item entity.ConstructionEstimate
 		if err := rows.Scan(
-			&item.ID, &item.TenantID, &item.ProjectID, &item.Version, &item.Name, &item.State, &item.IsCurrent,
+			&item.ID, &item.TenantID, &item.ProjectID, &item.BuildingID, &item.Version, &item.Name, &item.State, &item.IsCurrent,
 			&item.OverheadPct, &item.ProfitPct, &item.VatPct,
 			&item.AmountDirect, &item.AmountTotal,
 			&item.ApprovedBy, &item.ApprovedDate, &item.CreatedBy,
 			&item.CreatedDate, &item.UpdatedDate,
 			&item.LinesCount, &item.ApprovedName, &item.CreatedName,
+			&item.BuildingName,
 		); err != nil {
 			h.log.Error("Failed to scan estimate", "error", err)
 			continue
@@ -92,25 +95,28 @@ func (h *Handler) GetEstimate(c *gin.Context) {
 	// Get estimate header
 	var est entity.ConstructionEstimate
 	err = h.db.QueryRow(`
-		SELECT e.id, e.tenant_id, e.project_id, e.version, e.name, e.state, e.is_current,
+		SELECT e.id, e.tenant_id, e.project_id, e.building_id, e.version, e.name, e.state, e.is_current,
 		       e.overhead_pct, e.profit_pct, e.vat_pct,
 		       e.amount_direct, e.amount_total,
 		       e.approved_by, e.approved_date, e.created_by,
 		       e.created_date, e.updated_date,
 		       0 as lines_count,
 		       COALESCE(ua.first_name || ' ' || ua.last_name, '') as approved_name,
-		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name
+		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name,
+		       COALESCE(b.name, '') as building_name
 		FROM construction_estimate e
 		LEFT JOIN users ua ON ua.id = e.approved_by
 		LEFT JOIN users uc ON uc.id = e.created_by
+		LEFT JOIN construction_buildings b ON b.id = e.building_id
 		WHERE e.id = $1 AND e.tenant_id = $2
 	`, id, tenantID).Scan(
-		&est.ID, &est.TenantID, &est.ProjectID, &est.Version, &est.Name, &est.State, &est.IsCurrent,
+		&est.ID, &est.TenantID, &est.ProjectID, &est.BuildingID, &est.Version, &est.Name, &est.State, &est.IsCurrent,
 		&est.OverheadPct, &est.ProfitPct, &est.VatPct,
 		&est.AmountDirect, &est.AmountTotal,
 		&est.ApprovedBy, &est.ApprovedDate, &est.CreatedBy,
 		&est.CreatedDate, &est.UpdatedDate,
 		&est.LinesCount, &est.ApprovedName, &est.CreatedName,
+		&est.BuildingName,
 	)
 	if err != nil {
 		response.NotFound(c, "Estimate not found")
@@ -174,12 +180,12 @@ func (h *Handler) CreateEstimate(c *gin.Context) {
 	var itemID int64
 	err = h.db.QueryRow(`
 		INSERT INTO construction_estimate (
-			tenant_id, project_id, version, name, state, is_current,
+			tenant_id, project_id, building_id, version, name, state, is_current,
 			overhead_pct, profit_pct, vat_pct,
 			created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, 'draft', false, $5, $6, $7, $8, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, 'draft', false, $6, $7, $8, $9, NOW(), NOW())
 		RETURNING id
-	`, tenantID, projectID, nextVersion, req.Name,
+	`, tenantID, projectID, nullInt64FromVal(req.BuildingID), nextVersion, req.Name,
 		req.OverheadPct, req.ProfitPct, req.VatPct, userID,
 	).Scan(&itemID)
 
@@ -238,6 +244,15 @@ func (h *Handler) UpdateEstimate(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
 		args = append(args, *req.Name)
+	}
+	if req.BuildingID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("building_id = $%d", argCount))
+		if *req.BuildingID == 0 {
+			args = append(args, nil)
+		} else {
+			args = append(args, *req.BuildingID)
+		}
 	}
 	if req.OverheadPct != nil {
 		argCount++
@@ -436,10 +451,10 @@ func (h *Handler) DuplicateEstimate(c *gin.Context) {
 	// Get source estimate
 	var src entity.ConstructionEstimate
 	err = h.db.QueryRow(`
-		SELECT id, tenant_id, project_id, version, name, overhead_pct, profit_pct, vat_pct
+		SELECT id, tenant_id, project_id, building_id, version, name, overhead_pct, profit_pct, vat_pct
 		FROM construction_estimate WHERE id = $1 AND tenant_id = $2
 	`, id, tenantID).Scan(
-		&src.ID, &src.TenantID, &src.ProjectID, &src.Version, &src.Name,
+		&src.ID, &src.TenantID, &src.ProjectID, &src.BuildingID, &src.Version, &src.Name,
 		&src.OverheadPct, &src.ProfitPct, &src.VatPct,
 	)
 	if err != nil {
@@ -468,12 +483,12 @@ func (h *Handler) DuplicateEstimate(c *gin.Context) {
 	var newID int64
 	err = tx.QueryRow(`
 		INSERT INTO construction_estimate (
-			tenant_id, project_id, version, name, state, is_current,
+			tenant_id, project_id, building_id, version, name, state, is_current,
 			overhead_pct, profit_pct, vat_pct,
 			created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, 'draft', false, $5, $6, $7, $8, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, 'draft', false, $6, $7, $8, $9, NOW(), NOW())
 		RETURNING id
-	`, tenantID, src.ProjectID, nextVersion,
+	`, tenantID, src.ProjectID, src.BuildingID, nextVersion,
 		fmt.Sprintf("%s (v%d)", src.Name, nextVersion),
 		src.OverheadPct, src.ProfitPct, src.VatPct, userID,
 	).Scan(&newID)

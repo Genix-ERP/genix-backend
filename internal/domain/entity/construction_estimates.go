@@ -13,13 +13,14 @@ import (
 // =====================================================
 
 type ConstructionEstimate struct {
-	ID        int64     `json:"id" db:"id"`
-	TenantID  uuid.UUID `json:"tenant_id" db:"tenant_id"`
-	ProjectID int64     `json:"project_id" db:"project_id"`
-	Version   int       `json:"version" db:"version"`
-	Name      string    `json:"name" db:"name"`
-	State     string    `json:"state" db:"state"`
-	IsCurrent bool      `json:"is_current" db:"is_current"`
+	ID         int64         `json:"id" db:"id"`
+	TenantID   uuid.UUID     `json:"tenant_id" db:"tenant_id"`
+	ProjectID  int64         `json:"project_id" db:"project_id"`
+	BuildingID sql.NullInt64 `json:"building_id" db:"building_id"`
+	Version    int           `json:"version" db:"version"`
+	Name       string        `json:"name" db:"name"`
+	State      string        `json:"state" db:"state"`
+	IsCurrent  bool          `json:"is_current" db:"is_current"`
 
 	OverheadPct float64 `json:"overhead_pct" db:"overhead_pct"`
 	ProfitPct   float64 `json:"profit_pct" db:"profit_pct"`
@@ -39,6 +40,7 @@ type ConstructionEstimate struct {
 	LinesCount   int    `json:"lines_count,omitempty" db:"lines_count"`
 	ApprovedName string `json:"approved_name,omitempty" db:"approved_name"`
 	CreatedName  string `json:"created_name,omitempty" db:"created_name"`
+	BuildingName string `json:"building_name,omitempty" db:"building_name"`
 }
 
 func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
@@ -46,6 +48,7 @@ func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
 		ID           int64       `json:"id"`
 		TenantID     uuid.UUID   `json:"tenant_id"`
 		ProjectID    int64       `json:"project_id"`
+		BuildingID   interface{} `json:"building_id"`
 		Version      int         `json:"version"`
 		Name         string      `json:"name"`
 		State        string      `json:"state"`
@@ -63,10 +66,12 @@ func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
 		LinesCount   int         `json:"lines_count,omitempty"`
 		ApprovedName string      `json:"approved_name,omitempty"`
 		CreatedName  string      `json:"created_name,omitempty"`
+		BuildingName string      `json:"building_name,omitempty"`
 	}{
 		ID:           e.ID,
 		TenantID:     e.TenantID,
 		ProjectID:    e.ProjectID,
+		BuildingID:   nullInt64Value(e.BuildingID),
 		Version:      e.Version,
 		Name:         e.Name,
 		State:        e.State,
@@ -84,11 +89,13 @@ func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
 		LinesCount:   e.LinesCount,
 		ApprovedName: e.ApprovedName,
 		CreatedName:  e.CreatedName,
+		BuildingName: e.BuildingName,
 	})
 }
 
 type CreateEstimateInput struct {
 	Name        string  `json:"name" binding:"required"`
+	BuildingID  int64   `json:"building_id"`
 	OverheadPct float64 `json:"overhead_pct"`
 	ProfitPct   float64 `json:"profit_pct"`
 	VatPct      float64 `json:"vat_pct"`
@@ -96,6 +103,7 @@ type CreateEstimateInput struct {
 
 type UpdateEstimateInput struct {
 	Name        *string  `json:"name"`
+	BuildingID  *int64   `json:"building_id"`
 	OverheadPct *float64 `json:"overhead_pct"`
 	ProfitPct   *float64 `json:"profit_pct"`
 	VatPct      *float64 `json:"vat_pct"`
