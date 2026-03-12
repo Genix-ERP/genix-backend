@@ -3903,7 +3903,9 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 						currencyUUID, _ := uuid.Parse(paymentCurrencyID.String)
 						if currencyUUID != uuid.Nil {
 							var edContactName string
+							var edCurrencyCode string
 							tx.QueryRow("SELECT name FROM contacts WHERE id = $1", contactID).Scan(&edContactName)
+							tx.QueryRow("SELECT code FROM currencies WHERE id = $1", currencyUUID).Scan(&edCurrencyCode)
 							tx.Exec(`
 								INSERT INTO exchange_diffs (id, tenant_id, organization_id, currency_id, amount_uzs, diff_type, period_start, period_end, journal_entry_id, description, created_by, created_at, updated_at,
 									document_number, counterparty_id, counterparty_name, foreign_amount, initial_rate, final_rate)
@@ -3911,7 +3913,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 									$14, $15, $16, $17, $18, $19)`,
 								uuid.New(), tenantID, orgIDPtr, currencyUUID, absDiff, exchangeDiffType,
 								paymentDate, paymentDate, journalEntryID,
-								fmt.Sprintf("%s — %s", paymentNumber, exchangeDiffDesc),
+								fmt.Sprintf("Kurs farqi — %s — %s — %s", paymentNumber, edCurrencyCode, paymentDate.Format("02.01.2006")),
 								userID, now, now,
 								paymentNumber, contactID, edContactName, totalForeignAmount, weightedInvoiceRate, paymentExchangeRate,
 							)
@@ -4841,7 +4843,8 @@ func (h *Handler) ListExchangeRates(c *gin.Context) {
 
 	query := `
 		SELECT er.id, er.rate, er.effective_date, er.source, er.created_at,
-		       fc.code as from_currency, tc.code as to_currency
+		       fc.code as from_currency, tc.code as to_currency,
+		       COALESCE(er.previous_rate, 0), COALESCE(er.rate_change, 0), COALESCE(er.rate_change_percent, 0)
 		FROM exchange_rates er
 		JOIN currencies fc ON er.from_currency_id = fc.id
 		JOIN currencies tc ON er.to_currency_id = tc.id
@@ -4879,13 +4882,16 @@ func (h *Handler) ListExchangeRates(c *gin.Context) {
 	defer rows.Close()
 
 	type ExchangeRateResponse struct {
-		ID            uuid.UUID `json:"id"`
-		FromCurrency  string    `json:"from_currency"`
-		ToCurrency    string    `json:"to_currency"`
-		Rate          float64   `json:"rate"`
-		EffectiveDate string    `json:"effective_date"`
-		Source        string    `json:"source"`
-		CreatedAt     time.Time `json:"created_at"`
+		ID                 uuid.UUID `json:"id"`
+		FromCurrency       string    `json:"from_currency"`
+		ToCurrency         string    `json:"to_currency"`
+		Rate               float64   `json:"rate"`
+		EffectiveDate      string    `json:"effective_date"`
+		Source             string    `json:"source"`
+		CreatedAt          time.Time `json:"created_at"`
+		PreviousRate       float64   `json:"previous_rate,omitempty"`
+		RateChange         float64   `json:"rate_change,omitempty"`
+		RateChangePercent  float64   `json:"rate_change_percent,omitempty"`
 	}
 
 	rates := make([]ExchangeRateResponse, 0)
@@ -4893,7 +4899,8 @@ func (h *Handler) ListExchangeRates(c *gin.Context) {
 		var r ExchangeRateResponse
 		var effectiveDate time.Time
 		var source sql.NullString
-		err := rows.Scan(&r.ID, &r.Rate, &effectiveDate, &source, &r.CreatedAt, &r.FromCurrency, &r.ToCurrency)
+		err := rows.Scan(&r.ID, &r.Rate, &effectiveDate, &source, &r.CreatedAt, &r.FromCurrency, &r.ToCurrency,
+			&r.PreviousRate, &r.RateChange, &r.RateChangePercent)
 		if err != nil {
 			continue
 		}

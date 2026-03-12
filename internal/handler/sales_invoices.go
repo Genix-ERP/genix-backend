@@ -715,7 +715,8 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		if exchangeRate != 1 {
 			var exchangeDiffs []map[string]interface{}
 			edQuery := `
-				SELECT ed.id, ed.amount_uzs, ed.diff_type, ed.period_start, ed.description
+				SELECT ed.id, ed.amount_uzs, ed.diff_type, ed.period_start, ed.description,
+				       COALESCE(ed.document_number, ''), COALESCE(ed.initial_rate, 0), COALESCE(ed.final_rate, 0), COALESCE(ed.foreign_amount, 0)
 				FROM exchange_diffs ed
 				WHERE ed.tenant_id = $1 AND ed.deleted_at IS NULL
 				  AND ed.journal_entry_id IN (
@@ -729,18 +730,22 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 				defer edRows.Close()
 				for edRows.Next() {
 					var edID uuid.UUID
-					var edAmount float64
-					var edType, edDesc string
+					var edAmount, edInitialRate, edFinalRate, edForeignAmount float64
+					var edType, edDesc, edDocNumber string
 					var edDate time.Time
-					if err := edRows.Scan(&edID, &edAmount, &edType, &edDate, &edDesc); err != nil {
+					if err := edRows.Scan(&edID, &edAmount, &edType, &edDate, &edDesc, &edDocNumber, &edInitialRate, &edFinalRate, &edForeignAmount); err != nil {
 						continue
 					}
 					exchangeDiffs = append(exchangeDiffs, map[string]interface{}{
-						"id":          edID.String(),
-						"amount":      edAmount,
-						"type":        edType,
-						"date":        edDate.Format("2006-01-02"),
-						"description": edDesc,
+						"id":              edID.String(),
+						"amount":          edAmount,
+						"type":            edType,
+						"date":            edDate.Format("2006-01-02"),
+						"description":     edDesc,
+						"document_number": edDocNumber,
+						"initial_rate":    edInitialRate,
+						"final_rate":      edFinalRate,
+						"foreign_amount":  edForeignAmount,
 					})
 				}
 			}
