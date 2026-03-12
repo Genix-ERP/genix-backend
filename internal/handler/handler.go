@@ -404,11 +404,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		stockOps.POST("/:id/advance", h.perm.Require("inventory", "stock", "update"), h.AdvanceStockOperationStep)
 		stockOps.POST("/:id/backorder", h.perm.Require("inventory", "stock", "create"), h.CreateBackorder)
 		stockOps.POST("/:id/cancel", h.perm.Require("inventory", "stock", "update"), h.CancelStockOperation)
+		stockOps.POST("/:id/approve", h.perm.Require("inventory", "stock", "update"), h.ApproveStockOperationStep)
+		stockOps.POST("/:id/reject", h.perm.Require("inventory", "stock", "update"), h.RejectStockOperationStep)
+		stockOps.POST("/:id/steps/:step/documents", h.perm.Require("inventory", "stock", "update"), h.AddStepDocument)
 	}
 
 	// Operation Type Steps (per operation type configuration)
 	operationTypes.GET("/:id/steps", h.ListOperationTypeSteps)
 	operationTypes.PUT("/:id/steps", h.perm.Require("inventory", "warehouse", "update"), h.SaveOperationTypeSteps)
+
+	// Warehouse Alerts Dashboard
+	rg.GET("/warehouse-alerts", h.perm.Require("inventory", "stock", "read"), h.GetWarehouseAlerts)
 
 	// Product Attributes
 	productAttributes := rg.Group("/product-attributes")
@@ -1630,6 +1636,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Team Members
 		constructionProjects.GET("/:id/team", h.ListConstructionTeamMembers)
 		constructionProjects.POST("/:id/team", h.perm.Require("construction", "project", "update"), h.CreateConstructionTeamMember)
+		constructionProjects.PUT("/:id/team/:memberId", h.perm.Require("construction", "project", "update"), h.UpdateConstructionTeamMember)
 		constructionProjects.DELETE("/:id/team/:memberId", h.perm.Require("construction", "project", "update"), h.DeleteConstructionTeamMember)
 
 		// WBS (Work Breakdown Structure)
@@ -1647,6 +1654,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Daily Logs (WBS-linked)
 		constructionProjects.GET("/:id/daily-logs", h.ListConstructionDailyLogs)
 		constructionProjects.POST("/:id/daily-logs", h.perm.Require("construction", "daily_log", "create"), h.CreateConstructionDailyLog)
+		constructionProjects.GET("/:id/daily-logs/summary", h.GetDailyLogSummary)
 
 		// Stages
 		constructionProjects.GET("/:id/stages", h.ListConstructionStages)
@@ -1655,6 +1663,30 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Expense Lines (Xarajat operatsiyalari)
 		constructionProjects.GET("/:id/expenses", h.ListExpenseLines)
 		constructionProjects.POST("/:id/expenses", h.perm.Require("construction", "project", "update"), h.CreateExpenseLine)
+
+		// Material Usage
+		constructionProjects.GET("/:id/material-usage", h.ListMaterialUsage)
+		constructionProjects.POST("/:id/material-usage", h.perm.Require("construction", "project", "update"), h.CreateMaterialUsage)
+		constructionProjects.GET("/:id/material-summary", h.GetMaterialSummary)
+
+		// Progress Visualization
+		constructionProjects.GET("/:id/progress-summary", h.GetProgressSummary)
+		constructionProjects.GET("/:id/gantt", h.GetGanttData)
+
+		// Subcontracts
+		constructionProjects.GET("/:id/subcontracts", h.ListSubcontracts)
+		constructionProjects.POST("/:id/subcontracts", h.perm.Require("construction", "project", "update"), h.CreateSubcontract)
+
+		// Acts (KS-2 / KS-3)
+		constructionProjects.GET("/:id/acts", h.ListConstructionActs)
+		constructionProjects.POST("/:id/acts", h.perm.Require("construction", "project", "update"), h.CreateConstructionAct)
+		constructionProjects.POST("/:id/acts/generate-ks2", h.perm.Require("construction", "project", "update"), h.AutoGenerateKS2)
+
+		// Financial Analysis
+		constructionProjects.GET("/:id/financial/pnl", h.GetProjectPnL)
+		constructionProjects.GET("/:id/financial/budget-actual", h.GetBudgetVsActualByWBS)
+		constructionProjects.GET("/:id/financial/cost-trend", h.GetCostTrend)
+		constructionProjects.GET("/:id/financial/payment-schedule", h.GetPaymentSchedule)
 
 		// Reports
 		constructionProjects.GET("/:id/reports/summary", h.GetProjectSummaryReport)
@@ -1792,6 +1824,35 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		photoReports.GET("/:id", h.GetPhotoReport)
 		photoReports.PUT("/:id", h.perm.Require("construction", "reports", "submit"), h.UpdatePhotoReport)
 		photoReports.DELETE("/:id", h.perm.Require("construction", "reports", "submit"), h.DeletePhotoReport)
+	}
+
+	// Material Usage (direct access)
+	materialUsage := rg.Group("/construction/material-usage")
+	materialUsage.Use(h.perm.Require("construction", "project", "read"))
+	{
+		materialUsage.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateMaterialUsage)
+		materialUsage.DELETE("/:id", h.perm.Require("construction", "project", "update"), h.DeleteMaterialUsage)
+	}
+
+	// Subcontracts (direct access)
+	subcontracts := rg.Group("/construction/subcontracts")
+	subcontracts.Use(h.perm.Require("construction", "project", "read"))
+	{
+		subcontracts.GET("/:id", h.GetSubcontract)
+		subcontracts.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateSubcontract)
+		subcontracts.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteSubcontract)
+		subcontracts.PUT("/:id/state", h.perm.Require("construction", "project", "update"), h.UpdateSubcontractState)
+	}
+
+	// Acts (direct access)
+	acts := rg.Group("/construction/acts")
+	acts.Use(h.perm.Require("construction", "project", "read"))
+	{
+		acts.GET("/:id", h.GetConstructionAct)
+		acts.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionAct)
+		acts.PUT("/:id/approve", h.perm.Require("construction", "project", "update"), h.ApproveConstructionAct)
+		acts.PUT("/:id/reject", h.perm.Require("construction", "project", "update"), h.RejectConstructionAct)
+		acts.POST("/:id/generate-ks3", h.perm.Require("construction", "project", "update"), h.GenerateKS3FromKS2)
 	}
 
 	// =====================================================

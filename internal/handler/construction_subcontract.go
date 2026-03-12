@@ -1,0 +1,633 @@
+package handler
+
+import (
+	"database/sql"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/response"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// =====================================================
+// CONSTRUCTION SUBCONTRACT HANDLERS
+// =====================================================
+
+// ListSubcontracts returns subcontracts for a project
+func (h *Handler) ListSubcontracts(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	stateFilter := c.Query("state")
+
+	query := `
+		SELECT s.id, s.name, s.project_id, s.partner_id, s.work_description,
+		       s.amount, s.currency, s.start_date, s.end_date,
+		       s.retention_pct, s.state, s.rating,
+		       s.contact_person, s.contact_phone, s.notes,
+		       s.created_by, s.created_date, s.updated_date,
+		       COALESCE(p.name, '') as partner_name,
+		       COALESCE(acts.completed_amount, 0) as completed_amount,
+		       COALESCE(acts.paid_amount, 0) as paid_amount
+		FROM construction_subcontract s
+		LEFT JOIN organizations p ON p.id = s.partner_id
+		LEFT JOIN LATERAL (
+			SELECT COALESCE(SUM(CASE WHEN a.state = 'approved' AND a.act_type = 'ks2' THEN a.amount_total ELSE 0 END), 0) as completed_amount,
+			       COALESCE(SUM(CASE WHEN a.state = 'approved' AND a.act_type = 'ks3' THEN a.amount_total ELSE 0 END), 0) as paid_amount
+			FROM construction_act a WHERE a.subcontract_id = s.id
+		) acts ON true
+		WHERE s.project_id = $1 AND s.tenant_id = $2
+	`
+	args := []interface{}{projectID, tenantID}
+	argCount := 2
+
+	if stateFilter != "" {
+		argCount++
+		query += fmt.Sprintf(" AND s.state = $%d", argCount)
+		args = append(args, stateFilter)
+	}
+
+	query += " ORDER BY s.created_date DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list subcontracts", "error", err)
+		response.InternalError(c, "Failed to list subcontracts")
+		return
+	}
+	defer rows.Close()
+
+	items := []map[string]interface{}{}
+	for rows.Next() {
+		var id, projectIDVal int64
+		var name string
+		var partnerID uuid.NullUUID
+		var workDescription, notes sql.NullString
+		var amount float64
+		var currency string
+		var startDate, endDate sql.NullTime
+		var retentionPct, rating float64
+		var contactPerson, contactPhone sql.NullString
+		var createdBy uuid.NullUUID
+		var createdDate, updatedDate time.Time
+		var state, partnerName string
+		var completedAmount, paidAmount float64
+
+		if err := rows.Scan(
+			&id, &name, &projectIDVal, &partnerID, &workDescription,
+			&amount, &currency, &startDate, &endDate,
+			&retentionPct, &state, &rating,
+			&contactPerson, &contactPhone, &notes,
+			&createdBy, &createdDate, &updatedDate,
+			&partnerName, &completedAmount, &paidAmount,
+		); err != nil {
+			h.log.Error("Failed to scan subcontract", "error", err)
+			continue
+		}
+
+		// Get linked WBS IDs
+		wbsIDs := []int64{}
+		wbsRows, err := h.db.Query(
+			`SELECT wbs_id FROM construction_subcontract_wbs WHERE subcontract_id = $1`, id)
+		if err == nil {
+			defer wbsRows.Close()
+			for wbsRows.Next() {
+				var wbsID int64
+				if wbsRows.Scan(&wbsID) == nil {
+					wbsIDs = append(wbsIDs, wbsID)
+				}
+			}
+		}
+
+		var progressPct float64
+		if amount > 0 {
+			progressPct = (completedAmount / amount) * 100
+			if progressPct > 100 {
+				progressPct = 100
+			}
+		}
+
+		outstandingAmount := completedAmount - paidAmount
+		if outstandingAmount < 0 {
+			outstandingAmount = 0
+		}
+
+		items = append(items, map[string]interface{}{
+			"id":                 id,
+			"name":               name,
+			"project_id":         projectIDVal,
+			"partner_id":         nullUUIDVal(partnerID),
+			"partner_name":       partnerName,
+			"work_description":   nullStringVal(workDescription),
+			"amount":             amount,
+			"currency":           currency,
+			"start_date":         nullTimeVal(startDate),
+			"end_date":           nullTimeVal(endDate),
+			"retention_pct":      retentionPct,
+			"state":              state,
+			"rating":             rating,
+			"contact_person":     nullStringVal(contactPerson),
+			"contact_phone":      nullStringVal(contactPhone),
+			"notes":              nullStringVal(notes),
+			"created_date":       createdDate,
+			"updated_date":       updatedDate,
+			"wbs_ids":            wbsIDs,
+			"completed_amount":   completedAmount,
+			"paid_amount":        paidAmount,
+			"outstanding_amount": outstandingAmount,
+			"progress_pct":       round2(progressPct),
+		})
+	}
+
+	response.Success(c, items)
+}
+
+// CreateSubcontract creates a new subcontract
+func (h *Handler) CreateSubcontract(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req struct {
+		PartnerID       string  `json:"partner_id"`
+		WorkDescription string  `json:"work_description"`
+		Amount          float64 `json:"amount"`
+		Currency        string  `json:"currency"`
+		StartDate       string  `json:"start_date"`
+		EndDate         string  `json:"end_date"`
+		RetentionPct    float64 `json:"retention_pct"`
+		ContactPerson   string  `json:"contact_person"`
+		ContactPhone    string  `json:"contact_phone"`
+		Notes           string  `json:"notes"`
+		WBSIDs          []int64 `json:"wbs_ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	// Auto-generate name
+	var count int
+	h.db.QueryRow(`SELECT COUNT(*) FROM construction_subcontract WHERE project_id = $1 AND tenant_id = $2`,
+		projectID, tenantID).Scan(&count)
+	name := fmt.Sprintf("SUB-%03d", count+1)
+
+	currency := req.Currency
+	if currency == "" {
+		currency = "UZS"
+	}
+
+	var partnerID interface{}
+	if req.PartnerID != "" {
+		if parsed, err := uuid.Parse(req.PartnerID); err == nil {
+			partnerID = parsed
+		}
+	}
+
+	var startDate, endDate interface{}
+	if req.StartDate != "" {
+		startDate = req.StartDate
+	}
+	if req.EndDate != "" {
+		endDate = req.EndDate
+	}
+
+	var id int64
+	err = h.db.QueryRow(`
+		INSERT INTO construction_subcontract (
+			tenant_id, project_id, partner_id, name, work_description,
+			amount, currency, start_date, end_date, retention_pct,
+			state, rating, contact_person, contact_phone, notes,
+			created_by, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', 0, $11, $12, $13, $14, NOW(), NOW())
+		RETURNING id
+	`, tenantID, projectID, partnerID, name, nullStringFromVal(req.WorkDescription),
+		req.Amount, currency, startDate, endDate, req.RetentionPct,
+		nullStringFromVal(req.ContactPerson), nullStringFromVal(req.ContactPhone),
+		nullStringFromVal(req.Notes), userID,
+	).Scan(&id)
+
+	if err != nil {
+		h.log.Error("Failed to create subcontract", "error", err)
+		response.InternalError(c, "Failed to create subcontract")
+		return
+	}
+
+	// Link WBS items
+	for _, wbsID := range req.WBSIDs {
+		h.db.Exec(`INSERT INTO construction_subcontract_wbs (subcontract_id, wbs_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+			id, wbsID)
+	}
+
+	h.logConstructionActivity(tenantID, projectID, userID, "team",
+		fmt.Sprintf("Pudratchi shartnomasi yaratildi: %s", name), "Subcontract", id)
+
+	response.Created(c, map[string]interface{}{
+		"id":      id,
+		"name":    name,
+		"message": "Subcontract created successfully",
+	})
+}
+
+// GetSubcontract returns a single subcontract with details
+func (h *Handler) GetSubcontract(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	subID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var id, projectIDVal int64
+	var name, state, currency string
+	var partnerID uuid.NullUUID
+	var workDescription, notes, contactPerson, contactPhone sql.NullString
+	var amount, retentionPct, rating float64
+	var startDate, endDate sql.NullTime
+	var createdBy uuid.NullUUID
+	var createdDate, updatedDate time.Time
+	var partnerName string
+
+	err = h.db.QueryRow(`
+		SELECT s.id, s.name, s.project_id, s.partner_id, s.work_description,
+		       s.amount, s.currency, s.start_date, s.end_date,
+		       s.retention_pct, s.state, s.rating,
+		       s.contact_person, s.contact_phone, s.notes,
+		       s.created_by, s.created_date, s.updated_date,
+		       COALESCE(p.name, '') as partner_name
+		FROM construction_subcontract s
+		LEFT JOIN organizations p ON p.id = s.partner_id
+		WHERE s.id = $1 AND s.tenant_id = $2
+	`, subID, tenantID).Scan(
+		&id, &name, &projectIDVal, &partnerID, &workDescription,
+		&amount, &currency, &startDate, &endDate,
+		&retentionPct, &state, &rating,
+		&contactPerson, &contactPhone, &notes,
+		&createdBy, &createdDate, &updatedDate, &partnerName,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Subcontract not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get subcontract", "error", err)
+		response.InternalError(c, "Failed to get subcontract")
+		return
+	}
+
+	// Get WBS IDs
+	wbsIDs := []int64{}
+	wbsRows, _ := h.db.Query(`SELECT wbs_id FROM construction_subcontract_wbs WHERE subcontract_id = $1`, id)
+	if wbsRows != nil {
+		defer wbsRows.Close()
+		for wbsRows.Next() {
+			var wbsID int64
+			if wbsRows.Scan(&wbsID) == nil {
+				wbsIDs = append(wbsIDs, wbsID)
+			}
+		}
+	}
+
+	response.Success(c, map[string]interface{}{
+		"id":               id,
+		"name":             name,
+		"project_id":       projectIDVal,
+		"partner_id":       nullUUIDVal(partnerID),
+		"partner_name":     partnerName,
+		"work_description": nullStringVal(workDescription),
+		"amount":           amount,
+		"currency":         currency,
+		"start_date":       nullTimeVal(startDate),
+		"end_date":         nullTimeVal(endDate),
+		"retention_pct":    retentionPct,
+		"state":            state,
+		"rating":           rating,
+		"contact_person":   nullStringVal(contactPerson),
+		"contact_phone":    nullStringVal(contactPhone),
+		"notes":            nullStringVal(notes),
+		"created_date":     createdDate,
+		"updated_date":     updatedDate,
+		"wbs_ids":          wbsIDs,
+	})
+}
+
+// UpdateSubcontract updates a subcontract
+func (h *Handler) UpdateSubcontract(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	subID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var projectID int64
+	err = h.db.QueryRow(`SELECT project_id FROM construction_subcontract WHERE id = $1 AND tenant_id = $2`,
+		subID, tenantID).Scan(&projectID)
+	if err != nil {
+		response.NotFound(c, "Subcontract not found")
+		return
+	}
+
+	var req struct {
+		PartnerID       *string  `json:"partner_id"`
+		WorkDescription *string  `json:"work_description"`
+		Amount          *float64 `json:"amount"`
+		Currency        *string  `json:"currency"`
+		StartDate       *string  `json:"start_date"`
+		EndDate         *string  `json:"end_date"`
+		RetentionPct    *float64 `json:"retention_pct"`
+		Rating          *float64 `json:"rating"`
+		ContactPerson   *string  `json:"contact_person"`
+		ContactPhone    *string  `json:"contact_phone"`
+		Notes           *string  `json:"notes"`
+		WBSIDs          []int64  `json:"wbs_ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	updates := []string{}
+	args := []interface{}{}
+	argCount := 0
+
+	if req.PartnerID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("partner_id = $%d", argCount))
+		if *req.PartnerID == "" {
+			args = append(args, nil)
+		} else {
+			parsed, _ := uuid.Parse(*req.PartnerID)
+			args = append(args, parsed)
+		}
+	}
+	if req.WorkDescription != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("work_description = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.WorkDescription))
+	}
+	if req.Amount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("amount = $%d", argCount))
+		args = append(args, *req.Amount)
+	}
+	if req.Currency != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("currency = $%d", argCount))
+		args = append(args, *req.Currency)
+	}
+	if req.StartDate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("start_date = $%d", argCount))
+		if *req.StartDate == "" {
+			args = append(args, nil)
+		} else {
+			args = append(args, *req.StartDate)
+		}
+	}
+	if req.EndDate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("end_date = $%d", argCount))
+		if *req.EndDate == "" {
+			args = append(args, nil)
+		} else {
+			args = append(args, *req.EndDate)
+		}
+	}
+	if req.RetentionPct != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("retention_pct = $%d", argCount))
+		args = append(args, *req.RetentionPct)
+	}
+	if req.Rating != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("rating = $%d", argCount))
+		args = append(args, *req.Rating)
+	}
+	if req.ContactPerson != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contact_person = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.ContactPerson))
+	}
+	if req.ContactPhone != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contact_phone = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.ContactPhone))
+	}
+	if req.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.Notes))
+	}
+
+	if len(updates) == 0 && req.WBSIDs == nil {
+		response.BadRequest(c, "No fields to update")
+		return
+	}
+
+	if len(updates) > 0 {
+		argCount++
+		updates = append(updates, fmt.Sprintf("updated_date = $%d", argCount))
+		args = append(args, time.Now())
+
+		argCount++
+		args = append(args, subID)
+		argCount++
+		args = append(args, tenantID)
+
+		query := fmt.Sprintf(
+			"UPDATE construction_subcontract SET %s WHERE id = $%d AND tenant_id = $%d",
+			strings.Join(updates, ", "), argCount-1, argCount,
+		)
+
+		_, err := h.db.Exec(query, args...)
+		if err != nil {
+			h.log.Error("Failed to update subcontract", "error", err)
+			response.InternalError(c, "Failed to update subcontract")
+			return
+		}
+	}
+
+	// Update WBS links if provided
+	if req.WBSIDs != nil {
+		h.db.Exec(`DELETE FROM construction_subcontract_wbs WHERE subcontract_id = $1`, subID)
+		for _, wbsID := range req.WBSIDs {
+			h.db.Exec(`INSERT INTO construction_subcontract_wbs (subcontract_id, wbs_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+				subID, wbsID)
+		}
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	h.logConstructionActivity(tenantID, projectID, userID, "team",
+		"Pudratchi shartnomasi yangilandi", "Subcontract", subID)
+
+	response.Success(c, map[string]interface{}{
+		"id":      subID,
+		"message": "Subcontract updated successfully",
+	})
+}
+
+// DeleteSubcontract deletes a subcontract
+func (h *Handler) DeleteSubcontract(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	subID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var projectID int64
+	err = h.db.QueryRow(`SELECT project_id FROM construction_subcontract WHERE id = $1 AND tenant_id = $2`,
+		subID, tenantID).Scan(&projectID)
+	if err != nil {
+		response.NotFound(c, "Subcontract not found")
+		return
+	}
+
+	// Check for linked acts
+	var actCount int
+	h.db.QueryRow(`SELECT COUNT(*) FROM construction_act WHERE subcontract_id = $1`, subID).Scan(&actCount)
+	if actCount > 0 {
+		response.BadRequest(c, "Cannot delete subcontract with linked acts")
+		return
+	}
+
+	h.db.Exec(`DELETE FROM construction_subcontract_wbs WHERE subcontract_id = $1`, subID)
+	_, err = h.db.Exec(`DELETE FROM construction_subcontract WHERE id = $1 AND tenant_id = $2`, subID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete subcontract", "error", err)
+		response.InternalError(c, "Failed to delete subcontract")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	h.logConstructionActivity(tenantID, projectID, userID, "team",
+		"Pudratchi shartnomasi o'chirildi", "Subcontract", subID)
+
+	response.Success(c, map[string]interface{}{
+		"message": "Subcontract deleted successfully",
+	})
+}
+
+// UpdateSubcontractState changes a subcontract's state
+func (h *Handler) UpdateSubcontractState(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	subID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var req struct {
+		State string `json:"state" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "State is required")
+		return
+	}
+
+	validStates := map[string]bool{
+		"draft": true, "active": true, "completed": true, "terminated": true,
+	}
+	if !validStates[req.State] {
+		response.BadRequest(c, "Invalid state. Must be: draft, active, completed, or terminated")
+		return
+	}
+
+	var projectID int64
+	var currentState string
+	err = h.db.QueryRow(`SELECT project_id, state FROM construction_subcontract WHERE id = $1 AND tenant_id = $2`,
+		subID, tenantID).Scan(&projectID, &currentState)
+	if err != nil {
+		response.NotFound(c, "Subcontract not found")
+		return
+	}
+
+	// Validate state transitions
+	validTransitions := map[string][]string{
+		"draft":      {"active", "terminated"},
+		"active":     {"completed", "terminated"},
+		"completed":  {},
+		"terminated": {"draft"},
+	}
+	allowed := false
+	for _, s := range validTransitions[currentState] {
+		if s == req.State {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		response.BadRequest(c, fmt.Sprintf("Cannot transition from '%s' to '%s'", currentState, req.State))
+		return
+	}
+
+	_, err = h.db.Exec(`UPDATE construction_subcontract SET state = $1, updated_date = NOW() WHERE id = $2 AND tenant_id = $3`,
+		req.State, subID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to update subcontract state", "error", err)
+		response.InternalError(c, "Failed to update state")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	h.logConstructionActivity(tenantID, projectID, userID, "team",
+		fmt.Sprintf("Pudratchi holati o'zgartirildi: %s → %s", currentState, req.State), "Subcontract", subID)
+
+	response.Success(c, map[string]interface{}{
+		"id":      subID,
+		"state":   req.State,
+		"message": "State updated successfully",
+	})
+}
+
+// Helper for nullable time in maps
+func nullTimeVal(nt sql.NullTime) interface{} {
+	if nt.Valid {
+		return nt.Time.Format("2006-01-02")
+	}
+	return nil
+}

@@ -80,10 +80,7 @@ func (h *Handler) ListAuditLogs(c *gin.Context)   { response.Success(c, []interf
 func (h *Handler) ExportAuditLogs(c *gin.Context) { response.Success(c, gin.H{"url": "/exports/audit_logs.csv"}) }
 
 // ========== NOTIFICATIONS ==========
-
-func (h *Handler) ListNotifications(c *gin.Context)       { response.Success(c, []interface{}{}) }
-func (h *Handler) MarkNotificationRead(c *gin.Context)    { response.Success(c, gin.H{"message": "Marked as read"}) }
-func (h *Handler) MarkAllNotificationsRead(c *gin.Context) { response.Success(c, gin.H{"message": "All marked as read"}) }
+// Real implementations in notifications.go
 
 // ========== FILES ==========
 // File handlers are implemented in files.go
