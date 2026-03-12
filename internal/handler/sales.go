@@ -1687,12 +1687,18 @@ func (h *Handler) createDeliveryChainForSO(
 		      FROM warehouse_operation_types
 		      WHERE tenant_id = $1 AND type = $2 AND is_active = true`
 		args := []interface{}{tenantID, typeCode}
-		if warehouseUUID != nil {
-			q += " AND warehouse_id = $3 ORDER BY sequence LIMIT 1"
-			args = append(args, *warehouseUUID)
-		} else {
-			q += " ORDER BY sequence LIMIT 1"
+		argIdx := 2
+		if organizationID != nil {
+			argIdx++
+			q += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argIdx)
+			args = append(args, *organizationID)
 		}
+		if warehouseUUID != nil {
+			argIdx++
+			q += fmt.Sprintf(" AND warehouse_id = $%d", argIdx)
+			args = append(args, *warehouseUUID)
+		}
+		q += " ORDER BY organization_id IS NULL, sequence LIMIT 1"
 		h.db.QueryRow(q, args...).Scan(&id, &srcLoc, &destLoc)
 		return id, srcLoc, destLoc
 	}

@@ -861,9 +861,26 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 	}
 
 	// Intercompany: when PO is sent (status → ordered), create SO in vendor company
+	// Only for buyer-initiated POs — skip if PO was auto-created from a vendor's SO
 	if input.Status != nil && *input.Status == "ordered" {
-		if err := h.icSync.SyncPurchaseOrderToSaleOrder(tenantID, id); err != nil {
-			h.log.Error("Intercompany PO->SO sync failed on send", "error", err, "po_id", id)
+		var createdFromSO int
+		h.db.QueryRow(`
+			SELECT COUNT(*) FROM intercompany_document_links
+			WHERE tenant_id = $1 AND linked_document_type = 'purchase_order' AND linked_document_id = $2
+		`, tenantID, id).Scan(&createdFromSO)
+		if createdFromSO == 0 {
+			if err := h.icSync.SyncPurchaseOrderToSaleOrder(tenantID, id); err != nil {
+				h.log.Error("Intercompany PO->SO sync failed on send", "error", err, "po_id", id)
+			}
+		}
+	}
+
+	// Create receipt stock operation when PO is sent (ordered) or approved
+	if input.Status != nil && (*input.Status == "approved" || *input.Status == "ordered") {
+		now := time.Now()
+		opID, _, _ := h.createReceiptStockOpForPO(tenantID, id, now)
+		if opID != uuid.Nil {
+			h.log.Info("Created receipt stock op for PO on status change", "op_id", opID, "po_id", id, "status", *input.Status)
 		}
 	}
 
@@ -1108,17 +1125,6 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 
 	now := time.Now()
 
-	// Check if vendor is an intercompany contact — if so, skip receipt op creation.
-	// The receipt op will be created when the vendor confirms the linked SO.
-	var isIntercompany bool
-	var icCheck int
-	if icErr := h.db.QueryRow(`
-		SELECT 1 FROM contacts
-		WHERE id = $1 AND tenant_id = $2 AND source_organization_id IS NOT NULL AND deleted_at IS NULL
-	`, vendorID, tenantID).Scan(&icCheck); icErr == nil {
-		isIntercompany = true
-	}
-
 	tx, err := h.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to start transaction: %w", err)
@@ -1144,9 +1150,8 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		h.log.Warn("Failed to cancel pending workflows", "error", wfErr)
 	}
 
-	// 2. Create stock operation (warehouse receipt) — skip for intercompany POs.
-	// For intercompany POs, the receipt op is created when the vendor confirms the linked SO.
-	if !isIntercompany {
+	// 2. Create stock operation (warehouse receipt)
+	{
 		var opTypeID uuid.UUID
 		var srcLocID, destLocID *uuid.UUID
 
@@ -1156,21 +1161,37 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 			WHERE tenant_id = $1 AND type = 'receipt' AND is_active = true
 		`
 		opTypeArgs := []interface{}{tenantID}
+		argIdx := 1
 
-		if warehouseID != nil {
-			opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
-			opTypeArgs = append(opTypeArgs, *warehouseID)
-		} else {
-			opTypeQuery += " ORDER BY sequence LIMIT 1"
+		if orgID != nil {
+			argIdx++
+			opTypeQuery += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argIdx)
+			opTypeArgs = append(opTypeArgs, *orgID)
 		}
+		if warehouseID != nil {
+			argIdx++
+			opTypeQuery += fmt.Sprintf(" AND warehouse_id = $%d", argIdx)
+			opTypeArgs = append(opTypeArgs, *warehouseID)
+		}
+		opTypeQuery += " ORDER BY organization_id IS NULL, sequence LIMIT 1"
 
 		err = h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&opTypeID, &srcLocID, &destLocID)
+		if err != nil && warehouseID != nil && orgID != nil {
+			// Fallback: try with org only (no warehouse filter), but never cross orgs
+			fallbackQuery := `
+				SELECT id, default_location_src_id, default_location_dest_id
+				FROM warehouse_operation_types
+				WHERE tenant_id = $1 AND type = 'receipt' AND is_active = true
+				  AND (organization_id = $2 OR organization_id IS NULL)
+				ORDER BY organization_id IS NULL, sequence LIMIT 1
+			`
+			err = h.db.QueryRow(fallbackQuery, tenantID, *orgID).Scan(&opTypeID, &srcLocID, &destLocID)
+		}
 		if err != nil {
-			h.log.Warn("No receipt operation type found for stock operation creation",
-				"error", err, "tenant_id", tenantID, "warehouse_id", warehouseID)
+			return fmt.Errorf("NO_RECEIPT_WAREHOUSE")
 		}
 
-		if err == nil {
+		{
 			opID := uuid.New()
 			opName := h.nextStockOperationName(tenantID, "receipt")
 
@@ -1302,12 +1323,18 @@ func (h *Handler) createDeliveryStockOpForSO(tenantID uuid.UUID, soID uuid.UUID,
 		WHERE tenant_id = $1 AND type = 'delivery' AND is_active = true
 	`
 	opTypeArgs := []interface{}{tenantID}
-	if warehouseID != nil {
-		opTypeQuery += " AND warehouse_id = $2 ORDER BY sequence LIMIT 1"
-		opTypeArgs = append(opTypeArgs, *warehouseID)
-	} else {
-		opTypeQuery += " ORDER BY sequence LIMIT 1"
+	argIdx := 1
+	if organizationID != nil {
+		argIdx++
+		opTypeQuery += fmt.Sprintf(" AND organization_id = $%d", argIdx)
+		opTypeArgs = append(opTypeArgs, *organizationID)
 	}
+	if warehouseID != nil {
+		argIdx++
+		opTypeQuery += fmt.Sprintf(" AND warehouse_id = $%d", argIdx)
+		opTypeArgs = append(opTypeArgs, *warehouseID)
+	}
+	opTypeQuery += " ORDER BY sequence LIMIT 1"
 	if err := h.db.QueryRow(opTypeQuery, opTypeArgs...).Scan(&opTypeID, &srcLocID, &destLocID); err != nil {
 		h.log.Warn("Intercompany: no delivery op type found", "error", err, "so_id", soID)
 		return
@@ -1427,6 +1454,10 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 	}
 
 	if err := h.approvePOAndCreateReceipt(tenantID, userID, id); err != nil {
+		if err.Error() == "NO_RECEIPT_WAREHOUSE" {
+			response.BadRequest(c, "NO_RECEIPT_WAREHOUSE")
+			return
+		}
 		h.log.Error("Failed to approve purchase order", "error", err)
 		response.InternalError(c, "Failed to approve purchase order")
 		return
