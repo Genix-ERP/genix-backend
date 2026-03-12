@@ -270,6 +270,15 @@ type WarehouseOperationType struct {
 	CreatedAt              time.Time         `json:"created_at" db:"created_at"`
 	UpdatedAt              time.Time         `json:"updated_at" db:"updated_at"`
 
+	// TT extensions
+	JournalID                *uuid.UUID `json:"journal_id,omitempty" db:"journal_id"`
+	DebitAccountID           *uuid.UUID `json:"debit_account_id,omitempty" db:"debit_account_id"`
+	CreditAccountID          *uuid.UUID `json:"credit_account_id,omitempty" db:"credit_account_id"`
+	AutoPostAccounting       bool       `json:"auto_post_accounting" db:"auto_post_accounting"`
+	ApprovalRule             string     `json:"approval_rule" db:"approval_rule"`
+	ApprovalAmountThreshold  *float64   `json:"approval_amount_threshold,omitempty" db:"approval_amount_threshold"`
+	ApprovalQuantityThreshold *float64  `json:"approval_quantity_threshold,omitempty" db:"approval_quantity_threshold"`
+
 	// Relationships
 	Warehouse *Warehouse `json:"warehouse,omitempty"`
 }
@@ -382,6 +391,9 @@ type StockOperation struct {
 	ResponsibleID   *uuid.UUID `json:"responsible_id,omitempty"`
 	Note            string     `json:"note,omitempty"`
 	WriteOffReason  string     `json:"write_off_reason,omitempty"`
+	CarrierID       *uuid.UUID `json:"carrier_id,omitempty"`
+	DeliveryAddress string     `json:"delivery_address,omitempty"`
+	TrackingNumber  string     `json:"tracking_number,omitempty"`
 	Lines           []StockOperationLine    `json:"lines,omitempty"`
 	StepLogs        []StockOperationStepLog `json:"step_logs,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
@@ -406,9 +418,12 @@ type StockOperationLine struct {
 	QualityStatus    string     `json:"quality_status"` // good, defective, rejected
 	SourceLocationID *uuid.UUID `json:"source_location_id,omitempty"`
 	DestLocationID   *uuid.UUID `json:"dest_location_id,omitempty"`
-	WriteOffReason   string     `json:"write_off_reason,omitempty"`
-	Note             string     `json:"note,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
+	WriteOffReason     string     `json:"write_off_reason,omitempty"`
+	Note               string     `json:"note,omitempty"`
+	LineTrackingNumber string     `json:"tracking_number,omitempty"`
+	PackageWeight      *float64   `json:"package_weight,omitempty"`
+	PackageDimensions  string     `json:"package_dimensions,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
 }
 
 // StockOperationStepLog records the execution of each step
@@ -443,6 +458,9 @@ type CreateStockOperationInput struct {
 	Priority         string                       `json:"priority,omitempty"`
 	Note             string                       `json:"note,omitempty"`
 	WriteOffReason   string                       `json:"write_off_reason,omitempty"`
+	CarrierID        string                       `json:"carrier_id,omitempty"`
+	DeliveryAddress  string                       `json:"delivery_address,omitempty"`
+	TrackingNumber   string                       `json:"tracking_number,omitempty"`
 	Lines            []CreateStockOperationLine   `json:"lines,omitempty"`
 }
 
