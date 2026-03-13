@@ -31,24 +31,34 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		return
 	}
 
-	query := `
+	scope := c.Query("scope") // "subcontract" to get subcontract-linked estimates only
+
+	scopeFilter := "AND e.subcontract_id IS NULL"
+	if scope == "subcontract" {
+		scopeFilter = "AND e.subcontract_id IS NOT NULL"
+	}
+
+	query := fmt.Sprintf(`
 		SELECT e.id, e.tenant_id, e.project_id, e.building_id, e.version, e.name, e.state, e.is_current,
 		       e.overhead_pct, e.profit_pct, e.vat_pct,
 		       e.amount_direct, e.amount_total,
 		       COALESCE(e.source_type, '') as source_type,
+		       e.subcontract_id,
 		       e.approved_by, e.approved_date, e.created_by,
 		       e.created_date, e.updated_date,
 		       COALESCE((SELECT COUNT(*) FROM construction_estimate_line l WHERE l.estimate_id = e.id), 0) as lines_count,
 		       COALESCE(ua.first_name || ' ' || ua.last_name, '') as approved_name,
 		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name,
-		       COALESCE(b.name, '') as building_name
+		       COALESCE(b.name, '') as building_name,
+		       COALESCE(sc.name, '') as subcontract_name
 		FROM construction_estimate e
 		LEFT JOIN users ua ON ua.id = e.approved_by
 		LEFT JOIN users uc ON uc.id = e.created_by
 		LEFT JOIN construction_buildings b ON b.id = e.building_id
-		WHERE e.project_id = $1 AND e.tenant_id = $2
+		LEFT JOIN construction_subcontract sc ON sc.id = e.subcontract_id
+		WHERE e.project_id = $1 AND e.tenant_id = $2 %s
 		ORDER BY e.version DESC
-	`
+	`, scopeFilter)
 
 	rows, err := h.db.Query(query, projectID, tenantID)
 	if err != nil {
@@ -66,10 +76,12 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 			&item.OverheadPct, &item.ProfitPct, &item.VatPct,
 			&item.AmountDirect, &item.AmountTotal,
 			&item.SourceType,
+			&item.SubcontractID,
 			&item.ApprovedBy, &item.ApprovedDate, &item.CreatedBy,
 			&item.CreatedDate, &item.UpdatedDate,
 			&item.LinesCount, &item.ApprovedName, &item.CreatedName,
 			&item.BuildingName,
+			&item.SubcontractName,
 		); err != nil {
 			h.log.Error("Failed to scan estimate", "error", err)
 			continue
@@ -101,26 +113,31 @@ func (h *Handler) GetEstimate(c *gin.Context) {
 		       e.overhead_pct, e.profit_pct, e.vat_pct,
 		       e.amount_direct, e.amount_total,
 		       COALESCE(e.source_type, '') as source_type,
+		       e.subcontract_id,
 		       e.approved_by, e.approved_date, e.created_by,
 		       e.created_date, e.updated_date,
 		       0 as lines_count,
 		       COALESCE(ua.first_name || ' ' || ua.last_name, '') as approved_name,
 		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name,
-		       COALESCE(b.name, '') as building_name
+		       COALESCE(b.name, '') as building_name,
+		       COALESCE(sc.name, '') as subcontract_name
 		FROM construction_estimate e
 		LEFT JOIN users ua ON ua.id = e.approved_by
 		LEFT JOIN users uc ON uc.id = e.created_by
 		LEFT JOIN construction_buildings b ON b.id = e.building_id
+		LEFT JOIN construction_subcontract sc ON sc.id = e.subcontract_id
 		WHERE e.id = $1 AND e.tenant_id = $2
 	`, id, tenantID).Scan(
 		&est.ID, &est.TenantID, &est.ProjectID, &est.BuildingID, &est.Version, &est.Name, &est.State, &est.IsCurrent,
 		&est.OverheadPct, &est.ProfitPct, &est.VatPct,
 		&est.AmountDirect, &est.AmountTotal,
 		&est.SourceType,
+		&est.SubcontractID,
 		&est.ApprovedBy, &est.ApprovedDate, &est.CreatedBy,
 		&est.CreatedDate, &est.UpdatedDate,
 		&est.LinesCount, &est.ApprovedName, &est.CreatedName,
 		&est.BuildingName,
+		&est.SubcontractName,
 	)
 	if err != nil {
 		response.NotFound(c, "Estimate not found")
@@ -186,12 +203,12 @@ func (h *Handler) CreateEstimate(c *gin.Context) {
 		INSERT INTO construction_estimate (
 			tenant_id, project_id, building_id, version, name, state, is_current,
 			overhead_pct, profit_pct, vat_pct,
-			source_type, created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, 'draft', false, $6, $7, $8, $9, $10, NOW(), NOW())
+			source_type, subcontract_id, created_by, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, 'draft', false, $6, $7, $8, $9, $10, $11, NOW(), NOW())
 		RETURNING id
 	`, tenantID, projectID, nullInt64FromVal(req.BuildingID), nextVersion, req.Name,
 		req.OverheadPct, req.ProfitPct, req.VatPct,
-		nullStringFromVal(req.SourceType), userID,
+		nullStringFromVal(req.SourceType), nullInt64FromVal(req.SubcontractID), userID,
 	).Scan(&itemID)
 
 	if err != nil {
@@ -456,11 +473,11 @@ func (h *Handler) DuplicateEstimate(c *gin.Context) {
 	// Get source estimate
 	var src entity.ConstructionEstimate
 	err = h.db.QueryRow(`
-		SELECT id, tenant_id, project_id, building_id, version, name, overhead_pct, profit_pct, vat_pct
+		SELECT id, tenant_id, project_id, building_id, version, name, overhead_pct, profit_pct, vat_pct, subcontract_id
 		FROM construction_estimate WHERE id = $1 AND tenant_id = $2
 	`, id, tenantID).Scan(
 		&src.ID, &src.TenantID, &src.ProjectID, &src.BuildingID, &src.Version, &src.Name,
-		&src.OverheadPct, &src.ProfitPct, &src.VatPct,
+		&src.OverheadPct, &src.ProfitPct, &src.VatPct, &src.SubcontractID,
 	)
 	if err != nil {
 		response.NotFound(c, "Source estimate not found")
@@ -490,12 +507,12 @@ func (h *Handler) DuplicateEstimate(c *gin.Context) {
 		INSERT INTO construction_estimate (
 			tenant_id, project_id, building_id, version, name, state, is_current,
 			overhead_pct, profit_pct, vat_pct,
-			created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, 'draft', false, $6, $7, $8, $9, NOW(), NOW())
+			subcontract_id, created_by, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, 'draft', false, $6, $7, $8, $9, $10, NOW(), NOW())
 		RETURNING id
 	`, tenantID, src.ProjectID, src.BuildingID, nextVersion,
 		fmt.Sprintf("%s (v%d)", src.Name, nextVersion),
-		src.OverheadPct, src.ProfitPct, src.VatPct, userID,
+		src.OverheadPct, src.ProfitPct, src.VatPct, src.SubcontractID, userID,
 	).Scan(&newID)
 	if err != nil {
 		h.log.Error("Failed to create duplicate estimate", "error", err)
