@@ -258,10 +258,12 @@ type ConstructionDailyLog struct {
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
 
 	// Computed
-	BuildingName  string  `json:"building_name,omitempty" db:"building_name"`
-	StageName     string  `json:"stage_name,omitempty" db:"stage_name"`
-	StageProgress float64 `json:"stage_progress" db:"stage_progress"`
-	ReportedName  string  `json:"reported_name,omitempty" db:"reported_name"`
+	BuildingName       string  `json:"building_name,omitempty" db:"building_name"`
+	StageName          string  `json:"stage_name,omitempty" db:"stage_name"`
+	StageProgress      float64 `json:"stage_progress" db:"stage_progress"`
+	StagePlannedBudget float64 `json:"stage_planned_budget" db:"stage_planned_budget"`
+	StageMaterialTotal float64 `json:"stage_material_total" db:"stage_material_total"`
+	ReportedName       string  `json:"reported_name,omitempty" db:"reported_name"`
 }
 
 func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
@@ -281,30 +283,34 @@ func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
 		ReportedBy     interface{} `json:"reported_by"`
 		CreatedDate    time.Time   `json:"created_date"`
 		UpdatedDate    time.Time   `json:"updated_date"`
-		BuildingName   string      `json:"building_name,omitempty"`
-		StageName      string      `json:"stage_name,omitempty"`
-		StageProgress  float64     `json:"stage_progress"`
-		ReportedName   string      `json:"reported_name,omitempty"`
+		BuildingName       string      `json:"building_name,omitempty"`
+		StageName          string      `json:"stage_name,omitempty"`
+		StageProgress      float64     `json:"stage_progress"`
+		StagePlannedBudget float64     `json:"stage_planned_budget"`
+		StageMaterialTotal float64     `json:"stage_material_total"`
+		ReportedName       string      `json:"reported_name,omitempty"`
 	}{
-		ID:             d.ID,
-		TenantID:       d.TenantID,
-		ProjectID:      d.ProjectID,
-		BuildingID:     nullInt64Value(d.BuildingID),
-		StageID:        nullInt64Value(d.StageID),
-		Date:           d.Date,
-		EndDate:        nullStringValue(d.EndDate),
-		WorkersCount:   d.WorkersCount,
-		ExpectedBudget: d.ExpectedBudget,
-		Weather:        nullStringValue(d.Weather),
-		Description:    nullStringValue(d.Description),
-		Issues:         nullStringValue(d.Issues),
-		ReportedBy:     nullUUIDValue(d.ReportedBy),
-		CreatedDate:    d.CreatedDate,
-		UpdatedDate:    d.UpdatedDate,
-		BuildingName:   d.BuildingName,
-		StageName:      d.StageName,
-		StageProgress:  d.StageProgress,
-		ReportedName:   d.ReportedName,
+		ID:                 d.ID,
+		TenantID:           d.TenantID,
+		ProjectID:          d.ProjectID,
+		BuildingID:         nullInt64Value(d.BuildingID),
+		StageID:            nullInt64Value(d.StageID),
+		Date:               d.Date,
+		EndDate:            nullStringValue(d.EndDate),
+		WorkersCount:       d.WorkersCount,
+		ExpectedBudget:     d.ExpectedBudget,
+		Weather:            nullStringValue(d.Weather),
+		Description:        nullStringValue(d.Description),
+		Issues:             nullStringValue(d.Issues),
+		ReportedBy:         nullUUIDValue(d.ReportedBy),
+		CreatedDate:        d.CreatedDate,
+		UpdatedDate:        d.UpdatedDate,
+		BuildingName:       d.BuildingName,
+		StageName:          d.StageName,
+		StageProgress:      d.StageProgress,
+		StagePlannedBudget: d.StagePlannedBudget,
+		StageMaterialTotal: d.StageMaterialTotal,
+		ReportedName:       d.ReportedName,
 	})
 }
 

@@ -97,6 +97,13 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 		            FROM construction_sub_stages ss WHERE ss.stage_id = d.stage_id AND ss.tenant_id = d.tenant_id),
 		           CASE WHEN s.status = 'completed' THEN 100 ELSE 0 END
 		       ) as stage_progress,
+		       COALESCE(s.planned_budget, 0) as stage_planned_budget,
+		       COALESCE(
+		           (SELECT SUM(m.total_cost)
+		            FROM construction_sub_stage_materials m
+		            JOIN construction_sub_stages ss ON ss.id = m.sub_stage_id
+		            WHERE ss.stage_id = d.stage_id AND m.tenant_id = d.tenant_id),
+		       0) as stage_material_total,
 		       COALESCE(u.first_name || ' ' || u.last_name, '') as reported_name
 		FROM construction_daily_log d
 		LEFT JOIN construction_buildings b ON b.id = d.building_id
@@ -149,7 +156,7 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 			&item.Date, &item.EndDate,
 			&item.WorkersCount, &item.ExpectedBudget, &item.Weather, &item.Description, &item.Issues,
 			&item.ReportedBy, &item.CreatedDate, &item.UpdatedDate,
-			&item.BuildingName, &item.StageName, &item.StageProgress, &item.ReportedName,
+			&item.BuildingName, &item.StageName, &item.StageProgress, &item.StagePlannedBudget, &item.StageMaterialTotal, &item.ReportedName,
 		); err != nil {
 			h.log.Error("Failed to scan daily log", "error", err)
 			continue

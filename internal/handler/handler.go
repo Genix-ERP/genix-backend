@@ -1796,6 +1796,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionStages.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionStage)
 		constructionStages.GET("/:id/sub-stages", h.ListConstructionSubStages)
 		constructionStages.POST("/:id/sub-stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionSubStage)
+		constructionStages.GET("/:id/materials", h.ListStageMaterials)
 	}
 
 	// Construction Sub-Stages (direct access for update/delete)
@@ -1804,6 +1805,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		constructionSubStages.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionSubStage)
 		constructionSubStages.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionSubStage)
+		constructionSubStages.GET("/:id/materials", h.ListSubStageMaterials)
+		constructionSubStages.POST("/:id/materials", h.perm.Require("construction", "project", "update"), h.CreateSubStageMaterial)
+	}
+
+	// Construction Sub-Stage Materials (direct access for update/delete)
+	subStageMaterials := rg.Group("/construction/sub-stage-materials")
+	subStageMaterials.Use(h.perm.Require("construction", "project", "read"))
+	{
+		subStageMaterials.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateSubStageMaterial)
+		subStageMaterials.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteSubStageMaterial)
 	}
 
 	// Expense Lines (direct access for update/delete/approve/cancel)
