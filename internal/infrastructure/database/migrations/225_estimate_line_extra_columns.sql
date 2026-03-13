@@ -1,0 +1,3 @@
+ALTER TABLE construction_estimate_line
+  ADD COLUMN IF NOT EXISTS code VARCHAR(100),
+  ADD COLUMN IF NOT EXISTS item_number VARCHAR(50);

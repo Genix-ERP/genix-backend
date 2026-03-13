@@ -1,0 +1,2 @@
+ALTER TABLE construction_estimate
+  ADD COLUMN IF NOT EXISTS source_type VARCHAR(20) DEFAULT NULL;
