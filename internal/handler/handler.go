@@ -1651,6 +1651,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/estimates", h.ListEstimates)
 		constructionProjects.POST("/:id/estimates", h.perm.Require("construction", "estimate", "create"), h.CreateEstimate)
 
+		// Estimate Summary (Свод)
+		constructionProjects.GET("/:id/estimate-summary", h.ListEstimateSummary)
+		constructionProjects.POST("/:id/estimate-summary/import", h.perm.Require("construction", "estimate", "create"), h.ImportEstimateSummary)
+
 		// Daily Logs (WBS-linked)
 		constructionProjects.GET("/:id/daily-logs", h.ListConstructionDailyLogs)
 		constructionProjects.POST("/:id/daily-logs", h.perm.Require("construction", "daily_log", "create"), h.CreateConstructionDailyLog)
@@ -1764,8 +1768,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Estimate Lines
 		estimates.GET("/:id/lines", h.ListEstimateLines)
 		estimates.POST("/:id/lines", h.perm.Require("construction", "estimate", "update"), h.CreateEstimateLine)
+		estimates.POST("/:id/lines/bulk", h.perm.Require("construction", "estimate", "update"), h.BulkCreateEstimateLines)
 		estimates.PUT("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.UpdateEstimateLine)
 		estimates.DELETE("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.DeleteEstimateLine)
+	}
+
+	// Estimate Summary (direct access)
+	estimateSummary := rg.Group("/construction/estimate-summary")
+	estimateSummary.Use(h.perm.Require("construction", "estimate", "read"))
+	{
+		estimateSummary.DELETE("/:batch_id", h.perm.Require("construction", "estimate", "delete"), h.DeleteEstimateSummaryBatch)
 	}
 
 	// Construction Daily Logs (direct access)
