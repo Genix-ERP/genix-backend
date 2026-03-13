@@ -35,6 +35,7 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		SELECT e.id, e.tenant_id, e.project_id, e.building_id, e.version, e.name, e.state, e.is_current,
 		       e.overhead_pct, e.profit_pct, e.vat_pct,
 		       e.amount_direct, e.amount_total,
+		       COALESCE(e.source_type, '') as source_type,
 		       e.approved_by, e.approved_date, e.created_by,
 		       e.created_date, e.updated_date,
 		       COALESCE((SELECT COUNT(*) FROM construction_estimate_line l WHERE l.estimate_id = e.id), 0) as lines_count,
@@ -64,6 +65,7 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 			&item.ID, &item.TenantID, &item.ProjectID, &item.BuildingID, &item.Version, &item.Name, &item.State, &item.IsCurrent,
 			&item.OverheadPct, &item.ProfitPct, &item.VatPct,
 			&item.AmountDirect, &item.AmountTotal,
+			&item.SourceType,
 			&item.ApprovedBy, &item.ApprovedDate, &item.CreatedBy,
 			&item.CreatedDate, &item.UpdatedDate,
 			&item.LinesCount, &item.ApprovedName, &item.CreatedName,
@@ -98,6 +100,7 @@ func (h *Handler) GetEstimate(c *gin.Context) {
 		SELECT e.id, e.tenant_id, e.project_id, e.building_id, e.version, e.name, e.state, e.is_current,
 		       e.overhead_pct, e.profit_pct, e.vat_pct,
 		       e.amount_direct, e.amount_total,
+		       COALESCE(e.source_type, '') as source_type,
 		       e.approved_by, e.approved_date, e.created_by,
 		       e.created_date, e.updated_date,
 		       0 as lines_count,
@@ -113,6 +116,7 @@ func (h *Handler) GetEstimate(c *gin.Context) {
 		&est.ID, &est.TenantID, &est.ProjectID, &est.BuildingID, &est.Version, &est.Name, &est.State, &est.IsCurrent,
 		&est.OverheadPct, &est.ProfitPct, &est.VatPct,
 		&est.AmountDirect, &est.AmountTotal,
+		&est.SourceType,
 		&est.ApprovedBy, &est.ApprovedDate, &est.CreatedBy,
 		&est.CreatedDate, &est.UpdatedDate,
 		&est.LinesCount, &est.ApprovedName, &est.CreatedName,
@@ -182,11 +186,12 @@ func (h *Handler) CreateEstimate(c *gin.Context) {
 		INSERT INTO construction_estimate (
 			tenant_id, project_id, building_id, version, name, state, is_current,
 			overhead_pct, profit_pct, vat_pct,
-			created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, 'draft', false, $6, $7, $8, $9, NOW(), NOW())
+			source_type, created_by, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, 'draft', false, $6, $7, $8, $9, $10, NOW(), NOW())
 		RETURNING id
 	`, tenantID, projectID, nullInt64FromVal(req.BuildingID), nextVersion, req.Name,
-		req.OverheadPct, req.ProfitPct, req.VatPct, userID,
+		req.OverheadPct, req.ProfitPct, req.VatPct,
+		nullStringFromVal(req.SourceType), userID,
 	).Scan(&itemID)
 
 	if err != nil {
@@ -607,14 +612,16 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		INSERT INTO construction_estimate_line (
 			tenant_id, estimate_id, wbs_id, name, uom, quantity,
 			material_rate, labor_rate, equipment_rate,
-			unit_rate, total_amount, sort_order,
+			unit_rate, total_amount, code, item_number,
+			resource_type, parent_item_number, sort_order,
 			created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW())
 		RETURNING id
 	`, tenantID, estimateID, nullInt64FromVal(req.WBSID),
 		req.Name, uom, req.Quantity,
 		req.MaterialRate, req.LaborRate, req.EquipmentRate,
-		unitRate, totalAmount, req.SortOrder,
+		unitRate, totalAmount, nullStringFromVal(req.Code), nullStringFromVal(req.ItemNumber),
+		nullStringFromVal(req.ResourceType), nullStringFromVal(req.ParentItemNumber), req.SortOrder,
 	).Scan(&lineID)
 
 	if err != nil {
@@ -628,6 +635,101 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 
 	response.Success(c, map[string]interface{}{
 		"id": lineID,
+	})
+}
+
+// BulkCreateEstimateLines creates multiple estimate lines in a single transaction
+func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	estimateID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid estimate ID")
+		return
+	}
+
+	// Check state
+	var state string
+	err = h.db.QueryRow(`SELECT state FROM construction_estimate WHERE id = $1 AND tenant_id = $2`, estimateID, tenantID).Scan(&state)
+	if err != nil {
+		response.NotFound(c, "Estimate not found")
+		return
+	}
+	if state != "draft" {
+		response.BadRequest(c, "Only draft estimates can be modified")
+		return
+	}
+
+	var req entity.BulkCreateEstimateLinesInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	if len(req.Lines) == 0 {
+		response.BadRequest(c, "No lines provided")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin transaction", "error", err)
+		response.InternalError(c, "Failed to start import")
+		return
+	}
+	defer tx.Rollback()
+
+	count := 0
+	for i, line := range req.Lines {
+		unitRate := line.MaterialRate + line.LaborRate + line.EquipmentRate
+		totalAmount := unitRate * line.Quantity
+		uom := line.UOM
+		if uom == "" {
+			uom = "шт"
+		}
+		sortOrder := line.SortOrder
+		if sortOrder == 0 {
+			sortOrder = i + 1
+		}
+
+		_, err := tx.Exec(`
+			INSERT INTO construction_estimate_line (
+				tenant_id, estimate_id, wbs_id, name, uom, quantity,
+				material_rate, labor_rate, equipment_rate,
+				unit_rate, total_amount, code, item_number,
+				resource_type, parent_item_number, sort_order,
+				created_date, updated_date
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW())
+		`, tenantID, estimateID, nullInt64FromVal(line.WBSID),
+			line.Name, uom, line.Quantity,
+			line.MaterialRate, line.LaborRate, line.EquipmentRate,
+			unitRate, totalAmount, nullStringFromVal(line.Code), nullStringFromVal(line.ItemNumber),
+			nullStringFromVal(line.ResourceType), nullStringFromVal(line.ParentItemNumber), sortOrder,
+		)
+		if err != nil {
+			h.log.Error("Failed to insert estimate line", "error", err, "index", i)
+			response.InternalError(c, fmt.Sprintf("Failed to insert line %d: %s", i+1, line.Name))
+			return
+		}
+		count++
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to complete import")
+		return
+	}
+
+	// Recalculate estimate totals
+	h.recalculateEstimateTotals(estimateID)
+
+	response.Success(c, map[string]interface{}{
+		"count": count,
 	})
 }
 
@@ -832,6 +934,8 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       l.name, l.uom, l.quantity,
 		       l.material_rate, l.labor_rate, l.equipment_rate,
 		       l.unit_rate, l.total_amount, l.actual_amount,
+		       COALESCE(l.code, ''), COALESCE(l.item_number, ''),
+		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
@@ -856,6 +960,8 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 			&line.Name, &line.UOM, &line.Quantity,
 			&line.MaterialRate, &line.LaborRate, &line.EquipmentRate,
 			&line.UnitRate, &line.TotalAmount, &line.ActualAmount,
+			&line.Code, &line.ItemNumber,
+			&line.ResourceType, &line.ParentItemNumber,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
@@ -904,4 +1010,154 @@ func (h *Handler) recalculateEstimateTotals(estimateID int64) {
 	if err != nil {
 		h.log.Error("Failed to update estimate totals", "error", err)
 	}
+}
+
+// =====================================================
+// ESTIMATE SUMMARY (Свод) HANDLERS
+// =====================================================
+
+// ImportEstimateSummary bulk-imports Свод cross-tab data for a project
+func (h *Handler) ImportEstimateSummary(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req entity.BulkCreateEstimateSummaryInput
+	if err := c.ShouldBindJSON(&req); err != nil {
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	if len(req.Rows) == 0 {
+		response.BadRequest(c, "No rows provided")
+		return
+	}
+
+	// Generate batch ID
+	batchID := uuid.New().String()[:8]
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin transaction", "error", err)
+		response.InternalError(c, "Failed to start import")
+		return
+	}
+	defer tx.Rollback()
+
+	count := 0
+	for _, row := range req.Rows {
+		_, err := tx.Exec(`
+			INSERT INTO construction_estimate_summary (
+				tenant_id, project_id, batch_id, row_number,
+				category_name, building_column, amount, created_date
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+		`, tenantID, projectID, batchID, row.RowNumber,
+			row.CategoryName, row.BuildingColumn, row.Amount,
+		)
+		if err != nil {
+			h.log.Error("Failed to insert summary row", "error", err, "category", row.CategoryName)
+			response.InternalError(c, fmt.Sprintf("Failed to insert row: %s", row.CategoryName))
+			return
+		}
+		count++
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to complete import")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	h.logConstructionActivity(tenantID, projectID, userID, "estimate", fmt.Sprintf("Svod import qilindi: %d qator", count), "EstimateSummary", 0)
+
+	response.Success(c, map[string]interface{}{
+		"count":    count,
+		"batch_id": batchID,
+	})
+}
+
+// ListEstimateSummary returns all summary data for a project
+func (h *Handler) ListEstimateSummary(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	query := `
+		SELECT id, tenant_id, project_id, batch_id, row_number,
+		       category_name, building_column, amount, created_date
+		FROM construction_estimate_summary
+		WHERE project_id = $1 AND tenant_id = $2
+		ORDER BY batch_id DESC, row_number ASC, building_column ASC
+	`
+
+	rows, err := h.db.Query(query, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list estimate summary", "error", err)
+		response.InternalError(c, "Failed to list estimate summary")
+		return
+	}
+	defer rows.Close()
+
+	items := []entity.ConstructionEstimateSummary{}
+	for rows.Next() {
+		var item entity.ConstructionEstimateSummary
+		if err := rows.Scan(
+			&item.ID, &item.TenantID, &item.ProjectID, &item.BatchID, &item.RowNumber,
+			&item.CategoryName, &item.BuildingColumn, &item.Amount, &item.CreatedDate,
+		); err != nil {
+			h.log.Error("Failed to scan summary row", "error", err)
+			continue
+		}
+		items = append(items, item)
+	}
+
+	response.Success(c, items)
+}
+
+// DeleteEstimateSummaryBatch deletes all summary rows for a batch
+func (h *Handler) DeleteEstimateSummaryBatch(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	batchID := c.Param("batch_id")
+	if batchID == "" {
+		response.BadRequest(c, "Invalid batch ID")
+		return
+	}
+
+	result, err := h.db.Exec(
+		`DELETE FROM construction_estimate_summary WHERE batch_id = $1 AND tenant_id = $2`,
+		batchID, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to delete summary batch", "error", err)
+		response.InternalError(c, "Failed to delete summary batch")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	response.Success(c, map[string]interface{}{
+		"deleted": rowsAffected,
+	})
 }

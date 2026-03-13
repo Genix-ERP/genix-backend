@@ -32,6 +32,8 @@ type ConstructionEstimate struct {
 	ApprovedBy   uuid.NullUUID `json:"approved_by" db:"approved_by"`
 	ApprovedDate sql.NullTime  `json:"approved_date" db:"approved_date"`
 
+	SourceType string `json:"source_type" db:"source_type"`
+
 	CreatedBy   uuid.NullUUID `json:"created_by" db:"created_by"`
 	CreatedDate time.Time     `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time     `json:"updated_date" db:"updated_date"`
@@ -58,6 +60,7 @@ func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
 		VatPct       float64     `json:"vat_pct"`
 		AmountDirect float64     `json:"amount_direct"`
 		AmountTotal  float64     `json:"amount_total"`
+		SourceType   string      `json:"source_type"`
 		ApprovedBy   interface{} `json:"approved_by"`
 		ApprovedDate interface{} `json:"approved_date"`
 		CreatedBy    interface{} `json:"created_by"`
@@ -81,6 +84,7 @@ func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
 		VatPct:       e.VatPct,
 		AmountDirect: e.AmountDirect,
 		AmountTotal:  e.AmountTotal,
+		SourceType:   e.SourceType,
 		ApprovedBy:   nullUUIDValue(e.ApprovedBy),
 		ApprovedDate: nullTimeValue(e.ApprovedDate),
 		CreatedBy:    nullUUIDValue(e.CreatedBy),
@@ -99,6 +103,7 @@ type CreateEstimateInput struct {
 	OverheadPct float64 `json:"overhead_pct"`
 	ProfitPct   float64 `json:"profit_pct"`
 	VatPct      float64 `json:"vat_pct"`
+	SourceType  string  `json:"source_type"`
 }
 
 type UpdateEstimateInput struct {
@@ -132,6 +137,11 @@ type ConstructionEstimateLine struct {
 
 	ActualAmount float64 `json:"actual_amount" db:"actual_amount"`
 
+	Code             string `json:"code" db:"code"`
+	ItemNumber       string `json:"item_number" db:"item_number"`
+	ResourceType     string `json:"resource_type" db:"resource_type"`
+	ParentItemNumber string `json:"parent_item_number" db:"parent_item_number"`
+
 	SortOrder   int       `json:"sort_order" db:"sort_order"`
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
@@ -156,7 +166,11 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		UnitRate      float64     `json:"unit_rate"`
 		TotalAmount   float64     `json:"total_amount"`
 		ActualAmount  float64     `json:"actual_amount"`
-		SortOrder     int         `json:"sort_order"`
+		Code             string `json:"code"`
+		ItemNumber       string `json:"item_number"`
+		ResourceType     string `json:"resource_type"`
+		ParentItemNumber string `json:"parent_item_number"`
+		SortOrder        int    `json:"sort_order"`
 		CreatedDate   time.Time   `json:"created_date"`
 		UpdatedDate   time.Time   `json:"updated_date"`
 		WBSCode       string      `json:"wbs_code,omitempty"`
@@ -175,7 +189,11 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		UnitRate:      l.UnitRate,
 		TotalAmount:   l.TotalAmount,
 		ActualAmount:  l.ActualAmount,
-		SortOrder:     l.SortOrder,
+		Code:             l.Code,
+		ItemNumber:       l.ItemNumber,
+		ResourceType:     l.ResourceType,
+		ParentItemNumber: l.ParentItemNumber,
+		SortOrder:        l.SortOrder,
 		CreatedDate:   l.CreatedDate,
 		UpdatedDate:   l.UpdatedDate,
 		WBSCode:       l.WBSCode,
@@ -191,7 +209,15 @@ type CreateEstimateLineInput struct {
 	MaterialRate  float64 `json:"material_rate"`
 	LaborRate     float64 `json:"labor_rate"`
 	EquipmentRate float64 `json:"equipment_rate"`
-	SortOrder     int     `json:"sort_order"`
+	Code             string `json:"code"`
+	ItemNumber       string `json:"item_number"`
+	ResourceType     string `json:"resource_type"`
+	ParentItemNumber string `json:"parent_item_number"`
+	SortOrder        int    `json:"sort_order"`
+}
+
+type BulkCreateEstimateLinesInput struct {
+	Lines []CreateEstimateLineInput `json:"lines" binding:"required"`
 }
 
 type UpdateEstimateLineInput struct {
@@ -304,4 +330,31 @@ type UpdateDailyLogInput struct {
 	Weather        *string  `json:"weather"`
 	Description    *string  `json:"description"`
 	Issues         *string  `json:"issues"`
+}
+
+// =====================================================
+// CONSTRUCTION ESTIMATE SUMMARY (Свод cross-tab)
+// =====================================================
+
+type ConstructionEstimateSummary struct {
+	ID             int64     `json:"id" db:"id"`
+	TenantID       uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	ProjectID      int64     `json:"project_id" db:"project_id"`
+	BatchID        string    `json:"batch_id" db:"batch_id"`
+	RowNumber      int       `json:"row_number" db:"row_number"`
+	CategoryName   string    `json:"category_name" db:"category_name"`
+	BuildingColumn string    `json:"building_column" db:"building_column"`
+	Amount         float64   `json:"amount" db:"amount"`
+	CreatedDate    time.Time `json:"created_date" db:"created_date"`
+}
+
+type EstimateSummaryRowInput struct {
+	RowNumber      int     `json:"row_number"`
+	CategoryName   string  `json:"category_name" binding:"required"`
+	BuildingColumn string  `json:"building_column" binding:"required"`
+	Amount         float64 `json:"amount"`
+}
+
+type BulkCreateEstimateSummaryInput struct {
+	Rows []EstimateSummaryRowInput `json:"rows" binding:"required"`
 }
