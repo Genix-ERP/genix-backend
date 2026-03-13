@@ -50,6 +50,9 @@ type expenseLine struct {
 	CreatedBy           *string  `json:"created_by"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+	SubcontractID       *int64   `json:"subcontract_id"`
+	SubcontractName     *string  `json:"subcontract_name"`
+	MaterialRequestID   *int64   `json:"material_request_id"`
 }
 
 // ListExpenseLines returns expense lines for a project
@@ -82,7 +85,9 @@ func (h *Handler) ListExpenseLines(c *gin.Context) {
 		       el.document_url, el.status,
 		       el.approved_by, el.approved_at,
 		       el.cancelled_reason, el.created_by,
-		       el.created_at, el.updated_at
+		       el.created_at, el.updated_at,
+		       el.subcontract_id, sc.name,
+		       el.material_request_id
 		FROM construction_expense_lines el
 		LEFT JOIN construction_stages s ON s.id = el.stage_id
 		LEFT JOIN construction_cost_categories cat ON cat.id = el.cost_category_id
@@ -90,6 +95,7 @@ func (h *Handler) ListExpenseLines(c *gin.Context) {
 		LEFT JOIN contacts v ON v.id = el.vendor_id
 		LEFT JOIN accounts da ON da.id = el.debit_account_id
 		LEFT JOIN accounts ca ON ca.id = el.credit_account_id
+		LEFT JOIN construction_subcontract sc ON sc.id = el.subcontract_id
 		WHERE el.project_id = $1 AND el.tenant_id = $2 AND el.deleted_at IS NULL
 	`
 
@@ -129,6 +135,16 @@ func (h *Handler) ListExpenseLines(c *gin.Context) {
 		query += fmt.Sprintf(" AND el.vendor_id = $%d", argCount)
 		args = append(args, vendorID)
 	}
+	if subIDStr := c.Query("subcontract_id"); subIDStr != "" {
+		argCount++
+		subID, _ := strconv.ParseInt(subIDStr, 10, 64)
+		query += fmt.Sprintf(" AND el.subcontract_id = $%d", argCount)
+		args = append(args, subID)
+	}
+	// scope=subcontract returns only expenses linked to any subcontractor
+	if scope := c.Query("scope"); scope == "subcontract" {
+		query += " AND el.subcontract_id IS NOT NULL"
+	}
 
 	query += " ORDER BY el.expense_date DESC, el.created_at DESC"
 
@@ -160,6 +176,8 @@ func (h *Handler) ListExpenseLines(c *gin.Context) {
 			&el.ApprovedBy, &el.ApprovedAt,
 			&el.CancelledReason, &el.CreatedBy,
 			&el.CreatedAt, &el.UpdatedAt,
+			&el.SubcontractID, &el.SubcontractName,
+			&el.MaterialRequestID,
 		); err != nil {
 			h.log.Error("Failed to scan expense line", "error", err)
 			continue

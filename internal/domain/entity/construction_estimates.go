@@ -34,6 +34,8 @@ type ConstructionEstimate struct {
 
 	SourceType string `json:"source_type" db:"source_type"`
 
+	SubcontractID sql.NullInt64 `json:"subcontract_id" db:"subcontract_id"`
+
 	CreatedBy   uuid.NullUUID `json:"created_by" db:"created_by"`
 	CreatedDate time.Time     `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time     `json:"updated_date" db:"updated_date"`
@@ -42,7 +44,8 @@ type ConstructionEstimate struct {
 	LinesCount   int    `json:"lines_count,omitempty" db:"lines_count"`
 	ApprovedName string `json:"approved_name,omitempty" db:"approved_name"`
 	CreatedName  string `json:"created_name,omitempty" db:"created_name"`
-	BuildingName string `json:"building_name,omitempty" db:"building_name"`
+	BuildingName    string `json:"building_name,omitempty" db:"building_name"`
+	SubcontractName string `json:"subcontract_name,omitempty" db:"subcontract_name"`
 }
 
 func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
@@ -59,17 +62,19 @@ func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
 		ProfitPct    float64     `json:"profit_pct"`
 		VatPct       float64     `json:"vat_pct"`
 		AmountDirect float64     `json:"amount_direct"`
-		AmountTotal  float64     `json:"amount_total"`
-		SourceType   string      `json:"source_type"`
-		ApprovedBy   interface{} `json:"approved_by"`
+		AmountTotal    float64     `json:"amount_total"`
+		SourceType     string      `json:"source_type"`
+		SubcontractID  interface{} `json:"subcontract_id"`
+		ApprovedBy     interface{} `json:"approved_by"`
 		ApprovedDate interface{} `json:"approved_date"`
 		CreatedBy    interface{} `json:"created_by"`
 		CreatedDate  time.Time   `json:"created_date"`
 		UpdatedDate  time.Time   `json:"updated_date"`
 		LinesCount   int         `json:"lines_count,omitempty"`
 		ApprovedName string      `json:"approved_name,omitempty"`
-		CreatedName  string      `json:"created_name,omitempty"`
-		BuildingName string      `json:"building_name,omitempty"`
+		CreatedName     string      `json:"created_name,omitempty"`
+		BuildingName    string      `json:"building_name,omitempty"`
+		SubcontractName string      `json:"subcontract_name,omitempty"`
 	}{
 		ID:           e.ID,
 		TenantID:     e.TenantID,
@@ -83,27 +88,30 @@ func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
 		ProfitPct:    e.ProfitPct,
 		VatPct:       e.VatPct,
 		AmountDirect: e.AmountDirect,
-		AmountTotal:  e.AmountTotal,
-		SourceType:   e.SourceType,
-		ApprovedBy:   nullUUIDValue(e.ApprovedBy),
+		AmountTotal:    e.AmountTotal,
+		SourceType:     e.SourceType,
+		SubcontractID:  nullInt64Value(e.SubcontractID),
+		ApprovedBy:     nullUUIDValue(e.ApprovedBy),
 		ApprovedDate: nullTimeValue(e.ApprovedDate),
 		CreatedBy:    nullUUIDValue(e.CreatedBy),
 		CreatedDate:  e.CreatedDate,
 		UpdatedDate:  e.UpdatedDate,
 		LinesCount:   e.LinesCount,
 		ApprovedName: e.ApprovedName,
-		CreatedName:  e.CreatedName,
-		BuildingName: e.BuildingName,
+		CreatedName:     e.CreatedName,
+		BuildingName:    e.BuildingName,
+		SubcontractName: e.SubcontractName,
 	})
 }
 
 type CreateEstimateInput struct {
-	Name        string  `json:"name" binding:"required"`
-	BuildingID  int64   `json:"building_id"`
-	OverheadPct float64 `json:"overhead_pct"`
-	ProfitPct   float64 `json:"profit_pct"`
-	VatPct      float64 `json:"vat_pct"`
-	SourceType  string  `json:"source_type"`
+	Name          string  `json:"name" binding:"required"`
+	BuildingID    int64   `json:"building_id"`
+	OverheadPct   float64 `json:"overhead_pct"`
+	ProfitPct     float64 `json:"profit_pct"`
+	VatPct        float64 `json:"vat_pct"`
+	SourceType    string  `json:"source_type"`
+	SubcontractID int64   `json:"subcontract_id"`
 }
 
 type UpdateEstimateInput struct {

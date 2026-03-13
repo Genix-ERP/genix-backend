@@ -3094,11 +3094,15 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		       COALESCE(a.first_name || ' ' || a.last_name, '') as approver_name,
 		       mr.stock_operation_id,
 		       COALESCE(so.name, '') as delivery_name,
-		       COALESCE(so.state, '') as delivery_state
+		       COALESCE(so.state, '') as delivery_state,
+		       COALESCE(mr.bill_subcontractor, false),
+		       mr.subcontract_id,
+		       COALESCE(sc.name, '') as subcontract_name
 		FROM construction_material_requests mr
 		LEFT JOIN employees e ON e.id = mr.requested_by
 		LEFT JOIN employees a ON a.id = mr.approved_by
 		LEFT JOIN stock_operations so ON so.id = mr.stock_operation_id
+		LEFT JOIN construction_subcontract sc ON sc.id = mr.subcontract_id
 		WHERE mr.project_id = $1 AND mr.tenant_id = $2
 		ORDER BY mr.request_date DESC
 	`
@@ -3126,6 +3130,9 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		var requesterName, approverName string
 		var stockOperationID uuid.NullUUID
 		var deliveryName, deliveryState string
+		var billSubcontractor bool
+		var subcontractID sql.NullInt64
+		var subcontractName string
 
 		if err := rows.Scan(
 			&id, &tenantIDVal, &projectIDVal,
@@ -3136,6 +3143,7 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 			&notes, &createdDate, &updatedDate,
 			&requesterName, &approverName,
 			&stockOperationID, &deliveryName, &deliveryState,
+			&billSubcontractor, &subcontractID, &subcontractName,
 		); err != nil {
 			h.log.Error("Failed to scan material request", "error", err)
 			continue
@@ -3165,6 +3173,9 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 			"stock_operation_id": nullUUIDValue(stockOperationID),
 			"delivery_name":      deliveryName,
 			"delivery_state":     deliveryState,
+			"bill_subcontractor": billSubcontractor,
+			"subcontract_id":     nullInt64Value(subcontractID),
+			"subcontract_name":   subcontractName,
 		})
 	}
 
@@ -3194,6 +3205,7 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	}
 
 	organizationID, _ := middleware.GetOrganizationID(c)
+	userID, _ := middleware.GetUserID(c)
 
 	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -3202,10 +3214,12 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	}
 
 	var req struct {
-		RequestDate  string      `json:"request_date" binding:"required"`
-		RequiredDate string      `json:"required_date"`
-		Items        interface{} `json:"items"`
-		Notes        string      `json:"notes"`
+		RequestDate      string      `json:"request_date" binding:"required"`
+		RequiredDate     string      `json:"required_date"`
+		Items            interface{} `json:"items"`
+		Notes            string      `json:"notes"`
+		BillSubcontractor bool       `json:"bill_subcontractor"`
+		SubcontractID    int64       `json:"subcontract_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -3233,18 +3247,23 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 		}
 	}
 
+	var subcontractID interface{}
+	if req.BillSubcontractor && req.SubcontractID > 0 {
+		subcontractID = req.SubcontractID
+	}
+
 	query := `
 		INSERT INTO construction_material_requests (
 			tenant_id, project_id, request_number, request_date, required_date,
-			items, notes, status, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft', NOW(), NOW())
+			items, notes, status, bill_subcontractor, subcontract_id, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft', $8, $9, NOW(), NOW())
 		RETURNING id
 	`
 
 	var requestID int64
 	err = h.db.QueryRow(query,
 		tenantID, projectID, requestNumber, requestDate, requiredDate,
-		itemsJSON, nullString(req.Notes),
+		itemsJSON, nullString(req.Notes), req.BillSubcontractor, subcontractID,
 	).Scan(&requestID)
 	if err != nil {
 		h.log.Error("Failed to create material request", "error", err)
@@ -3258,6 +3277,39 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	if stockOpID != nil {
 		h.db.Exec(`UPDATE construction_material_requests SET stock_operation_id = $1 WHERE id = $2 AND tenant_id = $3`,
 			stockOpID, requestID, tenantID)
+	}
+
+	// Auto-create expense line for subcontractor billing
+	if req.BillSubcontractor && req.SubcontractID > 0 {
+		// Calculate total from items
+		var totalAmount float64
+		var itemDescriptions []string
+		if items, ok := req.Items.([]interface{}); ok {
+			for _, item := range items {
+				if m, ok := item.(map[string]interface{}); ok {
+					qty, _ := m["quantity"].(float64)
+					cost, _ := m["unit_cost"].(float64)
+					totalAmount += qty * cost
+					if pname, ok := m["product_name"].(string); ok && pname != "" {
+						itemDescriptions = append(itemDescriptions, pname)
+					}
+				}
+			}
+		}
+		if totalAmount > 0 {
+			expDesc := fmt.Sprintf("Material so'rovi: %s", requestNumber)
+			if len(itemDescriptions) > 0 {
+				expDesc += " (" + strings.Join(itemDescriptions, ", ") + ")"
+			}
+			h.db.Exec(`
+				INSERT INTO construction_expense_lines (
+					tenant_id, organization_id, project_id, expense_date, description,
+					amount, currency_code, subcontract_id, material_request_id,
+					status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
+			`, tenantID, organizationID, projectID, requestDate, expDesc,
+				totalAmount, req.SubcontractID, requestID, userID)
+		}
 	}
 
 	response.Created(c, map[string]interface{}{

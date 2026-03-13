@@ -112,6 +112,20 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			}
 		}
 
+		// Get linked building IDs
+		buildingIDs := []int64{}
+		bldRows, err := h.db.Query(
+			`SELECT building_id FROM construction_subcontract_buildings WHERE subcontract_id = $1`, id)
+		if err == nil {
+			defer bldRows.Close()
+			for bldRows.Next() {
+				var bldID int64
+				if bldRows.Scan(&bldID) == nil {
+					buildingIDs = append(buildingIDs, bldID)
+				}
+			}
+		}
+
 		var progressPct float64
 		if amount > 0 {
 			progressPct = (completedAmount / amount) * 100
@@ -145,6 +159,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			"created_date":       createdDate,
 			"updated_date":       updatedDate,
 			"wbs_ids":            wbsIDs,
+			"building_ids":       buildingIDs,
 			"completed_amount":   completedAmount,
 			"paid_amount":        paidAmount,
 			"outstanding_amount": outstandingAmount,
@@ -181,6 +196,7 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		ContactPhone    string  `json:"contact_phone"`
 		Notes           string  `json:"notes"`
 		WBSIDs          []int64 `json:"wbs_ids"`
+		BuildingIDs     []int64 `json:"building_ids"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid input")
@@ -240,6 +256,12 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 	for _, wbsID := range req.WBSIDs {
 		h.db.Exec(`INSERT INTO construction_subcontract_wbs (subcontract_id, wbs_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
 			id, wbsID)
+	}
+
+	// Link buildings
+	for _, bldID := range req.BuildingIDs {
+		h.db.Exec(`INSERT INTO construction_subcontract_buildings (subcontract_id, building_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+			id, bldID)
 	}
 
 	h.logConstructionActivity(tenantID, projectID, userID, "team",
@@ -316,6 +338,19 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		}
 	}
 
+	// Get building IDs
+	buildingIDs := []int64{}
+	bldRows, _ := h.db.Query(`SELECT building_id FROM construction_subcontract_buildings WHERE subcontract_id = $1`, id)
+	if bldRows != nil {
+		defer bldRows.Close()
+		for bldRows.Next() {
+			var bldID int64
+			if bldRows.Scan(&bldID) == nil {
+				buildingIDs = append(buildingIDs, bldID)
+			}
+		}
+	}
+
 	response.Success(c, map[string]interface{}{
 		"id":               id,
 		"name":             name,
@@ -336,6 +371,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		"created_date":     createdDate,
 		"updated_date":     updatedDate,
 		"wbs_ids":          wbsIDs,
+		"building_ids":     buildingIDs,
 	})
 }
 
@@ -374,6 +410,7 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 		ContactPhone    *string  `json:"contact_phone"`
 		Notes           *string  `json:"notes"`
 		WBSIDs          []int64  `json:"wbs_ids"`
+		BuildingIDs     []int64  `json:"building_ids"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid input")
@@ -453,7 +490,7 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 		args = append(args, nullStringFromVal(*req.Notes))
 	}
 
-	if len(updates) == 0 && req.WBSIDs == nil {
+	if len(updates) == 0 && req.WBSIDs == nil && req.BuildingIDs == nil {
 		response.BadRequest(c, "No fields to update")
 		return
 	}
@@ -487,6 +524,15 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 		for _, wbsID := range req.WBSIDs {
 			h.db.Exec(`INSERT INTO construction_subcontract_wbs (subcontract_id, wbs_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
 				subID, wbsID)
+		}
+	}
+
+	// Update building links if provided
+	if req.BuildingIDs != nil {
+		h.db.Exec(`DELETE FROM construction_subcontract_buildings WHERE subcontract_id = $1`, subID)
+		for _, bldID := range req.BuildingIDs {
+			h.db.Exec(`INSERT INTO construction_subcontract_buildings (subcontract_id, building_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+				subID, bldID)
 		}
 	}
 
@@ -531,6 +577,7 @@ func (h *Handler) DeleteSubcontract(c *gin.Context) {
 	}
 
 	h.db.Exec(`DELETE FROM construction_subcontract_wbs WHERE subcontract_id = $1`, subID)
+	h.db.Exec(`DELETE FROM construction_subcontract_buildings WHERE subcontract_id = $1`, subID)
 	_, err = h.db.Exec(`DELETE FROM construction_subcontract WHERE id = $1 AND tenant_id = $2`, subID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete subcontract", "error", err)
