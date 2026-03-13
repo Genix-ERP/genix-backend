@@ -25,11 +25,20 @@ func (h *Handler) ListProjectMaterials(c *gin.Context) {
 	}
 
 	rows, err := h.db.Query(`
-		SELECT id, tenant_id, project_id, product_id, product_name, uom,
-		       approved_quantity, unit_cost, created_date, updated_date
-		FROM construction_project_materials
-		WHERE tenant_id = $1 AND project_id = $2
-		ORDER BY product_name
+		SELECT pm.id, pm.tenant_id, pm.project_id, pm.product_id, pm.product_name, pm.uom,
+		       pm.approved_quantity, pm.unit_cost, pm.created_date, pm.updated_date,
+		       COALESCE(
+		           (SELECT SUM(m.quantity)
+		            FROM construction_sub_stage_materials m
+		            JOIN construction_sub_stages ss ON ss.id = m.sub_stage_id
+		            JOIN construction_stages s ON s.id = ss.stage_id
+		            WHERE s.project_id = pm.project_id
+		              AND m.tenant_id = pm.tenant_id
+		              AND m.product_id = pm.product_id),
+		       0) as assigned_quantity
+		FROM construction_project_materials pm
+		WHERE pm.tenant_id = $1 AND pm.project_id = $2
+		ORDER BY pm.product_name
 	`, tenantID, projectID)
 	if err != nil {
 		h.log.Error("Failed to list project materials", "error", err)
@@ -49,6 +58,7 @@ func (h *Handler) ListProjectMaterials(c *gin.Context) {
 		UnitCost         float64   `json:"unit_cost"`
 		CreatedDate      time.Time `json:"created_date"`
 		UpdatedDate      time.Time `json:"updated_date"`
+		AssignedQuantity float64   `json:"assigned_quantity"`
 	}
 
 	var materials []ProjectMaterial
@@ -59,6 +69,7 @@ func (h *Handler) ListProjectMaterials(c *gin.Context) {
 			&m.ProductName, &m.UOM,
 			&m.ApprovedQuantity, &m.UnitCost,
 			&m.CreatedDate, &m.UpdatedDate,
+			&m.AssignedQuantity,
 		); err != nil {
 			h.log.Error("Failed to scan project material", "error", err)
 			continue

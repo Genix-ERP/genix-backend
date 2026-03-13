@@ -34,7 +34,10 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		SELECT s.id, s.tenant_id, s.project_id, s.name, s.stage_order,
 		       s.status, s.planned_budget, s.planned_start, s.planned_end,
 		       s.actual_start, s.actual_end, s.notes, s.created_at, s.updated_at,
-		       COALESCE(SUM(CASE WHEN el.status = 'approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual_amount
+		       COALESCE(SUM(CASE WHEN el.status = 'approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual_amount,
+		       COALESCE((SELECT SUM(m.total_cost) FROM construction_sub_stage_materials m
+		                 JOIN construction_sub_stages ss ON ss.id = m.sub_stage_id
+		                 WHERE ss.stage_id = s.id), 0) AS material_total
 		FROM construction_stages s
 		LEFT JOIN construction_expense_lines el ON el.stage_id = s.id AND el.deleted_at IS NULL
 		WHERE s.project_id = $1 AND s.tenant_id = $2
@@ -49,21 +52,22 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 	defer rows.Close()
 
 	type Stage struct {
-		ID            int64    `json:"id"`
-		TenantID      string   `json:"tenant_id"`
-		ProjectID     int64    `json:"project_id"`
-		Name          string   `json:"name"`
-		StageOrder    int      `json:"stage_order"`
-		Status        string   `json:"status"`
-		PlannedBudget float64  `json:"planned_budget"`
-		PlannedStart  *string  `json:"planned_start"`
-		PlannedEnd    *string  `json:"planned_end"`
-		ActualStart   *string  `json:"actual_start"`
-		ActualEnd     *string  `json:"actual_end"`
-		Notes         *string  `json:"notes"`
+		ID            int64     `json:"id"`
+		TenantID      string    `json:"tenant_id"`
+		ProjectID     int64     `json:"project_id"`
+		Name          string    `json:"name"`
+		StageOrder    int       `json:"stage_order"`
+		Status        string    `json:"status"`
+		PlannedBudget float64   `json:"planned_budget"`
+		PlannedStart  *string   `json:"planned_start"`
+		PlannedEnd    *string   `json:"planned_end"`
+		ActualStart   *string   `json:"actual_start"`
+		ActualEnd     *string   `json:"actual_end"`
+		Notes         *string   `json:"notes"`
 		CreatedAt     time.Time `json:"created_at"`
 		UpdatedAt     time.Time `json:"updated_at"`
-		ActualAmount  float64  `json:"actual_amount"`
+		ActualAmount  float64   `json:"actual_amount"`
+		MaterialTotal float64   `json:"material_total"`
 	}
 
 	stages := []Stage{}
@@ -73,7 +77,7 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 			&s.ID, &s.TenantID, &s.ProjectID, &s.Name, &s.StageOrder,
 			&s.Status, &s.PlannedBudget, &s.PlannedStart, &s.PlannedEnd,
 			&s.ActualStart, &s.ActualEnd, &s.Notes, &s.CreatedAt, &s.UpdatedAt,
-			&s.ActualAmount,
+			&s.ActualAmount, &s.MaterialTotal,
 		); err != nil {
 			h.log.Error("Failed to scan stage", "error", err)
 			continue
@@ -284,21 +288,25 @@ func (h *Handler) ListConstructionSubStages(c *gin.Context) {
 	}
 
 	type SubStage struct {
-		ID       int64     `json:"id"`
-		StageID  int64     `json:"stage_id"`
-		Name     string    `json:"name"`
-		SubOrder int       `json:"sub_order"`
-		Status   string    `json:"status"`
-		Notes    *string   `json:"notes"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
+		ID            int64     `json:"id"`
+		StageID       int64     `json:"stage_id"`
+		Name          string    `json:"name"`
+		SubOrder      int       `json:"sub_order"`
+		Status        string    `json:"status"`
+		Notes         *string   `json:"notes"`
+		CreatedAt     time.Time `json:"created_at"`
+		UpdatedAt     time.Time `json:"updated_at"`
+		MaterialCount int       `json:"material_count"`
+		MaterialTotal float64   `json:"material_total"`
 	}
 
 	rows, err := h.db.Query(`
-		SELECT id, stage_id, name, sub_order, status, notes, created_at, updated_at
-		FROM construction_sub_stages
-		WHERE stage_id = $1 AND tenant_id = $2
-		ORDER BY sub_order ASC, id ASC
+		SELECT ss.id, ss.stage_id, ss.name, ss.sub_order, ss.status, ss.notes, ss.created_at, ss.updated_at,
+		       COALESCE((SELECT COUNT(*) FROM construction_sub_stage_materials m WHERE m.sub_stage_id = ss.id), 0) as material_count,
+		       COALESCE((SELECT SUM(m.total_cost) FROM construction_sub_stage_materials m WHERE m.sub_stage_id = ss.id), 0) as material_total
+		FROM construction_sub_stages ss
+		WHERE ss.stage_id = $1 AND ss.tenant_id = $2
+		ORDER BY ss.sub_order ASC, ss.id ASC
 	`, stageID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to list sub-stages", "error", err)
@@ -310,7 +318,7 @@ func (h *Handler) ListConstructionSubStages(c *gin.Context) {
 	subStages := []SubStage{}
 	for rows.Next() {
 		var s SubStage
-		if err := rows.Scan(&s.ID, &s.StageID, &s.Name, &s.SubOrder, &s.Status, &s.Notes, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.StageID, &s.Name, &s.SubOrder, &s.Status, &s.Notes, &s.CreatedAt, &s.UpdatedAt, &s.MaterialCount, &s.MaterialTotal); err != nil {
 			continue
 		}
 		subStages = append(subStages, s)
