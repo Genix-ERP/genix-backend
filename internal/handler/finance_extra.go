@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -590,9 +593,11 @@ type reconciliationActResponse struct {
 	RespondedAt    *time.Time `json:"responded_at,omitempty"`
 	DisputeNote    *string    `json:"dispute_note,omitempty"`
 	RespondentName *string    `json:"respondent_name,omitempty"`
-	SentAt         *time.Time `json:"sent_at,omitempty"`
-	SentVia        *string    `json:"sent_via,omitempty"`
-	SentTo         *string    `json:"sent_to,omitempty"`
+	SentAt          *time.Time `json:"sent_at,omitempty"`
+	SentVia         *string    `json:"sent_via,omitempty"`
+	SentTo          *string    `json:"sent_to,omitempty"`
+	DisputeAmount   *float64   `json:"dispute_amount,omitempty"`
+	ShareExpiresAt  *time.Time `json:"share_expires_at,omitempty"`
 }
 
 type reconciliationLine struct {
@@ -606,6 +611,32 @@ type reconciliationLine struct {
 
 // getUzDescription translates a journal entry source_type into an Uzbek description.
 // If the source_type is not recognized, the original English description is returned.
+// htmlToPDF converts HTML content to PDF using wkhtmltopdf
+func htmlToPDF(htmlContent string) ([]byte, error) {
+	tmpFile, err := os.CreateTemp("", "reconciliation-*.html")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(htmlContent); err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("failed to write HTML: %w", err)
+	}
+	tmpFile.Close()
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("wkhtmltopdf", "--quiet", "--encoding", "UTF-8", "--page-size", "A4", "--margin-top", "10mm", "--margin-bottom", "10mm", tmpFile.Name(), "-")
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("wkhtmltopdf failed: %w, stderr: %s", err, stderr.String())
+	}
+
+	return stdout.Bytes(), nil
+}
+
 func getUzDescription(sourceType, originalDescription string) string {
 	uzDescriptions := map[string]string{
 		// Xarid (Purchases)
@@ -614,44 +645,76 @@ func getUzDescription(sourceType, originalDescription string) string {
 		"purchase_return":          "Xariddan qaytarish",
 		"debit_note":               "Debet nota",
 		// Sotuv (Sales)
-		"sales_invoice":   "Sotuv fakturasi",
-		"sales_order":     "Sotuv buyurtmasi",
-		"sales_return":    "Sotuvdan qaytarish",
-		"credit_note":     "Kredit nota",
-		"payment_receipt": "To'lov qabul qilish",
+		"sales_invoice":      "Sotuv fakturasi",
+		"sales_order":        "Sotuv buyurtmasi",
+		"sales_return":       "Sotuvdan qaytarish",
+		"sales_return_refund": "Sotuvdan qaytarish to'lovi",
+		"credit_note":        "Kredit nota",
+		"payment_receipt":    "To'lov qabul qilish",
 		// To'lovlar (Payments)
 		"payment": "To'lov",
 		// Ombor (Inventory)
 		"goods_receipt":        "Tovar qabul qilish",
 		"inventory_adjustment": "Inventarizatsiya tuzatish",
+		"inventory_shortage":   "Inventarizatsiya kamomadi",
 		"scrap":                "Yaroqsizga chiqarish",
 		"stock_count":          "Ombor sanab chiqish",
 		"stock_operation":      "Ombor operatsiyasi",
 		// Asosiy vositalar (Fixed Assets)
-		"fixed_asset":    "Asosiy vosita kirim",
-		"depreciation":   "Amortizatsiya",
-		"disposal":       "Asosiy vosita chiqarish",
-		"maintenance":    "Texnik xizmat",
-		"asset_payment":  "Asosiy vosita to'lovi",
+		"fixed_asset":   "Asosiy vosita kirim",
+		"depreciation":  "Amortizatsiya",
+		"disposal":      "Asosiy vosita chiqarish",
+		"maintenance":   "Texnik xizmat",
+		"asset_payment": "Asosiy vosita to'lovi",
 		// Qurilish (Construction)
 		"construction_expense":          "Qurilish xarajati",
 		"construction_expense_reversal": "Qurilish xarajati bekor qilish",
 		"material_request":              "Material so'rovi",
 		"project_commission":            "Loyiha komissiyasi",
+		// Ishlab chiqarish (Manufacturing)
+		"production_complete": "Ishlab chiqarish yakunlandi",
 		// Ish haqi (Payroll)
 		"payroll":          "Ish haqi hisoblash",
 		"salary_deduction": "Ish haqidan ushlab qolish",
+		// Buyurtmalar (Orders)
+		"purchase_order": "Xarid buyurtmasi",
+		// Tizim (System)
+		"opening_balance": "Boshlang'ich qoldiq",
 		// Boshqa (Other)
-		"expense":                       "Xarajat",
-		"landed_cost":                   "Qo'shimcha xarajat",
-		"bank_reconciliation":           "Bank solishtirma",
-		"bank_reconciliation_writeoff":  "Bank farqi hisobdan chiqarish",
-		"manual":                        "Qo'lda kiritilgan yozuv",
+		"expense":                      "Xarajat",
+		"landed_cost":                  "Qo'shimcha xarajat",
+		"bank_reconciliation":          "Bank solishtirma",
+		"bank_reconciliation_writeoff": "Bank farqi hisobdan chiqarish",
+		"manual":                       "Qo'lda kiritilgan yozuv",
 	}
 
 	if uz, ok := uzDescriptions[sourceType]; ok {
 		return uz
 	}
+
+	// Fallback: translate common English patterns in the description text
+	descLower := strings.ToLower(originalDescription)
+	descPatterns := []struct {
+		pattern     string
+		replacement string
+	}{
+		{"purchase order", "Xarid buyurtmasi"},
+		{"goods delivery", "Tovar yetkazish"},
+		{"sales invoice", "Sotuv fakturasi"},
+		{"payment received", "To'lov qabul qilindi"},
+		{"vendor bill", "Yetkazuvchi fakturasi"},
+		{"credit note", "Kredit nota"},
+		{"stock adjustment", "Inventarizatsiya tuzatish"},
+		{"opening balance", "Boshlang'ich qoldiq"},
+		{"goods receipt", "Tovar qabul qilish"},
+		{"purchase invoice", "Xarid fakturasi"},
+	}
+	for _, p := range descPatterns {
+		if strings.Contains(descLower, p.pattern) {
+			return p.replacement
+		}
+	}
+
 	return originalDescription
 }
 
@@ -962,7 +1025,8 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 	var notes sql.NullString
 	var periodStart, periodEnd time.Time
 	var responseStatus, disputeNote, respondentName, sentVia, sentTo sql.NullString
-	var respondedAt, sentAt sql.NullTime
+	var respondedAt, sentAt, actShareExpiresAt sql.NullTime
+	var actDisputeAmount sql.NullFloat64
 
 	err = h.db.QueryRow(`
 		SELECT ra.id, ra.partner_id, COALESCE(ct.name, '') as partner_name,
@@ -970,7 +1034,8 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 			   ra.opening_balance, ra.our_debit_total, ra.our_credit_total, ra.our_balance,
 			   ra.status, ra.notes, ra.created_at,
 			   ra.response_status, ra.responded_at, ra.dispute_note, ra.respondent_name,
-			   ra.sent_at, ra.sent_via, ra.sent_to
+			   ra.sent_at, ra.sent_via, ra.sent_to,
+			   ra.dispute_amount, ra.share_expires_at
 		FROM reconciliation_acts ra
 		LEFT JOIN contacts ct ON ra.partner_id = ct.id
 		WHERE ra.id = $1 AND ra.tenant_id = $2 AND ra.deleted_at IS NULL
@@ -981,6 +1046,7 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 		&act.Status, &notes, &act.CreatedAt,
 		&responseStatus, &respondedAt, &disputeNote, &respondentName,
 		&sentAt, &sentVia, &sentTo,
+		&actDisputeAmount, &actShareExpiresAt,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Reconciliation act")
@@ -1018,6 +1084,12 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 	}
 	if sentTo.Valid {
 		act.SentTo = &sentTo.String
+	}
+	if actDisputeAmount.Valid {
+		act.DisputeAmount = &actDisputeAmount.Float64
+	}
+	if actShareExpiresAt.Valid {
+		act.ShareExpiresAt = &actShareExpiresAt.Time
 	}
 
 	// Fetch live transaction lines from journal entries
@@ -1072,8 +1144,9 @@ func (h *Handler) UpdateReconciliationAct(c *gin.Context) {
 			"draft":       {"sent", "confirmed", "discrepancy"},
 			"sent":        {"confirmed", "disputed", "discrepancy", "draft"},
 			"confirmed":   {"draft"},
-			"disputed":    {"draft", "confirmed"},
+			"disputed":    {"draft", "confirmed", "sent"},
 			"discrepancy": {"draft", "confirmed"},
+			"no_response": {"draft", "sent", "confirmed"},
 		}
 
 		valid := false
@@ -1357,8 +1430,23 @@ func (h *Handler) ExportReconciliationAct(c *gin.Context) {
 		return
 	}
 
-	html := h.renderReconciliationHTML(act, lines)
-	c.Data(200, "text/html; charset=utf-8", []byte(html))
+	htmlContent := h.renderReconciliationHTML(act, lines)
+
+	format := c.DefaultQuery("format", "html")
+	if format == "pdf" {
+		pdfBytes, pdfErr := htmlToPDF(htmlContent)
+		if pdfErr != nil {
+			h.log.Error("Failed to generate PDF", "error", pdfErr)
+			response.InternalError(c, "PDF yaratishda xatolik")
+			return
+		}
+		filename := fmt.Sprintf("akt_sverka_%s_%s_%s.pdf", act.PartnerName, act.PeriodStart, act.PeriodEnd)
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+		c.Data(200, "application/pdf", pdfBytes)
+		return
+	}
+
+	c.Data(200, "text/html; charset=utf-8", []byte(htmlContent))
 }
 
 // SendReconciliationAct sends the act via email or generates a WhatsApp share link
@@ -1376,9 +1464,11 @@ func (h *Handler) SendReconciliationAct(c *gin.Context) {
 	}
 
 	var input struct {
-		Via   string `json:"via" binding:"required"` // "email" or "whatsapp"
-		Email string `json:"email"`
-		Phone string `json:"phone"`
+		Via     string `json:"via" binding:"required"` // "email", "whatsapp", or "link"
+		Email   string `json:"email"`
+		Phone   string `json:"phone"`
+		Subject string `json:"subject"`
+		Message string `json:"message"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -1396,12 +1486,15 @@ func (h *Handler) SendReconciliationAct(c *gin.Context) {
 
 	if shareToken == "" {
 		shareToken = uuid.New().String()[:8] + uuid.New().String()[:8]
-		_, err = h.db.Exec(`UPDATE reconciliation_acts SET share_token = $1 WHERE id = $2 AND tenant_id = $3`, shareToken, actID, tenantID)
+		_, err = h.db.Exec(`UPDATE reconciliation_acts SET share_token = $1, share_expires_at = NOW() + INTERVAL '24 hours' WHERE id = $2 AND tenant_id = $3`, shareToken, actID, tenantID)
 		if err != nil {
 			h.log.Error("Failed to set share token", "error", err)
 			response.InternalError(c, "Failed to generate share link")
 			return
 		}
+	} else {
+		// Refresh expiry on re-send
+		_, _ = h.db.Exec(`UPDATE reconciliation_acts SET share_expires_at = NOW() + INTERVAL '24 hours' WHERE id = $1 AND tenant_id = $2`, actID, tenantID)
 	}
 
 	shareURL := fmt.Sprintf("%s/shared/reconciliation/%s", h.config.App.FrontendURL, shareToken)
@@ -1422,15 +1515,36 @@ func (h *Handler) SendReconciliationAct(c *gin.Context) {
 		}
 
 		closingBalance := act.OpeningBalance + act.OurDebitTotal - act.OurCreditTotal
-		subject := fmt.Sprintf("Akt sverka — %s (%s – %s)", act.PartnerName, act.PeriodStart, act.PeriodEnd)
+		subject := input.Subject
+		if subject == "" {
+			subject = fmt.Sprintf("Akt sverka — %s (%s – %s)", act.PartnerName, act.PeriodStart, act.PeriodEnd)
+		}
 
 		emailBody := h.renderReconciliationEmailHTML(act, lines, closingBalance, shareURL)
+		if input.Message != "" {
+			emailBody = fmt.Sprintf(`<div style="margin-bottom:20px;padding:12px 16px;background:#f8fafc;border-left:3px solid #3b82f6;border-radius:4px;font-size:14px;color:#334155;">%s</div>`, strings.ReplaceAll(input.Message, "\n", "<br>")) + emailBody
+		}
+
+		// Generate PDF attachment
+		var attachments []email.Attachment
+		pdfHTML := h.renderReconciliationHTML(act, lines)
+		if pdfBytes, pdfErr := htmlToPDF(pdfHTML); pdfErr == nil {
+			pdfFilename := fmt.Sprintf("akt_sverka_%s_%s_%s.pdf", act.PartnerName, act.PeriodStart, act.PeriodEnd)
+			attachments = append(attachments, email.Attachment{
+				Filename:    pdfFilename,
+				ContentType: "application/pdf",
+				Data:        pdfBytes,
+			})
+		} else {
+			h.log.Error("Failed to generate PDF for email attachment", "error", pdfErr)
+		}
 
 		sendErr := h.emailService.Send(&email.Email{
-			To:      []string{input.Email},
-			Subject: subject,
-			Body:    emailBody,
-			IsHTML:  true,
+			To:          []string{input.Email},
+			Subject:     subject,
+			Body:        emailBody,
+			IsHTML:      true,
+			Attachments: attachments,
 		})
 		if sendErr != nil {
 			h.log.Error("Failed to send reconciliation email", "error", sendErr)
@@ -1469,8 +1583,15 @@ func (h *Handler) SendReconciliationAct(c *gin.Context) {
 			"whatsapp_message": message,
 		})
 
+	case "link":
+		// Just generate/refresh the share link, no sending
+		response.Success(c, gin.H{
+			"message":   "Havola tayyor",
+			"share_url": shareURL,
+		})
+
 	default:
-		response.BadRequest(c, "Invalid send method. Use 'email' or 'whatsapp'")
+		response.BadRequest(c, "Invalid send method. Use 'email', 'whatsapp', or 'link'")
 	}
 }
 
@@ -1487,18 +1608,27 @@ func (h *Handler) GetPublicReconciliationAct(c *gin.Context) {
 	var partnerName, periodStart, periodEnd, status string
 	var openingBalance, ourDebitTotal, ourCreditTotal float64
 	var notes, responseStatus sql.NullString
+	var shareExpiresAt sql.NullTime
+	var disputeAmount sql.NullFloat64
 
 	err := h.db.QueryRow(`
 		SELECT ra.id, ra.tenant_id, COALESCE(ct.name, ''), ra.period_start, ra.period_end,
 			   ra.opening_balance, ra.our_debit_total, ra.our_credit_total, ra.status, ra.notes,
-			   ra.response_status
+			   ra.response_status, ra.share_expires_at, ra.dispute_amount
 		FROM reconciliation_acts ra
 		LEFT JOIN contacts ct ON ra.partner_id = ct.id
 		WHERE ra.share_token = $1 AND ra.deleted_at IS NULL
 	`, token).Scan(&actID, &tenantID, &partnerName, &periodStart, &periodEnd,
-		&openingBalance, &ourDebitTotal, &ourCreditTotal, &status, &notes, &responseStatus)
+		&openingBalance, &ourDebitTotal, &ourCreditTotal, &status, &notes, &responseStatus,
+		&shareExpiresAt, &disputeAmount)
 	if err != nil {
 		response.NotFound(c, "Reconciliation act")
+		return
+	}
+
+	// Check if share link has expired
+	if shareExpiresAt.Valid && time.Now().After(shareExpiresAt.Time) {
+		c.JSON(410, gin.H{"error": "Bu havola muddati tugagan. Iltimos, yangi havola so'rang."})
 		return
 	}
 
@@ -1534,6 +1664,12 @@ func (h *Handler) GetPublicReconciliationAct(c *gin.Context) {
 	if responseStatus.Valid {
 		result["response_status"] = responseStatus.String
 	}
+	if shareExpiresAt.Valid {
+		result["share_expires_at"] = shareExpiresAt.Time
+	}
+	if disputeAmount.Valid {
+		result["dispute_amount"] = disputeAmount.Float64
+	}
 
 	response.Success(c, result)
 }
@@ -1547,9 +1683,10 @@ func (h *Handler) RespondReconciliationAct(c *gin.Context) {
 	}
 
 	var input struct {
-		Action  string `json:"action" binding:"required"` // "confirm" or "dispute"
-		Name    string `json:"name"`
-		Note    string `json:"note"`
+		Action string   `json:"action" binding:"required"` // "confirm" or "dispute"
+		Name   string   `json:"name"`
+		Note   string   `json:"note"`
+		Amount *float64 `json:"amount"` // counterparty's stated balance (for disputes)
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -1566,12 +1703,19 @@ func (h *Handler) RespondReconciliationAct(c *gin.Context) {
 	var actID uuid.UUID
 	var currentStatus string
 	var currentResponse sql.NullString
+	var respondShareExpiresAt sql.NullTime
 	err := h.db.QueryRow(`
-		SELECT id, status, response_status FROM reconciliation_acts
+		SELECT id, status, response_status, share_expires_at FROM reconciliation_acts
 		WHERE share_token = $1 AND deleted_at IS NULL
-	`, token).Scan(&actID, &currentStatus, &currentResponse)
+	`, token).Scan(&actID, &currentStatus, &currentResponse, &respondShareExpiresAt)
 	if err != nil {
 		response.NotFound(c, "Reconciliation act")
+		return
+	}
+
+	// Check if share link has expired
+	if respondShareExpiresAt.Valid && time.Now().After(respondShareExpiresAt.Time) {
+		c.JSON(410, gin.H{"error": "Bu havola muddati tugagan. Iltimos, yangi havola so'rang."})
 		return
 	}
 
@@ -1594,12 +1738,17 @@ func (h *Handler) RespondReconciliationAct(c *gin.Context) {
 		newActStatus = "disputed"
 	}
 
+	var disputeAmountVal interface{}
+	if input.Amount != nil {
+		disputeAmountVal = *input.Amount
+	}
+
 	_, err = h.db.Exec(`
 		UPDATE reconciliation_acts
 		SET response_status = $1, responded_at = NOW(), respondent_name = $2, dispute_note = $3,
-			status = $4, updated_at = NOW()
-		WHERE id = $5
-	`, responseStatus, nullStr(input.Name), nullStr(input.Note), newActStatus, actID)
+			status = $4, dispute_amount = $5, response_notified = FALSE, updated_at = NOW()
+		WHERE id = $6
+	`, responseStatus, nullStr(input.Name), nullStr(input.Note), newActStatus, disputeAmountVal, actID)
 	if err != nil {
 		h.log.Error("Failed to record response", "error", err)
 		response.InternalError(c, "Failed to record response")
