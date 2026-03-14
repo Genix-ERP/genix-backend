@@ -307,13 +307,16 @@ func (d *DepreciationEntry) ToResponse() *DepreciationEntryResponse {
 
 // AssetCategoryResponse represents the API response for an asset category
 type AssetCategoryResponse struct {
-	ID                      uuid.UUID `json:"id"`
-	Code                    string    `json:"code"`
-	Name                    string    `json:"name"`
-	Description             string    `json:"description,omitempty"`
-	DepreciationMethod      string    `json:"depreciation_method"`
-	DefaultUsefulLifeMonths int       `json:"default_useful_life_months"`
-	IsActive                bool      `json:"is_active"`
+	ID                      uuid.UUID  `json:"id"`
+	Code                    string     `json:"code"`
+	Name                    string     `json:"name"`
+	Description             string     `json:"description,omitempty"`
+	DepreciationMethod      string     `json:"depreciation_method"`
+	DefaultUsefulLifeMonths int        `json:"default_useful_life_months"`
+	AssetAccountID          *uuid.UUID `json:"asset_account_id,omitempty"`
+	DepreciationAccountID   *uuid.UUID `json:"depreciation_account_id,omitempty"`
+	ExpenseAccountID        *uuid.UUID `json:"expense_account_id,omitempty"`
+	IsActive                bool       `json:"is_active"`
 }
 
 // ToResponse converts AssetCategory to AssetCategoryResponse
@@ -329,6 +332,9 @@ func (c *AssetCategory) ToResponse() *AssetCategoryResponse {
 	if c.Description != nil {
 		resp.Description = *c.Description
 	}
+	resp.AssetAccountID = c.AssetAccountID
+	resp.DepreciationAccountID = c.DepreciationAccountID
+	resp.ExpenseAccountID = c.ExpenseAccountID
 	return resp
 }
 
@@ -352,6 +358,7 @@ type AssetMaintenance struct {
 	Description         *string    `json:"description,omitempty" db:"description"`
 	PerformedBy         *string    `json:"performed_by,omitempty" db:"performed_by"`
 	DocumentNumber      *string    `json:"document_number,omitempty" db:"document_number"`
+	NextServiceDate     *time.Time `json:"next_service_date,omitempty" db:"next_service_date"`
 	CreatedBy           *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
 }
@@ -366,6 +373,7 @@ type RecordMaintenanceInput struct {
 	PerformedBy        string  `json:"performed_by"`
 	DocumentNumber     string  `json:"document_number"`
 	PaymentAccountCode string  `json:"payment_account_code"`
+	NextServiceDate    string  `json:"next_service_date"`
 }
 
 // AssetMaintenanceResponse represents the API response for asset maintenance
@@ -386,6 +394,7 @@ type AssetMaintenanceResponse struct {
 	Description         string    `json:"description,omitempty"`
 	PerformedBy         string    `json:"performed_by,omitempty"`
 	DocumentNumber      string    `json:"document_number,omitempty"`
+	NextServiceDate     string    `json:"next_service_date,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 }
 
@@ -415,6 +424,9 @@ func (m *AssetMaintenance) ToMaintenanceResponse() *AssetMaintenanceResponse {
 	}
 	if m.DocumentNumber != nil {
 		resp.DocumentNumber = *m.DocumentNumber
+	}
+	if m.NextServiceDate != nil {
+		resp.NextServiceDate = m.NextServiceDate.Format("2006-01-02")
 	}
 	return resp
 }

@@ -938,3 +938,213 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 
 	response.Success(c, transactions)
 }
+
+// PayTaxPeriod records a tax payment for a period, creates journal entry, and marks period as paid
+func (h *Handler) PayTaxPeriod(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	organizationID, _ := middleware.GetOrganizationID(c)
+
+	periodID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid period ID")
+		return
+	}
+
+	var input struct {
+		PaymentMethod string `json:"payment_method"` // "bank" or "cash"
+	}
+	c.ShouldBindJSON(&input)
+	if input.PaymentMethod == "" {
+		input.PaymentMethod = "bank"
+	}
+
+	// Load period
+	var period TaxReportPeriod
+	var paidAt sql.NullTime
+	err = h.db.QueryRow(`
+		SELECT id, tenant_id, name, status, total_sales_tax, total_purchase_tax, net_tax_liability, paid_at
+		FROM tax_report_periods WHERE id = $1 AND tenant_id = $2
+	`, periodID, tenantID).Scan(
+		&period.ID, &period.TenantID, &period.Name, &period.Status,
+		&period.TotalSalesTax, &period.TotalPurchaseTax, &period.NetTaxLiability,
+		&paidAt,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Tax report period not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to load tax period", "error", err)
+		response.InternalError(c, "Failed to load tax period")
+		return
+	}
+
+	// Validate
+	if period.Status == "draft" {
+		response.BadRequest(c, "Avval hisobotni hisoblang (Calculate)")
+		return
+	}
+	if paidAt.Valid {
+		response.BadRequest(c, "Bu davr allaqachon to'langan")
+		return
+	}
+	if period.NetTaxLiability <= 0 {
+		response.BadRequest(c, "To'lanadigan soliq majburiyati yo'q")
+		return
+	}
+
+	// Begin transaction
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Transaction failed")
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+
+	// Find accounts
+	var orgIDPtr *uuid.UUID
+	if organizationID != uuid.Nil {
+		orgIDPtr = &organizationID
+	}
+
+	outputVATAccountID := findAccount(tx, tenantID, orgIDPtr, "vat payable", "2210")
+	if outputVATAccountID == uuid.Nil {
+		outputVATAccountID = findAccount(tx, tenantID, orgIDPtr, "tax payable", "2200")
+	}
+	inputVATAccountID := findAccount(tx, tenantID, orgIDPtr, "input vat", "1410")
+	if inputVATAccountID == uuid.Nil {
+		inputVATAccountID = findAccount(tx, tenantID, orgIDPtr, "vat", "1410")
+	}
+
+	var bankAccountID uuid.UUID
+	if input.PaymentMethod == "cash" {
+		bankAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+	} else {
+		bankAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+	}
+
+	if outputVATAccountID == uuid.Nil || bankAccountID == uuid.Nil {
+		response.BadRequest(c, "Soliq yoki bank hisobi topilmadi")
+		return
+	}
+
+	// Find MISC journal
+	var journalID uuid.UUID
+	var nextNumber int
+	tx.QueryRow(`
+		SELECT id, next_number FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
+		ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`,
+		tenantID).Scan(&journalID, &nextNumber)
+
+	if journalID == uuid.Nil {
+		response.BadRequest(c, "MISC jurnali topilmadi")
+		return
+	}
+
+	entryNumber := fmt.Sprintf("MISC-%d-%04d", now.Year(), nextNumber)
+
+	// Calculate total debit/credit for the journal entry
+	// Dt: OutputVAT (TotalSalesTax), Kt: InputVAT (TotalPurchaseTax) + Bank (NetTaxLiability)
+	// Total = TotalSalesTax (which equals TotalPurchaseTax + NetTaxLiability)
+	entryTotal := period.TotalSalesTax
+	if entryTotal < period.NetTaxLiability {
+		entryTotal = period.NetTaxLiability
+	}
+
+	// Create journal entry
+	journalEntryID := uuid.New()
+	description := fmt.Sprintf("QQS to'lovi: %s", period.Name)
+
+	_, err = tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+			source_type, source_id, total_debit, total_credit, status, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
+		journalEntryID, tenantID, organizationID, journalID, entryNumber, now, period.Name, description,
+		"tax_payment", periodID, entryTotal, entryTotal, userID, now, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create tax payment journal entry", "error", err)
+		response.InternalError(c, "Jurnal yozuvi yaratishda xato")
+		return
+	}
+
+	lineNumber := 1
+
+	// Dt Output VAT (clear the liability)
+	if period.TotalSalesTax > 0 && outputVATAccountID != uuid.Nil {
+		tx.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			uuid.New(), journalEntryID, lineNumber, outputVATAccountID, "Chiquvchi QQS yopish",
+			period.TotalSalesTax, 0.0, now,
+		)
+		tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
+			period.TotalSalesTax, now, outputVATAccountID)
+		lineNumber++
+	}
+
+	// Kt Input VAT (clear the receivable)
+	if period.TotalPurchaseTax > 0 && inputVATAccountID != uuid.Nil {
+		tx.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			uuid.New(), journalEntryID, lineNumber, inputVATAccountID, "Kiruvchi QQS yopish",
+			0.0, period.TotalPurchaseTax, now,
+		)
+		tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
+			period.TotalPurchaseTax, now, inputVATAccountID)
+		lineNumber++
+	}
+
+	// Kt Bank/Cash (net payment)
+	tx.Exec(`
+		INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		uuid.New(), journalEntryID, lineNumber, bankAccountID, "Soliq to'lovi",
+		0.0, period.NetTaxLiability, now,
+	)
+	tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
+		period.NetTaxLiability, now, bankAccountID)
+
+	// Update journal next_number
+	tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+
+	// Mark period as paid
+	_, err = tx.Exec(`
+		UPDATE tax_report_periods SET
+			status = 'paid',
+			paid_at = $1,
+			paid_by = $2,
+			payment_journal_entry_id = $3,
+			updated_at = $1
+		WHERE id = $4 AND tenant_id = $5
+	`, now, userID, journalEntryID, periodID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to update tax period status", "error", err)
+		response.InternalError(c, "Davr holatini yangilashda xato")
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		h.log.Error("Failed to commit tax payment", "error", err)
+		response.InternalError(c, "Tranzaksiya yakunlanmadi")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"message":          "Soliq to'lovi muvaffaqiyatli qayd etildi",
+		"journal_entry_id": journalEntryID,
+		"entry_number":     entryNumber,
+		"amount":           period.NetTaxLiability,
+		"paid_at":          now,
+	})
+}
