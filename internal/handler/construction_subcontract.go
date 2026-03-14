@@ -34,16 +34,14 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 	stateFilter := c.Query("state")
 
 	query := `
-		SELECT s.id, s.name, s.project_id, s.partner_id, s.work_description,
+		SELECT s.id, s.name, s.project_id, s.partner_name, s.work_description,
 		       s.amount, s.currency, s.start_date, s.end_date,
 		       s.retention_pct, s.state, s.rating,
 		       s.contact_person, s.contact_phone, s.notes,
 		       s.created_by, s.created_date, s.updated_date,
-		       COALESCE(p.name, '') as partner_name,
 		       COALESCE(acts.completed_amount, 0) as completed_amount,
 		       COALESCE(acts.paid_amount, 0) as paid_amount
 		FROM construction_subcontract s
-		LEFT JOIN organizations p ON p.id = s.partner_id
 		LEFT JOIN LATERAL (
 			SELECT COALESCE(SUM(CASE WHEN a.state = 'approved' AND a.act_type = 'ks2' THEN a.amount_total ELSE 0 END), 0) as completed_amount,
 			       COALESCE(SUM(CASE WHEN a.state = 'approved' AND a.act_type = 'ks3' THEN a.amount_total ELSE 0 END), 0) as paid_amount
@@ -74,7 +72,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 	for rows.Next() {
 		var id, projectIDVal int64
 		var name string
-		var partnerID uuid.NullUUID
+		var partnerName sql.NullString
 		var workDescription, notes sql.NullString
 		var amount float64
 		var currency string
@@ -83,16 +81,16 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		var contactPerson, contactPhone sql.NullString
 		var createdBy uuid.NullUUID
 		var createdDate, updatedDate time.Time
-		var state, partnerName string
+		var state string
 		var completedAmount, paidAmount float64
 
 		if err := rows.Scan(
-			&id, &name, &projectIDVal, &partnerID, &workDescription,
+			&id, &name, &projectIDVal, &partnerName, &workDescription,
 			&amount, &currency, &startDate, &endDate,
 			&retentionPct, &state, &rating,
 			&contactPerson, &contactPhone, &notes,
 			&createdBy, &createdDate, &updatedDate,
-			&partnerName, &completedAmount, &paidAmount,
+			&completedAmount, &paidAmount,
 		); err != nil {
 			h.log.Error("Failed to scan subcontract", "error", err)
 			continue
@@ -143,8 +141,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			"id":                 id,
 			"name":               name,
 			"project_id":         projectIDVal,
-			"partner_id":         nullUUIDVal(partnerID),
-			"partner_name":       partnerName,
+			"partner_name":       nullStringVal(partnerName),
 			"work_description":   nullStringVal(workDescription),
 			"amount":             amount,
 			"currency":           currency,
@@ -185,7 +182,7 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 	}
 
 	var req struct {
-		PartnerID       string  `json:"partner_id"`
+		PartnerName     string  `json:"partner_name"`
 		WorkDescription string  `json:"work_description"`
 		Amount          float64 `json:"amount"`
 		Currency        string  `json:"currency"`
@@ -216,13 +213,6 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		currency = "UZS"
 	}
 
-	var partnerID interface{}
-	if req.PartnerID != "" {
-		if parsed, err := uuid.Parse(req.PartnerID); err == nil {
-			partnerID = parsed
-		}
-	}
-
 	var startDate, endDate interface{}
 	if req.StartDate != "" {
 		startDate = req.StartDate
@@ -234,13 +224,13 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 	var id int64
 	err = h.db.QueryRow(`
 		INSERT INTO construction_subcontract (
-			tenant_id, project_id, partner_id, name, work_description,
+			tenant_id, project_id, partner_name, name, work_description,
 			amount, currency, start_date, end_date, retention_pct,
 			state, rating, contact_person, contact_phone, notes,
 			created_by, created_date, updated_date
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', 0, $11, $12, $13, $14, NOW(), NOW())
 		RETURNING id
-	`, tenantID, projectID, partnerID, name, nullStringFromVal(req.WorkDescription),
+	`, tenantID, projectID, nullStringFromVal(req.PartnerName), name, nullStringFromVal(req.WorkDescription),
 		req.Amount, currency, startDate, endDate, req.RetentionPct,
 		nullStringFromVal(req.ContactPerson), nullStringFromVal(req.ContactPhone),
 		nullStringFromVal(req.Notes), userID,
@@ -290,30 +280,27 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 
 	var id, projectIDVal int64
 	var name, state, currency string
-	var partnerID uuid.NullUUID
+	var partnerNameVal sql.NullString
 	var workDescription, notes, contactPerson, contactPhone sql.NullString
 	var amount, retentionPct, rating float64
 	var startDate, endDate sql.NullTime
 	var createdBy uuid.NullUUID
 	var createdDate, updatedDate time.Time
-	var partnerName string
 
 	err = h.db.QueryRow(`
-		SELECT s.id, s.name, s.project_id, s.partner_id, s.work_description,
+		SELECT s.id, s.name, s.project_id, s.partner_name, s.work_description,
 		       s.amount, s.currency, s.start_date, s.end_date,
 		       s.retention_pct, s.state, s.rating,
 		       s.contact_person, s.contact_phone, s.notes,
-		       s.created_by, s.created_date, s.updated_date,
-		       COALESCE(p.name, '') as partner_name
+		       s.created_by, s.created_date, s.updated_date
 		FROM construction_subcontract s
-		LEFT JOIN organizations p ON p.id = s.partner_id
 		WHERE s.id = $1 AND s.tenant_id = $2
 	`, subID, tenantID).Scan(
-		&id, &name, &projectIDVal, &partnerID, &workDescription,
+		&id, &name, &projectIDVal, &partnerNameVal, &workDescription,
 		&amount, &currency, &startDate, &endDate,
 		&retentionPct, &state, &rating,
 		&contactPerson, &contactPhone, &notes,
-		&createdBy, &createdDate, &updatedDate, &partnerName,
+		&createdBy, &createdDate, &updatedDate,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Subcontract not found")
@@ -355,8 +342,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		"id":               id,
 		"name":             name,
 		"project_id":       projectIDVal,
-		"partner_id":       nullUUIDVal(partnerID),
-		"partner_name":     partnerName,
+		"partner_name":     nullStringVal(partnerNameVal),
 		"work_description": nullStringVal(workDescription),
 		"amount":           amount,
 		"currency":         currency,
@@ -398,7 +384,7 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 	}
 
 	var req struct {
-		PartnerID       *string  `json:"partner_id"`
+		PartnerName     *string  `json:"partner_name"`
 		WorkDescription *string  `json:"work_description"`
 		Amount          *float64 `json:"amount"`
 		Currency        *string  `json:"currency"`
@@ -421,15 +407,10 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 	args := []interface{}{}
 	argCount := 0
 
-	if req.PartnerID != nil {
+	if req.PartnerName != nil {
 		argCount++
-		updates = append(updates, fmt.Sprintf("partner_id = $%d", argCount))
-		if *req.PartnerID == "" {
-			args = append(args, nil)
-		} else {
-			parsed, _ := uuid.Parse(*req.PartnerID)
-			args = append(args, parsed)
-		}
+		updates = append(updates, fmt.Sprintf("partner_name = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.PartnerName))
 	}
 	if req.WorkDescription != nil {
 		argCount++

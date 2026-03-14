@@ -53,6 +53,7 @@ type expenseLine struct {
 	SubcontractID       *int64   `json:"subcontract_id"`
 	SubcontractName     *string  `json:"subcontract_name"`
 	MaterialRequestID   *int64   `json:"material_request_id"`
+	SupplierName        *string  `json:"supplier_name"`
 }
 
 // ListExpenseLines returns expense lines for a project
@@ -87,7 +88,8 @@ func (h *Handler) ListExpenseLines(c *gin.Context) {
 		       el.cancelled_reason, el.created_by,
 		       el.created_at, el.updated_at,
 		       el.subcontract_id, sc.name,
-		       el.material_request_id
+		       el.material_request_id,
+		       el.supplier_name
 		FROM construction_expense_lines el
 		LEFT JOIN construction_stages s ON s.id = el.stage_id
 		LEFT JOIN construction_cost_categories cat ON cat.id = el.cost_category_id
@@ -178,6 +180,7 @@ func (h *Handler) ListExpenseLines(c *gin.Context) {
 			&el.CreatedAt, &el.UpdatedAt,
 			&el.SubcontractID, &el.SubcontractName,
 			&el.MaterialRequestID,
+			&el.SupplierName,
 		); err != nil {
 			h.log.Error("Failed to scan expense line", "error", err)
 			continue
@@ -237,6 +240,7 @@ func (h *Handler) CreateExpenseLine(c *gin.Context) {
 		DebitAccountID  string `json:"debit_account_id"`
 		CreditAccountID string `json:"credit_account_id"`
 		DocumentURL    string  `json:"document_url"`
+		SupplierName   string  `json:"supplier_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -293,13 +297,15 @@ func (h *Handler) CreateExpenseLine(c *gin.Context) {
 			expense_date, description, product_id, quantity, uom, unit_price,
 			amount, currency_code, vendor_id,
 			debit_account_id, credit_account_id, analytic_account_id,
-			document_url, status, created_by, created_at, updated_at
+			document_url, status, created_by, created_at, updated_at,
+			supplier_name
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7,
 			$8, $9, $10, $11, $12, $13,
 			$14, $15, $16,
 			$17, $18, $19,
-			$20, 'draft', $21, NOW(), NOW()
+			$20, 'draft', $21, NOW(), NOW(),
+			$22
 		)
 	`,
 		id, tenantID, orgIDPtr, projectID,
@@ -309,6 +315,7 @@ func (h *Handler) CreateExpenseLine(c *gin.Context) {
 		req.Amount, req.CurrencyCode, nullUUIDFromVal(req.VendorID),
 		debitAccID, nullUUIDFromVal(req.CreditAccountID), analyticVal,
 		nullStringFromVal(req.DocumentURL), userID,
+		nullStringFromVal(req.SupplierName),
 	)
 	if err != nil {
 		h.log.Error("Failed to create expense line", "error", err)
@@ -367,6 +374,7 @@ func (h *Handler) UpdateExpenseLine(c *gin.Context) {
 		DebitAccountID  *string  `json:"debit_account_id"`
 		CreditAccountID *string  `json:"credit_account_id"`
 		DocumentURL     *string  `json:"document_url"`
+		SupplierName    *string  `json:"supplier_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -384,6 +392,9 @@ func (h *Handler) UpdateExpenseLine(c *gin.Context) {
 		args = append(args, val)
 	}
 
+	if req.SupplierName != nil {
+		addArg("supplier_name", nullStringFromVal(*req.SupplierName))
+	}
 	if req.StageID != nil {
 		addArg("stage_id", nullInt64FromVal(*req.StageID))
 	}
