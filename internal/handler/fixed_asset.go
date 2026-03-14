@@ -138,7 +138,8 @@ func (h *Handler) ListAssetCategories(c *gin.Context) {
 	}
 
 	query := `
-		SELECT id, tenant_id, code, name, description, depreciation_method, default_useful_life_months, is_active
+		SELECT id, tenant_id, code, name, description, depreciation_method, default_useful_life_months, is_active,
+			   asset_account_id, depreciation_account_id, expense_account_id
 		FROM asset_categories
 		WHERE tenant_id = $1
 	`
@@ -165,10 +166,12 @@ func (h *Handler) ListAssetCategories(c *gin.Context) {
 	for rows.Next() {
 		var cat entity.AssetCategory
 		var description sql.NullString
+		var assetAcctID, deprAcctID, expAcctID *uuid.UUID
 
 		if err := rows.Scan(
 			&cat.ID, &cat.TenantID, &cat.Code, &cat.Name, &description,
 			&cat.DepreciationMethod, &cat.DefaultUsefulLifeMonths, &cat.IsActive,
+			&assetAcctID, &deprAcctID, &expAcctID,
 		); err != nil {
 			h.log.Error("Failed to scan asset category", "error", err)
 			continue
@@ -177,6 +180,9 @@ func (h *Handler) ListAssetCategories(c *gin.Context) {
 		if description.Valid {
 			cat.Description = &description.String
 		}
+		cat.AssetAccountID = assetAcctID
+		cat.DepreciationAccountID = deprAcctID
+		cat.ExpenseAccountID = expAcctID
 
 		categories = append(categories, cat.ToResponse())
 	}
@@ -324,18 +330,24 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 
 	var categoryID, custodianID *uuid.UUID
 	var categoryName *string
+	var catAssetAcctID, catDeprAcctID, catExpenseAcctID *uuid.UUID
 	if input.CategoryID != "" {
 		if parsedID, err := uuid.Parse(input.CategoryID); err == nil {
 			categoryID = &parsedID
-			// Get category name
+			// Get category name and default account IDs
 			var name string
-			if err := h.db.QueryRow("SELECT name FROM asset_categories WHERE id = $1", parsedID).Scan(&name); err == nil {
+			var assetAcct, deprAcct, expAcct *uuid.UUID
+			if err := h.db.QueryRow("SELECT name, asset_account_id, depreciation_account_id, expense_account_id FROM asset_categories WHERE id = $1", parsedID).Scan(&name, &assetAcct, &deprAcct, &expAcct); err == nil {
 				categoryName = &name
+				catAssetAcctID = assetAcct
+				catDeprAcctID = deprAcct
+				catExpenseAcctID = expAcct
 			}
 		}
 	} else if input.Category != "" {
 		categoryName = &input.Category
 	}
+	_, _ = catDeprAcctID, catExpenseAcctID // used in depreciation context, available for future use
 	if input.CustodianID != "" {
 		if parsedID, err := uuid.Parse(input.CustodianID); err == nil {
 			custodianID = &parsedID
@@ -446,10 +458,15 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 			return
 		}
 
-		// Debit: Fixed Asset account (1500)
-		faAcct := findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
-		if faAcct == uuid.Nil {
-			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
+		// Debit: Fixed Asset account — use category default if available, else fallback to 1500
+		var faAcct uuid.UUID
+		if catAssetAcctID != nil {
+			faAcct = *catAssetAcctID
+		} else {
+			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
+			if faAcct == uuid.Nil {
+				faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
+			}
 		}
 		if faAcct == uuid.Nil {
 			return
@@ -1278,6 +1295,11 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 	if input.DocumentNumber != "" {
 		m.DocumentNumber = &input.DocumentNumber
 	}
+	if input.NextServiceDate != "" {
+		if nsd, err := time.Parse("2006-01-02", input.NextServiceDate); err == nil {
+			m.NextServiceDate = &nsd
+		}
+	}
 
 	// Calculate after-values based on maintenance type
 	newValue := curValue
@@ -1332,13 +1354,13 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 			value_before, useful_life_before, monthly_depr_before,
 			value_after, useful_life_after, monthly_depr_after,
 			life_extension_months, value_increase,
-			description, performed_by, document_number, created_by, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+			description, performed_by, document_number, next_service_date, created_by, created_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
 		m.ID, m.TenantID, m.OrganizationID, m.AssetID, m.MaintenanceType, m.ServiceDate, m.Cost,
 		m.ValueBefore, m.UsefulLifeBefore, m.MonthlyDeprBefore,
 		m.ValueAfter, m.UsefulLifeAfter, m.MonthlyDeprAfter,
 		m.LifeExtensionMonths, m.ValueIncrease,
-		m.Description, m.PerformedBy, m.DocumentNumber, m.CreatedBy, m.CreatedAt,
+		m.Description, m.PerformedBy, m.DocumentNumber, m.NextServiceDate, m.CreatedBy, m.CreatedAt,
 	)
 	if err != nil {
 		h.log.Error("Failed to insert maintenance record", "error", err)
@@ -1746,6 +1768,91 @@ func (h *Handler) CreateAssetCategory(c *gin.Context) {
 	response.Created(c, cat.ToResponse())
 }
 
+// UpdateAssetCategory updates an existing asset category
+func (h *Handler) UpdateAssetCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	catID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid category ID")
+		return
+	}
+
+	var input entity.CreateAssetCategoryInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	now := time.Now()
+	var description *string
+	if input.Description != "" {
+		description = &input.Description
+	}
+
+	result, err := h.db.Exec(`
+		UPDATE asset_categories SET name = $1, code = $2, description = $3, depreciation_method = $4,
+			default_useful_life_months = $5, updated_at = $6
+		WHERE id = $7 AND tenant_id = $8`,
+		input.Name, input.Code, description, input.DepreciationMethod, input.DefaultUsefulLifeMonths, now, catID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to update asset category", "error", err)
+		if strings.Contains(err.Error(), "duplicate") {
+			response.Conflict(c, "Category with this code already exists")
+			return
+		}
+		response.InternalError(c, "Failed to update asset category")
+		return
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		response.NotFound(c, "Asset category")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Category updated"})
+}
+
+// DeleteAssetCategory deletes (deactivates) an asset category
+func (h *Handler) DeleteAssetCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	catID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid category ID")
+		return
+	}
+
+	// Check if any active assets use this category
+	var assetCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM fixed_assets WHERE category_id = $1 AND tenant_id = $2 AND status = 'active' AND deleted_at IS NULL", catID, tenantID).Scan(&assetCount)
+	if assetCount > 0 {
+		response.BadRequest(c, fmt.Sprintf("Cannot delete category: %d active assets are using it", assetCount))
+		return
+	}
+
+	result, err := h.db.Exec("UPDATE asset_categories SET is_active = false, updated_at = $1 WHERE id = $2 AND tenant_id = $3", time.Now(), catID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete asset category", "error", err)
+		response.InternalError(c, "Failed to delete asset category")
+		return
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		response.NotFound(c, "Asset category")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Category deleted"})
+}
+
 // GetAssetDashboard returns summary statistics for fixed assets
 func (h *Handler) GetAssetDashboard(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -1777,13 +1884,21 @@ func (h *Handler) GetAssetDashboard(c *gin.Context) {
 		FROM fixed_assets WHERE tenant_id = $1 AND deleted_at IS NULL%s`, orgFilter),
 		args...).Scan(&totalAssets, &activeAssets, &disposedAssets, &totalAcquisitionCost, &totalCurrentValue, &totalAccumDepr, &creditAssetsDebt)
 
+	// This month's total depreciation (sum of monthly_depr for active assets)
+	var thisMonthDepr float64
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COALESCE(SUM(COALESCE(monthly_depr, 0)), 0)
+		FROM fixed_assets WHERE tenant_id = $1 AND status = 'active' AND deleted_at IS NULL AND remaining_months > 0%s`, orgFilter),
+		args...).Scan(&thisMonthDepr)
+
 	response.Success(c, gin.H{
-		"total_assets":           totalAssets,
-		"active_assets":          activeAssets,
-		"disposed_assets":        disposedAssets,
-		"total_acquisition_cost": totalAcquisitionCost,
-		"total_current_value":    totalCurrentValue,
+		"total_assets":             totalAssets,
+		"active_assets":            activeAssets,
+		"disposed_assets":          disposedAssets,
+		"total_acquisition_cost":   totalAcquisitionCost,
+		"total_current_value":      totalCurrentValue,
 		"total_accum_depreciation": totalAccumDepr,
-		"credit_remaining_debt":  creditAssetsDebt,
+		"credit_remaining_debt":    creditAssetsDebt,
+		"this_month_depreciation":  thisMonthDepr,
 	})
 }

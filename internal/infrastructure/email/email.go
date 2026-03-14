@@ -3,9 +3,12 @@ package email
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"html/template"
+	"mime/multipart"
 	"net/smtp"
+	"net/textproto"
 	"strings"
 
 	"github.com/genixerp/genix-backend/internal/config"
@@ -21,12 +24,20 @@ func NewService(cfg *config.EmailConfig) *Service {
 	return &Service{config: cfg}
 }
 
+// Attachment represents an email attachment
+type Attachment struct {
+	Filename    string
+	ContentType string
+	Data        []byte
+}
+
 // Email represents an email message
 type Email struct {
-	To      []string
-	Subject string
-	Body    string
-	IsHTML  bool
+	To          []string
+	Subject     string
+	Body        string
+	IsHTML      bool
+	Attachments []Attachment
 }
 
 // Send sends an email
@@ -54,16 +65,44 @@ func (s *Service) Send(email *Email) error {
 	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
 	msg.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(email.To, ", ")))
 	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", email.Subject))
+	msg.WriteString("MIME-Version: 1.0\r\n")
 
-	if email.IsHTML {
-		msg.WriteString("MIME-Version: 1.0\r\n")
-		msg.WriteString("Content-Type: text/html; charset=\"UTF-8\"\r\n")
+	if len(email.Attachments) > 0 {
+		// Multipart message with attachments
+		writer := multipart.NewWriter(&msg)
+		msg.WriteString(fmt.Sprintf("Content-Type: multipart/mixed; boundary=\"%s\"\r\n\r\n", writer.Boundary()))
+
+		// Body part
+		bodyHeader := make(textproto.MIMEHeader)
+		if email.IsHTML {
+			bodyHeader.Set("Content-Type", "text/html; charset=\"UTF-8\"")
+		} else {
+			bodyHeader.Set("Content-Type", "text/plain; charset=\"UTF-8\"")
+		}
+		bodyPart, _ := writer.CreatePart(bodyHeader)
+		bodyPart.Write([]byte(email.Body))
+
+		// Attachment parts
+		for _, att := range email.Attachments {
+			attHeader := make(textproto.MIMEHeader)
+			attHeader.Set("Content-Type", att.ContentType)
+			attHeader.Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", att.Filename))
+			attHeader.Set("Content-Transfer-Encoding", "base64")
+			attPart, _ := writer.CreatePart(attHeader)
+			encoded := base64.StdEncoding.EncodeToString(att.Data)
+			attPart.Write([]byte(encoded))
+		}
+		writer.Close()
 	} else {
-		msg.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
+		// Simple message without attachments
+		if email.IsHTML {
+			msg.WriteString("Content-Type: text/html; charset=\"UTF-8\"\r\n")
+		} else {
+			msg.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
+		}
+		msg.WriteString("\r\n")
+		msg.WriteString(email.Body)
 	}
-
-	msg.WriteString("\r\n")
-	msg.WriteString(email.Body)
 
 	// Connect to SMTP server
 	addr := fmt.Sprintf("%s:%d", s.config.SMTPHost, s.config.SMTPPort)

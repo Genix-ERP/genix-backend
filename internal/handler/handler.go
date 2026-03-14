@@ -700,6 +700,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		taxReports.POST("/periods/:id/calculate", h.perm.Require("finance", "tax_report", "update"), h.CalculateTaxReport)
 		taxReports.POST("/periods/:id/file", h.perm.Require("finance", "tax_report", "file"), h.FileTaxReport)
 		taxReports.DELETE("/periods/:id", h.perm.Require("finance", "tax_report", "delete"), h.DeleteTaxReportPeriod)
+		taxReports.POST("/periods/:id/pay", h.perm.Require("finance", "tax_report", "update"), h.PayTaxPeriod)
 	}
 
 	// Discounts
@@ -1496,6 +1497,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		assetCategories.GET("", h.ListAssetCategories)
 		assetCategories.POST("", h.perm.Require("finance", "asset", "create"), h.CreateAssetCategory)
+		assetCategories.PUT("/:id", h.perm.Require("finance", "asset", "update"), h.UpdateAssetCategory)
+		assetCategories.DELETE("/:id", h.perm.Require("finance", "asset", "delete"), h.DeleteAssetCategory)
 	}
 
 	// Fixed Assets
@@ -1681,10 +1684,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/subcontracts", h.ListSubcontracts)
 		constructionProjects.POST("/:id/subcontracts", h.perm.Require("construction", "project", "update"), h.CreateSubcontract)
 
-		// Acts (KS-2 / KS-3)
+		// Acts (Forma 2 / Forma 3 / Forma 19)
 		constructionProjects.GET("/:id/acts", h.ListConstructionActs)
 		constructionProjects.POST("/:id/acts", h.perm.Require("construction", "project", "update"), h.CreateConstructionAct)
 		constructionProjects.POST("/:id/acts/generate-ks2", h.perm.Require("construction", "project", "update"), h.AutoGenerateKS2)
+		constructionProjects.POST("/:id/acts/generate-ks3", h.perm.Require("construction", "project", "update"), h.GenerateForma3)
+
+		// Smeta vs Fact analytics
+		constructionProjects.GET("/:id/smeta-vs-fact", h.GetSmetaVsFact)
 
 		// Financial Analysis
 		constructionProjects.GET("/:id/financial/pnl", h.GetProjectPnL)
@@ -1697,6 +1704,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/reports/budget", h.GetStageBudgetReport)
 		constructionProjects.GET("/:id/reports/materials", h.GetMaterialsReport)
 		constructionProjects.GET("/:id/reports/journal-entries", h.GetJournalEntriesReport)
+
+		// Reja vs Fakt (Plan vs Fact)
+		constructionProjects.GET("/:id/reja-fakt", h.GetRejaFakt)
+		constructionProjects.GET("/:id/reja-fakt/audit", h.ListRejaFaktAudit)
 
 		// Commission (complete project)
 		constructionProjects.PUT("/:id/commission", h.perm.Require("construction", "project", "update"), h.CommissionProject)
@@ -1807,6 +1818,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionSubStages.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionSubStage)
 		constructionSubStages.GET("/:id/materials", h.ListSubStageMaterials)
 		constructionSubStages.POST("/:id/materials", h.perm.Require("construction", "project", "update"), h.CreateSubStageMaterial)
+		// Equipment
+		constructionSubStages.GET("/:id/equipment", h.ListSubStageEquipment)
+		constructionSubStages.POST("/:id/equipment", h.perm.Require("construction", "project", "update"), h.CreateSubStageEquipment)
 	}
 
 	// Construction Sub-Stage Materials (direct access for update/delete)
@@ -1814,7 +1828,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	subStageMaterials.Use(h.perm.Require("construction", "project", "read"))
 	{
 		subStageMaterials.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateSubStageMaterial)
+		subStageMaterials.PUT("/:id/plan-fact", h.perm.Require("construction", "project", "update"), h.UpdateSubStageMaterialPlanFact)
 		subStageMaterials.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteSubStageMaterial)
+	}
+
+	// Construction Sub-Stage Equipment (direct access for update/delete)
+	subStageEquipment := rg.Group("/construction/sub-stage-equipment")
+	subStageEquipment.Use(h.perm.Require("construction", "project", "read"))
+	{
+		subStageEquipment.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateSubStageEquipment)
+		subStageEquipment.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteSubStageEquipment)
 	}
 
 	// Expense Lines (direct access for update/delete/approve/cancel)
@@ -1867,7 +1890,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		subcontracts.PUT("/:id/state", h.perm.Require("construction", "project", "update"), h.UpdateSubcontractState)
 	}
 
-	// Acts (direct access)
+	// Acts (direct access) — Forma 2 / Forma 3 / Forma 19
 	acts := rg.Group("/construction/acts")
 	acts.Use(h.perm.Require("construction", "project", "read"))
 	{
@@ -1876,6 +1899,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		acts.PUT("/:id/approve", h.perm.Require("construction", "project", "update"), h.ApproveConstructionAct)
 		acts.PUT("/:id/reject", h.perm.Require("construction", "project", "update"), h.RejectConstructionAct)
 		acts.POST("/:id/generate-ks3", h.perm.Require("construction", "project", "update"), h.GenerateKS3FromKS2)
+		acts.PUT("/:id/sign", h.perm.Require("construction", "project", "update"), h.SignAct)
+		acts.PUT("/:id/cancel", h.perm.Require("construction", "project", "update"), h.CancelAct)
+		acts.GET("/:id/export", h.ExportActDocument)
 	}
 
 	// =====================================================
