@@ -3214,12 +3214,12 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	}
 
 	var req struct {
-		RequestDate      string      `json:"request_date" binding:"required"`
-		RequiredDate     string      `json:"required_date"`
-		Items            interface{} `json:"items"`
-		Notes            string      `json:"notes"`
-		BillSubcontractor bool       `json:"bill_subcontractor"`
-		SubcontractID    int64       `json:"subcontract_id"`
+		RequestDate       string      `json:"request_date" binding:"required"`
+		RequiredDate      string      `json:"required_date"`
+		Items             interface{} `json:"items"`
+		Notes             string      `json:"notes"`
+		BillSubcontractor bool        `json:"bill_subcontractor"`
+		SubcontractID     int64       `json:"subcontract_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -3248,7 +3248,7 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	}
 
 	var subcontractID interface{}
-	if req.BillSubcontractor && req.SubcontractID > 0 {
+	if req.SubcontractID > 0 {
 		subcontractID = req.SubcontractID
 	}
 
@@ -3279,9 +3279,8 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 			stockOpID, requestID, tenantID)
 	}
 
-	// Auto-create expense line for subcontractor billing
-	if req.BillSubcontractor && req.SubcontractID > 0 {
-		// Calculate total from items
+	// Auto-create expense line for material request
+	{
 		var totalAmount float64
 		var itemDescriptions []string
 		if items, ok := req.Items.([]interface{}); ok {
@@ -3301,14 +3300,32 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 			if len(itemDescriptions) > 0 {
 				expDesc += " (" + strings.Join(itemDescriptions, ", ") + ")"
 			}
-			h.db.Exec(`
-				INSERT INTO construction_expense_lines (
-					tenant_id, organization_id, project_id, expense_date, description,
-					amount, currency_code, subcontract_id, material_request_id,
-					status, created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
-			`, tenantID, organizationID, projectID, requestDate, expDesc,
-				totalAmount, req.SubcontractID, requestID, userID)
+
+			if req.SubcontractID > 0 {
+				// Billed to subcontractor — supplier_name = subcontractor partner_name
+				var scPartnerName string
+				h.db.QueryRow(`SELECT COALESCE(partner_name, name) FROM construction_subcontract WHERE id = $1`, req.SubcontractID).Scan(&scPartnerName)
+				h.db.Exec(`
+					INSERT INTO construction_expense_lines (
+						tenant_id, organization_id, project_id, expense_date, description,
+						amount, currency_code, subcontract_id, material_request_id,
+						supplier_name, status, created_by, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, 'UZS', $7, $8, $9, 'draft', $10, NOW(), NOW())
+				`, tenantID, organizationID, projectID, requestDate, expDesc,
+					totalAmount, req.SubcontractID, requestID, scPartnerName, userID)
+			} else {
+				// No subcontractor — supplier is the company itself
+				var orgName string
+				h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, organizationID).Scan(&orgName)
+				h.db.Exec(`
+					INSERT INTO construction_expense_lines (
+						tenant_id, organization_id, project_id, expense_date, description,
+						amount, currency_code, material_request_id,
+						supplier_name, status, created_by, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
+				`, tenantID, organizationID, projectID, requestDate, expDesc,
+					totalAmount, requestID, orgName, userID)
+			}
 		}
 	}
 
