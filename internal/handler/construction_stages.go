@@ -193,6 +193,14 @@ func (h *Handler) UpdateConstructionStage(c *gin.Context) {
 		addField("stage_order", *req.StageOrder)
 	}
 	if req.Status != nil {
+		// F19 blocking: check if stage requires signed Forma 19 before completion
+		if *req.Status == "completed" {
+			blocked, blockMsg := h.CheckF19Blocking(tenantID, id)
+			if blocked {
+				response.BadRequest(c, blockMsg)
+				return
+			}
+		}
 		addField("status", *req.Status)
 	}
 	if req.PlannedBudget != nil {
