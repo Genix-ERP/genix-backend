@@ -219,6 +219,22 @@ func (h *Handler) CreateEstimate(c *gin.Context) {
 
 	h.logConstructionActivity(tenantID, projectID, userID, "estimate", fmt.Sprintf("Smeta yaratildi: v%d - %s", nextVersion, req.Name), "Estimate", itemID)
 
+	// Auto-create a construction stage when VOR estimate is created
+	if req.SourceType == "vor" && req.Name != "" {
+		var existingStageID int64
+		err := h.db.QueryRow(
+			`SELECT id FROM construction_stages WHERE project_id = $1 AND tenant_id = $2 AND name = $3 LIMIT 1`,
+			projectID, tenantID, req.Name,
+		).Scan(&existingStageID)
+		if err != nil {
+			// Stage doesn't exist, create it
+			h.db.Exec(`
+				INSERT INTO construction_stages (tenant_id, project_id, name, status, planned_budget, stage_order, created_at, updated_at)
+				VALUES ($1, $2, $3, 'not_started', 0, (SELECT COALESCE(MAX(stage_order), 0) + 1 FROM construction_stages WHERE project_id = $2 AND tenant_id = $1), NOW(), NOW())
+			`, tenantID, projectID, req.Name)
+		}
+	}
+
 	response.Success(c, map[string]interface{}{
 		"id":      itemID,
 		"version": nextVersion,
