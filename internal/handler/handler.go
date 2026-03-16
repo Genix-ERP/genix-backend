@@ -1902,6 +1902,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		acts.PUT("/:id/sign", h.perm.Require("construction", "project", "update"), h.SignAct)
 		acts.PUT("/:id/cancel", h.perm.Require("construction", "project", "update"), h.CancelAct)
 		acts.GET("/:id/export", h.ExportActDocument)
+		acts.PUT("/:id/lines/:lineId", h.perm.Require("construction", "project", "update"), h.UpdateActLine)
 	}
 
 	// =====================================================

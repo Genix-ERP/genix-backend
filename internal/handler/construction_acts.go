@@ -217,7 +217,7 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 		} `json:"lines"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Invalid input: act_type is required")
+		response.BadRequest(c, "Akt turi (act_type) kiritilishi shart")
 		return
 	}
 
@@ -225,7 +225,7 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 		"ks2": true, "ks3": true, "hidden_work": true, "acceptance": true, "defect": true,
 	}
 	if !validTypes[req.ActType] {
-		response.BadRequest(c, "Invalid act_type")
+		response.BadRequest(c, "Noto'g'ri akt turi")
 		return
 	}
 
@@ -234,35 +234,31 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 	// Forma 19 validations
 	if req.ActType == "hidden_work" {
 		if req.StageID == 0 {
-			response.BadRequest(c, "stage_id is required for hidden work acts")
+			response.BadRequest(c, "Yashirin ishlar akti uchun bosqich (stage_id) tanlang")
 			return
 		}
 		if req.LocationAxes == "" {
-			response.BadRequest(c, "location_axes is required for hidden work acts")
+			response.BadRequest(c, "O'qlar va belgilarni kiriting")
 			return
 		}
 		if req.WorksStartDate == "" || req.WorksEndDate == "" {
-			response.BadRequest(c, "works_start_date and works_end_date are required")
+			response.BadRequest(c, "Ish boshlangan va tugagan sanalarni kiriting")
 			return
 		}
 		if req.WorksEndDate < req.WorksStartDate {
-			response.BadRequest(c, "works_end_date cannot be before works_start_date")
+			response.BadRequest(c, "Tugash sanasi boshlanish sanasidan oldin bo'lishi mumkin emas")
 			return
 		}
 		if len(req.Photos) < 2 {
-			response.BadRequest(c, "At least 2 photos are required for hidden work acts")
+			response.BadRequest(c, "Kamida 2 ta rasm yuklanishi shart")
 			return
 		}
 	}
 
 	// Forma 2 validations
 	if req.ActType == "ks2" {
-		if len(req.Lines) == 0 {
-			response.BadRequest(c, "At least one work item is required")
-			return
-		}
 		if req.SubcontractID == 0 {
-			response.BadRequest(c, "subcontract_id is required for KS-2 acts")
+			response.BadRequest(c, "KS-2 akti uchun subpudratchi tanlang")
 			return
 		}
 		// Validate qty_period <= remaining by smeta for each line
@@ -695,7 +691,7 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 		PeriodTo      string `json:"period_to" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "subcontract_id, period_from, and period_to are required")
+		response.BadRequest(c, "Subpudratchi, boshlanish va tugash sanalarini kiriting")
 		return
 	}
 
@@ -720,7 +716,7 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	if len(wbsIDs) == 0 {
-		response.BadRequest(c, "Subcontract has no linked WBS items")
+		response.BadRequest(c, "Subpudratchi WBS elementlariga bog'lanmagan")
 		return
 	}
 
@@ -779,7 +775,7 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	if len(lineDataList) == 0 {
-		response.BadRequest(c, "No work found for this subcontract in the specified period")
+		response.BadRequest(c, "Tanlangan davr uchun bu subpudratchi bo'yicha ishlar topilmadi")
 		return
 	}
 
@@ -874,7 +870,7 @@ func (h *Handler) SignAct(c *gin.Context) {
 		Role string `json:"role" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "role is required (contractor, client, designer, gasn)")
+		response.BadRequest(c, "Rolni tanlang (contractor, client, designer, gasn)")
 		return
 	}
 
@@ -882,7 +878,7 @@ func (h *Handler) SignAct(c *gin.Context) {
 		"contractor": true, "client": true, "designer": true, "gasn": true,
 	}
 	if !validRoles[req.Role] {
-		response.BadRequest(c, "Invalid role. Must be: contractor, client, designer, or gasn")
+		response.BadRequest(c, "Noto'g'ri rol. contractor, client, designer yoki gasn bo'lishi kerak")
 		return
 	}
 
@@ -899,13 +895,13 @@ func (h *Handler) SignAct(c *gin.Context) {
 	}
 
 	if currentState == "signed" || currentState == "cancelled" {
-		response.BadRequest(c, "Act is already signed or cancelled")
+		response.BadRequest(c, "Akt allaqachon imzolangan yoki bekor qilingan")
 		return
 	}
 
 	// Validate role is valid for act type
 	if actType == "ks2" && (req.Role == "designer" || req.Role == "gasn") {
-		response.BadRequest(c, "KS-2 acts only support contractor and client signatures")
+		response.BadRequest(c, "KS-2 aktlari faqat pudratchi va buyurtmachi imzolarini qo'llab-quvvatlaydi")
 		return
 	}
 
@@ -1017,7 +1013,7 @@ func (h *Handler) CancelAct(c *gin.Context) {
 		RejectionReason string `json:"rejection_reason" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "rejection_reason is required")
+		response.BadRequest(c, "Bekor qilish sababini kiriting")
 		return
 	}
 
@@ -1032,7 +1028,7 @@ func (h *Handler) CancelAct(c *gin.Context) {
 	}
 
 	if currentState != "signed" && currentState != "approved" {
-		response.BadRequest(c, "Only signed or approved acts can be cancelled")
+		response.BadRequest(c, "Faqat imzolangan yoki tasdiqlangan aktlarni bekor qilish mumkin")
 		return
 	}
 
@@ -1212,7 +1208,7 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 		PeriodTo      string `json:"period_to" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "subcontract_id, period_from, and period_to are required")
+		response.BadRequest(c, "Subpudratchi, boshlanish va tugash sanalarini kiriting")
 		return
 	}
 
@@ -1228,7 +1224,7 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 		  AND tenant_id = $4
 	`, req.SubcontractID, req.PeriodFrom, req.PeriodTo, tenantID).Scan(&periodAmount)
 	if err != nil || periodAmount == 0 {
-		response.BadRequest(c, "No signed KS-2 acts found for the specified period")
+		response.BadRequest(c, "Tanlangan davr uchun imzolangan KS-2 aktlar topilmadi")
 		return
 	}
 
@@ -1586,6 +1582,96 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 }
 
 // DeleteConstructionAct deletes a draft act
+func (h *Handler) UpdateActLine(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	actID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid act ID")
+		return
+	}
+	lineID, err := strconv.ParseInt(c.Param("lineId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid line ID")
+		return
+	}
+
+	// Check act is draft
+	var state, actType string
+	var projectID int64
+	err = h.db.QueryRow(`SELECT state, act_type, project_id FROM construction_act WHERE id = $1 AND tenant_id = $2`,
+		actID, tenantID).Scan(&state, &actType, &projectID)
+	if err != nil {
+		response.NotFound(c, "Act not found")
+		return
+	}
+	if state != "draft" {
+		response.BadRequest(c, "Can only edit lines in draft acts")
+		return
+	}
+
+	var req struct {
+		QtyPeriod *float64 `json:"qty_period"`
+		Note      *string  `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request")
+		return
+	}
+
+	// Get current line
+	var qtySmeta, unitRate float64
+	err = h.db.QueryRow(`SELECT COALESCE(qty_smeta, 0), COALESCE(unit_rate, 0) FROM construction_act_line WHERE id = $1 AND act_id = $2`,
+		lineID, actID).Scan(&qtySmeta, &unitRate)
+	if err != nil {
+		response.NotFound(c, "Line not found")
+		return
+	}
+
+	// Validate qty_period <= qty_smeta
+	if req.QtyPeriod != nil && qtySmeta > 0 && *req.QtyPeriod > qtySmeta {
+		response.BadRequest(c, "Miqdor smeta miqdoridan oshmasligi kerak")
+		return
+	}
+
+	// Update line
+	if req.QtyPeriod != nil {
+		lineTotal := *req.QtyPeriod * unitRate
+		_, err = h.db.Exec(`UPDATE construction_act_line SET quantity = $1, total_amount = $2 WHERE id = $3 AND act_id = $4`,
+			*req.QtyPeriod, lineTotal, lineID, actID)
+		if err != nil {
+			h.log.Error("Failed to update act line quantity", "error", err)
+			response.InternalError(c, "Failed to update line")
+			return
+		}
+	}
+	if req.Note != nil {
+		_, err = h.db.Exec(`UPDATE construction_act_line SET note = $1 WHERE id = $2 AND act_id = $3`,
+			*req.Note, lineID, actID)
+		if err != nil {
+			h.log.Error("Failed to update act line note", "error", err)
+			response.InternalError(c, "Failed to update line")
+			return
+		}
+	}
+
+	// Recalculate act totals
+	var totalAmt float64
+	h.db.QueryRow(`SELECT COALESCE(SUM(total_amount), 0) FROM construction_act_line WHERE act_id = $1`, actID).Scan(&totalAmt)
+	var vatPct float64
+	h.db.QueryRow(`SELECT COALESCE(vat_pct, 12) FROM construction_act WHERE id = $1`, actID).Scan(&vatPct)
+	vatAmt := totalAmt * vatPct / 100
+	totalWithVat := totalAmt + vatAmt
+	h.db.Exec(`UPDATE construction_act SET amount_total = $1, vat_amount = $2, amount_total_with_vat = $3 WHERE id = $4`,
+		totalAmt, vatAmt, totalWithVat, actID)
+
+	response.Success(c, map[string]interface{}{"message": "Line updated"})
+}
+
 func (h *Handler) DeleteConstructionAct(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1609,7 +1695,7 @@ func (h *Handler) DeleteConstructionAct(c *gin.Context) {
 	}
 
 	if state == "approved" || state == "signed" || state == "cancelled" {
-		response.BadRequest(c, "Cannot delete approved, signed, or cancelled acts")
+		response.BadRequest(c, "Tasdiqlangan, imzolangan yoki bekor qilingan aktlarni o'chirib bo'lmaydi")
 		return
 	}
 

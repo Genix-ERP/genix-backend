@@ -613,28 +613,57 @@ type reconciliationLine struct {
 // If the source_type is not recognized, the original English description is returned.
 // htmlToPDF converts HTML content to PDF using wkhtmltopdf
 func htmlToPDF(htmlContent string) ([]byte, error) {
-	tmpFile, err := os.CreateTemp("", "reconciliation-*.html")
+	tmpHTML, err := os.CreateTemp("", "report-*.html")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer os.Remove(tmpFile.Name())
+	defer os.Remove(tmpHTML.Name())
 
-	if _, err := tmpFile.WriteString(htmlContent); err != nil {
-		tmpFile.Close()
+	if _, err := tmpHTML.WriteString(htmlContent); err != nil {
+		tmpHTML.Close()
 		return nil, fmt.Errorf("failed to write HTML: %w", err)
 	}
-	tmpFile.Close()
+	tmpHTML.Close()
 
-	var stdout, stderr bytes.Buffer
-	cmd := exec.Command("wkhtmltopdf", "--quiet", "--encoding", "UTF-8", "--page-size", "A4", "--margin-top", "10mm", "--margin-bottom", "10mm", tmpFile.Name(), "-")
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("wkhtmltopdf failed: %w, stderr: %s", err, stderr.String())
+	// Try wkhtmltopdf first
+	if path, err := exec.LookPath("wkhtmltopdf"); err == nil {
+		var stdout, stderr bytes.Buffer
+		cmd := exec.Command(path, "--quiet", "--encoding", "UTF-8", "--page-size", "A4", "--margin-top", "10mm", "--margin-bottom", "10mm", tmpHTML.Name(), "-")
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err == nil {
+			return stdout.Bytes(), nil
+		}
 	}
 
-	return stdout.Bytes(), nil
+	// Fallback to weasyprint (check common paths)
+	weasyprintPaths := []string{"weasyprint", "/Users/behruzniyozov/.pyenv/versions/3.12.12/bin/weasyprint", "/usr/local/bin/weasyprint", "/opt/homebrew/bin/weasyprint"}
+	var wpPath string
+	for _, p := range weasyprintPaths {
+		if found, err := exec.LookPath(p); err == nil {
+			wpPath = found
+			break
+		}
+	}
+	if wpPath != "" {
+		path := wpPath
+		tmpPDF, err := os.CreateTemp("", "report-*.pdf")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create temp PDF file: %w", err)
+		}
+		tmpPDF.Close()
+		defer os.Remove(tmpPDF.Name())
+
+		var stderr bytes.Buffer
+		cmd := exec.Command(path, tmpHTML.Name(), tmpPDF.Name())
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("weasyprint failed: %w, stderr: %s", err, stderr.String())
+		}
+		return os.ReadFile(tmpPDF.Name())
+	}
+
+	return nil, fmt.Errorf("no PDF generator found: install wkhtmltopdf or weasyprint")
 }
 
 func getUzDescription(sourceType, originalDescription string) string {
