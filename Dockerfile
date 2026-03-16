@@ -36,7 +36,13 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 FROM alpine:3.19
 
 # Install runtime dependencies
-RUN apk add --no-cache ca-certificates tzdata wkhtmltopdf font-noto
+RUN apk add --no-cache ca-certificates tzdata font-noto \
+    libstdc++ libx11 libxrender libxext libssl3 libcrypto3 \
+    fontconfig freetype ttf-dejavu && \
+    wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox-0.12.6.1-3.linux-generic-amd64.tar.xz -O /tmp/wkhtmltox.tar.xz && \
+    tar -xf /tmp/wkhtmltox.tar.xz -C /tmp && \
+    cp /tmp/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/ && \
+    rm -rf /tmp/wkhtmltox /tmp/wkhtmltox.tar.xz
 
 # Create non-root user
 RUN addgroup -S genix && adduser -S genix -G genix
