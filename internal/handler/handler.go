@@ -1906,6 +1906,47 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// =====================================================
+	// FORMA 2 / 3 / 19 DEDICATED ROUTES
+	// =====================================================
+	f2 := constructionProjects.Group("/f2")
+	f2.Use(h.perm.Require("construction", "project", "read"))
+	{
+		f2.GET("", h.ListConstructionActs)
+		f2.POST("", h.perm.Require("construction", "project", "create"), h.CreateConstructionAct)
+		f2.GET("/:id", h.GetConstructionAct)
+		f2.PUT("/:id/lines/:lineId", h.perm.Require("construction", "project", "update"), h.UpdateActLine)
+		f2.POST("/:id/submit", h.perm.Require("construction", "project", "update"), h.SubmitForSigning)
+		f2.PUT("/:id/sign", h.perm.Require("construction", "project", "update"), h.SignAct)
+		f2.POST("/:id/cancel", h.perm.Require("construction", "project", "update"), h.CancelAct)
+		f2.GET("/:id/pdf", h.ExportActDocument)
+		f2.GET("/:id/xlsx", h.ExportActDocument)
+		f2.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionAct)
+	}
+
+	f3 := constructionProjects.Group("/f3")
+	f3.Use(h.perm.Require("construction", "project", "read"))
+	{
+		f3.GET("", h.ListConstructionActs)
+		f3.POST("/generate", h.perm.Require("construction", "project", "create"), h.GenerateForma3)
+		f3.GET("/:id", h.GetConstructionAct)
+		f3.POST("/:id/sign", h.perm.Require("construction", "project", "update"), h.SignAct)
+		f3.GET("/:id/pdf", h.ExportActDocument)
+	}
+
+	f19 := constructionProjects.Group("/f19")
+	f19.Use(h.perm.Require("construction", "project", "read"))
+	{
+		f19.GET("", h.ListConstructionActs)
+		f19.POST("", h.perm.Require("construction", "project", "create"), h.CreateConstructionAct)
+		f19.GET("/:id", h.GetConstructionAct)
+		f19.POST("/:id/submit", h.perm.Require("construction", "project", "update"), h.SubmitForSigning)
+		f19.PUT("/:id/sign", h.perm.Require("construction", "project", "update"), h.SignAct)
+		f19.POST("/:id/cancel", h.perm.Require("construction", "project", "update"), h.CancelAct)
+		f19.GET("/:id/pdf", h.ExportActDocument)
+		f19.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionAct)
+	}
+
+	// =====================================================
 	// INSTALLED APPS ROUTES
 	// =====================================================
 	installedApps := rg.Group("/installed-apps")

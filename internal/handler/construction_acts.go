@@ -853,6 +853,63 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 }
 
 // SignAct handles electronic signing of acts (Forma 2 and Forma 19)
+func (h *Handler) SubmitForSigning(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	actID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Noto'g'ri ID")
+		return
+	}
+
+	var state, actType string
+	var projectID int64
+	var lineCount int
+	err = h.db.QueryRow(`SELECT state, act_type, project_id FROM construction_act WHERE id = $1 AND tenant_id = $2`,
+		actID, tenantID).Scan(&state, &actType, &projectID)
+	if err != nil {
+		response.NotFound(c, "Akt topilmadi")
+		return
+	}
+
+	if state != "draft" {
+		response.BadRequest(c, "Faqat qoralama aktlarni imzolashga yuborish mumkin")
+		return
+	}
+
+	// For F2, require at least 1 line
+	if actType == "ks2" {
+		h.db.QueryRow(`SELECT COUNT(*) FROM construction_act_line WHERE act_id = $1`, actID).Scan(&lineCount)
+		if lineCount == 0 {
+			response.BadRequest(c, "Kamida bitta ish qatorini qo'shing")
+			return
+		}
+	}
+
+	_, err = h.db.Exec(`UPDATE construction_act SET state = 'pending' WHERE id = $1 AND tenant_id = $2`, actID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to submit act for signing", "error", err)
+		response.InternalError(c, "Xatolik yuz berdi")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+	h.logConstructionActivity(tenantID, projectID, userID, "act",
+		"Akt imzolashga yuborildi", "Act", actID)
+
+	// Notify signers
+	h.createNotification(tenantID, userID, "info",
+		"Akt imzolashga yuborildi",
+		fmt.Sprintf("Akt #%d imzolashni kutmoqda", actID),
+		nil)
+
+	response.Success(c, map[string]interface{}{"message": "Akt imzolashga yuborildi"})
+}
+
 func (h *Handler) SignAct(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
