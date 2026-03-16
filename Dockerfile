@@ -32,17 +32,19 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-w -s -X main.Version=2.0.0 -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o /app/genix-backend ./cmd/api
 
+# wkhtmltopdf stage - copy binary from known image
+FROM surnet/alpine-wkhtmltopdf:3.19.0-0.12.6-full AS wkhtmltopdf
+
 # Final stage
 FROM alpine:3.19
 
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates tzdata font-noto \
     libstdc++ libx11 libxrender libxext libssl3 libcrypto3 \
-    fontconfig freetype ttf-dejavu && \
-    wget -q https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox-0.12.6.1-3.linux-generic-amd64.tar.xz -O /tmp/wkhtmltox.tar.xz && \
-    tar -xf /tmp/wkhtmltox.tar.xz -C /tmp && \
-    cp /tmp/wkhtmltox/bin/wkhtmltopdf /usr/local/bin/ && \
-    rm -rf /tmp/wkhtmltox /tmp/wkhtmltox.tar.xz
+    fontconfig freetype ttf-dejavu
+
+# Copy wkhtmltopdf binary from the wkhtmltopdf stage
+COPY --from=wkhtmltopdf /bin/wkhtmltopdf /usr/local/bin/wkhtmltopdf
 
 # Create non-root user
 RUN addgroup -S genix && adduser -S genix -G genix
