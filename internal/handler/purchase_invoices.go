@@ -134,6 +134,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 	defer rows.Close()
 
 	var invoices []map[string]interface{}
+	today := time.Now().Truncate(24 * time.Hour)
 	for rows.Next() {
 		var id, tenantIDScan, vendorID uuid.UUID
 		var invoiceNumber, status, threeWayMatchStatus string
@@ -161,6 +162,18 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			continue
 		}
 
+		// Compute is_overdue: due_date < today AND status not paid/cancelled
+		isOverdue := false
+		if !dueDate.IsZero() && dueDate.Before(today) && status != "paid" && status != "cancelled" {
+			isOverdue = true
+		}
+
+		// amount_residual = total_amount - amount_paid (remaining unpaid)
+		amountResidual := totalAmount - amountPaid
+		if amountResidual < 0 {
+			amountResidual = 0
+		}
+
 		invoice := map[string]interface{}{
 			"id":                    id.String(),
 			"tenant_id":             tenantIDScan.String(),
@@ -175,6 +188,8 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			"total_amount":          totalAmount,
 			"amount_paid":           amountPaid,
 			"amount_due":            amountDue,
+			"amount_residual":       amountResidual,
+			"is_overdue":            isOverdue,
 			"status":                status,
 			"three_way_match_status": threeWayMatchStatus,
 			"invoice_type":          invoiceType,
@@ -237,6 +252,7 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		VendorInvoiceNumber string  `json:"vendor_invoice_number" binding:"required"`
 		InvoiceDate         string  `json:"invoice_date" binding:"required"`
 		DueDate             string  `json:"due_date" binding:"required"`
+		CurrencyID          string  `json:"currency_id"`
 		Subtotal            float64 `json:"subtotal"`
 		TaxRateID           string  `json:"tax_rate_id"`
 		TaxAmount           float64 `json:"tax_amount"`
@@ -316,20 +332,46 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		}
 	}
 
+	// Parse currency_id and lock the exchange rate at invoice creation time
+	var currencyID *uuid.UUID
+	exchangeRate := 1.0
+	if input.CurrencyID != "" {
+		parsed, parseErr := uuid.Parse(input.CurrencyID)
+		if parseErr == nil {
+			currencyID = &parsed
+			var baseCurrencyID uuid.UUID
+			errBase := h.db.QueryRow("SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1").Scan(&baseCurrencyID)
+			if errBase != nil {
+				h.db.QueryRow("SELECT id FROM currencies WHERE code = 'UZS' LIMIT 1").Scan(&baseCurrencyID)
+			}
+			if baseCurrencyID != uuid.Nil && parsed != baseCurrencyID {
+				var lockedRate float64
+				errRate := h.db.QueryRow(`
+					SELECT rate FROM exchange_rates
+					WHERE from_currency_id = $1 AND to_currency_id = $2
+					ORDER BY effective_date DESC LIMIT 1
+				`, parsed, baseCurrencyID).Scan(&lockedRate)
+				if errRate == nil && lockedRate > 0 {
+					exchangeRate = lockedRate
+				}
+			}
+		}
+	}
+
 	// Insert purchase invoice
 	query := `
 		INSERT INTO purchase_invoices (
 			id, tenant_id, organization_id, invoice_number, vendor_id, vendor_invoice_number,
 			invoice_date, due_date, subtotal, discount_amount,
 			tax_rate_id, tax_amount, total_amount, amount_paid, status,
-			three_way_match_status, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)`
+			three_way_match_status, notes, currency_id, exchange_rate, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`
 
 	_, err = h.db.Exec(query,
 		invoiceID, tenantID, orgID, invoiceNumber, vendorID, input.VendorInvoiceNumber,
 		invoiceDate, dueDate, subtotal, 0,
 		taxRateID, taxAmount, totalAmount, 0, "draft",
-		"pending", input.Notes, createdBy, now, now,
+		"pending", input.Notes, currencyID, exchangeRate, createdBy, now, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to create purchase invoice", "error", err)
@@ -1554,4 +1596,65 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 	}
 
 	h.GetPurchaseInvoice(c)
+}
+
+// GetPurchaseInvoiceStats returns summary statistics for vendor bills
+func (h *Handler) GetPurchaseInvoiceStats(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	baseWhere := "WHERE tenant_id = $1 AND deleted_at IS NULL"
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		baseWhere += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
+	query := fmt.Sprintf(`
+		SELECT
+			COUNT(*) AS total_count,
+			COALESCE(SUM(total_amount), 0) AS total_amount,
+			COUNT(*) FILTER (WHERE status NOT IN ('paid', 'cancelled') AND (amount_paid IS NULL OR amount_paid = 0)) AS unpaid_count,
+			COALESCE(SUM(total_amount - COALESCE(amount_paid, 0)) FILTER (WHERE status NOT IN ('paid', 'cancelled') AND (amount_paid IS NULL OR amount_paid = 0)), 0) AS unpaid_amount,
+			COUNT(*) FILTER (WHERE status NOT IN ('paid', 'cancelled') AND amount_paid > 0 AND amount_paid < total_amount) AS partial_count,
+			COALESCE(SUM(total_amount - COALESCE(amount_paid, 0)) FILTER (WHERE status NOT IN ('paid', 'cancelled') AND amount_paid > 0 AND amount_paid < total_amount), 0) AS partial_amount,
+			COUNT(*) FILTER (WHERE due_date < CURRENT_DATE AND status NOT IN ('paid', 'cancelled')) AS overdue_count,
+			COALESCE(SUM(total_amount - COALESCE(amount_paid, 0)) FILTER (WHERE due_date < CURRENT_DATE AND status NOT IN ('paid', 'cancelled')), 0) AS overdue_amount
+		FROM purchase_invoices
+		%s
+	`, baseWhere)
+
+	var totalCount int
+	var totalAmount, unpaidAmount, partialAmount, overdueAmount float64
+	var unpaidCount, partialCount, overdueCount int
+
+	err := h.db.QueryRow(query, args...).Scan(
+		&totalCount, &totalAmount,
+		&unpaidCount, &unpaidAmount,
+		&partialCount, &partialAmount,
+		&overdueCount, &overdueAmount,
+	)
+	if err != nil {
+		h.log.Error("Failed to fetch purchase invoice stats", "error", err)
+		response.InternalError(c, "Failed to fetch stats")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"total_count":    totalCount,
+		"total_amount":   totalAmount,
+		"unpaid_count":   unpaidCount,
+		"unpaid_amount":  unpaidAmount,
+		"partial_count":  partialCount,
+		"partial_amount": partialAmount,
+		"overdue_count":  overdueCount,
+		"overdue_amount": overdueAmount,
+	})
 }

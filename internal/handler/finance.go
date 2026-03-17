@@ -3044,7 +3044,8 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	baseQuery := `
 		SELECT p.id, p.payment_number, p.type, p.contact_id, p.payment_date, p.amount,
 			   p.status, p.reference, p.notes, p.created_at,
-			   c.name as contact_name, p.journal_id, COALESCE(j.name, '') as journal_name
+			   c.name as contact_name, p.journal_id, COALESCE(j.name, '') as journal_name,
+			   COALESCE(CASE WHEN j.type = 'cash' THEN 'cash' WHEN j.type = 'bank' THEN 'bank_transfer' ELSE '' END, '') as payment_method
 		FROM payments p
 		JOIN contacts c ON p.contact_id = c.id
 		LEFT JOIN journals j ON p.journal_id = j.id
@@ -3141,11 +3142,11 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	for rows.Next() {
 		var p entity.Payment
 		var ref, notes, journalIDStr sql.NullString
-		var contactName, journalName string
+		var contactName, journalName, paymentMethod string
 
 		err := rows.Scan(
 			&p.ID, &p.PaymentNumber, &p.Type, &p.ContactID, &p.PaymentDate, &p.Amount,
-			&p.Status, &ref, &notes, &p.CreatedAt, &contactName, &journalIDStr, &journalName,
+			&p.Status, &ref, &notes, &p.CreatedAt, &contactName, &journalIDStr, &journalName, &paymentMethod,
 		)
 		if err != nil {
 			continue
@@ -3161,6 +3162,7 @@ func (h *Handler) ListPayments(c *gin.Context) {
 		resp := p.ToResponse()
 		resp.ContactName = contactName
 		resp.JournalName = journalName
+		resp.PaymentMethod = paymentMethod
 		if journalIDStr.Valid {
 			resp.JournalID = journalIDStr.String
 		}
@@ -3273,6 +3275,18 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 			ref := GeneratePaymentReference(alloc.DocumentType, docNumber, "")
 			reference = &ref
 		}
+	}
+	// If still no reference, auto-generate PAY-YYYY-NNNN
+	if reference == nil {
+		year := time.Now().Year()
+		var lastRefNum int
+		h.db.QueryRow(
+			`SELECT COALESCE(MAX(CAST(SUBSTRING(reference FROM '[0-9]+$') AS INTEGER)), 0)
+			 FROM payments WHERE tenant_id = $1 AND reference ~ ('^PAY-' || $2 || '-[0-9]+$')`,
+			tenantID, fmt.Sprintf("%d", year),
+		).Scan(&lastRefNum)
+		ref := fmt.Sprintf("PAY-%d-%04d", year, lastRefNum+1)
+		reference = &ref
 	}
 	if input.Notes != "" {
 		notes = &input.Notes
@@ -4773,6 +4787,21 @@ func (h *Handler) SetExchangeRate(c *gin.Context) {
 		return
 	}
 
+	// Get previous rate for delta tracking
+	var previousRate sql.NullFloat64
+	h.db.QueryRow(`
+		SELECT rate FROM exchange_rates
+		WHERE tenant_id = $1 AND from_currency_id = $2 AND to_currency_id = $3
+		ORDER BY effective_date DESC LIMIT 1
+	`, tenantID, currencyID, baseCurrencyID).Scan(&previousRate)
+
+	var prevRate, rateChange, rateChangePct float64
+	if previousRate.Valid && previousRate.Float64 > 0 {
+		prevRate = previousRate.Float64
+		rateChange = input.Rate - prevRate
+		rateChangePct = (rateChange / prevRate) * 100
+	}
+
 	// Check if rate exists for this date
 	var existingID uuid.UUID
 	err = h.db.QueryRow(`
@@ -4783,8 +4812,8 @@ func (h *Handler) SetExchangeRate(c *gin.Context) {
 	if err == nil {
 		// Update existing rate
 		_, err = h.db.Exec(`
-			UPDATE exchange_rates SET rate = $1, source = $2 WHERE id = $3
-		`, input.Rate, source, existingID)
+			UPDATE exchange_rates SET rate = $1, source = $2, previous_rate = $3, rate_change = $4, rate_change_percent = $5 WHERE id = $6
+		`, input.Rate, source, prevRate, rateChange, rateChangePct, existingID)
 		if err != nil {
 			h.log.Error("Failed to update exchange rate", "error", err)
 			response.InternalError(c, "Failed to update exchange rate")
@@ -4794,9 +4823,9 @@ func (h *Handler) SetExchangeRate(c *gin.Context) {
 		// Create new rate
 		id := uuid.New()
 		_, err = h.db.Exec(`
-			INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-		`, id, tenantID, currencyID, baseCurrencyID, input.Rate, date, source)
+			INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source, previous_rate, rate_change, rate_change_percent)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`, id, tenantID, currencyID, baseCurrencyID, input.Rate, date, source, prevRate, rateChange, rateChangePct)
 		if err != nil {
 			h.log.Error("Failed to create exchange rate", "error", err)
 			response.InternalError(c, "Failed to create exchange rate")
