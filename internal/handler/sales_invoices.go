@@ -359,6 +359,27 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 		createdBy = &userID
 	}
 
+	// Lock the exchange rate at invoice creation time
+	exchangeRate := 1.0
+	if currencyID != nil {
+		var baseCurrencyID uuid.UUID
+		errBase := h.db.QueryRow("SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1").Scan(&baseCurrencyID)
+		if errBase != nil {
+			h.db.QueryRow("SELECT id FROM currencies WHERE code = 'UZS' LIMIT 1").Scan(&baseCurrencyID)
+		}
+		if baseCurrencyID != uuid.Nil && *currencyID != baseCurrencyID {
+			var lockedRate float64
+			errRate := h.db.QueryRow(`
+				SELECT rate FROM exchange_rates
+				WHERE from_currency_id = $1 AND to_currency_id = $2
+				ORDER BY effective_date DESC LIMIT 1
+			`, *currencyID, baseCurrencyID).Scan(&lockedRate)
+			if errRate == nil && lockedRate > 0 {
+				exchangeRate = lockedRate
+			}
+		}
+	}
+
 	// Insert sales invoice
 	query := `
 		INSERT INTO sales_invoices (
@@ -373,7 +394,7 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	_, err = h.db.Exec(query,
 		invoiceID, tenantID, orgID, invoiceNumber, customerID, salesOrderID,
 		invoiceDate, dueDate, billingAddressJSON, shippingAddressJSON,
-		currencyID, 1.0, subtotal, discountAmount,
+		currencyID, exchangeRate, subtotal, discountAmount,
 		taxAmount, totalAmount, 0, entity.InvoiceStatusDraft,
 		input.Reference, input.PONumber, input.Notes, input.TermsConditions,
 		createdBy, now, now,

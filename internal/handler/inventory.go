@@ -8391,6 +8391,49 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 		if orgIDPtr != nil {
 			deductionResp.OrganizationID = orgIDPtr
 		}
+
+		// 3. Create journal entry: Dt 9430 (Shortages/Losses) / Kt product inventory account
+		var journalID uuid.UUID
+		var nextNumber int
+		tx.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+
+		if journalID != uuid.Nil {
+			jeID := uuid.New()
+			entryNumber := fmt.Sprintf("SHR%06d", nextNumber)
+			jeDesc := fmt.Sprintf("Kamomad: %s", reason)
+
+			_, jeErr := tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+					description, source_type, source_id, status, total_debit, total_credit,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'inventory_shortage', $8, 'posted', $9, $9, $10, $11, $11)
+			`, jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+				jeDesc, lineID.String(), shortageAmount, userID, now)
+
+			if jeErr == nil {
+				// Dt 9430 - Shortages and losses from damage of valuables
+				shortageAcct := findAccount(tx, tenantID, orgIDPtr, "shortage", "9430")
+				if shortageAcct == uuid.Nil {
+					shortageAcct = findAccount(tx, tenantID, orgIDPtr, "kamomad", "9430")
+				}
+				// Kt - product inventory account (1300-series)
+				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1300")
+				if inventoryAcct == uuid.Nil {
+					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1300")
+				}
+
+				if shortageAcct != uuid.Nil && inventoryAcct != uuid.Nil {
+					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
+						uuid.New(), jeID, shortageAcct, jeDesc, shortageAmount, now)
+					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
+						uuid.New(), jeID, inventoryAcct, "Tovar hisobi", shortageAmount, now)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", shortageAmount, now, shortageAcct)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", shortageAmount, now, inventoryAcct)
+				}
+				tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+			}
+		}
 	}
 
 	if err = tx.Commit(); err != nil {

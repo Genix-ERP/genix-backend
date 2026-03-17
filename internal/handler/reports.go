@@ -684,19 +684,34 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 				Amount:      math.Round(amount*100) / 100,
 			}
 
-			// Categorize by account code
-			codePrefix := code[:2]
+			// Categorize by account code (Uzbekistan NAS chart of accounts)
+			// Investing: 0100-0899 (fixed/intangible assets, investments, capital expenditures)
+			// Financing: 6000-6999 (long-term liabilities), 3000-3999 (equity), 7000 (interest)
+			// Operating: everything else (revenue, COGS, OpEx, AR, AP, etc.)
+			codePrefix := ""
+			if len(code) >= 2 {
+				codePrefix = code[:2]
+			}
 			switch {
+			case code >= "0100" && code <= "0899":
+				// Fixed assets (01xx-04xx), intangible assets (04xx),
+				// long-term investments (06xx), equipment (08xx) → investing
+				investingItems = append(investingItems, item)
+				investingTotal += amount
 			case code >= "1500" && code <= "1699":
-				// Fixed assets, depreciation, intangible assets → investing
+				// Capital equipment, depreciation, intangible assets → investing
 				investingItems = append(investingItems, item)
 				investingTotal += amount
 			case code >= "2100" && code <= "2599":
-				// Loans (short/long term) → financing
+				// Short/long-term loans → financing
 				financingItems = append(financingItems, item)
 				financingTotal += amount
-			case codePrefix == "31" || codePrefix == "32" || codePrefix == "33" || codePrefix == "34" || codePrefix == "35" || codePrefix == "36":
-				// Equity accounts → financing
+			case code >= "6000" && code < "7000":
+				// Long-term liabilities (6000-6999) → financing
+				financingItems = append(financingItems, item)
+				financingTotal += amount
+			case codePrefix >= "30" && codePrefix <= "39":
+				// Equity accounts (3000-3999) → financing
 				financingItems = append(financingItems, item)
 				financingTotal += amount
 			case code == "7000":
