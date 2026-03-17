@@ -1653,6 +1653,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/team", h.perm.Require("construction", "project", "update"), h.CreateConstructionTeamMember)
 		constructionProjects.PUT("/:id/team/:memberId", h.perm.Require("construction", "project", "update"), h.UpdateConstructionTeamMember)
 		constructionProjects.DELETE("/:id/team/:memberId", h.perm.Require("construction", "project", "update"), h.DeleteConstructionTeamMember)
+		constructionProjects.POST("/:id/team/:memberId/transfer", h.perm.Require("construction", "project", "update"), h.TransferTeamMember)
 
 		// WBS (Work Breakdown Structure)
 		constructionProjects.GET("/:id/wbs", h.ListWBSItems)
