@@ -775,7 +775,7 @@ type RecordCountLineInput struct {
 	LocationID      string  `json:"location_id,omitempty"`
 	LotNumber       string  `json:"lot_number,omitempty"`
 	SerialNumber    string  `json:"serial_number,omitempty"`
-	CountedQuantity float64 `json:"counted_quantity" binding:"required,gte=0"`
+	CountedQuantity *float64 `json:"counted_quantity" binding:"required"`
 	Notes           string  `json:"notes,omitempty"`
 }
 
