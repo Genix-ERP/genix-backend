@@ -598,6 +598,8 @@ type reconciliationActResponse struct {
 	SentTo          *string    `json:"sent_to,omitempty"`
 	DisputeAmount   *float64   `json:"dispute_amount,omitempty"`
 	ShareExpiresAt  *time.Time `json:"share_expires_at,omitempty"`
+	Reminder3dSent  bool       `json:"reminder_3d_sent"`
+	Reminder7dSent  bool       `json:"reminder_7d_sent"`
 }
 
 type reconciliationLine struct {
@@ -709,12 +711,25 @@ func getUzDescription(sourceType, originalDescription string) string {
 		"purchase_order": "Xarid buyurtmasi",
 		// Tizim (System)
 		"opening_balance": "Boshlang'ich qoldiq",
+		// To'lov turlari (Payment variants)
+		"payment_sent":     "To'lov yuborildi",
+		"payment_received": "To'lov qabul qilindi",
+		"advance_payment":  "Oldindan to'lov",
+		"refund":           "Qaytarish (refund)",
+		// Faktura (Invoice variants)
+		"invoice":         "Faktura",
+		"bill":            "Hisob-faktura",
+		"proforma":        "Proforma faktura",
 		// Boshqa (Other)
 		"expense":                      "Xarajat",
 		"landed_cost":                  "Qo'shimcha xarajat",
 		"bank_reconciliation":          "Bank solishtirma",
 		"bank_reconciliation_writeoff": "Bank farqi hisobdan chiqarish",
 		"manual":                       "Qo'lda kiritilgan yozuv",
+		"write_off":                    "Hisobdan chiqarish",
+		"transfer":                     "O'tkazma",
+		"journal_entry":                "Jurnal yozuvi",
+		"contra":                       "Hisob-kitob chiqarish",
 	}
 
 	if uz, ok := uzDescriptions[sourceType]; ok {
@@ -737,6 +752,17 @@ func getUzDescription(sourceType, originalDescription string) string {
 		{"opening balance", "Boshlang'ich qoldiq"},
 		{"goods receipt", "Tovar qabul qilish"},
 		{"purchase invoice", "Xarid fakturasi"},
+		{"debit note", "Debet nota"},
+		{"payment", "To'lov"},
+		{"expense", "Xarajat"},
+		{"invoice", "Faktura"},
+		{"refund", "Qaytarish"},
+		{"write off", "Hisobdan chiqarish"},
+		{"write-off", "Hisobdan chiqarish"},
+		{"transfer", "O'tkazma"},
+		{"advance", "Oldindan to'lov"},
+		{"depreciation", "Amortizatsiya"},
+		{"salary", "Ish haqi"},
 	}
 	for _, p := range descPatterns {
 		if strings.Contains(descLower, p.pattern) {
@@ -834,7 +860,8 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 			   ra.opening_balance, ra.our_debit_total, ra.our_credit_total, ra.our_balance,
 			   ra.status, ra.notes, ra.created_at,
 			   ra.response_status, ra.responded_at, ra.dispute_note, ra.respondent_name,
-			   ra.sent_at, ra.sent_via, ra.sent_to
+			   ra.sent_at, ra.sent_via, ra.sent_to,
+			   COALESCE(ra.reminder_3d_sent, false), COALESCE(ra.reminder_7d_sent, false)
 		FROM reconciliation_acts ra
 		LEFT JOIN contacts ct ON ra.partner_id = ct.id
 		WHERE ra.tenant_id = $1 AND ra.deleted_at IS NULL
@@ -879,6 +906,7 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 			&a.Status, &notes, &a.CreatedAt,
 			&responseStatus, &respondedAt, &disputeNote, &respondentName,
 			&sentAt, &sentVia, &sentTo,
+			&a.Reminder3dSent, &a.Reminder7dSent,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan reconciliation act", "error", err)
@@ -1064,7 +1092,8 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 			   ra.status, ra.notes, ra.created_at,
 			   ra.response_status, ra.responded_at, ra.dispute_note, ra.respondent_name,
 			   ra.sent_at, ra.sent_via, ra.sent_to,
-			   ra.dispute_amount, ra.share_expires_at
+			   ra.dispute_amount, ra.share_expires_at,
+			   COALESCE(ra.reminder_3d_sent, false), COALESCE(ra.reminder_7d_sent, false)
 		FROM reconciliation_acts ra
 		LEFT JOIN contacts ct ON ra.partner_id = ct.id
 		WHERE ra.id = $1 AND ra.tenant_id = $2 AND ra.deleted_at IS NULL
@@ -1076,6 +1105,7 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 		&responseStatus, &respondedAt, &disputeNote, &respondentName,
 		&sentAt, &sentVia, &sentTo,
 		&actDisputeAmount, &actShareExpiresAt,
+		&act.Reminder3dSent, &act.Reminder7dSent,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Reconciliation act")
@@ -1621,6 +1651,98 @@ func (h *Handler) SendReconciliationAct(c *gin.Context) {
 
 	default:
 		response.BadRequest(c, "Invalid send method. Use 'email', 'whatsapp', or 'link'")
+	}
+}
+
+// SendReconciliationReminder re-sends the reconciliation act to the partner as a reminder
+func (h *Handler) SendReconciliationReminder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	actID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid act ID")
+		return
+	}
+
+	// Load act info
+	var status, sentVia, sentTo string
+	var shareToken sql.NullString
+	err = h.db.QueryRow(`
+		SELECT ra.status, COALESCE(ra.sent_via, ''), COALESCE(ra.sent_to, ''), ra.share_token
+		FROM reconciliation_acts ra
+		WHERE ra.id = $1 AND ra.tenant_id = $2 AND ra.deleted_at IS NULL
+	`, actID, tenantID).Scan(&status, &sentVia, &sentTo, &shareToken)
+	if err != nil {
+		response.NotFound(c, "Reconciliation act")
+		return
+	}
+
+	if status != "sent" {
+		response.BadRequest(c, "Eslatma faqat 'yuborilgan' holatdagi aktlar uchun mumkin")
+		return
+	}
+
+	// Ensure share token exists and refresh expiry
+	token := ""
+	if shareToken.Valid && shareToken.String != "" {
+		token = shareToken.String
+	} else {
+		token = uuid.New().String()[:8] + uuid.New().String()[:8]
+	}
+	_, _ = h.db.Exec(`UPDATE reconciliation_acts SET share_token = $1, share_expires_at = NOW() + INTERVAL '24 hours' WHERE id = $2 AND tenant_id = $3`, token, actID, tenantID)
+
+	shareURL := fmt.Sprintf("%s/shared/reconciliation/%s", h.config.App.FrontendURL, token)
+
+	// Re-send based on original method
+	if sentVia == "email" && sentTo != "" {
+		act, lines, loadErr := h.loadReconciliationActFull(tenantID, actID)
+		if loadErr != nil {
+			response.InternalError(c, "Failed to load act data")
+			return
+		}
+		closingBalance := act.OpeningBalance + act.OurDebitTotal - act.OurCreditTotal
+		subject := fmt.Sprintf("Eslatma: Akt sverka — %s (%s – %s)", act.PartnerName, act.PeriodStart, act.PeriodEnd)
+		emailBody := `<div style="margin-bottom:20px;padding:12px 16px;background:#fef3c7;border-left:3px solid #f59e0b;border-radius:4px;font-size:14px;color:#92400e;">Eslatma: Iltimos, akt sverkaga javob bering.</div>` + h.renderReconciliationEmailHTML(act, lines, closingBalance, shareURL)
+
+		sendErr := h.emailService.Send(&email.Email{
+			To:      []string{sentTo},
+			Subject: subject,
+			Body:    emailBody,
+			IsHTML:  true,
+		})
+		if sendErr != nil {
+			h.log.Error("Failed to send reconciliation reminder email", "error", sendErr)
+			response.InternalError(c, "Email eslatma yuborishda xatolik: "+sendErr.Error())
+			return
+		}
+		response.Success(c, gin.H{
+			"message": "Eslatma email orqali yuborildi",
+			"sent_to": sentTo,
+		})
+	} else if sentVia == "whatsapp" && sentTo != "" {
+		act, _, loadErr := h.loadReconciliationActFull(tenantID, actID)
+		if loadErr != nil {
+			response.InternalError(c, "Failed to load act data")
+			return
+		}
+		closingBalance := act.OpeningBalance + act.OurDebitTotal - act.OurCreditTotal
+		message := fmt.Sprintf("Eslatma: Akt sverka: %s\nDavr: %s — %s\nQoldiq: %.2f\n\nIltimos, javob bering: %s",
+			act.PartnerName, act.PeriodStart, act.PeriodEnd, closingBalance, shareURL)
+		response.Success(c, gin.H{
+			"message":          "WhatsApp eslatma havolasi tayyor",
+			"whatsapp_message": message,
+			"share_url":        shareURL,
+			"phone":            sentTo,
+		})
+	} else {
+		response.Success(c, gin.H{
+			"message":   "Eslatma havolasi yangilandi",
+			"share_url": shareURL,
+		})
 	}
 }
 

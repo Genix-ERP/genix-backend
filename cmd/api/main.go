@@ -125,6 +125,12 @@ func main() {
 	// Start daily currency sync from CBU at 09:00 Tashkent time
 	h.RunCurrencySyncScheduler(shutdownCtx)
 
+	// Start daily reconciliation act auto-reminders (email + in-app) at 09:00 Tashkent time
+	h.RunReconciliationReminderScheduler(shutdownCtx)
+
+	// Start daily vendor bill overdue notifications at 09:00 Tashkent time
+	h.RunVendorBillOverdueScheduler(shutdownCtx)
+
 	// Create HTTP server
 	server := &http.Server{
 		Addr:           fmt.Sprintf(":%d", cfg.App.Port),

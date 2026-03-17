@@ -112,18 +112,53 @@ func (h *Handler) renderForma2HTML(actID int64, tenantID uuid.UUID, projectName,
 	b.WriteString(fmt.Sprintf(`<tr><td><b>Всего с НДС:</b></td><td style="text-align:right"><b>%.2f %s</b></td></tr>`, totalWithVat, currency))
 	b.WriteString(`</table>`)
 
-	// Signatures
+	// Signatures — fetch signer names from users table
+	var contractorSignerName, clientSignerName string
+	h.db.QueryRow(`
+		SELECT COALESCE(u.first_name || ' ' || u.last_name, u.email, '')
+		FROM construction_act a
+		JOIN users u ON u.id = a.signed_contractor_by
+		WHERE a.id = $1 AND a.tenant_id = $2
+	`, actID, tenantID).Scan(&contractorSignerName)
+	h.db.QueryRow(`
+		SELECT COALESCE(u.first_name || ' ' || u.last_name, u.email, '')
+		FROM construction_act a
+		JOIN users u ON u.id = a.signed_client_by
+		WHERE a.id = $1 AND a.tenant_id = $2
+	`, actID, tenantID).Scan(&clientSignerName)
+
 	b.WriteString(`<table class="signatures"><tr>`)
-	b.WriteString(`<td><b>Подрядчик:</b><br><span class="sig-line">&nbsp;</span>`)
+
+	// Contractor signature block
+	b.WriteString(`<td>`)
+	b.WriteString(`<b>Подрядчик:</b><br>`)
+	if subcontractName.Valid && subcontractName.String != "" {
+		b.WriteString(fmt.Sprintf(`<span style="font-size:10pt">%s</span><br>`, subcontractName.String))
+	}
+	b.WriteString(`<br><span class="sig-line">&nbsp;</span>`)
+	if contractorSignerName != "" {
+		b.WriteString(fmt.Sprintf(`<br><span style="font-size:9pt">%s</span>`, contractorSignerName))
+	}
 	if signedContractorAt.Valid {
-		b.WriteString(fmt.Sprintf(`<br><span class="sig-date">Подписано: %s</span>`, signedContractorAt.Time.Format("02.01.2006")))
+		b.WriteString(fmt.Sprintf(`<br><span class="sig-date">Дата: %s</span>`, signedContractorAt.Time.Format("02.01.2006")))
 	}
 	b.WriteString(`</td>`)
-	b.WriteString(`<td><b>Заказчик:</b><br><span class="sig-line">&nbsp;</span>`)
+
+	// Client signature block
+	b.WriteString(`<td>`)
+	b.WriteString(`<b>Заказчик:</b><br>`)
+	if clientName != "" {
+		b.WriteString(fmt.Sprintf(`<span style="font-size:10pt">%s</span><br>`, clientName))
+	}
+	b.WriteString(`<br><span class="sig-line">&nbsp;</span>`)
+	if clientSignerName != "" {
+		b.WriteString(fmt.Sprintf(`<br><span style="font-size:9pt">%s</span>`, clientSignerName))
+	}
 	if signedClientAt.Valid {
-		b.WriteString(fmt.Sprintf(`<br><span class="sig-date">Подписано: %s</span>`, signedClientAt.Time.Format("02.01.2006")))
+		b.WriteString(fmt.Sprintf(`<br><span class="sig-date">Дата: %s</span>`, signedClientAt.Time.Format("02.01.2006")))
 	}
 	b.WriteString(`</td>`)
+
 	b.WriteString(`</tr></table>`)
 
 	b.WriteString(`</body></html>`)

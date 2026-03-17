@@ -522,7 +522,7 @@ func (h *Handler) CalculateTaxReport(c *gin.Context) {
 			COUNT(*) as tx_count,
 			SUM(pi.subtotal) as taxable_amount,
 			SUM(pi.tax_amount) as tax_amount,
-			SUM(pi.total) as total_amount
+			SUM(pi.total_amount) as total_amount
 		FROM purchase_invoices pi
 		LEFT JOIN tax_rates tr ON tr.id = pi.tax_rate_id
 		WHERE pi.tenant_id = $1
@@ -876,10 +876,10 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 		purchaseQuery := `
 			SELECT
 				pi.id, 'purchase_invoice' as type, pi.invoice_number, pi.invoice_date,
-				'vendor' as party_type, pi.vendor_id, pi.vendor_name,
+				'vendor' as party_type, pi.vendor_id, COALESCE(pi.supplier_name, c.name, '') as vendor_name,
 				COALESCE(c.tax_id, '') as party_tax_id,
 				tr.id as tax_rate_id, COALESCE(tr.name, 'No Tax') as tax_name, COALESCE(tr.rate, 0) as tax_rate,
-				pi.subtotal, pi.tax_amount, pi.total
+				pi.subtotal, pi.tax_amount, pi.total_amount
 			FROM purchase_invoices pi
 			LEFT JOIN contacts c ON c.id = pi.vendor_id
 			LEFT JOIN tax_rates tr ON tr.id = pi.tax_rate_id

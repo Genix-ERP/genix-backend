@@ -736,6 +736,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	purchaseInvoices.Use(h.perm.Require("purchase", "invoice", "read"))
 	{
 		purchaseInvoices.GET("", h.ListPurchaseInvoices)
+		purchaseInvoices.GET("/stats", h.GetPurchaseInvoiceStats)
 		purchaseInvoices.POST("", h.perm.Require("purchase", "invoice", "create"), h.CreatePurchaseInvoice)
 		purchaseInvoices.GET("/:id", h.GetPurchaseInvoice)
 		purchaseInvoices.PUT("/:id", h.perm.Require("purchase", "invoice", "update"), h.UpdatePurchaseInvoice)
@@ -1081,6 +1082,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		fiscalPeriods.POST("/:id/unlock", h.UnlockFiscalPeriod)
 	}
 
+	// Accounting Periods
+	periods := rg.Group("/accounting-periods")
+	{
+		periods.GET("", h.ListAccountingPeriods)
+		periods.POST("", h.CreateAccountingPeriod)
+		periods.POST("/auto-create", h.AutoCreatePeriods)
+		periods.POST("/:id/lock", h.LockAccountingPeriod)
+		periods.POST("/:id/unlock", h.UnlockAccountingPeriod)
+	}
+
 	// Budgets
 	budgets := rg.Group("/budgets")
 	{
@@ -1161,6 +1172,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reconciliation.DELETE("/:id", h.perm.Require("finance", "reconciliation", "delete"), h.DeleteReconciliationAct)
 		reconciliation.GET("/:id/export", h.ExportReconciliationAct)
 		reconciliation.POST("/:id/send", h.perm.Require("finance", "reconciliation", "update"), h.SendReconciliationAct)
+		reconciliation.POST("/:id/remind", h.perm.Require("finance", "reconciliation", "update"), h.SendReconciliationReminder)
 	}
 
 	// Budgets (Byudjetlashtirish)
