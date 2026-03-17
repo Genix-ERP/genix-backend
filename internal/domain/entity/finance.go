@@ -435,6 +435,7 @@ type PaymentResponse struct {
 	Notes           *string             `json:"notes,omitempty"`
 	JournalID       string              `json:"journal_id,omitempty"`
 	JournalName     string              `json:"journal_name,omitempty"`
+	PaymentMethod   string              `json:"payment_method,omitempty"`
 	CreatedAt       time.Time           `json:"created_at"`
 	Allocations     []PaymentAllocation `json:"allocations,omitempty"`
 }

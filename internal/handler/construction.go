@@ -387,6 +387,8 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 		return
 	}
 
+	organizationID, _ := middleware.GetOrganizationID(c)
+
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid project ID")
@@ -399,6 +401,10 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 		response.BadRequest(c, "Invalid input")
 		return
 	}
+
+	// Load previous status (needed for completion journal entry)
+	var previousStatus string
+	_ = h.db.QueryRow(`SELECT COALESCE(status,'draft') FROM construction_projects WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&previousStatus)
 
 	// Build dynamic update query
 	updates := []string{}
@@ -517,6 +523,11 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 	if rowsAffected == 0 {
 		response.NotFound(c, "Project not found")
 		return
+	}
+
+	// On project completion: create journal entry Dt 0100 (Fixed Assets) / Kt 0810 (Capital Investments)
+	if req.Status != nil && *req.Status == "completed" && previousStatus != "completed" {
+		go h.createProjectCompletionJournalEntry(tenantID, organizationID, id)
 	}
 
 	response.Success(c, map[string]interface{}{
@@ -5019,15 +5030,21 @@ func (h *Handler) GetConstructionPortfolioDashboard(c *gin.Context) {
 		}
 	}
 
+	var budgetDeviationPct float64
+	if totalBudget > 0 {
+		budgetDeviationPct = round2(((totalActual - totalBudget) / totalBudget) * 100)
+	}
+
 	response.Success(c, map[string]interface{}{
 		"kpis": map[string]interface{}{
-			"total_projects":      totalProjects,
-			"active_projects":     activeProjects,
-			"completed_projects":  completedProjects,
-			"total_budget":        totalBudget,
-			"total_actual":        totalActual,
-			"total_variance":      totalBudget - totalActual,
-			"expenses_this_month": expensesThisMonth,
+			"total_projects":       totalProjects,
+			"active_projects":      activeProjects,
+			"completed_projects":   completedProjects,
+			"total_budget":         totalBudget,
+			"total_actual":         totalActual,
+			"total_variance":       totalBudget - totalActual,
+			"budget_deviation_pct": budgetDeviationPct,
+			"expenses_this_month":  expensesThisMonth,
 		},
 		"charts": map[string]interface{}{
 			"per_project": perProject,
@@ -5035,4 +5052,106 @@ func (h *Handler) GetConstructionPortfolioDashboard(c *gin.Context) {
 			"monthly":     monthly,
 		},
 	})
+}
+
+// createProjectCompletionJournalEntry creates a journal entry on project completion:
+// Dt 0100 (Fixed Assets / Asosiy vositalar) / Kt 0810 (Capital Investments / Tugallanmagan qurilish)
+func (h *Handler) createProjectCompletionJournalEntry(tenantID, organizationID uuid.UUID, projectID int64) {
+	var orgIDPtr *uuid.UUID
+	if organizationID != uuid.Nil {
+		orgIDPtr = &organizationID
+	}
+
+	// Get project name and total actual cost (amount to capitalize)
+	var projectName string
+	var totalActualCost float64
+	err := h.db.QueryRow(`
+		SELECT COALESCE(p.name, ''), COALESCE(exp.total, 0)
+		FROM construction_projects p
+		LEFT JOIN LATERAL (
+			SELECT SUM(el.amount) as total
+			FROM construction_expense_lines el
+			WHERE el.project_id = p.id AND el.tenant_id = p.tenant_id AND el.status = 'approved' AND el.deleted_at IS NULL
+		) exp ON true
+		WHERE p.id = $1 AND p.tenant_id = $2
+	`, projectID, tenantID).Scan(&projectName, &totalActualCost)
+	if err != nil || totalActualCost <= 0 {
+		h.log.Error("Skipping completion journal entry: no costs or project not found", "project_id", projectID, "error", err)
+		return
+	}
+
+	// Resolve accounts: Dt 0100 (Fixed Assets), Kt 0810 (WIP / Capital Investments)
+	fixedAssetAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "fixed_assets_0100", "asosiy vosita", "0100")
+	if fixedAssetAcct == uuid.Nil {
+		fixedAssetAcct = findAccount(h.db, tenantID, orgIDPtr, "asosiy vosita", "0100")
+	}
+	wipAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "wip_0810", "tugallanmagan qurilish", "0810")
+	if wipAcct == uuid.Nil {
+		wipAcct = findAccount(h.db, tenantID, orgIDPtr, "tugallanmagan qurilish", "0810")
+	}
+	if fixedAssetAcct == uuid.Nil || wipAcct == uuid.Nil {
+		h.log.Error("Skipping completion journal entry: accounts 0100 or 0810 not found", "project_id", projectID)
+		return
+	}
+
+	journalID := h.ensureConstructionJournal(tenantID, orgIDPtr)
+	if journalID == uuid.Nil {
+		h.log.Error("Skipping completion journal entry: no journal", "project_id", projectID)
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin tx for completion JE", "error", err)
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+	nextNum := h.getNextJournalNumber(tx, journalID)
+	entryID := uuid.New()
+	entryNumber := fmt.Sprintf("CC%06d", nextNum)
+	description := fmt.Sprintf("Qurilish tugallandi: %s — Asosiy vositalarga kiritish", projectName)
+
+	_, err = tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number,
+			entry_date, description, source_type, source_id,
+			status, total_debit, total_credit, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,'construction_completion',NULL,'posted',$8,$8,$9,$9)
+	`, entryID, tenantID, organizationID, journalID, entryNumber,
+		now, description, totalActualCost, now)
+	if err != nil {
+		h.log.Error("Failed to create completion journal entry", "error", err)
+		return
+	}
+
+	// Debit 0100 (Fixed Assets)
+	_, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+		VALUES ($1,$2,$3,$4,$5,0,1,$6)`,
+		uuid.New(), entryID, fixedAssetAcct, description, totalActualCost, now)
+	if err != nil {
+		h.log.Error("Failed to create debit line for completion JE", "error", err)
+		return
+	}
+
+	// Credit 0810 (Capital Investments / WIP)
+	_, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+		VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
+		uuid.New(), entryID, wipAcct, description, totalActualCost, now)
+	if err != nil {
+		h.log.Error("Failed to create credit line for completion JE", "error", err)
+		return
+	}
+
+	// Update account balances
+	tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalActualCost, now, fixedAssetAcct)
+	tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalActualCost, now, wipAcct)
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit completion journal entry", "error", err)
+		return
+	}
+
+	h.log.Info("Created completion journal entry", "project_id", projectID, "entry_id", entryID, "amount", totalActualCost)
 }

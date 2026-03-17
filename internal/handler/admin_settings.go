@@ -493,7 +493,9 @@ func (h *Handler) checkLockDate(tenantID uuid.UUID, entryDate time.Time) string 
 }
 
 // checkPeriodLock checks if the entry date falls in a locked or closed fiscal period
+// or in a locked accounting period
 func (h *Handler) checkPeriodLock(tenantID uuid.UUID, entryDate time.Time) string {
+	// Check fiscal periods
 	var periodStatus sql.NullString
 	err := h.db.QueryRow(`
 		SELECT fp.status FROM fiscal_periods fp
@@ -501,12 +503,23 @@ func (h *Handler) checkPeriodLock(tenantID uuid.UUID, entryDate time.Time) strin
 		WHERE fy.tenant_id = $1 AND $2 BETWEEN fp.start_date AND fp.end_date
 		LIMIT 1
 	`, tenantID, entryDate).Scan(&periodStatus)
-	if err != nil || !periodStatus.Valid {
-		return "" // no period found — allow
+	if err == nil && periodStatus.Valid {
+		if periodStatus.String == "locked" || periodStatus.String == "closed" {
+			return fmt.Sprintf("This period is %s. Contact admin to unlock.", periodStatus.String)
+		}
 	}
-	if periodStatus.String == "locked" || periodStatus.String == "closed" {
-		return fmt.Sprintf("This period is %s. Contact admin to unlock.", periodStatus.String)
+
+	// Check accounting periods
+	var isLocked bool
+	err = h.db.QueryRow(`
+		SELECT is_locked FROM accounting_periods
+		WHERE tenant_id = $1 AND start_date <= $2 AND end_date >= $2 AND is_locked = true
+		LIMIT 1
+	`, tenantID, entryDate).Scan(&isLocked)
+	if err == nil && isLocked {
+		return "Bu davr yopilgan"
 	}
+
 	return ""
 }
 
