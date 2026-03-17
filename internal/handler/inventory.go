@@ -5326,12 +5326,17 @@ func (h *Handler) RecordCountLine(c *gin.Context) {
 		notes = &input.Notes
 	}
 
+	countedQty := float64(0)
+	if input.CountedQuantity != nil {
+		countedQty = *input.CountedQuantity
+	}
+
 	// Try to update existing line
 	result, err := h.db.Exec(`
 		UPDATE stock_count_lines SET
 			counted_quantity = $1, status = 'counted', counted_by = $2, counted_at = $3, notes = $4, updated_at = $3
 		WHERE stock_count_id = $5 AND product_id = $6
-	`, input.CountedQuantity, userID, now, notes, countID, productID)
+	`, countedQty, userID, now, notes, countID, productID)
 
 	if err != nil {
 		h.log.Error("Failed to record count line", "error", err)
@@ -5346,7 +5351,7 @@ func (h *Handler) RecordCountLine(c *gin.Context) {
 		_, err = h.db.Exec(`
 			INSERT INTO stock_count_lines (id, stock_count_id, product_id, system_quantity, counted_quantity, unit_cost, status, counted_by, counted_at, notes, created_at, updated_at)
 			VALUES ($1, $2, $3, 0, $4, 0, 'counted', $5, $6, $7, $6, $6)
-		`, lineID, countID, productID, input.CountedQuantity, userID, now, notes)
+		`, lineID, countID, productID, countedQty, userID, now, notes)
 		if err != nil {
 			h.log.Error("Failed to insert count line", "error", err)
 			response.InternalError(c, "Failed to record count line")

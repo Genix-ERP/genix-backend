@@ -75,8 +75,8 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 	if filter.Page <= 0 {
 		filter.Page = 1
 	}
-	if filter.Limit <= 0 || filter.Limit > 100 {
-		filter.Limit = 20
+	if filter.Limit <= 0 || filter.Limit > 10000 {
+		filter.Limit = 100
 	}
 	if filter.SortBy == "" {
 		filter.SortBy = "name"
@@ -844,8 +844,8 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	if filter.Page <= 0 {
 		filter.Page = 1
 	}
-	if filter.Limit <= 0 || filter.Limit > 100 {
-		filter.Limit = 20
+	if filter.Limit <= 0 || filter.Limit > 10000 {
+		filter.Limit = 100
 	}
 	if filter.SortBy == "" {
 		filter.SortBy = "created_at"
@@ -1855,6 +1855,24 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		}
 	}
 
+	// If no work orders were created (BOM had no operations or no BOM), create a default one
+	var confirmWOCount int
+	tx.QueryRow(`SELECT COUNT(*) FROM work_orders WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&confirmWOCount)
+	if confirmWOCount == 0 {
+		woID := uuid.New()
+		woCode := fmt.Sprintf("WO-%s-1", id.String()[:8])
+		woName := productName + " - Ishlab chiqarish"
+		_, err = tx.Exec(`
+			INSERT INTO work_orders (
+				id, tenant_id, production_order_id, code, name, sequence,
+				quantity_to_produce, uom, status, created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, 1, $6, $7, 'pending', $8, NOW(), NOW())
+		`, woID, tenantID, id, woCode, woName, quantityPlanned, uom, createdByID)
+		if err != nil {
+			h.log.Error("Failed to create default work order", "error", err)
+		}
+	}
+
 	// Update production order with calculated costs and confirm
 	now := time.Now()
 	updateQuery := `
@@ -2105,7 +2123,13 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 		var poBomID *uuid.UUID
 		var poOrgID *uuid.UUID
 		var poQty float64
-		fetchErr := h.db.QueryRow(`SELECT bom_id, organization_id, quantity_planned FROM production_orders WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&poBomID, &poOrgID, &poQty)
+		var poProductName string
+		fetchErr := h.db.QueryRow(`
+			SELECT po.bom_id, po.organization_id, po.quantity_planned, COALESCE(p.name, '')
+			FROM production_orders po
+			LEFT JOIN products p ON p.id = po.product_id
+			WHERE po.id = $1 AND po.tenant_id = $2
+		`, id, tenantID).Scan(&poBomID, &poOrgID, &poQty, &poProductName)
 		if fetchErr == nil && poBomID != nil {
 			orgVal := uuid.Nil
 			if poOrgID != nil {
@@ -2116,6 +2140,28 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			} else {
 				h.log.Info("Created work orders for production order on start", "order_id", id)
 			}
+		}
+
+		// Re-check: if still no work orders (BOM has no operations), create a default one
+		h.db.QueryRow(`SELECT COUNT(*) FROM work_orders WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&woCount)
+		if woCount == 0 {
+			qty := poQty
+			if qty <= 0 {
+				qty = 1
+			}
+			woID := uuid.New()
+			woCode := fmt.Sprintf("WO-%s-1", id.String()[:8])
+			woName := "Ishlab chiqarish"
+			if poProductName != "" {
+				woName = poProductName + " - Ishlab chiqarish"
+			}
+			h.db.Exec(`
+				INSERT INTO work_orders (
+					id, tenant_id, production_order_id, code, name, sequence,
+					quantity_to_produce, uom, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, 1, $6, 'pcs', 'pending', $7, $8, $8)
+			`, woID, tenantID, id, woCode, woName, qty, userID, now)
+			h.log.Info("Created default work order for production order without BOM operations", "order_id", id)
 		}
 	}
 
