@@ -2,7 +2,6 @@ package handler
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -217,103 +216,72 @@ func (h *Handler) renderForma3HTML(actID int64, tenantID uuid.UUID, projectName,
 	return b.String()
 }
 
-// renderForma19HTML generates HTML for Forma 19 (Hidden Works Act)
+// renderForma19HTML generates HTML for Forma 19 (Material Consumption Report)
 func (h *Handler) renderForma19HTML(actID int64, tenantID uuid.UUID, projectName, projectAddress, clientName string) string {
 	var b strings.Builder
 
 	var name, notes string
-	var locationAxes, drawingReference sql.NullString
-	var worksStartDate, worksEndDate sql.NullTime
-	var signedContractorAt, signedClientAt, signedDesignerAt, signedGasnAt sql.NullTime
-	var stageName sql.NullString
+	var periodFrom, periodTo sql.NullTime
+	var amountTotal float64
 
 	h.db.QueryRow(`
-		SELECT a.name, COALESCE(a.notes, ''),
-		       a.location_axes, a.drawing_reference,
-		       a.works_start_date, a.works_end_date,
-		       a.signed_contractor_at, a.signed_client_at, a.signed_designer_at, a.signed_gasn_at,
-		       COALESCE(st.name, '')
-		FROM construction_act a
-		LEFT JOIN construction_stages st ON st.id = a.stage_id
-		WHERE a.id = $1 AND a.tenant_id = $2
-	`, actID, tenantID).Scan(
-		&name, &notes,
-		&locationAxes, &drawingReference,
-		&worksStartDate, &worksEndDate,
-		&signedContractorAt, &signedClientAt, &signedDesignerAt, &signedGasnAt,
-		&stageName,
-	)
+		SELECT a.name, COALESCE(a.notes, ''), a.period_from, a.period_to, a.amount_total
+		FROM construction_act a WHERE a.id = $1 AND a.tenant_id = $2
+	`, actID, tenantID).Scan(&name, &notes, &periodFrom, &periodTo, &amountTotal)
 
-	_ = name
+	b.WriteString(fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="UTF-8"><style>%s
+		.change-row { background-color: #FFF7ED; }
+		.badge-base { background: #DCFCE7; color: #166534; padding: 2px 6px; border-radius: 4px; font-size: 9pt; }
+		.badge-change { background: #FED7AA; color: #9A3412; padding: 2px 6px; border-radius: 4px; font-size: 9pt; }
+	</style></head><body>`, pdfBaseCSS))
+	b.WriteString(`<h1>ФОРМА 19</h1>`)
+	b.WriteString(`<h2>Отчёт о расходе материалов</h2>`)
 
-	b.WriteString(fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="UTF-8"><style>%s</style></head><body>`, pdfBaseCSS))
-	b.WriteString(`<h1>АКТ</h1>`)
-	b.WriteString(`<h2>освидетельствования скрытых работ (Форма 19)</h2>`)
-
-	// Header
 	b.WriteString(`<table class="header-info">`)
 	b.WriteString(fmt.Sprintf(`<tr><td><b>Объект:</b></td><td>%s</td></tr>`, projectName))
-	if projectAddress != "" {
-		b.WriteString(fmt.Sprintf(`<tr><td><b>Адрес:</b></td><td>%s</td></tr>`, projectAddress))
-	}
-	if stageName.Valid && stageName.String != "" {
-		b.WriteString(fmt.Sprintf(`<tr><td><b>Этап:</b></td><td>%s</td></tr>`, stageName.String))
-	}
-	if locationAxes.Valid && locationAxes.String != "" {
-		b.WriteString(fmt.Sprintf(`<tr><td><b>Оси, отметки:</b></td><td>%s</td></tr>`, locationAxes.String))
-	}
-	if drawingReference.Valid && drawingReference.String != "" {
-		b.WriteString(fmt.Sprintf(`<tr><td><b>Ссылка на чертёж:</b></td><td>%s</td></tr>`, drawingReference.String))
-	}
-	if worksStartDate.Valid && worksEndDate.Valid {
-		b.WriteString(fmt.Sprintf(`<tr><td><b>Период работ:</b></td><td>%s — %s</td></tr>`,
-			worksStartDate.Time.Format("02.01.2006"), worksEndDate.Time.Format("02.01.2006")))
+	if periodFrom.Valid && periodTo.Valid {
+		b.WriteString(fmt.Sprintf(`<tr><td><b>Период:</b></td><td>%s — %s</td></tr>`,
+			periodFrom.Time.Format("02.01.2006"), periodTo.Time.Format("02.01.2006")))
 	}
 	b.WriteString(`</table>`)
 
-	// Work description
-	b.WriteString(`<h3 style="margin-top:15px">Описание скрытых работ</h3>`)
-	b.WriteString(fmt.Sprintf(`<p>%s</p>`, notes))
-
-	// Materials
-	var materialsRaw []byte
-	h.db.QueryRow(`SELECT COALESCE(materials_json::text, '[]')::bytea FROM construction_act WHERE id = $1`, actID).Scan(&materialsRaw)
-	type matItem struct {
-		Name           string `json:"name"`
-		CertificateURL string `json:"certificate_url"`
-	}
-	var materials []matItem
-	if err := json.Unmarshal(materialsRaw, &materials); err == nil && len(materials) > 0 {
-		b.WriteString(`<h3>Применённые материалы</h3>`)
-		b.WriteString(`<table class="data"><tr><th>№</th><th>Наименование</th><th>Сертификат</th></tr>`)
-		for i, m := range materials {
-			cert := "—"
-			if m.CertificateURL != "" {
-				cert = "Прилагается"
+	// Lines table
+	rows, err := h.db.Query(`
+		SELECT name, uom, row_type, boshi, keldi, sarf, qoldi, cost_price, change_reason, COALESCE(change_note, '')
+		FROM construction_act_line WHERE act_id = $1 ORDER BY row_type ASC, sort_order ASC
+	`, actID)
+	if err == nil {
+		defer rows.Close()
+		b.WriteString(`<table class="data" style="margin-top:15px">`)
+		b.WriteString(`<tr><th>№</th><th>Материал</th><th>Ед.</th><th>Бошида</th><th>Келди</th><th>Сарф</th><th>Қолди</th><th>Нарх</th><th>Сумма</th><th>Тур</th><th>Сабаб</th></tr>`)
+		i := 0
+		var smetaTotal, changeTotal float64
+		for rows.Next() {
+			var lName, uom, rowType, changeReason, changeNote string
+			var boshi, keldi, sarf, qoldi, costPrice float64
+			rows.Scan(&lName, &uom, &rowType, &boshi, &keldi, &sarf, &qoldi, &costPrice, &changeReason, &changeNote)
+			i++
+			summa := sarf * costPrice
+			rowClass := ""
+			badge := `<span class="badge-base">Asos</span>`
+			if rowType == "change" {
+				rowClass = ` class="change-row"`
+				badge = `<span class="badge-change">O'zgarish</span>`
+				changeTotal += summa
+			} else {
+				smetaTotal += summa
 			}
-			b.WriteString(fmt.Sprintf(`<tr><td class="center">%d</td><td>%s</td><td class="center">%s</td></tr>`, i+1, m.Name, cert))
+			b.WriteString(fmt.Sprintf(`<tr%s><td class="center">%d</td><td>%s</td><td class="center">%s</td><td class="right">%.2f</td><td class="right">%.2f</td><td class="right">%.2f</td><td class="right">%.2f</td><td class="right">%.2f</td><td class="right">%.2f</td><td class="center">%s</td><td>%s</td></tr>`,
+				rowClass, i, lName, uom, boshi, keldi, sarf, qoldi, costPrice, summa, badge, changeReason))
 		}
+		total := smetaTotal + changeTotal
+		b.WriteString(fmt.Sprintf(`<tr style="font-weight:bold"><td colspan="8" class="right">Smeta bo'yicha:</td><td class="right">%.2f</td><td colspan="2"></td></tr>`, smetaTotal))
+		b.WriteString(fmt.Sprintf(`<tr style="font-weight:bold"><td colspan="8" class="right">O'zgarishlar:</td><td class="right">%.2f</td><td colspan="2"></td></tr>`, changeTotal))
+		b.WriteString(fmt.Sprintf(`<tr style="font-weight:bold"><td colspan="8" class="right">JAMI:</td><td class="right">%.2f</td><td colspan="2"></td></tr>`, total))
 		b.WriteString(`</table>`)
 	}
 
-	// 4 Signatures
-	b.WriteString(`<table class="signatures">`)
-	writeSig := func(title string, signedAt sql.NullTime) {
-		b.WriteString(fmt.Sprintf(`<td><b>%s:</b><br><span class="sig-line">&nbsp;</span>`, title))
-		if signedAt.Valid {
-			b.WriteString(fmt.Sprintf(`<br><span class="sig-date">Подписано: %s</span>`, signedAt.Time.Format("02.01.2006")))
-		}
-		b.WriteString(`</td>`)
-	}
-	b.WriteString(`<tr>`)
-	writeSig("Подрядчик", signedContractorAt)
-	writeSig("Заказчик / Технадзор", signedClientAt)
-	b.WriteString(`</tr><tr>`)
-	writeSig("Проектировщик", signedDesignerAt)
-	writeSig("Инспектор ГАСН", signedGasnAt)
-	b.WriteString(`</tr></table>`)
-
-	b.WriteString(fmt.Sprintf(`<p style="font-size:9pt;color:#666;margin-top:30px">Документ сформирован: %s</p>`, time.Now().Format("02.01.2006 15:04")))
+	b.WriteString(fmt.Sprintf(`<p style="font-size:9pt;color:#666;margin-top:30px">Hujjat yaratilgan: %s</p>`, time.Now().Format("02.01.2006 15:04")))
 	b.WriteString(`</body></html>`)
 	return b.String()
 }

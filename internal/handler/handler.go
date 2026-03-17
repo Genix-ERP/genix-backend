@@ -1690,6 +1690,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/acts/generate-ks2", h.perm.Require("construction", "project", "update"), h.AutoGenerateKS2)
 		constructionProjects.POST("/:id/acts/generate-ks3", h.perm.Require("construction", "project", "update"), h.GenerateForma3)
 
+		// Forma 19 — Material consumption tracking
+		constructionProjects.GET("/:id/f19", h.ListForma19)
+		constructionProjects.POST("/:id/f19", h.perm.Require("construction", "project", "update"), h.CreateForma19)
+		constructionProjects.GET("/:id/f19/:actId", h.GetForma19Detail)
+		constructionProjects.POST("/:id/f19/:actId/change-row", h.perm.Require("construction", "project", "update"), h.AddF19ChangeRow)
+		constructionProjects.PUT("/:id/f19/:actId/rows/:rowId", h.perm.Require("construction", "project", "update"), h.UpdateF19Row)
+		constructionProjects.POST("/:id/f19/:actId/approve", h.perm.Require("construction", "project", "update"), h.ApproveForma19)
+		constructionProjects.DELETE("/:id/f19/:actId", h.perm.Require("construction", "project", "delete"), h.DeleteForma19)
+
 		// Smeta vs Fact analytics
 		constructionProjects.GET("/:id/smeta-vs-fact", h.GetSmetaVsFact)
 
@@ -1931,19 +1940,6 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		f3.GET("/:id", h.GetConstructionAct)
 		f3.POST("/:id/sign", h.perm.Require("construction", "project", "update"), h.SignAct)
 		f3.GET("/:id/pdf", h.ExportActDocument)
-	}
-
-	f19 := constructionProjects.Group("/f19")
-	f19.Use(h.perm.Require("construction", "project", "read"))
-	{
-		f19.GET("", h.ListConstructionActs)
-		f19.POST("", h.perm.Require("construction", "project", "create"), h.CreateConstructionAct)
-		f19.GET("/:id", h.GetConstructionAct)
-		f19.POST("/:id/submit", h.perm.Require("construction", "project", "update"), h.SubmitForSigning)
-		f19.PUT("/:id/sign", h.perm.Require("construction", "project", "update"), h.SignAct)
-		f19.POST("/:id/cancel", h.perm.Require("construction", "project", "update"), h.CancelAct)
-		f19.GET("/:id/pdf", h.ExportActDocument)
-		f19.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionAct)
 	}
 
 	// =====================================================
