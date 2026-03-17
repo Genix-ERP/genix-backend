@@ -4419,7 +4419,9 @@ func (h *Handler) ListConstructionTeamMembers(c *gin.Context) {
 		       COALESCE(e.first_name || ' ' || e.last_name, '') as employee_name,
 		       COALESCE(e.job_title, '') as position,
 		       COALESCE(e.phone, '') as phone,
-		       COALESCE(e.email, '') as email
+		       COALESCE(e.email, '') as email,
+		       COALESCE(pt.status, CASE WHEN pt.is_active THEN 'active' ELSE 'inactive' END) as status,
+		       COALESCE(pt.notes, '') as notes
 		FROM construction_project_team pt
 		JOIN employees e ON e.id = pt.employee_id
 		JOIN construction_projects cp ON cp.id = pt.project_id
@@ -4439,7 +4441,7 @@ func (h *Handler) ListConstructionTeamMembers(c *gin.Context) {
 	for rows.Next() {
 		var id, projectIDVal int64
 		var employeeID uuid.UUID
-		var role, employeeName, position, phone, email string
+		var role, employeeName, position, phone, email, status, notes string
 		var responsibilities sql.NullString
 		var startDate, endDate sql.NullTime
 		var isActive bool
@@ -4449,6 +4451,7 @@ func (h *Handler) ListConstructionTeamMembers(c *gin.Context) {
 			&id, &projectIDVal, &employeeID, &role, &responsibilities,
 			&startDate, &endDate, &isActive, &createdDate,
 			&employeeName, &position, &phone, &email,
+			&status, &notes,
 		); err != nil {
 			h.log.Error("Failed to scan team member", "error", err)
 			continue
@@ -4468,6 +4471,8 @@ func (h *Handler) ListConstructionTeamMembers(c *gin.Context) {
 			"position":         position,
 			"phone":            phone,
 			"email":            email,
+			"status":           status,
+			"notes":            notes,
 		})
 	}
 
@@ -4756,6 +4761,126 @@ func (h *Handler) UpdateConstructionTeamMember(c *gin.Context) {
 	response.Success(c, map[string]interface{}{
 		"id":      memberID,
 		"message": "Team member updated successfully",
+	})
+}
+
+// TransferTeamMember transfers a team member from one construction project to another
+func (h *Handler) TransferTeamMember(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	memberID, err := strconv.ParseInt(c.Param("memberId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid member ID")
+		return
+	}
+
+	var req struct {
+		TargetProjectID int64  `json:"target_project_id" binding:"required"`
+		Notes           string `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid input: target_project_id is required")
+		return
+	}
+
+	// 1. Get the team member from source project (verify exists, tenant matches)
+	var employeeID uuid.UUID
+	var role, memberStatus string
+	var responsibilities sql.NullString
+	var employeeName string
+	err = h.db.QueryRow(`
+		SELECT pt.employee_id, pt.role, COALESCE(pt.status, CASE WHEN pt.is_active THEN 'active' ELSE 'inactive' END),
+		       pt.responsibilities,
+		       COALESCE(e.first_name || ' ' || e.last_name, '') as employee_name
+		FROM construction_project_team pt
+		JOIN employees e ON e.id = pt.employee_id
+		JOIN construction_projects cp ON cp.id = pt.project_id
+		WHERE pt.id = $1 AND pt.project_id = $2 AND cp.tenant_id = $3
+	`, memberID, projectID, tenantID).Scan(&employeeID, &role, &memberStatus, &responsibilities, &employeeName)
+	if err != nil {
+		response.NotFound(c, "Team member not found")
+		return
+	}
+
+	// 3. Verify member isn't already transferred
+	if memberStatus == "transferred" {
+		response.BadRequest(c, "Team member is already transferred")
+		return
+	}
+
+	// 2. Verify target project exists and belongs to same tenant
+	var targetProjectName string
+	err = h.db.QueryRow(`
+		SELECT name FROM construction_projects WHERE id = $1 AND tenant_id = $2
+	`, req.TargetProjectID, tenantID).Scan(&targetProjectName)
+	if err != nil {
+		response.NotFound(c, "Target project not found")
+		return
+	}
+
+	// Get source project name
+	var sourceProjectName string
+	err = h.db.QueryRow(`
+		SELECT name FROM construction_projects WHERE id = $1 AND tenant_id = $2
+	`, projectID, tenantID).Scan(&sourceProjectName)
+	if err != nil {
+		response.NotFound(c, "Source project not found")
+		return
+	}
+
+	// 4. Update source member: SET status = 'transferred'
+	transferNote := fmt.Sprintf("Ko'chirildi: %s", targetProjectName)
+	_, err = h.db.Exec(`
+		UPDATE construction_project_team
+		SET status = 'transferred', is_active = false, notes = $1
+		WHERE id = $2 AND project_id = $3
+	`, transferNote, memberID, projectID)
+	if err != nil {
+		h.log.Error("Failed to update source team member", "error", err)
+		response.InternalError(c, "Failed to transfer team member")
+		return
+	}
+
+	// 5. Insert new member in target project
+	targetNote := fmt.Sprintf("%s dan ko'chirildi", sourceProjectName)
+	var newMemberID int64
+	err = h.db.QueryRow(`
+		INSERT INTO construction_project_team (
+			project_id, employee_id, role, responsibilities, status, is_active, notes, created_date
+		) VALUES ($1, $2, $3, $4, 'active', true, $5, NOW())
+		ON CONFLICT (project_id, employee_id, role) DO UPDATE
+		SET status = 'active', is_active = true, notes = EXCLUDED.notes
+		RETURNING id
+	`, req.TargetProjectID, employeeID, role, responsibilities, targetNote).Scan(&newMemberID)
+	if err != nil {
+		h.log.Error("Failed to create target team member", "error", err)
+		response.InternalError(c, "Failed to create team member in target project")
+		return
+	}
+
+	// 6. Log activity in both projects
+	h.logConstructionActivity(tenantID, projectID, userID, "team_transfer",
+		fmt.Sprintf("%s %s ga ko'chirildi", employeeName, targetProjectName), "TeamMember", memberID)
+	h.logConstructionActivity(tenantID, req.TargetProjectID, userID, "team_transfer",
+		fmt.Sprintf("%s %s dan ko'chirildi", employeeName, sourceProjectName), "TeamMember", newMemberID)
+
+	// 7. Return success with both member IDs
+	response.Success(c, map[string]interface{}{
+		"message":           "Team member transferred successfully",
+		"source_member_id":  memberID,
+		"target_member_id":  newMemberID,
+		"target_project_id": req.TargetProjectID,
 	})
 }
 
