@@ -583,6 +583,16 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 		return
 	}
 
+	// Also soft-delete the linked user record
+	h.db.Exec(`
+		UPDATE users SET deleted_at = NOW(), updated_at = NOW(), employee_id = NULL
+		WHERE tenant_id = $1 AND employee_id = $2 AND deleted_at IS NULL
+	`, tenantID, id)
+
+	// Clean up employee permissions and organization assignments
+	h.db.Exec(`DELETE FROM employee_module_permissions WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
+	h.db.Exec(`DELETE FROM employee_organizations WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
+
 	response.NoContent(c)
 }
 
