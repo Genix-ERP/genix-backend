@@ -377,9 +377,12 @@ func permissionCacheKey(tenantID, userID string) string {
 }
 
 // loadPermissions queries the database for all permissions granted to the user
-// through their assigned roles within the given tenant. The result is a set of
-// permission strings in the form "module:resource:action".
+// through their assigned roles and employee module permissions within the given tenant.
+// The result is a set of permission strings in the form "module:resource:action".
 func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, userID string) (map[string]bool, error) {
+	perms := make(map[string]bool)
+
+	// 1. Load from old role_permissions system (backward compat)
 	query := `
 		SELECT DISTINCT p.module, p.resource, p.action
 		FROM permissions p
@@ -395,7 +398,6 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 	}
 	defer rows.Close()
 
-	perms := make(map[string]bool)
 	for rows.Next() {
 		var module, resource, action string
 		if err := rows.Scan(&module, &resource, &action); err != nil {
@@ -405,6 +407,66 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	// 2. Load from employee_module_permissions (via user -> employee link)
+	empQuery := `
+		SELECT emp.module_id, emp.can_create, emp.can_read, emp.can_update, emp.can_delete
+		FROM employee_module_permissions emp
+		INNER JOIN users u ON u.employee_id = emp.employee_id AND u.tenant_id = emp.tenant_id
+		WHERE u.id = $1 AND u.tenant_id = $2
+	`
+
+	empRows, err := pc.db.QueryContext(ctx, empQuery, userID, tenantID)
+	if err != nil {
+		// Don't fail entirely, just log and continue with what we have
+		return perms, nil
+	}
+	defer empRows.Close()
+
+	// Collect all known resources per module so we can grant granular permissions
+	resourceMap := map[string][]string{
+		"inventory":    {"product", "warehouse", "stock", "category", "lot"},
+		"sales":        {"order", "invoice", "customer", "quotation", "payment"},
+		"purchase":     {"order", "vendor", "bill", "rfq"},
+		"hr":           {"employee", "department", "payroll", "contract", "attendance"},
+		"finance":      {"account", "journal", "transaction", "report", "budget"},
+		"crm":          {"contact", "lead", "opportunity", "pipeline"},
+		"organization": {"organization", "department"},
+		"users":        {"user", "role"},
+		"projects":     {"project", "task", "milestone"},
+		"manufacturing":{"order", "bom", "workorder", "workcenter"},
+		"assets":       {"asset", "category", "depreciation"},
+		"expenses":     {"expense", "report", "category"},
+	}
+
+	for empRows.Next() {
+		var moduleID string
+		var canCreate, canRead, canUpdate, canDelete bool
+		if err := empRows.Scan(&moduleID, &canCreate, &canRead, &canUpdate, &canDelete); err != nil {
+			continue
+		}
+
+		resources, ok := resourceMap[moduleID]
+		if !ok {
+			// Unknown module — grant wildcard-style with module as resource
+			resources = []string{moduleID}
+		}
+
+		for _, res := range resources {
+			if canCreate {
+				perms[moduleID+":"+res+":create"] = true
+			}
+			if canRead {
+				perms[moduleID+":"+res+":read"] = true
+			}
+			if canUpdate {
+				perms[moduleID+":"+res+":update"] = true
+			}
+			if canDelete {
+				perms[moduleID+":"+res+":delete"] = true
+			}
+		}
 	}
 
 	return perms, nil
