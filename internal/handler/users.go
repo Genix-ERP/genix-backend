@@ -338,6 +338,16 @@ func (h *Handler) SendCredentials(c *gin.Context) {
 			response.BadRequest(c, "Phone number is required for SMS")
 			return
 		}
+		// Dedup: prevent sending the same SMS twice within 30 seconds
+		dedupKey := fmt.Sprintf("sms_dedup:%s:%s", tenantID.String(), normalizePhone(input.Phone))
+		if h.redis != nil {
+			if val, _ := h.redis.Get(c.Request.Context(), dedupKey); val != "" {
+				h.log.Warn("Duplicate SMS request blocked", "phone", input.Phone)
+				response.Success(c, gin.H{"message": "Credentials already sent"})
+				return
+			}
+			_ = h.redis.Set(c.Request.Context(), dedupKey, "1", 30*time.Second)
+		}
 		smsMessage := fmt.Sprintf(trans.SMSTemplate, input.Password)
 		if err := h.smsService.Send(input.Phone, smsMessage); err != nil {
 			h.log.Error("Failed to send credentials SMS", "error", err)
