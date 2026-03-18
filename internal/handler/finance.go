@@ -3647,6 +3647,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	// --- Create journal entry for the payment ---
 	// Determine cash/bank account: stored bank_account_id → journal default account → payment method → name fallback
 	var cashAccountID uuid.UUID
+	var cashAccountBalance float64
 	if bankAccountIDStr.Valid {
 		cashAccountID, _ = uuid.Parse(bankAccountIDStr.String)
 	}
@@ -3668,6 +3669,21 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1010")
 		if cashAccountID == uuid.Nil {
 			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+		}
+	}
+
+	// Check cash/bank account balance for outbound payments
+	if cashAccountID != uuid.Nil && paymentType == "payment" {
+		_ = tx.QueryRow("SELECT COALESCE(current_balance, 0) FROM accounts WHERE id = $1", cashAccountID).Scan(&cashAccountBalance)
+		if cashAccountBalance < amount {
+			tx.Rollback()
+			var accountName, accountCode string
+			h.db.QueryRow("SELECT name, code FROM accounts WHERE id = $1", cashAccountID).Scan(&accountName, &accountCode)
+			response.BadRequest(c, fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas. Joriy balans: %s, kerakli summa: %s",
+				accountName, accountCode,
+				fmt.Sprintf("%.2f", cashAccountBalance),
+				fmt.Sprintf("%.2f", amount)))
+			return
 		}
 	}
 
