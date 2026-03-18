@@ -6734,10 +6734,17 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 		// Sync: when a delivery operation from a SO completes, mark SO as delivered
 		if op.SourceType != nil && *op.SourceType == "sales_order" && op.SourceID != nil && *op.SourceID != uuid.Nil {
-			h.db.Exec(`
+			res, soUpdErr := h.db.Exec(`
 				UPDATE sales_orders SET status = 'delivered', updated_at = $1
 				WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status != 'delivered'
 			`, now, *op.SourceID, tenantID)
+			if soUpdErr != nil {
+				h.log.Error("Failed to update SO to delivered", "error", soUpdErr, "so_id", *op.SourceID)
+			} else if rows, _ := res.RowsAffected(); rows == 0 {
+				h.log.Warn("SO not updated to delivered (0 rows affected)", "so_id", *op.SourceID, "tenant_id", tenantID)
+			} else {
+				h.log.Info("SO marked as delivered", "so_id", *op.SourceID, "rows", rows)
+			}
 
 			// Intercompany: when SO delivery completes, update linked PO and its receipt
 			var linkedPOID *uuid.UUID
