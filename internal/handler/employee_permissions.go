@@ -153,6 +153,15 @@ func (h *Handler) UpdateEmployeeModulePermission(c *gin.Context) {
 		return
 	}
 
+	// Invalidate permission cache for the linked user
+	var linkedUserID uuid.UUID
+	if scanErr := h.db.QueryRow(
+		"SELECT id FROM users WHERE tenant_id = $1 AND employee_id = $2 AND deleted_at IS NULL",
+		tenantID, employeeID,
+	).Scan(&linkedUserID); scanErr == nil {
+		h.perm.InvalidatePermissionCache(c.Request.Context(), tenantID.String(), linkedUserID.String())
+	}
+
 	response.Success(c, perm)
 }
 
@@ -239,6 +248,15 @@ func (h *Handler) BulkUpdateEmployeePermissions(c *gin.Context) {
 		h.log.Error("Failed to commit transaction", "error", err)
 		response.InternalError(c, "Failed to update permissions")
 		return
+	}
+
+	// Invalidate permission cache for the linked user
+	var linkedUserID uuid.UUID
+	if scanErr := h.db.QueryRow(
+		"SELECT id FROM users WHERE tenant_id = $1 AND employee_id = $2 AND deleted_at IS NULL",
+		tenantID, employeeID,
+	).Scan(&linkedUserID); scanErr == nil {
+		h.perm.InvalidatePermissionCache(c.Request.Context(), tenantID.String(), linkedUserID.String())
 	}
 
 	result := EmployeePermissionsResponse{
