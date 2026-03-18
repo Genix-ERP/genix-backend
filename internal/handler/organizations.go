@@ -1036,6 +1036,23 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		{"MISC", "Miscellaneous Journal", "miscellaneous", "", ""},
 	}
 
+	// Find profit/loss accounts for cash/bank journals
+	var profitAccountID, lossAccountID *uuid.UUID
+	// Profit: 6900 (Kurs farqi daromadi) or 4000 (Revenue) or 7100
+	for _, code := range []string{"6900", "4000", "7100"} {
+		if accID, ok := accountIDs[code]; ok {
+			profitAccountID = &accID
+			break
+		}
+	}
+	// Loss: 9400 (Kurs farqi zararlar) or 6000 (Expenses) or 7200
+	for _, code := range []string{"9400", "6000", "7200"} {
+		if accID, ok := accountIDs[code]; ok {
+			lossAccountID = &accID
+			break
+		}
+	}
+
 	for _, j := range defaultJournals {
 		id := uuid.New()
 
@@ -1051,12 +1068,20 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 			}
 		}
 
+		// Set profit/loss accounts for cash and bank journals
+		var profitAcct, lossAcct *uuid.UUID
+		if j.journalType == "cash" || j.journalType == "bank" {
+			profitAcct = profitAccountID
+			lossAcct = lossAccountID
+		}
+
 		_, err := h.db.Exec(`
 			INSERT INTO journals (
 				id, tenant_id, organization_id, code, name, type,
 				default_debit_account_id, default_credit_account_id,
+				profit_account_id, loss_account_id,
 				is_active, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (tenant_id, code) DO UPDATE
 				SET organization_id = EXCLUDED.organization_id,
 				    updated_at = NOW()
@@ -1064,6 +1089,7 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		`,
 			id, tenantID, orgID, j.code, j.name, j.journalType,
 			defaultDebitID, defaultCreditID,
+			profitAcct, lossAcct,
 			true, now,
 		)
 		if err != nil {
@@ -1094,13 +1120,19 @@ func (h *Handler) createDefaultPaymentMethods(tenantID, orgID uuid.UUID) {
 		{"CHECK", "Check", "check"},
 	}
 
-	// Find a default account for payment methods (cash account 1000)
-	var cashAccountID *uuid.UUID
+	// Find default accounts for payment methods
+	var cashAccountID, bankAccountID *uuid.UUID
 	var acctID uuid.UUID
 	if err := h.db.QueryRow(`
 		SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code = '1000' AND deleted_at IS NULL
 	`, tenantID, orgID).Scan(&acctID); err == nil {
 		cashAccountID = &acctID
+	}
+	var bankAcctID uuid.UUID
+	if err := h.db.QueryRow(`
+		SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code = '1010' AND deleted_at IS NULL
+	`, tenantID, orgID).Scan(&bankAcctID); err == nil {
+		bankAccountID = &bankAcctID
 	}
 
 	pmIDs := make(map[string]uuid.UUID)
@@ -1149,11 +1181,19 @@ func (h *Handler) createDefaultPaymentMethods(tenantID, orgID uuid.UUID) {
 			continue
 		}
 
+		// Set outstanding_account_id: bank account for BANK journal, cash account for CASH journal
+		var outstandingAcct *uuid.UUID
+		if link.journalCode == "BANK" {
+			outstandingAcct = bankAccountID
+		} else if link.journalCode == "CASH" {
+			outstandingAcct = cashAccountID
+		}
+
 		h.db.Exec(`
-			INSERT INTO journal_payment_methods (id, tenant_id, journal_id, payment_method_id, direction, name, is_active, created_at)
-			VALUES (gen_random_uuid(), $1, $2, $3, $4, '', true, $5)
+			INSERT INTO journal_payment_methods (id, tenant_id, journal_id, payment_method_id, direction, name, outstanding_account_id, is_active, created_at)
+			VALUES (gen_random_uuid(), $1, $2, $3, $4, '', $5, true, $6)
 			ON CONFLICT (journal_id, payment_method_id, direction) DO NOTHING
-		`, tenantID, journalID, pmID, link.direction, now)
+		`, tenantID, journalID, pmID, link.direction, outstandingAcct, now)
 	}
 
 	h.log.Info("Created default payment methods", "tenant_id", tenantID, "count", len(defaultPMs))
