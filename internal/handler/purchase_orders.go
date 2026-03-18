@@ -1150,8 +1150,15 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		h.log.Warn("Failed to cancel pending workflows", "error", wfErr)
 	}
 
-	// 2. Create stock operation (warehouse receipt)
-	{
+	// 2. Create stock operation (warehouse receipt) — skip if one already exists
+	var existingReceiptCount int
+	tx.QueryRow(`
+		SELECT COUNT(*) FROM stock_operations
+		WHERE source_type = 'purchase_order' AND source_id = $1 AND tenant_id = $2
+		  AND direction = 'receipt' AND deleted_at IS NULL AND state != 'cancelled'
+	`, poID, tenantID).Scan(&existingReceiptCount)
+
+	if existingReceiptCount == 0 {
 		var opTypeID uuid.UUID
 		var srcLocID, destLocID *uuid.UUID
 

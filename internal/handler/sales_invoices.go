@@ -1442,22 +1442,17 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 	// Get default account IDs — lookup by name first, then code fallback
 	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
-	// Use Outstanding Receipts account for 2-step payment posting
-	// Payment first goes to outstanding account, then cleared to bank during reconciliation
+	// Post directly to Cash/Bank based on payment method
 	var cashAccountID uuid.UUID
-	cashAccountID = findAccount(tx, tenantID, organizationID, "outstanding receipts", "1150")
-	if cashAccountID == uuid.Nil {
-		// Fallback to direct bank/cash posting if outstanding account doesn't exist
-		if input.PaymentMethod == "cash" {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
-			if cashAccountID == uuid.Nil {
-				cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
-			}
-		} else {
+	if input.PaymentMethod == "cash" {
+		cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
+		if cashAccountID == uuid.Nil {
 			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
-			if cashAccountID == uuid.Nil {
-				cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
-			}
+		}
+	} else {
+		cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
+		if cashAccountID == uuid.Nil {
+			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
 		}
 	}
 

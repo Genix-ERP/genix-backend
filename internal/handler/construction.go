@@ -3108,12 +3108,15 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		       COALESCE(so.state, '') as delivery_state,
 		       COALESCE(mr.bill_subcontractor, false),
 		       mr.subcontract_id,
-		       COALESCE(sc.name, '') as subcontract_name
+		       COALESCE(sc.name, '') as subcontract_name,
+		       COALESCE(mr.building_id, 0),
+		       COALESCE(bld.name, '') as building_name
 		FROM construction_material_requests mr
 		LEFT JOIN employees e ON e.id = mr.requested_by
 		LEFT JOIN employees a ON a.id = mr.approved_by
 		LEFT JOIN stock_operations so ON so.id = mr.stock_operation_id
 		LEFT JOIN construction_subcontract sc ON sc.id = mr.subcontract_id
+		LEFT JOIN construction_buildings bld ON bld.id = mr.building_id
 		WHERE mr.project_id = $1 AND mr.tenant_id = $2
 		ORDER BY mr.request_date DESC
 	`
@@ -3144,6 +3147,8 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		var billSubcontractor bool
 		var subcontractID sql.NullInt64
 		var subcontractName string
+		var buildingID int64
+		var buildingName string
 
 		if err := rows.Scan(
 			&id, &tenantIDVal, &projectIDVal,
@@ -3155,6 +3160,7 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 			&requesterName, &approverName,
 			&stockOperationID, &deliveryName, &deliveryState,
 			&billSubcontractor, &subcontractID, &subcontractName,
+			&buildingID, &buildingName,
 		); err != nil {
 			h.log.Error("Failed to scan material request", "error", err)
 			continue
@@ -3187,6 +3193,8 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 			"bill_subcontractor": billSubcontractor,
 			"subcontract_id":     nullInt64Value(subcontractID),
 			"subcontract_name":   subcontractName,
+			"building_id":        buildingID,
+			"building_name":      buildingName,
 		})
 	}
 
@@ -3231,6 +3239,7 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 		Notes             string      `json:"notes"`
 		BillSubcontractor bool        `json:"bill_subcontractor"`
 		SubcontractID     int64       `json:"subcontract_id"`
+		BuildingID        int64       `json:"building_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -3262,19 +3271,23 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	if req.SubcontractID > 0 {
 		subcontractID = req.SubcontractID
 	}
+	var buildingID interface{}
+	if req.BuildingID > 0 {
+		buildingID = req.BuildingID
+	}
 
 	query := `
 		INSERT INTO construction_material_requests (
 			tenant_id, project_id, request_number, request_date, required_date,
-			items, notes, status, bill_subcontractor, subcontract_id, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft', $8, $9, NOW(), NOW())
+			items, notes, status, bill_subcontractor, subcontract_id, building_id, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'draft', $8, $9, $10, NOW(), NOW())
 		RETURNING id
 	`
 
 	var requestID int64
 	err = h.db.QueryRow(query,
 		tenantID, projectID, requestNumber, requestDate, requiredDate,
-		itemsJSON, nullString(req.Notes), req.BillSubcontractor, subcontractID,
+		itemsJSON, nullString(req.Notes), req.BillSubcontractor, subcontractID, buildingID,
 	).Scan(&requestID)
 	if err != nil {
 		h.log.Error("Failed to create material request", "error", err)
@@ -3649,11 +3662,12 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 	var itemsRaw []byte
 	var status string
 	var expenseRecorded bool
+	var mrBuildingID sql.NullInt64
 	err = h.db.QueryRow(`
-		SELECT project_id, items, status, COALESCE(expense_recorded, false)
+		SELECT project_id, items, status, COALESCE(expense_recorded, false), building_id
 		FROM construction_material_requests
 		WHERE id = $1 AND tenant_id = $2
-	`, requestID, tenantID).Scan(&projectID, &itemsRaw, &status, &expenseRecorded)
+	`, requestID, tenantID).Scan(&projectID, &itemsRaw, &status, &expenseRecorded, &mrBuildingID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Material request not found")
 		return
@@ -3938,6 +3952,56 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 			tx.Exec(`ROLLBACK TO SAVEPOINT sp_pm`)
 		} else {
 			tx.Exec(`RELEASE SAVEPOINT sp_pm`)
+		}
+	}
+
+	// Auto-create material usage records (best-effort)
+	for _, item := range items {
+		productIDStr, _ := item["product_id"].(string)
+		if productIDStr == "" {
+			continue
+		}
+		var qty float64
+		switch v := item["quantity"].(type) {
+		case float64:
+			qty = v
+		case json.Number:
+			qty, _ = v.Float64()
+		}
+		if qty <= 0 {
+			continue
+		}
+		productName, _ := item["product_name"].(string)
+		uom, _ := item["unit_name"].(string)
+		if productName == "" {
+			pid, _ := uuid.Parse(productIDStr)
+			var dbName, dbUom string
+			tx.QueryRow(`SELECT COALESCE(name,''), COALESCE(unit_name,'') FROM products WHERE id = $1 LIMIT 1`, pid).Scan(&dbName, &dbUom)
+			if dbName != "" {
+				productName = dbName
+			}
+			if uom == "" && dbUom != "" {
+				uom = dbUom
+			}
+		}
+		var bldID interface{}
+		if mrBuildingID.Valid && mrBuildingID.Int64 > 0 {
+			bldID = mrBuildingID.Int64
+		}
+		tx.Exec(`SAVEPOINT sp_mu`)
+		_, muErr := tx.Exec(`
+			INSERT INTO construction_material_usage (
+				tenant_id, project_id, building_id, product_id, product_name, uom,
+				quantity_used, usage_date, recorded_by, notes, created_date, updated_date
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+		`, tenantID, projectID, bldID, productIDStr, productName, uom,
+			qty, now.Format("2006-01-02"), approverEmployeeID,
+			fmt.Sprintf("Material so'rovi #%d dan avtomatik qo'shildi", requestID))
+		if muErr != nil {
+			h.log.Error("material_usage insert failed (rolled back to savepoint)", "error", muErr)
+			tx.Exec(`ROLLBACK TO SAVEPOINT sp_mu`)
+		} else {
+			tx.Exec(`RELEASE SAVEPOINT sp_mu`)
 		}
 	}
 
