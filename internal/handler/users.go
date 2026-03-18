@@ -118,15 +118,38 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		return
 	}
 
-	// Check if email exists
-	var existingID uuid.UUID
-	err := h.db.QueryRow(
-		"SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND deleted_at IS NULL",
-		tenantID, input.Email,
-	).Scan(&existingID)
-	if err == nil {
-		response.Conflict(c, "Email already exists")
+	// At least email or phone must be provided
+	if input.Email == "" && input.Phone == "" {
+		response.BadRequest(c, "Email or phone number is required")
 		return
+	}
+
+	// Normalize phone
+	if input.Phone != "" {
+		input.Phone = normalizePhone(input.Phone)
+	}
+
+	// Check for duplicates
+	var existingID uuid.UUID
+	if input.Email != "" {
+		err := h.db.QueryRow(
+			"SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND deleted_at IS NULL",
+			tenantID, input.Email,
+		).Scan(&existingID)
+		if err == nil {
+			response.Conflict(c, "Email already exists")
+			return
+		}
+	}
+	if input.Phone != "" {
+		err := h.db.QueryRow(
+			"SELECT id FROM users WHERE tenant_id = $1 AND phone = $2 AND deleted_at IS NULL",
+			tenantID, input.Phone,
+		).Scan(&existingID)
+		if err == nil {
+			response.Conflict(c, "Phone number already exists")
+			return
+		}
 	}
 
 	// Hash password if provided
@@ -153,7 +176,7 @@ func (h *Handler) CreateUser(c *gin.Context) {
 
 	// Create user (password_hash can be empty for invite flow)
 	userID := uuid.New()
-	_, err = h.db.Exec(`
+	_, err := h.db.Exec(`
 		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, phone, language, timezone, settings, is_active, is_verified)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}', true, $10)
 	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, input.Phone, language, timezone, passwordHash != "")
@@ -239,7 +262,7 @@ func (h *Handler) SendCredentials(c *gin.Context) {
 	}
 
 	var input struct {
-		Email    string `json:"email" binding:"required"`
+		Email    string `json:"email"`
 		Password string `json:"password" binding:"required"`
 		Method   string `json:"method"` // "email" or "sms"
 		Phone    string `json:"phone"`
@@ -254,6 +277,16 @@ func (h *Handler) SendCredentials(c *gin.Context) {
 		input.Method = "email"
 	}
 
+	// Validate: need email for email method, phone for sms method
+	if input.Method == "email" && input.Email == "" {
+		response.BadRequest(c, "Email is required for email delivery")
+		return
+	}
+	if input.Method == "sms" && input.Phone == "" {
+		response.BadRequest(c, "Phone number is required for SMS delivery")
+		return
+	}
+
 	// Hash and update the user's password
 	passwordHash, err := crypto.HashPassword(input.Password)
 	if err != nil {
@@ -262,10 +295,20 @@ func (h *Handler) SendCredentials(c *gin.Context) {
 		return
 	}
 
-	result, err := h.db.Exec(
-		"UPDATE users SET password_hash = $1, updated_at = NOW() WHERE tenant_id = $2 AND email = $3 AND deleted_at IS NULL",
-		passwordHash, tenantID, input.Email,
-	)
+	// Find and update user by email or phone
+	var result sql.Result
+	if input.Email != "" {
+		result, err = h.db.Exec(
+			"UPDATE users SET password_hash = $1, updated_at = NOW() WHERE tenant_id = $2 AND email = $3 AND deleted_at IS NULL",
+			passwordHash, tenantID, input.Email,
+		)
+	} else {
+		phone := normalizePhone(input.Phone)
+		result, err = h.db.Exec(
+			"UPDATE users SET password_hash = $1, updated_at = NOW() WHERE tenant_id = $2 AND phone = $3 AND deleted_at IS NULL",
+			passwordHash, tenantID, phone,
+		)
+	}
 	if err != nil {
 		h.log.Error("Failed to update user password", "error", err)
 		response.InternalServerError(c, "")
