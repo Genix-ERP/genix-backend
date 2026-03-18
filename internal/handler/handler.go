@@ -106,6 +106,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		auth.PUT("/me/password", h.ChangePassword)
 		auth.POST("/send-invite", h.SendInvite) // Send invitation to a user
 		auth.GET("/me/permissions", h.GetCurrentUserPermissions) // Get current user's module permissions
+		auth.GET("/me/organizations", h.GetCurrentUserOrganizations)
 	}
 
 	// Users

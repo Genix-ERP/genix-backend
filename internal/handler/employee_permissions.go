@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -407,4 +408,111 @@ func (h *Handler) GetCurrentUserPermissions(c *gin.Context) {
 		"permissions":      permissions,
 		"organization_ids": organizationIDs,
 	})
+}
+
+// GetCurrentUserOrganizations returns full organization details for the current user's employee
+func (h *Handler) GetCurrentUserOrganizations(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, ok := middleware.GetUserID(c)
+	if !ok || userID == uuid.Nil {
+		response.Unauthorized(c, "User not found")
+		return
+	}
+
+	// Get user role and employee link
+	var role string
+	var employeeID sql.NullString
+	err := h.db.QueryRow(`
+		SELECT role, employee_id FROM users WHERE id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&role, &employeeID)
+	if err != nil {
+		response.InternalError(c, "Failed to get user")
+		return
+	}
+
+	var query string
+	var args []interface{}
+
+	// Admins get all organizations
+	if role == "site_admin" || role == "owner" || role == "system_admin" {
+		query = `
+			SELECT id, tenant_id, parent_id, code, name, type, tax_id, registration_number,
+			       address, contact_info, country, currency, accounting_standard, logo_url,
+			       settings, is_active, created_at, updated_at,
+			       oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
+			       tax_regime, activity_status, business_group, intercompany_relations,
+			       director_name, director_phone, legal_address, notes
+			FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL
+			ORDER BY name ASC
+		`
+		args = []interface{}{tenantID}
+	} else {
+		// Non-admin: get only assigned organizations
+		if !employeeID.Valid {
+			response.Success(c, []Organization{})
+			return
+		}
+		query = `
+			SELECT o.id, o.tenant_id, o.parent_id, o.code, o.name, o.type, o.tax_id, o.registration_number,
+			       o.address, o.contact_info, o.country, o.currency, o.accounting_standard, o.logo_url,
+			       o.settings, o.is_active, o.created_at, o.updated_at,
+			       o.oked, o.bank_account, o.bank_mfo, o.bank_name, COALESCE(o.is_vat_payer, false),
+			       o.tax_regime, o.activity_status, o.business_group, o.intercompany_relations,
+			       o.director_name, o.director_phone, o.legal_address, o.notes
+			FROM organizations o
+			INNER JOIN employee_organizations eo ON eo.organization_id = o.id AND eo.tenant_id = o.tenant_id
+			WHERE o.tenant_id = $1 AND eo.employee_id = $2 AND o.deleted_at IS NULL
+			ORDER BY o.name ASC
+		`
+		args = []interface{}{tenantID, employeeID.String}
+	}
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch organizations")
+		return
+	}
+	defer rows.Close()
+
+	var organizations []Organization
+	for rows.Next() {
+		var org Organization
+		var addressJSON, contactInfoJSON, settingsJSON []byte
+
+		if err := rows.Scan(
+			&org.ID, &org.TenantID, &org.ParentID, &org.Code, &org.Name, &org.Type,
+			&org.TaxID, &org.RegistrationNumber, &addressJSON, &contactInfoJSON,
+			&org.Country, &org.Currency, &org.AccountingStandard, &org.LogoURL,
+			&settingsJSON, &org.IsActive, &org.CreatedAt, &org.UpdatedAt,
+			&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
+			&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
+			&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
+		); err != nil {
+			h.log.Error("Failed to scan organization", "error", err)
+			continue
+		}
+
+		if len(addressJSON) > 0 {
+			json.Unmarshal(addressJSON, &org.Address)
+		}
+		if len(contactInfoJSON) > 0 {
+			json.Unmarshal(contactInfoJSON, &org.ContactInfo)
+		}
+		if len(settingsJSON) > 0 {
+			json.Unmarshal(settingsJSON, &org.Settings)
+		}
+
+		organizations = append(organizations, org)
+	}
+
+	if organizations == nil {
+		organizations = []Organization{}
+	}
+
+	response.Success(c, organizations)
 }
