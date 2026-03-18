@@ -330,7 +330,7 @@ func (h *Handler) SendCredentials(c *gin.Context) {
 	var tenantName string
 	_ = h.db.QueryRow("SELECT name FROM tenants WHERE id = $1", tenantID).Scan(&tenantName)
 	if tenantName == "" {
-		tenantName = "GenixERP"
+		tenantName = "Yuksalish"
 	}
 
 	if input.Method == "sms" {
