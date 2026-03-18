@@ -583,10 +583,10 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 		return
 	}
 
-	// Also soft-delete the linked user record
+	// Hard-delete the linked user record (soft-delete causes unique constraint
+	// violation on users_tenant_id_email_key when recreating with empty email)
 	h.db.Exec(`
-		UPDATE users SET deleted_at = NOW(), updated_at = NOW(), employee_id = NULL
-		WHERE tenant_id = $1 AND employee_id = $2 AND deleted_at IS NULL
+		DELETE FROM users WHERE tenant_id = $1 AND employee_id = $2 AND deleted_at IS NULL
 	`, tenantID, id)
 
 	// Clean up employee permissions and organization assignments
