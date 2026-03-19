@@ -5344,3 +5344,154 @@ func (h *Handler) createProjectCompletionJournalEntry(tenantID, organizationID u
 
 	h.log.Info("Created completion journal entry", "project_id", projectID, "entry_id", entryID, "amount", totalActualCost)
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Building Files
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ListBuildingFiles returns all files for a building
+func (h *Handler) ListBuildingFiles(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Tenant ID required")
+		return
+	}
+
+	buildingID, err := strconv.Atoi(c.Param("building_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid building ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, building_id, file_id, file_url, filename, file_size, mime_type, description, created_at, created_by
+		FROM building_files
+		WHERE tenant_id = $1 AND building_id = $2
+		ORDER BY created_at DESC
+	`, tenantID, buildingID)
+	if err != nil {
+		h.log.Error("Failed to list building files", "error", err)
+		response.InternalServerError(c, "Failed to list files")
+		return
+	}
+	defer rows.Close()
+
+	type BuildingFile struct {
+		ID          int    `json:"id"`
+		BuildingID  int    `json:"building_id"`
+		FileID      string `json:"file_id"`
+		FileURL     string `json:"file_url"`
+		Filename    string `json:"filename"`
+		FileSize    int64  `json:"file_size"`
+		MimeType    string `json:"mime_type"`
+		Description string `json:"description"`
+		CreatedAt   string `json:"created_at"`
+		CreatedBy   string `json:"created_by"`
+	}
+
+	var files []BuildingFile
+	for rows.Next() {
+		var f BuildingFile
+		var createdAt time.Time
+		if err := rows.Scan(&f.ID, &f.BuildingID, &f.FileID, &f.FileURL, &f.Filename, &f.FileSize, &f.MimeType, &f.Description, &createdAt, &f.CreatedBy); err != nil {
+			continue
+		}
+		f.CreatedAt = createdAt.Format(time.RFC3339)
+		files = append(files, f)
+	}
+
+	if files == nil {
+		files = []BuildingFile{}
+	}
+	response.Success(c, files)
+}
+
+// CreateBuildingFile adds a file reference to a building
+func (h *Handler) CreateBuildingFile(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Tenant ID required")
+		return
+	}
+
+	buildingID, err := strconv.Atoi(c.Param("building_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid building ID")
+		return
+	}
+
+	var input struct {
+		FileID      string `json:"file_id" binding:"required"`
+		FileURL     string `json:"file_url" binding:"required"`
+		Filename    string `json:"filename" binding:"required"`
+		FileSize    int64  `json:"file_size"`
+		MimeType    string `json:"mime_type"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	// Get user email from context
+	createdBy := ""
+	if email, exists := c.Get("user_email"); exists {
+		createdBy = email.(string)
+	}
+
+	var id int
+	err = h.db.QueryRow(`
+		INSERT INTO building_files (tenant_id, building_id, file_id, file_url, filename, file_size, mime_type, description, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id
+	`, tenantID, buildingID, input.FileID, input.FileURL, input.Filename, input.FileSize, input.MimeType, input.Description, createdBy).Scan(&id)
+	if err != nil {
+		h.log.Error("Failed to create building file", "error", err)
+		response.InternalServerError(c, "Failed to save file")
+		return
+	}
+
+	response.Created(c, gin.H{
+		"id":          id,
+		"building_id": buildingID,
+		"file_id":     input.FileID,
+		"file_url":    input.FileURL,
+		"filename":    input.Filename,
+		"file_size":   input.FileSize,
+		"mime_type":   input.MimeType,
+		"description": input.Description,
+		"created_by":  createdBy,
+	})
+}
+
+// DeleteBuildingFile removes a file reference from a building
+func (h *Handler) DeleteBuildingFile(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Tenant ID required")
+		return
+	}
+
+	fileID, err := strconv.Atoi(c.Param("file_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid file ID")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		DELETE FROM building_files WHERE id = $1 AND tenant_id = $2
+	`, fileID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete building file", "error", err)
+		response.InternalServerError(c, "Failed to delete file")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "File")
+		return
+	}
+
+	response.NoContent(c)
+}
