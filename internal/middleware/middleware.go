@@ -449,6 +449,21 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"dashboard":     {"dashboard"},
 	}
 
+	// Cross-module dependencies: when a user has access to one module,
+	// they also need read access to supporting resources from other modules.
+	crossModuleGrants := map[string][]string{
+		"hr":            {"organization:department", "organization:organization", "users:role"},
+		"inventory":     {"settings:tenant"},
+		"sales":         {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "inventory:product_attribute"},
+		"purchase":      {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant"},
+		"finance":       {"settings:tenant"},
+		"manufacturing": {"inventory:product", "inventory:bom", "inventory:warehouse"},
+		"construction":  {"organization:organization", "hr:employee", "inventory:product", "inventory:warehouse"},
+		"assets":        {"finance:asset", "finance:report"},
+		"expenses":      {"finance:expense", "finance:report"},
+		"payroll":       {"hr:employee"},
+	}
+
 	for empRows.Next() {
 		var moduleID string
 		var canCreate, canRead, canUpdate, canDelete bool
@@ -471,9 +486,23 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 			}
 			if canUpdate {
 				perms[moduleID+":"+res+":update"] = true
+				// Grant special actions that map to update permission
+				perms[moduleID+":"+res+":manage"] = true
+				perms[moduleID+":"+res+":adjust"] = true
+				perms[moduleID+":"+res+":transfer"] = true
+				perms[moduleID+":"+res+":approve"] = true
+				perms[moduleID+":"+res+":confirm"] = true
 			}
 			if canDelete {
 				perms[moduleID+":"+res+":delete"] = true
+			}
+		}
+
+		// Grant cross-module dependencies (e.g. HR needs organization:department:read)
+		if grants, ok := crossModuleGrants[moduleID]; ok && canRead {
+			for _, grant := range grants {
+				perms[grant+":read"] = true
+				perms[grant+":manage"] = true // warehouse listing requires manage
 			}
 		}
 	}
