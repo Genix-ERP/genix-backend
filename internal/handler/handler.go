@@ -1618,6 +1618,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/buildings", h.perm.Require("construction", "project", "create"), h.CreateConstructionBuilding)
 		constructionProjects.PUT("/:id/buildings/:building_id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionBuilding)
 		constructionProjects.DELETE("/:id/buildings/:building_id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionBuilding)
+		// Building Files
+		constructionProjects.GET("/:id/buildings/:building_id/files", h.ListBuildingFiles)
+		constructionProjects.POST("/:id/buildings/:building_id/files", h.perm.Require("construction", "project", "create"), h.CreateBuildingFile)
+		constructionProjects.DELETE("/:id/buildings/:building_id/files/:file_id", h.perm.Require("construction", "project", "delete"), h.DeleteBuildingFile)
 		// Smeta Sections
 		constructionProjects.GET("/:id/sections", h.ListSmetaSections)
 		constructionProjects.POST("/:id/sections", h.perm.Require("construction", "smeta", "create"), h.CreateSmetaSection)
