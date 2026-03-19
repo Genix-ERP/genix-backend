@@ -380,6 +380,9 @@ func permissionCacheKey(tenantID, userID string) string {
 // through their assigned roles within the given tenant. The result is a set of
 // permission strings in the form "module:resource:action".
 func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, userID string) (map[string]bool, error) {
+	perms := make(map[string]bool)
+
+	// 1. Load from old role-based permissions (permissions + role_permissions + user_roles)
 	query := `
 		SELECT DISTINCT p.module, p.resource, p.action
 		FROM permissions p
@@ -395,7 +398,6 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 	}
 	defer rows.Close()
 
-	perms := make(map[string]bool)
 	for rows.Next() {
 		var module, resource, action string
 		if err := rows.Scan(&module, &resource, &action); err != nil {
@@ -405,6 +407,79 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating permission rows: %w", err)
+	}
+
+	// 2. Load from employee_module_permissions (new system via roles.permissions JSONB)
+	empQuery := `
+		SELECT emp.module_id, emp.can_create, emp.can_read, emp.can_update, emp.can_delete
+		FROM employee_module_permissions emp
+		INNER JOIN users u ON u.employee_id = emp.employee_id AND u.tenant_id = emp.tenant_id
+		WHERE u.id = $1 AND u.tenant_id = $2
+	`
+
+	empRows, err := pc.db.QueryContext(ctx, empQuery, userID, tenantID)
+	if err != nil {
+		// Don't fail — old system perms are still usable
+		pc.log.Error("failed to query employee module permissions", "error", err)
+		return perms, nil
+	}
+	defer empRows.Close()
+
+	// Build all known resource names per module from the permissions table
+	// so we can grant module-level access to all resources in that module
+	resourceQuery := `SELECT DISTINCT module, resource, action FROM permissions`
+	resRows, err := pc.db.QueryContext(ctx, resourceQuery)
+	if err != nil {
+		pc.log.Error("failed to query permission resources", "error", err)
+		return perms, nil
+	}
+	defer resRows.Close()
+
+	// Map: module -> []"resource:action" grouped by CRUD type
+	type resAction struct {
+		resource string
+		action   string
+	}
+	moduleResources := make(map[string][]resAction)
+	for resRows.Next() {
+		var m, r, a string
+		if err := resRows.Scan(&m, &r, &a); err == nil {
+			moduleResources[m] = append(moduleResources[m], resAction{r, a})
+		}
+	}
+
+	for empRows.Next() {
+		var moduleID string
+		var canCreate, canRead, canUpdate, canDelete bool
+		if err := empRows.Scan(&moduleID, &canCreate, &canRead, &canUpdate, &canDelete); err != nil {
+			continue
+		}
+
+		// Map CRUD flags to action names
+		allowedActions := make(map[string]bool)
+		if canRead {
+			allowedActions["read"] = true
+			allowedActions["manage"] = true
+		}
+		if canCreate {
+			allowedActions["create"] = true
+		}
+		if canUpdate {
+			allowedActions["update"] = true
+			allowedActions["adjust"] = true
+			allowedActions["transfer"] = true
+			allowedActions["assign"] = true
+		}
+		if canDelete {
+			allowedActions["delete"] = true
+		}
+
+		// Grant all matching resource:action pairs for this module
+		for _, ra := range moduleResources[moduleID] {
+			if allowedActions[ra.action] {
+				perms[moduleID+":"+ra.resource+":"+ra.action] = true
+			}
+		}
 	}
 
 	return perms, nil
