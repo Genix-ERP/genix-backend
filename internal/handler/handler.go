@@ -1401,6 +1401,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workCenters.GET("/:id", h.GetWorkCenter)
 		workCenters.PUT("/:id", h.perm.Require("manufacturing", "work_centers", "update"), h.UpdateWorkCenter)
 		workCenters.DELETE("/:id", h.perm.Require("manufacturing", "work_centers", "delete"), h.DeleteWorkCenter)
+		workCenters.GET("/:id/employees", h.ListWorkCenterEmployees)
+		workCenters.POST("/:id/employees", h.perm.Require("manufacturing", "work_centers", "update"), h.AssignWorkCenterEmployees)
+		workCenters.DELETE("/:id/employees/:employee_id", h.perm.Require("manufacturing", "work_centers", "update"), h.RemoveWorkCenterEmployee)
 	}
 
 	// Production Orders
