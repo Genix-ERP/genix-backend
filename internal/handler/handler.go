@@ -56,6 +56,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		protected.Use(middleware.OrganizationResolver())
 		h.registerProtectedRoutes(protected)
 	}
+
+	// Tender platform routes (separate module with own auth flow)
+	h.RegisterTenderRoutes(r)
 }
 
 // registerPublicRoutes registers routes that don't require authentication

@@ -53,25 +53,40 @@ func (h *Handler) authenticateOnlinePBX(domain, apiKey string) (*onlinePBXAuth, 
 	}
 	defer resp.Body.Close()
 
-	var result struct {
-		Status bool `json:"status"`
-		Data   struct {
-			KeyID string `json:"key_id"`
-			Key   string `json:"key"`
-		} `json:"data"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, fmt.Errorf("failed to decode auth response: %w", err)
 	}
 
-	if !result.Status {
+	// Status can be bool (true) or string ("1"/"0")
+	statusOK := false
+	if s, ok := raw["status"]; ok {
+		str := strings.Trim(string(s), "\"")
+		statusOK = str == "true" || str == "1"
+	}
+
+	if !statusOK {
+		comment := ""
+		if c, ok := raw["comment"]; ok {
+			comment = strings.Trim(string(c), "\"")
+		}
+		if comment != "" {
+			return nil, fmt.Errorf("authentication failed: %s", comment)
+		}
 		return nil, fmt.Errorf("authentication failed")
 	}
 
+	var data struct {
+		KeyID string `json:"key_id"`
+		Key   string `json:"key"`
+	}
+	if d, ok := raw["data"]; ok {
+		json.Unmarshal(d, &data)
+	}
+
 	return &onlinePBXAuth{
-		KeyID: result.Data.KeyID,
-		Key:   result.Data.Key,
+		KeyID: data.KeyID,
+		Key:   data.Key,
 	}, nil
 }
 
@@ -237,17 +252,24 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	var callResult struct {
-		Status bool   `json:"status"`
-		Data   map[string]interface{} `json:"data"`
-		Comment string `json:"comment"`
+	var callRaw map[string]json.RawMessage
+	json.NewDecoder(resp.Body).Decode(&callRaw)
+
+	callStatusOK := false
+	if s, ok := callRaw["status"]; ok {
+		str := strings.Trim(string(s), "\"")
+		callStatusOK = str == "true" || str == "1"
 	}
-	json.NewDecoder(resp.Body).Decode(&callResult)
+
+	var callData map[string]interface{}
+	if d, ok := callRaw["data"]; ok {
+		json.Unmarshal(d, &callData)
+	}
 
 	// Extract call UUID from response
 	pbxCallID := ""
-	if callResult.Data != nil {
-		if uid, ok := callResult.Data["uuid"].(string); ok {
+	if callData != nil {
+		if uid, ok := callData["uuid"].(string); ok {
 			pbxCallID = uid
 		}
 	}
@@ -280,11 +302,16 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 		h.log.Error("Failed to create call log", "error", err)
 	}
 
+	callComment := ""
+	if c2, ok := callRaw["comment"]; ok {
+		callComment = strings.Trim(string(c2), "\"")
+	}
+
 	response.Success(c, gin.H{
-		"success":     callResult.Status,
+		"success":     callStatusOK,
 		"call_id":     callLogID,
 		"pbx_call_id": pbxCallID,
-		"comment":     callResult.Comment,
+		"comment":     callComment,
 	})
 }
 
@@ -325,9 +352,32 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	var data map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &data); err != nil {
-		c.String(http.StatusBadRequest, "invalid JSON")
-		return
+	contentType := c.GetHeader("Content-Type")
+	if strings.Contains(contentType, "application/json") {
+		if err := json.Unmarshal(bodyBytes, &data); err != nil {
+			c.String(http.StatusBadRequest, "invalid JSON")
+			return
+		}
+	} else {
+		// Handle form-encoded data (OnlinePBX sends this format)
+		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		_ = c.Request.ParseForm()
+		data = make(map[string]interface{})
+		for k, v := range c.Request.PostForm {
+			if len(v) == 1 {
+				data[k] = v[0]
+			} else {
+				data[k] = v
+			}
+		}
+		// Also check query params
+		for k, v := range c.Request.URL.Query() {
+			if _, exists := data[k]; !exists {
+				if len(v) == 1 {
+					data[k] = v[0]
+				}
+			}
+		}
 	}
 
 	h.log.Info("PBX webhook received", "data", data)
