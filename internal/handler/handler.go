@@ -1436,6 +1436,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.POST("/:id/pause", h.PauseWorkOrder)
 		workOrders.POST("/:id/complete", h.CompleteWorkOrder)
 		workOrders.POST("/:id/time", h.RecordWorkOrderTime)
+		workOrders.GET("/:id/materials", h.ListWorkOrderMaterials)
+		workOrders.POST("/:id/materials", h.AddWorkOrderMaterial)
+		workOrders.DELETE("/:id/materials/:material_id", h.RemoveWorkOrderMaterial)
 	}
 
 	// Manufacturing Transfers (Pick Components / Store Finished)

@@ -1922,3 +1922,176 @@ func (h *Handler) transferToFinishedGoodsWarehouse(
 		h.log.Info("transferToFG: finished goods transferred", "po_id", poID, "qty", qty, "from", productionWarehouseID, "to", fgWarehouseID)
 	}
 }
+
+// =====================================================
+// WORK ORDER MATERIALS
+// =====================================================
+
+func (h *Handler) ListWorkOrderMaterials(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	woID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	query := `
+		SELECT id, product_id, product_name, quantity, uom, unit_cost, total_cost, notes, created_at
+		FROM work_order_materials
+		WHERE tenant_id = $1 AND work_order_id = $2
+		ORDER BY created_at DESC`
+
+	rows, err := h.db.Query(query, tenantID, woID)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch materials")
+		return
+	}
+	defer rows.Close()
+
+	var materials []entity.WorkOrderMaterialResponse
+	var totalCost float64
+	for rows.Next() {
+		var m entity.WorkOrderMaterialResponse
+		if err := rows.Scan(&m.ID, &m.ProductID, &m.ProductName, &m.Quantity, &m.UOM,
+			&m.UnitCost, &m.TotalCost, &m.Notes, &m.CreatedAt); err != nil {
+			response.InternalError(c, "Failed to scan material")
+			return
+		}
+		totalCost += m.TotalCost
+		materials = append(materials, m)
+	}
+
+	if materials == nil {
+		materials = []entity.WorkOrderMaterialResponse{}
+	}
+
+	response.Success(c, gin.H{"materials": materials, "total_cost": totalCost})
+}
+
+func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	woID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	var input entity.WorkOrderMaterialInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	if input.Quantity <= 0 {
+		response.BadRequest(c, "Quantity must be greater than 0")
+		return
+	}
+
+	// Get work order to find production_order_id
+	var poID uuid.UUID
+	err = h.db.QueryRow(`SELECT production_order_id FROM work_orders WHERE id = $1 AND tenant_id = $2`, woID, tenantID).Scan(&poID)
+	if err != nil {
+		response.NotFound(c, "Work order not found")
+		return
+	}
+
+	// Get product name and cost from products table
+	var productName string
+	var productCost float64
+	err = h.db.QueryRow(`SELECT name, COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2`, input.ProductID, tenantID).Scan(&productName, &productCost)
+	if err != nil {
+		response.NotFound(c, "Product not found")
+		return
+	}
+
+	unitCost := input.UnitCost
+	if unitCost == 0 {
+		unitCost = productCost
+	}
+	totalCost := unitCost * input.Quantity
+
+	if input.UOM == "" {
+		input.UOM = "pcs"
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	id := uuid.New()
+	_, err = h.db.Exec(`
+		INSERT INTO work_order_materials (id, tenant_id, work_order_id, production_order_id, product_id, product_name, quantity, uom, unit_cost, total_cost, notes, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		id, tenantID, woID, poID, input.ProductID, productName, input.Quantity, input.UOM, unitCost, totalCost, input.Notes, userID)
+	if err != nil {
+		response.InternalError(c, "Failed to add material: "+err.Error())
+		return
+	}
+
+	// Update production order material_cost
+	h.db.Exec(`
+		UPDATE production_orders SET material_cost = COALESCE(
+			(SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0
+		) WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
+
+	response.Success(c, gin.H{
+		"id":           id,
+		"product_id":   input.ProductID,
+		"product_name": productName,
+		"quantity":     input.Quantity,
+		"uom":          input.UOM,
+		"unit_cost":    unitCost,
+		"total_cost":   totalCost,
+		"message":      "Material added",
+	})
+}
+
+func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	materialID, err := uuid.Parse(c.Param("material_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid material ID")
+		return
+	}
+
+	// Get production_order_id before deleting
+	var poID uuid.UUID
+	err = h.db.QueryRow(`SELECT production_order_id FROM work_order_materials WHERE id = $1 AND tenant_id = $2`, materialID, tenantID).Scan(&poID)
+	if err != nil {
+		response.NotFound(c, "Material not found")
+		return
+	}
+
+	result, err := h.db.Exec(`DELETE FROM work_order_materials WHERE id = $1 AND tenant_id = $2`, materialID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to remove material")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Material not found")
+		return
+	}
+
+	// Update production order material_cost
+	h.db.Exec(`
+		UPDATE production_orders SET material_cost = COALESCE(
+			(SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0
+		) WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
+
+	response.Success(c, gin.H{"message": "Material removed"})
+}

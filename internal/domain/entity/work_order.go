@@ -340,3 +340,43 @@ type WorkOrderFilter struct {
 	SortBy            string     `form:"sort_by"`
 	SortOrder         string     `form:"sort_order"`
 }
+
+// =====================================================
+// WORK ORDER MATERIALS
+// =====================================================
+
+type WorkOrderMaterial struct {
+	ID                uuid.UUID  `json:"id" db:"id"`
+	TenantID          uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	WorkOrderID       uuid.UUID  `json:"work_order_id" db:"work_order_id"`
+	ProductionOrderID uuid.UUID  `json:"production_order_id" db:"production_order_id"`
+	ProductID         uuid.UUID  `json:"product_id" db:"product_id"`
+	ProductName       string     `json:"product_name" db:"product_name"`
+	Quantity          float64    `json:"quantity" db:"quantity"`
+	UOM               string     `json:"uom" db:"uom"`
+	UnitCost          float64    `json:"unit_cost" db:"unit_cost"`
+	TotalCost         float64    `json:"total_cost" db:"total_cost"`
+	Notes             *string    `json:"notes,omitempty" db:"notes"`
+	CreatedBy         *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+}
+
+type WorkOrderMaterialInput struct {
+	ProductID uuid.UUID `json:"product_id" binding:"required"`
+	Quantity  float64   `json:"quantity" binding:"required"`
+	UOM       string    `json:"uom"`
+	UnitCost  float64   `json:"unit_cost"`
+	Notes     *string   `json:"notes,omitempty"`
+}
+
+type WorkOrderMaterialResponse struct {
+	ID          uuid.UUID `json:"id"`
+	ProductID   uuid.UUID `json:"product_id"`
+	ProductName string    `json:"product_name"`
+	Quantity    float64   `json:"quantity"`
+	UOM         string    `json:"uom"`
+	UnitCost    float64   `json:"unit_cost"`
+	TotalCost   float64   `json:"total_cost"`
+	Notes       *string   `json:"notes,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
