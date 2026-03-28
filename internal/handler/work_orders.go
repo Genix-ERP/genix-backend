@@ -2043,14 +2043,27 @@ func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
 	}
 
 	// Deduct from inventory (same pattern as consumeBOMComponents)
-	if warehouseID != nil {
+	{
 		var invID uuid.UUID
 		var invUnitCost float64
-		invErr := h.db.QueryRow(`
-			SELECT id, COALESCE(unit_cost, 0) FROM inventory
-			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-			AND lot_number IS NULL AND serial_number IS NULL
-		`, tenantID, input.ProductID, warehouseID).Scan(&invID, &invUnitCost)
+		var invErr error
+		if warehouseID != nil {
+			invErr = h.db.QueryRow(`
+				SELECT id, COALESCE(unit_cost, 0) FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+				AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
+				LIMIT 1
+			`, tenantID, input.ProductID, warehouseID).Scan(&invID, &invUnitCost)
+		}
+		// Fallback: find any inventory record for this product
+		if invErr != nil || warehouseID == nil {
+			invErr = h.db.QueryRow(`
+				SELECT id, COALESCE(unit_cost, 0) FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2
+				AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
+				ORDER BY quantity_on_hand DESC LIMIT 1
+			`, tenantID, input.ProductID).Scan(&invID, &invUnitCost)
+		}
 
 		if invErr == nil {
 			h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
@@ -2066,11 +2079,12 @@ func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
 		}
 	}
 
-	// Update production order material_cost
+	// Update production order material_cost and actual_cost
 	h.db.Exec(`
-		UPDATE production_orders SET material_cost = COALESCE(
-			(SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0
-		) WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
+		UPDATE production_orders SET
+			material_cost = COALESCE((SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0),
+			actual_cost = COALESCE((SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0)
+		WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
 
 	response.Success(c, gin.H{
 		"id":           id,
@@ -2120,15 +2134,28 @@ func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
 	}
 
 	// Restore inventory
-	var warehouseID *uuid.UUID
-	h.db.QueryRow(`SELECT warehouse_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&warehouseID)
-	if warehouseID != nil {
+	{
+		var warehouseID *uuid.UUID
+		h.db.QueryRow(`SELECT warehouse_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&warehouseID)
+
 		var invID uuid.UUID
-		invErr := h.db.QueryRow(`
-			SELECT id FROM inventory
-			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-			AND lot_number IS NULL AND serial_number IS NULL
-		`, tenantID, productID, warehouseID).Scan(&invID)
+		var invErr error
+		if warehouseID != nil {
+			invErr = h.db.QueryRow(`
+				SELECT id FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+				AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
+				LIMIT 1
+			`, tenantID, productID, warehouseID).Scan(&invID)
+		}
+		if invErr != nil || warehouseID == nil {
+			invErr = h.db.QueryRow(`
+				SELECT id FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2
+				AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
+				ORDER BY quantity_on_hand DESC LIMIT 1
+			`, tenantID, productID).Scan(&invID)
+		}
 		if invErr == nil {
 			now := time.Now()
 			h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
@@ -2148,11 +2175,12 @@ func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
 		}
 	}
 
-	// Update production order material_cost
+	// Update production order material_cost and actual_cost
 	h.db.Exec(`
-		UPDATE production_orders SET material_cost = COALESCE(
-			(SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0
-		) WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
+		UPDATE production_orders SET
+			material_cost = COALESCE((SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0),
+			actual_cost = COALESCE((SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0)
+		WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
 
 	response.Success(c, gin.H{"message": "Material removed"})
 }
