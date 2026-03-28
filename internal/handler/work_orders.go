@@ -2005,6 +2005,11 @@ func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
 		return
 	}
 
+	// Get production order warehouse and organization
+	var warehouseID *uuid.UUID
+	var organizationID *uuid.UUID
+	h.db.QueryRow(`SELECT warehouse_id, organization_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&warehouseID, &organizationID)
+
 	// Get product name and cost from products table
 	var productName string
 	var productCost float64
@@ -2025,6 +2030,7 @@ func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+	now := time.Now()
 
 	id := uuid.New()
 	_, err = h.db.Exec(`
@@ -2034,6 +2040,30 @@ func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
 	if err != nil {
 		response.InternalError(c, "Failed to add material: "+err.Error())
 		return
+	}
+
+	// Deduct from inventory (same pattern as consumeBOMComponents)
+	if warehouseID != nil {
+		var invID uuid.UUID
+		var invUnitCost float64
+		invErr := h.db.QueryRow(`
+			SELECT id, COALESCE(unit_cost, 0) FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+			AND lot_number IS NULL AND serial_number IS NULL
+		`, tenantID, input.ProductID, warehouseID).Scan(&invID, &invUnitCost)
+
+		if invErr == nil {
+			h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+				input.Quantity, now, invID)
+
+			h.db.Exec(`
+				INSERT INTO inventory_transactions (
+					id, tenant_id, organization_id, inventory_id, transaction_type,
+					reference_type, reference_id, quantity, unit_cost, total_cost,
+					reason, notes, transaction_date, created_by, created_at
+				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Work order material consumption',$9,$10,$9)
+			`, uuid.New(), tenantID, organizationID, invID, poID, input.Quantity, invUnitCost, input.Quantity*invUnitCost, now, userID)
+		}
 	}
 
 	// Update production order material_cost
@@ -2067,9 +2097,11 @@ func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
 		return
 	}
 
-	// Get production_order_id before deleting
+	// Get material details before deleting (for inventory restoration)
 	var poID uuid.UUID
-	err = h.db.QueryRow(`SELECT production_order_id FROM work_order_materials WHERE id = $1 AND tenant_id = $2`, materialID, tenantID).Scan(&poID)
+	var productID uuid.UUID
+	var quantity float64
+	err = h.db.QueryRow(`SELECT production_order_id, product_id, quantity FROM work_order_materials WHERE id = $1 AND tenant_id = $2`, materialID, tenantID).Scan(&poID, &productID, &quantity)
 	if err != nil {
 		response.NotFound(c, "Material not found")
 		return
@@ -2085,6 +2117,35 @@ func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
 	if rowsAffected == 0 {
 		response.NotFound(c, "Material not found")
 		return
+	}
+
+	// Restore inventory
+	var warehouseID *uuid.UUID
+	h.db.QueryRow(`SELECT warehouse_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&warehouseID)
+	if warehouseID != nil {
+		var invID uuid.UUID
+		invErr := h.db.QueryRow(`
+			SELECT id FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+			AND lot_number IS NULL AND serial_number IS NULL
+		`, tenantID, productID, warehouseID).Scan(&invID)
+		if invErr == nil {
+			now := time.Now()
+			h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+				quantity, now, invID)
+
+			userID, _ := middleware.GetUserID(c)
+			var organizationID *uuid.UUID
+			h.db.QueryRow(`SELECT organization_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&organizationID)
+
+			h.db.Exec(`
+				INSERT INTO inventory_transactions (
+					id, tenant_id, organization_id, inventory_id, transaction_type,
+					reference_type, reference_id, quantity, unit_cost, total_cost,
+					reason, notes, transaction_date, created_by, created_at
+				) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,0,0,'material_return','Work order material removed',$7,$8,$7)
+			`, uuid.New(), tenantID, organizationID, invID, poID, quantity, now, userID)
+		}
 	}
 
 	// Update production order material_cost
