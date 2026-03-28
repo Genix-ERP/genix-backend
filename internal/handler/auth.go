@@ -1304,10 +1304,17 @@ func (h *Handler) SendOTP(c *gin.Context) {
 		// Don't fail the request - OTP is stored, user can request resend
 	}
 
-	response.Success(c, gin.H{
+	result := gin.H{
 		"message":    "OTP code sent successfully",
 		"expires_at": expiresAt,
-	})
+	}
+
+	// In development mode, include OTP in response (email won't actually be sent)
+	if h.config.App.Env == "development" {
+		result["dev_otp_code"] = otpCode
+	}
+
+	response.Success(c, result)
 }
 
 // VerifyOTP verifies an OTP code for the specified email
