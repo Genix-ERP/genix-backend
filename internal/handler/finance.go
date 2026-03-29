@@ -1107,6 +1107,7 @@ func (h *Handler) ListJournals(c *gin.Context) {
 
 	query := `
 		SELECT j.id, j.code, j.name, j.type,
+			COALESCE(j.name_uz, ''), COALESCE(j.name_en, ''),
 			COALESCE(j.description, ''),
 			j.default_debit_account_id,
 			j.default_credit_account_id,
@@ -1149,6 +1150,8 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		ID                     uuid.UUID  `json:"id"`
 		Code                   string     `json:"code"`
 		Name                   string     `json:"name"`
+		NameUz                 string     `json:"name_uz,omitempty"`
+		NameEn                 string     `json:"name_en,omitempty"`
 		Type                   string     `json:"type"`
 		Description            string     `json:"description,omitempty"`
 		DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty"`
@@ -1170,7 +1173,7 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	journals := make([]JournalResponse, 0)
 	for rows.Next() {
 		var j JournalResponse
-		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.Description,
+		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.Type, &j.NameUz, &j.NameEn, &j.Description,
 			&j.DefaultDebitAccountID, &j.DefaultCreditAccountID,
 			&j.AutoSequence, &j.NextNumber, &j.NumberPrefix,
 			&j.ShortCode, &j.Currency,
