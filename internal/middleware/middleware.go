@@ -377,12 +377,12 @@ func permissionCacheKey(tenantID, userID string) string {
 }
 
 // loadPermissions queries the database for all permissions granted to the user
-// through their assigned roles within the given tenant. The result is a set of
-// permission strings in the form "module:resource:action".
+// through their assigned roles and employee module permissions within the given tenant.
+// The result is a set of permission strings in the form "module:resource:action".
 func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, userID string) (map[string]bool, error) {
 	perms := make(map[string]bool)
 
-	// 1. Load from old role-based permissions (permissions + role_permissions + user_roles)
+	// 1. Load from old role_permissions system (backward compat)
 	query := `
 		SELECT DISTINCT p.module, p.resource, p.action
 		FROM permissions p
@@ -409,7 +409,7 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		return nil, fmt.Errorf("error iterating permission rows: %w", err)
 	}
 
-	// 2. Load from employee_module_permissions (new system via roles.permissions JSONB)
+	// 2. Load from employee_module_permissions (via user -> employee link)
 	empQuery := `
 		SELECT emp.module_id, emp.can_create, emp.can_read, emp.can_update, emp.can_delete
 		FROM employee_module_permissions emp
@@ -419,33 +419,49 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 
 	empRows, err := pc.db.QueryContext(ctx, empQuery, userID, tenantID)
 	if err != nil {
-		// Don't fail — old system perms are still usable
-		pc.log.Error("failed to query employee module permissions", "error", err)
+		// Don't fail entirely, just log and continue with what we have
 		return perms, nil
 	}
 	defer empRows.Close()
 
-	// Build all known resource names per module from the permissions table
-	// so we can grant module-level access to all resources in that module
-	resourceQuery := `SELECT DISTINCT module, resource, action FROM permissions`
-	resRows, err := pc.db.QueryContext(ctx, resourceQuery)
-	if err != nil {
-		pc.log.Error("failed to query permission resources", "error", err)
-		return perms, nil
+	// Collect all known resources per module so we can grant granular permissions
+	resourceMap := map[string][]string{
+		"inventory":     {"product", "warehouse", "stock", "category", "lot", "bom", "carrier", "product_attribute", "product_variant", "reorder", "scrap"},
+		"sales":         {"order", "invoice", "customer", "quotation", "payment", "delivery", "discount", "dropship", "pricelist", "quotation_template", "return", "payment_term"},
+		"purchase":      {"order", "vendor", "bill", "rfq", "contract", "invoice", "price_history", "purchase_order", "receipt", "requisition", "return", "rule"},
+		"hr":            {"employee", "department", "payroll", "contract", "attendance", "leave"},
+		"finance":       {"account", "journal", "journal_entry", "transaction", "report", "budget", "asset", "bank_account", "cash", "cash_transaction", "currency", "expense", "followup", "followup_level", "payment", "reconciliation", "tax_report"},
+		"crm":           {"contact", "lead", "opportunity", "pipeline"},
+		"organization":  {"organization", "department"},
+		"users":         {"user", "role"},
+		"projects":      {"project", "task", "milestone", "expense", "time_entry"},
+		"manufacturing": {"production_orders", "work_orders", "work_centers", "transfers"},
+		"assets":        {"asset", "category", "depreciation"},
+		"expenses":      {"expense", "report", "category"},
+		"ai":            {"conversation"},
+		"audit":         {"log"},
+		"settings":      {"organization", "tenant"},
+		"workflow":      {"workflow"},
+		"contracts":     {"contract"},
+		"cargo":         {"shipment", "distribution", "cash"},
+		"construction":  {"project", "projects", "estimate", "smeta", "wbs", "daily_log", "reports"},
+		"payroll":       {"payroll", "employee"},
+		"dashboard":     {"dashboard"},
 	}
-	defer resRows.Close()
 
-	// Map: module -> []"resource:action" grouped by CRUD type
-	type resAction struct {
-		resource string
-		action   string
-	}
-	moduleResources := make(map[string][]resAction)
-	for resRows.Next() {
-		var m, r, a string
-		if err := resRows.Scan(&m, &r, &a); err == nil {
-			moduleResources[m] = append(moduleResources[m], resAction{r, a})
-		}
+	// Cross-module dependencies: when a user has access to one module,
+	// they also need read access to supporting resources from other modules.
+	crossModuleGrants := map[string][]string{
+		"hr":            {"organization:department", "organization:organization", "users:role"},
+		"inventory":     {"settings:tenant"},
+		"sales":         {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "inventory:product_attribute"},
+		"purchase":      {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant"},
+		"finance":       {"settings:tenant"},
+		"manufacturing": {"inventory:product", "inventory:bom", "inventory:warehouse"},
+		"construction":  {"organization:organization", "hr:employee", "inventory:product", "inventory:warehouse"},
+		"assets":        {"finance:asset", "finance:report"},
+		"expenses":      {"finance:expense", "finance:report"},
+		"payroll":       {"hr:employee"},
 	}
 
 	for empRows.Next() {
@@ -455,29 +471,38 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 			continue
 		}
 
-		// Map CRUD flags to action names
-		allowedActions := make(map[string]bool)
-		if canRead {
-			allowedActions["read"] = true
-			allowedActions["manage"] = true
-		}
-		if canCreate {
-			allowedActions["create"] = true
-		}
-		if canUpdate {
-			allowedActions["update"] = true
-			allowedActions["adjust"] = true
-			allowedActions["transfer"] = true
-			allowedActions["assign"] = true
-		}
-		if canDelete {
-			allowedActions["delete"] = true
+		resources, ok := resourceMap[moduleID]
+		if !ok {
+			// Unknown module — grant wildcard-style with module as resource
+			resources = []string{moduleID}
 		}
 
-		// Grant all matching resource:action pairs for this module
-		for _, ra := range moduleResources[moduleID] {
-			if allowedActions[ra.action] {
-				perms[moduleID+":"+ra.resource+":"+ra.action] = true
+		for _, res := range resources {
+			if canCreate {
+				perms[moduleID+":"+res+":create"] = true
+			}
+			if canRead {
+				perms[moduleID+":"+res+":read"] = true
+			}
+			if canUpdate {
+				perms[moduleID+":"+res+":update"] = true
+				// Grant special actions that map to update permission
+				perms[moduleID+":"+res+":manage"] = true
+				perms[moduleID+":"+res+":adjust"] = true
+				perms[moduleID+":"+res+":transfer"] = true
+				perms[moduleID+":"+res+":approve"] = true
+				perms[moduleID+":"+res+":confirm"] = true
+			}
+			if canDelete {
+				perms[moduleID+":"+res+":delete"] = true
+			}
+		}
+
+		// Grant cross-module dependencies (e.g. HR needs organization:department:read)
+		if grants, ok := crossModuleGrants[moduleID]; ok && canRead {
+			for _, grant := range grants {
+				perms[grant+":read"] = true
+				perms[grant+":manage"] = true // warehouse listing requires manage
 			}
 		}
 	}

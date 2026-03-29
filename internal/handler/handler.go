@@ -109,6 +109,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		auth.PUT("/me/password", h.ChangePassword)
 		auth.POST("/send-invite", h.SendInvite) // Send invitation to a user
 		auth.GET("/me/permissions", h.GetCurrentUserPermissions) // Get current user's module permissions
+		auth.GET("/me/organizations", h.GetCurrentUserOrganizations)
 	}
 
 	// Users
@@ -1403,6 +1404,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workCenters.GET("/:id", h.GetWorkCenter)
 		workCenters.PUT("/:id", h.perm.Require("manufacturing", "work_centers", "update"), h.UpdateWorkCenter)
 		workCenters.DELETE("/:id", h.perm.Require("manufacturing", "work_centers", "delete"), h.DeleteWorkCenter)
+		workCenters.GET("/:id/employees", h.ListWorkCenterEmployees)
+		workCenters.POST("/:id/employees", h.perm.Require("manufacturing", "work_centers", "update"), h.AssignWorkCenterEmployees)
+		workCenters.DELETE("/:id/employees/:employee_id", h.perm.Require("manufacturing", "work_centers", "update"), h.RemoveWorkCenterEmployee)
 	}
 
 	// Production Orders
@@ -1435,6 +1439,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.POST("/:id/pause", h.PauseWorkOrder)
 		workOrders.POST("/:id/complete", h.CompleteWorkOrder)
 		workOrders.POST("/:id/time", h.RecordWorkOrderTime)
+		workOrders.GET("/:id/materials", h.ListWorkOrderMaterials)
+		workOrders.POST("/:id/materials", h.AddWorkOrderMaterial)
+		workOrders.DELETE("/:id/materials/:material_id", h.RemoveWorkOrderMaterial)
 	}
 
 	// Manufacturing Transfers (Pick Components / Store Finished)
