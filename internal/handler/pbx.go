@@ -37,14 +37,14 @@ type onlinePBXAuth struct {
 }
 
 func (h *Handler) authenticateOnlinePBX(domain, apiKey string) (*onlinePBXAuth, error) {
-	url := fmt.Sprintf("https://api2.onlinepbx.ru/%s/auth.json", domain)
+	authURL := fmt.Sprintf("https://api2.onlinepbx.ru/%s/auth.json", domain)
 
-	body, _ := json.Marshal(map[string]string{"auth_key": apiKey})
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	formData := fmt.Sprintf("auth_key=%s", apiKey)
+	req, err := http.NewRequest("POST", authURL, strings.NewReader(formData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create auth request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
@@ -232,15 +232,12 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 		fromExt = config.Extension
 	}
 
-	// Initiate call via OnlinePBX
+	// Initiate call via OnlinePBX (form-encoded, not JSON)
 	callURL := fmt.Sprintf("https://api2.onlinepbx.ru/%s/call/now.json", config.Domain)
-	callBody, _ := json.Marshal(map[string]string{
-		"from": fromExt,
-		"to":   input.Phone,
-	})
+	callFormData := fmt.Sprintf("from=%s&to=%s", fromExt, input.Phone)
 
-	req, _ := http.NewRequest("POST", callURL, bytes.NewBuffer(callBody))
-	req.Header.Set("Content-Type", "application/json")
+	req, _ := http.NewRequest("POST", callURL, strings.NewReader(callFormData))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("x-pbx-authentication", fmt.Sprintf("%s:%s", auth.KeyID, auth.Key))
 
 	client := &http.Client{Timeout: 30 * time.Second}
