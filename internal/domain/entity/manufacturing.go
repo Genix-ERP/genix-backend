@@ -131,6 +131,34 @@ type WorkCenterFilter struct {
 }
 
 // =====================================================
+// WORK CENTER EMPLOYEE ENTITIES
+// =====================================================
+
+type WorkCenterEmployee struct {
+	ID           uuid.UUID `json:"id" db:"id"`
+	TenantID     uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	WorkCenterID uuid.UUID `json:"work_center_id" db:"work_center_id"`
+	EmployeeID   uuid.UUID `json:"employee_id" db:"employee_id"`
+	Role         string    `json:"role" db:"role"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+}
+
+type WorkCenterEmployeeInput struct {
+	EmployeeIDs []uuid.UUID `json:"employee_ids" binding:"required"`
+	Role        string      `json:"role"`
+}
+
+type WorkCenterEmployeeResponse struct {
+	ID             uuid.UUID `json:"id"`
+	EmployeeID     uuid.UUID `json:"employee_id"`
+	EmployeeName   string    `json:"employee_name"`
+	EmployeeNumber string    `json:"employee_number"`
+	JobTitle       *string   `json:"job_title,omitempty"`
+	Role           string    `json:"role"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// =====================================================
 // PRODUCTION ORDER ENTITIES
 // =====================================================
 

@@ -288,6 +288,11 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 		&wc.ID, &wc.Code, &wc.Name, &wc.Description, &wc.WarehouseID, &warehouseName,
 		&wc.Department, &wc.CapacityPerHour, &wc.EfficiencyFactor, &wc.OEETarget,
 		&wc.WorkingHoursPerDay, &wc.HourlyCost, &wc.SetupCost, &wc.OverheadCost,
+		&wc.AssetValue, &wc.UsefulLifeYears,
+		&wc.PowerKW, &wc.ElectricityRate,
+		&wc.AnnualMaintenance, &wc.OperatorMonthlySalary,
+		&wc.DepreciationPerHour, &wc.ElectricityPerHour,
+		&wc.MaintenancePerHour, &wc.LaborPerHour,
 		&wc.Currency, &wc.Status, &wc.IsAvailable, &nextMaint,
 		&lastMaint, &wc.TotalJobsCompleted, &wc.TotalHoursWorked,
 		&wc.CurrentUtilization, &wc.Notes, &wc.CreatedAt, &wc.UpdatedAt,
@@ -4197,4 +4202,143 @@ func (h *Handler) DeleteManufacturingCategory(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"message": "Manufacturing category deleted"})
+}
+
+// =====================================================
+// WORK CENTER EMPLOYEES
+// =====================================================
+
+func (h *Handler) ListWorkCenterEmployees(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	wcID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work center ID")
+		return
+	}
+
+	query := `
+		SELECT wce.id, wce.employee_id,
+			CONCAT(e.first_name, ' ', e.last_name) as employee_name,
+			e.employee_number, e.job_title, wce.role, wce.created_at
+		FROM work_center_employees wce
+		JOIN employees e ON e.id = wce.employee_id
+		WHERE wce.tenant_id = $1 AND wce.work_center_id = $2
+		ORDER BY e.first_name, e.last_name`
+
+	rows, err := h.db.Query(query, tenantID, wcID)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch work center employees")
+		return
+	}
+	defer rows.Close()
+
+	var employees []entity.WorkCenterEmployeeResponse
+	for rows.Next() {
+		var emp entity.WorkCenterEmployeeResponse
+		if err := rows.Scan(&emp.ID, &emp.EmployeeID, &emp.EmployeeName,
+			&emp.EmployeeNumber, &emp.JobTitle, &emp.Role, &emp.CreatedAt); err != nil {
+			response.InternalError(c, "Failed to scan employee")
+			return
+		}
+		employees = append(employees, emp)
+	}
+
+	if employees == nil {
+		employees = []entity.WorkCenterEmployeeResponse{}
+	}
+
+	response.Success(c, gin.H{"employees": employees})
+}
+
+func (h *Handler) AssignWorkCenterEmployees(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	wcID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work center ID")
+		return
+	}
+
+	var input entity.WorkCenterEmployeeInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	if len(input.EmployeeIDs) == 0 {
+		response.BadRequest(c, "At least one employee ID is required")
+		return
+	}
+
+	if input.Role == "" {
+		input.Role = "operator"
+	}
+
+	// Verify work center exists
+	var exists bool
+	err = h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM work_centers WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)`,
+		wcID, tenantID).Scan(&exists)
+	if err != nil || !exists {
+		response.NotFound(c, "Work center not found")
+		return
+	}
+
+	// Insert employees (ignore duplicates)
+	query := `INSERT INTO work_center_employees (tenant_id, work_center_id, employee_id, role)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (tenant_id, work_center_id, employee_id) DO UPDATE SET role = $4`
+
+	for _, empID := range input.EmployeeIDs {
+		_, err := h.db.Exec(query, tenantID, wcID, empID, input.Role)
+		if err != nil {
+			response.InternalError(c, "Failed to assign employee: "+err.Error())
+			return
+		}
+	}
+
+	response.Success(c, gin.H{"message": fmt.Sprintf("%d employee(s) assigned", len(input.EmployeeIDs))})
+}
+
+func (h *Handler) RemoveWorkCenterEmployee(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	wcID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work center ID")
+		return
+	}
+
+	empID, err := uuid.Parse(c.Param("employee_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid employee ID")
+		return
+	}
+
+	result, err := h.db.Exec(`DELETE FROM work_center_employees WHERE tenant_id = $1 AND work_center_id = $2 AND employee_id = $3`,
+		tenantID, wcID, empID)
+	if err != nil {
+		response.InternalError(c, "Failed to remove employee")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "Employee assignment not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Employee removed from work center"})
 }

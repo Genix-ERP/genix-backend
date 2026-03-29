@@ -1901,7 +1901,9 @@ func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.
 
 		// Create a production order for the deficit
 		moID := uuid.New()
-		moCode := fmt.Sprintf("MO-%s", moID.String()[:8])
+		var moCount int
+		h.db.QueryRow("SELECT COUNT(*) FROM production_orders WHERE tenant_id = $1", tenantID).Scan(&moCount)
+		moCode := fmt.Sprintf("MO%05d", moCount+1)
 		moName := fmt.Sprintf("Auto: %s (SO)", line.Name)
 		sourceType := "sales_order"
 

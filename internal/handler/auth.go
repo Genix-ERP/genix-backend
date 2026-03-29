@@ -19,9 +19,25 @@ import (
 	"google.golang.org/api/idtoken"
 )
 
+// normalizePhone strips non-digit chars and ensures 998 prefix for Uzbekistan
+func normalizePhone(phone string) string {
+	var buf strings.Builder
+	for _, c := range phone {
+		if c >= '0' && c <= '9' {
+			buf.WriteRune(c)
+		}
+	}
+	result := buf.String()
+	if !strings.HasPrefix(result, "998") && len(result) == 9 {
+		result = "998" + result
+	}
+	return result
+}
+
 // LoginInput represents login request
 type LoginInput struct {
-	Email    string `json:"email" binding:"required,email"`
+	Email    string `json:"email" binding:"-"`
+	Phone    string `json:"phone" binding:"-"`
 	Password string `json:"password" binding:"required"`
 	TenantID string `json:"tenant_id,omitempty"`
 }
@@ -368,6 +384,32 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	// Validate: at least email or phone must be provided
+	if input.Email == "" && input.Phone == "" {
+		response.BadRequest(c, "Email or phone number is required")
+		return
+	}
+
+	// Determine login method: phone or email
+	loginByPhone := input.Phone != "" && input.Email == ""
+
+	// Normalize phone number if logging in by phone
+	if loginByPhone {
+		input.Phone = normalizePhone(input.Phone)
+	}
+
+	// The column and value to search by
+	lookupColumn := "email"
+	lookupValue := input.Email
+	if loginByPhone {
+		lookupColumn = "phone"
+		lookupValue = input.Phone
+	}
+
+	selectFields := `id, tenant_id, email, password_hash, first_name, last_name,
+		phone, avatar_url, language, timezone, is_active, is_verified,
+		is_system_admin, failed_login_attempts, locked_until, created_at, updated_at`
+
 	// Build query based on whether tenant_id is provided
 	var query string
 	var args []interface{}
@@ -378,18 +420,12 @@ func (h *Handler) Login(c *gin.Context) {
 			response.BadRequest(c, "Invalid tenant ID")
 			return
 		}
-		query = `
-			SELECT id, tenant_id, email, password_hash, first_name, last_name,
-			       phone, avatar_url, language, timezone, is_active, is_verified,
-			       is_system_admin, failed_login_attempts, locked_until, created_at, updated_at
-			FROM users
-			WHERE tenant_id = $1 AND email = $2 AND deleted_at IS NULL
-		`
-		args = []interface{}{tenantUUID, input.Email}
+		query = fmt.Sprintf(`SELECT %s FROM users WHERE tenant_id = $1 AND %s = $2 AND deleted_at IS NULL`, selectFields, lookupColumn)
+		args = []interface{}{tenantUUID, lookupValue}
 	} else {
-		// Check if email exists in multiple tenants
+		// Check if identifier exists in multiple tenants
 		var userCount int
-		err := h.db.QueryRow("SELECT COUNT(*) FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&userCount)
+		err := h.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM users WHERE %s = $1 AND deleted_at IS NULL", lookupColumn), lookupValue).Scan(&userCount)
 		if err != nil {
 			h.log.Error("Failed to count users", "error", err)
 			response.InternalServerError(c, "")
@@ -397,13 +433,13 @@ func (h *Handler) Login(c *gin.Context) {
 		}
 
 		if userCount > 1 {
-			// Multiple accounts with same email - return list of tenants for user to choose
-			rows, err := h.db.Query(`
+			// Multiple accounts - return list of tenants for user to choose
+			rows, err := h.db.Query(fmt.Sprintf(`
 				SELECT t.id, t.name, t.code
 				FROM users u
 				JOIN tenants t ON u.tenant_id = t.id
-				WHERE u.email = $1 AND u.deleted_at IS NULL AND t.is_active = true
-			`, input.Email)
+				WHERE u.%s = $1 AND u.deleted_at IS NULL AND t.is_active = true
+			`, lookupColumn), lookupValue)
 			if err != nil {
 				h.log.Error("Failed to query tenants", "error", err)
 				response.InternalServerError(c, "")
@@ -426,12 +462,12 @@ func (h *Handler) Login(c *gin.Context) {
 			}
 
 			response.Error(c, http.StatusConflict, "TENANT_SELECTION_REQUIRED",
-				"This email is associated with multiple companies. Please select one.")
+				"This account is associated with multiple companies. Please select one.")
 			c.JSON(http.StatusConflict, gin.H{
 				"success": false,
 				"error": gin.H{
 					"code":    "TENANT_SELECTION_REQUIRED",
-					"message": "This email is associated with multiple companies. Please select one.",
+					"message": "This account is associated with multiple companies. Please select one.",
 				},
 				"data": gin.H{
 					"tenants": tenants,
@@ -441,14 +477,8 @@ func (h *Handler) Login(c *gin.Context) {
 		}
 
 		// Single user - proceed with login
-		query = `
-			SELECT id, tenant_id, email, password_hash, first_name, last_name,
-			       phone, avatar_url, language, timezone, is_active, is_verified,
-			       is_system_admin, failed_login_attempts, locked_until, created_at, updated_at
-			FROM users
-			WHERE email = $1 AND deleted_at IS NULL
-		`
-		args = []interface{}{input.Email}
+		query = fmt.Sprintf(`SELECT %s FROM users WHERE %s = $1 AND deleted_at IS NULL`, selectFields, lookupColumn)
+		args = []interface{}{lookupValue}
 	}
 
 	var user entity.User
