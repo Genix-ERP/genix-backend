@@ -154,7 +154,7 @@ type UserSettings struct {
 
 // CreateUserInput represents input for creating a user
 type CreateUserInput struct {
-	Email     string   `json:"email" binding:"required,email"`
+	Email     string   `json:"email" binding:"omitempty,email"`
 	Password  string   `json:"password" binding:"-"` // Optional - if not provided, user must be invited
 	FirstName string   `json:"first_name" binding:"required,min=1,max=100"`
 	LastName  string   `json:"last_name" binding:"required,min=1,max=100"`

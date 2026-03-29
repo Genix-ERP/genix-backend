@@ -234,6 +234,19 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 	notes := fmt.Sprintf(`{"department":"%s","performance_score":%.1f,"turnover_risk":"%s"}`,
 		input.Department, input.PerformanceScore, input.TurnoverRisk)
 
+	// Check for duplicate phone
+	if input.Phone != "" {
+		var existingID uuid.UUID
+		dupErr := h.db.QueryRow(
+			"SELECT id FROM employees WHERE tenant_id = $1 AND phone = $2 AND deleted_at IS NULL",
+			tenantID, normalizePhone(input.Phone),
+		).Scan(&existingID)
+		if dupErr == nil {
+			response.Conflict(c, "Employee with this phone number already exists")
+			return
+		}
+	}
+
 	id := uuid.New()
 	now := time.Now()
 
@@ -261,7 +274,8 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		email = &input.Email
 	}
 	if input.Phone != "" {
-		phone = &input.Phone
+		normalizedPhone := normalizePhone(input.Phone)
+		phone = &normalizedPhone
 	}
 	if input.JobTitle != "" {
 		jobTitle = &input.JobTitle
@@ -293,7 +307,7 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		return
 	}
 
-	// Link the user to this employee record (if user exists with same email)
+	// Link the user to this employee record (if user exists with same email or phone)
 	if input.Email != "" {
 		_, linkErr := h.db.Exec(`
 			UPDATE users SET employee_id = $1, updated_at = $2
@@ -301,6 +315,15 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		`, id, now, tenantID, input.Email)
 		if linkErr != nil {
 			h.log.Warn("Could not link user to employee", "error", linkErr, "email", input.Email)
+		}
+	} else if input.Phone != "" {
+		normalizedPhone := normalizePhone(input.Phone)
+		_, linkErr := h.db.Exec(`
+			UPDATE users SET employee_id = $1, updated_at = $2
+			WHERE tenant_id = $3 AND phone = $4 AND employee_id IS NULL
+		`, id, now, tenantID, normalizedPhone)
+		if linkErr != nil {
+			h.log.Warn("Could not link user to employee", "error", linkErr, "phone", normalizedPhone)
 		}
 	}
 
@@ -559,6 +582,16 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 		response.NotFound(c, "Employee")
 		return
 	}
+
+	// Hard-delete the linked user record (soft-delete causes unique constraint
+	// violation on users_tenant_id_email_key when recreating with empty email)
+	h.db.Exec(`
+		DELETE FROM users WHERE tenant_id = $1 AND employee_id = $2 AND deleted_at IS NULL
+	`, tenantID, id)
+
+	// Clean up employee permissions and organization assignments
+	h.db.Exec(`DELETE FROM employee_module_permissions WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
+	h.db.Exec(`DELETE FROM employee_organizations WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
 
 	response.NoContent(c)
 }
