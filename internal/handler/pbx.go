@@ -22,12 +22,13 @@ import (
 
 // PBXConfig represents the PBX configuration for a tenant
 type PBXConfig struct {
-	Enabled   bool   `json:"enabled"`
-	Provider  string `json:"provider"`  // "onlinepbx"
-	Domain    string `json:"domain"`    // e.g., "pbx36019.onpbx.ru"
-	APIKey    string `json:"api_key"`
-	Extension string `json:"extension"` // Default extension
-	CallerID  string `json:"caller_id"`
+	Enabled      bool   `json:"enabled"`
+	Provider     string `json:"provider"`      // "onlinepbx"
+	Domain       string `json:"domain"`        // e.g., "pbx36019.onpbx.ru"
+	APIKey       string `json:"api_key"`
+	Extension    string `json:"extension"`     // Default extension
+	CallerID     string `json:"caller_id"`
+	WebhookToken string `json:"webhook_token"` // Token for verifying webhook calls (set in OnlinePBX panel)
 }
 
 // onlinePBXAuth handles authentication with OnlinePBX API
@@ -105,9 +106,12 @@ func (h *Handler) GetPBXConfig(c *gin.Context) {
 		return
 	}
 
-	// Mask API key for security
+	// Mask secrets for security
 	if config.APIKey != "" {
 		config.APIKey = "***" + config.APIKey[max(0, len(config.APIKey)-4):]
+	}
+	if config.WebhookToken != "" {
+		config.WebhookToken = "***" + config.WebhookToken[max(0, len(config.WebhookToken)-4):]
 	}
 
 	response.Success(c, config)
@@ -128,11 +132,16 @@ func (h *Handler) SavePBXConfig(c *gin.Context) {
 		return
 	}
 
-	// If API key is masked, keep the old one
-	if strings.HasPrefix(config.APIKey, "***") {
+	// If secrets are masked, keep the old values
+	if strings.HasPrefix(config.APIKey, "***") || strings.HasPrefix(config.WebhookToken, "***") {
 		oldConfig, err := h.getPBXConfigFromDB(tenantID)
 		if err == nil {
-			config.APIKey = oldConfig.APIKey
+			if strings.HasPrefix(config.APIKey, "***") {
+				config.APIKey = oldConfig.APIKey
+			}
+			if strings.HasPrefix(config.WebhookToken, "***") {
+				config.WebhookToken = oldConfig.WebhookToken
+			}
 		}
 	}
 
@@ -200,6 +209,7 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
 
 	var input struct {
 		Phone      string `json:"phone" binding:"required"`
@@ -232,9 +242,18 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 		fromExt = config.Extension
 	}
 
+	// Clean phone number — OnlinePBX only accepts digits (no +, spaces, dashes, parens)
+	cleanPhone := strings.Map(func(r rune) rune {
+		if r >= '0' && r <= '9' {
+			return r
+		}
+		return -1
+	}, input.Phone)
+
 	// Initiate call via OnlinePBX (form-encoded, not JSON)
+	h.log.Info("OnlinePBX call initiation", "from_ext", fromExt, "to_phone", input.Phone, "clean_phone", cleanPhone, "input_ext", input.Extension, "config_ext", config.Extension, "domain", config.Domain)
 	callURL := fmt.Sprintf("https://api2.onlinepbx.ru/%s/call/now.json", config.Domain)
-	callFormData := fmt.Sprintf("from=%s&to=%s", fromExt, input.Phone)
+	callFormData := fmt.Sprintf("from=%s&to=%s", fromExt, cleanPhone)
 
 	req, _ := http.NewRequest("POST", callURL, strings.NewReader(callFormData))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -249,13 +268,33 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+	h.log.Info("OnlinePBX call response", "status_code", resp.StatusCode, "body", string(respBody))
+
 	var callRaw map[string]json.RawMessage
-	json.NewDecoder(resp.Body).Decode(&callRaw)
+	json.Unmarshal(respBody, &callRaw)
 
 	callStatusOK := false
 	if s, ok := callRaw["status"]; ok {
 		str := strings.Trim(string(s), "\"")
 		callStatusOK = str == "true" || str == "1"
+	}
+
+	// Extract error comment if call failed
+	callComment := ""
+	if c2, ok := callRaw["comment"]; ok {
+		callComment = strings.Trim(string(c2), "\"")
+	}
+
+	// If OnlinePBX rejected the call, return error to frontend
+	if !callStatusOK {
+		errorCode := ""
+		if ec, ok := callRaw["errorCode"]; ok {
+			errorCode = strings.Trim(string(ec), "\"")
+		}
+		h.log.Error("OnlinePBX call rejected", "status", "0", "comment", callComment, "errorCode", errorCode)
+		response.BadRequest(c, fmt.Sprintf("PBX call failed: %s", callComment))
+		return
 	}
 
 	var callData map[string]interface{}
@@ -271,7 +310,7 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 		}
 	}
 
-	// Create call log
+	// Create call log only on successful initiation
 	callLogID := uuid.New()
 	now := time.Now()
 
@@ -285,23 +324,23 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 
 	logQuery := `
 		INSERT INTO call_logs (
-			id, tenant_id, contact_id, caller_number, receiver_number,
+			id, tenant_id, organization_id, contact_id, caller_number, receiver_number,
 			call_type, call_start_time, call_duration, call_outcome,
 			pbx_call_id, agent_id, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, 'outbound', $6, 0, 'initiated', $7, $8, $8, $9, $9)
+		) VALUES ($1, $2, $3, $4, $5, $6, 'outbound', $7, 0, 'initiated', $8, $9, $9, $10, $10)
 	`
 
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
 	_, err = h.db.Exec(logQuery,
-		callLogID, tenantID, contactID, fromExt, input.Phone,
+		callLogID, tenantID, orgIDPtr, contactID, fromExt, cleanPhone,
 		now, pbxNullString(pbxCallID), userID, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to create call log", "error", err)
-	}
-
-	callComment := ""
-	if c2, ok := callRaw["comment"]; ok {
-		callComment = strings.Trim(string(c2), "\"")
 	}
 
 	response.Success(c, gin.H{
@@ -367,7 +406,6 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 				data[k] = v
 			}
 		}
-		// Also check query params
 		for k, v := range c.Request.URL.Query() {
 			if _, exists := data[k]; !exists {
 				if len(v) == 1 {
@@ -379,33 +417,66 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 
 	h.log.Info("PBX webhook received", "data", data)
 
-	// Extract common fields
+	// Extract call info — OnlinePBX field names:
+	// event, uuid, caller, callee, direction, dialog_duration, call_duration,
+	// hangup_cause, download_url
 	event := getStr(data, "event")
 	callSID := getStr(data, "uuid")
+	if callSID == "" {
+		callSID = getStr(data, "call_id")
+	}
 	callerNumber := getStr(data, "caller")
+	if callerNumber == "" {
+		callerNumber = getStr(data, "caller_id_number")
+	}
 	recipientNumber := getStr(data, "callee")
+	if recipientNumber == "" {
+		recipientNumber = getStr(data, "destination_number")
+	}
 	direction := getStr(data, "direction")
 
-	// Get tenant from query param or data
-	tenantIDStr := c.Query("tenant_id")
-	if tenantIDStr == "" {
-		tenantIDStr = getStr(data, "tenant_id")
+	// Identify tenant by X-Pbx-Token header (primary, how OnlinePBX sends it)
+	// or by tenant_id query param (fallback)
+	pbxToken := c.GetHeader("X-Pbx-Token")
+	if pbxToken == "" {
+		pbxToken = c.GetHeader("x-pbx-token")
 	}
 
-	tenantID, err := uuid.Parse(tenantIDStr)
-	if err != nil {
-		h.log.Warn("PBX webhook: invalid tenant_id", "tenant_id", tenantIDStr)
-		c.String(http.StatusOK, "ok")
-		return
+	var tenantID uuid.UUID
+	if pbxToken != "" {
+		err := h.db.QueryRow(`
+			SELECT tenant_id FROM tenant_settings
+			WHERE settings->'pbx'->>'webhook_token' = $1
+		`, pbxToken).Scan(&tenantID)
+		if err != nil {
+			h.log.Warn("PBX webhook: invalid X-Pbx-Token", "token", pbxToken)
+			c.String(http.StatusForbidden, "invalid webhook token")
+			return
+		}
+	} else {
+		// Fallback: tenant_id in query param
+		tenantIDStr := c.Query("tenant_id")
+		if tenantIDStr == "" {
+			tenantIDStr = getStr(data, "tenant_id")
+		}
+		var err error
+		tenantID, err = uuid.Parse(tenantIDStr)
+		if err != nil {
+			h.log.Warn("PBX webhook: no token and no valid tenant_id", "tenant_id", tenantIDStr)
+			c.String(http.StatusOK, "ok")
+			return
+		}
 	}
 
-	// Skip intermediate events
+	// Skip intermediate ring events (call_user_start, call_answered)
+	// Only process call_start (to create) and call_end (to update with final data)
 	if event == "call_user_start" || event == "call_answered" {
+		h.log.Debug("PBX webhook skipping intermediate event", "event", event, "uuid", callSID)
 		c.JSON(http.StatusOK, gin.H{"status": "ok", "skipped": event})
 		return
 	}
 
-	// Parse duration
+	// Duration: dialog_duration = actual talk time, call_duration = total including ringing
 	dialogDuration := getInt(data, "dialog_duration")
 	callDuration := getInt(data, "call_duration")
 	duration := dialogDuration
@@ -413,7 +484,7 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 		duration = callDuration
 	}
 
-	// Parse call status
+	// Status based on event type, talk time, and hangup cause
 	callStatus := "initiated"
 	if event == "call_end" {
 		hangup := getStr(data, "hangup_cause")
@@ -421,6 +492,8 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 			callStatus = "answered"
 		} else if hangup == "USER_BUSY" || hangup == "CALL_REJECTED" {
 			callStatus = "busy"
+		} else if hangup == "NO_ANSWER" || hangup == "NO_USER_RESPONSE" || hangup == "ORIGINATOR_CANCEL" || hangup == "RECOVERY_ON_TIMER_EXPIRE" {
+			callStatus = "no_answer"
 		} else {
 			callStatus = "no_answer"
 		}
@@ -428,8 +501,14 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 		callStatus = "initiated"
 	}
 
-	// Recording URL
+	// Recording URL (OnlinePBX uses download_url in call_end event)
 	recordingURL := getStr(data, "download_url")
+	if recordingURL == "" {
+		recordingURL = getStr(data, "download")
+	}
+	if recordingURL == "" {
+		recordingURL = getStr(data, "recording_url")
+	}
 
 	// Map direction
 	callType := "inbound"
@@ -442,14 +521,29 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 
 	// Try to find existing call log by pbx_call_id
 	var existingID uuid.UUID
-	err = h.db.QueryRow(`
+	err := h.db.QueryRow(`
 		SELECT id FROM call_logs
 		WHERE tenant_id = $1 AND pbx_call_id = $2 AND deleted_at IS NULL
 		LIMIT 1
 	`, tenantID, callSID).Scan(&existingID)
 
+	// Fallback: if UUID doesn't match, find most recent call log for this number
+	// (initiate_call may create with a different UUID than what webhooks report)
+	if err != nil && recipientNumber != "" {
+		err = h.db.QueryRow(`
+			SELECT id FROM call_logs
+			WHERE tenant_id = $1
+				AND receiver_number = $2
+				AND call_type = $3
+				AND created_at >= NOW() - INTERVAL '2 minutes'
+				AND deleted_at IS NULL
+			ORDER BY created_at DESC
+			LIMIT 1
+		`, tenantID, recipientNumber, callType).Scan(&existingID)
+	}
+
 	if err == nil {
-		// Update existing call log
+		// Update existing call log — only update with real data, never overwrite with empty/zero
 		updates := []string{"updated_at = NOW()"}
 		args := []interface{}{}
 		argN := 0
@@ -469,6 +563,11 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 			updates = append(updates, fmt.Sprintf("call_outcome = $%d", argN))
 			args = append(args, callStatus)
 		}
+		if callSID != "" {
+			argN++
+			updates = append(updates, fmt.Sprintf("pbx_call_id = COALESCE(NULLIF(pbx_call_id, ''), $%d)", argN))
+			args = append(args, callSID)
+		}
 		if event == "call_end" {
 			argN++
 			updates = append(updates, fmt.Sprintf("call_end_time = $%d", argN))
@@ -484,13 +583,18 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 			"UPDATE call_logs SET %s WHERE id = $%d AND tenant_id = $%d",
 			strings.Join(updates, ", "), argN-1, argN,
 		)
-		h.db.Exec(query, args...)
+		_, execErr := h.db.Exec(query, args...)
+		if execErr != nil {
+			h.log.Error("PBX webhook: failed to update call log", "error", execErr)
+		} else {
+			h.log.Info("PBX webhook updated call log", "id", existingID, "event", event, "duration", duration, "status", callStatus, "recording", recordingURL)
+		}
 	} else {
-		// Create new call log (inbound or unknown)
+		// Create new call log (inbound calls or calls not initiated from CRM)
 		newID := uuid.New()
 		now := time.Now()
 
-		// Try to match caller to a contact
+		// Try to match caller to a contact (last 10 digits)
 		var contactID *uuid.UUID
 		cleanNum := strings.Map(func(r rune) rune {
 			if r >= '0' && r <= '9' {
@@ -502,13 +606,13 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 		if len(cleanNum) >= 10 {
 			last10 := cleanNum[len(cleanNum)-10:]
 			var cid uuid.UUID
-			err := h.db.QueryRow(`
+			qErr := h.db.QueryRow(`
 				SELECT id FROM contacts
 				WHERE tenant_id = $1 AND (phone LIKE '%' || $2 OR phone LIKE '%' || $2 || '%')
 				AND deleted_at IS NULL
 				LIMIT 1
 			`, tenantID, last10).Scan(&cid)
-			if err == nil {
+			if qErr == nil {
 				contactID = &cid
 			}
 		}
@@ -528,12 +632,17 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 			endTime = &t
 		}
 
-		h.db.Exec(query,
+		_, execErr := h.db.Exec(query,
 			newID, tenantID, contactID, callerNumber, recipientNumber,
 			callType, now, endTime, duration,
 			callStatus, pbxNullString(recordingURL), pbxNullString(callSID),
 			uuid.Nil, now,
 		)
+		if execErr != nil {
+			h.log.Error("PBX webhook: failed to create call log", "error", execErr)
+		} else {
+			h.log.Info("PBX webhook created call log", "id", newID, "event", event, "call_sid", callSID, "direction", direction)
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})

@@ -1020,7 +1020,7 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		accountIDs[code] = id
 	}
 
-	// Define default journals
+	// Define default journals — must match migration 276 list
 	defaultJournals := []struct {
 		code              string
 		name              string
@@ -1029,11 +1029,16 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		defaultCreditCode string
 	}{
 		{"GEN", "General Journal", "general", "", ""},
-		{"SAL", "Sales Journal", "sales", "1100", "4000"},         // AR debit, Sales Revenue credit
-		{"PUR", "Purchase Journal", "purchase", "5000", "2000"},   // COGS debit, AP credit
-		{"CASH", "Cash Journal", "cash", "1000", "1000"},          // Cash
-		{"BANK", "Bank Journal", "bank", "1010", "1010"},          // Bank
+		{"SAL", "Sales Journal", "sales", "1100", "4000"},             // AR debit, Sales Revenue credit
+		{"PUR", "Purchase Journal", "purchase", "5000", "2000"},       // COGS debit, AP credit
+		{"CASH", "Cash Journal", "cash", "1000", "1000"},              // Cash
+		{"BANK", "Bank Journal", "bank", "1010", "1010"},              // Bank
 		{"MISC", "Miscellaneous Journal", "miscellaneous", "", ""},
+		{"CASH_RECEIPTS", "Cash Receipts Journal", "cash", "1000", ""}, // Cash receipts
+		{"STOCK", "Stock Journal", "general", "", ""},
+		{"ASSET", "Fixed Assets Journal", "general", "", ""},
+		{"PAYROLL", "Payroll Journal", "general", "", ""},
+		{"CONST", "Construction Journal", "general", "", ""},
 	}
 
 	// Find profit/loss accounts for cash/bank journals
