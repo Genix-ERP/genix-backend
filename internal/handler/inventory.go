@@ -6407,7 +6407,10 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			WHERE wot.id = $1 AND wot.tenant_id = $2
 		`, op.OpTypeID, tenantID).Scan(&autoPost, &cfgJournalID, &cfgDebitAcct, &cfgCreditAcct)
 
-		if autoPost && op.Direction != "internal" {
+		// Skip auto-posting for material_request deliveries — accounting happens when materials are used in construction stages
+	isMaterialRequestDelivery := op.SourceType != nil && *op.SourceType == "material_request" && op.Direction == "delivery"
+
+	if autoPost && op.Direction != "internal" && !isMaterialRequestDelivery {
 			// Calculate total value from operation lines
 			var totalValue float64
 			h.db.QueryRow(`

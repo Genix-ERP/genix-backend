@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
@@ -163,14 +164,17 @@ func (h *Handler) CreateSubStageMaterial(c *gin.Context) {
 	// Also record in material usage (sub_stage → stage → construction process → wbs/building)
 	var projectID int64
 	var buildingID, wbsID *int64
+	var orgID *uuid.UUID
 	err = h.db.QueryRow(`
 		SELECT s.project_id,
 		       (SELECT d.building_id FROM construction_daily_log d WHERE d.stage_id = s.id AND d.tenant_id = s.tenant_id ORDER BY d.date DESC LIMIT 1),
-		       (SELECT d.wbs_id FROM construction_daily_log d WHERE d.stage_id = s.id AND d.tenant_id = s.tenant_id ORDER BY d.date DESC LIMIT 1)
+		       (SELECT d.wbs_id FROM construction_daily_log d WHERE d.stage_id = s.id AND d.tenant_id = s.tenant_id ORDER BY d.date DESC LIMIT 1),
+		       cp.organization_id
 		FROM construction_sub_stages ss
 		JOIN construction_stages s ON s.id = ss.stage_id
+		JOIN construction_projects cp ON cp.id = s.project_id
 		WHERE ss.id = $1
-	`, subStageID).Scan(&projectID, &buildingID, &wbsID)
+	`, subStageID).Scan(&projectID, &buildingID, &wbsID, &orgID)
 	if err == nil && projectID > 0 {
 		userID, _ := middleware.GetUserID(c)
 		h.db.Exec(`
@@ -180,6 +184,54 @@ func (h *Handler) CreateSubStageMaterial(c *gin.Context) {
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_DATE, $9, $10, $11, NOW(), NOW())
 		`, tenantID, projectID, buildingID, wbsID, nullStringFromVal(req.ProductID), req.ProductName, req.UOM, req.Quantity,
 			userID, "Material assigned to stage", id)
+
+		// Create accounting entry: Debit 5100 (Direct Materials) / Credit 1300 (Inventory)
+		// This records the expense when materials are actually used in a construction stage
+		if totalCost > 0 {
+			now := time.Now()
+
+			// Find journal
+			var journalID uuid.UUID
+			var nextNumber int
+			h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+
+			if journalID != uuid.Nil {
+				debitAcct := findAccount(h.db, tenantID, orgID, "direct material", "5100")
+				if debitAcct == uuid.Nil {
+					debitAcct = findAccount(h.db, tenantID, orgID, "cost of goods", "5100")
+				}
+				if debitAcct == uuid.Nil {
+					debitAcct = findAccount(h.db, tenantID, orgID, "cogs", "5000")
+				}
+				creditAcct := findAccount(h.db, tenantID, orgID, "inventory", "1300")
+
+				if debitAcct != uuid.Nil && creditAcct != uuid.Nil {
+					entryID := uuid.New()
+					entryNumber := fmt.Sprintf("STG%06d", nextNumber)
+					description := fmt.Sprintf("Stage material usage: %s x%.0f", req.ProductName, req.Quantity)
+
+					h.db.Exec(`
+						INSERT INTO journal_entries (
+							id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+							description, source_type, source_id, status, total_debit, total_credit,
+							created_by, created_at, updated_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stage_material', $8, 'posted', $9, $9, $10, $11, $11)
+					`, entryID, tenantID, orgID, journalID, entryNumber, now,
+						description, fmt.Sprintf("%d", id), totalCost, userID, now)
+
+					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
+						uuid.New(), entryID, debitAcct, description, totalCost, now)
+					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
+						uuid.New(), entryID, creditAcct, description, totalCost, now)
+
+					h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCost, now, debitAcct)
+					h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCost, now, creditAcct)
+					h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+
+					h.log.Info("Stage material accounting entry created", "entry_id", entryID, "product", req.ProductName, "amount", totalCost)
+				}
+			}
+		}
 	}
 
 	response.Success(c, map[string]interface{}{"id": id})
