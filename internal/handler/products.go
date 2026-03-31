@@ -97,19 +97,20 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		LEFT JOIN units_of_measure pu ON p.purchase_unit_id = pu.id
 		LEFT JOIN units_of_measure su ON p.sales_unit_id = su.id
 	`
-	countQuery := `SELECT COUNT(*) FROM products p WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
-
 	args := []interface{}{tenantID}
 	countArgs := []interface{}{tenantID}
 	argCount := 1
 	countArgCount := 1
 
-	// LEFT JOIN org-specific settings (products are shared across orgs per migration 173)
+	// INNER JOIN org-specific settings so products only appear in companies they belong to
 	if orgID != uuid.Nil {
 		argCount++
 		baseQuery += fmt.Sprintf(`
-		LEFT JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d`, argCount)
+		INNER JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d`, argCount)
 		args = append(args, orgID)
+
+		countArgCount++
+		countArgs = append(countArgs, orgID)
 	} else {
 		baseQuery += `
 		LEFT JOIN product_organization_settings pos ON false`
@@ -117,6 +118,13 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	baseQuery += `
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
 	`
+
+	var countQuery string
+	if orgID != uuid.Nil {
+		countQuery = fmt.Sprintf(`SELECT COUNT(*) FROM products p INNER JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`, countArgCount)
+	} else {
+		countQuery = `SELECT COUNT(*) FROM products p WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
+	}
 
 	if !includeInactive {
 		baseQuery += " AND p.is_active = true"
