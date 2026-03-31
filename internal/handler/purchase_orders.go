@@ -253,13 +253,10 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
-	// Generate order number
-	orderNumber := input.OrderNumber
-	if orderNumber == "" {
-		var count int
-		h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&count)
-		orderNumber = fmt.Sprintf("P%05d", count+1)
-	}
+	// Generate sequential order number (PO-00001, PO-00002, ...)
+	var poCount int
+	h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
+	orderNumber := fmt.Sprintf("PO-%05d", poCount+1)
 
 	// Parse order date
 	orderDate := now

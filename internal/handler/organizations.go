@@ -364,6 +364,18 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 		// Don't fail the organization creation, just log the error
 	}
 
+	// Create default Warehouse for the new organization
+	if err := h.createDefaultWarehouse(tenantID, orgID, input.Code); err != nil {
+		h.log.Error("Failed to create default warehouse", "error", err, "org_id", orgID)
+		// Don't fail the organization creation, just log the error
+	}
+
+	// Backfill product_organization_settings so existing products are visible in the new org
+	if err := h.backfillProductOrgSettings(tenantID, orgID); err != nil {
+		h.log.Error("Failed to backfill product org settings", "error", err, "org_id", orgID)
+		// Don't fail the organization creation, just log the error
+	}
+
 	// Create intercompany vendor/customer contacts in selected organizations
 	if len(input.IntercompanyVendorIDs) > 0 {
 		h.createIntercompanyContacts(tenantID, orgID, input.Name, input.TaxID, input.IntercompanyVendorIDs)
@@ -1470,4 +1482,36 @@ func (h *Handler) ImportOrganizations(c *gin.Context) {
 		"errors":   errors,
 		"total":    len(input.Organizations),
 	})
+}
+
+// createDefaultWarehouse creates a default warehouse for a new organization
+func (h *Handler) createDefaultWarehouse(tenantID, orgID uuid.UUID, orgCode string) error {
+	warehouseID := uuid.New()
+	_, err := h.db.Exec(`
+		INSERT INTO warehouses (id, tenant_id, organization_id, code, name, is_default, is_active, reception_steps, delivery_steps, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'Main Warehouse', true, true, 1, 1, NOW(), NOW())
+	`, warehouseID, tenantID, orgID, "WH-"+orgCode)
+	if err != nil {
+		return err
+	}
+
+	// Create default warehouse locations
+	_, err = h.db.Exec(`
+		INSERT INTO warehouse_locations (id, warehouse_id, code, name, type, is_active)
+		VALUES ($1, $2, 'STOCK', 'Stock', 'storage', true)
+	`, uuid.New(), warehouseID)
+	return err
+}
+
+// backfillProductOrgSettings creates product_organization_settings entries for all existing
+// products in the tenant, so they are visible in the newly created organization
+func (h *Handler) backfillProductOrgSettings(tenantID, orgID uuid.UUID) error {
+	_, err := h.db.Exec(`
+		INSERT INTO product_organization_settings (tenant_id, product_id, organization_id, cost_price, list_price, min_price, min_stock_level, reorder_point, reorder_quantity)
+		SELECT p.tenant_id, p.id, $1, p.cost_price, p.list_price, p.min_price, p.min_stock_level, p.reorder_point, p.reorder_quantity
+		FROM products p
+		WHERE p.tenant_id = $2 AND p.deleted_at IS NULL
+		ON CONFLICT (product_id, organization_id) DO NOTHING
+	`, orgID, tenantID)
+	return err
 }
