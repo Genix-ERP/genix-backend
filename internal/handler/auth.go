@@ -303,6 +303,9 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
+	// Seed default units of measure
+	h.seedDefaultUnitsOfMeasure(tx, tenantID)
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
@@ -1599,6 +1602,9 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 		// Continue anyway - registration is more important
 	}
 
+	// Seed default units of measure
+	h.seedDefaultUnitsOfMeasure(tx, tenantID)
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
@@ -2042,6 +2048,9 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 		return
 	}
 
+	// Seed default units of measure
+	h.seedDefaultUnitsOfMeasure(tx, tenantID)
+
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
 		response.InternalServerError(c, "")
@@ -2125,4 +2134,41 @@ func randomSuffix() string {
 		b[i] = chars[rand.Intn(len(chars))]
 	}
 	return string(b)
+}
+
+// seedDefaultUnitsOfMeasure creates standard UoM entries for a new tenant
+func (h *Handler) seedDefaultUnitsOfMeasure(tx *sql.Tx, tenantID uuid.UUID) {
+	units := []struct {
+		code, name, category string
+		factor               float64
+	}{
+		{"unit", "Dona", "quantity", 1},
+		{"kg", "Kilogramm", "weight", 1},
+		{"g", "Gramm", "weight", 0.001},
+		{"l", "Litr", "volume", 1},
+		{"ml", "Millilitr", "volume", 0.001},
+		{"m", "Metr", "length", 1},
+		{"cm", "Santimetr", "length", 0.01},
+		{"box", "Quti", "quantity", 1},
+		{"pack", "Paket", "quantity", 1},
+		{"dozen", "Dujina", "quantity", 12},
+		{"t", "Tonna", "weight", 1000},
+		{"pcs", "Dona (pcs)", "quantity", 1},
+		{"set", "To'plam", "quantity", 1},
+		{"pair", "Juft", "quantity", 2},
+		{"roll", "Rulon", "quantity", 1},
+		{"sheet", "Varaq", "quantity", 1},
+		{"m2", "Kvadrat metr", "area", 1},
+		{"m3", "Kub metr", "volume", 1000},
+	}
+	for _, u := range units {
+		_, err := tx.Exec(`
+			INSERT INTO units_of_measure (id, tenant_id, code, name, category, conversion_factor, is_active)
+			VALUES ($1, $2, $3, $4, $5, $6, true)
+			ON CONFLICT DO NOTHING
+		`, uuid.New(), tenantID, u.code, u.name, u.category, u.factor)
+		if err != nil {
+			h.log.Error("Failed to seed UoM", "error", err, "code", u.code)
+		}
+	}
 }
