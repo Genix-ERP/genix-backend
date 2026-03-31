@@ -951,7 +951,7 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 	// Generate PO number
 	var poCount int
 	h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
-	poNumber := fmt.Sprintf("PO-%s-%04d", now.Format("2006"), poCount+1)
+	poNumber := fmt.Sprintf("PO-%05d", poCount+1)
 
 	// Calculate expected delivery date based on lead time
 	expectedDate := now.AddDate(0, 0, 7) // default 7 days

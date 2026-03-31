@@ -111,7 +111,9 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 
 	// Create purchase order in target organization
 	poID := uuid.New()
-	poNumber := fmt.Sprintf("PO-IC-%s", time.Now().Format("20060102150405"))
+	var poCount int
+	s.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
+	poNumber := fmt.Sprintf("PO-%05d", poCount+1)
 	now := time.Now()
 
 	notes := fmt.Sprintf("Auto-created from intercompany SO: %s", so.OrderNumber)
