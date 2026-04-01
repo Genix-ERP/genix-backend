@@ -1048,11 +1048,65 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 		return
 	}
 
+	// SMS: Ish haqi chiqarilganda
+	go func() {
+		var phone string
+		var grossSalary, totalDed, netSal float64
+		var loanDeduction float64
+		h.db.QueryRow(`
+			SELECT COALESCE(e.phone, ''),
+				COALESCE(pe.gross_salary, 0), COALESCE(pe.total_deductions, 0), COALESCE(pe.net_salary, 0)
+			FROM payroll_entries pe
+			JOIN employees e ON pe.employee_id = e.id
+			WHERE pe.id = $1 AND pe.tenant_id = $2
+		`, entryID, tenantID).Scan(&phone, &grossSalary, &totalDed, &netSal)
+		if phone != "" {
+			// Check if employee has active loan payment deduction
+			h.db.QueryRow(`SELECT COALESCE(monthly_payment, 0) FROM employee_loans WHERE employee_id = $1 AND tenant_id = $2 AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+				employeeID, tenantID).Scan(&loanDeduction)
+			// Check remaining loan
+			var loanRemaining float64
+			h.db.QueryRow(`SELECT COALESCE(remaining_amount, 0) FROM employee_loans WHERE employee_id = $1 AND tenant_id = $2 AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
+				employeeID, tenantID).Scan(&loanRemaining)
+
+			msg := fmt.Sprintf("Ish haqi: Hisoblangan: %s. ", formatSMSAmount(grossSalary))
+			if loanDeduction > 0 {
+				msg += fmt.Sprintf("Qarz ushildi: -%s. ", formatSMSAmount(loanDeduction))
+			}
+			if totalDed > 0 {
+				msg += fmt.Sprintf("Ushlanmalar: -%s. ", formatSMSAmount(totalDed))
+			}
+			msg += fmt.Sprintf("Qo'lga olasiz: %s.", formatSMSAmount(netSal))
+			if loanRemaining > 0 {
+				msg += fmt.Sprintf(" Qarz qoldi: %s.", formatSMSAmount(loanRemaining))
+			}
+			if err := h.smsService.Send(phone, msg); err != nil {
+				h.log.Error("Failed to send payroll SMS", "error", err, "phone", phone)
+			}
+		}
+	}()
+
 	response.Success(c, gin.H{
 		"success":        true,
 		"message":        "To'lov tasdiqlandi",
 		"total_deducted": totalDeducted,
 	})
+}
+
+// formatSMSAmount formats a number with space-separated thousands for SMS
+func formatSMSAmount(n float64) string {
+	s := fmt.Sprintf("%.0f", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var result []byte
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			result = append(result, ' ')
+		}
+		result = append(result, byte(c))
+	}
+	return string(result)
 }
 
 // ConfirmSalaryPaymentByEntry is a route adapter that reads :eid param instead of :id

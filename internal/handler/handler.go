@@ -1496,6 +1496,23 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payrollPeriods.POST("/:id/entries/:eid/confirm", h.perm.Require("hr", "payroll", "approve"), h.ConfirmSalaryPaymentByEntry)
 	}
 
+	// Employee Loans
+	loans := rg.Group("/employee-loans")
+	{
+		loans.GET("", h.ListEmployeeLoans)
+		loans.POST("", h.perm.Require("hr", "payroll", "create"), h.CreateEmployeeLoan)
+		loans.GET("/:id", h.GetEmployeeLoan)
+		loans.POST("/:id/payments/:paymentId/mark-paid", h.perm.Require("hr", "payroll", "approve"), h.MarkLoanPaymentPaid)
+	}
+
+	// Employee Self-Service Portal
+	myPortal := rg.Group("/my")
+	{
+		myPortal.GET("/profile", h.GetMyEmployeeProfile)
+		myPortal.GET("/payroll-history", h.GetMyPayrollHistory)
+		myPortal.GET("/loan", h.GetMyLoan)
+	}
+
 	// Expense Categories
 	expenseCategories := rg.Group("/expense-categories")
 	{
