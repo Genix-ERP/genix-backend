@@ -1929,6 +1929,39 @@ func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.
 			continue
 		}
 
+		// Find default BOM for this product and create work orders from its operations
+		var bomID uuid.UUID
+		var orgVal uuid.UUID
+		if organizationID != nil {
+			orgVal = *organizationID
+		}
+		bomErr := h.db.QueryRow(`
+			SELECT id FROM product_boms
+			WHERE product_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status = 'active'
+			ORDER BY is_default DESC, created_at DESC LIMIT 1
+		`, line.ProductID, tenantID).Scan(&bomID)
+		if bomErr == nil {
+			if woErr := h.CreateWorkOrdersFromBOM(moID, bomID, tenantID, orgVal, deficit, userID); woErr != nil {
+				h.log.Error("Auto MO: failed to create work orders from BOM", "error", woErr, "mo_id", moID)
+			}
+		}
+
+		// If no BOM or BOM had no operations, create a default single work order
+		var woCount int
+		h.db.QueryRow(`SELECT COUNT(*) FROM work_orders WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, moID, tenantID).Scan(&woCount)
+		if woCount == 0 {
+			h.db.Exec(`
+				INSERT INTO work_orders (
+					id, tenant_id, organization_id, production_order_id, code, name,
+					sequence, status, quantity_planned, created_by, created_at, updated_at
+				) VALUES ($1,$2,$3,$4,$5,$6,10,'pending',$7,$8,$9,$9)`,
+				uuid.New(), tenantID, organizationID, moID,
+				fmt.Sprintf("%s-1", moCode),
+				fmt.Sprintf("%s - Ishlab chiqarish", line.Name),
+				deficit, userID, now,
+			)
+		}
+
 		h.log.Info("Auto MO: created production order",
 			"mo_code", moCode, "product", line.Name, "deficit", deficit, "sales_order_id", orderID)
 	}
