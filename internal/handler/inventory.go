@@ -84,17 +84,18 @@ func (h *Handler) ListInventory(c *gin.Context) {
 	countQuery := `
 		SELECT COUNT(*) FROM inventory i
 		JOIN products p ON i.product_id = p.id
+		JOIN warehouses w ON i.warehouse_id = w.id
 		WHERE i.tenant_id = $1
 	`
 
 	args := []interface{}{tenantID}
 	argCount := 1
 
-	// Filter by organization
+	// Filter by organization (use warehouse's org since inventory.organization_id may be NULL)
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND i.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND i.organization_id = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
@@ -5441,31 +5442,20 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 			orgIDPtr = &orgID
 		}
 
-		// Find or create inventory record
+		// Find or create inventory record (upsert to prevent duplicates)
 		var inventoryID uuid.UUID
+		newInvID := uuid.New()
 		err = h.db.QueryRow(`
-			SELECT id FROM inventory
-			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-		`, tenantID, line.ProductID, warehouseID).Scan(&inventoryID)
-
-		if err == sql.ErrNoRows {
-			inventoryID = uuid.New()
-			_, insErr := h.db.Exec(`
-				INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8)
-			`, inventoryID, tenantID, orgIDPtr, line.ProductID, warehouseID, line.Variance, line.UnitCost, now)
-			if insErr != nil {
-				h.log.Error("Failed to insert inventory record for stock count adjustment", "error", insErr, "product_id", line.ProductID)
-			}
-		} else if err == nil {
-			_, updErr := h.db.Exec(`
-				UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
-			`, line.Variance, now, inventoryID)
-			if updErr != nil {
-				h.log.Error("Failed to update inventory for stock count adjustment", "error", updErr, "inventory_id", inventoryID, "variance", line.Variance)
-			}
-		} else {
-			h.log.Error("Failed to find inventory record for stock count adjustment", "error", err, "product_id", line.ProductID)
+			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8)
+			ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET
+				quantity_on_hand = inventory.quantity_on_hand + EXCLUDED.quantity_on_hand,
+				last_movement_date = $8,
+				updated_at = $8
+			RETURNING id
+		`, newInvID, tenantID, orgIDPtr, line.ProductID, warehouseID, line.Variance, line.UnitCost, now).Scan(&inventoryID)
+		if err != nil {
+			h.log.Error("Failed to upsert inventory for stock count adjustment", "error", err, "product_id", line.ProductID)
 		}
 
 		// Create inventory transaction
@@ -6579,26 +6569,17 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					}
 					h.log.Info("Processing inventory line", "product_id", prodID, "done_qty", doneQty, "direction", op.Direction, "warehouse_id", warehouseID)
 
-					// Find or create inventory record
+					// Find or create inventory record (upsert to prevent duplicates)
 					var invID uuid.UUID
+					newID := uuid.New()
 					err := h.db.QueryRow(`
-						SELECT id FROM inventory
-						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-						ORDER BY created_at ASC LIMIT 1
-					`, tenantID, prodID, warehouseID).Scan(&invID)
-
-					if err == sql.ErrNoRows {
-						invID = uuid.New()
-						_, insErr := h.db.Exec(`
-							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-							VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-						`, invID, tenantID, prodID, warehouseID, op.OrgID, unitPrice, now)
-						if insErr != nil {
-							h.log.Error("Failed to create inventory record", "error", insErr, "product_id", prodID, "warehouse_id", warehouseID)
-							continue
-						}
-					} else if err != nil {
-						h.log.Error("Failed to query inventory", "error", err, "product_id", prodID)
+						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+						ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET updated_at = NOW()
+						RETURNING id
+					`, newID, tenantID, prodID, warehouseID, op.OrgID, unitPrice, now).Scan(&invID)
+					if err != nil {
+						h.log.Error("Failed to upsert inventory record", "error", err, "product_id", prodID, "warehouse_id", warehouseID)
 						continue
 					}
 					// Backfill organization_id if missing
@@ -6903,22 +6884,28 @@ func (h *Handler) completeLinkedDeliveryOp(tenantID uuid.UUID, salesOrderID uuid
 					continue
 				}
 
-				// Find or create inventory record
+				// Find or create inventory record (upsert to prevent duplicates)
 				var invID uuid.UUID
-				err := h.db.QueryRow(`
-					SELECT id FROM inventory
-					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-					ORDER BY created_at ASC LIMIT 1
-				`, tenantID, prodID, warehouseID).Scan(&invID)
-
-				if err == sql.ErrNoRows && orgID != nil {
-					invID = uuid.New()
-					h.db.Exec(`
+				if orgID != nil {
+					newID := uuid.New()
+					err := h.db.QueryRow(`
 						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
 						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-					`, invID, tenantID, prodID, warehouseID, *orgID, unitPrice, now)
-				} else if err != nil {
-					continue
+						ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET updated_at = NOW()
+						RETURNING id
+					`, newID, tenantID, prodID, warehouseID, *orgID, unitPrice, now).Scan(&invID)
+					if err != nil {
+						continue
+					}
+				} else {
+					err := h.db.QueryRow(`
+						SELECT id FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID, prodID, warehouseID).Scan(&invID)
+					if err != nil {
+						continue
+					}
 				}
 
 				// Decrease inventory
@@ -7136,21 +7123,28 @@ func (h *Handler) completeLinkedReceiptOp(tenantID uuid.UUID, purchaseOrderID uu
 					continue
 				}
 
+				// Find or create inventory record (upsert to prevent duplicates)
 				var invID uuid.UUID
-				err := h.db.QueryRow(`
-					SELECT id FROM inventory
-					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-					ORDER BY created_at ASC LIMIT 1
-				`, tenantID, prodID, warehouseID).Scan(&invID)
-
-				if err == sql.ErrNoRows && orgID != nil {
-					invID = uuid.New()
-					h.db.Exec(`
+				if orgID != nil {
+					newID := uuid.New()
+					err := h.db.QueryRow(`
 						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
 						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-					`, invID, tenantID, prodID, warehouseID, *orgID, unitPrice, now)
-				} else if err != nil {
-					continue
+						ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET updated_at = NOW()
+						RETURNING id
+					`, newID, tenantID, prodID, warehouseID, *orgID, unitPrice, now).Scan(&invID)
+					if err != nil {
+						continue
+					}
+				} else {
+					err := h.db.QueryRow(`
+						SELECT id FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+						ORDER BY created_at ASC LIMIT 1
+					`, tenantID, prodID, warehouseID).Scan(&invID)
+					if err != nil {
+						continue
+					}
 				}
 
 				// Increase inventory
