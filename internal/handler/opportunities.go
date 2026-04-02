@@ -936,13 +936,8 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 		WHERE tenant_id = $1 AND COALESCE(pipeline_type, 'opportunity') = $2
 	`
 
-	// Filter by organization if provided (also include stages with NULL org for backwards compat)
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		query += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
-		args = append(args, orgID)
-	}
-
+	// Pipeline stages are tenant-wide — no organization filter
+	_ = argCount
 	query += " ORDER BY sequence ASC"
 
 	rows, err := h.db.Query(query, args...)
@@ -1000,33 +995,20 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		pipelineType = "opportunity"
 	}
 
-	// Get organization_id from header or input
-	var orgID *uuid.UUID
-	if input.OrganizationID != "" {
-		parsed, parseErr := uuid.Parse(input.OrganizationID)
-		if parseErr == nil {
-			orgID = &parsed
-		}
-	}
-	if orgID == nil {
-		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
-			orgID = &headerOrgID
-		}
-	}
-
+	// Pipeline stages are tenant-wide — organization_id is always NULL
 	query := `
 		INSERT INTO pipeline_stages (
 			id, tenant_id, name, code, sequence, probability,
 			is_won, is_lost, color, is_active, pipeline_type, organization_id,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12, $13)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, NULL, $11, $12)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
 		id, tenantID, input.Name, input.Code, input.Sequence,
 		input.Probability, input.IsWon, input.IsLost, color,
-		pipelineType, orgID, now, now,
+		pipelineType, now, now,
 	).Scan(&id)
 
 	if err != nil {
