@@ -565,12 +565,14 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 		return
 	}
 
-	query := `
+	// Fetch employee email before deleting (needed for user cleanup)
+	var empEmail sql.NullString
+	h.db.QueryRow(`SELECT email FROM employees WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&empEmail)
+
+	result, err := h.db.Exec(`
 		UPDATE employees SET deleted_at = $1, updated_at = $1
 		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-	`
-
-	result, err := h.db.Exec(query, time.Now(), id, tenantID)
+	`, time.Now(), id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete employee", "error", err)
 		response.InternalError(c, "Failed to delete employee")
@@ -583,11 +585,13 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 		return
 	}
 
-	// Hard-delete the linked user record (soft-delete causes unique constraint
-	// violation on users_tenant_id_email_key when recreating with empty email)
-	h.db.Exec(`
-		DELETE FROM users WHERE tenant_id = $1 AND employee_id = $2 AND deleted_at IS NULL
-	`, tenantID, id)
+	// Delete linked user by employee_id
+	h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
+
+	// Also delete by email as fallback (covers cases where employee_id link was not set)
+	if empEmail.Valid && empEmail.String != "" {
+		h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND email = $2`, tenantID, empEmail.String)
+	}
 
 	// Clean up employee permissions and organization assignments
 	h.db.Exec(`DELETE FROM employee_module_permissions WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
