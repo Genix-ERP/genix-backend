@@ -927,7 +927,7 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 	argCount := 2
 
 	query := `
-		SELECT id, tenant_id, name, code, sequence, probability,
+		SELECT id, tenant_id, name, custom_name, code, sequence, probability,
 			   is_won, is_lost, color, is_active,
 			   COALESCE(pipeline_type, 'opportunity') as pipeline_type,
 			   organization_id,
@@ -952,7 +952,7 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 	for rows.Next() {
 		var s entity.PipelineStage
 		err := rows.Scan(
-			&s.ID, &s.TenantID, &s.Name, &s.Code, &s.Sequence,
+			&s.ID, &s.TenantID, &s.Name, &s.CustomName, &s.Code, &s.Sequence,
 			&s.Probability, &s.IsWon, &s.IsLost, &s.Color,
 			&s.IsActive, &s.PipelineType, &s.OrganizationID,
 			&s.CreatedAt, &s.UpdatedAt,
@@ -1072,6 +1072,15 @@ func (h *Handler) UpdatePipelineStage(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
 		args = append(args, *input.Name)
+		// When name is updated, also update custom_name.
+		// custom_name is set for default stages (user override), nil/NULL for non-default stages.
+		argCount++
+		updates = append(updates, fmt.Sprintf("custom_name = $%d", argCount))
+		if input.CustomName != nil {
+			args = append(args, *input.CustomName)
+		} else {
+			args = append(args, nil)
+		}
 	}
 	if input.Sequence != nil {
 		argCount++

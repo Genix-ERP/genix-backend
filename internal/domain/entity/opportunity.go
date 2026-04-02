@@ -35,6 +35,7 @@ type PipelineStage struct {
 	ID             uuid.UUID  `json:"id" db:"id"`
 	TenantID       uuid.UUID  `json:"tenant_id" db:"tenant_id"`
 	Name           string     `json:"name" db:"name"`
+	CustomName     *string    `json:"custom_name" db:"custom_name"`
 	Code           string     `json:"code" db:"code"`
 	Sequence       int        `json:"sequence" db:"sequence"`
 	Probability    float64    `json:"probability" db:"probability"`
@@ -217,6 +218,7 @@ type CreatePipelineStageInput struct {
 // UpdatePipelineStageInput represents input for updating a pipeline stage
 type UpdatePipelineStageInput struct {
 	Name        *string  `json:"name,omitempty"`
+	CustomName  *string  `json:"custom_name"`
 	Sequence    *int     `json:"sequence,omitempty"`
 	Probability *float64 `json:"probability,omitempty"`
 	IsWon       *bool    `json:"is_won,omitempty"`
