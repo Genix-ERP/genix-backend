@@ -1937,7 +1937,7 @@ func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.
 		}
 		bomErr := h.db.QueryRow(`
 			SELECT id FROM product_boms
-			WHERE product_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status = 'active'
+			WHERE product_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND is_active = true
 			ORDER BY is_default DESC, created_at DESC LIMIT 1
 		`, line.ProductID, tenantID).Scan(&bomID)
 		if bomErr == nil {
@@ -1953,12 +1953,12 @@ func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.
 			h.db.Exec(`
 				INSERT INTO work_orders (
 					id, tenant_id, organization_id, production_order_id, code, name,
-					sequence, status, quantity_planned, created_by, created_at, updated_at
-				) VALUES ($1,$2,$3,$4,$5,$6,10,'pending',$7,$8,$9,$9)`,
+					sequence, status, quantity_to_produce, uom, created_by, created_at, updated_at
+				) VALUES ($1,$2,$3,$4,$5,$6,10,'pending',$7,$8,$9,$10,$10)`,
 				uuid.New(), tenantID, organizationID, moID,
 				fmt.Sprintf("%s-1", moCode),
 				fmt.Sprintf("%s - Ishlab chiqarish", line.Name),
-				deficit, userID, now,
+				deficit, line.UOM, userID, now,
 			)
 		}
 
