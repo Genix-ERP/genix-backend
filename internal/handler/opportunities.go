@@ -922,15 +922,30 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 		return
 	}
 
+	pipelineType := c.DefaultQuery("type", "opportunity")
+	args := []interface{}{tenantID, pipelineType}
+	argCount := 2
+
 	query := `
 		SELECT id, tenant_id, name, code, sequence, probability,
-			   is_won, is_lost, color, is_active, created_at, updated_at
+			   is_won, is_lost, color, is_active,
+			   COALESCE(pipeline_type, 'opportunity') as pipeline_type,
+			   organization_id,
+			   created_at, updated_at
 		FROM pipeline_stages
-		WHERE tenant_id = $1
-		ORDER BY sequence ASC
+		WHERE tenant_id = $1 AND COALESCE(pipeline_type, 'opportunity') = $2
 	`
 
-	rows, err := h.db.Query(query, tenantID)
+	// Filter by organization if provided (also include stages with NULL org for backwards compat)
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
+		args = append(args, orgID)
+	}
+
+	query += " ORDER BY sequence ASC"
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list pipeline stages", "error", err)
 		response.InternalError(c, "Failed to list pipeline stages")
@@ -944,7 +959,8 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 		err := rows.Scan(
 			&s.ID, &s.TenantID, &s.Name, &s.Code, &s.Sequence,
 			&s.Probability, &s.IsWon, &s.IsLost, &s.Color,
-			&s.IsActive, &s.CreatedAt, &s.UpdatedAt,
+			&s.IsActive, &s.PipelineType, &s.OrganizationID,
+			&s.CreatedAt, &s.UpdatedAt,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan pipeline stage", "error", err)
@@ -979,17 +995,38 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		color = "#3B82F6"
 	}
 
+	pipelineType := input.PipelineType
+	if pipelineType == "" {
+		pipelineType = "opportunity"
+	}
+
+	// Get organization_id from header or input
+	var orgID *uuid.UUID
+	if input.OrganizationID != "" {
+		parsed, parseErr := uuid.Parse(input.OrganizationID)
+		if parseErr == nil {
+			orgID = &parsed
+		}
+	}
+	if orgID == nil {
+		if headerOrgID, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrgID != uuid.Nil {
+			orgID = &headerOrgID
+		}
+	}
+
 	query := `
 		INSERT INTO pipeline_stages (
 			id, tenant_id, name, code, sequence, probability,
-			is_won, is_lost, color, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11)
+			is_won, is_lost, color, is_active, pipeline_type, organization_id,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12, $13)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
 		id, tenantID, input.Name, input.Code, input.Sequence,
-		input.Probability, input.IsWon, input.IsLost, color, now, now,
+		input.Probability, input.IsWon, input.IsLost, color,
+		pipelineType, orgID, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -1003,18 +1040,20 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 	}
 
 	stage := &entity.PipelineStage{
-		ID:          id,
-		TenantID:    tenantID,
-		Name:        input.Name,
-		Code:        input.Code,
-		Sequence:    input.Sequence,
-		Probability: input.Probability,
-		IsWon:       input.IsWon,
-		IsLost:      input.IsLost,
-		Color:       color,
-		IsActive:    true,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:             id,
+		TenantID:       tenantID,
+		Name:           input.Name,
+		Code:           input.Code,
+		Sequence:       input.Sequence,
+		Probability:    input.Probability,
+		IsWon:          input.IsWon,
+		IsLost:         input.IsLost,
+		Color:          color,
+		IsActive:       true,
+		PipelineType:   pipelineType,
+		OrganizationID: orgID,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 
 	response.Created(c, stage)

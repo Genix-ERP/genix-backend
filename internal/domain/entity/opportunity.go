@@ -32,18 +32,20 @@ const (
 
 // PipelineStage represents a customizable pipeline stage
 type PipelineStage struct {
-	ID          uuid.UUID `json:"id" db:"id"`
-	TenantID    uuid.UUID `json:"tenant_id" db:"tenant_id"`
-	Name        string    `json:"name" db:"name"`
-	Code        string    `json:"code" db:"code"`
-	Sequence    int       `json:"sequence" db:"sequence"`
-	Probability float64   `json:"probability" db:"probability"`
-	IsWon       bool      `json:"is_won" db:"is_won"`
-	IsLost      bool      `json:"is_lost" db:"is_lost"`
-	Color       string    `json:"color" db:"color"`
-	IsActive    bool      `json:"is_active" db:"is_active"`
-	CreatedAt   time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at" db:"updated_at"`
+	ID             uuid.UUID  `json:"id" db:"id"`
+	TenantID       uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Name           string     `json:"name" db:"name"`
+	Code           string     `json:"code" db:"code"`
+	Sequence       int        `json:"sequence" db:"sequence"`
+	Probability    float64    `json:"probability" db:"probability"`
+	IsWon          bool       `json:"is_won" db:"is_won"`
+	IsLost         bool       `json:"is_lost" db:"is_lost"`
+	Color          string     `json:"color" db:"color"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	PipelineType   string     `json:"pipeline_type" db:"pipeline_type"`
+	OrganizationID *uuid.UUID `json:"organization_id" db:"organization_id"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 // Opportunity represents a sales opportunity/deal
@@ -201,13 +203,15 @@ type OpportunityByStage struct {
 
 // CreatePipelineStageInput represents input for creating a pipeline stage
 type CreatePipelineStageInput struct {
-	Name        string  `json:"name" binding:"required,min=1,max=100"`
-	Code        string  `json:"code" binding:"required,min=1,max=50"`
-	Sequence    int     `json:"sequence"`
-	Probability float64 `json:"probability"`
-	IsWon       bool    `json:"is_won"`
-	IsLost      bool    `json:"is_lost"`
-	Color       string  `json:"color"`
+	Name           string  `json:"name" binding:"required,min=1,max=100"`
+	Code           string  `json:"code" binding:"required,min=1,max=50"`
+	Sequence       int     `json:"sequence"`
+	Probability    float64 `json:"probability"`
+	IsWon          bool    `json:"is_won"`
+	IsLost         bool    `json:"is_lost"`
+	Color          string  `json:"color"`
+	PipelineType   string  `json:"pipeline_type"`
+	OrganizationID string  `json:"organization_id"`
 }
 
 // UpdatePipelineStageInput represents input for updating a pipeline stage
