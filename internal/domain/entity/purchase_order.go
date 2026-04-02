@@ -44,8 +44,10 @@ type PurchaseOrder struct {
 	VendorReference *string             `json:"vendor_reference,omitempty" db:"vendor_reference"`
 	Notes           *string             `json:"notes,omitempty" db:"notes"`
 	InternalNotes   *string             `json:"internal_notes,omitempty" db:"internal_notes"`
-	WarehouseID     *uuid.UUID          `json:"warehouse_id,omitempty" db:"warehouse_id"`
-	RequestedBy     *uuid.UUID          `json:"requested_by,omitempty" db:"requested_by"`
+	WarehouseID      *uuid.UUID          `json:"warehouse_id,omitempty" db:"warehouse_id"`
+	VehicleNumber    *string             `json:"vehicle_number,omitempty" db:"vehicle_number"`
+	RequiresShipping bool                `json:"requires_shipping" db:"requires_shipping"`
+	RequestedBy      *uuid.UUID          `json:"requested_by,omitempty" db:"requested_by"`
 	ApprovedBy      *uuid.UUID          `json:"approved_by,omitempty" db:"approved_by"`
 	ApprovedAt      *time.Time          `json:"approved_at,omitempty" db:"approved_at"`
 	CreatedAt       time.Time           `json:"created_at" db:"created_at"`
@@ -101,9 +103,11 @@ type CreatePurchaseOrderInput struct {
 	VendorReference string                         `json:"vendor_reference,omitempty"`
 	Notes           string                         `json:"notes,omitempty"`
 	InternalNotes   string                         `json:"internal_notes,omitempty"`
-	WarehouseID     string                         `json:"warehouse_id,omitempty"`
-	ShippingAmount  float64                        `json:"shipping_amount,omitempty"`
-	Lines           []CreatePurchaseOrderLineInput `json:"lines" binding:"required,min=1"`
+	WarehouseID      string                         `json:"warehouse_id,omitempty"`
+	VehicleNumber    string                         `json:"vehicle_number,omitempty"`
+	RequiresShipping *bool                          `json:"requires_shipping,omitempty"`
+	ShippingAmount   float64                        `json:"shipping_amount,omitempty"`
+	Lines            []CreatePurchaseOrderLineInput `json:"lines" binding:"required,min=1"`
 }
 
 // CreatePurchaseOrderLineInput represents input for a line item
@@ -131,9 +135,11 @@ type UpdatePurchaseOrderInput struct {
 	VendorReference *string                        `json:"vendor_reference,omitempty"`
 	Notes           *string                        `json:"notes,omitempty"`
 	InternalNotes   *string                        `json:"internal_notes,omitempty"`
-	WarehouseID     *string                        `json:"warehouse_id,omitempty"`
-	ShippingAmount  *float64                       `json:"shipping_amount,omitempty"`
-	Status          *string                        `json:"status,omitempty"`
+	WarehouseID      *string                        `json:"warehouse_id,omitempty"`
+	VehicleNumber    *string                        `json:"vehicle_number,omitempty"`
+	RequiresShipping *bool                          `json:"requires_shipping,omitempty"`
+	ShippingAmount   *float64                       `json:"shipping_amount,omitempty"`
+	Status           *string                        `json:"status,omitempty"`
 	Lines           []CreatePurchaseOrderLineInput `json:"lines,omitempty"`
 }
 
@@ -176,10 +182,12 @@ type PurchaseOrderResponse struct {
 	Status          PurchaseOrderStatus `json:"status"`
 	PaymentStatus   PaymentStatus       `json:"payment_status"`
 	PaymentTerms    *int                `json:"payment_terms,omitempty"`
-	VendorReference *string             `json:"vendor_reference,omitempty"`
-	Notes           *string             `json:"notes,omitempty"`
-	Lines           []PurchaseOrderLine `json:"lines,omitempty"`
-	ApprovedAt      *time.Time          `json:"approved_at,omitempty"`
+	VendorReference  *string             `json:"vendor_reference,omitempty"`
+	Notes            *string             `json:"notes,omitempty"`
+	VehicleNumber    *string             `json:"vehicle_number,omitempty"`
+	RequiresShipping bool                `json:"requires_shipping"`
+	Lines            []PurchaseOrderLine `json:"lines,omitempty"`
+	ApprovedAt       *time.Time          `json:"approved_at,omitempty"`
 	CreatedAt       time.Time           `json:"created_at"`
 	UpdatedAt       time.Time           `json:"updated_at"`
 }
