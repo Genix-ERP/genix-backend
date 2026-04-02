@@ -1033,7 +1033,7 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		Color:          color,
 		IsActive:       true,
 		PipelineType:   pipelineType,
-		OrganizationID: orgID,
+		OrganizationID: nil,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
