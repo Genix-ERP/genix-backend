@@ -452,10 +452,10 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 	// Cross-module dependencies: when a user has access to one module,
 	// they also need read access to supporting resources from other modules.
 	crossModuleGrants := map[string][]string{
-		"hr":            {"organization:department", "organization:organization", "users:role"},
+		"hr":            {"organization:department", "organization:organization", "users:role", "users:user"},
 		"inventory":     {"settings:tenant"},
-		"sales":         {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "inventory:product_attribute"},
-		"purchase":      {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant"},
+		"sales":         {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "inventory:product_attribute", "users:user"},
+		"purchase":      {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "users:user"},
 		"finance":       {"settings:tenant"},
 		"manufacturing": {"inventory:product", "inventory:bom", "inventory:warehouse"},
 		"construction":  {"organization:organization", "hr:employee", "inventory:product", "inventory:warehouse"},

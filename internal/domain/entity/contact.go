@@ -174,6 +174,7 @@ type ContactResponse struct {
 	IsActive           bool                   `json:"is_active"`
 	Rating             *float64               `json:"rating,omitempty"`
 	RatingCount        *int                   `json:"rating_count,omitempty"`
+	SourceOrganizationID *string               `json:"source_organization_id,omitempty"`
 	ContactPersons     []ContactPerson        `json:"contact_persons,omitempty"`
 	CreatedAt          time.Time              `json:"created_at"`
 	UpdatedAt          time.Time              `json:"updated_at"`

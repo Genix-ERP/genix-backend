@@ -158,6 +158,70 @@ func (h *Handler) ListProjects(c *gin.Context) {
 	response.Paginated(c, projects, page, pageSize, total)
 }
 
+// ListProjectsByOrganization returns projects for a specific organization (used for intercompany)
+func (h *Handler) ListProjectsByOrganization(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	orgID := c.Query("organization_id")
+	if orgID == "" {
+		response.BadRequest(c, "organization_id is required")
+		return
+	}
+
+	parsedOrgID, err := uuid.Parse(orgID)
+	if err != nil {
+		response.BadRequest(c, "Invalid organization_id")
+		return
+	}
+
+	// Verify that this organization belongs to the same tenant
+	var exists bool
+	err = h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND tenant_id = $2)`, parsedOrgID, tenantID).Scan(&exists)
+	if err != nil || !exists {
+		response.NotFound(c, "Organization")
+		return
+	}
+
+	query := `
+		SELECT p.id, p.project_code, p.project_name, p.status
+		FROM projects p
+		WHERE p.tenant_id = $1 AND p.organization_id = $2 AND p.deleted_at IS NULL
+		  AND p.status IN ('planning', 'active')
+		ORDER BY p.project_name ASC`
+
+	rows, err := h.db.Query(query, tenantID, parsedOrgID)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch projects")
+		return
+	}
+	defer rows.Close()
+
+	var projects []map[string]interface{}
+	for rows.Next() {
+		var id uuid.UUID
+		var projectCode, projectName, status string
+		if err := rows.Scan(&id, &projectCode, &projectName, &status); err != nil {
+			continue
+		}
+		projects = append(projects, map[string]interface{}{
+			"id":           id.String(),
+			"project_code": projectCode,
+			"project_name": projectName,
+			"status":       status,
+		})
+	}
+
+	if projects == nil {
+		projects = []map[string]interface{}{}
+	}
+
+	response.Success(c, projects)
+}
+
 // CreateProject creates a new project
 func (h *Handler) CreateProject(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)

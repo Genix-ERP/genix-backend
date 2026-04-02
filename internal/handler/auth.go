@@ -757,32 +757,37 @@ func (h *Handler) UpdateCurrentUser(c *gin.Context) {
 	argNum := 1
 
 	if input.FirstName != nil {
-		updates = append(updates, "first_name = $"+string(rune('0'+argNum)))
+		updates = append(updates, fmt.Sprintf("first_name = $%d", argNum))
 		args = append(args, *input.FirstName)
 		argNum++
 	}
 	if input.LastName != nil {
-		updates = append(updates, "last_name = $"+string(rune('0'+argNum)))
+		updates = append(updates, fmt.Sprintf("last_name = $%d", argNum))
 		args = append(args, *input.LastName)
 		argNum++
 	}
 	if input.Phone != nil {
-		updates = append(updates, "phone = $"+string(rune('0'+argNum)))
+		updates = append(updates, fmt.Sprintf("phone = $%d", argNum))
 		args = append(args, *input.Phone)
 		argNum++
 	}
+	if input.Email != nil {
+		updates = append(updates, fmt.Sprintf("email = $%d", argNum))
+		args = append(args, *input.Email)
+		argNum++
+	}
 	if input.AvatarURL != nil {
-		updates = append(updates, "avatar_url = $"+string(rune('0'+argNum)))
+		updates = append(updates, fmt.Sprintf("avatar_url = $%d", argNum))
 		args = append(args, *input.AvatarURL)
 		argNum++
 	}
 	if input.Language != nil {
-		updates = append(updates, "language = $"+string(rune('0'+argNum)))
+		updates = append(updates, fmt.Sprintf("language = $%d", argNum))
 		args = append(args, *input.Language)
 		argNum++
 	}
 	if input.Timezone != nil {
-		updates = append(updates, "timezone = $"+string(rune('0'+argNum)))
+		updates = append(updates, fmt.Sprintf("timezone = $%d", argNum))
 		args = append(args, *input.Timezone)
 		argNum++
 	}
@@ -795,7 +800,7 @@ func (h *Handler) UpdateCurrentUser(c *gin.Context) {
 	args = append(args, claims.UserID)
 
 	// Execute update
-	query := "UPDATE users SET " + joinStrings(updates, ", ") + ", updated_at = NOW() WHERE id = $" + string(rune('0'+argNum))
+	query := "UPDATE users SET " + joinStrings(updates, ", ") + fmt.Sprintf(", updated_at = NOW() WHERE id = $%d", argNum)
 	_, err := h.db.Exec(query, args...)
 	if err != nil {
 		h.log.Error("Failed to update user", "error", err)
@@ -2171,4 +2176,161 @@ func (h *Handler) seedDefaultUnitsOfMeasure(tx *sql.Tx, tenantID uuid.UUID) {
 			h.log.Error("Failed to seed UoM", "error", err, "code", u.code)
 		}
 	}
+}
+
+// UpdateCurrentUserEmail updates email without verification
+func (h *Handler) UpdateCurrentUserEmail(c *gin.Context) {
+	claims, ok := middleware.GetClaims(c)
+	if !ok {
+		response.Unauthorized(c, "")
+		return
+	}
+
+	var input struct {
+		Email string `json:"email" binding:"required,email"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid email")
+		return
+	}
+
+	_, err := h.db.Exec("UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2", input.Email, claims.UserID)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+			response.BadRequest(c, "This email is already in use")
+			return
+		}
+		h.log.Error("Failed to update email", "error", err)
+		response.InternalServerError(c, "Failed to update email")
+		return
+	}
+
+	h.GetCurrentUser(c)
+}
+
+// SendPhoneOTP sends a 6-digit OTP code via SMS for phone number verification
+func (h *Handler) SendPhoneOTP(c *gin.Context) {
+	claims, ok := middleware.GetClaims(c)
+	if !ok {
+		response.Unauthorized(c, "")
+		return
+	}
+
+	var input struct {
+		Phone string `json:"phone" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Phone number is required")
+		return
+	}
+
+	// Generate OTP
+	otpCode := generateOTPCode()
+	expiresAt := time.Now().Add(5 * time.Minute)
+
+	// Invalidate previous phone OTPs for this user
+	h.db.Exec(`
+		UPDATE email_verification_otps SET verified_at = NOW()
+		WHERE email = $1 AND purpose = 'phone_change' AND verified_at IS NULL
+	`, claims.UserID.String())
+
+	// Store OTP (reuse email_verification_otps table, use userID as "email" key)
+	_, err := h.db.Exec(`
+		INSERT INTO email_verification_otps (email, otp_code, purpose, expires_at)
+		VALUES ($1, $2, 'phone_change', $3)
+	`, claims.UserID.String()+":"+input.Phone, otpCode, expiresAt)
+	if err != nil {
+		h.log.Error("Failed to store phone OTP", "error", err)
+		response.InternalServerError(c, "Failed to send OTP")
+		return
+	}
+
+	// Send SMS
+	smsMessage := fmt.Sprintf("GenixERP: Tasdiqlash kodi: %s. Kod 5 daqiqa amal qiladi.", otpCode)
+	if err := h.smsService.Send(input.Phone, smsMessage); err != nil {
+		h.log.Error("Failed to send SMS OTP", "error", err, "phone", input.Phone)
+		// Don't fail — in dev mode SMS logs to console
+	}
+
+	result := gin.H{
+		"message": "OTP code sent",
+		"phone":   input.Phone,
+	}
+
+	// In development, include OTP for testing
+	if h.config.App.Env == "development" || h.config.App.Env == "local" || h.config.App.Env == "" {
+		result["dev_otp_code"] = otpCode
+	}
+
+	response.Success(c, result)
+}
+
+// VerifyPhoneOTP verifies the OTP and updates the user's phone number
+func (h *Handler) VerifyPhoneOTP(c *gin.Context) {
+	claims, ok := middleware.GetClaims(c)
+	if !ok {
+		response.Unauthorized(c, "")
+		return
+	}
+
+	var input struct {
+		Phone   string `json:"phone" binding:"required"`
+		OTPCode string `json:"otp_code" binding:"required,len=6"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Phone and OTP code are required")
+		return
+	}
+
+	// Look up the OTP
+	var otpID uuid.UUID
+	var storedCode string
+	var expiresAt time.Time
+	var verifiedAt sql.NullTime
+
+	lookupKey := claims.UserID.String() + ":" + input.Phone
+	err := h.db.QueryRow(`
+		SELECT id, otp_code, expires_at, verified_at
+		FROM email_verification_otps
+		WHERE email = $1 AND purpose = 'phone_change'
+		ORDER BY created_at DESC LIMIT 1
+	`, lookupKey).Scan(&otpID, &storedCode, &expiresAt, &verifiedAt)
+
+	if err == sql.ErrNoRows {
+		response.BadRequest(c, "No OTP found. Please request a new one.")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to query phone OTP", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	if verifiedAt.Valid {
+		response.BadRequest(c, "OTP already used. Please request a new one.")
+		return
+	}
+	if time.Now().After(expiresAt) {
+		response.BadRequest(c, "OTP has expired. Please request a new one.")
+		return
+	}
+	if storedCode != input.OTPCode {
+		h.db.Exec("UPDATE email_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID)
+		response.BadRequest(c, "Invalid OTP code")
+		return
+	}
+
+	// Mark OTP as verified
+	h.db.Exec("UPDATE email_verification_otps SET verified_at = NOW() WHERE id = $1", otpID)
+
+	// Update the user's phone number
+	_, err = h.db.Exec("UPDATE users SET phone = $1, updated_at = NOW() WHERE id = $2", input.Phone, claims.UserID)
+	if err != nil {
+		h.log.Error("Failed to update phone number", "error", err)
+		response.InternalServerError(c, "Failed to update phone number")
+		return
+	}
+
+	// Return the updated user
+	h.GetCurrentUser(c)
 }

@@ -53,7 +53,8 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			   c.current_balance, c.currency_id, c.tax_exempt, c.tags, c.notes, c.expected_revenue,
 			   c.custom_fields, c.is_active, c.created_by, c.created_at, c.updated_at,
 			   COALESCE(sp.avg_rating, 0) AS avg_rating,
-			   COALESCE(sp.rating_count, 0) AS rating_count
+			   COALESCE(sp.rating_count, 0) AS rating_count,
+			   c.source_organization_id
 		FROM contacts c
 		LEFT JOIN (
 			SELECT vendor_id, AVG(overall_rating) AS avg_rating, COUNT(*) AS rating_count
@@ -136,6 +137,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		var avgRating float64
 		var ratingCount int
 		var expectedRevenue sql.NullFloat64
+		var sourceOrgID sql.NullString
 
 		err := rows.Scan(
 			&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
@@ -143,7 +145,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			&billingAddr, &shippingAddr, &ct.PaymentTerms, &ct.CreditLimit,
 			&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes, &expectedRevenue,
 			&customFields, &ct.IsActive, &createdBy, &ct.CreatedAt, &ct.UpdatedAt,
-			&avgRating, &ratingCount,
+			&avgRating, &ratingCount, &sourceOrgID,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan contact", "error", err)
@@ -220,6 +222,9 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		}
 		if expectedRevenue.Valid {
 			resp.ExpectedRevenue = &expectedRevenue.Float64
+		}
+		if sourceOrgID.Valid {
+			resp.SourceOrganizationID = &sourceOrgID.String
 		}
 
 		contacts = append(contacts, resp)
