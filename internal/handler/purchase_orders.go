@@ -1894,20 +1894,42 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	}
 	var poLines []poLine
 
+	// Use quantity_received if partial receipt, otherwise fall back to ordered quantity
 	linesRows, err := tx.Query(`
-		SELECT id, product_id, description, quantity, unit_price, COALESCE(tax_amount, 0), COALESCE(line_total, quantity * unit_price)
+		SELECT id, product_id, description,
+		       CASE WHEN quantity_received > 0 THEN quantity_received ELSE quantity END AS bill_qty,
+		       unit_price, COALESCE(tax_amount, 0)
 		FROM purchase_order_lines
 		WHERE purchase_order_id = $1`, poID)
 	if err == nil {
 		for linesRows.Next() {
 			var pl poLine
-			if err := linesRows.Scan(&pl.ID, &pl.ProductID, &pl.Desc, &pl.Qty, &pl.UnitPrice, &pl.TaxAmt, &pl.LineTotal); err != nil {
+			if err := linesRows.Scan(&pl.ID, &pl.ProductID, &pl.Desc, &pl.Qty, &pl.UnitPrice, &pl.TaxAmt); err != nil {
 				continue
 			}
+			pl.LineTotal = pl.Qty * pl.UnitPrice
 			poLines = append(poLines, pl)
 		}
 		linesRows.Close()
 	}
+
+	// Recalculate bill totals based on received quantities
+	var billSubtotal, billTaxTotal float64
+	for _, pl := range poLines {
+		billSubtotal += pl.LineTotal
+		billTaxTotal += pl.TaxAmt
+	}
+	billTotal := billSubtotal + billTaxTotal
+
+	// Update the bill header with corrected amounts
+	if _, err = tx.Exec(`
+		UPDATE purchase_invoices SET subtotal = $1, tax_amount = $2, total_amount = $3, updated_at = $4
+		WHERE id = $5`, billSubtotal, billTaxTotal, billTotal, now, billID); err != nil {
+		h.log.Error("CreateBillFromPO: failed to update bill totals", "error", err)
+	}
+	subtotal = billSubtotal
+	taxAmount = billTaxTotal
+	totalAmount = billTotal
 
 	for i, pl := range poLines {
 		if _, err := tx.Exec(`
