@@ -2867,6 +2867,9 @@ func (h *Handler) DeleteBOMOperation(c *gin.Context) {
 		return
 	}
 
+	// Detach any work orders referencing this operation before deleting
+	h.db.Exec("UPDATE work_orders SET operation_id = NULL WHERE operation_id = $1", operationID)
+
 	result, err := h.db.Exec("DELETE FROM bom_operations WHERE id = $1 AND bom_id = $2", operationID, bomID)
 	if err != nil {
 		h.log.Error("Failed to delete BOM operation", "error", err)
