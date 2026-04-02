@@ -1477,6 +1477,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		mfgCategories.DELETE("/:id", h.perm.Require("manufacturing", "work_centers", "delete"), h.DeleteManufacturingCategory)
 	}
 
+	// Cost Calculations
+	costCalcs := rg.Group("/cost-calculations")
+	costCalcs.Use(h.perm.Require("manufacturing", "work_centers", "read"))
+	{
+		costCalcs.GET("", h.ListCostCalculations)
+		costCalcs.POST("", h.CreateCostCalculation)
+		costCalcs.GET("/:id", h.GetCostCalculation)
+		costCalcs.PUT("/:id", h.UpdateCostCalculation)
+		costCalcs.DELETE("/:id", h.DeleteCostCalculation)
+	}
+
 	// =====================================================
 	// ERP EXTENSIONS MODULE ROUTES
 	// =====================================================

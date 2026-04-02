@@ -4342,3 +4342,284 @@ func (h *Handler) RemoveWorkCenterEmployee(c *gin.Context) {
 
 	response.Success(c, gin.H{"message": "Employee removed from work center"})
 }
+
+// ─── Cost Calculations ────────────────────────────────────────────────────────
+
+type costCalcLine struct {
+	ID          string  `json:"id,omitempty"`
+	ProductID   string  `json:"product_id,omitempty"`
+	ProductName string  `json:"product_name"`
+	Quantity    float64 `json:"quantity"`
+	Unit        string  `json:"unit"`
+	UnitCost    float64 `json:"unit_cost"`
+	TotalCost   float64 `json:"total_cost"`
+}
+
+type costCalcResponse struct {
+	ID              string         `json:"id"`
+	Name            string         `json:"name"`
+	ProductName     string         `json:"product_name"`
+	Quantity        float64        `json:"quantity"`
+	ProfitPercent   float64        `json:"profit_percent"`
+	MaterialCost    float64        `json:"material_cost"`
+	TotalCost       float64        `json:"total_cost"`
+	TotalWithProfit float64        `json:"total_with_profit"`
+	Notes           string         `json:"notes"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	Lines           []costCalcLine `json:"lines"`
+}
+
+func (h *Handler) ListCostCalculations(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, name, product_name, quantity, profit_percent,
+		       material_cost, total_cost, total_with_profit,
+		       COALESCE(notes,''), created_at, updated_at
+		FROM cost_calculations
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		ORDER BY created_at DESC
+	`, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to fetch calculations")
+		return
+	}
+	defer rows.Close()
+
+	var items []costCalcResponse
+	for rows.Next() {
+		var item costCalcResponse
+		var id uuid.UUID
+		if err := rows.Scan(&id, &item.Name, &item.ProductName, &item.Quantity,
+			&item.ProfitPercent, &item.MaterialCost, &item.TotalCost, &item.TotalWithProfit,
+			&item.Notes, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			continue
+		}
+		item.ID = id.String()
+		item.Lines = []costCalcLine{}
+		items = append(items, item)
+	}
+	if items == nil {
+		items = []costCalcResponse{}
+	}
+	response.Success(c, items)
+}
+
+func (h *Handler) CreateCostCalculation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	organizationID, _ := middleware.GetOrganizationID(c)
+
+	var req struct {
+		Name          string         `json:"name" binding:"required"`
+		ProductName   string         `json:"product_name" binding:"required"`
+		Quantity      float64        `json:"quantity"`
+		ProfitPercent float64        `json:"profit_percent"`
+		Notes         string         `json:"notes"`
+		Lines         []costCalcLine `json:"lines"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if req.Quantity == 0 {
+		req.Quantity = 1
+	}
+	if req.ProfitPercent == 0 {
+		req.ProfitPercent = 45
+	}
+
+	// Calculate totals
+	var materialCost float64
+	for i := range req.Lines {
+		req.Lines[i].TotalCost = req.Lines[i].Quantity * req.Lines[i].UnitCost
+		materialCost += req.Lines[i].TotalCost
+	}
+	totalCost := materialCost
+	totalWithProfit := totalCost * (1 + req.ProfitPercent/100)
+
+	now := time.Now()
+	id := uuid.New()
+
+	var orgVal interface{}
+	if organizationID != uuid.Nil {
+		orgVal = organizationID
+	}
+
+	_, err := h.db.Exec(`
+		INSERT INTO cost_calculations
+		  (id, tenant_id, organization_id, name, product_name, quantity, profit_percent,
+		   material_cost, total_cost, total_with_profit, notes, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
+	`, id, tenantID, orgVal, req.Name, req.ProductName, req.Quantity, req.ProfitPercent,
+		materialCost, totalCost, totalWithProfit, req.Notes, userID, now)
+	if err != nil {
+		h.log.Error("Failed to create cost calculation", "error", err)
+		response.InternalError(c, "Failed to create calculation")
+		return
+	}
+
+	for _, line := range req.Lines {
+		lineID := uuid.New()
+		var productID interface{}
+		if line.ProductID != "" {
+			if pid, err := uuid.Parse(line.ProductID); err == nil {
+				productID = pid
+			}
+		}
+		if line.Unit == "" {
+			line.Unit = "pcs"
+		}
+		h.db.Exec(`
+			INSERT INTO cost_calculation_lines
+			  (id, calculation_id, tenant_id, product_id, product_name, quantity, unit, unit_cost, total_cost)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		`, lineID, id, tenantID, productID, line.ProductName, line.Quantity, line.Unit, line.UnitCost, line.TotalCost)
+	}
+
+	response.Created(c, gin.H{"id": id.String()})
+}
+
+func (h *Handler) GetCostCalculation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var item costCalcResponse
+	var itemID uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT id, name, product_name, quantity, profit_percent,
+		       material_cost, total_cost, total_with_profit,
+		       COALESCE(notes,''), created_at, updated_at
+		FROM cost_calculations
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&itemID, &item.Name, &item.ProductName, &item.Quantity,
+		&item.ProfitPercent, &item.MaterialCost, &item.TotalCost, &item.TotalWithProfit,
+		&item.Notes, &item.CreatedAt, &item.UpdatedAt)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Calculation not found")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to fetch calculation")
+		return
+	}
+	item.ID = itemID.String()
+
+	lrows, err := h.db.Query(`
+		SELECT id, COALESCE(product_id::text,''), product_name, quantity, unit, unit_cost, total_cost
+		FROM cost_calculation_lines WHERE calculation_id = $1 ORDER BY created_at
+	`, id)
+	if err == nil {
+		defer lrows.Close()
+		for lrows.Next() {
+			var l costCalcLine
+			lrows.Scan(&l.ID, &l.ProductID, &l.ProductName, &l.Quantity, &l.Unit, &l.UnitCost, &l.TotalCost)
+			item.Lines = append(item.Lines, l)
+		}
+	}
+	if item.Lines == nil {
+		item.Lines = []costCalcLine{}
+	}
+	response.Success(c, item)
+}
+
+func (h *Handler) UpdateCostCalculation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var req struct {
+		Name          string         `json:"name"`
+		ProductName   string         `json:"product_name"`
+		Quantity      float64        `json:"quantity"`
+		ProfitPercent float64        `json:"profit_percent"`
+		Notes         string         `json:"notes"`
+		Lines         []costCalcLine `json:"lines"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+
+	var materialCost float64
+	for i := range req.Lines {
+		req.Lines[i].TotalCost = req.Lines[i].Quantity * req.Lines[i].UnitCost
+		materialCost += req.Lines[i].TotalCost
+	}
+	totalCost := materialCost
+	totalWithProfit := totalCost * (1 + req.ProfitPercent/100)
+	now := time.Now()
+
+	_, err = h.db.Exec(`
+		UPDATE cost_calculations SET
+		  name=$1, product_name=$2, quantity=$3, profit_percent=$4,
+		  material_cost=$5, total_cost=$6, total_with_profit=$7, notes=$8, updated_at=$9
+		WHERE id=$10 AND tenant_id=$11 AND deleted_at IS NULL
+	`, req.Name, req.ProductName, req.Quantity, req.ProfitPercent,
+		materialCost, totalCost, totalWithProfit, req.Notes, now, id, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to update calculation")
+		return
+	}
+
+	// Replace lines
+	h.db.Exec("DELETE FROM cost_calculation_lines WHERE calculation_id=$1", id)
+	for _, line := range req.Lines {
+		lineID := uuid.New()
+		var productID interface{}
+		if line.ProductID != "" {
+			if pid, err2 := uuid.Parse(line.ProductID); err2 == nil {
+				productID = pid
+			}
+		}
+		if line.Unit == "" {
+			line.Unit = "pcs"
+		}
+		h.db.Exec(`
+			INSERT INTO cost_calculation_lines
+			  (id, calculation_id, tenant_id, product_id, product_name, quantity, unit, unit_cost, total_cost)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		`, lineID, id, tenantID, productID, line.ProductName, line.Quantity, line.Unit, line.UnitCost, line.TotalCost)
+	}
+
+	response.Success(c, gin.H{"message": "Updated"})
+}
+
+func (h *Handler) DeleteCostCalculation(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+	h.db.Exec(`UPDATE cost_calculations SET deleted_at=NOW() WHERE id=$1 AND tenant_id=$2`, id, tenantID)
+	response.Success(c, gin.H{"message": "Deleted"})
+}
