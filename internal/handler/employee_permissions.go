@@ -26,6 +26,8 @@ type ModulePermission struct {
 // EmployeePermissionsResponse represents the full permissions for an employee
 type EmployeePermissionsResponse struct {
 	EmployeeID  uuid.UUID                     `json:"employee_id"`
+	RoleID      *uuid.UUID                    `json:"role_id,omitempty"`
+	RoleName    string                        `json:"role_name,omitempty"`
 	Permissions map[string]*ModulePermission  `json:"permissions"`
 }
 
@@ -58,14 +60,24 @@ func (h *Handler) GetEmployeePermissions(c *gin.Context) {
 		return
 	}
 
-	// Verify employee exists and belongs to tenant
-	var exists bool
+	// Verify employee exists and fetch role info
+	var roleID *uuid.UUID
+	var roleName string
+	var tmpRoleID uuid.NullUUID
+	var tmpRoleName sql.NullString
 	err = h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM employees WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)
-	`, employeeID, tenantID).Scan(&exists)
-	if err != nil || !exists {
+		SELECT e.role_id, COALESCE(r.name, '') as role_name
+		FROM employees e
+		LEFT JOIN roles r ON r.id = e.role_id AND r.deleted_at IS NULL
+		WHERE e.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
+	`, employeeID, tenantID).Scan(&tmpRoleID, &tmpRoleName)
+	if err != nil {
 		response.NotFound(c, "Employee")
 		return
+	}
+	if tmpRoleID.Valid {
+		roleID = &tmpRoleID.UUID
+		roleName = tmpRoleName.String
 	}
 
 	// Fetch all permissions for this employee
@@ -96,6 +108,8 @@ func (h *Handler) GetEmployeePermissions(c *gin.Context) {
 
 	result := EmployeePermissionsResponse{
 		EmployeeID:  employeeID,
+		RoleID:      roleID,
+		RoleName:    roleName,
 		Permissions: permissions,
 	}
 
@@ -244,6 +258,35 @@ func (h *Handler) BulkUpdateEmployeePermissions(c *gin.Context) {
 		}
 	}
 
+	// If employee has a role, sync permissions back to the role and propagate to all role members
+	var empRoleID uuid.NullUUID
+	_ = tx.QueryRow(`SELECT role_id FROM employees WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, employeeID, tenantID).Scan(&empRoleID)
+	if empRoleID.Valid {
+		// Build RolePermissions from the input
+		rolePerms := make(RolePermissions)
+		for _, p := range input.Permissions {
+			rolePerms[p.ModuleID] = RoleModulePerm{
+				CanCreate: p.CanCreate,
+				CanRead:   p.CanRead,
+				CanUpdate: p.CanUpdate,
+				CanDelete: p.CanDelete,
+			}
+		}
+		// Update the role's permissions JSONB
+		permsJSON, _ := json.Marshal(rolePerms)
+		_, err = tx.Exec(`UPDATE roles SET permissions = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+			permsJSON, now, empRoleID.UUID, tenantID)
+		if err != nil {
+			h.log.Error("Failed to update role permissions", "error", err)
+			// Don't fail the whole operation — employee permissions are already saved
+		} else {
+			// Sync to all other employees with the same role
+			if syncErr := h.syncRolePermissionsToEmployees(tx, tenantID, empRoleID.UUID, rolePerms, now); syncErr != nil {
+				h.log.Error("Failed to sync role permissions to employees", "error", syncErr)
+			}
+		}
+	}
+
 	// Commit transaction
 	if err = tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
@@ -258,6 +301,24 @@ func (h *Handler) BulkUpdateEmployeePermissions(c *gin.Context) {
 		tenantID, employeeID,
 	).Scan(&linkedUserID); scanErr == nil {
 		h.perm.InvalidatePermissionCache(c.Request.Context(), tenantID.String(), linkedUserID.String())
+	}
+
+	// Also invalidate cache for all other employees with the same role
+	if empRoleID.Valid {
+		userRows, _ := h.db.Query(`
+			SELECT u.id FROM users u
+			JOIN employees e ON e.id = u.employee_id
+			WHERE e.tenant_id = $1 AND e.role_id = $2 AND e.deleted_at IS NULL AND u.deleted_at IS NULL
+		`, tenantID, empRoleID.UUID)
+		if userRows != nil {
+			defer userRows.Close()
+			for userRows.Next() {
+				var uid uuid.UUID
+				if userRows.Scan(&uid) == nil {
+					h.perm.InvalidatePermissionCache(c.Request.Context(), tenantID.String(), uid.String())
+				}
+			}
+		}
 	}
 
 	result := EmployeePermissionsResponse{

@@ -107,6 +107,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		auth.GET("/me", h.GetCurrentUser)
 		auth.PUT("/me", h.UpdateCurrentUser)
 		auth.PUT("/me/password", h.ChangePassword)
+		auth.PUT("/me/email", h.UpdateCurrentUserEmail)
+		auth.POST("/me/phone/send-otp", h.SendPhoneOTP)
+		auth.POST("/me/phone/verify-otp", h.VerifyPhoneOTP)
 		auth.POST("/send-invite", h.SendInvite) // Send invitation to a user
 		auth.GET("/me/permissions", h.GetCurrentUserPermissions) // Get current user's module permissions
 		auth.GET("/me/organizations", h.GetCurrentUserOrganizations)
@@ -1577,6 +1580,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	projects.Use(h.perm.Require("projects", "project", "read"))
 	{
 		projects.GET("", h.ListProjects)
+		projects.GET("/by-organization", h.ListProjectsByOrganization)
 		projects.POST("", h.perm.Require("projects", "project", "create"), h.CreateProject)
 		projects.GET("/:id", h.GetProject)
 		projects.PUT("/:id", h.perm.Require("projects", "project", "update"), h.UpdateProject)
