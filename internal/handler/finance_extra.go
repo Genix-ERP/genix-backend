@@ -18,6 +18,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // ========== CASH REGISTERS ==========
@@ -602,13 +603,24 @@ type reconciliationActResponse struct {
 	Reminder7dSent  bool       `json:"reminder_7d_sent"`
 }
 
+type reconciliationLineItem struct {
+	ProductName string  `json:"product_name"`
+	Quantity    float64 `json:"quantity"`
+	UnitPrice   float64 `json:"unit_price"`
+	LineTotal   float64 `json:"line_total"`
+}
+
 type reconciliationLine struct {
-	Date           string  `json:"date"`
-	Document       string  `json:"document"`
-	Description    string  `json:"description"`
-	Debit          float64 `json:"debit"`
-	Credit         float64 `json:"credit"`
-	RunningBalance float64 `json:"running_balance"`
+	Date           string                  `json:"date"`
+	Document       string                  `json:"document"`
+	Description    string                  `json:"description"`
+	Debit          float64                 `json:"debit"`
+	Credit         float64                 `json:"credit"`
+	RunningBalance float64                 `json:"running_balance"`
+	SourceType     string                  `json:"source_type,omitempty"`
+	SourceID       *uuid.UUID              `json:"source_id,omitempty"`
+	VehicleNumber  string                  `json:"vehicle_number,omitempty"`
+	Items          []reconciliationLineItem `json:"items,omitempty"`
 }
 
 // getUzDescription translates a journal entry source_type into an Uzbek description.
@@ -799,10 +811,10 @@ func (h *Handler) computeReconciliationData(tenantID, partnerID uuid.UUID, orgID
 		return
 	}
 
-	// 2. Transaction lines within the period
+	// 2. Transaction lines within the period (include source_type and source_id for detail lookup)
 	linesQuery := `
 		SELECT je.entry_date, je.entry_number, COALESCE(je.description, COALESCE(jel.description, '')),
-			   COALESCE(je.source_type, ''), jel.debit_amount, jel.credit_amount
+			   COALESCE(je.source_type, ''), je.source_id, jel.debit_amount, jel.credit_amount
 		FROM journal_entry_lines jel
 		JOIN journal_entries je ON jel.journal_entry_id = je.id
 		WHERE je.tenant_id = $1
@@ -827,24 +839,142 @@ func (h *Handler) computeReconciliationData(tenantID, partnerID uuid.UUID, orgID
 
 	lines = make([]reconciliationLine, 0)
 	runningBal := openingBalance
+	// Collect unique source_ids to batch-fetch line items later
+	sourceIDs := make(map[uuid.UUID]string) // source_id -> source_type
 	for rows.Next() {
 		var l reconciliationLine
 		var entryDate time.Time
 		var sourceType string
-		err = rows.Scan(&entryDate, &l.Document, &l.Description, &sourceType, &l.Debit, &l.Credit)
+		var sourceID *uuid.UUID
+		err = rows.Scan(&entryDate, &l.Document, &l.Description, &sourceType, &sourceID, &l.Debit, &l.Credit)
 		if err != nil {
 			return
 		}
 		l.Date = entryDate.Format("2006-01-02")
 		l.Description = getUzDescription(sourceType, l.Description)
+		l.SourceType = sourceType
+		l.SourceID = sourceID
 		runningBal += l.Debit - l.Credit
 		l.RunningBalance = runningBal
 		totalDebit += l.Debit
 		totalCredit += l.Credit
 		lines = append(lines, l)
+		if sourceID != nil && *sourceID != uuid.Nil {
+			sourceIDs[*sourceID] = sourceType
+		}
+	}
+
+	// 3. Enrich lines with product details and vehicle numbers
+	if len(sourceIDs) > 0 {
+		h.enrichReconciliationLines(tenantID, lines, sourceIDs)
 	}
 
 	return
+}
+
+// enrichReconciliationLines fetches product line items and vehicle numbers for source documents.
+func (h *Handler) enrichReconciliationLines(tenantID uuid.UUID, lines []reconciliationLine, sourceIDs map[uuid.UUID]string) {
+	// Collect invoice IDs and payment_receipt IDs
+	invoiceIDs := make([]uuid.UUID, 0)
+	for sid, stype := range sourceIDs {
+		if stype == "sales_invoice" || stype == "purchase_invoice" || stype == "payment_receipt" {
+			invoiceIDs = append(invoiceIDs, sid)
+		}
+	}
+
+	if len(invoiceIDs) == 0 {
+		return
+	}
+
+	// Fetch sales invoice line items with product names
+	itemsMap := make(map[uuid.UUID][]reconciliationLineItem)
+	vehicleMap := make(map[uuid.UUID]string)
+
+	// Query sales invoice lines with product names, and vehicle_number via sales_order
+	itemsQuery := `
+		SELECT si.id,
+			   COALESCE(p.name, sil.description, ''),
+			   COALESCE(sil.quantity, 0),
+			   COALESCE(sil.unit_price, 0),
+			   COALESCE(sil.line_total, 0),
+			   COALESCE(so.vehicle_number, '')
+		FROM sales_invoices si
+		JOIN sales_invoice_lines sil ON sil.sales_invoice_id = si.id
+		LEFT JOIN products p ON p.id = sil.product_id
+		LEFT JOIN sales_orders so ON so.id = si.sales_order_id
+		WHERE si.tenant_id = $1
+		  AND si.id = ANY($2)
+		ORDER BY si.id, sil.id
+	`
+
+	rows, err := h.db.Query(itemsQuery, tenantID, pq.Array(invoiceIDs))
+	if err != nil {
+		h.log.Warn("Failed to fetch invoice line items for reconciliation", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var invoiceID uuid.UUID
+		var item reconciliationLineItem
+		var vehicleNumber string
+		if err := rows.Scan(&invoiceID, &item.ProductName, &item.Quantity, &item.UnitPrice, &item.LineTotal, &vehicleNumber); err != nil {
+			continue
+		}
+		itemsMap[invoiceID] = append(itemsMap[invoiceID], item)
+		if vehicleNumber != "" {
+			vehicleMap[invoiceID] = vehicleNumber
+		}
+	}
+
+	// Also fetch purchase invoice lines if any
+	purchaseIDs := make([]uuid.UUID, 0)
+	for sid, stype := range sourceIDs {
+		if stype == "purchase_invoice" {
+			purchaseIDs = append(purchaseIDs, sid)
+		}
+	}
+
+	if len(purchaseIDs) > 0 {
+		piQuery := `
+			SELECT pi.id,
+				   COALESCE(p.name, pil.description, ''),
+				   COALESCE(pil.quantity, 0),
+				   COALESCE(pil.unit_price, 0),
+				   COALESCE(pil.line_total, 0)
+			FROM purchase_invoices pi
+			JOIN purchase_invoice_lines pil ON pil.purchase_invoice_id = pi.id
+			LEFT JOIN products p ON p.id = pil.product_id
+			WHERE pi.tenant_id = $1
+			  AND pi.id = ANY($2)
+			ORDER BY pi.id, pil.id
+		`
+		piRows, piErr := h.db.Query(piQuery, tenantID, pq.Array(purchaseIDs))
+		if piErr == nil {
+			defer piRows.Close()
+			for piRows.Next() {
+				var piID uuid.UUID
+				var item reconciliationLineItem
+				if err := piRows.Scan(&piID, &item.ProductName, &item.Quantity, &item.UnitPrice, &item.LineTotal); err != nil {
+					continue
+				}
+				itemsMap[piID] = append(itemsMap[piID], item)
+			}
+		}
+	}
+
+	// Assign items and vehicle numbers to reconciliation lines
+	for i := range lines {
+		if lines[i].SourceID != nil {
+			sid := *lines[i].SourceID
+			if items, ok := itemsMap[sid]; ok {
+				lines[i].Items = items
+			}
+			if vn, ok := vehicleMap[sid]; ok {
+				lines[i].VehicleNumber = vn
+			}
+		}
+	}
 }
 
 func (h *Handler) ListReconciliationActs(c *gin.Context) {

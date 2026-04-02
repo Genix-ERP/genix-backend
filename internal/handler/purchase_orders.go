@@ -64,6 +64,7 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 			   po.order_date, po.expected_date, po.subtotal, po.discount_amount,
 			   po.tax_amount, po.shipping_amount, po.total_amount, po.status,
 			   po.payment_status, po.payment_terms, po.vendor_reference, po.notes,
+			   po.vehicle_number, po.requires_shipping,
 			   po.approved_at, po.created_at, po.updated_at
 		FROM purchase_orders po
 		LEFT JOIN contacts c ON po.vendor_id = c.id
@@ -151,6 +152,7 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 		var expectedDate sql.NullTime
 		var paymentTerms sql.NullInt32
 		var vendorReference, notes sql.NullString
+		var vehicleNumberList sql.NullString
 		var approvedAt sql.NullTime
 		var vendorID sql.NullString
 		var vendorName sql.NullString
@@ -160,6 +162,7 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 			&po.OrderDate, &expectedDate, &po.Subtotal, &po.DiscountAmount,
 			&po.TaxAmount, &po.ShippingAmount, &po.TotalAmount, &po.Status,
 			&po.PaymentStatus, &paymentTerms, &vendorReference, &notes,
+			&vehicleNumberList, &po.RequiresShipping,
 			&approvedAt, &po.CreatedAt, &po.UpdatedAt,
 		)
 		if err != nil {
@@ -188,6 +191,9 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 		}
 		if approvedAt.Valid {
 			po.ApprovedAt = &approvedAt.Time
+		}
+		if vehicleNumberList.Valid {
+			po.VehicleNumber = &vehicleNumberList.String
 		}
 
 		orders = append(orders, &po)
@@ -343,6 +349,16 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		internalNotes = &input.InternalNotes
 	}
 
+	var vehicleNumber *string
+	if input.VehicleNumber != "" {
+		vehicleNumber = &input.VehicleNumber
+	}
+
+	requiresShipping := true
+	if input.RequiresShipping != nil {
+		requiresShipping = *input.RequiresShipping
+	}
+
 	// Get organization ID
 	orgID, _ := middleware.GetOrganizationID(c)
 	var orgIDPtr *uuid.UUID
@@ -366,9 +382,9 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			order_date, expected_date, currency_id, exchange_rate,
 			subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
 			status, payment_status, payment_terms, vendor_reference,
-			notes, internal_notes, warehouse_id, requested_by,
+			notes, internal_notes, warehouse_id, vehicle_number, requires_shipping, requested_by,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 	`
 
 	_, err = tx.Exec(query,
@@ -376,7 +392,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		orderDate, expectedDate, currencyID, exchangeRate,
 		subtotal, discountTotal, taxTotal, input.ShippingAmount, totalAmount,
 		entity.POStatusDraft, entity.PaymentStatusUnpaid, paymentTerms, vendorReference,
-		notes, internalNotes, warehouseID, userID,
+		notes, internalNotes, warehouseID, vehicleNumber, requiresShipping, userID,
 		now, now,
 	)
 	if err != nil {
@@ -495,11 +511,13 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		Status:          entity.POStatusDraft,
 		PaymentStatus:   entity.PaymentStatusUnpaid,
 		PaymentTerms:    &paymentTerms,
-		VendorReference: vendorReference,
-		Notes:           notes,
-		Lines:           lines,
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		VendorReference:  vendorReference,
+		Notes:            notes,
+		VehicleNumber:    vehicleNumber,
+		RequiresShipping: requiresShipping,
+		Lines:            lines,
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
 
 	response.Created(c, resp)
@@ -539,7 +557,9 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			   po.contact_person_id, po.order_date, po.expected_date,
 			   po.subtotal, po.discount_amount, po.tax_amount, po.shipping_amount,
 			   po.total_amount, po.status, po.payment_status, po.payment_terms,
-			   po.vendor_reference, po.notes, po.approved_at, po.created_at, po.updated_at
+			   po.vendor_reference, po.notes,
+			   po.vehicle_number, po.requires_shipping,
+			   po.approved_at, po.created_at, po.updated_at
 		FROM purchase_orders po
 		LEFT JOIN contacts c ON po.vendor_id = c.id
 		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL
@@ -551,13 +571,16 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	var vendorID, vendorName sql.NullString
 	var paymentTerms sql.NullInt32
 	var vendorReference, notes sql.NullString
+	var vehicleNumber sql.NullString
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&po.ID, &po.OrderNumber, &vendorID, &vendorName,
 		&contactPersonID, &po.OrderDate, &expectedDate,
 		&po.Subtotal, &po.DiscountAmount, &po.TaxAmount, &po.ShippingAmount,
 		&po.TotalAmount, &po.Status, &po.PaymentStatus, &paymentTerms,
-		&vendorReference, &notes, &approvedAt, &po.CreatedAt, &po.UpdatedAt,
+		&vendorReference, &notes,
+		&vehicleNumber, &po.RequiresShipping,
+		&approvedAt, &po.CreatedAt, &po.UpdatedAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -598,6 +621,9 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	}
 	if approvedAt.Valid {
 		po.ApprovedAt = &approvedAt.Time
+	}
+	if vehicleNumber.Valid {
+		po.VehicleNumber = &vehicleNumber.String
 	}
 
 	// Get line items
@@ -800,6 +826,16 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("internal_notes = $%d", argCount))
 		args = append(args, *input.InternalNotes)
+	}
+	if input.VehicleNumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("vehicle_number = $%d", argCount))
+		args = append(args, *input.VehicleNumber)
+	}
+	if input.RequiresShipping != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("requires_shipping = $%d", argCount))
+		args = append(args, *input.RequiresShipping)
 	}
 	if input.ShippingAmount != nil {
 		argCount++
