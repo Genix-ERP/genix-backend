@@ -487,13 +487,12 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	`, progressPct, now, productionOrderID, tenantID)
 
 	if nextErr == nil {
-		// Auto-start next work order
+		// Mark next work order as ready — worker must press Start manually
 		h.db.Exec(`
 			UPDATE work_orders
-			SET status = 'in_progress', actual_start = $1, started_by = $2,
-				quantity_to_produce = $3
-			WHERE id = $4 AND tenant_id = $5
-		`, now, userID, input.QuantityProduced, nextWoID, tenantID)
+			SET status = 'ready', updated_at = $1
+			WHERE id = $2 AND tenant_id = $3
+		`, now, nextWoID, tenantID)
 
 		// Advance production order stage to next operation
 		nextStage := fmt.Sprintf("op_%d", nextSequence)
