@@ -717,6 +717,16 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
+	// If replace mode, delete all existing lines first
+	if req.Replace {
+		_, err := tx.Exec(`DELETE FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`, estimateID, tenantID)
+		if err != nil {
+			h.log.Error("Failed to clear existing estimate lines", "error", err)
+			response.InternalError(c, "Failed to clear existing lines")
+			return
+		}
+	}
+
 	count := 0
 	for i, line := range req.Lines {
 		unitRate := line.MaterialRate + line.LaborRate + line.EquipmentRate

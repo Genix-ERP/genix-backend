@@ -123,6 +123,7 @@ type EmployeeResponse struct {
 	Email            string     `json:"email,omitempty"`
 	Phone            string     `json:"phone,omitempty"`
 	JobTitle         string     `json:"job_title,omitempty"`
+	DepartmentID     string     `json:"department_id,omitempty"`
 	Department       string     `json:"department,omitempty"`
 	HireDate         string     `json:"hire_date"`
 	Status           string     `json:"status"`
@@ -147,6 +148,7 @@ func (e *Employee) ToResponse() *EmployeeResponse {
 		PerformanceScore: e.PerformanceScore,
 		TurnoverRisk:     e.TurnoverRisk,
 		Department:       e.Department,
+		DepartmentID:     func() string { if e.DepartmentID != nil { return e.DepartmentID.String() }; return "" }(),
 		CreatedAt:        e.CreatedAt,
 		UpdatedAt:        e.UpdatedAt,
 	}

@@ -808,6 +808,14 @@ func (h *Handler) UpdateCurrentUser(c *gin.Context) {
 		return
 	}
 
+	// Sync phone/email changes to linked employee record
+	if input.Phone != nil {
+		h.db.Exec("UPDATE employees SET phone = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", *input.Phone, claims.UserID)
+	}
+	if input.Email != nil {
+		h.db.Exec("UPDATE employees SET email = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", *input.Email, claims.UserID)
+	}
+
 	// Return updated user
 	h.GetCurrentUser(c)
 }
@@ -2205,6 +2213,9 @@ func (h *Handler) UpdateCurrentUserEmail(c *gin.Context) {
 		return
 	}
 
+	// Sync email to linked employee record
+	h.db.Exec("UPDATE employees SET email = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", input.Email, claims.UserID)
+
 	h.GetCurrentUser(c)
 }
 
@@ -2330,6 +2341,9 @@ func (h *Handler) VerifyPhoneOTP(c *gin.Context) {
 		response.InternalServerError(c, "Failed to update phone number")
 		return
 	}
+
+	// Sync phone to linked employee record
+	h.db.Exec("UPDATE employees SET phone = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", input.Phone, claims.UserID)
 
 	// Return the updated user
 	h.GetCurrentUser(c)
