@@ -268,12 +268,6 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 		return
 	}
 
-	// Validate contract amount is provided and positive
-	if req.ContractAmount <= 0 {
-		response.BadRequest(c, "Contract amount is required and must be greater than 0")
-		return
-	}
-
 	// Auto-generate code if not provided
 	if req.Code == "" {
 		req.Code = fmt.Sprintf("PRJ-%d", time.Now().UnixMilli())
