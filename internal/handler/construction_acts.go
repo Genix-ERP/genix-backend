@@ -217,7 +217,7 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 		} `json:"lines"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Akt turi (act_type) kiritilishi shart")
+		response.BadRequest(c, "Akt turi tanlanishi shart")
 		return
 	}
 

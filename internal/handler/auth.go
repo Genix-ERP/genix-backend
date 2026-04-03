@@ -247,8 +247,8 @@ func (h *Handler) Register(c *gin.Context) {
 	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
 
 	_, err = tx.Exec(`
-		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, false, $8, $8)
+		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, role, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, false, 'owner', $8, $8)
 	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
@@ -1552,8 +1552,8 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
 
 	_, err = tx.Exec(`
-		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, true, false, $8, $8)
+		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, role, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, true, true, false, 'owner', $8, $8)
 	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
@@ -2010,8 +2010,8 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 	_, err = tx.Exec(`
 		INSERT INTO users (id, tenant_id, email, first_name, last_name, settings,
 		                   is_active, is_verified, is_system_admin, auth_provider, google_id,
-		                   avatar_url, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, true, true, false, 'google', $7, $8, $9, $9)
+		                   avatar_url, role, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, true, true, false, 'google', $7, $8, 'owner', $9, $9)
 	`, userID, tenantID, email, firstName, lastName, defaultUserSettings, googleSub, picture, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
