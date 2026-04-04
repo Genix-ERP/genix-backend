@@ -955,6 +955,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		accounts.GET("/:id/transactions", h.GetAccountTransactions)
 	}
 
+	// Payment journals (bank/cash only) — no finance permission required, any authenticated user can access
+	rg.GET("/journals/payment", h.ListPaymentJournals)
+
 	// Journals (accounting journals like GEN, SAL, PUR, MISC)
 	journalGroup := rg.Group("/journals")
 	journalGroup.Use(h.perm.Require("finance", "journal", "read"))
@@ -1956,6 +1959,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		subcontracts.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateSubcontract)
 		subcontracts.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteSubcontract)
 		subcontracts.PUT("/:id/state", h.perm.Require("construction", "project", "update"), h.UpdateSubcontractState)
+	}
+
+	// Act Types (user-manageable list of act types)
+	actTypes := rg.Group("/construction/act-types")
+	actTypes.Use(h.perm.Require("construction", "project", "read"))
+	{
+		actTypes.GET("", h.ListConstructionActTypes)
+		actTypes.POST("", h.perm.Require("construction", "project", "update"), h.CreateConstructionActType)
+		actTypes.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionActType)
 	}
 
 	// Acts (direct access) — Forma 2 / Forma 3 / Forma 19

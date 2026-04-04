@@ -221,11 +221,8 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 		return
 	}
 
-	validTypes := map[string]bool{
-		"ks2": true, "ks3": true, "hidden_work": true, "acceptance": true, "defect": true,
-	}
-	if !validTypes[req.ActType] {
-		response.BadRequest(c, "Noto'g'ri akt turi")
+	if req.ActType == "" {
+		response.BadRequest(c, "Akt turi tanlanishi shart")
 		return
 	}
 
@@ -257,10 +254,6 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 
 	// Forma 2 validations
 	if req.ActType == "ks2" {
-		if req.SubcontractID == 0 {
-			response.BadRequest(c, "KS-2 akti uchun subpudratchi tanlang")
-			return
-		}
 		// Validate qty_period <= remaining by smeta for each line
 		for _, line := range req.Lines {
 			if line.EstimateLineID > 0 && line.Quantity > 0 {
@@ -686,38 +679,64 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	var req struct {
-		SubcontractID int64  `json:"subcontract_id" binding:"required"`
+		SubcontractID int64  `json:"subcontract_id"`
 		PeriodFrom    string `json:"period_from" binding:"required"`
 		PeriodTo      string `json:"period_to" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Subpudratchi, boshlanish va tugash sanalarini kiriting")
+		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
 		return
 	}
 
 	userID, _ := middleware.GetUserID(c)
 
-	// Get WBS IDs linked to this subcontract
-	wbsRows, err := h.db.Query(
-		`SELECT wbs_id FROM construction_subcontract_wbs WHERE subcontract_id = $1`, req.SubcontractID)
-	if err != nil {
-		h.log.Error("Failed to get subcontract WBS", "error", err)
-		response.InternalError(c, "Failed to get subcontract WBS items")
-		return
-	}
-	defer wbsRows.Close()
-
 	wbsIDs := []int64{}
-	for wbsRows.Next() {
-		var wbsID int64
-		if wbsRows.Scan(&wbsID) == nil {
-			wbsIDs = append(wbsIDs, wbsID)
-		}
-	}
 
-	if len(wbsIDs) == 0 {
-		response.BadRequest(c, "Subpudratchi WBS elementlariga bog'lanmagan")
-		return
+	if req.SubcontractID > 0 {
+		// Get WBS IDs linked to this subcontract
+		wbsRows, err := h.db.Query(
+			`SELECT wbs_id FROM construction_subcontract_wbs WHERE subcontract_id = $1`, req.SubcontractID)
+		if err != nil {
+			h.log.Error("Failed to get subcontract WBS", "error", err)
+			response.InternalError(c, "Failed to get subcontract WBS items")
+			return
+		}
+		defer wbsRows.Close()
+
+		for wbsRows.Next() {
+			var wbsID int64
+			if wbsRows.Scan(&wbsID) == nil {
+				wbsIDs = append(wbsIDs, wbsID)
+			}
+		}
+
+		if len(wbsIDs) == 0 {
+			response.BadRequest(c, "Subpudratchi WBS elementlariga bog'lanmagan")
+			return
+		}
+	} else {
+		// Own forces: get ALL WBS IDs for this project
+		wbsRows, err := h.db.Query(
+			`SELECT id FROM construction_wbs WHERE project_id = $1 AND tenant_id = $2 AND is_active = true`,
+			projectID, tenantID)
+		if err != nil {
+			h.log.Error("Failed to get project WBS", "error", err)
+			response.InternalError(c, "Failed to get project WBS items")
+			return
+		}
+		defer wbsRows.Close()
+
+		for wbsRows.Next() {
+			var wbsID int64
+			if wbsRows.Scan(&wbsID) == nil {
+				wbsIDs = append(wbsIDs, wbsID)
+			}
+		}
+
+		if len(wbsIDs) == 0 {
+			response.BadRequest(c, "Loyihada WBS elementlari topilmadi")
+			return
+		}
 	}
 
 	type actLineData struct {
@@ -775,7 +794,11 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	if len(lineDataList) == 0 {
-		response.BadRequest(c, "Tanlangan davr uchun bu subpudratchi bo'yicha ishlar topilmadi")
+		if req.SubcontractID > 0 {
+			response.BadRequest(c, "Tanlangan davr uchun bu subpudratchi bo'yicha ishlar topilmadi")
+		} else {
+			response.BadRequest(c, "Tanlangan davr uchun ishlar topilmadi")
+		}
 		return
 	}
 
@@ -785,8 +808,13 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	name := fmt.Sprintf("KS2-%03d", count+1)
 
 	var actNumber int
-	h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id = $1 AND act_type = 'ks2' AND tenant_id = $2`,
-		req.SubcontractID, tenantID).Scan(&actNumber)
+	if req.SubcontractID > 0 {
+		h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id = $1 AND act_type = 'ks2' AND tenant_id = $2`,
+			req.SubcontractID, tenantID).Scan(&actNumber)
+	} else {
+		h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id IS NULL AND act_type = 'ks2' AND project_id = $1 AND tenant_id = $2`,
+			projectID, tenantID).Scan(&actNumber)
+	}
 
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -804,7 +832,7 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 			act_number, vat_pct
 		) VALUES ($1, $2, $3, $4, 'ks2', $5, $6, 0, 'UZS', 'draft', $7, NOW(), NOW(), $8, 12)
 		RETURNING id
-	`, tenantID, projectID, req.SubcontractID, name, req.PeriodFrom, req.PeriodTo, userID, actNumber,
+	`, tenantID, projectID, nullInt64FromVal(req.SubcontractID), name, req.PeriodFrom, req.PeriodTo, userID, actNumber,
 	).Scan(&actID)
 	if err != nil {
 		h.log.Error("Failed to create KS-2 act", "error", err)
@@ -1260,26 +1288,37 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	}
 
 	var req struct {
-		SubcontractID int64  `json:"subcontract_id" binding:"required"`
+		SubcontractID int64  `json:"subcontract_id"`
 		PeriodFrom    string `json:"period_from" binding:"required"`
 		PeriodTo      string `json:"period_to" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.BadRequest(c, "Subpudratchi, boshlanish va tugash sanalarini kiriting")
+		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
 		return
 	}
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Build subcontract filter for SQL queries
+	var subFilter string
+	var subFilterArgs []interface{}
+	if req.SubcontractID > 0 {
+		subFilter = "subcontract_id = $1"
+		subFilterArgs = []interface{}{req.SubcontractID}
+	} else {
+		subFilter = "subcontract_id IS NULL AND project_id = $1"
+		subFilterArgs = []interface{}{projectID}
+	}
+
 	// Check there are signed KS-2 acts for this period
 	var periodAmount float64
-	err = h.db.QueryRow(`
+	err = h.db.QueryRow(fmt.Sprintf(`
 		SELECT COALESCE(SUM(amount_total), 0)
 		FROM construction_act
-		WHERE subcontract_id = $1 AND act_type = 'ks2' AND state = 'signed'
+		WHERE %s AND act_type = 'ks2' AND state = 'signed'
 		  AND period_from >= $2::date AND period_to <= $3::date
 		  AND tenant_id = $4
-	`, req.SubcontractID, req.PeriodFrom, req.PeriodTo, tenantID).Scan(&periodAmount)
+	`, subFilter), append(subFilterArgs, req.PeriodFrom, req.PeriodTo, tenantID)...).Scan(&periodAmount)
 	if err != nil || periodAmount == 0 {
 		response.BadRequest(c, "Tanlangan davr uchun imzolangan KS-2 aktlar topilmadi")
 		return
@@ -1287,22 +1326,22 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 
 	// Cumulative from start of construction
 	var cumulFromStart float64
-	h.db.QueryRow(`
+	h.db.QueryRow(fmt.Sprintf(`
 		SELECT COALESCE(SUM(amount_total), 0)
 		FROM construction_act
-		WHERE subcontract_id = $1 AND act_type = 'ks2' AND state = 'signed' AND tenant_id = $2
-	`, req.SubcontractID, tenantID).Scan(&cumulFromStart)
+		WHERE %s AND act_type = 'ks2' AND state = 'signed' AND tenant_id = $2
+	`, subFilter), append(subFilterArgs, tenantID)...).Scan(&cumulFromStart)
 
 	// Cumulative from start of year
 	periodYear := req.PeriodFrom[:4] // Extract year
 	yearStart := periodYear + "-01-01"
 	var cumulFromYearStart float64
-	h.db.QueryRow(`
+	h.db.QueryRow(fmt.Sprintf(`
 		SELECT COALESCE(SUM(amount_total), 0)
 		FROM construction_act
-		WHERE subcontract_id = $1 AND act_type = 'ks2' AND state = 'signed'
+		WHERE %s AND act_type = 'ks2' AND state = 'signed'
 		  AND period_from >= $2::date AND tenant_id = $3
-	`, req.SubcontractID, yearStart, tenantID).Scan(&cumulFromYearStart)
+	`, subFilter), append(subFilterArgs, yearStart, tenantID)...).Scan(&cumulFromYearStart)
 
 	cumulPrevPeriod := cumulFromStart - periodAmount
 
@@ -1318,8 +1357,13 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	name := fmt.Sprintf("KS3-%03d", count+1)
 
 	var actNumber int
-	h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id = $1 AND act_type = 'ks3' AND tenant_id = $2`,
-		req.SubcontractID, tenantID).Scan(&actNumber)
+	if req.SubcontractID > 0 {
+		h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id = $1 AND act_type = 'ks3' AND tenant_id = $2`,
+			req.SubcontractID, tenantID).Scan(&actNumber)
+	} else {
+		h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id IS NULL AND act_type = 'ks3' AND project_id = $1 AND tenant_id = $2`,
+			projectID, tenantID).Scan(&actNumber)
+	}
 
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -1342,7 +1386,7 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 			$7, 0, 0
 		)
 		RETURNING id
-	`, tenantID, projectID, req.SubcontractID, name,
+	`, tenantID, projectID, nullInt64FromVal(req.SubcontractID), name,
 		req.PeriodFrom, req.PeriodTo, periodAmount, vatPct, vatAmount, totalWithVat,
 		userID,
 		actNumber, cumulFromStart, cumulFromYearStart, cumulPrevPeriod,
@@ -1354,16 +1398,32 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	}
 
 	// Copy lines from all signed KS-2 in the period
-	_, err = tx.Exec(`
-		INSERT INTO construction_act_line (act_id, wbs_id, estimate_line_id, name, uom, quantity, unit_rate, total_amount, sort_order, qty_smeta, note)
-		SELECT $1, al.wbs_id, al.estimate_line_id, al.name, al.uom, al.quantity, al.unit_rate, al.total_amount, al.sort_order, al.qty_smeta, al.note
-		FROM construction_act_line al
-		JOIN construction_act a ON a.id = al.act_id
-		WHERE a.subcontract_id = $2 AND a.act_type = 'ks2' AND a.state = 'signed'
-		  AND a.period_from >= $3::date AND a.period_to <= $4::date
-		  AND a.tenant_id = $5
-		ORDER BY al.sort_order
-	`, ks3ID, req.SubcontractID, req.PeriodFrom, req.PeriodTo, tenantID)
+	var copyQuery string
+	var copyArgs []interface{}
+	if req.SubcontractID > 0 {
+		copyQuery = `
+			INSERT INTO construction_act_line (act_id, wbs_id, estimate_line_id, name, uom, quantity, unit_rate, total_amount, sort_order, qty_smeta, note)
+			SELECT $1, al.wbs_id, al.estimate_line_id, al.name, al.uom, al.quantity, al.unit_rate, al.total_amount, al.sort_order, al.qty_smeta, al.note
+			FROM construction_act_line al
+			JOIN construction_act a ON a.id = al.act_id
+			WHERE a.subcontract_id = $2 AND a.act_type = 'ks2' AND a.state = 'signed'
+			  AND a.period_from >= $3::date AND a.period_to <= $4::date
+			  AND a.tenant_id = $5
+			ORDER BY al.sort_order`
+		copyArgs = []interface{}{ks3ID, req.SubcontractID, req.PeriodFrom, req.PeriodTo, tenantID}
+	} else {
+		copyQuery = `
+			INSERT INTO construction_act_line (act_id, wbs_id, estimate_line_id, name, uom, quantity, unit_rate, total_amount, sort_order, qty_smeta, note)
+			SELECT $1, al.wbs_id, al.estimate_line_id, al.name, al.uom, al.quantity, al.unit_rate, al.total_amount, al.sort_order, al.qty_smeta, al.note
+			FROM construction_act_line al
+			JOIN construction_act a ON a.id = al.act_id
+			WHERE a.subcontract_id IS NULL AND a.project_id = $2 AND a.act_type = 'ks2' AND a.state = 'signed'
+			  AND a.period_from >= $3::date AND a.period_to <= $4::date
+			  AND a.tenant_id = $5
+			ORDER BY al.sort_order`
+		copyArgs = []interface{}{ks3ID, projectID, req.PeriodFrom, req.PeriodTo, tenantID}
+	}
+	_, err = tx.Exec(copyQuery, copyArgs...)
 	if err != nil {
 		h.log.Error("Failed to copy lines to KS-3", "error", err)
 		response.InternalError(c, "Failed to create KS-3 lines")
