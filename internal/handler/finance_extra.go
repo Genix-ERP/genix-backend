@@ -415,7 +415,7 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 		SELECT DISTINCT ON (c.id) c.id, c.code, er.rate
 		FROM currencies c
 		JOIN exchange_rates er ON er.from_currency_id = c.id AND er.tenant_id = $1
-		WHERE c.tenant_id = $1 AND c.is_base_currency = false AND c.deleted_at IS NULL
+		WHERE c.is_base_currency = false AND c.is_active = true
 		ORDER BY c.id, er.effective_date DESC
 	`, tenantID)
 	if err != nil {
@@ -444,7 +444,7 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 			COALESCE(cu.name, '') as partner_name, si.invoice_date
 		FROM sales_invoices si
 		LEFT JOIN currencies c ON si.currency_id = c.id
-		LEFT JOIN customers cu ON si.customer_id = cu.id
+		LEFT JOIN contacts cu ON si.customer_id = cu.id
 		WHERE si.tenant_id = $1 %s
 			AND si.currency_id IS NOT NULL
 			AND si.exchange_rate > 1
@@ -505,7 +505,7 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 			COALESCE(s.name, '') as partner_name, pi.bill_date
 		FROM purchase_invoices pi
 		LEFT JOIN currencies c ON pi.currency_id = c.id
-		LEFT JOIN suppliers s ON pi.supplier_id = s.id
+		LEFT JOIN contacts s ON pi.supplier_id = s.id
 		WHERE pi.tenant_id = $1 %s
 			AND pi.currency_id IS NOT NULL
 			AND COALESCE(pi.exchange_rate, 1) > 1

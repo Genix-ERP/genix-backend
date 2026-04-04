@@ -990,10 +990,10 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 					lineID := uuid.New()
 					tx.Exec(`
 						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, line_number, account_id, contact_id, description,
+							id, journal_entry_id, line_number, account_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						lineID, journalEntryID, lineNumber, inputAcct, vendorID, "Stock Interim Receipt",
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						lineID, journalEntryID, lineNumber, inputAcct, "Stock Interim Receipt",
 						amount, 0.0, 1.0, now,
 					)
 					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct)

@@ -133,6 +133,7 @@ type CreateAccountInput struct {
 // UpdateAccountInput is the input for updating an account
 type UpdateAccountInput struct {
 	ParentID         *string  `json:"parent_id"`
+	Code             *string  `json:"code"`
 	Name             *string  `json:"name"`
 	Description      *string  `json:"description"`
 	InternalType     *string  `json:"internal_type"`
@@ -757,6 +758,8 @@ type TrialBalanceAccount struct {
 	AccountID     uuid.UUID              `json:"account_id"`
 	AccountCode   string                 `json:"account_code"`
 	AccountName   string                 `json:"account_name"`
+	AccountNameUz string                 `json:"account_name_uz,omitempty"`
+	AccountNameEn string                 `json:"account_name_en,omitempty"`
 	Category      string                 `json:"category"`
 	DebitBalance  float64                `json:"debit_balance"`
 	CreditBalance float64                `json:"credit_balance"`
@@ -785,10 +788,12 @@ type BalanceSheetSection struct {
 
 // BalanceSheetAccount represents an account in balance sheet
 type BalanceSheetAccount struct {
-	AccountID   uuid.UUID `json:"account_id"`
-	AccountCode string    `json:"account_code"`
-	AccountName string    `json:"account_name"`
-	Balance     float64   `json:"balance"`
+	AccountID     uuid.UUID `json:"account_id"`
+	AccountCode   string    `json:"account_code"`
+	AccountName   string    `json:"account_name"`
+	AccountNameUz string    `json:"account_name_uz,omitempty"`
+	AccountNameEn string    `json:"account_name_en,omitempty"`
+	Balance       float64   `json:"balance"`
 }
 
 // IncomeStatementReport represents income statement (P&L) data
@@ -811,10 +816,12 @@ type IncomeStatementReport struct {
 
 // IncomeStatementSection represents a section in income statement
 type IncomeStatementSection struct {
-	AccountID   uuid.UUID `json:"account_id"`
-	AccountCode string    `json:"account_code"`
-	AccountName string    `json:"account_name"`
-	Amount      float64   `json:"amount"`
+	AccountID     uuid.UUID `json:"account_id"`
+	AccountCode   string    `json:"account_code"`
+	AccountName   string    `json:"account_name"`
+	AccountNameUz string    `json:"account_name_uz,omitempty"`
+	AccountNameEn string    `json:"account_name_en,omitempty"`
+	Amount        float64   `json:"amount"`
 }
 
 // GeneralLedgerReport represents general ledger data

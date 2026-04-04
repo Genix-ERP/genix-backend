@@ -1187,6 +1187,81 @@ func (h *Handler) ListJournals(c *gin.Context) {
 	response.Success(c, journals)
 }
 
+// ListPaymentJournals returns only bank/cash journals for payment flows.
+// This endpoint requires no finance permissions — any authenticated user can call it.
+func (h *Handler) ListPaymentJournals(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	query := `
+		SELECT j.id, j.code, j.name, COALESCE(j.name_uz, ''), COALESCE(j.name_en, ''), j.type,
+			COALESCE(j.short_code, ''), COALESCE(j.currency, ''),
+			j.default_debit_account_id, j.default_credit_account_id,
+			j.bank_account_id, j.suspense_account_id,
+			j.profit_account_id, j.loss_account_id
+		FROM journals j
+		WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
+		  AND j.type IN ('bank', 'cash')
+		  AND COALESCE(j.is_active, true) = true
+		ORDER BY j.code ASC
+	`
+
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND (j.organization_id = $%d OR j.organization_id IS NULL) ORDER BY", argCount), 1)
+		args = append(args, orgID)
+	}
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to query payment journals", "error", err)
+		response.InternalError(c, "Failed to fetch payment journals")
+		return
+	}
+	defer rows.Close()
+
+	type PaymentJournal struct {
+		ID                     uuid.UUID  `json:"id"`
+		Code                   string     `json:"code"`
+		Name                   string     `json:"name"`
+		NameUz                 string     `json:"name_uz,omitempty"`
+		NameEn                 string     `json:"name_en,omitempty"`
+		Type                   string     `json:"type"`
+		ShortCode              string     `json:"short_code"`
+		Currency               string     `json:"currency"`
+		DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty"`
+		DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty"`
+		BankAccountID          *uuid.UUID `json:"bank_account_id,omitempty"`
+		SuspenseAccountID      *uuid.UUID `json:"suspense_account_id,omitempty"`
+		ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty"`
+		LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty"`
+		IsActive               bool       `json:"is_active"`
+	}
+
+	journals := make([]PaymentJournal, 0)
+	for rows.Next() {
+		var j PaymentJournal
+		j.IsActive = true
+		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.NameUz, &j.NameEn, &j.Type,
+			&j.ShortCode, &j.Currency,
+			&j.DefaultDebitAccountID, &j.DefaultCreditAccountID,
+			&j.BankAccountID, &j.SuspenseAccountID,
+			&j.ProfitAccountID, &j.LossAccountID); err != nil {
+			h.log.Error("Failed to scan payment journal", "error", err)
+			continue
+		}
+		journals = append(journals, j)
+	}
+
+	response.Success(c, journals)
+}
+
 // GetJournal godoc
 // @Summary Get journal by ID
 // @Description Get detailed information about a specific journal
