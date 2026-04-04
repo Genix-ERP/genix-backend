@@ -353,9 +353,18 @@ func TrialCheck(db *database.DB) gin.HandlerFunc {
 		// Allow auth and subscription routes unconditionally
 		path := c.FullPath()
 		if strings.HasPrefix(path, "/api/v1/auth/") ||
-			strings.HasPrefix(path, "/api/v1/subscription") {
+			strings.HasPrefix(path, "/api/v1/subscription") ||
+			strings.HasPrefix(path, "/api/v1/admin/") {
 			c.Next()
 			return
+		}
+
+		// System admins bypass trial checks entirely
+		if claims, exists := c.Get(ContextKeyClaims); exists {
+			if jwtClaims, ok := claims.(*crypto.Claims); ok && jwtClaims.IsSystemAdmin {
+				c.Next()
+				return
+			}
 		}
 
 		tenantID := c.GetString(ContextKeyTenantID)
