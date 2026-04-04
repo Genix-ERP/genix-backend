@@ -54,6 +54,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		protected.Use(middleware.Auth(h.jwtManager))
 		protected.Use(middleware.TenantResolver())
 		protected.Use(middleware.OrganizationResolver())
+		protected.Use(middleware.TrialCheck(h.db))
 		h.registerProtectedRoutes(protected)
 	}
 
@@ -100,6 +101,13 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 
 // registerProtectedRoutes registers routes that require authentication
 func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
+	// Subscription / trial status (allowed even when trial expired — TrialCheck skips these)
+	subscription := rg.Group("/subscription")
+	{
+		subscription.GET("/status", h.GetSubscriptionStatus)
+		subscription.POST("/activate", h.ActivateSubscription)
+	}
+
 	// Authentication (protected)
 	auth := rg.Group("/auth")
 	{
@@ -1369,6 +1377,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		admin.GET("/users", h.ListAllSystemUsers)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
+		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
 	}
 
 	// Audit Logs

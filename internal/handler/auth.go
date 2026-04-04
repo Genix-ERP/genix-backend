@@ -227,8 +227,8 @@ func (h *Handler) Register(c *gin.Context) {
 	})
 
 	_, err = tx.Exec(`
-		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status)
-		VALUES ($1, $2, $3, $4, 'free', 'active')
+		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status, trial_ends_at, account_clear_at)
+		VALUES ($1, $2, $3, $4, 'free', 'trialing', NOW() + INTERVAL '7 days', NOW() + INTERVAL '30 days')
 	`, tenantID, input.TenantCode, input.TenantName, defaultSettings)
 	if err != nil {
 		h.log.Error("Failed to create tenant", "error", err)
@@ -1572,8 +1572,8 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 	})
 
 	_, err = tx.Exec(`
-		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status)
-		VALUES ($1, $2, $3, $4, 'free', 'active')
+		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status, trial_ends_at, account_clear_at)
+		VALUES ($1, $2, $3, $4, 'free', 'trialing', NOW() + INTERVAL '7 days', NOW() + INTERVAL '30 days')
 	`, tenantID, input.TenantCode, input.TenantName, defaultSettings)
 	if err != nil {
 		h.log.Error("Failed to create tenant", "error", err)
@@ -2045,8 +2045,8 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 	})
 
 	_, err = tx.Exec(`
-		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status)
-		VALUES ($1, $2, $3, $4, 'free', 'active')
+		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status, trial_ends_at, account_clear_at)
+		VALUES ($1, $2, $3, $4, 'free', 'trialing', NOW() + INTERVAL '7 days', NOW() + INTERVAL '30 days')
 	`, tenantID, tenantCode, companyName, defaultSettings)
 	if err != nil {
 		h.log.Error("Failed to create tenant", "error", err)
