@@ -1894,13 +1894,27 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	}
 	var poLines []poLine
 
-	// Use quantity_received if partial receipt, otherwise fall back to ordered quantity
+	// Use quantity_received if set; otherwise check stock op done_qty (bill created mid-receipt);
+	// only fall back to full ordered quantity if no receipt activity at all.
 	linesRows, err := tx.Query(`
-		SELECT id, product_id, description,
-		       CASE WHEN quantity_received > 0 THEN quantity_received ELSE quantity END AS bill_qty,
-		       unit_price, COALESCE(tax_amount, 0)
-		FROM purchase_order_lines
-		WHERE purchase_order_id = $1`, poID)
+		SELECT pol.id, pol.product_id, pol.description,
+		       CASE
+		           WHEN pol.quantity_received > 0 THEN pol.quantity_received
+		           WHEN COALESCE(sol_agg.done_qty, 0) > 0 THEN sol_agg.done_qty
+		           ELSE pol.quantity
+		       END AS bill_qty,
+		       pol.unit_price, COALESCE(pol.tax_amount, 0)
+		FROM purchase_order_lines pol
+		LEFT JOIN (
+		    SELECT sol.product_id, SUM(sol.done_qty) AS done_qty
+		    FROM stock_operation_lines sol
+		    JOIN stock_operations so ON so.id = sol.operation_id
+		    WHERE so.source_id = $1 AND so.source_type = 'purchase_order'
+		      AND so.direction = 'receipt' AND so.tenant_id = $2
+		      AND so.deleted_at IS NULL AND so.state != 'cancelled'
+		    GROUP BY sol.product_id
+		) sol_agg ON sol_agg.product_id = pol.product_id
+		WHERE pol.purchase_order_id = $1`, poID, tenantID)
 	if err == nil {
 		for linesRows.Next() {
 			var pl poLine
@@ -1921,9 +1935,9 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	}
 	billTotal := billSubtotal + billTaxTotal
 
-	// Update the bill header with corrected amounts
+	// Update the bill header with corrected amounts (based on received qty, not ordered qty)
 	if _, err = tx.Exec(`
-		UPDATE purchase_invoices SET subtotal = $1, tax_amount = $2, total_amount = $3, updated_at = $4
+		UPDATE purchase_invoices SET subtotal = $1, tax_amount = $2, total_amount = $3, amount_due = $3, updated_at = $4
 		WHERE id = $5`, billSubtotal, billTaxTotal, billTotal, now, billID); err != nil {
 		h.log.Error("CreateBillFromPO: failed to update bill totals", "error", err)
 	}
