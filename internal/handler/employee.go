@@ -3,12 +3,14 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/crypto"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -338,23 +340,64 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		return
 	}
 
-	// Link the user to this employee record (if user exists with same email or phone)
-	if input.Email != "" {
-		_, linkErr := h.db.Exec(`
-			UPDATE users SET employee_id = $1, updated_at = $2
-			WHERE tenant_id = $3 AND email = $4 AND employee_id IS NULL
-		`, id, now, tenantID, input.Email)
-		if linkErr != nil {
-			h.log.Warn("Could not link user to employee", "error", linkErr, "email", input.Email)
+	// Create or link user account for this employee
+	contact := input.Email
+	isEmail := contact != ""
+	if !isEmail && input.Phone != "" {
+		contact = normalizePhone(input.Phone)
+	}
+
+	if contact != "" {
+		// Check if user already exists
+		var existingUserID uuid.UUID
+		var lookupErr error
+		if isEmail {
+			lookupErr = h.db.QueryRow(
+				"SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND deleted_at IS NULL",
+				tenantID, contact,
+			).Scan(&existingUserID)
+		} else {
+			lookupErr = h.db.QueryRow(
+				"SELECT id FROM users WHERE tenant_id = $1 AND phone = $2 AND deleted_at IS NULL",
+				tenantID, contact,
+			).Scan(&existingUserID)
 		}
-	} else if input.Phone != "" {
-		normalizedPhone := normalizePhone(input.Phone)
-		_, linkErr := h.db.Exec(`
-			UPDATE users SET employee_id = $1, updated_at = $2
-			WHERE tenant_id = $3 AND phone = $4 AND employee_id IS NULL
-		`, id, now, tenantID, normalizedPhone)
-		if linkErr != nil {
-			h.log.Warn("Could not link user to employee", "error", linkErr, "phone", normalizedPhone)
+
+		if lookupErr == sql.ErrNoRows {
+			// User doesn't exist — create one
+			const chars = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+			b := make([]byte, 8)
+			for i := range b {
+				b[i] = chars[rand.Intn(len(chars))]
+			}
+			plainPassword := string(b)
+			passwordHash, _ := crypto.HashPassword(plainPassword)
+
+			newUserID := uuid.New()
+			var emailVal, phoneVal *string
+			if isEmail {
+				emailVal = &contact
+				if input.Phone != "" {
+					p := normalizePhone(input.Phone)
+					phoneVal = &p
+				}
+			} else {
+				phoneVal = &contact
+			}
+
+			_, createErr := h.db.Exec(`
+				INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, phone,
+				                   language, timezone, settings, is_active, is_verified, employee_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, 'uz', 'Asia/Tashkent', '{}', true, true, $8)
+				ON CONFLICT DO NOTHING
+			`, newUserID, tenantID, emailVal, passwordHash, firstName, lastName, phoneVal, id)
+			if createErr != nil {
+				h.log.Warn("Could not auto-create user for employee", "error", createErr)
+			}
+		} else if lookupErr == nil {
+			// User exists — link to this employee
+			h.db.Exec(`UPDATE users SET employee_id = $1, updated_at = $2 WHERE id = $3`,
+				id, now, existingUserID)
 		}
 	}
 
