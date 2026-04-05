@@ -499,7 +499,7 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 
 		entryNumber := fmt.Sprintf("FA%06d", nextNumber)
 		journalEntryID := uuid.New()
-		jeDescription := "Fixed Asset Acquisition: " + assetCode + " - " + input.Name
+		jeDescription := "Asosiy vosita sotib olish: " + assetCode + " - " + input.Name
 
 		_, err = h.db.Exec(`
 			INSERT INTO journal_entries (

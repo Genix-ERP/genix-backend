@@ -6480,7 +6480,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 						var opName string
 						h.db.QueryRow("SELECT name FROM stock_operations WHERE id=$1", id).Scan(&opName)
-						description := fmt.Sprintf("Stock Operation: %s", opName)
+						description := fmt.Sprintf("Ombor operatsiyasi: %s", opName)
 
 						h.db.Exec(`
 							INSERT INTO journal_entries (

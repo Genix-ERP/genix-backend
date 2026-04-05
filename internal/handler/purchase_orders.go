@@ -2035,7 +2035,7 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			// Create journal entry
 			jeID := uuid.New()
 			journalEntryID = &jeID
-			jeDescription := fmt.Sprintf("Vendor Bill %s", invoiceNumber)
+			jeDescription := fmt.Sprintf("Yetkazib beruvchi hisob-fakturasi %s", invoiceNumber)
 
 			if _, err := tx.Exec(`
 				INSERT INTO journal_entries (

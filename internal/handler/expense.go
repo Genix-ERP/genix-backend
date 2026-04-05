@@ -677,7 +677,7 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 
 		entryNumber := fmt.Sprintf("EXP%06d", nextNumber)
 		journalEntryID := uuid.New()
-		jeDescription := "Expense: " + expenseNumber + " - " + description
+		jeDescription := "Xarajat: " + expenseNumber + " - " + description
 
 		_, err = h.db.Exec(`
 			INSERT INTO journal_entries (
