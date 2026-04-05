@@ -2456,7 +2456,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			// Create journal entry
 			jeID := uuid.New()
 			journalEntryID = &jeID
-			jeDescription := fmt.Sprintf("Sotuv hisob-fakturasi %s", invoiceNumber)
+			jeDescription := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
 
 			var createdBy *uuid.UUID
 			if userID != uuid.Nil {
