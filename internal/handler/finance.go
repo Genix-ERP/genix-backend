@@ -968,7 +968,7 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 		SELECT je.id, je.tenant_id, je.journal_id, je.entry_number, je.entry_date,
 			   je.reference, je.description, je.source_type, je.total_debit, je.total_credit,
 			   je.status, je.posted_at, je.created_at, je.updated_at,
-			   j.code as journal_code, j.name as journal_name
+			   j.code as journal_code, COALESCE(NULLIF(j.name_uz,''), j.name) as journal_name
 		FROM journal_entries je
 		JOIN journals j ON je.journal_id = j.id
 		WHERE je.tenant_id = $1 AND je.deleted_at IS NULL
@@ -2211,7 +2211,7 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 			   je.reference, je.description, je.source_type, je.total_debit, je.total_credit,
 			   je.status, je.posted_at, je.reversed_entry_id, je.is_reversal, je.reversal_of_id,
 			   je.reversal_reason, je.tags, je.created_at, je.updated_at,
-			   j.code as journal_code, j.name as journal_name
+			   j.code as journal_code, COALESCE(NULLIF(j.name_uz,''), j.name) as journal_name
 		FROM journal_entries je
 		JOIN journals j ON je.journal_id = j.id
 		WHERE je.id = $1 AND je.tenant_id = $2 AND je.deleted_at IS NULL
