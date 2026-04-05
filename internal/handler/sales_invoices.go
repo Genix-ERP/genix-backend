@@ -1151,7 +1151,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 
 	// Create journal entry
 	journalEntryID := uuid.New()
-	description := fmt.Sprintf("Sotuv hisob-fakturasi %s", invoiceNumber)
+	description := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
 
 	var createdBy *uuid.UUID
 	if userID != uuid.Nil {
@@ -2212,7 +2212,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 
 		jeID := uuid.New()
-		description := fmt.Sprintf("Sotuv hisob-fakturasi %s (ta'mirlash)", mi.InvoiceNumber)
+		description := fmt.Sprintf("Sales Invoice %s (repair)", mi.InvoiceNumber)
 
 		_, err = tx.Exec(`
 			INSERT INTO journal_entries (
