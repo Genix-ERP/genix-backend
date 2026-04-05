@@ -135,7 +135,9 @@ func (h *Handler) CreatePayrollPeriod(c *gin.Context) {
 
 	periodCode := input.PeriodCode
 	if periodCode == "" {
-		periodCode = fmt.Sprintf("PAY-%d-%02d", time.Now().Year(), time.Now().Month())
+		var seq int
+		h.db.QueryRow(`SELECT COUNT(*) + 1 FROM payroll_periods WHERE tenant_id = $1`, tenantID).Scan(&seq)
+		periodCode = fmt.Sprintf("PAY-%d-%05d", time.Now().Year(), seq)
 	}
 
 	startDate, err := time.Parse("2006-01-02", input.StartDate)
