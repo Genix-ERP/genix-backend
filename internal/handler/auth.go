@@ -488,16 +488,19 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	var user entity.User
-	var phone, avatarURL, passwordHash sql.NullString
+	var email, phone, avatarURL, passwordHash sql.NullString
 	var lockedUntil sql.NullTime
 
 	err := h.db.QueryRow(query, args...).Scan(
-		&user.ID, &user.TenantID, &user.Email, &passwordHash,
+		&user.ID, &user.TenantID, &email, &passwordHash,
 		&user.FirstName, &user.LastName, &phone, &avatarURL,
 		&user.Language, &user.Timezone, &user.IsActive, &user.IsVerified,
 		&user.IsSystemAdmin, &user.FailedLoginAttempts, &lockedUntil,
 		&user.CreatedAt, &user.UpdatedAt,
 	)
+	if email.Valid {
+		user.Email = email.String
+	}
 
 	if err == sql.ErrNoRows {
 		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "Invalid email or password")
