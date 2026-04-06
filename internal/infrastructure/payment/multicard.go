@@ -76,7 +76,7 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
 		return "", err
 	}
-	if !ar.Success || ar.Token == "" {
+	if ar.Token == "" {
 		return "", fmt.Errorf("multicard auth failed")
 	}
 
