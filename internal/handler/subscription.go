@@ -12,33 +12,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// planAmount returns the plan price in UZS and tiyin.
-func (h *Handler) planAmount(plan string) (uzs int64, tiyin int64, ok bool) {
-	switch plan {
-	case "starter":
-		uzs = h.config.Multicard.StarterAmount
-	case "professional":
-		uzs = h.config.Multicard.ProfessionalAmount
-	case "enterprise":
-		uzs = h.config.Multicard.EnterpriseAmount
-	default:
-		return 0, 0, false
-	}
-	return uzs, uzs * 100, true
-}
-
-// GetPlans returns available plans with UZS prices.
+// GetPlans returns per-user pricing.
 // GET /subscription/plans
 func (h *Handler) GetPlans(c *gin.Context) {
-	type plan struct {
-		Key    string `json:"key"`
-		Name   string `json:"name"`
-		AmountUZS int64 `json:"amount_uzs"`
-	}
-	response.Success(c, []plan{
-		{Key: "starter", Name: "Starter", AmountUZS: h.config.Multicard.StarterAmount},
-		{Key: "professional", Name: "Professional", AmountUZS: h.config.Multicard.ProfessionalAmount},
-		{Key: "enterprise", Name: "Enterprise", AmountUZS: h.config.Multicard.EnterpriseAmount},
+	response.Success(c, gin.H{
+		"price_per_user_monthly": h.config.Multicard.PricePerUserMonthly,
+		"price_per_user_yearly":  h.config.Multicard.PricePerUserYearly,
 	})
 }
 
@@ -148,7 +127,7 @@ func (h *Handler) ActivateSubscription(c *gin.Context) {
 
 // CreateCheckout creates a Multicard invoice and returns the checkout URL.
 // POST /subscription/checkout
-// Body: { "plan": "starter" | "professional" | "enterprise" }
+// Body: { "users": 3, "billing": "monthly" | "yearly" }
 func (h *Handler) CreateCheckout(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
 	if tenantID == "" {
@@ -157,20 +136,27 @@ func (h *Handler) CreateCheckout(c *gin.Context) {
 	}
 
 	var input struct {
-		Plan string `json:"plan" binding:"required"`
+		Users   int    `json:"users" binding:"required,min=1"`
+		Billing string `json:"billing" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
-		response.BadRequest(c, "Plan is required")
+		response.BadRequest(c, "users (min 1) and billing (monthly|yearly) are required")
+		return
+	}
+	if input.Billing != "monthly" && input.Billing != "yearly" {
+		response.BadRequest(c, "billing must be 'monthly' or 'yearly'")
 		return
 	}
 
-	amountUZS, amountTiyin, ok := h.planAmount(input.Plan)
-	if !ok {
-		response.BadRequest(c, "Invalid plan")
-		return
+	var pricePerUser int64
+	if input.Billing == "yearly" {
+		pricePerUser = h.config.Multicard.PricePerUserYearly * 12 // yearly upfront
+	} else {
+		pricePerUser = h.config.Multicard.PricePerUserMonthly
 	}
+	amountUZS := pricePerUser * int64(input.Users)
+	amountTiyin := amountUZS * 100
 
-	// Unique invoice ID for this payment attempt
 	invoiceID := fmt.Sprintf("genix-%s-%s", tenantID[:8], uuid.New().String()[:8])
 
 	frontendURL := h.config.App.FrontendURL
@@ -179,7 +165,7 @@ func (h *Handler) CreateCheckout(c *gin.Context) {
 	inv, err := h.multicardClient.CreateInvoice(c.Request.Context(), payment.InvoiceRequest{
 		Amount:       amountTiyin,
 		InvoiceID:    invoiceID,
-		ReturnURL:    frontendURL + "/payment-success?plan=" + input.Plan,
+		ReturnURL:    fmt.Sprintf("%s/payment-success?users=%d&billing=%s", frontendURL, input.Users, input.Billing),
 		ReturnErrURL: frontendURL + "/payment-error",
 		CallbackURL:  backendURL + "/api/v1/webhooks/multicard",
 	})
@@ -189,12 +175,13 @@ func (h *Handler) CreateCheckout(c *gin.Context) {
 		return
 	}
 
-	// Record payment attempt
+	// Record payment attempt — store users+billing in plan field as "Nusers_billing"
+	plan := fmt.Sprintf("%dusers_%s", input.Users, input.Billing)
 	h.db.Exec(`
 		INSERT INTO subscription_payments
 			(tenant_id, plan, amount_uzs, amount_tiyin, invoice_id, multicard_uuid, checkout_url, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-	`, tenantID, input.Plan, amountUZS, amountTiyin, invoiceID, inv.UUID, inv.CheckoutURL)
+	`, tenantID, plan, amountUZS, amountTiyin, invoiceID, inv.UUID, inv.CheckoutURL)
 
 	response.Success(c, gin.H{
 		"checkout_url": inv.CheckoutURL,
@@ -246,19 +233,28 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 
 	// Only activate on final success
 	if payload.Status == "success" {
+		// Parse users count from plan string (e.g. "4users_monthly")
+		var paidUsers int
+		var billing string
+		fmt.Sscanf(plan, "%dusers_%s", &paidUsers, &billing)
+		if paidUsers < 1 {
+			paidUsers = 1
+		}
+
 		h.db.Exec(`
 			UPDATE tenants
 			SET subscription_status = 'active',
 			    subscription_plan   = $2,
+			    paid_users          = $3,
 			    is_active           = true,
 			    trial_ends_at       = NULL,
 			    account_clear_at    = NULL,
 			    updated_at          = NOW()
 			WHERE id = $1
-		`, tenantID, plan)
+		`, tenantID, plan, paidUsers)
 
 		h.log.Info("Subscription activated via Multicard",
-			"tenant_id", tenantID, "plan", plan, "invoice", payload.InvoiceID)
+			"tenant_id", tenantID, "plan", plan, "paid_users", paidUsers, "invoice", payload.InvoiceID)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
