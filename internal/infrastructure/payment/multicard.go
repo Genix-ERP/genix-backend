@@ -60,6 +60,7 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	}
 
 	body, _ := json.Marshal(authRequest{ApplicationID: c.applicationID, Secret: c.secret})
+	fmt.Printf("[Multicard] Auth request to %s/auth body: %s\n", c.baseURL, string(body))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/auth", bytes.NewReader(body))
 	if err != nil {
 		return "", err
