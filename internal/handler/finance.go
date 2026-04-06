@@ -653,6 +653,9 @@ func (h *Handler) UpdateAccount(c *gin.Context) {
 		args = append(args, value)
 	}
 
+	if input.Code != nil {
+		addUpdate("code", *input.Code)
+	}
 	if input.Name != nil {
 		addUpdate("name", *input.Name)
 	}

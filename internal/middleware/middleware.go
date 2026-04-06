@@ -498,11 +498,25 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 			}
 		}
 
-		// Grant cross-module dependencies (e.g. HR needs organization:department:read)
-		if grants, ok := crossModuleGrants[moduleID]; ok && canRead {
+		// Grant cross-module dependencies (e.g. HR needs organization:department access)
+		if grants, ok := crossModuleGrants[moduleID]; ok {
 			for _, grant := range grants {
-				perms[grant+":read"] = true
-				perms[grant+":manage"] = true // warehouse listing requires manage
+				if canRead {
+					perms[grant+":read"] = true
+					perms[grant+":manage"] = true
+				}
+				if canCreate {
+					perms[grant+":create"] = true
+				}
+				if canUpdate {
+					perms[grant+":update"] = true
+					perms[grant+":manage"] = true
+					perms[grant+":approve"] = true
+					perms[grant+":confirm"] = true
+				}
+				if canDelete {
+					perms[grant+":delete"] = true
+				}
 			}
 		}
 	}
