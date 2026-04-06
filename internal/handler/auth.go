@@ -1353,8 +1353,16 @@ func (h *Handler) SendOTP(c *gin.Context) {
 	}
 
 	if usePhone {
-		// Send via SMS
-		smsMessage := fmt.Sprintf("GenixERP: Tasdiqlash kodi: %s. Kod 10 daqiqa amal qiladi.", otpCode)
+		// Send via SMS using confirmed Eskiz templates
+		var smsMessage string
+		switch input.Language {
+		case "ru":
+			smsMessage = fmt.Sprintf("Ваш код для входа в панель Genix Admin: %s", otpCode)
+		case "en":
+			smsMessage = fmt.Sprintf("Your Genix Admin panel login code: %s", otpCode)
+		default: // uz
+			smsMessage = fmt.Sprintf("Sizning Genix Admin paneliga kirish kodingiz: %s", otpCode)
+		}
 		if err := h.smsService.Send(input.Phone, smsMessage); err != nil {
 			h.log.Error("Failed to send SMS OTP", "error", err, "phone", input.Phone)
 		}
