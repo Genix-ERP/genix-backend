@@ -691,7 +691,7 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 	}
 
 	var user entity.User
-	var phone, avatarURL sql.NullString
+	var email, phone, avatarURL sql.NullString
 
 	err := h.db.QueryRow(`
 		SELECT id, tenant_id, email, first_name, last_name, phone, avatar_url,
@@ -700,11 +700,14 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 		FROM users
 		WHERE id = $1 AND deleted_at IS NULL
 	`, claims.UserID).Scan(
-		&user.ID, &user.TenantID, &user.Email, &user.FirstName, &user.LastName,
+		&user.ID, &user.TenantID, &email, &user.FirstName, &user.LastName,
 		&phone, &avatarURL, &user.Language, &user.Timezone,
 		&user.IsActive, &user.IsVerified, &user.IsSystemAdmin,
 		&user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt,
 	)
+	if email.Valid {
+		user.Email = email.String
+	}
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "User")
@@ -1906,10 +1909,10 @@ func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, pict
 	}
 
 	var user entity.User
-	var phone, avatarURL, googleID sql.NullString
+	var email, phone, avatarURL, googleID sql.NullString
 
 	err := h.db.QueryRow(query, args...).Scan(
-		&user.ID, &user.TenantID, &user.Email, &user.FirstName, &user.LastName,
+		&user.ID, &user.TenantID, &email, &user.FirstName, &user.LastName,
 		&phone, &avatarURL, &user.Language, &user.Timezone, &user.IsActive, &user.IsVerified,
 		&user.IsSystemAdmin, &user.AuthProvider, &googleID,
 		&user.CreatedAt, &user.UpdatedAt,
@@ -1925,6 +1928,9 @@ func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, pict
 		return
 	}
 
+	if email.Valid {
+		user.Email = email.String
+	}
 	if phone.Valid {
 		user.Phone = &phone.String
 	}
