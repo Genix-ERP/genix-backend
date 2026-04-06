@@ -163,24 +163,24 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 	// Departments
 	depts := rg.Group("/departments")
-	depts.Use(h.perm.Require("organization", "department", "read"))
+	depts.Use(h.perm.Require("hr", "employee", "read"))
 	{
 		depts.GET("", h.ListDepartments)
-		depts.POST("", h.perm.Require("organization", "department", "create"), h.CreateDepartment)
+		depts.POST("", h.perm.Require("hr", "employee", "create"), h.CreateDepartment)
 		depts.GET("/:id", h.GetDepartment)
-		depts.PUT("/:id", h.perm.Require("organization", "department", "update"), h.UpdateDepartment)
-		depts.DELETE("/:id", h.perm.Require("organization", "department", "delete"), h.DeleteDepartment)
+		depts.PUT("/:id", h.perm.Require("hr", "employee", "update"), h.UpdateDepartment)
+		depts.DELETE("/:id", h.perm.Require("hr", "employee", "delete"), h.DeleteDepartment)
 	}
 
 	// Job Positions
 	jobPositions := rg.Group("/job-positions")
-	jobPositions.Use(h.perm.Require("organization", "department", "read"))
+	jobPositions.Use(h.perm.Require("hr", "employee", "read"))
 	{
 		jobPositions.GET("", h.ListJobPositions)
-		jobPositions.POST("", h.perm.Require("organization", "department", "create"), h.CreateJobPosition)
+		jobPositions.POST("", h.perm.Require("hr", "employee", "create"), h.CreateJobPosition)
 		jobPositions.GET("/:id", h.GetJobPosition)
-		jobPositions.PUT("/:id", h.perm.Require("organization", "department", "update"), h.UpdateJobPosition)
-		jobPositions.DELETE("/:id", h.perm.Require("organization", "department", "delete"), h.DeleteJobPosition)
+		jobPositions.PUT("/:id", h.perm.Require("hr", "employee", "update"), h.UpdateJobPosition)
+		jobPositions.DELETE("/:id", h.perm.Require("hr", "employee", "delete"), h.DeleteJobPosition)
 	}
 
 	// Contacts (Customers & Vendors)
