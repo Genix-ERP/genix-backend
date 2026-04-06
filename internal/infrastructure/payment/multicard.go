@@ -72,12 +72,14 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	rawBody, _ := io.ReadAll(resp.Body)
+	fmt.Printf("[Multicard] Auth status: %d, body: %s\n", resp.StatusCode, string(rawBody))
 	var ar authResponse
-	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
-		return "", err
+	if err := json.Unmarshal(rawBody, &ar); err != nil {
+		return "", fmt.Errorf("multicard auth decode error: %w", err)
 	}
 	if ar.Token == "" {
-		return "", fmt.Errorf("multicard auth failed")
+		return "", fmt.Errorf("multicard auth failed: status=%d body=%s", resp.StatusCode, string(rawBody))
 	}
 
 	// Token is valid for 24 hours; cache for 23 to be safe
