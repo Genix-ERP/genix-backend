@@ -527,46 +527,62 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 			`, productionOrderID, tenantID).Scan(&totalScrapped)
 
-			h.db.Exec(`
-				UPDATE production_orders
-				SET status = 'completed', current_stage = 'done', progress_percent = 100,
-				    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
-				    actual_end = $3, updated_at = $3
-				WHERE id = $4 AND tenant_id = $5
-			`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
+			// Check if this production order uses split output (bulk → packaged products)
+			var hasSplitOutput bool
+			h.db.QueryRow(`SELECT has_split_output FROM production_orders WHERE id = $1 AND tenant_id = $2`,
+				productionOrderID, tenantID).Scan(&hasSplitOutput)
 
-			// Add finished goods to inventory (last step's good output)
-			unitCost := h.receiveFinishedGoods(productionOrderID, tenantID, userID, lastWoProduced, now)
-
-			// Set material_cost and actual_cost on the production order
-			totalCost := unitCost * (lastWoProduced + totalScrapped)
-			if totalCost > 0 {
+			if hasSplitOutput {
+				// Move to "packaging" status — worker will use CompleteSplitOutput to finalize
 				h.db.Exec(`
 					UPDATE production_orders
-					SET material_cost = $1, actual_cost = $1, updated_at = $2
-					WHERE id = $3 AND tenant_id = $4
-				`, totalCost, now, productionOrderID, tenantID)
-			}
+					SET status = 'packaging', current_stage = 'packaging', progress_percent = 95,
+					    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
+					    actual_end = $3, updated_at = $3
+					WHERE id = $4 AND tenant_id = $5
+				`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
+			} else {
+				h.db.Exec(`
+					UPDATE production_orders
+					SET status = 'completed', current_stage = 'done', progress_percent = 100,
+					    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
+					    actual_end = $3, updated_at = $3
+					WHERE id = $4 AND tenant_id = $5
+				`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
 
-			// Move scrapped items to scrap warehouse
-			var productID uuid.UUID
-			var organizationID *uuid.UUID
-			var warehouseID *uuid.UUID
-			h.db.QueryRow(`
-				SELECT product_id, organization_id, warehouse_id FROM production_orders
-				WHERE id = $1 AND tenant_id = $2
-			`, productionOrderID, tenantID).Scan(&productID, &organizationID, &warehouseID)
+				// Add finished goods to inventory (last step's good output)
+				unitCost := h.receiveFinishedGoods(productionOrderID, tenantID, userID, lastWoProduced, now)
 
-			if totalScrapped > 0 {
-				h.receiveScrapGoods(productionOrderID, tenantID, userID, productID, organizationID, totalScrapped, unitCost, now)
-			}
+				// Set material_cost and actual_cost on the production order
+				totalCost := unitCost * (lastWoProduced + totalScrapped)
+				if totalCost > 0 {
+					h.db.Exec(`
+						UPDATE production_orders
+						SET material_cost = $1, actual_cost = $1, updated_at = $2
+						WHERE id = $3 AND tenant_id = $4
+					`, totalCost, now, productionOrderID, tenantID)
+				}
 
-			// Create journal entries for finished goods (WIP → Finished Goods)
-			h.createFinishedGoodsJournalEntry(productionOrderID, tenantID, organizationID, productID, userID, lastWoProduced, unitCost, now)
+				// Move scrapped items to scrap warehouse
+				var productID uuid.UUID
+				var organizationID *uuid.UUID
+				var warehouseID *uuid.UUID
+				h.db.QueryRow(`
+					SELECT product_id, organization_id, warehouse_id FROM production_orders
+					WHERE id = $1 AND tenant_id = $2
+				`, productionOrderID, tenantID).Scan(&productID, &organizationID, &warehouseID)
 
-			// Transfer finished goods to dedicated finished goods warehouse if one exists
-			if warehouseID != nil {
-				h.transferToFinishedGoodsWarehouse(productionOrderID, tenantID, organizationID, productID, *warehouseID, userID, lastWoProduced, unitCost, now)
+				if totalScrapped > 0 {
+					h.receiveScrapGoods(productionOrderID, tenantID, userID, productID, organizationID, totalScrapped, unitCost, now)
+				}
+
+				// Create journal entries for finished goods (WIP → Finished Goods)
+				h.createFinishedGoodsJournalEntry(productionOrderID, tenantID, organizationID, productID, userID, lastWoProduced, unitCost, now)
+
+				// Transfer finished goods to dedicated finished goods warehouse if one exists
+				if warehouseID != nil {
+					h.transferToFinishedGoodsWarehouse(productionOrderID, tenantID, organizationID, productID, *warehouseID, userID, lastWoProduced, unitCost, now)
+				}
 			}
 		}
 	}
