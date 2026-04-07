@@ -3,7 +3,7 @@ package payment
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -176,11 +176,11 @@ type WebhookPayload struct {
 	Sign        string  `json:"sign"`
 }
 
-// VerifySign checks the SHA1 signature from the webhook payload.
-// sign = SHA1( uuid + invoice_id + amount + secret )
+// VerifySign checks the MD5 signature from the webhook payload.
+// sign = MD5( uuid + invoice_id + amount + secret )
 func (c *Client) VerifySign(p WebhookPayload) bool {
 	raw := fmt.Sprintf("%s%s%d%s", p.UUID, p.InvoiceID, p.Amount, c.secret)
-	h := sha1.New()
+	h := md5.New()
 	h.Write([]byte(raw))
 	expected := fmt.Sprintf("%x", h.Sum(nil))
 	return expected == p.Sign
