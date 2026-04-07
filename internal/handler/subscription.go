@@ -205,7 +205,13 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 
 	// Verify signature
 	if !h.multicardClient.VerifySign(payload) {
-		h.log.Warn("Multicard webhook: invalid signature", "invoice_id", payload.InvoiceID)
+		h.log.Warn("Multicard webhook: invalid signature",
+			"invoice_id", payload.InvoiceID,
+			"uuid", payload.UUID,
+			"amount", payload.Amount,
+			"status", payload.Status,
+			"received_sign", payload.Sign,
+		)
 		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "Invalid signature"})
 		return
 	}
