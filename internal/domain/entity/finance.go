@@ -180,6 +180,7 @@ type Journal struct {
 	OrganizationID         *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
 	DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty" db:"default_debit_account_id"`
 	DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty" db:"default_credit_account_id"`
+	IsPayrollJournal       bool       `json:"is_payroll_journal" db:"is_payroll_journal"`
 	IsActive               bool       `json:"is_active" db:"is_active"`
 	CreatedAt              time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt              time.Time  `json:"updated_at" db:"updated_at"`
@@ -214,6 +215,7 @@ type CreateJournalInput struct {
 	SuspenseAccountID      *string `json:"suspense_account_id"`
 	ProfitAccountID        *string `json:"profit_account_id"`
 	LossAccountID          *string `json:"loss_account_id"`
+	IsPayrollJournal       bool    `json:"is_payroll_journal"`
 }
 
 // UpdateJournalInput is the input for updating a journal
@@ -225,6 +227,7 @@ type UpdateJournalInput struct {
 	AutoSequence           *bool   `json:"auto_sequence"`
 	NumberPrefix           *string `json:"number_prefix"`
 	IsActive               *bool   `json:"is_active"`
+	IsPayrollJournal       *bool   `json:"is_payroll_journal"`
 	ShortCode              *string `json:"short_code"`
 	Currency               *string `json:"currency"`
 	BankAccountID          *string `json:"bank_account_id"`

@@ -461,7 +461,8 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"construction":  {"organization:organization", "hr:employee", "inventory:product", "inventory:warehouse"},
 		"assets":        {"finance:asset", "finance:report"},
 		"expenses":      {"finance:expense", "finance:report"},
-		"payroll":       {"hr:employee"},
+		"payroll":       {"hr:employee", "hr:payroll"},
+		"contracts":     {"purchase:contract", "purchase:order"},
 	}
 
 	for empRows.Next() {

@@ -394,11 +394,21 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 			if paymentAcct != uuid.Nil && wagesPayableAcct != uuid.Nil {
 				var journalID uuid.UUID
 				var nextNumber int
+				// Try journal marked as payroll journal first
 				h.db.QueryRow(`
 					SELECT id, COALESCE(next_number, 1) FROM journals
-					WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
-					ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
+					WHERE tenant_id = $1 AND COALESCE(is_payroll_journal, false) = true
+					  AND COALESCE(is_active, true) = true AND deleted_at IS NULL
+					LIMIT 1`,
 					tenantID).Scan(&journalID, &nextNumber)
+				// Fallback to legacy PAYROLL/MISC/GENERAL code lookup
+				if journalID == uuid.Nil {
+					h.db.QueryRow(`
+						SELECT id, COALESCE(next_number, 1) FROM journals
+						WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
+						ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
+						tenantID).Scan(&journalID, &nextNumber)
+				}
 
 				if journalID != uuid.Nil {
 					jeID := uuid.New()
