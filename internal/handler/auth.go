@@ -1909,10 +1909,10 @@ func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, pict
 	}
 
 	var user entity.User
-	var email, phone, avatarURL, googleID sql.NullString
+	var emailNull, phone, avatarURL, googleID sql.NullString
 
 	err := h.db.QueryRow(query, args...).Scan(
-		&user.ID, &user.TenantID, &email, &user.FirstName, &user.LastName,
+		&user.ID, &user.TenantID, &emailNull, &user.FirstName, &user.LastName,
 		&phone, &avatarURL, &user.Language, &user.Timezone, &user.IsActive, &user.IsVerified,
 		&user.IsSystemAdmin, &user.AuthProvider, &googleID,
 		&user.CreatedAt, &user.UpdatedAt,
@@ -1928,8 +1928,8 @@ func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, pict
 		return
 	}
 
-	if email.Valid {
-		user.Email = email.String
+	if emailNull.Valid {
+		user.Email = emailNull.String
 	}
 	if phone.Valid {
 		user.Phone = &phone.String
