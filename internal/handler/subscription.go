@@ -177,11 +177,15 @@ func (h *Handler) CreateCheckout(c *gin.Context) {
 
 	// Record payment attempt — store users+billing in plan field as "Nusers_billing"
 	plan := fmt.Sprintf("%dusers_%s", input.Users, input.Billing)
-	h.db.Exec(`
+	if _, err := h.db.Exec(`
 		INSERT INTO subscription_payments
 			(tenant_id, plan, amount_uzs, amount_tiyin, invoice_id, multicard_uuid, checkout_url, status)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-	`, tenantID, plan, amountUZS, amountTiyin, invoiceID, inv.UUID, inv.CheckoutURL)
+	`, tenantID, plan, amountUZS, amountTiyin, invoiceID, inv.UUID, inv.CheckoutURL); err != nil {
+		h.log.Error("CreateCheckout: failed to record payment attempt", "error", err, "invoice_id", invoiceID)
+		response.InternalServerError(c, "Failed to record payment")
+		return
+	}
 
 	response.Success(c, gin.H{
 		"checkout_url": inv.CheckoutURL,
