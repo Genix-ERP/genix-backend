@@ -36,13 +36,15 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 		trialEndsAt    sql.NullTime
 		accountClearAt sql.NullTime
 		isActive       bool
+		paidUsers      int
 	)
 
 	err := h.db.QueryRow(`
-		SELECT subscription_status, subscription_plan, trial_ends_at, account_clear_at, is_active
+		SELECT subscription_status, subscription_plan, trial_ends_at, account_clear_at, is_active,
+		       COALESCE(paid_users, 0)
 		FROM tenants
 		WHERE id = $1 AND deleted_at IS NULL
-	`, tenantID).Scan(&status, &plan, &trialEndsAt, &accountClearAt, &isActive)
+	`, tenantID).Scan(&status, &plan, &trialEndsAt, &accountClearAt, &isActive, &paidUsers)
 	if err != nil {
 		response.NotFound(c, "Tenant not found")
 		return
@@ -61,9 +63,10 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"status":    status,
-		"plan":      plan,
-		"is_active": isActive,
+		"status":     status,
+		"plan":       plan,
+		"is_active":  isActive,
+		"paid_users": paidUsers,
 	}
 	if trialEndsAt.Valid {
 		resp["trial_ends_at"] = trialEndsAt.Time
@@ -292,6 +295,57 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// GetPaymentHistory returns the list of payment records for the tenant.
+// GET /subscription/payments
+func (h *Handler) GetPaymentHistory(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "Tenant not resolved")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT invoice_id, plan, amount_uzs, status, payment_time, created_at
+		FROM subscription_payments
+		WHERE tenant_id = $1
+		ORDER BY created_at DESC
+		LIMIT 50
+	`, tenantID)
+	if err != nil {
+		response.InternalServerError(c, "Failed to fetch payment history")
+		return
+	}
+	defer rows.Close()
+
+	type PaymentRecord struct {
+		InvoiceID   string       `json:"invoice_id"`
+		Plan        string       `json:"plan"`
+		AmountUZS   int64        `json:"amount_uzs"`
+		Status      string       `json:"status"`
+		PaymentTime sql.NullTime `json:"-"`
+		CreatedAt   time.Time    `json:"created_at"`
+		PaidAt      *time.Time   `json:"paid_at"`
+	}
+
+	var payments []PaymentRecord
+	for rows.Next() {
+		var p PaymentRecord
+		if err := rows.Scan(&p.InvoiceID, &p.Plan, &p.AmountUZS, &p.Status, &p.PaymentTime, &p.CreatedAt); err != nil {
+			continue
+		}
+		if p.PaymentTime.Valid {
+			t := p.PaymentTime.Time
+			p.PaidAt = &t
+		}
+		payments = append(payments, p)
+	}
+	if payments == nil {
+		payments = []PaymentRecord{}
+	}
+
+	response.Success(c, payments)
 }
 
 // CleanExpiredTenants soft-deletes tenants whose account_clear_at has passed.
