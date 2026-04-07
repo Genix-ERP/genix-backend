@@ -1935,11 +1935,14 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	}
 	billTotal := billSubtotal + billTaxTotal
 
-	// Update the bill header with corrected amounts (based on received qty, not ordered qty)
+	// Update the bill header with corrected amounts (based on received qty, not ordered qty).
+	// amount_due is a GENERATED column (total_amount - amount_paid), so never set it explicitly.
 	if _, err = tx.Exec(`
-		UPDATE purchase_invoices SET subtotal = $1, tax_amount = $2, total_amount = $3, amount_due = $3, updated_at = $4
+		UPDATE purchase_invoices SET subtotal = $1, tax_amount = $2, total_amount = $3, updated_at = $4
 		WHERE id = $5`, billSubtotal, billTaxTotal, billTotal, now, billID); err != nil {
 		h.log.Error("CreateBillFromPO: failed to update bill totals", "error", err)
+		response.InternalError(c, "Failed to update bill totals")
+		return
 	}
 	subtotal = billSubtotal
 	taxAmount = billTaxTotal

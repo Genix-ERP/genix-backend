@@ -1123,6 +1123,7 @@ func (h *Handler) ListJournals(c *gin.Context) {
 			j.profit_account_id,
 			j.loss_account_id,
 			COALESCE(j.is_active, true),
+			COALESCE(j.is_payroll_journal, false),
 			j.created_at,
 			COALESCE(j.updated_at, j.created_at)
 		FROM journals j
@@ -1168,6 +1169,7 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty"`
 		LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty"`
 		IsActive               bool       `json:"is_active"`
+		IsPayrollJournal       bool       `json:"is_payroll_journal"`
 		CreatedAt              time.Time  `json:"created_at"`
 		UpdatedAt              time.Time  `json:"updated_at"`
 	}
@@ -1180,7 +1182,7 @@ func (h *Handler) ListJournals(c *gin.Context) {
 			&j.AutoSequence, &j.NextNumber, &j.NumberPrefix,
 			&j.ShortCode, &j.Currency,
 			&j.BankAccountID, &j.SuspenseAccountID, &j.ProfitAccountID, &j.LossAccountID,
-			&j.IsActive, &j.CreatedAt, &j.UpdatedAt); err != nil {
+			&j.IsActive, &j.IsPayrollJournal, &j.CreatedAt, &j.UpdatedAt); err != nil {
 			h.log.Error("Failed to scan journal", "error", err)
 			continue
 		}
@@ -1311,6 +1313,7 @@ func (h *Handler) GetJournal(c *gin.Context) {
 		ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty"`
 		LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty"`
 		IsActive               bool       `json:"is_active"`
+		IsPayrollJournal       bool       `json:"is_payroll_journal"`
 		CreatedAt              time.Time  `json:"created_at"`
 		UpdatedAt              time.Time  `json:"updated_at"`
 		// Enriched names from JOINs
@@ -1338,6 +1341,7 @@ func (h *Handler) GetJournal(c *gin.Context) {
 			j.profit_account_id,
 			j.loss_account_id,
 			COALESCE(j.is_active, true),
+			COALESCE(j.is_payroll_journal, false),
 			j.created_at,
 			COALESCE(j.updated_at, j.created_at),
 			COALESCE(ba.bank_name || ' - ' || ba.account_number, ''),
@@ -1360,7 +1364,7 @@ func (h *Handler) GetJournal(c *gin.Context) {
 		&j.AutoSequence, &j.NextNumber, &j.NumberPrefix,
 		&j.ShortCode, &j.Currency,
 		&j.BankAccountID, &j.SuspenseAccountID, &j.ProfitAccountID, &j.LossAccountID,
-		&j.IsActive, &j.CreatedAt, &j.UpdatedAt,
+		&j.IsActive, &j.IsPayrollJournal, &j.CreatedAt, &j.UpdatedAt,
 		&j.BankAccountName, &j.SuspenseAccountName, &j.ProfitAccountName, &j.LossAccountName,
 		&j.DebitAccountName, &j.CreditAccountName,
 		&j.EntryCount)
@@ -1487,15 +1491,15 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 			auto_sequence, next_number, number_prefix,
 			short_code, currency,
 			bank_account_id, suspense_account_id, profit_account_id, loss_account_id,
-			organization_id, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14, $15, $16, $17, true, $18, $18)
+			organization_id, is_active, is_payroll_journal, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14, $15, $16, $17, true, $18, $19, $19)
 	`, journalID, tenantID, input.Code, input.Name, input.Type, input.Description,
 		debitAccID, creditAccID,
 		input.AutoSequence, input.NumberPrefix,
 		shortCode, input.Currency,
 		nullIfEmpty(input.BankAccountID), nullIfEmpty(input.SuspenseAccountID),
 		nullIfEmpty(input.ProfitAccountID), nullIfEmpty(input.LossAccountID),
-		orgID, now)
+		orgID, input.IsPayrollJournal, now)
 
 	if err != nil {
 		h.log.Error("Failed to create journal", "error", err)
@@ -1581,6 +1585,9 @@ func (h *Handler) UpdateJournal(c *gin.Context) {
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
+	}
+	if input.IsPayrollJournal != nil {
+		addUpdate("is_payroll_journal", *input.IsPayrollJournal)
 	}
 	if input.ShortCode != nil {
 		addUpdate("short_code", *input.ShortCode)
