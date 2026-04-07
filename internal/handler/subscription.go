@@ -297,6 +297,95 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true})
 }
 
+// VerifyPayment polls Multicard for the latest payment status and activates
+// the subscription if the payment is confirmed as successful.
+// POST /subscription/verify-payment
+// Body: { "invoice_id": "genix-xxxx-yyyy" }
+func (h *Handler) VerifyPayment(c *gin.Context) {
+	tenantID := c.GetString("tenant_id")
+	if tenantID == "" {
+		response.BadRequest(c, "Tenant not resolved")
+		return
+	}
+
+	var input struct {
+		InvoiceID string `json:"invoice_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "invoice_id is required")
+		return
+	}
+
+	// Look up payment record
+	var (
+		plan          string
+		multicardUUID string
+		currentStatus string
+	)
+	err := h.db.QueryRow(`
+		SELECT plan, multicard_uuid, status
+		FROM subscription_payments
+		WHERE invoice_id = $1 AND tenant_id = $2
+	`, input.InvoiceID, tenantID).Scan(&plan, &multicardUUID, &currentStatus)
+	if err != nil {
+		response.NotFound(c, "Invoice not found")
+		return
+	}
+
+	if currentStatus == "success" {
+		response.Success(c, gin.H{"status": "success", "message": "Already activated"})
+		return
+	}
+
+	// Query Multicard for real status
+	ps, err := h.multicardClient.GetPaymentStatus(c.Request.Context(), multicardUUID)
+	if err != nil {
+		h.log.Error("VerifyPayment: failed to query Multicard", "error", err, "uuid", multicardUUID)
+		response.InternalServerError(c, "Failed to query payment status")
+		return
+	}
+
+	h.log.Info("VerifyPayment: Multicard status",
+		"invoice_id", input.InvoiceID, "uuid", multicardUUID,
+		"status", ps.Status, "billing_id", ps.BillingID, "amount", ps.Amount)
+
+	// Update our record with the latest status
+	h.db.Exec(`
+		UPDATE subscription_payments
+		SET status       = $2,
+		    billing_id   = $3,
+		    card_pan     = $4,
+		    ps           = $5,
+		    card_token   = $6,
+		    payment_time = $7,
+		    updated_at   = NOW()
+		WHERE invoice_id = $1
+	`, input.InvoiceID, ps.Status, ps.BillingID, ps.CardPan, ps.PS, ps.CardToken, ps.PaymentTime)
+
+	if ps.Status == "success" {
+		var paidUsers int
+		var billing string
+		fmt.Sscanf(plan, "%dusers_%s", &paidUsers, &billing)
+		if paidUsers < 1 {
+			paidUsers = 1
+		}
+		h.db.Exec(`
+			UPDATE tenants
+			SET subscription_status = 'active',
+			    subscription_plan   = $2,
+			    paid_users          = $3,
+			    is_active           = true,
+			    trial_ends_at       = NULL,
+			    account_clear_at    = NULL,
+			    updated_at          = NOW()
+			WHERE id = $1
+		`, tenantID, plan, paidUsers)
+		h.log.Info("VerifyPayment: subscription activated", "tenant_id", tenantID, "plan", plan)
+	}
+
+	response.Success(c, gin.H{"status": ps.Status})
+}
+
 // GetPaymentHistory returns the list of payment records for the tenant.
 // GET /subscription/payments
 func (h *Handler) GetPaymentHistory(c *gin.Context) {

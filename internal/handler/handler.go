@@ -120,6 +120,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		subscription.POST("/checkout", h.CreateCheckout)
 		subscription.GET("/plans", h.GetPlans)
 		subscription.GET("/payments", h.GetPaymentHistory)
+		subscription.POST("/verify-payment", h.VerifyPayment)
 	}
 
 	// Authentication (protected)
