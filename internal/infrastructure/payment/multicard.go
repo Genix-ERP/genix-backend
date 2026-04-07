@@ -176,6 +176,61 @@ type WebhookPayload struct {
 	Sign        string  `json:"sign"`
 }
 
+// ----- Payment Status -----
+
+// PaymentStatus is returned when querying an invoice's current state.
+type PaymentStatus struct {
+	UUID        string `json:"uuid"`
+	InvoiceID   string `json:"invoice_id"`
+	Amount      int64  `json:"amount"`
+	Status      string `json:"status"`
+	BillingID   string `json:"billing_id"`
+	PaymentTime string `json:"payment_time"`
+	Phone       string `json:"phone"`
+	CardPan     string `json:"card_pan"`
+	PS          string `json:"ps"`
+	CardToken   string `json:"card_token"`
+}
+
+// GetPaymentStatus queries Multicard for the current status of an invoice by UUID.
+func (c *Client) GetPaymentStatus(ctx context.Context, uuid string) (*PaymentStatus, error) {
+	token, err := c.token(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("%s/payment/invoice/%s", c.baseURL, uuid), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+
+	var result struct {
+		Success bool          `json:"success"`
+		Data    PaymentStatus `json:"data"`
+		Error   struct {
+			Code    string `json:"code"`
+			Details string `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode payment status: %w", err)
+	}
+	if !result.Success {
+		return nil, fmt.Errorf("multicard status error %s: %s", result.Error.Code, result.Error.Details)
+	}
+	return &result.Data, nil
+}
+
 // VerifySign checks the MD5 signature from the webhook payload.
 // sign = MD5( uuid + invoice_id + amount + secret )
 func (c *Client) VerifySign(p WebhookPayload) bool {
