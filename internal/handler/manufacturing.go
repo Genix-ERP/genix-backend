@@ -1125,7 +1125,8 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 			   po.work_center_id, wc.name as work_center_name, po.requires_quality_check, po.quality_status,
 			   po.notes, po.tags, po.created_by, cu.first_name || ' ' || cu.last_name as created_by_name,
 			   po.confirmed_at, po.completed_at, po.created_at, po.updated_at,
-			   po.manufacturing_category_id, mc.name as manufacturing_category_name
+			   po.manufacturing_category_id, mc.name as manufacturing_category_name,
+			   po.has_split_output
 		FROM production_orders po
 		LEFT JOIN products p ON po.product_id = p.id
 		LEFT JOIN product_boms b ON po.bom_id = b.id
@@ -1154,6 +1155,7 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 		&po.Notes, &tags, &po.CreatedBy, &createdByName,
 		&confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
 		&po.ManufacturingCategoryID, &categoryName,
+		&po.HasSplitOutput,
 	)
 
 	if err == sql.ErrNoRows {
@@ -1387,6 +1389,11 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		moldCount = *input.MoldCount
 	}
 
+	hasSplitOutput := false
+	if input.HasSplitOutput != nil {
+		hasSplitOutput = *input.HasSplitOutput
+	}
+
 	query := `
 		INSERT INTO production_orders (
 			id, tenant_id, organization_id, code, name, product_id, bom_id, quantity_planned, uom,
@@ -1394,8 +1401,8 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 			scheduled_start, scheduled_end, priority, status, source_type, source_id,
 			sales_order_id, customer_id, warehouse_id, location_id, assigned_to,
 			work_center_id, requires_quality_check, notes, tags, created_by, created_at, updated_at,
-			manufacturing_category_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, 'draft', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+			manufacturing_category_id, has_split_output
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, 'draft', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
 		RETURNING id
 	`
 
@@ -1410,7 +1417,7 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		scheduledStart, scheduledEnd, priority, input.SourceType, input.SourceID,
 		input.SalesOrderID, input.CustomerID, input.WarehouseID, input.LocationID, input.AssignedTo,
 		input.WorkCenterID, requiresQC, input.Notes, tags, userID, now, now,
-		input.ManufacturingCategoryID,
+		input.ManufacturingCategoryID, hasSplitOutput,
 	).Scan(&id)
 
 	if err != nil {
@@ -1559,6 +1566,11 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("manufacturing_category_id = $%d", argCount))
 		args = append(args, *input.ManufacturingCategoryID)
+	}
+	if input.HasSplitOutput != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("has_split_output = $%d", argCount))
+		args = append(args, *input.HasSplitOutput)
 	}
 
 	if len(updates) == 0 {

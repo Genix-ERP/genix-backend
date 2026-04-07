@@ -115,13 +115,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		auth.GET("/me/organizations", h.GetCurrentUserOrganizations)
 	}
 
+	// Send credentials — HR workers need this without requiring users:user:read
+	rg.POST("/send-credentials", h.perm.Require("hr", "employee", "update"), h.SendCredentials)
+
 	// Users
 	users := rg.Group("/users")
 	users.Use(h.perm.Require("users", "user", "read"))
 	{
 		users.GET("", h.ListUsers)
 		users.POST("", h.perm.Require("users", "user", "create"), h.CreateUser)
-		users.POST("/send-credentials", h.perm.Require("users", "user", "create"), h.SendCredentials)
 		users.GET("/:id", h.GetUser)
 		users.PUT("/:id", h.perm.Require("users", "user", "update"), h.UpdateUser)
 		users.DELETE("/:id", h.perm.Require("users", "user", "delete"), h.DeleteUser)
@@ -729,6 +731,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		purchaseOrders.GET("", h.ListPurchaseOrders)
 		purchaseOrders.POST("", h.perm.Require("purchase", "order", "create"), h.CreatePurchaseOrder)
+		purchaseOrders.POST("/scan-receipt", h.perm.Require("purchase", "order", "create"), h.ScanPurchaseReceipt)
 		purchaseOrders.GET("/:id", h.GetPurchaseOrder)
 		purchaseOrders.PUT("/:id", h.perm.Require("purchase", "order", "update"), h.UpdatePurchaseOrder)
 		purchaseOrders.DELETE("/:id", h.perm.Require("purchase", "order", "delete"), h.DeletePurchaseOrder)
@@ -1432,6 +1435,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		productionOrders.POST("/:id/complete", h.CompleteProductionOrder)
 		productionOrders.POST("/:id/cancel", h.CancelProductionOrder)
 		productionOrders.POST("/:id/record-production", h.RecordProduction)
+		productionOrders.POST("/:id/complete-split", h.perm.Require("manufacturing", "production_orders", "update"), h.CompleteSplitOutput)
+		productionOrders.GET("/:id/split-outputs", h.GetSplitOutputs)
 	}
 
 	// Work Orders
