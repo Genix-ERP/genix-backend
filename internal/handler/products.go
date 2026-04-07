@@ -84,6 +84,8 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.can_be_subcontracted, false) as can_be_subcontracted,
 			   COALESCE(p.is_overhead_expense, false) as is_overhead_expense,
 			   COALESCE(p.has_variants, false) as has_variants,
+			   COALESCE(p.has_delivery, false) as has_delivery,
+			   COALESCE(p.delivery_price, 0) as delivery_price,
 			   p.is_active, p.tags, COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
 			   p.created_at, p.updated_at,
@@ -202,7 +204,8 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.IsPurchasable, &p.IsSellable,
 			&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 			&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
-			&p.IsOverheadExpense, &p.HasVariants, &p.IsActive, &tags, &imageURL,
+			&p.IsOverheadExpense, &p.HasVariants, &p.HasDelivery, &p.DeliveryPrice,
+			&p.IsActive, &tags, &imageURL,
 			&inventoryType,
 			&p.CreatedAt, &p.UpdatedAt,
 			&categoryCode, &categoryName,
@@ -276,6 +279,8 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			CanBeSubcontracted: p.CanBeSubcontracted,
 			IsOverheadExpense: p.IsOverheadExpense,
 			HasVariants:       p.HasVariants,
+			HasDelivery:       p.HasDelivery,
+			DeliveryPrice:     p.DeliveryPrice,
 			IsActive:          p.IsActive,
 			ImageURL:          imageURL,
 			InventoryType:     inventoryType,
@@ -445,6 +450,10 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 	if input.AutoManufacture != nil {
 		autoManufacture = *input.AutoManufacture
 	}
+	hasDelivery := false
+	if input.HasDelivery != nil {
+		hasDelivery = *input.HasDelivery
+	}
 
 	// Default inventory_type to 'trade', or 'service' if type is 'service'
 	inventoryType := "trade"
@@ -500,8 +509,9 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
 			can_be_expensed, can_be_rented, can_be_subcontracted, is_overhead_expense,
 			is_manufacturable, auto_manufacture,
+			has_delivery, delivery_price,
 			is_active, tags, image_url, inventory_type, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
 		RETURNING id
 	`
 
@@ -512,6 +522,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
 		canBeExpensed, canBeRented, canBeSubcontracted, isOverheadExpense,
 		isManufacturable, autoManufacture,
+		hasDelivery, input.DeliveryPrice,
 		true, tagsJSON, imageURL, inventoryType, userID, now, now,
 	).Scan(&id)
 
@@ -635,6 +646,8 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			   COALESCE(p.can_be_subcontracted, false) as can_be_subcontracted,
 			   COALESCE(p.is_overhead_expense, false) as is_overhead_expense,
 			   COALESCE(p.has_variants, false) as has_variants,
+			   COALESCE(p.has_delivery, false) as has_delivery,
+			   COALESCE(p.delivery_price, 0) as delivery_price,
 			   p.is_active, p.tags,
 			   COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
@@ -670,7 +683,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		&p.IsPurchasable, &p.IsSellable,
 		&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 		&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
-		&p.IsOverheadExpense, &p.HasVariants,
+		&p.IsOverheadExpense, &p.HasVariants, &p.HasDelivery, &p.DeliveryPrice,
 		&p.IsActive, &tags, &imageURL,
 		&inventoryType,
 		&p.CreatedAt, &p.UpdatedAt,
@@ -707,6 +720,8 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		CanBeSubcontracted: p.CanBeSubcontracted,
 		IsOverheadExpense:  p.IsOverheadExpense,
 		HasVariants:        p.HasVariants,
+		HasDelivery:        p.HasDelivery,
+		DeliveryPrice:      p.DeliveryPrice,
 		IsActive:           p.IsActive,
 		ImageURL:           imageURL,
 		InventoryType:      inventoryType,
@@ -908,6 +923,12 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	}
 	if input.AutoManufacture != nil {
 		addUpdate("auto_manufacture", *input.AutoManufacture)
+	}
+	if input.HasDelivery != nil {
+		addUpdate("has_delivery", *input.HasDelivery)
+	}
+	if input.DeliveryPrice != nil {
+		addUpdate("delivery_price", *input.DeliveryPrice)
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
