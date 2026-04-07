@@ -1131,6 +1131,10 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 		WHERE pc.tenant_id = $1 AND pc.deleted_at IS NULL
 	`
 
+	if orgID != uuid.Nil {
+		query += fmt.Sprintf(` AND (pc.origin_organization_id = $%d OR pc.origin_organization_id IS NULL)`, len(args))
+	}
+
 	if !includeInactive {
 		query += " AND pc.is_active = true"
 	}
