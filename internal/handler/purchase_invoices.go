@@ -1174,6 +1174,16 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 				h.log.Error("Failed to create payment record", "error", err)
 			} else {
 				h.log.Info("Payment record created", "payment_id", paymentID, "invoice_id", invoiceID)
+
+				// Create payment allocation linking payment to this invoice
+				allocID := uuid.New()
+				_, allocErr := h.db.Exec(`
+					INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
+					VALUES ($1, $2, 'purchase_invoice', $3, $4, $5)
+				`, allocID, paymentID, invoiceID, paymentAmount, now)
+				if allocErr != nil {
+					h.log.Error("Failed to create payment allocation", "error", allocErr)
+				}
 			}
 		}
 	} else {
