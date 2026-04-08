@@ -746,7 +746,7 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 
 		// Get warehouse from GR
 		var warehouseID sql.NullString
-		h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1", grID).Scan(&warehouseID)
+		h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1 AND tenant_id = $2", grID, tenantID).Scan(&warehouseID)
 
 		for allocRows.Next() {
 			var productID uuid.UUID

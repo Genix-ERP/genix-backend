@@ -1655,18 +1655,29 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 	var poWarehouseID sql.NullString
 	var poOrgID *uuid.UUID
 	var poVendorID *uuid.UUID
-	h.db.QueryRow("SELECT warehouse_id, organization_id, vendor_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID, &poOrgID, &poVendorID)
+	h.db.QueryRow("SELECT warehouse_id, organization_id, vendor_id FROM purchase_orders WHERE id = $1 AND tenant_id = $2", id, tenantID).Scan(&poWarehouseID, &poOrgID, &poVendorID)
 
-	// Fall back to the first warehouse for this tenant if PO has no warehouse
+	// Fall back to org-specific warehouse first, then any tenant warehouse
 	var defaultWarehouseID sql.NullString
 	if !poWarehouseID.Valid || poWarehouseID.String == "" {
-		h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1", tenantID).Scan(&defaultWarehouseID)
+		if poOrgID != nil && *poOrgID != uuid.Nil {
+			h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1", tenantID, *poOrgID).Scan(&defaultWarehouseID)
+		}
+		if !defaultWarehouseID.Valid {
+			h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1", tenantID).Scan(&defaultWarehouseID)
+		}
 	}
 
-	// Auto-assign first warehouse if PO has none
+	// Auto-assign warehouse if PO has none - prefer org-specific warehouse
 	if !poWarehouseID.Valid || poWarehouseID.String == "" {
 		var firstWH string
-		if h.db.QueryRow(`SELECT id::text FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
+		if poOrgID != nil && *poOrgID != uuid.Nil {
+			h.db.QueryRow(`SELECT id::text FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1`, tenantID, *poOrgID).Scan(&firstWH)
+		}
+		if firstWH == "" {
+			h.db.QueryRow(`SELECT id::text FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH)
+		}
+		if firstWH != "" {
 			poWarehouseID = sql.NullString{String: firstWH, Valid: true}
 			h.db.Exec(`UPDATE purchase_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, id, tenantID)
 		}

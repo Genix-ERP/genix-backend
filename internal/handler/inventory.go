@@ -529,14 +529,25 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		unitCost = productCostPrice
 	}
 
-	// Verify warehouse belongs to tenant
-	var warehouseExists bool
-	h.db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)",
+	// Verify warehouse belongs to tenant and get its organization_id
+	var warehouseOrgID uuid.UUID
+	err = h.db.QueryRow(
+		"SELECT COALESCE(organization_id, '00000000-0000-0000-0000-000000000000') FROM warehouses WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
 		warehouseID, tenantID,
-	).Scan(&warehouseExists)
-	if !warehouseExists {
+	).Scan(&warehouseOrgID)
+	if err != nil {
 		response.NotFound(c, "Warehouse")
+		return
+	}
+
+	// If organizationID from middleware is nil, derive it from the warehouse
+	if organizationID == uuid.Nil && warehouseOrgID != uuid.Nil {
+		organizationID = warehouseOrgID
+	}
+
+	// Validate warehouse belongs to the same organization if both are set
+	if organizationID != uuid.Nil && warehouseOrgID != uuid.Nil && organizationID != warehouseOrgID {
+		response.BadRequest(c, "Warehouse does not belong to the selected organization")
 		return
 	}
 

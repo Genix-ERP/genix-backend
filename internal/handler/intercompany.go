@@ -334,11 +334,11 @@ func (h *Handler) CreateIntercompanyTransfer(c *gin.Context) {
 		var unitCost float64
 		err = h.db.QueryRow(`
 			SELECT COALESCE(
-				(SELECT unit_cost FROM inventory WHERE product_id = $1 AND warehouse_id = $2 LIMIT 1),
-				(SELECT cost_price FROM products WHERE id = $1),
+				(SELECT unit_cost FROM inventory WHERE product_id = $1 AND warehouse_id = $2 AND tenant_id = $3 LIMIT 1),
+				(SELECT cost_price FROM products WHERE id = $1 AND tenant_id = $3),
 				0
 			)
-		`, productID, fromWarehouseID).Scan(&unitCost)
+		`, productID, fromWarehouseID, tenantID).Scan(&unitCost)
 		if err != nil {
 			unitCost = 0
 		}
@@ -831,11 +831,10 @@ func (h *Handler) ShipIntercompanyTransfer(c *gin.Context) {
 		_, err = tx.Exec(`
 			UPDATE inventory
 			SET quantity_on_hand = quantity_on_hand - $1,
-				quantity_available = quantity_available - $1,
 				last_movement_date = CURRENT_TIMESTAMP,
 				updated_at = CURRENT_TIMESTAMP
-			WHERE product_id = $2 AND warehouse_id = $3
-		`, quantity, productID, fromWarehouseID)
+			WHERE product_id = $2 AND warehouse_id = $3 AND tenant_id = $4
+		`, quantity, productID, fromWarehouseID, tenantID)
 		if err != nil {
 			h.log.Error("Failed to deduct inventory", "error", err, "product_id", productID)
 		}
@@ -851,7 +850,7 @@ func (h *Handler) ShipIntercompanyTransfer(c *gin.Context) {
 				'intercompany_transfer', $2, $3,
 				$4, 'Inter-company transfer shipment', CURRENT_TIMESTAMP, $5
 			FROM inventory i
-			WHERE i.product_id = $6 AND i.warehouse_id = $4
+			WHERE i.product_id = $6 AND i.warehouse_id = $4 AND i.tenant_id = $1
 			LIMIT 1
 		`, tenantID, id, quantity, fromWarehouseID, userID, productID)
 		if err != nil {
@@ -963,29 +962,30 @@ func (h *Handler) ReceiveIntercompanyTransfer(c *gin.Context) {
 		var existingID uuid.UUID
 		err = tx.QueryRow(`
 			SELECT id FROM inventory
-			WHERE product_id = $1 AND warehouse_id = $2
-		`, productID, toWarehouseID).Scan(&existingID)
+			WHERE product_id = $1 AND warehouse_id = $2 AND tenant_id = $3
+		`, productID, toWarehouseID, tenantID).Scan(&existingID)
 
 		if err == sql.ErrNoRows {
 			// Create new inventory record
+			// Get organization_id from the destination warehouse
+			var toWhOrgID *uuid.UUID
+			tx.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", toWarehouseID, tenantID).Scan(&toWhOrgID)
 			_, err = tx.Exec(`
 				INSERT INTO inventory (
-					id, tenant_id, product_id, warehouse_id,
-					quantity_on_hand, quantity_available, unit_cost, total_value,
-					last_movement_date
-				) VALUES ($1, $2, $3, $4, $5, $5, $6, $7, CURRENT_TIMESTAMP)
-			`, uuid.New(), tenantID, productID, toWarehouseID, quantity, transferPrice, quantity*transferPrice)
+					id, tenant_id, organization_id, product_id, warehouse_id,
+					quantity_on_hand, quantity_reserved, unit_cost,
+					last_movement_date, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			`, uuid.New(), tenantID, toWhOrgID, productID, toWarehouseID, quantity, transferPrice)
 		} else if err == nil {
 			// Update existing inventory record
 			_, err = tx.Exec(`
 				UPDATE inventory
 				SET quantity_on_hand = quantity_on_hand + $1,
-					quantity_available = quantity_available + $1,
-					total_value = total_value + $2,
 					last_movement_date = CURRENT_TIMESTAMP,
 					updated_at = CURRENT_TIMESTAMP
-				WHERE id = $3
-			`, quantity, quantity*transferPrice, existingID)
+				WHERE id = $2
+			`, quantity, existingID)
 		}
 		if err != nil {
 			h.log.Error("Failed to add inventory", "error", err, "product_id", productID)
@@ -1002,7 +1002,7 @@ func (h *Handler) ReceiveIntercompanyTransfer(c *gin.Context) {
 				'intercompany_transfer', $2, $3,
 				$4, 'Inter-company transfer receipt', CURRENT_TIMESTAMP, $5
 			FROM inventory i
-			WHERE i.product_id = $6 AND i.warehouse_id = $4
+			WHERE i.product_id = $6 AND i.warehouse_id = $4 AND i.tenant_id = $1
 			LIMIT 1
 		`, tenantID, id, quantity, toWarehouseID, userID, productID)
 		if err != nil {
