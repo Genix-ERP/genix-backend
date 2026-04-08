@@ -1197,6 +1197,29 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	}
 	err = h.db.QueryRow(journalQuery, tenantID).Scan(&payJournalID, &nextNumber, &numberPrefix)
 
+	// Fallback: try any active journal with matching type
+	if err != nil {
+		h.log.Warn("No journal found by code for payment, trying fallback", "payment_method", input.PaymentMethod, "error", err)
+		fallbackType := "bank"
+		if input.PaymentMethod == "cash" {
+			fallbackType = "cash"
+		}
+		err = h.db.QueryRow(
+			`SELECT id, COALESCE(next_number, 1), number_prefix FROM journals WHERE tenant_id = $1 AND type = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1`,
+			tenantID, fallbackType,
+		).Scan(&payJournalID, &nextNumber, &numberPrefix)
+		if err != nil {
+			// Last fallback: any journal
+			err = h.db.QueryRow(
+				`SELECT id, COALESCE(next_number, 1), number_prefix FROM journals WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY is_default DESC LIMIT 1`,
+				tenantID,
+			).Scan(&payJournalID, &nextNumber, &numberPrefix)
+			if err != nil {
+				h.log.Error("No journal found at all for payment", "tenant_id", tenantID, "error", err)
+			}
+		}
+	}
+
 	if err == nil {
 		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "2000")
 		// Select credit account based on payment method
@@ -1218,6 +1241,12 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			cashAcctID = findAccount(h.db, tenantID, organizationID, "outstanding payments", "1160")
 		}
 
+		if apAcctID == uuid.Nil {
+			h.log.Error("AP account not found for vendor payment", "tenant_id", tenantID, "org_id", organizationID)
+		}
+		if cashAcctID == uuid.Nil {
+			h.log.Error("Cash/Bank account not found for vendor payment", "tenant_id", tenantID, "org_id", organizationID, "payment_method", input.PaymentMethod)
+		}
 		if apAcctID != uuid.Nil && cashAcctID != uuid.Nil {
 			prefix := ""
 			if numberPrefix.Valid {
@@ -1293,9 +1322,15 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 
 				// Update account balances
 				// Debit AP (credit-normal: debit decreases) — includes write-off
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID)
-				// Credit Outstanding Payments (debit-normal: credit decreases)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
+				if _, apErr := h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID); apErr != nil {
+					h.log.Error("Failed to update AP account balance", "error", apErr, "account_id", apAcctID, "amount", apDebitAmount)
+				}
+				// Credit Cash/Bank (debit-normal: credit decreases)
+				if _, cashErr := h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID); cashErr != nil {
+					h.log.Error("Failed to update Cash/Bank account balance", "error", cashErr, "account_id", cashAcctID, "amount", paymentAmount)
+				} else {
+					h.log.Info("Vendor payment: account balances updated", "ap_account", apAcctID, "cash_account", cashAcctID, "amount", paymentAmount)
+				}
 			}
 		}
 	}
