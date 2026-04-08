@@ -25,7 +25,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 		return
 	}
 
-	// Note: organization_id filter skipped as it may not exist in migration 010 schema
+	organizationID := c.Query("organization_id")
 
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -43,9 +43,8 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	workCenterID := c.Query("work_center_id")
 	status := c.Query("status")
 
-	// Use only columns from migration 010 schema for backward compatibility
 	query := `
-		SELECT wo.id, wo.tenant_id, NULL as organization_id, wo.production_order_id,
+		SELECT wo.id, wo.tenant_id, wo.organization_id, wo.production_order_id,
 			   COALESCE(wo.code, '') as work_order_number,
 			   COALESCE(wo.name, '') as name, wo.sequence,
 			   wo.operation_id as bom_operation_id, '' as operation_name,
@@ -71,7 +70,11 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argIdx := 2
 
-	// Note: organization_id may not exist in migration 010 schema, skip filter
+	if organizationID != "" {
+		query += fmt.Sprintf(" AND wo.organization_id = $%d", argIdx)
+		args = append(args, organizationID)
+		argIdx++
+	}
 	if productionOrderID != "" {
 		query += fmt.Sprintf(" AND wo.production_order_id = $%d", argIdx)
 		args = append(args, productionOrderID)
@@ -188,9 +191,8 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 		return
 	}
 
-	// Use only columns from migration 010 schema for backward compatibility
 	query := `
-		SELECT wo.id, wo.tenant_id, NULL as organization_id, wo.production_order_id,
+		SELECT wo.id, wo.tenant_id, wo.organization_id, wo.production_order_id,
 			   COALESCE(wo.code, '') as work_order_number,
 			   COALESCE(wo.name, '') as name, wo.sequence,
 			   wo.operation_id as bom_operation_id, '' as operation_name,
