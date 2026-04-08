@@ -1101,7 +1101,7 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		// Get SO warehouse_id and organization_id
 		var soWarehouseID sql.NullString
 		var soOrgID sql.NullString
-		h.db.QueryRow("SELECT warehouse_id, organization_id FROM sales_orders WHERE id = $1", orderID).Scan(&soWarehouseID, &soOrgID)
+		h.db.QueryRow("SELECT warehouse_id, organization_id FROM sales_orders WHERE id = $1 AND tenant_id = $2", orderID, tenantID).Scan(&soWarehouseID, &soOrgID)
 
 		// Determine warehouse
 		var warehouseID uuid.UUID

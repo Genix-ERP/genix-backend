@@ -269,6 +269,26 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		warehouseID = soWarehouseID.String
 	}
 
+	// If warehouse is set, validate it belongs to the same organization
+	if warehouseID != "" && orgIDPtr != nil {
+		var warehouseOrgMatch bool
+		h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND organization_id = $3 AND deleted_at IS NULL)",
+			warehouseID, tenantID, *orgIDPtr,
+		).Scan(&warehouseOrgMatch)
+		if !warehouseOrgMatch {
+			// Try to find a warehouse that belongs to this organization instead
+			var orgWarehouseID string
+			err := h.db.QueryRow(
+				"SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1",
+				tenantID, *orgIDPtr,
+			).Scan(&orgWarehouseID)
+			if err == nil {
+				warehouseID = orgWarehouseID
+			}
+		}
+	}
+
 	// Use provided delivery date or today
 	deliveryDate := now
 	if input.DeliveryDate != "" {
@@ -628,12 +648,13 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 	var currentStatus string
 	var salesOrderID uuid.UUID
 	var warehouseID sql.NullString
+	var doOrgID sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT status, sales_order_id, warehouse_id
+		SELECT status, sales_order_id, warehouse_id, organization_id
 		FROM sales_delivery_orders
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, doID, tenantID).Scan(&currentStatus, &salesOrderID, &warehouseID)
+	`, doID, tenantID).Scan(&currentStatus, &salesOrderID, &warehouseID, &doOrgID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Delivery order")
@@ -681,6 +702,18 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		return
 	}
 
+	// If no warehouse is set on the DO, try to find one from the org
+	if (!warehouseID.Valid || warehouseID.String == "") && doOrgID.Valid && doOrgID.String != "" {
+		var orgWarehouse string
+		err := h.db.QueryRow(
+			"SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1",
+			tenantID, doOrgID.String,
+		).Scan(&orgWarehouse)
+		if err == nil {
+			warehouseID = sql.NullString{String: orgWarehouse, Valid: true}
+		}
+	}
+
 	// Pre-validate stock availability for all lines before making any changes
 	type insufficientItem struct {
 		ProductName string  `json:"product_name"`
@@ -698,10 +731,30 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 			continue
 		}
 
+		// Validate that the effective warehouse belongs to the same organization
+		if doOrgID.Valid && doOrgID.String != "" {
+			var whOrgMatch bool
+			h.db.QueryRow(
+				"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND organization_id = $3 AND deleted_at IS NULL)",
+				effectiveWarehouseID, tenantID, doOrgID.String,
+			).Scan(&whOrgMatch)
+			if !whOrgMatch {
+				// Fall back to org's default warehouse
+				var orgWH string
+				if h.db.QueryRow(
+					"SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1",
+					tenantID, doOrgID.String,
+				).Scan(&orgWH) == nil {
+					effectiveWarehouseID = orgWH
+				}
+			}
+		}
+
 		var qtyAvailable float64
 		var productName string
+		// Sum available quantity across all inventory records for this product+warehouse (handles multiple lots/serials)
 		err := h.db.QueryRow(`
-			SELECT COALESCE(i.quantity_available, 0), COALESCE(p.name, 'Unknown')
+			SELECT COALESCE(SUM(i.quantity_available), 0), COALESCE(MAX(p.name), 'Unknown')
 			FROM products p
 			LEFT JOIN inventory i ON i.product_id = p.id AND i.tenant_id = p.tenant_id AND i.warehouse_id = $3
 			WHERE p.id = $1 AND p.tenant_id = $2
@@ -748,6 +801,24 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		}
 		if effectiveWarehouseID == "" {
 			continue
+		}
+
+		// Validate warehouse belongs to the same organization (same check as above)
+		if doOrgID.Valid && doOrgID.String != "" {
+			var whOrgMatch bool
+			h.db.QueryRow(
+				"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND organization_id = $3 AND deleted_at IS NULL)",
+				effectiveWarehouseID, tenantID, doOrgID.String,
+			).Scan(&whOrgMatch)
+			if !whOrgMatch {
+				var orgWH string
+				if h.db.QueryRow(
+					"SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1",
+					tenantID, doOrgID.String,
+				).Scan(&orgWH) == nil {
+					effectiveWarehouseID = orgWH
+				}
+			}
 		}
 
 		var inventoryID uuid.UUID
