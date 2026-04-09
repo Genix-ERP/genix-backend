@@ -3721,64 +3721,33 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	// Determine cash/bank account: stored bank_account_id → journal default account → payment method → name fallback
 	var cashAccountID uuid.UUID
 	var cashAccountBalance float64
+
+	// 1. Use explicit bank_account_id if provided
 	if bankAccountIDStr.Valid {
 		cashAccountID, _ = uuid.Parse(bankAccountIDStr.String)
 	}
+
+	// 2. Use journal's default account — journal is already linked to its account
 	if cashAccountID == uuid.Nil && storedJournalID.Valid {
-		// Try the selected journal's default debit account (bank/cash journals typically use a single default account)
 		_ = tx.QueryRow(
 			`SELECT COALESCE(default_debit_account_id, default_credit_account_id) FROM journals WHERE id = $1 AND tenant_id = $2`,
 			storedJournalID.String, tenantID,
 		).Scan(&cashAccountID)
 	}
-	if cashAccountID == uuid.Nil && storedJournalID.Valid {
-		// Use journal type to determine the correct account
-		var journalName sql.NullString
-		var journalType sql.NullString
-		_ = tx.QueryRow(
-			`SELECT name, type FROM journals WHERE id = $1 AND tenant_id = $2`,
-			storedJournalID.String, tenantID,
-		).Scan(&journalName, &journalType)
 
-		if journalType.Valid {
-			switch journalType.String {
-			case "cash":
-				cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
-				if cashAccountID == uuid.Nil {
-					cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
-				}
-			case "bank":
-				cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
-				if cashAccountID == uuid.Nil {
-					cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank hisobi", "1010")
-				}
-			}
-		}
-		// Last resort: try matching journal name to account name
-		if cashAccountID == uuid.Nil && journalName.Valid && journalName.String != "" {
-			jNameLower := strings.ToLower(journalName.String)
-			_ = tx.QueryRow(
-				`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) LIKE $2 AND deleted_at IS NULL LIMIT 1`,
-				tenantID, jNameLower+"%",
-			).Scan(&cashAccountID)
-		}
-	}
-	if cashAccountID == uuid.Nil && paymentMethodID.Valid {
-		_ = tx.QueryRow(
-			`SELECT account_id FROM payment_methods WHERE id = $1 AND tenant_id = $2`,
-			paymentMethodID.String, tenantID,
-		).Scan(&cashAccountID)
-	}
-	if cashAccountID == uuid.Nil {
-		// Fallback: look up by name (English + Uzbek patterns) and code
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1010")
-		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank hisobi", "1010")
-		}
-		if cashAccountID == uuid.Nil {
+	// 3. Fallback: use journal type to pick account code
+	if cashAccountID == uuid.Nil && storedJournalID.Valid {
+		var jType sql.NullString
+		_ = tx.QueryRow(`SELECT type FROM journals WHERE id = $1 AND tenant_id = $2`, storedJournalID.String, tenantID).Scan(&jType)
+		if jType.Valid && jType.String == "cash" {
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+		} else if jType.Valid && jType.String == "bank" {
 			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
 		}
-		if cashAccountID == uuid.Nil {
+	}
+
+	// 4. Last fallback: find by account code
+	if cashAccountID == uuid.Nil {
 			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
 		}
 		if cashAccountID == uuid.Nil {
