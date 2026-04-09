@@ -1309,9 +1309,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// Workflow Logs
 	rg.GET("/workflow-logs", h.perm.Require("workflow", "workflow", "read"), h.ListWorkflowLogs)
 
-	// AI Assistant
+	// AI Assistant — accessible to all authenticated users
 	ai := rg.Group("/ai")
-	ai.Use(h.perm.Require("ai", "conversation", "create"))
 	{
 		ai.GET("/capabilities", h.GetAICapabilities)
 		ai.POST("/chat", h.AIChat)
