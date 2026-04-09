@@ -2281,26 +2281,30 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				consumption := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
 
 				var compInvID uuid.UUID
+				// Try to find inventory record — first with organization, then without lot/serial constraints
 				compErr := tx.QueryRow(`
 					SELECT id FROM inventory
 					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-					AND lot_number IS NULL AND serial_number IS NULL
+					ORDER BY quantity_on_hand DESC LIMIT 1
 				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
 
 				if compErr != nil {
-					h.log.Warn("Component not found in inventory, skipping consumption", "component_id", comp.ComponentID)
+					h.log.Warn("Component not found in inventory, skipping consumption", "component_id", comp.ComponentID, "warehouse_id", warehouseID)
 					continue
 				}
 
-				_, _ = tx.Exec(`
+				if _, deductErr := tx.Exec(`
 					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
 					WHERE id = $3
-				`, consumption, now, compInvID)
+				`, consumption, now, compInvID); deductErr != nil {
+					h.log.Error("Failed to deduct component from inventory", "error", deductErr, "component_id", comp.ComponentID, "qty", consumption)
+					continue
+				}
 
 				var compCost float64
-				h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
+				tx.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
 
-				_, _ = tx.Exec(`
+				if _, txErr := tx.Exec(`
 					INSERT INTO inventory_transactions (
 						id, tenant_id, organization_id, inventory_id, transaction_type,
 						reference_type, reference_id, quantity, unit_cost, total_cost,
@@ -2308,7 +2312,9 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
 				`, uuid.New(), tenantID, organizationID, compInvID, entity.TransactionTypeIssue,
 					"production_order", id, -consumption, compCost, consumption*compCost,
-					"material_consumption", "Materials consumed at production start", now, userID)
+					"material_consumption", "Materials consumed at production start", now, userID); txErr != nil {
+					h.log.Error("Failed to create inventory transaction for component", "error", txErr, "component_id", comp.ComponentID)
+				}
 			}
 
 			if commitErr := tx.Commit(); commitErr != nil {
