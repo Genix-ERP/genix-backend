@@ -71,7 +71,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	argIdx := 2
 
 	if organizationID != "" {
-		query += fmt.Sprintf(" AND wo.organization_id = $%d", argIdx)
+		query += fmt.Sprintf(" AND (wo.organization_id = $%d OR (wo.organization_id IS NULL AND po.organization_id = $%d))", argIdx, argIdx)
 		args = append(args, organizationID)
 		argIdx++
 	}
