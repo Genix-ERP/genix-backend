@@ -233,13 +233,14 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 	var soCustomerName sql.NullString
 	var soWarehouseID sql.NullString
 	var soExpectedDate sql.NullTime
+	var soOrgID sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT so.order_number, so.status, so.customer_id, c.name, so.warehouse_id, so.expected_date
+		SELECT so.order_number, so.status, so.customer_id, c.name, so.warehouse_id, so.expected_date, so.organization_id
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL
-	`, salesOrderID, tenantID).Scan(&soNumber, &soStatus, &soCustomerID, &soCustomerName, &soWarehouseID, &soExpectedDate)
+	`, salesOrderID, tenantID).Scan(&soNumber, &soStatus, &soCustomerID, &soCustomerName, &soWarehouseID, &soExpectedDate, &soOrgID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales order")
@@ -249,6 +250,14 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		h.log.Error("Failed to fetch sales order", "error", err)
 		response.InternalError(c, "Failed to fetch sales order")
 		return
+	}
+
+	// If orgIDPtr is nil (middleware didn't set it), derive from sales order's organization_id
+	if orgIDPtr == nil && soOrgID.Valid && soOrgID.String != "" {
+		parsedOrgID, parseErr := uuid.Parse(soOrgID.String)
+		if parseErr == nil {
+			orgIDPtr = &parsedOrgID
+		}
 	}
 
 	// Validate SO status - must be confirmed or processing
@@ -833,7 +842,34 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		`, tenantID, line.ProductID, effectiveWarehouseID).Scan(&inventoryID, &qtyOnHand, &qtyAvailable, &unitCost, &productName)
 
 		if err != nil {
-			stockMap[line.ProductID] = stockInfo{WarehouseID: effectiveWarehouseID, ProductName: line.ProductID.String()}
+			// No inventory record exists — create one with zero quantity
+			// so that inventory deduction is tracked (may go negative, which is valid for backorders)
+			var pName string
+			var pCost float64
+			h.db.QueryRow("SELECT COALESCE(name, ''), COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", line.ProductID, tenantID).Scan(&pName, &pCost)
+
+			newInvID := uuid.New()
+			// Get organization_id from the warehouse
+			var whOrgID *uuid.UUID
+			h.db.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", effectiveWarehouseID, tenantID).Scan(&whOrgID)
+
+			_, createErr := h.db.Exec(`
+				INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+			`, newInvID, tenantID, whOrgID, line.ProductID, effectiveWarehouseID, pCost, now)
+			if createErr != nil {
+				h.log.Error("Failed to create inventory record for delivery", "error", createErr, "product_id", line.ProductID)
+				stockMap[line.ProductID] = stockInfo{WarehouseID: effectiveWarehouseID, ProductName: pName}
+				continue
+			}
+
+			stockMap[line.ProductID] = stockInfo{
+				InventoryID: newInvID,
+				Available:   0,
+				UnitCost:    pCost,
+				WarehouseID: effectiveWarehouseID,
+				ProductName: pName,
+			}
 			continue
 		}
 		stockMap[line.ProductID] = stockInfo{
