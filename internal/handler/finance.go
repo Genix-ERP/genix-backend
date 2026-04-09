@@ -3748,11 +3748,10 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 	// 4. Last fallback: find by account code
 	if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
-		}
-		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
-		}
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+	}
+	if cashAccountID == uuid.Nil {
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
 	}
 	h.log.Info("Payment cash/bank account resolution", "cash_account_id", cashAccountID, "payment_id", id,
 		"had_bank_account_id", bankAccountIDStr.Valid, "had_journal_id", storedJournalID.Valid, "had_payment_method_id", paymentMethodID.Valid)
