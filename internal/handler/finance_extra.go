@@ -1021,6 +1021,12 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	// Get org ID for live recomputation
+	var listOrgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		listOrgIDPtr = &orgID
+	}
+
 	acts := make([]reconciliationActResponse, 0)
 	for rows.Next() {
 		var a reconciliationActResponse
@@ -1045,7 +1051,20 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 
 		a.PeriodStart = periodStart.Format("2006-01-02")
 		a.PeriodEnd = periodEnd.Format("2006-01-02")
-		a.ClosingBalance = a.OpeningBalance + a.OurDebitTotal - a.OurCreditTotal
+
+		// Recompute LIVE totals from journal entries so list always shows current data
+		liveOpening, _, liveDebit, liveCredit, liveErr := h.computeReconciliationData(tenantID, a.PartnerID, listOrgIDPtr, a.PeriodStart, a.PeriodEnd)
+		if liveErr == nil {
+			a.OpeningBalance = liveOpening
+			a.OurDebitTotal = liveDebit
+			a.OurCreditTotal = liveCredit
+			a.OurBalance = liveOpening + liveDebit - liveCredit
+			a.ClosingBalance = a.OurBalance
+		} else {
+			// Fallback to stored values if live computation fails
+			a.ClosingBalance = a.OpeningBalance + a.OurDebitTotal - a.OurCreditTotal
+		}
+
 		if notes.Valid {
 			a.Notes = &notes.String
 		}
@@ -1281,17 +1300,23 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 		act.ShareExpiresAt = &actShareExpiresAt.Time
 	}
 
-	// Fetch live transaction lines from journal entries
+	// Fetch LIVE transaction data from journal entries — always recompute totals
+	// so the act reflects the current state of journal entries (not stale stored values).
 	var orgIDPtr *uuid.UUID
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		orgIDPtr = &orgID
 	}
 
-	_, lines, _, _, linesErr := h.computeReconciliationData(tenantID, act.PartnerID, orgIDPtr, act.PeriodStart, act.PeriodEnd)
+	liveOpening, lines, liveDebit, liveCredit, linesErr := h.computeReconciliationData(tenantID, act.PartnerID, orgIDPtr, act.PeriodStart, act.PeriodEnd)
 	if linesErr != nil {
 		h.log.Error("Failed to fetch reconciliation lines", "error", linesErr)
 	} else {
 		act.Lines = lines
+		act.OpeningBalance = liveOpening
+		act.OurDebitTotal = liveDebit
+		act.OurCreditTotal = liveCredit
+		act.OurBalance = liveOpening + liveDebit - liveCredit
+		act.ClosingBalance = act.OurBalance
 	}
 
 	response.Success(c, act)

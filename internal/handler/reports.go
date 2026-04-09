@@ -162,6 +162,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		asOfDate = time.Now().Format("2006-01-02")
 	}
 
+	// Query ALL account categories including revenue/expense to compute net income
 	query := `
 		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''),
 			   at.category, at.normal_balance,
@@ -174,7 +175,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
 			AND je.status = 'posted' AND je.entry_date <= $2 AND je.deleted_at IS NULL
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
-			AND at.category IN ('asset', 'liability', 'equity')
+			AND at.category IN ('asset', 'liability', 'equity', 'revenue', 'expense')
 	`
 	args := []interface{}{tenantID, asOfDate}
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
@@ -198,6 +199,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 	liabilityAccounts := make([]entity.BalanceSheetAccount, 0)
 	equityAccounts := make([]entity.BalanceSheetAccount, 0)
 	var totalAssets, totalLiabilities, totalEquity float64
+	var totalRevenue, totalExpenses float64
 
 	for rows.Next() {
 		var accountID uuid.UUID
@@ -215,6 +217,17 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 			balance = openingBalance + debitSum - creditSum
 		} else {
 			balance = openingBalance + creditSum - debitSum
+		}
+
+		// Revenue and expense accounts contribute to net income (shown in equity)
+		// but are not displayed as separate balance sheet line items
+		switch category {
+		case "revenue":
+			totalRevenue += balance
+			continue
+		case "expense":
+			totalExpenses += balance
+			continue
 		}
 
 		// Skip zero balances for assets/liabilities, but always show equity accounts
@@ -242,6 +255,34 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 			equityAccounts = append(equityAccounts, acc)
 			totalEquity += balance
 		}
+	}
+
+	// Net income = Revenue - Expenses (this is the current year's undistributed profit)
+	netIncome := math.Round((totalRevenue - totalExpenses) * 100) / 100
+
+	// Add net income as a line item in equity if it's non-zero
+	// This represents "Joriy yil foydasi" (Current Year Profit/Loss)
+	if math.Abs(netIncome) >= 0.01 {
+		// Check if there's already a "3300" account in equityAccounts
+		found := false
+		for i, acc := range equityAccounts {
+			if acc.AccountCode == "3300" {
+				// Add net income to the existing account's balance
+				equityAccounts[i].Balance += netIncome
+				found = true
+				break
+			}
+		}
+		if !found {
+			equityAccounts = append(equityAccounts, entity.BalanceSheetAccount{
+				AccountCode:   "3300",
+				AccountName:   "Joriy yil foydasi",
+				AccountNameUz: "Joriy yil foydasi",
+				AccountNameEn: "Current Year Profit/Loss",
+				Balance:       netIncome,
+			})
+		}
+		totalEquity += netIncome
 	}
 
 	report := entity.BalanceSheetReport{
