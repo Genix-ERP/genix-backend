@@ -303,7 +303,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		exchangeRate = 1.0
 	}
 
-	// Calculate totals
+	// Calculate totals from lines
 	var subtotal, discountTotal, taxTotal float64
 	for _, line := range input.Lines {
 		lineSubtotal := line.Quantity * line.UnitPrice
@@ -315,6 +315,17 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	}
 
 	totalAmount := subtotal - discountTotal + taxTotal + input.ShippingAmount
+
+	// Use frontend-calculated values when provided (handles tax-inclusive pricing correctly)
+	if input.Subtotal > 0 {
+		subtotal = input.Subtotal
+	}
+	if input.TaxAmount > 0 {
+		taxTotal = input.TaxAmount
+	}
+	if input.TotalAmount > 0 {
+		totalAmount = input.TotalAmount
+	}
 
 	// Prepare optional strings
 	var vendorReference, notes, internalNotes *string
