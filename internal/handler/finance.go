@@ -1409,23 +1409,9 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 		return
 	}
 
-	// Auto-generate code from name if empty
+	// Auto-generate code from name if empty (supports Cyrillic/non-Latin names)
 	if strings.TrimSpace(input.Code) == "" && strings.TrimSpace(input.Name) != "" {
-		input.Code = strings.ToUpper(strings.TrimSpace(input.Name))
-		// Keep only A-Z, 0-9, spaces; replace spaces with underscore
-		var cleaned []rune
-		for _, r := range input.Code {
-			if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' {
-				cleaned = append(cleaned, r)
-			}
-		}
-		input.Code = strings.ReplaceAll(strings.TrimSpace(string(cleaned)), " ", "_")
-		if len(input.Code) > 20 {
-			input.Code = input.Code[:20]
-		}
-		if input.Code == "" {
-			input.Code = "JRN"
-		}
+		input.Code = generateCodeFromName(input.Name, 20, "JRN")
 	}
 
 	// Check for duplicate code and auto-suffix if needed
