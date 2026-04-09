@@ -3745,6 +3745,28 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			storedJournalID.String, tenantID,
 		).Scan(&cashAccountID)
 	}
+	if cashAccountID == uuid.Nil && storedJournalID.Valid {
+		// Try to find the account from the journal's name/code (e.g. journal named "Bank" or "Kassa" often maps to the same-named account)
+		var journalName, journalCode sql.NullString
+		_ = tx.QueryRow(
+			`SELECT name, code FROM journals WHERE id = $1 AND tenant_id = $2`,
+			storedJournalID.String, tenantID,
+		).Scan(&journalName, &journalCode)
+		if journalName.Valid && journalName.String != "" {
+			jNameLower := strings.ToLower(journalName.String)
+			// Try finding an account whose name matches the journal name
+			_ = tx.QueryRow(
+				`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) = $2 AND deleted_at IS NULL LIMIT 1`,
+				tenantID, jNameLower,
+			).Scan(&cashAccountID)
+			if cashAccountID == uuid.Nil {
+				_ = tx.QueryRow(
+					`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) LIKE $2 AND deleted_at IS NULL LIMIT 1`,
+					tenantID, jNameLower+"%",
+				).Scan(&cashAccountID)
+			}
+		}
+	}
 	if cashAccountID == uuid.Nil && paymentMethodID.Valid {
 		_ = tx.QueryRow(
 			`SELECT account_id FROM payment_methods WHERE id = $1 AND tenant_id = $2`,
@@ -3752,12 +3774,23 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		).Scan(&cashAccountID)
 	}
 	if cashAccountID == uuid.Nil {
-		// Fallback: look up by name
+		// Fallback: look up by name (English + Uzbek patterns) and code
 		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1010")
+		if cashAccountID == uuid.Nil {
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank hisobi", "1010")
+		}
+		if cashAccountID == uuid.Nil {
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+		}
 		if cashAccountID == uuid.Nil {
 			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
 		}
+		if cashAccountID == uuid.Nil {
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+		}
 	}
+	h.log.Info("Payment cash/bank account resolution", "cash_account_id", cashAccountID, "payment_id", id,
+		"had_bank_account_id", bankAccountIDStr.Valid, "had_journal_id", storedJournalID.Valid, "had_payment_method_id", paymentMethodID.Valid)
 
 	// Check cash/bank account balance for outbound payments
 	if cashAccountID != uuid.Nil && paymentType == "payment" {
@@ -3781,6 +3814,12 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	if paymentType == "receipt" {
 		// Inbound: customer pays us → Debit Cash, Credit AR
 		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "debitorlar", "1100")
+		}
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "receivable", "1100")
+		}
 		journalCode = "CASH_RECEIPTS"
 		sourceType = "payment_receipt"
 		debitDesc = "Cash Receipt"
@@ -3788,11 +3827,21 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	} else {
 		// Outbound: we pay vendor → Debit AP, Credit Cash
 		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlar", "2000")
+		}
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "payable", "2000")
+		}
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlik", "2000")
+		}
 		journalCode = "CASH_DISBURSEMENTS"
 		sourceType = "payment"
 		debitDesc = "Accounts Payable"
 		creditDesc = "Cash/Bank"
 	}
+	h.log.Info("Payment counter account resolution", "counter_account_id", counterAccountID, "payment_type", paymentType)
 
 	// --- Create journal entry for the payment (inside a SAVEPOINT so failures don't abort the tx) ---
 	if cashAccountID != uuid.Nil && counterAccountID != uuid.Nil {
@@ -3863,13 +3912,15 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			} else {
 				if paymentType == "receipt" {
 					// Receipt: Debit Cash, Credit AR
+					// Only set contact_id on the AR credit line (counter account),
+					// NOT on the cash line — so reconciliation only counts the AR side.
 					line1ID := uuid.New()
 					tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						line1ID, journalEntryID, 1, cashAccountID, contactID, debitDesc,
+						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
+						line1ID, journalEntryID, 1, cashAccountID, debitDesc,
 						amount, 0.0, 1.0, now,
 					)
 					line2ID := uuid.New()
@@ -3889,6 +3940,8 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID)
 				} else {
 					// Payment: Debit AP, Credit Cash
+					// Only set contact_id on the AP debit line (counter account),
+					// NOT on the cash line — so reconciliation only counts the AP side.
 					line1ID := uuid.New()
 					tx.Exec(`
 						INSERT INTO journal_entry_lines (
@@ -3903,8 +3956,8 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						line2ID, journalEntryID, 2, cashAccountID, contactID, creditDesc,
+						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
+						line2ID, journalEntryID, 2, cashAccountID, creditDesc,
 						0.0, amount, 1.0, now,
 					)
 
@@ -4049,10 +4102,18 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)
 		}
 	} else {
-		h.log.Warn("Cannot create payment journal entry: missing accounts",
+		h.log.Error("Cannot create payment journal entry: missing accounts",
 			"has_cash_account", cashAccountID != uuid.Nil,
 			"has_counter_account", counterAccountID != uuid.Nil,
 			"payment_type", paymentType)
+		// Roll back - don't confirm payment without proper accounting
+		tx.Rollback()
+		missingAcct := "Kassa/Bank hisobi"
+		if cashAccountID != uuid.Nil {
+			missingAcct = "Kreditorlar (Accounts Payable)"
+		}
+		response.BadRequest(c, fmt.Sprintf("To'lovni tasdiqlash imkoni yo'q: %s hisobi topilmadi. Iltimos, hisoblar rejasini tekshiring.", missingAcct))
+		return
 	}
 
 	if err := tx.Commit(); err != nil {

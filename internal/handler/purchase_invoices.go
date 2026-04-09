@@ -1232,6 +1232,15 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 
 	if err == nil {
 		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "2000")
+		if apAcctID == uuid.Nil {
+			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlar", "2000")
+		}
+		if apAcctID == uuid.Nil {
+			apAcctID = findAccount(h.db, tenantID, organizationID, "payable", "2000")
+		}
+		if apAcctID == uuid.Nil {
+			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlik", "2000")
+		}
 		// Select credit account based on payment method
 		var cashAcctID uuid.UUID
 		switch input.PaymentMethod {
@@ -1244,6 +1253,9 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank", "1010")
 			if cashAcctID == uuid.Nil {
 				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "1010")
+			}
+			if cashAcctID == uuid.Nil {
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank hisobi", "1010")
 			}
 		}
 		if cashAcctID == uuid.Nil {

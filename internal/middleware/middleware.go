@@ -93,6 +93,9 @@ func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 		}
 	}
 
+	// Log configured origins on startup for debugging
+	fmt.Printf("[CORS] Allowed origins: %v\n", cfg.AllowedOrigins)
+
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
 
@@ -103,6 +106,10 @@ func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 				allowed = true
 				break
 			}
+		}
+
+		if !allowed && origin != "" {
+			fmt.Printf("[CORS] Rejected origin: %q for %s %s\n", origin, c.Request.Method, c.Request.URL.Path)
 		}
 
 		if allowed {
