@@ -1840,14 +1840,14 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 
 			woQuery := `
 				INSERT INTO work_orders (
-					id, tenant_id, production_order_id, code, name,
+					id, tenant_id, organization_id, production_order_id, code, name,
 					sequence, operation_id, work_center_id,
 					quantity_to_produce, uom,
 					planned_duration_hours, setup_time_hours,
 					planned_cost, labor_cost, machine_cost,
 					status, instructions, notes,
 					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $19, $20)
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', $17, $18, $19, $20, $21)
 			`
 
 			var instructions *string
@@ -1856,7 +1856,7 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			}
 
 			_, err = tx.Exec(woQuery,
-				woID, tenantID, id, woCode, woName,
+				woID, tenantID, orgID, id, woCode, woName,
 				op.Sequence, op.ID, effectiveWorkCenterID,
 				quantityPlanned, uom,
 				totalTimeHours, op.SetupTime/60.0,
@@ -1881,10 +1881,10 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		woName := productName + " - Ishlab chiqarish"
 		_, err = tx.Exec(`
 			INSERT INTO work_orders (
-				id, tenant_id, production_order_id, code, name, sequence,
+				id, tenant_id, organization_id, production_order_id, code, name, sequence,
 				quantity_to_produce, uom, status, created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, 1, $6, $7, 'pending', $8, NOW(), NOW())
-		`, woID, tenantID, id, woCode, woName, quantityPlanned, uom, createdByID)
+			) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, 'pending', $9, NOW(), NOW())
+		`, woID, tenantID, orgID, id, woCode, woName, quantityPlanned, uom, createdByID)
 		if err != nil {
 			h.log.Error("Failed to create default work order", "error", err)
 		}
@@ -2174,10 +2174,10 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			}
 			h.db.Exec(`
 				INSERT INTO work_orders (
-					id, tenant_id, production_order_id, code, name, sequence,
+					id, tenant_id, organization_id, production_order_id, code, name, sequence,
 					quantity_to_produce, uom, status, created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, 1, $6, 'pcs', 'pending', $7, $8, $8)
-			`, woID, tenantID, id, woCode, woName, qty, userID, now)
+				) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 'pcs', 'pending', $8, $9, $9)
+			`, woID, tenantID, poOrgID, id, woCode, woName, qty, userID, now)
 			h.log.Info("Created default work order for production order without BOM operations", "order_id", id)
 		}
 	}

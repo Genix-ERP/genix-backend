@@ -71,7 +71,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	argIdx := 2
 
 	if organizationID != "" {
-		query += fmt.Sprintf(" AND (wo.organization_id = $%d OR (wo.organization_id IS NULL AND po.organization_id = $%d))", argIdx, argIdx)
+		query += fmt.Sprintf(" AND wo.organization_id = $%d", argIdx)
 		args = append(args, organizationID)
 		argIdx++
 	}
@@ -1256,17 +1256,16 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 			notesVal = notes.String
 		}
 
-		// Use only migration 010 columns
 		_, err := h.db.Exec(`
 			INSERT INTO work_orders (
-				id, tenant_id, production_order_id,
+				id, tenant_id, organization_id, production_order_id,
 				code, name, sequence,
 				operation_id, work_center_id,
 				quantity_to_produce, uom,
 				planned_duration_hours, setup_time_hours,
 				status, instructions, created_by
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pcs', $10, $11, 'pending', $12, $13)
-		`, woID, tenantID, productionOrderID,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pcs', $11, $12, 'pending', $13, $14)
+		`, woID, tenantID, orgID, productionOrderID,
 			woNumber, opName, sequence,
 			opID, workCenterID,
 			quantity,
