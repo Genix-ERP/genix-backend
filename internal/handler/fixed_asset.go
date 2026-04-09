@@ -413,7 +413,7 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 	}
 	pm := input.PaymentMethod
 	if pm == "" {
-		pm = "cash"
+		pm = "bank"
 	}
 	paymentMethod = &pm
 	// For cash/bank, total_paid = acquisition_cost; for credit, total_paid = 0
