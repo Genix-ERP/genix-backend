@@ -107,6 +107,9 @@ type CreatePurchaseOrderInput struct {
 	VehicleNumber    string                         `json:"vehicle_number,omitempty"`
 	RequiresShipping *bool                          `json:"requires_shipping,omitempty"`
 	ShippingAmount   float64                        `json:"shipping_amount,omitempty"`
+	Subtotal         float64                        `json:"subtotal,omitempty"`
+	TaxAmount        float64                        `json:"tax_amount,omitempty"`
+	TotalAmount      float64                        `json:"total_amount,omitempty"`
 	Lines            []CreatePurchaseOrderLineInput `json:"lines" binding:"required,min=1"`
 }
 
