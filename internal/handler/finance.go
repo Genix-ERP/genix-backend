@@ -3732,25 +3732,35 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		).Scan(&cashAccountID)
 	}
 	if cashAccountID == uuid.Nil && storedJournalID.Valid {
-		// Try to find the account from the journal's name/code (e.g. journal named "Bank" or "Kassa" often maps to the same-named account)
-		var journalName, journalCode sql.NullString
+		// Use journal type to determine the correct account
+		var journalName sql.NullString
+		var journalType sql.NullString
 		_ = tx.QueryRow(
-			`SELECT name, code FROM journals WHERE id = $1 AND tenant_id = $2`,
+			`SELECT name, type FROM journals WHERE id = $1 AND tenant_id = $2`,
 			storedJournalID.String, tenantID,
-		).Scan(&journalName, &journalCode)
-		if journalName.Valid && journalName.String != "" {
-			jNameLower := strings.ToLower(journalName.String)
-			// Try finding an account whose name matches the journal name
-			_ = tx.QueryRow(
-				`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) = $2 AND deleted_at IS NULL LIMIT 1`,
-				tenantID, jNameLower,
-			).Scan(&cashAccountID)
-			if cashAccountID == uuid.Nil {
-				_ = tx.QueryRow(
-					`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) LIKE $2 AND deleted_at IS NULL LIMIT 1`,
-					tenantID, jNameLower+"%",
-				).Scan(&cashAccountID)
+		).Scan(&journalName, &journalType)
+
+		if journalType.Valid {
+			switch journalType.String {
+			case "cash":
+				cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+				if cashAccountID == uuid.Nil {
+					cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+				}
+			case "bank":
+				cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+				if cashAccountID == uuid.Nil {
+					cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank hisobi", "1010")
+				}
 			}
+		}
+		// Last resort: try matching journal name to account name
+		if cashAccountID == uuid.Nil && journalName.Valid && journalName.String != "" {
+			jNameLower := strings.ToLower(journalName.String)
+			_ = tx.QueryRow(
+				`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) LIKE $2 AND deleted_at IS NULL LIMIT 1`,
+				tenantID, jNameLower+"%",
+			).Scan(&cashAccountID)
 		}
 	}
 	if cashAccountID == uuid.Nil && paymentMethodID.Valid {
@@ -3921,9 +3931,15 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 					// Update account balances
 					// Cash: debit-normal, debit increases balance
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID)
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID); balErr != nil {
+						h.log.Error("Failed to update cash account balance (receipt)", "error", balErr, "account_id", cashAccountID, "amount", amount)
+					} else {
+						h.log.Info("Receipt: cash account balance updated", "account_id", cashAccountID, "amount", amount)
+					}
 					// AR: debit-normal, credit decreases balance
-					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID)
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID); balErr != nil {
+						h.log.Error("Failed to update AR account balance (receipt)", "error", balErr, "account_id", counterAccountID, "amount", amount)
+					}
 				} else {
 					// Payment: Debit AP, Credit Cash
 					// Only set contact_id on the AP debit line (counter account),
@@ -3949,9 +3965,15 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 					// Update account balances
 					// AP: credit-normal, debit decreases balance (we're paying off liability)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID)
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID); balErr != nil {
+						h.log.Error("Failed to update AP account balance (payment)", "error", balErr, "account_id", counterAccountID, "amount", amount)
+					}
 					// Cash: debit-normal, credit decreases balance
-					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID)
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID); balErr != nil {
+						h.log.Error("Failed to update cash account balance (payment)", "error", balErr, "account_id", cashAccountID, "amount", amount)
+					} else {
+						h.log.Info("Payment: cash account balance updated", "account_id", cashAccountID, "amount", -amount)
+					}
 				}
 
 				// Update journal next number
