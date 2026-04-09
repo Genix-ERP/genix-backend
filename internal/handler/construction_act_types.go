@@ -3,7 +3,6 @@ package handler
 import (
 	"fmt"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -227,18 +226,7 @@ func (h *Handler) DeleteConstructionActType(c *gin.Context) {
 	response.Success(c, map[string]interface{}{"deleted": true})
 }
 
-// generateActTypeValue creates a URL-safe slug from a label
+// generateActTypeValue creates a URL-safe slug from a label (supports Cyrillic/non-Latin)
 func generateActTypeValue(label string) string {
-	s := strings.ToLower(strings.TrimSpace(label))
-	// Replace spaces and special chars with underscore
-	reg := regexp.MustCompile(`[^a-z0-9]+`)
-	s = reg.ReplaceAllString(s, "_")
-	s = strings.Trim(s, "_")
-	if s == "" {
-		s = "custom"
-	}
-	if len(s) > 100 {
-		s = s[:100]
-	}
-	return s
+	return generateCodeFromNameLower(label, 100, "custom")
 }

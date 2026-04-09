@@ -1966,20 +1966,8 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 		return
 	}
 
-	// Generate tenant code
-	baseCode := strings.ToLower(strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' {
-			return r
-		}
-		if r >= 'A' && r <= 'Z' {
-			return r + 32
-		}
-		return '_'
-	}, companyName))
-	if len(baseCode) > 40 {
-		baseCode = baseCode[:40]
-	}
-	tenantCode := fmt.Sprintf("%s_%s", baseCode, randomSuffix())
+	// Generate tenant code (supports Cyrillic/non-Latin company names)
+	tenantCode := generateTenantCode(companyName, randomSuffix)
 
 	// Create tenant
 	tenantID := uuid.New()

@@ -46,9 +46,11 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 	baseQuery := `
 		SELECT e.id, e.tenant_id, e.employee_number, e.first_name, e.last_name, e.middle_name,
 			   e.email, e.phone, e.mobile, e.job_title, e.hire_date, e.status, e.base_salary, e.permission,
-			   e.notes, e.created_at, e.updated_at, e.department_id, COALESCE(d.name, '') as department_name
+			   e.notes, e.created_at, e.updated_at, e.department_id, COALESCE(d.name, '') as department_name,
+			   e.job_position_id, COALESCE(jp.name, '') as job_position_name
 		FROM employees e
 		LEFT JOIN departments d ON e.department_id = d.id
+		LEFT JOIN job_positions jp ON e.job_position_id = jp.id
 		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM employees e WHERE e.tenant_id = $1 AND e.deleted_at IS NULL`
@@ -132,12 +134,15 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 		var baseSalary sql.NullFloat64
 		var departmentID sql.NullString
 		var departmentName string
+		var jobPositionID sql.NullString
+		var jobPositionName string
 
 		err := rows.Scan(
 			&emp.ID, &emp.TenantID, &emp.EmployeeNumber, &emp.FirstName, &emp.LastName,
 			&middleName, &email, &phone, &mobile, &jobTitle, &emp.HireDate, &emp.Status,
 			&baseSalary, &permission, &notes, &emp.CreatedAt, &emp.UpdatedAt,
 			&departmentID, &departmentName,
+			&jobPositionID, &jobPositionName,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan employee", "error", err)
@@ -161,6 +166,12 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 		}
 		if permission.Valid {
 			emp.Permission = &permission.String
+		}
+
+		// Set job_position_id from JOIN result
+		if jobPositionID.Valid {
+			jpUUID, _ := uuid.Parse(jobPositionID.String)
+			emp.JobPositionID = &jpUUID
 		}
 
 		// Set department from JOIN result, fall back to notes parsing for legacy data
@@ -290,12 +301,20 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		}
 	}
 
+	// Resolve job_position_id
+	var jobPositionID *uuid.UUID
+	if input.JobPositionID != "" {
+		if jpUUID, parseErr := uuid.Parse(input.JobPositionID); parseErr == nil {
+			jobPositionID = &jpUUID
+		}
+	}
+
 	query := `
 		INSERT INTO employees (
-			id, tenant_id, organization_id, department_id, employee_number, first_name, last_name, middle_name,
+			id, tenant_id, organization_id, department_id, job_position_id, employee_number, first_name, last_name, middle_name,
 			email, phone, job_title, hire_date, status, base_salary, permission, notes,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		RETURNING id, created_at
 	`
 
@@ -325,7 +344,7 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 	}
 
 	err := h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, departmentID, employeeNumber, firstName, lastName, middleName,
+		id, tenantID, orgIDPtr, departmentID, jobPositionID, employeeNumber, firstName, lastName, middleName,
 		email, phone, jobTitle, hireDate, status, baseSalary, permission, notes,
 		now, now,
 	).Scan(&id, &now)
@@ -572,8 +591,19 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 		addUpdate("permission", *input.Permission)
 	}
 
-	// Update department_id
-	if input.Department != nil && *input.Department != "" {
+	// Update job_position_id
+	if input.JobPositionID != nil && *input.JobPositionID != "" {
+		if jpUUID, parseErr := uuid.Parse(*input.JobPositionID); parseErr == nil {
+			addUpdate("job_position_id", jpUUID)
+		}
+	}
+
+	// Update department_id (also accept department_id field directly)
+	if input.DepartmentID != nil && *input.DepartmentID != "" {
+		if deptUUID, parseErr := uuid.Parse(*input.DepartmentID); parseErr == nil {
+			addUpdate("department_id", deptUUID)
+		}
+	} else if input.Department != nil && *input.Department != "" {
 		// Try parsing as UUID first
 		if deptUUID, parseErr := uuid.Parse(*input.Department); parseErr == nil {
 			addUpdate("department_id", deptUUID)
