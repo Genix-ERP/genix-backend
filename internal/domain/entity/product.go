@@ -236,6 +236,7 @@ type ProductResponse struct {
 	ShortDescription *string          `json:"short_description,omitempty"`
 	UnitID           *uuid.UUID       `json:"unit_id,omitempty"`
 	UnitName         string           `json:"unit_name,omitempty"`
+	UnitCode         string           `json:"unit_code,omitempty"`
 	PurchaseUnitID   *uuid.UUID       `json:"purchase_unit_id,omitempty"`
 	PurchaseUnitName string           `json:"purchase_unit_name,omitempty"`
 	SalesUnitID      *uuid.UUID       `json:"sales_unit_id,omitempty"`

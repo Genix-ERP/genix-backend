@@ -90,7 +90,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
 			   p.created_at, p.updated_at,
 			   pc.code as category_code, pc.name as category_name,
-			   COALESCE(u.name, '') as unit_name,
+			   COALESCE(u.name, '') as unit_name, COALESCE(u.code, '') as unit_code,
 			   p.purchase_unit_id, COALESCE(pu.name, '') as purchase_unit_name,
 			   p.sales_unit_id, COALESCE(su.name, '') as sales_unit_name
 		FROM products p
@@ -189,7 +189,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var tags json.RawMessage
 		var imageURL string
 		var inventoryType string
-		var unitName string
+		var unitName, unitCode string
 		var purchaseUnitID sql.NullString
 		var purchaseUnitName string
 		var salesUnitID sql.NullString
@@ -209,7 +209,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&inventoryType,
 			&p.CreatedAt, &p.UpdatedAt,
 			&categoryCode, &categoryName,
-			&unitName,
+			&unitName, &unitCode,
 			&purchaseUnitID, &purchaseUnitName,
 			&salesUnitID, &salesUnitName,
 		)
@@ -260,6 +260,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			Description:       p.Description,
 			UnitID:            parsedUnitID,
 			UnitName:          unitName,
+			UnitCode:          unitCode,
 			PurchaseUnitID:    parsedPurchaseUnitID,
 			PurchaseUnitName:  purchaseUnitName,
 			SalesUnitID:       parsedSalesUnitID,
