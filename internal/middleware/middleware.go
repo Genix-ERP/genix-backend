@@ -500,6 +500,7 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 				perms[moduleID+":"+res+":transfer"] = true
 				perms[moduleID+":"+res+":approve"] = true
 				perms[moduleID+":"+res+":confirm"] = true
+				perms[moduleID+":"+res+":post"] = true
 			}
 			if canDelete {
 				perms[moduleID+":"+res+":delete"] = true
