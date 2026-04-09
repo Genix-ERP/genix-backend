@@ -944,14 +944,14 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		addUpdate("inventory_type", *input.InventoryType)
 	}
 
-	// Handle unit_id directly (UUID) or resolve from UOM string code
-	if input.UnitID != nil && *input.UnitID != "" {
-		if uid, parseErr := uuid.Parse(*input.UnitID); parseErr == nil {
-			addUpdate("unit_id", uid)
-		}
-	} else if input.InventoryUOM != nil && *input.InventoryUOM != "" {
+	// Resolve UOM: prefer inventory_uom code (user just changed it), fallback to unit_id UUID
+	if input.InventoryUOM != nil && *input.InventoryUOM != "" {
 		if resolved := h.resolveUOMCode(tenantID, *input.InventoryUOM); resolved != nil {
 			addUpdate("unit_id", *resolved)
+		}
+	} else if input.UnitID != nil && *input.UnitID != "" {
+		if uid, parseErr := uuid.Parse(*input.UnitID); parseErr == nil {
+			addUpdate("unit_id", uid)
 		}
 	}
 	if input.PurchaseUOM != nil && *input.PurchaseUOM != "" {
