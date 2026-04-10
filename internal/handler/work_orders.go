@@ -457,10 +457,14 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	// Get the production order ID and current work order sequence
 	var productionOrderID uuid.UUID
 	var currentSequence int
-	h.db.QueryRow(`
+	scanErr := h.db.QueryRow(`
 		SELECT production_order_id, COALESCE(sequence, 0)
 		FROM work_orders WHERE id = $1 AND tenant_id = $2
 	`, woID, tenantID).Scan(&productionOrderID, &currentSequence)
+	if scanErr != nil {
+		h.log.Error("CompleteWorkOrder: failed to get production_order_id", "error", scanErr, "wo_id", woID)
+	}
+	h.log.Info("CompleteWorkOrder: context", "wo_id", woID, "production_order_id", productionOrderID, "sequence", currentSequence)
 
 	// Find the next work order in sequence
 	var nextWoID uuid.UUID
@@ -483,12 +487,15 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	if totalWOs > 0 {
 		progressPct = float64(completedWOs) / float64(totalWOs) * 100.0
 	}
+	h.log.Info("CompleteWorkOrder: progress", "totalWOs", totalWOs, "completedWOs", completedWOs, "progressPct", progressPct, "nextErr", nextErr)
+
 	h.db.Exec(`
 		UPDATE production_orders SET progress_percent = $1, updated_at = $2
 		WHERE id = $3 AND tenant_id = $4
 	`, progressPct, now, productionOrderID, tenantID)
 
 	if nextErr == nil {
+		h.log.Info("CompleteWorkOrder: advancing to next WO", "next_wo_id", nextWoID, "next_sequence", nextSequence)
 		// Mark next work order as ready — worker must press Start manually
 		h.db.Exec(`
 			UPDATE work_orders
@@ -512,6 +519,8 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				AND status NOT IN ('completed', 'done', 'cancelled')
 		`, productionOrderID, tenantID).Scan(&incompleteCount)
 
+		h.log.Info("CompleteWorkOrder: all WOs check", "incompleteCount", incompleteCount)
+
 		if incompleteCount == 0 {
 			// All work orders done — use last step's output as final quantity
 			var lastWoProduced float64
@@ -530,19 +539,27 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 			`, productionOrderID, tenantID).Scan(&totalScrapped)
 
 			// Check if this production order uses split output (bulk → packaged products)
-			var hasSplitOutput bool
+			var hasSplitOutput sql.NullBool
 			h.db.QueryRow(`SELECT has_split_output FROM production_orders WHERE id = $1 AND tenant_id = $2`,
 				productionOrderID, tenantID).Scan(&hasSplitOutput)
 
-			if hasSplitOutput {
+			splitEnabled := hasSplitOutput.Valid && hasSplitOutput.Bool
+			h.log.Info("CompleteWorkOrder: split output check", "has_split_output_raw", hasSplitOutput, "splitEnabled", splitEnabled, "lastWoProduced", lastWoProduced, "totalScrapped", totalScrapped)
+
+			if splitEnabled {
 				// Move to "packaging" status — worker will use CompleteSplitOutput to finalize
-				h.db.Exec(`
+				_, execErr := h.db.Exec(`
 					UPDATE production_orders
 					SET status = 'packaging', current_stage = 'packaging', progress_percent = 95,
 					    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
 					    actual_end = $3, updated_at = $3
 					WHERE id = $4 AND tenant_id = $5
 				`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
+				if execErr != nil {
+					h.log.Error("CompleteWorkOrder: failed to set packaging status", "error", execErr)
+				} else {
+					h.log.Info("CompleteWorkOrder: set production order to PACKAGING", "po_id", productionOrderID)
+				}
 			} else {
 				h.db.Exec(`
 					UPDATE production_orders
