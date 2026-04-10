@@ -2060,7 +2060,12 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			// Create journal entry
 			jeID := uuid.New()
 			journalEntryID = &jeID
+			var vendorNameForJE string
+			_ = tx.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, vendorID).Scan(&vendorNameForJE)
 			jeDescription := fmt.Sprintf("Vendor Bill %s", invoiceNumber)
+			if vendorNameForJE != "" {
+				jeDescription = fmt.Sprintf("Vendor Bill %s — %s", invoiceNumber, vendorNameForJE)
+			}
 
 			if _, err := tx.Exec(`
 				INSERT INTO journal_entries (

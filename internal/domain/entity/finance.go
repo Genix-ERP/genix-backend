@@ -166,6 +166,8 @@ type Journal struct {
 	TenantID               uuid.UUID  `json:"tenant_id" db:"tenant_id"`
 	Code                   string     `json:"code" db:"code"`
 	Name                   string     `json:"name" db:"name"`
+	NameUz                 string     `json:"name_uz,omitempty" db:"name_uz"`
+	NameEn                 string     `json:"name_en,omitempty" db:"name_en"`
 	Type                   string     `json:"type" db:"type"` // general, sales, purchase, cash, bank, miscellaneous
 	Description            *string    `json:"description,omitempty" db:"description"`
 	AutoSequence           bool       `json:"auto_sequence" db:"auto_sequence"`

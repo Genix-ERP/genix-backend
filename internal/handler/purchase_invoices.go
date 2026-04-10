@@ -1168,7 +1168,12 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 					id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
 					exchange_rate, reference, notes, status, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, 'payment', $5, $6, $7, 1, $8, $9, 'confirmed', $10, $10)
-			`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8]), now)
+			`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, func() string {
+					if vendorName.Valid && vendorName.String != "" {
+						return fmt.Sprintf("Payment for invoice %s — %s", invoiceID.String()[:8], vendorName.String)
+					}
+					return fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
+				}(), now)
 
 			if err != nil {
 				h.log.Error("Failed to create payment record", "error", err)
@@ -1276,6 +1281,9 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			}
 			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 			description := fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
+			if vendorName.Valid && vendorName.String != "" {
+				description = fmt.Sprintf("Payment for invoice %s — %s", invoiceID.String()[:8], vendorName.String)
+			}
 
 			var contactUUID uuid.UUID
 			if vendorID.Valid {
