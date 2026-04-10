@@ -1572,6 +1572,16 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("has_split_output = $%d", argCount))
 		args = append(args, *input.HasSplitOutput)
 	}
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+	}
+	if input.ProgressPercent != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("progress_percent = $%d", argCount))
+		args = append(args, *input.ProgressPercent)
+	}
 
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")

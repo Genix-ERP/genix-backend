@@ -267,6 +267,8 @@ type ProductionOrderUpdateInput struct {
 	RejectQuantity       *float64   `json:"reject_quantity,omitempty"`
 	ManufacturingCategoryID *uuid.UUID `json:"manufacturing_category_id,omitempty"`
 	HasSplitOutput       *bool      `json:"has_split_output,omitempty"`
+	Status               *string    `json:"status,omitempty"`
+	ProgressPercent      *float64   `json:"progress_percent,omitempty"`
 }
 
 type ProductionOrderResponse struct {
