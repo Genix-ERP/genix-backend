@@ -1393,6 +1393,7 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	if input.HasSplitOutput != nil {
 		hasSplitOutput = *input.HasSplitOutput
 	}
+	h.log.Info("CreateProductionOrder: split output", "input_value", input.HasSplitOutput, "resolved", hasSplitOutput)
 
 	query := `
 		INSERT INTO production_orders (
