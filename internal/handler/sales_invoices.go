@@ -1151,7 +1151,13 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 
 	// Create journal entry
 	journalEntryID := uuid.New()
+	// Fetch customer name for richer description
+	var custName string
+	_ = tx.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&custName)
 	description := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
+	if custName != "" {
+		description = fmt.Sprintf("Sales Invoice %s — %s", invoiceNumber, custName)
+	}
 
 	var createdBy *uuid.UUID
 	if userID != uuid.Nil {

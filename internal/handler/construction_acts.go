@@ -609,6 +609,47 @@ func (h *Handler) GetConstructionAct(c *gin.Context) {
 		return n
 	}
 
+	// For KS-2 acts, also fetch material usage during the act period
+	var materialUsage []map[string]interface{}
+	if actType == "ks2" && periodFrom.Valid && periodTo.Valid {
+		muRows, muErr := h.db.Query(`
+			SELECT mu.product_name, mu.uom, SUM(mu.quantity_used) as total_qty,
+			       mu.product_id, mu.estimate_line_id,
+			       STRING_AGG(DISTINCT mu.notes, '; ') FILTER (WHERE mu.notes IS NOT NULL AND mu.notes != '') as notes
+			FROM construction_material_usage mu
+			WHERE mu.tenant_id = $1 AND mu.project_id = $2
+			  AND mu.usage_date >= $3 AND mu.usage_date <= $4
+			GROUP BY mu.product_name, mu.uom, mu.product_id, mu.estimate_line_id
+			ORDER BY mu.product_name
+		`, tenantID, projectIDVal, periodFrom.Time, periodTo.Time)
+		if muErr == nil {
+			defer muRows.Close()
+			idx := 0
+			for muRows.Next() {
+				var muName, muUOM string
+				var muQty float64
+				var muProductID uuid.NullUUID
+				var muEstLineID sql.NullInt64
+				var muNotes sql.NullString
+				idx++
+				if muRows.Scan(&muName, &muUOM, &muQty, &muProductID, &muEstLineID, &muNotes) == nil {
+					materialUsage = append(materialUsage, map[string]interface{}{
+						"id":               idx,
+						"product_name":     muName,
+						"uom":              muUOM,
+						"quantity_used":    muQty,
+						"product_id":       nullUUIDVal(muProductID),
+						"notes":            nullStringVal(muNotes),
+						"estimate_line_id": nullInt64Val(muEstLineID),
+					})
+				}
+			}
+		}
+	}
+	if materialUsage == nil {
+		materialUsage = []map[string]interface{}{}
+	}
+
 	result := map[string]interface{}{
 		"id":                     id,
 		"name":                   name,
@@ -659,6 +700,7 @@ func (h *Handler) GetConstructionAct(c *gin.Context) {
 		"smr_amount":             nullFloat64Val(smrAmount),
 		"equipment_amount":       nullFloat64Val(equipAmount),
 		"other_amount":           nullFloat64Val(otherAmount),
+		"material_usage":         materialUsage,
 	}
 
 	response.Success(c, result)

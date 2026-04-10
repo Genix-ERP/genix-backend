@@ -971,7 +971,9 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 		SELECT je.id, je.tenant_id, je.journal_id, je.entry_number, je.entry_date,
 			   je.reference, je.description, je.source_type, je.total_debit, je.total_credit,
 			   je.status, je.posted_at, je.created_at, je.updated_at,
-			   j.code as journal_code, COALESCE(NULLIF(j.name_uz,''), j.name) as journal_name
+			   j.code as journal_code, j.name as journal_name,
+			   COALESCE(j.name_uz, '') as journal_name_uz,
+			   COALESCE(j.name_en, '') as journal_name_en
 		FROM journal_entries je
 		JOIN journals j ON je.journal_id = j.id
 		WHERE je.tenant_id = $1 AND je.deleted_at IS NULL
@@ -1050,13 +1052,13 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 		var je entity.JournalEntry
 		var ref, desc, sourceType sql.NullString
 		var postedAt sql.NullTime
-		var journalCode, journalName string
+		var journalCode, journalName, journalNameUz, journalNameEn string
 
 		err := rows.Scan(
 			&je.ID, &je.TenantID, &je.JournalID, &je.EntryNumber, &je.EntryDate,
 			&ref, &desc, &sourceType, &je.TotalDebit, &je.TotalCredit,
 			&je.Status, &postedAt, &je.CreatedAt, &je.UpdatedAt,
-			&journalCode, &journalName,
+			&journalCode, &journalName, &journalNameUz, &journalNameEn,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan journal entry", "error", err)
@@ -1077,8 +1079,10 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 		}
 
 		je.Journal = &entity.Journal{
-			Code: journalCode,
-			Name: journalName,
+			Code:   journalCode,
+			Name:   journalName,
+			NameUz: journalNameUz,
+			NameEn: journalNameEn,
 		}
 
 		entries = append(entries, je.ToResponse())
@@ -2207,7 +2211,9 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 			   je.reference, je.description, je.source_type, je.total_debit, je.total_credit,
 			   je.status, je.posted_at, je.reversed_entry_id, je.is_reversal, je.reversal_of_id,
 			   je.reversal_reason, je.tags, je.created_at, je.updated_at,
-			   j.code as journal_code, COALESCE(NULLIF(j.name_uz,''), j.name) as journal_name
+			   j.code as journal_code, j.name as journal_name,
+			   COALESCE(j.name_uz, '') as journal_name_uz,
+			   COALESCE(j.name_en, '') as journal_name_en
 		FROM journal_entries je
 		JOIN journals j ON je.journal_id = j.id
 		WHERE je.id = $1 AND je.tenant_id = $2 AND je.deleted_at IS NULL
@@ -2216,7 +2222,7 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 	var je entity.JournalEntry
 	var ref, desc, sourceType, reversalReason sql.NullString
 	var postedAt sql.NullTime
-	var journalCode, journalName string
+	var journalCode, journalName, journalNameUz, journalNameEn string
 	var tags []string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
@@ -2224,7 +2230,7 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 		&ref, &desc, &sourceType, &je.TotalDebit, &je.TotalCredit,
 		&je.Status, &postedAt, &je.ReversedEntryID, &je.IsReversal, &je.ReversalOfID,
 		&reversalReason, pq.Array(&tags), &je.CreatedAt, &je.UpdatedAt,
-		&journalCode, &journalName,
+		&journalCode, &journalName, &journalNameUz, &journalNameEn,
 	)
 
 	if err == sql.ErrNoRows {
@@ -2255,8 +2261,10 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 	je.Tags = tags
 
 	je.Journal = &entity.Journal{
-		Code: journalCode,
-		Name: journalName,
+		Code:   journalCode,
+		Name:   journalName,
+		NameUz: journalNameUz,
+		NameEn: journalNameEn,
 	}
 
 	// Get lines

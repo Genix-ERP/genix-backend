@@ -2007,10 +2007,15 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 				if jeErr == nil && journalID != uuid.Nil {
 					var poCode string
 					h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poCode)
+					var prodName string
+					h.db.QueryRow(`SELECT COALESCE(p.name, '') FROM production_orders po JOIN products p ON po.product_id = p.id WHERE po.id = $1`, id).Scan(&prodName)
 
 					entryID := uuid.New()
 					entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
 					description := fmt.Sprintf("Production Order %s confirmed - planned material cost", poCode)
+					if prodName != "" {
+						description = fmt.Sprintf("Production Order %s confirmed - %s - planned material cost", poCode, prodName)
+					}
 
 					_, jeInsertErr := h.db.Exec(`
 						INSERT INTO journal_entries (
@@ -2364,10 +2369,15 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 							if err == nil && journalID != uuid.Nil {
 								var poNumber string
 								h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
+								var prodNameStarted string
+								h.db.QueryRow(`SELECT COALESCE(p.name, '') FROM production_orders po JOIN products p ON po.product_id = p.id WHERE po.id = $1`, id).Scan(&prodNameStarted)
 
 								entryID := uuid.New()
 								entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
 								description := fmt.Sprintf("Production Order %s started - materials consumed", poNumber)
+								if prodNameStarted != "" {
+									description = fmt.Sprintf("Production Order %s started - %s - materials consumed", poNumber, prodNameStarted)
+								}
 
 								h.db.Exec(`
 									INSERT INTO journal_entries (
