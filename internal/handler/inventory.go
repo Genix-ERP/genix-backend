@@ -6639,12 +6639,8 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 							unitPrice, now, prodID, tenantID)
 						// Also update org-specific settings (this is what the frontend actually reads)
 						if op.OrgID != nil {
-							h.db.Exec(`
-								INSERT INTO product_organization_settings (tenant_id, product_id, organization_id, cost_price, updated_at)
-								VALUES ($1, $2, $3, $4, $5)
-								ON CONFLICT (tenant_id, product_id, organization_id)
-								DO UPDATE SET cost_price = $4, updated_at = $5
-							`, tenantID, prodID, *op.OrgID, unitPrice, now)
+							h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+								unitPrice, now, prodID, *op.OrgID)
 						}
 						h.log.Info("[v2] Updated product cost_price from stock receipt", "product_id", prodID, "cost_price", unitPrice, "org_id", op.OrgID)
 					} else {

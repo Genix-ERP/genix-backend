@@ -1330,7 +1330,12 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		}
 	}
 
-	// Update product cost_price for each PO line in both products AND product_organization_settings
+	// Update product cost_price for each PO line (after commit, outside tx to avoid failures)
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Now update cost_price outside the transaction
 	poLineRows, _ := h.db.Query(`
 		SELECT product_id, unit_price FROM purchase_order_lines
 		WHERE purchase_order_id = $1 AND product_id IS NOT NULL
@@ -1340,23 +1345,15 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 			var pid uuid.UUID
 			var uprice float64
 			if poLineRows.Scan(&pid, &uprice) == nil && uprice > 0 {
-				tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+				h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
 					uprice, now, pid, tenantID)
 				if orgID != nil {
-					tx.Exec(`
-						INSERT INTO product_organization_settings (tenant_id, product_id, organization_id, cost_price, updated_at)
-						VALUES ($1, $2, $3, $4, $5)
-						ON CONFLICT (tenant_id, product_id, organization_id)
-						DO UPDATE SET cost_price = $4, updated_at = $5
-					`, tenantID, pid, *orgID, uprice, now)
+					h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+						uprice, now, pid, *orgID)
 				}
 			}
 		}
 		poLineRows.Close()
-	}
-
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil
