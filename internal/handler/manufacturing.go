@@ -2297,15 +2297,25 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				consumption := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
 
 				var compInvID uuid.UUID
-				// Try to find inventory record — first with organization, then without lot/serial constraints
+				// Try to find inventory record in the production order's warehouse first
 				compErr := tx.QueryRow(`
 					SELECT id FROM inventory
 					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
 					ORDER BY quantity_on_hand DESC LIMIT 1
 				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
 
+				// Fallback: find any inventory record for this component (any warehouse)
 				if compErr != nil {
-					h.log.Warn("Component not found in inventory, skipping consumption", "component_id", comp.ComponentID, "warehouse_id", warehouseID)
+					compErr = tx.QueryRow(`
+						SELECT id FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2
+						AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
+						ORDER BY quantity_on_hand DESC LIMIT 1
+					`, tenantID, comp.ComponentID).Scan(&compInvID)
+				}
+
+				if compErr != nil {
+					h.log.Warn("Component not found in any inventory, skipping consumption", "component_id", comp.ComponentID)
 					continue
 				}
 
