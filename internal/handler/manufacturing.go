@@ -2245,6 +2245,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 	}
 
 	// Only consume if we have a BOM and warehouse
+	h.log.Info("[v2] StartProductionOrder: material consumption check", "bomID", bomID, "warehouseID", warehouseID, "qtyPlanned", qtyPlanned, "po_id", id)
 	if bomID != nil && warehouseID != nil {
 		// Check if materials were already consumed (prevent double-deduction on pause/resume)
 		var existingConsumption int
@@ -2253,6 +2254,8 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2
 			AND transaction_type = $3
 		`, tenantID, id, entity.TransactionTypeIssue).Scan(&existingConsumption)
+
+		h.log.Info("[v2] StartProductionOrder: existing consumption count", "count", existingConsumption, "po_id", id)
 
 		if existingConsumption == 0 {
 			tx, txErr := h.db.Begin()
