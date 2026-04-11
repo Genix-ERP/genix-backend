@@ -75,6 +75,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 		auth.POST("/refresh", h.RefreshToken)
 		auth.POST("/forgot-password", h.ForgotPassword)
 		auth.POST("/reset-password", h.ResetPassword)
+		auth.POST("/send-phone-otp", h.SendPasswordResetOTP)         // Send OTP via SMS for password reset
+		auth.POST("/verify-phone-otp", h.VerifyPasswordResetOTP)     // Verify phone OTP for password reset
+		auth.POST("/reset-password-phone", h.ResetPasswordWithPhone) // Reset password with phone OTP
 		auth.POST("/verify-email", h.VerifyEmail)
 		auth.GET("/validate-invite", h.ValidateInvite)  // Public - validate invite token
 		auth.POST("/accept-invite", h.AcceptInvite)     // Public - accept invite and set password
