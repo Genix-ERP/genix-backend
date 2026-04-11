@@ -946,6 +946,10 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
 			`, lotID, tenantID, productID, warehouseID, lotNumber,
 				now, expDate, acceptedQty, unitPrice, vendorID, poID, now)
+
+			// Update product cost_price with the latest purchase price
+			h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+				unitPrice, now, productID, tenantID)
 		}
 	}
 
