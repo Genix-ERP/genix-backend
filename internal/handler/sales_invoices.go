@@ -1022,7 +1022,12 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	}
 
 	// Odoo-style: AR + per-category Income + COGS/Interim clearing
-	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+	// 1. Try contact's default receivable account
+	arAccountID := getContactDefaultAccount(tx, customerID, "receivable")
+	// 2. Fallback to standard findAccount
+	if arAccountID == uuid.Nil {
+		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+	}
 	if arAccountID == uuid.Nil {
 		h.log.Error("AR account not found", "tenant_id", tenantID)
 		response.InternalError(c, "Accounts Receivable account (1100) not found. Please configure chart of accounts.")
@@ -1271,6 +1276,23 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
+
+	// Notify: invoice sent
+	go func() {
+		var customerName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
+		amountStr := fmt.Sprintf("%.0f", totalAmount)
+		h.createTranslatedNotification(tenantID, userID, "invoice_sent",
+			map[string]interface{}{
+				"invoice_id":     invoiceID.String(),
+				"invoice_number": invoiceNumber,
+				"customer_id":    customerID.String(),
+				"customer_name":  customerName,
+				"amount":         totalAmount,
+			},
+			invoiceNumber, customerName, amountStr,
+		)
+	}()
 
 	h.GetSalesInvoice(c)
 }
@@ -1651,6 +1673,22 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		return
 	}
 
+	// Notify: payment recorded on invoice
+	go func() {
+		var customerName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
+		amountStr := fmt.Sprintf("%.0f", input.Amount)
+		h.createTranslatedNotification(tenantID, userID, "payment_recorded",
+			map[string]interface{}{
+				"invoice_id":     invoiceID.String(),
+				"invoice_number": invoiceNumber,
+				"customer_id":    customerID.String(),
+				"amount":         input.Amount,
+			},
+			amountStr, invoiceNumber, customerName,
+		)
+	}()
+
 	h.GetSalesInvoice(c)
 }
 
@@ -1808,6 +1846,23 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 			}
 		}
 	}
+
+	// Notify: credit note created
+	go func() {
+		var customerName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
+		amountStr := fmt.Sprintf("%.0f", cnTotalAmount)
+		h.createTranslatedNotification(tenantID, userID, "credit_note_created",
+			map[string]interface{}{
+				"credit_note_id":     creditNoteID.String(),
+				"credit_note_number": cnNumber,
+				"invoice_number":     orgInvoiceNumber,
+				"customer_id":        customerID.String(),
+				"amount":             cnTotalAmount,
+			},
+			cnNumber, orgInvoiceNumber, amountStr,
+		)
+	}()
 
 	// Replace the id param so GetSalesInvoice returns the credit note
 	for i, p := range c.Params {

@@ -413,6 +413,21 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		invoiceResponse["notes"] = input.Notes
 	}
 
+	// Notify: purchase invoice created
+	go func() {
+		amountStr := fmt.Sprintf("%.0f", totalAmount)
+		h.createTranslatedNotification(tenantID, userID, "purchase_invoice_created",
+			map[string]interface{}{
+				"invoice_id":     invoiceID.String(),
+				"invoice_number": invoiceNumber,
+				"vendor_id":      vendorID.String(),
+				"vendor_name":    vendorName,
+				"amount":         totalAmount,
+			},
+			invoiceNumber, vendorName, amountStr,
+		)
+	}()
+
 	response.Created(c, invoiceResponse)
 }
 
@@ -835,6 +850,24 @@ func (h *Handler) ConfirmPurchaseInvoice(c *gin.Context) {
 		return
 	}
 
+	// Notify: purchase invoice confirmed
+	go func() {
+		var invNumber, vendorName string
+		var totalAmt float64
+		h.db.QueryRow(`SELECT pi.invoice_number, COALESCE(c.name, ''), COALESCE(pi.total_amount, 0)
+			FROM purchase_invoices pi LEFT JOIN contacts c ON pi.vendor_id = c.id
+			WHERE pi.id = $1`, invoiceID).Scan(&invNumber, &vendorName, &totalAmt)
+		userID, _ := middleware.GetUserID(c)
+		h.createTranslatedNotification(tenantID, userID, "purchase_invoice_confirmed",
+			map[string]interface{}{
+				"invoice_id":     invoiceID.String(),
+				"invoice_number": invNumber,
+				"vendor_name":    vendorName,
+			},
+			invNumber, vendorName,
+		)
+	}()
+
 	h.GetPurchaseInvoice(c)
 }
 
@@ -904,7 +937,12 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 
 	if err == nil {
 		// Odoo-style: Debit Stock Interim Receipt (per category), Credit AP
-		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+		// 1. Try vendor's default payable account
+		apAccountID := getContactDefaultAccount(tx, vendorID, "payable")
+		// 2. Fallback to standard findAccount
+		if apAccountID == uuid.Nil {
+			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+		}
 		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
 
 		// Get invoice lines for per-category accounting

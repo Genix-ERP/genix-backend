@@ -1151,6 +1151,25 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 		return
 	}
 
+	// In-app notification: salary confirmed
+	go func() {
+		var empName string
+		var netSalary float64
+		h.db.QueryRow(`
+			SELECT CONCAT(e.first_name, ' ', e.last_name), COALESCE(pe.net_salary, 0)
+			FROM payroll_entries pe JOIN employees e ON pe.employee_id = e.id
+			WHERE pe.id = $1`, entryID).Scan(&empName, &netSalary)
+		salaryStr := fmt.Sprintf("%.0f", netSalary)
+		h.createTranslatedNotification(tenantID, userID, "salary_confirmed",
+			map[string]interface{}{
+				"entry_id":    entryID.String(),
+				"employee_id": employeeID.String(),
+				"net_salary":  netSalary,
+			},
+			salaryStr, empName,
+		)
+	}()
+
 	// SMS: Ish haqi chiqarilganda
 	go func() {
 		var phone string

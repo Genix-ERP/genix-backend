@@ -715,5 +715,21 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
 	}()
 
+	// Notify: expense approved
+	go func() {
+		var expNum string
+		var expAmount float64
+		h.db.QueryRow(`SELECT expense_number, COALESCE(total_amount, 0) FROM expenses WHERE id = $1`, id).Scan(&expNum, &expAmount)
+		amountStr := fmt.Sprintf("%.0f", expAmount)
+		h.createTranslatedNotification(tenantID, userID, "expense_approved",
+			map[string]interface{}{
+				"expense_id":     id.String(),
+				"expense_number": expNum,
+				"amount":         expAmount,
+			},
+			expNum, amountStr,
+		)
+	}()
+
 	h.GetExpense(c)
 }

@@ -766,6 +766,17 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 				"reorder_point": reorderPoint,
 				"available":     newBalance,
 			})
+			// In-app low stock notification
+			balanceStr := fmt.Sprintf("%.0f", newBalance)
+			h.createTranslatedNotification(tenantID, userID, "low_stock",
+				map[string]interface{}{
+					"product_id":   input.ProductID,
+					"product_name": productName,
+					"product_code": productCode,
+					"available":    newBalance,
+				},
+				productName, balanceStr,
+			)
 		}
 
 		h.EvaluateWorkflowRules(tenantID, "inventory.adjusted", map[string]interface{}{

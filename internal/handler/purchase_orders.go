@@ -1536,6 +1536,26 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	// Notify: purchase order approved
+	go func() {
+		var poNumber, vendorName string
+		var totalAmt float64
+		h.db.QueryRow(`
+			SELECT po.order_number, COALESCE(c.name, ''), COALESCE(po.total_amount, 0)
+			FROM purchase_orders po LEFT JOIN contacts c ON po.vendor_id = c.id
+			WHERE po.id = $1`, id).Scan(&poNumber, &vendorName, &totalAmt)
+		amountStr := fmt.Sprintf("%.0f", totalAmt)
+		h.createTranslatedNotification(tenantID, userID, "purchase_order_approved",
+			map[string]interface{}{
+				"order_id":     id.String(),
+				"order_number": poNumber,
+				"vendor_name":  vendorName,
+				"amount":       totalAmt,
+			},
+			poNumber, vendorName, amountStr,
+		)
+	}()
+
 	response.Success(c, gin.H{"message": "Purchase order approved successfully", "status": entity.POStatusApproved})
 }
 
