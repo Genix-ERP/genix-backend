@@ -3785,7 +3785,12 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 	if paymentType == "receipt" {
 		// Inbound: customer pays us → Debit Cash, Credit AR
-		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
+		// 1. Try contact's default receivable account
+		counterAccountID = getContactDefaultAccount(tx, contactID, "receivable")
+		// 2. Fallback to standard findAccount chain
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
+		}
 		if counterAccountID == uuid.Nil {
 			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "debitorlar", "1100")
 		}
@@ -3798,7 +3803,12 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		creditDesc = "Accounts Receivable"
 	} else {
 		// Outbound: we pay vendor → Debit AP, Credit Cash
-		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+		// 1. Try contact's default payable account
+		counterAccountID = getContactDefaultAccount(tx, contactID, "payable")
+		// 2. Fallback to standard findAccount chain
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+		}
 		if counterAccountID == uuid.Nil {
 			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlar", "2000")
 		}
@@ -4105,6 +4115,23 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		response.InternalError(c, "Failed to confirm payment")
 		return
 	}
+
+	// Notify: payment confirmed
+	go func() {
+		var contactName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, contactID).Scan(&contactName)
+		amountStr := fmt.Sprintf("%.0f", amount)
+		h.createTranslatedNotification(tenantID, userID, "payment_confirmed",
+			map[string]interface{}{
+				"payment_id":     id.String(),
+				"payment_number": paymentNumber,
+				"contact_id":     contactID.String(),
+				"contact_name":   contactName,
+				"amount":         amount,
+			},
+			paymentNumber, amountStr, contactName,
+		)
+	}()
 
 	response.Success(c, gin.H{"message": "Payment confirmed successfully", "confirmed_at": now})
 }

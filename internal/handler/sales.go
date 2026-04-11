@@ -1673,6 +1673,27 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	// update the linked PO to confirmed and create a receipt op for it.
 	h.syncIntercompanySOConfirmToPO(tenantID, orderID, now)
 
+	// Notify: sales order confirmed
+	go func() {
+		var totalAmt float64
+		h.db.QueryRow(`SELECT COALESCE(total_amount, 0) FROM sales_orders WHERE id = $1`, orderID).Scan(&totalAmt)
+		custName := ""
+		if customerName.Valid {
+			custName = customerName.String
+		}
+		amountStr := fmt.Sprintf("%.0f", totalAmt)
+		h.createTranslatedNotification(tenantID, userID, "sales_order_confirmed",
+			map[string]interface{}{
+				"order_id":      orderID.String(),
+				"order_number":  orderNumber,
+				"customer_id":   customerID.String(),
+				"customer_name": custName,
+				"amount":        totalAmt,
+			},
+			orderNumber, custName, amountStr,
+		)
+	}()
+
 	h.GetSalesOrder(c)
 }
 
