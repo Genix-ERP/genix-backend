@@ -6634,25 +6634,19 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						`, lotID, tenantID, prodID, warehouseID, lotNumber,
 							now, expDate, doneQty, unitPrice, vendorID, op.SourceID, now)
 
-						// Update product cost_price with the purchase price
-						cpResult, cpErr := h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+						// Update product cost_price in both products table AND product_organization_settings
+						h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
 							unitPrice, now, prodID, tenantID)
-						if cpErr != nil {
-							h.log.Error("[v2] Failed to update product cost_price", "error", cpErr, "product_id", prodID, "unitPrice", unitPrice)
-						} else {
-							cpRows, _ := cpResult.RowsAffected()
-							h.log.Info("[v2] Updated product cost_price from stock receipt", "product_id", prodID, "cost_price", unitPrice, "rows_affected", cpRows, "tenant_id", tenantID)
-							if cpRows == 0 {
-								// Try without tenant_id filter
-								r2, _ := h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3`, unitPrice, now, prodID)
-								r2Rows, _ := r2.RowsAffected()
-								h.log.Info("[v2] Retry without tenant_id", "rows_affected", r2Rows, "product_id", prodID)
-							}
-							// Verify
-							var verifyCost float64
-							h.db.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, prodID).Scan(&verifyCost)
-							h.log.Info("[v2] Verify cost_price after update", "product_id", prodID, "cost_price_in_db", verifyCost)
+						// Also update org-specific settings (this is what the frontend actually reads)
+						if op.OrgID != nil {
+							h.db.Exec(`
+								INSERT INTO product_organization_settings (tenant_id, product_id, organization_id, cost_price, updated_at)
+								VALUES ($1, $2, $3, $4, $5)
+								ON CONFLICT (tenant_id, product_id, organization_id)
+								DO UPDATE SET cost_price = $4, updated_at = $5
+							`, tenantID, prodID, *op.OrgID, unitPrice, now)
 						}
+						h.log.Info("[v2] Updated product cost_price from stock receipt", "product_id", prodID, "cost_price", unitPrice, "org_id", op.OrgID)
 					} else {
 						// Delivery or write-off: decrease inventory
 						h.db.Exec(`
