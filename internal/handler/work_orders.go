@@ -561,6 +561,7 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 					h.log.Info("CompleteWorkOrder: set production order to PACKAGING", "po_id", productionOrderID)
 				}
 			} else {
+				h.log.Info("[v2] CompleteWorkOrder: completing PO (non-split)", "po_id", productionOrderID, "lastWoProduced", lastWoProduced)
 				h.db.Exec(`
 					UPDATE production_orders
 					SET status = 'completed', current_stage = 'done', progress_percent = 100,
@@ -571,6 +572,7 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 
 				// Add finished goods to inventory (last step's good output)
 				unitCost := h.receiveFinishedGoods(productionOrderID, tenantID, userID, lastWoProduced, now)
+				h.log.Info("[v2] receiveFinishedGoods returned", "unitCost", unitCost, "po_id", productionOrderID)
 
 				// Set material_cost and actual_cost on the production order
 				totalCost := unitCost * (lastWoProduced + totalScrapped)
@@ -1516,9 +1518,17 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
 	}
 
-	// If no warehouse set, just return the unitCost (for cost calculation) without inventory changes
+	// If no warehouse set, try to find one
 	if warehouseID == nil {
-		return unitCost
+		var firstWH uuid.UUID
+		if h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
+			warehouseID = &firstWH
+			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, poID, tenantID)
+			h.log.Info("receiveFinishedGoods: auto-assigned warehouse", "warehouse_id", firstWH, "po_id", poID)
+		} else {
+			h.log.Warn("receiveFinishedGoods: no warehouse found, skipping inventory", "po_id", poID)
+			return unitCost
+		}
 	}
 
 	tx, err := h.db.Begin()
