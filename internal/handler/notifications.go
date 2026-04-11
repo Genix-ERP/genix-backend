@@ -282,3 +282,34 @@ func (h *Handler) MarkAllNotificationsRead(c *gin.Context) {
 
 	response.Success(c, gin.H{"message": "All marked as read"})
 }
+
+// DeleteNotification deletes a single notification
+func (h *Handler) DeleteNotification(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid notification ID")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		DELETE FROM notifications WHERE id = $1 AND tenant_id = $2 AND user_id = $3
+	`, id, tenantID, userID)
+	if err != nil {
+		response.InternalServerError(c, "Failed to delete notification")
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		response.NotFound(c, "Notification not found")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Notification deleted"})
+}
