@@ -6633,6 +6633,10 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
 						`, lotID, tenantID, prodID, warehouseID, lotNumber,
 							now, expDate, doneQty, unitPrice, vendorID, op.SourceID, now)
+
+						// Update product cost_price with the purchase price
+						h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+							unitPrice, now, prodID, tenantID)
 					} else {
 						// Delivery or write-off: decrease inventory
 						h.db.Exec(`
