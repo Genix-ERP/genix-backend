@@ -1455,6 +1455,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.GET("/:id/materials", h.ListWorkOrderMaterials)
 		workOrders.POST("/:id/materials", h.AddWorkOrderMaterial)
 		workOrders.DELETE("/:id/materials/:material_id", h.RemoveWorkOrderMaterial)
+		workOrders.GET("/:id/attachments", h.ListWorkOrderAttachments)
+		workOrders.POST("/:id/attachments", h.UploadWorkOrderAttachment)
+		workOrders.DELETE("/:id/attachments/:attachment_id", h.DeleteWorkOrderAttachment)
 	}
 
 	// Manufacturing Transfers (Pick Components / Store Finished)
