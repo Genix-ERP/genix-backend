@@ -2294,6 +2294,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				}
 			}
 			compRows.Close()
+			h.log.Info("[v2] BOM components found", "count", len(components), "bom_id", bomID, "po_id", id)
 
 			// Deduct each component from inventory
 			for _, comp := range components {
@@ -2347,9 +2348,9 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			}
 
 			if commitErr := tx.Commit(); commitErr != nil {
-				h.log.Error("Failed to commit material consumption", "error", commitErr)
+				h.log.Error("[v2] Failed to commit material consumption", "error", commitErr, "po_id", id)
 			} else {
-				h.log.Info("Materials consumed for production order start", "order_id", id, "components", len(components))
+				h.log.Info("[v2] SUCCESS: Materials consumed for production order start", "order_id", id, "components", len(components))
 
 				// --- Create journal entry: Dt 1320 WIP / Kt 1310 Raw Materials ---
 				// Skip if journal was already created at confirm step
