@@ -6635,8 +6635,12 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 							now, expDate, doneQty, unitPrice, vendorID, op.SourceID, now)
 
 						// Update product cost_price with the purchase price
-						h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-							unitPrice, now, prodID, tenantID)
+						if _, cpErr := h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+							unitPrice, now, prodID, tenantID); cpErr != nil {
+							h.log.Error("[v2] Failed to update product cost_price", "error", cpErr, "product_id", prodID, "unitPrice", unitPrice)
+						} else {
+							h.log.Info("[v2] Updated product cost_price from stock receipt", "product_id", prodID, "cost_price", unitPrice)
+						}
 					} else {
 						// Delivery or write-off: decrease inventory
 						h.db.Exec(`
