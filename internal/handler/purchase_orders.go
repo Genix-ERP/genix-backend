@@ -1330,6 +1330,23 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		}
 	}
 
+	// Update product cost_price for each PO line (before commit so it's in same tx)
+	poLineRows, _ := h.db.Query(`
+		SELECT product_id, unit_price FROM purchase_order_lines
+		WHERE purchase_order_id = $1 AND product_id IS NOT NULL
+	`, poID)
+	if poLineRows != nil {
+		for poLineRows.Next() {
+			var pid uuid.UUID
+			var uprice float64
+			if poLineRows.Scan(&pid, &uprice) == nil && uprice > 0 {
+				tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+					uprice, now, pid, tenantID)
+			}
+		}
+		poLineRows.Close()
+	}
+
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
