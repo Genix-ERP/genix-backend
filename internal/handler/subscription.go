@@ -507,28 +507,8 @@ func (h *Handler) CleanExpiredTenants(c *gin.Context) {
 	`, now)
 	deactivated, _ := r3.RowsAffected()
 
-	// Step 4: Expired → HARD DELETE all company data immediately
-	expiredRows, _ := h.db.Query(`
-		SELECT id::text FROM tenants
-		WHERE deleted_at IS NULL
-		  AND subscription_status = 'expired'
-		  AND is_active = false
-	`)
+	// Step 4: Disabled — keeping expired tenant data for now
 	var deleted int64
-	if expiredRows != nil {
-		var tenantIDs []string
-		for expiredRows.Next() {
-			var tid string
-			expiredRows.Scan(&tid)
-			tenantIDs = append(tenantIDs, tid)
-		}
-		expiredRows.Close()
-		for _, tid := range tenantIDs {
-			h.log.Info("Hard-deleting expired tenant", "tenant_id", tid)
-			h.hardDeleteTenantData(tid)
-			deleted++
-		}
-	}
 
 	h.log.Info("CleanExpiredTenants completed",
 		"trial_expired", trialExpired, "sub_expired", subExpired,
@@ -669,23 +649,8 @@ func (h *Handler) RunSubscriptionCleanupScheduler(ctx context.Context) {
 			t2, _ := r2.RowsAffected()
 			t3, _ := r3.RowsAffected()
 
-			// Hard-delete expired tenants
-			expiredRows, _ := h.db.Query(`SELECT id::text FROM tenants WHERE deleted_at IS NULL AND subscription_status = 'expired' AND is_active = false`)
+			// Hard-delete disabled — keeping expired tenant data for now
 			var t4 int64
-			if expiredRows != nil {
-				var ids []string
-				for expiredRows.Next() {
-					var tid string
-					expiredRows.Scan(&tid)
-					ids = append(ids, tid)
-				}
-				expiredRows.Close()
-				for _, tid := range ids {
-					h.log.Info("Scheduler: hard-deleting expired tenant", "tenant_id", tid)
-					h.hardDeleteTenantData(tid)
-					t4++
-				}
-			}
 
 			h.log.Info("Subscription cleanup done", "trial_expired", t1, "sub_expired", t2, "deactivated", t3, "deleted", t4)
 		}
