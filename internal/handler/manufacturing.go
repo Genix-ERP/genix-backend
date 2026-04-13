@@ -2739,9 +2739,13 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		h.db.QueryRow("SELECT COALESCE(list_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
 		materialCost = unitCost
 	}
-	// Update product's cost_price
+	// Update product's cost_price (both tables — frontend reads from product_organization_settings)
 	if unitCost > 0 {
 		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
+		if organizationID != nil {
+			h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+				unitCost, now, productID, *organizationID)
+		}
 	}
 
 	tx, txErr := h.db.Begin()
