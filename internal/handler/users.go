@@ -805,6 +805,118 @@ func (h *Handler) ListAllSystemUsers(c *gin.Context) {
 	response.SuccessWithMeta(c, users, pagination)
 }
 
+// ListAllTenants returns all tenants/companies with owner info and subscription status.
+// GET /admin/tenants
+func (h *Handler) ListAllTenants(c *gin.Context) {
+	search := c.Query("search")
+	statusFilter := c.Query("status") // active, trialing, past_due, expired
+
+	query := `
+		SELECT t.id, t.code, t.name, t.subscription_plan, t.subscription_status,
+		       COALESCE(t.paid_users, 0), t.is_active, t.trial_ends_at, t.account_clear_at,
+		       t.created_at, t.updated_at,
+		       (SELECT COUNT(*) FROM users u WHERE u.tenant_id = t.id AND u.deleted_at IS NULL) as user_count,
+		       (SELECT u.first_name || ' ' || u.last_name FROM users u
+		        LEFT JOIN user_roles ur ON u.id = ur.user_id
+		        LEFT JOIN roles r ON ur.role_id = r.id
+		        WHERE u.tenant_id = t.id AND u.deleted_at IS NULL
+		        AND (u.is_system_admin = true OR r.code = 'owner')
+		        LIMIT 1) as owner_name,
+		       (SELECT u.email FROM users u
+		        LEFT JOIN user_roles ur ON u.id = ur.user_id
+		        LEFT JOIN roles r ON ur.role_id = r.id
+		        WHERE u.tenant_id = t.id AND u.deleted_at IS NULL
+		        AND (u.is_system_admin = true OR r.code = 'owner')
+		        LIMIT 1) as owner_email
+		FROM tenants t
+		WHERE t.deleted_at IS NULL
+	`
+	args := []interface{}{}
+	argIdx := 1
+
+	if search != "" {
+		query += " AND (t.name ILIKE $" + itoa(argIdx) + " OR t.code ILIKE $" + itoa(argIdx) + ")"
+		args = append(args, "%"+search+"%")
+		argIdx++
+	}
+	if statusFilter != "" && statusFilter != "all" {
+		query += " AND t.subscription_status = $" + itoa(argIdx)
+		args = append(args, statusFilter)
+		argIdx++
+	}
+
+	query += " ORDER BY t.created_at DESC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list tenants", "error", err)
+		response.InternalServerError(c, "Failed to list tenants")
+		return
+	}
+	defer rows.Close()
+
+	type TenantResponse struct {
+		ID                 uuid.UUID  `json:"id"`
+		Code               string     `json:"code"`
+		Name               string     `json:"name"`
+		SubscriptionPlan   string     `json:"subscription_plan"`
+		SubscriptionStatus string     `json:"subscription_status"`
+		PaidUsers          int        `json:"paid_users"`
+		IsActive           bool       `json:"is_active"`
+		TrialEndsAt        *time.Time `json:"trial_ends_at,omitempty"`
+		AccountClearAt     *time.Time `json:"account_clear_at,omitempty"`
+		CreatedAt          time.Time  `json:"created_at"`
+		UpdatedAt          time.Time  `json:"updated_at"`
+		UserCount          int        `json:"user_count"`
+		OwnerName          *string    `json:"owner_name,omitempty"`
+		OwnerEmail         *string    `json:"owner_email,omitempty"`
+	}
+
+	var tenants []TenantResponse
+	for rows.Next() {
+		var t TenantResponse
+		var plan, status sql.NullString
+		var trialEnds, clearAt sql.NullTime
+		var ownerName, ownerEmail sql.NullString
+
+		if err := rows.Scan(&t.ID, &t.Code, &t.Name, &plan, &status,
+			&t.PaidUsers, &t.IsActive, &trialEnds, &clearAt,
+			&t.CreatedAt, &t.UpdatedAt, &t.UserCount,
+			&ownerName, &ownerEmail); err != nil {
+			h.log.Error("Failed to scan tenant", "error", err)
+			continue
+		}
+
+		t.SubscriptionPlan = "free"
+		if plan.Valid {
+			t.SubscriptionPlan = plan.String
+		}
+		t.SubscriptionStatus = "trialing"
+		if status.Valid {
+			t.SubscriptionStatus = status.String
+		}
+		if trialEnds.Valid {
+			t.TrialEndsAt = &trialEnds.Time
+		}
+		if clearAt.Valid {
+			t.AccountClearAt = &clearAt.Time
+		}
+		if ownerName.Valid {
+			t.OwnerName = &ownerName.String
+		}
+		if ownerEmail.Valid {
+			t.OwnerEmail = &ownerEmail.String
+		}
+
+		tenants = append(tenants, t)
+	}
+	if tenants == nil {
+		tenants = []TenantResponse{}
+	}
+
+	response.Success(c, tenants)
+}
+
 // DeleteSystemUser soft-deletes a user (for system admin only)
 // This marks the user as deleted without removing data
 func (h *Handler) DeleteSystemUser(c *gin.Context) {

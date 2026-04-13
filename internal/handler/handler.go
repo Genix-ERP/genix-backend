@@ -1391,6 +1391,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	admin.Use(middleware.RequireSystemAdmin())
 	{
 		admin.GET("/users", h.ListAllSystemUsers)
+		admin.GET("/tenants", h.ListAllTenants)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
 		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
 	}
