@@ -917,6 +917,59 @@ func (h *Handler) ListAllTenants(c *gin.Context) {
 	response.Success(c, tenants)
 }
 
+// ActivateTenantSubscription manually activates a tenant's subscription (cash payment).
+// PUT /admin/tenants/:id/activate
+func (h *Handler) ActivateTenantSubscription(c *gin.Context) {
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid tenant ID")
+		return
+	}
+
+	var input struct {
+		PaidUsers int `json:"paid_users"`
+		Months    int `json:"months"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+	if input.PaidUsers < 1 {
+		input.PaidUsers = 1
+	}
+	if input.Months < 1 {
+		input.Months = 1
+	}
+
+	now := time.Now()
+	endDate := now.AddDate(0, input.Months, 0)
+
+	_, err = h.db.Exec(`
+		UPDATE tenants
+		SET subscription_status = 'active',
+		    subscription_plan = 'professional',
+		    paid_users = $1,
+		    is_active = true,
+		    trial_ends_at = NULL,
+		    account_clear_at = $2,
+		    updated_at = NOW()
+		WHERE id = $3
+	`, input.PaidUsers, endDate, tenantID)
+	if err != nil {
+		h.log.Error("Failed to activate tenant subscription", "error", err)
+		response.InternalServerError(c, "Failed to activate subscription")
+		return
+	}
+
+	h.log.Info("Tenant subscription manually activated", "tenant_id", tenantID, "paid_users", input.PaidUsers, "months", input.Months, "ends_at", endDate)
+	response.Success(c, gin.H{
+		"message":    "Subscription activated",
+		"paid_users": input.PaidUsers,
+		"months":     input.Months,
+		"ends_at":    endDate,
+	})
+}
+
 // DeleteSystemUser soft-deletes a user (for system admin only)
 // This marks the user as deleted without removing data
 func (h *Handler) DeleteSystemUser(c *gin.Context) {
