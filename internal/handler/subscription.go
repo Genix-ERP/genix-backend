@@ -270,7 +270,7 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 
 	// Only activate on final success
 	if payload.Status == "success" {
-		// Parse users count from plan string (e.g. "4users_monthly")
+		// Parse users count and billing period from plan string (e.g. "4users_monthly")
 		var paidUsers int
 		var billing string
 		fmt.Sscanf(plan, "%dusers_%s", &paidUsers, &billing)
@@ -278,20 +278,30 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 			paidUsers = 1
 		}
 
+		// Calculate subscription end date based on billing period
+		now := time.Now()
+		var endDate time.Time
+		switch billing {
+		case "yearly":
+			endDate = now.AddDate(1, 0, 0) // +1 year
+		default:
+			endDate = now.AddDate(0, 1, 0) // +1 month
+		}
+
 		h.db.Exec(`
 			UPDATE tenants
 			SET subscription_status = 'active',
-			    subscription_plan   = $2,
-			    paid_users          = $3,
+			    subscription_plan   = 'professional',
+			    paid_users          = $2,
 			    is_active           = true,
 			    trial_ends_at       = NULL,
-			    account_clear_at    = NULL,
+			    account_clear_at    = $3,
 			    updated_at          = NOW()
 			WHERE id = $1
-		`, tenantID, plan, paidUsers)
+		`, tenantID, paidUsers, endDate)
 
 		h.log.Info("Subscription activated via Multicard",
-			"tenant_id", tenantID, "plan", plan, "paid_users", paidUsers, "invoice", payload.InvoiceID)
+			"tenant_id", tenantID, "plan", plan, "paid_users", paidUsers, "ends_at", endDate, "invoice", payload.InvoiceID)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -369,18 +379,28 @@ func (h *Handler) VerifyPayment(c *gin.Context) {
 		if paidUsers < 1 {
 			paidUsers = 1
 		}
+
+		now := time.Now()
+		var endDate time.Time
+		switch billing {
+		case "yearly":
+			endDate = now.AddDate(1, 0, 0)
+		default:
+			endDate = now.AddDate(0, 1, 0)
+		}
+
 		h.db.Exec(`
 			UPDATE tenants
 			SET subscription_status = 'active',
-			    subscription_plan   = $2,
-			    paid_users          = $3,
+			    subscription_plan   = 'professional',
+			    paid_users          = $2,
 			    is_active           = true,
 			    trial_ends_at       = NULL,
-			    account_clear_at    = NULL,
+			    account_clear_at    = $3,
 			    updated_at          = NOW()
 			WHERE id = $1
-		`, tenantID, plan, paidUsers)
-		h.log.Info("VerifyPayment: subscription activated", "tenant_id", tenantID, "plan", plan)
+		`, tenantID, paidUsers, endDate)
+		h.log.Info("VerifyPayment: subscription activated", "tenant_id", tenantID, "plan", plan, "ends_at", endDate)
 	}
 
 	response.Success(c, gin.H{"status": ps.Status})
