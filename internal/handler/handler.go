@@ -1724,6 +1724,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Activity Log
 		constructionProjects.GET("/:id/activity-log", h.ListConstructionActivityLog)
 
+		// Estimate Resources (grouped by type for substage dropdowns)
+		constructionProjects.GET("/:id/estimate-resources", h.ListProjectEstimateResources)
+
 		// Estimates
 		constructionProjects.GET("/:id/estimates", h.ListEstimates)
 		constructionProjects.POST("/:id/estimates", h.perm.Require("construction", "estimate", "create"), h.CreateEstimate)
@@ -1931,6 +1934,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionExpenses.DELETE("/:id", h.perm.Require("construction", "project", "update"), h.DeleteExpenseLine)
 		constructionExpenses.PUT("/:id/approve", h.perm.Require("construction", "project", "update"), h.ApproveExpenseLine)
 		constructionExpenses.PUT("/:id/cancel", h.perm.Require("construction", "project", "update"), h.CancelExpenseLine)
+	}
+
+	// Material Reservations (Materiallar zaxirasi)
+	materialReservations := rg.Group("/material-reservations")
+	materialReservations.Use(h.perm.Require("inventory", "stock", "read"))
+	{
+		materialReservations.GET("", h.ListMaterialReservations)
+		materialReservations.POST("", h.perm.Require("construction", "project", "update"), h.CreateMaterialReservation)
+		materialReservations.PUT(":id/approve", h.perm.Require("inventory", "stock", "adjust"), h.ApproveMaterialReservation)
+		materialReservations.PUT(":id/reject", h.perm.Require("inventory", "stock", "adjust"), h.RejectMaterialReservation)
+		materialReservations.DELETE(":id", h.perm.Require("construction", "project", "update"), h.DeleteMaterialReservation)
 	}
 
 	// Cost Categories & Account Mapping (settings)

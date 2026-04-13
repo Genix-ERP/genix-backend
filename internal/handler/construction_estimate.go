@@ -598,6 +598,95 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	response.Success(c, lines)
 }
 
+// ListProjectEstimateResources returns unique resource lines across all estimates for a project
+// Filtered by resource_type (labor, equipment, material) via ?type= query param
+func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	resourceType := c.Query("type") // "labor", "equipment", "material", or empty for all
+
+	query := `
+		SELECT DISTINCT ON (UPPER(el.name))
+			el.id, el.name, el.uom, el.quantity,
+			el.material_rate, el.labor_rate, el.equipment_rate,
+			el.unit_rate, COALESCE(el.code, ''), COALESCE(el.resource_type, '')
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id
+		WHERE e.tenant_id = $1
+		  AND e.project_id = $2
+		  AND el.name != ''
+	`
+	args := []interface{}{tenantID, projectID}
+	argIdx := 3
+
+	if resourceType != "" {
+		// Filter by resource type or UOM pattern
+		switch strings.ToLower(resourceType) {
+		case "labor":
+			query += ` AND (LOWER(el.resource_type) = 'labor' OR (UPPER(el.uom) LIKE '%ЧЕЛ%' AND UPPER(el.uom) LIKE '%Ч%') OR (el.labor_rate > 0 AND el.material_rate = 0 AND el.equipment_rate = 0))`
+		case "equipment":
+			query += ` AND (LOWER(el.resource_type) = 'equipment' OR (UPPER(el.uom) LIKE '%МАШ%' AND UPPER(el.uom) LIKE '%Ч%') OR (el.equipment_rate > 0 AND el.material_rate = 0 AND el.labor_rate = 0))`
+		case "material":
+			query += ` AND LOWER(COALESCE(el.resource_type,'')) != 'labor' AND LOWER(COALESCE(el.resource_type,'')) != 'equipment'`
+			query += ` AND NOT (UPPER(el.uom) LIKE '%ЧЕЛ%' AND UPPER(el.uom) LIKE '%Ч%')`
+			query += ` AND NOT (UPPER(el.uom) LIKE '%МАШ%' AND UPPER(el.uom) LIKE '%Ч%')`
+			query += ` AND NOT (el.labor_rate > 0 AND el.material_rate = 0 AND el.equipment_rate = 0)`
+			query += ` AND NOT (el.equipment_rate > 0 AND el.material_rate = 0 AND el.labor_rate = 0)`
+		default:
+			query += fmt.Sprintf(` AND LOWER(el.resource_type) = $%d`, argIdx)
+			args = append(args, strings.ToLower(resourceType))
+			argIdx++
+		}
+	}
+
+	query += ` ORDER BY UPPER(el.name), el.id LIMIT 500`
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list project estimate resources", "error", err, "query", query, "args", args)
+		response.InternalError(c, "Failed to list resources")
+		return
+	}
+	defer rows.Close()
+
+	type ResourceLine struct {
+		ID            int64   `json:"id"`
+		Name          string  `json:"name"`
+		UOM           string  `json:"uom"`
+		Quantity      float64 `json:"quantity"`
+		MaterialRate  float64 `json:"material_rate"`
+		LaborRate     float64 `json:"labor_rate"`
+		EquipmentRate float64 `json:"equipment_rate"`
+		UnitRate      float64 `json:"unit_rate"`
+		Code          string  `json:"code"`
+		ResourceType  string  `json:"resource_type"`
+	}
+
+	resources := make([]ResourceLine, 0)
+	for rows.Next() {
+		var r ResourceLine
+		if err := rows.Scan(&r.ID, &r.Name, &r.UOM, &r.Quantity,
+			&r.MaterialRate, &r.LaborRate, &r.EquipmentRate,
+			&r.UnitRate, &r.Code, &r.ResourceType); err != nil {
+			h.log.Error("Scan resource row", "error", err)
+			continue
+		}
+		resources = append(resources, r)
+	}
+
+	response.Success(c, resources)
+}
+
 // CreateEstimateLine creates a new line in an estimate
 func (h *Handler) CreateEstimateLine(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -771,8 +860,15 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
 
+	// Auto-create products from imported resource lines
+	// Exclude labor (ЧЕЛ.-Ч) and equipment (МАШ.-Ч) resources
+	orgID, _ := middleware.GetOrganizationID(c)
+	userID, _ := middleware.GetUserID(c)
+	productsCreated := h.autoCreateProductsFromEstimateLines(tenantID, orgID, userID, req.Lines)
+
 	response.Success(c, map[string]interface{}{
-		"count": count,
+		"count":            count,
+		"products_created": productsCreated,
 	})
 }
 
@@ -1204,3 +1300,140 @@ func (h *Handler) DeleteEstimateSummaryBatch(c *gin.Context) {
 		"deleted": rowsAffected,
 	})
 }
+
+// ─── Auto-create products from estimate resource lines ───────────────────────
+
+// autoCreateProductsFromEstimateLines creates products for resource lines
+// that are material type (excludes ЧЕЛ.-Ч labor and МАШ.-Ч equipment).
+// Returns number of products created.
+func (h *Handler) autoCreateProductsFromEstimateLines(tenantID, orgID, userID uuid.UUID, lines []entity.CreateEstimateLineInput) int {
+	created := 0
+
+	// Deduplicate by name (case-insensitive)
+	seen := make(map[string]bool)
+
+	for _, line := range lines {
+		name := strings.TrimSpace(line.Name)
+		if name == "" {
+			continue
+		}
+
+		// Skip labor and equipment resources by UOM
+		uomUpper := strings.ToUpper(strings.TrimSpace(line.UOM))
+		if strings.Contains(uomUpper, "ЧЕЛ") && strings.Contains(uomUpper, "Ч") {
+			continue // Labor — employee hours
+		}
+		if strings.Contains(uomUpper, "МАШ") && strings.Contains(uomUpper, "Ч") {
+			continue // Equipment — machine hours
+		}
+
+		// Also skip by resource_type if explicitly set
+		rt := strings.ToLower(strings.TrimSpace(line.ResourceType))
+		if rt == "labor" || rt == "equipment" {
+			continue
+		}
+
+		// Skip BOP/section headers (they have no UOM or are parent items)
+		if line.UOM == "" && line.MaterialRate == 0 && line.LaborRate == 0 && line.EquipmentRate == 0 {
+			continue
+		}
+
+		// Deduplicate within this import batch
+		nameKey := strings.ToUpper(name)
+		if seen[nameKey] {
+			continue
+		}
+		seen[nameKey] = true
+
+		// Check if product with this name already exists for this tenant
+		var exists bool
+		err := h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM products WHERE tenant_id = $1 AND UPPER(name) = UPPER($2) AND deleted_at IS NULL)`,
+			tenantID, name,
+		).Scan(&exists)
+		if err != nil {
+			h.log.Error("Failed to check product existence", "error", err, "name", name)
+			continue
+		}
+		if exists {
+			continue
+		}
+
+		// Resolve UOM to unit_id
+		unitID := h.resolveUOMCode(tenantID, line.UOM)
+
+		// Determine cost price from the estimate rates
+		costPrice := line.MaterialRate
+		if costPrice == 0 {
+			costPrice = line.MaterialRate + line.LaborRate + line.EquipmentRate
+		}
+
+		// Generate a product code from the estimate code or name
+		code := strings.TrimSpace(line.Code)
+		if code == "" {
+			// Generate code from first letters + index
+			code = fmt.Sprintf("EST-%s", strings.ReplaceAll(strings.ToUpper(name[:min(len(name), 10)]), " ", ""))
+		}
+
+		// Ensure code uniqueness
+		var codeExists bool
+		h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM products WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)`,
+			tenantID, code,
+		).Scan(&codeExists)
+		if codeExists {
+			code = fmt.Sprintf("%s-%s", code, uuid.New().String()[:4])
+		}
+
+		id := uuid.New()
+		now := time.Now()
+
+		var orgIDPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgIDPtr = &orgID
+		}
+
+		_, err = h.db.Exec(`
+			INSERT INTO products (
+				id, tenant_id, origin_organization_id, type, code, name,
+				unit_id, cost_price, list_price,
+				is_stockable, track_inventory,
+				is_purchasable, is_sellable, can_be_sold, can_be_purchased,
+				can_be_expensed, inventory_type,
+				is_active, tags, created_by, created_at, updated_at
+			) VALUES (
+				$1, $2, $3, 'product', $4, $5,
+				$6, $7, $7,
+				true, true,
+				true, false, false, true,
+				true, 'trade',
+				true, '["estimate-import"]'::jsonb, $8, $9, $9
+			)
+		`, id, tenantID, orgIDPtr, code, name,
+			unitID, costPrice,
+			userID, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to auto-create product from estimate", "error", err, "name", name)
+			continue
+		}
+
+		// Create org settings if org is set
+		if orgID != uuid.Nil {
+			h.db.Exec(`
+				INSERT INTO product_organization_settings (
+					tenant_id, product_id, organization_id,
+					cost_price, list_price, min_price,
+					min_stock_level, reorder_point, reorder_quantity
+				) VALUES ($1, $2, $3, $4, $4, 0, 0, 0, 0)
+				ON CONFLICT (product_id, organization_id) DO NOTHING
+			`, tenantID, id, orgID, costPrice)
+		}
+
+		created++
+		h.log.Info("Auto-created product from estimate", "name", name, "code", code, "cost", costPrice)
+	}
+
+	return created
+}
+
