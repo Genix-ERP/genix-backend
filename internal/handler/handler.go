@@ -1392,6 +1392,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		admin.GET("/users", h.ListAllSystemUsers)
 		admin.GET("/tenants", h.ListAllTenants)
+		admin.PUT("/tenants/:id/activate", h.ActivateTenantSubscription)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
 		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
 	}
