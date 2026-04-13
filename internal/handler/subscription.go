@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -457,31 +458,114 @@ func (h *Handler) GetPaymentHistory(c *gin.Context) {
 	response.Success(c, payments)
 }
 
-// CleanExpiredTenants soft-deletes tenants whose account_clear_at has passed.
+// CleanExpiredTenants handles subscription lifecycle:
+// 1. Trial expired (trial_ends_at passed) → set past_due + account_clear_at = trial_ends_at + 30 days
+// 2. Active subscription expired (account_clear_at passed) → set past_due + account_clear_at = now + 30 days
+// 3. Past due for 30+ days (account_clear_at passed while past_due) → soft-delete
 // POST /admin/clean-expired-tenants
 func (h *Handler) CleanExpiredTenants(c *gin.Context) {
 	now := time.Now()
+	gracePeriod := now.AddDate(0, 0, -30) // 30 days ago
 
-	h.db.Exec(`
-		UPDATE tenants SET subscription_status = 'expired', is_active = false
+	// Step 1: Expired trials → past_due with 30-day grace period
+	r1, _ := h.db.Exec(`
+		UPDATE tenants
+		SET subscription_status = 'past_due',
+		    account_clear_at = trial_ends_at + INTERVAL '30 days',
+		    updated_at = NOW()
 		WHERE deleted_at IS NULL
-		  AND subscription_status NOT IN ('active', 'expired')
+		  AND subscription_status = 'trialing'
+		  AND trial_ends_at IS NOT NULL
+		  AND trial_ends_at < $1
+	`, now)
+	trialExpired, _ := r1.RowsAffected()
+
+	// Step 2: Active subscriptions expired → past_due with 30-day grace
+	r2, _ := h.db.Exec(`
+		UPDATE tenants
+		SET subscription_status = 'past_due',
+		    account_clear_at = account_clear_at + INTERVAL '30 days',
+		    updated_at = NOW()
+		WHERE deleted_at IS NULL
+		  AND subscription_status = 'active'
 		  AND account_clear_at IS NOT NULL
 		  AND account_clear_at < $1
 	`, now)
+	subExpired, _ := r2.RowsAffected()
 
-	result, err := h.db.Exec(`
+	// Step 3: Past due for 30+ days → mark expired and deactivate
+	r3, _ := h.db.Exec(`
+		UPDATE tenants
+		SET subscription_status = 'expired', is_active = false, updated_at = NOW()
+		WHERE deleted_at IS NULL
+		  AND subscription_status = 'past_due'
+		  AND account_clear_at IS NOT NULL
+		  AND account_clear_at < $1
+	`, now)
+	deactivated, _ := r3.RowsAffected()
+
+	// Step 4: Expired for 30+ more days → soft-delete
+	r4, _ := h.db.Exec(`
 		UPDATE tenants SET deleted_at = NOW()
 		WHERE deleted_at IS NULL
 		  AND subscription_status = 'expired'
+		  AND is_active = false
 		  AND account_clear_at IS NOT NULL
 		  AND account_clear_at < $1
-	`, now)
-	if err != nil {
-		response.InternalServerError(c, "Failed to clean expired tenants")
-		return
-	}
+	`, gracePeriod)
+	deleted, _ := r4.RowsAffected()
 
-	rows, _ := result.RowsAffected()
-	c.JSON(http.StatusOK, gin.H{"success": true, "tenants_archived": rows})
+	h.log.Info("CleanExpiredTenants completed",
+		"trial_expired", trialExpired, "sub_expired", subExpired,
+		"deactivated", deactivated, "deleted", deleted)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":        true,
+		"trial_expired":  trialExpired,
+		"sub_expired":    subExpired,
+		"deactivated":    deactivated,
+		"tenants_deleted": deleted,
+	})
+}
+
+// RunSubscriptionCleanupScheduler runs CleanExpiredTenants daily at 03:00 Tashkent time.
+func (h *Handler) RunSubscriptionCleanupScheduler(ctx context.Context) {
+	go func() {
+		loc, _ := time.LoadLocation("Asia/Tashkent")
+		if loc == nil {
+			loc = time.FixedZone("UZT", 5*3600)
+		}
+
+		for {
+			// Calculate next 03:00 Tashkent
+			nowTashkent := time.Now().In(loc)
+			next := time.Date(nowTashkent.Year(), nowTashkent.Month(), nowTashkent.Day(), 3, 0, 0, 0, loc)
+			if next.Before(nowTashkent) {
+				next = next.Add(24 * time.Hour)
+			}
+			sleepDur := next.Sub(time.Now())
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(sleepDur):
+			}
+
+			h.log.Info("Running scheduled subscription cleanup")
+			now := time.Now()
+
+			// Same logic as CleanExpiredTenants but without gin.Context
+			r1, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'past_due', account_clear_at = trial_ends_at + INTERVAL '30 days', updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'trialing' AND trial_ends_at IS NOT NULL AND trial_ends_at < $1`, now)
+			r2, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'past_due', account_clear_at = account_clear_at + INTERVAL '30 days', updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'active' AND account_clear_at IS NOT NULL AND account_clear_at < $1`, now)
+			r3, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'expired', is_active = false, updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'past_due' AND account_clear_at IS NOT NULL AND account_clear_at < $1`, now)
+			gracePeriod := now.AddDate(0, 0, -30)
+			r4, _ := h.db.Exec(`UPDATE tenants SET deleted_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'expired' AND is_active = false AND account_clear_at IS NOT NULL AND account_clear_at < $1`, gracePeriod)
+
+			t1, _ := r1.RowsAffected()
+			t2, _ := r2.RowsAffected()
+			t3, _ := r3.RowsAffected()
+			t4, _ := r4.RowsAffected()
+			h.log.Info("Subscription cleanup done", "trial_expired", t1, "sub_expired", t2, "deactivated", t3, "deleted", t4)
+		}
+	}()
 }
