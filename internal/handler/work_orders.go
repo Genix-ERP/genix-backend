@@ -1519,9 +1519,13 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 	if unitCost <= 0 {
 		h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
 	}
-	// Update product's cost_price with the calculated manufacturing cost
+	// Update product's cost_price with the calculated manufacturing cost (both tables)
 	if unitCost > 0 {
 		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
+		if organizationID != nil {
+			h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+				unitCost, now, productID, *organizationID)
+		}
 	}
 
 	// If no warehouse set, try to find one
