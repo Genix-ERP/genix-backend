@@ -808,6 +808,15 @@ func (h *Handler) ListAllSystemUsers(c *gin.Context) {
 // ListAllTenants returns all tenants/companies with owner info and subscription status.
 // GET /admin/tenants
 func (h *Handler) ListAllTenants(c *gin.Context) {
+	// Auto-expire trials that have passed their trial_ends_at
+	h.db.Exec(`
+		UPDATE tenants SET subscription_status = 'past_due'
+		WHERE deleted_at IS NULL
+		  AND subscription_status = 'trialing'
+		  AND trial_ends_at IS NOT NULL
+		  AND trial_ends_at < NOW()
+	`)
+
 	search := c.Query("search")
 	statusFilter := c.Query("status") // active, trialing, past_due, expired
 
