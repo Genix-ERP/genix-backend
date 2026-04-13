@@ -1220,3 +1220,91 @@ func (h *Handler) GetLeadAuditLogs(c *gin.Context) {
 
 	response.Success(c, logs)
 }
+
+// PublicCreateLead creates a lead from an external website form (no auth required).
+// POST /api/v1/public/leads
+func (h *Handler) PublicCreateLead(c *gin.Context) {
+	var input struct {
+		TenantCode  string  `json:"tenant_code" binding:"required"`
+		ContactName string  `json:"contact_name" binding:"required"`
+		Email       string  `json:"email"`
+		Phone       string  `json:"phone"`
+		CompanyName string  `json:"company_name"`
+		Notes       string  `json:"notes"`
+		Source      string  `json:"source"`
+		PageURL     string  `json:"page_url"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(400, gin.H{"success": false, "error": "tenant_code and contact_name are required"})
+		return
+	}
+
+	if input.Email == "" && input.Phone == "" {
+		c.JSON(400, gin.H{"success": false, "error": "email or phone is required"})
+		return
+	}
+
+	// Look up tenant by code
+	var tenantID uuid.UUID
+	var tenantActive bool
+	err := h.db.QueryRow(`
+		SELECT id, is_active FROM tenants WHERE code = $1 AND deleted_at IS NULL
+	`, input.TenantCode).Scan(&tenantID, &tenantActive)
+	if err != nil {
+		c.JSON(404, gin.H{"success": false, "error": "Company not found"})
+		return
+	}
+	if !tenantActive {
+		c.JSON(403, gin.H{"success": false, "error": "Company subscription inactive"})
+		return
+	}
+
+	// Find the tenant owner to assign the lead to
+	var assignedTo uuid.UUID
+	h.db.QueryRow(`
+		SELECT u.id FROM users u
+		LEFT JOIN user_roles ur ON u.id = ur.user_id
+		LEFT JOIN roles r ON ur.role_id = r.id
+		WHERE u.tenant_id = $1 AND u.deleted_at IS NULL
+		AND (u.is_system_admin = true OR r.code = 'owner')
+		LIMIT 1
+	`, tenantID).Scan(&assignedTo)
+
+	// Get organization ID
+	var orgID *uuid.UUID
+	var oid uuid.UUID
+	if h.db.QueryRow(`SELECT id FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&oid) == nil {
+		orgID = &oid
+	}
+
+	source := input.Source
+	if source == "" {
+		source = "website"
+	}
+
+	notes := input.Notes
+	if input.PageURL != "" {
+		if notes != "" {
+			notes += "\n"
+		}
+		notes += "Page: " + input.PageURL
+	}
+
+	leadID := uuid.New()
+	now := time.Now()
+
+	_, err = h.db.Exec(`
+		INSERT INTO leads (id, tenant_id, organization_id, contact_name, company_name, email, phone,
+			status, source, notes, assigned_to, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'new', $8, $9, $10, $11, $11)
+	`, leadID, tenantID, orgID, input.ContactName, input.CompanyName, input.Email, input.Phone,
+		source, notes, assignedTo, now)
+	if err != nil {
+		h.log.Error("PublicCreateLead: failed to create lead", "error", err)
+		c.JSON(500, gin.H{"success": false, "error": "Failed to create lead"})
+		return
+	}
+
+	h.log.Info("PublicCreateLead: lead created from website", "tenant_code", input.TenantCode, "lead_id", leadID, "email", input.Email)
+	c.JSON(200, gin.H{"success": true, "lead_id": leadID})
+}
