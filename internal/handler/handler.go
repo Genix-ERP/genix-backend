@@ -108,6 +108,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 
 	// Multicard payment webhook (public - called by Multicard servers)
 	rg.POST("/webhooks/multicard", h.MulticardWebhook)
+
+	// Public lead capture from external websites (embed script)
+	rg.POST("/public/leads", h.PublicCreateLead)
 }
 
 // registerProtectedRoutes registers routes that require authentication
