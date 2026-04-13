@@ -465,7 +465,6 @@ func (h *Handler) GetPaymentHistory(c *gin.Context) {
 // POST /admin/clean-expired-tenants
 func (h *Handler) CleanExpiredTenants(c *gin.Context) {
 	now := time.Now()
-	gracePeriod := now.AddDate(0, 0, -30) // 30 days ago
 
 	// Step 1: Expired trials → past_due with 30-day grace period
 	r1, _ := h.db.Exec(`
@@ -504,16 +503,28 @@ func (h *Handler) CleanExpiredTenants(c *gin.Context) {
 	`, now)
 	deactivated, _ := r3.RowsAffected()
 
-	// Step 4: Expired for 30+ more days → soft-delete
-	r4, _ := h.db.Exec(`
-		UPDATE tenants SET deleted_at = NOW()
+	// Step 4: Expired → HARD DELETE all company data immediately
+	expiredRows, _ := h.db.Query(`
+		SELECT id::text FROM tenants
 		WHERE deleted_at IS NULL
 		  AND subscription_status = 'expired'
 		  AND is_active = false
-		  AND account_clear_at IS NOT NULL
-		  AND account_clear_at < $1
-	`, gracePeriod)
-	deleted, _ := r4.RowsAffected()
+	`)
+	var deleted int64
+	if expiredRows != nil {
+		var tenantIDs []string
+		for expiredRows.Next() {
+			var tid string
+			expiredRows.Scan(&tid)
+			tenantIDs = append(tenantIDs, tid)
+		}
+		expiredRows.Close()
+		for _, tid := range tenantIDs {
+			h.log.Info("Hard-deleting expired tenant", "tenant_id", tid)
+			h.hardDeleteTenantData(tid)
+			deleted++
+		}
+	}
 
 	h.log.Info("CleanExpiredTenants completed",
 		"trial_expired", trialExpired, "sub_expired", subExpired,
@@ -526,6 +537,97 @@ func (h *Handler) CleanExpiredTenants(c *gin.Context) {
 		"deactivated":    deactivated,
 		"tenants_deleted": deleted,
 	})
+}
+
+// HardDeleteTenant permanently removes ALL data for a tenant from every table.
+func (h *Handler) hardDeleteTenantData(tenantID string) (int, error) {
+	// Order matters: delete child tables first, parent tables last.
+	// All these tables have tenant_id column.
+	tables := []string{
+		// Manufacturing
+		"work_order_time_logs", "work_order_materials", "production_material_consumption",
+		"production_split_outputs", "quality_checks", "quality_defects", "quality_control_points",
+		"oee_metrics", "downtime_logs", "equipment_maintenance", "manufacturing_equipment",
+		"work_center_calendar", "manufacturing_shifts", "mrp_recommendations", "mrp_supply", "mrp_demand",
+		"work_orders", "production_orders", "manufacturing_categories", "work_centers",
+		// Inventory
+		"inventory_transactions", "inventory_lots", "inventory",
+		"stock_operation_step_log", "stock_operation_lines", "stock_operations",
+		"operation_type_steps", "warehouse_operation_types", "warehouse_locations",
+		"scrap_order_lines", "scrap_orders", "scrap_reasons",
+		"stock_count_items", "stock_counts", "transfer_order_lines", "transfer_orders",
+		"reorder_rules", "reorder_alerts",
+		// Products
+		"product_organization_settings", "product_variant_values", "product_variants",
+		"product_attribute_values", "product_attributes", "product_packagings",
+		"bom_operations", "bom_lines", "product_boms", "products", "product_categories", "units_of_measure",
+		// Sales
+		"sales_order_lines", "sales_orders", "sales_invoice_lines", "sales_invoices",
+		"sales_return_lines", "sales_returns", "delivery_order_lines", "delivery_orders",
+		"quotation_lines", "quotations",
+		// Purchase
+		"purchase_order_lines", "purchase_orders", "purchase_invoice_lines", "purchase_invoices",
+		"purchase_return_lines", "purchase_returns",
+		"goods_receipt_lines", "goods_receipts",
+		"rfq_lines", "rfq_responses", "rfqs",
+		"vendor_prices", "blanket_order_lines", "blanket_orders",
+		"procurement_contracts", "procurement_rules",
+		// Finance
+		"journal_entry_lines", "journal_entries", "journals",
+		"payment_allocations", "payments", "payment_methods",
+		"bank_reconciliation_items", "bank_reconciliations", "bank_transactions", "bank_accounts",
+		"cash_book_entries", "cash_orders", "cash_registers", "cash_transactions",
+		"budget_lines", "budgets", "fiscal_periods", "fiscal_years",
+		"reconciliation_act_lines", "reconciliation_acts",
+		"accounts", "tax_rates", "exchange_rates", "currencies",
+		// HR
+		"payroll_lines", "payroll_periods",
+		"attendance_records", "leave_requests", "leave_allocations",
+		"employee_contracts", "employees",
+		// CRM
+		"crm_attachments", "activities", "opportunity_stages", "pipeline_stages",
+		"opportunities", "leads",
+		// Projects & Construction
+		"project_expenses", "project_team_members", "tasks", "projects",
+		"construction_stage_materials", "construction_stages", "construction_buildings",
+		"building_files", "construction_projects",
+		// Expenses & Assets
+		"expense_lines", "expenses", "fixed_asset_depreciation", "fixed_assets",
+		// Cargo
+		"cargo_shipment_items", "cargo_shipments",
+		// Misc
+		"subscription_payments", "contact_submissions",
+		"approval_step_actions", "approval_steps", "approval_workflow_instances", "approval_workflows",
+		"notifications", "audit_logs", "attachments", "ai_conversations", "ai_prompts",
+		"sequences", "settings", "tenant_settings",
+		// Installed apps
+		"installed_apps",
+		// User & org (last)
+		"user_roles", "role_permissions", "roles", "api_keys",
+		"departments", "organizations",
+		"users",
+	}
+
+	totalDeleted := 0
+	for _, table := range tables {
+		result, err := h.db.Exec(fmt.Sprintf("DELETE FROM %s WHERE tenant_id = $1", table), tenantID)
+		if err != nil {
+			// Table might not exist or have different schema — skip
+			h.log.Warn("hardDeleteTenantData: failed to delete from table", "table", table, "error", err)
+			continue
+		}
+		rows, _ := result.RowsAffected()
+		if rows > 0 {
+			h.log.Info("hardDeleteTenantData: deleted rows", "table", table, "rows", rows)
+			totalDeleted += int(rows)
+		}
+	}
+
+	// Finally delete the tenant itself
+	h.db.Exec("DELETE FROM tenants WHERE id = $1", tenantID)
+	totalDeleted++
+
+	return totalDeleted, nil
 }
 
 // RunSubscriptionCleanupScheduler runs CleanExpiredTenants daily at 03:00 Tashkent time.
@@ -558,13 +660,29 @@ func (h *Handler) RunSubscriptionCleanupScheduler(ctx context.Context) {
 			r1, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'past_due', account_clear_at = trial_ends_at + INTERVAL '30 days', updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'trialing' AND trial_ends_at IS NOT NULL AND trial_ends_at < $1`, now)
 			r2, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'past_due', account_clear_at = account_clear_at + INTERVAL '30 days', updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'active' AND account_clear_at IS NOT NULL AND account_clear_at < $1`, now)
 			r3, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'expired', is_active = false, updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'past_due' AND account_clear_at IS NOT NULL AND account_clear_at < $1`, now)
-			gracePeriod := now.AddDate(0, 0, -30)
-			r4, _ := h.db.Exec(`UPDATE tenants SET deleted_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'expired' AND is_active = false AND account_clear_at IS NOT NULL AND account_clear_at < $1`, gracePeriod)
 
 			t1, _ := r1.RowsAffected()
 			t2, _ := r2.RowsAffected()
 			t3, _ := r3.RowsAffected()
-			t4, _ := r4.RowsAffected()
+
+			// Hard-delete expired tenants
+			expiredRows, _ := h.db.Query(`SELECT id::text FROM tenants WHERE deleted_at IS NULL AND subscription_status = 'expired' AND is_active = false`)
+			var t4 int64
+			if expiredRows != nil {
+				var ids []string
+				for expiredRows.Next() {
+					var tid string
+					expiredRows.Scan(&tid)
+					ids = append(ids, tid)
+				}
+				expiredRows.Close()
+				for _, tid := range ids {
+					h.log.Info("Scheduler: hard-deleting expired tenant", "tenant_id", tid)
+					h.hardDeleteTenantData(tid)
+					t4++
+				}
+			}
+
 			h.log.Info("Subscription cleanup done", "trial_expired", t1, "sub_expired", t2, "deactivated", t3, "deleted", t4)
 		}
 	}()
