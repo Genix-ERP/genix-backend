@@ -34,6 +34,8 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 	var (
 		status         string
 		plan           string
+		tenantCode     string
+		tenantName     string
 		trialEndsAt    sql.NullTime
 		accountClearAt sql.NullTime
 		isActive       bool
@@ -41,11 +43,11 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 	)
 
 	err := h.db.QueryRow(`
-		SELECT subscription_status, subscription_plan, trial_ends_at, account_clear_at, is_active,
-		       COALESCE(paid_users, 0)
+		SELECT subscription_status, subscription_plan, code, COALESCE(name, ''),
+		       trial_ends_at, account_clear_at, is_active, COALESCE(paid_users, 0)
 		FROM tenants
 		WHERE id = $1 AND deleted_at IS NULL
-	`, tenantID).Scan(&status, &plan, &trialEndsAt, &accountClearAt, &isActive, &paidUsers)
+	`, tenantID).Scan(&status, &plan, &tenantCode, &tenantName, &trialEndsAt, &accountClearAt, &isActive, &paidUsers)
 	if err != nil {
 		response.NotFound(c, "Tenant not found")
 		return
@@ -64,10 +66,12 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"status":     status,
-		"plan":       plan,
-		"is_active":  isActive,
-		"paid_users": paidUsers,
+		"status":      status,
+		"plan":        plan,
+		"tenant_code": tenantCode,
+		"tenant_name": tenantName,
+		"is_active":   isActive,
+		"paid_users":  paidUsers,
 	}
 	if trialEndsAt.Valid {
 		resp["trial_ends_at"] = trialEndsAt.Time
