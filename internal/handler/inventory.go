@@ -6645,13 +6645,20 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						`, lotID, tenantID, prodID, warehouseID, lotNumber,
 							now, expDate, doneQty, unitPrice, vendorID, op.SourceID, now)
 
-						// Update product cost_price in both products table AND product_organization_settings
+						// FIFO: set cost_price to the OLDEST available lot's cost (not latest purchase)
+						var fifoCost float64
+						if h.db.QueryRow(`
+							SELECT unit_cost FROM inventory_lots
+							WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+							ORDER BY received_date ASC LIMIT 1
+						`, tenantID, prodID).Scan(&fifoCost) != nil || fifoCost <= 0 {
+							fifoCost = unitPrice // fallback to current purchase price if no lots
+						}
 						h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-							unitPrice, now, prodID, tenantID)
-						// Also update org-specific settings (this is what the frontend actually reads)
+							fifoCost, now, prodID, tenantID)
 						if op.OrgID != nil {
 							h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
-								unitPrice, now, prodID, *op.OrgID)
+								fifoCost, now, prodID, *op.OrgID)
 						}
 						h.log.Info("[v2] Updated product cost_price from stock receipt", "product_id", prodID, "cost_price", unitPrice, "org_id", op.OrgID)
 					} else {

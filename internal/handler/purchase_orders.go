@@ -1345,11 +1345,17 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 			var pid uuid.UUID
 			var uprice float64
 			if poLineRows.Scan(&pid, &uprice) == nil && uprice > 0 {
+				// FIFO: set cost_price to oldest available lot's cost
+				var fifoCost float64
+				if h.db.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
+					tenantID, pid).Scan(&fifoCost) != nil || fifoCost <= 0 {
+					fifoCost = uprice
+				}
 				h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-					uprice, now, pid, tenantID)
+					fifoCost, now, pid, tenantID)
 				if orgID != nil {
 					h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
-						uprice, now, pid, *orgID)
+						fifoCost, now, pid, *orgID)
 				}
 			}
 		}
@@ -1808,9 +1814,14 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 			) VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, 'purchase_order', $8, 'PO Goods Receipt', $9, $9)
 		`, txnID, tenantID, inventoryID, poOrgID, line.QuantityReceived, unitPrice, line.QuantityReceived*unitPrice, id, now)
 
-		// Update product cost_price with the latest purchase price
+		// FIFO: set cost_price to oldest available lot's cost (not latest purchase)
+		var fifoCostRcv float64
+		if h.db.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
+			tenantID, productID).Scan(&fifoCostRcv) != nil || fifoCostRcv <= 0 {
+			fifoCostRcv = unitPrice // first purchase, use current price
+		}
 		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-			unitPrice, now, productID, tenantID)
+			fifoCostRcv, now, productID, tenantID)
 
 		// Auto-create inventory lot for received goods
 		lotNumber := h.generateLotNumber(tenantID)
