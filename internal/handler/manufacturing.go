@@ -1412,11 +1412,20 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		tags = []byte(fmt.Sprintf(`["%s"]`, strings.Join(input.Tags, `","`)))
 	}
 
+	// Auto-fill warehouse from BOM if not provided
+	warehouseID := input.WarehouseID
+	if warehouseID == nil && input.BOMID != nil {
+		var bomWhID uuid.UUID
+		if h.db.QueryRow(`SELECT warehouse_id FROM product_boms WHERE id = $1 AND warehouse_id IS NOT NULL`, input.BOMID).Scan(&bomWhID) == nil {
+			warehouseID = &bomWhID
+		}
+	}
+
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, code, input.Name, input.ProductID, input.BOMID, input.QuantityPlanned, input.UOM,
 		moldCount, input.Shift,
 		scheduledStart, scheduledEnd, priority, input.SourceType, input.SourceID,
-		input.SalesOrderID, input.CustomerID, input.WarehouseID, input.LocationID, input.AssignedTo,
+		input.SalesOrderID, input.CustomerID, warehouseID, input.LocationID, input.AssignedTo,
 		input.WorkCenterID, requiresQC, input.Notes, tags, userID, now, now,
 		input.ManufacturingCategoryID, hasSplitOutput,
 	).Scan(&id)

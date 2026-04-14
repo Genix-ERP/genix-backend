@@ -1644,7 +1644,7 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 	baseQuery := `
 		SELECT b.id, b.code, b.name, b.product_id, b.bom_type, b.quantity, b.version,
 			   b.is_active, b.is_default, b.effective_date, b.expiry_date, b.notes,
-			   b.created_at,
+			   b.created_at, b.warehouse_id, w.name as warehouse_name,
 			   p.code as product_code, p.name as product_name,
 			   (SELECT COUNT(*) FROM bom_lines bl WHERE bl.bom_id = b.id) as line_count,
 			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(NULLIF(cp.cost_price, 0), cp.list_price, 0) * (1 + bl2.scrap_percent/100))
@@ -1655,6 +1655,7 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			     WHERE bo.bom_id = b.id), 0) as total_cost
 		FROM product_boms b
 		JOIN products p ON b.product_id = p.id
+		LEFT JOIN warehouses w ON b.warehouse_id = w.id
 		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM product_boms b WHERE b.tenant_id = $1 AND b.deleted_at IS NULL`
@@ -1722,11 +1723,13 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		var b entity.BOMResponse
 		var effectiveDate, expiryDate sql.NullTime
 		var notes sql.NullString
+		var warehouseID sql.NullString
+		var warehouseName sql.NullString
 
 		err := rows.Scan(
 			&b.ID, &b.Code, &b.Name, &b.ProductID, &b.BOMType, &b.Quantity, &b.Version,
 			&b.IsActive, &b.IsDefault, &effectiveDate, &expiryDate, &notes,
-			&b.CreatedAt,
+			&b.CreatedAt, &warehouseID, &warehouseName,
 			&b.ProductCode, &b.ProductName, &b.LineCount, &b.TotalCost,
 		)
 		if err != nil {
@@ -1741,6 +1744,13 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		if expiryDate.Valid {
 			s := expiryDate.Time.Format("2006-01-02")
 			b.ExpiryDate = &s
+		}
+		if warehouseID.Valid {
+			wid, _ := uuid.Parse(warehouseID.String)
+			b.WarehouseID = &wid
+		}
+		if warehouseName.Valid {
+			b.WarehouseName = &warehouseName.String
 		}
 
 		boms = append(boms, &b)
@@ -1960,14 +1970,22 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		tx.Exec("UPDATE product_boms SET is_default = false WHERE product_id = $1 AND tenant_id = $2", productID, tenantID)
 	}
 
+	var warehouseID *uuid.UUID
+	if input.WarehouseID != "" {
+		wid, _ := uuid.Parse(input.WarehouseID)
+		if wid != uuid.Nil {
+			warehouseID = &wid
+		}
+	}
+
 	_, err = tx.Exec(`
 		INSERT INTO product_boms (
 			id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
-			is_active, is_default, effective_date, expiry_date, notes,
+			is_active, is_default, effective_date, expiry_date, notes, warehouse_id,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $15, $15)
 	`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
-		input.IsDefault, effectiveDate, expiryDate, notes, userID, now)
+		input.IsDefault, effectiveDate, expiryDate, notes, warehouseID, userID, now)
 
 	if err != nil {
 		h.log.Error("Failed to create BOM", "error", err)
@@ -2130,6 +2148,17 @@ func (h *Handler) UpdateBOM(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
 		args = append(args, *input.Notes)
+	}
+	if input.WarehouseID != nil {
+		argCount++
+		if *input.WarehouseID == "" {
+			updates = append(updates, "warehouse_id = NULL")
+			argCount-- // no arg added
+		} else {
+			wid, _ := uuid.Parse(*input.WarehouseID)
+			updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+			args = append(args, wid)
+		}
 	}
 
 	if len(updates) == 0 {
