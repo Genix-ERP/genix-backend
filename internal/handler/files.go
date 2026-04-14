@@ -54,6 +54,15 @@ func (h *Handler) UploadFile(c *gin.Context) {
 	// Reset file reader position
 	file.Seek(0, io.SeekStart)
 
+	// If detection is too generic, try to resolve from file extension
+	if mimeType == "" || strings.HasPrefix(mimeType, "application/octet-stream") || strings.HasPrefix(mimeType, "application/zip") {
+		if ext := strings.ToLower(filepath.Ext(header.Filename)); ext != "" {
+			if mapped := getMimeTypeFromExtension(ext); mapped != "" {
+				mimeType = mapped
+			}
+		}
+	}
+
 	// Validate MIME type if restrictions are set
 	if len(h.config.Storage.AllowedMimeTypes) > 0 {
 		allowed := false
@@ -61,6 +70,14 @@ func (h *Handler) UploadFile(c *gin.Context) {
 			if strings.HasPrefix(mimeType, allowedType) {
 				allowed = true
 				break
+			}
+		}
+		// Fall back: allow if the file extension is in the known-safe list
+		if !allowed {
+			if ext := strings.ToLower(filepath.Ext(header.Filename)); ext != "" {
+				if isAllowedExtension(ext) {
+					allowed = true
+				}
 			}
 		}
 		if !allowed {
@@ -301,4 +318,49 @@ func getExtensionFromMimeType(mimeType string) string {
 		}
 	}
 	return ""
+}
+
+// getMimeTypeFromExtension returns the canonical MIME type for a given file extension.
+// Used as a fallback when http.DetectContentType returns a generic type like
+// application/octet-stream (e.g. for .xls OLE2 files).
+func getMimeTypeFromExtension(ext string) string {
+	extToMime := map[string]string{
+		".jpg":  "image/jpeg",
+		".jpeg": "image/jpeg",
+		".png":  "image/png",
+		".gif":  "image/gif",
+		".webp": "image/webp",
+		".svg":  "image/svg+xml",
+		".pdf":  "application/pdf",
+		".txt":  "text/plain",
+		".csv":  "text/csv",
+		".html": "text/html",
+		".json": "application/json",
+		".xml":  "application/xml",
+		".zip":  "application/zip",
+		".rar":  "application/vnd.rar",
+		".7z":   "application/x-7z-compressed",
+		".doc":  "application/msword",
+		".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		".xls":  "application/vnd.ms-excel",
+		".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		".ppt":  "application/vnd.ms-powerpoint",
+		".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	}
+	return extToMime[ext]
+}
+
+// isAllowedExtension returns true when the file extension is in the allow-list
+// of known-safe document/image/archive formats. This acts as a safety net when
+// MIME detection fails or returns a generic content type.
+func isAllowedExtension(ext string) bool {
+	allowed := map[string]bool{
+		".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true,
+		".pdf": true, ".txt": true, ".csv": true,
+		".doc": true, ".docx": true,
+		".xls": true, ".xlsx": true,
+		".ppt": true, ".pptx": true,
+		".zip": true, ".rar": true, ".7z": true,
+	}
+	return allowed[ext]
 }

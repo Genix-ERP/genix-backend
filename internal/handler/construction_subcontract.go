@@ -38,6 +38,10 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		       s.amount, s.currency, s.start_date, s.end_date,
 		       s.retention_pct, s.state, s.rating,
 		       s.contact_person, s.contact_phone, s.notes,
+		       COALESCE(s.address, ''), COALESCE(s.phone, ''),
+		       COALESCE(s.bank_name, ''), COALESCE(s.bank_account, ''),
+		       COALESCE(s.mfo, ''), COALESCE(s.stir, ''), COALESCE(s.okonh, ''),
+		       COALESCE(s.director_name, ''), COALESCE(s.chief_accountant_name, ''),
 		       s.created_by, s.created_date, s.updated_date,
 		       COALESCE(acts.completed_amount, 0) as completed_amount,
 		       COALESCE(acts.paid_amount, 0) as paid_amount
@@ -79,6 +83,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		var startDate, endDate sql.NullTime
 		var retentionPct, rating float64
 		var contactPerson, contactPhone sql.NullString
+		var address, phone, bankName, bankAccount, mfo, stir, okonh, directorName, chiefAccName string
 		var createdBy uuid.NullUUID
 		var createdDate, updatedDate time.Time
 		var state string
@@ -89,6 +94,8 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			&amount, &currency, &startDate, &endDate,
 			&retentionPct, &state, &rating,
 			&contactPerson, &contactPhone, &notes,
+			&address, &phone, &bankName, &bankAccount,
+			&mfo, &stir, &okonh, &directorName, &chiefAccName,
 			&createdBy, &createdDate, &updatedDate,
 			&completedAmount, &paidAmount,
 		); err != nil {
@@ -138,29 +145,38 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		}
 
 		items = append(items, map[string]interface{}{
-			"id":                 id,
-			"name":               name,
-			"project_id":         projectIDVal,
-			"partner_name":       nullStringVal(partnerName),
-			"work_description":   nullStringVal(workDescription),
-			"amount":             amount,
-			"currency":           currency,
-			"start_date":         nullTimeVal(startDate),
-			"end_date":           nullTimeVal(endDate),
-			"retention_pct":      retentionPct,
-			"state":              state,
-			"rating":             rating,
-			"contact_person":     nullStringVal(contactPerson),
-			"contact_phone":      nullStringVal(contactPhone),
-			"notes":              nullStringVal(notes),
-			"created_date":       createdDate,
-			"updated_date":       updatedDate,
-			"wbs_ids":            wbsIDs,
-			"building_ids":       buildingIDs,
-			"completed_amount":   completedAmount,
-			"paid_amount":        paidAmount,
-			"outstanding_amount": outstandingAmount,
-			"progress_pct":       round2(progressPct),
+			"id":                    id,
+			"name":                  name,
+			"project_id":            projectIDVal,
+			"partner_name":          nullStringVal(partnerName),
+			"work_description":      nullStringVal(workDescription),
+			"amount":                amount,
+			"currency":              currency,
+			"start_date":            nullTimeVal(startDate),
+			"end_date":              nullTimeVal(endDate),
+			"retention_pct":         retentionPct,
+			"state":                 state,
+			"rating":                rating,
+			"contact_person":        nullStringVal(contactPerson),
+			"contact_phone":         nullStringVal(contactPhone),
+			"notes":                 nullStringVal(notes),
+			"address":               address,
+			"phone":                 phone,
+			"bank_name":             bankName,
+			"bank_account":          bankAccount,
+			"mfo":                   mfo,
+			"stir":                  stir,
+			"okonh":                 okonh,
+			"director_name":         directorName,
+			"chief_accountant_name": chiefAccName,
+			"created_date":          createdDate,
+			"updated_date":          updatedDate,
+			"wbs_ids":               wbsIDs,
+			"building_ids":          buildingIDs,
+			"completed_amount":      completedAmount,
+			"paid_amount":           paidAmount,
+			"outstanding_amount":    outstandingAmount,
+			"progress_pct":          round2(progressPct),
 		})
 	}
 
@@ -194,6 +210,16 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		Notes           string  `json:"notes"`
 		WBSIDs          []int64 `json:"wbs_ids"`
 		BuildingIDs     []int64 `json:"building_ids"`
+		// Forma 2/3 identity block
+		Address             string `json:"address"`
+		Phone               string `json:"phone"`
+		BankName            string `json:"bank_name"`
+		BankAccount         string `json:"bank_account"`
+		MFO                 string `json:"mfo"`
+		STIR                string `json:"stir"`
+		OKONH               string `json:"okonh"`
+		DirectorName        string `json:"director_name"`
+		ChiefAccountantName string `json:"chief_accountant_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid input")
@@ -227,13 +253,22 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 			tenant_id, project_id, partner_name, name, work_description,
 			amount, currency, start_date, end_date, retention_pct,
 			state, rating, contact_person, contact_phone, notes,
+			address, phone, bank_name, bank_account, mfo, stir, okonh,
+			director_name, chief_accountant_name,
 			created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', 0, $11, $12, $13, $14, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', 0, $11, $12, $13,
+			$14, $15, $16, $17, $18, $19, $20, $21, $22,
+			$23, NOW(), NOW())
 		RETURNING id
 	`, tenantID, projectID, nullStringFromVal(req.PartnerName), name, nullStringFromVal(req.WorkDescription),
 		req.Amount, currency, startDate, endDate, req.RetentionPct,
 		nullStringFromVal(req.ContactPerson), nullStringFromVal(req.ContactPhone),
-		nullStringFromVal(req.Notes), userID,
+		nullStringFromVal(req.Notes),
+		nullStringFromVal(req.Address), nullStringFromVal(req.Phone),
+		nullStringFromVal(req.BankName), nullStringFromVal(req.BankAccount),
+		nullStringFromVal(req.MFO), nullStringFromVal(req.STIR), nullStringFromVal(req.OKONH),
+		nullStringFromVal(req.DirectorName), nullStringFromVal(req.ChiefAccountantName),
+		userID,
 	).Scan(&id)
 
 	if err != nil {
@@ -282,6 +317,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 	var name, state, currency string
 	var partnerNameVal sql.NullString
 	var workDescription, notes, contactPerson, contactPhone sql.NullString
+	var address, phone, bankName, bankAccount, mfo, stir, okonh, directorName, chiefAccName sql.NullString
 	var amount, retentionPct, rating float64
 	var startDate, endDate sql.NullTime
 	var createdBy uuid.NullUUID
@@ -292,6 +328,8 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		       s.amount, s.currency, s.start_date, s.end_date,
 		       s.retention_pct, s.state, s.rating,
 		       s.contact_person, s.contact_phone, s.notes,
+		       s.address, s.phone, s.bank_name, s.bank_account,
+		       s.mfo, s.stir, s.okonh, s.director_name, s.chief_accountant_name,
 		       s.created_by, s.created_date, s.updated_date
 		FROM construction_subcontract s
 		WHERE s.id = $1 AND s.tenant_id = $2
@@ -300,6 +338,8 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		&amount, &currency, &startDate, &endDate,
 		&retentionPct, &state, &rating,
 		&contactPerson, &contactPhone, &notes,
+		&address, &phone, &bankName, &bankAccount,
+		&mfo, &stir, &okonh, &directorName, &chiefAccName,
 		&createdBy, &createdDate, &updatedDate,
 	)
 	if err == sql.ErrNoRows {
@@ -339,25 +379,34 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 	}
 
 	response.Success(c, map[string]interface{}{
-		"id":               id,
-		"name":             name,
-		"project_id":       projectIDVal,
-		"partner_name":     nullStringVal(partnerNameVal),
-		"work_description": nullStringVal(workDescription),
-		"amount":           amount,
-		"currency":         currency,
-		"start_date":       nullTimeVal(startDate),
-		"end_date":         nullTimeVal(endDate),
-		"retention_pct":    retentionPct,
-		"state":            state,
-		"rating":           rating,
-		"contact_person":   nullStringVal(contactPerson),
-		"contact_phone":    nullStringVal(contactPhone),
-		"notes":            nullStringVal(notes),
-		"created_date":     createdDate,
-		"updated_date":     updatedDate,
-		"wbs_ids":          wbsIDs,
-		"building_ids":     buildingIDs,
+		"id":                    id,
+		"name":                  name,
+		"project_id":            projectIDVal,
+		"partner_name":          nullStringVal(partnerNameVal),
+		"work_description":      nullStringVal(workDescription),
+		"amount":                amount,
+		"currency":              currency,
+		"start_date":            nullTimeVal(startDate),
+		"end_date":              nullTimeVal(endDate),
+		"retention_pct":         retentionPct,
+		"state":                 state,
+		"rating":                rating,
+		"contact_person":        nullStringVal(contactPerson),
+		"contact_phone":         nullStringVal(contactPhone),
+		"notes":                 nullStringVal(notes),
+		"address":               nullStringVal(address),
+		"phone":                 nullStringVal(phone),
+		"bank_name":             nullStringVal(bankName),
+		"bank_account":          nullStringVal(bankAccount),
+		"mfo":                   nullStringVal(mfo),
+		"stir":                  nullStringVal(stir),
+		"okonh":                 nullStringVal(okonh),
+		"director_name":         nullStringVal(directorName),
+		"chief_accountant_name": nullStringVal(chiefAccName),
+		"created_date":          createdDate,
+		"updated_date":          updatedDate,
+		"wbs_ids":               wbsIDs,
+		"building_ids":          buildingIDs,
 	})
 }
 
@@ -397,6 +446,16 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 		Notes           *string  `json:"notes"`
 		WBSIDs          []int64  `json:"wbs_ids"`
 		BuildingIDs     []int64  `json:"building_ids"`
+		// Forma 2/3 identity block
+		Address             *string `json:"address"`
+		Phone               *string `json:"phone"`
+		BankName            *string `json:"bank_name"`
+		BankAccount         *string `json:"bank_account"`
+		MFO                 *string `json:"mfo"`
+		STIR                *string `json:"stir"`
+		OKONH               *string `json:"okonh"`
+		DirectorName        *string `json:"director_name"`
+		ChiefAccountantName *string `json:"chief_accountant_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid input")
@@ -469,6 +528,51 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
 		args = append(args, nullStringFromVal(*req.Notes))
+	}
+	if req.Address != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("address = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.Address))
+	}
+	if req.Phone != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("phone = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.Phone))
+	}
+	if req.BankName != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("bank_name = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.BankName))
+	}
+	if req.BankAccount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("bank_account = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.BankAccount))
+	}
+	if req.MFO != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("mfo = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.MFO))
+	}
+	if req.STIR != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("stir = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.STIR))
+	}
+	if req.OKONH != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("okonh = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.OKONH))
+	}
+	if req.DirectorName != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("director_name = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.DirectorName))
+	}
+	if req.ChiefAccountantName != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("chief_accountant_name = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.ChiefAccountantName))
 	}
 
 	if len(updates) == 0 && req.WBSIDs == nil && req.BuildingIDs == nil {
