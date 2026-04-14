@@ -146,6 +146,22 @@ func (h *Handler) CompleteSplitOutput(c *gin.Context) {
 		totalFinishedCost += totalCost
 	}
 
+	// Calculate leftover: total produced - total split weight
+	var totalSplitWeight float64
+	for _, out := range outputs {
+		totalSplitWeight += out.TotalWeightKg
+	}
+	leftover := quantityProduced - totalSplitWeight
+	if leftover > 0.001 { // small threshold for float precision
+		// Add leftover back to inventory as the original bulk product
+		leftoverCost := leftover * costPerKg
+		if defaultWarehouseID != nil {
+			h.receiveSplitProduct(tenantID, organizationID, poID, productID, defaultWarehouseID, userID, leftover, costPerKg, now)
+			h.log.Info("CompleteSplitOutput: leftover added to inventory", "product_id", productID, "leftover_qty", leftover, "warehouse_id", defaultWarehouseID)
+		}
+		totalFinishedCost += leftoverCost
+	}
+
 	// Create journal entry (WIP → Finished Goods) for total split output cost
 	if totalFinishedCost > 0 {
 		h.createSplitOutputJournalEntry(poID, tenantID, organizationID, productID, userID, totalFinishedCost, now)
