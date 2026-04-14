@@ -1586,6 +1586,18 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		return 0
 	}
 
+	// Create inventory lot for FIFO tracking
+	lotID := uuid.New()
+	lotNumber := fmt.Sprintf("MFG-%s", poID.String()[:8])
+	tx.Exec(`
+		INSERT INTO inventory_lots (
+			id, tenant_id, product_id, warehouse_id, lot_number,
+			received_date, initial_quantity, remaining_quantity,
+			unit_cost, purchase_order_id, status, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)
+	`, lotID, tenantID, productID, warehouseID, lotNumber,
+		now, producedQty, unitCost, poID)
+
 	if commitErr := tx.Commit(); commitErr != nil {
 		h.log.Error("receiveFinishedGoods: failed to commit transaction", "error", commitErr, "po_id", poID)
 	} else {

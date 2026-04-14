@@ -2800,6 +2800,18 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// Create inventory lot for FIFO tracking
+	lotID := uuid.New()
+	lotNumber := fmt.Sprintf("MFG-%s", id.String()[:8])
+	tx.Exec(`
+		INSERT INTO inventory_lots (
+			id, tenant_id, product_id, warehouse_id, lot_number,
+			received_date, initial_quantity, remaining_quantity,
+			unit_cost, purchase_order_id, status, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)
+	`, lotID, tenantID, productID, warehouseID, lotNumber,
+		now, producedQty, unitCost, id)
+
 	// Note: BOM component consumption is handled in StartProductionOrder (when production begins)
 
 	if commitErr := tx.Commit(); commitErr != nil {
