@@ -650,33 +650,56 @@ func htmlToPDF(htmlContent string) ([]byte, error) {
 		}
 	}
 
-	// Fallback to weasyprint (check common paths)
-	weasyprintPaths := []string{"weasyprint", "/Users/behruzniyozov/.pyenv/versions/3.12.12/bin/weasyprint", "/usr/local/bin/weasyprint", "/opt/homebrew/bin/weasyprint"}
-	var wpPath string
-	for _, p := range weasyprintPaths {
-		if found, err := exec.LookPath(p); err == nil {
-			wpPath = found
-			break
-		}
+	// Fallback to weasyprint. IMPORTANT: absolute paths come FIRST so we bypass
+	// any pyenv shim in PATH (the shim exits 127 when the pinned Python version
+	// isn't installed, e.g. when ~/.python-version pins an absent 3.13). Try each
+	// candidate by actually running it — LookPath alone isn't enough because the
+	// shim resolves successfully but fails at exec time.
+	weasyprintCandidates := []string{
+		// Common pyenv python version paths (both Intel and Apple Silicon homes)
+		os.ExpandEnv("$HOME/.pyenv/versions/3.12.12/bin/weasyprint"),
+		os.ExpandEnv("$HOME/.pyenv/versions/3.12/bin/weasyprint"),
+		os.ExpandEnv("$HOME/.pyenv/versions/3.11/bin/weasyprint"),
+		// Legacy hard-coded path (kept for backward compat)
+		"/Users/behruzniyozov/.pyenv/versions/3.12.12/bin/weasyprint",
+		// System / Homebrew installs
+		"/opt/homebrew/bin/weasyprint",
+		"/usr/local/bin/weasyprint",
+		// Last resort: the PATH-resolved one (may be a pyenv shim)
+		"weasyprint",
 	}
-	if wpPath != "" {
-		path := wpPath
-		tmpPDF, err := os.CreateTemp("", "report-*.pdf")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create temp PDF file: %w", err)
-		}
-		tmpPDF.Close()
-		defer os.Remove(tmpPDF.Name())
 
+	tmpPDF, err := os.CreateTemp("", "report-*.pdf")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp PDF file: %w", err)
+	}
+	tmpPDF.Close()
+	defer os.Remove(tmpPDF.Name())
+
+	var lastErr error
+	var lastStderr string
+	for _, candidate := range weasyprintCandidates {
+		path, lookErr := exec.LookPath(candidate)
+		if lookErr != nil {
+			continue
+		}
 		var stderr bytes.Buffer
 		cmd := exec.Command(path, tmpHTML.Name(), tmpPDF.Name())
+		// Strip any PYENV_VERSION env vars so a pinned-but-missing version in a
+		// dotfile does not break a fully-qualified binary we're invoking directly.
+		cmd.Env = append(os.Environ(), "PYENV_VERSION=")
 		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("weasyprint failed: %w, stderr: %s", err, stderr.String())
+		if runErr := cmd.Run(); runErr == nil {
+			return os.ReadFile(tmpPDF.Name())
+		} else {
+			lastErr = runErr
+			lastStderr = stderr.String()
 		}
-		return os.ReadFile(tmpPDF.Name())
 	}
 
+	if lastErr != nil {
+		return nil, fmt.Errorf("weasyprint failed: %w, stderr: %s", lastErr, lastStderr)
+	}
 	return nil, fmt.Errorf("no PDF generator found: install wkhtmltopdf or weasyprint")
 }
 

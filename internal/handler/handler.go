@@ -1679,6 +1679,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/buildings/:building_id/files", h.ListBuildingFiles)
 		constructionProjects.POST("/:id/buildings/:building_id/files", h.perm.Require("construction", "project", "create"), h.CreateBuildingFile)
 		constructionProjects.DELETE("/:id/buildings/:building_id/files/:file_id", h.perm.Require("construction", "project", "delete"), h.DeleteBuildingFile)
+		// Project Files
+		constructionProjects.GET("/:id/files", h.ListProjectFiles)
+		constructionProjects.POST("/:id/files", h.perm.Require("construction", "project", "create"), h.CreateProjectFile)
+		constructionProjects.DELETE("/:id/files/:file_id", h.perm.Require("construction", "project", "delete"), h.DeleteProjectFile)
 		// Smeta Sections
 		constructionProjects.GET("/:id/sections", h.ListSmetaSections)
 		constructionProjects.POST("/:id/sections", h.perm.Require("construction", "smeta", "create"), h.CreateSmetaSection)
@@ -1764,6 +1768,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Acts (Forma 2 / Forma 3 / Forma 19)
 		constructionProjects.GET("/:id/acts", h.ListConstructionActs)
 		constructionProjects.POST("/:id/acts", h.perm.Require("construction", "project", "update"), h.CreateConstructionAct)
+		constructionProjects.POST("/:id/acts/generate-ks2/preview", h.perm.Require("construction", "project", "read"), h.PreviewAutoGenerateKS2)
 		constructionProjects.POST("/:id/acts/generate-ks2", h.perm.Require("construction", "project", "update"), h.AutoGenerateKS2)
 		constructionProjects.POST("/:id/acts/generate-ks3", h.perm.Require("construction", "project", "update"), h.GenerateForma3)
 

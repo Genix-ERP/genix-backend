@@ -191,6 +191,17 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 		PeriodTo         string  `json:"period_to"`
 		Notes            string  `json:"notes"`
 		VatPct           float64 `json:"vat_pct"`
+		// Forma 2 cost-split aggregates (optional — if omitted we derive from lines)
+		F2LaborTotal       float64 `json:"f2_labor_total"`
+		F2EquipmentTotal   float64 `json:"f2_equipment_total"`
+		F2MaterialsTotal   float64 `json:"f2_materials_total"`
+		F2CablesTotal      float64 `json:"f2_cables_total"`
+		F2TransportPct     float64 `json:"f2_transport_pct"`
+		F2OtherPct         float64 `json:"f2_other_pct"`
+		F2MaterialsReturn  float64 `json:"f2_materials_returned"`
+		PeriodMonthFrom    int     `json:"period_month_from"`
+		PeriodMonthTo      int     `json:"period_month_to"`
+		PeriodYear         int     `json:"period_year"`
 		// Forma 19 fields
 		StageID          int64   `json:"stage_id"`
 		LocationAxes     string  `json:"location_axes"`
@@ -206,14 +217,23 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 			CertificateURL string `json:"certificate_url"`
 		} `json:"materials_json"`
 		Lines []struct {
-			WBSID          int64   `json:"wbs_id"`
-			EstimateLineID int64   `json:"estimate_line_id"`
-			Name           string  `json:"name"`
-			UOM            string  `json:"uom"`
-			Quantity       float64 `json:"quantity"`
-			QtySmeta       float64 `json:"qty_smeta"`
-			UnitRate       float64 `json:"unit_rate"`
-			Note           string  `json:"note"`
+			WBSID             int64   `json:"wbs_id"`
+			EstimateLineID    int64   `json:"estimate_line_id"`
+			Name              string  `json:"name"`
+			UOM               string  `json:"uom"`
+			Quantity          float64 `json:"quantity"`
+			QtySmeta          float64 `json:"qty_smeta"`
+			UnitRate          float64 `json:"unit_rate"`
+			Note              string  `json:"note"`
+			// Forma 2 per-line hierarchy + cost split (all optional)
+			LineNumberDisplay string  `json:"line_number_display"`
+			IsSectionHeader   bool    `json:"is_section_header"`
+			SectionName       string  `json:"section_name"`
+			NormCode          string  `json:"norm_code"`
+			LaborAmount       float64 `json:"labor_amount"`
+			EquipmentAmount   float64 `json:"equipment_amount"`
+			MaterialsAmount   float64 `json:"materials_amount"`
+			CablesAmount      float64 `json:"cables_amount"`
 		} `json:"lines"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -367,18 +387,32 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 
 	// Insert lines and calculate total
 	var totalAmount float64
+	var sumLabor, sumEquip, sumMaterials, sumCables float64
 	for i, line := range req.Lines {
 		lineTotal := line.Quantity * line.UnitRate
-		totalAmount += lineTotal
+		// Section-header rows don't contribute to totals.
+		if !line.IsSectionHeader {
+			totalAmount += lineTotal
+		}
+		sumLabor += line.LaborAmount
+		sumEquip += line.EquipmentAmount
+		sumMaterials += line.MaterialsAmount
+		sumCables += line.CablesAmount
 		_, err := tx.Exec(`
 			INSERT INTO construction_act_line (
 				act_id, wbs_id, estimate_line_id, name, uom,
 				quantity, unit_rate, total_amount, sort_order,
-				qty_smeta, note
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				qty_smeta, note,
+				line_number_display, is_section_header, section_name, norm_code,
+				labor_amount, equipment_amount, materials_amount, cables_amount
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+				$12, $13, $14, $15,
+				$16, $17, $18, $19)
 		`, actID, nullInt64FromVal(line.WBSID), nullInt64FromVal(line.EstimateLineID),
 			line.Name, line.UOM, line.Quantity, line.UnitRate, lineTotal, i+1,
 			line.QtySmeta, nullStringFromVal(line.Note),
+			nullStringFromVal(line.LineNumberDisplay), line.IsSectionHeader, nullStringFromVal(line.SectionName), nullStringFromVal(line.NormCode),
+			line.LaborAmount, line.EquipmentAmount, line.MaterialsAmount, line.CablesAmount,
 		)
 		if err != nil {
 			h.log.Error("Failed to create act line", "error", err)
@@ -387,11 +421,39 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 		}
 	}
 
-	// Update total with VAT
+	// Update total with VAT and Forma-2 cost-split snapshot.
+	// If caller didn't provide explicit totals, derive them from per-line values.
+	if req.F2LaborTotal == 0 {
+		req.F2LaborTotal = sumLabor
+	}
+	if req.F2EquipmentTotal == 0 {
+		req.F2EquipmentTotal = sumEquip
+	}
+	if req.F2MaterialsTotal == 0 {
+		req.F2MaterialsTotal = sumMaterials
+	}
+	if req.F2CablesTotal == 0 {
+		req.F2CablesTotal = sumCables
+	}
+	if req.F2TransportPct == 0 {
+		req.F2TransportPct = 5
+	}
+	if req.F2OtherPct == 0 {
+		req.F2OtherPct = 17
+	}
 	vatAmount := totalAmount * req.VatPct / 100
 	totalWithVat := totalAmount + vatAmount
-	tx.Exec(`UPDATE construction_act SET amount_total = $1, vat_amount = $2, amount_total_with_vat = $3 WHERE id = $4`,
-		totalAmount, vatAmount, totalWithVat, actID)
+	tx.Exec(`UPDATE construction_act SET
+			amount_total = $1, vat_amount = $2, amount_total_with_vat = $3,
+			f2_labor_total = $4, f2_equipment_total = $5, f2_materials_total = $6, f2_cables_total = $7,
+			f2_transport_pct = $8, f2_other_pct = $9, f2_materials_returned = $10,
+			period_month_from = NULLIF($11, 0), period_month_to = NULLIF($12, 0), period_year = NULLIF($13, 0)
+		WHERE id = $14`,
+		totalAmount, vatAmount, totalWithVat,
+		req.F2LaborTotal, req.F2EquipmentTotal, req.F2MaterialsTotal, req.F2CablesTotal,
+		req.F2TransportPct, req.F2OtherPct, req.F2MaterialsReturn,
+		req.PeriodMonthFrom, req.PeriodMonthTo, req.PeriodYear,
+		actID)
 
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit act", "error", err)
@@ -550,13 +612,17 @@ func (h *Handler) GetConstructionAct(c *gin.Context) {
 	json.Unmarshal(photosRaw, &photos)
 	json.Unmarshal(materialsRaw, &materials)
 
-	// Get lines with new fields
+	// Get lines with new fields (Forma 2 hierarchy + cost split)
 	lineRows, err := h.db.Query(`
 		SELECT al.id, al.wbs_id, al.estimate_line_id, al.name, al.uom,
 		       al.quantity, al.unit_rate, al.total_amount, al.sort_order,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name,
-		       al.qty_smeta, al.note
+		       al.qty_smeta, al.note,
+		       COALESCE(al.line_number_display, ''), COALESCE(al.is_section_header, FALSE),
+		       COALESCE(al.section_name, ''), COALESCE(al.norm_code, ''),
+		       COALESCE(al.labor_amount, 0), COALESCE(al.equipment_amount, 0),
+		       COALESCE(al.materials_amount, 0), COALESCE(al.cables_amount, 0)
 		FROM construction_act_line al
 		LEFT JOIN construction_wbs w ON w.id = al.wbs_id
 		WHERE al.act_id = $1
@@ -573,27 +639,41 @@ func (h *Handler) GetConstructionAct(c *gin.Context) {
 			var sortOrder int
 			var qtySmeta sql.NullFloat64
 			var lineNote sql.NullString
+			var lineNumberDisplay, sectionName, normCode string
+			var isSectionHeader bool
+			var laborAmt, equipAmt, materialsAmt, cablesAmt float64
 
 			if lineRows.Scan(
 				&lineID, &wbsID, &estimateLineID, &lineName, &lineUOM,
 				&qty, &unitRate, &lineTotal, &sortOrder,
 				&wbsCode, &wbsName,
 				&qtySmeta, &lineNote,
+				&lineNumberDisplay, &isSectionHeader,
+				&sectionName, &normCode,
+				&laborAmt, &equipAmt, &materialsAmt, &cablesAmt,
 			) == nil {
 				lines = append(lines, map[string]interface{}{
-					"id":               lineID,
-					"wbs_id":           nullInt64Val(wbsID),
-					"estimate_line_id": nullInt64Val(estimateLineID),
-					"name":             lineName,
-					"uom":              lineUOM,
-					"quantity":         qty,
-					"unit_rate":        unitRate,
-					"total_amount":     lineTotal,
-					"sort_order":       sortOrder,
-					"wbs_code":         wbsCode,
-					"wbs_name":         wbsName,
-					"qty_smeta":        nullFloat64Val(qtySmeta),
-					"note":             nullStringVal(lineNote),
+					"id":                  lineID,
+					"wbs_id":              nullInt64Val(wbsID),
+					"estimate_line_id":    nullInt64Val(estimateLineID),
+					"name":                lineName,
+					"uom":                 lineUOM,
+					"quantity":            qty,
+					"unit_rate":           unitRate,
+					"total_amount":        lineTotal,
+					"sort_order":          sortOrder,
+					"wbs_code":            wbsCode,
+					"wbs_name":            wbsName,
+					"qty_smeta":           nullFloat64Val(qtySmeta),
+					"note":                nullStringVal(lineNote),
+					"line_number_display": lineNumberDisplay,
+					"is_section_header":   isSectionHeader,
+					"section_name":        sectionName,
+					"norm_code":           normCode,
+					"labor_amount":        laborAmt,
+					"equipment_amount":    equipAmt,
+					"materials_amount":    materialsAmt,
+					"cables_amount":       cablesAmt,
 				})
 			}
 		}
@@ -919,6 +999,172 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 		"amount_total_with_vat": totalWithVat,
 		"lines_count":           len(lineDataList),
 		"message":               "KS-2 act auto-generated successfully",
+	})
+}
+
+// PreviewAutoGenerateKS2 computes what an auto-generated KS-2 would contain
+// without creating any database records. Used to show a confirmation dialog
+// before the user commits to creating the act.
+func (h *Handler) PreviewAutoGenerateKS2(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req struct {
+		SubcontractID int64  `json:"subcontract_id"`
+		PeriodFrom    string `json:"period_from" binding:"required"`
+		PeriodTo      string `json:"period_to" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
+		return
+	}
+
+	wbsIDs := []int64{}
+	if req.SubcontractID > 0 {
+		wbsRows, err := h.db.Query(
+			`SELECT wbs_id FROM construction_subcontract_wbs WHERE subcontract_id = $1`, req.SubcontractID)
+		if err != nil {
+			response.InternalError(c, "Failed to get subcontract WBS items")
+			return
+		}
+		defer wbsRows.Close()
+		for wbsRows.Next() {
+			var wbsID int64
+			if wbsRows.Scan(&wbsID) == nil {
+				wbsIDs = append(wbsIDs, wbsID)
+			}
+		}
+		if len(wbsIDs) == 0 {
+			response.BadRequest(c, "Subpudratchi WBS elementlariga bog'lanmagan")
+			return
+		}
+	} else {
+		wbsRows, err := h.db.Query(
+			`SELECT id FROM construction_wbs WHERE project_id = $1 AND tenant_id = $2 AND is_active = true`,
+			projectID, tenantID)
+		if err != nil {
+			response.InternalError(c, "Failed to get project WBS items")
+			return
+		}
+		defer wbsRows.Close()
+		for wbsRows.Next() {
+			var wbsID int64
+			if wbsRows.Scan(&wbsID) == nil {
+				wbsIDs = append(wbsIDs, wbsID)
+			}
+		}
+		if len(wbsIDs) == 0 {
+			response.BadRequest(c, "Loyihada WBS elementlari topilmadi")
+			return
+		}
+	}
+
+	type previewLine struct {
+		WBSID          int64   `json:"wbs_id"`
+		EstimateLineID int64   `json:"estimate_line_id"`
+		Name           string  `json:"name"`
+		UOM            string  `json:"uom"`
+		Quantity       float64 `json:"quantity"`
+		QtySmeta       float64 `json:"qty_smeta"`
+		UnitRate       float64 `json:"unit_rate"`
+		LineTotal      float64 `json:"line_total"`
+	}
+
+	lines := []previewLine{}
+	var totalAmount float64
+
+	for _, wbsID := range wbsIDs {
+		var totalDone float64
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(quantity_done), 0)
+			FROM construction_daily_log
+			WHERE wbs_id = $1 AND tenant_id = $2 AND date >= $3 AND date <= $4
+		`, wbsID, tenantID, req.PeriodFrom, req.PeriodTo).Scan(&totalDone)
+
+		if totalDone <= 0 {
+			continue
+		}
+
+		rows, err := h.db.Query(`
+			SELECT el.id, el.name, el.uom, el.unit_rate, COALESCE(el.quantity, 0)
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE el.wbs_id = $1 AND e.is_current = true AND e.tenant_id = $2
+			LIMIT 1
+		`, wbsID, tenantID)
+		if err != nil {
+			continue
+		}
+		for rows.Next() {
+			var elID int64
+			var elName, elUOM string
+			var unitRate, smetaQty float64
+			if rows.Scan(&elID, &elName, &elUOM, &unitRate, &smetaQty) == nil {
+				lineTotal := totalDone * unitRate
+				totalAmount += lineTotal
+				lines = append(lines, previewLine{
+					WBSID:          wbsID,
+					EstimateLineID: elID,
+					Name:           elName,
+					UOM:            elUOM,
+					Quantity:       totalDone,
+					QtySmeta:       smetaQty,
+					UnitRate:       unitRate,
+					LineTotal:      lineTotal,
+				})
+			}
+		}
+		rows.Close()
+	}
+
+	if len(lines) == 0 {
+		if req.SubcontractID > 0 {
+			response.BadRequest(c, "Tanlangan davr uchun bu subpudratchi bo'yicha ishlar topilmadi")
+		} else {
+			response.BadRequest(c, "Tanlangan davr uchun ishlar topilmadi")
+		}
+		return
+	}
+
+	var existingCount int
+	h.db.QueryRow(`SELECT COUNT(*) FROM construction_act WHERE project_id = $1 AND tenant_id = $2 AND act_type = 'ks2'`,
+		projectID, tenantID).Scan(&existingCount)
+	proposedName := fmt.Sprintf("KS2-%03d", existingCount+1)
+
+	var actNumber int
+	if req.SubcontractID > 0 {
+		h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id = $1 AND act_type = 'ks2' AND tenant_id = $2`,
+			req.SubcontractID, tenantID).Scan(&actNumber)
+	} else {
+		h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id IS NULL AND act_type = 'ks2' AND project_id = $1 AND tenant_id = $2`,
+			projectID, tenantID).Scan(&actNumber)
+	}
+
+	vatPct := 12.0
+	vatAmount := totalAmount * vatPct / 100
+	totalWithVat := totalAmount + vatAmount
+
+	response.Success(c, map[string]interface{}{
+		"proposed_name":         proposedName,
+		"proposed_act_number":   actNumber,
+		"period_from":           req.PeriodFrom,
+		"period_to":             req.PeriodTo,
+		"subcontract_id":        req.SubcontractID,
+		"lines":                 lines,
+		"lines_count":           len(lines),
+		"amount_total":          totalAmount,
+		"vat_pct":               vatPct,
+		"vat_amount":            vatAmount,
+		"amount_total_with_vat": totalWithVat,
 	})
 }
 
@@ -1702,15 +1948,39 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 		projectID).Scan(&projectName, &projectAddress, &clientName)
 
 	if format == "xlsx" {
-		// Return JSON data for frontend ExcelJS export
-		response.Success(c, map[string]interface{}{
-			"format":       "xlsx",
-			"project_name": projectName,
-			"address":      projectAddress,
-			"client_name":  clientName,
-			"act_type":     actType,
-			"act_id":       actID,
-		})
+		// Server-side XLSX generation matching reference industry format.
+		var (
+			xlsxBytes []byte
+			xlsxErr   error
+		)
+		switch actType {
+		case "ks2":
+			xlsxBytes, xlsxErr = h.GenerateForma2XLSXBytes(actID, tenantID)
+		case "ks3":
+			xlsxBytes, xlsxErr = h.GenerateForma3XLSXBytes(actID, tenantID)
+		case "hidden_work":
+			xlsxBytes, xlsxErr = h.GenerateForma19XLSXBytes(actID, tenantID)
+		default:
+			// Fallback: surface JSON metadata so the frontend can still render
+			// unsupported act types locally.
+			response.Success(c, map[string]interface{}{
+				"format":       "xlsx",
+				"project_name": projectName,
+				"address":      projectAddress,
+				"client_name":  clientName,
+				"act_type":     actType,
+				"act_id":       actID,
+			})
+			return
+		}
+		if xlsxErr != nil {
+			h.log.Error("Failed to generate XLSX", "error", xlsxErr, "actType", actType, "actID", actID)
+			response.InternalError(c, "Failed to generate XLSX")
+			return
+		}
+		filename := fmt.Sprintf("act_%s_%d.xlsx", actType, actID)
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+		c.Data(http.StatusOK, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsxBytes)
 		return
 	}
 

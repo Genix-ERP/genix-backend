@@ -615,11 +615,21 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 
 	resourceType := c.Query("type") // "labor", "equipment", "material", or empty for all
 
+	// Aggregate across duplicate names by taking the MAX rate — so a resource
+	// that has a non-zero rate in at least one estimate line is returned
+	// with that rate (avoids picking a 0-rate skeleton row).
 	query := `
-		SELECT DISTINCT ON (UPPER(el.name))
-			el.id, el.name, el.uom, el.quantity,
-			el.material_rate, el.labor_rate, el.equipment_rate,
-			el.unit_rate, COALESCE(el.code, ''), COALESCE(el.resource_type, '')
+		SELECT
+			MIN(el.id) AS id,
+			el.name,
+			MAX(el.uom) AS uom,
+			MAX(el.quantity) AS quantity,
+			MAX(el.material_rate) AS material_rate,
+			MAX(el.labor_rate) AS labor_rate,
+			MAX(el.equipment_rate) AS equipment_rate,
+			MAX(el.unit_rate) AS unit_rate,
+			MAX(COALESCE(el.code, '')) AS code,
+			MAX(COALESCE(el.resource_type, '')) AS resource_type
 		FROM construction_estimate_line el
 		JOIN construction_estimate e ON e.id = el.estimate_id
 		WHERE e.tenant_id = $1
@@ -649,7 +659,7 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 		}
 	}
 
-	query += ` ORDER BY UPPER(el.name), el.id LIMIT 500`
+	query += ` GROUP BY el.name ORDER BY UPPER(el.name) LIMIT 500`
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
