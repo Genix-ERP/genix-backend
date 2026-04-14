@@ -1644,7 +1644,7 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 	baseQuery := `
 		SELECT b.id, b.code, b.name, b.product_id, b.bom_type, b.quantity, b.version,
 			   b.is_active, b.is_default, b.effective_date, b.expiry_date, b.notes,
-			   b.created_at, b.warehouse_id, w.name as warehouse_name,
+			   b.created_at,
 			   p.code as product_code, p.name as product_name,
 			   (SELECT COUNT(*) FROM bom_lines bl WHERE bl.bom_id = b.id) as line_count,
 			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(NULLIF(cp.cost_price, 0), cp.list_price, 0) * (1 + bl2.scrap_percent/100))
@@ -1655,7 +1655,6 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			     WHERE bo.bom_id = b.id), 0) as total_cost
 		FROM product_boms b
 		JOIN products p ON b.product_id = p.id
-		LEFT JOIN warehouses w ON b.warehouse_id = w.id
 		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM product_boms b WHERE b.tenant_id = $1 AND b.deleted_at IS NULL`
@@ -1723,13 +1722,11 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		var b entity.BOMResponse
 		var effectiveDate, expiryDate sql.NullTime
 		var notes sql.NullString
-		var warehouseID sql.NullString
-		var warehouseName sql.NullString
 
 		err := rows.Scan(
 			&b.ID, &b.Code, &b.Name, &b.ProductID, &b.BOMType, &b.Quantity, &b.Version,
 			&b.IsActive, &b.IsDefault, &effectiveDate, &expiryDate, &notes,
-			&b.CreatedAt, &warehouseID, &warehouseName,
+			&b.CreatedAt,
 			&b.ProductCode, &b.ProductName, &b.LineCount, &b.TotalCost,
 		)
 		if err != nil {
@@ -1745,12 +1742,16 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			s := expiryDate.Time.Format("2006-01-02")
 			b.ExpiryDate = &s
 		}
-		if warehouseID.Valid {
-			wid, _ := uuid.Parse(warehouseID.String)
+		// Load warehouse_id separately (column may not exist yet if migration 314 hasn't run)
+		var whID sql.NullString
+		var whName sql.NullString
+		h.db.QueryRow(`SELECT b2.warehouse_id, w.name FROM product_boms b2 LEFT JOIN warehouses w ON w.id = b2.warehouse_id WHERE b2.id = $1`, b.ID).Scan(&whID, &whName)
+		if whID.Valid {
+			wid, _ := uuid.Parse(whID.String)
 			b.WarehouseID = &wid
 		}
-		if warehouseName.Valid {
-			b.WarehouseName = &warehouseName.String
+		if whName.Valid {
+			b.WarehouseName = &whName.String
 		}
 
 		boms = append(boms, &b)
@@ -1978,6 +1979,7 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		}
 	}
 
+	// Try INSERT with warehouse_id first; fall back without if column doesn't exist yet
 	_, err = tx.Exec(`
 		INSERT INTO product_boms (
 			id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
@@ -1988,9 +1990,29 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		input.IsDefault, effectiveDate, expiryDate, notes, warehouseID, userID, now)
 
 	if err != nil {
-		h.log.Error("Failed to create BOM", "error", err)
-		response.InternalError(c, "Failed to create BOM")
-		return
+		// Retry without warehouse_id if column doesn't exist
+		tx.Rollback()
+		tx, _ = h.db.Begin()
+		if input.IsDefault {
+			tx.Exec("UPDATE product_boms SET is_default = false WHERE product_id = $1 AND tenant_id = $2", productID, tenantID)
+		}
+		_, err = tx.Exec(`
+			INSERT INTO product_boms (
+				id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
+				is_active, is_default, effective_date, expiry_date, notes,
+				created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $14)
+		`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
+			input.IsDefault, effectiveDate, expiryDate, notes, userID, now)
+		if err != nil {
+			h.log.Error("Failed to create BOM", "error", err)
+			response.InternalError(c, "Failed to create BOM")
+			return
+		}
+		// Set warehouse after if column exists
+		if warehouseID != nil {
+			h.db.Exec(`UPDATE product_boms SET warehouse_id = $1 WHERE id = $2`, warehouseID, bomID)
+		}
 	}
 
 	// Create lines
