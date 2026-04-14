@@ -941,6 +941,57 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 			continue
 		}
 
+		// FIFO: consume from oldest lots first
+		remainingToConsume := action.QtyToShip
+		var fifoCostPerUnit float64
+		lotRows, lotErr := h.db.Query(`
+			SELECT id, remaining_quantity, unit_cost FROM inventory_lots
+			WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+			ORDER BY received_date ASC
+		`, tenantID, action.Line.ProductID)
+		if lotErr == nil {
+			for lotRows.Next() && remainingToConsume > 0 {
+				var lotID uuid.UUID
+				var lotQty, lotCost float64
+				lotRows.Scan(&lotID, &lotQty, &lotCost)
+
+				consume := remainingToConsume
+				if consume > lotQty {
+					consume = lotQty
+				}
+				remainingToConsume -= consume
+				fifoCostPerUnit = lotCost // track last consumed lot's cost
+
+				h.db.Exec(`UPDATE inventory_lots SET remaining_quantity = remaining_quantity - $1, updated_at = $2 WHERE id = $3`,
+					consume, now, lotID)
+
+				// Mark lot as depleted if empty
+				h.db.Exec(`UPDATE inventory_lots SET status = 'depleted' WHERE id = $1 AND remaining_quantity <= 0`, lotID)
+			}
+			lotRows.Close()
+		}
+
+		// Update product cost_price to the next available lot's cost (FIFO)
+		var nextLotCost float64
+		if h.db.QueryRow(`
+			SELECT unit_cost FROM inventory_lots
+			WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+			ORDER BY received_date ASC LIMIT 1
+		`, tenantID, action.Line.ProductID).Scan(&nextLotCost) == nil && nextLotCost > 0 {
+			h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+				nextLotCost, now, action.Line.ProductID, tenantID)
+			// Also update org-specific settings
+			h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = (
+				SELECT organization_id FROM inventory WHERE id = $4 LIMIT 1
+			)`, nextLotCost, now, action.Line.ProductID, stock.InventoryID)
+		}
+
+		// Use FIFO cost for the transaction if available
+		txUnitCost := stock.UnitCost
+		if fifoCostPerUnit > 0 {
+			txUnitCost = fifoCostPerUnit
+		}
+
 		// Create inventory transaction (outbound)
 		transactionID := uuid.New()
 		_, err = h.db.Exec(`
@@ -949,7 +1000,7 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 				unit_cost, total_cost, reference_type, reference_id,
 				reason, transaction_date, created_by, created_at
 			) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'sales_delivery', $7, 'Sales Delivery', $8, $9, $8)
-		`, transactionID, tenantID, stock.InventoryID, -action.QtyToShip, stock.UnitCost, action.QtyToShip*stock.UnitCost, doID, now, createdBy)
+		`, transactionID, tenantID, stock.InventoryID, -action.QtyToShip, txUnitCost, action.QtyToShip*txUnitCost, doID, now, createdBy)
 		if err != nil {
 			h.log.Error("Failed to create inventory transaction", "error", err)
 		}
