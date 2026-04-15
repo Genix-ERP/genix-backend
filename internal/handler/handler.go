@@ -1338,6 +1338,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// Reports
+	// Dashboard
+	dashboard := rg.Group("/dashboard")
+	{
+		dashboard.GET("/top-products", h.GetDashboardTopProducts)
+	}
+
 	reports := rg.Group("/reports")
 	reports.Use(h.perm.Require("finance", "report", "read"))
 	{
