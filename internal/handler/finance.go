@@ -653,6 +653,9 @@ func (h *Handler) UpdateAccount(c *gin.Context) {
 		args = append(args, value)
 	}
 
+	if input.Code != nil {
+		addUpdate("code", *input.Code)
+	}
 	if input.Name != nil {
 		addUpdate("name", *input.Name)
 	}
@@ -968,7 +971,9 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 		SELECT je.id, je.tenant_id, je.journal_id, je.entry_number, je.entry_date,
 			   je.reference, je.description, je.source_type, je.total_debit, je.total_credit,
 			   je.status, je.posted_at, je.created_at, je.updated_at,
-			   j.code as journal_code, j.name as journal_name
+			   j.code as journal_code, j.name as journal_name,
+			   COALESCE(j.name_uz, '') as journal_name_uz,
+			   COALESCE(j.name_en, '') as journal_name_en
 		FROM journal_entries je
 		JOIN journals j ON je.journal_id = j.id
 		WHERE je.tenant_id = $1 AND je.deleted_at IS NULL
@@ -1047,13 +1052,13 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 		var je entity.JournalEntry
 		var ref, desc, sourceType sql.NullString
 		var postedAt sql.NullTime
-		var journalCode, journalName string
+		var journalCode, journalName, journalNameUz, journalNameEn string
 
 		err := rows.Scan(
 			&je.ID, &je.TenantID, &je.JournalID, &je.EntryNumber, &je.EntryDate,
 			&ref, &desc, &sourceType, &je.TotalDebit, &je.TotalCredit,
 			&je.Status, &postedAt, &je.CreatedAt, &je.UpdatedAt,
-			&journalCode, &journalName,
+			&journalCode, &journalName, &journalNameUz, &journalNameEn,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan journal entry", "error", err)
@@ -1074,8 +1079,10 @@ func (h *Handler) ListJournalEntries(c *gin.Context) {
 		}
 
 		je.Journal = &entity.Journal{
-			Code: journalCode,
-			Name: journalName,
+			Code:   journalCode,
+			Name:   journalName,
+			NameUz: journalNameUz,
+			NameEn: journalNameEn,
 		}
 
 		entries = append(entries, je.ToResponse())
@@ -1120,6 +1127,7 @@ func (h *Handler) ListJournals(c *gin.Context) {
 			j.profit_account_id,
 			j.loss_account_id,
 			COALESCE(j.is_active, true),
+			COALESCE(j.is_payroll_journal, false),
 			j.created_at,
 			COALESCE(j.updated_at, j.created_at)
 		FROM journals j
@@ -1165,6 +1173,7 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty"`
 		LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty"`
 		IsActive               bool       `json:"is_active"`
+		IsPayrollJournal       bool       `json:"is_payroll_journal"`
 		CreatedAt              time.Time  `json:"created_at"`
 		UpdatedAt              time.Time  `json:"updated_at"`
 	}
@@ -1177,8 +1186,83 @@ func (h *Handler) ListJournals(c *gin.Context) {
 			&j.AutoSequence, &j.NextNumber, &j.NumberPrefix,
 			&j.ShortCode, &j.Currency,
 			&j.BankAccountID, &j.SuspenseAccountID, &j.ProfitAccountID, &j.LossAccountID,
-			&j.IsActive, &j.CreatedAt, &j.UpdatedAt); err != nil {
+			&j.IsActive, &j.IsPayrollJournal, &j.CreatedAt, &j.UpdatedAt); err != nil {
 			h.log.Error("Failed to scan journal", "error", err)
+			continue
+		}
+		journals = append(journals, j)
+	}
+
+	response.Success(c, journals)
+}
+
+// ListPaymentJournals returns only bank/cash journals for payment flows.
+// This endpoint requires no finance permissions — any authenticated user can call it.
+func (h *Handler) ListPaymentJournals(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	query := `
+		SELECT j.id, j.code, j.name, COALESCE(j.name_uz, ''), COALESCE(j.name_en, ''), j.type,
+			COALESCE(j.short_code, ''), COALESCE(j.currency, ''),
+			j.default_debit_account_id, j.default_credit_account_id,
+			j.bank_account_id, j.suspense_account_id,
+			j.profit_account_id, j.loss_account_id
+		FROM journals j
+		WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
+		  AND j.type IN ('bank', 'cash')
+		  AND COALESCE(j.is_active, true) = true
+		ORDER BY j.code ASC
+	`
+
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND (j.organization_id = $%d OR j.organization_id IS NULL) ORDER BY", argCount), 1)
+		args = append(args, orgID)
+	}
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to query payment journals", "error", err)
+		response.InternalError(c, "Failed to fetch payment journals")
+		return
+	}
+	defer rows.Close()
+
+	type PaymentJournal struct {
+		ID                     uuid.UUID  `json:"id"`
+		Code                   string     `json:"code"`
+		Name                   string     `json:"name"`
+		NameUz                 string     `json:"name_uz,omitempty"`
+		NameEn                 string     `json:"name_en,omitempty"`
+		Type                   string     `json:"type"`
+		ShortCode              string     `json:"short_code"`
+		Currency               string     `json:"currency"`
+		DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty"`
+		DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty"`
+		BankAccountID          *uuid.UUID `json:"bank_account_id,omitempty"`
+		SuspenseAccountID      *uuid.UUID `json:"suspense_account_id,omitempty"`
+		ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty"`
+		LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty"`
+		IsActive               bool       `json:"is_active"`
+	}
+
+	journals := make([]PaymentJournal, 0)
+	for rows.Next() {
+		var j PaymentJournal
+		j.IsActive = true
+		if err := rows.Scan(&j.ID, &j.Code, &j.Name, &j.NameUz, &j.NameEn, &j.Type,
+			&j.ShortCode, &j.Currency,
+			&j.DefaultDebitAccountID, &j.DefaultCreditAccountID,
+			&j.BankAccountID, &j.SuspenseAccountID,
+			&j.ProfitAccountID, &j.LossAccountID); err != nil {
+			h.log.Error("Failed to scan payment journal", "error", err)
 			continue
 		}
 		journals = append(journals, j)
@@ -1233,6 +1317,7 @@ func (h *Handler) GetJournal(c *gin.Context) {
 		ProfitAccountID        *uuid.UUID `json:"profit_account_id,omitempty"`
 		LossAccountID          *uuid.UUID `json:"loss_account_id,omitempty"`
 		IsActive               bool       `json:"is_active"`
+		IsPayrollJournal       bool       `json:"is_payroll_journal"`
 		CreatedAt              time.Time  `json:"created_at"`
 		UpdatedAt              time.Time  `json:"updated_at"`
 		// Enriched names from JOINs
@@ -1260,6 +1345,7 @@ func (h *Handler) GetJournal(c *gin.Context) {
 			j.profit_account_id,
 			j.loss_account_id,
 			COALESCE(j.is_active, true),
+			COALESCE(j.is_payroll_journal, false),
 			j.created_at,
 			COALESCE(j.updated_at, j.created_at),
 			COALESCE(ba.bank_name || ' - ' || ba.account_number, ''),
@@ -1282,7 +1368,7 @@ func (h *Handler) GetJournal(c *gin.Context) {
 		&j.AutoSequence, &j.NextNumber, &j.NumberPrefix,
 		&j.ShortCode, &j.Currency,
 		&j.BankAccountID, &j.SuspenseAccountID, &j.ProfitAccountID, &j.LossAccountID,
-		&j.IsActive, &j.CreatedAt, &j.UpdatedAt,
+		&j.IsActive, &j.IsPayrollJournal, &j.CreatedAt, &j.UpdatedAt,
 		&j.BankAccountName, &j.SuspenseAccountName, &j.ProfitAccountName, &j.LossAccountName,
 		&j.DebitAccountName, &j.CreditAccountName,
 		&j.EntryCount)
@@ -1327,23 +1413,9 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 		return
 	}
 
-	// Auto-generate code from name if empty
+	// Auto-generate code from name if empty (supports Cyrillic/non-Latin names)
 	if strings.TrimSpace(input.Code) == "" && strings.TrimSpace(input.Name) != "" {
-		input.Code = strings.ToUpper(strings.TrimSpace(input.Name))
-		// Keep only A-Z, 0-9, spaces; replace spaces with underscore
-		var cleaned []rune
-		for _, r := range input.Code {
-			if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ' ' {
-				cleaned = append(cleaned, r)
-			}
-		}
-		input.Code = strings.ReplaceAll(strings.TrimSpace(string(cleaned)), " ", "_")
-		if len(input.Code) > 20 {
-			input.Code = input.Code[:20]
-		}
-		if input.Code == "" {
-			input.Code = "JRN"
-		}
+		input.Code = generateCodeFromName(input.Name, 20, "JRN")
 	}
 
 	// Check for duplicate code and auto-suffix if needed
@@ -1409,15 +1481,15 @@ func (h *Handler) CreateJournal(c *gin.Context) {
 			auto_sequence, next_number, number_prefix,
 			short_code, currency,
 			bank_account_id, suspense_account_id, profit_account_id, loss_account_id,
-			organization_id, is_active, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14, $15, $16, $17, true, $18, $18)
+			organization_id, is_active, is_payroll_journal, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $11, $12, $13, $14, $15, $16, $17, true, $18, $19, $19)
 	`, journalID, tenantID, input.Code, input.Name, input.Type, input.Description,
 		debitAccID, creditAccID,
 		input.AutoSequence, input.NumberPrefix,
 		shortCode, input.Currency,
 		nullIfEmpty(input.BankAccountID), nullIfEmpty(input.SuspenseAccountID),
 		nullIfEmpty(input.ProfitAccountID), nullIfEmpty(input.LossAccountID),
-		orgID, now)
+		orgID, input.IsPayrollJournal, now)
 
 	if err != nil {
 		h.log.Error("Failed to create journal", "error", err)
@@ -1503,6 +1575,9 @@ func (h *Handler) UpdateJournal(c *gin.Context) {
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
+	}
+	if input.IsPayrollJournal != nil {
+		addUpdate("is_payroll_journal", *input.IsPayrollJournal)
 	}
 	if input.ShortCode != nil {
 		addUpdate("short_code", *input.ShortCode)
@@ -2136,7 +2211,9 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 			   je.reference, je.description, je.source_type, je.total_debit, je.total_credit,
 			   je.status, je.posted_at, je.reversed_entry_id, je.is_reversal, je.reversal_of_id,
 			   je.reversal_reason, je.tags, je.created_at, je.updated_at,
-			   j.code as journal_code, j.name as journal_name
+			   j.code as journal_code, j.name as journal_name,
+			   COALESCE(j.name_uz, '') as journal_name_uz,
+			   COALESCE(j.name_en, '') as journal_name_en
 		FROM journal_entries je
 		JOIN journals j ON je.journal_id = j.id
 		WHERE je.id = $1 AND je.tenant_id = $2 AND je.deleted_at IS NULL
@@ -2145,7 +2222,7 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 	var je entity.JournalEntry
 	var ref, desc, sourceType, reversalReason sql.NullString
 	var postedAt sql.NullTime
-	var journalCode, journalName string
+	var journalCode, journalName, journalNameUz, journalNameEn string
 	var tags []string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
@@ -2153,7 +2230,7 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 		&ref, &desc, &sourceType, &je.TotalDebit, &je.TotalCredit,
 		&je.Status, &postedAt, &je.ReversedEntryID, &je.IsReversal, &je.ReversalOfID,
 		&reversalReason, pq.Array(&tags), &je.CreatedAt, &je.UpdatedAt,
-		&journalCode, &journalName,
+		&journalCode, &journalName, &journalNameUz, &journalNameEn,
 	)
 
 	if err == sql.ErrNoRows {
@@ -2184,8 +2261,10 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 	je.Tags = tags
 
 	je.Journal = &entity.Journal{
-		Code: journalCode,
-		Name: journalName,
+		Code:   journalCode,
+		Name:   journalName,
+		NameUz: journalNameUz,
+		NameEn: journalNameEn,
 	}
 
 	// Get lines
@@ -3650,29 +3729,40 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	// Determine cash/bank account: stored bank_account_id → journal default account → payment method → name fallback
 	var cashAccountID uuid.UUID
 	var cashAccountBalance float64
+
+	// 1. Use explicit bank_account_id if provided
 	if bankAccountIDStr.Valid {
 		cashAccountID, _ = uuid.Parse(bankAccountIDStr.String)
 	}
+
+	// 2. Use journal's default account — journal is already linked to its account
 	if cashAccountID == uuid.Nil && storedJournalID.Valid {
-		// Try the selected journal's default debit account (bank/cash journals typically use a single default account)
 		_ = tx.QueryRow(
 			`SELECT COALESCE(default_debit_account_id, default_credit_account_id) FROM journals WHERE id = $1 AND tenant_id = $2`,
 			storedJournalID.String, tenantID,
 		).Scan(&cashAccountID)
 	}
-	if cashAccountID == uuid.Nil && paymentMethodID.Valid {
-		_ = tx.QueryRow(
-			`SELECT account_id FROM payment_methods WHERE id = $1 AND tenant_id = $2`,
-			paymentMethodID.String, tenantID,
-		).Scan(&cashAccountID)
-	}
-	if cashAccountID == uuid.Nil {
-		// Fallback: look up by name
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "1010")
-		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+
+	// 3. Fallback: use journal type to pick account code
+	if cashAccountID == uuid.Nil && storedJournalID.Valid {
+		var jType sql.NullString
+		_ = tx.QueryRow(`SELECT type FROM journals WHERE id = $1 AND tenant_id = $2`, storedJournalID.String, tenantID).Scan(&jType)
+		if jType.Valid && jType.String == "cash" {
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+		} else if jType.Valid && jType.String == "bank" {
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
 		}
 	}
+
+	// 4. Last fallback: find by account code
+	if cashAccountID == uuid.Nil {
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+	}
+	if cashAccountID == uuid.Nil {
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+	}
+	h.log.Info("Payment cash/bank account resolution", "cash_account_id", cashAccountID, "payment_id", id,
+		"had_bank_account_id", bankAccountIDStr.Valid, "had_journal_id", storedJournalID.Valid, "had_payment_method_id", paymentMethodID.Valid)
 
 	// Check cash/bank account balance for outbound payments
 	if cashAccountID != uuid.Nil && paymentType == "payment" {
@@ -3695,19 +3785,45 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 	if paymentType == "receipt" {
 		// Inbound: customer pays us → Debit Cash, Credit AR
-		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
+		// 1. Try contact's default receivable account
+		counterAccountID = getContactDefaultAccount(tx, contactID, "receivable")
+		// 2. Fallback to standard findAccount chain
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
+		}
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "debitorlar", "1100")
+		}
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "receivable", "1100")
+		}
 		journalCode = "CASH_RECEIPTS"
 		sourceType = "payment_receipt"
 		debitDesc = "Cash Receipt"
 		creditDesc = "Accounts Receivable"
 	} else {
 		// Outbound: we pay vendor → Debit AP, Credit Cash
-		counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+		// 1. Try contact's default payable account
+		counterAccountID = getContactDefaultAccount(tx, contactID, "payable")
+		// 2. Fallback to standard findAccount chain
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+		}
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlar", "2000")
+		}
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "payable", "2000")
+		}
+		if counterAccountID == uuid.Nil {
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlik", "2000")
+		}
 		journalCode = "CASH_DISBURSEMENTS"
 		sourceType = "payment"
 		debitDesc = "Accounts Payable"
 		creditDesc = "Cash/Bank"
 	}
+	h.log.Info("Payment counter account resolution", "counter_account_id", counterAccountID, "payment_type", paymentType)
 
 	// --- Create journal entry for the payment (inside a SAVEPOINT so failures don't abort the tx) ---
 	if cashAccountID != uuid.Nil && counterAccountID != uuid.Nil {
@@ -3778,13 +3894,15 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			} else {
 				if paymentType == "receipt" {
 					// Receipt: Debit Cash, Credit AR
+					// Only set contact_id on the AR credit line (counter account),
+					// NOT on the cash line — so reconciliation only counts the AR side.
 					line1ID := uuid.New()
 					tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						line1ID, journalEntryID, 1, cashAccountID, contactID, debitDesc,
+						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
+						line1ID, journalEntryID, 1, cashAccountID, debitDesc,
 						amount, 0.0, 1.0, now,
 					)
 					line2ID := uuid.New()
@@ -3799,11 +3917,19 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 					// Update account balances
 					// Cash: debit-normal, debit increases balance
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID)
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID); balErr != nil {
+						h.log.Error("Failed to update cash account balance (receipt)", "error", balErr, "account_id", cashAccountID, "amount", amount)
+					} else {
+						h.log.Info("Receipt: cash account balance updated", "account_id", cashAccountID, "amount", amount)
+					}
 					// AR: debit-normal, credit decreases balance
-					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID)
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID); balErr != nil {
+						h.log.Error("Failed to update AR account balance (receipt)", "error", balErr, "account_id", counterAccountID, "amount", amount)
+					}
 				} else {
 					// Payment: Debit AP, Credit Cash
+					// Only set contact_id on the AP debit line (counter account),
+					// NOT on the cash line — so reconciliation only counts the AP side.
 					line1ID := uuid.New()
 					tx.Exec(`
 						INSERT INTO journal_entry_lines (
@@ -3818,16 +3944,22 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						line2ID, journalEntryID, 2, cashAccountID, contactID, creditDesc,
+						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
+						line2ID, journalEntryID, 2, cashAccountID, creditDesc,
 						0.0, amount, 1.0, now,
 					)
 
 					// Update account balances
 					// AP: credit-normal, debit decreases balance (we're paying off liability)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID)
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID); balErr != nil {
+						h.log.Error("Failed to update AP account balance (payment)", "error", balErr, "account_id", counterAccountID, "amount", amount)
+					}
 					// Cash: debit-normal, credit decreases balance
-					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID)
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID); balErr != nil {
+						h.log.Error("Failed to update cash account balance (payment)", "error", balErr, "account_id", cashAccountID, "amount", amount)
+					} else {
+						h.log.Info("Payment: cash account balance updated", "account_id", cashAccountID, "amount", -amount)
+					}
 				}
 
 				// Update journal next number
@@ -3964,10 +4096,18 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)
 		}
 	} else {
-		h.log.Warn("Cannot create payment journal entry: missing accounts",
+		h.log.Error("Cannot create payment journal entry: missing accounts",
 			"has_cash_account", cashAccountID != uuid.Nil,
 			"has_counter_account", counterAccountID != uuid.Nil,
 			"payment_type", paymentType)
+		// Roll back - don't confirm payment without proper accounting
+		tx.Rollback()
+		missingAcct := "Kassa/Bank hisobi"
+		if cashAccountID != uuid.Nil {
+			missingAcct = "Kreditorlar (Accounts Payable)"
+		}
+		response.BadRequest(c, fmt.Sprintf("To'lovni tasdiqlash imkoni yo'q: %s hisobi topilmadi. Iltimos, hisoblar rejasini tekshiring.", missingAcct))
+		return
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -3975,6 +4115,23 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		response.InternalError(c, "Failed to confirm payment")
 		return
 	}
+
+	// Notify: payment confirmed
+	go func() {
+		var contactName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, contactID).Scan(&contactName)
+		amountStr := fmt.Sprintf("%.0f", amount)
+		h.createTranslatedNotification(tenantID, userID, "payment_confirmed",
+			map[string]interface{}{
+				"payment_id":     id.String(),
+				"payment_number": paymentNumber,
+				"contact_id":     contactID.String(),
+				"contact_name":   contactName,
+				"amount":         amount,
+			},
+			paymentNumber, amountStr, contactName,
+		)
+	}()
 
 	response.Success(c, gin.H{"message": "Payment confirmed successfully", "confirmed_at": now})
 }

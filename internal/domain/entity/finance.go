@@ -133,6 +133,7 @@ type CreateAccountInput struct {
 // UpdateAccountInput is the input for updating an account
 type UpdateAccountInput struct {
 	ParentID         *string  `json:"parent_id"`
+	Code             *string  `json:"code"`
 	Name             *string  `json:"name"`
 	Description      *string  `json:"description"`
 	InternalType     *string  `json:"internal_type"`
@@ -165,6 +166,8 @@ type Journal struct {
 	TenantID               uuid.UUID  `json:"tenant_id" db:"tenant_id"`
 	Code                   string     `json:"code" db:"code"`
 	Name                   string     `json:"name" db:"name"`
+	NameUz                 string     `json:"name_uz,omitempty" db:"name_uz"`
+	NameEn                 string     `json:"name_en,omitempty" db:"name_en"`
 	Type                   string     `json:"type" db:"type"` // general, sales, purchase, cash, bank, miscellaneous
 	Description            *string    `json:"description,omitempty" db:"description"`
 	AutoSequence           bool       `json:"auto_sequence" db:"auto_sequence"`
@@ -179,6 +182,7 @@ type Journal struct {
 	OrganizationID         *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
 	DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty" db:"default_debit_account_id"`
 	DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty" db:"default_credit_account_id"`
+	IsPayrollJournal       bool       `json:"is_payroll_journal" db:"is_payroll_journal"`
 	IsActive               bool       `json:"is_active" db:"is_active"`
 	CreatedAt              time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt              time.Time  `json:"updated_at" db:"updated_at"`
@@ -213,6 +217,7 @@ type CreateJournalInput struct {
 	SuspenseAccountID      *string `json:"suspense_account_id"`
 	ProfitAccountID        *string `json:"profit_account_id"`
 	LossAccountID          *string `json:"loss_account_id"`
+	IsPayrollJournal       bool    `json:"is_payroll_journal"`
 }
 
 // UpdateJournalInput is the input for updating a journal
@@ -224,6 +229,7 @@ type UpdateJournalInput struct {
 	AutoSequence           *bool   `json:"auto_sequence"`
 	NumberPrefix           *string `json:"number_prefix"`
 	IsActive               *bool   `json:"is_active"`
+	IsPayrollJournal       *bool   `json:"is_payroll_journal"`
 	ShortCode              *string `json:"short_code"`
 	Currency               *string `json:"currency"`
 	BankAccountID          *string `json:"bank_account_id"`
@@ -757,6 +763,8 @@ type TrialBalanceAccount struct {
 	AccountID     uuid.UUID              `json:"account_id"`
 	AccountCode   string                 `json:"account_code"`
 	AccountName   string                 `json:"account_name"`
+	AccountNameUz string                 `json:"account_name_uz,omitempty"`
+	AccountNameEn string                 `json:"account_name_en,omitempty"`
 	Category      string                 `json:"category"`
 	DebitBalance  float64                `json:"debit_balance"`
 	CreditBalance float64                `json:"credit_balance"`
@@ -785,10 +793,12 @@ type BalanceSheetSection struct {
 
 // BalanceSheetAccount represents an account in balance sheet
 type BalanceSheetAccount struct {
-	AccountID   uuid.UUID `json:"account_id"`
-	AccountCode string    `json:"account_code"`
-	AccountName string    `json:"account_name"`
-	Balance     float64   `json:"balance"`
+	AccountID     uuid.UUID `json:"account_id"`
+	AccountCode   string    `json:"account_code"`
+	AccountName   string    `json:"account_name"`
+	AccountNameUz string    `json:"account_name_uz,omitempty"`
+	AccountNameEn string    `json:"account_name_en,omitempty"`
+	Balance       float64   `json:"balance"`
 }
 
 // IncomeStatementReport represents income statement (P&L) data
@@ -811,10 +821,12 @@ type IncomeStatementReport struct {
 
 // IncomeStatementSection represents a section in income statement
 type IncomeStatementSection struct {
-	AccountID   uuid.UUID `json:"account_id"`
-	AccountCode string    `json:"account_code"`
-	AccountName string    `json:"account_name"`
-	Amount      float64   `json:"amount"`
+	AccountID     uuid.UUID `json:"account_id"`
+	AccountCode   string    `json:"account_code"`
+	AccountName   string    `json:"account_name"`
+	AccountNameUz string    `json:"account_name_uz,omitempty"`
+	AccountNameEn string    `json:"account_name_en,omitempty"`
+	Amount        float64   `json:"amount"`
 }
 
 // GeneralLedgerReport represents general ledger data

@@ -233,13 +233,14 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 	var soCustomerName sql.NullString
 	var soWarehouseID sql.NullString
 	var soExpectedDate sql.NullTime
+	var soOrgID sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT so.order_number, so.status, so.customer_id, c.name, so.warehouse_id, so.expected_date
+		SELECT so.order_number, so.status, so.customer_id, c.name, so.warehouse_id, so.expected_date, so.organization_id
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL
-	`, salesOrderID, tenantID).Scan(&soNumber, &soStatus, &soCustomerID, &soCustomerName, &soWarehouseID, &soExpectedDate)
+	`, salesOrderID, tenantID).Scan(&soNumber, &soStatus, &soCustomerID, &soCustomerName, &soWarehouseID, &soExpectedDate, &soOrgID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales order")
@@ -249,6 +250,14 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 		h.log.Error("Failed to fetch sales order", "error", err)
 		response.InternalError(c, "Failed to fetch sales order")
 		return
+	}
+
+	// If orgIDPtr is nil (middleware didn't set it), derive from sales order's organization_id
+	if orgIDPtr == nil && soOrgID.Valid && soOrgID.String != "" {
+		parsedOrgID, parseErr := uuid.Parse(soOrgID.String)
+		if parseErr == nil {
+			orgIDPtr = &parsedOrgID
+		}
 	}
 
 	// Validate SO status - must be confirmed or processing
@@ -267,6 +276,26 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 	warehouseID := input.WarehouseID
 	if warehouseID == "" && soWarehouseID.Valid {
 		warehouseID = soWarehouseID.String
+	}
+
+	// If warehouse is set, validate it belongs to the same organization
+	if warehouseID != "" && orgIDPtr != nil {
+		var warehouseOrgMatch bool
+		h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND organization_id = $3 AND deleted_at IS NULL)",
+			warehouseID, tenantID, *orgIDPtr,
+		).Scan(&warehouseOrgMatch)
+		if !warehouseOrgMatch {
+			// Try to find a warehouse that belongs to this organization instead
+			var orgWarehouseID string
+			err := h.db.QueryRow(
+				"SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1",
+				tenantID, *orgIDPtr,
+			).Scan(&orgWarehouseID)
+			if err == nil {
+				warehouseID = orgWarehouseID
+			}
+		}
 	}
 
 	// Use provided delivery date or today
@@ -628,12 +657,13 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 	var currentStatus string
 	var salesOrderID uuid.UUID
 	var warehouseID sql.NullString
+	var doOrgID sql.NullString
 
 	err = h.db.QueryRow(`
-		SELECT status, sales_order_id, warehouse_id
+		SELECT status, sales_order_id, warehouse_id, organization_id
 		FROM sales_delivery_orders
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, doID, tenantID).Scan(&currentStatus, &salesOrderID, &warehouseID)
+	`, doID, tenantID).Scan(&currentStatus, &salesOrderID, &warehouseID, &doOrgID)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Delivery order")
@@ -681,6 +711,18 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		return
 	}
 
+	// If no warehouse is set on the DO, try to find one from the org
+	if (!warehouseID.Valid || warehouseID.String == "") && doOrgID.Valid && doOrgID.String != "" {
+		var orgWarehouse string
+		err := h.db.QueryRow(
+			"SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1",
+			tenantID, doOrgID.String,
+		).Scan(&orgWarehouse)
+		if err == nil {
+			warehouseID = sql.NullString{String: orgWarehouse, Valid: true}
+		}
+	}
+
 	// Pre-validate stock availability for all lines before making any changes
 	type insufficientItem struct {
 		ProductName string  `json:"product_name"`
@@ -698,10 +740,30 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 			continue
 		}
 
+		// Validate that the effective warehouse belongs to the same organization
+		if doOrgID.Valid && doOrgID.String != "" {
+			var whOrgMatch bool
+			h.db.QueryRow(
+				"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND organization_id = $3 AND deleted_at IS NULL)",
+				effectiveWarehouseID, tenantID, doOrgID.String,
+			).Scan(&whOrgMatch)
+			if !whOrgMatch {
+				// Fall back to org's default warehouse
+				var orgWH string
+				if h.db.QueryRow(
+					"SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1",
+					tenantID, doOrgID.String,
+				).Scan(&orgWH) == nil {
+					effectiveWarehouseID = orgWH
+				}
+			}
+		}
+
 		var qtyAvailable float64
 		var productName string
+		// Sum available quantity across all inventory records for this product+warehouse (handles multiple lots/serials)
 		err := h.db.QueryRow(`
-			SELECT COALESCE(i.quantity_available, 0), COALESCE(p.name, 'Unknown')
+			SELECT COALESCE(SUM(i.quantity_available), 0), COALESCE(MAX(p.name), 'Unknown')
 			FROM products p
 			LEFT JOIN inventory i ON i.product_id = p.id AND i.tenant_id = p.tenant_id AND i.warehouse_id = $3
 			WHERE p.id = $1 AND p.tenant_id = $2
@@ -750,6 +812,24 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 			continue
 		}
 
+		// Validate warehouse belongs to the same organization (same check as above)
+		if doOrgID.Valid && doOrgID.String != "" {
+			var whOrgMatch bool
+			h.db.QueryRow(
+				"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND organization_id = $3 AND deleted_at IS NULL)",
+				effectiveWarehouseID, tenantID, doOrgID.String,
+			).Scan(&whOrgMatch)
+			if !whOrgMatch {
+				var orgWH string
+				if h.db.QueryRow(
+					"SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1",
+					tenantID, doOrgID.String,
+				).Scan(&orgWH) == nil {
+					effectiveWarehouseID = orgWH
+				}
+			}
+		}
+
 		var inventoryID uuid.UUID
 		var qtyOnHand, qtyAvailable, unitCost float64
 		var productName string
@@ -762,7 +842,34 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		`, tenantID, line.ProductID, effectiveWarehouseID).Scan(&inventoryID, &qtyOnHand, &qtyAvailable, &unitCost, &productName)
 
 		if err != nil {
-			stockMap[line.ProductID] = stockInfo{WarehouseID: effectiveWarehouseID, ProductName: line.ProductID.String()}
+			// No inventory record exists — create one with zero quantity
+			// so that inventory deduction is tracked (may go negative, which is valid for backorders)
+			var pName string
+			var pCost float64
+			h.db.QueryRow("SELECT COALESCE(name, ''), COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", line.ProductID, tenantID).Scan(&pName, &pCost)
+
+			newInvID := uuid.New()
+			// Get organization_id from the warehouse
+			var whOrgID *uuid.UUID
+			h.db.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", effectiveWarehouseID, tenantID).Scan(&whOrgID)
+
+			_, createErr := h.db.Exec(`
+				INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+			`, newInvID, tenantID, whOrgID, line.ProductID, effectiveWarehouseID, pCost, now)
+			if createErr != nil {
+				h.log.Error("Failed to create inventory record for delivery", "error", createErr, "product_id", line.ProductID)
+				stockMap[line.ProductID] = stockInfo{WarehouseID: effectiveWarehouseID, ProductName: pName}
+				continue
+			}
+
+			stockMap[line.ProductID] = stockInfo{
+				InventoryID: newInvID,
+				Available:   0,
+				UnitCost:    pCost,
+				WarehouseID: effectiveWarehouseID,
+				ProductName: pName,
+			}
 			continue
 		}
 		stockMap[line.ProductID] = stockInfo{
@@ -834,6 +941,57 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 			continue
 		}
 
+		// FIFO: consume from oldest lots first
+		remainingToConsume := action.QtyToShip
+		var fifoCostPerUnit float64
+		lotRows, lotErr := h.db.Query(`
+			SELECT id, remaining_quantity, unit_cost FROM inventory_lots
+			WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+			ORDER BY received_date ASC
+		`, tenantID, action.Line.ProductID)
+		if lotErr == nil {
+			for lotRows.Next() && remainingToConsume > 0 {
+				var lotID uuid.UUID
+				var lotQty, lotCost float64
+				lotRows.Scan(&lotID, &lotQty, &lotCost)
+
+				consume := remainingToConsume
+				if consume > lotQty {
+					consume = lotQty
+				}
+				remainingToConsume -= consume
+				fifoCostPerUnit = lotCost // track last consumed lot's cost
+
+				h.db.Exec(`UPDATE inventory_lots SET remaining_quantity = remaining_quantity - $1, updated_at = $2 WHERE id = $3`,
+					consume, now, lotID)
+
+				// Mark lot as depleted if empty
+				h.db.Exec(`UPDATE inventory_lots SET status = 'depleted' WHERE id = $1 AND remaining_quantity <= 0`, lotID)
+			}
+			lotRows.Close()
+		}
+
+		// Update product cost_price to the next available lot's cost (FIFO)
+		var nextLotCost float64
+		if h.db.QueryRow(`
+			SELECT unit_cost FROM inventory_lots
+			WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+			ORDER BY received_date ASC LIMIT 1
+		`, tenantID, action.Line.ProductID).Scan(&nextLotCost) == nil && nextLotCost > 0 {
+			h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+				nextLotCost, now, action.Line.ProductID, tenantID)
+			// Also update org-specific settings
+			h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = (
+				SELECT organization_id FROM inventory WHERE id = $4 LIMIT 1
+			)`, nextLotCost, now, action.Line.ProductID, stock.InventoryID)
+		}
+
+		// Use FIFO cost for the transaction if available
+		txUnitCost := stock.UnitCost
+		if fifoCostPerUnit > 0 {
+			txUnitCost = fifoCostPerUnit
+		}
+
 		// Create inventory transaction (outbound)
 		transactionID := uuid.New()
 		_, err = h.db.Exec(`
@@ -842,7 +1000,7 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 				unit_cost, total_cost, reference_type, reference_id,
 				reason, transaction_date, created_by, created_at
 			) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'sales_delivery', $7, 'Sales Delivery', $8, $9, $8)
-		`, transactionID, tenantID, stock.InventoryID, -action.QtyToShip, stock.UnitCost, action.QtyToShip*stock.UnitCost, doID, now, createdBy)
+		`, transactionID, tenantID, stock.InventoryID, -action.QtyToShip, txUnitCost, action.QtyToShip*txUnitCost, doID, now, createdBy)
 		if err != nil {
 			h.log.Error("Failed to create inventory transaction", "error", err)
 		}

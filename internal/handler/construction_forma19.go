@@ -92,6 +92,7 @@ func (h *Handler) ListForma19(c *gin.Context) {
 		item := map[string]interface{}{
 			"id":           id,
 			"name":         name,
+			"act_type":     "hidden_work",
 			"state":        state,
 			"amount_total": amountTotal,
 			"created_date": createdDate,

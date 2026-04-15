@@ -139,12 +139,9 @@ func (h *Handler) CreateDepartment(c *gin.Context) {
 		return
 	}
 
-	// Auto-generate code from name if not provided
+	// Auto-generate code from name if not provided (supports Cyrillic/non-Latin names)
 	if strings.TrimSpace(input.Code) == "" {
-		input.Code = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(input.Name), " ", "_"))
-		if len(input.Code) > 20 {
-			input.Code = input.Code[:20]
-		}
+		input.Code = generateCodeFromName(input.Name, 20, "DEPT")
 	}
 
 	id := uuid.New()

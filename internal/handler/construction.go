@@ -234,7 +234,43 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, p)
+	// Load Forma 2 / Forma 3 client banking & legal identity fields
+	var clientAddress, clientBankName, clientBankAccount string
+	var clientMFO, clientSTIR, clientOKONH string
+	var contractNumber, objectFullName string
+	var clientDirectorName, clientChiefAccName string
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(client_address, ''), COALESCE(client_bank_name, ''), COALESCE(client_bank_account, ''),
+		       COALESCE(client_mfo, ''), COALESCE(client_stir, ''), COALESCE(client_okonh, ''),
+		       COALESCE(contract_number, ''), COALESCE(object_full_name, ''),
+		       COALESCE(client_director_name, ''), COALESCE(client_chief_accountant_name, '')
+		FROM construction_projects WHERE id = $1 AND tenant_id = $2
+	`, id, tenantID).Scan(
+		&clientAddress, &clientBankName, &clientBankAccount,
+		&clientMFO, &clientSTIR, &clientOKONH,
+		&contractNumber, &objectFullName,
+		&clientDirectorName, &clientChiefAccName,
+	)
+
+	// Build response by marshalling project + new fields into a single map
+	projBytes, _ := json.Marshal(p)
+	var projMap map[string]interface{}
+	_ = json.Unmarshal(projBytes, &projMap)
+	if projMap == nil {
+		projMap = map[string]interface{}{}
+	}
+	projMap["client_address"] = clientAddress
+	projMap["client_bank_name"] = clientBankName
+	projMap["client_bank_account"] = clientBankAccount
+	projMap["client_mfo"] = clientMFO
+	projMap["client_stir"] = clientSTIR
+	projMap["client_okonh"] = clientOKONH
+	projMap["contract_number"] = contractNumber
+	projMap["object_full_name"] = objectFullName
+	projMap["client_director_name"] = clientDirectorName
+	projMap["client_chief_accountant_name"] = clientChiefAccName
+
+	response.Success(c, projMap)
 }
 
 // CreateConstructionProject creates a new construction project
@@ -265,12 +301,6 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
 		response.BadRequest(c, "Invalid input")
-		return
-	}
-
-	// Validate contract amount is provided and positive
-	if req.ContractAmount <= 0 {
-		response.BadRequest(c, "Contract amount is required and must be greater than 0")
 		return
 	}
 
@@ -330,6 +360,35 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 		response.InternalError(c, "Failed to create project")
 		return
 	}
+
+	// Persist Forma 2 / Forma 3 client banking & legal identity fields
+	_, _ = h.db.Exec(`
+		UPDATE construction_projects SET
+			client_address = $1,
+			client_bank_name = $2,
+			client_bank_account = $3,
+			client_mfo = $4,
+			client_stir = $5,
+			client_okonh = $6,
+			contract_number = $7,
+			object_full_name = $8,
+			client_director_name = $9,
+			client_chief_accountant_name = $10,
+			updated_date = NOW()
+		WHERE id = $11 AND tenant_id = $12
+	`,
+		nullString(req.ClientAddress),
+		nullString(req.ClientBankName),
+		nullString(req.ClientBankAccount),
+		nullString(req.ClientMFO),
+		nullString(req.ClientSTIR),
+		nullString(req.ClientOKONH),
+		nullString(req.ContractNumber),
+		nullString(req.ObjectFullName),
+		nullString(req.ClientDirectorName),
+		nullString(req.ClientChiefAccountantName),
+		projectID, tenantID,
+	)
 
 	// Auto-create analytic account for the project (best-effort)
 	go func() {
@@ -491,6 +550,58 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("actual_end_date = $%d", argCount))
 		t, _ := time.Parse("2006-01-02", *req.ActualEndDate)
 		args = append(args, t)
+	}
+
+	// Forma 2 / Forma 3 client banking & legal identity
+	if req.ClientAddress != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("client_address = $%d", argCount))
+		args = append(args, nullString(*req.ClientAddress))
+	}
+	if req.ClientBankName != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("client_bank_name = $%d", argCount))
+		args = append(args, nullString(*req.ClientBankName))
+	}
+	if req.ClientBankAccount != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("client_bank_account = $%d", argCount))
+		args = append(args, nullString(*req.ClientBankAccount))
+	}
+	if req.ClientMFO != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("client_mfo = $%d", argCount))
+		args = append(args, nullString(*req.ClientMFO))
+	}
+	if req.ClientSTIR != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("client_stir = $%d", argCount))
+		args = append(args, nullString(*req.ClientSTIR))
+	}
+	if req.ClientOKONH != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("client_okonh = $%d", argCount))
+		args = append(args, nullString(*req.ClientOKONH))
+	}
+	if req.ContractNumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contract_number = $%d", argCount))
+		args = append(args, nullString(*req.ContractNumber))
+	}
+	if req.ObjectFullName != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("object_full_name = $%d", argCount))
+		args = append(args, nullString(*req.ObjectFullName))
+	}
+	if req.ClientDirectorName != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("client_director_name = $%d", argCount))
+		args = append(args, nullString(*req.ClientDirectorName))
+	}
+	if req.ClientChiefAccountantName != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("client_chief_accountant_name = $%d", argCount))
+		args = append(args, nullString(*req.ClientChiefAccountantName))
 	}
 
 	if len(updates) == 0 {
@@ -5483,6 +5594,157 @@ func (h *Handler) DeleteBuildingFile(c *gin.Context) {
 	`, fileID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete building file", "error", err)
+		response.InternalServerError(c, "Failed to delete file")
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		response.NotFound(c, "File")
+		return
+	}
+
+	response.NoContent(c)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Project Files
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ListProjectFiles returns all files for a project
+func (h *Handler) ListProjectFiles(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Tenant ID required")
+		return
+	}
+
+	projectID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, project_id, file_id, file_url, filename, file_size, mime_type, description, created_at, created_by
+		FROM project_files
+		WHERE tenant_id = $1 AND project_id = $2
+		ORDER BY created_at DESC
+	`, tenantID, projectID)
+	if err != nil {
+		h.log.Error("Failed to list project files", "error", err)
+		response.InternalServerError(c, "Failed to list files")
+		return
+	}
+	defer rows.Close()
+
+	type ProjectFile struct {
+		ID          int    `json:"id"`
+		ProjectID   int    `json:"project_id"`
+		FileID      string `json:"file_id"`
+		FileURL     string `json:"file_url"`
+		Filename    string `json:"filename"`
+		FileSize    int64  `json:"file_size"`
+		MimeType    string `json:"mime_type"`
+		Description string `json:"description"`
+		CreatedAt   string `json:"created_at"`
+		CreatedBy   string `json:"created_by"`
+	}
+
+	var files []ProjectFile
+	for rows.Next() {
+		var f ProjectFile
+		var createdAt time.Time
+		if err := rows.Scan(&f.ID, &f.ProjectID, &f.FileID, &f.FileURL, &f.Filename, &f.FileSize, &f.MimeType, &f.Description, &createdAt, &f.CreatedBy); err != nil {
+			continue
+		}
+		f.CreatedAt = createdAt.Format(time.RFC3339)
+		files = append(files, f)
+	}
+
+	if files == nil {
+		files = []ProjectFile{}
+	}
+	response.Success(c, files)
+}
+
+// CreateProjectFile adds a file reference to a project
+func (h *Handler) CreateProjectFile(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Tenant ID required")
+		return
+	}
+
+	projectID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var input struct {
+		FileID      string `json:"file_id" binding:"required"`
+		FileURL     string `json:"file_url" binding:"required"`
+		Filename    string `json:"filename" binding:"required"`
+		FileSize    int64  `json:"file_size"`
+		MimeType    string `json:"mime_type"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	// Get user email from context
+	createdBy := ""
+	if email, exists := c.Get("user_email"); exists {
+		createdBy = email.(string)
+	}
+
+	var id int
+	err = h.db.QueryRow(`
+		INSERT INTO project_files (tenant_id, project_id, file_id, file_url, filename, file_size, mime_type, description, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id
+	`, tenantID, projectID, input.FileID, input.FileURL, input.Filename, input.FileSize, input.MimeType, input.Description, createdBy).Scan(&id)
+	if err != nil {
+		h.log.Error("Failed to create project file", "error", err)
+		response.InternalServerError(c, "Failed to save file")
+		return
+	}
+
+	response.Created(c, gin.H{
+		"id":          id,
+		"project_id":  projectID,
+		"file_id":     input.FileID,
+		"file_url":    input.FileURL,
+		"filename":    input.Filename,
+		"file_size":   input.FileSize,
+		"mime_type":   input.MimeType,
+		"description": input.Description,
+		"created_by":  createdBy,
+	})
+}
+
+// DeleteProjectFile removes a file reference from a project
+func (h *Handler) DeleteProjectFile(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Tenant ID required")
+		return
+	}
+
+	fileID, err := strconv.Atoi(c.Param("file_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid file ID")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		DELETE FROM project_files WHERE id = $1 AND tenant_id = $2
+	`, fileID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete project file", "error", err)
 		response.InternalServerError(c, "Failed to delete file")
 		return
 	}

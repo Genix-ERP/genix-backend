@@ -186,12 +186,14 @@ func (h *Handler) ListProjectsByOrganization(c *gin.Context) {
 		return
 	}
 
+	// Fetch construction projects: first try matching org, then fall back to all tenant projects
 	query := `
-		SELECT p.id, p.project_code, p.project_name, p.status
-		FROM projects p
-		WHERE p.tenant_id = $1 AND p.organization_id = $2 AND p.deleted_at IS NULL
-		  AND p.status IN ('planning', 'active')
-		ORDER BY p.project_name ASC`
+		SELECT cp.id, cp.code, cp.name, cp.status
+		FROM construction_projects cp
+		WHERE cp.tenant_id = $1 AND cp.deleted_at IS NULL
+		  AND cp.status IN ('draft', 'planning', 'active', 'in_progress')
+		  AND (cp.organization_id = $2 OR cp.organization_id IS NULL OR cp.organization_id = '00000000-0000-0000-0000-000000000000')
+		ORDER BY cp.name ASC`
 
 	rows, err := h.db.Query(query, tenantID, parsedOrgID)
 	if err != nil {
@@ -202,17 +204,45 @@ func (h *Handler) ListProjectsByOrganization(c *gin.Context) {
 
 	var projects []map[string]interface{}
 	for rows.Next() {
-		var id uuid.UUID
+		var id int64
 		var projectCode, projectName, status string
 		if err := rows.Scan(&id, &projectCode, &projectName, &status); err != nil {
 			continue
 		}
 		projects = append(projects, map[string]interface{}{
-			"id":           id.String(),
+			"id":           fmt.Sprintf("%d", id),
 			"project_code": projectCode,
 			"project_name": projectName,
 			"status":       status,
 		})
+	}
+
+	// If no projects found with org filter, fetch all construction projects in the tenant
+	if len(projects) == 0 {
+		fallbackQuery := `
+			SELECT cp.id, cp.code, cp.name, cp.status
+			FROM construction_projects cp
+			WHERE cp.tenant_id = $1 AND cp.deleted_at IS NULL
+			  AND cp.status IN ('draft', 'planning', 'active', 'in_progress')
+			ORDER BY cp.name ASC`
+
+		fbRows, fbErr := h.db.Query(fallbackQuery, tenantID)
+		if fbErr == nil {
+			defer fbRows.Close()
+			for fbRows.Next() {
+				var id int64
+				var projectCode, projectName, status string
+				if fbErr := fbRows.Scan(&id, &projectCode, &projectName, &status); fbErr != nil {
+					continue
+				}
+				projects = append(projects, map[string]interface{}{
+					"id":           fmt.Sprintf("%d", id),
+					"project_code": projectCode,
+					"project_name": projectName,
+					"status":       status,
+				})
+			}
+		}
 	}
 
 	if projects == nil {
