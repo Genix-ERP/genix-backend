@@ -256,6 +256,8 @@ type ProductResponse struct {
 	CanBeRented        bool      `json:"can_be_rented"`
 	CanBeSubcontracted bool      `json:"can_be_subcontracted"`
 	IsOverheadExpense  bool      `json:"is_overhead_expense"`
+	IsManufacturable   bool      `json:"is_manufacturable"`
+	AutoManufacture    bool      `json:"auto_manufacture"`
 	HasVariants        bool      `json:"has_variants"`
 	HasDelivery        bool      `json:"has_delivery"`
 	DeliveryPrice      float64   `json:"delivery_price"`
