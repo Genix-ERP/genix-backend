@@ -3,12 +3,14 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/crypto"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -42,13 +44,16 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 
 	// Build query
 	baseQuery := `
-		SELECT id, tenant_id, employee_number, first_name, last_name, middle_name,
-			   email, phone, mobile, job_title, hire_date, status, base_salary, permission,
-			   notes, created_at, updated_at
-		FROM employees
-		WHERE tenant_id = $1 AND deleted_at IS NULL
+		SELECT e.id, e.tenant_id, e.employee_number, e.first_name, e.last_name, e.middle_name,
+			   e.email, e.phone, e.mobile, e.job_title, e.hire_date, e.status, e.base_salary, e.permission,
+			   e.notes, e.created_at, e.updated_at, e.department_id, COALESCE(d.name, '') as department_name,
+			   e.job_position_id, COALESCE(jp.name, '') as job_position_name
+		FROM employees e
+		LEFT JOIN departments d ON e.department_id = d.id
+		LEFT JOIN job_positions jp ON e.job_position_id = jp.id
+		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL
 	`
-	countQuery := `SELECT COUNT(*) FROM employees WHERE tenant_id = $1 AND deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM employees e WHERE e.tenant_id = $1 AND e.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -56,7 +61,7 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 	// Filter by organization - use employee_organizations to show all employees with access to this company
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		orgFilter := fmt.Sprintf(" AND (organization_id = $%d OR id IN (SELECT employee_id FROM employee_organizations WHERE organization_id = $%d))", argCount, argCount)
+		orgFilter := fmt.Sprintf(" AND (e.organization_id = $%d OR e.id IN (SELECT employee_id FROM employee_organizations WHERE organization_id = $%d))", argCount, argCount)
 		baseQuery += orgFilter
 		countQuery += orgFilter
 		args = append(args, orgID)
@@ -65,7 +70,7 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 	// Apply filters
 	if search != "" {
 		argCount++
-		searchFilter := fmt.Sprintf(" AND (first_name ILIKE $%d OR last_name ILIKE $%d OR email ILIKE $%d OR employee_number ILIKE $%d)", argCount, argCount, argCount, argCount)
+		searchFilter := fmt.Sprintf(" AND (e.first_name ILIKE $%d OR e.last_name ILIKE $%d OR e.email ILIKE $%d OR e.employee_number ILIKE $%d)", argCount, argCount, argCount, argCount)
 		baseQuery += searchFilter
 		countQuery += searchFilter
 		args = append(args, "%"+search+"%")
@@ -73,7 +78,7 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 
 	if status != "" && status != "all" {
 		argCount++
-		statusFilter := fmt.Sprintf(" AND status = $%d", argCount)
+		statusFilter := fmt.Sprintf(" AND e.status = $%d", argCount)
 		baseQuery += statusFilter
 		countQuery += statusFilter
 		args = append(args, status)
@@ -81,11 +86,11 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 
 	if department != "" && department != "all" {
 		argCount++
-		// Department is stored in notes or custom_fields for now
-		deptFilter := fmt.Sprintf(" AND notes ILIKE $%d", argCount)
+		// Filter by department_id (UUID)
+		deptFilter := fmt.Sprintf(" AND e.department_id = $%d", argCount)
 		baseQuery += deptFilter
 		countQuery += deptFilter
-		args = append(args, "%"+department+"%")
+		args = append(args, department)
 	}
 
 	// Add sorting
@@ -99,7 +104,7 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 	if sortOrder != "ASC" && sortOrder != "DESC" {
 		sortOrder = "DESC"
 	}
-	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortBy, sortOrder)
+	baseQuery += fmt.Sprintf(" ORDER BY e.%s %s", sortBy, sortOrder)
 
 	// Add pagination
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
@@ -127,11 +132,17 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 		var emp entity.Employee
 		var middleName, email, phone, mobile, jobTitle, permission, notes sql.NullString
 		var baseSalary sql.NullFloat64
+		var departmentID sql.NullString
+		var departmentName string
+		var jobPositionID sql.NullString
+		var jobPositionName string
 
 		err := rows.Scan(
 			&emp.ID, &emp.TenantID, &emp.EmployeeNumber, &emp.FirstName, &emp.LastName,
 			&middleName, &email, &phone, &mobile, &jobTitle, &emp.HireDate, &emp.Status,
 			&baseSalary, &permission, &notes, &emp.CreatedAt, &emp.UpdatedAt,
+			&departmentID, &departmentName,
+			&jobPositionID, &jobPositionName,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan employee", "error", err)
@@ -157,11 +168,25 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 			emp.Permission = &permission.String
 		}
 
-		// Parse department and performance from notes (temporary storage)
+		// Set job_position_id from JOIN result
+		if jobPositionID.Valid {
+			jpUUID, _ := uuid.Parse(jobPositionID.String)
+			emp.JobPositionID = &jpUUID
+		}
+
+		// Set department from JOIN result, fall back to notes parsing for legacy data
+		if departmentID.Valid {
+			deptUUID, _ := uuid.Parse(departmentID.String)
+			emp.DepartmentID = &deptUUID
+		}
+		if departmentName != "" {
+			emp.Department = departmentName
+		} else if notes.Valid {
+			// Legacy fallback: parse department from notes JSON
+			emp.Department = parseDepartmentFromNotes(notes.String)
+		}
 		if notes.Valid {
 			emp.Notes = &notes.String
-			// Parse department from notes JSON-like format
-			emp.Department = parseDepartmentFromNotes(notes.String)
 			emp.PerformanceScore = parsePerformanceFromNotes(notes.String)
 			emp.TurnoverRisk = parseTurnoverRiskFromNotes(notes.String)
 		}
@@ -257,12 +282,39 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
+	// Resolve department_id from department name
+	var departmentID *uuid.UUID
+	if input.Department != "" {
+		// Try parsing as UUID first
+		if deptUUID, parseErr := uuid.Parse(input.Department); parseErr == nil {
+			departmentID = &deptUUID
+		} else {
+			// Look up department by name
+			var deptID uuid.UUID
+			lookupErr := h.db.QueryRow(
+				"SELECT id FROM departments WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL LIMIT 1",
+				tenantID, input.Department,
+			).Scan(&deptID)
+			if lookupErr == nil {
+				departmentID = &deptID
+			}
+		}
+	}
+
+	// Resolve job_position_id
+	var jobPositionID *uuid.UUID
+	if input.JobPositionID != "" {
+		if jpUUID, parseErr := uuid.Parse(input.JobPositionID); parseErr == nil {
+			jobPositionID = &jpUUID
+		}
+	}
+
 	query := `
 		INSERT INTO employees (
-			id, tenant_id, organization_id, employee_number, first_name, last_name, middle_name,
+			id, tenant_id, organization_id, department_id, job_position_id, employee_number, first_name, last_name, middle_name,
 			email, phone, job_title, hire_date, status, base_salary, permission, notes,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 		RETURNING id, created_at
 	`
 
@@ -292,7 +344,7 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 	}
 
 	err := h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, employeeNumber, firstName, lastName, middleName,
+		id, tenantID, orgIDPtr, departmentID, jobPositionID, employeeNumber, firstName, lastName, middleName,
 		email, phone, jobTitle, hireDate, status, baseSalary, permission, notes,
 		now, now,
 	).Scan(&id, &now)
@@ -307,23 +359,64 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		return
 	}
 
-	// Link the user to this employee record (if user exists with same email or phone)
-	if input.Email != "" {
-		_, linkErr := h.db.Exec(`
-			UPDATE users SET employee_id = $1, updated_at = $2
-			WHERE tenant_id = $3 AND email = $4 AND employee_id IS NULL
-		`, id, now, tenantID, input.Email)
-		if linkErr != nil {
-			h.log.Warn("Could not link user to employee", "error", linkErr, "email", input.Email)
+	// Create or link user account for this employee
+	contact := input.Email
+	isEmail := contact != ""
+	if !isEmail && input.Phone != "" {
+		contact = normalizePhone(input.Phone)
+	}
+
+	if contact != "" {
+		// Check if user already exists
+		var existingUserID uuid.UUID
+		var lookupErr error
+		if isEmail {
+			lookupErr = h.db.QueryRow(
+				"SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND deleted_at IS NULL",
+				tenantID, contact,
+			).Scan(&existingUserID)
+		} else {
+			lookupErr = h.db.QueryRow(
+				"SELECT id FROM users WHERE tenant_id = $1 AND phone = $2 AND deleted_at IS NULL",
+				tenantID, contact,
+			).Scan(&existingUserID)
 		}
-	} else if input.Phone != "" {
-		normalizedPhone := normalizePhone(input.Phone)
-		_, linkErr := h.db.Exec(`
-			UPDATE users SET employee_id = $1, updated_at = $2
-			WHERE tenant_id = $3 AND phone = $4 AND employee_id IS NULL
-		`, id, now, tenantID, normalizedPhone)
-		if linkErr != nil {
-			h.log.Warn("Could not link user to employee", "error", linkErr, "phone", normalizedPhone)
+
+		if lookupErr == sql.ErrNoRows {
+			// User doesn't exist — create one
+			const chars = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+			b := make([]byte, 8)
+			for i := range b {
+				b[i] = chars[rand.Intn(len(chars))]
+			}
+			plainPassword := string(b)
+			passwordHash, _ := crypto.HashPassword(plainPassword)
+
+			newUserID := uuid.New()
+			var emailVal, phoneVal *string
+			if isEmail {
+				emailVal = &contact
+				if input.Phone != "" {
+					p := normalizePhone(input.Phone)
+					phoneVal = &p
+				}
+			} else {
+				phoneVal = &contact
+			}
+
+			_, createErr := h.db.Exec(`
+				INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, phone,
+				                   language, timezone, settings, is_active, is_verified, employee_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, 'uz', 'Asia/Tashkent', '{}', true, true, $8)
+				ON CONFLICT DO NOTHING
+			`, newUserID, tenantID, emailVal, passwordHash, firstName, lastName, phoneVal, id)
+			if createErr != nil {
+				h.log.Warn("Could not auto-create user for employee", "error", createErr)
+			}
+		} else if lookupErr == nil {
+			// User exists — link to this employee
+			h.db.Exec(`UPDATE users SET employee_id = $1, updated_at = $2 WHERE id = $3`,
+				id, now, existingUserID)
 		}
 	}
 
@@ -498,7 +591,36 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 		addUpdate("permission", *input.Permission)
 	}
 
-	// Update notes with department/performance/turnover
+	// Update job_position_id
+	if input.JobPositionID != nil && *input.JobPositionID != "" {
+		if jpUUID, parseErr := uuid.Parse(*input.JobPositionID); parseErr == nil {
+			addUpdate("job_position_id", jpUUID)
+		}
+	}
+
+	// Update department_id (also accept department_id field directly)
+	if input.DepartmentID != nil && *input.DepartmentID != "" {
+		if deptUUID, parseErr := uuid.Parse(*input.DepartmentID); parseErr == nil {
+			addUpdate("department_id", deptUUID)
+		}
+	} else if input.Department != nil && *input.Department != "" {
+		// Try parsing as UUID first
+		if deptUUID, parseErr := uuid.Parse(*input.Department); parseErr == nil {
+			addUpdate("department_id", deptUUID)
+		} else {
+			// Look up department by name
+			var deptID uuid.UUID
+			lookupErr := h.db.QueryRow(
+				"SELECT id FROM departments WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL LIMIT 1",
+				tenantID, *input.Department,
+			).Scan(&deptID)
+			if lookupErr == nil {
+				addUpdate("department_id", deptID)
+			}
+		}
+	}
+
+	// Update notes with performance/turnover
 	if input.Department != nil || input.PerformanceScore != nil || input.TurnoverRisk != nil {
 		dept := ""
 		perf := 3.0

@@ -60,24 +60,32 @@ func (h *Handler) GetEmployeePermissions(c *gin.Context) {
 		return
 	}
 
-	// Verify employee exists and fetch role info
-	var roleID *uuid.UUID
-	var roleName string
-	var tmpRoleID uuid.NullUUID
-	var tmpRoleName sql.NullString
+	// Verify employee exists
+	var exists bool
 	err = h.db.QueryRow(`
-		SELECT e.role_id, COALESCE(r.name, '') as role_name
-		FROM employees e
-		LEFT JOIN roles r ON r.id = e.role_id AND r.deleted_at IS NULL
-		WHERE e.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
-	`, employeeID, tenantID).Scan(&tmpRoleID, &tmpRoleName)
-	if err != nil {
+		SELECT EXISTS(SELECT 1 FROM employees WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)
+	`, employeeID, tenantID).Scan(&exists)
+	if err != nil || !exists {
 		response.NotFound(c, "Employee")
 		return
 	}
-	if tmpRoleID.Valid {
-		roleID = &tmpRoleID.UUID
-		roleName = tmpRoleName.String
+
+	// Fetch role info separately to avoid scan type issues
+	var roleID *uuid.UUID
+	var roleName string
+	var tmpRoleIDStr sql.NullString
+	var tmpRoleName sql.NullString
+	_ = h.db.QueryRow(`
+		SELECT e.role_id::text, COALESCE(r.name, '') as role_name
+		FROM employees e
+		LEFT JOIN roles r ON r.id = e.role_id AND r.deleted_at IS NULL
+		WHERE e.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
+	`, employeeID, tenantID).Scan(&tmpRoleIDStr, &tmpRoleName)
+	if tmpRoleIDStr.Valid && tmpRoleIDStr.String != "" {
+		if parsed, parseErr := uuid.Parse(tmpRoleIDStr.String); parseErr == nil {
+			roleID = &parsed
+			roleName = tmpRoleName.String
+		}
 	}
 
 	// Fetch all permissions for this employee

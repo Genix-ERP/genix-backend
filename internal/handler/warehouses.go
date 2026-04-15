@@ -723,8 +723,8 @@ func (h *Handler) DeleteWarehouse(c *gin.Context) {
 	// Check for existing inventory
 	var hasInventory bool
 	h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM inventory WHERE warehouse_id = $1 AND quantity_on_hand > 0)
-	`, id).Scan(&hasInventory)
+		SELECT EXISTS(SELECT 1 FROM inventory WHERE warehouse_id = $1 AND tenant_id = $2 AND quantity_on_hand > 0)
+	`, id, tenantID).Scan(&hasInventory)
 
 	if hasInventory {
 		response.BadRequest(c, "Cannot delete warehouse with existing inventory. Set to inactive instead.")

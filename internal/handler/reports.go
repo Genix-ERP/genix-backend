@@ -30,7 +30,8 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 	}
 
 	query := `
-		SELECT a.id, a.code, a.name, at.category, at.normal_balance, a.parent_id,
+		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''),
+			   at.category, at.normal_balance, a.parent_id,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
 			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
 		FROM accounts a
@@ -46,7 +47,7 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance, a.parent_id
+		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, at.category, at.normal_balance, a.parent_id
 		ORDER BY a.code
 	`
 
@@ -67,7 +68,7 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		var debitSum, creditSum float64
 		var parentID *uuid.UUID
 
-		err := rows.Scan(&acc.AccountID, &acc.AccountCode, &acc.AccountName, &acc.Category, &normalBalance, &parentID, &debitSum, &creditSum)
+		err := rows.Scan(&acc.AccountID, &acc.AccountCode, &acc.AccountName, &acc.AccountNameUz, &acc.AccountNameEn, &acc.Category, &normalBalance, &parentID, &debitSum, &creditSum)
 		if err != nil {
 			continue
 		}
@@ -161,8 +162,9 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		asOfDate = time.Now().Format("2006-01-02")
 	}
 
+	// Query ALL account categories including revenue/expense to compute net income
 	query := `
-		SELECT a.id, a.code, COALESCE(NULLIF(a.name_uz, ''), a.name) as display_name,
+		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''),
 			   at.category, at.normal_balance,
 			   a.opening_balance,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
@@ -173,7 +175,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
 			AND je.status = 'posted' AND je.entry_date <= $2 AND je.deleted_at IS NULL
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
-			AND at.category IN ('asset', 'liability', 'equity')
+			AND at.category IN ('asset', 'liability', 'equity', 'revenue', 'expense')
 	`
 	args := []interface{}{tenantID, asOfDate}
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
@@ -181,7 +183,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance, a.opening_balance
+		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, at.category, at.normal_balance, a.opening_balance
 		ORDER BY at.category, a.code
 	`
 
@@ -197,13 +199,14 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 	liabilityAccounts := make([]entity.BalanceSheetAccount, 0)
 	equityAccounts := make([]entity.BalanceSheetAccount, 0)
 	var totalAssets, totalLiabilities, totalEquity float64
+	var totalRevenue, totalExpenses float64
 
 	for rows.Next() {
 		var accountID uuid.UUID
-		var code, name, category, normalBalance string
+		var code, name, nameUz, nameEn, category, normalBalance string
 		var openingBalance, debitSum, creditSum float64
 
-		err := rows.Scan(&accountID, &code, &name, &category, &normalBalance, &openingBalance, &debitSum, &creditSum)
+		err := rows.Scan(&accountID, &code, &name, &nameUz, &nameEn, &category, &normalBalance, &openingBalance, &debitSum, &creditSum)
 		if err != nil {
 			continue
 		}
@@ -216,16 +219,29 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 			balance = openingBalance + creditSum - debitSum
 		}
 
+		// Revenue and expense accounts contribute to net income (shown in equity)
+		// but are not displayed as separate balance sheet line items
+		switch category {
+		case "revenue":
+			totalRevenue += balance
+			continue
+		case "expense":
+			totalExpenses += balance
+			continue
+		}
+
 		// Skip zero balances for assets/liabilities, but always show equity accounts
 		if math.Abs(balance) < 0.01 && category != "equity" {
 			continue
 		}
 
 		acc := entity.BalanceSheetAccount{
-			AccountID:   accountID,
-			AccountCode: code,
-			AccountName: name,
-			Balance:     math.Round(balance*100) / 100,
+			AccountID:     accountID,
+			AccountCode:   code,
+			AccountName:   name,
+			AccountNameUz: nameUz,
+			AccountNameEn: nameEn,
+			Balance:       math.Round(balance*100) / 100,
 		}
 
 		switch category {
@@ -239,6 +255,34 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 			equityAccounts = append(equityAccounts, acc)
 			totalEquity += balance
 		}
+	}
+
+	// Net income = Revenue - Expenses (this is the current year's undistributed profit)
+	netIncome := math.Round((totalRevenue - totalExpenses) * 100) / 100
+
+	// Add net income as a line item in equity if it's non-zero
+	// This represents "Joriy yil foydasi" (Current Year Profit/Loss)
+	if math.Abs(netIncome) >= 0.01 {
+		// Check if there's already a "3300" account in equityAccounts
+		found := false
+		for i, acc := range equityAccounts {
+			if acc.AccountCode == "3300" {
+				// Add net income to the existing account's balance
+				equityAccounts[i].Balance += netIncome
+				found = true
+				break
+			}
+		}
+		if !found {
+			equityAccounts = append(equityAccounts, entity.BalanceSheetAccount{
+				AccountCode:   "3300",
+				AccountName:   "Joriy yil foydasi",
+				AccountNameUz: "Joriy yil foydasi",
+				AccountNameEn: "Current Year Profit/Loss",
+				Balance:       netIncome,
+			})
+		}
+		totalEquity += netIncome
 	}
 
 	report := entity.BalanceSheetReport{
@@ -287,7 +331,8 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 	}
 
 	query := `
-		SELECT a.id, a.code, a.name, at.category, at.normal_balance, at.code as type_code,
+		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''),
+			   at.category, at.normal_balance, at.code as type_code,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
 			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
 		FROM accounts a
@@ -306,7 +351,7 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, at.category, at.normal_balance, at.code
+		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, at.category, at.normal_balance, at.code
 		HAVING COALESCE(SUM(jel.debit_amount), 0) > 0 OR COALESCE(SUM(jel.credit_amount), 0) > 0
 		ORDER BY at.category DESC, a.code
 	`
@@ -328,10 +373,10 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 
 	for rows.Next() {
 		var accountID uuid.UUID
-		var code, name, category, normalBalance, typeCode string
+		var code, name, nameUz, nameEn, category, normalBalance, typeCode string
 		var debitSum, creditSum float64
 
-		err := rows.Scan(&accountID, &code, &name, &category, &normalBalance, &typeCode, &debitSum, &creditSum)
+		err := rows.Scan(&accountID, &code, &name, &nameUz, &nameEn, &category, &normalBalance, &typeCode, &debitSum, &creditSum)
 		if err != nil {
 			continue
 		}
@@ -349,10 +394,12 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 		}
 
 		section := entity.IncomeStatementSection{
-			AccountID:   accountID,
-			AccountCode: code,
-			AccountName: name,
-			Amount:      math.Round(amount*100) / 100,
+			AccountID:     accountID,
+			AccountCode:   code,
+			AccountName:   name,
+			AccountNameUz: nameUz,
+			AccountNameEn: nameEn,
+			Amount:        math.Round(amount*100) / 100,
 		}
 
 		// Categorize by account_type code, with account code range fallback

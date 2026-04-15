@@ -100,6 +100,8 @@ type CreateContactInput struct {
 	Notes              string                 `json:"notes,omitempty"`
 	ExpectedRevenue    *float64               `json:"expected_revenue,omitempty"`
 	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
+	DefaultReceivableAccountID string         `json:"default_receivable_account_id,omitempty"`
+	DefaultPayableAccountID    string         `json:"default_payable_account_id,omitempty"`
 	ContactPersons     []CreateContactPersonInput `json:"contact_persons,omitempty"`
 }
 
@@ -123,7 +125,9 @@ type UpdateContactInput struct {
 	Notes              *string                `json:"notes,omitempty"`
 	ExpectedRevenue    *float64               `json:"expected_revenue,omitempty"`
 	CustomFields       map[string]interface{} `json:"custom_fields,omitempty"`
-	IsActive           *bool                  `json:"is_active,omitempty"`
+	IsActive                   *bool                  `json:"is_active,omitempty"`
+	DefaultReceivableAccountID *string                `json:"default_receivable_account_id,omitempty"`
+	DefaultPayableAccountID    *string                `json:"default_payable_account_id,omitempty"`
 }
 
 // CreateContactPersonInput represents input for creating a contact person
@@ -174,7 +178,9 @@ type ContactResponse struct {
 	IsActive           bool                   `json:"is_active"`
 	Rating             *float64               `json:"rating,omitempty"`
 	RatingCount        *int                   `json:"rating_count,omitempty"`
-	SourceOrganizationID *string               `json:"source_organization_id,omitempty"`
+	SourceOrganizationID       *string               `json:"source_organization_id,omitempty"`
+	DefaultReceivableAccountID *string              `json:"default_receivable_account_id,omitempty"`
+	DefaultPayableAccountID    *string              `json:"default_payable_account_id,omitempty"`
 	ContactPersons     []ContactPerson        `json:"contact_persons,omitempty"`
 	CreatedAt          time.Time              `json:"created_at"`
 	UpdatedAt          time.Time              `json:"updated_at"`

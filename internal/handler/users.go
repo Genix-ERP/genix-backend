@@ -44,7 +44,7 @@ func (h *Handler) ListUsers(c *gin.Context) {
 
 	// Query users
 	query := `
-		SELECT id, email, first_name, last_name, phone, avatar_url,
+		SELECT id, COALESCE(email, ''), first_name, last_name, phone, avatar_url,
 		       language, timezone, is_active, is_verified, last_login_at,
 		       password_hash, invite_token_expires,
 		       created_at, updated_at
@@ -330,7 +330,7 @@ func (h *Handler) SendCredentials(c *gin.Context) {
 	var tenantName string
 	_ = h.db.QueryRow("SELECT name FROM tenants WHERE id = $1", tenantID).Scan(&tenantName)
 	if tenantName == "" {
-		tenantName = "Yuksalish"
+		tenantName = "Genix"
 	}
 
 	if input.Method == "sms" {
@@ -410,7 +410,7 @@ func (h *Handler) GetUser(c *gin.Context) {
 	var lastLogin sql.NullTime
 
 	err = h.db.QueryRow(`
-		SELECT id, email, first_name, last_name, phone, avatar_url,
+		SELECT id, COALESCE(email, ''), first_name, last_name, phone, avatar_url,
 		       language, timezone, is_active, is_verified, last_login_at,
 		       created_at, updated_at
 		FROM users
@@ -660,7 +660,7 @@ func (h *Handler) ListAllSystemUsers(c *gin.Context) {
 	// Query tenant owners with tenant info and user count
 	// Find users with 'owner' role or is_system_admin=true for backwards compatibility
 	query := `
-		SELECT DISTINCT u.id, u.email, u.first_name, u.last_name, u.phone, u.avatar_url,
+		SELECT DISTINCT u.id, COALESCE(u.email, ''), u.first_name, u.last_name, u.phone, u.avatar_url,
 		       u.language, u.timezone, u.is_active, u.is_verified, u.last_login_at,
 		       u.created_at, u.updated_at,
 		       t.id as tenant_id, t.name as tenant_name, t.code as tenant_code,

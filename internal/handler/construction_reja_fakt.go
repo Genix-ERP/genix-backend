@@ -352,16 +352,19 @@ func (h *Handler) ListSubStageEquipment(c *gin.Context) {
 		ID           int64     `json:"id"`
 		SubStageID   int64     `json:"sub_stage_id"`
 		Name         string    `json:"name"`
+		Type         string    `json:"type"`
 		WorkUnit     string    `json:"work_unit"`
 		PlanQuantity float64   `json:"plan_quantity"`
 		FactQuantity float64   `json:"fact_quantity"`
+		Quantity     float64   `json:"quantity"`
 		UnitPrice    float64   `json:"unit_price"`
+		TotalCost    float64   `json:"total_cost"`
 		Note         *string   `json:"note"`
 		CreatedAt    time.Time `json:"created_at"`
 	}
 
 	rows, err := h.db.Query(`
-		SELECT id, sub_stage_id, name, work_unit, plan_quantity, fact_quantity, unit_price, note, created_at
+		SELECT id, sub_stage_id, name, COALESCE(resource_type,'equipment'), work_unit, plan_quantity, fact_quantity, unit_price, note, created_at
 		FROM construction_sub_stage_equipment
 		WHERE sub_stage_id = $1 AND tenant_id = $2
 		ORDER BY id ASC
@@ -376,9 +379,12 @@ func (h *Handler) ListSubStageEquipment(c *gin.Context) {
 	items := []Equipment{}
 	for rows.Next() {
 		var e Equipment
-		if err := rows.Scan(&e.ID, &e.SubStageID, &e.Name, &e.WorkUnit, &e.PlanQuantity, &e.FactQuantity, &e.UnitPrice, &e.Note, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.SubStageID, &e.Name, &e.Type, &e.WorkUnit, &e.PlanQuantity, &e.FactQuantity, &e.UnitPrice, &e.Note, &e.CreatedAt); err != nil {
 			continue
 		}
+		// Convenience fields: quantity = plan_quantity, total_cost = plan * price
+		e.Quantity = e.PlanQuantity
+		e.TotalCost = e.PlanQuantity * e.UnitPrice
 		items = append(items, e)
 	}
 
@@ -401,7 +407,9 @@ func (h *Handler) CreateSubStageEquipment(c *gin.Context) {
 
 	var req struct {
 		Name         string  `json:"name" binding:"required"`
+		Type         string  `json:"type"`
 		WorkUnit     string  `json:"work_unit"`
+		Quantity     float64 `json:"quantity"`
 		PlanQuantity float64 `json:"plan_quantity"`
 		FactQuantity float64 `json:"fact_quantity"`
 		UnitPrice    float64 `json:"unit_price"`
@@ -415,14 +423,22 @@ func (h *Handler) CreateSubStageEquipment(c *gin.Context) {
 	if req.WorkUnit == "" {
 		req.WorkUnit = "soat"
 	}
+	// Accept `quantity` as alias for plan_quantity (from frontend)
+	if req.PlanQuantity == 0 && req.Quantity != 0 {
+		req.PlanQuantity = req.Quantity
+	}
+	// Normalize resource type
+	if req.Type != "employee" {
+		req.Type = "equipment"
+	}
 
 	var id int64
 	err = h.db.QueryRow(`
 		INSERT INTO construction_sub_stage_equipment (
-			tenant_id, sub_stage_id, name, work_unit, plan_quantity, fact_quantity, unit_price, note
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			tenant_id, sub_stage_id, name, resource_type, work_unit, plan_quantity, fact_quantity, unit_price, note
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id
-	`, tenantID, subStageID, req.Name, req.WorkUnit, req.PlanQuantity, req.FactQuantity, req.UnitPrice, nullStringFromVal(req.Note)).Scan(&id)
+	`, tenantID, subStageID, req.Name, req.Type, req.WorkUnit, req.PlanQuantity, req.FactQuantity, req.UnitPrice, nullStringFromVal(req.Note)).Scan(&id)
 	if err != nil {
 		h.log.Error("Failed to create sub-stage equipment", "error", err)
 		response.InternalError(c, "Failed to create equipment")
