@@ -50,8 +50,11 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 5000 {
+		limit = 5000
 	}
 	offset := (page - 1) * limit
 
