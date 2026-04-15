@@ -62,6 +62,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	search := c.Query("search")
 	categoryID := c.Query("category_id")
 	productType := c.Query("type")
+	inventoryType := c.Query("inventory_type")
 	includeInactive := c.Query("include_inactive") == "true"
 
 	// Build query - products are shared across orgs, org-specific data comes from product_organization_settings
@@ -154,6 +155,15 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		countQuery += fmt.Sprintf(" AND p.type = $%d", countArgCount)
 		args = append(args, productType)
 		countArgs = append(countArgs, productType)
+	}
+
+	if inventoryType != "" {
+		argCount++
+		countArgCount++
+		baseQuery += fmt.Sprintf(" AND COALESCE(p.inventory_type, 'trade') = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND COALESCE(p.inventory_type, 'trade') = $%d", countArgCount)
+		args = append(args, inventoryType)
+		countArgs = append(countArgs, inventoryType)
 	}
 
 	if search != "" {
