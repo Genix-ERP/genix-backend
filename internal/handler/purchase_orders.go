@@ -1362,6 +1362,70 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		poLineRows.Close()
 	}
 
+	// Auto-receive: directly add goods to inventory (1-step simplified flow)
+	{
+		var whID uuid.UUID
+		if warehouseID != nil {
+			whID = *warehouseID
+		} else {
+			// Fallback to first warehouse
+			h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&whID)
+		}
+
+		if whID != uuid.Nil {
+			lineRows, _ := h.db.Query(`
+				SELECT pol.product_id, pol.quantity, pol.unit_price
+				FROM purchase_order_lines pol
+				WHERE pol.purchase_order_id = $1 AND pol.product_id IS NOT NULL
+			`, poID)
+			if lineRows != nil {
+				for lineRows.Next() {
+					var prodID uuid.UUID
+					var qty, unitPrice float64
+					if lineRows.Scan(&prodID, &qty, &unitPrice) != nil {
+						continue
+					}
+
+					// Upsert inventory
+					var invID uuid.UUID
+					err := h.db.QueryRow(`
+						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+						ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET updated_at = NOW()
+						RETURNING id
+					`, uuid.New(), tenantID, prodID, whID, orgID, unitPrice, now).Scan(&invID)
+					if err != nil {
+						continue
+					}
+
+					// Add quantity
+					h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, unit_cost = $2, last_movement_date = $3, updated_at = $3 WHERE id = $4`,
+						qty, unitPrice, now, invID)
+
+					// Create transaction
+					h.db.Exec(`INSERT INTO inventory_transactions (id, tenant_id, organization_id, inventory_id, transaction_type, quantity, unit_cost, total_cost, reference_type, reference_id, reason, transaction_date, created_at)
+						VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, 'purchase_order', $8, 'PO Auto-Receipt', $9, $9)`,
+						uuid.New(), tenantID, orgID, invID, qty, unitPrice, qty*unitPrice, poID, now)
+
+					// Create lot for FIFO
+					lotNumber := fmt.Sprintf("PO-%s", poID.String()[:8])
+					h.db.Exec(`INSERT INTO inventory_lots (id, tenant_id, product_id, warehouse_id, lot_number, received_date, initial_quantity, remaining_quantity, unit_cost, purchase_order_id, status, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)`,
+						uuid.New(), tenantID, prodID, whID, lotNumber, now, qty, unitPrice, poID)
+				}
+				lineRows.Close()
+			}
+
+			// Update PO status to received
+			h.db.Exec(`UPDATE purchase_orders SET status = 'received', updated_at = NOW() WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
+
+			// Update PO line quantities received
+			h.db.Exec(`UPDATE purchase_order_lines SET quantity_received = quantity WHERE purchase_order_id = $1`, poID)
+
+			h.log.Info("Auto-received PO goods into inventory", "po_id", poID, "warehouse_id", whID)
+		}
+	}
+
 	return nil
 }
 
