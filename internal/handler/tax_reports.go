@@ -710,46 +710,60 @@ func (h *Handler) GetTaxReportSummary(c *gin.Context) {
 		return
 	}
 
+	organizationID, _ := middleware.GetOrganizationID(c)
+
 	startDate := c.Query("start_date")
 	endDate := c.Query("end_date")
 	hasDates := startDate != "" && endDate != ""
+
+	// Build org filter
+	orgFilter := ""
+	args := []interface{}{tenantID}
+	argIdx := 2
+	if organizationID != uuid.Nil {
+		orgFilter = fmt.Sprintf(" AND organization_id = $%d", argIdx)
+		args = append(args, organizationID)
+		argIdx++
+	}
 
 	// Get sales tax summary
 	var totalSales, totalSalesTax float64
 	var salesCount int
 	if hasDates {
-		h.db.QueryRow(`
+		dateArgs := append(args, startDate, endDate)
+		h.db.QueryRow(fmt.Sprintf(`
 			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
 			FROM sales_invoices
-			WHERE tenant_id = $1 AND invoice_date >= $2 AND invoice_date <= $3
+			WHERE tenant_id = $1%s AND invoice_date >= $%d AND invoice_date <= $%d
 				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
-		`, tenantID, startDate, endDate).Scan(&totalSales, &totalSalesTax, &salesCount)
+		`, orgFilter, argIdx, argIdx+1), dateArgs...).Scan(&totalSales, &totalSalesTax, &salesCount)
 	} else {
-		h.db.QueryRow(`
+		h.db.QueryRow(fmt.Sprintf(`
 			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
 			FROM sales_invoices
-			WHERE tenant_id = $1
+			WHERE tenant_id = $1%s
 				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
-		`, tenantID).Scan(&totalSales, &totalSalesTax, &salesCount)
+		`, orgFilter), args...).Scan(&totalSales, &totalSalesTax, &salesCount)
 	}
 
 	// Get purchase tax summary
 	var totalPurchases, totalPurchaseTax float64
 	var purchaseCount int
 	if hasDates {
-		h.db.QueryRow(`
+		dateArgs := append(args, startDate, endDate)
+		h.db.QueryRow(fmt.Sprintf(`
 			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
 			FROM purchase_invoices
-			WHERE tenant_id = $1 AND invoice_date >= $2 AND invoice_date <= $3
+			WHERE tenant_id = $1%s AND invoice_date >= $%d AND invoice_date <= $%d
 				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
-		`, tenantID, startDate, endDate).Scan(&totalPurchases, &totalPurchaseTax, &purchaseCount)
+		`, orgFilter, argIdx, argIdx+1), dateArgs...).Scan(&totalPurchases, &totalPurchaseTax, &purchaseCount)
 	} else {
-		h.db.QueryRow(`
+		h.db.QueryRow(fmt.Sprintf(`
 			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
 			FROM purchase_invoices
-			WHERE tenant_id = $1
+			WHERE tenant_id = $1%s
 				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
-		`, tenantID).Scan(&totalPurchases, &totalPurchaseTax, &purchaseCount)
+		`, orgFilter), args...).Scan(&totalPurchases, &totalPurchaseTax, &purchaseCount)
 	}
 
 	// Get filed periods count
@@ -797,6 +811,8 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 		return
 	}
 
+	organizationID, _ := middleware.GetOrganizationID(c)
+
 	startDate := c.Query("start_date")
 	endDate := c.Query("end_date")
 	txType := c.Query("type") // sales, purchases
@@ -804,11 +820,21 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 	// Build date filter clause and args dynamically
 	hasDates := startDate != "" && endDate != ""
 
+	// Build org filter
+	txOrgFilter := ""
+	baseArgs := []interface{}{tenantID}
+	nextArg := 2
+	if organizationID != uuid.Nil {
+		txOrgFilter = fmt.Sprintf(" AND si.organization_id = $%d", nextArg)
+		baseArgs = append(baseArgs, organizationID)
+		nextArg++
+	}
+
 	transactions := make([]map[string]interface{}, 0)
 
 	if txType == "" || txType == "sales" {
 		// Get sales invoices
-		salesQuery := `
+		salesQuery := fmt.Sprintf(`
 			SELECT
 				si.id, 'sales_invoice' as type, si.invoice_number, si.invoice_date,
 				'customer' as party_type, si.customer_id, si.customer_name,
@@ -818,11 +844,12 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 			FROM sales_invoices si
 			LEFT JOIN contacts c ON c.id = si.customer_id
 			LEFT JOIN tax_rates tr ON tr.id = si.tax_rate_id
-			WHERE si.tenant_id = $1
-				AND si.status NOT IN ('draft', 'cancelled') AND si.deleted_at IS NULL`
-		salesArgs := []interface{}{tenantID}
+			WHERE si.tenant_id = $1%s
+				AND si.status NOT IN ('draft', 'cancelled') AND si.deleted_at IS NULL`, txOrgFilter)
+		salesArgs := make([]interface{}, len(baseArgs))
+		copy(salesArgs, baseArgs)
 		if hasDates {
-			salesQuery += ` AND si.invoice_date >= $2 AND si.invoice_date <= $3`
+			salesQuery += fmt.Sprintf(` AND si.invoice_date >= $%d AND si.invoice_date <= $%d`, nextArg, nextArg+1)
 			salesArgs = append(salesArgs, startDate, endDate)
 		}
 		salesQuery += ` ORDER BY si.invoice_date DESC`
@@ -872,8 +899,12 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 	}
 
 	if txType == "" || txType == "purchases" {
-		// Get purchase invoices
-		purchaseQuery := `
+		// Get purchase invoices - build org filter for pi alias
+		piOrgFilter := ""
+		if organizationID != uuid.Nil {
+			piOrgFilter = fmt.Sprintf(" AND pi.organization_id = $%d", 2)
+		}
+		purchaseQuery := fmt.Sprintf(`
 			SELECT
 				pi.id, 'purchase_invoice' as type, pi.invoice_number, pi.invoice_date,
 				'vendor' as party_type, pi.vendor_id, COALESCE(pi.supplier_name, c.name, '') as vendor_name,
@@ -883,11 +914,12 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 			FROM purchase_invoices pi
 			LEFT JOIN contacts c ON c.id = pi.vendor_id
 			LEFT JOIN tax_rates tr ON tr.id = pi.tax_rate_id
-			WHERE pi.tenant_id = $1
-				AND pi.status NOT IN ('draft', 'cancelled') AND pi.deleted_at IS NULL`
-		purchaseArgs := []interface{}{tenantID}
+			WHERE pi.tenant_id = $1%s
+				AND pi.status NOT IN ('draft', 'cancelled') AND pi.deleted_at IS NULL`, piOrgFilter)
+		purchaseArgs := make([]interface{}, len(baseArgs))
+		copy(purchaseArgs, baseArgs)
 		if hasDates {
-			purchaseQuery += ` AND pi.invoice_date >= $2 AND pi.invoice_date <= $3`
+			purchaseQuery += fmt.Sprintf(` AND pi.invoice_date >= $%d AND pi.invoice_date <= $%d`, nextArg, nextArg+1)
 			purchaseArgs = append(purchaseArgs, startDate, endDate)
 		}
 		purchaseQuery += ` ORDER BY pi.invoice_date DESC`

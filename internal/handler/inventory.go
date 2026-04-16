@@ -8787,6 +8787,8 @@ func (h *Handler) ListInventoryLots(c *gin.Context) {
 		return
 	}
 
+	organizationID, _ := middleware.GetOrganizationID(c)
+
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
@@ -8829,6 +8831,14 @@ func (h *Handler) ListInventoryLots(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization's warehouses
+	if organizationID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		args = append(args, organizationID)
+	}
 
 	if productID != "" {
 		argCount++
