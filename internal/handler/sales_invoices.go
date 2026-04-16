@@ -44,7 +44,28 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
 			   COALESCE(c.name, si.customer_name, '') as customer_name,
 			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason,
-			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date
+			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date,
+			   COALESCE((
+				   SELECT string_agg(DISTINCT j.name, ', ')
+				   FROM payment_allocations pa
+				   JOIN payments p ON pa.payment_id = p.id
+				   JOIN journals j ON p.journal_id = j.id
+				   WHERE pa.document_id = si.id AND pa.document_type = 'sales_invoice' AND p.status = 'confirmed'
+			   ), '') as payment_journals,
+			   COALESCE((
+				   SELECT string_agg(DISTINCT COALESCE(j.name_uz, j.name), ', ')
+				   FROM payment_allocations pa
+				   JOIN payments p ON pa.payment_id = p.id
+				   JOIN journals j ON p.journal_id = j.id
+				   WHERE pa.document_id = si.id AND pa.document_type = 'sales_invoice' AND p.status = 'confirmed'
+			   ), '') as payment_journals_uz,
+			   COALESCE((
+				   SELECT string_agg(DISTINCT COALESCE(j.name_en, j.name), ', ')
+				   FROM payment_allocations pa
+				   JOIN payments p ON pa.payment_id = p.id
+				   JOIN journals j ON p.journal_id = j.id
+				   WHERE pa.document_id = si.id AND pa.document_type = 'sales_invoice' AND p.status = 'confirmed'
+			   ), '') as payment_journals_en
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
@@ -165,6 +186,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		var paymentTermID sql.NullString
 		var earlyDiscountAmount float64
 		var earlyDiscountDate sql.NullTime
+		var paymentJournals, paymentJournalsUz, paymentJournalsEn string
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -176,6 +198,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			&customerName,
 			&invoiceType, &originalInvoiceID, &reason,
 			&paymentTermID, &earlyDiscountAmount, &earlyDiscountDate,
+			&paymentJournals, &paymentJournalsUz, &paymentJournalsEn,
 		)
 		if err != nil {
 			continue
@@ -207,9 +230,12 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			"balance":         amountDue, // Add balance as alias for amount_due for frontend compatibility
 			"status":          status,
 			"payment_status":  paymentStatus,
-			"invoice_type":    invoiceType,
-			"created_at":      createdAt,
-			"updated_at":      updatedAt,
+			"invoice_type":      invoiceType,
+			"created_at":        createdAt,
+			"updated_at":        updatedAt,
+			"payment_journals":    paymentJournals,
+			"payment_journals_uz": paymentJournalsUz,
+			"payment_journals_en": paymentJournalsEn,
 		}
 
 		if organizationID.Valid {
@@ -697,7 +723,8 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	// Get payment allocations with payment details
 	paQuery := `
 		SELECT pa.id, pa.payment_id, pa.amount, p.payment_number, p.status, p.payment_date,
-			   COALESCE(p.reference, '') as reference, COALESCE(j.name, '') as journal_name
+			   COALESCE(p.reference, '') as reference, COALESCE(j.name, '') as journal_name,
+			   COALESCE(j.name_uz, '') as journal_name_uz, COALESCE(j.name_en, '') as journal_name_en
 		FROM payment_allocations pa
 		JOIN payments p ON p.id = pa.payment_id
 		LEFT JOIN journals j ON p.journal_id = j.id
@@ -713,21 +740,23 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		for paRows.Next() {
 			var paID, paymentID uuid.UUID
 			var paAmount float64
-			var paymentNumber, pStatus, pReference, journalName string
+			var paymentNumber, pStatus, pReference, journalName, journalNameUz, journalNameEn string
 			var paymentDate time.Time
 
-			if err := paRows.Scan(&paID, &paymentID, &paAmount, &paymentNumber, &pStatus, &paymentDate, &pReference, &journalName); err != nil {
+			if err := paRows.Scan(&paID, &paymentID, &paAmount, &paymentNumber, &pStatus, &paymentDate, &pReference, &journalName, &journalNameUz, &journalNameEn); err != nil {
 				continue
 			}
 			paymentAllocations = append(paymentAllocations, map[string]interface{}{
-				"id":             paID.String(),
-				"payment_id":     paymentID.String(),
-				"amount":         paAmount,
-				"payment_number": paymentNumber,
-				"status":         pStatus,
-				"payment_date":   paymentDate.Format("2006-01-02"),
-				"reference":      pReference,
-				"journal_name":   journalName,
+				"id":              paID.String(),
+				"payment_id":      paymentID.String(),
+				"amount":          paAmount,
+				"payment_number":  paymentNumber,
+				"status":          pStatus,
+				"payment_date":    paymentDate.Format("2006-01-02"),
+				"reference":       pReference,
+				"journal_name":    journalName,
+				"journal_name_uz": journalNameUz,
+				"journal_name_en": journalNameEn,
 			})
 		}
 		invoice["payment_allocations"] = paymentAllocations
