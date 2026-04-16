@@ -558,6 +558,19 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 		h.log.Warn("Could not create credit note - missing accounts or journal", "ar_account", arAccountID, "revenue_account", revenueAccountID, "journal", journalID)
 	}
 
+	// Deduct return total from customer balance
+	if customerID.Valid {
+		_, err := h.db.Exec(
+			"UPDATE contacts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
+			totalAmount, now, customerID.String,
+		)
+		if err != nil {
+			h.log.Error("Failed to update customer balance for return", "error", err, "customer_id", customerID.String)
+		} else {
+			h.log.Info("Customer balance deducted for sales return", "customer_id", customerID.String, "amount", totalAmount)
+		}
+	}
+
 	ret, _ := h.getSalesReturnByID(tenantID, returnID)
 	response.Success(c, ret)
 }
