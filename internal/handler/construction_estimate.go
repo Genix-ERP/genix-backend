@@ -1416,6 +1416,22 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 		return 0
 	}
 
+	// Skip auto-creation if project is missing required client details for KS-2
+	var clientName, clientStir, clientBankName, clientBankAccount, clientMfo, clientAddress sql.NullString
+	_ = h.db.QueryRow(`
+		SELECT client_name, client_stir, client_bank_name, client_bank_account, client_mfo, client_address
+		FROM construction_projects WHERE id = $1 AND tenant_id = $2
+	`, projectID, tenantID).Scan(&clientName, &clientStir, &clientBankName, &clientBankAccount, &clientMfo, &clientAddress)
+	if !clientName.Valid || strings.TrimSpace(clientName.String) == "" ||
+		!clientStir.Valid || strings.TrimSpace(clientStir.String) == "" ||
+		!clientBankName.Valid || strings.TrimSpace(clientBankName.String) == "" ||
+		!clientBankAccount.Valid || strings.TrimSpace(clientBankAccount.String) == "" ||
+		!clientMfo.Valid || strings.TrimSpace(clientMfo.String) == "" ||
+		!clientAddress.Valid || strings.TrimSpace(clientAddress.String) == "" {
+		h.log.Info("Skipping auto Forma 2 creation: project missing required client details", "projectID", projectID)
+		return 0
+	}
+
 	// Fetch all estimate lines (excluding resource sub-items for edinich)
 	rows, err := h.db.Query(`
 		SELECT id, name, uom, quantity,

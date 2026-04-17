@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -247,6 +248,15 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+
+	// Validate client details for KS-2 and KS-3 types
+	if req.ActType == "ks2" || req.ActType == "ks3" {
+		if !h.projectHasRequiredClientDetails(tenantID, projectID) {
+			response.Error(c, http.StatusBadRequest, "MISSING_CLIENT_DETAILS",
+				"Loyiha buyurtmachi ma'lumotlari to'ldirilmagan (nomi, STIR, bank, MFO, manzil)")
+			return
+		}
+	}
 
 	// Forma 19 validations
 	if req.ActType == "hidden_work" {
@@ -812,6 +822,13 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
+	// Validate project has required client details for KS-2
+	if !h.projectHasRequiredClientDetails(tenantID, projectID) {
+		response.Error(c, http.StatusBadRequest, "MISSING_CLIENT_DETAILS",
+			"Loyiha buyurtmachi ma'lumotlari to'ldirilmagan (nomi, STIR, bank, MFO, manzil)")
+		return
+	}
+
 	wbsIDs := []int64{}
 
 	if req.SubcontractID > 0 {
@@ -1025,6 +1042,13 @@ func (h *Handler) PreviewAutoGenerateKS2(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
+		return
+	}
+
+	// Validate project has required client details for KS-2
+	if !h.projectHasRequiredClientDetails(tenantID, projectID) {
+		response.Error(c, http.StatusBadRequest, "MISSING_CLIENT_DETAILS",
+			"Loyiha buyurtmachi ma'lumotlari to'ldirilmagan (nomi, STIR, bank, MFO, manzil)")
 		return
 	}
 
@@ -1586,6 +1610,13 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+
+	// Validate project has required client details for KS-3
+	if !h.projectHasRequiredClientDetails(tenantID, projectID) {
+		response.Error(c, http.StatusBadRequest, "MISSING_CLIENT_DETAILS",
+			"Loyiha buyurtmachi ma'lumotlari to'ldirilmagan (nomi, STIR, bank, MFO, manzil)")
+		return
+	}
 
 	// Build subcontract filter for SQL queries
 	var subFilter string
@@ -2172,4 +2203,23 @@ func nullFloat64Val(n sql.NullFloat64) interface{} {
 		return math.Round(n.Float64*100) / 100
 	}
 	return nil
+}
+
+// projectHasRequiredClientDetails checks if a construction project has all required
+// client details filled in for generating KS-2 and KS-3 documents.
+func (h *Handler) projectHasRequiredClientDetails(tenantID uuid.UUID, projectID int64) bool {
+	var clientName, clientStir, clientBankName, clientBankAccount, clientMfo, clientAddress sql.NullString
+	err := h.db.QueryRow(`
+		SELECT client_name, client_stir, client_bank_name, client_bank_account, client_mfo, client_address
+		FROM construction_projects WHERE id = $1 AND tenant_id = $2
+	`, projectID, tenantID).Scan(&clientName, &clientStir, &clientBankName, &clientBankAccount, &clientMfo, &clientAddress)
+	if err != nil {
+		return false
+	}
+	return clientName.Valid && strings.TrimSpace(clientName.String) != "" &&
+		clientStir.Valid && strings.TrimSpace(clientStir.String) != "" &&
+		clientBankName.Valid && strings.TrimSpace(clientBankName.String) != "" &&
+		clientBankAccount.Valid && strings.TrimSpace(clientBankAccount.String) != "" &&
+		clientMfo.Valid && strings.TrimSpace(clientMfo.String) != "" &&
+		clientAddress.Valid && strings.TrimSpace(clientAddress.String) != ""
 }
