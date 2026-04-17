@@ -249,15 +249,6 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
-	// Validate client details for KS-2 and KS-3 types
-	if req.ActType == "ks2" || req.ActType == "ks3" {
-		if !h.projectHasRequiredClientDetails(tenantID, projectID) {
-			response.Error(c, http.StatusBadRequest, "MISSING_CLIENT_DETAILS",
-				"Loyiha buyurtmachi ma'lumotlari to'ldirilmagan (nomi, STIR, bank, MFO, manzil)")
-			return
-		}
-	}
-
 	// Forma 19 validations
 	if req.ActType == "hidden_work" {
 		if req.StageID == 0 {
@@ -811,9 +802,21 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	var req struct {
-		SubcontractID int64  `json:"subcontract_id"`
-		PeriodFrom    string `json:"period_from" binding:"required"`
-		PeriodTo      string `json:"period_to" binding:"required"`
+		SubcontractID             int64  `json:"subcontract_id"`
+		PeriodFrom                string `json:"period_from" binding:"required"`
+		PeriodTo                  string `json:"period_to" binding:"required"`
+		ClientName                string `json:"client_name"`
+		ClientPhone               string `json:"client_phone"`
+		ClientAddress             string `json:"client_address"`
+		ClientBankName            string `json:"client_bank_name"`
+		ClientBankAccount         string `json:"client_bank_account"`
+		ClientMFO                 string `json:"client_mfo"`
+		ClientSTIR                string `json:"client_stir"`
+		ClientOKONH               string `json:"client_okonh"`
+		ContractNumber            string `json:"contract_number"`
+		ObjectFullName            string `json:"object_full_name"`
+		ClientDirectorName        string `json:"client_director_name"`
+		ClientChiefAccountantName string `json:"client_chief_accountant_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
@@ -821,6 +824,13 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+
+	// Save client requisites to project if provided
+	if req.ClientName != "" {
+		h.saveProjectClientDetails(tenantID, projectID, req.ClientName, req.ClientPhone, req.ClientAddress,
+			req.ClientBankName, req.ClientBankAccount, req.ClientMFO, req.ClientSTIR, req.ClientOKONH,
+			req.ContractNumber, req.ObjectFullName, req.ClientDirectorName, req.ClientChiefAccountantName)
+	}
 
 	// Validate project has required client details for KS-2
 	if !h.projectHasRequiredClientDetails(tenantID, projectID) {
@@ -1042,13 +1052,6 @@ func (h *Handler) PreviewAutoGenerateKS2(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
-		return
-	}
-
-	// Validate project has required client details for KS-2
-	if !h.projectHasRequiredClientDetails(tenantID, projectID) {
-		response.Error(c, http.StatusBadRequest, "MISSING_CLIENT_DETAILS",
-			"Loyiha buyurtmachi ma'lumotlari to'ldirilmagan (nomi, STIR, bank, MFO, manzil)")
 		return
 	}
 
@@ -1600,9 +1603,21 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	}
 
 	var req struct {
-		SubcontractID int64  `json:"subcontract_id"`
-		PeriodFrom    string `json:"period_from" binding:"required"`
-		PeriodTo      string `json:"period_to" binding:"required"`
+		SubcontractID             int64  `json:"subcontract_id"`
+		PeriodFrom                string `json:"period_from" binding:"required"`
+		PeriodTo                  string `json:"period_to" binding:"required"`
+		ClientName                string `json:"client_name"`
+		ClientPhone               string `json:"client_phone"`
+		ClientAddress             string `json:"client_address"`
+		ClientBankName            string `json:"client_bank_name"`
+		ClientBankAccount         string `json:"client_bank_account"`
+		ClientMFO                 string `json:"client_mfo"`
+		ClientSTIR                string `json:"client_stir"`
+		ClientOKONH               string `json:"client_okonh"`
+		ContractNumber            string `json:"contract_number"`
+		ObjectFullName            string `json:"object_full_name"`
+		ClientDirectorName        string `json:"client_director_name"`
+		ClientChiefAccountantName string `json:"client_chief_accountant_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
@@ -1610,6 +1625,13 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+
+	// Save client requisites to project if provided
+	if req.ClientName != "" {
+		h.saveProjectClientDetails(tenantID, projectID, req.ClientName, req.ClientPhone, req.ClientAddress,
+			req.ClientBankName, req.ClientBankAccount, req.ClientMFO, req.ClientSTIR, req.ClientOKONH,
+			req.ContractNumber, req.ObjectFullName, req.ClientDirectorName, req.ClientChiefAccountantName)
+	}
 
 	// Validate project has required client details for KS-3
 	if !h.projectHasRequiredClientDetails(tenantID, projectID) {
@@ -2222,4 +2244,34 @@ func (h *Handler) projectHasRequiredClientDetails(tenantID uuid.UUID, projectID 
 		clientBankAccount.Valid && strings.TrimSpace(clientBankAccount.String) != "" &&
 		clientMfo.Valid && strings.TrimSpace(clientMfo.String) != "" &&
 		clientAddress.Valid && strings.TrimSpace(clientAddress.String) != ""
+}
+
+// saveProjectClientDetails persists client requisites to the construction project.
+// Called when KS-2/KS-3 forms are created with inline client details.
+func (h *Handler) saveProjectClientDetails(tenantID uuid.UUID, projectID int64,
+	clientName, clientPhone, clientAddress, clientBankName, clientBankAccount,
+	clientMFO, clientSTIR, clientOKONH, contractNumber, objectFullName,
+	clientDirectorName, clientChiefAccountantName string) {
+
+	_, err := h.db.Exec(`
+		UPDATE construction_projects SET
+			client_name = COALESCE(NULLIF($1, ''), client_name),
+			client_phone = COALESCE(NULLIF($2, ''), client_phone),
+			client_address = COALESCE(NULLIF($3, ''), client_address),
+			client_bank_name = COALESCE(NULLIF($4, ''), client_bank_name),
+			client_bank_account = COALESCE(NULLIF($5, ''), client_bank_account),
+			client_mfo = COALESCE(NULLIF($6, ''), client_mfo),
+			client_stir = COALESCE(NULLIF($7, ''), client_stir),
+			client_okonh = COALESCE(NULLIF($8, ''), client_okonh),
+			contract_number = COALESCE(NULLIF($9, ''), contract_number),
+			object_full_name = COALESCE(NULLIF($10, ''), object_full_name),
+			client_director_name = COALESCE(NULLIF($11, ''), client_director_name),
+			client_chief_accountant_name = COALESCE(NULLIF($12, ''), client_chief_accountant_name)
+		WHERE id = $13 AND tenant_id = $14
+	`, clientName, clientPhone, clientAddress, clientBankName, clientBankAccount,
+		clientMFO, clientSTIR, clientOKONH, contractNumber, objectFullName,
+		clientDirectorName, clientChiefAccountantName, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to save project client details", "error", err, "projectID", projectID)
+	}
 }
