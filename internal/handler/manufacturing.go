@@ -697,9 +697,12 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 			argCount++
 			updates = append(updates, fmt.Sprintf("labor_per_hour = $%d", argCount))
 			args = append(args, labor)
-			argCount++
-			updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
-			args = append(args, total)
+			// Only set hourly_cost to calculated total if user didn't explicitly provide it
+			if input.HourlyCost == nil {
+				argCount++
+				updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
+				args = append(args, total)
+			}
 		}
 	}
 
