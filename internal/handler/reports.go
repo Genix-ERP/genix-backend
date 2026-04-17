@@ -1224,7 +1224,7 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 	response.Success(c, report)
 }
 
-// GetSalesSummary returns sales summary report
+// GetSalesSummary returns comprehensive sales dashboard stats in a single response
 func (h *Handler) GetSalesSummary(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1232,86 +1232,94 @@ func (h *Handler) GetSalesSummary(c *gin.Context) {
 		return
 	}
 
-	periodFrom := c.Query("period_from")
-	periodTo := c.Query("period_to")
-
-	now := time.Now()
-	if periodFrom == "" {
-		periodFrom = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
-	}
-	if periodTo == "" {
-		periodTo = now.Format("2006-01-02")
+	orgID, hasOrg := middleware.GetOrganizationID(c)
+	orgFilter := ""
+	args := []interface{}{tenantID}
+	if hasOrg && orgID != uuid.Nil {
+		orgFilter = " AND organization_id = $2"
+		args = append(args, orgID)
 	}
 
-	// Get sales totals
-	var totalOrders, totalInvoiced int
-	var orderAmount, invoicedAmount, paidAmount float64
+	// Sales orders: total, revenue, active
+	var totalOrders, activeOrders int
+	var totalRevenue float64
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*),
+		       COALESCE(SUM(total_amount), 0),
+		       COUNT(*) FILTER (WHERE status IN ('draft','quotation','confirmed','processing','shipped'))
+		FROM sales_orders
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&totalOrders, &totalRevenue, &activeOrders)
 
-	soQuery := `
-		SELECT COUNT(*), COALESCE(SUM(total_amount), 0)
+	// Quotations
+	var totalQuotations, pendingQuotations int
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'sent')
+		FROM quotations
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&totalQuotations, &pendingQuotations)
+
+	// Invoices
+	var totalInvoices, unpaidInvoices int
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE payment_status IN ('unpaid','partial'))
+		FROM sales_invoices
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&totalInvoices, &unpaidInvoices)
+
+	// Returns
+	var totalReturns, pendingReturns int
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'pending')
+		FROM sales_returns
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&totalReturns, &pendingReturns)
+
+	// Active discounts
+	var activeDiscounts int
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*) FILTER (WHERE is_active = true)
+		FROM discounts
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&activeDiscounts)
+
+	// Chart data: revenue per month for last 6 months
+	type ChartPoint struct {
+		Month   string  `json:"month"`
+		Revenue float64 `json:"revenue"`
+	}
+	chartData := make([]ChartPoint, 0)
+	chartRows, err := h.db.Query(fmt.Sprintf(`
+		SELECT TO_CHAR(order_date, 'YYYY-MM') AS month,
+		       COALESCE(SUM(total_amount), 0) AS revenue
 		FROM sales_orders
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-			AND order_date >= $2 AND order_date <= $3
-	`
-	siQuery := `
-		SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COALESCE(SUM(amount_paid), 0)
-		FROM sales_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-			AND invoice_date >= $2 AND invoice_date <= $3
-	`
-	tcQuery := `
-		SELECT c.id, c.name, COUNT(si.id), COALESCE(SUM(si.total_amount), 0)
-		FROM sales_invoices si
-		JOIN contacts c ON si.customer_id = c.id
-		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
-			AND si.invoice_date >= $2 AND si.invoice_date <= $3
-	`
-	salesArgs := []interface{}{tenantID, periodFrom, periodTo}
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		soQuery += " AND organization_id = $4"
-		siQuery += " AND organization_id = $4"
-		tcQuery += " AND si.organization_id = $4"
-		salesArgs = append(salesArgs, orgID)
-	}
-
-	h.db.QueryRow(soQuery, salesArgs...).Scan(&totalOrders, &orderAmount)
-	h.db.QueryRow(siQuery, salesArgs...).Scan(&totalInvoiced, &invoicedAmount, &paidAmount)
-
-	// Get top customers
-	type TopCustomer struct {
-		CustomerID   uuid.UUID `json:"customer_id"`
-		CustomerName string    `json:"customer_name"`
-		OrderCount   int       `json:"order_count"`
-		TotalAmount  float64   `json:"total_amount"`
-	}
-
-	tcQuery += `
-		GROUP BY c.id, c.name
-		ORDER BY SUM(si.total_amount) DESC
-		LIMIT 10
-	`
-	topCustomers := make([]TopCustomer, 0)
-	rows, err := h.db.Query(tcQuery, salesArgs...)
-
+		  AND order_date >= NOW() - INTERVAL '6 months'%s
+		GROUP BY TO_CHAR(order_date, 'YYYY-MM')
+		ORDER BY month
+	`, orgFilter), args...)
 	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var tc TopCustomer
-			rows.Scan(&tc.CustomerID, &tc.CustomerName, &tc.OrderCount, &tc.TotalAmount)
-			topCustomers = append(topCustomers, tc)
+		defer chartRows.Close()
+		for chartRows.Next() {
+			var p ChartPoint
+			if err := chartRows.Scan(&p.Month, &p.Revenue); err == nil {
+				chartData = append(chartData, p)
+			}
 		}
 	}
 
 	response.Success(c, gin.H{
-		"period_from":      periodFrom,
-		"period_to":        periodTo,
-		"total_orders":     totalOrders,
-		"order_amount":     orderAmount,
-		"total_invoiced":   totalInvoiced,
-		"invoiced_amount":  invoicedAmount,
-		"paid_amount":      paidAmount,
-		"outstanding":      invoicedAmount - paidAmount,
-		"top_customers":    topCustomers,
+		"total_orders":       totalOrders,
+		"total_revenue":      totalRevenue,
+		"active_orders":      activeOrders,
+		"total_quotations":   totalQuotations,
+		"pending_quotations": pendingQuotations,
+		"total_invoices":     totalInvoices,
+		"unpaid_invoices":    unpaidInvoices,
+		"total_returns":      totalReturns,
+		"pending_returns":    pendingReturns,
+		"active_discounts":   activeDiscounts,
+		"chart_data":         chartData,
 	})
 }
 

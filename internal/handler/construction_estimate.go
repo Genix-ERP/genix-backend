@@ -581,7 +581,7 @@ func (h *Handler) DuplicateEstimate(c *gin.Context) {
 // ESTIMATE LINE HANDLERS
 // =====================================================
 
-// ListEstimateLines returns lines for an estimate
+// ListEstimateLines returns lines for an estimate with pagination
 func (h *Handler) ListEstimateLines(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -595,8 +595,66 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		return
 	}
 
-	lines := h.getEstimateLines(estimateID, tenantID)
-	response.Success(c, lines)
+	// Pagination — default 50, max 5000 (some callers need all at once)
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 5000 {
+		pageSize = 50
+	}
+	offset := (page - 1) * pageSize
+
+	// Count total
+	var total int
+	h.db.QueryRow(`SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`,
+		estimateID, tenantID).Scan(&total)
+
+	// Query paginated rows
+	query := `
+		SELECT l.id, l.tenant_id, l.estimate_id, l.wbs_id,
+		       l.name, l.uom, l.quantity,
+		       l.material_rate, l.labor_rate, l.equipment_rate,
+		       l.unit_rate, l.total_amount, l.actual_amount,
+		       COALESCE(l.code, ''), COALESCE(l.item_number, ''),
+		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
+		       l.sort_order, l.created_date, l.updated_date,
+		       COALESCE(w.code, '') as wbs_code,
+		       COALESCE(w.name, '') as wbs_name
+		FROM construction_estimate_line l
+		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
+		WHERE l.estimate_id = $1 AND l.tenant_id = $2
+		ORDER BY l.sort_order ASC, l.id ASC
+		LIMIT $3 OFFSET $4
+	`
+	rows, err := h.db.Query(query, estimateID, tenantID, pageSize, offset)
+	if err != nil {
+		h.log.Error("Failed to list estimate lines", "error", err)
+		response.InternalError(c, "Failed to list estimate lines")
+		return
+	}
+	defer rows.Close()
+
+	lines := []entity.ConstructionEstimateLine{}
+	for rows.Next() {
+		var line entity.ConstructionEstimateLine
+		if err := rows.Scan(
+			&line.ID, &line.TenantID, &line.EstimateID, &line.WBSID,
+			&line.Name, &line.UOM, &line.Quantity,
+			&line.MaterialRate, &line.LaborRate, &line.EquipmentRate,
+			&line.UnitRate, &line.TotalAmount, &line.ActualAmount,
+			&line.Code, &line.ItemNumber,
+			&line.ResourceType, &line.ParentItemNumber,
+			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
+			&line.WBSCode, &line.WBSName,
+		); err != nil {
+			continue
+		}
+		lines = append(lines, line)
+	}
+
+	response.Paginated(c, lines, page, pageSize, total)
 }
 
 // ListProjectEstimateResources returns unique resource lines across all estimates for a project
@@ -827,6 +885,15 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		}
 	}
 
+	// Update source_type on the estimate if provided (important for re-imports into existing estimates)
+	if req.SourceType != "" {
+		_, stErr := tx.Exec(`UPDATE construction_estimate SET source_type = $1 WHERE id = $2 AND tenant_id = $3`,
+			req.SourceType, estimateID, tenantID)
+		if stErr != nil {
+			h.log.Error("Failed to update source_type on estimate", "error", stErr, "source_type", req.SourceType)
+		}
+	}
+
 	count := 0
 	for i, line := range req.Lines {
 		unitRate := line.MaterialRate + line.LaborRate + line.EquipmentRate
@@ -871,10 +938,12 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
 
-	// Fetch source_type to decide what to auto-create
-	var sourceType string
-	h.db.QueryRow(`SELECT COALESCE(source_type, '') FROM construction_estimate WHERE id = $1 AND tenant_id = $2`,
-		estimateID, tenantID).Scan(&sourceType)
+	// Use source_type from request if provided, otherwise fetch from DB
+	sourceType := req.SourceType
+	if sourceType == "" {
+		h.db.QueryRow(`SELECT COALESCE(source_type, '') FROM construction_estimate WHERE id = $1 AND tenant_id = $2`,
+			estimateID, tenantID).Scan(&sourceType)
+	}
 
 	orgID, _ := middleware.GetOrganizationID(c)
 	userID, _ := middleware.GetUserID(c)
@@ -887,7 +956,10 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	}
 
 	// Auto-create Forma 2 (KS-2) draft for VOR and Edinich estimates
+	h.log.Info("BulkCreateEstimateLines: about to auto-create Forma 2",
+		"estimate_id", estimateID, "source_type", sourceType, "line_count", count)
 	forma2ID := h.autoCreateForma2FromEstimate(tenantID, userID, estimateID)
+	h.log.Info("BulkCreateEstimateLines: auto-create Forma 2 result", "forma2_id", forma2ID)
 
 	resp := map[string]interface{}{
 		"count":            count,
@@ -1407,29 +1479,36 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 		WHERE id = $1 AND tenant_id = $2
 	`, estimateID, tenantID).Scan(&sourceType, &projectID, &subcontractID, &estName)
 	if err != nil {
-		h.log.Error("Failed to fetch estimate for auto Forma 2", "error", err)
+		h.log.Error("Failed to fetch estimate for auto Forma 2", "error", err, "estimate_id", estimateID)
 		return 0
 	}
+
+	h.log.Info("autoCreateForma2FromEstimate called",
+		"estimate_id", estimateID, "source_type", sourceType,
+		"project_id", projectID, "est_name", estName)
 
 	// Only auto-create for VOR and Edinich types
 	if sourceType != "vor" && sourceType != "edinich" {
+		h.log.Info("Skipping auto Forma 2: source_type not vor/edinich", "source_type", sourceType)
 		return 0
 	}
 
-	// Skip auto-creation if project is missing required client details for KS-2
-	var clientName, clientStir, clientBankName, clientBankAccount, clientMfo, clientAddress sql.NullString
-	_ = h.db.QueryRow(`
-		SELECT client_name, client_stir, client_bank_name, client_bank_account, client_mfo, client_address
-		FROM construction_projects WHERE id = $1 AND tenant_id = $2
-	`, projectID, tenantID).Scan(&clientName, &clientStir, &clientBankName, &clientBankAccount, &clientMfo, &clientAddress)
-	if !clientName.Valid || strings.TrimSpace(clientName.String) == "" ||
-		!clientStir.Valid || strings.TrimSpace(clientStir.String) == "" ||
-		!clientBankName.Valid || strings.TrimSpace(clientBankName.String) == "" ||
-		!clientBankAccount.Valid || strings.TrimSpace(clientBankAccount.String) == "" ||
-		!clientMfo.Valid || strings.TrimSpace(clientMfo.String) == "" ||
-		!clientAddress.Valid || strings.TrimSpace(clientAddress.String) == "" {
-		h.log.Info("Skipping auto Forma 2 creation: project missing required client details", "projectID", projectID)
-		return 0
+	// Skip if a forma2 was already auto-created from this estimate (avoid duplicates on re-import)
+	var existingActID int64
+	err = h.db.QueryRow(`
+		SELECT a.id FROM construction_act a
+		WHERE a.project_id = $1 AND a.tenant_id = $2 AND a.act_type = 'ks2'
+		  AND EXISTS (
+			SELECT 1 FROM construction_act_line al
+			JOIN construction_estimate_line el ON el.id = al.estimate_line_id
+			WHERE al.act_id = a.id AND el.estimate_id = $3
+		  )
+		LIMIT 1
+	`, projectID, tenantID, estimateID).Scan(&existingActID)
+	if err == nil && existingActID > 0 {
+		h.log.Info("Forma 2 already exists for this estimate, skipping auto-create",
+			"existing_act_id", existingActID, "estimate_id", estimateID)
+		return existingActID
 	}
 
 	// Fetch all estimate lines (excluding resource sub-items for edinich)
@@ -1478,6 +1557,7 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 	}
 
 	if len(lines) == 0 {
+		h.log.Info("No estimate lines found for auto Forma 2", "estimate_id", estimateID)
 		return 0
 	}
 
@@ -1503,6 +1583,9 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 		// VOR: include all lines
 		f2Lines = lines
 	}
+
+	h.log.Info("Auto Forma 2: line filtering complete",
+		"total_lines", len(lines), "f2_lines", len(f2Lines), "source_type", sourceType)
 
 	// Generate act name
 	var actCount int
@@ -1556,17 +1639,20 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 	}
 
 	// Insert act lines from estimate lines
+	// Use savepoints so a single failed INSERT does not abort the entire transaction
 	var totalAmount float64
 	var sumLabor, sumEquip, sumMaterials float64
+	var insertedLines int
 	for i, l := range f2Lines {
 		unitRate := l.MaterialRate + l.LaborRate + l.EquipmentRate
 		lineTotal := l.Quantity * unitRate
 
-		totalAmount += lineTotal
-		sumLabor += l.Quantity * l.LaborRate
-		sumEquip += l.Quantity * l.EquipmentRate
-		sumMaterials += l.Quantity * l.MaterialRate
-		// cables_amount is not in estimate lines, defaults to 0
+		// Create savepoint before each insert
+		spName := fmt.Sprintf("sp_line_%d", i)
+		if _, spErr := tx.Exec("SAVEPOINT " + spName); spErr != nil {
+			h.log.Error("Failed to create savepoint for auto Forma 2 line", "error", spErr, "name", l.Name)
+			continue
+		}
 
 		_, err := tx.Exec(`
 			INSERT INTO construction_act_line (
@@ -1588,9 +1674,22 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 		)
 		if err != nil {
 			h.log.Error("Failed to insert auto Forma 2 line", "error", err, "name", l.Name)
+			// Rollback to savepoint so the transaction remains usable
+			tx.Exec("ROLLBACK TO SAVEPOINT " + spName)
 			continue
 		}
+
+		// Release savepoint on success and count totals
+		tx.Exec("RELEASE SAVEPOINT " + spName)
+		totalAmount += lineTotal
+		sumLabor += l.Quantity * l.LaborRate
+		sumEquip += l.Quantity * l.EquipmentRate
+		sumMaterials += l.Quantity * l.MaterialRate
+		insertedLines++
 	}
+
+	h.log.Info("Auto Forma 2 lines insert result",
+		"total_lines", len(f2Lines), "inserted", insertedLines, "skipped", len(f2Lines)-insertedLines)
 
 	// Update totals
 	vatAmount := totalAmount * 12 / 100

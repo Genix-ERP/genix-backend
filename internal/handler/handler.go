@@ -1345,6 +1345,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	reports := rg.Group("/reports")
+	// sales-summary is accessible to sales users, not just finance
+	reports.GET("/sales-summary", h.perm.Require("sales", "order", "read"), h.GetSalesSummary)
 	reports.Use(h.perm.Require("finance", "report", "read"))
 	{
 		reports.GET("/balance-sheet", h.GetBalanceSheet)
@@ -1354,7 +1356,6 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reports.GET("/general-ledger", h.GetGeneralLedger)
 		reports.GET("/aging-receivables", h.GetAgingReceivables)
 		reports.GET("/aging-payables", h.GetAgingPayables)
-		reports.GET("/sales-summary", h.GetSalesSummary)
 		reports.GET("/inventory-summary", h.GetInventoryReport)
 	}
 

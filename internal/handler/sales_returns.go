@@ -3,9 +3,11 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/listparams"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +25,10 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 	status := c.Query("status")
 	customerID := c.Query("customer_id")
 
+	lp := listparams.Parse(c,
+		[]string{"created_at", "return_number", "customer_name", "total_amount", "return_date", "status"},
+		"created_at")
+
 	query := `
 		SELECT sr.id, sr.tenant_id, sr.return_number, sr.sales_invoice_id, sr.sales_order_id, sr.customer_id, sr.customer_name,
 			   sr.return_date, sr.reason, sr.subtotal, sr.tax_amount, sr.total_amount, sr.status,
@@ -31,6 +37,7 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 		FROM sales_returns sr
 		LEFT JOIN sales_orders so ON so.id = sr.sales_order_id
 		WHERE sr.tenant_id = $1 AND sr.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM sales_returns sr WHERE sr.tenant_id = $1 AND sr.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -39,22 +46,38 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
 		query += fmt.Sprintf(" AND sr.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sr.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	if status != "" {
 		argCount++
 		query += fmt.Sprintf(" AND sr.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sr.status = $%d", argCount)
 		args = append(args, status)
 	}
 
 	if customerID != "" {
 		argCount++
 		query += fmt.Sprintf(" AND sr.customer_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sr.customer_id = $%d", argCount)
 		args = append(args, customerID)
 	}
 
-	query += " ORDER BY sr.created_at DESC"
+	// Search
+	if lp.Search != "" {
+		argCount++
+		pattern := "%" + strings.ToLower(lp.Search) + "%"
+		query += fmt.Sprintf(" AND (LOWER(sr.return_number) LIKE $%d OR LOWER(sr.customer_name) LIKE $%d)", argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(sr.return_number) LIKE $%d OR LOWER(sr.customer_name) LIKE $%d)", argCount, argCount)
+		args = append(args, pattern)
+	}
+
+	var total int
+	h.db.QueryRow(countQuery, args...).Scan(&total)
+
+	query += lp.OrderClause("sr.") + fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	args = append(args, lp.PageSize, lp.Offset())
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -137,7 +160,7 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 		returns = []map[string]interface{}{}
 	}
 
-	response.Success(c, returns)
+	response.Paginated(c, returns, lp.Page, lp.PageSize, total)
 }
 
 // GetSalesReturn returns a single sales return by ID
