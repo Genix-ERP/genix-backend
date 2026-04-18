@@ -1022,7 +1022,12 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	}
 
 	// Odoo-style: AR + per-category Income + COGS/Interim clearing
-	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+	// 1. Try contact's default receivable account
+	arAccountID := getContactDefaultAccount(tx, customerID, "receivable")
+	// 2. Fallback to standard findAccount
+	if arAccountID == uuid.Nil {
+		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+	}
 	if arAccountID == uuid.Nil {
 		h.log.Error("AR account not found", "tenant_id", tenantID)
 		response.InternalError(c, "Accounts Receivable account (1100) not found. Please configure chart of accounts.")
@@ -1151,7 +1156,13 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 
 	// Create journal entry
 	journalEntryID := uuid.New()
+	// Fetch customer name for richer description
+	var custName string
+	_ = tx.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&custName)
 	description := fmt.Sprintf("Sales Invoice %s", invoiceNumber)
+	if custName != "" {
+		description = fmt.Sprintf("Sales Invoice %s — %s", invoiceNumber, custName)
+	}
 
 	var createdBy *uuid.UUID
 	if userID != uuid.Nil {
@@ -1265,6 +1276,23 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
+
+	// Notify: invoice sent
+	go func() {
+		var customerName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
+		amountStr := fmt.Sprintf("%.0f", totalAmount)
+		h.createTranslatedNotification(tenantID, userID, "invoice_sent",
+			map[string]interface{}{
+				"invoice_id":     invoiceID.String(),
+				"invoice_number": invoiceNumber,
+				"customer_id":    customerID.String(),
+				"customer_name":  customerName,
+				"amount":         totalAmount,
+			},
+			invoiceNumber, customerName, amountStr,
+		)
+	}()
 
 	h.GetSalesInvoice(c)
 }
@@ -1492,14 +1520,14 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		)
 
 		if glErr == nil {
-			// Line 1: Debit Cash/Bank
+			// Line 1: Debit Cash/Bank (no contact_id — cash line is not partner-specific)
 			cashLineID := uuid.New()
 			_, glErr = tx.Exec(`
 				INSERT INTO journal_entry_lines (
-					id, journal_entry_id, line_number, account_id, contact_id, description,
+					id, journal_entry_id, line_number, account_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-				cashLineID, journalEntryID, 1, cashAccountID, customerID, "Outstanding Receipt",
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+				cashLineID, journalEntryID, 1, cashAccountID, "Outstanding Receipt",
 				input.Amount, 0.0, 1.0, now,
 			)
 		}
@@ -1529,10 +1557,10 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				writeOffLineID := uuid.New()
 				_, glErr = tx.Exec(`
 					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, contact_id, description,
+						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-					writeOffLineID, journalEntryID, lineNumber, writeOffAccountID, customerID, "Payment Difference Write-off",
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					writeOffLineID, journalEntryID, lineNumber, writeOffAccountID, "Payment Difference Write-off",
 					input.WriteOffAmount, 0.0, 1.0, now,
 				)
 				lineNumber++
@@ -1555,10 +1583,10 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 				discountLineID := uuid.New()
 				_, glErr = tx.Exec(`
 					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, contact_id, description,
+						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-					discountLineID, journalEntryID, lineNumber, discountAccountID, customerID, "Early Payment Discount",
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					discountLineID, journalEntryID, lineNumber, discountAccountID, "Early Payment Discount",
 					earlyDiscountApplied, 0.0, 1.0, now,
 				)
 				lineNumber++
@@ -1644,6 +1672,22 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		response.InternalError(c, "Failed to commit transaction")
 		return
 	}
+
+	// Notify: payment recorded on invoice
+	go func() {
+		var customerName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
+		amountStr := fmt.Sprintf("%.0f", input.Amount)
+		h.createTranslatedNotification(tenantID, userID, "payment_recorded",
+			map[string]interface{}{
+				"invoice_id":     invoiceID.String(),
+				"invoice_number": invoiceNumber,
+				"customer_id":    customerID.String(),
+				"amount":         input.Amount,
+			},
+			amountStr, invoiceNumber, customerName,
+		)
+	}()
 
 	h.GetSalesInvoice(c)
 }
@@ -1802,6 +1846,23 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 			}
 		}
 	}
+
+	// Notify: credit note created
+	go func() {
+		var customerName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
+		amountStr := fmt.Sprintf("%.0f", cnTotalAmount)
+		h.createTranslatedNotification(tenantID, userID, "credit_note_created",
+			map[string]interface{}{
+				"credit_note_id":     creditNoteID.String(),
+				"credit_note_number": cnNumber,
+				"invoice_number":     orgInvoiceNumber,
+				"customer_id":        customerID.String(),
+				"amount":             cnTotalAmount,
+			},
+			cnNumber, orgInvoiceNumber, amountStr,
+		)
+	}()
 
 	// Replace the id param so GetSalesInvoice returns the credit note
 	for i, p := range c.Params {

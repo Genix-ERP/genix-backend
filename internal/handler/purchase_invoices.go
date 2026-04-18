@@ -413,6 +413,21 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		invoiceResponse["notes"] = input.Notes
 	}
 
+	// Notify: purchase invoice created
+	go func() {
+		amountStr := fmt.Sprintf("%.0f", totalAmount)
+		h.createTranslatedNotification(tenantID, userID, "purchase_invoice_created",
+			map[string]interface{}{
+				"invoice_id":     invoiceID.String(),
+				"invoice_number": invoiceNumber,
+				"vendor_id":      vendorID.String(),
+				"vendor_name":    vendorName,
+				"amount":         totalAmount,
+			},
+			invoiceNumber, vendorName, amountStr,
+		)
+	}()
+
 	response.Created(c, invoiceResponse)
 }
 
@@ -835,6 +850,24 @@ func (h *Handler) ConfirmPurchaseInvoice(c *gin.Context) {
 		return
 	}
 
+	// Notify: purchase invoice confirmed
+	go func() {
+		var invNumber, vendorName string
+		var totalAmt float64
+		h.db.QueryRow(`SELECT pi.invoice_number, COALESCE(c.name, ''), COALESCE(pi.total_amount, 0)
+			FROM purchase_invoices pi LEFT JOIN contacts c ON pi.vendor_id = c.id
+			WHERE pi.id = $1`, invoiceID).Scan(&invNumber, &vendorName, &totalAmt)
+		userID, _ := middleware.GetUserID(c)
+		h.createTranslatedNotification(tenantID, userID, "purchase_invoice_confirmed",
+			map[string]interface{}{
+				"invoice_id":     invoiceID.String(),
+				"invoice_number": invNumber,
+				"vendor_name":    vendorName,
+			},
+			invNumber, vendorName,
+		)
+	}()
+
 	h.GetPurchaseInvoice(c)
 }
 
@@ -904,7 +937,12 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 
 	if err == nil {
 		// Odoo-style: Debit Stock Interim Receipt (per category), Credit AP
-		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+		// 1. Try vendor's default payable account
+		apAccountID := getContactDefaultAccount(tx, vendorID, "payable")
+		// 2. Fallback to standard findAccount
+		if apAccountID == uuid.Nil {
+			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+		}
 		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
 
 		// Get invoice lines for per-category accounting
@@ -990,10 +1028,10 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 					lineID := uuid.New()
 					tx.Exec(`
 						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, line_number, account_id, contact_id, description,
+							id, journal_entry_id, line_number, account_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						lineID, journalEntryID, lineNumber, inputAcct, vendorID, "Stock Interim Receipt",
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						lineID, journalEntryID, lineNumber, inputAcct, "Stock Interim Receipt",
 						amount, 0.0, 1.0, now,
 					)
 					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct)
@@ -1168,12 +1206,27 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 					id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
 					exchange_rate, reference, notes, status, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, 'payment', $5, $6, $7, 1, $8, $9, 'confirmed', $10, $10)
-			`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8]), now)
+			`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, func() string {
+					if vendorName.Valid && vendorName.String != "" {
+						return fmt.Sprintf("Payment for invoice %s — %s", invoiceID.String()[:8], vendorName.String)
+					}
+					return fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
+				}(), now)
 
 			if err != nil {
 				h.log.Error("Failed to create payment record", "error", err)
 			} else {
 				h.log.Info("Payment record created", "payment_id", paymentID, "invoice_id", invoiceID)
+
+				// Create payment allocation linking payment to this invoice
+				allocID := uuid.New()
+				_, allocErr := h.db.Exec(`
+					INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
+					VALUES ($1, $2, 'purchase_invoice', $3, $4, $5)
+				`, allocID, paymentID, invoiceID, paymentAmount, now)
+				if allocErr != nil {
+					h.log.Error("Failed to create payment allocation", "error", allocErr)
+				}
 			}
 		}
 	} else {
@@ -1197,8 +1250,40 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	}
 	err = h.db.QueryRow(journalQuery, tenantID).Scan(&payJournalID, &nextNumber, &numberPrefix)
 
+	// Fallback: try any active journal with matching type
+	if err != nil {
+		h.log.Warn("No journal found by code for payment, trying fallback", "payment_method", input.PaymentMethod, "error", err)
+		fallbackType := "bank"
+		if input.PaymentMethod == "cash" {
+			fallbackType = "cash"
+		}
+		err = h.db.QueryRow(
+			`SELECT id, COALESCE(next_number, 1), number_prefix FROM journals WHERE tenant_id = $1 AND type = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1`,
+			tenantID, fallbackType,
+		).Scan(&payJournalID, &nextNumber, &numberPrefix)
+		if err != nil {
+			// Last fallback: any journal
+			err = h.db.QueryRow(
+				`SELECT id, COALESCE(next_number, 1), number_prefix FROM journals WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY is_default DESC LIMIT 1`,
+				tenantID,
+			).Scan(&payJournalID, &nextNumber, &numberPrefix)
+			if err != nil {
+				h.log.Error("No journal found at all for payment", "tenant_id", tenantID, "error", err)
+			}
+		}
+	}
+
 	if err == nil {
 		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "2000")
+		if apAcctID == uuid.Nil {
+			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlar", "2000")
+		}
+		if apAcctID == uuid.Nil {
+			apAcctID = findAccount(h.db, tenantID, organizationID, "payable", "2000")
+		}
+		if apAcctID == uuid.Nil {
+			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlik", "2000")
+		}
 		// Select credit account based on payment method
 		var cashAcctID uuid.UUID
 		switch input.PaymentMethod {
@@ -1212,12 +1297,21 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			if cashAcctID == uuid.Nil {
 				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "1010")
 			}
+			if cashAcctID == uuid.Nil {
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank hisobi", "1010")
+			}
 		}
 		if cashAcctID == uuid.Nil {
 			// Final fallback
 			cashAcctID = findAccount(h.db, tenantID, organizationID, "outstanding payments", "1160")
 		}
 
+		if apAcctID == uuid.Nil {
+			h.log.Error("AP account not found for vendor payment", "tenant_id", tenantID, "org_id", organizationID)
+		}
+		if cashAcctID == uuid.Nil {
+			h.log.Error("Cash/Bank account not found for vendor payment", "tenant_id", tenantID, "org_id", organizationID, "payment_method", input.PaymentMethod)
+		}
 		if apAcctID != uuid.Nil && cashAcctID != uuid.Nil {
 			prefix := ""
 			if numberPrefix.Valid {
@@ -1225,6 +1319,9 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			}
 			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 			description := fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
+			if vendorName.Valid && vendorName.String != "" {
+				description = fmt.Sprintf("Payment for invoice %s — %s", invoiceID.String()[:8], vendorName.String)
+			}
 
 			var contactUUID uuid.UUID
 			if vendorID.Valid {
@@ -1293,9 +1390,15 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 
 				// Update account balances
 				// Debit AP (credit-normal: debit decreases) — includes write-off
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID)
-				// Credit Outstanding Payments (debit-normal: credit decreases)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
+				if _, apErr := h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID); apErr != nil {
+					h.log.Error("Failed to update AP account balance", "error", apErr, "account_id", apAcctID, "amount", apDebitAmount)
+				}
+				// Credit Cash/Bank (debit-normal: credit decreases)
+				if _, cashErr := h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID); cashErr != nil {
+					h.log.Error("Failed to update Cash/Bank account balance", "error", cashErr, "account_id", cashAcctID, "amount", paymentAmount)
+				} else {
+					h.log.Info("Vendor payment: account balances updated", "ap_account", apAcctID, "cash_account", cashAcctID, "amount", paymentAmount)
+				}
 			}
 		}
 	}

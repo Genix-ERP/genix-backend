@@ -135,7 +135,9 @@ func (h *Handler) CreatePayrollPeriod(c *gin.Context) {
 
 	periodCode := input.PeriodCode
 	if periodCode == "" {
-		periodCode = fmt.Sprintf("PAY-%d-%02d", time.Now().Year(), time.Now().Month())
+		var seq int
+		h.db.QueryRow(`SELECT COUNT(*) + 1 FROM payroll_periods WHERE tenant_id = $1`, tenantID).Scan(&seq)
+		periodCode = fmt.Sprintf("PAY-%d-%05d", time.Now().Year(), seq)
 	}
 
 	startDate, err := time.Parse("2006-01-02", input.StartDate)
@@ -337,6 +339,107 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 		h.log.Error("Failed to update payroll period", "error", err)
 		response.InternalError(c, "Failed to update payroll period")
 		return
+	}
+
+	// If marking as paid, create payment journal entry (Dt: Wages Payable / Kt: Cash or Bank)
+	if input.Status != nil && *input.Status == "paid" {
+		userID, _ := middleware.GetUserID(c)
+		orgID, _ := middleware.GetOrganizationID(c)
+		now := time.Now()
+
+		var periodName string
+		var orgIDStr sql.NullString
+		var totalNet float64
+		h.db.QueryRow(`SELECT period_name, organization_id, COALESCE(total_net, 0) FROM payroll_periods WHERE id = $1`, id).Scan(&periodName, &orgIDStr, &totalNet)
+		if orgIDStr.Valid {
+			if parsed, err2 := uuid.Parse(orgIDStr.String); err2 == nil {
+				orgID = parsed
+			}
+		}
+
+		var orgIDPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgIDPtr = &orgID
+		}
+
+		if totalNet > 0 {
+			// Determine payment account based on payment method
+			paymentMethod := "cash"
+			if input.PaymentMethod != nil {
+				paymentMethod = *input.PaymentMethod
+			}
+
+			var paymentAcct uuid.UUID
+			var paymentAcctDesc string
+			if paymentMethod == "card" || paymentMethod == "bank_transfer" {
+				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
+				if paymentAcct == uuid.Nil {
+					paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
+				}
+				paymentAcctDesc = "Bank Account"
+			} else {
+				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1010")
+				if paymentAcct == uuid.Nil {
+					paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "kassa", "1010")
+				}
+				paymentAcctDesc = "Cash"
+			}
+
+			// Wages payable account (liability cleared)
+			wagesPayableAcct := findAccount(h.db, tenantID, orgIDPtr, "wages payable", "6700")
+			if wagesPayableAcct == uuid.Nil {
+				wagesPayableAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+			}
+
+			if paymentAcct != uuid.Nil && wagesPayableAcct != uuid.Nil {
+				var journalID uuid.UUID
+				var nextNumber int
+				// Try journal marked as payroll journal first
+				h.db.QueryRow(`
+					SELECT id, COALESCE(next_number, 1) FROM journals
+					WHERE tenant_id = $1 AND COALESCE(is_payroll_journal, false) = true
+					  AND COALESCE(is_active, true) = true AND deleted_at IS NULL
+					LIMIT 1`,
+					tenantID).Scan(&journalID, &nextNumber)
+				// Fallback to legacy PAYROLL/MISC/GENERAL code lookup
+				if journalID == uuid.Nil {
+					h.db.QueryRow(`
+						SELECT id, COALESCE(next_number, 1) FROM journals
+						WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
+						ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
+						tenantID).Scan(&journalID, &nextNumber)
+				}
+
+				if journalID != uuid.Nil {
+					jeID := uuid.New()
+					entryNumber := fmt.Sprintf("PAYPMT%05d", nextNumber)
+					description := fmt.Sprintf("Salary Payment: %s (%s)", periodName, paymentMethod)
+
+					h.db.Exec(`
+						INSERT INTO journal_entries (
+							id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+							description, source_type, source_id, exchange_rate,
+							total_debit, total_credit, status, created_by, created_at, updated_at
+						) VALUES ($1,$2,$3,$4,$5,$6,$7,'payroll_payment',$8,1.0,$9,$9,'posted',$10,$11,$11)`,
+						jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+						description, id.String(), totalNet, userID, now)
+
+					// Dt: Wages Payable (liability cleared)
+					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+						VALUES ($1,$2,$3,'Wages Payable',$4,0,1,$5)`,
+						uuid.New(), jeID, wagesPayableAcct, totalNet, now)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, wagesPayableAcct)
+
+					// Kt: Cash or Bank (money goes out)
+					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+						VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
+						uuid.New(), jeID, paymentAcct, paymentAcctDesc, totalNet, now)
+					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, paymentAcct)
+
+					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+				}
+			}
+		}
 	}
 
 	h.GetPayrollPeriod(c)
@@ -1047,6 +1150,25 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 		response.InternalError(c, "Failed to commit")
 		return
 	}
+
+	// In-app notification: salary confirmed
+	go func() {
+		var empName string
+		var netSalary float64
+		h.db.QueryRow(`
+			SELECT CONCAT(e.first_name, ' ', e.last_name), COALESCE(pe.net_salary, 0)
+			FROM payroll_entries pe JOIN employees e ON pe.employee_id = e.id
+			WHERE pe.id = $1`, entryID).Scan(&empName, &netSalary)
+		salaryStr := fmt.Sprintf("%.0f", netSalary)
+		h.createTranslatedNotification(tenantID, userID, "salary_confirmed",
+			map[string]interface{}{
+				"entry_id":    entryID.String(),
+				"employee_id": employeeID.String(),
+				"net_salary":  netSalary,
+			},
+			salaryStr, empName,
+		)
+	}()
 
 	// SMS: Ish haqi chiqarilganda
 	go func() {

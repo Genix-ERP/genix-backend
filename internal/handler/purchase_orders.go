@@ -303,7 +303,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		exchangeRate = 1.0
 	}
 
-	// Calculate totals
+	// Calculate totals from lines
 	var subtotal, discountTotal, taxTotal float64
 	for _, line := range input.Lines {
 		lineSubtotal := line.Quantity * line.UnitPrice
@@ -315,6 +315,17 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	}
 
 	totalAmount := subtotal - discountTotal + taxTotal + input.ShippingAmount
+
+	// Use frontend-calculated values when provided (handles tax-inclusive pricing correctly)
+	if input.Subtotal > 0 {
+		subtotal = input.Subtotal
+	}
+	if input.TaxAmount > 0 {
+		taxTotal = input.TaxAmount
+	}
+	if input.TotalAmount > 0 {
+		totalAmount = input.TotalAmount
+	}
 
 	// Prepare optional strings
 	var vendorReference, notes, internalNotes *string
@@ -1319,8 +1330,36 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		}
 	}
 
+	// Update product cost_price for each PO line (after commit, outside tx to avoid failures)
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Now update cost_price outside the transaction
+	poLineRows, _ := h.db.Query(`
+		SELECT product_id, unit_price FROM purchase_order_lines
+		WHERE purchase_order_id = $1 AND product_id IS NOT NULL
+	`, poID)
+	if poLineRows != nil {
+		for poLineRows.Next() {
+			var pid uuid.UUID
+			var uprice float64
+			if poLineRows.Scan(&pid, &uprice) == nil && uprice > 0 {
+				// FIFO: set cost_price to oldest available lot's cost
+				var fifoCost float64
+				if h.db.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
+					tenantID, pid).Scan(&fifoCost) != nil || fifoCost <= 0 {
+					fifoCost = uprice
+				}
+				h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+					fifoCost, now, pid, tenantID)
+				if orgID != nil {
+					h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+						fifoCost, now, pid, *orgID)
+				}
+			}
+		}
+		poLineRows.Close()
 	}
 
 	return nil
@@ -1503,6 +1542,26 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	// Notify: purchase order approved
+	go func() {
+		var poNumber, vendorName string
+		var totalAmt float64
+		h.db.QueryRow(`
+			SELECT po.order_number, COALESCE(c.name, ''), COALESCE(po.total_amount, 0)
+			FROM purchase_orders po LEFT JOIN contacts c ON po.vendor_id = c.id
+			WHERE po.id = $1`, id).Scan(&poNumber, &vendorName, &totalAmt)
+		amountStr := fmt.Sprintf("%.0f", totalAmt)
+		h.createTranslatedNotification(tenantID, userID, "purchase_order_approved",
+			map[string]interface{}{
+				"order_id":     id.String(),
+				"order_number": poNumber,
+				"vendor_name":  vendorName,
+				"amount":       totalAmt,
+			},
+			poNumber, vendorName, amountStr,
+		)
+	}()
+
 	response.Success(c, gin.H{"message": "Purchase order approved successfully", "status": entity.POStatusApproved})
 }
 
@@ -1655,18 +1714,29 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 	var poWarehouseID sql.NullString
 	var poOrgID *uuid.UUID
 	var poVendorID *uuid.UUID
-	h.db.QueryRow("SELECT warehouse_id, organization_id, vendor_id FROM purchase_orders WHERE id = $1", id).Scan(&poWarehouseID, &poOrgID, &poVendorID)
+	h.db.QueryRow("SELECT warehouse_id, organization_id, vendor_id FROM purchase_orders WHERE id = $1 AND tenant_id = $2", id, tenantID).Scan(&poWarehouseID, &poOrgID, &poVendorID)
 
-	// Fall back to the first warehouse for this tenant if PO has no warehouse
+	// Fall back to org-specific warehouse first, then any tenant warehouse
 	var defaultWarehouseID sql.NullString
 	if !poWarehouseID.Valid || poWarehouseID.String == "" {
-		h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1", tenantID).Scan(&defaultWarehouseID)
+		if poOrgID != nil && *poOrgID != uuid.Nil {
+			h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1", tenantID, *poOrgID).Scan(&defaultWarehouseID)
+		}
+		if !defaultWarehouseID.Valid {
+			h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1", tenantID).Scan(&defaultWarehouseID)
+		}
 	}
 
-	// Auto-assign first warehouse if PO has none
+	// Auto-assign warehouse if PO has none - prefer org-specific warehouse
 	if !poWarehouseID.Valid || poWarehouseID.String == "" {
 		var firstWH string
-		if h.db.QueryRow(`SELECT id::text FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
+		if poOrgID != nil && *poOrgID != uuid.Nil {
+			h.db.QueryRow(`SELECT id::text FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1`, tenantID, *poOrgID).Scan(&firstWH)
+		}
+		if firstWH == "" {
+			h.db.QueryRow(`SELECT id::text FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH)
+		}
+		if firstWH != "" {
 			poWarehouseID = sql.NullString{String: firstWH, Valid: true}
 			h.db.Exec(`UPDATE purchase_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, id, tenantID)
 		}
@@ -1743,6 +1813,15 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 				reason, transaction_date, created_at
 			) VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, 'purchase_order', $8, 'PO Goods Receipt', $9, $9)
 		`, txnID, tenantID, inventoryID, poOrgID, line.QuantityReceived, unitPrice, line.QuantityReceived*unitPrice, id, now)
+
+		// FIFO: set cost_price to oldest available lot's cost (not latest purchase)
+		var fifoCostRcv float64
+		if h.db.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
+			tenantID, productID).Scan(&fifoCostRcv) != nil || fifoCostRcv <= 0 {
+			fifoCostRcv = unitPrice // first purchase, use current price
+		}
+		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+			fifoCostRcv, now, productID, tenantID)
 
 		// Auto-create inventory lot for received goods
 		lotNumber := h.generateLotNumber(tenantID)
@@ -1894,13 +1973,27 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	}
 	var poLines []poLine
 
-	// Use quantity_received if partial receipt, otherwise fall back to ordered quantity
+	// Use quantity_received if set; otherwise check stock op done_qty (bill created mid-receipt);
+	// only fall back to full ordered quantity if no receipt activity at all.
 	linesRows, err := tx.Query(`
-		SELECT id, product_id, description,
-		       CASE WHEN quantity_received > 0 THEN quantity_received ELSE quantity END AS bill_qty,
-		       unit_price, COALESCE(tax_amount, 0)
-		FROM purchase_order_lines
-		WHERE purchase_order_id = $1`, poID)
+		SELECT pol.id, pol.product_id, pol.description,
+		       CASE
+		           WHEN pol.quantity_received > 0 THEN pol.quantity_received
+		           WHEN COALESCE(sol_agg.done_qty, 0) > 0 THEN sol_agg.done_qty
+		           ELSE pol.quantity
+		       END AS bill_qty,
+		       pol.unit_price, COALESCE(pol.tax_amount, 0)
+		FROM purchase_order_lines pol
+		LEFT JOIN (
+		    SELECT sol.product_id, SUM(sol.done_qty) AS done_qty
+		    FROM stock_operation_lines sol
+		    JOIN stock_operations so ON so.id = sol.operation_id
+		    WHERE so.source_id = $1 AND so.source_type = 'purchase_order'
+		      AND so.direction = 'receipt' AND so.tenant_id = $2
+		      AND so.deleted_at IS NULL AND so.state != 'cancelled'
+		    GROUP BY sol.product_id
+		) sol_agg ON sol_agg.product_id = pol.product_id
+		WHERE pol.purchase_order_id = $1`, poID, tenantID)
 	if err == nil {
 		for linesRows.Next() {
 			var pl poLine
@@ -1921,11 +2014,14 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	}
 	billTotal := billSubtotal + billTaxTotal
 
-	// Update the bill header with corrected amounts
+	// Update the bill header with corrected amounts (based on received qty, not ordered qty).
+	// amount_due is a GENERATED column (total_amount - amount_paid), so never set it explicitly.
 	if _, err = tx.Exec(`
 		UPDATE purchase_invoices SET subtotal = $1, tax_amount = $2, total_amount = $3, updated_at = $4
 		WHERE id = $5`, billSubtotal, billTaxTotal, billTotal, now, billID); err != nil {
 		h.log.Error("CreateBillFromPO: failed to update bill totals", "error", err)
+		response.InternalError(c, "Failed to update bill totals")
+		return
 	}
 	subtotal = billSubtotal
 	taxAmount = billTaxTotal
@@ -2021,7 +2117,12 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			// Create journal entry
 			jeID := uuid.New()
 			journalEntryID = &jeID
+			var vendorNameForJE string
+			_ = tx.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, vendorID).Scan(&vendorNameForJE)
 			jeDescription := fmt.Sprintf("Vendor Bill %s", invoiceNumber)
+			if vendorNameForJE != "" {
+				jeDescription = fmt.Sprintf("Vendor Bill %s — %s", invoiceNumber, vendorNameForJE)
+			}
 
 			if _, err := tx.Exec(`
 				INSERT INTO journal_entries (

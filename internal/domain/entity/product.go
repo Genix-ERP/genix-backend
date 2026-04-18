@@ -111,6 +111,8 @@ type Product struct {
 	IsManufacturable   bool            `json:"is_manufacturable" db:"is_manufacturable"`
 	AutoManufacture    bool            `json:"auto_manufacture" db:"auto_manufacture"`
 	HasVariants        bool            `json:"has_variants" db:"has_variants"`
+	HasDelivery        bool            `json:"has_delivery" db:"has_delivery"`
+	DeliveryPrice      float64         `json:"delivery_price" db:"delivery_price"`
 	IsActive           bool            `json:"is_active" db:"is_active"`
 	CreatedBy          *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
@@ -160,6 +162,8 @@ type CreateProductInput struct {
 	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
 	IsManufacturable   *bool    `json:"is_manufacturable,omitempty"`
 	AutoManufacture    *bool    `json:"auto_manufacture,omitempty"`
+	HasDelivery        *bool    `json:"has_delivery,omitempty"`
+	DeliveryPrice      float64  `json:"delivery_price"`
 	OrganizationIDs    []string `json:"organization_ids,omitempty"`
 	Tags               []string `json:"tags,omitempty"`
 	ImageURL           string   `json:"image_url,omitempty"`
@@ -197,6 +201,8 @@ type UpdateProductInput struct {
 	IsOverheadExpense  *bool    `json:"is_overhead_expense,omitempty"`
 	IsManufacturable   *bool    `json:"is_manufacturable,omitempty"`
 	AutoManufacture    *bool    `json:"auto_manufacture,omitempty"`
+	HasDelivery        *bool    `json:"has_delivery,omitempty"`
+	DeliveryPrice      *float64 `json:"delivery_price,omitempty"`
 	InventoryType      *string  `json:"inventory_type,omitempty"`
 	OrganizationIDs    []string `json:"organization_ids,omitempty"`
 	IsActive           *bool    `json:"is_active,omitempty"`
@@ -230,6 +236,7 @@ type ProductResponse struct {
 	ShortDescription *string          `json:"short_description,omitempty"`
 	UnitID           *uuid.UUID       `json:"unit_id,omitempty"`
 	UnitName         string           `json:"unit_name,omitempty"`
+	UnitCode         string           `json:"unit_code,omitempty"`
 	PurchaseUnitID   *uuid.UUID       `json:"purchase_unit_id,omitempty"`
 	PurchaseUnitName string           `json:"purchase_unit_name,omitempty"`
 	SalesUnitID      *uuid.UUID       `json:"sales_unit_id,omitempty"`
@@ -250,6 +257,8 @@ type ProductResponse struct {
 	CanBeSubcontracted bool      `json:"can_be_subcontracted"`
 	IsOverheadExpense  bool      `json:"is_overhead_expense"`
 	HasVariants        bool      `json:"has_variants"`
+	HasDelivery        bool      `json:"has_delivery"`
+	DeliveryPrice      float64   `json:"delivery_price"`
 	IsActive           bool        `json:"is_active"`
 	Tags               []string    `json:"tags"`
 	ImageURL           string      `json:"image_url"`

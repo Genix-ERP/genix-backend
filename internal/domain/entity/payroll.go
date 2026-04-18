@@ -69,12 +69,13 @@ type CreatePayrollPeriodInput struct {
 
 // UpdatePayrollPeriodInput represents input for updating a payroll period
 type UpdatePayrollPeriodInput struct {
-	PeriodName *string `json:"period_name,omitempty"`
-	StartDate  *string `json:"start_date,omitempty"`
-	EndDate    *string `json:"end_date,omitempty"`
-	PayDate    *string `json:"pay_date,omitempty"`
-	Status     *string `json:"status,omitempty"`
-	Notes      *string `json:"notes,omitempty"`
+	PeriodName    *string `json:"period_name,omitempty"`
+	StartDate     *string `json:"start_date,omitempty"`
+	EndDate       *string `json:"end_date,omitempty"`
+	PayDate       *string `json:"pay_date,omitempty"`
+	Status        *string `json:"status,omitempty"`
+	Notes         *string `json:"notes,omitempty"`
+	PaymentMethod *string `json:"payment_method,omitempty"`
 }
 
 // CreatePayrollEntryInput represents input for creating a payroll entry

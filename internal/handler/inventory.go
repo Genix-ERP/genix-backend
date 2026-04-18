@@ -529,14 +529,25 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		unitCost = productCostPrice
 	}
 
-	// Verify warehouse belongs to tenant
-	var warehouseExists bool
-	h.db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)",
+	// Verify warehouse belongs to tenant and get its organization_id
+	var warehouseOrgID uuid.UUID
+	err = h.db.QueryRow(
+		"SELECT COALESCE(organization_id, '00000000-0000-0000-0000-000000000000') FROM warehouses WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
 		warehouseID, tenantID,
-	).Scan(&warehouseExists)
-	if !warehouseExists {
+	).Scan(&warehouseOrgID)
+	if err != nil {
 		response.NotFound(c, "Warehouse")
+		return
+	}
+
+	// If organizationID from middleware is nil, derive it from the warehouse
+	if organizationID == uuid.Nil && warehouseOrgID != uuid.Nil {
+		organizationID = warehouseOrgID
+	}
+
+	// Validate warehouse belongs to the same organization if both are set
+	if organizationID != uuid.Nil && warehouseOrgID != uuid.Nil && organizationID != warehouseOrgID {
+		response.BadRequest(c, "Warehouse does not belong to the selected organization")
 		return
 	}
 
@@ -755,6 +766,17 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 				"reorder_point": reorderPoint,
 				"available":     newBalance,
 			})
+			// In-app low stock notification
+			balanceStr := fmt.Sprintf("%.0f", newBalance)
+			h.createTranslatedNotification(tenantID, userID, "low_stock",
+				map[string]interface{}{
+					"product_id":   input.ProductID,
+					"product_name": productName,
+					"product_code": productCode,
+					"available":    newBalance,
+				},
+				productName, balanceStr,
+			)
 		}
 
 		h.EvaluateWorkflowRules(tenantID, "inventory.adjusted", map[string]interface{}{
@@ -1622,7 +1644,7 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 	baseQuery := `
 		SELECT b.id, b.code, b.name, b.product_id, b.bom_type, b.quantity, b.version,
 			   b.is_active, b.is_default, b.effective_date, b.expiry_date, b.notes,
-			   b.created_at,
+			   b.created_at, b.warehouse_id, w.name as warehouse_name,
 			   p.code as product_code, p.name as product_name,
 			   (SELECT COUNT(*) FROM bom_lines bl WHERE bl.bom_id = b.id) as line_count,
 			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(NULLIF(cp.cost_price, 0), cp.list_price, 0) * (1 + bl2.scrap_percent/100))
@@ -1633,6 +1655,7 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			     WHERE bo.bom_id = b.id), 0) as total_cost
 		FROM product_boms b
 		JOIN products p ON b.product_id = p.id
+		LEFT JOIN warehouses w ON b.warehouse_id = w.id
 		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM product_boms b WHERE b.tenant_id = $1 AND b.deleted_at IS NULL`
@@ -1700,11 +1723,13 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		var b entity.BOMResponse
 		var effectiveDate, expiryDate sql.NullTime
 		var notes sql.NullString
+		var warehouseID sql.NullString
+		var warehouseName sql.NullString
 
 		err := rows.Scan(
 			&b.ID, &b.Code, &b.Name, &b.ProductID, &b.BOMType, &b.Quantity, &b.Version,
 			&b.IsActive, &b.IsDefault, &effectiveDate, &expiryDate, &notes,
-			&b.CreatedAt,
+			&b.CreatedAt, &warehouseID, &warehouseName,
 			&b.ProductCode, &b.ProductName, &b.LineCount, &b.TotalCost,
 		)
 		if err != nil {
@@ -1719,6 +1744,13 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		if expiryDate.Valid {
 			s := expiryDate.Time.Format("2006-01-02")
 			b.ExpiryDate = &s
+		}
+		if warehouseID.Valid {
+			wid, _ := uuid.Parse(warehouseID.String)
+			b.WarehouseID = &wid
+		}
+		if warehouseName.Valid {
+			b.WarehouseName = &warehouseName.String
 		}
 
 		boms = append(boms, &b)
@@ -1938,14 +1970,22 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		tx.Exec("UPDATE product_boms SET is_default = false WHERE product_id = $1 AND tenant_id = $2", productID, tenantID)
 	}
 
+	var warehouseID *uuid.UUID
+	if input.WarehouseID != "" {
+		wid, _ := uuid.Parse(input.WarehouseID)
+		if wid != uuid.Nil {
+			warehouseID = &wid
+		}
+	}
+
 	_, err = tx.Exec(`
 		INSERT INTO product_boms (
 			id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
-			is_active, is_default, effective_date, expiry_date, notes,
+			is_active, is_default, effective_date, expiry_date, notes, warehouse_id,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $15, $15)
 	`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
-		input.IsDefault, effectiveDate, expiryDate, notes, userID, now)
+		input.IsDefault, effectiveDate, expiryDate, notes, warehouseID, userID, now)
 
 	if err != nil {
 		h.log.Error("Failed to create BOM", "error", err)
@@ -2108,6 +2148,17 @@ func (h *Handler) UpdateBOM(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
 		args = append(args, *input.Notes)
+	}
+	if input.WarehouseID != nil {
+		argCount++
+		if *input.WarehouseID == "" {
+			updates = append(updates, "warehouse_id = NULL")
+			argCount-- // no arg added
+		} else {
+			wid, _ := uuid.Parse(*input.WarehouseID)
+			updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+			args = append(args, wid)
+		}
 	}
 
 	if len(updates) == 0 {
@@ -6622,6 +6673,23 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
 						`, lotID, tenantID, prodID, warehouseID, lotNumber,
 							now, expDate, doneQty, unitPrice, vendorID, op.SourceID, now)
+
+						// FIFO: set cost_price to the OLDEST available lot's cost (not latest purchase)
+						var fifoCost float64
+						if h.db.QueryRow(`
+							SELECT unit_cost FROM inventory_lots
+							WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+							ORDER BY received_date ASC LIMIT 1
+						`, tenantID, prodID).Scan(&fifoCost) != nil || fifoCost <= 0 {
+							fifoCost = unitPrice // fallback to current purchase price if no lots
+						}
+						h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+							fifoCost, now, prodID, tenantID)
+						if op.OrgID != nil {
+							h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+								fifoCost, now, prodID, *op.OrgID)
+						}
+						h.log.Info("[v2] Updated product cost_price from stock receipt", "product_id", prodID, "cost_price", unitPrice, "org_id", op.OrgID)
 					} else {
 						// Delivery or write-off: decrease inventory
 						h.db.Exec(`
