@@ -54,7 +54,8 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			   c.custom_fields, c.is_active, c.created_by, c.created_at, c.updated_at,
 			   COALESCE(sp.avg_rating, 0) AS avg_rating,
 			   COALESCE(sp.rating_count, 0) AS rating_count,
-			   c.source_organization_id
+			   c.source_organization_id,
+			   c.default_receivable_account_id, c.default_payable_account_id
 		FROM contacts c
 		LEFT JOIN (
 			SELECT vendor_id, AVG(overall_rating) AS avg_rating, COUNT(*) AS rating_count
@@ -138,6 +139,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		var ratingCount int
 		var expectedRevenue sql.NullFloat64
 		var sourceOrgID sql.NullString
+		var defaultReceivableAccountID, defaultPayableAccountID sql.NullString
 
 		err := rows.Scan(
 			&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
@@ -146,6 +148,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes, &expectedRevenue,
 			&customFields, &ct.IsActive, &createdBy, &ct.CreatedAt, &ct.UpdatedAt,
 			&avgRating, &ratingCount, &sourceOrgID,
+			&defaultReceivableAccountID, &defaultPayableAccountID,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan contact", "error", err)
@@ -225,6 +228,12 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		}
 		if sourceOrgID.Valid {
 			resp.SourceOrganizationID = &sourceOrgID.String
+		}
+		if defaultReceivableAccountID.Valid {
+			resp.DefaultReceivableAccountID = &defaultReceivableAccountID.String
+		}
+		if defaultPayableAccountID.Valid {
+			resp.DefaultPayableAccountID = &defaultPayableAccountID.String
 		}
 
 		contacts = append(contacts, resp)
@@ -347,14 +356,28 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		}
 	}
 
+	// Parse optional account IDs
+	var receivableAccountID, payableAccountID *uuid.UUID
+	if input.DefaultReceivableAccountID != "" {
+		if uid, err := uuid.Parse(input.DefaultReceivableAccountID); err == nil {
+			receivableAccountID = &uid
+		}
+	}
+	if input.DefaultPayableAccountID != "" {
+		if uid, err := uuid.Parse(input.DefaultPayableAccountID); err == nil {
+			payableAccountID = &uid
+		}
+	}
+
 	query := `
 		INSERT INTO contacts (
 			id, tenant_id, organization_id, type, code, name, legal_name, tax_id,
 			registration_number, industry, website, email, phone, fax,
 			billing_address, shipping_address, payment_terms, credit_limit,
 			current_balance, tax_exempt, tags, notes, expected_revenue, custom_fields,
-			is_active, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+			is_active, created_by, created_at, updated_at,
+			default_receivable_account_id, default_payable_account_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
 		RETURNING id
 	`
 
@@ -364,6 +387,7 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		billingAddr, shippingAddr, input.PaymentTerms, input.CreditLimit,
 		0, input.TaxExempt, tags, notes, input.ExpectedRevenue, customFields,
 		true, userID, now, now,
+		receivableAccountID, payableAccountID,
 	).Scan(&id)
 
 	if err != nil {
@@ -402,6 +426,14 @@ func (h *Handler) CreateContact(c *gin.Context) {
 	if input.ExpectedRevenue != nil {
 		resp.ExpectedRevenue = input.ExpectedRevenue
 	}
+	if receivableAccountID != nil {
+		s := receivableAccountID.String()
+		resp.DefaultReceivableAccountID = &s
+	}
+	if payableAccountID != nil {
+		s := payableAccountID.String()
+		resp.DefaultPayableAccountID = &s
+	}
 
 	response.Created(c, resp)
 }
@@ -426,7 +458,8 @@ func (h *Handler) GetContact(c *gin.Context) {
 			   registration_number, industry, website, email, phone, fax,
 			   billing_address, shipping_address, payment_terms, credit_limit,
 			   current_balance, currency_id, tax_exempt, tags, notes, expected_revenue,
-			   custom_fields, is_active, created_by, created_at, updated_at
+			   custom_fields, is_active, created_by, created_at, updated_at,
+			   default_receivable_account_id, default_payable_account_id
 		FROM contacts
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`
@@ -436,6 +469,7 @@ func (h *Handler) GetContact(c *gin.Context) {
 	var currencyID, createdBy sql.NullString
 	var billingAddr, shippingAddr, tags, customFields []byte
 	var expectedRevenue sql.NullFloat64
+	var defaultReceivableAccountID, defaultPayableAccountID sql.NullString
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
@@ -443,6 +477,7 @@ func (h *Handler) GetContact(c *gin.Context) {
 		&billingAddr, &shippingAddr, &ct.PaymentTerms, &ct.CreditLimit,
 		&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes, &expectedRevenue,
 		&customFields, &ct.IsActive, &createdBy, &ct.CreatedAt, &ct.UpdatedAt,
+		&defaultReceivableAccountID, &defaultPayableAccountID,
 	)
 
 	if err == sql.ErrNoRows {
@@ -515,6 +550,12 @@ func (h *Handler) GetContact(c *gin.Context) {
 	}
 	if expectedRevenue.Valid {
 		resp.ExpectedRevenue = &expectedRevenue.Float64
+	}
+	if defaultReceivableAccountID.Valid {
+		resp.DefaultReceivableAccountID = &defaultReceivableAccountID.String
+	}
+	if defaultPayableAccountID.Valid {
+		resp.DefaultPayableAccountID = &defaultPayableAccountID.String
 	}
 
 	response.Success(c, resp)
@@ -645,6 +686,26 @@ func (h *Handler) UpdateContact(c *gin.Context) {
 		customFields, _ := json.Marshal(input.CustomFields)
 		updates = append(updates, fmt.Sprintf("custom_fields = $%d", argCount))
 		args = append(args, customFields)
+	}
+	if input.DefaultReceivableAccountID != nil {
+		argCount++
+		if *input.DefaultReceivableAccountID == "" {
+			updates = append(updates, fmt.Sprintf("default_receivable_account_id = $%d", argCount))
+			args = append(args, nil)
+		} else if uid, err := uuid.Parse(*input.DefaultReceivableAccountID); err == nil {
+			updates = append(updates, fmt.Sprintf("default_receivable_account_id = $%d", argCount))
+			args = append(args, uid)
+		}
+	}
+	if input.DefaultPayableAccountID != nil {
+		argCount++
+		if *input.DefaultPayableAccountID == "" {
+			updates = append(updates, fmt.Sprintf("default_payable_account_id = $%d", argCount))
+			args = append(args, nil)
+		} else if uid, err := uuid.Parse(*input.DefaultPayableAccountID); err == nil {
+			updates = append(updates, fmt.Sprintf("default_payable_account_id = $%d", argCount))
+			args = append(args, uid)
+		}
 	}
 
 	if len(updates) == 0 {

@@ -84,6 +84,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 		auth.POST("/refresh", h.RefreshToken)
 		auth.POST("/forgot-password", h.ForgotPassword)
 		auth.POST("/reset-password", h.ResetPassword)
+		auth.POST("/send-phone-otp", h.SendPasswordResetOTP)         // Send OTP via SMS for password reset
+		auth.POST("/verify-phone-otp", h.VerifyPasswordResetOTP)     // Verify phone OTP for password reset
+		auth.POST("/reset-password-phone", h.ResetPasswordWithPhone) // Reset password with phone OTP
 		auth.POST("/verify-email", h.VerifyEmail)
 		auth.GET("/validate-invite", h.ValidateInvite)  // Public - validate invite token
 		auth.POST("/accept-invite", h.AcceptInvite)     // Public - accept invite and set password
@@ -141,13 +144,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		auth.GET("/me/organizations", h.GetCurrentUserOrganizations)
 	}
 
+	// Send credentials — HR workers need this without requiring users:user:read
+	rg.POST("/send-credentials", h.perm.Require("hr", "employee", "update"), h.SendCredentials)
+
 	// Users
 	users := rg.Group("/users")
 	users.Use(h.perm.Require("users", "user", "read"))
 	{
 		users.GET("", h.ListUsers)
 		users.POST("", h.perm.Require("users", "user", "create"), h.CreateUser)
-		users.POST("/send-credentials", h.perm.Require("users", "user", "create"), h.SendCredentials)
 		users.GET("/:id", h.GetUser)
 		users.PUT("/:id", h.perm.Require("users", "user", "update"), h.UpdateUser)
 		users.DELETE("/:id", h.perm.Require("users", "user", "delete"), h.DeleteUser)
@@ -189,24 +194,24 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 	// Departments
 	depts := rg.Group("/departments")
-	depts.Use(h.perm.Require("organization", "department", "read"))
+	depts.Use(h.perm.Require("hr", "employee", "read"))
 	{
 		depts.GET("", h.ListDepartments)
-		depts.POST("", h.perm.Require("organization", "department", "create"), h.CreateDepartment)
+		depts.POST("", h.perm.Require("hr", "employee", "create"), h.CreateDepartment)
 		depts.GET("/:id", h.GetDepartment)
-		depts.PUT("/:id", h.perm.Require("organization", "department", "update"), h.UpdateDepartment)
-		depts.DELETE("/:id", h.perm.Require("organization", "department", "delete"), h.DeleteDepartment)
+		depts.PUT("/:id", h.perm.Require("hr", "employee", "update"), h.UpdateDepartment)
+		depts.DELETE("/:id", h.perm.Require("hr", "employee", "delete"), h.DeleteDepartment)
 	}
 
 	// Job Positions
 	jobPositions := rg.Group("/job-positions")
-	jobPositions.Use(h.perm.Require("organization", "department", "read"))
+	jobPositions.Use(h.perm.Require("hr", "employee", "read"))
 	{
 		jobPositions.GET("", h.ListJobPositions)
-		jobPositions.POST("", h.perm.Require("organization", "department", "create"), h.CreateJobPosition)
+		jobPositions.POST("", h.perm.Require("hr", "employee", "create"), h.CreateJobPosition)
 		jobPositions.GET("/:id", h.GetJobPosition)
-		jobPositions.PUT("/:id", h.perm.Require("organization", "department", "update"), h.UpdateJobPosition)
-		jobPositions.DELETE("/:id", h.perm.Require("organization", "department", "delete"), h.DeleteJobPosition)
+		jobPositions.PUT("/:id", h.perm.Require("hr", "employee", "update"), h.UpdateJobPosition)
+		jobPositions.DELETE("/:id", h.perm.Require("hr", "employee", "delete"), h.DeleteJobPosition)
 	}
 
 	// Contacts (Customers & Vendors)
@@ -755,6 +760,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		purchaseOrders.GET("", h.ListPurchaseOrders)
 		purchaseOrders.POST("", h.perm.Require("purchase", "order", "create"), h.CreatePurchaseOrder)
+		purchaseOrders.POST("/scan-receipt", h.perm.Require("purchase", "order", "create"), h.ScanPurchaseReceipt)
 		purchaseOrders.GET("/:id", h.GetPurchaseOrder)
 		purchaseOrders.PUT("/:id", h.perm.Require("purchase", "order", "update"), h.UpdatePurchaseOrder)
 		purchaseOrders.DELETE("/:id", h.perm.Require("purchase", "order", "delete"), h.DeletePurchaseOrder)
@@ -980,6 +986,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		accounts.DELETE("/:id", h.perm.Require("finance", "account", "delete"), h.DeleteAccount)
 		accounts.GET("/:id/transactions", h.GetAccountTransactions)
 	}
+
+	// Payment journals (bank/cash only) — no finance permission required, any authenticated user can access
+	rg.GET("/journals/payment", h.ListPaymentJournals)
 
 	// Journals (accounting journals like GEN, SAL, PUR, MISC)
 	journalGroup := rg.Group("/journals")
@@ -1329,9 +1338,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// Workflow Logs
 	rg.GET("/workflow-logs", h.perm.Require("workflow", "workflow", "read"), h.ListWorkflowLogs)
 
-	// AI Assistant
+	// AI Assistant — accessible to all authenticated users
 	ai := rg.Group("/ai")
-	ai.Use(h.perm.Require("ai", "conversation", "create"))
 	{
 		ai.GET("/capabilities", h.GetAICapabilities)
 		ai.POST("/chat", h.AIChat)
@@ -1356,6 +1364,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// Reports
+	// Dashboard
+	dashboard := rg.Group("/dashboard")
+	{
+		dashboard.GET("/top-products", h.GetDashboardTopProducts)
+	}
+
 	reports := rg.Group("/reports")
 	reports.Use(h.perm.Require("finance", "report", "read"))
 	{
@@ -1412,7 +1426,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	notifications := rg.Group("/notifications")
 	{
 		notifications.GET("", h.ListNotifications)
+		notifications.GET("/unread-count", h.UnreadCount)
 		notifications.PUT("/:id/read", h.MarkNotificationRead)
+		notifications.DELETE("/:id", h.DeleteNotification)
 		notifications.PUT("/read-all", h.MarkAllNotificationsRead)
 	}
 
@@ -1458,6 +1474,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		productionOrders.POST("/:id/complete", h.CompleteProductionOrder)
 		productionOrders.POST("/:id/cancel", h.CancelProductionOrder)
 		productionOrders.POST("/:id/record-production", h.RecordProduction)
+		productionOrders.POST("/:id/complete-split", h.perm.Require("manufacturing", "production_orders", "update"), h.CompleteSplitOutput)
+		productionOrders.GET("/:id/split-outputs", h.GetSplitOutputs)
 	}
 
 	// Work Orders
@@ -1474,6 +1492,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.GET("/:id/materials", h.ListWorkOrderMaterials)
 		workOrders.POST("/:id/materials", h.AddWorkOrderMaterial)
 		workOrders.DELETE("/:id/materials/:material_id", h.RemoveWorkOrderMaterial)
+		workOrders.GET("/:id/attachments", h.ListWorkOrderAttachments)
+		workOrders.POST("/:id/attachments", h.UploadWorkOrderAttachment)
+		workOrders.DELETE("/:id/attachments/:attachment_id", h.DeleteWorkOrderAttachment)
 	}
 
 	// Manufacturing Transfers (Pick Components / Store Finished)
@@ -1693,6 +1714,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/buildings/:building_id/files", h.ListBuildingFiles)
 		constructionProjects.POST("/:id/buildings/:building_id/files", h.perm.Require("construction", "project", "create"), h.CreateBuildingFile)
 		constructionProjects.DELETE("/:id/buildings/:building_id/files/:file_id", h.perm.Require("construction", "project", "delete"), h.DeleteBuildingFile)
+		// Project Files
+		constructionProjects.GET("/:id/files", h.ListProjectFiles)
+		constructionProjects.POST("/:id/files", h.perm.Require("construction", "project", "create"), h.CreateProjectFile)
+		constructionProjects.DELETE("/:id/files/:file_id", h.perm.Require("construction", "project", "delete"), h.DeleteProjectFile)
 		// Smeta Sections
 		constructionProjects.GET("/:id/sections", h.ListSmetaSections)
 		constructionProjects.POST("/:id/sections", h.perm.Require("construction", "smeta", "create"), h.CreateSmetaSection)
@@ -1738,6 +1763,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Activity Log
 		constructionProjects.GET("/:id/activity-log", h.ListConstructionActivityLog)
 
+		// Estimate Resources (grouped by type for substage dropdowns)
+		constructionProjects.GET("/:id/estimate-resources", h.ListProjectEstimateResources)
+
 		// Estimates
 		constructionProjects.GET("/:id/estimates", h.ListEstimates)
 		constructionProjects.POST("/:id/estimates", h.perm.Require("construction", "estimate", "create"), h.CreateEstimate)
@@ -1775,6 +1803,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Acts (Forma 2 / Forma 3 / Forma 19)
 		constructionProjects.GET("/:id/acts", h.ListConstructionActs)
 		constructionProjects.POST("/:id/acts", h.perm.Require("construction", "project", "update"), h.CreateConstructionAct)
+		constructionProjects.POST("/:id/acts/generate-ks2/preview", h.perm.Require("construction", "project", "read"), h.PreviewAutoGenerateKS2)
 		constructionProjects.POST("/:id/acts/generate-ks2", h.perm.Require("construction", "project", "update"), h.AutoGenerateKS2)
 		constructionProjects.POST("/:id/acts/generate-ks3", h.perm.Require("construction", "project", "update"), h.GenerateForma3)
 
@@ -1877,6 +1906,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		estimates.GET("/:id/lines", h.ListEstimateLines)
 		estimates.POST("/:id/lines", h.perm.Require("construction", "estimate", "update"), h.CreateEstimateLine)
 		estimates.POST("/:id/lines/bulk", h.perm.Require("construction", "estimate", "update"), h.BulkCreateEstimateLines)
+		estimates.POST("/:id/create-products", h.perm.Require("construction", "estimate", "update"), h.CreateProductsFromEstimate)
 		estimates.PUT("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.UpdateEstimateLine)
 		estimates.DELETE("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.DeleteEstimateLine)
 	}
@@ -1947,6 +1977,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionExpenses.PUT("/:id/cancel", h.perm.Require("construction", "project", "update"), h.CancelExpenseLine)
 	}
 
+	// Material Reservations (Materiallar zaxirasi)
+	materialReservations := rg.Group("/material-reservations")
+	materialReservations.Use(h.perm.Require("inventory", "stock", "read"))
+	{
+		materialReservations.GET("", h.ListMaterialReservations)
+		materialReservations.POST("", h.perm.Require("construction", "project", "update"), h.CreateMaterialReservation)
+		materialReservations.PUT(":id/approve", h.perm.Require("inventory", "stock", "adjust"), h.ApproveMaterialReservation)
+		materialReservations.PUT(":id/reject", h.perm.Require("inventory", "stock", "adjust"), h.RejectMaterialReservation)
+		materialReservations.DELETE(":id", h.perm.Require("construction", "project", "update"), h.DeleteMaterialReservation)
+	}
+
 	// Cost Categories & Account Mapping (settings)
 	constructionSettings := rg.Group("/construction")
 	constructionSettings.Use(h.perm.Require("construction", "project", "read"))
@@ -1985,6 +2026,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		subcontracts.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateSubcontract)
 		subcontracts.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteSubcontract)
 		subcontracts.PUT("/:id/state", h.perm.Require("construction", "project", "update"), h.UpdateSubcontractState)
+	}
+
+	// Act Types (user-manageable list of act types)
+	actTypes := rg.Group("/construction/act-types")
+	actTypes.Use(h.perm.Require("construction", "project", "read"))
+	{
+		actTypes.GET("", h.ListConstructionActTypes)
+		actTypes.POST("", h.perm.Require("construction", "project", "update"), h.CreateConstructionActType)
+		actTypes.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionActType)
 	}
 
 	// Acts (direct access) — Forma 2 / Forma 3 / Forma 19

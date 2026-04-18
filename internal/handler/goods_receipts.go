@@ -842,7 +842,7 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 
 	// Get warehouse ID from the goods receipt
 	var grWarehouseID sql.NullString
-	h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1", grID).Scan(&grWarehouseID)
+	h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1 AND tenant_id = $2", grID, tenantID).Scan(&grWarehouseID)
 
 	// Get GR lines with product info for inventory update (including batch/expiry for lot creation)
 	grLinesForInventory, err := h.db.Query(`
@@ -885,10 +885,13 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 			if err == sql.ErrNoRows {
 				// Create new inventory record (quantity_available and total_value are generated columns)
 				inventoryID = uuid.New()
+				// Get organization_id from the warehouse
+				var whOrgID *uuid.UUID
+				h.db.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", warehouseID, tenantID).Scan(&whOrgID)
 				h.db.Exec(`
-					INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $6)
-				`, inventoryID, tenantID, productID, warehouseID, unitPrice, now)
+					INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+				`, inventoryID, tenantID, whOrgID, productID, warehouseID, unitPrice, now)
 			}
 
 			// 2. Update inventory quantity
@@ -943,6 +946,10 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
 			`, lotID, tenantID, productID, warehouseID, lotNumber,
 				now, expDate, acceptedQty, unitPrice, vendorID, poID, now)
+
+			// Update product cost_price with the latest purchase price
+			h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+				unitPrice, now, productID, tenantID)
 		}
 	}
 

@@ -180,6 +180,7 @@ type ProductionOrder struct {
 	PackageCount         int        `json:"package_count" db:"package_count"`
 	GoodQuantity         float64    `json:"good_quantity" db:"good_quantity"`
 	RejectQuantity       float64    `json:"reject_quantity" db:"reject_quantity"`
+	HasSplitOutput       bool       `json:"has_split_output" db:"has_split_output"`
 	// Schedule fields
 	ScheduledStart       *time.Time `json:"scheduled_start,omitempty" db:"scheduled_start"`
 	ScheduledEnd         *time.Time `json:"scheduled_end,omitempty" db:"scheduled_end"`
@@ -242,6 +243,7 @@ type ProductionOrderInput struct {
 	Notes                *string    `json:"notes,omitempty"`
 	Tags                 []string   `json:"tags,omitempty"`
 	ManufacturingCategoryID *uuid.UUID `json:"manufacturing_category_id,omitempty"`
+	HasSplitOutput       *bool      `json:"has_split_output,omitempty"`
 }
 
 type ProductionOrderUpdateInput struct {
@@ -264,6 +266,9 @@ type ProductionOrderUpdateInput struct {
 	GoodQuantity         *float64   `json:"good_quantity,omitempty"`
 	RejectQuantity       *float64   `json:"reject_quantity,omitempty"`
 	ManufacturingCategoryID *uuid.UUID `json:"manufacturing_category_id,omitempty"`
+	HasSplitOutput       *bool      `json:"has_split_output,omitempty"`
+	Status               *string    `json:"status,omitempty"`
+	ProgressPercent      *float64   `json:"progress_percent,omitempty"`
 }
 
 type ProductionOrderResponse struct {
@@ -288,6 +293,7 @@ type ProductionOrderResponse struct {
 	PackageCount         int         `json:"package_count"`
 	GoodQuantity         float64     `json:"good_quantity"`
 	RejectQuantity       float64     `json:"reject_quantity"`
+	HasSplitOutput       bool        `json:"has_split_output"`
 	// Schedule fields
 	ScheduledStart       *string     `json:"scheduled_start,omitempty"`
 	ScheduledEnd         *string     `json:"scheduled_end,omitempty"`
@@ -738,6 +744,38 @@ type ProductionOutputResponse struct {
 	RecordedByName    *string   `json:"recorded_by_name,omitempty"`
 	RecordedAt        string    `json:"recorded_at"`
 	CreatedAt         time.Time `json:"created_at"`
+}
+
+// =====================================================
+// PRODUCTION SPLIT OUTPUT ENTITIES
+// =====================================================
+
+// SplitOutputItem is the input for one packaged product line in a split output
+type SplitOutputItem struct {
+	ProductID    uuid.UUID  `json:"product_id" binding:"required"`
+	Quantity     float64    `json:"quantity" binding:"required,gt=0"`
+	WarehouseID  *uuid.UUID `json:"warehouse_id,omitempty"`
+}
+
+// CompleteSplitOutputInput is sent by the worker to finalize packaging
+type CompleteSplitOutputInput struct {
+	Items []SplitOutputItem `json:"items" binding:"required,min=1"`
+}
+
+// SplitOutputResponse is the DB row returned to the client
+type SplitOutputResponse struct {
+	ID                uuid.UUID  `json:"id"`
+	ProductionOrderID uuid.UUID  `json:"production_order_id"`
+	ProductID         uuid.UUID  `json:"product_id"`
+	ProductName       string     `json:"product_name"`
+	Quantity          float64    `json:"quantity"`
+	UnitWeightKg      float64    `json:"unit_weight_kg"`
+	TotalWeightKg     float64    `json:"total_weight_kg"`
+	CostPerKg         float64    `json:"cost_per_kg"`
+	UnitCost          float64    `json:"unit_cost"`
+	TotalCost         float64    `json:"total_cost"`
+	WarehouseID       *uuid.UUID `json:"warehouse_id,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 // Manufacturing stage constants

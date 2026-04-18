@@ -218,6 +218,18 @@ type CreateConstructionProjectInput struct {
 	PlannedEndDate   string  `json:"planned_end_date"`
 	ProjectManagerID string  `json:"project_manager_id"`
 	ChiefEngineerID  string  `json:"chief_engineer_id"`
+
+	// Forma 2 / Forma 3 client (Заказчик) banking & legal identity
+	ClientAddress             string `json:"client_address"`
+	ClientBankName            string `json:"client_bank_name"`
+	ClientBankAccount         string `json:"client_bank_account"`
+	ClientMFO                 string `json:"client_mfo"`
+	ClientSTIR                string `json:"client_stir"`
+	ClientOKONH               string `json:"client_okonh"`
+	ContractNumber            string `json:"contract_number"`
+	ObjectFullName            string `json:"object_full_name"`
+	ClientDirectorName        string `json:"client_director_name"`
+	ClientChiefAccountantName string `json:"client_chief_accountant_name"`
 }
 
 // UpdateConstructionProjectInput represents input for updating a construction project
@@ -246,6 +258,18 @@ type UpdateConstructionProjectInput struct {
 	ProgressPercent  *float64 `json:"progress_percent"`
 	ProjectManagerID *string  `json:"project_manager_id"`
 	ChiefEngineerID  *string  `json:"chief_engineer_id"`
+
+	// Forma 2 / Forma 3 client (Заказчик) banking & legal identity
+	ClientAddress             *string `json:"client_address"`
+	ClientBankName            *string `json:"client_bank_name"`
+	ClientBankAccount         *string `json:"client_bank_account"`
+	ClientMFO                 *string `json:"client_mfo"`
+	ClientSTIR                *string `json:"client_stir"`
+	ClientOKONH               *string `json:"client_okonh"`
+	ContractNumber            *string `json:"contract_number"`
+	ObjectFullName            *string `json:"object_full_name"`
+	ClientDirectorName        *string `json:"client_director_name"`
+	ClientChiefAccountantName *string `json:"client_chief_accountant_name"`
 }
 
 // =====================================================
