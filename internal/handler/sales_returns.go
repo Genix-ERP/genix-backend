@@ -522,8 +522,8 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 		WHERE sr.id = $1`, returnID).Scan(&returnOrgID)
 
 	// Get accounts — lookup by name first, then code fallback
-	arAccountID := findAccount(h.db, tenantID, returnOrgID, "accounts receivable", "1100")
-	revenueAccountID := findAccount(h.db, tenantID, returnOrgID, "sales revenue", "4000")
+	arAccountID := findAccount(h.db, tenantID, returnOrgID, "accounts receivable", "4010")
+	revenueAccountID := findAccount(h.db, tenantID, returnOrgID, "sales revenue", "9010")
 
 	// Get journal
 	var journalID uuid.UUID
@@ -809,8 +809,8 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 			WHERE sr.id = $1`, returnID).Scan(&refundOrgID)
 
 		// Get accounts — lookup by name first, then code fallback
-		arAccountID := findAccount(h.db, tenantID, refundOrgID, "accounts receivable", "1100")
-		cashAccountID := findAccount(h.db, tenantID, refundOrgID, "cash", "1000")
+		arAccountID := findAccount(h.db, tenantID, refundOrgID, "accounts receivable", "4010")
+		cashAccountID := findAccount(h.db, tenantID, refundOrgID, "cash", "5010")
 
 		// Get journal
 		var journalID uuid.UUID

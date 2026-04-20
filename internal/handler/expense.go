@@ -645,17 +645,17 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 		}
 
 		// Look up expense account
-		expenseAccountID := findAccount(h.db, tenantID, orgIDPtr, "operating expense", "6900")
+		expenseAccountID := findAccount(h.db, tenantID, orgIDPtr, "operating expense", "9410")
 		if expenseAccountID == uuid.Nil {
-			expenseAccountID = findAccount(h.db, tenantID, orgIDPtr, "miscellaneous expense", "6900")
+			expenseAccountID = findAccount(h.db, tenantID, orgIDPtr, "miscellaneous expense", "9410")
 		}
 
 		// Credit account: AP if reimbursable, Cash otherwise
 		var creditAccountID uuid.UUID
 		if reimbursable {
-			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 		} else {
-			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 		}
 
 		if expenseAccountID == uuid.Nil || creditAccountID == uuid.Nil {

@@ -1744,11 +1744,11 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 	totalLaborCost := producedQty * laborCost
 
 	// Look up accounts
-	wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
-	rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
-	finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "1330")
+	wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
+	rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
+	finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "2810")
 	machineAcct := findAccount(h.db, tenantID, organizationID, "accrued machine", "2590")
-	salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6720")
+	salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6710")
 
 	useDetailedFlow := wipAcct != uuid.Nil && rawAcct != uuid.Nil && finishedAcct != uuid.Nil
 
@@ -1862,10 +1862,10 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 		inventoryAcct := ca.StockValuationAccountID
 		cogsAcct := ca.ExpenseAccountID
 		if cogsAcct == uuid.Nil {
-			cogsAcct = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
+			cogsAcct = findAccount(h.db, tenantID, organizationID, "manufacturing", "9120")
 		}
 		if cogsAcct == uuid.Nil {
-			cogsAcct = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
+			cogsAcct = findAccount(h.db, tenantID, organizationID, "cost of production", "9110")
 		}
 
 		if inventoryAcct != uuid.Nil && cogsAcct != uuid.Nil {

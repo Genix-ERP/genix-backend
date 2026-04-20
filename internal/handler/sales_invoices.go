@@ -1055,15 +1055,15 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	arAccountID := getContactDefaultAccount(tx, customerID, "receivable")
 	// 2. Fallback to standard findAccount
 	if arAccountID == uuid.Nil {
-		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 	}
 	if arAccountID == uuid.Nil {
 		h.log.Error("AR account not found", "tenant_id", tenantID)
-		response.InternalError(c, "Accounts Receivable account (1100) not found. Please configure chart of accounts.")
+		response.InternalError(c, "Accounts Receivable account (4010) not found. Please configure chart of accounts.")
 		return
 	}
 
-	taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+	taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 	// Get invoice lines for per-category accounting
 	type invoiceLineAcct struct {
@@ -1114,7 +1114,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	cogsGrouped := make(map[cogsPair]float64)
 
 	// Resolve fallback revenue account for products without category income account
-	fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+	fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
 
 	// Check if a delivery stock operation already posted COGS for this sales order
 	// to avoid double-counting COGS (once from stock operation, once from invoice)
@@ -1498,18 +1498,18 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	// Get default account IDs — lookup by name first, then code fallback
-	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 	// Post directly to Cash/Bank based on payment method
 	var cashAccountID uuid.UUID
 	if input.PaymentMethod == "cash" {
-		cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
+		cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
 		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
+			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
 		}
 	} else {
-		cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
+		cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
 		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
+			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
 		}
 	}
 
@@ -1578,9 +1578,9 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		lineNumber := 3
 		// Line 3: Write-off (DR Write-off Expense, already credited AR above)
 		if glErr == nil && input.WriteOffAmount > 0 {
-			writeOffAccountID := findAccount(tx, tenantID, organizationID, "payment difference write-off", "6950")
+			writeOffAccountID := findAccount(tx, tenantID, organizationID, "payment difference write-off", "9690")
 			if writeOffAccountID == uuid.Nil {
-				writeOffAccountID = findAccount(tx, tenantID, organizationID, "miscellaneous expense", "6900")
+				writeOffAccountID = findAccount(tx, tenantID, organizationID, "miscellaneous expense", "9410")
 			}
 			if writeOffAccountID != uuid.Nil {
 				writeOffLineID := uuid.New()
@@ -1601,12 +1601,12 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 		// Line for early payment discount (DR Sales Discount)
 		if glErr == nil && earlyDiscountApplied > 0 {
-			discountAccountID := findAccount(tx, tenantID, organizationID, "sales discount", "4900")
+			discountAccountID := findAccount(tx, tenantID, organizationID, "sales discount", "9310")
 			if discountAccountID == uuid.Nil {
-				discountAccountID = findAccount(tx, tenantID, organizationID, "cash discount", "4900")
+				discountAccountID = findAccount(tx, tenantID, organizationID, "cash discount", "9310")
 			}
 			if discountAccountID == uuid.Nil {
-				discountAccountID = findAccount(tx, tenantID, organizationID, "discount", "4900")
+				discountAccountID = findAccount(tx, tenantID, organizationID, "discount", "9310")
 			}
 			if discountAccountID != uuid.Nil {
 				discountLineID := uuid.New()
@@ -1970,9 +1970,9 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	).Scan(&salesJournalID, &numberPrefix)
 
 	if err == nil {
-		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
-		revenueAccountID := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
-		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
+		revenueAccountID := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 		if arAccountID != uuid.Nil {
 			prefix := ""
@@ -2191,9 +2191,9 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 			orgPtr = &orgID
 		}
 
-		arAccountID := findAccount(h.db, tenantID, orgPtr, "accounts receivable", "1100")
-		taxAccountID := findAccount(h.db, tenantID, orgPtr, "tax", "2100")
-		revenueAccountID := findAccount(h.db, tenantID, orgPtr, "sales revenue", "4000")
+		arAccountID := findAccount(h.db, tenantID, orgPtr, "accounts receivable", "4010")
+		taxAccountID := findAccount(h.db, tenantID, orgPtr, "tax", "6990")
+		revenueAccountID := findAccount(h.db, tenantID, orgPtr, "sales revenue", "9010")
 
 		if arAccountID == uuid.Nil || revenueAccountID == uuid.Nil {
 			continue
@@ -2424,7 +2424,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 				continue
 			}
 
-			revenueAccountID := findAccount(h.db, tenantID, organizationID, "sales revenue", "4000")
+			revenueAccountID := findAccount(h.db, tenantID, organizationID, "sales revenue", "9010")
 			if revenueAccountID == uuid.Nil {
 				continue
 			}

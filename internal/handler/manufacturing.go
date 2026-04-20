@@ -1997,13 +1997,13 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			"quantityPlanned", quantityPlanned)
 
 		if totalMaterialCost > 0 {
-			wipAcct := findAccount(h.db, tenantID, orgID, "work in progress", "1320")
-			rawAcct := findAccount(h.db, tenantID, orgID, "raw materials", "1310")
+			wipAcct := findAccount(h.db, tenantID, orgID, "work in progress", "2010")
+			rawAcct := findAccount(h.db, tenantID, orgID, "raw materials", "1030")
 			if rawAcct == uuid.Nil {
-				rawAcct = findAccount(h.db, tenantID, orgID, "goods for resale", "1340")
+				rawAcct = findAccount(h.db, tenantID, orgID, "goods for resale", "2910")
 			}
 			if rawAcct == uuid.Nil {
-				rawAcct = findAccount(h.db, tenantID, orgID, "inventory", "1300")
+				rawAcct = findAccount(h.db, tenantID, orgID, "inventory", "1010")
 			}
 
 			h.log.Info("Account lookup results", "wipAcct", wipAcct, "rawAcct", rawAcct, "tenant_id", tenantID)
@@ -2384,14 +2384,14 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 					}
 
 					if totalMaterialCost > 0 {
-						wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
-						rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+						wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
+						rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
 						// Fallback: try goods for resale (1340) if raw materials not found
 						if rawAcct == uuid.Nil {
-							rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "1340")
+							rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "2910")
 						}
 						if rawAcct == uuid.Nil {
-							rawAcct = findAccount(h.db, tenantID, organizationID, "inventory", "1300")
+							rawAcct = findAccount(h.db, tenantID, organizationID, "inventory", "1010")
 						}
 
 						if wipAcct != uuid.Nil && rawAcct != uuid.Nil {
@@ -2849,37 +2849,37 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 
 	if totalCost > 0 {
 		// Look up WIP-based accounts (try English, then Uzbek, then Russian names)
-		wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
+		wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
 		if wipAcct == uuid.Nil {
-			wipAcct = findAccount(h.db, tenantID, organizationID, "tugallanmagan ishlab chiqarish", "1320")
+			wipAcct = findAccount(h.db, tenantID, organizationID, "tugallanmagan ishlab chiqarish", "2010")
 		}
 		if wipAcct == uuid.Nil {
-			wipAcct = findAccount(h.db, tenantID, organizationID, "незавершенное производство", "1320")
+			wipAcct = findAccount(h.db, tenantID, organizationID, "незавершенное производство", "2010")
 		}
 
-		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
 		if rawAcct == uuid.Nil {
-			rawAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1310")
+			rawAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1030")
 		}
 		if rawAcct == uuid.Nil {
-			rawAcct = findAccount(h.db, tenantID, organizationID, "материал", "1310")
+			rawAcct = findAccount(h.db, tenantID, organizationID, "материал", "1030")
 		}
 
-		finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "1330")
+		finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "2810")
 		if finishedAcct == uuid.Nil {
-			finishedAcct = findAccount(h.db, tenantID, organizationID, "tayyor mahsulot", "1330")
+			finishedAcct = findAccount(h.db, tenantID, organizationID, "tayyor mahsulot", "2810")
 		}
 		if finishedAcct == uuid.Nil {
-			finishedAcct = findAccount(h.db, tenantID, organizationID, "готовая продукция", "1330")
+			finishedAcct = findAccount(h.db, tenantID, organizationID, "готовая продукция", "2810")
 		}
 		if finishedAcct == uuid.Nil {
 			finishedAcct = getInventoryAccountByType(h.db, tenantID, organizationID, productID)
 		}
 
 		machineAcct := findAccount(h.db, tenantID, organizationID, "accrued machine", "2590")
-		salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6720")
+		salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6710")
 		if salaryAcct == uuid.Nil {
-			salaryAcct = findAccount(h.db, tenantID, organizationID, "ish haqi", "6720")
+			salaryAcct = findAccount(h.db, tenantID, organizationID, "ish haqi", "6710")
 		}
 
 		h.log.Info("CompleteProductionOrder: account lookup",
@@ -3048,25 +3048,25 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 				inventoryAccountID := ca.StockValuationAccountID
 				cogsAccountID := ca.ExpenseAccountID
 				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "9120")
 				}
 				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "9110")
 				}
 				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "ishlab chiqarish", "5100")
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "ishlab chiqarish", "9120")
 				}
 				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "tannarx", "5000")
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "tannarx", "9110")
 				}
 				if inventoryAccountID == uuid.Nil {
 					inventoryAccountID = getInventoryAccountByType(h.db, tenantID, organizationID, productID)
 				}
 				if inventoryAccountID == uuid.Nil {
-					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "inventory", "1300")
+					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "inventory", "1010")
 				}
 				if inventoryAccountID == uuid.Nil {
-					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "tovar-moddiy", "1300")
+					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "tovar-moddiy", "1010")
 				}
 
 				h.log.Info("CompleteProductionOrder: fallback accounting",

@@ -1047,20 +1047,20 @@ func (h *Handler) PayTaxPeriod(c *gin.Context) {
 		orgIDPtr = &organizationID
 	}
 
-	outputVATAccountID := findAccount(tx, tenantID, orgIDPtr, "vat payable", "2210")
+	outputVATAccountID := findAccount(tx, tenantID, orgIDPtr, "vat payable", "6420")
 	if outputVATAccountID == uuid.Nil {
-		outputVATAccountID = findAccount(tx, tenantID, orgIDPtr, "tax payable", "2200")
+		outputVATAccountID = findAccount(tx, tenantID, orgIDPtr, "tax payable", "6410")
 	}
-	inputVATAccountID := findAccount(tx, tenantID, orgIDPtr, "input vat", "1410")
+	inputVATAccountID := findAccount(tx, tenantID, orgIDPtr, "input vat", "4410")
 	if inputVATAccountID == uuid.Nil {
-		inputVATAccountID = findAccount(tx, tenantID, orgIDPtr, "vat", "1410")
+		inputVATAccountID = findAccount(tx, tenantID, orgIDPtr, "vat", "4410")
 	}
 
 	var bankAccountID uuid.UUID
 	if input.PaymentMethod == "cash" {
-		bankAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+		bankAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "5010")
 	} else {
-		bankAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+		bankAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
 	}
 
 	if outputVATAccountID == uuid.Nil || bankAccountID == uuid.Nil {

@@ -3817,12 +3817,12 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 	}
 
 	// Find expense/COGS account and inventory journal
-	expenseAcct := findAccount(tx, tenantID, orgIDPtr, "construction expense", "7000")
+	expenseAcct := findAccount(tx, tenantID, orgIDPtr, "construction expense", "9610")
 	if expenseAcct == uuid.Nil {
-		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "cost of goods", "5000")
+		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "cost of goods", "9110")
 	}
 	if expenseAcct == uuid.Nil {
-		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "expense", "6000")
+		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "expense", "9420")
 	}
 
 	var journalID uuid.UUID
@@ -4144,7 +4144,7 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 		var creditAccountID uuid.UUID
 		creditAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
 		if creditAccountID == uuid.Nil {
-			creditAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+			creditAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "5010")
 		}
 
 		// Get construction journal for journal entries

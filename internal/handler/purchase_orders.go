@@ -2120,13 +2120,13 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 	if journalErr == nil {
 		// Find AP account
-		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
 		if apAccountID == uuid.Nil {
-			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "2100")
+			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
 		}
 
 		if apAccountID != uuid.Nil {
-			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 			// Per-category accounting: resolve Stock Interim Receipt per product
 			type billLineAcct struct {
@@ -2156,12 +2156,12 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 			// Fallback if no product lines matched
 			if len(inputGrouped) == 0 && subtotal > 0 {
-				fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "2230")
+				fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "6015")
 				if fallbackInput == uuid.Nil {
-					fallbackInput = findAccount(tx, tenantID, organizationID, "stock interim receipt", "2200")
+					fallbackInput = findAccount(tx, tenantID, organizationID, "stock interim receipt", "6015")
 				}
 				if fallbackInput == uuid.Nil {
-					fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
+					fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "9110")
 				}
 				if fallbackInput != uuid.Nil {
 					inputGrouped[fallbackInput] = subtotal

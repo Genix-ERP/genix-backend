@@ -2407,10 +2407,10 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	if journalErr == nil {
 		// Find AR account
-		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 
 		if arAccountID != uuid.Nil {
-			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 			// Get invoice lines for per-category accounting
 			type invoiceLineAcct struct {
@@ -2457,7 +2457,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			cogsGrouped := make(map[cogsPair]float64)
 
 			// Resolve fallback revenue account for products without category income account
-			fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+			fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
 
 			for _, al := range acctLines {
 				if al.LineTotal > 0 {

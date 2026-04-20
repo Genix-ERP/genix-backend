@@ -1046,10 +1046,10 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 			creditAcct := ca.StockInputAccountID
 
 			if debitAcct == uuid.Nil {
-				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
 			}
 			if creditAcct == uuid.Nil {
-				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 			}
 			if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
 				continue
