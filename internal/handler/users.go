@@ -836,7 +836,13 @@ func (h *Handler) ListAllTenants(c *gin.Context) {
 		        LEFT JOIN roles r ON ur.role_id = r.id
 		        WHERE u.tenant_id = t.id AND u.deleted_at IS NULL
 		        AND (u.is_system_admin = true OR r.code = 'owner')
-		        LIMIT 1) as owner_email
+		        LIMIT 1) as owner_email,
+		       (SELECT u.phone FROM users u
+		        LEFT JOIN user_roles ur ON u.id = ur.user_id
+		        LEFT JOIN roles r ON ur.role_id = r.id
+		        WHERE u.tenant_id = t.id AND u.deleted_at IS NULL
+		        AND (u.is_system_admin = true OR r.code = 'owner')
+		        LIMIT 1) as owner_phone
 		FROM tenants t
 		WHERE t.deleted_at IS NULL
 	`
@@ -879,6 +885,7 @@ func (h *Handler) ListAllTenants(c *gin.Context) {
 		UserCount          int        `json:"user_count"`
 		OwnerName          *string    `json:"owner_name,omitempty"`
 		OwnerEmail         *string    `json:"owner_email,omitempty"`
+		OwnerPhone         *string    `json:"owner_phone,omitempty"`
 	}
 
 	var tenants []TenantResponse
@@ -886,12 +893,12 @@ func (h *Handler) ListAllTenants(c *gin.Context) {
 		var t TenantResponse
 		var plan, status sql.NullString
 		var trialEnds, clearAt sql.NullTime
-		var ownerName, ownerEmail sql.NullString
+		var ownerName, ownerEmail, ownerPhone sql.NullString
 
 		if err := rows.Scan(&t.ID, &t.Code, &t.Name, &plan, &status,
 			&t.PaidUsers, &t.IsActive, &trialEnds, &clearAt,
 			&t.CreatedAt, &t.UpdatedAt, &t.UserCount,
-			&ownerName, &ownerEmail); err != nil {
+			&ownerName, &ownerEmail, &ownerPhone); err != nil {
 			h.log.Error("Failed to scan tenant", "error", err)
 			continue
 		}
@@ -915,6 +922,9 @@ func (h *Handler) ListAllTenants(c *gin.Context) {
 		}
 		if ownerEmail.Valid {
 			t.OwnerEmail = &ownerEmail.String
+		}
+		if ownerPhone.Valid {
+			t.OwnerPhone = &ownerPhone.String
 		}
 
 		tenants = append(tenants, t)
@@ -981,6 +991,189 @@ func (h *Handler) ActivateTenantSubscription(c *gin.Context) {
 
 // DeleteSystemUser soft-deletes a user (for system admin only)
 // This marks the user as deleted without removing data
+// GetTenantDetails returns full information about a tenant: tenant info, owner,
+// users list, employee/organization counts, and subscription payment history.
+// GET /admin/tenants/:id
+func (h *Handler) GetTenantDetails(c *gin.Context) {
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid tenant ID")
+		return
+	}
+
+	// Tenant base info
+	type TenantInfo struct {
+		ID                 uuid.UUID  `json:"id"`
+		Code               string     `json:"code"`
+		Name               string     `json:"name"`
+		SubscriptionPlan   string     `json:"subscription_plan"`
+		SubscriptionStatus string     `json:"subscription_status"`
+		PaidUsers          int        `json:"paid_users"`
+		IsActive           bool       `json:"is_active"`
+		TrialEndsAt        *time.Time `json:"trial_ends_at,omitempty"`
+		AccountClearAt     *time.Time `json:"account_clear_at,omitempty"`
+		CreatedAt          time.Time  `json:"created_at"`
+		UpdatedAt          time.Time  `json:"updated_at"`
+	}
+	var ti TenantInfo
+	var plan, status sql.NullString
+	var trialEnds, clearAt sql.NullTime
+	err = h.db.QueryRow(`
+		SELECT id, code, name, subscription_plan, subscription_status,
+		       COALESCE(paid_users, 0), is_active, trial_ends_at, account_clear_at,
+		       created_at, updated_at
+		FROM tenants WHERE id = $1 AND deleted_at IS NULL`, tenantID).Scan(
+		&ti.ID, &ti.Code, &ti.Name, &plan, &status,
+		&ti.PaidUsers, &ti.IsActive, &trialEnds, &clearAt,
+		&ti.CreatedAt, &ti.UpdatedAt,
+	)
+	if err != nil {
+		response.NotFound(c, "Tenant not found")
+		return
+	}
+	ti.SubscriptionPlan = "free"
+	if plan.Valid {
+		ti.SubscriptionPlan = plan.String
+	}
+	ti.SubscriptionStatus = "trialing"
+	if status.Valid {
+		ti.SubscriptionStatus = status.String
+	}
+	if trialEnds.Valid {
+		ti.TrialEndsAt = &trialEnds.Time
+	}
+	if clearAt.Valid {
+		ti.AccountClearAt = &clearAt.Time
+	}
+
+	// Users list
+	type UserRow struct {
+		ID         uuid.UUID  `json:"id"`
+		FirstName  string     `json:"first_name"`
+		LastName   string     `json:"last_name"`
+		Email      *string    `json:"email,omitempty"`
+		Phone      *string    `json:"phone,omitempty"`
+		IsActive   bool       `json:"is_active"`
+		LastLogin  *time.Time `json:"last_login,omitempty"`
+		CreatedAt  time.Time  `json:"created_at"`
+		RoleName   *string    `json:"role_name,omitempty"`
+	}
+	urows, err := h.db.Query(`
+		SELECT u.id, COALESCE(u.first_name,''), COALESCE(u.last_name,''),
+		       u.email, u.phone, u.is_active,
+		       u.last_login_at, u.created_at,
+		       (SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+		         WHERE ur.user_id = u.id LIMIT 1) as role_name
+		FROM users u
+		WHERE u.tenant_id = $1 AND u.deleted_at IS NULL
+		ORDER BY u.created_at ASC`, tenantID)
+	users := []UserRow{}
+	if err == nil {
+		defer urows.Close()
+		for urows.Next() {
+			var u UserRow
+			var em, ph, rn sql.NullString
+			var ll sql.NullTime
+			if err := urows.Scan(&u.ID, &u.FirstName, &u.LastName, &em, &ph, &u.IsActive, &ll, &u.CreatedAt, &rn); err == nil {
+				if em.Valid {
+					u.Email = &em.String
+				}
+				if ph.Valid {
+					u.Phone = &ph.String
+				}
+				if ll.Valid {
+					u.LastLogin = &ll.Time
+				}
+				if rn.Valid {
+					u.RoleName = &rn.String
+				}
+				users = append(users, u)
+			}
+		}
+	}
+
+	// Counts (employees, organizations)
+	var employeeCount, orgCount int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM employees WHERE tenant_id = $1 AND deleted_at IS NULL`, tenantID).Scan(&employeeCount)
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL`, tenantID).Scan(&orgCount)
+
+	// Organizations list
+	type OrgRow struct {
+		ID        uuid.UUID `json:"id"`
+		Code      string    `json:"code"`
+		Name      string    `json:"name"`
+		Currency  string    `json:"currency"`
+		IsActive  bool      `json:"is_active"`
+		CreatedAt time.Time `json:"created_at"`
+	}
+	orgs := []OrgRow{}
+	orows, err := h.db.Query(`
+		SELECT id, code, name, COALESCE(currency, 'UZS'), is_active, created_at
+		FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL
+		ORDER BY created_at ASC`, tenantID)
+	if err == nil {
+		defer orows.Close()
+		for orows.Next() {
+			var o OrgRow
+			if err := orows.Scan(&o.ID, &o.Code, &o.Name, &o.Currency, &o.IsActive, &o.CreatedAt); err == nil {
+				orgs = append(orgs, o)
+			}
+		}
+	}
+
+	// Payment history
+	type PaymentRow struct {
+		ID          uuid.UUID `json:"id"`
+		Plan        string    `json:"plan"`
+		AmountUZS   int64     `json:"amount_uzs"`
+		Status      string    `json:"status"`
+		InvoiceID   string    `json:"invoice_id"`
+		CardPan     *string   `json:"card_pan,omitempty"`
+		PS          *string   `json:"ps,omitempty"`
+		ReceiptURL  *string   `json:"receipt_url,omitempty"`
+		PaymentTime *string   `json:"payment_time,omitempty"`
+		CreatedAt   time.Time `json:"created_at"`
+	}
+	payments := []PaymentRow{}
+	prows, err := h.db.Query(`
+		SELECT id, plan, amount_uzs, status, invoice_id, card_pan, ps, receipt_url, payment_time, created_at
+		FROM subscription_payments
+		WHERE tenant_id = $1
+		ORDER BY created_at DESC LIMIT 200`, tenantID)
+	if err == nil {
+		defer prows.Close()
+		for prows.Next() {
+			var p PaymentRow
+			var card, ps, rurl, pt sql.NullString
+			if err := prows.Scan(&p.ID, &p.Plan, &p.AmountUZS, &p.Status, &p.InvoiceID, &card, &ps, &rurl, &pt, &p.CreatedAt); err == nil {
+				if card.Valid {
+					p.CardPan = &card.String
+				}
+				if ps.Valid {
+					p.PS = &ps.String
+				}
+				if rurl.Valid {
+					p.ReceiptURL = &rurl.String
+				}
+				if pt.Valid {
+					p.PaymentTime = &pt.String
+				}
+				payments = append(payments, p)
+			}
+		}
+	}
+
+	response.Success(c, gin.H{
+		"tenant":         ti,
+		"users":          users,
+		"organizations":  orgs,
+		"employee_count": employeeCount,
+		"org_count":      orgCount,
+		"user_count":     len(users),
+		"payments":       payments,
+	})
+}
+
 func (h *Handler) DeleteSystemUser(c *gin.Context) {
 	userID := c.Param("id")
 	if userID == "" {
