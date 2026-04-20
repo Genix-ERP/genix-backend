@@ -349,8 +349,8 @@ func (h *Handler) createSplitOutputJournalEntry(
 		return
 	}
 
-	wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
-	finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "1330")
+	wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
+	finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "2810")
 	if wipAcct == uuid.Nil || finishedAcct == uuid.Nil {
 		return
 	}

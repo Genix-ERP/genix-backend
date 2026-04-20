@@ -669,7 +669,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "inventory adjustment", "6910")
 		}
 		if adjustAcct == uuid.Nil {
-			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "miscellaneous expense", "6900")
+			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "miscellaneous expense", "9410")
 		}
 
 		if ca.StockValuationAccountID != uuid.Nil && adjustAcct != uuid.Nil {
@@ -702,7 +702,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 					debitAcct = ca.StockValuationAccountID
 					creditAcct = ca.StockInputAccountID
 					if creditAcct == uuid.Nil {
-						creditAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+						creditAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
 					}
 					debitDesc = "Stock Valuation (adjustment in)"
 					creditDesc = "Stock Input (adjustment in)"
@@ -3606,9 +3606,9 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 				}
 
 				// Credit: Inventory Asset
-				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1300")
+				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
 				if inventoryAcct == uuid.Nil {
-					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1300")
+					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
 				}
 
 				if scrapAcct != uuid.Nil && inventoryAcct != uuid.Nil {
@@ -5582,9 +5582,9 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 				adjustAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory adjustment", "6910")
 			}
 			// Credit: Stock Valuation
-			stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+			stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
 			if stockAcct == uuid.Nil {
-				stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1300")
+				stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1010")
 			}
 
 			if adjustAcct != uuid.Nil && stockAcct != uuid.Nil {
@@ -6511,33 +6511,33 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						switch op.Direction {
 						case "receipt":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "2100")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "6010")
 								if creditAcct == uuid.Nil {
-									creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "2100")
+									creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "6010")
 								}
 							}
 						case "delivery":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "5100")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "9110")
 								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "5100")
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "9110")
 								}
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 						case "write_off":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "6920")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "9430")
 								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "6910")
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "9420")
 								}
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 						}
 					}
@@ -7306,7 +7306,7 @@ func (h *Handler) postIntercompanyStockAccounting(tenantID uuid.UUID, opID uuid.
 			debitAcct = ca.StockValuationAccountID
 			creditAcct = ca.StockInputAccountID
 			if creditAcct == uuid.Nil {
-				creditAcct = findAccount(h.db, tenantID, orgID, "accounts payable", "2100")
+				creditAcct = findAccount(h.db, tenantID, orgID, "accounts payable", "6010")
 			}
 		case "delivery":
 			debitAcct = ca.ExpenseAccountID
@@ -7433,9 +7433,9 @@ func (h *Handler) completeMaterialRequestFromStockOp(tenantID uuid.UUID, stockOp
 	}
 
 	// Find expense account
-	expenseAcct := findAccount(h.db, tenantID, orgIDPtr, "construction expense", "7000")
+	expenseAcct := findAccount(h.db, tenantID, orgIDPtr, "construction expense", "9610")
 	if expenseAcct == uuid.Nil {
-		expenseAcct = findAccount(h.db, tenantID, orgIDPtr, "cost of goods", "5000")
+		expenseAcct = findAccount(h.db, tenantID, orgIDPtr, "cost of goods", "9110")
 	}
 
 	var totalExpense float64
@@ -8514,10 +8514,10 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 				if shortageAcct == uuid.Nil {
 					shortageAcct = findAccount(tx, tenantID, orgIDPtr, "kamomad", "9430")
 				}
-				// Kt - product inventory account (1300-series)
-				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1300")
+				// Kt - product inventory account (1010-series)
+				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
 				if inventoryAcct == uuid.Nil {
-					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1300")
+					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
 				}
 
 				if shortageAcct != uuid.Nil && inventoryAcct != uuid.Nil {

@@ -646,27 +646,27 @@ func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, prod
 
 	// Fallbacks if category accounts not set
 	if ca.IncomeAccountID == uuid.Nil {
-		ca.IncomeAccountID = findAccount(q, tenantID, orgID, "sales revenue", "4000")
+		ca.IncomeAccountID = findAccount(q, tenantID, orgID, "sales revenue", "9010")
 	}
 	if ca.ExpenseAccountID == uuid.Nil {
-		ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cost of goods", "5000")
+		ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cost of goods", "9110")
 		if ca.ExpenseAccountID == uuid.Nil {
-			ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cogs", "5000")
+			ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cogs", "9110")
 		}
 	}
 	if ca.StockValuationAccountID == uuid.Nil {
-		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1300")
+		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1010")
 	}
 	if ca.StockInputAccountID == uuid.Nil {
-		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2230")
+		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "6015")
 		if ca.StockInputAccountID == uuid.Nil {
-			ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2200")
+			ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "6015")
 		}
 	}
 	if ca.StockOutputAccountID == uuid.Nil {
-		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2231")
+		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "6016")
 		if ca.StockOutputAccountID == uuid.Nil {
-			ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2201")
+			ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "6016")
 		}
 	}
 	return ca
@@ -683,14 +683,14 @@ func getInventoryAccountByType(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID
 
 	switch inventoryType {
 	case "raw":
-		return findAccount(q, tenantID, orgID, "raw materials", "1310")
+		return findAccount(q, tenantID, orgID, "raw materials", "1030")
 	case "finished":
-		return findAccount(q, tenantID, orgID, "finished goods", "1330")
+		return findAccount(q, tenantID, orgID, "finished goods", "2810")
 	case "trade":
-		return findAccount(q, tenantID, orgID, "goods for resale", "1340")
+		return findAccount(q, tenantID, orgID, "goods for resale", "2910")
 	case "service":
 		return uuid.Nil
 	default:
-		return findAccount(q, tenantID, orgID, "goods for resale", "1340")
+		return findAccount(q, tenantID, orgID, "goods for resale", "2910")
 	}
 }

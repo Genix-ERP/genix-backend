@@ -263,10 +263,10 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 	// Add net income as a line item in equity if it's non-zero
 	// This represents "Joriy yil foydasi" (Current Year Profit/Loss)
 	if math.Abs(netIncome) >= 0.01 {
-		// Check if there's already a "3300" account in equityAccounts
+		// Check if there's already a "8710" account in equityAccounts
 		found := false
 		for i, acc := range equityAccounts {
-			if acc.AccountCode == "3300" {
+			if acc.AccountCode == "8710" {
 				// Add net income to the existing account's balance
 				equityAccounts[i].Balance += netIncome
 				found = true
@@ -275,10 +275,10 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		}
 		if !found {
 			equityAccounts = append(equityAccounts, entity.BalanceSheetAccount{
-				AccountCode:   "3300",
-				AccountName:   "Joriy yil foydasi",
-				AccountNameUz: "Joriy yil foydasi",
-				AccountNameEn: "Current Year Profit/Loss",
+				AccountCode:   "8710",
+				AccountName:   "Joriy yil taqsimlanmagan foydasi",
+				AccountNameUz: "Joriy yil taqsimlanmagan foydasi",
+				AccountNameEn: "Current Year Undistributed Profit/Loss",
 				Balance:       netIncome,
 			})
 		}
@@ -732,37 +732,34 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 			}
 
 			// Categorize by account code (Uzbekistan NAS chart of accounts)
+			// NAS classification for cash flow statement:
 			// Investing: 0100-0899 (fixed/intangible assets, investments, capital expenditures)
-			// Financing: 6000-6999 (long-term liabilities), 3000-3999 (equity), 7000 (interest)
+			// Financing: 6000-6999 (current liabilities), 7000-7999 (long-term liabilities), 8000-8999 (equity)
 			// Operating: everything else (revenue, COGS, OpEx, AR, AP, etc.)
-			codePrefix := ""
-			if len(code) >= 2 {
-				codePrefix = code[:2]
-			}
 			switch {
 			case code >= "0100" && code <= "0899":
 				// Fixed assets (01xx-04xx), intangible assets (04xx),
 				// long-term investments (06xx), equipment (08xx) → investing
 				investingItems = append(investingItems, item)
 				investingTotal += amount
-			case code >= "1500" && code <= "1699":
-				// Capital equipment, depreciation, intangible assets → investing
+			case code >= "0400" && code <= "0499":
+				// Intangible assets (04xx) → investing
 				investingItems = append(investingItems, item)
 				investingTotal += amount
-			case code >= "2100" && code <= "2599":
-				// Short/long-term loans → financing
+			case code >= "0600" && code <= "0699":
+				// Long-term investments (06xx) → investing
+				investingItems = append(investingItems, item)
+				investingTotal += amount
+			case code >= "6000" && code <= "6999":
+				// Current liabilities / accounts payable (60xx-69xx) → financing
 				financingItems = append(financingItems, item)
 				financingTotal += amount
-			case code >= "6000" && code < "7000":
-				// Long-term liabilities (6000-6999) → financing
+			case code >= "7000" && code <= "7999":
+				// Long-term liabilities (70xx-79xx) → financing
 				financingItems = append(financingItems, item)
 				financingTotal += amount
-			case codePrefix >= "30" && codePrefix <= "39":
-				// Equity accounts (3000-3999) → financing
-				financingItems = append(financingItems, item)
-				financingTotal += amount
-			case code == "7000":
-				// Interest expense → financing
+			case code >= "8000" && code <= "8999":
+				// Equity accounts (80xx-89xx) → financing
 				financingItems = append(financingItems, item)
 				financingTotal += amount
 			default:

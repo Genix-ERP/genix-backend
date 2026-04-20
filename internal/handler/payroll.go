@@ -378,17 +378,17 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 				}
 				paymentAcctDesc = "Bank Account"
 			} else {
-				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1010")
+				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 				if paymentAcct == uuid.Nil {
-					paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "kassa", "1010")
+					paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "kassa", "5010")
 				}
 				paymentAcctDesc = "Cash"
 			}
 
 			// Wages payable account (liability cleared)
-			wagesPayableAcct := findAccount(h.db, tenantID, orgIDPtr, "wages payable", "6700")
+			wagesPayableAcct := findAccount(h.db, tenantID, orgIDPtr, "wages payable", "6710")
 			if wagesPayableAcct == uuid.Nil {
-				wagesPayableAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+				wagesPayableAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 			}
 
 			if paymentAcct != uuid.Nil && wagesPayableAcct != uuid.Nil {
@@ -810,14 +810,14 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		description := "Payroll: " + periodName
 
 		// Debit: Salary Expense
-		salaryAcct := findAccount(h.db, tenantID, orgIDPtr, "salaries", "6000")
+		salaryAcct := findAccount(h.db, tenantID, orgIDPtr, "salaries", "9420")
 		if salaryAcct == uuid.Nil {
-			salaryAcct = findAccount(h.db, tenantID, orgIDPtr, "salary", "6000")
+			salaryAcct = findAccount(h.db, tenantID, orgIDPtr, "salary", "9420")
 		}
 		// Credit: AP / Wages Payable
-		payableAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+		payableAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 		if payableAcct == uuid.Nil {
-			payableAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			payableAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 		}
 
 		if salaryAcct == uuid.Nil || payableAcct == uuid.Nil {

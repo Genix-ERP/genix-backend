@@ -373,8 +373,8 @@ func runAutoDepreciation(db *database.DB, log logger.Logger) {
 		}
 
 		// Look up accounts for this tenant
-		deprExpenseAcct := findAccountBg(db, tenantID, "depreciation expense", "6500")
-		accumDeprAcct := findAccountBg(db, tenantID, "accumulated depreciation", "1510")
+		deprExpenseAcct := findAccountBg(db, tenantID, "depreciation expense", "9470")
+		accumDeprAcct := findAccountBg(db, tenantID, "accumulated depreciation", "0200")
 		var journalID uuid.UUID
 		var nextNumber int
 		_ = db.QueryRow(`

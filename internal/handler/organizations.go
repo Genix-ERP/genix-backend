@@ -884,7 +884,7 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		accountTypeIDs[code] = id
 	}
 
-	// Define default accounts - following standard Chart of Accounts
+	// Define default accounts - following Uzbekistan NAS (lex.uz/acts/1357627)
 	defaultAccounts := []struct {
 		code        string
 		name        string
@@ -894,78 +894,117 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		isRecon     bool
 		description string
 	}{
-		// Assets (1xxx)
-		{"1000", "Cash", "CASH", false, false, true, "Cash on hand"},
-		{"1010", "Bank Account", "CASH", true, false, true, "Main bank account"},
-		{"1100", "Accounts Receivable", "AR", false, true, true, "Trade receivables from customers"},
-		{"1210", "Allowance for Doubtful Accounts", "CONTRA_ASSET", false, false, false, "Reserve for bad debts"},
-		{"1300", "Inventory", "INV", false, true, false, "Goods held for sale"},
-		{"1310", "Raw Materials", "INV", false, false, false, "Raw materials inventory"},
-		{"1320", "Work in Progress", "INV", false, false, false, "Work in progress inventory"},
-		{"1330", "Finished Goods", "INV", false, false, false, "Finished goods inventory"},
-		{"1400", "Prepaid Expenses", "OA", false, false, false, "Prepaid expenses"},
-		{"1500", "Fixed Assets", "FA", false, false, false, "Property, plant and equipment"},
-		{"1510", "Accumulated Depreciation", "CONTRA_ASSET", false, false, false, "Accumulated depreciation"},
-		{"1600", "Intangible Assets", "OA", false, false, false, "Intangible assets"},
-		{"1020", "Foreign Currency Account", "CASH", false, false, true, "Foreign currency bank account"},
-		{"1340", "Goods for Resale", "INV", false, false, false, "Goods purchased for resale"},
-		{"1410", "Input VAT", "OA", false, false, false, "VAT on purchases (receivable)"},
-		{"1700", "Construction Costs", "OA", false, false, false, "Construction work in progress costs"},
-		{"1730", "Employee Advances", "OA", false, false, false, "Advances paid to employees"},
+		// Asosiy vositalar (01xx)
+		{"0100", "Asosiy vositalar", "FA", false, false, false, "Asosiy vositalar (mol-mulk, zavod va jihozlar)"},
+		{"0110", "Yer", "FA", false, false, false, "Yer uchastkasi"},
+		{"0120", "Binolar, inshootlar va uzatuvchi moslamalar", "FA", false, false, false, "Binolar va inshootlar"},
+		{"0130", "Mashina va asbob-uskunalar", "FA", false, false, false, "Mashina va uskunalar"},
+		{"0140", "Mebel va ofis jihozlari", "FA", false, false, false, "Mebel va ofis jihozlari"},
+		{"0150", "Kompyuter jihozlari va hisoblash texnikasi", "FA", false, false, false, "Kompyuter jihozlari"},
+		{"0160", "Transport vositalari", "FA", false, false, false, "Transport vositalari"},
 
-		// Liabilities (2xxx)
-		{"2000", "Accounts Payable", "AP", false, true, true, "Trade payables to suppliers"},
-		{"2100", "Accrued Expenses", "ST_LIAB", false, false, false, "Accrued liabilities"},
-		{"2110", "Wages Payable", "ST_LIAB", false, false, false, "Wages and salaries payable"},
-		{"2120", "Interest Payable", "ST_LIAB", false, false, false, "Interest payable"},
-		{"2200", "Tax Payable", "ST_LIAB", false, false, false, "Tax liabilities"},
-		{"2210", "VAT Payable", "ST_LIAB", false, false, false, "VAT/Sales tax payable"},
-		{"2220", "Income Tax Payable", "ST_LIAB", false, false, false, "Income tax payable"},
-		{"2230", "Stock Interim Receipt", "ST_LIAB", false, false, false, "Interim account for goods received not yet invoiced"},
-		{"2231", "Stock Interim Delivery", "ST_LIAB", false, false, false, "Interim account for goods delivered not yet invoiced"},
-		{"2590", "Accrued Machine Costs", "ST_LIAB", false, false, false, "Accrued liabilities for machine hour costs in production"},
-		{"2300", "Unearned Revenue", "ST_LIAB", false, false, false, "Deferred revenue"},
-		{"2400", "Short-term Loans", "ST_LIAB", false, false, true, "Short-term borrowings"},
-		{"2500", "Long-term Loans", "LT_LIAB", false, false, true, "Long-term borrowings"},
+		// Eskirish (02xx)
+		{"0200", "Asosiy vositalar eskirishi", "CONTRA_ASSET", false, false, false, "Yig'ilgan eskirish"},
+		{"0220", "Bino va inshootlarning eskirishi", "CONTRA_ASSET", false, false, false, "Bino va inshootlar eskirishi"},
+		{"0230", "Mashina va asbob-uskunalarning eskirishi", "CONTRA_ASSET", false, false, false, "Mashina uskunalar eskirishi"},
+		{"0260", "Transport vositalarining eskirishi", "CONTRA_ASSET", false, false, false, "Transport eskirishi"},
 
-		// Equity (3xxx)
-		{"3000", "Owner's Equity", "EQUITY", false, false, false, "Owner's capital"},
-		{"3100", "Share Capital", "EQUITY", false, false, false, "Issued share capital"},
-		{"3200", "Retained Earnings", "RETAIN", false, false, false, "Accumulated profits"},
-		{"3300", "Current Year Earnings", "RETAIN", false, false, false, "Current period profit/loss"},
-		{"3400", "Dividends", "EQUITY", false, false, false, "Dividends declared"},
+		// Nomoddiy aktivlar (04xx)
+		{"0400", "Nomoddiy aktivlar", "OA", false, false, false, "Nomoddiy aktivlar"},
+		{"0490", "Nomoddiy aktivlar eskirishi", "CONTRA_ASSET", false, false, false, "Nomoddiy aktivlar amortizatsiyasi"},
 
-		// Revenue (4xxx)
-		{"4000", "Sales Revenue", "REVENUE", false, false, false, "Revenue from sales"},
-		{"4100", "Service Revenue", "REVENUE", false, false, false, "Revenue from services"},
-		{"4300", "Construction Revenue", "REVENUE", false, false, false, "Revenue from construction projects"},
-		{"4900", "Other Income", "OTHER_INC", false, false, false, "Miscellaneous income"},
-		{"4910", "Interest Income", "OTHER_INC", false, false, false, "Interest earned"},
-		{"4920", "Foreign Exchange Gain", "OTHER_INC", false, false, false, "Gain on foreign exchange"},
+		// Kapital qo'yilmalar (08xx)
+		{"0810", "Tugallanmagan kapital qo'yilmalar", "OA", false, false, false, "Qurilish ishlari xarajatlari"},
 
-		// Cost of Goods Sold (5xxx)
-		{"5000", "Cost of Goods Sold", "COGS", false, false, false, "Direct cost of goods sold"},
-		{"5100", "Direct Materials", "COGS", false, false, false, "Cost of raw materials used"},
-		{"5200", "Direct Labor", "COGS", false, false, false, "Direct labor costs"},
-		{"5300", "Manufacturing Overhead", "COGS", false, false, false, "Manufacturing overhead"},
+		// Materiallar (10xx)
+		{"1010", "Xom ashyo va materiallar", "INV", false, false, false, "Tovar-moddiy zaxiralar"},
+		{"1030", "Yoqilg'i", "INV", false, false, false, "Yoqilg'i materiallari"},
+		{"1050", "Ehtiyot qismlar", "INV", false, false, false, "Ehtiyot qismlar"},
+		{"1060", "Qurilish materiallari", "INV", false, false, false, "Qurilish materiallari"},
+		{"1090", "Boshqa materiallar", "INV", false, false, false, "Boshqa materiallar"},
 
-		// Operating Expenses (6xxx)
-		{"6000", "Salaries & Wages", "OPEX", false, false, false, "Employee salaries and wages"},
-		{"6100", "Rent Expense", "OPEX", false, false, false, "Rent and lease payments"},
-		{"6200", "Utilities", "OPEX", false, false, false, "Electricity, water, gas"},
-		{"6300", "Office Supplies", "OPEX", false, false, false, "Office supplies expense"},
-		{"6400", "Insurance Expense", "OPEX", false, false, false, "Insurance premiums"},
-		{"6500", "Depreciation Expense", "OPEX", false, false, false, "Depreciation of assets"},
-		{"6600", "Advertising & Marketing", "OPEX", false, false, false, "Marketing expenses"},
-		{"6700", "Professional Fees", "OPEX", false, false, false, "Legal, accounting fees"},
-		{"6800", "Travel & Entertainment", "OPEX", false, false, false, "Business travel expenses"},
-		{"6900", "Miscellaneous Expense", "OPEX", false, false, false, "Other operating expenses"},
+		// Ishlab chiqarish (20xx-29xx)
+		{"2010", "Asosiy ishlab chiqarish", "INV", false, false, false, "Tugallanmagan ishlab chiqarish"},
+		{"2310", "Yordamchi ishlab chiqarish", "INV", false, false, false, "Yordamchi ishlab chiqarish xarajatlari"},
+		{"2510", "Umumishlab chiqarish xarajatlari", "OPEX", false, false, false, "Ishlab chiqarish ustama xarajatlari"},
+		{"2810", "Tayyor mahsulot", "INV", false, false, false, "Tayyor mahsulot omborda"},
+		{"2910", "Sotib olingan tovarlar", "INV", false, false, false, "Qayta sotish uchun tovarlar"},
 
-		// Other Expenses (7xxx)
-		{"7000", "Interest Expense", "OTHER_EXP", false, false, false, "Interest on borrowings"},
-		{"7100", "Bank Charges", "OTHER_EXP", false, false, false, "Bank fees and charges"},
-		{"7200", "Foreign Exchange Loss", "OTHER_EXP", false, false, false, "Loss on foreign exchange"},
-		{"7900", "Other Expenses", "OTHER_EXP", false, false, false, "Miscellaneous expenses"},
+		// Kelgusi davr xarajatlari (31xx)
+		{"3100", "Kelgusi davr xarajatlari", "OA", false, false, false, "Oldindan to'langan xarajatlar"},
+
+		// Debitorlik qarzlari (40xx-49xx)
+		{"4010", "Xaridor va buyurtmachilardan olinadigan schyotlar", "AR", false, true, true, "Savdo debitorlik qarzlari"},
+		{"4210", "Mehnat haqi bo'yicha berilgan bo'naklar", "OA", false, false, false, "Xodimlarga berilgan bo'naklar"},
+		{"4310", "TMQ uchun berilgan bo'naklar", "OA", false, false, false, "Mol yetkazib beruvchilarga bo'naklar"},
+		{"4410", "Byudjetga soliqlar bo'yicha bo'nak to'lovlari", "OA", false, false, false, "QQS kirim (olinadigan)"},
+		{"4710", "Hisobdor shaxslar", "OA", false, false, false, "Hisobdor shaxslarga berilgan summa"},
+		{"4790", "Boshqa debitorlik qarzlari", "AR", false, false, false, "Boshqa debitorlik qarzlari"},
+		{"4910", "Shubhali qarzlar bo'yicha zaxira", "CONTRA_ASSET", false, false, false, "Shubhali qarzlar uchun zaxira"},
+
+		// Pul mablag'lari (50xx-55xx)
+		{"5010", "Kassa", "CASH", false, false, true, "Naqd pul kassada"},
+		{"5020", "Valyuta kassasi", "CASH", false, false, true, "Chet el valyutasidagi naqd pullar"},
+		{"5110", "Hisob-kitob schyoti", "CASH", true, false, true, "Asosiy bank hisob raqami"},
+
+		// Kreditorlik qarzlari (60xx-69xx)
+		{"6010", "Mol yetkazib beruvchilar va pudratchilar", "AP", false, true, true, "Mol yetkazib beruvchilarga savdo kreditorlik qarzlari"},
+		{"6015", "Olingan, lekin hisob-faktura qilinmagan tovarlar", "ST_LIAB", false, false, false, "Olingan, lekin hali hisob-faktura ko'rsatilmagan tovarlar uchun oraliq hisob"},
+		{"6016", "Yetkazilgan, lekin hisob-faktura qilinmagan tovarlar", "ST_LIAB", false, false, false, "Yetkazilgan, lekin hali hisob-faktura ko'rsatilmagan tovarlar uchun oraliq hisob"},
+		{"6310", "Kelgusi davr daromadlari", "ST_LIAB", false, false, false, "Kechiktirilgan daromad"},
+		{"6410", "Byudjetga to'lovlar bo'yicha qarz (turlar bo'yicha)", "ST_LIAB", false, false, false, "Soliq majburiyatlari"},
+		{"6420", "QQS bo'yicha qarz", "ST_LIAB", false, false, false, "QQS/Savdo solig'i to'lanishi kerak"},
+		{"6430", "Foyda solig'i bo'yicha qarz", "ST_LIAB", false, false, false, "Daromad solig'i to'lanishi kerak"},
+		{"6510", "Maqsadli davlat jamg'armalariga to'lovlar", "ST_LIAB", false, false, false, "Ijtimoiy sug'urta to'lovlari"},
+		{"6710", "Mehnat haqi bo'yicha xodimlarga bo'lgan qarz", "ST_LIAB", false, false, false, "Ish haqi va maoshlar to'lanishi kerak"},
+		{"6810", "Qisqa muddatli bank kreditlari", "ST_LIAB", false, false, true, "Qisqa muddatli qarzlar"},
+		{"6920", "Foizlar bo'yicha hisoblashlar", "ST_LIAB", false, false, false, "To'lanishi kerak bo'lgan foizlar"},
+		{"6990", "Boshqa kreditorlik qarzlari", "ST_LIAB", false, false, false, "Hisoblangan majburiyatlar"},
+
+		// Uzoq muddatli majburiyatlar (78xx)
+		{"7810", "Uzoq muddatli bank kreditlari", "LT_LIAB", false, false, true, "Uzoq muddatli qarzlar"},
+		{"7820", "Uzoq muddatli qarzlar", "LT_LIAB", false, false, true, "Uzoq muddatli qarzlar"},
+
+		// Kapital (83xx-87xx)
+		{"8300", "Ustav kapitali", "EQUITY", false, false, false, "Egasining kapitali"},
+		{"8310", "Oddiy aksiyalar", "EQUITY", false, false, false, "Chiqarilgan aksiyadorlik kapitali"},
+		{"8400", "Zaxira kapitali", "EQUITY", false, false, false, "Zaxira kapitali"},
+		{"8500", "Qo'shimcha kapital", "EQUITY", false, false, false, "Qo'shimcha kapital"},
+		{"8700", "Taqsimlanmagan foyda (qoplanmagan zarar)", "RETAIN", false, false, false, "Yig'ilgan foyda"},
+		{"8720", "E'lon qilingan dividendlar", "EQUITY", false, false, false, "E'lon qilingan dividendlar"},
+
+		// Daromadlar (90xx-95xx)
+		{"9010", "Tayyor mahsulot sotishdan daromadlar", "REVENUE", false, false, false, "Sotishdan tushum"},
+		{"9020", "Tovarlar sotishdan daromadlar", "REVENUE", false, false, false, "Tovarlar sotishdan tushum"},
+		{"9030", "Xizmatlar ko'rsatishdan daromadlar", "REVENUE", false, false, false, "Xizmatlardan tushum"},
+		{"9040", "Qurilish shartnomasi bo'yicha daromadlar", "REVENUE", false, false, false, "Qurilish loyihalaridan tushum"},
+		{"9310", "Boshqa operatsion daromadlar", "OTHER_INC", false, false, false, "Turli xil daromadlar"},
+		{"9510", "Foiz shaklida daromadlar", "OTHER_INC", false, false, false, "Olingan foizlar"},
+		{"9540", "Valyuta kursi farqlaridan daromadlar", "OTHER_INC", false, false, false, "Valyuta ayirboshlash bo'yicha foyda"},
+
+		// Xarajatlar (91xx-96xx)
+		{"9110", "Sotilgan tayyor mahsulot tannarxi", "COGS", false, false, false, "Sotilgan tovarlarning to'g'ridan-to'g'ri tannarxi"},
+		{"9120", "Sotilgan tovarlar tannarxi", "COGS", false, false, false, "Ishlatilgan xom ashyo tannarxi"},
+		{"9130", "Ishlab chiqarish xarajatlari", "COGS", false, false, false, "Bevosita mehnat xarajatlari"},
+		{"9140", "Umumishlab chiqarish xarajatlari", "COGS", false, false, false, "Ishlab chiqarish ustama xarajatlari"},
+		{"9150", "Xizmatlar tannarxi", "COGS", false, false, false, "Ko'rsatilgan xizmatlar tannarxi"},
+		{"9160", "Qurilish ishlari tannarxi", "COGS", false, false, false, "Qurilish ishlari tannarxi"},
+		{"9410", "Davr xarajatlari", "OPEX", false, false, false, "Boshqa operatsion xarajatlar"},
+		{"9420", "Mehnat haqi xarajatlari", "OPEX", false, false, false, "Xodimlar ish haqi va maoshlari"},
+		{"9430", "Ijara xarajatlari", "OPEX", false, false, false, "Ijara va lizing to'lovlari"},
+		{"9440", "Kommunal xarajatlar", "OPEX", false, false, false, "Elektr, suv, gaz"},
+		{"9450", "Ofis xarajatlari", "OPEX", false, false, false, "Ofis jihozlari xarajati"},
+		{"9460", "Sug'urta xarajatlari", "OPEX", false, false, false, "Sug'urta mukofotlari"},
+		{"9470", "Eskirish xarajatlari", "OPEX", false, false, false, "Aktivlar eskirishi"},
+		{"9480", "Reklama va marketing xarajatlari", "OPEX", false, false, false, "Marketing xarajatlari"},
+		{"9490", "Boshqa xizmatlar uchun xarajatlar", "OPEX", false, false, false, "Yuridik, buxgalteriya to'lovlari"},
+		{"9610", "Foiz shaklida xarajatlar", "OTHER_EXP", false, false, false, "Qarzlar bo'yicha foizlar"},
+		{"9620", "Bank xizmatlari uchun xarajatlar", "OTHER_EXP", false, false, false, "Bank to'lovlari va yig'imlar"},
+		{"9630", "Valyuta kursi farqlaridan zararlar", "OTHER_EXP", false, false, false, "Valyuta ayirboshlashda zarar"},
+		{"9690", "Boshqa moliyaviy xarajatlar", "OTHER_EXP", false, false, false, "Turli xil xarajatlar"},
+
+		// Yakuniy natija (99xx)
+		{"9910", "Yakuniy moliyaviy natija", "RETAIN", false, false, false, "Joriy davr foydasi/zarari"},
 	}
 
 	for _, acc := range defaultAccounts {
@@ -1041,12 +1080,12 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		defaultCreditCode string
 	}{
 		{"GEN", "General Journal", "general", "", ""},
-		{"SAL", "Sales Journal", "sales", "1100", "4000"},             // AR debit, Sales Revenue credit
-		{"PUR", "Purchase Journal", "purchase", "5000", "2000"},       // COGS debit, AP credit
-		{"CASH", "Cash Journal", "cash", "1000", "1000"},              // Cash
-		{"BANK", "Bank Journal", "bank", "1010", "1010"},              // Bank
+		{"SAL", "Sales Journal", "sales", "4010", "9010"},             // AR debit, Sales Revenue credit
+		{"PUR", "Purchase Journal", "purchase", "9110", "6010"},       // COGS debit, AP credit
+		{"CASH", "Cash Journal", "cash", "5010", "5010"},              // Cash
+		{"BANK", "Bank Journal", "bank", "5110", "5110"},              // Bank
 		{"MISC", "Miscellaneous Journal", "miscellaneous", "", ""},
-		{"CASH_RECEIPTS", "Cash Receipts Journal", "cash", "1000", ""}, // Cash receipts
+		{"CASH_RECEIPTS", "Cash Receipts Journal", "cash", "5010", ""}, // Cash receipts
 		{"STOCK", "Stock Journal", "general", "", ""},
 		{"ASSET", "Fixed Assets Journal", "general", "", ""},
 		{"PAYROLL", "Payroll Journal", "general", "", ""},
@@ -1055,15 +1094,15 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 
 	// Find profit/loss accounts for cash/bank journals
 	var profitAccountID, lossAccountID *uuid.UUID
-	// Profit: 6900 (Kurs farqi daromadi) or 4000 (Revenue) or 7100
-	for _, code := range []string{"6900", "4000", "7100"} {
+	// Profit: 9540 (Valyuta kurs farqi daromadi) or 9310 (Boshqa daromadlar) or 6900
+	for _, code := range []string{"9540", "9310", "6900"} {
 		if accID, ok := accountIDs[code]; ok {
 			profitAccountID = &accID
 			break
 		}
 	}
-	// Loss: 9400 (Kurs farqi zararlar) or 6000 (Expenses) or 7200
-	for _, code := range []string{"9400", "6000", "7200"} {
+	// Loss: 9630 (Valyuta kurs farqi zararlari) or 9410 (Boshqa xarajatlar) or 9400
+	for _, code := range []string{"9630", "9410", "9400"} {
 		if accID, ok := accountIDs[code]; ok {
 			lossAccountID = &accID
 			break

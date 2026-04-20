@@ -397,7 +397,7 @@ func (h *Handler) ApproveMaterialReservation(c *gin.Context) {
 	var creditAcct uuid.UUID
 	h.db.QueryRow(`SELECT COALESCE(inventory_account_id, '00000000-0000-0000-0000-000000000000') FROM products WHERE id = $1`, productID).Scan(&creditAcct)
 	if creditAcct == uuid.Nil {
-		creditAcct = findAccount(h.db, tenantID, orgIDPtr, "material", "1000")
+		creditAcct = findAccount(h.db, tenantID, orgIDPtr, "material", "1010")
 	}
 
 	var journalEntryID uuid.UUID

@@ -2476,7 +2476,7 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 		if err != nil {
 			continue
 		}
-		isCashOrBank := strings.HasPrefix(accountCode, "1000") || strings.HasPrefix(accountCode, "1010") || strings.HasPrefix(accountCode, "1100")
+		isCashOrBank := strings.HasPrefix(accountCode, "5010") || strings.HasPrefix(accountCode, "5110") || strings.HasPrefix(accountCode, "50") || strings.HasPrefix(accountCode, "51")
 		if isCashOrBank && newBalance < -0.001 {
 			response.BadRequest(c, fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas (balans: %.2f)", accountName, accountCode, newBalance))
 			return
@@ -3748,18 +3748,18 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		var jType sql.NullString
 		_ = tx.QueryRow(`SELECT type FROM journals WHERE id = $1 AND tenant_id = $2`, storedJournalID.String, tenantID).Scan(&jType)
 		if jType.Valid && jType.String == "cash" {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
 		} else if jType.Valid && jType.String == "bank" {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
 		}
 	}
 
 	// 4. Last fallback: find by account code
 	if cashAccountID == uuid.Nil {
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
 	}
 	if cashAccountID == uuid.Nil {
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
 	}
 	h.log.Info("Payment cash/bank account resolution", "cash_account_id", cashAccountID, "payment_id", id,
 		"had_bank_account_id", bankAccountIDStr.Valid, "had_journal_id", storedJournalID.Valid, "had_payment_method_id", paymentMethodID.Valid)
@@ -3789,13 +3789,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		counterAccountID = getContactDefaultAccount(tx, contactID, "receivable")
 		// 2. Fallback to standard findAccount chain
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "4010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "debitorlar", "1100")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "debitorlar", "4010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "receivable", "1100")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "receivable", "4010")
 		}
 		journalCode = "CASH_RECEIPTS"
 		sourceType = "payment_receipt"
@@ -3807,16 +3807,16 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		counterAccountID = getContactDefaultAccount(tx, contactID, "payable")
 		// 2. Fallback to standard findAccount chain
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlar", "2000")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlar", "6010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "payable", "2000")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "payable", "6010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlik", "2000")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlik", "6010")
 		}
 		journalCode = "CASH_DISBURSEMENTS"
 		sourceType = "payment"
@@ -4008,12 +4008,12 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				var exchangeDiffType string
 				if (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0) {
 					// Exchange gain
-					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "4920")
+					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "9540")
 					exchangeDiffDesc = "Valyuta kursi bo'yicha foyda"
 					exchangeDiffType = "positive"
 				} else {
 					// Exchange loss
-					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "7200")
+					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "9630")
 					exchangeDiffDesc = "Valyuta kursi bo'yicha zarar"
 					exchangeDiffType = "negative"
 				}
@@ -6512,8 +6512,8 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	}
 
 	// Find outstanding accounts
-	outReceiptsID := findAccount(h.db, tenantUUID, orgID, "outstanding receipts", "1150")
-	outPaymentsID := findAccount(h.db, tenantUUID, orgID, "outstanding payments", "1160")
+	outReceiptsID := findAccount(h.db, tenantUUID, orgID, "outstanding receipts", "5110")
+	outPaymentsID := findAccount(h.db, tenantUUID, orgID, "outstanding payments", "5110")
 
 	if outReceiptsID == uuid.Nil && outPaymentsID == uuid.Nil {
 		return // No outstanding accounts configured, nothing to clear
@@ -6706,7 +6706,7 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	if difference > 0 {
 		// Statement > book: bank has more than expected (e.g., interest earned)
 		// DR Bank, CR Other Income
-		otherIncomeID := findAccount(h.db, tenantUUID, orgID, "other income", "4900")
+		otherIncomeID := findAccount(h.db, tenantUUID, orgID, "other income", "9310")
 		if otherIncomeID == uuid.Nil {
 			return
 		}
@@ -6724,9 +6724,9 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	} else {
 		// Book > statement: bank has less than expected (e.g., bank charges)
 		// DR Bank Charges, CR Bank
-		bankChargesID := findAccount(h.db, tenantUUID, orgID, "bank charges", "7100")
+		bankChargesID := findAccount(h.db, tenantUUID, orgID, "bank charges", "9620")
 		if bankChargesID == uuid.Nil {
-			bankChargesID = findAccount(h.db, tenantUUID, orgID, "payment difference write-off", "6950")
+			bankChargesID = findAccount(h.db, tenantUUID, orgID, "payment difference write-off", "9690")
 		}
 		if bankChargesID == uuid.Nil {
 			return
