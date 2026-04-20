@@ -94,16 +94,18 @@ type ValidateInviteResponse struct {
 	ExpiresAt  string `json:"expires_at,omitempty"`
 }
 
-// SendOTPInput represents OTP request
+// SendOTPInput represents OTP request (either email or phone must be provided)
 type SendOTPInput struct {
-	Email    string `json:"email" binding:"required,email"`
+	Email    string `json:"email"`
+	Phone    string `json:"phone"`
 	Purpose  string `json:"purpose" binding:"required"` // registration, password_reset
 	Language string `json:"language"`                   // en, uz, ru - defaults to uz
 }
 
-// VerifyOTPInput represents OTP verification request
+// VerifyOTPInput represents OTP verification request (either email or phone)
 type VerifyOTPInput struct {
-	Email   string `json:"email" binding:"required,email"`
+	Email   string `json:"email"`
+	Phone   string `json:"phone"`
 	OTPCode string `json:"otp_code" binding:"required,len=6"`
 	Purpose string `json:"purpose" binding:"required"`
 }
@@ -133,7 +135,8 @@ type ResetPasswordWithPhoneInput struct {
 type RegisterWithOTPInput struct {
 	TenantCode string `json:"tenant_code" binding:"required,min=2,max=50"`
 	TenantName string `json:"tenant_name" binding:"required,min=2,max=255"`
-	Email      string `json:"email" binding:"required,email"`
+	Email      string `json:"email"`
+	Phone      string `json:"phone"`
 	Password   string `json:"password" binding:"required,min=8"`
 	FirstName  string `json:"first_name" binding:"required,min=1,max=100"`
 	LastName   string `json:"last_name" binding:"required,min=1,max=100"`
@@ -1573,12 +1576,18 @@ func (h *Handler) AcceptInvite(c *gin.Context) {
 	})
 }
 
-// SendOTP sends an OTP code to the specified email for verification
+// SendOTP sends an OTP code to the specified email or phone for verification
 func (h *Handler) SendOTP(c *gin.Context) {
 	var input SendOTPInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		h.log.Error("Invalid input", "error", err)
 		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	// Either email OR phone must be provided
+	if input.Email == "" && input.Phone == "" {
+		response.BadRequest(c, "Email or phone is required")
 		return
 	}
 
@@ -1588,45 +1597,77 @@ func (h *Handler) SendOTP(c *gin.Context) {
 		return
 	}
 
-	// For registration, check if email already exists
+	// Decide identifier (phone takes precedence when provided) — used as the key in email_verification_otps.email column
+	usePhone := input.Phone != ""
+	if usePhone {
+		input.Phone = normalizePhone(input.Phone)
+	}
+	identifier := input.Email
+	if usePhone {
+		identifier = input.Phone
+	}
+
+	// For registration, check if identifier already exists
 	if input.Purpose == "registration" {
 		var existingUserID uuid.UUID
-		err := h.db.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
+		var query string
+		var arg interface{}
+		if usePhone {
+			query = "SELECT id FROM users WHERE phone = $1 AND deleted_at IS NULL"
+			arg = input.Phone
+		} else {
+			query = "SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL"
+			arg = input.Email
+		}
+		err := h.db.QueryRow(query, arg).Scan(&existingUserID)
 		if err == nil {
-			response.Conflict(c, "Email already registered. Please use a different email or login to your existing account.")
+			if usePhone {
+				response.Conflict(c, "Phone number already registered. Please login to your existing account.")
+			} else {
+				response.Conflict(c, "Email already registered. Please use a different email or login to your existing account.")
+			}
 			return
 		}
 		if err != sql.ErrNoRows {
-			h.log.Error("Failed to check email", "error", err)
+			h.log.Error("Failed to check identifier", "error", err)
 			response.InternalServerError(c, "")
 			return
 		}
 	}
 
-	// For password_reset, check if email exists
+	// For password_reset, check if identifier exists
 	if input.Purpose == "password_reset" {
 		var existingUserID uuid.UUID
-		err := h.db.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
+		var query string
+		var arg interface{}
+		if usePhone {
+			query = "SELECT id FROM users WHERE phone = $1 AND deleted_at IS NULL"
+			arg = input.Phone
+		} else {
+			query = "SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL"
+			arg = input.Email
+		}
+		err := h.db.QueryRow(query, arg).Scan(&existingUserID)
 		if err == sql.ErrNoRows {
-			// Don't reveal if email exists or not for security
+			// Don't reveal if identifier exists or not for security
 			response.Success(c, gin.H{
-				"message": "If an account exists with this email, you will receive an OTP code",
+				"message": "If an account exists, you will receive an OTP code",
 			})
 			return
 		}
 		if err != nil {
-			h.log.Error("Failed to check email", "error", err)
+			h.log.Error("Failed to check identifier", "error", err)
 			response.InternalServerError(c, "")
 			return
 		}
 	}
 
-	// Invalidate any existing OTPs for this email and purpose
+	// Invalidate any existing OTPs for this identifier and purpose
 	_, err := h.db.Exec(`
 		UPDATE email_verification_otps
 		SET verified_at = NOW()
 		WHERE email = $1 AND purpose = $2 AND verified_at IS NULL
-	`, input.Email, input.Purpose)
+	`, identifier, input.Purpose)
 	if err != nil {
 		h.log.Error("Failed to invalidate existing OTPs", "error", err)
 		// Continue anyway
@@ -1636,21 +1677,29 @@ func (h *Handler) SendOTP(c *gin.Context) {
 	otpCode := generateOTPCode()
 	expiresAt := time.Now().Add(10 * time.Minute) // 10 minutes validity
 
-	// Store OTP in database
+	// Store OTP in database (reuse email column as a generic identifier)
 	_, err = h.db.Exec(`
 		INSERT INTO email_verification_otps (email, otp_code, purpose, expires_at)
 		VALUES ($1, $2, $3, $4)
-	`, input.Email, otpCode, input.Purpose, expiresAt)
+	`, identifier, otpCode, input.Purpose, expiresAt)
 	if err != nil {
 		h.log.Error("Failed to store OTP", "error", err)
 		response.InternalServerError(c, "")
 		return
 	}
 
-	// Send OTP email with language support
-	if err := h.emailService.SendOTP(input.Email, otpCode, input.Purpose, input.Language); err != nil {
-		h.log.Error("Failed to send OTP email", "error", err, "email", input.Email)
-		// Don't fail the request - OTP is stored, user can request resend
+	// Send OTP via the appropriate channel
+	if usePhone {
+		smsMessage := fmt.Sprintf("GenixERP: Tasdiqlash kodi: %s. Kod 10 daqiqa amal qiladi.", otpCode)
+		if err := h.smsService.Send(input.Phone, smsMessage); err != nil {
+			h.log.Error("Failed to send SMS OTP", "error", err, "phone", input.Phone)
+			// Don't fail the request - OTP is stored, dev mode prints code
+		}
+	} else {
+		if err := h.emailService.SendOTP(input.Email, otpCode, input.Purpose, input.Language); err != nil {
+			h.log.Error("Failed to send OTP email", "error", err, "email", input.Email)
+			// Don't fail the request - OTP is stored, user can request resend
+		}
 	}
 
 	result := gin.H{
@@ -1675,6 +1724,15 @@ func (h *Handler) VerifyOTP(c *gin.Context) {
 		return
 	}
 
+	if input.Email == "" && input.Phone == "" {
+		response.BadRequest(c, "Email or phone is required")
+		return
+	}
+	identifier := input.Email
+	if input.Phone != "" {
+		identifier = normalizePhone(input.Phone)
+	}
+
 	// Find the OTP record
 	var otpID uuid.UUID
 	var storedCode string
@@ -1688,7 +1746,7 @@ func (h *Handler) VerifyOTP(c *gin.Context) {
 		WHERE email = $1 AND purpose = $2
 		ORDER BY created_at DESC
 		LIMIT 1
-	`, input.Email, input.Purpose).Scan(&otpID, &storedCode, &attempts, &maxAttempts, &expiresAt, &verifiedAt)
+	`, identifier, input.Purpose).Scan(&otpID, &storedCode, &attempts, &maxAttempts, &expiresAt, &verifiedAt)
 
 	if err == sql.ErrNoRows {
 		response.BadRequest(c, "No OTP found. Please request a new one.")
@@ -1749,7 +1807,19 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 		return
 	}
 
-	// Verify OTP first
+	if input.Email == "" && input.Phone == "" {
+		response.BadRequest(c, "Email or phone is required")
+		return
+	}
+	if input.Phone != "" {
+		input.Phone = normalizePhone(input.Phone)
+	}
+	identifier := input.Email
+	if input.Phone != "" && input.Email == "" {
+		identifier = input.Phone
+	}
+
+	// Verify OTP first (stored against the identifier actually used for sending)
 	var otpID uuid.UUID
 	var storedCode string
 	var expiresAt time.Time
@@ -1761,7 +1831,7 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 		WHERE email = $1 AND purpose = 'registration'
 		ORDER BY created_at DESC
 		LIMIT 1
-	`, input.Email).Scan(&otpID, &storedCode, &expiresAt, &verifiedAt)
+	`, identifier).Scan(&otpID, &storedCode, &expiresAt, &verifiedAt)
 
 	if err == sql.ErrNoRows {
 		response.BadRequest(c, "No OTP found. Please verify your email first.")
@@ -1794,17 +1864,31 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Check if email already exists globally (across all tenants)
+	// Check if email/phone already exists globally (across all tenants)
 	var existingUserID uuid.UUID
-	err = tx.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
-	if err == nil {
-		response.Conflict(c, "Email already registered. Please use a different email or login to your existing account.")
-		return
+	if input.Email != "" {
+		err = tx.QueryRow("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL", input.Email).Scan(&existingUserID)
+		if err == nil {
+			response.Conflict(c, "Email already registered. Please use a different email or login to your existing account.")
+			return
+		}
+		if err != sql.ErrNoRows {
+			h.log.Error("Failed to check email", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
 	}
-	if err != sql.ErrNoRows {
-		h.log.Error("Failed to check email", "error", err)
-		response.InternalServerError(c, "")
-		return
+	if input.Phone != "" {
+		err = tx.QueryRow("SELECT id FROM users WHERE phone = $1 AND deleted_at IS NULL", input.Phone).Scan(&existingUserID)
+		if err == nil {
+			response.Conflict(c, "Phone number already registered. Please login to your existing account.")
+			return
+		}
+		if err != sql.ErrNoRows {
+			h.log.Error("Failed to check phone", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
 	}
 
 	// Check if tenant code exists
@@ -1849,15 +1933,25 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 		return
 	}
 
-	// Create user - email is verified via OTP
+	// Create user - email/phone is verified via OTP
 	userID := uuid.New()
 	now := time.Now()
 	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
 
+	// Normalize empty strings to NULL to avoid unique-constraint collisions on ""
+	var emailArg interface{}
+	if input.Email != "" {
+		emailArg = input.Email
+	}
+	var phoneArg interface{}
+	if input.Phone != "" {
+		phoneArg = input.Phone
+	}
+
 	_, err = tx.Exec(`
-		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, role, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, true, false, 'owner', $8, $8)
-	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
+		INSERT INTO users (id, tenant_id, email, phone, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, role, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, true, false, 'owner', $9, $9)
+	`, userID, tenantID, emailArg, phoneArg, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
 		response.InternalServerError(c, "")
