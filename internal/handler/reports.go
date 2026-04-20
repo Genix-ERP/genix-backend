@@ -981,6 +981,67 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		}
 	}
 
+	// ── Step 3: Subtract approved sales returns (credit notes) ──
+	retQuery := `
+		SELECT sr.id, sr.return_number, COALESCE(sr.approved_at, sr.return_date), sr.total_amount,
+		       sr.customer_id, COALESCE(c.name, sr.customer_name, '') as contact_name
+		FROM sales_returns sr
+		LEFT JOIN contacts c ON sr.customer_id = c.id
+		WHERE sr.tenant_id = $1 AND sr.deleted_at IS NULL
+		  AND sr.status IN ('approved', 'completed')
+		  AND sr.customer_id IS NOT NULL
+		  AND COALESCE(sr.approved_at, sr.return_date) <= $2::date
+	`
+	retArgs := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		retQuery += " AND sr.organization_id = $3"
+		retArgs = append(retArgs, orgID)
+	}
+	retRows, retErr := h.db.Query(retQuery, retArgs...)
+	if retErr == nil {
+		defer retRows.Close()
+		for retRows.Next() {
+			var retID, contactID uuid.UUID
+			var retNumber, contactName string
+			var retDate time.Time
+			var amount float64
+			if err := retRows.Scan(&retID, &retNumber, &retDate, &amount, &contactID, &contactName); err != nil {
+				continue
+			}
+			if amount <= 0 {
+				continue
+			}
+			negativeAmount := -amount
+			contact, exists := contactMap[contactID]
+			if !exists {
+				if !contactHasInvoices[contactID] {
+					continue
+				}
+				contact = &entity.AgingContact{
+					ContactID:   contactID,
+					ContactName: contactName,
+					Invoices:    make([]entity.AgingInvoice, 0),
+				}
+				contactMap[contactID] = contact
+			}
+			contact.Current += negativeAmount
+			currentTotal += negativeAmount
+			retEntry := entity.AgingInvoice{
+				InvoiceID:     retID,
+				InvoiceNumber: "CN-" + retNumber,
+				InvoiceDate:   retDate.Format("2006-01-02"),
+				DueDate:       retDate.Format("2006-01-02"),
+				TotalAmount:   negativeAmount,
+				AmountDue:     negativeAmount,
+				DaysOverdue:   0,
+				AgingBucket:   "current",
+			}
+			contact.Invoices = append(contact.Invoices, retEntry)
+			contact.TotalAmount += negativeAmount
+			totalAmount += negativeAmount
+		}
+	}
+
 	// Remove contacts with zero or negative net balance (fully paid)
 	for id, contact := range contactMap {
 		if contact.TotalAmount <= 0 {
