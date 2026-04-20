@@ -43,7 +43,8 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 			   COALESCE((SELECT SUM(pe.net_salary) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.total_net) as total_net,
 			   COALESCE((SELECT COUNT(*) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.employee_count) as employee_count,
 			   pp.notes, pp.created_at,
-			   (SELECT pe.employee_name FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_name
+			   (SELECT pe.employee_name FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_name,
+			   (SELECT pe.employee_id FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_id
 		FROM payroll_periods pp
 		WHERE pp.tenant_id = $1 AND pp.deleted_at IS NULL
 	`
@@ -87,13 +88,14 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 	periods := make([]*entity.PayrollPeriodResponse, 0)
 	for rows.Next() {
 		var period entity.PayrollPeriod
-		var notes, firstEmployeeName sql.NullString
+		var notes, firstEmployeeName, firstEmployeeID sql.NullString
 
 		if err := rows.Scan(
 			&period.ID, &period.TenantID, &period.PeriodCode, &period.PeriodName,
 			&period.StartDate, &period.EndDate, &period.PayDate, &period.Status,
 			&period.TotalGross, &period.TotalDeductions, &period.TotalNet,
 			&period.EmployeeCount, &notes, &period.CreatedAt, &firstEmployeeName,
+			&firstEmployeeID,
 		); err != nil {
 			h.log.Error("Failed to scan payroll period", "error", err)
 			continue
@@ -104,9 +106,17 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 		}
 
 		resp := period.ToResponse()
-		// If there's only one employee, include their name
-		if firstEmployeeName.Valid && period.EmployeeCount == 1 {
-			resp.EmployeeName = firstEmployeeName.String
+		// If there's only one employee, include their name and ID
+		if period.EmployeeCount == 1 {
+			if firstEmployeeName.Valid {
+				resp.EmployeeName = firstEmployeeName.String
+			}
+			if firstEmployeeID.Valid {
+				empUUID, err := uuid.Parse(firstEmployeeID.String)
+				if err == nil {
+					resp.EmployeeID = &empUUID
+				}
+			}
 		}
 		periods = append(periods, resp)
 	}
@@ -1131,12 +1141,13 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 			}
 
 			if salaryAcct != uuid.Nil && deductAcct != uuid.Nil {
-				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-					VALUES ($1, $2, $3, 'Ish haqi xarajat', $4, 0, 1, $5)`,
-					uuid.New(), jeID, salaryAcct, totalDeducted, now)
-				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-					VALUES ($1, $2, $3, 'Kamomad ushlab qolish', 0, $4, 2, $5)`,
-					uuid.New(), jeID, deductAcct, totalDeducted, now)
+				// TT §4.5 — 6710 and 4730 both require xodim (employee) subkonto
+				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, employee_id, description, debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, line_number, created_at)
+					VALUES ($1, $2, $3, $4, 'Ish haqi xarajat', $5, 0, 1.0, $5, '{}'::jsonb, 1, $6)`,
+					uuid.New(), jeID, salaryAcct, employeeID, totalDeducted, now)
+				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, employee_id, description, debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, line_number, created_at)
+					VALUES ($1, $2, $3, $4, 'Kamomad ushlab qolish', 0, $5, 1.0, $5, '{}'::jsonb, 2, $6)`,
+					uuid.New(), jeID, deductAcct, employeeID, totalDeducted, now)
 
 				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalDeducted, now, salaryAcct)
 				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalDeducted, now, deductAcct)

@@ -47,7 +47,8 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 		SELECT e.id, e.tenant_id, e.employee_number, e.first_name, e.last_name, e.middle_name,
 			   e.email, e.phone, e.mobile, e.job_title, e.hire_date, e.status, e.base_salary, e.permission,
 			   e.notes, e.created_at, e.updated_at, e.department_id, COALESCE(d.name, '') as department_name,
-			   e.job_position_id, COALESCE(jp.name, '') as job_position_name
+			   e.job_position_id, COALESCE(jp.name, '') as job_position_name,
+			   e.user_id
 		FROM employees e
 		LEFT JOIN departments d ON e.department_id = d.id
 		LEFT JOIN job_positions jp ON e.job_position_id = jp.id
@@ -136,6 +137,7 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 		var departmentName string
 		var jobPositionID sql.NullString
 		var jobPositionName string
+		var userID sql.NullString
 
 		err := rows.Scan(
 			&emp.ID, &emp.TenantID, &emp.EmployeeNumber, &emp.FirstName, &emp.LastName,
@@ -143,6 +145,7 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 			&baseSalary, &permission, &notes, &emp.CreatedAt, &emp.UpdatedAt,
 			&departmentID, &departmentName,
 			&jobPositionID, &jobPositionName,
+			&userID,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan employee", "error", err)
@@ -168,10 +171,13 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 			emp.Permission = &permission.String
 		}
 
-		// Set job_position_id from JOIN result
+		// Set job_position_id and name from JOIN result
 		if jobPositionID.Valid {
 			jpUUID, _ := uuid.Parse(jobPositionID.String)
 			emp.JobPositionID = &jpUUID
+		}
+		if jobPositionName != "" {
+			emp.JobPositionName = jobPositionName
 		}
 
 		// Set department from JOIN result, fall back to notes parsing for legacy data
@@ -189,6 +195,10 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 			emp.Notes = &notes.String
 			emp.PerformanceScore = parsePerformanceFromNotes(notes.String)
 			emp.TurnoverRisk = parseTurnoverRiskFromNotes(notes.String)
+		}
+		if userID.Valid {
+			uid, _ := uuid.Parse(userID.String)
+			emp.UserID = &uid
 		}
 
 		employees = append(employees, emp.ToResponse())
@@ -459,21 +469,29 @@ func (h *Handler) GetEmployee(c *gin.Context) {
 	}
 
 	query := `
-		SELECT id, tenant_id, employee_number, first_name, last_name, middle_name,
-			   email, phone, mobile, job_title, hire_date, status, base_salary, permission,
-			   notes, created_at, updated_at
-		FROM employees
-		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		SELECT e.id, e.tenant_id, e.employee_number, e.first_name, e.last_name, e.middle_name,
+			   e.email, e.phone, e.mobile, e.job_title, e.hire_date, e.status, e.base_salary, e.permission,
+			   e.notes, e.created_at, e.updated_at,
+			   e.department_id, COALESCE(d.name, '') as department_name,
+			   e.job_position_id, COALESCE(jp.name, '') as job_position_name
+		FROM employees e
+		LEFT JOIN departments d ON e.department_id = d.id
+		LEFT JOIN job_positions jp ON e.job_position_id = jp.id
+		WHERE e.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
 	`
 
 	var emp entity.Employee
 	var middleName, email, phone, mobile, jobTitle, permission, notes sql.NullString
 	var baseSalary sql.NullFloat64
+	var departmentID, jobPositionID sql.NullString
+	var departmentName, jobPositionName string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&emp.ID, &emp.TenantID, &emp.EmployeeNumber, &emp.FirstName, &emp.LastName,
 		&middleName, &email, &phone, &mobile, &jobTitle, &emp.HireDate, &emp.Status,
 		&baseSalary, &permission, &notes, &emp.CreatedAt, &emp.UpdatedAt,
+		&departmentID, &departmentName,
+		&jobPositionID, &jobPositionName,
 	)
 
 	if err == sql.ErrNoRows {
@@ -504,9 +522,25 @@ func (h *Handler) GetEmployee(c *gin.Context) {
 	if permission.Valid {
 		emp.Permission = &permission.String
 	}
+	if departmentID.Valid {
+		deptUUID, _ := uuid.Parse(departmentID.String)
+		emp.DepartmentID = &deptUUID
+	}
+	if departmentName != "" {
+		emp.Department = departmentName
+	}
+	if jobPositionID.Valid {
+		jpUUID, _ := uuid.Parse(jobPositionID.String)
+		emp.JobPositionID = &jpUUID
+	}
+	if jobPositionName != "" {
+		emp.JobPositionName = jobPositionName
+	}
 	if notes.Valid {
 		emp.Notes = &notes.String
-		emp.Department = parseDepartmentFromNotes(notes.String)
+		if emp.Department == "" {
+			emp.Department = parseDepartmentFromNotes(notes.String)
+		}
 		emp.PerformanceScore = parsePerformanceFromNotes(notes.String)
 		emp.TurnoverRisk = parseTurnoverRiskFromNotes(notes.String)
 	}
@@ -534,6 +568,13 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 		h.log.Error("Invalid input", "error", err)
 		response.BadRequest(c, "Invalid input")
 		return
+	}
+
+	// Debug: log job_position_id
+	if input.JobPositionID != nil {
+		h.log.Info("UpdateEmployee: job_position_id received", "value", *input.JobPositionID)
+	} else {
+		h.log.Info("UpdateEmployee: job_position_id is nil")
 	}
 
 	// Build dynamic update query
@@ -595,6 +636,9 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 	if input.JobPositionID != nil && *input.JobPositionID != "" {
 		if jpUUID, parseErr := uuid.Parse(*input.JobPositionID); parseErr == nil {
 			addUpdate("job_position_id", jpUUID)
+			h.log.Info("UpdateEmployee: adding job_position_id to update", "uuid", jpUUID.String())
+		} else {
+			h.log.Error("UpdateEmployee: failed to parse job_position_id", "value", *input.JobPositionID, "error", parseErr)
 		}
 	}
 

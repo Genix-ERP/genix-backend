@@ -3,6 +3,7 @@ package handler
 import (
 	"fmt"
 	"math"
+	"strconv"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -1434,4 +1435,204 @@ func (h *Handler) GetInventoryReport(c *gin.Context) {
 		"total_value":     math.Round(totalValue*100) / 100,
 		"low_stock_count": lowStockCount,
 	})
+}
+
+// GetAccountCard returns hisob kartochkasi (account card) - detailed transaction
+// history for a single account with counterpart accounts and running balance
+func (h *Handler) GetAccountCard(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	accountID := c.Query("account_id")
+	if accountID == "" {
+		response.BadRequest(c, "account_id is required")
+		return
+	}
+
+	periodFrom := c.Query("period_from")
+	periodTo := c.Query("period_to")
+	counterpartCode := c.Query("counterpart_code")
+	contactName := c.Query("contact_name")
+	// TT §6.3: filters — summa (amount range), hujjat turi (doc type)
+	docType := c.Query("doc_type")
+	amountMinStr := c.Query("amount_min")
+	amountMaxStr := c.Query("amount_max")
+
+	now := time.Now()
+	if periodFrom == "" {
+		periodFrom = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	}
+	if periodTo == "" {
+		periodTo = now.Format("2006-01-02")
+	}
+
+	// Get account info
+	var accID uuid.UUID
+	var accCode, accName, normalBalance string
+	var openingBalance float64
+
+	accQuery := `
+		SELECT a.id, a.code, a.name, a.opening_balance, at.normal_balance
+		FROM accounts a
+		JOIN account_types at ON a.account_type_id = at.id
+		WHERE a.id = $1 AND a.tenant_id = $2 AND a.deleted_at IS NULL
+	`
+	err := h.db.QueryRow(accQuery, accountID, tenantID).Scan(&accID, &accCode, &accName, &openingBalance, &normalBalance)
+	if err != nil {
+		h.log.Error("Account not found", "error", err)
+		response.NotFound(c, "Account not found")
+		return
+	}
+
+	// Calculate opening balance: account's opening_balance + all posted transactions BEFORE periodFrom
+	priorQuery := `
+		SELECT COALESCE(SUM(jel.debit_amount), 0), COALESCE(SUM(jel.credit_amount), 0)
+		FROM journal_entry_lines jel
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+		WHERE jel.account_id = $1 AND je.tenant_id = $2
+			AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.entry_date < $3
+	`
+	var priorDebit, priorCredit float64
+	err = h.db.QueryRow(priorQuery, accID, tenantID, periodFrom).Scan(&priorDebit, &priorCredit)
+	if err != nil {
+		priorDebit = 0
+		priorCredit = 0
+	}
+
+	calcOpeningBalance := openingBalance
+	if normalBalance == "debit" {
+		calcOpeningBalance += priorDebit - priorCredit
+	} else {
+		calcOpeningBalance += priorCredit - priorDebit
+	}
+	calcOpeningBalance = math.Round(calcOpeningBalance*100) / 100
+
+	// Get transactions with counterpart accounts
+	txQuery := `
+		SELECT je.id, je.entry_date, je.entry_number, COALESCE(je.doc_type, ''),
+			   COALESCE(je.description, ''), COALESCE(je.reference, ''),
+			   jel.debit_amount, jel.credit_amount,
+			   COALESCE(cp_acc.code, '') as counterpart_code,
+			   COALESCE(cp_acc.name, '') as counterpart_name,
+			   COALESCE(c.company_name, c.contact_name, '') as contact_name
+		FROM journal_entry_lines jel
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+		LEFT JOIN LATERAL (
+			SELECT a2.code, a2.name
+			FROM journal_entry_lines jel2
+			JOIN accounts a2 ON jel2.account_id = a2.id
+			WHERE jel2.journal_entry_id = jel.journal_entry_id
+				AND jel2.account_id != jel.account_id
+			LIMIT 1
+		) cp_acc ON true
+		LEFT JOIN contacts c ON je.contact_id = c.id
+		WHERE jel.account_id = $1 AND je.tenant_id = $2
+			AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.entry_date >= $3 AND je.entry_date <= $4
+	`
+	args := []interface{}{accID, tenantID, periodFrom, periodTo}
+	argCount := 4
+
+	if counterpartCode != "" {
+		argCount++
+		txQuery += fmt.Sprintf(" AND cp_acc.code = $%d", argCount)
+		args = append(args, counterpartCode)
+	}
+	if contactName != "" {
+		argCount++
+		txQuery += fmt.Sprintf(" AND (c.company_name ILIKE $%d OR c.contact_name ILIKE $%d)", argCount, argCount)
+		args = append(args, "%"+contactName+"%")
+	}
+	// TT §6.3: doc type and amount range filters
+	if docType != "" {
+		argCount++
+		txQuery += fmt.Sprintf(" AND (je.doc_type = $%d OR je.source_type = $%d)", argCount, argCount)
+		args = append(args, docType)
+	}
+	if amountMinStr != "" {
+		if v, err := strconv.ParseFloat(amountMinStr, 64); err == nil {
+			argCount++
+			txQuery += fmt.Sprintf(" AND (jel.debit_amount + jel.credit_amount) >= $%d", argCount)
+			args = append(args, v)
+		}
+	}
+	if amountMaxStr != "" {
+		if v, err := strconv.ParseFloat(amountMaxStr, 64); err == nil {
+			argCount++
+			txQuery += fmt.Sprintf(" AND (jel.debit_amount + jel.credit_amount) <= $%d", argCount)
+			args = append(args, v)
+		}
+	}
+
+	txQuery += " ORDER BY je.entry_date ASC, je.entry_number ASC"
+
+	rows, err := h.db.Query(txQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to get account card transactions", "error", err)
+		response.InternalError(c, "Failed to generate account card")
+		return
+	}
+	defer rows.Close()
+
+	transactions := make([]entity.AccountCardTransaction, 0)
+	runningBalance := calcOpeningBalance
+	var totalDebit, totalCredit float64
+
+	for rows.Next() {
+		var tx entity.AccountCardTransaction
+		var entryDate time.Time
+		var entryID uuid.UUID
+
+		err := rows.Scan(
+			&entryID, &entryDate, &tx.EntryNumber, &tx.DocType,
+			&tx.Description, &tx.Reference,
+			&tx.DebitAmount, &tx.CreditAmount,
+			&tx.CounterpartCode, &tx.CounterpartName,
+			&tx.ContactName,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan account card row", "error", err)
+			continue
+		}
+
+		tx.Date = entryDate.Format("2006-01-02")
+		tx.EntryID = entryID.String()
+
+		// Calculate running balance
+		if normalBalance == "debit" {
+			runningBalance += tx.DebitAmount - tx.CreditAmount
+		} else {
+			runningBalance += tx.CreditAmount - tx.DebitAmount
+		}
+		tx.RunningBalance = math.Round(runningBalance*100) / 100
+
+		totalDebit += tx.DebitAmount
+		totalCredit += tx.CreditAmount
+		transactions = append(transactions, tx)
+	}
+
+	accountType := "active"
+	if normalBalance == "credit" {
+		accountType = "passive"
+	}
+
+	report := entity.AccountCardReport{
+		AccountID:      accID,
+		AccountCode:    accCode,
+		AccountName:    accName,
+		AccountType:    accountType,
+		PeriodFrom:     periodFrom,
+		PeriodTo:       periodTo,
+		OpeningBalance: calcOpeningBalance,
+		TotalDebit:     math.Round(totalDebit*100) / 100,
+		TotalCredit:    math.Round(totalCredit*100) / 100,
+		ClosingBalance: math.Round(runningBalance*100) / 100,
+		Transactions:   transactions,
+	}
+
+	response.Success(c, report)
 }

@@ -1108,6 +1108,43 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		periods.POST("/:id/unlock", h.UnlockAccountingPeriod)
 	}
 
+	// Period Close Procedure (TT Buxgalteriya §4.3)
+	periodClose := rg.Group("/period-close")
+	{
+		periodClose.POST("/run", h.ClosePeriod)
+		periodClose.GET("", h.ListClosings)
+		periodClose.GET("/:id", h.GetClosing)
+		periodClose.POST("/:id/reopen", h.ReopenPeriod)
+	}
+
+	// Bank Statement Import (TT Buxgalteriya §8.1 Bank-mijoz) — 1C format
+	bankImport := rg.Group("/bank-statement-imports")
+	{
+		bankImport.POST("", h.ImportBankStatement1C)
+		bankImport.GET("", h.ListBankImports)
+	}
+
+	// E-invoice (TT Buxgalteriya §8.2)
+	einvoices := rg.Group("/einvoices")
+	{
+		einvoices.POST("/ingest", h.IngestEInvoice)
+		einvoices.GET("", h.ListEInvoices)
+		einvoices.POST("/:id/approve", h.ApproveEInvoice)
+		einvoices.POST("/:id/reject", h.RejectEInvoice)
+		// Provider adapter calls
+		einvoices.POST("/sync", h.SyncEInvoices)
+		einvoices.POST("/:id/send", h.SendEInvoice)
+	}
+
+	// Webhook subscriptions (TT Buxgalteriya §7.4)
+	hooks := rg.Group("/webhook-subscriptions")
+	{
+		hooks.POST("", h.CreateWebhookSubscription)
+		hooks.GET("", h.ListWebhookSubscriptions)
+		hooks.DELETE("/:id", h.DeleteWebhookSubscription)
+		hooks.GET("/:id/deliveries", h.ListWebhookDeliveries)
+	}
+
 	// Budgets
 	budgets := rg.Group("/budgets")
 	{
@@ -1353,10 +1390,21 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reports.GET("/income-statement", h.GetIncomeStatement)
 		reports.GET("/cash-flow", h.GetCashFlow)
 		reports.GET("/trial-balance", h.GetTrialBalance)
+		// ASQ per TT Buxgalteriya §6.1 — opening/turnover/closing + Excel export
+		reports.GET("/trial-balance/turnover", h.GetTrialBalanceWithTurnover)
+		reports.GET("/trial-balance/excel", h.ExportTrialBalanceExcel)
 		reports.GET("/general-ledger", h.GetGeneralLedger)
+		// Bosh kitob — monthly breakdown per TT Buxgalteriya §6.2
+		reports.GET("/general-ledger/monthly", h.GetGeneralLedgerMonthly)
 		reports.GET("/aging-receivables", h.GetAgingReceivables)
 		reports.GET("/aging-payables", h.GetAgingPayables)
 		reports.GET("/inventory-summary", h.GetInventoryReport)
+		reports.GET("/account-card", h.GetAccountCard)
+		// BHMS №21 regulated reports (TT §6.4)
+		reports.GET("/forma-1", h.GetForma1)
+		reports.GET("/forma-2", h.GetForma2)
+		reports.GET("/forma-3", h.GetForma3)
+		reports.GET("/formas/excel", h.ExportFormasExcel)
 	}
 
 	// Settings
