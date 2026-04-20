@@ -173,6 +173,10 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.internal_type,
+			   COALESCE(a.is_leaf, true) as is_leaf,
+			   COALESCE(a.account_nature, 'ACTIVE') as account_nature,
+			   COALESCE(a.analytics_types, '[]') as analytics_types,
+			   COALESCE(a.mandatory_analytics, false) as mandatory_analytics,
 			   a.current_balance, a.opening_balance, a.is_active,
 			   a.created_at, a.updated_at,
 			   at.code as type_code, at.name as type_name, at.category, at.normal_balance
@@ -253,6 +257,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	for rows.Next() {
 		var acc entity.Account
 		var orgID, parentID, currencyID, description, nameUz, nameEn, nameRu, internalType sql.NullString
+		var analyticsTypes sql.NullString
 		var typeCode, typeName, typeCategory, normalBalance string
 
 		err := rows.Scan(
@@ -260,6 +265,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			&acc.Code, &acc.Name, &nameUz, &nameEn, &nameRu, &description, &currencyID, &acc.IsBankAccount,
 			&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 			&internalType,
+			&acc.IsLeaf, &acc.AccountNature, &analyticsTypes, &acc.MandatoryAnalytics,
 			&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 			&acc.CreatedAt, &acc.UpdatedAt,
 			&typeCode, &typeName, &typeCategory, &normalBalance,
@@ -287,6 +293,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		}
 		if internalType.Valid {
 			acc.InternalType = &internalType.String
+		}
+		if analyticsTypes.Valid {
+			acc.AnalyticsTypes = &analyticsTypes.String
 		}
 
 		acc.AccountType = &entity.AccountType{
@@ -550,6 +559,10 @@ func (h *Handler) GetAccount(c *gin.Context) {
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.internal_type,
+			   COALESCE(a.is_leaf, true) as is_leaf,
+			   COALESCE(a.account_nature, 'ACTIVE') as account_nature,
+			   COALESCE(a.analytics_types, '[]') as analytics_types,
+			   COALESCE(a.mandatory_analytics, false) as mandatory_analytics,
 			   a.current_balance, a.opening_balance, a.is_active,
 			   a.created_at, a.updated_at,
 			   at.code as type_code, at.name as type_name, at.category, at.normal_balance
@@ -560,6 +573,7 @@ func (h *Handler) GetAccount(c *gin.Context) {
 
 	var acc entity.Account
 	var orgID, parentID, currencyID, description, nameUz, nameEn, nameRu, internalType sql.NullString
+	var analyticsTypes sql.NullString
 	var typeCode, typeName, typeCategory, normalBalance string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
@@ -567,6 +581,7 @@ func (h *Handler) GetAccount(c *gin.Context) {
 		&acc.Code, &acc.Name, &nameUz, &nameEn, &nameRu, &description, &currencyID, &acc.IsBankAccount,
 		&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 		&internalType,
+		&acc.IsLeaf, &acc.AccountNature, &analyticsTypes, &acc.MandatoryAnalytics,
 		&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 		&acc.CreatedAt, &acc.UpdatedAt,
 		&typeCode, &typeName, &typeCategory, &normalBalance,
@@ -600,6 +615,9 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	}
 	if internalType.Valid {
 		acc.InternalType = &internalType.String
+	}
+	if analyticsTypes.Valid {
+		acc.AnalyticsTypes = &analyticsTypes.String
 	}
 
 	acc.AccountType = &entity.AccountType{
@@ -2028,6 +2046,13 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// TT Buxgalteriya §4.2 + §4.5: validate all accounts are is_leaf and have required analytics.
+	// The DB trigger enforces this too, but app-layer errors give callers clearer messages.
+	if errMsg := h.validateJournalLines(tenantID, input.Lines); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	// Resolve organization ID early (needed for entry number generation)
 	var orgID *uuid.UUID
 	if input.OrganizationID != "" {
@@ -2128,22 +2153,63 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 			lineDesc = &line.Description
 		}
 
-		var contactID *uuid.UUID
-		if line.ContactID != nil && *line.ContactID != "" {
-			cid, _ := uuid.Parse(*line.ContactID)
-			contactID = &cid
+		contactID := parseOptionalUUID(line.ContactID)
+		warehouseID := parseOptionalUUID(line.WarehouseID)
+		employeeID := parseOptionalUUID(line.EmployeeID)
+		contractID := parseOptionalUUID(line.ContractID)
+		currencyID := parseOptionalUUID(line.CurrencyID)
+
+		// TT 4.6: compute UZS equivalent. Line-level exchange_rate overrides entry-level.
+		lineRate := exchangeRate
+		if line.ExchangeRate != nil && *line.ExchangeRate > 0 {
+			lineRate = *line.ExchangeRate
 		}
+		lineGross := line.DebitAmount + line.CreditAmount
+		amountBase := lineGross * lineRate
 
 		_, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (
-				id, journal_entry_id, line_number, account_id, contact_id, description,
-				debit_amount, credit_amount, exchange_rate, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		`, lineID, id, i+1, accountID, contactID, lineDesc,
-			line.DebitAmount, line.CreditAmount, exchangeRate, now)
+				id, journal_entry_id, line_number, account_id, contact_id,
+				warehouse_id, employee_id, contract_id, analytics_json,
+				currency_id, currency_amount,
+				description, debit_amount, credit_amount,
+				exchange_rate, amount_base, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::jsonb, '{}'::jsonb),
+				$10, $11, $12, $13, $14, $15, $16, $17)
+		`, lineID, id, i+1, accountID, contactID,
+			warehouseID, employeeID, contractID, line.AnalyticsJSON,
+			currencyID, line.CurrencyAmount,
+			lineDesc, line.DebitAmount, line.CreditAmount,
+			lineRate, amountBase, now)
 
 		if err != nil {
 			h.log.Error("Failed to create journal entry line", "error", err)
+			// Surface trigger errors to the client so the buxgalter sees which rule fired
+			if strings.HasPrefix(err.Error(), "pq: TT ") {
+				response.BadRequest(c, strings.TrimPrefix(err.Error(), "pq: "))
+				return
+			}
+			response.InternalError(c, "Failed to create journal entry")
+			return
+		}
+	}
+
+	// TT §4.6 — if base-currency totals don't tie because of mixed exchange
+	// rates across lines, auto-append an FX gain (9540) or loss (9630) line.
+	fxRes, err := h.appendFXBalancingLine(tx, tenantID, orgID, id, len(input.Lines)+1, now)
+	if err != nil {
+		h.log.Error("Failed to append FX balancing line", "error", err)
+		response.InternalError(c, "Failed to create journal entry")
+		return
+	}
+	if fxRes.AppendedLine {
+		totalDebit += fxRes.DebitAdded
+		totalCredit += fxRes.CreditAdded
+		if _, uerr := tx.Exec(
+			`UPDATE journal_entries SET total_debit = $1, total_credit = $2, updated_at = $3 WHERE id = $4`,
+			totalDebit, totalCredit, now, id,
+		); uerr != nil {
+			h.log.Error("Failed to update totals after FX adjust", "error", uerr)
 			response.InternalError(c, "Failed to create journal entry")
 			return
 		}
@@ -2513,6 +2579,15 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	h.logJournalEntryAction(tenantID, userID, id, "post", "draft", "posted", map[string]interface{}{
 		"total_debit":  totalDebit,
 		"total_credit": totalCredit,
+	})
+
+	// TT §7.4 — dispatch webhook event
+	go h.DispatchWebhookEvent(tenantID, "journal_entry.posted", gin.H{
+		"journal_entry_id": id,
+		"total_debit":      totalDebit,
+		"total_credit":     totalCredit,
+		"posted_at":        now,
+		"posted_by":        userID,
 	})
 
 	response.Success(c, gin.H{"message": "Journal entry posted successfully", "posted_at": now})

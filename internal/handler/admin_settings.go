@@ -23,6 +23,7 @@ type AdminSettingsResponse struct {
 	HR            map[string]interface{} `json:"hr"`
 	Finance       map[string]interface{} `json:"finance"`
 	Projects      map[string]interface{} `json:"projects"`
+	Construction  map[string]interface{} `json:"construction"`
 	UpdatedAt     *time.Time             `json:"updated_at,omitempty"`
 	UpdatedBy     *uuid.UUID             `json:"updated_by,omitempty"`
 }
@@ -153,6 +154,12 @@ func getDefaultAdminSettings() AdminSettingsResponse {
 			},
 			"timesheet": map[string]interface{}{
 				"approval_required": true,
+			},
+		},
+		Construction: map[string]interface{}{
+			"material_approval": map[string]interface{}{
+				"approver_user_id": "",
+				"require_approval": true,
 			},
 		},
 	}
