@@ -37,6 +37,7 @@ type Account struct {
 	Name             string       `json:"name" db:"name"`
 	NameUz           *string      `json:"name_uz,omitempty" db:"name_uz"`
 	NameEn           *string      `json:"name_en,omitempty" db:"name_en"`
+	NameRu           *string      `json:"name_ru,omitempty" db:"name_ru"`
 	Description      *string      `json:"description,omitempty" db:"description"`
 	CurrencyID       *uuid.UUID   `json:"currency_id,omitempty" db:"currency_id"`
 	IsBankAccount    bool         `json:"is_bank_account" db:"is_bank_account"`
@@ -67,6 +68,7 @@ type AccountResponse struct {
 	Name             string           `json:"name"`
 	NameUz           *string          `json:"name_uz,omitempty"`
 	NameEn           *string          `json:"name_en,omitempty"`
+	NameRu           *string          `json:"name_ru,omitempty"`
 	Description      *string          `json:"description,omitempty"`
 	Category         string           `json:"category,omitempty"`
 	NormalBalance    string           `json:"normal_balance,omitempty"`
@@ -94,6 +96,7 @@ func (a *Account) ToResponse() *AccountResponse {
 		Name:             a.Name,
 		NameUz:           a.NameUz,
 		NameEn:           a.NameEn,
+		NameRu:           a.NameRu,
 		Description:      a.Description,
 		IsBankAccount:    a.IsBankAccount,
 		IsControlAccount: a.IsControlAccount,
@@ -765,6 +768,7 @@ type TrialBalanceAccount struct {
 	AccountName   string                 `json:"account_name"`
 	AccountNameUz string                 `json:"account_name_uz,omitempty"`
 	AccountNameEn string                 `json:"account_name_en,omitempty"`
+	AccountNameRu string                 `json:"account_name_ru,omitempty"`
 	Category      string                 `json:"category"`
 	DebitBalance  float64                `json:"debit_balance"`
 	CreditBalance float64                `json:"credit_balance"`
@@ -798,6 +802,7 @@ type BalanceSheetAccount struct {
 	AccountName   string    `json:"account_name"`
 	AccountNameUz string    `json:"account_name_uz,omitempty"`
 	AccountNameEn string    `json:"account_name_en,omitempty"`
+	AccountNameRu string    `json:"account_name_ru,omitempty"`
 	Balance       float64   `json:"balance"`
 }
 
@@ -826,6 +831,7 @@ type IncomeStatementSection struct {
 	AccountName   string    `json:"account_name"`
 	AccountNameUz string    `json:"account_name_uz,omitempty"`
 	AccountNameEn string    `json:"account_name_en,omitempty"`
+	AccountNameRu string    `json:"account_name_ru,omitempty"`
 	Amount        float64   `json:"amount"`
 }
 

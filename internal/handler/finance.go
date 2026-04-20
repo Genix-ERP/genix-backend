@@ -169,7 +169,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	// Build query
 	baseQuery := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
-			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
+			   a.code, a.name, a.name_uz, a.name_en, COALESCE(a.name_ru, '') as name_ru, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.internal_type,
@@ -252,12 +252,12 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	accounts := make([]*entity.AccountResponse, 0)
 	for rows.Next() {
 		var acc entity.Account
-		var orgID, parentID, currencyID, description, nameUz, nameEn, internalType sql.NullString
+		var orgID, parentID, currencyID, description, nameUz, nameEn, nameRu, internalType sql.NullString
 		var typeCode, typeName, typeCategory, normalBalance string
 
 		err := rows.Scan(
 			&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
-			&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
+			&acc.Code, &acc.Name, &nameUz, &nameEn, &nameRu, &description, &currencyID, &acc.IsBankAccount,
 			&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 			&internalType,
 			&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
@@ -281,6 +281,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		}
 		if nameEn.Valid {
 			acc.NameEn = &nameEn.String
+		}
+		if nameRu.Valid {
+			acc.NameRu = &nameRu.String
 		}
 		if internalType.Valid {
 			acc.InternalType = &internalType.String
@@ -543,7 +546,7 @@ func (h *Handler) GetAccount(c *gin.Context) {
 
 	query := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
-			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
+			   a.code, a.name, a.name_uz, a.name_en, COALESCE(a.name_ru, '') as name_ru, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.internal_type,
@@ -556,12 +559,12 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	`
 
 	var acc entity.Account
-	var orgID, parentID, currencyID, description, nameUz, nameEn, internalType sql.NullString
+	var orgID, parentID, currencyID, description, nameUz, nameEn, nameRu, internalType sql.NullString
 	var typeCode, typeName, typeCategory, normalBalance string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
-		&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
+		&acc.Code, &acc.Name, &nameUz, &nameEn, &nameRu, &description, &currencyID, &acc.IsBankAccount,
 		&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 		&internalType,
 		&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
@@ -591,6 +594,9 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	}
 	if nameEn.Valid {
 		acc.NameEn = &nameEn.String
+	}
+	if nameRu.Valid {
+		acc.NameRu = &nameRu.String
 	}
 	if internalType.Valid {
 		acc.InternalType = &internalType.String
