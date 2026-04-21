@@ -529,14 +529,25 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		unitCost = productCostPrice
 	}
 
-	// Verify warehouse belongs to tenant
-	var warehouseExists bool
-	h.db.QueryRow(
-		"SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)",
+	// Verify warehouse belongs to tenant and get its organization_id
+	var warehouseOrgID uuid.UUID
+	err = h.db.QueryRow(
+		"SELECT COALESCE(organization_id, '00000000-0000-0000-0000-000000000000') FROM warehouses WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
 		warehouseID, tenantID,
-	).Scan(&warehouseExists)
-	if !warehouseExists {
+	).Scan(&warehouseOrgID)
+	if err != nil {
 		response.NotFound(c, "Warehouse")
+		return
+	}
+
+	// If organizationID from middleware is nil, derive it from the warehouse
+	if organizationID == uuid.Nil && warehouseOrgID != uuid.Nil {
+		organizationID = warehouseOrgID
+	}
+
+	// Validate warehouse belongs to the same organization if both are set
+	if organizationID != uuid.Nil && warehouseOrgID != uuid.Nil && organizationID != warehouseOrgID {
+		response.BadRequest(c, "Warehouse does not belong to the selected organization")
 		return
 	}
 
@@ -658,7 +669,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "inventory adjustment", "6910")
 		}
 		if adjustAcct == uuid.Nil {
-			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "miscellaneous expense", "6900")
+			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "miscellaneous expense", "9410")
 		}
 
 		if ca.StockValuationAccountID != uuid.Nil && adjustAcct != uuid.Nil {
@@ -691,7 +702,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 					debitAcct = ca.StockValuationAccountID
 					creditAcct = ca.StockInputAccountID
 					if creditAcct == uuid.Nil {
-						creditAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+						creditAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
 					}
 					debitDesc = "Stock Valuation (adjustment in)"
 					creditDesc = "Stock Input (adjustment in)"
@@ -755,6 +766,17 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 				"reorder_point": reorderPoint,
 				"available":     newBalance,
 			})
+			// In-app low stock notification
+			balanceStr := fmt.Sprintf("%.0f", newBalance)
+			h.createTranslatedNotification(tenantID, userID, "low_stock",
+				map[string]interface{}{
+					"product_id":   input.ProductID,
+					"product_name": productName,
+					"product_code": productCode,
+					"available":    newBalance,
+				},
+				productName, balanceStr,
+			)
 		}
 
 		h.EvaluateWorkflowRules(tenantID, "inventory.adjusted", map[string]interface{}{
@@ -1720,6 +1742,17 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			s := expiryDate.Time.Format("2006-01-02")
 			b.ExpiryDate = &s
 		}
+		// Load warehouse_id separately (column may not exist yet if migration 314 hasn't run)
+		var whID sql.NullString
+		var whName sql.NullString
+		h.db.QueryRow(`SELECT b2.warehouse_id, w.name FROM product_boms b2 LEFT JOIN warehouses w ON w.id = b2.warehouse_id WHERE b2.id = $1`, b.ID).Scan(&whID, &whName)
+		if whID.Valid {
+			wid, _ := uuid.Parse(whID.String)
+			b.WarehouseID = &wid
+		}
+		if whName.Valid {
+			b.WarehouseName = &whName.String
+		}
 
 		boms = append(boms, &b)
 	}
@@ -1938,19 +1971,48 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		tx.Exec("UPDATE product_boms SET is_default = false WHERE product_id = $1 AND tenant_id = $2", productID, tenantID)
 	}
 
+	var warehouseID *uuid.UUID
+	if input.WarehouseID != "" {
+		wid, _ := uuid.Parse(input.WarehouseID)
+		if wid != uuid.Nil {
+			warehouseID = &wid
+		}
+	}
+
+	// Try INSERT with warehouse_id first; fall back without if column doesn't exist yet
 	_, err = tx.Exec(`
 		INSERT INTO product_boms (
 			id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
-			is_active, is_default, effective_date, expiry_date, notes,
+			is_active, is_default, effective_date, expiry_date, notes, warehouse_id,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $14)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $15, $15)
 	`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
-		input.IsDefault, effectiveDate, expiryDate, notes, userID, now)
+		input.IsDefault, effectiveDate, expiryDate, notes, warehouseID, userID, now)
 
 	if err != nil {
-		h.log.Error("Failed to create BOM", "error", err)
-		response.InternalError(c, "Failed to create BOM")
-		return
+		// Retry without warehouse_id if column doesn't exist
+		tx.Rollback()
+		tx, _ = h.db.Begin()
+		if input.IsDefault {
+			tx.Exec("UPDATE product_boms SET is_default = false WHERE product_id = $1 AND tenant_id = $2", productID, tenantID)
+		}
+		_, err = tx.Exec(`
+			INSERT INTO product_boms (
+				id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
+				is_active, is_default, effective_date, expiry_date, notes,
+				created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $14)
+		`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
+			input.IsDefault, effectiveDate, expiryDate, notes, userID, now)
+		if err != nil {
+			h.log.Error("Failed to create BOM", "error", err)
+			response.InternalError(c, "Failed to create BOM")
+			return
+		}
+		// Set warehouse after if column exists
+		if warehouseID != nil {
+			h.db.Exec(`UPDATE product_boms SET warehouse_id = $1 WHERE id = $2`, warehouseID, bomID)
+		}
 	}
 
 	// Create lines
@@ -2108,6 +2170,17 @@ func (h *Handler) UpdateBOM(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
 		args = append(args, *input.Notes)
+	}
+	if input.WarehouseID != nil {
+		argCount++
+		if *input.WarehouseID == "" {
+			updates = append(updates, "warehouse_id = NULL")
+			argCount-- // no arg added
+		} else {
+			wid, _ := uuid.Parse(*input.WarehouseID)
+			updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+			args = append(args, wid)
+		}
 	}
 
 	if len(updates) == 0 {
@@ -3533,9 +3606,9 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 				}
 
 				// Credit: Inventory Asset
-				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1300")
+				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
 				if inventoryAcct == uuid.Nil {
-					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1300")
+					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
 				}
 
 				if scrapAcct != uuid.Nil && inventoryAcct != uuid.Nil {
@@ -5509,9 +5582,9 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 				adjustAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory adjustment", "6910")
 			}
 			// Credit: Stock Valuation
-			stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+			stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
 			if stockAcct == uuid.Nil {
-				stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1300")
+				stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1010")
 			}
 
 			if adjustAcct != uuid.Nil && stockAcct != uuid.Nil {
@@ -6438,33 +6511,33 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						switch op.Direction {
 						case "receipt":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "2100")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "6010")
 								if creditAcct == uuid.Nil {
-									creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "2100")
+									creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "6010")
 								}
 							}
 						case "delivery":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "5100")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "9110")
 								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "5100")
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "9110")
 								}
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 						case "write_off":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "6920")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "9430")
 								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "6910")
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "9420")
 								}
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 						}
 					}
@@ -6622,6 +6695,23 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
 						`, lotID, tenantID, prodID, warehouseID, lotNumber,
 							now, expDate, doneQty, unitPrice, vendorID, op.SourceID, now)
+
+						// FIFO: set cost_price to the OLDEST available lot's cost (not latest purchase)
+						var fifoCost float64
+						if h.db.QueryRow(`
+							SELECT unit_cost FROM inventory_lots
+							WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+							ORDER BY received_date ASC LIMIT 1
+						`, tenantID, prodID).Scan(&fifoCost) != nil || fifoCost <= 0 {
+							fifoCost = unitPrice // fallback to current purchase price if no lots
+						}
+						h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+							fifoCost, now, prodID, tenantID)
+						if op.OrgID != nil {
+							h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+								fifoCost, now, prodID, *op.OrgID)
+						}
+						h.log.Info("[v2] Updated product cost_price from stock receipt", "product_id", prodID, "cost_price", unitPrice, "org_id", op.OrgID)
 					} else {
 						// Delivery or write-off: decrease inventory
 						h.db.Exec(`
@@ -7216,7 +7306,7 @@ func (h *Handler) postIntercompanyStockAccounting(tenantID uuid.UUID, opID uuid.
 			debitAcct = ca.StockValuationAccountID
 			creditAcct = ca.StockInputAccountID
 			if creditAcct == uuid.Nil {
-				creditAcct = findAccount(h.db, tenantID, orgID, "accounts payable", "2100")
+				creditAcct = findAccount(h.db, tenantID, orgID, "accounts payable", "6010")
 			}
 		case "delivery":
 			debitAcct = ca.ExpenseAccountID
@@ -7343,9 +7433,9 @@ func (h *Handler) completeMaterialRequestFromStockOp(tenantID uuid.UUID, stockOp
 	}
 
 	// Find expense account
-	expenseAcct := findAccount(h.db, tenantID, orgIDPtr, "construction expense", "7000")
+	expenseAcct := findAccount(h.db, tenantID, orgIDPtr, "construction expense", "9610")
 	if expenseAcct == uuid.Nil {
-		expenseAcct = findAccount(h.db, tenantID, orgIDPtr, "cost of goods", "5000")
+		expenseAcct = findAccount(h.db, tenantID, orgIDPtr, "cost of goods", "9110")
 	}
 
 	var totalExpense float64
@@ -8424,10 +8514,10 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 				if shortageAcct == uuid.Nil {
 					shortageAcct = findAccount(tx, tenantID, orgIDPtr, "kamomad", "9430")
 				}
-				// Kt - product inventory account (1300-series)
-				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1300")
+				// Kt - product inventory account (1010-series)
+				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
 				if inventoryAcct == uuid.Nil {
-					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1300")
+					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
 				}
 
 				if shortageAcct != uuid.Nil && inventoryAcct != uuid.Nil {
@@ -8697,6 +8787,8 @@ func (h *Handler) ListInventoryLots(c *gin.Context) {
 		return
 	}
 
+	organizationID, _ := middleware.GetOrganizationID(c)
+
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
@@ -8739,6 +8831,14 @@ func (h *Handler) ListInventoryLots(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization's warehouses
+	if organizationID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		args = append(args, organizationID)
+	}
 
 	if productID != "" {
 		argCount++

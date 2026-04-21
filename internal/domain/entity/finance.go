@@ -37,6 +37,7 @@ type Account struct {
 	Name             string       `json:"name" db:"name"`
 	NameUz           *string      `json:"name_uz,omitempty" db:"name_uz"`
 	NameEn           *string      `json:"name_en,omitempty" db:"name_en"`
+	NameRu           *string      `json:"name_ru,omitempty" db:"name_ru"`
 	Description      *string      `json:"description,omitempty" db:"description"`
 	CurrencyID       *uuid.UUID   `json:"currency_id,omitempty" db:"currency_id"`
 	IsBankAccount    bool         `json:"is_bank_account" db:"is_bank_account"`
@@ -44,10 +45,14 @@ type Account struct {
 	IsControlAccount bool         `json:"is_control_account" db:"is_control_account"`
 	IsReconcilable   bool         `json:"is_reconcilable" db:"is_reconcilable"`
 	BudgetTracking   bool         `json:"budget_tracking" db:"budget_tracking"`
-	InternalType     *string      `json:"internal_type,omitempty" db:"internal_type"`
-	CurrentBalance   float64      `json:"current_balance" db:"current_balance"`
-	OpeningBalance   float64      `json:"opening_balance" db:"opening_balance"`
-	IsActive         bool         `json:"is_active" db:"is_active"`
+	InternalType       *string      `json:"internal_type,omitempty" db:"internal_type"`
+	IsLeaf             bool         `json:"is_leaf" db:"is_leaf"`
+	AccountNature      string       `json:"account_nature" db:"account_nature"` // ACTIVE, PASSIVE, ACTIVE_PASSIVE
+	AnalyticsTypes     *string      `json:"analytics_types,omitempty" db:"analytics_types"` // JSONB array
+	MandatoryAnalytics bool         `json:"mandatory_analytics" db:"mandatory_analytics"`
+	CurrentBalance     float64      `json:"current_balance" db:"current_balance"`
+	OpeningBalance     float64      `json:"opening_balance" db:"opening_balance"`
+	IsActive           bool         `json:"is_active" db:"is_active"`
 	CreatedAt        time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt        time.Time    `json:"updated_at" db:"updated_at"`
 	DeletedAt        sql.NullTime `json:"-" db:"deleted_at"`
@@ -67,6 +72,7 @@ type AccountResponse struct {
 	Name             string           `json:"name"`
 	NameUz           *string          `json:"name_uz,omitempty"`
 	NameEn           *string          `json:"name_en,omitempty"`
+	NameRu           *string          `json:"name_ru,omitempty"`
 	Description      *string          `json:"description,omitempty"`
 	Category         string           `json:"category,omitempty"`
 	NormalBalance    string           `json:"normal_balance,omitempty"`
@@ -74,14 +80,18 @@ type AccountResponse struct {
 	IsControlAccount bool             `json:"is_control_account"`
 	IsReconcilable   bool             `json:"is_reconcilable"`
 	BudgetTracking   bool             `json:"budget_tracking"`
-	InternalType     *string          `json:"internal_type,omitempty"`
-	CurrentBalance   float64          `json:"current_balance"`
-	OpeningBalance   float64          `json:"opening_balance"`
-	IsActive         bool             `json:"is_active"`
-	CreatedAt        time.Time        `json:"created_at"`
-	UpdatedAt        time.Time        `json:"updated_at"`
-	AccountType      *AccountType     `json:"account_type,omitempty"`
-	Children         []AccountResponse `json:"children,omitempty"`
+	InternalType       *string          `json:"internal_type,omitempty"`
+	IsLeaf             bool             `json:"is_leaf"`
+	AccountNature      string           `json:"account_nature"`
+	AnalyticsTypes     *string          `json:"analytics_types,omitempty"`
+	MandatoryAnalytics bool             `json:"mandatory_analytics"`
+	CurrentBalance     float64          `json:"current_balance"`
+	OpeningBalance     float64          `json:"opening_balance"`
+	IsActive           bool             `json:"is_active"`
+	CreatedAt          time.Time        `json:"created_at"`
+	UpdatedAt          time.Time        `json:"updated_at"`
+	AccountType        *AccountType     `json:"account_type,omitempty"`
+	Children           []AccountResponse `json:"children,omitempty"`
 }
 
 // ToResponse converts Account to AccountResponse
@@ -94,13 +104,18 @@ func (a *Account) ToResponse() *AccountResponse {
 		Name:             a.Name,
 		NameUz:           a.NameUz,
 		NameEn:           a.NameEn,
+		NameRu:           a.NameRu,
 		Description:      a.Description,
 		IsBankAccount:    a.IsBankAccount,
 		IsControlAccount: a.IsControlAccount,
 		IsReconcilable:   a.IsReconcilable,
 		BudgetTracking:   a.BudgetTracking,
-		InternalType:     a.InternalType,
-		CurrentBalance:   a.CurrentBalance,
+		InternalType:       a.InternalType,
+		IsLeaf:             a.IsLeaf,
+		AccountNature:      a.AccountNature,
+		AnalyticsTypes:     a.AnalyticsTypes,
+		MandatoryAnalytics: a.MandatoryAnalytics,
+		CurrentBalance:     a.CurrentBalance,
 		OpeningBalance:   a.OpeningBalance,
 		IsActive:         a.IsActive,
 		CreatedAt:        a.CreatedAt,
@@ -133,6 +148,7 @@ type CreateAccountInput struct {
 // UpdateAccountInput is the input for updating an account
 type UpdateAccountInput struct {
 	ParentID         *string  `json:"parent_id"`
+	Code             *string  `json:"code"`
 	Name             *string  `json:"name"`
 	Description      *string  `json:"description"`
 	InternalType     *string  `json:"internal_type"`
@@ -165,6 +181,8 @@ type Journal struct {
 	TenantID               uuid.UUID  `json:"tenant_id" db:"tenant_id"`
 	Code                   string     `json:"code" db:"code"`
 	Name                   string     `json:"name" db:"name"`
+	NameUz                 string     `json:"name_uz,omitempty" db:"name_uz"`
+	NameEn                 string     `json:"name_en,omitempty" db:"name_en"`
 	Type                   string     `json:"type" db:"type"` // general, sales, purchase, cash, bank, miscellaneous
 	Description            *string    `json:"description,omitempty" db:"description"`
 	AutoSequence           bool       `json:"auto_sequence" db:"auto_sequence"`
@@ -179,6 +197,7 @@ type Journal struct {
 	OrganizationID         *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
 	DefaultDebitAccountID  *uuid.UUID `json:"default_debit_account_id,omitempty" db:"default_debit_account_id"`
 	DefaultCreditAccountID *uuid.UUID `json:"default_credit_account_id,omitempty" db:"default_credit_account_id"`
+	IsPayrollJournal       bool       `json:"is_payroll_journal" db:"is_payroll_journal"`
 	IsActive               bool       `json:"is_active" db:"is_active"`
 	CreatedAt              time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt              time.Time  `json:"updated_at" db:"updated_at"`
@@ -213,6 +232,7 @@ type CreateJournalInput struct {
 	SuspenseAccountID      *string `json:"suspense_account_id"`
 	ProfitAccountID        *string `json:"profit_account_id"`
 	LossAccountID          *string `json:"loss_account_id"`
+	IsPayrollJournal       bool    `json:"is_payroll_journal"`
 }
 
 // UpdateJournalInput is the input for updating a journal
@@ -224,6 +244,7 @@ type UpdateJournalInput struct {
 	AutoSequence           *bool   `json:"auto_sequence"`
 	NumberPrefix           *string `json:"number_prefix"`
 	IsActive               *bool   `json:"is_active"`
+	IsPayrollJournal       *bool   `json:"is_payroll_journal"`
 	ShortCode              *string `json:"short_code"`
 	Currency               *string `json:"currency"`
 	BankAccountID          *string `json:"bank_account_id"`
@@ -275,16 +296,23 @@ type JournalEntryLine struct {
 	LineNumber     int        `json:"line_number" db:"line_number"`
 	AccountID      uuid.UUID  `json:"account_id" db:"account_id"`
 	ContactID      *uuid.UUID `json:"contact_id,omitempty" db:"contact_id"`
+	// Analytics dimensions (subkonto) required by TT Buxgalteriya 4.5
+	WarehouseID    *uuid.UUID `json:"warehouse_id,omitempty" db:"warehouse_id"`
+	EmployeeID     *uuid.UUID `json:"employee_id,omitempty" db:"employee_id"`
+	ContractID     *uuid.UUID `json:"contract_id,omitempty" db:"contract_id"`
+	AnalyticsJSON  *string    `json:"analytics_json,omitempty" db:"analytics_json"`
 	Description    *string    `json:"description,omitempty" db:"description"`
 	DebitAmount    float64    `json:"debit_amount" db:"debit_amount"`
 	CreditAmount   float64    `json:"credit_amount" db:"credit_amount"`
 	CurrencyID     *uuid.UUID `json:"currency_id,omitempty" db:"currency_id"`
 	CurrencyAmount *float64   `json:"currency_amount,omitempty" db:"currency_amount"`
 	ExchangeRate   float64    `json:"exchange_rate" db:"exchange_rate"`
-	TaxID          *uuid.UUID `json:"tax_id,omitempty" db:"tax_id"`
-	TaxAmount      float64    `json:"tax_amount" db:"tax_amount"`
-	Reconciled     bool       `json:"reconciled" db:"reconciled"`
-	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	// AmountBase is the UZS (base currency) equivalent of the line (TT 4.6)
+	AmountBase *float64   `json:"amount_base,omitempty" db:"amount_base"`
+	TaxID      *uuid.UUID `json:"tax_id,omitempty" db:"tax_id"`
+	TaxAmount  float64    `json:"tax_amount" db:"tax_amount"`
+	Reconciled bool       `json:"reconciled" db:"reconciled"`
+	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
 
 	// Relationships
 	Account *Account `json:"account,omitempty"`
@@ -355,10 +383,19 @@ type CreateJournalEntryInput struct {
 type CreateJournalEntryLineInput struct {
 	AccountID    string  `json:"account_id" binding:"required"`
 	ContactID    *string `json:"contact_id"`
-	Description  string  `json:"description"`
-	DebitAmount  float64 `json:"debit_amount"`
-	CreditAmount float64 `json:"credit_amount"`
-	TaxID        *string `json:"tax_id"`
+	// Analytics (subkonto) dimensions per TT Buxgalteriya 4.5
+	WarehouseID    *string  `json:"warehouse_id"`
+	EmployeeID     *string  `json:"employee_id"`
+	ContractID     *string  `json:"contract_id"`
+	AnalyticsJSON  *string  `json:"analytics_json"`
+	Description    string   `json:"description"`
+	DebitAmount    float64  `json:"debit_amount"`
+	CreditAmount   float64  `json:"credit_amount"`
+	CurrencyID     *string  `json:"currency_id"`
+	CurrencyAmount *float64 `json:"currency_amount"`
+	// When provided, overrides the entry-level exchange_rate for this line (TT 4.6)
+	ExchangeRate *float64 `json:"exchange_rate"`
+	TaxID        *string  `json:"tax_id"`
 }
 
 // ReverseJournalEntryInput is the input for reversing a journal entry
@@ -757,6 +794,9 @@ type TrialBalanceAccount struct {
 	AccountID     uuid.UUID              `json:"account_id"`
 	AccountCode   string                 `json:"account_code"`
 	AccountName   string                 `json:"account_name"`
+	AccountNameUz string                 `json:"account_name_uz,omitempty"`
+	AccountNameEn string                 `json:"account_name_en,omitempty"`
+	AccountNameRu string                 `json:"account_name_ru,omitempty"`
 	Category      string                 `json:"category"`
 	DebitBalance  float64                `json:"debit_balance"`
 	CreditBalance float64                `json:"credit_balance"`
@@ -785,10 +825,13 @@ type BalanceSheetSection struct {
 
 // BalanceSheetAccount represents an account in balance sheet
 type BalanceSheetAccount struct {
-	AccountID   uuid.UUID `json:"account_id"`
-	AccountCode string    `json:"account_code"`
-	AccountName string    `json:"account_name"`
-	Balance     float64   `json:"balance"`
+	AccountID     uuid.UUID `json:"account_id"`
+	AccountCode   string    `json:"account_code"`
+	AccountName   string    `json:"account_name"`
+	AccountNameUz string    `json:"account_name_uz,omitempty"`
+	AccountNameEn string    `json:"account_name_en,omitempty"`
+	AccountNameRu string    `json:"account_name_ru,omitempty"`
+	Balance       float64   `json:"balance"`
 }
 
 // IncomeStatementReport represents income statement (P&L) data
@@ -811,10 +854,13 @@ type IncomeStatementReport struct {
 
 // IncomeStatementSection represents a section in income statement
 type IncomeStatementSection struct {
-	AccountID   uuid.UUID `json:"account_id"`
-	AccountCode string    `json:"account_code"`
-	AccountName string    `json:"account_name"`
-	Amount      float64   `json:"amount"`
+	AccountID     uuid.UUID `json:"account_id"`
+	AccountCode   string    `json:"account_code"`
+	AccountName   string    `json:"account_name"`
+	AccountNameUz string    `json:"account_name_uz,omitempty"`
+	AccountNameEn string    `json:"account_name_en,omitempty"`
+	AccountNameRu string    `json:"account_name_ru,omitempty"`
+	Amount        float64   `json:"amount"`
 }
 
 // GeneralLedgerReport represents general ledger data
@@ -845,6 +891,37 @@ type GeneralLedgerTransaction struct {
 	DebitAmount    float64 `json:"debit_amount"`
 	CreditAmount   float64 `json:"credit_amount"`
 	RunningBalance float64 `json:"running_balance"`
+}
+
+// AccountCardReport represents hisob kartochkasi (account card) report
+type AccountCardReport struct {
+	AccountID      uuid.UUID              `json:"account_id"`
+	AccountCode    string                 `json:"account_code"`
+	AccountName    string                 `json:"account_name"`
+	AccountType    string                 `json:"account_type"`
+	PeriodFrom     string                 `json:"period_from"`
+	PeriodTo       string                 `json:"period_to"`
+	OpeningBalance float64                `json:"opening_balance"`
+	TotalDebit     float64                `json:"total_debit"`
+	TotalCredit    float64                `json:"total_credit"`
+	ClosingBalance float64                `json:"closing_balance"`
+	Transactions   []AccountCardTransaction `json:"transactions"`
+}
+
+// AccountCardTransaction represents a single transaction in the account card
+type AccountCardTransaction struct {
+	Date               string  `json:"date"`
+	EntryID            string  `json:"entry_id"`
+	EntryNumber        string  `json:"entry_number"`
+	DocType            string  `json:"doc_type"`
+	Description        string  `json:"description"`
+	Reference          string  `json:"reference"`
+	CounterpartCode    string  `json:"counterpart_code"`
+	CounterpartName    string  `json:"counterpart_name"`
+	DebitAmount        float64 `json:"debit_amount"`
+	CreditAmount       float64 `json:"credit_amount"`
+	RunningBalance     float64 `json:"running_balance"`
+	ContactName        string  `json:"contact_name,omitempty"`
 }
 
 // AgingReport represents aging report data (AR/AP)

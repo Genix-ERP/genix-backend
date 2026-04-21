@@ -1101,7 +1101,7 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		// Get SO warehouse_id and organization_id
 		var soWarehouseID sql.NullString
 		var soOrgID sql.NullString
-		h.db.QueryRow("SELECT warehouse_id, organization_id FROM sales_orders WHERE id = $1", orderID).Scan(&soWarehouseID, &soOrgID)
+		h.db.QueryRow("SELECT warehouse_id, organization_id FROM sales_orders WHERE id = $1 AND tenant_id = $2", orderID, tenantID).Scan(&soWarehouseID, &soOrgID)
 
 		// Determine warehouse
 		var warehouseID uuid.UUID
@@ -1657,7 +1657,9 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 
 	// Auto-create stock operations (delivery chain) — TT 12.3: SO → delivery via stock_operations
 	// For multi-step delivery: Pick → Pack → Ship (3-step) or Pick → Ship (2-step)
-	h.createDeliveryChainForSO(tenantID, orderID, organizationID, warehouseUUID, customerID, orderNumber, expectedDate, userID, now)
+	if chainErr := h.createDeliveryChainForSO(tenantID, orderID, organizationID, warehouseUUID, customerID, orderNumber, expectedDate, userID, now); chainErr != nil {
+		h.log.Error("Failed to create delivery chain for SO", "error", chainErr, "order_id", orderID, "warehouse_id", warehouseUUID)
+	}
 
 	// Auto-create Production Orders for products with insufficient stock
 	h.autoCreateProductionOrders(tenantID, orderID, customerID, warehouseUUID, organizationID, userID, now)
@@ -1670,6 +1672,27 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	// Intercompany: if this SO was created from a PO (vendor confirms SO),
 	// update the linked PO to confirmed and create a receipt op for it.
 	h.syncIntercompanySOConfirmToPO(tenantID, orderID, now)
+
+	// Notify: sales order confirmed
+	go func() {
+		var totalAmt float64
+		h.db.QueryRow(`SELECT COALESCE(total_amount, 0) FROM sales_orders WHERE id = $1`, orderID).Scan(&totalAmt)
+		custName := ""
+		if customerName.Valid {
+			custName = customerName.String
+		}
+		amountStr := fmt.Sprintf("%.0f", totalAmt)
+		h.createTranslatedNotification(tenantID, userID, "sales_order_confirmed",
+			map[string]interface{}{
+				"order_id":      orderID.String(),
+				"order_number":  orderNumber,
+				"customer_id":   customerID.String(),
+				"customer_name": custName,
+				"amount":        totalAmt,
+			},
+			orderNumber, custName, amountStr,
+		)
+	}()
 
 	h.GetSalesOrder(c)
 }
@@ -1685,7 +1708,7 @@ func (h *Handler) createDeliveryChainForSO(
 	expectedDate sql.NullTime,
 	userID uuid.UUID,
 	now time.Time,
-) {
+) error {
 	// Determine delivery steps from warehouse config
 	deliverySteps := 1
 	if warehouseUUID != nil {
@@ -1710,7 +1733,7 @@ func (h *Handler) createDeliveryChainForSO(
 	`, orderID)
 	if err != nil {
 		h.log.Error("Failed to fetch SO lines for delivery chain", "error", err)
-		return
+		return fmt.Errorf("failed to fetch SO lines: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -1720,7 +1743,8 @@ func (h *Handler) createDeliveryChainForSO(
 		}
 	}
 	if len(soLines) == 0 {
-		return
+		h.log.Warn("No SO lines with products found for delivery chain", "order_id", orderID)
+		return fmt.Errorf("no order lines with products found")
 	}
 
 	// Helper: find operation type by warehouse + type code
@@ -1794,7 +1818,7 @@ func (h *Handler) createDeliveryChainForSO(
 					id, tenant_id, operation_id, product_id,
 					expected_qty, done_qty, uom, unit_price,
 					quality_status, created_at, updated_at
-				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
+				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,0,$5,$6,'good',$7,$7)
 			`, tenantID, opID, l.ProductID, l.Qty, l.UOM, l.UnitPrice, now)
 		}
 
@@ -1824,6 +1848,12 @@ func (h *Handler) createDeliveryChainForSO(
 		packTypeID, packSrc, packDest := findOpType("pack")
 		deliveryTypeID, delSrc, delDest := findOpType("delivery")
 
+		if pickTypeID == uuid.Nil || packTypeID == uuid.Nil || deliveryTypeID == uuid.Nil {
+			h.log.Warn("Missing operation types for 3-step delivery", "tenant_id", tenantID, "warehouse_id", warehouseUUID,
+				"pick", pickTypeID, "pack", packTypeID, "delivery", deliveryTypeID)
+			return fmt.Errorf("missing operation types for 3-step delivery chain")
+		}
+
 		pickID := createOp(pickTypeID, "internal", "draft", pickSrc, pickDest)
 		packID := createOp(packTypeID, "internal", "waiting", packSrc, packDest)
 		deliveryID := createOp(deliveryTypeID, "delivery", "waiting", delSrc, delDest)
@@ -1836,6 +1866,12 @@ func (h *Handler) createDeliveryChainForSO(
 		pickTypeID, pickSrc, pickDest := findOpType("pick")
 		deliveryTypeID, delSrc, delDest := findOpType("delivery")
 
+		if pickTypeID == uuid.Nil || deliveryTypeID == uuid.Nil {
+			h.log.Warn("Missing operation types for 2-step delivery", "tenant_id", tenantID, "warehouse_id", warehouseUUID,
+				"pick", pickTypeID, "delivery", deliveryTypeID)
+			return fmt.Errorf("missing operation types for 2-step delivery chain")
+		}
+
 		pickID := createOp(pickTypeID, "internal", "draft", pickSrc, pickDest)
 		deliveryID := createOp(deliveryTypeID, "delivery", "waiting", delSrc, delDest)
 
@@ -1846,12 +1882,16 @@ func (h *Handler) createDeliveryChainForSO(
 		// 1-step: Direct delivery
 		deliveryTypeID, delSrc, delDest := findOpType("delivery")
 		if deliveryTypeID == uuid.Nil {
-			h.log.Warn("No delivery operation type found for SO", "tenant_id", tenantID)
-			return
+			h.log.Warn("No delivery operation type found for SO", "tenant_id", tenantID, "warehouse_id", warehouseUUID)
+			return fmt.Errorf("no delivery operation type found for warehouse")
 		}
 		deliveryID := createOp(deliveryTypeID, "delivery", "draft", delSrc, delDest)
+		if deliveryID == uuid.Nil {
+			return fmt.Errorf("failed to create delivery stock operation")
+		}
 		h.log.Info("Created 1-step delivery for SO", "so_id", orderID, "delivery", deliveryID)
 	}
+	return nil
 }
 
 // syncIntercompanySOConfirmToPO handles the case where a vendor confirms an intercompany SO.
@@ -2367,10 +2407,10 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	if journalErr == nil {
 		// Find AR account
-		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 
 		if arAccountID != uuid.Nil {
-			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 			// Get invoice lines for per-category accounting
 			type invoiceLineAcct struct {
@@ -2417,7 +2457,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			cogsGrouped := make(map[cogsPair]float64)
 
 			// Resolve fallback revenue account for products without category income account
-			fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+			fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
 
 			for _, al := range acctLines {
 				if al.LineTotal > 0 {

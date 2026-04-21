@@ -746,7 +746,7 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 
 		// Get warehouse from GR
 		var warehouseID sql.NullString
-		h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1", grID).Scan(&warehouseID)
+		h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1 AND tenant_id = $2", grID, tenantID).Scan(&warehouseID)
 
 		for allocRows.Next() {
 			var productID uuid.UUID
@@ -828,12 +828,12 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 		}
 
 		// Debit: Stock Valuation (inventory)
-		invAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+		invAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
 		if invAcct == uuid.Nil {
-			invAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1300")
+			invAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1010")
 		}
 		// Credit: Accounts Payable
-		apAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+		apAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 
 		if invAcct == uuid.Nil || apAcct == uuid.Nil {
 			return

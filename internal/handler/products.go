@@ -50,8 +50,11 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 5000 {
+		limit = 5000
 	}
 	offset := (page - 1) * limit
 
@@ -59,6 +62,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	search := c.Query("search")
 	categoryID := c.Query("category_id")
 	productType := c.Query("type")
+	inventoryType := c.Query("inventory_type")
 	includeInactive := c.Query("include_inactive") == "true"
 
 	// Build query - products are shared across orgs, org-specific data comes from product_organization_settings
@@ -83,12 +87,16 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.can_be_rented, false) as can_be_rented,
 			   COALESCE(p.can_be_subcontracted, false) as can_be_subcontracted,
 			   COALESCE(p.is_overhead_expense, false) as is_overhead_expense,
+			   COALESCE(p.is_manufacturable, false) as is_manufacturable,
+			   COALESCE(p.auto_manufacture, false) as auto_manufacture,
 			   COALESCE(p.has_variants, false) as has_variants,
+			   COALESCE(p.has_delivery, false) as has_delivery,
+			   COALESCE(p.delivery_price, 0) as delivery_price,
 			   p.is_active, p.tags, COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
 			   p.created_at, p.updated_at,
 			   pc.code as category_code, pc.name as category_name,
-			   COALESCE(u.name, '') as unit_name,
+			   COALESCE(u.name, '') as unit_name, COALESCE(u.code, '') as unit_code,
 			   p.purchase_unit_id, COALESCE(pu.name, '') as purchase_unit_name,
 			   p.sales_unit_id, COALESCE(su.name, '') as sales_unit_name
 		FROM products p
@@ -149,6 +157,15 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		countArgs = append(countArgs, productType)
 	}
 
+	if inventoryType != "" {
+		argCount++
+		countArgCount++
+		baseQuery += fmt.Sprintf(" AND COALESCE(p.inventory_type, 'trade') = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND COALESCE(p.inventory_type, 'trade') = $%d", countArgCount)
+		args = append(args, inventoryType)
+		countArgs = append(countArgs, inventoryType)
+	}
+
 	if search != "" {
 		argCount++
 		countArgCount++
@@ -168,7 +185,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	}
 
 	// Add ordering and pagination
-	baseQuery += " ORDER BY p.code ASC"
+	baseQuery += " ORDER BY p.name ASC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
@@ -187,7 +204,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var tags json.RawMessage
 		var imageURL string
 		var inventoryType string
-		var unitName string
+		var unitName, unitCode string
 		var purchaseUnitID sql.NullString
 		var purchaseUnitName string
 		var salesUnitID sql.NullString
@@ -202,11 +219,12 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.IsPurchasable, &p.IsSellable,
 			&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 			&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
-			&p.IsOverheadExpense, &p.HasVariants, &p.IsActive, &tags, &imageURL,
+			&p.IsOverheadExpense, &p.IsManufacturable, &p.AutoManufacture, &p.HasVariants, &p.HasDelivery, &p.DeliveryPrice,
+			&p.IsActive, &tags, &imageURL,
 			&inventoryType,
 			&p.CreatedAt, &p.UpdatedAt,
 			&categoryCode, &categoryName,
-			&unitName,
+			&unitName, &unitCode,
 			&purchaseUnitID, &purchaseUnitName,
 			&salesUnitID, &salesUnitName,
 		)
@@ -257,6 +275,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			Description:       p.Description,
 			UnitID:            parsedUnitID,
 			UnitName:          unitName,
+			UnitCode:          unitCode,
 			PurchaseUnitID:    parsedPurchaseUnitID,
 			PurchaseUnitName:  purchaseUnitName,
 			SalesUnitID:       parsedSalesUnitID,
@@ -274,13 +293,17 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			CanBeExpensed:     p.CanBeExpensed,
 			CanBeRented:       p.CanBeRented,
 			CanBeSubcontracted: p.CanBeSubcontracted,
-			IsOverheadExpense: p.IsOverheadExpense,
-			HasVariants:       p.HasVariants,
-			IsActive:          p.IsActive,
-			ImageURL:          imageURL,
-			InventoryType:     inventoryType,
-			CreatedAt:         p.CreatedAt,
-			UpdatedAt:         p.UpdatedAt,
+			IsOverheadExpense:  p.IsOverheadExpense,
+			IsManufacturable:   p.IsManufacturable,
+			AutoManufacture:    p.AutoManufacture,
+			HasVariants:        p.HasVariants,
+			HasDelivery:        p.HasDelivery,
+			DeliveryPrice:      p.DeliveryPrice,
+			IsActive:           p.IsActive,
+			ImageURL:           imageURL,
+			InventoryType:      inventoryType,
+			CreatedAt:          p.CreatedAt,
+			UpdatedAt:          p.UpdatedAt,
 		}
 
 		if categoryCode.Valid && categoryName.Valid {
@@ -445,6 +468,10 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 	if input.AutoManufacture != nil {
 		autoManufacture = *input.AutoManufacture
 	}
+	hasDelivery := false
+	if input.HasDelivery != nil {
+		hasDelivery = *input.HasDelivery
+	}
 
 	// Default inventory_type to 'trade', or 'service' if type is 'service'
 	inventoryType := "trade"
@@ -500,8 +527,9 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
 			can_be_expensed, can_be_rented, can_be_subcontracted, is_overhead_expense,
 			is_manufacturable, auto_manufacture,
+			has_delivery, delivery_price,
 			is_active, tags, image_url, inventory_type, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
 		RETURNING id
 	`
 
@@ -512,6 +540,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
 		canBeExpensed, canBeRented, canBeSubcontracted, isOverheadExpense,
 		isManufacturable, autoManufacture,
+		hasDelivery, input.DeliveryPrice,
 		true, tagsJSON, imageURL, inventoryType, userID, now, now,
 	).Scan(&id)
 
@@ -634,7 +663,11 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			   COALESCE(p.can_be_rented, false) as can_be_rented,
 			   COALESCE(p.can_be_subcontracted, false) as can_be_subcontracted,
 			   COALESCE(p.is_overhead_expense, false) as is_overhead_expense,
+			   COALESCE(p.is_manufacturable, false) as is_manufacturable,
+			   COALESCE(p.auto_manufacture, false) as auto_manufacture,
 			   COALESCE(p.has_variants, false) as has_variants,
+			   COALESCE(p.has_delivery, false) as has_delivery,
+			   COALESCE(p.delivery_price, 0) as delivery_price,
 			   p.is_active, p.tags,
 			   COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
@@ -670,7 +703,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		&p.IsPurchasable, &p.IsSellable,
 		&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 		&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
-		&p.IsOverheadExpense, &p.HasVariants,
+		&p.IsOverheadExpense, &p.IsManufacturable, &p.AutoManufacture, &p.HasVariants, &p.HasDelivery, &p.DeliveryPrice,
 		&p.IsActive, &tags, &imageURL,
 		&inventoryType,
 		&p.CreatedAt, &p.UpdatedAt,
@@ -706,7 +739,11 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		CanBeRented:        p.CanBeRented,
 		CanBeSubcontracted: p.CanBeSubcontracted,
 		IsOverheadExpense:  p.IsOverheadExpense,
+		IsManufacturable:   p.IsManufacturable,
+		AutoManufacture:    p.AutoManufacture,
 		HasVariants:        p.HasVariants,
+		HasDelivery:        p.HasDelivery,
+		DeliveryPrice:      p.DeliveryPrice,
 		IsActive:           p.IsActive,
 		ImageURL:           imageURL,
 		InventoryType:      inventoryType,
@@ -909,6 +946,12 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	if input.AutoManufacture != nil {
 		addUpdate("auto_manufacture", *input.AutoManufacture)
 	}
+	if input.HasDelivery != nil {
+		addUpdate("has_delivery", *input.HasDelivery)
+	}
+	if input.DeliveryPrice != nil {
+		addUpdate("delivery_price", *input.DeliveryPrice)
+	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
 	}
@@ -923,10 +966,14 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		addUpdate("inventory_type", *input.InventoryType)
 	}
 
-	// Resolve UOM string codes to UUID references
+	// Resolve UOM: prefer inventory_uom code (user just changed it), fallback to unit_id UUID
 	if input.InventoryUOM != nil && *input.InventoryUOM != "" {
 		if resolved := h.resolveUOMCode(tenantID, *input.InventoryUOM); resolved != nil {
 			addUpdate("unit_id", *resolved)
+		}
+	} else if input.UnitID != nil && *input.UnitID != "" {
+		if uid, parseErr := uuid.Parse(*input.UnitID); parseErr == nil {
+			addUpdate("unit_id", uid)
 		}
 	}
 	if input.PurchaseUOM != nil && *input.PurchaseUOM != "" {
@@ -1109,6 +1156,10 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 	query += `
 		WHERE pc.tenant_id = $1 AND pc.deleted_at IS NULL
 	`
+
+	if orgID != uuid.Nil {
+		query += fmt.Sprintf(` AND (pc.origin_organization_id = $%d OR pc.origin_organization_id IS NULL)`, len(args))
+	}
 
 	if !includeInactive {
 		query += " AND pc.is_active = true"

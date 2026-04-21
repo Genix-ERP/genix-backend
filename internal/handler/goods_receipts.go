@@ -842,7 +842,7 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 
 	// Get warehouse ID from the goods receipt
 	var grWarehouseID sql.NullString
-	h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1", grID).Scan(&grWarehouseID)
+	h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1 AND tenant_id = $2", grID, tenantID).Scan(&grWarehouseID)
 
 	// Get GR lines with product info for inventory update (including batch/expiry for lot creation)
 	grLinesForInventory, err := h.db.Query(`
@@ -885,10 +885,13 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 			if err == sql.ErrNoRows {
 				// Create new inventory record (quantity_available and total_value are generated columns)
 				inventoryID = uuid.New()
+				// Get organization_id from the warehouse
+				var whOrgID *uuid.UUID
+				h.db.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", warehouseID, tenantID).Scan(&whOrgID)
 				h.db.Exec(`
-					INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, 0, 0, $5, $6, $6)
-				`, inventoryID, tenantID, productID, warehouseID, unitPrice, now)
+					INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+					VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+				`, inventoryID, tenantID, whOrgID, productID, warehouseID, unitPrice, now)
 			}
 
 			// 2. Update inventory quantity
@@ -943,6 +946,10 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
 			`, lotID, tenantID, productID, warehouseID, lotNumber,
 				now, expDate, acceptedQty, unitPrice, vendorID, poID, now)
+
+			// Update product cost_price with the latest purchase price
+			h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+				unitPrice, now, productID, tenantID)
 		}
 	}
 
@@ -950,16 +957,29 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 	// CREATE JOURNAL ENTRY FOR GOODS RECEIPT
 	// ============================================
 	func() {
-		// Get GR details for JE
+		// Get GR details for JE (incl. TT §4.5 analytics subkonto: warehouse_id + supplier_id)
 		var grNumber string
-		var grOrgID sql.NullString
+		var grOrgID, grWarehouseID, grSupplierID sql.NullString
 		var receiptDate time.Time
-		h.db.QueryRow(`SELECT gr_number, organization_id, receipt_date FROM goods_receipts WHERE id = $1`, grID).Scan(&grNumber, &grOrgID, &receiptDate)
+		h.db.QueryRow(`
+			SELECT gr_number, organization_id, warehouse_id, supplier_id, receipt_date
+			FROM goods_receipts WHERE id = $1`, grID).Scan(&grNumber, &grOrgID, &grWarehouseID, &grSupplierID, &receiptDate)
 
 		var orgIDPtr *uuid.UUID
 		if grOrgID.Valid {
 			if parsedOrgID, err := uuid.Parse(grOrgID.String); err == nil {
 				orgIDPtr = &parsedOrgID
+			}
+		}
+		var warehouseIDPtr, supplierIDPtr *uuid.UUID
+		if grWarehouseID.Valid {
+			if w, err := uuid.Parse(grWarehouseID.String); err == nil {
+				warehouseIDPtr = &w
+			}
+		}
+		if grSupplierID.Valid {
+			if s, err := uuid.Parse(grSupplierID.String); err == nil {
+				supplierIDPtr = &s
 			}
 		}
 
@@ -1039,33 +1059,33 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 			creditAcct := ca.StockInputAccountID
 
 			if debitAcct == uuid.Nil {
-				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
 			}
 			if creditAcct == uuid.Nil {
-				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 			}
 			if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
 				continue
 			}
 
-			// Debit: Stock Valuation
+			// Debit: Stock Valuation (TT §4.5 — warehouse subkonto required on inventory accounts)
 			h.db.Exec(`
 				INSERT INTO journal_entry_lines (
-					id, journal_entry_id, line_number, account_id, description,
-					debit_amount, credit_amount, exchange_rate, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, 0, 1.0, $7)`,
-				uuid.New(), journalEntryID, lineNumber, debitAcct, "Stock Valuation", line.amount, now,
+					id, journal_entry_id, line_number, account_id, warehouse_id, description,
+					debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 1.0, $7, '{}'::jsonb, $8)`,
+				uuid.New(), journalEntryID, lineNumber, debitAcct, warehouseIDPtr, "Stock Valuation", line.amount, now,
 			)
 			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", line.amount, now, debitAcct)
 			lineNumber++
 
-			// Credit: Accounts Payable / Stock Interim Receipt
+			// Credit: Accounts Payable / Stock Interim Receipt (TT §4.5 — kontragent subkonto required)
 			h.db.Exec(`
 				INSERT INTO journal_entry_lines (
-					id, journal_entry_id, line_number, account_id, description,
-					debit_amount, credit_amount, exchange_rate, created_at
-				) VALUES ($1, $2, $3, $4, $5, 0, $6, 1.0, $7)`,
-				uuid.New(), journalEntryID, lineNumber, creditAcct, "Accounts Payable", line.amount, now,
+					id, journal_entry_id, line_number, account_id, contact_id, description,
+					debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 1.0, $7, '{}'::jsonb, $8)`,
+				uuid.New(), journalEntryID, lineNumber, creditAcct, supplierIDPtr, "Accounts Payable", line.amount, now,
 			)
 			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", line.amount, now, creditAcct)
 			lineNumber++

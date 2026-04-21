@@ -1,8 +1,14 @@
 package handler
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -25,7 +31,7 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 		return
 	}
 
-	// Note: organization_id filter skipped as it may not exist in migration 010 schema
+	organizationID := c.Query("organization_id")
 
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -43,9 +49,8 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	workCenterID := c.Query("work_center_id")
 	status := c.Query("status")
 
-	// Use only columns from migration 010 schema for backward compatibility
 	query := `
-		SELECT wo.id, wo.tenant_id, NULL as organization_id, wo.production_order_id,
+		SELECT wo.id, wo.tenant_id, wo.organization_id, wo.production_order_id,
 			   COALESCE(wo.code, '') as work_order_number,
 			   COALESCE(wo.name, '') as name, wo.sequence,
 			   wo.operation_id as bom_operation_id, '' as operation_name,
@@ -71,7 +76,11 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argIdx := 2
 
-	// Note: organization_id may not exist in migration 010 schema, skip filter
+	if organizationID != "" {
+		query += fmt.Sprintf(" AND wo.organization_id = $%d", argIdx)
+		args = append(args, organizationID)
+		argIdx++
+	}
 	if productionOrderID != "" {
 		query += fmt.Sprintf(" AND wo.production_order_id = $%d", argIdx)
 		args = append(args, productionOrderID)
@@ -188,9 +197,8 @@ func (h *Handler) GetWorkOrder(c *gin.Context) {
 		return
 	}
 
-	// Use only columns from migration 010 schema for backward compatibility
 	query := `
-		SELECT wo.id, wo.tenant_id, NULL as organization_id, wo.production_order_id,
+		SELECT wo.id, wo.tenant_id, wo.organization_id, wo.production_order_id,
 			   COALESCE(wo.code, '') as work_order_number,
 			   COALESCE(wo.name, '') as name, wo.sequence,
 			   wo.operation_id as bom_operation_id, '' as operation_name,
@@ -307,7 +315,7 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 		return
 	}
 
-	if currentStatus != "draft" && currentStatus != "ready" && currentStatus != "waiting" && currentStatus != "pending" {
+	if currentStatus != "draft" && currentStatus != "ready" && currentStatus != "waiting" && currentStatus != "pending" && currentStatus != "paused" {
 		response.BadRequest(c, "Work order cannot be started. Current status: "+currentStatus)
 		return
 	}
@@ -455,10 +463,14 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	// Get the production order ID and current work order sequence
 	var productionOrderID uuid.UUID
 	var currentSequence int
-	h.db.QueryRow(`
+	scanErr := h.db.QueryRow(`
 		SELECT production_order_id, COALESCE(sequence, 0)
 		FROM work_orders WHERE id = $1 AND tenant_id = $2
 	`, woID, tenantID).Scan(&productionOrderID, &currentSequence)
+	if scanErr != nil {
+		h.log.Error("CompleteWorkOrder: failed to get production_order_id", "error", scanErr, "wo_id", woID)
+	}
+	h.log.Info("CompleteWorkOrder: context", "wo_id", woID, "production_order_id", productionOrderID, "sequence", currentSequence)
 
 	// Find the next work order in sequence
 	var nextWoID uuid.UUID
@@ -481,12 +493,15 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	if totalWOs > 0 {
 		progressPct = float64(completedWOs) / float64(totalWOs) * 100.0
 	}
+	h.log.Info("CompleteWorkOrder: progress", "totalWOs", totalWOs, "completedWOs", completedWOs, "progressPct", progressPct, "nextErr", nextErr)
+
 	h.db.Exec(`
 		UPDATE production_orders SET progress_percent = $1, updated_at = $2
 		WHERE id = $3 AND tenant_id = $4
 	`, progressPct, now, productionOrderID, tenantID)
 
 	if nextErr == nil {
+		h.log.Info("CompleteWorkOrder: advancing to next WO", "next_wo_id", nextWoID, "next_sequence", nextSequence)
 		// Mark next work order as ready — worker must press Start manually
 		h.db.Exec(`
 			UPDATE work_orders
@@ -510,6 +525,8 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				AND status NOT IN ('completed', 'done', 'cancelled')
 		`, productionOrderID, tenantID).Scan(&incompleteCount)
 
+		h.log.Info("CompleteWorkOrder: all WOs check", "incompleteCount", incompleteCount)
+
 		if incompleteCount == 0 {
 			// All work orders done — use last step's output as final quantity
 			var lastWoProduced float64
@@ -527,46 +544,72 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 			`, productionOrderID, tenantID).Scan(&totalScrapped)
 
-			h.db.Exec(`
-				UPDATE production_orders
-				SET status = 'completed', current_stage = 'done', progress_percent = 100,
-				    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
-				    actual_end = $3, updated_at = $3
-				WHERE id = $4 AND tenant_id = $5
-			`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
+			// Check if this production order uses split output (bulk → packaged products)
+			var hasSplitOutput sql.NullBool
+			h.db.QueryRow(`SELECT has_split_output FROM production_orders WHERE id = $1 AND tenant_id = $2`,
+				productionOrderID, tenantID).Scan(&hasSplitOutput)
 
-			// Add finished goods to inventory (last step's good output)
-			unitCost := h.receiveFinishedGoods(productionOrderID, tenantID, userID, lastWoProduced, now)
+			splitEnabled := hasSplitOutput.Valid && hasSplitOutput.Bool
+			h.log.Info("CompleteWorkOrder: split output check", "has_split_output_raw", hasSplitOutput, "splitEnabled", splitEnabled, "lastWoProduced", lastWoProduced, "totalScrapped", totalScrapped)
 
-			// Set material_cost and actual_cost on the production order
-			totalCost := unitCost * (lastWoProduced + totalScrapped)
-			if totalCost > 0 {
+			if splitEnabled {
+				// Move to "packaging" status — worker will use CompleteSplitOutput to finalize
+				_, execErr := h.db.Exec(`
+					UPDATE production_orders
+					SET status = 'packaging', current_stage = 'packaging', progress_percent = 95,
+					    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
+					    actual_end = $3, updated_at = $3
+					WHERE id = $4 AND tenant_id = $5
+				`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
+				if execErr != nil {
+					h.log.Error("CompleteWorkOrder: failed to set packaging status", "error", execErr)
+				} else {
+					h.log.Info("CompleteWorkOrder: set production order to PACKAGING", "po_id", productionOrderID)
+				}
+			} else {
+				h.log.Info("[v2] CompleteWorkOrder: completing PO (non-split)", "po_id", productionOrderID, "lastWoProduced", lastWoProduced)
 				h.db.Exec(`
 					UPDATE production_orders
-					SET material_cost = $1, actual_cost = $1, updated_at = $2
-					WHERE id = $3 AND tenant_id = $4
-				`, totalCost, now, productionOrderID, tenantID)
-			}
+					SET status = 'completed', current_stage = 'done', progress_percent = 100,
+					    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
+					    actual_end = $3, updated_at = $3
+					WHERE id = $4 AND tenant_id = $5
+				`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
 
-			// Move scrapped items to scrap warehouse
-			var productID uuid.UUID
-			var organizationID *uuid.UUID
-			var warehouseID *uuid.UUID
-			h.db.QueryRow(`
-				SELECT product_id, organization_id, warehouse_id FROM production_orders
-				WHERE id = $1 AND tenant_id = $2
-			`, productionOrderID, tenantID).Scan(&productID, &organizationID, &warehouseID)
+				// Add finished goods to inventory (last step's good output)
+				unitCost := h.receiveFinishedGoods(productionOrderID, tenantID, userID, lastWoProduced, now)
+				h.log.Info("[v2] receiveFinishedGoods returned", "unitCost", unitCost, "po_id", productionOrderID)
 
-			if totalScrapped > 0 {
-				h.receiveScrapGoods(productionOrderID, tenantID, userID, productID, organizationID, totalScrapped, unitCost, now)
-			}
+				// Set material_cost and actual_cost on the production order
+				totalCost := unitCost * (lastWoProduced + totalScrapped)
+				if totalCost > 0 {
+					h.db.Exec(`
+						UPDATE production_orders
+						SET material_cost = $1, actual_cost = $1, updated_at = $2
+						WHERE id = $3 AND tenant_id = $4
+					`, totalCost, now, productionOrderID, tenantID)
+				}
 
-			// Create journal entries for finished goods (WIP → Finished Goods)
-			h.createFinishedGoodsJournalEntry(productionOrderID, tenantID, organizationID, productID, userID, lastWoProduced, unitCost, now)
+				// Move scrapped items to scrap warehouse
+				var productID uuid.UUID
+				var organizationID *uuid.UUID
+				var warehouseID *uuid.UUID
+				h.db.QueryRow(`
+					SELECT product_id, organization_id, warehouse_id FROM production_orders
+					WHERE id = $1 AND tenant_id = $2
+				`, productionOrderID, tenantID).Scan(&productID, &organizationID, &warehouseID)
 
-			// Transfer finished goods to dedicated finished goods warehouse if one exists
-			if warehouseID != nil {
-				h.transferToFinishedGoodsWarehouse(productionOrderID, tenantID, organizationID, productID, *warehouseID, userID, lastWoProduced, unitCost, now)
+				if totalScrapped > 0 {
+					h.receiveScrapGoods(productionOrderID, tenantID, userID, productID, organizationID, totalScrapped, unitCost, now)
+				}
+
+				// Create journal entries for finished goods (WIP → Finished Goods)
+				h.createFinishedGoodsJournalEntry(productionOrderID, tenantID, organizationID, productID, userID, lastWoProduced, unitCost, now)
+
+				// Transfer finished goods to dedicated finished goods warehouse if one exists
+				if warehouseID != nil {
+					h.transferToFinishedGoodsWarehouse(productionOrderID, tenantID, organizationID, productID, *warehouseID, userID, lastWoProduced, unitCost, now)
+				}
 			}
 		}
 	}
@@ -1238,17 +1281,16 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 			notesVal = notes.String
 		}
 
-		// Use only migration 010 columns
 		_, err := h.db.Exec(`
 			INSERT INTO work_orders (
-				id, tenant_id, production_order_id,
+				id, tenant_id, organization_id, production_order_id,
 				code, name, sequence,
 				operation_id, work_center_id,
 				quantity_to_produce, uom,
 				planned_duration_hours, setup_time_hours,
 				status, instructions, created_by
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pcs', $10, $11, 'pending', $12, $13)
-		`, woID, tenantID, productionOrderID,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pcs', $11, $12, 'pending', $13, $14)
+		`, woID, tenantID, orgID, productionOrderID,
 			woNumber, opName, sequence,
 			opID, workCenterID,
 			quantity,
@@ -1477,14 +1519,26 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 	if unitCost <= 0 {
 		h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
 	}
-	// Update product's cost_price with the calculated manufacturing cost
+	// Update product's cost_price with the calculated manufacturing cost (both tables)
 	if unitCost > 0 {
 		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
+		if organizationID != nil {
+			h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+				unitCost, now, productID, *organizationID)
+		}
 	}
 
-	// If no warehouse set, just return the unitCost (for cost calculation) without inventory changes
+	// If no warehouse set, try to find one
 	if warehouseID == nil {
-		return unitCost
+		var firstWH uuid.UUID
+		if h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
+			warehouseID = &firstWH
+			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, poID, tenantID)
+			h.log.Info("receiveFinishedGoods: auto-assigned warehouse", "warehouse_id", firstWH, "po_id", poID)
+		} else {
+			h.log.Warn("receiveFinishedGoods: no warehouse found, skipping inventory", "po_id", poID)
+			return unitCost
+		}
 	}
 
 	tx, err := h.db.Begin()
@@ -1531,6 +1585,18 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		h.log.Error("receiveFinishedGoods: failed to insert inventory_transaction", "error", txErr, "po_id", poID)
 		return 0
 	}
+
+	// Create inventory lot for FIFO tracking
+	lotID := uuid.New()
+	lotNumber := fmt.Sprintf("MFG-%s", poID.String()[:8])
+	tx.Exec(`
+		INSERT INTO inventory_lots (
+			id, tenant_id, product_id, warehouse_id, lot_number,
+			received_date, initial_quantity, remaining_quantity,
+			unit_cost, purchase_order_id, status, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)
+	`, lotID, tenantID, productID, warehouseID, lotNumber,
+		now, producedQty, unitCost, poID)
 
 	if commitErr := tx.Commit(); commitErr != nil {
 		h.log.Error("receiveFinishedGoods: failed to commit transaction", "error", commitErr, "po_id", poID)
@@ -1678,11 +1744,11 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 	totalLaborCost := producedQty * laborCost
 
 	// Look up accounts
-	wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
-	rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
-	finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "1330")
+	wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
+	rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
+	finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "2810")
 	machineAcct := findAccount(h.db, tenantID, organizationID, "accrued machine", "2590")
-	salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6720")
+	salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6710")
 
 	useDetailedFlow := wipAcct != uuid.Nil && rawAcct != uuid.Nil && finishedAcct != uuid.Nil
 
@@ -1796,10 +1862,10 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 		inventoryAcct := ca.StockValuationAccountID
 		cogsAcct := ca.ExpenseAccountID
 		if cogsAcct == uuid.Nil {
-			cogsAcct = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
+			cogsAcct = findAccount(h.db, tenantID, organizationID, "manufacturing", "9120")
 		}
 		if cogsAcct == uuid.Nil {
-			cogsAcct = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
+			cogsAcct = findAccount(h.db, tenantID, organizationID, "cost of production", "9110")
 		}
 
 		if inventoryAcct != uuid.Nil && cogsAcct != uuid.Nil {
@@ -2182,4 +2248,188 @@ func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
 		WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
 
 	response.Success(c, gin.H{"message": "Material removed"})
+}
+
+// ListWorkOrderAttachments returns all attachments for a work order
+func (h *Handler) ListWorkOrderAttachments(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	woID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, file_name, original_name, mime_type, file_size, storage_path,
+		       COALESCE(metadata->>'description', '') as description, created_at
+		FROM attachments
+		WHERE tenant_id = $1 AND entity_type = 'work_order' AND entity_id = $2
+		ORDER BY created_at DESC
+	`, tenantID, woID)
+	if err != nil {
+		response.InternalError(c, "Failed to list attachments")
+		return
+	}
+	defer rows.Close()
+
+	type Attachment struct {
+		ID           uuid.UUID `json:"id"`
+		FileName     string    `json:"file_name"`
+		OriginalName string    `json:"original_name"`
+		MimeType     string    `json:"mime_type"`
+		FileSize     int64     `json:"file_size"`
+		URL          string    `json:"url"`
+		Description  string    `json:"description"`
+		CreatedAt    time.Time `json:"created_at"`
+	}
+
+	var attachments []Attachment
+	for rows.Next() {
+		var a Attachment
+		var storagePath string
+		if err := rows.Scan(&a.ID, &a.FileName, &a.OriginalName, &a.MimeType, &a.FileSize, &storagePath, &a.Description, &a.CreatedAt); err != nil {
+			continue
+		}
+		a.URL = "/api/v1/files/" + a.FileName
+		attachments = append(attachments, a)
+	}
+	if attachments == nil {
+		attachments = []Attachment{}
+	}
+
+	response.Success(c, attachments)
+}
+
+// UploadWorkOrderAttachment uploads a file and attaches it to a work order
+func (h *Handler) UploadWorkOrderAttachment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	woID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	// Get the file from the request
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		response.BadRequest(c, "No file provided")
+		return
+	}
+	defer file.Close()
+
+	// Validate file size
+	if header.Size > h.config.Storage.MaxFileSize {
+		response.BadRequest(c, fmt.Sprintf("File size exceeds maximum of %d bytes", h.config.Storage.MaxFileSize))
+		return
+	}
+
+	// Detect MIME type
+	buffer := make([]byte, 512)
+	file.Read(buffer)
+	mimeType := http.DetectContentType(buffer)
+	file.Seek(0, 0)
+
+	// Generate unique file name
+	randomBytes := make([]byte, 16)
+	rand.Read(randomBytes)
+	fileID := hex.EncodeToString(randomBytes)
+	ext := filepath.Ext(header.Filename)
+	storedName := fileID + ext
+
+	// Create directory
+	now := time.Now()
+	dirPath := filepath.Join(h.config.Storage.LocalPath, "uploads", now.Format("2006"), now.Format("01"))
+	os.MkdirAll(dirPath, 0755)
+	filePath := filepath.Join(dirPath, storedName)
+
+	// Save file
+	dst, err := os.Create(filePath)
+	if err != nil {
+		response.InternalError(c, "Failed to save file")
+		return
+	}
+	defer dst.Close()
+
+	if _, err = io.Copy(dst, file); err != nil {
+		response.InternalError(c, "Failed to write file")
+		return
+	}
+
+	// Save metadata file (same pattern as files.go)
+	metaPath := filePath + ".meta"
+	metaContent := fmt.Sprintf("%s\n%s\n%d\n%s\n%d", header.Filename, mimeType, header.Size, filePath, now.Unix())
+	os.WriteFile(metaPath, []byte(metaContent), 0644)
+
+	// Get optional description
+	description := c.PostForm("description")
+	metadata := fmt.Sprintf(`{"description": "%s"}`, description)
+
+	// Insert into attachments table
+	attachID := uuid.New()
+	_, err = h.db.Exec(`
+		INSERT INTO attachments (id, tenant_id, uploaded_by, entity_type, entity_id,
+			file_name, original_name, mime_type, file_size, storage_path, metadata)
+		VALUES ($1, $2, $3, 'work_order', $4, $5, $6, $7, $8, $9, $10::jsonb)
+	`, attachID, tenantID, userID, woID, storedName, header.Filename, mimeType, header.Size, filePath, metadata)
+	if err != nil {
+		h.log.Error("Failed to save attachment record", "error", err)
+		response.InternalError(c, "Failed to save attachment")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"id":            attachID,
+		"file_name":     storedName,
+		"original_name": header.Filename,
+		"mime_type":     mimeType,
+		"file_size":     header.Size,
+		"url":           "/api/v1/files/" + storedName,
+		"description":   description,
+		"created_at":    now,
+	})
+}
+
+// DeleteWorkOrderAttachment removes an attachment from a work order
+func (h *Handler) DeleteWorkOrderAttachment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	attachID, err := uuid.Parse(c.Param("attachment_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid attachment ID")
+		return
+	}
+
+	// Get file path before deleting
+	var storagePath string
+	h.db.QueryRow(`SELECT storage_path FROM attachments WHERE id = $1 AND tenant_id = $2`, attachID, tenantID).Scan(&storagePath)
+
+	_, err = h.db.Exec(`DELETE FROM attachments WHERE id = $1 AND tenant_id = $2`, attachID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to delete attachment")
+		return
+	}
+
+	// Remove file from disk
+	if storagePath != "" {
+		os.Remove(storagePath)
+		os.Remove(storagePath + ".meta")
+	}
+
+	response.Success(c, gin.H{"message": "Attachment deleted"})
 }

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -580,7 +581,7 @@ func (h *Handler) DuplicateEstimate(c *gin.Context) {
 // ESTIMATE LINE HANDLERS
 // =====================================================
 
-// ListEstimateLines returns lines for an estimate
+// ListEstimateLines returns lines for an estimate with pagination
 func (h *Handler) ListEstimateLines(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -594,8 +595,165 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		return
 	}
 
-	lines := h.getEstimateLines(estimateID, tenantID)
-	response.Success(c, lines)
+	// Pagination — default 50, max 5000 (some callers need all at once)
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 5000 {
+		pageSize = 50
+	}
+	offset := (page - 1) * pageSize
+
+	// Count total
+	var total int
+	h.db.QueryRow(`SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`,
+		estimateID, tenantID).Scan(&total)
+
+	// Query paginated rows
+	query := `
+		SELECT l.id, l.tenant_id, l.estimate_id, l.wbs_id,
+		       l.name, l.uom, l.quantity,
+		       l.material_rate, l.labor_rate, l.equipment_rate,
+		       l.unit_rate, l.total_amount, l.actual_amount,
+		       COALESCE(l.code, ''), COALESCE(l.item_number, ''),
+		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
+		       l.sort_order, l.created_date, l.updated_date,
+		       COALESCE(w.code, '') as wbs_code,
+		       COALESCE(w.name, '') as wbs_name
+		FROM construction_estimate_line l
+		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
+		WHERE l.estimate_id = $1 AND l.tenant_id = $2
+		ORDER BY l.sort_order ASC, l.id ASC
+		LIMIT $3 OFFSET $4
+	`
+	rows, err := h.db.Query(query, estimateID, tenantID, pageSize, offset)
+	if err != nil {
+		h.log.Error("Failed to list estimate lines", "error", err)
+		response.InternalError(c, "Failed to list estimate lines")
+		return
+	}
+	defer rows.Close()
+
+	lines := []entity.ConstructionEstimateLine{}
+	for rows.Next() {
+		var line entity.ConstructionEstimateLine
+		if err := rows.Scan(
+			&line.ID, &line.TenantID, &line.EstimateID, &line.WBSID,
+			&line.Name, &line.UOM, &line.Quantity,
+			&line.MaterialRate, &line.LaborRate, &line.EquipmentRate,
+			&line.UnitRate, &line.TotalAmount, &line.ActualAmount,
+			&line.Code, &line.ItemNumber,
+			&line.ResourceType, &line.ParentItemNumber,
+			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
+			&line.WBSCode, &line.WBSName,
+		); err != nil {
+			continue
+		}
+		lines = append(lines, line)
+	}
+
+	response.Paginated(c, lines, page, pageSize, total)
+}
+
+// ListProjectEstimateResources returns unique resource lines across all estimates for a project
+// Filtered by resource_type (labor, equipment, material) via ?type= query param
+func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	resourceType := c.Query("type") // "labor", "equipment", "material", or empty for all
+
+	// Aggregate across duplicate names by taking the MAX rate — so a resource
+	// that has a non-zero rate in at least one estimate line is returned
+	// with that rate (avoids picking a 0-rate skeleton row).
+	query := `
+		SELECT
+			MIN(el.id) AS id,
+			el.name,
+			MAX(el.uom) AS uom,
+			MAX(el.quantity) AS quantity,
+			MAX(el.material_rate) AS material_rate,
+			MAX(el.labor_rate) AS labor_rate,
+			MAX(el.equipment_rate) AS equipment_rate,
+			MAX(el.unit_rate) AS unit_rate,
+			MAX(COALESCE(el.code, '')) AS code,
+			MAX(COALESCE(el.resource_type, '')) AS resource_type
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id
+		WHERE e.tenant_id = $1
+		  AND e.project_id = $2
+		  AND el.name != ''
+	`
+	args := []interface{}{tenantID, projectID}
+	argIdx := 3
+
+	if resourceType != "" {
+		// Filter by resource type or UOM pattern
+		switch strings.ToLower(resourceType) {
+		case "labor":
+			query += ` AND (LOWER(el.resource_type) = 'labor' OR (UPPER(el.uom) LIKE '%ЧЕЛ%' AND UPPER(el.uom) LIKE '%Ч%') OR (el.labor_rate > 0 AND el.material_rate = 0 AND el.equipment_rate = 0))`
+		case "equipment":
+			query += ` AND (LOWER(el.resource_type) = 'equipment' OR (UPPER(el.uom) LIKE '%МАШ%' AND UPPER(el.uom) LIKE '%Ч%') OR (el.equipment_rate > 0 AND el.material_rate = 0 AND el.labor_rate = 0))`
+		case "material":
+			query += ` AND LOWER(COALESCE(el.resource_type,'')) != 'labor' AND LOWER(COALESCE(el.resource_type,'')) != 'equipment'`
+			query += ` AND NOT (UPPER(el.uom) LIKE '%ЧЕЛ%' AND UPPER(el.uom) LIKE '%Ч%')`
+			query += ` AND NOT (UPPER(el.uom) LIKE '%МАШ%' AND UPPER(el.uom) LIKE '%Ч%')`
+			query += ` AND NOT (el.labor_rate > 0 AND el.material_rate = 0 AND el.equipment_rate = 0)`
+			query += ` AND NOT (el.equipment_rate > 0 AND el.material_rate = 0 AND el.labor_rate = 0)`
+		default:
+			query += fmt.Sprintf(` AND LOWER(el.resource_type) = $%d`, argIdx)
+			args = append(args, strings.ToLower(resourceType))
+			argIdx++
+		}
+	}
+
+	query += ` GROUP BY el.name ORDER BY UPPER(el.name) LIMIT 500`
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list project estimate resources", "error", err, "query", query, "args", args)
+		response.InternalError(c, "Failed to list resources")
+		return
+	}
+	defer rows.Close()
+
+	type ResourceLine struct {
+		ID            int64   `json:"id"`
+		Name          string  `json:"name"`
+		UOM           string  `json:"uom"`
+		Quantity      float64 `json:"quantity"`
+		MaterialRate  float64 `json:"material_rate"`
+		LaborRate     float64 `json:"labor_rate"`
+		EquipmentRate float64 `json:"equipment_rate"`
+		UnitRate      float64 `json:"unit_rate"`
+		Code          string  `json:"code"`
+		ResourceType  string  `json:"resource_type"`
+	}
+
+	resources := make([]ResourceLine, 0)
+	for rows.Next() {
+		var r ResourceLine
+		if err := rows.Scan(&r.ID, &r.Name, &r.UOM, &r.Quantity,
+			&r.MaterialRate, &r.LaborRate, &r.EquipmentRate,
+			&r.UnitRate, &r.Code, &r.ResourceType); err != nil {
+			h.log.Error("Scan resource row", "error", err)
+			continue
+		}
+		resources = append(resources, r)
+	}
+
+	response.Success(c, resources)
 }
 
 // CreateEstimateLine creates a new line in an estimate
@@ -717,6 +875,25 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
+	// If replace mode, delete all existing lines first
+	if req.Replace {
+		_, err := tx.Exec(`DELETE FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`, estimateID, tenantID)
+		if err != nil {
+			h.log.Error("Failed to clear existing estimate lines", "error", err)
+			response.InternalError(c, "Failed to clear existing lines")
+			return
+		}
+	}
+
+	// Update source_type on the estimate if provided (important for re-imports into existing estimates)
+	if req.SourceType != "" {
+		_, stErr := tx.Exec(`UPDATE construction_estimate SET source_type = $1 WHERE id = $2 AND tenant_id = $3`,
+			req.SourceType, estimateID, tenantID)
+		if stErr != nil {
+			h.log.Error("Failed to update source_type on estimate", "error", stErr, "source_type", req.SourceType)
+		}
+	}
+
 	count := 0
 	for i, line := range req.Lines {
 		unitRate := line.MaterialRate + line.LaborRate + line.EquipmentRate
@@ -761,8 +938,99 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
 
+	// Use source_type from request if provided, otherwise fetch from DB
+	sourceType := req.SourceType
+	if sourceType == "" {
+		h.db.QueryRow(`SELECT COALESCE(source_type, '') FROM construction_estimate WHERE id = $1 AND tenant_id = $2`,
+			estimateID, tenantID).Scan(&sourceType)
+	}
+
+	orgID, _ := middleware.GetOrganizationID(c)
+	userID, _ := middleware.GetUserID(c)
+
+	// Auto-create products ONLY for resource-type estimates
+	// (excludes labor ЧЕЛ.-Ч and equipment МАШ.-Ч resources)
+	productsCreated := 0
+	if sourceType == "resurs" {
+		productsCreated = h.autoCreateProductsFromEstimateLines(tenantID, orgID, userID, req.Lines)
+	}
+
+	// Auto-create Forma 2 (KS-2) draft for VOR and Edinich estimates
+	h.log.Info("BulkCreateEstimateLines: about to auto-create Forma 2",
+		"estimate_id", estimateID, "source_type", sourceType, "line_count", count)
+	forma2ID := h.autoCreateForma2FromEstimate(tenantID, userID, estimateID)
+	h.log.Info("BulkCreateEstimateLines: auto-create Forma 2 result", "forma2_id", forma2ID)
+
+	resp := map[string]interface{}{
+		"count":            count,
+		"products_created": productsCreated,
+	}
+	if forma2ID > 0 {
+		resp["forma2_created"] = forma2ID
+	}
+	response.Success(c, resp)
+}
+
+// CreateProductsFromEstimate creates inventory products from an existing estimate's resource lines.
+// This is useful for retroactively creating products from estimates that were imported before
+// the auto-create feature was added.
+func (h *Handler) CreateProductsFromEstimate(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	estimateID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid estimate ID")
+		return
+	}
+
+	// Verify estimate exists and belongs to this tenant
+	var exists bool
+	err = h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM construction_estimate WHERE id = $1 AND tenant_id = $2)`, estimateID, tenantID).Scan(&exists)
+	if err != nil || !exists {
+		response.NotFound(c, "Estimate not found")
+		return
+	}
+
+	// Fetch all lines from this estimate
+	rows, err := h.db.Query(`
+		SELECT name, uom, quantity, material_rate, labor_rate, equipment_rate,
+		       COALESCE(code, '') as code, COALESCE(item_number, '') as item_number,
+		       COALESCE(resource_type, '') as resource_type
+		FROM construction_estimate_line
+		WHERE estimate_id = $1 AND tenant_id = $2
+		ORDER BY sort_order
+	`, estimateID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to fetch estimate lines", "error", err)
+		response.InternalError(c, "Failed to fetch estimate lines")
+		return
+	}
+	defer rows.Close()
+
+	var lines []entity.CreateEstimateLineInput
+	for rows.Next() {
+		var line entity.CreateEstimateLineInput
+		err := rows.Scan(&line.Name, &line.UOM, &line.Quantity,
+			&line.MaterialRate, &line.LaborRate, &line.EquipmentRate,
+			&line.Code, &line.ItemNumber, &line.ResourceType)
+		if err != nil {
+			h.log.Error("Failed to scan estimate line", "error", err)
+			continue
+		}
+		lines = append(lines, line)
+	}
+
+	orgID, _ := middleware.GetOrganizationID(c)
+	userID, _ := middleware.GetUserID(c)
+	productsCreated := h.autoCreateProductsFromEstimateLines(tenantID, orgID, userID, lines)
+
 	response.Success(c, map[string]interface{}{
-		"count": count,
+		"products_created": productsCreated,
+		"total_lines":      len(lines),
 	})
 }
 
@@ -1194,3 +1462,422 @@ func (h *Handler) DeleteEstimateSummaryBatch(c *gin.Context) {
 		"deleted": rowsAffected,
 	})
 }
+
+// ─── Auto-create Forma 2 (KS-2) from estimate ───────────────────────────────
+
+// autoCreateForma2FromEstimate creates a draft Forma 2 act when a VOR or Edinich
+// estimate is imported. Lines are pre-filled from the estimate with qty_period = qty_smeta.
+// Returns the created act ID, or 0 if not applicable.
+func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estimateID int64) int64 {
+	// Fetch estimate metadata: source_type, project_id, subcontract_id, name
+	var sourceType, estName string
+	var projectID int64
+	var subcontractID sql.NullInt64
+	err := h.db.QueryRow(`
+		SELECT COALESCE(source_type, ''), project_id, subcontract_id, COALESCE(name, '')
+		FROM construction_estimate
+		WHERE id = $1 AND tenant_id = $2
+	`, estimateID, tenantID).Scan(&sourceType, &projectID, &subcontractID, &estName)
+	if err != nil {
+		h.log.Error("Failed to fetch estimate for auto Forma 2", "error", err, "estimate_id", estimateID)
+		return 0
+	}
+
+	h.log.Info("autoCreateForma2FromEstimate called",
+		"estimate_id", estimateID, "source_type", sourceType,
+		"project_id", projectID, "est_name", estName)
+
+	// Only auto-create for VOR and Edinich types
+	if sourceType != "vor" && sourceType != "edinich" {
+		h.log.Info("Skipping auto Forma 2: source_type not vor/edinich", "source_type", sourceType)
+		return 0
+	}
+
+	// Skip if a forma2 was already auto-created from this estimate (avoid duplicates on re-import)
+	var existingActID int64
+	err = h.db.QueryRow(`
+		SELECT a.id FROM construction_act a
+		WHERE a.project_id = $1 AND a.tenant_id = $2 AND a.act_type = 'ks2'
+		  AND EXISTS (
+			SELECT 1 FROM construction_act_line al
+			JOIN construction_estimate_line el ON el.id = al.estimate_line_id
+			WHERE al.act_id = a.id AND el.estimate_id = $3
+		  )
+		LIMIT 1
+	`, projectID, tenantID, estimateID).Scan(&existingActID)
+	if err == nil && existingActID > 0 {
+		h.log.Info("Forma 2 already exists for this estimate, skipping auto-create",
+			"existing_act_id", existingActID, "estimate_id", estimateID)
+		return existingActID
+	}
+
+	// Fetch all estimate lines (excluding resource sub-items for edinich)
+	rows, err := h.db.Query(`
+		SELECT id, name, uom, quantity,
+			   material_rate, labor_rate, equipment_rate,
+			   COALESCE(code, '') as code,
+			   COALESCE(item_number, '') as item_number,
+			   COALESCE(resource_type, '') as resource_type,
+			   sort_order
+		FROM construction_estimate_line
+		WHERE estimate_id = $1 AND tenant_id = $2
+		ORDER BY sort_order
+	`, estimateID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to fetch estimate lines for Forma 2", "error", err)
+		return 0
+	}
+	defer rows.Close()
+
+	type estLine struct {
+		ID            int64
+		Name          string
+		UOM           string
+		Quantity      float64
+		MaterialRate  float64
+		LaborRate     float64
+		EquipmentRate float64
+		Code          string
+		ItemNumber    string
+		ResourceType  string
+		SortOrder     int
+	}
+
+	var lines []estLine
+	for rows.Next() {
+		var l estLine
+		err := rows.Scan(&l.ID, &l.Name, &l.UOM, &l.Quantity,
+			&l.MaterialRate, &l.LaborRate, &l.EquipmentRate,
+			&l.Code, &l.ItemNumber, &l.ResourceType, &l.SortOrder)
+		if err != nil {
+			h.log.Error("Failed to scan estimate line for Forma 2", "error", err)
+			continue
+		}
+		lines = append(lines, l)
+	}
+
+	if len(lines) == 0 {
+		h.log.Info("No estimate lines found for auto Forma 2", "estimate_id", estimateID)
+		return 0
+	}
+
+	// For edinich, skip resource sub-items (labor/equipment/material children)
+	// and only include parent work items
+	var f2Lines []estLine
+	if sourceType == "edinich" {
+		for _, l := range lines {
+			rt := strings.ToLower(strings.TrimSpace(l.ResourceType))
+			if rt == "" || rt == "material" {
+				// Parent work items have empty resource_type; include those + material items
+				// Only include if they have an item_number (parent rows)
+				if l.ItemNumber != "" {
+					f2Lines = append(f2Lines, l)
+				}
+			}
+		}
+		// If no parent rows found (all have item numbers), include all non-resource lines
+		if len(f2Lines) == 0 {
+			f2Lines = lines
+		}
+	} else {
+		// VOR: include all lines
+		f2Lines = lines
+	}
+
+	h.log.Info("Auto Forma 2: line filtering complete",
+		"total_lines", len(lines), "f2_lines", len(f2Lines), "source_type", sourceType)
+
+	// Generate act name
+	var actCount int
+	h.db.QueryRow(`SELECT COUNT(*) FROM construction_act WHERE project_id = $1 AND tenant_id = $2 AND act_type = 'ks2'`,
+		projectID, tenantID).Scan(&actCount)
+	actName := fmt.Sprintf("KS2-%03d", actCount+1)
+
+	// Auto-assign act_number for the subcontract
+	var actNumber int
+	if subcontractID.Valid && subcontractID.Int64 > 0 {
+		h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id = $1 AND act_type = 'ks2' AND tenant_id = $2`,
+			subcontractID.Int64, tenantID).Scan(&actNumber)
+	}
+
+	// Create the act within a transaction
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin tx for auto Forma 2", "error", err)
+		return 0
+	}
+	defer tx.Rollback()
+
+	var subcontractIDVal interface{}
+	if subcontractID.Valid && subcontractID.Int64 > 0 {
+		subcontractIDVal = subcontractID.Int64
+	}
+
+	var actID int64
+	err = tx.QueryRow(`
+		INSERT INTO construction_act (
+			tenant_id, project_id, subcontract_id, name, act_type,
+			amount_total, currency, state, notes,
+			created_by, created_date, updated_date,
+			act_number, vat_pct,
+			f2_transport_pct, f2_other_pct
+		) VALUES ($1, $2, $3, $4, 'ks2',
+			0, 'UZS', 'draft', $5,
+			$6, NOW(), NOW(),
+			$7, 12,
+			5, 17
+		)
+		RETURNING id
+	`, tenantID, projectID, subcontractIDVal, actName,
+		fmt.Sprintf("Avtomatik yaratildi: %s smetasidan", estName),
+		userID,
+		nullInt64FromVal(int64(actNumber)),
+	).Scan(&actID)
+	if err != nil {
+		h.log.Error("Failed to insert auto Forma 2 act", "error", err)
+		return 0
+	}
+
+	// Insert act lines from estimate lines
+	// Use savepoints so a single failed INSERT does not abort the entire transaction
+	var totalAmount float64
+	var sumLabor, sumEquip, sumMaterials float64
+	var insertedLines int
+	for i, l := range f2Lines {
+		unitRate := l.MaterialRate + l.LaborRate + l.EquipmentRate
+		lineTotal := l.Quantity * unitRate
+
+		// Create savepoint before each insert
+		spName := fmt.Sprintf("sp_line_%d", i)
+		if _, spErr := tx.Exec("SAVEPOINT " + spName); spErr != nil {
+			h.log.Error("Failed to create savepoint for auto Forma 2 line", "error", spErr, "name", l.Name)
+			continue
+		}
+
+		_, err := tx.Exec(`
+			INSERT INTO construction_act_line (
+				act_id, estimate_line_id, name, uom,
+				quantity, unit_rate, total_amount, sort_order,
+				qty_smeta, norm_code,
+				line_number_display,
+				labor_amount, equipment_amount, materials_amount, cables_amount
+			) VALUES ($1, $2, $3, $4,
+				$5, $6, $7, $8,
+				$9, $10,
+				$11,
+				$12, $13, $14, 0)
+		`, actID, l.ID, l.Name, l.UOM,
+			l.Quantity, unitRate, lineTotal, i+1,
+			l.Quantity, nullStringFromVal(l.Code),
+			nullStringFromVal(l.ItemNumber),
+			l.Quantity*l.LaborRate, l.Quantity*l.EquipmentRate, l.Quantity*l.MaterialRate,
+		)
+		if err != nil {
+			h.log.Error("Failed to insert auto Forma 2 line", "error", err, "name", l.Name)
+			// Rollback to savepoint so the transaction remains usable
+			tx.Exec("ROLLBACK TO SAVEPOINT " + spName)
+			continue
+		}
+
+		// Release savepoint on success and count totals
+		tx.Exec("RELEASE SAVEPOINT " + spName)
+		totalAmount += lineTotal
+		sumLabor += l.Quantity * l.LaborRate
+		sumEquip += l.Quantity * l.EquipmentRate
+		sumMaterials += l.Quantity * l.MaterialRate
+		insertedLines++
+	}
+
+	h.log.Info("Auto Forma 2 lines insert result",
+		"total_lines", len(f2Lines), "inserted", insertedLines, "skipped", len(f2Lines)-insertedLines)
+
+	// Update totals
+	vatAmount := totalAmount * 12 / 100
+	totalWithVat := totalAmount + vatAmount
+	tx.Exec(`UPDATE construction_act SET
+			amount_total = $1, vat_amount = $2, amount_total_with_vat = $3,
+			f2_labor_total = $4, f2_equipment_total = $5, f2_materials_total = $6, f2_cables_total = 0
+		WHERE id = $7`,
+		totalAmount, vatAmount, totalWithVat,
+		sumLabor, sumEquip, sumMaterials,
+		actID)
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit auto Forma 2", "error", err)
+		return 0
+	}
+
+	h.log.Info("Auto-created Forma 2 from estimate",
+		"act_id", actID, "act_name", actName,
+		"estimate_id", estimateID, "source_type", sourceType,
+		"lines", len(f2Lines), "total", totalAmount)
+
+	// Activity logging
+	h.logConstructionActivity(tenantID, projectID, userID, "act",
+		fmt.Sprintf("Forma 2 avtomatik yaratildi: %s (%s smetasidan)", actName, estName),
+		"Act", actID)
+
+	return actID
+}
+
+// ─── Auto-create products from estimate resource lines ───────────────────────
+
+// truncateRuneSafe truncates a string to at most maxRunes Unicode characters.
+func truncateRuneSafe(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes])
+	}
+	return s
+}
+
+// autoCreateProductsFromEstimateLines creates products for resource lines
+// that are material type (excludes ЧЕЛ.-Ч labor and МАШ.-Ч equipment).
+// Returns number of products created.
+func (h *Handler) autoCreateProductsFromEstimateLines(tenantID, orgID, userID uuid.UUID, lines []entity.CreateEstimateLineInput) int {
+	created := 0
+	skipped := 0
+	errors := 0
+
+	// Deduplicate by name (case-insensitive)
+	seen := make(map[string]bool)
+
+	// Track codes used in this batch to avoid collisions
+	usedCodes := make(map[string]bool)
+
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+
+	for _, line := range lines {
+		name := strings.TrimSpace(line.Name)
+		if name == "" {
+			continue
+		}
+
+		// Skip labor and equipment resources by UOM
+		uomUpper := strings.ToUpper(strings.TrimSpace(line.UOM))
+		if strings.Contains(uomUpper, "ЧЕЛ") && strings.Contains(uomUpper, "Ч") {
+			continue // Labor — employee hours
+		}
+		if strings.Contains(uomUpper, "МАШ") && strings.Contains(uomUpper, "Ч") {
+			continue // Equipment — machine hours
+		}
+
+		// Also skip by resource_type if explicitly set
+		rt := strings.ToLower(strings.TrimSpace(line.ResourceType))
+		if rt == "labor" || rt == "equipment" {
+			continue
+		}
+
+		// Skip BOP/section headers (they have no UOM or are parent items)
+		if line.UOM == "" && line.MaterialRate == 0 && line.LaborRate == 0 && line.EquipmentRate == 0 {
+			continue
+		}
+
+		// Deduplicate within this import batch
+		nameKey := strings.ToUpper(name)
+		if seen[nameKey] {
+			continue
+		}
+		seen[nameKey] = true
+
+		// Check if product with this name already exists for this tenant
+		var exists bool
+		err := h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM products WHERE tenant_id = $1 AND UPPER(name) = UPPER($2) AND deleted_at IS NULL)`,
+			tenantID, name,
+		).Scan(&exists)
+		if err != nil {
+			h.log.Error("Failed to check product existence", "error", err, "name", name)
+			errors++
+			continue
+		}
+		if exists {
+			skipped++
+			continue
+		}
+
+		// Resolve UOM to unit_id
+		unitID := h.resolveUOMCode(tenantID, line.UOM)
+
+		// Determine cost price from the estimate rates
+		costPrice := line.MaterialRate
+		if costPrice == 0 {
+			costPrice = line.MaterialRate + line.LaborRate + line.EquipmentRate
+		}
+
+		// Generate a product code from the estimate code or name
+		code := strings.TrimSpace(line.Code)
+		if code == "" {
+			// Generate code from first runes (Unicode-safe), keep under VARCHAR(50)
+			nameClean := strings.ReplaceAll(strings.ToUpper(truncateRuneSafe(name, 15)), " ", "")
+			code = truncateRuneSafe(fmt.Sprintf("EST-%s", nameClean), 40)
+		}
+
+		// Ensure code uniqueness — check both DB and current batch
+		for attempt := 0; attempt < 5; attempt++ {
+			var codeExists bool
+			h.db.QueryRow(
+				`SELECT EXISTS(SELECT 1 FROM products WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL)`,
+				tenantID, code,
+			).Scan(&codeExists)
+			if !codeExists && !usedCodes[code] {
+				break
+			}
+			code = fmt.Sprintf("%s-%s", code, uuid.New().String()[:6])
+		}
+		usedCodes[code] = true
+
+		id := uuid.New()
+		now := time.Now()
+
+		_, err = h.db.Exec(`
+			INSERT INTO products (
+				id, tenant_id, origin_organization_id, type, code, name,
+				unit_id, cost_price, list_price,
+				is_stockable, track_inventory,
+				is_purchasable, is_sellable, can_be_sold, can_be_purchased,
+				can_be_expensed, inventory_type,
+				is_active, tags, created_by, created_at, updated_at
+			) VALUES (
+				$1, $2, $3, 'product', $4, $5,
+				$6, $7, $7,
+				true, true,
+				true, false, false, true,
+				true, 'trade',
+				true, '["estimate-import"]'::jsonb, $8, $9, $9
+			)
+		`, id, tenantID, orgIDPtr, code, name,
+			unitID, costPrice,
+			userID, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to auto-create product from estimate", "error", err, "name", name, "code", code)
+			errors++
+			continue
+		}
+
+		// Create org settings if org is set
+		if orgID != uuid.Nil {
+			h.db.Exec(`
+				INSERT INTO product_organization_settings (
+					tenant_id, product_id, organization_id,
+					cost_price, list_price, min_price,
+					min_stock_level, reorder_point, reorder_quantity
+				) VALUES ($1, $2, $3, $4, $4, 0, 0, 0, 0)
+				ON CONFLICT (product_id, organization_id) DO NOTHING
+			`, tenantID, id, orgID, costPrice)
+		}
+
+		created++
+	}
+
+	h.log.Info("Auto-create products from estimate completed",
+		"created", created, "skipped_existing", skipped, "errors", errors,
+		"total_lines", len(lines))
+
+	return created
+}
+
