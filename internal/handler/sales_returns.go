@@ -594,6 +594,211 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 		}
 	}
 
+	// =====================================================
+	// RESTOCK INVENTORY + INVENTORY JOURNAL (reversal of COGS)
+	// Physically: returned items go back into stock.
+	// Accounting: Dr Inventory (asset), Cr COGS (expense) at cost.
+	// =====================================================
+	items := h.loadSalesReturnItems(returnID)
+	var totalCostReversal float64
+
+	for _, item := range items {
+		productIDStr, okPid := item["product_id"].(string)
+		if !okPid || productIDStr == "" {
+			continue
+		}
+		productID, err := uuid.Parse(productIDStr)
+		if err != nil {
+			continue
+		}
+		quantity, _ := item["quantity"].(float64)
+		unitPrice, _ := item["unit_price"].(float64)
+		if quantity <= 0 {
+			continue
+		}
+
+		// Accumulate cost basis for COGS reversal journal
+		var costPrice float64
+		h.db.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, productID).Scan(&costPrice)
+		totalCostReversal += costPrice * quantity
+
+		// Find or create inventory record for this product
+		var inventoryID, warehouseID uuid.UUID
+		var currentQty float64
+		invErr := h.db.QueryRow(`
+			SELECT id, quantity_on_hand, warehouse_id FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2
+			LIMIT 1`,
+			tenantID, productID,
+		).Scan(&inventoryID, &currentQty, &warehouseID)
+
+		if invErr == sql.ErrNoRows {
+			inventoryID = uuid.New()
+			h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 LIMIT 1", tenantID).Scan(&warehouseID)
+			if warehouseID == uuid.Nil {
+				h.log.Warn("No warehouse found for inventory restock", "product_id", productID)
+				continue
+			}
+			_, err = h.db.Exec(`
+				INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+				inventoryID, tenantID, productID, warehouseID, quantity, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create inventory record on return approval", "error", err, "product_id", productID)
+				continue
+			}
+		} else if invErr == nil {
+			_, err = h.db.Exec(`
+				UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, updated_at = $2
+				WHERE id = $3`,
+				quantity, now, inventoryID,
+			)
+			if err != nil {
+				h.log.Error("Failed to update inventory on return approval", "error", err, "inventory_id", inventoryID)
+				continue
+			}
+		} else {
+			h.log.Error("Inventory lookup failed on return approval", "error", invErr)
+			continue
+		}
+
+		// Audit trail row
+		txID := uuid.New()
+		h.db.Exec(`
+			INSERT INTO inventory_transactions (
+				id, tenant_id, inventory_id, transaction_type, quantity,
+				unit_cost, total_cost, reference_type, reference_id,
+				reason, transaction_date, created_at
+			) VALUES ($1, $2, $3, 'return', $4, $5, $6, 'sales_return', $7, 'Sales Return - Customer Return', $8, $8)
+		`, txID, tenantID, inventoryID, quantity, unitPrice, quantity*unitPrice, returnID, now)
+	}
+
+	// Inventory/COGS reversal journal entry
+	if totalCostReversal > 0 {
+		inventoryAcctID := findAccount(h.db, tenantID, returnOrgID, "inventory", "1010")
+		cogsAcctID := findAccount(h.db, tenantID, returnOrgID, "cost of goods", "9110")
+		if cogsAcctID == uuid.Nil {
+			cogsAcctID = findAccount(h.db, tenantID, returnOrgID, "cogs", "9110")
+		}
+
+		var invJournalID uuid.UUID
+		h.db.QueryRow(`
+			SELECT id FROM journals
+			WHERE tenant_id = $1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END
+			LIMIT 1`, tenantID,
+		).Scan(&invJournalID)
+
+		if inventoryAcctID != uuid.Nil && cogsAcctID != uuid.Nil && invJournalID != uuid.Nil {
+			invEntryNumber := fmt.Sprintf("INV-CN-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
+			invEntryID := uuid.New()
+			_, err := h.db.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
+				invEntryID, tenantID, returnOrgID, invJournalID, invEntryNumber, now, returnNumber,
+				fmt.Sprintf("Inventory restock from Sales Return %s - %s", returnNumber, customerName),
+				"sales_return_inventory", returnID, totalCostReversal, totalCostReversal, approvedBy, now, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create inventory reversal journal entry", "error", err)
+			} else {
+				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					uuid.New(), invEntryID, inventoryAcctID, "Inventory Restock - Sales Return", totalCostReversal, 0, 1, now,
+				)
+				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					uuid.New(), invEntryID, cogsAcctID, "COGS Reversal - Sales Return", 0, totalCostReversal, 2, now,
+				)
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCostReversal, now, inventoryAcctID)
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCostReversal, now, cogsAcctID)
+				h.log.Info("Inventory reversal journal created", "return_id", returnID, "entry_number", invEntryNumber, "amount", totalCostReversal)
+			}
+		} else {
+			h.log.Warn("Could not create inventory reversal journal - missing accounts/journal",
+				"inventory_account", inventoryAcctID, "cogs_account", cogsAcctID, "journal", invJournalID)
+		}
+	}
+
+	// =====================================================
+	// FIFO-ALLOCATE return amount to customer's unpaid invoices
+	// so the Sales Orders → Invoices widgets (Pending/Overdue) reflect the refund.
+	// =====================================================
+	if customerID.Valid {
+		custUUID, parseErr := uuid.Parse(customerID.String)
+		if parseErr == nil {
+			remaining := totalAmount
+			invRows, invErr := h.db.Query(`
+				SELECT id, COALESCE(total_amount, 0), COALESCE(amount_paid, 0)
+				FROM sales_invoices
+				WHERE tenant_id = $1 AND customer_id = $2 AND deleted_at IS NULL
+				  AND payment_status IN ('unpaid', 'partial', 'pending')
+				  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+				ORDER BY due_date ASC NULLS LAST, created_at ASC`,
+				tenantID, custUUID,
+			)
+			if invErr == nil {
+				type invPay struct {
+					id        uuid.UUID
+					newPaid   float64
+					newStatus string
+				}
+				var updates []invPay
+				for invRows.Next() {
+					if remaining <= 0.005 {
+						break
+					}
+					var invID uuid.UUID
+					var invTotal, invPaid float64
+					if err := invRows.Scan(&invID, &invTotal, &invPaid); err != nil {
+						continue
+					}
+					balance := invTotal - invPaid
+					if balance <= 0.005 {
+						continue
+					}
+					apply := remaining
+					if apply > balance {
+						apply = balance
+					}
+					newPaid := invPaid + apply
+					newStatus := "partial"
+					if newPaid >= invTotal-0.005 {
+						newStatus = "paid"
+						newPaid = invTotal
+					}
+					updates = append(updates, invPay{id: invID, newPaid: newPaid, newStatus: newStatus})
+					remaining -= apply
+				}
+				invRows.Close()
+				for _, u := range updates {
+					h.db.Exec(
+						`UPDATE sales_invoices SET amount_paid = $1, payment_status = $2, updated_at = $3 WHERE id = $4`,
+						u.newPaid, u.newStatus, now, u.id,
+					)
+				}
+				h.log.Info("FIFO-applied sales return to customer invoices",
+					"return_id", returnID, "customer_id", customerID.String,
+					"applied", totalAmount-remaining, "leftover", remaining)
+			}
+		}
+	}
+
+	// =====================================================
+	// COMPLETE the return in one shot — no separate "Process Refund" step.
+	// =====================================================
+	_, err = h.db.Exec(`
+		UPDATE sales_returns
+		SET status = 'completed', refund_status = 'processed', refund_method = COALESCE(refund_method, 'credit_note'),
+		    refund_date = $1, updated_at = $2
+		WHERE id = $3`,
+		now, now, returnID,
+	)
+	if err != nil {
+		h.log.Error("Failed to mark return completed after approval", "error", err)
+	}
+
 	ret, _ := h.getSalesReturnByID(tenantID, returnID)
 	response.Success(c, ret)
 }
