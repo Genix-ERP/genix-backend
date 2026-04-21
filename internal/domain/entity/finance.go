@@ -865,21 +865,47 @@ type IncomeStatementSection struct {
 
 // GeneralLedgerReport represents general ledger data
 type GeneralLedgerReport struct {
-	PeriodFrom string                  `json:"period_from"`
-	PeriodTo   string                  `json:"period_to"`
-	Accounts   []GeneralLedgerAccount  `json:"accounts"`
+	PeriodFrom string                 `json:"period_from"`
+	PeriodTo   string                 `json:"period_to"`
+	Accounts   []GeneralLedgerAccount `json:"accounts"`
+
+	// Report-level totals across every returned account. `closing_debit_total` and
+	// `closing_credit_total` should be equal in a balanced ledger — the frontend
+	// uses the delta as a visual integrity check ("Balance verification OK").
+	TotalOpening       float64 `json:"total_opening"`
+	TotalDebit         float64 `json:"total_debit"`
+	TotalCredit        float64 `json:"total_credit"`
+	ClosingDebitTotal  float64 `json:"closing_debit_total"`
+	ClosingCreditTotal float64 `json:"closing_credit_total"`
 }
 
 // GeneralLedgerAccount represents an account in general ledger
 type GeneralLedgerAccount struct {
-	AccountID      uuid.UUID                `json:"account_id"`
-	AccountCode    string                   `json:"account_code"`
-	AccountName    string                   `json:"account_name"`
-	OpeningBalance float64                  `json:"opening_balance"`
-	TotalDebit     float64                  `json:"total_debit"`
-	TotalCredit    float64                  `json:"total_credit"`
-	ClosingBalance float64                  `json:"closing_balance"`
-	Transactions   []GeneralLedgerTransaction `json:"transactions"`
+	AccountID   uuid.UUID `json:"account_id"`
+	AccountCode string    `json:"account_code"`
+	AccountName string    `json:"account_name"`
+	// Trilingual names (migration 316). Returned alongside `account_name`
+	// so the frontend can pick the right label per user's language —
+	// mirrors the pattern used by Chart of Accounts (handler/finance.go::ListAccounts).
+	AccountNameUz string `json:"account_name_uz"`
+	AccountNameEn string `json:"account_name_en"`
+	AccountNameRu string `json:"account_name_ru"`
+	AccountType   string `json:"account_type"`
+	NormalBalance string `json:"normal_balance"`
+	OpeningBalance float64                    `json:"opening_balance"`
+	TotalDebit     float64                    `json:"total_debit"`
+	TotalCredit    float64                    `json:"total_credit"`
+	ClosingBalance float64                    `json:"closing_balance"`
+	// Closing balance split by side (migration: none — derived from NormalBalance
+	// + ClosingBalance at query time). An account's side is determined by its
+	// type's normal_balance:
+	//   normal_balance='debit'  → ClosingDebit  = max(ClosingBalance, 0); ClosingCredit = abs(min(ClosingBalance, 0))
+	//   normal_balance='credit' → ClosingCredit = max(ClosingBalance, 0); ClosingDebit  = abs(min(ClosingBalance, 0))
+	// Negative balances (unusual) flip to the opposite column so the reader
+	// immediately sees something is off.
+	ClosingDebit  float64                    `json:"closing_debit"`
+	ClosingCredit float64                    `json:"closing_credit"`
+	Transactions  []GeneralLedgerTransaction `json:"transactions"`
 }
 
 // GeneralLedgerTransaction represents a transaction in general ledger
