@@ -611,7 +611,9 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	h.db.QueryRow(`SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`,
 		estimateID, tenantID).Scan(&total)
 
-	// Query paginated rows
+	// Query paginated rows. Parent rows come first (parent_line_id IS NULL),
+	// then sub-lines are ordered by sort_order → subline_seq → id so the
+	// frontend can render them nested without extra work.
 	query := `
 		SELECT l.id, l.tenant_id, l.estimate_id, l.wbs_id,
 		       l.name, l.uom, l.quantity,
@@ -619,13 +621,17 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       l.unit_rate, l.total_amount, l.actual_amount,
 		       COALESCE(l.code, ''), COALESCE(l.item_number, ''),
 		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
+		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
 		WHERE l.estimate_id = $1 AND l.tenant_id = $2
-		ORDER BY l.sort_order ASC, l.id ASC
+		ORDER BY l.sort_order ASC,
+		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
+		         COALESCE(l.subline_seq, 0) ASC,
+		         l.id ASC
 		LIMIT $3 OFFSET $4
 	`
 	rows, err := h.db.Query(query, estimateID, tenantID, pageSize, offset)
@@ -646,6 +652,7 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 			&line.UnitRate, &line.TotalAmount, &line.ActualAmount,
 			&line.Code, &line.ItemNumber,
 			&line.ResourceType, &line.ParentItemNumber,
+			&line.ParentLineID, &line.NormRate, &line.SublineSeq,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
@@ -789,6 +796,87 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		return
 	}
 
+	// ──────────────── Sub-line (подкатор) resolution ────────────────
+	// When the client asked to bind this new line under a parent, fetch the
+	// parent, auto-assign subline_seq + item_number, and re-derive quantity
+	// from parent.quantity × norm_rate. See migration 332.
+	var (
+		parentLineIDSQL   sql.NullInt64
+		parentItemNumber  = req.ParentItemNumber
+		parentQuantity    float64
+		sublineSeq        int
+		assignedItemNum   = req.ItemNumber
+	)
+	if req.ParentLineID > 0 {
+		var pItem, pUom sql.NullString
+		var pQty float64
+		var pEstimateID int64
+		err := h.db.QueryRow(`
+			SELECT estimate_id, COALESCE(item_number, ''), COALESCE(uom, ''), COALESCE(quantity, 0)
+			FROM construction_estimate_line
+			WHERE id = $1 AND tenant_id = $2
+		`, req.ParentLineID, tenantID).Scan(&pEstimateID, &pItem, &pUom, &pQty)
+		if err == sql.ErrNoRows {
+			response.BadRequest(c, "Parent line not found")
+			return
+		}
+		if err != nil {
+			h.log.Error("Failed to load parent estimate line", "error", err)
+			response.InternalError(c, "Failed to load parent line")
+			return
+		}
+		if pEstimateID != estimateID {
+			response.BadRequest(c, "Parent line belongs to a different estimate")
+			return
+		}
+
+		parentLineIDSQL = sql.NullInt64{Int64: req.ParentLineID, Valid: true}
+		parentItemNumber = pItem.String
+		parentQuantity = pQty
+
+		// Auto-assign the next subline_seq for this parent
+		if err := h.db.QueryRow(`
+			SELECT COALESCE(MAX(subline_seq), 0) + 1
+			FROM construction_estimate_line
+			WHERE parent_line_id = $1 AND tenant_id = $2
+		`, req.ParentLineID, tenantID).Scan(&sublineSeq); err != nil {
+			sublineSeq = 1
+		}
+
+		// Compose item_number if the client didn't pin one explicitly.
+		if assignedItemNum == "" && pItem.String != "" {
+			assignedItemNum = fmt.Sprintf("%s-%d", pItem.String, sublineSeq)
+		}
+
+		// Sub-line quantity = parent.quantity × norm_rate, denormalized so
+		// existing reports don't need to know about the sub-line model.
+		if req.NormRate > 0 {
+			req.Quantity = parentQuantity * req.NormRate
+		}
+		// Inherit parent UOM when the client didn't override it.
+		if req.UOM == "" && pUom.String != "" {
+			req.UOM = pUom.String
+		}
+	}
+
+	// UnitPrice convenience: if the caller set it, map it onto the rate column
+	// that matches resource_type. This keeps the existing unit_rate =
+	// material_rate + labor_rate + equipment_rate invariant intact.
+	if req.UnitPrice > 0 {
+		switch strings.ToLower(strings.TrimSpace(req.ResourceType)) {
+		case "equipment", "machine", "mashina", "masina":
+			req.EquipmentRate = req.UnitPrice
+		case "labor", "ish", "ishchi", "worker":
+			req.LaborRate = req.UnitPrice
+		case "material", "materialy", "mat":
+			req.MaterialRate = req.UnitPrice
+		default:
+			// Unknown resource type — default to equipment (machine), since that's
+			// what BHMS breakdowns most often describe.
+			req.EquipmentRate = req.UnitPrice
+		}
+	}
+
 	// Calculate rates
 	unitRate := req.MaterialRate + req.LaborRate + req.EquipmentRate
 	totalAmount := unitRate * req.Quantity
@@ -805,14 +893,18 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 			material_rate, labor_rate, equipment_rate,
 			unit_rate, total_amount, code, item_number,
 			resource_type, parent_item_number, sort_order,
+			parent_line_id, norm_rate, subline_seq,
 			created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+		          $17, $18, $19,
+		          NOW(), NOW())
 		RETURNING id
 	`, tenantID, estimateID, nullInt64FromVal(req.WBSID),
 		req.Name, uom, req.Quantity,
 		req.MaterialRate, req.LaborRate, req.EquipmentRate,
-		unitRate, totalAmount, nullStringFromVal(req.Code), nullStringFromVal(req.ItemNumber),
-		nullStringFromVal(req.ResourceType), nullStringFromVal(req.ParentItemNumber), req.SortOrder,
+		unitRate, totalAmount, nullStringFromVal(req.Code), nullStringFromVal(assignedItemNum),
+		nullStringFromVal(req.ResourceType), nullStringFromVal(parentItemNumber), req.SortOrder,
+		parentLineIDSQL, req.NormRate, sublineSeq,
 	).Scan(&lineID)
 
 	if err != nil {
@@ -825,7 +917,9 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 	h.recalculateEstimateTotals(estimateID)
 
 	response.Success(c, map[string]interface{}{
-		"id": lineID,
+		"id":          lineID,
+		"item_number": assignedItemNum,
+		"subline_seq": sublineSeq,
 	})
 }
 
@@ -1070,11 +1164,61 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 
 	// Only actual_amount can be updated on non-draft estimates
 	isActualAmountOnly := req.ActualAmount != nil && req.WBSID == nil && req.Name == nil && req.UOM == nil &&
-		req.Quantity == nil && req.MaterialRate == nil && req.LaborRate == nil && req.EquipmentRate == nil && req.SortOrder == nil
+		req.Quantity == nil && req.MaterialRate == nil && req.LaborRate == nil && req.EquipmentRate == nil && req.SortOrder == nil &&
+		req.Code == nil && req.ItemNumber == nil && req.ResourceType == nil && req.NormRate == nil && req.UnitPrice == nil
 
 	if state != "draft" && !isActualAmountOnly {
 		response.BadRequest(c, "Only draft estimates can be modified")
 		return
+	}
+
+	// ─── Sub-line handling (migration 332) ───
+	// If this row has a parent and the user edited norm_rate, re-derive its
+	// quantity from parent.quantity × norm_rate. Same logic as create.
+	if req.NormRate != nil {
+		var parentLineID sql.NullInt64
+		var parentQty float64
+		if err := h.db.QueryRow(`
+			SELECT l.parent_line_id, COALESCE(p.quantity, 0)
+			FROM construction_estimate_line l
+			LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
+			WHERE l.id = $1 AND l.tenant_id = $2
+		`, lineID, tenantID).Scan(&parentLineID, &parentQty); err == nil && parentLineID.Valid {
+			derivedQty := parentQty * (*req.NormRate)
+			req.Quantity = &derivedQty
+		}
+	}
+
+	// UnitPrice convenience: route a single edited unit price into the matching
+	// rate column based on resource_type. Does not override rates the user
+	// edited directly in the same request.
+	if req.UnitPrice != nil {
+		var rType sql.NullString
+		if req.ResourceType != nil {
+			rType = sql.NullString{String: *req.ResourceType, Valid: true}
+		} else {
+			h.db.QueryRow(`SELECT COALESCE(resource_type, '') FROM construction_estimate_line WHERE id = $1 AND tenant_id = $2`,
+				lineID, tenantID).Scan(&rType)
+		}
+		up := *req.UnitPrice
+		switch strings.ToLower(strings.TrimSpace(rType.String)) {
+		case "equipment", "machine", "mashina", "masina":
+			if req.EquipmentRate == nil {
+				req.EquipmentRate = &up
+			}
+		case "labor", "ish", "ishchi", "worker":
+			if req.LaborRate == nil {
+				req.LaborRate = &up
+			}
+		case "material", "materialy", "mat":
+			if req.MaterialRate == nil {
+				req.MaterialRate = &up
+			}
+		default:
+			if req.EquipmentRate == nil {
+				req.EquipmentRate = &up
+			}
+		}
 	}
 
 	updates := []string{}
@@ -1129,6 +1273,26 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("actual_amount = $%d", argCount))
 		args = append(args, *req.ActualAmount)
+	}
+	if req.Code != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("code = $%d", argCount))
+		args = append(args, *req.Code)
+	}
+	if req.ItemNumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("item_number = $%d", argCount))
+		args = append(args, *req.ItemNumber)
+	}
+	if req.ResourceType != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("resource_type = $%d", argCount))
+		args = append(args, *req.ResourceType)
+	}
+	if req.NormRate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("norm_rate = $%d", argCount))
+		args = append(args, *req.NormRate)
 	}
 
 	if len(updates) == 0 {
@@ -1469,15 +1633,18 @@ func (h *Handler) DeleteEstimateSummaryBatch(c *gin.Context) {
 // estimate is imported. Lines are pre-filled from the estimate with qty_period = qty_smeta.
 // Returns the created act ID, or 0 if not applicable.
 func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estimateID int64) int64 {
-	// Fetch estimate metadata: source_type, project_id, subcontract_id, name
+	// Fetch estimate metadata: source_type, project_id, subcontract_id, building_id, name
+	// building_id is the per-building scope added in migration 213 — we copy
+	// it to the auto-created Forma 2 so the act belongs to the same building
+	// as the estimate it was derived from.
 	var sourceType, estName string
 	var projectID int64
-	var subcontractID sql.NullInt64
+	var subcontractID, buildingID sql.NullInt64
 	err := h.db.QueryRow(`
-		SELECT COALESCE(source_type, ''), project_id, subcontract_id, COALESCE(name, '')
+		SELECT COALESCE(source_type, ''), project_id, subcontract_id, building_id, COALESCE(name, '')
 		FROM construction_estimate
 		WHERE id = $1 AND tenant_id = $2
-	`, estimateID, tenantID).Scan(&sourceType, &projectID, &subcontractID, &estName)
+	`, estimateID, tenantID).Scan(&sourceType, &projectID, &subcontractID, &buildingID, &estName)
 	if err != nil {
 		h.log.Error("Failed to fetch estimate for auto Forma 2", "error", err, "estimate_id", estimateID)
 		return 0
@@ -1613,22 +1780,29 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 		subcontractIDVal = subcontractID.Int64
 	}
 
+	// Pass through the estimate's building_id so the auto-created Forma 2
+	// belongs to the same building/block as the source estimate.
+	var actBuildingID interface{}
+	if buildingID.Valid {
+		actBuildingID = buildingID.Int64
+	}
+
 	var actID int64
 	err = tx.QueryRow(`
 		INSERT INTO construction_act (
-			tenant_id, project_id, subcontract_id, name, act_type,
+			tenant_id, project_id, subcontract_id, building_id, name, act_type,
 			amount_total, currency, state, notes,
 			created_by, created_date, updated_date,
 			act_number, vat_pct,
 			f2_transport_pct, f2_other_pct
-		) VALUES ($1, $2, $3, $4, 'ks2',
-			0, 'UZS', 'draft', $5,
-			$6, NOW(), NOW(),
-			$7, 12,
+		) VALUES ($1, $2, $3, $4, $5, 'ks2',
+			0, 'UZS', 'draft', $6,
+			$7, NOW(), NOW(),
+			$8, 12,
 			5, 17
 		)
 		RETURNING id
-	`, tenantID, projectID, subcontractIDVal, actName,
+	`, tenantID, projectID, subcontractIDVal, actBuildingID, actName,
 		fmt.Sprintf("Avtomatik yaratildi: %s smetasidan", estName),
 		userID,
 		nullInt64FromVal(int64(actNumber)),

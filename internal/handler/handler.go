@@ -736,6 +736,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		taxReports.POST("/periods/:id/file", h.perm.Require("finance", "tax_report", "file"), h.FileTaxReport)
 		taxReports.DELETE("/periods/:id", h.perm.Require("finance", "tax_report", "delete"), h.DeleteTaxReportPeriod)
 		taxReports.POST("/periods/:id/pay", h.perm.Require("finance", "tax_report", "update"), h.PayTaxPeriod)
+		// Employee-taxes aggregation (migration 330)
+		taxReports.GET("/employee-taxes", h.GetEmployeeTaxReport)
 	}
 
 	// Discounts
@@ -1604,7 +1606,40 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payrollPeriods.POST("/:id/process", h.perm.Require("hr", "payroll", "approve"), h.ProcessPayroll)
 		payrollPeriods.GET("/:id/entries", h.ListPayrollEntries)
 		payrollPeriods.POST("/:id/entries", h.perm.Require("hr", "payroll", "create"), h.CreatePayrollEntry)
+		payrollPeriods.PUT("/:id/entries/:eid", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollEntry)
+		payrollPeriods.GET("/:id/entries/:eid/taxes", h.GetPayrollEntryTaxes)
 		payrollPeriods.POST("/:id/entries/:eid/confirm", h.perm.Require("hr", "payroll", "approve"), h.ConfirmSalaryPaymentByEntry)
+	}
+
+	// ────────────── Employee Taxes (migration 330) ──────────────
+	// Configurable per-tenant catalog of employee taxes. Drives the Settings →
+	// Finance → Employee Taxes UI, the create-payroll modal's tax picker, and
+	// the Tax Reports → Employee Taxes section. Matches the loose auth pattern
+	// of the existing /tax-rates group (auth-only, no extra permission check).
+	employeeTaxes := rg.Group("/employee-taxes")
+	{
+		employeeTaxes.GET("", h.ListEmployeeTaxes)
+		employeeTaxes.POST("", h.CreateEmployeeTax)
+		employeeTaxes.PUT("/:id", h.UpdateEmployeeTax)
+		employeeTaxes.DELETE("/:id", h.DeleteEmployeeTax)
+		employeeTaxes.POST("/preview", h.PreviewPayrollTaxes)
+	}
+
+	// ────────────── TT "Ish haqi" (payroll simple model) ──────────────
+	// Settings, auto-create, mark-paid-with-day, and backup export.
+	// Share the same "hr.payroll" permission with the existing payroll flow.
+	payrollTT := rg.Group("/payroll")
+	payrollTT.Use(h.perm.Require("hr", "payroll", "read"))
+	{
+		payrollTT.GET("/settings", h.GetPayrollSettings)
+		payrollTT.PUT("/settings", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollSettings)
+		payrollTT.POST("/periods/current-or-create",
+			h.perm.Require("hr", "payroll", "create"), h.GetOrCreateCurrentMonthPayroll)
+		payrollTT.POST("/entries/:id/advance-paid",
+			h.perm.Require("hr", "payroll", "update"), h.MarkAdvancePaid)
+		payrollTT.POST("/entries/:id/remainder-paid",
+			h.perm.Require("hr", "payroll", "update"), h.MarkRemainderPaid)
+		payrollTT.GET("/export", h.ExportPayrollBackup)
 	}
 
 	// Employee Loans

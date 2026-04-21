@@ -512,9 +512,16 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 		periodTo = now.Format("2006-01-02")
 	}
 
-	// Get accounts to include
+	// Get accounts to include. We pull `category` and `normal_balance` from
+	// account_types so the UI can render the debit/credit closing columns
+	// without a second round-trip, and so we can split ClosingBalance by side.
+	// Trilingual name columns (migration 316) are returned too so the frontend
+	// can pick the right label per-language — same pattern as ListAccounts.
 	accountQuery := `
-		SELECT a.id, a.code, a.name, a.opening_balance, at.normal_balance
+		SELECT a.id, a.code, a.name,
+		       COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
+		       a.opening_balance,
+		       COALESCE(at.category, ''), COALESCE(at.normal_balance, 'debit')
 		FROM accounts a
 		JOIN account_types at ON a.account_type_id = at.id
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
@@ -548,12 +555,18 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 
 	for accountRows.Next() {
 		var acc entity.GeneralLedgerAccount
-		var normalBalance string
+		var category, normalBalance string
 
-		err := accountRows.Scan(&acc.AccountID, &acc.AccountCode, &acc.AccountName, &acc.OpeningBalance, &normalBalance)
+		err := accountRows.Scan(
+			&acc.AccountID, &acc.AccountCode, &acc.AccountName,
+			&acc.AccountNameUz, &acc.AccountNameEn, &acc.AccountNameRu,
+			&acc.OpeningBalance, &category, &normalBalance,
+		)
 		if err != nil {
 			continue
 		}
+		acc.AccountType = category
+		acc.NormalBalance = normalBalance
 
 		// Get transactions for this account
 		txQuery := `
@@ -612,13 +625,51 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 		acc.TotalCredit = math.Round(acc.TotalCredit*100) / 100
 		acc.ClosingBalance = math.Round(acc.ClosingBalance*100) / 100
 
+		// Split the closing balance by side. `runningBalance` is the signed
+		// balance in the account's "natural" direction (positive = sits on the
+		// normal_balance side). Negative balances flip to the opposite column.
+		switch normalBalance {
+		case "credit":
+			if acc.ClosingBalance >= 0 {
+				acc.ClosingCredit = acc.ClosingBalance
+				acc.ClosingDebit = 0
+			} else {
+				acc.ClosingCredit = 0
+				acc.ClosingDebit = math.Round(-acc.ClosingBalance*100) / 100
+			}
+		default: // "debit"
+			if acc.ClosingBalance >= 0 {
+				acc.ClosingDebit = acc.ClosingBalance
+				acc.ClosingCredit = 0
+			} else {
+				acc.ClosingDebit = 0
+				acc.ClosingCredit = math.Round(-acc.ClosingBalance*100) / 100
+			}
+		}
+
 		accounts = append(accounts, acc)
 	}
 
+	// Report-level totals: frontend uses the debit/credit-closing difference as
+	// a balance-integrity check (shows red ≠ indicator when mismatched).
+	var totalOpening, totalDebit, totalCredit, closingDebit, closingCredit float64
+	for _, a := range accounts {
+		totalOpening += a.OpeningBalance
+		totalDebit += a.TotalDebit
+		totalCredit += a.TotalCredit
+		closingDebit += a.ClosingDebit
+		closingCredit += a.ClosingCredit
+	}
+
 	report := entity.GeneralLedgerReport{
-		PeriodFrom: periodFrom,
-		PeriodTo:   periodTo,
-		Accounts:   accounts,
+		PeriodFrom:         periodFrom,
+		PeriodTo:           periodTo,
+		Accounts:           accounts,
+		TotalOpening:       math.Round(totalOpening*100) / 100,
+		TotalDebit:         math.Round(totalDebit*100) / 100,
+		TotalCredit:        math.Round(totalCredit*100) / 100,
+		ClosingDebitTotal:  math.Round(closingDebit*100) / 100,
+		ClosingCreditTotal: math.Round(closingCredit*100) / 100,
 	}
 
 	response.Success(c, report)
