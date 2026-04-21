@@ -1690,7 +1690,7 @@ func (h *Handler) SendOTP(c *gin.Context) {
 
 	// Send OTP via the appropriate channel
 	if usePhone {
-		smsMessage := fmt.Sprintf("GenixERP: Tasdiqlash kodi: %s. Kod 10 daqiqa amal qiladi.", otpCode)
+		smsMessage := fmt.Sprintf("Genix ERP tasdiqlash kodi: %s. Kodni hech kimga bermang.", otpCode)
 		if err := h.smsService.Send(input.Phone, smsMessage); err != nil {
 			h.log.Error("Failed to send SMS OTP", "error", err, "phone", input.Phone)
 			// Don't fail the request - OTP is stored, dev mode prints code
@@ -2642,7 +2642,7 @@ func (h *Handler) SendPhoneOTP(c *gin.Context) {
 	}
 
 	// Send SMS
-	smsMessage := fmt.Sprintf("GenixERP: Tasdiqlash kodi: %s. Kod 5 daqiqa amal qiladi.", otpCode)
+	smsMessage := fmt.Sprintf("Genix ERP tasdiqlash kodi: %s. Kodni hech kimga bermang.", otpCode)
 	if err := h.smsService.Send(input.Phone, smsMessage); err != nil {
 		h.log.Error("Failed to send SMS OTP", "error", err, "phone", input.Phone)
 		// Don't fail — in dev mode SMS logs to console
