@@ -1862,3 +1862,332 @@ func (h *Handler) GetAccountCard(c *gin.Context) {
 
 	response.Success(c, report)
 }
+
+// =====================================================
+// DIRECTOR DASHBOARD — single-shot cross-company summary
+// Returns aggregated metrics for every organization in the tenant in ONE call,
+// so the frontend doesn't have to fan out N×M requests.
+// =====================================================
+
+type directorCompanySummary struct {
+	ID                string             `json:"id"`
+	Name              string             `json:"name"`
+	Revenue           float64            `json:"revenue"`
+	Expenses          float64            `json:"expenses"`
+	Profit            float64            `json:"profit"`
+	Debtors           float64            `json:"debtors"`
+	Creditors         float64            `json:"creditors"`
+	MonthlyRevenue    []float64          `json:"monthly_revenue"`
+	ExpenseByCategory map[string]float64 `json:"expense_by_category"`
+	StockUnits        float64            `json:"stock_units"`
+	StockValue        float64            `json:"stock_value"`
+	LowStockCount     int                `json:"low_stock_count"`
+	TotalEmployees    int                `json:"total_employees"`
+	ActiveEmployees   int                `json:"active_employees"`
+	SalaryFund        float64            `json:"salary_fund"`
+}
+
+// GetDirectorSummary returns per-organization financial/stock/HR metrics in a single response.
+func (h *Handler) GetDirectorSummary(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Month window: last 6 months (oldest → newest)
+	now := time.Now()
+	type monthBucket struct {
+		year  int
+		month int
+		label string
+	}
+	months := make([]monthBucket, 6)
+	labels := make([]string, 6)
+	for i := 0; i < 6; i++ {
+		d := time.Date(now.Year(), now.Month()-time.Month(5-i), 1, 0, 0, 0, 0, now.Location())
+		months[i] = monthBucket{year: d.Year(), month: int(d.Month()), label: d.Format("Jan")}
+		labels[i] = months[i].label
+	}
+	monthIdx := func(y, m int) int {
+		for i, mb := range months {
+			if mb.year == y && mb.month == m {
+				return i
+			}
+		}
+		return -1
+	}
+
+	// 1. All organizations for this tenant (base skeleton)
+	orgRows, err := h.db.Query(
+		`SELECT id, COALESCE(name, '') FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY name`,
+		tenantID,
+	)
+	if err != nil {
+		h.log.Error("director-summary: org query failed", "error", err)
+		response.InternalError(c, "Failed to load organizations")
+		return
+	}
+	defer orgRows.Close()
+	byOrg := make(map[string]*directorCompanySummary)
+	order := make([]string, 0, 32)
+	for orgRows.Next() {
+		var id uuid.UUID
+		var name string
+		if err := orgRows.Scan(&id, &name); err != nil {
+			continue
+		}
+		idStr := id.String()
+		byOrg[idStr] = &directorCompanySummary{
+			ID:                idStr,
+			Name:              name,
+			MonthlyRevenue:    make([]float64, 6),
+			ExpenseByCategory: map[string]float64{},
+		}
+		order = append(order, idStr)
+	}
+
+	// Ensure a row exists before indexing
+	touch := func(orgID string) *directorCompanySummary {
+		s, ok := byOrg[orgID]
+		if !ok {
+			return nil
+		}
+		return s
+	}
+
+	// 2. Revenue — total + monthly, from sales_invoices (only invoice-type, non-cancelled)
+	revRows, err := h.db.Query(`
+		SELECT organization_id,
+		       DATE_PART('year', invoice_date)::int AS y,
+		       DATE_PART('month', invoice_date)::int AS m,
+		       COALESCE(SUM(total_amount), 0)
+		FROM sales_invoices
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
+		  AND status NOT IN ('cancelled')
+		  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+		GROUP BY organization_id, y, m`,
+		tenantID,
+	)
+	if err == nil {
+		for revRows.Next() {
+			var orgID uuid.UUID
+			var y, m int
+			var amt float64
+			if err := revRows.Scan(&orgID, &y, &m, &amt); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.Revenue += amt
+			if idx := monthIdx(y, m); idx >= 0 {
+				s.MonthlyRevenue[idx] += amt
+			}
+		}
+		revRows.Close()
+	}
+
+	// 3. Expenses — total per org + breakdown-by-category for CURRENT month only
+	//    (the donut on the dashboard shows "this month" breakdown)
+	expRows, err := h.db.Query(`
+		SELECT e.organization_id, COALESCE(e.amount, 0),
+		       COALESCE(ec.name, 'Other') AS category,
+		       DATE_PART('year', e.expense_date)::int AS y,
+		       DATE_PART('month', e.expense_date)::int AS m
+		FROM expenses e
+		LEFT JOIN expense_categories ec ON ec.id = e.category_id
+		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND e.organization_id IS NOT NULL`,
+		tenantID,
+	)
+	if err == nil {
+		curY, curM := now.Year(), int(now.Month())
+		for expRows.Next() {
+			var orgID uuid.UUID
+			var amt float64
+			var cat string
+			var y, m int
+			if err := expRows.Scan(&orgID, &amt, &cat, &y, &m); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.Expenses += amt
+			if y == curY && m == curM {
+				s.ExpenseByCategory[cat] += amt
+			}
+		}
+		expRows.Close()
+	}
+
+	// 4. Debtors / Creditors from contacts.current_balance per org
+	cRows, err := h.db.Query(`
+		SELECT organization_id,
+		       COALESCE(SUM(CASE WHEN current_balance > 0 THEN current_balance ELSE 0 END), 0) AS debtors,
+		       COALESCE(SUM(CASE WHEN current_balance < 0 THEN -current_balance ELSE 0 END), 0) AS creditors
+		FROM contacts
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
+		GROUP BY organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for cRows.Next() {
+			var orgID uuid.UUID
+			var deb, cred float64
+			if err := cRows.Scan(&orgID, &deb, &cred); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.Debtors = deb
+			s.Creditors = cred
+		}
+		cRows.Close()
+	}
+
+	// 5. Inventory — stock units + stock value + low-stock count via warehouse.organization_id
+	invRows, err := h.db.Query(`
+		SELECT w.organization_id,
+		       COALESCE(SUM(i.quantity_on_hand), 0) AS qty,
+		       COALESCE(SUM(i.quantity_on_hand * COALESCE(p.cost_price, i.unit_cost, 0)), 0) AS value,
+		       COUNT(DISTINCT p.id) FILTER (
+		         WHERE COALESCE(p.min_stock_level, 0) > 0
+		           AND i.quantity_on_hand <= COALESCE(p.min_stock_level, 0)
+		       ) AS low_stock
+		FROM inventory i
+		JOIN warehouses w ON w.id = i.warehouse_id
+		LEFT JOIN products p ON p.id = i.product_id
+		WHERE i.tenant_id = $1 AND w.organization_id IS NOT NULL
+		GROUP BY w.organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for invRows.Next() {
+			var orgID uuid.UUID
+			var qty, val float64
+			var low int
+			if err := invRows.Scan(&orgID, &qty, &val, &low); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.StockUnits = qty
+			s.StockValue = val
+			s.LowStockCount = low
+		}
+		invRows.Close()
+	}
+
+	// 6. Employees — total + active + salary fund per org (direct org + many-to-many)
+	//    Union the two sources, then aggregate in Go to avoid double-counting.
+	empRows, err := h.db.Query(`
+		SELECT DISTINCT e.id, COALESCE(org_id, e.organization_id) AS org_id,
+		       COALESCE(e.base_salary, 0),
+		       COALESCE(e.termination_date IS NULL, true) AS is_active
+		FROM employees e
+		LEFT JOIN LATERAL (
+		  SELECT eo.organization_id AS org_id
+		  FROM employee_organizations eo
+		  WHERE eo.employee_id = e.id
+		) eo_link ON true
+		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL
+		  AND COALESCE(eo_link.org_id, e.organization_id) IS NOT NULL`,
+		tenantID,
+	)
+	if err == nil {
+		// employee rows may repeat per-org via the lateral join; that's intentional —
+		// each (emp, org) pair contributes once to that org's counters.
+		type empSeen struct {
+			emp string
+			org string
+		}
+		seen := map[empSeen]bool{}
+		for empRows.Next() {
+			var empID, orgID uuid.UUID
+			var salary float64
+			var active bool
+			if err := empRows.Scan(&empID, &orgID, &salary, &active); err != nil {
+				continue
+			}
+			key := empSeen{emp: empID.String(), org: orgID.String()}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.TotalEmployees++
+			if active {
+				s.ActiveEmployees++
+			}
+			s.SalaryFund += salary
+		}
+		empRows.Close()
+	}
+
+	// Compute profit and round output
+	companies := make([]directorCompanySummary, 0, len(order))
+	round2 := func(v float64) float64 { return math.Round(v*100) / 100 }
+	for _, id := range order {
+		s := byOrg[id]
+		s.Profit = s.Revenue - s.Expenses
+		s.Revenue = round2(s.Revenue)
+		s.Expenses = round2(s.Expenses)
+		s.Profit = round2(s.Profit)
+		s.Debtors = round2(s.Debtors)
+		s.Creditors = round2(s.Creditors)
+		s.StockValue = round2(s.StockValue)
+		s.SalaryFund = round2(s.SalaryFund)
+		for i, v := range s.MonthlyRevenue {
+			s.MonthlyRevenue[i] = round2(v)
+		}
+		for k, v := range s.ExpenseByCategory {
+			s.ExpenseByCategory[k] = round2(v)
+		}
+		companies = append(companies, *s)
+	}
+
+	// Grand totals
+	var totRev, totExp, totDeb, totCred, totStockVal, totSalary float64
+	var totStockUnits float64
+	var totLow, totEmps, totActive int
+	for _, s := range companies {
+		totRev += s.Revenue
+		totExp += s.Expenses
+		totDeb += s.Debtors
+		totCred += s.Creditors
+		totStockVal += s.StockValue
+		totStockUnits += s.StockUnits
+		totLow += s.LowStockCount
+		totEmps += s.TotalEmployees
+		totActive += s.ActiveEmployees
+		totSalary += s.SalaryFund
+	}
+
+	response.Success(c, gin.H{
+		"companies":    companies,
+		"month_labels": labels,
+		"totals": gin.H{
+			"revenue":          round2(totRev),
+			"expenses":         round2(totExp),
+			"profit":           round2(totRev - totExp),
+			"debtors":          round2(totDeb),
+			"creditors":        round2(totCred),
+			"stock_units":      round2(totStockUnits),
+			"stock_value":      round2(totStockVal),
+			"low_stock_count":  totLow,
+			"total_employees":  totEmps,
+			"active_employees": totActive,
+			"salary_fund":      round2(totSalary),
+		},
+	})
+}
