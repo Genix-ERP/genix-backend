@@ -150,6 +150,14 @@ type ConstructionEstimateLine struct {
 	ResourceType     string `json:"resource_type" db:"resource_type"`
 	ParentItemNumber string `json:"parent_item_number" db:"parent_item_number"`
 
+	// Sub-line (подкатор) support — migration 332.
+	// When ParentLineID is set, this row is a resource breakdown of its parent.
+	// NormRate is the ШРНК норма; sub-line quantity is stored as
+	// parent.quantity × NormRate (denormalized on write).
+	ParentLineID sql.NullInt64 `json:"parent_line_id" db:"parent_line_id"`
+	NormRate     float64       `json:"norm_rate" db:"norm_rate"`
+	SublineSeq   int           `json:"subline_seq" db:"subline_seq"`
+
 	SortOrder   int       `json:"sort_order" db:"sort_order"`
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
@@ -174,11 +182,14 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		UnitRate      float64     `json:"unit_rate"`
 		TotalAmount   float64     `json:"total_amount"`
 		ActualAmount  float64     `json:"actual_amount"`
-		Code             string `json:"code"`
-		ItemNumber       string `json:"item_number"`
-		ResourceType     string `json:"resource_type"`
-		ParentItemNumber string `json:"parent_item_number"`
-		SortOrder        int    `json:"sort_order"`
+		Code             string      `json:"code"`
+		ItemNumber       string      `json:"item_number"`
+		ResourceType     string      `json:"resource_type"`
+		ParentItemNumber string      `json:"parent_item_number"`
+		ParentLineID     interface{} `json:"parent_line_id"`
+		NormRate         float64     `json:"norm_rate"`
+		SublineSeq       int         `json:"subline_seq"`
+		SortOrder        int         `json:"sort_order"`
 		CreatedDate   time.Time   `json:"created_date"`
 		UpdatedDate   time.Time   `json:"updated_date"`
 		WBSCode       string      `json:"wbs_code,omitempty"`
@@ -201,6 +212,9 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		ItemNumber:       l.ItemNumber,
 		ResourceType:     l.ResourceType,
 		ParentItemNumber: l.ParentItemNumber,
+		ParentLineID:     nullInt64Value(l.ParentLineID),
+		NormRate:         l.NormRate,
+		SublineSeq:       l.SublineSeq,
 		SortOrder:        l.SortOrder,
 		CreatedDate:   l.CreatedDate,
 		UpdatedDate:   l.UpdatedDate,
@@ -222,6 +236,15 @@ type CreateEstimateLineInput struct {
 	ResourceType     string `json:"resource_type"`
 	ParentItemNumber string `json:"parent_item_number"`
 	SortOrder        int    `json:"sort_order"`
+
+	// Sub-line support (migration 332). When ParentLineID != 0, the server:
+	//   - looks up the parent
+	//   - auto-generates ItemNumber = "{parent.item_number}-{next_subline_seq}"
+	//     if the caller didn't supply one
+	//   - computes Quantity = parent.quantity × NormRate
+	ParentLineID int64   `json:"parent_line_id"`
+	NormRate     float64 `json:"norm_rate"`
+	UnitPrice    float64 `json:"unit_price"` // convenience — mapped to the rate column that matches resource_type
 }
 
 type BulkCreateEstimateLinesInput struct {
@@ -240,6 +263,16 @@ type UpdateEstimateLineInput struct {
 	EquipmentRate *float64 `json:"equipment_rate"`
 	SortOrder     *int     `json:"sort_order"`
 	ActualAmount  *float64 `json:"actual_amount"`
+
+	// Optional edits to line metadata (used by the full edit modal).
+	Code         *string `json:"code"`
+	ItemNumber   *string `json:"item_number"`
+	ResourceType *string `json:"resource_type"`
+
+	// Sub-line fields. When NormRate is supplied for a row that has a parent,
+	// Quantity is re-derived from parent.quantity × NormRate.
+	NormRate  *float64 `json:"norm_rate"`
+	UnitPrice *float64 `json:"unit_price"`
 }
 
 // =====================================================

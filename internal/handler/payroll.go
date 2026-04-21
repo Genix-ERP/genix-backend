@@ -507,9 +507,15 @@ func (h *Handler) ListPayrollEntries(c *gin.Context) {
 	}
 
 	query := `
-		SELECT id, tenant_id, payroll_period_id, employee_id, employee_name, base_salary,
+		SELECT id, tenant_id, payroll_period_id, employee_id, employee_name,
+		       COALESCE(position_snapshot, ''),
+		       base_salary,
 			   overtime_hours, overtime_amount, bonus, allowances, gross_salary, income_tax,
 			   social_security, pension, other_deductions, total_deductions, net_salary,
+			   COALESCE(advance_amount, 0), COALESCE(remainder_amount, 0),
+			   COALESCE(advance_paid, false), advance_paid_day,
+			   COALESCE(remainder_paid, false), remainder_paid_day,
+			   COALESCE(advance_percent_used, 40),
 			   payment_method, bank_account, status, notes, created_at
 		FROM payroll_entries
 		WHERE payroll_period_id = $1 AND tenant_id = $2
@@ -528,13 +534,20 @@ func (h *Handler) ListPayrollEntries(c *gin.Context) {
 	for rows.Next() {
 		var entry entity.PayrollEntry
 		var bankAccount, notes sql.NullString
+		var advanceDay, remainderDay sql.NullInt64
 
 		if err := rows.Scan(
 			&entry.ID, &entry.TenantID, &entry.PayrollPeriodID, &entry.EmployeeID,
-			&entry.EmployeeName, &entry.BaseSalary, &entry.OvertimeHours, &entry.OvertimeAmount,
+			&entry.EmployeeName, &entry.PositionSnapshot,
+			&entry.BaseSalary, &entry.OvertimeHours, &entry.OvertimeAmount,
 			&entry.Bonus, &entry.Allowances, &entry.GrossSalary, &entry.IncomeTax,
 			&entry.SocialSecurity, &entry.Pension, &entry.OtherDeductions, &entry.TotalDeductions,
-			&entry.NetSalary, &entry.PaymentMethod, &bankAccount, &entry.Status, &notes, &entry.CreatedAt,
+			&entry.NetSalary,
+			&entry.AdvanceAmount, &entry.RemainderAmount,
+			&entry.AdvancePaid, &advanceDay,
+			&entry.RemainderPaid, &remainderDay,
+			&entry.AdvancePercentUsed,
+			&entry.PaymentMethod, &bankAccount, &entry.Status, &notes, &entry.CreatedAt,
 		); err != nil {
 			h.log.Error("Failed to scan payroll entry", "error", err)
 			continue
@@ -545,6 +558,14 @@ func (h *Handler) ListPayrollEntries(c *gin.Context) {
 		}
 		if notes.Valid {
 			entry.Notes = &notes.String
+		}
+		if advanceDay.Valid {
+			d := int(advanceDay.Int64)
+			entry.AdvancePaidDay = &d
+		}
+		if remainderDay.Valid {
+			d := int(remainderDay.Int64)
+			entry.RemainderPaidDay = &d
 		}
 
 		entries = append(entries, entry.ToResponse())
@@ -581,17 +602,64 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 		return
 	}
 
-	// Get employee name
-	var employeeName string
-	if err := h.db.QueryRow("SELECT CONCAT(first_name, ' ', last_name) FROM employees WHERE id = $1 AND tenant_id = $2", employeeID, tenantID).Scan(&employeeName); err != nil {
+	// Get employee name + job_title (TT §2.1 snapshot for immutability)
+	var employeeName, positionSnapshot string
+	if err := h.db.QueryRow(
+		`SELECT CONCAT(first_name, ' ', last_name), COALESCE(job_title, '')
+		 FROM employees WHERE id = $1 AND tenant_id = $2`,
+		employeeID, tenantID,
+	).Scan(&employeeName, &positionSnapshot); err != nil {
 		response.BadRequest(c, "Employee not found")
 		return
 	}
 
-	// Calculate gross and net salary
+	// Calculate gross salary
 	grossSalary := input.BaseSalary + input.OvertimeAmount + input.Bonus + input.Allowances
-	totalDeductions := input.IncomeTax + input.SocialSecurity + input.Pension + input.OtherDeductions
+
+	// Compute configurable employee taxes (migration 330). When the tenant has active
+	// employee_taxes configured, those drive income_tax / social_security / pension;
+	// the legacy per-field values from input are ignored. If no active taxes exist,
+	// we fall back to the legacy fields for backward compatibility.
+	appliedTaxes, taxTotals, tErr := h.computeEmployeeTaxesForEntry(
+		tenantID, input.BaseSalary, input.OvertimeAmount, input.Bonus, input.Allowances,
+		input.ExcludedTaxIDs,
+	)
+	if tErr != nil {
+		h.log.Error("Failed to compute employee taxes for payroll entry", "error", tErr)
+	}
+
+	var effectiveIncomeTax, effectiveSocialSecurity, effectivePension float64
+	if len(appliedTaxes) > 0 {
+		// Bucket by code so legacy columns still show sensible values for reports
+		// that haven't yet been migrated to read from payroll_entry_taxes.
+		effectiveIncomeTax, effectiveSocialSecurity, effectivePension = legacyBucketsFromTaxes(appliedTaxes)
+	} else {
+		effectiveIncomeTax = input.IncomeTax
+		effectiveSocialSecurity = input.SocialSecurity
+		effectivePension = input.Pension
+	}
+
+	totalEmployeeTax := taxTotals.Employee
+	if len(appliedTaxes) == 0 {
+		totalEmployeeTax = effectiveIncomeTax + effectiveSocialSecurity + effectivePension
+	}
+	totalDeductions := totalEmployeeTax + input.OtherDeductions
 	netSalary := grossSalary - totalDeductions
+
+	// TT §2.3.2: advance = base_salary × advance_percent / 100 (rounded); remainder = base_salary − advance.
+	// Per-entry override wins; else use tenant payroll_settings.advance_percent; else default 40.
+	advancePct := input.AdvancePercent
+	if advancePct <= 0 || advancePct > 100 {
+		settings, sErr := h.getOrInitPayrollSettings(tenantID)
+		if sErr == nil && settings != nil {
+			advancePct = settings.AdvancePercent
+		}
+	}
+	if advancePct <= 0 || advancePct > 100 {
+		advancePct = 40
+	}
+	advanceAmount := math.Round(input.BaseSalary * advancePct / 100)
+	remainderAmount := input.BaseSalary - advanceAmount
 
 	orgID, _ := middleware.GetOrganizationID(c)
 	userID, _ := middleware.GetUserID(c)
@@ -610,11 +678,16 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 
 	query := `
 		INSERT INTO payroll_entries (
-			id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name, base_salary,
+			id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name,
+			position_snapshot, base_salary,
 			overtime_hours, overtime_amount, bonus, allowances, gross_salary, income_tax,
 			social_security, pension, other_deductions, total_deductions, net_salary,
+			advance_amount, remainder_amount, advance_percent_used, advance_paid, remainder_paid,
 			payment_method, bank_account, status, notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+		          $15, $16, $17, $18, $19,
+		          $20, $21, $22, false, false,
+		          $23, $24, $25, $26, $27, $27)
 		RETURNING id
 	`
 
@@ -627,10 +700,12 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 	}
 
 	if err := h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, payrollPeriodID, employeeID, employeeName, input.BaseSalary,
+		id, tenantID, orgIDPtr, payrollPeriodID, employeeID, employeeName,
+		positionSnapshot, input.BaseSalary,
 		input.OvertimeHours, input.OvertimeAmount, input.Bonus, input.Allowances, grossSalary,
-		input.IncomeTax, input.SocialSecurity, input.Pension, input.OtherDeductions, totalDeductions,
-		netSalary, paymentMethod, bankAccount, "pending", notes, now, now,
+		effectiveIncomeTax, effectiveSocialSecurity, effectivePension, input.OtherDeductions, totalDeductions,
+		netSalary, advanceAmount, remainderAmount, advancePct,
+		paymentMethod, bankAccount, "pending", notes, now,
 	).Scan(&id); err != nil {
 		h.log.Error("Failed to create payroll entry", "error", err)
 		if strings.Contains(err.Error(), "duplicate") {
@@ -639,6 +714,14 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 		}
 		response.InternalError(c, "Failed to create payroll entry")
 		return
+	}
+
+	// Persist the employee-tax snapshot rows for this entry (migration 330).
+	if len(appliedTaxes) > 0 {
+		if err := h.writePayrollEntryTaxes(tenantID, orgIDPtr, id, appliedTaxes); err != nil {
+			h.log.Error("Failed to persist payroll entry taxes", "error", err)
+			// Not fatal — the entry was created. Admin can re-save to retry.
+		}
 	}
 
 	// Process partial deductions if deduction_percent is specified
@@ -706,9 +789,9 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 		Bonus:           input.Bonus,
 		Allowances:      input.Allowances,
 		GrossSalary:     grossSalary,
-		IncomeTax:       input.IncomeTax,
-		SocialSecurity:  input.SocialSecurity,
-		Pension:         input.Pension,
+		IncomeTax:       effectiveIncomeTax,
+		SocialSecurity:  effectiveSocialSecurity,
+		Pension:         effectivePension,
 		OtherDeductions: input.OtherDeductions,
 		TotalDeductions: totalDeductions,
 		NetSalary:       netSalary,
@@ -720,6 +803,29 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 	}
 
 	response.Created(c, entry.ToResponse())
+}
+
+// legacyBucketsFromTaxes distributes the applied employee-paid tax amounts into
+// the legacy (income_tax / social_security / pension) buckets so that older
+// reports and screens that read those columns still show meaningful numbers.
+// Unknown codes fall into income_tax. Employer-paid taxes are NOT bucketed here
+// because they don't reduce the employee's net pay.
+func legacyBucketsFromTaxes(applied []entity.PayrollEntryTax) (income, social, pension float64) {
+	for _, t := range applied {
+		if t.PayerSnapshot != "employee" {
+			continue
+		}
+		code := strings.ToUpper(strings.TrimSpace(t.TaxCodeSnapshot))
+		switch code {
+		case "INPS", "SOC", "SS", "SOCIAL", "SOCIAL_SECURITY":
+			social += t.Amount
+		case "PENSION", "PF", "PENSIYA":
+			pension += t.Amount
+		default:
+			income += t.Amount
+		}
+	}
+	return
 }
 
 // updatePayrollPeriodTotals recalculates and updates period totals
@@ -734,6 +840,292 @@ func (h *Handler) updatePayrollPeriodTotals(periodID, tenantID uuid.UUID) {
 		WHERE id = $1 AND tenant_id = $3
 	`
 	h.db.Exec(query, periodID, time.Now(), tenantID)
+}
+
+// UpdatePayrollEntry updates a single payroll entry for a given period.
+// All numeric fields are pointer-nullable — only provided fields are changed.
+// Gross, total_deductions, net_salary, advance_amount and remainder_amount are
+// recomputed server-side after the overlay. Entries in status 'paid' or 'approved'
+// cannot be edited (TT §2.1 immutability once processed).
+func (h *Handler) UpdatePayrollEntry(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	periodID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid payroll period ID")
+		return
+	}
+	entryID, err := uuid.Parse(c.Param("eid"))
+	if err != nil {
+		response.BadRequest(c, "Invalid payroll entry ID")
+		return
+	}
+
+	var input entity.UpdatePayrollEntryInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		h.log.Error("Invalid update payroll entry input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	// Load existing entry
+	var (
+		curBaseSalary, curOvertimeHours, curOvertimeAmount, curBonus, curAllowances float64
+		curIncomeTax, curSocialSecurity, curPension, curOtherDeductions             float64
+		curAdvancePercentUsed                                                       float64
+		curPaymentMethod, curStatus                                                 string
+		curBankAccount, curNotes                                                    sql.NullString
+	)
+	err = h.db.QueryRow(`
+		SELECT base_salary, overtime_hours, overtime_amount, bonus, allowances,
+		       income_tax, social_security, pension, other_deductions,
+		       COALESCE(advance_percent_used, 40),
+		       payment_method, status, bank_account, notes
+		FROM payroll_entries
+		WHERE id = $1 AND payroll_period_id = $2 AND tenant_id = $3
+	`, entryID, periodID, tenantID).Scan(
+		&curBaseSalary, &curOvertimeHours, &curOvertimeAmount, &curBonus, &curAllowances,
+		&curIncomeTax, &curSocialSecurity, &curPension, &curOtherDeductions,
+		&curAdvancePercentUsed,
+		&curPaymentMethod, &curStatus, &curBankAccount, &curNotes,
+	)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Payroll entry not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to load payroll entry", "error", err)
+		response.InternalError(c, "Failed to load payroll entry")
+		return
+	}
+
+	// Block edits on entries that have already been processed
+	if curStatus == "paid" || curStatus == "approved" {
+		response.BadRequest(c, "Cannot edit a payroll entry that has already been approved or paid")
+		return
+	}
+
+	// Overlay provided fields
+	if input.BaseSalary != nil {
+		curBaseSalary = *input.BaseSalary
+	}
+	if input.OvertimeHours != nil {
+		curOvertimeHours = *input.OvertimeHours
+	}
+	if input.OvertimeAmount != nil {
+		curOvertimeAmount = *input.OvertimeAmount
+	}
+	if input.Bonus != nil {
+		curBonus = *input.Bonus
+	}
+	if input.Allowances != nil {
+		curAllowances = *input.Allowances
+	}
+	if input.IncomeTax != nil {
+		curIncomeTax = *input.IncomeTax
+	}
+	if input.SocialSecurity != nil {
+		curSocialSecurity = *input.SocialSecurity
+	}
+	if input.Pension != nil {
+		curPension = *input.Pension
+	}
+	if input.OtherDeductions != nil {
+		curOtherDeductions = *input.OtherDeductions
+	}
+	if input.PaymentMethod != nil && *input.PaymentMethod != "" {
+		curPaymentMethod = *input.PaymentMethod
+	}
+	if input.Status != nil && *input.Status != "" {
+		curStatus = *input.Status
+	}
+	if input.BankAccount != nil {
+		if *input.BankAccount == "" {
+			curBankAccount = sql.NullString{Valid: false}
+		} else {
+			curBankAccount = sql.NullString{String: *input.BankAccount, Valid: true}
+		}
+	}
+	if input.Notes != nil {
+		if *input.Notes == "" {
+			curNotes = sql.NullString{Valid: false}
+		} else {
+			curNotes = sql.NullString{String: *input.Notes, Valid: true}
+		}
+	}
+
+	// Recompute derivatives — prefer the new employee-tax catalog when it's
+	// populated for this tenant. When the client has supplied a new exclusion
+	// list, rebuild the snapshot rows. Otherwise replay the same catalog but
+	// keep the previously-excluded taxes excluded.
+	grossSalary := curBaseSalary + curOvertimeAmount + curBonus + curAllowances
+
+	var excluded []uuid.UUID
+	if input.ExcludedTaxIDs != nil {
+		excluded = *input.ExcludedTaxIDs
+	} else {
+		// Replay previous selection: compute the complement of what's currently stored.
+		if existing, _ := h.listPayrollEntryTaxes(tenantID, entryID); len(existing) > 0 {
+			applied := make(map[uuid.UUID]bool, len(existing))
+			for _, r := range existing {
+				if r.TaxID != nil {
+					applied[*r.TaxID] = true
+				}
+			}
+			catalog, _ := h.listActiveEmployeeTaxesForTenant(tenantID)
+			for _, t := range catalog {
+				if !applied[t.ID] {
+					excluded = append(excluded, t.ID)
+				}
+			}
+		}
+	}
+
+	appliedTaxes, taxTotals, tErr := h.computeEmployeeTaxesForEntry(
+		tenantID, curBaseSalary, curOvertimeAmount, curBonus, curAllowances, excluded,
+	)
+	if tErr != nil {
+		h.log.Error("Failed to compute employee taxes in update", "error", tErr)
+	}
+
+	if len(appliedTaxes) > 0 {
+		curIncomeTax, curSocialSecurity, curPension = legacyBucketsFromTaxes(appliedTaxes)
+	}
+
+	totalDeductions := curIncomeTax + curSocialSecurity + curPension + curOtherDeductions
+	if len(appliedTaxes) > 0 {
+		totalDeductions = taxTotals.Employee + curOtherDeductions
+	}
+	netSalary := grossSalary - totalDeductions
+	advancePct := curAdvancePercentUsed
+	if advancePct <= 0 || advancePct > 100 {
+		advancePct = 40
+	}
+	advanceAmount := math.Round(curBaseSalary * advancePct / 100)
+	remainderAmount := curBaseSalary - advanceAmount
+
+	now := time.Now()
+	var bankPtr, notesPtr interface{}
+	if curBankAccount.Valid {
+		bankPtr = curBankAccount.String
+	} else {
+		bankPtr = nil
+	}
+	if curNotes.Valid {
+		notesPtr = curNotes.String
+	} else {
+		notesPtr = nil
+	}
+
+	_, err = h.db.Exec(`
+		UPDATE payroll_entries SET
+			base_salary = $1,
+			overtime_hours = $2,
+			overtime_amount = $3,
+			bonus = $4,
+			allowances = $5,
+			gross_salary = $6,
+			income_tax = $7,
+			social_security = $8,
+			pension = $9,
+			other_deductions = $10,
+			total_deductions = $11,
+			net_salary = $12,
+			advance_amount = $13,
+			remainder_amount = $14,
+			payment_method = $15,
+			status = $16,
+			bank_account = $17,
+			notes = $18,
+			updated_at = $19
+		WHERE id = $20 AND payroll_period_id = $21 AND tenant_id = $22
+	`,
+		curBaseSalary, curOvertimeHours, curOvertimeAmount, curBonus, curAllowances,
+		grossSalary,
+		curIncomeTax, curSocialSecurity, curPension, curOtherDeductions, totalDeductions,
+		netSalary,
+		advanceAmount, remainderAmount,
+		curPaymentMethod, curStatus, bankPtr, notesPtr, now,
+		entryID, periodID, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to update payroll entry", "error", err)
+		response.InternalError(c, "Failed to update payroll entry")
+		return
+	}
+
+	// Rewrite the employee-tax snapshot for this entry based on the newly-computed
+	// applied list. When the tenant has no active employee_taxes, `appliedTaxes` is
+	// empty and we simply clear any stale rows.
+	{
+		orgID, _ := middleware.GetOrganizationID(c)
+		var orgIDPtr *uuid.UUID
+		if orgID != uuid.Nil {
+			orgIDPtr = &orgID
+		}
+		if err := h.writePayrollEntryTaxes(tenantID, orgIDPtr, entryID, appliedTaxes); err != nil {
+			h.log.Error("Failed to persist payroll entry taxes", "error", err)
+		}
+	}
+
+	// Recalc period totals
+	h.updatePayrollPeriodTotals(periodID, tenantID)
+
+	// Re-read full row and return a response
+	var entry entity.PayrollEntry
+	var bankAccount, notes sql.NullString
+	var advanceDay, remainderDay sql.NullInt64
+	if err := h.db.QueryRow(`
+		SELECT id, tenant_id, payroll_period_id, employee_id, employee_name,
+		       COALESCE(position_snapshot, ''),
+		       base_salary, overtime_hours, overtime_amount, bonus, allowances,
+		       gross_salary, income_tax, social_security, pension, other_deductions,
+		       total_deductions, net_salary,
+		       COALESCE(advance_amount, 0), COALESCE(remainder_amount, 0),
+		       COALESCE(advance_paid, false), advance_paid_day,
+		       COALESCE(remainder_paid, false), remainder_paid_day,
+		       COALESCE(advance_percent_used, 40),
+		       payment_method, bank_account, status, notes, created_at
+		FROM payroll_entries
+		WHERE id = $1 AND tenant_id = $2
+	`, entryID, tenantID).Scan(
+		&entry.ID, &entry.TenantID, &entry.PayrollPeriodID, &entry.EmployeeID,
+		&entry.EmployeeName, &entry.PositionSnapshot,
+		&entry.BaseSalary, &entry.OvertimeHours, &entry.OvertimeAmount,
+		&entry.Bonus, &entry.Allowances, &entry.GrossSalary, &entry.IncomeTax,
+		&entry.SocialSecurity, &entry.Pension, &entry.OtherDeductions, &entry.TotalDeductions,
+		&entry.NetSalary,
+		&entry.AdvanceAmount, &entry.RemainderAmount,
+		&entry.AdvancePaid, &advanceDay,
+		&entry.RemainderPaid, &remainderDay,
+		&entry.AdvancePercentUsed,
+		&entry.PaymentMethod, &bankAccount, &entry.Status, &notes, &entry.CreatedAt,
+	); err != nil {
+		h.log.Error("Failed to re-read payroll entry after update", "error", err)
+		response.InternalError(c, "Failed to load updated payroll entry")
+		return
+	}
+
+	if bankAccount.Valid {
+		entry.BankAccount = &bankAccount.String
+	}
+	if notes.Valid {
+		entry.Notes = &notes.String
+	}
+	if advanceDay.Valid {
+		d := int(advanceDay.Int64)
+		entry.AdvancePaidDay = &d
+	}
+	if remainderDay.Valid {
+		d := int(remainderDay.Int64)
+		entry.RemainderPaidDay = &d
+	}
+
+	response.Success(c, entry.ToResponse())
 }
 
 // ProcessPayroll processes payroll for a period (approves all entries)
@@ -834,38 +1226,144 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 			return
 		}
 
+		// Aggregate employee-tax amounts by account (migration 330). When the period
+		// has configured taxes, we split the credit side of the journal into:
+		//   Cr Wages Payable  = Net pay actually paid to employees
+		//   Cr Tax Liability  = Per-tax credit to the configured liability account
+		//   Dr Tax Expense    = Per-tax debit for employer-paid taxes (adds to total debit)
+		type acctBucket struct {
+			amount      float64
+			description string
+		}
+		taxLiabilityByAcct := map[uuid.UUID]*acctBucket{} // Cr (both employee and employer taxes land here)
+		taxExpenseByAcct := map[uuid.UUID]*acctBucket{}   // Dr (employer-paid only)
+		totalEmployeeTaxWithdrawn := 0.0                  // reduces Wages Payable
+		totalEmployerTaxExpense := 0.0                    // adds to total_debit / total_credit
+
+		taxRows, _ := h.db.Query(`
+			SELECT
+				pet.payer_snapshot,
+				pet.amount,
+				pet.account_id_snapshot,
+				pet.expense_account_id_snapshot,
+				pet.tax_code_snapshot,
+				pet.tax_name_snapshot
+			FROM payroll_entry_taxes pet
+			JOIN payroll_entries pe ON pe.id = pet.payroll_entry_id
+			WHERE pe.payroll_period_id = $1 AND pet.tenant_id = $2
+		`, id, tenantID)
+		if taxRows != nil {
+			for taxRows.Next() {
+				var payer, taxCode, taxName string
+				var amount float64
+				var acctID, expAcctID sql.NullString
+				if err := taxRows.Scan(&payer, &amount, &acctID, &expAcctID, &taxCode, &taxName); err != nil {
+					continue
+				}
+				if amount <= 0 {
+					continue
+				}
+				// Credit side — tax liability account (always required)
+				if acctID.Valid {
+					if u, perr := uuid.Parse(acctID.String); perr == nil {
+						b := taxLiabilityByAcct[u]
+						if b == nil {
+							b = &acctBucket{description: fmt.Sprintf("Tax liability: %s", taxName)}
+							taxLiabilityByAcct[u] = b
+						}
+						b.amount += amount
+					}
+				}
+				if payer == "employer" {
+					totalEmployerTaxExpense += amount
+					if expAcctID.Valid {
+						if u, perr := uuid.Parse(expAcctID.String); perr == nil {
+							b := taxExpenseByAcct[u]
+							if b == nil {
+								b = &acctBucket{description: fmt.Sprintf("Tax expense: %s", taxName)}
+								taxExpenseByAcct[u] = b
+							}
+							b.amount += amount
+						}
+					}
+				} else {
+					totalEmployeeTaxWithdrawn += amount
+				}
+				_ = taxCode
+			}
+			taxRows.Close()
+		}
+
+		// Debit totals = gross salary (to salary expense) + employer-paid tax expenses
+		// Credit totals = wages payable (net) + tax liability credits
+		totalDebit := totalGross + totalEmployerTaxExpense
+		totalCredit := totalDebit // balanced by construction
+
 		_, err = h.db.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'payroll', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'payroll', $9, 1.0, $10, $11, 'posted', $12, $13, $13)`,
 			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, now, periodName, description,
-			id.String(), totalGross, userID, now,
+			id.String(), totalDebit, totalCredit, userID, now,
 		)
 		if err != nil {
 			h.log.Error("Failed to create payroll journal entry", "error", err)
 			return
 		}
 
-		// Debit: Salary Expense
+		lineNo := 1
+
+		// Dr: Salary Expense
 		h.db.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
-			) VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
-			uuid.New(), journalEntryID, salaryAcct, "Salary Expense", totalGross, now,
+			) VALUES ($1, $2, $3, $4, $5, $6, 0, 1.0, $7)`,
+			uuid.New(), journalEntryID, lineNo, salaryAcct, "Salary Expense", totalGross, now,
 		)
 		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalGross, now, salaryAcct)
+		lineNo++
 
-		// Credit: Wages Payable
-		h.db.Exec(`
-			INSERT INTO journal_entry_lines (
-				id, journal_entry_id, line_number, account_id, description,
-				debit_amount, credit_amount, exchange_rate, created_at
-			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
-			uuid.New(), journalEntryID, payableAcct, "Wages Payable", totalGross, now,
-		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalGross, now, payableAcct)
+		// Dr: Employer tax expense(s)
+		for acctID, b := range taxExpenseByAcct {
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, 0, 1.0, $7)`,
+				uuid.New(), journalEntryID, lineNo, acctID, b.description, b.amount, now,
+			)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", b.amount, now, acctID)
+			lineNo++
+		}
+
+		// Cr: Wages Payable (net pay to employees, after employee-paid taxes withheld)
+		netPayable := totalGross - totalEmployeeTaxWithdrawn
+		if netPayable > 0 {
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, 0, $6, 1.0, $7)`,
+				uuid.New(), journalEntryID, lineNo, payableAcct, "Wages Payable", netPayable, now,
+			)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", netPayable, now, payableAcct)
+			lineNo++
+		}
+
+		// Cr: Tax Liability account(s) — one line per distinct liability account
+		for acctID, b := range taxLiabilityByAcct {
+			h.db.Exec(`
+				INSERT INTO journal_entry_lines (
+					id, journal_entry_id, line_number, account_id, description,
+					debit_amount, credit_amount, exchange_rate, created_at
+				) VALUES ($1, $2, $3, $4, $5, 0, $6, 1.0, $7)`,
+				uuid.New(), journalEntryID, lineNo, acctID, b.description, b.amount, now,
+			)
+			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", b.amount, now, acctID)
+			lineNo++
+		}
 
 		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
 	}()

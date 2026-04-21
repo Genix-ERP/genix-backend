@@ -26,8 +26,8 @@ var defaultActTypes = []struct {
 }{
 	{"acceptance", "Qabul qilish", "bg-green-100 text-green-700", 1},
 	{"defect", "Nuqson", "bg-red-100 text-red-700", 2},
-	{"ks2", "KS-2", "bg-blue-100 text-blue-700", 3},
-	{"ks3", "KS-3", "bg-purple-100 text-purple-700", 4},
+	{"ks2", "Forma 2", "bg-blue-100 text-blue-700", 3},
+	{"ks3", "Forma 3", "bg-purple-100 text-purple-700", 4},
 	{"hidden_work", "Yashirin ish", "bg-amber-100 text-amber-700", 5},
 }
 
