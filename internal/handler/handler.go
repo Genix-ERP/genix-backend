@@ -1407,6 +1407,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	reports := rg.Group("/reports")
 	// sales-summary is accessible to sales users, not just finance
 	reports.GET("/sales-summary", h.perm.Require("sales", "order", "read"), h.GetSalesSummary)
+	// director-summary aggregates cross-org metrics in one call for the Director Dashboard.
+	// No extra permission beyond auth — the dashboard itself is gated by the installable app on the frontend.
+	reports.GET("/director-summary", h.GetDirectorSummary)
 	reports.Use(h.perm.Require("finance", "report", "read"))
 	{
 		reports.GET("/balance-sheet", h.GetBalanceSheet)
