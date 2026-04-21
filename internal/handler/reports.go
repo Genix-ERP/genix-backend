@@ -3,6 +3,7 @@ package handler
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"time"
 
@@ -1042,18 +1043,104 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		}
 	}
 
-	// Remove contacts with zero or negative net balance (fully paid)
-	for id, contact := range contactMap {
-		if contact.TotalAmount <= 0 {
-			// Subtract their bucket amounts from totals
-			currentTotal -= contact.Current
-			days1To30 -= contact.Days1To30
-			days31To60 -= contact.Days31To60
-			days61To90 -= contact.Days61To90
-			over90Days -= contact.Over90Days
-			totalAmount -= contact.TotalAmount
-			delete(contactMap, id)
+	// ── Step 4: FIFO-apply credits (payments + credit notes) against oldest invoices ──
+	// Credits consume the oldest invoices first (FIFO). Once a credit is consumed, its
+	// amount_due is zeroed so line items and bucket totals stay consistent on the UI.
+	// Leftover credit (if credits exceed invoices) shows as a negative in "Not Due".
+	totalAmount = 0
+	currentTotal = 0
+	days1To30 = 0
+	days31To60 = 0
+	days61To90 = 0
+	over90Days = 0
+
+	for _, contact := range contactMap {
+		var creditIdx, invoiceIdx []int
+		for i := range contact.Invoices {
+			if contact.Invoices[i].TotalAmount < 0 {
+				creditIdx = append(creditIdx, i)
+			} else {
+				invoiceIdx = append(invoiceIdx, i)
+			}
 		}
+
+		// Sort both oldest-first by date
+		sort.SliceStable(invoiceIdx, func(a, b int) bool {
+			return contact.Invoices[invoiceIdx[a]].DueDate < contact.Invoices[invoiceIdx[b]].DueDate
+		})
+		sort.SliceStable(creditIdx, func(a, b int) bool {
+			return contact.Invoices[creditIdx[a]].DueDate < contact.Invoices[creditIdx[b]].DueDate
+		})
+
+		var totalCredits float64
+		for _, ci := range creditIdx {
+			totalCredits += -contact.Invoices[ci].TotalAmount
+		}
+
+		// Reset per-contact bucket accumulators; rebuild from post-FIFO amount_due
+		contact.Current = 0
+		contact.Days1To30 = 0
+		contact.Days31To60 = 0
+		contact.Days61To90 = 0
+		contact.Over90Days = 0
+		contact.TotalAmount = 0
+
+		// Apply credits FIFO against invoices, reducing each invoice's amount_due
+		remaining := totalCredits
+		for _, ii := range invoiceIdx {
+			inv := &contact.Invoices[ii]
+			applied := math.Min(remaining, inv.TotalAmount)
+			inv.AmountDue = inv.TotalAmount - applied
+			remaining -= applied
+
+			switch inv.AgingBucket {
+			case "current":
+				contact.Current += inv.AmountDue
+			case "1-30":
+				contact.Days1To30 += inv.AmountDue
+			case "31-60":
+				contact.Days31To60 += inv.AmountDue
+			case "61-90":
+				contact.Days61To90 += inv.AmountDue
+			case "90+":
+				contact.Over90Days += inv.AmountDue
+			}
+			contact.TotalAmount += inv.AmountDue
+		}
+
+		// Mirror consumption back onto credit line items so UI stays consistent:
+		// consumed credits get amount_due=0; unconsumed (overpayment) retain negative amount_due
+		appliedCredit := totalCredits - remaining
+		for _, ci := range creditIdx {
+			credit := &contact.Invoices[ci]
+			creditAmount := -credit.TotalAmount
+			switch {
+			case appliedCredit >= creditAmount:
+				credit.AmountDue = 0
+				appliedCredit -= creditAmount
+			case appliedCredit > 0:
+				credit.AmountDue = -(creditAmount - appliedCredit)
+				appliedCredit = 0
+			default:
+				credit.AmountDue = credit.TotalAmount
+			}
+			contact.Current += credit.AmountDue
+			contact.TotalAmount += credit.AmountDue
+		}
+	}
+
+	// Drop fully-settled contacts, then accumulate grand totals
+	for id, contact := range contactMap {
+		if math.Abs(contact.TotalAmount) < 0.005 {
+			delete(contactMap, id)
+			continue
+		}
+		currentTotal += contact.Current
+		days1To30 += contact.Days1To30
+		days31To60 += contact.Days31To60
+		days61To90 += contact.Days61To90
+		over90Days += contact.Over90Days
+		totalAmount += contact.TotalAmount
 	}
 
 	// Convert map to slice
@@ -1253,17 +1340,95 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		}
 	}
 
-	// Remove contacts with zero or negative net balance (fully paid)
-	for id, contact := range contactMap {
-		if contact.TotalAmount <= 0 {
-			currentTotal -= contact.Current
-			days1To30 -= contact.Days1To30
-			days31To60 -= contact.Days31To60
-			days61To90 -= contact.Days61To90
-			over90Days -= contact.Over90Days
-			totalAmount -= contact.TotalAmount
-			delete(contactMap, id)
+	// ── Step 3: FIFO-apply vendor payments against oldest vendor invoices ──
+	totalAmount = 0
+	currentTotal = 0
+	days1To30 = 0
+	days31To60 = 0
+	days61To90 = 0
+	over90Days = 0
+
+	for _, contact := range contactMap {
+		var creditIdx, invoiceIdx []int
+		for i := range contact.Invoices {
+			if contact.Invoices[i].TotalAmount < 0 {
+				creditIdx = append(creditIdx, i)
+			} else {
+				invoiceIdx = append(invoiceIdx, i)
+			}
 		}
+
+		sort.SliceStable(invoiceIdx, func(a, b int) bool {
+			return contact.Invoices[invoiceIdx[a]].DueDate < contact.Invoices[invoiceIdx[b]].DueDate
+		})
+		sort.SliceStable(creditIdx, func(a, b int) bool {
+			return contact.Invoices[creditIdx[a]].DueDate < contact.Invoices[creditIdx[b]].DueDate
+		})
+
+		var totalCredits float64
+		for _, ci := range creditIdx {
+			totalCredits += -contact.Invoices[ci].TotalAmount
+		}
+
+		contact.Current = 0
+		contact.Days1To30 = 0
+		contact.Days31To60 = 0
+		contact.Days61To90 = 0
+		contact.Over90Days = 0
+		contact.TotalAmount = 0
+
+		remaining := totalCredits
+		for _, ii := range invoiceIdx {
+			inv := &contact.Invoices[ii]
+			applied := math.Min(remaining, inv.TotalAmount)
+			inv.AmountDue = inv.TotalAmount - applied
+			remaining -= applied
+
+			switch inv.AgingBucket {
+			case "current":
+				contact.Current += inv.AmountDue
+			case "1-30":
+				contact.Days1To30 += inv.AmountDue
+			case "31-60":
+				contact.Days31To60 += inv.AmountDue
+			case "61-90":
+				contact.Days61To90 += inv.AmountDue
+			case "90+":
+				contact.Over90Days += inv.AmountDue
+			}
+			contact.TotalAmount += inv.AmountDue
+		}
+
+		appliedCredit := totalCredits - remaining
+		for _, ci := range creditIdx {
+			credit := &contact.Invoices[ci]
+			creditAmount := -credit.TotalAmount
+			switch {
+			case appliedCredit >= creditAmount:
+				credit.AmountDue = 0
+				appliedCredit -= creditAmount
+			case appliedCredit > 0:
+				credit.AmountDue = -(creditAmount - appliedCredit)
+				appliedCredit = 0
+			default:
+				credit.AmountDue = credit.TotalAmount
+			}
+			contact.Current += credit.AmountDue
+			contact.TotalAmount += credit.AmountDue
+		}
+	}
+
+	for id, contact := range contactMap {
+		if math.Abs(contact.TotalAmount) < 0.005 {
+			delete(contactMap, id)
+			continue
+		}
+		currentTotal += contact.Current
+		days1To30 += contact.Days1To30
+		days31To60 += contact.Days31To60
+		days61To90 += contact.Days61To90
+		over90Days += contact.Over90Days
+		totalAmount += contact.TotalAmount
 	}
 
 	contacts := make([]entity.AgingContact, 0, len(contactMap))
