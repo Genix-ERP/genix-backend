@@ -225,7 +225,9 @@ type CreateEstimateLineInput struct {
 }
 
 type BulkCreateEstimateLinesInput struct {
-	Lines []CreateEstimateLineInput `json:"lines" binding:"required"`
+	Lines      []CreateEstimateLineInput `json:"lines" binding:"required"`
+	Replace    bool                      `json:"replace"`
+	SourceType string                    `json:"source_type"`
 }
 
 type UpdateEstimateLineInput struct {

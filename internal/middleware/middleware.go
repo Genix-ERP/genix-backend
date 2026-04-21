@@ -93,6 +93,9 @@ func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 		}
 	}
 
+	// Log configured origins on startup for debugging
+	fmt.Printf("[CORS] Allowed origins: %v\n", cfg.AllowedOrigins)
+
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
 
@@ -103,6 +106,10 @@ func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 				allowed = true
 				break
 			}
+		}
+
+		if !allowed && origin != "" {
+			fmt.Printf("[CORS] Rejected origin: %q for %s %s\n", origin, c.Request.Method, c.Request.URL.Path)
 		}
 
 		if allowed {
@@ -536,7 +543,8 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"construction":  {"organization:organization", "hr:employee", "inventory:product", "inventory:warehouse"},
 		"assets":        {"finance:asset", "finance:report"},
 		"expenses":      {"finance:expense", "finance:report"},
-		"payroll":       {"hr:employee"},
+		"payroll":       {"hr:employee", "hr:payroll"},
+		"contracts":     {"purchase:contract", "purchase:order"},
 	}
 
 	for empRows.Next() {
@@ -567,17 +575,32 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 				perms[moduleID+":"+res+":transfer"] = true
 				perms[moduleID+":"+res+":approve"] = true
 				perms[moduleID+":"+res+":confirm"] = true
+				perms[moduleID+":"+res+":post"] = true
 			}
 			if canDelete {
 				perms[moduleID+":"+res+":delete"] = true
 			}
 		}
 
-		// Grant cross-module dependencies (e.g. HR needs organization:department:read)
-		if grants, ok := crossModuleGrants[moduleID]; ok && canRead {
+		// Grant cross-module dependencies (e.g. HR needs organization:department access)
+		if grants, ok := crossModuleGrants[moduleID]; ok {
 			for _, grant := range grants {
-				perms[grant+":read"] = true
-				perms[grant+":manage"] = true // warehouse listing requires manage
+				if canRead {
+					perms[grant+":read"] = true
+					perms[grant+":manage"] = true
+				}
+				if canCreate {
+					perms[grant+":create"] = true
+				}
+				if canUpdate {
+					perms[grant+":update"] = true
+					perms[grant+":manage"] = true
+					perms[grant+":approve"] = true
+					perms[grant+":confirm"] = true
+				}
+				if canDelete {
+					perms[grant+":delete"] = true
+				}
 			}
 		}
 	}

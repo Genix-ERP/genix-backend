@@ -23,6 +23,7 @@ type AdminSettingsResponse struct {
 	HR            map[string]interface{} `json:"hr"`
 	Finance       map[string]interface{} `json:"finance"`
 	Projects      map[string]interface{} `json:"projects"`
+	Construction  map[string]interface{} `json:"construction"`
 	UpdatedAt     *time.Time             `json:"updated_at,omitempty"`
 	UpdatedBy     *uuid.UUID             `json:"updated_by,omitempty"`
 }
@@ -153,6 +154,12 @@ func getDefaultAdminSettings() AdminSettingsResponse {
 			},
 			"timesheet": map[string]interface{}{
 				"approval_required": true,
+			},
+		},
+		Construction: map[string]interface{}{
+			"material_approval": map[string]interface{}{
+				"approver_user_id": "",
+				"require_approval": true,
 			},
 		},
 	}
@@ -603,6 +610,21 @@ func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike str
 	return id
 }
 
+// getContactDefaultAccount returns the contact's default receivable or payable account.
+// accountType should be "receivable" or "payable".
+func getContactDefaultAccount(q dbQuerier, contactID uuid.UUID, accountType string) uuid.UUID {
+	var id uuid.UUID
+	col := "default_receivable_account_id"
+	if accountType == "payable" {
+		col = "default_payable_account_id"
+	}
+	_ = q.QueryRow(
+		fmt.Sprintf(`SELECT %s FROM contacts WHERE id = $1 AND %s IS NOT NULL AND deleted_at IS NULL`, col, col),
+		contactID,
+	).Scan(&id)
+	return id
+}
+
 // CategoryAccounts holds the GL accounts configured on a product category (Odoo-style).
 type CategoryAccounts struct {
 	IncomeAccountID         uuid.UUID
@@ -631,27 +653,27 @@ func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, prod
 
 	// Fallbacks if category accounts not set
 	if ca.IncomeAccountID == uuid.Nil {
-		ca.IncomeAccountID = findAccount(q, tenantID, orgID, "sales revenue", "4000")
+		ca.IncomeAccountID = findAccount(q, tenantID, orgID, "sales revenue", "9010")
 	}
 	if ca.ExpenseAccountID == uuid.Nil {
-		ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cost of goods", "5000")
+		ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cost of goods", "9110")
 		if ca.ExpenseAccountID == uuid.Nil {
-			ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cogs", "5000")
+			ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cogs", "9110")
 		}
 	}
 	if ca.StockValuationAccountID == uuid.Nil {
-		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1300")
+		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1010")
 	}
 	if ca.StockInputAccountID == uuid.Nil {
-		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2230")
+		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "6015")
 		if ca.StockInputAccountID == uuid.Nil {
-			ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2200")
+			ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "6015")
 		}
 	}
 	if ca.StockOutputAccountID == uuid.Nil {
-		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2231")
+		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "6016")
 		if ca.StockOutputAccountID == uuid.Nil {
-			ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2201")
+			ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "6016")
 		}
 	}
 	return ca
@@ -668,14 +690,14 @@ func getInventoryAccountByType(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID
 
 	switch inventoryType {
 	case "raw":
-		return findAccount(q, tenantID, orgID, "raw materials", "1310")
+		return findAccount(q, tenantID, orgID, "raw materials", "1030")
 	case "finished":
-		return findAccount(q, tenantID, orgID, "finished goods", "1330")
+		return findAccount(q, tenantID, orgID, "finished goods", "2810")
 	case "trade":
-		return findAccount(q, tenantID, orgID, "goods for resale", "1340")
+		return findAccount(q, tenantID, orgID, "goods for resale", "2910")
 	case "service":
 		return uuid.Nil
 	default:
-		return findAccount(q, tenantID, orgID, "goods for resale", "1340")
+		return findAccount(q, tenantID, orgID, "goods for resale", "2910")
 	}
 }

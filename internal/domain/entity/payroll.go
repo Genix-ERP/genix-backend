@@ -69,12 +69,13 @@ type CreatePayrollPeriodInput struct {
 
 // UpdatePayrollPeriodInput represents input for updating a payroll period
 type UpdatePayrollPeriodInput struct {
-	PeriodName *string `json:"period_name,omitempty"`
-	StartDate  *string `json:"start_date,omitempty"`
-	EndDate    *string `json:"end_date,omitempty"`
-	PayDate    *string `json:"pay_date,omitempty"`
-	Status     *string `json:"status,omitempty"`
-	Notes      *string `json:"notes,omitempty"`
+	PeriodName    *string `json:"period_name,omitempty"`
+	StartDate     *string `json:"start_date,omitempty"`
+	EndDate       *string `json:"end_date,omitempty"`
+	PayDate       *string `json:"pay_date,omitempty"`
+	Status        *string `json:"status,omitempty"`
+	Notes         *string `json:"notes,omitempty"`
+	PaymentMethod *string `json:"payment_method,omitempty"`
 }
 
 // CreatePayrollEntryInput represents input for creating a payroll entry
@@ -114,20 +115,21 @@ type UpdatePayrollEntryInput struct {
 
 // PayrollPeriodResponse represents the API response for a payroll period
 type PayrollPeriodResponse struct {
-	ID              uuid.UUID `json:"id"`
-	PeriodCode      string    `json:"period_code"`
-	PeriodName      string    `json:"period_name"`
-	EmployeeName    string    `json:"employee_name,omitempty"` // Populated when there's only one employee
-	StartDate       string    `json:"start_date"`
-	EndDate         string    `json:"end_date"`
-	PayDate         string    `json:"pay_date"`
-	Status          string    `json:"status"`
-	TotalGross      float64   `json:"total_gross"`
-	TotalDeductions float64   `json:"total_deductions"`
-	TotalNet        float64   `json:"total_net"`
-	EmployeeCount   int       `json:"employee_count"`
-	Notes           string    `json:"notes,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID              uuid.UUID  `json:"id"`
+	PeriodCode      string     `json:"period_code"`
+	PeriodName      string     `json:"period_name"`
+	EmployeeID      *uuid.UUID `json:"employee_id,omitempty"`   // Populated when there's only one employee
+	EmployeeName    string     `json:"employee_name,omitempty"` // Populated when there's only one employee
+	StartDate       string     `json:"start_date"`
+	EndDate         string     `json:"end_date"`
+	PayDate         string     `json:"pay_date"`
+	Status          string     `json:"status"`
+	TotalGross      float64    `json:"total_gross"`
+	TotalDeductions float64    `json:"total_deductions"`
+	TotalNet        float64    `json:"total_net"`
+	EmployeeCount   int        `json:"employee_count"`
+	Notes           string     `json:"notes,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
 // ToResponse converts PayrollPeriod to PayrollPeriodResponse

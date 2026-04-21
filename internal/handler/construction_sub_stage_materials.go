@@ -196,14 +196,14 @@ func (h *Handler) CreateSubStageMaterial(c *gin.Context) {
 			h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 			if journalID != uuid.Nil {
-				debitAcct := findAccount(h.db, tenantID, orgID, "direct material", "5100")
+				debitAcct := findAccount(h.db, tenantID, orgID, "direct material", "9130")
 				if debitAcct == uuid.Nil {
-					debitAcct = findAccount(h.db, tenantID, orgID, "cost of goods", "5100")
+					debitAcct = findAccount(h.db, tenantID, orgID, "cost of goods", "9130")
 				}
 				if debitAcct == uuid.Nil {
-					debitAcct = findAccount(h.db, tenantID, orgID, "cogs", "5000")
+					debitAcct = findAccount(h.db, tenantID, orgID, "cogs", "9110")
 				}
-				creditAcct := findAccount(h.db, tenantID, orgID, "inventory", "1300")
+				creditAcct := findAccount(h.db, tenantID, orgID, "inventory", "1010")
 
 				if debitAcct != uuid.Nil && creditAcct != uuid.Nil {
 					entryID := uuid.New()

@@ -415,7 +415,7 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 		SELECT DISTINCT ON (c.id) c.id, c.code, er.rate
 		FROM currencies c
 		JOIN exchange_rates er ON er.from_currency_id = c.id AND er.tenant_id = $1
-		WHERE c.tenant_id = $1 AND c.is_base_currency = false AND c.deleted_at IS NULL
+		WHERE c.is_base_currency = false AND c.is_active = true
 		ORDER BY c.id, er.effective_date DESC
 	`, tenantID)
 	if err != nil {
@@ -444,7 +444,7 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 			COALESCE(cu.name, '') as partner_name, si.invoice_date
 		FROM sales_invoices si
 		LEFT JOIN currencies c ON si.currency_id = c.id
-		LEFT JOIN customers cu ON si.customer_id = cu.id
+		LEFT JOIN contacts cu ON si.customer_id = cu.id
 		WHERE si.tenant_id = $1 %s
 			AND si.currency_id IS NOT NULL
 			AND si.exchange_rate > 1
@@ -505,7 +505,7 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 			COALESCE(s.name, '') as partner_name, pi.bill_date
 		FROM purchase_invoices pi
 		LEFT JOIN currencies c ON pi.currency_id = c.id
-		LEFT JOIN suppliers s ON pi.supplier_id = s.id
+		LEFT JOIN contacts s ON pi.supplier_id = s.id
 		WHERE pi.tenant_id = $1 %s
 			AND pi.currency_id IS NOT NULL
 			AND COALESCE(pi.exchange_rate, 1) > 1
@@ -650,33 +650,56 @@ func htmlToPDF(htmlContent string) ([]byte, error) {
 		}
 	}
 
-	// Fallback to weasyprint (check common paths)
-	weasyprintPaths := []string{"weasyprint", "/Users/behruzniyozov/.pyenv/versions/3.12.12/bin/weasyprint", "/usr/local/bin/weasyprint", "/opt/homebrew/bin/weasyprint"}
-	var wpPath string
-	for _, p := range weasyprintPaths {
-		if found, err := exec.LookPath(p); err == nil {
-			wpPath = found
-			break
-		}
+	// Fallback to weasyprint. IMPORTANT: absolute paths come FIRST so we bypass
+	// any pyenv shim in PATH (the shim exits 127 when the pinned Python version
+	// isn't installed, e.g. when ~/.python-version pins an absent 3.13). Try each
+	// candidate by actually running it — LookPath alone isn't enough because the
+	// shim resolves successfully but fails at exec time.
+	weasyprintCandidates := []string{
+		// Common pyenv python version paths (both Intel and Apple Silicon homes)
+		os.ExpandEnv("$HOME/.pyenv/versions/3.12.12/bin/weasyprint"),
+		os.ExpandEnv("$HOME/.pyenv/versions/3.12/bin/weasyprint"),
+		os.ExpandEnv("$HOME/.pyenv/versions/3.11/bin/weasyprint"),
+		// Legacy hard-coded path (kept for backward compat)
+		"/Users/behruzniyozov/.pyenv/versions/3.12.12/bin/weasyprint",
+		// System / Homebrew installs
+		"/opt/homebrew/bin/weasyprint",
+		"/usr/local/bin/weasyprint",
+		// Last resort: the PATH-resolved one (may be a pyenv shim)
+		"weasyprint",
 	}
-	if wpPath != "" {
-		path := wpPath
-		tmpPDF, err := os.CreateTemp("", "report-*.pdf")
-		if err != nil {
-			return nil, fmt.Errorf("failed to create temp PDF file: %w", err)
-		}
-		tmpPDF.Close()
-		defer os.Remove(tmpPDF.Name())
 
+	tmpPDF, err := os.CreateTemp("", "report-*.pdf")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp PDF file: %w", err)
+	}
+	tmpPDF.Close()
+	defer os.Remove(tmpPDF.Name())
+
+	var lastErr error
+	var lastStderr string
+	for _, candidate := range weasyprintCandidates {
+		path, lookErr := exec.LookPath(candidate)
+		if lookErr != nil {
+			continue
+		}
 		var stderr bytes.Buffer
 		cmd := exec.Command(path, tmpHTML.Name(), tmpPDF.Name())
+		// Strip any PYENV_VERSION env vars so a pinned-but-missing version in a
+		// dotfile does not break a fully-qualified binary we're invoking directly.
+		cmd.Env = append(os.Environ(), "PYENV_VERSION=")
 		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("weasyprint failed: %w, stderr: %s", err, stderr.String())
+		if runErr := cmd.Run(); runErr == nil {
+			return os.ReadFile(tmpPDF.Name())
+		} else {
+			lastErr = runErr
+			lastStderr = stderr.String()
 		}
-		return os.ReadFile(tmpPDF.Name())
 	}
 
+	if lastErr != nil {
+		return nil, fmt.Errorf("weasyprint failed: %w, stderr: %s", lastErr, lastStderr)
+	}
 	return nil, fmt.Errorf("no PDF generator found: install wkhtmltopdf or weasyprint")
 }
 
@@ -1021,6 +1044,12 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	// Get org ID for live recomputation
+	var listOrgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		listOrgIDPtr = &orgID
+	}
+
 	acts := make([]reconciliationActResponse, 0)
 	for rows.Next() {
 		var a reconciliationActResponse
@@ -1045,7 +1074,20 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 
 		a.PeriodStart = periodStart.Format("2006-01-02")
 		a.PeriodEnd = periodEnd.Format("2006-01-02")
-		a.ClosingBalance = a.OpeningBalance + a.OurDebitTotal - a.OurCreditTotal
+
+		// Recompute LIVE totals from journal entries so list always shows current data
+		liveOpening, _, liveDebit, liveCredit, liveErr := h.computeReconciliationData(tenantID, a.PartnerID, listOrgIDPtr, a.PeriodStart, a.PeriodEnd)
+		if liveErr == nil {
+			a.OpeningBalance = liveOpening
+			a.OurDebitTotal = liveDebit
+			a.OurCreditTotal = liveCredit
+			a.OurBalance = liveOpening + liveDebit - liveCredit
+			a.ClosingBalance = a.OurBalance
+		} else {
+			// Fallback to stored values if live computation fails
+			a.ClosingBalance = a.OpeningBalance + a.OurDebitTotal - a.OurCreditTotal
+		}
+
 		if notes.Valid {
 			a.Notes = &notes.String
 		}
@@ -1281,17 +1323,23 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 		act.ShareExpiresAt = &actShareExpiresAt.Time
 	}
 
-	// Fetch live transaction lines from journal entries
+	// Fetch LIVE transaction data from journal entries — always recompute totals
+	// so the act reflects the current state of journal entries (not stale stored values).
 	var orgIDPtr *uuid.UUID
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		orgIDPtr = &orgID
 	}
 
-	_, lines, _, _, linesErr := h.computeReconciliationData(tenantID, act.PartnerID, orgIDPtr, act.PeriodStart, act.PeriodEnd)
+	liveOpening, lines, liveDebit, liveCredit, linesErr := h.computeReconciliationData(tenantID, act.PartnerID, orgIDPtr, act.PeriodStart, act.PeriodEnd)
 	if linesErr != nil {
 		h.log.Error("Failed to fetch reconciliation lines", "error", linesErr)
 	} else {
 		act.Lines = lines
+		act.OpeningBalance = liveOpening
+		act.OurDebitTotal = liveDebit
+		act.OurCreditTotal = liveCredit
+		act.OurBalance = liveOpening + liveDebit - liveCredit
+		act.ClosingBalance = act.OurBalance
 	}
 
 	response.Success(c, act)

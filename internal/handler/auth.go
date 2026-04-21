@@ -110,6 +110,27 @@ type VerifyOTPInput struct {
 	Purpose string `json:"purpose" binding:"required"`
 }
 
+// SendPhoneOTPInput represents phone-based OTP request
+type SendPhoneOTPInput struct {
+	Phone    string `json:"phone" binding:"required"`
+	Purpose  string `json:"purpose" binding:"required"` // password_reset
+	Language string `json:"language"`                   // en, uz, ru
+}
+
+// VerifyPhoneOTPInput represents phone-based OTP verification request
+type VerifyPhoneOTPInput struct {
+	Phone   string `json:"phone" binding:"required"`
+	OTPCode string `json:"otp_code" binding:"required,len=6"`
+	Purpose string `json:"purpose" binding:"required"`
+}
+
+// ResetPasswordWithPhoneInput represents password reset with phone verification
+type ResetPasswordWithPhoneInput struct {
+	Phone       string `json:"phone" binding:"required"`
+	OTPCode     string `json:"otp_code" binding:"required,len=6"`
+	NewPassword string `json:"new_password" binding:"required,min=8"`
+}
+
 // RegisterWithOTPInput represents registration with OTP verification
 type RegisterWithOTPInput struct {
 	TenantCode string `json:"tenant_code" binding:"required,min=2,max=50"`
@@ -250,8 +271,13 @@ func (h *Handler) Register(c *gin.Context) {
 	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
 
 	_, err = tx.Exec(`
+<<<<<<< HEAD
 		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, 'owner', $7, true, false, false, $8, $8)
+=======
+		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, role, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, false, 'owner', $8, $8)
+>>>>>>> 25fd5f4f5ed9dd93945e5fd014b5d80eb5090b2d
 	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
@@ -412,7 +438,7 @@ func (h *Handler) Login(c *gin.Context) {
 		lookupValue = input.Phone
 	}
 
-	selectFields := `id, tenant_id, email, password_hash, first_name, last_name,
+	selectFields := `id, tenant_id, COALESCE(email, ''), password_hash, first_name, last_name,
 		phone, avatar_url, language, timezone, is_active, is_verified,
 		is_system_admin, failed_login_attempts, locked_until, created_at, updated_at`
 
@@ -694,7 +720,7 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 	var email, phone, avatarURL sql.NullString
 
 	err := h.db.QueryRow(`
-		SELECT id, tenant_id, email, first_name, last_name, phone, avatar_url,
+		SELECT id, tenant_id, COALESCE(email, ''), first_name, last_name, phone, avatar_url,
 		       language, timezone, is_active, is_verified, is_system_admin,
 		       last_login_at, created_at, updated_at
 		FROM users
@@ -815,6 +841,14 @@ func (h *Handler) UpdateCurrentUser(c *gin.Context) {
 		h.log.Error("Failed to update user", "error", err)
 		response.InternalServerError(c, "")
 		return
+	}
+
+	// Sync phone/email changes to linked employee record
+	if input.Phone != nil {
+		h.db.Exec("UPDATE employees SET phone = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", *input.Phone, claims.UserID)
+	}
+	if input.Email != nil {
+		h.db.Exec("UPDATE employees SET email = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", *input.Email, claims.UserID)
 	}
 
 	// Return updated user
@@ -986,6 +1020,288 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 	h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", userID)
 
 	response.Success(c, gin.H{"message": "Password reset successfully"})
+}
+
+// SendPasswordResetOTP sends an OTP code via SMS to the specified phone number for password reset
+func (h *Handler) SendPasswordResetOTP(c *gin.Context) {
+	var input SendPhoneOTPInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	if input.Purpose != "password_reset" {
+		response.BadRequest(c, "Invalid purpose. Must be 'password_reset'")
+		return
+	}
+
+	phone := normalizePhone(input.Phone)
+
+	fmt.Printf("[OTP-DEBUG] Input phone: %s, Normalized: %s\n", input.Phone, phone)
+
+	// Check if an employee exists with this phone number (user account may or may not exist)
+	var employeeID uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT id FROM employees
+		WHERE REGEXP_REPLACE(phone, '[^0-9]', '', 'g') = $1 AND deleted_at IS NULL
+		LIMIT 1
+	`, phone).Scan(&employeeID)
+
+	if err == sql.ErrNoRows {
+		fmt.Printf("[OTP-DEBUG] No employee found for phone: %s\n", phone)
+		// Don't reveal if phone exists — return success anyway
+		response.Success(c, gin.H{
+			"message": "If an account exists with this phone, you will receive an OTP code",
+		})
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to check phone", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+	fmt.Printf("[OTP-DEBUG] Found employee: %s for phone: %s\n", employeeID, phone)
+
+	// Invalidate any existing OTPs for this phone and purpose
+	h.db.Exec(`
+		UPDATE phone_verification_otps
+		SET verified_at = NOW()
+		WHERE phone = $1 AND purpose = $2 AND verified_at IS NULL
+	`, phone, input.Purpose)
+
+	// Generate 6-digit OTP code
+	otpCode := generateOTPCode()
+	expiresAt := time.Now().Add(10 * time.Minute)
+
+	// Store OTP in database
+	_, err = h.db.Exec(`
+		INSERT INTO phone_verification_otps (phone, otp_code, purpose, expires_at)
+		VALUES ($1, $2, $3, $4)
+	`, phone, otpCode, input.Purpose, expiresAt)
+	if err != nil {
+		h.log.Error("Failed to store phone OTP", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// SMS message — use same template style as credential sending
+	smsMessage := fmt.Sprintf("Sizning Genix Admin paneliga kirish kodingiz: %s", otpCode)
+
+	// Always log OTP to console for debugging
+	fmt.Printf("[OTP] Phone: %s, Code: %s\n", phone, otpCode)
+
+	// Send OTP via SMS
+	if err := h.smsService.Send(phone, smsMessage); err != nil {
+		h.log.Error("Failed to send OTP SMS", "error", err, "phone", phone)
+		// Don't fail — OTP is stored, user can request resend
+	}
+
+	result := gin.H{
+		"message":    "OTP code sent successfully",
+		"expires_at": expiresAt,
+	}
+
+	// In development mode, include OTP in response
+	if h.config.App.Env == "development" || h.config.App.Env == "local" || h.config.App.Env == "" {
+		result["dev_otp_code"] = otpCode
+	}
+
+	response.Success(c, result)
+}
+
+// VerifyPasswordResetOTP verifies an OTP code for the specified phone number (password reset flow)
+func (h *Handler) VerifyPasswordResetOTP(c *gin.Context) {
+	var input VerifyPhoneOTPInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	phone := normalizePhone(input.Phone)
+
+	var otpID uuid.UUID
+	var storedCode string
+	var attempts, maxAttempts int
+	var expiresAt time.Time
+	var verifiedAt sql.NullTime
+
+	err := h.db.QueryRow(`
+		SELECT id, otp_code, attempts, max_attempts, expires_at, verified_at
+		FROM phone_verification_otps
+		WHERE phone = $1 AND purpose = $2
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, phone, input.Purpose).Scan(&otpID, &storedCode, &attempts, &maxAttempts, &expiresAt, &verifiedAt)
+
+	if err == sql.ErrNoRows {
+		response.BadRequest(c, "No OTP found. Please request a new one.")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to query phone OTP", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	if verifiedAt.Valid {
+		response.BadRequest(c, "OTP already used. Please request a new one.")
+		return
+	}
+
+	if time.Now().After(expiresAt) {
+		response.BadRequest(c, "OTP has expired. Please request a new one.")
+		return
+	}
+
+	if attempts >= maxAttempts {
+		response.BadRequest(c, "Too many failed attempts. Please request a new OTP.")
+		return
+	}
+
+	if storedCode != input.OTPCode {
+		h.db.Exec("UPDATE phone_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID)
+		response.BadRequest(c, "Invalid OTP code")
+		return
+	}
+
+	// Mark as verified
+	_, err = h.db.Exec("UPDATE phone_verification_otps SET verified_at = NOW() WHERE id = $1", otpID)
+	if err != nil {
+		h.log.Error("Failed to mark phone OTP as verified", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"message":  "Phone verified successfully",
+		"verified": true,
+	})
+}
+
+// ResetPasswordWithPhone handles password set/reset using phone + OTP verification
+func (h *Handler) ResetPasswordWithPhone(c *gin.Context) {
+	var input ResetPasswordWithPhoneInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		h.log.Error("Invalid input", "error", err)
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	phone := normalizePhone(input.Phone)
+
+	// Verify that this phone has a recently verified OTP
+	var otpID uuid.UUID
+	var storedCode string
+	var verifiedAt sql.NullTime
+
+	err := h.db.QueryRow(`
+		SELECT id, otp_code, verified_at
+		FROM phone_verification_otps
+		WHERE phone = $1 AND purpose = 'password_reset'
+		  AND verified_at IS NOT NULL
+		  AND verified_at > NOW() - INTERVAL '15 minutes'
+		ORDER BY verified_at DESC
+		LIMIT 1
+	`, phone).Scan(&otpID, &storedCode, &verifiedAt)
+
+	if err == sql.ErrNoRows {
+		response.BadRequest(c, "Phone not verified. Please verify your phone first.")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to check phone verification", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Double-check OTP code matches
+	if storedCode != input.OTPCode {
+		response.BadRequest(c, "Invalid OTP code")
+		return
+	}
+
+	// Find employee by phone
+	var employeeID uuid.UUID
+	var empEmail sql.NullString
+	var empFirstName, empLastName string
+	var empTenantID uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT id, tenant_id, COALESCE(email, ''), first_name, last_name
+		FROM employees
+		WHERE REGEXP_REPLACE(phone, '[^0-9]', '', 'g') = $1 AND deleted_at IS NULL
+		LIMIT 1
+	`, phone).Scan(&employeeID, &empTenantID, &empEmail, &empFirstName, &empLastName)
+
+	if err != nil {
+		h.log.Error("Failed to find employee by phone", "error", err)
+		response.BadRequest(c, "No account found with this phone number")
+		return
+	}
+
+	// Hash the new password
+	hashedPassword, err := crypto.HashPassword(input.NewPassword)
+	if err != nil {
+		h.log.Error("Failed to hash password", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Try to find existing user linked to this employee
+	var userID uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT u.id FROM users u
+		WHERE (u.employee_id = $1 OR (u.email = $2 AND $2 != ''))
+		  AND u.deleted_at IS NULL
+		LIMIT 1
+	`, employeeID, empEmail.String).Scan(&userID)
+
+	if err == sql.ErrNoRows {
+		// No user account exists — create one
+		userID = uuid.New()
+		var emailVal *string
+		if empEmail.Valid && empEmail.String != "" {
+			emailVal = &empEmail.String
+		}
+		_, err = h.db.Exec(`
+			INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, phone,
+			                   language, timezone, settings, is_active, is_verified, employee_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 'uz', 'Asia/Tashkent', '{}', true, true, $8)
+		`, userID, empTenantID, emailVal, hashedPassword, empFirstName, empLastName, phone, employeeID)
+		if err != nil {
+			h.log.Error("Failed to create user for employee", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
+		fmt.Printf("[OTP] Created new user %s for employee %s\n", userID, employeeID)
+	} else if err != nil {
+		h.log.Error("Failed to find user", "error", err)
+		response.InternalServerError(c, "")
+		return
+	} else {
+		// User exists — update password
+		_, err = h.db.Exec(`
+			UPDATE users SET
+				password_hash = $1,
+				password_changed_at = NOW(),
+				updated_at = NOW()
+			WHERE id = $2
+		`, hashedPassword, userID)
+		if err != nil {
+			h.log.Error("Failed to set password", "error", err)
+			response.InternalServerError(c, "")
+			return
+		}
+	}
+
+	// Revoke all refresh tokens for security
+	h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", userID)
+
+	// Invalidate the used OTP
+	h.db.Exec("UPDATE phone_verification_otps SET verified_at = NOW() WHERE phone = $1 AND purpose = 'password_reset' AND verified_at IS NULL", phone)
+
+	response.Success(c, gin.H{"message": "Password set successfully"})
 }
 
 // VerifyEmail handles email verification
@@ -1618,9 +1934,15 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 	}
 
 	_, err = tx.Exec(`
+<<<<<<< HEAD
 		INSERT INTO users (id, tenant_id, email, phone, password_hash, first_name, last_name, role, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'owner', $8, true, true, false, $9, $9)
 	`, userID, tenantID, userEmail, userPhone, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
+=======
+		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, role, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, true, true, false, 'owner', $8, $8)
+	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
+>>>>>>> 25fd5f4f5ed9dd93945e5fd014b5d80eb5090b2d
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
 		response.InternalServerError(c, "")
@@ -1887,7 +2209,7 @@ func (h *Handler) GoogleAuth(c *gin.Context) {
 // googleLoginExistingUser logs in an existing user via Google
 func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, picture string, tenantID *uuid.UUID) {
 	query := `
-		SELECT id, tenant_id, email, first_name, last_name,
+		SELECT id, tenant_id, COALESCE(email, ''), first_name, last_name,
 		       phone, avatar_url, language, timezone, is_active, is_verified,
 		       is_system_admin, COALESCE(auth_provider, 'local') as auth_provider, google_id,
 		       created_at, updated_at
@@ -1898,7 +2220,7 @@ func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, pict
 
 	if tenantID != nil {
 		query = `
-			SELECT id, tenant_id, email, first_name, last_name,
+			SELECT id, tenant_id, COALESCE(email, ''), first_name, last_name,
 			       phone, avatar_url, language, timezone, is_active, is_verified,
 			       is_system_admin, COALESCE(auth_provider, 'local') as auth_provider, google_id,
 			       created_at, updated_at
@@ -2035,20 +2357,8 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 		return
 	}
 
-	// Generate tenant code
-	baseCode := strings.ToLower(strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' {
-			return r
-		}
-		if r >= 'A' && r <= 'Z' {
-			return r + 32
-		}
-		return '_'
-	}, companyName))
-	if len(baseCode) > 40 {
-		baseCode = baseCode[:40]
-	}
-	tenantCode := fmt.Sprintf("%s_%s", baseCode, randomSuffix())
+	// Generate tenant code (supports Cyrillic/non-Latin company names)
+	tenantCode := generateTenantCode(companyName, randomSuffix)
 
 	// Create tenant
 	tenantID := uuid.New()
@@ -2079,8 +2389,8 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 	_, err = tx.Exec(`
 		INSERT INTO users (id, tenant_id, email, first_name, last_name, settings,
 		                   is_active, is_verified, is_system_admin, auth_provider, google_id,
-		                   avatar_url, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, true, true, false, 'google', $7, $8, $9, $9)
+		                   avatar_url, role, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, true, true, false, 'google', $7, $8, 'owner', $9, $9)
 	`, userID, tenantID, email, firstName, lastName, defaultUserSettings, googleSub, picture, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
@@ -2282,6 +2592,9 @@ func (h *Handler) UpdateCurrentUserEmail(c *gin.Context) {
 		return
 	}
 
+	// Sync email to linked employee record
+	h.db.Exec("UPDATE employees SET email = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", input.Email, claims.UserID)
+
 	h.GetCurrentUser(c)
 }
 
@@ -2407,6 +2720,9 @@ func (h *Handler) VerifyPhoneOTP(c *gin.Context) {
 		response.InternalServerError(c, "Failed to update phone number")
 		return
 	}
+
+	// Sync phone to linked employee record
+	h.db.Exec("UPDATE employees SET phone = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", input.Phone, claims.UserID)
 
 	// Return the updated user
 	h.GetCurrentUser(c)

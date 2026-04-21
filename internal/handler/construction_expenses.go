@@ -616,7 +616,7 @@ func (h *Handler) ApproveExpenseLine(c *gin.Context) {
 	if creditAccID == nil || *creditAccID == uuid.Nil {
 		cashAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "cash_5010", "kassa", "5010")
 		if cashAcct == uuid.Nil {
-			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 		}
 		if cashAcct != uuid.Nil {
 			creditAccID = &cashAcct

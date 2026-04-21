@@ -697,9 +697,12 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 			argCount++
 			updates = append(updates, fmt.Sprintf("labor_per_hour = $%d", argCount))
 			args = append(args, labor)
-			argCount++
-			updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
-			args = append(args, total)
+			// Only set hourly_cost to calculated total if user didn't explicitly provide it
+			if input.HourlyCost == nil {
+				argCount++
+				updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
+				args = append(args, total)
+			}
 		}
 	}
 
@@ -1125,7 +1128,8 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 			   po.work_center_id, wc.name as work_center_name, po.requires_quality_check, po.quality_status,
 			   po.notes, po.tags, po.created_by, cu.first_name || ' ' || cu.last_name as created_by_name,
 			   po.confirmed_at, po.completed_at, po.created_at, po.updated_at,
-			   po.manufacturing_category_id, mc.name as manufacturing_category_name
+			   po.manufacturing_category_id, mc.name as manufacturing_category_name,
+			   po.has_split_output
 		FROM production_orders po
 		LEFT JOIN products p ON po.product_id = p.id
 		LEFT JOIN product_boms b ON po.bom_id = b.id
@@ -1154,6 +1158,7 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 		&po.Notes, &tags, &po.CreatedBy, &createdByName,
 		&confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
 		&po.ManufacturingCategoryID, &categoryName,
+		&po.HasSplitOutput,
 	)
 
 	if err == sql.ErrNoRows {
@@ -1387,6 +1392,12 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		moldCount = *input.MoldCount
 	}
 
+	hasSplitOutput := false
+	if input.HasSplitOutput != nil {
+		hasSplitOutput = *input.HasSplitOutput
+	}
+	h.log.Info("CreateProductionOrder: split output", "input_value", input.HasSplitOutput, "resolved", hasSplitOutput)
+
 	query := `
 		INSERT INTO production_orders (
 			id, tenant_id, organization_id, code, name, product_id, bom_id, quantity_planned, uom,
@@ -1394,8 +1405,8 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 			scheduled_start, scheduled_end, priority, status, source_type, source_id,
 			sales_order_id, customer_id, warehouse_id, location_id, assigned_to,
 			work_center_id, requires_quality_check, notes, tags, created_by, created_at, updated_at,
-			manufacturing_category_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, 'draft', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+			manufacturing_category_id, has_split_output
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'draft', $12, $13, $14, 'draft', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
 		RETURNING id
 	`
 
@@ -1404,13 +1415,22 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		tags = []byte(fmt.Sprintf(`["%s"]`, strings.Join(input.Tags, `","`)))
 	}
 
+	// Auto-fill warehouse from BOM if not provided
+	warehouseID := input.WarehouseID
+	if warehouseID == nil && input.BOMID != nil {
+		var bomWhID uuid.UUID
+		if h.db.QueryRow(`SELECT warehouse_id FROM product_boms WHERE id = $1 AND warehouse_id IS NOT NULL`, input.BOMID).Scan(&bomWhID) == nil {
+			warehouseID = &bomWhID
+		}
+	}
+
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, code, input.Name, input.ProductID, input.BOMID, input.QuantityPlanned, input.UOM,
 		moldCount, input.Shift,
 		scheduledStart, scheduledEnd, priority, input.SourceType, input.SourceID,
-		input.SalesOrderID, input.CustomerID, input.WarehouseID, input.LocationID, input.AssignedTo,
+		input.SalesOrderID, input.CustomerID, warehouseID, input.LocationID, input.AssignedTo,
 		input.WorkCenterID, requiresQC, input.Notes, tags, userID, now, now,
-		input.ManufacturingCategoryID,
+		input.ManufacturingCategoryID, hasSplitOutput,
 	).Scan(&id)
 
 	if err != nil {
@@ -1559,6 +1579,21 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("manufacturing_category_id = $%d", argCount))
 		args = append(args, *input.ManufacturingCategoryID)
+	}
+	if input.HasSplitOutput != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("has_split_output = $%d", argCount))
+		args = append(args, *input.HasSplitOutput)
+	}
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+	}
+	if input.ProgressPercent != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("progress_percent = $%d", argCount))
+		args = append(args, *input.ProgressPercent)
 	}
 
 	if len(updates) == 0 {
@@ -1828,14 +1863,14 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 
 			woQuery := `
 				INSERT INTO work_orders (
-					id, tenant_id, production_order_id, code, name,
+					id, tenant_id, organization_id, production_order_id, code, name,
 					sequence, operation_id, work_center_id,
 					quantity_to_produce, uom,
 					planned_duration_hours, setup_time_hours,
 					planned_cost, labor_cost, machine_cost,
 					status, instructions, notes,
 					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $19, $20)
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', $17, $18, $19, $20, $21)
 			`
 
 			var instructions *string
@@ -1844,7 +1879,7 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			}
 
 			_, err = tx.Exec(woQuery,
-				woID, tenantID, id, woCode, woName,
+				woID, tenantID, orgID, id, woCode, woName,
 				op.Sequence, op.ID, effectiveWorkCenterID,
 				quantityPlanned, uom,
 				totalTimeHours, op.SetupTime/60.0,
@@ -1869,10 +1904,10 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		woName := productName + " - Ishlab chiqarish"
 		_, err = tx.Exec(`
 			INSERT INTO work_orders (
-				id, tenant_id, production_order_id, code, name, sequence,
+				id, tenant_id, organization_id, production_order_id, code, name, sequence,
 				quantity_to_produce, uom, status, created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, 1, $6, $7, 'pending', $8, NOW(), NOW())
-		`, woID, tenantID, id, woCode, woName, quantityPlanned, uom, createdByID)
+			) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, 'pending', $9, NOW(), NOW())
+		`, woID, tenantID, orgID, id, woCode, woName, quantityPlanned, uom, createdByID)
 		if err != nil {
 			h.log.Error("Failed to create default work order", "error", err)
 		}
@@ -1962,13 +1997,13 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			"quantityPlanned", quantityPlanned)
 
 		if totalMaterialCost > 0 {
-			wipAcct := findAccount(h.db, tenantID, orgID, "work in progress", "1320")
-			rawAcct := findAccount(h.db, tenantID, orgID, "raw materials", "1310")
+			wipAcct := findAccount(h.db, tenantID, orgID, "work in progress", "2010")
+			rawAcct := findAccount(h.db, tenantID, orgID, "raw materials", "1030")
 			if rawAcct == uuid.Nil {
-				rawAcct = findAccount(h.db, tenantID, orgID, "goods for resale", "1340")
+				rawAcct = findAccount(h.db, tenantID, orgID, "goods for resale", "2910")
 			}
 			if rawAcct == uuid.Nil {
-				rawAcct = findAccount(h.db, tenantID, orgID, "inventory", "1300")
+				rawAcct = findAccount(h.db, tenantID, orgID, "inventory", "1010")
 			}
 
 			h.log.Info("Account lookup results", "wipAcct", wipAcct, "rawAcct", rawAcct, "tenant_id", tenantID)
@@ -1995,10 +2030,15 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 				if jeErr == nil && journalID != uuid.Nil {
 					var poCode string
 					h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poCode)
+					var prodName string
+					h.db.QueryRow(`SELECT COALESCE(p.name, '') FROM production_orders po JOIN products p ON po.product_id = p.id WHERE po.id = $1`, id).Scan(&prodName)
 
 					entryID := uuid.New()
 					entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
 					description := fmt.Sprintf("Production Order %s confirmed - planned material cost", poCode)
+					if prodName != "" {
+						description = fmt.Sprintf("Production Order %s confirmed - %s - planned material cost", poCode, prodName)
+					}
 
 					_, jeInsertErr := h.db.Exec(`
 						INSERT INTO journal_entries (
@@ -2162,10 +2202,10 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			}
 			h.db.Exec(`
 				INSERT INTO work_orders (
-					id, tenant_id, production_order_id, code, name, sequence,
+					id, tenant_id, organization_id, production_order_id, code, name, sequence,
 					quantity_to_produce, uom, status, created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, 1, $6, 'pcs', 'pending', $7, $8, $8)
-			`, woID, tenantID, id, woCode, woName, qty, userID, now)
+				) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 'pcs', 'pending', $8, $9, $9)
+			`, woID, tenantID, poOrgID, id, woCode, woName, qty, userID, now)
 			h.log.Info("Created default work order for production order without BOM operations", "order_id", id)
 		}
 	}
@@ -2217,6 +2257,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 	}
 
 	// Only consume if we have a BOM and warehouse
+	h.log.Info("[v2] StartProductionOrder: material consumption check", "bomID", bomID, "warehouseID", warehouseID, "qtyPlanned", qtyPlanned, "po_id", id)
 	if bomID != nil && warehouseID != nil {
 		// Check if materials were already consumed (prevent double-deduction on pause/resume)
 		var existingConsumption int
@@ -2225,6 +2266,8 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2
 			AND transaction_type = $3
 		`, tenantID, id, entity.TransactionTypeIssue).Scan(&existingConsumption)
+
+		h.log.Info("[v2] StartProductionOrder: existing consumption count", "count", existingConsumption, "po_id", id)
 
 		if existingConsumption == 0 {
 			tx, txErr := h.db.Begin()
@@ -2263,32 +2306,47 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				}
 			}
 			compRows.Close()
+			h.log.Info("[v2] BOM components found", "count", len(components), "bom_id", bomID, "po_id", id)
 
 			// Deduct each component from inventory
 			for _, comp := range components {
 				consumption := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
 
 				var compInvID uuid.UUID
+				// Try to find inventory record in the production order's warehouse first
 				compErr := tx.QueryRow(`
 					SELECT id FROM inventory
 					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-					AND lot_number IS NULL AND serial_number IS NULL
+					ORDER BY quantity_on_hand DESC LIMIT 1
 				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
 
+				// Fallback: find any inventory record for this component (any warehouse)
 				if compErr != nil {
-					h.log.Warn("Component not found in inventory, skipping consumption", "component_id", comp.ComponentID)
+					compErr = tx.QueryRow(`
+						SELECT id FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2
+						AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
+						ORDER BY quantity_on_hand DESC LIMIT 1
+					`, tenantID, comp.ComponentID).Scan(&compInvID)
+				}
+
+				if compErr != nil {
+					h.log.Warn("Component not found in any inventory, skipping consumption", "component_id", comp.ComponentID)
 					continue
 				}
 
-				_, _ = tx.Exec(`
+				if _, deductErr := tx.Exec(`
 					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
 					WHERE id = $3
-				`, consumption, now, compInvID)
+				`, consumption, now, compInvID); deductErr != nil {
+					h.log.Error("Failed to deduct component from inventory", "error", deductErr, "component_id", comp.ComponentID, "qty", consumption)
+					continue
+				}
 
 				var compCost float64
-				h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
+				tx.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
 
-				_, _ = tx.Exec(`
+				if _, txErr := tx.Exec(`
 					INSERT INTO inventory_transactions (
 						id, tenant_id, organization_id, inventory_id, transaction_type,
 						reference_type, reference_id, quantity, unit_cost, total_cost,
@@ -2296,13 +2354,15 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
 				`, uuid.New(), tenantID, organizationID, compInvID, entity.TransactionTypeIssue,
 					"production_order", id, -consumption, compCost, consumption*compCost,
-					"material_consumption", "Materials consumed at production start", now, userID)
+					"material_consumption", "Materials consumed at production start", now, userID); txErr != nil {
+					h.log.Error("Failed to create inventory transaction for component", "error", txErr, "component_id", comp.ComponentID)
+				}
 			}
 
 			if commitErr := tx.Commit(); commitErr != nil {
-				h.log.Error("Failed to commit material consumption", "error", commitErr)
+				h.log.Error("[v2] Failed to commit material consumption", "error", commitErr, "po_id", id)
 			} else {
-				h.log.Info("Materials consumed for production order start", "order_id", id, "components", len(components))
+				h.log.Info("[v2] SUCCESS: Materials consumed for production order start", "order_id", id, "components", len(components))
 
 				// --- Create journal entry: Dt 1320 WIP / Kt 1310 Raw Materials ---
 				// Skip if journal was already created at confirm step
@@ -2324,14 +2384,14 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 					}
 
 					if totalMaterialCost > 0 {
-						wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
-						rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+						wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
+						rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
 						// Fallback: try goods for resale (1340) if raw materials not found
 						if rawAcct == uuid.Nil {
-							rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "1340")
+							rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "2910")
 						}
 						if rawAcct == uuid.Nil {
-							rawAcct = findAccount(h.db, tenantID, organizationID, "inventory", "1300")
+							rawAcct = findAccount(h.db, tenantID, organizationID, "inventory", "1010")
 						}
 
 						if wipAcct != uuid.Nil && rawAcct != uuid.Nil {
@@ -2346,10 +2406,15 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 							if err == nil && journalID != uuid.Nil {
 								var poNumber string
 								h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
+								var prodNameStarted string
+								h.db.QueryRow(`SELECT COALESCE(p.name, '') FROM production_orders po JOIN products p ON po.product_id = p.id WHERE po.id = $1`, id).Scan(&prodNameStarted)
 
 								entryID := uuid.New()
 								entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
 								description := fmt.Sprintf("Production Order %s started - materials consumed", poNumber)
+								if prodNameStarted != "" {
+									description = fmt.Sprintf("Production Order %s started - %s - materials consumed", poNumber, prodNameStarted)
+								}
 
 								h.db.Exec(`
 									INSERT INTO journal_entries (
@@ -2686,9 +2751,13 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		h.db.QueryRow("SELECT COALESCE(list_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
 		materialCost = unitCost
 	}
-	// Update product's cost_price
+	// Update product's cost_price (both tables — frontend reads from product_organization_settings)
 	if unitCost > 0 {
 		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
+		if organizationID != nil {
+			h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+				unitCost, now, productID, *organizationID)
+		}
 	}
 
 	tx, txErr := h.db.Begin()
@@ -2743,6 +2812,18 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		return
 	}
 
+	// Create inventory lot for FIFO tracking
+	lotID := uuid.New()
+	lotNumber := fmt.Sprintf("MFG-%s", id.String()[:8])
+	tx.Exec(`
+		INSERT INTO inventory_lots (
+			id, tenant_id, product_id, warehouse_id, lot_number,
+			received_date, initial_quantity, remaining_quantity,
+			unit_cost, purchase_order_id, status, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)
+	`, lotID, tenantID, productID, warehouseID, lotNumber,
+		now, producedQty, unitCost, id)
+
 	// Note: BOM component consumption is handled in StartProductionOrder (when production begins)
 
 	if commitErr := tx.Commit(); commitErr != nil {
@@ -2768,37 +2849,37 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 
 	if totalCost > 0 {
 		// Look up WIP-based accounts (try English, then Uzbek, then Russian names)
-		wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "1320")
+		wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
 		if wipAcct == uuid.Nil {
-			wipAcct = findAccount(h.db, tenantID, organizationID, "tugallanmagan ishlab chiqarish", "1320")
+			wipAcct = findAccount(h.db, tenantID, organizationID, "tugallanmagan ishlab chiqarish", "2010")
 		}
 		if wipAcct == uuid.Nil {
-			wipAcct = findAccount(h.db, tenantID, organizationID, "незавершенное производство", "1320")
+			wipAcct = findAccount(h.db, tenantID, organizationID, "незавершенное производство", "2010")
 		}
 
-		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1310")
+		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
 		if rawAcct == uuid.Nil {
-			rawAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1310")
+			rawAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1030")
 		}
 		if rawAcct == uuid.Nil {
-			rawAcct = findAccount(h.db, tenantID, organizationID, "материал", "1310")
+			rawAcct = findAccount(h.db, tenantID, organizationID, "материал", "1030")
 		}
 
-		finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "1330")
+		finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "2810")
 		if finishedAcct == uuid.Nil {
-			finishedAcct = findAccount(h.db, tenantID, organizationID, "tayyor mahsulot", "1330")
+			finishedAcct = findAccount(h.db, tenantID, organizationID, "tayyor mahsulot", "2810")
 		}
 		if finishedAcct == uuid.Nil {
-			finishedAcct = findAccount(h.db, tenantID, organizationID, "готовая продукция", "1330")
+			finishedAcct = findAccount(h.db, tenantID, organizationID, "готовая продукция", "2810")
 		}
 		if finishedAcct == uuid.Nil {
 			finishedAcct = getInventoryAccountByType(h.db, tenantID, organizationID, productID)
 		}
 
 		machineAcct := findAccount(h.db, tenantID, organizationID, "accrued machine", "2590")
-		salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6720")
+		salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6710")
 		if salaryAcct == uuid.Nil {
-			salaryAcct = findAccount(h.db, tenantID, organizationID, "ish haqi", "6720")
+			salaryAcct = findAccount(h.db, tenantID, organizationID, "ish haqi", "6710")
 		}
 
 		h.log.Info("CompleteProductionOrder: account lookup",
@@ -2967,25 +3048,25 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 				inventoryAccountID := ca.StockValuationAccountID
 				cogsAccountID := ca.ExpenseAccountID
 				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "5100")
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "9120")
 				}
 				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "5000")
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "9110")
 				}
 				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "ishlab chiqarish", "5100")
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "ishlab chiqarish", "9120")
 				}
 				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "tannarx", "5000")
+					cogsAccountID = findAccount(h.db, tenantID, organizationID, "tannarx", "9110")
 				}
 				if inventoryAccountID == uuid.Nil {
 					inventoryAccountID = getInventoryAccountByType(h.db, tenantID, organizationID, productID)
 				}
 				if inventoryAccountID == uuid.Nil {
-					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "inventory", "1300")
+					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "inventory", "1010")
 				}
 				if inventoryAccountID == uuid.Nil {
-					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "tovar-moddiy", "1300")
+					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "tovar-moddiy", "1010")
 				}
 
 				h.log.Info("CompleteProductionOrder: fallback accounting",

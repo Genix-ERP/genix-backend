@@ -645,17 +645,17 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 		}
 
 		// Look up expense account
-		expenseAccountID := findAccount(h.db, tenantID, orgIDPtr, "operating expense", "6900")
+		expenseAccountID := findAccount(h.db, tenantID, orgIDPtr, "operating expense", "9410")
 		if expenseAccountID == uuid.Nil {
-			expenseAccountID = findAccount(h.db, tenantID, orgIDPtr, "miscellaneous expense", "6900")
+			expenseAccountID = findAccount(h.db, tenantID, orgIDPtr, "miscellaneous expense", "9410")
 		}
 
 		// Credit account: AP if reimbursable, Cash otherwise
 		var creditAccountID uuid.UUID
 		if reimbursable {
-			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 		} else {
-			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			creditAccountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 		}
 
 		if expenseAccountID == uuid.Nil || creditAccountID == uuid.Nil {
@@ -713,6 +713,22 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, creditAccountID)
 
 		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	}()
+
+	// Notify: expense approved
+	go func() {
+		var expNum string
+		var expAmount float64
+		h.db.QueryRow(`SELECT expense_number, COALESCE(total_amount, 0) FROM expenses WHERE id = $1`, id).Scan(&expNum, &expAmount)
+		amountStr := fmt.Sprintf("%.0f", expAmount)
+		h.createTranslatedNotification(tenantID, userID, "expense_approved",
+			map[string]interface{}{
+				"expense_id":     id.String(),
+				"expense_number": expNum,
+				"amount":         expAmount,
+			},
+			expNum, amountStr,
+		)
 	}()
 
 	h.GetExpense(c)

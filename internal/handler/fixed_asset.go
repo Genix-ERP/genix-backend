@@ -413,7 +413,7 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 	}
 	pm := input.PaymentMethod
 	if pm == "" {
-		pm = "cash"
+		pm = "bank"
 	}
 	paymentMethod = &pm
 	// For cash/bank, total_paid = acquisition_cost; for credit, total_paid = 0
@@ -463,9 +463,9 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 		if catAssetAcctID != nil {
 			faAcct = *catAssetAcctID
 		} else {
-			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
+			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "0100")
 			if faAcct == uuid.Nil {
-				faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
+				faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "0100")
 			}
 		}
 		if faAcct == uuid.Nil {
@@ -477,19 +477,19 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 		var creditDesc string
 		switch pm {
 		case "credit":
-			// Dt 1500 Fixed Assets / Kt 2000 Accounts Payable
-			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+			// Dt 1500 Fixed Assets / Kt 6010 Accounts Payable
+			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 			if creditAcct == uuid.Nil {
-				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "payable", "2010")
+				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "payable", "6010")
 			}
 			creditDesc = "Accounts Payable"
 		case "bank":
-			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
 			creditDesc = "Bank"
 		default: // cash
-			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 			if creditAcct == uuid.Nil {
-				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
 			}
 			creditDesc = "Cash"
 		}
@@ -851,11 +851,11 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 			return
 		}
 
-		faAcct := findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
+		faAcct := findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "0100")
 		if faAcct == uuid.Nil {
-			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
+			faAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "0100")
 		}
-		accumDeprAcct := findAccount(h.db, tenantID, orgIDPtr, "accumulated depreciation", "1510")
+		accumDeprAcct := findAccount(h.db, tenantID, orgIDPtr, "accumulated depreciation", "0200")
 
 		if faAcct == uuid.Nil {
 			return
@@ -889,9 +889,9 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 		if input.DisposalReason == "sold" && input.DisposalAmount > 0 {
 			// Dt: Cash/Bank for sale proceeds
 			var cashAcct uuid.UUID
-			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 			if cashAcct == uuid.Nil {
-				cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+				cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
 			}
 			if cashAcct != uuid.Nil {
 				lineNum++
@@ -1003,8 +1003,8 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 	newEntries := make([]*entity.DepreciationEntryResponse, 0)
 
 	// Look up accounts for journal entries: Dt 6500 Depr Expense / Kt 1510 Accum Depr
-	deprExpenseAcct := findAccount(h.db, tenantID, orgIDPtr, "depreciation expense", "6500")
-	accumDeprAcct := findAccount(h.db, tenantID, orgIDPtr, "accumulated depreciation", "1510")
+	deprExpenseAcct := findAccount(h.db, tenantID, orgIDPtr, "depreciation expense", "9470")
+	accumDeprAcct := findAccount(h.db, tenantID, orgIDPtr, "accumulated depreciation", "0200")
 	var journalID uuid.UUID
 	var nextNumber int
 	_ = h.db.QueryRow(`
@@ -1395,9 +1395,9 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 			}
 
 			// Payment account (cash/bank)
-			payAcct := findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
-			if input.PaymentAccountCode == "1010" {
-				payAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+			payAcct := findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+			if input.PaymentAccountCode == "5110" {
+				payAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
 			}
 			if payAcct == uuid.Nil {
 				return
@@ -1408,16 +1408,16 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 			switch input.MaintenanceType {
 			case "capital_repair", "modernization":
 				// Dt 1500 Fixed Assets (capitalized)
-				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "1500")
+				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed assets", "0100")
 				if debitAcct == uuid.Nil {
-					debitAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "1400")
+					debitAcct = findAccount(h.db, tenantID, orgIDPtr, "fixed asset", "0100")
 				}
 				debitDesc = "Capital Repair / Modernization"
 			default:
 				// Dt 6900 Misc Expense (or 7110)
-				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "repair", "6900")
+				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "repair", "9410")
 				if debitAcct == uuid.Nil {
-					debitAcct = findAccount(h.db, tenantID, orgIDPtr, "misc expense", "7110")
+					debitAcct = findAccount(h.db, tenantID, orgIDPtr, "misc expense", "9620")
 				}
 				debitDesc = "Maintenance Expense"
 			}
@@ -1602,15 +1602,15 @@ func (h *Handler) RecordAssetPayment(c *gin.Context) {
 			return
 		}
 
-		apAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "2000")
+		apAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 		if apAcct == uuid.Nil {
-			apAcct = findAccount(h.db, tenantID, orgIDPtr, "payable", "2010")
+			apAcct = findAccount(h.db, tenantID, orgIDPtr, "payable", "6010")
 		}
 		var cashAcct uuid.UUID
 		if input.Method == "bank" {
-			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "1010")
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
 		} else {
-			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 		}
 		if apAcct == uuid.Nil || cashAcct == uuid.Nil {
 			return
