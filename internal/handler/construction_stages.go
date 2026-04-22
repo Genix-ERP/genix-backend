@@ -623,3 +623,188 @@ func (h *Handler) DeleteConstructionStage(c *gin.Context) {
 
 	response.Success(c, map[string]interface{}{"message": "Stage deleted successfully"})
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GetProjectInProgressItems
+//
+// Returns a flat feed of every construction item that is currently
+// `status = 'in_progress'` for a given project — stages and sub-stages today,
+// pluggable for more sources later. Used by the "Jarayon" tab in the frontend.
+//
+// Sub-stages don't have their own planned/actual dates, so they inherit the
+// parent stage's dates for reporting purposes. `progress_pct` is derived from
+// the elapsed fraction of the planned window; `bucket` classifies each row
+// as "on_track" (actual_start ≤ today ≤ planned_end) or "behind" (planned_end
+// has passed).
+// ─────────────────────────────────────────────────────────────────────────────
+func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	const q = `
+		SELECT 'stage'::text AS source,
+		       s.id,
+		       NULL::bigint AS parent_id,
+		       NULL::text   AS parent_name,
+		       s.name,
+		       s.status,
+		       s.planned_start, s.planned_end,
+		       s.actual_start,  s.actual_end,
+		       b.name AS building_name
+		FROM construction_stages s
+		LEFT JOIN construction_buildings b ON b.id = s.building_id
+		WHERE s.project_id = $1 AND s.tenant_id = $2 AND s.status = 'in_progress'
+
+		UNION ALL
+
+		SELECT 'sub_stage'::text AS source,
+		       ss.id,
+		       s.id   AS parent_id,
+		       s.name AS parent_name,
+		       ss.name,
+		       ss.status,
+		       s.planned_start, s.planned_end,
+		       s.actual_start,  s.actual_end,
+		       b.name AS building_name
+		FROM construction_sub_stages ss
+		JOIN construction_stages s ON s.id = ss.stage_id
+		LEFT JOIN construction_buildings b ON b.id = s.building_id
+		WHERE s.project_id = $1 AND s.tenant_id = $2 AND ss.status = 'in_progress'
+
+		ORDER BY source, name
+	`
+	rows, err := h.db.Query(q, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query in-progress items", "error", err)
+		response.InternalError(c, "Failed to load in-progress items")
+		return
+	}
+	defer rows.Close()
+
+	type Item struct {
+		Source       string   `json:"source"`
+		ID           int64    `json:"id"`
+		ParentID     *int64   `json:"parent_id"`
+		ParentName   *string  `json:"parent_name"`
+		Name         string   `json:"name"`
+		Status       string   `json:"status"`
+		PlannedStart *string  `json:"planned_start"`
+		PlannedEnd   *string  `json:"planned_end"`
+		ActualStart  *string  `json:"actual_start"`
+		ActualEnd    *string  `json:"actual_end"`
+		BuildingName *string  `json:"building_name"`
+		ProgressPct  float64  `json:"progress_pct"`
+		Bucket       string   `json:"bucket"` // on_track | behind
+	}
+
+	now := time.Now()
+	items := []Item{}
+
+	for rows.Next() {
+		var it Item
+		var parentID sql.NullInt64
+		var parentName, actualStart, actualEnd, buildingName sql.NullString
+		var plannedStartT, plannedEndT sql.NullTime
+		if err := rows.Scan(
+			&it.Source, &it.ID, &parentID, &parentName,
+			&it.Name, &it.Status,
+			&plannedStartT, &plannedEndT,
+			&actualStart, &actualEnd,
+			&buildingName,
+		); err != nil {
+			h.log.Error("Failed to scan in-progress item", "error", err)
+			continue
+		}
+		if parentID.Valid {
+			v := parentID.Int64
+			it.ParentID = &v
+		}
+		if parentName.Valid {
+			v := parentName.String
+			it.ParentName = &v
+		}
+		if plannedStartT.Valid {
+			v := plannedStartT.Time.Format("2006-01-02")
+			it.PlannedStart = &v
+		}
+		if plannedEndT.Valid {
+			v := plannedEndT.Time.Format("2006-01-02")
+			it.PlannedEnd = &v
+		}
+		if actualStart.Valid {
+			v := actualStart.String
+			it.ActualStart = &v
+		}
+		if actualEnd.Valid {
+			v := actualEnd.String
+			it.ActualEnd = &v
+		}
+		if buildingName.Valid {
+			v := buildingName.String
+			it.BuildingName = &v
+		}
+
+		// Compute progress_pct and bucket.
+		if plannedStartT.Valid && plannedEndT.Valid {
+			totalDays := plannedEndT.Time.Sub(plannedStartT.Time).Hours() / 24
+			if totalDays <= 0 {
+				totalDays = 1
+			}
+			elapsed := now.Sub(plannedStartT.Time).Hours() / 24
+			if elapsed < 0 {
+				elapsed = 0
+			}
+			if elapsed > totalDays {
+				elapsed = totalDays
+			}
+			it.ProgressPct = (elapsed / totalDays) * 100
+			if now.After(plannedEndT.Time) {
+				it.Bucket = "behind"
+			} else {
+				it.Bucket = "on_track"
+			}
+		} else {
+			it.ProgressPct = 0
+			it.Bucket = "on_track"
+		}
+		items = append(items, it)
+	}
+
+	// KPI rollup
+	total := len(items)
+	onTrack := 0
+	behind := 0
+	sumPct := 0.0
+	for _, it := range items {
+		if it.Bucket == "behind" {
+			behind++
+		} else {
+			onTrack++
+		}
+		sumPct += it.ProgressPct
+	}
+	avgPct := 0.0
+	if total > 0 {
+		avgPct = sumPct / float64(total)
+	}
+
+	response.Success(c, map[string]interface{}{
+		"project_id": projectID,
+		"items":      items,
+		"kpis": map[string]interface{}{
+			"total":    total,
+			"on_track": onTrack,
+			"behind":   behind,
+			"avg_pct":  avgPct,
+		},
+	})
+}
