@@ -377,13 +377,11 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		return
 	}
 
-	// Generate order number
+	// Order number is generated below, AFTER org resolution, because the unique
+	// constraint is (tenant_id, organization_id, order_number). The old code used
+	// SELECT COUNT(*) scoped only by tenant which caused collisions across orgs
+	// and a classic race when two POSTs landed back-to-back.
 	orderNumber := input.OrderNumber
-	if orderNumber == "" {
-		var count int
-		h.db.QueryRow("SELECT COUNT(*) FROM sales_orders WHERE tenant_id = $1", tenantID).Scan(&count)
-		orderNumber = fmt.Sprintf("S%05d", count+1)
-	}
 
 	orderID := uuid.New()
 	now := time.Now()
@@ -527,18 +525,61 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		discountCode = &input.DiscountCode
 	}
 
-	_, err = h.db.Exec(query,
-		orderID, tenantID, orgID, orderNumber, customerID, contactPersonID,
-		orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
-		currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
-		taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
-		input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, input.VehicleNumber, salesRepID,
-		projectID, projectName,
-		createdBy, now, now,
-	)
-	if err != nil {
+	// Generate order number if not supplied. Uses MAX + 1 scoped by (tenant, org)
+	// so we don't collide across orgs, and retries on unique-constraint violation
+	// to survive concurrent POSTs racing for the same next number.
+	nextOrderNumber := func() string {
+		var maxNum int
+		if orgID != nil {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM sales_orders
+				WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+				  AND order_number ~ '^S[0-9]+$'`,
+				tenantID, *orgID,
+			).Scan(&maxNum)
+		} else {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM sales_orders
+				WHERE tenant_id = $1 AND organization_id IS NULL AND deleted_at IS NULL
+				  AND order_number ~ '^S[0-9]+$'`,
+				tenantID,
+			).Scan(&maxNum)
+		}
+		return fmt.Sprintf("S%05d", maxNum+1)
+	}
+
+	maxAttempts := 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if orderNumber == "" {
+			orderNumber = nextOrderNumber()
+		}
+
+		_, err = h.db.Exec(query,
+			orderID, tenantID, orgID, orderNumber, customerID, contactPersonID,
+			orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
+			currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
+			taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
+			input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, input.VehicleNumber, salesRepID,
+			projectID, projectName,
+			createdBy, now, now,
+		)
+		if err == nil {
+			break
+		}
+		// Retry only on the order-number unique-violation collision; everything else fails fast.
+		if strings.Contains(err.Error(), "sales_orders_tenant_org_order_number_key") && input.OrderNumber == "" {
+			h.log.Warn("Sales order number collision, retrying", "order_number", orderNumber, "attempt", attempt+1)
+			orderNumber = "" // force regeneration next iteration
+			continue
+		}
 		h.log.Error("Failed to create sales order", "error", err, "customer_id", customerID, "order_number", orderNumber)
-		h.log.Error("Failed to create sales order", "error", err)
+		response.InternalError(c, "Failed to create sales order")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to create sales order after retries", "error", err, "customer_id", customerID, "order_number", orderNumber)
 		response.InternalError(c, "Failed to create sales order")
 		return
 	}
