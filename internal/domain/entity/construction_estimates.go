@@ -251,6 +251,12 @@ type BulkCreateEstimateLinesInput struct {
 	Lines      []CreateEstimateLineInput `json:"lines" binding:"required"`
 	Replace    bool                      `json:"replace"`
 	SourceType string                    `json:"source_type"`
+	// SourceFileName identifies the Excel file the user uploaded. Used by
+	// autoCreateForma2FromEstimate to dedupe Forma 2 drafts: multiple
+	// estimate types extracted from the SAME file produce ONE merged
+	// Forma 2, while imports from different files stay separate. See
+	// migration 339 for the matching column on construction_act.
+	SourceFileName string `json:"source_file_name"`
 }
 
 type UpdateEstimateLineInput struct {

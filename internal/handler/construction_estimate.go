@@ -220,49 +220,17 @@ func (h *Handler) CreateEstimate(c *gin.Context) {
 
 	h.logConstructionActivity(tenantID, projectID, userID, "estimate", fmt.Sprintf("Smeta yaratildi: v%d - %s", nextVersion, req.Name), "Estimate", itemID)
 
-	// Auto-create a construction stage when a VOR estimate is created.
-	// The stage inherits the estimate's building/block (migration 333
-	// added construction_stages.building_id) so it shows up under the
-	// correct Bosqichlar tab instead of landing project-wide. The
-	// existing-stage lookup also scopes by building_id so the same
-	// stage name in two different blocks doesn't collide.
-	if req.SourceType == "vor" && req.Name != "" {
-		var existingStageID int64
-		var lookupErr error
-		if req.BuildingID > 0 {
-			lookupErr = h.db.QueryRow(
-				`SELECT id FROM construction_stages
-				 WHERE project_id = $1 AND tenant_id = $2
-				   AND name = $3 AND building_id = $4
-				 LIMIT 1`,
-				projectID, tenantID, req.Name, req.BuildingID,
-			).Scan(&existingStageID)
-		} else {
-			lookupErr = h.db.QueryRow(
-				`SELECT id FROM construction_stages
-				 WHERE project_id = $1 AND tenant_id = $2
-				   AND name = $3 AND building_id IS NULL
-				 LIMIT 1`,
-				projectID, tenantID, req.Name,
-			).Scan(&existingStageID)
-		}
-		if lookupErr != nil {
-			// Stage doesn't exist in this block — create it with the
-			// estimate's building_id (nullInt64FromVal maps 0 → NULL).
-			h.db.Exec(`
-				INSERT INTO construction_stages (
-					tenant_id, project_id, name, status, planned_budget,
-					building_id, stage_order, created_at, updated_at
-				)
-				VALUES (
-					$1, $2, $3, 'not_started', 0,
-					$4,
-					(SELECT COALESCE(MAX(stage_order), 0) + 1 FROM construction_stages WHERE project_id = $2 AND tenant_id = $1),
-					NOW(), NOW()
-				)
-			`, tenantID, projectID, req.Name, nullInt64FromVal(req.BuildingID))
-		}
-	}
+	// NOTE: Auto-stage creation used to happen here, creating a single
+	// stage named after the estimate (`req.Name`). That was wrong for
+	// real-world imports — the uploaded file typically has multiple bold
+	// section headers (e.g. "ТРУДОВЫЕ РЕСУРСЫ", "СТРОИТЕЛЬНЫЕ МАШИНЫ И
+	// МЕХАНИЗМЫ", "МАТЕРИАЛЬНЫЕ РЕСУРСЫ" in a Ресурс sheet, or "Блок №1",
+	// "Блок №2" in a ВОР sheet), each of which should be its own stage.
+	// The SmetaImportModal parser already splits the file into sections
+	// and the frontend handleImport flow now creates one stage per
+	// section, scoped to the estimate's building, for every source type.
+	// Removing the single-stage auto-create here prevents duplicate
+	// "catch-all" stages named after the estimate.
 
 	response.Success(c, map[string]interface{}{
 		"id":      itemID,
@@ -1091,10 +1059,13 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		productsCreated = h.autoCreateProductsFromEstimateLines(tenantID, orgID, userID, req.Lines)
 	}
 
-	// Auto-create Forma 2 (KS-2) draft for VOR and Edinich estimates
+	// Auto-create Forma 2 (KS-2) draft for VOR and Edinich estimates.
+	// `source_file_name` comes from the upload modal — multiple estimate
+	// types imported from the same Excel file share a Forma 2.
 	h.log.Info("BulkCreateEstimateLines: about to auto-create Forma 2",
-		"estimate_id", estimateID, "source_type", sourceType, "line_count", count)
-	forma2ID := h.autoCreateForma2FromEstimate(tenantID, userID, estimateID)
+		"estimate_id", estimateID, "source_type", sourceType,
+		"line_count", count, "source_file_name", req.SourceFileName)
+	forma2ID := h.autoCreateForma2FromEstimate(tenantID, userID, estimateID, req.SourceFileName)
 	h.log.Info("BulkCreateEstimateLines: auto-create Forma 2 result", "forma2_id", forma2ID)
 
 	resp := map[string]interface{}{
@@ -1684,10 +1655,17 @@ func (h *Handler) DeleteEstimateSummaryBatch(c *gin.Context) {
 
 // ─── Auto-create Forma 2 (KS-2) from estimate ───────────────────────────────
 
-// autoCreateForma2FromEstimate creates a draft Forma 2 act when a VOR or Edinich
-// estimate is imported. Lines are pre-filled from the estimate with qty_period = qty_smeta.
-// Returns the created act ID, or 0 if not applicable.
-func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estimateID int64) int64 {
+// autoCreateForma2FromEstimate creates a draft Forma 2 act when a VOR or
+// Edinich estimate is imported. Lines are pre-filled from the estimate
+// with qty_period = qty_smeta. Returns the act ID (new or reused), or 0
+// if not applicable.
+//
+// `sourceFileName` (optional) is the name of the Excel file the user
+// uploaded. When non-empty it acts as the dedup key: every estimate
+// imported from the same file merges into the same Forma 2 draft — so
+// importing VOR + Единич from "april-estimate.xlsx" produces one Forma 2,
+// while a later import of "may-estimate.xlsx" produces a separate one.
+func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estimateID int64, sourceFileName string) int64 {
 	// Fetch estimate metadata: source_type, project_id, subcontract_id, building_id, name
 	// building_id is the per-building scope added in migration 213 — we copy
 	// it to the auto-created Forma 2 so the act belongs to the same building
@@ -1731,6 +1709,41 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 		h.log.Info("Forma 2 already exists for this estimate, skipping auto-create",
 			"existing_act_id", existingActID, "estimate_id", estimateID)
 		return existingActID
+	}
+
+	// Reuse a DRAFT Forma 2 that was auto-created from the SAME uploaded
+	// Excel file. This is the dedup key: importing multiple estimate
+	// types (VOR + Единич) from one file merges into one Forma 2, while
+	// imports from different files stay separate — regardless of how
+	// much time passes between the uploads, which is what the user
+	// wanted. (An earlier pass of this fix used a 10-minute time window
+	// and incorrectly absorbed unrelated drafts that happened to land
+	// within the window.)
+	//
+	// `IS NOT DISTINCT FROM` treats NULL == NULL so no-subcontract /
+	// no-building drafts still match within a file. We only ever look up
+	// by non-empty file name — a missing name falls through to the
+	// create-new-act branch so auto-create never silently merges into
+	// something unrelated.
+	var reuseActID int64
+	if sourceFileName != "" {
+		var subParam, bldParam interface{}
+		if subcontractID.Valid && subcontractID.Int64 > 0 {
+			subParam = subcontractID.Int64
+		}
+		if buildingID.Valid {
+			bldParam = buildingID.Int64
+		}
+		_ = h.db.QueryRow(`
+			SELECT id FROM construction_act
+			WHERE tenant_id = $1 AND project_id = $2 AND act_type = 'ks2'
+			  AND state = 'draft'
+			  AND (subcontract_id IS NOT DISTINCT FROM $3)
+			  AND (building_id   IS NOT DISTINCT FROM $4)
+			  AND source_file_name = $5
+			ORDER BY id DESC
+			LIMIT 1
+		`, tenantID, projectID, subParam, bldParam, sourceFileName).Scan(&reuseActID)
 	}
 
 	// Fetch all estimate lines (excluding resource sub-items for edinich)
@@ -1843,28 +1856,63 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 	}
 
 	var actID int64
-	err = tx.QueryRow(`
-		INSERT INTO construction_act (
-			tenant_id, project_id, subcontract_id, building_id, name, act_type,
-			amount_total, currency, state, notes,
-			created_by, created_date, updated_date,
-			act_number, vat_pct,
-			f2_transport_pct, f2_other_pct
-		) VALUES ($1, $2, $3, $4, $5, 'ks2',
-			0, 'UZS', 'draft', $6,
-			$7, NOW(), NOW(),
-			$8, 12,
-			5, 17
-		)
-		RETURNING id
-	`, tenantID, projectID, subcontractIDVal, actBuildingID, actName,
-		fmt.Sprintf("Avtomatik yaratildi: %s smetasidan", estName),
-		userID,
-		nullInt64FromVal(int64(actNumber)),
-	).Scan(&actID)
-	if err != nil {
-		h.log.Error("Failed to insert auto Forma 2 act", "error", err)
-		return 0
+	// Running base values we'll add the new lines onto. For a brand-new act
+	// these start at zero. For a reused draft we seed them from the existing
+	// row so the final UPDATE writes the merged totals rather than
+	// overwriting what was already there.
+	var sortOffset int
+	var existingTotal, existingLabor, existingEquip, existingMaterials float64
+
+	if reuseActID > 0 {
+		actID = reuseActID
+		// Pick up where the previous lines left off. Using MAX(sort_order)
+		// keeps the merged list in the order we inserted it — VOR lines
+		// first, then Единич, then Ресурс (whatever order the caller ran).
+		_ = tx.QueryRow(
+			`SELECT COALESCE(MAX(sort_order), 0) FROM construction_act_line WHERE act_id = $1`,
+			actID,
+		).Scan(&sortOffset)
+		_ = tx.QueryRow(`
+			SELECT COALESCE(amount_total, 0),
+			       COALESCE(f2_labor_total, 0),
+			       COALESCE(f2_equipment_total, 0),
+			       COALESCE(f2_materials_total, 0)
+			FROM construction_act WHERE id = $1
+		`, actID).Scan(&existingTotal, &existingLabor, &existingEquip, &existingMaterials)
+		h.log.Info("Reusing draft Forma 2 for auto-create merge",
+			"existing_act_id", actID, "estimate_id", estimateID,
+			"sort_offset", sortOffset, "existing_total", existingTotal)
+	} else {
+		// `source_file_name` is the dedup key that a subsequent estimate
+		// from the same uploaded file will match on — see the reuse
+		// branch above. nullStringFromVal keeps the column NULL when
+		// the caller didn't supply a name.
+		err = tx.QueryRow(`
+			INSERT INTO construction_act (
+				tenant_id, project_id, subcontract_id, building_id, name, act_type,
+				amount_total, currency, state, notes,
+				created_by, created_date, updated_date,
+				act_number, vat_pct,
+				f2_transport_pct, f2_other_pct,
+				source_file_name
+			) VALUES ($1, $2, $3, $4, $5, 'ks2',
+				0, 'UZS', 'draft', $6,
+				$7, NOW(), NOW(),
+				$8, 12,
+				5, 17,
+				$9
+			)
+			RETURNING id
+		`, tenantID, projectID, subcontractIDVal, actBuildingID, actName,
+			fmt.Sprintf("Avtomatik yaratildi: %s smetasidan", estName),
+			userID,
+			nullInt64FromVal(int64(actNumber)),
+			nullStringFromVal(sourceFileName),
+		).Scan(&actID)
+		if err != nil {
+			h.log.Error("Failed to insert auto Forma 2 act", "error", err)
+			return 0
+		}
 	}
 
 	// Insert act lines from estimate lines
@@ -1896,7 +1944,7 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 				$11,
 				$12, $13, $14, 0)
 		`, actID, l.ID, l.Name, l.UOM,
-			l.Quantity, unitRate, lineTotal, i+1,
+			l.Quantity, unitRate, lineTotal, sortOffset+i+1,
 			l.Quantity, nullStringFromVal(l.Code),
 			nullStringFromVal(l.ItemNumber),
 			l.Quantity*l.LaborRate, l.Quantity*l.EquipmentRate, l.Quantity*l.MaterialRate,
@@ -1918,17 +1966,25 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 	}
 
 	h.log.Info("Auto Forma 2 lines insert result",
-		"total_lines", len(f2Lines), "inserted", insertedLines, "skipped", len(f2Lines)-insertedLines)
+		"total_lines", len(f2Lines), "inserted", insertedLines,
+		"skipped", len(f2Lines)-insertedLines, "reused", reuseActID > 0)
+
+	// Merge with the existing totals when we're appending to a reused draft.
+	mergedTotal := totalAmount + existingTotal
+	mergedLabor := sumLabor + existingLabor
+	mergedEquip := sumEquip + existingEquip
+	mergedMaterials := sumMaterials + existingMaterials
 
 	// Update totals
-	vatAmount := totalAmount * 12 / 100
-	totalWithVat := totalAmount + vatAmount
+	vatAmount := mergedTotal * 12 / 100
+	totalWithVat := mergedTotal + vatAmount
 	tx.Exec(`UPDATE construction_act SET
 			amount_total = $1, vat_amount = $2, amount_total_with_vat = $3,
-			f2_labor_total = $4, f2_equipment_total = $5, f2_materials_total = $6, f2_cables_total = 0
+			f2_labor_total = $4, f2_equipment_total = $5, f2_materials_total = $6, f2_cables_total = 0,
+			updated_date = NOW()
 		WHERE id = $7`,
-		totalAmount, vatAmount, totalWithVat,
-		sumLabor, sumEquip, sumMaterials,
+		mergedTotal, vatAmount, totalWithVat,
+		mergedLabor, mergedEquip, mergedMaterials,
 		actID)
 
 	if err := tx.Commit(); err != nil {
@@ -1936,15 +1992,24 @@ func (h *Handler) autoCreateForma2FromEstimate(tenantID, userID uuid.UUID, estim
 		return 0
 	}
 
-	h.log.Info("Auto-created Forma 2 from estimate",
+	h.log.Info("Auto Forma 2 merge result",
 		"act_id", actID, "act_name", actName,
 		"estimate_id", estimateID, "source_type", sourceType,
-		"lines", len(f2Lines), "total", totalAmount)
+		"reused_draft", reuseActID > 0,
+		"appended_lines", len(f2Lines), "appended_total", totalAmount,
+		"merged_total", mergedTotal)
 
-	// Activity logging
-	h.logConstructionActivity(tenantID, projectID, userID, "act",
-		fmt.Sprintf("Forma 2 avtomatik yaratildi: %s (%s smetasidan)", actName, estName),
-		"Act", actID)
+	// Activity logging — different verb depending on whether we created
+	// a fresh act or merged into an existing draft.
+	if reuseActID > 0 {
+		h.logConstructionActivity(tenantID, projectID, userID, "act",
+			fmt.Sprintf("Forma 2 ga %s smetasining qatorlari qo'shildi", estName),
+			"Act", actID)
+	} else {
+		h.logConstructionActivity(tenantID, projectID, userID, "act",
+			fmt.Sprintf("Forma 2 avtomatik yaratildi: %s (%s smetasidan)", actName, estName),
+			"Act", actID)
+	}
 
 	return actID
 }
