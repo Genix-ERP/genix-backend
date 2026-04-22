@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -1963,23 +1964,74 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		return
 	}
 
-	// Month window: last 6 months (oldest → newest)
+	// Period-aware time buckets. The dashboard's Day/Month/Quarter/Year
+	// pill filters the `period` query param; each value picks a number
+	// of buckets and the unit spanned by each bucket. Oldest bucket is
+	// index 0, newest (= current) is the last index.
 	now := time.Now()
-	type monthBucket struct {
-		year  int
-		month int
+	period := strings.ToLower(strings.TrimSpace(c.Query("period")))
+	if period == "" {
+		period = "month"
+	}
+	var bucketCount int
+	switch period {
+	case "day":
+		bucketCount = 7 // last 7 days
+	case "quarter":
+		bucketCount = 4 // last 4 quarters
+	case "year":
+		bucketCount = 5 // last 5 years
+	default: // "month"
+		period = "month"
+		bucketCount = 6
+	}
+
+	type timeBucket struct {
+		start time.Time
+		end   time.Time
 		label string
 	}
-	months := make([]monthBucket, 6)
-	labels := make([]string, 6)
-	for i := 0; i < 6; i++ {
-		d := time.Date(now.Year(), now.Month()-time.Month(5-i), 1, 0, 0, 0, 0, now.Location())
-		months[i] = monthBucket{year: d.Year(), month: int(d.Month()), label: d.Format("Jan")}
-		labels[i] = months[i].label
+	buckets := make([]timeBucket, bucketCount)
+	labels := make([]string, bucketCount)
+	for i := 0; i < bucketCount; i++ {
+		offsetFromNow := bucketCount - 1 - i
+		var start, end time.Time
+		var label string
+		switch period {
+		case "day":
+			d := time.Date(now.Year(), now.Month(), now.Day()-offsetFromNow, 0, 0, 0, 0, now.Location())
+			start = d
+			end = d.AddDate(0, 0, 1)
+			label = d.Format("Jan 2")
+		case "quarter":
+			currentQ := (int(now.Month()) - 1) / 3
+			currentQStart := time.Date(now.Year(), time.Month(currentQ*3+1), 1, 0, 0, 0, 0, now.Location())
+			start = currentQStart.AddDate(0, -3*offsetFromNow, 0)
+			end = start.AddDate(0, 3, 0)
+			q := (int(start.Month())-1)/3 + 1
+			label = fmt.Sprintf("Q%d %d", q, start.Year())
+		case "year":
+			start = time.Date(now.Year()-offsetFromNow, 1, 1, 0, 0, 0, 0, now.Location())
+			end = start.AddDate(1, 0, 0)
+			label = fmt.Sprintf("%d", start.Year())
+		default: // "month"
+			d := time.Date(now.Year(), now.Month()-time.Month(offsetFromNow), 1, 0, 0, 0, 0, now.Location())
+			start = d
+			end = d.AddDate(0, 1, 0)
+			label = d.Format("Jan")
+		}
+		buckets[i] = timeBucket{start: start, end: end, label: label}
+		labels[i] = label
 	}
-	monthIdx := func(y, m int) int {
-		for i, mb := range months {
-			if mb.year == y && mb.month == m {
+
+	// Earliest/latest — used to scope the revenue/expense SQL queries
+	// so totals also respect the selected period.
+	rangeStart := buckets[0].start
+	rangeEnd := buckets[len(buckets)-1].end
+
+	bucketIdx := func(t time.Time) int {
+		for i, b := range buckets {
+			if !t.Before(b.start) && t.Before(b.end) {
 				return i
 			}
 		}
@@ -2009,7 +2061,7 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		byOrg[idStr] = &directorCompanySummary{
 			ID:                idStr,
 			Name:              name,
-			MonthlyRevenue:    make([]float64, 6),
+			MonthlyRevenue:    make([]float64, bucketCount),
 			ExpenseByCategory: map[string]float64{},
 		}
 		order = append(order, idStr)
@@ -2024,25 +2076,22 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		return s
 	}
 
-	// 2. Revenue — total + monthly, from sales_invoices (only invoice-type, non-cancelled)
+	// 2. Revenue — scoped to the selected period window.
 	revRows, err := h.db.Query(`
-		SELECT organization_id,
-		       DATE_PART('year', invoice_date)::int AS y,
-		       DATE_PART('month', invoice_date)::int AS m,
-		       COALESCE(SUM(total_amount), 0)
+		SELECT organization_id, invoice_date, COALESCE(total_amount, 0)
 		FROM sales_invoices
 		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
 		  AND status NOT IN ('cancelled')
 		  AND COALESCE(invoice_type, 'invoice') = 'invoice'
-		GROUP BY organization_id, y, m`,
-		tenantID,
+		  AND invoice_date >= $2 AND invoice_date < $3`,
+		tenantID, rangeStart, rangeEnd,
 	)
 	if err == nil {
 		for revRows.Next() {
 			var orgID uuid.UUID
-			var y, m int
+			var invDate time.Time
 			var amt float64
-			if err := revRows.Scan(&orgID, &y, &m, &amt); err != nil {
+			if err := revRows.Scan(&orgID, &invDate, &amt); err != nil {
 				continue
 			}
 			s := touch(orgID.String())
@@ -2050,33 +2099,35 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 				continue
 			}
 			s.Revenue += amt
-			if idx := monthIdx(y, m); idx >= 0 {
+			if idx := bucketIdx(invDate); idx >= 0 {
 				s.MonthlyRevenue[idx] += amt
 			}
 		}
 		revRows.Close()
 	}
 
-	// 3. Expenses — total per org + breakdown-by-category for CURRENT month only
-	//    (the donut on the dashboard shows "this month" breakdown)
+	// 3. Expenses — scoped to the selected period window.
+	//    The donut breakdown is "current bucket" (latest = today's
+	//    period segment, e.g. this month / this quarter / this year).
 	expRows, err := h.db.Query(`
 		SELECT e.organization_id, COALESCE(e.amount, 0),
 		       COALESCE(ec.name, 'Other') AS category,
-		       DATE_PART('year', e.expense_date)::int AS y,
-		       DATE_PART('month', e.expense_date)::int AS m
+		       e.expense_date
 		FROM expenses e
 		LEFT JOIN expense_categories ec ON ec.id = e.category_id
-		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND e.organization_id IS NOT NULL`,
-		tenantID,
+		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND e.organization_id IS NOT NULL
+		  AND e.expense_date >= $2 AND e.expense_date < $3`,
+		tenantID, rangeStart, rangeEnd,
 	)
 	if err == nil {
-		curY, curM := now.Year(), int(now.Month())
+		latestStart := buckets[len(buckets)-1].start
+		latestEnd := buckets[len(buckets)-1].end
 		for expRows.Next() {
 			var orgID uuid.UUID
 			var amt float64
 			var cat string
-			var y, m int
-			if err := expRows.Scan(&orgID, &amt, &cat, &y, &m); err != nil {
+			var expDate time.Time
+			if err := expRows.Scan(&orgID, &amt, &cat, &expDate); err != nil {
 				continue
 			}
 			s := touch(orgID.String())
@@ -2084,7 +2135,7 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 				continue
 			}
 			s.Expenses += amt
-			if y == curY && m == curM {
+			if !expDate.Before(latestStart) && expDate.Before(latestEnd) {
 				s.ExpenseByCategory[cat] += amt
 			}
 		}
