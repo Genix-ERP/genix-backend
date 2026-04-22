@@ -316,13 +316,16 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 		}
 	}
 
-	// Auto-generate name
+	// Auto-generate name. Migration 327 renamed the user-facing labels from
+	// "KS-2 / KS-3" to "Forma 2 / Forma 3"; mirror that here so new acts are
+	// named "Forma 2-001" / "Forma 3-001" instead of "KS2-001" / "KS3-001".
+	// The internal act_type values (ks2 / ks3) stay the same.
 	prefix := "ACT"
 	switch req.ActType {
 	case "ks2":
-		prefix = "KS2"
+		prefix = "Forma 2"
 	case "ks3":
-		prefix = "KS3"
+		prefix = "Forma 3"
 	case "hidden_work":
 		prefix = "F19"
 	}

@@ -1841,6 +1841,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/stages", h.ListConstructionStages)
 		constructionProjects.POST("/:id/stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionStage)
 
+		// Flat feed of everything currently in_progress (stages + sub-stages).
+		// Drives the "Jarayon" tab on the frontend.
+		constructionProjects.GET("/:id/in-progress", h.GetProjectInProgressItems)
+
 		// Expense Lines (Xarajat operatsiyalari)
 		constructionProjects.GET("/:id/expenses", h.ListExpenseLines)
 		constructionProjects.POST("/:id/expenses", h.perm.Require("construction", "project", "update"), h.CreateExpenseLine)

@@ -34,6 +34,7 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	// Optional filters
 	stageFilter := c.Query("stage_id")
 	statusFilter := c.Query("status")
+	buildingFilter := c.Query("building_id")
 
 	// 1. Load stages
 	type Stage struct {
@@ -63,6 +64,14 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	if statusFilter != "" {
 		stageQuery += ` AND status = $` + strconv.Itoa(argN)
 		stageArgs = append(stageArgs, statusFilter)
+		argN++
+	}
+	if buildingFilter != "" {
+		// Scope stages to one building/block. `building_id` was added by
+		// migration 333 — nullable, so project-wide stages simply won't match.
+		stageQuery += ` AND building_id = $` + strconv.Itoa(argN)
+		bid, _ := strconv.ParseInt(buildingFilter, 10, 64)
+		stageArgs = append(stageArgs, bid)
 		argN++
 	}
 	stageQuery += ` ORDER BY stage_order ASC, id ASC`

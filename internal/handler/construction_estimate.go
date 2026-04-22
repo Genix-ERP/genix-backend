@@ -220,19 +220,47 @@ func (h *Handler) CreateEstimate(c *gin.Context) {
 
 	h.logConstructionActivity(tenantID, projectID, userID, "estimate", fmt.Sprintf("Smeta yaratildi: v%d - %s", nextVersion, req.Name), "Estimate", itemID)
 
-	// Auto-create a construction stage when VOR estimate is created
+	// Auto-create a construction stage when a VOR estimate is created.
+	// The stage inherits the estimate's building/block (migration 333
+	// added construction_stages.building_id) so it shows up under the
+	// correct Bosqichlar tab instead of landing project-wide. The
+	// existing-stage lookup also scopes by building_id so the same
+	// stage name in two different blocks doesn't collide.
 	if req.SourceType == "vor" && req.Name != "" {
 		var existingStageID int64
-		err := h.db.QueryRow(
-			`SELECT id FROM construction_stages WHERE project_id = $1 AND tenant_id = $2 AND name = $3 LIMIT 1`,
-			projectID, tenantID, req.Name,
-		).Scan(&existingStageID)
-		if err != nil {
-			// Stage doesn't exist, create it
+		var lookupErr error
+		if req.BuildingID > 0 {
+			lookupErr = h.db.QueryRow(
+				`SELECT id FROM construction_stages
+				 WHERE project_id = $1 AND tenant_id = $2
+				   AND name = $3 AND building_id = $4
+				 LIMIT 1`,
+				projectID, tenantID, req.Name, req.BuildingID,
+			).Scan(&existingStageID)
+		} else {
+			lookupErr = h.db.QueryRow(
+				`SELECT id FROM construction_stages
+				 WHERE project_id = $1 AND tenant_id = $2
+				   AND name = $3 AND building_id IS NULL
+				 LIMIT 1`,
+				projectID, tenantID, req.Name,
+			).Scan(&existingStageID)
+		}
+		if lookupErr != nil {
+			// Stage doesn't exist in this block — create it with the
+			// estimate's building_id (nullInt64FromVal maps 0 → NULL).
 			h.db.Exec(`
-				INSERT INTO construction_stages (tenant_id, project_id, name, status, planned_budget, stage_order, created_at, updated_at)
-				VALUES ($1, $2, $3, 'not_started', 0, (SELECT COALESCE(MAX(stage_order), 0) + 1 FROM construction_stages WHERE project_id = $2 AND tenant_id = $1), NOW(), NOW())
-			`, tenantID, projectID, req.Name)
+				INSERT INTO construction_stages (
+					tenant_id, project_id, name, status, planned_budget,
+					building_id, stage_order, created_at, updated_at
+				)
+				VALUES (
+					$1, $2, $3, 'not_started', 0,
+					$4,
+					(SELECT COALESCE(MAX(stage_order), 0) + 1 FROM construction_stages WHERE project_id = $2 AND tenant_id = $1),
+					NOW(), NOW()
+				)
+			`, tenantID, projectID, req.Name, nullInt64FromVal(req.BuildingID))
 		}
 	}
 
@@ -1406,7 +1434,13 @@ func (h *Handler) DeleteEstimateLine(c *gin.Context) {
 // HELPER FUNCTIONS
 // =====================================================
 
-// getEstimateLines retrieves all lines for an estimate
+// getEstimateLines retrieves all lines for an estimate, including the
+// sub-line linkage fields (parent_line_id, norm_rate, subline_seq) added by
+// migration 332. Without these the frontend falls back to matching
+// item_number against /^\d+-\d+$/, which works for numeric BOP/Единич codes
+// but silently fails for Ресурс estimates whose item_numbers are SNiP-style
+// codes (e.g. "Э14-1-17"), so podkators created on resurs rows never render
+// as nested children of their parent.
 func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entity.ConstructionEstimateLine {
 	query := `
 		SELECT l.id, l.tenant_id, l.estimate_id, l.wbs_id,
@@ -1415,13 +1449,19 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       l.unit_rate, l.total_amount, l.actual_amount,
 		       COALESCE(l.code, ''), COALESCE(l.item_number, ''),
 		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
+		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
+		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
 		WHERE l.estimate_id = $1 AND l.tenant_id = $2
-		ORDER BY l.sort_order ASC, l.id ASC
+		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
+		         COALESCE(l.parent_line_id, l.id) ASC,
+		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
+		         COALESCE(l.subline_seq, 0) ASC,
+		         l.id ASC
 	`
 
 	rows, err := h.db.Query(query, estimateID, tenantID)
@@ -1441,6 +1481,7 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 			&line.UnitRate, &line.TotalAmount, &line.ActualAmount,
 			&line.Code, &line.ItemNumber,
 			&line.ResourceType, &line.ParentItemNumber,
+			&line.ParentLineID, &line.NormRate, &line.SublineSeq,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
