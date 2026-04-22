@@ -262,6 +262,21 @@ func (h *Handler) UpdateConstructionStage(c *gin.Context) {
 	}
 	if req.Status != nil {
 		addField("status", *req.Status)
+		// Stamp actual_start the first time a stage transitions into
+		// in_progress / completed, unless the request already supplies an
+		// explicit actual_start. COALESCE preserves any previously-recorded
+		// date, so toggling status back and forth doesn't reset it.
+		if req.ActualStart == nil && (*req.Status == "in_progress" || *req.Status == "completed") {
+			argCount++
+			updates = append(updates, fmt.Sprintf("actual_start = COALESCE(actual_start, $%d)", argCount))
+			args = append(args, time.Now().Format("2006-01-02"))
+		}
+		// Stamp actual_end the first time a stage is marked completed.
+		if req.ActualEnd == nil && *req.Status == "completed" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("actual_end = COALESCE(actual_end, $%d)", argCount))
+			args = append(args, time.Now().Format("2006-01-02"))
+		}
 	}
 	if req.PlannedBudget != nil {
 		addField("planned_budget", *req.PlannedBudget)
@@ -504,6 +519,19 @@ func (h *Handler) UpdateConstructionSubStage(c *gin.Context) {
 	}
 	if req.Status != nil {
 		addField("status", *req.Status)
+		// Stamp actual_start / actual_end on the matching status transitions.
+		// Columns were added by migration 335; COALESCE preserves any value
+		// already on record if the status is toggled multiple times.
+		if *req.Status == "in_progress" || *req.Status == "completed" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("actual_start = COALESCE(actual_start, $%d)", argCount))
+			args = append(args, time.Now().Format("2006-01-02"))
+		}
+		if *req.Status == "completed" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("actual_end = COALESCE(actual_end, $%d)", argCount))
+			args = append(args, time.Now().Format("2006-01-02"))
+		}
 	}
 	if req.Notes != nil {
 		if *req.Notes == "" {
@@ -650,6 +678,15 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		return
 	}
 
+	// Additional columns beyond the previous version:
+	//   - sub_total / sub_done: counts of sub-stages and completed sub-stages
+	//     under each row. For a stage row we use its own counts; for a
+	//     sub-stage row we report 1 / (1 if completed else 0) so the
+	//     downstream progress logic is uniform. Drives the progress_pct
+	//     that the Jarayon tab renders (matches the Bosqichlar tab's
+	//     "completed/total" ratio instead of the old time-elapsed estimate).
+	//   - Sub-stage actual_start / actual_end (migration 335) fall back to
+	//     the parent stage's dates so legacy rows still report something.
 	const q = `
 		SELECT 'stage'::text AS source,
 		       s.id,
@@ -659,7 +696,14 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		       s.status,
 		       s.planned_start, s.planned_end,
 		       s.actual_start,  s.actual_end,
-		       b.name AS building_name
+		       b.name AS building_name,
+		       COALESCE((SELECT COUNT(*)
+		                 FROM construction_sub_stages x
+		                 WHERE x.stage_id = s.id AND x.tenant_id = s.tenant_id), 0) AS sub_total,
+		       COALESCE((SELECT COUNT(*)
+		                 FROM construction_sub_stages x
+		                 WHERE x.stage_id = s.id AND x.tenant_id = s.tenant_id
+		                   AND x.status = 'completed'), 0) AS sub_done
 		FROM construction_stages s
 		LEFT JOIN construction_buildings b ON b.id = s.building_id
 		WHERE s.project_id = $1 AND s.tenant_id = $2 AND s.status = 'in_progress'
@@ -673,8 +717,11 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		       ss.name,
 		       ss.status,
 		       s.planned_start, s.planned_end,
-		       s.actual_start,  s.actual_end,
-		       b.name AS building_name
+		       COALESCE(ss.actual_start, s.actual_start) AS actual_start,
+		       COALESCE(ss.actual_end,   s.actual_end)   AS actual_end,
+		       b.name AS building_name,
+		       1 AS sub_total,
+		       (CASE WHEN ss.status = 'completed' THEN 1 ELSE 0 END) AS sub_done
 		FROM construction_sub_stages ss
 		JOIN construction_stages s ON s.id = ss.stage_id
 		LEFT JOIN construction_buildings b ON b.id = s.building_id
@@ -712,14 +759,16 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 	for rows.Next() {
 		var it Item
 		var parentID sql.NullInt64
-		var parentName, actualStart, actualEnd, buildingName sql.NullString
-		var plannedStartT, plannedEndT sql.NullTime
+		var parentName, buildingName sql.NullString
+		var plannedStartT, plannedEndT, actualStartT, actualEndT sql.NullTime
+		var subTotal, subDone int64
 		if err := rows.Scan(
 			&it.Source, &it.ID, &parentID, &parentName,
 			&it.Name, &it.Status,
 			&plannedStartT, &plannedEndT,
-			&actualStart, &actualEnd,
+			&actualStartT, &actualEndT,
 			&buildingName,
+			&subTotal, &subDone,
 		); err != nil {
 			h.log.Error("Failed to scan in-progress item", "error", err)
 			continue
@@ -740,12 +789,12 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 			v := plannedEndT.Time.Format("2006-01-02")
 			it.PlannedEnd = &v
 		}
-		if actualStart.Valid {
-			v := actualStart.String
+		if actualStartT.Valid {
+			v := actualStartT.Time.Format("2006-01-02")
 			it.ActualStart = &v
 		}
-		if actualEnd.Valid {
-			v := actualEnd.String
+		if actualEndT.Valid {
+			v := actualEndT.Time.Format("2006-01-02")
 			it.ActualEnd = &v
 		}
 		if buildingName.Valid {
@@ -753,27 +802,36 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 			it.BuildingName = &v
 		}
 
-		// Compute progress_pct and bucket.
-		if plannedStartT.Valid && plannedEndT.Valid {
-			totalDays := plannedEndT.Time.Sub(plannedStartT.Time).Hours() / 24
-			if totalDays <= 0 {
-				totalDays = 1
-			}
-			elapsed := now.Sub(plannedStartT.Time).Hours() / 24
-			if elapsed < 0 {
-				elapsed = 0
-			}
-			if elapsed > totalDays {
-				elapsed = totalDays
-			}
-			it.ProgressPct = (elapsed / totalDays) * 100
-			if now.After(plannedEndT.Time) {
-				it.Bucket = "behind"
+		// Progress policy:
+		//   * stage rows → ratio of completed sub-stages (matches the
+		//     Bosqichlar tab's "1/2 = 50%" display).
+		//   * stage rows with no sub-stages → 0% when in progress, 100% when
+		//     completed. (This feed only returns in_progress, so effectively 0.)
+		//   * sub-stage rows → 0/50/100 based on their own status.
+		switch it.Source {
+		case "stage":
+			if subTotal > 0 {
+				it.ProgressPct = float64(subDone) / float64(subTotal) * 100
+			} else if it.Status == "completed" {
+				it.ProgressPct = 100
 			} else {
-				it.Bucket = "on_track"
+				it.ProgressPct = 0
 			}
+		case "sub_stage":
+			switch it.Status {
+			case "completed":
+				it.ProgressPct = 100
+			case "in_progress":
+				it.ProgressPct = 50
+			default:
+				it.ProgressPct = 0
+			}
+		}
+
+		// "Behind" only makes sense once a planned_end is on record and past.
+		if plannedEndT.Valid && now.After(plannedEndT.Time) {
+			it.Bucket = "behind"
 		} else {
-			it.ProgressPct = 0
 			it.Bucket = "on_track"
 		}
 		items = append(items, it)
