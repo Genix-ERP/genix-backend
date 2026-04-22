@@ -480,11 +480,10 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		createdBy = &userID
 	}
 
-	// Parse organization ID
+	// Resolve organization ID (input body first, then header)
 	var orgID *uuid.UUID
 	if input.OrganizationID != "" {
-		parsed, parseErr := uuid.Parse(input.OrganizationID)
-		if parseErr == nil {
+		if parsed, parseErr := uuid.Parse(input.OrganizationID); parseErr == nil {
 			orgID = &parsed
 		}
 	}
