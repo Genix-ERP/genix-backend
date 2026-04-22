@@ -220,12 +220,20 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 		return
 	}
 
-	// Insert one entry per active employee, with advance/remainder snapshots.
+	// Collect all employees first, then insert — pq doesn't allow executing
+	// new statements on a tx while rows are still open on the same connection
+	// (surfaces as "unexpected Parse response 'D'").
+	type empRow struct {
+		id       uuid.UUID
+		fullName string
+		position string
+		salary   float64
+	}
 	rows, err := tx.Query(`
 		SELECT id,
 		       COALESCE(first_name, '') || ' ' || COALESCE(last_name, '') AS full_name,
 		       COALESCE(job_title, ''),
-		       COALESCE(salary, 0)
+		       COALESCE(base_salary, 0)
 		FROM employees
 		WHERE tenant_id = $1 AND (deleted_at IS NULL)
 	`, tenantID)
@@ -233,19 +241,21 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 		response.InternalError(c, "Failed to load employees")
 		return
 	}
-	defer rows.Close()
+	var emps []empRow
+	for rows.Next() {
+		var e empRow
+		if err := rows.Scan(&e.id, &e.fullName, &e.position, &e.salary); err != nil {
+			continue
+		}
+		emps = append(emps, e)
+	}
+	rows.Close()
 
 	created := 0
 	var totalSalary float64
-	for rows.Next() {
-		var empID uuid.UUID
-		var fullName, position string
-		var salary float64
-		if err := rows.Scan(&empID, &fullName, &position, &salary); err != nil {
-			continue
-		}
-		advance := math.Round(salary * settings.AdvancePercent / 100)
-		remainder := salary - advance
+	for _, e := range emps {
+		advance := math.Round(e.salary * settings.AdvancePercent / 100)
+		remainder := e.salary - advance
 
 		_, err := tx.Exec(`
 			INSERT INTO payroll_entries (
@@ -261,14 +271,14 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 				false, false,
 				'bank_transfer', 'pending', $10, $10
 			)
-		`, tenantID, periodID, empID, fullName, position, salary,
+		`, tenantID, periodID, e.id, e.fullName, e.position, e.salary,
 			advance, remainder, settings.AdvancePercent, now)
 		if err != nil {
-			h.log.Error("Auto-create entry failed", "error", err, "employee", empID)
+			h.log.Error("Auto-create entry failed", "error", err, "employee", e.id)
 			continue
 		}
 		created++
-		totalSalary += salary
+		totalSalary += e.salary
 	}
 
 	// Update period totals
@@ -447,7 +457,7 @@ func (h *Handler) ExportPayrollBackup(c *gin.Context) {
 
 	empRows, _ := h.db.Query(`
 		SELECT id, COALESCE(first_name,'') || ' ' || COALESCE(last_name,'') AS full_name,
-		       COALESCE(job_title,''), COALESCE(salary, 0)
+		       COALESCE(job_title,''), COALESCE(base_salary, 0)
 		FROM employees WHERE tenant_id = $1
 	`, tenantID)
 	type empOut struct {

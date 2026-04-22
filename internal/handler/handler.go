@@ -1610,6 +1610,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employeeTaxes.POST("/preview", h.PreviewPayrollTaxes)
 	}
 
+	// ────────────── Company Tax Rates (migration 340) ──────────────
+	// Activity-level taxes (NDS / Profit / Turnover / Dividend / …).
+	// Complements /employee-taxes so Settings → Finance can present the
+	// full 8-tax default catalog from TZ §1.2 of ТЗ_Ish_Haqi_Soliq_Tolik.
+	companyTaxRates := rg.Group("/company-tax-rates")
+	{
+		companyTaxRates.GET("", h.ListCompanyTaxRates)
+		companyTaxRates.POST("", h.CreateCompanyTaxRate)
+		companyTaxRates.PUT("/:id", h.UpdateCompanyTaxRate)
+		companyTaxRates.DELETE("/:id", h.DeleteCompanyTaxRate)
+	}
+
 	// ────────────── TT "Ish haqi" (payroll simple model) ──────────────
 	// Settings, auto-create, mark-paid-with-day, and backup export.
 	// Share the same "hr.payroll" permission with the existing payroll flow.
