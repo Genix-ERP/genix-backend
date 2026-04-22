@@ -1811,11 +1811,18 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 		response.BadRequest(c, "Email or phone is required")
 		return
 	}
+	// Phone-based registration ignores email entirely: the OTP was
+	// keyed by phone in SendOTP, the "already registered" check must
+	// be by phone, and the users row is saved with email=NULL. Any
+	// stray email value on the request (empty string, placeholder,
+	// whatever) gets wiped here so the rest of the function can't
+	// accidentally read it.
 	if input.Phone != "" {
 		input.Phone = normalizePhone(input.Phone)
+		input.Email = ""
 	}
 	identifier := input.Email
-	if input.Phone != "" && input.Email == "" {
+	if input.Phone != "" {
 		identifier = input.Phone
 	}
 
@@ -1834,7 +1841,7 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 	`, identifier).Scan(&otpID, &storedCode, &expiresAt, &verifiedAt)
 
 	if err == sql.ErrNoRows {
-		response.BadRequest(c, "No OTP found. Please verify your email first.")
+		response.BadRequest(c, "No OTP found. Please request a new code.")
 		return
 	}
 	if err != nil {
