@@ -328,6 +328,9 @@ type ConstructionBuilding struct {
 	// Computed
 	SectionsCount int     `json:"sections_count,omitempty" db:"sections_count"`
 	TotalSmeta    float64 `json:"total_smeta,omitempty" db:"total_smeta"`
+	// FilesCount is the number of rows in building_files linked to this
+	// building. Drives the badge on the "Fayllar" button in the UI.
+	FilesCount int `json:"files_count" db:"files_count"`
 }
 
 // MarshalJSON custom marshaler for ConstructionBuilding to handle sql.Null* types
@@ -365,6 +368,7 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		UpdatedDate          time.Time       `json:"updated_date"`
 		SectionsCount        int             `json:"sections_count,omitempty"`
 		TotalSmeta           float64         `json:"total_smeta,omitempty"`
+		FilesCount           int             `json:"files_count"`
 	}{
 		ID:                   b.ID,
 		TenantID:             b.TenantID,
@@ -398,6 +402,7 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		UpdatedDate:          b.UpdatedDate,
 		SectionsCount:        b.SectionsCount,
 		TotalSmeta:           b.TotalSmeta,
+		FilesCount:           b.FilesCount,
 	})
 }
 

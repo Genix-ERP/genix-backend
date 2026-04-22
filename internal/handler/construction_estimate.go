@@ -220,19 +220,47 @@ func (h *Handler) CreateEstimate(c *gin.Context) {
 
 	h.logConstructionActivity(tenantID, projectID, userID, "estimate", fmt.Sprintf("Smeta yaratildi: v%d - %s", nextVersion, req.Name), "Estimate", itemID)
 
-	// Auto-create a construction stage when VOR estimate is created
+	// Auto-create a construction stage when a VOR estimate is created.
+	// The stage inherits the estimate's building/block (migration 333
+	// added construction_stages.building_id) so it shows up under the
+	// correct Bosqichlar tab instead of landing project-wide. The
+	// existing-stage lookup also scopes by building_id so the same
+	// stage name in two different blocks doesn't collide.
 	if req.SourceType == "vor" && req.Name != "" {
 		var existingStageID int64
-		err := h.db.QueryRow(
-			`SELECT id FROM construction_stages WHERE project_id = $1 AND tenant_id = $2 AND name = $3 LIMIT 1`,
-			projectID, tenantID, req.Name,
-		).Scan(&existingStageID)
-		if err != nil {
-			// Stage doesn't exist, create it
+		var lookupErr error
+		if req.BuildingID > 0 {
+			lookupErr = h.db.QueryRow(
+				`SELECT id FROM construction_stages
+				 WHERE project_id = $1 AND tenant_id = $2
+				   AND name = $3 AND building_id = $4
+				 LIMIT 1`,
+				projectID, tenantID, req.Name, req.BuildingID,
+			).Scan(&existingStageID)
+		} else {
+			lookupErr = h.db.QueryRow(
+				`SELECT id FROM construction_stages
+				 WHERE project_id = $1 AND tenant_id = $2
+				   AND name = $3 AND building_id IS NULL
+				 LIMIT 1`,
+				projectID, tenantID, req.Name,
+			).Scan(&existingStageID)
+		}
+		if lookupErr != nil {
+			// Stage doesn't exist in this block — create it with the
+			// estimate's building_id (nullInt64FromVal maps 0 → NULL).
 			h.db.Exec(`
-				INSERT INTO construction_stages (tenant_id, project_id, name, status, planned_budget, stage_order, created_at, updated_at)
-				VALUES ($1, $2, $3, 'not_started', 0, (SELECT COALESCE(MAX(stage_order), 0) + 1 FROM construction_stages WHERE project_id = $2 AND tenant_id = $1), NOW(), NOW())
-			`, tenantID, projectID, req.Name)
+				INSERT INTO construction_stages (
+					tenant_id, project_id, name, status, planned_budget,
+					building_id, stage_order, created_at, updated_at
+				)
+				VALUES (
+					$1, $2, $3, 'not_started', 0,
+					$4,
+					(SELECT COALESCE(MAX(stage_order), 0) + 1 FROM construction_stages WHERE project_id = $2 AND tenant_id = $1),
+					NOW(), NOW()
+				)
+			`, tenantID, projectID, req.Name, nullInt64FromVal(req.BuildingID))
 		}
 	}
 
@@ -611,9 +639,10 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	h.db.QueryRow(`SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`,
 		estimateID, tenantID).Scan(&total)
 
-	// Query paginated rows. Parent rows come first (parent_line_id IS NULL),
-	// then sub-lines are ordered by sort_order → subline_seq → id so the
-	// frontend can render them nested without extra work.
+	// Query paginated rows. We group each sub-line immediately after its
+	// parent by sorting on the *parent's* sort_order (via self-join) plus the
+	// parent's id as a stable group key. Within a group, the parent comes
+	// first, then children by subline_seq.
 	query := `
 		SELECT l.id, l.tenant_id, l.estimate_id, l.wbs_id,
 		       l.name, l.uom, l.quantity,
@@ -627,8 +656,10 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
+		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
 		WHERE l.estimate_id = $1 AND l.tenant_id = $2
-		ORDER BY l.sort_order ASC,
+		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
+		         COALESCE(l.parent_line_id, l.id) ASC,
 		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
 		         COALESCE(l.subline_seq, 0) ASC,
 		         l.id ASC
@@ -811,11 +842,13 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		var pItem, pUom sql.NullString
 		var pQty float64
 		var pEstimateID int64
+		var pSortOrder int
 		err := h.db.QueryRow(`
-			SELECT estimate_id, COALESCE(item_number, ''), COALESCE(uom, ''), COALESCE(quantity, 0)
+			SELECT estimate_id, COALESCE(item_number, ''), COALESCE(uom, ''),
+			       COALESCE(quantity, 0), COALESCE(sort_order, 0)
 			FROM construction_estimate_line
 			WHERE id = $1 AND tenant_id = $2
-		`, req.ParentLineID, tenantID).Scan(&pEstimateID, &pItem, &pUom, &pQty)
+		`, req.ParentLineID, tenantID).Scan(&pEstimateID, &pItem, &pUom, &pQty, &pSortOrder)
 		if err == sql.ErrNoRows {
 			response.BadRequest(c, "Parent line not found")
 			return
@@ -833,6 +866,15 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		parentLineIDSQL = sql.NullInt64{Int64: req.ParentLineID, Valid: true}
 		parentItemNumber = pItem.String
 		parentQuantity = pQty
+
+		// Inherit the parent's sort_order so the backend ORDER BY places the
+		// sub-line next to its parent (without this, newly-created sub-lines
+		// default to sort_order = 0 and drift to the top of the list when other
+		// rows have higher sort_orders — which was the "3-1 appears before 1"
+		// bug). Clients can still override by sending their own sort_order.
+		if req.SortOrder == 0 {
+			req.SortOrder = pSortOrder
+		}
 
 		// Auto-assign the next subline_seq for this parent
 		if err := h.db.QueryRow(`
@@ -1392,7 +1434,13 @@ func (h *Handler) DeleteEstimateLine(c *gin.Context) {
 // HELPER FUNCTIONS
 // =====================================================
 
-// getEstimateLines retrieves all lines for an estimate
+// getEstimateLines retrieves all lines for an estimate, including the
+// sub-line linkage fields (parent_line_id, norm_rate, subline_seq) added by
+// migration 332. Without these the frontend falls back to matching
+// item_number against /^\d+-\d+$/, which works for numeric BOP/Единич codes
+// but silently fails for Ресурс estimates whose item_numbers are SNiP-style
+// codes (e.g. "Э14-1-17"), so podkators created on resurs rows never render
+// as nested children of their parent.
 func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entity.ConstructionEstimateLine {
 	query := `
 		SELECT l.id, l.tenant_id, l.estimate_id, l.wbs_id,
@@ -1401,13 +1449,19 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       l.unit_rate, l.total_amount, l.actual_amount,
 		       COALESCE(l.code, ''), COALESCE(l.item_number, ''),
 		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
+		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
+		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
 		WHERE l.estimate_id = $1 AND l.tenant_id = $2
-		ORDER BY l.sort_order ASC, l.id ASC
+		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
+		         COALESCE(l.parent_line_id, l.id) ASC,
+		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
+		         COALESCE(l.subline_seq, 0) ASC,
+		         l.id ASC
 	`
 
 	rows, err := h.db.Query(query, estimateID, tenantID)
@@ -1427,6 +1481,7 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 			&line.UnitRate, &line.TotalAmount, &line.ActualAmount,
 			&line.Code, &line.ItemNumber,
 			&line.ResourceType, &line.ParentItemNumber,
+			&line.ParentLineID, &line.NormRate, &line.SublineSeq,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
@@ -2007,23 +2062,36 @@ func (h *Handler) autoCreateProductsFromEstimateLines(tenantID, orgID, userID uu
 		id := uuid.New()
 		now := time.Now()
 
+		// Copy search_key ONLY if an existing same-name product in the
+		// tenant already has one. We do NOT derive a key from the
+		// smeta name — construction names are long GOST Cyrillic
+		// strings that produce meaningless keys. Keys are meant to be
+		// set by hand on the manufacturing side (short technical
+		// codes); the construction side just picks them up when names
+		// match. If there is no match, leave the column NULL so the
+		// product remains unlinked until a user sets a key manually.
+		var searchKeyPtr *string
+		if k := h.lookupSearchKeyForName(tenantID, name); k != "" {
+			searchKeyPtr = &k
+		}
+
 		_, err = h.db.Exec(`
 			INSERT INTO products (
-				id, tenant_id, origin_organization_id, type, code, name,
+				id, tenant_id, origin_organization_id, type, code, name, search_key,
 				unit_id, cost_price, list_price,
 				is_stockable, track_inventory,
 				is_purchasable, is_sellable, can_be_sold, can_be_purchased,
 				can_be_expensed, inventory_type,
 				is_active, tags, created_by, created_at, updated_at
 			) VALUES (
-				$1, $2, $3, 'product', $4, $5,
-				$6, $7, $7,
+				$1, $2, $3, 'product', $4, $5, $6,
+				$7, $8, $8,
 				true, true,
 				true, false, false, true,
 				true, 'trade',
-				true, '["estimate-import"]'::jsonb, $8, $9, $9
+				true, '["estimate-import"]'::jsonb, $9, $10, $10
 			)
-		`, id, tenantID, orgIDPtr, code, name,
+		`, id, tenantID, orgIDPtr, code, name, searchKeyPtr,
 			unitID, costPrice,
 			userID, now,
 		)

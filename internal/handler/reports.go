@@ -1921,21 +1921,38 @@ func (h *Handler) GetAccountCard(c *gin.Context) {
 // =====================================================
 
 type directorCompanySummary struct {
-	ID                string             `json:"id"`
-	Name              string             `json:"name"`
-	Revenue           float64            `json:"revenue"`
-	Expenses          float64            `json:"expenses"`
-	Profit            float64            `json:"profit"`
-	Debtors           float64            `json:"debtors"`
-	Creditors         float64            `json:"creditors"`
-	MonthlyRevenue    []float64          `json:"monthly_revenue"`
-	ExpenseByCategory map[string]float64 `json:"expense_by_category"`
-	StockUnits        float64            `json:"stock_units"`
-	StockValue        float64            `json:"stock_value"`
-	LowStockCount     int                `json:"low_stock_count"`
-	TotalEmployees    int                `json:"total_employees"`
-	ActiveEmployees   int                `json:"active_employees"`
-	SalaryFund        float64            `json:"salary_fund"`
+	ID                   string                       `json:"id"`
+	Name                 string                       `json:"name"`
+	Revenue              float64                      `json:"revenue"`
+	Expenses             float64                      `json:"expenses"`
+	Profit               float64                      `json:"profit"`
+	Debtors              float64                      `json:"debtors"`
+	Creditors            float64                      `json:"creditors"`
+	MonthlyRevenue       []float64                    `json:"monthly_revenue"`
+	ExpenseByCategory    map[string]float64           `json:"expense_by_category"`
+	StockUnits           float64                      `json:"stock_units"`
+	StockValue           float64                      `json:"stock_value"`
+	LowStockCount        int                          `json:"low_stock_count"`
+	TotalEmployees       int                          `json:"total_employees"`
+	ActiveEmployees      int                          `json:"active_employees"`
+	SalaryFund           float64                      `json:"salary_fund"`
+	TopStockProducts     []directorTopStockProduct    `json:"top_stock_products"`
+	ConstructionProjects []directorConstructionProjct `json:"construction_projects"`
+}
+
+type directorTopStockProduct struct {
+	Name  string  `json:"name"`
+	Qty   float64 `json:"qty"`
+	Value float64 `json:"value"`
+}
+
+type directorConstructionProjct struct {
+	ID             int64   `json:"id"`
+	Name           string  `json:"name"`
+	Code           string  `json:"code"`
+	Status         string  `json:"status"`
+	Progress       float64 `json:"progress"`
+	ContractAmount float64 `json:"contract_amount"`
 }
 
 // GetDirectorSummary returns per-organization financial/stock/HR metrics in a single response.
@@ -2183,6 +2200,71 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 			s.SalaryFund += salary
 		}
 		empRows.Close()
+	}
+
+	// 7. Top stock products per org (top 8 by value) — for warehouse diagram
+	topRows, err := h.db.Query(`
+		SELECT org_id, name, qty, value FROM (
+			SELECT w.organization_id AS org_id,
+			       COALESCE(p.name, 'N/A') AS name,
+			       COALESCE(SUM(i.quantity_on_hand), 0) AS qty,
+			       COALESCE(SUM(i.quantity_on_hand * COALESCE(p.cost_price, i.unit_cost, 0)), 0) AS value,
+			       ROW_NUMBER() OVER (PARTITION BY w.organization_id ORDER BY COALESCE(SUM(i.quantity_on_hand * COALESCE(p.cost_price, i.unit_cost, 0)), 0) DESC) AS rn
+			FROM inventory i
+			JOIN warehouses w ON w.id = i.warehouse_id
+			LEFT JOIN products p ON p.id = i.product_id
+			WHERE i.tenant_id = $1 AND w.organization_id IS NOT NULL
+			GROUP BY w.organization_id, p.id, p.name
+		) t WHERE rn <= 8`,
+		tenantID,
+	)
+	if err == nil {
+		for topRows.Next() {
+			var orgID uuid.UUID
+			var name string
+			var qty, val float64
+			if err := topRows.Scan(&orgID, &name, &qty, &val); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.TopStockProducts = append(s.TopStockProducts, directorTopStockProduct{Name: name, Qty: qty, Value: val})
+		}
+		topRows.Close()
+	}
+
+	// 8. Construction projects per org (active/in-progress) — for Активные объекты
+	projRows, err := h.db.Query(`
+		SELECT id, organization_id, COALESCE(code, ''), COALESCE(name, ''),
+		       COALESCE(status, ''), COALESCE(progress_percent, 0),
+		       COALESCE(contract_amount, 0)
+		FROM construction_projects
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
+		  AND COALESCE(status, '') NOT IN ('cancelled', 'archived')
+		ORDER BY organization_id, progress_percent DESC, id`,
+		tenantID,
+	)
+	if err == nil {
+		for projRows.Next() {
+			var id int64
+			var orgID uuid.UUID
+			var code, name, status string
+			var progress, amt float64
+			if err := projRows.Scan(&id, &orgID, &code, &name, &status, &progress, &amt); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.ConstructionProjects = append(s.ConstructionProjects, directorConstructionProjct{
+				ID: id, Name: name, Code: code, Status: status,
+				Progress: progress, ContractAmount: amt,
+			})
+		}
+		projRows.Close()
 	}
 
 	// Compute profit and round output
