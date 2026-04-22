@@ -65,6 +65,7 @@ type Product struct {
 	Code               string          `json:"code" db:"code"`
 	SKU                *string         `json:"sku,omitempty" db:"sku"`
 	Barcode            *string         `json:"barcode,omitempty" db:"barcode"`
+	SearchKey          *string         `json:"search_key,omitempty" db:"search_key"`
 	Name               string          `json:"name" db:"name"`
 	Description        *string         `json:"description,omitempty" db:"description"`
 	ShortDescription   *string         `json:"short_description,omitempty" db:"short_description"`
@@ -134,6 +135,7 @@ type CreateProductInput struct {
 	Code             string      `json:"code" binding:"required,min=1,max=50"`
 	SKU              string      `json:"sku,omitempty"`
 	Barcode          string      `json:"barcode,omitempty"`
+	SearchKey        string      `json:"search_key,omitempty"`
 	Name             string      `json:"name" binding:"required,min=1,max=255"`
 	Description      string      `json:"description,omitempty"`
 	ShortDescription string      `json:"short_description,omitempty"`
@@ -174,6 +176,7 @@ type UpdateProductInput struct {
 	CategoryID       *string     `json:"category_id,omitempty"`
 	SKU              *string     `json:"sku,omitempty"`
 	Barcode          *string     `json:"barcode,omitempty"`
+	SearchKey        *string     `json:"search_key,omitempty"`
 	Name             *string     `json:"name,omitempty"`
 	Description      *string     `json:"description,omitempty"`
 	ShortDescription *string     `json:"short_description,omitempty"`
@@ -231,6 +234,7 @@ type ProductResponse struct {
 	Code             string           `json:"code"`
 	SKU              *string          `json:"sku,omitempty"`
 	Barcode          *string          `json:"barcode,omitempty"`
+	SearchKey        *string          `json:"search_key,omitempty"`
 	Name             string           `json:"name"`
 	Description      *string          `json:"description,omitempty"`
 	ShortDescription *string          `json:"short_description,omitempty"`

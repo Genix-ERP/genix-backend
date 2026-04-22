@@ -19,6 +19,52 @@ func NewIntercompanySyncService(db *sql.DB) *IntercompanySyncService {
 	return &IntercompanySyncService{db: db}
 }
 
+// resolveCrossOrgProductID maps a product from the source organisation
+// to the matching product in the target organisation via search_key.
+//
+// Scenario: construction company A raises a PO for product
+// "ПЛИТЫ ПЕРЕКРЫТИЙ 1 ПК 59.10-6ШВ С8" (A's product row). The sync
+// creates an SO in manufacturing company B — but B doesn't own A's
+// product row, B sells the same material under "ПБ-5.9*100а" with its
+// own product row. We find B's row by search_key match and use
+// *that* id on the SO line so B can ship from their inventory.
+//
+// Returns the target org's product id if a match exists; otherwise
+// returns the original sourceProductID so the line still carries a
+// product reference (even if unlinked from the target org).
+func (s *IntercompanySyncService) resolveCrossOrgProductID(
+	tenantID, targetOrgID uuid.UUID, sourceProductID *uuid.UUID,
+) *uuid.UUID {
+	if sourceProductID == nil {
+		return nil
+	}
+	// Read the source product's search_key.
+	var key sql.NullString
+	if err := s.db.QueryRow(
+		`SELECT search_key FROM products WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		*sourceProductID, tenantID,
+	).Scan(&key); err != nil || !key.Valid || key.String == "" {
+		return sourceProductID // no key → can't resolve, keep original
+	}
+	// Find a product in the target org with the same key.
+	var targetID uuid.UUID
+	err := s.db.QueryRow(`
+		SELECT p.id
+		FROM products p
+		INNER JOIN product_organization_settings pos
+		        ON pos.product_id = p.id AND pos.organization_id = $3
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+		  AND upper(p.search_key) = upper($2)
+		ORDER BY p.created_at ASC
+		LIMIT 1`,
+		tenantID, key.String, targetOrgID,
+	).Scan(&targetID)
+	if err != nil {
+		return sourceProductID // no match in target org → keep source
+	}
+	return &targetID
+}
+
 // SyncSaleOrderToPurchaseOrder creates a PO in the customer's company when SO is created.
 // When company A creates an SO for intercompany customer B, this creates a PO in company B
 // with company A as the vendor.
@@ -179,6 +225,12 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 				&discountAmt, &taxID, &taxAmt, &lineTotal,
 				&lineWarehouseID, &lineNotes, &packagingID, &packagingQty)
 
+			// Resolve seller's product → buyer's equivalent via
+			// search_key, so the PO line references a product in
+			// the buyer's (target) organisation.
+			srcID := productID
+			resolvedProductID := s.resolveCrossOrgProductID(tenantID, targetOrgID, &srcID)
+
 			lineID := uuid.New()
 			s.db.Exec(`
 				INSERT INTO purchase_order_lines (
@@ -188,7 +240,7 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 					warehouse_id, notes, packaging_id, packaging_qty,
 					created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-			`, lineID, poID, lineNum, productID, description,
+			`, lineID, poID, lineNum, resolvedProductID, description,
 				qty, unitID, unitPrice, discountAmt, taxID, taxAmt,
 				lineTotal, 0.0, 0.0,
 				lineWarehouseID, lineNotes, packagingID, packagingQty,
@@ -365,6 +417,12 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 				&discountAmt, &taxID, &taxAmt, &lineTotal,
 				&lineWarehouseID, &lineNotes, &packagingID, &packagingQty)
 
+			// Resolve buyer's product → seller's equivalent via
+			// search_key. The SO must reference a product that
+			// belongs to the seller (target) organisation,
+			// otherwise inventory / pricing joins break.
+			resolvedProductID := s.resolveCrossOrgProductID(tenantID, targetOrgID, productID)
+
 			lineID := uuid.New()
 			s.db.Exec(`
 				INSERT INTO sales_order_lines (
@@ -375,7 +433,7 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 					warehouse_id, notes, packaging_id, packaging_qty,
 					created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-			`, lineID, soID, lineNum, productID, description,
+			`, lineID, soID, lineNum, resolvedProductID, description,
 				qty, unitID, unitPrice, discountAmt,
 				taxID, taxAmt, lineTotal,
 				0.0, 0.0,
