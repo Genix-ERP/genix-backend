@@ -1,7 +1,7 @@
 stages:
   - deploy
 
-deploy:
+deploy_main:
   stage: deploy
   tags:
     - genix
@@ -15,3 +15,20 @@ deploy:
   environment:
     name: production
     url: https://api.genixerp.com
+
+deploy_yuksalish:
+  stage: deploy
+  tags:
+    - yuksalish-genix
+  only:
+    - yuksalish
+  script:
+    - cd /home/ubuntu/genix-backend
+    - git fetch origin
+    - git checkout yuksalish
+    - git pull origin yuksalish
+    - docker compose down
+    - docker compose up -d --build
+  environment:
+    name: yuksalish
+    url: https://api.yuksalish.group
