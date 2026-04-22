@@ -915,6 +915,17 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		return
 	}
 
+	// files_count joins building_files so the UI can render the count badge
+	// on the "Fayllar" button without a per-building extra round-trip.
+	//
+	// Note: we intentionally don't filter building_files by tenant_id inside
+	// the subquery. construction_buildings.tenant_id is UUID but
+	// building_files.tenant_id is VARCHAR(100) (see migrations 112 / 253),
+	// so reusing $2 in both contexts tripped Postgres' parameter type
+	// inference and made the whole query fail (returning an empty buildings
+	// list, which also left the estimates panel stuck on "Avval bino
+	// tanlang"). Tenant scoping is already guaranteed by the outer
+	// b.tenant_id = $2 filter plus the FK link f.building_id = b.id.
 	query := `
 		SELECT b.id, b.tenant_id, b.project_id, b.code, b.name, b.description,
 		       b.building_type, b.building_purpose, b.floors_count, b.floors_underground,
@@ -925,8 +936,14 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		       COALESCE(b.status, 'draft'), b.progress_percent, COALESCE(b.gps_coordinates::text, '{}')::text, b.location_description,
 		       COALESCE(b.sort_order, 0), b.created_date, b.updated_date,
 		       0 as sections_count,
-		       0.0 as total_smeta
+		       0.0 as total_smeta,
+		       COALESCE(f.cnt, 0) AS files_count
 		FROM construction_buildings b
+		LEFT JOIN (
+		    SELECT building_id, COUNT(*) AS cnt
+		    FROM building_files
+		    GROUP BY building_id
+		) f ON f.building_id = b.id
 		WHERE b.project_id = $1 AND b.tenant_id = $2
 		ORDER BY COALESCE(b.sort_order, 0), b.code
 	`
@@ -952,7 +969,7 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 			&b.PlannedStartDate, &b.PlannedEndDate, &b.ActualStartDate, &b.ActualEndDate,
 			&b.Status, &b.ProgressPercent, &gpsCoordinates, &b.LocationDescription,
 			&b.SortOrder, &b.CreatedDate, &b.UpdatedDate,
-			&b.SectionsCount, &b.TotalSmeta,
+			&b.SectionsCount, &b.TotalSmeta, &b.FilesCount,
 		); err != nil {
 			h.log.Error("Failed to scan building", "error", err, "project_id", projectID)
 			continue

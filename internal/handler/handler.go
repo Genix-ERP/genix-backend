@@ -309,8 +309,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		products.GET("", h.ListProducts)
 		products.POST("", h.perm.Require("inventory", "product", "create"), h.CreateProduct)
+		products.GET("/by-search-key", h.FindProductsBySearchKey)
 		products.GET("/:id", h.GetProduct)
 		products.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateProduct)
+		products.POST("/:id/generate-search-key", h.perm.Require("inventory", "product", "update"), h.GenerateProductSearchKey)
 		products.DELETE("/:id", h.perm.Require("inventory", "product", "delete"), h.DeleteProduct)
 	}
 
@@ -1864,6 +1866,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Stages
 		constructionProjects.GET("/:id/stages", h.ListConstructionStages)
 		constructionProjects.POST("/:id/stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionStage)
+
+		// Flat feed of everything currently in_progress (stages + sub-stages).
+		// Drives the "Jarayon" tab on the frontend.
+		constructionProjects.GET("/:id/in-progress", h.GetProjectInProgressItems)
 
 		// Expense Lines (Xarajat operatsiyalari)
 		constructionProjects.GET("/:id/expenses", h.ListExpenseLines)
