@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -30,10 +31,33 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
-		SELECT s.id, s.tenant_id, s.project_id, s.name, s.stage_order,
+	// Optional building filter (migration 333). Accepts:
+	//   ?building_id=<id>    - stages assigned to that building
+	//   ?building_id=0       - project-wide stages (no building)
+	// Omit the param to get every stage (used by the "Hammasi" tab).
+	var buildingFilter sql.NullInt64
+	if raw := c.Query("building_id"); raw != "" {
+		if v, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil {
+			buildingFilter = sql.NullInt64{Int64: v, Valid: true}
+		}
+	}
+
+	args := []interface{}{projectID, tenantID}
+	buildingClause := ""
+	if buildingFilter.Valid {
+		if buildingFilter.Int64 == 0 {
+			buildingClause = " AND s.building_id IS NULL"
+		} else {
+			args = append(args, buildingFilter.Int64)
+			buildingClause = " AND s.building_id = $3"
+		}
+	}
+
+	query := `
+		SELECT s.id, s.tenant_id, s.project_id, s.building_id, s.name, s.stage_order,
 		       s.status, s.planned_budget, s.planned_start, s.planned_end,
 		       s.actual_start, s.actual_end, s.notes, s.created_at, s.updated_at,
+		       b.name AS building_name,
 		       COALESCE(SUM(CASE WHEN el.status = 'approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual_amount,
 		       COALESCE((SELECT SUM(m.total_cost) FROM construction_sub_stage_materials m
 		                 JOIN construction_sub_stages ss ON ss.id = m.sub_stage_id
@@ -52,10 +76,13 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		                 WHERE ss.stage_id = s.id AND eq.resource_type = 'employee'), 0) AS labor_count
 		FROM construction_stages s
 		LEFT JOIN construction_expense_lines el ON el.stage_id = s.id AND el.deleted_at IS NULL
-		WHERE s.project_id = $1 AND s.tenant_id = $2
-		GROUP BY s.id
+		LEFT JOIN construction_buildings b ON b.id = s.building_id
+		WHERE s.project_id = $1 AND s.tenant_id = $2` + buildingClause + `
+		GROUP BY s.id, b.name
 		ORDER BY s.stage_order ASC, s.id ASC
-	`, projectID, tenantID)
+	`
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list stages", "error", err)
 		response.InternalError(c, "Failed to list stages")
@@ -67,6 +94,8 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		ID             int64     `json:"id"`
 		TenantID       string    `json:"tenant_id"`
 		ProjectID      int64     `json:"project_id"`
+		BuildingID     *int64    `json:"building_id"`
+		BuildingName   *string   `json:"building_name"`
 		Name           string    `json:"name"`
 		StageOrder     int       `json:"stage_order"`
 		Status         string    `json:"status"`
@@ -89,15 +118,26 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 	stages := []Stage{}
 	for rows.Next() {
 		var s Stage
+		var bID sql.NullInt64
+		var bName sql.NullString
 		if err := rows.Scan(
-			&s.ID, &s.TenantID, &s.ProjectID, &s.Name, &s.StageOrder,
+			&s.ID, &s.TenantID, &s.ProjectID, &bID, &s.Name, &s.StageOrder,
 			&s.Status, &s.PlannedBudget, &s.PlannedStart, &s.PlannedEnd,
 			&s.ActualStart, &s.ActualEnd, &s.Notes, &s.CreatedAt, &s.UpdatedAt,
+			&bName,
 			&s.ActualAmount, &s.MaterialTotal,
 			&s.EquipmentTotal, &s.EquipmentCount, &s.LaborTotal, &s.LaborCount,
 		); err != nil {
 			h.log.Error("Failed to scan stage", "error", err)
 			continue
+		}
+		if bID.Valid {
+			v := bID.Int64
+			s.BuildingID = &v
+		}
+		if bName.Valid {
+			v := bName.String
+			s.BuildingName = &v
 		}
 		stages = append(stages, s)
 	}
@@ -127,6 +167,9 @@ func (h *Handler) CreateConstructionStage(c *gin.Context) {
 		PlannedStart  string  `json:"planned_start"`
 		PlannedEnd    string  `json:"planned_end"`
 		Notes         string  `json:"notes"`
+		// Migration 333: stages can be assigned to a specific building/block.
+		// 0 or absent → project-wide (unassigned), same as before.
+		BuildingID int64 `json:"building_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -138,15 +181,20 @@ func (h *Handler) CreateConstructionStage(c *gin.Context) {
 		req.Status = "not_started"
 	}
 
+	var buildingIDArg interface{}
+	if req.BuildingID > 0 {
+		buildingIDArg = req.BuildingID
+	}
+
 	var id int64
 	err = h.db.QueryRow(`
 		INSERT INTO construction_stages (
-			tenant_id, project_id, name, stage_order, status, planned_budget,
+			tenant_id, project_id, building_id, name, stage_order, status, planned_budget,
 			planned_start, planned_end, notes, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
 		RETURNING id
 	`,
-		tenantID, projectID, req.Name, req.StageOrder, req.Status, req.PlannedBudget,
+		tenantID, projectID, buildingIDArg, req.Name, req.StageOrder, req.Status, req.PlannedBudget,
 		nullStringFromVal(req.PlannedStart), nullStringFromVal(req.PlannedEnd),
 		nullStringFromVal(req.Notes),
 	).Scan(&id)
@@ -186,6 +234,9 @@ func (h *Handler) UpdateConstructionStage(c *gin.Context) {
 		ActualStart   *string  `json:"actual_start"`
 		ActualEnd     *string  `json:"actual_end"`
 		Notes         *string  `json:"notes"`
+		// Migration 333. Send 0 to clear the assignment (back to project-wide);
+		// omit the field to leave it unchanged.
+		BuildingID *int64 `json:"building_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -248,6 +299,13 @@ func (h *Handler) UpdateConstructionStage(c *gin.Context) {
 			addField("notes", nil)
 		} else {
 			addField("notes", *req.Notes)
+		}
+	}
+	if req.BuildingID != nil {
+		if *req.BuildingID == 0 {
+			addField("building_id", nil)
+		} else {
+			addField("building_id", *req.BuildingID)
 		}
 	}
 

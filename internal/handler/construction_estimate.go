@@ -611,9 +611,10 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	h.db.QueryRow(`SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`,
 		estimateID, tenantID).Scan(&total)
 
-	// Query paginated rows. Parent rows come first (parent_line_id IS NULL),
-	// then sub-lines are ordered by sort_order → subline_seq → id so the
-	// frontend can render them nested without extra work.
+	// Query paginated rows. We group each sub-line immediately after its
+	// parent by sorting on the *parent's* sort_order (via self-join) plus the
+	// parent's id as a stable group key. Within a group, the parent comes
+	// first, then children by subline_seq.
 	query := `
 		SELECT l.id, l.tenant_id, l.estimate_id, l.wbs_id,
 		       l.name, l.uom, l.quantity,
@@ -627,8 +628,10 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
+		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
 		WHERE l.estimate_id = $1 AND l.tenant_id = $2
-		ORDER BY l.sort_order ASC,
+		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
+		         COALESCE(l.parent_line_id, l.id) ASC,
 		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
 		         COALESCE(l.subline_seq, 0) ASC,
 		         l.id ASC
@@ -811,11 +814,13 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		var pItem, pUom sql.NullString
 		var pQty float64
 		var pEstimateID int64
+		var pSortOrder int
 		err := h.db.QueryRow(`
-			SELECT estimate_id, COALESCE(item_number, ''), COALESCE(uom, ''), COALESCE(quantity, 0)
+			SELECT estimate_id, COALESCE(item_number, ''), COALESCE(uom, ''),
+			       COALESCE(quantity, 0), COALESCE(sort_order, 0)
 			FROM construction_estimate_line
 			WHERE id = $1 AND tenant_id = $2
-		`, req.ParentLineID, tenantID).Scan(&pEstimateID, &pItem, &pUom, &pQty)
+		`, req.ParentLineID, tenantID).Scan(&pEstimateID, &pItem, &pUom, &pQty, &pSortOrder)
 		if err == sql.ErrNoRows {
 			response.BadRequest(c, "Parent line not found")
 			return
@@ -833,6 +838,15 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		parentLineIDSQL = sql.NullInt64{Int64: req.ParentLineID, Valid: true}
 		parentItemNumber = pItem.String
 		parentQuantity = pQty
+
+		// Inherit the parent's sort_order so the backend ORDER BY places the
+		// sub-line next to its parent (without this, newly-created sub-lines
+		// default to sort_order = 0 and drift to the top of the list when other
+		// rows have higher sort_orders — which was the "3-1 appears before 1"
+		// bug). Clients can still override by sending their own sort_order.
+		if req.SortOrder == 0 {
+			req.SortOrder = pSortOrder
+		}
 
 		// Auto-assign the next subline_seq for this parent
 		if err := h.db.QueryRow(`
