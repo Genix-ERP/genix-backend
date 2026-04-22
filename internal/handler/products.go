@@ -69,7 +69,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	orgID, _ := middleware.GetOrganizationID(c)
 
 	baseQuery := `
-		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode,
+		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode, p.search_key,
 			   p.name, p.description, p.short_description, p.unit_id,
 			   COALESCE(pos.cost_price, p.cost_price) as cost_price,
 			   COALESCE(pos.list_price, p.list_price) as list_price,
@@ -169,8 +169,8 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	if search != "" {
 		argCount++
 		countArgCount++
-		baseQuery += fmt.Sprintf(" AND (p.code ILIKE $%d OR p.name ILIKE $%d OR p.sku ILIKE $%d OR p.barcode ILIKE $%d)", argCount, argCount, argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (p.code ILIKE $%d OR p.name ILIKE $%d OR p.sku ILIKE $%d OR p.barcode ILIKE $%d)", countArgCount, countArgCount, countArgCount, countArgCount)
+		baseQuery += fmt.Sprintf(" AND (p.code ILIKE $%d OR p.name ILIKE $%d OR p.sku ILIKE $%d OR p.barcode ILIKE $%d OR p.search_key ILIKE $%d)", argCount, argCount, argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (p.code ILIKE $%d OR p.name ILIKE $%d OR p.sku ILIKE $%d OR p.barcode ILIKE $%d OR p.search_key ILIKE $%d)", countArgCount, countArgCount, countArgCount, countArgCount, countArgCount)
 		args = append(args, "%"+search+"%")
 		countArgs = append(countArgs, "%"+search+"%")
 	}
@@ -199,7 +199,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	products := make([]*entity.ProductResponse, 0)
 	for rows.Next() {
 		var p entity.Product
-		var categoryID, sku, barcode, desc, shortDesc, unitID sql.NullString
+		var categoryID, sku, barcode, searchKey, desc, shortDesc, unitID sql.NullString
 		var categoryCode, categoryName sql.NullString
 		var tags json.RawMessage
 		var imageURL string
@@ -211,7 +211,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var salesUnitName string
 
 		err := rows.Scan(
-			&p.ID, &p.TenantID, &categoryID, &p.Type, &p.Code, &sku, &barcode,
+			&p.ID, &p.TenantID, &categoryID, &p.Type, &p.Code, &sku, &barcode, &searchKey,
 			&p.Name, &desc, &shortDesc, &unitID,
 			&p.CostPrice, &p.ListPrice, &p.MinPrice,
 			&p.IsStockable, &p.TrackInventory, &p.MinStockLevel,
@@ -243,6 +243,10 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		if barcode.Valid {
 			p.Barcode = &barcode.String
 		}
+		if searchKey.Valid {
+			sk := searchKey.String
+			p.SearchKey = &sk
+		}
 		if desc.Valid {
 			p.Description = &desc.String
 		}
@@ -271,6 +275,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			Code:              p.Code,
 			SKU:               p.SKU,
 			Barcode:           p.Barcode,
+			SearchKey:         p.SearchKey,
 			Name:              p.Name,
 			Description:       p.Description,
 			UnitID:            parsedUnitID,
@@ -499,6 +504,21 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 		shortDescription = &input.ShortDescription
 	}
 
+	// search_key: either passed explicitly (user typed / clicked
+	// Generate in the form), or inherited from an existing same-name
+	// product in the tenant (any organisation). If neither applies,
+	// leave it NULL — keys are set deliberately by the manufacturing
+	// side, and construction-side products pick them up only via
+	// name match. Do NOT auto-generate here.
+	searchKey := strings.TrimSpace(input.SearchKey)
+	if searchKey == "" {
+		searchKey = h.lookupSearchKeyForName(tenantID, input.Name)
+	}
+	var searchKeyPtr *string
+	if searchKey != "" {
+		searchKeyPtr = &searchKey
+	}
+
 	// Serialize tags
 	var tagsJSON []byte
 	if len(input.Tags) > 0 {
@@ -521,7 +541,7 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 
 	query := `
 		INSERT INTO products (
-			id, tenant_id, origin_organization_id, category_id, type, code, sku, barcode, name, description, short_description,
+			id, tenant_id, origin_organization_id, category_id, type, code, sku, barcode, search_key, name, description, short_description,
 			unit_id, purchase_unit_id, sales_unit_id, cost_price, list_price, min_price, currency_id,
 			is_stockable, track_inventory, min_stock_level, reorder_point, reorder_quantity,
 			is_purchasable, is_sellable, can_be_sold, can_be_purchased, available_in_pos,
@@ -529,12 +549,12 @@ func (h *Handler) CreateProduct(c *gin.Context) {
 			is_manufacturable, auto_manufacture,
 			has_delivery, delivery_price,
 			is_active, tags, image_url, inventory_type, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, categoryID, input.Type, input.Code, sku, barcode, input.Name, description, shortDescription,
+		id, tenantID, orgIDPtr, categoryID, input.Type, input.Code, sku, barcode, searchKeyPtr, input.Name, description, shortDescription,
 		unitID, purchaseUnitID, salesUnitID, input.CostPrice, input.ListPrice, input.MinPrice, currencyID,
 		isStockable, trackInventory, input.MinStockLevel, input.ReorderPoint, input.ReorderQuantity,
 		isPurchasable, isSellable, canBeSold, canBePurchased, availableInPOS,
@@ -645,7 +665,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	orgID, _ := middleware.GetOrganizationID(c)
 
 	query := `
-		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode,
+		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode, p.search_key,
 			   p.name, p.description, p.short_description, p.unit_id,
 			   COALESCE(pos.cost_price, p.cost_price) as cost_price,
 			   COALESCE(pos.list_price, p.list_price) as list_price,
@@ -688,14 +708,14 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	`
 
 	var p entity.Product
-	var categoryIDStr, sku, barcode, desc, shortDesc, unitID sql.NullString
+	var categoryIDStr, sku, barcode, searchKey, desc, shortDesc, unitID sql.NullString
 	var categoryIDRel, categoryCode, categoryName sql.NullString
 	var tags json.RawMessage
 	var imageURL string
 	var inventoryType string
 
 	err = h.db.QueryRow(query, queryArgs...).Scan(
-		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode,
+		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode, &searchKey,
 		&p.Name, &desc, &shortDesc, &unitID,
 		&p.CostPrice, &p.ListPrice, &p.MinPrice,
 		&p.IsStockable, &p.TrackInventory, &p.MinStockLevel,
@@ -760,6 +780,10 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	}
 	if barcode.Valid {
 		resp.Barcode = &barcode.String
+	}
+	if searchKey.Valid {
+		sk := searchKey.String
+		resp.SearchKey = &sk
 	}
 	if desc.Valid {
 		resp.Description = &desc.String
@@ -865,6 +889,9 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 	}
 	if input.Barcode != nil {
 		addUpdate("barcode", *input.Barcode)
+	}
+	if input.SearchKey != nil {
+		addUpdate("search_key", *input.SearchKey)
 	}
 	if input.Name != nil {
 		addUpdate("name", *input.Name)

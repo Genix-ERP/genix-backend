@@ -286,8 +286,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		products.GET("", h.ListProducts)
 		products.POST("", h.perm.Require("inventory", "product", "create"), h.CreateProduct)
+		products.GET("/by-search-key", h.FindProductsBySearchKey)
 		products.GET("/:id", h.GetProduct)
 		products.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateProduct)
+		products.POST("/:id/generate-search-key", h.perm.Require("inventory", "product", "update"), h.GenerateProductSearchKey)
 		products.DELETE("/:id", h.perm.Require("inventory", "product", "delete"), h.DeleteProduct)
 	}
 

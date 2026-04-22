@@ -2062,23 +2062,36 @@ func (h *Handler) autoCreateProductsFromEstimateLines(tenantID, orgID, userID uu
 		id := uuid.New()
 		now := time.Now()
 
+		// Copy search_key ONLY if an existing same-name product in the
+		// tenant already has one. We do NOT derive a key from the
+		// smeta name — construction names are long GOST Cyrillic
+		// strings that produce meaningless keys. Keys are meant to be
+		// set by hand on the manufacturing side (short technical
+		// codes); the construction side just picks them up when names
+		// match. If there is no match, leave the column NULL so the
+		// product remains unlinked until a user sets a key manually.
+		var searchKeyPtr *string
+		if k := h.lookupSearchKeyForName(tenantID, name); k != "" {
+			searchKeyPtr = &k
+		}
+
 		_, err = h.db.Exec(`
 			INSERT INTO products (
-				id, tenant_id, origin_organization_id, type, code, name,
+				id, tenant_id, origin_organization_id, type, code, name, search_key,
 				unit_id, cost_price, list_price,
 				is_stockable, track_inventory,
 				is_purchasable, is_sellable, can_be_sold, can_be_purchased,
 				can_be_expensed, inventory_type,
 				is_active, tags, created_by, created_at, updated_at
 			) VALUES (
-				$1, $2, $3, 'product', $4, $5,
-				$6, $7, $7,
+				$1, $2, $3, 'product', $4, $5, $6,
+				$7, $8, $8,
 				true, true,
 				true, false, false, true,
 				true, 'trade',
-				true, '["estimate-import"]'::jsonb, $8, $9, $9
+				true, '["estimate-import"]'::jsonb, $9, $10, $10
 			)
-		`, id, tenantID, orgIDPtr, code, name,
+		`, id, tenantID, orgIDPtr, code, name, searchKeyPtr,
 			unitID, costPrice,
 			userID, now,
 		)
