@@ -876,13 +876,17 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 					"allocations", len(explicit), "applied", applied, "total", totalAmount)
 			} else {
 				// Fallback: FIFO over all unpaid invoices (oldest due first).
+				// sales_invoices uses `status`, not `payment_status` — that column
+				// only exists on purchase_invoices. Filter on amount_due > 0 so we
+				// pick up any invoice that still has a remaining balance.
 				remaining := totalAmount
 				invRows, invErr := h.db.Query(`
 					SELECT id, COALESCE(total_amount, 0), COALESCE(amount_paid, 0)
 					FROM sales_invoices
 					WHERE tenant_id = $1 AND customer_id = $2 AND deleted_at IS NULL
-					  AND payment_status IN ('unpaid', 'partial', 'pending')
 					  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+					  AND status NOT IN ('paid', 'cancelled', 'draft')
+					  AND COALESCE(total_amount, 0) - COALESCE(amount_paid, 0) > 0.005
 					ORDER BY due_date ASC NULLS LAST, created_at ASC`,
 					tenantID, custUUID,
 				)
@@ -922,10 +926,17 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 			}
 
 			for _, u := range updates {
-				h.db.Exec(
-					`UPDATE sales_invoices SET amount_paid = $1, payment_status = $2, updated_at = $3 WHERE id = $4`,
+				// sales_invoices has `status`, not `payment_status`. Valid values:
+				// draft, sent, partial, paid, overdue, cancelled. Map from our
+				// partial/paid intent onto the real column.
+				_, execErr := h.db.Exec(
+					`UPDATE sales_invoices SET amount_paid = $1, status = $2, updated_at = $3 WHERE id = $4`,
 					u.newPaid, u.newStatus, now, u.id,
 				)
+				if execErr != nil {
+					h.log.Error("Failed to update invoice after return allocation",
+						"error", execErr, "invoice_id", u.id, "return_id", returnID)
+				}
 			}
 		}
 	}
