@@ -175,6 +175,11 @@ func (h *Handler) GetProjectSummaryReport(c *gin.Context) {
 
 // GetStageBudgetReport returns plan vs actual by stage × category
 // GET /construction/projects/:id/reports/budget
+// Optional query param: ?building_id=<id> — scope the stages (and the
+// total_planned / total_actual KPIs) to a single building/block so the
+// Byudjet tab can mirror the per-block tab row used on the Bosqichlar tab
+// (migration 333 added construction_stages.building_id). Omitting the param
+// keeps the original project-wide behaviour.
 func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -188,6 +193,26 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		return
 	}
 
+	// Optional building filter. `0` / missing / unparseable = project-wide.
+	var buildingID int64
+	if raw := c.Query("building_id"); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			buildingID = v
+		}
+	}
+
+	// When a building filter is supplied we add `AND s.building_id = $3`
+	// to the stage query and reuse the same clause in the totals queries
+	// below so every number on the screen is scoped consistently. Going
+	// through a format-string keeps the two code paths readable without
+	// duplicating the 20-line SELECT.
+	stageFilterSQL := ""
+	stageArgs := []interface{}{projectID, tenantID}
+	if buildingID > 0 {
+		stageFilterSQL = " AND s.building_id = $3"
+		stageArgs = append(stageArgs, buildingID)
+	}
+
 	// Stages with planned budgets and actual totals
 	rows, err := h.db.Query(`
 		SELECT
@@ -197,10 +222,10 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		FROM construction_stages s
 		LEFT JOIN construction_expense_lines el ON el.stage_id = s.id AND el.project_id = s.project_id
 		LEFT JOIN construction_cost_categories cat ON cat.id = el.cost_category_id
-		WHERE s.project_id = $1 AND s.tenant_id = $2
+		WHERE s.project_id = $1 AND s.tenant_id = $2`+stageFilterSQL+`
 		GROUP BY s.id, s.name, s.planned_budget, cat.id, cat.name, cat.code
 		ORDER BY s.stage_order ASC, s.id ASC, cat.name ASC
-	`, projectID, tenantID)
+	`, stageArgs...)
 	if err != nil {
 		h.log.Error("Failed to query stage budget", "error", err)
 		response.InternalError(c, "Failed to get budget report")
@@ -237,18 +262,42 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		budgetRows = append(budgetRows, br)
 	}
 
-	// Also compute total actual for project (including non-stage expenses)
+	// Also compute total actual for project (including non-stage expenses).
+	// When a building filter is active we scope actuals to that building too,
+	// by restricting to expenses tied to stages that belong to the building.
+	// Project-wide expenses (stage_id NULL) are excluded from per-building
+	// totals because we can't attribute them to a specific block.
 	var totalActual float64
-	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(amount), 0)
-		FROM construction_expense_lines
-		WHERE project_id = $1 AND tenant_id = $2 AND status = 'approved' AND deleted_at IS NULL
-	`, projectID, tenantID).Scan(&totalActual)
+	if buildingID > 0 {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(SUM(el.amount), 0)
+			FROM construction_expense_lines el
+			JOIN construction_stages s
+			  ON s.id = el.stage_id AND s.tenant_id = el.tenant_id
+			WHERE el.project_id = $1 AND el.tenant_id = $2
+			  AND el.status = 'approved' AND el.deleted_at IS NULL
+			  AND s.building_id = $3
+		`, projectID, tenantID, buildingID).Scan(&totalActual)
+	} else {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(SUM(amount), 0)
+			FROM construction_expense_lines
+			WHERE project_id = $1 AND tenant_id = $2 AND status = 'approved' AND deleted_at IS NULL
+		`, projectID, tenantID).Scan(&totalActual)
+	}
 
 	var totalPlanned float64
-	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(planned_budget), 0) FROM construction_stages WHERE project_id = $1 AND tenant_id = $2
-	`, projectID, tenantID).Scan(&totalPlanned)
+	if buildingID > 0 {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(SUM(planned_budget), 0)
+			FROM construction_stages
+			WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3
+		`, projectID, tenantID, buildingID).Scan(&totalPlanned)
+	} else {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(SUM(planned_budget), 0) FROM construction_stages WHERE project_id = $1 AND tenant_id = $2
+		`, projectID, tenantID).Scan(&totalPlanned)
+	}
 
 	response.Success(c, map[string]interface{}{
 		"rows":          budgetRows,
