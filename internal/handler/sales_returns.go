@@ -222,6 +222,13 @@ func (h *Handler) CreateSalesReturn(c *gin.Context) {
 			UnitPrice   float64 `json:"unit_price"`
 			Condition   string  `json:"condition"`
 		} `json:"items"`
+		// Optional: explicit allocations of the return amount across specific
+		// unpaid invoices. When present, ApproveSalesReturn applies the return
+		// to these invoices instead of FIFO-picking them by due date.
+		InvoiceAllocations []struct {
+			InvoiceID string  `json:"invoice_id"`
+			Amount    float64 `json:"amount"`
+		} `json:"invoice_allocations"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -311,6 +318,28 @@ func (h *Handler) CreateSalesReturn(c *gin.Context) {
 		)
 		if err != nil {
 			h.log.Error("Failed to create sales return item", "error", err, "item_index", i)
+		}
+	}
+
+	// Persist optional invoice allocations. We validate light-touch here
+	// (parseable UUID + positive amount); the actual balance checks happen on
+	// approval when we know invoice balances are still valid.
+	for _, alloc := range input.InvoiceAllocations {
+		if alloc.Amount <= 0 {
+			continue
+		}
+		invID, err := uuid.Parse(alloc.InvoiceID)
+		if err != nil {
+			continue
+		}
+		_, err = h.db.Exec(`
+			INSERT INTO sales_return_invoice_allocations (id, sales_return_id, sales_invoice_id, amount, created_at)
+			VALUES ($1, $2, $3, $4, $5)`,
+			uuid.New(), returnID, invID, alloc.Amount, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to persist return invoice allocation", "error", err,
+				"return_id", returnID, "invoice_id", invID)
 		}
 	}
 
@@ -722,43 +751,75 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 	}
 
 	// =====================================================
-	// FIFO-ALLOCATE return amount to customer's unpaid invoices
-	// so the Sales Orders → Invoices widgets (Pending/Overdue) reflect the refund.
+	// APPLY return amount to customer's unpaid invoices.
+	// If the user picked specific invoices at creation time
+	// (sales_return_invoice_allocations has rows), honour those. Otherwise fall
+	// back to FIFO over all unpaid invoices (oldest due first).
 	// =====================================================
 	if customerID.Valid {
 		custUUID, parseErr := uuid.Parse(customerID.String)
 		if parseErr == nil {
-			remaining := totalAmount
-			invRows, invErr := h.db.Query(`
-				SELECT id, COALESCE(total_amount, 0), COALESCE(amount_paid, 0)
-				FROM sales_invoices
-				WHERE tenant_id = $1 AND customer_id = $2 AND deleted_at IS NULL
-				  AND payment_status IN ('unpaid', 'partial', 'pending')
-				  AND COALESCE(invoice_type, 'invoice') = 'invoice'
-				ORDER BY due_date ASC NULLS LAST, created_at ASC`,
-				tenantID, custUUID,
+			// First check whether explicit allocations exist.
+			allocRows, allocErr := h.db.Query(`
+				SELECT sales_invoice_id, amount FROM sales_return_invoice_allocations
+				WHERE sales_return_id = $1`, returnID,
 			)
-			if invErr == nil {
-				type invPay struct {
-					id        uuid.UUID
-					newPaid   float64
-					newStatus string
-				}
-				var updates []invPay
-				for invRows.Next() {
-					if remaining <= 0.005 {
-						break
+			var explicit []struct {
+				id     uuid.UUID
+				amount float64
+			}
+			if allocErr == nil {
+				for allocRows.Next() {
+					var id uuid.UUID
+					var amt float64
+					if err := allocRows.Scan(&id, &amt); err == nil {
+						explicit = append(explicit, struct {
+							id     uuid.UUID
+							amount float64
+						}{id: id, amount: amt})
 					}
-					var invID uuid.UUID
+				}
+				allocRows.Close()
+			}
+
+			type invPay struct {
+				id        uuid.UUID
+				newPaid   float64
+				newStatus string
+			}
+			var updates []invPay
+			var applied float64
+
+			if len(explicit) > 0 {
+				// Honour explicit allocations. We still clamp each allocation to
+				// the invoice's remaining balance — if the user over-allocated
+				// (e.g. invoice got paid between create and approve), we apply
+				// what we can and log the drift.
+				for _, a := range explicit {
 					var invTotal, invPaid float64
-					if err := invRows.Scan(&invID, &invTotal, &invPaid); err != nil {
+					var invCustomer uuid.UUID
+					err := h.db.QueryRow(`
+						SELECT COALESCE(total_amount, 0), COALESCE(amount_paid, 0), customer_id
+						FROM sales_invoices
+						WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+						a.id, tenantID,
+					).Scan(&invTotal, &invPaid, &invCustomer)
+					if err != nil {
+						h.log.Warn("Return allocation references missing invoice",
+							"return_id", returnID, "invoice_id", a.id, "error", err)
+						continue
+					}
+					// Defensive: allocation must belong to this customer.
+					if invCustomer != custUUID {
+						h.log.Warn("Return allocation invoice belongs to different customer — skipping",
+							"return_id", returnID, "invoice_id", a.id)
 						continue
 					}
 					balance := invTotal - invPaid
 					if balance <= 0.005 {
 						continue
 					}
-					apply := remaining
+					apply := a.amount
 					if apply > balance {
 						apply = balance
 					}
@@ -768,19 +829,64 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 						newStatus = "paid"
 						newPaid = invTotal
 					}
-					updates = append(updates, invPay{id: invID, newPaid: newPaid, newStatus: newStatus})
-					remaining -= apply
+					updates = append(updates, invPay{id: a.id, newPaid: newPaid, newStatus: newStatus})
+					applied += apply
 				}
-				invRows.Close()
-				for _, u := range updates {
-					h.db.Exec(
-						`UPDATE sales_invoices SET amount_paid = $1, payment_status = $2, updated_at = $3 WHERE id = $4`,
-						u.newPaid, u.newStatus, now, u.id,
-					)
+				h.log.Info("Applied explicit allocations for sales return",
+					"return_id", returnID, "customer_id", customerID.String,
+					"allocations", len(explicit), "applied", applied, "total", totalAmount)
+			} else {
+				// Fallback: FIFO over all unpaid invoices (oldest due first).
+				remaining := totalAmount
+				invRows, invErr := h.db.Query(`
+					SELECT id, COALESCE(total_amount, 0), COALESCE(amount_paid, 0)
+					FROM sales_invoices
+					WHERE tenant_id = $1 AND customer_id = $2 AND deleted_at IS NULL
+					  AND payment_status IN ('unpaid', 'partial', 'pending')
+					  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+					ORDER BY due_date ASC NULLS LAST, created_at ASC`,
+					tenantID, custUUID,
+				)
+				if invErr == nil {
+					for invRows.Next() {
+						if remaining <= 0.005 {
+							break
+						}
+						var invID uuid.UUID
+						var invTotal, invPaid float64
+						if err := invRows.Scan(&invID, &invTotal, &invPaid); err != nil {
+							continue
+						}
+						balance := invTotal - invPaid
+						if balance <= 0.005 {
+							continue
+						}
+						apply := remaining
+						if apply > balance {
+							apply = balance
+						}
+						newPaid := invPaid + apply
+						newStatus := "partial"
+						if newPaid >= invTotal-0.005 {
+							newStatus = "paid"
+							newPaid = invTotal
+						}
+						updates = append(updates, invPay{id: invID, newPaid: newPaid, newStatus: newStatus})
+						remaining -= apply
+						applied += apply
+					}
+					invRows.Close()
 				}
 				h.log.Info("FIFO-applied sales return to customer invoices",
 					"return_id", returnID, "customer_id", customerID.String,
-					"applied", totalAmount-remaining, "leftover", remaining)
+					"applied", applied, "leftover", totalAmount-applied)
+			}
+
+			for _, u := range updates {
+				h.db.Exec(
+					`UPDATE sales_invoices SET amount_paid = $1, payment_status = $2, updated_at = $3 WHERE id = $4`,
+					u.newPaid, u.newStatus, now, u.id,
+				)
 			}
 		}
 	}
