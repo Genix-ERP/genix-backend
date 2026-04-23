@@ -503,13 +503,13 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 
 	// Get return details for journal entry
 	var returnNumber, customerName string
-	var customerID sql.NullString
+	var customerID, returnSalesOrderID sql.NullString
 	var totalAmount float64
 	err = h.db.QueryRow(`
-		SELECT return_number, customer_id, customer_name, total_amount
+		SELECT return_number, customer_id, customer_name, total_amount, sales_order_id
 		FROM sales_returns WHERE id = $1 AND tenant_id = $2 AND status = 'pending' AND deleted_at IS NULL`,
 		returnID, tenantID,
-	).Scan(&returnNumber, &customerID, &customerName, &totalAmount)
+	).Scan(&returnNumber, &customerID, &customerName, &totalAmount, &returnSalesOrderID)
 	if err == sql.ErrNoRows {
 		response.BadRequest(c, "Return not found or not in pending status")
 		return
@@ -752,9 +752,13 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 
 	// =====================================================
 	// APPLY return amount to customer's unpaid invoices.
-	// If the user picked specific invoices at creation time
-	// (sales_return_invoice_allocations has rows), honour those. Otherwise fall
-	// back to FIFO over all unpaid invoices (oldest due first).
+	// Priority order:
+	//   1) Explicit allocations (sales_return_invoice_allocations) — user picked
+	//      specific invoices at create time.
+	//   2) If the return is tied to a sales order, apply the return total to
+	//      that order's linked invoice first (clamped to its balance). Any
+	//      leftover falls through to FIFO.
+	//   3) FIFO over all unpaid invoices (oldest due first).
 	// =====================================================
 	if customerID.Valid {
 		custUUID, parseErr := uuid.Parse(customerID.String)
@@ -780,6 +784,41 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 					}
 				}
 				allocRows.Close()
+			}
+
+			// If no explicit allocations but the return is tied to a sales
+			// order, synthesise an allocation against that order's invoice.
+			// This is the new default flow — user picks an order in the UI
+			// and the return credits that order's invoice.
+			if len(explicit) == 0 && returnSalesOrderID.Valid {
+				if soUUID, err := uuid.Parse(returnSalesOrderID.String); err == nil {
+					var soInvoiceID uuid.UUID
+					var soInvBalance float64
+					err := h.db.QueryRow(`
+						SELECT id, COALESCE(total_amount, 0) - COALESCE(amount_paid, 0)
+						FROM sales_invoices
+						WHERE tenant_id = $1 AND sales_order_id = $2 AND deleted_at IS NULL
+						  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+						ORDER BY created_at ASC LIMIT 1`,
+						tenantID, soUUID,
+					).Scan(&soInvoiceID, &soInvBalance)
+					if err == nil && soInvBalance > 0.005 {
+						apply := totalAmount
+						if apply > soInvBalance {
+							apply = soInvBalance
+						}
+						explicit = append(explicit, struct {
+							id     uuid.UUID
+							amount float64
+						}{id: soInvoiceID, amount: apply})
+						h.log.Info("Synthesised allocation from sales_order_id",
+							"return_id", returnID, "sales_order_id", soUUID,
+							"invoice_id", soInvoiceID, "apply", apply)
+					} else if err != nil && err != sql.ErrNoRows {
+						h.log.Warn("Failed to look up SO invoice for return", "error", err,
+							"return_id", returnID, "sales_order_id", soUUID)
+					}
+				}
 			}
 
 			type invPay struct {
