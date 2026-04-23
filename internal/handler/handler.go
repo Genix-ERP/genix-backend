@@ -5,6 +5,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/infrastructure/cache"
 	"github.com/genixerp/genix-backend/internal/infrastructure/database"
 	"github.com/genixerp/genix-backend/internal/infrastructure/email"
+	"github.com/genixerp/genix-backend/internal/infrastructure/payment"
 	"github.com/genixerp/genix-backend/internal/infrastructure/sms"
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/crypto"
@@ -15,29 +16,36 @@ import (
 
 // Handler holds all handler dependencies
 type Handler struct {
-	db           *database.DB
-	redis        *cache.RedisClient
-	config       *config.Config
-	log          logger.Logger
-	jwtManager   *crypto.JWTManager
-	emailService *email.Service
-	smsService   *sms.Service
-	icSync       *service.IntercompanySyncService
-	perm         *middleware.PermissionChecker
+	db             *database.DB
+	redis          *cache.RedisClient
+	config         *config.Config
+	log            logger.Logger
+	jwtManager     *crypto.JWTManager
+	emailService   *email.Service
+	smsService     *sms.Service
+	icSync         *service.IntercompanySyncService
+	perm           *middleware.PermissionChecker
+	multicardClient *payment.Client
 }
 
 // NewHandler creates a new handler instance
 func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, log logger.Logger) *Handler {
 	return &Handler{
-		db:           db,
-		redis:        redis,
-		config:       cfg,
-		log:          log,
-		jwtManager:   crypto.NewJWTManager(cfg.JWT),
-		emailService: email.NewService(&cfg.Email),
-		smsService:   sms.NewService(&cfg.SMS),
-		icSync:       service.NewIntercompanySyncService(db.DB),
-		perm:         middleware.NewPermissionChecker(db, redis, log),
+		db:             db,
+		redis:          redis,
+		config:         cfg,
+		log:            log,
+		jwtManager:     crypto.NewJWTManager(cfg.JWT),
+		emailService:   email.NewService(&cfg.Email),
+		smsService:     sms.NewService(&cfg.SMS),
+		icSync:         service.NewIntercompanySyncService(db.DB),
+		perm:           middleware.NewPermissionChecker(db, redis, log),
+		multicardClient: payment.NewClient(
+			cfg.Multicard.ApplicationID,
+			cfg.Multicard.Secret,
+			cfg.Multicard.StoreID,
+			cfg.Multicard.BaseURL,
+		),
 	}
 }
 
@@ -54,6 +62,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		protected.Use(middleware.Auth(h.jwtManager))
 		protected.Use(middleware.TenantResolver())
 		protected.Use(middleware.OrganizationResolver())
+		protected.Use(middleware.TrialCheck(h.db))
 		h.registerProtectedRoutes(protected)
 	}
 
@@ -99,10 +108,24 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 	// PBX Webhook (public - called by OnlinePBX)
 	rg.GET("/webhooks/pbx", h.PBXWebhook)
 	rg.POST("/webhooks/pbx", h.PBXWebhook)
+
+	// Multicard payment webhook (public - called by Multicard servers)
+	rg.POST("/webhooks/multicard", h.MulticardWebhook)
 }
 
 // registerProtectedRoutes registers routes that require authentication
 func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
+	// Subscription / trial status (allowed even when trial expired — TrialCheck skips these)
+	subscription := rg.Group("/subscription")
+	{
+		subscription.GET("/status", h.GetSubscriptionStatus)
+		subscription.POST("/activate", h.ActivateSubscription)
+		subscription.POST("/checkout", h.CreateCheckout)
+		subscription.GET("/plans", h.GetPlans)
+		subscription.GET("/payments", h.GetPaymentHistory)
+		subscription.POST("/verify-payment", h.VerifyPayment)
+	}
+
 	// Authentication (protected)
 	auth := rg.Group("/auth")
 	{
@@ -1442,6 +1465,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		admin.GET("/users", h.ListAllSystemUsers)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
+		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
 	}
 
 	// Audit Logs

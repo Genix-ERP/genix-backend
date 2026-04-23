@@ -42,6 +42,14 @@ services:
       - CORS_ALLOW_CREDENTIALS=${CORS_ALLOW_CREDENTIALS:-true}
       - STORAGE_PROVIDER=local
       - STORAGE_LOCAL_PATH=/app/storage
+      - MULTICARD_APPLICATION_ID=${MULTICARD_APPLICATION_ID:-}
+      - MULTICARD_SECRET=${MULTICARD_SECRET:-}
+      - MULTICARD_STORE_ID=${MULTICARD_STORE_ID:-0}
+      - MULTICARD_BASE_URL=${MULTICARD_BASE_URL:-https://mesh.multicard.uz}
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8080}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:5173}
+      - PRICE_PER_USER_MONTHLY=${PRICE_PER_USER_MONTHLY:-199000}
+      - PRICE_PER_USER_YEARLY=${PRICE_PER_USER_YEARLY:-169000}
     volumes:
       - genix_storage:/app/storage
     depends_on:

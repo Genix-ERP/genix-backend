@@ -24,7 +24,18 @@ type Config struct {
 	Email     EmailConfig
 	SMS       SMSConfig
 	Queue     QueueConfig
-	Google    GoogleConfig
+	Google     GoogleConfig
+	Multicard  MulticardConfig
+}
+
+// MulticardConfig holds Multicard payment gateway settings
+type MulticardConfig struct {
+	ApplicationID        string
+	Secret               string
+	StoreID              int
+	BaseURL              string
+	PricePerUserMonthly  int64 // UZS per user per month
+	PricePerUserYearly   int64 // UZS per user per month when billed yearly
 }
 
 // GoogleConfig holds Google OAuth settings
@@ -286,6 +297,14 @@ func Load() (*Config, error) {
 		},
 		Google: GoogleConfig{
 			ClientID: getEnv("GOOGLE_CLIENT_ID", ""),
+		},
+		Multicard: MulticardConfig{
+			ApplicationID:       getEnv("MULTICARD_APPLICATION_ID", ""),
+			Secret:              getEnv("MULTICARD_SECRET", ""),
+			StoreID:             getEnvAsInt("MULTICARD_STORE_ID", 0),
+			BaseURL:             getEnv("MULTICARD_BASE_URL", "https://mesh.multicard.uz"),
+			PricePerUserMonthly: getEnvAsInt64("PRICE_PER_USER_MONTHLY", 199000),
+			PricePerUserYearly:  getEnvAsInt64("PRICE_PER_USER_YEARLY", 169000),
 		},
 	}
 
