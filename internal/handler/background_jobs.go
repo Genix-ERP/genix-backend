@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -191,13 +192,21 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 				continue
 			}
 			if createdBy != nil {
+				// `partner_name` + `days` packed into data so the web renderer
+				// can rebuild body in the current UI language. Additive —
+				// mobile reads title/message unchanged.
+				notifData, _ := json.Marshal(map[string]interface{}{
+					"reconciliation_id": actID.String(),
+					"partner_name":      partnerName,
+					"days":              3,
+				})
 				db.Exec(`
 					INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 					VALUES ($1, $2, $3, 'reconciliation_reminder', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
 				`, uuid.New(), tenantID, *createdBy,
 					"Akt sverka javobsiz",
 					partnerName+" hali akt sverkaga javob bermadi (3 kun)",
-					`{"reconciliation_id":"`+actID.String()+`"}`, now)
+					string(notifData), now)
 			}
 			db.Exec("UPDATE reconciliation_acts SET reminder_3d_sent = true WHERE id = $1", actID)
 			count++
@@ -228,6 +237,13 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 				continue
 			}
 
+			// partner_name + days packed into data for web re-render. Additive.
+			notifData7d, _ := json.Marshal(map[string]interface{}{
+				"reconciliation_id": actID.String(),
+				"partner_name":      partnerName,
+				"days":              7,
+			})
+
 			// Notify creator
 			if createdBy != nil {
 				db.Exec(`
@@ -236,7 +252,7 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 				`, uuid.New(), tenantID, *createdBy,
 					"Akt sverka javobsiz — eslatma yuboring",
 					partnerName+" 7 kun davomida akt sverkaga javob bermadi",
-					`{"reconciliation_id":"`+actID.String()+`"}`, now)
+					string(notifData7d), now)
 			}
 
 			// Notify admins
@@ -254,7 +270,7 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 						`, uuid.New(), tenantID, adminID,
 							"Akt sverka javobsiz — eslatma yuboring",
 							partnerName+" 7 kun davomida akt sverkaga javob bermadi",
-							`{"reconciliation_id":"`+actID.String()+`"}`, now)
+							string(notifData7d), now)
 					}
 				}
 				adminRows.Close()
@@ -298,13 +314,20 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 				priority = "high"
 			}
 
+			// partner_name + response packed in data; additive.
+			respData, _ := json.Marshal(map[string]interface{}{
+				"reconciliation_id": actID.String(),
+				"partner_name":      partnerName,
+				"response":          respStatus,
+			})
+
 			if createdBy != nil {
 				db.Exec(`
 					INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 					VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', $8, $9)
 				`, uuid.New(), tenantID, *createdBy,
 					"reconciliation_response", title, message,
-					`{"reconciliation_id":"`+actID.String()+`","response":"`+respStatus+`"}`, priority, now)
+					string(respData), priority, now)
 			}
 
 			// If disputed, also notify admins
@@ -322,7 +345,7 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 								VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', 'high', $8)
 							`, uuid.New(), tenantID, adminID,
 								"reconciliation_response", title, message,
-								`{"reconciliation_id":"`+actID.String()+`","response":"`+respStatus+`"}`, now)
+								string(respData), now)
 						}
 					}
 					adminRows.Close()

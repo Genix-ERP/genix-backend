@@ -619,6 +619,7 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       COALESCE(l.code, ''), COALESCE(l.item_number, ''),
 		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
 		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
+		       COALESCE(l.quantity_override, FALSE),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
@@ -652,6 +653,7 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 			&line.Code, &line.ItemNumber,
 			&line.ResourceType, &line.ParentItemNumber,
 			&line.ParentLineID, &line.NormRate, &line.SublineSeq,
+			&line.QuantityOverride,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
@@ -860,7 +862,13 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 
 		// Sub-line quantity = parent.quantity × norm_rate, denormalized so
 		// existing reports don't need to know about the sub-line model.
-		if req.NormRate > 0 {
+		//
+		// BUT: when the client switches the sub-line into MANUAL mode
+		// (QuantityOverride == true, migration 342), respect whatever
+		// Quantity the user entered and do NOT re-derive from parent×norm.
+		// This covers the "10 hours of pump time independent of parent
+		// volume" case raised by the field team.
+		if req.NormRate > 0 && !req.QuantityOverride {
 			req.Quantity = parentQuantity * req.NormRate
 		}
 		// Inherit parent UOM when the client didn't override it.
@@ -903,10 +911,10 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 			material_rate, labor_rate, equipment_rate,
 			unit_rate, total_amount, code, item_number,
 			resource_type, parent_item_number, sort_order,
-			parent_line_id, norm_rate, subline_seq,
+			parent_line_id, norm_rate, subline_seq, quantity_override,
 			created_date, updated_date
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-		          $17, $18, $19,
+		          $17, $18, $19, $20,
 		          NOW(), NOW())
 		RETURNING id
 	`, tenantID, estimateID, nullInt64FromVal(req.WBSID),
@@ -914,7 +922,7 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		req.MaterialRate, req.LaborRate, req.EquipmentRate,
 		unitRate, totalAmount, nullStringFromVal(req.Code), nullStringFromVal(assignedItemNum),
 		nullStringFromVal(req.ResourceType), nullStringFromVal(parentItemNumber), req.SortOrder,
-		parentLineIDSQL, req.NormRate, sublineSeq,
+		parentLineIDSQL, req.NormRate, sublineSeq, req.QuantityOverride,
 	).Scan(&lineID)
 
 	if err != nil {
@@ -1178,27 +1186,42 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 	// Only actual_amount can be updated on non-draft estimates
 	isActualAmountOnly := req.ActualAmount != nil && req.WBSID == nil && req.Name == nil && req.UOM == nil &&
 		req.Quantity == nil && req.MaterialRate == nil && req.LaborRate == nil && req.EquipmentRate == nil && req.SortOrder == nil &&
-		req.Code == nil && req.ItemNumber == nil && req.ResourceType == nil && req.NormRate == nil && req.UnitPrice == nil
+		req.Code == nil && req.ItemNumber == nil && req.ResourceType == nil && req.NormRate == nil && req.UnitPrice == nil &&
+		req.QuantityOverride == nil
 
 	if state != "draft" && !isActualAmountOnly {
 		response.BadRequest(c, "Only draft estimates can be modified")
 		return
 	}
 
-	// ─── Sub-line handling (migration 332) ───
+	// ─── Sub-line handling (migration 332 + 342) ───
 	// If this row has a parent and the user edited norm_rate, re-derive its
 	// quantity from parent.quantity × norm_rate. Same logic as create.
+	//
+	// Skip the derivation when the sub-line is (or is becoming) in MANUAL
+	// override mode — in that case the user-supplied Quantity is the source
+	// of truth and must not be overwritten. Derivation is allowed again only
+	// when override is explicitly being turned back off AND the user didn't
+	// send a Quantity alongside.
 	if req.NormRate != nil {
 		var parentLineID sql.NullInt64
 		var parentQty float64
+		var storedOverride bool
 		if err := h.db.QueryRow(`
-			SELECT l.parent_line_id, COALESCE(p.quantity, 0)
+			SELECT l.parent_line_id, COALESCE(p.quantity, 0),
+			       COALESCE(l.quantity_override, FALSE)
 			FROM construction_estimate_line l
 			LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
 			WHERE l.id = $1 AND l.tenant_id = $2
-		`, lineID, tenantID).Scan(&parentLineID, &parentQty); err == nil && parentLineID.Valid {
-			derivedQty := parentQty * (*req.NormRate)
-			req.Quantity = &derivedQty
+		`, lineID, tenantID).Scan(&parentLineID, &parentQty, &storedOverride); err == nil && parentLineID.Valid {
+			effectiveOverride := storedOverride
+			if req.QuantityOverride != nil {
+				effectiveOverride = *req.QuantityOverride
+			}
+			if !effectiveOverride && req.Quantity == nil {
+				derivedQty := parentQty * (*req.NormRate)
+				req.Quantity = &derivedQty
+			}
 		}
 	}
 
@@ -1306,6 +1329,11 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("norm_rate = $%d", argCount))
 		args = append(args, *req.NormRate)
+	}
+	if req.QuantityOverride != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("quantity_override = $%d", argCount))
+		args = append(args, *req.QuantityOverride)
 	}
 
 	if len(updates) == 0 {
@@ -1421,6 +1449,7 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       COALESCE(l.code, ''), COALESCE(l.item_number, ''),
 		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
 		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
+		       COALESCE(l.quantity_override, FALSE),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
@@ -1453,6 +1482,7 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 			&line.Code, &line.ItemNumber,
 			&line.ResourceType, &line.ParentItemNumber,
 			&line.ParentLineID, &line.NormRate, &line.SublineSeq,
+			&line.QuantityOverride,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {

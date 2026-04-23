@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
@@ -81,15 +82,21 @@ func (h *Handler) sendReconciliationAutoReminders() {
 				h.sendReconciliationReminderEmail(tenantID, actID, sentTo, partnerName, shareToken, "3 kun")
 			}
 
-			// Also create in-app notification for the creator
+			// Also create in-app notification for the creator.
+			// partner_name + days packed in data for the web renderer. Additive.
 			if createdBy != nil {
+				notifData, _ := json.Marshal(map[string]interface{}{
+					"reconciliation_id": actID.String(),
+					"partner_name":      partnerName,
+					"days":              3,
+				})
 				h.db.Exec(`
 					INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 					VALUES ($1, $2, $3, 'reconciliation_reminder', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
 				`, uuid.New(), tenantID, *createdBy,
 					"Akt sverka javobsiz",
 					partnerName+" hali akt sverkaga javob bermadi (3 kun)",
-					`{"reconciliation_id":"`+actID.String()+`"}`, now)
+					string(notifData), now)
 			}
 
 			h.db.Exec("UPDATE reconciliation_acts SET reminder_3d_sent = true WHERE id = $1", actID)
@@ -129,6 +136,13 @@ func (h *Handler) sendReconciliationAutoReminders() {
 				h.sendReconciliationReminderEmail(tenantID, actID, sentTo, partnerName, shareToken, "7 kun")
 			}
 
+			// partner_name + days packed in data; additive.
+			notifData7d, _ := json.Marshal(map[string]interface{}{
+				"reconciliation_id": actID.String(),
+				"partner_name":      partnerName,
+				"days":              7,
+			})
+
 			// Notify creator
 			if createdBy != nil {
 				h.db.Exec(`
@@ -137,7 +151,7 @@ func (h *Handler) sendReconciliationAutoReminders() {
 				`, uuid.New(), tenantID, *createdBy,
 					"Akt sverka javobsiz — eslatma yuboring",
 					partnerName+" 7 kun davomida akt sverkaga javob bermadi",
-					`{"reconciliation_id":"`+actID.String()+`"}`, now)
+					string(notifData7d), now)
 			}
 
 			// Notify admins
@@ -155,7 +169,7 @@ func (h *Handler) sendReconciliationAutoReminders() {
 						`, uuid.New(), tenantID, adminID,
 							"Akt sverka javobsiz — eslatma yuboring",
 							partnerName+" 7 kun davomida akt sverkaga javob bermadi",
-							`{"reconciliation_id":"`+actID.String()+`"}`, now)
+							string(notifData7d), now)
 					}
 				}
 				adminRows.Close()

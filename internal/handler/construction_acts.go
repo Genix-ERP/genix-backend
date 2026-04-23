@@ -500,10 +500,13 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 			WHERE p.id = $1
 		`, projectID).Scan(&pmUserID)
 		if err == nil && pmUserID != uuid.Nil {
+			// `act_name` is stored in `data` so the web can re-render the
+			// notification body in the user's current UI language via
+			// notificationCatalog.js. Additive — mobile still reads title/message.
 			h.createNotification(tenantID, pmUserID, "forma19_created",
 				"Yashirin ishlar akti yaratildi",
 				fmt.Sprintf("Yangi Forma 19 yaratildi: %s. Tekshirish va imzolash talab etiladi.", name),
-				map[string]interface{}{"project_id": projectID, "act_id": actID})
+				map[string]interface{}{"project_id": projectID, "act_id": actID, "act_name": name})
 		}
 	}
 
@@ -1440,10 +1443,11 @@ func (h *Handler) SignAct(c *gin.Context) {
 			WHERE p.id = $1
 		`, projectID).Scan(&pmUserID)
 		if pmUserID != uuid.Nil {
+			// `act_type` carried in `data` for the web renderer; additive.
 			h.createNotification(tenantID, pmUserID, "act_signed",
 				"Akt imzolandi",
 				fmt.Sprintf("Akt barcha tomonlar tomonidan imzolandi (loyiha: %d)", projectID),
-				map[string]interface{}{"project_id": projectID, "act_id": actID})
+				map[string]interface{}{"project_id": projectID, "act_id": actID, "act_type": actType})
 		}
 
 		// Recalculate Forma 3 if a KS-2 was signed
@@ -1533,13 +1537,14 @@ func (h *Handler) CancelAct(c *gin.Context) {
 	`, projectID).Scan(&pmUserID, &ceUserID)
 
 	notifMsg := fmt.Sprintf("Akt bekor qilindi. Sabab: %s", req.RejectionReason)
+	// `reason` carried in `data` so the web renderer can rebuild the body in
+	// the current UI language. Mobile continues to use the frozen notifMsg.
+	notifData := map[string]interface{}{"project_id": projectID, "act_id": actID, "reason": req.RejectionReason}
 	if pmUserID != uuid.Nil {
-		h.createNotification(tenantID, pmUserID, "act_cancelled", "Akt bekor qilindi", notifMsg,
-			map[string]interface{}{"project_id": projectID, "act_id": actID})
+		h.createNotification(tenantID, pmUserID, "act_cancelled", "Akt bekor qilindi", notifMsg, notifData)
 	}
 	if ceUserID != uuid.Nil && ceUserID != pmUserID {
-		h.createNotification(tenantID, ceUserID, "act_cancelled", "Akt bekor qilindi", notifMsg,
-			map[string]interface{}{"project_id": projectID, "act_id": actID})
+		h.createNotification(tenantID, ceUserID, "act_cancelled", "Akt bekor qilindi", notifMsg, notifData)
 	}
 
 	response.Success(c, map[string]interface{}{
