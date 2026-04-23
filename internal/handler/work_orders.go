@@ -1429,6 +1429,9 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 		}
 		totalNeeded := comp.Quantity * (1 + comp.ScrapPercent/100) * (qtyPlanned / bomOutputQty)
 
+		// Deduct from the PO's warehouse; create the inventory row if missing
+		// so a zero / negative balance still records against the right
+		// warehouse instead of silently skipping the consumption.
 		var invID uuid.UUID
 		var unitCost float64
 		err = tx.QueryRow(`
@@ -1436,7 +1439,23 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
 			AND lot_number IS NULL AND serial_number IS NULL
 		`, tenantID, comp.ComponentID, warehouseID).Scan(&invID, &unitCost)
-		if err != nil {
+		if err == sql.ErrNoRows {
+			invID = uuid.New()
+			if _, createErr := tx.Exec(`
+				INSERT INTO inventory (
+					id, tenant_id, product_id, warehouse_id,
+					quantity_on_hand, quantity_reserved,
+					last_movement_date, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, 0, 0, $5, $5, $5)
+			`, invID, tenantID, comp.ComponentID, warehouseID, now); createErr != nil {
+				h.log.Error("Failed to create inventory row for work-order consumption",
+					"error", createErr, "component_id", comp.ComponentID,
+					"warehouse_id", warehouseID)
+				continue
+			}
+			// unit_cost stays 0 for newly-created rows — pull product default.
+			h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&unitCost)
+		} else if err != nil {
 			continue
 		}
 
