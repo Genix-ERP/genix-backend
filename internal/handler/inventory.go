@@ -1650,7 +1650,14 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(NULLIF(cp.cost_price, 0), cp.list_price, 0) * (1 + bl2.scrap_percent/100))
 			     FROM bom_lines bl2 JOIN products cp ON bl2.component_id = cp.id
 			     WHERE bl2.bom_id = b.id), 0)
-			   + COALESCE((SELECT SUM(COALESCE(wc.hourly_cost, 0) / GREATEST(COALESCE(wc.capacity_per_hour, 1), 1))
+			   -- Work center cost per product = hourly_cost / capacity_per_hour
+			   -- (how many so'm it costs to make one unit at this work center).
+			   -- Summed across all operations in the routing, added to the
+			   -- components total to yield total cost per finished product.
+			   + COALESCE((SELECT SUM(
+			         COALESCE(wc.hourly_cost, 0)
+			       / GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
+			     )
 			     FROM bom_operations bo LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
 			     WHERE bo.bom_id = b.id), 0) as total_cost
 		FROM product_boms b
@@ -1865,7 +1872,21 @@ func (h *Handler) GetBOM(c *gin.Context) {
 		b.Lines = append(b.Lines, l)
 	}
 
-	b.TotalCost = totalCost
+	// Add work-center cost per product (hourly_cost / capacity_per_hour)
+	// summed across all operations in the routing, so the detail Total
+	// Cost matches the list Total Cost.
+	var operationsCost sql.NullFloat64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(
+		    COALESCE(wc.hourly_cost, 0)
+		  / GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
+		), 0)
+		FROM bom_operations bo
+		LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
+		WHERE bo.bom_id = $1
+	`, bomID).Scan(&operationsCost)
+
+	b.TotalCost = totalCost + operationsCost.Float64
 
 	response.Success(c, b)
 }
