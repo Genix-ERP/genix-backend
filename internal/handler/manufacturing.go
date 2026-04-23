@@ -38,6 +38,12 @@ func calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHoursPerDay, p
 	if annualWorkingHours <= 0 {
 		annualWorkingHours = 2000
 	}
+	// Uzbek work schedule: 27 working days/month × configured hours per day.
+	// Fall back to the old 176h (22 × 8) only if workingHoursPerDay is invalid.
+	monthlyWorkingHours := workingHoursPerDay * 27
+	if monthlyWorkingHours <= 0 {
+		monthlyWorkingHours = 176
+	}
 	if assetValue > 0 && usefulLifeYears > 0 {
 		depreciationPerHour = assetValue / usefulLifeYears / annualWorkingHours
 	}
@@ -46,7 +52,7 @@ func calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHoursPerDay, p
 		maintenancePerHour = annualMaintenance / annualWorkingHours
 	}
 	if operatorMonthlySalary > 0 {
-		laborPerHour = operatorMonthlySalary / 176
+		laborPerHour = operatorMonthlySalary / monthlyWorkingHours
 	}
 	totalHourlyCost = depreciationPerHour + electricityPerHour + maintenancePerHour + laborPerHour + overheadCost
 	return
