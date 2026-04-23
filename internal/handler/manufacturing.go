@@ -2314,30 +2314,46 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			compRows.Close()
 			h.log.Info("[v2] BOM components found", "count", len(components), "bom_id", bomID, "po_id", id)
 
-			// Deduct each component from inventory
+			// Deduct each component from inventory. We deduct in full even when
+			// the on-hand balance is less than needed — the stock goes negative
+			// and the user sees what they're short. This matches how
+			// construction / manufacturing shops actually work (you keep
+			// building even if the storeroom says you're out; the missing
+			// quantity gets reconciled with a purchase or stock count later).
 			for _, comp := range components {
 				consumption := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
 
+				// Always deduct from the PO's warehouse. If no inventory row
+				// exists there yet, create one at zero so the negative balance
+				// lands on the correct warehouse instead of some unrelated one
+				// that happened to have the largest stock.
 				var compInvID uuid.UUID
-				// Try to find inventory record in the production order's warehouse first
 				compErr := tx.QueryRow(`
 					SELECT id FROM inventory
 					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+					  AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
 					ORDER BY quantity_on_hand DESC LIMIT 1
 				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
 
-				// Fallback: find any inventory record for this component (any warehouse)
-				if compErr != nil {
-					compErr = tx.QueryRow(`
-						SELECT id FROM inventory
-						WHERE tenant_id = $1 AND product_id = $2
-						AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
-						ORDER BY quantity_on_hand DESC LIMIT 1
-					`, tenantID, comp.ComponentID).Scan(&compInvID)
-				}
-
-				if compErr != nil {
-					h.log.Warn("Component not found in any inventory, skipping consumption", "component_id", comp.ComponentID)
+				if compErr == sql.ErrNoRows {
+					// No row in the PO's warehouse yet. Create one so the
+					// consumption lands in the right place (and can go negative).
+					compInvID = uuid.New()
+					if _, createErr := tx.Exec(`
+						INSERT INTO inventory (
+							id, tenant_id, product_id, warehouse_id,
+							quantity_on_hand, quantity_reserved,
+							last_movement_date, created_at, updated_at
+						) VALUES ($1, $2, $3, $4, 0, 0, $5, $5, $5)
+					`, compInvID, tenantID, comp.ComponentID, warehouseID, now); createErr != nil {
+						h.log.Error("Failed to create inventory row for component consumption",
+							"error", createErr, "component_id", comp.ComponentID,
+							"warehouse_id", warehouseID)
+						continue
+					}
+				} else if compErr != nil {
+					h.log.Error("Failed to look up component inventory",
+						"error", compErr, "component_id", comp.ComponentID)
 					continue
 				}
 
