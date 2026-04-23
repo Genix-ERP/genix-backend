@@ -1934,15 +1934,9 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 	}
 
 	_, err = tx.Exec(`
-<<<<<<< HEAD
 		INSERT INTO users (id, tenant_id, email, phone, password_hash, first_name, last_name, role, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'owner', $8, true, true, false, $9, $9)
 	`, userID, tenantID, userEmail, userPhone, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
-=======
-		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, role, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, true, false, 'owner', $8, $8)
-	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
->>>>>>> 25fd5f4f5ed9dd93945e5fd014b5d80eb5090b2d
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
 		response.InternalServerError(c, "")
