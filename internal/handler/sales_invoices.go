@@ -34,7 +34,8 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	// Build query with filters - join with contacts for customer_name
+	// Build query with filters - join with contacts for customer_name and
+	// sales_orders so we can surface the originating order number.
 	baseQuery := `
 		SELECT si.id, si.tenant_id, si.organization_id, si.invoice_number, si.customer_id, si.sales_order_id,
 			   si.invoice_date, si.due_date, si.billing_address, si.shipping_address,
@@ -45,6 +46,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			   COALESCE(c.name, si.customer_name, '') as customer_name,
 			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason,
 			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date,
+			   COALESCE(so.order_number, '') as order_number,
 			   COALESCE((
 				   SELECT string_agg(DISTINCT j.name, ', ')
 				   FROM payment_allocations pa
@@ -68,6 +70,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			   ), '') as payment_journals_en
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
+		LEFT JOIN sales_orders so ON si.sales_order_id = so.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
 	countQuery := `SELECT COUNT(*) FROM sales_invoices si WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
 	args := []interface{}{tenantID}
@@ -187,6 +190,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		var earlyDiscountAmount float64
 		var earlyDiscountDate sql.NullTime
 		var paymentJournals, paymentJournalsUz, paymentJournalsEn string
+		var orderNumber string
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -198,6 +202,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			&customerName,
 			&invoiceType, &originalInvoiceID, &reason,
 			&paymentTermID, &earlyDiscountAmount, &earlyDiscountDate,
+			&orderNumber,
 			&paymentJournals, &paymentJournalsUz, &paymentJournalsEn,
 		)
 		if err != nil {
@@ -231,6 +236,7 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			"status":          status,
 			"payment_status":  paymentStatus,
 			"invoice_type":      invoiceType,
+			"order_number":      orderNumber,
 			"created_at":        createdAt,
 			"updated_at":        updatedAt,
 			"payment_journals":    paymentJournals,
