@@ -350,6 +350,81 @@ func OrganizationResolver() gin.HandlerFunc {
 	}
 }
 
+// TrialCheck middleware enforces the 7-day trial / 30-day account clearing policy.
+// - If trial_ends_at has passed and status is 'trialing' → advance to 'past_due'.
+// - If account_clear_at has passed → mark tenant expired/inactive.
+// - If status is 'past_due' or 'expired' → return 402 Payment Required.
+// Routes under /api/v1/auth/* and /api/v1/subscription* are always allowed through.
+func TrialCheck(db *database.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Allow auth and subscription routes unconditionally
+		path := c.FullPath()
+		if strings.HasPrefix(path, "/api/v1/auth/") ||
+			strings.HasPrefix(path, "/api/v1/subscription") ||
+			strings.HasPrefix(path, "/api/v1/admin/") {
+			c.Next()
+			return
+		}
+
+		// System admins bypass trial checks entirely
+		if claims, exists := c.Get(ContextKeyClaims); exists {
+			if jwtClaims, ok := claims.(*crypto.Claims); ok && jwtClaims.IsSystemAdmin {
+				c.Next()
+				return
+			}
+		}
+
+		tenantID := c.GetString(ContextKeyTenantID)
+		if tenantID == "" {
+			c.Next()
+			return
+		}
+
+		var (
+			status         string
+			trialEndsAt    sql.NullTime
+			accountClearAt sql.NullTime
+			isActive       bool
+		)
+
+		err := db.QueryRow(`
+			SELECT subscription_status, trial_ends_at, account_clear_at, is_active
+			FROM tenants
+			WHERE id = $1 AND deleted_at IS NULL
+		`, tenantID).Scan(&status, &trialEndsAt, &accountClearAt, &isActive)
+		if err != nil {
+			// Can't verify — let the request pass (fail-open)
+			c.Next()
+			return
+		}
+
+		now := time.Now()
+
+		// Advance trialing → past_due when trial period ends
+		if status == "trialing" && trialEndsAt.Valid && now.After(trialEndsAt.Time) {
+			db.Exec(`UPDATE tenants SET subscription_status = 'past_due' WHERE id = $1`, tenantID)
+			status = "past_due"
+		}
+
+		// Advance past_due / any non-active → expired when account_clear_at passes
+		if accountClearAt.Valid && now.After(accountClearAt.Time) && status != "active" {
+			db.Exec(`UPDATE tenants SET subscription_status = 'expired', is_active = false WHERE id = $1`, tenantID)
+			status = "expired"
+			isActive = false
+		}
+
+		// Block access when not active
+		if !isActive || status == "past_due" || status == "expired" || status == "cancelled" {
+			response.Error(c, http.StatusPaymentRequired, "payment_required",
+				"Trial period has ended. Please upgrade your plan to continue.")
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
 // RequireTenant middleware ensures a tenant is resolved
 func RequireTenant() gin.HandlerFunc {
 	return func(c *gin.Context) {
