@@ -1707,11 +1707,14 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		var customerName string
 		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
 		amountStr := fmt.Sprintf("%.0f", input.Amount)
+		// `customer_name` added to data so the web renderer (notificationCatalog.js)
+		// can rebuild the body in the current UI language. Additive — mobile-safe.
 		h.createTranslatedNotification(tenantID, userID, "payment_recorded",
 			map[string]interface{}{
 				"invoice_id":     invoiceID.String(),
 				"invoice_number": invoiceNumber,
 				"customer_id":    customerID.String(),
+				"customer_name":  customerName,
 				"amount":         input.Amount,
 			},
 			amountStr, invoiceNumber, customerName,
@@ -1881,12 +1884,14 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 		var customerName string
 		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
 		amountStr := fmt.Sprintf("%.0f", cnTotalAmount)
+		// customer_name added for web re-render; additive and mobile-safe.
 		h.createTranslatedNotification(tenantID, userID, "credit_note_created",
 			map[string]interface{}{
 				"credit_note_id":     creditNoteID.String(),
 				"credit_note_number": cnNumber,
 				"invoice_number":     orgInvoiceNumber,
 				"customer_id":        customerID.String(),
+				"customer_name":      customerName,
 				"amount":             cnTotalAmount,
 			},
 			cnNumber, orgInvoiceNumber, amountStr,

@@ -86,11 +86,18 @@ func (h *Handler) ListExpenses(c *gin.Context) {
 	status := c.Query("status")
 	categoryID := c.Query("category_id")
 	employeeID := c.Query("employee_id")
+	// Profit-tax filters used by the Profit Tax page (§7.3 of the TZ):
+	//   ?is_recognized=true|false   — narrow to recognized or unrecognized.
+	//   ?date_from=YYYY-MM-DD       — inclusive lower bound on expense_date.
+	//   ?date_to=YYYY-MM-DD         — inclusive upper bound on expense_date.
+	isRecognized := c.Query("is_recognized")
+	dateFrom := c.Query("date_from")
+	dateTo := c.Query("date_to")
 
 	baseQuery := `
 		SELECT e.id, e.tenant_id, e.expense_number, e.category_id, e.employee_id, e.employee_name,
 			   e.vendor_id, e.vendor_name, e.expense_date, e.description, e.amount, e.tax_amount,
-			   e.total_amount, e.currency, e.payment_method, e.reference, e.receipt_url,
+			   e.total_amount, e.currency, e.payment_method, e.reference, e.receipt_url, e.is_recognized,
 			   e.status, e.reimbursable, e.notes, e.created_at, e.updated_at,
 			   COALESCE(c.name, '') as category_name
 		FROM expenses e
@@ -134,6 +141,26 @@ func (h *Handler) ListExpenses(c *gin.Context) {
 		}
 	}
 
+	if isRecognized == "true" || isRecognized == "false" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND e.is_recognized = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND is_recognized = $%d", argCount)
+		args = append(args, isRecognized == "true")
+	}
+
+	if dateFrom != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND e.expense_date >= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND expense_date >= $%d", argCount)
+		args = append(args, dateFrom)
+	}
+	if dateTo != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND e.expense_date <= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND expense_date <= $%d", argCount)
+		args = append(args, dateTo)
+	}
+
 	baseQuery += " ORDER BY e.expense_date DESC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
@@ -162,7 +189,8 @@ func (h *Handler) ListExpenses(c *gin.Context) {
 			&expense.ID, &expense.TenantID, &expense.ExpenseNumber, &categoryID,
 			&employeeID, &employeeName, &vendorID, &vendorName, &expense.ExpenseDate,
 			&expense.Description, &expense.Amount, &expense.TaxAmount, &expense.TotalAmount,
-			&expense.Currency, &paymentMethod, &reference, &receiptURL, &expense.Status,
+			&expense.Currency, &paymentMethod, &reference, &receiptURL, &expense.IsRecognized,
+			&expense.Status,
 			&expense.Reimbursable, &notes, &expense.CreatedAt, &expense.UpdatedAt,
 			&expense.CategoryName,
 		); err != nil {
@@ -270,13 +298,20 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 		currency = "UZS"
 	}
 
+	// is_recognized defaults to TRUE — matches the DB default and the safe
+	// "deductible" interpretation. Clients that know about the flag (new
+	// Expenses page + Profit Tax classifier) can send an explicit value.
+	isRecognized := true
+	if input.IsRecognized != nil {
+		isRecognized = *input.IsRecognized
+	}
 	query := `
 		INSERT INTO expenses (
 			id, tenant_id, organization_id, expense_number, category_id, category_name, employee_id, employee_name,
 			vendor_id, vendor_name, expense_date, description, amount, tax_amount,
 			total_amount, currency, payment_method, reference, receipt_url, status,
-			reimbursable, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+			reimbursable, is_recognized, notes, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
 		RETURNING id
 	`
 
@@ -307,7 +342,7 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 		id, tenantID, orgIDPtr, expenseNumber, categoryID, categoryName, employeeID, employeeName,
 		vendorID, vendorName, expenseDate, input.Description, input.Amount, input.TaxAmount,
 		totalAmount, currency, paymentMethod, reference, receiptURL, "pending",
-		input.Reimbursable, notes, userID, now, now,
+		input.Reimbursable, isRecognized, notes, userID, now, now,
 	).Scan(&id); err != nil {
 		h.log.Error("Failed to create expense", "error", err)
 		response.InternalError(c, "Failed to create expense")
@@ -335,6 +370,7 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 		ReceiptURL:    receiptURL,
 		Status:        "pending",
 		Reimbursable:  input.Reimbursable,
+		IsRecognized:  isRecognized,
 		Notes:         notes,
 		CreatedAt:     now,
 		UpdatedAt:     now,
@@ -361,7 +397,7 @@ func (h *Handler) GetExpense(c *gin.Context) {
 	query := `
 		SELECT e.id, e.tenant_id, e.expense_number, e.category_id, e.employee_id, e.employee_name,
 			   e.vendor_id, e.vendor_name, e.expense_date, e.description, e.amount, e.tax_amount,
-			   e.total_amount, e.currency, e.payment_method, e.reference, e.receipt_url,
+			   e.total_amount, e.currency, e.payment_method, e.reference, e.receipt_url, e.is_recognized,
 			   e.status, e.reimbursable, e.notes, e.created_at, e.updated_at,
 			   COALESCE(c.name, '') as category_name
 		FROM expenses e
@@ -377,7 +413,8 @@ func (h *Handler) GetExpense(c *gin.Context) {
 		&expense.ID, &expense.TenantID, &expense.ExpenseNumber, &categoryID,
 		&employeeID, &employeeName, &vendorID, &vendorName, &expense.ExpenseDate,
 		&expense.Description, &expense.Amount, &expense.TaxAmount, &expense.TotalAmount,
-		&expense.Currency, &paymentMethod, &reference, &receiptURL, &expense.Status,
+		&expense.Currency, &paymentMethod, &reference, &receiptURL, &expense.IsRecognized,
+		&expense.Status,
 		&expense.Reimbursable, &notes, &expense.CreatedAt, &expense.UpdatedAt,
 		&expense.CategoryName,
 	); err == sql.ErrNoRows {
@@ -514,6 +551,9 @@ func (h *Handler) UpdateExpense(c *gin.Context) {
 	if input.Reimbursable != nil {
 		addUpdate("reimbursable", *input.Reimbursable)
 	}
+	if input.IsRecognized != nil {
+		addUpdate("is_recognized", *input.IsRecognized)
+	}
 	if input.Notes != nil {
 		addUpdate("notes", *input.Notes)
 	}
@@ -546,6 +586,55 @@ func (h *Handler) UpdateExpense(c *gin.Context) {
 		return
 	}
 
+	h.GetExpense(c)
+}
+
+// RecognizeExpense flips the is_recognized flag on a single expense.
+// PATCH /expenses/:id/recognize  body: { "is_recognized": true|false }.
+// This endpoint is intentionally narrow — finance/accounting staff review
+// expenses one-by-one and toggle recognition as they verify documentation
+// (see §7.2 of ТЗ_Ish_Haqi_Soliq_Tolik.docx). Using a dedicated route
+// instead of the general UpdateExpense PUT means we can gate it with a
+// distinct permission and keep the audit log focused.
+func (h *Handler) RecognizeExpense(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid expense ID")
+		return
+	}
+
+	var input struct {
+		IsRecognized *bool `json:"is_recognized"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil || input.IsRecognized == nil {
+		response.BadRequest(c, "is_recognized is required")
+		return
+	}
+
+	res, err := h.db.Exec(`
+		UPDATE expenses
+		SET is_recognized = $1, updated_at = $2
+		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+	`, *input.IsRecognized, time.Now(), id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to update expense recognition", "error", err)
+		response.InternalError(c, "Failed to update recognition")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.NotFound(c, "Expense")
+		return
+	}
+
+	// Re-use GetExpense so the client gets the same response shape as the
+	// other endpoints on this resource.
 	h.GetExpense(c)
 }
 

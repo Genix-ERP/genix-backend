@@ -740,6 +740,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		taxReports.POST("/periods/:id/pay", h.perm.Require("finance", "tax_report", "update"), h.PayTaxPeriod)
 		// Employee-taxes aggregation (migration 330)
 		taxReports.GET("/employee-taxes", h.GetEmployeeTaxReport)
+		// Per-tax XML export for regulator filings (NDFL quarterly, ESP
+		// monthly, INPS monthly — §10 reports #2–4 of the TZ).
+		taxReports.GET("/employee-taxes/xml", h.ExportEmployeeTaxReportXML)
 	}
 
 	// Discounts
@@ -1611,6 +1614,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payrollPeriods.PUT("/:id/entries/:eid", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollEntry)
 		payrollPeriods.GET("/:id/entries/:eid/taxes", h.GetPayrollEntryTaxes)
 		payrollPeriods.POST("/:id/entries/:eid/confirm", h.perm.Require("hr", "payroll", "approve"), h.ConfirmSalaryPaymentByEntry)
+		// Vedomost (maosh vedomosti) — aggregated per-period payroll view
+		// with every tax pivoted into its own column. Drives the Excel
+		// export in §7.4 + §10 report #1 of ТЗ_Ish_Haqi_Soliq_Tolik.docx.
+		payrollPeriods.GET("/:id/vedomost", h.GetPayrollVedomost)
 	}
 
 	// ────────────── Employee Taxes (migration 330) ──────────────
@@ -1625,6 +1632,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employeeTaxes.PUT("/:id", h.UpdateEmployeeTax)
 		employeeTaxes.DELETE("/:id", h.DeleteEmployeeTax)
 		employeeTaxes.POST("/preview", h.PreviewPayrollTaxes)
+	}
+
+	// ────────────── Company Tax Rates (migration 340) ──────────────
+	// Activity-level taxes (NDS / Profit / Turnover / Dividend / …).
+	// Complements /employee-taxes so Settings → Finance can present the
+	// full 8-tax default catalog from TZ §1.2 of ТЗ_Ish_Haqi_Soliq_Tolik.
+	companyTaxRates := rg.Group("/company-tax-rates")
+	{
+		companyTaxRates.GET("", h.ListCompanyTaxRates)
+		companyTaxRates.POST("", h.CreateCompanyTaxRate)
+		companyTaxRates.PUT("/:id", h.UpdateCompanyTaxRate)
+		companyTaxRates.DELETE("/:id", h.DeleteCompanyTaxRate)
 	}
 
 	// ────────────── TT "Ish haqi" (payroll simple model) ──────────────
@@ -1677,6 +1696,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		expenses.PUT("/:id", h.perm.Require("finance", "expense", "update"), h.UpdateExpense)
 		expenses.DELETE("/:id", h.perm.Require("finance", "expense", "delete"), h.DeleteExpense)
 		expenses.POST("/:id/approve", h.perm.Require("finance", "expense", "approve"), h.ApproveExpense)
+		// Dedicated recognition toggle — see RecognizeExpense / §7.2 of
+		// ТЗ_Ish_Haqi_Soliq_Tolik.docx. Re-uses the generic "update"
+		// permission; wire to its own perm node if/when RBAC grows.
+		expenses.PATCH("/:id/recognize", h.perm.Require("finance", "expense", "update"), h.RecognizeExpense)
+	}
+
+	// Profit-tax calculation + snapshots (migrations 336/337)
+	profitTax := rg.Group("/profit-tax")
+	profitTax.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		profitTax.GET("", h.GetProfitTax)
+		profitTax.GET("/revenue", h.GetProfitTaxRevenue)
+		profitTax.GET("/snapshots", h.ListProfitTaxSnapshots)
+		profitTax.POST("/snapshot", h.perm.Require("finance", "expense", "approve"), h.SnapshotProfitTax)
 	}
 
 	// Asset Categories

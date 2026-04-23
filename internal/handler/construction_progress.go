@@ -370,7 +370,3 @@ func (n nullableTime) stringVal() interface{} {
 	}
 	return nil
 }
-
-func round2(f float64) float64 {
-	return float64(int(f*100)) / 100
-}

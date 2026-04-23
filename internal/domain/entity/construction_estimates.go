@@ -154,9 +154,15 @@ type ConstructionEstimateLine struct {
 	// When ParentLineID is set, this row is a resource breakdown of its parent.
 	// NormRate is the ШРНК норма; sub-line quantity is stored as
 	// parent.quantity × NormRate (denormalized on write).
-	ParentLineID sql.NullInt64 `json:"parent_line_id" db:"parent_line_id"`
-	NormRate     float64       `json:"norm_rate" db:"norm_rate"`
-	SublineSeq   int           `json:"subline_seq" db:"subline_seq"`
+	//
+	// QuantityOverride (migration 342) switches the sub-line into MANUAL mode:
+	// when TRUE, Quantity is what the user entered directly (e.g. "10 hours"
+	// for a machine) and is NOT re-derived from parent.quantity × NormRate.
+	// NormRate remains persisted for reference.
+	ParentLineID     sql.NullInt64 `json:"parent_line_id" db:"parent_line_id"`
+	NormRate         float64       `json:"norm_rate" db:"norm_rate"`
+	SublineSeq       int           `json:"subline_seq" db:"subline_seq"`
+	QuantityOverride bool          `json:"quantity_override" db:"quantity_override"`
 
 	SortOrder   int       `json:"sort_order" db:"sort_order"`
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
@@ -189,6 +195,7 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		ParentLineID     interface{} `json:"parent_line_id"`
 		NormRate         float64     `json:"norm_rate"`
 		SublineSeq       int         `json:"subline_seq"`
+		QuantityOverride bool        `json:"quantity_override"`
 		SortOrder        int         `json:"sort_order"`
 		CreatedDate   time.Time   `json:"created_date"`
 		UpdatedDate   time.Time   `json:"updated_date"`
@@ -215,6 +222,7 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		ParentLineID:     nullInt64Value(l.ParentLineID),
 		NormRate:         l.NormRate,
 		SublineSeq:       l.SublineSeq,
+		QuantityOverride: l.QuantityOverride,
 		SortOrder:        l.SortOrder,
 		CreatedDate:   l.CreatedDate,
 		UpdatedDate:   l.UpdatedDate,
@@ -241,16 +249,25 @@ type CreateEstimateLineInput struct {
 	//   - looks up the parent
 	//   - auto-generates ItemNumber = "{parent.item_number}-{next_subline_seq}"
 	//     if the caller didn't supply one
-	//   - computes Quantity = parent.quantity × NormRate
-	ParentLineID int64   `json:"parent_line_id"`
-	NormRate     float64 `json:"norm_rate"`
-	UnitPrice    float64 `json:"unit_price"` // convenience — mapped to the rate column that matches resource_type
+	//   - computes Quantity = parent.quantity × NormRate  UNLESS the client
+	//     set QuantityOverride = true, in which case the user-supplied
+	//     Quantity is persisted as-is (migration 342).
+	ParentLineID     int64   `json:"parent_line_id"`
+	NormRate         float64 `json:"norm_rate"`
+	UnitPrice        float64 `json:"unit_price"` // convenience — mapped to the rate column that matches resource_type
+	QuantityOverride bool    `json:"quantity_override"`
 }
 
 type BulkCreateEstimateLinesInput struct {
 	Lines      []CreateEstimateLineInput `json:"lines" binding:"required"`
 	Replace    bool                      `json:"replace"`
 	SourceType string                    `json:"source_type"`
+	// SourceFileName identifies the Excel file the user uploaded. Used by
+	// autoCreateForma2FromEstimate to dedupe Forma 2 drafts: multiple
+	// estimate types extracted from the SAME file produce ONE merged
+	// Forma 2, while imports from different files stay separate. See
+	// migration 339 for the matching column on construction_act.
+	SourceFileName string `json:"source_file_name"`
 }
 
 type UpdateEstimateLineInput struct {
@@ -270,9 +287,12 @@ type UpdateEstimateLineInput struct {
 	ResourceType *string `json:"resource_type"`
 
 	// Sub-line fields. When NormRate is supplied for a row that has a parent,
-	// Quantity is re-derived from parent.quantity × NormRate.
-	NormRate  *float64 `json:"norm_rate"`
-	UnitPrice *float64 `json:"unit_price"`
+	// Quantity is re-derived from parent.quantity × NormRate — UNLESS
+	// QuantityOverride is true on the row (or is being set to true in this
+	// request), in which case the user-supplied Quantity wins (migration 342).
+	NormRate         *float64 `json:"norm_rate"`
+	UnitPrice        *float64 `json:"unit_price"`
+	QuantityOverride *bool    `json:"quantity_override"`
 }
 
 // =====================================================
