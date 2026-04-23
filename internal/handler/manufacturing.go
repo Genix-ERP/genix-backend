@@ -610,7 +610,16 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("working_hours_per_day = $%d", argCount))
 		args = append(args, *input.WorkingHoursPerDay)
 	}
-	if input.HourlyCost != nil {
+	// Whether any breakdown component is being changed — used to decide
+	// whether the explicit hourly_cost input should be applied now or
+	// deferred. When a breakdown field changes the detailed-compute block
+	// below sets hourly_cost to the computed total, so skip the manual
+	// assignment here to avoid assigning the same column twice.
+	costFieldChangedEarly := input.AssetValue != nil || input.UsefulLifeYears != nil ||
+		input.PowerKW != nil || input.ElectricityRate != nil ||
+		input.AnnualMaintenance != nil || input.OperatorMonthlySalary != nil ||
+		input.OverheadCost != nil || input.WorkingHoursPerDay != nil
+	if input.HourlyCost != nil && !costFieldChangedEarly {
 		argCount++
 		updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
 		args = append(args, *input.HourlyCost)
@@ -656,12 +665,10 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 		args = append(args, *input.OperatorMonthlySalary)
 	}
 
-	// Recalculate cost breakdown if any cost-related field changed
-	costFieldChanged := input.AssetValue != nil || input.UsefulLifeYears != nil ||
-		input.PowerKW != nil || input.ElectricityRate != nil ||
-		input.AnnualMaintenance != nil || input.OperatorMonthlySalary != nil ||
-		input.OverheadCost != nil || input.WorkingHoursPerDay != nil
-	if costFieldChanged {
+	// Recalculate cost breakdown if any cost-related field changed.
+	// (costFieldChangedEarly was computed above to gate the explicit
+	// hourly_cost assignment — reuse it here.)
+	if costFieldChangedEarly {
 		var cur struct {
 			AssetValue, UsefulLifeYears, WorkingHoursPerDay float64
 			PowerKW, ElectricityRate, AnnualMaintenance     float64
@@ -703,12 +710,14 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 			argCount++
 			updates = append(updates, fmt.Sprintf("labor_per_hour = $%d", argCount))
 			args = append(args, labor)
-			// Only set hourly_cost to calculated total if user didn't explicitly provide it
-			if input.HourlyCost == nil {
-				argCount++
-				updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
-				args = append(args, total)
-			}
+			// Always overwrite hourly_cost with the computed total when the
+			// breakdown components are provided. The breakdown is the source
+			// of truth — matches create-handler behavior. Without this, a WC
+			// edited to add breakdown inputs would keep hourly_cost = 0
+			// because the frontend always sends hourly_cost in the payload.
+			argCount++
+			updates = append(updates, fmt.Sprintf("hourly_cost = $%d", argCount))
+			args = append(args, total)
 		}
 	}
 
