@@ -253,11 +253,26 @@ func (h *Handler) CreateMaterialReservation(c *gin.Context) {
 		`, req.Quantity, now, productID, warehouseID, tenantID)
 	}
 
-	// Notify inventory users
-	h.createNotificationForAllTenantUsers(tenantID, "low_stock", map[string]interface{}{
+	// Notify inventory users that a material reservation is pending.
+	//
+	// This used to be emitted as `low_stock` which was semantically wrong
+	// (it's a reservation request, not a stock-level alert) and resulted
+	// in garbled text like "Product Reservation request for product
+	// (qty: 3.00) is running low ( remaining)" on the web.
+	//
+	// Now emitted as a dedicated type `material_reservation_request` with
+	// the real fields packed into `data` so the web renderer can build a
+	// proper localised body. Falls back to the frozen title/message for
+	// historical rows and on mobile.
+	var productName string
+	h.db.QueryRow(`SELECT COALESCE(name, '') FROM products WHERE id = $1 AND tenant_id = $2`,
+		productID, tenantID).Scan(&productName)
+	h.createNotificationForAllTenantUsers(tenantID, "material_reservation_request", map[string]interface{}{
 		"reservation_id": id.String(),
 		"product_id":     productID.String(),
-	}, fmt.Sprintf("Reservation request for product (qty: %.2f)", req.Quantity), "")
+		"product_name":   productName,
+		"quantity":       req.Quantity,
+	}, productName, fmt.Sprintf("%.2f", req.Quantity))
 
 	response.Created(c, map[string]interface{}{
 		"id":         id,

@@ -88,6 +88,15 @@ var notificationTemplates = map[string]map[string]struct{ Title, Message string 
 		"uz": {Title: "Xarid buyurtmasi tasdiqlandi", Message: "%s xarid buyurtmasi %s yetkazuvchi uchun tasdiqlandi, %s miqdorida"},
 		"ru": {Title: "Заказ на закупку одобрён", Message: "Заказ на закупку %s для поставщика %s одобрён на сумму %s"},
 	},
+	// ── Material reservation (construction) ──
+	// Dedicated type; the older "low_stock" misuse produced garbled text
+	// because low_stock's template expects (product_name, remaining_qty)
+	// and this emitter was sending ("Reservation request for product...", "").
+	"material_reservation_request": {
+		"en": {Title: "Material Reservation Request", Message: "Reservation request for %s (qty: %s)"},
+		"uz": {Title: "Material bron qilish so'rovi", Message: "%s uchun bron qilish so'rovi (miqdori: %s)"},
+		"ru": {Title: "Запрос на резервирование материала", Message: "Запрос на резервирование %s (количество: %s)"},
+	},
 }
 
 // getUserLanguage retrieves the language preference from the user profile

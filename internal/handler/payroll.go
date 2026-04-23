@@ -1669,11 +1669,13 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 			FROM payroll_entries pe JOIN employees e ON pe.employee_id = e.id
 			WHERE pe.id = $1`, entryID).Scan(&empName, &netSalary)
 		salaryStr := fmt.Sprintf("%.0f", netSalary)
+		// employee_name added for web re-render; additive.
 		h.createTranslatedNotification(tenantID, userID, "salary_confirmed",
 			map[string]interface{}{
-				"entry_id":    entryID.String(),
-				"employee_id": employeeID.String(),
-				"net_salary":  netSalary,
+				"entry_id":      entryID.String(),
+				"employee_id":   employeeID.String(),
+				"employee_name": empName,
+				"net_salary":    netSalary,
 			},
 			salaryStr, empName,
 		)
