@@ -821,19 +821,20 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 				}
 			}
 
-			type invPay struct {
-				id        uuid.UUID
-				newPaid   float64
-				newStatus string
+			// A return reduces the invoice's total (the value of goods invoiced
+			// drops). We do NOT mark it as "paid" — that would lie about money
+			// received. Any return amount beyond the outstanding balance
+			// becomes a customer credit (handled by the contacts.current_balance
+			// deduction below, which uses the full totalAmount regardless of
+			// how much actually landed on invoices).
+			type invUpdate struct {
+				id    uuid.UUID
+				apply float64
 			}
-			var updates []invPay
+			var updates []invUpdate
 			var applied float64
 
 			if len(explicit) > 0 {
-				// Honour explicit allocations. We still clamp each allocation to
-				// the invoice's remaining balance — if the user over-allocated
-				// (e.g. invoice got paid between create and approve), we apply
-				// what we can and log the drift.
 				for _, a := range explicit {
 					var invTotal, invPaid float64
 					var invCustomer uuid.UUID
@@ -848,7 +849,6 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 							"return_id", returnID, "invoice_id", a.id, "error", err)
 						continue
 					}
-					// Defensive: allocation must belong to this customer.
 					if invCustomer != custUUID {
 						h.log.Warn("Return allocation invoice belongs to different customer — skipping",
 							"return_id", returnID, "invoice_id", a.id)
@@ -862,13 +862,7 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 					if apply > balance {
 						apply = balance
 					}
-					newPaid := invPaid + apply
-					newStatus := "partial"
-					if newPaid >= invTotal-0.005 {
-						newStatus = "paid"
-						newPaid = invTotal
-					}
-					updates = append(updates, invPay{id: a.id, newPaid: newPaid, newStatus: newStatus})
+					updates = append(updates, invUpdate{id: a.id, apply: apply})
 					applied += apply
 				}
 				h.log.Info("Applied explicit allocations for sales return",
@@ -876,9 +870,6 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 					"allocations", len(explicit), "applied", applied, "total", totalAmount)
 			} else {
 				// Fallback: FIFO over all unpaid invoices (oldest due first).
-				// sales_invoices uses `status`, not `payment_status` — that column
-				// only exists on purchase_invoices. Filter on amount_due > 0 so we
-				// pick up any invoice that still has a remaining balance.
 				remaining := totalAmount
 				invRows, invErr := h.db.Query(`
 					SELECT id, COALESCE(total_amount, 0), COALESCE(amount_paid, 0)
@@ -908,13 +899,7 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 						if apply > balance {
 							apply = balance
 						}
-						newPaid := invPaid + apply
-						newStatus := "partial"
-						if newPaid >= invTotal-0.005 {
-							newStatus = "paid"
-							newPaid = invTotal
-						}
-						updates = append(updates, invPay{id: invID, newPaid: newPaid, newStatus: newStatus})
+						updates = append(updates, invUpdate{id: invID, apply: apply})
 						remaining -= apply
 						applied += apply
 					}
@@ -926,15 +911,24 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 			}
 
 			for _, u := range updates {
-				// sales_invoices has `status`, not `payment_status`. Valid values:
-				// draft, sent, partial, paid, overdue, cancelled. Map from our
-				// partial/paid intent onto the real column.
+				// Reduce the invoice's total_amount by the applied return amount.
+				// GREATEST(..., amount_paid) keeps the balance non-negative if
+				// anything had already been paid. Status flips to 'paid' only
+				// when balance fully closes (new total == paid). amount_due is
+				// a generated column so it recomputes automatically.
 				_, execErr := h.db.Exec(
-					`UPDATE sales_invoices SET amount_paid = $1, status = $2, updated_at = $3 WHERE id = $4`,
-					u.newPaid, u.newStatus, now, u.id,
+					`UPDATE sales_invoices
+					    SET total_amount = GREATEST(total_amount - $1, amount_paid),
+					        status = CASE
+					            WHEN GREATEST(total_amount - $1, amount_paid) <= amount_paid + 0.005 THEN 'paid'
+					            ELSE status
+					        END,
+					        updated_at = $2
+					  WHERE id = $3`,
+					u.apply, now, u.id,
 				)
 				if execErr != nil {
-					h.log.Error("Failed to update invoice after return allocation",
+					h.log.Error("Failed to reduce invoice total after return",
 						"error", execErr, "invoice_id", u.id, "return_id", returnID)
 				}
 			}
