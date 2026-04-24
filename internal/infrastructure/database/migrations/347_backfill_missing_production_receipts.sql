@@ -13,13 +13,13 @@
 
 DO $$
 DECLARE
-    po RECORD;
+    rec RECORD;
     inv_id UUID;
     qty NUMERIC;
     unit_cost NUMERIC;
     wh_id UUID;
 BEGIN
-    FOR po IN
+    FOR rec IN
         SELECT po.id, po.tenant_id, po.organization_id, po.product_id,
                po.warehouse_id, po.quantity_produced, po.quantity_planned
         FROM production_orders po
@@ -33,20 +33,20 @@ BEGIN
                 AND it.transaction_type = 'receipt'
           )
     LOOP
-        qty := COALESCE(NULLIF(po.quantity_produced, 0), po.quantity_planned);
+        qty := COALESCE(NULLIF(rec.quantity_produced, 0), rec.quantity_planned);
         IF qty IS NULL OR qty <= 0 THEN
             CONTINUE;
         END IF;
 
         SELECT COALESCE(cost_price, list_price, 0) INTO unit_cost
-        FROM products WHERE id = po.product_id;
+        FROM products WHERE id = rec.product_id;
         unit_cost := COALESCE(unit_cost, 0);
 
-        wh_id := po.warehouse_id;
+        wh_id := rec.warehouse_id;
         IF wh_id IS NULL THEN
             SELECT id INTO wh_id
             FROM warehouses
-            WHERE tenant_id = po.tenant_id AND deleted_at IS NULL
+            WHERE tenant_id = rec.tenant_id AND deleted_at IS NULL
             ORDER BY created_at ASC LIMIT 1;
         END IF;
 
@@ -56,8 +56,8 @@ BEGIN
 
         SELECT id INTO inv_id
         FROM inventory
-        WHERE tenant_id = po.tenant_id
-          AND product_id = po.product_id
+        WHERE tenant_id = rec.tenant_id
+          AND product_id = rec.product_id
           AND warehouse_id = wh_id
           AND lot_number IS NULL
           AND serial_number IS NULL
@@ -70,7 +70,7 @@ BEGIN
                 quantity_on_hand, quantity_reserved, unit_cost,
                 last_movement_date, created_at, updated_at
             ) VALUES (
-                inv_id, po.tenant_id, po.organization_id, po.product_id, wh_id,
+                inv_id, rec.tenant_id, rec.organization_id, rec.product_id, wh_id,
                 qty, 0, unit_cost, NOW(), NOW(), NOW()
             );
         ELSE
@@ -86,8 +86,8 @@ BEGIN
             reference_type, reference_id, quantity, unit_cost, total_cost,
             reason, notes, transaction_date, created_at
         ) VALUES (
-            gen_random_uuid(), po.tenant_id, po.organization_id, inv_id, 'receipt',
-            'production_order', po.id, qty, unit_cost, qty * unit_cost,
+            gen_random_uuid(), rec.tenant_id, rec.organization_id, inv_id, 'receipt',
+            'production_order', rec.id, qty, unit_cost, qty * unit_cost,
             'production_complete',
             'Backfilled by migration 347 (original receipt lost to FK violation on inventory_lots.purchase_order_id)',
             NOW(), NOW()
