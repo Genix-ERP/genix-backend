@@ -623,6 +623,8 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       COALESCE(l.material_type, 'standard'),
 		       COALESCE(l.original_quantity, l.quantity),
 		       COALESCE(l.original_unit_rate, l.unit_rate),
+		       COALESCE(l.approval_status, 'pending'),
+		       COALESCE(l.done_quantity, 0),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
@@ -659,6 +661,7 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 			&line.QuantityOverride,
 			&line.MaterialType,
 			&line.OriginalQuantity, &line.OriginalUnitRate,
+			&line.ApprovalStatus, &line.DoneQuantity,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
@@ -783,9 +786,10 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		return
 	}
 
-	// Check state
+	// Check state + capture project_id for the audit row.
 	var state string
-	err = h.db.QueryRow(`SELECT state FROM construction_estimate WHERE id = $1 AND tenant_id = $2`, estimateID, tenantID).Scan(&state)
+	var projectID int64
+	err = h.db.QueryRow(`SELECT state, project_id FROM construction_estimate WHERE id = $1 AND tenant_id = $2`, estimateID, tenantID).Scan(&state, &projectID)
 	if err != nil {
 		response.NotFound(c, "Estimate not found")
 		return
@@ -938,6 +942,17 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
+
+	// Audit: parent rows are sub-stages, child rows are resources.
+	userIDLog, _ := middleware.GetUserID(c)
+	userNameLog := c.GetString("user_name")
+	action := "subwork_add"
+	if parentLineIDSQL.Valid {
+		action = "res_add"
+	}
+	h.logSmetaAudit(tenantID, projectID, &estimateID, action, req.Name, &lineID,
+		"", strconv.FormatFloat(req.Quantity, 'f', -1, 64),
+		"Yangi qator qo'shildi", userIDLog, userNameLog)
 
 	response.Success(c, map[string]interface{}{
 		"id":          lineID,
@@ -1164,15 +1179,20 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 		return
 	}
 
-	// Check estimate state
+	// Check estimate state + capture pre-update snapshot for the audit log.
 	var state string
-	var estimateID int64
+	var estimateID, projectID int64
+	var oldName, oldMaterialType string
+	var oldQty, oldUnitRate float64
 	err = h.db.QueryRow(`
-		SELECT e.state, l.estimate_id
+		SELECT e.state, l.estimate_id, e.project_id,
+		       COALESCE(l.name, ''), COALESCE(l.material_type, 'standard'),
+		       COALESCE(l.quantity, 0), COALESCE(l.unit_rate, 0)
 		FROM construction_estimate_line l
 		JOIN construction_estimate e ON e.id = l.estimate_id
 		WHERE l.id = $1 AND l.tenant_id = $2
-	`, lineID, tenantID).Scan(&state, &estimateID)
+	`, lineID, tenantID).Scan(&state, &estimateID, &projectID,
+		&oldName, &oldMaterialType, &oldQty, &oldUnitRate)
 	if err != nil {
 		response.NotFound(c, "Estimate line not found")
 		return
@@ -1391,6 +1411,39 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
 
+	// ─── Audit: Smeta boshqaruvi → Jurnal ───
+	// Read the post-update line so we can diff vs the snapshot taken above.
+	userIDLog, _ := middleware.GetUserID(c)
+	userNameLog := c.GetString("user_name")
+	var newName, newMaterialType string
+	var newQty, newUnitRate float64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(name, ''), COALESCE(material_type, 'standard'),
+		       COALESCE(quantity, 0), COALESCE(unit_rate, 0)
+		FROM construction_estimate_line WHERE id = $1
+	`, lineID).Scan(&newName, &newMaterialType, &newQty, &newUnitRate)
+
+	target := newName
+	if target == "" {
+		target = oldName
+	}
+	if newQty != oldQty {
+		h.logSmetaAudit(tenantID, projectID, &estimateID, "qty_change", target, &lineID,
+			strconv.FormatFloat(oldQty, 'f', -1, 64),
+			strconv.FormatFloat(newQty, 'f', -1, 64),
+			"", userIDLog, userNameLog)
+	}
+	if newUnitRate != oldUnitRate {
+		h.logSmetaAudit(tenantID, projectID, &estimateID, "price_change", target, &lineID,
+			strconv.FormatFloat(oldUnitRate, 'f', -1, 64),
+			strconv.FormatFloat(newUnitRate, 'f', -1, 64),
+			"", userIDLog, userNameLog)
+	}
+	if newMaterialType != oldMaterialType {
+		h.logSmetaAudit(tenantID, projectID, &estimateID, "mat_type", target, &lineID,
+			oldMaterialType, newMaterialType, "", userIDLog, userNameLog)
+	}
+
 	response.Success(c, map[string]interface{}{
 		"id":      lineID,
 		"message": "Estimate line updated successfully",
@@ -1411,15 +1464,18 @@ func (h *Handler) DeleteEstimateLine(c *gin.Context) {
 		return
 	}
 
-	// Check estimate state and get estimate_id
+	// Check estimate state and grab everything we need for the audit row.
 	var state string
-	var estimateID int64
+	var estimateID, projectID int64
+	var lineName string
+	var parentLineID sql.NullInt64
 	err = h.db.QueryRow(`
-		SELECT e.state, l.estimate_id
+		SELECT e.state, l.estimate_id, e.project_id,
+		       COALESCE(l.name, ''), l.parent_line_id
 		FROM construction_estimate_line l
 		JOIN construction_estimate e ON e.id = l.estimate_id
 		WHERE l.id = $1 AND l.tenant_id = $2
-	`, lineID, tenantID).Scan(&state, &estimateID)
+	`, lineID, tenantID).Scan(&state, &estimateID, &projectID, &lineName, &parentLineID)
 	if err != nil {
 		response.NotFound(c, "Estimate line not found")
 		return
@@ -1438,6 +1494,16 @@ func (h *Handler) DeleteEstimateLine(c *gin.Context) {
 
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
+
+	// Audit: parent rows are sub-stages (subwork_del), children are resources (res_del).
+	userIDLog, _ := middleware.GetUserID(c)
+	userNameLog := c.GetString("user_name")
+	action := "subwork_del"
+	if parentLineID.Valid {
+		action = "res_del"
+	}
+	h.logSmetaAudit(tenantID, projectID, &estimateID, action, lineName, &lineID,
+		"", "", "Qator o'chirildi", userIDLog, userNameLog)
 
 	response.Success(c, map[string]interface{}{
 		"message": "Estimate line deleted successfully",
@@ -1463,16 +1529,18 @@ func (h *Handler) ResetEstimateLineQuantity(c *gin.Context) {
 
 	// Confirm the estimate is editable + grab the estimate_id for recalc.
 	var state string
-	var estimateID int64
+	var estimateID, projectID int64
 	var origQty sql.NullFloat64
-	var unitRate float64
+	var unitRate, oldQty float64
+	var lineName string
 	err = h.db.QueryRow(`
-		SELECT e.state, l.estimate_id,
-		       COALESCE(l.original_quantity, l.quantity), l.unit_rate
+		SELECT e.state, l.estimate_id, e.project_id,
+		       COALESCE(l.original_quantity, l.quantity), l.unit_rate,
+		       COALESCE(l.quantity, 0), COALESCE(l.name, '')
 		FROM construction_estimate_line l
 		JOIN construction_estimate e ON e.id = l.estimate_id
 		WHERE l.id = $1 AND l.tenant_id = $2
-	`, lineID, tenantID).Scan(&state, &estimateID, &origQty, &unitRate)
+	`, lineID, tenantID).Scan(&state, &estimateID, &projectID, &origQty, &unitRate, &oldQty, &lineName)
 	if err != nil {
 		response.NotFound(c, "Estimate line not found")
 		return
@@ -1522,10 +1590,102 @@ func (h *Handler) ResetEstimateLineQuantity(c *gin.Context) {
 
 	h.recalculateEstimateTotals(estimateID)
 
+	userIDLog, _ := middleware.GetUserID(c)
+	userNameLog := c.GetString("user_name")
+	h.logSmetaAudit(tenantID, projectID, &estimateID, "reset_qty", lineName, &lineID,
+		strconv.FormatFloat(oldQty, 'f', -1, 64),
+		strconv.FormatFloat(origQty.Float64, 'f', -1, 64),
+		"Hajm asliga qaytarildi", userIDLog, userNameLog)
+
 	response.Success(c, gin.H{
 		"id":       lineID,
 		"quantity": origQty.Float64,
 	})
+}
+
+// ResetAllEstimateQuantities zeroes the quantity on every TOP-LEVEL work
+// row in an estimate (parent_line_id IS NULL) and cascades to non-override
+// sub-lines via parent.quantity × norm_rate (which collapses to 0). Used
+// by the Smeta boshqaruvi "Reset all quantities" button when foremen want
+// to start a Forma 2 from a clean slate.
+//
+// IMPORTANT: original_quantity anchors are kept untouched so the per-line
+// reset-to-original button can still bring back the imported figure. We
+// only mutate `quantity` and `total_amount`.
+func (h *Handler) ResetAllEstimateQuantities(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	estimateID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid estimate ID")
+		return
+	}
+
+	// Block on non-draft estimates — same guard as per-line edits.
+	var state string
+	var projectID int64
+	err = h.db.QueryRow(
+		`SELECT state, project_id FROM construction_estimate WHERE id = $1 AND tenant_id = $2`,
+		estimateID, tenantID,
+	).Scan(&state, &projectID)
+	if err != nil {
+		response.NotFound(c, "Estimate not found")
+		return
+	}
+	if state != "draft" {
+		response.BadRequest(c, "Only draft estimates can be modified")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Zero every top-level row's qty + recompute total.
+	res, err := tx.Exec(`
+		UPDATE construction_estimate_line
+		SET quantity = 0, total_amount = 0, updated_date = NOW()
+		WHERE estimate_id = $1 AND tenant_id = $2
+		  AND parent_line_id IS NULL
+	`, estimateID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to zero estimate qty", "error", err)
+		response.InternalError(c, "Failed to reset quantities")
+		return
+	}
+	worksZeroed, _ := res.RowsAffected()
+
+	// Cascade to non-override sub-lines (parent.qty=0 × norm_rate = 0).
+	_, _ = tx.Exec(`
+		UPDATE construction_estimate_line c
+		SET quantity = 0, total_amount = 0, updated_date = NOW()
+		FROM construction_estimate_line p
+		WHERE p.id = c.parent_line_id
+		  AND c.estimate_id = $1 AND c.tenant_id = $2
+		  AND COALESCE(c.quantity_override, FALSE) = FALSE
+	`, estimateID, tenantID)
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit reset-all-qty", "error", err)
+		response.InternalError(c, "Failed to reset quantities")
+		return
+	}
+
+	h.recalculateEstimateTotals(estimateID)
+
+	userIDLog, _ := middleware.GetUserID(c)
+	userNameLog := c.GetString("user_name")
+	h.logSmetaAudit(tenantID, projectID, &estimateID, "reset_qty_all", "", nil,
+		"", strconv.FormatInt(worksZeroed, 10),
+		"Barcha hajmlar nolga tushirildi", userIDLog, userNameLog)
+
+	response.Success(c, gin.H{"works_zeroed": worksZeroed})
 }
 
 // =====================================================
@@ -1552,6 +1712,8 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       COALESCE(l.material_type, 'standard'),
 		       COALESCE(l.original_quantity, l.quantity),
 		       COALESCE(l.original_unit_rate, l.unit_rate),
+		       COALESCE(l.approval_status, 'pending'),
+		       COALESCE(l.done_quantity, 0),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
@@ -1587,6 +1749,7 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 			&line.QuantityOverride,
 			&line.MaterialType,
 			&line.OriginalQuantity, &line.OriginalUnitRate,
+			&line.ApprovalStatus, &line.DoneQuantity,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {

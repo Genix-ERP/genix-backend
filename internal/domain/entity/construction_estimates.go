@@ -177,6 +177,10 @@ type ConstructionEstimateLine struct {
 	OriginalQuantity float64 `json:"original_quantity" db:"original_quantity"`
 	OriginalUnitRate float64 `json:"original_unit_rate" db:"original_unit_rate"`
 
+	// v2 Bosqichlar workflow (migration 353).
+	ApprovalStatus string  `json:"approval_status" db:"approval_status"`
+	DoneQuantity   float64 `json:"done_quantity" db:"done_quantity"`
+
 	SortOrder   int       `json:"sort_order" db:"sort_order"`
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
@@ -212,6 +216,8 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		MaterialType     string      `json:"material_type"`
 		OriginalQuantity float64     `json:"original_quantity"`
 		OriginalUnitRate float64     `json:"original_unit_rate"`
+		ApprovalStatus   string      `json:"approval_status"`
+		DoneQuantity     float64     `json:"done_quantity"`
 		SortOrder        int         `json:"sort_order"`
 		CreatedDate   time.Time   `json:"created_date"`
 		UpdatedDate   time.Time   `json:"updated_date"`
@@ -242,6 +248,8 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		MaterialType:     l.MaterialType,
 		OriginalQuantity: l.OriginalQuantity,
 		OriginalUnitRate: l.OriginalUnitRate,
+		ApprovalStatus:   l.ApprovalStatus,
+		DoneQuantity:     l.DoneQuantity,
 		SortOrder:        l.SortOrder,
 		CreatedDate:   l.CreatedDate,
 		UpdatedDate:   l.UpdatedDate,

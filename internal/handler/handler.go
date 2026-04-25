@@ -2016,6 +2016,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/reja-fakt", h.GetRejaFakt)
 		constructionProjects.GET("/:id/reja-fakt/audit", h.ListRejaFaktAudit)
 
+		// Smeta audit log (project-wide, every estimate).
+		constructionProjects.GET("/:id/smeta-audit", h.ListProjectSmetaAudit)
+
+		// v2 Stages workflow: who am I on this project?
+		constructionProjects.GET("/:id/my-role", h.GetMyProjectRole)
+
 		// Commission (complete project)
 		constructionProjects.PUT("/:id/commission", h.perm.Require("construction", "project", "update"), h.CommissionProject)
 	}
@@ -2093,6 +2099,48 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Reset a single line's quantity back to its original_quantity anchor (migration 349).
 		estimates.POST("/:id/lines/:line_id/reset-quantity",
 			h.perm.Require("construction", "estimate", "update"), h.ResetEstimateLineQuantity)
+		// Bulk-zero every top-level work qty in this estimate. Non-override
+		// sub-line qtys cascade to 0 via parent.qty × norm_rate.
+		estimates.POST("/:id/reset-quantities",
+			h.perm.Require("construction", "estimate", "update"), h.ResetAllEstimateQuantities)
+
+		// Forma 2 snapshots — Smeta boshqaruvi → Tarix tab.
+		estimates.GET("/:id/form2-snapshots", h.ListForm2Snapshots)
+		estimates.POST("/:id/form2-snapshots",
+			h.perm.Require("construction", "estimate", "update"), h.CreateForm2Snapshot)
+
+		// Smeta boshqaruvi → Jurnal tab (audit log scoped to one estimate).
+		estimates.GET("/:id/audit", h.ListSmetaAudit)
+	}
+
+	// Forma 2 snapshot direct access (get/delete by snapshot id).
+	form2Snapshots := rg.Group("/construction/form2-snapshots")
+	form2Snapshots.Use(h.perm.Require("construction", "estimate", "read"))
+	{
+		form2Snapshots.GET("/:snapshot_id", h.GetForm2Snapshot)
+		form2Snapshots.DELETE("/:snapshot_id",
+			h.perm.Require("construction", "estimate", "update"), h.DeleteForm2Snapshot)
+	}
+
+	// v2 Stages workflow — work approval transitions.
+	// Permissions are enforced inside the handlers based on the caller's
+	// project role (foreman / supervisor / engineer); the route-level
+	// "estimate update" gate keeps random users out.
+	works := rg.Group("/construction/works")
+	works.Use(h.perm.Require("construction", "estimate", "update"))
+	{
+		// Foreman.
+		works.POST("/:id/done-quantity",      h.UpdateWorkDoneQuantity)
+		works.POST("/:id/submit",             h.SubmitWork)
+		works.POST("/bulk-submit",            h.BulkSubmitWorks)
+		// Supervisor.
+		works.POST("/:id/confirm-supervisor", h.ConfirmWorkSupervisor)
+		works.POST("/:id/reject-supervisor",  h.RejectWorkSupervisor)
+		works.POST("/bulk-confirm-supervisor", h.BulkConfirmSupervisor)
+		// Engineer (final).
+		works.POST("/:id/confirm-engineer",   h.ConfirmWorkEngineer)
+		works.POST("/:id/reject-engineer",    h.RejectWorkEngineer)
+		works.POST("/bulk-confirm-engineer",  h.BulkConfirmEngineer)
 	}
 
 	// Estimate Summary (direct access)
