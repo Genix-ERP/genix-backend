@@ -687,6 +687,13 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 	//     "completed/total" ratio instead of the old time-elapsed estimate).
 	//   - Sub-stage actual_start / actual_end (migration 335) fall back to
 	//     the parent stage's dates so legacy rows still report something.
+	//
+	// Union arm 3 — works (construction_estimate_line) whose v2 approval
+	// workflow is mid-flight. The user wants the Jarayon tab to surface
+	// everything that isn't pending (draft) or confirmed_engineer
+	// (final/completed); so we list works in `in_progress`, `submitted`,
+	// or `confirmed_supervisor`. These are the works currently moving
+	// through the foreman → supervisor → engineer pipeline.
 	const q = `
 		SELECT 'stage'::text AS source,
 		       s.id,
@@ -726,6 +733,43 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		JOIN construction_stages s ON s.id = ss.stage_id
 		LEFT JOIN construction_buildings b ON b.id = s.building_id
 		WHERE s.project_id = $1 AND s.tenant_id = $2 AND ss.status = 'in_progress'
+
+		UNION ALL
+
+		-- v2 approval-workflow works that are mid-pipeline.
+		--   in_progress           — foreman has entered qty but not submitted
+		--   submitted             — waiting on supervisor
+		--   confirmed_supervisor  — waiting on chief engineer's final OK
+		-- pending and confirmed_engineer are intentionally excluded —
+		-- pending == not started yet (draft), confirmed_engineer == done.
+		SELECT 'work'::text AS source,
+		       el.id,
+		       NULL::bigint AS parent_id,
+		       NULLIF(el.parent_item_number, '') AS parent_name,
+		       el.name,
+		       el.approval_status AS status,
+		       NULL::date AS planned_start,
+		       NULL::date AS planned_end,
+		       NULL::date AS actual_start,
+		       NULL::date AS actual_end,
+		       b.name AS building_name,
+		       -- Use plan/done quantity as the progress source. Mapping
+		       -- onto the existing sub_total/sub_done columns lets the
+		       -- downstream code path stay uniform with stages.
+		       (CASE WHEN el.quantity > 0 THEN 100 ELSE 0 END)::bigint AS sub_total,
+		       (CASE
+		          WHEN el.quantity > 0
+		            THEN LEAST(100, ROUND(COALESCE(el.done_quantity, 0) / el.quantity * 100))
+		          ELSE 0
+		        END)::bigint AS sub_done
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id
+		LEFT JOIN construction_buildings b ON b.id = e.building_id
+		WHERE e.project_id = $1
+		  AND el.tenant_id = $2
+		  AND el.parent_line_id IS NULL                       -- top-level works only
+		  AND COALESCE(el.resource_type, '') = ''             -- skip resource lines
+		  AND el.approval_status IN ('in_progress', 'submitted', 'confirmed_supervisor')
 
 		ORDER BY source, name
 	`
@@ -808,6 +852,12 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		//   * stage rows with no sub-stages → 0% when in progress, 100% when
 		//     completed. (This feed only returns in_progress, so effectively 0.)
 		//   * sub-stage rows → 0/50/100 based on their own status.
+		//   * work rows (v2 approval workflow) → done_quantity / quantity *
+		//     100, with a small bump for the "submitted" /
+		//     "confirmed_supervisor" stages so works that already passed
+		//     a review step never read as 0% even when the foreman didn't
+		//     bother filling in a quantity. The SQL feeds sub_total = 100
+		//     and sub_done = ratio*100 already, so this is just division.
 		switch it.Source {
 		case "stage":
 			if subTotal > 0 {
@@ -825,6 +875,27 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 				it.ProgressPct = 50
 			default:
 				it.ProgressPct = 0
+			}
+		case "work":
+			if subTotal > 0 {
+				it.ProgressPct = float64(subDone) / float64(subTotal) * 100
+			}
+			// Floor a few representative values so submitted / supervisor-
+			// confirmed works never read as 0% even when the foreman left
+			// the done quantity blank.
+			switch it.Status {
+			case "confirmed_supervisor":
+				if it.ProgressPct < 90 {
+					it.ProgressPct = 90
+				}
+			case "submitted":
+				if it.ProgressPct < 75 {
+					it.ProgressPct = 75
+				}
+			case "in_progress":
+				if it.ProgressPct < 25 {
+					it.ProgressPct = 25
+				}
 			}
 		}
 

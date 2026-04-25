@@ -289,6 +289,12 @@ func (h *Handler) BulkUpdateResourcePrice(c *gin.Context) {
 		estRows.Close()
 	}
 
+	userNameLog := c.GetString("user_name")
+	h.logSmetaAudit(tenantID, projectID, nil, "price_change", in.ResourceName, nil,
+		strconv.FormatFloat(oldPrice.Float64, 'f', -1, 64),
+		strconv.FormatFloat(in.NewPrice, 'f', -1, 64),
+		"Resurs narxi yangilandi", userID, userNameLog)
+
 	response.Success(c, gin.H{
 		"resource_name":   in.ResourceName,
 		"uom":             in.UOM,
@@ -307,6 +313,7 @@ func (h *Handler) BulkUpdateResourceMaterialType(c *gin.Context) {
 		response.Unauthorized(c, "Tenant not found")
 		return
 	}
+	userID, _ := middleware.GetUserID(c)
 	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid project ID")
@@ -330,6 +337,17 @@ func (h *Handler) BulkUpdateResourceMaterialType(c *gin.Context) {
 		return
 	}
 
+	// Capture an old material_type for the audit row before we mutate.
+	var oldMt string
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(MIN(material_type), 'standard')
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id
+		WHERE e.project_id = $1 AND e.tenant_id = $2
+		  AND LOWER(el.name) = LOWER($3)
+		  AND COALESCE(el.uom, '') = COALESCE($4, '')
+	`, projectID, tenantID, in.ResourceName, in.UOM).Scan(&oldMt)
+
 	res, err := h.db.Exec(`
 		UPDATE construction_estimate_line
 		SET material_type = $1, updated_date = NOW()
@@ -348,6 +366,11 @@ func (h *Handler) BulkUpdateResourceMaterialType(c *gin.Context) {
 		return
 	}
 	n, _ := res.RowsAffected()
+
+	userNameLog := c.GetString("user_name")
+	h.logSmetaAudit(tenantID, projectID, nil, "mat_type", in.ResourceName, nil,
+		oldMt, mt, "Material turi o'zgartirildi", userID, userNameLog)
+
 	response.Success(c, gin.H{"lines_updated": n, "material_type": mt})
 }
 
@@ -456,6 +479,12 @@ func (h *Handler) ResetResourcePrice(c *gin.Context) {
 		}
 		estRows.Close()
 	}
+
+	userNameLog := c.GetString("user_name")
+	h.logSmetaAudit(tenantID, projectID, nil, "reset_price", in.ResourceName, nil,
+		strconv.FormatFloat(oldPrice.Float64, 'f', -1, 64),
+		strconv.FormatFloat(newPrice.Float64, 'f', -1, 64),
+		"Narx asliga qaytarildi", userID, userNameLog)
 
 	response.Success(c, gin.H{
 		"resource_name": in.ResourceName,
@@ -582,6 +611,11 @@ func (h *Handler) ResetAllResourcePrices(c *gin.Context) {
 		}
 		estRows.Close()
 	}
+
+	userNameLog := c.GetString("user_name")
+	h.logSmetaAudit(tenantID, projectID, nil, "reset_price_all", "", nil,
+		"", strconv.FormatInt(updated, 10),
+		"Barcha narxlar asliga qaytarildi", userID, userNameLog)
 
 	response.Success(c, gin.H{
 		"lines_updated":      updated,
