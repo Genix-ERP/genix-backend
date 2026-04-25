@@ -1609,6 +1609,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payrollPeriods.PUT("/:id", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollPeriod)
 		payrollPeriods.DELETE("/:id", h.perm.Require("hr", "payroll", "delete"), h.DeletePayrollPeriod)
 		payrollPeriods.POST("/:id/process", h.perm.Require("hr", "payroll", "approve"), h.ProcessPayroll)
+		// TZ §7.1 / §9.3 "calculate-all" — bulk-create payroll entries
+		// for every active employee in the period. Idempotent: skips
+		// employees who already have an entry.
+		payrollPeriods.POST("/:id/calculate-all", h.perm.Require("hr", "payroll", "create"), h.CalculateAllPayroll)
 		payrollPeriods.GET("/:id/entries", h.ListPayrollEntries)
 		payrollPeriods.POST("/:id/entries", h.perm.Require("hr", "payroll", "create"), h.CreatePayrollEntry)
 		payrollPeriods.PUT("/:id/entries/:eid", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollEntry)
@@ -1710,6 +1714,47 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		profitTax.GET("/revenue", h.GetProfitTaxRevenue)
 		profitTax.GET("/snapshots", h.ListProfitTaxSnapshots)
 		profitTax.POST("/snapshot", h.perm.Require("finance", "expense", "approve"), h.SnapshotProfitTax)
+	}
+
+	// Turnover tax calculator (TZ §5.2). Driven by company_tax_rates
+	// applies_to='turnover'. Same revenue source as profit-tax to keep
+	// the two calculators reconciled.
+	turnoverTax := rg.Group("/turnover-tax")
+	turnoverTax.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		turnoverTax.GET("", h.GetTurnoverTax)
+	}
+
+	// NDS/VAT per-period calculator (TZ §5.1). Sums stamped tax_amount on
+	// sales and purchase invoices and returns realizatsiya / zachet /
+	// balansi. Rate display pulls from company_tax_rates applies_to='sales'.
+	ndsTax := rg.Group("/nds-tax")
+	ndsTax.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		ndsTax.GET("", h.GetNdsTax)
+	}
+
+	// Dividend withholding helper (TZ §5.3). GET/POST compute-only preview;
+	// POST /dividend-distributions actually posts the journal entry.
+	dividendTax := rg.Group("/dividend-tax")
+	dividendTax.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		dividendTax.GET("", h.ComputeDividendTax)
+		dividendTax.POST("/compute", h.ComputeDividendTax)
+	}
+	dividendDist := rg.Group("/dividend-distributions")
+	{
+		dividendDist.POST("", h.perm.Require("finance", "expense", "approve"), h.CreateDividendDistribution)
+	}
+
+	// Combined tax summary — director-level dashboard (TZ §10 "Umumiy soliq
+	// jamlanmasi"). Aggregates payroll + NDS + Foyda + Aylanma + Dividend
+	// rate into one response so the UI renders the whole picture in one
+	// round-trip.
+	taxSummary := rg.Group("/tax-summary")
+	taxSummary.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		taxSummary.GET("/combined", h.GetTaxSummaryCombined)
 	}
 
 	// Asset Categories
@@ -1883,6 +1928,21 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Estimate Resources (grouped by type for substage dropdowns)
 		constructionProjects.GET("/:id/estimate-resources", h.ListProjectEstimateResources)
 
+		// Resource prices — Smeta boshqaruvi → Resurslar tab. Bulk-edits
+		// resource unit prices across every matching estimate line in the
+		// project, with audit history.
+		constructionProjects.GET("/:id/resource-prices", h.ListResourcePrices)
+		constructionProjects.POST("/:id/resource-prices/bulk-update",
+			h.perm.Require("construction", "estimate", "update"), h.BulkUpdateResourcePrice)
+		constructionProjects.POST("/:id/resource-prices/material-type",
+			h.perm.Require("construction", "estimate", "update"), h.BulkUpdateResourceMaterialType)
+		// Reset-to-original (migration 349 anchors). Per-resource and project-wide.
+		constructionProjects.POST("/:id/resource-prices/reset",
+			h.perm.Require("construction", "estimate", "update"), h.ResetResourcePrice)
+		constructionProjects.POST("/:id/resource-prices/reset-all",
+			h.perm.Require("construction", "estimate", "update"), h.ResetAllResourcePrices)
+		constructionProjects.GET("/:id/resource-prices/history", h.GetResourcePriceHistory)
+
 		// Estimates
 		constructionProjects.GET("/:id/estimates", h.ListEstimates)
 		constructionProjects.POST("/:id/estimates", h.perm.Require("construction", "estimate", "create"), h.CreateEstimate)
@@ -2030,6 +2090,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		estimates.POST("/:id/create-products", h.perm.Require("construction", "estimate", "update"), h.CreateProductsFromEstimate)
 		estimates.PUT("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.UpdateEstimateLine)
 		estimates.DELETE("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.DeleteEstimateLine)
+		// Reset a single line's quantity back to its original_quantity anchor (migration 349).
+		estimates.POST("/:id/lines/:line_id/reset-quantity",
+			h.perm.Require("construction", "estimate", "update"), h.ResetEstimateLineQuantity)
 	}
 
 	// Estimate Summary (direct access)
