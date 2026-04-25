@@ -620,6 +620,9 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
 		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
 		       COALESCE(l.quantity_override, FALSE),
+		       COALESCE(l.material_type, 'standard'),
+		       COALESCE(l.original_quantity, l.quantity),
+		       COALESCE(l.original_unit_rate, l.unit_rate),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
@@ -654,6 +657,8 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 			&line.ResourceType, &line.ParentItemNumber,
 			&line.ParentLineID, &line.NormRate, &line.SublineSeq,
 			&line.QuantityOverride,
+			&line.MaterialType,
+			&line.OriginalQuantity, &line.OriginalUnitRate,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
@@ -1067,21 +1072,17 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		productsCreated = h.autoCreateProductsFromEstimateLines(tenantID, orgID, userID, req.Lines)
 	}
 
-	// Auto-create Forma 2 (KS-2) draft for VOR and Edinich estimates.
-	// `source_file_name` comes from the upload modal — multiple estimate
-	// types imported from the same Excel file share a Forma 2.
-	h.log.Info("BulkCreateEstimateLines: about to auto-create Forma 2",
-		"estimate_id", estimateID, "source_type", sourceType,
-		"line_count", count, "source_file_name", req.SourceFileName)
-	forma2ID := h.autoCreateForma2FromEstimate(tenantID, userID, estimateID, req.SourceFileName)
-	h.log.Info("BulkCreateEstimateLines: auto-create Forma 2 result", "forma2_id", forma2ID)
+	// Auto-create Forma 2 was previously triggered here on every import.
+	// Disabled per product feedback — the user creates Forma 2 manually
+	// from the Smeta boshqaruvi tab when they're ready, so importing an
+	// estimate no longer side-effects a Forma 2 draft. The helper
+	// `autoCreateForma2FromEstimate` is kept in the codebase (still
+	// referenced from CreateProductsFromEstimate) in case the behaviour
+	// needs to come back, just not invoked here.
 
 	resp := map[string]interface{}{
 		"count":            count,
 		"products_created": productsCreated,
-	}
-	if forma2ID > 0 {
-		resp["forma2_created"] = forma2ID
 	}
 	response.Success(c, resp)
 }
@@ -1335,6 +1336,20 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("quantity_override = $%d", argCount))
 		args = append(args, *req.QuantityOverride)
 	}
+	if req.MaterialType != nil {
+		// Validate against the schema CHECK constraint so we get a 400 instead
+		// of an opaque pq error.
+		mt := strings.ToLower(strings.TrimSpace(*req.MaterialType))
+		switch mt {
+		case "standard", "equipment", "cable", "metal", "import":
+			argCount++
+			updates = append(updates, fmt.Sprintf("material_type = $%d", argCount))
+			args = append(args, mt)
+		default:
+			response.BadRequest(c, "material_type must be one of: standard, equipment, cable, metal, import")
+			return
+		}
+	}
 
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")
@@ -1429,6 +1444,90 @@ func (h *Handler) DeleteEstimateLine(c *gin.Context) {
 	})
 }
 
+// ResetEstimateLineQuantity reverts the line's quantity back to
+// original_quantity (anchor set by migration 349). For parent rows the action
+// also re-derives any sub-line quantities that aren't in manual override mode
+// — keeping their parent.quantity × norm_rate invariant intact.
+func (h *Handler) ResetEstimateLineQuantity(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	lineID, err := strconv.ParseInt(c.Param("line_id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid line ID")
+		return
+	}
+
+	// Confirm the estimate is editable + grab the estimate_id for recalc.
+	var state string
+	var estimateID int64
+	var origQty sql.NullFloat64
+	var unitRate float64
+	err = h.db.QueryRow(`
+		SELECT e.state, l.estimate_id,
+		       COALESCE(l.original_quantity, l.quantity), l.unit_rate
+		FROM construction_estimate_line l
+		JOIN construction_estimate e ON e.id = l.estimate_id
+		WHERE l.id = $1 AND l.tenant_id = $2
+	`, lineID, tenantID).Scan(&state, &estimateID, &origQty, &unitRate)
+	if err != nil {
+		response.NotFound(c, "Estimate line not found")
+		return
+	}
+	if state != "draft" {
+		response.BadRequest(c, "Only draft estimates can be modified")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Reset the line itself. total_amount is rebuilt from the now-restored qty.
+	_, err = tx.Exec(`
+		UPDATE construction_estimate_line
+		SET quantity     = COALESCE(original_quantity, quantity),
+		    total_amount = COALESCE(original_quantity, quantity) * COALESCE(unit_rate, 0),
+		    updated_date = NOW()
+		WHERE id = $1
+	`, lineID)
+	if err != nil {
+		h.log.Error("Failed to reset line quantity", "error", err)
+		response.InternalError(c, "Failed to reset quantity")
+		return
+	}
+
+	// Cascade to children that aren't in manual override mode — they recompute
+	// from parent.quantity × norm_rate. Override children keep their qty.
+	_, _ = tx.Exec(`
+		UPDATE construction_estimate_line c
+		SET quantity     = $1 * COALESCE(c.norm_rate, 0),
+		    total_amount = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
+		    updated_date = NOW()
+		WHERE c.parent_line_id = $2
+		  AND COALESCE(c.quantity_override, FALSE) = FALSE
+	`, origQty.Float64, lineID)
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit reset qty", "error", err)
+		response.InternalError(c, "Failed to reset quantity")
+		return
+	}
+
+	h.recalculateEstimateTotals(estimateID)
+
+	response.Success(c, gin.H{
+		"id":       lineID,
+		"quantity": origQty.Float64,
+	})
+}
+
 // =====================================================
 // HELPER FUNCTIONS
 // =====================================================
@@ -1450,6 +1549,9 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       COALESCE(l.resource_type, ''), COALESCE(l.parent_item_number, ''),
 		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
 		       COALESCE(l.quantity_override, FALSE),
+		       COALESCE(l.material_type, 'standard'),
+		       COALESCE(l.original_quantity, l.quantity),
+		       COALESCE(l.original_unit_rate, l.unit_rate),
 		       l.sort_order, l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
@@ -1483,6 +1585,8 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 			&line.ResourceType, &line.ParentItemNumber,
 			&line.ParentLineID, &line.NormRate, &line.SublineSeq,
 			&line.QuantityOverride,
+			&line.MaterialType,
+			&line.OriginalQuantity, &line.OriginalUnitRate,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {

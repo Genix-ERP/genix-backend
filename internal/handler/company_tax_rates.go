@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -186,6 +187,18 @@ func (h *Handler) CreateCompanyTaxRate(c *gin.Context) {
 	}
 	description := strings.TrimSpace(input.Description)
 
+	// TZ §5.2: NDS and Turnover tax are mutually exclusive (general vs
+	// simplified regime). Block activating one while the other is active.
+	if conflict, ok := h.ensureVatTurnoverExclusive(tenantID, appliesTo, isActive, nil); !ok {
+		response.ErrorWithDetails(c, http.StatusBadRequest, "TAX_REGIME_CONFLICT",
+			"NDS (sales) and Turnover tax cannot both be active at the same time",
+			map[string]string{
+				"applies_to": appliesTo,
+				"conflict":   conflict,
+			})
+		return
+	}
+
 	id := uuid.New()
 	now := time.Now()
 	_, err := h.db.Exec(`
@@ -212,6 +225,12 @@ func (h *Handler) CreateCompanyTaxRate(c *gin.Context) {
 		return
 	}
 
+	// Project the sales-NDS rate into the legacy tax_rates table so per-line
+	// invoice VAT picks it up (TZ §11.9). No-op for non-sales rows.
+	if appliesTo == "sales" {
+		h.syncSalesNdsToLegacyTaxRates(tenantID, input.Code, input.Name, input.Rate, isActive)
+	}
+
 	response.Success(c, gin.H{"id": id})
 }
 
@@ -231,6 +250,37 @@ func (h *Handler) UpdateCompanyTaxRate(c *gin.Context) {
 	var input entity.UpdateCompanyTaxRateInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	// TZ §5.2: NDS / Turnover exclusivity. Fetch the current row so we know
+	// the EFFECTIVE applies_to + is_active after the caller's patch is
+	// applied, then block the save if it would produce "both VAT and
+	// turnover active" in the tenant.
+	var currentApplies string
+	var currentActive bool
+	if err := h.db.QueryRow(`
+		SELECT applies_to, is_active FROM company_tax_rates
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&currentApplies, &currentActive); err != nil {
+		response.NotFound(c, "Company tax rate")
+		return
+	}
+	effectiveApplies := currentApplies
+	if input.AppliesTo != nil {
+		effectiveApplies = normalizeCompanyTaxAppliesTo(*input.AppliesTo)
+	}
+	effectiveActive := currentActive
+	if input.IsActive != nil {
+		effectiveActive = *input.IsActive
+	}
+	if conflict, ok := h.ensureVatTurnoverExclusive(tenantID, effectiveApplies, effectiveActive, &id); !ok {
+		response.ErrorWithDetails(c, http.StatusBadRequest, "TAX_REGIME_CONFLICT",
+			"NDS (sales) and Turnover tax cannot both be active at the same time",
+			map[string]string{
+				"applies_to": effectiveApplies,
+				"conflict":   conflict,
+			})
 		return
 	}
 
@@ -323,6 +373,27 @@ func (h *Handler) UpdateCompanyTaxRate(c *gin.Context) {
 		response.NotFound(c, "Company tax rate")
 		return
 	}
+
+	// If the row is (or became) sales-NDS, re-project its current state
+	// into the legacy tax_rates table so invoice VAT is in sync (TZ §11.9).
+	// We refetch instead of inferring so partial updates that didn't touch
+	// rate/name still produce the correct projection.
+	if effectiveApplies == "sales" {
+		var (
+			refCode string
+			refName string
+			refRate float64
+			refActive bool
+		)
+		if err := h.db.QueryRow(`
+			SELECT code, name, rate, COALESCE(is_active, TRUE)
+			FROM company_tax_rates
+			WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		`, id, tenantID).Scan(&refCode, &refName, &refRate, &refActive); err == nil {
+			h.syncSalesNdsToLegacyTaxRates(tenantID, refCode, refName, refRate, refActive)
+		}
+	}
+
 	response.Success(c, gin.H{"id": id})
 }
 
@@ -352,4 +423,132 @@ func (h *Handler) DeleteCompanyTaxRate(c *gin.Context) {
 		return
 	}
 	response.Success(c, gin.H{"id": id, "deleted": true})
+}
+
+// ─── Shared helpers for the consumer side ───────────────────────────────────
+// These are what makes the Kompaniya soliqlari catalog actually drive
+// calculations elsewhere (profit tax, turnover tax, etc. — see TZ §5, §6,
+// §11.9). Nothing outside this file wrote to company_tax_rates before; now
+// profit_tax.go and others call `getCompanyTaxRatePct` to pick up the
+// tenant's configured rate instead of hardcoded constants.
+
+// getCompanyTaxRatePct returns the active rate (percent, e.g. 15.0) for the
+// given `applies_to` bucket. Falls back to the supplied default when no
+// active rate is configured or when the lookup errors. Always returns a
+// sensible value so callers can inline it without extra nil-handling.
+func (h *Handler) getCompanyTaxRatePct(tenantID uuid.UUID, appliesTo string, fallback float64) float64 {
+	var rate float64
+	err := h.db.QueryRow(`
+		SELECT rate FROM company_tax_rates
+		WHERE tenant_id = $1
+		  AND applies_to = $2
+		  AND is_active = TRUE
+		  AND deleted_at IS NULL
+		ORDER BY sort_order ASC, created_at ASC
+		LIMIT 1
+	`, tenantID, appliesTo).Scan(&rate)
+	if err != nil || rate <= 0 {
+		return fallback
+	}
+	return rate
+}
+
+// hasActiveCompanyTaxRate reports whether the tenant has ANY active rate
+// in the given `applies_to` bucket (excluding the optional row id so the
+// caller can ignore the row currently being updated).
+func (h *Handler) hasActiveCompanyTaxRate(tenantID uuid.UUID, appliesTo string, excludeID *uuid.UUID) bool {
+	q := `
+		SELECT COUNT(*) FROM company_tax_rates
+		WHERE tenant_id = $1
+		  AND applies_to = $2
+		  AND is_active = TRUE
+		  AND deleted_at IS NULL`
+	args := []interface{}{tenantID, appliesTo}
+	if excludeID != nil {
+		q += " AND id <> $3"
+		args = append(args, *excludeID)
+	}
+	var n int
+	if err := h.db.QueryRow(q, args...).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// syncSalesNdsToLegacyTaxRates propagates the sales-NDS rate from
+// `company_tax_rates` (the activity-level catalog the admin edits) into
+// the legacy `tax_rates` table that the per-line invoice calculator
+// already consumes (sales_order_lines.tax_id, sales_invoice_lines.tax_id,
+// purchase_invoices.tax_rate_id, etc.). This is the lightweight bridge
+// that closes TZ §11.9 "rate change → all calculations update" for
+// invoice VAT without rewiring 10 FK columns.
+//
+// Direction: company_tax_rates → tax_rates only. The legacy table is
+// FK'd from a dozen other places, so we treat it as the downstream
+// projection of the catalog. We touch only the fields that map cleanly
+// (rate, name, is_active); user-set behavioural flags on the legacy row
+// (price_include, is_compound, is_recoverable, tax_account_id) are
+// preserved because they don't have a counterpart in `company_tax_rates`.
+//
+// Match key: (tenant_id, LOWER(code)). On miss we insert a new
+// `tax_rates` row with `tax_type='sales'` so it shows up in sales-line
+// tax pickers immediately.
+//
+// The sync is best-effort: failures are logged but don't fail the
+// caller's CRUD operation. The catalog row is the source of truth and
+// stays consistent on its own; the legacy projection is convenience.
+func (h *Handler) syncSalesNdsToLegacyTaxRates(tenantID uuid.UUID, code, name string, rate float64, isActive bool) {
+	if code == "" {
+		return
+	}
+	// Try update first.
+	res, err := h.db.Exec(`
+		UPDATE tax_rates
+		SET rate = $1, name = $2, is_active = $3, updated_at = NOW()
+		WHERE tenant_id = $4 AND LOWER(code) = LOWER($5) AND COALESCE(deleted_at IS NULL, TRUE)
+	`, rate, name, isActive, tenantID, code)
+	if err != nil {
+		h.log.Warn("company_tax_rates → tax_rates sync UPDATE failed", "code", code, "error", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return
+	}
+	// No matching row — insert a fresh sales-tax entry.
+	_, err = h.db.Exec(`
+		INSERT INTO tax_rates (id, tenant_id, code, name, rate, type, tax_type, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, 'percentage', 'sales', $6, NOW(), NOW())
+		ON CONFLICT (tenant_id, code) DO NOTHING
+	`, uuid.New(), tenantID, code, name, rate, isActive)
+	if err != nil {
+		h.log.Warn("company_tax_rates → tax_rates sync INSERT failed", "code", code, "error", err)
+	}
+}
+
+// ensureVatTurnoverExclusive enforces TZ §5.2: "НДС ёки Айланма --- бир
+// вақтда иккаласи тўланмайди". A tenant is either on the general regime
+// (NDS/VAT + profit tax) or on the simplified regime (turnover tax) — never
+// both. Called from Create/Update when the caller is trying to make a
+// `sales` or `turnover` row active.
+//
+// Returns (conflictAppliesTo, ok). `ok == false` means the save must be
+// rejected; `conflictAppliesTo` is the opposing bucket so the UI can tell
+// the user which rate to deactivate first.
+func (h *Handler) ensureVatTurnoverExclusive(tenantID uuid.UUID, appliesTo string, willBeActive bool, excludeID *uuid.UUID) (string, bool) {
+	if !willBeActive {
+		return "", true
+	}
+	var opposing string
+	switch appliesTo {
+	case "sales":
+		opposing = "turnover"
+	case "turnover":
+		opposing = "sales"
+	default:
+		return "", true
+	}
+	if h.hasActiveCompanyTaxRate(tenantID, opposing, excludeID) {
+		return opposing, false
+	}
+	return "", true
 }

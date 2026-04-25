@@ -159,10 +159,23 @@ type ConstructionEstimateLine struct {
 	// when TRUE, Quantity is what the user entered directly (e.g. "10 hours"
 	// for a machine) and is NOT re-derived from parent.quantity × NormRate.
 	// NormRate remains persisted for reference.
+	//
+	// MaterialType (migration 347) classifies a `resource_type='material'`
+	// row for the Form 2 transport+storage overhead engine per
+	// Госкомархитектстрой Письмо № 352/11-05. One of:
+	//   standard | equipment | cable | metal | import
+	// Default 'standard'. No-op for non-material rows.
 	ParentLineID     sql.NullInt64 `json:"parent_line_id" db:"parent_line_id"`
 	NormRate         float64       `json:"norm_rate" db:"norm_rate"`
 	SublineSeq       int           `json:"subline_seq" db:"subline_seq"`
 	QuantityOverride bool          `json:"quantity_override" db:"quantity_override"`
+	MaterialType     string        `json:"material_type" db:"material_type"`
+
+	// OriginalQuantity / OriginalUnitRate (migration 349) capture the row's
+	// values at first INSERT and never change after that. The Smeta UI
+	// surfaces them as "Reset to original" affordances on each line.
+	OriginalQuantity float64 `json:"original_quantity" db:"original_quantity"`
+	OriginalUnitRate float64 `json:"original_unit_rate" db:"original_unit_rate"`
 
 	SortOrder   int       `json:"sort_order" db:"sort_order"`
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
@@ -196,6 +209,9 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		NormRate         float64     `json:"norm_rate"`
 		SublineSeq       int         `json:"subline_seq"`
 		QuantityOverride bool        `json:"quantity_override"`
+		MaterialType     string      `json:"material_type"`
+		OriginalQuantity float64     `json:"original_quantity"`
+		OriginalUnitRate float64     `json:"original_unit_rate"`
 		SortOrder        int         `json:"sort_order"`
 		CreatedDate   time.Time   `json:"created_date"`
 		UpdatedDate   time.Time   `json:"updated_date"`
@@ -223,6 +239,9 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		NormRate:         l.NormRate,
 		SublineSeq:       l.SublineSeq,
 		QuantityOverride: l.QuantityOverride,
+		MaterialType:     l.MaterialType,
+		OriginalQuantity: l.OriginalQuantity,
+		OriginalUnitRate: l.OriginalUnitRate,
 		SortOrder:        l.SortOrder,
 		CreatedDate:   l.CreatedDate,
 		UpdatedDate:   l.UpdatedDate,
@@ -293,6 +312,7 @@ type UpdateEstimateLineInput struct {
 	NormRate         *float64 `json:"norm_rate"`
 	UnitPrice        *float64 `json:"unit_price"`
 	QuantityOverride *bool    `json:"quantity_override"`
+	MaterialType     *string  `json:"material_type"` // standard|equipment|cable|metal|import
 }
 
 // =====================================================

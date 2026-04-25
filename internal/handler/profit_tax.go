@@ -161,7 +161,12 @@ func (h *Handler) GetProfitTax(c *gin.Context) {
 
 	income, _ := strconv.ParseFloat(c.Query("income"), 64) // 0 if unset
 
-	rate := defaultProfitTaxRatePct
+	// Rate resolution order (TZ §11.9 — "Soliq stavkasi o'zgardi → barcha
+	// hisoblar yangilanadi"):
+	//   1. explicit ?rate= override (admin dry-run tool)
+	//   2. company_tax_rates row with applies_to='profit' and is_active
+	//   3. the TZ-canonical 15% default
+	rate := h.getCompanyTaxRatePct(tenantID, "profit", defaultProfitTaxRatePct)
 	if r, err := strconv.ParseFloat(c.Query("rate"), 64); err == nil && r > 0 {
 		rate = r
 	}
@@ -231,7 +236,8 @@ func (h *Handler) SnapshotProfitTax(c *gin.Context) {
 		return
 	}
 
-	rate := defaultProfitTaxRatePct
+	// Same rate resolution as GetProfitTax: explicit override → settings → 15%.
+	rate := h.getCompanyTaxRatePct(tenantID, "profit", defaultProfitTaxRatePct)
 	if input.Rate != nil && *input.Rate > 0 {
 		rate = *input.Rate
 	}
