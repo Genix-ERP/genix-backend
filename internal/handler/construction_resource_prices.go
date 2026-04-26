@@ -195,6 +195,12 @@ func (h *Handler) BulkUpdateResourcePrice(c *gin.Context) {
 		ResourceType string  `json:"resource_type"`
 		NewPrice     float64 `json:"new_price" binding:"required"`
 		Note         string  `json:"note"`
+		// EstimateID — when > 0, scope the price update to lines of THIS
+		// one estimate (block) only. Without it the change is project-wide
+		// (legacy behaviour). The Smeta boshqaruvi → Resurslar tab now
+		// always sets it so editing Block 1's cement price doesn't bleed
+		// into Block 2's lines.
+		EstimateID int64 `json:"estimate_id"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		response.BadRequest(c, "Invalid input")
@@ -211,15 +217,29 @@ func (h *Handler) BulkUpdateResourcePrice(c *gin.Context) {
 	}
 
 	// Read current avg price for the history row's `old_price` field.
+	// Mirrors the same estimate_id scoping as the UPDATE so the recorded
+	// "old_price" matches what the user actually saw before editing.
 	var oldPrice sql.NullFloat64
-	_ = h.db.QueryRow(`
-		SELECT AVG(el.unit_rate)
-		FROM construction_estimate_line el
-		JOIN construction_estimate e ON e.id = el.estimate_id
-		WHERE e.project_id = $1 AND e.tenant_id = $2
-		  AND LOWER(el.name) = LOWER($3)
-		  AND COALESCE(el.uom, '') = COALESCE($4, '')
-	`, projectID, tenantID, in.ResourceName, in.UOM).Scan(&oldPrice)
+	if in.EstimateID > 0 {
+		_ = h.db.QueryRow(`
+			SELECT AVG(el.unit_rate)
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND el.estimate_id = $3
+			  AND LOWER(el.name) = LOWER($4)
+			  AND COALESCE(el.uom, '') = COALESCE($5, '')
+		`, projectID, tenantID, in.EstimateID, in.ResourceName, in.UOM).Scan(&oldPrice)
+	} else {
+		_ = h.db.QueryRow(`
+			SELECT AVG(el.unit_rate)
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(el.name) = LOWER($3)
+			  AND COALESCE(el.uom, '') = COALESCE($4, '')
+		`, projectID, tenantID, in.ResourceName, in.UOM).Scan(&oldPrice)
+	}
 
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -230,20 +250,43 @@ func (h *Handler) BulkUpdateResourcePrice(c *gin.Context) {
 
 	// Bulk update unit_rate + recompute total_amount = unit_rate × quantity
 	// across every estimate-line in this project that matches the resource.
-	res, err := tx.Exec(`
-		UPDATE construction_estimate_line
-		SET unit_rate    = $1,
-		    total_amount = $1 * COALESCE(quantity, 0),
-		    updated_date = NOW()
-		WHERE id IN (
-		    SELECT el.id
-		    FROM construction_estimate_line el
-		    JOIN construction_estimate e ON e.id = el.estimate_id
-		    WHERE e.project_id = $2 AND e.tenant_id = $3
-		      AND LOWER(el.name) = LOWER($4)
-		      AND COALESCE(el.uom, '') = COALESCE($5, '')
-		)
-	`, in.NewPrice, projectID, tenantID, in.ResourceName, in.UOM)
+	// When estimate_id is set we add `el.estimate_id = $N` so the UPDATE
+	// touches one block only.
+	var (
+		res sql.Result
+	)
+	if in.EstimateID > 0 {
+		res, err = tx.Exec(`
+			UPDATE construction_estimate_line
+			SET unit_rate    = $1,
+			    total_amount = $1 * COALESCE(quantity, 0),
+			    updated_date = NOW()
+			WHERE id IN (
+			    SELECT el.id
+			    FROM construction_estimate_line el
+			    JOIN construction_estimate e ON e.id = el.estimate_id
+			    WHERE e.project_id = $2 AND e.tenant_id = $3
+			      AND el.estimate_id = $4
+			      AND LOWER(el.name) = LOWER($5)
+			      AND COALESCE(el.uom, '') = COALESCE($6, '')
+			)
+		`, in.NewPrice, projectID, tenantID, in.EstimateID, in.ResourceName, in.UOM)
+	} else {
+		res, err = tx.Exec(`
+			UPDATE construction_estimate_line
+			SET unit_rate    = $1,
+			    total_amount = $1 * COALESCE(quantity, 0),
+			    updated_date = NOW()
+			WHERE id IN (
+			    SELECT el.id
+			    FROM construction_estimate_line el
+			    JOIN construction_estimate e ON e.id = el.estimate_id
+			    WHERE e.project_id = $2 AND e.tenant_id = $3
+			      AND LOWER(el.name) = LOWER($4)
+			      AND COALESCE(el.uom, '') = COALESCE($5, '')
+			)
+		`, in.NewPrice, projectID, tenantID, in.ResourceName, in.UOM)
+	}
 	if err != nil {
 		h.log.Error("Failed to bulk-update resource price", "error", err)
 		response.InternalError(c, "Failed to update price")
@@ -269,24 +312,30 @@ func (h *Handler) BulkUpdateResourcePrice(c *gin.Context) {
 		return
 	}
 
-	// Recalc the parent estimates' totals — multiple estimates may share
-	// this resource. Cheap to do; keeps headline numbers in sync.
-	estRows, _ := h.db.Query(`
-		SELECT DISTINCT e.id
-		FROM construction_estimate e
-		JOIN construction_estimate_line el ON el.estimate_id = e.id
-		WHERE e.project_id = $1 AND e.tenant_id = $2
-		  AND LOWER(el.name) = LOWER($3)
-		  AND COALESCE(el.uom, '') = COALESCE($4, '')
-	`, projectID, tenantID, in.ResourceName, in.UOM)
-	if estRows != nil {
-		for estRows.Next() {
-			var eid int64
-			if err := estRows.Scan(&eid); err == nil {
-				h.recalculateEstimateTotals(eid)
+	// Recalc the parent estimates' totals. When the price update was
+	// scoped to one estimate, only that estimate needs its headline
+	// numbers refreshed; otherwise sweep every estimate that has a line
+	// matching this resource.
+	if in.EstimateID > 0 {
+		h.recalculateEstimateTotals(in.EstimateID)
+	} else {
+		estRows, _ := h.db.Query(`
+			SELECT DISTINCT e.id
+			FROM construction_estimate e
+			JOIN construction_estimate_line el ON el.estimate_id = e.id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(el.name) = LOWER($3)
+			  AND COALESCE(el.uom, '') = COALESCE($4, '')
+		`, projectID, tenantID, in.ResourceName, in.UOM)
+		if estRows != nil {
+			for estRows.Next() {
+				var eid int64
+				if err := estRows.Scan(&eid); err == nil {
+					h.recalculateEstimateTotals(eid)
+				}
 			}
+			estRows.Close()
 		}
-		estRows.Close()
 	}
 
 	userNameLog := c.GetString("user_name")
@@ -324,6 +373,10 @@ func (h *Handler) BulkUpdateResourceMaterialType(c *gin.Context) {
 		ResourceName string `json:"resource_name" binding:"required"`
 		UOM          string `json:"uom"`
 		MaterialType string `json:"material_type" binding:"required"`
+		// EstimateID — when > 0, scope the material_type change to one
+		// estimate (block) only. Same per-block scoping rule as
+		// BulkUpdateResourcePrice — see that handler for context.
+		EstimateID int64 `json:"estimate_id"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		response.BadRequest(c, "Invalid input")
@@ -339,27 +392,56 @@ func (h *Handler) BulkUpdateResourceMaterialType(c *gin.Context) {
 
 	// Capture an old material_type for the audit row before we mutate.
 	var oldMt string
-	_ = h.db.QueryRow(`
-		SELECT COALESCE(MIN(material_type), 'standard')
-		FROM construction_estimate_line el
-		JOIN construction_estimate e ON e.id = el.estimate_id
-		WHERE e.project_id = $1 AND e.tenant_id = $2
-		  AND LOWER(el.name) = LOWER($3)
-		  AND COALESCE(el.uom, '') = COALESCE($4, '')
-	`, projectID, tenantID, in.ResourceName, in.UOM).Scan(&oldMt)
+	if in.EstimateID > 0 {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(MIN(material_type), 'standard')
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND el.estimate_id = $3
+			  AND LOWER(el.name) = LOWER($4)
+			  AND COALESCE(el.uom, '') = COALESCE($5, '')
+		`, projectID, tenantID, in.EstimateID, in.ResourceName, in.UOM).Scan(&oldMt)
+	} else {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(MIN(material_type), 'standard')
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(el.name) = LOWER($3)
+			  AND COALESCE(el.uom, '') = COALESCE($4, '')
+		`, projectID, tenantID, in.ResourceName, in.UOM).Scan(&oldMt)
+	}
 
-	res, err := h.db.Exec(`
-		UPDATE construction_estimate_line
-		SET material_type = $1, updated_date = NOW()
-		WHERE id IN (
-		    SELECT el.id
-		    FROM construction_estimate_line el
-		    JOIN construction_estimate e ON e.id = el.estimate_id
-		    WHERE e.project_id = $2 AND e.tenant_id = $3
-		      AND LOWER(el.name) = LOWER($4)
-		      AND COALESCE(el.uom, '') = COALESCE($5, '')
-		)
-	`, mt, projectID, tenantID, in.ResourceName, in.UOM)
+	var res sql.Result
+	if in.EstimateID > 0 {
+		res, err = h.db.Exec(`
+			UPDATE construction_estimate_line
+			SET material_type = $1, updated_date = NOW()
+			WHERE id IN (
+			    SELECT el.id
+			    FROM construction_estimate_line el
+			    JOIN construction_estimate e ON e.id = el.estimate_id
+			    WHERE e.project_id = $2 AND e.tenant_id = $3
+			      AND el.estimate_id = $4
+			      AND LOWER(el.name) = LOWER($5)
+			      AND COALESCE(el.uom, '') = COALESCE($6, '')
+			)
+		`, mt, projectID, tenantID, in.EstimateID, in.ResourceName, in.UOM)
+	} else {
+		res, err = h.db.Exec(`
+			UPDATE construction_estimate_line
+			SET material_type = $1, updated_date = NOW()
+			WHERE id IN (
+			    SELECT el.id
+			    FROM construction_estimate_line el
+			    JOIN construction_estimate e ON e.id = el.estimate_id
+			    WHERE e.project_id = $2 AND e.tenant_id = $3
+			      AND LOWER(el.name) = LOWER($4)
+			      AND COALESCE(el.uom, '') = COALESCE($5, '')
+			)
+		`, mt, projectID, tenantID, in.ResourceName, in.UOM)
+	}
 	if err != nil {
 		h.log.Error("Failed to bulk-update material_type", "error", err)
 		response.InternalError(c, "Failed to update material type")
@@ -395,6 +477,8 @@ func (h *Handler) ResetResourcePrice(c *gin.Context) {
 	var in struct {
 		ResourceName string `json:"resource_name" binding:"required"`
 		UOM          string `json:"uom"`
+		// EstimateID — when > 0, scope the rollback to one estimate only.
+		EstimateID int64 `json:"estimate_id"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		response.BadRequest(c, "Invalid input")
@@ -408,14 +492,26 @@ func (h *Handler) ResetResourcePrice(c *gin.Context) {
 
 	// Capture old + new (original) avg before the bulk-update for the history row.
 	var oldPrice, newPrice sql.NullFloat64
-	_ = h.db.QueryRow(`
-		SELECT AVG(el.unit_rate), AVG(COALESCE(el.original_unit_rate, el.unit_rate))
-		FROM construction_estimate_line el
-		JOIN construction_estimate e ON e.id = el.estimate_id
-		WHERE e.project_id = $1 AND e.tenant_id = $2
-		  AND LOWER(el.name) = LOWER($3)
-		  AND COALESCE(el.uom, '') = COALESCE($4, '')
-	`, projectID, tenantID, in.ResourceName, in.UOM).Scan(&oldPrice, &newPrice)
+	if in.EstimateID > 0 {
+		_ = h.db.QueryRow(`
+			SELECT AVG(el.unit_rate), AVG(COALESCE(el.original_unit_rate, el.unit_rate))
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND el.estimate_id = $3
+			  AND LOWER(el.name) = LOWER($4)
+			  AND COALESCE(el.uom, '') = COALESCE($5, '')
+		`, projectID, tenantID, in.EstimateID, in.ResourceName, in.UOM).Scan(&oldPrice, &newPrice)
+	} else {
+		_ = h.db.QueryRow(`
+			SELECT AVG(el.unit_rate), AVG(COALESCE(el.original_unit_rate, el.unit_rate))
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(el.name) = LOWER($3)
+			  AND COALESCE(el.uom, '') = COALESCE($4, '')
+		`, projectID, tenantID, in.ResourceName, in.UOM).Scan(&oldPrice, &newPrice)
+	}
 
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -424,20 +520,39 @@ func (h *Handler) ResetResourcePrice(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	res, err := tx.Exec(`
-		UPDATE construction_estimate_line
-		SET unit_rate    = COALESCE(original_unit_rate, unit_rate),
-		    total_amount = COALESCE(original_unit_rate, unit_rate) * COALESCE(quantity, 0),
-		    updated_date = NOW()
-		WHERE id IN (
-		    SELECT el.id
-		    FROM construction_estimate_line el
-		    JOIN construction_estimate e ON e.id = el.estimate_id
-		    WHERE e.project_id = $1 AND e.tenant_id = $2
-		      AND LOWER(el.name) = LOWER($3)
-		      AND COALESCE(el.uom, '') = COALESCE($4, '')
-		)
-	`, projectID, tenantID, in.ResourceName, in.UOM)
+	var res sql.Result
+	if in.EstimateID > 0 {
+		res, err = tx.Exec(`
+			UPDATE construction_estimate_line
+			SET unit_rate    = COALESCE(original_unit_rate, unit_rate),
+			    total_amount = COALESCE(original_unit_rate, unit_rate) * COALESCE(quantity, 0),
+			    updated_date = NOW()
+			WHERE id IN (
+			    SELECT el.id
+			    FROM construction_estimate_line el
+			    JOIN construction_estimate e ON e.id = el.estimate_id
+			    WHERE e.project_id = $1 AND e.tenant_id = $2
+			      AND el.estimate_id = $3
+			      AND LOWER(el.name) = LOWER($4)
+			      AND COALESCE(el.uom, '') = COALESCE($5, '')
+			)
+		`, projectID, tenantID, in.EstimateID, in.ResourceName, in.UOM)
+	} else {
+		res, err = tx.Exec(`
+			UPDATE construction_estimate_line
+			SET unit_rate    = COALESCE(original_unit_rate, unit_rate),
+			    total_amount = COALESCE(original_unit_rate, unit_rate) * COALESCE(quantity, 0),
+			    updated_date = NOW()
+			WHERE id IN (
+			    SELECT el.id
+			    FROM construction_estimate_line el
+			    JOIN construction_estimate e ON e.id = el.estimate_id
+			    WHERE e.project_id = $1 AND e.tenant_id = $2
+			      AND LOWER(el.name) = LOWER($3)
+			      AND COALESCE(el.uom, '') = COALESCE($4, '')
+			)
+		`, projectID, tenantID, in.ResourceName, in.UOM)
+	}
 	if err != nil {
 		h.log.Error("Failed to reset resource price", "error", err)
 		response.InternalError(c, "Failed to reset price")
@@ -461,23 +576,29 @@ func (h *Handler) ResetResourcePrice(c *gin.Context) {
 		return
 	}
 
-	// Recalc estimate totals — same pattern as BulkUpdateResourcePrice.
-	estRows, _ := h.db.Query(`
-		SELECT DISTINCT e.id
-		FROM construction_estimate e
-		JOIN construction_estimate_line el ON el.estimate_id = e.id
-		WHERE e.project_id = $1 AND e.tenant_id = $2
-		  AND LOWER(el.name) = LOWER($3)
-		  AND COALESCE(el.uom, '') = COALESCE($4, '')
-	`, projectID, tenantID, in.ResourceName, in.UOM)
-	if estRows != nil {
-		for estRows.Next() {
-			var eid int64
-			if err := estRows.Scan(&eid); err == nil {
-				h.recalculateEstimateTotals(eid)
+	// Recalc estimate totals — scope to the touched estimate when the
+	// rollback was per-block, else sweep every estimate that has a line
+	// matching this resource (mirrors BulkUpdateResourcePrice).
+	if in.EstimateID > 0 {
+		h.recalculateEstimateTotals(in.EstimateID)
+	} else {
+		estRows, _ := h.db.Query(`
+			SELECT DISTINCT e.id
+			FROM construction_estimate e
+			JOIN construction_estimate_line el ON el.estimate_id = e.id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(el.name) = LOWER($3)
+			  AND COALESCE(el.uom, '') = COALESCE($4, '')
+		`, projectID, tenantID, in.ResourceName, in.UOM)
+		if estRows != nil {
+			for estRows.Next() {
+				var eid int64
+				if err := estRows.Scan(&eid); err == nil {
+					h.recalculateEstimateTotals(eid)
+				}
 			}
+			estRows.Close()
 		}
-		estRows.Close()
 	}
 
 	userNameLog := c.GetString("user_name")
@@ -513,6 +634,14 @@ func (h *Handler) ResetAllResourcePrices(c *gin.Context) {
 		return
 	}
 
+	// Optional `estimate_id` body field — when set, scope the rollback to
+	// one estimate (block) only. The Resurslar tab passes it so "Reset
+	// all" inside Block 1 doesn't wipe out modified prices in Block 2.
+	var body struct {
+		EstimateID int64 `json:"estimate_id"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		response.InternalError(c, "Failed to start transaction")
@@ -522,27 +651,43 @@ func (h *Handler) ResetAllResourcePrices(c *gin.Context) {
 
 	// Snapshot per-resource averages BEFORE the reset for the history rows.
 	type bucketSnap struct {
-		Name     string
-		UOM      string
-		OldAvg   float64
-		NewAvg   float64
+		Name   string
+		UOM    string
+		OldAvg float64
+		NewAvg float64
 	}
 	var snaps []bucketSnap
-	snapRows, err := tx.Query(`
-		SELECT el.name, COALESCE(el.uom, ''),
-		       AVG(el.unit_rate), AVG(COALESCE(el.original_unit_rate, el.unit_rate))
-		FROM construction_estimate_line el
-		JOIN construction_estimate e ON e.id = el.estimate_id
-		WHERE e.project_id = $1 AND e.tenant_id = $2
-		  AND COALESCE(el.name, '') <> ''
-		  -- Same resource-detection criterion as ListResourcePrices: a row
-		  -- counts as a resource if it has a real resource_type, regardless
-		  -- of whether it's a sub-line (BOP) or a flat top-level row (Ресурс).
-		  AND COALESCE(el.resource_type, '') <> ''
-		  AND ABS(COALESCE(el.unit_rate, 0) - COALESCE(el.original_unit_rate, el.unit_rate)) > 0.0001
-		GROUP BY el.name, el.uom
-	`, projectID, tenantID)
-	if err == nil {
+	var snapRows *sql.Rows
+	if body.EstimateID > 0 {
+		snapRows, err = tx.Query(`
+			SELECT el.name, COALESCE(el.uom, ''),
+			       AVG(el.unit_rate), AVG(COALESCE(el.original_unit_rate, el.unit_rate))
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND el.estimate_id = $3
+			  AND COALESCE(el.name, '') <> ''
+			  AND COALESCE(el.resource_type, '') <> ''
+			  AND ABS(COALESCE(el.unit_rate, 0) - COALESCE(el.original_unit_rate, el.unit_rate)) > 0.0001
+			GROUP BY el.name, el.uom
+		`, projectID, tenantID, body.EstimateID)
+	} else {
+		snapRows, err = tx.Query(`
+			SELECT el.name, COALESCE(el.uom, ''),
+			       AVG(el.unit_rate), AVG(COALESCE(el.original_unit_rate, el.unit_rate))
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND COALESCE(el.name, '') <> ''
+			  -- Same resource-detection criterion as ListResourcePrices: a row
+			  -- counts as a resource if it has a real resource_type, regardless
+			  -- of whether it's a sub-line (BOP) or a flat top-level row (Ресурс).
+			  AND COALESCE(el.resource_type, '') <> ''
+			  AND ABS(COALESCE(el.unit_rate, 0) - COALESCE(el.original_unit_rate, el.unit_rate)) > 0.0001
+			GROUP BY el.name, el.uom
+		`, projectID, tenantID)
+	}
+	if err == nil && snapRows != nil {
 		for snapRows.Next() {
 			var s bucketSnap
 			var oldAvg, newAvg sql.NullFloat64
@@ -559,20 +704,38 @@ func (h *Handler) ResetAllResourcePrices(c *gin.Context) {
 		snapRows.Close()
 	}
 
-	// Bulk reset every line in the project.
-	res, err := tx.Exec(`
-		UPDATE construction_estimate_line
-		SET unit_rate    = COALESCE(original_unit_rate, unit_rate),
-		    total_amount = COALESCE(original_unit_rate, unit_rate) * COALESCE(quantity, 0),
-		    updated_date = NOW()
-		WHERE id IN (
-		    SELECT el.id
-		    FROM construction_estimate_line el
-		    JOIN construction_estimate e ON e.id = el.estimate_id
-		    WHERE e.project_id = $1 AND e.tenant_id = $2
-		      AND ABS(COALESCE(el.unit_rate, 0) - COALESCE(el.original_unit_rate, el.unit_rate)) > 0.0001
-		)
-	`, projectID, tenantID)
+	// Bulk reset — every line in the project, OR only the selected estimate.
+	var res sql.Result
+	if body.EstimateID > 0 {
+		res, err = tx.Exec(`
+			UPDATE construction_estimate_line
+			SET unit_rate    = COALESCE(original_unit_rate, unit_rate),
+			    total_amount = COALESCE(original_unit_rate, unit_rate) * COALESCE(quantity, 0),
+			    updated_date = NOW()
+			WHERE id IN (
+			    SELECT el.id
+			    FROM construction_estimate_line el
+			    JOIN construction_estimate e ON e.id = el.estimate_id
+			    WHERE e.project_id = $1 AND e.tenant_id = $2
+			      AND el.estimate_id = $3
+			      AND ABS(COALESCE(el.unit_rate, 0) - COALESCE(el.original_unit_rate, el.unit_rate)) > 0.0001
+			)
+		`, projectID, tenantID, body.EstimateID)
+	} else {
+		res, err = tx.Exec(`
+			UPDATE construction_estimate_line
+			SET unit_rate    = COALESCE(original_unit_rate, unit_rate),
+			    total_amount = COALESCE(original_unit_rate, unit_rate) * COALESCE(quantity, 0),
+			    updated_date = NOW()
+			WHERE id IN (
+			    SELECT el.id
+			    FROM construction_estimate_line el
+			    JOIN construction_estimate e ON e.id = el.estimate_id
+			    WHERE e.project_id = $1 AND e.tenant_id = $2
+			      AND ABS(COALESCE(el.unit_rate, 0) - COALESCE(el.original_unit_rate, el.unit_rate)) > 0.0001
+			)
+		`, projectID, tenantID)
+	}
 	if err != nil {
 		h.log.Error("Failed to reset all resource prices", "error", err)
 		response.InternalError(c, "Failed to reset prices")
@@ -598,18 +761,23 @@ func (h *Handler) ResetAllResourcePrices(c *gin.Context) {
 		return
 	}
 
-	// Recalc every estimate in the project once.
-	estRows, _ := h.db.Query(`
-		SELECT id FROM construction_estimate WHERE project_id = $1 AND tenant_id = $2
-	`, projectID, tenantID)
-	if estRows != nil {
-		for estRows.Next() {
-			var eid int64
-			if err := estRows.Scan(&eid); err == nil {
-				h.recalculateEstimateTotals(eid)
+	// Recalc the affected estimates' totals — single estimate when scoped,
+	// every estimate in the project otherwise.
+	if body.EstimateID > 0 {
+		h.recalculateEstimateTotals(body.EstimateID)
+	} else {
+		estRows, _ := h.db.Query(`
+			SELECT id FROM construction_estimate WHERE project_id = $1 AND tenant_id = $2
+		`, projectID, tenantID)
+		if estRows != nil {
+			for estRows.Next() {
+				var eid int64
+				if err := estRows.Scan(&eid); err == nil {
+					h.recalculateEstimateTotals(eid)
+				}
 			}
+			estRows.Close()
 		}
-		estRows.Close()
 	}
 
 	userNameLog := c.GetString("user_name")

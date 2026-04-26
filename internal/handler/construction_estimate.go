@@ -1039,19 +1039,30 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 			sortOrder = i + 1
 		}
 
+		// material_type — sub-bucket for resource_type='material' rows
+		// (migration 350). Falls back to 'standard' when omitted or when
+		// the line is labor/equipment so the CHECK constraint is happy.
+		materialType := strings.ToLower(strings.TrimSpace(line.MaterialType))
+		switch materialType {
+		case "standard", "equipment", "cable", "metal", "import":
+			// already valid
+		default:
+			materialType = "standard"
+		}
+
 		_, err := tx.Exec(`
 			INSERT INTO construction_estimate_line (
 				tenant_id, estimate_id, wbs_id, name, uom, quantity,
 				material_rate, labor_rate, equipment_rate,
 				unit_rate, total_amount, code, item_number,
-				resource_type, parent_item_number, sort_order,
+				resource_type, material_type, parent_item_number, sort_order,
 				created_date, updated_date
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW())
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW())
 		`, tenantID, estimateID, nullInt64FromVal(line.WBSID),
 			line.Name, uom, line.Quantity,
 			line.MaterialRate, line.LaborRate, line.EquipmentRate,
 			unitRate, totalAmount, nullStringFromVal(line.Code), nullStringFromVal(line.ItemNumber),
-			nullStringFromVal(line.ResourceType), nullStringFromVal(line.ParentItemNumber), sortOrder,
+			nullStringFromVal(line.ResourceType), materialType, nullStringFromVal(line.ParentItemNumber), sortOrder,
 		)
 		if err != nil {
 			h.log.Error("Failed to insert estimate line", "error", err, "index", i)
@@ -2341,6 +2352,39 @@ func (h *Handler) autoCreateProductsFromEstimateLines(tenantID, orgID, userID uu
 		orgIDPtr = &orgID
 	}
 
+	// Resolve which organizations the new product should be linked to via
+	// product_organization_settings. The Inventory list page INNER JOINs
+	// product_organization_settings on the active org, so a product with
+	// NO org link is invisible everywhere — that's why "auto-created
+	// products don't show up in inventory" was the most common report.
+	//
+	// Strategy:
+	//   • If the request had an active org → link to just that org.
+	//   • Otherwise → link to every active organization of the tenant so
+	//     the product is visible regardless of which company the user
+	//     later switches to.
+	var targetOrgIDs []uuid.UUID
+	if orgID != uuid.Nil {
+		targetOrgIDs = []uuid.UUID{orgID}
+	} else {
+		orgRows, qErr := h.db.Query(
+			`SELECT id FROM organizations WHERE tenant_id = $1 AND COALESCE(is_active, true) = true`,
+			tenantID,
+		)
+		if qErr != nil {
+			h.log.Error("Failed to load tenant organizations for auto-create",
+				"error", qErr, "tenant_id", tenantID)
+		} else {
+			for orgRows.Next() {
+				var oid uuid.UUID
+				if scanErr := orgRows.Scan(&oid); scanErr == nil {
+					targetOrgIDs = append(targetOrgIDs, oid)
+				}
+			}
+			orgRows.Close()
+		}
+	}
+
 	for _, line := range lines {
 		name := strings.TrimSpace(line.Name)
 		if name == "" {
@@ -2463,16 +2507,22 @@ func (h *Handler) autoCreateProductsFromEstimateLines(tenantID, orgID, userID uu
 			continue
 		}
 
-		// Create org settings if org is set
-		if orgID != uuid.Nil {
-			h.db.Exec(`
+		// Link the product to every target organization so it shows up in
+		// the Mahsulotlar / Inventory list under the right company. With
+		// no rows here the product is created but invisible because the
+		// inventory list INNER JOINs product_organization_settings.
+		for _, targetOrg := range targetOrgIDs {
+			if _, posErr := h.db.Exec(`
 				INSERT INTO product_organization_settings (
 					tenant_id, product_id, organization_id,
 					cost_price, list_price, min_price,
 					min_stock_level, reorder_point, reorder_quantity
 				) VALUES ($1, $2, $3, $4, $4, 0, 0, 0, 0)
 				ON CONFLICT (product_id, organization_id) DO NOTHING
-			`, tenantID, id, orgID, costPrice)
+			`, tenantID, id, targetOrg, costPrice); posErr != nil {
+				h.log.Error("Failed to link auto-created product to organization",
+					"error", posErr, "product_id", id, "organization_id", targetOrg)
+			}
 		}
 
 		created++
