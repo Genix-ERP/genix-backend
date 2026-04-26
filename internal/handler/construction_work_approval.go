@@ -455,6 +455,30 @@ func (h *Handler) transitionWork(
 	h.logSmetaAudit(tenantID, ctx.ProjectID, &ctx.EstimateID, "qty_change", ctx.Name, &lineID,
 		ctx.Status, newStatus, desc, userID, userName)
 
+	// ── Material reservation side-effects ────────────────────────────
+	// Status update succeeded — wire the new state into the warehouse.
+	// All three helpers are best-effort (they log warnings but don't
+	// surface errors here) so a missing product / warehouse never blocks
+	// the approval workflow itself.
+	orgID, _ := middleware.GetOrganizationID(c)
+	switch newStatus {
+	case "submitted":
+		// Foreman → supervisor. Create pending reservations sized as
+		// done_quantity × subline.norm_rate.
+		h.reserveMaterialsForWork(tenantID, orgID, userID, ctx.ProjectID, lineID)
+	case "confirmed_engineer":
+		// Engineer finalises. Approve every pending reservation, deduct
+		// from quantity_on_hand (allowed to go negative).
+		h.finaliseMaterialsForWork(tenantID, userID, ctx.ProjectID, lineID)
+	case "in_progress":
+		// Reverted from submitted → in_progress (supervisor rejected).
+		// Release the reserved quantity so the warehouse balance
+		// returns to its pre-submit value.
+		if ctx.Status == "submitted" {
+			h.cancelMaterialsForWork(tenantID, lineID)
+		}
+	}
+
 	response.Success(c, gin.H{
 		"id":              lineID,
 		"approval_status": newStatus,
@@ -560,6 +584,44 @@ func (h *Handler) bulkWorksTransition(
 	h.logSmetaAudit(tenantID, projectID, nil, "qty_change", "", nil,
 		"", strconv.FormatInt(updated, 10), auditDescription,
 		userID, userName)
+
+	// ── Material reservation side-effects (bulk path) ───────────────
+	// Re-query which works actually carry the new status and run the
+	// matching warehouse step on each. This is the bulk twin of the
+	// per-work hook in transitionWork. Same best-effort semantics:
+	// failures are logged, never surfaced to the caller.
+	if newStatus == "submitted" || newStatus == "confirmed_engineer" || newStatus == "in_progress" {
+		orgID, _ := middleware.GetOrganizationID(c)
+		idRows, qErr := h.db.Query(`
+			SELECT id FROM construction_estimate_line
+			WHERE tenant_id = $1
+			  AND id = ANY($2::bigint[])
+			  AND approval_status = $3
+		`, tenantID, int64SliceArg(body.WorkIDs), newStatus)
+		if qErr == nil {
+			var ids []int64
+			for idRows.Next() {
+				var wid int64
+				if scanErr := idRows.Scan(&wid); scanErr == nil {
+					ids = append(ids, wid)
+				}
+			}
+			idRows.Close()
+			for _, wid := range ids {
+				switch newStatus {
+				case "submitted":
+					h.reserveMaterialsForWork(tenantID, orgID, userID, projectID, wid)
+				case "confirmed_engineer":
+					h.finaliseMaterialsForWork(tenantID, userID, projectID, wid)
+				case "in_progress":
+					h.cancelMaterialsForWork(tenantID, wid)
+				}
+			}
+		} else {
+			h.log.Error("bulkWorksTransition: failed to re-query updated work ids",
+				"error", qErr, "to", newStatus)
+		}
+	}
 
 	response.Success(c, gin.H{
 		"updated":         updated,

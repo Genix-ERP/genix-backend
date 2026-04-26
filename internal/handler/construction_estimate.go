@@ -1055,14 +1055,14 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 				tenant_id, estimate_id, wbs_id, name, uom, quantity,
 				material_rate, labor_rate, equipment_rate,
 				unit_rate, total_amount, code, item_number,
-				resource_type, material_type, parent_item_number, sort_order,
+				resource_type, material_type, parent_item_number, norm_rate, sort_order,
 				created_date, updated_date
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW())
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW())
 		`, tenantID, estimateID, nullInt64FromVal(line.WBSID),
 			line.Name, uom, line.Quantity,
 			line.MaterialRate, line.LaborRate, line.EquipmentRate,
 			unitRate, totalAmount, nullStringFromVal(line.Code), nullStringFromVal(line.ItemNumber),
-			nullStringFromVal(line.ResourceType), materialType, nullStringFromVal(line.ParentItemNumber), sortOrder,
+			nullStringFromVal(line.ResourceType), materialType, nullStringFromVal(line.ParentItemNumber), line.NormRate, sortOrder,
 		)
 		if err != nil {
 			h.log.Error("Failed to insert estimate line", "error", err, "index", i)
@@ -1076,6 +1076,69 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		h.log.Error("Failed to commit transaction", "error", err)
 		response.InternalError(c, "Failed to complete import")
 		return
+	}
+
+	// Resolve parent_line_id (and subline_seq) for child resource rows.
+	//
+	// The bulk INSERT above writes parent_item_number (text — the parent
+	// work's local item_number, e.g. "648" or "1.1's parent = 1") but not
+	// parent_line_id (the FK). The Smeta Management tab and the v2
+	// Bosqichlar tab both group sub-resources by parent_line_id, so
+	// without this step every work shows "0 resurs" even though the
+	// children are present in the database.
+	//
+	// For each child line (resource_type set, parent_item_number is a
+	// numeric string like "648" or "1.1") we link it to the IMMEDIATELY
+	// PRECEDING top-level work whose item_number matches — preceding by
+	// sort_order, since the import always writes a parent followed by
+	// its children. The numeric-string filter on parent_item_number is
+	// what distinguishes children (parent_item_number = "648") from
+	// top-level works (parent_item_number = "СЕКЦИЯ №3 › ЗЕМЛЯННЫЕ
+	// РАБОТЫ" — a section path, has spaces / "›").
+	//
+	// We MUST also assign a unique subline_seq per parent because of the
+	// `uq_estimate_line_parent_seq (parent_line_id, subline_seq)` index
+	// from migration 332. Without it every child of a single parent
+	// would default to subline_seq=0 and collide on the second row.
+	// ROW_NUMBER() partitioned by the resolved parent gives 1, 2, 3, …
+	// in sort_order, which keeps the visual ordering stable.
+	if _, linkErr := h.db.Exec(`
+		WITH resolved AS (
+		    SELECT
+		        child.id            AS child_id,
+		        parent.parent_id    AS parent_id,
+		        ROW_NUMBER() OVER (
+		            PARTITION BY parent.parent_id
+		            ORDER BY child.sort_order, child.id
+		        ) AS new_seq
+		    FROM construction_estimate_line child
+		    CROSS JOIN LATERAL (
+		        SELECT p.id AS parent_id
+		        FROM construction_estimate_line p
+		        WHERE p.estimate_id = child.estimate_id
+		          AND p.tenant_id   = child.tenant_id
+		          AND p.item_number = child.parent_item_number
+		          AND p.sort_order  < child.sort_order
+		          AND COALESCE(p.resource_type, '') = ''
+		        ORDER BY p.sort_order DESC
+		        LIMIT 1
+		    ) parent
+		    WHERE child.estimate_id = $1
+		      AND child.tenant_id   = $2
+		      AND child.parent_line_id IS NULL
+		      AND COALESCE(child.resource_type, '') <> ''
+		      AND child.parent_item_number ~ '^[0-9]+([.][0-9]+)?$'
+		)
+		UPDATE construction_estimate_line el
+		SET parent_line_id = r.parent_id,
+		    subline_seq    = r.new_seq
+		FROM resolved r
+		WHERE el.id = r.child_id
+	`, estimateID, tenantID); linkErr != nil {
+		// Non-fatal — works will still display, sub-resources will just
+		// be missing until the user re-imports or links manually.
+		h.log.Error("Failed to resolve parent_line_id post-import",
+			"error", linkErr, "estimate_id", estimateID)
 	}
 
 	// Recalculate estimate totals
