@@ -269,6 +269,10 @@ type CreateEstimateLineInput struct {
 	Code             string `json:"code"`
 	ItemNumber       string `json:"item_number"`
 	ResourceType     string `json:"resource_type"`
+	// MaterialType (migration 350) — sub-bucket for resource_type='material'.
+	// Allowed values: 'standard' | 'equipment' | 'cable' | 'metal' | 'import'.
+	// Empty string falls back to 'standard' on insert.
+	MaterialType     string `json:"material_type"`
 	ParentItemNumber string `json:"parent_item_number"`
 	SortOrder        int    `json:"sort_order"`
 
