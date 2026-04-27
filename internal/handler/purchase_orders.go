@@ -1606,6 +1606,26 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	// Intercompany: when PO is approved, ensure the matching SO exists in
+	// the vendor's company. The sync also fires from UpdatePurchaseOrder
+	// when status moves to "ordered", but users sometimes go straight
+	// from draft → approved (skipping send), so call it here too. The
+	// service is idempotent — it no-ops when an SO link already exists or
+	// when this PO was itself created from an SO.
+	go func() {
+		var createdFromSO int
+		h.db.QueryRow(`
+			SELECT COUNT(*) FROM intercompany_document_links
+			WHERE tenant_id = $1 AND linked_document_type = 'purchase_order' AND linked_document_id = $2
+		`, tenantID, id).Scan(&createdFromSO)
+		if createdFromSO > 0 {
+			return
+		}
+		if err := h.icSync.SyncPurchaseOrderToSaleOrder(tenantID, id); err != nil {
+			h.log.Error("Intercompany PO->SO sync failed on approve", "error", err, "po_id", id)
+		}
+	}()
+
 	// Notify: purchase order approved
 	go func() {
 		var poNumber, vendorName string
