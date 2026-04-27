@@ -201,30 +201,107 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		}
 	}
 
-	// When a building filter is supplied we add `AND s.building_id = $3`
-	// to the stage query and reuse the same clause in the totals queries
-	// below so every number on the screen is scoped consistently. Going
-	// through a format-string keeps the two code paths readable without
-	// duplicating the 20-line SELECT.
+	// When a building filter is supplied we add `AND e.building_id = $3`
+	// to the estimate_line CTE so we only sum the lines of that block's
+	// edinich estimate. Stage filtering would be wrong here because the
+	// row set is now driven by parent_item_number from estimate lines,
+	// not from construction_stages.
 	stageFilterSQL := ""
 	stageArgs := []interface{}{projectID, tenantID}
 	if buildingID > 0 {
-		stageFilterSQL = " AND s.building_id = $3"
+		stageFilterSQL = " AND e.building_id = $3"
 		stageArgs = append(stageArgs, buildingID)
 	}
 
-	// Stages with planned budgets and actual totals
+	// Stages with planned budgets and actual totals.
+	//
+	// `planned_budget` on the construction_stages row is hardcoded to 0
+	// at auto-create time (we don't yet know the price when the stage is
+	// being seeded from a section header during import). So we COMPUTE
+	// planned per-stage from the matching Единич estimate lines:
+	//
+	//   For each parent work whose parent_item_number = stage.name in
+	//   ANY Единич estimate of this project,
+	//     • if it has children → SUM(children.total_amount)
+	//     • else                → parent.total_amount
+	//   Sum across all such parents.
+	//
+	// We deliberately DON'T filter by building_id when matching lines to
+	// stages. In practice, users re-import their estimates many times and
+	// stages from older imports may carry a different building_id than
+	// the current priced lines. Filtering by building would leave most
+	// stages at 0 even though the prices exist in the project. Matching
+	// by section path (parent_item_number = stage.name) is unique enough
+	// in real estimates that cross-block leakage isn't a concern; the
+	// total_planned at the bottom uses the same broad scope, so the per-
+	// row sums add up to the total.
+	// Source the row set DIRECTLY from estimate-line parent_item_numbers
+	// (in the project's Единич estimates) instead of construction_stages.
+	// This guarantees that every section path with priced works gets a
+	// row, even when construction_stages is out of sync (re-imports, old
+	// stale stages from VOR-era code, etc.). For each section path we
+	// LEFT JOIN to construction_stages by name to grab the optional
+	// stage_id + building_id, so per-building filtering still works when
+	// a stage row exists; sections without a matching stage default to
+	// stage_id=0 and pass through the 'all' filter.
+	//
+	// `actual` is 0 unless a matching стажа exists (because expenses are
+	// keyed by stage_id). That's fine for the smeta-driven Byudjet view
+	// — once the user starts recording expenses we can revisit.
 	rows, err := h.db.Query(`
+		WITH parent_costs AS (
+		    SELECT
+		        e.project_id,
+		        e.tenant_id,
+		        e.building_id,
+		        p.parent_item_number AS section_path,
+		        SUM(
+		            CASE WHEN EXISTS (
+		                SELECT 1 FROM construction_estimate_line ch
+		                WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+		            ) THEN COALESCE((
+		                SELECT SUM(ch.total_amount)
+		                FROM construction_estimate_line ch
+		                WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+		            ), 0)
+		            ELSE COALESCE(p.total_amount, 0)
+		            END
+		        ) AS planned
+		    FROM construction_estimate_line p
+		    JOIN construction_estimate e ON e.id = p.estimate_id
+		    WHERE e.project_id = $1
+		      AND e.tenant_id  = $2
+		      AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		      AND COALESCE(p.resource_type, '') = ''
+		      AND p.parent_line_id IS NULL
+		      AND COALESCE(p.parent_item_number, '') <> ''
+		      `+stageFilterSQL+`
+		    GROUP BY e.project_id, e.tenant_id, e.building_id, p.parent_item_number
+		)
 		SELECT
-			s.id, s.name, s.planned_budget,
-			COALESCE(cat.id, 0), COALESCE(cat.name, 'Uncategorized'), COALESCE(cat.code, ''),
-			COALESCE(SUM(CASE WHEN el.status='approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual
-		FROM construction_stages s
-		LEFT JOIN construction_expense_lines el ON el.stage_id = s.id AND el.project_id = s.project_id
-		LEFT JOIN construction_cost_categories cat ON cat.id = el.cost_category_id
-		WHERE s.project_id = $1 AND s.tenant_id = $2`+stageFilterSQL+`
-		GROUP BY s.id, s.name, s.planned_budget, cat.id, cat.name, cat.code
-		ORDER BY s.stage_order ASC, s.id ASC, cat.name ASC
+		    COALESCE(s.id, 0)                                   AS stage_id,
+		    pc.section_path                                     AS stage_name,
+		    pc.planned                                          AS planned_budget,
+		    COALESCE(cat.id, 0)                                 AS category_id,
+		    COALESCE(cat.name, 'Uncategorized')                 AS category_name,
+		    COALESCE(cat.code, '')                              AS category_code,
+		    COALESCE(SUM(CASE WHEN el.status='approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual
+		FROM parent_costs pc
+		LEFT JOIN LATERAL (
+		    SELECT id, stage_order
+		    FROM construction_stages
+		    WHERE tenant_id  = pc.tenant_id
+		      AND project_id = pc.project_id
+		      AND name       = pc.section_path
+		    ORDER BY id ASC
+		    LIMIT 1
+		) s ON TRUE
+		LEFT JOIN construction_expense_lines el
+		    ON el.stage_id = s.id AND el.project_id = pc.project_id
+		LEFT JOIN construction_cost_categories cat
+		    ON cat.id = el.cost_category_id
+		GROUP BY s.id, pc.section_path, pc.planned, s.stage_order, cat.id, cat.name, cat.code
+		ORDER BY pc.section_path ASC, cat.name ASC
 	`, stageArgs...)
 	if err != nil {
 		h.log.Error("Failed to query stage budget", "error", err)
@@ -286,16 +363,53 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		`, projectID, tenantID).Scan(&totalActual)
 	}
 
+	// Total planned — sum the per-parent-work computed cost across every
+	// parent work in the project's Единич estimates (scoped to building
+	// when filtered). Mirrors the per-stage formula above so that
+	// `total_planned == SUM(rows.planned_budget)` modulo rounding.
 	var totalPlanned float64
 	if buildingID > 0 {
 		_ = h.db.QueryRow(`
-			SELECT COALESCE(SUM(planned_budget), 0)
-			FROM construction_stages
-			WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3
+			SELECT COALESCE(SUM(
+				CASE WHEN EXISTS (
+					SELECT 1 FROM construction_estimate_line ch
+					WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+				) THEN COALESCE((
+					SELECT SUM(ch.total_amount)
+					FROM construction_estimate_line ch
+					WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+				), 0)
+				ELSE COALESCE(p.total_amount, 0)
+				END
+			), 0)
+			FROM construction_estimate_line p
+			JOIN construction_estimate e ON e.id = p.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND e.building_id = $3
+			  AND COALESCE(p.resource_type, '') = ''
+			  AND p.parent_line_id IS NULL
 		`, projectID, tenantID, buildingID).Scan(&totalPlanned)
 	} else {
 		_ = h.db.QueryRow(`
-			SELECT COALESCE(SUM(planned_budget), 0) FROM construction_stages WHERE project_id = $1 AND tenant_id = $2
+			SELECT COALESCE(SUM(
+				CASE WHEN EXISTS (
+					SELECT 1 FROM construction_estimate_line ch
+					WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+				) THEN COALESCE((
+					SELECT SUM(ch.total_amount)
+					FROM construction_estimate_line ch
+					WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+				), 0)
+				ELSE COALESCE(p.total_amount, 0)
+				END
+			), 0)
+			FROM construction_estimate_line p
+			JOIN construction_estimate e ON e.id = p.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND COALESCE(p.resource_type, '') = ''
+			  AND p.parent_line_id IS NULL
 		`, projectID, tenantID).Scan(&totalPlanned)
 	}
 

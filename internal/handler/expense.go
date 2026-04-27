@@ -14,7 +14,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// ListExpenseCategories returns all expense categories
+// ListExpenseCategories returns all expense categories. The query LEFT
+// JOINs accounts so the response surfaces the GL account code+name each
+// category posts to, and counts referencing expenses so the frontend can
+// disable delete on rows that are still in use.
 func (h *Handler) ListExpenseCategories(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -23,10 +26,14 @@ func (h *Handler) ListExpenseCategories(c *gin.Context) {
 	}
 
 	query := `
-		SELECT id, tenant_id, code, name, description, parent_id, is_active, created_at
-		FROM expense_categories
-		WHERE tenant_id = $1
-		ORDER BY name
+		SELECT ec.id, ec.tenant_id, ec.code, ec.name, ec.description, ec.parent_id,
+		       ec.account_id, ec.is_active, ec.created_at,
+		       a.code, a.name,
+		       COALESCE((SELECT COUNT(*) FROM expenses e WHERE e.category_id = ec.id), 0) AS usage_count
+		FROM expense_categories ec
+		LEFT JOIN accounts a ON a.id = ec.account_id
+		WHERE ec.tenant_id = $1
+		ORDER BY ec.name
 	`
 
 	rows, err := h.db.Query(query, tenantID)
@@ -42,9 +49,15 @@ func (h *Handler) ListExpenseCategories(c *gin.Context) {
 		var cat entity.ExpenseCategory
 		var description sql.NullString
 		var parentID sql.NullString
+		var accountID sql.NullString
+		var accountCode sql.NullString
+		var accountName sql.NullString
+		var usageCount int
 
 		if err := rows.Scan(
-			&cat.ID, &cat.TenantID, &cat.Code, &cat.Name, &description, &parentID, &cat.IsActive, &cat.CreatedAt,
+			&cat.ID, &cat.TenantID, &cat.Code, &cat.Name, &description, &parentID,
+			&accountID, &cat.IsActive, &cat.CreatedAt,
+			&accountCode, &accountName, &usageCount,
 		); err != nil {
 			h.log.Error("Failed to scan expense category", "error", err)
 			continue
@@ -58,11 +71,374 @@ func (h *Handler) ListExpenseCategories(c *gin.Context) {
 				cat.ParentID = &id
 			}
 		}
+		if accountID.Valid {
+			if id, err := uuid.Parse(accountID.String); err == nil {
+				cat.AccountID = &id
+			}
+		}
 
-		categories = append(categories, cat.ToResponse())
+		resp := cat.ToResponse()
+		if accountCode.Valid {
+			resp.AccountCode = accountCode.String
+		}
+		if accountName.Valid {
+			resp.AccountName = accountName.String
+		}
+		resp.UsageCount = usageCount
+
+		categories = append(categories, resp)
 	}
 
 	response.Success(c, categories)
+}
+
+// expenseCategoryRequest is the create/update payload. Code is optional —
+// when omitted we slugify the name so the existing UNIQUE(tenant_id, code)
+// constraint keeps holding without forcing the user to invent one.
+type expenseCategoryRequest struct {
+	Name        string  `json:"name" binding:"required"`
+	Code        string  `json:"code"`
+	Description *string `json:"description"`
+	AccountID   *string `json:"account_id"`
+	IsActive    *bool   `json:"is_active"`
+}
+
+// slugifyCategoryCode turns "Travel & Lodging" → "TRAVEL_LODGING" so the
+// auto-generated code stays stable, uppercase, and unique-looking.
+func slugifyCategoryCode(name string) string {
+	if name == "" {
+		return ""
+	}
+	out := make([]byte, 0, len(name))
+	prevSep := false
+	for i := 0; i < len(name); i++ {
+		ch := name[i]
+		switch {
+		case (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'):
+			if ch >= 'a' && ch <= 'z' {
+				ch -= 32
+			}
+			out = append(out, ch)
+			prevSep = false
+		default:
+			if !prevSep && len(out) > 0 {
+				out = append(out, '_')
+				prevSep = true
+			}
+		}
+	}
+	for len(out) > 0 && out[len(out)-1] == '_' {
+		out = out[:len(out)-1]
+	}
+	if len(out) == 0 {
+		return "CAT"
+	}
+	return string(out)
+}
+
+// nextExpenseNumber returns the next sequential expense number for a
+// tenant in the form `EXP-{year}-{seq:04d}` (e.g. EXP-2026-0001). The
+// previous implementation used `time.Now().UnixNano() % 10000`, which
+// produced random-looking codes (EXP-2026-5000, EXP-2026-0, …) that
+// confused the user when scanning the list. We now derive the next
+// sequence by parsing the trailing integer from the highest-numbered
+// row already in the table for this tenant + year and adding 1.
+//
+// The query uses regex extraction so legacy rows whose suffix is wider
+// or narrower than 4 digits (created by the old generator) still parse
+// cleanly; rows that don't match the pattern at all are ignored.
+//
+// Concurrency: a UNIQUE(tenant_id, expense_number) constraint already
+// guards the table, so worst-case two simultaneous inserts both pick
+// the same number and one of them gets a 23505 conflict — the user
+// retries and lands on the next slot. For low-concurrency ERP traffic
+// this is acceptable; we don't introduce an advisory lock.
+func (h *Handler) nextExpenseNumber(tenantID uuid.UUID, year int) (string, error) {
+	prefix := fmt.Sprintf("EXP-%d-", year)
+	var maxSeq sql.NullInt64
+	err := h.db.QueryRow(`
+		SELECT MAX(CAST(substring(expense_number FROM '\d+$') AS INTEGER))
+		FROM expenses
+		WHERE tenant_id = $1
+		  AND expense_number LIKE $2 || '%'
+		  AND expense_number ~ ('^' || $2 || '\d+$')
+	`, tenantID, prefix).Scan(&maxSeq)
+	if err != nil {
+		return "", err
+	}
+	next := int64(1)
+	if maxSeq.Valid {
+		next = maxSeq.Int64 + 1
+	}
+	return fmt.Sprintf("EXP-%d-%04d", year, next), nil
+}
+
+// CreateExpenseCategory inserts a new category for the active tenant.
+// The chart-of-account FK is optional — categories without one still work,
+// but expense GL posting falls back to the global "operating expense"
+// lookup. Code defaults to a slug of the name when not supplied.
+func (h *Handler) CreateExpenseCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var req expenseCategoryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		response.BadRequest(c, "Name is required")
+		return
+	}
+
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		code = slugifyCategoryCode(name)
+	}
+
+	var accountID *uuid.UUID
+	if req.AccountID != nil && *req.AccountID != "" {
+		id, err := uuid.Parse(*req.AccountID)
+		if err != nil {
+			response.BadRequest(c, "Invalid account_id")
+			return
+		}
+		// Verify the account belongs to this tenant — prevents cross-tenant
+		// account-id stuffing through the API.
+		var ok bool
+		if err := h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND tenant_id = $2)`,
+			id, tenantID,
+		).Scan(&ok); err != nil || !ok {
+			response.BadRequest(c, "Account not found in this tenant")
+			return
+		}
+		accountID = &id
+	}
+
+	isActive := true
+	if req.IsActive != nil {
+		isActive = *req.IsActive
+	}
+
+	var description sql.NullString
+	if req.Description != nil && strings.TrimSpace(*req.Description) != "" {
+		description = sql.NullString{String: strings.TrimSpace(*req.Description), Valid: true}
+	}
+
+	newID := uuid.New()
+	_, err := h.db.Exec(`
+		INSERT INTO expense_categories (id, tenant_id, code, name, description, account_id, is_active, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+	`, newID, tenantID, code, name, description, accountID, isActive)
+	if err != nil {
+		// Surface the unique-violation as a 400 so the UI can highlight
+		// the offending field; everything else is an internal error.
+		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+			response.BadRequest(c, "Category code already exists")
+			return
+		}
+		h.log.Error("Failed to create expense category", "error", err)
+		response.InternalError(c, "Failed to create expense category")
+		return
+	}
+
+	h.respondCategoryByID(c, tenantID, newID)
+}
+
+// UpdateExpenseCategory edits a category. Only the fields explicitly
+// present in the JSON body are touched so the UI can do partial updates
+// (e.g. "just change the account") without overwriting every column.
+func (h *Handler) UpdateExpenseCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid id")
+		return
+	}
+
+	var req expenseCategoryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		response.BadRequest(c, "Name is required")
+		return
+	}
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		code = slugifyCategoryCode(name)
+	}
+
+	var accountID *uuid.UUID
+	if req.AccountID != nil && *req.AccountID != "" {
+		aid, err := uuid.Parse(*req.AccountID)
+		if err != nil {
+			response.BadRequest(c, "Invalid account_id")
+			return
+		}
+		var exists bool
+		if err := h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND tenant_id = $2)`,
+			aid, tenantID,
+		).Scan(&exists); err != nil || !exists {
+			response.BadRequest(c, "Account not found in this tenant")
+			return
+		}
+		accountID = &aid
+	}
+
+	var description sql.NullString
+	if req.Description != nil {
+		trimmed := strings.TrimSpace(*req.Description)
+		if trimmed != "" {
+			description = sql.NullString{String: trimmed, Valid: true}
+		}
+	}
+
+	isActive := true
+	if req.IsActive != nil {
+		isActive = *req.IsActive
+	}
+
+	res, err := h.db.Exec(`
+		UPDATE expense_categories
+		   SET name = $1, code = $2, description = $3, account_id = $4, is_active = $5, updated_at = NOW()
+		 WHERE id = $6 AND tenant_id = $7
+	`, name, code, description, accountID, isActive, id, tenantID)
+	if err != nil {
+		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
+			response.BadRequest(c, "Category code already exists")
+			return
+		}
+		h.log.Error("Failed to update expense category", "error", err)
+		response.InternalError(c, "Failed to update expense category")
+		return
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		response.NotFound(c, "Category not found")
+		return
+	}
+
+	h.respondCategoryByID(c, tenantID, id)
+}
+
+// DeleteExpenseCategory removes a category, but only when no expense rows
+// reference it. Soft-delete-by-deactivation is exposed via the regular
+// update endpoint (is_active = false) for users who'd rather archive.
+func (h *Handler) DeleteExpenseCategory(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid id")
+		return
+	}
+
+	var usage int
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM expenses WHERE category_id = $1 AND tenant_id = $2`,
+		id, tenantID,
+	).Scan(&usage); err != nil {
+		h.log.Error("Failed to check category usage", "error", err)
+		response.InternalError(c, "Failed to check category usage")
+		return
+	}
+	if usage > 0 {
+		response.BadRequest(c, fmt.Sprintf("Category is used by %d expense(s); reassign them before deleting", usage))
+		return
+	}
+
+	res, err := h.db.Exec(
+		`DELETE FROM expense_categories WHERE id = $1 AND tenant_id = $2`,
+		id, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to delete expense category", "error", err)
+		response.InternalError(c, "Failed to delete expense category")
+		return
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		response.NotFound(c, "Category not found")
+		return
+	}
+
+	response.Success(c, gin.H{"deleted": true})
+}
+
+// respondCategoryByID re-reads a single row through the same JOIN as the
+// list endpoint so create/update return the fully-populated record (with
+// account_code, account_name, usage_count) instead of forcing the UI to
+// refetch the whole list.
+func (h *Handler) respondCategoryByID(c *gin.Context, tenantID, id uuid.UUID) {
+	row := h.db.QueryRow(`
+		SELECT ec.id, ec.tenant_id, ec.code, ec.name, ec.description, ec.parent_id,
+		       ec.account_id, ec.is_active, ec.created_at,
+		       a.code, a.name,
+		       COALESCE((SELECT COUNT(*) FROM expenses e WHERE e.category_id = ec.id), 0) AS usage_count
+		FROM expense_categories ec
+		LEFT JOIN accounts a ON a.id = ec.account_id
+		WHERE ec.id = $1 AND ec.tenant_id = $2
+	`, id, tenantID)
+
+	var cat entity.ExpenseCategory
+	var description sql.NullString
+	var parentID sql.NullString
+	var accountID sql.NullString
+	var accountCode sql.NullString
+	var accountName sql.NullString
+	var usageCount int
+
+	if err := row.Scan(
+		&cat.ID, &cat.TenantID, &cat.Code, &cat.Name, &description, &parentID,
+		&accountID, &cat.IsActive, &cat.CreatedAt,
+		&accountCode, &accountName, &usageCount,
+	); err != nil {
+		h.log.Error("Failed to read back expense category", "error", err)
+		response.InternalError(c, "Failed to read back expense category")
+		return
+	}
+	if description.Valid {
+		cat.Description = &description.String
+	}
+	if parentID.Valid {
+		if pid, err := uuid.Parse(parentID.String); err == nil {
+			cat.ParentID = &pid
+		}
+	}
+	if accountID.Valid {
+		if aid, err := uuid.Parse(accountID.String); err == nil {
+			cat.AccountID = &aid
+		}
+	}
+
+	resp := cat.ToResponse()
+	if accountCode.Valid {
+		resp.AccountCode = accountCode.String
+	}
+	if accountName.Valid {
+		resp.AccountName = accountName.String
+	}
+	resp.UsageCount = usageCount
+
+	response.Success(c, resp)
 }
 
 // ListExpenses returns a paginated list of expenses
@@ -257,7 +633,12 @@ func (h *Handler) CreateExpense(c *gin.Context) {
 		return
 	}
 
-	expenseNumber := fmt.Sprintf("EXP-%d-%d", time.Now().Year(), time.Now().UnixNano()%10000)
+	expenseNumber, err := h.nextExpenseNumber(tenantID, time.Now().Year())
+	if err != nil {
+		h.log.Error("Failed to allocate expense number", "error", err)
+		response.InternalError(c, "Failed to allocate expense number")
+		return
+	}
 
 	expenseDate, err := time.Parse("2006-01-02", input.ExpenseDate)
 	if err != nil {

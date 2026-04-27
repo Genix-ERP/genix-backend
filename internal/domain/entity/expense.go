@@ -183,14 +183,21 @@ func (e *Expense) ToResponse() *ExpenseResponse {
 	return resp
 }
 
-// ExpenseCategoryResponse represents the API response for an expense category
+// ExpenseCategoryResponse represents the API response for an expense category.
+// AccountID + AccountCode + AccountName surface the chart-of-account that
+// expenses in this category are posted against, so the frontend can render
+// "Travel → 9410 — Operating Expense" without a second roundtrip.
 type ExpenseCategoryResponse struct {
 	ID          uuid.UUID `json:"id"`
 	Code        string    `json:"code"`
 	Name        string    `json:"name"`
 	Description string    `json:"description,omitempty"`
 	ParentID    string    `json:"parent_id,omitempty"`
+	AccountID   string    `json:"account_id,omitempty"`
+	AccountCode string    `json:"account_code,omitempty"`
+	AccountName string    `json:"account_name,omitempty"`
 	IsActive    bool      `json:"is_active"`
+	UsageCount  int       `json:"usage_count"`
 }
 
 // ToResponse converts ExpenseCategory to ExpenseCategoryResponse
@@ -206,6 +213,9 @@ func (c *ExpenseCategory) ToResponse() *ExpenseCategoryResponse {
 	}
 	if c.ParentID != nil {
 		resp.ParentID = c.ParentID.String()
+	}
+	if c.AccountID != nil {
+		resp.AccountID = c.AccountID.String()
 	}
 	return resp
 }

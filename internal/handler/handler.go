@@ -1684,10 +1684,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		myPortal.GET("/loan", h.GetMyLoan)
 	}
 
-	// Expense Categories
+	// Expense Categories — list is open to anyone with read on expenses
+	// (foremen need it for the submit-claim dropdown). Mutations are
+	// gated to the same write permission as the rest of the expense
+	// admin surface.
 	expenseCategories := rg.Group("/expense-categories")
 	{
 		expenseCategories.GET("", h.ListExpenseCategories)
+		expenseCategories.POST("", h.perm.Require("finance", "expense", "write"), h.CreateExpenseCategory)
+		expenseCategories.PUT("/:id", h.perm.Require("finance", "expense", "write"), h.UpdateExpenseCategory)
+		expenseCategories.DELETE("/:id", h.perm.Require("finance", "expense", "write"), h.DeleteExpenseCategory)
 	}
 
 	// Expenses
@@ -1927,6 +1933,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 		// Estimate Resources (grouped by type for substage dropdowns)
 		constructionProjects.GET("/:id/estimate-resources", h.ListProjectEstimateResources)
+		// Create a new project resource (lands in the project's catalog
+		// estimate). Used by the AddResourcePickerModal "+" button.
+		constructionProjects.POST("/:id/resources", h.CreateProjectResource)
 
 		// Resource prices — Smeta boshqaruvi → Resurslar tab. Bulk-edits
 		// resource unit prices across every matching estimate line in the
