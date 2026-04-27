@@ -1189,8 +1189,30 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		}
 	}
 
+	// TEMPLATE MODE — when this bulk insert is driven by a known
+	// imported source (vor / edinich / resurs), every line lands with
+	// quantity = 0. The user fills the parent's Bajarildi field after
+	// the smeta is in the system, and the per-row cascade
+	//   child.quantity = parent.quantity × child.norm_rate
+	// derives child quantities from there. Hardcoding this server-side
+	// guarantees the rule even if a stale frontend (or a curl client)
+	// pushes the file's pre-computed totals — the user explicitly asked
+	// that imports never carry the Excel file's own "по проектным
+	// данным" number into REJA HAJMI / REJA SARF.
+	importTemplateMode := false
+	switch strings.ToLower(strings.TrimSpace(req.SourceType)) {
+	case "vor", "edinich", "resurs":
+		importTemplateMode = true
+	}
+
 	count := 0
 	for i, line := range req.Lines {
+		// In template mode, force the ledger column to 0 — the file's
+		// pre-baked total is intentionally discarded. norm_rate is left
+		// alone so the per-unit norm survives the round-trip.
+		if importTemplateMode {
+			line.Quantity = 0
+		}
 		unitRate := line.MaterialRate + line.LaborRate + line.EquipmentRate
 		totalAmount := unitRate * line.Quantity
 		uom := line.UOM
