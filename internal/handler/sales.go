@@ -827,6 +827,11 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 	}
 
 	// Get order lines with product name, unit name and packaging info
+	// alt_name: when this line's product has a search_key, look up the
+	// matching product in any *other* organisation in the same tenant
+	// (typically the buyer's company in an intercompany flow). The
+	// frontend prints both names so each side sees the product label
+	// they recognise.
 	linesQuery := `
 		SELECT sol.id, sol.line_number, sol.product_id, sol.description, sol.quantity, sol.unit_id, sol.unit_price,
 			   sol.discount_type, sol.discount_value, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total,
@@ -834,7 +839,17 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			   sol.packaging_id, sol.packaging_qty,
 			   COALESCE(p.name, '') as product_name,
 			   COALESCE(pp.name, '') as packaging_name, COALESCE(pp.qty, 0) as packaging_unit_qty,
-			   COALESCE(u.name, '') as unit_name
+			   COALESCE(u.name, '') as unit_name,
+			   COALESCE((
+			       SELECT p2.name FROM products p2
+			       WHERE p2.tenant_id = p.tenant_id
+			         AND p2.deleted_at IS NULL
+			         AND p2.id <> p.id
+			         AND p.search_key IS NOT NULL AND p.search_key <> ''
+			         AND upper(p2.search_key) = upper(p.search_key)
+			       ORDER BY p2.created_at ASC
+			       LIMIT 1
+			   ), '') as alt_name
 		FROM sales_order_lines sol
 		LEFT JOIN products p ON p.id = sol.product_id
 		LEFT JOIN product_packagings pp ON pp.id = sol.packaging_id
@@ -856,6 +871,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			var productName, packagingName string
 			var packagingUnitQty float64
 			var unitName string
+			var altName string
 
 			err := linesRows.Scan(
 				&lineID, &lineNumber, &productID, &description, &quantity, &unitID, &unitPrice,
@@ -863,7 +879,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 				&qtyDelivered, &qtyInvoiced, &lineWarehouseID, &lineNotes,
 				&packagingID, &packagingQty,
 				&productName, &packagingName, &packagingUnitQty,
-				&unitName,
+				&unitName, &altName,
 			)
 			if err != nil {
 				continue
@@ -874,6 +890,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 				"line_number":        lineNumber,
 				"product_id":         productID.String(),
 				"product_name":       productName,
+				"alt_name":           altName,
 				"quantity":           quantity,
 				"unit_price":         unitPrice,
 				"discount_value":     lineDiscountValue,
