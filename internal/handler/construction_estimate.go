@@ -1189,19 +1189,18 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		}
 	}
 
-	// TEMPLATE MODE — when this bulk insert is driven by a known
-	// imported source (vor / edinich / resurs), every line lands with
-	// quantity = 0. The user fills the parent's Bajarildi field after
-	// the smeta is in the system, and the per-row cascade
+	// TEMPLATE MODE — applies to the structural sheets (edinich /
+	// resurs) where the user wants every line to land at quantity = 0
+	// and fill BAJARILDI manually. ВОР is the canonical source of the
+	// planned project Miqdor — stripping its quantities would make the
+	// Bosqichlar tab's REJA column 0 across the board, since REJA is
+	// matched by work name to the ВОР row's quantity. Per-row cascade
 	//   child.quantity = parent.quantity × child.norm_rate
-	// derives child quantities from there. Hardcoding this server-side
-	// guarantees the rule even if a stale frontend (or a curl client)
-	// pushes the file's pre-computed totals — the user explicitly asked
-	// that imports never carry the Excel file's own "по проектным
-	// данным" number into REJA HAJMI / REJA SARF.
+	// runs only on the единич side, so its quantities can safely
+	// start at 0.
 	importTemplateMode := false
 	switch strings.ToLower(strings.TrimSpace(req.SourceType)) {
-	case "vor", "edinich", "resurs":
+	case "edinich", "resurs":
 		importTemplateMode = true
 	}
 
@@ -1714,6 +1713,31 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 			`, *req.Quantity, lineID); cascadeErr != nil {
 				h.log.Error("Failed to cascade quantity to children",
 					"error", cascadeErr, "parent_line_id", lineID)
+			}
+			// Mirror ISH HAJMI → BAJARILDI for the parent so the
+			// Bosqichlar tab's done_quantity column matches the new
+			// plan. Counterpart of the mirror in UpdateWorkDoneQuantity
+			// — the two screens are now bound to a single logical
+			// "work amount" in template-mode workflows. approval_status
+			// also follows: 0 → pending, >0 → in_progress (mirrors the
+			// foreman-side rule so the status badge stays consistent).
+			newStatus := "pending"
+			if *req.Quantity > 0 {
+				newStatus = "in_progress"
+			}
+			if _, mirrorErr := h.db.Exec(`
+				UPDATE construction_estimate_line
+				SET done_quantity   = $1,
+				    approval_status = CASE
+				        WHEN COALESCE(approval_status, 'pending') IN ('pending', 'in_progress')
+				          THEN $2
+				        ELSE approval_status
+				    END,
+				    updated_date = NOW()
+				WHERE id = $3 AND tenant_id = $4
+			`, *req.Quantity, newStatus, lineID, tenantID); mirrorErr != nil {
+				h.log.Error("Failed to mirror plan quantity to done_quantity",
+					"error", mirrorErr, "line_id", lineID)
 			}
 		}
 	}
