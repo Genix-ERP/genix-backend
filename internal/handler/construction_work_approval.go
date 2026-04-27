@@ -220,13 +220,14 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 		return
 	}
 
-	// Clamp 0 ≤ done ≤ plan.
+	// Clamp ≥ 0. The previous "done ≤ plan" ceiling was dropped because
+	// template-mode imports leave plan=0 and the user's authoritative
+	// number IS the BAJARILDI value — capping at plan would freeze the
+	// foreman at 0. The Smeta boshqaruvi ISH HAJMI mirror below keeps
+	// the two screens in sync regardless of which one was edited last.
 	done := body.DoneQuantity
 	if done < 0 {
 		done = 0
-	}
-	if done > ctx.PlanQty && ctx.PlanQty > 0 {
-		done = ctx.PlanQty
 	}
 
 	newStatus := "pending"
@@ -246,12 +247,41 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 		return
 	}
 
+	// Mirror BAJARILDI → ISH HAJMI for parent works so the Smeta
+	// boshqaruvi tab and the Bosqichlar tab show the same number for
+	// the same work. Then cascade the new plan to non-override
+	// sub-lines (sub.quantity = parent.quantity × norm_rate) — same
+	// math as UpdateEstimateLine. We only mirror on top-level rows
+	// (parent_line_id IS NULL) to avoid stomping on a sub-line's own
+	// quantity, which is computed from its parent's plan.
+	if _, err := h.db.Exec(`
+		UPDATE construction_estimate_line
+		SET quantity     = $1,
+		    total_amount = $1 * COALESCE(unit_rate, 0),
+		    updated_date = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND parent_line_id IS NULL
+	`, done, lineID, tenantID); err != nil {
+		h.log.Error("Failed to mirror done_quantity to plan quantity",
+			"error", err, "line_id", lineID)
+	}
+	if _, err := h.db.Exec(`
+		UPDATE construction_estimate_line c
+		SET quantity     = $1 * COALESCE(c.norm_rate, 0),
+		    total_amount = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
+		    updated_date = NOW()
+		WHERE c.parent_line_id = $2
+		  AND COALESCE(c.quantity_override, FALSE) = FALSE
+	`, done, lineID); err != nil {
+		h.log.Error("Failed to cascade plan quantity to children",
+			"error", err, "parent_line_id", lineID)
+	}
+
 	h.logSmetaAudit(tenantID, ctx.ProjectID, &ctx.EstimateID, "qty_change", ctx.Name, &lineID,
 		strconv.FormatFloat(ctx.DoneQty, 'f', -1, 64),
 		strconv.FormatFloat(done, 'f', -1, 64),
 		"Bajarilgan hajm yangilandi", userID, userName)
 
-	response.Success(c, gin.H{"done_quantity": done, "approval_status": newStatus})
+	response.Success(c, gin.H{"done_quantity": done, "approval_status": newStatus, "quantity": done})
 }
 
 // SubmitWork — POST /construction/works/:id/submit
