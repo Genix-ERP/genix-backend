@@ -772,6 +772,167 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 	response.Success(c, resources)
 }
 
+// CreateProjectResource — POST /construction/projects/:id/resources
+//
+// Lets the user define a brand-new resource (labour entry, machine,
+// or material) from inside the AddResourcePickerModal when the smeta
+// import didn't include it. The new resource lands in a sentinel
+// "catalog" estimate per project (created lazily) so the existing
+// ListProjectEstimateResources aggregation picks it up everywhere —
+// the modal's resource list refreshes and the resource becomes pickable
+// for any work / sub-stage afterwards.
+//
+// For resource_type='material' we also auto-create an inventory product
+// (mirrors the autoCreateProductsFromEstimateLines path used at import)
+// so the warehouse reservation flow has a real product to bind to.
+//
+// Body: { name, uom, resource_type ('labor' | 'equipment' | 'material'),
+//         unit_price?, material_type? }
+func (h *Handler) CreateProjectResource(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	orgID, _ := middleware.GetOrganizationID(c)
+	userID, _ := middleware.GetUserID(c)
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var req struct {
+		Name         string  `json:"name" binding:"required"`
+		UOM          string  `json:"uom"`
+		ResourceType string  `json:"resource_type" binding:"required"`
+		UnitPrice    float64 `json:"unit_price"`
+		MaterialType string  `json:"material_type"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+
+	req.Name = strings.TrimSpace(req.Name)
+	req.UOM = strings.TrimSpace(req.UOM)
+	rType := strings.ToLower(strings.TrimSpace(req.ResourceType))
+	switch rType {
+	case "labor", "equipment", "material":
+		// ok
+	default:
+		response.BadRequest(c, "resource_type must be one of: labor, equipment, material")
+		return
+	}
+	if req.Name == "" {
+		response.BadRequest(c, "name is required")
+		return
+	}
+	if req.UnitPrice < 0 {
+		response.BadRequest(c, "unit_price must be >= 0")
+		return
+	}
+
+	// Material sub-bucket — only meaningful for material rows. Default to
+	// 'standard'; the modal can pass 'cable' / 'equipment' explicitly later.
+	matType := strings.ToLower(strings.TrimSpace(req.MaterialType))
+	switch matType {
+	case "standard", "equipment", "cable", "metal", "import":
+		// ok
+	default:
+		matType = "standard"
+	}
+
+	// Resolve / lazily create the project's catalog estimate (source_type
+	// 'catalog'). Only one per (tenant, project). Block-selector and
+	// estimates list filter this out — see SmetaManagementTab.
+	var catalogID int64
+	if err := h.db.QueryRow(`
+		SELECT id FROM construction_estimate
+		WHERE tenant_id = $1 AND project_id = $2 AND LOWER(COALESCE(source_type, '')) = 'catalog'
+		ORDER BY id ASC LIMIT 1
+	`, tenantID, projectID).Scan(&catalogID); err != nil {
+		// Not found — create it.
+		err = h.db.QueryRow(`
+			INSERT INTO construction_estimate (
+				tenant_id, project_id, name, state, source_type,
+				overhead_pct, profit_pct, vat_pct,
+				created_by, created_date, updated_date
+			) VALUES (
+				$1, $2, '__catalog__', 'draft', 'catalog',
+				0, 0, 0,
+				$3, NOW(), NOW()
+			)
+			RETURNING id
+		`, tenantID, projectID, uuidArg(userID)).Scan(&catalogID)
+		if err != nil {
+			h.log.Error("Failed to create catalog estimate", "error", err)
+			response.InternalError(c, "Failed to create resource")
+			return
+		}
+	}
+
+	// Insert a standalone line into the catalog estimate. quantity = 0 so
+	// it doesn't pollute Form 2 totals. parent_line_id stays NULL.
+	matRate, labRate, eqRate := 0.0, 0.0, 0.0
+	switch rType {
+	case "labor":
+		labRate = req.UnitPrice
+	case "equipment":
+		eqRate = req.UnitPrice
+	case "material":
+		matRate = req.UnitPrice
+	}
+
+	var lineID int64
+	err = h.db.QueryRow(`
+		INSERT INTO construction_estimate_line (
+			tenant_id, estimate_id, name, uom, quantity,
+			material_rate, labor_rate, equipment_rate,
+			unit_rate, total_amount, resource_type, material_type,
+			parent_item_number, sort_order, created_date, updated_date
+		) VALUES (
+			$1, $2, $3, $4, 0,
+			$5, $6, $7,
+			$8, 0, $9, $10,
+			'__catalog__', 0, NOW(), NOW()
+		)
+		RETURNING id
+	`, tenantID, catalogID, req.Name, req.UOM,
+		matRate, labRate, eqRate,
+		req.UnitPrice, rType, matType).Scan(&lineID)
+	if err != nil {
+		h.log.Error("Failed to insert catalog resource", "error", err, "name", req.Name)
+		response.InternalError(c, "Failed to create resource")
+		return
+	}
+
+	// For material resources, also create a matching product in inventory
+	// so the warehouse reservation flow has something to bind to. Reuses
+	// the same helper that handles bulk imports from Ресурс estimates.
+	if rType == "material" {
+		h.autoCreateProductsFromEstimateLines(tenantID, orgID, userID,
+			[]entity.CreateEstimateLineInput{{
+				Name:         req.Name,
+				UOM:          req.UOM,
+				MaterialRate: matRate,
+				LaborRate:    labRate,
+				EquipmentRate: eqRate,
+				ResourceType: rType,
+			}})
+	}
+
+	response.Created(c, map[string]interface{}{
+		"id":            lineID,
+		"name":          req.Name,
+		"uom":           req.UOM,
+		"resource_type": rType,
+		"material_type": matType,
+		"unit_rate":     req.UnitPrice,
+	})
+}
+
 // CreateEstimateLine creates a new line in an estimate
 func (h *Handler) CreateEstimateLine(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -975,9 +1136,11 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		return
 	}
 
-	// Check state
+	// Check state + grab project_id (needed for the post-import price
+	// propagation step that copies Ресурс prices into Единич sub-lines).
 	var state string
-	err = h.db.QueryRow(`SELECT state FROM construction_estimate WHERE id = $1 AND tenant_id = $2`, estimateID, tenantID).Scan(&state)
+	var importProjectID int64
+	err = h.db.QueryRow(`SELECT state, project_id FROM construction_estimate WHERE id = $1 AND tenant_id = $2`, estimateID, tenantID).Scan(&state, &importProjectID)
 	if err != nil {
 		response.NotFound(c, "Estimate not found")
 		return
@@ -1139,6 +1302,19 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		// be missing until the user re-imports or links manually.
 		h.log.Error("Failed to resolve parent_line_id post-import",
 			"error", linkErr, "estimate_id", estimateID)
+	}
+
+	// Propagate prices from the project's Ресурс estimate(s) into any
+	// 0-priced sub-lines in the project. The Единич parser doesn't
+	// extract per-resource prices (the Единич sheet has only norm + qty
+	// columns), so without this step every sub-resource on the Smeta
+	// boshqaruvi tab shows NARX = 0. Runs project-wide so it handles
+	// both directions:
+	//   • non-resurs just imported → fill from existing resurs prices
+	//   • resurs just imported     → push prices into already-imported
+	//                                Единич / ВОР sub-lines
+	if importProjectID > 0 {
+		h.propagateResursPricesForProject(tenantID, importProjectID)
 	}
 
 	// Recalculate estimate totals
@@ -1480,6 +1656,44 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 	`, lineID)
 	if err != nil {
 		h.log.Error("Failed to recalculate line totals", "error", err)
+	}
+
+	// Cascade quantity changes to non-override children.
+	//
+	// When the user edits ISH HAJMI on a parent work in the Smeta
+	// boshqaruvi → Ishlar tab, every child sub-line whose
+	// quantity_override = FALSE should recompute
+	//     child.quantity     = new_parent_qty × child.norm_rate
+	//     child.total_amount = child.quantity × child.unit_rate
+	// so the JAMI / SUMMA columns and the rollup row at the bottom of
+	// the expanded card pick up the new values. Without this the parent
+	// updates but children stay at the template-mode 0 from import,
+	// which is exactly the "why is SUMMA still 0" report.
+	//
+	// The same logic already runs on the Reset button (see
+	// ResetLineQuantity below) — this just makes it run on regular
+	// edits too. We only fire when the request actually changed
+	// quantity, and only when the row is a parent (parent_line_id IS
+	// NULL) — children's qty edits don't cascade further.
+	if req.Quantity != nil {
+		var isParent bool
+		_ = h.db.QueryRow(`
+			SELECT parent_line_id IS NULL FROM construction_estimate_line
+			WHERE id = $1 AND tenant_id = $2
+		`, lineID, tenantID).Scan(&isParent)
+		if isParent {
+			if _, cascadeErr := h.db.Exec(`
+				UPDATE construction_estimate_line c
+				SET quantity     = $1 * COALESCE(c.norm_rate, 0),
+				    total_amount = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
+				    updated_date = NOW()
+				WHERE c.parent_line_id = $2
+				  AND COALESCE(c.quantity_override, FALSE) = FALSE
+			`, *req.Quantity, lineID); cascadeErr != nil {
+				h.log.Error("Failed to cascade quantity to children",
+					"error", cascadeErr, "parent_line_id", lineID)
+			}
+		}
 	}
 
 	// Recalculate estimate totals
@@ -2598,3 +2812,67 @@ func (h *Handler) autoCreateProductsFromEstimateLines(tenantID, orgID, userID uu
 	return created
 }
 
+// ─── Cross-estimate price propagation ────────────────────────────────────────
+//
+// propagateResursPricesForProject copies unit_rate (+ the labor / equipment /
+// material rate splits and total_amount) from the project's Ресурс estimate(s)
+// into any 0-priced sub-lines in any other estimate in the same project.
+//
+// Why this exists: the Единич sheet has only norm and quantity columns —
+// no per-resource price. So when the Единич parser emits sub-line resources
+// they all carry unit_rate=0. The Ресурс estimate is where prices live, and
+// users typically import all three (ВОР / Единич / Ресурс) for a building.
+// Without this step, the Smeta boshqaruvi tab shows NARX = 0 and
+// SUMMA = 0 for every sub-resource even though the Ресурс estimate has the
+// number right next door.
+//
+// Idempotency:
+//   • only touches rows where unit_rate is currently 0, so manual edits
+//     made from the Resurslar tab aren't overwritten.
+//   • only touches sub-lines (parent_line_id IS NOT NULL), never the
+//     top-level work rows or the Ресурс lines themselves.
+//
+// Match key: case-insensitive name + uom. When several Ресурс estimates
+// have the same resource, the most-recently-created one wins (DISTINCT ON
+// + ORDER BY created_date DESC).
+func (h *Handler) propagateResursPricesForProject(tenantID uuid.UUID, projectID int64) {
+	if _, err := h.db.Exec(`
+		WITH price_src AS (
+		    SELECT DISTINCT ON (LOWER(srcLine.name), COALESCE(srcLine.uom, ''))
+		        LOWER(srcLine.name)         AS name_key,
+		        COALESCE(srcLine.uom, '')   AS uom_key,
+		        srcLine.unit_rate           AS unit_rate,
+		        srcLine.material_rate       AS material_rate,
+		        srcLine.labor_rate          AS labor_rate,
+		        srcLine.equipment_rate      AS equipment_rate
+		    FROM construction_estimate_line srcLine
+		    JOIN construction_estimate src ON src.id = srcLine.estimate_id
+		    WHERE src.tenant_id  = $1
+		      AND src.project_id = $2
+		      AND LOWER(COALESCE(src.source_type, '')) = 'resurs'
+		      AND COALESCE(srcLine.unit_rate, 0) > 0
+		    ORDER BY LOWER(srcLine.name),
+		             COALESCE(srcLine.uom, ''),
+		             srcLine.created_date DESC
+		)
+		UPDATE construction_estimate_line tgt
+		SET unit_rate      = ps.unit_rate,
+		    material_rate  = ps.material_rate,
+		    labor_rate     = ps.labor_rate,
+		    equipment_rate = ps.equipment_rate,
+		    total_amount   = ps.unit_rate * COALESCE(tgt.quantity, 0),
+		    updated_date   = NOW()
+		FROM price_src ps, construction_estimate tgt_e
+		WHERE tgt_e.id              = tgt.estimate_id
+		  AND tgt.tenant_id         = $1
+		  AND tgt_e.project_id      = $2
+		  AND LOWER(COALESCE(tgt_e.source_type, '')) <> 'resurs'
+		  AND tgt.parent_line_id IS NOT NULL
+		  AND COALESCE(tgt.unit_rate, 0) = 0
+		  AND LOWER(tgt.name)       = ps.name_key
+		  AND COALESCE(tgt.uom, '') = ps.uom_key
+	`, tenantID, projectID); err != nil {
+		h.log.Error("Failed to propagate Ресурс prices",
+			"error", err, "project_id", projectID)
+	}
+}
