@@ -85,6 +85,7 @@ type PurchaseOrderLine struct {
 	// Computed
 	ProductName string `json:"product_name,omitempty"`
 	UnitName    string `json:"unit_name,omitempty"`
+	AltName     string `json:"alt_name,omitempty"` // counterparty's product name (cross-org search_key match)
 
 	// Relationships
 	Packaging *ProductPackaging `json:"packaging,omitempty"`

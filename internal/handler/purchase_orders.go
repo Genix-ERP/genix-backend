@@ -637,7 +637,9 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 		po.VehicleNumber = &vehicleNumber.String
 	}
 
-	// Get line items
+	// Get line items. alt_name pulls the counterparty's product name (the
+	// product in another organisation that shares this product's
+	// search_key), so the print template can show both names.
 	linesQuery := `
 		SELECT pol.id, pol.purchase_order_id, pol.line_number, pol.product_id,
 			   pol.description, pol.quantity, pol.unit_id, pol.unit_price,
@@ -646,6 +648,16 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			   pol.packaging_id, pol.packaging_qty,
 			   COALESCE(p.name, '') as product_name, COALESCE(u.name, '') as unit_name,
 			   COALESCE(pkg.name, '') as packaging_name, COALESCE(pkg.qty, 0) as packaging_unit_qty,
+			   COALESCE((
+			       SELECT p2.name FROM products p2
+			       WHERE p2.tenant_id = p.tenant_id
+			         AND p2.deleted_at IS NULL
+			         AND p2.id <> p.id
+			         AND p.search_key IS NOT NULL AND p.search_key <> ''
+			         AND upper(p2.search_key) = upper(p.search_key)
+			       ORDER BY p2.created_at ASC
+			       LIMIT 1
+			   ), '') as alt_name,
 			   pol.created_at, pol.updated_at
 		FROM purchase_order_lines pol
 		LEFT JOIN products p ON pol.product_id = p.id
@@ -680,6 +692,7 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			&packagingID, &packagingQty,
 			&line.ProductName, &line.UnitName,
 			&packagingName, &packagingUnitQty,
+			&line.AltName,
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
