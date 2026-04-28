@@ -552,15 +552,318 @@ func (h *Handler) GetEmployeeTaxReport(c *gin.Context) {
 		out = append(out, row)
 	}
 
+	// Subtract recorded payments to get the "pending" balance per tax.
+	// A payment is recorded via POST /employee-taxes/payments and creates
+	// a journal entry that debits the liability account; this query is
+	// the report-side complement that shows users how much of each tax
+	// is still owed for the same period window.
+	paidByCode := map[string]float64{}
+	{
+		paidWhere := "tenant_id = $1 AND deleted_at IS NULL"
+		paidArgs := []interface{}{tenantID}
+		paidIdx := 2
+		if hasDates {
+			paidWhere += fmt.Sprintf(" AND period_start <= $%d AND period_end >= $%d",
+				paidIdx, paidIdx+1)
+			paidArgs = append(paidArgs, endDate, startDate)
+		}
+		paidRows, perr := h.db.Query(`
+			SELECT tax_code, COALESCE(SUM(amount), 0)
+			FROM employee_tax_payments
+			WHERE `+paidWhere+`
+			GROUP BY tax_code
+		`, paidArgs...)
+		if perr != nil {
+			h.log.Error("Failed to aggregate employee_tax_payments", "error", perr)
+		} else {
+			defer paidRows.Close()
+			for paidRows.Next() {
+				var code string
+				var amt float64
+				if scanErr := paidRows.Scan(&code, &amt); scanErr == nil {
+					paidByCode[code] = amt
+				}
+			}
+		}
+	}
+
+	totalPaid := 0.0
+	totalPending := 0.0
+	enriched := make([]map[string]interface{}, 0, len(out))
+	for _, r := range out {
+		paid := paidByCode[r.TaxCode]
+		pending := r.TotalAmount - paid
+		if pending < 0 {
+			pending = 0
+		}
+		totalPaid += paid
+		totalPending += pending
+		enriched = append(enriched, map[string]interface{}{
+			"tax_code":     r.TaxCode,
+			"tax_name":     r.TaxName,
+			"payer":        r.Payer,
+			"entry_count":  r.EntryCount,
+			"total_base":   r.TotalBase,
+			"total_amount": r.TotalAmount,
+			"paid_amount":  paid,
+			"pending":      pending,
+		})
+	}
+
 	response.Success(c, gin.H{
-		"rows":           out,
+		"rows":           enriched,
 		"total_employee": totalEmployee,
 		"total_employer": totalEmployer,
 		"total":          totalEmployee + totalEmployer,
+		"total_paid":     totalPaid,
+		"total_pending":  totalPending,
 		"period": gin.H{
 			"start_date": startDate,
 			"end_date":   endDate,
 		},
+	})
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tax payment recording — POST /employee-taxes/payments (migration 360)
+//
+// Closes a tax-liability balance for a (tax, period) pair. Side-effects:
+//   1. Inserts an employee_tax_payments row with the amount + reference
+//   2. Creates a journal entry: Dr (tax liability account) Cr (cash/bank)
+//   3. Updates the running pending balance the report query subtracts
+//      (no separate state needed — the report just sums payments live).
+// ─────────────────────────────────────────────────────────────────────
+
+type recordEmployeeTaxPaymentInput struct {
+	TaxCode        string  `json:"tax_code" binding:"required"`
+	PeriodStart    string  `json:"period_start" binding:"required"` // YYYY-MM-DD
+	PeriodEnd      string  `json:"period_end" binding:"required"`
+	Amount         float64 `json:"amount" binding:"required,gt=0"`
+	PaymentMethod  string  `json:"payment_method"`
+	BankAccountID  string  `json:"bank_account_id"` // optional: Cr account override
+	Note           string  `json:"note"`
+}
+
+// RecordEmployeeTaxPayment POST /employee-taxes/payments
+func (h *Handler) RecordEmployeeTaxPayment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	var orgIDPtr *uuid.UUID
+	if oid, oOk := middleware.GetOrganizationID(c); oOk && oid != uuid.Nil {
+		v := oid
+		orgIDPtr = &v
+	}
+
+	var in recordEmployeeTaxPaymentInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+	periodStart, err := time.Parse("2006-01-02", in.PeriodStart)
+	if err != nil {
+		response.BadRequest(c, "Invalid period_start")
+		return
+	}
+	periodEnd, err := time.Parse("2006-01-02", in.PeriodEnd)
+	if err != nil {
+		response.BadRequest(c, "Invalid period_end")
+		return
+	}
+
+	// Look up the tax catalog row to grab the canonical name + the GL
+	// liability account to debit. If the operator deactivated / renamed
+	// the tax we still have payroll_entry_taxes snapshots to fall back
+	// on for the display name + account.
+	var taxID sql.NullString
+	var taxName string
+	var payer string
+	var liabilityAcctID sql.NullString
+	err = h.db.QueryRow(`
+		SELECT id::text, name, payer, COALESCE(account_id::text, '')
+		FROM employee_taxes
+		WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL
+		ORDER BY (organization_id IS NULL) ASC
+		LIMIT 1
+	`, tenantID, in.TaxCode).Scan(&taxID, &taxName, &payer, &liabilityAcctID)
+	if err == sql.ErrNoRows {
+		// Fall back: derive from the most recent snapshot.
+		err = h.db.QueryRow(`
+			SELECT MAX(tax_name_snapshot), MAX(payer_snapshot),
+			       COALESCE(MAX(account_id_snapshot::text), '')
+			FROM payroll_entry_taxes
+			WHERE tenant_id = $1 AND tax_code_snapshot = $2
+		`, tenantID, in.TaxCode).Scan(&taxName, &payer, &liabilityAcctID)
+	}
+	if err != nil {
+		h.log.Error("Failed to resolve tax for payment", "error", err, "code", in.TaxCode)
+		response.BadRequest(c, "Unknown tax code")
+		return
+	}
+	if !liabilityAcctID.Valid || liabilityAcctID.String == "" {
+		response.BadRequest(c,
+			"Tax has no liability GL account configured — open Settings → Employee taxes")
+		return
+	}
+	liabilityUUID, _ := uuid.Parse(liabilityAcctID.String)
+
+	// Pick the credit-side account (cash/bank). Caller can override
+	// with bank_account_id; otherwise pick the first cash/bank account
+	// for this tenant.
+	var creditAcctID uuid.UUID
+	if in.BankAccountID != "" {
+		if id, perr := uuid.Parse(in.BankAccountID); perr == nil {
+			creditAcctID = id
+		}
+	}
+	if creditAcctID == uuid.Nil {
+		// Pick the first bank/cash account in the chart. Uzbek 21-сон
+		// БҲМС standard codes: 5110 = расчётный счёт (bank), 5010 =
+		// касса (cash). Sort puts the bank account first when both
+		// exist, falls back to anything flagged is_bank_account.
+		var idStr string
+		_ = h.db.QueryRow(`
+			SELECT id::text FROM accounts
+			WHERE tenant_id = $1
+			  AND deleted_at IS NULL
+			  AND (is_bank_account = true OR code IN ('5010', '5110'))
+			ORDER BY (code = '5110') DESC,
+			         (is_bank_account = true) DESC,
+			         code ASC
+			LIMIT 1
+		`, tenantID).Scan(&idStr)
+		if idStr != "" {
+			creditAcctID, _ = uuid.Parse(idStr)
+		}
+	}
+	if creditAcctID == uuid.Nil {
+		response.BadRequest(c,
+			"No cash / bank GL account found — create one or pass bank_account_id")
+		return
+	}
+
+	// Resolve the destination journal — prefer the dedicated payroll
+	// journal, fall back to the GENERAL / MISC journal if the tenant
+	// hasn't configured a payroll-specific one yet. Same lookup pattern
+	// payroll.go uses for the period-level entry.
+	var journalID uuid.UUID
+	h.db.QueryRow(`
+		SELECT id FROM journals
+		WHERE tenant_id = $1 AND COALESCE(is_payroll_journal, false) = true
+		  AND COALESCE(is_active, true) = true AND deleted_at IS NULL
+		LIMIT 1
+	`, tenantID).Scan(&journalID)
+	if journalID == uuid.Nil {
+		h.db.QueryRow(`
+			SELECT id FROM journals
+			WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END
+			LIMIT 1
+		`, tenantID).Scan(&journalID)
+	}
+	if journalID == uuid.Nil {
+		response.BadRequest(c,
+			"No journal found — create a PAYROLL or GENERAL journal in Accounting → Journals")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Allocate journal entry id + number first so we can FK the payment row.
+	jeID := uuid.New()
+	now := time.Now()
+	entryNumber := fmt.Sprintf("PAY-TAX-%s-%d", in.TaxCode, now.Unix())
+	desc := fmt.Sprintf("%s ushlash to'lovi (%s — %s)",
+		taxName, in.PeriodStart, in.PeriodEnd)
+	_, err = tx.Exec(`
+		INSERT INTO journal_entries (
+		    id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+		    description, source_type, source_id, exchange_rate,
+		    total_debit, total_credit, status, created_by,
+		    created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'employee_tax_payment', $1, 1.0,
+		          $8, $8, 'posted', $9, $10, $10)
+	`, jeID, tenantID, orgIDPtr, journalID, entryNumber, now, desc, in.Amount, userID, now)
+	if err != nil {
+		h.log.Error("Failed to insert tax-payment journal entry", "error", err)
+		response.InternalError(c, "Failed to create journal entry")
+		return
+	}
+
+	// Dr liability (clear the credit balance), Cr cash/bank. The columns
+	// match the schema in migration 002 (debit_amount/credit_amount,
+	// line_number — no tenant_id on line rows).
+	_, err = tx.Exec(`
+		INSERT INTO journal_entry_lines
+		    (id, journal_entry_id, line_number, account_id, description,
+		     debit_amount, credit_amount, exchange_rate, created_at)
+		VALUES (gen_random_uuid(), $1, 1, $2, $3, $4, 0, 1.0, $5)
+	`, jeID, liabilityUUID, desc, in.Amount, now)
+	if err != nil {
+		h.log.Error("Failed to insert debit line", "error", err)
+		response.InternalError(c, "Failed to insert journal line")
+		return
+	}
+	_, err = tx.Exec(`
+		INSERT INTO journal_entry_lines
+		    (id, journal_entry_id, line_number, account_id, description,
+		     debit_amount, credit_amount, exchange_rate, created_at)
+		VALUES (gen_random_uuid(), $1, 2, $2, $3, 0, $4, 1.0, $5)
+	`, jeID, creditAcctID, desc, in.Amount, now)
+	if err != nil {
+		h.log.Error("Failed to insert credit line", "error", err)
+		response.InternalError(c, "Failed to insert journal line")
+		return
+	}
+
+	// Record the payment row.
+	var taxIDPtr *uuid.UUID
+	if taxID.Valid && taxID.String != "" {
+		if v, perr := uuid.Parse(taxID.String); perr == nil {
+			taxIDPtr = &v
+		}
+	}
+	paymentID := uuid.New()
+	_, err = tx.Exec(`
+		INSERT INTO employee_tax_payments (
+		    id, tenant_id, organization_id, tax_id,
+		    tax_code, tax_name, payer,
+		    period_start, period_end, amount,
+		    journal_entry_id, paid_at, paid_by,
+		    payment_method, note,
+		    created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULLIF($14, ''), NULLIF($15, ''), $16, $16)
+	`, paymentID, tenantID, orgIDPtr, taxIDPtr,
+		in.TaxCode, taxName, payer,
+		periodStart, periodEnd, in.Amount,
+		jeID, now, userID,
+		in.PaymentMethod, in.Note,
+		now)
+	if err != nil {
+		h.log.Error("Failed to insert tax payment", "error", err)
+		response.InternalError(c, "Failed to record payment")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"id":               paymentID,
+		"tax_code":         in.TaxCode,
+		"amount":           in.Amount,
+		"journal_entry_id": jeID,
 	})
 }
 

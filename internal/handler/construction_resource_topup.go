@@ -162,7 +162,12 @@ func (h *Handler) CreateResourceTopup(c *gin.Context) {
 	if topup.Note != "" {
 		desc += " (" + topup.Note + ")"
 	}
-	h.logSmetaAudit(tenantID, projectID, &estimateID, "topup_add", "topup",
+	// `target` is the human-facing object the action ran against — for
+	// top-ups that's the resource line, not the literal word "topup".
+	// The audit log table renders this column as the row's primary label
+	// so a generic "topup" was misleading once the user had several
+	// top-ups in flight against different resources.
+	h.logSmetaAudit(tenantID, projectID, &estimateID, "topup_add", lineName,
 		&lineID, "", toVal, desc, userID, userName)
 
 	response.Success(c, topup)
@@ -242,7 +247,9 @@ func (h *Handler) DeleteResourceTopup(c *gin.Context) {
 	fromVal := strconv.FormatFloat(extraQuantity, 'f', -1, 64) + " × " +
 		strconv.FormatFloat(newPrice, 'f', -1, 64)
 	desc := lineName + " uchun qo'shimcha buyurtma o'chirildi: " + fromVal
-	h.logSmetaAudit(tenantID, projectID, &estimateID, "topup_del", "topup",
+	// Same reasoning as topup_add — log the resource line name in
+	// `target` so the audit row reads "<resource>" instead of "topup".
+	h.logSmetaAudit(tenantID, projectID, &estimateID, "topup_del", lineName,
 		&lineID, fromVal, "", desc, userID, userName)
 
 	response.Success(c, gin.H{"deleted": topupID})

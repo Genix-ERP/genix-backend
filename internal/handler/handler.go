@@ -1636,6 +1636,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employeeTaxes.PUT("/:id", h.UpdateEmployeeTax)
 		employeeTaxes.DELETE("/:id", h.DeleteEmployeeTax)
 		employeeTaxes.POST("/preview", h.PreviewPayrollTaxes)
+		// Record a payment against a tax-period liability (migration 360).
+		// Posts a Dr-liability / Cr-cash journal entry and inserts a
+		// row in employee_tax_payments so the Tax Reports → Employee
+		// Taxes tab can subtract it from the accrued total to display
+		// the running pending balance.
+		employeeTaxes.POST("/payments", h.RecordEmployeeTaxPayment)
 	}
 
 	// ────────────── Company Tax Rates (migration 340) ──────────────

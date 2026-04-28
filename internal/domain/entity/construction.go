@@ -112,6 +112,9 @@ type ConstructionProject struct {
 	ChiefEngineerName  string `json:"chief_engineer_name,omitempty" db:"chief_engineer_name"`
 	SectionsCount      int    `json:"sections_count,omitempty" db:"sections_count"`
 	TotalSmeta         float64 `json:"total_smeta,omitempty" db:"total_smeta"`
+	// FilesCount drives the badge on the "Fayllar" button on each
+	// project card. Computed via a subquery against project_files.
+	FilesCount int `json:"files_count" db:"files_count"`
 }
 
 // MarshalJSON custom marshaler for ConstructionProject to handle sql.Null* types
@@ -154,6 +157,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		ChiefEngineerName  string    `json:"chief_engineer_name,omitempty"`
 		SectionsCount      int       `json:"sections_count,omitempty"`
 		TotalSmeta         float64   `json:"total_smeta,omitempty"`
+		FilesCount         int       `json:"files_count"`
 	}{
 		Description:        nullStringValue(p.Description),
 		Address:            nullStringValue(p.Address),
@@ -191,6 +195,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		ChiefEngineerName:  p.ChiefEngineerName,
 		SectionsCount:      p.SectionsCount,
 		TotalSmeta:         p.TotalSmeta,
+		FilesCount:         p.FilesCount,
 	})
 }
 

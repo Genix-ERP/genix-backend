@@ -71,7 +71,8 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
-		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta
+		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta,
+		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id), 0) as files_count
 		FROM construction_projects cp
 		LEFT JOIN employees pm ON pm.id = cp.project_manager_id
 		LEFT JOIN employees ce ON ce.id = cp.chief_engineer_id
@@ -148,7 +149,7 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 			&p.ProjectManagerID, &p.ChiefEngineerID,
 			&p.CreatedBy, &p.CreatedDate, &p.UpdatedDate,
 			&p.ProjectManagerName, &p.ChiefEngineerName,
-			&p.SectionsCount, &p.TotalSmeta,
+			&p.SectionsCount, &p.TotalSmeta, &p.FilesCount,
 		); err != nil {
 			h.log.Error("Failed to scan construction project", "error", err)
 			continue
@@ -202,7 +203,8 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
-		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta
+		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta,
+		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id), 0) as files_count
 		FROM construction_projects cp
 		LEFT JOIN employees pm ON pm.id = cp.project_manager_id
 		LEFT JOIN employees ce ON ce.id = cp.chief_engineer_id
@@ -222,7 +224,7 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		&p.ProjectManagerID, &p.ChiefEngineerID,
 		&p.CreatedBy, &p.CreatedDate, &p.UpdatedDate,
 		&p.ProjectManagerName, &p.ChiefEngineerName,
-		&p.SectionsCount, &p.TotalSmeta,
+		&p.SectionsCount, &p.TotalSmeta, &p.FilesCount,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Project not found")

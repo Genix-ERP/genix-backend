@@ -148,6 +148,17 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 	}
 	userID, _ := middleware.GetUserID(c)
 
+	// Active company scope. The frontend sets X-Organization-ID via
+	// the global apiClient interceptor; we honour it here so multi-
+	// company tenants don't smush every employee into one period.
+	// When absent (admin contexts, single-company setups), we fall
+	// back to the legacy tenant-wide path with organization_id NULL.
+	var orgIDPtr *uuid.UUID
+	if oid, oOk := middleware.GetOrganizationID(c); oOk && oid != uuid.Nil {
+		v := oid
+		orgIDPtr = &v
+	}
+
 	monthStr := c.Query("month")
 	if monthStr == "" {
 		monthStr = time.Now().Format("2006-01")
@@ -160,13 +171,25 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 	monthEnd := monthStart.AddDate(0, 1, -1)
 	periodCode := monthStr // YYYY-MM
 
-	// Try to find an existing period by code or date range
+	// Existing-period lookup: scoped to the active org. NULL-org rows
+	// belong to the legacy tenant-wide pool and only match when no
+	// active org is set.
 	var periodID uuid.UUID
-	err = h.db.QueryRow(`
-		SELECT id FROM payroll_periods
-		WHERE tenant_id = $1 AND period_code = $2 AND deleted_at IS NULL
-		LIMIT 1
-	`, tenantID, periodCode).Scan(&periodID)
+	if orgIDPtr != nil {
+		err = h.db.QueryRow(`
+			SELECT id FROM payroll_periods
+			WHERE tenant_id = $1 AND organization_id = $2
+			  AND period_code = $3 AND deleted_at IS NULL
+			LIMIT 1
+		`, tenantID, *orgIDPtr, periodCode).Scan(&periodID)
+	} else {
+		err = h.db.QueryRow(`
+			SELECT id FROM payroll_periods
+			WHERE tenant_id = $1 AND organization_id IS NULL
+			  AND period_code = $2 AND deleted_at IS NULL
+			LIMIT 1
+		`, tenantID, periodCode).Scan(&periodID)
+	}
 
 	if err == nil {
 		h.respondPayrollPeriodWithEntries(c, tenantID, periodID, false)
@@ -179,13 +202,32 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 	}
 
 	// Ensure there are employees first (TT §2.3: "Agar xodimlar bo'lmasa —
-	// avval xodim qo'shish haqida xabar beradi.")
+	// avval xodim qo'shish haqida xabar beradi."). Active employees
+	// belong to the org via either employees.organization_id (the
+	// primary org) or the employee_organizations junction (extra
+	// assignments). Filter once, here, so the count and the actual
+	// SELECT below agree on which rows are eligible.
+	empBaseFilter := `tenant_id = $1
+		  AND deleted_at IS NULL
+		  AND (status IS NULL OR status IN ('active', 'working'))`
+	empArgs := []interface{}{tenantID}
+	if orgIDPtr != nil {
+		empBaseFilter += `
+		  AND (organization_id = $2
+		       OR id IN (
+		           SELECT employee_id FROM employee_organizations
+		           WHERE tenant_id = $1 AND organization_id = $2
+		       ))`
+		empArgs = append(empArgs, *orgIDPtr)
+	}
 	var empCount int
-	h.db.QueryRow(`
-		SELECT COUNT(*) FROM employees
-		WHERE tenant_id = $1 AND (deleted_at IS NULL OR deleted_at IS NULL)
-		  AND (status IS NULL OR status IN ('active', 'working'))
-	`, tenantID).Scan(&empCount)
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM employees WHERE `+empBaseFilter,
+		empArgs...,
+	).Scan(&empCount); err != nil {
+		h.log.Error("GetOrCreateCurrentMonthPayroll: count failed", "error", err)
+		empCount = 0
+	}
 	if empCount == 0 {
 		response.BadRequest(c, "Avval xodimlarni qo'shing — qaydnoma yaratish mumkin emas")
 		return
@@ -209,34 +251,38 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 	periodName := monthStart.Format("January 2006")
 	_, err = tx.Exec(`
 		INSERT INTO payroll_periods (
-			id, tenant_id, period_code, period_name, start_date, end_date, pay_date,
+			id, tenant_id, organization_id, period_code, period_name,
+			start_date, end_date, pay_date,
 			status, total_gross, total_deductions, total_net, employee_count,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $6, 'draft', 0, 0, 0, 0, $7, $8, $8)
-	`, periodID, tenantID, periodCode, periodName, monthStart, monthEnd, userID, now)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, 'draft', 0, 0, 0, 0, $8, $9, $9)
+	`, periodID, tenantID, orgIDPtr, periodCode, periodName,
+		monthStart, monthEnd, userID, now)
 	if err != nil {
 		h.log.Error("Auto-create payroll period failed", "error", err)
 		response.InternalError(c, "Failed to create period")
 		return
 	}
 
-	// Collect all employees first, then insert — pq doesn't allow executing
-	// new statements on a tx while rows are still open on the same connection
-	// (surfaces as "unexpected Parse response 'D'").
+	// Collect all eligible employees first, then insert — pq doesn't
+	// allow executing new statements on a tx while rows are still
+	// open on the same connection (surfaces as "unexpected Parse
+	// response 'D'"). Same status + org filter as the count above so
+	// the two queries can never disagree on eligibility.
 	type empRow struct {
 		id       uuid.UUID
 		fullName string
 		position string
 		salary   float64
 	}
-	rows, err := tx.Query(`
+	selectQuery := `
 		SELECT id,
 		       COALESCE(first_name, '') || ' ' || COALESCE(last_name, '') AS full_name,
 		       COALESCE(job_title, ''),
 		       COALESCE(base_salary, 0)
 		FROM employees
-		WHERE tenant_id = $1 AND (deleted_at IS NULL)
-	`, tenantID)
+		WHERE ` + empBaseFilter
+	rows, err := tx.Query(selectQuery, empArgs...)
 	if err != nil {
 		response.InternalError(c, "Failed to load employees")
 		return
@@ -259,19 +305,19 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 
 		_, err := tx.Exec(`
 			INSERT INTO payroll_entries (
-				id, tenant_id, payroll_period_id, employee_id, employee_name,
+				id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name,
 				position_snapshot,
 				base_salary, gross_salary, net_salary,
 				advance_amount, remainder_amount, advance_percent_used,
 				advance_paid, remainder_paid,
 				payment_method, status, created_at, updated_at
 			) VALUES (
-				gen_random_uuid(), $1, $2, $3, $4,
-				$5, $6, $6, $6, $7, $8, $9,
+				gen_random_uuid(), $1, $2, $3, $4, $5,
+				$6, $7, $7, $7, $8, $9, $10,
 				false, false,
-				'bank_transfer', 'pending', $10, $10
+				'bank_transfer', 'pending', $11, $11
 			)
-		`, tenantID, periodID, e.id, e.fullName, e.position, e.salary,
+		`, tenantID, orgIDPtr, periodID, e.id, e.fullName, e.position, e.salary,
 			advance, remainder, settings.AdvancePercent, now)
 		if err != nil {
 			h.log.Error("Auto-create entry failed", "error", err, "employee", e.id)

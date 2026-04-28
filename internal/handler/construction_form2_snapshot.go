@@ -45,6 +45,11 @@ type Form2Snapshot struct {
 	CreatedBy         *uuid.UUID      `json:"created_by"`
 	CreatedByName     string          `json:"created_by_name"`
 	CreatedAt         time.Time       `json:"created_at"`
+	// BuildingName is joined in from construction_buildings via the
+	// estimate so the History list can show which block (Blok A/B/…)
+	// the snapshot belongs to. Empty string when the estimate has no
+	// building (project-wide / "Butun loyiha").
+	BuildingName string `json:"building_name"`
 }
 
 // CreateForm2SnapshotInput is the request body for POST .../snapshots.
@@ -84,9 +89,12 @@ func (h *Handler) ListForm2Snapshots(c *gin.Context) {
 		       s.construction_total, s.equipment_total,
 		       COALESCE(s.act_number, ''),
 		       s.created_by, s.created_at,
-		       COALESCE(u.first_name || ' ' || u.last_name, '') AS created_name
+		       COALESCE(u.first_name || ' ' || u.last_name, '') AS created_name,
+		       COALESCE(b.name, '') AS building_name
 		FROM construction_form2_snapshot s
 		LEFT JOIN users u ON u.id = s.created_by
+		LEFT JOIN construction_estimate e ON e.id = s.estimate_id
+		LEFT JOIN construction_buildings b ON b.id = e.building_id
 		WHERE s.estimate_id = $1 AND s.tenant_id = $2
 		ORDER BY s.created_at DESC
 	`, estimateID, tenantID)
@@ -109,6 +117,7 @@ func (h *Handler) ListForm2Snapshots(c *gin.Context) {
 			&s.ActNumber,
 			&s.CreatedBy, &s.CreatedAt,
 			&s.CreatedByName,
+			&s.BuildingName,
 		); err != nil {
 			h.log.Error("Failed to scan form2 snapshot row", "error", err)
 			continue
@@ -148,9 +157,12 @@ func (h *Handler) GetForm2Snapshot(c *gin.Context) {
 		       COALESCE(s.act_number, ''),
 		       COALESCE(s.snapshot_data::text, '{}'),
 		       s.created_by, s.created_at,
-		       COALESCE(u.first_name || ' ' || u.last_name, '') AS created_name
+		       COALESCE(u.first_name || ' ' || u.last_name, '') AS created_name,
+		       COALESCE(b.name, '') AS building_name
 		FROM construction_form2_snapshot s
 		LEFT JOIN users u ON u.id = s.created_by
+		LEFT JOIN construction_estimate e ON e.id = s.estimate_id
+		LEFT JOIN construction_buildings b ON b.id = e.building_id
 		WHERE s.id = $1 AND s.tenant_id = $2
 	`, snapshotID, tenantID).Scan(
 		&s.ID, &s.TenantID, &s.ProjectID, &s.EstimateID,
@@ -162,6 +174,7 @@ func (h *Handler) GetForm2Snapshot(c *gin.Context) {
 		&dataStr,
 		&s.CreatedBy, &s.CreatedAt,
 		&s.CreatedByName,
+		&s.BuildingName,
 	)
 	if err != nil {
 		response.NotFound(c, "Snapshot not found")
