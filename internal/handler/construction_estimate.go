@@ -670,6 +670,47 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		lines = append(lines, line)
 	}
 
+	// Load top-ups (migration 358) for every line in this estimate in a
+	// single query and attach them to their parent line. We do this on
+	// the HTTP path (not just the internal helper) because the
+	// SmetaManagementTab consumes this endpoint directly and renders
+	// indented top-up rows under each resource — without this, a newly
+	// created top-up wouldn't show until a hard reload.
+	topupRows, terr := h.db.Query(`
+		SELECT t.id, t.tenant_id, t.estimate_line_id,
+		       t.extra_quantity, t.new_price, t.ordered_at,
+		       COALESCE(t.note, ''), t.created_by, t.created_date
+		FROM construction_resource_topup t
+		JOIN construction_estimate_line l ON l.id = t.estimate_line_id
+		WHERE l.estimate_id = $1 AND t.tenant_id = $2
+		ORDER BY t.ordered_at ASC, t.id ASC
+	`, estimateID, tenantID)
+	if terr == nil {
+		defer topupRows.Close()
+		bucket := make(map[int64][]entity.ResourceTopup)
+		for topupRows.Next() {
+			var t entity.ResourceTopup
+			if scanErr := topupRows.Scan(
+				&t.ID, &t.TenantID, &t.EstimateLineID,
+				&t.ExtraQuantity, &t.NewPrice, &t.OrderedAt,
+				&t.Note, &t.CreatedBy, &t.CreatedDate,
+			); scanErr != nil {
+				h.log.Error("Failed to scan resource topup", "error", scanErr)
+				continue
+			}
+			bucket[t.EstimateLineID] = append(bucket[t.EstimateLineID], t)
+		}
+		for i := range lines {
+			if list, ok := bucket[lines[i].ID]; ok {
+				lines[i].Topups = list
+			}
+		}
+	} else {
+		// Don't fail the listing if the topup table doesn't exist yet
+		// (e.g. migration 358 not yet applied) — just log and proceed.
+		h.log.Error("Failed to load resource topups", "error", terr)
+	}
+
 	response.Paginated(c, lines, page, pageSize, total)
 }
 
@@ -2093,17 +2134,67 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		lines = append(lines, line)
 	}
 
+	// Load top-ups (migration 358) for every line in this estimate in a
+	// single query, then bucket them by line ID so we can attach without
+	// re-querying. Top-ups are rare on most lines, so the slice is nil
+	// unless the line actually has any.
+	topupQuery := `
+		SELECT t.id, t.tenant_id, t.estimate_line_id,
+		       t.extra_quantity, t.new_price, t.ordered_at,
+		       COALESCE(t.note, ''), t.created_by, t.created_date
+		FROM construction_resource_topup t
+		JOIN construction_estimate_line l ON l.id = t.estimate_line_id
+		WHERE l.estimate_id = $1 AND t.tenant_id = $2
+		ORDER BY t.ordered_at ASC, t.id ASC
+	`
+	topupRows, terr := h.db.Query(topupQuery, estimateID, tenantID)
+	if terr == nil {
+		defer topupRows.Close()
+		bucket := make(map[int64][]entity.ResourceTopup)
+		for topupRows.Next() {
+			var t entity.ResourceTopup
+			if scanErr := topupRows.Scan(
+				&t.ID, &t.TenantID, &t.EstimateLineID,
+				&t.ExtraQuantity, &t.NewPrice, &t.OrderedAt,
+				&t.Note, &t.CreatedBy, &t.CreatedDate,
+			); scanErr != nil {
+				h.log.Error("Failed to scan resource topup", "error", scanErr)
+				continue
+			}
+			bucket[t.EstimateLineID] = append(bucket[t.EstimateLineID], t)
+		}
+		for i := range lines {
+			if list, ok := bucket[lines[i].ID]; ok {
+				lines[i].Topups = list
+			}
+		}
+	} else {
+		// Don't fail the whole estimate fetch if the topup table
+		// doesn't exist yet — just log and proceed without topups.
+		h.log.Error("Failed to load resource topups", "error", terr)
+	}
+
 	return lines
 }
 
-// recalculateEstimateTotals updates the estimate header with recalculated totals
+// recalculateEstimateTotals updates the estimate header with recalculated totals.
+// amount_direct is the line-level direct cost PLUS any resource top-ups
+// (migration 358) attached to those lines — top-ups represent real
+// money spent above the original plan and must flow into overhead /
+// profit / VAT the same way regular line cost does.
 func (h *Handler) recalculateEstimateTotals(estimateID int64) {
-	// Sum direct costs from lines
+	// Sum direct costs from lines + topups in one round-trip.
 	var amountDirect float64
-	err := h.db.QueryRow(
-		`SELECT COALESCE(SUM(total_amount), 0) FROM construction_estimate_line WHERE estimate_id = $1`,
-		estimateID,
-	).Scan(&amountDirect)
+	err := h.db.QueryRow(`
+		SELECT
+		    COALESCE((SELECT SUM(total_amount)
+		              FROM construction_estimate_line
+		              WHERE estimate_id = $1), 0)
+		  + COALESCE((SELECT SUM(t.extra_quantity * t.new_price)
+		              FROM construction_resource_topup t
+		              JOIN construction_estimate_line l ON l.id = t.estimate_line_id
+		              WHERE l.estimate_id = $1), 0)
+	`, estimateID).Scan(&amountDirect)
 	if err != nil {
 		h.log.Error("Failed to sum estimate lines", "error", err)
 		return
