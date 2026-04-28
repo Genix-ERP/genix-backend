@@ -1079,6 +1079,18 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		// Quantity the user entered and do NOT re-derive from parent×norm.
 		// This covers the "10 hours of pump time independent of parent
 		// volume" case raised by the field team.
+		//
+		// Defensive carve-out: if the client SAID it's an override but
+		// also sent quantity ≤ 0, that's almost always a stale bundle
+		// from when the AddResourcePickerModal blindly stamped
+		// quantity_override = true regardless of the empty Total Qty
+		// field. Treat it as "no override" so the cascade kicks in and
+		// the new row picks up parent.quantity × norm_rate. Legitimate
+		// manual overrides always carry a non-zero quantity (a user
+		// typing an explicit "0" intends to delete the row, not pin it).
+		if req.QuantityOverride && req.Quantity <= 0 && req.NormRate > 0 {
+			req.QuantityOverride = false
+		}
 		if req.NormRate > 0 && !req.QuantityOverride {
 			req.Quantity = parentQuantity * req.NormRate
 		}
@@ -1744,13 +1756,26 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 			WHERE id = $1 AND tenant_id = $2
 		`, lineID, tenantID).Scan(&isParent)
 		if isParent {
+			// Cascade fires on every non-override child PLUS any
+			// "stale-override" child that was created with
+			// quantity_override = TRUE but quantity = 0 — a leftover
+			// from a client bundle that mis-stamped the flag. Healing
+			// those rows here (resetting their override and computing
+			// qty from parent × norm) means the user doesn't have to
+			// delete + re-add the resource after a backend update.
 			if _, cascadeErr := h.db.Exec(`
 				UPDATE construction_estimate_line c
-				SET quantity     = $1 * COALESCE(c.norm_rate, 0),
-				    total_amount = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
-				    updated_date = NOW()
+				SET quantity          = $1 * COALESCE(c.norm_rate, 0),
+				    total_amount      = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
+				    quantity_override = FALSE,
+				    updated_date      = NOW()
 				WHERE c.parent_line_id = $2
-				  AND COALESCE(c.quantity_override, FALSE) = FALSE
+				  AND (
+				    COALESCE(c.quantity_override, FALSE) = FALSE
+				    OR (COALESCE(c.quantity_override, FALSE) = TRUE
+				        AND COALESCE(c.quantity, 0) = 0
+				        AND COALESCE(c.norm_rate, 0) > 0)
+				  )
 			`, *req.Quantity, lineID); cascadeErr != nil {
 				h.log.Error("Failed to cascade quantity to children",
 					"error", cascadeErr, "parent_line_id", lineID)
@@ -2178,28 +2203,37 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 }
 
 // recalculateEstimateTotals updates the estimate header with recalculated totals.
-// Per-line effective cost rule:
-//   - If the line has at least one resource top-up (migration 358),
-//     its effective cost is Σ (extra_quantity × new_price). The
-//     planned total_amount is REPLACED — top-ups capture the real
-//     purchase at the price actually paid, so adding the planned
-//     cost back in would double-count the same physical material.
-//   - If the line has no top-ups, fall back to the stored total_amount.
+// Per-line effective cost rule (matches the SmetaManagementTab +
+// Form2Preview frontend):
+//   - If the line has top-ups (migration 358) AND their total
+//     extra_quantity COVERS the line's planned quantity
+//     (Σ extra_quantity ≥ l.quantity), the effective cost is
+//     Σ (extra_quantity × new_price) — the top-ups represent the
+//     full purchase at the prices actually paid, so the planned
+//     total_amount is replaced.
+//   - If the top-up qty is SMALLER than the planned qty, the
+//     top-ups are just a partial side-record. The planned
+//     total_amount stays in place; otherwise the resource would be
+//     understated.
+//   - With no top-ups at all, fall back to the stored total_amount.
 //
-// amount_direct is the sum of those per-line effective costs across
-// the whole estimate; overhead / profit / VAT then layer on top.
+// amount_direct = sum of effective per-line costs across the whole
+// estimate; overhead / profit / VAT then layer on top.
 func (h *Handler) recalculateEstimateTotals(estimateID int64) {
 	var amountDirect float64
 	err := h.db.QueryRow(`
 		SELECT COALESCE(SUM(
 		    CASE
-		        WHEN COALESCE(tp.tp_sum, 0) > 0 THEN tp.tp_sum
+		        WHEN COALESCE(tp.tp_qty, 0) >= COALESCE(l.quantity, 0)
+		         AND COALESCE(tp.tp_sum, 0) > 0
+		            THEN tp.tp_sum
 		        ELSE l.total_amount
 		    END
 		), 0)
 		FROM construction_estimate_line l
 		LEFT JOIN (
 		    SELECT estimate_line_id,
+		           SUM(extra_quantity)             AS tp_qty,
 		           SUM(extra_quantity * new_price) AS tp_sum
 		    FROM construction_resource_topup
 		    GROUP BY estimate_line_id
