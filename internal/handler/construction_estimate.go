@@ -2178,22 +2178,33 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 }
 
 // recalculateEstimateTotals updates the estimate header with recalculated totals.
-// amount_direct is the line-level direct cost PLUS any resource top-ups
-// (migration 358) attached to those lines — top-ups represent real
-// money spent above the original plan and must flow into overhead /
-// profit / VAT the same way regular line cost does.
+// Per-line effective cost rule:
+//   - If the line has at least one resource top-up (migration 358),
+//     its effective cost is Σ (extra_quantity × new_price). The
+//     planned total_amount is REPLACED — top-ups capture the real
+//     purchase at the price actually paid, so adding the planned
+//     cost back in would double-count the same physical material.
+//   - If the line has no top-ups, fall back to the stored total_amount.
+//
+// amount_direct is the sum of those per-line effective costs across
+// the whole estimate; overhead / profit / VAT then layer on top.
 func (h *Handler) recalculateEstimateTotals(estimateID int64) {
-	// Sum direct costs from lines + topups in one round-trip.
 	var amountDirect float64
 	err := h.db.QueryRow(`
-		SELECT
-		    COALESCE((SELECT SUM(total_amount)
-		              FROM construction_estimate_line
-		              WHERE estimate_id = $1), 0)
-		  + COALESCE((SELECT SUM(t.extra_quantity * t.new_price)
-		              FROM construction_resource_topup t
-		              JOIN construction_estimate_line l ON l.id = t.estimate_line_id
-		              WHERE l.estimate_id = $1), 0)
+		SELECT COALESCE(SUM(
+		    CASE
+		        WHEN COALESCE(tp.tp_sum, 0) > 0 THEN tp.tp_sum
+		        ELSE l.total_amount
+		    END
+		), 0)
+		FROM construction_estimate_line l
+		LEFT JOIN (
+		    SELECT estimate_line_id,
+		           SUM(extra_quantity * new_price) AS tp_sum
+		    FROM construction_resource_topup
+		    GROUP BY estimate_line_id
+		) tp ON tp.estimate_line_id = l.id
+		WHERE l.estimate_id = $1
 	`, estimateID).Scan(&amountDirect)
 	if err != nil {
 		h.log.Error("Failed to sum estimate lines", "error", err)
