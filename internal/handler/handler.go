@@ -2113,6 +2113,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		estimates.POST("/:id/reset-quantities",
 			h.perm.Require("construction", "estimate", "update"), h.ResetAllEstimateQuantities)
 
+		// Resource top-ups — when a foreman orders MORE of a material
+		// than the smeta planned (often at a different price). Each
+		// top-up is appended to construction_resource_topup; the
+		// estimate's amount_total recomputes to fold them in.
+		estimates.POST("/:id/lines/:line_id/topups",
+			h.perm.Require("construction", "estimate", "update"), h.CreateResourceTopup)
+		estimates.DELETE("/:id/lines/:line_id/topups/:topup_id",
+			h.perm.Require("construction", "estimate", "update"), h.DeleteResourceTopup)
+
 		// Forma 2 snapshots — Smeta boshqaruvi → Tarix tab.
 		estimates.GET("/:id/form2-snapshots", h.ListForm2Snapshots)
 		estimates.POST("/:id/form2-snapshots",

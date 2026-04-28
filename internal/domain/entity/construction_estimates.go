@@ -188,6 +188,11 @@ type ConstructionEstimateLine struct {
 	// Computed
 	WBSCode string `json:"wbs_code,omitempty" db:"wbs_code"`
 	WBSName string `json:"wbs_name,omitempty" db:"wbs_name"`
+
+	// Resource top-ups (migration 358) — additional purchases for this
+	// resource sub-line, populated by getEstimateLines via a secondary
+	// query. Empty for non-resource rows.
+	Topups []ResourceTopup `json:"topups,omitempty"`
 }
 
 func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
@@ -219,10 +224,11 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		ApprovalStatus   string      `json:"approval_status"`
 		DoneQuantity     float64     `json:"done_quantity"`
 		SortOrder        int         `json:"sort_order"`
-		CreatedDate   time.Time   `json:"created_date"`
-		UpdatedDate   time.Time   `json:"updated_date"`
-		WBSCode       string      `json:"wbs_code,omitempty"`
-		WBSName       string      `json:"wbs_name,omitempty"`
+		CreatedDate   time.Time       `json:"created_date"`
+		UpdatedDate   time.Time       `json:"updated_date"`
+		WBSCode       string          `json:"wbs_code,omitempty"`
+		WBSName       string          `json:"wbs_name,omitempty"`
+		Topups        []ResourceTopup `json:"topups,omitempty"`
 	}{
 		ID:            l.ID,
 		TenantID:      l.TenantID,
@@ -255,7 +261,61 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		UpdatedDate:   l.UpdatedDate,
 		WBSCode:       l.WBSCode,
 		WBSName:       l.WBSName,
+		Topups:        l.Topups,
 	})
+}
+
+// =====================================================
+// CONSTRUCTION RESOURCE TOPUP (migration 358)
+// =====================================================
+//
+// A top-up represents an additional purchase for an estimate resource
+// line — typically when the originally planned quantity ran short and
+// the supplier's price has since changed. The smeta plan stays
+// untouched (immutable for audit) and the line's effective total
+// becomes plan + Σ(topup.extra_quantity × topup.new_price).
+
+type ResourceTopup struct {
+	ID             int64         `json:"id" db:"id"`
+	TenantID       uuid.UUID     `json:"tenant_id" db:"tenant_id"`
+	EstimateLineID int64         `json:"estimate_line_id" db:"estimate_line_id"`
+	ExtraQuantity  float64       `json:"extra_quantity" db:"extra_quantity"`
+	NewPrice       float64       `json:"new_price" db:"new_price"`
+	OrderedAt      time.Time     `json:"ordered_at" db:"ordered_at"`
+	Note           string        `json:"note" db:"note"`
+	CreatedBy      uuid.NullUUID `json:"created_by" db:"created_by"`
+	CreatedDate    time.Time     `json:"created_date" db:"created_date"`
+}
+
+func (t ResourceTopup) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		ID             int64       `json:"id"`
+		TenantID       uuid.UUID   `json:"tenant_id"`
+		EstimateLineID int64       `json:"estimate_line_id"`
+		ExtraQuantity  float64     `json:"extra_quantity"`
+		NewPrice       float64     `json:"new_price"`
+		OrderedAt      string      `json:"ordered_at"`
+		Note           string      `json:"note"`
+		CreatedBy      interface{} `json:"created_by"`
+		CreatedDate    time.Time   `json:"created_date"`
+	}{
+		ID:             t.ID,
+		TenantID:       t.TenantID,
+		EstimateLineID: t.EstimateLineID,
+		ExtraQuantity:  t.ExtraQuantity,
+		NewPrice:       t.NewPrice,
+		OrderedAt:      t.OrderedAt.Format("2006-01-02"),
+		Note:           t.Note,
+		CreatedBy:      nullUUIDValue(t.CreatedBy),
+		CreatedDate:    t.CreatedDate,
+	})
+}
+
+type CreateResourceTopupInput struct {
+	ExtraQuantity float64 `json:"extra_quantity" binding:"required"`
+	NewPrice      float64 `json:"new_price" binding:"required"`
+	OrderedAt     string  `json:"ordered_at"`
+	Note          string  `json:"note"`
 }
 
 type CreateEstimateLineInput struct {
