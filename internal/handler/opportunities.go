@@ -936,8 +936,22 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 		WHERE tenant_id = $1 AND COALESCE(pipeline_type, 'opportunity') = $2
 	`
 
-	// Pipeline stages are tenant-wide — no organization filter
-	_ = argCount
+	// Per-organization scope (user request: "stage created in one
+	// company should not be in second"). When X-Organization-ID is
+	// present, return THIS org's stages PLUS any legacy tenant-wide
+	// stages (organization_id IS NULL). Including the NULL rows is
+	// what preserves the data created before this scoping was
+	// introduced — without it, a user who upgraded suddenly saw an
+	// empty pipeline (and the frontend's seed-defaults auto-created
+	// fresh ones, orphaning their existing leads). New stages
+	// created from now on get stamped with the active org and stay
+	// invisible to other companies in the same tenant.
+	orgID, orgOk := middleware.GetOrganizationID(c)
+	if orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
+		args = append(args, orgID)
+	}
 	query += " ORDER BY sequence ASC"
 
 	rows, err := h.db.Query(query, args...)
@@ -995,20 +1009,30 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		pipelineType = "opportunity"
 	}
 
-	// Pipeline stages are tenant-wide — organization_id is always NULL
+	// Pipeline stages are now per-organization (per user request).
+	// Stamp the active company id from X-Organization-ID so each
+	// company keeps its own pipeline. Falls back to NULL when no org
+	// is active — those legacy rows remain accessible only when the
+	// list endpoint is called without an org context.
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		o := orgID
+		orgIDPtr = &o
+	}
+
 	query := `
 		INSERT INTO pipeline_stages (
 			id, tenant_id, name, code, sequence, probability,
 			is_won, is_lost, color, is_active, pipeline_type, organization_id,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, NULL, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12, $13)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
 		id, tenantID, input.Name, input.Code, input.Sequence,
 		input.Probability, input.IsWon, input.IsLost, color,
-		pipelineType, now, now,
+		pipelineType, orgIDPtr, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -1033,7 +1057,7 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		Color:          color,
 		IsActive:       true,
 		PipelineType:   pipelineType,
-		OrganizationID: nil,
+		OrganizationID: orgIDPtr,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -1123,15 +1147,29 @@ func (h *Handler) UpdatePipelineStage(c *gin.Context) {
 	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
 	args = append(args, time.Now())
 
-	// Add WHERE conditions
+	// Add WHERE conditions — scoped by tenant AND, when an active
+	// organization is set, the stage must belong to that org OR be a
+	// legacy tenant-wide row (organization_id IS NULL). The NULL-row
+	// allowance keeps users able to edit pre-scoping stages that
+	// were never stamped with an org id; without it, their legacy
+	// pipeline would render read-only.
 	argCount++
 	args = append(args, id)
+	idArg := argCount
 	argCount++
 	args = append(args, tenantID)
+	tenantArg := argCount
+
+	whereClause := fmt.Sprintf("id = $%d AND tenant_id = $%d", idArg, tenantArg)
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		args = append(args, orgID)
+		whereClause += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
+	}
 
 	query := fmt.Sprintf(
-		"UPDATE pipeline_stages SET %s WHERE id = $%d AND tenant_id = $%d",
-		strings.Join(updates, ", "), argCount-1, argCount,
+		"UPDATE pipeline_stages SET %s WHERE %s",
+		strings.Join(updates, ", "), whereClause,
 	)
 
 	result, err := h.db.Exec(query, args...)
@@ -1177,8 +1215,16 @@ func (h *Handler) DeletePipelineStage(c *gin.Context) {
 	}
 
 	query := `DELETE FROM pipeline_stages WHERE id = $1 AND tenant_id = $2`
+	args := []interface{}{id, tenantID}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		// Same rationale as the update path: allow deleting either
+		// the active org's stages or the legacy NULL-org rows that
+		// every company shared before scoping was added.
+		query += " AND (organization_id = $3 OR organization_id IS NULL)"
+		args = append(args, orgID)
+	}
 
-	result, err := h.db.Exec(query, id, tenantID)
+	result, err := h.db.Exec(query, args...)
 	if err != nil {
 		h.log.Error("Failed to delete pipeline stage", "error", err)
 		response.InternalError(c, "Failed to delete pipeline stage")
