@@ -3,6 +3,7 @@ package service
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -231,6 +232,20 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 			srcID := productID
 			resolvedProductID := s.resolveCrossOrgProductID(tenantID, targetOrgID, &srcID)
 
+			// When resolution succeeds, swap the description to
+			// the target product's name so the buyer sees their
+			// own product name on their PO (not the seller's).
+			lineDescription := description
+			if resolvedProductID != nil && *resolvedProductID != productID {
+				var targetName sql.NullString
+				if err := s.db.QueryRow(
+					`SELECT name FROM products WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+					*resolvedProductID, tenantID,
+				).Scan(&targetName); err == nil && targetName.Valid && targetName.String != "" {
+					lineDescription = targetName
+				}
+			}
+
 			lineID := uuid.New()
 			s.db.Exec(`
 				INSERT INTO purchase_order_lines (
@@ -240,7 +255,7 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 					warehouse_id, notes, packaging_id, packaging_qty,
 					created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-			`, lineID, poID, lineNum, resolvedProductID, description,
+			`, lineID, poID, lineNum, resolvedProductID, lineDescription,
 				qty, unitID, unitPrice, discountAmt, taxID, taxAmt,
 				lineTotal, 0.0, 0.0,
 				lineWarehouseID, lineNotes, packagingID, packagingQty,
@@ -345,9 +360,26 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 		return nil // This PO was created from an SO, don't create another SO
 	}
 
-	// Create sales order in target organization
+	// Create sales order in target organization.
+	// Use the same sequential numbering scheme as user-created SOs
+	// (S00001, S00002, ...) scoped by (tenant_id, organization_id),
+	// so the intercompany-synced SO is indistinguishable from a
+	// regular one in the list. The unique constraint is
+	// (tenant_id, organization_id, order_number); we retry on
+	// collision below if a concurrent INSERT grabbed the same number.
 	soID := uuid.New()
-	soNumber := fmt.Sprintf("SO-IC-%s", time.Now().Format("20060102150405"))
+	nextSONumber := func() string {
+		var maxNum int
+		s.db.QueryRow(`
+			SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+			FROM sales_orders
+			WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+			  AND order_number ~ '^S[0-9]+$'`,
+			tenantID, targetOrgID,
+		).Scan(&maxNum)
+		return fmt.Sprintf("S%05d", maxNum+1)
+	}
+	soNumber := nextSONumber()
 	now := time.Now()
 
 	notes := fmt.Sprintf("Auto-created from intercompany PO: %s", po.OrderNumber)
@@ -378,15 +410,28 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 	`
 
-	_, err = s.db.Exec(soInsertQuery,
-		soID, tenantID, targetOrgID, soNumber, customerID,
-		now, now.AddDate(0, 0, 7), po.CurrencyID, po.ExchangeRate,
-		po.Subtotal, po.DiscountAmount, po.TaxAmount, po.ShippingAmount, po.TotalAmount,
-		entity.OrderStatusDraft, entity.PaymentStatusUnpaid, paymentTerms,
-		po.OrderNumber, notes, targetWarehouseID,
-		now, now,
-	)
-	if err != nil {
+	// Retry on number collision: another concurrent SO insert in the
+	// target org may have grabbed the same MAX+1. Up to 5 attempts.
+	for attempt := 0; attempt < 5; attempt++ {
+		_, err = s.db.Exec(soInsertQuery,
+			soID, tenantID, targetOrgID, soNumber, customerID,
+			now, now.AddDate(0, 0, 7), po.CurrencyID, po.ExchangeRate,
+			po.Subtotal, po.DiscountAmount, po.TaxAmount, po.ShippingAmount, po.TotalAmount,
+			entity.OrderStatusDraft, entity.PaymentStatusUnpaid, paymentTerms,
+			po.OrderNumber, notes, targetWarehouseID,
+			now, now,
+		)
+		if err == nil {
+			break
+		}
+		// Detect unique-constraint collision on order_number; recompute and retry.
+		msg := err.Error()
+		if attempt < 4 && (strings.Contains(msg, "sales_orders_tenant_org_order_number_key") ||
+			strings.Contains(msg, "duplicate key") ||
+			strings.Contains(msg, "unique constraint")) {
+			soNumber = nextSONumber()
+			continue
+		}
 		return fmt.Errorf("failed to create intercompany SO: %w", err)
 	}
 
@@ -423,6 +468,25 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 			// otherwise inventory / pricing joins break.
 			resolvedProductID := s.resolveCrossOrgProductID(tenantID, targetOrgID, productID)
 
+			// When resolution succeeds, also replace the line
+			// description with the target product's name. The
+			// source description carries Company A's product name
+			// (e.g. "АНКЕРНЫЙ БОЛТ С ГАЙКОЙ 10X100 ММ"); on
+			// Company B's side we want B's own name (e.g.
+			// "Анкер 10×100"). Falls back to the source
+			// description when either no target product was
+			// found or its name is empty.
+			lineDescription := description
+			if resolvedProductID != nil && (productID == nil || *resolvedProductID != *productID) {
+				var targetName sql.NullString
+				if err := s.db.QueryRow(
+					`SELECT name FROM products WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+					*resolvedProductID, tenantID,
+				).Scan(&targetName); err == nil && targetName.Valid && targetName.String != "" {
+					lineDescription = targetName
+				}
+			}
+
 			lineID := uuid.New()
 			s.db.Exec(`
 				INSERT INTO sales_order_lines (
@@ -433,7 +497,7 @@ func (s *IntercompanySyncService) SyncPurchaseOrderToSaleOrder(tenantID uuid.UUI
 					warehouse_id, notes, packaging_id, packaging_qty,
 					created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-			`, lineID, soID, lineNum, resolvedProductID, description,
+			`, lineID, soID, lineNum, resolvedProductID, lineDescription,
 				qty, unitID, unitPrice, discountAmt,
 				taxID, taxAmt, lineTotal,
 				0.0, 0.0,
