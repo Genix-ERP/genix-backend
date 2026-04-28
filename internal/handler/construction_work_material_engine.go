@@ -206,16 +206,29 @@ func (h *Handler) reserveMaterialsForWork(tenantID, orgID, userID uuid.UUID, pro
 
 // finaliseMaterialsForWork approves every pending reservation tied to the
 // work, decrementing quantity_on_hand AND quantity_reserved by the
-// reservation qty (mirrors ApproveMaterialReservation's inventory step
-// without touching expense_lines / journal_entries — accounting wiring
-// can come later if needed).
+// reservation qty AND recording a draft construction_expense_lines row so
+// the project's Xarajatlar tab reflects what was consumed.
 //
 // Allows quantity_on_hand to go negative — per product feedback the user
 // wants the system to record reality even if procurement hasn't refilled
-// the warehouse yet.
+// the warehouse yet ("ombordan ostatka ayrilmadi minusga bolsa ham" bug).
+//
+// If the inventory row for (product, warehouse) doesn't exist yet we
+// INSERT it at the negative balance instead of silently no-op'ing the
+// UPDATE — the page would otherwise keep showing Qoldiq=0 forever.
+//
+// Each approved reservation also produces one construction_expense_lines
+// row tagged with material_request_id=NULL but enough metadata
+// (product_id, qty, uom, unit_price, amount, supplier_name) for the
+// Xarajatlar tab to surface it. Without this the section's Tasdiqlangan
+// xarajatlar / Jami totals stayed at 0 even after a YAKUNIY work
+// ("bu joylardi xarajatlar hisoblanmadi" bug).
 func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID, workID int64) {
+	// We need extra metadata per reservation (cost, uom, organization,
+	// product name) to build the expense line — pull it inline.
 	rows, err := h.db.Query(`
-		SELECT id, product_id, warehouse_id, quantity
+		SELECT id, organization_id, product_id, warehouse_id, quantity,
+		       COALESCE(unit, ''), COALESCE(unit_cost, 0), COALESCE(total_cost, 0)
 		FROM material_reservations
 		WHERE tenant_id = $1
 		  AND estimate_line_id = $2
@@ -231,15 +244,24 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 
 	type resRow struct {
 		ID          uuid.UUID
+		OrgID       *uuid.UUID
 		ProductID   uuid.UUID
 		WarehouseID *uuid.UUID
 		Quantity    float64
+		Unit        string
+		UnitCost    float64
+		TotalCost   float64
 	}
 	var ress []resRow
 	for rows.Next() {
 		var r resRow
-		var wh uuid.NullUUID
-		if scanErr := rows.Scan(&r.ID, &r.ProductID, &wh, &r.Quantity); scanErr == nil {
+		var org, wh uuid.NullUUID
+		if scanErr := rows.Scan(&r.ID, &org, &r.ProductID, &wh, &r.Quantity,
+			&r.Unit, &r.UnitCost, &r.TotalCost); scanErr == nil {
+			if org.Valid {
+				v := org.UUID
+				r.OrgID = &v
+			}
 			if wh.Valid {
 				w := wh.UUID
 				r.WarehouseID = &w
@@ -250,6 +272,13 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 
 	if len(ress) == 0 {
 		return
+	}
+
+	// Resolve the company name once — used as supplier_name for expense
+	// lines so the row reads "internal stock issue" rather than blank.
+	var companyName string
+	if len(ress) > 0 && ress[0].OrgID != nil {
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, *ress[0].OrgID).Scan(&companyName)
 	}
 
 	now := time.Now()
@@ -266,16 +295,69 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 			continue
 		}
 
-		// Decrement on_hand AND release reserved.
+		// Decrement on_hand AND release reserved. UPSERT path: try
+		// UPDATE first, and if no row exists (RowsAffected = 0) INSERT
+		// a new inventory row at the negative balance so the deduction
+		// is visible. Without this fallback, products that never had
+		// stock would keep showing Qoldiq=0 even after work was finalised.
 		if r.WarehouseID != nil {
-			_, _ = h.db.Exec(`
+			result, exErr := h.db.Exec(`
 				UPDATE inventory
 				SET quantity_on_hand  = COALESCE(quantity_on_hand, 0)  - $1,
-				    quantity_reserved = COALESCE(quantity_reserved, 0) - $1,
+				    quantity_reserved = GREATEST(COALESCE(quantity_reserved, 0) - $1, 0),
 				    updated_at = $2
 				WHERE product_id = $3 AND warehouse_id = $4 AND tenant_id = $5
 			`, r.Quantity, now, r.ProductID, r.WarehouseID, tenantID)
+			if exErr != nil {
+				h.log.Error("finaliseMaterialsForWork: failed to update inventory",
+					"error", exErr, "reservation_id", r.ID)
+			} else if affected, _ := result.RowsAffected(); affected == 0 {
+				// No matching inventory row — create one at the negative
+				// balance. Allowed per product policy.
+				if _, insErr := h.db.Exec(`
+					INSERT INTO inventory (
+						id, tenant_id, product_id, warehouse_id,
+						quantity_on_hand, quantity_reserved,
+						created_at, updated_at
+					) VALUES (gen_random_uuid(), $1, $2, $3, -$4, 0, $5, $5)
+				`, tenantID, r.ProductID, r.WarehouseID, r.Quantity, now); insErr != nil {
+					h.log.Error("finaliseMaterialsForWork: failed to insert inventory row",
+						"error", insErr, "reservation_id", r.ID)
+				}
+			}
 		}
+
+		// Project-level expense — one row per finalized reservation.
+		// Status='draft' to mirror the createMaterialRequest pipeline so
+		// the row appears in Xarajatlar without auto-approving spend.
+		var productName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM products WHERE id = $1`, r.ProductID).Scan(&productName)
+		desc := fmt.Sprintf("Yakunlangan ish #%d — %s", workID, productName)
+		amount := r.TotalCost
+		if amount <= 0 {
+			amount = r.Quantity * r.UnitCost
+		}
+		if _, exErr := h.db.Exec(`
+			INSERT INTO construction_expense_lines (
+				tenant_id, organization_id, project_id,
+				expense_date, description,
+				product_id, quantity, uom, unit_price,
+				amount, currency_code,
+				supplier_name, status, created_by, created_at, updated_at
+			) VALUES (
+				$1, $2, $3,
+				$4::date, $5,
+				$6, $7, $8, $9,
+				$10, 'UZS',
+				$11, 'draft', $12, $4, $4
+			)
+		`, tenantID, r.OrgID, projectID, now, desc,
+			r.ProductID, r.Quantity, r.Unit, r.UnitCost,
+			amount, companyName, uuidArg(userID)); exErr != nil {
+			h.log.Error("finaliseMaterialsForWork: failed to insert expense line",
+				"error", exErr, "reservation_id", r.ID)
+		}
+
 		approved++
 	}
 

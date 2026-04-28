@@ -3,7 +3,9 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -12,6 +14,25 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
+
+// stageNameFromPath extracts the human-facing stage name from a row's
+// parent_item_number field. Estimate imports store the section path in the
+// SmetaImportModal hierarchy format ("СЕКЦИЯ №1 › ФУНДАМЕНТЫ"); the bit we
+// want for the Reja vs Fakt aggregation is the LAST segment, since the
+// section prefix ("СЕКЦИЯ №…") is just a regulatory grouping that's the
+// same for the whole estimate. Falls back to the bare value when the
+// hierarchy delimiter isn't present (legacy / hand-typed rows).
+func stageNameFromPath(parentItemNumber string) string {
+	const delim = " › "
+	s := strings.TrimSpace(parentItemNumber)
+	if s == "" {
+		return ""
+	}
+	if i := strings.LastIndex(s, delim); i >= 0 {
+		return strings.TrimSpace(s[i+len(delim):])
+	}
+	return s
+}
 
 // =====================================================
 // REJA VS FAKT (Plan vs Fact) HANDLERS
@@ -227,6 +248,190 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		}
 	}
 
+	// 4b. Collect raw work + sub-resource data from construction_estimate_line.
+	//
+	// Background: foremen do their day-to-day work (entering done quantity,
+	// completing stages) on the Bosqichlar tab, which writes to
+	// construction_estimate_line. The legacy construction_sub_stage_*
+	// tables this handler was originally built around are mostly empty
+	// for newer projects, so without this side-channel Reja vs Fakt would
+	// keep reporting 0/0/0 even after a stage is fully YAKUNIY in
+	// Bosqichlar.
+	//
+	// Match logic: each top-level work line carries a parent_item_number
+	// like "СЕКЦИЯ №1 › ФУНДАМЕНТЫ". stageNameFromPath() pulls the last
+	// segment ("ФУНДАМЕНТЫ") which matches construction_stages.name set
+	// by SmetaImportModal during import.
+	//
+	// We collect raw rows here and project them into virtual SubStageResult
+	// rows below (after the SubStageResult/MaterialRow/EquipmentRow types
+	// are declared in step 5). Each top-level work becomes one virtual
+	// sub-stage with id = -line.id so it never collides with a real
+	// sub-stage id; its priced labour / machine / material sub-rows fan
+	// out into the Equipment and Materials lists the frontend already
+	// renders.
+	type workMeta struct {
+		id         int64
+		name       string
+		uom        string
+		section    string
+		parentQty  float64
+		parentDone float64
+		plan       float64
+		fact       float64
+		status     string
+	}
+	type subResRow struct {
+		parentID     int64
+		name         string
+		uom          string
+		resourceType string
+		normRate     float64
+		ownQty       float64
+		unitRate     float64
+	}
+	workByID := map[int64]workMeta{}
+	subsByWork := map[int64][]subResRow{}
+	{
+		estimateScopeQ := `
+			SELECT id FROM construction_estimate
+			WHERE project_id = $1 AND tenant_id = $2
+		`
+		estimateScopeArgs := []interface{}{projectID, tenantID}
+		if buildingFilter != "" {
+			bid, _ := strconv.ParseInt(buildingFilter, 10, 64)
+			estimateScopeQ += ` AND building_id = $3`
+			estimateScopeArgs = append(estimateScopeArgs, bid)
+		}
+
+		// Pull every top-level work line in scope plus the data we need
+		// to price them. The sub_derived_rate subquery sums
+		// Σ(sub.unit_rate × sub.norm_rate) over the line's resource
+		// sub-rows so works whose own unit_rate is zero (common for
+		// ВОР-imported parents) still contribute — same fallback the
+		// Bosqichlar tab uses on the frontend.
+		linesQ := `
+			SELECT
+				l.id,
+				COALESCE(l.name, '')               AS name,
+				COALESCE(l.uom, '')                AS uom,
+				COALESCE(l.parent_item_number, '') AS parent_item_number,
+				COALESCE(l.total_amount, 0)        AS total_amount,
+				COALESCE(l.quantity, 0)            AS quantity,
+				COALESCE(l.done_quantity, 0)       AS done_quantity,
+				COALESCE(l.unit_rate, 0)           AS unit_rate,
+				COALESCE(l.approval_status, '')    AS approval_status,
+				COALESCE((
+					SELECT SUM(COALESCE(s.unit_rate, 0) * COALESCE(s.norm_rate, 0))
+					FROM construction_estimate_line s
+					WHERE s.parent_line_id = l.id
+					  AND s.tenant_id = l.tenant_id
+					  AND COALESCE(s.resource_type, '') <> ''
+				), 0) AS sub_derived_rate
+			FROM construction_estimate_line l
+			WHERE l.tenant_id = $2
+			  AND l.estimate_id IN (` + estimateScopeQ + `)
+			  AND COALESCE(l.resource_type, '') = ''
+			  AND COALESCE(l.parent_line_id, 0) = 0
+		`
+		// Arg order: $1=projectID, $2=tenantID, optional $3=buildingID.
+		lineRows, lineErr := h.db.Query(linesQ, estimateScopeArgs...)
+		if lineErr == nil {
+			func() {
+				defer lineRows.Close()
+				for lineRows.Next() {
+					var (
+						lineID                                        int64
+						lineName, lineUOM, parentItem, approvalStatus string
+						totalAmt, qty, doneQty, unitRate, subDerived  float64
+					)
+					if err := lineRows.Scan(&lineID, &lineName, &lineUOM, &parentItem,
+						&totalAmt, &qty, &doneQty, &unitRate, &approvalStatus, &subDerived); err != nil {
+						continue
+					}
+					name := stageNameFromPath(parentItem)
+					if name == "" {
+						continue
+					}
+					// Effective per-unit rate. Prefer stored unit_rate; if
+					// it's zero but total_amount is set we can back-compute
+					// total_amount / qty; finally fall back to the
+					// sub-resource derived rate. The last fallback is what
+					// makes the texnadzor-bug test case work — parent rows
+					// with no own price but priced sub-resources.
+					rate := unitRate
+					if rate <= 0 && qty > 0 && totalAmt > 0 {
+						rate = totalAmt / qty
+					}
+					if rate <= 0 {
+						rate = subDerived
+					}
+					plan := totalAmt
+					if plan <= 0 {
+						plan = rate * qty
+					}
+					done := doneQty
+					if qty > 0 && done > qty {
+						done = qty
+					}
+					fact := rate * done
+
+					workByID[lineID] = workMeta{
+						id:         lineID,
+						name:       lineName,
+						uom:        lineUOM,
+						section:    name,
+						parentQty:  qty,
+						parentDone: done,
+						plan:       plan,
+						fact:       fact,
+						status:     approvalStatus,
+					}
+				}
+			}()
+		} else {
+			h.log.Error("Failed to aggregate estimate lines for reja-fakt", "error", lineErr)
+		}
+
+		// Pull every priced sub-resource of the works we just collected.
+		if len(workByID) > 0 {
+			parentIDs := make([]int64, 0, len(workByID))
+			for id := range workByID {
+				parentIDs = append(parentIDs, id)
+			}
+			subQ := `
+				SELECT
+					parent_line_id,
+					COALESCE(name, ''),
+					COALESCE(uom, ''),
+					COALESCE(resource_type, ''),
+					COALESCE(norm_rate, 0),
+					COALESCE(quantity, 0),
+					COALESCE(unit_rate, 0)
+				FROM construction_estimate_line
+				WHERE tenant_id = $1
+				  AND parent_line_id = ANY($2)
+				  AND COALESCE(resource_type, '') <> ''
+			`
+			subRows, subErr := h.db.Query(subQ, tenantID, pq.Array(parentIDs))
+			if subErr == nil {
+				func() {
+					defer subRows.Close()
+					for subRows.Next() {
+						var s subResRow
+						if err := subRows.Scan(
+							&s.parentID, &s.name, &s.uom, &s.resourceType,
+							&s.normRate, &s.ownQty, &s.unitRate,
+						); err != nil {
+							continue
+						}
+						subsByWork[s.parentID] = append(subsByWork[s.parentID], s)
+					}
+				}()
+			}
+		}
+	}
+
 	// 5. Build response
 	type SubStageResult struct {
 		SubStage
@@ -300,6 +505,115 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			sr.EquipFactTotal += ssr.EquipFactTotal
 
 			sr.SubStages = append(sr.SubStages, ssr)
+		}
+
+		// Project the estimate-line work rows that match this stage into
+		// virtual SubStageResults so the page can render expandable rows
+		// per work (УСТРОЙСТВО БЕТОННОЙ ПОДГОТОВКИ → its labour / machine /
+		// material breakdown) instead of just a "Bosqich jami:" total.
+		//
+		// Materials = sub-rows with resource_type='material'.
+		// Equipment = labour + machine sub-rows. The page labels this
+		// table "Equipment" — semantically a bit loose but the existing
+		// UI already groups labour with equipment, and splitting them
+		// would need a third panel that doesn't exist on the frontend yet.
+		// Stable order: ascending line.id matches the SmetaImportModal
+		// insert order, which in turn matches the sort_order seen in the
+		// Bosqichlar tab. Without sorting we'd reshuffle the works on
+		// every reload (map iteration is randomized in Go).
+		stageWorkIDs := make([]int64, 0, len(workByID))
+		for id, w := range workByID {
+			if w.section == sr.Name {
+				stageWorkIDs = append(stageWorkIDs, id)
+			}
+		}
+		sort.Slice(stageWorkIDs, func(i, j int) bool { return stageWorkIDs[i] < stageWorkIDs[j] })
+		// Synthetic-row id counter — gives every projected MaterialRow /
+		// EquipmentRow a unique negative id so React's `key={mat.id}` /
+		// `key={eq.id}` lookups don't collide with each other or with
+		// real rows from the legacy construction_sub_stage_* tables.
+		var synthRowID int64 = -1
+		for _, wid := range stageWorkIDs {
+			w := workByID[wid]
+			vsub := SubStageResult{
+				SubStage: SubStage{
+					ID:       -w.id, // negative = synthetic, won't collide with real sub_stage ids
+					StageID:  sr.ID,
+					Name:     w.name,
+					SubOrder: 0,
+					Status:   w.status,
+				},
+				Materials: []MaterialRow{},
+				Equipment: []EquipmentRow{},
+			}
+			for _, s := range subsByWork[w.id] {
+				// Plan qty for the resource = parent.qty × norm (or its
+				// own stored quantity if norm is missing). Fact qty
+				// scales by parent.done so it matches the expandable
+				// resource table in Bosqichlar.
+				planQty := s.normRate * w.parentQty
+				if planQty <= 0 {
+					planQty = s.ownQty
+				}
+				factQty := 0.0
+				if s.normRate > 0 {
+					factQty = s.normRate * w.parentDone
+				} else if w.parentQty > 0 {
+					factQty = s.ownQty * (w.parentDone / w.parentQty)
+				}
+				planAmt := planQty * s.unitRate
+				factAmt := factQty * s.unitRate
+				rt := strings.ToLower(strings.TrimSpace(s.resourceType))
+				if rt == "material" || rt == "materialy" || rt == "mat" {
+					vsub.Materials = append(vsub.Materials, MaterialRow{
+						ID:           synthRowID,
+						SubStageID:   -w.id,
+						ProductName:  s.name,
+						UOM:          s.uom,
+						PlanQuantity: planQty,
+						FactQuantity: factQty,
+						UnitCost:     s.unitRate,
+						PlanAmount:   planAmt,
+						FactAmount:   factAmt,
+						Difference:   planAmt - factAmt,
+					})
+					vsub.MaterialPlanTotal += planAmt
+					vsub.MaterialFactTotal += factAmt
+				} else {
+					vsub.Equipment = append(vsub.Equipment, EquipmentRow{
+						ID:           synthRowID,
+						SubStageID:   -w.id,
+						Name:         s.name,
+						WorkUnit:     s.uom,
+						PlanQuantity: planQty,
+						FactQuantity: factQty,
+						UnitPrice:    s.unitRate,
+						PlanAmount:   planAmt,
+						FactAmount:   factAmt,
+						Difference:   planAmt - factAmt,
+					})
+					vsub.EquipPlanTotal += planAmt
+					vsub.EquipFactTotal += factAmt
+				}
+				synthRowID--
+			}
+			// Lines without any priced sub-resources still need to show
+			// sensible Reja / Fakt — fall back to the work-level totals
+			// so the row isn't a confusing 0/0 next to a non-zero Bosqich
+			// jami.
+			if len(vsub.Materials) == 0 && len(vsub.Equipment) == 0 {
+				vsub.MaterialPlanTotal = w.plan
+				vsub.MaterialFactTotal = w.fact
+			}
+			vsub.PlanTotal = vsub.MaterialPlanTotal + vsub.EquipPlanTotal
+			vsub.FactTotal = vsub.MaterialFactTotal + vsub.EquipFactTotal
+			vsub.Difference = vsub.PlanTotal - vsub.FactTotal
+
+			sr.SubStages = append(sr.SubStages, vsub)
+			sr.MaterialPlanTotal += vsub.MaterialPlanTotal
+			sr.MaterialFactTotal += vsub.MaterialFactTotal
+			sr.EquipPlanTotal += vsub.EquipPlanTotal
+			sr.EquipFactTotal += vsub.EquipFactTotal
 		}
 
 		sr.PlanTotal = sr.MaterialPlanTotal + sr.EquipPlanTotal

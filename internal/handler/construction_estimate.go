@@ -1020,16 +1020,19 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		assignedItemNum   = req.ItemNumber
 	)
 	if req.ParentLineID > 0 {
-		var pItem, pUom sql.NullString
+		var pItem, pUom, pParentItem sql.NullString
 		var pQty float64
 		var pEstimateID int64
 		var pSortOrder int
 		err := h.db.QueryRow(`
 			SELECT estimate_id, COALESCE(item_number, ''), COALESCE(uom, ''),
-			       COALESCE(quantity, 0), COALESCE(sort_order, 0)
+			       COALESCE(quantity, 0), COALESCE(sort_order, 0),
+			       COALESCE(parent_item_number, '')
 			FROM construction_estimate_line
 			WHERE id = $1 AND tenant_id = $2
-		`, req.ParentLineID, tenantID).Scan(&pEstimateID, &pItem, &pUom, &pQty, &pSortOrder)
+		`, req.ParentLineID, tenantID).Scan(
+			&pEstimateID, &pItem, &pUom, &pQty, &pSortOrder, &pParentItem,
+		)
 		if err == sql.ErrNoRows {
 			response.BadRequest(c, "Parent line not found")
 			return
@@ -1045,7 +1048,24 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		}
 
 		parentLineIDSQL = sql.NullInt64{Int64: req.ParentLineID, Valid: true}
-		parentItemNumber = pItem.String
+		// parent_item_number resolution depends on what KIND of child this is:
+		//   • Resource child (Mehnat / Mashina / Material — resource_type set)
+		//     ─ tracks which work owns it via parent.item_number ("13"), so
+		//       legacy fallbacks that bucket children by parent_item_number
+		//       still work when parent_line_id is absent. Existing behavior.
+		//   • Sub-stage (resource_type = '' — created via "Yangi etap" in
+		//     Smeta boshqaruvi) — must inherit the parent work's SECTION
+		//     path ("СЕКЦИЯ №1 › ФУНДАМЕНТЫ") so deriveStages() in the
+		//     Bosqichlar tab buckets it inside the same stage as its
+		//     parent. Otherwise the sub-stage ends up under a fake stage
+		//     called "13" (parent.item_number), and the user reported it
+		//     as missing from Bosqichlar entirely.
+		isSubStageNew := strings.TrimSpace(req.ResourceType) == "" && req.NormRate == 0
+		if isSubStageNew {
+			parentItemNumber = pParentItem.String
+		} else {
+			parentItemNumber = pItem.String
+		}
 		parentQuantity = pQty
 
 		// Inherit the parent's sort_order so the backend ORDER BY places the
