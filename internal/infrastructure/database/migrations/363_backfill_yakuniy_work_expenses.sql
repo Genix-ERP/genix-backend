@@ -209,6 +209,16 @@ SELECT
     'Yakunlangan ish #' || work_id::text || ' — ' || work_name,
     done_qty, work_uom, effective_rate,
     amount, 'UZS',
-    supplier_name, 'approved', confirmed_by, confirmed_at,
+    supplier_name, 'approved',
+    -- approved_by has a FK to employees(id), but confirmed_engineer_by
+    -- holds a user_id (auth side, not HR side). Inserting it directly
+    -- triggers construction_expense_lines_approved_by_fkey violations
+    -- because most users are not also employee rows. NULL is safe and
+    -- the column is nullable. The runtime path has the same theoretical
+    -- bug but its FK violations are logged and swallowed; the migration
+    -- can't swallow them, so we play it safe here.
+    NULL, confirmed_at,
+    -- created_by has no FK, so the user_id slots in fine and we keep
+    -- the audit trail of who confirmed the work.
     confirmed_by, confirmed_at, NOW()
 FROM to_insert;
