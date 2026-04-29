@@ -33,6 +33,7 @@ package handler
 // done.
 
 import (
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -102,6 +103,20 @@ func (h *Handler) reserveMaterialsForWork(tenantID, orgID, userID uuid.UUID, pro
 		orgIDPtr = &orgID
 	}
 
+	// Project's chosen default warehouse (migration 365). Resolved once
+	// before the loop and reused for every sub-line so a single project
+	// always charges the same warehouse — no more "random tiebreaker"
+	// behaviour where each sub-line could land on a different warehouse
+	// just because of inventory row order. Stays nil when the project
+	// hasn't picked one, in which case the existing auto-pick chain
+	// (highest-stock → oldest-active) takes over downstream.
+	var projectWarehouseID uuid.NullUUID
+	_ = h.db.QueryRow(`
+		SELECT warehouse_id
+		FROM construction_projects
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectWarehouseID)
+
 	now := time.Now()
 	created := 0
 	skipped := 0
@@ -134,16 +149,29 @@ func (h *Handler) reserveMaterialsForWork(tenantID, orgID, userID uuid.UUID, pro
 			continue
 		}
 
-		// Pick a warehouse — prefer one that has stock for this product, but
-		// fall back to ANY tenant warehouse so we always have a row to write
-		// to (stock is allowed to go negative per product feedback).
+		// Pick a warehouse. Three-step chain:
+		//   0. Project's chosen default (construction_projects.warehouse_id,
+		//      migration 365). When set, every sub-line of every work in
+		//      this project lands on the same warehouse — predictable for
+		//      the project manager, no surprise debits to other sites.
+		//   1. Whichever warehouse already has the most stock for this
+		//      product (legacy behaviour, kept as fallback for projects
+		//      that haven't chosen a default).
+		//   2. Oldest active tenant warehouse — last-ditch so we always
+		//      have a row to write to (stock is allowed to go negative
+		//      per product feedback).
 		var warehouseID uuid.UUID
-		_ = h.db.QueryRow(`
-			SELECT warehouse_id FROM inventory
-			WHERE product_id = $1 AND tenant_id = $2
-			ORDER BY quantity_on_hand DESC NULLS LAST
-			LIMIT 1
-		`, productID, tenantID).Scan(&warehouseID)
+		if projectWarehouseID.Valid {
+			warehouseID = projectWarehouseID.UUID
+		}
+		if warehouseID == uuid.Nil {
+			_ = h.db.QueryRow(`
+				SELECT warehouse_id FROM inventory
+				WHERE product_id = $1 AND tenant_id = $2
+				ORDER BY quantity_on_hand DESC NULLS LAST
+				LIMIT 1
+			`, productID, tenantID).Scan(&warehouseID)
+		}
 		if warehouseID == uuid.Nil {
 			_ = h.db.QueryRow(`
 				SELECT id FROM warehouses
@@ -270,15 +298,184 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 		}
 	}
 
-	if len(ress) == 0 {
-		return
+	// Resolve the work line metadata up front. We need it for both the
+	// section→stage lookup AND the work-level expense line at the end.
+	// Pulling once here keeps the inner loop compact.
+	var (
+		workName       string
+		workUOM        string
+		sectionPath    sql.NullString
+		workQty        float64
+		workDone       float64
+		workUnitRate   float64
+		workTotalAmt   float64
+		workOrgID      sql.NullString
+	)
+	// `organization_id` lives on construction_projects, not on
+	// construction_estimate. Joining through the project keeps the
+	// query honest (the previous SELECT against e.organization_id
+	// silently returned NULL because the column doesn't exist on the
+	// estimate header — that left expense rows untagged with org).
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(l.name, ''),
+		       COALESCE(l.uom, ''),
+		       l.parent_item_number,
+		       COALESCE(l.quantity, 0),
+		       COALESCE(l.done_quantity, 0),
+		       COALESCE(l.unit_rate, 0),
+		       COALESCE(l.total_amount, 0),
+		       (SELECT cp.organization_id::text
+		        FROM construction_estimate e
+		        JOIN construction_projects cp ON cp.id = e.project_id
+		        WHERE e.id = l.estimate_id AND e.tenant_id = l.tenant_id)
+		FROM construction_estimate_line l
+		WHERE l.id = $1 AND l.tenant_id = $2
+	`, workID, tenantID).Scan(
+		&workName, &workUOM, &sectionPath,
+		&workQty, &workDone, &workUnitRate, &workTotalAmt, &workOrgID,
+	)
+
+	// Sub-resource derived rate — Σ(sub.unit_rate × sub.norm_rate) — so
+	// works with zero stored unit_rate (common for ВОР-imported parents)
+	// still produce a non-zero expense line. Mirrors the same fallback
+	// used by the Bosqichlar table and the Reja vs Fakt aggregation.
+	var subDerivedRate float64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(COALESCE(s.unit_rate, 0) * COALESCE(s.norm_rate, 0)), 0)
+		FROM construction_estimate_line s
+		WHERE s.parent_line_id = $1
+		  AND s.tenant_id = $2
+		  AND COALESCE(s.resource_type, '') <> ''
+	`, workID, tenantID).Scan(&subDerivedRate)
+
+	// Effective per-unit cost. Prefer stored unit_rate; back-compute from
+	// total_amount / quantity if it's zero; finally fall back to the
+	// sub-resource derived rate.
+	effectiveRate := workUnitRate
+	if effectiveRate <= 0 && workQty > 0 && workTotalAmt > 0 {
+		effectiveRate = workTotalAmt / workQty
+	}
+	if effectiveRate <= 0 {
+		effectiveRate = subDerivedRate
 	}
 
-	// Resolve the company name once — used as supplier_name for expense
-	// lines so the row reads "internal stock issue" rather than blank.
+	// Resolve the work's section → stage_id once. The Byudjet tab joins
+	// expenses to sections via stage_id; without it the auto-generated
+	// row falls into the synthetic "(Boshqalar)" bucket instead of
+	// attributing to the right section.
+	//
+	// We have to be building-aware: when the user filters Byudjet to a
+	// specific Block (Bosqichlar tab building filter), the per-building
+	// totalActual query inner-joins construction_stages with
+	// building_id = <selected>. So a stage match for the wrong block
+	// would correctly attribute to a section but would still miss the
+	// per-block filter — this is what the user reported as "Fakt still
+	// 0 under Block 2 even after YAKUNIY". We pull the work's
+	// building_id from its estimate and prefer a stage in the same
+	// building. Falling back to a name-only match keeps backwards
+	// compat for projects whose stages were created before migration
+	// 333 added building_id.
+	var workBuildingID sql.NullInt64
+	_ = h.db.QueryRow(`
+		SELECT e.building_id
+		FROM construction_estimate_line l
+		JOIN construction_estimate e ON e.id = l.estimate_id
+		WHERE l.id = $1 AND l.tenant_id = $2
+	`, workID, tenantID).Scan(&workBuildingID)
+
+	var stageIDForExpense sql.NullInt64
+	if sectionPath.Valid && sectionPath.String != "" {
+		var stageID int64
+		// Prefer a stage in the same building.
+		if workBuildingID.Valid {
+			if err := h.db.QueryRow(`
+				SELECT id
+				FROM construction_stages
+				WHERE tenant_id = $1
+				  AND project_id = $2
+				  AND name = $3
+				  AND building_id = $4
+				ORDER BY id ASC
+				LIMIT 1
+			`, tenantID, projectID, sectionPath.String, workBuildingID.Int64).Scan(&stageID); err == nil {
+				stageIDForExpense = sql.NullInt64{Int64: stageID, Valid: true}
+			}
+		}
+		// Fallback: any stage with the matching name.
+		if !stageIDForExpense.Valid {
+			if err := h.db.QueryRow(`
+				SELECT id
+				FROM construction_stages
+				WHERE tenant_id = $1
+				  AND project_id = $2
+				  AND name = $3
+				ORDER BY id ASC
+				LIMIT 1
+			`, tenantID, projectID, sectionPath.String).Scan(&stageID); err == nil {
+				stageIDForExpense = sql.NullInt64{Int64: stageID, Valid: true}
+			}
+		}
+		// Auto-create fallback. StagesTabV2 derives sections directly from
+		// estimate-line parent_item_numbers — there is no UI step that
+		// creates rows in construction_stages for those sections. So a
+		// project can have YAKUNIY works in a section that has no
+		// matching stage row, which would force stage_id=NULL on the
+		// expense line and hide it from the per-Block Fakt total (the
+		// report INNER-JOINs construction_stages and filters by
+		// building_id). To avoid that, we create the stage on demand,
+		// tagged with the work's building_id when known. The stage_order
+		// is set to MAX+1 within the project so it sorts after existing
+		// rows and doesn't collide.
+		if !stageIDForExpense.Valid {
+			var bidArg interface{}
+			if workBuildingID.Valid {
+				bidArg = workBuildingID.Int64
+			} else {
+				bidArg = nil
+			}
+			var newStageID int64
+			if err := h.db.QueryRow(`
+				INSERT INTO construction_stages (
+					tenant_id, project_id, building_id, name,
+					stage_order, status, planned_budget,
+					created_at, updated_at
+				)
+				VALUES (
+					$1, $2, $3, $4,
+					COALESCE((
+						SELECT MAX(stage_order) + 1
+						FROM construction_stages
+						WHERE tenant_id = $1 AND project_id = $2
+					), 1),
+					'pending', 0,
+					NOW(), NOW()
+				)
+				RETURNING id
+			`, tenantID, projectID, bidArg, sectionPath.String).Scan(&newStageID); err == nil {
+				stageIDForExpense = sql.NullInt64{Int64: newStageID, Valid: true}
+			} else {
+				h.log.Error("finaliseMaterialsForWork: stage auto-create failed",
+					"error", err, "section", sectionPath.String, "project_id", projectID)
+			}
+		}
+	}
+
+	// Resolve the company name once — used as supplier_name for the
+	// expense line so the row reads as an internal-stock issue rather
+	// than a blank vendor.
 	var companyName string
-	if len(ress) > 0 && ress[0].OrgID != nil {
-		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, *ress[0].OrgID).Scan(&companyName)
+	{
+		var orgIDForName *uuid.UUID
+		if len(ress) > 0 && ress[0].OrgID != nil {
+			orgIDForName = ress[0].OrgID
+		} else if workOrgID.Valid {
+			if u, err := uuid.Parse(workOrgID.String); err == nil {
+				orgIDForName = &u
+			}
+		}
+		if orgIDForName != nil {
+			_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, *orgIDForName).Scan(&companyName)
+		}
 	}
 
 	now := time.Now()
@@ -327,42 +524,80 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 			}
 		}
 
-		// Project-level expense — one row per finalized reservation.
-		// Status='draft' to mirror the createMaterialRequest pipeline so
-		// the row appears in Xarajatlar without auto-approving spend.
-		var productName string
-		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM products WHERE id = $1`, r.ProductID).Scan(&productName)
-		desc := fmt.Sprintf("Yakunlangan ish #%d — %s", workID, productName)
-		amount := r.TotalCost
-		if amount <= 0 {
-			amount = r.Quantity * r.UnitCost
-		}
-		if _, exErr := h.db.Exec(`
-			INSERT INTO construction_expense_lines (
-				tenant_id, organization_id, project_id,
-				expense_date, description,
-				product_id, quantity, uom, unit_price,
-				amount, currency_code,
-				supplier_name, status, created_by, created_at, updated_at
-			) VALUES (
-				$1, $2, $3,
-				$4::date, $5,
-				$6, $7, $8, $9,
-				$10, 'UZS',
-				$11, 'draft', $12, $4, $4
-			)
-		`, tenantID, r.OrgID, projectID, now, desc,
-			r.ProductID, r.Quantity, r.Unit, r.UnitCost,
-			amount, companyName, uuidArg(userID)); exErr != nil {
-			h.log.Error("finaliseMaterialsForWork: failed to insert expense line",
-				"error", exErr, "reservation_id", r.ID)
-		}
-
 		approved++
 	}
 
+	// One summary expense line per finalised work, regardless of how
+	// many (or how few) reservations existed. Computed straight from
+	// the work line's done × effective rate so it always agrees with
+	// what the user sees as FAKT JAMI on the Bosqichlar table.
+	//
+	// We deliberately don't break this into per-reservation rows any
+	// more. Doing it per-reservation meant works with no material
+	// sub-lines (labour-only / machine-only) wrote nothing, even when
+	// they had real cost — that's why the user reported "FAKT still 0
+	// after YAKUNIY". The reservations themselves are still updated
+	// above for warehouse tracking; this row is purely the cost-side
+	// projection.
+	//
+	// Idempotency: if the work was already finalised once and the
+	// engineer re-runs the transition (e.g. after a reject + reconfirm
+	// round-trip), we'd risk double-writing. We use estimate_line.id
+	// as part of a description-based dedupe key and check before
+	// inserting.
+	workCost := workDone * effectiveRate
+	if workCost > 0 {
+		// Check for an existing approved expense line for this work to
+		// prevent double-write on re-confirmation. We tag the row's
+		// description with the work id ("Yakunlangan ish #N — …") so
+		// LIKE-matching on that prefix is enough to detect it.
+		var existing int64
+		_ = h.db.QueryRow(`
+			SELECT COUNT(*)
+			FROM construction_expense_lines
+			WHERE tenant_id = $1
+			  AND project_id = $2
+			  AND status = 'approved'
+			  AND deleted_at IS NULL
+			  AND description LIKE $3
+		`, tenantID, projectID, fmt.Sprintf("Yakunlangan ish #%d —%%", workID)).Scan(&existing)
+		if existing == 0 {
+			desc := fmt.Sprintf("Yakunlangan ish #%d — %s", workID, workName)
+			var orgIDArg interface{}
+			if len(ress) > 0 && ress[0].OrgID != nil {
+				orgIDArg = ress[0].OrgID
+			} else if workOrgID.Valid {
+				if u, err := uuid.Parse(workOrgID.String); err == nil {
+					orgIDArg = u
+				}
+			}
+			if _, exErr := h.db.Exec(`
+				INSERT INTO construction_expense_lines (
+					tenant_id, organization_id, project_id, stage_id,
+					expense_date, description,
+					quantity, uom, unit_price,
+					amount, currency_code,
+					supplier_name, status, approved_by, approved_at,
+					created_by, created_at, updated_at
+				) VALUES (
+					$1, $2, $3, $11,
+					$4::date, $5,
+					$6, $7, $8,
+					$9, 'UZS',
+					$10, 'approved', $12, $4,
+					$12, $4, $4
+				)
+			`, tenantID, orgIDArg, projectID, now, desc,
+				workDone, workUOM, effectiveRate,
+				workCost, companyName, stageIDForExpense, uuidArg(userID)); exErr != nil {
+				h.log.Error("finaliseMaterialsForWork: failed to insert work expense line",
+					"error", exErr, "work_id", workID)
+			}
+		}
+	}
+
 	h.log.Info("finaliseMaterialsForWork: complete",
-		"work_id", workID, "approved", approved)
+		"work_id", workID, "reservations_approved", approved, "work_cost", workCost)
 }
 
 // cancelMaterialsForWork cancels every pending reservation tied to the

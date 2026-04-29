@@ -370,10 +370,13 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 					if plan <= 0 {
 						plan = rate * qty
 					}
+					// Use the raw done quantity — over-completion (done >
+					// qty) MUST surface in the fact column. Capping made
+					// the parent FAKT JAMI silently equal REJA JAMI when
+					// the foreman over-recorded, hiding the discrepancy
+					// (user-reported "REJA va BAJARILDI har xil bo'lsa
+					// ham jami bir xil" bug).
 					done := doneQty
-					if qty > 0 && done > qty {
-						done = qty
-					}
 					fact := rate * done
 
 					workByID[lineID] = workMeta{

@@ -340,10 +340,19 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 	}
 
 	// Also compute total actual for project (including non-stage expenses).
-	// When a building filter is active we scope actuals to that building too,
-	// by restricting to expenses tied to stages that belong to the building.
-	// Project-wide expenses (stage_id NULL) are excluded from per-building
-	// totals because we can't attribute them to a specific block.
+	// When a building filter is active we scope actuals to that building too.
+	//
+	// Two attribution paths are used so that legacy data (where
+	// construction_stages.building_id is NULL because the stage was created
+	// before migration 333 backfilled buildings) still shows up:
+	//   (a) direct match — stage.building_id = $3, OR
+	//   (b) name-via-estimate fallback — the stage's name equals a
+	//       parent_item_number on an estimate line whose estimate has
+	//       building_id = $3. This mirrors the per-section breakdown
+	//       above, which sources rows from estimate-line section paths
+	//       rather than from construction_stages directly.
+	// Project-wide expenses (stage_id NULL) are still excluded from per-
+	// building totals because they can't be attributed to a specific block.
 	var totalActual float64
 	if buildingID > 0 {
 		_ = h.db.QueryRow(`
@@ -353,7 +362,19 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 			  ON s.id = el.stage_id AND s.tenant_id = el.tenant_id
 			WHERE el.project_id = $1 AND el.tenant_id = $2
 			  AND el.status = 'approved' AND el.deleted_at IS NULL
-			  AND s.building_id = $3
+			  AND (
+			    s.building_id = $3
+			    OR EXISTS (
+			      SELECT 1
+			      FROM construction_estimate_line ll
+			      JOIN construction_estimate ee ON ee.id = ll.estimate_id
+			      WHERE ll.tenant_id = el.tenant_id
+			        AND ee.project_id = el.project_id
+			        AND ee.building_id = $3
+			        AND ll.parent_item_number = s.name
+			      LIMIT 1
+			    )
+			  )
 		`, projectID, tenantID, buildingID).Scan(&totalActual)
 	} else {
 		_ = h.db.QueryRow(`
@@ -411,6 +432,44 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 			  AND COALESCE(p.resource_type, '') = ''
 			  AND p.parent_line_id IS NULL
 		`, projectID, tenantID).Scan(&totalPlanned)
+	}
+
+	// Reconciliation row. The per-section breakdown query above only
+	// counts expenses whose stage_id matches a stage with the same
+	// `name` as a parent_item_number — manual expense entries created
+	// without a stage_id (or with a stage_id that doesn't map to any
+	// section in the smeta) drop out. Those still flow into
+	// `total_actual` because the top-card query just sums every
+	// approved expense for the project, so the sum of breakdown rows
+	// would be lower than the headline. Adding a synthetic
+	// "Boshqalar / Project-wide" row equal to the difference keeps the
+	// two sides reconciled — bug "Fakt 4 612 000 in headline but 0
+	// across all sections".
+	//
+	// Skipped when a building filter is active because the per-building
+	// totalActual query already restricts to expenses tied to a stage
+	// with that building_id, so there's no untagged residue.
+	if buildingID == 0 {
+		var mapped float64
+		for _, br := range budgetRows {
+			mapped += br.Actual
+		}
+		residue := totalActual - mapped
+		// Allow a small floating-point cushion so a rounding tail
+		// doesn't show as a 0,01 sum row.
+		if residue > 0.5 {
+			budgetRows = append(budgetRows, BudgetRow{
+				StageID:       0,
+				StageName:     "(Boshqalar / Project-wide)",
+				PlannedBudget: 0,
+				CategoryID:    0,
+				CategoryName:  "Uncategorized",
+				CategoryCode:  "",
+				Actual:        residue,
+				Variance:      -residue,
+				VariancePct:   0,
+			})
+		}
 	}
 
 	response.Success(c, map[string]interface{}{

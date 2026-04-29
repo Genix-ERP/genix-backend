@@ -67,15 +67,18 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 		       cp.actual_start_date, cp.actual_end_date,
 		       cp.status, cp.progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
+		       cp.warehouse_id,
 		       cp.created_by, cp.created_date, cp.updated_date,
 		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
+		       COALESCE(w.name, '') as warehouse_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
 		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta,
 		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id), 0) as files_count
 		FROM construction_projects cp
 		LEFT JOIN employees pm ON pm.id = cp.project_manager_id
 		LEFT JOIN employees ce ON ce.id = cp.chief_engineer_id
+		LEFT JOIN warehouses w ON w.id = cp.warehouse_id AND w.tenant_id = cp.tenant_id
 		WHERE cp.tenant_id = $1 AND cp.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM construction_projects WHERE tenant_id = $1 AND deleted_at IS NULL`
@@ -147,8 +150,10 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 			&p.ActualStartDate, &p.ActualEndDate,
 			&p.Status, &p.ProgressPercent,
 			&p.ProjectManagerID, &p.ChiefEngineerID,
+			&p.WarehouseID,
 			&p.CreatedBy, &p.CreatedDate, &p.UpdatedDate,
 			&p.ProjectManagerName, &p.ChiefEngineerName,
+			&p.WarehouseName,
 			&p.SectionsCount, &p.TotalSmeta, &p.FilesCount,
 		); err != nil {
 			h.log.Error("Failed to scan construction project", "error", err)
@@ -199,15 +204,18 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		       cp.actual_start_date, cp.actual_end_date,
 		       cp.status, cp.progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
+		       cp.warehouse_id,
 		       cp.created_by, cp.created_date, cp.updated_date,
 		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
+		       COALESCE(w.name, '') as warehouse_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
 		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta,
 		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id), 0) as files_count
 		FROM construction_projects cp
 		LEFT JOIN employees pm ON pm.id = cp.project_manager_id
 		LEFT JOIN employees ce ON ce.id = cp.chief_engineer_id
+		LEFT JOIN warehouses w ON w.id = cp.warehouse_id AND w.tenant_id = cp.tenant_id
 		WHERE cp.id = $1 AND cp.tenant_id = $2 AND cp.deleted_at IS NULL
 	`
 
@@ -222,8 +230,10 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		&p.ActualStartDate, &p.ActualEndDate,
 		&p.Status, &p.ProgressPercent,
 		&p.ProjectManagerID, &p.ChiefEngineerID,
+		&p.WarehouseID,
 		&p.CreatedBy, &p.CreatedDate, &p.UpdatedDate,
 		&p.ProjectManagerName, &p.ChiefEngineerName,
+		&p.WarehouseName,
 		&p.SectionsCount, &p.TotalSmeta, &p.FilesCount,
 	)
 	if err == sql.ErrNoRows {
@@ -271,6 +281,9 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 	projMap["object_full_name"] = objectFullName
 	projMap["client_director_name"] = clientDirectorName
 	projMap["client_chief_accountant_name"] = clientChiefAccName
+
+	// warehouse_name is already populated by the SELECT/MarshalJSON path
+	// (LEFT JOIN warehouses w). No extra lookup needed here.
 
 	response.Success(c, projMap)
 }
@@ -325,9 +338,9 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 			project_type, building_type, total_area, floors_count,
 			contract_amount, currency,
 			contract_date, planned_start_date, planned_end_date,
-			status, project_manager_id, chief_engineer_id,
+			status, project_manager_id, chief_engineer_id, warehouse_id,
 			created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, NOW(), NOW())
 		RETURNING id, created_date
 	`
 
@@ -355,6 +368,7 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 		nullFloat64(req.ContractAmount), currency,
 		contractDate, plannedStart, plannedEnd,
 		"draft", nullUUID(req.ProjectManagerID), nullUUID(req.ChiefEngineerID),
+		nullUUID(req.WarehouseID),
 		userID,
 	).Scan(&projectID, &createdDate)
 	if err != nil {
@@ -528,6 +542,15 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("chief_engineer_id = $%d", argCount))
 		parsed, _ := uuid.Parse(*req.ChiefEngineerID)
 		args = append(args, parsed)
+	}
+	// Default warehouse. Pointer-typed so that an absent key leaves the
+	// column alone, and an explicit "" clears it (NULL = revert to
+	// auto-pick). nullUUID handles both cases — empty string parses to
+	// uuid.Nil which it represents as nil.
+	if req.WarehouseID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+		args = append(args, nullUUID(*req.WarehouseID))
 	}
 	if req.PlannedStartDate != nil {
 		argCount++
@@ -3370,6 +3393,12 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 		BillSubcontractor bool        `json:"bill_subcontractor"`
 		SubcontractID     int64       `json:"subcontract_id"`
 		BuildingID        int64       `json:"building_id"`
+		// StageID lets the caller attribute the auto-generated expense
+		// line to a specific section. Optional — when omitted the
+		// expense lands as project-wide and falls into the synthetic
+		// "(Boshqalar)" row in the Byudjet breakdown. Existing callers
+		// that don't set it keep working.
+		StageID int64 `json:"stage_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -3455,30 +3484,38 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 				expDesc += " (" + strings.Join(itemDescriptions, ", ") + ")"
 			}
 
+			// Optional stage_id from the request body — pass through to
+			// the expense INSERT so the Byudjet breakdown can attribute
+			// the row to a section. NULLIF(0,0)=NULL keeps backward-
+			// compatible behaviour when the caller doesn't supply one.
+			var stageIDInsert interface{}
+			if req.StageID > 0 {
+				stageIDInsert = req.StageID
+			}
 			if req.SubcontractID > 0 {
 				// Billed to subcontractor — supplier_name = subcontractor partner_name
 				var scPartnerName string
 				h.db.QueryRow(`SELECT COALESCE(partner_name, name) FROM construction_subcontract WHERE id = $1`, req.SubcontractID).Scan(&scPartnerName)
 				h.db.Exec(`
 					INSERT INTO construction_expense_lines (
-						tenant_id, organization_id, project_id, expense_date, description,
+						tenant_id, organization_id, project_id, stage_id, expense_date, description,
 						amount, currency_code, subcontract_id, material_request_id,
 						supplier_name, status, created_by, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6, 'UZS', $7, $8, $9, 'draft', $10, NOW(), NOW())
+					) VALUES ($1, $2, $3, $11, $4, $5, $6, 'UZS', $7, $8, $9, 'draft', $10, NOW(), NOW())
 				`, tenantID, organizationID, projectID, requestDate, expDesc,
-					totalAmount, req.SubcontractID, requestID, scPartnerName, userID)
+					totalAmount, req.SubcontractID, requestID, scPartnerName, userID, stageIDInsert)
 			} else {
 				// No subcontractor — supplier is the company itself
 				var orgName string
 				h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, organizationID).Scan(&orgName)
 				h.db.Exec(`
 					INSERT INTO construction_expense_lines (
-						tenant_id, organization_id, project_id, expense_date, description,
+						tenant_id, organization_id, project_id, stage_id, expense_date, description,
 						amount, currency_code, material_request_id,
 						supplier_name, status, created_by, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
+					) VALUES ($1, $2, $3, $10, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
 				`, tenantID, organizationID, projectID, requestDate, expDesc,
-					totalAmount, requestID, orgName, userID)
+					totalAmount, requestID, orgName, userID, stageIDInsert)
 			}
 		}
 	}
@@ -3850,6 +3887,19 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 
 	var totalExpense float64
 
+	// Project's chosen default warehouse (migration 365). When set, it
+	// becomes the second-priority fallback for items that don't supply
+	// their own warehouse_id — preferred over the legacy "highest stock
+	// anywhere" auto-pick. Same priority chain as reserveMaterialsForWork
+	// so material requests and YAKUNIY confirmations both target the
+	// same site warehouse.
+	var projectWarehouseID uuid.NullUUID
+	tx.QueryRow(`
+		SELECT warehouse_id
+		FROM construction_projects
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectWarehouseID)
+
 	for index, item := range items {
 		// Extract fields from item
 		productIDStr, _ := item["product_id"].(string)
@@ -3892,7 +3942,13 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 		if warehouseIDStr != "" {
 			warehouseID, _ = uuid.Parse(warehouseIDStr)
 		}
-		// If no warehouse specified, find best warehouse for this product/variant
+		// Project default takes precedence over the legacy "highest stock"
+		// auto-pick. Only consulted when the item itself didn't carry an
+		// explicit warehouse_id, preserving the per-line override.
+		if warehouseID == uuid.Nil && projectWarehouseID.Valid {
+			warehouseID = projectWarehouseID.UUID
+		}
+		// If still unresolved, find best warehouse for this product/variant
 		if warehouseID == uuid.Nil {
 			if variantID != nil {
 				tx.QueryRow(`SELECT warehouse_id FROM inventory WHERE tenant_id = $1 AND product_id = $2 AND variant_id = $3 AND quantity_on_hand > 0 ORDER BY quantity_on_hand DESC LIMIT 1`, tenantID, productID, variantID).Scan(&warehouseID)
