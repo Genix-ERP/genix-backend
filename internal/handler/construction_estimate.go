@@ -621,7 +621,56 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
 		       COALESCE(l.quantity_override, FALSE),
 		       COALESCE(l.material_type, 'standard'),
-		       COALESCE(l.original_quantity, l.quantity),
+		       -- Norma anchor for the Smeta boshqaruvi NORMA pill.
+		       -- Falls back from explicit anchor → current ledger → matching
+		       -- ВОР work's quantity. The ВОР fallback only fires for
+		       -- parent rows (resource_type = '') and rescues Единич
+		       -- template-mode imports whose own quantity/anchor are 0.
+		       COALESCE(
+		         NULLIF(l.original_quantity, 0),
+		         NULLIF(l.quantity, 0),
+		         CASE WHEN COALESCE(l.resource_type, '') = '' THEN (
+		             -- One ВОР row per work — pick the first matching one
+		             -- (lowest id ⇒ earliest import). Earlier this query
+		             -- summed across all matches, which double-counted
+		             -- when the user re-imported the same ВОР file (the
+		             -- old rows aren't deleted because each import gets
+		             -- a fresh estimate_id). Picking a single row keeps
+		             -- NORMA aligned with the file's stated quantity for
+		             -- this work, even if the user has re-imported.
+		             -- Restricted to the SAME building when the Единич
+		             -- estimate carries a building_id, so multi-block
+		             -- projects don't cross-pollinate quantities.
+		             SELECT vl.quantity
+		             FROM construction_estimate_line vl
+		             JOIN construction_estimate ve ON ve.id = vl.estimate_id
+		             WHERE ve.tenant_id = l.tenant_id
+		               AND ve.project_id = (
+		                 SELECT project_id FROM construction_estimate
+		                 WHERE id = l.estimate_id AND tenant_id = l.tenant_id
+		               )
+		               AND LOWER(COALESCE(ve.source_type, '')) = 'vor'
+		               AND (
+		                 ve.building_id IS NULL
+		                 OR ve.building_id = (
+		                   SELECT building_id FROM construction_estimate
+		                   WHERE id = l.estimate_id AND tenant_id = l.tenant_id
+		                 )
+		                 OR (
+		                   SELECT building_id FROM construction_estimate
+		                   WHERE id = l.estimate_id AND tenant_id = l.tenant_id
+		                 ) IS NULL
+		               )
+		               AND vl.name = l.name
+		               AND COALESCE(vl.parent_item_number, '') = COALESCE(l.parent_item_number, '')
+		               AND COALESCE(vl.resource_type, '') = ''
+		               AND COALESCE(vl.parent_line_id, 0) = 0
+		               AND vl.quantity > 0
+		             ORDER BY vl.id ASC
+		             LIMIT 1
+		         ) ELSE NULL END,
+		         0
+		       ),
 		       COALESCE(l.original_unit_rate, l.unit_rate),
 		       COALESCE(l.approval_status, 'pending'),
 		       COALESCE(l.done_quantity, 0),
@@ -894,14 +943,23 @@ func (h *Handler) CreateProjectResource(c *gin.Context) {
 		WHERE tenant_id = $1 AND project_id = $2 AND LOWER(COALESCE(source_type, '')) = 'catalog'
 		ORDER BY id ASC LIMIT 1
 	`, tenantID, projectID).Scan(&catalogID); err != nil {
-		// Not found — create it.
+		// Not found — create it. The unique index
+		// idx_construction_estimate_version covers (project_id, version),
+		// and the column defaults to 1 — which collides with the project's
+		// existing ВОР/Единич at version 1. We pick MAX(version)+1 so the
+		// catalog row slots in after whatever's already there. The
+		// version itself is meaningless for catalog estimates (they're a
+		// hidden bucket for project-level resources) but Postgres still
+		// needs it to be unique per project.
 		err = h.db.QueryRow(`
 			INSERT INTO construction_estimate (
-				tenant_id, project_id, name, state, source_type,
+				tenant_id, project_id, version, name, state, source_type,
 				overhead_pct, profit_pct, vat_pct,
 				created_by, created_date, updated_date
 			) VALUES (
-				$1, $2, '__catalog__', 'draft', 'catalog',
+				$1, $2,
+				COALESCE((SELECT MAX(version) FROM construction_estimate WHERE project_id = $2), 0) + 1,
+				'__catalog__', 'draft', 'catalog',
 				0, 0, 0,
 				$3, NOW(), NOW()
 			)
@@ -1019,6 +1077,11 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		sublineSeq        int
 		assignedItemNum   = req.ItemNumber
 	)
+	// parent metadata for the YAKUNIY-trigger path below.
+	var parentApprovalStatus string
+	var parentDoneQuantity float64
+	var parentSectionPath string
+	var parentName string
 	if req.ParentLineID > 0 {
 		var pItem, pUom, pParentItem sql.NullString
 		var pQty float64
@@ -1027,12 +1090,16 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		err := h.db.QueryRow(`
 			SELECT estimate_id, COALESCE(item_number, ''), COALESCE(uom, ''),
 			       COALESCE(quantity, 0), COALESCE(sort_order, 0),
-			       COALESCE(parent_item_number, '')
+			       COALESCE(parent_item_number, ''),
+			       COALESCE(approval_status, ''), COALESCE(done_quantity, 0),
+			       COALESCE(name, '')
 			FROM construction_estimate_line
 			WHERE id = $1 AND tenant_id = $2
 		`, req.ParentLineID, tenantID).Scan(
 			&pEstimateID, &pItem, &pUom, &pQty, &pSortOrder, &pParentItem,
+			&parentApprovalStatus, &parentDoneQuantity, &parentName,
 		)
+		parentSectionPath = pParentItem.String
 		if err == sql.ErrNoRows {
 			response.BadRequest(c, "Parent line not found")
 			return
@@ -1177,6 +1244,37 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
 
+	// YAKUNIY catch-up: when an ad-hoc resource is grafted onto a work
+	// that's already in confirmed_engineer state (e.g. the foreman
+	// remembered a missing material after final sign-off), the normal
+	// reserve→confirm pipeline never runs for it because both events are
+	// already in the past. Process the resource immediately so:
+	//   • inventory of the matching product is decremented (allowing
+	//     negative balance per product policy)
+	//   • a single approved expense_line is written with the new
+	//     resource's consumed cost
+	// We only run this when:
+	//   - parent is confirmed_engineer
+	//   - this row is a resource (resource_type set, norm_rate or override
+	//     gives a non-zero consumed quantity)
+	if parentLineIDSQL.Valid &&
+		parentApprovalStatus == "confirmed_engineer" &&
+		strings.TrimSpace(req.ResourceType) != "" {
+		// Consumed = override quantity if user pinned one, else
+		// parent.done_quantity × norm_rate (cascade rule).
+		consumed := req.Quantity
+		if !req.QuantityOverride {
+			consumed = parentDoneQuantity * req.NormRate
+		}
+		if consumed > 0 && req.UnitPrice > 0 {
+			h.processYakuniyAdHocResource(
+				c, tenantID, estimateID, req.ParentLineID, lineID,
+				req.Name, uom, req.UnitPrice, consumed, parentSectionPath,
+			)
+		}
+		_ = parentName // reserved for future audit description shapes
+	}
+
 	// Audit: parent rows are sub-stages, child rows are resources.
 	userIDLog, _ := middleware.GetUserID(c)
 	userNameLog := c.GetString("user_name")
@@ -1307,19 +1405,33 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 			materialType = "standard"
 		}
 
+		// original_quantity passthrough. When the import client sends a
+		// value (template-mode parents carry the file's planned norma),
+		// we write it explicitly so the migration 349 trigger sees a
+		// non-NULL value and leaves it alone. Without this path the
+		// trigger would default original_quantity = quantity = 0 and
+		// the Smeta boshqaruvi NORMA pill renders empty for every
+		// imported parent in template mode.
+		var origQtyArg interface{}
+		if line.OriginalQuantity != nil {
+			origQtyArg = *line.OriginalQuantity
+		}
+
 		_, err := tx.Exec(`
 			INSERT INTO construction_estimate_line (
 				tenant_id, estimate_id, wbs_id, name, uom, quantity,
 				material_rate, labor_rate, equipment_rate,
 				unit_rate, total_amount, code, item_number,
 				resource_type, material_type, parent_item_number, norm_rate, sort_order,
+				original_quantity,
 				created_date, updated_date
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW())
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW(), NOW())
 		`, tenantID, estimateID, nullInt64FromVal(line.WBSID),
 			line.Name, uom, line.Quantity,
 			line.MaterialRate, line.LaborRate, line.EquipmentRate,
 			unitRate, totalAmount, nullStringFromVal(line.Code), nullStringFromVal(line.ItemNumber),
 			nullStringFromVal(line.ResourceType), materialType, nullStringFromVal(line.ParentItemNumber), line.NormRate, sortOrder,
+			origQtyArg,
 		)
 		if err != nil {
 			h.log.Error("Failed to insert estimate line", "error", err, "index", i)
@@ -2130,7 +2242,56 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       l.parent_line_id, COALESCE(l.norm_rate, 0), COALESCE(l.subline_seq, 0),
 		       COALESCE(l.quantity_override, FALSE),
 		       COALESCE(l.material_type, 'standard'),
-		       COALESCE(l.original_quantity, l.quantity),
+		       -- Norma anchor for the Smeta boshqaruvi NORMA pill.
+		       -- Falls back from explicit anchor → current ledger → matching
+		       -- ВОР work's quantity. The ВОР fallback only fires for
+		       -- parent rows (resource_type = '') and rescues Единич
+		       -- template-mode imports whose own quantity/anchor are 0.
+		       COALESCE(
+		         NULLIF(l.original_quantity, 0),
+		         NULLIF(l.quantity, 0),
+		         CASE WHEN COALESCE(l.resource_type, '') = '' THEN (
+		             -- One ВОР row per work — pick the first matching one
+		             -- (lowest id ⇒ earliest import). Earlier this query
+		             -- summed across all matches, which double-counted
+		             -- when the user re-imported the same ВОР file (the
+		             -- old rows aren't deleted because each import gets
+		             -- a fresh estimate_id). Picking a single row keeps
+		             -- NORMA aligned with the file's stated quantity for
+		             -- this work, even if the user has re-imported.
+		             -- Restricted to the SAME building when the Единич
+		             -- estimate carries a building_id, so multi-block
+		             -- projects don't cross-pollinate quantities.
+		             SELECT vl.quantity
+		             FROM construction_estimate_line vl
+		             JOIN construction_estimate ve ON ve.id = vl.estimate_id
+		             WHERE ve.tenant_id = l.tenant_id
+		               AND ve.project_id = (
+		                 SELECT project_id FROM construction_estimate
+		                 WHERE id = l.estimate_id AND tenant_id = l.tenant_id
+		               )
+		               AND LOWER(COALESCE(ve.source_type, '')) = 'vor'
+		               AND (
+		                 ve.building_id IS NULL
+		                 OR ve.building_id = (
+		                   SELECT building_id FROM construction_estimate
+		                   WHERE id = l.estimate_id AND tenant_id = l.tenant_id
+		                 )
+		                 OR (
+		                   SELECT building_id FROM construction_estimate
+		                   WHERE id = l.estimate_id AND tenant_id = l.tenant_id
+		                 ) IS NULL
+		               )
+		               AND vl.name = l.name
+		               AND COALESCE(vl.parent_item_number, '') = COALESCE(l.parent_item_number, '')
+		               AND COALESCE(vl.resource_type, '') = ''
+		               AND COALESCE(vl.parent_line_id, 0) = 0
+		               AND vl.quantity > 0
+		             ORDER BY vl.id ASC
+		             LIMIT 1
+		         ) ELSE NULL END,
+		         0
+		       ),
 		       COALESCE(l.original_unit_rate, l.unit_rate),
 		       COALESCE(l.approval_status, 'pending'),
 		       COALESCE(l.done_quantity, 0),

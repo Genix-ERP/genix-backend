@@ -95,7 +95,25 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		stageArgs = append(stageArgs, bid)
 		argN++
 	}
-	stageQuery += ` ORDER BY stage_order ASC, id ASC`
+	// Order sections to match Bosqichlar. StagesTabV2 groups works by
+	// parent_item_number directly off the estimate, so a section's
+	// "first appearance" in the estimate (lowest sort_order among lines
+	// that reference it) defines its position. We mirror that here so
+	// users see ЗЕМЛЯННЫЕ РАБОТЫ → ФУНДАМЕНТЫ → … in the same order on
+	// both tabs, regardless of when the construction_stages rows were
+	// created. Falls back to stage_order/id when no estimate line
+	// references the section (manual stages, legacy data).
+	stageQuery += `
+		ORDER BY
+		    (SELECT MIN(el.sort_order)
+		       FROM construction_estimate_line el
+		       JOIN construction_estimate e ON e.id = el.estimate_id
+		       WHERE el.tenant_id = construction_stages.tenant_id
+		         AND e.project_id = construction_stages.project_id
+		         AND COALESCE(el.parent_item_number, '') = construction_stages.name
+		    ) ASC NULLS LAST,
+		    stage_order ASC,
+		    id ASC`
 
 	stageRows, err := h.db.Query(stageQuery, stageArgs...)
 	if err != nil {
@@ -137,13 +155,68 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		Name     string `json:"name"`
 		SubOrder int    `json:"sub_order"`
 		Status   string `json:"status"`
+		// Estimate-line derived fields. Used as plan/fact when the
+		// project does not maintain construction_sub_stage_materials /
+		// _equipment rows (the v2 estimate-driven workflow). Bosqichlar
+		// computes plan/fact the same way, so the two tabs agree.
+		ELQuantity     sql.NullFloat64
+		ELDoneQuantity sql.NullFloat64
+		ELUnitRate     sql.NullFloat64
+		ELTotalAmount  sql.NullFloat64
+		ELSubDerived   sql.NullFloat64
 	}
 
+	// Order matches the Bosqichlar (StagesTabV2) tab. Bosqichlar reads
+	// directly from construction_estimate_line and renders works in
+	// estimate `sort_order` (the same order the user imported them in).
+	// construction_sub_stages.name mirrors estimate_line.name and the
+	// parent stage.name mirrors estimate_line.parent_item_number, so we
+	// can resolve each sub-stage's "natural" order via that name pair
+	// against any of the project's edinich estimate lines. Falling back
+	// to ss.sub_order keeps the row visible if no matching estimate
+	// line exists (e.g. user-renamed sub-stages, manually-added rows).
+	//
+	// We also pull plan/fact-shaped fields off the matched estimate
+	// line so the assembly step downstream can fall back to estimate-
+	// derived totals when sub_stage_materials/_equipment are empty.
 	subRows, err := h.db.Query(`
-		SELECT id, stage_id, name, sub_order, status
-		FROM construction_sub_stages
-		WHERE tenant_id = $1 AND stage_id = ANY($2)
-		ORDER BY sub_order ASC, id ASC
+		SELECT ss.id, ss.stage_id, ss.name, ss.sub_order, ss.status,
+		       el.quantity, el.done_quantity, el.unit_rate, el.total_amount, el.sub_derived
+		FROM construction_sub_stages ss
+		JOIN construction_stages s ON s.id = ss.stage_id AND s.tenant_id = ss.tenant_id
+		LEFT JOIN LATERAL (
+			SELECT
+			    el.sort_order,
+			    el.item_number,
+			    -- original_quantity / original_unit_rate are the anchor values
+			    -- written on first INSERT and never updated; they survive the
+			    -- v2 done_quantity↔quantity sync that otherwise overwrites
+			    -- el.quantity, making plan==fact.
+			    COALESCE(el.original_quantity,  el.quantity, 0)  AS quantity,
+			    el.done_quantity,
+			    COALESCE(el.original_unit_rate, el.unit_rate, 0) AS unit_rate,
+			    el.total_amount,
+			    COALESCE((
+			        SELECT SUM(COALESCE(c.unit_rate, 0) * COALESCE(c.norm_rate, 0))
+			        FROM construction_estimate_line c
+			        WHERE c.parent_line_id = el.id
+			          AND c.tenant_id = el.tenant_id
+			          AND COALESCE(c.resource_type, '') <> ''
+			    ), 0) AS sub_derived
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id
+			WHERE el.tenant_id = ss.tenant_id
+			  AND e.project_id = s.project_id
+			  AND COALESCE(el.parent_item_number, '') = s.name
+			  AND el.name = ss.name
+			ORDER BY el.sort_order ASC, el.id ASC
+			LIMIT 1
+		) el ON TRUE
+		WHERE ss.tenant_id = $1 AND ss.stage_id = ANY($2)
+		ORDER BY el.sort_order ASC NULLS LAST,
+		         el.item_number ASC NULLS LAST,
+		         ss.sub_order ASC,
+		         ss.id ASC
 	`, tenantID, pq.Array(stageIDs))
 	if err != nil {
 		h.log.Error("Failed to load sub-stages", "error", err)
@@ -156,7 +229,10 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	subStagesMap := map[int64][]SubStage{} // stageID -> []SubStage
 	for subRows.Next() {
 		var ss SubStage
-		if err := subRows.Scan(&ss.ID, &ss.StageID, &ss.Name, &ss.SubOrder, &ss.Status); err != nil {
+		if err := subRows.Scan(
+			&ss.ID, &ss.StageID, &ss.Name, &ss.SubOrder, &ss.Status,
+			&ss.ELQuantity, &ss.ELDoneQuantity, &ss.ELUnitRate, &ss.ELTotalAmount, &ss.ELSubDerived,
+		); err != nil {
 			continue
 		}
 		subStageIDs = append(subStageIDs, ss.ID)
@@ -272,6 +348,8 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	// renders.
 	type workMeta struct {
 		id         int64
+		sortOrder  int
+		itemNumber string
 		name       string
 		uom        string
 		section    string
@@ -310,16 +388,29 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		// sub-rows so works whose own unit_rate is zero (common for
 		// ВОР-imported parents) still contribute — same fallback the
 		// Bosqichlar tab uses on the frontend.
+		// quantity vs original_quantity (migration 349):
+		//   `quantity` gets mirrored from done_quantity by the v2 sync
+		//   (Smeta ↔ Bosqichlar mirror task), so reading it here gives
+		//   plan == fact for every work the foreman has touched.
+		//   `original_quantity` is the value at first INSERT — never
+		//   updated post-insert, so it survives every UI-driven sync.
+		//   That's the "Reja" Bosqichlar shows in the REJA column.
+		// We coalesce to quantity for legacy rows that pre-date 349 and
+		// somehow still carry NULL anchors (the trigger handles new
+		// inserts but a manual SQL backfill could have missed older
+		// data).
 		linesQ := `
 			SELECT
 				l.id,
+				COALESCE(l.sort_order, 0)          AS sort_order,
+				COALESCE(l.item_number, '')        AS item_number,
 				COALESCE(l.name, '')               AS name,
 				COALESCE(l.uom, '')                AS uom,
 				COALESCE(l.parent_item_number, '') AS parent_item_number,
 				COALESCE(l.total_amount, 0)        AS total_amount,
-				COALESCE(l.quantity, 0)            AS quantity,
+				COALESCE(l.original_quantity, l.quantity, 0) AS quantity,
 				COALESCE(l.done_quantity, 0)       AS done_quantity,
-				COALESCE(l.unit_rate, 0)           AS unit_rate,
+				COALESCE(l.original_unit_rate, l.unit_rate, 0) AS unit_rate,
 				COALESCE(l.approval_status, '')    AS approval_status,
 				COALESCE((
 					SELECT SUM(COALESCE(s.unit_rate, 0) * COALESCE(s.norm_rate, 0))
@@ -341,11 +432,12 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 				defer lineRows.Close()
 				for lineRows.Next() {
 					var (
-						lineID                                        int64
-						lineName, lineUOM, parentItem, approvalStatus string
-						totalAmt, qty, doneQty, unitRate, subDerived  float64
+						lineID                                                    int64
+						lineSortOrder                                             int
+						lineItemNumber, lineName, lineUOM, parentItem, approvalStatus string
+						totalAmt, qty, doneQty, unitRate, subDerived              float64
 					)
-					if err := lineRows.Scan(&lineID, &lineName, &lineUOM, &parentItem,
+					if err := lineRows.Scan(&lineID, &lineSortOrder, &lineItemNumber, &lineName, &lineUOM, &parentItem,
 						&totalAmt, &qty, &doneQty, &unitRate, &approvalStatus, &subDerived); err != nil {
 						continue
 					}
@@ -366,10 +458,14 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 					if rate <= 0 {
 						rate = subDerived
 					}
-					plan := totalAmt
-					if plan <= 0 {
-						plan = rate * qty
-					}
+					// Plan is always rate × qty to match Bosqichlar's REJA
+					// JAMI column exactly. We used to fall back to a
+					// stored total_amount, but in practice that column
+					// drifts (gets re-saved as rate × done after a YAKUNIY
+					// confirm in some legacy paths), which made Reja vs
+					// Fakt show equal plan/fact even when Bosqichlar showed
+					// them apart. Recomputing here is cheap and bulletproof.
+					plan := rate * qty
 					// Use the raw done quantity — over-completion (done >
 					// qty) MUST surface in the fact column. Capping made
 					// the parent FAKT JAMI silently equal REJA JAMI when
@@ -381,6 +477,8 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 
 					workByID[lineID] = workMeta{
 						id:         lineID,
+						sortOrder:  lineSortOrder,
+						itemNumber: lineItemNumber,
 						name:       lineName,
 						uom:        lineUOM,
 						section:    name,
@@ -475,62 +573,48 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		}
 
 		sr.SubStages = []SubStageResult{}
-		for _, sub := range subs {
-			ssr := SubStageResult{SubStage: sub}
 
-			mats := materialsMap[sub.ID]
-			if mats == nil {
-				mats = []MaterialRow{}
-			}
-			ssr.Materials = mats
-
-			eqs := equipmentMap[sub.ID]
-			if eqs == nil {
-				eqs = []EquipmentRow{}
-			}
-			ssr.Equipment = eqs
-
-			for _, m := range mats {
-				ssr.MaterialPlanTotal += m.PlanAmount
-				ssr.MaterialFactTotal += m.FactAmount
-			}
-			for _, e := range eqs {
-				ssr.EquipPlanTotal += e.PlanAmount
-				ssr.EquipFactTotal += e.FactAmount
-			}
-			ssr.PlanTotal = ssr.MaterialPlanTotal + ssr.EquipPlanTotal
-			ssr.FactTotal = ssr.MaterialFactTotal + ssr.EquipFactTotal
-			ssr.Difference = ssr.PlanTotal - ssr.FactTotal
-
-			sr.MaterialPlanTotal += ssr.MaterialPlanTotal
-			sr.MaterialFactTotal += ssr.MaterialFactTotal
-			sr.EquipPlanTotal += ssr.EquipPlanTotal
-			sr.EquipFactTotal += ssr.EquipFactTotal
-
-			sr.SubStages = append(sr.SubStages, ssr)
-		}
-
-		// Project the estimate-line work rows that match this stage into
-		// virtual SubStageResults so the page can render expandable rows
-		// per work (УСТРОЙСТВО БЕТОННОЙ ПОДГОТОВКИ → its labour / machine /
-		// material breakdown) instead of just a "Bosqich jami:" total.
+		// Estimate-line work projection FIRST. Bosqichlar is the source
+		// of truth for v2 projects — works come from
+		// construction_estimate_line sorted by sort_order/id (the same
+		// order foremen see when they confirm работы). We render those
+		// works in this exact order, then below add any legacy real
+		// construction_sub_stages rows whose names don't match (so
+		// stale, manually-renamed, or ad-hoc sub-stages don't disappear).
 		//
 		// Materials = sub-rows with resource_type='material'.
 		// Equipment = labour + machine sub-rows. The page labels this
 		// table "Equipment" — semantically a bit loose but the existing
 		// UI already groups labour with equipment, and splitting them
 		// would need a third panel that doesn't exist on the frontend yet.
-		// Stable order: ascending line.id matches the SmetaImportModal
-		// insert order, which in turn matches the sort_order seen in the
-		// Bosqichlar tab. Without sorting we'd reshuffle the works on
-		// every reload (map iteration is randomized in Go).
 		stageWorkIDs := make([]int64, 0, len(workByID))
 		for id, w := range workByID {
 			if w.section == sr.Name {
 				stageWorkIDs = append(stageWorkIDs, id)
 			}
 		}
-		sort.Slice(stageWorkIDs, func(i, j int) bool { return stageWorkIDs[i] < stageWorkIDs[j] })
+		// Sort by the estimate line's sort_order (Bosqichlar's display
+		// order) → item_number (covers ties from the same imported
+		// section) → id (final stable tiebreaker for legacy rows
+		// without sort_order/item_number).
+		sort.Slice(stageWorkIDs, func(i, j int) bool {
+			a := workByID[stageWorkIDs[i]]
+			b := workByID[stageWorkIDs[j]]
+			if a.sortOrder != b.sortOrder {
+				return a.sortOrder < b.sortOrder
+			}
+			if a.itemNumber != b.itemNumber {
+				return a.itemNumber < b.itemNumber
+			}
+			return stageWorkIDs[i] < stageWorkIDs[j]
+		})
+
+		// Track work names projected from estimate lines so we can drop
+		// matching real sub-stages below. Without this the UI shows two
+		// rows for the same work — synthetic with the right numbers,
+		// real with 0/0 because the legacy materials/equipment tables
+		// are empty for v2 projects.
+		projectedNames := make(map[string]bool, len(stageWorkIDs))
 		// Synthetic-row id counter — gives every projected MaterialRow /
 		// EquipmentRow a unique negative id so React's `key={mat.id}` /
 		// `key={eq.id}` lookups don't collide with each other or with
@@ -538,13 +622,31 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		var synthRowID int64 = -1
 		for _, wid := range stageWorkIDs {
 			w := workByID[wid]
+			// Normalize the work's approval_status (pending /
+			// in_progress / submitted / confirmed_supervisor /
+			// confirmed_engineer) into the simpler not_started /
+			// in_progress / completed scheme the section pill uses.
+			// Without this the row would render an empty / unknown
+			// pill for "submitted" or "confirmed_supervisor", since
+			// the frontend's STATUS_COLORS map only has the simple keys.
+			workDisplayStatus := "not_started"
+			switch w.status {
+			case "confirmed_engineer":
+				workDisplayStatus = "completed"
+			case "in_progress", "submitted", "confirmed_supervisor":
+				workDisplayStatus = "in_progress"
+			default:
+				if w.parentDone > 0 {
+					workDisplayStatus = "in_progress"
+				}
+			}
 			vsub := SubStageResult{
 				SubStage: SubStage{
 					ID:       -w.id, // negative = synthetic, won't collide with real sub_stage ids
 					StageID:  sr.ID,
 					Name:     w.name,
 					SubOrder: 0,
-					Status:   w.status,
+					Status:   workDisplayStatus,
 				},
 				Materials: []MaterialRow{},
 				Equipment: []EquipmentRow{},
@@ -617,11 +719,125 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			sr.MaterialFactTotal += vsub.MaterialFactTotal
 			sr.EquipPlanTotal += vsub.EquipPlanTotal
 			sr.EquipFactTotal += vsub.EquipFactTotal
+
+			// Mark this name as projected so the legacy real-sub-stages
+			// loop below skips it. Same case-insensitive trim treatment
+			// used for matching elsewhere.
+			projectedNames[strings.ToLower(strings.TrimSpace(w.name))] = true
+		}
+
+		// Real construction_sub_stages rows that DIDN'T match any
+		// estimate-line work in this stage. Keeps legacy v1 data
+		// visible (renamed/manual sub-stages, ad-hoc rows) while v2
+		// estimate-line projections drive the order and numbers above.
+		for _, sub := range subs {
+			if projectedNames[strings.ToLower(strings.TrimSpace(sub.Name))] {
+				continue
+			}
+			ssr := SubStageResult{SubStage: sub}
+
+			mats := materialsMap[sub.ID]
+			if mats == nil {
+				mats = []MaterialRow{}
+			}
+			ssr.Materials = mats
+
+			eqs := equipmentMap[sub.ID]
+			if eqs == nil {
+				eqs = []EquipmentRow{}
+			}
+			ssr.Equipment = eqs
+
+			for _, m := range mats {
+				ssr.MaterialPlanTotal += m.PlanAmount
+				ssr.MaterialFactTotal += m.FactAmount
+			}
+			for _, e := range eqs {
+				ssr.EquipPlanTotal += e.PlanAmount
+				ssr.EquipFactTotal += e.FactAmount
+			}
+			ssr.PlanTotal = ssr.MaterialPlanTotal + ssr.EquipPlanTotal
+			ssr.FactTotal = ssr.MaterialFactTotal + ssr.EquipFactTotal
+
+			// Estimate-line fallback if the legacy materials/equipment
+			// tables happen to be empty even when the sub-stage was
+			// manually linked to an estimate line via name.
+			if ssr.PlanTotal == 0 && ssr.FactTotal == 0 {
+				qty := 0.0
+				if sub.ELQuantity.Valid {
+					qty = sub.ELQuantity.Float64
+				}
+				done := 0.0
+				if sub.ELDoneQuantity.Valid {
+					done = sub.ELDoneQuantity.Float64
+				}
+				rate := 0.0
+				switch {
+				case sub.ELUnitRate.Valid && sub.ELUnitRate.Float64 > 0:
+					rate = sub.ELUnitRate.Float64
+				case sub.ELTotalAmount.Valid && sub.ELTotalAmount.Float64 > 0 && qty > 0:
+					rate = sub.ELTotalAmount.Float64 / qty
+				case sub.ELSubDerived.Valid && sub.ELSubDerived.Float64 > 0:
+					rate = sub.ELSubDerived.Float64
+				}
+				if rate > 0 {
+					ssr.MaterialPlanTotal = qty * rate
+					ssr.MaterialFactTotal = done * rate
+					ssr.PlanTotal = ssr.MaterialPlanTotal
+					ssr.FactTotal = ssr.MaterialFactTotal
+				}
+			}
+			ssr.Difference = ssr.PlanTotal - ssr.FactTotal
+
+			sr.SubStages = append(sr.SubStages, ssr)
+			sr.MaterialPlanTotal += ssr.MaterialPlanTotal
+			sr.MaterialFactTotal += ssr.MaterialFactTotal
+			sr.EquipPlanTotal += ssr.EquipPlanTotal
+			sr.EquipFactTotal += ssr.EquipFactTotal
 		}
 
 		sr.PlanTotal = sr.MaterialPlanTotal + sr.EquipPlanTotal
 		sr.FactTotal = sr.MaterialFactTotal + sr.EquipFactTotal
 		sr.Difference = sr.PlanTotal - sr.FactTotal
+
+		// Derive the section's display status from the works in it
+		// rather than from the stored construction_stages.status (which
+		// nobody reliably updates — that column was set once at section
+		// auto-create and never moves). Rule:
+		//   • any work past `pending` (in_progress / submitted /
+		//     confirmed_supervisor / confirmed_engineer) OR with a
+		//     non-zero done_quantity → section is `in_progress`
+		//   • all works confirmed_engineer (locked) AND >=1 work →
+		//     section is `completed`
+		//   • else → keep stored status (typically `not_started`).
+		//
+		// Mirrors what Bosqichlar shows (the "JARAYONDA / TUGALLANGAN /
+		// BOSHLANMAGAN" pill comes from the same derivation) so the two
+		// pages agree.
+		{
+			anyStarted := false
+			allConfirmed := true
+			workCount := 0
+			for _, wid := range stageWorkIDs {
+				w := workByID[wid]
+				workCount++
+				if w.parentDone > 0 {
+					anyStarted = true
+				}
+				if w.status != "" && w.status != "pending" {
+					anyStarted = true
+				}
+				if w.status != "confirmed_engineer" {
+					allConfirmed = false
+				}
+			}
+			if workCount > 0 && allConfirmed {
+				sr.Status = "completed"
+			} else if anyStarted {
+				sr.Status = "in_progress"
+			}
+			// else: leave whatever stg.Status was (usually "not_started").
+		}
 
 		totalMaterialPlan += sr.MaterialPlanTotal
 		totalMaterialFact += sr.MaterialFactTotal
