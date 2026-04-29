@@ -129,7 +129,12 @@ WITH effective AS (
         COALESCE(l.unit_rate, 0)   AS unit_rate,
         COALESCE(l.total_amount, 0) AS total_amount,
         COALESCE(l.confirmed_engineer_at, NOW()) AS confirmed_at,
-        COALESCE(l.confirmed_engineer_by, l.created_by) AS confirmed_by,
+        -- construction_estimate_line has no created_by column (only
+        -- created_date / updated_date); migration 353 added
+        -- confirmed_engineer_by directly. NULL is acceptable downstream
+        -- because construction_expense_lines.approved_by and created_by
+        -- are both nullable.
+        l.confirmed_engineer_by AS confirmed_by,
         COALESCE((
             SELECT SUM(COALESCE(s.unit_rate, 0) * COALESCE(s.norm_rate, 0))
             FROM construction_estimate_line s
