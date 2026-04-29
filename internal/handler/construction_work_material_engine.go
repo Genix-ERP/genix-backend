@@ -37,6 +37,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
@@ -111,11 +113,12 @@ func (h *Handler) reserveMaterialsForWork(tenantID, orgID, userID uuid.UUID, pro
 	// hasn't picked one, in which case the existing auto-pick chain
 	// (highest-stock → oldest-active) takes over downstream.
 	var projectWarehouseID uuid.NullUUID
+	var projectOrgID uuid.NullUUID
 	_ = h.db.QueryRow(`
-		SELECT warehouse_id
+		SELECT warehouse_id, organization_id
 		FROM construction_projects
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, projectID, tenantID).Scan(&projectWarehouseID)
+	`, projectID, tenantID).Scan(&projectWarehouseID, &projectOrgID)
 
 	now := time.Now()
 	created := 0
@@ -149,20 +152,46 @@ func (h *Handler) reserveMaterialsForWork(tenantID, orgID, userID uuid.UUID, pro
 			continue
 		}
 
-		// Pick a warehouse. Three-step chain:
+		// Pick a warehouse. Multi-step chain, all org-aware so the row
+		// lands somewhere the project's company can actually see in the
+		// products tab (Inventory.jsx filters inventory rows whose
+		// warehouse.organization_id != activeCompany.id, so a row that
+		// lands in a different-org warehouse is invisible — the user
+		// sees "Qoldiq yo'q" even though the DB has the deduction).
+		//
 		//   0. Project's chosen default (construction_projects.warehouse_id,
-		//      migration 365). When set, every sub-line of every work in
-		//      this project lands on the same warehouse — predictable for
-		//      the project manager, no surprise debits to other sites.
-		//   1. Whichever warehouse already has the most stock for this
-		//      product (legacy behaviour, kept as fallback for projects
-		//      that haven't chosen a default).
-		//   2. Oldest active tenant warehouse — last-ditch so we always
-		//      have a row to write to (stock is allowed to go negative
-		//      per product feedback).
+		//      migration 365) — explicit user pick, always wins.
+		//   1. Same-org highest-stock for this product — keeps the org
+		//      isolation guarantee while preserving the "consume from
+		//      where it lives" intuition.
+		//   2. Same-org oldest active warehouse — last-ditch within the
+		//      project's company.
+		//   3. Tenant-wide oldest active warehouse — only if the project
+		//      has no organization at all (rare). Stock may end up
+		//      invisible, but a row is better than dropping silently.
 		var warehouseID uuid.UUID
 		if projectWarehouseID.Valid {
 			warehouseID = projectWarehouseID.UUID
+		}
+		if warehouseID == uuid.Nil && projectOrgID.Valid {
+			_ = h.db.QueryRow(`
+				SELECT inv.warehouse_id
+				FROM inventory inv
+				JOIN warehouses w ON w.id = inv.warehouse_id
+				WHERE inv.product_id = $1 AND inv.tenant_id = $2
+				  AND w.organization_id = $3
+				ORDER BY inv.quantity_on_hand DESC NULLS LAST
+				LIMIT 1
+			`, productID, tenantID, projectOrgID.UUID).Scan(&warehouseID)
+		}
+		if warehouseID == uuid.Nil && projectOrgID.Valid {
+			_ = h.db.QueryRow(`
+				SELECT id FROM warehouses
+				WHERE tenant_id = $1
+				  AND organization_id = $2
+				  AND COALESCE(is_active, true) = true
+				ORDER BY created_at LIMIT 1
+			`, tenantID, projectOrgID.UUID).Scan(&warehouseID)
 		}
 		if warehouseID == uuid.Nil {
 			_ = h.db.QueryRow(`
@@ -670,4 +699,236 @@ func (h *Handler) cancelMaterialsForWork(tenantID uuid.UUID, workID int64) {
 
 	h.log.Info("cancelMaterialsForWork: complete",
 		"work_id", workID, "cancelled", cancelled)
+}
+
+// processYakuniyAdHocResource handles a single resource line that gets
+// grafted onto a work that's already been engineer-confirmed. The normal
+// reserveMaterialsForWork → finaliseMaterialsForWork pipeline can't help
+// here because both events have already passed for the parent work.
+//
+// We do the minimum needed for the page to be self-consistent:
+//   • inventory of the matching product is decremented by `consumed`
+//     (allowed to go negative — same policy as finaliseMaterialsForWork)
+//   • a single approved expense_line is written for `consumed × unit_rate`
+//     so the Moliya → Xarajatlar feed and Byudjet Fakt totals reflect
+//     the new resource's cost
+//
+// We do NOT create a `pending` reservation row — there's nothing to
+// "reserve" anymore once the work is locked, and skipping reservations
+// keeps the post-confirmation audit trail tied to the resource line
+// directly via the expense's description.
+//
+// All steps are best-effort: errors are logged but the parent CreateLine
+// HTTP response still succeeds. Worst case the user sees the line but
+// has to re-trigger inventory manually — preferable to bouncing the
+// whole add-resource UI just because one warehouse op failed.
+func (h *Handler) processYakuniyAdHocResource(
+	c *gin.Context,
+	tenantID uuid.UUID,
+	estimateID, parentLineID, lineID int64,
+	resourceName, uom string,
+	unitPrice, consumed float64,
+	parentSectionPath string,
+) {
+	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
+
+	// Resolve the project + building of the parent work via its estimate.
+	var projectID int64
+	var buildingID sql.NullInt64
+	if err := h.db.QueryRow(`
+		SELECT project_id, building_id
+		FROM construction_estimate
+		WHERE id = $1 AND tenant_id = $2
+	`, estimateID, tenantID).Scan(&projectID, &buildingID); err != nil {
+		h.log.Error("processYakuniyAdHocResource: failed to load estimate", "error", err, "estimate_id", estimateID)
+		return
+	}
+
+	// Pull the project's default warehouse + owning organization. Both
+	// drive the warehouse picker below so the inventory row lands
+	// somewhere the project's company can actually see (the products
+	// tab filters out inventory in warehouses owned by a DIFFERENT org
+	// than the active company).
+	var projectWarehouseID uuid.NullUUID
+	var projectOrgID uuid.NullUUID
+	_ = h.db.QueryRow(`
+		SELECT warehouse_id, organization_id
+		FROM construction_projects
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectWarehouseID, &projectOrgID)
+
+	// Resolve the matching product by case-insensitive name match. If not
+	// found we skip inventory decrement but still write the expense — the
+	// resource may be a service item (no SKU) and the user expects the
+	// cost to land on the project regardless.
+	var productID uuid.UUID
+	_ = h.db.QueryRow(`
+		SELECT id FROM products
+		WHERE tenant_id = $1
+		  AND deleted_at IS NULL
+		  AND UPPER(name) = UPPER($2)
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, tenantID, resourceName).Scan(&productID)
+
+	// Pick a warehouse — same chain as reserveMaterialsForWork, all
+	// org-aware so the resulting inventory row is visible in the
+	// project's company's products tab.
+	//   0. Project's chosen default
+	//   1. Same-org highest-stock for this product
+	//   2. Same-org oldest active warehouse
+	//   3. Tenant-wide oldest active (only when project has no org)
+	var warehouseID uuid.UUID
+	if projectWarehouseID.Valid {
+		warehouseID = projectWarehouseID.UUID
+	}
+	if warehouseID == uuid.Nil && productID != uuid.Nil && projectOrgID.Valid {
+		_ = h.db.QueryRow(`
+			SELECT inv.warehouse_id
+			FROM inventory inv
+			JOIN warehouses w ON w.id = inv.warehouse_id
+			WHERE inv.product_id = $1 AND inv.tenant_id = $2
+			  AND w.organization_id = $3
+			ORDER BY inv.quantity_on_hand DESC NULLS LAST
+			LIMIT 1
+		`, productID, tenantID, projectOrgID.UUID).Scan(&warehouseID)
+	}
+	if warehouseID == uuid.Nil && projectOrgID.Valid {
+		_ = h.db.QueryRow(`
+			SELECT id FROM warehouses
+			WHERE tenant_id = $1
+			  AND organization_id = $2
+			  AND COALESCE(is_active, true) = true
+			ORDER BY created_at LIMIT 1
+		`, tenantID, projectOrgID.UUID).Scan(&warehouseID)
+	}
+	if warehouseID == uuid.Nil && productID != uuid.Nil {
+		_ = h.db.QueryRow(`
+			SELECT warehouse_id FROM inventory
+			WHERE product_id = $1 AND tenant_id = $2
+			ORDER BY quantity_on_hand DESC NULLS LAST
+			LIMIT 1
+		`, productID, tenantID).Scan(&warehouseID)
+	}
+	if warehouseID == uuid.Nil {
+		_ = h.db.QueryRow(`
+			SELECT id FROM warehouses
+			WHERE tenant_id = $1 AND COALESCE(is_active, true) = true
+			ORDER BY created_at LIMIT 1
+		`, tenantID).Scan(&warehouseID)
+	}
+
+	now := time.Now()
+
+	// Inventory decrement (best-effort). UPDATE first; INSERT a negative
+	// row when no inventory row exists so the deduction is visible.
+	if productID != uuid.Nil && warehouseID != uuid.Nil {
+		result, exErr := h.db.Exec(`
+			UPDATE inventory
+			SET quantity_on_hand = COALESCE(quantity_on_hand, 0) - $1,
+			    updated_at       = $2
+			WHERE product_id = $3 AND warehouse_id = $4 AND tenant_id = $5
+		`, consumed, now, productID, warehouseID, tenantID)
+		if exErr != nil {
+			h.log.Error("processYakuniyAdHocResource: inventory update failed",
+				"error", exErr, "product_id", productID, "consumed", consumed)
+		} else if affected, _ := result.RowsAffected(); affected == 0 {
+			if _, insErr := h.db.Exec(`
+				INSERT INTO inventory (
+					id, tenant_id, product_id, warehouse_id,
+					quantity_on_hand, quantity_reserved,
+					created_at, updated_at
+				) VALUES (gen_random_uuid(), $1, $2, $3, -$4, 0, $5, $5)
+			`, tenantID, productID, warehouseID, consumed, now); insErr != nil {
+				h.log.Error("processYakuniyAdHocResource: inventory insert failed",
+					"error", insErr, "product_id", productID)
+			}
+		}
+	}
+
+	// Resolve the section's stage_id (same lookup the work-level handler
+	// uses) so the expense lands in the right Byudjet bucket.
+	var stageIDForExpense sql.NullInt64
+	if parentSectionPath != "" {
+		var stageID int64
+		if buildingID.Valid {
+			if err := h.db.QueryRow(`
+				SELECT id FROM construction_stages
+				WHERE tenant_id = $1 AND project_id = $2 AND name = $3 AND building_id = $4
+				ORDER BY id ASC LIMIT 1
+			`, tenantID, projectID, parentSectionPath, buildingID.Int64).Scan(&stageID); err == nil {
+				stageIDForExpense = sql.NullInt64{Int64: stageID, Valid: true}
+			}
+		}
+		if !stageIDForExpense.Valid {
+			if err := h.db.QueryRow(`
+				SELECT id FROM construction_stages
+				WHERE tenant_id = $1 AND project_id = $2 AND name = $3
+				ORDER BY id ASC LIMIT 1
+			`, tenantID, projectID, parentSectionPath).Scan(&stageID); err == nil {
+				stageIDForExpense = sql.NullInt64{Int64: stageID, Valid: true}
+			}
+		}
+	}
+
+	// Resolve the project's organization for the expense row.
+	var orgIDArg interface{}
+	{
+		var orgIDFromProject sql.NullString
+		_ = h.db.QueryRow(`
+			SELECT organization_id::text FROM construction_projects
+			WHERE id = $1 AND tenant_id = $2
+		`, projectID, tenantID).Scan(&orgIDFromProject)
+		if orgIDFromProject.Valid {
+			if u, err := uuid.Parse(orgIDFromProject.String); err == nil {
+				orgIDArg = u
+			}
+		}
+		if orgIDArg == nil && orgID != uuid.Nil {
+			orgIDArg = orgID
+		}
+	}
+
+	// Resolve a supplier display name (project's company).
+	var companyName string
+	if u, ok := orgIDArg.(uuid.UUID); ok && u != uuid.Nil {
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, u).Scan(&companyName)
+	}
+
+	// Approved expense line. Description ties it to the parent work id
+	// + the resource name so the Moliya → Xarajatlar list reads
+	// naturally and `Yakunlangan ish #N — <resource>` keeps the same
+	// shape as legacy per-reservation rows.
+	cost := consumed * unitPrice
+	if cost <= 0 {
+		return
+	}
+	desc := fmt.Sprintf("Yakunlangan ish #%d — %s", parentLineID, resourceName)
+	if _, exErr := h.db.Exec(`
+		INSERT INTO construction_expense_lines (
+			tenant_id, organization_id, project_id, stage_id,
+			expense_date, description,
+			quantity, uom, unit_price,
+			amount, currency_code,
+			supplier_name, status, approved_by, approved_at,
+			created_by, created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $11,
+			$4::date, $5,
+			$6, $7, $8,
+			$9, 'UZS',
+			$10, 'approved', NULL, $4,
+			$12, $4, $4
+		)
+	`, tenantID, orgIDArg, projectID, now, desc,
+		consumed, uom, unitPrice,
+		cost, companyName, stageIDForExpense, uuidArg(userID)); exErr != nil {
+		h.log.Error("processYakuniyAdHocResource: expense insert failed",
+			"error", exErr, "parent_line_id", parentLineID, "resource", resourceName)
+	}
+
+	h.log.Info("processYakuniyAdHocResource: complete",
+		"parent_line_id", parentLineID, "resource_line_id", lineID,
+		"resource", resourceName, "consumed", consumed, "cost", cost)
 }

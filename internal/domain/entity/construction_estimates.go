@@ -336,6 +336,15 @@ type CreateEstimateLineInput struct {
 	ParentItemNumber string `json:"parent_item_number"`
 	SortOrder        int    `json:"sort_order"`
 
+	// OriginalQuantity (migration 349 anchor). When provided, the bulk
+	// insert writes it directly — bypassing the trigger that would
+	// otherwise default to Quantity. Used by Единич/Ресурс template
+	// imports so the planned norma from the source file survives even
+	// though the live Quantity ledger column is forced to 0.
+	// *float64 so callers can omit (NULL → trigger fills from Quantity)
+	// without colliding with the explicit-zero case.
+	OriginalQuantity *float64 `json:"original_quantity"`
+
 	// Sub-line support (migration 332). When ParentLineID != 0, the server:
 	//   - looks up the parent
 	//   - auto-generates ItemNumber = "{parent.item_number}-{next_subline_seq}"
