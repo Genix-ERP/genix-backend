@@ -622,13 +622,23 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       COALESCE(l.quantity_override, FALSE),
 		       COALESCE(l.material_type, 'standard'),
 		       -- Norma anchor for the Smeta boshqaruvi NORMA pill.
-		       -- Falls back from explicit anchor → current ledger → matching
-		       -- ВОР work's quantity. The ВОР fallback only fires for
-		       -- parent rows (resource_type = '') and rescues Единич
-		       -- template-mode imports whose own quantity/anchor are 0.
+		       -- Falls back from explicit anchor → matching ВОР work's
+		       -- quantity. The ВОР fallback only fires for parent rows
+		       -- (resource_type = '') and rescues Единич template-mode
+		       -- imports whose own anchor is 0.
+		       --
+		       -- IMPORTANT: we deliberately do NOT fall back to
+		       -- l.quantity here. l.quantity is the live FAKT ledger
+		       -- (mirrored from done_quantity by UpdateEstimateLine), so
+		       -- coupling NORMA to it makes NORMA visibly follow FAKT
+		       -- as the user types — exactly the bug the user reported
+		       -- ("when i change Fakt, Norma is also changing"). Skipping
+		       -- the fallback means rows with no anchor and no ВОР match
+		       -- render NORMA as "—", which is correct (we genuinely
+		       -- don't know the planned amount) and harmless to the
+		       -- numeric calculations that read original_quantity directly.
 		       COALESCE(
 		         NULLIF(l.original_quantity, 0),
-		         NULLIF(l.quantity, 0),
 		         CASE WHEN COALESCE(l.resource_type, '') = '' THEN (
 		             -- One ВОР row per work — pick the first matching one
 		             -- (lowest id ⇒ earliest import). Earlier this query
@@ -1266,7 +1276,19 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		if !req.QuantityOverride {
 			consumed = parentDoneQuantity * req.NormRate
 		}
-		if consumed > 0 && req.UnitPrice > 0 {
+		// We deliberately drop the legacy `req.UnitPrice > 0` guard from
+		// this gate. Inventory decrement is a physical-reality
+		// bookkeeping step — when the foreman says "I consumed 330 шт of
+		// test 11" the warehouse balance has to follow even if the user
+		// didn't bother to fill in a price for that ad-hoc resource.
+		// processYakuniyAdHocResource itself still gates the EXPENSE
+		// write on cost > 0 (an empty price means there's no money line
+		// to record), so a price-less resource produces an inventory
+		// decrement without a phantom 0-сум expense row. The user-
+		// reported case "test 11 — REJA SARF 11 / FAKT SARF 330,
+		// inventory still 0" is exactly this path: ad-hoc material
+		// added with no unit price never triggered the engine.
+		if consumed > 0 {
 			h.processYakuniyAdHocResource(
 				c, tenantID, estimateID, req.ParentLineID, lineID,
 				req.Name, uom, req.UnitPrice, consumed, parentSectionPath,
@@ -1357,6 +1379,29 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 			req.SourceType, estimateID, tenantID)
 		if stErr != nil {
 			h.log.Error("Failed to update source_type on estimate", "error", stErr, "source_type", req.SourceType)
+		}
+	}
+
+	// Imported-budget capture (migration 369). Only updates the columns
+	// that arrived non-zero so non-Ресурс re-imports don't wipe an
+	// already-stored budget. The Reja vs Fakt summary handler reads
+	// these to display the canonical project budget.
+	if req.BudgetTotal > 0 || req.MaterialBudget > 0 || req.TransportBudget > 0 {
+		_, bErr := tx.Exec(`
+			UPDATE construction_estimate
+			SET budget_total     = CASE WHEN $1 > 0 THEN $1 ELSE budget_total END,
+			    material_budget  = CASE WHEN $2 > 0 THEN $2 ELSE material_budget END,
+			    transport_budget = CASE WHEN $3 > 0 THEN $3 ELSE transport_budget END
+			WHERE id = $4 AND tenant_id = $5`,
+			req.BudgetTotal, req.MaterialBudget, req.TransportBudget,
+			estimateID, tenantID)
+		if bErr != nil {
+			h.log.Error("Failed to persist imported budget on estimate",
+				"error", bErr,
+				"budget_total", req.BudgetTotal,
+				"material_budget", req.MaterialBudget,
+				"transport_budget", req.TransportBudget,
+				"estimate_id", estimateID)
 		}
 	}
 
@@ -2243,13 +2288,23 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       COALESCE(l.quantity_override, FALSE),
 		       COALESCE(l.material_type, 'standard'),
 		       -- Norma anchor for the Smeta boshqaruvi NORMA pill.
-		       -- Falls back from explicit anchor → current ledger → matching
-		       -- ВОР work's quantity. The ВОР fallback only fires for
-		       -- parent rows (resource_type = '') and rescues Единич
-		       -- template-mode imports whose own quantity/anchor are 0.
+		       -- Falls back from explicit anchor → matching ВОР work's
+		       -- quantity. The ВОР fallback only fires for parent rows
+		       -- (resource_type = '') and rescues Единич template-mode
+		       -- imports whose own anchor is 0.
+		       --
+		       -- IMPORTANT: we deliberately do NOT fall back to
+		       -- l.quantity here. l.quantity is the live FAKT ledger
+		       -- (mirrored from done_quantity by UpdateEstimateLine), so
+		       -- coupling NORMA to it makes NORMA visibly follow FAKT
+		       -- as the user types — exactly the bug the user reported
+		       -- ("when i change Fakt, Norma is also changing"). Skipping
+		       -- the fallback means rows with no anchor and no ВОР match
+		       -- render NORMA as "—", which is correct (we genuinely
+		       -- don't know the planned amount) and harmless to the
+		       -- numeric calculations that read original_quantity directly.
 		       COALESCE(
 		         NULLIF(l.original_quantity, 0),
-		         NULLIF(l.quantity, 0),
 		         CASE WHEN COALESCE(l.resource_type, '') = '' THEN (
 		             -- One ВОР row per work — pick the first matching one
 		             -- (lowest id ⇒ earliest import). Earlier this query

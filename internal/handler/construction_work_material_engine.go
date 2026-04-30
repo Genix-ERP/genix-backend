@@ -152,26 +152,52 @@ func (h *Handler) reserveMaterialsForWork(tenantID, orgID, userID uuid.UUID, pro
 			continue
 		}
 
-		// Pick a warehouse. Multi-step chain, all org-aware so the row
-		// lands somewhere the project's company can actually see in the
-		// products tab (Inventory.jsx filters inventory rows whose
-		// warehouse.organization_id != activeCompany.id, so a row that
-		// lands in a different-org warehouse is invisible — the user
-		// sees "Qoldiq yo'q" even though the DB has the deduction).
+		// Pick a warehouse. Multi-step chain, biased toward the org the
+		// CONFIRMING USER is currently looking at, because the products
+		// tab in Inventory.jsx filters out inventory rows whose
+		// warehouse.organization_id != activeCompany.id. If the engine
+		// picks an org-mismatched warehouse, the deduction ends up
+		// "invisible" to the very user who just confirmed the work
+		// ("Qoldiq yo'q" even though the DB has -N) — that's the bug
+		// reported as "i created new product and confirmed stage
+		// completion but inventory not changed".
 		//
 		//   0. Project's chosen default (construction_projects.warehouse_id,
 		//      migration 365) — explicit user pick, always wins.
-		//   1. Same-org highest-stock for this product — keeps the org
-		//      isolation guarantee while preserving the "consume from
-		//      where it lives" intuition.
-		//   2. Same-org oldest active warehouse — last-ditch within the
-		//      project's company.
-		//   3. Tenant-wide oldest active warehouse — only if the project
-		//      has no organization at all (rare). Stock may end up
-		//      invisible, but a row is better than dropping silently.
+		//   1. CONFIRMING USER's active org — highest-stock for this product.
+		//      Lets the user-visible inventory show the decrement.
+		//   2. CONFIRMING USER's active org — oldest active warehouse.
+		//   3. Project's org — highest-stock for this product. Falls back
+		//      when the confirming user's org doesn't have a warehouse
+		//      to lay the row into.
+		//   4. Project's org — oldest active warehouse.
+		//   5. Tenant-wide oldest active warehouse — only when neither
+		//      org has a usable warehouse. Stock may end up invisible
+		//      to the current user, but writing a row is better than
+		//      dropping silently.
 		var warehouseID uuid.UUID
 		if projectWarehouseID.Valid {
 			warehouseID = projectWarehouseID.UUID
+		}
+		if warehouseID == uuid.Nil && orgID != uuid.Nil {
+			_ = h.db.QueryRow(`
+				SELECT inv.warehouse_id
+				FROM inventory inv
+				JOIN warehouses w ON w.id = inv.warehouse_id
+				WHERE inv.product_id = $1 AND inv.tenant_id = $2
+				  AND w.organization_id = $3
+				ORDER BY inv.quantity_on_hand DESC NULLS LAST
+				LIMIT 1
+			`, productID, tenantID, orgID).Scan(&warehouseID)
+		}
+		if warehouseID == uuid.Nil && orgID != uuid.Nil {
+			_ = h.db.QueryRow(`
+				SELECT id FROM warehouses
+				WHERE tenant_id = $1
+				  AND organization_id = $2
+				  AND COALESCE(is_active, true) = true
+				ORDER BY created_at LIMIT 1
+			`, tenantID, orgID).Scan(&warehouseID)
 		}
 		if warehouseID == uuid.Nil && projectOrgID.Valid {
 			_ = h.db.QueryRow(`
@@ -208,6 +234,31 @@ func (h *Handler) reserveMaterialsForWork(tenantID, orgID, userID uuid.UUID, pro
 				ORDER BY created_at LIMIT 1
 			`, tenantID).Scan(&warehouseID)
 		}
+
+		// Make the product visible in the picked warehouse's org so the
+		// inventory list shows the deduction. Without this, products
+		// created via Yangi Mahsulot are linked only to the user's
+		// creating org; if the picker chose a different-org warehouse
+		// (project default, or a fallback), the deduction lands in a
+		// row the user can't see. Idempotent via ON CONFLICT.
+		if warehouseID != uuid.Nil {
+			_, _ = h.db.Exec(`
+				INSERT INTO product_organization_settings (
+					tenant_id, product_id, organization_id,
+					cost_price, list_price, min_price,
+					min_stock_level, reorder_point, reorder_quantity
+				)
+				SELECT
+					$1, $2, w.organization_id,
+					COALESCE((SELECT cost_price FROM products WHERE id = $2), 0),
+					COALESCE((SELECT list_price FROM products WHERE id = $2), 0),
+					0, 0, 0, 0
+				FROM warehouses w
+				WHERE w.id = $3 AND w.organization_id IS NOT NULL
+				ON CONFLICT (product_id, organization_id) DO NOTHING
+			`, tenantID, productID, warehouseID)
+		}
+
 		var warehouseIDPtr *uuid.UUID
 		if warehouseID != uuid.Nil {
 			warehouseIDPtr = &warehouseID
@@ -510,50 +561,267 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 	now := time.Now()
 	approved := 0
 	for _, r := range ress {
-		// Mark reservation approved.
-		if _, upErr := h.db.Exec(`
+		// Atomic reservation-approve + inventory-decrement.
+		//
+		// Previously the status UPDATE and the inventory UPDATE/INSERT
+		// were separate non-transactional Exec calls. When the
+		// inventory step silently no-op'd (UPDATE matched 0 rows AND
+		// INSERT failed for any reason — e.g. a constraint hiccup, a
+		// dropped connection, or even just the unique-index race when
+		// two reservations for the same product land at once), the
+		// reservation stayed status='approved' without the
+		// corresponding deduction. Result: reservation table says the
+		// material was consumed, inventory table doesn't agree, and
+		// finaliseMaterialsForWork's WHERE status='pending' filter
+		// means a re-run can't find the row to retry. That's exactly
+		// the "Test inventory 123 has approved reservations but no
+		// inventory row" state the user reported.
+		//
+		// Wrapping both writes in a single tx + ON CONFLICT keeps
+		// them atomic: either both succeed, or neither does and the
+		// reservation stays pending so the next confirm attempt can
+		// retry.
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("finaliseMaterialsForWork: failed to start tx",
+				"error", txErr, "reservation_id", r.ID)
+			continue
+		}
+
+		if _, upErr := tx.Exec(`
 			UPDATE material_reservations
 			SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2
 			WHERE id = $3
 		`, uuidArg(userID), now, r.ID); upErr != nil {
 			h.log.Error("finaliseMaterialsForWork: failed to mark approved",
 				"error", upErr, "reservation_id", r.ID)
+			tx.Rollback()
 			continue
 		}
 
-		// Decrement on_hand AND release reserved. UPSERT path: try
-		// UPDATE first, and if no row exists (RowsAffected = 0) INSERT
-		// a new inventory row at the negative balance so the deduction
-		// is visible. Without this fallback, products that never had
-		// stock would keep showing Qoldiq=0 even after work was finalised.
+		// Single-statement UPSERT against the unique index
+		// (tenant_id, product_id, warehouse_id) added in migration
+		// 282. Decrement existing rows in place; insert a -consumed
+		// row when none exists. Allowed to go negative — the runtime
+		// has always permitted that for YAKUNIY consumption when the
+		// procurement side hasn't refilled yet.
 		if r.WarehouseID != nil {
-			result, exErr := h.db.Exec(`
-				UPDATE inventory
-				SET quantity_on_hand  = COALESCE(quantity_on_hand, 0)  - $1,
-				    quantity_reserved = GREATEST(COALESCE(quantity_reserved, 0) - $1, 0),
-				    updated_at = $2
-				WHERE product_id = $3 AND warehouse_id = $4 AND tenant_id = $5
-			`, r.Quantity, now, r.ProductID, r.WarehouseID, tenantID)
-			if exErr != nil {
-				h.log.Error("finaliseMaterialsForWork: failed to update inventory",
-					"error", exErr, "reservation_id", r.ID)
-			} else if affected, _ := result.RowsAffected(); affected == 0 {
-				// No matching inventory row — create one at the negative
-				// balance. Allowed per product policy.
-				if _, insErr := h.db.Exec(`
+			// CAST $4 to numeric — without it Postgres can't resolve the
+			// unary `-` (and the inline `-$4` in VALUES) and errors with
+			// "operator is not unique: - unknown". The driver sends the
+			// float64 parameter as type 'unknown' and Postgres has
+			// multiple negation operators to choose from.
+			if _, exErr := tx.Exec(`
+				INSERT INTO inventory (
+					id, tenant_id, product_id, warehouse_id,
+					quantity_on_hand, quantity_reserved,
+					created_at, updated_at
+				) VALUES (gen_random_uuid(), $1, $2, $3, (0 - $4::numeric), 0, $5, $5)
+				ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE
+				SET quantity_on_hand  = inventory.quantity_on_hand - $4::numeric,
+				    quantity_reserved = GREATEST(COALESCE(inventory.quantity_reserved, 0) - $4::numeric, 0::numeric),
+				    updated_at        = $5
+			`, tenantID, r.ProductID, r.WarehouseID, r.Quantity, now); exErr != nil {
+				h.log.Error("finaliseMaterialsForWork: failed to upsert inventory",
+					"error", exErr, "reservation_id", r.ID,
+					"product_id", r.ProductID, "warehouse_id", r.WarehouseID)
+				tx.Rollback()
+				continue
+			}
+		}
+
+		if cErr := tx.Commit(); cErr != nil {
+			h.log.Error("finaliseMaterialsForWork: tx commit failed",
+				"error", cErr, "reservation_id", r.ID)
+			continue
+		}
+
+		approved++
+	}
+
+	// ── Finalise-from-estimate sweep ───────────────────────────────
+	// Catches material sub-lines that were grafted onto the work
+	// AFTER it transitioned to 'submitted' (so reserveMaterialsForWork
+	// didn't see them) but BEFORE engineer-confirm — the natural mid-
+	// flow add. Without this sweep those resources land in the
+	// estimate but never touch inventory or expenses, exactly the
+	// "biton" case the user reported.
+	//
+	// We iterate every material sub-line of this work, compute the
+	// expected consumption (override qty if pinned, else parent.done ×
+	// norm_rate), and process anything that doesn't already have a
+	// matching `Yakunlangan ish #<work_id> — <resource_name>` expense.
+	// The expense's existence is the idempotency marker — both the
+	// reservation flow above and processYakuniyAdHocResource use the
+	// same description shape, so we won't double-process.
+	estRows, estErr := h.db.Query(`
+		SELECT
+		    sub.id,
+		    sub.name,
+		    COALESCE(sub.uom, ''),
+		    COALESCE(sub.norm_rate, 0),
+		    COALESCE(sub.unit_rate, 0),
+		    COALESCE(sub.quantity, 0),
+		    COALESCE(sub.quantity_override, FALSE)
+		FROM construction_estimate_line sub
+		WHERE sub.tenant_id = $1
+		  AND sub.parent_line_id = $2
+		  AND LOWER(COALESCE(sub.resource_type, '')) = 'material'
+	`, tenantID, workID)
+	if estErr == nil {
+		defer estRows.Close()
+		for estRows.Next() {
+			var subID int64
+			var subName, subUOM string
+			var subNormRate, subUnitRate, subOwnQty float64
+			var subOverride bool
+			if scanErr := estRows.Scan(&subID, &subName, &subUOM,
+				&subNormRate, &subUnitRate, &subOwnQty, &subOverride); scanErr != nil {
+				continue
+			}
+			consumed := subNormRate * workDone
+			if subOverride && subOwnQty > 0 {
+				consumed = subOwnQty
+			}
+			if consumed <= 0 {
+				continue
+			}
+			// Already processed? processYakuniyAdHocResource and the
+			// reservation path both write a row with this exact shape.
+			expenseDesc := fmt.Sprintf("Yakunlangan ish #%d — %s", workID, subName)
+			var alreadyHave int64
+			_ = h.db.QueryRow(`
+				SELECT COUNT(*) FROM construction_expense_lines
+				WHERE tenant_id = $1 AND project_id = $2
+				  AND deleted_at IS NULL
+				  AND description = $3
+			`, tenantID, projectID, expenseDesc).Scan(&alreadyHave)
+			if alreadyHave > 0 {
+				continue
+			}
+
+			// Look up the matching product. Skip silently if the user
+			// typed a resource name that doesn't have a SKU yet — the
+			// estimate row stays, but inventory has nothing to update.
+			var subProductID uuid.UUID
+			_ = h.db.QueryRow(`
+				SELECT id FROM products
+				WHERE tenant_id = $1 AND deleted_at IS NULL
+				  AND UPPER(name) = UPPER($2)
+				ORDER BY created_at DESC LIMIT 1
+			`, tenantID, subName).Scan(&subProductID)
+
+			// Pick a warehouse using the same chain reserveMaterialsForWork
+			// uses. orgID isn't available here (this function doesn't
+			// receive it) — fall back to the project's org for the bias.
+			var subProjectWh, subProjectOrg uuid.NullUUID
+			_ = h.db.QueryRow(`
+				SELECT warehouse_id, organization_id
+				FROM construction_projects
+				WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+			`, projectID, tenantID).Scan(&subProjectWh, &subProjectOrg)
+			var subWarehouse uuid.UUID
+			if subProjectWh.Valid {
+				subWarehouse = subProjectWh.UUID
+			}
+			if subWarehouse == uuid.Nil && subProductID != uuid.Nil && subProjectOrg.Valid {
+				_ = h.db.QueryRow(`
+					SELECT inv.warehouse_id FROM inventory inv
+					JOIN warehouses w ON w.id = inv.warehouse_id
+					WHERE inv.product_id = $1 AND inv.tenant_id = $2
+					  AND w.organization_id = $3
+					ORDER BY inv.quantity_on_hand DESC NULLS LAST LIMIT 1
+				`, subProductID, tenantID, subProjectOrg.UUID).Scan(&subWarehouse)
+			}
+			if subWarehouse == uuid.Nil && subProjectOrg.Valid {
+				_ = h.db.QueryRow(`
+					SELECT id FROM warehouses
+					WHERE tenant_id = $1 AND organization_id = $2
+					  AND COALESCE(is_active, true) = true
+					ORDER BY created_at LIMIT 1
+				`, tenantID, subProjectOrg.UUID).Scan(&subWarehouse)
+			}
+			if subWarehouse == uuid.Nil {
+				_ = h.db.QueryRow(`
+					SELECT id FROM warehouses
+					WHERE tenant_id = $1 AND COALESCE(is_active, true) = true
+					ORDER BY created_at LIMIT 1
+				`, tenantID).Scan(&subWarehouse)
+			}
+
+			// Decrement inventory atomically (UPSERT). Same shape as the
+			// reservation loop above so a re-run is safe — the expense
+			// existence check at the top of this iteration prevents a
+			// second pass from double-decrementing. $4 is cast to
+			// numeric so Postgres can resolve the `-` operator.
+			if subProductID != uuid.Nil && subWarehouse != uuid.Nil {
+				if _, exErr := h.db.Exec(`
 					INSERT INTO inventory (
 						id, tenant_id, product_id, warehouse_id,
 						quantity_on_hand, quantity_reserved,
 						created_at, updated_at
-					) VALUES (gen_random_uuid(), $1, $2, $3, -$4, 0, $5, $5)
-				`, tenantID, r.ProductID, r.WarehouseID, r.Quantity, now); insErr != nil {
-					h.log.Error("finaliseMaterialsForWork: failed to insert inventory row",
-						"error", insErr, "reservation_id", r.ID)
+					) VALUES (gen_random_uuid(), $1, $2, $3, (0 - $4::numeric), 0, $5, $5)
+					ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE
+					SET quantity_on_hand = inventory.quantity_on_hand - $4::numeric,
+					    updated_at       = $5
+				`, tenantID, subProductID, subWarehouse, consumed, now); exErr != nil {
+					h.log.Error("finaliseMaterialsForWork: estimate-sweep inventory upsert failed",
+						"error", exErr, "sub_id", subID,
+						"product_id", subProductID, "warehouse_id", subWarehouse)
+					continue
+				}
+				// Link product to the warehouse's org so the inventory
+				// list can render the new row.
+				_, _ = h.db.Exec(`
+					INSERT INTO product_organization_settings (
+						tenant_id, product_id, organization_id,
+						cost_price, list_price, min_price,
+						min_stock_level, reorder_point, reorder_quantity
+					)
+					SELECT
+						$1, $2, w.organization_id,
+						COALESCE((SELECT cost_price FROM products WHERE id = $2), 0),
+						COALESCE((SELECT list_price FROM products WHERE id = $2), 0),
+						0, 0, 0, 0
+					FROM warehouses w
+					WHERE w.id = $3 AND w.organization_id IS NOT NULL
+					ON CONFLICT (product_id, organization_id) DO NOTHING
+				`, tenantID, subProductID, subWarehouse)
+			}
+
+			// Write the per-resource expense (the idempotency marker).
+			subOrgIDArg := interface{}(nil)
+			if workOrgID.Valid {
+				if u, err := uuid.Parse(workOrgID.String); err == nil {
+					subOrgIDArg = u
 				}
 			}
+			// approved_by → NULL: the column FKs to employees(id), and
+			// the user confirming YAKUNIY may not have a matching
+			// employee row. Same fix as the work-summary insert below.
+			if _, exErr := h.db.Exec(`
+				INSERT INTO construction_expense_lines (
+					tenant_id, organization_id, project_id, stage_id,
+					expense_date, description,
+					quantity, uom, unit_price,
+					amount, currency_code,
+					supplier_name, status, approved_by, approved_at,
+					created_by, created_at, updated_at
+				) VALUES (
+					$1, $2, $3, $11,
+					$4::date, $5,
+					$6, $7, $8,
+					$9, 'UZS',
+					$10, 'approved', NULL, $4,
+					$12, $4, $4
+				)
+			`, tenantID, subOrgIDArg, projectID, now, expenseDesc,
+				consumed, subUOM, subUnitRate,
+				consumed*subUnitRate, companyName, stageIDForExpense, uuidArg(userID)); exErr != nil {
+				h.log.Error("finaliseMaterialsForWork: estimate-sweep expense insert failed",
+					"error", exErr, "sub_id", subID, "resource", subName)
+			}
 		}
-
-		approved++
 	}
 
 	// One summary expense line per finalised work, regardless of how
@@ -600,6 +868,13 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 					orgIDArg = u
 				}
 			}
+			// approved_by must reference employees(id), not users(id) — the
+			// user confirming YAKUNIY may not have a matching employee
+			// row, which is what produced the
+			//   "violates foreign key constraint
+			//    construction_expense_lines_approved_by_fkey"
+			// error in the logs. Send NULL; the description and
+			// approved_at timestamp are sufficient audit trail.
 			if _, exErr := h.db.Exec(`
 				INSERT INTO construction_expense_lines (
 					tenant_id, organization_id, project_id, stage_id,
@@ -613,7 +888,7 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 					$4::date, $5,
 					$6, $7, $8,
 					$9, 'UZS',
-					$10, 'approved', $12, $4,
+					$10, 'approved', NULL, $4,
 					$12, $4, $4
 				)
 			`, tenantID, orgIDArg, projectID, now, desc,
@@ -772,16 +1047,41 @@ func (h *Handler) processYakuniyAdHocResource(
 		LIMIT 1
 	`, tenantID, resourceName).Scan(&productID)
 
-	// Pick a warehouse — same chain as reserveMaterialsForWork, all
-	// org-aware so the resulting inventory row is visible in the
-	// project's company's products tab.
+	// Pick a warehouse — same chain as reserveMaterialsForWork, biased
+	// toward the CALLING USER's active org so the deduction is visible
+	// in their products tab. Inventory.jsx filters out rows in
+	// warehouses owned by a different org than the active company; an
+	// org-mismatched pick here is exactly what makes "Yangi mahsulot"
+	// products show 0 even after a YAKUNIY-confirmed consumption.
 	//   0. Project's chosen default
-	//   1. Same-org highest-stock for this product
-	//   2. Same-org oldest active warehouse
-	//   3. Tenant-wide oldest active (only when project has no org)
+	//   1. Calling user's active org — highest-stock for this product
+	//   2. Calling user's active org — oldest active warehouse
+	//   3. Project's org — highest-stock for this product
+	//   4. Project's org — oldest active warehouse
+	//   5. Tenant-wide oldest active (only when neither org has one)
 	var warehouseID uuid.UUID
 	if projectWarehouseID.Valid {
 		warehouseID = projectWarehouseID.UUID
+	}
+	if warehouseID == uuid.Nil && productID != uuid.Nil && orgID != uuid.Nil {
+		_ = h.db.QueryRow(`
+			SELECT inv.warehouse_id
+			FROM inventory inv
+			JOIN warehouses w ON w.id = inv.warehouse_id
+			WHERE inv.product_id = $1 AND inv.tenant_id = $2
+			  AND w.organization_id = $3
+			ORDER BY inv.quantity_on_hand DESC NULLS LAST
+			LIMIT 1
+		`, productID, tenantID, orgID).Scan(&warehouseID)
+	}
+	if warehouseID == uuid.Nil && orgID != uuid.Nil {
+		_ = h.db.QueryRow(`
+			SELECT id FROM warehouses
+			WHERE tenant_id = $1
+			  AND organization_id = $2
+			  AND COALESCE(is_active, true) = true
+			ORDER BY created_at LIMIT 1
+		`, tenantID, orgID).Scan(&warehouseID)
 	}
 	if warehouseID == uuid.Nil && productID != uuid.Nil && projectOrgID.Valid {
 		_ = h.db.QueryRow(`
@@ -819,32 +1119,64 @@ func (h *Handler) processYakuniyAdHocResource(
 		`, tenantID).Scan(&warehouseID)
 	}
 
+	// Make the product visible in the picked warehouse's org. The
+	// products tab INNER JOINs product_organization_settings, so a
+	// row created via "Yangi mahsulot" stays invisible to the org
+	// owning the picked warehouse unless we add the link. Idempotent
+	// via ON CONFLICT (product_id, organization_id).
+	if productID != uuid.Nil && warehouseID != uuid.Nil {
+		_, _ = h.db.Exec(`
+			INSERT INTO product_organization_settings (
+				tenant_id, product_id, organization_id,
+				cost_price, list_price, min_price,
+				min_stock_level, reorder_point, reorder_quantity
+			)
+			SELECT
+				$1, $2, w.organization_id,
+				COALESCE((SELECT cost_price FROM products WHERE id = $2), 0),
+				COALESCE((SELECT list_price FROM products WHERE id = $2), 0),
+				0, 0, 0, 0
+			FROM warehouses w
+			WHERE w.id = $3 AND w.organization_id IS NOT NULL
+			ON CONFLICT (product_id, organization_id) DO NOTHING
+		`, tenantID, productID, warehouseID)
+	}
+
 	now := time.Now()
 
-	// Inventory decrement (best-effort). UPDATE first; INSERT a negative
-	// row when no inventory row exists so the deduction is visible.
+	// Inventory decrement, atomic via UPSERT against the unique index
+	// (tenant_id, product_id, warehouse_id) from migration 282.
+	//
+	// Previously this was a two-step UPDATE-then-INSERT-on-zero-rows. The
+	// gap between the two statements (each was its own auto-committed
+	// Exec) meant a silent INSERT failure left no row at all — exactly
+	// the "biton" case the user reported: product created, resource
+	// added to YAKUNIY work, no inventory row ever materialised. Replacing
+	// it with a single ON CONFLICT statement removes the gap; either
+	// the row gets inserted at -consumed, or the existing row gets its
+	// balance decremented, with no in-between failure mode.
 	if productID != uuid.Nil && warehouseID != uuid.Nil {
-		result, exErr := h.db.Exec(`
-			UPDATE inventory
-			SET quantity_on_hand = COALESCE(quantity_on_hand, 0) - $1,
-			    updated_at       = $2
-			WHERE product_id = $3 AND warehouse_id = $4 AND tenant_id = $5
-		`, consumed, now, productID, warehouseID, tenantID)
-		if exErr != nil {
-			h.log.Error("processYakuniyAdHocResource: inventory update failed",
-				"error", exErr, "product_id", productID, "consumed", consumed)
-		} else if affected, _ := result.RowsAffected(); affected == 0 {
-			if _, insErr := h.db.Exec(`
-				INSERT INTO inventory (
-					id, tenant_id, product_id, warehouse_id,
-					quantity_on_hand, quantity_reserved,
-					created_at, updated_at
-				) VALUES (gen_random_uuid(), $1, $2, $3, -$4, 0, $5, $5)
-			`, tenantID, productID, warehouseID, consumed, now); insErr != nil {
-				h.log.Error("processYakuniyAdHocResource: inventory insert failed",
-					"error", insErr, "product_id", productID)
-			}
+		// $4 cast to numeric so Postgres can resolve the unary `-` and
+		// the subtract; without the cast the parameter type is 'unknown'
+		// and Postgres errors with "operator is not unique: - unknown".
+		if _, exErr := h.db.Exec(`
+			INSERT INTO inventory (
+				id, tenant_id, product_id, warehouse_id,
+				quantity_on_hand, quantity_reserved,
+				created_at, updated_at
+			) VALUES (gen_random_uuid(), $1, $2, $3, (0 - $4::numeric), 0, $5, $5)
+			ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE
+			SET quantity_on_hand = inventory.quantity_on_hand - $4::numeric,
+			    updated_at       = $5
+		`, tenantID, productID, warehouseID, consumed, now); exErr != nil {
+			h.log.Error("processYakuniyAdHocResource: inventory upsert failed",
+				"error", exErr, "product_id", productID,
+				"warehouse_id", warehouseID, "consumed", consumed)
 		}
+	} else {
+		h.log.Warn("processYakuniyAdHocResource: skipping inventory step — missing id",
+			"product_id", productID, "warehouse_id", warehouseID,
+			"resource_name", resourceName)
 	}
 
 	// Resolve the section's stage_id (same lookup the work-level handler
@@ -900,10 +1232,20 @@ func (h *Handler) processYakuniyAdHocResource(
 	// + the resource name so the Moliya → Xarajatlar list reads
 	// naturally and `Yakunlangan ish #N — <resource>` keeps the same
 	// shape as legacy per-reservation rows.
+	//
+	// We write the expense unconditionally — even at cost=0 — for two
+	// reasons:
+	//   1. Idempotency. Backfill migrations (366 / 370) detect "already
+	//      processed" by looking for a matching description. Skipping
+	//      the write at cost=0 leaves no marker, so a backfill re-run
+	//      decrements inventory a second time. A 0-сум expense is the
+	//      cheap way to keep the bookkeeping consistent.
+	//   2. Audit trail. The user added the resource on purpose; even at
+	//      0 СУМ it's visible in the Xarajatlar feed as confirmation
+	//      that the consumption was recorded.
+	// The user can filter out 0-сум rows in the Xarajatlar UI if they
+	// find them noisy.
 	cost := consumed * unitPrice
-	if cost <= 0 {
-		return
-	}
 	desc := fmt.Sprintf("Yakunlangan ish #%d — %s", parentLineID, resourceName)
 	if _, exErr := h.db.Exec(`
 		INSERT INTO construction_expense_lines (

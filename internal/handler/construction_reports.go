@@ -434,6 +434,35 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		`, projectID, tenantID).Scan(&totalPlanned)
 	}
 
+	// Imported-budget override (migration 369). The Ресурс Excel sheet
+	// carries the canonical project totals at the bottom (ИТОГО ПРЯМЫЕ
+	// ЗАТРАТЫ) — captured at import time and stored on construction_estimate.
+	// The Единич-derived sum above always under-counts the real budget
+	// because it ignores transport overhead and indirect costs that live
+	// only on the Ресурс sheet, so when an imported budget exists we
+	// prefer it as the authoritative figure for the Byudjet KPI cards.
+	// Scoped to the same building filter as the rest of the handler so a
+	// per-block view shows that block's imported total.
+	{
+		var importedBudget float64
+		budgetQuery := `
+			SELECT COALESCE(SUM(budget_total), 0)
+			FROM construction_estimate
+			WHERE project_id = $1
+			  AND tenant_id  = $2
+			  AND LOWER(COALESCE(source_type, '')) = 'resurs'
+		`
+		budgetArgs := []interface{}{projectID, tenantID}
+		if buildingID > 0 {
+			budgetQuery += ` AND building_id = $3`
+			budgetArgs = append(budgetArgs, buildingID)
+		}
+		_ = h.db.QueryRow(budgetQuery, budgetArgs...).Scan(&importedBudget)
+		if importedBudget > 0 {
+			totalPlanned = importedBudget
+		}
+	}
+
 	// Reconciliation row. The per-section breakdown query above only
 	// counts expenses whose stage_id matches a stage with the same
 	// `name` as a parent_item_number — manual expense entries created
