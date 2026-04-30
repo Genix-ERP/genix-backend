@@ -399,7 +399,104 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		// somehow still carry NULL anchors (the trigger handles new
 		// inserts but a manual SQL backfill could have missed older
 		// data).
+		// quantity / done_quantity / unit_rate frequently live in
+		// DIFFERENT estimates for v2 projects:
+		//   • ВОР carries the planned project quantity (rate=0)
+		//   • Единич carries the per-unit price (quantity=0 — template)
+		// Picking any single row gives 0 for one of the three factors,
+		// so the synthetic projection collapses to 0/0 even though
+		// Bosqichlar shows real numbers (Bosqichlar resolves the
+		// pieces manually). We pre-aggregate the best non-zero value
+		// per (work_name, section_path) across the WHOLE project in a
+		// single CTE pass — no correlated subqueries, so this scales
+		// linearly with line count instead of N×4 like the previous
+		// implementation that timed the page out.
+		//
+		// The aggregated row is project-wide (not building-scoped) so
+		// cross-block fallbacks still work: a Block 2 Единич with no
+		// rate can pick up the rate from the same work in any block
+		// that does have it. The dedup-within-synthetic-loop further
+		// up ensures only one row per (name, section) renders, so the
+		// merged MAX values are what actually drives plan/fact.
+		// Section path normalization: imports sometimes carry the full
+		// hierarchy ("СЕКЦИЯ №1 › ФУНДАМЕНТЫ") and sometimes just the
+		// leaf ("ФУНДАМЕНТЫ"). The user's project 1 has both shapes
+		// across different Единич imports for the same work, which
+		// would split the GROUP BY into separate buckets and prevent
+		// the merge. We extract just the leaf — everything after the
+		// last "›" — which matches what the frontend renders as the
+		// section heading. Both shapes collapse into one bucket so a
+		// work can pull its qty from one estimate and its sub-derived
+		// price from another.
+		const sectionLeafExpr = `regexp_replace(COALESCE(l.parent_item_number, ''), '^.*›\s*', '')`
+		// per_line carries enough context to decide which row a value
+		// "really" came from. The Smeta↔Bosqichlar sync (task #85)
+		// overwrites `quantity` with `done_quantity` when the foreman
+		// types Bajarildi, which destroys the planned value — so we
+		// can't just MAX the columns. Instead we tag each row with its
+		// estimate's source_type so the aggregation can prefer ВОР's
+		// quantity (sticky, never synced) over Единич's quantity (which
+		// might already be corrupted to match done_quantity).
 		linesQ := `
+			WITH per_line AS (
+			    SELECT
+			        l.id,
+			        l.tenant_id,
+			        l.estimate_id,
+			        l.name,
+			        ` + sectionLeafExpr + ` AS section_leaf,
+			        LOWER(COALESCE(e.source_type, ''))  AS source_type,
+			        COALESCE(l.original_quantity, 0)    AS row_orig_qty,
+			        COALESCE(l.quantity, 0)             AS row_qty,
+			        COALESCE(l.done_quantity, 0)        AS row_done,
+			        COALESCE(l.original_unit_rate, 0)   AS row_orig_rate,
+			        COALESCE(l.unit_rate, 0)            AS row_rate,
+			        COALESCE((
+			            SELECT SUM(COALESCE(s.unit_rate, 0) * COALESCE(s.norm_rate, 0))
+			            FROM construction_estimate_line s
+			            WHERE s.parent_line_id = l.id
+			              AND s.tenant_id = l.tenant_id
+			              AND COALESCE(s.resource_type, '') <> ''
+			        ), 0) AS row_sub_derived
+			    FROM construction_estimate_line l
+			    JOIN construction_estimate e
+			      ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
+			    WHERE e.project_id = $1
+			      AND l.tenant_id = $2
+			      AND COALESCE(l.resource_type, '') = ''
+			      AND COALESCE(l.parent_line_id, 0) = 0
+			),
+			-- Plan / fact / rate are sourced INDEPENDENTLY across all
+			-- rows in (name, section_leaf):
+			--   plan_qty  → ВОР's quantity (canonical) →
+			--               row_orig_qty (anchor) →
+			--               row_qty from rows where done == 0 (not yet synced)
+			--   done      → MAX(done_quantity) — straightforward, foreman's input
+			--   rate      → MAX(unit_rate or original_unit_rate) →
+			--               MAX(sub_derived_rate) when own rate is 0
+			-- COALESCE-of-FILTER is much cheaper than correlated
+			-- subqueries — single GROUP BY pass handles everything.
+			agg AS (
+			    SELECT
+			        name AS work_name,
+			        section_leaf,
+			        COALESCE(
+			            MAX(row_qty)      FILTER (WHERE source_type = 'vor' AND row_qty > 0),
+			            MAX(row_orig_qty) FILTER (WHERE row_orig_qty > 0),
+			            MAX(row_qty)      FILTER (WHERE row_done = 0 AND row_qty > 0),
+			            0
+			        ) AS plan_qty,
+			        COALESCE(MAX(row_done) FILTER (WHERE row_done > 0), 0) AS done_max,
+			        COALESCE(
+			            MAX(GREATEST(row_orig_rate, row_rate))
+			                FILTER (WHERE row_orig_rate > 0 OR row_rate > 0),
+			            MAX(row_sub_derived) FILTER (WHERE row_sub_derived > 0),
+			            0
+			        ) AS rate_max,
+			        COALESCE(MAX(row_sub_derived) FILTER (WHERE row_sub_derived > 0), 0) AS sub_derived_max
+			    FROM per_line
+			    GROUP BY name, section_leaf
+			)
 			SELECT
 				l.id,
 				COALESCE(l.sort_order, 0)          AS sort_order,
@@ -408,18 +505,15 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 				COALESCE(l.uom, '')                AS uom,
 				COALESCE(l.parent_item_number, '') AS parent_item_number,
 				COALESCE(l.total_amount, 0)        AS total_amount,
-				COALESCE(l.original_quantity, l.quantity, 0) AS quantity,
-				COALESCE(l.done_quantity, 0)       AS done_quantity,
-				COALESCE(l.original_unit_rate, l.unit_rate, 0) AS unit_rate,
+				COALESCE(agg.plan_qty, 0)          AS quantity,
+				COALESCE(agg.done_max, 0)          AS done_quantity,
+				COALESCE(agg.rate_max, 0)          AS unit_rate,
 				COALESCE(l.approval_status, '')    AS approval_status,
-				COALESCE((
-					SELECT SUM(COALESCE(s.unit_rate, 0) * COALESCE(s.norm_rate, 0))
-					FROM construction_estimate_line s
-					WHERE s.parent_line_id = l.id
-					  AND s.tenant_id = l.tenant_id
-					  AND COALESCE(s.resource_type, '') <> ''
-				), 0) AS sub_derived_rate
+				COALESCE(agg.sub_derived_max, 0)   AS sub_derived_rate
 			FROM construction_estimate_line l
+			LEFT JOIN agg
+			  ON agg.work_name    = l.name
+			 AND agg.section_leaf = ` + sectionLeafExpr + `
 			WHERE l.tenant_id = $2
 			  AND l.estimate_id IN (` + estimateScopeQ + `)
 			  AND COALESCE(l.resource_type, '') = ''
@@ -622,6 +716,18 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		var synthRowID int64 = -1
 		for _, wid := range stageWorkIDs {
 			w := workByID[wid]
+			// Skip if we've already projected this work name in this
+			// section. The project may carry multiple Единич estimates
+			// (re-imports never delete the old ones) which produces
+			// duplicate workByID entries with identical (section, name)
+			// pairs — without this guard each duplicate renders as a
+			// separate row in Reja vs Fakt. Sort order above ensures
+			// the surviving row is the one with the lowest sort_order /
+			// item_number / id, so the user sees the canonical entry.
+			nameKey := strings.ToLower(strings.TrimSpace(w.name))
+			if projectedNames[nameKey] {
+				continue
+			}
 			// Normalize the work's approval_status (pending /
 			// in_progress / submitted / confirmed_supervisor /
 			// confirmed_engineer) into the simpler not_started /
@@ -727,9 +833,19 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		}
 
 		// Real construction_sub_stages rows that DIDN'T match any
-		// estimate-line work in this stage. Keeps legacy v1 data
-		// visible (renamed/manual sub-stages, ad-hoc rows) while v2
-		// estimate-line projections drive the order and numbers above.
+		// estimate-line work in this stage. Skipped entirely when the
+		// section already has estimate-line projections, because the
+		// project is on the v2 workflow and any leftover rows in
+		// construction_sub_stages are stale (re-imports, old auto-
+		// creates from migration 363, etc.). Keeping them produced
+		// duplicate listings whose order didn't match Bosqichlar
+		// — the issue the user flagged as "ordering is still not
+		// fixed". Only fall through to the legacy data path when
+		// the section has NO estimate-line works at all (genuine
+		// v1-only project).
+		if len(stageWorkIDs) > 0 {
+			subs = nil
+		}
 		for _, sub := range subs {
 			if projectedNames[strings.ToLower(strings.TrimSpace(sub.Name))] {
 				continue
@@ -850,6 +966,49 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	planTotal := totalMaterialPlan + totalEquipPlan
 	factTotal := totalMaterialFact + totalEquipFact
 
+	// Imported-budget lookup (migration 369). The Ресурс Excel sheet
+	// carries the canonical project totals at the bottom (ИТОГО ПРЯМЫЕ
+	// ЗАТРАТЫ etc.) — we surfaced them onto construction_estimate during
+	// import and now sum them across the project (or the selected
+	// building) so the Reja vs Fakt page can show the file's grand total
+	// instead of a per-line derivation.
+	//
+	// Match condition: only Ресурс estimates count, scoped to the same
+	// building filter the rest of this handler uses. Edinich/ВОР imports
+	// leave budget_total at 0 so they don't double-count here.
+	var importedBudgetTotal, importedMaterialBudget, importedTransportBudget float64
+	{
+		budgetQuery := `
+			SELECT COALESCE(SUM(budget_total), 0),
+			       COALESCE(SUM(material_budget), 0),
+			       COALESCE(SUM(transport_budget), 0)
+			FROM construction_estimate
+			WHERE project_id = $1
+			  AND tenant_id = $2
+			  AND LOWER(COALESCE(source_type, '')) = 'resurs'
+		`
+		budgetArgs := []interface{}{projectID, tenantID}
+		if buildingFilter != "" {
+			bid, _ := strconv.ParseInt(buildingFilter, 10, 64)
+			budgetQuery += ` AND building_id = $3`
+			budgetArgs = append(budgetArgs, bid)
+		}
+		_ = h.db.QueryRow(budgetQuery, budgetArgs...).Scan(
+			&importedBudgetTotal,
+			&importedMaterialBudget,
+			&importedTransportBudget,
+		)
+	}
+
+	// effectivePlan picks the imported budget when it's present (the
+	// user's stated source of truth) and falls back to the per-line sum
+	// when no Ресурс file has been imported yet. This keeps the
+	// `difference` and `budget_used_pct` cards meaningful in both modes.
+	effectivePlan := planTotal
+	if importedBudgetTotal > 0 {
+		effectivePlan = importedBudgetTotal
+	}
+
 	response.Success(c, map[string]interface{}{
 		"stages": stages,
 		"summary": map[string]interface{}{
@@ -857,10 +1016,17 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			"material_fact_total":  totalMaterialFact,
 			"equipment_plan_total": totalEquipPlan,
 			"equipment_fact_total": totalEquipFact,
-			"plan_total":           planTotal,
+			// plan_total now prefers the imported budget. Frontend can
+			// still distinguish derived vs imported via plan_total_derived
+			// and imported_budget below.
+			"plan_total":           effectivePlan,
+			"plan_total_derived":   planTotal,
+			"imported_budget":      importedBudgetTotal,
+			"imported_material":    importedMaterialBudget,
+			"imported_transport":   importedTransportBudget,
 			"fact_total":           factTotal,
-			"difference":           planTotal - factTotal,
-			"budget_used_pct":      budgetPct(factTotal, planTotal),
+			"difference":           effectivePlan - factTotal,
+			"budget_used_pct":      budgetPct(factTotal, effectivePlan),
 		},
 	})
 }

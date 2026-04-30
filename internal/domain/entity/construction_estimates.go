@@ -368,6 +368,20 @@ type BulkCreateEstimateLinesInput struct {
 	// Forma 2, while imports from different files stay separate. See
 	// migration 339 for the matching column on construction_act.
 	SourceFileName string `json:"source_file_name"`
+	// Imported budget totals captured from the Ресурс sheet's bottom
+	// summary block (parseResurs in SmetaImportModal.jsx). Persisted onto
+	// construction_estimate via migration 369 so the Reja vs Fakt page
+	// can show the file's grand total instead of summing per-line plans.
+	//
+	// BudgetTotal     = ИТОГО ПРЯМЫЕ ЗАТРАТЫ (the headline figure)
+	// MaterialBudget  = ИТОГО ПО СТРОИТЕЛЬНЫМ МАТЕРИАЛАМ
+	// TransportBudget = ТРАНСПОРТНЫЕ РАСХОДЫ НА МАТЕРИАЛЫ (project-wide)
+	//
+	// All three are optional — non-Ресурс imports leave them at 0 and the
+	// handler preserves the previous values rather than zeroing them out.
+	BudgetTotal     float64 `json:"budget_total"`
+	MaterialBudget  float64 `json:"material_budget"`
+	TransportBudget float64 `json:"transport_budget"`
 }
 
 type UpdateEstimateLineInput struct {
