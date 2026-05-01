@@ -716,3 +716,213 @@ func (h *Handler) GetJournalEntriesReport(c *gin.Context) {
 		"count": len(entries),
 	})
 }
+
+// =====================================================================
+// СВОД (consolidated estimate) report
+// =====================================================================
+//
+// GET /construction/projects/:id/reports/svod
+//
+// Returns the per-building breakdown for the Uzbek "Сводная сметная"
+// 12-line layout. Each building gets four cost rows split between PLAN
+// and FAKT so the frontend can toggle between modes:
+//
+//   • R4 — installed equipment / furniture / inventory ("оборудование")
+//   • R5 — labor wages ("з/плата рабочих")
+//   • R6 — machine ops ("эксплуатация машин и механизмов")
+//   • R7 — building materials ("строительные материалы")
+//
+// Rows 8 (direct subtotal), 9 (overhead %), 10 (insurance %), 11
+// (subtotal), 12 (VAT), 13 (current price), 14 (PQ-161), 15 (grand
+// total) are derived on the FRONTEND from the user-editable percentage
+// inputs.
+//
+// =================
+// Source of values
+// =================
+//
+// In GenixERP each top-level work (parent_line_id IS NULL,
+// resource_type = '') in a Единич estimate decomposes into
+// sub-resources (parent_line_id > 0) tagged with resource_type
+// ∈ {labor, equipment, material, ...}. Sub.total_amount is the
+// per-unit-of-parent cost contribution × parent.quantity, i.e. the
+// sub already encodes the parent's planned scale.
+//
+// PLAN per (building, resource_class):
+//   sum(sub.total_amount) grouped by classify(sub.resource_type)
+//
+// FAKT per (building, resource_class):
+//   sub.total_amount × (parent.done_quantity / parent.quantity)
+//   When parent.quantity is 0 (Единич template-mode imports), we
+//   fall back to original_quantity (the import-time anchor).
+//   When parent.done_quantity is 0 (work not started), FAKT is 0.
+//
+// Resource type classification (case-insensitive, tolerant of
+// Russian / Uzbek-Latin variants):
+//   labor    = labor, mehnat, ish, ishchi, worker, трудовой
+//   machine  = equipment, mashina, mexanizm, machinery
+//   material = material, materialy, mat
+//   else     = "equipment" bucket (R4 — installed equipment /
+//              furniture / inventory). This rescues lines in
+//              engineering-system estimates whose authors typed
+//              non-standard resource_types like "оборудование".
+//
+// Reference: matches the structure of "Жилдом Саттепо Авеню Блок 1.xlsx"
+// resource sheet's three subtotal rows (G14 labor, G69 machines, G296
+// materials) — the same totals every Block file in that project ships.
+func (h *Handler) GetSvodReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Project header (name + address) for the modal title block.
+	var projectName, projectAddress string
+	if err := h.db.QueryRow(`
+		SELECT COALESCE(name, ''), COALESCE(address, '')
+		  FROM construction_projects
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectName, &projectAddress); err != nil {
+		h.log.Error("Failed to load project for svod report", "error", err)
+		response.NotFound(c, "Project not found")
+		return
+	}
+
+	// Walk every sub-resource (parent_line_id IS NOT NULL) of the
+	// project's estimates, classify each line, and emit per-building
+	// totals split between PLAN and FAKT.
+	//
+	// CRITICAL: classification uses BOTH resource_type AND uom.
+	// Real Единич imports (like the reference "Жилдом Саттепо Авеню
+	// Блок 1.xlsx") tag sub-resources only by UOM —
+	//   ЧЕЛ.-Ч (man-hour)  → labor
+	//   МАШ.-Ч (machine-hour) → machine ops
+	//   anything else      → material
+	// — and SmetaImportModal sometimes leaves resource_type blank.
+	// Filtering by resource_type alone would drop most of the data
+	// and skew the labor/material ratio (the bug the user observed
+	// where Block 2 showed labor 735M vs material only 105M, when
+	// the real Block 1 ratio is labor 2.7B vs material 7.8B).
+	//
+	// Source-type filtering removed too — `parent_line_id IS NOT NULL`
+	// already restricts us to estimates with a parent/child hierarchy,
+	// which is the Единич shape. Ресурс estimates are flat (no
+	// children) so they're naturally excluded.
+	//
+	// LEFT JOIN on construction_buildings starts FROM all the project's
+	// buildings so empty blocks still appear as 0-columns ready to be
+	// filled in manually if the user wants — this matches the reference
+	// xlsx where every block has a column whether or not data exists.
+	rows, err := h.db.Query(`
+		WITH classified AS (
+		    SELECT
+		        e.building_id AS bid,
+		        CASE
+		            -- Explicit resource_type wins.
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('labor', 'mehnat', 'ish', 'ishchi', 'worker', 'трудовой', 'трудовые')
+		                 THEN 'labor'
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('equipment', 'mashina', 'masina', 'mexanizm', 'mexanizmlar', 'machinery', 'машина')
+		                 THEN 'machine'
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('material', 'materialy', 'mat', 'materiallar', 'материал', 'материалы')
+		                 THEN 'material'
+		            -- Fallback: classify by UOM. ЧЕЛ.-Ч / ЧЕЛ-Ч / ЧЕЛ Ч all
+		            -- mean man-hours → labor. Anything with МАШ → machine.
+		            -- Everything else (m3, шт, kg, t, ...) → material.
+		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
+		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%МАШ%' THEN 'machine'
+		            ELSE 'material'
+		        END AS rc,
+		        COALESCE(s.total_amount, 0) AS plan_amt,
+		        CASE
+		            WHEN COALESCE(p.done_quantity, 0) <= 0 THEN 0
+		            WHEN COALESCE(p.quantity, 0) > 0 THEN
+		                COALESCE(s.total_amount, 0) * (p.done_quantity::numeric / p.quantity)
+		            WHEN COALESCE(p.original_quantity, 0) > 0 THEN
+		                COALESCE(s.total_amount, 0) * (p.done_quantity::numeric / p.original_quantity)
+		            ELSE COALESCE(s.total_amount, 0)
+		        END AS fakt_amt
+		    FROM construction_estimate_line s
+		    JOIN construction_estimate_line p
+		      ON p.id = s.parent_line_id
+		     AND p.tenant_id = s.tenant_id
+		    JOIN construction_estimate e
+		      ON e.id = s.estimate_id
+		     AND e.tenant_id = s.tenant_id
+		    WHERE e.project_id  = $1
+		      AND e.tenant_id   = $2
+		      AND s.tenant_id   = $2
+		      AND s.parent_line_id IS NOT NULL
+		)
+		SELECT
+		    b.id                                                                AS building_id,
+		    COALESCE(NULLIF(b.name, ''), b.code, 'Block #' || b.id::text)       AS building_name,
+		    COALESCE(SUM(CASE WHEN c.rc = 'labor'    THEN c.plan_amt ELSE 0 END), 0) AS labor_plan,
+		    COALESCE(SUM(CASE WHEN c.rc = 'machine'  THEN c.plan_amt ELSE 0 END), 0) AS machine_plan,
+		    COALESCE(SUM(CASE WHEN c.rc = 'material' THEN c.plan_amt ELSE 0 END), 0) AS material_plan,
+		    0                                                                   AS equipment_plan,
+		    COALESCE(SUM(CASE WHEN c.rc = 'labor'    THEN c.fakt_amt ELSE 0 END), 0) AS labor_fakt,
+		    COALESCE(SUM(CASE WHEN c.rc = 'machine'  THEN c.fakt_amt ELSE 0 END), 0) AS machine_fakt,
+		    COALESCE(SUM(CASE WHEN c.rc = 'material' THEN c.fakt_amt ELSE 0 END), 0) AS material_fakt,
+		    0                                                                   AS equipment_fakt
+		FROM construction_buildings b
+		LEFT JOIN classified c ON c.bid = b.id
+		WHERE b.tenant_id = $2
+		  AND b.project_id = $1
+		GROUP BY b.id, b.name, b.code, b.sort_order
+		ORDER BY b.sort_order ASC NULLS LAST, b.code ASC, b.id ASC
+	`, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query svod report", "error", err)
+		response.InternalError(c, "Failed to compute svod report")
+		return
+	}
+	defer rows.Close()
+
+	type buildingRow struct {
+		ID             int64   `json:"id"`
+		Name           string  `json:"name"`
+		LaborPlan      float64 `json:"labor_plan"`
+		MachinePlan    float64 `json:"machine_plan"`
+		MaterialPlan   float64 `json:"material_plan"`
+		EquipmentPlan  float64 `json:"equipment_plan"`
+		LaborFakt      float64 `json:"labor_fakt"`
+		MachineFakt    float64 `json:"machine_fakt"`
+		MaterialFakt   float64 `json:"material_fakt"`
+		EquipmentFakt  float64 `json:"equipment_fakt"`
+	}
+	var buildings []buildingRow
+	for rows.Next() {
+		var br buildingRow
+		if err := rows.Scan(
+			&br.ID, &br.Name,
+			&br.LaborPlan, &br.MachinePlan, &br.MaterialPlan, &br.EquipmentPlan,
+			&br.LaborFakt, &br.MachineFakt, &br.MaterialFakt, &br.EquipmentFakt,
+		); err != nil {
+			h.log.Error("Failed to scan svod row", "error", err)
+			continue
+		}
+		if br.ID == 0 && br.Name == "" {
+			br.Name = "Umumiy"
+		}
+		buildings = append(buildings, br)
+	}
+
+	response.Success(c, gin.H{
+		"project": gin.H{
+			"id":      projectID,
+			"name":    projectName,
+			"address": projectAddress,
+		},
+		"buildings": buildings,
+	})
+}
