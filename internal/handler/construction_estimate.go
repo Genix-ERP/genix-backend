@@ -39,7 +39,25 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		scopeFilter = "AND e.subcontract_id IS NOT NULL"
 	}
 
+	// Pre-aggregate line counts in a CTE rather than running a
+	// correlated `(SELECT COUNT(*) ...)` subquery for every estimate
+	// row. On tenants with hundreds of estimates the old per-row form
+	// was an O(N×M) sequential scan over construction_estimate_line
+	// (count(estimates) × count(lines per estimate)) and was the
+	// observed cause of Smeta boshqaruvi page timeouts.
+	//
+	// The CTE is scoped to THIS project (via the JOIN on e.project_id)
+	// so it only counts the slice we actually render. With migration
+	// 378's covering index (tenant_id, estimate_id) this becomes a
+	// single index-only scan + GROUP BY hash aggregate.
 	query := fmt.Sprintf(`
+		WITH estimate_line_counts AS (
+		    SELECT l.estimate_id, COUNT(*)::int AS lines_count
+		    FROM construction_estimate_line l
+		    JOIN construction_estimate e ON e.id = l.estimate_id
+		    WHERE e.project_id = $1 AND l.tenant_id = $2
+		    GROUP BY l.estimate_id
+		)
 		SELECT e.id, e.tenant_id, e.project_id, e.building_id, e.version, e.name, e.state, e.is_current,
 		       e.overhead_pct, e.profit_pct, e.vat_pct,
 		       e.amount_direct, e.amount_total,
@@ -47,12 +65,13 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		       e.subcontract_id,
 		       e.approved_by, e.approved_date, e.created_by,
 		       e.created_date, e.updated_date,
-		       COALESCE((SELECT COUNT(*) FROM construction_estimate_line l WHERE l.estimate_id = e.id), 0) as lines_count,
+		       COALESCE(elc.lines_count, 0) as lines_count,
 		       COALESCE(ua.first_name || ' ' || ua.last_name, '') as approved_name,
 		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name,
 		       COALESCE(b.name, '') as building_name,
 		       COALESCE(sc.name, '') as subcontract_name
 		FROM construction_estimate e
+		LEFT JOIN estimate_line_counts elc ON elc.estimate_id = e.id
 		LEFT JOIN users ua ON ua.id = e.approved_by
 		LEFT JOIN users uc ON uc.id = e.created_by
 		LEFT JOIN construction_buildings b ON b.id = e.building_id
@@ -607,6 +626,33 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	h.db.QueryRow(`SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`,
 		estimateID, tenantID).Scan(&total)
 
+	// Hoist the parent estimate's project_id and building_id out to
+	// Go-side parameters. The ВОР fallback subquery below previously
+	// re-derived them via three nested scalar subqueries per ROW; on
+	// big tenants that ballooned ListEstimateLines latency to multiple
+	// seconds and was the observed cause of Smeta boshqaruvi + Stages
+	// page timeouts. One extra round-trip here saves N×3 wasted scalar
+	// lookups in the main query (N = page size, often 5000).
+	var estProjectID int64
+	var estBuildingID sql.NullInt64
+	if err := h.db.QueryRow(
+		`SELECT project_id, building_id
+		   FROM construction_estimate
+		  WHERE id = $1 AND tenant_id = $2`,
+		estimateID, tenantID,
+	).Scan(&estProjectID, &estBuildingID); err != nil {
+		h.log.Error("Failed to load estimate header for ListEstimateLines",
+			"error", err, "estimate_id", estimateID)
+		response.NotFound(c, "Estimate not found")
+		return
+	}
+	var estBuildingArg interface{}
+	if estBuildingID.Valid {
+		estBuildingArg = estBuildingID.Int64
+	} else {
+		estBuildingArg = nil
+	}
+
 	// Query paginated rows. We group each sub-line immediately after its
 	// parent by sorting on the *parent's* sort_order (via self-join) plus the
 	// parent's id as a stable group key. Within a group, the parent comes
@@ -651,25 +697,23 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		             -- Restricted to the SAME building when the Единич
 		             -- estimate carries a building_id, so multi-block
 		             -- projects don't cross-pollinate quantities.
+		             --
+		             -- $5 is the parent estimate's project_id and
+		             -- $6 is its building_id (nullable) — both fetched
+		             -- once in Go above. Migration 378 added a partial
+		             -- index on construction_estimate(project_id,
+		             -- tenant_id) WHERE source_type='vor' that this
+		             -- clause uses.
 		             SELECT vl.quantity
 		             FROM construction_estimate_line vl
 		             JOIN construction_estimate ve ON ve.id = vl.estimate_id
 		             WHERE ve.tenant_id = l.tenant_id
-		               AND ve.project_id = (
-		                 SELECT project_id FROM construction_estimate
-		                 WHERE id = l.estimate_id AND tenant_id = l.tenant_id
-		               )
+		               AND ve.project_id = $5
 		               AND LOWER(COALESCE(ve.source_type, '')) = 'vor'
 		               AND (
 		                 ve.building_id IS NULL
-		                 OR ve.building_id = (
-		                   SELECT building_id FROM construction_estimate
-		                   WHERE id = l.estimate_id AND tenant_id = l.tenant_id
-		                 )
-		                 OR (
-		                   SELECT building_id FROM construction_estimate
-		                   WHERE id = l.estimate_id AND tenant_id = l.tenant_id
-		                 ) IS NULL
+		                 OR ve.building_id = $6::bigint
+		                 OR $6::bigint IS NULL
 		               )
 		               AND vl.name = l.name
 		               AND COALESCE(vl.parent_item_number, '') = COALESCE(l.parent_item_number, '')
@@ -698,7 +742,7 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		         l.id ASC
 		LIMIT $3 OFFSET $4
 	`
-	rows, err := h.db.Query(query, estimateID, tenantID, pageSize, offset)
+	rows, err := h.db.Query(query, estimateID, tenantID, pageSize, offset, estProjectID, estBuildingArg)
 	if err != nil {
 		h.log.Error("Failed to list estimate lines", "error", err)
 		response.InternalError(c, "Failed to list estimate lines")
@@ -2295,6 +2339,36 @@ func (h *Handler) ResetAllEstimateQuantities(c *gin.Context) {
 // codes (e.g. "Э14-1-17"), so podkators created on resurs rows never render
 // as nested children of their parent.
 func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entity.ConstructionEstimateLine {
+	// Hoist the parent estimate's project_id and building_id out to
+	// Go-side parameters. The ВОР fallback subquery below previously
+	// re-derived these via three nested scalar subqueries
+	// (`SELECT project_id FROM construction_estimate WHERE id = l.estimate_id`)
+	// per ROW — and on a 5K-line estimate the planner ran them N times
+	// instead of once, which is the observed source of Smeta boshqaruvi
+	// timeouts on big tenants. Fetching them once here is one extra
+	// round-trip but eliminates ~15K wasted scalar lookups in the main
+	// query.
+	var estProjectID int64
+	var estBuildingID sql.NullInt64
+	if err := h.db.QueryRow(
+		`SELECT project_id, building_id
+		   FROM construction_estimate
+		  WHERE id = $1 AND tenant_id = $2`,
+		estimateID, tenantID,
+	).Scan(&estProjectID, &estBuildingID); err != nil {
+		h.log.Error("Failed to load estimate header for getEstimateLines",
+			"error", err, "estimate_id", estimateID)
+		return []entity.ConstructionEstimateLine{}
+	}
+	var estBuildingArg interface{}
+	if estBuildingID.Valid {
+		estBuildingArg = estBuildingID.Int64
+	} else {
+		// Pass NULL through pq so the SQL `$4::bigint IS NULL` branch
+		// fires correctly.
+		estBuildingArg = nil
+	}
+
 	query := `
 		SELECT l.id, l.tenant_id, l.estimate_id, l.wbs_id,
 		       l.name, l.uom, l.quantity,
@@ -2335,25 +2409,22 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		             -- Restricted to the SAME building when the Единич
 		             -- estimate carries a building_id, so multi-block
 		             -- projects don't cross-pollinate quantities.
+		             --
+		             -- $3 is the parent estimate's project_id and
+		             -- $4 is its building_id (nullable) — both fetched
+		             -- once in Go. Migration 378 added a partial index
+		             -- on construction_estimate(project_id, tenant_id)
+		             -- WHERE source_type='vor' that this clause uses.
 		             SELECT vl.quantity
 		             FROM construction_estimate_line vl
 		             JOIN construction_estimate ve ON ve.id = vl.estimate_id
 		             WHERE ve.tenant_id = l.tenant_id
-		               AND ve.project_id = (
-		                 SELECT project_id FROM construction_estimate
-		                 WHERE id = l.estimate_id AND tenant_id = l.tenant_id
-		               )
+		               AND ve.project_id = $3
 		               AND LOWER(COALESCE(ve.source_type, '')) = 'vor'
 		               AND (
 		                 ve.building_id IS NULL
-		                 OR ve.building_id = (
-		                   SELECT building_id FROM construction_estimate
-		                   WHERE id = l.estimate_id AND tenant_id = l.tenant_id
-		                 )
-		                 OR (
-		                   SELECT building_id FROM construction_estimate
-		                   WHERE id = l.estimate_id AND tenant_id = l.tenant_id
-		                 ) IS NULL
+		                 OR ve.building_id = $4::bigint
+		                 OR $4::bigint IS NULL
 		               )
 		               AND vl.name = l.name
 		               AND COALESCE(vl.parent_item_number, '') = COALESCE(l.parent_item_number, '')
@@ -2382,7 +2453,7 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		         l.id ASC
 	`
 
-	rows, err := h.db.Query(query, estimateID, tenantID)
+	rows, err := h.db.Query(query, estimateID, tenantID, estProjectID, estBuildingArg)
 	if err != nil {
 		h.log.Error("Failed to get estimate lines", "error", err)
 		return []entity.ConstructionEstimateLine{}
