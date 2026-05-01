@@ -3,9 +3,12 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -14,6 +17,43 @@ import (
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
+
+// ─── Reja vs Fakt response cache ─────────────────────────────────────────
+//
+// The full Reja vs Fakt computation walks the entire project's
+// construction_estimate_line tree (parent works + every child resource
+// + every sub-stage) and runs correlated SUMs on every parent. On real
+// 10+ block projects this reaches the gateway timeout even with the
+// indexes from migration 374, especially in the "Hammasi" view that
+// can't be building-scoped.
+//
+// We cache the rendered response body keyed by the query signature so
+// repeated views from the same dashboard hit memory instead of the DB.
+// TTL is short enough that staleness is invisible to the user (15s ≈
+// the time between dashboard renders) but long enough to absorb the
+// burst of requests every browser makes when the user navigates here
+// (the React tab can fire 3-4 requests in flight while it's deciding
+// which filter to settle on).
+//
+// Invalidation: TTL-only. The data churn comes from YAKUNIY confirms
+// and quantity edits, both of which are deliberate user actions where
+// a 15s lag before the page reflects the change is acceptable.
+//
+// Cache key includes every parameter that influences the response:
+// tenant, project, building, status, stage filter.
+type rejaFaktCacheEntry struct {
+	body      []byte
+	expiresAt time.Time
+}
+
+var rejaFaktCache sync.Map // map[string]*rejaFaktCacheEntry
+
+const rejaFaktCacheTTL = 15 * time.Second
+
+func rejaFaktCacheKey(tenantID uuid.UUID, projectID int64, buildingFilter, statusFilter, stageFilter string) string {
+	return fmt.Sprintf("%s|%d|%s|%s|%s",
+		tenantID.String(), projectID, buildingFilter, statusFilter, stageFilter)
+}
 
 // stageNameFromPath extracts the human-facing stage name from a row's
 // parent_item_number field. Estimate imports store the section path in the
@@ -56,6 +96,24 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	stageFilter := c.Query("stage_id")
 	statusFilter := c.Query("status")
 	buildingFilter := c.Query("building_id")
+
+	// Cache check — return memoised JSON when fresh. Skip when the
+	// request carries a `?refresh=1` flag so the user can force-bust
+	// the cache after a YAKUNIY confirm or qty edit if they don't
+	// want to wait the 15s TTL.
+	cacheKey := rejaFaktCacheKey(tenantID, projectID, buildingFilter, statusFilter, stageFilter)
+	if c.Query("refresh") != "1" {
+		if v, ok := rejaFaktCache.Load(cacheKey); ok {
+			entry := v.(*rejaFaktCacheEntry)
+			if time.Now().Before(entry.expiresAt) {
+				c.Data(http.StatusOK, "application/json", entry.body)
+				return
+			}
+			// Expired — drop it so we don't accumulate stale entries
+			// for projects that aren't being viewed anymore.
+			rejaFaktCache.Delete(cacheKey)
+		}
+	}
 
 	// 1. Load stages
 	type Stage struct {
@@ -137,14 +195,19 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	}
 
 	if len(stageIDs) == 0 {
-		response.Success(c, map[string]interface{}{
+		emptyPayload := map[string]interface{}{
 			"stages": []interface{}{},
 			"summary": map[string]interface{}{
 				"material_plan_total": 0, "material_fact_total": 0,
 				"equipment_plan_total": 0, "equipment_fact_total": 0,
 				"plan_total": 0, "fact_total": 0, "difference": 0,
 			},
-		})
+		}
+		// Cache empty results too — projects with no stages render
+		// repeatedly while the user explores filters and shouldn't
+		// re-query the DB on every render.
+		cacheRejaFaktResponse(cacheKey, emptyPayload)
+		response.Success(c, emptyPayload)
 		return
 	}
 
@@ -196,13 +259,9 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			    el.done_quantity,
 			    COALESCE(el.original_unit_rate, el.unit_rate, 0) AS unit_rate,
 			    el.total_amount,
-			    COALESCE((
-			        SELECT SUM(COALESCE(c.unit_rate, 0) * COALESCE(c.norm_rate, 0))
-			        FROM construction_estimate_line c
-			        WHERE c.parent_line_id = el.id
-			          AND c.tenant_id = el.tenant_id
-			          AND COALESCE(c.resource_type, '') <> ''
-			    ), 0) AS sub_derived
+			    -- Materialised column (migration 375) — was a per-row
+			    -- correlated SUM that quadratically blew up runtime.
+			    COALESCE(el.sub_derived, 0) AS sub_derived
 			FROM construction_estimate_line el
 			JOIN construction_estimate e ON e.id = el.estimate_id
 			WHERE el.tenant_id = ss.tenant_id
@@ -437,6 +496,21 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		// estimate's source_type so the aggregation can prefer ВОР's
 		// quantity (sticky, never synced) over Единич's quantity (which
 		// might already be corrupted to match done_quantity).
+		// per_line scope: when a building is filtered, restrict the CTE
+		// to that building's estimates. Without this restriction the
+		// CTE scans every parent line across every block in the
+		// project, runs a correlated SUM per row, and the production
+		// gateway times out at 60s on real-world projects (10+ block
+		// projects with 3000+ lines per block = 30K+ correlated
+		// subquery executions). The trade-off is that the cross-block
+		// rate-fallback (a Block 2 line picking up a unit_rate from the
+		// same work in Block 3) only fires when the user views the
+		// "Hammasi" tab; that's an acceptable price for a 10x speedup
+		// on per-block views, which is what users open 99% of the time.
+		perLineBuildingFilter := ""
+		if buildingFilter != "" {
+			perLineBuildingFilter = " AND e.building_id = $3"
+		}
 		linesQ := `
 			WITH per_line AS (
 			    SELECT
@@ -451,13 +525,13 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			        COALESCE(l.done_quantity, 0)        AS row_done,
 			        COALESCE(l.original_unit_rate, 0)   AS row_orig_rate,
 			        COALESCE(l.unit_rate, 0)            AS row_rate,
-			        COALESCE((
-			            SELECT SUM(COALESCE(s.unit_rate, 0) * COALESCE(s.norm_rate, 0))
-			            FROM construction_estimate_line s
-			            WHERE s.parent_line_id = l.id
-			              AND s.tenant_id = l.tenant_id
-			              AND COALESCE(s.resource_type, '') <> ''
-			        ), 0) AS row_sub_derived
+			        -- Materialised sub_derived column (migration 375)
+			        -- replaces a correlated subquery that was the
+			        -- single biggest perf hotspot — running it for
+			        -- every parent on every render meant 10K+ subquery
+			        -- executions per page on real projects. The column
+			        -- is kept fresh by trigger.
+			        COALESCE(l.sub_derived, 0)          AS row_sub_derived
 			    FROM construction_estimate_line l
 			    JOIN construction_estimate e
 			      ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
@@ -465,6 +539,7 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			      AND l.tenant_id = $2
 			      AND COALESCE(l.resource_type, '') = ''
 			      AND COALESCE(l.parent_line_id, 0) = 0
+			      ` + perLineBuildingFilter + `
 			),
 			-- Plan / fact / rate are sourced INDEPENDENTLY across all
 			-- rows in (name, section_leaf):
@@ -1009,7 +1084,7 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		effectivePlan = importedBudgetTotal
 	}
 
-	response.Success(c, map[string]interface{}{
+	payload := map[string]interface{}{
 		"stages": stages,
 		"summary": map[string]interface{}{
 			"material_plan_total":  totalMaterialPlan,
@@ -1028,6 +1103,27 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			"difference":           effectivePlan - factTotal,
 			"budget_used_pct":      budgetPct(factTotal, effectivePlan),
 		},
+	}
+	cacheRejaFaktResponse(cacheKey, payload)
+	response.Success(c, payload)
+}
+
+// cacheRejaFaktResponse stores the response payload as JSON bytes so
+// subsequent reads can short-circuit straight back to the network
+// without re-marshalling. The shape mirrors what response.Success
+// would have written, so frontend code sees identical results
+// whether the handler computed fresh or pulled from cache.
+func cacheRejaFaktResponse(key string, payload map[string]interface{}) {
+	body, err := json.Marshal(map[string]interface{}{
+		"data":    payload,
+		"success": true,
+	})
+	if err != nil {
+		return // best-effort — skip cache on marshal failure
+	}
+	rejaFaktCache.Store(key, &rejaFaktCacheEntry{
+		body:      body,
+		expiresAt: time.Now().Add(rejaFaktCacheTTL),
 	})
 }
 
