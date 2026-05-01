@@ -756,9 +756,23 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		// table "Equipment" — semantically a bit loose but the existing
 		// UI already groups labour with equipment, and splitting them
 		// would need a third panel that doesn't exist on the frontend yet.
+		// Match works to this stage by either the stage's full name OR
+		// its leaf segment. Stages can be stored either way:
+		//   • Full path: "СЕКЦИЯ №5 › ЗЕМЛЯННЫЕ РАБОТЫ" (auto-create
+		//     from finaliseMaterialsForWork writes the full
+		//     parent_item_number).
+		//   • Leaf only: "ЗЕМЛЯННЫЕ РАБОТЫ" (legacy single-block
+		//     projects, hand-created stages).
+		// workMeta.section is ALWAYS the leaf (set via stageNameFromPath
+		// when the row was scanned). Without the dual comparison below,
+		// projects whose stages carry the full path got an empty
+		// stageWorkIDs for every stage — the response then had every
+		// stage's sub_stages = [] and totals = 0. Exactly the bug user
+		// reported as "every section, every column showing 0".
+		stageLeaf := stageNameFromPath(sr.Name)
 		stageWorkIDs := make([]int64, 0, len(workByID))
 		for id, w := range workByID {
-			if w.section == sr.Name {
+			if w.section == sr.Name || w.section == stageLeaf {
 				stageWorkIDs = append(stageWorkIDs, id)
 			}
 		}
@@ -887,7 +901,25 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			// sensible Reja / Fakt — fall back to the work-level totals
 			// so the row isn't a confusing 0/0 next to a non-zero Bosqich
 			// jami.
-			if len(vsub.Materials) == 0 && len(vsub.Equipment) == 0 {
+			//
+			// Two fallback triggers:
+			//   1. NO sub-resource rows at all (the original case).
+			//   2. Sub-resource rows EXIST but their PlanAmount + FactAmount
+			//      all sum to 0. This happens when the Единич template
+			//      import emits children at unit_rate=0 (price normally
+			//      propagates from the Ресурс estimate via
+			//      propagateResursPricesForProject; if propagation hasn't
+			//      run, or the Ресурс side has no matching name, the
+			//      children stay at 0 even though the parent work itself
+			//      has a non-zero rate from agg.rate_max). Without this
+			//      second branch, the section row showed Reja=0/Fakt=0
+			//      while Bosqichlar showed real numbers — exactly the
+			//      bug the user reported as "Reja va Fakt section is not
+			//      showing".
+			noPricedSubs := len(vsub.Materials) == 0 && len(vsub.Equipment) == 0
+			zeroSubAmounts := vsub.MaterialPlanTotal == 0 && vsub.EquipPlanTotal == 0 &&
+				vsub.MaterialFactTotal == 0 && vsub.EquipFactTotal == 0
+			if (noPricedSubs || zeroSubAmounts) && (w.plan > 0 || w.fact > 0) {
 				vsub.MaterialPlanTotal = w.plan
 				vsub.MaterialFactTotal = w.fact
 			}

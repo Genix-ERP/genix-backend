@@ -686,8 +686,23 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 			if consumed <= 0 {
 				continue
 			}
-			// Already processed? processYakuniyAdHocResource and the
-			// reservation path both write a row with this exact shape.
+			// Already processed? Two markers, either one is sufficient:
+			//
+			// 1. A per-resource expense with the canonical
+			//    `Yakunlangan ish #<workID> — <name>` description.
+			//    Written by processYakuniyAdHocResource and by
+			//    backfill migration 370.
+			//
+			// 2. An APPROVED material_reservation for this work whose
+			//    product_id matches a product with this resource's
+			//    name. The reservation loop above just decremented
+			//    inventory for it, but DOESN'T write a per-resource
+			//    expense — only a per-WORK summary expense at the
+			//    bottom of this function. Without this second check
+			//    the sweep below treated a freshly-decremented
+			//    reservation row as "unprocessed" and decremented a
+			//    second time. User reported as "test 123 confirmed
+			//    with 30, inventory -60" (the double-debit).
 			expenseDesc := fmt.Sprintf("Yakunlangan ish #%d — %s", workID, subName)
 			var alreadyHave int64
 			_ = h.db.QueryRow(`
@@ -697,6 +712,23 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 				  AND description = $3
 			`, tenantID, projectID, expenseDesc).Scan(&alreadyHave)
 			if alreadyHave > 0 {
+				continue
+			}
+			// Reservation-side dedup. Match by name → product → any
+			// approved reservation for THIS work. Case-insensitive
+			// name match mirrors the rest of the engine.
+			var reservedHits int64
+			_ = h.db.QueryRow(`
+				SELECT COUNT(*)
+				FROM material_reservations mr
+				JOIN products pr ON pr.id = mr.product_id
+				WHERE mr.tenant_id = $1
+				  AND mr.estimate_line_id = $2
+				  AND mr.status = 'approved'
+				  AND mr.deleted_at IS NULL
+				  AND UPPER(pr.name) = UPPER($3)
+			`, tenantID, workID, subName).Scan(&reservedHits)
+			if reservedHits > 0 {
 				continue
 			}
 
