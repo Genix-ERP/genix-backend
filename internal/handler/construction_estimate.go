@@ -1386,22 +1386,40 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	// that arrived non-zero so non-Ресурс re-imports don't wipe an
 	// already-stored budget. The Reja vs Fakt summary handler reads
 	// these to display the canonical project budget.
+	//
+	// The ::numeric casts on every $N parameter are mandatory: without
+	// them Postgres infers the parameter type from the `> 0` comparison
+	// and picks INTEGER, which overflows on real-world budgets (15 B
+	// СУМ etc.) with "value 15006076328.372952 is out of range for
+	// type integer". Even worse, the failed Exec aborts the parent
+	// transaction, so every subsequent INSERT in this bulk-import
+	// cascades with "current transaction is aborted, commands ignored".
+	// We also wrap the call in a savepoint so a stray budget failure
+	// (e.g. column missing on an old DB that hasn't run migration 369)
+	// can't take the line inserts down with it.
 	if req.BudgetTotal > 0 || req.MaterialBudget > 0 || req.TransportBudget > 0 {
-		_, bErr := tx.Exec(`
-			UPDATE construction_estimate
-			SET budget_total     = CASE WHEN $1 > 0 THEN $1 ELSE budget_total END,
-			    material_budget  = CASE WHEN $2 > 0 THEN $2 ELSE material_budget END,
-			    transport_budget = CASE WHEN $3 > 0 THEN $3 ELSE transport_budget END
-			WHERE id = $4 AND tenant_id = $5`,
-			req.BudgetTotal, req.MaterialBudget, req.TransportBudget,
-			estimateID, tenantID)
-		if bErr != nil {
-			h.log.Error("Failed to persist imported budget on estimate",
-				"error", bErr,
-				"budget_total", req.BudgetTotal,
-				"material_budget", req.MaterialBudget,
-				"transport_budget", req.TransportBudget,
-				"estimate_id", estimateID)
+		if _, spErr := tx.Exec(`SAVEPOINT budget_update`); spErr == nil {
+			_, bErr := tx.Exec(`
+				UPDATE construction_estimate
+				SET budget_total     = CASE WHEN $1::numeric > 0 THEN $1::numeric ELSE budget_total END,
+				    material_budget  = CASE WHEN $2::numeric > 0 THEN $2::numeric ELSE material_budget END,
+				    transport_budget = CASE WHEN $3::numeric > 0 THEN $3::numeric ELSE transport_budget END
+				WHERE id = $4 AND tenant_id = $5`,
+				req.BudgetTotal, req.MaterialBudget, req.TransportBudget,
+				estimateID, tenantID)
+			if bErr != nil {
+				h.log.Error("Failed to persist imported budget on estimate",
+					"error", bErr,
+					"budget_total", req.BudgetTotal,
+					"material_budget", req.MaterialBudget,
+					"transport_budget", req.TransportBudget,
+					"estimate_id", estimateID)
+				// Rewind to the savepoint so the parent tx stays alive
+				// for the line INSERTs below.
+				_, _ = tx.Exec(`ROLLBACK TO SAVEPOINT budget_update`)
+			} else {
+				_, _ = tx.Exec(`RELEASE SAVEPOINT budget_update`)
+			}
 		}
 	}
 
