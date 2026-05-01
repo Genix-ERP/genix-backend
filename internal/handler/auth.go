@@ -430,12 +430,20 @@ func (h *Handler) Login(c *gin.Context) {
 		input.Phone = normalizePhone(input.Phone)
 	}
 
-	// The column and value to search by
-	lookupColumn := "email"
+	// The column and value to search by.
+	// For phone, normalize on BOTH sides of the comparison via REGEXP_REPLACE
+	// so we tolerate stored values like "+998901234567" or "+998 90 123 45 67"
+	// against an input that normalizePhone reduced to bare digits "998901234567".
+	// Email matching stays exact.
 	lookupValue := input.Email
+	lookupClause := "email = $1"        // for queries where users is unaliased
+	lookupClauseU := "u.email = $1"     // for queries where users is aliased as u
+	lookupClauseTenant := "email = $2"  // for tenant-scoped query (param $2)
 	if loginByPhone {
-		lookupColumn = "phone"
 		lookupValue = input.Phone
+		lookupClause = "REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g') = $1"
+		lookupClauseU = "REGEXP_REPLACE(COALESCE(u.phone, ''), '[^0-9]', '', 'g') = $1"
+		lookupClauseTenant = "REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g') = $2"
 	}
 
 	selectFields := `id, tenant_id, COALESCE(email, ''), password_hash, first_name, last_name,
@@ -452,12 +460,12 @@ func (h *Handler) Login(c *gin.Context) {
 			response.BadRequest(c, "Invalid tenant ID")
 			return
 		}
-		query = fmt.Sprintf(`SELECT %s FROM users WHERE tenant_id = $1 AND %s = $2 AND deleted_at IS NULL`, selectFields, lookupColumn)
+		query = fmt.Sprintf(`SELECT %s FROM users WHERE tenant_id = $1 AND %s AND deleted_at IS NULL`, selectFields, lookupClauseTenant)
 		args = []interface{}{tenantUUID, lookupValue}
 	} else {
 		// Check if identifier exists in multiple tenants
 		var userCount int
-		err := h.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM users WHERE %s = $1 AND deleted_at IS NULL", lookupColumn), lookupValue).Scan(&userCount)
+		err := h.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM users WHERE %s AND deleted_at IS NULL", lookupClause), lookupValue).Scan(&userCount)
 		if err != nil {
 			h.log.Error("Failed to count users", "error", err)
 			response.InternalServerError(c, "")
@@ -470,8 +478,8 @@ func (h *Handler) Login(c *gin.Context) {
 				SELECT t.id, t.name, t.code
 				FROM users u
 				JOIN tenants t ON u.tenant_id = t.id
-				WHERE u.%s = $1 AND u.deleted_at IS NULL AND t.is_active = true
-			`, lookupColumn), lookupValue)
+				WHERE %s AND u.deleted_at IS NULL AND t.is_active = true
+			`, lookupClauseU), lookupValue)
 			if err != nil {
 				h.log.Error("Failed to query tenants", "error", err)
 				response.InternalServerError(c, "")
@@ -509,7 +517,7 @@ func (h *Handler) Login(c *gin.Context) {
 		}
 
 		// Single user - proceed with login
-		query = fmt.Sprintf(`SELECT %s FROM users WHERE %s = $1 AND deleted_at IS NULL`, selectFields, lookupColumn)
+		query = fmt.Sprintf(`SELECT %s FROM users WHERE %s AND deleted_at IS NULL`, selectFields, lookupClause)
 		args = []interface{}{lookupValue}
 	}
 

@@ -288,12 +288,49 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		    COALESCE(SUM(CASE WHEN el.status='approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual
 		FROM parent_costs pc
 		LEFT JOIN LATERAL (
-		    SELECT id, stage_order
-		    FROM construction_stages
-		    WHERE tenant_id  = pc.tenant_id
-		      AND project_id = pc.project_id
-		      AND name       = pc.section_path
-		    ORDER BY id ASC
+		    -- Match a stage to this section bucket. Two name shapes
+		    -- coexist in the wild:
+		    --   • Full path: "СЕКЦИЯ №5 › ЗЕМЛЯННЫЕ РАБОТЫ" (newer
+		    --     auto-creates write the full parent_item_number).
+		    --   • Leaf only: "ЗЕМЛЯННЫЕ РАБОТЫ" (legacy single-block
+		    --     projects whose stages were created by hand).
+		    -- We accept either form, BUT we have to be careful in
+		    -- multi-block projects: a leaf-named stage from Block 1
+		    -- ("ЗЕМЛЯННЫЕ РАБОТЫ", building_id=14) must NOT match a
+		    -- Block 2 section bucket. Without that guard the LATERAL
+		    -- happily picked the Block 1 stage (lower id ⇒ earlier
+		    -- in ORDER BY id ASC), then the LEFT JOIN below looked
+		    -- for expenses on the wrong stage_id and reported Fakt=0
+		    -- in the per-section row even though the top card was
+		    -- correct — that's the bug the user reported as
+		    -- "Byudjet shows Fakt=0 in section but top is 97,200".
+		    --
+		    -- Scoping rules:
+		    --   1. Building-aware: the stage's building_id must match
+		    --      the line's building_id, OR the stage has none
+		    --      (project-wide stage). Stages in a different
+		    --      building are excluded entirely.
+		    --   2. Order: prefer same-building match, then full-path
+		    --      name match, then by id. So "СЕКЦИЯ №5 › ЗЕМЛЯННЫЕ
+		    --      РАБОТЫ" picks the building-15 full-path stage 1277
+		    --      over the building-14 leaf stage 1197.
+		    SELECT cs.id, cs.stage_order
+		    FROM construction_stages cs
+		    WHERE cs.tenant_id  = pc.tenant_id
+		      AND cs.project_id = pc.project_id
+		      AND (
+		          cs.name = pc.section_path
+		          OR cs.name = regexp_replace(COALESCE(pc.section_path, ''), '^.*›\s*', '')
+		      )
+		      AND (
+		          pc.building_id IS NULL
+		          OR cs.building_id IS NULL
+		          OR cs.building_id = pc.building_id
+		      )
+		    ORDER BY
+		      CASE WHEN cs.building_id = pc.building_id THEN 0 ELSE 1 END ASC,
+		      CASE WHEN cs.name = pc.section_path THEN 0 ELSE 1 END ASC,
+		      cs.id ASC
 		    LIMIT 1
 		) s ON TRUE
 		LEFT JOIN construction_expense_lines el
