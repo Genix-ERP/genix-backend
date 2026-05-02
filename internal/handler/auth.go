@@ -431,19 +431,42 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	// The column and value to search by.
-	// For phone, normalize on BOTH sides of the comparison via REGEXP_REPLACE
-	// so we tolerate stored values like "+998901234567" or "+998 90 123 45 67"
-	// against an input that normalizePhone reduced to bare digits "998901234567".
+	//
+	// Phone matching: we match by the LAST 9 DIGITS of the
+	// digit-stripped value (the local Uzbekistan mobile part). This
+	// tolerates ALL of these stored formats vs. the same actual
+	// number:
+	//   "+998 94 535 27 68" / "+998945352768" / "998945352768"
+	//   "8 (94) 535 27 68"  (Russia-style 8 prefix some users typed)
+	//   "94 535 27 68"      (9 digits, no country code at all)
+	//
+	// Earlier exact-string matching only worked when input and DB
+	// happened to have the same prefix shape — that's why login
+	// worked on localhost (consistent format from a single import)
+	// but failed for some users on production (mixed formats from
+	// years of registrations). Length>=9 guard prevents short junk
+	// values (e.g. an admin row with placeholder phone "12345") from
+	// matching a real number's last 9 digits by accident.
+	//
 	// Email matching stays exact.
 	lookupValue := input.Email
 	lookupClause := "email = $1"        // for queries where users is unaliased
 	lookupClauseU := "u.email = $1"     // for queries where users is aliased as u
 	lookupClauseTenant := "email = $2"  // for tenant-scoped query (param $2)
 	if loginByPhone {
-		lookupValue = input.Phone
-		lookupClause = "REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g') = $1"
-		lookupClauseU = "REGEXP_REPLACE(COALESCE(u.phone, ''), '[^0-9]', '', 'g') = $1"
-		lookupClauseTenant = "REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g') = $2"
+		// Send the LAST 9 digits as the parameter — already normalized
+		// to digits-only by normalizePhone() above; truncate here.
+		digits := input.Phone
+		if len(digits) > 9 {
+			digits = digits[len(digits)-9:]
+		}
+		lookupValue = digits
+		lookupClause = "LENGTH(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g')) >= 9 " +
+			"AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g'), 9) = $1"
+		lookupClauseU = "LENGTH(REGEXP_REPLACE(COALESCE(u.phone, ''), '[^0-9]', '', 'g')) >= 9 " +
+			"AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone, ''), '[^0-9]', '', 'g'), 9) = $1"
+		lookupClauseTenant = "LENGTH(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g')) >= 9 " +
+			"AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g'), 9) = $2"
 	}
 
 	selectFields := `id, tenant_id, COALESCE(email, ''), password_hash, first_name, last_name,
@@ -463,22 +486,37 @@ func (h *Handler) Login(c *gin.Context) {
 		query = fmt.Sprintf(`SELECT %s FROM users WHERE tenant_id = $1 AND %s AND deleted_at IS NULL`, selectFields, lookupClauseTenant)
 		args = []interface{}{tenantUUID, lookupValue}
 	} else {
-		// Check if identifier exists in multiple tenants
-		var userCount int
-		err := h.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM users WHERE %s AND deleted_at IS NULL", lookupClause), lookupValue).Scan(&userCount)
+		// Check if identifier exists in multiple DISTINCT tenants.
+		// Counting users (not tenants) was wrong: two users with the
+		// same phone in the SAME tenant would trigger the picker, but
+		// there's only one tenant to pick — and the tenant list below
+		// returned two duplicate cards because of the missing DISTINCT.
+		// Counting distinct tenants here means: if all matching users
+		// belong to a single tenant (whether one user or several), we
+		// fall through to the regular login path; the picker only
+		// appears when the user genuinely has accounts in two or more
+		// different companies.
+		var tenantCount int
+		err := h.db.QueryRow(fmt.Sprintf(
+			"SELECT COUNT(DISTINCT tenant_id) FROM users WHERE %s AND deleted_at IS NULL",
+			lookupClause,
+		), lookupValue).Scan(&tenantCount)
 		if err != nil {
-			h.log.Error("Failed to count users", "error", err)
+			h.log.Error("Failed to count tenants", "error", err)
 			response.InternalServerError(c, "")
 			return
 		}
 
-		if userCount > 1 {
-			// Multiple accounts - return list of tenants for user to choose
+		if tenantCount > 1 {
+			// Multiple accounts - return list of tenants for user to choose.
+			// SELECT DISTINCT so a tenant only appears once even when it
+			// contains multiple users matching the same phone.
 			rows, err := h.db.Query(fmt.Sprintf(`
-				SELECT t.id, t.name, t.code
+				SELECT DISTINCT t.id, t.name, t.code
 				FROM users u
 				JOIN tenants t ON u.tenant_id = t.id
 				WHERE %s AND u.deleted_at IS NULL AND t.is_active = true
+				ORDER BY t.name ASC
 			`, lookupClauseU), lookupValue)
 			if err != nil {
 				h.log.Error("Failed to query tenants", "error", err)
@@ -501,8 +539,15 @@ func (h *Handler) Login(c *gin.Context) {
 				})
 			}
 
-			response.Error(c, http.StatusConflict, "TENANT_SELECTION_REQUIRED",
-				"This account is associated with multiple companies. Please select one.")
+			// Single c.JSON only — `response.Error` would also call
+			// c.JSON internally, so calling both wrote the body
+			// twice and produced concatenated/malformed JSON. The
+			// frontend's `err.response.data.data.tenants` then came
+			// back undefined and the tenant picker never rendered,
+			// so phone-login users with multi-tenant collisions saw
+			// just "login failed" instead of the chooser. The full
+			// payload (error code + message + tenant list) goes out
+			// in this single response.
 			c.JSON(http.StatusConflict, gin.H{
 				"success": false,
 				"error": gin.H{
@@ -516,8 +561,18 @@ func (h *Handler) Login(c *gin.Context) {
 			return
 		}
 
-		// Single user - proceed with login
-		query = fmt.Sprintf(`SELECT %s FROM users WHERE %s AND deleted_at IS NULL`, selectFields, lookupClause)
+		// Single tenant — proceed with login. ORDER BY id ASC + LIMIT 1
+		// so QueryRow is deterministic when the same tenant happens to
+		// contain multiple users with the same phone (a data condition
+		// the count-distinct check above tolerates by falling through to
+		// here). The password check runs against this row; if it doesn't
+		// match, the user gets the standard "Invalid credentials"
+		// response and can re-try (or contact support to dedupe their
+		// account in that tenant).
+		query = fmt.Sprintf(
+			`SELECT %s FROM users WHERE %s AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`,
+			selectFields, lookupClause,
+		)
 		args = []interface{}{lookupValue}
 	}
 
