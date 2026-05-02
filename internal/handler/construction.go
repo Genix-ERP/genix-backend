@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -1064,23 +1065,56 @@ func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 		RETURNING id, created_date
 	`
 
+	// Resolve a unique code. The frontend auto-generates a code from
+	// the building name (e.g. "Block 2" → "BLOCK_2") which is
+	// deterministic — meaning two buildings with the same name in the
+	// same project would collide on `construction_buildings_project_id_code_key`
+	// and the user used to see a generic 500. Now we retry with a
+	// numeric suffix until we find a free code (BLOCK_2, BLOCK_2-2,
+	// BLOCK_2-3, ...). 50 attempts is more than enough for any sane
+	// project; if exhausted we fall back to a UUID-suffixed code so
+	// the request still succeeds rather than 500-ing.
+	baseCode := strings.TrimSpace(req.Code)
+	if baseCode == "" {
+		baseCode = "BUILDING"
+	}
+	tryCode := baseCode
+
 	var buildingID int64
 	var createdDate time.Time
-	err = h.db.QueryRow(query,
-		tenantID, projectID, req.Code, req.Name, nullString(req.Description),
-		nullString(req.BuildingType), nullString(req.BuildingPurpose),
-		nullInt32(int32(req.FloorsCount)), nullInt32(int32(req.FloorsUnderground)),
-		nullFloat64(req.TotalArea), nullFloat64(req.LivingArea), nullFloat64(req.NonLivingArea),
-		nullInt32(int32(req.ApartmentsCount)), nullInt32(int32(req.CommercialUnitsCount)), nullInt32(int32(req.ParkingSpots)),
-		nullFloat64(req.EstimatedCost),
-		plannedStart, plannedEnd,
-		req.SortOrder,
-	).Scan(&buildingID, &createdDate)
-	if err != nil {
-		h.log.Error("Failed to create building", "error", err)
+
+	const maxAttempts = 50
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		lastErr = h.db.QueryRow(query,
+			tenantID, projectID, tryCode, req.Name, nullString(req.Description),
+			nullString(req.BuildingType), nullString(req.BuildingPurpose),
+			nullInt32(int32(req.FloorsCount)), nullInt32(int32(req.FloorsUnderground)),
+			nullFloat64(req.TotalArea), nullFloat64(req.LivingArea), nullFloat64(req.NonLivingArea),
+			nullInt32(int32(req.ApartmentsCount)), nullInt32(int32(req.CommercialUnitsCount)), nullInt32(int32(req.ParkingSpots)),
+			nullFloat64(req.EstimatedCost),
+			plannedStart, plannedEnd,
+			req.SortOrder,
+		).Scan(&buildingID, &createdDate)
+		if lastErr == nil {
+			break // success
+		}
+		// 23505 is Postgres' unique_violation. Anything else is fatal —
+		// fall through to the error path below.
+		if pqErr, ok := lastErr.(*pq.Error); ok && pqErr.Code == "23505" {
+			tryCode = fmt.Sprintf("%s-%d", baseCode, attempt+1)
+			continue
+		}
+		break
+	}
+	if lastErr != nil {
+		h.log.Error("Failed to create building", "error", lastErr, "last_tried_code", tryCode)
 		response.InternalError(c, "Failed to create building")
 		return
 	}
+	// Surface the resolved code back to the client so the frontend can
+	// show "Created as BLOCK_2-3" if the original collided.
+	req.Code = tryCode
 
 	// Update project buildings count
 	h.db.Exec(`UPDATE construction_projects SET buildings_count = buildings_count + 1, updated_date = NOW() WHERE id = $1`, projectID)
