@@ -1066,6 +1066,17 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		FROM material_lines ml
 		LEFT JOIN construction_buildings b ON b.id = ml.bid
 		GROUP BY ml.bid, b.id, b.name, b.code, b.sort_order, ml.name, ml.uom, ml.unit_rate
+		-- Drop materials that haven't actually been consumed. The
+		-- catalog often contains many resources at planned prices
+		-- that the foreman never used (zero done_quantity → zero
+		-- fakt_quantity), so they were padding the report with empty
+		-- rows of БЕНЗИН РАСТВОРИТЕЛЬ / БЛОКИ ДВЕРНЫЕ etc. at qty 0
+		-- that distract from the actual consumption picture.
+		-- Topups attached to those lines are still loaded below, but
+		-- only matter when the parent group has a non-zero base spend
+		-- — a pure topup-only material is rare and can be added back
+		-- here later if the user wants it.
+		HAVING SUM(ml.fakt_quantity) > 0
 		ORDER BY b.sort_order ASC NULLS LAST, b.id ASC NULLS LAST,
 		         UPPER(ml.name) ASC, ml.uom ASC, ml.unit_rate ASC
 	`, projectID, tenantID)
