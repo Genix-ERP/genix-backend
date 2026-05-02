@@ -2,11 +2,13 @@ package handler
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -924,5 +926,316 @@ func (h *Handler) GetSvodReport(c *gin.Context) {
 			"address": projectAddress,
 		},
 		"buildings": buildings,
+	})
+}
+
+// =====================================================================
+// Material consolidation report
+// =====================================================================
+//
+// GET /construction/projects/:id/reports/material-consolidation
+//
+// Aggregates all MATERIAL sub-resources (resource_type = 'material', or
+// any non-labor / non-machine resource by UOM) of the project's
+// estimates, in **Fakt mode** — i.e. each line's contribution is scaled
+// by its parent work's done_quantity / quantity ratio.
+//
+// Aggregation key
+// ───────────────
+//   (building_id, name (case-insensitive), uom, unit_rate)
+//
+// So two lines with the same name + uom but DIFFERENT unit_rate
+// produce two separate output rows, each with its own consumed
+// quantity. Same name + same uom + same unit_rate → one combined row
+// with the summed quantity. This matches the user's requirement:
+// "if a material's price is different, show separately based on volume;
+// if the same, sum them up".
+//
+// Resource topups (migration 358 — purchases that came in at a new
+// price after the line was already in the smeta) are returned as a
+// nested list under each parent group. They're emitted under the group
+// of the line they were attached to so the UI can render them as
+// indented sub-rows.
+//
+// Output shape
+// ────────────
+//
+//   {
+//     project: {id, name, address},
+//     blocks: [
+//       {
+//         id, name,
+//         groups: [{
+//             name, uom, unit_rate,
+//             fakt_quantity, fakt_amount,
+//             topups: [{extra_quantity, new_price, amount, ordered_at, note}]
+//         }],
+//         total_amount
+//       }
+//     ],
+//     total: {
+//       groups: [...same shape, aggregated across blocks],
+//       total_amount
+//     }
+//   }
+//
+// "Block #0" is reserved for lines whose estimate has no building_id —
+// the modal renders these under "Umumiy" so the user can see them.
+func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Project header
+	var projectName, projectAddress string
+	if err := h.db.QueryRow(`
+		SELECT COALESCE(name, ''), COALESCE(address, '')
+		  FROM construction_projects
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectName, &projectAddress); err != nil {
+		h.log.Error("Failed to load project for material report", "error", err)
+		response.NotFound(c, "Project not found")
+		return
+	}
+
+	// Per-building × (name, uom, unit_rate) Fakt aggregation.
+	//
+	// `is_material` selector matches the same fallback logic Свод uses:
+	//   resource_type explicitly tagged 'material' wins; otherwise the
+	//   UOM excludes labor (ЧЕЛ) and machine (МАШ) and everything else
+	//   counts as material. This keeps legacy imports (where
+	//   resource_type was left blank) from being mis-classified.
+	//
+	// `parent_ratio` is parent.done_quantity / parent.quantity (or
+	// /original_quantity as fallback) — same shape as the Свод query.
+	rows, err := h.db.Query(`
+		WITH material_lines AS (
+		    SELECT
+		        e.building_id                     AS bid,
+		        s.name                            AS name,
+		        COALESCE(s.uom, '')               AS uom,
+		        COALESCE(s.unit_rate, 0)          AS unit_rate,
+		        s.id                              AS line_id,
+		        CASE
+		            WHEN COALESCE(p.done_quantity, 0) <= 0 THEN 0
+		            WHEN COALESCE(p.quantity, 0) > 0 THEN
+		                COALESCE(s.quantity, 0) * (p.done_quantity::numeric / p.quantity)
+		            WHEN COALESCE(p.original_quantity, 0) > 0 THEN
+		                COALESCE(s.quantity, 0) * (p.done_quantity::numeric / p.original_quantity)
+		            ELSE COALESCE(s.quantity, 0)
+		        END                               AS fakt_quantity
+		    FROM construction_estimate_line s
+		    JOIN construction_estimate_line p
+		      ON p.id = s.parent_line_id
+		     AND p.tenant_id = s.tenant_id
+		    JOIN construction_estimate e
+		      ON e.id = s.estimate_id
+		     AND e.tenant_id = s.tenant_id
+		    WHERE e.project_id  = $1
+		      AND e.tenant_id   = $2
+		      AND s.tenant_id   = $2
+		      AND s.parent_line_id IS NOT NULL
+		      AND (
+		          LOWER(COALESCE(s.resource_type, '')) IN ('material', 'materialy', 'mat', 'materiallar', 'материал', 'материалы')
+		          OR (
+		              UPPER(COALESCE(s.uom, '')) NOT LIKE '%ЧЕЛ%'
+		              AND UPPER(COALESCE(s.uom, '')) NOT LIKE '%МАШ%'
+		              AND LOWER(COALESCE(s.resource_type, '')) NOT IN
+		                  ('labor', 'mehnat', 'ish', 'ishchi', 'worker',
+		                   'equipment', 'mashina', 'masina', 'mexanizm', 'mexanizmlar', 'machinery',
+		                   'трудовой', 'трудовые', 'машина')
+		          )
+		      )
+		)
+		SELECT
+		    COALESCE(ml.bid, 0)                 AS building_id,
+		    COALESCE(b.name, b.code, 'Umumiy')  AS building_name,
+		    ml.name                             AS name,
+		    ml.uom                              AS uom,
+		    ml.unit_rate                        AS unit_rate,
+		    SUM(ml.fakt_quantity)               AS fakt_quantity,
+		    ARRAY_AGG(ml.line_id)               AS line_ids
+		FROM material_lines ml
+		LEFT JOIN construction_buildings b ON b.id = ml.bid
+		GROUP BY ml.bid, b.id, b.name, b.code, b.sort_order, ml.name, ml.uom, ml.unit_rate
+		ORDER BY b.sort_order ASC NULLS LAST, b.id ASC NULLS LAST,
+		         UPPER(ml.name) ASC, ml.uom ASC, ml.unit_rate ASC
+	`, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query material consolidation", "error", err)
+		response.InternalError(c, "Failed to compute material report")
+		return
+	}
+	defer rows.Close()
+
+	type topup struct {
+		ExtraQuantity float64 `json:"extra_quantity"`
+		NewPrice      float64 `json:"new_price"`
+		Amount        float64 `json:"amount"`
+		OrderedAt     string  `json:"ordered_at"`
+		Note          string  `json:"note"`
+	}
+	type group struct {
+		Name         string  `json:"name"`
+		UOM          string  `json:"uom"`
+		UnitRate     float64 `json:"unit_rate"`
+		FaktQuantity float64 `json:"fakt_quantity"`
+		FaktAmount   float64 `json:"fakt_amount"`
+		Topups       []topup `json:"topups"`
+		LineIDs      []int64 `json:"-"`
+	}
+	type block struct {
+		ID          int64   `json:"id"`
+		Name        string  `json:"name"`
+		Groups      []group `json:"groups"`
+		TotalAmount float64 `json:"total_amount"`
+	}
+
+	// Bucket groups by building_id in iteration order (preserved by
+	// ORDER BY in the SQL above).
+	blockOrder := []int64{}
+	blockMap := map[int64]*block{}
+	allLineIDs := []int64{}
+
+	for rows.Next() {
+		var bid int64
+		var bname, name, uom string
+		var rate, qty float64
+		var lineIDs pq.Int64Array
+		if err := rows.Scan(&bid, &bname, &name, &uom, &rate, &qty, &lineIDs); err != nil {
+			h.log.Error("Failed to scan material row", "error", err)
+			continue
+		}
+		blk, ok := blockMap[bid]
+		if !ok {
+			b := &block{ID: bid, Name: bname}
+			blockMap[bid] = b
+			blockOrder = append(blockOrder, bid)
+			blk = b
+		}
+		g := group{
+			Name:         name,
+			UOM:          uom,
+			UnitRate:     rate,
+			FaktQuantity: qty,
+			FaktAmount:   qty * rate,
+			Topups:       []topup{},
+			LineIDs:      []int64(lineIDs),
+		}
+		blk.Groups = append(blk.Groups, g)
+		blk.TotalAmount += g.FaktAmount
+		allLineIDs = append(allLineIDs, []int64(lineIDs)...)
+	}
+
+	// Bulk-load topups attached to any line we just emitted, then
+	// distribute them into their parent groups. Each topup's amount
+	// is extra_quantity × new_price (independent of the line's base
+	// unit_rate — that's the whole point of a top-up).
+	topupsByLine := map[int64][]topup{}
+	if len(allLineIDs) > 0 {
+		topupRows, terr := h.db.Query(`
+			SELECT estimate_line_id, COALESCE(extra_quantity, 0), COALESCE(new_price, 0),
+			       COALESCE(ordered_at::text, ''), COALESCE(note, '')
+			FROM construction_resource_topup
+			WHERE tenant_id = $1
+			  AND estimate_line_id = ANY($2::bigint[])
+			ORDER BY ordered_at ASC, id ASC
+		`, tenantID, pq.Array(allLineIDs))
+		if terr == nil {
+			defer topupRows.Close()
+			for topupRows.Next() {
+				var lineID int64
+				var t topup
+				if scanErr := topupRows.Scan(
+					&lineID, &t.ExtraQuantity, &t.NewPrice, &t.OrderedAt, &t.Note,
+				); scanErr != nil {
+					continue
+				}
+				t.Amount = t.ExtraQuantity * t.NewPrice
+				topupsByLine[lineID] = append(topupsByLine[lineID], t)
+			}
+		} else {
+			h.log.Error("Failed to load resource topups for material report", "error", terr)
+		}
+	}
+
+	// Attach topups to their groups (one topup may belong to one of
+	// several lines that fold into the same group when the lines share
+	// name/uom/unit_rate). Sum into block totals.
+	for _, blk := range blockMap {
+		for i := range blk.Groups {
+			for _, lid := range blk.Groups[i].LineIDs {
+				if ts, ok := topupsByLine[lid]; ok {
+					blk.Groups[i].Topups = append(blk.Groups[i].Topups, ts...)
+					for _, tp := range ts {
+						blk.TotalAmount += tp.Amount
+					}
+				}
+			}
+		}
+	}
+
+	// Build the project-wide "Total" pseudo-block by re-aggregating
+	// across blocks on the same (name, uom, unit_rate) key.
+	type aggKey struct {
+		name string
+		uom  string
+		rate float64
+	}
+	totalAgg := map[aggKey]*group{}
+	totalOrder := []aggKey{}
+	var grandTotal float64
+	for _, blk := range blockMap {
+		for _, g := range blk.Groups {
+			k := aggKey{name: strings.ToUpper(g.Name), uom: g.UOM, rate: g.UnitRate}
+			tg, ok := totalAgg[k]
+			if !ok {
+				ng := group{
+					Name: g.Name, UOM: g.UOM, UnitRate: g.UnitRate,
+					Topups: []topup{},
+				}
+				totalAgg[k] = &ng
+				tg = &ng
+				totalOrder = append(totalOrder, k)
+			}
+			tg.FaktQuantity += g.FaktQuantity
+			tg.FaktAmount += g.FaktAmount
+			tg.Topups = append(tg.Topups, g.Topups...)
+			grandTotal += g.FaktAmount
+			for _, tp := range g.Topups {
+				grandTotal += tp.Amount
+			}
+		}
+	}
+	totalGroups := make([]group, 0, len(totalOrder))
+	for _, k := range totalOrder {
+		totalGroups = append(totalGroups, *totalAgg[k])
+	}
+
+	// Materialise blocks in deterministic order.
+	out := make([]*block, 0, len(blockOrder))
+	for _, bid := range blockOrder {
+		out = append(out, blockMap[bid])
+	}
+
+	response.Success(c, gin.H{
+		"project": gin.H{
+			"id":      projectID,
+			"name":    projectName,
+			"address": projectAddress,
+		},
+		"blocks": out,
+		"total": gin.H{
+			"groups":       totalGroups,
+			"total_amount": grandTotal,
+		},
 	})
 }
