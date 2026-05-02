@@ -1482,70 +1482,112 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		importTemplateMode = true
 	}
 
+	// Batched bulk INSERT — `batchSize` rows per round-trip instead of
+	// one-row-per-Exec. The previous loop's 3 000+ sequential
+	// tx.Exec() calls were the dominant cost on real-world imports
+	// (each call = round-trip + parse + plan + write); switching to
+	// multi-row VALUES collapses 3 000 round-trips down to ~6 for a
+	// 3 000-line file, which is the difference between "tens of
+	// seconds" and "well under one".
+	//
+	// 19 columns × 500 rows = 9 500 placeholders per batch — well
+	// under PostgreSQL's 65 535 parameter limit.
+	const fieldsPerRow = 19
+	const batchSize = 500
+
+	insertHeader := `INSERT INTO construction_estimate_line (
+		tenant_id, estimate_id, wbs_id, name, uom, quantity,
+		material_rate, labor_rate, equipment_rate,
+		unit_rate, total_amount, code, item_number,
+		resource_type, material_type, parent_item_number, norm_rate, sort_order,
+		original_quantity,
+		created_date, updated_date
+	) VALUES `
+
 	count := 0
-	for i, line := range req.Lines {
-		// In template mode, force the ledger column to 0 — the file's
-		// pre-baked total is intentionally discarded. norm_rate is left
-		// alone so the per-unit norm survives the round-trip.
-		if importTemplateMode {
-			line.Quantity = 0
-		}
-		unitRate := line.MaterialRate + line.LaborRate + line.EquipmentRate
-		totalAmount := unitRate * line.Quantity
-		uom := line.UOM
-		if uom == "" {
-			uom = "шт"
-		}
-		sortOrder := line.SortOrder
-		if sortOrder == 0 {
-			sortOrder = i + 1
+	for batchStart := 0; batchStart < len(req.Lines); batchStart += batchSize {
+		batchEnd := batchStart + batchSize
+		if batchEnd > len(req.Lines) {
+			batchEnd = len(req.Lines)
 		}
 
-		// material_type — sub-bucket for resource_type='material' rows
-		// (migration 350). Falls back to 'standard' when omitted or when
-		// the line is labor/equipment so the CHECK constraint is happy.
-		materialType := strings.ToLower(strings.TrimSpace(line.MaterialType))
-		switch materialType {
-		case "standard", "equipment", "cable", "metal", "import":
-			// already valid
-		default:
-			materialType = "standard"
+		var sb strings.Builder
+		sb.Grow(len(insertHeader) + (batchEnd-batchStart)*120)
+		sb.WriteString(insertHeader)
+
+		args := make([]interface{}, 0, (batchEnd-batchStart)*fieldsPerRow)
+
+		for i := batchStart; i < batchEnd; i++ {
+			line := req.Lines[i]
+			// In template mode, force the ledger column to 0 — the
+			// file's pre-baked total is intentionally discarded.
+			// norm_rate is left alone so the per-unit norm survives
+			// the round-trip.
+			if importTemplateMode {
+				line.Quantity = 0
+			}
+			unitRate := line.MaterialRate + line.LaborRate + line.EquipmentRate
+			totalAmount := unitRate * line.Quantity
+			uom := line.UOM
+			if uom == "" {
+				uom = "шт"
+			}
+			sortOrder := line.SortOrder
+			if sortOrder == 0 {
+				sortOrder = i + 1
+			}
+
+			// material_type — sub-bucket for resource_type='material'
+			// rows (migration 350). Falls back to 'standard' when
+			// omitted or when the line is labor/equipment so the CHECK
+			// constraint is happy.
+			materialType := strings.ToLower(strings.TrimSpace(line.MaterialType))
+			switch materialType {
+			case "standard", "equipment", "cable", "metal", "import":
+				// already valid
+			default:
+				materialType = "standard"
+			}
+
+			// original_quantity passthrough — see comments in the
+			// pre-batched implementation; behaviour is unchanged.
+			var origQtyArg interface{}
+			if line.OriginalQuantity != nil {
+				origQtyArg = *line.OriginalQuantity
+			}
+
+			// Build the ($N, $N+1, ..., $N+18, NOW(), NOW()) tuple.
+			if i > batchStart {
+				sb.WriteByte(',')
+			}
+			base := (i - batchStart) * fieldsPerRow
+			sb.WriteByte('(')
+			for j := 0; j < fieldsPerRow; j++ {
+				if j > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteByte('$')
+				sb.WriteString(strconv.Itoa(base + j + 1))
+			}
+			sb.WriteString(",NOW(),NOW())")
+
+			args = append(args,
+				tenantID, estimateID, nullInt64FromVal(line.WBSID),
+				line.Name, uom, line.Quantity,
+				line.MaterialRate, line.LaborRate, line.EquipmentRate,
+				unitRate, totalAmount, nullStringFromVal(line.Code), nullStringFromVal(line.ItemNumber),
+				nullStringFromVal(line.ResourceType), materialType, nullStringFromVal(line.ParentItemNumber), line.NormRate, sortOrder,
+				origQtyArg,
+			)
+			count++
 		}
 
-		// original_quantity passthrough. When the import client sends a
-		// value (template-mode parents carry the file's planned norma),
-		// we write it explicitly so the migration 349 trigger sees a
-		// non-NULL value and leaves it alone. Without this path the
-		// trigger would default original_quantity = quantity = 0 and
-		// the Smeta boshqaruvi NORMA pill renders empty for every
-		// imported parent in template mode.
-		var origQtyArg interface{}
-		if line.OriginalQuantity != nil {
-			origQtyArg = *line.OriginalQuantity
-		}
-
-		_, err := tx.Exec(`
-			INSERT INTO construction_estimate_line (
-				tenant_id, estimate_id, wbs_id, name, uom, quantity,
-				material_rate, labor_rate, equipment_rate,
-				unit_rate, total_amount, code, item_number,
-				resource_type, material_type, parent_item_number, norm_rate, sort_order,
-				original_quantity,
-				created_date, updated_date
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, NOW(), NOW())
-		`, tenantID, estimateID, nullInt64FromVal(line.WBSID),
-			line.Name, uom, line.Quantity,
-			line.MaterialRate, line.LaborRate, line.EquipmentRate,
-			unitRate, totalAmount, nullStringFromVal(line.Code), nullStringFromVal(line.ItemNumber),
-			nullStringFromVal(line.ResourceType), materialType, nullStringFromVal(line.ParentItemNumber), line.NormRate, sortOrder,
-			origQtyArg,
-		)
-		if err != nil {
-			h.log.Error("Failed to insert estimate line", "error", err, "index", i)
-			response.InternalError(c, fmt.Sprintf("Failed to insert line %d: %s", i+1, line.Name))
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			h.log.Error("Failed to bulk-insert estimate lines",
+				"error", err, "batch_start", batchStart, "batch_end", batchEnd)
+			response.InternalError(c, fmt.Sprintf("Failed to insert lines %d-%d", batchStart+1, batchEnd))
 			return
 		}
-		count++
 	}
 
 	if err := tx.Commit(); err != nil {
