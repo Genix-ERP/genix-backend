@@ -2025,6 +2025,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/reports/summary", h.GetProjectSummaryReport)
 		constructionProjects.GET("/:id/reports/budget", h.GetStageBudgetReport)
 		constructionProjects.GET("/:id/reports/svod", h.GetSvodReport)
+		constructionProjects.GET("/:id/reports/material-consolidation", h.GetMaterialConsolidationReport)
 		constructionProjects.GET("/:id/reports/materials", h.GetMaterialsReport)
 		constructionProjects.GET("/:id/reports/journal-entries", h.GetJournalEntriesReport)
 
