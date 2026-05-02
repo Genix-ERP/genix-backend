@@ -467,6 +467,24 @@ func (h *Handler) Login(c *gin.Context) {
 			"AND RIGHT(REGEXP_REPLACE(COALESCE(u.phone, ''), '[^0-9]', '', 'g'), 9) = $1"
 		lookupClauseTenant = "LENGTH(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g')) >= 9 " +
 			"AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g'), 9) = $2"
+
+		// === TEMPORARY DIAGNOSTIC LOG (remove once phone login is stable) ===
+		// Logs the LENGTH of the raw input + the last 4 digits of the
+		// normalized lookup value so we can confirm in production logs:
+		//   (1) the new RIGHT-9-digits binary is actually deployed
+		//   (2) the input is being normalized as expected
+		//   (3) NO full phone number is leaked into logs
+		last4 := digits
+		if len(last4) > 4 {
+			last4 = last4[len(last4)-4:]
+		}
+		h.log.Info("Phone login attempt",
+			"raw_input_len", len(input.Phone),
+			"lookup_digits_len", len(digits),
+			"last4", last4,
+			"version", "right-9-match-v2",
+		)
+		// === END DIAGNOSTIC LOG ===
 	}
 
 	selectFields := `id, tenant_id, COALESCE(email, ''), password_hash, first_name, last_name,
@@ -592,6 +610,14 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	if err == sql.ErrNoRows {
+		// === DIAGNOSTIC: tells us "user not found" vs "wrong password" ===
+		// "user_not_found" here means the SQL `RIGHT 9 digits`
+		// matcher couldn't find ANY user with the supplied phone —
+		// either the DB stores phones in a format that doesn't
+		// produce 9 stripped digits, or the phone isn't registered.
+		if loginByPhone {
+			h.log.Warn("Phone login: no user matched", "reason", "user_not_found")
+		}
 		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "Invalid email or password")
 		return
 	}
@@ -635,6 +661,19 @@ func (h *Handler) Login(c *gin.Context) {
 	// Verify password
 	valid, err := crypto.VerifyPassword(input.Password, user.PasswordHash)
 	if err != nil || !valid {
+		// === DIAGNOSTIC: "user found but wrong password" ===
+		// If you see this on a phone-login failure it means the
+		// RIGHT-9-digits matcher DID find a user record — the lookup
+		// path is healthy. The 401 is then strictly a password
+		// mismatch (or the matcher landed on a duplicate user record
+		// that has a different password). Compare with
+		// "no user matched" above.
+		if loginByPhone {
+			h.log.Warn("Phone login: password mismatch",
+				"reason", "password_mismatch",
+				"user_id", user.ID,
+			)
+		}
 		// Increment failed login attempts
 		h.db.Exec(`
 			UPDATE users SET
