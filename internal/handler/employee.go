@@ -424,9 +424,36 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 				h.log.Warn("Could not auto-create user for employee", "error", createErr)
 			}
 		} else if lookupErr == nil {
-			// User exists — link to this employee
-			h.db.Exec(`UPDATE users SET employee_id = $1, updated_at = $2 WHERE id = $3`,
-				id, now, existingUserID)
+			// User exists — link to this employee AND mirror the
+			// employee's phone/email onto the user record so the two
+			// stay in sync. Previously this branch only set
+			// employee_id, which left the user's contact info as
+			// whatever it was at OTP-registration time — exactly the
+			// drift that produced the `bsotuv@gmail.com` case (user
+			// registered with one phone, HR later created an employee
+			// with a different phone, login then failed because the
+			// canonical phone lived on employees while login matched
+			// against users.phone). Conditional COALESCE means we
+			// only overwrite when the new value is actually present
+			// in the create input.
+			var phoneVal *string
+			if input.Phone != "" {
+				p := normalizePhone(input.Phone)
+				phoneVal = &p
+			}
+			var emailVal *string
+			if input.Email != "" {
+				e := input.Email
+				emailVal = &e
+			}
+			h.db.Exec(`
+				UPDATE users
+				   SET employee_id = $1,
+				       phone       = COALESCE($2, phone),
+				       email       = COALESCE($3, email),
+				       updated_at  = $4
+				 WHERE id = $5
+			`, id, phoneVal, emailVal, now, existingUserID)
 		}
 	}
 
@@ -710,6 +737,36 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 		h.log.Error("Failed to update employee", "error", err)
 		response.InternalError(c, "Failed to update employee")
 		return
+	}
+
+	// Mirror phone / email changes to the linked user record so login
+	// stays in sync. Without this, HR could update an employee's phone
+	// and the corresponding user's `users.phone` would silently drift
+	// — which is exactly how `bsotuv@gmail.com` ended up with two
+	// different phones (employee record had the canonical work number,
+	// users.phone still held the original OTP-registration number, so
+	// phone login failed).
+	//
+	// The opposite direction (user → employee) is already mirrored in
+	// auth.go's UpdateCurrentUser and VerifyPhoneOTP. This adds the
+	// missing reverse leg. Errors are logged-but-ignored — the
+	// employee update itself already succeeded; we don't want to fail
+	// the whole request because a soft-mirror couldn't propagate.
+	if input.Phone != nil {
+		if _, mErr := h.db.Exec(
+			`UPDATE users SET phone = $1, updated_at = NOW() WHERE employee_id = $2 AND tenant_id = $3 AND deleted_at IS NULL`,
+			*input.Phone, returnedID, tenantID,
+		); mErr != nil {
+			h.log.Warn("Failed to mirror employee.phone → users.phone", "error", mErr, "employee_id", returnedID)
+		}
+	}
+	if input.Email != nil {
+		if _, mErr := h.db.Exec(
+			`UPDATE users SET email = $1, updated_at = NOW() WHERE employee_id = $2 AND tenant_id = $3 AND deleted_at IS NULL`,
+			*input.Email, returnedID, tenantID,
+		); mErr != nil {
+			h.log.Warn("Failed to mirror employee.email → users.email", "error", mErr, "employee_id", returnedID)
+		}
 	}
 
 	// Fetch updated employee
