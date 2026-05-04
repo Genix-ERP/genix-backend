@@ -936,16 +936,16 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 		WHERE tenant_id = $1 AND COALESCE(pipeline_type, 'opportunity') = $2
 	`
 
-	// Strict per-organization scope: stages belong to one company,
-	// only that company's teammates see them. Create/Update always
-	// stamp the active org (with a primary-org fallback when no
-	// X-Organization-ID header is sent) and migration 388 backfills
-	// any historic NULL-org rows, so a strict equality filter can't
-	// hide stages from teammates.
+	// Per-org scope with NULL-row allowance for legacy stages.
+	// Create now stamps the active org (with primary-org fallback),
+	// so new stages always carry a concrete organization_id. But
+	// pre-existing rows with organization_id = NULL — created
+	// before scoping was added — stay visible to every org viewer
+	// so we don't disappear a tenant's existing pipeline overnight.
 	orgID, orgOk := middleware.GetOrganizationID(c)
 	if orgOk && orgID != uuid.Nil {
 		argCount++
-		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		query += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
 		args = append(args, orgID)
 	}
 	query += " ORDER BY sequence ASC"
@@ -1157,10 +1157,12 @@ func (h *Handler) UpdatePipelineStage(c *gin.Context) {
 	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
 	args = append(args, time.Now())
 
-	// Strict org scope on update: the stage must belong to the
-	// caller's active org. Migration 388 backfills any pre-existing
-	// NULL-org rows, so the strict equality can't render legacy
-	// stages read-only.
+	// Org scope on update with NULL-row allowance for legacy stages.
+	// Without the OR IS NULL branch, pre-existing stages created
+	// before per-org scoping landed would render read-only — admin
+	// could see them via list (which also allows NULL rows) but
+	// every reorder PUT would silently fail because the WHERE
+	// excluded them.
 	argCount++
 	args = append(args, id)
 	idArg := argCount
@@ -1172,7 +1174,7 @@ func (h *Handler) UpdatePipelineStage(c *gin.Context) {
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
 		args = append(args, orgID)
-		whereClause += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		whereClause += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
 	}
 
 	query := fmt.Sprintf(
