@@ -174,8 +174,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	rg.GET("/permissions", h.ListPermissions)
 
 	// Organizations
+	// NOTE: GET endpoints are NOT permission-gated. CompanyContext on the
+	// frontend calls `GET /organizations` on app startup; without it
+	// `activeCompany` is null and basically every other page breaks. The
+	// user is already JWT-scoped to their tenant, so they can only ever
+	// see their own tenant's orgs. Mutations remain gated.
 	orgs := rg.Group("/organizations")
-	orgs.Use(h.perm.Require("organization", "organization", "read"))
 	{
 		orgs.GET("", h.ListOrganizations)
 		orgs.POST("", h.perm.Require("organization", "organization", "create"), h.CreateOrganization)
