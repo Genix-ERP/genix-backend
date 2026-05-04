@@ -71,17 +71,16 @@ func (h *Handler) ListLeads(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
-	// Filter by organization. Leads created without an active org
-	// context (typically by an admin who hasn't switched to a
-	// specific company) end up with organization_id = NULL. We still
-	// want those leads visible to org-scoped teammates — otherwise
-	// only the admin/creator see them and the rest of the company
-	// thinks the CRM lost their lead. So match either the user's
-	// org OR a NULL org.
+	// Strict org filter: leads belong to one company and only that
+	// company's teammates see them. CreateLead/ConvertLead always
+	// populate organization_id (with a primary-org fallback when no
+	// X-Organization-ID header is supplied), and a one-time
+	// backfill migration handles any legacy NULL-org rows. So a
+	// strict equality filter here can't leave leads invisible.
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND (l.organization_id = $%d OR l.organization_id IS NULL)", argCount)
-		countQuery += fmt.Sprintf(" AND (l.organization_id = $%d OR l.organization_id IS NULL)", argCount)
+		baseQuery += fmt.Sprintf(" AND l.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND l.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
