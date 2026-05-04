@@ -2159,6 +2159,77 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 		}
 
 		if apAccountID != uuid.Nil {
+			// TT §4.5 requires every 6010 (Mol yetkazib beruvchilar va
+			// pudratchilar) line to carry a contract reference. The
+			// `journal_entry_lines.contract_id` column has a foreign key
+			// to **contracts(id)** (migration 318), NOT to
+			// procurement_contracts(id) — those are two separate tables
+			// that happen to share part of the schema. The enrichment
+			// trigger (migration 385) looks up `contracts` for the
+			// vendor-level fallback, so we have to write spot contracts
+			// there too. Otherwise the trigger fills in a UUID that
+			// belongs to procurement_contracts and the FK on the JE
+			// line rejects with `fk_jel_contract` violation.
+			//
+			// Lookup column mapping is `contracts.supplier_id` (not
+			// `vendor_id` like procurement_contracts uses).
+			//
+			// Idempotent: re-running the bill flow finds the spot
+			// contract created on a previous attempt instead of
+			// inserting a duplicate.
+			var existingContractID uuid.UUID
+			contractErr := tx.QueryRow(`
+				SELECT id FROM contracts
+				WHERE tenant_id = $1
+				  AND supplier_id = $2
+				  AND COALESCE(status, 'active') IN ('active', 'draft', 'approved')
+				  AND deleted_at IS NULL
+				ORDER BY created_at DESC
+				LIMIT 1
+			`, tenantID, vendorID).Scan(&existingContractID)
+
+			if contractErr == sql.ErrNoRows {
+				// No master contract exists — create a Spot Purchase
+				// stub. contracts(supplier_name) is NOT NULL so we
+				// look it up from the contacts table.
+				spotID := uuid.New()
+				spotNumber := fmt.Sprintf("SPOT-%s", poNumber)
+				spotTitle := fmt.Sprintf("Spot purchase via PO %s", poNumber)
+				var vendorName string
+				_ = tx.QueryRow(
+					`SELECT COALESCE(name, COALESCE(legal_name, 'Vendor')) FROM contacts WHERE id = $1`,
+					vendorID,
+				).Scan(&vendorName)
+				if vendorName == "" {
+					vendorName = "Vendor"
+				}
+
+				spotStart := now
+				spotEnd := now.AddDate(5, 0, 0)
+				if _, ccErr := tx.Exec(`
+					INSERT INTO contracts (
+						id, tenant_id, contract_number, supplier_id, supplier_name,
+						title, contract_type, start_date, end_date, value, currency,
+						status, created_by, created_at, updated_at
+					) VALUES (
+						$1, $2, $3, $4, $5,
+						$6, 'fixed', $7, $8, $9, 'UZS',
+						'active', $10, NOW(), NOW()
+					)
+				`, spotID, tenantID, spotNumber, vendorID, vendorName,
+					spotTitle, spotStart, spotEnd, totalAmount, createdBy); ccErr != nil {
+					// Non-fatal logging — the JE insert below will fail
+					// with the §4.5 error if we couldn't create the
+					// contract, giving the operator a clear actionable
+					// message rather than masking a deeper data issue.
+					h.log.Warn("CreateBillFromPO: failed to auto-create spot contract",
+						"error", ccErr, "vendor_id", vendorID)
+				}
+			} else if contractErr != nil {
+				h.log.Warn("CreateBillFromPO: contract lookup failed",
+					"error", contractErr, "vendor_id", vendorID)
+			}
+
 			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 			// Per-category accounting: resolve Stock Interim Receipt per product

@@ -454,8 +454,10 @@ func NewPermissionChecker(db *database.DB, redis *cache.RedisClient, log logger.
 }
 
 // permissionCacheKey builds the Redis key for a user's permission set.
+// The "v2:" prefix invalidates older cache entries when the permission
+// map shape changes (e.g. when wildcard module:*:action keys were added).
 func permissionCacheKey(tenantID, userID string) string {
-	return fmt.Sprintf("permissions:%s:%s", tenantID, userID)
+	return fmt.Sprintf("permissions:v2:%s:%s", tenantID, userID)
 }
 
 // loadPermissions queries the database for all permissions granted to the user
@@ -552,6 +554,36 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		var canCreate, canRead, canUpdate, canDelete bool
 		if err := empRows.Scan(&moduleID, &canCreate, &canRead, &canUpdate, &canDelete); err != nil {
 			continue
+		}
+
+		// Wildcard grants: module:*:action.
+		// The frontend stores permissions at the module level only (one
+		// can_read/can_create/can_update/can_delete per module), but the
+		// backend `Require()` middleware checks 3-level keys like
+		// "inventory:product:read". The resourceMap below enumerates
+		// known sub-resources per module, but it's easy to drift — any
+		// route that uses a sub-resource not in the map silently 403s
+		// even though the user clearly has module-level access (and the
+		// sidebar shows the tab). We also publish a wildcard variant so
+		// `Require()` can fall back to "module:*:action" when the
+		// specific "module:resource:action" key is missing.
+		if canCreate {
+			perms[moduleID+":*:create"] = true
+		}
+		if canRead {
+			perms[moduleID+":*:read"] = true
+		}
+		if canUpdate {
+			perms[moduleID+":*:update"] = true
+			perms[moduleID+":*:manage"] = true
+			perms[moduleID+":*:adjust"] = true
+			perms[moduleID+":*:transfer"] = true
+			perms[moduleID+":*:approve"] = true
+			perms[moduleID+":*:confirm"] = true
+			perms[moduleID+":*:post"] = true
+		}
+		if canDelete {
+			perms[moduleID+":*:delete"] = true
 		}
 
 		resources, ok := resourceMap[moduleID]
@@ -730,8 +762,14 @@ func (pc *PermissionChecker) Require(module, resource, action string) gin.Handle
 			return
 		}
 
+		// Check specific key first; fall back to module-level wildcard
+		// (module:*:action) so users with module-level access don't 403
+		// on sub-resources that the resourceMap doesn't enumerate.
+		// This keeps the sidebar's module-only gating in sync with what
+		// the API will actually allow.
 		permKey := module + ":" + resource + ":" + action
-		if !perms[permKey] {
+		wildcardKey := module + ":*:" + action
+		if !perms[permKey] && !perms[wildcardKey] {
 			response.Forbidden(c, fmt.Sprintf("Missing required permission: %s", permKey))
 			c.Abort()
 			return
