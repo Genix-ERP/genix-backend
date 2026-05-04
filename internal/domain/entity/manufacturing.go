@@ -323,6 +323,12 @@ type ProductionOrderResponse struct {
 	Stages               []ProductionOrderStageResponse `json:"stages,omitempty"`
 	ManufacturingCategoryID   *uuid.UUID `json:"manufacturing_category_id,omitempty"`
 	ManufacturingCategoryName *string    `json:"manufacturing_category_name,omitempty"`
+	// Sales order link (populated when the production order was
+	// created from a sales order — frontend shows the SO number on
+	// the Stage Workflow modal so operators see what they're
+	// building for, and stays empty for ad-hoc production orders).
+	SalesOrderID         *uuid.UUID `json:"sales_order_id,omitempty"`
+	SalesOrderNumber     *string    `json:"sales_order_number,omitempty"`
 	CreatedBy            *uuid.UUID  `json:"created_by,omitempty"`
 	CreatedByName        *string     `json:"created_by_name,omitempty"`
 	ConfirmedAt          *string     `json:"confirmed_at,omitempty"`
