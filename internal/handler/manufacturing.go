@@ -1144,7 +1144,8 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 			   po.notes, po.tags, po.created_by, cu.first_name || ' ' || cu.last_name as created_by_name,
 			   po.confirmed_at, po.completed_at, po.created_at, po.updated_at,
 			   po.manufacturing_category_id, mc.name as manufacturing_category_name,
-			   po.has_split_output
+			   po.has_split_output,
+			   po.sales_order_id, so.order_number as sales_order_number
 		FROM production_orders po
 		LEFT JOIN products p ON po.product_id = p.id
 		LEFT JOIN product_boms b ON po.bom_id = b.id
@@ -1153,11 +1154,12 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 		LEFT JOIN work_centers wc ON po.work_center_id = wc.id
 		LEFT JOIN users cu ON po.created_by = cu.id
 		LEFT JOIN manufacturing_categories mc ON po.manufacturing_category_id = mc.id
+		LEFT JOIN sales_orders so ON po.sales_order_id = so.id
 		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL
 	`
 
 	var po entity.ProductionOrderResponse
-	var bomName, warehouseName, assignedToName, workCenterName, createdByName, shift, categoryName sql.NullString
+	var bomName, warehouseName, assignedToName, workCenterName, createdByName, shift, categoryName, salesOrderNumber sql.NullString
 	var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 	var tags []byte
 
@@ -1174,6 +1176,7 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 		&confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
 		&po.ManufacturingCategoryID, &categoryName,
 		&po.HasSplitOutput,
+		&po.SalesOrderID, &salesOrderNumber,
 	)
 
 	if err == sql.ErrNoRows {
@@ -1206,6 +1209,9 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 	}
 	if categoryName.Valid {
 		po.ManufacturingCategoryName = &categoryName.String
+	}
+	if salesOrderNumber.Valid {
+		po.SalesOrderNumber = &salesOrderNumber.String
 	}
 	if scheduledStart.Valid {
 		s := scheduledStart.Time.Format("2006-01-02")
