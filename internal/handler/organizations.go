@@ -11,6 +11,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // Organization represents a company/organization within a tenant
@@ -48,6 +49,10 @@ type Organization struct {
 	LegalAddress          *string  `json:"legal_address,omitempty"`
 	Notes                 *string  `json:"notes,omitempty"`
 	IntercompanyVendorIDs []string `json:"intercompany_vendor_ids,omitempty"`
+	// Per-org sidebar visibility override (migration 386).
+	// If an app_id is in this list, the app is hidden from the sidebar
+	// when this organization is the active company. Empty by default.
+	HiddenApps []string `json:"hidden_apps"`
 }
 
 // CreateOrganizationInput represents the input for creating an organization
@@ -113,6 +118,9 @@ type UpdateOrganizationInput struct {
 	Notes                 *string `json:"notes,omitempty"`
 	// Intercompany vendoring: create vendor+customer contacts in these org IDs
 	IntercompanyVendorIDs []string `json:"intercompany_vendor_ids,omitempty"`
+	// Per-org sidebar visibility override (migration 386). Pointer so
+	// "absent in payload" is distinguishable from "explicitly empty".
+	HiddenApps *[]string `json:"hidden_apps,omitempty"`
 }
 
 // ListOrganizations returns all organizations for the current tenant
@@ -129,7 +137,8 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 		       settings, is_active, created_at, updated_at,
 		       oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 		       tax_regime, activity_status, business_group, intercompany_relations,
-		       director_name, director_phone, legal_address, notes
+		       director_name, director_phone, legal_address, notes,
+		       COALESCE(hidden_apps, '{}'::text[])
 		FROM organizations
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 		ORDER BY name ASC
@@ -147,6 +156,7 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 	for rows.Next() {
 		var org Organization
 		var addressJSON, contactInfoJSON, settingsJSON []byte
+		var hiddenApps pq.StringArray
 
 		err := rows.Scan(
 			&org.ID, &org.TenantID, &org.ParentID, &org.Code, &org.Name, &org.Type,
@@ -156,7 +166,12 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 			&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 			&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 			&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
+			&hiddenApps,
 		)
+		org.HiddenApps = []string(hiddenApps)
+		if org.HiddenApps == nil {
+			org.HiddenApps = []string{}
+		}
 		if err != nil {
 			h.log.Error("Failed to scan organization", "error", err)
 			continue
@@ -340,6 +355,9 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 		response.InternalServerError(c, "Failed to create organization")
 		return
 	}
+	// New orgs always start with no hidden apps. Setting explicitly so the
+	// JSON response includes [] instead of null.
+	org.HiddenApps = []string{}
 
 	// Parse JSONB fields
 	if len(addressJSONOut) > 0 {
@@ -404,13 +422,15 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		       settings, is_active, created_at, updated_at,
 		       oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 		       tax_regime, activity_status, business_group, intercompany_relations,
-		       director_name, director_phone, legal_address, notes
+		       director_name, director_phone, legal_address, notes,
+		       COALESCE(hidden_apps, '{}'::text[])
 		FROM organizations
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`
 
 	var org Organization
 	var addressJSON, contactInfoJSON, settingsJSON []byte
+	var hiddenApps pq.StringArray
 
 	err = h.db.QueryRow(query, orgID, tenantID).Scan(
 		&org.ID, &org.TenantID, &org.ParentID, &org.Code, &org.Name, &org.Type,
@@ -420,6 +440,7 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
+		&hiddenApps,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Organization")
@@ -429,6 +450,10 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		h.log.Error("Failed to get organization", "error", err)
 		response.InternalServerError(c, "Failed to get organization")
 		return
+	}
+	org.HiddenApps = []string(hiddenApps)
+	if org.HiddenApps == nil {
+		org.HiddenApps = []string{}
 	}
 
 	// Parse JSONB fields
@@ -633,6 +658,14 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		args = append(args, *input.Notes)
 		argIndex++
 	}
+	if input.HiddenApps != nil {
+		// Per-org sidebar visibility list (migration 386). pq.StringArray
+		// marshals []string to PostgreSQL text[] correctly; passing the
+		// raw slice would land as a single quoted string.
+		query += fmt.Sprintf(", hidden_apps = $%d", argIndex)
+		args = append(args, pq.StringArray(*input.HiddenApps))
+		argIndex++
+	}
 
 	query += fmt.Sprintf(" WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL", argIndex, argIndex+1)
 	args = append(args, orgID, tenantID)
@@ -642,10 +675,12 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 	           settings, is_active, created_at, updated_at,
 	           oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 	           tax_regime, activity_status, business_group, intercompany_relations,
-	           director_name, director_phone, legal_address, notes`
+	           director_name, director_phone, legal_address, notes,
+	           COALESCE(hidden_apps, '{}'::text[])`
 
 	var org Organization
 	var addressJSON, contactInfoJSON, settingsJSON []byte
+	var hiddenApps pq.StringArray
 
 	err = h.db.QueryRow(query, args...).Scan(
 		&org.ID, &org.TenantID, &org.ParentID, &org.Code, &org.Name, &org.Type,
@@ -655,11 +690,16 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
+		&hiddenApps,
 	)
 	if err != nil {
 		h.log.Error("Failed to update organization", "error", err)
 		response.InternalServerError(c, "Failed to update organization")
 		return
+	}
+	org.HiddenApps = []string(hiddenApps)
+	if org.HiddenApps == nil {
+		org.HiddenApps = []string{}
 	}
 
 	// Parse JSONB fields
