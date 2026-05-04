@@ -936,20 +936,16 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 		WHERE tenant_id = $1 AND COALESCE(pipeline_type, 'opportunity') = $2
 	`
 
-	// Per-organization scope (user request: "stage created in one
-	// company should not be in second"). When X-Organization-ID is
-	// present, return THIS org's stages PLUS any legacy tenant-wide
-	// stages (organization_id IS NULL). Including the NULL rows is
-	// what preserves the data created before this scoping was
-	// introduced — without it, a user who upgraded suddenly saw an
-	// empty pipeline (and the frontend's seed-defaults auto-created
-	// fresh ones, orphaning their existing leads). New stages
-	// created from now on get stamped with the active org and stay
-	// invisible to other companies in the same tenant.
+	// Strict per-organization scope: stages belong to one company,
+	// only that company's teammates see them. Create/Update always
+	// stamp the active org (with a primary-org fallback when no
+	// X-Organization-ID header is sent) and migration 388 backfills
+	// any historic NULL-org rows, so a strict equality filter can't
+	// hide stages from teammates.
 	orgID, orgOk := middleware.GetOrganizationID(c)
 	if orgOk && orgID != uuid.Nil {
 		argCount++
-		query += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
+		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 	query += " ORDER BY sequence ASC"
@@ -1009,15 +1005,29 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		pipelineType = "opportunity"
 	}
 
-	// Pipeline stages are now per-organization (per user request).
-	// Stamp the active company id from X-Organization-ID so each
-	// company keeps its own pipeline. Falls back to NULL when no org
-	// is active — those legacy rows remain accessible only when the
-	// list endpoint is called without an org context.
+	// Pipeline stages are per-organization. Stamp the active company
+	// id from X-Organization-ID so each company keeps its own
+	// pipeline. When the request didn't carry an active-org header
+	// (admin without a switched company), fall back to the creator's
+	// primary org via employees → employee_organizations — never
+	// store NULL, otherwise teammates can't see the stage.
+	userID, _ := middleware.GetUserID(c)
 	var orgIDPtr *uuid.UUID
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		o := orgID
 		orgIDPtr = &o
+	} else if userID != uuid.Nil {
+		var fallbackOrg uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT eo.organization_id
+			FROM employee_organizations eo
+			JOIN employees e ON e.id = eo.employee_id
+			WHERE e.user_id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
+			ORDER BY eo.is_primary DESC, eo.created_at ASC
+			LIMIT 1
+		`, userID, tenantID).Scan(&fallbackOrg); err == nil && fallbackOrg != uuid.Nil {
+			orgIDPtr = &fallbackOrg
+		}
 	}
 
 	query := `
@@ -1147,12 +1157,10 @@ func (h *Handler) UpdatePipelineStage(c *gin.Context) {
 	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
 	args = append(args, time.Now())
 
-	// Add WHERE conditions — scoped by tenant AND, when an active
-	// organization is set, the stage must belong to that org OR be a
-	// legacy tenant-wide row (organization_id IS NULL). The NULL-row
-	// allowance keeps users able to edit pre-scoping stages that
-	// were never stamped with an org id; without it, their legacy
-	// pipeline would render read-only.
+	// Strict org scope on update: the stage must belong to the
+	// caller's active org. Migration 388 backfills any pre-existing
+	// NULL-org rows, so the strict equality can't render legacy
+	// stages read-only.
 	argCount++
 	args = append(args, id)
 	idArg := argCount
@@ -1164,7 +1172,7 @@ func (h *Handler) UpdatePipelineStage(c *gin.Context) {
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
 		args = append(args, orgID)
-		whereClause += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
+		whereClause += fmt.Sprintf(" AND organization_id = $%d", argCount)
 	}
 
 	query := fmt.Sprintf(
