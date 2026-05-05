@@ -313,6 +313,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		products.GET("", h.ListProducts)
 		products.POST("", h.perm.Require("inventory", "product", "create"), h.CreateProduct)
+		products.POST("/bulk", h.perm.Require("inventory", "product", "create"), h.BulkCreateProducts)
 		products.GET("/by-search-key", h.FindProductsBySearchKey)
 		products.GET("/:id", h.GetProduct)
 		products.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateProduct)
