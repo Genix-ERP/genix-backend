@@ -166,6 +166,59 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	includeInactive := c.Query("include_inactive") == "true"
 	_ = c.Query("flat") // Reserved for future hierarchical view
 
+	// Auto-heal: when a specific organization is requested and that org
+	// has zero accounts in the DB, seed the default UzNAS chart of
+	// accounts (and default journals) before serving the request. This
+	// covers two real-world cases observed on production:
+	//   1. Organizations created before CreateOrganization started
+	//      auto-initializing a chart of accounts.
+	//   2. Organizations where CreateOrganization's auto-init silently
+	//      failed (the handler intentionally only logs that error so
+	//      org creation isn't blocked) and the user later opened a
+	//      page that needs accounts (e.g. Products → Categories,
+	//      where the dropdowns appeared empty because no rows matched
+	//      the strict `organization_id = X` filter).
+	// The init helpers use ON CONFLICT DO NOTHING so concurrent first
+	// reads are safe. No-op for orgs that already have any accounts.
+	{
+		var requestedOrg uuid.UUID
+		if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+			requestedOrg = orgID
+		} else if organizationID != "" {
+			if parsed, perr := uuid.Parse(organizationID); perr == nil {
+				requestedOrg = parsed
+			}
+		}
+		if requestedOrg != uuid.Nil {
+			var existingCount int
+			if err := h.db.QueryRow(
+				`SELECT COUNT(*) FROM accounts
+				  WHERE tenant_id = $1 AND organization_id = $2`,
+				tenantID, requestedOrg,
+			).Scan(&existingCount); err == nil && existingCount == 0 {
+				var orgExists bool
+				if err := h.db.QueryRow(
+					`SELECT EXISTS(SELECT 1 FROM organizations
+					                WHERE id = $1 AND tenant_id = $2
+					                  AND deleted_at IS NULL)`,
+					requestedOrg, tenantID,
+				).Scan(&orgExists); err == nil && orgExists {
+					if initErr := h.createDefaultChartOfAccounts(tenantID, requestedOrg); initErr != nil {
+						h.log.Warn("auto-init chart of accounts failed",
+							"error", initErr, "tenant_id", tenantID, "org_id", requestedOrg)
+					} else {
+						if jErr := h.createDefaultJournals(tenantID, requestedOrg); jErr != nil {
+							h.log.Warn("auto-init default journals failed",
+								"error", jErr, "tenant_id", tenantID, "org_id", requestedOrg)
+						}
+						h.log.Info("auto-initialized chart of accounts for organization",
+							"tenant_id", tenantID, "org_id", requestedOrg)
+					}
+				}
+			}
+		}
+	}
+
 	// Build query
 	baseQuery := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
