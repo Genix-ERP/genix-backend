@@ -1438,12 +1438,52 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		tags = []byte(fmt.Sprintf(`["%s"]`, strings.Join(input.Tags, `","`)))
 	}
 
-	// Auto-fill warehouse from BOM if not provided
+	// Auto-fill warehouse: prefer caller-supplied; else BOM (validated against
+	// the MO's organization); else any warehouse belonging to the MO's org.
+	// Critical: never accept a cross-org warehouse, otherwise the produced
+	// inventory ends up in another organization's stock (real bug observed:
+	// EVROPLIT MO ended up writing to a warehouse owned by a different org
+	// because the BOM's cached warehouse_id was from before the org-split).
 	warehouseID := input.WarehouseID
-	if warehouseID == nil && input.BOMID != nil {
+	if warehouseID != nil && orgIDPtr != nil {
+		// Validate caller-supplied warehouse belongs to this org
+		var ok bool
+		if h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM warehouses WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL)`,
+			*warehouseID, *orgIDPtr,
+		).Scan(&ok); !ok {
+			h.log.Warn("CreateProductionOrder: caller-supplied warehouse not in org, ignoring",
+				"warehouse_id", *warehouseID, "org_id", *orgIDPtr)
+			warehouseID = nil
+		}
+	}
+	if warehouseID == nil && input.BOMID != nil && orgIDPtr != nil {
 		var bomWhID uuid.UUID
-		if h.db.QueryRow(`SELECT warehouse_id FROM product_boms WHERE id = $1 AND warehouse_id IS NOT NULL`, input.BOMID).Scan(&bomWhID) == nil {
+		if err := h.db.QueryRow(
+			`SELECT b.warehouse_id
+			 FROM product_boms b
+			 JOIN warehouses w ON w.id = b.warehouse_id
+			 WHERE b.id = $1 AND w.organization_id = $2 AND w.deleted_at IS NULL`,
+			input.BOMID, *orgIDPtr,
+		).Scan(&bomWhID); err == nil {
 			warehouseID = &bomWhID
+		} else {
+			h.log.Warn("CreateProductionOrder: BOM warehouse not in MO org, skipping",
+				"bom_id", input.BOMID, "org_id", *orgIDPtr)
+		}
+	}
+	if warehouseID == nil && orgIDPtr != nil {
+		// Last-resort fallback: pick any active warehouse for the org
+		var fallbackWhID uuid.UUID
+		if err := h.db.QueryRow(
+			`SELECT id FROM warehouses
+			 WHERE organization_id = $1 AND deleted_at IS NULL AND is_active = true
+			 ORDER BY created_at LIMIT 1`,
+			*orgIDPtr,
+		).Scan(&fallbackWhID); err == nil {
+			warehouseID = &fallbackWhID
+			h.log.Info("CreateProductionOrder: using org default warehouse",
+				"warehouse_id", fallbackWhID, "org_id", *orgIDPtr)
 		}
 	}
 
