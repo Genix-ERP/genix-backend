@@ -1145,7 +1145,8 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 			   po.confirmed_at, po.completed_at, po.created_at, po.updated_at,
 			   po.manufacturing_category_id, mc.name as manufacturing_category_name,
 			   po.has_split_output,
-			   po.sales_order_id, so.order_number as sales_order_number
+			   po.sales_order_id, so.order_number as sales_order_number,
+			   po.shortfall_reason
 		FROM production_orders po
 		LEFT JOIN products p ON po.product_id = p.id
 		LEFT JOIN product_boms b ON po.bom_id = b.id
@@ -1177,6 +1178,7 @@ func (h *Handler) GetProductionOrder(c *gin.Context) {
 		&po.ManufacturingCategoryID, &categoryName,
 		&po.HasSplitOutput,
 		&po.SalesOrderID, &salesOrderNumber,
+		&po.ShortfallReason,
 	)
 
 	if err == sql.ErrNoRows {
@@ -2595,6 +2597,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		GoodQuantity     *float64 `json:"good_quantity"`
 		RejectQuantity   *float64 `json:"reject_quantity"`
 		PackageCount     *int     `json:"package_count"`
+		ShortfallReason  *string  `json:"shortfall_reason"`
 	}
 	c.ShouldBindJSON(&input)
 
@@ -2639,6 +2642,11 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		argCount++
 		query += fmt.Sprintf(", package_count = $%d", argCount)
 		args = append(args, *input.PackageCount)
+	}
+	if input.ShortfallReason != nil {
+		argCount++
+		query += fmt.Sprintf(", shortfall_reason = $%d", argCount)
+		args = append(args, *input.ShortfallReason)
 	}
 
 	argCount++

@@ -181,6 +181,7 @@ type ProductionOrder struct {
 	GoodQuantity         float64    `json:"good_quantity" db:"good_quantity"`
 	RejectQuantity       float64    `json:"reject_quantity" db:"reject_quantity"`
 	HasSplitOutput       bool       `json:"has_split_output" db:"has_split_output"`
+	ShortfallReason      *string    `json:"shortfall_reason,omitempty" db:"shortfall_reason"`
 	// Schedule fields
 	ScheduledStart       *time.Time `json:"scheduled_start,omitempty" db:"scheduled_start"`
 	ScheduledEnd         *time.Time `json:"scheduled_end,omitempty" db:"scheduled_end"`
