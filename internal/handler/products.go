@@ -1678,6 +1678,12 @@ func (h *Handler) DeleteProductCategory(c *gin.Context) {
 // at the route registration site.
 
 type BulkProductInput struct {
+	// When ID is non-empty the row is processed as an UPDATE rather
+	// than a CREATE. Set by the export → edit → re-import round-trip
+	// flow; allows users to edit a single column on N rows in Excel
+	// and re-upload without creating duplicates.
+	ID string `json:"id,omitempty"`
+
 	Name        string   `json:"name"`
 	Code        string   `json:"code,omitempty"`
 	Barcode     string   `json:"barcode,omitempty"`
@@ -1690,6 +1696,39 @@ type BulkProductInput struct {
 	CostPrice   float64  `json:"cost_price"`
 	ListPrice   float64  `json:"list_price"`
 	IsActive    *bool    `json:"is_active,omitempty"`
+
+	// Pointer-typed extension fields. Used by the UPDATE branch to
+	// distinguish "field absent in JSON" (nil → don't touch the
+	// column) from "field set to empty string / 0" (which would
+	// blank existing values). For CREATE rows these may all be nil
+	// and the backend uses the column defaults from the schema.
+	WholesalePrice       *float64 `json:"wholesale_price,omitempty"`
+	MinPrice             *float64 `json:"min_price,omitempty"`
+	DeliveryPrice        *float64 `json:"delivery_price,omitempty"`
+	Brand                *string  `json:"brand,omitempty"`
+	Manufacturer         *string  `json:"manufacturer,omitempty"`
+	ModelNumber          *string  `json:"model_number,omitempty"`
+	UPC                  *string  `json:"upc,omitempty"`
+	EAN                  *string  `json:"ean,omitempty"`
+	ISBN                 *string  `json:"isbn,omitempty"`
+	MPN                  *string  `json:"mpn,omitempty"`
+	HSCode               *string  `json:"hs_code,omitempty"`
+	CountryOfOrigin      *string  `json:"country_of_origin,omitempty"`
+	SearchKey            *string  `json:"search_key,omitempty"`
+	InventoryType        *string  `json:"inventory_type,omitempty"`
+	StorageConditions    *string  `json:"storage_conditions,omitempty"`
+	SupplierSKU          *string  `json:"supplier_sku,omitempty"`
+	Weight               *float64 `json:"weight,omitempty"`
+	Length               *float64 `json:"length,omitempty"`
+	Width                *float64 `json:"width,omitempty"`
+	Height               *float64 `json:"height,omitempty"`
+	MinStockLevel        *float64 `json:"min_stock_level,omitempty"`
+	ReorderPoint         *float64 `json:"reorder_point,omitempty"`
+	ReorderQuantity      *float64 `json:"reorder_quantity,omitempty"`
+	WarrantyMonths       *int     `json:"warranty_months,omitempty"`
+	LeadTimeDays         *int     `json:"lead_time_days,omitempty"`
+	CustomerLeadTimeDays *int     `json:"customer_lead_time_days,omitempty"`
+	ShelfLifeDays        *int     `json:"shelf_life_days,omitempty"`
 }
 
 type BulkCreateProductsInput struct {
@@ -1921,6 +1960,276 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 
 	for i, p := range input.Products {
 		rowNum := i + 1
+
+		// ── UPDATE branch ──────────────────────────────────────────────
+		// When a row carries an ID we treat it as an edit of an
+		// existing product (the round-trip Export → Edit in Excel →
+		// Re-import flow). We only write the columns the caller
+		// actually populated — empty strings and nil pointers leave
+		// the existing column value untouched. This makes "edit one
+		// column on N rows" safe even when the export omits or blanks
+		// other columns.
+		if strings.TrimSpace(p.ID) != "" {
+			productID, parseErr := uuid.Parse(strings.TrimSpace(p.ID))
+			if parseErr != nil {
+				outcomes = append(outcomes, BulkProductOutcome{
+					Row: rowNum, Name: p.Name,
+					Status: "failed", Reason: "invalid id (not a UUID)",
+				})
+				continue
+			}
+			// Verify the product exists for this tenant. Tenant scope
+			// is critical — without it a user could overwrite another
+			// tenant's product by guessing a UUID.
+			var existingName string
+			err := h.db.QueryRow(
+				`SELECT name FROM products WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+				productID, tenantID,
+			).Scan(&existingName)
+			if err == sql.ErrNoRows {
+				outcomes = append(outcomes, BulkProductOutcome{
+					Row: rowNum, Name: p.Name,
+					Status: "skipped", Reason: "product not found for tenant",
+					ID: productID.String(),
+				})
+				continue
+			}
+			if err != nil {
+				outcomes = append(outcomes, BulkProductOutcome{
+					Row: rowNum, Name: p.Name,
+					Status: "failed", Reason: "lookup failed: " + err.Error(),
+					ID: productID.String(),
+				})
+				continue
+			}
+
+			// Build a dynamic UPDATE from whichever fields are present.
+			// Strings: non-empty values are written. Pointer fields:
+			// non-nil pointers are written (even pointing to "" or 0,
+			// because the frontend explicitly sent that — frontend
+			// strips truly absent values before sending).
+			sets := []string{}
+			args := []interface{}{}
+			argN := 1
+			addStr := func(col, val string) {
+				if val == "" { return }
+				sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
+				args = append(args, val); argN++
+			}
+			addStrPtr := func(col string, v *string) {
+				if v == nil { return }
+				sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
+				args = append(args, *v); argN++
+			}
+			addF64Ptr := func(col string, v *float64) {
+				if v == nil { return }
+				sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
+				args = append(args, *v); argN++
+			}
+			addIntPtr := func(col string, v *int) {
+				if v == nil { return }
+				sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
+				args = append(args, *v); argN++
+			}
+
+			// Plain strings — only when non-empty so blank Excel cells
+			// don't wipe existing values.
+			addStr("name", strings.TrimSpace(p.Name))
+			addStr("barcode", strings.TrimSpace(p.Barcode))
+			addStr("sku", strings.TrimSpace(p.SKU))
+			addStr("description", strings.TrimSpace(p.Description))
+			addStr("type", strings.TrimSpace(p.Type))
+
+			// Category by ID OR by name. If ID is given, use it; else
+			// look up by name and use the matching id.
+			if catID := strings.TrimSpace(p.CategoryID); catID != "" {
+				if cid, err := uuid.Parse(catID); err == nil {
+					sets = append(sets, fmt.Sprintf("category_id = $%d", argN))
+					args = append(args, cid); argN++
+				}
+			} else if catName := strings.TrimSpace(p.Category); catName != "" {
+				var cid uuid.UUID
+				if err := h.db.QueryRow(
+					`SELECT id FROM product_categories
+					 WHERE tenant_id = $1 AND LOWER(name) = LOWER($2)
+					 LIMIT 1`,
+					tenantID, catName,
+				).Scan(&cid); err == nil {
+					sets = append(sets, fmt.Sprintf("category_id = $%d", argN))
+					args = append(args, cid); argN++
+				}
+			}
+
+			// Tags — only update if a non-nil slice was sent. Note:
+			// the frontend sends `undefined` (omits) on update rows
+			// when no tags column was present; an explicit empty
+			// array would clear them. Tags are stored as JSON in
+			// the products table, mirroring CreateProduct (line 525).
+			if p.Tags != nil {
+				if tagsJSON, jerr := json.Marshal(p.Tags); jerr == nil {
+					sets = append(sets, fmt.Sprintf("tags = $%d", argN))
+					args = append(args, tagsJSON); argN++
+				}
+			}
+
+			// is_active is a pointer so we can distinguish absent vs false.
+			if p.IsActive != nil {
+				sets = append(sets, fmt.Sprintf("is_active = $%d", argN))
+				args = append(args, *p.IsActive); argN++
+			}
+
+			// Cost / list price — non-pointer floats. Only write if
+			// the value is greater than zero (treating "0" as "user
+			// didn't fill this in"). Users who legitimately want to
+			// set a price to 0 can use the single-product edit form.
+			if p.CostPrice > 0 {
+				sets = append(sets, fmt.Sprintf("cost_price = $%d", argN))
+				args = append(args, p.CostPrice); argN++
+			}
+			if p.ListPrice > 0 {
+				sets = append(sets, fmt.Sprintf("list_price = $%d", argN))
+				args = append(args, p.ListPrice); argN++
+			}
+
+			// Pointer-typed extension fields.
+			addF64Ptr("wholesale_price", p.WholesalePrice)
+			addF64Ptr("min_price", p.MinPrice)
+			addF64Ptr("delivery_price", p.DeliveryPrice)
+			addStrPtr("brand", p.Brand)
+			addStrPtr("manufacturer", p.Manufacturer)
+			addStrPtr("model_number", p.ModelNumber)
+			addStrPtr("upc", p.UPC)
+			addStrPtr("ean", p.EAN)
+			addStrPtr("isbn", p.ISBN)
+			addStrPtr("mpn", p.MPN)
+			addStrPtr("hs_code", p.HSCode)
+			addStrPtr("country_of_origin", p.CountryOfOrigin)
+			addStrPtr("search_key", p.SearchKey)
+			addStrPtr("inventory_type", p.InventoryType)
+			addStrPtr("storage_conditions", p.StorageConditions)
+			addStrPtr("supplier_sku", p.SupplierSKU)
+			addF64Ptr("weight", p.Weight)
+			addF64Ptr("length", p.Length)
+			addF64Ptr("width", p.Width)
+			addF64Ptr("height", p.Height)
+			addF64Ptr("min_stock_level", p.MinStockLevel)
+			addF64Ptr("reorder_point", p.ReorderPoint)
+			addF64Ptr("reorder_quantity", p.ReorderQuantity)
+			addIntPtr("warranty_months", p.WarrantyMonths)
+			addIntPtr("lead_time_days", p.LeadTimeDays)
+			addIntPtr("customer_lead_time_days", p.CustomerLeadTimeDays)
+			addIntPtr("shelf_life_days", p.ShelfLifeDays)
+
+			if len(sets) == 0 {
+				outcomes = append(outcomes, BulkProductOutcome{
+					Row: rowNum, Name: existingName,
+					Status: "skipped", Reason: "no fields to update",
+					ID: productID.String(),
+				})
+				continue
+			}
+
+			// Always bump updated_at, then add the WHERE args.
+			sets = append(sets, fmt.Sprintf("updated_at = $%d", argN))
+			args = append(args, time.Now()); argN++
+			args = append(args, productID, tenantID)
+
+			query := fmt.Sprintf(
+				"UPDATE products SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
+				strings.Join(sets, ", "), argN, argN+1,
+			)
+			res, err := h.db.Exec(query, args...)
+			if err != nil {
+				outcomes = append(outcomes, BulkProductOutcome{
+					Row: rowNum, Name: existingName,
+					Status: "failed", Reason: "update failed: " + err.Error(),
+					ID: productID.String(),
+				})
+				continue
+			}
+
+			// Diagnostic: log which columns were SET on this row plus
+			// rows-affected. Without this, "20 updated" toasts that
+			// don't reflect on the UI are impossible to debug because
+			// we can't tell whether the SET clause actually included
+			// the user's edit or whether the WHERE matched.
+			rowsAffected, _ := res.RowsAffected()
+			h.log.Info("BulkCreateProducts: row updated",
+				"row", rowNum,
+				"product_id", productID.String(),
+				"sets", strings.Join(sets, ", "),
+				"cost_price", p.CostPrice,
+				"list_price", p.ListPrice,
+				"rows_affected", rowsAffected,
+			)
+			if rowsAffected == 0 {
+				// SET clauses were valid but WHERE didn't match — most
+				// likely a tenant_id mismatch (export from one tenant,
+				// re-imported into another). Surface as failed so the
+				// user sees something actually went wrong instead of
+				// the cosmetic "updated" status.
+				outcomes = append(outcomes, BulkProductOutcome{
+					Row: rowNum, Name: existingName,
+					Status: "failed", Reason: "update affected 0 rows (tenant or id mismatch)",
+					ID: productID.String(),
+				})
+				continue
+			}
+
+			// Per-org price overrides: the products list view reads
+			// COALESCE(pos.cost_price, p.cost_price) and same for
+			// list_price (see GetProducts query line 74-75). If we
+			// only touch the `products` table and a non-NULL row
+			// already exists in product_organization_settings for
+			// this product+org, the list view keeps showing the OLD
+			// price because COALESCE picks pos's non-null value over
+			// the products table's freshly-updated value.
+			//
+			// Fix: also upsert pos for each target org, mirroring the
+			// single-product UpdateProduct flow (line 1052+). We only
+			// write fields the user actually populated in this row —
+			// COALESCE($n, existing) preserves untouched columns.
+			if orgID != uuid.Nil && (p.CostPrice > 0 || p.ListPrice > 0 || p.MinPrice != nil ||
+				p.MinStockLevel != nil || p.ReorderPoint != nil || p.ReorderQuantity != nil) {
+				var costArg, listArg, minPriceArg, minStockArg, reorderPtArg, reorderQtyArg interface{}
+				if p.CostPrice > 0 { costArg = p.CostPrice }
+				if p.ListPrice > 0 { listArg = p.ListPrice }
+				if p.MinPrice != nil { minPriceArg = *p.MinPrice }
+				if p.MinStockLevel != nil { minStockArg = *p.MinStockLevel }
+				if p.ReorderPoint != nil { reorderPtArg = *p.ReorderPoint }
+				if p.ReorderQuantity != nil { reorderQtyArg = *p.ReorderQuantity }
+
+				if _, posErr := h.db.Exec(`
+					INSERT INTO product_organization_settings (tenant_id, product_id, organization_id,
+						cost_price, list_price, min_price, min_stock_level, reorder_point, reorder_quantity)
+					VALUES ($1, $2, $3,
+						COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
+						COALESCE($7, 0), COALESCE($8, 0), COALESCE($9, 0))
+					ON CONFLICT (product_id, organization_id) DO UPDATE SET
+						cost_price = COALESCE($4, product_organization_settings.cost_price),
+						list_price = COALESCE($5, product_organization_settings.list_price),
+						min_price = COALESCE($6, product_organization_settings.min_price),
+						min_stock_level = COALESCE($7, product_organization_settings.min_stock_level),
+						reorder_point = COALESCE($8, product_organization_settings.reorder_point),
+						reorder_quantity = COALESCE($9, product_organization_settings.reorder_quantity),
+						updated_at = NOW()
+				`, tenantID, productID, orgID,
+					costArg, listArg, minPriceArg,
+					minStockArg, reorderPtArg, reorderQtyArg); posErr != nil {
+					// Non-fatal: products table got the new value, only
+					// the per-org override failed. Log so the operator
+					// can investigate but don't fail the row.
+					h.log.Warn("BulkCreateProducts: failed to upsert per-org overrides",
+						"error", posErr, "product_id", productID.String(), "org_id", orgID.String())
+				}
+			}
+
+			outcomes = append(outcomes, BulkProductOutcome{
+				Row: rowNum, Name: existingName,
+				Status: "updated", ID: productID.String(),
+			})
+			continue
+		}
 
 		name := strings.TrimSpace(p.Name)
 		if name == "" {
