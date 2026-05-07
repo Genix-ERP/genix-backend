@@ -295,6 +295,7 @@ type ProductionOrderResponse struct {
 	GoodQuantity         float64     `json:"good_quantity"`
 	RejectQuantity       float64     `json:"reject_quantity"`
 	HasSplitOutput       bool        `json:"has_split_output"`
+	ShortfallReason      *string     `json:"shortfall_reason,omitempty"`
 	// Schedule fields
 	ScheduledStart       *string     `json:"scheduled_start,omitempty"`
 	ScheduledEnd         *string     `json:"scheduled_end,omitempty"`
