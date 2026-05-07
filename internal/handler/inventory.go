@@ -1836,6 +1836,19 @@ func (h *Handler) GetBOM(c *gin.Context) {
 		b.ExpiryDate = &s
 	}
 
+	// Load warehouse_id and warehouse_name separately (column may not exist
+	// yet if migration 314 hasn't run on this environment).
+	var whID sql.NullString
+	var whName sql.NullString
+	h.db.QueryRow(`SELECT b2.warehouse_id, w.name FROM product_boms b2 LEFT JOIN warehouses w ON w.id = b2.warehouse_id WHERE b2.id = $1`, bomID).Scan(&whID, &whName)
+	if whID.Valid {
+		wid, _ := uuid.Parse(whID.String)
+		b.WarehouseID = &wid
+	}
+	if whName.Valid {
+		b.WarehouseName = &whName.String
+	}
+
 	// Get BOM lines
 	rows, err := h.db.Query(`
 		SELECT l.id, l.line_number, l.component_id, l.quantity, l.unit_of_measure,
