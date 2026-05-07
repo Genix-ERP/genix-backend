@@ -2152,11 +2152,13 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	).Scan(&purchaseJournalID, &numberPrefix)
 
 	if journalErr == nil {
-		// Find AP account
+		// Find AP account. findAccount already filters is_leaf=true,
+		// but we run resolveLeafAccount as a final safety net so this
+		// handler is robust even if a future change introduces a path
+		// that bypasses the leaf filter. Same pattern below for the
+		// Stock Input and Tax accounts.
 		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
-		if apAccountID == uuid.Nil {
-			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
-		}
+		apAccountID = resolveLeafAccount(tx, apAccountID)
 
 		if apAccountID != uuid.Nil {
 			// TT §4.5 requires every 6010 (Mol yetkazib beruvchilar va
@@ -2231,6 +2233,7 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			}
 
 			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
+			taxAccountID = resolveLeafAccount(tx, taxAccountID)
 
 			// Per-category accounting: resolve Stock Interim Receipt per product
 			type billLineAcct struct {
@@ -2249,26 +2252,48 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			}
 			for i := range billLines {
 				ca := getCategoryAccounts(tx, tenantID, organizationID, billLines[i].ProductID)
-				billLines[i].InputAcct = ca.StockInputAccountID
+				// Belt-and-suspenders: getCategoryAccounts already pipes
+				// through resolveLeafAccount + leaf-filtered findAccount,
+				// but we resolve once more here to defend against any
+				// future code path that bypasses the helpers. Posting to
+				// a group account is rejected by TT §4.2 trigger.
+				billLines[i].InputAcct = resolveLeafAccount(tx, ca.StockInputAccountID)
 			}
 
-			// Group by stock input account
+			// Group by stock input account. Skip uuid.Nil entries —
+			// happens when a product's category has no stock_input
+			// account configured AND the chart has no leaf descendant
+			// of 1010/6015. We'd rather fall through to the global
+			// fallback below than crash the whole bill.
 			inputGrouped := make(map[uuid.UUID]float64)
 			for _, bl := range billLines {
+				if bl.InputAcct == uuid.Nil {
+					continue
+				}
 				inputGrouped[bl.InputAcct] += bl.LineTotal
 			}
 
-			// Fallback if no product lines matched
+			// Fallback if no product lines resolved to a leaf account.
+			// findAccount + resolveLeafAccount both filter is_leaf=true
+			// already, but we apply resolveLeafAccount once more in
+			// case a deployment is mid-rollout where one helper has
+			// the new code and the other doesn't.
 			if len(inputGrouped) == 0 && subtotal > 0 {
 				fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "6015")
 				if fallbackInput == uuid.Nil {
-					fallbackInput = findAccount(tx, tenantID, organizationID, "stock interim receipt", "6015")
-				}
-				if fallbackInput == uuid.Nil {
 					fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "9110")
 				}
+				if fallbackInput == uuid.Nil {
+					fallbackInput = findAccount(tx, tenantID, organizationID, "inventory", "1010")
+				}
+				fallbackInput = resolveLeafAccount(tx, fallbackInput)
 				if fallbackInput != uuid.Nil {
 					inputGrouped[fallbackInput] = subtotal
+				} else {
+					h.log.Error("CreateBillFromPO: no leaf account available for stock input — chart of accounts misconfigured",
+						"po_id", poID, "tenant_id", tenantID, "org_id", organizationID)
+					response.InternalError(c, "Chart of accounts has no leaf account for stock input. Please add a leaf child under 1010 (Xom ashyo) or 6015 (Stock Interim Receipt) and try again.")
+					return
 				}
 			}
 
