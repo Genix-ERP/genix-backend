@@ -2332,17 +2332,88 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 			jeLineNumber := 1
 
-			// Debit: Stock Interim Receipt (per category)
+			// Resolve the warehouse_id used for inventory-account debits.
+			// TT §4.5 mandates the "ombor" analytic on every leaf
+			// inventory account (1010 family). The trigger from
+			// migration 393 will also enrich this server-side, but
+			// packing it here gives us a fast-path success and a
+			// clearer error if no warehouse can be determined.
+			//
+			// Lookup chain mirrors the trigger:
+			//   1. goods_receipt.warehouse_id (3-way matched bills),
+			//   2. PO → most recent receipt stock_operation → dest_location → warehouse,
+			//   3. NULL — trigger will reject if the account requires it.
+			var billWarehouseID *uuid.UUID
+			{
+				var w uuid.UUID
+				// Step 1: 3-way matched bill → linked goods_receipt.
+				_ = tx.QueryRow(`
+					SELECT gr.warehouse_id
+					FROM purchase_invoices pi
+					JOIN goods_receipts gr ON gr.id = pi.goods_receipt_id
+					WHERE pi.id = $1
+				`, billID).Scan(&w)
+				// Step 2: PO → most recent receipt stock_operation.
+				if w == uuid.Nil {
+					_ = tx.QueryRow(`
+						SELECT wl.warehouse_id
+						FROM stock_operations so
+						LEFT JOIN warehouse_locations wl ON wl.id = so.dest_location_id
+						WHERE so.source_id = $1
+						  AND so.source_type = 'purchase_order'
+						  AND so.direction = 'receipt'
+						  AND so.tenant_id = $2
+						  AND so.deleted_at IS NULL
+						  AND so.state != 'cancelled'
+						  AND wl.warehouse_id IS NOT NULL
+						ORDER BY so.created_at DESC
+						LIMIT 1
+					`, poID, tenantID).Scan(&w)
+				}
+				// Step 3: tenant/org default warehouse — for bills
+				// created BEFORE any receipt (some flows pre-bill the
+				// vendor and reconcile receipts later). Picks the
+				// alphabetically-first active warehouse so the choice
+				// is deterministic across retries.
+				if w == uuid.Nil {
+					if organizationID != nil {
+						_ = tx.QueryRow(`
+							SELECT id FROM warehouses
+							WHERE tenant_id = $1 AND organization_id = $2
+							  AND COALESCE(is_active, true) = true
+							  AND deleted_at IS NULL
+							ORDER BY name ASC LIMIT 1
+						`, tenantID, *organizationID).Scan(&w)
+					}
+					if w == uuid.Nil {
+						_ = tx.QueryRow(`
+							SELECT id FROM warehouses
+							WHERE tenant_id = $1
+							  AND COALESCE(is_active, true) = true
+							  AND deleted_at IS NULL
+							ORDER BY name ASC LIMIT 1
+						`, tenantID).Scan(&w)
+					}
+				}
+				if w != uuid.Nil {
+					billWarehouseID = &w
+				}
+			}
+
+			// Debit: Stock Interim Receipt (per category). Pack
+			// warehouse_id so TT §4.5 ombor analytics is satisfied
+			// even on tenants where the trigger from migration 393
+			// hasn't been applied yet.
 			for inputAcct, amount := range inputGrouped {
 				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, contact_id, description,
+						id, journal_entry_id, line_number, account_id, contact_id, warehouse_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, "Stock Interim Receipt",
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, billWarehouseID, "Stock Interim Receipt",
 					amount, 0.0, 1.0, now,
 				); err != nil {
-					h.log.Error("CreateBillFromPO: failed to insert JE debit line", "error", err, "account", inputAcct)
+					h.log.Error("CreateBillFromPO: failed to insert JE debit line", "error", err, "account", inputAcct, "warehouse", billWarehouseID)
 					response.InternalError(c, "Failed to create journal entry line: "+err.Error())
 					return
 				}
