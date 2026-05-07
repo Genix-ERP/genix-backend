@@ -866,6 +866,32 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("shipping_amount = $%d", argCount))
 		args = append(args, *input.ShippingAmount)
 	}
+	// Warehouse — accepts empty string as "clear back to NULL" so the
+	// auto-pick logic on receipt can run again. Validates UUID parse
+	// before writing so a malformed value doesn't blow up the whole
+	// update.
+	if input.WarehouseID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+		if *input.WarehouseID == "" {
+			args = append(args, nil)
+		} else if wid, err := uuid.Parse(*input.WarehouseID); err == nil {
+			args = append(args, wid)
+		} else {
+			args = append(args, nil)
+		}
+	}
+	if input.ContactPersonID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contact_person_id = $%d", argCount))
+		if *input.ContactPersonID == "" {
+			args = append(args, nil)
+		} else if cpid, err := uuid.Parse(*input.ContactPersonID); err == nil {
+			args = append(args, cpid)
+		} else {
+			args = append(args, nil)
+		}
+	}
 	if input.Status != nil {
 		// Block statuses that must go through dedicated endpoints
 		// approved → POST /:id/approve (creates stock operations)
@@ -888,32 +914,182 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		return
 	}
 
-	// Add updated_at
-	argCount++
-	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
-	args = append(args, time.Now())
-
-	// Add WHERE conditions
-	argCount++
-	args = append(args, id)
-	argCount++
-	args = append(args, tenantID)
-
-	query := fmt.Sprintf(
-		"UPDATE purchase_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
-		strings.Join(updates, ", "), argCount-1, argCount,
-	)
-
-	result, err := h.db.Exec(query, args...)
-	if err != nil {
-		h.log.Error("Failed to update purchase order", "error", err)
+	// Wrap the whole update in a transaction so header changes and
+	// line replacement either all succeed or all roll back. The old
+	// implementation used h.db.Exec directly and ignored input.Lines
+	// entirely — line edits made in the UI silently disappeared.
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to start transaction for PO update", "error", txErr)
 		response.InternalError(c, "Failed to update purchase order")
 		return
 	}
+	defer tx.Rollback()
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		response.NotFound(c, "Purchase order")
+	now := time.Now()
+
+	// Header update — only run if any header fields changed.
+	if len(updates) > 0 {
+		// Add updated_at
+		argCount++
+		updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+		args = append(args, now)
+
+		// Add WHERE conditions
+		argCount++
+		args = append(args, id)
+		argCount++
+		args = append(args, tenantID)
+
+		query := fmt.Sprintf(
+			"UPDATE purchase_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
+			strings.Join(updates, ", "), argCount-1, argCount,
+		)
+
+		result, err := tx.Exec(query, args...)
+		if err != nil {
+			h.log.Error("Failed to update purchase order", "error", err)
+			response.InternalError(c, "Failed to update purchase order")
+			return
+		}
+
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			response.NotFound(c, "Purchase order")
+			return
+		}
+	}
+
+	// Line replacement. Strategy: delete all existing lines for the
+	// PO, insert the new ones, then recompute and store the header
+	// totals (subtotal / tax_amount / total_amount). This is destructive
+	// to line IDs but the create-modal-style edit form sends a complete
+	// replacement set anyway.
+	//
+	// Refuse the wipe in two cases (FK referential integrity):
+	//   1. quantity_received > 0 — downstream stock postings exist.
+	//   2. purchase_invoice_lines reference any of these lines —
+	//      a bill has been created from the PO, so dropping the PO
+	//      lines would orphan the bill lines via FK
+	//      `purchase_invoice_lines_purchase_order_line_id_fkey`.
+	// In either case we surface a clear error rather than letting
+	// the database throw a cryptic FK violation. Header edits already
+	// committed earlier in this same handler still apply.
+	if len(input.Lines) > 0 {
+		var receivedCount int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM purchase_order_lines
+			 WHERE purchase_order_id = $1 AND quantity_received > 0`, id,
+		).Scan(&receivedCount)
+		if receivedCount > 0 {
+			// Structured error so the frontend can render a localized
+			// message via apiErrors.js (ERROR_TEMPLATES).
+			response.ErrorWithDetails(c, 400, "PO_LINES_LOCKED_RECEIVED",
+				"Cannot edit lines on a purchase order that has been received against. Cancel the receipt first or create an amended PO.",
+				nil)
+			return
+		}
+
+		var billedCount int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM purchase_invoice_lines pil
+			 JOIN purchase_order_lines pol ON pol.id = pil.purchase_order_line_id
+			 WHERE pol.purchase_order_id = $1`, id,
+		).Scan(&billedCount)
+		if billedCount > 0 {
+			response.ErrorWithDetails(c, 400, "PO_LINES_LOCKED_BILLED",
+				"Cannot edit lines on a purchase order that has been billed. Cancel the related bill(s) first, or create a new PO.",
+				nil)
+			return
+		}
+
+		if _, err := tx.Exec(`DELETE FROM purchase_order_lines WHERE purchase_order_id = $1`, id); err != nil {
+			h.log.Error("Failed to delete existing PO lines", "error", err, "po_id", id)
+			response.InternalError(c, "Failed to update purchase order lines: "+err.Error())
+			return
+		}
+
+		var newSubtotal, newTax, newTotal float64
+		for i, line := range input.Lines {
+			lineID := uuid.New()
+
+			var productID, unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
+			if line.ProductID != "" {
+				if pid, err := uuid.Parse(line.ProductID); err == nil {
+					productID = &pid
+				}
+			}
+			if line.UnitID != "" {
+				if uid, err := uuid.Parse(line.UnitID); err == nil {
+					unitID = &uid
+				}
+			}
+			if line.TaxID != "" {
+				if tid, err := uuid.Parse(line.TaxID); err == nil {
+					taxID = &tid
+				}
+			}
+			if line.WarehouseID != "" {
+				if wid, err := uuid.Parse(line.WarehouseID); err == nil {
+					lineWarehouseID = &wid
+				}
+			}
+			if line.PackagingID != "" {
+				if pkgid, err := uuid.Parse(line.PackagingID); err == nil {
+					packagingID = &pkgid
+				}
+			}
+
+			lineSubtotal := line.Quantity * line.UnitPrice
+			lineTax := (lineSubtotal - line.DiscountAmount) * line.TaxPercent / 100
+			lineTotal := lineSubtotal - line.DiscountAmount + lineTax
+
+			var lineNotes *string
+			if line.Notes != "" {
+				lineNotes = &line.Notes
+			}
+
+			if _, err := tx.Exec(`
+				INSERT INTO purchase_order_lines (
+					id, purchase_order_id, line_number, product_id, description,
+					quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount,
+					line_total, quantity_received, quantity_invoiced, warehouse_id, notes,
+					packaging_id, packaging_qty, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			`,
+				lineID, id, i+1, productID, line.Description,
+				line.Quantity, unitID, line.UnitPrice, line.DiscountAmount, taxID, lineTax,
+				lineTotal, 0, 0, lineWarehouseID, lineNotes,
+				packagingID, line.PackagingQty, now, now,
+			); err != nil {
+				h.log.Error("Failed to insert replacement PO line", "error", err, "line_index", i)
+				response.InternalError(c, "Failed to update purchase order lines")
+				return
+			}
+
+			newSubtotal += lineSubtotal - line.DiscountAmount
+			newTax += lineTax
+			newTotal += lineTotal
+		}
+
+		// Refresh header totals so the PO list view, bill creation,
+		// and reporting all see the correct numbers. amount_due isn't
+		// touched directly — it's a generated column on
+		// purchase_invoices, not on purchase_orders.
+		if _, err := tx.Exec(`
+			UPDATE purchase_orders
+			SET subtotal = $1, tax_amount = $2, total_amount = $3, updated_at = $4
+			WHERE id = $5
+		`, newSubtotal, newTax, newTotal, now, id); err != nil {
+			h.log.Error("Failed to refresh PO totals after line update", "error", err, "po_id", id)
+			response.InternalError(c, "Failed to update purchase order totals")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit PO update transaction", "error", err)
+		response.InternalError(c, "Failed to update purchase order")
 		return
 	}
 
