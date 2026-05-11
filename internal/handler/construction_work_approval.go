@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"strconv"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -79,35 +80,57 @@ func (h *Handler) resolveProjectRole(tenantID, userID uuid.UUID, projectID int64
 		}
 	}
 
-	// Step 2: tenant-wide settings fallback. The three role IDs are
-	// stored under tenant_settings.settings JSONB at:
-	//   .construction.roles.foreman_user_id
-	//   .construction.roles.supervisor_user_id
-	//   .construction.roles.engineer_user_id
-	//
-	// We query all three in one round-trip and match against userID.
+	// Step 2: tenant-wide settings fallback. Each role accepts either a
+	// single legacy `*_user_id` string OR a new `*_user_ids` JSON array
+	// so multiple employees can share a role (e.g. several prorabs).
+	// Both formats are queried in one round-trip; legacy values are
+	// kept readable so existing tenants don't need a backfill.
 	var foremanID, supervisorID, engineerID sql.NullString
+	var foremanIDs, supervisorIDs, engineerIDs []byte
 	_ = h.db.QueryRow(`
 		SELECT
-		    settings->'construction'->'roles'->>'foreman_user_id'    AS foreman_id,
-		    settings->'construction'->'roles'->>'supervisor_user_id' AS supervisor_id,
-		    settings->'construction'->'roles'->>'engineer_user_id'   AS engineer_id
+		    settings->'construction'->'roles'->>'foreman_user_id'                            AS foreman_id,
+		    settings->'construction'->'roles'->>'supervisor_user_id'                         AS supervisor_id,
+		    settings->'construction'->'roles'->>'engineer_user_id'                           AS engineer_id,
+		    COALESCE(settings->'construction'->'roles'->'foreman_user_ids',    '[]'::jsonb) AS foreman_ids,
+		    COALESCE(settings->'construction'->'roles'->'supervisor_user_ids', '[]'::jsonb) AS supervisor_ids,
+		    COALESCE(settings->'construction'->'roles'->'engineer_user_ids',   '[]'::jsonb) AS engineer_ids
 		FROM tenant_settings
 		WHERE tenant_id = $1
-	`, tenantID).Scan(&foremanID, &supervisorID, &engineerID)
+	`, tenantID).Scan(&foremanID, &supervisorID, &engineerID,
+		&foremanIDs, &supervisorIDs, &engineerIDs)
 
 	uid := userID.String()
-	if foremanID.Valid && foremanID.String == uid {
+	if (foremanID.Valid && foremanID.String == uid) || jsonArrayContains(foremanIDs, uid) {
 		return "foreman"
 	}
-	if supervisorID.Valid && supervisorID.String == uid {
+	if (supervisorID.Valid && supervisorID.String == uid) || jsonArrayContains(supervisorIDs, uid) {
 		return "supervisor"
 	}
-	if engineerID.Valid && engineerID.String == uid {
+	if (engineerID.Valid && engineerID.String == uid) || jsonArrayContains(engineerIDs, uid) {
 		return "engineer"
 	}
 
 	return ""
+}
+
+// jsonArrayContains reports whether the given JSON-encoded string array
+// contains target. Returns false on parse error or non-array input —
+// missing/malformed settings fall back to the legacy single-user path.
+func jsonArrayContains(raw []byte, target string) bool {
+	if len(raw) == 0 || target == "" {
+		return false
+	}
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return false
+	}
+	for _, s := range arr {
+		if s == target {
+			return true
+		}
+	}
+	return false
 }
 
 // normaliseRole maps the various free-form role strings stored on
