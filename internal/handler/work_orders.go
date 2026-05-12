@@ -1637,33 +1637,26 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		return 0
 	}
 
-	// Create inventory lot for FIFO tracking. Leave purchase_order_id NULL —
-	// it FKs to purchase_orders(id), and the production_order UUID we have
-	// here does not exist there. Pre-fix code stuffed the PO id into that
-	// column, which triggered a silent FK violation and aborted the whole
-	// transaction — so the inventory update and receipt transaction above
-	// were rolled back too. That's why finished goods never showed up in
-	// the warehouse. The production-order link is already captured in
-	// inventory_transactions (reference_type='production_order').
+	if commitErr := tx.Commit(); commitErr != nil {
+		h.log.Error("receiveFinishedGoods: failed to commit transaction", "error", commitErr, "po_id", poID)
+		return 0
+	}
+	h.log.Info("receiveFinishedGoods: finished goods added to inventory", "po_id", poID, "qty", producedQty)
+
+	// Lot insert is separate — a failure here must NOT roll back the inventory
+	// update above. In PostgreSQL, any error inside a transaction poisons it
+	// and makes COMMIT fail, so the lot lives outside the critical transaction.
 	lotID := uuid.New()
 	lotNumber := fmt.Sprintf("MFG-%s", poID.String()[:8])
-	if _, lotErr := tx.Exec(`
+	if _, lotErr := h.db.Exec(`
 		INSERT INTO inventory_lots (
 			id, tenant_id, product_id, warehouse_id, lot_number,
 			received_date, initial_quantity, remaining_quantity,
 			unit_cost, status, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'available', $6, $6)
+		) VALUES ($1, $2, $3, $4, $5, $6::date, $7, $7, $8, 'available', $9, $9)
 	`, lotID, tenantID, productID, warehouseID, lotNumber,
-		now, producedQty, unitCost); lotErr != nil {
-		h.log.Error("receiveFinishedGoods: lot insert failed (non-fatal, continuing)", "error", lotErr, "po_id", poID)
-		// Don't return — lot is only for FIFO tracking; the inventory
-		// update and receipt transaction are what actually matter.
-	}
-
-	if commitErr := tx.Commit(); commitErr != nil {
-		h.log.Error("receiveFinishedGoods: failed to commit transaction", "error", commitErr, "po_id", poID)
-	} else {
-		h.log.Info("receiveFinishedGoods: finished goods added to inventory", "po_id", poID, "qty", producedQty)
+		now, producedQty, unitCost, now); lotErr != nil {
+		h.log.Error("receiveFinishedGoods: lot insert failed (non-fatal)", "error", lotErr, "po_id", poID)
 	}
 	return unitCost
 }

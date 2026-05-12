@@ -2932,29 +2932,26 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		return
 	}
 
-	// Create inventory lot for FIFO tracking. Leave purchase_order_id NULL —
-	// it FKs to purchase_orders(id); stuffing the production_order id in
-	// there would trigger a silent FK violation and abort this whole
-	// transaction, rolling back the finished-goods receipt above.
-	lotID := uuid.New()
-	lotNumber := fmt.Sprintf("MFG-%s", id.String()[:8])
-	if _, lotErr := tx.Exec(`
-		INSERT INTO inventory_lots (
-			id, tenant_id, product_id, warehouse_id, lot_number,
-			received_date, initial_quantity, remaining_quantity,
-			unit_cost, status, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, 'available', $6, $6)
-	`, lotID, tenantID, productID, warehouseID, lotNumber,
-		now, producedQty, unitCost); lotErr != nil {
-		h.log.Error("CompleteProductionOrder: failed to insert inventory_lot", "error", lotErr, "po_id", id)
-		// continue — the inventory row and receipt transaction are what
-		// actually matter; lot is only for FIFO tracking.
-	}
-
 	// Note: BOM component consumption is handled in StartProductionOrder (when production begins)
 
 	if commitErr := tx.Commit(); commitErr != nil {
 		h.log.Error("Failed to commit inventory transaction", "error", commitErr)
+	}
+
+	// Lot insert lives OUTSIDE the transaction — in PostgreSQL any error
+	// inside a tx poisons it and makes COMMIT fail, so a lot-insert failure
+	// was silently rolling back the inventory update above.
+	lotID := uuid.New()
+	lotNumber := fmt.Sprintf("MFG-%s", id.String()[:8])
+	if _, lotErr := h.db.Exec(`
+		INSERT INTO inventory_lots (
+			id, tenant_id, product_id, warehouse_id, lot_number,
+			received_date, initial_quantity, remaining_quantity,
+			unit_cost, status, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6::date, $7, $7, $8, 'available', $9, $9)
+	`, lotID, tenantID, productID, warehouseID, lotNumber,
+		now, producedQty, unitCost, now); lotErr != nil {
+		h.log.Error("CompleteProductionOrder: lot insert failed (non-fatal)", "error", lotErr, "po_id", id)
 	}
 
 	// ============================================
