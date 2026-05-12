@@ -2310,7 +2310,19 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 		organizationID = &startActiveOrgID
 	}
 
-	// Auto-assign first warehouse if none set on the production order
+	// Auto-assign warehouse if none set: check BOM first, then org default, then tenant default
+	if warehouseID == nil && bomID != nil && organizationID != nil {
+		var bomWhID uuid.UUID
+		if h.db.QueryRow(
+			`SELECT b.warehouse_id FROM product_boms b
+			 JOIN warehouses w ON w.id = b.warehouse_id
+			 WHERE b.id = $1 AND w.organization_id = $2 AND w.deleted_at IS NULL`,
+			bomID, *organizationID,
+		).Scan(&bomWhID) == nil {
+			warehouseID = &bomWhID
+			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, bomWhID, id, tenantID)
+		}
+	}
 	if warehouseID == nil {
 		var firstWH uuid.UUID
 		if h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
