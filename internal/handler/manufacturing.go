@@ -2740,14 +2740,14 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	var bomID *uuid.UUID
 	var warehouseID *uuid.UUID
 	var organizationID *uuid.UUID
-	var qtyProduced, qtyPlanned float64
+	var qtyProduced, qtyPlanned, qtyScrapped float64
 
 	err = h.db.QueryRow(`
 		SELECT product_id, bom_id, warehouse_id, organization_id,
 		       CASE WHEN COALESCE(quantity_produced, 0) > 0 THEN quantity_produced ELSE quantity_planned END,
-		       quantity_planned
+		       quantity_planned, COALESCE(quantity_scrapped, 0)
 		FROM production_orders WHERE id = $1 AND tenant_id = $2
-	`, id, tenantID).Scan(&productID, &bomID, &warehouseID, &organizationID, &qtyProduced, &qtyPlanned)
+	`, id, tenantID).Scan(&productID, &bomID, &warehouseID, &organizationID, &qtyProduced, &qtyPlanned, &qtyScrapped)
 	if err != nil {
 		h.log.Error("Failed to fetch production order for inventory", "error", err)
 		h.GetProductionOrder(c)
@@ -2759,6 +2759,29 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		organizationID = &completeActiveOrgID
 	}
 
+	if warehouseID == nil && bomID != nil && organizationID != nil {
+		var bomWhID uuid.UUID
+		if h.db.QueryRow(
+			`SELECT b.warehouse_id
+			 FROM product_boms b
+			 JOIN warehouses w ON w.id = b.warehouse_id
+			 WHERE b.id = $1 AND w.organization_id = $2 AND w.deleted_at IS NULL`,
+			bomID, *organizationID,
+		).Scan(&bomWhID) == nil {
+			warehouseID = &bomWhID
+			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, bomWhID, id, tenantID)
+		}
+	}
+	if warehouseID == nil && organizationID != nil {
+		var orgWH uuid.UUID
+		if h.db.QueryRow(
+			`SELECT id FROM warehouses WHERE organization_id = $1 AND deleted_at IS NULL AND is_active = true ORDER BY created_at LIMIT 1`,
+			*organizationID,
+		).Scan(&orgWH) == nil {
+			warehouseID = &orgWH
+			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, orgWH, id, tenantID)
+		}
+	}
 	if warehouseID == nil {
 		var firstWH uuid.UUID
 		if h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
@@ -3213,7 +3236,177 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 			"unitCost", unitCost, "producedQty", producedQty, "productID", productID)
 	}
 
+	// Return unused components to inventory if produced + scrapped < planned
+	finalScrapped := qtyScrapped
+	if input.QuantityScrapped > 0 {
+		finalScrapped = input.QuantityScrapped
+	}
+	h.returnUnusedComponents(id, tenantID, bomID, warehouseID, organizationID, userID,
+		qtyPlanned, producedQty, finalScrapped, now)
+
 	h.GetProductionOrder(c)
+}
+
+// returnUnusedComponents returns unconsumed BOM components to inventory when
+// production finishes with a shortfall (produced + scrapped < planned).
+// Materials were consumed in full at StartProductionOrder; this reverses the
+// unused portion so inventory stays accurate.
+func (h *Handler) returnUnusedComponents(
+	poID, tenantID uuid.UUID, bomID *uuid.UUID, warehouseID *uuid.UUID,
+	organizationID *uuid.UUID, userID uuid.UUID,
+	qtyPlanned, qtyProduced, qtyScrapped float64, now time.Time,
+) {
+	if bomID == nil || warehouseID == nil {
+		return
+	}
+	shortfall := qtyPlanned - qtyProduced - qtyScrapped
+	if shortfall <= 0 {
+		return
+	}
+	returnRatio := shortfall / qtyPlanned
+
+	type bomComponent struct {
+		ComponentID  uuid.UUID
+		Quantity     float64
+		ScrapPercent float64
+		BOMOutputQty float64
+	}
+
+	rows, err := h.db.Query(`
+		SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), COALESCE(pb.quantity, 1)
+		FROM bom_lines bl
+		JOIN product_boms pb ON pb.id = bl.bom_id
+		WHERE bl.bom_id = $1
+	`, bomID)
+	if err != nil {
+		h.log.Error("returnUnusedComponents: failed to fetch BOM components", "error", err, "po_id", poID)
+		return
+	}
+	var components []bomComponent
+	for rows.Next() {
+		var comp bomComponent
+		if scanErr := rows.Scan(&comp.ComponentID, &comp.Quantity, &comp.ScrapPercent, &comp.BOMOutputQty); scanErr == nil {
+			components = append(components, comp)
+		}
+	}
+	rows.Close()
+
+	if len(components) == 0 {
+		return
+	}
+
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("returnUnusedComponents: failed to start transaction", "error", txErr)
+		return
+	}
+	defer tx.Rollback()
+
+	var totalReturnCost float64
+
+	for _, comp := range components {
+		consumed := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
+		returnQty := consumed * returnRatio
+
+		var compInvID uuid.UUID
+		if tx.QueryRow(`
+			SELECT id FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+			  AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
+			ORDER BY created_at ASC LIMIT 1
+		`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID) != nil {
+			h.log.Warn("returnUnusedComponents: no inventory row for component, skipping",
+				"component_id", comp.ComponentID, "warehouse_id", warehouseID)
+			continue
+		}
+
+		tx.Exec(`
+			UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2
+			WHERE id = $3
+		`, returnQty, now, compInvID)
+
+		var compCost float64
+		tx.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
+		totalReturnCost += returnQty * compCost
+
+		tx.Exec(`
+			INSERT INTO inventory_transactions (
+				id, tenant_id, organization_id, inventory_id, transaction_type,
+				reference_type, reference_id, quantity, unit_cost, total_cost,
+				reason, notes, transaction_date, created_by, created_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$13)
+		`, uuid.New(), tenantID, organizationID, compInvID, entity.TransactionTypeReceipt,
+			"production_order", poID, returnQty, compCost, returnQty*compCost,
+			"material_return", "Unused materials returned due to production shortfall", now, userID)
+	}
+
+	if commitErr := tx.Commit(); commitErr != nil {
+		h.log.Error("returnUnusedComponents: commit failed", "error", commitErr, "po_id", poID)
+		return
+	}
+	h.log.Info("returnUnusedComponents: materials returned",
+		"po_id", poID, "shortfall", shortfall, "returnRatio", returnRatio,
+		"components", len(components), "totalReturnCost", totalReturnCost)
+
+	// Journal entry: Dt Raw Materials / Kt WIP (reverse the unused portion)
+	if totalReturnCost > 0 {
+		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
+		if rawAcct == uuid.Nil {
+			rawAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1030")
+		}
+		if rawAcct == uuid.Nil {
+			rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "2910")
+		}
+		wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
+		if wipAcct == uuid.Nil {
+			wipAcct = findAccount(h.db, tenantID, organizationID, "tugallanmagan ishlab chiqarish", "2010")
+		}
+
+		if rawAcct != uuid.Nil && wipAcct != uuid.Nil {
+			var journalID uuid.UUID
+			var nextNumber int
+			h.db.QueryRow(`
+				SELECT id, next_number FROM journals
+				WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+				ORDER BY created_at ASC LIMIT 1
+			`, tenantID).Scan(&journalID, &nextNumber)
+
+			if journalID != uuid.Nil {
+				var poNumber string
+				h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, poID).Scan(&poNumber)
+
+				entryID := uuid.New()
+				entryNumber := fmt.Sprintf("MRT%06d", nextNumber)
+				description := fmt.Sprintf("Material return - %s shortfall %.2f (produced %.2f / planned %.2f)",
+					poNumber, shortfall, qtyProduced, qtyPlanned)
+
+				h.db.Exec(`
+					INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
+						date, description, status, created_by, created_at, updated_at)
+					VALUES ($1,$2,$3,$4,$5,$6,$7,'posted',$8,$6,$6)
+				`, entryID, tenantID, organizationID, journalID, entryNumber, now, description, userID)
+
+				// Dt Raw Materials (return materials to inventory account)
+				h.db.Exec(`
+					INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description,
+						debit_amount, credit_amount, created_at, updated_at)
+					VALUES ($1,$2,$3,$4,$5,0,$6,$6)
+				`, uuid.New(), entryID, rawAcct, "Unused materials returned", totalReturnCost, now)
+
+				// Kt WIP (reduce WIP by returned amount)
+				h.db.Exec(`
+					INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description,
+						debit_amount, credit_amount, created_at, updated_at)
+					VALUES ($1,$2,$3,$4,0,$5,$6,$6)
+				`, uuid.New(), entryID, wipAcct, "WIP reduced for returned materials", totalReturnCost, now)
+
+				h.db.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID)
+
+				h.log.Info("returnUnusedComponents: journal entry created",
+					"entryID", entryID, "totalReturnCost", totalReturnCost)
+			}
+		}
+	}
 }
 
 // CancelProductionOrder godoc

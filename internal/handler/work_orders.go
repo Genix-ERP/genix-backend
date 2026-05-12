@@ -594,10 +594,11 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				var productID uuid.UUID
 				var organizationID *uuid.UUID
 				var warehouseID *uuid.UUID
+				var bomID *uuid.UUID
 				h.db.QueryRow(`
-					SELECT product_id, organization_id, warehouse_id FROM production_orders
+					SELECT product_id, organization_id, warehouse_id, bom_id FROM production_orders
 					WHERE id = $1 AND tenant_id = $2
-				`, productionOrderID, tenantID).Scan(&productID, &organizationID, &warehouseID)
+				`, productionOrderID, tenantID).Scan(&productID, &organizationID, &warehouseID, &bomID)
 
 				if totalScrapped > 0 {
 					h.receiveScrapGoods(productionOrderID, tenantID, userID, productID, organizationID, totalScrapped, unitCost, now)
@@ -606,10 +607,28 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				// Create journal entries for finished goods (WIP → Finished Goods)
 				h.createFinishedGoodsJournalEntry(productionOrderID, tenantID, organizationID, productID, userID, lastWoProduced, unitCost, now)
 
-				// Transfer finished goods to dedicated finished goods warehouse if one exists
+				// Transfer finished goods to dedicated finished goods warehouse,
+				// but only if the BOM did NOT specify a warehouse — when the BOM
+				// has a warehouse, the product is already in the correct location.
 				if warehouseID != nil {
-					h.transferToFinishedGoodsWarehouse(productionOrderID, tenantID, organizationID, productID, *warehouseID, userID, lastWoProduced, unitCost, now)
+					var bomHasWarehouse bool
+					if bomID != nil {
+						var bomWhID uuid.UUID
+						if h.db.QueryRow(`SELECT warehouse_id FROM product_boms WHERE id = $1 AND warehouse_id IS NOT NULL`, bomID).Scan(&bomWhID) == nil {
+							bomHasWarehouse = true
+						}
+					}
+					if !bomHasWarehouse {
+						h.transferToFinishedGoodsWarehouse(productionOrderID, tenantID, organizationID, productID, *warehouseID, userID, lastWoProduced, unitCost, now)
+					}
 				}
+
+				// Return unused components when produced + scrapped < planned
+				var qtyPlanned float64
+				h.db.QueryRow(`SELECT quantity_planned FROM production_orders WHERE id = $1 AND tenant_id = $2`,
+					productionOrderID, tenantID).Scan(&qtyPlanned)
+				h.returnUnusedComponents(productionOrderID, tenantID, bomID, warehouseID, organizationID, userID,
+					qtyPlanned, lastWoProduced, totalScrapped, now)
 			}
 		}
 	}
