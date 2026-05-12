@@ -568,13 +568,22 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				}
 			} else {
 				h.log.Info("[v2] CompleteWorkOrder: completing PO (non-split)", "po_id", productionOrderID, "lastWoProduced", lastWoProduced)
+				var qtyPlannedForPO float64
+				h.db.QueryRow(`SELECT quantity_planned FROM production_orders WHERE id = $1 AND tenant_id = $2`,
+					productionOrderID, tenantID).Scan(&qtyPlannedForPO)
+				shortfallReasonSQL := ""
+				shortfallArgs := []interface{}{lastWoProduced, totalScrapped, now, productionOrderID, tenantID}
+				if input.ShortfallReason != "" && (lastWoProduced+totalScrapped) < qtyPlannedForPO {
+					shortfallReasonSQL = ", shortfall_reason = $6"
+					shortfallArgs = append(shortfallArgs, input.ShortfallReason)
+				}
 				h.db.Exec(`
 					UPDATE production_orders
 					SET status = 'completed', current_stage = 'done', progress_percent = 100,
 					    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
-					    actual_end = $3, updated_at = $3
+					    actual_end = $3, updated_at = $3`+shortfallReasonSQL+`
 					WHERE id = $4 AND tenant_id = $5
-				`, lastWoProduced, totalScrapped, now, productionOrderID, tenantID)
+				`, shortfallArgs...)
 
 				// Add finished goods to inventory (last step's good output)
 				unitCost := h.receiveFinishedGoods(productionOrderID, tenantID, userID, lastWoProduced, now)
