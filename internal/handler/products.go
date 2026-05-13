@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -326,7 +327,35 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			resp.Tags = []string{}
 		}
 
+		resp.OrganizationIDs = []uuid.UUID{}
 		products = append(products, resp)
+	}
+
+	// Batch-load organization_ids for all products in this page (avoids N+1)
+	if len(products) > 0 {
+		productIDs := make([]uuid.UUID, len(products))
+		productIndex := make(map[uuid.UUID]*entity.ProductResponse, len(products))
+		for i, p := range products {
+			productIDs[i] = p.ID
+			productIndex[p.ID] = p
+		}
+		orgRows, orgErr := h.db.Query(`
+			SELECT product_id, organization_id FROM product_organization_settings
+			WHERE tenant_id = $1 AND product_id = ANY($2)
+		`, tenantID, pq.Array(productIDs))
+		if orgErr == nil {
+			defer orgRows.Close()
+			for orgRows.Next() {
+				var pid, oid uuid.UUID
+				if err := orgRows.Scan(&pid, &oid); err == nil {
+					if p, ok := productIndex[pid]; ok {
+						p.OrganizationIDs = append(p.OrganizationIDs, oid)
+					}
+				}
+			}
+		} else {
+			h.log.Error("Failed to load product organization_ids", "error", orgErr)
+		}
 	}
 
 	pagination := entity.NewPagination(page, limit)
@@ -1958,6 +1987,12 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 		origOrgPtr = &orgID
 	}
 
+	// Default UOM for bulk-imported rows. The Excel template doesn't expose
+	// UOM columns, so without this every imported product would land with
+	// unit_id = NULL, breaking downstream UI (PO modal, BOM, etc.) that
+	// expects to show the unit next to quantity. Looked up once per request.
+	defaultUnitID := h.resolveUOMCode(tenantID, "unit")
+
 	for i, p := range input.Products {
 		rowNum := i + 1
 
@@ -2374,12 +2409,14 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 			INSERT INTO products (
 				id, tenant_id, origin_organization_id, category_id, type,
 				code, sku, barcode, name, description,
+				unit_id, purchase_unit_id, sales_unit_id,
 				cost_price, list_price, is_active, tags,
 				created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)
 		`,
 			newID, tenantID, origOrgPtr, categoryID, pType,
 			code, skuPtr, barcodePtr, name, description,
+			defaultUnitID, defaultUnitID, defaultUnitID,
 			p.CostPrice, p.ListPrice, isActive, tagsJSON,
 			userID, now,
 		)
