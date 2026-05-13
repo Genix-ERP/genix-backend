@@ -349,11 +349,13 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
 		FROM accounts a
 		JOIN account_types at ON a.account_type_id = at.id
-		LEFT JOIN journal_entry_lines jel ON a.id = jel.account_id
-		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
-			AND je.status = 'posted'
-			AND je.entry_date >= $2 AND je.entry_date <= $3
-			AND je.deleted_at IS NULL` + jeOrgFilter + `
+		LEFT JOIN (
+			journal_entry_lines jel
+			INNER JOIN journal_entries je ON jel.journal_entry_id = je.id
+				AND je.status = 'posted'
+				AND je.entry_date >= $2 AND je.entry_date <= $3
+				AND je.deleted_at IS NULL` + jeOrgFilter + `
+		) ON a.id = jel.account_id
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
 			AND at.category IN ('revenue', 'expense')
 	`
