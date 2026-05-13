@@ -319,6 +319,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		products.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateProduct)
 		products.POST("/:id/generate-search-key", h.perm.Require("inventory", "product", "update"), h.GenerateProductSearchKey)
 		products.DELETE("/:id", h.perm.Require("inventory", "product", "delete"), h.DeleteProduct)
+		products.GET("/:id/packaging-materials", h.ListProductPackagingMaterials)
+		products.POST("/:id/packaging-materials", h.SaveProductPackagingMaterials)
+		products.DELETE("/:id/packaging-materials/:materialId", h.DeleteProductPackagingMaterial)
 	}
 
 	// Product Categories
