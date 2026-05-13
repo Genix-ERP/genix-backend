@@ -335,6 +335,13 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 		periodTo = now.Format("2006-01-02")
 	}
 
+	args := []interface{}{tenantID, periodFrom, periodTo}
+	jeOrgFilter := ""
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		jeOrgFilter = " AND je.organization_id = $4"
+		args = append(args, orgID)
+	}
+
 	query := `
 		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
 			   at.category, at.normal_balance, at.code as type_code,
@@ -346,14 +353,12 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
 			AND je.status = 'posted'
 			AND je.entry_date >= $2 AND je.entry_date <= $3
-			AND je.deleted_at IS NULL
+			AND je.deleted_at IS NULL` + jeOrgFilter + `
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
 			AND at.category IN ('revenue', 'expense')
 	`
-	args := []interface{}{tenantID, periodFrom, periodTo}
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+	if jeOrgFilter != "" {
 		query += " AND a.organization_id = $4"
-		args = append(args, orgID)
 	}
 	query += `
 		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, a.name_ru, at.category, at.normal_balance, at.code
