@@ -1429,6 +1429,13 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	if input.HasSplitOutput != nil {
 		hasSplitOutput = *input.HasSplitOutput
 	}
+	// Auto-inherit from BOM if not explicitly set in the request
+	if !hasSplitOutput && input.BOMID != nil {
+		var bomSplit bool
+		if h.db.QueryRow(`SELECT COALESCE(has_split_output, false) FROM product_boms WHERE id = $1`, input.BOMID).Scan(&bomSplit) == nil && bomSplit {
+			hasSplitOutput = true
+		}
+	}
 	h.log.Info("CreateProductionOrder: split output", "input_value", input.HasSplitOutput, "resolved", hasSplitOutput)
 
 	query := `
