@@ -949,6 +949,14 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		result, err := tx.Exec(query, args...)
 		if err != nil {
 			h.log.Error("Failed to update purchase order", "error", err)
+			// Surface FK violations as structured 400s so the frontend can
+			// render a localised hint instead of a generic 500.
+			if strings.Contains(err.Error(), "purchase_orders_vendor_id_fkey") {
+				response.ErrorWithDetails(c, 400, "PO_INVALID_VENDOR",
+					"Selected supplier is no longer valid. Pick another supplier and save again.",
+					nil)
+				return
+			}
 			response.InternalError(c, "Failed to update purchase order")
 			return
 		}
