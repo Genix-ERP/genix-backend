@@ -761,11 +761,18 @@ type ProductionOutputResponse struct {
 // PRODUCTION SPLIT OUTPUT ENTITIES
 // =====================================================
 
+// SplitOutputMaterial describes an additional material consumed per piece during split output
+type SplitOutputMaterial struct {
+	ProductID        uuid.UUID `json:"product_id" binding:"required"`
+	QuantityPerPiece float64   `json:"quantity_per_piece" binding:"required,gt=0"`
+}
+
 // SplitOutputItem is the input for one packaged product line in a split output
 type SplitOutputItem struct {
-	ProductID    uuid.UUID  `json:"product_id" binding:"required"`
-	Quantity     float64    `json:"quantity" binding:"required,gt=0"`
-	WarehouseID  *uuid.UUID `json:"warehouse_id,omitempty"`
+	ProductID    uuid.UUID              `json:"product_id" binding:"required"`
+	Quantity     float64                `json:"quantity" binding:"required,gt=0"`
+	WarehouseID  *uuid.UUID             `json:"warehouse_id,omitempty"`
+	Materials    []SplitOutputMaterial   `json:"materials,omitempty"`
 }
 
 // CompleteSplitOutputInput is sent by the worker to finalize packaging
