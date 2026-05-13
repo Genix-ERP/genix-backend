@@ -98,13 +98,55 @@ func (h *Handler) CompleteSplitOutput(c *gin.Context) {
 
 		totalWeightKg := item.Quantity * unitWeightKg
 		unitCost := unitWeightKg * costPerKg
-		totalCost := item.Quantity * unitCost
 
 		// Determine warehouse for this item
 		warehouseID := defaultWarehouseID
 		if item.WarehouseID != nil {
 			warehouseID = item.WarehouseID
 		}
+
+		// Process additional materials per piece
+		var materialCostPerPiece float64
+		type materialRecord struct {
+			ProductID        uuid.UUID
+			QuantityPerPiece float64
+			TotalQty         float64
+			UnitCost         float64
+			TotalCost        float64
+		}
+		var matRecords []materialRecord
+
+		for _, mat := range item.Materials {
+			totalMatQty := mat.QuantityPerPiece * item.Quantity
+
+			// Look up material cost_price
+			var matCostPrice float64
+			if scanErr := h.db.QueryRow(`
+				SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2
+			`, mat.ProductID, tenantID).Scan(&matCostPrice); scanErr != nil {
+				response.BadRequest(c, fmt.Sprintf("Material product %s not found", mat.ProductID))
+				return
+			}
+
+			matTotalCost := totalMatQty * matCostPrice
+			matCostPerUnit := mat.QuantityPerPiece * matCostPrice
+			materialCostPerPiece += matCostPerUnit
+
+			// Deduct material from inventory (use production order's warehouse)
+			h.consumeSplitMaterial(tenantID, organizationID, poID, mat.ProductID, defaultWarehouseID, userID, totalMatQty, matCostPrice, now)
+
+			matRecords = append(matRecords, materialRecord{
+				ProductID:        mat.ProductID,
+				QuantityPerPiece: mat.QuantityPerPiece,
+				TotalQty:         totalMatQty,
+				UnitCost:         matCostPrice,
+				TotalCost:        matTotalCost,
+			})
+		}
+
+		// Add material cost to the unit cost
+		unitCost += materialCostPerPiece
+		totalCost := item.Quantity * unitCost
 
 		// Add to inventory
 		h.receiveSplitProduct(tenantID, organizationID, poID, item.ProductID, warehouseID, userID, item.Quantity, unitCost, now)
@@ -127,6 +169,20 @@ func (h *Handler) CompleteSplitOutput(c *gin.Context) {
 			h.log.Error("CompleteSplitOutput: failed to insert split output row", "error", insertErr)
 			response.InternalError(c, "Failed to save split output")
 			return
+		}
+
+		// Insert material records into production_split_output_materials
+		for _, mr := range matRecords {
+			if _, matInsertErr := h.db.Exec(`
+				INSERT INTO production_split_output_materials (
+					id, tenant_id, split_output_id, product_id,
+					quantity_per_piece, total_quantity, unit_cost, total_cost, created_at
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+			`, uuid.New(), tenantID, outID, mr.ProductID,
+				mr.QuantityPerPiece, mr.TotalQty, mr.UnitCost, mr.TotalCost, now,
+			); matInsertErr != nil {
+				h.log.Error("CompleteSplitOutput: failed to insert split output material", "error", matInsertErr)
+			}
 		}
 
 		outputs = append(outputs, entity.SplitOutputResponse{
@@ -330,6 +386,62 @@ func (h *Handler) receiveSplitProduct(
 
 	if err := tx.Commit(); err != nil {
 		h.log.Error("receiveSplitProduct: commit failed", "error", err)
+	}
+}
+
+// consumeSplitMaterial deducts a material from inventory for split output material consumption.
+func (h *Handler) consumeSplitMaterial(
+	tenantID uuid.UUID, organizationID *uuid.UUID,
+	poID, productID uuid.UUID, warehouseID *uuid.UUID,
+	userID uuid.UUID, qty, unitCost float64, now time.Time,
+) {
+	if warehouseID == nil || qty <= 0 {
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("consumeSplitMaterial: begin tx failed", "error", err)
+		return
+	}
+	defer tx.Rollback()
+
+	var invID uuid.UUID
+	var currentQty float64
+	scanErr := tx.QueryRow(`
+		SELECT id, quantity_on_hand FROM inventory
+		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+		AND lot_number IS NULL AND serial_number IS NULL
+	`, tenantID, productID, warehouseID).Scan(&invID, &currentQty)
+
+	if scanErr != nil {
+		h.log.Error("consumeSplitMaterial: material not found in inventory", "product_id", productID, "error", scanErr)
+		return
+	}
+
+	// Deduct quantity
+	if _, updateErr := tx.Exec(`
+		UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1,
+		last_movement_date = $2, updated_at = $2 WHERE id = $3
+	`, qty, now, invID); updateErr != nil {
+		h.log.Error("consumeSplitMaterial: update inventory failed", "error", updateErr)
+		return
+	}
+
+	// Create inventory transaction (issue)
+	if _, txErr := tx.Exec(`
+		INSERT INTO inventory_transactions (
+			id, tenant_id, organization_id, inventory_id, transaction_type,
+			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reason, notes, transaction_date, created_by, created_at
+		) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'split_material_consumption','Additional material consumed during split packaging',$9,$10,$9)
+	`, uuid.New(), tenantID, organizationID, invID, poID, qty, unitCost, qty*unitCost, now, userID); txErr != nil {
+		h.log.Error("consumeSplitMaterial: insert transaction failed", "error", txErr)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("consumeSplitMaterial: commit failed", "error", err)
 	}
 }
 
