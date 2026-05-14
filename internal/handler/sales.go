@@ -113,12 +113,16 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		args = append(args, dateTo)
 	}
 
-	// Search - also search by customer name
+	// Search - order number, reference, PO number, customer name, or product name in lines
 	if search := c.Query("search"); search != "" {
 		argCount++
 		searchPattern := "%" + strings.ToLower(search) + "%"
-		baseQuery += fmt.Sprintf(" AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d)", argCount, argCount, argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d)", argCount, argCount, argCount)
+		baseQuery += fmt.Sprintf(` AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d
+			OR EXISTS (SELECT 1 FROM sales_order_lines sol LEFT JOIN products p ON sol.product_id = p.id WHERE sol.sales_order_id = so.id AND (LOWER(p.name) LIKE $%d OR LOWER(sol.description) LIKE $%d)))`,
+			argCount, argCount, argCount, argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(` AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d
+			OR EXISTS (SELECT 1 FROM sales_order_lines sol LEFT JOIN products p ON sol.product_id = p.id WHERE sol.sales_order_id = so.id AND (LOWER(p.name) LIKE $%d OR LOWER(sol.description) LIKE $%d)))`,
+			argCount, argCount, argCount, argCount, argCount)
 		args = append(args, searchPattern)
 	}
 
@@ -2670,8 +2674,9 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		}
 	}
 
-	// Update order status to processing
-	if _, err := tx.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3",
+	// Update order status to processing — but only if it's still in an early stage.
+	// Don't regress shipped/delivered orders back to processing.
+	if _, err := tx.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3 AND status IN ('draft', 'quotation', 'confirmed')",
 		entity.OrderStatusProcessing, now, orderID); err != nil {
 		h.log.Error("CreateInvoiceFromOrder: update order status failed", "error", err)
 	}
