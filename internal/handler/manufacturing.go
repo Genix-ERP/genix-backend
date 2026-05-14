@@ -416,6 +416,11 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 		operatorMonthlySalary = *input.OperatorMonthlySalary
 	}
 
+	laborRateType := "monthly"
+	if input.LaborRateType != nil && *input.LaborRateType != "" {
+		laborRateType = *input.LaborRateType
+	}
+
 	// Auto-calculate cost breakdown if any detailed input is provided
 	var depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour float64
 	hasDetailedCosts := assetValue > 0 || powerKW > 0 || annualMaintenance > 0 || operatorMonthlySalary > 0
@@ -468,11 +473,6 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 			$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)
 		RETURNING id
 	`
-
-	laborRateType := "monthly"
-	if input.LaborRateType != nil && *input.LaborRateType != "" {
-		laborRateType = *input.LaborRateType
-	}
 
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, input.Code, input.Name, input.Description, input.WarehouseID,
