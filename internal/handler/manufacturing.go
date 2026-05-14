@@ -33,16 +33,10 @@ import (
 // @Param sort_by query string false "Sort by field" default(name)
 // @Param sort_order query string false "Sort order (asc/desc)" default(asc)
 // calculateWorkCenterCosts computes per-hour cost components from input parameters.
-func calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHoursPerDay, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, overheadCost float64) (depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour, totalHourlyCost float64) {
+func calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHoursPerDay, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, overheadCost float64, laborRateType string) (depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour, totalHourlyCost float64) {
 	annualWorkingHours := workingHoursPerDay * 250
 	if annualWorkingHours <= 0 {
 		annualWorkingHours = 2000
-	}
-	// Uzbek work schedule: 27 working days/month × configured hours per day.
-	// Fall back to the old 176h (22 × 8) only if workingHoursPerDay is invalid.
-	monthlyWorkingHours := workingHoursPerDay * 27
-	if monthlyWorkingHours <= 0 {
-		monthlyWorkingHours = 176
 	}
 	if assetValue > 0 && usefulLifeYears > 0 {
 		depreciationPerHour = assetValue / usefulLifeYears / annualWorkingHours
@@ -52,7 +46,17 @@ func calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHoursPerDay, p
 		maintenancePerHour = annualMaintenance / annualWorkingHours
 	}
 	if operatorMonthlySalary > 0 {
-		laborPerHour = operatorMonthlySalary / monthlyWorkingHours
+		if laborRateType == "daily" {
+			// Daily wage: divide by hours per day
+			laborPerHour = operatorMonthlySalary / workingHoursPerDay
+		} else {
+			// Monthly wage: divide by 27 working days × hours per day
+			monthlyWorkingHours := workingHoursPerDay * 27
+			if monthlyWorkingHours <= 0 {
+				monthlyWorkingHours = 176
+			}
+			laborPerHour = operatorMonthlySalary / monthlyWorkingHours
+		}
 	}
 	totalHourlyCost = depreciationPerHour + electricityPerHour + maintenancePerHour + laborPerHour + overheadCost
 	return
@@ -417,7 +421,7 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	hasDetailedCosts := assetValue > 0 || powerKW > 0 || annualMaintenance > 0 || operatorMonthlySalary > 0
 	if hasDetailedCosts {
 		depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour, hourlyCost =
-			calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHours, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, overheadCost)
+			calculateWorkCenterCosts(assetValue, usefulLifeYears, workingHours, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, overheadCost, laborRateType)
 	}
 
 	currency := "USD"
@@ -683,15 +687,16 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 			AssetValue, UsefulLifeYears, WorkingHoursPerDay float64
 			PowerKW, ElectricityRate, AnnualMaintenance     float64
 			OperatorMonthlySalary, OverheadCost             float64
+			LaborRateType                                   string
 		}
 		h.db.QueryRow(`
 			SELECT COALESCE(asset_value,0), COALESCE(useful_life_years,10), COALESCE(working_hours_per_day,8),
 				COALESCE(power_kw,0), COALESCE(electricity_rate,0), COALESCE(annual_maintenance,0),
-				COALESCE(operator_monthly_salary,0), COALESCE(overhead_cost,0)
+				COALESCE(operator_monthly_salary,0), COALESCE(overhead_cost,0), COALESCE(labor_rate_type,'monthly')
 			FROM work_centers WHERE id = $1 AND tenant_id = $2
 		`, id, tenantID).Scan(&cur.AssetValue, &cur.UsefulLifeYears, &cur.WorkingHoursPerDay,
 			&cur.PowerKW, &cur.ElectricityRate, &cur.AnnualMaintenance,
-			&cur.OperatorMonthlySalary, &cur.OverheadCost)
+			&cur.OperatorMonthlySalary, &cur.OverheadCost, &cur.LaborRateType)
 
 		if input.AssetValue != nil { cur.AssetValue = *input.AssetValue }
 		if input.UsefulLifeYears != nil { cur.UsefulLifeYears = *input.UsefulLifeYears }
@@ -701,13 +706,14 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 		if input.AnnualMaintenance != nil { cur.AnnualMaintenance = *input.AnnualMaintenance }
 		if input.OperatorMonthlySalary != nil { cur.OperatorMonthlySalary = *input.OperatorMonthlySalary }
 		if input.OverheadCost != nil { cur.OverheadCost = *input.OverheadCost }
+		if input.LaborRateType != nil { cur.LaborRateType = *input.LaborRateType }
 
 		hasDetailed := cur.AssetValue > 0 || cur.PowerKW > 0 || cur.AnnualMaintenance > 0 || cur.OperatorMonthlySalary > 0
 		if hasDetailed {
 			dep, elec, maint, labor, total := calculateWorkCenterCosts(
 				cur.AssetValue, cur.UsefulLifeYears, cur.WorkingHoursPerDay,
 				cur.PowerKW, cur.ElectricityRate, cur.AnnualMaintenance,
-				cur.OperatorMonthlySalary, cur.OverheadCost)
+				cur.OperatorMonthlySalary, cur.OverheadCost, cur.LaborRateType)
 			argCount++
 			updates = append(updates, fmt.Sprintf("depreciation_per_hour = $%d", argCount))
 			args = append(args, dep)
@@ -2372,16 +2378,19 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 
 			// Read all BOM components first
 			type bomComponent struct {
-				ComponentID  uuid.UUID
-				Quantity     float64
-				ScrapPercent float64
-				BOMOutputQty float64
+				ComponentID    uuid.UUID
+				Quantity       float64
+				ScrapPercent   float64
+				BOMOutputQty   float64
+				TrackInventory bool
 			}
 
 			compRows, compErr := tx.Query(`
-				SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), pb.quantity
+				SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), pb.quantity,
+				       COALESCE(p.track_inventory, true)
 				FROM bom_lines bl
 				JOIN product_boms pb ON pb.id = bl.bom_id
+				LEFT JOIN products p ON p.id = bl.component_id
 				WHERE bl.bom_id = $1
 			`, bomID)
 			if compErr != nil {
@@ -2393,7 +2402,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			var components []bomComponent
 			for compRows.Next() {
 				var comp bomComponent
-				if scanErr := compRows.Scan(&comp.ComponentID, &comp.Quantity, &comp.ScrapPercent, &comp.BOMOutputQty); scanErr == nil {
+				if scanErr := compRows.Scan(&comp.ComponentID, &comp.Quantity, &comp.ScrapPercent, &comp.BOMOutputQty, &comp.TrackInventory); scanErr == nil {
 					components = append(components, comp)
 				}
 			}
@@ -2443,12 +2452,21 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 					continue
 				}
 
-				if _, deductErr := tx.Exec(`
-					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
-					WHERE id = $3
-				`, consumption, now, compInvID); deductErr != nil {
-					h.log.Error("Failed to deduct component from inventory", "error", deductErr, "component_id", comp.ComponentID, "qty", consumption)
-					continue
+				// Only deduct from inventory if the product tracks inventory.
+				// Products with track_inventory=false (e.g. water, gas) are
+				// treated as infinite supply — their cost still counts in BOM
+				// calculations but their quantity is never reduced.
+				if comp.TrackInventory {
+					if _, deductErr := tx.Exec(`
+						UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
+						WHERE id = $3
+					`, consumption, now, compInvID); deductErr != nil {
+						h.log.Error("Failed to deduct component from inventory", "error", deductErr, "component_id", comp.ComponentID, "qty", consumption)
+						continue
+					}
+				} else {
+					h.log.Info("Skipping inventory deduction for non-tracked component",
+						"component_id", comp.ComponentID, "qty", consumption)
 				}
 
 				var compCost float64
@@ -2747,19 +2765,18 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	`, now, id, tenantID)
 
 	// --- Inventory integration: add produced goods & consume materials ---
-	// Skip if inventory was already updated for this production order (prevent double-add)
-	// Check if finished goods were already added (prevent double-add on re-completion)
-	// Only check for Receipt transactions - Issue transactions are from material consumption at start
+	// Check specifically for 'production_complete' receipts (not material_return receipts).
+	// receiveFinishedGoods (called from CompleteWorkOrder) may have already added the
+	// finished goods — in that case skip inventory but still run component return.
 	var existingReceiptCount int
 	h.db.QueryRow(`
 		SELECT COUNT(*) FROM inventory_transactions
 		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2
-		AND transaction_type = $3
+		AND transaction_type = $3 AND reason = 'production_complete'
 	`, tenantID, id, entity.TransactionTypeReceipt).Scan(&existingReceiptCount)
-	if existingReceiptCount > 0 {
-		h.log.Info("Finished goods already added for production order, skipping", "order_id", id)
-		h.GetProductionOrder(c)
-		return
+	alreadyReceived := existingReceiptCount > 0
+	if alreadyReceived {
+		h.log.Info("Finished goods already added for production order, skipping inventory", "order_id", id)
 	}
 
 	// Get active organization from request header
@@ -2897,6 +2914,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		}
 	}
 
+	if !alreadyReceived {
 	tx, txErr := h.db.Begin()
 	if txErr != nil {
 		h.log.Error("Failed to start inventory transaction", "error", txErr)
@@ -2970,6 +2988,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 		now, producedQty, unitCost, now); lotErr != nil {
 		h.log.Error("CompleteProductionOrder: lot insert failed (non-fatal)", "error", lotErr, "po_id", id)
 	}
+	} // end if !alreadyReceived
 
 	// ============================================
 	// CREATE JOURNAL ENTRIES: WIP-based manufacturing cost flow
@@ -3292,16 +3311,19 @@ func (h *Handler) returnUnusedComponents(
 	returnRatio := shortfall / qtyPlanned
 
 	type bomComponent struct {
-		ComponentID  uuid.UUID
-		Quantity     float64
-		ScrapPercent float64
-		BOMOutputQty float64
+		ComponentID    uuid.UUID
+		Quantity       float64
+		ScrapPercent   float64
+		BOMOutputQty   float64
+		TrackInventory bool
 	}
 
 	rows, err := h.db.Query(`
-		SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), COALESCE(pb.quantity, 1)
+		SELECT bl.component_id, bl.quantity, COALESCE(bl.scrap_percent, 0), COALESCE(pb.quantity, 1),
+		       COALESCE(p.track_inventory, true)
 		FROM bom_lines bl
 		JOIN product_boms pb ON pb.id = bl.bom_id
+		LEFT JOIN products p ON p.id = bl.component_id
 		WHERE bl.bom_id = $1
 	`, bomID)
 	if err != nil {
@@ -3311,7 +3333,7 @@ func (h *Handler) returnUnusedComponents(
 	var components []bomComponent
 	for rows.Next() {
 		var comp bomComponent
-		if scanErr := rows.Scan(&comp.ComponentID, &comp.Quantity, &comp.ScrapPercent, &comp.BOMOutputQty); scanErr == nil {
+		if scanErr := rows.Scan(&comp.ComponentID, &comp.Quantity, &comp.ScrapPercent, &comp.BOMOutputQty, &comp.TrackInventory); scanErr == nil {
 			components = append(components, comp)
 		}
 	}
@@ -3331,6 +3353,12 @@ func (h *Handler) returnUnusedComponents(
 	var totalReturnCost float64
 
 	for _, comp := range components {
+		// Skip non-tracked components — their inventory was never deducted,
+		// so there is nothing to return.
+		if !comp.TrackInventory {
+			continue
+		}
+
 		consumed := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
 		returnQty := consumed * returnRatio
 

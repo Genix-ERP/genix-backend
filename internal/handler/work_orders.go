@@ -1300,9 +1300,20 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 		woNumber := fmt.Sprintf("WO%05d", woCount+seq)
 
 		var workCenterID interface{} = nil
+		var capacityPerHour float64
 		if wcID.Valid {
 			workCenterID, _ = uuid.Parse(wcID.String)
+			// Get work center capacity to calculate realistic planned duration
+			h.db.QueryRow(`SELECT COALESCE(capacity_per_hour, 1) FROM work_centers WHERE id = $1`, workCenterID).Scan(&capacityPerHour)
 		}
+		if capacityPerHour <= 0 {
+			capacityPerHour = 1
+		}
+
+		// Planned duration = quantity / capacity_per_hour (how long to actually produce this qty)
+		// BOM run_time is per-unit reference; real duration depends on capacity
+		plannedHours := quantity / capacityPerHour
+		setupHours := float64(setupTime) / 60
 
 		var notesVal interface{} = nil
 		if notes.Valid {
@@ -1322,7 +1333,7 @@ func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uui
 			woNumber, opName, sequence,
 			opID, workCenterID,
 			quantity,
-			float64(runTime)/60, float64(setupTime)/60,
+			plannedHours, setupHours,
 			notesVal, userID)
 		if err != nil {
 			return err

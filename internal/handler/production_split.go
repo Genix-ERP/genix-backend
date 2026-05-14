@@ -399,6 +399,16 @@ func (h *Handler) consumeSplitMaterial(
 		return
 	}
 
+	// Check if the product tracks inventory. Products with track_inventory=false
+	// (e.g. water, gas) are infinite-supply — skip the deduction but still record
+	// the transaction for cost tracking.
+	var trackInventory bool
+	if err := h.db.QueryRow(`SELECT COALESCE(track_inventory, true) FROM products WHERE id = $1`, productID).Scan(&trackInventory); err != nil {
+		h.log.Error("consumeSplitMaterial: failed to check track_inventory", "product_id", productID, "error", err)
+		// Default to tracking if lookup fails
+		trackInventory = true
+	}
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		h.log.Error("consumeSplitMaterial: begin tx failed", "error", err)
@@ -419,16 +429,21 @@ func (h *Handler) consumeSplitMaterial(
 		return
 	}
 
-	// Deduct quantity
-	if _, updateErr := tx.Exec(`
-		UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1,
-		last_movement_date = $2, updated_at = $2 WHERE id = $3
-	`, qty, now, invID); updateErr != nil {
-		h.log.Error("consumeSplitMaterial: update inventory failed", "error", updateErr)
-		return
+	// Only deduct quantity if the product tracks inventory
+	if trackInventory {
+		if _, updateErr := tx.Exec(`
+			UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1,
+			last_movement_date = $2, updated_at = $2 WHERE id = $3
+		`, qty, now, invID); updateErr != nil {
+			h.log.Error("consumeSplitMaterial: update inventory failed", "error", updateErr)
+			return
+		}
+	} else {
+		h.log.Info("consumeSplitMaterial: skipping inventory deduction for non-tracked product",
+			"product_id", productID, "qty", qty)
 	}
 
-	// Create inventory transaction (issue)
+	// Create inventory transaction (issue) — always recorded for cost tracking
 	if _, txErr := tx.Exec(`
 		INSERT INTO inventory_transactions (
 			id, tenant_id, organization_id, inventory_id, transaction_type,
