@@ -265,6 +265,10 @@ type ProductResponse struct {
 	HasVariants        bool      `json:"has_variants"`
 	HasDelivery        bool      `json:"has_delivery"`
 	DeliveryPrice      float64   `json:"delivery_price"`
+	Weight             *float64  `json:"weight,omitempty"`
+	Length             *float64  `json:"length,omitempty"`
+	Width              *float64  `json:"width,omitempty"`
+	Height             *float64  `json:"height,omitempty"`
 	IsActive           bool        `json:"is_active"`
 	Tags               []string    `json:"tags"`
 	ImageURL           string      `json:"image_url"`

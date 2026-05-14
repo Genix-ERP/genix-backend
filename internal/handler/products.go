@@ -93,6 +93,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.has_variants, false) as has_variants,
 			   COALESCE(p.has_delivery, false) as has_delivery,
 			   COALESCE(p.delivery_price, 0) as delivery_price,
+			   p.weight, p.length, p.width, p.height,
 			   p.is_active, p.tags, COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
 			   p.created_at, p.updated_at,
@@ -210,6 +211,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var purchaseUnitName string
 		var salesUnitID sql.NullString
 		var salesUnitName string
+		var weight, length, width, height sql.NullFloat64
 
 		err := rows.Scan(
 			&p.ID, &p.TenantID, &categoryID, &p.Type, &p.Code, &sku, &barcode, &searchKey,
@@ -221,6 +223,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 			&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
 			&p.IsOverheadExpense, &p.IsManufacturable, &p.AutoManufacture, &p.HasVariants, &p.HasDelivery, &p.DeliveryPrice,
+			&weight, &length, &width, &height,
 			&p.IsActive, &tags, &imageURL,
 			&inventoryType,
 			&p.CreatedAt, &p.UpdatedAt,
@@ -318,6 +321,11 @@ func (h *Handler) ListProducts(c *gin.Context) {
 				Name: categoryName.String,
 			}
 		}
+
+		if weight.Valid { v := weight.Float64; resp.Weight = &v }
+		if length.Valid { v := length.Float64; resp.Length = &v }
+		if width.Valid  { v := width.Float64;  resp.Width  = &v }
+		if height.Valid { v := height.Float64; resp.Height = &v }
 
 		// Parse tags
 		if len(tags) > 0 {
@@ -717,6 +725,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			   COALESCE(p.has_variants, false) as has_variants,
 			   COALESCE(p.has_delivery, false) as has_delivery,
 			   COALESCE(p.delivery_price, 0) as delivery_price,
+			   p.weight, p.length, p.width, p.height,
 			   p.is_active, p.tags,
 			   COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
@@ -742,6 +751,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	var tags json.RawMessage
 	var imageURL string
 	var inventoryType string
+	var weight, length, width, height sql.NullFloat64
 
 	err = h.db.QueryRow(query, queryArgs...).Scan(
 		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode, &searchKey,
@@ -753,6 +763,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 		&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
 		&p.IsOverheadExpense, &p.IsManufacturable, &p.AutoManufacture, &p.HasVariants, &p.HasDelivery, &p.DeliveryPrice,
+		&weight, &length, &width, &height,
 		&p.IsActive, &tags, &imageURL,
 		&inventoryType,
 		&p.CreatedAt, &p.UpdatedAt,
@@ -829,6 +840,11 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			Name: categoryName.String,
 		}
 	}
+
+	if weight.Valid { v := weight.Float64; resp.Weight = &v }
+	if length.Valid { v := length.Float64; resp.Length = &v }
+	if width.Valid  { v := width.Float64;  resp.Width  = &v }
+	if height.Valid { v := height.Float64; resp.Height = &v }
 
 	if len(tags) > 0 {
 		json.Unmarshal(tags, &resp.Tags)
