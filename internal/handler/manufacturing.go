@@ -1520,8 +1520,14 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 	).Scan(&id)
 
 	if err != nil {
-		h.log.Error("Failed to create production order", "error", err)
-		response.InternalError(c, "Failed to create production order")
+		h.log.Error("Failed to create production order", "error", err,
+			"product_id", input.ProductID, "bom_id", input.BOMID, "org_id", orgIDPtr,
+			"warehouse_id", warehouseID, "has_split_output", hasSplitOutput)
+		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+			response.Conflict(c, "Production order code already exists")
+		} else {
+			response.InternalError(c, "Failed to create production order: "+err.Error())
+		}
 		return
 	}
 
