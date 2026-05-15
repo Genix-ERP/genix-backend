@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1387,12 +1388,18 @@ func (h *Handler) CreateProductionOrder(c *gin.Context) {
 		return
 	}
 
-	// Generate code
+	// Generate code — use MAX to avoid conflicts with deleted orders or multi-org gaps
 	now := time.Now()
 	id := uuid.New()
-	var moCount int
-	h.db.QueryRow("SELECT COUNT(*) FROM production_orders WHERE tenant_id = $1", tenantID).Scan(&moCount)
-	code := fmt.Sprintf("MO%05d", moCount+1)
+	var maxCode sql.NullString
+	h.db.QueryRow(`SELECT MAX(code) FROM production_orders WHERE tenant_id = $1 AND code ~ '^MO[0-9]+$'`, tenantID).Scan(&maxCode)
+	nextNum := 1
+	if maxCode.Valid && len(maxCode.String) > 2 {
+		if n, err := strconv.Atoi(maxCode.String[2:]); err == nil {
+			nextNum = n + 1
+		}
+	}
+	code := fmt.Sprintf("MO%05d", nextNum)
 
 	// Set defaults
 	priority := 5
