@@ -1116,17 +1116,28 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		}
 	}
 
-	// Update organization assignments if provided
+	// Sync organization assignments without destroying existing per-org
+	// pricing. The old code DELETE'd every product_organization_settings
+	// row and reinserted them with hard-coded zeros — which wiped the
+	// cost_price/list_price the user had just set (the per-org upsert
+	// above ran first, then this block deleted its work). Now we only
+	// delete rows for orgs that were removed from the list, and INSERT
+	// ON CONFLICT DO NOTHING preserves prices for orgs still selected.
 	if len(input.OrganizationIDs) > 0 {
-		// Delete existing org assignments
-		h.db.Exec(`DELETE FROM product_organization_settings WHERE product_id = $1 AND tenant_id = $2`, id, tenantID)
-
-		// Re-create for selected orgs
+		orgIDsToKeep := make([]uuid.UUID, 0, len(input.OrganizationIDs))
 		for _, oid := range input.OrganizationIDs {
-			parsedOrgID, parseErr := uuid.Parse(oid)
-			if parseErr != nil {
-				continue
+			if parsedOrgID, parseErr := uuid.Parse(oid); parseErr == nil {
+				orgIDsToKeep = append(orgIDsToKeep, parsedOrgID)
 			}
+		}
+
+		h.db.Exec(`
+			DELETE FROM product_organization_settings
+			WHERE product_id = $1 AND tenant_id = $2
+			  AND organization_id <> ALL($3)
+		`, id, tenantID, pq.Array(orgIDsToKeep))
+
+		for _, parsedOrgID := range orgIDsToKeep {
 			h.db.Exec(`
 				INSERT INTO product_organization_settings (
 					tenant_id, product_id, organization_id,
@@ -1213,7 +1224,9 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 			COALESCE(cos.expense_account_id, pc.expense_account_id) as expense_account_id,
 			COALESCE(cos.stock_valuation_account_id, pc.stock_valuation_account_id) as stock_valuation_account_id,
 			COALESCE(cos.stock_input_account_id, pc.stock_input_account_id) as stock_input_account_id,
-			COALESCE(cos.stock_output_account_id, pc.stock_output_account_id) as stock_output_account_id
+			COALESCE(cos.stock_output_account_id, pc.stock_output_account_id) as stock_output_account_id,
+			(SELECT COUNT(*) FROM products
+			   WHERE category_id = pc.id AND tenant_id = pc.tenant_id AND deleted_at IS NULL) as product_count
 		FROM product_categories pc
 	`
 	args := []interface{}{tenantID}
@@ -1255,7 +1268,8 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 		var parentID, desc sql.NullString
 
 		err := rows.Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt,
-			&cat.IncomeAccountID, &cat.ExpenseAccountID, &cat.StockValuationAccountID, &cat.StockInputAccountID, &cat.StockOutputAccountID)
+			&cat.IncomeAccountID, &cat.ExpenseAccountID, &cat.StockValuationAccountID, &cat.StockInputAccountID, &cat.StockOutputAccountID,
+			&cat.ProductCount)
 		if err != nil {
 			continue
 		}

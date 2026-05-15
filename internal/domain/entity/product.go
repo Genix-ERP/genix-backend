@@ -37,6 +37,11 @@ type ProductCategory struct {
 	StockInputAccountID     *uuid.UUID `json:"stock_input_account_id,omitempty" db:"stock_input_account_id"`
 	StockOutputAccountID    *uuid.UUID `json:"stock_output_account_id,omitempty" db:"stock_output_account_id"`
 
+	// Tenant-wide product count (not org-scoped). Matches what the
+	// delete-category guard actually checks, so the UI count is
+	// consistent with whether delete will be refused.
+	ProductCount int `json:"product_count"`
+
 	// Relationships
 	Parent   *ProductCategory  `json:"parent,omitempty"`
 	Children []ProductCategory `json:"children,omitempty"`
