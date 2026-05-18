@@ -1167,9 +1167,23 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 				orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice,
 				orgUpdates.minStockLevel, orgUpdates.reorderPoint, orgUpdates.reorderQuantity)
 			if execErr != nil {
-				h.log.Error("Failed to upsert product org settings", "error", execErr, "org_id", targetOrgID.String())
-				response.InternalError(c, "Failed to update product prices for organization")
-				return
+				h.log.Error("Failed to upsert product org settings, trying plain UPDATE as fallback",
+					"error", execErr, "product_id", id.String(), "org_id", targetOrgID.String())
+				// Upsert failed (likely INSERT part). Try a plain UPDATE on existing row.
+				_, fallbackErr := h.db.Exec(`
+					UPDATE product_organization_settings SET
+						cost_price  = COALESCE($3, cost_price),
+						list_price  = COALESCE($4, list_price),
+						min_price   = COALESCE($5, min_price),
+						updated_at  = NOW()
+					WHERE product_id = $1 AND organization_id = $2
+				`, id, targetOrgID,
+					orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice)
+				if fallbackErr != nil {
+					h.log.Error("Fallback UPDATE also failed", "error", fallbackErr)
+				} else {
+					h.log.Info("Fallback UPDATE succeeded for pos row")
+				}
 			} else {
 				rows, _ := res.RowsAffected()
 				h.log.Info("UpdateProduct: pos upsert result", "org_id", targetOrgID.String(), "rows_affected", rows)
