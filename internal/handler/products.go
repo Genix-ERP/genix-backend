@@ -72,9 +72,9 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	baseQuery := `
 		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode, p.search_key,
 			   p.name, p.description, p.short_description, p.unit_id,
-			   COALESCE(pos.cost_price, p.cost_price) as cost_price,
-			   COALESCE(pos.list_price, p.list_price) as list_price,
-			   COALESCE(pos.min_price, p.min_price) as min_price,
+			   COALESCE(NULLIF(pos.cost_price, 0), p.cost_price) as cost_price,
+			   COALESCE(NULLIF(pos.list_price, 0), p.list_price) as list_price,
+			   COALESCE(NULLIF(pos.min_price, 0), p.min_price) as min_price,
 			   p.is_stockable, p.track_inventory,
 			   COALESCE(pos.min_stock_level, p.min_stock_level) as min_stock_level,
 			   COALESCE(pos.reorder_point, p.reorder_point) as reorder_point,
@@ -704,9 +704,9 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	query := `
 		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode, p.search_key,
 			   p.name, p.description, p.short_description, p.unit_id,
-			   COALESCE(pos.cost_price, p.cost_price) as cost_price,
-			   COALESCE(pos.list_price, p.list_price) as list_price,
-			   COALESCE(pos.min_price, p.min_price) as min_price,
+			   COALESCE(NULLIF(pos.cost_price, 0), p.cost_price) as cost_price,
+			   COALESCE(NULLIF(pos.list_price, 0), p.list_price) as list_price,
+			   COALESCE(NULLIF(pos.min_price, 0), p.min_price) as min_price,
 			   p.is_stockable, p.track_inventory,
 			   COALESCE(pos.min_stock_level, p.min_stock_level) as min_stock_level,
 			   COALESCE(pos.reorder_point, p.reorder_point) as reorder_point,
@@ -1073,6 +1073,22 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		argCount++
 		args = append(args, tenantID)
 
+		// DIAGNOSTIC: log the SET clause and key input values so we can
+		// see whether list_price/cost_price are actually being included.
+		// If the production payload has list_price=770000 but the SET
+		// clause doesn't mention list_price, it means the JSON didn't
+		// bind into input.ListPrice for some reason.
+		var inCost, inList interface{} = "<nil>", "<nil>"
+		if input.CostPrice != nil { inCost = *input.CostPrice }
+		if input.ListPrice != nil { inList = *input.ListPrice }
+		h.log.Info("UpdateProduct: products UPDATE",
+			"product_id", id.String(),
+			"input_cost_price", inCost,
+			"input_list_price", inList,
+			"organization_ids", input.OrganizationIDs,
+			"set_clause", strings.Join(updates, ", "),
+		)
+
 		query := fmt.Sprintf(`
 			UPDATE products SET %s
 			WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL
@@ -1118,7 +1134,22 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		}
 
 		for _, targetOrgID := range orgsToWrite {
-			_, err = h.db.Exec(`
+			// DIAGNOSTIC: log what we're about to upsert. The per-org pos
+			// row's list_price has been mysteriously stuck at the old
+			// value despite this branch existing, so prove what gets
+			// passed to Postgres. Remove once the price-stuck bug is
+			// understood.
+			var costVal, listVal interface{} = "<nil>", "<nil>"
+			if orgUpdates.costPrice != nil { costVal = *orgUpdates.costPrice }
+			if orgUpdates.listPrice != nil { listVal = *orgUpdates.listPrice }
+			h.log.Info("UpdateProduct: pos upsert",
+				"product_id", id.String(),
+				"target_org_id", targetOrgID.String(),
+				"cost_price_arg", costVal,
+				"list_price_arg", listVal,
+			)
+
+			res, execErr := h.db.Exec(`
 				INSERT INTO product_organization_settings (tenant_id, product_id, organization_id,
 					cost_price, list_price, min_price, min_stock_level, reorder_point, reorder_quantity)
 				VALUES ($1, $2, $3,
@@ -1135,9 +1166,31 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 			`, tenantID, id, targetOrgID,
 				orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice,
 				orgUpdates.minStockLevel, orgUpdates.reorderPoint, orgUpdates.reorderQuantity)
-			if err != nil {
-				h.log.Error("Failed to upsert product org settings", "error", err, "org_id", targetOrgID.String())
+			if execErr != nil {
+				h.log.Error("Failed to upsert product org settings", "error", execErr, "org_id", targetOrgID.String())
+				response.InternalError(c, "Failed to update product prices for organization")
+				return
+			} else {
+				rows, _ := res.RowsAffected()
+				h.log.Info("UpdateProduct: pos upsert result", "org_id", targetOrgID.String(), "rows_affected", rows)
 			}
+
+			// Verify what's actually stored after the upsert. If the
+			// SELECT here returns the new value but the user still sees
+			// the old, the issue is read-side (caching / replica lag).
+			// If the SELECT returns the OLD value, the upsert never
+			// applied — points at SQL-level issue we can dig into.
+			var verifyList float64
+			verifyErr := h.db.QueryRow(
+				`SELECT list_price FROM product_organization_settings
+				 WHERE product_id = $1 AND organization_id = $2`,
+				id, targetOrgID,
+			).Scan(&verifyList)
+			h.log.Info("UpdateProduct: pos verify",
+				"org_id", targetOrgID.String(),
+				"list_price_after_upsert", verifyList,
+				"verify_err", verifyErr,
+			)
 		}
 	}
 
