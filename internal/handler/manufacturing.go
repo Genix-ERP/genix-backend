@@ -103,7 +103,7 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 			   wc.working_hours_per_day, wc.hourly_cost, wc.setup_cost, wc.overhead_cost,
 			   COALESCE(wc.asset_value,0), COALESCE(wc.useful_life_years,10),
 			   COALESCE(wc.power_kw,0), COALESCE(wc.electricity_rate,0),
-			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0), COALESCE(wc.labor_rate_type,'monthly'), COALESCE(wc.cost_method,'capacity'),
+			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0), COALESCE(wc.labor_rate_type,'monthly'), COALESCE(wc.cost_method,'capacity'), COALESCE(wc.require_operator, false),
 			   COALESCE(wc.depreciation_per_hour,0), COALESCE(wc.electricity_per_hour,0),
 			   COALESCE(wc.maintenance_per_hour,0), COALESCE(wc.labor_per_hour,0),
 			   wc.currency, wc.status, wc.is_available, wc.next_maintenance_date,
@@ -214,7 +214,7 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 			&wc.WorkingHoursPerDay, &wc.HourlyCost, &wc.SetupCost, &wc.OverheadCost,
 			&wc.AssetValue, &wc.UsefulLifeYears,
 			&wc.PowerKW, &wc.ElectricityRate,
-			&wc.AnnualMaintenance, &wc.OperatorMonthlySalary, &wc.LaborRateType, &wc.CostMethod,
+			&wc.AnnualMaintenance, &wc.OperatorMonthlySalary, &wc.LaborRateType, &wc.CostMethod, &wc.RequireOperator,
 			&wc.DepreciationPerHour, &wc.ElectricityPerHour,
 			&wc.MaintenancePerHour, &wc.LaborPerHour,
 			&wc.Currency, &wc.Status, &wc.IsAvailable, &nextMaint,
@@ -280,7 +280,7 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 			   wc.working_hours_per_day, wc.hourly_cost, wc.setup_cost, wc.overhead_cost,
 			   COALESCE(wc.asset_value,0), COALESCE(wc.useful_life_years,10),
 			   COALESCE(wc.power_kw,0), COALESCE(wc.electricity_rate,0),
-			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0), COALESCE(wc.labor_rate_type,'monthly'), COALESCE(wc.cost_method,'capacity'),
+			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0), COALESCE(wc.labor_rate_type,'monthly'), COALESCE(wc.cost_method,'capacity'), COALESCE(wc.require_operator, false),
 			   COALESCE(wc.depreciation_per_hour,0), COALESCE(wc.electricity_per_hour,0),
 			   COALESCE(wc.maintenance_per_hour,0), COALESCE(wc.labor_per_hour,0),
 			   wc.currency, wc.status, wc.is_available, wc.next_maintenance_date,
@@ -301,7 +301,7 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 		&wc.WorkingHoursPerDay, &wc.HourlyCost, &wc.SetupCost, &wc.OverheadCost,
 		&wc.AssetValue, &wc.UsefulLifeYears,
 		&wc.PowerKW, &wc.ElectricityRate,
-		&wc.AnnualMaintenance, &wc.OperatorMonthlySalary, &wc.LaborRateType, &wc.CostMethod,
+		&wc.AnnualMaintenance, &wc.OperatorMonthlySalary, &wc.LaborRateType, &wc.CostMethod, &wc.RequireOperator,
 		&wc.DepreciationPerHour, &wc.ElectricityPerHour,
 		&wc.MaintenancePerHour, &wc.LaborPerHour,
 		&wc.Currency, &wc.Status, &wc.IsAvailable, &nextMaint,
@@ -466,12 +466,12 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 			id, tenant_id, organization_id, code, name, description, warehouse_id, department,
 			capacity_per_hour, efficiency_factor, oee_target, working_hours_per_day,
 			hourly_cost, setup_cost, overhead_cost,
-			asset_value, useful_life_years, power_kw, electricity_rate, annual_maintenance, operator_monthly_salary, labor_rate_type, cost_method,
+			asset_value, useful_life_years, power_kw, electricity_rate, annual_maintenance, operator_monthly_salary, labor_rate_type, cost_method, require_operator,
 			depreciation_per_hour, electricity_per_hour, maintenance_per_hour, labor_per_hour,
 			currency, status, is_available,
 			next_maintenance_date, notes, created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-			$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
+			$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)
 		RETURNING id
 	`
 
@@ -479,12 +479,16 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 	if input.CostMethod != nil && *input.CostMethod != "" {
 		costMethod = *input.CostMethod
 	}
+	requireOperator := false
+	if input.RequireOperator != nil {
+		requireOperator = *input.RequireOperator
+	}
 
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, input.Code, input.Name, input.Description, input.WarehouseID,
 		input.Department, capacityPerHour, efficiencyFactor, oeeTarget, workingHours,
 		hourlyCost, setupCost, overheadCost,
-		assetValue, usefulLifeYears, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, laborRateType, costMethod,
+		assetValue, usefulLifeYears, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, laborRateType, costMethod, requireOperator,
 		depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour,
 		currency, status, isAvailable,
 		nextMaintDate, input.Notes, userID, now, now,
@@ -688,6 +692,11 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("cost_method = $%d", argCount))
 		args = append(args, *input.CostMethod)
+	}
+	if input.RequireOperator != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("require_operator = $%d", argCount))
+		args = append(args, *input.RequireOperator)
 	}
 
 	// Recalculate cost breakdown if any cost-related field changed.
