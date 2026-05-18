@@ -1092,27 +1092,52 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		}
 	}
 
-	// Upsert org-specific settings
-	if hasOrgUpdates && orgID != uuid.Nil {
-		_, err = h.db.Exec(`
-			INSERT INTO product_organization_settings (tenant_id, product_id, organization_id,
-				cost_price, list_price, min_price, min_stock_level, reorder_point, reorder_quantity)
-			VALUES ($1, $2, $3,
-				COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
-				COALESCE($7, 0), COALESCE($8, 0), COALESCE($9, 0))
-			ON CONFLICT (product_id, organization_id) DO UPDATE SET
-				cost_price = COALESCE($4, product_organization_settings.cost_price),
-				list_price = COALESCE($5, product_organization_settings.list_price),
-				min_price = COALESCE($6, product_organization_settings.min_price),
-				min_stock_level = COALESCE($7, product_organization_settings.min_stock_level),
-				reorder_point = COALESCE($8, product_organization_settings.reorder_point),
-				reorder_quantity = COALESCE($9, product_organization_settings.reorder_quantity),
-				updated_at = NOW()
-		`, tenantID, id, orgID,
-			orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice,
-			orgUpdates.minStockLevel, orgUpdates.reorderPoint, orgUpdates.reorderQuantity)
-		if err != nil {
-			h.log.Error("Failed to upsert product org settings", "error", err)
+	// Upsert org-specific settings.
+	//
+	// Build the list of orgs that need their pos row updated. Previously
+	// we only wrote to pos for the request's active orgID (from the
+	// header). That caused a subtle data bug: when the user's active
+	// session is org A but the product is assigned only to org B,
+	// pos[A] got the new price, then the org-sync block below deleted
+	// pos[A] (A not in the assignment list) and left pos[B] untouched
+	// with stale prices. The displayed value (COALESCE(pos.list_price,
+	// p.list_price) for the viewing org) stayed at the old number.
+	//
+	// Fix: write the new prices to pos for every org the product is
+	// currently assigned to, so prices propagate uniformly. Falls back
+	// to the header orgID when the request didn't supply assignments.
+	if hasOrgUpdates {
+		orgsToWrite := make([]uuid.UUID, 0, len(input.OrganizationIDs)+1)
+		for _, oidStr := range input.OrganizationIDs {
+			if parsedOrgID, parseErr := uuid.Parse(oidStr); parseErr == nil {
+				orgsToWrite = append(orgsToWrite, parsedOrgID)
+			}
+		}
+		if len(orgsToWrite) == 0 && orgID != uuid.Nil {
+			orgsToWrite = append(orgsToWrite, orgID)
+		}
+
+		for _, targetOrgID := range orgsToWrite {
+			_, err = h.db.Exec(`
+				INSERT INTO product_organization_settings (tenant_id, product_id, organization_id,
+					cost_price, list_price, min_price, min_stock_level, reorder_point, reorder_quantity)
+				VALUES ($1, $2, $3,
+					COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
+					COALESCE($7, 0), COALESCE($8, 0), COALESCE($9, 0))
+				ON CONFLICT (product_id, organization_id) DO UPDATE SET
+					cost_price = COALESCE($4, product_organization_settings.cost_price),
+					list_price = COALESCE($5, product_organization_settings.list_price),
+					min_price = COALESCE($6, product_organization_settings.min_price),
+					min_stock_level = COALESCE($7, product_organization_settings.min_stock_level),
+					reorder_point = COALESCE($8, product_organization_settings.reorder_point),
+					reorder_quantity = COALESCE($9, product_organization_settings.reorder_quantity),
+					updated_at = NOW()
+			`, tenantID, id, targetOrgID,
+				orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice,
+				orgUpdates.minStockLevel, orgUpdates.reorderPoint, orgUpdates.reorderQuantity)
+			if err != nil {
+				h.log.Error("Failed to upsert product org settings", "error", err, "org_id", targetOrgID.String())
+			}
 		}
 	}
 
