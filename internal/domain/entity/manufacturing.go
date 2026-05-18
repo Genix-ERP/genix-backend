@@ -34,6 +34,7 @@ type WorkCenter struct {
 	OperatorMonthlySalary float64  `json:"operator_monthly_salary" db:"operator_monthly_salary"`
 	LaborRateType         string   `json:"labor_rate_type" db:"labor_rate_type"`
 	CostMethod            string   `json:"cost_method" db:"cost_method"`
+	RequireOperator       bool     `json:"require_operator" db:"require_operator"`
 	// Calculated per-hour components
 	DepreciationPerHour   float64  `json:"depreciation_per_hour" db:"depreciation_per_hour"`
 	ElectricityPerHour    float64  `json:"electricity_per_hour" db:"electricity_per_hour"`
@@ -76,6 +77,7 @@ type WorkCenterInput struct {
 	OperatorMonthlySalary *float64 `json:"operator_monthly_salary,omitempty"`
 	LaborRateType         *string  `json:"labor_rate_type,omitempty"`
 	CostMethod            *string  `json:"cost_method,omitempty"`
+	RequireOperator       *bool    `json:"require_operator,omitempty"`
 	Currency            *string    `json:"currency,omitempty"`
 	Status              *string    `json:"status,omitempty"`
 	IsAvailable         *bool      `json:"is_available,omitempty"`
@@ -107,6 +109,7 @@ type WorkCenterResponse struct {
 	OperatorMonthlySalary float64  `json:"operator_monthly_salary"`
 	LaborRateType         string   `json:"labor_rate_type"`
 	CostMethod            string   `json:"cost_method"`
+	RequireOperator       bool     `json:"require_operator"`
 	DepreciationPerHour   float64  `json:"depreciation_per_hour"`
 	ElectricityPerHour    float64  `json:"electricity_per_hour"`
 	MaintenancePerHour    float64  `json:"maintenance_per_hour"`
