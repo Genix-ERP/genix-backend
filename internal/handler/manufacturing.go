@@ -103,7 +103,7 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 			   wc.working_hours_per_day, wc.hourly_cost, wc.setup_cost, wc.overhead_cost,
 			   COALESCE(wc.asset_value,0), COALESCE(wc.useful_life_years,10),
 			   COALESCE(wc.power_kw,0), COALESCE(wc.electricity_rate,0),
-			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0), COALESCE(wc.labor_rate_type,'monthly'),
+			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0), COALESCE(wc.labor_rate_type,'monthly'), COALESCE(wc.cost_method,'capacity'),
 			   COALESCE(wc.depreciation_per_hour,0), COALESCE(wc.electricity_per_hour,0),
 			   COALESCE(wc.maintenance_per_hour,0), COALESCE(wc.labor_per_hour,0),
 			   wc.currency, wc.status, wc.is_available, wc.next_maintenance_date,
@@ -214,7 +214,7 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 			&wc.WorkingHoursPerDay, &wc.HourlyCost, &wc.SetupCost, &wc.OverheadCost,
 			&wc.AssetValue, &wc.UsefulLifeYears,
 			&wc.PowerKW, &wc.ElectricityRate,
-			&wc.AnnualMaintenance, &wc.OperatorMonthlySalary, &wc.LaborRateType,
+			&wc.AnnualMaintenance, &wc.OperatorMonthlySalary, &wc.LaborRateType, &wc.CostMethod,
 			&wc.DepreciationPerHour, &wc.ElectricityPerHour,
 			&wc.MaintenancePerHour, &wc.LaborPerHour,
 			&wc.Currency, &wc.Status, &wc.IsAvailable, &nextMaint,
@@ -280,7 +280,7 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 			   wc.working_hours_per_day, wc.hourly_cost, wc.setup_cost, wc.overhead_cost,
 			   COALESCE(wc.asset_value,0), COALESCE(wc.useful_life_years,10),
 			   COALESCE(wc.power_kw,0), COALESCE(wc.electricity_rate,0),
-			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0), COALESCE(wc.labor_rate_type,'monthly'),
+			   COALESCE(wc.annual_maintenance,0), COALESCE(wc.operator_monthly_salary,0), COALESCE(wc.labor_rate_type,'monthly'), COALESCE(wc.cost_method,'capacity'),
 			   COALESCE(wc.depreciation_per_hour,0), COALESCE(wc.electricity_per_hour,0),
 			   COALESCE(wc.maintenance_per_hour,0), COALESCE(wc.labor_per_hour,0),
 			   wc.currency, wc.status, wc.is_available, wc.next_maintenance_date,
@@ -301,7 +301,7 @@ func (h *Handler) GetWorkCenter(c *gin.Context) {
 		&wc.WorkingHoursPerDay, &wc.HourlyCost, &wc.SetupCost, &wc.OverheadCost,
 		&wc.AssetValue, &wc.UsefulLifeYears,
 		&wc.PowerKW, &wc.ElectricityRate,
-		&wc.AnnualMaintenance, &wc.OperatorMonthlySalary, &wc.LaborRateType,
+		&wc.AnnualMaintenance, &wc.OperatorMonthlySalary, &wc.LaborRateType, &wc.CostMethod,
 		&wc.DepreciationPerHour, &wc.ElectricityPerHour,
 		&wc.MaintenancePerHour, &wc.LaborPerHour,
 		&wc.Currency, &wc.Status, &wc.IsAvailable, &nextMaint,
@@ -466,20 +466,25 @@ func (h *Handler) CreateWorkCenter(c *gin.Context) {
 			id, tenant_id, organization_id, code, name, description, warehouse_id, department,
 			capacity_per_hour, efficiency_factor, oee_target, working_hours_per_day,
 			hourly_cost, setup_cost, overhead_cost,
-			asset_value, useful_life_years, power_kw, electricity_rate, annual_maintenance, operator_monthly_salary, labor_rate_type,
+			asset_value, useful_life_years, power_kw, electricity_rate, annual_maintenance, operator_monthly_salary, labor_rate_type, cost_method,
 			depreciation_per_hour, electricity_per_hour, maintenance_per_hour, labor_per_hour,
 			currency, status, is_available,
 			next_maintenance_date, notes, created_by, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-			$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)
+			$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
 		RETURNING id
 	`
+
+	costMethod := "capacity"
+	if input.CostMethod != nil && *input.CostMethod != "" {
+		costMethod = *input.CostMethod
+	}
 
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, input.Code, input.Name, input.Description, input.WarehouseID,
 		input.Department, capacityPerHour, efficiencyFactor, oeeTarget, workingHours,
 		hourlyCost, setupCost, overheadCost,
-		assetValue, usefulLifeYears, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, laborRateType,
+		assetValue, usefulLifeYears, powerKW, electricityRate, annualMaintenance, operatorMonthlySalary, laborRateType, costMethod,
 		depreciationPerHour, electricityPerHour, maintenancePerHour, laborPerHour,
 		currency, status, isAvailable,
 		nextMaintDate, input.Notes, userID, now, now,
@@ -678,6 +683,11 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("labor_rate_type = $%d", argCount))
 		args = append(args, *input.LaborRateType)
+	}
+	if input.CostMethod != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("cost_method = $%d", argCount))
+		args = append(args, *input.CostMethod)
 	}
 
 	// Recalculate cost breakdown if any cost-related field changed.
@@ -2871,7 +2881,8 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 				WHERE bl.bom_id = $2
 			`, bomOutputQty, bomID).Scan(&materialCost)
 
-			// Machine cost = (depreciation + electricity + maintenance) / capacity_per_hour, summed per BOM operation
+			// Machine cost: capacity-based WCs use hourly_cost/capacity, time-based WCs use actual hours
+			// 1) Capacity-based work centers
 			h.db.QueryRow(`
 				SELECT COALESCE(SUM(
 					(COALESCE(wc.depreciation_per_hour, 0) + COALESCE(wc.electricity_per_hour, 0) + COALESCE(wc.maintenance_per_hour, 0))
@@ -2879,10 +2890,23 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 				), 0) / $1
 				FROM bom_operations bo
 				LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
-				WHERE bo.bom_id = $2
+				WHERE bo.bom_id = $2 AND COALESCE(wc.cost_method, 'capacity') = 'capacity'
 			`, bomOutputQty, bomID).Scan(&machineCost)
 
-			// Labor cost = labor_per_hour / capacity_per_hour, summed per BOM operation
+			// 2) Time-based work centers: use actual hours from work orders
+			var timeMachineCost float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(
+					COALESCE(wc.hourly_cost, 0) * COALESCE(wo.actual_duration_hours, 0)
+				), 0) / GREATEST($1, 1)
+				FROM work_orders wo
+				LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
+				WHERE wo.production_order_id = $2 AND COALESCE(wc.cost_method, 'capacity') = 'time'
+				AND wo.status IN ('completed', 'done')
+			`, producedQty, id).Scan(&timeMachineCost)
+			machineCost += timeMachineCost
+
+			// Labor cost: same split — capacity vs time
 			h.db.QueryRow(`
 				SELECT COALESCE(SUM(
 					COALESCE(wc.labor_per_hour, 0)
@@ -2890,10 +2914,22 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 				), 0) / $1
 				FROM bom_operations bo
 				LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
-				WHERE bo.bom_id = $2
+				WHERE bo.bom_id = $2 AND COALESCE(wc.cost_method, 'capacity') = 'capacity'
 			`, bomOutputQty, bomID).Scan(&laborCost)
 
-			// If detailed cost fields are all zero (old work centers), fall back to hourly_cost as machineCost
+			var timeLaborCost float64
+			h.db.QueryRow(`
+				SELECT COALESCE(SUM(
+					COALESCE(wc.labor_per_hour, 0) * COALESCE(wo.actual_duration_hours, 0)
+				), 0) / GREATEST($1, 1)
+				FROM work_orders wo
+				LEFT JOIN work_centers wc ON wo.work_center_id = wc.id
+				WHERE wo.production_order_id = $2 AND COALESCE(wc.cost_method, 'capacity') = 'time'
+				AND wo.status IN ('completed', 'done')
+			`, producedQty, id).Scan(&timeLaborCost)
+			laborCost += timeLaborCost
+
+			// If detailed cost fields are all zero (old work centers), fall back to hourly_cost
 			if machineCost == 0 && laborCost == 0 {
 				h.db.QueryRow(`
 					SELECT COALESCE(SUM(
