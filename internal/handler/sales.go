@@ -531,13 +531,20 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 	// Generate order number if not supplied. Uses MAX + 1 scoped by (tenant, org)
 	// so we don't collide across orgs, and retries on unique-constraint violation
 	// to survive concurrent POSTs racing for the same next number.
+	//
+	// IMPORTANT: do NOT filter on deleted_at here. The unique constraint
+	// sales_orders_tenant_org_order_number_key covers every row in the table
+	// — soft-deleted rows still occupy their order_number. Excluding them
+	// from MAX makes the generator hand out a number that's already taken
+	// by a soft-deleted row, and every retry repeats the same calculation
+	// → infinite loop of "Sales order number collision, retrying".
 	nextOrderNumber := func() string {
 		var maxNum int
 		if orgID != nil {
 			h.db.QueryRow(`
 				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
 				FROM sales_orders
-				WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+				WHERE tenant_id = $1 AND organization_id = $2
 				  AND order_number ~ '^S[0-9]+$'`,
 				tenantID, *orgID,
 			).Scan(&maxNum)
@@ -545,7 +552,7 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			h.db.QueryRow(`
 				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
 				FROM sales_orders
-				WHERE tenant_id = $1 AND organization_id IS NULL AND deleted_at IS NULL
+				WHERE tenant_id = $1 AND organization_id IS NULL
 				  AND order_number ~ '^S[0-9]+$'`,
 				tenantID,
 			).Scan(&maxNum)
@@ -996,7 +1003,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		input.DiscountValue == nil && input.ShippingAmount == nil && input.PaymentTerms == nil &&
 		input.Reference == nil && input.PONumber == nil && input.Notes == nil &&
 		input.InternalNotes == nil && input.WarehouseID == nil && input.Carrier == nil &&
-		input.SalesRepID == nil && input.PaymentStatus == nil
+		input.SalesRepID == nil && input.PaymentStatus == nil &&
+		input.CustomerID == nil && input.CustomerName == nil
 
 	if !isStatusOnlyUpdate && currentStatus != string(entity.OrderStatusDraft) {
 		response.BadRequest(c, "Can only update order details in draft status")
@@ -1007,6 +1015,60 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 	updates := []string{}
 	args := []interface{}{}
 	argCount := 0
+
+	// Customer change. Prefer customer_id (UUID from a frontend dropdown);
+	// fall back to customer_name lookup-or-create, mirroring the create
+	// path. Previously this field wasn't on the input struct at all, so
+	// the customer column was silently ignored on every edit.
+	if input.CustomerID != nil && strings.TrimSpace(*input.CustomerID) != "" {
+		cid, parseErr := uuid.Parse(strings.TrimSpace(*input.CustomerID))
+		if parseErr != nil {
+			response.BadRequest(c, "Invalid customer_id")
+			return
+		}
+		// Verify the contact exists for this tenant before writing.
+		var exists bool
+		h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM contacts WHERE id = $1 AND tenant_id = $2)",
+			cid, tenantID,
+		).Scan(&exists)
+		if !exists {
+			response.BadRequest(c, "Customer not found")
+			return
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("customer_id = $%d", argCount))
+		args = append(args, cid)
+	} else if input.CustomerName != nil && strings.TrimSpace(*input.CustomerName) != "" {
+		newName := strings.TrimSpace(*input.CustomerName)
+		var cid uuid.UUID
+		err := h.db.QueryRow(
+			"SELECT id FROM contacts WHERE tenant_id = $1 AND name ILIKE $2 LIMIT 1",
+			tenantID, newName,
+		).Scan(&cid)
+		if err == sql.ErrNoRows {
+			// Auto-create a placeholder contact, same as CreateSalesOrder does.
+			cid = uuid.New()
+			now := time.Now()
+			contactCode := "CUST-" + uuid.New().String()[:8]
+			if _, execErr := h.db.Exec(`
+				INSERT INTO contacts (id, tenant_id, type, code, name, created_at, updated_at)
+				VALUES ($1, $2, 'customer', $3, $4, $5, $5)`,
+				cid, tenantID, contactCode, newName, now,
+			); execErr != nil {
+				h.log.Error("Failed to create placeholder contact", "error", execErr)
+				response.InternalError(c, "Failed to update customer")
+				return
+			}
+		} else if err != nil {
+			h.log.Error("Failed to lookup customer", "error", err)
+			response.InternalError(c, "Failed to update customer")
+			return
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("customer_id = $%d", argCount))
+		args = append(args, cid)
+	}
 
 	if input.ExpectedDate != nil {
 		argCount++
