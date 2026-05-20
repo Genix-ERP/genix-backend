@@ -1002,9 +1002,21 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// Payment journals (bank/cash only) — no finance permission required, any authenticated user can access
 	rg.GET("/journals/payment", h.ListPaymentJournals)
 
-	// Journals (accounting journals like GEN, SAL, PUR, MISC)
+	// Journals (accounting journals like GEN, SAL, PUR, MISC).
+	//
+	// Read access (GET) is INTENTIONALLY ungated. Sales-invoice and
+	// purchase-bill creation flows fetch this list to populate the
+	// "journal" dropdown — gating reads behind `finance:journal:read`
+	// breaks invoice creation for employees who legitimately have
+	// only sales / purchase permissions but no finance permission.
+	// Journals are reference data (like products, units of measure,
+	// tax rates), not sensitive financial details — so any
+	// authenticated user can list them.
+	//
+	// Mutating operations (POST / PUT / DELETE) remain gated behind
+	// the finance permission — only Buxgalter / Admin can create or
+	// modify the journal *definitions*.
 	journalGroup := rg.Group("/journals")
-	journalGroup.Use(h.perm.Require("finance", "journal", "read"))
 	{
 		journalGroup.GET("", h.ListJournals)
 		journalGroup.POST("", h.perm.Require("finance", "journal", "create"), h.CreateJournal)
@@ -1023,9 +1035,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		paymentMethodsGroup.GET("", h.ListPaymentMethods)
 	}
 
-	// Journal Entries
+	// Journal Entries.
+	//
+	// Read access (GET) is also ungated — same reason as /journals
+	// above. Sales / purchase modules render JE references on invoice
+	// detail screens (e.g. "linked to journal entry JE-20260507-…"),
+	// and the auto-post code paths emit JE rows that the originating
+	// module sometimes needs to read back. Mutations stay gated.
 	journals := rg.Group("/journal-entries")
-	journals.Use(h.perm.Require("finance", "journal", "read"))
 	{
 		journals.GET("", h.ListJournalEntries)
 		journals.POST("", h.perm.Require("finance", "journal", "create"), h.CreateJournalEntry)
