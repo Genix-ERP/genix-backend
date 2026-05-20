@@ -2951,6 +2951,18 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 				`, bomOutputQty, bomID).Scan(&machineCost)
 			}
 
+			// Add per-unit cost of extras added in shop floor. The BOM-derived
+			// materialCost above only includes BOM components; any extra
+			// materials the operator added via the work-order shop floor are
+			// recorded in work_order_materials but excluded from BOM, so the
+			// finished-goods value would otherwise miss them entirely.
+			if producedQty > 0 {
+				var extraMaterialCost float64
+				h.db.QueryRow(`SELECT COALESCE(SUM(total_cost), 0) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2`, id, tenantID).Scan(&extraMaterialCost)
+				if extraMaterialCost > 0 {
+					materialCost += extraMaterialCost / producedQty
+				}
+			}
 			unitCost = materialCost + machineCost + laborCost
 		}
 	}

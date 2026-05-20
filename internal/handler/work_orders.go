@@ -1574,6 +1574,17 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 			unitCost = (materialCost + machineCost) / bomOutputQty
 		}
 	}
+	// Add per-unit cost of extras added in shop floor (work_order_materials
+	// are NOT in the BOM, so the BOM-derived material cost above ignores them).
+	// work_order_materials.total_cost is a per-PO total; divide by producedQty
+	// to convert it to a per-unit contribution.
+	if producedQty > 0 {
+		var extraMaterialCost float64
+		h.db.QueryRow(`SELECT COALESCE(SUM(total_cost), 0) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&extraMaterialCost)
+		if extraMaterialCost > 0 {
+			unitCost += extraMaterialCost / producedQty
+		}
+	}
 	if unitCost <= 0 {
 		h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1 AND tenant_id = $2", productID, tenantID).Scan(&unitCost)
 	}
