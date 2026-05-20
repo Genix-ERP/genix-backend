@@ -1278,7 +1278,10 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		{"CASH", "Кассовый журнал", "Kassa jurnali", "Cash Journal", "cash", "5010", "5010"},
 		{"BANK", "Банковский журнал", "Bank jurnali", "Bank Journal", "bank", "5110", "5110"},
 		{"MISC", "Прочие операции", "Boshqa operatsiyalar jurnali", "Miscellaneous Journal", "miscellaneous", "", ""},
-		{"CASH_RECEIPTS", "Журнал кассовых поступлений", "Naqd pul tushumlari jurnali", "Cash Receipts Journal", "cash", "5010", ""},
+		// CASH_RECEIPTS removed — was redundant with CASH. Callers in
+		// sales_returns.go already fall back to 'CASH' when the
+		// CASH_RECEIPTS code isn't found, so no other code paths
+		// break. Migration 395 retires the existing rows.
 		{"STOCK", "Складской журнал", "Ombor jurnali", "Stock Journal", "general", "", ""},
 		{"ASSET", "Журнал основных средств", "Asosiy vositalar jurnali", "Fixed Assets Journal", "general", "", ""},
 		{"PAYROLL", "Журнал зарплаты", "Ish haqi jurnali", "Payroll Journal", "general", "", ""},
