@@ -1257,25 +1257,32 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		accountIDs[code] = id
 	}
 
-	// Define default journals — must match migration 276 list
+	// Define default journals — must match migration 276/278 list.
+	// Each journal carries name in three languages so the UI can
+	// localize. The `name` field (Russian, the system's lingua franca)
+	// is what migration 278's backfill stored; keeping the same value
+	// here so re-running this seeder for an org that already has
+	// migration-seeded journals is a no-op.
 	defaultJournals := []struct {
 		code              string
-		name              string
+		nameRu            string
+		nameUz            string
+		nameEn            string
 		journalType       string
 		defaultDebitCode  string
 		defaultCreditCode string
 	}{
-		{"GEN", "General Journal", "general", "", ""},
-		{"SAL", "Sales Journal", "sales", "4010", "9010"},             // AR debit, Sales Revenue credit
-		{"PUR", "Purchase Journal", "purchase", "9110", "6010"},       // COGS debit, AP credit
-		{"CASH", "Cash Journal", "cash", "5010", "5010"},              // Cash
-		{"BANK", "Bank Journal", "bank", "5110", "5110"},              // Bank
-		{"MISC", "Miscellaneous Journal", "miscellaneous", "", ""},
-		{"CASH_RECEIPTS", "Cash Receipts Journal", "cash", "5010", ""}, // Cash receipts
-		{"STOCK", "Stock Journal", "general", "", ""},
-		{"ASSET", "Fixed Assets Journal", "general", "", ""},
-		{"PAYROLL", "Payroll Journal", "general", "", ""},
-		{"CONST", "Construction Journal", "general", "", ""},
+		{"GEN", "Главный журнал", "Bosh jurnal", "General Journal", "general", "", ""},
+		{"SAL", "Журнал продаж", "Sotish jurnali", "Sales Journal", "sales", "4010", "9010"},
+		{"PUR", "Журнал закупок", "Xarid jurnali", "Purchase Journal", "purchase", "9110", "6010"},
+		{"CASH", "Кассовый журнал", "Kassa jurnali", "Cash Journal", "cash", "5010", "5010"},
+		{"BANK", "Банковский журнал", "Bank jurnali", "Bank Journal", "bank", "5110", "5110"},
+		{"MISC", "Прочие операции", "Boshqa operatsiyalar jurnali", "Miscellaneous Journal", "miscellaneous", "", ""},
+		{"CASH_RECEIPTS", "Журнал кассовых поступлений", "Naqd pul tushumlari jurnali", "Cash Receipts Journal", "cash", "5010", ""},
+		{"STOCK", "Складской журнал", "Ombor jurnali", "Stock Journal", "general", "", ""},
+		{"ASSET", "Журнал основных средств", "Asosiy vositalar jurnali", "Fixed Assets Journal", "general", "", ""},
+		{"PAYROLL", "Журнал зарплаты", "Ish haqi jurnali", "Payroll Journal", "general", "", ""},
+		{"CONST", "Строительный журнал", "Qurilish jurnali", "Construction Journal", "general", "", ""},
 	}
 
 	// Find profit/loss accounts for cash/bank journals
@@ -1326,21 +1333,25 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		// empty Journals page on the second+ org under any tenant).
 		_, err := h.db.Exec(`
 			INSERT INTO journals (
-				id, tenant_id, organization_id, code, name, type,
+				id, tenant_id, organization_id, code, name, name_uz, name_en, type,
 				default_debit_account_id, default_credit_account_id,
 				profit_account_id, loss_account_id,
 				is_active, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			ON CONFLICT (tenant_id, organization_id, code) DO UPDATE
 				SET default_debit_account_id  = COALESCE(EXCLUDED.default_debit_account_id,  journals.default_debit_account_id),
 				    default_credit_account_id = COALESCE(EXCLUDED.default_credit_account_id, journals.default_credit_account_id),
 				    profit_account_id         = COALESCE(EXCLUDED.profit_account_id,         journals.profit_account_id),
 				    loss_account_id           = COALESCE(EXCLUDED.loss_account_id,           journals.loss_account_id),
+				    -- Backfill localized name columns if they were empty
+				    -- (legacy rows created before the seeder wrote them).
+				    name_uz = COALESCE(NULLIF(journals.name_uz, ''), EXCLUDED.name_uz),
+				    name_en = COALESCE(NULLIF(journals.name_en, ''), EXCLUDED.name_en),
 				    is_active = true,
 				    updated_at = NOW()
 				WHERE journals.deleted_at IS NULL
 		`,
-			id, tenantID, orgID, j.code, j.name, j.journalType,
+			id, tenantID, orgID, j.code, j.nameRu, j.nameUz, j.nameEn, j.journalType,
 			defaultDebitID, defaultCreditID,
 			profitAcct, lossAcct,
 			true, now,
