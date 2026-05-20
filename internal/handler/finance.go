@@ -190,12 +190,40 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 		}
 		if requestedOrg != uuid.Nil {
-			var existingCount int
-			if err := h.db.QueryRow(
+			// Fire the seed function whenever the org is missing
+			// ANY of the three things it should have:
+			//   1. accounts (initial creation case),
+			//   2. the GROUP-account hierarchy (org created before
+			//      createDefaultChartOfAccounts seeded groups, or
+			//      created after migration 317 but before the
+			//      runtime-seeder learned about groups),
+			//   3. default journals (the legacy ON-CONFLICT bug
+			//      silently dropped journals for the 2nd+ org per
+			//      tenant before migration 278 fixed the constraint).
+			// Each seeder uses ON CONFLICT DO NOTHING / DO UPDATE so
+			// re-running is safe and only writes missing rows.
+			var totalAccounts, groupAccounts, journalCount int
+			_ = h.db.QueryRow(
 				`SELECT COUNT(*) FROM accounts
-				  WHERE tenant_id = $1 AND organization_id = $2`,
+				  WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
 				tenantID, requestedOrg,
-			).Scan(&existingCount); err == nil && existingCount == 0 {
+			).Scan(&totalAccounts)
+			_ = h.db.QueryRow(
+				`SELECT COUNT(*) FROM accounts
+				  WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+				    AND COALESCE(is_leaf, true) = false`,
+				tenantID, requestedOrg,
+			).Scan(&groupAccounts)
+			_ = h.db.QueryRow(
+				`SELECT COUNT(*) FROM journals
+				  WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+				tenantID, requestedOrg,
+			).Scan(&journalCount)
+
+			needsAccountSeed := totalAccounts == 0 || groupAccounts < 30 // legacy orgs have 40 groups
+			needsJournalSeed := journalCount < 5                          // 11 defaults; under 5 means broken
+
+			if needsAccountSeed || needsJournalSeed {
 				var orgExists bool
 				if err := h.db.QueryRow(
 					`SELECT EXISTS(SELECT 1 FROM organizations
@@ -203,16 +231,25 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 					                  AND deleted_at IS NULL)`,
 					requestedOrg, tenantID,
 				).Scan(&orgExists); err == nil && orgExists {
-					if initErr := h.createDefaultChartOfAccounts(tenantID, requestedOrg); initErr != nil {
-						h.log.Warn("auto-init chart of accounts failed",
-							"error", initErr, "tenant_id", tenantID, "org_id", requestedOrg)
-					} else {
+					if needsAccountSeed {
+						if initErr := h.createDefaultChartOfAccounts(tenantID, requestedOrg); initErr != nil {
+							h.log.Warn("auto-init chart of accounts failed",
+								"error", initErr, "tenant_id", tenantID, "org_id", requestedOrg)
+						} else {
+							h.log.Info("auto-initialized chart of accounts for organization",
+								"tenant_id", tenantID, "org_id", requestedOrg,
+								"previous_accounts", totalAccounts, "previous_groups", groupAccounts)
+						}
+					}
+					if needsJournalSeed {
 						if jErr := h.createDefaultJournals(tenantID, requestedOrg); jErr != nil {
 							h.log.Warn("auto-init default journals failed",
 								"error", jErr, "tenant_id", tenantID, "org_id", requestedOrg)
+						} else {
+							h.log.Info("auto-initialized default journals for organization",
+								"tenant_id", tenantID, "org_id", requestedOrg,
+								"previous_journals", journalCount)
 						}
-						h.log.Info("auto-initialized chart of accounts for organization",
-							"tenant_id", tenantID, "org_id", requestedOrg)
 					}
 				}
 			}
