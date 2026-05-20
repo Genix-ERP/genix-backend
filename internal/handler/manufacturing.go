@@ -1781,6 +1781,12 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 	}
 
 	now := time.Now()
+
+	// Fetch the PO code BEFORE the soft-delete so we can wipe its journal
+	// entries (descriptions reference it by code, not id).
+	var poCode string
+	h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&poCode)
+
 	query := `UPDATE production_orders SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status IN ('draft', 'cancelled', 'completed')`
 	result, err := h.db.Exec(query, now, id, tenantID)
 	if err != nil {
@@ -1797,6 +1803,113 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 
 	// Cascade soft-delete all work orders so they disappear from Shop Floor Control
 	h.db.Exec(`UPDATE work_orders SET deleted_at = $1 WHERE production_order_id = $2 AND tenant_id = $3 AND deleted_at IS NULL`, now, id, tenantID)
+
+	// --- Cascade cleanup of side effects ---
+	// Without this, "deleting" an MO leaves a trail of postings on 1030, 2010,
+	// 1330 and the inventory ledger that nothing in the UI can undo. Test MOs
+	// (and any legitimately abandoned MO) used to bloat WIP for billions.
+	//
+	// We soft-delete the journal entries (so the audit trail survives via
+	// deleted_at), then recompute every account's current_balance from the
+	// surviving posted lines. Inventory transactions are also soft-deleted
+	// and the on-hand / lots quantities are rolled back to match.
+	if poCode != "" {
+		// 1. Soft-delete journal entries whose description references this PO code
+		h.db.Exec(`
+			UPDATE journal_entries
+			SET deleted_at = $1, updated_at = $1
+			WHERE tenant_id = $2
+			  AND description LIKE '%' || $3 || '%'
+			  AND deleted_at IS NULL
+		`, now, tenantID, poCode)
+
+		// 2. Reverse inventory deductions: for every 'issue' transaction tied
+		//    to this PO, add the quantity back to its inventory row, then soft-
+		//    delete the transaction so we don't double-undo on a retry.
+		h.db.Exec(`
+			WITH issues AS (
+				SELECT id, inventory_id, quantity
+				FROM inventory_transactions
+				WHERE tenant_id = $1
+				  AND reference_type = 'production_order'
+				  AND reference_id = $2
+				  AND transaction_type = 'issue'
+				  AND deleted_at IS NULL
+			), restore AS (
+				UPDATE inventory inv
+				SET quantity_on_hand = inv.quantity_on_hand + i.quantity,
+				    last_movement_date = $3,
+				    updated_at = $3
+				FROM issues i
+				WHERE inv.id = i.inventory_id
+				RETURNING inv.id
+			)
+			UPDATE inventory_transactions
+			SET deleted_at = $3, updated_at = $3
+			WHERE id IN (SELECT id FROM issues);
+		`, tenantID, id, now)
+
+		// 3. Reverse finished-goods receipts: subtract what was received back
+		//    out of the warehouse, then soft-delete the receipt transactions.
+		h.db.Exec(`
+			WITH receipts AS (
+				SELECT id, inventory_id, quantity
+				FROM inventory_transactions
+				WHERE tenant_id = $1
+				  AND reference_type = 'production_order'
+				  AND reference_id = $2
+				  AND transaction_type = 'receipt'
+				  AND deleted_at IS NULL
+			), restore AS (
+				UPDATE inventory inv
+				SET quantity_on_hand = GREATEST(inv.quantity_on_hand - r.quantity, 0),
+				    last_movement_date = $3,
+				    updated_at = $3
+				FROM receipts r
+				WHERE inv.id = r.inventory_id
+				RETURNING inv.id
+			)
+			UPDATE inventory_transactions
+			SET deleted_at = $3, updated_at = $3
+			WHERE id IN (SELECT id FROM receipts);
+		`, tenantID, id, now)
+
+		// 4. Soft-delete the finished-goods lot(s) created for this PO so they
+		//    don't keep showing on the lot tracking screen.
+		h.db.Exec(`
+			UPDATE inventory_lots
+			SET status = 'consumed', remaining_quantity = 0, updated_at = $1
+			WHERE tenant_id = $2 AND lot_number = 'MFG-' || LEFT($3::text, 8)
+		`, now, tenantID, id)
+
+		// 5. Recompute account balances so 1030 / 2010 / 1330 / 2810 reflect
+		//    reality after the cascade above.
+		h.db.Exec(`
+			WITH totals AS (
+				SELECT a.id AS account_id,
+				       COALESCE(SUM(jel.debit_amount), 0)  AS dt,
+				       COALESCE(SUM(jel.credit_amount), 0) AS kt
+				FROM accounts a
+				LEFT JOIN journal_entry_lines jel ON jel.account_id = a.id
+				LEFT JOIN journal_entries je ON je.id = jel.journal_entry_id
+					AND je.status = 'posted' AND je.deleted_at IS NULL
+				WHERE a.tenant_id = $1
+				GROUP BY a.id
+			)
+			UPDATE accounts a
+			SET current_balance = CASE
+				WHEN at.normal_balance = 'debit' THEN t.dt - t.kt
+				ELSE                                  t.kt - t.dt
+			END,
+			    updated_at = NOW()
+			FROM account_types at, totals t
+			WHERE a.account_type_id = at.id
+			  AND t.account_id = a.id
+			  AND a.tenant_id = $1;
+		`, tenantID)
+
+		h.log.Info("DeleteProductionOrder: cascade cleanup complete", "po_id", id, "po_code", poCode)
+	}
 
 	response.Success(c, map[string]interface{}{"message": "Production order deleted successfully"})
 }
