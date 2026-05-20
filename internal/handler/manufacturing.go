@@ -2114,99 +2114,29 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			"totalPlannedCost", totalPlannedCost,
 			"quantityPlanned", quantityPlanned)
 
+		// PLANNED-COST JOURNAL: intentionally NOT posted at confirm time.
+		//
+		// Previously this block created a "confirmed - planned material cost"
+		// journal entry (Dt 2010 WIP / Kt 1030 Raw Materials) using the BOM
+		// estimate. The problem: the same Dt 2010 / Kt 1030 pair is posted
+		// again at CompleteProductionOrder (line 4 of the WIP cost flow),
+		// so every MO ended up double-charging 1030 and double-debiting 2010.
+		//
+		// Real-world impact (May 2026): 1030 Xom ashyo accumulated a
+		// -21,258,612,507 so'm balance because every MO contributed two
+		// credit lines instead of one. Cleanup SQL was run separately on
+		// the existing data; this guard prevents the bug from recurring.
+		//
+		// Actual material consumption is journalled exactly once, by
+		// StartProductionOrder (when materials are actually issued from
+		// stock) or by CompleteProductionOrder (full WIP→Finished flow).
+		// We still update production_orders.material_cost here because
+		// other parts of the UI read that planned figure.
 		if totalMaterialCost > 0 {
-			wipAcct := findAccount(h.db, tenantID, orgID, "work in progress", "2010")
-			rawAcct := findAccount(h.db, tenantID, orgID, "raw materials", "1030")
-			if rawAcct == uuid.Nil {
-				rawAcct = findAccount(h.db, tenantID, orgID, "goods for resale", "2910")
-			}
-			if rawAcct == uuid.Nil {
-				rawAcct = findAccount(h.db, tenantID, orgID, "inventory", "1010")
-			}
-
-			h.log.Info("Account lookup results", "wipAcct", wipAcct, "rawAcct", rawAcct, "tenant_id", tenantID)
-
-			if wipAcct != uuid.Nil && rawAcct != uuid.Nil {
-				var journalID uuid.UUID
-				var nextNumber int
-				jeErr := h.db.QueryRow(`
-					SELECT id, next_number FROM journals
-					WHERE tenant_id = $1 AND type = 'general' AND is_active = true
-					ORDER BY created_at ASC LIMIT 1
-				`, tenantID).Scan(&journalID, &nextNumber)
-
-				if jeErr != nil {
-					h.log.Warn("No active general journal found, trying any active journal", "tenant_id", tenantID, "error", jeErr)
-					// Fallback: try any active journal
-					jeErr = h.db.QueryRow(`
-						SELECT id, next_number FROM journals
-						WHERE tenant_id = $1 AND is_active = true
-						ORDER BY created_at ASC LIMIT 1
-					`, tenantID).Scan(&journalID, &nextNumber)
-				}
-
-				if jeErr == nil && journalID != uuid.Nil {
-					var poCode string
-					h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poCode)
-					var prodName string
-					h.db.QueryRow(`SELECT COALESCE(p.name, '') FROM production_orders po JOIN products p ON po.product_id = p.id WHERE po.id = $1`, id).Scan(&prodName)
-
-					entryID := uuid.New()
-					entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
-					description := fmt.Sprintf("Production Order %s confirmed - planned material cost", poCode)
-					if prodName != "" {
-						description = fmt.Sprintf("Production Order %s confirmed - %s - planned material cost", poCode, prodName)
-					}
-
-					_, jeInsertErr := h.db.Exec(`
-						INSERT INTO journal_entries (
-							id, tenant_id, organization_id, journal_id, entry_number,
-							entry_date, description, status, total_debit, total_credit,
-							created_at, updated_at
-						) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
-					`, entryID, tenantID, orgID, journalID, entryNumber,
-						now, description, totalMaterialCost, now)
-
-					if jeInsertErr == nil {
-						// Dt 1320 WIP
-						h.db.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, account_id, description,
-								debit_amount, credit_amount, line_number, created_at
-							) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
-						`, uuid.New(), entryID, wipAcct, "WIP: planned materials for production", totalMaterialCost, now)
-
-						// Kt 1310 Raw Materials
-						h.db.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, account_id, description,
-								debit_amount, credit_amount, line_number, created_at
-							) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
-						`, uuid.New(), entryID, rawAcct, "Raw materials committed to production", totalMaterialCost, now)
-
-						// Update account balances
-						h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct)
-						h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct)
-
-						// Increment journal number
-						h.db.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID)
-
-						// Update material_cost on production order
-						h.db.Exec(`UPDATE production_orders SET material_cost = $1 WHERE id = $2`, totalMaterialCost, id)
-
-						h.log.Info("Created planned material cost journal entry for confirmed production order", "order_id", id, "amount", totalMaterialCost)
-					} else {
-						h.log.Error("Failed to insert journal entry for confirmed production order", "error", jeInsertErr, "order_id", id)
-					}
-				} else {
-					h.log.Error("No active journal found for manufacturing journal entry", "tenant_id", tenantID, "error", jeErr)
-				}
-			} else {
-				h.log.Error("WIP or Raw Materials account not found for manufacturing journal entry",
-					"wip_account", wipAcct, "raw_account", rawAcct, "tenant_id", tenantID)
-			}
+			h.db.Exec(`UPDATE production_orders SET material_cost = $1 WHERE id = $2`, totalMaterialCost, id)
+			h.log.Info("Confirm: skipped planned-cost journal (would double-count on complete)", "order_id", id, "planned_material_cost", totalMaterialCost)
 		} else {
-			h.log.Warn("Total material cost is 0 for confirmed production order, no journal entry created", "order_id", id)
+			h.log.Warn("Total material cost is 0 for confirmed production order", "order_id", id)
 		}
 	}
 
