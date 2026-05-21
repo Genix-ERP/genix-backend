@@ -1468,46 +1468,115 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 		}
 		totalNeeded := comp.Quantity * (1 + comp.ScrapPercent/100) * (qtyPlanned / bomOutputQty)
 
-		// Deduct from the PO's warehouse; create the inventory row if missing
-		// so a zero / negative balance still records against the right
-		// warehouse instead of silently skipping the consumption.
-		var invID uuid.UUID
-		var unitCost float64
-		err = tx.QueryRow(`
-			SELECT id, COALESCE(unit_cost, 0) FROM inventory
-			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-			AND lot_number IS NULL AND serial_number IS NULL
-		`, tenantID, comp.ComponentID, warehouseID).Scan(&invID, &unitCost)
-		if err == sql.ErrNoRows {
-			invID = uuid.New()
-			if _, createErr := tx.Exec(`
-				INSERT INTO inventory (
-					id, tenant_id, product_id, warehouse_id,
-					quantity_on_hand, quantity_reserved,
-					last_movement_date, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, 0, 0, $5, $5, $5)
-			`, invID, tenantID, comp.ComponentID, warehouseID, now); createErr != nil {
-				h.log.Error("Failed to create inventory row for work-order consumption",
-					"error", createErr, "component_id", comp.ComponentID,
-					"warehouse_id", warehouseID)
-				continue
+		var compCost float64
+		tx.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
+
+		// Greedy multi-warehouse consumption (see StartProductionOrder for
+		// the full rationale): consume from any warehouse in the org that
+		// has stock, biggest first; fall back to the PO's warehouse for
+		// any remaining shortfall.
+		type src struct {
+			invID    uuid.UUID
+			whID     uuid.UUID
+			unitCost float64
+			onHand   float64
+		}
+		var sources []src
+
+		srcQuery := `
+			SELECT i.id, i.warehouse_id, COALESCE(i.unit_cost, 0), COALESCE(i.quantity_on_hand, 0)
+			FROM inventory i
+			JOIN warehouses w ON w.id = i.warehouse_id
+			WHERE i.tenant_id = $1 AND i.product_id = $2
+			  AND (i.lot_number IS NULL OR i.lot_number = '')
+			  AND (i.serial_number IS NULL OR i.serial_number = '')
+			  AND i.quantity_on_hand > 0
+			  AND w.deleted_at IS NULL`
+		srcArgs := []interface{}{tenantID, comp.ComponentID}
+		if organizationID != nil {
+			srcQuery += ` AND w.organization_id = $3`
+			srcArgs = append(srcArgs, *organizationID)
+		}
+		srcQuery += ` ORDER BY i.quantity_on_hand DESC`
+
+		if sRows, sErr := tx.Query(srcQuery, srcArgs...); sErr == nil {
+			for sRows.Next() {
+				var s src
+				if scanErr := sRows.Scan(&s.invID, &s.whID, &s.unitCost, &s.onHand); scanErr == nil {
+					sources = append(sources, s)
+				}
 			}
-			// unit_cost stays 0 for newly-created rows — pull product default.
-			h.db.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&unitCost)
-		} else if err != nil {
-			continue
+			sRows.Close()
 		}
 
-		tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-			totalNeeded, now, invID)
+		remaining := totalNeeded
+		for _, s := range sources {
+			if remaining <= 0 {
+				break
+			}
+			take := s.onHand
+			if take > remaining {
+				take = remaining
+			}
+			tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+				take, now, s.invID)
+			unitCost := s.unitCost
+			if unitCost == 0 {
+				unitCost = compCost
+			}
+			tx.Exec(`
+				INSERT INTO inventory_transactions (
+					id, tenant_id, organization_id, inventory_id, transaction_type,
+					reference_type, reference_id, quantity, unit_cost, total_cost,
+					reason, notes, transaction_date, created_by, created_at
+				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Materials consumed for production',$9,$10,$9)
+			`, uuid.New(), tenantID, organizationID, s.invID, poID, take, unitCost, take*unitCost, now, userID)
+			remaining -= take
+		}
 
-		tx.Exec(`
-			INSERT INTO inventory_transactions (
-				id, tenant_id, organization_id, inventory_id, transaction_type,
-				reference_type, reference_id, quantity, unit_cost, total_cost,
-				reason, notes, transaction_date, created_by, created_at
-			) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Materials consumed for production',  $9,$10,$9)
-		`, uuid.New(), tenantID, organizationID, invID, poID, totalNeeded, unitCost, totalNeeded*unitCost, now, userID)
+		// Shortfall: book the remainder against the PO's warehouse so the
+		// missing stock is visible there and the planned material cost on
+		// the PO still matches the journal entries.
+		if remaining > 0 && warehouseID != nil {
+			var invID uuid.UUID
+			var unitCost float64
+			lookupErr := tx.QueryRow(`
+				SELECT id, COALESCE(unit_cost, 0) FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+				AND lot_number IS NULL AND serial_number IS NULL
+			`, tenantID, comp.ComponentID, warehouseID).Scan(&invID, &unitCost)
+			if lookupErr == sql.ErrNoRows {
+				invID = uuid.New()
+				if _, createErr := tx.Exec(`
+					INSERT INTO inventory (
+						id, tenant_id, product_id, warehouse_id,
+						quantity_on_hand, quantity_reserved,
+						last_movement_date, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, 0, 0, $5, $5, $5)
+				`, invID, tenantID, comp.ComponentID, warehouseID, now); createErr != nil {
+					h.log.Error("Failed to create fallback inventory row",
+						"error", createErr, "component_id", comp.ComponentID,
+						"warehouse_id", warehouseID)
+					continue
+				}
+				unitCost = compCost
+			} else if lookupErr != nil {
+				continue
+			}
+			if unitCost == 0 {
+				unitCost = compCost
+			}
+
+			tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
+				remaining, now, invID)
+			tx.Exec(`
+				INSERT INTO inventory_transactions (
+					id, tenant_id, organization_id, inventory_id, transaction_type,
+					reference_type, reference_id, quantity, unit_cost, total_cost,
+					reason, notes, transaction_date, created_by, created_at
+				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Materials shortfall — booked to PO warehouse',$9,$10,$9)
+			`, uuid.New(), tenantID, organizationID, invID, poID, remaining, unitCost, remaining*unitCost, now, userID)
+		}
 	}
 
 	tx.Commit()

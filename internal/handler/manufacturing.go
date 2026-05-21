@@ -2484,79 +2484,142 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			compRows.Close()
 			h.log.Info("[v2] BOM components found", "count", len(components), "bom_id", bomID, "po_id", id)
 
-			// Deduct each component from inventory. We deduct in full even when
-			// the on-hand balance is less than needed — the stock goes negative
-			// and the user sees what they're short. This matches how
-			// construction / manufacturing shops actually work (you keep
-			// building even if the storeroom says you're out; the missing
-			// quantity gets reconciled with a purchase or stock count later).
+			// Deduct each component from inventory across multiple warehouses.
+			// Strategy: pull greedily from any warehouse in the same org that
+			// has stock (largest balance first). Only if total available is
+			// still short do we let the PO's warehouse go negative for the
+			// remainder. Previously we always hit the PO's (= BOM finished
+			// goods) warehouse, which made it deeply negative on raw-material
+			// components even when those components sat fully stocked in the
+			// raw-materials warehouse next door.
 			for _, comp := range components {
 				consumption := comp.Quantity * (qtyPlanned / comp.BOMOutputQty) * (1 + comp.ScrapPercent/100)
 
-				// Always deduct from the PO's warehouse. If no inventory row
-				// exists there yet, create one at zero so the negative balance
-				// lands on the correct warehouse instead of some unrelated one
-				// that happened to have the largest stock.
-				var compInvID uuid.UUID
-				compErr := tx.QueryRow(`
-					SELECT id FROM inventory
-					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-					  AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
-					ORDER BY quantity_on_hand DESC LIMIT 1
-				`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
-
-				if compErr == sql.ErrNoRows {
-					// No row in the PO's warehouse yet. Create one so the
-					// consumption lands in the right place (and can go negative).
-					compInvID = uuid.New()
-					if _, createErr := tx.Exec(`
-						INSERT INTO inventory (
-							id, tenant_id, product_id, warehouse_id,
-							quantity_on_hand, quantity_reserved,
-							last_movement_date, created_at, updated_at
-						) VALUES ($1, $2, $3, $4, 0, 0, $5, $5, $5)
-					`, compInvID, tenantID, comp.ComponentID, warehouseID, now); createErr != nil {
-						h.log.Error("Failed to create inventory row for component consumption",
-							"error", createErr, "component_id", comp.ComponentID,
-							"warehouse_id", warehouseID)
-						continue
-					}
-				} else if compErr != nil {
-					h.log.Error("Failed to look up component inventory",
-						"error", compErr, "component_id", comp.ComponentID)
-					continue
-				}
-
-				// Only deduct from inventory if the product tracks inventory.
-				// Products with track_inventory=false (e.g. water, gas) are
-				// treated as infinite supply — their cost still counts in BOM
-				// calculations but their quantity is never reduced.
-				if comp.TrackInventory {
-					if _, deductErr := tx.Exec(`
-						UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
-						WHERE id = $3
-					`, consumption, now, compInvID); deductErr != nil {
-						h.log.Error("Failed to deduct component from inventory", "error", deductErr, "component_id", comp.ComponentID, "qty", consumption)
-						continue
-					}
-				} else {
+				// Non-tracked components (water, gas, etc.) are treated as
+				// infinite supply. Cost still flows via BOM calculations, but
+				// no inventory rows are touched and no transactions emitted.
+				if !comp.TrackInventory {
 					h.log.Info("Skipping inventory deduction for non-tracked component",
 						"component_id", comp.ComponentID, "qty", consumption)
+					continue
 				}
 
 				var compCost float64
 				tx.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
 
-				if _, txErr := tx.Exec(`
-					INSERT INTO inventory_transactions (
-						id, tenant_id, organization_id, inventory_id, transaction_type,
-						reference_type, reference_id, quantity, unit_cost, total_cost,
-						reason, notes, transaction_date, created_by, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
-				`, uuid.New(), tenantID, organizationID, compInvID, entity.TransactionTypeIssue,
-					"production_order", id, -consumption, compCost, consumption*compCost,
-					"material_consumption", "Materials consumed at production start", now, userID); txErr != nil {
-					h.log.Error("Failed to create inventory transaction for component", "error", txErr, "component_id", comp.ComponentID)
+				// Collect candidate source rows: any inventory row in the same
+				// org with positive stock, ordered by largest balance first.
+				type src struct {
+					invID    uuid.UUID
+					whID     uuid.UUID
+					unitCost float64
+					onHand   float64
+				}
+				var sources []src
+
+				srcQuery := `
+					SELECT i.id, i.warehouse_id, COALESCE(i.unit_cost, 0), COALESCE(i.quantity_on_hand, 0)
+					FROM inventory i
+					JOIN warehouses w ON w.id = i.warehouse_id
+					WHERE i.tenant_id = $1 AND i.product_id = $2
+					  AND (i.lot_number IS NULL OR i.lot_number = '')
+					  AND (i.serial_number IS NULL OR i.serial_number = '')
+					  AND i.quantity_on_hand > 0
+					  AND w.deleted_at IS NULL`
+				srcArgs := []interface{}{tenantID, comp.ComponentID}
+				if organizationID != nil {
+					srcQuery += ` AND w.organization_id = $3`
+					srcArgs = append(srcArgs, *organizationID)
+				}
+				srcQuery += ` ORDER BY i.quantity_on_hand DESC`
+
+				if sRows, sErr := tx.Query(srcQuery, srcArgs...); sErr == nil {
+					for sRows.Next() {
+						var s src
+						if scanErr := sRows.Scan(&s.invID, &s.whID, &s.unitCost, &s.onHand); scanErr == nil {
+							sources = append(sources, s)
+						}
+					}
+					sRows.Close()
+				}
+
+				remaining := consumption
+				for _, s := range sources {
+					if remaining <= 0 {
+						break
+					}
+					take := s.onHand
+					if take > remaining {
+						take = remaining
+					}
+					if _, deductErr := tx.Exec(`
+						UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
+						WHERE id = $3
+					`, take, now, s.invID); deductErr != nil {
+						h.log.Error("Failed to deduct component from source warehouse",
+							"error", deductErr, "inv_id", s.invID, "qty", take)
+						continue
+					}
+					unitCost := s.unitCost
+					if unitCost == 0 {
+						unitCost = compCost
+					}
+					tx.Exec(`
+						INSERT INTO inventory_transactions (
+							id, tenant_id, organization_id, inventory_id, transaction_type,
+							reference_type, reference_id, quantity, unit_cost, total_cost,
+							reason, notes, transaction_date, created_by, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
+					`, uuid.New(), tenantID, organizationID, s.invID, entity.TransactionTypeIssue,
+						"production_order", id, -take, unitCost, take*unitCost,
+						"material_consumption", "Materials consumed at production start", now, userID)
+					remaining -= take
+				}
+
+				// Shortfall: any unmet need still has to be booked, otherwise
+				// accounting and the PO's planned material cost won't match
+				// reality. Land it on the PO's warehouse so it's visible there
+				// and reconcilable via a stock count or purchase.
+				if remaining > 0 && warehouseID != nil {
+					var compInvID uuid.UUID
+					lookupErr := tx.QueryRow(`
+						SELECT id FROM inventory
+						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+						  AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
+						ORDER BY quantity_on_hand DESC LIMIT 1
+					`, tenantID, comp.ComponentID, warehouseID).Scan(&compInvID)
+					if lookupErr == sql.ErrNoRows {
+						compInvID = uuid.New()
+						if _, createErr := tx.Exec(`
+							INSERT INTO inventory (
+								id, tenant_id, product_id, warehouse_id,
+								quantity_on_hand, quantity_reserved,
+								last_movement_date, created_at, updated_at
+							) VALUES ($1, $2, $3, $4, 0, 0, $5, $5, $5)
+						`, compInvID, tenantID, comp.ComponentID, warehouseID, now); createErr != nil {
+							h.log.Error("Failed to create fallback inventory row",
+								"error", createErr, "component_id", comp.ComponentID)
+							continue
+						}
+					} else if lookupErr != nil {
+						h.log.Error("Failed to look up fallback inventory",
+							"error", lookupErr, "component_id", comp.ComponentID)
+						continue
+					}
+
+					tx.Exec(`
+						UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
+						WHERE id = $3
+					`, remaining, now, compInvID)
+					tx.Exec(`
+						INSERT INTO inventory_transactions (
+							id, tenant_id, organization_id, inventory_id, transaction_type,
+							reference_type, reference_id, quantity, unit_cost, total_cost,
+							reason, notes, transaction_date, created_by, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
+					`, uuid.New(), tenantID, organizationID, compInvID, entity.TransactionTypeIssue,
+						"production_order", id, -remaining, compCost, remaining*compCost,
+						"material_consumption", "Materials shortfall — booked to PO warehouse", now, userID)
 				}
 			}
 
