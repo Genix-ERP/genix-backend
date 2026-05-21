@@ -63,7 +63,12 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
-	countQuery := `SELECT COUNT(*) FROM sales_orders so WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
+	// Mirror baseQuery's LEFT JOIN to contacts so the search clause below
+	// can reference c.name without breaking the count query (and therefore
+	// pagination) when the user searches by customer name.
+	countQuery := `SELECT COUNT(*) FROM sales_orders so
+		LEFT JOIN contacts c ON so.customer_id = c.id
+		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
 	args := []interface{}{tenantID}
 	argCount := 1
 
@@ -120,9 +125,9 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		baseQuery += fmt.Sprintf(` AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d
 			OR EXISTS (SELECT 1 FROM sales_order_lines sol LEFT JOIN products p ON sol.product_id = p.id WHERE sol.sales_order_id = so.id AND (LOWER(p.name) LIKE $%d OR LOWER(sol.description) LIKE $%d)))`,
 			argCount, argCount, argCount, argCount, argCount, argCount)
-		countQuery += fmt.Sprintf(` AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d
+		countQuery += fmt.Sprintf(` AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d
 			OR EXISTS (SELECT 1 FROM sales_order_lines sol LEFT JOIN products p ON sol.product_id = p.id WHERE sol.sales_order_id = so.id AND (LOWER(p.name) LIKE $%d OR LOWER(sol.description) LIKE $%d)))`,
-			argCount, argCount, argCount, argCount, argCount)
+			argCount, argCount, argCount, argCount, argCount, argCount)
 		args = append(args, searchPattern)
 	}
 
