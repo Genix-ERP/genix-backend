@@ -64,6 +64,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	categoryID := c.Query("category_id")
 	productType := c.Query("type")
 	inventoryType := c.Query("inventory_type")
+	warehouseID := c.Query("warehouse_id") // optional: only return products that have at least one inventory row in this warehouse
 	includeInactive := c.Query("include_inactive") == "true"
 
 	// Build query - products are shared across orgs, org-specific data comes from product_organization_settings
@@ -166,6 +167,36 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		countQuery += fmt.Sprintf(" AND COALESCE(p.inventory_type, 'trade') = $%d", countArgCount)
 		args = append(args, inventoryType)
 		countArgs = append(countArgs, inventoryType)
+	}
+
+	// Warehouse filter: restricts the result to products that have at least one
+	// inventory row in the requested warehouse. The previous frontend
+	// implementation page-filtered client-side, which silently dropped any
+	// product not on the current 20-row page — making the warehouse filter
+	// look broken to users. Validating as a UUID first because warehouse_id
+	// is a UUID column in postgres and a malformed value would otherwise
+	// surface as a 500 from `EXISTS (... WHERE warehouse_id = 'abc')`.
+	if warehouseID != "" {
+		if _, parseErr := uuid.Parse(warehouseID); parseErr == nil {
+			argCount++
+			countArgCount++
+			// Tie the EXISTS subquery to the same tenant ($1) so we don't
+			// leak data across tenants if a UUID collision ever occurred.
+			baseQuery += fmt.Sprintf(` AND EXISTS (
+				SELECT 1 FROM inventory inv
+				WHERE inv.product_id = p.id
+				  AND inv.warehouse_id = $%d
+				  AND inv.tenant_id = $1
+			)`, argCount)
+			countQuery += fmt.Sprintf(` AND EXISTS (
+				SELECT 1 FROM inventory inv
+				WHERE inv.product_id = p.id
+				  AND inv.warehouse_id = $%d
+				  AND inv.tenant_id = $1
+			)`, countArgCount)
+			args = append(args, warehouseID)
+			countArgs = append(countArgs, warehouseID)
+		}
 	}
 
 	if search != "" {
@@ -1260,14 +1291,20 @@ func (h *Handler) DeleteProduct(c *gin.Context) {
 		return
 	}
 
-	// Check for existing inventory
+	// Check for existing inventory. The previous check was `quantity_on_hand > 0`,
+	// which let products with NEGATIVE stock slip through (e.g., when construction
+	// consumption ran ahead of procurement). Soft-deleting such a product orphaned
+	// the negative inventory row — invisible to the products list (it filters by
+	// deleted_at IS NULL) but still dragging warehouse totals down because the
+	// inventory listing did not. Use `<> 0` so any non-zero balance (positive OR
+	// negative) blocks the delete and forces reconciliation first.
 	var hasInventory bool
 	h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM inventory WHERE product_id = $1 AND quantity_on_hand > 0)
+		SELECT EXISTS(SELECT 1 FROM inventory WHERE product_id = $1 AND quantity_on_hand <> 0)
 	`, id).Scan(&hasInventory)
 
 	if hasInventory {
-		response.BadRequest(c, "Cannot delete product with existing inventory. Set to inactive instead.")
+		response.BadRequest(c, "Cannot delete product with non-zero inventory (positive or negative). Reconcile stock first, then set the product to inactive.")
 		return
 	}
 

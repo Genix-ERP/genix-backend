@@ -65,6 +65,13 @@ func (h *Handler) ListInventory(c *gin.Context) {
 	expiryDays, _ := strconv.Atoi(c.DefaultQuery("expiry_days", "30"))
 
 	// Build query
+	// The JOIN to `products` filters out rows belonging to soft-deleted
+	// products. Without this, ghost inventory rows for deleted products are
+	// still returned by the API, which then drags warehouse totals down in
+	// the UI (the products page filters by deleted_at IS NULL, so the
+	// orphans are invisible in the list but still contribute to aggregate
+	// stats). Same filter is applied at line 5343 of this file for the
+	// per-warehouse stock value query, so this matches existing precedent.
 	baseQuery := `
 		SELECT i.id, i.tenant_id, i.product_id, i.warehouse_id, i.location_id,
 			   i.lot_number, i.serial_number, i.expiry_date,
@@ -76,14 +83,14 @@ func (h *Handler) ListInventory(c *gin.Context) {
 			   COALESCE(w.warehouse_type, 'regular') as warehouse_type,
 			   wl.code as location_code, wl.name as location_name
 		FROM inventory i
-		JOIN products p ON i.product_id = p.id
+		JOIN products p ON i.product_id = p.id AND p.deleted_at IS NULL
 		JOIN warehouses w ON i.warehouse_id = w.id
 		LEFT JOIN warehouse_locations wl ON i.location_id = wl.id
 		WHERE i.tenant_id = $1
 	`
 	countQuery := `
 		SELECT COUNT(*) FROM inventory i
-		JOIN products p ON i.product_id = p.id
+		JOIN products p ON i.product_id = p.id AND p.deleted_at IS NULL
 		JOIN warehouses w ON i.warehouse_id = w.id
 		WHERE i.tenant_id = $1
 	`
