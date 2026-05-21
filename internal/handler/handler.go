@@ -1491,6 +1491,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		admin.GET("/users", h.ListAllSystemUsers)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
 		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
+		// /admin/migrations — read-only view over schema_migrations so a
+		// system admin can verify which DB migrations are applied on the
+		// running backend without needing direct psql access. Intended
+		// for production deploy verification.
+		admin.GET("/migrations", h.GetMigrationStatus)
 	}
 
 	// Audit Logs
