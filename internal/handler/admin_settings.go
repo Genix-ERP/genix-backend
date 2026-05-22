@@ -752,7 +752,21 @@ func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, prod
 		}
 	}
 	if ca.StockValuationAccountID == uuid.Nil {
-		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1010")
+		// Try the raw-materials leaf first (NAS code 1030 in most charts;
+		// in some tenants 1030 is named "Yoqilg'i" historically — fall
+		// back through "raw materials" / "1010" for charts where 1010
+		// itself is a leaf rather than a group). Without this multi-step
+		// fallback, every Goods Delivery JE for an org whose 1010 is a
+		// group ended up as a DR-only entry — the credit silently failed
+		// because findAccount("inventory","1010") returned uuid.Nil and
+		// the INSERT FK was rejected without anyone noticing.
+		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "xom ashyo", "1030")
+		if ca.StockValuationAccountID == uuid.Nil {
+			ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "raw materials", "1010")
+		}
+		if ca.StockValuationAccountID == uuid.Nil {
+			ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1010")
+		}
 	}
 	if ca.StockInputAccountID == uuid.Nil {
 		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "6015")
