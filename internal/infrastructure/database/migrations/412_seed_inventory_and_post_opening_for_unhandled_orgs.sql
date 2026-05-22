@@ -148,6 +148,14 @@ BEGIN
         LIMIT 1;
 
         IF v_inv_acct_id IS NULL THEN
+            -- ON CONFLICT DO NOTHING: the SELECT above filters
+            -- deleted_at IS NULL, but the unique constraint
+            -- accounts_tenant_id_organization_id_code_key applies to
+            -- every row regardless of soft-delete. If 1010 exists but
+            -- was soft-deleted, the SELECT misses it and a plain
+            -- INSERT would crash the whole migration on the unique
+            -- violation (this is why 412 was blocking startup in
+            -- production). Same pattern as the equity branch below.
             INSERT INTO accounts (
                 id, tenant_id, organization_id, account_type_id,
                 code, name, description,
@@ -170,8 +178,30 @@ BEGIN
                 NOW(),
                 NOW()
             )
+            ON CONFLICT (tenant_id, organization_id, code) DO NOTHING
             RETURNING id INTO v_inv_acct_id;
-            created_1010 := created_1010 + 1;
+
+            -- If ON CONFLICT fired, the row exists (possibly with
+            -- deleted_at set). Re-read its id — if it's soft-deleted,
+            -- undelete it so the opening JE can land on a live row.
+            IF v_inv_acct_id IS NULL THEN
+                UPDATE accounts
+                   SET deleted_at = NULL,
+                       is_active = true,
+                       updated_at = NOW()
+                WHERE tenant_id = pair.tenant_id
+                  AND organization_id = pair.organization_id
+                  AND code = v_inv_acct_code
+                RETURNING id INTO v_inv_acct_id;
+            ELSE
+                created_1010 := created_1010 + 1;
+            END IF;
+
+            IF v_inv_acct_id IS NULL THEN
+                RAISE WARNING 'Could not create or find inventory leaf 1010 for tenant=% org=%; skipping',
+                    pair.tenant_id, pair.organization_id;
+                CONTINUE;
+            END IF;
         END IF;
 
         -- ============================================================
