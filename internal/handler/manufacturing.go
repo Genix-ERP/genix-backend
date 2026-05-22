@@ -2649,13 +2649,18 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 
 					if totalMaterialCost > 0 {
 						wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
-						rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
-						// Fallback: try goods for resale (1340) if raw materials not found
+						// Raw-materials account is NAS code 1010 (Xom ashyo va
+						// materiallar). Code 1030 is Yoqilg'i (Fuel) — it
+						// was incorrectly used as the primary here, which
+						// is what migration 411 had to clean up after the
+						// fact. Use 1010 first, then fall back to 2910
+						// (merchandise) for trading tenants without 1010.
+						rawAcct := findAccount(h.db, tenantID, organizationID, "xom ashyo", "1010")
 						if rawAcct == uuid.Nil {
-							rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "2910")
+							rawAcct = findAccount(h.db, tenantID, organizationID, "raw materials", "1010")
 						}
 						if rawAcct == uuid.Nil {
-							rawAcct = findAccount(h.db, tenantID, organizationID, "inventory", "1010")
+							rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "2910")
 						}
 
 						if wipAcct != uuid.Nil && rawAcct != uuid.Nil {
@@ -3193,12 +3198,15 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 			wipAcct = findAccount(h.db, tenantID, organizationID, "незавершенное производство", "2010")
 		}
 
-		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
+		// Raw-materials account is NAS code 1010 (Xom ashyo va materiallar).
+		// 1030 is Yoqilg'i (Fuel) and was the wrong default — see the
+		// matching fix in the start-MO JE branch and migration 411.
+		rawAcct := findAccount(h.db, tenantID, organizationID, "xom ashyo", "1010")
 		if rawAcct == uuid.Nil {
-			rawAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1030")
+			rawAcct = findAccount(h.db, tenantID, organizationID, "raw materials", "1010")
 		}
 		if rawAcct == uuid.Nil {
-			rawAcct = findAccount(h.db, tenantID, organizationID, "материал", "1030")
+			rawAcct = findAccount(h.db, tenantID, organizationID, "материал", "1010")
 		}
 
 		finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "2810")
@@ -3580,9 +3588,12 @@ func (h *Handler) returnUnusedComponents(
 
 	// Journal entry: Dt Raw Materials / Kt WIP (reverse the unused portion)
 	if totalReturnCost > 0 {
-		rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
+		// Raw-materials account is NAS code 1010 (Xom ashyo va materiallar).
+		// 1030 is Yoqilg'i (Fuel) — was the wrong primary, see the
+		// matching fixes in the start-MO and complete-MO JE branches.
+		rawAcct := findAccount(h.db, tenantID, organizationID, "xom ashyo", "1010")
 		if rawAcct == uuid.Nil {
-			rawAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1030")
+			rawAcct = findAccount(h.db, tenantID, organizationID, "raw materials", "1010")
 		}
 		if rawAcct == uuid.Nil {
 			rawAcct = findAccount(h.db, tenantID, organizationID, "goods for resale", "2910")

@@ -774,7 +774,16 @@ func getInventoryAccountByType(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID
 
 	switch inventoryType {
 	case "raw":
-		return findAccount(q, tenantID, orgID, "raw materials", "1030")
+		// NAS code 1010 (Xom ashyo va materiallar). 1030 is Yoqilg'i
+		// (Fuel) and was the wrong default — same bug fixed in the
+		// manufacturing/work-order JE branches. Purchase-receipt JEs
+		// flow through here, so leaving 1030 in place would keep
+		// crediting Fuel for every raw-material receipt.
+		acct := findAccount(q, tenantID, orgID, "xom ashyo", "1010")
+		if acct == uuid.Nil {
+			acct = findAccount(q, tenantID, orgID, "raw materials", "1010")
+		}
+		return acct
 	case "finished":
 		return findAccount(q, tenantID, orgID, "finished goods", "2810")
 	case "trade":
