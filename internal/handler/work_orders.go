@@ -1461,6 +1461,24 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 	}
 	defer tx.Rollback()
 
+	// Accumulate per-component consumption (qty × cost) during the
+	// loop so we can post one GL JE per component AFTER the tx commits.
+	// Posting after commit (rather than inside the tx) means a GL
+	// failure never rolls back the production-order consumption — the
+	// reconcile admin endpoint will surface any residual gap and a
+	// backfill keyed by `WO-CONS-<poID>-<componentID>` can re-attempt.
+	//
+	// We collect per-component because BOM consumption may pull from
+	// multiple lots/warehouses for one component; aggregating to a
+	// single JE per component keeps GL output proportional to BOM
+	// granularity rather than lot granularity.
+	type consAcc struct {
+		componentID uuid.UUID
+		qty         float64
+		cost        float64 // accumulated total_cost across all sources
+	}
+	consAggMap := make(map[uuid.UUID]*consAcc, len(components))
+
 	for _, comp := range components {
 		bomOutputQty := comp.BOMOutputQty
 		if bomOutputQty <= 0 {
@@ -1531,6 +1549,15 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 					reason, notes, transaction_date, created_by, created_at
 				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Materials consumed for production',$9,$10,$9)
 			`, uuid.New(), tenantID, organizationID, s.invID, poID, take, unitCost, take*unitCost, now, userID)
+			// Accumulate this lot's consumption into the per-component
+			// total for post-commit GL posting.
+			acc, ok := consAggMap[comp.ComponentID]
+			if !ok {
+				acc = &consAcc{componentID: comp.ComponentID}
+				consAggMap[comp.ComponentID] = acc
+			}
+			acc.qty += take
+			acc.cost += take * unitCost
 			remaining -= take
 		}
 
@@ -1576,10 +1603,55 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 					reason, notes, transaction_date, created_by, created_at
 				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Materials shortfall — booked to PO warehouse',$9,$10,$9)
 			`, uuid.New(), tenantID, organizationID, invID, poID, remaining, unitCost, remaining*unitCost, now, userID)
+			// Accumulate shortfall consumption for post-commit GL posting.
+			acc, ok := consAggMap[comp.ComponentID]
+			if !ok {
+				acc = &consAcc{componentID: comp.ComponentID}
+				consAggMap[comp.ComponentID] = acc
+			}
+			acc.qty += remaining
+			acc.cost += remaining * unitCost
 		}
 	}
 
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		h.log.Error("consumeBOMComponents: tx commit failed",
+			"error", err, "po_id", poID)
+		return
+	}
+
+	// POST-COMMIT GL POSTING — DR cost-of-materials / CR inventory, one
+	// JE per consumed component. Sister handler StartProductionOrder in
+	// manufacturing.go already posts this leg; consumeBOMComponents
+	// (called from StartWorkOrder) historically didn't, which is what
+	// produced the LUXURYMEBEL part of the +334M Buxgalteriya-vs-Ombor
+	// drift by mid-2026 (LUXURYMEBEL uses the work-order start path).
+	//
+	// Posting after commit keeps a GL failure from rolling back the
+	// production consumption — the reconcile admin endpoint will
+	// surface any residual gap, and the idempotency key
+	// (`WO-CONS-<poID>-<componentID>`) makes a backfill safe.
+	for _, acc := range consAggMap {
+		if acc.qty <= 0 || acc.cost <= 0 {
+			continue
+		}
+		// Effective unit cost = weighted average across the lots we
+		// actually consumed (acc.cost / acc.qty). This matches the
+		// inventory_transactions rows that were just written.
+		effectiveUnitCost := acc.cost / acc.qty
+		h.postInventoryConsumptionJE(h.db, postInventoryConsumptionArgs{
+			TenantID:       tenantID,
+			OrganizationID: organizationID,
+			ProductID:      acc.componentID,
+			Quantity:       acc.qty,
+			UnitCost:       effectiveUnitCost,
+			SourceType:     "production_order_consume",
+			SourceID:       poID,
+			IdempotencyKey: fmt.Sprintf("WO-CONS-%s-%s", poID.String(), acc.componentID.String()),
+			Description: fmt.Sprintf("Production order %s — BOM component consumption",
+				poID.String()[:8]),
+		})
+	}
 }
 
 // receiveFinishedGoods adds the produced quantity of the finished product to inventory.
@@ -2296,6 +2368,35 @@ func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
 					reason, notes, transaction_date, created_by, created_at
 				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Work order material consumption',$9,$10,$9)
 			`, uuid.New(), tenantID, organizationID, invID, poID, input.Quantity, invUnitCost, input.Quantity*invUnitCost, now, userID)
+
+			// GL posting — DR cost-of-materials / CR inventory. Before
+			// this call, AddWorkOrderMaterial decremented inventory and
+			// wrote an inventory_transactions row but never posted the
+			// offsetting JE, contributing to the Buxgalteriya-vs-Ombor
+			// drift on LUXURYMEBEL. Idempotency key uses the new
+			// work_order_materials row id (`id`) which is fresh on
+			// every successful add.
+			//
+			// Unit cost preference: stored inventory unit_cost ↦
+			// fallback to the input/product cost we already resolved
+			// above. Matches the cost basis written to
+			// inventory_transactions.
+			effectiveUnitCost := invUnitCost
+			if effectiveUnitCost == 0 {
+				effectiveUnitCost = unitCost
+			}
+			h.postInventoryConsumptionJE(h.db, postInventoryConsumptionArgs{
+				TenantID:       tenantID,
+				OrganizationID: organizationID,
+				ProductID:      input.ProductID,
+				Quantity:       input.Quantity,
+				UnitCost:       effectiveUnitCost,
+				SourceType:     "work_order_material_add",
+				SourceID:       id,
+				IdempotencyKey: fmt.Sprintf("WO-MAT-%s", id.String()),
+				Description: fmt.Sprintf("Work order material — %s × %.2f %s",
+					productName, input.Quantity, input.UOM),
+			})
 		}
 	}
 
