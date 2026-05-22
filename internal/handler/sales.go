@@ -1466,13 +1466,26 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 				}
 			}
 
-			// Group by account pair
+			// Group by account pair. Skip lines whose Debit or Credit
+			// account resolved to uuid.Nil — without this guard, the
+			// CR INSERT below silently fails (FK rejects Nil account_id
+			// but Go code ignores the error), leaving a permanently
+			// imbalanced DR-only JE in the ledger. This was the source
+			// of 50+ "Goods Delivery" JEs with no CR side.
 			type acctPair struct {
 				Debit  uuid.UUID
 				Credit uuid.UUID
 			}
 			grouped := make(map[acctPair]float64)
 			for _, sl := range soLines {
+				if sl.OutputAcct == uuid.Nil || sl.ValuationAcct == uuid.Nil {
+					h.log.Warn("Stock-movement JE: skipping product with unresolved account",
+						"product_id", sl.ProductID.String(),
+						"output_acct", sl.OutputAcct.String(),
+						"valuation_acct", sl.ValuationAcct.String(),
+						"amount", sl.CostAmount)
+					continue
+				}
 				key := acctPair{Debit: sl.OutputAcct, Credit: sl.ValuationAcct}
 				grouped[key] += sl.CostAmount
 			}
