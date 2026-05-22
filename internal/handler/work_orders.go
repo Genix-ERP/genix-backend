@@ -1972,7 +1972,14 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 
 	// Look up accounts
 	wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
-	rawAcct := findAccount(h.db, tenantID, organizationID, "raw materials", "1030")
+	// Raw-materials account is NAS code 1010 (Xom ashyo va materiallar).
+	// 1030 is Yoqilg'i (Fuel) — was the wrong primary and is what
+	// migration 411 had to clean up post-hoc. Same fix applied in
+	// manufacturing.go (start, complete, return-to-WIP JEs).
+	rawAcct := findAccount(h.db, tenantID, organizationID, "xom ashyo", "1010")
+	if rawAcct == uuid.Nil {
+		rawAcct = findAccount(h.db, tenantID, organizationID, "raw materials", "1010")
+	}
 	finishedAcct := findAccount(h.db, tenantID, organizationID, "finished goods", "2810")
 	machineAcct := findAccount(h.db, tenantID, organizationID, "accrued machine", "2590")
 	salaryAcct := findAccount(h.db, tenantID, organizationID, "accrued salaries", "6710")
