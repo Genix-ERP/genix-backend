@@ -1496,6 +1496,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// running backend without needing direct psql access. Intended
 		// for production deploy verification.
 		admin.GET("/migrations", h.GetMigrationStatus)
+
+		// /admin/inventory-reconcile — diagnostic view that lines up the
+		// inventory MODULE total (Ombor "Jami qiymat") against the
+		// inventory GL ACCOUNT balance (Buxgalteriya "Xom ashyo")
+		// per (tenant, organization), with top contributing products.
+		// Use to pinpoint which org / product is driving any gap.
+		// Read-only, system-admin gated by the parent group.
+		admin.GET("/inventory-reconcile", h.GetInventoryReconcile)
 	}
 
 	// Audit Logs

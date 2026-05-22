@@ -636,6 +636,42 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 			continue
 		}
 
+		// GL posting — DR cost-of-materials / CR inventory, posted
+		// AFTER the inventory-decrement tx commits so a transient JE
+		// failure (missing journal, missing chart accounts, trigger
+		// hiccup) never rolls back the user's reservation approval.
+		// Before this call, this loop wrote only to
+		// construction_expense_lines (a module-local cost row), never
+		// to journal_entries. That left the inventory GL account
+		// untouched when goods left stock, which is what produced
+		// the +334M Buxgalteriya-vs-Ombor drift across EVROPLIT and
+		// LUXURYMEBEL by mid-2026.
+		//
+		// Trade-off: if the server crashes between commit and JE
+		// post, we have stock decremented but no JE. The reconcile
+		// admin endpoint (/admin/inventory-reconcile) will surface
+		// that gap, and the idempotency key here means it's safe to
+		// re-run a backfill that posts missing JEs by reservation
+		// UUID without double-posting for events that did succeed.
+		//
+		// Idempotency: the reservation UUID is unique per row.
+		// Reconfirms-after-reject create new reservations (the
+		// previous batch is set to 'cancelled' by
+		// cancelMaterialsForWork), so a reconfirm posts a fresh JE
+		// rather than being silently deduped.
+		h.postInventoryConsumptionJE(h.db, postInventoryConsumptionArgs{
+			TenantID:       tenantID,
+			OrganizationID: r.OrgID,
+			ProductID:      r.ProductID,
+			Quantity:       r.Quantity,
+			UnitCost:       r.UnitCost,
+			SourceType:     "construction_yakuniy_reservation",
+			SourceID:       r.ID,
+			IdempotencyKey: fmt.Sprintf("CONS-YAK-RES-%s", r.ID.String()),
+			Description: fmt.Sprintf("Yakunlangan ish #%d — reservation %s",
+				workID, r.ID.String()[:8]),
+		})
+
 		approved++
 	}
 
@@ -821,12 +857,46 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 				`, tenantID, subProductID, subWarehouse)
 			}
 
-			// Write the per-resource expense (the idempotency marker).
-			subOrgIDArg := interface{}(nil)
+			// GL posting for the estimate-sweep path — DR cost-of-
+			// materials / CR inventory. Same reason as the reservation
+			// loop above: the existing code wrote only to
+			// construction_expense_lines, never to journal_entries,
+			// leaving the GL drifted from physical. The expense-line
+			// existence check at the top of this iteration is the
+			// outer idempotency guard, and the helper's own JE-
+			// reference check is the inner guard, so re-runs are safe
+			// twice over.
+			//
+			// Idempotency key uses (work, sub) IDs so each estimate-
+			// line resource gets a unique JE per work confirmation.
+			var subOrgPtr *uuid.UUID
 			if workOrgID.Valid {
 				if u, err := uuid.Parse(workOrgID.String); err == nil {
-					subOrgIDArg = u
+					subOrgPtr = &u
 				}
+			}
+			if subProductID != uuid.Nil {
+				h.postInventoryConsumptionJE(h.db, postInventoryConsumptionArgs{
+					TenantID:       tenantID,
+					OrganizationID: subOrgPtr,
+					ProductID:      subProductID,
+					Quantity:       consumed,
+					UnitCost:       subUnitRate,
+					SourceType:     "construction_yakuniy_sweep",
+					// journal_entries.source_id is UUID; subID is int64
+					// (construction_estimate_line.id). The idempotency
+					// key already encodes (sub, work) for traceability,
+					// so leaving source_id NULL here is the safe choice.
+					SourceID:       nil,
+					IdempotencyKey: fmt.Sprintf("CONS-YAK-SUB-%d-W%d", subID, workID),
+					Description:    expenseDesc,
+				})
+			}
+
+			// Write the per-resource expense (the idempotency marker).
+			subOrgIDArg := interface{}(nil)
+			if subOrgPtr != nil {
+				subOrgIDArg = *subOrgPtr
 			}
 			// approved_by → NULL: the column FKs to employees(id), and
 			// the user confirming YAKUNIY may not have a matching
