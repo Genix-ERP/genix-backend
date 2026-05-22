@@ -184,8 +184,16 @@ func Load() (*Config, error) {
 			Port:           getEnvAsInt("APP_PORT", 8080),
 			BaseURL:        getEnv("APP_BASE_URL", "http://localhost:8080"),
 			FrontendURL:    getEnv("FRONTEND_URL", "http://localhost:5173"),
-			ReadTimeout:    getEnvAsDuration("APP_READ_TIMEOUT", 15*time.Second),
-			WriteTimeout:   getEnvAsDuration("APP_WRITE_TIMEOUT", 15*time.Second),
+			// Read/Write timeouts cover the WHOLE request lifecycle including
+			// body upload, so on slow connections they need to be generous
+			// enough for big uploads (e.g. a 3000-line resurs import is
+			// 2–3 MB of JSON; at 100 kbps that's >4 minutes just to upload).
+			// 5 minutes matches the frontend's per-endpoint timeout for the
+			// bulk-estimate-import call. Can still be overridden via the
+			// APP_READ_TIMEOUT / APP_WRITE_TIMEOUT env vars on production
+			// boxes where a fronting proxy enforces its own limits.
+			ReadTimeout:    getEnvAsDuration("APP_READ_TIMEOUT", 5*time.Minute),
+			WriteTimeout:   getEnvAsDuration("APP_WRITE_TIMEOUT", 5*time.Minute),
 			IdleTimeout:    getEnvAsDuration("APP_IDLE_TIMEOUT", 60*time.Second),
 			RequestTimeout: getEnvAsDuration("APP_REQUEST_TIMEOUT", 30*time.Second),
 			Debug:          getEnvAsBool("APP_DEBUG", false),
