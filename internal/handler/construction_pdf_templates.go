@@ -450,3 +450,146 @@ func (h *Handler) renderForma19HTML(actID int64, tenantID uuid.UUID, projectName
 	b.WriteString(`</body></html>`)
 	return b.String()
 }
+
+// renderGenericActHTML produces a simple PDF for act types that don't
+// have a regulated form layout — currently "acceptance" (Qabul qilish)
+// and "defect" (Nuqson). The Russian/Uzbek construction industry only
+// standardises Forma 2 / 3 / 19; acceptance and defect acts are
+// project-specific, so we emit a neutral document with:
+//
+//   • Header titled per act type ("AKT QABUL QILISH" / "NUQSONLAR
+//     AKTI"), localized in Russian below.
+//   • Project info block (name, address, period).
+//   • Notes section (act.notes) — typically the acceptance criteria
+//     or the defect description the user entered.
+//   • Line items table (if any rows are linked) — uses the same
+//     construction_act_line layout the other forms use.
+//   • Amount-total line.
+//   • Two-column signature block for contractor + client.
+//
+// This keeps the user from hitting the "PDF eksport qo'llab-quvvatlanmaydi"
+// 400 they used to get for these types.
+func (h *Handler) renderGenericActHTML(actID int64, tenantID uuid.UUID, actType, projectName, projectAddress, clientName string) string {
+	var b strings.Builder
+
+	var name, notes string
+	var periodFrom, periodTo sql.NullTime
+	var amountTotal float64
+	h.db.QueryRow(`
+		SELECT a.name, COALESCE(a.notes, ''), a.period_from, a.period_to, a.amount_total
+		FROM construction_act a WHERE a.id = $1 AND a.tenant_id = $2
+	`, actID, tenantID).Scan(&name, &notes, &periodFrom, &periodTo, &amountTotal)
+
+	// Pick the document title based on type. Both shown bilingually so
+	// the printed PDF reads naturally for the Uzbek+Russian audiences
+	// this app serves.
+	var titleUz, titleRu string
+	switch actType {
+	case "acceptance":
+		titleUz, titleRu = "AKT QABUL QILISH", "АКТ ПРИЁМКИ"
+	case "defect":
+		titleUz, titleRu = "NUQSONLAR AKTI", "АКТ ДЕФЕКТОВ"
+	default:
+		titleUz, titleRu = "AKT", "АКТ"
+	}
+
+	// Portrait page is fine here — no wide line tables like Forma 2.
+	b.WriteString(fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="UTF-8"><style>%s
+		@page { size: A4; margin: 14mm; }
+		.notes-block { border: 1px solid #000; padding: 8px 10px; margin: 8px 0 12px 0; min-height: 80px; font-size: 10pt; white-space: pre-wrap; }
+		.notes-empty { color: #999; font-style: italic; }
+	</style></head><body>`, pdfBaseCSS))
+
+	b.WriteString(fmt.Sprintf(`<h1 class="title">%s</h1>`, esc(titleUz)))
+	b.WriteString(fmt.Sprintf(`<h2 class="subtitle">%s</h2>`, esc(titleRu)))
+	if name != "" {
+		b.WriteString(fmt.Sprintf(`<p style="text-align:center;font-size:11pt;margin:2px 0 12px 0">№ %s</p>`, esc(name)))
+	}
+
+	// Parties / project info block.
+	b.WriteString(`<table class="parties">`)
+	b.WriteString(fmt.Sprintf(`<tr><td class="lbl">Объект:</td><td class="val" colspan="3">%s</td></tr>`, esc(projectName)))
+	if projectAddress != "" {
+		b.WriteString(fmt.Sprintf(`<tr><td class="lbl">Адрес:</td><td class="val" colspan="3">%s</td></tr>`, esc(projectAddress)))
+	}
+	if clientName != "" {
+		b.WriteString(fmt.Sprintf(`<tr><td class="lbl">Заказчик:</td><td class="val" colspan="3">%s</td></tr>`, esc(clientName)))
+	}
+	if periodFrom.Valid && periodTo.Valid {
+		b.WriteString(fmt.Sprintf(`<tr><td class="lbl">Период:</td><td class="val" colspan="3">%s — %s</td></tr>`,
+			periodFrom.Time.Format("02.01.2006"), periodTo.Time.Format("02.01.2006")))
+	}
+	b.WriteString(`</table>`)
+
+	// Notes / description block — main free-text content for
+	// acceptance/defect acts.
+	b.WriteString(`<p style="font-weight:bold;margin:10px 0 4px 0">Описание / Tavsif:</p>`)
+	if strings.TrimSpace(notes) == "" {
+		b.WriteString(`<div class="notes-block notes-empty">— описание не заполнено —</div>`)
+	} else {
+		b.WriteString(fmt.Sprintf(`<div class="notes-block">%s</div>`, esc(notes)))
+	}
+
+	// Lines table — same shape as the other render functions for
+	// consistency, but column set trimmed since these acts don't carry
+	// rates/totals the way Forma 2 does.
+	rows, err := h.db.Query(`
+		SELECT name, uom, quantity, unit_rate, total_amount
+		FROM construction_act_line WHERE act_id = $1 ORDER BY sort_order ASC, id ASC
+	`, actID)
+	if err == nil {
+		defer rows.Close()
+		lineRows := make([]struct {
+			name      string
+			uom       string
+			quantity  float64
+			unitRate  float64
+			totalAmt  float64
+		}, 0)
+		for rows.Next() {
+			var r struct {
+				name      string
+				uom       string
+				quantity  float64
+				unitRate  float64
+				totalAmt  float64
+			}
+			if scanErr := rows.Scan(&r.name, &r.uom, &r.quantity, &r.unitRate, &r.totalAmt); scanErr == nil {
+				lineRows = append(lineRows, r)
+			}
+		}
+		if len(lineRows) > 0 {
+			b.WriteString(`<table class="data">`)
+			b.WriteString(`<tr><th style="width:6%">№</th><th>Наименование</th><th style="width:10%">Ед.</th><th style="width:12%">Кол-во</th><th style="width:14%">Цена</th><th style="width:14%">Сумма</th></tr>`)
+			var sum float64
+			for i, r := range lineRows {
+				b.WriteString(fmt.Sprintf(`<tr><td class="center">%d</td><td>%s</td><td class="center">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td></tr>`,
+					i+1, esc(r.name), esc(r.uom),
+					fmtMoney(r.quantity), fmtMoney(r.unitRate), fmtMoney(r.totalAmt)))
+				sum += r.totalAmt
+			}
+			b.WriteString(fmt.Sprintf(`<tr class="total-row"><td colspan="5" class="num">ИТОГО:</td><td class="num">%s</td></tr>`,
+				fmtMoney(sum)))
+			b.WriteString(`</table>`)
+		}
+	}
+
+	// Amount summary — falls back to act.amount_total when no lines
+	// exist (acceptance acts often have just a global sum).
+	if amountTotal > 0 {
+		b.WriteString(fmt.Sprintf(`<p class="amount-in-words">Общая сумма: %s сум</p>`, fmtMoney(amountTotal)))
+	}
+
+	// Signature block — universal contractor + client pair. Real
+	// signing happens via the construction_act_signature flow; the
+	// printed PDF just leaves the lines for ink signatures.
+	b.WriteString(`<table class="signatures">`)
+	b.WriteString(`<tr>`)
+	b.WriteString(`<td><b>Подрядчик / Pudratchi:</b><br><br><span class="sig-line"></span><br><span style="font-size:9pt;color:#666">(подпись, ФИО, дата)</span></td>`)
+	b.WriteString(`<td><b>Заказчик / Buyurtmachi:</b><br><br><span class="sig-line"></span><br><span style="font-size:9pt;color:#666">(подпись, ФИО, дата)</span></td>`)
+	b.WriteString(`</tr></table>`)
+
+	b.WriteString(fmt.Sprintf(`<p style="font-size:9pt;color:#666;margin-top:30px">Hujjat yaratilgan: %s</p>`, time.Now().Format("02.01.2006 15:04")))
+	b.WriteString(`</body></html>`)
+	return b.String()
+}
