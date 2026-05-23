@@ -2,6 +2,7 @@ package handler
 
 import (
 	"github.com/genixerp/genix-backend/internal/config"
+	"github.com/genixerp/genix-backend/internal/crm"
 	"github.com/genixerp/genix-backend/internal/infrastructure/cache"
 	"github.com/genixerp/genix-backend/internal/infrastructure/database"
 	"github.com/genixerp/genix-backend/internal/infrastructure/email"
@@ -26,6 +27,11 @@ type Handler struct {
 	icSync         *service.IntercompanySyncService
 	perm           *middleware.PermissionChecker
 	multicardClient *payment.Client
+	// crmSync pushes construction photo reports into the Yuksalish CRM.
+	// nil-safe at the call sites (see CreatePhotoReport): if env vars
+	// aren't set, syncer is constructed but reports itself as
+	// not-configured and every Enqueue is a no-op.
+	crmSync         *crm.Syncer
 }
 
 // NewHandler creates a new handler instance
@@ -46,8 +52,13 @@ func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, l
 			cfg.Multicard.StoreID,
 			cfg.Multicard.BaseURL,
 		),
+		crmSync: crm.NewSyncer(db.DB, log),
 	}
 }
+
+// CRMSyncer exposes the syncer to main() for starting the background
+// retry worker.
+func (h *Handler) CRMSyncer() *crm.Syncer { return h.crmSync }
 
 // RegisterRoutes registers all API routes
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -1922,6 +1933,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/buildings", h.perm.Require("construction", "project", "create"), h.CreateConstructionBuilding)
 		constructionProjects.PUT("/:id/buildings/:building_id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionBuilding)
 		constructionProjects.DELETE("/:id/buildings/:building_id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionBuilding)
+		// CRM linkage — set/clear crm_project_id on the project and
+		// crm_block_id / current_crm_stage / auto_sync on the building.
+		constructionProjects.PUT("/:id/crm-link", h.perm.Require("construction", "project", "update"), h.UpdateProjectCRMLink)
+		constructionProjects.PUT("/:id/buildings/:building_id/crm-link", h.perm.Require("construction", "project", "update"), h.UpdateBuildingCRMLink)
 		// Building Files
 		constructionProjects.GET("/:id/buildings/:building_id/files", h.ListBuildingFiles)
 		constructionProjects.POST("/:id/buildings/:building_id/files", h.perm.Require("construction", "project", "create"), h.CreateBuildingFile)
@@ -2304,6 +2319,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		photoReports.GET("/:id", h.GetPhotoReport)
 		photoReports.PUT("/:id", h.perm.Require("construction", "reports", "submit"), h.UpdatePhotoReport)
 		photoReports.DELETE("/:id", h.perm.Require("construction", "reports", "submit"), h.DeletePhotoReport)
+		// Manual re-sync to CRM (used after a failure or when the building
+		// was re-linked after the report was created).
+		photoReports.POST("/:id/resync-crm", h.perm.Require("construction", "reports", "submit"), h.ResyncPhotoReportToCRM)
+	}
+
+	// CRM proxy + linkage endpoints (used by the construction page UI to
+	// populate dropdowns when configuring the project↔CRM-project and
+	// building↔CRM-block links).
+	constructionCRM := rg.Group("/construction/crm")
+	constructionCRM.Use(h.perm.Require("construction", "project", "read"))
+	{
+		constructionCRM.GET("/projects", h.ListCRMProjects)
+		constructionCRM.GET("/blocks", h.ListCRMBlocks)
 	}
 
 	// Material Usage (direct access)
