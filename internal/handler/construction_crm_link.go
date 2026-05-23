@@ -15,6 +15,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/genixerp/genix-backend/internal/crm"
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -178,7 +179,7 @@ func (h *Handler) UpdateBuildingCRMLink(c *gin.Context) {
 	argCount++
 	args = append(args, tenantID)
 
-	q := "UPDATE construction_buildings SET " + joinStrings(updates, ", ") +
+	q := "UPDATE construction_buildings SET " + strings.Join(updates, ", ") +
 		", updated_date = NOW() WHERE id = $" + strconv.Itoa(argCount-1) +
 		" AND tenant_id = $" + strconv.Itoa(argCount)
 	if _, err := h.db.Exec(q, args...); err != nil {
@@ -220,18 +221,6 @@ func (h *Handler) ResyncPhotoReportToCRM(c *gin.Context) {
 	response.Success(c, map[string]string{"message": "Re-sync queued"})
 }
 
-// joinStrings is a tiny strings.Join shim so we don't import strings just
-// for one line.
-func joinStrings(parts []string, sep string) string {
-	if len(parts) == 0 {
-		return ""
-	}
-	out := parts[0]
-	for _, p := range parts[1:] {
-		out += sep + p
-	}
-	return out
-}
 
 // suppress unused import in case http isn't referenced after future refactors
 var _ = http.StatusOK
