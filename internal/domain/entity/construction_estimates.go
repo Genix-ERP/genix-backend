@@ -177,6 +177,19 @@ type ConstructionEstimateLine struct {
 	OriginalQuantity float64 `json:"original_quantity" db:"original_quantity"`
 	OriginalUnitRate float64 `json:"original_unit_rate" db:"original_unit_rate"`
 
+	// ImportedQuantity / ImportedTotal (migration 400) preserve the
+	// Ресурс XLSX file's "Количество" and "Сметная стоимость в базисном
+	// уровне" columns verbatim. These are DISPLAY-ONLY — the rest of the
+	// system (cost cascade, NORMA pill, FAKT ledger, Reja vs Fakt budget
+	// summary, top-ups, approval workflow) deliberately ignores them so
+	// existing business logic is not affected. Nullable on the DB side
+	// because non-resurs imports and rows that predate the migration
+	// leave them empty. The MarshalJSON below emits the numeric value or
+	// `null` (never 0) so the frontend can tell "no value imported" apart
+	// from "imported zero" and render an em-dash accordingly.
+	ImportedQuantity sql.NullFloat64 `json:"-" db:"imported_quantity"`
+	ImportedTotal    sql.NullFloat64 `json:"-" db:"imported_total"`
+
 	// v2 Bosqichlar workflow (migration 353).
 	ApprovalStatus string  `json:"approval_status" db:"approval_status"`
 	DoneQuantity   float64 `json:"done_quantity" db:"done_quantity"`
@@ -221,6 +234,8 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		MaterialType     string      `json:"material_type"`
 		OriginalQuantity float64     `json:"original_quantity"`
 		OriginalUnitRate float64     `json:"original_unit_rate"`
+		ImportedQuantity interface{} `json:"imported_quantity"`
+		ImportedTotal    interface{} `json:"imported_total"`
 		ApprovalStatus   string      `json:"approval_status"`
 		DoneQuantity     float64     `json:"done_quantity"`
 		SortOrder        int         `json:"sort_order"`
@@ -254,6 +269,11 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		MaterialType:     l.MaterialType,
 		OriginalQuantity: l.OriginalQuantity,
 		OriginalUnitRate: l.OriginalUnitRate,
+		// Emit numeric value when the row carries an imported figure,
+		// `null` when it doesn't. The frontend distinguishes "no imported
+		// value" (em-dash) from "imported zero" via this distinction.
+		ImportedQuantity: nullFloat64Value(l.ImportedQuantity),
+		ImportedTotal:    nullFloat64Value(l.ImportedTotal),
 		ApprovalStatus:   l.ApprovalStatus,
 		DoneQuantity:     l.DoneQuantity,
 		SortOrder:        l.SortOrder,
@@ -356,6 +376,14 @@ type CreateEstimateLineInput struct {
 	NormRate         float64 `json:"norm_rate"`
 	UnitPrice        float64 `json:"unit_price"` // convenience — mapped to the rate column that matches resource_type
 	QuantityOverride bool    `json:"quantity_override"`
+
+	// ImportedQuantity / ImportedTotal (migration 400). Verbatim "Количество"
+	// and "Сметная стоимость" totals from the imported Ресурс XLSX — stored
+	// for display only and ignored by every calc path. Pointers so callers
+	// can omit them (NULL on insert) without colliding with the explicit-zero
+	// case (a row whose file figure is genuinely 0).
+	ImportedQuantity *float64 `json:"imported_quantity"`
+	ImportedTotal    *float64 `json:"imported_total"`
 }
 
 type BulkCreateEstimateLinesInput struct {

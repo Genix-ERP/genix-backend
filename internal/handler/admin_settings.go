@@ -752,7 +752,21 @@ func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, prod
 		}
 	}
 	if ca.StockValuationAccountID == uuid.Nil {
-		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1010")
+		// Try the raw-materials leaf first (NAS code 1030 in most charts;
+		// in some tenants 1030 is named "Yoqilg'i" historically — fall
+		// back through "raw materials" / "1010" for charts where 1010
+		// itself is a leaf rather than a group). Without this multi-step
+		// fallback, every Goods Delivery JE for an org whose 1010 is a
+		// group ended up as a DR-only entry — the credit silently failed
+		// because findAccount("inventory","1010") returned uuid.Nil and
+		// the INSERT FK was rejected without anyone noticing.
+		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "xom ashyo", "1030")
+		if ca.StockValuationAccountID == uuid.Nil {
+			ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "raw materials", "1010")
+		}
+		if ca.StockValuationAccountID == uuid.Nil {
+			ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1010")
+		}
 	}
 	if ca.StockInputAccountID == uuid.Nil {
 		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "6015")
@@ -774,7 +788,16 @@ func getInventoryAccountByType(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID
 
 	switch inventoryType {
 	case "raw":
-		return findAccount(q, tenantID, orgID, "raw materials", "1030")
+		// NAS code 1010 (Xom ashyo va materiallar). 1030 is Yoqilg'i
+		// (Fuel) and was the wrong default — same bug fixed in the
+		// manufacturing/work-order JE branches. Purchase-receipt JEs
+		// flow through here, so leaving 1030 in place would keep
+		// crediting Fuel for every raw-material receipt.
+		acct := findAccount(q, tenantID, orgID, "xom ashyo", "1010")
+		if acct == uuid.Nil {
+			acct = findAccount(q, tenantID, orgID, "raw materials", "1010")
+		}
+		return acct
 	case "finished":
 		return findAccount(q, tenantID, orgID, "finished goods", "2810")
 	case "trade":

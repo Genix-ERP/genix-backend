@@ -552,17 +552,23 @@ func (h *Handler) DuplicateEstimate(c *gin.Context) {
 		return
 	}
 
-	// Copy lines
+	// Copy lines. imported_quantity / imported_total (migration 400) are
+	// carried over so the duplicated estimate still shows the file's
+	// "Количество" and "Сметная стоимость" figures — those columns are
+	// per-line metadata about the source XLSX, not derived state, so a
+	// copy should preserve them verbatim.
 	_, err = tx.Exec(`
 		INSERT INTO construction_estimate_line (
 			tenant_id, estimate_id, wbs_id, name, uom, quantity,
 			material_rate, labor_rate, equipment_rate,
 			unit_rate, total_amount, sort_order,
+			imported_quantity, imported_total,
 			created_date, updated_date
 		)
 		SELECT $1, $2, wbs_id, name, uom, quantity,
 		       material_rate, labor_rate, equipment_rate,
 		       unit_rate, total_amount, sort_order,
+		       imported_quantity, imported_total,
 		       NOW(), NOW()
 		FROM construction_estimate_line
 		WHERE estimate_id = $3
@@ -726,6 +732,12 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		         0
 		       ),
 		       COALESCE(l.original_unit_rate, l.unit_rate),
+		       -- Display-only fields from migration 400. Returned as raw
+		       -- nullable numerics so the frontend can distinguish "no
+		       -- imported value" from "imported zero" and render an
+		       -- em-dash for the former.
+		       l.imported_quantity,
+		       l.imported_total,
 		       COALESCE(l.approval_status, 'pending'),
 		       COALESCE(l.done_quantity, 0),
 		       l.sort_order, l.created_date, l.updated_date,
@@ -764,6 +776,10 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 			&line.QuantityOverride,
 			&line.MaterialType,
 			&line.OriginalQuantity, &line.OriginalUnitRate,
+			// Migration 400 — display-only nullable numerics. Scanning
+			// into sql.NullFloat64 preserves the NULL distinction so
+			// MarshalJSON emits `null` (not 0) when no file value exists.
+			&line.ImportedQuantity, &line.ImportedTotal,
 			&line.ApprovalStatus, &line.DoneQuantity,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
@@ -1490,9 +1506,15 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	// 3 000-line file, which is the difference between "tens of
 	// seconds" and "well under one".
 	//
-	// 19 columns × 500 rows = 9 500 placeholders per batch — well
+	// 21 columns × 500 rows = 10 500 placeholders per batch — well
 	// under PostgreSQL's 65 535 parameter limit.
-	const fieldsPerRow = 19
+	//
+	// The last two slots (imported_quantity, imported_total) are the
+	// migration-400 display-only fields. They mirror the Ресурс XLSX
+	// "Количество" and "Сметная стоимость в базисном уровне" columns and
+	// are deliberately NOT consumed by any cost / cascade / ledger logic.
+	// Non-resurs imports leave them nil → stored as NULL.
+	const fieldsPerRow = 21
 	const batchSize = 500
 
 	insertHeader := `INSERT INTO construction_estimate_line (
@@ -1501,6 +1523,7 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 		unit_rate, total_amount, code, item_number,
 		resource_type, material_type, parent_item_number, norm_rate, sort_order,
 		original_quantity,
+		imported_quantity, imported_total,
 		created_date, updated_date
 	) VALUES `
 
@@ -1556,7 +1579,22 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 				origQtyArg = *line.OriginalQuantity
 			}
 
-			// Build the ($N, $N+1, ..., $N+18, NOW(), NOW()) tuple.
+			// Migration 400: display-only "imported" fields. Pass the
+			// pointer's value when present, nil otherwise — pq will write
+			// NULL into the nullable NUMERIC columns. These never feed
+			// any business logic; only the read path returns them so the
+			// frontend can render the file figure alongside the
+			// computed/live columns.
+			var impQtyArg interface{}
+			if line.ImportedQuantity != nil {
+				impQtyArg = *line.ImportedQuantity
+			}
+			var impTotalArg interface{}
+			if line.ImportedTotal != nil {
+				impTotalArg = *line.ImportedTotal
+			}
+
+			// Build the ($N, $N+1, ..., $N+20, NOW(), NOW()) tuple.
 			if i > batchStart {
 				sb.WriteByte(',')
 			}
@@ -1578,6 +1616,7 @@ func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 				unitRate, totalAmount, nullStringFromVal(line.Code), nullStringFromVal(line.ItemNumber),
 				nullStringFromVal(line.ResourceType), materialType, nullStringFromVal(line.ParentItemNumber), line.NormRate, sortOrder,
 				origQtyArg,
+				impQtyArg, impTotalArg,
 			)
 			count++
 		}
@@ -2479,6 +2518,12 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		         0
 		       ),
 		       COALESCE(l.original_unit_rate, l.unit_rate),
+		       -- Display-only fields from migration 400. Returned as raw
+		       -- nullable numerics so the frontend can distinguish "no
+		       -- imported value" from "imported zero" and render an
+		       -- em-dash for the former.
+		       l.imported_quantity,
+		       l.imported_total,
 		       COALESCE(l.approval_status, 'pending'),
 		       COALESCE(l.done_quantity, 0),
 		       l.sort_order, l.created_date, l.updated_date,
@@ -2516,6 +2561,10 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 			&line.QuantityOverride,
 			&line.MaterialType,
 			&line.OriginalQuantity, &line.OriginalUnitRate,
+			// Migration 400 — display-only nullable numerics. Scanning
+			// into sql.NullFloat64 preserves the NULL distinction so
+			// MarshalJSON emits `null` (not 0) when no file value exists.
+			&line.ImportedQuantity, &line.ImportedTotal,
 			&line.ApprovalStatus, &line.DoneQuantity,
 			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,

@@ -50,6 +50,9 @@ services:
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:5173}
       - PRICE_PER_USER_MONTHLY=${PRICE_PER_USER_MONTHLY:-199000}
       - PRICE_PER_USER_YEARLY=${PRICE_PER_USER_YEARLY:-169000}
+      - CRM_API_BASE=${CRM_API_BASE:-}
+      - CRM_USERNAME=${CRM_USERNAME:-}
+      - CRM_PASSWORD=${CRM_PASSWORD:-}
     volumes:
       - genix_storage:/app/storage
     depends_on:

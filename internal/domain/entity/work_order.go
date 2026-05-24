@@ -195,6 +195,7 @@ type CompleteWorkOrderInput struct {
 	QuantityProduced   float64 `json:"quantity_produced" binding:"required"`
 	ScrapQuantity      float64 `json:"scrap_quantity,omitempty"`
 	ScrapReason        string  `json:"scrap_reason,omitempty"`
+	ShortfallReason    string  `json:"shortfall_reason,omitempty"`
 	QualityCheckPassed *bool   `json:"quality_check_passed,omitempty"`
 	Notes              string  `json:"notes,omitempty"`
 }

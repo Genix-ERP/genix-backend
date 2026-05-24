@@ -1072,6 +1072,151 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		}
 	}
 
+	// ── GROUP accounts (mirror migration 317) ─────────────────────────
+	// New orgs created AFTER migration 317 don't get the group
+	// hierarchy because migration 317 only ran once for orgs that
+	// existed at that time. Without these, the chart-of-accounts view
+	// only shows leaves and the hierarchy looks "flat". Insert the
+	// same 40 group accounts here so every new org has the standard
+	// UzNAS hierarchy from day one.
+	groupAccounts := []struct {
+		code     string
+		nameUz   string
+		nameEn   string
+		nameRu   string
+		typeCode string
+		nature   string
+	}{
+		// Section 0
+		{"0000", "Uzoq muddatli aktivlar", "Long-term Assets", "Долгосрочные активы", "FA", "ACTIVE"},
+		{"0100", "Asosiy vositalar", "Fixed Assets", "Основные средства", "FA", "ACTIVE"},
+		{"0200", "Asosiy vositalar eskirishi", "Depreciation of Fixed Assets", "Износ основных средств", "CONTRA_ASSET", "PASSIVE"},
+		{"0400", "Nomoddiy aktivlar", "Intangible Assets", "Нематериальные активы", "OA", "ACTIVE"},
+		{"0800", "Kapital qo'yilmalar", "Capital Investments", "Капитальные вложения", "FA", "ACTIVE"},
+		// Section 1
+		{"1000", "Tovar-moddiy zaxiralar", "Inventories", "Товарно-материальные запасы", "INV", "ACTIVE"},
+		// Section 2
+		{"2000", "Ishlab chiqarish xarajatlari", "Production Costs", "Затраты на производство", "INV", "ACTIVE"},
+		{"2800", "Tayyor mahsulot va tovarlar", "Finished Goods and Merchandise", "Готовая продукция и товары", "INV", "ACTIVE"},
+		{"2900", "Sotib olingan tovarlar", "Purchased Goods", "Приобретённые товары", "INV", "ACTIVE"},
+		// Section 3
+		{"3000", "Kelgusi davr xarajatlari", "Deferred Expenses", "Расходы будущих периодов", "OA", "ACTIVE"},
+		// Section 4
+		{"4000", "Debitorlik qarzdorligi", "Receivables", "Дебиторская задолженность", "AR", "ACTIVE"},
+		{"4200", "Hisobdor shaxslar bilan hisob-kitob", "Settlements with Accountable Persons", "Расчёты с подотчётными лицами", "OA", "ACTIVE"},
+		{"4400", "Byudjet bilan hisob-kitob", "Budget Settlements", "Расчёты с бюджетом", "OA", "ACTIVE_PASSIVE"},
+		{"4700", "Turli debitorlar", "Various Debtors", "Разные дебиторы", "OA", "ACTIVE"},
+		// Section 5
+		{"5000", "Pul mablag'lari", "Cash and Cash Equivalents", "Денежные средства", "CASH", "ACTIVE"},
+		{"5100", "Bank hisob raqamlari", "Bank Accounts", "Банковские счета", "CASH", "ACTIVE"},
+		{"5200", "Maxsus bank hisobvaraqlari", "Special Bank Accounts", "Специальные банковские счета", "CASH", "ACTIVE"},
+		{"5500", "Qisqa muddatli moliyaviy qo'yilmalar", "Short-term Financial Investments", "Краткосрочные финансовые вложения", "OA", "ACTIVE"},
+		// Section 6
+		{"6000", "Qisqa muddatli majburiyatlar", "Short-term Liabilities", "Краткосрочные обязательства", "AP", "PASSIVE"},
+		{"6100", "Bo'naklar", "Advances", "Авансы полученные", "ST_LIAB", "PASSIVE"},
+		{"6200", "Qisqa muddatli kreditlar", "Short-term Loans", "Краткосрочные кредиты", "ST_LIAB", "PASSIVE"},
+		{"6400", "Byudjetga to'lovlar", "Tax Payments", "Расчёты с бюджетом", "ST_LIAB", "PASSIVE"},
+		{"6500", "Ijtimoiy sug'urta", "Social Insurance", "Социальное страхование", "ST_LIAB", "PASSIVE"},
+		{"6700", "Xodimlar bilan hisob-kitob", "Employee Settlements", "Расчёты с персоналом", "ST_LIAB", "PASSIVE"},
+		{"6800", "Qisqa muddatli kreditlar va qarzlar", "Short-term Credits", "Краткосрочные кредиты и займы", "ST_LIAB", "PASSIVE"},
+		{"6900", "Boshqa majburiyatlar", "Other Liabilities", "Прочие обязательства", "ST_LIAB", "PASSIVE"},
+		// Section 7
+		{"7000", "Uzoq muddatli majburiyatlar", "Long-term Liabilities", "Долгосрочные обязательства", "LT_LIAB", "PASSIVE"},
+		{"7300", "Uzoq muddatli bo'naklar", "Long-term Advances", "Долгосрочные авансы", "LT_LIAB", "PASSIVE"},
+		{"7800", "Uzoq muddatli kreditlar", "Long-term Credits", "Долгосрочные кредиты", "LT_LIAB", "PASSIVE"},
+		// Section 8
+		{"8000", "Kapital", "Equity", "Собственный капитал", "EQUITY", "PASSIVE"},
+		// Section 9
+		{"9000", "Daromadlar va xarajatlar", "Revenue and Expenses", "Доходы и расходы", "REVENUE", "ACTIVE_PASSIVE"},
+		{"9100", "Tannarx", "Cost of Goods Sold", "Себестоимость", "COGS", "ACTIVE"},
+		{"9200", "Boshqa daromadlar", "Other Income", "Прочие доходы", "OTHER_INC", "PASSIVE"},
+		{"9300", "Boshqa operatsion daromadlar", "Other Operating Income", "Прочие операционные доходы", "OTHER_INC", "PASSIVE"},
+		{"9400", "Davr xarajatlari", "Period Expenses", "Расходы периода", "OPEX", "ACTIVE"},
+		{"9500", "Moliyaviy daromadlar", "Financial Income", "Финансовые доходы", "OTHER_INC", "PASSIVE"},
+		{"9600", "Moliyaviy xarajatlar", "Financial Expenses", "Финансовые расходы", "OTHER_EXP", "ACTIVE"},
+		{"9700", "Favqulodda foyda va zarar", "Extraordinary Gains and Losses", "Чрезвычайные прибыли и убытки", "OTHER_EXP", "ACTIVE_PASSIVE"},
+		{"9800", "Favqulodda xarajatlar", "Extraordinary Expenses", "Чрезвычайные расходы", "OTHER_EXP", "ACTIVE"},
+		{"9900", "Yakuniy moliyaviy natija", "Final Financial Result", "Итоговый финансовый результат", "EQUITY", "ACTIVE_PASSIVE"},
+	}
+	for _, grp := range groupAccounts {
+		typeID, ok := accountTypeIDs[grp.typeCode]
+		if !ok {
+			continue
+		}
+		_, _ = h.db.Exec(`
+			INSERT INTO accounts (
+				id, tenant_id, organization_id, account_type_id,
+				code, name, name_en, name_ru,
+				is_bank_account, is_control_account, is_reconcilable,
+				current_balance, opening_balance, is_active, is_leaf, account_nature,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, false, false, 0, 0, true, false, $9, $10, $10)
+			ON CONFLICT (tenant_id, organization_id, code) DO UPDATE
+				SET is_leaf = false,
+				    account_nature = EXCLUDED.account_nature,
+				    name_en = COALESCE(NULLIF(accounts.name_en, ''), EXCLUDED.name_en),
+				    name_ru = COALESCE(NULLIF(accounts.name_ru, ''), EXCLUDED.name_ru),
+				    updated_at = EXCLUDED.updated_at
+				WHERE accounts.deleted_at IS NULL
+		`, uuid.New(), tenantID, orgID, typeID,
+			grp.code, grp.nameUz, grp.nameEn, grp.nameRu,
+			grp.nature, now)
+	}
+
+	// ── parent_id linkage ─────────────────────────────────────────────
+	// Wire leaf codes (1010, 4010, etc.) to their group parents (1000,
+	// 4000, etc.) using the SAME logic migration 317 applied to legacy
+	// orgs. Idempotent — only touches rows where parent_id IS NULL.
+	// Link 4-char leaves to 4-char "X000" group: e.g. 1010 → 1000.
+	h.db.Exec(`
+		UPDATE accounts a SET parent_id = g.id
+		FROM accounts g
+		WHERE a.organization_id = $2 AND g.organization_id = $2
+		  AND a.tenant_id = $1 AND g.tenant_id = $1
+		  AND a.deleted_at IS NULL AND g.deleted_at IS NULL
+		  AND a.parent_id IS NULL
+		  AND a.code ~ '^[1-9][0-9]{2,3}$'
+		  AND LENGTH(a.code) = 4
+		  AND g.code = LEFT(a.code, 2) || '00'
+		  AND a.id != g.id
+	`, tenantID, orgID)
+	// Link section groups (0100, 0200, ...) to section header (0000).
+	h.db.Exec(`
+		UPDATE accounts a SET parent_id = g.id
+		FROM accounts g
+		WHERE a.organization_id = $2 AND g.organization_id = $2
+		  AND a.tenant_id = $1 AND g.tenant_id = $1
+		  AND a.deleted_at IS NULL AND g.deleted_at IS NULL
+		  AND a.parent_id IS NULL
+		  AND a.code ~ '^0[0-9]00$'
+		  AND g.code = '0000'
+		  AND a.id != g.id
+		  AND a.code != '0000'
+	`, tenantID, orgID)
+	// Link sub-section groups (e.g. 6100, 6200) to section header (6000).
+	h.db.Exec(`
+		UPDATE accounts a SET parent_id = g.id
+		FROM accounts g
+		WHERE a.organization_id = $2 AND g.organization_id = $2
+		  AND a.tenant_id = $1 AND g.tenant_id = $1
+		  AND a.deleted_at IS NULL AND g.deleted_at IS NULL
+		  AND a.parent_id IS NULL
+		  AND a.code ~ '^[1-9][0-9]00$'
+		  AND g.code = LEFT(a.code, 1) || '000'
+		  AND a.id != g.id
+		  AND a.code != LEFT(a.code, 1) || '000'
+		  AND EXISTS (SELECT 1 FROM accounts WHERE code = LEFT(a.code, 1) || '000' AND organization_id = $2 AND tenant_id = $1 AND deleted_at IS NULL)
+	`, tenantID, orgID)
+	// Mark any account that now has children as non-leaf.
+	h.db.Exec(`
+		UPDATE accounts a SET is_leaf = false
+		WHERE a.tenant_id = $1 AND a.organization_id = $2 AND a.deleted_at IS NULL
+		  AND EXISTS (
+		    SELECT 1 FROM accounts c
+		    WHERE c.parent_id = a.id AND c.deleted_at IS NULL
+		  )
+	`, tenantID, orgID)
+
 	// Set parent_id for inventory sub-accounts (1310/1320/1330/1340 → parent 1300)
 	h.db.Exec(`
 		UPDATE accounts SET parent_id = (
@@ -1083,7 +1228,8 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		AND code IN ('1310', '1320', '1330', '1340') AND parent_id IS NULL
 	`, tenantID, orgID)
 
-	h.log.Info("Created default chart of accounts", "tenant_id", tenantID, "org_id", orgID, "account_count", len(defaultAccounts))
+	h.log.Info("Created default chart of accounts", "tenant_id", tenantID, "org_id", orgID,
+		"leaf_count", len(defaultAccounts), "group_count", len(groupAccounts))
 	return nil
 }
 
@@ -1111,25 +1257,35 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		accountIDs[code] = id
 	}
 
-	// Define default journals — must match migration 276 list
+	// Define default journals — must match migration 276/278 list.
+	// Each journal carries name in three languages so the UI can
+	// localize. The `name` field (Russian, the system's lingua franca)
+	// is what migration 278's backfill stored; keeping the same value
+	// here so re-running this seeder for an org that already has
+	// migration-seeded journals is a no-op.
 	defaultJournals := []struct {
 		code              string
-		name              string
+		nameRu            string
+		nameUz            string
+		nameEn            string
 		journalType       string
 		defaultDebitCode  string
 		defaultCreditCode string
 	}{
-		{"GEN", "General Journal", "general", "", ""},
-		{"SAL", "Sales Journal", "sales", "4010", "9010"},             // AR debit, Sales Revenue credit
-		{"PUR", "Purchase Journal", "purchase", "9110", "6010"},       // COGS debit, AP credit
-		{"CASH", "Cash Journal", "cash", "5010", "5010"},              // Cash
-		{"BANK", "Bank Journal", "bank", "5110", "5110"},              // Bank
-		{"MISC", "Miscellaneous Journal", "miscellaneous", "", ""},
-		{"CASH_RECEIPTS", "Cash Receipts Journal", "cash", "5010", ""}, // Cash receipts
-		{"STOCK", "Stock Journal", "general", "", ""},
-		{"ASSET", "Fixed Assets Journal", "general", "", ""},
-		{"PAYROLL", "Payroll Journal", "general", "", ""},
-		{"CONST", "Construction Journal", "general", "", ""},
+		{"GEN", "Главный журнал", "Bosh jurnal", "General Journal", "general", "", ""},
+		{"SAL", "Журнал продаж", "Sotish jurnali", "Sales Journal", "sales", "4010", "9010"},
+		{"PUR", "Журнал закупок", "Xarid jurnali", "Purchase Journal", "purchase", "9110", "6010"},
+		{"CASH", "Кассовый журнал", "Kassa jurnali", "Cash Journal", "cash", "5010", "5010"},
+		{"BANK", "Банковский журнал", "Bank jurnali", "Bank Journal", "bank", "5110", "5110"},
+		{"MISC", "Прочие операции", "Boshqa operatsiyalar jurnali", "Miscellaneous Journal", "miscellaneous", "", ""},
+		// CASH_RECEIPTS removed — was redundant with CASH. Callers in
+		// sales_returns.go already fall back to 'CASH' when the
+		// CASH_RECEIPTS code isn't found, so no other code paths
+		// break. Migration 395 retires the existing rows.
+		{"STOCK", "Складской журнал", "Ombor jurnali", "Stock Journal", "general", "", ""},
+		{"ASSET", "Журнал основных средств", "Asosiy vositalar jurnali", "Fixed Assets Journal", "general", "", ""},
+		{"PAYROLL", "Журнал зарплаты", "Ish haqi jurnali", "Payroll Journal", "general", "", ""},
+		{"CONST", "Строительный журнал", "Qurilish jurnali", "Construction Journal", "general", "", ""},
 	}
 
 	// Find profit/loss accounts for cash/bank journals
@@ -1171,19 +1327,34 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 			lossAcct = lossAccountID
 		}
 
+		// Migration 278 dropped the old UNIQUE(tenant_id, code) and
+		// added UNIQUE(tenant_id, organization_id, code) so each org
+		// can have its own journals. The ON CONFLICT here MUST match
+		// the live constraint or the insert will throw "no unique or
+		// exclusion constraint matching the ON CONFLICT specification"
+		// and the org will end up with zero journals (the symptom: an
+		// empty Journals page on the second+ org under any tenant).
 		_, err := h.db.Exec(`
 			INSERT INTO journals (
-				id, tenant_id, organization_id, code, name, type,
+				id, tenant_id, organization_id, code, name, name_uz, name_en, type,
 				default_debit_account_id, default_credit_account_id,
 				profit_account_id, loss_account_id,
 				is_active, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-			ON CONFLICT (tenant_id, code) DO UPDATE
-				SET organization_id = EXCLUDED.organization_id,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			ON CONFLICT (tenant_id, organization_id, code) DO UPDATE
+				SET default_debit_account_id  = COALESCE(EXCLUDED.default_debit_account_id,  journals.default_debit_account_id),
+				    default_credit_account_id = COALESCE(EXCLUDED.default_credit_account_id, journals.default_credit_account_id),
+				    profit_account_id         = COALESCE(EXCLUDED.profit_account_id,         journals.profit_account_id),
+				    loss_account_id           = COALESCE(EXCLUDED.loss_account_id,           journals.loss_account_id),
+				    -- Backfill localized name columns if they were empty
+				    -- (legacy rows created before the seeder wrote them).
+				    name_uz = COALESCE(NULLIF(journals.name_uz, ''), EXCLUDED.name_uz),
+				    name_en = COALESCE(NULLIF(journals.name_en, ''), EXCLUDED.name_en),
+				    is_active = true,
 				    updated_at = NOW()
-			WHERE journals.organization_id IS NULL
+				WHERE journals.deleted_at IS NULL
 		`,
-			id, tenantID, orgID, j.code, j.name, j.journalType,
+			id, tenantID, orgID, j.code, j.nameRu, j.nameUz, j.nameEn, j.journalType,
 			defaultDebitID, defaultCreditID,
 			profitAcct, lossAcct,
 			true, now,

@@ -131,6 +131,10 @@ func main() {
 	// Start daily vendor bill overdue notifications at 09:00 Tashkent time
 	h.RunVendorBillOverdueScheduler(shutdownCtx)
 
+	// Start CRM sync retry worker. No-op when CRM_API_BASE/CRM_API_TOKEN
+	// aren't configured, so safe to run unconditionally.
+	go h.CRMSyncer().RunWorker(shutdownCtx)
+
 	// Create HTTP server
 	server := &http.Server{
 		Addr:           fmt.Sprintf(":%d", cfg.App.Port),

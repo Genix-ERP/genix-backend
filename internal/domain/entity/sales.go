@@ -236,6 +236,8 @@ type CreateSalesOrderLineInput struct {
 
 // UpdateSalesOrderInput represents input for updating a sales order
 type UpdateSalesOrderInput struct {
+	CustomerID      *string  `json:"customer_id,omitempty"`
+	CustomerName    *string  `json:"customer_name,omitempty"`
 	ContactPersonID *string  `json:"contact_person_id,omitempty"`
 	ExpectedDate    *string  `json:"expected_date,omitempty"`
 	BillingAddress  *Address `json:"billing_address,omitempty"`

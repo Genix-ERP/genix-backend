@@ -2,6 +2,7 @@ package handler
 
 import (
 	"github.com/genixerp/genix-backend/internal/config"
+	"github.com/genixerp/genix-backend/internal/crm"
 	"github.com/genixerp/genix-backend/internal/infrastructure/cache"
 	"github.com/genixerp/genix-backend/internal/infrastructure/database"
 	"github.com/genixerp/genix-backend/internal/infrastructure/email"
@@ -26,6 +27,11 @@ type Handler struct {
 	icSync         *service.IntercompanySyncService
 	perm           *middleware.PermissionChecker
 	multicardClient *payment.Client
+	// crmSync pushes construction photo reports into the Yuksalish CRM.
+	// nil-safe at the call sites (see CreatePhotoReport): if env vars
+	// aren't set, syncer is constructed but reports itself as
+	// not-configured and every Enqueue is a no-op.
+	crmSync         *crm.Syncer
 }
 
 // NewHandler creates a new handler instance
@@ -46,8 +52,13 @@ func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, l
 			cfg.Multicard.StoreID,
 			cfg.Multicard.BaseURL,
 		),
+		crmSync: crm.NewSyncer(db.DB, log),
 	}
 }
+
+// CRMSyncer exposes the syncer to main() for starting the background
+// retry worker.
+func (h *Handler) CRMSyncer() *crm.Syncer { return h.crmSync }
 
 // RegisterRoutes registers all API routes
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -319,6 +330,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		products.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateProduct)
 		products.POST("/:id/generate-search-key", h.perm.Require("inventory", "product", "update"), h.GenerateProductSearchKey)
 		products.DELETE("/:id", h.perm.Require("inventory", "product", "delete"), h.DeleteProduct)
+		products.GET("/:id/packaging-materials", h.ListProductPackagingMaterials)
+		products.POST("/:id/packaging-materials", h.SaveProductPackagingMaterials)
+		products.DELETE("/:id/packaging-materials/:materialId", h.DeleteProductPackagingMaterial)
 	}
 
 	// Product Categories
@@ -999,9 +1013,21 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// Payment journals (bank/cash only) — no finance permission required, any authenticated user can access
 	rg.GET("/journals/payment", h.ListPaymentJournals)
 
-	// Journals (accounting journals like GEN, SAL, PUR, MISC)
+	// Journals (accounting journals like GEN, SAL, PUR, MISC).
+	//
+	// Read access (GET) is INTENTIONALLY ungated. Sales-invoice and
+	// purchase-bill creation flows fetch this list to populate the
+	// "journal" dropdown — gating reads behind `finance:journal:read`
+	// breaks invoice creation for employees who legitimately have
+	// only sales / purchase permissions but no finance permission.
+	// Journals are reference data (like products, units of measure,
+	// tax rates), not sensitive financial details — so any
+	// authenticated user can list them.
+	//
+	// Mutating operations (POST / PUT / DELETE) remain gated behind
+	// the finance permission — only Buxgalter / Admin can create or
+	// modify the journal *definitions*.
 	journalGroup := rg.Group("/journals")
-	journalGroup.Use(h.perm.Require("finance", "journal", "read"))
 	{
 		journalGroup.GET("", h.ListJournals)
 		journalGroup.POST("", h.perm.Require("finance", "journal", "create"), h.CreateJournal)
@@ -1020,9 +1046,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		paymentMethodsGroup.GET("", h.ListPaymentMethods)
 	}
 
-	// Journal Entries
+	// Journal Entries.
+	//
+	// Read access (GET) is also ungated — same reason as /journals
+	// above. Sales / purchase modules render JE references on invoice
+	// detail screens (e.g. "linked to journal entry JE-20260507-…"),
+	// and the auto-post code paths emit JE rows that the originating
+	// module sometimes needs to read back. Mutations stay gated.
 	journals := rg.Group("/journal-entries")
-	journals.Use(h.perm.Require("finance", "journal", "read"))
 	{
 		journals.GET("", h.ListJournalEntries)
 		journals.POST("", h.perm.Require("finance", "journal", "create"), h.CreateJournalEntry)
@@ -1471,6 +1502,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		admin.GET("/users", h.ListAllSystemUsers)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
 		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
+		// /admin/migrations — read-only view over schema_migrations so a
+		// system admin can verify which DB migrations are applied on the
+		// running backend without needing direct psql access. Intended
+		// for production deploy verification.
+		admin.GET("/migrations", h.GetMigrationStatus)
+
+		// /admin/inventory-reconcile — diagnostic view that lines up the
+		// inventory MODULE total (Ombor "Jami qiymat") against the
+		// inventory GL ACCOUNT balance (Buxgalteriya "Xom ashyo")
+		// per (tenant, organization), with top contributing products.
+		// Use to pinpoint which org / product is driving any gap.
+		// Read-only, system-admin gated by the parent group.
+		admin.GET("/inventory-reconcile", h.GetInventoryReconcile)
 	}
 
 	// Audit Logs
@@ -1889,6 +1933,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/buildings", h.perm.Require("construction", "project", "create"), h.CreateConstructionBuilding)
 		constructionProjects.PUT("/:id/buildings/:building_id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionBuilding)
 		constructionProjects.DELETE("/:id/buildings/:building_id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionBuilding)
+		// CRM linkage — set/clear crm_project_id on the project and
+		// crm_block_id / current_crm_stage / auto_sync on the building.
+		constructionProjects.PUT("/:id/crm-link", h.perm.Require("construction", "project", "update"), h.UpdateProjectCRMLink)
+		constructionProjects.PUT("/:id/buildings/:building_id/crm-link", h.perm.Require("construction", "project", "update"), h.UpdateBuildingCRMLink)
 		// Building Files
 		constructionProjects.GET("/:id/buildings/:building_id/files", h.ListBuildingFiles)
 		constructionProjects.POST("/:id/buildings/:building_id/files", h.perm.Require("construction", "project", "create"), h.CreateBuildingFile)
@@ -2271,6 +2319,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		photoReports.GET("/:id", h.GetPhotoReport)
 		photoReports.PUT("/:id", h.perm.Require("construction", "reports", "submit"), h.UpdatePhotoReport)
 		photoReports.DELETE("/:id", h.perm.Require("construction", "reports", "submit"), h.DeletePhotoReport)
+		// Manual re-sync to CRM (used after a failure or when the building
+		// was re-linked after the report was created).
+		photoReports.POST("/:id/resync-crm", h.perm.Require("construction", "reports", "submit"), h.ResyncPhotoReportToCRM)
+	}
+
+	// CRM proxy + linkage endpoints (used by the construction page UI to
+	// populate dropdowns when configuring the project↔CRM-project and
+	// building↔CRM-block links).
+	constructionCRM := rg.Group("/construction/crm")
+	constructionCRM.Use(h.perm.Require("construction", "project", "read"))
+	{
+		constructionCRM.GET("/projects", h.ListCRMProjects)
+		constructionCRM.GET("/blocks", h.ListCRMBlocks)
 	}
 
 	// Material Usage (direct access)

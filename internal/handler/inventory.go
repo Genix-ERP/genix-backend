@@ -65,6 +65,13 @@ func (h *Handler) ListInventory(c *gin.Context) {
 	expiryDays, _ := strconv.Atoi(c.DefaultQuery("expiry_days", "30"))
 
 	// Build query
+	// The JOIN to `products` filters out rows belonging to soft-deleted
+	// products. Without this, ghost inventory rows for deleted products are
+	// still returned by the API, which then drags warehouse totals down in
+	// the UI (the products page filters by deleted_at IS NULL, so the
+	// orphans are invisible in the list but still contribute to aggregate
+	// stats). Same filter is applied at line 5343 of this file for the
+	// per-warehouse stock value query, so this matches existing precedent.
 	baseQuery := `
 		SELECT i.id, i.tenant_id, i.product_id, i.warehouse_id, i.location_id,
 			   i.lot_number, i.serial_number, i.expiry_date,
@@ -76,14 +83,14 @@ func (h *Handler) ListInventory(c *gin.Context) {
 			   COALESCE(w.warehouse_type, 'regular') as warehouse_type,
 			   wl.code as location_code, wl.name as location_name
 		FROM inventory i
-		JOIN products p ON i.product_id = p.id
+		JOIN products p ON i.product_id = p.id AND p.deleted_at IS NULL
 		JOIN warehouses w ON i.warehouse_id = w.id
 		LEFT JOIN warehouse_locations wl ON i.location_id = wl.id
 		WHERE i.tenant_id = $1
 	`
 	countQuery := `
 		SELECT COUNT(*) FROM inventory i
-		JOIN products p ON i.product_id = p.id
+		JOIN products p ON i.product_id = p.id AND p.deleted_at IS NULL
 		JOIN warehouses w ON i.warehouse_id = w.id
 		WHERE i.tenant_id = $1
 	`
@@ -1760,6 +1767,9 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		if whName.Valid {
 			b.WarehouseName = &whName.String
 		}
+		var bomSplit sql.NullBool
+		h.db.QueryRow(`SELECT has_split_output FROM product_boms WHERE id = $1`, b.ID).Scan(&bomSplit)
+		b.HasSplitOutput = bomSplit.Valid && bomSplit.Bool
 
 		boms = append(boms, &b)
 	}
@@ -1848,6 +1858,9 @@ func (h *Handler) GetBOM(c *gin.Context) {
 	if whName.Valid {
 		b.WarehouseName = &whName.String
 	}
+	var bomSplit sql.NullBool
+	h.db.QueryRow(`SELECT has_split_output FROM product_boms WHERE id = $1`, bomID).Scan(&bomSplit)
+	b.HasSplitOutput = bomSplit.Valid && bomSplit.Bool
 
 	// Get BOM lines
 	rows, err := h.db.Query(`
@@ -2013,15 +2026,15 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		}
 	}
 
-	// Try INSERT with warehouse_id first; fall back without if column doesn't exist yet
+	// Try INSERT with warehouse_id and has_split_output
 	_, err = tx.Exec(`
 		INSERT INTO product_boms (
 			id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
-			is_active, is_default, effective_date, expiry_date, notes, warehouse_id,
+			is_active, is_default, effective_date, expiry_date, notes, warehouse_id, has_split_output,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $15, $15)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $15, $16, $16)
 	`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
-		input.IsDefault, effectiveDate, expiryDate, notes, warehouseID, userID, now)
+		input.IsDefault, effectiveDate, expiryDate, notes, warehouseID, input.HasSplitOutput, userID, now)
 
 	if err != nil {
 		// Retry without warehouse_id if column doesn't exist
@@ -2215,6 +2228,11 @@ func (h *Handler) UpdateBOM(c *gin.Context) {
 			updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
 			args = append(args, wid)
 		}
+	}
+	if input.HasSplitOutput != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("has_split_output = $%d", argCount))
+		args = append(args, *input.HasSplitOutput)
 	}
 
 	if len(updates) == 0 {
