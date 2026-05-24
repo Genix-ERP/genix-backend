@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -63,6 +64,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	categoryID := c.Query("category_id")
 	productType := c.Query("type")
 	inventoryType := c.Query("inventory_type")
+	warehouseID := c.Query("warehouse_id") // optional: only return products that have at least one inventory row in this warehouse
 	includeInactive := c.Query("include_inactive") == "true"
 
 	// Build query - products are shared across orgs, org-specific data comes from product_organization_settings
@@ -71,9 +73,9 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	baseQuery := `
 		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode, p.search_key,
 			   p.name, p.description, p.short_description, p.unit_id,
-			   COALESCE(pos.cost_price, p.cost_price) as cost_price,
-			   COALESCE(pos.list_price, p.list_price) as list_price,
-			   COALESCE(pos.min_price, p.min_price) as min_price,
+			   COALESCE(NULLIF(pos.cost_price, 0), p.cost_price) as cost_price,
+			   COALESCE(NULLIF(pos.list_price, 0), p.list_price) as list_price,
+			   COALESCE(NULLIF(pos.min_price, 0), p.min_price) as min_price,
 			   p.is_stockable, p.track_inventory,
 			   COALESCE(pos.min_stock_level, p.min_stock_level) as min_stock_level,
 			   COALESCE(pos.reorder_point, p.reorder_point) as reorder_point,
@@ -92,6 +94,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   COALESCE(p.has_variants, false) as has_variants,
 			   COALESCE(p.has_delivery, false) as has_delivery,
 			   COALESCE(p.delivery_price, 0) as delivery_price,
+			   p.weight, p.length, p.width, p.height,
 			   p.is_active, p.tags, COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
 			   p.created_at, p.updated_at,
@@ -166,6 +169,36 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		countArgs = append(countArgs, inventoryType)
 	}
 
+	// Warehouse filter: restricts the result to products that have at least one
+	// inventory row in the requested warehouse. The previous frontend
+	// implementation page-filtered client-side, which silently dropped any
+	// product not on the current 20-row page — making the warehouse filter
+	// look broken to users. Validating as a UUID first because warehouse_id
+	// is a UUID column in postgres and a malformed value would otherwise
+	// surface as a 500 from `EXISTS (... WHERE warehouse_id = 'abc')`.
+	if warehouseID != "" {
+		if _, parseErr := uuid.Parse(warehouseID); parseErr == nil {
+			argCount++
+			countArgCount++
+			// Tie the EXISTS subquery to the same tenant ($1) so we don't
+			// leak data across tenants if a UUID collision ever occurred.
+			baseQuery += fmt.Sprintf(` AND EXISTS (
+				SELECT 1 FROM inventory inv
+				WHERE inv.product_id = p.id
+				  AND inv.warehouse_id = $%d
+				  AND inv.tenant_id = $1
+			)`, argCount)
+			countQuery += fmt.Sprintf(` AND EXISTS (
+				SELECT 1 FROM inventory inv
+				WHERE inv.product_id = p.id
+				  AND inv.warehouse_id = $%d
+				  AND inv.tenant_id = $1
+			)`, countArgCount)
+			args = append(args, warehouseID)
+			countArgs = append(countArgs, warehouseID)
+		}
+	}
+
 	if search != "" {
 		argCount++
 		countArgCount++
@@ -209,6 +242,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var purchaseUnitName string
 		var salesUnitID sql.NullString
 		var salesUnitName string
+		var weight, length, width, height sql.NullFloat64
 
 		err := rows.Scan(
 			&p.ID, &p.TenantID, &categoryID, &p.Type, &p.Code, &sku, &barcode, &searchKey,
@@ -220,6 +254,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 			&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
 			&p.IsOverheadExpense, &p.IsManufacturable, &p.AutoManufacture, &p.HasVariants, &p.HasDelivery, &p.DeliveryPrice,
+			&weight, &length, &width, &height,
 			&p.IsActive, &tags, &imageURL,
 			&inventoryType,
 			&p.CreatedAt, &p.UpdatedAt,
@@ -318,6 +353,11 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			}
 		}
 
+		if weight.Valid { v := weight.Float64; resp.Weight = &v }
+		if length.Valid { v := length.Float64; resp.Length = &v }
+		if width.Valid  { v := width.Float64;  resp.Width  = &v }
+		if height.Valid { v := height.Float64; resp.Height = &v }
+
 		// Parse tags
 		if len(tags) > 0 {
 			json.Unmarshal(tags, &resp.Tags)
@@ -326,7 +366,35 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			resp.Tags = []string{}
 		}
 
+		resp.OrganizationIDs = []uuid.UUID{}
 		products = append(products, resp)
+	}
+
+	// Batch-load organization_ids for all products in this page (avoids N+1)
+	if len(products) > 0 {
+		productIDs := make([]uuid.UUID, len(products))
+		productIndex := make(map[uuid.UUID]*entity.ProductResponse, len(products))
+		for i, p := range products {
+			productIDs[i] = p.ID
+			productIndex[p.ID] = p
+		}
+		orgRows, orgErr := h.db.Query(`
+			SELECT product_id, organization_id FROM product_organization_settings
+			WHERE tenant_id = $1 AND product_id = ANY($2)
+		`, tenantID, pq.Array(productIDs))
+		if orgErr == nil {
+			defer orgRows.Close()
+			for orgRows.Next() {
+				var pid, oid uuid.UUID
+				if err := orgRows.Scan(&pid, &oid); err == nil {
+					if p, ok := productIndex[pid]; ok {
+						p.OrganizationIDs = append(p.OrganizationIDs, oid)
+					}
+				}
+			}
+		} else {
+			h.log.Error("Failed to load product organization_ids", "error", orgErr)
+		}
 	}
 
 	pagination := entity.NewPagination(page, limit)
@@ -667,9 +735,9 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	query := `
 		SELECT p.id, p.tenant_id, p.category_id, p.type, p.code, p.sku, p.barcode, p.search_key,
 			   p.name, p.description, p.short_description, p.unit_id,
-			   COALESCE(pos.cost_price, p.cost_price) as cost_price,
-			   COALESCE(pos.list_price, p.list_price) as list_price,
-			   COALESCE(pos.min_price, p.min_price) as min_price,
+			   COALESCE(NULLIF(pos.cost_price, 0), p.cost_price) as cost_price,
+			   COALESCE(NULLIF(pos.list_price, 0), p.list_price) as list_price,
+			   COALESCE(NULLIF(pos.min_price, 0), p.min_price) as min_price,
 			   p.is_stockable, p.track_inventory,
 			   COALESCE(pos.min_stock_level, p.min_stock_level) as min_stock_level,
 			   COALESCE(pos.reorder_point, p.reorder_point) as reorder_point,
@@ -688,6 +756,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			   COALESCE(p.has_variants, false) as has_variants,
 			   COALESCE(p.has_delivery, false) as has_delivery,
 			   COALESCE(p.delivery_price, 0) as delivery_price,
+			   p.weight, p.length, p.width, p.height,
 			   p.is_active, p.tags,
 			   COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
@@ -713,6 +782,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	var tags json.RawMessage
 	var imageURL string
 	var inventoryType string
+	var weight, length, width, height sql.NullFloat64
 
 	err = h.db.QueryRow(query, queryArgs...).Scan(
 		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode, &searchKey,
@@ -724,6 +794,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		&p.CanBeSold, &p.CanBePurchased, &p.AvailableInPOS,
 		&p.CanBeExpensed, &p.CanBeRented, &p.CanBeSubcontracted,
 		&p.IsOverheadExpense, &p.IsManufacturable, &p.AutoManufacture, &p.HasVariants, &p.HasDelivery, &p.DeliveryPrice,
+		&weight, &length, &width, &height,
 		&p.IsActive, &tags, &imageURL,
 		&inventoryType,
 		&p.CreatedAt, &p.UpdatedAt,
@@ -800,6 +871,11 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			Name: categoryName.String,
 		}
 	}
+
+	if weight.Valid { v := weight.Float64; resp.Weight = &v }
+	if length.Valid { v := length.Float64; resp.Length = &v }
+	if width.Valid  { v := width.Float64;  resp.Width  = &v }
+	if height.Valid { v := height.Float64; resp.Height = &v }
 
 	if len(tags) > 0 {
 		json.Unmarshal(tags, &resp.Tags)
@@ -1028,6 +1104,22 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		argCount++
 		args = append(args, tenantID)
 
+		// DIAGNOSTIC: log the SET clause and key input values so we can
+		// see whether list_price/cost_price are actually being included.
+		// If the production payload has list_price=770000 but the SET
+		// clause doesn't mention list_price, it means the JSON didn't
+		// bind into input.ListPrice for some reason.
+		var inCost, inList interface{} = "<nil>", "<nil>"
+		if input.CostPrice != nil { inCost = *input.CostPrice }
+		if input.ListPrice != nil { inList = *input.ListPrice }
+		h.log.Info("UpdateProduct: products UPDATE",
+			"product_id", id.String(),
+			"input_cost_price", inCost,
+			"input_list_price", inList,
+			"organization_ids", input.OrganizationIDs,
+			"set_clause", strings.Join(updates, ", "),
+		)
+
 		query := fmt.Sprintf(`
 			UPDATE products SET %s
 			WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL
@@ -1047,41 +1139,128 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		}
 	}
 
-	// Upsert org-specific settings
-	if hasOrgUpdates && orgID != uuid.Nil {
-		_, err = h.db.Exec(`
-			INSERT INTO product_organization_settings (tenant_id, product_id, organization_id,
-				cost_price, list_price, min_price, min_stock_level, reorder_point, reorder_quantity)
-			VALUES ($1, $2, $3,
-				COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
-				COALESCE($7, 0), COALESCE($8, 0), COALESCE($9, 0))
-			ON CONFLICT (product_id, organization_id) DO UPDATE SET
-				cost_price = COALESCE($4, product_organization_settings.cost_price),
-				list_price = COALESCE($5, product_organization_settings.list_price),
-				min_price = COALESCE($6, product_organization_settings.min_price),
-				min_stock_level = COALESCE($7, product_organization_settings.min_stock_level),
-				reorder_point = COALESCE($8, product_organization_settings.reorder_point),
-				reorder_quantity = COALESCE($9, product_organization_settings.reorder_quantity),
-				updated_at = NOW()
-		`, tenantID, id, orgID,
-			orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice,
-			orgUpdates.minStockLevel, orgUpdates.reorderPoint, orgUpdates.reorderQuantity)
-		if err != nil {
-			h.log.Error("Failed to upsert product org settings", "error", err)
+	// Upsert org-specific settings.
+	//
+	// Build the list of orgs that need their pos row updated. Previously
+	// we only wrote to pos for the request's active orgID (from the
+	// header). That caused a subtle data bug: when the user's active
+	// session is org A but the product is assigned only to org B,
+	// pos[A] got the new price, then the org-sync block below deleted
+	// pos[A] (A not in the assignment list) and left pos[B] untouched
+	// with stale prices. The displayed value (COALESCE(pos.list_price,
+	// p.list_price) for the viewing org) stayed at the old number.
+	//
+	// Fix: write the new prices to pos for every org the product is
+	// currently assigned to, so prices propagate uniformly. Falls back
+	// to the header orgID when the request didn't supply assignments.
+	if hasOrgUpdates {
+		orgsToWrite := make([]uuid.UUID, 0, len(input.OrganizationIDs)+1)
+		for _, oidStr := range input.OrganizationIDs {
+			if parsedOrgID, parseErr := uuid.Parse(oidStr); parseErr == nil {
+				orgsToWrite = append(orgsToWrite, parsedOrgID)
+			}
+		}
+		if len(orgsToWrite) == 0 && orgID != uuid.Nil {
+			orgsToWrite = append(orgsToWrite, orgID)
+		}
+
+		for _, targetOrgID := range orgsToWrite {
+			// DIAGNOSTIC: log what we're about to upsert. The per-org pos
+			// row's list_price has been mysteriously stuck at the old
+			// value despite this branch existing, so prove what gets
+			// passed to Postgres. Remove once the price-stuck bug is
+			// understood.
+			var costVal, listVal interface{} = "<nil>", "<nil>"
+			if orgUpdates.costPrice != nil { costVal = *orgUpdates.costPrice }
+			if orgUpdates.listPrice != nil { listVal = *orgUpdates.listPrice }
+			h.log.Info("UpdateProduct: pos upsert",
+				"product_id", id.String(),
+				"target_org_id", targetOrgID.String(),
+				"cost_price_arg", costVal,
+				"list_price_arg", listVal,
+			)
+
+			res, execErr := h.db.Exec(`
+				INSERT INTO product_organization_settings (tenant_id, product_id, organization_id,
+					cost_price, list_price, min_price, min_stock_level, reorder_point, reorder_quantity)
+				VALUES ($1, $2, $3,
+					COALESCE($4, 0), COALESCE($5, 0), COALESCE($6, 0),
+					COALESCE($7, 0), COALESCE($8, 0), COALESCE($9, 0))
+				ON CONFLICT (product_id, organization_id) DO UPDATE SET
+					cost_price = COALESCE($4, product_organization_settings.cost_price),
+					list_price = COALESCE($5, product_organization_settings.list_price),
+					min_price = COALESCE($6, product_organization_settings.min_price),
+					min_stock_level = COALESCE($7, product_organization_settings.min_stock_level),
+					reorder_point = COALESCE($8, product_organization_settings.reorder_point),
+					reorder_quantity = COALESCE($9, product_organization_settings.reorder_quantity),
+					updated_at = NOW()
+			`, tenantID, id, targetOrgID,
+				orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice,
+				orgUpdates.minStockLevel, orgUpdates.reorderPoint, orgUpdates.reorderQuantity)
+			if execErr != nil {
+				h.log.Error("Failed to upsert product org settings, trying plain UPDATE as fallback",
+					"error", execErr, "product_id", id.String(), "org_id", targetOrgID.String())
+				// Upsert failed (likely INSERT part). Try a plain UPDATE on existing row.
+				_, fallbackErr := h.db.Exec(`
+					UPDATE product_organization_settings SET
+						cost_price  = COALESCE($3, cost_price),
+						list_price  = COALESCE($4, list_price),
+						min_price   = COALESCE($5, min_price),
+						updated_at  = NOW()
+					WHERE product_id = $1 AND organization_id = $2
+				`, id, targetOrgID,
+					orgUpdates.costPrice, orgUpdates.listPrice, orgUpdates.minPrice)
+				if fallbackErr != nil {
+					h.log.Error("Fallback UPDATE also failed", "error", fallbackErr)
+				} else {
+					h.log.Info("Fallback UPDATE succeeded for pos row")
+				}
+			} else {
+				rows, _ := res.RowsAffected()
+				h.log.Info("UpdateProduct: pos upsert result", "org_id", targetOrgID.String(), "rows_affected", rows)
+			}
+
+			// Verify what's actually stored after the upsert. If the
+			// SELECT here returns the new value but the user still sees
+			// the old, the issue is read-side (caching / replica lag).
+			// If the SELECT returns the OLD value, the upsert never
+			// applied — points at SQL-level issue we can dig into.
+			var verifyList float64
+			verifyErr := h.db.QueryRow(
+				`SELECT list_price FROM product_organization_settings
+				 WHERE product_id = $1 AND organization_id = $2`,
+				id, targetOrgID,
+			).Scan(&verifyList)
+			h.log.Info("UpdateProduct: pos verify",
+				"org_id", targetOrgID.String(),
+				"list_price_after_upsert", verifyList,
+				"verify_err", verifyErr,
+			)
 		}
 	}
 
-	// Update organization assignments if provided
+	// Sync organization assignments without destroying existing per-org
+	// pricing. The old code DELETE'd every product_organization_settings
+	// row and reinserted them with hard-coded zeros — which wiped the
+	// cost_price/list_price the user had just set (the per-org upsert
+	// above ran first, then this block deleted its work). Now we only
+	// delete rows for orgs that were removed from the list, and INSERT
+	// ON CONFLICT DO NOTHING preserves prices for orgs still selected.
 	if len(input.OrganizationIDs) > 0 {
-		// Delete existing org assignments
-		h.db.Exec(`DELETE FROM product_organization_settings WHERE product_id = $1 AND tenant_id = $2`, id, tenantID)
-
-		// Re-create for selected orgs
+		orgIDsToKeep := make([]uuid.UUID, 0, len(input.OrganizationIDs))
 		for _, oid := range input.OrganizationIDs {
-			parsedOrgID, parseErr := uuid.Parse(oid)
-			if parseErr != nil {
-				continue
+			if parsedOrgID, parseErr := uuid.Parse(oid); parseErr == nil {
+				orgIDsToKeep = append(orgIDsToKeep, parsedOrgID)
 			}
+		}
+
+		h.db.Exec(`
+			DELETE FROM product_organization_settings
+			WHERE product_id = $1 AND tenant_id = $2
+			  AND organization_id <> ALL($3)
+		`, id, tenantID, pq.Array(orgIDsToKeep))
+
+		for _, parsedOrgID := range orgIDsToKeep {
 			h.db.Exec(`
 				INSERT INTO product_organization_settings (
 					tenant_id, product_id, organization_id,
@@ -1112,14 +1291,20 @@ func (h *Handler) DeleteProduct(c *gin.Context) {
 		return
 	}
 
-	// Check for existing inventory
+	// Check for existing inventory. The previous check was `quantity_on_hand > 0`,
+	// which let products with NEGATIVE stock slip through (e.g., when construction
+	// consumption ran ahead of procurement). Soft-deleting such a product orphaned
+	// the negative inventory row — invisible to the products list (it filters by
+	// deleted_at IS NULL) but still dragging warehouse totals down because the
+	// inventory listing did not. Use `<> 0` so any non-zero balance (positive OR
+	// negative) blocks the delete and forces reconciliation first.
 	var hasInventory bool
 	h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM inventory WHERE product_id = $1 AND quantity_on_hand > 0)
+		SELECT EXISTS(SELECT 1 FROM inventory WHERE product_id = $1 AND quantity_on_hand <> 0)
 	`, id).Scan(&hasInventory)
 
 	if hasInventory {
-		response.BadRequest(c, "Cannot delete product with existing inventory. Set to inactive instead.")
+		response.BadRequest(c, "Cannot delete product with non-zero inventory (positive or negative). Reconcile stock first, then set the product to inactive.")
 		return
 	}
 
@@ -1168,7 +1353,9 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 			COALESCE(cos.expense_account_id, pc.expense_account_id) as expense_account_id,
 			COALESCE(cos.stock_valuation_account_id, pc.stock_valuation_account_id) as stock_valuation_account_id,
 			COALESCE(cos.stock_input_account_id, pc.stock_input_account_id) as stock_input_account_id,
-			COALESCE(cos.stock_output_account_id, pc.stock_output_account_id) as stock_output_account_id
+			COALESCE(cos.stock_output_account_id, pc.stock_output_account_id) as stock_output_account_id,
+			(SELECT COUNT(*) FROM products
+			   WHERE category_id = pc.id AND tenant_id = pc.tenant_id AND deleted_at IS NULL) as product_count
 		FROM product_categories pc
 	`
 	args := []interface{}{tenantID}
@@ -1210,7 +1397,8 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 		var parentID, desc sql.NullString
 
 		err := rows.Scan(&cat.ID, &cat.TenantID, &parentID, &cat.Code, &cat.Name, &desc, &cat.IsActive, &cat.CreatedAt, &cat.UpdatedAt,
-			&cat.IncomeAccountID, &cat.ExpenseAccountID, &cat.StockValuationAccountID, &cat.StockInputAccountID, &cat.StockOutputAccountID)
+			&cat.IncomeAccountID, &cat.ExpenseAccountID, &cat.StockValuationAccountID, &cat.StockInputAccountID, &cat.StockOutputAccountID,
+			&cat.ProductCount)
 		if err != nil {
 			continue
 		}
@@ -1958,6 +2146,12 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 		origOrgPtr = &orgID
 	}
 
+	// Default UOM for bulk-imported rows. The Excel template doesn't expose
+	// UOM columns, so without this every imported product would land with
+	// unit_id = NULL, breaking downstream UI (PO modal, BOM, etc.) that
+	// expects to show the unit next to quantity. Looked up once per request.
+	defaultUnitID := h.resolveUOMCode(tenantID, "unit")
+
 	for i, p := range input.Products {
 		rowNum := i + 1
 
@@ -2374,12 +2568,14 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 			INSERT INTO products (
 				id, tenant_id, origin_organization_id, category_id, type,
 				code, sku, barcode, name, description,
+				unit_id, purchase_unit_id, sales_unit_id,
 				cost_price, list_price, is_active, tags,
 				created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)
 		`,
 			newID, tenantID, origOrgPtr, categoryID, pType,
 			code, skuPtr, barcodePtr, name, description,
+			defaultUnitID, defaultUnitID, defaultUnitID,
 			p.CostPrice, p.ListPrice, isActive, tagsJSON,
 			userID, now,
 		)

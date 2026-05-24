@@ -259,10 +259,10 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
-	// Generate sequential order number (PO-00001, PO-00002, ...)
-	var poCount int
-	h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
-	orderNumber := fmt.Sprintf("PO-%05d", poCount+1)
+	// Order number is generated below, AFTER orgID resolution, because the
+	// unique constraint is (tenant_id, organization_id, order_number).
+	// We honour a user-supplied OrderNumber if one came in.
+	orderNumber := input.OrderNumber
 
 	// Parse order date
 	orderDate := now
@@ -377,16 +377,38 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
-	// Start transaction
-	tx, err := h.db.Begin()
-	if err != nil {
-		h.log.Error("Failed to start transaction", "error", err)
-		response.InternalError(c, "Failed to create purchase order")
-		return
+	// Generate order number with MAX+1 scoped by (tenant, org). Must NOT
+	// filter on deleted_at — the unique constraint
+	// purchase_orders_tenant_org_order_number_key applies to every row
+	// (including soft-deleted), so excluding them would hand out numbers
+	// that are already taken and loop forever on collision retry. Mirrors
+	// the sales-orders fix.
+	nextOrderNumber := func() string {
+		var maxNum int
+		if orgIDPtr != nil {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM purchase_orders
+				WHERE tenant_id = $1 AND organization_id = $2
+				  AND order_number ~ '^PO-[0-9]+$'`,
+				tenantID, *orgIDPtr,
+			).Scan(&maxNum)
+		} else {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM purchase_orders
+				WHERE tenant_id = $1 AND organization_id IS NULL
+				  AND order_number ~ '^PO-[0-9]+$'`,
+				tenantID,
+			).Scan(&maxNum)
+		}
+		return fmt.Sprintf("PO-%05d", maxNum+1)
 	}
-	defer tx.Rollback()
 
-	// Insert purchase order
+	// Insert purchase order — done OUTSIDE the transaction so we can retry
+	// on a unique-constraint collision (which happens with concurrent POSTs
+	// racing for the same next number). The transaction below covers only
+	// the line items, matching the create-sales-order pattern.
 	query := `
 		INSERT INTO purchase_orders (
 			id, tenant_id, organization_id, order_number, vendor_id, contact_person_id,
@@ -398,19 +420,46 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 	`
 
-	_, err = tx.Exec(query,
-		id, tenantID, orgIDPtr, orderNumber, vendorID, contactPersonID,
-		orderDate, expectedDate, currencyID, exchangeRate,
-		subtotal, discountTotal, taxTotal, input.ShippingAmount, totalAmount,
-		entity.POStatusDraft, entity.PaymentStatusUnpaid, paymentTerms, vendorReference,
-		notes, internalNotes, warehouseID, vehicleNumber, requiresShipping, userID,
-		now, now,
-	)
-	if err != nil {
-		h.log.Error("Failed to insert purchase order", "error", err)
+	maxAttempts := 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if orderNumber == "" {
+			orderNumber = nextOrderNumber()
+		}
+
+		_, err = h.db.Exec(query,
+			id, tenantID, orgIDPtr, orderNumber, vendorID, contactPersonID,
+			orderDate, expectedDate, currencyID, exchangeRate,
+			subtotal, discountTotal, taxTotal, input.ShippingAmount, totalAmount,
+			entity.POStatusDraft, entity.PaymentStatusUnpaid, paymentTerms, vendorReference,
+			notes, internalNotes, warehouseID, vehicleNumber, requiresShipping, userID,
+			now, now,
+		)
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "purchase_orders_tenant_org_order_number_key") && input.OrderNumber == "" {
+			h.log.Warn("Purchase order number collision, retrying", "order_number", orderNumber, "attempt", attempt+1)
+			orderNumber = "" // force regeneration next iteration
+			continue
+		}
+		h.log.Error("Failed to insert purchase order", "error", err, "order_number", orderNumber)
 		response.InternalError(c, "Failed to create purchase order")
 		return
 	}
+	if err != nil {
+		h.log.Error("Failed to insert purchase order after retries", "error", err, "order_number", orderNumber)
+		response.InternalError(c, "Failed to create purchase order")
+		return
+	}
+
+	// Transaction now covers line-item inserts only.
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to create purchase order")
+		return
+	}
+	defer tx.Rollback()
 
 	// Insert line items
 	lineQuery := `
@@ -949,6 +998,14 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		result, err := tx.Exec(query, args...)
 		if err != nil {
 			h.log.Error("Failed to update purchase order", "error", err)
+			// Surface FK violations as structured 400s so the frontend can
+			// render a localised hint instead of a generic 500.
+			if strings.Contains(err.Error(), "purchase_orders_vendor_id_fkey") {
+				response.ErrorWithDetails(c, 400, "PO_INVALID_VENDOR",
+					"Selected supplier is no longer valid. Pick another supplier and save again.",
+					nil)
+				return
+			}
 			response.InternalError(c, "Failed to update purchase order")
 			return
 		}

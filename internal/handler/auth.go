@@ -416,6 +416,12 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	// Trim whitespace — browser autofill on some devices/browsers
+	// adds invisible leading/trailing spaces to form fields.
+	input.Email = strings.TrimSpace(input.Email)
+	input.Phone = strings.TrimSpace(input.Phone)
+	input.Password = strings.TrimSpace(input.Password)
+
 	// Validate: at least email or phone must be provided
 	if input.Email == "" && input.Phone == "" {
 		response.BadRequest(c, "Email or phone number is required")
@@ -448,11 +454,13 @@ func (h *Handler) Login(c *gin.Context) {
 	// values (e.g. an admin row with placeholder phone "12345") from
 	// matching a real number's last 9 digits by accident.
 	//
-	// Email matching stays exact.
-	lookupValue := input.Email
-	lookupClause := "email = $1"        // for queries where users is unaliased
-	lookupClauseU := "u.email = $1"     // for queries where users is aliased as u
-	lookupClauseTenant := "email = $2"  // for tenant-scoped query (param $2)
+	// Email matching: case-insensitive (different browsers/devices
+	// autocomplete with different casing — e.g. "User@Mail.com" vs
+	// "user@mail.com"). Using LOWER() on both sides.
+	lookupValue := strings.ToLower(input.Email)
+	lookupClause := "LOWER(email) = $1"        // for queries where users is unaliased
+	lookupClauseU := "LOWER(u.email) = $1"     // for queries where users is aliased as u
+	lookupClauseTenant := "LOWER(email) = $2"  // for tenant-scoped query (param $2)
 	if loginByPhone {
 		// Send the LAST 9 digits as the parameter — already normalized
 		// to digits-only by normalizePhone() above; truncate here.

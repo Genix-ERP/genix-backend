@@ -2142,7 +2142,10 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 		return
 	}
 
-	// Generate PDF
+	// Generate PDF. Forma 2 / 3 / 19 have regulated layouts with their
+	// own renderers. Everything else (acceptance, defect, plus any
+	// future ad-hoc types) falls through to the generic renderer so the
+	// PDF button works for them too instead of returning a 400.
 	var htmlContent string
 	switch actType {
 	case "ks2":
@@ -2152,8 +2155,7 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 	case "hidden_work":
 		htmlContent = h.renderForma19HTML(actID, tenantID, projectName, projectAddress, clientName)
 	default:
-		response.BadRequest(c, "PDF export not supported for this act type")
-		return
+		htmlContent = h.renderGenericActHTML(actID, tenantID, actType, projectName, projectAddress, clientName)
 	}
 
 	pdfBytes, pdfErr := htmlToPDF(htmlContent)

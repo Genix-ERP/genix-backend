@@ -2579,6 +2579,14 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 		return
 	}
 
+	// Fire-and-forget push to the Yuksalish CRM. Enqueue is a no-op if the
+	// building isn't linked or CRM env isn't configured, so it's safe to
+	// call unconditionally here. On failure it lands in crm_sync_queue and
+	// the background worker retries it.
+	if h.crmSync != nil {
+		h.crmSync.Enqueue(c.Request.Context(), tenantID, reportID)
+	}
+
 	response.Created(c, map[string]interface{}{
 		"id":      reportID,
 		"message": "Photo report created successfully",
