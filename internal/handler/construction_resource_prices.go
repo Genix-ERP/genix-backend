@@ -91,7 +91,14 @@ func (h *Handler) ListResourcePrices(c *gin.Context) {
 	}
 	if estimateIDStr != "" {
 		if estID, err := strconv.ParseInt(estimateIDStr, 10, 64); err == nil && estID > 0 {
-			q += fmt.Sprintf(" AND el.estimate_id = $%d", argIdx)
+			// Scope to the selected estimate, BUT always include rows from
+			// the project's __catalog__ estimate. Catalog rows are the
+			// resources the user manually created via the "+" button on
+			// the AddResourcePickerModal — they live in a hidden estimate
+			// per project so the Resurslar tab can show them regardless
+			// of which block is currently selected. Without this OR clause
+			// a freshly-created resource silently disappears from the tab.
+			q += fmt.Sprintf(" AND (el.estimate_id = $%d OR LOWER(COALESCE(e.source_type, '')) = 'catalog')", argIdx)
 			args = append(args, estID)
 			argIdx++
 		}

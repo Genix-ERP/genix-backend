@@ -979,10 +979,14 @@ func (h *Handler) CreateProjectResource(c *gin.Context) {
 	req.UOM = strings.TrimSpace(req.UOM)
 	rType := strings.ToLower(strings.TrimSpace(req.ResourceType))
 	switch rType {
-	case "labor", "equipment", "material":
+	case "labor", "equipment", "material", "machinery":
+		// 'machinery' = строительные машины и механизмы (construction
+		// machinery used to BUILD, MAШ.-Ч hours) — added as a separate
+		// bucket alongside 'equipment' (стационарное оборудование). Both
+		// classify into the MASHINA section on the frontend.
 		// ok
 	default:
-		response.BadRequest(c, "resource_type must be one of: labor, equipment, material")
+		response.BadRequest(c, "resource_type must be one of: labor, equipment, material, machinery")
 		return
 	}
 	if req.Name == "" {
@@ -1048,7 +1052,10 @@ func (h *Handler) CreateProjectResource(c *gin.Context) {
 	switch rType {
 	case "labor":
 		labRate = req.UnitPrice
-	case "equipment":
+	case "equipment", "machinery":
+		// Both stationary equipment and construction machinery park
+		// their unit price into equipment_rate — the frontend Form 2
+		// rollups already sum equipment_rate × quantity for both.
 		eqRate = req.UnitPrice
 	case "material":
 		matRate = req.UnitPrice
