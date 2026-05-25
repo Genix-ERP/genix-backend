@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -33,6 +34,8 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 	var (
 		status         string
 		plan           string
+		tenantCode     string
+		tenantName     string
 		trialEndsAt    sql.NullTime
 		accountClearAt sql.NullTime
 		isActive       bool
@@ -40,11 +43,11 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 	)
 
 	err := h.db.QueryRow(`
-		SELECT subscription_status, subscription_plan, trial_ends_at, account_clear_at, is_active,
-		       COALESCE(paid_users, 0)
+		SELECT subscription_status, subscription_plan, code, COALESCE(name, ''),
+		       trial_ends_at, account_clear_at, is_active, COALESCE(paid_users, 0)
 		FROM tenants
 		WHERE id = $1 AND deleted_at IS NULL
-	`, tenantID).Scan(&status, &plan, &trialEndsAt, &accountClearAt, &isActive, &paidUsers)
+	`, tenantID).Scan(&status, &plan, &tenantCode, &tenantName, &trialEndsAt, &accountClearAt, &isActive, &paidUsers)
 	if err != nil {
 		response.NotFound(c, "Tenant not found")
 		return
@@ -63,10 +66,12 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 	}
 
 	resp := gin.H{
-		"status":     status,
-		"plan":       plan,
-		"is_active":  isActive,
-		"paid_users": paidUsers,
+		"status":      status,
+		"plan":        plan,
+		"tenant_code": tenantCode,
+		"tenant_name": tenantName,
+		"is_active":   isActive,
+		"paid_users":  paidUsers,
 	}
 	if trialEndsAt.Valid {
 		resp["trial_ends_at"] = trialEndsAt.Time
@@ -270,7 +275,7 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 
 	// Only activate on final success
 	if payload.Status == "success" {
-		// Parse users count from plan string (e.g. "4users_monthly")
+		// Parse users count and billing period from plan string (e.g. "4users_monthly")
 		var paidUsers int
 		var billing string
 		fmt.Sscanf(plan, "%dusers_%s", &paidUsers, &billing)
@@ -278,20 +283,30 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 			paidUsers = 1
 		}
 
+		// Calculate subscription end date based on billing period
+		now := time.Now()
+		var endDate time.Time
+		switch billing {
+		case "yearly":
+			endDate = now.AddDate(1, 0, 0) // +1 year
+		default:
+			endDate = now.AddDate(0, 1, 0) // +1 month
+		}
+
 		h.db.Exec(`
 			UPDATE tenants
 			SET subscription_status = 'active',
-			    subscription_plan   = $2,
-			    paid_users          = $3,
+			    subscription_plan   = 'professional',
+			    paid_users          = $2,
 			    is_active           = true,
 			    trial_ends_at       = NULL,
-			    account_clear_at    = NULL,
+			    account_clear_at    = $3,
 			    updated_at          = NOW()
 			WHERE id = $1
-		`, tenantID, plan, paidUsers)
+		`, tenantID, paidUsers, endDate)
 
 		h.log.Info("Subscription activated via Multicard",
-			"tenant_id", tenantID, "plan", plan, "paid_users", paidUsers, "invoice", payload.InvoiceID)
+			"tenant_id", tenantID, "plan", plan, "paid_users", paidUsers, "ends_at", endDate, "invoice", payload.InvoiceID)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -369,18 +384,28 @@ func (h *Handler) VerifyPayment(c *gin.Context) {
 		if paidUsers < 1 {
 			paidUsers = 1
 		}
+
+		now := time.Now()
+		var endDate time.Time
+		switch billing {
+		case "yearly":
+			endDate = now.AddDate(1, 0, 0)
+		default:
+			endDate = now.AddDate(0, 1, 0)
+		}
+
 		h.db.Exec(`
 			UPDATE tenants
 			SET subscription_status = 'active',
-			    subscription_plan   = $2,
-			    paid_users          = $3,
+			    subscription_plan   = 'professional',
+			    paid_users          = $2,
 			    is_active           = true,
 			    trial_ends_at       = NULL,
-			    account_clear_at    = NULL,
+			    account_clear_at    = $3,
 			    updated_at          = NOW()
 			WHERE id = $1
-		`, tenantID, plan, paidUsers)
-		h.log.Info("VerifyPayment: subscription activated", "tenant_id", tenantID, "plan", plan)
+		`, tenantID, paidUsers, endDate)
+		h.log.Info("VerifyPayment: subscription activated", "tenant_id", tenantID, "plan", plan, "ends_at", endDate)
 	}
 
 	response.Success(c, gin.H{"status": ps.Status})
@@ -437,31 +462,197 @@ func (h *Handler) GetPaymentHistory(c *gin.Context) {
 	response.Success(c, payments)
 }
 
-// CleanExpiredTenants soft-deletes tenants whose account_clear_at has passed.
+// CleanExpiredTenants handles subscription lifecycle:
+// 1. Trial expired (trial_ends_at passed) → set past_due + account_clear_at = trial_ends_at + 30 days
+// 2. Active subscription expired (account_clear_at passed) → set past_due + account_clear_at = now + 30 days
+// 3. Past due for 30+ days (account_clear_at passed while past_due) → soft-delete
 // POST /admin/clean-expired-tenants
 func (h *Handler) CleanExpiredTenants(c *gin.Context) {
 	now := time.Now()
 
-	h.db.Exec(`
-		UPDATE tenants SET subscription_status = 'expired', is_active = false
+	// Step 1: Expired trials → past_due with 30-day grace period
+	r1, _ := h.db.Exec(`
+		UPDATE tenants
+		SET subscription_status = 'past_due',
+		    account_clear_at = trial_ends_at + INTERVAL '30 days',
+		    updated_at = NOW()
 		WHERE deleted_at IS NULL
-		  AND subscription_status NOT IN ('active', 'expired')
-		  AND account_clear_at IS NOT NULL
-		  AND account_clear_at < $1
+		  AND subscription_status = 'trialing'
+		  AND trial_ends_at IS NOT NULL
+		  AND trial_ends_at < $1
 	`, now)
+	trialExpired, _ := r1.RowsAffected()
 
-	result, err := h.db.Exec(`
-		UPDATE tenants SET deleted_at = NOW()
+	// Step 2: Active subscriptions expired → past_due with 30-day grace
+	r2, _ := h.db.Exec(`
+		UPDATE tenants
+		SET subscription_status = 'past_due',
+		    account_clear_at = account_clear_at + INTERVAL '30 days',
+		    updated_at = NOW()
 		WHERE deleted_at IS NULL
-		  AND subscription_status = 'expired'
+		  AND subscription_status = 'active'
 		  AND account_clear_at IS NOT NULL
 		  AND account_clear_at < $1
 	`, now)
-	if err != nil {
-		response.InternalServerError(c, "Failed to clean expired tenants")
-		return
+	subExpired, _ := r2.RowsAffected()
+
+	// Step 3: Past due for 30+ days → mark expired and deactivate
+	r3, _ := h.db.Exec(`
+		UPDATE tenants
+		SET subscription_status = 'expired', is_active = false, updated_at = NOW()
+		WHERE deleted_at IS NULL
+		  AND subscription_status = 'past_due'
+		  AND account_clear_at IS NOT NULL
+		  AND account_clear_at < $1
+	`, now)
+	deactivated, _ := r3.RowsAffected()
+
+	// Step 4: Disabled — keeping expired tenant data for now
+	var deleted int64
+
+	h.log.Info("CleanExpiredTenants completed",
+		"trial_expired", trialExpired, "sub_expired", subExpired,
+		"deactivated", deactivated, "deleted", deleted)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":        true,
+		"trial_expired":  trialExpired,
+		"sub_expired":    subExpired,
+		"deactivated":    deactivated,
+		"tenants_deleted": deleted,
+	})
+}
+
+// HardDeleteTenant permanently removes ALL data for a tenant from every table.
+func (h *Handler) hardDeleteTenantData(tenantID string) (int, error) {
+	// Order matters: delete child tables first, parent tables last.
+	// All these tables have tenant_id column.
+	tables := []string{
+		// Manufacturing
+		"work_order_time_logs", "work_order_materials", "production_material_consumption",
+		"production_split_outputs", "quality_checks", "quality_defects", "quality_control_points",
+		"oee_metrics", "downtime_logs", "equipment_maintenance", "manufacturing_equipment",
+		"work_center_calendar", "manufacturing_shifts", "mrp_recommendations", "mrp_supply", "mrp_demand",
+		"work_orders", "production_orders", "manufacturing_categories", "work_centers",
+		// Inventory
+		"inventory_transactions", "inventory_lots", "inventory",
+		"stock_operation_step_log", "stock_operation_lines", "stock_operations",
+		"operation_type_steps", "warehouse_operation_types", "warehouse_locations",
+		"scrap_order_lines", "scrap_orders", "scrap_reasons",
+		"stock_count_items", "stock_counts", "transfer_order_lines", "transfer_orders",
+		"reorder_rules", "reorder_alerts",
+		// Products
+		"product_organization_settings", "product_variant_values", "product_variants",
+		"product_attribute_values", "product_attributes", "product_packagings",
+		"bom_operations", "bom_lines", "product_boms", "products", "product_categories", "units_of_measure",
+		// Sales
+		"sales_order_lines", "sales_orders", "sales_invoice_lines", "sales_invoices",
+		"sales_return_lines", "sales_returns", "delivery_order_lines", "delivery_orders",
+		"quotation_lines", "quotations",
+		// Purchase
+		"purchase_order_lines", "purchase_orders", "purchase_invoice_lines", "purchase_invoices",
+		"purchase_return_lines", "purchase_returns",
+		"goods_receipt_lines", "goods_receipts",
+		"rfq_lines", "rfq_responses", "rfqs",
+		"vendor_prices", "blanket_order_lines", "blanket_orders",
+		"procurement_contracts", "procurement_rules",
+		// Finance
+		"journal_entry_lines", "journal_entries", "journals",
+		"payment_allocations", "payments", "payment_methods",
+		"bank_reconciliation_items", "bank_reconciliations", "bank_transactions", "bank_accounts",
+		"cash_book_entries", "cash_orders", "cash_registers", "cash_transactions",
+		"budget_lines", "budgets", "fiscal_periods", "fiscal_years",
+		"reconciliation_act_lines", "reconciliation_acts",
+		"accounts", "tax_rates", "exchange_rates", "currencies",
+		// HR
+		"payroll_lines", "payroll_periods",
+		"attendance_records", "leave_requests", "leave_allocations",
+		"employee_contracts", "employees",
+		// CRM
+		"crm_attachments", "activities", "opportunity_stages", "pipeline_stages",
+		"opportunities", "leads",
+		// Projects & Construction
+		"project_expenses", "project_team_members", "tasks", "projects",
+		"construction_stage_materials", "construction_stages", "construction_buildings",
+		"building_files", "construction_projects",
+		// Expenses & Assets
+		"expense_lines", "expenses", "fixed_asset_depreciation", "fixed_assets",
+		// Cargo
+		"cargo_shipment_items", "cargo_shipments",
+		// Misc
+		"subscription_payments", "contact_submissions",
+		"approval_step_actions", "approval_steps", "approval_workflow_instances", "approval_workflows",
+		"notifications", "audit_logs", "attachments", "ai_conversations", "ai_prompts",
+		"sequences", "settings", "tenant_settings",
+		// Installed apps
+		"installed_apps",
+		// User & org (last)
+		"user_roles", "role_permissions", "roles", "api_keys",
+		"departments", "organizations",
+		"users",
 	}
 
-	rows, _ := result.RowsAffected()
-	c.JSON(http.StatusOK, gin.H{"success": true, "tenants_archived": rows})
+	totalDeleted := 0
+	for _, table := range tables {
+		result, err := h.db.Exec(fmt.Sprintf("DELETE FROM %s WHERE tenant_id = $1", table), tenantID)
+		if err != nil {
+			// Table might not exist or have different schema — skip
+			h.log.Warn("hardDeleteTenantData: failed to delete from table", "table", table, "error", err)
+			continue
+		}
+		rows, _ := result.RowsAffected()
+		if rows > 0 {
+			h.log.Info("hardDeleteTenantData: deleted rows", "table", table, "rows", rows)
+			totalDeleted += int(rows)
+		}
+	}
+
+	// Finally delete the tenant itself
+	h.db.Exec("DELETE FROM tenants WHERE id = $1", tenantID)
+	totalDeleted++
+
+	return totalDeleted, nil
+}
+
+// RunSubscriptionCleanupScheduler runs CleanExpiredTenants daily at 03:00 Tashkent time.
+func (h *Handler) RunSubscriptionCleanupScheduler(ctx context.Context) {
+	go func() {
+		loc, _ := time.LoadLocation("Asia/Tashkent")
+		if loc == nil {
+			loc = time.FixedZone("UZT", 5*3600)
+		}
+
+		for {
+			// Calculate next 03:00 Tashkent
+			nowTashkent := time.Now().In(loc)
+			next := time.Date(nowTashkent.Year(), nowTashkent.Month(), nowTashkent.Day(), 3, 0, 0, 0, loc)
+			if next.Before(nowTashkent) {
+				next = next.Add(24 * time.Hour)
+			}
+			sleepDur := next.Sub(time.Now())
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(sleepDur):
+			}
+
+			h.log.Info("Running scheduled subscription cleanup")
+			now := time.Now()
+
+			// Same logic as CleanExpiredTenants but without gin.Context
+			r1, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'past_due', account_clear_at = trial_ends_at + INTERVAL '30 days', updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'trialing' AND trial_ends_at IS NOT NULL AND trial_ends_at < $1`, now)
+			r2, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'past_due', account_clear_at = account_clear_at + INTERVAL '30 days', updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'active' AND account_clear_at IS NOT NULL AND account_clear_at < $1`, now)
+			r3, _ := h.db.Exec(`UPDATE tenants SET subscription_status = 'expired', is_active = false, updated_at = NOW() WHERE deleted_at IS NULL AND subscription_status = 'past_due' AND account_clear_at IS NOT NULL AND account_clear_at < $1`, now)
+
+			t1, _ := r1.RowsAffected()
+			t2, _ := r2.RowsAffected()
+			t3, _ := r3.RowsAffected()
+
+			// Hard-delete disabled — keeping expired tenant data for now
+			var t4 int64
+
+			h.log.Info("Subscription cleanup done", "trial_expired", t1, "sub_expired", t2, "deactivated", t3, "deleted", t4)
+		}
+	}()
 }

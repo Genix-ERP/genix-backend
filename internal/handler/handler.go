@@ -122,6 +122,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 
 	// Multicard payment webhook (public - called by Multicard servers)
 	rg.POST("/webhooks/multicard", h.MulticardWebhook)
+
+	// Public lead capture from external websites (embed script)
+	rg.POST("/public/leads", h.PublicCreateLead)
 }
 
 // registerProtectedRoutes registers routes that require authentication
@@ -1500,6 +1503,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	admin.Use(middleware.RequireSystemAdmin())
 	{
 		admin.GET("/users", h.ListAllSystemUsers)
+		admin.GET("/tenants", h.ListAllTenants)
+		admin.GET("/tenants/:id", h.GetTenantDetails)
+		admin.PUT("/tenants/:id/activate", h.ActivateTenantSubscription)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
 		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
 		// /admin/migrations — read-only view over schema_migrations so a
