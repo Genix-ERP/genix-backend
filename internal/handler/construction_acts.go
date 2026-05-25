@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -36,6 +37,7 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 	actType := c.Query("type")
 	state := c.Query("state")
 	subcontractIDStr := c.Query("subcontract_id")
+	buildingIDStr := c.Query("building_id") // new: per-building filter
 
 	query := `
 		SELECT a.id, a.name, a.act_type, a.project_id, a.subcontract_id,
@@ -49,9 +51,13 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 		       a.signed_contractor_at, a.signed_client_at,
 		       a.stage_id, a.location_axes, a.works_start_date, a.works_end_date,
 		       a.signed_designer_at, a.signed_gasn_at,
-		       a.cumul_from_start, a.cumul_from_year_start
+		       a.cumul_from_start, a.cumul_from_year_start,
+		       a.building_id,
+		       COALESCE(b.name, '') as building_name,
+		       COALESCE(b.code, '') as building_code
 		FROM construction_act a
 		LEFT JOIN construction_subcontract s ON s.id = a.subcontract_id
+		LEFT JOIN construction_buildings b ON b.id = a.building_id
 		LEFT JOIN users u ON u.id = a.approved_by
 		LEFT JOIN users cu ON cu.id = a.created_by
 		WHERE a.project_id = $1 AND a.tenant_id = $2
@@ -74,6 +80,13 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 		query += fmt.Sprintf(" AND a.subcontract_id = $%d", argCount)
 		subID, _ := strconv.ParseInt(subcontractIDStr, 10, 64)
 		args = append(args, subID)
+	}
+	if buildingIDStr != "" {
+		if bID, parseErr := strconv.ParseInt(buildingIDStr, 10, 64); parseErr == nil && bID > 0 {
+			argCount++
+			query += fmt.Sprintf(" AND a.building_id = $%d", argCount)
+			args = append(args, bID)
+		}
 	}
 
 	query += " ORDER BY a.created_date DESC"
@@ -109,6 +122,8 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 		var worksStartDate, worksEndDate sql.NullTime
 		var signedDesignerAt, signedGasnAt sql.NullTime
 		var cumulFromStart, cumulFromYearStart sql.NullFloat64
+		var buildingID sql.NullInt64
+		var buildingName, buildingCode string
 
 		if err := rows.Scan(
 			&id, &name, &actTypeVal, &projectIDVal, &subcontractID,
@@ -121,6 +136,7 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 			&stageID, &locationAxes, &worksStartDate, &worksEndDate,
 			&signedDesignerAt, &signedGasnAt,
 			&cumulFromStart, &cumulFromYearStart,
+			&buildingID, &buildingName, &buildingCode,
 		); err != nil {
 			h.log.Error("Failed to scan act", "error", err)
 			continue
@@ -133,6 +149,9 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 			"project_id":             projectIDVal,
 			"subcontract_id":         nullInt64Val(subcontractID),
 			"subcontract_name":       subcontractName,
+			"building_id":            nullInt64Val(buildingID),
+			"building_name":          buildingName,
+			"building_code":          buildingCode,
 			"period_from":            nullTimeVal(periodFrom),
 			"period_to":              nullTimeVal(periodTo),
 			"amount_total":           amountTotal,
@@ -297,13 +316,16 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 		}
 	}
 
-	// Auto-generate name
+	// Auto-generate name. Migration 327 renamed the user-facing labels from
+	// "KS-2 / KS-3" to "Forma 2 / Forma 3"; mirror that here so new acts are
+	// named "Forma 2-001" / "Forma 3-001" instead of "KS2-001" / "KS3-001".
+	// The internal act_type values (ks2 / ks3) stay the same.
 	prefix := "ACT"
 	switch req.ActType {
 	case "ks2":
-		prefix = "KS2"
+		prefix = "Forma 2"
 	case "ks3":
-		prefix = "KS3"
+		prefix = "Forma 3"
 	case "hidden_work":
 		prefix = "F19"
 	}
@@ -478,10 +500,13 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 			WHERE p.id = $1
 		`, projectID).Scan(&pmUserID)
 		if err == nil && pmUserID != uuid.Nil {
+			// `act_name` is stored in `data` so the web can re-render the
+			// notification body in the user's current UI language via
+			// notificationCatalog.js. Additive — mobile still reads title/message.
 			h.createNotification(tenantID, pmUserID, "forma19_created",
 				"Yashirin ishlar akti yaratildi",
 				fmt.Sprintf("Yangi Forma 19 yaratildi: %s. Tekshirish va imzolash talab etiladi.", name),
-				map[string]interface{}{"project_id": projectID, "act_id": actID})
+				map[string]interface{}{"project_id": projectID, "act_id": actID, "act_name": name})
 		}
 	}
 
@@ -801,9 +826,22 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	var req struct {
-		SubcontractID int64  `json:"subcontract_id"`
-		PeriodFrom    string `json:"period_from" binding:"required"`
-		PeriodTo      string `json:"period_to" binding:"required"`
+		SubcontractID             int64  `json:"subcontract_id"`
+		BuildingID                int64  `json:"building_id"`            // 0 = all buildings (project-wide)
+		PeriodFrom                string `json:"period_from" binding:"required"`
+		PeriodTo                  string `json:"period_to" binding:"required"`
+		ClientName                string `json:"client_name"`
+		ClientPhone               string `json:"client_phone"`
+		ClientAddress             string `json:"client_address"`
+		ClientBankName            string `json:"client_bank_name"`
+		ClientBankAccount         string `json:"client_bank_account"`
+		ClientMFO                 string `json:"client_mfo"`
+		ClientSTIR                string `json:"client_stir"`
+		ClientOKONH               string `json:"client_okonh"`
+		ContractNumber            string `json:"contract_number"`
+		ObjectFullName            string `json:"object_full_name"`
+		ClientDirectorName        string `json:"client_director_name"`
+		ClientChiefAccountantName string `json:"client_chief_accountant_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
@@ -811,6 +849,33 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	userID, _ := middleware.GetUserID(c)
+
+	// Save client requisites to project if provided
+	if req.ClientName != "" {
+		h.saveProjectClientDetails(tenantID, projectID, req.ClientName, req.ClientPhone, req.ClientAddress,
+			req.ClientBankName, req.ClientBankAccount, req.ClientMFO, req.ClientSTIR, req.ClientOKONH,
+			req.ContractNumber, req.ObjectFullName, req.ClientDirectorName, req.ClientChiefAccountantName)
+	}
+
+	// Validate project has required client details for KS-2
+	if !h.projectHasRequiredClientDetails(tenantID, projectID) {
+		response.Error(c, http.StatusBadRequest, "MISSING_CLIENT_DETAILS",
+			"Loyiha buyurtmachi ma'lumotlari to'ldirilmagan (nomi, STIR, bank, MFO, manzil)")
+		return
+	}
+
+	// If a specific building is requested, verify it belongs to this project
+	if req.BuildingID > 0 {
+		var ok bool
+		h.db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM construction_buildings
+			WHERE id = $1 AND project_id = $2 AND tenant_id = $3
+		)`, req.BuildingID, projectID, tenantID).Scan(&ok)
+		if !ok {
+			response.BadRequest(c, "Tanlangan bino ushbu loyihaga tegishli emas")
+			return
+		}
+	}
 
 	wbsIDs := []int64{}
 
@@ -885,14 +950,30 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 			continue
 		}
 
-		rows, err := h.db.Query(`
-			SELECT el.id, el.name, el.uom, el.unit_rate, COALESCE(el.quantity, 0)
-			FROM construction_estimate_line el
-			JOIN construction_estimate e ON e.id = el.estimate_id
-			WHERE el.wbs_id = $1 AND e.is_current = true AND e.tenant_id = $2
-			LIMIT 1
-		`, wbsID, tenantID)
-		if err != nil {
+		// When a specific building is requested, restrict the estimate-line
+		// pick to that building (via construction_estimate.building_id). Else
+		// stay project-wide (legacy behaviour).
+		var rows *sql.Rows
+		var queryErr error
+		if req.BuildingID > 0 {
+			rows, queryErr = h.db.Query(`
+				SELECT el.id, el.name, el.uom, el.unit_rate, COALESCE(el.quantity, 0)
+				FROM construction_estimate_line el
+				JOIN construction_estimate e ON e.id = el.estimate_id
+				WHERE el.wbs_id = $1 AND e.is_current = true AND e.tenant_id = $2
+				  AND e.building_id = $3
+				LIMIT 1
+			`, wbsID, tenantID, req.BuildingID)
+		} else {
+			rows, queryErr = h.db.Query(`
+				SELECT el.id, el.name, el.uom, el.unit_rate, COALESCE(el.quantity, 0)
+				FROM construction_estimate_line el
+				JOIN construction_estimate e ON e.id = el.estimate_id
+				WHERE el.wbs_id = $1 AND e.is_current = true AND e.tenant_id = $2
+				LIMIT 1
+			`, wbsID, tenantID)
+		}
+		if queryErr != nil {
 			continue
 		}
 
@@ -916,7 +997,9 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	if len(lineDataList) == 0 {
-		if req.SubcontractID > 0 {
+		if req.BuildingID > 0 {
+			response.BadRequest(c, "Tanlangan bino va davr uchun ishlar topilmadi")
+		} else if req.SubcontractID > 0 {
 			response.BadRequest(c, "Tanlangan davr uchun bu subpudratchi bo'yicha ishlar topilmadi")
 		} else {
 			response.BadRequest(c, "Tanlangan davr uchun ishlar topilmadi")
@@ -948,17 +1031,18 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	var actID int64
 	err = tx.QueryRow(`
 		INSERT INTO construction_act (
-			tenant_id, project_id, subcontract_id, name, act_type,
+			tenant_id, project_id, subcontract_id, building_id, name, act_type,
 			period_from, period_to, amount_total, currency,
 			state, created_by, created_date, updated_date,
 			act_number, vat_pct
-		) VALUES ($1, $2, $3, $4, 'ks2', $5, $6, 0, 'UZS', 'draft', $7, NOW(), NOW(), $8, 12)
+		) VALUES ($1, $2, $3, $4, $5, 'ks2', $6, $7, 0, 'UZS', 'draft', $8, NOW(), NOW(), $9, 12)
 		RETURNING id
-	`, tenantID, projectID, nullInt64FromVal(req.SubcontractID), name, req.PeriodFrom, req.PeriodTo, userID, actNumber,
+	`, tenantID, projectID, nullInt64FromVal(req.SubcontractID), nullInt64FromVal(req.BuildingID),
+		name, req.PeriodFrom, req.PeriodTo, userID, actNumber,
 	).Scan(&actID)
 	if err != nil {
-		h.log.Error("Failed to create KS-2 act", "error", err)
-		response.InternalError(c, "Failed to create KS-2")
+		h.log.Error("Failed to create Forma 2 act", "error", err)
+		response.InternalError(c, "Failed to create Forma 2")
 		return
 	}
 
@@ -988,7 +1072,7 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 	}
 
 	h.logConstructionActivity(tenantID, projectID, userID, "act",
-		fmt.Sprintf("KS-2 avtomatik yaratildi: %s (%.0f so'm)", name, totalAmount), "Act", actID)
+		fmt.Sprintf("Forma 2 avtomatik yaratildi: %s (%.0f so'm)", name, totalAmount), "Act", actID)
 
 	response.Created(c, map[string]interface{}{
 		"id":                    actID,
@@ -998,7 +1082,7 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 		"vat_amount":            vatAmount,
 		"amount_total_with_vat": totalWithVat,
 		"lines_count":           len(lineDataList),
-		"message":               "KS-2 act auto-generated successfully",
+		"message":               "Forma 2 act auto-generated successfully",
 	})
 }
 
@@ -1020,6 +1104,7 @@ func (h *Handler) PreviewAutoGenerateKS2(c *gin.Context) {
 
 	var req struct {
 		SubcontractID int64  `json:"subcontract_id"`
+		BuildingID    int64  `json:"building_id"`
 		PeriodFrom    string `json:"period_from" binding:"required"`
 		PeriodTo      string `json:"period_to" binding:"required"`
 	}
@@ -1094,13 +1179,27 @@ func (h *Handler) PreviewAutoGenerateKS2(c *gin.Context) {
 			continue
 		}
 
-		rows, err := h.db.Query(`
-			SELECT el.id, el.name, el.uom, el.unit_rate, COALESCE(el.quantity, 0)
-			FROM construction_estimate_line el
-			JOIN construction_estimate e ON e.id = el.estimate_id
-			WHERE el.wbs_id = $1 AND e.is_current = true AND e.tenant_id = $2
-			LIMIT 1
-		`, wbsID, tenantID)
+		var rows *sql.Rows
+		var queryErr error
+		if req.BuildingID > 0 {
+			rows, queryErr = h.db.Query(`
+				SELECT el.id, el.name, el.uom, el.unit_rate, COALESCE(el.quantity, 0)
+				FROM construction_estimate_line el
+				JOIN construction_estimate e ON e.id = el.estimate_id
+				WHERE el.wbs_id = $1 AND e.is_current = true AND e.tenant_id = $2
+				  AND e.building_id = $3
+				LIMIT 1
+			`, wbsID, tenantID, req.BuildingID)
+		} else {
+			rows, queryErr = h.db.Query(`
+				SELECT el.id, el.name, el.uom, el.unit_rate, COALESCE(el.quantity, 0)
+				FROM construction_estimate_line el
+				JOIN construction_estimate e ON e.id = el.estimate_id
+				WHERE el.wbs_id = $1 AND e.is_current = true AND e.tenant_id = $2
+				LIMIT 1
+			`, wbsID, tenantID)
+		}
+		err := queryErr
 		if err != nil {
 			continue
 		}
@@ -1274,7 +1373,7 @@ func (h *Handler) SignAct(c *gin.Context) {
 
 	// Validate role is valid for act type
 	if actType == "ks2" && (req.Role == "designer" || req.Role == "gasn") {
-		response.BadRequest(c, "KS-2 aktlari faqat pudratchi va buyurtmachi imzolarini qo'llab-quvvatlaydi")
+		response.BadRequest(c, "Forma 2 aktlari faqat pudratchi va buyurtmachi imzolarini qo'llab-quvvatlaydi")
 		return
 	}
 
@@ -1344,10 +1443,11 @@ func (h *Handler) SignAct(c *gin.Context) {
 			WHERE p.id = $1
 		`, projectID).Scan(&pmUserID)
 		if pmUserID != uuid.Nil {
+			// `act_type` carried in `data` for the web renderer; additive.
 			h.createNotification(tenantID, pmUserID, "act_signed",
 				"Akt imzolandi",
 				fmt.Sprintf("Akt barcha tomonlar tomonidan imzolandi (loyiha: %d)", projectID),
-				map[string]interface{}{"project_id": projectID, "act_id": actID})
+				map[string]interface{}{"project_id": projectID, "act_id": actID, "act_type": actType})
 		}
 
 		// Recalculate Forma 3 if a KS-2 was signed
@@ -1437,13 +1537,14 @@ func (h *Handler) CancelAct(c *gin.Context) {
 	`, projectID).Scan(&pmUserID, &ceUserID)
 
 	notifMsg := fmt.Sprintf("Akt bekor qilindi. Sabab: %s", req.RejectionReason)
+	// `reason` carried in `data` so the web renderer can rebuild the body in
+	// the current UI language. Mobile continues to use the frozen notifMsg.
+	notifData := map[string]interface{}{"project_id": projectID, "act_id": actID, "reason": req.RejectionReason}
 	if pmUserID != uuid.Nil {
-		h.createNotification(tenantID, pmUserID, "act_cancelled", "Akt bekor qilindi", notifMsg,
-			map[string]interface{}{"project_id": projectID, "act_id": actID})
+		h.createNotification(tenantID, pmUserID, "act_cancelled", "Akt bekor qilindi", notifMsg, notifData)
 	}
 	if ceUserID != uuid.Nil && ceUserID != pmUserID {
-		h.createNotification(tenantID, ceUserID, "act_cancelled", "Akt bekor qilindi", notifMsg,
-			map[string]interface{}{"project_id": projectID, "act_id": actID})
+		h.createNotification(tenantID, ceUserID, "act_cancelled", "Akt bekor qilindi", notifMsg, notifData)
 	}
 
 	response.Success(c, map[string]interface{}{
@@ -1576,9 +1677,22 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	}
 
 	var req struct {
-		SubcontractID int64  `json:"subcontract_id"`
-		PeriodFrom    string `json:"period_from" binding:"required"`
-		PeriodTo      string `json:"period_to" binding:"required"`
+		SubcontractID             int64  `json:"subcontract_id"`
+		BuildingID                int64  `json:"building_id"` // 0 = project-wide
+		PeriodFrom                string `json:"period_from" binding:"required"`
+		PeriodTo                  string `json:"period_to" binding:"required"`
+		ClientName                string `json:"client_name"`
+		ClientPhone               string `json:"client_phone"`
+		ClientAddress             string `json:"client_address"`
+		ClientBankName            string `json:"client_bank_name"`
+		ClientBankAccount         string `json:"client_bank_account"`
+		ClientMFO                 string `json:"client_mfo"`
+		ClientSTIR                string `json:"client_stir"`
+		ClientOKONH               string `json:"client_okonh"`
+		ContractNumber            string `json:"contract_number"`
+		ObjectFullName            string `json:"object_full_name"`
+		ClientDirectorName        string `json:"client_director_name"`
+		ClientChiefAccountantName string `json:"client_chief_accountant_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Boshlanish va tugash sanalarini kiriting")
@@ -1587,7 +1701,36 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
-	// Build subcontract filter for SQL queries
+	// Save client requisites to project if provided
+	if req.ClientName != "" {
+		h.saveProjectClientDetails(tenantID, projectID, req.ClientName, req.ClientPhone, req.ClientAddress,
+			req.ClientBankName, req.ClientBankAccount, req.ClientMFO, req.ClientSTIR, req.ClientOKONH,
+			req.ContractNumber, req.ObjectFullName, req.ClientDirectorName, req.ClientChiefAccountantName)
+	}
+
+	// Validate project has required client details for KS-3
+	if !h.projectHasRequiredClientDetails(tenantID, projectID) {
+		response.Error(c, http.StatusBadRequest, "MISSING_CLIENT_DETAILS",
+			"Loyiha buyurtmachi ma'lumotlari to'ldirilmagan (nomi, STIR, bank, MFO, manzil)")
+		return
+	}
+
+	// Verify the building belongs to this project
+	if req.BuildingID > 0 {
+		var ok bool
+		h.db.QueryRow(`SELECT EXISTS (
+			SELECT 1 FROM construction_buildings
+			WHERE id = $1 AND project_id = $2 AND tenant_id = $3
+		)`, req.BuildingID, projectID, tenantID).Scan(&ok)
+		if !ok {
+			response.BadRequest(c, "Tanlangan bino ushbu loyihaga tegishli emas")
+			return
+		}
+	}
+
+	// Build subcontract + building filter for SQL queries. The $N numbers
+	// are preserved from the original code; we append the building as an
+	// extra AND-clause when needed (no positional conflict).
 	var subFilter string
 	var subFilterArgs []interface{}
 	if req.SubcontractID > 0 {
@@ -1596,6 +1739,13 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	} else {
 		subFilter = "subcontract_id IS NULL AND project_id = $1"
 		subFilterArgs = []interface{}{projectID}
+	}
+	if req.BuildingID > 0 {
+		// Append as last positional arg — callers concatenate $2,$3,$4
+		// (period_from, period_to, tenant_id) after this filter, so we must
+		// stay at $1. Instead, inline the building_id as a raw int64 (safe —
+		// validated above).
+		subFilter = fmt.Sprintf("%s AND building_id = %d", subFilter, req.BuildingID)
 	}
 
 	// Check there are signed KS-2 acts for this period
@@ -1663,31 +1813,38 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	var ks3ID int64
 	err = tx.QueryRow(`
 		INSERT INTO construction_act (
-			tenant_id, project_id, subcontract_id, name, act_type,
+			tenant_id, project_id, subcontract_id, building_id, name, act_type,
 			period_from, period_to, amount_total, vat_pct, vat_amount, amount_total_with_vat,
 			currency, state, created_by, created_date, updated_date,
 			act_number, cumul_from_start, cumul_from_year_start, cumul_previous_period,
 			smr_amount, equipment_amount, other_amount
-		) VALUES ($1, $2, $3, $4, 'ks3', $5, $6, $7, $8, $9, $10,
-			'UZS', 'draft', $11, NOW(), NOW(),
-			$12, $13, $14, $15,
-			$7, 0, 0
+		) VALUES ($1, $2, $3, $4, $5, 'ks3', $6, $7, $8, $9, $10, $11,
+			'UZS', 'draft', $12, NOW(), NOW(),
+			$13, $14, $15, $16,
+			$8, 0, 0
 		)
 		RETURNING id
-	`, tenantID, projectID, nullInt64FromVal(req.SubcontractID), name,
+	`, tenantID, projectID, nullInt64FromVal(req.SubcontractID), nullInt64FromVal(req.BuildingID), name,
 		req.PeriodFrom, req.PeriodTo, periodAmount, vatPct, vatAmount, totalWithVat,
 		userID,
 		actNumber, cumulFromStart, cumulFromYearStart, cumulPrevPeriod,
 	).Scan(&ks3ID)
 	if err != nil {
-		h.log.Error("Failed to create KS-3", "error", err)
-		response.InternalError(c, "Failed to create KS-3")
+		h.log.Error("Failed to create Forma 3", "error", err)
+		response.InternalError(c, "Failed to create Forma 3")
 		return
 	}
 
-	// Copy lines from all signed KS-2 in the period
+	// Copy lines from all signed KS-2 in the period. When a specific
+	// building is requested, only copy lines from KS-2 acts that belong to
+	// that building (using the building_id column added in migration 328).
 	var copyQuery string
 	var copyArgs []interface{}
+	buildingClause := ""
+	if req.BuildingID > 0 {
+		// Safe: BuildingID is int64 already validated above.
+		buildingClause = fmt.Sprintf(" AND a.building_id = %d", req.BuildingID)
+	}
 	if req.SubcontractID > 0 {
 		copyQuery = `
 			INSERT INTO construction_act_line (act_id, wbs_id, estimate_line_id, name, uom, quantity, unit_rate, total_amount, sort_order, qty_smeta, note)
@@ -1696,7 +1853,7 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 			JOIN construction_act a ON a.id = al.act_id
 			WHERE a.subcontract_id = $2 AND a.act_type = 'ks2' AND a.state = 'signed'
 			  AND a.period_from >= $3::date AND a.period_to <= $4::date
-			  AND a.tenant_id = $5
+			  AND a.tenant_id = $5` + buildingClause + `
 			ORDER BY al.sort_order`
 		copyArgs = []interface{}{ks3ID, req.SubcontractID, req.PeriodFrom, req.PeriodTo, tenantID}
 	} else {
@@ -1707,7 +1864,7 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 			JOIN construction_act a ON a.id = al.act_id
 			WHERE a.subcontract_id IS NULL AND a.project_id = $2 AND a.act_type = 'ks2' AND a.state = 'signed'
 			  AND a.period_from >= $3::date AND a.period_to <= $4::date
-			  AND a.tenant_id = $5
+			  AND a.tenant_id = $5` + buildingClause + `
 			ORDER BY al.sort_order`
 		copyArgs = []interface{}{ks3ID, projectID, req.PeriodFrom, req.PeriodTo, tenantID}
 	}
@@ -1725,7 +1882,7 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 	}
 
 	h.logConstructionActivity(tenantID, projectID, userID, "act",
-		fmt.Sprintf("KS-3 yaratildi: %s (%.0f so'm)", name, periodAmount), "Act", ks3ID)
+		fmt.Sprintf("Forma 3 yaratildi: %s (%.0f so'm)", name, periodAmount), "Act", ks3ID)
 
 	response.Created(c, map[string]interface{}{
 		"id":                    ks3ID,
@@ -1736,7 +1893,7 @@ func (h *Handler) GenerateForma3(c *gin.Context) {
 		"cumul_from_start":      cumulFromStart,
 		"cumul_from_year_start": cumulFromYearStart,
 		"cumul_previous_period": cumulPrevPeriod,
-		"message":               "KS-3 generated successfully",
+		"message":               "Forma 3 generated successfully",
 	})
 }
 
@@ -1758,13 +1915,14 @@ func (h *Handler) GenerateKS3FromKS2(c *gin.Context) {
 	var ks2State, ks2Type string
 	var periodFrom, periodTo sql.NullTime
 	var ks2Amount float64
+	var ks2BuildingID sql.NullInt64
 
 	err = h.db.QueryRow(`
-		SELECT project_id, COALESCE(subcontract_id, 0), state, act_type, period_from, period_to, amount_total
+		SELECT project_id, COALESCE(subcontract_id, 0), state, act_type, period_from, period_to, amount_total, building_id
 		FROM construction_act WHERE id = $1 AND tenant_id = $2
-	`, ks2ID, tenantID).Scan(&projectID, &subcontractID, &ks2State, &ks2Type, &periodFrom, &periodTo, &ks2Amount)
+	`, ks2ID, tenantID).Scan(&projectID, &subcontractID, &ks2State, &ks2Type, &periodFrom, &periodTo, &ks2Amount, &ks2BuildingID)
 	if err != nil {
-		response.NotFound(c, "KS-2 act not found")
+		response.NotFound(c, "Forma 2 act not found")
 		return
 	}
 
@@ -1773,7 +1931,7 @@ func (h *Handler) GenerateKS3FromKS2(c *gin.Context) {
 		return
 	}
 	if ks2State != "approved" && ks2State != "signed" {
-		response.BadRequest(c, "KS-2 must be approved or signed before generating KS-3")
+		response.BadRequest(c, "Forma 2 must be approved or signed before generating Forma 3")
 		return
 	}
 
@@ -1804,22 +1962,22 @@ func (h *Handler) GenerateKS3FromKS2(c *gin.Context) {
 	var ks3ID int64
 	err = tx.QueryRow(`
 		INSERT INTO construction_act (
-			tenant_id, project_id, subcontract_id, name, act_type,
+			tenant_id, project_id, subcontract_id, building_id, name, act_type,
 			period_from, period_to, amount_total, vat_pct, vat_amount, amount_total_with_vat,
 			currency, state, ks2_source_id, created_by, created_date, updated_date,
 			cumul_from_start, cumul_previous_period, smr_amount
-		) VALUES ($1, $2, $3, $4, 'ks3', $5, $6, $7, 12, $8, $9,
-			'UZS', 'draft', $10, $11, NOW(), NOW(),
-			$12, $13, $7
+		) VALUES ($1, $2, $3, $4, $5, 'ks3', $6, $7, $8, 12, $9, $10,
+			'UZS', 'draft', $11, $12, NOW(), NOW(),
+			$13, $14, $8
 		)
 		RETURNING id
-	`, tenantID, projectID, nullInt64FromVal(subcontractID), name,
+	`, tenantID, projectID, nullInt64FromVal(subcontractID), ks2BuildingID, name,
 		periodFrom, periodTo, ks2Amount, vatAmount, totalWithVat, ks2ID, userID,
 		cumulFromStart, cumulFromStart-ks2Amount,
 	).Scan(&ks3ID)
 	if err != nil {
-		h.log.Error("Failed to create KS-3", "error", err)
-		response.InternalError(c, "Failed to create KS-3")
+		h.log.Error("Failed to create Forma 3", "error", err)
+		response.InternalError(c, "Failed to create Forma 3")
 		return
 	}
 
@@ -1842,7 +2000,7 @@ func (h *Handler) GenerateKS3FromKS2(c *gin.Context) {
 	}
 
 	h.logConstructionActivity(tenantID, projectID, userID, "act",
-		fmt.Sprintf("KS-3 yaratildi: %s (KS-2 dan)", name), "Act", ks3ID)
+		fmt.Sprintf("Forma 3 yaratildi: %s (Forma 2 dan)", name), "Act", ks3ID)
 
 	response.Created(c, map[string]interface{}{
 		"id":                    ks3ID,
@@ -1851,7 +2009,7 @@ func (h *Handler) GenerateKS3FromKS2(c *gin.Context) {
 		"vat_amount":            vatAmount,
 		"amount_total_with_vat": totalWithVat,
 		"cumul_from_start":      cumulFromStart,
-		"message":               "KS-3 generated from KS-2 successfully",
+		"message":               "Forma 3 generated from Forma 2 successfully",
 	})
 }
 
@@ -1984,7 +2142,10 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 		return
 	}
 
-	// Generate PDF
+	// Generate PDF. Forma 2 / 3 / 19 have regulated layouts with their
+	// own renderers. Everything else (acceptance, defect, plus any
+	// future ad-hoc types) falls through to the generic renderer so the
+	// PDF button works for them too instead of returning a 400.
 	var htmlContent string
 	switch actType {
 	case "ks2":
@@ -1994,8 +2155,7 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 	case "hidden_work":
 		htmlContent = h.renderForma19HTML(actID, tenantID, projectName, projectAddress, clientName)
 	default:
-		response.BadRequest(c, "PDF export not supported for this act type")
-		return
+		htmlContent = h.renderGenericActHTML(actID, tenantID, actType, projectName, projectAddress, clientName)
 	}
 
 	pdfBytes, pdfErr := htmlToPDF(htmlContent)
@@ -2172,4 +2332,53 @@ func nullFloat64Val(n sql.NullFloat64) interface{} {
 		return math.Round(n.Float64*100) / 100
 	}
 	return nil
+}
+
+// projectHasRequiredClientDetails checks if a construction project has all required
+// client details filled in for generating KS-2 and KS-3 documents.
+func (h *Handler) projectHasRequiredClientDetails(tenantID uuid.UUID, projectID int64) bool {
+	var clientName, clientStir, clientBankName, clientBankAccount, clientMfo, clientAddress sql.NullString
+	err := h.db.QueryRow(`
+		SELECT client_name, client_stir, client_bank_name, client_bank_account, client_mfo, client_address
+		FROM construction_projects WHERE id = $1 AND tenant_id = $2
+	`, projectID, tenantID).Scan(&clientName, &clientStir, &clientBankName, &clientBankAccount, &clientMfo, &clientAddress)
+	if err != nil {
+		return false
+	}
+	return clientName.Valid && strings.TrimSpace(clientName.String) != "" &&
+		clientStir.Valid && strings.TrimSpace(clientStir.String) != "" &&
+		clientBankName.Valid && strings.TrimSpace(clientBankName.String) != "" &&
+		clientBankAccount.Valid && strings.TrimSpace(clientBankAccount.String) != "" &&
+		clientMfo.Valid && strings.TrimSpace(clientMfo.String) != "" &&
+		clientAddress.Valid && strings.TrimSpace(clientAddress.String) != ""
+}
+
+// saveProjectClientDetails persists client requisites to the construction project.
+// Called when KS-2/KS-3 forms are created with inline client details.
+func (h *Handler) saveProjectClientDetails(tenantID uuid.UUID, projectID int64,
+	clientName, clientPhone, clientAddress, clientBankName, clientBankAccount,
+	clientMFO, clientSTIR, clientOKONH, contractNumber, objectFullName,
+	clientDirectorName, clientChiefAccountantName string) {
+
+	_, err := h.db.Exec(`
+		UPDATE construction_projects SET
+			client_name = COALESCE(NULLIF($1, ''), client_name),
+			client_phone = COALESCE(NULLIF($2, ''), client_phone),
+			client_address = COALESCE(NULLIF($3, ''), client_address),
+			client_bank_name = COALESCE(NULLIF($4, ''), client_bank_name),
+			client_bank_account = COALESCE(NULLIF($5, ''), client_bank_account),
+			client_mfo = COALESCE(NULLIF($6, ''), client_mfo),
+			client_stir = COALESCE(NULLIF($7, ''), client_stir),
+			client_okonh = COALESCE(NULLIF($8, ''), client_okonh),
+			contract_number = COALESCE(NULLIF($9, ''), contract_number),
+			object_full_name = COALESCE(NULLIF($10, ''), object_full_name),
+			client_director_name = COALESCE(NULLIF($11, ''), client_director_name),
+			client_chief_accountant_name = COALESCE(NULLIF($12, ''), client_chief_accountant_name)
+		WHERE id = $13 AND tenant_id = $14
+	`, clientName, clientPhone, clientAddress, clientBankName, clientBankAccount,
+		clientMFO, clientSTIR, clientOKONH, contractNumber, objectFullName,
+		clientDirectorName, clientChiefAccountantName, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to save project client details", "error", err, "projectID", projectID)
+	}
 }

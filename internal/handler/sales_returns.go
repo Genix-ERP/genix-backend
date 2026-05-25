@@ -3,9 +3,11 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/listparams"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +25,10 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 	status := c.Query("status")
 	customerID := c.Query("customer_id")
 
+	lp := listparams.Parse(c,
+		[]string{"created_at", "return_number", "customer_name", "total_amount", "return_date", "status"},
+		"created_at")
+
 	query := `
 		SELECT sr.id, sr.tenant_id, sr.return_number, sr.sales_invoice_id, sr.sales_order_id, sr.customer_id, sr.customer_name,
 			   sr.return_date, sr.reason, sr.subtotal, sr.tax_amount, sr.total_amount, sr.status,
@@ -31,6 +37,7 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 		FROM sales_returns sr
 		LEFT JOIN sales_orders so ON so.id = sr.sales_order_id
 		WHERE sr.tenant_id = $1 AND sr.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM sales_returns sr WHERE sr.tenant_id = $1 AND sr.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -39,22 +46,38 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
 		query += fmt.Sprintf(" AND sr.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sr.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	if status != "" {
 		argCount++
 		query += fmt.Sprintf(" AND sr.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sr.status = $%d", argCount)
 		args = append(args, status)
 	}
 
 	if customerID != "" {
 		argCount++
 		query += fmt.Sprintf(" AND sr.customer_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sr.customer_id = $%d", argCount)
 		args = append(args, customerID)
 	}
 
-	query += " ORDER BY sr.created_at DESC"
+	// Search
+	if lp.Search != "" {
+		argCount++
+		pattern := "%" + strings.ToLower(lp.Search) + "%"
+		query += fmt.Sprintf(" AND (LOWER(sr.return_number) LIKE $%d OR LOWER(sr.customer_name) LIKE $%d)", argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(sr.return_number) LIKE $%d OR LOWER(sr.customer_name) LIKE $%d)", argCount, argCount)
+		args = append(args, pattern)
+	}
+
+	var total int
+	h.db.QueryRow(countQuery, args...).Scan(&total)
+
+	query += lp.OrderClause("sr.") + fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	args = append(args, lp.PageSize, lp.Offset())
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -137,7 +160,7 @@ func (h *Handler) ListSalesReturns(c *gin.Context) {
 		returns = []map[string]interface{}{}
 	}
 
-	response.Success(c, returns)
+	response.Paginated(c, returns, lp.Page, lp.PageSize, total)
 }
 
 // GetSalesReturn returns a single sales return by ID
@@ -199,6 +222,13 @@ func (h *Handler) CreateSalesReturn(c *gin.Context) {
 			UnitPrice   float64 `json:"unit_price"`
 			Condition   string  `json:"condition"`
 		} `json:"items"`
+		// Optional: explicit allocations of the return amount across specific
+		// unpaid invoices. When present, ApproveSalesReturn applies the return
+		// to these invoices instead of FIFO-picking them by due date.
+		InvoiceAllocations []struct {
+			InvoiceID string  `json:"invoice_id"`
+			Amount    float64 `json:"amount"`
+		} `json:"invoice_allocations"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -288,6 +318,28 @@ func (h *Handler) CreateSalesReturn(c *gin.Context) {
 		)
 		if err != nil {
 			h.log.Error("Failed to create sales return item", "error", err, "item_index", i)
+		}
+	}
+
+	// Persist optional invoice allocations. We validate light-touch here
+	// (parseable UUID + positive amount); the actual balance checks happen on
+	// approval when we know invoice balances are still valid.
+	for _, alloc := range input.InvoiceAllocations {
+		if alloc.Amount <= 0 {
+			continue
+		}
+		invID, err := uuid.Parse(alloc.InvoiceID)
+		if err != nil {
+			continue
+		}
+		_, err = h.db.Exec(`
+			INSERT INTO sales_return_invoice_allocations (id, sales_return_id, sales_invoice_id, amount, created_at)
+			VALUES ($1, $2, $3, $4, $5)`,
+			uuid.New(), returnID, invID, alloc.Amount, now,
+		)
+		if err != nil {
+			h.log.Error("Failed to persist return invoice allocation", "error", err,
+				"return_id", returnID, "invoice_id", invID)
 		}
 	}
 
@@ -451,13 +503,13 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 
 	// Get return details for journal entry
 	var returnNumber, customerName string
-	var customerID sql.NullString
+	var customerID, returnSalesOrderID sql.NullString
 	var totalAmount float64
 	err = h.db.QueryRow(`
-		SELECT return_number, customer_id, customer_name, total_amount
+		SELECT return_number, customer_id, customer_name, total_amount, sales_order_id
 		FROM sales_returns WHERE id = $1 AND tenant_id = $2 AND status = 'pending' AND deleted_at IS NULL`,
 		returnID, tenantID,
-	).Scan(&returnNumber, &customerID, &customerName, &totalAmount)
+	).Scan(&returnNumber, &customerID, &customerName, &totalAmount, &returnSalesOrderID)
 	if err == sql.ErrNoRows {
 		response.BadRequest(c, "Return not found or not in pending status")
 		return
@@ -499,8 +551,8 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 		WHERE sr.id = $1`, returnID).Scan(&returnOrgID)
 
 	// Get accounts — lookup by name first, then code fallback
-	arAccountID := findAccount(h.db, tenantID, returnOrgID, "accounts receivable", "1100")
-	revenueAccountID := findAccount(h.db, tenantID, returnOrgID, "sales revenue", "4000")
+	arAccountID := findAccount(h.db, tenantID, returnOrgID, "accounts receivable", "4010")
+	revenueAccountID := findAccount(h.db, tenantID, returnOrgID, "sales revenue", "9010")
 
 	// Get journal
 	var journalID uuid.UUID
@@ -556,6 +608,345 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 		}
 	} else {
 		h.log.Warn("Could not create credit note - missing accounts or journal", "ar_account", arAccountID, "revenue_account", revenueAccountID, "journal", journalID)
+	}
+
+	// Deduct return total from customer balance
+	if customerID.Valid {
+		_, err := h.db.Exec(
+			"UPDATE contacts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
+			totalAmount, now, customerID.String,
+		)
+		if err != nil {
+			h.log.Error("Failed to update customer balance for return", "error", err, "customer_id", customerID.String)
+		} else {
+			h.log.Info("Customer balance deducted for sales return", "customer_id", customerID.String, "amount", totalAmount)
+		}
+	}
+
+	// =====================================================
+	// RESTOCK INVENTORY + INVENTORY JOURNAL (reversal of COGS)
+	// Physically: returned items go back into stock.
+	// Accounting: Dr Inventory (asset), Cr COGS (expense) at cost.
+	// =====================================================
+	items := h.loadSalesReturnItems(returnID)
+	var totalCostReversal float64
+
+	for _, item := range items {
+		productIDStr, okPid := item["product_id"].(string)
+		if !okPid || productIDStr == "" {
+			continue
+		}
+		productID, err := uuid.Parse(productIDStr)
+		if err != nil {
+			continue
+		}
+		quantity, _ := item["quantity"].(float64)
+		unitPrice, _ := item["unit_price"].(float64)
+		if quantity <= 0 {
+			continue
+		}
+
+		// Accumulate cost basis for COGS reversal journal
+		var costPrice float64
+		h.db.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, productID).Scan(&costPrice)
+		totalCostReversal += costPrice * quantity
+
+		// Find or create inventory record for this product
+		var inventoryID, warehouseID uuid.UUID
+		var currentQty float64
+		invErr := h.db.QueryRow(`
+			SELECT id, quantity_on_hand, warehouse_id FROM inventory
+			WHERE tenant_id = $1 AND product_id = $2
+			LIMIT 1`,
+			tenantID, productID,
+		).Scan(&inventoryID, &currentQty, &warehouseID)
+
+		if invErr == sql.ErrNoRows {
+			inventoryID = uuid.New()
+			h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 LIMIT 1", tenantID).Scan(&warehouseID)
+			if warehouseID == uuid.Nil {
+				h.log.Warn("No warehouse found for inventory restock", "product_id", productID)
+				continue
+			}
+			_, err = h.db.Exec(`
+				INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+				inventoryID, tenantID, productID, warehouseID, quantity, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create inventory record on return approval", "error", err, "product_id", productID)
+				continue
+			}
+		} else if invErr == nil {
+			_, err = h.db.Exec(`
+				UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, updated_at = $2
+				WHERE id = $3`,
+				quantity, now, inventoryID,
+			)
+			if err != nil {
+				h.log.Error("Failed to update inventory on return approval", "error", err, "inventory_id", inventoryID)
+				continue
+			}
+		} else {
+			h.log.Error("Inventory lookup failed on return approval", "error", invErr)
+			continue
+		}
+
+		// Audit trail row
+		txID := uuid.New()
+		h.db.Exec(`
+			INSERT INTO inventory_transactions (
+				id, tenant_id, inventory_id, transaction_type, quantity,
+				unit_cost, total_cost, reference_type, reference_id,
+				reason, transaction_date, created_at
+			) VALUES ($1, $2, $3, 'return', $4, $5, $6, 'sales_return', $7, 'Sales Return - Customer Return', $8, $8)
+		`, txID, tenantID, inventoryID, quantity, unitPrice, quantity*unitPrice, returnID, now)
+	}
+
+	// Inventory/COGS reversal journal entry
+	if totalCostReversal > 0 {
+		inventoryAcctID := findAccount(h.db, tenantID, returnOrgID, "inventory", "1010")
+		cogsAcctID := findAccount(h.db, tenantID, returnOrgID, "cost of goods", "9110")
+		if cogsAcctID == uuid.Nil {
+			cogsAcctID = findAccount(h.db, tenantID, returnOrgID, "cogs", "9110")
+		}
+
+		var invJournalID uuid.UUID
+		h.db.QueryRow(`
+			SELECT id FROM journals
+			WHERE tenant_id = $1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END
+			LIMIT 1`, tenantID,
+		).Scan(&invJournalID)
+
+		if inventoryAcctID != uuid.Nil && cogsAcctID != uuid.Nil && invJournalID != uuid.Nil {
+			invEntryNumber := fmt.Sprintf("INV-CN-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
+			invEntryID := uuid.New()
+			_, err := h.db.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
+				invEntryID, tenantID, returnOrgID, invJournalID, invEntryNumber, now, returnNumber,
+				fmt.Sprintf("Inventory restock from Sales Return %s - %s", returnNumber, customerName),
+				"sales_return_inventory", returnID, totalCostReversal, totalCostReversal, approvedBy, now, now,
+			)
+			if err != nil {
+				h.log.Error("Failed to create inventory reversal journal entry", "error", err)
+			} else {
+				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					uuid.New(), invEntryID, inventoryAcctID, "Inventory Restock - Sales Return", totalCostReversal, 0, 1, now,
+				)
+				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					uuid.New(), invEntryID, cogsAcctID, "COGS Reversal - Sales Return", 0, totalCostReversal, 2, now,
+				)
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCostReversal, now, inventoryAcctID)
+				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCostReversal, now, cogsAcctID)
+				h.log.Info("Inventory reversal journal created", "return_id", returnID, "entry_number", invEntryNumber, "amount", totalCostReversal)
+			}
+		} else {
+			h.log.Warn("Could not create inventory reversal journal - missing accounts/journal",
+				"inventory_account", inventoryAcctID, "cogs_account", cogsAcctID, "journal", invJournalID)
+		}
+	}
+
+	// =====================================================
+	// APPLY return amount to customer's unpaid invoices.
+	// Priority order:
+	//   1) Explicit allocations (sales_return_invoice_allocations) — user picked
+	//      specific invoices at create time.
+	//   2) If the return is tied to a sales order, apply the return total to
+	//      that order's linked invoice first (clamped to its balance). Any
+	//      leftover falls through to FIFO.
+	//   3) FIFO over all unpaid invoices (oldest due first).
+	// =====================================================
+	if customerID.Valid {
+		custUUID, parseErr := uuid.Parse(customerID.String)
+		if parseErr == nil {
+			// First check whether explicit allocations exist.
+			allocRows, allocErr := h.db.Query(`
+				SELECT sales_invoice_id, amount FROM sales_return_invoice_allocations
+				WHERE sales_return_id = $1`, returnID,
+			)
+			var explicit []struct {
+				id     uuid.UUID
+				amount float64
+			}
+			if allocErr == nil {
+				for allocRows.Next() {
+					var id uuid.UUID
+					var amt float64
+					if err := allocRows.Scan(&id, &amt); err == nil {
+						explicit = append(explicit, struct {
+							id     uuid.UUID
+							amount float64
+						}{id: id, amount: amt})
+					}
+				}
+				allocRows.Close()
+			}
+
+			// If no explicit allocations but the return is tied to a sales
+			// order, synthesise an allocation against that order's invoice.
+			// This is the new default flow — user picks an order in the UI
+			// and the return credits that order's invoice.
+			if len(explicit) == 0 && returnSalesOrderID.Valid {
+				if soUUID, err := uuid.Parse(returnSalesOrderID.String); err == nil {
+					var soInvoiceID uuid.UUID
+					var soInvBalance float64
+					err := h.db.QueryRow(`
+						SELECT id, COALESCE(total_amount, 0) - COALESCE(amount_paid, 0)
+						FROM sales_invoices
+						WHERE tenant_id = $1 AND sales_order_id = $2 AND deleted_at IS NULL
+						  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+						ORDER BY created_at ASC LIMIT 1`,
+						tenantID, soUUID,
+					).Scan(&soInvoiceID, &soInvBalance)
+					if err == nil && soInvBalance > 0.005 {
+						apply := totalAmount
+						if apply > soInvBalance {
+							apply = soInvBalance
+						}
+						explicit = append(explicit, struct {
+							id     uuid.UUID
+							amount float64
+						}{id: soInvoiceID, amount: apply})
+						h.log.Info("Synthesised allocation from sales_order_id",
+							"return_id", returnID, "sales_order_id", soUUID,
+							"invoice_id", soInvoiceID, "apply", apply)
+					} else if err != nil && err != sql.ErrNoRows {
+						h.log.Warn("Failed to look up SO invoice for return", "error", err,
+							"return_id", returnID, "sales_order_id", soUUID)
+					}
+				}
+			}
+
+			// A return reduces the invoice's total (the value of goods invoiced
+			// drops). We do NOT mark it as "paid" — that would lie about money
+			// received. Any return amount beyond the outstanding balance
+			// becomes a customer credit (handled by the contacts.current_balance
+			// deduction below, which uses the full totalAmount regardless of
+			// how much actually landed on invoices).
+			type invUpdate struct {
+				id    uuid.UUID
+				apply float64
+			}
+			var updates []invUpdate
+			var applied float64
+
+			if len(explicit) > 0 {
+				for _, a := range explicit {
+					var invTotal, invPaid float64
+					var invCustomer uuid.UUID
+					err := h.db.QueryRow(`
+						SELECT COALESCE(total_amount, 0), COALESCE(amount_paid, 0), customer_id
+						FROM sales_invoices
+						WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+						a.id, tenantID,
+					).Scan(&invTotal, &invPaid, &invCustomer)
+					if err != nil {
+						h.log.Warn("Return allocation references missing invoice",
+							"return_id", returnID, "invoice_id", a.id, "error", err)
+						continue
+					}
+					if invCustomer != custUUID {
+						h.log.Warn("Return allocation invoice belongs to different customer — skipping",
+							"return_id", returnID, "invoice_id", a.id)
+						continue
+					}
+					balance := invTotal - invPaid
+					if balance <= 0.005 {
+						continue
+					}
+					apply := a.amount
+					if apply > balance {
+						apply = balance
+					}
+					updates = append(updates, invUpdate{id: a.id, apply: apply})
+					applied += apply
+				}
+				h.log.Info("Applied explicit allocations for sales return",
+					"return_id", returnID, "customer_id", customerID.String,
+					"allocations", len(explicit), "applied", applied, "total", totalAmount)
+			} else {
+				// Fallback: FIFO over all unpaid invoices (oldest due first).
+				remaining := totalAmount
+				invRows, invErr := h.db.Query(`
+					SELECT id, COALESCE(total_amount, 0), COALESCE(amount_paid, 0)
+					FROM sales_invoices
+					WHERE tenant_id = $1 AND customer_id = $2 AND deleted_at IS NULL
+					  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+					  AND status NOT IN ('paid', 'cancelled', 'draft')
+					  AND COALESCE(total_amount, 0) - COALESCE(amount_paid, 0) > 0.005
+					ORDER BY due_date ASC NULLS LAST, created_at ASC`,
+					tenantID, custUUID,
+				)
+				if invErr == nil {
+					for invRows.Next() {
+						if remaining <= 0.005 {
+							break
+						}
+						var invID uuid.UUID
+						var invTotal, invPaid float64
+						if err := invRows.Scan(&invID, &invTotal, &invPaid); err != nil {
+							continue
+						}
+						balance := invTotal - invPaid
+						if balance <= 0.005 {
+							continue
+						}
+						apply := remaining
+						if apply > balance {
+							apply = balance
+						}
+						updates = append(updates, invUpdate{id: invID, apply: apply})
+						remaining -= apply
+						applied += apply
+					}
+					invRows.Close()
+				}
+				h.log.Info("FIFO-applied sales return to customer invoices",
+					"return_id", returnID, "customer_id", customerID.String,
+					"applied", applied, "leftover", totalAmount-applied)
+			}
+
+			for _, u := range updates {
+				// Reduce the invoice's total_amount by the applied return amount.
+				// GREATEST(..., amount_paid) keeps the balance non-negative if
+				// anything had already been paid. Status flips to 'paid' only
+				// when balance fully closes (new total == paid). amount_due is
+				// a generated column so it recomputes automatically.
+				_, execErr := h.db.Exec(
+					`UPDATE sales_invoices
+					    SET total_amount = GREATEST(total_amount - $1, amount_paid),
+					        status = CASE
+					            WHEN GREATEST(total_amount - $1, amount_paid) <= amount_paid + 0.005 THEN 'paid'
+					            ELSE status
+					        END,
+					        updated_at = $2
+					  WHERE id = $3`,
+					u.apply, now, u.id,
+				)
+				if execErr != nil {
+					h.log.Error("Failed to reduce invoice total after return",
+						"error", execErr, "invoice_id", u.id, "return_id", returnID)
+				}
+			}
+		}
+	}
+
+	// =====================================================
+	// COMPLETE the return in one shot — no separate "Process Refund" step.
+	// =====================================================
+	_, err = h.db.Exec(`
+		UPDATE sales_returns
+		SET status = 'completed', refund_status = 'processed', refund_method = COALESCE(refund_method, 'credit_note'),
+		    refund_date = $1, updated_at = $2
+		WHERE id = $3`,
+		now, now, returnID,
+	)
+	if err != nil {
+		h.log.Error("Failed to mark return completed after approval", "error", err)
 	}
 
 	ret, _ := h.getSalesReturnByID(tenantID, returnID)
@@ -773,8 +1164,8 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 			WHERE sr.id = $1`, returnID).Scan(&refundOrgID)
 
 		// Get accounts — lookup by name first, then code fallback
-		arAccountID := findAccount(h.db, tenantID, refundOrgID, "accounts receivable", "1100")
-		cashAccountID := findAccount(h.db, tenantID, refundOrgID, "cash", "1000")
+		arAccountID := findAccount(h.db, tenantID, refundOrgID, "accounts receivable", "4010")
+		cashAccountID := findAccount(h.db, tenantID, refundOrgID, "cash", "5010")
 
 		// Get journal
 		var journalID uuid.UUID

@@ -720,14 +720,17 @@ func (h *Handler) DeleteWarehouse(c *gin.Context) {
 		return
 	}
 
-	// Check for existing inventory
+	// Check for existing inventory. Use `<> 0` (not `> 0`) so warehouses with
+	// negative balances are also blocked — otherwise deleting a warehouse with
+	// negative stock orphans the negative rows in inventory (same root cause as
+	// the soft-deleted-product / ghost-row bug). Force reconciliation first.
 	var hasInventory bool
 	h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM inventory WHERE warehouse_id = $1 AND tenant_id = $2 AND quantity_on_hand > 0)
+		SELECT EXISTS(SELECT 1 FROM inventory WHERE warehouse_id = $1 AND tenant_id = $2 AND quantity_on_hand <> 0)
 	`, id, tenantID).Scan(&hasInventory)
 
 	if hasInventory {
-		response.BadRequest(c, "Cannot delete warehouse with existing inventory. Set to inactive instead.")
+		response.BadRequest(c, "Cannot delete warehouse with non-zero inventory (positive or negative). Reconcile stock first, then set the warehouse to inactive.")
 		return
 	}
 
@@ -1228,14 +1231,16 @@ func (h *Handler) DeleteWarehouseLocation(c *gin.Context) {
 		return
 	}
 
-	// Check for inventory at this location
+	// Check for inventory at this location. Use `<> 0` so a location with a
+	// negative balance also blocks the delete — otherwise we orphan rows that
+	// silently affect aggregate stock totals.
 	var hasInventory bool
 	h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM inventory WHERE location_id = $1 AND quantity_on_hand > 0)
+		SELECT EXISTS(SELECT 1 FROM inventory WHERE location_id = $1 AND quantity_on_hand <> 0)
 	`, locationID).Scan(&hasInventory)
 
 	if hasInventory {
-		response.BadRequest(c, "Cannot delete location with existing inventory. Move inventory first.")
+		response.BadRequest(c, "Cannot delete location with non-zero inventory (positive or negative). Move or reconcile inventory first.")
 		return
 	}
 

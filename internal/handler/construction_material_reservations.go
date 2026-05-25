@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"net/http"
 	"strconv"
 	"time"
 
@@ -253,11 +254,26 @@ func (h *Handler) CreateMaterialReservation(c *gin.Context) {
 		`, req.Quantity, now, productID, warehouseID, tenantID)
 	}
 
-	// Notify inventory users
-	h.createNotificationForAllTenantUsers(tenantID, "low_stock", map[string]interface{}{
+	// Notify inventory users that a material reservation is pending.
+	//
+	// This used to be emitted as `low_stock` which was semantically wrong
+	// (it's a reservation request, not a stock-level alert) and resulted
+	// in garbled text like "Product Reservation request for product
+	// (qty: 3.00) is running low ( remaining)" on the web.
+	//
+	// Now emitted as a dedicated type `material_reservation_request` with
+	// the real fields packed into `data` so the web renderer can build a
+	// proper localised body. Falls back to the frozen title/message for
+	// historical rows and on mobile.
+	var productName string
+	h.db.QueryRow(`SELECT COALESCE(name, '') FROM products WHERE id = $1 AND tenant_id = $2`,
+		productID, tenantID).Scan(&productName)
+	h.createNotificationForAllTenantUsers(tenantID, "material_reservation_request", map[string]interface{}{
 		"reservation_id": id.String(),
 		"product_id":     productID.String(),
-	}, fmt.Sprintf("Reservation request for product (qty: %.2f)", req.Quantity), "")
+		"product_name":   productName,
+		"quantity":       req.Quantity,
+	}, productName, fmt.Sprintf("%.2f", req.Quantity))
 
 	response.Created(c, map[string]interface{}{
 		"id":         id,
@@ -327,7 +343,21 @@ func (h *Handler) ApproveMaterialReservation(c *gin.Context) {
 			FROM inventory WHERE product_id = $1 AND warehouse_id = $2 AND tenant_id = $3
 		`, productID, warehouseID, tenantID).Scan(&onHand)
 		if onHand < quantity {
-			response.BadRequest(c, fmt.Sprintf("Insufficient stock. Available: %.2f, Requested: %.2f", onHand, quantity))
+			// Emit as a structured error (code + details) so the web can
+			// render a localised toast ("Yetarli emas. Mavjud: 151, So'ralgan:
+			// 200" / "Недостаточно на складе…" / "Insufficient stock…")
+			// through src/utils/apiErrors.js. The english `message` field is
+			// preserved as a fallback for clients that don't know the code.
+			response.ErrorWithDetails(
+				c,
+				http.StatusBadRequest,
+				"INSUFFICIENT_STOCK",
+				fmt.Sprintf("Insufficient stock. Available: %.2f, Requested: %.2f", onHand, quantity),
+				map[string]string{
+					"available": fmt.Sprintf("%.2f", onHand),
+					"requested": fmt.Sprintf("%.2f", quantity),
+				},
+			)
 			return
 		}
 	}
@@ -341,31 +371,47 @@ func (h *Handler) ApproveMaterialReservation(c *gin.Context) {
 
 	now := time.Now()
 
-	// 1. Update reservation status
-	tx.Exec(`
+	// 1. Update reservation status.
+	//
+	// Critical `tx.Exec` returns are now checked. Before this fix they were
+	// all ignored: when a later statement (the since-removed inventory
+	// movements INSERT, see below) errored because its table did not exist,
+	// the Postgres transaction entered the "aborted" state and every
+	// subsequent statement cascaded with
+	//   "current transaction is aborted, commands ignored until end of
+	//    transaction block"
+	// producing the 500 that was observed on reservation approval.
+	if _, err := tx.Exec(`
 		UPDATE material_reservations
 		SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2
 		WHERE id = $3
-	`, userID, now, resID)
+	`, userID, now, resID); err != nil {
+		h.log.Error("Failed to update reservation status", "error", err)
+		response.InternalError(c, "Failed to approve reservation")
+		return
+	}
 
-	// 2. Deduct from inventory (quantity_on_hand) and release reserved
+	// 2. Deduct from inventory (quantity_on_hand) and release reserved.
+	//
+	// The follow-up `INSERT INTO inventory_movements (...)` call that used to
+	// sit here was removed: no CREATE TABLE for `inventory_movements` exists
+	// in any migration and nothing else in the codebase reads from it. The
+	// broken INSERT was the first statement to abort the transaction, which
+	// in turn cascaded through the expense-line insert and the journal-entry
+	// insert. If a proper inventory-movement audit trail is desired later,
+	// create the table in a migration and restore a checked Exec here.
 	if warehouseID != nil {
-		tx.Exec(`
+		if _, err := tx.Exec(`
 			UPDATE inventory
 			SET quantity_on_hand = quantity_on_hand - $1,
 				quantity_reserved = quantity_reserved - $1,
 				updated_at = $2
 			WHERE product_id = $3 AND warehouse_id = $4 AND tenant_id = $5
-		`, quantity, now, productID, warehouseID, tenantID)
-
-		// Record inventory movement
-		tx.Exec(`
-			INSERT INTO inventory_movements (
-				id, tenant_id, product_id, warehouse_id, movement_type,
-				quantity, unit_cost, reference_type, reference_id,
-				notes, created_at
-			) VALUES ($1,$2,$3,$4,'out',$5,$6,'material_reservation',$7,'Material reservation approved',$8)
-		`, uuid.New(), tenantID, productID, warehouseID, quantity, unitCost, resID.String(), now)
+		`, quantity, now, productID, warehouseID, tenantID); err != nil {
+			h.log.Error("Failed to update inventory on approval", "error", err)
+			response.InternalError(c, "Failed to approve reservation")
+			return
+		}
 	}
 
 	// 3. Create construction expense line
@@ -397,7 +443,7 @@ func (h *Handler) ApproveMaterialReservation(c *gin.Context) {
 	var creditAcct uuid.UUID
 	h.db.QueryRow(`SELECT COALESCE(inventory_account_id, '00000000-0000-0000-0000-000000000000') FROM products WHERE id = $1`, productID).Scan(&creditAcct)
 	if creditAcct == uuid.Nil {
-		creditAcct = findAccount(h.db, tenantID, orgIDPtr, "material", "1000")
+		creditAcct = findAccount(h.db, tenantID, orgIDPtr, "material", "1010")
 	}
 
 	var journalEntryID uuid.UUID

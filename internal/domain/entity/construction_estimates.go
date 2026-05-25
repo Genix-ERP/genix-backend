@@ -150,6 +150,50 @@ type ConstructionEstimateLine struct {
 	ResourceType     string `json:"resource_type" db:"resource_type"`
 	ParentItemNumber string `json:"parent_item_number" db:"parent_item_number"`
 
+	// Sub-line (подкатор) support — migration 332.
+	// When ParentLineID is set, this row is a resource breakdown of its parent.
+	// NormRate is the ШРНК норма; sub-line quantity is stored as
+	// parent.quantity × NormRate (denormalized on write).
+	//
+	// QuantityOverride (migration 342) switches the sub-line into MANUAL mode:
+	// when TRUE, Quantity is what the user entered directly (e.g. "10 hours"
+	// for a machine) and is NOT re-derived from parent.quantity × NormRate.
+	// NormRate remains persisted for reference.
+	//
+	// MaterialType (migration 347) classifies a `resource_type='material'`
+	// row for the Form 2 transport+storage overhead engine per
+	// Госкомархитектстрой Письмо № 352/11-05. One of:
+	//   standard | equipment | cable | metal | import
+	// Default 'standard'. No-op for non-material rows.
+	ParentLineID     sql.NullInt64 `json:"parent_line_id" db:"parent_line_id"`
+	NormRate         float64       `json:"norm_rate" db:"norm_rate"`
+	SublineSeq       int           `json:"subline_seq" db:"subline_seq"`
+	QuantityOverride bool          `json:"quantity_override" db:"quantity_override"`
+	MaterialType     string        `json:"material_type" db:"material_type"`
+
+	// OriginalQuantity / OriginalUnitRate (migration 349) capture the row's
+	// values at first INSERT and never change after that. The Smeta UI
+	// surfaces them as "Reset to original" affordances on each line.
+	OriginalQuantity float64 `json:"original_quantity" db:"original_quantity"`
+	OriginalUnitRate float64 `json:"original_unit_rate" db:"original_unit_rate"`
+
+	// ImportedQuantity / ImportedTotal (migration 400) preserve the
+	// Ресурс XLSX file's "Количество" and "Сметная стоимость в базисном
+	// уровне" columns verbatim. These are DISPLAY-ONLY — the rest of the
+	// system (cost cascade, NORMA pill, FAKT ledger, Reja vs Fakt budget
+	// summary, top-ups, approval workflow) deliberately ignores them so
+	// existing business logic is not affected. Nullable on the DB side
+	// because non-resurs imports and rows that predate the migration
+	// leave them empty. The MarshalJSON below emits the numeric value or
+	// `null` (never 0) so the frontend can tell "no value imported" apart
+	// from "imported zero" and render an em-dash accordingly.
+	ImportedQuantity sql.NullFloat64 `json:"-" db:"imported_quantity"`
+	ImportedTotal    sql.NullFloat64 `json:"-" db:"imported_total"`
+
+	// v2 Bosqichlar workflow (migration 353).
+	ApprovalStatus string  `json:"approval_status" db:"approval_status"`
+	DoneQuantity   float64 `json:"done_quantity" db:"done_quantity"`
+
 	SortOrder   int       `json:"sort_order" db:"sort_order"`
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
@@ -157,6 +201,11 @@ type ConstructionEstimateLine struct {
 	// Computed
 	WBSCode string `json:"wbs_code,omitempty" db:"wbs_code"`
 	WBSName string `json:"wbs_name,omitempty" db:"wbs_name"`
+
+	// Resource top-ups (migration 358) — additional purchases for this
+	// resource sub-line, populated by getEstimateLines via a secondary
+	// query. Empty for non-resource rows.
+	Topups []ResourceTopup `json:"topups,omitempty"`
 }
 
 func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
@@ -174,15 +223,27 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		UnitRate      float64     `json:"unit_rate"`
 		TotalAmount   float64     `json:"total_amount"`
 		ActualAmount  float64     `json:"actual_amount"`
-		Code             string `json:"code"`
-		ItemNumber       string `json:"item_number"`
-		ResourceType     string `json:"resource_type"`
-		ParentItemNumber string `json:"parent_item_number"`
-		SortOrder        int    `json:"sort_order"`
-		CreatedDate   time.Time   `json:"created_date"`
-		UpdatedDate   time.Time   `json:"updated_date"`
-		WBSCode       string      `json:"wbs_code,omitempty"`
-		WBSName       string      `json:"wbs_name,omitempty"`
+		Code             string      `json:"code"`
+		ItemNumber       string      `json:"item_number"`
+		ResourceType     string      `json:"resource_type"`
+		ParentItemNumber string      `json:"parent_item_number"`
+		ParentLineID     interface{} `json:"parent_line_id"`
+		NormRate         float64     `json:"norm_rate"`
+		SublineSeq       int         `json:"subline_seq"`
+		QuantityOverride bool        `json:"quantity_override"`
+		MaterialType     string      `json:"material_type"`
+		OriginalQuantity float64     `json:"original_quantity"`
+		OriginalUnitRate float64     `json:"original_unit_rate"`
+		ImportedQuantity interface{} `json:"imported_quantity"`
+		ImportedTotal    interface{} `json:"imported_total"`
+		ApprovalStatus   string      `json:"approval_status"`
+		DoneQuantity     float64     `json:"done_quantity"`
+		SortOrder        int         `json:"sort_order"`
+		CreatedDate   time.Time       `json:"created_date"`
+		UpdatedDate   time.Time       `json:"updated_date"`
+		WBSCode       string          `json:"wbs_code,omitempty"`
+		WBSName       string          `json:"wbs_name,omitempty"`
+		Topups        []ResourceTopup `json:"topups,omitempty"`
 	}{
 		ID:            l.ID,
 		TenantID:      l.TenantID,
@@ -201,12 +262,80 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		ItemNumber:       l.ItemNumber,
 		ResourceType:     l.ResourceType,
 		ParentItemNumber: l.ParentItemNumber,
+		ParentLineID:     nullInt64Value(l.ParentLineID),
+		NormRate:         l.NormRate,
+		SublineSeq:       l.SublineSeq,
+		QuantityOverride: l.QuantityOverride,
+		MaterialType:     l.MaterialType,
+		OriginalQuantity: l.OriginalQuantity,
+		OriginalUnitRate: l.OriginalUnitRate,
+		// Emit numeric value when the row carries an imported figure,
+		// `null` when it doesn't. The frontend distinguishes "no imported
+		// value" (em-dash) from "imported zero" via this distinction.
+		ImportedQuantity: nullFloat64Value(l.ImportedQuantity),
+		ImportedTotal:    nullFloat64Value(l.ImportedTotal),
+		ApprovalStatus:   l.ApprovalStatus,
+		DoneQuantity:     l.DoneQuantity,
 		SortOrder:        l.SortOrder,
 		CreatedDate:   l.CreatedDate,
 		UpdatedDate:   l.UpdatedDate,
 		WBSCode:       l.WBSCode,
 		WBSName:       l.WBSName,
+		Topups:        l.Topups,
 	})
+}
+
+// =====================================================
+// CONSTRUCTION RESOURCE TOPUP (migration 358)
+// =====================================================
+//
+// A top-up represents an additional purchase for an estimate resource
+// line — typically when the originally planned quantity ran short and
+// the supplier's price has since changed. The smeta plan stays
+// untouched (immutable for audit) and the line's effective total
+// becomes plan + Σ(topup.extra_quantity × topup.new_price).
+
+type ResourceTopup struct {
+	ID             int64         `json:"id" db:"id"`
+	TenantID       uuid.UUID     `json:"tenant_id" db:"tenant_id"`
+	EstimateLineID int64         `json:"estimate_line_id" db:"estimate_line_id"`
+	ExtraQuantity  float64       `json:"extra_quantity" db:"extra_quantity"`
+	NewPrice       float64       `json:"new_price" db:"new_price"`
+	OrderedAt      time.Time     `json:"ordered_at" db:"ordered_at"`
+	Note           string        `json:"note" db:"note"`
+	CreatedBy      uuid.NullUUID `json:"created_by" db:"created_by"`
+	CreatedDate    time.Time     `json:"created_date" db:"created_date"`
+}
+
+func (t ResourceTopup) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		ID             int64       `json:"id"`
+		TenantID       uuid.UUID   `json:"tenant_id"`
+		EstimateLineID int64       `json:"estimate_line_id"`
+		ExtraQuantity  float64     `json:"extra_quantity"`
+		NewPrice       float64     `json:"new_price"`
+		OrderedAt      string      `json:"ordered_at"`
+		Note           string      `json:"note"`
+		CreatedBy      interface{} `json:"created_by"`
+		CreatedDate    time.Time   `json:"created_date"`
+	}{
+		ID:             t.ID,
+		TenantID:       t.TenantID,
+		EstimateLineID: t.EstimateLineID,
+		ExtraQuantity:  t.ExtraQuantity,
+		NewPrice:       t.NewPrice,
+		OrderedAt:      t.OrderedAt.Format("2006-01-02"),
+		Note:           t.Note,
+		CreatedBy:      nullUUIDValue(t.CreatedBy),
+		CreatedDate:    t.CreatedDate,
+	})
+}
+
+type CreateResourceTopupInput struct {
+	ExtraQuantity float64 `json:"extra_quantity" binding:"required"`
+	NewPrice      float64 `json:"new_price" binding:"required"`
+	OrderedAt     string  `json:"ordered_at"`
+	Note          string  `json:"note"`
 }
 
 type CreateEstimateLineInput struct {
@@ -220,13 +349,67 @@ type CreateEstimateLineInput struct {
 	Code             string `json:"code"`
 	ItemNumber       string `json:"item_number"`
 	ResourceType     string `json:"resource_type"`
+	// MaterialType (migration 350) — sub-bucket for resource_type='material'.
+	// Allowed values: 'standard' | 'equipment' | 'cable' | 'metal' | 'import'.
+	// Empty string falls back to 'standard' on insert.
+	MaterialType     string `json:"material_type"`
 	ParentItemNumber string `json:"parent_item_number"`
 	SortOrder        int    `json:"sort_order"`
+
+	// OriginalQuantity (migration 349 anchor). When provided, the bulk
+	// insert writes it directly — bypassing the trigger that would
+	// otherwise default to Quantity. Used by Единич/Ресурс template
+	// imports so the planned norma from the source file survives even
+	// though the live Quantity ledger column is forced to 0.
+	// *float64 so callers can omit (NULL → trigger fills from Quantity)
+	// without colliding with the explicit-zero case.
+	OriginalQuantity *float64 `json:"original_quantity"`
+
+	// Sub-line support (migration 332). When ParentLineID != 0, the server:
+	//   - looks up the parent
+	//   - auto-generates ItemNumber = "{parent.item_number}-{next_subline_seq}"
+	//     if the caller didn't supply one
+	//   - computes Quantity = parent.quantity × NormRate  UNLESS the client
+	//     set QuantityOverride = true, in which case the user-supplied
+	//     Quantity is persisted as-is (migration 342).
+	ParentLineID     int64   `json:"parent_line_id"`
+	NormRate         float64 `json:"norm_rate"`
+	UnitPrice        float64 `json:"unit_price"` // convenience — mapped to the rate column that matches resource_type
+	QuantityOverride bool    `json:"quantity_override"`
+
+	// ImportedQuantity / ImportedTotal (migration 400). Verbatim "Количество"
+	// and "Сметная стоимость" totals from the imported Ресурс XLSX — stored
+	// for display only and ignored by every calc path. Pointers so callers
+	// can omit them (NULL on insert) without colliding with the explicit-zero
+	// case (a row whose file figure is genuinely 0).
+	ImportedQuantity *float64 `json:"imported_quantity"`
+	ImportedTotal    *float64 `json:"imported_total"`
 }
 
 type BulkCreateEstimateLinesInput struct {
-	Lines   []CreateEstimateLineInput `json:"lines" binding:"required"`
-	Replace bool                      `json:"replace"`
+	Lines      []CreateEstimateLineInput `json:"lines" binding:"required"`
+	Replace    bool                      `json:"replace"`
+	SourceType string                    `json:"source_type"`
+	// SourceFileName identifies the Excel file the user uploaded. Used by
+	// autoCreateForma2FromEstimate to dedupe Forma 2 drafts: multiple
+	// estimate types extracted from the SAME file produce ONE merged
+	// Forma 2, while imports from different files stay separate. See
+	// migration 339 for the matching column on construction_act.
+	SourceFileName string `json:"source_file_name"`
+	// Imported budget totals captured from the Ресурс sheet's bottom
+	// summary block (parseResurs in SmetaImportModal.jsx). Persisted onto
+	// construction_estimate via migration 369 so the Reja vs Fakt page
+	// can show the file's grand total instead of summing per-line plans.
+	//
+	// BudgetTotal     = ИТОГО ПРЯМЫЕ ЗАТРАТЫ (the headline figure)
+	// MaterialBudget  = ИТОГО ПО СТРОИТЕЛЬНЫМ МАТЕРИАЛАМ
+	// TransportBudget = ТРАНСПОРТНЫЕ РАСХОДЫ НА МАТЕРИАЛЫ (project-wide)
+	//
+	// All three are optional — non-Ресурс imports leave them at 0 and the
+	// handler preserves the previous values rather than zeroing them out.
+	BudgetTotal     float64 `json:"budget_total"`
+	MaterialBudget  float64 `json:"material_budget"`
+	TransportBudget float64 `json:"transport_budget"`
 }
 
 type UpdateEstimateLineInput struct {
@@ -239,6 +422,20 @@ type UpdateEstimateLineInput struct {
 	EquipmentRate *float64 `json:"equipment_rate"`
 	SortOrder     *int     `json:"sort_order"`
 	ActualAmount  *float64 `json:"actual_amount"`
+
+	// Optional edits to line metadata (used by the full edit modal).
+	Code         *string `json:"code"`
+	ItemNumber   *string `json:"item_number"`
+	ResourceType *string `json:"resource_type"`
+
+	// Sub-line fields. When NormRate is supplied for a row that has a parent,
+	// Quantity is re-derived from parent.quantity × NormRate — UNLESS
+	// QuantityOverride is true on the row (or is being set to true in this
+	// request), in which case the user-supplied Quantity wins (migration 342).
+	NormRate         *float64 `json:"norm_rate"`
+	UnitPrice        *float64 `json:"unit_price"`
+	QuantityOverride *bool    `json:"quantity_override"`
+	MaterialType     *string  `json:"material_type"` // standard|equipment|cable|metal|import
 }
 
 // =====================================================

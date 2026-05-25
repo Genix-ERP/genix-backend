@@ -946,8 +946,9 @@ type CreateBOMInput struct {
 	EffectiveDate string              `json:"effective_date,omitempty"`
 	ExpiryDate    string              `json:"expiry_date,omitempty"`
 	Notes         string              `json:"notes,omitempty"`
-	WarehouseID   string              `json:"warehouse_id,omitempty"`
-	Lines         []CreateBOMLineInput `json:"lines,omitempty"`
+	WarehouseID      string              `json:"warehouse_id,omitempty"`
+	HasSplitOutput   bool                `json:"has_split_output,omitempty"`
+	Lines            []CreateBOMLineInput `json:"lines,omitempty"`
 }
 
 // UpdateBOMInput represents input for updating a BOM
@@ -959,8 +960,9 @@ type UpdateBOMInput struct {
 	IsDefault     *bool   `json:"is_default,omitempty"`
 	EffectiveDate *string `json:"effective_date,omitempty"`
 	ExpiryDate    *string `json:"expiry_date,omitempty"`
-	Notes         *string `json:"notes,omitempty"`
-	WarehouseID   *string `json:"warehouse_id,omitempty"`
+	Notes            *string `json:"notes,omitempty"`
+	WarehouseID      *string `json:"warehouse_id,omitempty"`
+	HasSplitOutput   *bool   `json:"has_split_output,omitempty"`
 }
 
 // CreateBOMLineInput represents input for creating a BOM line
@@ -1011,9 +1013,10 @@ type BOMResponse struct {
 	ExpiryDate    *string             `json:"expiry_date,omitempty"`
 	TotalCost     float64             `json:"total_cost"`
 	LineCount     int                 `json:"line_count"`
-	WarehouseID   *uuid.UUID          `json:"warehouse_id,omitempty"`
-	WarehouseName *string             `json:"warehouse_name,omitempty"`
-	Lines         []BOMLineResponse   `json:"lines,omitempty"`
+	WarehouseID    *uuid.UUID          `json:"warehouse_id,omitempty"`
+	WarehouseName  *string             `json:"warehouse_name,omitempty"`
+	HasSplitOutput bool                `json:"has_split_output"`
+	Lines          []BOMLineResponse   `json:"lines,omitempty"`
 	CreatedAt     time.Time           `json:"created_at"`
 }
 

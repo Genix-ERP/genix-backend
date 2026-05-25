@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -67,14 +68,18 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 		       cp.actual_start_date, cp.actual_end_date,
 		       cp.status, cp.progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
+		       cp.warehouse_id,
 		       cp.created_by, cp.created_date, cp.updated_date,
 		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
+		       COALESCE(w.name, '') as warehouse_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
-		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta
+		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta,
+		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id), 0) as files_count
 		FROM construction_projects cp
 		LEFT JOIN employees pm ON pm.id = cp.project_manager_id
 		LEFT JOIN employees ce ON ce.id = cp.chief_engineer_id
+		LEFT JOIN warehouses w ON w.id = cp.warehouse_id AND w.tenant_id = cp.tenant_id
 		WHERE cp.tenant_id = $1 AND cp.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM construction_projects WHERE tenant_id = $1 AND deleted_at IS NULL`
@@ -146,9 +151,11 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 			&p.ActualStartDate, &p.ActualEndDate,
 			&p.Status, &p.ProgressPercent,
 			&p.ProjectManagerID, &p.ChiefEngineerID,
+			&p.WarehouseID,
 			&p.CreatedBy, &p.CreatedDate, &p.UpdatedDate,
 			&p.ProjectManagerName, &p.ChiefEngineerName,
-			&p.SectionsCount, &p.TotalSmeta,
+			&p.WarehouseName,
+			&p.SectionsCount, &p.TotalSmeta, &p.FilesCount,
 		); err != nil {
 			h.log.Error("Failed to scan construction project", "error", err)
 			continue
@@ -198,14 +205,18 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		       cp.actual_start_date, cp.actual_end_date,
 		       cp.status, cp.progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
+		       cp.warehouse_id,
 		       cp.created_by, cp.created_date, cp.updated_date,
 		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
+		       COALESCE(w.name, '') as warehouse_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
-		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta
+		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta,
+		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id), 0) as files_count
 		FROM construction_projects cp
 		LEFT JOIN employees pm ON pm.id = cp.project_manager_id
 		LEFT JOIN employees ce ON ce.id = cp.chief_engineer_id
+		LEFT JOIN warehouses w ON w.id = cp.warehouse_id AND w.tenant_id = cp.tenant_id
 		WHERE cp.id = $1 AND cp.tenant_id = $2 AND cp.deleted_at IS NULL
 	`
 
@@ -220,9 +231,11 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		&p.ActualStartDate, &p.ActualEndDate,
 		&p.Status, &p.ProgressPercent,
 		&p.ProjectManagerID, &p.ChiefEngineerID,
+		&p.WarehouseID,
 		&p.CreatedBy, &p.CreatedDate, &p.UpdatedDate,
 		&p.ProjectManagerName, &p.ChiefEngineerName,
-		&p.SectionsCount, &p.TotalSmeta,
+		&p.WarehouseName,
+		&p.SectionsCount, &p.TotalSmeta, &p.FilesCount,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Project not found")
@@ -269,6 +282,9 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 	projMap["object_full_name"] = objectFullName
 	projMap["client_director_name"] = clientDirectorName
 	projMap["client_chief_accountant_name"] = clientChiefAccName
+
+	// warehouse_name is already populated by the SELECT/MarshalJSON path
+	// (LEFT JOIN warehouses w). No extra lookup needed here.
 
 	response.Success(c, projMap)
 }
@@ -323,9 +339,9 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 			project_type, building_type, total_area, floors_count,
 			contract_amount, currency,
 			contract_date, planned_start_date, planned_end_date,
-			status, project_manager_id, chief_engineer_id,
+			status, project_manager_id, chief_engineer_id, warehouse_id,
 			created_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, NOW(), NOW())
 		RETURNING id, created_date
 	`
 
@@ -353,6 +369,7 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 		nullFloat64(req.ContractAmount), currency,
 		contractDate, plannedStart, plannedEnd,
 		"draft", nullUUID(req.ProjectManagerID), nullUUID(req.ChiefEngineerID),
+		nullUUID(req.WarehouseID),
 		userID,
 	).Scan(&projectID, &createdDate)
 	if err != nil {
@@ -526,6 +543,15 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("chief_engineer_id = $%d", argCount))
 		parsed, _ := uuid.Parse(*req.ChiefEngineerID)
 		args = append(args, parsed)
+	}
+	// Default warehouse. Pointer-typed so that an absent key leaves the
+	// column alone, and an explicit "" clears it (NULL = revert to
+	// auto-pick). nullUUID handles both cases — empty string parses to
+	// uuid.Nil which it represents as nil.
+	if req.WarehouseID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+		args = append(args, nullUUID(*req.WarehouseID))
 	}
 	if req.PlannedStartDate != nil {
 		argCount++
@@ -915,6 +941,17 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		return
 	}
 
+	// files_count joins building_files so the UI can render the count badge
+	// on the "Fayllar" button without a per-building extra round-trip.
+	//
+	// Note: we intentionally don't filter building_files by tenant_id inside
+	// the subquery. construction_buildings.tenant_id is UUID but
+	// building_files.tenant_id is VARCHAR(100) (see migrations 112 / 253),
+	// so reusing $2 in both contexts tripped Postgres' parameter type
+	// inference and made the whole query fail (returning an empty buildings
+	// list, which also left the estimates panel stuck on "Avval bino
+	// tanlang"). Tenant scoping is already guaranteed by the outer
+	// b.tenant_id = $2 filter plus the FK link f.building_id = b.id.
 	query := `
 		SELECT b.id, b.tenant_id, b.project_id, b.code, b.name, b.description,
 		       b.building_type, b.building_purpose, b.floors_count, b.floors_underground,
@@ -925,8 +962,14 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		       COALESCE(b.status, 'draft'), b.progress_percent, COALESCE(b.gps_coordinates::text, '{}')::text, b.location_description,
 		       COALESCE(b.sort_order, 0), b.created_date, b.updated_date,
 		       0 as sections_count,
-		       0.0 as total_smeta
+		       0.0 as total_smeta,
+		       COALESCE(f.cnt, 0) AS files_count
 		FROM construction_buildings b
+		LEFT JOIN (
+		    SELECT building_id, COUNT(*) AS cnt
+		    FROM building_files
+		    GROUP BY building_id
+		) f ON f.building_id = b.id
 		WHERE b.project_id = $1 AND b.tenant_id = $2
 		ORDER BY COALESCE(b.sort_order, 0), b.code
 	`
@@ -952,7 +995,7 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 			&b.PlannedStartDate, &b.PlannedEndDate, &b.ActualStartDate, &b.ActualEndDate,
 			&b.Status, &b.ProgressPercent, &gpsCoordinates, &b.LocationDescription,
 			&b.SortOrder, &b.CreatedDate, &b.UpdatedDate,
-			&b.SectionsCount, &b.TotalSmeta,
+			&b.SectionsCount, &b.TotalSmeta, &b.FilesCount,
 		); err != nil {
 			h.log.Error("Failed to scan building", "error", err, "project_id", projectID)
 			continue
@@ -1022,23 +1065,56 @@ func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 		RETURNING id, created_date
 	`
 
+	// Resolve a unique code. The frontend auto-generates a code from
+	// the building name (e.g. "Block 2" → "BLOCK_2") which is
+	// deterministic — meaning two buildings with the same name in the
+	// same project would collide on `construction_buildings_project_id_code_key`
+	// and the user used to see a generic 500. Now we retry with a
+	// numeric suffix until we find a free code (BLOCK_2, BLOCK_2-2,
+	// BLOCK_2-3, ...). 50 attempts is more than enough for any sane
+	// project; if exhausted we fall back to a UUID-suffixed code so
+	// the request still succeeds rather than 500-ing.
+	baseCode := strings.TrimSpace(req.Code)
+	if baseCode == "" {
+		baseCode = "BUILDING"
+	}
+	tryCode := baseCode
+
 	var buildingID int64
 	var createdDate time.Time
-	err = h.db.QueryRow(query,
-		tenantID, projectID, req.Code, req.Name, nullString(req.Description),
-		nullString(req.BuildingType), nullString(req.BuildingPurpose),
-		nullInt32(int32(req.FloorsCount)), nullInt32(int32(req.FloorsUnderground)),
-		nullFloat64(req.TotalArea), nullFloat64(req.LivingArea), nullFloat64(req.NonLivingArea),
-		nullInt32(int32(req.ApartmentsCount)), nullInt32(int32(req.CommercialUnitsCount)), nullInt32(int32(req.ParkingSpots)),
-		nullFloat64(req.EstimatedCost),
-		plannedStart, plannedEnd,
-		req.SortOrder,
-	).Scan(&buildingID, &createdDate)
-	if err != nil {
-		h.log.Error("Failed to create building", "error", err)
+
+	const maxAttempts = 50
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		lastErr = h.db.QueryRow(query,
+			tenantID, projectID, tryCode, req.Name, nullString(req.Description),
+			nullString(req.BuildingType), nullString(req.BuildingPurpose),
+			nullInt32(int32(req.FloorsCount)), nullInt32(int32(req.FloorsUnderground)),
+			nullFloat64(req.TotalArea), nullFloat64(req.LivingArea), nullFloat64(req.NonLivingArea),
+			nullInt32(int32(req.ApartmentsCount)), nullInt32(int32(req.CommercialUnitsCount)), nullInt32(int32(req.ParkingSpots)),
+			nullFloat64(req.EstimatedCost),
+			plannedStart, plannedEnd,
+			req.SortOrder,
+		).Scan(&buildingID, &createdDate)
+		if lastErr == nil {
+			break // success
+		}
+		// 23505 is Postgres' unique_violation. Anything else is fatal —
+		// fall through to the error path below.
+		if pqErr, ok := lastErr.(*pq.Error); ok && pqErr.Code == "23505" {
+			tryCode = fmt.Sprintf("%s-%d", baseCode, attempt+1)
+			continue
+		}
+		break
+	}
+	if lastErr != nil {
+		h.log.Error("Failed to create building", "error", lastErr, "last_tried_code", tryCode)
 		response.InternalError(c, "Failed to create building")
 		return
 	}
+	// Surface the resolved code back to the client so the frontend can
+	// show "Created as BLOCK_2-3" if the original collided.
+	req.Code = tryCode
 
 	// Update project buildings count
 	h.db.Exec(`UPDATE construction_projects SET buildings_count = buildings_count + 1, updated_date = NOW() WHERE id = $1`, projectID)
@@ -2503,6 +2579,14 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 		return
 	}
 
+	// Fire-and-forget push to the Yuksalish CRM. Enqueue is a no-op if the
+	// building isn't linked or CRM env isn't configured, so it's safe to
+	// call unconditionally here. On failure it lands in crm_sync_queue and
+	// the background worker retries it.
+	if h.crmSync != nil {
+		h.crmSync.Enqueue(c.Request.Context(), tenantID, reportID)
+	}
+
 	response.Created(c, map[string]interface{}{
 		"id":      reportID,
 		"message": "Photo report created successfully",
@@ -3351,6 +3435,12 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 		BillSubcontractor bool        `json:"bill_subcontractor"`
 		SubcontractID     int64       `json:"subcontract_id"`
 		BuildingID        int64       `json:"building_id"`
+		// StageID lets the caller attribute the auto-generated expense
+		// line to a specific section. Optional — when omitted the
+		// expense lands as project-wide and falls into the synthetic
+		// "(Boshqalar)" row in the Byudjet breakdown. Existing callers
+		// that don't set it keep working.
+		StageID int64 `json:"stage_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -3436,30 +3526,38 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 				expDesc += " (" + strings.Join(itemDescriptions, ", ") + ")"
 			}
 
+			// Optional stage_id from the request body — pass through to
+			// the expense INSERT so the Byudjet breakdown can attribute
+			// the row to a section. NULLIF(0,0)=NULL keeps backward-
+			// compatible behaviour when the caller doesn't supply one.
+			var stageIDInsert interface{}
+			if req.StageID > 0 {
+				stageIDInsert = req.StageID
+			}
 			if req.SubcontractID > 0 {
 				// Billed to subcontractor — supplier_name = subcontractor partner_name
 				var scPartnerName string
 				h.db.QueryRow(`SELECT COALESCE(partner_name, name) FROM construction_subcontract WHERE id = $1`, req.SubcontractID).Scan(&scPartnerName)
 				h.db.Exec(`
 					INSERT INTO construction_expense_lines (
-						tenant_id, organization_id, project_id, expense_date, description,
+						tenant_id, organization_id, project_id, stage_id, expense_date, description,
 						amount, currency_code, subcontract_id, material_request_id,
 						supplier_name, status, created_by, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6, 'UZS', $7, $8, $9, 'draft', $10, NOW(), NOW())
+					) VALUES ($1, $2, $3, $11, $4, $5, $6, 'UZS', $7, $8, $9, 'draft', $10, NOW(), NOW())
 				`, tenantID, organizationID, projectID, requestDate, expDesc,
-					totalAmount, req.SubcontractID, requestID, scPartnerName, userID)
+					totalAmount, req.SubcontractID, requestID, scPartnerName, userID, stageIDInsert)
 			} else {
 				// No subcontractor — supplier is the company itself
 				var orgName string
 				h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, organizationID).Scan(&orgName)
 				h.db.Exec(`
 					INSERT INTO construction_expense_lines (
-						tenant_id, organization_id, project_id, expense_date, description,
+						tenant_id, organization_id, project_id, stage_id, expense_date, description,
 						amount, currency_code, material_request_id,
 						supplier_name, status, created_by, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
+					) VALUES ($1, $2, $3, $10, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
 				`, tenantID, organizationID, projectID, requestDate, expDesc,
-					totalAmount, requestID, orgName, userID)
+					totalAmount, requestID, orgName, userID, stageIDInsert)
 			}
 		}
 	}
@@ -3817,12 +3915,12 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 	}
 
 	// Find expense/COGS account and inventory journal
-	expenseAcct := findAccount(tx, tenantID, orgIDPtr, "construction expense", "7000")
+	expenseAcct := findAccount(tx, tenantID, orgIDPtr, "construction expense", "9610")
 	if expenseAcct == uuid.Nil {
-		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "cost of goods", "5000")
+		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "cost of goods", "9110")
 	}
 	if expenseAcct == uuid.Nil {
-		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "expense", "6000")
+		expenseAcct = findAccount(tx, tenantID, orgIDPtr, "expense", "9420")
 	}
 
 	var journalID uuid.UUID
@@ -3830,6 +3928,19 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 	tx.QueryRow(`SELECT id, next_number FROM journals WHERE tenant_id = $1 AND code IN ('CONST','STOCK','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'CONST' THEN 0 WHEN 'STOCK' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 	var totalExpense float64
+
+	// Project's chosen default warehouse (migration 365). When set, it
+	// becomes the second-priority fallback for items that don't supply
+	// their own warehouse_id — preferred over the legacy "highest stock
+	// anywhere" auto-pick. Same priority chain as reserveMaterialsForWork
+	// so material requests and YAKUNIY confirmations both target the
+	// same site warehouse.
+	var projectWarehouseID uuid.NullUUID
+	tx.QueryRow(`
+		SELECT warehouse_id
+		FROM construction_projects
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectWarehouseID)
 
 	for index, item := range items {
 		// Extract fields from item
@@ -3873,7 +3984,13 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 		if warehouseIDStr != "" {
 			warehouseID, _ = uuid.Parse(warehouseIDStr)
 		}
-		// If no warehouse specified, find best warehouse for this product/variant
+		// Project default takes precedence over the legacy "highest stock"
+		// auto-pick. Only consulted when the item itself didn't carry an
+		// explicit warehouse_id, preserving the per-line override.
+		if warehouseID == uuid.Nil && projectWarehouseID.Valid {
+			warehouseID = projectWarehouseID.UUID
+		}
+		// If still unresolved, find best warehouse for this product/variant
 		if warehouseID == uuid.Nil {
 			if variantID != nil {
 				tx.QueryRow(`SELECT warehouse_id FROM inventory WHERE tenant_id = $1 AND product_id = $2 AND variant_id = $3 AND quantity_on_hand > 0 ORDER BY quantity_on_hand DESC LIMIT 1`, tenantID, productID, variantID).Scan(&warehouseID)
@@ -4144,7 +4261,7 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 		var creditAccountID uuid.UUID
 		creditAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
 		if creditAccountID == uuid.Nil {
-			creditAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "1000")
+			creditAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "5010")
 		}
 
 		// Get construction journal for journal entries

@@ -32,6 +32,9 @@ type WorkCenter struct {
 	ElectricityRate       float64  `json:"electricity_rate" db:"electricity_rate"`
 	AnnualMaintenance     float64  `json:"annual_maintenance" db:"annual_maintenance"`
 	OperatorMonthlySalary float64  `json:"operator_monthly_salary" db:"operator_monthly_salary"`
+	LaborRateType         string   `json:"labor_rate_type" db:"labor_rate_type"`
+	CostMethod            string   `json:"cost_method" db:"cost_method"`
+	RequireOperator       bool     `json:"require_operator" db:"require_operator"`
 	// Calculated per-hour components
 	DepreciationPerHour   float64  `json:"depreciation_per_hour" db:"depreciation_per_hour"`
 	ElectricityPerHour    float64  `json:"electricity_per_hour" db:"electricity_per_hour"`
@@ -72,6 +75,9 @@ type WorkCenterInput struct {
 	ElectricityRate       *float64 `json:"electricity_rate,omitempty"`
 	AnnualMaintenance     *float64 `json:"annual_maintenance,omitempty"`
 	OperatorMonthlySalary *float64 `json:"operator_monthly_salary,omitempty"`
+	LaborRateType         *string  `json:"labor_rate_type,omitempty"`
+	CostMethod            *string  `json:"cost_method,omitempty"`
+	RequireOperator       *bool    `json:"require_operator,omitempty"`
 	Currency            *string    `json:"currency,omitempty"`
 	Status              *string    `json:"status,omitempty"`
 	IsAvailable         *bool      `json:"is_available,omitempty"`
@@ -101,6 +107,9 @@ type WorkCenterResponse struct {
 	ElectricityRate       float64  `json:"electricity_rate"`
 	AnnualMaintenance     float64  `json:"annual_maintenance"`
 	OperatorMonthlySalary float64  `json:"operator_monthly_salary"`
+	LaborRateType         string   `json:"labor_rate_type"`
+	CostMethod            string   `json:"cost_method"`
+	RequireOperator       bool     `json:"require_operator"`
 	DepreciationPerHour   float64  `json:"depreciation_per_hour"`
 	ElectricityPerHour    float64  `json:"electricity_per_hour"`
 	MaintenancePerHour    float64  `json:"maintenance_per_hour"`
@@ -181,6 +190,7 @@ type ProductionOrder struct {
 	GoodQuantity         float64    `json:"good_quantity" db:"good_quantity"`
 	RejectQuantity       float64    `json:"reject_quantity" db:"reject_quantity"`
 	HasSplitOutput       bool       `json:"has_split_output" db:"has_split_output"`
+	ShortfallReason      *string    `json:"shortfall_reason,omitempty" db:"shortfall_reason"`
 	// Schedule fields
 	ScheduledStart       *time.Time `json:"scheduled_start,omitempty" db:"scheduled_start"`
 	ScheduledEnd         *time.Time `json:"scheduled_end,omitempty" db:"scheduled_end"`
@@ -294,6 +304,7 @@ type ProductionOrderResponse struct {
 	GoodQuantity         float64     `json:"good_quantity"`
 	RejectQuantity       float64     `json:"reject_quantity"`
 	HasSplitOutput       bool        `json:"has_split_output"`
+	ShortfallReason      *string     `json:"shortfall_reason,omitempty"`
 	// Schedule fields
 	ScheduledStart       *string     `json:"scheduled_start,omitempty"`
 	ScheduledEnd         *string     `json:"scheduled_end,omitempty"`
@@ -323,6 +334,12 @@ type ProductionOrderResponse struct {
 	Stages               []ProductionOrderStageResponse `json:"stages,omitempty"`
 	ManufacturingCategoryID   *uuid.UUID `json:"manufacturing_category_id,omitempty"`
 	ManufacturingCategoryName *string    `json:"manufacturing_category_name,omitempty"`
+	// Sales order link (populated when the production order was
+	// created from a sales order — frontend shows the SO number on
+	// the Stage Workflow modal so operators see what they're
+	// building for, and stays empty for ad-hoc production orders).
+	SalesOrderID         *uuid.UUID `json:"sales_order_id,omitempty"`
+	SalesOrderNumber     *string    `json:"sales_order_number,omitempty"`
 	CreatedBy            *uuid.UUID  `json:"created_by,omitempty"`
 	CreatedByName        *string     `json:"created_by_name,omitempty"`
 	ConfirmedAt          *string     `json:"confirmed_at,omitempty"`
@@ -750,11 +767,18 @@ type ProductionOutputResponse struct {
 // PRODUCTION SPLIT OUTPUT ENTITIES
 // =====================================================
 
+// SplitOutputMaterial describes an additional material consumed per piece during split output
+type SplitOutputMaterial struct {
+	ProductID        uuid.UUID `json:"product_id" binding:"required"`
+	QuantityPerPiece float64   `json:"quantity_per_piece" binding:"required,gt=0"`
+}
+
 // SplitOutputItem is the input for one packaged product line in a split output
 type SplitOutputItem struct {
-	ProductID    uuid.UUID  `json:"product_id" binding:"required"`
-	Quantity     float64    `json:"quantity" binding:"required,gt=0"`
-	WarehouseID  *uuid.UUID `json:"warehouse_id,omitempty"`
+	ProductID    uuid.UUID              `json:"product_id" binding:"required"`
+	Quantity     float64                `json:"quantity" binding:"required,gt=0"`
+	WarehouseID  *uuid.UUID             `json:"warehouse_id,omitempty"`
+	Materials    []SplitOutputMaterial   `json:"materials,omitempty"`
 }
 
 // CompleteSplitOutputInput is sent by the worker to finalize packaging

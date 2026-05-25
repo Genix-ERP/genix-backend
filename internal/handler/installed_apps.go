@@ -157,6 +157,23 @@ func (h *Handler) UninstallApp(c *gin.Context) {
 		return
 	}
 
+	// Per the design discussed with the user, the per-organization
+	// hidden_apps overrides (migration 386) should NOT survive a
+	// tenant-wide uninstall — a fresh reinstall starts with the app
+	// visible everywhere. Scrub the app_id from every org in this tenant.
+	if _, scrubErr := h.db.Exec(
+		`UPDATE organizations
+		    SET hidden_apps = array_remove(hidden_apps, $2),
+		        updated_at  = NOW()
+		  WHERE tenant_id = $1
+		    AND $2 = ANY(hidden_apps)`,
+		tenantID, appID,
+	); scrubErr != nil {
+		// Don't fail the uninstall if the scrub fails — the app is
+		// already marked inactive, which is what the user asked for.
+		h.log.Warn("Failed to scrub hidden_apps after uninstall", "error", scrubErr, "app_id", appID)
+	}
+
 	response.Success(c, gin.H{"message": "App uninstalled successfully"})
 }
 

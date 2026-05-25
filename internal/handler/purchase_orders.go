@@ -259,10 +259,10 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
-	// Generate sequential order number (PO-00001, PO-00002, ...)
-	var poCount int
-	h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
-	orderNumber := fmt.Sprintf("PO-%05d", poCount+1)
+	// Order number is generated below, AFTER orgID resolution, because the
+	// unique constraint is (tenant_id, organization_id, order_number).
+	// We honour a user-supplied OrderNumber if one came in.
+	orderNumber := input.OrderNumber
 
 	// Parse order date
 	orderDate := now
@@ -377,16 +377,38 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
-	// Start transaction
-	tx, err := h.db.Begin()
-	if err != nil {
-		h.log.Error("Failed to start transaction", "error", err)
-		response.InternalError(c, "Failed to create purchase order")
-		return
+	// Generate order number with MAX+1 scoped by (tenant, org). Must NOT
+	// filter on deleted_at — the unique constraint
+	// purchase_orders_tenant_org_order_number_key applies to every row
+	// (including soft-deleted), so excluding them would hand out numbers
+	// that are already taken and loop forever on collision retry. Mirrors
+	// the sales-orders fix.
+	nextOrderNumber := func() string {
+		var maxNum int
+		if orgIDPtr != nil {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM purchase_orders
+				WHERE tenant_id = $1 AND organization_id = $2
+				  AND order_number ~ '^PO-[0-9]+$'`,
+				tenantID, *orgIDPtr,
+			).Scan(&maxNum)
+		} else {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM purchase_orders
+				WHERE tenant_id = $1 AND organization_id IS NULL
+				  AND order_number ~ '^PO-[0-9]+$'`,
+				tenantID,
+			).Scan(&maxNum)
+		}
+		return fmt.Sprintf("PO-%05d", maxNum+1)
 	}
-	defer tx.Rollback()
 
-	// Insert purchase order
+	// Insert purchase order — done OUTSIDE the transaction so we can retry
+	// on a unique-constraint collision (which happens with concurrent POSTs
+	// racing for the same next number). The transaction below covers only
+	// the line items, matching the create-sales-order pattern.
 	query := `
 		INSERT INTO purchase_orders (
 			id, tenant_id, organization_id, order_number, vendor_id, contact_person_id,
@@ -398,19 +420,46 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
 	`
 
-	_, err = tx.Exec(query,
-		id, tenantID, orgIDPtr, orderNumber, vendorID, contactPersonID,
-		orderDate, expectedDate, currencyID, exchangeRate,
-		subtotal, discountTotal, taxTotal, input.ShippingAmount, totalAmount,
-		entity.POStatusDraft, entity.PaymentStatusUnpaid, paymentTerms, vendorReference,
-		notes, internalNotes, warehouseID, vehicleNumber, requiresShipping, userID,
-		now, now,
-	)
-	if err != nil {
-		h.log.Error("Failed to insert purchase order", "error", err)
+	maxAttempts := 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if orderNumber == "" {
+			orderNumber = nextOrderNumber()
+		}
+
+		_, err = h.db.Exec(query,
+			id, tenantID, orgIDPtr, orderNumber, vendorID, contactPersonID,
+			orderDate, expectedDate, currencyID, exchangeRate,
+			subtotal, discountTotal, taxTotal, input.ShippingAmount, totalAmount,
+			entity.POStatusDraft, entity.PaymentStatusUnpaid, paymentTerms, vendorReference,
+			notes, internalNotes, warehouseID, vehicleNumber, requiresShipping, userID,
+			now, now,
+		)
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "purchase_orders_tenant_org_order_number_key") && input.OrderNumber == "" {
+			h.log.Warn("Purchase order number collision, retrying", "order_number", orderNumber, "attempt", attempt+1)
+			orderNumber = "" // force regeneration next iteration
+			continue
+		}
+		h.log.Error("Failed to insert purchase order", "error", err, "order_number", orderNumber)
 		response.InternalError(c, "Failed to create purchase order")
 		return
 	}
+	if err != nil {
+		h.log.Error("Failed to insert purchase order after retries", "error", err, "order_number", orderNumber)
+		response.InternalError(c, "Failed to create purchase order")
+		return
+	}
+
+	// Transaction now covers line-item inserts only.
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to create purchase order")
+		return
+	}
+	defer tx.Rollback()
 
 	// Insert line items
 	lineQuery := `
@@ -637,7 +686,9 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 		po.VehicleNumber = &vehicleNumber.String
 	}
 
-	// Get line items
+	// Get line items. alt_name pulls the counterparty's product name (the
+	// product in another organisation that shares this product's
+	// search_key), so the print template can show both names.
 	linesQuery := `
 		SELECT pol.id, pol.purchase_order_id, pol.line_number, pol.product_id,
 			   pol.description, pol.quantity, pol.unit_id, pol.unit_price,
@@ -646,6 +697,16 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			   pol.packaging_id, pol.packaging_qty,
 			   COALESCE(p.name, '') as product_name, COALESCE(u.name, '') as unit_name,
 			   COALESCE(pkg.name, '') as packaging_name, COALESCE(pkg.qty, 0) as packaging_unit_qty,
+			   COALESCE((
+			       SELECT p2.name FROM products p2
+			       WHERE p2.tenant_id = p.tenant_id
+			         AND p2.deleted_at IS NULL
+			         AND p2.id <> p.id
+			         AND p.search_key IS NOT NULL AND p.search_key <> ''
+			         AND upper(p2.search_key) = upper(p.search_key)
+			       ORDER BY p2.created_at ASC
+			       LIMIT 1
+			   ), '') as alt_name,
 			   pol.created_at, pol.updated_at
 		FROM purchase_order_lines pol
 		LEFT JOIN products p ON pol.product_id = p.id
@@ -680,6 +741,7 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			&packagingID, &packagingQty,
 			&line.ProductName, &line.UnitName,
 			&packagingName, &packagingUnitQty,
+			&line.AltName,
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
@@ -853,6 +915,32 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("shipping_amount = $%d", argCount))
 		args = append(args, *input.ShippingAmount)
 	}
+	// Warehouse — accepts empty string as "clear back to NULL" so the
+	// auto-pick logic on receipt can run again. Validates UUID parse
+	// before writing so a malformed value doesn't blow up the whole
+	// update.
+	if input.WarehouseID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
+		if *input.WarehouseID == "" {
+			args = append(args, nil)
+		} else if wid, err := uuid.Parse(*input.WarehouseID); err == nil {
+			args = append(args, wid)
+		} else {
+			args = append(args, nil)
+		}
+	}
+	if input.ContactPersonID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contact_person_id = $%d", argCount))
+		if *input.ContactPersonID == "" {
+			args = append(args, nil)
+		} else if cpid, err := uuid.Parse(*input.ContactPersonID); err == nil {
+			args = append(args, cpid)
+		} else {
+			args = append(args, nil)
+		}
+	}
 	if input.Status != nil {
 		// Block statuses that must go through dedicated endpoints
 		// approved → POST /:id/approve (creates stock operations)
@@ -875,32 +963,190 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 		return
 	}
 
-	// Add updated_at
-	argCount++
-	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
-	args = append(args, time.Now())
-
-	// Add WHERE conditions
-	argCount++
-	args = append(args, id)
-	argCount++
-	args = append(args, tenantID)
-
-	query := fmt.Sprintf(
-		"UPDATE purchase_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
-		strings.Join(updates, ", "), argCount-1, argCount,
-	)
-
-	result, err := h.db.Exec(query, args...)
-	if err != nil {
-		h.log.Error("Failed to update purchase order", "error", err)
+	// Wrap the whole update in a transaction so header changes and
+	// line replacement either all succeed or all roll back. The old
+	// implementation used h.db.Exec directly and ignored input.Lines
+	// entirely — line edits made in the UI silently disappeared.
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to start transaction for PO update", "error", txErr)
 		response.InternalError(c, "Failed to update purchase order")
 		return
 	}
+	defer tx.Rollback()
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		response.NotFound(c, "Purchase order")
+	now := time.Now()
+
+	// Header update — only run if any header fields changed.
+	if len(updates) > 0 {
+		// Add updated_at
+		argCount++
+		updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+		args = append(args, now)
+
+		// Add WHERE conditions
+		argCount++
+		args = append(args, id)
+		argCount++
+		args = append(args, tenantID)
+
+		query := fmt.Sprintf(
+			"UPDATE purchase_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
+			strings.Join(updates, ", "), argCount-1, argCount,
+		)
+
+		result, err := tx.Exec(query, args...)
+		if err != nil {
+			h.log.Error("Failed to update purchase order", "error", err)
+			// Surface FK violations as structured 400s so the frontend can
+			// render a localised hint instead of a generic 500.
+			if strings.Contains(err.Error(), "purchase_orders_vendor_id_fkey") {
+				response.ErrorWithDetails(c, 400, "PO_INVALID_VENDOR",
+					"Selected supplier is no longer valid. Pick another supplier and save again.",
+					nil)
+				return
+			}
+			response.InternalError(c, "Failed to update purchase order")
+			return
+		}
+
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			response.NotFound(c, "Purchase order")
+			return
+		}
+	}
+
+	// Line replacement. Strategy: delete all existing lines for the
+	// PO, insert the new ones, then recompute and store the header
+	// totals (subtotal / tax_amount / total_amount). This is destructive
+	// to line IDs but the create-modal-style edit form sends a complete
+	// replacement set anyway.
+	//
+	// Refuse the wipe in two cases (FK referential integrity):
+	//   1. quantity_received > 0 — downstream stock postings exist.
+	//   2. purchase_invoice_lines reference any of these lines —
+	//      a bill has been created from the PO, so dropping the PO
+	//      lines would orphan the bill lines via FK
+	//      `purchase_invoice_lines_purchase_order_line_id_fkey`.
+	// In either case we surface a clear error rather than letting
+	// the database throw a cryptic FK violation. Header edits already
+	// committed earlier in this same handler still apply.
+	if len(input.Lines) > 0 {
+		var receivedCount int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM purchase_order_lines
+			 WHERE purchase_order_id = $1 AND quantity_received > 0`, id,
+		).Scan(&receivedCount)
+		if receivedCount > 0 {
+			// Structured error so the frontend can render a localized
+			// message via apiErrors.js (ERROR_TEMPLATES).
+			response.ErrorWithDetails(c, 400, "PO_LINES_LOCKED_RECEIVED",
+				"Cannot edit lines on a purchase order that has been received against. Cancel the receipt first or create an amended PO.",
+				nil)
+			return
+		}
+
+		var billedCount int
+		_ = tx.QueryRow(
+			`SELECT COUNT(*) FROM purchase_invoice_lines pil
+			 JOIN purchase_order_lines pol ON pol.id = pil.purchase_order_line_id
+			 WHERE pol.purchase_order_id = $1`, id,
+		).Scan(&billedCount)
+		if billedCount > 0 {
+			response.ErrorWithDetails(c, 400, "PO_LINES_LOCKED_BILLED",
+				"Cannot edit lines on a purchase order that has been billed. Cancel the related bill(s) first, or create a new PO.",
+				nil)
+			return
+		}
+
+		if _, err := tx.Exec(`DELETE FROM purchase_order_lines WHERE purchase_order_id = $1`, id); err != nil {
+			h.log.Error("Failed to delete existing PO lines", "error", err, "po_id", id)
+			response.InternalError(c, "Failed to update purchase order lines: "+err.Error())
+			return
+		}
+
+		var newSubtotal, newTax, newTotal float64
+		for i, line := range input.Lines {
+			lineID := uuid.New()
+
+			var productID, unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
+			if line.ProductID != "" {
+				if pid, err := uuid.Parse(line.ProductID); err == nil {
+					productID = &pid
+				}
+			}
+			if line.UnitID != "" {
+				if uid, err := uuid.Parse(line.UnitID); err == nil {
+					unitID = &uid
+				}
+			}
+			if line.TaxID != "" {
+				if tid, err := uuid.Parse(line.TaxID); err == nil {
+					taxID = &tid
+				}
+			}
+			if line.WarehouseID != "" {
+				if wid, err := uuid.Parse(line.WarehouseID); err == nil {
+					lineWarehouseID = &wid
+				}
+			}
+			if line.PackagingID != "" {
+				if pkgid, err := uuid.Parse(line.PackagingID); err == nil {
+					packagingID = &pkgid
+				}
+			}
+
+			lineSubtotal := line.Quantity * line.UnitPrice
+			lineTax := (lineSubtotal - line.DiscountAmount) * line.TaxPercent / 100
+			lineTotal := lineSubtotal - line.DiscountAmount + lineTax
+
+			var lineNotes *string
+			if line.Notes != "" {
+				lineNotes = &line.Notes
+			}
+
+			if _, err := tx.Exec(`
+				INSERT INTO purchase_order_lines (
+					id, purchase_order_id, line_number, product_id, description,
+					quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount,
+					line_total, quantity_received, quantity_invoiced, warehouse_id, notes,
+					packaging_id, packaging_qty, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			`,
+				lineID, id, i+1, productID, line.Description,
+				line.Quantity, unitID, line.UnitPrice, line.DiscountAmount, taxID, lineTax,
+				lineTotal, 0, 0, lineWarehouseID, lineNotes,
+				packagingID, line.PackagingQty, now, now,
+			); err != nil {
+				h.log.Error("Failed to insert replacement PO line", "error", err, "line_index", i)
+				response.InternalError(c, "Failed to update purchase order lines")
+				return
+			}
+
+			newSubtotal += lineSubtotal - line.DiscountAmount
+			newTax += lineTax
+			newTotal += lineTotal
+		}
+
+		// Refresh header totals so the PO list view, bill creation,
+		// and reporting all see the correct numbers. amount_due isn't
+		// touched directly — it's a generated column on
+		// purchase_invoices, not on purchase_orders.
+		if _, err := tx.Exec(`
+			UPDATE purchase_orders
+			SET subtotal = $1, tax_amount = $2, total_amount = $3, updated_at = $4
+			WHERE id = $5
+		`, newSubtotal, newTax, newTotal, now, id); err != nil {
+			h.log.Error("Failed to refresh PO totals after line update", "error", err, "po_id", id)
+			response.InternalError(c, "Failed to update purchase order totals")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit PO update transaction", "error", err)
+		response.InternalError(c, "Failed to update purchase order")
 		return
 	}
 
@@ -1362,6 +1608,70 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		poLineRows.Close()
 	}
 
+	// Auto-receive: directly add goods to inventory (1-step simplified flow)
+	{
+		var whID uuid.UUID
+		if warehouseID != nil {
+			whID = *warehouseID
+		} else {
+			// Fallback to first warehouse
+			h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&whID)
+		}
+
+		if whID != uuid.Nil {
+			lineRows, _ := h.db.Query(`
+				SELECT pol.product_id, pol.quantity, pol.unit_price
+				FROM purchase_order_lines pol
+				WHERE pol.purchase_order_id = $1 AND pol.product_id IS NOT NULL
+			`, poID)
+			if lineRows != nil {
+				for lineRows.Next() {
+					var prodID uuid.UUID
+					var qty, unitPrice float64
+					if lineRows.Scan(&prodID, &qty, &unitPrice) != nil {
+						continue
+					}
+
+					// Upsert inventory
+					var invID uuid.UUID
+					err := h.db.QueryRow(`
+						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
+						ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET updated_at = NOW()
+						RETURNING id
+					`, uuid.New(), tenantID, prodID, whID, orgID, unitPrice, now).Scan(&invID)
+					if err != nil {
+						continue
+					}
+
+					// Add quantity
+					h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, unit_cost = $2, last_movement_date = $3, updated_at = $3 WHERE id = $4`,
+						qty, unitPrice, now, invID)
+
+					// Create transaction
+					h.db.Exec(`INSERT INTO inventory_transactions (id, tenant_id, organization_id, inventory_id, transaction_type, quantity, unit_cost, total_cost, reference_type, reference_id, reason, transaction_date, created_at)
+						VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, 'purchase_order', $8, 'PO Auto-Receipt', $9, $9)`,
+						uuid.New(), tenantID, orgID, invID, qty, unitPrice, qty*unitPrice, poID, now)
+
+					// Create lot for FIFO
+					lotNumber := fmt.Sprintf("PO-%s", poID.String()[:8])
+					h.db.Exec(`INSERT INTO inventory_lots (id, tenant_id, product_id, warehouse_id, lot_number, received_date, initial_quantity, remaining_quantity, unit_cost, purchase_order_id, status, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)`,
+						uuid.New(), tenantID, prodID, whID, lotNumber, now, qty, unitPrice, poID)
+				}
+				lineRows.Close()
+			}
+
+			// Update PO status to received
+			h.db.Exec(`UPDATE purchase_orders SET status = 'received', updated_at = NOW() WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
+
+			// Update PO line quantities received
+			h.db.Exec(`UPDATE purchase_order_lines SET quantity_received = quantity WHERE purchase_order_id = $1`, poID)
+
+			h.log.Info("Auto-received PO goods into inventory", "po_id", poID, "warehouse_id", whID)
+		}
+	}
+
 	return nil
 }
 
@@ -1541,6 +1851,26 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		response.InternalError(c, "Failed to approve purchase order")
 		return
 	}
+
+	// Intercompany: when PO is approved, ensure the matching SO exists in
+	// the vendor's company. The sync also fires from UpdatePurchaseOrder
+	// when status moves to "ordered", but users sometimes go straight
+	// from draft → approved (skipping send), so call it here too. The
+	// service is idempotent — it no-ops when an SO link already exists or
+	// when this PO was itself created from an SO.
+	go func() {
+		var createdFromSO int
+		h.db.QueryRow(`
+			SELECT COUNT(*) FROM intercompany_document_links
+			WHERE tenant_id = $1 AND linked_document_type = 'purchase_order' AND linked_document_id = $2
+		`, tenantID, id).Scan(&createdFromSO)
+		if createdFromSO > 0 {
+			return
+		}
+		if err := h.icSync.SyncPurchaseOrderToSaleOrder(tenantID, id); err != nil {
+			h.log.Error("Intercompany PO->SO sync failed on approve", "error", err, "po_id", id)
+		}
+	}()
 
 	// Notify: purchase order approved
 	go func() {
@@ -2055,14 +2385,88 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	).Scan(&purchaseJournalID, &numberPrefix)
 
 	if journalErr == nil {
-		// Find AP account
-		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
-		if apAccountID == uuid.Nil {
-			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "2100")
-		}
+		// Find AP account. findAccount already filters is_leaf=true,
+		// but we run resolveLeafAccount as a final safety net so this
+		// handler is robust even if a future change introduces a path
+		// that bypasses the leaf filter. Same pattern below for the
+		// Stock Input and Tax accounts.
+		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
+		apAccountID = resolveLeafAccount(tx, apAccountID)
 
 		if apAccountID != uuid.Nil {
-			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+			// TT §4.5 requires every 6010 (Mol yetkazib beruvchilar va
+			// pudratchilar) line to carry a contract reference. The
+			// `journal_entry_lines.contract_id` column has a foreign key
+			// to **contracts(id)** (migration 318), NOT to
+			// procurement_contracts(id) — those are two separate tables
+			// that happen to share part of the schema. The enrichment
+			// trigger (migration 385) looks up `contracts` for the
+			// vendor-level fallback, so we have to write spot contracts
+			// there too. Otherwise the trigger fills in a UUID that
+			// belongs to procurement_contracts and the FK on the JE
+			// line rejects with `fk_jel_contract` violation.
+			//
+			// Lookup column mapping is `contracts.supplier_id` (not
+			// `vendor_id` like procurement_contracts uses).
+			//
+			// Idempotent: re-running the bill flow finds the spot
+			// contract created on a previous attempt instead of
+			// inserting a duplicate.
+			var existingContractID uuid.UUID
+			contractErr := tx.QueryRow(`
+				SELECT id FROM contracts
+				WHERE tenant_id = $1
+				  AND supplier_id = $2
+				  AND COALESCE(status, 'active') IN ('active', 'draft', 'approved')
+				  AND deleted_at IS NULL
+				ORDER BY created_at DESC
+				LIMIT 1
+			`, tenantID, vendorID).Scan(&existingContractID)
+
+			if contractErr == sql.ErrNoRows {
+				// No master contract exists — create a Spot Purchase
+				// stub. contracts(supplier_name) is NOT NULL so we
+				// look it up from the contacts table.
+				spotID := uuid.New()
+				spotNumber := fmt.Sprintf("SPOT-%s", poNumber)
+				spotTitle := fmt.Sprintf("Spot purchase via PO %s", poNumber)
+				var vendorName string
+				_ = tx.QueryRow(
+					`SELECT COALESCE(name, COALESCE(legal_name, 'Vendor')) FROM contacts WHERE id = $1`,
+					vendorID,
+				).Scan(&vendorName)
+				if vendorName == "" {
+					vendorName = "Vendor"
+				}
+
+				spotStart := now
+				spotEnd := now.AddDate(5, 0, 0)
+				if _, ccErr := tx.Exec(`
+					INSERT INTO contracts (
+						id, tenant_id, contract_number, supplier_id, supplier_name,
+						title, contract_type, start_date, end_date, value, currency,
+						status, created_by, created_at, updated_at
+					) VALUES (
+						$1, $2, $3, $4, $5,
+						$6, 'fixed', $7, $8, $9, 'UZS',
+						'active', $10, NOW(), NOW()
+					)
+				`, spotID, tenantID, spotNumber, vendorID, vendorName,
+					spotTitle, spotStart, spotEnd, totalAmount, createdBy); ccErr != nil {
+					// Non-fatal logging — the JE insert below will fail
+					// with the §4.5 error if we couldn't create the
+					// contract, giving the operator a clear actionable
+					// message rather than masking a deeper data issue.
+					h.log.Warn("CreateBillFromPO: failed to auto-create spot contract",
+						"error", ccErr, "vendor_id", vendorID)
+				}
+			} else if contractErr != nil {
+				h.log.Warn("CreateBillFromPO: contract lookup failed",
+					"error", contractErr, "vendor_id", vendorID)
+			}
+
+			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
+			taxAccountID = resolveLeafAccount(tx, taxAccountID)
 
 			// Per-category accounting: resolve Stock Interim Receipt per product
 			type billLineAcct struct {
@@ -2081,26 +2485,48 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			}
 			for i := range billLines {
 				ca := getCategoryAccounts(tx, tenantID, organizationID, billLines[i].ProductID)
-				billLines[i].InputAcct = ca.StockInputAccountID
+				// Belt-and-suspenders: getCategoryAccounts already pipes
+				// through resolveLeafAccount + leaf-filtered findAccount,
+				// but we resolve once more here to defend against any
+				// future code path that bypasses the helpers. Posting to
+				// a group account is rejected by TT §4.2 trigger.
+				billLines[i].InputAcct = resolveLeafAccount(tx, ca.StockInputAccountID)
 			}
 
-			// Group by stock input account
+			// Group by stock input account. Skip uuid.Nil entries —
+			// happens when a product's category has no stock_input
+			// account configured AND the chart has no leaf descendant
+			// of 1010/6015. We'd rather fall through to the global
+			// fallback below than crash the whole bill.
 			inputGrouped := make(map[uuid.UUID]float64)
 			for _, bl := range billLines {
+				if bl.InputAcct == uuid.Nil {
+					continue
+				}
 				inputGrouped[bl.InputAcct] += bl.LineTotal
 			}
 
-			// Fallback if no product lines matched
+			// Fallback if no product lines resolved to a leaf account.
+			// findAccount + resolveLeafAccount both filter is_leaf=true
+			// already, but we apply resolveLeafAccount once more in
+			// case a deployment is mid-rollout where one helper has
+			// the new code and the other doesn't.
 			if len(inputGrouped) == 0 && subtotal > 0 {
-				fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "2230")
+				fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "6015")
 				if fallbackInput == uuid.Nil {
-					fallbackInput = findAccount(tx, tenantID, organizationID, "stock interim receipt", "2200")
+					fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "9110")
 				}
 				if fallbackInput == uuid.Nil {
-					fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
+					fallbackInput = findAccount(tx, tenantID, organizationID, "inventory", "1010")
 				}
+				fallbackInput = resolveLeafAccount(tx, fallbackInput)
 				if fallbackInput != uuid.Nil {
 					inputGrouped[fallbackInput] = subtotal
+				} else {
+					h.log.Error("CreateBillFromPO: no leaf account available for stock input — chart of accounts misconfigured",
+						"po_id", poID, "tenant_id", tenantID, "org_id", organizationID)
+					response.InternalError(c, "Chart of accounts has no leaf account for stock input. Please add a leaf child under 1010 (Xom ashyo) or 6015 (Stock Interim Receipt) and try again.")
+					return
 				}
 			}
 
@@ -2139,17 +2565,88 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 			jeLineNumber := 1
 
-			// Debit: Stock Interim Receipt (per category)
+			// Resolve the warehouse_id used for inventory-account debits.
+			// TT §4.5 mandates the "ombor" analytic on every leaf
+			// inventory account (1010 family). The trigger from
+			// migration 393 will also enrich this server-side, but
+			// packing it here gives us a fast-path success and a
+			// clearer error if no warehouse can be determined.
+			//
+			// Lookup chain mirrors the trigger:
+			//   1. goods_receipt.warehouse_id (3-way matched bills),
+			//   2. PO → most recent receipt stock_operation → dest_location → warehouse,
+			//   3. NULL — trigger will reject if the account requires it.
+			var billWarehouseID *uuid.UUID
+			{
+				var w uuid.UUID
+				// Step 1: 3-way matched bill → linked goods_receipt.
+				_ = tx.QueryRow(`
+					SELECT gr.warehouse_id
+					FROM purchase_invoices pi
+					JOIN goods_receipts gr ON gr.id = pi.goods_receipt_id
+					WHERE pi.id = $1
+				`, billID).Scan(&w)
+				// Step 2: PO → most recent receipt stock_operation.
+				if w == uuid.Nil {
+					_ = tx.QueryRow(`
+						SELECT wl.warehouse_id
+						FROM stock_operations so
+						LEFT JOIN warehouse_locations wl ON wl.id = so.dest_location_id
+						WHERE so.source_id = $1
+						  AND so.source_type = 'purchase_order'
+						  AND so.direction = 'receipt'
+						  AND so.tenant_id = $2
+						  AND so.deleted_at IS NULL
+						  AND so.state != 'cancelled'
+						  AND wl.warehouse_id IS NOT NULL
+						ORDER BY so.created_at DESC
+						LIMIT 1
+					`, poID, tenantID).Scan(&w)
+				}
+				// Step 3: tenant/org default warehouse — for bills
+				// created BEFORE any receipt (some flows pre-bill the
+				// vendor and reconcile receipts later). Picks the
+				// alphabetically-first active warehouse so the choice
+				// is deterministic across retries.
+				if w == uuid.Nil {
+					if organizationID != nil {
+						_ = tx.QueryRow(`
+							SELECT id FROM warehouses
+							WHERE tenant_id = $1 AND organization_id = $2
+							  AND COALESCE(is_active, true) = true
+							  AND deleted_at IS NULL
+							ORDER BY name ASC LIMIT 1
+						`, tenantID, *organizationID).Scan(&w)
+					}
+					if w == uuid.Nil {
+						_ = tx.QueryRow(`
+							SELECT id FROM warehouses
+							WHERE tenant_id = $1
+							  AND COALESCE(is_active, true) = true
+							  AND deleted_at IS NULL
+							ORDER BY name ASC LIMIT 1
+						`, tenantID).Scan(&w)
+					}
+				}
+				if w != uuid.Nil {
+					billWarehouseID = &w
+				}
+			}
+
+			// Debit: Stock Interim Receipt (per category). Pack
+			// warehouse_id so TT §4.5 ombor analytics is satisfied
+			// even on tenants where the trigger from migration 393
+			// hasn't been applied yet.
 			for inputAcct, amount := range inputGrouped {
 				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, contact_id, description,
+						id, journal_entry_id, line_number, account_id, contact_id, warehouse_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, "Stock Interim Receipt",
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, billWarehouseID, "Stock Interim Receipt",
 					amount, 0.0, 1.0, now,
 				); err != nil {
-					h.log.Error("CreateBillFromPO: failed to insert JE debit line", "error", err, "account", inputAcct)
+					h.log.Error("CreateBillFromPO: failed to insert JE debit line", "error", err, "account", inputAcct, "warehouse", billWarehouseID)
 					response.InternalError(c, "Failed to create journal entry line: "+err.Error())
 					return
 				}

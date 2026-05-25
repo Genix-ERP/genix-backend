@@ -65,6 +65,13 @@ func (h *Handler) ListInventory(c *gin.Context) {
 	expiryDays, _ := strconv.Atoi(c.DefaultQuery("expiry_days", "30"))
 
 	// Build query
+	// The JOIN to `products` filters out rows belonging to soft-deleted
+	// products. Without this, ghost inventory rows for deleted products are
+	// still returned by the API, which then drags warehouse totals down in
+	// the UI (the products page filters by deleted_at IS NULL, so the
+	// orphans are invisible in the list but still contribute to aggregate
+	// stats). Same filter is applied at line 5343 of this file for the
+	// per-warehouse stock value query, so this matches existing precedent.
 	baseQuery := `
 		SELECT i.id, i.tenant_id, i.product_id, i.warehouse_id, i.location_id,
 			   i.lot_number, i.serial_number, i.expiry_date,
@@ -76,14 +83,14 @@ func (h *Handler) ListInventory(c *gin.Context) {
 			   COALESCE(w.warehouse_type, 'regular') as warehouse_type,
 			   wl.code as location_code, wl.name as location_name
 		FROM inventory i
-		JOIN products p ON i.product_id = p.id
+		JOIN products p ON i.product_id = p.id AND p.deleted_at IS NULL
 		JOIN warehouses w ON i.warehouse_id = w.id
 		LEFT JOIN warehouse_locations wl ON i.location_id = wl.id
 		WHERE i.tenant_id = $1
 	`
 	countQuery := `
 		SELECT COUNT(*) FROM inventory i
-		JOIN products p ON i.product_id = p.id
+		JOIN products p ON i.product_id = p.id AND p.deleted_at IS NULL
 		JOIN warehouses w ON i.warehouse_id = w.id
 		WHERE i.tenant_id = $1
 	`
@@ -669,7 +676,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "inventory adjustment", "6910")
 		}
 		if adjustAcct == uuid.Nil {
-			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "miscellaneous expense", "6900")
+			adjustAcct = findAccount(tx, tenantID, orgIDPtr, "miscellaneous expense", "9410")
 		}
 
 		if ca.StockValuationAccountID != uuid.Nil && adjustAcct != uuid.Nil {
@@ -702,7 +709,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 					debitAcct = ca.StockValuationAccountID
 					creditAcct = ca.StockInputAccountID
 					if creditAcct == uuid.Nil {
-						creditAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+						creditAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
 					}
 					debitDesc = "Stock Valuation (adjustment in)"
 					creditDesc = "Stock Input (adjustment in)"
@@ -1644,18 +1651,24 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 	baseQuery := `
 		SELECT b.id, b.code, b.name, b.product_id, b.bom_type, b.quantity, b.version,
 			   b.is_active, b.is_default, b.effective_date, b.expiry_date, b.notes,
-			   b.created_at, b.warehouse_id, w.name as warehouse_name,
+			   b.created_at,
 			   p.code as product_code, p.name as product_name,
 			   (SELECT COUNT(*) FROM bom_lines bl WHERE bl.bom_id = b.id) as line_count,
 			   COALESCE((SELECT SUM(bl2.quantity * COALESCE(NULLIF(cp.cost_price, 0), cp.list_price, 0) * (1 + bl2.scrap_percent/100))
 			     FROM bom_lines bl2 JOIN products cp ON bl2.component_id = cp.id
 			     WHERE bl2.bom_id = b.id), 0)
-			   + COALESCE((SELECT SUM(COALESCE(wc.hourly_cost, 0) / GREATEST(COALESCE(wc.capacity_per_hour, 1), 1))
+			   -- Work center cost per product = hourly_cost / capacity_per_hour
+			   -- (how many so'm it costs to make one unit at this work center).
+			   -- Summed across all operations in the routing, added to the
+			   -- components total to yield total cost per finished product.
+			   + COALESCE((SELECT SUM(
+			         COALESCE(wc.hourly_cost, 0)
+			       / GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
+			     )
 			     FROM bom_operations bo LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
 			     WHERE bo.bom_id = b.id), 0) as total_cost
 		FROM product_boms b
 		JOIN products p ON b.product_id = p.id
-		LEFT JOIN warehouses w ON b.warehouse_id = w.id
 		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM product_boms b WHERE b.tenant_id = $1 AND b.deleted_at IS NULL`
@@ -1723,13 +1736,11 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		var b entity.BOMResponse
 		var effectiveDate, expiryDate sql.NullTime
 		var notes sql.NullString
-		var warehouseID sql.NullString
-		var warehouseName sql.NullString
 
 		err := rows.Scan(
 			&b.ID, &b.Code, &b.Name, &b.ProductID, &b.BOMType, &b.Quantity, &b.Version,
 			&b.IsActive, &b.IsDefault, &effectiveDate, &expiryDate, &notes,
-			&b.CreatedAt, &warehouseID, &warehouseName,
+			&b.CreatedAt,
 			&b.ProductCode, &b.ProductName, &b.LineCount, &b.TotalCost,
 		)
 		if err != nil {
@@ -1745,13 +1756,20 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 			s := expiryDate.Time.Format("2006-01-02")
 			b.ExpiryDate = &s
 		}
-		if warehouseID.Valid {
-			wid, _ := uuid.Parse(warehouseID.String)
+		// Load warehouse_id separately (column may not exist yet if migration 314 hasn't run)
+		var whID sql.NullString
+		var whName sql.NullString
+		h.db.QueryRow(`SELECT b2.warehouse_id, w.name FROM product_boms b2 LEFT JOIN warehouses w ON w.id = b2.warehouse_id WHERE b2.id = $1`, b.ID).Scan(&whID, &whName)
+		if whID.Valid {
+			wid, _ := uuid.Parse(whID.String)
 			b.WarehouseID = &wid
 		}
-		if warehouseName.Valid {
-			b.WarehouseName = &warehouseName.String
+		if whName.Valid {
+			b.WarehouseName = &whName.String
 		}
+		var bomSplit sql.NullBool
+		h.db.QueryRow(`SELECT has_split_output FROM product_boms WHERE id = $1`, b.ID).Scan(&bomSplit)
+		b.HasSplitOutput = bomSplit.Valid && bomSplit.Bool
 
 		boms = append(boms, &b)
 	}
@@ -1828,6 +1846,22 @@ func (h *Handler) GetBOM(c *gin.Context) {
 		b.ExpiryDate = &s
 	}
 
+	// Load warehouse_id and warehouse_name separately (column may not exist
+	// yet if migration 314 hasn't run on this environment).
+	var whID sql.NullString
+	var whName sql.NullString
+	h.db.QueryRow(`SELECT b2.warehouse_id, w.name FROM product_boms b2 LEFT JOIN warehouses w ON w.id = b2.warehouse_id WHERE b2.id = $1`, bomID).Scan(&whID, &whName)
+	if whID.Valid {
+		wid, _ := uuid.Parse(whID.String)
+		b.WarehouseID = &wid
+	}
+	if whName.Valid {
+		b.WarehouseName = &whName.String
+	}
+	var bomSplit sql.NullBool
+	h.db.QueryRow(`SELECT has_split_output FROM product_boms WHERE id = $1`, bomID).Scan(&bomSplit)
+	b.HasSplitOutput = bomSplit.Valid && bomSplit.Bool
+
 	// Get BOM lines
 	rows, err := h.db.Query(`
 		SELECT l.id, l.line_number, l.component_id, l.quantity, l.unit_of_measure,
@@ -1864,7 +1898,21 @@ func (h *Handler) GetBOM(c *gin.Context) {
 		b.Lines = append(b.Lines, l)
 	}
 
-	b.TotalCost = totalCost
+	// Add work-center cost per product (hourly_cost / capacity_per_hour)
+	// summed across all operations in the routing, so the detail Total
+	// Cost matches the list Total Cost.
+	var operationsCost sql.NullFloat64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(
+		    COALESCE(wc.hourly_cost, 0)
+		  / GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
+		), 0)
+		FROM bom_operations bo
+		LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
+		WHERE bo.bom_id = $1
+	`, bomID).Scan(&operationsCost)
+
+	b.TotalCost = totalCost + operationsCost.Float64
 
 	response.Success(c, b)
 }
@@ -1978,19 +2026,40 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		}
 	}
 
+	// Try INSERT with warehouse_id and has_split_output
 	_, err = tx.Exec(`
 		INSERT INTO product_boms (
 			id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
-			is_active, is_default, effective_date, expiry_date, notes, warehouse_id,
+			is_active, is_default, effective_date, expiry_date, notes, warehouse_id, has_split_output,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $15, $15)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $15, $16, $16)
 	`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
-		input.IsDefault, effectiveDate, expiryDate, notes, warehouseID, userID, now)
+		input.IsDefault, effectiveDate, expiryDate, notes, warehouseID, input.HasSplitOutput, userID, now)
 
 	if err != nil {
-		h.log.Error("Failed to create BOM", "error", err)
-		response.InternalError(c, "Failed to create BOM")
-		return
+		// Retry without warehouse_id if column doesn't exist
+		tx.Rollback()
+		tx, _ = h.db.Begin()
+		if input.IsDefault {
+			tx.Exec("UPDATE product_boms SET is_default = false WHERE product_id = $1 AND tenant_id = $2", productID, tenantID)
+		}
+		_, err = tx.Exec(`
+			INSERT INTO product_boms (
+				id, tenant_id, organization_id, code, name, product_id, bom_type, quantity, version,
+				is_active, is_default, effective_date, expiry_date, notes,
+				created_by, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1, true, $9, $10, $11, $12, $13, $14, $14)
+		`, bomID, tenantID, orgIDPtr, input.Code, input.Name, productID, bomType, quantity,
+			input.IsDefault, effectiveDate, expiryDate, notes, userID, now)
+		if err != nil {
+			h.log.Error("Failed to create BOM", "error", err)
+			response.InternalError(c, "Failed to create BOM")
+			return
+		}
+		// Set warehouse after if column exists
+		if warehouseID != nil {
+			h.db.Exec(`UPDATE product_boms SET warehouse_id = $1 WHERE id = $2`, warehouseID, bomID)
+		}
 	}
 
 	// Create lines
@@ -2159,6 +2228,11 @@ func (h *Handler) UpdateBOM(c *gin.Context) {
 			updates = append(updates, fmt.Sprintf("warehouse_id = $%d", argCount))
 			args = append(args, wid)
 		}
+	}
+	if input.HasSplitOutput != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("has_split_output = $%d", argCount))
+		args = append(args, *input.HasSplitOutput)
 	}
 
 	if len(updates) == 0 {
@@ -3584,9 +3658,9 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 				}
 
 				// Credit: Inventory Asset
-				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1300")
+				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
 				if inventoryAcct == uuid.Nil {
-					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1300")
+					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
 				}
 
 				if scrapAcct != uuid.Nil && inventoryAcct != uuid.Nil {
@@ -5560,9 +5634,9 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 				adjustAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory adjustment", "6910")
 			}
 			// Credit: Stock Valuation
-			stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1300")
+			stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
 			if stockAcct == uuid.Nil {
-				stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1300")
+				stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1010")
 			}
 
 			if adjustAcct != uuid.Nil && stockAcct != uuid.Nil {
@@ -6489,33 +6563,33 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						switch op.Direction {
 						case "receipt":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "2100")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "6010")
 								if creditAcct == uuid.Nil {
-									creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "2100")
+									creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "6010")
 								}
 							}
 						case "delivery":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "5100")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "9110")
 								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "5100")
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "9110")
 								}
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 						case "write_off":
 							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "6920")
+								debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "9430")
 								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "6910")
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "9420")
 								}
 							}
 							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1300")
+								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
 							}
 						}
 					}
@@ -7284,7 +7358,7 @@ func (h *Handler) postIntercompanyStockAccounting(tenantID uuid.UUID, opID uuid.
 			debitAcct = ca.StockValuationAccountID
 			creditAcct = ca.StockInputAccountID
 			if creditAcct == uuid.Nil {
-				creditAcct = findAccount(h.db, tenantID, orgID, "accounts payable", "2100")
+				creditAcct = findAccount(h.db, tenantID, orgID, "accounts payable", "6010")
 			}
 		case "delivery":
 			debitAcct = ca.ExpenseAccountID
@@ -7411,9 +7485,9 @@ func (h *Handler) completeMaterialRequestFromStockOp(tenantID uuid.UUID, stockOp
 	}
 
 	// Find expense account
-	expenseAcct := findAccount(h.db, tenantID, orgIDPtr, "construction expense", "7000")
+	expenseAcct := findAccount(h.db, tenantID, orgIDPtr, "construction expense", "9610")
 	if expenseAcct == uuid.Nil {
-		expenseAcct = findAccount(h.db, tenantID, orgIDPtr, "cost of goods", "5000")
+		expenseAcct = findAccount(h.db, tenantID, orgIDPtr, "cost of goods", "9110")
 	}
 
 	var totalExpense float64
@@ -8492,10 +8566,10 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 				if shortageAcct == uuid.Nil {
 					shortageAcct = findAccount(tx, tenantID, orgIDPtr, "kamomad", "9430")
 				}
-				// Kt - product inventory account (1300-series)
-				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1300")
+				// Kt - product inventory account (1010-series)
+				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
 				if inventoryAcct == uuid.Nil {
-					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1300")
+					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
 				}
 
 				if shortageAcct != uuid.Nil && inventoryAcct != uuid.Nil {
@@ -8765,6 +8839,8 @@ func (h *Handler) ListInventoryLots(c *gin.Context) {
 		return
 	}
 
+	organizationID, _ := middleware.GetOrganizationID(c)
+
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
@@ -8807,6 +8883,14 @@ func (h *Handler) ListInventoryLots(c *gin.Context) {
 
 	args := []interface{}{tenantID}
 	argCount := 1
+
+	// Filter by organization's warehouses
+	if organizationID != uuid.Nil {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		args = append(args, organizationID)
+	}
 
 	if productID != "" {
 		argCount++

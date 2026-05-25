@@ -63,7 +63,12 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
-	countQuery := `SELECT COUNT(*) FROM sales_orders so WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
+	// Mirror baseQuery's LEFT JOIN to contacts so the search clause below
+	// can reference c.name without breaking the count query (and therefore
+	// pagination) when the user searches by customer name.
+	countQuery := `SELECT COUNT(*) FROM sales_orders so
+		LEFT JOIN contacts c ON so.customer_id = c.id
+		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
 	args := []interface{}{tenantID}
 	argCount := 1
 
@@ -113,12 +118,16 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		args = append(args, dateTo)
 	}
 
-	// Search - also search by customer name
+	// Search - order number, reference, PO number, customer name, or product name in lines
 	if search := c.Query("search"); search != "" {
 		argCount++
 		searchPattern := "%" + strings.ToLower(search) + "%"
-		baseQuery += fmt.Sprintf(" AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d)", argCount, argCount, argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d)", argCount, argCount, argCount)
+		baseQuery += fmt.Sprintf(` AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d
+			OR EXISTS (SELECT 1 FROM sales_order_lines sol LEFT JOIN products p ON sol.product_id = p.id WHERE sol.sales_order_id = so.id AND (LOWER(p.name) LIKE $%d OR LOWER(sol.description) LIKE $%d)))`,
+			argCount, argCount, argCount, argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(` AND (LOWER(so.order_number) LIKE $%d OR LOWER(so.reference) LIKE $%d OR LOWER(so.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d
+			OR EXISTS (SELECT 1 FROM sales_order_lines sol LEFT JOIN products p ON sol.product_id = p.id WHERE sol.sales_order_id = so.id AND (LOWER(p.name) LIKE $%d OR LOWER(sol.description) LIKE $%d)))`,
+			argCount, argCount, argCount, argCount, argCount, argCount)
 		args = append(args, searchPattern)
 	}
 
@@ -377,13 +386,11 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		return
 	}
 
-	// Generate order number
+	// Order number is generated below, AFTER org resolution, because the unique
+	// constraint is (tenant_id, organization_id, order_number). The old code used
+	// SELECT COUNT(*) scoped only by tenant which caused collisions across orgs
+	// and a classic race when two POSTs landed back-to-back.
 	orderNumber := input.OrderNumber
-	if orderNumber == "" {
-		var count int
-		h.db.QueryRow("SELECT COUNT(*) FROM sales_orders WHERE tenant_id = $1", tenantID).Scan(&count)
-		orderNumber = fmt.Sprintf("S%05d", count+1)
-	}
 
 	orderID := uuid.New()
 	now := time.Now()
@@ -482,11 +489,10 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		createdBy = &userID
 	}
 
-	// Parse organization ID
+	// Resolve organization ID (input body first, then header)
 	var orgID *uuid.UUID
 	if input.OrganizationID != "" {
-		parsed, parseErr := uuid.Parse(input.OrganizationID)
-		if parseErr == nil {
+		if parsed, parseErr := uuid.Parse(input.OrganizationID); parseErr == nil {
 			orgID = &parsed
 		}
 	}
@@ -527,18 +533,68 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		discountCode = &input.DiscountCode
 	}
 
-	_, err = h.db.Exec(query,
-		orderID, tenantID, orgID, orderNumber, customerID, contactPersonID,
-		orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
-		currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
-		taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
-		input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, input.VehicleNumber, salesRepID,
-		projectID, projectName,
-		createdBy, now, now,
-	)
-	if err != nil {
+	// Generate order number if not supplied. Uses MAX + 1 scoped by (tenant, org)
+	// so we don't collide across orgs, and retries on unique-constraint violation
+	// to survive concurrent POSTs racing for the same next number.
+	//
+	// IMPORTANT: do NOT filter on deleted_at here. The unique constraint
+	// sales_orders_tenant_org_order_number_key covers every row in the table
+	// — soft-deleted rows still occupy their order_number. Excluding them
+	// from MAX makes the generator hand out a number that's already taken
+	// by a soft-deleted row, and every retry repeats the same calculation
+	// → infinite loop of "Sales order number collision, retrying".
+	nextOrderNumber := func() string {
+		var maxNum int
+		if orgID != nil {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM sales_orders
+				WHERE tenant_id = $1 AND organization_id = $2
+				  AND order_number ~ '^S[0-9]+$'`,
+				tenantID, *orgID,
+			).Scan(&maxNum)
+		} else {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM sales_orders
+				WHERE tenant_id = $1 AND organization_id IS NULL
+				  AND order_number ~ '^S[0-9]+$'`,
+				tenantID,
+			).Scan(&maxNum)
+		}
+		return fmt.Sprintf("S%05d", maxNum+1)
+	}
+
+	maxAttempts := 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if orderNumber == "" {
+			orderNumber = nextOrderNumber()
+		}
+
+		_, err = h.db.Exec(query,
+			orderID, tenantID, orgID, orderNumber, customerID, contactPersonID,
+			orderDate, expectedDate, billingAddressJSON, shippingAddressJSON,
+			currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
+			taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
+			input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, input.VehicleNumber, salesRepID,
+			projectID, projectName,
+			createdBy, now, now,
+		)
+		if err == nil {
+			break
+		}
+		// Retry only on the order-number unique-violation collision; everything else fails fast.
+		if strings.Contains(err.Error(), "sales_orders_tenant_org_order_number_key") && input.OrderNumber == "" {
+			h.log.Warn("Sales order number collision, retrying", "order_number", orderNumber, "attempt", attempt+1)
+			orderNumber = "" // force regeneration next iteration
+			continue
+		}
 		h.log.Error("Failed to create sales order", "error", err, "customer_id", customerID, "order_number", orderNumber)
-		h.log.Error("Failed to create sales order", "error", err)
+		response.InternalError(c, "Failed to create sales order")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to create sales order after retries", "error", err, "customer_id", customerID, "order_number", orderNumber)
 		response.InternalError(c, "Failed to create sales order")
 		return
 	}
@@ -787,6 +843,11 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 	}
 
 	// Get order lines with product name, unit name and packaging info
+	// alt_name: when this line's product has a search_key, look up the
+	// matching product in any *other* organisation in the same tenant
+	// (typically the buyer's company in an intercompany flow). The
+	// frontend prints both names so each side sees the product label
+	// they recognise.
 	linesQuery := `
 		SELECT sol.id, sol.line_number, sol.product_id, sol.description, sol.quantity, sol.unit_id, sol.unit_price,
 			   sol.discount_type, sol.discount_value, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total,
@@ -794,7 +855,17 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			   sol.packaging_id, sol.packaging_qty,
 			   COALESCE(p.name, '') as product_name,
 			   COALESCE(pp.name, '') as packaging_name, COALESCE(pp.qty, 0) as packaging_unit_qty,
-			   COALESCE(u.name, '') as unit_name
+			   COALESCE(u.name, '') as unit_name,
+			   COALESCE((
+			       SELECT p2.name FROM products p2
+			       WHERE p2.tenant_id = p.tenant_id
+			         AND p2.deleted_at IS NULL
+			         AND p2.id <> p.id
+			         AND p.search_key IS NOT NULL AND p.search_key <> ''
+			         AND upper(p2.search_key) = upper(p.search_key)
+			       ORDER BY p2.created_at ASC
+			       LIMIT 1
+			   ), '') as alt_name
 		FROM sales_order_lines sol
 		LEFT JOIN products p ON p.id = sol.product_id
 		LEFT JOIN product_packagings pp ON pp.id = sol.packaging_id
@@ -816,6 +887,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			var productName, packagingName string
 			var packagingUnitQty float64
 			var unitName string
+			var altName string
 
 			err := linesRows.Scan(
 				&lineID, &lineNumber, &productID, &description, &quantity, &unitID, &unitPrice,
@@ -823,7 +895,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 				&qtyDelivered, &qtyInvoiced, &lineWarehouseID, &lineNotes,
 				&packagingID, &packagingQty,
 				&productName, &packagingName, &packagingUnitQty,
-				&unitName,
+				&unitName, &altName,
 			)
 			if err != nil {
 				continue
@@ -834,6 +906,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 				"line_number":        lineNumber,
 				"product_id":         productID.String(),
 				"product_name":       productName,
+				"alt_name":           altName,
 				"quantity":           quantity,
 				"unit_price":         unitPrice,
 				"discount_value":     lineDiscountValue,
@@ -935,7 +1008,8 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		input.DiscountValue == nil && input.ShippingAmount == nil && input.PaymentTerms == nil &&
 		input.Reference == nil && input.PONumber == nil && input.Notes == nil &&
 		input.InternalNotes == nil && input.WarehouseID == nil && input.Carrier == nil &&
-		input.SalesRepID == nil && input.PaymentStatus == nil
+		input.SalesRepID == nil && input.PaymentStatus == nil &&
+		input.CustomerID == nil && input.CustomerName == nil
 
 	if !isStatusOnlyUpdate && currentStatus != string(entity.OrderStatusDraft) {
 		response.BadRequest(c, "Can only update order details in draft status")
@@ -946,6 +1020,60 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 	updates := []string{}
 	args := []interface{}{}
 	argCount := 0
+
+	// Customer change. Prefer customer_id (UUID from a frontend dropdown);
+	// fall back to customer_name lookup-or-create, mirroring the create
+	// path. Previously this field wasn't on the input struct at all, so
+	// the customer column was silently ignored on every edit.
+	if input.CustomerID != nil && strings.TrimSpace(*input.CustomerID) != "" {
+		cid, parseErr := uuid.Parse(strings.TrimSpace(*input.CustomerID))
+		if parseErr != nil {
+			response.BadRequest(c, "Invalid customer_id")
+			return
+		}
+		// Verify the contact exists for this tenant before writing.
+		var exists bool
+		h.db.QueryRow(
+			"SELECT EXISTS(SELECT 1 FROM contacts WHERE id = $1 AND tenant_id = $2)",
+			cid, tenantID,
+		).Scan(&exists)
+		if !exists {
+			response.BadRequest(c, "Customer not found")
+			return
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("customer_id = $%d", argCount))
+		args = append(args, cid)
+	} else if input.CustomerName != nil && strings.TrimSpace(*input.CustomerName) != "" {
+		newName := strings.TrimSpace(*input.CustomerName)
+		var cid uuid.UUID
+		err := h.db.QueryRow(
+			"SELECT id FROM contacts WHERE tenant_id = $1 AND name ILIKE $2 LIMIT 1",
+			tenantID, newName,
+		).Scan(&cid)
+		if err == sql.ErrNoRows {
+			// Auto-create a placeholder contact, same as CreateSalesOrder does.
+			cid = uuid.New()
+			now := time.Now()
+			contactCode := "CUST-" + uuid.New().String()[:8]
+			if _, execErr := h.db.Exec(`
+				INSERT INTO contacts (id, tenant_id, type, code, name, created_at, updated_at)
+				VALUES ($1, $2, 'customer', $3, $4, $5, $5)`,
+				cid, tenantID, contactCode, newName, now,
+			); execErr != nil {
+				h.log.Error("Failed to create placeholder contact", "error", execErr)
+				response.InternalError(c, "Failed to update customer")
+				return
+			}
+		} else if err != nil {
+			h.log.Error("Failed to lookup customer", "error", err)
+			response.InternalError(c, "Failed to update customer")
+			return
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("customer_id = $%d", argCount))
+		args = append(args, cid)
+	}
 
 	if input.ExpectedDate != nil {
 		argCount++
@@ -1338,13 +1466,26 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 				}
 			}
 
-			// Group by account pair
+			// Group by account pair. Skip lines whose Debit or Credit
+			// account resolved to uuid.Nil — without this guard, the
+			// CR INSERT below silently fails (FK rejects Nil account_id
+			// but Go code ignores the error), leaving a permanently
+			// imbalanced DR-only JE in the ledger. This was the source
+			// of 50+ "Goods Delivery" JEs with no CR side.
 			type acctPair struct {
 				Debit  uuid.UUID
 				Credit uuid.UUID
 			}
 			grouped := make(map[acctPair]float64)
 			for _, sl := range soLines {
+				if sl.OutputAcct == uuid.Nil || sl.ValuationAcct == uuid.Nil {
+					h.log.Warn("Stock-movement JE: skipping product with unresolved account",
+						"product_id", sl.ProductID.String(),
+						"output_acct", sl.OutputAcct.String(),
+						"valuation_acct", sl.ValuationAcct.String(),
+						"amount", sl.CostAmount)
+					continue
+				}
 				key := acctPair{Debit: sl.OutputAcct, Credit: sl.ValuationAcct}
 				grouped[key] += sl.CostAmount
 			}
@@ -2407,10 +2548,10 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	if journalErr == nil {
 		// Find AR account
-		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 
 		if arAccountID != uuid.Nil {
-			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 			// Get invoice lines for per-category accounting
 			type invoiceLineAcct struct {
@@ -2457,7 +2598,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			cogsGrouped := make(map[cogsPair]float64)
 
 			// Resolve fallback revenue account for products without category income account
-			fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+			fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
 
 			for _, al := range acctLines {
 				if al.LineTotal > 0 {
@@ -2613,8 +2754,9 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		}
 	}
 
-	// Update order status to processing
-	if _, err := tx.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3",
+	// Update order status to processing — but only if it's still in an early stage.
+	// Don't regress shipped/delivered orders back to processing.
+	if _, err := tx.Exec("UPDATE sales_orders SET status = $1, updated_at = $2 WHERE id = $3 AND status IN ('draft', 'quotation', 'confirmed')",
 		entity.OrderStatusProcessing, now, orderID); err != nil {
 		h.log.Error("CreateInvoiceFromOrder: update order status failed", "error", err)
 	}

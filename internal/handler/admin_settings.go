@@ -23,6 +23,7 @@ type AdminSettingsResponse struct {
 	HR            map[string]interface{} `json:"hr"`
 	Finance       map[string]interface{} `json:"finance"`
 	Projects      map[string]interface{} `json:"projects"`
+	Construction  map[string]interface{} `json:"construction"`
 	UpdatedAt     *time.Time             `json:"updated_at,omitempty"`
 	UpdatedBy     *uuid.UUID             `json:"updated_by,omitempty"`
 }
@@ -153,6 +154,12 @@ func getDefaultAdminSettings() AdminSettingsResponse {
 			},
 			"timesheet": map[string]interface{}{
 				"approval_required": true,
+			},
+		},
+		Construction: map[string]interface{}{
+			"material_approval": map[string]interface{}{
+				"approver_user_id": "",
+				"require_approval": true,
 			},
 		},
 	}
@@ -532,13 +539,28 @@ type dbQuerier interface {
 // tenant-wide name match, then org-specific code match. This handles organizations where
 // account codes may be reassigned to different account types.
 // nameLike should be specific (e.g. "accounts receivable", "sales revenue") to avoid ambiguity.
+// findAccount looks up an account by name (preferred) or code, and ALWAYS
+// returns a leaf account (is_leaf=true).
+//
+// Why is_leaf matters: TT §4.2 (migrations 319 + 326) forbids posting to
+// group accounts at the database trigger level. Returning a group account
+// from this helper would 500 every JE-emitting handler downstream — and
+// that's exactly the bug we keep fighting (CreateBillFromPO, sales
+// invoices, goods receipts, etc.). Filtering at the lookup layer kills
+// the problem class.
+//
+// Behavior when no leaf is found at any priority level: the helper falls
+// through all 6 strategies and returns uuid.Nil. The caller is expected
+// to handle uuid.Nil (typically by skipping that GL leg) rather than
+// post to a group account.
 func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike string, code string) uuid.UUID {
 	var id uuid.UUID
+	const leafFilter = `AND COALESCE(is_leaf, true) = true`
 
 	// 1. Try org + exact name start match (most precise)
 	if orgID != nil {
 		_ = q.QueryRow(
-			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND LOWER(name) LIKE $3 AND deleted_at IS NULL LIMIT 1`,
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND LOWER(name) LIKE $3 AND deleted_at IS NULL `+leafFilter+` LIMIT 1`,
 			tenantID, *orgID, nameLike+"%",
 		).Scan(&id)
 		if id != uuid.Nil {
@@ -549,7 +571,7 @@ func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike str
 	// 2. Try org + contains name match (broader)
 	if orgID != nil {
 		_ = q.QueryRow(
-			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND LOWER(name) LIKE $3 AND deleted_at IS NULL LIMIT 1`,
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND LOWER(name) LIKE $3 AND deleted_at IS NULL `+leafFilter+` LIMIT 1`,
 			tenantID, *orgID, "%"+nameLike+"%",
 		).Scan(&id)
 		if id != uuid.Nil {
@@ -557,10 +579,10 @@ func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike str
 		}
 	}
 
-	// 3. Try org + code match
+	// 3. Try org + exact code match
 	if orgID != nil {
 		_ = q.QueryRow(
-			`SELECT id FROM accounts WHERE tenant_id = $1 AND (organization_id = $2 OR organization_id IS NULL) AND code = $3 AND deleted_at IS NULL LIMIT 1`,
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND (organization_id = $2 OR organization_id IS NULL) AND code = $3 AND deleted_at IS NULL `+leafFilter+` LIMIT 1`,
 			tenantID, *orgID, code,
 		).Scan(&id)
 		if id != uuid.Nil {
@@ -570,26 +592,29 @@ func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike str
 
 	// 4. Fallback: tenant-wide name match (no org filter)
 	_ = q.QueryRow(
-		`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) LIKE $2 AND deleted_at IS NULL LIMIT 1`,
+		`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) LIKE $2 AND deleted_at IS NULL `+leafFilter+` LIMIT 1`,
 		tenantID, nameLike+"%",
 	).Scan(&id)
 	if id != uuid.Nil {
 		return id
 	}
 
-	// 5. Last resort: tenant-wide code match
+	// 5. Tenant-wide exact code match
 	_ = q.QueryRow(
-		`SELECT id FROM accounts WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL LIMIT 1`,
+		`SELECT id FROM accounts WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL `+leafFilter+` LIMIT 1`,
 		tenantID, code,
 	).Scan(&id)
 	if id != uuid.Nil {
 		return id
 	}
 
-	// 6. Code prefix match (org-scoped, then tenant-wide)
+	// 6. Code prefix match (org-scoped, then tenant-wide). Sorts the
+	//    resulting child codes ascending so we get the first leaf
+	//    under the requested code branch — e.g. asking for "6015"
+	//    when the chart only has 6015.10, 6015.20 returns 6015.10.
 	if orgID != nil {
 		_ = q.QueryRow(
-			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code LIKE $3 AND deleted_at IS NULL ORDER BY code ASC LIMIT 1`,
+			`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND code LIKE $3 AND deleted_at IS NULL `+leafFilter+` ORDER BY code ASC LIMIT 1`,
 			tenantID, *orgID, code+"%",
 		).Scan(&id)
 		if id != uuid.Nil {
@@ -597,10 +622,60 @@ func findAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, nameLike str
 		}
 	}
 	_ = q.QueryRow(
-		`SELECT id FROM accounts WHERE tenant_id = $1 AND code LIKE $2 AND deleted_at IS NULL ORDER BY code ASC LIMIT 1`,
+		`SELECT id FROM accounts WHERE tenant_id = $1 AND code LIKE $2 AND deleted_at IS NULL `+leafFilter+` ORDER BY code ASC LIMIT 1`,
 		tenantID, code+"%",
 	).Scan(&id)
 	return id
+}
+
+// resolveLeafAccount accepts any accountID and returns either:
+//   - the same ID if the account is already a leaf,
+//   - a leaf descendant if the account is a group (walks the parent_id
+//     tree breadth-first, picking the lowest-coded leaf at the shallowest
+//     depth — caps recursion at 10 levels to avoid runaway scans),
+//   - uuid.Nil if the account doesn't exist or has no leaf descendants.
+//
+// Used to harden every account-id read from user-configured tables
+// (product_categories.stock_input_account_id, contacts.payable_account_id,
+// etc.) where the user might have selected a group account by mistake.
+// Without this, the misconfiguration cascades into a 500 at the JE
+// trigger (TT §4.2) every time we try to post a journal entry.
+func resolveLeafAccount(q dbQuerier, accountID uuid.UUID) uuid.UUID {
+	if accountID == uuid.Nil {
+		return uuid.Nil
+	}
+	var isLeaf bool
+	if err := q.QueryRow(
+		`SELECT COALESCE(is_leaf, true) FROM accounts WHERE id = $1 AND deleted_at IS NULL`,
+		accountID,
+	).Scan(&isLeaf); err != nil {
+		return uuid.Nil
+	}
+	if isLeaf {
+		return accountID
+	}
+	// Group account — walk down to the first leaf descendant.
+	// Recursive CTE bounded at depth 10. Tenant scope inherits via
+	// the parent_id chain (parent_id targets accounts(id), and the
+	// caller already validated tenant when passing accountID in).
+	var leafID uuid.UUID
+	_ = q.QueryRow(`
+		WITH RECURSIVE descendants AS (
+			SELECT id, COALESCE(is_leaf, true) AS leaf, code, 0 AS depth
+			FROM accounts
+			WHERE parent_id = $1 AND deleted_at IS NULL
+			UNION ALL
+			SELECT a.id, COALESCE(a.is_leaf, true), a.code, d.depth + 1
+			FROM accounts a
+			JOIN descendants d ON a.parent_id = d.id
+			WHERE d.depth < 10 AND a.deleted_at IS NULL
+		)
+		SELECT id FROM descendants
+		WHERE leaf = true
+		ORDER BY depth ASC, code ASC
+		LIMIT 1
+	`, accountID).Scan(&leafID)
+	return leafID
 }
 
 // getContactDefaultAccount returns the contact's default receivable or payable account.
@@ -615,7 +690,11 @@ func getContactDefaultAccount(q dbQuerier, contactID uuid.UUID, accountType stri
 		fmt.Sprintf(`SELECT %s FROM contacts WHERE id = $1 AND %s IS NOT NULL AND deleted_at IS NULL`, col, col),
 		contactID,
 	).Scan(&id)
-	return id
+	// Same TT §4.2 protection as getCategoryAccounts: if the contact
+	// was configured with a group AR/AP account (e.g. 4010 instead of
+	// a leaf 4010.10), drop down to a leaf descendant rather than
+	// 500ing every invoice/payment posting for this contact.
+	return resolveLeafAccount(q, id)
 }
 
 // CategoryAccounts holds the GL accounts configured on a product category (Odoo-style).
@@ -629,6 +708,14 @@ type CategoryAccounts struct {
 
 // getCategoryAccounts returns GL accounts for a product's category.
 // Falls back to findAccount() defaults if category accounts are not configured.
+//
+// Every account ID read from `product_categories` is piped through
+// resolveLeafAccount() because users have, multiple times, configured
+// the category with a group/parent account (e.g. 1010 "Xom ashyo va
+// materiallar" instead of a leaf child like 1010.10). Posting to a
+// group account triggers TT §4.2 and 500s the bill/invoice flow. By
+// resolving to a leaf at read time, we make the system tolerant of
+// the misconfiguration without changing the user's data.
 func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, productID uuid.UUID) CategoryAccounts {
 	var ca CategoryAccounts
 	// Query: product → category → category's account fields
@@ -644,30 +731,48 @@ func getCategoryAccounts(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, prod
 	`, productID).Scan(&ca.IncomeAccountID, &ca.ExpenseAccountID,
 		&ca.StockValuationAccountID, &ca.StockInputAccountID, &ca.StockOutputAccountID)
 
-	// Fallbacks if category accounts not set
+	// Resolve any group accounts the user might have configured to
+	// the first leaf descendant. resolveLeafAccount returns uuid.Nil
+	// for missing/invalid IDs so the fallback paths below still work.
+	ca.IncomeAccountID = resolveLeafAccount(q, ca.IncomeAccountID)
+	ca.ExpenseAccountID = resolveLeafAccount(q, ca.ExpenseAccountID)
+	ca.StockValuationAccountID = resolveLeafAccount(q, ca.StockValuationAccountID)
+	ca.StockInputAccountID = resolveLeafAccount(q, ca.StockInputAccountID)
+	ca.StockOutputAccountID = resolveLeafAccount(q, ca.StockOutputAccountID)
+
+	// Fallbacks if category accounts not set or didn't resolve to a leaf.
+	// findAccount itself filters is_leaf=true so these are guaranteed leaves.
 	if ca.IncomeAccountID == uuid.Nil {
-		ca.IncomeAccountID = findAccount(q, tenantID, orgID, "sales revenue", "4000")
+		ca.IncomeAccountID = findAccount(q, tenantID, orgID, "sales revenue", "9010")
 	}
 	if ca.ExpenseAccountID == uuid.Nil {
-		ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cost of goods", "5000")
+		ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cost of goods", "9110")
 		if ca.ExpenseAccountID == uuid.Nil {
-			ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cogs", "5000")
+			ca.ExpenseAccountID = findAccount(q, tenantID, orgID, "cogs", "9110")
 		}
 	}
 	if ca.StockValuationAccountID == uuid.Nil {
-		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1300")
+		// Try the raw-materials leaf first (NAS code 1030 in most charts;
+		// in some tenants 1030 is named "Yoqilg'i" historically — fall
+		// back through "raw materials" / "1010" for charts where 1010
+		// itself is a leaf rather than a group). Without this multi-step
+		// fallback, every Goods Delivery JE for an org whose 1010 is a
+		// group ended up as a DR-only entry — the credit silently failed
+		// because findAccount("inventory","1010") returned uuid.Nil and
+		// the INSERT FK was rejected without anyone noticing.
+		ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "xom ashyo", "1030")
+		if ca.StockValuationAccountID == uuid.Nil {
+			ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "raw materials", "1010")
+		}
+		if ca.StockValuationAccountID == uuid.Nil {
+			ca.StockValuationAccountID = findAccount(q, tenantID, orgID, "inventory", "1010")
+		}
 	}
 	if ca.StockInputAccountID == uuid.Nil {
-		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2230")
-		if ca.StockInputAccountID == uuid.Nil {
-			ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "2200")
-		}
+		ca.StockInputAccountID = findAccount(q, tenantID, orgID, "stock interim receipt", "6015")
 	}
 	if ca.StockOutputAccountID == uuid.Nil {
-		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2231")
-		if ca.StockOutputAccountID == uuid.Nil {
-			ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "2201")
-		}
+		ca.StockOutputAccountID = findAccount(q, tenantID, orgID, "stock interim delivery", "6016")
 	}
 	return ca
 }
@@ -683,14 +788,23 @@ func getInventoryAccountByType(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID
 
 	switch inventoryType {
 	case "raw":
-		return findAccount(q, tenantID, orgID, "raw materials", "1310")
+		// NAS code 1010 (Xom ashyo va materiallar). 1030 is Yoqilg'i
+		// (Fuel) and was the wrong default — same bug fixed in the
+		// manufacturing/work-order JE branches. Purchase-receipt JEs
+		// flow through here, so leaving 1030 in place would keep
+		// crediting Fuel for every raw-material receipt.
+		acct := findAccount(q, tenantID, orgID, "xom ashyo", "1010")
+		if acct == uuid.Nil {
+			acct = findAccount(q, tenantID, orgID, "raw materials", "1010")
+		}
+		return acct
 	case "finished":
-		return findAccount(q, tenantID, orgID, "finished goods", "1330")
+		return findAccount(q, tenantID, orgID, "finished goods", "2810")
 	case "trade":
-		return findAccount(q, tenantID, orgID, "goods for resale", "1340")
+		return findAccount(q, tenantID, orgID, "goods for resale", "2910")
 	case "service":
 		return uuid.Nil
 	default:
-		return findAccount(q, tenantID, orgID, "goods for resale", "1340")
+		return findAccount(q, tenantID, orgID, "goods for resale", "2910")
 	}
 }

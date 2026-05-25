@@ -71,7 +71,12 @@ func (h *Handler) ListLeads(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
-	// Filter by organization
+	// Strict org filter: leads belong to one company and only that
+	// company's teammates see them. CreateLead/ConvertLead always
+	// populate organization_id (with a primary-org fallback when no
+	// X-Organization-ID header is supplied), and a one-time
+	// backfill migration handles any legacy NULL-org rows. So a
+	// strict equality filter here can't leave leads invisible.
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND l.organization_id = $%d", argCount)
@@ -463,11 +468,28 @@ func (h *Handler) CreateLead(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
-	// Get organization ID
+	// Get organization ID. Fall back to the creator's primary org via
+	// employees → employee_organizations when the request didn't carry
+	// an active-org header (admin without a switched company) —
+	// otherwise the lead (or converted record) ends up with
+	// organization_id = NULL and is visible only to admins and the
+	// creator, confusing teammates in the same company.
 	orgID, _ := middleware.GetOrganizationID(c)
 	var orgIDPtr *uuid.UUID
 	if orgID != uuid.Nil {
 		orgIDPtr = &orgID
+	} else if userID != uuid.Nil {
+		var fallbackOrg uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT eo.organization_id
+			FROM employee_organizations eo
+			JOIN employees e ON e.id = eo.employee_id
+			WHERE e.user_id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
+			ORDER BY eo.is_primary DESC, eo.created_at ASC
+			LIMIT 1
+		`, userID, tenantID).Scan(&fallbackOrg); err == nil && fallbackOrg != uuid.Nil {
+			orgIDPtr = &fallbackOrg
+		}
 	}
 
 	// Set defaults
@@ -986,11 +1008,28 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 
 	now := time.Now()
 
-	// Get organization ID
+	// Get organization ID. Fall back to the creator's primary org via
+	// employees → employee_organizations when the request didn't carry
+	// an active-org header (admin without a switched company) —
+	// otherwise the lead (or converted record) ends up with
+	// organization_id = NULL and is visible only to admins and the
+	// creator, confusing teammates in the same company.
 	orgID, _ := middleware.GetOrganizationID(c)
 	var orgIDPtr *uuid.UUID
 	if orgID != uuid.Nil {
 		orgIDPtr = &orgID
+	} else if userID != uuid.Nil {
+		var fallbackOrg uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT eo.organization_id
+			FROM employee_organizations eo
+			JOIN employees e ON e.id = eo.employee_id
+			WHERE e.user_id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
+			ORDER BY eo.is_primary DESC, eo.created_at ASC
+			LIMIT 1
+		`, userID, tenantID).Scan(&fallbackOrg); err == nil && fallbackOrg != uuid.Nil {
+			orgIDPtr = &fallbackOrg
+		}
 	}
 
 	result := map[string]interface{}{

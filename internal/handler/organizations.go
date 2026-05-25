@@ -11,6 +11,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // Organization represents a company/organization within a tenant
@@ -48,6 +49,10 @@ type Organization struct {
 	LegalAddress          *string  `json:"legal_address,omitempty"`
 	Notes                 *string  `json:"notes,omitempty"`
 	IntercompanyVendorIDs []string `json:"intercompany_vendor_ids,omitempty"`
+	// Per-org sidebar visibility override (migration 386).
+	// If an app_id is in this list, the app is hidden from the sidebar
+	// when this organization is the active company. Empty by default.
+	HiddenApps []string `json:"hidden_apps"`
 }
 
 // CreateOrganizationInput represents the input for creating an organization
@@ -113,6 +118,9 @@ type UpdateOrganizationInput struct {
 	Notes                 *string `json:"notes,omitempty"`
 	// Intercompany vendoring: create vendor+customer contacts in these org IDs
 	IntercompanyVendorIDs []string `json:"intercompany_vendor_ids,omitempty"`
+	// Per-org sidebar visibility override (migration 386). Pointer so
+	// "absent in payload" is distinguishable from "explicitly empty".
+	HiddenApps *[]string `json:"hidden_apps,omitempty"`
 }
 
 // ListOrganizations returns all organizations for the current tenant
@@ -129,7 +137,8 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 		       settings, is_active, created_at, updated_at,
 		       oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 		       tax_regime, activity_status, business_group, intercompany_relations,
-		       director_name, director_phone, legal_address, notes
+		       director_name, director_phone, legal_address, notes,
+		       COALESCE(hidden_apps, '{}'::text[])
 		FROM organizations
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 		ORDER BY name ASC
@@ -147,6 +156,7 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 	for rows.Next() {
 		var org Organization
 		var addressJSON, contactInfoJSON, settingsJSON []byte
+		var hiddenApps pq.StringArray
 
 		err := rows.Scan(
 			&org.ID, &org.TenantID, &org.ParentID, &org.Code, &org.Name, &org.Type,
@@ -156,7 +166,12 @@ func (h *Handler) ListOrganizations(c *gin.Context) {
 			&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 			&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 			&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
+			&hiddenApps,
 		)
+		org.HiddenApps = []string(hiddenApps)
+		if org.HiddenApps == nil {
+			org.HiddenApps = []string{}
+		}
 		if err != nil {
 			h.log.Error("Failed to scan organization", "error", err)
 			continue
@@ -340,6 +355,9 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 		response.InternalServerError(c, "Failed to create organization")
 		return
 	}
+	// New orgs always start with no hidden apps. Setting explicitly so the
+	// JSON response includes [] instead of null.
+	org.HiddenApps = []string{}
 
 	// Parse JSONB fields
 	if len(addressJSONOut) > 0 {
@@ -404,13 +422,15 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		       settings, is_active, created_at, updated_at,
 		       oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 		       tax_regime, activity_status, business_group, intercompany_relations,
-		       director_name, director_phone, legal_address, notes
+		       director_name, director_phone, legal_address, notes,
+		       COALESCE(hidden_apps, '{}'::text[])
 		FROM organizations
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`
 
 	var org Organization
 	var addressJSON, contactInfoJSON, settingsJSON []byte
+	var hiddenApps pq.StringArray
 
 	err = h.db.QueryRow(query, orgID, tenantID).Scan(
 		&org.ID, &org.TenantID, &org.ParentID, &org.Code, &org.Name, &org.Type,
@@ -420,6 +440,7 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
+		&hiddenApps,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Organization")
@@ -429,6 +450,10 @@ func (h *Handler) GetOrganization(c *gin.Context) {
 		h.log.Error("Failed to get organization", "error", err)
 		response.InternalServerError(c, "Failed to get organization")
 		return
+	}
+	org.HiddenApps = []string(hiddenApps)
+	if org.HiddenApps == nil {
+		org.HiddenApps = []string{}
 	}
 
 	// Parse JSONB fields
@@ -633,6 +658,14 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		args = append(args, *input.Notes)
 		argIndex++
 	}
+	if input.HiddenApps != nil {
+		// Per-org sidebar visibility list (migration 386). pq.StringArray
+		// marshals []string to PostgreSQL text[] correctly; passing the
+		// raw slice would land as a single quoted string.
+		query += fmt.Sprintf(", hidden_apps = $%d", argIndex)
+		args = append(args, pq.StringArray(*input.HiddenApps))
+		argIndex++
+	}
 
 	query += fmt.Sprintf(" WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL", argIndex, argIndex+1)
 	args = append(args, orgID, tenantID)
@@ -642,10 +675,12 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 	           settings, is_active, created_at, updated_at,
 	           oked, bank_account, bank_mfo, bank_name, COALESCE(is_vat_payer, false),
 	           tax_regime, activity_status, business_group, intercompany_relations,
-	           director_name, director_phone, legal_address, notes`
+	           director_name, director_phone, legal_address, notes,
+	           COALESCE(hidden_apps, '{}'::text[])`
 
 	var org Organization
 	var addressJSON, contactInfoJSON, settingsJSON []byte
+	var hiddenApps pq.StringArray
 
 	err = h.db.QueryRow(query, args...).Scan(
 		&org.ID, &org.TenantID, &org.ParentID, &org.Code, &org.Name, &org.Type,
@@ -655,11 +690,16 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		&org.OKED, &org.BankAccount, &org.BankMFO, &org.BankName, &org.IsVATPayer,
 		&org.TaxRegime, &org.ActivityStatus, &org.BusinessGroup, &org.IntercompanyRelations,
 		&org.DirectorName, &org.DirectorPhone, &org.LegalAddress, &org.Notes,
+		&hiddenApps,
 	)
 	if err != nil {
 		h.log.Error("Failed to update organization", "error", err)
 		response.InternalServerError(c, "Failed to update organization")
 		return
+	}
+	org.HiddenApps = []string(hiddenApps)
+	if org.HiddenApps == nil {
+		org.HiddenApps = []string{}
 	}
 
 	// Parse JSONB fields
@@ -884,7 +924,7 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		accountTypeIDs[code] = id
 	}
 
-	// Define default accounts - following standard Chart of Accounts
+	// Define default accounts - following Uzbekistan NAS (lex.uz/acts/1357627)
 	defaultAccounts := []struct {
 		code        string
 		name        string
@@ -894,78 +934,117 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		isRecon     bool
 		description string
 	}{
-		// Assets (1xxx)
-		{"1000", "Cash", "CASH", false, false, true, "Cash on hand"},
-		{"1010", "Bank Account", "CASH", true, false, true, "Main bank account"},
-		{"1100", "Accounts Receivable", "AR", false, true, true, "Trade receivables from customers"},
-		{"1210", "Allowance for Doubtful Accounts", "CONTRA_ASSET", false, false, false, "Reserve for bad debts"},
-		{"1300", "Inventory", "INV", false, true, false, "Goods held for sale"},
-		{"1310", "Raw Materials", "INV", false, false, false, "Raw materials inventory"},
-		{"1320", "Work in Progress", "INV", false, false, false, "Work in progress inventory"},
-		{"1330", "Finished Goods", "INV", false, false, false, "Finished goods inventory"},
-		{"1400", "Prepaid Expenses", "OA", false, false, false, "Prepaid expenses"},
-		{"1500", "Fixed Assets", "FA", false, false, false, "Property, plant and equipment"},
-		{"1510", "Accumulated Depreciation", "CONTRA_ASSET", false, false, false, "Accumulated depreciation"},
-		{"1600", "Intangible Assets", "OA", false, false, false, "Intangible assets"},
-		{"1020", "Foreign Currency Account", "CASH", false, false, true, "Foreign currency bank account"},
-		{"1340", "Goods for Resale", "INV", false, false, false, "Goods purchased for resale"},
-		{"1410", "Input VAT", "OA", false, false, false, "VAT on purchases (receivable)"},
-		{"1700", "Construction Costs", "OA", false, false, false, "Construction work in progress costs"},
-		{"1730", "Employee Advances", "OA", false, false, false, "Advances paid to employees"},
+		// Asosiy vositalar (01xx)
+		{"0100", "Asosiy vositalar", "FA", false, false, false, "Asosiy vositalar (mol-mulk, zavod va jihozlar)"},
+		{"0110", "Yer", "FA", false, false, false, "Yer uchastkasi"},
+		{"0120", "Binolar, inshootlar va uzatuvchi moslamalar", "FA", false, false, false, "Binolar va inshootlar"},
+		{"0130", "Mashina va asbob-uskunalar", "FA", false, false, false, "Mashina va uskunalar"},
+		{"0140", "Mebel va ofis jihozlari", "FA", false, false, false, "Mebel va ofis jihozlari"},
+		{"0150", "Kompyuter jihozlari va hisoblash texnikasi", "FA", false, false, false, "Kompyuter jihozlari"},
+		{"0160", "Transport vositalari", "FA", false, false, false, "Transport vositalari"},
 
-		// Liabilities (2xxx)
-		{"2000", "Accounts Payable", "AP", false, true, true, "Trade payables to suppliers"},
-		{"2100", "Accrued Expenses", "ST_LIAB", false, false, false, "Accrued liabilities"},
-		{"2110", "Wages Payable", "ST_LIAB", false, false, false, "Wages and salaries payable"},
-		{"2120", "Interest Payable", "ST_LIAB", false, false, false, "Interest payable"},
-		{"2200", "Tax Payable", "ST_LIAB", false, false, false, "Tax liabilities"},
-		{"2210", "VAT Payable", "ST_LIAB", false, false, false, "VAT/Sales tax payable"},
-		{"2220", "Income Tax Payable", "ST_LIAB", false, false, false, "Income tax payable"},
-		{"2230", "Stock Interim Receipt", "ST_LIAB", false, false, false, "Interim account for goods received not yet invoiced"},
-		{"2231", "Stock Interim Delivery", "ST_LIAB", false, false, false, "Interim account for goods delivered not yet invoiced"},
-		{"2590", "Accrued Machine Costs", "ST_LIAB", false, false, false, "Accrued liabilities for machine hour costs in production"},
-		{"2300", "Unearned Revenue", "ST_LIAB", false, false, false, "Deferred revenue"},
-		{"2400", "Short-term Loans", "ST_LIAB", false, false, true, "Short-term borrowings"},
-		{"2500", "Long-term Loans", "LT_LIAB", false, false, true, "Long-term borrowings"},
+		// Eskirish (02xx)
+		{"0200", "Asosiy vositalar eskirishi", "CONTRA_ASSET", false, false, false, "Yig'ilgan eskirish"},
+		{"0220", "Bino va inshootlarning eskirishi", "CONTRA_ASSET", false, false, false, "Bino va inshootlar eskirishi"},
+		{"0230", "Mashina va asbob-uskunalarning eskirishi", "CONTRA_ASSET", false, false, false, "Mashina uskunalar eskirishi"},
+		{"0260", "Transport vositalarining eskirishi", "CONTRA_ASSET", false, false, false, "Transport eskirishi"},
 
-		// Equity (3xxx)
-		{"3000", "Owner's Equity", "EQUITY", false, false, false, "Owner's capital"},
-		{"3100", "Share Capital", "EQUITY", false, false, false, "Issued share capital"},
-		{"3200", "Retained Earnings", "RETAIN", false, false, false, "Accumulated profits"},
-		{"3300", "Current Year Earnings", "RETAIN", false, false, false, "Current period profit/loss"},
-		{"3400", "Dividends", "EQUITY", false, false, false, "Dividends declared"},
+		// Nomoddiy aktivlar (04xx)
+		{"0400", "Nomoddiy aktivlar", "OA", false, false, false, "Nomoddiy aktivlar"},
+		{"0490", "Nomoddiy aktivlar eskirishi", "CONTRA_ASSET", false, false, false, "Nomoddiy aktivlar amortizatsiyasi"},
 
-		// Revenue (4xxx)
-		{"4000", "Sales Revenue", "REVENUE", false, false, false, "Revenue from sales"},
-		{"4100", "Service Revenue", "REVENUE", false, false, false, "Revenue from services"},
-		{"4300", "Construction Revenue", "REVENUE", false, false, false, "Revenue from construction projects"},
-		{"4900", "Other Income", "OTHER_INC", false, false, false, "Miscellaneous income"},
-		{"4910", "Interest Income", "OTHER_INC", false, false, false, "Interest earned"},
-		{"4920", "Foreign Exchange Gain", "OTHER_INC", false, false, false, "Gain on foreign exchange"},
+		// Kapital qo'yilmalar (08xx)
+		{"0810", "Tugallanmagan kapital qo'yilmalar", "OA", false, false, false, "Qurilish ishlari xarajatlari"},
 
-		// Cost of Goods Sold (5xxx)
-		{"5000", "Cost of Goods Sold", "COGS", false, false, false, "Direct cost of goods sold"},
-		{"5100", "Direct Materials", "COGS", false, false, false, "Cost of raw materials used"},
-		{"5200", "Direct Labor", "COGS", false, false, false, "Direct labor costs"},
-		{"5300", "Manufacturing Overhead", "COGS", false, false, false, "Manufacturing overhead"},
+		// Materiallar (10xx)
+		{"1010", "Xom ashyo va materiallar", "INV", false, false, false, "Tovar-moddiy zaxiralar"},
+		{"1030", "Yoqilg'i", "INV", false, false, false, "Yoqilg'i materiallari"},
+		{"1050", "Ehtiyot qismlar", "INV", false, false, false, "Ehtiyot qismlar"},
+		{"1060", "Qurilish materiallari", "INV", false, false, false, "Qurilish materiallari"},
+		{"1090", "Boshqa materiallar", "INV", false, false, false, "Boshqa materiallar"},
 
-		// Operating Expenses (6xxx)
-		{"6000", "Salaries & Wages", "OPEX", false, false, false, "Employee salaries and wages"},
-		{"6100", "Rent Expense", "OPEX", false, false, false, "Rent and lease payments"},
-		{"6200", "Utilities", "OPEX", false, false, false, "Electricity, water, gas"},
-		{"6300", "Office Supplies", "OPEX", false, false, false, "Office supplies expense"},
-		{"6400", "Insurance Expense", "OPEX", false, false, false, "Insurance premiums"},
-		{"6500", "Depreciation Expense", "OPEX", false, false, false, "Depreciation of assets"},
-		{"6600", "Advertising & Marketing", "OPEX", false, false, false, "Marketing expenses"},
-		{"6700", "Professional Fees", "OPEX", false, false, false, "Legal, accounting fees"},
-		{"6800", "Travel & Entertainment", "OPEX", false, false, false, "Business travel expenses"},
-		{"6900", "Miscellaneous Expense", "OPEX", false, false, false, "Other operating expenses"},
+		// Ishlab chiqarish (20xx-29xx)
+		{"2010", "Asosiy ishlab chiqarish", "INV", false, false, false, "Tugallanmagan ishlab chiqarish"},
+		{"2310", "Yordamchi ishlab chiqarish", "INV", false, false, false, "Yordamchi ishlab chiqarish xarajatlari"},
+		{"2510", "Umumishlab chiqarish xarajatlari", "OPEX", false, false, false, "Ishlab chiqarish ustama xarajatlari"},
+		{"2810", "Tayyor mahsulot", "INV", false, false, false, "Tayyor mahsulot omborda"},
+		{"2910", "Sotib olingan tovarlar", "INV", false, false, false, "Qayta sotish uchun tovarlar"},
 
-		// Other Expenses (7xxx)
-		{"7000", "Interest Expense", "OTHER_EXP", false, false, false, "Interest on borrowings"},
-		{"7100", "Bank Charges", "OTHER_EXP", false, false, false, "Bank fees and charges"},
-		{"7200", "Foreign Exchange Loss", "OTHER_EXP", false, false, false, "Loss on foreign exchange"},
-		{"7900", "Other Expenses", "OTHER_EXP", false, false, false, "Miscellaneous expenses"},
+		// Kelgusi davr xarajatlari (31xx)
+		{"3100", "Kelgusi davr xarajatlari", "OA", false, false, false, "Oldindan to'langan xarajatlar"},
+
+		// Debitorlik qarzlari (40xx-49xx)
+		{"4010", "Xaridor va buyurtmachilardan olinadigan schyotlar", "AR", false, true, true, "Savdo debitorlik qarzlari"},
+		{"4210", "Mehnat haqi bo'yicha berilgan bo'naklar", "OA", false, false, false, "Xodimlarga berilgan bo'naklar"},
+		{"4310", "TMQ uchun berilgan bo'naklar", "OA", false, false, false, "Mol yetkazib beruvchilarga bo'naklar"},
+		{"4410", "Byudjetga soliqlar bo'yicha bo'nak to'lovlari", "OA", false, false, false, "QQS kirim (olinadigan)"},
+		{"4710", "Hisobdor shaxslar", "OA", false, false, false, "Hisobdor shaxslarga berilgan summa"},
+		{"4790", "Boshqa debitorlik qarzlari", "AR", false, false, false, "Boshqa debitorlik qarzlari"},
+		{"4910", "Shubhali qarzlar bo'yicha zaxira", "CONTRA_ASSET", false, false, false, "Shubhali qarzlar uchun zaxira"},
+
+		// Pul mablag'lari (50xx-55xx)
+		{"5010", "Kassa", "CASH", false, false, true, "Naqd pul kassada"},
+		{"5020", "Valyuta kassasi", "CASH", false, false, true, "Chet el valyutasidagi naqd pullar"},
+		{"5110", "Hisob-kitob schyoti", "CASH", true, false, true, "Asosiy bank hisob raqami"},
+
+		// Kreditorlik qarzlari (60xx-69xx)
+		{"6010", "Mol yetkazib beruvchilar va pudratchilar", "AP", false, true, true, "Mol yetkazib beruvchilarga savdo kreditorlik qarzlari"},
+		{"6015", "Olingan, lekin hisob-faktura qilinmagan tovarlar", "ST_LIAB", false, false, false, "Olingan, lekin hali hisob-faktura ko'rsatilmagan tovarlar uchun oraliq hisob"},
+		{"6016", "Yetkazilgan, lekin hisob-faktura qilinmagan tovarlar", "ST_LIAB", false, false, false, "Yetkazilgan, lekin hali hisob-faktura ko'rsatilmagan tovarlar uchun oraliq hisob"},
+		{"6310", "Kelgusi davr daromadlari", "ST_LIAB", false, false, false, "Kechiktirilgan daromad"},
+		{"6410", "Byudjetga to'lovlar bo'yicha qarz (turlar bo'yicha)", "ST_LIAB", false, false, false, "Soliq majburiyatlari"},
+		{"6420", "QQS bo'yicha qarz", "ST_LIAB", false, false, false, "QQS/Savdo solig'i to'lanishi kerak"},
+		{"6430", "Foyda solig'i bo'yicha qarz", "ST_LIAB", false, false, false, "Daromad solig'i to'lanishi kerak"},
+		{"6510", "Maqsadli davlat jamg'armalariga to'lovlar", "ST_LIAB", false, false, false, "Ijtimoiy sug'urta to'lovlari"},
+		{"6710", "Mehnat haqi bo'yicha xodimlarga bo'lgan qarz", "ST_LIAB", false, false, false, "Ish haqi va maoshlar to'lanishi kerak"},
+		{"6810", "Qisqa muddatli bank kreditlari", "ST_LIAB", false, false, true, "Qisqa muddatli qarzlar"},
+		{"6920", "Foizlar bo'yicha hisoblashlar", "ST_LIAB", false, false, false, "To'lanishi kerak bo'lgan foizlar"},
+		{"6990", "Boshqa kreditorlik qarzlari", "ST_LIAB", false, false, false, "Hisoblangan majburiyatlar"},
+
+		// Uzoq muddatli majburiyatlar (78xx)
+		{"7810", "Uzoq muddatli bank kreditlari", "LT_LIAB", false, false, true, "Uzoq muddatli qarzlar"},
+		{"7820", "Uzoq muddatli qarzlar", "LT_LIAB", false, false, true, "Uzoq muddatli qarzlar"},
+
+		// Kapital (83xx-87xx)
+		{"8300", "Ustav kapitali", "EQUITY", false, false, false, "Egasining kapitali"},
+		{"8310", "Oddiy aksiyalar", "EQUITY", false, false, false, "Chiqarilgan aksiyadorlik kapitali"},
+		{"8400", "Zaxira kapitali", "EQUITY", false, false, false, "Zaxira kapitali"},
+		{"8500", "Qo'shimcha kapital", "EQUITY", false, false, false, "Qo'shimcha kapital"},
+		{"8700", "Taqsimlanmagan foyda (qoplanmagan zarar)", "RETAIN", false, false, false, "Yig'ilgan foyda"},
+		{"8720", "E'lon qilingan dividendlar", "EQUITY", false, false, false, "E'lon qilingan dividendlar"},
+
+		// Daromadlar (90xx-95xx)
+		{"9010", "Tayyor mahsulot sotishdan daromadlar", "REVENUE", false, false, false, "Sotishdan tushum"},
+		{"9020", "Tovarlar sotishdan daromadlar", "REVENUE", false, false, false, "Tovarlar sotishdan tushum"},
+		{"9030", "Xizmatlar ko'rsatishdan daromadlar", "REVENUE", false, false, false, "Xizmatlardan tushum"},
+		{"9040", "Qurilish shartnomasi bo'yicha daromadlar", "REVENUE", false, false, false, "Qurilish loyihalaridan tushum"},
+		{"9310", "Boshqa operatsion daromadlar", "OTHER_INC", false, false, false, "Turli xil daromadlar"},
+		{"9510", "Foiz shaklida daromadlar", "OTHER_INC", false, false, false, "Olingan foizlar"},
+		{"9540", "Valyuta kursi farqlaridan daromadlar", "OTHER_INC", false, false, false, "Valyuta ayirboshlash bo'yicha foyda"},
+
+		// Xarajatlar (91xx-96xx)
+		{"9110", "Sotilgan tayyor mahsulot tannarxi", "COGS", false, false, false, "Sotilgan tovarlarning to'g'ridan-to'g'ri tannarxi"},
+		{"9120", "Sotilgan tovarlar tannarxi", "COGS", false, false, false, "Ishlatilgan xom ashyo tannarxi"},
+		{"9130", "Ishlab chiqarish xarajatlari", "COGS", false, false, false, "Bevosita mehnat xarajatlari"},
+		{"9140", "Umumishlab chiqarish xarajatlari", "COGS", false, false, false, "Ishlab chiqarish ustama xarajatlari"},
+		{"9150", "Xizmatlar tannarxi", "COGS", false, false, false, "Ko'rsatilgan xizmatlar tannarxi"},
+		{"9160", "Qurilish ishlari tannarxi", "COGS", false, false, false, "Qurilish ishlari tannarxi"},
+		{"9410", "Davr xarajatlari", "OPEX", false, false, false, "Boshqa operatsion xarajatlar"},
+		{"9420", "Mehnat haqi xarajatlari", "OPEX", false, false, false, "Xodimlar ish haqi va maoshlari"},
+		{"9430", "Ijara xarajatlari", "OPEX", false, false, false, "Ijara va lizing to'lovlari"},
+		{"9440", "Kommunal xarajatlar", "OPEX", false, false, false, "Elektr, suv, gaz"},
+		{"9450", "Ofis xarajatlari", "OPEX", false, false, false, "Ofis jihozlari xarajati"},
+		{"9460", "Sug'urta xarajatlari", "OPEX", false, false, false, "Sug'urta mukofotlari"},
+		{"9470", "Eskirish xarajatlari", "OPEX", false, false, false, "Aktivlar eskirishi"},
+		{"9480", "Reklama va marketing xarajatlari", "OPEX", false, false, false, "Marketing xarajatlari"},
+		{"9490", "Boshqa xizmatlar uchun xarajatlar", "OPEX", false, false, false, "Yuridik, buxgalteriya to'lovlari"},
+		{"9610", "Foiz shaklida xarajatlar", "OTHER_EXP", false, false, false, "Qarzlar bo'yicha foizlar"},
+		{"9620", "Bank xizmatlari uchun xarajatlar", "OTHER_EXP", false, false, false, "Bank to'lovlari va yig'imlar"},
+		{"9630", "Valyuta kursi farqlaridan zararlar", "OTHER_EXP", false, false, false, "Valyuta ayirboshlashda zarar"},
+		{"9690", "Boshqa moliyaviy xarajatlar", "OTHER_EXP", false, false, false, "Turli xil xarajatlar"},
+
+		// Yakuniy natija (99xx)
+		{"9910", "Yakuniy moliyaviy natija", "RETAIN", false, false, false, "Joriy davr foydasi/zarari"},
 	}
 
 	for _, acc := range defaultAccounts {
@@ -993,6 +1072,151 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		}
 	}
 
+	// ── GROUP accounts (mirror migration 317) ─────────────────────────
+	// New orgs created AFTER migration 317 don't get the group
+	// hierarchy because migration 317 only ran once for orgs that
+	// existed at that time. Without these, the chart-of-accounts view
+	// only shows leaves and the hierarchy looks "flat". Insert the
+	// same 40 group accounts here so every new org has the standard
+	// UzNAS hierarchy from day one.
+	groupAccounts := []struct {
+		code     string
+		nameUz   string
+		nameEn   string
+		nameRu   string
+		typeCode string
+		nature   string
+	}{
+		// Section 0
+		{"0000", "Uzoq muddatli aktivlar", "Long-term Assets", "Долгосрочные активы", "FA", "ACTIVE"},
+		{"0100", "Asosiy vositalar", "Fixed Assets", "Основные средства", "FA", "ACTIVE"},
+		{"0200", "Asosiy vositalar eskirishi", "Depreciation of Fixed Assets", "Износ основных средств", "CONTRA_ASSET", "PASSIVE"},
+		{"0400", "Nomoddiy aktivlar", "Intangible Assets", "Нематериальные активы", "OA", "ACTIVE"},
+		{"0800", "Kapital qo'yilmalar", "Capital Investments", "Капитальные вложения", "FA", "ACTIVE"},
+		// Section 1
+		{"1000", "Tovar-moddiy zaxiralar", "Inventories", "Товарно-материальные запасы", "INV", "ACTIVE"},
+		// Section 2
+		{"2000", "Ishlab chiqarish xarajatlari", "Production Costs", "Затраты на производство", "INV", "ACTIVE"},
+		{"2800", "Tayyor mahsulot va tovarlar", "Finished Goods and Merchandise", "Готовая продукция и товары", "INV", "ACTIVE"},
+		{"2900", "Sotib olingan tovarlar", "Purchased Goods", "Приобретённые товары", "INV", "ACTIVE"},
+		// Section 3
+		{"3000", "Kelgusi davr xarajatlari", "Deferred Expenses", "Расходы будущих периодов", "OA", "ACTIVE"},
+		// Section 4
+		{"4000", "Debitorlik qarzdorligi", "Receivables", "Дебиторская задолженность", "AR", "ACTIVE"},
+		{"4200", "Hisobdor shaxslar bilan hisob-kitob", "Settlements with Accountable Persons", "Расчёты с подотчётными лицами", "OA", "ACTIVE"},
+		{"4400", "Byudjet bilan hisob-kitob", "Budget Settlements", "Расчёты с бюджетом", "OA", "ACTIVE_PASSIVE"},
+		{"4700", "Turli debitorlar", "Various Debtors", "Разные дебиторы", "OA", "ACTIVE"},
+		// Section 5
+		{"5000", "Pul mablag'lari", "Cash and Cash Equivalents", "Денежные средства", "CASH", "ACTIVE"},
+		{"5100", "Bank hisob raqamlari", "Bank Accounts", "Банковские счета", "CASH", "ACTIVE"},
+		{"5200", "Maxsus bank hisobvaraqlari", "Special Bank Accounts", "Специальные банковские счета", "CASH", "ACTIVE"},
+		{"5500", "Qisqa muddatli moliyaviy qo'yilmalar", "Short-term Financial Investments", "Краткосрочные финансовые вложения", "OA", "ACTIVE"},
+		// Section 6
+		{"6000", "Qisqa muddatli majburiyatlar", "Short-term Liabilities", "Краткосрочные обязательства", "AP", "PASSIVE"},
+		{"6100", "Bo'naklar", "Advances", "Авансы полученные", "ST_LIAB", "PASSIVE"},
+		{"6200", "Qisqa muddatli kreditlar", "Short-term Loans", "Краткосрочные кредиты", "ST_LIAB", "PASSIVE"},
+		{"6400", "Byudjetga to'lovlar", "Tax Payments", "Расчёты с бюджетом", "ST_LIAB", "PASSIVE"},
+		{"6500", "Ijtimoiy sug'urta", "Social Insurance", "Социальное страхование", "ST_LIAB", "PASSIVE"},
+		{"6700", "Xodimlar bilan hisob-kitob", "Employee Settlements", "Расчёты с персоналом", "ST_LIAB", "PASSIVE"},
+		{"6800", "Qisqa muddatli kreditlar va qarzlar", "Short-term Credits", "Краткосрочные кредиты и займы", "ST_LIAB", "PASSIVE"},
+		{"6900", "Boshqa majburiyatlar", "Other Liabilities", "Прочие обязательства", "ST_LIAB", "PASSIVE"},
+		// Section 7
+		{"7000", "Uzoq muddatli majburiyatlar", "Long-term Liabilities", "Долгосрочные обязательства", "LT_LIAB", "PASSIVE"},
+		{"7300", "Uzoq muddatli bo'naklar", "Long-term Advances", "Долгосрочные авансы", "LT_LIAB", "PASSIVE"},
+		{"7800", "Uzoq muddatli kreditlar", "Long-term Credits", "Долгосрочные кредиты", "LT_LIAB", "PASSIVE"},
+		// Section 8
+		{"8000", "Kapital", "Equity", "Собственный капитал", "EQUITY", "PASSIVE"},
+		// Section 9
+		{"9000", "Daromadlar va xarajatlar", "Revenue and Expenses", "Доходы и расходы", "REVENUE", "ACTIVE_PASSIVE"},
+		{"9100", "Tannarx", "Cost of Goods Sold", "Себестоимость", "COGS", "ACTIVE"},
+		{"9200", "Boshqa daromadlar", "Other Income", "Прочие доходы", "OTHER_INC", "PASSIVE"},
+		{"9300", "Boshqa operatsion daromadlar", "Other Operating Income", "Прочие операционные доходы", "OTHER_INC", "PASSIVE"},
+		{"9400", "Davr xarajatlari", "Period Expenses", "Расходы периода", "OPEX", "ACTIVE"},
+		{"9500", "Moliyaviy daromadlar", "Financial Income", "Финансовые доходы", "OTHER_INC", "PASSIVE"},
+		{"9600", "Moliyaviy xarajatlar", "Financial Expenses", "Финансовые расходы", "OTHER_EXP", "ACTIVE"},
+		{"9700", "Favqulodda foyda va zarar", "Extraordinary Gains and Losses", "Чрезвычайные прибыли и убытки", "OTHER_EXP", "ACTIVE_PASSIVE"},
+		{"9800", "Favqulodda xarajatlar", "Extraordinary Expenses", "Чрезвычайные расходы", "OTHER_EXP", "ACTIVE"},
+		{"9900", "Yakuniy moliyaviy natija", "Final Financial Result", "Итоговый финансовый результат", "EQUITY", "ACTIVE_PASSIVE"},
+	}
+	for _, grp := range groupAccounts {
+		typeID, ok := accountTypeIDs[grp.typeCode]
+		if !ok {
+			continue
+		}
+		_, _ = h.db.Exec(`
+			INSERT INTO accounts (
+				id, tenant_id, organization_id, account_type_id,
+				code, name, name_en, name_ru,
+				is_bank_account, is_control_account, is_reconcilable,
+				current_balance, opening_balance, is_active, is_leaf, account_nature,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, false, false, 0, 0, true, false, $9, $10, $10)
+			ON CONFLICT (tenant_id, organization_id, code) DO UPDATE
+				SET is_leaf = false,
+				    account_nature = EXCLUDED.account_nature,
+				    name_en = COALESCE(NULLIF(accounts.name_en, ''), EXCLUDED.name_en),
+				    name_ru = COALESCE(NULLIF(accounts.name_ru, ''), EXCLUDED.name_ru),
+				    updated_at = EXCLUDED.updated_at
+				WHERE accounts.deleted_at IS NULL
+		`, uuid.New(), tenantID, orgID, typeID,
+			grp.code, grp.nameUz, grp.nameEn, grp.nameRu,
+			grp.nature, now)
+	}
+
+	// ── parent_id linkage ─────────────────────────────────────────────
+	// Wire leaf codes (1010, 4010, etc.) to their group parents (1000,
+	// 4000, etc.) using the SAME logic migration 317 applied to legacy
+	// orgs. Idempotent — only touches rows where parent_id IS NULL.
+	// Link 4-char leaves to 4-char "X000" group: e.g. 1010 → 1000.
+	h.db.Exec(`
+		UPDATE accounts a SET parent_id = g.id
+		FROM accounts g
+		WHERE a.organization_id = $2 AND g.organization_id = $2
+		  AND a.tenant_id = $1 AND g.tenant_id = $1
+		  AND a.deleted_at IS NULL AND g.deleted_at IS NULL
+		  AND a.parent_id IS NULL
+		  AND a.code ~ '^[1-9][0-9]{2,3}$'
+		  AND LENGTH(a.code) = 4
+		  AND g.code = LEFT(a.code, 2) || '00'
+		  AND a.id != g.id
+	`, tenantID, orgID)
+	// Link section groups (0100, 0200, ...) to section header (0000).
+	h.db.Exec(`
+		UPDATE accounts a SET parent_id = g.id
+		FROM accounts g
+		WHERE a.organization_id = $2 AND g.organization_id = $2
+		  AND a.tenant_id = $1 AND g.tenant_id = $1
+		  AND a.deleted_at IS NULL AND g.deleted_at IS NULL
+		  AND a.parent_id IS NULL
+		  AND a.code ~ '^0[0-9]00$'
+		  AND g.code = '0000'
+		  AND a.id != g.id
+		  AND a.code != '0000'
+	`, tenantID, orgID)
+	// Link sub-section groups (e.g. 6100, 6200) to section header (6000).
+	h.db.Exec(`
+		UPDATE accounts a SET parent_id = g.id
+		FROM accounts g
+		WHERE a.organization_id = $2 AND g.organization_id = $2
+		  AND a.tenant_id = $1 AND g.tenant_id = $1
+		  AND a.deleted_at IS NULL AND g.deleted_at IS NULL
+		  AND a.parent_id IS NULL
+		  AND a.code ~ '^[1-9][0-9]00$'
+		  AND g.code = LEFT(a.code, 1) || '000'
+		  AND a.id != g.id
+		  AND a.code != LEFT(a.code, 1) || '000'
+		  AND EXISTS (SELECT 1 FROM accounts WHERE code = LEFT(a.code, 1) || '000' AND organization_id = $2 AND tenant_id = $1 AND deleted_at IS NULL)
+	`, tenantID, orgID)
+	// Mark any account that now has children as non-leaf.
+	h.db.Exec(`
+		UPDATE accounts a SET is_leaf = false
+		WHERE a.tenant_id = $1 AND a.organization_id = $2 AND a.deleted_at IS NULL
+		  AND EXISTS (
+		    SELECT 1 FROM accounts c
+		    WHERE c.parent_id = a.id AND c.deleted_at IS NULL
+		  )
+	`, tenantID, orgID)
+
 	// Set parent_id for inventory sub-accounts (1310/1320/1330/1340 → parent 1300)
 	h.db.Exec(`
 		UPDATE accounts SET parent_id = (
@@ -1004,7 +1228,8 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		AND code IN ('1310', '1320', '1330', '1340') AND parent_id IS NULL
 	`, tenantID, orgID)
 
-	h.log.Info("Created default chart of accounts", "tenant_id", tenantID, "org_id", orgID, "account_count", len(defaultAccounts))
+	h.log.Info("Created default chart of accounts", "tenant_id", tenantID, "org_id", orgID,
+		"leaf_count", len(defaultAccounts), "group_count", len(groupAccounts))
 	return nil
 }
 
@@ -1032,38 +1257,48 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 		accountIDs[code] = id
 	}
 
-	// Define default journals — must match migration 276 list
+	// Define default journals — must match migration 276/278 list.
+	// Each journal carries name in three languages so the UI can
+	// localize. The `name` field (Russian, the system's lingua franca)
+	// is what migration 278's backfill stored; keeping the same value
+	// here so re-running this seeder for an org that already has
+	// migration-seeded journals is a no-op.
 	defaultJournals := []struct {
 		code              string
-		name              string
+		nameRu            string
+		nameUz            string
+		nameEn            string
 		journalType       string
 		defaultDebitCode  string
 		defaultCreditCode string
 	}{
-		{"GEN", "General Journal", "general", "", ""},
-		{"SAL", "Sales Journal", "sales", "1100", "4000"},             // AR debit, Sales Revenue credit
-		{"PUR", "Purchase Journal", "purchase", "5000", "2000"},       // COGS debit, AP credit
-		{"CASH", "Cash Journal", "cash", "1000", "1000"},              // Cash
-		{"BANK", "Bank Journal", "bank", "1010", "1010"},              // Bank
-		{"MISC", "Miscellaneous Journal", "miscellaneous", "", ""},
-		{"CASH_RECEIPTS", "Cash Receipts Journal", "cash", "1000", ""}, // Cash receipts
-		{"STOCK", "Stock Journal", "general", "", ""},
-		{"ASSET", "Fixed Assets Journal", "general", "", ""},
-		{"PAYROLL", "Payroll Journal", "general", "", ""},
-		{"CONST", "Construction Journal", "general", "", ""},
+		{"GEN", "Главный журнал", "Bosh jurnal", "General Journal", "general", "", ""},
+		{"SAL", "Журнал продаж", "Sotish jurnali", "Sales Journal", "sales", "4010", "9010"},
+		{"PUR", "Журнал закупок", "Xarid jurnali", "Purchase Journal", "purchase", "9110", "6010"},
+		{"CASH", "Кассовый журнал", "Kassa jurnali", "Cash Journal", "cash", "5010", "5010"},
+		{"BANK", "Банковский журнал", "Bank jurnali", "Bank Journal", "bank", "5110", "5110"},
+		{"MISC", "Прочие операции", "Boshqa operatsiyalar jurnali", "Miscellaneous Journal", "miscellaneous", "", ""},
+		// CASH_RECEIPTS removed — was redundant with CASH. Callers in
+		// sales_returns.go already fall back to 'CASH' when the
+		// CASH_RECEIPTS code isn't found, so no other code paths
+		// break. Migration 395 retires the existing rows.
+		{"STOCK", "Складской журнал", "Ombor jurnali", "Stock Journal", "general", "", ""},
+		{"ASSET", "Журнал основных средств", "Asosiy vositalar jurnali", "Fixed Assets Journal", "general", "", ""},
+		{"PAYROLL", "Журнал зарплаты", "Ish haqi jurnali", "Payroll Journal", "general", "", ""},
+		{"CONST", "Строительный журнал", "Qurilish jurnali", "Construction Journal", "general", "", ""},
 	}
 
 	// Find profit/loss accounts for cash/bank journals
 	var profitAccountID, lossAccountID *uuid.UUID
-	// Profit: 6900 (Kurs farqi daromadi) or 4000 (Revenue) or 7100
-	for _, code := range []string{"6900", "4000", "7100"} {
+	// Profit: 9540 (Valyuta kurs farqi daromadi) or 9310 (Boshqa daromadlar) or 6900
+	for _, code := range []string{"9540", "9310", "6900"} {
 		if accID, ok := accountIDs[code]; ok {
 			profitAccountID = &accID
 			break
 		}
 	}
-	// Loss: 9400 (Kurs farqi zararlar) or 6000 (Expenses) or 7200
-	for _, code := range []string{"9400", "6000", "7200"} {
+	// Loss: 9630 (Valyuta kurs farqi zararlari) or 9410 (Boshqa xarajatlar) or 9400
+	for _, code := range []string{"9630", "9410", "9400"} {
 		if accID, ok := accountIDs[code]; ok {
 			lossAccountID = &accID
 			break
@@ -1092,19 +1327,34 @@ func (h *Handler) createDefaultJournals(tenantID, orgID uuid.UUID) error {
 			lossAcct = lossAccountID
 		}
 
+		// Migration 278 dropped the old UNIQUE(tenant_id, code) and
+		// added UNIQUE(tenant_id, organization_id, code) so each org
+		// can have its own journals. The ON CONFLICT here MUST match
+		// the live constraint or the insert will throw "no unique or
+		// exclusion constraint matching the ON CONFLICT specification"
+		// and the org will end up with zero journals (the symptom: an
+		// empty Journals page on the second+ org under any tenant).
 		_, err := h.db.Exec(`
 			INSERT INTO journals (
-				id, tenant_id, organization_id, code, name, type,
+				id, tenant_id, organization_id, code, name, name_uz, name_en, type,
 				default_debit_account_id, default_credit_account_id,
 				profit_account_id, loss_account_id,
 				is_active, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-			ON CONFLICT (tenant_id, code) DO UPDATE
-				SET organization_id = EXCLUDED.organization_id,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			ON CONFLICT (tenant_id, organization_id, code) DO UPDATE
+				SET default_debit_account_id  = COALESCE(EXCLUDED.default_debit_account_id,  journals.default_debit_account_id),
+				    default_credit_account_id = COALESCE(EXCLUDED.default_credit_account_id, journals.default_credit_account_id),
+				    profit_account_id         = COALESCE(EXCLUDED.profit_account_id,         journals.profit_account_id),
+				    loss_account_id           = COALESCE(EXCLUDED.loss_account_id,           journals.loss_account_id),
+				    -- Backfill localized name columns if they were empty
+				    -- (legacy rows created before the seeder wrote them).
+				    name_uz = COALESCE(NULLIF(journals.name_uz, ''), EXCLUDED.name_uz),
+				    name_en = COALESCE(NULLIF(journals.name_en, ''), EXCLUDED.name_en),
+				    is_active = true,
 				    updated_at = NOW()
-			WHERE journals.organization_id IS NULL
+				WHERE journals.deleted_at IS NULL
 		`,
-			id, tenantID, orgID, j.code, j.name, j.journalType,
+			id, tenantID, orgID, j.code, j.nameRu, j.nameUz, j.nameEn, j.journalType,
 			defaultDebitID, defaultCreditID,
 			profitAcct, lossAcct,
 			true, now,

@@ -2,11 +2,13 @@ package handler
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -175,6 +177,11 @@ func (h *Handler) GetProjectSummaryReport(c *gin.Context) {
 
 // GetStageBudgetReport returns plan vs actual by stage × category
 // GET /construction/projects/:id/reports/budget
+// Optional query param: ?building_id=<id> — scope the stages (and the
+// total_planned / total_actual KPIs) to a single building/block so the
+// Byudjet tab can mirror the per-block tab row used on the Bosqichlar tab
+// (migration 333 added construction_stages.building_id). Omitting the param
+// keeps the original project-wide behaviour.
 func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -188,19 +195,153 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		return
 	}
 
-	// Stages with planned budgets and actual totals
+	// Optional building filter. `0` / missing / unparseable = project-wide.
+	var buildingID int64
+	if raw := c.Query("building_id"); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			buildingID = v
+		}
+	}
+
+	// When a building filter is supplied we add `AND e.building_id = $3`
+	// to the estimate_line CTE so we only sum the lines of that block's
+	// edinich estimate. Stage filtering would be wrong here because the
+	// row set is now driven by parent_item_number from estimate lines,
+	// not from construction_stages.
+	stageFilterSQL := ""
+	stageArgs := []interface{}{projectID, tenantID}
+	if buildingID > 0 {
+		stageFilterSQL = " AND e.building_id = $3"
+		stageArgs = append(stageArgs, buildingID)
+	}
+
+	// Stages with planned budgets and actual totals.
+	//
+	// `planned_budget` on the construction_stages row is hardcoded to 0
+	// at auto-create time (we don't yet know the price when the stage is
+	// being seeded from a section header during import). So we COMPUTE
+	// planned per-stage from the matching Единич estimate lines:
+	//
+	//   For each parent work whose parent_item_number = stage.name in
+	//   ANY Единич estimate of this project,
+	//     • if it has children → SUM(children.total_amount)
+	//     • else                → parent.total_amount
+	//   Sum across all such parents.
+	//
+	// We deliberately DON'T filter by building_id when matching lines to
+	// stages. In practice, users re-import their estimates many times and
+	// stages from older imports may carry a different building_id than
+	// the current priced lines. Filtering by building would leave most
+	// stages at 0 even though the prices exist in the project. Matching
+	// by section path (parent_item_number = stage.name) is unique enough
+	// in real estimates that cross-block leakage isn't a concern; the
+	// total_planned at the bottom uses the same broad scope, so the per-
+	// row sums add up to the total.
+	// Source the row set DIRECTLY from estimate-line parent_item_numbers
+	// (in the project's Единич estimates) instead of construction_stages.
+	// This guarantees that every section path with priced works gets a
+	// row, even when construction_stages is out of sync (re-imports, old
+	// stale stages from VOR-era code, etc.). For each section path we
+	// LEFT JOIN to construction_stages by name to grab the optional
+	// stage_id + building_id, so per-building filtering still works when
+	// a stage row exists; sections without a matching stage default to
+	// stage_id=0 and pass through the 'all' filter.
+	//
+	// `actual` is 0 unless a matching стажа exists (because expenses are
+	// keyed by stage_id). That's fine for the smeta-driven Byudjet view
+	// — once the user starts recording expenses we can revisit.
 	rows, err := h.db.Query(`
+		WITH parent_costs AS (
+		    SELECT
+		        e.project_id,
+		        e.tenant_id,
+		        e.building_id,
+		        p.parent_item_number AS section_path,
+		        SUM(
+		            CASE WHEN EXISTS (
+		                SELECT 1 FROM construction_estimate_line ch
+		                WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+		            ) THEN COALESCE((
+		                SELECT SUM(ch.total_amount)
+		                FROM construction_estimate_line ch
+		                WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+		            ), 0)
+		            ELSE COALESCE(p.total_amount, 0)
+		            END
+		        ) AS planned
+		    FROM construction_estimate_line p
+		    JOIN construction_estimate e ON e.id = p.estimate_id
+		    WHERE e.project_id = $1
+		      AND e.tenant_id  = $2
+		      AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		      AND COALESCE(p.resource_type, '') = ''
+		      AND p.parent_line_id IS NULL
+		      AND COALESCE(p.parent_item_number, '') <> ''
+		      `+stageFilterSQL+`
+		    GROUP BY e.project_id, e.tenant_id, e.building_id, p.parent_item_number
+		)
 		SELECT
-			s.id, s.name, s.planned_budget,
-			COALESCE(cat.id, 0), COALESCE(cat.name, 'Uncategorized'), COALESCE(cat.code, ''),
-			COALESCE(SUM(CASE WHEN el.status='approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual
-		FROM construction_stages s
-		LEFT JOIN construction_expense_lines el ON el.stage_id = s.id AND el.project_id = s.project_id
-		LEFT JOIN construction_cost_categories cat ON cat.id = el.cost_category_id
-		WHERE s.project_id = $1 AND s.tenant_id = $2
-		GROUP BY s.id, s.name, s.planned_budget, cat.id, cat.name, cat.code
-		ORDER BY s.stage_order ASC, s.id ASC, cat.name ASC
-	`, projectID, tenantID)
+		    COALESCE(s.id, 0)                                   AS stage_id,
+		    pc.section_path                                     AS stage_name,
+		    pc.planned                                          AS planned_budget,
+		    COALESCE(cat.id, 0)                                 AS category_id,
+		    COALESCE(cat.name, 'Uncategorized')                 AS category_name,
+		    COALESCE(cat.code, '')                              AS category_code,
+		    COALESCE(SUM(CASE WHEN el.status='approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual
+		FROM parent_costs pc
+		LEFT JOIN LATERAL (
+		    -- Match a stage to this section bucket. Two name shapes
+		    -- coexist in the wild:
+		    --   • Full path: "СЕКЦИЯ №5 › ЗЕМЛЯННЫЕ РАБОТЫ" (newer
+		    --     auto-creates write the full parent_item_number).
+		    --   • Leaf only: "ЗЕМЛЯННЫЕ РАБОТЫ" (legacy single-block
+		    --     projects whose stages were created by hand).
+		    -- We accept either form, BUT we have to be careful in
+		    -- multi-block projects: a leaf-named stage from Block 1
+		    -- ("ЗЕМЛЯННЫЕ РАБОТЫ", building_id=14) must NOT match a
+		    -- Block 2 section bucket. Without that guard the LATERAL
+		    -- happily picked the Block 1 stage (lower id ⇒ earlier
+		    -- in ORDER BY id ASC), then the LEFT JOIN below looked
+		    -- for expenses on the wrong stage_id and reported Fakt=0
+		    -- in the per-section row even though the top card was
+		    -- correct — that's the bug the user reported as
+		    -- "Byudjet shows Fakt=0 in section but top is 97,200".
+		    --
+		    -- Scoping rules:
+		    --   1. Building-aware: the stage's building_id must match
+		    --      the line's building_id, OR the stage has none
+		    --      (project-wide stage). Stages in a different
+		    --      building are excluded entirely.
+		    --   2. Order: prefer same-building match, then full-path
+		    --      name match, then by id. So "СЕКЦИЯ №5 › ЗЕМЛЯННЫЕ
+		    --      РАБОТЫ" picks the building-15 full-path stage 1277
+		    --      over the building-14 leaf stage 1197.
+		    SELECT cs.id, cs.stage_order
+		    FROM construction_stages cs
+		    WHERE cs.tenant_id  = pc.tenant_id
+		      AND cs.project_id = pc.project_id
+		      AND (
+		          cs.name = pc.section_path
+		          OR cs.name = regexp_replace(COALESCE(pc.section_path, ''), '^.*›\s*', '')
+		      )
+		      AND (
+		          pc.building_id IS NULL
+		          OR cs.building_id IS NULL
+		          OR cs.building_id = pc.building_id
+		      )
+		    ORDER BY
+		      CASE WHEN cs.building_id = pc.building_id THEN 0 ELSE 1 END ASC,
+		      CASE WHEN cs.name = pc.section_path THEN 0 ELSE 1 END ASC,
+		      cs.id ASC
+		    LIMIT 1
+		) s ON TRUE
+		LEFT JOIN construction_expense_lines el
+		    ON el.stage_id = s.id AND el.project_id = pc.project_id
+		LEFT JOIN construction_cost_categories cat
+		    ON cat.id = el.cost_category_id
+		GROUP BY s.id, pc.section_path, pc.planned, s.stage_order, cat.id, cat.name, cat.code
+		ORDER BY pc.section_path ASC, cat.name ASC
+	`, stageArgs...)
 	if err != nil {
 		h.log.Error("Failed to query stage budget", "error", err)
 		response.InternalError(c, "Failed to get budget report")
@@ -237,18 +378,167 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 		budgetRows = append(budgetRows, br)
 	}
 
-	// Also compute total actual for project (including non-stage expenses)
+	// Also compute total actual for project (including non-stage expenses).
+	// When a building filter is active we scope actuals to that building too.
+	//
+	// Two attribution paths are used so that legacy data (where
+	// construction_stages.building_id is NULL because the stage was created
+	// before migration 333 backfilled buildings) still shows up:
+	//   (a) direct match — stage.building_id = $3, OR
+	//   (b) name-via-estimate fallback — the stage's name equals a
+	//       parent_item_number on an estimate line whose estimate has
+	//       building_id = $3. This mirrors the per-section breakdown
+	//       above, which sources rows from estimate-line section paths
+	//       rather than from construction_stages directly.
+	// Project-wide expenses (stage_id NULL) are still excluded from per-
+	// building totals because they can't be attributed to a specific block.
 	var totalActual float64
-	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(amount), 0)
-		FROM construction_expense_lines
-		WHERE project_id = $1 AND tenant_id = $2 AND status = 'approved' AND deleted_at IS NULL
-	`, projectID, tenantID).Scan(&totalActual)
+	if buildingID > 0 {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(SUM(el.amount), 0)
+			FROM construction_expense_lines el
+			JOIN construction_stages s
+			  ON s.id = el.stage_id AND s.tenant_id = el.tenant_id
+			WHERE el.project_id = $1 AND el.tenant_id = $2
+			  AND el.status = 'approved' AND el.deleted_at IS NULL
+			  AND (
+			    s.building_id = $3
+			    OR EXISTS (
+			      SELECT 1
+			      FROM construction_estimate_line ll
+			      JOIN construction_estimate ee ON ee.id = ll.estimate_id
+			      WHERE ll.tenant_id = el.tenant_id
+			        AND ee.project_id = el.project_id
+			        AND ee.building_id = $3
+			        AND ll.parent_item_number = s.name
+			      LIMIT 1
+			    )
+			  )
+		`, projectID, tenantID, buildingID).Scan(&totalActual)
+	} else {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(SUM(amount), 0)
+			FROM construction_expense_lines
+			WHERE project_id = $1 AND tenant_id = $2 AND status = 'approved' AND deleted_at IS NULL
+		`, projectID, tenantID).Scan(&totalActual)
+	}
 
+	// Total planned — sum the per-parent-work computed cost across every
+	// parent work in the project's Единич estimates (scoped to building
+	// when filtered). Mirrors the per-stage formula above so that
+	// `total_planned == SUM(rows.planned_budget)` modulo rounding.
 	var totalPlanned float64
-	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(planned_budget), 0) FROM construction_stages WHERE project_id = $1 AND tenant_id = $2
-	`, projectID, tenantID).Scan(&totalPlanned)
+	if buildingID > 0 {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(SUM(
+				CASE WHEN EXISTS (
+					SELECT 1 FROM construction_estimate_line ch
+					WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+				) THEN COALESCE((
+					SELECT SUM(ch.total_amount)
+					FROM construction_estimate_line ch
+					WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+				), 0)
+				ELSE COALESCE(p.total_amount, 0)
+				END
+			), 0)
+			FROM construction_estimate_line p
+			JOIN construction_estimate e ON e.id = p.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND e.building_id = $3
+			  AND COALESCE(p.resource_type, '') = ''
+			  AND p.parent_line_id IS NULL
+		`, projectID, tenantID, buildingID).Scan(&totalPlanned)
+	} else {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(SUM(
+				CASE WHEN EXISTS (
+					SELECT 1 FROM construction_estimate_line ch
+					WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+				) THEN COALESCE((
+					SELECT SUM(ch.total_amount)
+					FROM construction_estimate_line ch
+					WHERE ch.parent_line_id = p.id AND ch.tenant_id = p.tenant_id
+				), 0)
+				ELSE COALESCE(p.total_amount, 0)
+				END
+			), 0)
+			FROM construction_estimate_line p
+			JOIN construction_estimate e ON e.id = p.estimate_id
+			WHERE e.project_id = $1 AND e.tenant_id = $2
+			  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND COALESCE(p.resource_type, '') = ''
+			  AND p.parent_line_id IS NULL
+		`, projectID, tenantID).Scan(&totalPlanned)
+	}
+
+	// Imported-budget override (migration 369). The Ресурс Excel sheet
+	// carries the canonical project totals at the bottom (ИТОГО ПРЯМЫЕ
+	// ЗАТРАТЫ) — captured at import time and stored on construction_estimate.
+	// The Единич-derived sum above always under-counts the real budget
+	// because it ignores transport overhead and indirect costs that live
+	// only on the Ресурс sheet, so when an imported budget exists we
+	// prefer it as the authoritative figure for the Byudjet KPI cards.
+	// Scoped to the same building filter as the rest of the handler so a
+	// per-block view shows that block's imported total.
+	{
+		var importedBudget float64
+		budgetQuery := `
+			SELECT COALESCE(SUM(budget_total), 0)
+			FROM construction_estimate
+			WHERE project_id = $1
+			  AND tenant_id  = $2
+			  AND LOWER(COALESCE(source_type, '')) = 'resurs'
+		`
+		budgetArgs := []interface{}{projectID, tenantID}
+		if buildingID > 0 {
+			budgetQuery += ` AND building_id = $3`
+			budgetArgs = append(budgetArgs, buildingID)
+		}
+		_ = h.db.QueryRow(budgetQuery, budgetArgs...).Scan(&importedBudget)
+		if importedBudget > 0 {
+			totalPlanned = importedBudget
+		}
+	}
+
+	// Reconciliation row. The per-section breakdown query above only
+	// counts expenses whose stage_id matches a stage with the same
+	// `name` as a parent_item_number — manual expense entries created
+	// without a stage_id (or with a stage_id that doesn't map to any
+	// section in the smeta) drop out. Those still flow into
+	// `total_actual` because the top-card query just sums every
+	// approved expense for the project, so the sum of breakdown rows
+	// would be lower than the headline. Adding a synthetic
+	// "Boshqalar / Project-wide" row equal to the difference keeps the
+	// two sides reconciled — bug "Fakt 4 612 000 in headline but 0
+	// across all sections".
+	//
+	// Skipped when a building filter is active because the per-building
+	// totalActual query already restricts to expenses tied to a stage
+	// with that building_id, so there's no untagged residue.
+	if buildingID == 0 {
+		var mapped float64
+		for _, br := range budgetRows {
+			mapped += br.Actual
+		}
+		residue := totalActual - mapped
+		// Allow a small floating-point cushion so a rounding tail
+		// doesn't show as a 0,01 sum row.
+		if residue > 0.5 {
+			budgetRows = append(budgetRows, BudgetRow{
+				StageID:       0,
+				StageName:     "(Boshqalar / Project-wide)",
+				PlannedBudget: 0,
+				CategoryID:    0,
+				CategoryName:  "Uncategorized",
+				CategoryCode:  "",
+				Actual:        residue,
+				Variance:      -residue,
+				VariancePct:   0,
+			})
+		}
+	}
 
 	response.Success(c, map[string]interface{}{
 		"rows":          budgetRows,
@@ -426,5 +716,537 @@ func (h *Handler) GetJournalEntriesReport(c *gin.Context) {
 	response.Success(c, map[string]interface{}{
 		"items": entries,
 		"count": len(entries),
+	})
+}
+
+// =====================================================================
+// СВОД (consolidated estimate) report
+// =====================================================================
+//
+// GET /construction/projects/:id/reports/svod
+//
+// Returns the per-building breakdown for the Uzbek "Сводная сметная"
+// 12-line layout. Each building gets four cost rows split between PLAN
+// and FAKT so the frontend can toggle between modes:
+//
+//   • R4 — installed equipment / furniture / inventory ("оборудование")
+//   • R5 — labor wages ("з/плата рабочих")
+//   • R6 — machine ops ("эксплуатация машин и механизмов")
+//   • R7 — building materials ("строительные материалы")
+//
+// Rows 8 (direct subtotal), 9 (overhead %), 10 (insurance %), 11
+// (subtotal), 12 (VAT), 13 (current price), 14 (PQ-161), 15 (grand
+// total) are derived on the FRONTEND from the user-editable percentage
+// inputs.
+//
+// =================
+// Source of values
+// =================
+//
+// In GenixERP each top-level work (parent_line_id IS NULL,
+// resource_type = '') in a Единич estimate decomposes into
+// sub-resources (parent_line_id > 0) tagged with resource_type
+// ∈ {labor, equipment, material, ...}. Sub.total_amount is the
+// per-unit-of-parent cost contribution × parent.quantity, i.e. the
+// sub already encodes the parent's planned scale.
+//
+// PLAN per (building, resource_class):
+//   sum(sub.total_amount) grouped by classify(sub.resource_type)
+//
+// FAKT per (building, resource_class):
+//   sub.total_amount × (parent.done_quantity / parent.quantity)
+//   When parent.quantity is 0 (Единич template-mode imports), we
+//   fall back to original_quantity (the import-time anchor).
+//   When parent.done_quantity is 0 (work not started), FAKT is 0.
+//
+// Resource type classification (case-insensitive, tolerant of
+// Russian / Uzbek-Latin variants):
+//   labor    = labor, mehnat, ish, ishchi, worker, трудовой
+//   machine  = equipment, mashina, mexanizm, machinery
+//   material = material, materialy, mat
+//   else     = "equipment" bucket (R4 — installed equipment /
+//              furniture / inventory). This rescues lines in
+//              engineering-system estimates whose authors typed
+//              non-standard resource_types like "оборудование".
+//
+// Reference: matches the structure of "Жилдом Саттепо Авеню Блок 1.xlsx"
+// resource sheet's three subtotal rows (G14 labor, G69 machines, G296
+// materials) — the same totals every Block file in that project ships.
+func (h *Handler) GetSvodReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Project header (name + address) for the modal title block.
+	var projectName, projectAddress string
+	if err := h.db.QueryRow(`
+		SELECT COALESCE(name, ''), COALESCE(address, '')
+		  FROM construction_projects
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectName, &projectAddress); err != nil {
+		h.log.Error("Failed to load project for svod report", "error", err)
+		response.NotFound(c, "Project not found")
+		return
+	}
+
+	// Walk every sub-resource (parent_line_id IS NOT NULL) of the
+	// project's estimates, classify each line, and emit per-building
+	// totals split between PLAN and FAKT.
+	//
+	// CRITICAL: classification uses BOTH resource_type AND uom.
+	// Real Единич imports (like the reference "Жилдом Саттепо Авеню
+	// Блок 1.xlsx") tag sub-resources only by UOM —
+	//   ЧЕЛ.-Ч (man-hour)  → labor
+	//   МАШ.-Ч (machine-hour) → machine ops
+	//   anything else      → material
+	// — and SmetaImportModal sometimes leaves resource_type blank.
+	// Filtering by resource_type alone would drop most of the data
+	// and skew the labor/material ratio (the bug the user observed
+	// where Block 2 showed labor 735M vs material only 105M, when
+	// the real Block 1 ratio is labor 2.7B vs material 7.8B).
+	//
+	// Source-type filtering removed too — `parent_line_id IS NOT NULL`
+	// already restricts us to estimates with a parent/child hierarchy,
+	// which is the Единич shape. Ресурс estimates are flat (no
+	// children) so they're naturally excluded.
+	//
+	// LEFT JOIN on construction_buildings starts FROM all the project's
+	// buildings so empty blocks still appear as 0-columns ready to be
+	// filled in manually if the user wants — this matches the reference
+	// xlsx where every block has a column whether or not data exists.
+	rows, err := h.db.Query(`
+		WITH classified AS (
+		    SELECT
+		        e.building_id AS bid,
+		        CASE
+		            -- Explicit resource_type wins.
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('labor', 'mehnat', 'ish', 'ishchi', 'worker', 'трудовой', 'трудовые')
+		                 THEN 'labor'
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('equipment', 'mashina', 'masina', 'mexanizm', 'mexanizmlar', 'machinery', 'машина')
+		                 THEN 'machine'
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('material', 'materialy', 'mat', 'materiallar', 'материал', 'материалы')
+		                 THEN 'material'
+		            -- Fallback: classify by UOM. ЧЕЛ.-Ч / ЧЕЛ-Ч / ЧЕЛ Ч all
+		            -- mean man-hours → labor. Anything with МАШ → machine.
+		            -- Everything else (m3, шт, kg, t, ...) → material.
+		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
+		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%МАШ%' THEN 'machine'
+		            ELSE 'material'
+		        END AS rc,
+		        COALESCE(s.total_amount, 0) AS plan_amt,
+		        CASE
+		            WHEN COALESCE(p.done_quantity, 0) <= 0 THEN 0
+		            WHEN COALESCE(p.quantity, 0) > 0 THEN
+		                COALESCE(s.total_amount, 0) * (p.done_quantity::numeric / p.quantity)
+		            WHEN COALESCE(p.original_quantity, 0) > 0 THEN
+		                COALESCE(s.total_amount, 0) * (p.done_quantity::numeric / p.original_quantity)
+		            ELSE COALESCE(s.total_amount, 0)
+		        END AS fakt_amt
+		    FROM construction_estimate_line s
+		    JOIN construction_estimate_line p
+		      ON p.id = s.parent_line_id
+		     AND p.tenant_id = s.tenant_id
+		    JOIN construction_estimate e
+		      ON e.id = s.estimate_id
+		     AND e.tenant_id = s.tenant_id
+		    WHERE e.project_id  = $1
+		      AND e.tenant_id   = $2
+		      AND s.tenant_id   = $2
+		      AND s.parent_line_id IS NOT NULL
+		)
+		SELECT
+		    b.id                                                                AS building_id,
+		    COALESCE(NULLIF(b.name, ''), b.code, 'Block #' || b.id::text)       AS building_name,
+		    COALESCE(SUM(CASE WHEN c.rc = 'labor'    THEN c.plan_amt ELSE 0 END), 0) AS labor_plan,
+		    COALESCE(SUM(CASE WHEN c.rc = 'machine'  THEN c.plan_amt ELSE 0 END), 0) AS machine_plan,
+		    COALESCE(SUM(CASE WHEN c.rc = 'material' THEN c.plan_amt ELSE 0 END), 0) AS material_plan,
+		    0                                                                   AS equipment_plan,
+		    COALESCE(SUM(CASE WHEN c.rc = 'labor'    THEN c.fakt_amt ELSE 0 END), 0) AS labor_fakt,
+		    COALESCE(SUM(CASE WHEN c.rc = 'machine'  THEN c.fakt_amt ELSE 0 END), 0) AS machine_fakt,
+		    COALESCE(SUM(CASE WHEN c.rc = 'material' THEN c.fakt_amt ELSE 0 END), 0) AS material_fakt,
+		    0                                                                   AS equipment_fakt
+		FROM construction_buildings b
+		LEFT JOIN classified c ON c.bid = b.id
+		WHERE b.tenant_id = $2
+		  AND b.project_id = $1
+		GROUP BY b.id, b.name, b.code, b.sort_order
+		ORDER BY b.sort_order ASC NULLS LAST, b.code ASC, b.id ASC
+	`, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query svod report", "error", err)
+		response.InternalError(c, "Failed to compute svod report")
+		return
+	}
+	defer rows.Close()
+
+	type buildingRow struct {
+		ID             int64   `json:"id"`
+		Name           string  `json:"name"`
+		LaborPlan      float64 `json:"labor_plan"`
+		MachinePlan    float64 `json:"machine_plan"`
+		MaterialPlan   float64 `json:"material_plan"`
+		EquipmentPlan  float64 `json:"equipment_plan"`
+		LaborFakt      float64 `json:"labor_fakt"`
+		MachineFakt    float64 `json:"machine_fakt"`
+		MaterialFakt   float64 `json:"material_fakt"`
+		EquipmentFakt  float64 `json:"equipment_fakt"`
+	}
+	var buildings []buildingRow
+	for rows.Next() {
+		var br buildingRow
+		if err := rows.Scan(
+			&br.ID, &br.Name,
+			&br.LaborPlan, &br.MachinePlan, &br.MaterialPlan, &br.EquipmentPlan,
+			&br.LaborFakt, &br.MachineFakt, &br.MaterialFakt, &br.EquipmentFakt,
+		); err != nil {
+			h.log.Error("Failed to scan svod row", "error", err)
+			continue
+		}
+		if br.ID == 0 && br.Name == "" {
+			br.Name = "Umumiy"
+		}
+		buildings = append(buildings, br)
+	}
+
+	response.Success(c, gin.H{
+		"project": gin.H{
+			"id":      projectID,
+			"name":    projectName,
+			"address": projectAddress,
+		},
+		"buildings": buildings,
+	})
+}
+
+// =====================================================================
+// Material consolidation report
+// =====================================================================
+//
+// GET /construction/projects/:id/reports/material-consolidation
+//
+// Aggregates all MATERIAL sub-resources (resource_type = 'material', or
+// any non-labor / non-machine resource by UOM) of the project's
+// estimates, in **Fakt mode** — i.e. each line's contribution is scaled
+// by its parent work's done_quantity / quantity ratio.
+//
+// Aggregation key
+// ───────────────
+//   (building_id, name (case-insensitive), uom, unit_rate)
+//
+// So two lines with the same name + uom but DIFFERENT unit_rate
+// produce two separate output rows, each with its own consumed
+// quantity. Same name + same uom + same unit_rate → one combined row
+// with the summed quantity. This matches the user's requirement:
+// "if a material's price is different, show separately based on volume;
+// if the same, sum them up".
+//
+// Resource topups (migration 358 — purchases that came in at a new
+// price after the line was already in the smeta) are returned as a
+// nested list under each parent group. They're emitted under the group
+// of the line they were attached to so the UI can render them as
+// indented sub-rows.
+//
+// Output shape
+// ────────────
+//
+//   {
+//     project: {id, name, address},
+//     blocks: [
+//       {
+//         id, name,
+//         groups: [{
+//             name, uom, unit_rate,
+//             fakt_quantity, fakt_amount,
+//             topups: [{extra_quantity, new_price, amount, ordered_at, note}]
+//         }],
+//         total_amount
+//       }
+//     ],
+//     total: {
+//       groups: [...same shape, aggregated across blocks],
+//       total_amount
+//     }
+//   }
+//
+// "Block #0" is reserved for lines whose estimate has no building_id —
+// the modal renders these under "Umumiy" so the user can see them.
+func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Project header
+	var projectName, projectAddress string
+	if err := h.db.QueryRow(`
+		SELECT COALESCE(name, ''), COALESCE(address, '')
+		  FROM construction_projects
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectName, &projectAddress); err != nil {
+		h.log.Error("Failed to load project for material report", "error", err)
+		response.NotFound(c, "Project not found")
+		return
+	}
+
+	// Per-building × (name, uom, unit_rate) Fakt aggregation.
+	//
+	// `is_material` selector matches the same fallback logic Свод uses:
+	//   resource_type explicitly tagged 'material' wins; otherwise the
+	//   UOM excludes labor (ЧЕЛ) and machine (МАШ) and everything else
+	//   counts as material. This keeps legacy imports (where
+	//   resource_type was left blank) from being mis-classified.
+	//
+	// `parent_ratio` is parent.done_quantity / parent.quantity (or
+	// /original_quantity as fallback) — same shape as the Свод query.
+	rows, err := h.db.Query(`
+		WITH material_lines AS (
+		    SELECT
+		        e.building_id                     AS bid,
+		        s.name                            AS name,
+		        COALESCE(s.uom, '')               AS uom,
+		        COALESCE(s.unit_rate, 0)          AS unit_rate,
+		        s.id                              AS line_id,
+		        CASE
+		            WHEN COALESCE(p.done_quantity, 0) <= 0 THEN 0
+		            WHEN COALESCE(p.quantity, 0) > 0 THEN
+		                COALESCE(s.quantity, 0) * (p.done_quantity::numeric / p.quantity)
+		            WHEN COALESCE(p.original_quantity, 0) > 0 THEN
+		                COALESCE(s.quantity, 0) * (p.done_quantity::numeric / p.original_quantity)
+		            ELSE COALESCE(s.quantity, 0)
+		        END                               AS fakt_quantity
+		    FROM construction_estimate_line s
+		    JOIN construction_estimate_line p
+		      ON p.id = s.parent_line_id
+		     AND p.tenant_id = s.tenant_id
+		    JOIN construction_estimate e
+		      ON e.id = s.estimate_id
+		     AND e.tenant_id = s.tenant_id
+		    WHERE e.project_id  = $1
+		      AND e.tenant_id   = $2
+		      AND s.tenant_id   = $2
+		      AND s.parent_line_id IS NOT NULL
+		      AND (
+		          LOWER(COALESCE(s.resource_type, '')) IN ('material', 'materialy', 'mat', 'materiallar', 'материал', 'материалы')
+		          OR (
+		              UPPER(COALESCE(s.uom, '')) NOT LIKE '%ЧЕЛ%'
+		              AND UPPER(COALESCE(s.uom, '')) NOT LIKE '%МАШ%'
+		              AND LOWER(COALESCE(s.resource_type, '')) NOT IN
+		                  ('labor', 'mehnat', 'ish', 'ishchi', 'worker',
+		                   'equipment', 'mashina', 'masina', 'mexanizm', 'mexanizmlar', 'machinery',
+		                   'трудовой', 'трудовые', 'машина')
+		          )
+		      )
+		)
+		SELECT
+		    COALESCE(ml.bid, 0)                 AS building_id,
+		    COALESCE(b.name, b.code, 'Umumiy')  AS building_name,
+		    ml.name                             AS name,
+		    ml.uom                              AS uom,
+		    ml.unit_rate                        AS unit_rate,
+		    SUM(ml.fakt_quantity)               AS fakt_quantity,
+		    ARRAY_AGG(ml.line_id)               AS line_ids
+		FROM material_lines ml
+		LEFT JOIN construction_buildings b ON b.id = ml.bid
+		GROUP BY ml.bid, b.id, b.name, b.code, b.sort_order, ml.name, ml.uom, ml.unit_rate
+		-- Drop materials that haven't actually been consumed. The
+		-- catalog often contains many resources at planned prices
+		-- that the foreman never used (zero done_quantity → zero
+		-- fakt_quantity), so they were padding the report with empty
+		-- rows of БЕНЗИН РАСТВОРИТЕЛЬ / БЛОКИ ДВЕРНЫЕ etc. at qty 0
+		-- that distract from the actual consumption picture.
+		-- Topups attached to those lines are still loaded below, but
+		-- only matter when the parent group has a non-zero base spend
+		-- — a pure topup-only material is rare and can be added back
+		-- here later if the user wants it.
+		HAVING SUM(ml.fakt_quantity) > 0
+		ORDER BY b.sort_order ASC NULLS LAST, b.id ASC NULLS LAST,
+		         UPPER(ml.name) ASC, ml.uom ASC, ml.unit_rate ASC
+	`, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query material consolidation", "error", err)
+		response.InternalError(c, "Failed to compute material report")
+		return
+	}
+	defer rows.Close()
+
+	type topup struct {
+		ExtraQuantity float64 `json:"extra_quantity"`
+		NewPrice      float64 `json:"new_price"`
+		Amount        float64 `json:"amount"`
+		OrderedAt     string  `json:"ordered_at"`
+		Note          string  `json:"note"`
+	}
+	type group struct {
+		Name         string  `json:"name"`
+		UOM          string  `json:"uom"`
+		UnitRate     float64 `json:"unit_rate"`
+		FaktQuantity float64 `json:"fakt_quantity"`
+		FaktAmount   float64 `json:"fakt_amount"`
+		Topups       []topup `json:"topups"`
+		LineIDs      []int64 `json:"-"`
+	}
+	type block struct {
+		ID          int64   `json:"id"`
+		Name        string  `json:"name"`
+		Groups      []group `json:"groups"`
+		TotalAmount float64 `json:"total_amount"`
+	}
+
+	// Bucket groups by building_id in iteration order (preserved by
+	// ORDER BY in the SQL above).
+	blockOrder := []int64{}
+	blockMap := map[int64]*block{}
+	allLineIDs := []int64{}
+
+	for rows.Next() {
+		var bid int64
+		var bname, name, uom string
+		var rate, qty float64
+		var lineIDs pq.Int64Array
+		if err := rows.Scan(&bid, &bname, &name, &uom, &rate, &qty, &lineIDs); err != nil {
+			h.log.Error("Failed to scan material row", "error", err)
+			continue
+		}
+		blk, ok := blockMap[bid]
+		if !ok {
+			b := &block{ID: bid, Name: bname}
+			blockMap[bid] = b
+			blockOrder = append(blockOrder, bid)
+			blk = b
+		}
+		g := group{
+			Name:         name,
+			UOM:          uom,
+			UnitRate:     rate,
+			FaktQuantity: qty,
+			FaktAmount:   qty * rate,
+			Topups:       []topup{},
+			LineIDs:      []int64(lineIDs),
+		}
+		blk.Groups = append(blk.Groups, g)
+		blk.TotalAmount += g.FaktAmount
+		allLineIDs = append(allLineIDs, []int64(lineIDs)...)
+	}
+
+	// Bulk-load topups attached to any line we just emitted, then
+	// distribute them into their parent groups. Each topup's amount
+	// is extra_quantity × new_price (independent of the line's base
+	// unit_rate — that's the whole point of a top-up).
+	topupsByLine := map[int64][]topup{}
+	if len(allLineIDs) > 0 {
+		topupRows, terr := h.db.Query(`
+			SELECT estimate_line_id, COALESCE(extra_quantity, 0), COALESCE(new_price, 0),
+			       COALESCE(ordered_at::text, ''), COALESCE(note, '')
+			FROM construction_resource_topup
+			WHERE tenant_id = $1
+			  AND estimate_line_id = ANY($2::bigint[])
+			ORDER BY ordered_at ASC, id ASC
+		`, tenantID, pq.Array(allLineIDs))
+		if terr == nil {
+			defer topupRows.Close()
+			for topupRows.Next() {
+				var lineID int64
+				var t topup
+				if scanErr := topupRows.Scan(
+					&lineID, &t.ExtraQuantity, &t.NewPrice, &t.OrderedAt, &t.Note,
+				); scanErr != nil {
+					continue
+				}
+				t.Amount = t.ExtraQuantity * t.NewPrice
+				topupsByLine[lineID] = append(topupsByLine[lineID], t)
+			}
+		} else {
+			h.log.Error("Failed to load resource topups for material report", "error", terr)
+		}
+	}
+
+	// Attach topups to their groups (one topup may belong to one of
+	// several lines that fold into the same group when the lines share
+	// name/uom/unit_rate). Sum into block totals.
+	for _, blk := range blockMap {
+		for i := range blk.Groups {
+			for _, lid := range blk.Groups[i].LineIDs {
+				if ts, ok := topupsByLine[lid]; ok {
+					blk.Groups[i].Topups = append(blk.Groups[i].Topups, ts...)
+					for _, tp := range ts {
+						blk.TotalAmount += tp.Amount
+					}
+				}
+			}
+		}
+	}
+
+	// Build the project-wide "Total" pseudo-block by re-aggregating
+	// across blocks on the same (name, uom, unit_rate) key.
+	type aggKey struct {
+		name string
+		uom  string
+		rate float64
+	}
+	totalAgg := map[aggKey]*group{}
+	totalOrder := []aggKey{}
+	var grandTotal float64
+	for _, blk := range blockMap {
+		for _, g := range blk.Groups {
+			k := aggKey{name: strings.ToUpper(g.Name), uom: g.UOM, rate: g.UnitRate}
+			tg, ok := totalAgg[k]
+			if !ok {
+				ng := group{
+					Name: g.Name, UOM: g.UOM, UnitRate: g.UnitRate,
+					Topups: []topup{},
+				}
+				totalAgg[k] = &ng
+				tg = &ng
+				totalOrder = append(totalOrder, k)
+			}
+			tg.FaktQuantity += g.FaktQuantity
+			tg.FaktAmount += g.FaktAmount
+			tg.Topups = append(tg.Topups, g.Topups...)
+			grandTotal += g.FaktAmount
+			for _, tp := range g.Topups {
+				grandTotal += tp.Amount
+			}
+		}
+	}
+	totalGroups := make([]group, 0, len(totalOrder))
+	for _, k := range totalOrder {
+		totalGroups = append(totalGroups, *totalAgg[k])
+	}
+
+	// Materialise blocks in deterministic order.
+	out := make([]*block, 0, len(blockOrder))
+	for _, bid := range blockOrder {
+		out = append(out, blockMap[bid])
+	}
+
+	response.Success(c, gin.H{
+		"project": gin.H{
+			"id":      projectID,
+			"name":    projectName,
+			"address": projectAddress,
+		},
+		"blocks": out,
+		"total": gin.H{
+			"groups":       totalGroups,
+			"total_amount": grandTotal,
+		},
 	})
 }

@@ -148,6 +148,44 @@ func (h *Handler) ListExpenseLines(c *gin.Context) {
 		query += " AND el.subcontract_id IS NOT NULL"
 	}
 
+	// Building filter (block pills on the Xarajatlar tab). Mirrors the
+	// dual-path attribution used by the Byudjet report:
+	//
+	//   1. direct match — stage.building_id = ?
+	//   2. fallback via estimate — the expense's stage shares a name
+	//      with a parent_item_number on an estimate_line whose estimate
+	//      carries building_id = ?
+	//
+	// Without (2) legacy expenses written before construction_stages got
+	// a building_id (migration 333) would fall out of every per-block
+	// view even though they belong to a specific block. Project-wide
+	// expenses (stage_id NULL) are excluded from per-block views since
+	// they can't be attributed.
+	if buildingIDStr := c.Query("building_id"); buildingIDStr != "" {
+		argCount++
+		bid, _ := strconv.ParseInt(buildingIDStr, 10, 64)
+		query += fmt.Sprintf(`
+			AND el.stage_id IS NOT NULL
+			AND EXISTS (
+				SELECT 1 FROM construction_stages st
+				WHERE st.id = el.stage_id
+				  AND st.tenant_id = el.tenant_id
+				  AND (
+				    st.building_id = $%d
+				    OR EXISTS (
+				      SELECT 1 FROM construction_estimate_line ll
+				      JOIN construction_estimate ee ON ee.id = ll.estimate_id
+				      WHERE ll.tenant_id = el.tenant_id
+				        AND ee.project_id = el.project_id
+				        AND ee.building_id = $%d
+				        AND ll.parent_item_number = st.name
+				      LIMIT 1
+				    )
+				  )
+			)`, argCount, argCount)
+		args = append(args, bid)
+	}
+
 	query += " ORDER BY el.expense_date DESC, el.created_at DESC"
 
 	rows, err := h.db.Query(query, args...)
@@ -616,7 +654,7 @@ func (h *Handler) ApproveExpenseLine(c *gin.Context) {
 	if creditAccID == nil || *creditAccID == uuid.Nil {
 		cashAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "cash_5010", "kassa", "5010")
 		if cashAcct == uuid.Nil {
-			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "1000")
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 		}
 		if cashAcct != uuid.Nil {
 			creditAccID = &cashAcct

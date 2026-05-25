@@ -3,6 +3,9 @@ package handler
 import (
 	"fmt"
 	"math"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -30,7 +33,7 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 	}
 
 	query := `
-		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''),
+		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
 			   at.category, at.normal_balance, a.parent_id,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
 			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
@@ -47,7 +50,7 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, at.category, at.normal_balance, a.parent_id
+		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, a.name_ru, at.category, at.normal_balance, a.parent_id
 		ORDER BY a.code
 	`
 
@@ -68,7 +71,7 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		var debitSum, creditSum float64
 		var parentID *uuid.UUID
 
-		err := rows.Scan(&acc.AccountID, &acc.AccountCode, &acc.AccountName, &acc.AccountNameUz, &acc.AccountNameEn, &acc.Category, &normalBalance, &parentID, &debitSum, &creditSum)
+		err := rows.Scan(&acc.AccountID, &acc.AccountCode, &acc.AccountName, &acc.AccountNameUz, &acc.AccountNameEn, &acc.AccountNameRu, &acc.Category, &normalBalance, &parentID, &debitSum, &creditSum)
 		if err != nil {
 			continue
 		}
@@ -164,7 +167,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 
 	// Query ALL account categories including revenue/expense to compute net income
 	query := `
-		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''),
+		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
 			   at.category, at.normal_balance,
 			   a.opening_balance,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
@@ -183,7 +186,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, at.category, at.normal_balance, a.opening_balance
+		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, a.name_ru, at.category, at.normal_balance, a.opening_balance
 		ORDER BY at.category, a.code
 	`
 
@@ -203,10 +206,10 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 
 	for rows.Next() {
 		var accountID uuid.UUID
-		var code, name, nameUz, nameEn, category, normalBalance string
+		var code, name, nameUz, nameEn, nameRu, category, normalBalance string
 		var openingBalance, debitSum, creditSum float64
 
-		err := rows.Scan(&accountID, &code, &name, &nameUz, &nameEn, &category, &normalBalance, &openingBalance, &debitSum, &creditSum)
+		err := rows.Scan(&accountID, &code, &name, &nameUz, &nameEn, &nameRu, &category, &normalBalance, &openingBalance, &debitSum, &creditSum)
 		if err != nil {
 			continue
 		}
@@ -241,6 +244,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 			AccountName:   name,
 			AccountNameUz: nameUz,
 			AccountNameEn: nameEn,
+			AccountNameRu: nameRu,
 			Balance:       math.Round(balance*100) / 100,
 		}
 
@@ -263,10 +267,10 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 	// Add net income as a line item in equity if it's non-zero
 	// This represents "Joriy yil foydasi" (Current Year Profit/Loss)
 	if math.Abs(netIncome) >= 0.01 {
-		// Check if there's already a "3300" account in equityAccounts
+		// Check if there's already a "8710" account in equityAccounts
 		found := false
 		for i, acc := range equityAccounts {
-			if acc.AccountCode == "3300" {
+			if acc.AccountCode == "8710" {
 				// Add net income to the existing account's balance
 				equityAccounts[i].Balance += netIncome
 				found = true
@@ -275,10 +279,11 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		}
 		if !found {
 			equityAccounts = append(equityAccounts, entity.BalanceSheetAccount{
-				AccountCode:   "3300",
-				AccountName:   "Joriy yil foydasi",
-				AccountNameUz: "Joriy yil foydasi",
-				AccountNameEn: "Current Year Profit/Loss",
+				AccountCode:   "8710",
+				AccountName:   "Joriy yil taqsimlanmagan foydasi",
+				AccountNameUz: "Joriy yil taqsimlanmagan foydasi",
+				AccountNameEn: "Current Year Undistributed Profit/Loss",
+				AccountNameRu: "Нераспределённая прибыль текущего года",
 				Balance:       netIncome,
 			})
 		}
@@ -330,28 +335,35 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 		periodTo = now.Format("2006-01-02")
 	}
 
+	args := []interface{}{tenantID, periodFrom, periodTo}
+	jeOrgFilter := ""
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		jeOrgFilter = " AND je.organization_id = $4"
+		args = append(args, orgID)
+	}
+
 	query := `
-		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''),
+		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
 			   at.category, at.normal_balance, at.code as type_code,
 			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
 			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
 		FROM accounts a
 		JOIN account_types at ON a.account_type_id = at.id
-		LEFT JOIN journal_entry_lines jel ON a.id = jel.account_id
-		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
-			AND je.status = 'posted'
-			AND je.entry_date >= $2 AND je.entry_date <= $3
-			AND je.deleted_at IS NULL
+		LEFT JOIN (
+			journal_entry_lines jel
+			INNER JOIN journal_entries je ON jel.journal_entry_id = je.id
+				AND je.status = 'posted'
+				AND je.entry_date >= $2 AND je.entry_date <= $3
+				AND je.deleted_at IS NULL` + jeOrgFilter + `
+		) ON a.id = jel.account_id
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
 			AND at.category IN ('revenue', 'expense')
 	`
-	args := []interface{}{tenantID, periodFrom, periodTo}
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+	if jeOrgFilter != "" {
 		query += " AND a.organization_id = $4"
-		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, at.category, at.normal_balance, at.code
+		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, a.name_ru, at.category, at.normal_balance, at.code
 		HAVING COALESCE(SUM(jel.debit_amount), 0) > 0 OR COALESCE(SUM(jel.credit_amount), 0) > 0
 		ORDER BY at.category DESC, a.code
 	`
@@ -373,10 +385,10 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 
 	for rows.Next() {
 		var accountID uuid.UUID
-		var code, name, nameUz, nameEn, category, normalBalance, typeCode string
+		var code, name, nameUz, nameEn, nameRu, category, normalBalance, typeCode string
 		var debitSum, creditSum float64
 
-		err := rows.Scan(&accountID, &code, &name, &nameUz, &nameEn, &category, &normalBalance, &typeCode, &debitSum, &creditSum)
+		err := rows.Scan(&accountID, &code, &name, &nameUz, &nameEn, &nameRu, &category, &normalBalance, &typeCode, &debitSum, &creditSum)
 		if err != nil {
 			continue
 		}
@@ -399,6 +411,7 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 			AccountName:   name,
 			AccountNameUz: nameUz,
 			AccountNameEn: nameEn,
+			AccountNameRu: nameRu,
 			Amount:        math.Round(amount*100) / 100,
 		}
 
@@ -507,9 +520,16 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 		periodTo = now.Format("2006-01-02")
 	}
 
-	// Get accounts to include
+	// Get accounts to include. We pull `category` and `normal_balance` from
+	// account_types so the UI can render the debit/credit closing columns
+	// without a second round-trip, and so we can split ClosingBalance by side.
+	// Trilingual name columns (migration 316) are returned too so the frontend
+	// can pick the right label per-language — same pattern as ListAccounts.
 	accountQuery := `
-		SELECT a.id, a.code, a.name, a.opening_balance, at.normal_balance
+		SELECT a.id, a.code, a.name,
+		       COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
+		       a.opening_balance,
+		       COALESCE(at.category, ''), COALESCE(at.normal_balance, 'debit')
 		FROM accounts a
 		JOIN account_types at ON a.account_type_id = at.id
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
@@ -543,12 +563,18 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 
 	for accountRows.Next() {
 		var acc entity.GeneralLedgerAccount
-		var normalBalance string
+		var category, normalBalance string
 
-		err := accountRows.Scan(&acc.AccountID, &acc.AccountCode, &acc.AccountName, &acc.OpeningBalance, &normalBalance)
+		err := accountRows.Scan(
+			&acc.AccountID, &acc.AccountCode, &acc.AccountName,
+			&acc.AccountNameUz, &acc.AccountNameEn, &acc.AccountNameRu,
+			&acc.OpeningBalance, &category, &normalBalance,
+		)
 		if err != nil {
 			continue
 		}
+		acc.AccountType = category
+		acc.NormalBalance = normalBalance
 
 		// Get transactions for this account
 		txQuery := `
@@ -607,13 +633,51 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 		acc.TotalCredit = math.Round(acc.TotalCredit*100) / 100
 		acc.ClosingBalance = math.Round(acc.ClosingBalance*100) / 100
 
+		// Split the closing balance by side. `runningBalance` is the signed
+		// balance in the account's "natural" direction (positive = sits on the
+		// normal_balance side). Negative balances flip to the opposite column.
+		switch normalBalance {
+		case "credit":
+			if acc.ClosingBalance >= 0 {
+				acc.ClosingCredit = acc.ClosingBalance
+				acc.ClosingDebit = 0
+			} else {
+				acc.ClosingCredit = 0
+				acc.ClosingDebit = math.Round(-acc.ClosingBalance*100) / 100
+			}
+		default: // "debit"
+			if acc.ClosingBalance >= 0 {
+				acc.ClosingDebit = acc.ClosingBalance
+				acc.ClosingCredit = 0
+			} else {
+				acc.ClosingDebit = 0
+				acc.ClosingCredit = math.Round(-acc.ClosingBalance*100) / 100
+			}
+		}
+
 		accounts = append(accounts, acc)
 	}
 
+	// Report-level totals: frontend uses the debit/credit-closing difference as
+	// a balance-integrity check (shows red ≠ indicator when mismatched).
+	var totalOpening, totalDebit, totalCredit, closingDebit, closingCredit float64
+	for _, a := range accounts {
+		totalOpening += a.OpeningBalance
+		totalDebit += a.TotalDebit
+		totalCredit += a.TotalCredit
+		closingDebit += a.ClosingDebit
+		closingCredit += a.ClosingCredit
+	}
+
 	report := entity.GeneralLedgerReport{
-		PeriodFrom: periodFrom,
-		PeriodTo:   periodTo,
-		Accounts:   accounts,
+		PeriodFrom:         periodFrom,
+		PeriodTo:           periodTo,
+		Accounts:           accounts,
+		TotalOpening:       math.Round(totalOpening*100) / 100,
+		TotalDebit:         math.Round(totalDebit*100) / 100,
+		TotalCredit:        math.Round(totalCredit*100) / 100,
+		ClosingDebitTotal:  math.Round(closingDebit*100) / 100,
+		ClosingCreditTotal: math.Round(closingCredit*100) / 100,
 	}
 
 	response.Success(c, report)
@@ -732,37 +796,34 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 			}
 
 			// Categorize by account code (Uzbekistan NAS chart of accounts)
+			// NAS classification for cash flow statement:
 			// Investing: 0100-0899 (fixed/intangible assets, investments, capital expenditures)
-			// Financing: 6000-6999 (long-term liabilities), 3000-3999 (equity), 7000 (interest)
+			// Financing: 6000-6999 (current liabilities), 7000-7999 (long-term liabilities), 8000-8999 (equity)
 			// Operating: everything else (revenue, COGS, OpEx, AR, AP, etc.)
-			codePrefix := ""
-			if len(code) >= 2 {
-				codePrefix = code[:2]
-			}
 			switch {
 			case code >= "0100" && code <= "0899":
 				// Fixed assets (01xx-04xx), intangible assets (04xx),
 				// long-term investments (06xx), equipment (08xx) → investing
 				investingItems = append(investingItems, item)
 				investingTotal += amount
-			case code >= "1500" && code <= "1699":
-				// Capital equipment, depreciation, intangible assets → investing
+			case code >= "0400" && code <= "0499":
+				// Intangible assets (04xx) → investing
 				investingItems = append(investingItems, item)
 				investingTotal += amount
-			case code >= "2100" && code <= "2599":
-				// Short/long-term loans → financing
+			case code >= "0600" && code <= "0699":
+				// Long-term investments (06xx) → investing
+				investingItems = append(investingItems, item)
+				investingTotal += amount
+			case code >= "6000" && code <= "6999":
+				// Current liabilities / accounts payable (60xx-69xx) → financing
 				financingItems = append(financingItems, item)
 				financingTotal += amount
-			case code >= "6000" && code < "7000":
-				// Long-term liabilities (6000-6999) → financing
+			case code >= "7000" && code <= "7999":
+				// Long-term liabilities (70xx-79xx) → financing
 				financingItems = append(financingItems, item)
 				financingTotal += amount
-			case codePrefix >= "30" && codePrefix <= "39":
-				// Equity accounts (3000-3999) → financing
-				financingItems = append(financingItems, item)
-				financingTotal += amount
-			case code == "7000":
-				// Interest expense → financing
+			case code >= "8000" && code <= "8999":
+				// Equity accounts (80xx-89xx) → financing
 				financingItems = append(financingItems, item)
 				financingTotal += amount
 			default:
@@ -980,18 +1041,165 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		}
 	}
 
-	// Remove contacts with zero or negative net balance (fully paid)
-	for id, contact := range contactMap {
-		if contact.TotalAmount <= 0 {
-			// Subtract their bucket amounts from totals
-			currentTotal -= contact.Current
-			days1To30 -= contact.Days1To30
-			days31To60 -= contact.Days31To60
-			days61To90 -= contact.Days61To90
-			over90Days -= contact.Over90Days
-			totalAmount -= contact.TotalAmount
-			delete(contactMap, id)
+	// ── Step 3: Subtract approved sales returns (credit notes) ──
+	retQuery := `
+		SELECT sr.id, sr.return_number, COALESCE(sr.approved_at, sr.return_date), sr.total_amount,
+		       sr.customer_id, COALESCE(c.name, sr.customer_name, '') as contact_name
+		FROM sales_returns sr
+		LEFT JOIN contacts c ON sr.customer_id = c.id
+		WHERE sr.tenant_id = $1 AND sr.deleted_at IS NULL
+		  AND sr.status IN ('approved', 'completed')
+		  AND sr.customer_id IS NOT NULL
+		  AND COALESCE(sr.approved_at, sr.return_date) <= $2::date
+	`
+	retArgs := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		retQuery += " AND sr.organization_id = $3"
+		retArgs = append(retArgs, orgID)
+	}
+	retRows, retErr := h.db.Query(retQuery, retArgs...)
+	if retErr == nil {
+		defer retRows.Close()
+		for retRows.Next() {
+			var retID, contactID uuid.UUID
+			var retNumber, contactName string
+			var retDate time.Time
+			var amount float64
+			if err := retRows.Scan(&retID, &retNumber, &retDate, &amount, &contactID, &contactName); err != nil {
+				continue
+			}
+			if amount <= 0 {
+				continue
+			}
+			negativeAmount := -amount
+			contact, exists := contactMap[contactID]
+			if !exists {
+				if !contactHasInvoices[contactID] {
+					continue
+				}
+				contact = &entity.AgingContact{
+					ContactID:   contactID,
+					ContactName: contactName,
+					Invoices:    make([]entity.AgingInvoice, 0),
+				}
+				contactMap[contactID] = contact
+			}
+			contact.Current += negativeAmount
+			currentTotal += negativeAmount
+			retEntry := entity.AgingInvoice{
+				InvoiceID:     retID,
+				InvoiceNumber: "CN-" + retNumber,
+				InvoiceDate:   retDate.Format("2006-01-02"),
+				DueDate:       retDate.Format("2006-01-02"),
+				TotalAmount:   negativeAmount,
+				AmountDue:     negativeAmount,
+				DaysOverdue:   0,
+				AgingBucket:   "current",
+			}
+			contact.Invoices = append(contact.Invoices, retEntry)
+			contact.TotalAmount += negativeAmount
+			totalAmount += negativeAmount
 		}
+	}
+
+	// ── Step 4: FIFO-apply credits (payments + credit notes) against oldest invoices ──
+	// Credits consume the oldest invoices first (FIFO). Once a credit is consumed, its
+	// amount_due is zeroed so line items and bucket totals stay consistent on the UI.
+	// Leftover credit (if credits exceed invoices) shows as a negative in "Not Due".
+	totalAmount = 0
+	currentTotal = 0
+	days1To30 = 0
+	days31To60 = 0
+	days61To90 = 0
+	over90Days = 0
+
+	for _, contact := range contactMap {
+		var creditIdx, invoiceIdx []int
+		for i := range contact.Invoices {
+			if contact.Invoices[i].TotalAmount < 0 {
+				creditIdx = append(creditIdx, i)
+			} else {
+				invoiceIdx = append(invoiceIdx, i)
+			}
+		}
+
+		// Sort both oldest-first by date
+		sort.SliceStable(invoiceIdx, func(a, b int) bool {
+			return contact.Invoices[invoiceIdx[a]].DueDate < contact.Invoices[invoiceIdx[b]].DueDate
+		})
+		sort.SliceStable(creditIdx, func(a, b int) bool {
+			return contact.Invoices[creditIdx[a]].DueDate < contact.Invoices[creditIdx[b]].DueDate
+		})
+
+		var totalCredits float64
+		for _, ci := range creditIdx {
+			totalCredits += -contact.Invoices[ci].TotalAmount
+		}
+
+		// Reset per-contact bucket accumulators; rebuild from post-FIFO amount_due
+		contact.Current = 0
+		contact.Days1To30 = 0
+		contact.Days31To60 = 0
+		contact.Days61To90 = 0
+		contact.Over90Days = 0
+		contact.TotalAmount = 0
+
+		// Apply credits FIFO against invoices, reducing each invoice's amount_due
+		remaining := totalCredits
+		for _, ii := range invoiceIdx {
+			inv := &contact.Invoices[ii]
+			applied := math.Min(remaining, inv.TotalAmount)
+			inv.AmountDue = inv.TotalAmount - applied
+			remaining -= applied
+
+			switch inv.AgingBucket {
+			case "current":
+				contact.Current += inv.AmountDue
+			case "1-30":
+				contact.Days1To30 += inv.AmountDue
+			case "31-60":
+				contact.Days31To60 += inv.AmountDue
+			case "61-90":
+				contact.Days61To90 += inv.AmountDue
+			case "90+":
+				contact.Over90Days += inv.AmountDue
+			}
+			contact.TotalAmount += inv.AmountDue
+		}
+
+		// Mirror consumption back onto credit line items so UI stays consistent:
+		// consumed credits get amount_due=0; unconsumed (overpayment) retain negative amount_due
+		appliedCredit := totalCredits - remaining
+		for _, ci := range creditIdx {
+			credit := &contact.Invoices[ci]
+			creditAmount := -credit.TotalAmount
+			switch {
+			case appliedCredit >= creditAmount:
+				credit.AmountDue = 0
+				appliedCredit -= creditAmount
+			case appliedCredit > 0:
+				credit.AmountDue = -(creditAmount - appliedCredit)
+				appliedCredit = 0
+			default:
+				credit.AmountDue = credit.TotalAmount
+			}
+			contact.Current += credit.AmountDue
+			contact.TotalAmount += credit.AmountDue
+		}
+	}
+
+	// Drop fully-settled contacts, then accumulate grand totals
+	for id, contact := range contactMap {
+		if math.Abs(contact.TotalAmount) < 0.005 {
+			delete(contactMap, id)
+			continue
+		}
+		currentTotal += contact.Current
+		days1To30 += contact.Days1To30
+		days31To60 += contact.Days31To60
+		days61To90 += contact.Days61To90
+		over90Days += contact.Over90Days
+		totalAmount += contact.TotalAmount
 	}
 
 	// Convert map to slice
@@ -1191,17 +1399,95 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		}
 	}
 
-	// Remove contacts with zero or negative net balance (fully paid)
-	for id, contact := range contactMap {
-		if contact.TotalAmount <= 0 {
-			currentTotal -= contact.Current
-			days1To30 -= contact.Days1To30
-			days31To60 -= contact.Days31To60
-			days61To90 -= contact.Days61To90
-			over90Days -= contact.Over90Days
-			totalAmount -= contact.TotalAmount
-			delete(contactMap, id)
+	// ── Step 3: FIFO-apply vendor payments against oldest vendor invoices ──
+	totalAmount = 0
+	currentTotal = 0
+	days1To30 = 0
+	days31To60 = 0
+	days61To90 = 0
+	over90Days = 0
+
+	for _, contact := range contactMap {
+		var creditIdx, invoiceIdx []int
+		for i := range contact.Invoices {
+			if contact.Invoices[i].TotalAmount < 0 {
+				creditIdx = append(creditIdx, i)
+			} else {
+				invoiceIdx = append(invoiceIdx, i)
+			}
 		}
+
+		sort.SliceStable(invoiceIdx, func(a, b int) bool {
+			return contact.Invoices[invoiceIdx[a]].DueDate < contact.Invoices[invoiceIdx[b]].DueDate
+		})
+		sort.SliceStable(creditIdx, func(a, b int) bool {
+			return contact.Invoices[creditIdx[a]].DueDate < contact.Invoices[creditIdx[b]].DueDate
+		})
+
+		var totalCredits float64
+		for _, ci := range creditIdx {
+			totalCredits += -contact.Invoices[ci].TotalAmount
+		}
+
+		contact.Current = 0
+		contact.Days1To30 = 0
+		contact.Days31To60 = 0
+		contact.Days61To90 = 0
+		contact.Over90Days = 0
+		contact.TotalAmount = 0
+
+		remaining := totalCredits
+		for _, ii := range invoiceIdx {
+			inv := &contact.Invoices[ii]
+			applied := math.Min(remaining, inv.TotalAmount)
+			inv.AmountDue = inv.TotalAmount - applied
+			remaining -= applied
+
+			switch inv.AgingBucket {
+			case "current":
+				contact.Current += inv.AmountDue
+			case "1-30":
+				contact.Days1To30 += inv.AmountDue
+			case "31-60":
+				contact.Days31To60 += inv.AmountDue
+			case "61-90":
+				contact.Days61To90 += inv.AmountDue
+			case "90+":
+				contact.Over90Days += inv.AmountDue
+			}
+			contact.TotalAmount += inv.AmountDue
+		}
+
+		appliedCredit := totalCredits - remaining
+		for _, ci := range creditIdx {
+			credit := &contact.Invoices[ci]
+			creditAmount := -credit.TotalAmount
+			switch {
+			case appliedCredit >= creditAmount:
+				credit.AmountDue = 0
+				appliedCredit -= creditAmount
+			case appliedCredit > 0:
+				credit.AmountDue = -(creditAmount - appliedCredit)
+				appliedCredit = 0
+			default:
+				credit.AmountDue = credit.TotalAmount
+			}
+			contact.Current += credit.AmountDue
+			contact.TotalAmount += credit.AmountDue
+		}
+	}
+
+	for id, contact := range contactMap {
+		if math.Abs(contact.TotalAmount) < 0.005 {
+			delete(contactMap, id)
+			continue
+		}
+		currentTotal += contact.Current
+		days1To30 += contact.Days1To30
+		days31To60 += contact.Days31To60
+		days61To90 += contact.Days61To90
+		over90Days += contact.Over90Days
+		totalAmount += contact.TotalAmount
 	}
 
 	contacts := make([]entity.AgingContact, 0, len(contactMap))
@@ -1224,7 +1510,7 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 	response.Success(c, report)
 }
 
-// GetSalesSummary returns sales summary report
+// GetSalesSummary returns comprehensive sales dashboard stats in a single response
 func (h *Handler) GetSalesSummary(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1232,86 +1518,94 @@ func (h *Handler) GetSalesSummary(c *gin.Context) {
 		return
 	}
 
-	periodFrom := c.Query("period_from")
-	periodTo := c.Query("period_to")
-
-	now := time.Now()
-	if periodFrom == "" {
-		periodFrom = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
-	}
-	if periodTo == "" {
-		periodTo = now.Format("2006-01-02")
+	orgID, hasOrg := middleware.GetOrganizationID(c)
+	orgFilter := ""
+	args := []interface{}{tenantID}
+	if hasOrg && orgID != uuid.Nil {
+		orgFilter = " AND organization_id = $2"
+		args = append(args, orgID)
 	}
 
-	// Get sales totals
-	var totalOrders, totalInvoiced int
-	var orderAmount, invoicedAmount, paidAmount float64
+	// Sales orders: total, revenue, active
+	var totalOrders, activeOrders int
+	var totalRevenue float64
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*),
+		       COALESCE(SUM(total_amount), 0),
+		       COUNT(*) FILTER (WHERE status IN ('draft','quotation','confirmed','processing','shipped'))
+		FROM sales_orders
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&totalOrders, &totalRevenue, &activeOrders)
 
-	soQuery := `
-		SELECT COUNT(*), COALESCE(SUM(total_amount), 0)
+	// Quotations
+	var totalQuotations, pendingQuotations int
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'sent')
+		FROM quotations
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&totalQuotations, &pendingQuotations)
+
+	// Invoices
+	var totalInvoices, unpaidInvoices int
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE payment_status IN ('unpaid','partial'))
+		FROM sales_invoices
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&totalInvoices, &unpaidInvoices)
+
+	// Returns
+	var totalReturns, pendingReturns int
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'pending')
+		FROM sales_returns
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&totalReturns, &pendingReturns)
+
+	// Active discounts
+	var activeDiscounts int
+	h.db.QueryRow(fmt.Sprintf(`
+		SELECT COUNT(*) FILTER (WHERE is_active = true)
+		FROM discounts
+		WHERE tenant_id = $1 AND deleted_at IS NULL%s
+	`, orgFilter), args...).Scan(&activeDiscounts)
+
+	// Chart data: revenue per month for last 6 months
+	type ChartPoint struct {
+		Month   string  `json:"month"`
+		Revenue float64 `json:"revenue"`
+	}
+	chartData := make([]ChartPoint, 0)
+	chartRows, err := h.db.Query(fmt.Sprintf(`
+		SELECT TO_CHAR(order_date, 'YYYY-MM') AS month,
+		       COALESCE(SUM(total_amount), 0) AS revenue
 		FROM sales_orders
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-			AND order_date >= $2 AND order_date <= $3
-	`
-	siQuery := `
-		SELECT COUNT(*), COALESCE(SUM(total_amount), 0), COALESCE(SUM(amount_paid), 0)
-		FROM sales_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-			AND invoice_date >= $2 AND invoice_date <= $3
-	`
-	tcQuery := `
-		SELECT c.id, c.name, COUNT(si.id), COALESCE(SUM(si.total_amount), 0)
-		FROM sales_invoices si
-		JOIN contacts c ON si.customer_id = c.id
-		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
-			AND si.invoice_date >= $2 AND si.invoice_date <= $3
-	`
-	salesArgs := []interface{}{tenantID, periodFrom, periodTo}
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		soQuery += " AND organization_id = $4"
-		siQuery += " AND organization_id = $4"
-		tcQuery += " AND si.organization_id = $4"
-		salesArgs = append(salesArgs, orgID)
-	}
-
-	h.db.QueryRow(soQuery, salesArgs...).Scan(&totalOrders, &orderAmount)
-	h.db.QueryRow(siQuery, salesArgs...).Scan(&totalInvoiced, &invoicedAmount, &paidAmount)
-
-	// Get top customers
-	type TopCustomer struct {
-		CustomerID   uuid.UUID `json:"customer_id"`
-		CustomerName string    `json:"customer_name"`
-		OrderCount   int       `json:"order_count"`
-		TotalAmount  float64   `json:"total_amount"`
-	}
-
-	tcQuery += `
-		GROUP BY c.id, c.name
-		ORDER BY SUM(si.total_amount) DESC
-		LIMIT 10
-	`
-	topCustomers := make([]TopCustomer, 0)
-	rows, err := h.db.Query(tcQuery, salesArgs...)
-
+		  AND order_date >= NOW() - INTERVAL '6 months'%s
+		GROUP BY TO_CHAR(order_date, 'YYYY-MM')
+		ORDER BY month
+	`, orgFilter), args...)
 	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var tc TopCustomer
-			rows.Scan(&tc.CustomerID, &tc.CustomerName, &tc.OrderCount, &tc.TotalAmount)
-			topCustomers = append(topCustomers, tc)
+		defer chartRows.Close()
+		for chartRows.Next() {
+			var p ChartPoint
+			if err := chartRows.Scan(&p.Month, &p.Revenue); err == nil {
+				chartData = append(chartData, p)
+			}
 		}
 	}
 
 	response.Success(c, gin.H{
-		"period_from":      periodFrom,
-		"period_to":        periodTo,
-		"total_orders":     totalOrders,
-		"order_amount":     orderAmount,
-		"total_invoiced":   totalInvoiced,
-		"invoiced_amount":  invoicedAmount,
-		"paid_amount":      paidAmount,
-		"outstanding":      invoicedAmount - paidAmount,
-		"top_customers":    topCustomers,
+		"total_orders":       totalOrders,
+		"total_revenue":      totalRevenue,
+		"active_orders":      activeOrders,
+		"total_quotations":   totalQuotations,
+		"pending_quotations": pendingQuotations,
+		"total_invoices":     totalInvoices,
+		"unpaid_invoices":    unpaidInvoices,
+		"total_returns":      totalReturns,
+		"pending_returns":    pendingReturns,
+		"active_discounts":   activeDiscounts,
+		"chart_data":         chartData,
 	})
 }
 
@@ -1425,5 +1719,666 @@ func (h *Handler) GetInventoryReport(c *gin.Context) {
 		"total_items":     len(items),
 		"total_value":     math.Round(totalValue*100) / 100,
 		"low_stock_count": lowStockCount,
+	})
+}
+
+// GetAccountCard returns hisob kartochkasi (account card) - detailed transaction
+// history for a single account with counterpart accounts and running balance
+func (h *Handler) GetAccountCard(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	accountID := c.Query("account_id")
+	if accountID == "" {
+		response.BadRequest(c, "account_id is required")
+		return
+	}
+
+	periodFrom := c.Query("period_from")
+	periodTo := c.Query("period_to")
+	counterpartCode := c.Query("counterpart_code")
+	contactName := c.Query("contact_name")
+	// TT §6.3: filters — summa (amount range), hujjat turi (doc type)
+	docType := c.Query("doc_type")
+	amountMinStr := c.Query("amount_min")
+	amountMaxStr := c.Query("amount_max")
+
+	now := time.Now()
+	if periodFrom == "" {
+		periodFrom = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	}
+	if periodTo == "" {
+		periodTo = now.Format("2006-01-02")
+	}
+
+	// Get account info
+	var accID uuid.UUID
+	var accCode, accName, normalBalance string
+	var openingBalance float64
+
+	accQuery := `
+		SELECT a.id, a.code, a.name, a.opening_balance, at.normal_balance
+		FROM accounts a
+		JOIN account_types at ON a.account_type_id = at.id
+		WHERE a.id = $1 AND a.tenant_id = $2 AND a.deleted_at IS NULL
+	`
+	err := h.db.QueryRow(accQuery, accountID, tenantID).Scan(&accID, &accCode, &accName, &openingBalance, &normalBalance)
+	if err != nil {
+		h.log.Error("Account not found", "error", err)
+		response.NotFound(c, "Account not found")
+		return
+	}
+
+	// Calculate opening balance: account's opening_balance + all posted transactions BEFORE periodFrom
+	priorQuery := `
+		SELECT COALESCE(SUM(jel.debit_amount), 0), COALESCE(SUM(jel.credit_amount), 0)
+		FROM journal_entry_lines jel
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+		WHERE jel.account_id = $1 AND je.tenant_id = $2
+			AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.entry_date < $3
+	`
+	var priorDebit, priorCredit float64
+	err = h.db.QueryRow(priorQuery, accID, tenantID, periodFrom).Scan(&priorDebit, &priorCredit)
+	if err != nil {
+		priorDebit = 0
+		priorCredit = 0
+	}
+
+	calcOpeningBalance := openingBalance
+	if normalBalance == "debit" {
+		calcOpeningBalance += priorDebit - priorCredit
+	} else {
+		calcOpeningBalance += priorCredit - priorDebit
+	}
+	calcOpeningBalance = math.Round(calcOpeningBalance*100) / 100
+
+	// Get transactions with counterpart accounts
+	txQuery := `
+		SELECT je.id, je.entry_date, je.entry_number, COALESCE(je.doc_type, ''),
+			   COALESCE(je.description, ''), COALESCE(je.reference, ''),
+			   jel.debit_amount, jel.credit_amount,
+			   COALESCE(cp_acc.code, '') as counterpart_code,
+			   COALESCE(cp_acc.name, '') as counterpart_name,
+			   COALESCE(c.company_name, c.contact_name, '') as contact_name
+		FROM journal_entry_lines jel
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+		LEFT JOIN LATERAL (
+			SELECT a2.code, a2.name
+			FROM journal_entry_lines jel2
+			JOIN accounts a2 ON jel2.account_id = a2.id
+			WHERE jel2.journal_entry_id = jel.journal_entry_id
+				AND jel2.account_id != jel.account_id
+			LIMIT 1
+		) cp_acc ON true
+		LEFT JOIN contacts c ON je.contact_id = c.id
+		WHERE jel.account_id = $1 AND je.tenant_id = $2
+			AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.entry_date >= $3 AND je.entry_date <= $4
+	`
+	args := []interface{}{accID, tenantID, periodFrom, periodTo}
+	argCount := 4
+
+	if counterpartCode != "" {
+		argCount++
+		txQuery += fmt.Sprintf(" AND cp_acc.code = $%d", argCount)
+		args = append(args, counterpartCode)
+	}
+	if contactName != "" {
+		argCount++
+		txQuery += fmt.Sprintf(" AND (c.company_name ILIKE $%d OR c.contact_name ILIKE $%d)", argCount, argCount)
+		args = append(args, "%"+contactName+"%")
+	}
+	// TT §6.3: doc type and amount range filters
+	if docType != "" {
+		argCount++
+		txQuery += fmt.Sprintf(" AND (je.doc_type = $%d OR je.source_type = $%d)", argCount, argCount)
+		args = append(args, docType)
+	}
+	if amountMinStr != "" {
+		if v, err := strconv.ParseFloat(amountMinStr, 64); err == nil {
+			argCount++
+			txQuery += fmt.Sprintf(" AND (jel.debit_amount + jel.credit_amount) >= $%d", argCount)
+			args = append(args, v)
+		}
+	}
+	if amountMaxStr != "" {
+		if v, err := strconv.ParseFloat(amountMaxStr, 64); err == nil {
+			argCount++
+			txQuery += fmt.Sprintf(" AND (jel.debit_amount + jel.credit_amount) <= $%d", argCount)
+			args = append(args, v)
+		}
+	}
+
+	txQuery += " ORDER BY je.entry_date ASC, je.entry_number ASC"
+
+	rows, err := h.db.Query(txQuery, args...)
+	if err != nil {
+		h.log.Error("Failed to get account card transactions", "error", err)
+		response.InternalError(c, "Failed to generate account card")
+		return
+	}
+	defer rows.Close()
+
+	transactions := make([]entity.AccountCardTransaction, 0)
+	runningBalance := calcOpeningBalance
+	var totalDebit, totalCredit float64
+
+	for rows.Next() {
+		var tx entity.AccountCardTransaction
+		var entryDate time.Time
+		var entryID uuid.UUID
+
+		err := rows.Scan(
+			&entryID, &entryDate, &tx.EntryNumber, &tx.DocType,
+			&tx.Description, &tx.Reference,
+			&tx.DebitAmount, &tx.CreditAmount,
+			&tx.CounterpartCode, &tx.CounterpartName,
+			&tx.ContactName,
+		)
+		if err != nil {
+			h.log.Error("Failed to scan account card row", "error", err)
+			continue
+		}
+
+		tx.Date = entryDate.Format("2006-01-02")
+		tx.EntryID = entryID.String()
+
+		// Calculate running balance
+		if normalBalance == "debit" {
+			runningBalance += tx.DebitAmount - tx.CreditAmount
+		} else {
+			runningBalance += tx.CreditAmount - tx.DebitAmount
+		}
+		tx.RunningBalance = math.Round(runningBalance*100) / 100
+
+		totalDebit += tx.DebitAmount
+		totalCredit += tx.CreditAmount
+		transactions = append(transactions, tx)
+	}
+
+	accountType := "active"
+	if normalBalance == "credit" {
+		accountType = "passive"
+	}
+
+	report := entity.AccountCardReport{
+		AccountID:      accID,
+		AccountCode:    accCode,
+		AccountName:    accName,
+		AccountType:    accountType,
+		PeriodFrom:     periodFrom,
+		PeriodTo:       periodTo,
+		OpeningBalance: calcOpeningBalance,
+		TotalDebit:     math.Round(totalDebit*100) / 100,
+		TotalCredit:    math.Round(totalCredit*100) / 100,
+		ClosingBalance: math.Round(runningBalance*100) / 100,
+		Transactions:   transactions,
+	}
+
+	response.Success(c, report)
+}
+
+// =====================================================
+// DIRECTOR DASHBOARD — single-shot cross-company summary
+// Returns aggregated metrics for every organization in the tenant in ONE call,
+// so the frontend doesn't have to fan out N×M requests.
+// =====================================================
+
+type directorCompanySummary struct {
+	ID                   string                       `json:"id"`
+	Name                 string                       `json:"name"`
+	Revenue              float64                      `json:"revenue"`
+	Expenses             float64                      `json:"expenses"`
+	Profit               float64                      `json:"profit"`
+	Debtors              float64                      `json:"debtors"`
+	Creditors            float64                      `json:"creditors"`
+	MonthlyRevenue       []float64                    `json:"monthly_revenue"`
+	ExpenseByCategory    map[string]float64           `json:"expense_by_category"`
+	StockUnits           float64                      `json:"stock_units"`
+	StockValue           float64                      `json:"stock_value"`
+	LowStockCount        int                          `json:"low_stock_count"`
+	TotalEmployees       int                          `json:"total_employees"`
+	ActiveEmployees      int                          `json:"active_employees"`
+	SalaryFund           float64                      `json:"salary_fund"`
+	TopStockProducts     []directorTopStockProduct    `json:"top_stock_products"`
+	ConstructionProjects []directorConstructionProjct `json:"construction_projects"`
+}
+
+type directorTopStockProduct struct {
+	Name  string  `json:"name"`
+	Qty   float64 `json:"qty"`
+	Value float64 `json:"value"`
+}
+
+type directorConstructionProjct struct {
+	ID             int64   `json:"id"`
+	Name           string  `json:"name"`
+	Code           string  `json:"code"`
+	Status         string  `json:"status"`
+	Progress       float64 `json:"progress"`
+	ContractAmount float64 `json:"contract_amount"`
+}
+
+// GetDirectorSummary returns per-organization financial/stock/HR metrics in a single response.
+func (h *Handler) GetDirectorSummary(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	// Period-aware time buckets. The dashboard's Day/Month/Quarter/Year
+	// pill filters the `period` query param; each value picks a number
+	// of buckets and the unit spanned by each bucket. Oldest bucket is
+	// index 0, newest (= current) is the last index.
+	now := time.Now()
+	period := strings.ToLower(strings.TrimSpace(c.Query("period")))
+	if period == "" {
+		period = "month"
+	}
+	var bucketCount int
+	switch period {
+	case "day":
+		bucketCount = 7 // last 7 days
+	case "quarter":
+		bucketCount = 4 // last 4 quarters
+	case "year":
+		bucketCount = 5 // last 5 years
+	default: // "month"
+		period = "month"
+		bucketCount = 6
+	}
+
+	type timeBucket struct {
+		start time.Time
+		end   time.Time
+		label string
+	}
+	buckets := make([]timeBucket, bucketCount)
+	labels := make([]string, bucketCount)
+	for i := 0; i < bucketCount; i++ {
+		offsetFromNow := bucketCount - 1 - i
+		var start, end time.Time
+		var label string
+		switch period {
+		case "day":
+			d := time.Date(now.Year(), now.Month(), now.Day()-offsetFromNow, 0, 0, 0, 0, now.Location())
+			start = d
+			end = d.AddDate(0, 0, 1)
+			label = d.Format("Jan 2")
+		case "quarter":
+			currentQ := (int(now.Month()) - 1) / 3
+			currentQStart := time.Date(now.Year(), time.Month(currentQ*3+1), 1, 0, 0, 0, 0, now.Location())
+			start = currentQStart.AddDate(0, -3*offsetFromNow, 0)
+			end = start.AddDate(0, 3, 0)
+			q := (int(start.Month())-1)/3 + 1
+			label = fmt.Sprintf("Q%d %d", q, start.Year())
+		case "year":
+			start = time.Date(now.Year()-offsetFromNow, 1, 1, 0, 0, 0, 0, now.Location())
+			end = start.AddDate(1, 0, 0)
+			label = fmt.Sprintf("%d", start.Year())
+		default: // "month"
+			d := time.Date(now.Year(), now.Month()-time.Month(offsetFromNow), 1, 0, 0, 0, 0, now.Location())
+			start = d
+			end = d.AddDate(0, 1, 0)
+			label = d.Format("Jan")
+		}
+		buckets[i] = timeBucket{start: start, end: end, label: label}
+		labels[i] = label
+	}
+
+	// Earliest/latest — used to scope the revenue/expense SQL queries
+	// so totals also respect the selected period.
+	rangeStart := buckets[0].start
+	rangeEnd := buckets[len(buckets)-1].end
+
+	bucketIdx := func(t time.Time) int {
+		for i, b := range buckets {
+			if !t.Before(b.start) && t.Before(b.end) {
+				return i
+			}
+		}
+		return -1
+	}
+
+	// 1. All organizations for this tenant (base skeleton)
+	orgRows, err := h.db.Query(
+		`SELECT id, COALESCE(name, '') FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY name`,
+		tenantID,
+	)
+	if err != nil {
+		h.log.Error("director-summary: org query failed", "error", err)
+		response.InternalError(c, "Failed to load organizations")
+		return
+	}
+	defer orgRows.Close()
+	byOrg := make(map[string]*directorCompanySummary)
+	order := make([]string, 0, 32)
+	for orgRows.Next() {
+		var id uuid.UUID
+		var name string
+		if err := orgRows.Scan(&id, &name); err != nil {
+			continue
+		}
+		idStr := id.String()
+		byOrg[idStr] = &directorCompanySummary{
+			ID:                idStr,
+			Name:              name,
+			MonthlyRevenue:    make([]float64, bucketCount),
+			ExpenseByCategory: map[string]float64{},
+		}
+		order = append(order, idStr)
+	}
+
+	// Ensure a row exists before indexing
+	touch := func(orgID string) *directorCompanySummary {
+		s, ok := byOrg[orgID]
+		if !ok {
+			return nil
+		}
+		return s
+	}
+
+	// 2. Revenue — scoped to the selected period window.
+	revRows, err := h.db.Query(`
+		SELECT organization_id, invoice_date, COALESCE(total_amount, 0)
+		FROM sales_invoices
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
+		  AND status NOT IN ('cancelled')
+		  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+		  AND invoice_date >= $2 AND invoice_date < $3`,
+		tenantID, rangeStart, rangeEnd,
+	)
+	if err == nil {
+		for revRows.Next() {
+			var orgID uuid.UUID
+			var invDate time.Time
+			var amt float64
+			if err := revRows.Scan(&orgID, &invDate, &amt); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.Revenue += amt
+			if idx := bucketIdx(invDate); idx >= 0 {
+				s.MonthlyRevenue[idx] += amt
+			}
+		}
+		revRows.Close()
+	}
+
+	// 3. Expenses — scoped to the selected period window.
+	//    The donut breakdown is "current bucket" (latest = today's
+	//    period segment, e.g. this month / this quarter / this year).
+	expRows, err := h.db.Query(`
+		SELECT e.organization_id, COALESCE(e.amount, 0),
+		       COALESCE(ec.name, 'Other') AS category,
+		       e.expense_date
+		FROM expenses e
+		LEFT JOIN expense_categories ec ON ec.id = e.category_id
+		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND e.organization_id IS NOT NULL
+		  AND e.expense_date >= $2 AND e.expense_date < $3`,
+		tenantID, rangeStart, rangeEnd,
+	)
+	if err == nil {
+		latestStart := buckets[len(buckets)-1].start
+		latestEnd := buckets[len(buckets)-1].end
+		for expRows.Next() {
+			var orgID uuid.UUID
+			var amt float64
+			var cat string
+			var expDate time.Time
+			if err := expRows.Scan(&orgID, &amt, &cat, &expDate); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.Expenses += amt
+			if !expDate.Before(latestStart) && expDate.Before(latestEnd) {
+				s.ExpenseByCategory[cat] += amt
+			}
+		}
+		expRows.Close()
+	}
+
+	// 4. Debtors / Creditors from contacts.current_balance per org
+	cRows, err := h.db.Query(`
+		SELECT organization_id,
+		       COALESCE(SUM(CASE WHEN current_balance > 0 THEN current_balance ELSE 0 END), 0) AS debtors,
+		       COALESCE(SUM(CASE WHEN current_balance < 0 THEN -current_balance ELSE 0 END), 0) AS creditors
+		FROM contacts
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
+		GROUP BY organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for cRows.Next() {
+			var orgID uuid.UUID
+			var deb, cred float64
+			if err := cRows.Scan(&orgID, &deb, &cred); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.Debtors = deb
+			s.Creditors = cred
+		}
+		cRows.Close()
+	}
+
+	// 5. Inventory — stock units + stock value + low-stock count via warehouse.organization_id
+	invRows, err := h.db.Query(`
+		SELECT w.organization_id,
+		       COALESCE(SUM(i.quantity_on_hand), 0) AS qty,
+		       COALESCE(SUM(i.quantity_on_hand * COALESCE(p.cost_price, i.unit_cost, 0)), 0) AS value,
+		       COUNT(DISTINCT p.id) FILTER (
+		         WHERE COALESCE(p.min_stock_level, 0) > 0
+		           AND i.quantity_on_hand <= COALESCE(p.min_stock_level, 0)
+		       ) AS low_stock
+		FROM inventory i
+		JOIN warehouses w ON w.id = i.warehouse_id
+		LEFT JOIN products p ON p.id = i.product_id
+		WHERE i.tenant_id = $1 AND w.organization_id IS NOT NULL
+		GROUP BY w.organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for invRows.Next() {
+			var orgID uuid.UUID
+			var qty, val float64
+			var low int
+			if err := invRows.Scan(&orgID, &qty, &val, &low); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.StockUnits = qty
+			s.StockValue = val
+			s.LowStockCount = low
+		}
+		invRows.Close()
+	}
+
+	// 6. Employees — total + active + salary fund per org (direct org + many-to-many)
+	//    Union the two sources, then aggregate in Go to avoid double-counting.
+	empRows, err := h.db.Query(`
+		SELECT DISTINCT e.id, COALESCE(org_id, e.organization_id) AS org_id,
+		       COALESCE(e.base_salary, 0),
+		       COALESCE(e.termination_date IS NULL, true) AS is_active
+		FROM employees e
+		LEFT JOIN LATERAL (
+		  SELECT eo.organization_id AS org_id
+		  FROM employee_organizations eo
+		  WHERE eo.employee_id = e.id
+		) eo_link ON true
+		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL
+		  AND COALESCE(eo_link.org_id, e.organization_id) IS NOT NULL`,
+		tenantID,
+	)
+	if err == nil {
+		// employee rows may repeat per-org via the lateral join; that's intentional —
+		// each (emp, org) pair contributes once to that org's counters.
+		type empSeen struct {
+			emp string
+			org string
+		}
+		seen := map[empSeen]bool{}
+		for empRows.Next() {
+			var empID, orgID uuid.UUID
+			var salary float64
+			var active bool
+			if err := empRows.Scan(&empID, &orgID, &salary, &active); err != nil {
+				continue
+			}
+			key := empSeen{emp: empID.String(), org: orgID.String()}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.TotalEmployees++
+			if active {
+				s.ActiveEmployees++
+			}
+			s.SalaryFund += salary
+		}
+		empRows.Close()
+	}
+
+	// 7. Top stock products per org (top 8 by value) — for warehouse diagram
+	topRows, err := h.db.Query(`
+		SELECT org_id, name, qty, value FROM (
+			SELECT w.organization_id AS org_id,
+			       COALESCE(p.name, 'N/A') AS name,
+			       COALESCE(SUM(i.quantity_on_hand), 0) AS qty,
+			       COALESCE(SUM(i.quantity_on_hand * COALESCE(p.cost_price, i.unit_cost, 0)), 0) AS value,
+			       ROW_NUMBER() OVER (PARTITION BY w.organization_id ORDER BY COALESCE(SUM(i.quantity_on_hand * COALESCE(p.cost_price, i.unit_cost, 0)), 0) DESC) AS rn
+			FROM inventory i
+			JOIN warehouses w ON w.id = i.warehouse_id
+			LEFT JOIN products p ON p.id = i.product_id
+			WHERE i.tenant_id = $1 AND w.organization_id IS NOT NULL
+			GROUP BY w.organization_id, p.id, p.name
+		) t WHERE rn <= 8`,
+		tenantID,
+	)
+	if err == nil {
+		for topRows.Next() {
+			var orgID uuid.UUID
+			var name string
+			var qty, val float64
+			if err := topRows.Scan(&orgID, &name, &qty, &val); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.TopStockProducts = append(s.TopStockProducts, directorTopStockProduct{Name: name, Qty: qty, Value: val})
+		}
+		topRows.Close()
+	}
+
+	// 8. Construction projects per org (active/in-progress) — for Активные объекты
+	projRows, err := h.db.Query(`
+		SELECT id, organization_id, COALESCE(code, ''), COALESCE(name, ''),
+		       COALESCE(status, ''), COALESCE(progress_percent, 0),
+		       COALESCE(contract_amount, 0)
+		FROM construction_projects
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
+		  AND COALESCE(status, '') NOT IN ('cancelled', 'archived')
+		ORDER BY organization_id, progress_percent DESC, id`,
+		tenantID,
+	)
+	if err == nil {
+		for projRows.Next() {
+			var id int64
+			var orgID uuid.UUID
+			var code, name, status string
+			var progress, amt float64
+			if err := projRows.Scan(&id, &orgID, &code, &name, &status, &progress, &amt); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.ConstructionProjects = append(s.ConstructionProjects, directorConstructionProjct{
+				ID: id, Name: name, Code: code, Status: status,
+				Progress: progress, ContractAmount: amt,
+			})
+		}
+		projRows.Close()
+	}
+
+	// Compute profit and round output
+	companies := make([]directorCompanySummary, 0, len(order))
+	round2 := func(v float64) float64 { return math.Round(v*100) / 100 }
+	for _, id := range order {
+		s := byOrg[id]
+		s.Profit = s.Revenue - s.Expenses
+		s.Revenue = round2(s.Revenue)
+		s.Expenses = round2(s.Expenses)
+		s.Profit = round2(s.Profit)
+		s.Debtors = round2(s.Debtors)
+		s.Creditors = round2(s.Creditors)
+		s.StockValue = round2(s.StockValue)
+		s.SalaryFund = round2(s.SalaryFund)
+		for i, v := range s.MonthlyRevenue {
+			s.MonthlyRevenue[i] = round2(v)
+		}
+		for k, v := range s.ExpenseByCategory {
+			s.ExpenseByCategory[k] = round2(v)
+		}
+		companies = append(companies, *s)
+	}
+
+	// Grand totals
+	var totRev, totExp, totDeb, totCred, totStockVal, totSalary float64
+	var totStockUnits float64
+	var totLow, totEmps, totActive int
+	for _, s := range companies {
+		totRev += s.Revenue
+		totExp += s.Expenses
+		totDeb += s.Debtors
+		totCred += s.Creditors
+		totStockVal += s.StockValue
+		totStockUnits += s.StockUnits
+		totLow += s.LowStockCount
+		totEmps += s.TotalEmployees
+		totActive += s.ActiveEmployees
+		totSalary += s.SalaryFund
+	}
+
+	response.Success(c, gin.H{
+		"companies":    companies,
+		"month_labels": labels,
+		"totals": gin.H{
+			"revenue":          round2(totRev),
+			"expenses":         round2(totExp),
+			"profit":           round2(totRev - totExp),
+			"debtors":          round2(totDeb),
+			"creditors":        round2(totCred),
+			"stock_units":      round2(totStockUnits),
+			"stock_value":      round2(totStockVal),
+			"low_stock_count":  totLow,
+			"total_employees":  totEmps,
+			"active_employees": totActive,
+			"salary_fund":      round2(totSalary),
+		},
 	})
 }

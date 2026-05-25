@@ -34,7 +34,8 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	// Build query with filters - join with contacts for customer_name
+	// Build query with filters - join with contacts for customer_name and
+	// sales_orders so we can surface the originating order number.
 	baseQuery := `
 		SELECT si.id, si.tenant_id, si.organization_id, si.invoice_number, si.customer_id, si.sales_order_id,
 			   si.invoice_date, si.due_date, si.billing_address, si.shipping_address,
@@ -44,9 +45,32 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
 			   COALESCE(c.name, si.customer_name, '') as customer_name,
 			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason,
-			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date
+			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date,
+			   COALESCE(so.order_number, '') as order_number,
+			   COALESCE((
+				   SELECT string_agg(DISTINCT j.name, ', ')
+				   FROM payment_allocations pa
+				   JOIN payments p ON pa.payment_id = p.id
+				   JOIN journals j ON p.journal_id = j.id
+				   WHERE pa.document_id = si.id AND pa.document_type = 'sales_invoice' AND p.status = 'confirmed'
+			   ), '') as payment_journals,
+			   COALESCE((
+				   SELECT string_agg(DISTINCT COALESCE(j.name_uz, j.name), ', ')
+				   FROM payment_allocations pa
+				   JOIN payments p ON pa.payment_id = p.id
+				   JOIN journals j ON p.journal_id = j.id
+				   WHERE pa.document_id = si.id AND pa.document_type = 'sales_invoice' AND p.status = 'confirmed'
+			   ), '') as payment_journals_uz,
+			   COALESCE((
+				   SELECT string_agg(DISTINCT COALESCE(j.name_en, j.name), ', ')
+				   FROM payment_allocations pa
+				   JOIN payments p ON pa.payment_id = p.id
+				   JOIN journals j ON p.journal_id = j.id
+				   WHERE pa.document_id = si.id AND pa.document_type = 'sales_invoice' AND p.status = 'confirmed'
+			   ), '') as payment_journals_en
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
+		LEFT JOIN sales_orders so ON si.sales_order_id = so.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
 	countQuery := `SELECT COUNT(*) FROM sales_invoices si WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
 	args := []interface{}{tenantID}
@@ -165,6 +189,8 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		var paymentTermID sql.NullString
 		var earlyDiscountAmount float64
 		var earlyDiscountDate sql.NullTime
+		var paymentJournals, paymentJournalsUz, paymentJournalsEn string
+		var orderNumber string
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -176,6 +202,8 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			&customerName,
 			&invoiceType, &originalInvoiceID, &reason,
 			&paymentTermID, &earlyDiscountAmount, &earlyDiscountDate,
+			&orderNumber,
+			&paymentJournals, &paymentJournalsUz, &paymentJournalsEn,
 		)
 		if err != nil {
 			continue
@@ -207,9 +235,13 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			"balance":         amountDue, // Add balance as alias for amount_due for frontend compatibility
 			"status":          status,
 			"payment_status":  paymentStatus,
-			"invoice_type":    invoiceType,
-			"created_at":      createdAt,
-			"updated_at":      updatedAt,
+			"invoice_type":      invoiceType,
+			"order_number":      orderNumber,
+			"created_at":        createdAt,
+			"updated_at":        updatedAt,
+			"payment_journals":    paymentJournals,
+			"payment_journals_uz": paymentJournalsUz,
+			"payment_journals_en": paymentJournalsEn,
 		}
 
 		if organizationID.Valid {
@@ -697,7 +729,8 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	// Get payment allocations with payment details
 	paQuery := `
 		SELECT pa.id, pa.payment_id, pa.amount, p.payment_number, p.status, p.payment_date,
-			   COALESCE(p.reference, '') as reference, COALESCE(j.name, '') as journal_name
+			   COALESCE(p.reference, '') as reference, COALESCE(j.name, '') as journal_name,
+			   COALESCE(j.name_uz, '') as journal_name_uz, COALESCE(j.name_en, '') as journal_name_en
 		FROM payment_allocations pa
 		JOIN payments p ON p.id = pa.payment_id
 		LEFT JOIN journals j ON p.journal_id = j.id
@@ -713,21 +746,23 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		for paRows.Next() {
 			var paID, paymentID uuid.UUID
 			var paAmount float64
-			var paymentNumber, pStatus, pReference, journalName string
+			var paymentNumber, pStatus, pReference, journalName, journalNameUz, journalNameEn string
 			var paymentDate time.Time
 
-			if err := paRows.Scan(&paID, &paymentID, &paAmount, &paymentNumber, &pStatus, &paymentDate, &pReference, &journalName); err != nil {
+			if err := paRows.Scan(&paID, &paymentID, &paAmount, &paymentNumber, &pStatus, &paymentDate, &pReference, &journalName, &journalNameUz, &journalNameEn); err != nil {
 				continue
 			}
 			paymentAllocations = append(paymentAllocations, map[string]interface{}{
-				"id":             paID.String(),
-				"payment_id":     paymentID.String(),
-				"amount":         paAmount,
-				"payment_number": paymentNumber,
-				"status":         pStatus,
-				"payment_date":   paymentDate.Format("2006-01-02"),
-				"reference":      pReference,
-				"journal_name":   journalName,
+				"id":              paID.String(),
+				"payment_id":      paymentID.String(),
+				"amount":          paAmount,
+				"payment_number":  paymentNumber,
+				"status":          pStatus,
+				"payment_date":    paymentDate.Format("2006-01-02"),
+				"reference":       pReference,
+				"journal_name":    journalName,
+				"journal_name_uz": journalNameUz,
+				"journal_name_en": journalNameEn,
 			})
 		}
 		invoice["payment_allocations"] = paymentAllocations
@@ -1026,15 +1061,15 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	arAccountID := getContactDefaultAccount(tx, customerID, "receivable")
 	// 2. Fallback to standard findAccount
 	if arAccountID == uuid.Nil {
-		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 	}
 	if arAccountID == uuid.Nil {
 		h.log.Error("AR account not found", "tenant_id", tenantID)
-		response.InternalError(c, "Accounts Receivable account (1100) not found. Please configure chart of accounts.")
+		response.InternalError(c, "Accounts Receivable account (4010) not found. Please configure chart of accounts.")
 		return
 	}
 
-	taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+	taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 	// Get invoice lines for per-category accounting
 	type invoiceLineAcct struct {
@@ -1085,7 +1120,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	cogsGrouped := make(map[cogsPair]float64)
 
 	// Resolve fallback revenue account for products without category income account
-	fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
+	fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
 
 	// Check if a delivery stock operation already posted COGS for this sales order
 	// to avoid double-counting COGS (once from stock operation, once from invoice)
@@ -1469,18 +1504,18 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	// Get default account IDs — lookup by name first, then code fallback
-	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
+	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 	// Post directly to Cash/Bank based on payment method
 	var cashAccountID uuid.UUID
 	if input.PaymentMethod == "cash" {
-		cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
+		cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
 		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
+			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
 		}
 	} else {
-		cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "1010")
+		cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
 		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "1000")
+			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
 		}
 	}
 
@@ -1549,9 +1584,9 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		lineNumber := 3
 		// Line 3: Write-off (DR Write-off Expense, already credited AR above)
 		if glErr == nil && input.WriteOffAmount > 0 {
-			writeOffAccountID := findAccount(tx, tenantID, organizationID, "payment difference write-off", "6950")
+			writeOffAccountID := findAccount(tx, tenantID, organizationID, "payment difference write-off", "9690")
 			if writeOffAccountID == uuid.Nil {
-				writeOffAccountID = findAccount(tx, tenantID, organizationID, "miscellaneous expense", "6900")
+				writeOffAccountID = findAccount(tx, tenantID, organizationID, "miscellaneous expense", "9410")
 			}
 			if writeOffAccountID != uuid.Nil {
 				writeOffLineID := uuid.New()
@@ -1572,12 +1607,12 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 
 		// Line for early payment discount (DR Sales Discount)
 		if glErr == nil && earlyDiscountApplied > 0 {
-			discountAccountID := findAccount(tx, tenantID, organizationID, "sales discount", "4900")
+			discountAccountID := findAccount(tx, tenantID, organizationID, "sales discount", "9310")
 			if discountAccountID == uuid.Nil {
-				discountAccountID = findAccount(tx, tenantID, organizationID, "cash discount", "4900")
+				discountAccountID = findAccount(tx, tenantID, organizationID, "cash discount", "9310")
 			}
 			if discountAccountID == uuid.Nil {
-				discountAccountID = findAccount(tx, tenantID, organizationID, "discount", "4900")
+				discountAccountID = findAccount(tx, tenantID, organizationID, "discount", "9310")
 			}
 			if discountAccountID != uuid.Nil {
 				discountLineID := uuid.New()
@@ -1678,11 +1713,14 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		var customerName string
 		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
 		amountStr := fmt.Sprintf("%.0f", input.Amount)
+		// `customer_name` added to data so the web renderer (notificationCatalog.js)
+		// can rebuild the body in the current UI language. Additive — mobile-safe.
 		h.createTranslatedNotification(tenantID, userID, "payment_recorded",
 			map[string]interface{}{
 				"invoice_id":     invoiceID.String(),
 				"invoice_number": invoiceNumber,
 				"customer_id":    customerID.String(),
+				"customer_name":  customerName,
 				"amount":         input.Amount,
 			},
 			amountStr, invoiceNumber, customerName,
@@ -1852,12 +1890,14 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 		var customerName string
 		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
 		amountStr := fmt.Sprintf("%.0f", cnTotalAmount)
+		// customer_name added for web re-render; additive and mobile-safe.
 		h.createTranslatedNotification(tenantID, userID, "credit_note_created",
 			map[string]interface{}{
 				"credit_note_id":     creditNoteID.String(),
 				"credit_note_number": cnNumber,
 				"invoice_number":     orgInvoiceNumber,
 				"customer_id":        customerID.String(),
+				"customer_name":      customerName,
 				"amount":             cnTotalAmount,
 			},
 			cnNumber, orgInvoiceNumber, amountStr,
@@ -1941,9 +1981,9 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	).Scan(&salesJournalID, &numberPrefix)
 
 	if err == nil {
-		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "1100")
-		revenueAccountID := findAccount(tx, tenantID, organizationID, "sales revenue", "4000")
-		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
+		revenueAccountID := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 		if arAccountID != uuid.Nil {
 			prefix := ""
@@ -2162,9 +2202,9 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 			orgPtr = &orgID
 		}
 
-		arAccountID := findAccount(h.db, tenantID, orgPtr, "accounts receivable", "1100")
-		taxAccountID := findAccount(h.db, tenantID, orgPtr, "tax", "2100")
-		revenueAccountID := findAccount(h.db, tenantID, orgPtr, "sales revenue", "4000")
+		arAccountID := findAccount(h.db, tenantID, orgPtr, "accounts receivable", "4010")
+		taxAccountID := findAccount(h.db, tenantID, orgPtr, "tax", "6990")
+		revenueAccountID := findAccount(h.db, tenantID, orgPtr, "sales revenue", "9010")
 
 		if arAccountID == uuid.Nil || revenueAccountID == uuid.Nil {
 			continue
@@ -2395,7 +2435,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 				continue
 			}
 
-			revenueAccountID := findAccount(h.db, tenantID, organizationID, "sales revenue", "4000")
+			revenueAccountID := findAccount(h.db, tenantID, organizationID, "sales revenue", "9010")
 			if revenueAccountID == uuid.Nil {
 				continue
 			}

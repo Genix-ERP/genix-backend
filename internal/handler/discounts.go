@@ -3,9 +3,11 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/listparams"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +25,10 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 
 	status := c.Query("status")
 
+	lp := listparams.Parse(c,
+		[]string{"created_at", "code", "name", "discount_value", "valid_from", "valid_until", "status"},
+		"created_at")
+
 	query := `
 		SELECT id, tenant_id, code, name, description, discount_type, discount_value,
 			   min_order_amount, max_discount_amount, usage_limit, usage_per_customer, used_count,
@@ -30,6 +36,7 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 			   new_customers_only, valid_from, valid_until, status, created_at, updated_at
 		FROM discounts
 		WHERE tenant_id = $1 AND deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM discounts WHERE tenant_id = $1 AND deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -38,16 +45,31 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
 		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	if status != "" {
 		argCount++
 		query += fmt.Sprintf(" AND status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND status = $%d", argCount)
 		args = append(args, status)
 	}
 
-	query += " ORDER BY created_at DESC"
+	// Search
+	if lp.Search != "" {
+		argCount++
+		pattern := "%" + strings.ToLower(lp.Search) + "%"
+		query += fmt.Sprintf(" AND (LOWER(code) LIKE $%d OR LOWER(name) LIKE $%d)", argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(code) LIKE $%d OR LOWER(name) LIKE $%d)", argCount, argCount)
+		args = append(args, pattern)
+	}
+
+	var total int
+	h.db.QueryRow(countQuery, args...).Scan(&total)
+
+	query += lp.OrderClause("") + fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	args = append(args, lp.PageSize, lp.Offset())
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -138,7 +160,7 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 		discounts = []map[string]interface{}{}
 	}
 
-	response.Success(c, discounts)
+	response.Paginated(c, discounts, lp.Page, lp.PageSize, total)
 }
 
 // GetDiscount returns a single discount by ID

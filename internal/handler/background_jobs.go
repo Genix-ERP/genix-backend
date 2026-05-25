@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -51,7 +52,24 @@ func StartBackgroundJobs(db *database.DB, log logger.Logger) {
 		}
 	}()
 
-	log.Info("Background jobs started (step timeout checker every 15 min, reconciliation reminders every 1 hour, auto depreciation hourly)")
+	// CRM activity reminders — every minute, fires notifications when
+	// an activity's reminder_datetime has passed and reminder_sent is
+	// still false. 1-minute granularity is plenty for "remind me to
+	// call this lead at 3pm" UX without hammering the DB.
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		// First run after 20s so the server is warm.
+		time.Sleep(20 * time.Second)
+		checkActivityReminders(db, log)
+
+		for range ticker.C {
+			checkActivityReminders(db, log)
+		}
+	}()
+
+	log.Info("Background jobs started (step timeout checker every 15 min, reconciliation reminders every 1 hour, auto depreciation hourly, activity reminders every 1 min)")
 }
 
 // checkStepTimeouts finds step logs that have exceeded their max_duration_hours
@@ -191,13 +209,21 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 				continue
 			}
 			if createdBy != nil {
+				// `partner_name` + `days` packed into data so the web renderer
+				// can rebuild body in the current UI language. Additive —
+				// mobile reads title/message unchanged.
+				notifData, _ := json.Marshal(map[string]interface{}{
+					"reconciliation_id": actID.String(),
+					"partner_name":      partnerName,
+					"days":              3,
+				})
 				db.Exec(`
 					INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 					VALUES ($1, $2, $3, 'reconciliation_reminder', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
 				`, uuid.New(), tenantID, *createdBy,
 					"Akt sverka javobsiz",
 					partnerName+" hali akt sverkaga javob bermadi (3 kun)",
-					`{"reconciliation_id":"`+actID.String()+`"}`, now)
+					string(notifData), now)
 			}
 			db.Exec("UPDATE reconciliation_acts SET reminder_3d_sent = true WHERE id = $1", actID)
 			count++
@@ -228,6 +254,13 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 				continue
 			}
 
+			// partner_name + days packed into data for web re-render. Additive.
+			notifData7d, _ := json.Marshal(map[string]interface{}{
+				"reconciliation_id": actID.String(),
+				"partner_name":      partnerName,
+				"days":              7,
+			})
+
 			// Notify creator
 			if createdBy != nil {
 				db.Exec(`
@@ -236,7 +269,7 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 				`, uuid.New(), tenantID, *createdBy,
 					"Akt sverka javobsiz — eslatma yuboring",
 					partnerName+" 7 kun davomida akt sverkaga javob bermadi",
-					`{"reconciliation_id":"`+actID.String()+`"}`, now)
+					string(notifData7d), now)
 			}
 
 			// Notify admins
@@ -254,7 +287,7 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 						`, uuid.New(), tenantID, adminID,
 							"Akt sverka javobsiz — eslatma yuboring",
 							partnerName+" 7 kun davomida akt sverkaga javob bermadi",
-							`{"reconciliation_id":"`+actID.String()+`"}`, now)
+							string(notifData7d), now)
 					}
 				}
 				adminRows.Close()
@@ -298,13 +331,20 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 				priority = "high"
 			}
 
+			// partner_name + response packed in data; additive.
+			respData, _ := json.Marshal(map[string]interface{}{
+				"reconciliation_id": actID.String(),
+				"partner_name":      partnerName,
+				"response":          respStatus,
+			})
+
 			if createdBy != nil {
 				db.Exec(`
 					INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 					VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', $8, $9)
 				`, uuid.New(), tenantID, *createdBy,
 					"reconciliation_response", title, message,
-					`{"reconciliation_id":"`+actID.String()+`","response":"`+respStatus+`"}`, priority, now)
+					string(respData), priority, now)
 			}
 
 			// If disputed, also notify admins
@@ -322,7 +362,7 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 								VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', 'high', $8)
 							`, uuid.New(), tenantID, adminID,
 								"reconciliation_response", title, message,
-								`{"reconciliation_id":"`+actID.String()+`","response":"`+respStatus+`"}`, now)
+								string(respData), now)
 						}
 					}
 					adminRows.Close()
@@ -373,8 +413,8 @@ func runAutoDepreciation(db *database.DB, log logger.Logger) {
 		}
 
 		// Look up accounts for this tenant
-		deprExpenseAcct := findAccountBg(db, tenantID, "depreciation expense", "6500")
-		accumDeprAcct := findAccountBg(db, tenantID, "accumulated depreciation", "1510")
+		deprExpenseAcct := findAccountBg(db, tenantID, "depreciation expense", "9470")
+		accumDeprAcct := findAccountBg(db, tenantID, "accumulated depreciation", "0200")
 		var journalID uuid.UUID
 		var nextNumber int
 		_ = db.QueryRow(`
@@ -521,4 +561,178 @@ func findAccountBg(db *database.DB, tenantID uuid.UUID, nameLike, codeFallback s
 		return uuid.Nil
 	}
 	return id
+}
+
+// checkActivityReminders scans the `activities` table for any planned
+// activity whose reminder_datetime has passed and whose reminder_sent
+// flag is still false, then inserts an in-app notification for the
+// assigned user (falling back to the creator) and flips reminder_sent
+// to true so the same activity isn't notified twice.
+//
+// Recipient priority: assigned_to > created_by. If neither is set,
+// the activity is silently skipped — there's no one to notify.
+//
+// Notification metadata (lead_id, activity_id, activity_type) is stored
+// in the JSONB `data` column so the web/mobile clients can deep-link
+// the user back to the lead detail screen on click.
+func checkActivityReminders(db *database.DB, log logger.Logger) {
+	// Diagnostic: count how many rows match BEFORE we process them so
+	// the operator can see whether the worker is finding candidates
+	// even when delivery later fails.
+	var candidateCount int
+	_ = db.QueryRow(`
+		SELECT COUNT(*) FROM activities a
+		WHERE a.reminder_datetime IS NOT NULL
+		  AND a.reminder_datetime <= NOW()
+		  AND COALESCE(a.reminder_sent, false) = false
+		  AND a.status = 'planned'
+		  AND a.deleted_at IS NULL
+	`).Scan(&candidateCount)
+	if candidateCount > 0 {
+		log.Info("CRM activity reminders: candidates found", "count", candidateCount)
+	}
+
+	rows, err := db.Query(`
+		SELECT a.id, a.tenant_id, a.activity_type, a.subject, a.description,
+		       a.lead_id, a.start_datetime, a.reminder_datetime,
+		       a.assigned_to, a.created_by,
+		       l.contact_name, l.company_name
+		FROM activities a
+		LEFT JOIN leads l ON l.id = a.lead_id AND l.tenant_id = a.tenant_id
+		WHERE a.reminder_datetime IS NOT NULL
+		  AND a.reminder_datetime <= NOW()
+		  AND COALESCE(a.reminder_sent, false) = false
+		  AND a.status = 'planned'
+		  AND a.deleted_at IS NULL
+		LIMIT 200
+	`)
+	if err != nil {
+		log.Error("Failed to query due activity reminders", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	now := time.Now()
+	count := 0
+	skippedNoRecipient := 0
+
+	for rows.Next() {
+		var (
+			activityID, tenantID            uuid.UUID
+			activityType, subject           string
+			description                     *string
+			leadID                          *uuid.UUID
+			startDatetime, reminderDatetime *time.Time
+			assignedTo, createdBy           *uuid.UUID
+			contactName, companyName        *string
+		)
+		if err := rows.Scan(&activityID, &tenantID, &activityType, &subject, &description,
+			&leadID, &startDatetime, &reminderDatetime,
+			&assignedTo, &createdBy, &contactName, &companyName); err != nil {
+			log.Error("Failed to scan activity reminder row", "error", err)
+			continue
+		}
+
+		// Pick recipient — assigned user wins; fall back to creator.
+		var recipientID *uuid.UUID
+		if assignedTo != nil && *assignedTo != uuid.Nil {
+			recipientID = assignedTo
+		} else if createdBy != nil && *createdBy != uuid.Nil {
+			recipientID = createdBy
+		}
+
+		// Mark as sent regardless of whether we have a recipient, so
+		// orphan activities don't get re-scanned forever.
+		if recipientID == nil {
+			log.Warn("CRM activity reminder skipped — no recipient", "activity_id", activityID.String())
+			skippedNoRecipient++
+			db.Exec(`UPDATE activities SET reminder_sent = true, updated_at = $2 WHERE id = $1`, activityID, now)
+			continue
+		}
+
+		// Build a friendly title + message.
+		title := subject
+		if title == "" {
+			switch activityType {
+			case "call":
+				title = "Reminder: Call"
+			case "meeting":
+				title = "Reminder: Meeting"
+			case "email":
+				title = "Reminder: Email"
+			default:
+				title = "Reminder: Follow-up"
+			}
+		}
+
+		// Build the contact label for the message body.
+		who := ""
+		if contactName != nil && *contactName != "" {
+			who = *contactName
+		}
+		if companyName != nil && *companyName != "" {
+			if who != "" {
+				who = who + " (" + *companyName + ")"
+			} else {
+				who = *companyName
+			}
+		}
+
+		message := ""
+		if who != "" {
+			message = "Lead: " + who
+		}
+		if description != nil && *description != "" {
+			if message != "" {
+				message = message + " — " + *description
+			} else {
+				message = *description
+			}
+		}
+
+		// Pack metadata into the JSONB data so the web client can:
+		//   1. Re-render title/message in whatever language the user
+		//      has selected right now (mobile uses the frozen
+		//      `title`/`message` strings instead).
+		//   2. Deep-link to the lead detail screen on click.
+		dataMap := map[string]interface{}{
+			"activity_id":   activityID.String(),
+			"activity_type": activityType,
+			"lead_name":     who, // already combined contact + company
+		}
+		if leadID != nil {
+			dataMap["lead_id"] = leadID.String()
+		}
+		if startDatetime != nil {
+			dataMap["start_datetime"] = startDatetime.Format(time.RFC3339)
+		}
+		if description != nil && *description != "" {
+			dataMap["description"] = *description
+		}
+		dataJSON, _ := json.Marshal(dataMap)
+
+		_, err := db.Exec(`
+			INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
+			VALUES ($1, $2, $3, 'crm_activity_reminder', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
+		`, uuid.New(), tenantID, *recipientID, title, message, string(dataJSON), now)
+		if err != nil {
+			log.Error("Failed to insert activity reminder notification", "error", err, "activity_id", activityID.String())
+			continue
+		}
+
+		// Flip the flag so we don't re-notify on the next tick.
+		_, err = db.Exec(`UPDATE activities SET reminder_sent = true, updated_at = $2 WHERE id = $1`, activityID, now)
+		if err != nil {
+			log.Error("Failed to mark activity reminder_sent", "error", err, "activity_id", activityID.String())
+			continue
+		}
+
+		count++
+	}
+
+	if count > 0 || skippedNoRecipient > 0 {
+		log.Info("CRM activity reminders processed",
+			"sent", count,
+			"skipped_no_recipient", skippedNoRecipient)
+	}
 }
