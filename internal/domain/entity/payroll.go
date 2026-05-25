@@ -37,6 +37,8 @@ type PayrollEntry struct {
 	PayrollPeriodID uuid.UUID `json:"payroll_period_id" db:"payroll_period_id"`
 	EmployeeID      uuid.UUID `json:"employee_id" db:"employee_id"`
 	EmployeeName    string    `json:"employee_name" db:"employee_name"`
+	// TT §2.1 immutability: job title snapshot at entry-creation time
+	PositionSnapshot string `json:"position_snapshot" db:"position_snapshot"`
 	BaseSalary      float64   `json:"base_salary" db:"base_salary"`
 	OvertimeHours   float64   `json:"overtime_hours" db:"overtime_hours"`
 	OvertimeAmount  float64   `json:"overtime_amount" db:"overtime_amount"`
@@ -49,12 +51,46 @@ type PayrollEntry struct {
 	OtherDeductions float64   `json:"other_deductions" db:"other_deductions"`
 	TotalDeductions float64   `json:"total_deductions" db:"total_deductions"`
 	NetSalary       float64   `json:"net_salary" db:"net_salary"`
+	// TT §2.3.2 / §2.4: simple advance + remainder model with day-of-month tracking.
+	// Coexists with the richer gross/tax/net fields above.
+	AdvanceAmount      float64 `json:"advance_amount" db:"advance_amount"`
+	RemainderAmount    float64 `json:"remainder_amount" db:"remainder_amount"`
+	AdvancePaid        bool    `json:"advance_paid" db:"advance_paid"`
+	AdvancePaidDay     *int    `json:"advance_paid_day,omitempty" db:"advance_paid_day"`
+	RemainderPaid      bool    `json:"remainder_paid" db:"remainder_paid"`
+	RemainderPaidDay   *int    `json:"remainder_paid_day,omitempty" db:"remainder_paid_day"`
+	AdvancePercentUsed float64 `json:"advance_percent_used" db:"advance_percent_used"`
 	PaymentMethod   string    `json:"payment_method" db:"payment_method"`
 	BankAccount     *string   `json:"bank_account,omitempty" db:"bank_account"`
 	Status          string    `json:"status" db:"status"`
 	Notes           *string   `json:"notes,omitempty" db:"notes"`
 	CreatedAt       time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// PayrollSettings — TT §2.2 global payroll configuration.
+type PayrollSettings struct {
+	TenantID       uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	AdvancePercent float64   `json:"advance_percent" db:"advance_percent"`
+	Currency       string    `json:"currency" db:"currency"`
+	CompanyName    string    `json:"company_name" db:"company_name"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
+}
+
+// UpdatePayrollSettingsInput — API input for PUT /payroll/settings.
+type UpdatePayrollSettingsInput struct {
+	AdvancePercent *float64 `json:"advance_percent" binding:"omitempty,gte=0,lte=100"`
+	Currency       *string  `json:"currency"`
+	CompanyName    *string  `json:"company_name"`
+}
+
+// MarkPaidInput — API input for mark-advance-paid / mark-remainder-paid.
+// If Day is nil the server uses the current day-of-month (clamped to the
+// period's month length). If Paid is false the Day is cleared.
+type MarkPaidInput struct {
+	Paid bool `json:"paid"`
+	Day  *int `json:"day"` // 1..31, optional
 }
 
 // CreatePayrollPeriodInput represents input for creating a payroll period
@@ -91,9 +127,19 @@ type CreatePayrollEntryInput struct {
 	Pension          float64 `json:"pension"`
 	OtherDeductions  float64 `json:"other_deductions"`
 	DeductionPercent float64 `json:"deduction_percent"`
-	PaymentMethod    string  `json:"payment_method"`
-	BankAccount      string  `json:"bank_account,omitempty"`
-	Notes            string  `json:"notes,omitempty"`
+	// Optional per-entry override; when 0 or absent the server uses
+	// payroll_settings.advance_percent (TT §2.2).
+	AdvancePercent float64 `json:"advance_percent"`
+	PaymentMethod  string  `json:"payment_method"`
+	BankAccount    string  `json:"bank_account,omitempty"`
+	Notes          string  `json:"notes,omitempty"`
+
+	// Employee-tax system (migration 330). When the tenant has active employee_taxes
+	// configured, these drive income_tax / social_security / pension. Fields above
+	// that are labelled as individual taxes are ignored in that mode.
+	// ExcludedTaxIDs allows the user to opt out of specific configured taxes per entry
+	// (clicking the X next to a tax in the create-payroll modal).
+	ExcludedTaxIDs []uuid.UUID `json:"excluded_tax_ids,omitempty"`
 }
 
 // UpdatePayrollEntryInput represents input for updating a payroll entry
@@ -111,24 +157,31 @@ type UpdatePayrollEntryInput struct {
 	BankAccount     *string  `json:"bank_account,omitempty"`
 	Status          *string  `json:"status,omitempty"`
 	Notes           *string  `json:"notes,omitempty"`
+
+	// Opt-out list — same semantics as CreatePayrollEntryInput.ExcludedTaxIDs.
+	// When nil, the existing tax selection for this entry is preserved.
+	// When set (even to an empty slice), the existing payroll_entry_taxes rows are
+	// rebuilt from the active catalog minus the IDs in this list.
+	ExcludedTaxIDs *[]uuid.UUID `json:"excluded_tax_ids,omitempty"`
 }
 
 // PayrollPeriodResponse represents the API response for a payroll period
 type PayrollPeriodResponse struct {
-	ID              uuid.UUID `json:"id"`
-	PeriodCode      string    `json:"period_code"`
-	PeriodName      string    `json:"period_name"`
-	EmployeeName    string    `json:"employee_name,omitempty"` // Populated when there's only one employee
-	StartDate       string    `json:"start_date"`
-	EndDate         string    `json:"end_date"`
-	PayDate         string    `json:"pay_date"`
-	Status          string    `json:"status"`
-	TotalGross      float64   `json:"total_gross"`
-	TotalDeductions float64   `json:"total_deductions"`
-	TotalNet        float64   `json:"total_net"`
-	EmployeeCount   int       `json:"employee_count"`
-	Notes           string    `json:"notes,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID              uuid.UUID  `json:"id"`
+	PeriodCode      string     `json:"period_code"`
+	PeriodName      string     `json:"period_name"`
+	EmployeeID      *uuid.UUID `json:"employee_id,omitempty"`   // Populated when there's only one employee
+	EmployeeName    string     `json:"employee_name,omitempty"` // Populated when there's only one employee
+	StartDate       string     `json:"start_date"`
+	EndDate         string     `json:"end_date"`
+	PayDate         string     `json:"pay_date"`
+	Status          string     `json:"status"`
+	TotalGross      float64    `json:"total_gross"`
+	TotalDeductions float64    `json:"total_deductions"`
+	TotalNet        float64    `json:"total_net"`
+	EmployeeCount   int        `json:"employee_count"`
+	Notes           string     `json:"notes,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
 // ToResponse converts PayrollPeriod to PayrollPeriodResponse
@@ -155,51 +208,68 @@ func (p *PayrollPeriod) ToResponse() *PayrollPeriodResponse {
 
 // PayrollEntryResponse represents the API response for a payroll entry
 type PayrollEntryResponse struct {
-	ID              uuid.UUID `json:"id"`
-	PayrollPeriodID uuid.UUID `json:"payroll_period_id"`
-	EmployeeID      uuid.UUID `json:"employee_id"`
-	EmployeeName    string    `json:"employee_name"`
-	BaseSalary      float64   `json:"base_salary"`
-	OvertimeHours   float64   `json:"overtime_hours"`
-	OvertimeAmount  float64   `json:"overtime_amount"`
-	Bonus           float64   `json:"bonus"`
-	Allowances      float64   `json:"allowances"`
-	GrossSalary     float64   `json:"gross_salary"`
-	IncomeTax       float64   `json:"income_tax"`
-	SocialSecurity  float64   `json:"social_security"`
-	Pension         float64   `json:"pension"`
-	OtherDeductions float64   `json:"other_deductions"`
-	TotalDeductions float64   `json:"total_deductions"`
-	NetSalary       float64   `json:"net_salary"`
-	PaymentMethod   string    `json:"payment_method"`
-	BankAccount     string    `json:"bank_account,omitempty"`
-	Status          string    `json:"status"`
-	Notes           string    `json:"notes,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID               uuid.UUID `json:"id"`
+	PayrollPeriodID  uuid.UUID `json:"payroll_period_id"`
+	EmployeeID       uuid.UUID `json:"employee_id"`
+	EmployeeName     string    `json:"employee_name"`
+	PositionSnapshot string    `json:"position_snapshot"`
+	BaseSalary       float64   `json:"base_salary"`
+	OvertimeHours    float64   `json:"overtime_hours"`
+	OvertimeAmount   float64   `json:"overtime_amount"`
+	Bonus            float64   `json:"bonus"`
+	Allowances       float64   `json:"allowances"`
+	GrossSalary      float64   `json:"gross_salary"`
+	IncomeTax        float64   `json:"income_tax"`
+	SocialSecurity   float64   `json:"social_security"`
+	Pension          float64   `json:"pension"`
+	OtherDeductions  float64   `json:"other_deductions"`
+	TotalDeductions  float64   `json:"total_deductions"`
+	NetSalary        float64   `json:"net_salary"`
+	// TT advance/remainder + day-of-month tracking
+	AdvanceAmount      float64 `json:"advance_amount"`
+	RemainderAmount    float64 `json:"remainder_amount"`
+	AdvancePaid        bool    `json:"advance_paid"`
+	AdvancePaidDay     *int    `json:"advance_paid_day,omitempty"`
+	RemainderPaid      bool    `json:"remainder_paid"`
+	RemainderPaidDay   *int    `json:"remainder_paid_day,omitempty"`
+	AdvancePercentUsed float64 `json:"advance_percent_used"`
+	PaymentMethod    string    `json:"payment_method"`
+	BankAccount      string    `json:"bank_account,omitempty"`
+	Status           string    `json:"status"`
+	Notes            string    `json:"notes,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // ToResponse converts PayrollEntry to PayrollEntryResponse
 func (e *PayrollEntry) ToResponse() *PayrollEntryResponse {
 	resp := &PayrollEntryResponse{
-		ID:              e.ID,
-		PayrollPeriodID: e.PayrollPeriodID,
-		EmployeeID:      e.EmployeeID,
-		EmployeeName:    e.EmployeeName,
-		BaseSalary:      e.BaseSalary,
-		OvertimeHours:   e.OvertimeHours,
-		OvertimeAmount:  e.OvertimeAmount,
-		Bonus:           e.Bonus,
-		Allowances:      e.Allowances,
-		GrossSalary:     e.GrossSalary,
-		IncomeTax:       e.IncomeTax,
-		SocialSecurity:  e.SocialSecurity,
-		Pension:         e.Pension,
-		OtherDeductions: e.OtherDeductions,
-		TotalDeductions: e.TotalDeductions,
-		NetSalary:       e.NetSalary,
-		PaymentMethod:   e.PaymentMethod,
-		Status:          e.Status,
-		CreatedAt:       e.CreatedAt,
+		ID:                 e.ID,
+		PayrollPeriodID:    e.PayrollPeriodID,
+		EmployeeID:         e.EmployeeID,
+		EmployeeName:       e.EmployeeName,
+		PositionSnapshot:   e.PositionSnapshot,
+		BaseSalary:         e.BaseSalary,
+		OvertimeHours:      e.OvertimeHours,
+		OvertimeAmount:     e.OvertimeAmount,
+		Bonus:              e.Bonus,
+		Allowances:         e.Allowances,
+		GrossSalary:        e.GrossSalary,
+		IncomeTax:          e.IncomeTax,
+		SocialSecurity:     e.SocialSecurity,
+		Pension:            e.Pension,
+		OtherDeductions:    e.OtherDeductions,
+		TotalDeductions:    e.TotalDeductions,
+		NetSalary:          e.NetSalary,
+		AdvanceAmount:      e.AdvanceAmount,
+		RemainderAmount:    e.RemainderAmount,
+		AdvancePaid:        e.AdvancePaid,
+		AdvancePaidDay:     e.AdvancePaidDay,
+		RemainderPaid:      e.RemainderPaid,
+		RemainderPaidDay:   e.RemainderPaidDay,
+		AdvancePercentUsed: e.AdvancePercentUsed,
+		PaymentMethod:      e.PaymentMethod,
+		Status:             e.Status,
+		CreatedAt:          e.CreatedAt,
 	}
 	if e.BankAccount != nil {
 		resp.BankAccount = *e.BankAccount

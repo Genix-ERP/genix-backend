@@ -3,10 +3,12 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/listparams"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 
 	"github.com/gin-gonic/gin"
@@ -24,12 +26,18 @@ func (h *Handler) ListQuotations(c *gin.Context) {
 	status := c.Query("status")
 	customerID := c.Query("customer_id")
 
+	// Common list params: page, page_size, sort, order, search
+	lp := listparams.Parse(c,
+		[]string{"created_at", "quotation_number", "customer_name", "total_amount", "valid_until", "status"},
+		"created_at")
+
 	query := `
 		SELECT id, tenant_id, quotation_number, customer_id, customer_name, contact_person, email,
 			   valid_until, subtotal, discount_percent, discount_amount, tax_percent, tax_amount,
 			   total_amount, status, converted_to_order, sales_order_id, notes, created_at, updated_at
 		FROM sales_quotations
 		WHERE tenant_id = $1 AND deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM sales_quotations WHERE tenant_id = $1 AND deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -38,22 +46,40 @@ func (h *Handler) ListQuotations(c *gin.Context) {
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
 		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	if status != "" {
 		argCount++
 		query += fmt.Sprintf(" AND status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND status = $%d", argCount)
 		args = append(args, status)
 	}
 
 	if customerID != "" {
 		argCount++
 		query += fmt.Sprintf(" AND customer_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND customer_id = $%d", argCount)
 		args = append(args, customerID)
 	}
 
-	query += " ORDER BY created_at DESC"
+	// Search by quotation_number, customer_name
+	if lp.Search != "" {
+		argCount++
+		pattern := "%" + strings.ToLower(lp.Search) + "%"
+		query += fmt.Sprintf(" AND (LOWER(quotation_number) LIKE $%d OR LOWER(customer_name) LIKE $%d)", argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(quotation_number) LIKE $%d OR LOWER(customer_name) LIKE $%d)", argCount, argCount)
+		args = append(args, pattern)
+	}
+
+	var total int
+	if err := h.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
+		h.log.Error("Failed to count quotations", "error", err)
+	}
+
+	query += lp.OrderClause("") + fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	args = append(args, lp.PageSize, lp.Offset())
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -110,7 +136,7 @@ func (h *Handler) ListQuotations(c *gin.Context) {
 		quotations = []*entity.QuotationResponse{}
 	}
 
-	response.Success(c, quotations)
+	response.Paginated(c, quotations, lp.Page, lp.PageSize, total)
 }
 
 // GetQuotation returns a single quotation by ID

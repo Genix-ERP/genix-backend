@@ -936,8 +936,18 @@ func (h *Handler) ListPipelineStages(c *gin.Context) {
 		WHERE tenant_id = $1 AND COALESCE(pipeline_type, 'opportunity') = $2
 	`
 
-	// Pipeline stages are tenant-wide — no organization filter
-	_ = argCount
+	// Per-org scope with NULL-row allowance for legacy stages.
+	// Create now stamps the active org (with primary-org fallback),
+	// so new stages always carry a concrete organization_id. But
+	// pre-existing rows with organization_id = NULL — created
+	// before scoping was added — stay visible to every org viewer
+	// so we don't disappear a tenant's existing pipeline overnight.
+	orgID, orgOk := middleware.GetOrganizationID(c)
+	if orgOk && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
+		args = append(args, orgID)
+	}
 	query += " ORDER BY sequence ASC"
 
 	rows, err := h.db.Query(query, args...)
@@ -995,20 +1005,44 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		pipelineType = "opportunity"
 	}
 
-	// Pipeline stages are tenant-wide — organization_id is always NULL
+	// Pipeline stages are per-organization. Stamp the active company
+	// id from X-Organization-ID so each company keeps its own
+	// pipeline. When the request didn't carry an active-org header
+	// (admin without a switched company), fall back to the creator's
+	// primary org via employees → employee_organizations — never
+	// store NULL, otherwise teammates can't see the stage.
+	userID, _ := middleware.GetUserID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		o := orgID
+		orgIDPtr = &o
+	} else if userID != uuid.Nil {
+		var fallbackOrg uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT eo.organization_id
+			FROM employee_organizations eo
+			JOIN employees e ON e.id = eo.employee_id
+			WHERE e.user_id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
+			ORDER BY eo.is_primary DESC, eo.created_at ASC
+			LIMIT 1
+		`, userID, tenantID).Scan(&fallbackOrg); err == nil && fallbackOrg != uuid.Nil {
+			orgIDPtr = &fallbackOrg
+		}
+	}
+
 	query := `
 		INSERT INTO pipeline_stages (
 			id, tenant_id, name, code, sequence, probability,
 			is_won, is_lost, color, is_active, pipeline_type, organization_id,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, NULL, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12, $13)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
 		id, tenantID, input.Name, input.Code, input.Sequence,
 		input.Probability, input.IsWon, input.IsLost, color,
-		pipelineType, now, now,
+		pipelineType, orgIDPtr, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -1033,7 +1067,7 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		Color:          color,
 		IsActive:       true,
 		PipelineType:   pipelineType,
-		OrganizationID: nil,
+		OrganizationID: orgIDPtr,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -1123,15 +1157,29 @@ func (h *Handler) UpdatePipelineStage(c *gin.Context) {
 	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
 	args = append(args, time.Now())
 
-	// Add WHERE conditions
+	// Org scope on update with NULL-row allowance for legacy stages.
+	// Without the OR IS NULL branch, pre-existing stages created
+	// before per-org scoping landed would render read-only — admin
+	// could see them via list (which also allows NULL rows) but
+	// every reorder PUT would silently fail because the WHERE
+	// excluded them.
 	argCount++
 	args = append(args, id)
+	idArg := argCount
 	argCount++
 	args = append(args, tenantID)
+	tenantArg := argCount
+
+	whereClause := fmt.Sprintf("id = $%d AND tenant_id = $%d", idArg, tenantArg)
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		args = append(args, orgID)
+		whereClause += fmt.Sprintf(" AND (organization_id = $%d OR organization_id IS NULL)", argCount)
+	}
 
 	query := fmt.Sprintf(
-		"UPDATE pipeline_stages SET %s WHERE id = $%d AND tenant_id = $%d",
-		strings.Join(updates, ", "), argCount-1, argCount,
+		"UPDATE pipeline_stages SET %s WHERE %s",
+		strings.Join(updates, ", "), whereClause,
 	)
 
 	result, err := h.db.Exec(query, args...)
@@ -1177,8 +1225,16 @@ func (h *Handler) DeletePipelineStage(c *gin.Context) {
 	}
 
 	query := `DELETE FROM pipeline_stages WHERE id = $1 AND tenant_id = $2`
+	args := []interface{}{id, tenantID}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		// Same rationale as the update path: allow deleting either
+		// the active org's stages or the legacy NULL-org rows that
+		// every company shared before scoping was added.
+		query += " AND (organization_id = $3 OR organization_id IS NULL)"
+		args = append(args, orgID)
+	}
 
-	result, err := h.db.Exec(query, id, tenantID)
+	result, err := h.db.Exec(query, args...)
 	if err != nil {
 		h.log.Error("Failed to delete pipeline stage", "error", err)
 		response.InternalError(c, "Failed to delete pipeline stage")

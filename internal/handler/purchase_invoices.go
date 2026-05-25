@@ -941,9 +941,9 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 		apAccountID := getContactDefaultAccount(tx, vendorID, "payable")
 		// 2. Fallback to standard findAccount
 		if apAccountID == uuid.Nil {
-			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
+			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
 		}
-		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 		// Get invoice lines for per-category accounting
 		type billLineAcct struct {
@@ -985,11 +985,11 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 
 		// Fallback if no lines found
 		if len(inputGrouped) == 0 && subtotal > 0 {
-			fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "2200")
+			fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "6015")
 			if fallbackInput == uuid.Nil {
-				fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "5000")
+				fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "9110")
 				if fallbackInput == uuid.Nil {
-					fallbackInput = findAccount(tx, tenantID, organizationID, "inventory", "1300")
+					fallbackInput = findAccount(tx, tenantID, organizationID, "inventory", "1010")
 				}
 			}
 			if fallbackInput != uuid.Nil {
@@ -1274,36 +1274,36 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	}
 
 	if err == nil {
-		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "2000")
+		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "6010")
 		if apAcctID == uuid.Nil {
-			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlar", "2000")
+			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlar", "6010")
 		}
 		if apAcctID == uuid.Nil {
-			apAcctID = findAccount(h.db, tenantID, organizationID, "payable", "2000")
+			apAcctID = findAccount(h.db, tenantID, organizationID, "payable", "6010")
 		}
 		if apAcctID == uuid.Nil {
-			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlik", "2000")
+			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlik", "6010")
 		}
 		// Select credit account based on payment method
 		var cashAcctID uuid.UUID
 		switch input.PaymentMethod {
 		case "cash":
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "cash", "1000")
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "cash", "5010")
 			if cashAcctID == uuid.Nil {
-				cashAcctID = findAccount(h.db, tenantID, organizationID, "kassa", "1000")
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "kassa", "5010")
 			}
 		default: // bank, card
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank", "1010")
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank", "5110")
 			if cashAcctID == uuid.Nil {
-				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "1010")
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "5110")
 			}
 			if cashAcctID == uuid.Nil {
-				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank hisobi", "1010")
+				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank hisobi", "5110")
 			}
 		}
 		if cashAcctID == uuid.Nil {
 			// Final fallback
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "outstanding payments", "1160")
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "outstanding payments", "5110")
 		}
 
 		if apAcctID == uuid.Nil {
@@ -1366,9 +1366,9 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 
 				// Write-off line: CR Other Income (vendor owes less = gain for us)
 				if input.WriteOffAmount > 0 {
-					otherIncomeID := findAccount(h.db, tenantID, organizationID, "other income", "4900")
+					otherIncomeID := findAccount(h.db, tenantID, organizationID, "other income", "9310")
 					if otherIncomeID == uuid.Nil {
-						otherIncomeID = findAccount(h.db, tenantID, organizationID, "payment difference write-off", "6950")
+						otherIncomeID = findAccount(h.db, tenantID, organizationID, "payment difference write-off", "9690")
 					}
 					if otherIncomeID != uuid.Nil {
 						writeOffLineID := uuid.New()
@@ -1583,9 +1583,9 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 	).Scan(&purchaseJournalID, &nextNumber, &numberPrefix)
 
 	if err == nil {
-		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "2000")
-		expenseAccountID := findAccount(tx, tenantID, organizationID, "expense", "5000")
-		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "2100")
+		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
+		expenseAccountID := findAccount(tx, tenantID, organizationID, "expense", "9420")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
 
 		if apAccountID != uuid.Nil {
 			prefix := ""

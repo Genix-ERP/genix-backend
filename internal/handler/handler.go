@@ -2,6 +2,7 @@ package handler
 
 import (
 	"github.com/genixerp/genix-backend/internal/config"
+	"github.com/genixerp/genix-backend/internal/crm"
 	"github.com/genixerp/genix-backend/internal/infrastructure/cache"
 	"github.com/genixerp/genix-backend/internal/infrastructure/database"
 	"github.com/genixerp/genix-backend/internal/infrastructure/email"
@@ -26,6 +27,11 @@ type Handler struct {
 	icSync         *service.IntercompanySyncService
 	perm           *middleware.PermissionChecker
 	multicardClient *payment.Client
+	// crmSync pushes construction photo reports into the Yuksalish CRM.
+	// nil-safe at the call sites (see CreatePhotoReport): if env vars
+	// aren't set, syncer is constructed but reports itself as
+	// not-configured and every Enqueue is a no-op.
+	crmSync         *crm.Syncer
 }
 
 // NewHandler creates a new handler instance
@@ -46,8 +52,13 @@ func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, l
 			cfg.Multicard.StoreID,
 			cfg.Multicard.BaseURL,
 		),
+		crmSync: crm.NewSyncer(db.DB, log),
 	}
 }
+
+// CRMSyncer exposes the syncer to main() for starting the background
+// retry worker.
+func (h *Handler) CRMSyncer() *crm.Syncer { return h.crmSync }
 
 // RegisterRoutes registers all API routes
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -177,8 +188,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	rg.GET("/permissions", h.ListPermissions)
 
 	// Organizations
+	// NOTE: GET endpoints are NOT permission-gated. CompanyContext on the
+	// frontend calls `GET /organizations` on app startup; without it
+	// `activeCompany` is null and basically every other page breaks. The
+	// user is already JWT-scoped to their tenant, so they can only ever
+	// see their own tenant's orgs. Mutations remain gated.
 	orgs := rg.Group("/organizations")
-	orgs.Use(h.perm.Require("organization", "organization", "read"))
 	{
 		orgs.GET("", h.ListOrganizations)
 		orgs.POST("", h.perm.Require("organization", "organization", "create"), h.CreateOrganization)
@@ -312,9 +327,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		products.GET("", h.ListProducts)
 		products.POST("", h.perm.Require("inventory", "product", "create"), h.CreateProduct)
+		products.POST("/bulk", h.perm.Require("inventory", "product", "create"), h.BulkCreateProducts)
+		products.GET("/by-search-key", h.FindProductsBySearchKey)
 		products.GET("/:id", h.GetProduct)
 		products.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateProduct)
+		products.POST("/:id/generate-search-key", h.perm.Require("inventory", "product", "update"), h.GenerateProductSearchKey)
 		products.DELETE("/:id", h.perm.Require("inventory", "product", "delete"), h.DeleteProduct)
+		products.GET("/:id/packaging-materials", h.ListProductPackagingMaterials)
+		products.POST("/:id/packaging-materials", h.SaveProductPackagingMaterials)
+		products.DELETE("/:id/packaging-materials/:materialId", h.DeleteProductPackagingMaterial)
 	}
 
 	// Product Categories
@@ -739,6 +760,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		taxReports.POST("/periods/:id/file", h.perm.Require("finance", "tax_report", "file"), h.FileTaxReport)
 		taxReports.DELETE("/periods/:id", h.perm.Require("finance", "tax_report", "delete"), h.DeleteTaxReportPeriod)
 		taxReports.POST("/periods/:id/pay", h.perm.Require("finance", "tax_report", "update"), h.PayTaxPeriod)
+		// Employee-taxes aggregation (migration 330)
+		taxReports.GET("/employee-taxes", h.GetEmployeeTaxReport)
+		// Per-tax XML export for regulator filings (NDFL quarterly, ESP
+		// monthly, INPS monthly — §10 reports #2–4 of the TZ).
+		taxReports.GET("/employee-taxes/xml", h.ExportEmployeeTaxReportXML)
 	}
 
 	// Discounts
@@ -990,9 +1016,21 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// Payment journals (bank/cash only) — no finance permission required, any authenticated user can access
 	rg.GET("/journals/payment", h.ListPaymentJournals)
 
-	// Journals (accounting journals like GEN, SAL, PUR, MISC)
+	// Journals (accounting journals like GEN, SAL, PUR, MISC).
+	//
+	// Read access (GET) is INTENTIONALLY ungated. Sales-invoice and
+	// purchase-bill creation flows fetch this list to populate the
+	// "journal" dropdown — gating reads behind `finance:journal:read`
+	// breaks invoice creation for employees who legitimately have
+	// only sales / purchase permissions but no finance permission.
+	// Journals are reference data (like products, units of measure,
+	// tax rates), not sensitive financial details — so any
+	// authenticated user can list them.
+	//
+	// Mutating operations (POST / PUT / DELETE) remain gated behind
+	// the finance permission — only Buxgalter / Admin can create or
+	// modify the journal *definitions*.
 	journalGroup := rg.Group("/journals")
-	journalGroup.Use(h.perm.Require("finance", "journal", "read"))
 	{
 		journalGroup.GET("", h.ListJournals)
 		journalGroup.POST("", h.perm.Require("finance", "journal", "create"), h.CreateJournal)
@@ -1011,9 +1049,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		paymentMethodsGroup.GET("", h.ListPaymentMethods)
 	}
 
-	// Journal Entries
+	// Journal Entries.
+	//
+	// Read access (GET) is also ungated — same reason as /journals
+	// above. Sales / purchase modules render JE references on invoice
+	// detail screens (e.g. "linked to journal entry JE-20260507-…"),
+	// and the auto-post code paths emit JE rows that the originating
+	// module sometimes needs to read back. Mutations stay gated.
 	journals := rg.Group("/journal-entries")
-	journals.Use(h.perm.Require("finance", "journal", "read"))
 	{
 		journals.GET("", h.ListJournalEntries)
 		journals.POST("", h.perm.Require("finance", "journal", "create"), h.CreateJournalEntry)
@@ -1132,6 +1175,43 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		periods.POST("/auto-create", h.AutoCreatePeriods)
 		periods.POST("/:id/lock", h.LockAccountingPeriod)
 		periods.POST("/:id/unlock", h.UnlockAccountingPeriod)
+	}
+
+	// Period Close Procedure (TT Buxgalteriya §4.3)
+	periodClose := rg.Group("/period-close")
+	{
+		periodClose.POST("/run", h.ClosePeriod)
+		periodClose.GET("", h.ListClosings)
+		periodClose.GET("/:id", h.GetClosing)
+		periodClose.POST("/:id/reopen", h.ReopenPeriod)
+	}
+
+	// Bank Statement Import (TT Buxgalteriya §8.1 Bank-mijoz) — 1C format
+	bankImport := rg.Group("/bank-statement-imports")
+	{
+		bankImport.POST("", h.ImportBankStatement1C)
+		bankImport.GET("", h.ListBankImports)
+	}
+
+	// E-invoice (TT Buxgalteriya §8.2)
+	einvoices := rg.Group("/einvoices")
+	{
+		einvoices.POST("/ingest", h.IngestEInvoice)
+		einvoices.GET("", h.ListEInvoices)
+		einvoices.POST("/:id/approve", h.ApproveEInvoice)
+		einvoices.POST("/:id/reject", h.RejectEInvoice)
+		// Provider adapter calls
+		einvoices.POST("/sync", h.SyncEInvoices)
+		einvoices.POST("/:id/send", h.SendEInvoice)
+	}
+
+	// Webhook subscriptions (TT Buxgalteriya §7.4)
+	hooks := rg.Group("/webhook-subscriptions")
+	{
+		hooks.POST("", h.CreateWebhookSubscription)
+		hooks.GET("", h.ListWebhookSubscriptions)
+		hooks.DELETE("/:id", h.DeleteWebhookSubscription)
+		hooks.GET("/:id/deliveries", h.ListWebhookDeliveries)
 	}
 
 	// Budgets
@@ -1371,17 +1451,32 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	reports := rg.Group("/reports")
+	// sales-summary is accessible to sales users, not just finance
+	reports.GET("/sales-summary", h.perm.Require("sales", "order", "read"), h.GetSalesSummary)
+	// director-summary aggregates cross-org metrics in one call for the Director Dashboard.
+	// No extra permission beyond auth — the dashboard itself is gated by the installable app on the frontend.
+	reports.GET("/director-summary", h.GetDirectorSummary)
 	reports.Use(h.perm.Require("finance", "report", "read"))
 	{
 		reports.GET("/balance-sheet", h.GetBalanceSheet)
 		reports.GET("/income-statement", h.GetIncomeStatement)
 		reports.GET("/cash-flow", h.GetCashFlow)
 		reports.GET("/trial-balance", h.GetTrialBalance)
+		// ASQ per TT Buxgalteriya §6.1 — opening/turnover/closing + Excel export
+		reports.GET("/trial-balance/turnover", h.GetTrialBalanceWithTurnover)
+		reports.GET("/trial-balance/excel", h.ExportTrialBalanceExcel)
 		reports.GET("/general-ledger", h.GetGeneralLedger)
+		// Bosh kitob — monthly breakdown per TT Buxgalteriya §6.2
+		reports.GET("/general-ledger/monthly", h.GetGeneralLedgerMonthly)
 		reports.GET("/aging-receivables", h.GetAgingReceivables)
 		reports.GET("/aging-payables", h.GetAgingPayables)
-		reports.GET("/sales-summary", h.GetSalesSummary)
 		reports.GET("/inventory-summary", h.GetInventoryReport)
+		reports.GET("/account-card", h.GetAccountCard)
+		// BHMS №21 regulated reports (TT §6.4)
+		reports.GET("/forma-1", h.GetForma1)
+		reports.GET("/forma-2", h.GetForma2)
+		reports.GET("/forma-3", h.GetForma3)
+		reports.GET("/formas/excel", h.ExportFormasExcel)
 	}
 
 	// Settings
@@ -1413,6 +1508,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		admin.PUT("/tenants/:id/activate", h.ActivateTenantSubscription)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
 		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
+		// /admin/migrations — read-only view over schema_migrations so a
+		// system admin can verify which DB migrations are applied on the
+		// running backend without needing direct psql access. Intended
+		// for production deploy verification.
+		admin.GET("/migrations", h.GetMigrationStatus)
+
+		// /admin/inventory-reconcile — diagnostic view that lines up the
+		// inventory MODULE total (Ombor "Jami qiymat") against the
+		// inventory GL ACCOUNT balance (Buxgalteriya "Xom ashyo")
+		// per (tenant, organization), with top contributing products.
+		// Use to pinpoint which org / product is driving any gap.
+		// Read-only, system-admin gated by the parent group.
+		admin.GET("/inventory-reconcile", h.GetInventoryReconcile)
 	}
 
 	// Audit Logs
@@ -1556,9 +1664,68 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payrollPeriods.PUT("/:id", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollPeriod)
 		payrollPeriods.DELETE("/:id", h.perm.Require("hr", "payroll", "delete"), h.DeletePayrollPeriod)
 		payrollPeriods.POST("/:id/process", h.perm.Require("hr", "payroll", "approve"), h.ProcessPayroll)
+		// TZ §7.1 / §9.3 "calculate-all" — bulk-create payroll entries
+		// for every active employee in the period. Idempotent: skips
+		// employees who already have an entry.
+		payrollPeriods.POST("/:id/calculate-all", h.perm.Require("hr", "payroll", "create"), h.CalculateAllPayroll)
 		payrollPeriods.GET("/:id/entries", h.ListPayrollEntries)
 		payrollPeriods.POST("/:id/entries", h.perm.Require("hr", "payroll", "create"), h.CreatePayrollEntry)
+		payrollPeriods.PUT("/:id/entries/:eid", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollEntry)
+		payrollPeriods.GET("/:id/entries/:eid/taxes", h.GetPayrollEntryTaxes)
 		payrollPeriods.POST("/:id/entries/:eid/confirm", h.perm.Require("hr", "payroll", "approve"), h.ConfirmSalaryPaymentByEntry)
+		// Vedomost (maosh vedomosti) — aggregated per-period payroll view
+		// with every tax pivoted into its own column. Drives the Excel
+		// export in §7.4 + §10 report #1 of ТЗ_Ish_Haqi_Soliq_Tolik.docx.
+		payrollPeriods.GET("/:id/vedomost", h.GetPayrollVedomost)
+	}
+
+	// ────────────── Employee Taxes (migration 330) ──────────────
+	// Configurable per-tenant catalog of employee taxes. Drives the Settings →
+	// Finance → Employee Taxes UI, the create-payroll modal's tax picker, and
+	// the Tax Reports → Employee Taxes section. Matches the loose auth pattern
+	// of the existing /tax-rates group (auth-only, no extra permission check).
+	employeeTaxes := rg.Group("/employee-taxes")
+	{
+		employeeTaxes.GET("", h.ListEmployeeTaxes)
+		employeeTaxes.POST("", h.CreateEmployeeTax)
+		employeeTaxes.PUT("/:id", h.UpdateEmployeeTax)
+		employeeTaxes.DELETE("/:id", h.DeleteEmployeeTax)
+		employeeTaxes.POST("/preview", h.PreviewPayrollTaxes)
+		// Record a payment against a tax-period liability (migration 360).
+		// Posts a Dr-liability / Cr-cash journal entry and inserts a
+		// row in employee_tax_payments so the Tax Reports → Employee
+		// Taxes tab can subtract it from the accrued total to display
+		// the running pending balance.
+		employeeTaxes.POST("/payments", h.RecordEmployeeTaxPayment)
+	}
+
+	// ────────────── Company Tax Rates (migration 340) ──────────────
+	// Activity-level taxes (NDS / Profit / Turnover / Dividend / …).
+	// Complements /employee-taxes so Settings → Finance can present the
+	// full 8-tax default catalog from TZ §1.2 of ТЗ_Ish_Haqi_Soliq_Tolik.
+	companyTaxRates := rg.Group("/company-tax-rates")
+	{
+		companyTaxRates.GET("", h.ListCompanyTaxRates)
+		companyTaxRates.POST("", h.CreateCompanyTaxRate)
+		companyTaxRates.PUT("/:id", h.UpdateCompanyTaxRate)
+		companyTaxRates.DELETE("/:id", h.DeleteCompanyTaxRate)
+	}
+
+	// ────────────── TT "Ish haqi" (payroll simple model) ──────────────
+	// Settings, auto-create, mark-paid-with-day, and backup export.
+	// Share the same "hr.payroll" permission with the existing payroll flow.
+	payrollTT := rg.Group("/payroll")
+	payrollTT.Use(h.perm.Require("hr", "payroll", "read"))
+	{
+		payrollTT.GET("/settings", h.GetPayrollSettings)
+		payrollTT.PUT("/settings", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollSettings)
+		payrollTT.POST("/periods/current-or-create",
+			h.perm.Require("hr", "payroll", "create"), h.GetOrCreateCurrentMonthPayroll)
+		payrollTT.POST("/entries/:id/advance-paid",
+			h.perm.Require("hr", "payroll", "update"), h.MarkAdvancePaid)
+		payrollTT.POST("/entries/:id/remainder-paid",
+			h.perm.Require("hr", "payroll", "update"), h.MarkRemainderPaid)
+		payrollTT.GET("/export", h.ExportPayrollBackup)
 	}
 
 	// Employee Loans
@@ -1578,10 +1745,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		myPortal.GET("/loan", h.GetMyLoan)
 	}
 
-	// Expense Categories
+	// Expense Categories — list is open to anyone with read on expenses
+	// (foremen need it for the submit-claim dropdown). Mutations are
+	// gated to the same write permission as the rest of the expense
+	// admin surface.
 	expenseCategories := rg.Group("/expense-categories")
 	{
 		expenseCategories.GET("", h.ListExpenseCategories)
+		expenseCategories.POST("", h.perm.Require("finance", "expense", "write"), h.CreateExpenseCategory)
+		expenseCategories.PUT("/:id", h.perm.Require("finance", "expense", "write"), h.UpdateExpenseCategory)
+		expenseCategories.DELETE("/:id", h.perm.Require("finance", "expense", "write"), h.DeleteExpenseCategory)
 	}
 
 	// Expenses
@@ -1594,6 +1767,61 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		expenses.PUT("/:id", h.perm.Require("finance", "expense", "update"), h.UpdateExpense)
 		expenses.DELETE("/:id", h.perm.Require("finance", "expense", "delete"), h.DeleteExpense)
 		expenses.POST("/:id/approve", h.perm.Require("finance", "expense", "approve"), h.ApproveExpense)
+		// Dedicated recognition toggle — see RecognizeExpense / §7.2 of
+		// ТЗ_Ish_Haqi_Soliq_Tolik.docx. Re-uses the generic "update"
+		// permission; wire to its own perm node if/when RBAC grows.
+		expenses.PATCH("/:id/recognize", h.perm.Require("finance", "expense", "update"), h.RecognizeExpense)
+	}
+
+	// Profit-tax calculation + snapshots (migrations 336/337)
+	profitTax := rg.Group("/profit-tax")
+	profitTax.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		profitTax.GET("", h.GetProfitTax)
+		profitTax.GET("/revenue", h.GetProfitTaxRevenue)
+		profitTax.GET("/snapshots", h.ListProfitTaxSnapshots)
+		profitTax.POST("/snapshot", h.perm.Require("finance", "expense", "approve"), h.SnapshotProfitTax)
+	}
+
+	// Turnover tax calculator (TZ §5.2). Driven by company_tax_rates
+	// applies_to='turnover'. Same revenue source as profit-tax to keep
+	// the two calculators reconciled.
+	turnoverTax := rg.Group("/turnover-tax")
+	turnoverTax.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		turnoverTax.GET("", h.GetTurnoverTax)
+	}
+
+	// NDS/VAT per-period calculator (TZ §5.1). Sums stamped tax_amount on
+	// sales and purchase invoices and returns realizatsiya / zachet /
+	// balansi. Rate display pulls from company_tax_rates applies_to='sales'.
+	ndsTax := rg.Group("/nds-tax")
+	ndsTax.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		ndsTax.GET("", h.GetNdsTax)
+	}
+
+	// Dividend withholding helper (TZ §5.3). GET/POST compute-only preview;
+	// POST /dividend-distributions actually posts the journal entry.
+	dividendTax := rg.Group("/dividend-tax")
+	dividendTax.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		dividendTax.GET("", h.ComputeDividendTax)
+		dividendTax.POST("/compute", h.ComputeDividendTax)
+	}
+	dividendDist := rg.Group("/dividend-distributions")
+	{
+		dividendDist.POST("", h.perm.Require("finance", "expense", "approve"), h.CreateDividendDistribution)
+	}
+
+	// Combined tax summary — director-level dashboard (TZ §10 "Umumiy soliq
+	// jamlanmasi"). Aggregates payroll + NDS + Foyda + Aylanma + Dividend
+	// rate into one response so the UI renders the whole picture in one
+	// round-trip.
+	taxSummary := rg.Group("/tax-summary")
+	taxSummary.Use(h.perm.Require("finance", "expense", "read"))
+	{
+		taxSummary.GET("/combined", h.GetTaxSummaryCombined)
 	}
 
 	// Asset Categories
@@ -1711,6 +1939,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/buildings", h.perm.Require("construction", "project", "create"), h.CreateConstructionBuilding)
 		constructionProjects.PUT("/:id/buildings/:building_id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionBuilding)
 		constructionProjects.DELETE("/:id/buildings/:building_id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionBuilding)
+		// CRM linkage — set/clear crm_project_id on the project and
+		// crm_block_id / current_crm_stage / auto_sync on the building.
+		constructionProjects.PUT("/:id/crm-link", h.perm.Require("construction", "project", "update"), h.UpdateProjectCRMLink)
+		constructionProjects.PUT("/:id/buildings/:building_id/crm-link", h.perm.Require("construction", "project", "update"), h.UpdateBuildingCRMLink)
 		// Building Files
 		constructionProjects.GET("/:id/buildings/:building_id/files", h.ListBuildingFiles)
 		constructionProjects.POST("/:id/buildings/:building_id/files", h.perm.Require("construction", "project", "create"), h.CreateBuildingFile)
@@ -1766,6 +1998,24 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 		// Estimate Resources (grouped by type for substage dropdowns)
 		constructionProjects.GET("/:id/estimate-resources", h.ListProjectEstimateResources)
+		// Create a new project resource (lands in the project's catalog
+		// estimate). Used by the AddResourcePickerModal "+" button.
+		constructionProjects.POST("/:id/resources", h.CreateProjectResource)
+
+		// Resource prices — Smeta boshqaruvi → Resurslar tab. Bulk-edits
+		// resource unit prices across every matching estimate line in the
+		// project, with audit history.
+		constructionProjects.GET("/:id/resource-prices", h.ListResourcePrices)
+		constructionProjects.POST("/:id/resource-prices/bulk-update",
+			h.perm.Require("construction", "estimate", "update"), h.BulkUpdateResourcePrice)
+		constructionProjects.POST("/:id/resource-prices/material-type",
+			h.perm.Require("construction", "estimate", "update"), h.BulkUpdateResourceMaterialType)
+		// Reset-to-original (migration 349 anchors). Per-resource and project-wide.
+		constructionProjects.POST("/:id/resource-prices/reset",
+			h.perm.Require("construction", "estimate", "update"), h.ResetResourcePrice)
+		constructionProjects.POST("/:id/resource-prices/reset-all",
+			h.perm.Require("construction", "estimate", "update"), h.ResetAllResourcePrices)
+		constructionProjects.GET("/:id/resource-prices/history", h.GetResourcePriceHistory)
 
 		// Estimates
 		constructionProjects.GET("/:id/estimates", h.ListEstimates)
@@ -1783,6 +2033,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Stages
 		constructionProjects.GET("/:id/stages", h.ListConstructionStages)
 		constructionProjects.POST("/:id/stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionStage)
+
+		// Flat feed of everything currently in_progress (stages + sub-stages).
+		// Drives the "Jarayon" tab on the frontend.
+		constructionProjects.GET("/:id/in-progress", h.GetProjectInProgressItems)
 
 		// Expense Lines (Xarajat operatsiyalari)
 		constructionProjects.GET("/:id/expenses", h.ListExpenseLines)
@@ -1829,12 +2083,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Reports
 		constructionProjects.GET("/:id/reports/summary", h.GetProjectSummaryReport)
 		constructionProjects.GET("/:id/reports/budget", h.GetStageBudgetReport)
+		constructionProjects.GET("/:id/reports/svod", h.GetSvodReport)
+		constructionProjects.GET("/:id/reports/material-consolidation", h.GetMaterialConsolidationReport)
 		constructionProjects.GET("/:id/reports/materials", h.GetMaterialsReport)
 		constructionProjects.GET("/:id/reports/journal-entries", h.GetJournalEntriesReport)
 
 		// Reja vs Fakt (Plan vs Fact)
 		constructionProjects.GET("/:id/reja-fakt", h.GetRejaFakt)
 		constructionProjects.GET("/:id/reja-fakt/audit", h.ListRejaFaktAudit)
+
+		// Smeta audit log (project-wide, every estimate).
+		constructionProjects.GET("/:id/smeta-audit", h.ListProjectSmetaAudit)
+
+		// v2 Stages workflow: who am I on this project?
+		constructionProjects.GET("/:id/my-role", h.GetMyProjectRole)
 
 		// Commission (complete project)
 		constructionProjects.PUT("/:id/commission", h.perm.Require("construction", "project", "update"), h.CommissionProject)
@@ -1910,6 +2172,60 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		estimates.POST("/:id/create-products", h.perm.Require("construction", "estimate", "update"), h.CreateProductsFromEstimate)
 		estimates.PUT("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.UpdateEstimateLine)
 		estimates.DELETE("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.DeleteEstimateLine)
+		// Reset a single line's quantity back to its original_quantity anchor (migration 349).
+		estimates.POST("/:id/lines/:line_id/reset-quantity",
+			h.perm.Require("construction", "estimate", "update"), h.ResetEstimateLineQuantity)
+		// Bulk-zero every top-level work qty in this estimate. Non-override
+		// sub-line qtys cascade to 0 via parent.qty × norm_rate.
+		estimates.POST("/:id/reset-quantities",
+			h.perm.Require("construction", "estimate", "update"), h.ResetAllEstimateQuantities)
+
+		// Resource top-ups — when a foreman orders MORE of a material
+		// than the smeta planned (often at a different price). Each
+		// top-up is appended to construction_resource_topup; the
+		// estimate's amount_total recomputes to fold them in.
+		estimates.POST("/:id/lines/:line_id/topups",
+			h.perm.Require("construction", "estimate", "update"), h.CreateResourceTopup)
+		estimates.DELETE("/:id/lines/:line_id/topups/:topup_id",
+			h.perm.Require("construction", "estimate", "update"), h.DeleteResourceTopup)
+
+		// Forma 2 snapshots — Smeta boshqaruvi → Tarix tab.
+		estimates.GET("/:id/form2-snapshots", h.ListForm2Snapshots)
+		estimates.POST("/:id/form2-snapshots",
+			h.perm.Require("construction", "estimate", "update"), h.CreateForm2Snapshot)
+
+		// Smeta boshqaruvi → Jurnal tab (audit log scoped to one estimate).
+		estimates.GET("/:id/audit", h.ListSmetaAudit)
+	}
+
+	// Forma 2 snapshot direct access (get/delete by snapshot id).
+	form2Snapshots := rg.Group("/construction/form2-snapshots")
+	form2Snapshots.Use(h.perm.Require("construction", "estimate", "read"))
+	{
+		form2Snapshots.GET("/:snapshot_id", h.GetForm2Snapshot)
+		form2Snapshots.DELETE("/:snapshot_id",
+			h.perm.Require("construction", "estimate", "update"), h.DeleteForm2Snapshot)
+	}
+
+	// v2 Stages workflow — work approval transitions.
+	// Permissions are enforced inside the handlers based on the caller's
+	// project role (foreman / supervisor / engineer); the route-level
+	// "estimate update" gate keeps random users out.
+	works := rg.Group("/construction/works")
+	works.Use(h.perm.Require("construction", "estimate", "update"))
+	{
+		// Foreman.
+		works.POST("/:id/done-quantity",      h.UpdateWorkDoneQuantity)
+		works.POST("/:id/submit",             h.SubmitWork)
+		works.POST("/bulk-submit",            h.BulkSubmitWorks)
+		// Supervisor.
+		works.POST("/:id/confirm-supervisor", h.ConfirmWorkSupervisor)
+		works.POST("/:id/reject-supervisor",  h.RejectWorkSupervisor)
+		works.POST("/bulk-confirm-supervisor", h.BulkConfirmSupervisor)
+		// Engineer (final).
+		works.POST("/:id/confirm-engineer",   h.ConfirmWorkEngineer)
+		works.POST("/:id/reject-engineer",    h.RejectWorkEngineer)
+		works.POST("/bulk-confirm-engineer",  h.BulkConfirmEngineer)
 	}
 
 	// Estimate Summary (direct access)
@@ -2009,6 +2325,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		photoReports.GET("/:id", h.GetPhotoReport)
 		photoReports.PUT("/:id", h.perm.Require("construction", "reports", "submit"), h.UpdatePhotoReport)
 		photoReports.DELETE("/:id", h.perm.Require("construction", "reports", "submit"), h.DeletePhotoReport)
+		// Manual re-sync to CRM (used after a failure or when the building
+		// was re-linked after the report was created).
+		photoReports.POST("/:id/resync-crm", h.perm.Require("construction", "reports", "submit"), h.ResyncPhotoReportToCRM)
+	}
+
+	// CRM proxy + linkage endpoints (used by the construction page UI to
+	// populate dropdowns when configuring the project↔CRM-project and
+	// building↔CRM-block links).
+	constructionCRM := rg.Group("/construction/crm")
+	constructionCRM.Use(h.perm.Require("construction", "project", "read"))
+	{
+		constructionCRM.GET("/projects", h.ListCRMProjects)
+		constructionCRM.GET("/blocks", h.ListCRMBlocks)
 	}
 
 	// Material Usage (direct access)

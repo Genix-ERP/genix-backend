@@ -42,6 +42,12 @@ type Expense struct {
 	ReceiptURL    *string      `json:"receipt_url,omitempty" db:"receipt_url"`
 	Status        string       `json:"status" db:"status"`
 	Reimbursable  bool         `json:"reimbursable" db:"reimbursable"`
+	// IsRecognized drives whether this expense is deducted from the
+	// profit-tax base. Non-recognized expenses (fines, undocumented
+	// spending, dividends, etc.) still count in the accounting profit but
+	// are excluded from the tax base — see migration 336 and §6 of
+	// ТЗ_Ish_Haqi_Soliq_Tolik.docx.
+	IsRecognized   bool        `json:"is_recognized" db:"is_recognized"`
 	ReimbursedDate *time.Time  `json:"reimbursed_date,omitempty" db:"reimbursed_date"`
 	ApprovedBy    *uuid.UUID   `json:"approved_by,omitempty" db:"approved_by"`
 	ApprovedAt    *time.Time   `json:"approved_at,omitempty" db:"approved_at"`
@@ -72,6 +78,9 @@ type CreateExpenseInput struct {
 	Reference     string  `json:"reference,omitempty"`
 	ReceiptURL    string  `json:"receipt_url,omitempty"`
 	Reimbursable  bool    `json:"reimbursable"`
+	// Defaults to TRUE (matches the DB default) so callers that don't
+	// know about recognition get the safe "deductible" semantics.
+	IsRecognized  *bool   `json:"is_recognized,omitempty"`
 	Notes         string  `json:"notes,omitempty"`
 }
 
@@ -93,6 +102,7 @@ type UpdateExpenseInput struct {
 	ReceiptURL    *string  `json:"receipt_url,omitempty"`
 	Status        *string  `json:"status,omitempty"`
 	Reimbursable  *bool    `json:"reimbursable,omitempty"`
+	IsRecognized  *bool    `json:"is_recognized,omitempty"`
 	Notes         *string  `json:"notes,omitempty"`
 }
 
@@ -117,6 +127,7 @@ type ExpenseResponse struct {
 	ReceiptURL    string    `json:"receipt_url,omitempty"`
 	Status        string    `json:"status"`
 	Reimbursable  bool      `json:"reimbursable"`
+	IsRecognized  bool      `json:"is_recognized"`
 	Notes         string    `json:"notes,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -135,6 +146,7 @@ func (e *Expense) ToResponse() *ExpenseResponse {
 		Currency:      e.Currency,
 		Status:        e.Status,
 		Reimbursable:  e.Reimbursable,
+		IsRecognized:  e.IsRecognized,
 		CategoryName:  e.CategoryName,
 		CreatedAt:     e.CreatedAt,
 		UpdatedAt:     e.UpdatedAt,
@@ -171,14 +183,21 @@ func (e *Expense) ToResponse() *ExpenseResponse {
 	return resp
 }
 
-// ExpenseCategoryResponse represents the API response for an expense category
+// ExpenseCategoryResponse represents the API response for an expense category.
+// AccountID + AccountCode + AccountName surface the chart-of-account that
+// expenses in this category are posted against, so the frontend can render
+// "Travel → 9410 — Operating Expense" without a second roundtrip.
 type ExpenseCategoryResponse struct {
 	ID          uuid.UUID `json:"id"`
 	Code        string    `json:"code"`
 	Name        string    `json:"name"`
 	Description string    `json:"description,omitempty"`
 	ParentID    string    `json:"parent_id,omitempty"`
+	AccountID   string    `json:"account_id,omitempty"`
+	AccountCode string    `json:"account_code,omitempty"`
+	AccountName string    `json:"account_name,omitempty"`
 	IsActive    bool      `json:"is_active"`
+	UsageCount  int       `json:"usage_count"`
 }
 
 // ToResponse converts ExpenseCategory to ExpenseCategoryResponse
@@ -194,6 +213,9 @@ func (c *ExpenseCategory) ToResponse() *ExpenseCategoryResponse {
 	}
 	if c.ParentID != nil {
 		resp.ParentID = c.ParentID.String()
+	}
+	if c.AccountID != nil {
+		resp.AccountID = c.AccountID.String()
 	}
 	return resp
 }

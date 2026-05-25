@@ -49,6 +49,7 @@ type Employee struct {
 	PerformanceScore float64         `json:"performance_score,omitempty"`
 	TurnoverRisk     string          `json:"turnover_risk,omitempty"`
 	Department       string          `json:"department,omitempty"`
+	JobPositionName  string          `json:"job_position_name,omitempty"`
 }
 
 // GetFullName returns the employee's full name
@@ -121,6 +122,7 @@ type EmployeeListFilter struct {
 // EmployeeResponse represents the API response for an employee
 type EmployeeResponse struct {
 	ID               uuid.UUID  `json:"id"`
+	UserID           string     `json:"user_id,omitempty"`
 	EmployeeNumber   string     `json:"employee_number"`
 	FullName         string     `json:"full_name"`
 	FirstName        string     `json:"first_name"`
@@ -129,6 +131,7 @@ type EmployeeResponse struct {
 	Phone            string     `json:"phone,omitempty"`
 	JobTitle         string     `json:"job_title,omitempty"`
 	JobPositionID    string     `json:"job_position_id,omitempty"`
+	JobPositionName  string     `json:"job_position_name,omitempty"`
 	DepartmentID     string     `json:"department_id,omitempty"`
 	Department       string     `json:"department,omitempty"`
 	HireDate         string     `json:"hire_date"`
@@ -154,12 +157,16 @@ func (e *Employee) ToResponse() *EmployeeResponse {
 		PerformanceScore: e.PerformanceScore,
 		TurnoverRisk:     e.TurnoverRisk,
 		Department:       e.Department,
+		JobPositionName:  e.JobPositionName,
 		JobPositionID:    func() string { if e.JobPositionID != nil { return e.JobPositionID.String() }; return "" }(),
 		DepartmentID:     func() string { if e.DepartmentID != nil { return e.DepartmentID.String() }; return "" }(),
 		CreatedAt:        e.CreatedAt,
 		UpdatedAt:        e.UpdatedAt,
 	}
 
+	if e.UserID != nil {
+		resp.UserID = e.UserID.String()
+	}
 	if e.Email != nil {
 		resp.Email = *e.Email
 	}

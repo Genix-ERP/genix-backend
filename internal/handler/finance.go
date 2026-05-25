@@ -166,13 +166,107 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	includeInactive := c.Query("include_inactive") == "true"
 	_ = c.Query("flat") // Reserved for future hierarchical view
 
+	// Auto-heal: when a specific organization is requested and that org
+	// has zero accounts in the DB, seed the default UzNAS chart of
+	// accounts (and default journals) before serving the request. This
+	// covers two real-world cases observed on production:
+	//   1. Organizations created before CreateOrganization started
+	//      auto-initializing a chart of accounts.
+	//   2. Organizations where CreateOrganization's auto-init silently
+	//      failed (the handler intentionally only logs that error so
+	//      org creation isn't blocked) and the user later opened a
+	//      page that needs accounts (e.g. Products → Categories,
+	//      where the dropdowns appeared empty because no rows matched
+	//      the strict `organization_id = X` filter).
+	// The init helpers use ON CONFLICT DO NOTHING so concurrent first
+	// reads are safe. No-op for orgs that already have any accounts.
+	{
+		var requestedOrg uuid.UUID
+		if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+			requestedOrg = orgID
+		} else if organizationID != "" {
+			if parsed, perr := uuid.Parse(organizationID); perr == nil {
+				requestedOrg = parsed
+			}
+		}
+		if requestedOrg != uuid.Nil {
+			// Fire the seed function whenever the org is missing
+			// ANY of the three things it should have:
+			//   1. accounts (initial creation case),
+			//   2. the GROUP-account hierarchy (org created before
+			//      createDefaultChartOfAccounts seeded groups, or
+			//      created after migration 317 but before the
+			//      runtime-seeder learned about groups),
+			//   3. default journals (the legacy ON-CONFLICT bug
+			//      silently dropped journals for the 2nd+ org per
+			//      tenant before migration 278 fixed the constraint).
+			// Each seeder uses ON CONFLICT DO NOTHING / DO UPDATE so
+			// re-running is safe and only writes missing rows.
+			var totalAccounts, groupAccounts, journalCount int
+			_ = h.db.QueryRow(
+				`SELECT COUNT(*) FROM accounts
+				  WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+				tenantID, requestedOrg,
+			).Scan(&totalAccounts)
+			_ = h.db.QueryRow(
+				`SELECT COUNT(*) FROM accounts
+				  WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
+				    AND COALESCE(is_leaf, true) = false`,
+				tenantID, requestedOrg,
+			).Scan(&groupAccounts)
+			_ = h.db.QueryRow(
+				`SELECT COUNT(*) FROM journals
+				  WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+				tenantID, requestedOrg,
+			).Scan(&journalCount)
+
+			needsAccountSeed := totalAccounts == 0 || groupAccounts < 30 // legacy orgs have 40 groups
+			needsJournalSeed := journalCount < 5                          // 11 defaults; under 5 means broken
+
+			if needsAccountSeed || needsJournalSeed {
+				var orgExists bool
+				if err := h.db.QueryRow(
+					`SELECT EXISTS(SELECT 1 FROM organizations
+					                WHERE id = $1 AND tenant_id = $2
+					                  AND deleted_at IS NULL)`,
+					requestedOrg, tenantID,
+				).Scan(&orgExists); err == nil && orgExists {
+					if needsAccountSeed {
+						if initErr := h.createDefaultChartOfAccounts(tenantID, requestedOrg); initErr != nil {
+							h.log.Warn("auto-init chart of accounts failed",
+								"error", initErr, "tenant_id", tenantID, "org_id", requestedOrg)
+						} else {
+							h.log.Info("auto-initialized chart of accounts for organization",
+								"tenant_id", tenantID, "org_id", requestedOrg,
+								"previous_accounts", totalAccounts, "previous_groups", groupAccounts)
+						}
+					}
+					if needsJournalSeed {
+						if jErr := h.createDefaultJournals(tenantID, requestedOrg); jErr != nil {
+							h.log.Warn("auto-init default journals failed",
+								"error", jErr, "tenant_id", tenantID, "org_id", requestedOrg)
+						} else {
+							h.log.Info("auto-initialized default journals for organization",
+								"tenant_id", tenantID, "org_id", requestedOrg,
+								"previous_journals", journalCount)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Build query
 	baseQuery := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
-			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
+			   a.code, a.name, a.name_uz, a.name_en, COALESCE(a.name_ru, '') as name_ru, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.internal_type,
+			   COALESCE(a.is_leaf, true) as is_leaf,
+			   COALESCE(a.account_nature, 'ACTIVE') as account_nature,
+			   COALESCE(a.analytics_types, '[]') as analytics_types,
+			   COALESCE(a.mandatory_analytics, false) as mandatory_analytics,
 			   a.current_balance, a.opening_balance, a.is_active,
 			   a.created_at, a.updated_at,
 			   at.code as type_code, at.name as type_name, at.category, at.normal_balance
@@ -252,14 +346,16 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	accounts := make([]*entity.AccountResponse, 0)
 	for rows.Next() {
 		var acc entity.Account
-		var orgID, parentID, currencyID, description, nameUz, nameEn, internalType sql.NullString
+		var orgID, parentID, currencyID, description, nameUz, nameEn, nameRu, internalType sql.NullString
+		var analyticsTypes sql.NullString
 		var typeCode, typeName, typeCategory, normalBalance string
 
 		err := rows.Scan(
 			&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
-			&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
+			&acc.Code, &acc.Name, &nameUz, &nameEn, &nameRu, &description, &currencyID, &acc.IsBankAccount,
 			&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 			&internalType,
+			&acc.IsLeaf, &acc.AccountNature, &analyticsTypes, &acc.MandatoryAnalytics,
 			&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 			&acc.CreatedAt, &acc.UpdatedAt,
 			&typeCode, &typeName, &typeCategory, &normalBalance,
@@ -282,8 +378,14 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if nameEn.Valid {
 			acc.NameEn = &nameEn.String
 		}
+		if nameRu.Valid {
+			acc.NameRu = &nameRu.String
+		}
 		if internalType.Valid {
 			acc.InternalType = &internalType.String
+		}
+		if analyticsTypes.Valid {
+			acc.AnalyticsTypes = &analyticsTypes.String
 		}
 
 		acc.AccountType = &entity.AccountType{
@@ -543,10 +645,14 @@ func (h *Handler) GetAccount(c *gin.Context) {
 
 	query := `
 		SELECT a.id, a.tenant_id, a.organization_id, a.parent_id, a.account_type_id,
-			   a.code, a.name, a.name_uz, a.name_en, a.description, a.currency_id, a.is_bank_account,
+			   a.code, a.name, a.name_uz, a.name_en, COALESCE(a.name_ru, '') as name_ru, a.description, a.currency_id, a.is_bank_account,
 			   a.is_control_account, a.is_reconcilable,
 			   COALESCE(a.budget_tracking, false) as budget_tracking,
 			   a.internal_type,
+			   COALESCE(a.is_leaf, true) as is_leaf,
+			   COALESCE(a.account_nature, 'ACTIVE') as account_nature,
+			   COALESCE(a.analytics_types, '[]') as analytics_types,
+			   COALESCE(a.mandatory_analytics, false) as mandatory_analytics,
 			   a.current_balance, a.opening_balance, a.is_active,
 			   a.created_at, a.updated_at,
 			   at.code as type_code, at.name as type_name, at.category, at.normal_balance
@@ -556,14 +662,16 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	`
 
 	var acc entity.Account
-	var orgID, parentID, currencyID, description, nameUz, nameEn, internalType sql.NullString
+	var orgID, parentID, currencyID, description, nameUz, nameEn, nameRu, internalType sql.NullString
+	var analyticsTypes sql.NullString
 	var typeCode, typeName, typeCategory, normalBalance string
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&acc.ID, &acc.TenantID, &orgID, &parentID, &acc.AccountTypeID,
-		&acc.Code, &acc.Name, &nameUz, &nameEn, &description, &currencyID, &acc.IsBankAccount,
+		&acc.Code, &acc.Name, &nameUz, &nameEn, &nameRu, &description, &currencyID, &acc.IsBankAccount,
 		&acc.IsControlAccount, &acc.IsReconcilable, &acc.BudgetTracking,
 		&internalType,
+		&acc.IsLeaf, &acc.AccountNature, &analyticsTypes, &acc.MandatoryAnalytics,
 		&acc.CurrentBalance, &acc.OpeningBalance, &acc.IsActive,
 		&acc.CreatedAt, &acc.UpdatedAt,
 		&typeCode, &typeName, &typeCategory, &normalBalance,
@@ -592,8 +700,14 @@ func (h *Handler) GetAccount(c *gin.Context) {
 	if nameEn.Valid {
 		acc.NameEn = &nameEn.String
 	}
+	if nameRu.Valid {
+		acc.NameRu = &nameRu.String
+	}
 	if internalType.Valid {
 		acc.InternalType = &internalType.String
+	}
+	if analyticsTypes.Valid {
+		acc.AnalyticsTypes = &analyticsTypes.String
 	}
 
 	acc.AccountType = &entity.AccountType{
@@ -2022,6 +2136,13 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// TT Buxgalteriya §4.2 + §4.5: validate all accounts are is_leaf and have required analytics.
+	// The DB trigger enforces this too, but app-layer errors give callers clearer messages.
+	if errMsg := h.validateJournalLines(tenantID, input.Lines); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	// Resolve organization ID early (needed for entry number generation)
 	var orgID *uuid.UUID
 	if input.OrganizationID != "" {
@@ -2122,22 +2243,63 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 			lineDesc = &line.Description
 		}
 
-		var contactID *uuid.UUID
-		if line.ContactID != nil && *line.ContactID != "" {
-			cid, _ := uuid.Parse(*line.ContactID)
-			contactID = &cid
+		contactID := parseOptionalUUID(line.ContactID)
+		warehouseID := parseOptionalUUID(line.WarehouseID)
+		employeeID := parseOptionalUUID(line.EmployeeID)
+		contractID := parseOptionalUUID(line.ContractID)
+		currencyID := parseOptionalUUID(line.CurrencyID)
+
+		// TT 4.6: compute UZS equivalent. Line-level exchange_rate overrides entry-level.
+		lineRate := exchangeRate
+		if line.ExchangeRate != nil && *line.ExchangeRate > 0 {
+			lineRate = *line.ExchangeRate
 		}
+		lineGross := line.DebitAmount + line.CreditAmount
+		amountBase := lineGross * lineRate
 
 		_, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (
-				id, journal_entry_id, line_number, account_id, contact_id, description,
-				debit_amount, credit_amount, exchange_rate, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		`, lineID, id, i+1, accountID, contactID, lineDesc,
-			line.DebitAmount, line.CreditAmount, exchangeRate, now)
+				id, journal_entry_id, line_number, account_id, contact_id,
+				warehouse_id, employee_id, contract_id, analytics_json,
+				currency_id, currency_amount,
+				description, debit_amount, credit_amount,
+				exchange_rate, amount_base, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::jsonb, '{}'::jsonb),
+				$10, $11, $12, $13, $14, $15, $16, $17)
+		`, lineID, id, i+1, accountID, contactID,
+			warehouseID, employeeID, contractID, line.AnalyticsJSON,
+			currencyID, line.CurrencyAmount,
+			lineDesc, line.DebitAmount, line.CreditAmount,
+			lineRate, amountBase, now)
 
 		if err != nil {
 			h.log.Error("Failed to create journal entry line", "error", err)
+			// Surface trigger errors to the client so the buxgalter sees which rule fired
+			if strings.HasPrefix(err.Error(), "pq: TT ") {
+				response.BadRequest(c, strings.TrimPrefix(err.Error(), "pq: "))
+				return
+			}
+			response.InternalError(c, "Failed to create journal entry")
+			return
+		}
+	}
+
+	// TT §4.6 — if base-currency totals don't tie because of mixed exchange
+	// rates across lines, auto-append an FX gain (9540) or loss (9630) line.
+	fxRes, err := h.appendFXBalancingLine(tx, tenantID, orgID, id, len(input.Lines)+1, now)
+	if err != nil {
+		h.log.Error("Failed to append FX balancing line", "error", err)
+		response.InternalError(c, "Failed to create journal entry")
+		return
+	}
+	if fxRes.AppendedLine {
+		totalDebit += fxRes.DebitAdded
+		totalCredit += fxRes.CreditAdded
+		if _, uerr := tx.Exec(
+			`UPDATE journal_entries SET total_debit = $1, total_credit = $2, updated_at = $3 WHERE id = $4`,
+			totalDebit, totalCredit, now, id,
+		); uerr != nil {
+			h.log.Error("Failed to update totals after FX adjust", "error", uerr)
 			response.InternalError(c, "Failed to create journal entry")
 			return
 		}
@@ -2476,7 +2638,7 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 		if err != nil {
 			continue
 		}
-		isCashOrBank := strings.HasPrefix(accountCode, "1000") || strings.HasPrefix(accountCode, "1010") || strings.HasPrefix(accountCode, "1100")
+		isCashOrBank := strings.HasPrefix(accountCode, "5010") || strings.HasPrefix(accountCode, "5110") || strings.HasPrefix(accountCode, "50") || strings.HasPrefix(accountCode, "51")
 		if isCashOrBank && newBalance < -0.001 {
 			response.BadRequest(c, fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas (balans: %.2f)", accountName, accountCode, newBalance))
 			return
@@ -2507,6 +2669,15 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	h.logJournalEntryAction(tenantID, userID, id, "post", "draft", "posted", map[string]interface{}{
 		"total_debit":  totalDebit,
 		"total_credit": totalCredit,
+	})
+
+	// TT §7.4 — dispatch webhook event
+	go h.DispatchWebhookEvent(tenantID, "journal_entry.posted", gin.H{
+		"journal_entry_id": id,
+		"total_debit":      totalDebit,
+		"total_credit":     totalCredit,
+		"posted_at":        now,
+		"posted_by":        userID,
 	})
 
 	response.Success(c, gin.H{"message": "Journal entry posted successfully", "posted_at": now})
@@ -3748,18 +3919,18 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		var jType sql.NullString
 		_ = tx.QueryRow(`SELECT type FROM journals WHERE id = $1 AND tenant_id = $2`, storedJournalID.String, tenantID).Scan(&jType)
 		if jType.Valid && jType.String == "cash" {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
 		} else if jType.Valid && jType.String == "bank" {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
 		}
 	}
 
 	// 4. Last fallback: find by account code
 	if cashAccountID == uuid.Nil {
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "1010")
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
 	}
 	if cashAccountID == uuid.Nil {
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "1000")
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
 	}
 	h.log.Info("Payment cash/bank account resolution", "cash_account_id", cashAccountID, "payment_id", id,
 		"had_bank_account_id", bankAccountIDStr.Valid, "had_journal_id", storedJournalID.Valid, "had_payment_method_id", paymentMethodID.Valid)
@@ -3789,13 +3960,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		counterAccountID = getContactDefaultAccount(tx, contactID, "receivable")
 		// 2. Fallback to standard findAccount chain
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "1100")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "4010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "debitorlar", "1100")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "debitorlar", "4010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "receivable", "1100")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "receivable", "4010")
 		}
 		journalCode = "CASH_RECEIPTS"
 		sourceType = "payment_receipt"
@@ -3807,16 +3978,16 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		counterAccountID = getContactDefaultAccount(tx, contactID, "payable")
 		// 2. Fallback to standard findAccount chain
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "2000")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlar", "2000")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlar", "6010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "payable", "2000")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "payable", "6010")
 		}
 		if counterAccountID == uuid.Nil {
-			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlik", "2000")
+			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "kreditorlik", "6010")
 		}
 		journalCode = "CASH_DISBURSEMENTS"
 		sourceType = "payment"
@@ -4008,12 +4179,12 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				var exchangeDiffType string
 				if (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0) {
 					// Exchange gain
-					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "4920")
+					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "9540")
 					exchangeDiffDesc = "Valyuta kursi bo'yicha foyda"
 					exchangeDiffType = "positive"
 				} else {
 					// Exchange loss
-					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "7200")
+					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "9630")
 					exchangeDiffDesc = "Valyuta kursi bo'yicha zarar"
 					exchangeDiffType = "negative"
 				}
@@ -6512,8 +6683,8 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	}
 
 	// Find outstanding accounts
-	outReceiptsID := findAccount(h.db, tenantUUID, orgID, "outstanding receipts", "1150")
-	outPaymentsID := findAccount(h.db, tenantUUID, orgID, "outstanding payments", "1160")
+	outReceiptsID := findAccount(h.db, tenantUUID, orgID, "outstanding receipts", "5110")
+	outPaymentsID := findAccount(h.db, tenantUUID, orgID, "outstanding payments", "5110")
 
 	if outReceiptsID == uuid.Nil && outPaymentsID == uuid.Nil {
 		return // No outstanding accounts configured, nothing to clear
@@ -6706,7 +6877,7 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	if difference > 0 {
 		// Statement > book: bank has more than expected (e.g., interest earned)
 		// DR Bank, CR Other Income
-		otherIncomeID := findAccount(h.db, tenantUUID, orgID, "other income", "4900")
+		otherIncomeID := findAccount(h.db, tenantUUID, orgID, "other income", "9310")
 		if otherIncomeID == uuid.Nil {
 			return
 		}
@@ -6724,9 +6895,9 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	} else {
 		// Book > statement: bank has less than expected (e.g., bank charges)
 		// DR Bank Charges, CR Bank
-		bankChargesID := findAccount(h.db, tenantUUID, orgID, "bank charges", "7100")
+		bankChargesID := findAccount(h.db, tenantUUID, orgID, "bank charges", "9620")
 		if bankChargesID == uuid.Nil {
-			bankChargesID = findAccount(h.db, tenantUUID, orgID, "payment difference write-off", "6950")
+			bankChargesID = findAccount(h.db, tenantUUID, orgID, "payment difference write-off", "9690")
 		}
 		if bankChargesID == uuid.Nil {
 			return

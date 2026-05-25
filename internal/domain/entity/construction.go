@@ -101,6 +101,15 @@ type ConstructionProject struct {
 	ProjectManagerID uuid.NullUUID `json:"project_manager_id" db:"project_manager_id"`
 	ChiefEngineerID  uuid.NullUUID `json:"chief_engineer_id" db:"chief_engineer_id"`
 
+	// Default warehouse for material reservations and material requests.
+	// NULL means the runtime falls back to the auto-pick logic
+	// ("highest stock anywhere in the tenant" → "oldest active warehouse").
+	// Migration 365 added the column.
+	WarehouseID uuid.NullUUID `json:"warehouse_id" db:"warehouse_id"`
+	// Resolved display name (LEFT JOIN warehouses) — handy for the project
+	// info card so the frontend doesn't need a second round-trip.
+	WarehouseName string `json:"warehouse_name,omitempty" db:"warehouse_name"`
+
 	// Metadata
 	CreatedBy   *uuid.UUID   `json:"created_by" db:"created_by"`
 	CreatedDate time.Time    `json:"created_date" db:"created_date"`
@@ -112,6 +121,9 @@ type ConstructionProject struct {
 	ChiefEngineerName  string `json:"chief_engineer_name,omitempty" db:"chief_engineer_name"`
 	SectionsCount      int    `json:"sections_count,omitempty" db:"sections_count"`
 	TotalSmeta         float64 `json:"total_smeta,omitempty" db:"total_smeta"`
+	// FilesCount drives the badge on the "Fayllar" button on each
+	// project card. Computed via a subquery against project_files.
+	FilesCount int `json:"files_count" db:"files_count"`
 }
 
 // MarshalJSON custom marshaler for ConstructionProject to handle sql.Null* types
@@ -140,6 +152,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		ProjectManagerID interface{} `json:"project_manager_id"`
 		ChiefEngineerID  interface{} `json:"chief_engineer_id"`
 		OrganizationID   interface{} `json:"organization_id"`
+		WarehouseID      interface{} `json:"warehouse_id"`
 		ID               int64       `json:"id"`
 		TenantID         uuid.UUID   `json:"tenant_id"`
 		Code             string      `json:"code"`
@@ -152,8 +165,10 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		UpdatedDate      time.Time   `json:"updated_date"`
 		ProjectManagerName string    `json:"project_manager_name,omitempty"`
 		ChiefEngineerName  string    `json:"chief_engineer_name,omitempty"`
+		WarehouseName      string    `json:"warehouse_name,omitempty"`
 		SectionsCount      int       `json:"sections_count,omitempty"`
 		TotalSmeta         float64   `json:"total_smeta,omitempty"`
+		FilesCount         int       `json:"files_count"`
 	}{
 		Description:        nullStringValue(p.Description),
 		Address:            nullStringValue(p.Address),
@@ -177,6 +192,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		ProjectManagerID:   nullUUIDValue(p.ProjectManagerID),
 		ChiefEngineerID:    nullUUIDValue(p.ChiefEngineerID),
 		OrganizationID:     nullUUIDValue(p.OrganizationID),
+		WarehouseID:        nullUUIDValue(p.WarehouseID),
 		ID:                 p.ID,
 		TenantID:           p.TenantID,
 		Code:               p.Code,
@@ -189,8 +205,10 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		UpdatedDate:        p.UpdatedDate,
 		ProjectManagerName: p.ProjectManagerName,
 		ChiefEngineerName:  p.ChiefEngineerName,
+		WarehouseName:      p.WarehouseName,
 		SectionsCount:      p.SectionsCount,
 		TotalSmeta:         p.TotalSmeta,
+		FilesCount:         p.FilesCount,
 	})
 }
 
@@ -218,6 +236,10 @@ type CreateConstructionProjectInput struct {
 	PlannedEndDate   string  `json:"planned_end_date"`
 	ProjectManagerID string  `json:"project_manager_id"`
 	ChiefEngineerID  string  `json:"chief_engineer_id"`
+
+	// Optional default warehouse (UUID string). Empty string = no default;
+	// reservation pipeline falls back to auto-pick.
+	WarehouseID string `json:"warehouse_id"`
 
 	// Forma 2 / Forma 3 client (Заказчик) banking & legal identity
 	ClientAddress             string `json:"client_address"`
@@ -258,6 +280,11 @@ type UpdateConstructionProjectInput struct {
 	ProgressPercent  *float64 `json:"progress_percent"`
 	ProjectManagerID *string  `json:"project_manager_id"`
 	ChiefEngineerID  *string  `json:"chief_engineer_id"`
+
+	// Optional default warehouse (UUID string). Pointer so absence vs empty
+	// string is distinguishable: omitting the key leaves the column alone,
+	// passing "" sets it back to NULL (clears the default).
+	WarehouseID *string `json:"warehouse_id"`
 
 	// Forma 2 / Forma 3 client (Заказчик) banking & legal identity
 	ClientAddress             *string `json:"client_address"`
@@ -328,6 +355,9 @@ type ConstructionBuilding struct {
 	// Computed
 	SectionsCount int     `json:"sections_count,omitempty" db:"sections_count"`
 	TotalSmeta    float64 `json:"total_smeta,omitempty" db:"total_smeta"`
+	// FilesCount is the number of rows in building_files linked to this
+	// building. Drives the badge on the "Fayllar" button in the UI.
+	FilesCount int `json:"files_count" db:"files_count"`
 }
 
 // MarshalJSON custom marshaler for ConstructionBuilding to handle sql.Null* types
@@ -365,6 +395,7 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		UpdatedDate          time.Time       `json:"updated_date"`
 		SectionsCount        int             `json:"sections_count,omitempty"`
 		TotalSmeta           float64         `json:"total_smeta,omitempty"`
+		FilesCount           int             `json:"files_count"`
 	}{
 		ID:                   b.ID,
 		TenantID:             b.TenantID,
@@ -398,6 +429,7 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		UpdatedDate:          b.UpdatedDate,
 		SectionsCount:        b.SectionsCount,
 		TotalSmeta:           b.TotalSmeta,
+		FilesCount:           b.FilesCount,
 	})
 }
 
