@@ -849,6 +849,12 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 	}
 
 	resourceType := c.Query("type") // "labor", "equipment", "material", or empty for all
+	// Optional name/code substring search — sent by the picker so resources
+	// past the alphabetical LIMIT cap still show up when the user types
+	// their name. Without this, names starting with letters deep in the
+	// Cyrillic alphabet (e.g. С — position 19) get cut off in projects with
+	// hundreds of resources.
+	searchQ := strings.TrimSpace(c.Query("q"))
 
 	// Aggregate across duplicate rows by taking the MAX rate — so a resource
 	// that has a non-zero rate in at least one estimate line is returned
@@ -883,6 +889,23 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 	args := []interface{}{tenantID, projectID}
 	argIdx := 3
 
+	if searchQ != "" {
+		// Case-insensitive substring match on name / uom / code. We filter
+		// BEFORE the GROUP BY so groups whose name doesn't match are
+		// excluded — that's what makes the LIMIT useful for narrow
+		// searches and bypasses the alphabetical cap entirely when the
+		// user types a query.
+		query += fmt.Sprintf(`
+			AND (
+			  UPPER(COALESCE(el.name, '')) LIKE UPPER('%%' || $%d || '%%')
+			  OR UPPER(COALESCE(el.uom, '')) LIKE UPPER('%%' || $%d || '%%')
+			  OR UPPER(COALESCE(el.code, '')) LIKE UPPER('%%' || $%d || '%%')
+			)
+		`, argIdx, argIdx, argIdx)
+		args = append(args, searchQ)
+		argIdx++
+	}
+
 	if resourceType != "" {
 		// Filter by resource type or UOM pattern
 		switch strings.ToLower(resourceType) {
@@ -903,7 +926,13 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 		}
 	}
 
-	query += ` GROUP BY el.name, COALESCE(el.uom, ''), COALESCE(el.resource_type, '') ORDER BY UPPER(el.name), COALESCE(el.uom, '') LIMIT 500`
+	// Higher cap than before (was 500) — projects with multiple єдинич +
+	// ВОР + Ресурс imports can easily exceed 500 distinct
+	// (name, uom, resource_type) tuples, and the alphabetical sort meant
+	// rows past position 500 (often Cyrillic С/Т/У letters) silently
+	// disappeared from the picker. With server-side `q=` search this cap
+	// is rarely hit anyway.
+	query += ` GROUP BY el.name, COALESCE(el.uom, ''), COALESCE(el.resource_type, '') ORDER BY UPPER(el.name), COALESCE(el.uom, '') LIMIT 5000`
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
