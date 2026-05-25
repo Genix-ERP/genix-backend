@@ -164,8 +164,17 @@ func (h *Handler) GetEstimate(c *gin.Context) {
 		return
 	}
 
-	// Get lines
-	lines := h.getEstimateLines(id, tenantID)
+	// Get lines — honour `?include_manual=false` so the Smetalar tab can
+	// hide rows added via the Smeta boshqaruvi / Bosqichlar UI (migration
+	// 417). Defaults to TRUE for every other caller so behaviour is
+	// unchanged unless the param is explicitly passed.
+	includeManual := true
+	if raw := strings.TrimSpace(c.Query("include_manual")); raw != "" {
+		if v, err := strconv.ParseBool(raw); err == nil {
+			includeManual = v
+		}
+	}
+	lines := h.getEstimateLines(id, tenantID, includeManual)
 
 	response.Success(c, map[string]interface{}{
 		"estimate": est,
@@ -627,10 +636,33 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	}
 	offset := (page - 1) * pageSize
 
-	// Count total
+	// include_manual — when "false", hide rows created via the
+	// individual line endpoints (CreateEstimateLine,
+	// CloneEstimateLineByCode, CreateProjectResource — all flagged
+	// is_manual = TRUE by migration 417). Defaults to true so the
+	// Smeta boshqaruvi / Bosqichlar tabs keep seeing everything; the
+	// Smetalar tab passes ?include_manual=false to limit its view to
+	// the file's original imported content.
+	includeManual := true
+	if raw := strings.TrimSpace(c.Query("include_manual")); raw != "" {
+		if v, err := strconv.ParseBool(raw); err == nil {
+			includeManual = v
+		}
+	}
+	manualFilter := ""
+	if !includeManual {
+		manualFilter = " AND COALESCE(l.is_manual, FALSE) = FALSE"
+	}
+	// Count total — respect the same filter so pagination is consistent.
+	countFilter := ""
+	if !includeManual {
+		countFilter = " AND COALESCE(is_manual, FALSE) = FALSE"
+	}
 	var total int
-	h.db.QueryRow(`SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`,
-		estimateID, tenantID).Scan(&total)
+	h.db.QueryRow(
+		"SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2"+countFilter,
+		estimateID, tenantID,
+	).Scan(&total)
 
 	// Hoist the parent estimate's project_id and building_id out to
 	// Go-side parameters. The ВОР fallback subquery below previously
@@ -746,7 +778,7 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
 		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
-		WHERE l.estimate_id = $1 AND l.tenant_id = $2
+		WHERE l.estimate_id = $1 AND l.tenant_id = $2` + manualFilter + `
 		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
 		         COALESCE(l.parent_line_id, l.id) ASC,
 		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
@@ -1099,18 +1131,21 @@ func (h *Handler) CreateProjectResource(c *gin.Context) {
 		matRate = req.UnitPrice
 	}
 
+	// is_manual = TRUE (migration 417) — CreateProjectResource is only
+	// reachable from the AddResourcePickerModal "+" affordance, so every
+	// row is by definition user-added. The Smetalar tab filters these out.
 	var lineID int64
 	err = h.db.QueryRow(`
 		INSERT INTO construction_estimate_line (
 			tenant_id, estimate_id, name, uom, quantity,
 			material_rate, labor_rate, equipment_rate,
 			unit_rate, total_amount, resource_type, material_type,
-			parent_item_number, sort_order, created_date, updated_date
+			parent_item_number, sort_order, is_manual, created_date, updated_date
 		) VALUES (
 			$1, $2, $3, $4, 0,
 			$5, $6, $7,
 			$8, 0, $9, $10,
-			'__catalog__', 0, NOW(), NOW()
+			'__catalog__', 0, TRUE, NOW(), NOW()
 		)
 		RETURNING id
 	`, tenantID, catalogID, req.Name, req.UOM,
@@ -1337,9 +1372,11 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 			unit_rate, total_amount, code, item_number,
 			resource_type, parent_item_number, sort_order,
 			parent_line_id, norm_rate, subline_seq, quantity_override,
+			is_manual,
 			created_date, updated_date
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 		          $17, $18, $19, $20,
+		          TRUE,
 		          NOW(), NOW())
 		RETURNING id
 	`, tenantID, estimateID, nullInt64FromVal(req.WBSID),
@@ -1349,6 +1386,10 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		nullStringFromVal(req.ResourceType), nullStringFromVal(parentItemNumber), req.SortOrder,
 		parentLineIDSQL, req.NormRate, sublineSeq, req.QuantityOverride,
 	).Scan(&lineID)
+	// is_manual = TRUE (migration 417) — every CreateEstimateLine call
+	// comes from a UI affordance ("+ Ish", "+ Yangi qo'shimcha etap",
+	// "+ Qo'shimcha resurs"), so the row is by definition user-added.
+	// The Smetalar tab filters by is_manual = FALSE to hide these.
 
 	if err != nil {
 		h.log.Error("Failed to create estimate line", "error", err)
@@ -1601,6 +1642,9 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 	// Insert the new line. Mirrors the column set CreateEstimateLine uses
 	// so trigger-set defaults (original_quantity / original_unit_rate from
 	// migration 349) and constraints stay consistent.
+	// is_manual = TRUE (migration 417) — the clone-by-code endpoint is
+	// only ever called from the UI, so the new row is user-added and
+	// must be hidden from the Smetalar tab.
 	var newID int64
 	err = tx.QueryRow(`
 		INSERT INTO construction_estimate_line (
@@ -1611,6 +1655,7 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 			material_rate, labor_rate, equipment_rate,
 			unit_rate, total_amount,
 			norm_rate, sort_order,
+			is_manual,
 			created_date, updated_date
 		) VALUES (
 			$1, $2, $3, $4,
@@ -1620,6 +1665,7 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 			$12, $13, $14,
 			$15, $16,
 			0, 0,
+			TRUE,
 			NOW(), NOW()
 		) RETURNING id
 	`,
@@ -1691,6 +1737,7 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 					material_rate, labor_rate, equipment_rate,
 					unit_rate, total_amount,
 					norm_rate, subline_seq, sort_order,
+					is_manual,
 					created_date, updated_date
 				) VALUES (
 					$1, $2, $3, NULL,
@@ -1700,6 +1747,7 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 					$9, $10, $11,
 					$12, $13,
 					$14, $15, 0,
+					TRUE,
 					NOW(), NOW()
 				)
 			`,
@@ -2791,7 +2839,15 @@ func (h *Handler) ResetAllEstimateQuantities(c *gin.Context) {
 // but silently fails for Ресурс estimates whose item_numbers are SNiP-style
 // codes (e.g. "Э14-1-17"), so podkators created on resurs rows never render
 // as nested children of their parent.
-func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entity.ConstructionEstimateLine {
+func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID, includeManual ...bool) []entity.ConstructionEstimateLine {
+	// Variadic for backwards compatibility — existing callers don't pass
+	// includeManual and default to TRUE (show everything). The
+	// EstimatesTab path passes FALSE so user-added lines are hidden
+	// from the file-derived Smetalar view.
+	wantManual := true
+	if len(includeManual) > 0 {
+		wantManual = includeManual[0]
+	}
 	// Hoist the parent estimate's project_id and building_id out to
 	// Go-side parameters. The ВОР fallback subquery below previously
 	// re-derived these via three nested scalar subqueries
@@ -2908,7 +2964,12 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
 		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
-		WHERE l.estimate_id = $1 AND l.tenant_id = $2
+		WHERE l.estimate_id = $1 AND l.tenant_id = $2` + func() string {
+		if !wantManual {
+			return " AND COALESCE(l.is_manual, FALSE) = FALSE"
+		}
+		return ""
+	}() + `
 		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
 		         COALESCE(l.parent_line_id, l.id) ASC,
 		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
