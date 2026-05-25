@@ -423,6 +423,13 @@ type UpdateEstimateLineInput struct {
 	SortOrder     *int     `json:"sort_order"`
 	ActualAmount  *float64 `json:"actual_amount"`
 
+	// OriginalQuantity — the smeta-anchored "NORMA" pill shown on each
+	// work card (migration 349). Defaults to the row's first Quantity at
+	// import time and the UI usually treats it as immutable. The full
+	// edit modal exposes it as a Norma input so the user can correct an
+	// imported figure when the smeta itself was wrong.
+	OriginalQuantity *float64 `json:"original_quantity"`
+
 	// Optional edits to line metadata (used by the full edit modal).
 	Code         *string `json:"code"`
 	ItemNumber   *string `json:"item_number"`

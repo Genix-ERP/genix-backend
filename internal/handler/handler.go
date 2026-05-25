@@ -2163,6 +2163,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		estimates.GET("/:id/lines", h.ListEstimateLines)
 		estimates.POST("/:id/lines", h.perm.Require("construction", "estimate", "update"), h.CreateEstimateLine)
 		estimates.POST("/:id/lines/bulk", h.perm.Require("construction", "estimate", "update"), h.BulkCreateEstimateLines)
+		// Clone-by-code: create a new line and, if an existing parent line with
+		// the same code lives anywhere in the project, copy all of its
+		// resources (sub-lines) onto the new one. See CloneEstimateLineByCode.
+		estimates.POST("/:id/lines/clone-by-code", h.perm.Require("construction", "estimate", "update"), h.CloneEstimateLineByCode)
 		estimates.POST("/:id/create-products", h.perm.Require("construction", "estimate", "update"), h.CreateProductsFromEstimate)
 		estimates.PUT("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.UpdateEstimateLine)
 		estimates.DELETE("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.DeleteEstimateLine)
