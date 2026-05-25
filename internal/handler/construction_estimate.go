@@ -850,21 +850,30 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 
 	resourceType := c.Query("type") // "labor", "equipment", "material", or empty for all
 
-	// Aggregate across duplicate names by taking the MAX rate — so a resource
+	// Aggregate across duplicate rows by taking the MAX rate — so a resource
 	// that has a non-zero rate in at least one estimate line is returned
 	// with that rate (avoids picking a 0-rate skeleton row).
+	//
+	// Grouping key is (name, uom, resource_type) to match what the Resurslar
+	// tab does, so each variant of the same name surfaces as its own picker
+	// row. Earlier this grouped by name only, which collapsed manually-added
+	// resources sharing a name (different uoms / different types) into one
+	// row — they then "disappeared" from the picker even though the Resurslar
+	// tab still showed them. User report:
+	//     "some still not seeing manually added resources in add resource
+	//      to work modal, but seeing in resources tab"
 	query := `
 		SELECT
 			MIN(el.id) AS id,
 			el.name,
-			MAX(el.uom) AS uom,
+			COALESCE(el.uom, '') AS uom,
 			MAX(el.quantity) AS quantity,
 			MAX(el.material_rate) AS material_rate,
 			MAX(el.labor_rate) AS labor_rate,
 			MAX(el.equipment_rate) AS equipment_rate,
 			MAX(el.unit_rate) AS unit_rate,
 			MAX(COALESCE(el.code, '')) AS code,
-			MAX(COALESCE(el.resource_type, '')) AS resource_type
+			COALESCE(el.resource_type, '') AS resource_type
 		FROM construction_estimate_line el
 		JOIN construction_estimate e ON e.id = el.estimate_id
 		WHERE e.tenant_id = $1
@@ -894,7 +903,7 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 		}
 	}
 
-	query += ` GROUP BY el.name ORDER BY UPPER(el.name) LIMIT 500`
+	query += ` GROUP BY el.name, COALESCE(el.uom, ''), COALESCE(el.resource_type, '') ORDER BY UPPER(el.name), COALESCE(el.uom, '') LIMIT 500`
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -1382,6 +1391,328 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 	})
 }
 
+// CloneEstimateLineByCode — POST /construction/estimates/:id/lines/clone-by-code
+//
+// Creates a new estimate line and, if any existing parent line in the SAME
+// project carries the same `source_code`, copies every one of that line's
+// resource sub-lines onto the new line in one round-trip. The new line itself
+// inherits the source's material/labor/equipment rates, uom and resource_type
+// unless the request explicitly overrides them.
+//
+// When no source line is found, the endpoint just creates the new line with
+// the supplied fields (same as a plain CreateEstimateLine) so the frontend
+// can call this unconditionally on every "+ Ish" / "+ Yangi qo'shimcha etap"
+// submission and let the backend decide whether cloning applies.
+//
+// Body: {
+//   source_code:        string  // required — the code to match against existing lines
+//   parent_line_id?:    int64   // attach the new line as a sub-stage of this work
+//   parent_item_number?: string // top-level: lands the new line under this section
+//   item_number?:       string  // explicit numbering (else auto-derived from parent)
+//   name?:              string  // overrides source's name
+//   uom?:               string  // overrides source's uom
+//   code?:              string  // overrides source's code on the new row (defaults to source_code)
+//   quantity?:          float64 // overrides quantity (defaults to 0)
+// }
+//
+// Returns: { id, cloned_resources, source_id?, source_name? }
+func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	estimateID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid estimate ID")
+		return
+	}
+
+	// Pull the destination estimate so we can scope the code lookup to its
+	// project. Clone semantics are project-wide (the user added a work in
+	// section A and may have shifted to section B keeping the same SHRNK
+	// code), but never cross-tenant or cross-project.
+	var destState string
+	var destProjectID int64
+	err = h.db.QueryRow(`
+		SELECT state, project_id FROM construction_estimate
+		WHERE id = $1 AND tenant_id = $2
+	`, estimateID, tenantID).Scan(&destState, &destProjectID)
+	if err != nil {
+		response.NotFound(c, "Estimate not found")
+		return
+	}
+	if destState != "draft" {
+		response.BadRequest(c, "Only draft estimates can be modified")
+		return
+	}
+
+	var req struct {
+		SourceCode       string   `json:"source_code" binding:"required"`
+		ParentLineID     int64    `json:"parent_line_id"`
+		ParentItemNumber string   `json:"parent_item_number"`
+		ItemNumber       string   `json:"item_number"`
+		Name             string   `json:"name"`
+		UOM              string   `json:"uom"`
+		Code             string   `json:"code"`
+		Quantity         *float64 `json:"quantity"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+	srcCode := strings.TrimSpace(req.SourceCode)
+	if srcCode == "" {
+		response.BadRequest(c, "source_code is required")
+		return
+	}
+
+	// Locate a parent line in this project whose code matches. Parent-level
+	// only (parent_line_id IS NULL OR 0) so we don't accidentally clone a
+	// resource row's children (resources don't have children).
+	//
+	// Tie-break: prefer the candidate with the MOST direct children — the
+	// user almost certainly wants to clone from an imported original that
+	// already carries resources, not from a blank stub they just created
+	// in this same session under the same code. Within the same
+	// child-count tier we fall back to the oldest id (earliest import).
+	//
+	// Case- and whitespace-insensitive comparison so "E0101-197-1 " and
+	// "e0101-197-1" still match what the user typed.
+	var (
+		srcID                                          int64
+		srcName, srcUOM, srcResourceType, srcMaterial string
+		srcMatRate, srcLabRate, srcEqRate             float64
+		srcChildCount                                  int64
+	)
+	err = h.db.QueryRow(`
+		SELECT l.id,
+		       COALESCE(l.name, ''),
+		       COALESCE(l.uom, ''),
+		       COALESCE(l.resource_type, ''),
+		       COALESCE(l.material_type, 'standard'),
+		       COALESCE(l.material_rate, 0),
+		       COALESCE(l.labor_rate, 0),
+		       COALESCE(l.equipment_rate, 0),
+		       (SELECT COUNT(*) FROM construction_estimate_line c
+		         WHERE c.tenant_id = l.tenant_id
+		           AND c.parent_line_id = l.id) AS child_count
+		FROM construction_estimate_line l
+		JOIN construction_estimate e ON e.id = l.estimate_id
+		WHERE e.tenant_id = $1
+		  AND e.project_id = $2
+		  AND UPPER(TRIM(COALESCE(l.code, ''))) = UPPER(TRIM($3))
+		  AND COALESCE(l.parent_line_id, 0) = 0
+		ORDER BY child_count DESC, l.id ASC
+		LIMIT 1
+	`, tenantID, destProjectID, srcCode).Scan(
+		&srcID, &srcName, &srcUOM, &srcResourceType, &srcMaterial,
+		&srcMatRate, &srcLabRate, &srcEqRate, &srcChildCount,
+	)
+	hasSource := err == nil
+
+	// Fill in defaults from the source when the user left a field blank.
+	name := strings.TrimSpace(req.Name)
+	uom := strings.TrimSpace(req.UOM)
+	newCode := strings.TrimSpace(req.Code)
+	if newCode == "" {
+		newCode = srcCode
+	}
+	if hasSource {
+		if name == "" {
+			name = srcName
+		}
+		if uom == "" {
+			uom = srcUOM
+		}
+	}
+	if name == "" {
+		response.BadRequest(c, "name is required")
+		return
+	}
+
+	// Run the clone inside a single transaction so a partial copy never
+	// leaks (either the new work + every cloned resource lands, or none).
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to open clone transaction", "error", err)
+		response.InternalError(c, "Failed to clone line")
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var parentLineArg interface{}
+	if req.ParentLineID > 0 {
+		parentLineArg = req.ParentLineID
+	}
+	var parentItemArg interface{}
+	if strings.TrimSpace(req.ParentItemNumber) != "" {
+		parentItemArg = req.ParentItemNumber
+	}
+	itemNumberArg := strings.TrimSpace(req.ItemNumber)
+	qty := 0.0
+	if req.Quantity != nil {
+		qty = *req.Quantity
+	}
+
+	matRate := srcMatRate
+	labRate := srcLabRate
+	eqRate := srcEqRate
+	if !hasSource {
+		matRate, labRate, eqRate = 0, 0, 0
+	}
+	unitRate := matRate + labRate + eqRate
+
+	// Insert the new line. Mirrors the column set CreateEstimateLine uses
+	// so trigger-set defaults (original_quantity / original_unit_rate from
+	// migration 349) and constraints stay consistent.
+	var newID int64
+	err = tx.QueryRow(`
+		INSERT INTO construction_estimate_line (
+			tenant_id, estimate_id, parent_line_id, parent_item_number,
+			item_number, code, name, uom,
+			resource_type, material_type,
+			quantity, quantity_override,
+			material_rate, labor_rate, equipment_rate,
+			unit_rate, total_amount,
+			norm_rate, sort_order,
+			created_date, updated_date
+		) VALUES (
+			$1, $2, $3, $4,
+			NULLIF($5, ''), NULLIF($6, ''), $7, $8,
+			$9, COALESCE(NULLIF($10, ''), 'standard'),
+			$11, TRUE,
+			$12, $13, $14,
+			$15, $16,
+			0, 0,
+			NOW(), NOW()
+		) RETURNING id
+	`,
+		tenantID, estimateID, parentLineArg, parentItemArg,
+		itemNumberArg, newCode, name, uom,
+		srcResourceType, srcMaterial,
+		qty,
+		matRate, labRate, eqRate,
+		unitRate, qty*unitRate,
+	).Scan(&newID)
+	if err != nil {
+		h.log.Error("Failed to insert cloned line", "error", err, "source_code", srcCode)
+		response.InternalError(c, "Failed to create line")
+		return
+	}
+
+	// Clone every resource sub-line of the source onto the new line. We
+	// preserve norm_rate, unit_rate, material_type, resource_type, uom and
+	// the per-component rates exactly. quantity is re-derived from the new
+	// parent's qty × norm_rate so the JAMI column matches the new work's
+	// scale (this is the same cascade rule UpdateEstimateLine uses).
+	clonedCount := 0
+	if hasSource {
+		rows, qerr := tx.Query(`
+			SELECT COALESCE(name, ''), COALESCE(uom, ''),
+			       COALESCE(resource_type, ''),
+			       COALESCE(material_type, 'standard'),
+			       COALESCE(material_rate, 0), COALESCE(labor_rate, 0),
+			       COALESCE(equipment_rate, 0), COALESCE(unit_rate, 0),
+			       COALESCE(norm_rate, 0)
+			FROM construction_estimate_line
+			WHERE tenant_id = $1
+			  AND parent_line_id = $2
+			ORDER BY subline_seq ASC, id ASC
+		`, tenantID, srcID)
+		if qerr != nil {
+			h.log.Error("Failed to read source children", "error", qerr, "source_id", srcID)
+			response.InternalError(c, "Failed to clone children")
+			return
+		}
+		type childRow struct {
+			Name, UOM, ResType, MatType                       string
+			MatRate, LabRate, EqRate, UnitRate, NormRate      float64
+		}
+		var children []childRow
+		for rows.Next() {
+			var ch childRow
+			if scanErr := rows.Scan(
+				&ch.Name, &ch.UOM, &ch.ResType, &ch.MatType,
+				&ch.MatRate, &ch.LabRate, &ch.EqRate, &ch.UnitRate, &ch.NormRate,
+			); scanErr != nil {
+				rows.Close()
+				h.log.Error("Failed to scan source child", "error", scanErr)
+				response.InternalError(c, "Failed to clone children")
+				return
+			}
+			children = append(children, ch)
+		}
+		rows.Close()
+
+		for i, ch := range children {
+			childQty := qty * ch.NormRate
+			_, ierr := tx.Exec(`
+				INSERT INTO construction_estimate_line (
+					tenant_id, estimate_id, parent_line_id, parent_item_number,
+					item_number, name, uom,
+					resource_type, material_type,
+					quantity, quantity_override,
+					material_rate, labor_rate, equipment_rate,
+					unit_rate, total_amount,
+					norm_rate, subline_seq, sort_order,
+					created_date, updated_date
+				) VALUES (
+					$1, $2, $3, NULL,
+					NULL, $4, $5,
+					$6, $7,
+					$8, FALSE,
+					$9, $10, $11,
+					$12, $13,
+					$14, $15, 0,
+					NOW(), NOW()
+				)
+			`,
+				tenantID, estimateID, newID,
+				ch.Name, ch.UOM,
+				ch.ResType, ch.MatType,
+				childQty,
+				ch.MatRate, ch.LabRate, ch.EqRate,
+				ch.UnitRate, childQty*ch.UnitRate,
+				ch.NormRate, i+1,
+			)
+			if ierr != nil {
+				h.log.Error("Failed to insert cloned child", "error", ierr, "source_id", srcID, "i", i)
+				response.InternalError(c, "Failed to clone children")
+				return
+			}
+			clonedCount++
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit clone transaction", "error", err)
+		response.InternalError(c, "Failed to clone line")
+		return
+	}
+	committed = true
+
+	// Recompute estimate totals so the topbar pills and Form 2 rollups
+	// pick up the freshly cloned resources without a manual refresh.
+	h.recalculateEstimateTotals(estimateID)
+
+	out := map[string]interface{}{
+		"id":               newID,
+		"cloned_resources": clonedCount,
+	}
+	if hasSource {
+		out["source_id"] = srcID
+		out["source_name"] = srcName
+	}
+	response.Success(c, out)
+}
+
 // BulkCreateEstimateLines creates multiple estimate lines in a single transaction
 func (h *Handler) BulkCreateEstimateLines(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -1859,7 +2190,7 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 	isActualAmountOnly := req.ActualAmount != nil && req.WBSID == nil && req.Name == nil && req.UOM == nil &&
 		req.Quantity == nil && req.MaterialRate == nil && req.LaborRate == nil && req.EquipmentRate == nil && req.SortOrder == nil &&
 		req.Code == nil && req.ItemNumber == nil && req.ResourceType == nil && req.NormRate == nil && req.UnitPrice == nil &&
-		req.QuantityOverride == nil
+		req.QuantityOverride == nil && req.OriginalQuantity == nil
 
 	if state != "draft" && !isActualAmountOnly {
 		response.BadRequest(c, "Only draft estimates can be modified")
@@ -2006,6 +2337,11 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("quantity_override = $%d", argCount))
 		args = append(args, *req.QuantityOverride)
+	}
+	if req.OriginalQuantity != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("original_quantity = $%d", argCount))
+		args = append(args, *req.OriginalQuantity)
 	}
 	if req.MaterialType != nil {
 		// Validate against the schema CHECK constraint so we get a 400 instead
@@ -2503,6 +2839,10 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		             -- once in Go. Migration 378 added a partial index
 		             -- on construction_estimate(project_id, tenant_id)
 		             -- WHERE source_type='vor' that this clause uses.
+		             -- Same priority as the other VOR NORMA fallback
+		             -- (see lines ~713): imported_quantity > original_
+		             -- quantity > live quantity, so this matches what
+		             -- Smetalar tab actually displays.
 		             SELECT vl.quantity
 		             FROM construction_estimate_line vl
 		             JOIN construction_estimate ve ON ve.id = vl.estimate_id
