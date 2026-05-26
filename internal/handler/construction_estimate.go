@@ -1538,18 +1538,21 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 		return
 	}
 
-	// Locate a parent line in this project whose code matches. Parent-level
-	// only (parent_line_id IS NULL OR 0) so we don't accidentally clone a
-	// resource row's children (resources don't have children).
+	// Locate a line in this project whose code matches. We accept BOTH
+	// top-level parents AND sub-stages (sub-stages are sub-lines of a
+	// work but can themselves carry resources — the user's "1122" etap
+	// added via "+ Yangi bosqich qo'shish" is exactly this shape). The
+	// "MOST children" tie-break naturally pushes resource leaf rows
+	// (zero children) to the back, so we never accidentally clone from
+	// a resource row that has no payload to copy.
 	//
-	// Tie-break: prefer the candidate with the MOST direct children — the
-	// user almost certainly wants to clone from an imported original that
-	// already carries resources, not from a blank stub they just created
-	// in this same session under the same code. Within the same
-	// child-count tier we fall back to the oldest id (earliest import).
+	// Tie-break: prefer the candidate with the MOST direct children —
+	// the user almost certainly wants to clone from a line that already
+	// has resources, not from a blank stub they created earlier under
+	// the same code. Within the same child-count tier we fall back to
+	// the oldest id (earliest import).
 	//
-	// Case- and whitespace-insensitive comparison so "E0101-197-1 " and
-	// "e0101-197-1" still match what the user typed.
+	// Case- and whitespace-insensitive comparison.
 	var (
 		srcID                                          int64
 		srcName, srcUOM, srcResourceType, srcMaterial string
@@ -1573,7 +1576,6 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 		WHERE e.tenant_id = $1
 		  AND e.project_id = $2
 		  AND UPPER(TRIM(COALESCE(l.code, ''))) = UPPER(TRIM($3))
-		  AND COALESCE(l.parent_line_id, 0) = 0
 		ORDER BY child_count DESC, l.id ASC
 		LIMIT 1
 	`, tenantID, destProjectID, srcCode).Scan(
@@ -1639,6 +1641,23 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 	}
 	unitRate := matRate + labRate + eqRate
 
+	// When the new line is a sub-line (parent_line_id set), auto-assign
+	// the next subline_seq for that parent. Without this the column
+	// defaults to 0 and conflicts with the (parent_line_id, subline_seq)
+	// unique index from migration 332 if another sub-line already exists
+	// — surfaces as "duplicate key value violates unique constraint
+	// uq_estimate_line_parent_seq" 500 on the clone endpoint.
+	var newSublineSeq int
+	if req.ParentLineID > 0 {
+		if err := tx.QueryRow(`
+			SELECT COALESCE(MAX(subline_seq), 0) + 1
+			FROM construction_estimate_line
+			WHERE parent_line_id = $1 AND tenant_id = $2
+		`, req.ParentLineID, tenantID).Scan(&newSublineSeq); err != nil {
+			newSublineSeq = 1
+		}
+	}
+
 	// Insert the new line. Mirrors the column set CreateEstimateLine uses
 	// so trigger-set defaults (original_quantity / original_unit_rate from
 	// migration 349) and constraints stay consistent.
@@ -1653,8 +1672,10 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 			resource_type, material_type,
 			quantity, quantity_override,
 			material_rate, labor_rate, equipment_rate,
-			unit_rate, total_amount,
-			norm_rate, sort_order,
+			unit_rate, sort_order,
+			subline_seq,
+			total_amount,
+			norm_rate,
 			is_manual,
 			created_date, updated_date
 		) VALUES (
@@ -1663,8 +1684,10 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 			$9, COALESCE(NULLIF($10, ''), 'standard'),
 			$11, TRUE,
 			$12, $13, $14,
-			$15, $16,
-			0, 0,
+			$15, 0,
+			$17,
+			$16,
+			0,
 			TRUE,
 			NOW(), NOW()
 		) RETURNING id
@@ -1675,6 +1698,7 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 		qty,
 		matRate, labRate, eqRate,
 		unitRate, qty*unitRate,
+		newSublineSeq,
 	).Scan(&newID)
 	if err != nil {
 		h.log.Error("Failed to insert cloned line", "error", err, "source_code", srcCode)
