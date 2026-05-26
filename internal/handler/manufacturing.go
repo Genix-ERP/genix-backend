@@ -2056,9 +2056,14 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			return
 		}
 
-		// Step 2: Now create work orders from the collected operations
+		// Step 2: Now create work orders from the collected operations.
+		// We use a 1-based loop index in the work-order code instead of
+		// op.Sequence — operators sometimes set the same sequence number
+		// on parallel operations (e.g. two ops both at seq=30), which
+		// used to collide on the (tenant_id, organization_id, code)
+		// unique index inside this transaction and fail the whole confirm.
 		now := time.Now()
-		for _, op := range operations {
+		for woIdx, op := range operations {
 			totalTimeMinutes := op.SetupTime + (op.RunTime * quantityPlanned)
 			totalTimeHours := totalTimeMinutes / 60.0
 
@@ -2089,7 +2094,10 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			}
 
 			woID := uuid.New()
-			woCode := fmt.Sprintf("WO-%s-%d", id.String()[:8], op.Sequence)
+			// 12-char UUID prefix (instead of 8) drops cross-MO collision risk
+			// to effectively zero; woIdx+1 guarantees uniqueness within this MO
+			// even when two BOM operations share a sequence number.
+			woCode := fmt.Sprintf("WO-%s-%d", id.String()[:12], woIdx+1)
 			woName := fmt.Sprintf("%s - %s", productName, op.OperationName)
 
 			woQuery := `
@@ -2131,7 +2139,7 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 	tx.QueryRow(`SELECT COUNT(*) FROM work_orders WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&confirmWOCount)
 	if confirmWOCount == 0 {
 		woID := uuid.New()
-		woCode := fmt.Sprintf("WO-%s-1", id.String()[:8])
+		woCode := fmt.Sprintf("WO-%s-1", id.String()[:12])
 		woName := productName + " - Ishlab chiqarish"
 		_, err = tx.Exec(`
 			INSERT INTO work_orders (
@@ -2356,7 +2364,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				qty = 1
 			}
 			woID := uuid.New()
-			woCode := fmt.Sprintf("WO-%s-1", id.String()[:8])
+			woCode := fmt.Sprintf("WO-%s-1", id.String()[:12])
 			woName := "Ishlab chiqarish"
 			if poProductName != "" {
 				woName = poProductName + " - Ishlab chiqarish"
