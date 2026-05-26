@@ -112,6 +112,11 @@ func (c *Client) login() error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// When CRM_API_BASE is the internal http://yuksalish-backend:8000 URL,
+	// Django's SECURE_SSL_REDIRECT would 301 us to https. Telling it we
+	// already came in via TLS (the way nginx does for browser traffic)
+	// short-circuits that. Harmless when the base is already https://.
+	req.Header.Set("X-Forwarded-Proto", "https")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("crm login: %w", err)
@@ -155,6 +160,7 @@ func (c *Client) tryRefresh() error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Forwarded-Proto", "https")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -224,6 +230,7 @@ func (c *Client) do(reqBuilder func() (*http.Request, error)) (*http.Response, e
 		c.mu.Unlock()
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
+		req.Header.Set("X-Forwarded-Proto", "https")
 		return c.httpClient.Do(req)
 	}
 
