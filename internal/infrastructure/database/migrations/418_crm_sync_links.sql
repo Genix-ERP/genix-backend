@@ -1,6 +1,13 @@
--- 404_crm_sync_links.sql
+-- 418_crm_sync_links.sql
 -- Adds the columns + tables that wire Genix's construction module to the
 -- Yuksalish CRM's project/block/block_progress hierarchy.
+--
+-- Originally numbered 404; renumbered to 418 because the version-404 slot
+-- was taken by 404_reverse_buggy_po_receipt_journal_entries.sql before
+-- this file shipped, and the runner tracks by integer version only (so
+-- a file sharing a number with an already-applied one gets silently
+-- skipped). Every statement here is IF NOT EXISTS, so re-running on an
+-- env where the original 404 *did* apply is a no-op.
 --
 -- Linking model (set by the user, one time, in the UI):
 --   construction_projects.crm_project_id    -> CRM project id
