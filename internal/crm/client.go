@@ -314,8 +314,10 @@ func (c *Client) decodeOrError(resp *http.Response, out interface{}) error {
 }
 
 // ListProjects fetches every CRM project the service user can see.
+// CRM mounts ProjectViewSet at the root of /api/projects/ (the router
+// registers it with r''), not at /api/projects/projects/.
 func (c *Client) ListProjects() ([]Project, error) {
-	resp, err := c.do(jsonReqBuilder("GET", c.baseURL+"/projects/projects/", nil))
+	resp, err := c.do(jsonReqBuilder("GET", c.baseURL+"/projects/", nil))
 	if err != nil {
 		return nil, err
 	}
