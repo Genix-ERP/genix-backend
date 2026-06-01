@@ -1232,6 +1232,13 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 	var parentDoneQuantity float64
 	var parentSectionPath string
 	var parentName string
+	// Parent's OWN item_number (e.g. "13"), captured here at the outer
+	// scope so the later tx block can compose the "13-N" suffix once
+	// subline_seq is known. Distinct from `parentItemNumber`, which is
+	// the value stored on the new row's parent_item_number column — for
+	// sub-stages that's the parent's parent_item_number (the SECTION path),
+	// not the parent's item_number.
+	var parentOwnItemNumber string
 	if req.ParentLineID > 0 {
 		var pItem, pUom, pParentItem sql.NullString
 		var pQty float64
@@ -1283,6 +1290,7 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		} else {
 			parentItemNumber = pItem.String
 		}
+		parentOwnItemNumber = pItem.String
 		parentQuantity = pQty
 
 		// Inherit the parent's sort_order so the backend ORDER BY places the
@@ -1294,19 +1302,19 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 			req.SortOrder = pSortOrder
 		}
 
-		// Auto-assign the next subline_seq for this parent
-		if err := h.db.QueryRow(`
-			SELECT COALESCE(MAX(subline_seq), 0) + 1
-			FROM construction_estimate_line
-			WHERE parent_line_id = $1 AND tenant_id = $2
-		`, req.ParentLineID, tenantID).Scan(&sublineSeq); err != nil {
-			sublineSeq = 1
-		}
-
-		// Compose item_number if the client didn't pin one explicitly.
-		if assignedItemNum == "" && pItem.String != "" {
-			assignedItemNum = fmt.Sprintf("%s-%d", pItem.String, sublineSeq)
-		}
+		// subline_seq is auto-assigned inside the same transaction as the
+		// INSERT below (see "tx, err := h.db.Begin()" further down) so
+		// concurrent "+ Qo'shimcha resurs" / "+ Yangi etap" clicks under
+		// the same parent can't both read MAX = N and both insert N+1 —
+		// the second one would otherwise crash on the
+		// uq_estimate_line_parent_seq (parent_line_id, subline_seq) unique
+		// constraint (migration 332) and surface as the intermittent
+		// "adding resource sometimes fails" 500 the field team reported.
+		// The actual SELECT-MAX runs after the FOR UPDATE row lock is
+		// taken so it sees every concurrent sibling.
+		//
+		// item_number composition also moves under the lock — without the
+		// new subline_seq it'd resolve to the wrong "13-N" suffix.
 
 		// Sub-line quantity = parent.quantity × norm_rate, denormalized so
 		// existing reports don't need to know about the sub-line model.
@@ -1364,8 +1372,60 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		uom = "шт"
 	}
 
+	// Insert runs in a transaction so the subline_seq MAX+1 assign + INSERT
+	// happen atomically against the parent row. When req.ParentLineID > 0
+	// we take a FOR UPDATE row lock on the parent first; concurrent
+	// "+ Qo'shimcha resurs" / "+ Yangi etap" clicks under the same parent
+	// queue on that lock instead of both reading MAX = N and both inserting
+	// N+1 (the second of which would crash on the uq_estimate_line_parent_seq
+	// unique constraint from migration 332). Sibling inserts under a
+	// DIFFERENT parent take a different row lock and proceed in parallel,
+	// so this doesn't introduce a global bottleneck.
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin estimate line insert tx", "error", err)
+		response.InternalError(c, "Failed to create estimate line")
+		return
+	}
+	txCommitted := false
+	defer func() {
+		if !txCommitted {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if req.ParentLineID > 0 {
+		// FOR UPDATE row lock — serializes concurrent sibling inserts.
+		if _, lockErr := tx.Exec(`
+			SELECT 1 FROM construction_estimate_line
+			WHERE id = $1 AND tenant_id = $2
+			FOR UPDATE
+		`, req.ParentLineID, tenantID); lockErr != nil {
+			h.log.Error("Failed to lock parent line for sub-insert", "error", lockErr, "parent_line_id", req.ParentLineID)
+			response.InternalError(c, "Failed to create estimate line")
+			return
+		}
+
+		// Inside the lock we can safely MAX+1 — no other writer can land a
+		// sibling between this read and our INSERT.
+		if seqErr := tx.QueryRow(`
+			SELECT COALESCE(MAX(subline_seq), 0) + 1
+			FROM construction_estimate_line
+			WHERE parent_line_id = $1 AND tenant_id = $2
+		`, req.ParentLineID, tenantID).Scan(&sublineSeq); seqErr != nil {
+			sublineSeq = 1
+		}
+
+		// Compose item_number now that subline_seq is final. We deliberately
+		// only auto-fill when the client left it blank — explicit values
+		// from the modal still win.
+		if assignedItemNum == "" && parentOwnItemNumber != "" {
+			assignedItemNum = fmt.Sprintf("%s-%d", parentOwnItemNumber, sublineSeq)
+		}
+	}
+
 	var lineID int64
-	err = h.db.QueryRow(`
+	err = tx.QueryRow(`
 		INSERT INTO construction_estimate_line (
 			tenant_id, estimate_id, wbs_id, name, uom, quantity,
 			material_rate, labor_rate, equipment_rate,
@@ -1396,6 +1456,13 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		response.InternalError(c, "Failed to create estimate line")
 		return
 	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit estimate line insert tx", "error", err)
+		response.InternalError(c, "Failed to create estimate line")
+		return
+	}
+	txCommitted = true
 
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
@@ -2498,77 +2565,60 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 
 	// Cascade quantity changes to non-override children.
 	//
-	// When the user edits ISH HAJMI on a parent work in the Smeta
-	// boshqaruvi → Ishlar tab, every child sub-line whose
-	// quantity_override = FALSE should recompute
+	// When the user edits ISH HAJMI on ANY line that has children — a
+	// top-level work OR a sub-stage (sub-stages have parent_line_id
+	// set, but ALSO carry their own resource children) — every child
+	// sub-line whose quantity_override = FALSE should recompute
 	//     child.quantity     = new_parent_qty × child.norm_rate
 	//     child.total_amount = child.quantity × child.unit_rate
-	// so the JAMI / SUMMA columns and the rollup row at the bottom of
-	// the expanded card pick up the new values. Without this the parent
-	// updates but children stay at the template-mode 0 from import,
-	// which is exactly the "why is SUMMA still 0" report.
+	// so the JAMI / SUMMA columns pick up the new values.
 	//
-	// The same logic already runs on the Reset button (see
-	// ResetLineQuantity below) — this just makes it run on regular
-	// edits too. We only fire when the request actually changed
-	// quantity, and only when the row is a parent (parent_line_id IS
-	// NULL) — children's qty edits don't cascade further.
+	// Earlier this fired only for top-level works (parent_line_id
+	// IS NULL). User report: typing FAKT on a sub-stage left every
+	// inner resource at 0. The cascade UPDATE itself is a no-op when
+	// the line has no children (it just touches zero rows), so we
+	// can fire it unconditionally on any quantity update.
 	if req.Quantity != nil {
-		var isParent bool
-		_ = h.db.QueryRow(`
-			SELECT parent_line_id IS NULL FROM construction_estimate_line
-			WHERE id = $1 AND tenant_id = $2
-		`, lineID, tenantID).Scan(&isParent)
-		if isParent {
-			// Cascade fires on every non-override child PLUS any
-			// "stale-override" child that was created with
-			// quantity_override = TRUE but quantity = 0 — a leftover
-			// from a client bundle that mis-stamped the flag. Healing
-			// those rows here (resetting their override and computing
-			// qty from parent × norm) means the user doesn't have to
-			// delete + re-add the resource after a backend update.
-			if _, cascadeErr := h.db.Exec(`
-				UPDATE construction_estimate_line c
-				SET quantity          = $1 * COALESCE(c.norm_rate, 0),
-				    total_amount      = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
-				    quantity_override = FALSE,
-				    updated_date      = NOW()
-				WHERE c.parent_line_id = $2
-				  AND (
-				    COALESCE(c.quantity_override, FALSE) = FALSE
-				    OR (COALESCE(c.quantity_override, FALSE) = TRUE
-				        AND COALESCE(c.quantity, 0) = 0
-				        AND COALESCE(c.norm_rate, 0) > 0)
-				  )
-			`, *req.Quantity, lineID); cascadeErr != nil {
-				h.log.Error("Failed to cascade quantity to children",
-					"error", cascadeErr, "parent_line_id", lineID)
-			}
-			// Mirror ISH HAJMI → BAJARILDI for the parent so the
-			// Bosqichlar tab's done_quantity column matches the new
-			// plan. Counterpart of the mirror in UpdateWorkDoneQuantity
-			// — the two screens are now bound to a single logical
-			// "work amount" in template-mode workflows. approval_status
-			// also follows: 0 → pending, >0 → in_progress (mirrors the
-			// foreman-side rule so the status badge stays consistent).
-			newStatus := "pending"
-			if *req.Quantity > 0 {
-				newStatus = "in_progress"
-			}
-			if _, mirrorErr := h.db.Exec(`
-				UPDATE construction_estimate_line
-				SET done_quantity   = $1,
-				    approval_status = CASE
-				        WHEN COALESCE(approval_status, 'pending') IN ('pending', 'in_progress')
-				          THEN $2
-				        ELSE approval_status
-				    END,
-				    updated_date = NOW()
-				WHERE id = $3 AND tenant_id = $4
-			`, *req.Quantity, newStatus, lineID, tenantID); mirrorErr != nil {
-				h.log.Error("Failed to mirror plan quantity to done_quantity",
-					"error", mirrorErr, "line_id", lineID)
-			}
+		if _, cascadeErr := h.db.Exec(`
+			UPDATE construction_estimate_line c
+			SET quantity          = $1 * COALESCE(c.norm_rate, 0),
+			    total_amount      = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
+			    quantity_override = FALSE,
+			    updated_date      = NOW()
+			WHERE c.parent_line_id = $2
+			  AND (
+			    COALESCE(c.quantity_override, FALSE) = FALSE
+			    OR (COALESCE(c.quantity_override, FALSE) = TRUE
+			        AND COALESCE(c.quantity, 0) = 0
+			        AND COALESCE(c.norm_rate, 0) > 0)
+			  )
+		`, *req.Quantity, lineID); cascadeErr != nil {
+			h.log.Error("Failed to cascade quantity to children",
+				"error", cascadeErr, "parent_line_id", lineID)
+		}
+
+		// Mirror ISH HAJMI → BAJARILDI on the row itself. For
+		// top-level works this drives the Bosqichlar BAJARILDI column;
+		// for sub-stages it does the same against the sub-stage's own
+		// done_quantity. Approval_status follows: 0 → pending,
+		// >0 → in_progress.
+		newStatus := "pending"
+		if *req.Quantity > 0 {
+			newStatus = "in_progress"
+		}
+		if _, mirrorErr := h.db.Exec(`
+			UPDATE construction_estimate_line
+			SET done_quantity   = $1,
+			    approval_status = CASE
+			        WHEN COALESCE(approval_status, 'pending') IN ('pending', 'in_progress')
+			          THEN $2
+			        ELSE approval_status
+			    END,
+			    updated_date = NOW()
+			WHERE id = $3 AND tenant_id = $4
+		`, *req.Quantity, newStatus, lineID, tenantID); mirrorErr != nil {
+			h.log.Error("Failed to mirror plan quantity to done_quantity",
+				"error", mirrorErr, "line_id", lineID)
 		}
 	}
 
