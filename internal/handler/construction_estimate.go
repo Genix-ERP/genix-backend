@@ -1345,6 +1345,30 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		}
 	}
 
+	// Top-level work without parent — append to the END of its section
+	// instead of letting sort_order default to 0 (which would put the new
+	// "+ Ish" line ABOVE every imported row in that section, surfaced by
+	// the user as the "123" row appearing at the top of ФУНДАМЕНТЫ before
+	// row #8). We take MAX(sort_order)+1 inside the same estimate AND the
+	// same parent_item_number — scoped this way so:
+	//   • Adding a work to ФУНДАМЕНТЫ doesn't jump it past unrelated
+	//     ЗЕМЛЯННЫЕ work rows that happen to have higher sort_order.
+	//   • Two sections with overlapping sort_order numbers don't fight.
+	// Skip when client pinned a SortOrder explicitly (≥ 1) — that
+	// overrides our default.
+	if req.ParentLineID == 0 && req.SortOrder == 0 {
+		var maxSort int
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(MAX(sort_order), 0)
+			FROM construction_estimate_line
+			WHERE estimate_id = $1
+			  AND tenant_id   = $2
+			  AND parent_line_id IS NULL
+			  AND COALESCE(parent_item_number, '') = $3
+		`, estimateID, tenantID, req.ParentItemNumber).Scan(&maxSort)
+		req.SortOrder = maxSort + 1
+	}
+
 	// UnitPrice convenience: if the caller set it, map it onto the rate column
 	// that matches resource_type. This keeps the existing unit_rate =
 	// material_rate + labor_rate + equipment_rate invariant intact.

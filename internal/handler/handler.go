@@ -2205,6 +2205,21 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 			h.perm.Require("construction", "estimate", "update"), h.DeleteForm2Snapshot)
 	}
 
+	// Forma 2 iterations — multi-run series (migration 419). The iter
+	// header lives at the project level (one open per project); the
+	// Bosqichlar tab uses these to render "Forma 2 #1, #2, #3" tabs.
+	// Freezing an iteration also writes a construction_form2_snapshot
+	// row so the Smeta boshqaruvi → Formalar tarixi list never drifts
+	// out of sync with the iteration tab strip.
+	form2Iters := rg.Group("/construction/projects/:id/form2-iterations")
+	form2Iters.Use(h.perm.Require("construction", "estimate", "read"))
+	{
+		form2Iters.GET("", h.ListForm2Iterations)
+		form2Iters.POST("",
+			h.perm.Require("construction", "estimate", "update"), h.CreateForm2Iteration)
+		form2Iters.GET("/:iter_id/lines", h.GetForm2IterationLines)
+	}
+
 	// v2 Stages workflow — work approval transitions.
 	// Permissions are enforced inside the handlers based on the caller's
 	// project role (foreman / supervisor / engineer); the route-level
