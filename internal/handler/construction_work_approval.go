@@ -248,9 +248,80 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 	// number IS the BAJARILDI value — capping at plan would freeze the
 	// foreman at 0. The Smeta boshqaruvi ISH HAJMI mirror below keeps
 	// the two screens in sync regardless of which one was edited last.
-	done := body.DoneQuantity
-	if done < 0 {
-		done = 0
+	//
+	// NOTE on semantics (migration 419 / multi-iteration Forma 2):
+	// `body.DoneQuantity` now represents this OPEN iteration's
+	// period contribution, not the cumulative. The wire field name
+	// stays `done_quantity` so the frontend doesn't need to flip its
+	// payload shape, but conceptually:
+	//
+	//   period_fakt (this iteration)         = body.DoneQuantity
+	//   line.done_quantity (cumulative)      = Σ period_fakt across iters
+	//
+	// Legacy behaviour is preserved because the migration 419 backfill
+	// stamped iteration #1.period_fakt = old done_quantity for every
+	// line, and there's exactly one open iter per project. Until the
+	// first freeze, this endpoint behaves identically to before.
+	periodFakt := body.DoneQuantity
+	if periodFakt < 0 {
+		periodFakt = 0
+	}
+
+	// Resolve the open iteration for this project. If none exists
+	// (shouldn't happen post-backfill, but defence in depth), bootstrap
+	// one so the write doesn't silently no-op.
+	var openIterID int64
+	err = h.db.QueryRow(`
+		SELECT id FROM construction_form2_iteration
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'open'
+	`, ctx.ProjectID, tenantID).Scan(&openIterID)
+	if err == sql.ErrNoRows {
+		if insertErr := h.db.QueryRow(`
+			INSERT INTO construction_form2_iteration
+			    (tenant_id, project_id, iteration_seq, status, opened_at, opened_by)
+			VALUES ($1, $2, 1, 'open', NOW(), $3)
+			RETURNING id
+		`, tenantID, ctx.ProjectID, userID).Scan(&openIterID); insertErr != nil {
+			h.log.Error("Failed to seed open iteration on fakt write", "error", insertErr)
+			response.InternalError(c, "Failed to update done quantity")
+			return
+		}
+	} else if err != nil {
+		h.log.Error("Failed to resolve open iteration", "error", err)
+		response.InternalError(c, "Failed to update done quantity")
+		return
+	}
+
+	// Upsert this line's period_fakt for the open iteration. Migration
+	// 419 pre-creates iteration_line rows on freeze, but legacy
+	// estimate_lines created BEFORE 419 ran on this DB, or new lines
+	// inserted into an existing project after iteration #N opened, may
+	// not have a row yet — INSERT … ON CONFLICT covers both.
+	if _, err := h.db.Exec(`
+		INSERT INTO construction_form2_iteration_line
+		    (iteration_id, estimate_line_id, period_fakt, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (iteration_id, estimate_line_id)
+		DO UPDATE SET period_fakt = EXCLUDED.period_fakt,
+		              updated_at  = NOW()
+	`, openIterID, lineID, periodFakt); err != nil {
+		h.log.Error("Failed to write period_fakt", "error", err, "line_id", lineID, "iter_id", openIterID)
+		response.InternalError(c, "Failed to update done quantity")
+		return
+	}
+
+	// Recompute the cumulative done_quantity = Σ period_fakt across
+	// every iteration for this line. Frozen iters contribute their
+	// historical numbers, the open iter contributes what we just wrote.
+	var done float64
+	if err := h.db.QueryRow(`
+		SELECT COALESCE(SUM(period_fakt), 0)
+		FROM construction_form2_iteration_line
+		WHERE estimate_line_id = $1
+	`, lineID).Scan(&done); err != nil {
+		h.log.Error("Failed to recompute cumulative done_quantity", "error", err)
+		response.InternalError(c, "Failed to update done quantity")
+		return
 	}
 
 	newStatus := "pending"
