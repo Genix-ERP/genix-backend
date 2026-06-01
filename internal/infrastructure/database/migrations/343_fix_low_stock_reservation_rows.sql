@@ -38,23 +38,41 @@ WHERE type = 'low_stock'
 -- ─── Pass B — backfill data + refresh title/message where the reservation
 --               still exists (so web can retranslate and mobile shows clean
 --               Uzbek defaults). ─────────────────────────────────────────────
-UPDATE notifications n
-SET title   = 'Material bron qilish so''rovi',
-    message = COALESCE(p.name, 'Mahsulot')
-              || ' uchun bron qilish so''rovi (miqdori: '
-              || TRIM(TO_CHAR(COALESCE(mr.quantity, 0), 'FM9999999990.00'))
-              || ')',
-    data    = COALESCE(n.data, '{}'::jsonb)
-              || jsonb_build_object(
-                   'product_name', COALESCE(p.name, ''),
-                   'quantity',     COALESCE(mr.quantity, 0)
-                 )
-FROM material_reservations mr
-LEFT JOIN products p ON p.id = mr.product_id
-WHERE n.type = 'material_reservation_request'
-  AND n.data ? 'reservation_id'
-  AND NOT (n.data ? 'product_name')
-  AND mr.id::text = n.data->>'reservation_id';
+--
+-- Wrapped in a table-existence check because some legacy production DBs have
+-- schema_migrations marked through 310 but never actually created the
+-- material_reservations table (DB restore from a logical dump that copied
+-- the migrations table without copying all the data tables). Without this
+-- guard the migration runner crash-loops on every container start.
+-- Pass A is independent of material_reservations and always runs.
+DO $mr$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_tables
+        WHERE schemaname = 'public' AND tablename = 'material_reservations'
+    ) THEN
+        UPDATE notifications n
+        SET title   = 'Material bron qilish so''rovi',
+            message = COALESCE(p.name, 'Mahsulot')
+                      || ' uchun bron qilish so''rovi (miqdori: '
+                      || TRIM(TO_CHAR(COALESCE(mr.quantity, 0), 'FM9999999990.00'))
+                      || ')',
+            data    = COALESCE(n.data, '{}'::jsonb)
+                      || jsonb_build_object(
+                           'product_name', COALESCE(p.name, ''),
+                           'quantity',     COALESCE(mr.quantity, 0)
+                         )
+        FROM material_reservations mr
+        LEFT JOIN products p ON p.id = mr.product_id
+        WHERE n.type = 'material_reservation_request'
+          AND n.data ? 'reservation_id'
+          AND NOT (n.data ? 'product_name')
+          AND mr.id::text = n.data->>'reservation_id';
+    ELSE
+        RAISE NOTICE 'Skipping Pass B: material_reservations table does not exist (legacy DB).';
+    END IF;
+END
+$mr$;
 
 -- ─── Pass C — orphan rows (reservation deleted). At minimum replace the
 --               broken English title/message with a generic Uzbek default so
