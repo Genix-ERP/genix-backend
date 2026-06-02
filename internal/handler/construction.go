@@ -2564,17 +2564,17 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 
 	query := `
 		INSERT INTO construction_photo_reports (
-			tenant_id, project_id, smeta_item_id, section_id,
+			tenant_id, project_id, smeta_item_id, section_id, building_id,
 			report_date, report_type, title, description, location_description,
 			gps_latitude, gps_longitude, weather, temperature,
 			photos, reported_by, review_status, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', NOW(), NOW())
 		RETURNING id
 	`
 
 	var reportID int64
 	err = h.db.QueryRow(query,
-		tenantID, projectID, nullInt64(req.SmetaItemID), nullInt64(req.SectionID),
+		tenantID, projectID, nullInt64(req.SmetaItemID), nullInt64(req.SectionID), nullInt64(req.BuildingID),
 		reportDate, nullString(req.ReportType), nullString(req.Title), nullString(req.Description), nullString(req.LocationDescription),
 		nullFloat64(req.GpsLatitude), nullFloat64(req.GpsLongitude), nullString(req.Weather), nullFloat64(req.Temperature),
 		photosJSON, nil, // photos, reported_by
