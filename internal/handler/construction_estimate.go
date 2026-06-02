@@ -772,7 +772,8 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       l.imported_total,
 		       COALESCE(l.approval_status, 'pending'),
 		       COALESCE(l.done_quantity, 0),
-		       l.sort_order, l.created_date, l.updated_date,
+		       l.sort_order, COALESCE(l.is_manual, FALSE),
+		       l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
@@ -813,7 +814,8 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 			// MarshalJSON emits `null` (not 0) when no file value exists.
 			&line.ImportedQuantity, &line.ImportedTotal,
 			&line.ApprovalStatus, &line.DoneQuantity,
-			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
+			&line.SortOrder, &line.IsManual,
+			&line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
 			continue
@@ -3056,7 +3058,8 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID, include
 		       l.imported_total,
 		       COALESCE(l.approval_status, 'pending'),
 		       COALESCE(l.done_quantity, 0),
-		       l.sort_order, l.created_date, l.updated_date,
+		       l.sort_order, COALESCE(l.is_manual, FALSE),
+		       l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
@@ -3101,7 +3104,8 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID, include
 			// MarshalJSON emits `null` (not 0) when no file value exists.
 			&line.ImportedQuantity, &line.ImportedTotal,
 			&line.ApprovalStatus, &line.DoneQuantity,
-			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
+			&line.SortOrder, &line.IsManual,
+			&line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
 			h.log.Error("Failed to scan estimate line", "error", err)
