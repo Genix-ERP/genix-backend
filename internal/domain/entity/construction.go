@@ -110,6 +110,13 @@ type ConstructionProject struct {
 	// info card so the frontend doesn't need a second round-trip.
 	WarehouseName string `json:"warehouse_name,omitempty" db:"warehouse_name"`
 
+	// CRM linkage — the Yuksalish CRM project id this Genix project mirrors.
+	// NULL means not linked. Set/cleared exclusively via the
+	// PUT /construction/projects/:id/crm-link endpoint; read here so the
+	// edit form can pre-fill the CRMLinkPanel dropdown after reload.
+	// Migration 418 added the column.
+	CRMProjectID sql.NullInt64 `json:"crm_project_id" db:"crm_project_id"`
+
 	// Metadata
 	CreatedBy   *uuid.UUID   `json:"created_by" db:"created_by"`
 	CreatedDate time.Time    `json:"created_date" db:"created_date"`
@@ -153,6 +160,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		ChiefEngineerID  interface{} `json:"chief_engineer_id"`
 		OrganizationID   interface{} `json:"organization_id"`
 		WarehouseID      interface{} `json:"warehouse_id"`
+		CRMProjectID     interface{} `json:"crm_project_id"`
 		ID               int64       `json:"id"`
 		TenantID         uuid.UUID   `json:"tenant_id"`
 		Code             string      `json:"code"`
@@ -193,6 +201,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		ChiefEngineerID:    nullUUIDValue(p.ChiefEngineerID),
 		OrganizationID:     nullUUIDValue(p.OrganizationID),
 		WarehouseID:        nullUUIDValue(p.WarehouseID),
+		CRMProjectID:       nullInt64Value(p.CRMProjectID),
 		ID:                 p.ID,
 		TenantID:           p.TenantID,
 		Code:               p.Code,
