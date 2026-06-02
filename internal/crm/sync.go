@@ -78,11 +78,17 @@ func (s *Syncer) syncOnce(ctx context.Context, tenantID uuid.UUID, reportID int6
 		currentStage sql.NullString
 		autoSync     sql.NullBool
 	)
+	// JOIN on building_id (not section_id — those are completely different
+	// FKs; section_id points to smeta_sections, building_id points to
+	// construction_buildings). Earlier code used section_id here, which
+	// silently broke the link lookup whenever the report did have a
+	// section but not the matching building. Building is what carries
+	// the crm_block_id, so we use that.
 	err := s.db.QueryRowContext(ctx, `
-		SELECT pr.project_id, pr.section_id, pr.photos, pr.crm_synced_at,
+		SELECT pr.project_id, pr.building_id, pr.photos, pr.crm_synced_at,
 		       b.crm_block_id, b.current_crm_stage, b.crm_auto_sync
 		FROM construction_photo_reports pr
-		LEFT JOIN construction_buildings b ON b.id = pr.section_id AND b.tenant_id = pr.tenant_id
+		LEFT JOIN construction_buildings b ON b.id = pr.building_id AND b.tenant_id = pr.tenant_id
 		WHERE pr.id = $1 AND pr.tenant_id = $2
 	`, reportID, tenantID).Scan(&projectID, &buildingID, &photosJSON, &alreadySync,
 		&crmBlockID, &currentStage, &autoSync)

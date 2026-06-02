@@ -895,6 +895,11 @@ type PhotoItem struct {
 type CreatePhotoReportInput struct {
 	SmetaItemID         int64       `json:"smeta_item_id"`
 	SectionID           int64       `json:"section_id"`
+	// BuildingID is the construction_buildings row this report belongs to.
+	// REQUIRED for CRM sync to work — the syncer looks up the linked CRM
+	// block via construction_buildings.crm_block_id. NULL is allowed at
+	// DB level for legacy rows, but the photo modal should always send it.
+	BuildingID          int64       `json:"building_id"`
 	ReportDate          string      `json:"report_date" binding:"required"`
 	ReportType          string      `json:"report_type"`
 	Title               string      `json:"title"`
