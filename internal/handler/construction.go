@@ -965,6 +965,7 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		       b.planned_start_date, b.planned_end_date, b.actual_start_date, b.actual_end_date,
 		       COALESCE(b.status, 'draft'), b.progress_percent, COALESCE(b.gps_coordinates::text, '{}')::text, b.location_description,
 		       COALESCE(b.sort_order, 0), b.created_date, b.updated_date,
+		       b.crm_block_id, b.current_crm_stage, b.crm_auto_sync,
 		       0 as sections_count,
 		       0.0 as total_smeta,
 		       COALESCE(f.cnt, 0) AS files_count
@@ -999,6 +1000,7 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 			&b.PlannedStartDate, &b.PlannedEndDate, &b.ActualStartDate, &b.ActualEndDate,
 			&b.Status, &b.ProgressPercent, &gpsCoordinates, &b.LocationDescription,
 			&b.SortOrder, &b.CreatedDate, &b.UpdatedDate,
+			&b.CRMBlockID, &b.CurrentCRMStage, &b.CRMAutoSync,
 			&b.SectionsCount, &b.TotalSmeta, &b.FilesCount,
 		); err != nil {
 			h.log.Error("Failed to scan building", "error", err, "project_id", projectID)

@@ -51,6 +51,13 @@ func nullUUIDValue(nu uuid.NullUUID) interface{} {
 	return nil
 }
 
+func nullBoolValue(nb sql.NullBool) interface{} {
+	if nb.Valid {
+		return nb.Bool
+	}
+	return nil
+}
+
 // =====================================================
 // CONSTRUCTION PROJECT
 // =====================================================
@@ -361,6 +368,17 @@ type ConstructionBuilding struct {
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
 
+	// CRM linkage — the Yuksalish CRM block id this Genix building mirrors,
+	// the current construction stage that new photo reports for this
+	// building should land on, and the auto-sync toggle. All three are
+	// set/cleared exclusively via PUT /construction/projects/:id/buildings/
+	// :building_id/crm-link; SELECTed here so the edit modal can pre-fill
+	// the CRMLinkPanel block dropdown after reload. Migration 418 added
+	// the columns.
+	CRMBlockID      sql.NullInt64  `json:"crm_block_id" db:"crm_block_id"`
+	CurrentCRMStage sql.NullString `json:"current_crm_stage" db:"current_crm_stage"`
+	CRMAutoSync     sql.NullBool   `json:"crm_auto_sync" db:"crm_auto_sync"`
+
 	// Computed
 	SectionsCount int     `json:"sections_count,omitempty" db:"sections_count"`
 	TotalSmeta    float64 `json:"total_smeta,omitempty" db:"total_smeta"`
@@ -402,6 +420,9 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		SortOrder            int             `json:"sort_order"`
 		CreatedDate          time.Time       `json:"created_date"`
 		UpdatedDate          time.Time       `json:"updated_date"`
+		CRMBlockID           interface{}     `json:"crm_block_id"`
+		CurrentCRMStage      interface{}     `json:"current_crm_stage"`
+		CRMAutoSync          interface{}     `json:"crm_auto_sync"`
 		SectionsCount        int             `json:"sections_count,omitempty"`
 		TotalSmeta           float64         `json:"total_smeta,omitempty"`
 		FilesCount           int             `json:"files_count"`
@@ -436,6 +457,9 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		SortOrder:            b.SortOrder,
 		CreatedDate:          b.CreatedDate,
 		UpdatedDate:          b.UpdatedDate,
+		CRMBlockID:           nullInt64Value(b.CRMBlockID),
+		CurrentCRMStage:      nullStringValue(b.CurrentCRMStage),
+		CRMAutoSync:          nullBoolValue(b.CRMAutoSync),
 		SectionsCount:        b.SectionsCount,
 		TotalSmeta:           b.TotalSmeta,
 		FilesCount:           b.FilesCount,
