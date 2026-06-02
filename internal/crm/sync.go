@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -32,13 +33,25 @@ type Syncer struct {
 	db     *sql.DB
 	client *Client
 	log    Logger
+	// selfBase is the absolute base URL used to resolve RELATIVE photo
+	// URLs stored in construction_photo_reports (e.g. "/api/v1/files/abc").
+	// We deliberately use loopback (http://localhost:<APP_PORT>) rather
+	// than APP_BASE_URL: the syncer runs in the same container/process as
+	// the file server, and the public domain would NAT-hairpin (the exact
+	// problem that broke the CRM call leg). Loopback always works.
+	selfBase string
 }
 
 func NewSyncer(db *sql.DB, log Logger) *Syncer {
+	port := os.Getenv("APP_PORT")
+	if port == "" {
+		port = "8080"
+	}
 	return &Syncer{
-		db:     db,
-		client: NewClient(),
-		log:    log,
+		db:       db,
+		client:   NewClient(),
+		log:      log,
+		selfBase: "http://localhost:" + port,
 	}
 }
 
@@ -184,6 +197,13 @@ func (s *Syncer) fetchPhotoFiles(photos []photoEntry) ([]File, func(), error) {
 		u := strings.TrimSpace(p.URL)
 		if u == "" {
 			continue
+		}
+		// Genix stores photo URLs as relative paths ("/api/v1/files/<id>").
+		// Go's http.Get rejects those with "unsupported protocol scheme".
+		// Resolve against our own loopback base so the fetch hits the
+		// in-process file server. Absolute URLs (legacy rows) pass through.
+		if strings.HasPrefix(u, "/") {
+			u = s.selfBase + u
 		}
 		// Best effort. If a single photo fails to fetch we log + skip it
 		// so the report can still partially sync.
