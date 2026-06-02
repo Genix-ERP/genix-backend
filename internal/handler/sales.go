@@ -1200,6 +1200,23 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 	query := fmt.Sprintf("UPDATE sales_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
 		strings.Join(updates, ", "), argCount-1, argCount)
 
+	// Read previous status BEFORE the UPDATE so we can detect a real
+	// status transition (vs. a no-op "ship" call on an already-shipped
+	// order). Without this the inventory decrement block below runs on
+	// EVERY UpdateSalesOrder call where input.Status="shipped" — a
+	// rapid double-click, browser retry, or any "save again" UI path
+	// re-deducts the same quantity. Field report: Rodbond MP-75 had
+	// sales_order 9b88cb53 post three −14 issue rows within 20ms,
+	// dropping on-hand by −28 phantom units. The stock_operations.done
+	// guard further down only fires when a stock_operations row
+	// exists — direct SO→shipped flows don't create one, so it was a
+	// no-op for the common path.
+	var prevStatus string
+	_ = h.db.QueryRow(
+		`SELECT status FROM sales_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		orderID, tenantID,
+	).Scan(&prevStatus)
+
 	_, err = h.db.Exec(query, args...)
 	if err != nil {
 		h.log.Error("Failed to update sales order", "error", err)
@@ -1209,8 +1226,11 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 	// ============================================
 	// DECREASE INVENTORY WHEN SO STATUS → "shipped"
+	// Idempotency gate (see prevStatus block above): only run when the
+	// order is ACTUALLY transitioning into shipped. A re-shipping of an
+	// already-shipped order is a no-op for inventory.
 	// ============================================
-	if input.Status != nil && *input.Status == "shipped" {
+	if input.Status != nil && *input.Status == "shipped" && prevStatus != "shipped" {
 		now := time.Now()
 
 		// Skip inventory deduction if stock operation already completed it
@@ -1346,6 +1366,16 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 					}
 
 					// Batch UPDATE inventory quantities and batch INSERT inventory transactions
+					//
+					// Previously these Exec calls discarded errors. When the
+					// UPDATE failed (deadlock, constraint, etc.) the INSERT
+					// inventory_transactions still ran, so the ledger grew
+					// while inventory.quantity_on_hand stayed put — that's
+					// exactly how the May-6 −14.46 row landed on the ledger
+					// for Rodbond MP-75 without ever touching the on-hand
+					// (D4 drift). Errors are now checked: if the UPDATE
+					// fails we skip its matching transaction row so the two
+					// stay in lock-step.
 					var txValues []string
 					var txArgs []interface{}
 					txArgIdx := 0
@@ -1356,13 +1386,17 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						}
 
 						// Individual UPDATE for inventory (each has different qty)
-						h.db.Exec(`
+						if _, updErr := h.db.Exec(`
 							UPDATE inventory
 							SET quantity_on_hand = quantity_on_hand - $1,
 								last_movement_date = $2,
 								updated_at = $2
 							WHERE id = $3
-						`, l.Qty, now, inventoryID)
+						`, l.Qty, now, inventoryID); updErr != nil {
+							h.log.Error("Failed to decrement inventory on SO ship; skipping matching ledger row",
+								"error", updErr, "inventory_id", inventoryID, "qty", l.Qty, "so_id", orderID)
+							continue
+						}
 
 						txID := uuid.New()
 						txValues = append(txValues, fmt.Sprintf("($%d,$%d,$%d,'issue',$%d,$%d,$%d,'sales_order',$%d,'Sales Order Shipped',$%d,$%d)",
@@ -1373,12 +1407,19 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 					// ONE INSERT for all inventory transactions
 					if len(txValues) > 0 {
-						h.db.Exec(`
+						if _, insErr := h.db.Exec(`
 							INSERT INTO inventory_transactions (
 								id, tenant_id, inventory_id, transaction_type, quantity,
 								unit_cost, total_cost, reference_type, reference_id,
 								reason, transaction_date, created_at
-							) VALUES `+strings.Join(txValues, ","), txArgs...)
+							) VALUES `+strings.Join(txValues, ","), txArgs...); insErr != nil {
+							// Cache was already decremented above. If the
+							// ledger insert fails, log loudly so the drift
+							// is fixable from D4 instead of silently
+							// disappearing.
+							h.log.Error("Failed to write inventory_transactions for SO ship; on-hand decremented WITHOUT ledger rows — manual reconcile needed",
+								"error", insErr, "so_id", orderID, "rows", len(txValues))
+						}
 					}
 				}
 			}
