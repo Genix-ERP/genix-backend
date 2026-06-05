@@ -20,13 +20,17 @@
 --   akt-sverka reconciliation. This migration changes NO debit/credit amount and
 --   NO account, so the double-entry and audit trail are unaffected.
 --
---   We therefore disable the invariants trigger for the duration of this one
---   correction and re-enable it. The whole migration runs in a single
---   transaction (see internal/infrastructure/database/migrations.go), and
---   ALTER TABLE ... DISABLE/ENABLE TRIGGER is transactional, so the trigger is
---   atomically restored even if the UPDATEs fail and roll back. The 325
---   enrichment trigger skips UPDATEs, so it will not re-populate contact_id.
-ALTER TABLE journal_entry_lines DISABLE TRIGGER trg_enforce_journal_line_invariants;
+--   We therefore suppress triggers for the duration of this one correction via
+--   session_replication_role = 'replica', which disables normal triggers for the
+--   current transaction WITHOUT a catalog change. (ALTER TABLE ... DISABLE TRIGGER
+--   cannot be used here: after the UPDATEs queue FK constraint-trigger events, a
+--   follow-up ALTER TABLE fails with "pending trigger events".) SET LOCAL scopes
+--   the change to this transaction and auto-reverts on commit/rollback, so the
+--   immutability guard is restored atomically even if the UPDATEs fail. The 325
+--   enrichment trigger skips UPDATEs, so it would not re-populate contact_id
+--   anyway. The DB role (POSTGRES_USER=genix) is a superuser, as required to set
+--   session_replication_role.
+SET LOCAL session_replication_role = 'replica';
 
 -- For vendor payments (source_type = 'payment'):
 -- The AP debit line is on an AP-type account (keep contact_id).
@@ -52,5 +56,6 @@ WHERE jel.journal_entry_id = je.id
   AND jel.debit_amount > 0
   AND jel.credit_amount = 0;
 
--- Restore the immutability guard for all normal (non-migration) writes.
-ALTER TABLE journal_entry_lines ENABLE TRIGGER trg_enforce_journal_line_invariants;
+-- Restore normal trigger behaviour (the immutability guard) for the rest of the
+-- transaction. SET LOCAL would also auto-revert at commit, but we reset explicitly.
+SET LOCAL session_replication_role = DEFAULT;
