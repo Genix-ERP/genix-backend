@@ -60,21 +60,26 @@
 -- wrong debits — that would also trip the cash/bank guard.
 --
 -- This migration is a one-time data cleanup that must touch data which
--- was legitimately posted before either invariant existed. We disable
--- the two specific triggers for the duration of THIS transaction only:
--- ALTER TABLE ... DISABLE TRIGGER is transactional in PostgreSQL, so if
--- the migration fails mid-way the rollback restores the triggers to
--- their original ENABLED state. We re-enable them explicitly on the
--- happy path too, so a successful commit leaves the schema unchanged.
--- We do NOT alter the trigger functions themselves; new code paths
--- continue to be enforced normally as soon as this migration commits.
+-- was legitimately posted before either invariant existed. We suppress
+-- triggers for the duration of THIS transaction only via
+-- session_replication_role = 'replica', which disables normal triggers
+-- (the invariants guard AND the cash/bank balance guard, on every table)
+-- without any catalog change.
 --
--- Required privilege: table owner (not superuser). The `genix` role
--- owns these tables (it created them via earlier migrations), so the
--- ALTER TABLE succeeds without elevated permissions.
+-- We do NOT use ALTER TABLE ... DISABLE/ENABLE TRIGGER here: the INSERTs
+-- and UPDATEs below queue FK constraint-trigger events on
+-- journal_entry_lines, after which a closing ALTER TABLE ... ENABLE
+-- TRIGGER fails with "cannot ALTER TABLE because it has pending trigger
+-- events". SET LOCAL has no such restriction. It is scoped to this
+-- transaction and auto-reverts on commit/rollback, so the guards are
+-- restored atomically even if the DO block raises. We do NOT alter the
+-- trigger functions themselves; new code paths are enforced normally as
+-- soon as this migration commits.
+--
+-- Required privilege: superuser (to set session_replication_role). The
+-- `genix` role is created via POSTGRES_USER and is a superuser.
 
-ALTER TABLE journal_entry_lines DISABLE TRIGGER trg_enforce_journal_line_invariants;
-ALTER TABLE accounts            DISABLE TRIGGER trg_check_cash_bank_balance;
+SET LOCAL session_replication_role = 'replica';
 
 DO $$
 DECLARE
@@ -201,11 +206,11 @@ BEGIN
         reversed_count, total_reversal_count;
 END $$;
 
--- Re-enable the triggers we disabled at the top. If the DO block above
--- raised, we never reach here, but the surrounding transaction will roll
--- back and the triggers come back automatically as part of the DDL rollback.
-ALTER TABLE accounts            ENABLE TRIGGER trg_check_cash_bank_balance;
-ALTER TABLE journal_entry_lines ENABLE TRIGGER trg_enforce_journal_line_invariants;
+-- Restore normal trigger behaviour (both guards) for the rest of the
+-- transaction. SET LOCAL would also auto-revert at commit, but we reset
+-- explicitly. If the DO block above raised we never reach here, and the
+-- transaction rollback restores the setting anyway.
+SET LOCAL session_replication_role = DEFAULT;
 
 -- POST-DEPLOY VERIFICATION
 -- Run this after the migration to confirm the account that was bleeding
