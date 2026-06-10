@@ -9335,3 +9335,230 @@ func (h *Handler) DeleteInventoryLot(c *gin.Context) {
 
 	response.Success(c, gin.H{"message": "Inventory lot deleted successfully"})
 }
+
+// =====================================================
+// STOCK-AT-DATE REPORT
+// =====================================================
+//
+// GetStockAtDate replays the inventory_transactions ledger up to a
+// user-supplied date and returns the on-hand quantity + weighted-average
+// cost for every (product, warehouse) pair that touched stock by that
+// date. Soft-deleted products are included by default — they're the
+// whole point of an "as-of" report (you want to see what the warehouse
+// looked like before someone deleted a SKU).
+//
+// Conceptually:
+//
+//   for each inventory_transactions row T with T.transaction_date <= as_of:
+//     signed_qty = T.quantity, signed according to T.transaction_type
+//     accumulate (T.inventory_id → product_id, warehouse_id):
+//       on_hand += signed_qty
+//       wac_basis += signed_qty * unit_cost  (only when signed_qty > 0)
+//       wac_units += signed_qty              (only when signed_qty > 0)
+//   unit_cost_at_date = wac_basis / wac_units   (Odoo's default WAC method)
+//
+// All write paths in the codebase store `quantity` already signed (issue
+// rows have negative quantities — see sales_delivery.go ~line 998), but
+// the CASE in the CTE re-signs based on transaction_type as a defense
+// against legacy rows / future adapters that get the sign wrong.
+//
+// GET /api/v1/inventory/stock-at-date
+//
+// Query params:
+//   as_of            REQUIRED   YYYY-MM-DD or RFC3339. Interpreted as
+//                               end-of-day UTC when only the date part
+//                               is given so a transaction posted at
+//                               23:55 on the as_of day is still in scope.
+//   warehouse_id     optional   uuid — filter to a single warehouse.
+//   product_id       optional   uuid — filter to a single product.
+//   include_deleted  optional   "true"/"false", default "true". The
+//                               default is intentionally different from
+//                               the live products list because a date
+//                               report that hides deleted SKUs is
+//                               useless — that's the very thing the
+//                               user wants to see at this date.
+//
+// Response:
+//   {
+//     "as_of": "2026-06-01T23:59:59Z",
+//     "warehouse_id": null,
+//     "include_deleted": true,
+//     "rows": [
+//       { "product_id":..., "product_code":"...", "product_name":"...",
+//         "is_deleted":false, "warehouse_id":..., "warehouse_name":"...",
+//         "quantity":12.5, "unit_cost":150000.0, "total_value":1875000.0,
+//         "current_sales_price":175000.0,
+//         "last_txn_date":"2026-05-28T10:11:00Z" },
+//       ...
+//     ],
+//     "totals": { "products": N, "quantity": Q, "total_value": V }
+//   }
+func (h *Handler) GetStockAtDate(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	asOfStr := strings.TrimSpace(c.Query("as_of"))
+	if asOfStr == "" {
+		response.BadRequest(c, "as_of query param is required (YYYY-MM-DD)")
+		return
+	}
+	asOf, err := parseAsOfDate(asOfStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid as_of format — use YYYY-MM-DD")
+		return
+	}
+
+	// Optional filters. SQL uses NULL-aware predicates so we can pass
+	// untyped nils and have the WHERE clause treat them as "no filter".
+	var orgArg, whArg, prodArg interface{}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgArg = orgID
+	}
+	if v := strings.TrimSpace(c.Query("warehouse_id")); v != "" {
+		whArg = v
+	}
+	if v := strings.TrimSpace(c.Query("product_id")); v != "" {
+		prodArg = v
+	}
+	includeDeleted := !strings.EqualFold(c.DefaultQuery("include_deleted", "true"), "false")
+
+	rows, err := h.db.Query(stockAtDateQuery,
+		tenantID, asOf, orgArg, whArg, prodArg, includeDeleted)
+	if err != nil {
+		h.log.Error("GetStockAtDate: query failed", "error", err)
+		response.InternalError(c, "Failed to compute stock at date")
+		return
+	}
+	defer rows.Close()
+
+	type StockAtDateRow struct {
+		ProductID         uuid.UUID  `json:"product_id"`
+		ProductCode       string     `json:"product_code"`
+		ProductName       string     `json:"product_name"`
+		IsDeleted         bool       `json:"is_deleted"`
+		WarehouseID       uuid.UUID  `json:"warehouse_id"`
+		WarehouseName     string     `json:"warehouse_name"`
+		Quantity          float64    `json:"quantity"`
+		UnitCost          float64    `json:"unit_cost"`
+		TotalValue        float64    `json:"total_value"`
+		CurrentSalesPrice float64    `json:"current_sales_price"`
+		LastTxnDate       *time.Time `json:"last_txn_date,omitempty"`
+	}
+
+	out := make([]StockAtDateRow, 0, 256)
+	var totalQty, totalValue float64
+	for rows.Next() {
+		var r StockAtDateRow
+		var last sql.NullTime
+		if err := rows.Scan(
+			&r.ProductID, &r.ProductCode, &r.ProductName, &r.IsDeleted,
+			&r.WarehouseID, &r.WarehouseName,
+			&r.Quantity, &r.UnitCost, &r.TotalValue,
+			&r.CurrentSalesPrice, &last,
+		); err != nil {
+			h.log.Error("GetStockAtDate: scan failed", "error", err)
+			continue
+		}
+		if last.Valid {
+			r.LastTxnDate = &last.Time
+		}
+		totalQty += r.Quantity
+		totalValue += r.TotalValue
+		out = append(out, r)
+	}
+
+	response.Success(c, gin.H{
+		"as_of":           asOf,
+		"warehouse_id":    whArg,
+		"product_id":      prodArg,
+		"include_deleted": includeDeleted,
+		"rows":            out,
+		"totals": gin.H{
+			"products":    len(out),
+			"quantity":    totalQty,
+			"total_value": totalValue,
+		},
+	})
+}
+
+// parseAsOfDate accepts "YYYY-MM-DD" (interpreted as 23:59:59 UTC of
+// that day so a same-day transaction at 23:30 is included) or any
+// RFC3339 timestamp (used verbatim).
+func parseAsOfDate(s string) (time.Time, error) {
+	// Try date-only first — most common UI input.
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		// Roll to end-of-day UTC. Picking UTC matches how Postgres compares
+		// timestamptz columns against a literal — keeps the math
+		// timezone-stable across the user's local clock.
+		return time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, time.UTC), nil
+	}
+	// Then RFC3339 (allows passing an exact timestamp from automation).
+	return time.Parse(time.RFC3339, s)
+}
+
+// stockAtDateQuery — see GetStockAtDate above for the full annotation.
+// Param order:  $1 tenantID  $2 as_of  $3 orgID  $4 warehouseID
+//               $5 productID $6 include_deleted
+const stockAtDateQuery = `
+WITH ledger AS (
+    SELECT
+        inv.product_id,
+        inv.warehouse_id,
+        CASE
+            WHEN t.transaction_type IN (
+                'issue', 'sale', 'ship', 'delivery',
+                'adjustment_out', 'transfer_out',
+                'consume', 'production_out', 'write_off', 'scrap'
+            ) THEN -ABS(t.quantity)
+            ELSE t.quantity
+        END AS signed_qty,
+        t.unit_cost,
+        t.transaction_date
+    FROM inventory_transactions t
+    JOIN inventory inv ON inv.id = t.inventory_id
+    WHERE t.tenant_id = $1
+      AND t.transaction_date <= $2
+      AND ($3::uuid IS NULL OR inv.organization_id = $3)
+      AND ($4::uuid IS NULL OR inv.warehouse_id  = $4)
+      AND ($5::uuid IS NULL OR inv.product_id    = $5)
+),
+agg AS (
+    SELECT
+        product_id,
+        warehouse_id,
+        SUM(signed_qty)                                                     AS quantity_at_date,
+        MAX(transaction_date)                                                AS last_txn_date,
+        CASE
+            WHEN SUM(CASE WHEN signed_qty > 0 THEN signed_qty ELSE 0 END) > 0
+            THEN SUM(CASE WHEN signed_qty > 0 THEN signed_qty * COALESCE(unit_cost, 0) ELSE 0 END)
+                 / SUM(CASE WHEN signed_qty > 0 THEN signed_qty ELSE 0 END)
+            ELSE 0
+        END AS wac_unit_cost
+    FROM ledger
+    GROUP BY product_id, warehouse_id
+)
+SELECT
+    p.id                                                                      AS product_id,
+    COALESCE(p.code, '')                                                      AS product_code,
+    p.name                                                                    AS product_name,
+    (p.deleted_at IS NOT NULL)                                                AS is_deleted,
+    w.id                                                                      AS warehouse_id,
+    w.name                                                                    AS warehouse_name,
+    COALESCE(a.quantity_at_date, 0)                                           AS quantity,
+    COALESCE(NULLIF(a.wac_unit_cost, 0), p.cost_price, 0)                     AS unit_cost,
+    COALESCE(a.quantity_at_date, 0)
+        * COALESCE(NULLIF(a.wac_unit_cost, 0), p.cost_price, 0)               AS total_value,
+    -- products.list_price is the canonical sales-price column (see
+    -- migration 002_erp_modules.sql and 171_product_organization_settings).
+    -- There is no unit_price column on this table.
+    COALESCE(p.list_price, 0)                                                 AS current_sales_price,
+    a.last_txn_date
+FROM agg a
+JOIN products   p ON p.id = a.product_id
+JOIN warehouses w ON w.id = a.warehouse_id
+WHERE ($6 = TRUE OR p.deleted_at IS NULL)
+ORDER BY p.name ASC, w.name ASC
+`
