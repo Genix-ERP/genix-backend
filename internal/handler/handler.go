@@ -410,6 +410,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.GET("/movements", h.ListInventoryMovements)
 		inventory.GET("/valuation", h.GetInventoryValuation)
 		inventory.GET("/cogs", h.GetCOGSData)
+		// As-of date stock report — replays inventory_transactions up to
+		// the chosen date so the user can see what each warehouse held
+		// (incl. soft-deleted SKUs) on any historical day.
+		inventory.GET("/stock-at-date", h.GetStockAtDate)
 
 		// Inventory Lots (Partiyalar) - lots are created automatically during Goods Receipt
 		inventory.GET("/lots", h.ListInventoryLots)
