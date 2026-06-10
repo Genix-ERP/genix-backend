@@ -1933,6 +1933,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/buildings", h.perm.Require("construction", "project", "create"), h.CreateConstructionBuilding)
 		constructionProjects.PUT("/:id/buildings/:building_id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionBuilding)
 		constructionProjects.DELETE("/:id/buildings/:building_id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionBuilding)
+		// Clone all estimates (Единич, ВОР, Ресурс) + their lines from a
+		// sibling block. Target must be empty; same project only. Used by
+		// the "Klonlash" entry in the block card "..." menu.
+		constructionProjects.POST("/:id/buildings/:building_id/clone-estimates", h.perm.Require("construction", "smeta", "create"), h.CloneBuildingEstimates)
 		// CRM linkage — set/clear crm_project_id on the project and
 		// crm_block_id / current_crm_stage / auto_sync on the building.
 		constructionProjects.PUT("/:id/crm-link", h.perm.Require("construction", "project", "update"), h.UpdateProjectCRMLink)
