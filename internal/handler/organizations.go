@@ -986,6 +986,8 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		{"5010", "Kassa", "CASH", false, false, true, "Naqd pul kassada"},
 		{"5020", "Valyuta kassasi", "CASH", false, false, true, "Chet el valyutasidagi naqd pullar"},
 		{"5110", "Hisob-kitob schyoti", "CASH", true, false, true, "Asosiy bank hisob raqami"},
+		{"5210", "Mamlakat ichidagi valyuta schyotlari", "CASH", true, false, true, "Mamlakat ichidagi banklardagi chet el valyutasi schyotlari"},
+		{"5220", "Chet eldagi valyuta schyotlari", "CASH", true, false, true, "Chet eldagi banklardagi chet el valyutasi schyotlari"},
 
 		// Kreditorlik qarzlari (60xx-69xx)
 		{"6010", "Mol yetkazib beruvchilar va pudratchilar", "AP", false, true, true, "Mol yetkazib beruvchilarga savdo kreditorlik qarzlari"},

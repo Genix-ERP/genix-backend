@@ -8,7 +8,6 @@ package handler
 // transaction burns a journal number.
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 
@@ -132,12 +131,4 @@ func (h *Handler) validateJournalLines(tenantID uuid.UUID, lines []entity.Create
 	}
 
 	return ""
-}
-
-// dbNullable is a tiny util to convert *string → sql.NullString.
-func dbNullable(s *string) sql.NullString {
-	if s == nil || *s == "" {
-		return sql.NullString{Valid: false}
-	}
-	return sql.NullString{String: *s, Valid: true}
 }

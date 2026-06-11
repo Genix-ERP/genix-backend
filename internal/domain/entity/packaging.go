@@ -108,10 +108,6 @@ type PackageType struct {
 	DeletedAt  *time.Time `json:"-" db:"deleted_at"`
 }
 
-func (PackageType) TableName() string {
-	return "package_types"
-}
-
 // CreatePackageTypeInput represents input for creating a package type
 type CreatePackageTypeInput struct {
 	Name       string  `json:"name" binding:"required,min=1,max=100"`
@@ -187,10 +183,6 @@ type Package struct {
 	Contents    []PackageContent `json:"contents,omitempty"`
 }
 
-func (Package) TableName() string {
-	return "packages"
-}
-
 // PackageContent represents products inside a package
 type PackageContent struct {
 	ID        uuid.UUID  `json:"id" db:"id"`
@@ -202,10 +194,6 @@ type PackageContent struct {
 
 	// Relationships
 	Product *Product `json:"product,omitempty"`
-}
-
-func (PackageContent) TableName() string {
-	return "package_contents"
 }
 
 // CreatePackageInput represents input for creating a package

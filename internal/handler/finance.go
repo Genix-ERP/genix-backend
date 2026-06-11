@@ -2167,12 +2167,16 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 	year := entryDate.Year()
 	yearPrefix := fmt.Sprintf("%s-%d-", prefix, year)
 
+	// Entry numbers are unique per (tenant, org) across ALL journals
+	// (journal_entries_tenant_org_entry_number_key), so the max must be taken
+	// at that scope: journal-scoped numbering collides as soon as two journals
+	// share a number_prefix (e.g. both empty).
 	var maxNumber int
 	_ = h.db.QueryRow(
 		`SELECT COALESCE(MAX(
 			CAST(SUBSTRING(entry_number FROM '[0-9]+$') AS INTEGER)
-		), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
-		tenantID, journalID, yearPrefix+"%",
+		), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
+		tenantID, orgID, yearPrefix+"%",
 	).Scan(&maxNumber)
 
 	actualNext := maxNumber + 1
@@ -2788,12 +2792,13 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	reversalYear := time.Now().Year()
 	yearPrefix := fmt.Sprintf("%s-%d-", prefix, reversalYear)
 
+	// Max at (tenant, org) scope to match journal_entries_tenant_org_entry_number_key.
 	var maxNumber int
 	_ = h.db.QueryRow(
 		`SELECT COALESCE(MAX(
 			CAST(SUBSTRING(entry_number FROM '[0-9]+$') AS INTEGER)
-		), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
-		tenantID, journalID, yearPrefix+"%",
+		), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
+		tenantID, organizationID, yearPrefix+"%",
 	).Scan(&maxNumber)
 
 	actualNext := maxNumber + 1
@@ -3901,9 +3906,14 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	var cashAccountID uuid.UUID
 	var cashAccountBalance float64
 
-	// 1. Use explicit bank_account_id if provided
+	// 1. Use explicit bank_account_id if provided. payments.bank_account_id
+	//    references bank_accounts(id), not the GL chart of accounts — resolve
+	//    through the bank account's linked GL account (NULL → fall through).
 	if bankAccountIDStr.Valid {
-		cashAccountID, _ = uuid.Parse(bankAccountIDStr.String)
+		_ = tx.QueryRow(
+			`SELECT COALESCE(account_id, '00000000-0000-0000-0000-000000000000') FROM bank_accounts WHERE id = $1 AND tenant_id = $2`,
+			bankAccountIDStr.String, tenantID,
+		).Scan(&cashAccountID)
 	}
 
 	// 2. Use journal's default account — journal is already linked to its account
@@ -3921,13 +3931,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		if jType.Valid && jType.String == "cash" {
 			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
 		} else if jType.Valid && jType.String == "bank" {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "5110")
 		}
 	}
 
 	// 4. Last fallback: find by account code
 	if cashAccountID == uuid.Nil {
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "5110")
 	}
 	if cashAccountID == uuid.Nil {
 		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
@@ -4011,11 +4021,32 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			).Scan(&journalID, &nextNumber, &numberPrefix)
 		}
 		if journalID == uuid.Nil {
+			// The legacy CASH_RECEIPTS/CASH_DISBURSEMENTS/GENERAL journals don't exist
+			// in the standard seed (codes are CASH, BANK, GEN, ... — see the journal
+			// seeding in organizations.go), so also accept the seeded code matching the
+			// resolved money account, then any journal of that type, then the general
+			// journal.
+			moneyJournalCode, moneyJournalType := "BANK", "bank"
+			var moneyAcctCode sql.NullString
+			_ = tx.QueryRow(`SELECT code FROM accounts WHERE id = $1`, cashAccountID).Scan(&moneyAcctCode)
+			if moneyAcctCode.Valid && strings.HasPrefix(moneyAcctCode.String, "50") {
+				moneyJournalCode, moneyJournalType = "CASH", "cash"
+			}
 			_ = tx.QueryRow(`
 				SELECT id, COALESCE(next_number, 1), number_prefix
-				FROM journals WHERE tenant_id = $1 AND (code = $2 OR code = 'GENERAL') AND deleted_at IS NULL
-				ORDER BY CASE WHEN code = $2 THEN 0 ELSE 1 END LIMIT 1`,
-				tenantID, journalCode,
+				FROM journals
+				WHERE tenant_id = $1 AND deleted_at IS NULL
+				  AND ($5::uuid IS NULL OR organization_id = $5)
+				  AND (code IN ($2, $3, 'GENERAL', 'GEN') OR type IN ($4, 'general'))
+				ORDER BY CASE
+					WHEN code = $2 THEN 0
+					WHEN code = $3 THEN 1
+					WHEN type = $4 THEN 2
+					WHEN code IN ('GENERAL', 'GEN') THEN 3
+					ELSE 4
+				END
+				LIMIT 1`,
+				tenantID, journalCode, moneyJournalCode, moneyJournalType, orgIDPtr,
 			).Scan(&journalID, &nextNumber, &numberPrefix)
 		}
 
@@ -4028,23 +4059,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				prefix = numberPrefix.String
 			}
 
-			// Use journal-scoped max filtered by prefix to avoid date-embedded entry numbers
-			var maxNum int
-			if prefix != "" {
-				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
-					tenantID, journalID, prefix+"%",
-				).Scan(&maxNum)
-			} else {
-				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
-					tenantID, journalID,
-				).Scan(&maxNum)
-			}
-			actualNum := maxNum + 1
-			if nextNumber > actualNum {
-				actualNum = nextNumber
-			}
+			actualNum := nextEntryNumberSeq(tx, tenantID, orgIDPtr, prefix, nextNumber)
 			entryNumber := fmt.Sprintf("%s%06d", prefix, actualNum)
 
 			description := fmt.Sprintf("%s to'lov tasdiqlandi", paymentNumber)
@@ -4063,28 +4078,38 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				h.log.Error("Failed to create payment journal entry, rolling back savepoint", "error", jeErr)
 				tx.Exec("ROLLBACK TO SAVEPOINT create_payment_je")
 			} else {
+				// Any failed statement aborts the savepoint's subtransaction, so track
+				// line failures and ROLLBACK TO SAVEPOINT at the end instead of
+				// RELEASE — otherwise the whole confirmation tx fails to commit.
+				jeOK := true
 				if paymentType == "receipt" {
 					// Receipt: Debit Cash, Credit AR
 					// Only set contact_id on the AR credit line (counter account),
 					// NOT on the cash line — so reconciliation only counts the AR side.
 					line1ID := uuid.New()
-					tx.Exec(`
+					if _, lErr := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
 						line1ID, journalEntryID, 1, cashAccountID, debitDesc,
 						amount, 0.0, 1.0, now,
-					)
+					); lErr != nil {
+						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 1, "account_id", cashAccountID)
+						jeOK = false
+					}
 					line2ID := uuid.New()
-					tx.Exec(`
+					if _, lErr := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 						line2ID, journalEntryID, 2, counterAccountID, contactID, creditDesc,
 						0.0, amount, 1.0, now,
-					)
+					); lErr != nil {
+						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 2, "account_id", counterAccountID)
+						jeOK = false
+					}
 
 					// Update account balances
 					// Cash: debit-normal, debit increases balance
@@ -4102,23 +4127,29 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					// Only set contact_id on the AP debit line (counter account),
 					// NOT on the cash line — so reconciliation only counts the AP side.
 					line1ID := uuid.New()
-					tx.Exec(`
+					if _, lErr := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 						line1ID, journalEntryID, 1, counterAccountID, contactID, debitDesc,
 						amount, 0.0, 1.0, now,
-					)
+					); lErr != nil {
+						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 1, "account_id", counterAccountID)
+						jeOK = false
+					}
 					line2ID := uuid.New()
-					tx.Exec(`
+					if _, lErr := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
 						line2ID, journalEntryID, 2, cashAccountID, creditDesc,
 						0.0, amount, 1.0, now,
-					)
+					); lErr != nil {
+						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 2, "account_id", cashAccountID)
+						jeOK = false
+					}
 
 					// Update account balances
 					// AP: credit-normal, debit decreases balance (we're paying off liability)
@@ -4261,7 +4292,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				}
 			}
 
-			tx.Exec("RELEASE SAVEPOINT create_payment_je")
+			if jeOK {
+				tx.Exec("RELEASE SAVEPOINT create_payment_je")
+			} else {
+				// Drop the partial GL entry but keep the confirmation itself.
+				h.log.Error("Payment journal entry incomplete, rolling back GL entry", "payment_id", id)
+				tx.Exec("ROLLBACK TO SAVEPOINT create_payment_je")
+			}
 			}
 		} else {
 			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)
@@ -6713,8 +6750,19 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	var numberPrefix sql.NullString
 	err = h.db.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH', 'GENERAL') AND deleted_at IS NULL LIMIT 1
-	`, tenantID).Scan(&journalID, &nextNumber, &numberPrefix)
+		FROM journals
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR organization_id = $2)
+		  AND (code IN ('CASH_RECEIPTS', 'CASH', 'GENERAL', 'GEN') OR type IN ('cash', 'general'))
+		ORDER BY CASE
+			WHEN code = 'CASH_RECEIPTS' THEN 0
+			WHEN code = 'CASH' THEN 1
+			WHEN type = 'cash' THEN 2
+			WHEN code IN ('GENERAL', 'GEN') THEN 3
+			ELSE 4
+		END
+		LIMIT 1
+	`, tenantID, orgID).Scan(&journalID, &nextNumber, &numberPrefix)
 	if err != nil || journalID == uuid.Nil {
 		h.log.Error("No journal found for clearing entries", "error", err)
 		return
@@ -6728,7 +6776,7 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	// Create clearing entry for Outstanding Receipts → Bank
 	// DR Bank, CR Outstanding Receipts
 	if receiptsBalance > 0.01 {
-		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
 		journalEntryID := uuid.New()
 		description := fmt.Sprintf("Bank reconciliation clearing - receipts (%s)", statementDate.Format("2006-01-02"))
 
@@ -6777,7 +6825,7 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	// Outstanding Payments has a negative current_balance (credit balance) when payments are pending
 	absPayments := -paymentsBalance // Make positive for the entry amounts
 	if absPayments > 0.01 {
-		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
 		journalEntryID := uuid.New()
 		description := fmt.Sprintf("Bank reconciliation clearing - payments (%s)", statementDate.Format("2006-01-02"))
 
@@ -6841,8 +6889,19 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	var numberPrefix sql.NullString
 	err = h.db.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code IN ('GENERAL', 'CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL LIMIT 1
-	`, tenantID).Scan(&journalID, &nextNumber, &numberPrefix)
+		FROM journals
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR organization_id = $2)
+		  AND (code IN ('GENERAL', 'GEN', 'CASH_RECEIPTS', 'CASH') OR type IN ('general', 'cash'))
+		ORDER BY CASE
+			WHEN code IN ('GENERAL', 'GEN') THEN 0
+			WHEN type = 'general' THEN 1
+			WHEN code = 'CASH_RECEIPTS' THEN 2
+			WHEN code = 'CASH' THEN 3
+			ELSE 4
+		END
+		LIMIT 1
+	`, tenantID, orgID).Scan(&journalID, &nextNumber, &numberPrefix)
 	if err != nil || journalID == uuid.Nil {
 		return
 	}
@@ -6851,7 +6910,7 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
-	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
 
 	absDiff := difference
 	if absDiff < 0 {

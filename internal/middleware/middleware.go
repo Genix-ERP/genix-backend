@@ -285,32 +285,6 @@ func Auth(jwtManager *crypto.JWTManager) gin.HandlerFunc {
 	}
 }
 
-// OptionalAuth middleware validates JWT tokens if present, but doesn't require them
-func OptionalAuth(jwtManager *crypto.JWTManager) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.Next()
-			return
-		}
-
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			c.Next()
-			return
-		}
-
-		claims, err := jwtManager.ValidateAccessToken(parts[1])
-		if err == nil {
-			c.Set(ContextKeyClaims, claims)
-			c.Set(ContextKeyUserID, claims.UserID.String())
-			c.Set(ContextKeyTenantID, claims.TenantID.String())
-		}
-
-		c.Next()
-	}
-}
-
 // TenantResolver middleware resolves tenant from header or subdomain
 func TenantResolver() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -421,18 +395,6 @@ func TrialCheck(db *database.DB) gin.HandlerFunc {
 			return
 		}
 
-		c.Next()
-	}
-}
-
-// RequireTenant middleware ensures a tenant is resolved
-func RequireTenant() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if _, exists := c.Get(ContextKeyTenantID); !exists {
-			response.BadRequest(c, "Tenant ID is required")
-			c.Abort()
-			return
-		}
 		c.Next()
 	}
 }
@@ -787,35 +749,6 @@ func (pc *PermissionChecker) InvalidatePermissionCache(ctx context.Context, tena
 	}
 	_ = pc.redis.Delete(ctx, permissionCacheKey(tenantID, userID))
 	_ = pc.redis.Delete(ctx, fmt.Sprintf("userrole:%s:%s", tenantID, userID))
-}
-
-// RequirePermission is kept as a backward-compatible package-level function.
-// It creates a PermissionChecker-less middleware that allows all authenticated
-// users through. Callers should migrate to PermissionChecker.Require() for
-// actual enforcement.
-//
-// Deprecated: Use PermissionChecker.Require() instead.
-func RequirePermission(module, resource, action string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		claims, exists := c.Get(ContextKeyClaims)
-		if !exists {
-			response.Unauthorized(c, "Authentication required")
-			c.Abort()
-			return
-		}
-
-		_, ok := claims.(*crypto.Claims)
-		if !ok {
-			response.Unauthorized(c, "Invalid authentication")
-			c.Abort()
-			return
-		}
-
-		// Without a PermissionChecker (no DB/Redis), we can only verify
-		// that the user is authenticated. Use PermissionChecker.Require()
-		// for full enforcement.
-		c.Next()
-	}
 }
 
 // RequireSystemAdmin middleware ensures user is a system admin

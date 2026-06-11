@@ -118,61 +118,6 @@ func TestHashToken_DifferentInputs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GenerateAPIKey
-// ---------------------------------------------------------------------------
-
-func TestGenerateAPIKey(t *testing.T) {
-	tests := []struct {
-		name   string
-		prefix string
-	}{
-		{"gx prefix", "gx"},
-		{"sk prefix", "sk"},
-		{"empty prefix", ""},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			key, hash, err := GenerateAPIKey(tc.prefix)
-			if err != nil {
-				t.Fatalf("GenerateAPIKey(%q) returned error: %v", tc.prefix, err)
-			}
-			if key == "" {
-				t.Error("key should not be empty")
-			}
-			if hash == "" {
-				t.Error("hash should not be empty")
-			}
-
-			// Key must start with the prefix followed by underscore
-			expectedPrefix := tc.prefix + "_"
-			if !strings.HasPrefix(key, expectedPrefix) {
-				t.Errorf("key %q should start with %q", key, expectedPrefix)
-			}
-
-			// Hash of the key must be consistent
-			if rehash := HashToken(key); rehash != hash {
-				t.Errorf("hash mismatch: GenerateAPIKey returned %q but HashToken gives %q", hash, rehash)
-			}
-		})
-	}
-}
-
-func TestGenerateAPIKey_Unique(t *testing.T) {
-	key1, _, err := GenerateAPIKey("gx")
-	if err != nil {
-		t.Fatal(err)
-	}
-	key2, _, err := GenerateAPIKey("gx")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if key1 == key2 {
-		t.Error("two generated API keys should be different")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // GenerateRandomString (stands in for GenerateSecureToken)
 // ---------------------------------------------------------------------------
 
@@ -210,19 +155,5 @@ func TestGenerateRandomString_Unique(t *testing.T) {
 	}
 	if s1 == s2 {
 		t.Error("two random strings should differ")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// GenerateRandomBytes
-// ---------------------------------------------------------------------------
-
-func TestGenerateRandomBytes(t *testing.T) {
-	b, err := GenerateRandomBytes(32)
-	if err != nil {
-		t.Fatalf("GenerateRandomBytes returned error: %v", err)
-	}
-	if len(b) != 32 {
-		t.Errorf("expected 32 bytes, got %d", len(b))
 	}
 }

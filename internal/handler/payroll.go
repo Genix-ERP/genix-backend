@@ -382,7 +382,7 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 			var paymentAcct uuid.UUID
 			var paymentAcctDesc string
 			if paymentMethod == "card" || paymentMethod == "bank_transfer" {
-				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
+				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 				if paymentAcct == uuid.Nil {
 					paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 				}

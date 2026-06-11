@@ -4,7 +4,7 @@ Asosiy qoida: Har bir provodkada Dt = Kt
 """
 import uuid
 import pytest
-from conftest import today, assert_balanced
+from conftest import today, assert_balanced, find_leaf_account
 
 
 class TestAllEntriesBalanced:
@@ -68,8 +68,8 @@ class TestManualEntry:
     """10.4 - Qo'lda provodka yaratish."""
 
     def test_create_manual_entry(self, api_client, accounts, journals):
-        cash_acc = accounts.get("1000") or accounts.get("5010") or accounts.get("1010")
-        expense_acc = accounts.get("6000") or accounts.get("6100") or accounts.get("6200")
+        cash_acc = find_leaf_account(accounts, "1000", "5010", "1010")
+        expense_acc = find_leaf_account(accounts, "6000", "6100", "6200", "9410", "9430")
         journal = journals.get("general") or list(journals.values())[0]
 
         if not all([cash_acc, expense_acc]):
@@ -104,8 +104,8 @@ class TestUnbalancedEntryRejected:
     """10.5 - Dt != Kt bo'lsa rad etilishi kerak."""
 
     def test_unbalanced_entry_rejected(self, api_client, accounts, journals):
-        cash_acc = accounts.get("1000") or accounts.get("5010") or accounts.get("1010")
-        expense_acc = accounts.get("6000") or accounts.get("6100")
+        cash_acc = find_leaf_account(accounts, "1000", "5010", "1010")
+        expense_acc = find_leaf_account(accounts, "6000", "6100", "9410", "9430")
         journal = journals.get("general") or list(journals.values())[0]
 
         if not all([cash_acc, expense_acc]):
@@ -137,8 +137,8 @@ class TestPostJournalEntry:
     """Jurnal yozuvini e'lon qilish (post)."""
 
     def test_post_journal_entry(self, api_client, accounts, journals):
-        cash_acc = accounts.get("1000") or accounts.get("1010")
-        rev_acc = accounts.get("4000") or accounts.get("4100")
+        cash_acc = find_leaf_account(accounts, "1000", "1010", "5010")
+        rev_acc = find_leaf_account(accounts, "4000", "4100", "9010")
         journal = journals.get("general") or list(journals.values())[0]
 
         if not all([cash_acc, rev_acc]):

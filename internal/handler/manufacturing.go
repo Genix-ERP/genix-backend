@@ -2679,7 +2679,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 								h.db.QueryRow(`SELECT COALESCE(p.name, '') FROM production_orders po JOIN products p ON po.product_id = p.id WHERE po.id = $1`, id).Scan(&prodNameStarted)
 
 								entryID := uuid.New()
-								entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+								entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
 								description := fmt.Sprintf("Production Order %s started - materials consumed", poNumber)
 								if prodNameStarted != "" {
 									description = fmt.Sprintf("Production Order %s started - %s - materials consumed", poNumber, prodNameStarted)
@@ -3258,7 +3258,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 			h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, productID).Scan(&productName)
 
 			entryID := uuid.New()
-			entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+			entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
 			description := fmt.Sprintf("Production Order %s completed - %s (qty: %.2f)", poNumber, productName, producedQty)
 
 			h.log.Info("CompleteProductionOrder: journal creation",

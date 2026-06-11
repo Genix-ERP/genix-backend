@@ -21,11 +21,6 @@ import (
 
 const xlsxFont = "Times New Roman"
 
-func xlsxMoney(v float64) string {
-	// #,##0.00 with Russian-style space separators is the safest portable format.
-	return fmt.Sprintf("%.2f", v)
-}
-
 // numberToWordsRU converts an integer (sum in Uzbek som) to its Russian
 // textual representation, matching the Uzbekistan construction industry
 // convention used in Forma 3 ("Итого к оплате: 173 666 813 (Сто семьдесят …) сум").
