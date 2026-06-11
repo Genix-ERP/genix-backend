@@ -414,6 +414,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// the chosen date so the user can see what each warehouse held
 		// (incl. soft-deleted SKUs) on any historical day.
 		inventory.GET("/stock-at-date", h.GetStockAtDate)
+		// Per-(product, warehouse) turnover for a date range: opening
+		// balance, kirim/chiqim within the period, and closing balance +
+		// weighted-average cost. Powers the "Ombor holati" report sub-tab.
+		inventory.GET("/turnover", h.GetInventoryTurnover)
 
 		// Inventory Lots (Partiyalar) - lots are created automatically during Goods Receipt
 		inventory.GET("/lots", h.ListInventoryLots)
