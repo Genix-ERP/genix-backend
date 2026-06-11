@@ -562,23 +562,6 @@ type InventoryLot struct {
 	Warehouse *Warehouse `json:"warehouse,omitempty"`
 }
 
-// CreateInventoryLotInput represents input for creating an inventory lot
-type CreateInventoryLotInput struct {
-	ProductID       string  `json:"product_id" binding:"required"`
-	WarehouseID     string  `json:"warehouse_id" binding:"required"`
-	LocationID      string  `json:"location_id,omitempty"`
-	LotNumber       string  `json:"lot_number"`
-	SerialNumber    string  `json:"serial_number,omitempty"`
-	ReceivedDate    string  `json:"received_date" binding:"required"`
-	ExpiryDate      string  `json:"expiry_date,omitempty"`
-	ManufactureDate string  `json:"manufacture_date,omitempty"`
-	Quantity        float64 `json:"quantity" binding:"required,gt=0"`
-	UnitCost        float64 `json:"unit_cost" binding:"required,gte=0"`
-	VendorID        string  `json:"vendor_id,omitempty"`
-	PurchaseOrderID string  `json:"purchase_order_id,omitempty"`
-	Notes           string  `json:"notes,omitempty"`
-}
-
 // InventoryLotListFilter represents filters for listing inventory lots
 type InventoryLotListFilter struct {
 	ProductID   string `form:"product_id"`

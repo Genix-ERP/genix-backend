@@ -4,7 +4,7 @@ Mijozdan qaytarish va yetkazuvchiga qaytarish
 """
 import uuid
 import pytest
-from conftest import today, assert_balanced
+from conftest import today, assert_balanced, find_leaf_account
 
 
 class TestCustomerReturn:
@@ -12,8 +12,8 @@ class TestCustomerReturn:
 
     def test_customer_return_journal_entry(self, api_client, accounts, journals, test_customer):
         """Teskari provodka: Dt 9010 (Revenue), Kt 4010 (AR) - debitorlik kamayadi."""
-        ar_acc = accounts.get("1200") or accounts.get("4010")
-        rev_acc = accounts.get("4000") or accounts.get("9010") or accounts.get("4100")
+        ar_acc = find_leaf_account(accounts, "1200", "4010")
+        rev_acc = find_leaf_account(accounts, "4000", "9010", "4100")
         journal = journals.get("sales") or journals.get("general") or list(journals.values())[0]
 
         if not all([ar_acc, rev_acc]):
@@ -50,8 +50,8 @@ class TestSupplierReturn:
 
     def test_supplier_return_journal_entry(self, api_client, accounts, journals, test_supplier):
         """Teskari provodka: Dt 6010 (AP), Kt 1300 (Inventory) - kreditorlik kamayadi."""
-        ap_acc = accounts.get("2000") or accounts.get("6010")
-        inv_acc = accounts.get("1300") or accounts.get("5000")
+        ap_acc = find_leaf_account(accounts, "2000", "6010")
+        inv_acc = find_leaf_account(accounts, "1300", "1010", "5000")
         journal = journals.get("purchase") or journals.get("general") or list(journals.values())[0]
 
         if not all([ap_acc, inv_acc]):
@@ -88,8 +88,8 @@ class TestReturnJournalEntry:
 
     def test_reverse_journal_entry(self, api_client, accounts, journals):
         """Mavjud yozuvni teskari qilish (reverse)."""
-        cash_acc = accounts.get("1000") or accounts.get("1010")
-        rev_acc = accounts.get("4000") or accounts.get("4100")
+        cash_acc = find_leaf_account(accounts, "1000", "1010", "5010")
+        rev_acc = find_leaf_account(accounts, "4000", "4100", "9010")
         journal = journals.get("general") or list(journals.values())[0]
 
         if not all([cash_acc, rev_acc]):
@@ -139,8 +139,8 @@ class TestPartialReturn:
     """13.5 - Qisman qaytarish."""
 
     def test_partial_return(self, api_client, accounts, journals, test_customer):
-        ar_acc = accounts.get("1200") or accounts.get("4010")
-        rev_acc = accounts.get("4000") or accounts.get("4100")
+        ar_acc = find_leaf_account(accounts, "1200", "4010")
+        rev_acc = find_leaf_account(accounts, "4000", "4100", "9010")
         journal = journals.get("general") or list(journals.values())[0]
 
         if not all([ar_acc, rev_acc]):

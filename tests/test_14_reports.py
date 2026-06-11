@@ -49,7 +49,7 @@ class TestIncomeStatement:
         assert data is not None, "Income statement bo'sh"
 
     def test_net_profit_formula(self, api_client):
-        """revenue - expenses = net_profit."""
+        """revenue - expenses - foyda solig'i (15%) = net_profit."""
         resp = api_client.get("/reports/income-statement", params={
             "period_from": "2026-01-01",
             "period_to": today(),
@@ -58,11 +58,12 @@ class TestIncomeStatement:
             data = resp.json().get("data", resp.json())
             revenue = float(data.get("total_revenue", data.get("total_income", 0)))
             expenses = float(data.get("total_expenses", 0))
+            income_tax = float(data.get("income_tax", 0))
             net = float(data.get("net_profit", data.get("net_income", 0)))
             if revenue > 0 or expenses > 0:
-                expected = revenue - expenses
+                expected = revenue - expenses - income_tax
                 assert abs(net - expected) < 1, \
-                    f"Foyda formulasi: {revenue} - {expenses} = {expected}, lekin {net}"
+                    f"Foyda formulasi: {revenue} - {expenses} - {income_tax} = {expected}, lekin {net}"
 
 
 class TestCashFlow:

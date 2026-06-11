@@ -1167,103 +1167,6 @@ func (h *Handler) ValidateManufacturingTransfer(c *gin.Context) {
 	})
 }
 
-// =====================================================
-// CREATE TRANSFERS FOR MANUFACTURING ORDER
-// =====================================================
-
-// CreateManufacturingTransfers creates pick/store transfers when MO is confirmed
-func (h *Handler) CreateManufacturingTransfers(productionOrderID uuid.UUID, tenantID uuid.UUID, userID uuid.UUID) error {
-	// Get MO details
-	var orgID uuid.UUID
-	var warehouseID uuid.UUID
-	var orderNumber string
-	var bomID uuid.UUID
-
-	err := h.db.QueryRow(`
-		SELECT po.organization_id, po.warehouse_id, po.code, po.bom_id
-		FROM production_orders po
-		WHERE po.id = $1 AND po.tenant_id = $2
-	`, productionOrderID, tenantID).Scan(&orgID, &warehouseID, &orderNumber, &bomID)
-	if err != nil {
-		return err
-	}
-
-	// Get warehouse manufacturing steps
-	var manufacturingSteps int
-	var productionLocationID, stockLocationID sql.NullString
-	h.db.QueryRow(`
-		SELECT COALESCE(manufacturing_steps, 1), production_location_id,
-			   (SELECT id FROM warehouse_locations WHERE warehouse_id = $1 AND location_type = 'stock' LIMIT 1)
-		FROM warehouses WHERE id = $1
-	`, warehouseID).Scan(&manufacturingSteps, &productionLocationID, &stockLocationID)
-
-	if manufacturingSteps < 2 {
-		return nil // 1-step manufacturing, no transfers needed
-	}
-
-	// Create Pick Components transfer (for 2 and 3 step)
-	pickTransferID := uuid.New()
-	pickNumber := fmt.Sprintf("PC/%s", orderNumber)
-
-	_, err = h.db.Exec(`
-		INSERT INTO manufacturing_transfers (
-			id, tenant_id, organization_id, production_order_id,
-			transfer_number, transfer_type, source_location_id, destination_location_id,
-			warehouse_id, status, scheduled_date, created_by
-		) VALUES ($1, $2, $3, $4, $5, 'pick_components', $6, $7, $8, 'ready', NOW(), $9)
-	`, pickTransferID, tenantID, orgID, productionOrderID,
-		pickNumber, stockLocationID, productionLocationID, warehouseID, userID)
-	if err != nil {
-		return err
-	}
-
-	// Create transfer lines from BOM components
-	rows, err := h.db.Query(`
-		SELECT bl.component_id, bl.quantity, bl.unit_of_measure
-		FROM bom_lines bl
-		WHERE bl.bom_id = $1
-	`, bomID)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var componentID uuid.UUID
-			var qty float64
-			var uom string
-			rows.Scan(&componentID, &qty, &uom)
-
-			h.db.Exec(`
-				INSERT INTO manufacturing_transfer_lines (
-					id, manufacturing_transfer_id, product_id, quantity_demanded, uom,
-					source_location_id, destination_location_id
-				) VALUES ($1, $2, $3, $4, $5, $6, $7)
-			`, uuid.New(), pickTransferID, componentID, qty, uom, stockLocationID, productionLocationID)
-		}
-	}
-
-	// Link pick transfer to production order
-	h.db.Exec("UPDATE production_orders SET pick_transfer_id = $1 WHERE id = $2", pickTransferID, productionOrderID)
-
-	// Create Store Finished transfer (for 3 step only)
-	if manufacturingSteps >= 3 {
-		storeTransferID := uuid.New()
-		storeNumber := fmt.Sprintf("SF/%s", orderNumber)
-
-		_, err = h.db.Exec(`
-			INSERT INTO manufacturing_transfers (
-				id, tenant_id, organization_id, production_order_id,
-				transfer_number, transfer_type, source_location_id, destination_location_id,
-				warehouse_id, status, created_by
-			) VALUES ($1, $2, $3, $4, $5, 'store_finished', $6, $7, $8, 'waiting', $9)
-		`, storeTransferID, tenantID, orgID, productionOrderID,
-			storeNumber, productionLocationID, stockLocationID, warehouseID, userID)
-
-		// Link store transfer to production order
-		h.db.Exec("UPDATE production_orders SET store_transfer_id = $1 WHERE id = $2", storeTransferID, productionOrderID)
-	}
-
-	return nil
-}
-
 // CreateWorkOrdersFromBOM creates work orders from BOM operations
 func (h *Handler) CreateWorkOrdersFromBOM(productionOrderID uuid.UUID, bomID uuid.UUID, tenantID uuid.UUID, orgID uuid.UUID, quantity float64, userID uuid.UUID) error {
 	// Get BOM operations
@@ -2005,7 +1908,7 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 	h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, productID).Scan(&productName)
 
 	entryID := uuid.New()
-	entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+	entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
 	description := fmt.Sprintf("Ishlab chiqarish yakunlandi: %s - %s (soni: %.0f)", poNumber, productName, producedQty)
 
 	if useDetailedFlow {

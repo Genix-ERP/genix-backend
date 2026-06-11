@@ -133,16 +133,6 @@ func BadRequest(c *gin.Context, message string) {
 	Error(c, http.StatusBadRequest, "BAD_REQUEST", message)
 }
 
-// BadRequestWithDetails sends a 400 Bad Request response with details
-func BadRequestWithDetails(c *gin.Context, message string, details map[string]string) {
-	ErrorWithDetails(c, http.StatusBadRequest, "BAD_REQUEST", message, details)
-}
-
-// ValidationError sends a 400 response for validation errors
-func ValidationError(c *gin.Context, details map[string]string) {
-	ErrorWithDetails(c, http.StatusBadRequest, "VALIDATION_ERROR", "Validation failed", details)
-}
-
 // Unauthorized sends a 401 Unauthorized response
 func Unauthorized(c *gin.Context, message string) {
 	if message == "" {
@@ -185,11 +175,6 @@ func ConflictWithData(c *gin.Context, code, message string, data interface{}) {
 	})
 }
 
-// UnprocessableEntity sends a 422 Unprocessable Entity response
-func UnprocessableEntity(c *gin.Context, message string) {
-	Error(c, http.StatusUnprocessableEntity, "UNPROCESSABLE_ENTITY", message)
-}
-
 // TooManyRequests sends a 429 Too Many Requests response
 func TooManyRequests(c *gin.Context, message string) {
 	if message == "" {
@@ -204,14 +189,6 @@ func InternalServerError(c *gin.Context, message string) {
 		message = "An unexpected error occurred"
 	}
 	Error(c, http.StatusInternalServerError, "INTERNAL_ERROR", message)
-}
-
-// ServiceUnavailable sends a 503 Service Unavailable response
-func ServiceUnavailable(c *gin.Context, message string) {
-	if message == "" {
-		message = "Service temporarily unavailable"
-	}
-	Error(c, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", message)
 }
 
 // Common error codes

@@ -316,26 +316,6 @@ func (s *Service) SendOTP(toEmail, otpCode, purpose, language string) error {
 	})
 }
 
-// SendWelcome sends a welcome email
-func (s *Service) SendWelcome(toEmail, firstName, tenantName string) error {
-	subject := fmt.Sprintf("%s ga xush kelibsiz!", tenantName)
-
-	body, err := s.renderTemplate(welcomeTemplate, map[string]string{
-		"FirstName":  firstName,
-		"TenantName": tenantName,
-	})
-	if err != nil {
-		return err
-	}
-
-	return s.Send(&Email{
-		To:      []string{toEmail},
-		Subject: subject,
-		Body:    body,
-		IsHTML:  true,
-	})
-}
-
 func (s *Service) renderTemplate(tmpl string, data map[string]string) (string, error) {
 	t, err := template.New("email").Parse(tmpl)
 	if err != nil {

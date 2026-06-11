@@ -86,15 +86,6 @@ func GenerateRandomString(length int) (string, error) {
 	return base64.URLEncoding.EncodeToString(bytes)[:length], nil
 }
 
-// GenerateRandomBytes generates cryptographically secure random bytes
-func GenerateRandomBytes(length int) ([]byte, error) {
-	bytes := make([]byte, length)
-	if _, err := rand.Read(bytes); err != nil {
-		return nil, fmt.Errorf("failed to generate random bytes: %w", err)
-	}
-	return bytes, nil
-}
-
 // TokenSalt is the salt used for token hashing. Set from config on startup.
 var TokenSalt = "genix-token-salt"
 
@@ -102,21 +93,4 @@ var TokenSalt = "genix-token-salt"
 func HashToken(token string) string {
 	hash := argon2.IDKey([]byte(token), []byte(TokenSalt), 1, 16*1024, 1, 32)
 	return base64.RawStdEncoding.EncodeToString(hash)
-}
-
-// GenerateAPIKey generates an API key with a prefix
-func GenerateAPIKey(prefix string) (key string, hash string, err error) {
-	// Generate 32 random bytes
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", "", fmt.Errorf("failed to generate API key: %w", err)
-	}
-
-	// Create the key with prefix
-	key = fmt.Sprintf("%s_%s", prefix, base64.URLEncoding.EncodeToString(bytes))
-
-	// Hash for storage
-	hash = HashToken(key)
-
-	return key, hash, nil
 }

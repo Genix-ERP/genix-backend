@@ -4,7 +4,7 @@ UZS (asosiy), USD, RUB
 Kurs farqi: ijobiy -> Kt 9540, salbiy -> Dt 9620
 """
 import pytest
-from conftest import today, first_of_month
+from conftest import today, first_of_month, find_leaf_account
 
 
 class TestCurrenciesExist:
@@ -82,8 +82,8 @@ class TestMultiCurrencyBalance:
 
     def test_forex_journal_entry(self, api_client, accounts, journals, currencies):
         """USD da jurnal yozuvi."""
-        bank_acc = accounts.get("1100") or accounts.get("5110") or accounts.get("5220")
-        rev_acc = accounts.get("4000") or accounts.get("4100")
+        bank_acc = find_leaf_account(accounts, "1100", "5220", "5110")
+        rev_acc = find_leaf_account(accounts, "4000", "4100", "9030", "9010")
         journal = journals.get("general") or list(journals.values())[0]
         usd = currencies.get("USD")
 

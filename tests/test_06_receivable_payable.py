@@ -4,15 +4,15 @@ Provodkalar orqali debitorlik va kreditorlik tekshiruvi.
 """
 import uuid
 import pytest
-from conftest import today, find_account_id, assert_balanced
+from conftest import today, find_account_id, find_leaf_account, assert_balanced
 
 
 class TestSaleCreatesReceivable:
     """6.2 - Sotish -> debitorlik oshadi (Dt 4010)."""
 
     def test_sale_journal_entry(self, api_client, accounts, journals, test_customer):
-        ar_acc = accounts.get("1200") or accounts.get("4010")
-        rev_acc = accounts.get("4000") or accounts.get("9010") or accounts.get("4100")
+        ar_acc = find_leaf_account(accounts, "1200", "4010")
+        rev_acc = find_leaf_account(accounts, "4000", "9010", "4100")
         journal = journals.get("sales") or journals.get("general") or list(journals.values())[0]
 
         if not ar_acc or not rev_acc:
@@ -48,8 +48,8 @@ class TestPurchaseCreatesPayable:
     """6.1 - Xarid -> kreditorlik oshadi (Kt 6010)."""
 
     def test_purchase_journal_entry(self, api_client, accounts, journals, test_supplier):
-        ap_acc = accounts.get("2000") or accounts.get("6010")
-        inv_acc = accounts.get("1300") or accounts.get("1010") or accounts.get("5000")
+        ap_acc = find_leaf_account(accounts, "2000", "6010")
+        inv_acc = find_leaf_account(accounts, "1300", "1010", "5000")
         journal = journals.get("purchase") or journals.get("general") or list(journals.values())[0]
 
         if not ap_acc or not inv_acc:

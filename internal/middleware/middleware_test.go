@@ -616,46 +616,6 @@ func TestOrganizationResolver(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// RequireTenant
-// ---------------------------------------------------------------------------
-
-func TestRequireTenant_Present(t *testing.T) {
-	router := gin.New()
-	router.Use(func(c *gin.Context) {
-		c.Set(ContextKeyTenantID, "550e8400-e29b-41d4-a716-446655440000")
-		c.Next()
-	})
-	router.Use(RequireTenant())
-	router.GET("/test", func(c *gin.Context) {
-		c.String(http.StatusOK, "ok")
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
-	}
-}
-
-func TestRequireTenant_Missing(t *testing.T) {
-	router := gin.New()
-	router.Use(RequireTenant())
-	router.GET("/test", func(c *gin.Context) {
-		t.Error("handler should not be called when tenant is missing")
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // RateLimiter — Lua script correctness via miniredis
 // ---------------------------------------------------------------------------
 

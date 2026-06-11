@@ -65,7 +65,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		) sp ON sp.vendor_id = c.id
 		WHERE c.tenant_id = $1 AND c.deleted_at IS NULL
 	`
-	countQuery := `SELECT COUNT(*) FROM contacts WHERE tenant_id = $1 AND deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM contacts c WHERE c.tenant_id = $1 AND c.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1

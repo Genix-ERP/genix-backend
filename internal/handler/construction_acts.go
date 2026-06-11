@@ -2305,27 +2305,6 @@ func (h *Handler) DeleteConstructionAct(c *gin.Context) {
 	})
 }
 
-// CheckF19Blocking checks if a stage requires a signed Forma 19 before completion
-func (h *Handler) CheckF19Blocking(tenantID uuid.UUID, stageID int64) (bool, string) {
-	var requiresF19 bool
-	err := h.db.QueryRow(`SELECT COALESCE(requires_f19, false) FROM construction_stages WHERE id = $1 AND tenant_id = $2`,
-		stageID, tenantID).Scan(&requiresF19)
-	if err != nil || !requiresF19 {
-		return false, ""
-	}
-
-	var signedCount int
-	h.db.QueryRow(`
-		SELECT COUNT(*) FROM construction_act
-		WHERE stage_id = $1 AND act_type = 'hidden_work' AND state = 'signed' AND tenant_id = $2
-	`, stageID, tenantID).Scan(&signedCount)
-
-	if signedCount == 0 {
-		return true, "Bosqichni yakunlash uchun yashirin ishlar akti (Forma 19) tasdiqlanishi kerak"
-	}
-	return false, ""
-}
-
 // nullFloat64Val converts sql.NullFloat64 to interface{} (nil if not valid)
 func nullFloat64Val(n sql.NullFloat64) interface{} {
 	if n.Valid {

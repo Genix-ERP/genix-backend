@@ -56,10 +56,6 @@ type PurchaseRequisition struct {
 	Lines []PurchaseRequisitionLine `json:"lines,omitempty" gorm:"foreignKey:RequisitionID"`
 }
 
-func (PurchaseRequisition) TableName() string {
-	return "purchase_requisitions"
-}
-
 // PurchaseRequisitionLine represents a line item in a purchase requisition
 type PurchaseRequisitionLine struct {
 	ID               uuid.UUID  `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
@@ -78,10 +74,6 @@ type PurchaseRequisitionLine struct {
 	ApprovedQuantity float64    `json:"approved_quantity" gorm:"type:decimal(15,3)"`
 	CreatedAt        time.Time  `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt        time.Time  `json:"updated_at" gorm:"autoUpdateTime"`
-}
-
-func (PurchaseRequisitionLine) TableName() string {
-	return "purchase_requisition_lines"
 }
 
 // Input/Output structs

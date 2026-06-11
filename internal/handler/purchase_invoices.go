@@ -1002,7 +1002,10 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
 			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+			// Scoped to (tenant, org) to match journal_entries_tenant_org_entry_number_key;
+			// the journal's next_number counter alone collides with MAX-derived numbers
+			// from other journals sharing the (empty) prefix.
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(tx, tenantID, organizationID, prefix, nextNumber))
 
 			description := "Bill Posted"
 			if vendorName.Valid {
@@ -1293,7 +1296,7 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 				cashAcctID = findAccount(h.db, tenantID, organizationID, "kassa", "5010")
 			}
 		default: // bank, card
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank", "5110")
+			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "5110")
 			if cashAcctID == uuid.Nil {
 				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "5110")
 			}
@@ -1317,7 +1320,7 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
 			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, organizationID, prefix, nextNumber))
 			description := fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
 			if vendorName.Valid && vendorName.String != "" {
 				description = fmt.Sprintf("Payment for invoice %s — %s", invoiceID.String()[:8], vendorName.String)
@@ -1592,7 +1595,7 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
 			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+			entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(tx, tenantID, organizationID, prefix, nextNumber))
 
 			journalEntryID := uuid.New()
 			description := fmt.Sprintf("Debit Note %s", dnNumber)

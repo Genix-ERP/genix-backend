@@ -497,7 +497,7 @@ func (h *Handler) createSplitOutputJournalEntry(
 	h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, primaryProductID).Scan(&productName)
 
 	entryID := uuid.New()
-	entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+	entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
 	description := fmt.Sprintf("Split output: %s — %s", poCode, productName)
 
 	tx, err := h.db.Begin()
