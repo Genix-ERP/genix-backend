@@ -9562,3 +9562,218 @@ JOIN warehouses w ON w.id = a.warehouse_id
 WHERE ($6 = TRUE OR p.deleted_at IS NULL)
 ORDER BY p.name ASC, w.name ASC
 `
+
+// GetInventoryTurnover returns a per-(product, warehouse) turnover sheet for a
+// date range: opening balance (everything before date_from), kirim/chiqim that
+// happened during the period, and the closing balance + weighted-average cost
+// as of date_to. It replays the inventory_transactions ledger exactly like
+// GetStockAtDate, but splits the running total at the period boundary so the
+// user sees how much came in and went out — not just the end snapshot.
+//
+// Query params:
+//
+//	date_from        — YYYY-MM-DD (required) period start, inclusive
+//	date_to          — YYYY-MM-DD (required) period end, inclusive
+//	warehouse_id     — uuid, filter to a single warehouse
+//	product_id       — uuid, filter to a single product
+//	include_deleted  — bool, default true (show SKUs deleted since)
+func (h *Handler) GetInventoryTurnover(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	fromStr := strings.TrimSpace(c.Query("date_from"))
+	toStr := strings.TrimSpace(c.Query("date_to"))
+	if fromStr == "" || toStr == "" {
+		response.BadRequest(c, "date_from and date_to query params are required (YYYY-MM-DD)")
+		return
+	}
+	// date_from is the START of its day; date_to is the END of its day. That
+	// makes the period [from 00:00:00, to 23:59:59] fully inclusive and the
+	// opening balance everything strictly before date_from.
+	fromTime, err := parseDayStart(fromStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid date_from format — use YYYY-MM-DD")
+		return
+	}
+	toTime, err := parseAsOfDate(toStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid date_to format — use YYYY-MM-DD")
+		return
+	}
+	if toTime.Before(fromTime) {
+		response.BadRequest(c, "date_to must not be earlier than date_from")
+		return
+	}
+
+	// Optional filters. SQL uses NULL-aware predicates so untyped nils are
+	// treated as "no filter".
+	var orgArg, whArg, prodArg interface{}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgArg = orgID
+	}
+	if v := strings.TrimSpace(c.Query("warehouse_id")); v != "" {
+		whArg = v
+	}
+	if v := strings.TrimSpace(c.Query("product_id")); v != "" {
+		prodArg = v
+	}
+	includeDeleted := !strings.EqualFold(c.DefaultQuery("include_deleted", "true"), "false")
+
+	rows, err := h.db.Query(stockTurnoverQuery,
+		tenantID, fromTime, toTime, orgArg, whArg, prodArg, includeDeleted)
+	if err != nil {
+		h.log.Error("GetInventoryTurnover: query failed", "error", err)
+		response.InternalError(c, "Failed to compute inventory turnover")
+		return
+	}
+	defer rows.Close()
+
+	type TurnoverRow struct {
+		ProductID         uuid.UUID  `json:"product_id"`
+		ProductCode       string     `json:"product_code"`
+		ProductName       string     `json:"product_name"`
+		IsDeleted         bool       `json:"is_deleted"`
+		WarehouseID       uuid.UUID  `json:"warehouse_id"`
+		WarehouseName     string     `json:"warehouse_name"`
+		OpeningQty        float64    `json:"opening_qty"`
+		InQty             float64    `json:"in_qty"`
+		InValue           float64    `json:"in_value"`
+		OutQty            float64    `json:"out_qty"`
+		OutValue          float64    `json:"out_value"`
+		ClosingQty        float64    `json:"closing_qty"`
+		UnitCost          float64    `json:"unit_cost"`
+		ClosingValue      float64    `json:"closing_value"`
+		CurrentSalesPrice float64    `json:"current_sales_price"`
+		LastTxnDate       *time.Time `json:"last_txn_date,omitempty"`
+	}
+
+	out := make([]TurnoverRow, 0, 256)
+	var totInQty, totInVal, totOutQty, totOutVal, totClosingVal float64
+	for rows.Next() {
+		var r TurnoverRow
+		var last sql.NullTime
+		if err := rows.Scan(
+			&r.ProductID, &r.ProductCode, &r.ProductName, &r.IsDeleted,
+			&r.WarehouseID, &r.WarehouseName,
+			&r.OpeningQty, &r.InQty, &r.InValue, &r.OutQty, &r.OutValue,
+			&r.ClosingQty, &r.UnitCost, &r.ClosingValue,
+			&r.CurrentSalesPrice, &last,
+		); err != nil {
+			h.log.Error("GetInventoryTurnover: scan failed", "error", err)
+			continue
+		}
+		if last.Valid {
+			r.LastTxnDate = &last.Time
+		}
+		totInQty += r.InQty
+		totInVal += r.InValue
+		totOutQty += r.OutQty
+		totOutVal += r.OutValue
+		totClosingVal += r.ClosingValue
+		out = append(out, r)
+	}
+
+	response.Success(c, gin.H{
+		"date_from":       fromTime,
+		"date_to":         toTime,
+		"warehouse_id":    whArg,
+		"product_id":      prodArg,
+		"include_deleted": includeDeleted,
+		"rows":            out,
+		"totals": gin.H{
+			"products":      len(out),
+			"in_qty":        totInQty,
+			"in_value":      totInVal,
+			"out_qty":       totOutQty,
+			"out_value":     totOutVal,
+			"closing_value": totClosingVal,
+		},
+	})
+}
+
+// parseDayStart accepts "YYYY-MM-DD" and returns 00:00:00 UTC of that day so a
+// transaction stamped at 00:05 on date_from still falls inside the period.
+// Falls back to RFC3339 for an exact timestamp passed by automation.
+func parseDayStart(s string) (time.Time, error) {
+	if t, err := time.Parse("2006-01-02", s); err == nil {
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC), nil
+	}
+	return time.Parse(time.RFC3339, s)
+}
+
+// stockTurnoverQuery — see GetInventoryTurnover above.
+// Param order:  $1 tenantID  $2 date_from(start)  $3 date_to(end)
+//               $4 orgID      $5 warehouseID        $6 productID
+//               $7 include_deleted
+const stockTurnoverQuery = `
+WITH ledger AS (
+    SELECT
+        inv.product_id,
+        inv.warehouse_id,
+        CASE
+            WHEN t.transaction_type IN (
+                'issue', 'sale', 'ship', 'delivery',
+                'adjustment_out', 'transfer_out',
+                'consume', 'production_out', 'write_off', 'scrap'
+            ) THEN -ABS(t.quantity)
+            ELSE t.quantity
+        END AS signed_qty,
+        t.unit_cost,
+        t.transaction_date
+    FROM inventory_transactions t
+    JOIN inventory inv ON inv.id = t.inventory_id
+    WHERE t.tenant_id = $1
+      AND t.transaction_date <= $3
+      AND ($4::uuid IS NULL OR inv.organization_id = $4)
+      AND ($5::uuid IS NULL OR inv.warehouse_id  = $5)
+      AND ($6::uuid IS NULL OR inv.product_id    = $6)
+),
+agg AS (
+    SELECT
+        product_id,
+        warehouse_id,
+        SUM(CASE WHEN transaction_date <  $2 THEN signed_qty ELSE 0 END)                      AS opening_qty,
+        SUM(CASE WHEN transaction_date >= $2 AND signed_qty > 0 THEN signed_qty ELSE 0 END)   AS in_qty,
+        SUM(CASE WHEN transaction_date >= $2 AND signed_qty > 0 THEN signed_qty * COALESCE(unit_cost, 0) ELSE 0 END)  AS in_value,
+        SUM(CASE WHEN transaction_date >= $2 AND signed_qty < 0 THEN -signed_qty ELSE 0 END)  AS out_qty,
+        SUM(CASE WHEN transaction_date >= $2 AND signed_qty < 0 THEN -signed_qty * COALESCE(unit_cost, 0) ELSE 0 END) AS out_value,
+        SUM(signed_qty)                                                                       AS closing_qty,
+        MAX(transaction_date)                                                                 AS last_txn_date,
+        CASE
+            WHEN SUM(CASE WHEN signed_qty > 0 THEN signed_qty ELSE 0 END) > 0
+            THEN SUM(CASE WHEN signed_qty > 0 THEN signed_qty * COALESCE(unit_cost, 0) ELSE 0 END)
+                 / SUM(CASE WHEN signed_qty > 0 THEN signed_qty ELSE 0 END)
+            ELSE 0
+        END AS wac_unit_cost
+    FROM ledger
+    GROUP BY product_id, warehouse_id
+)
+SELECT
+    p.id                                                                      AS product_id,
+    COALESCE(p.code, '')                                                      AS product_code,
+    p.name                                                                    AS product_name,
+    (p.deleted_at IS NOT NULL)                                                AS is_deleted,
+    w.id                                                                      AS warehouse_id,
+    w.name                                                                    AS warehouse_name,
+    COALESCE(a.opening_qty, 0)                                                AS opening_qty,
+    COALESCE(a.in_qty, 0)                                                     AS in_qty,
+    COALESCE(a.in_value, 0)                                                   AS in_value,
+    COALESCE(a.out_qty, 0)                                                    AS out_qty,
+    COALESCE(a.out_value, 0)                                                  AS out_value,
+    COALESCE(a.closing_qty, 0)                                                AS closing_qty,
+    COALESCE(NULLIF(a.wac_unit_cost, 0), p.cost_price, 0)                     AS unit_cost,
+    COALESCE(a.closing_qty, 0)
+        * COALESCE(NULLIF(a.wac_unit_cost, 0), p.cost_price, 0)               AS closing_value,
+    COALESCE(p.list_price, 0)                                                 AS current_sales_price,
+    a.last_txn_date
+FROM agg a
+JOIN products   p ON p.id = a.product_id
+JOIN warehouses w ON w.id = a.warehouse_id
+WHERE ($7 = TRUE OR p.deleted_at IS NULL)
+  -- Drop rows that had no opening, no movement, and no closing — pure noise.
+  AND (a.opening_qty <> 0 OR a.in_qty <> 0 OR a.out_qty <> 0 OR a.closing_qty <> 0)
+ORDER BY p.name ASC, w.name ASC
+`
