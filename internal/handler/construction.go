@@ -5939,9 +5939,23 @@ func (h *Handler) DeleteProjectFile(c *gin.Context) {
 //     "fresh build" reasoning as above.
 //
 // POST /construction/projects/:id/buildings/:building_id/clone-estimates
-// Body: { "source_building_id": <int> }
-// 200: { estimates_created, lines_created }
-// 409: target building already has estimates ({ code: "TARGET_NOT_EMPTY" })
+//
+// The :building_id in the URL is the SOURCE — the handler creates a brand
+// new construction_buildings row called "<source name> Copy" (or " Copy
+// (2)", " Copy (3)", … on subsequent duplications) in the same project,
+// inherits all of the source's physical / financial / timeline metadata
+// EXCEPT actuals (progress, actual_cost, actual dates — those belong to
+// the source's history), then copies every estimate, line, stage, and
+// file across in the same transaction. Net effect of one button-press:
+// a new sibling block appears in the project with identical smeta and
+// drawings to the source, ready for the user to start work.
+//
+// 200: { new_building: { id, name, code, … }, estimates_created,
+//        lines_created, stages_created, files_created }
+//
+// (The body parameter `source_building_id` and the old "fail if target
+// not empty" check from the previous implementation are no longer
+// relevant — the target is always a fresh row.)
 func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -5954,63 +5968,63 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 		response.BadRequest(c, "Invalid project ID")
 		return
 	}
-	targetBuildingID, err := strconv.ParseInt(c.Param("building_id"), 10, 64)
+	sourceBuildingID, err := strconv.ParseInt(c.Param("building_id"), 10, 64)
 	if err != nil {
-		response.BadRequest(c, "Invalid target building ID")
+		response.BadRequest(c, "Invalid source building ID")
 		return
 	}
 
-	var req struct {
-		SourceBuildingID int64 `json:"source_building_id" binding:"required"`
+	// Load the source building's metadata so the duplicate carries the
+	// same building_type / floors / area / etc. — these are "what the
+	// block IS" attributes and would normally have to be re-entered by
+	// hand. We deliberately do NOT copy actuals (actual_cost,
+	// progress_percent, actual_start_date, actual_end_date) — those belong
+	// to the source's history and would mis-report progress on the
+	// duplicate.
+	var src struct {
+		Name                 string
+		Code                 string
+		Description          sql.NullString
+		BuildingType         sql.NullString
+		BuildingPurpose      sql.NullString
+		FloorsCount          sql.NullInt64
+		FloorsUnderground    sql.NullInt64
+		TotalArea            sql.NullFloat64
+		LivingArea           sql.NullFloat64
+		NonLivingArea        sql.NullFloat64
+		ApartmentsCount      sql.NullInt64
+		CommercialUnitsCount sql.NullInt64
+		ParkingSpots         sql.NullInt64
+		EstimatedCost        sql.NullFloat64
+		Currency             sql.NullString
+		PlannedStart         sql.NullTime
+		PlannedEnd           sql.NullTime
+		SortOrder            sql.NullInt64
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.SourceBuildingID == 0 {
-		response.BadRequest(c, "source_building_id is required")
-		return
-	}
-	if req.SourceBuildingID == targetBuildingID {
-		response.BadRequest(c, "Source and target buildings must differ")
-		return
-	}
-
-	// Both buildings must belong to this project and tenant. We check both
-	// in a single round-trip; either NOT EXISTS short-circuits to NotFound.
-	var srcExists, tgtExists bool
 	if err := h.db.QueryRow(`
-		SELECT
-			EXISTS(SELECT 1 FROM construction_buildings WHERE id = $1 AND project_id = $2 AND tenant_id = $3),
-			EXISTS(SELECT 1 FROM construction_buildings WHERE id = $4 AND project_id = $2 AND tenant_id = $3)
-	`, req.SourceBuildingID, projectID, tenantID, targetBuildingID).Scan(&srcExists, &tgtExists); err != nil {
-		h.log.Error("CloneBuildingEstimates: building existence check failed", "error", err)
-		response.InternalError(c, "Failed to verify buildings")
-		return
-	}
-	if !srcExists {
-		response.NotFound(c, "Source building")
-		return
-	}
-	if !tgtExists {
-		response.NotFound(c, "Target building")
-		return
-	}
-
-	// Refuse if target already has estimates. The frontend checks this
-	// too (greys out the menu entry) — this guard is the server-side
-	// enforcement against a race / direct API call.
-	var targetEstimateCount int
-	if err := h.db.QueryRow(`
-		SELECT COUNT(*) FROM construction_estimate
-		WHERE building_id = $1 AND tenant_id = $2
-	`, targetBuildingID, tenantID).Scan(&targetEstimateCount); err != nil {
-		h.log.Error("CloneBuildingEstimates: target count failed", "error", err)
-		response.InternalError(c, "Failed to inspect target building")
-		return
-	}
-	if targetEstimateCount > 0 {
-		c.JSON(409, gin.H{
-			"success": false,
-			"error":   "Target building already has estimates",
-			"code":    "TARGET_NOT_EMPTY",
-		})
+		SELECT name, code, description, building_type, building_purpose,
+		       floors_count, floors_underground,
+		       total_area, living_area, non_living_area,
+		       apartments_count, commercial_units_count, parking_spots,
+		       estimated_cost, currency,
+		       planned_start_date, planned_end_date, sort_order
+		FROM construction_buildings
+		WHERE id = $1 AND project_id = $2 AND tenant_id = $3
+	`, sourceBuildingID, projectID, tenantID).Scan(
+		&src.Name, &src.Code, &src.Description,
+		&src.BuildingType, &src.BuildingPurpose,
+		&src.FloorsCount, &src.FloorsUnderground,
+		&src.TotalArea, &src.LivingArea, &src.NonLivingArea,
+		&src.ApartmentsCount, &src.CommercialUnitsCount, &src.ParkingSpots,
+		&src.EstimatedCost, &src.Currency,
+		&src.PlannedStart, &src.PlannedEnd, &src.SortOrder,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Source building")
+			return
+		}
+		h.log.Error("CloneBuildingEstimates: load source failed", "error", err)
+		response.InternalError(c, "Failed to read source building")
 		return
 	}
 
@@ -6026,6 +6040,32 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 			_ = tx.Rollback()
 		}
 	}()
+
+	// 0a. Create the duplicate building first — the rest of the clone
+	//     logic INSERTs into construction_estimate, construction_stages
+	//     and building_files using `targetBuildingID` as the foreign key,
+	//     so it has to exist before any of that fires. Generated name is
+	//     "<source name> Copy"; on subsequent duplications it becomes
+	//     " Copy (2)", " Copy (3)", etc. Same retry-suffix pattern for
+	//     the code (the existing CreateConstructionBuilding handler uses
+	//     this to dodge the unique (project_id, code) index when the
+	//     auto-generated code collides). actuals (progress_percent,
+	//     actual_cost, actual_*_date) intentionally left at defaults so
+	//     dashboards don't mis-report the duplicate as already in flight.
+	targetBuildingID, newName, newCode, createErr := h.createDuplicateBuildingTx(
+		tx, tenantID, projectID, src.Name, src.Code,
+		src.Description, src.BuildingType, src.BuildingPurpose,
+		src.FloorsCount, src.FloorsUnderground,
+		src.TotalArea, src.LivingArea, src.NonLivingArea,
+		src.ApartmentsCount, src.CommercialUnitsCount, src.ParkingSpots,
+		src.EstimatedCost, src.Currency,
+		src.PlannedStart, src.PlannedEnd, src.SortOrder,
+	)
+	if createErr != nil {
+		h.log.Error("CloneBuildingEstimates: create duplicate failed", "error", createErr)
+		response.InternalError(c, "Failed to create duplicate building")
+		return
+	}
 
 	// 0. Pull and clone construction_stages for the source block. Stages
 	//    are independent of estimate_line in the schema (lines reference
@@ -6057,7 +6097,7 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 		FROM construction_stages
 		WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3
 		ORDER BY COALESCE(stage_order, 0) ASC, id ASC
-	`, projectID, tenantID, req.SourceBuildingID)
+	`, projectID, tenantID, sourceBuildingID)
 	if err != nil {
 		h.log.Error("CloneBuildingEstimates: list source stages failed", "error", err)
 		response.InternalError(c, "Failed to list source stages")
@@ -6124,7 +6164,7 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 		FROM construction_estimate
 		WHERE building_id = $1 AND project_id = $2 AND tenant_id = $3
 		ORDER BY id ASC
-	`, req.SourceBuildingID, projectID, tenantID)
+	`, sourceBuildingID, projectID, tenantID)
 	if err != nil {
 		h.log.Error("CloneBuildingEstimates: list source estimates failed", "error", err)
 		response.InternalError(c, "Failed to list source estimates")
@@ -6177,7 +6217,7 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 		FROM building_files
 		WHERE tenant_id = $1 AND building_id = $2
 		ORDER BY created_at ASC, id ASC
-	`, tenantID, req.SourceBuildingID)
+	`, tenantID, sourceBuildingID)
 	if err != nil {
 		h.log.Error("CloneBuildingEstimates: list source files failed", "error", err)
 		response.InternalError(c, "Failed to list source files")
@@ -6437,13 +6477,117 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 	}
 	committed = true
 
+	// Bump the project's denormalised building count so the UI badge
+	// updates without a separate round-trip. Best-effort; failure to
+	// update the cache shouldn't break the duplication (the buildings
+	// list will recompute it on next load anyway).
+	_, _ = h.db.Exec(`
+		UPDATE construction_projects
+		SET buildings_count = buildings_count + 1, updated_date = NOW()
+		WHERE id = $1
+	`, projectID)
+
 	response.Success(c, gin.H{
-		"message":             "Estimates cloned",
-		"estimates_created":   estimatesCreated,
-		"lines_created":       linesCreated,
-		"stages_created":      stagesCreated,
-		"files_created":       filesCreated,
-		"source_building_id":  req.SourceBuildingID,
-		"target_building_id":  targetBuildingID,
+		"message":           "Building duplicated",
+		"estimates_created": estimatesCreated,
+		"lines_created":     linesCreated,
+		"stages_created":    stagesCreated,
+		"files_created":     filesCreated,
+		"source_building_id": sourceBuildingID,
+		"new_building": gin.H{
+			"id":   targetBuildingID,
+			"name": newName,
+			"code": newCode,
+		},
 	})
+}
+
+// createDuplicateBuildingTx inserts a new construction_buildings row
+// inside an existing transaction, named "<sourceName> Copy" (or " Copy
+// (N)" on subsequent duplications). Returns the new building id, name,
+// and code. Mirrors the unique-code retry pattern used by
+// CreateConstructionBuilding so a collision on
+// (project_id, code) doesn't 500 the duplicate.
+func (h *Handler) createDuplicateBuildingTx(
+	tx *sql.Tx,
+	tenantID uuid.UUID, projectID int64,
+	srcName, srcCode string,
+	description, buildingType, buildingPurpose sql.NullString,
+	floorsCount, floorsUnderground sql.NullInt64,
+	totalArea, livingArea, nonLivingArea sql.NullFloat64,
+	apartmentsCount, commercialUnitsCount, parkingSpots sql.NullInt64,
+	estimatedCost sql.NullFloat64,
+	currency sql.NullString,
+	plannedStart, plannedEnd sql.NullTime,
+	sortOrder sql.NullInt64,
+) (newID int64, finalName string, finalCode string, err error) {
+	// Pick a base name. " Copy" first, then " Copy (2)" / " Copy (3)" if
+	// names already exist. We check up-front against the existing names
+	// to avoid hammering the unique index with retries (name has no
+	// uniqueness constraint, but readability matters — the UI would show
+	// two blocks both literally called "Block 1 Copy" which is confusing).
+	tryName := srcName + " Copy"
+	for n := 2; n <= 50; n++ {
+		var exists bool
+		if err = tx.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM construction_buildings
+				WHERE project_id = $1 AND tenant_id = $2 AND name = $3
+			)
+		`, projectID, tenantID, tryName).Scan(&exists); err != nil {
+			return 0, "", "", err
+		}
+		if !exists {
+			break
+		}
+		tryName = fmt.Sprintf("%s Copy (%d)", srcName, n)
+	}
+
+	// Pick a base code with the same suffix dance as CreateConstructionBuilding,
+	// but driven by attempts rather than a pre-scan because the (project_id,
+	// code) unique index gives us a 23505 we can catch and react to.
+	baseCode := strings.TrimSpace(srcCode)
+	if baseCode == "" {
+		baseCode = "BUILDING"
+	}
+	baseCode = baseCode + "-COPY"
+	tryCode := baseCode
+
+	const query = `
+		INSERT INTO construction_buildings (
+			tenant_id, project_id, code, name, description,
+			building_type, building_purpose, floors_count, floors_underground,
+			total_area, living_area, non_living_area,
+			apartments_count, commercial_units_count, parking_spots,
+			estimated_cost, currency,
+			planned_start_date, planned_end_date,
+			status, sort_order, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+		          $10, $11, $12, $13, $14, $15,
+		          $16, COALESCE($17, 'UZS'),
+		          $18, $19,
+		          'draft', $20, NOW(), NOW())
+		RETURNING id
+	`
+	const maxAttempts = 50
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		err = tx.QueryRow(query,
+			tenantID, projectID, tryCode, tryName, description,
+			buildingType, buildingPurpose, floorsCount, floorsUnderground,
+			totalArea, livingArea, nonLivingArea,
+			apartmentsCount, commercialUnitsCount, parkingSpots,
+			estimatedCost, currency,
+			plannedStart, plannedEnd,
+			sortOrder,
+		).Scan(&newID)
+		if err == nil {
+			return newID, tryName, tryCode, nil
+		}
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			tryCode = fmt.Sprintf("%s-%d", baseCode, attempt+1)
+			continue
+		}
+		return 0, "", "", err
+	}
+	return 0, "", "", fmt.Errorf("could not allocate unique code after %d attempts", maxAttempts)
 }
