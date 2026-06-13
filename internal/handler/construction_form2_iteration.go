@@ -436,6 +436,186 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 	})
 }
 
+// DeleteForm2Iteration deletes the current OPEN (joriy) Forma 2 and re-opens
+// the frozen iteration immediately before it. This is the "delete the joriy
+// and unfreeze the one before it" action: the user wants to discard the
+// current empty period and resume editing the previous Forma 2.
+//
+// Route: DELETE /construction/projects/:id/form2-iterations/:iter_id
+//   (:iter_id must be the open iteration)
+//
+// Deleting it:
+//   1. removes the open iteration (along with its iteration_line rows, via
+//      FK cascade),
+//   2. flips the previous frozen iteration (seq − 1) back to 'open' (clears
+//      frozen_at/by + snapshot_id), and
+//   3. deletes the construction_form2_snapshot row that froze it, so Formalar
+//      tarixi loses the corresponding entry.
+//
+// The "exactly one open iteration per project" invariant is preserved: we
+// delete one open and re-open one frozen in the same transaction.
+//
+// Guards:
+//   * the target must be the open iteration (you can't delete a frozen one
+//     directly — delete the joriy to roll the chain back),
+//   * there must be a frozen predecessor to unfreeze (can't delete the very
+//     first iteration when nothing is frozen), and
+//   * if the open iteration already has period_fakt entered on any line we
+//     refuse (409) so the foreman's new-period work isn't silently discarded.
+func (h *Handler) DeleteForm2Iteration(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	userName := c.GetString("user_name")
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project id")
+		return
+	}
+	iterID, err := strconv.ParseInt(c.Param("iter_id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid iteration id")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to open unfreeze tx", "error", err)
+		response.InternalError(c, "Failed to delete iteration")
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// 1. Load + lock the target iteration. Must be the OPEN (joriy) one and
+	//    belong to this tenant+project.
+	var (
+		openIterSeq  int
+		targetStatus string
+	)
+	if err := tx.QueryRow(`
+		SELECT iteration_seq, status
+		FROM construction_form2_iteration
+		WHERE id = $1 AND project_id = $2 AND tenant_id = $3
+		FOR UPDATE
+	`, iterID, projectID, tenantID).Scan(&openIterSeq, &targetStatus); err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Iteration not found")
+			return
+		}
+		h.log.Error("Failed to lock target iteration", "error", err, "iter_id", iterID)
+		response.InternalError(c, "Failed to delete iteration")
+		return
+	}
+	if targetStatus != "open" {
+		response.BadRequest(c, "Only the current (joriy) Forma 2 can be deleted")
+		return
+	}
+
+	// 2. Lock the frozen predecessor (seq − 1) we'll re-open. Its existence is
+	//    what makes the joriy deletable — without it there's nothing to roll
+	//    back into (the very first iteration can't be deleted this way).
+	var (
+		prevIterID int64
+		prevSeq    int
+		snapshotID sql.NullInt64
+	)
+	if err := tx.QueryRow(`
+		SELECT id, iteration_seq, snapshot_id
+		FROM construction_form2_iteration
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'frozen'
+		      AND iteration_seq = $3
+		FOR UPDATE
+	`, projectID, tenantID, openIterSeq-1).Scan(&prevIterID, &prevSeq, &snapshotID); err != nil {
+		if err == sql.ErrNoRows {
+			response.BadRequest(c, "No frozen Forma 2 to unfreeze")
+			return
+		}
+		h.log.Error("Failed to lock previous iteration", "error", err, "project_id", projectID)
+		response.InternalError(c, "Failed to delete iteration")
+		return
+	}
+
+	// 3. Refuse if the open iteration already carries entered work — deleting
+	//    it would throw that away.
+	var enteredLines int
+	if err := tx.QueryRow(`
+		SELECT COUNT(*)
+		FROM construction_form2_iteration_line
+		WHERE iteration_id = $1 AND period_fakt <> 0
+	`, iterID).Scan(&enteredLines); err != nil {
+		h.log.Error("Failed to check open iteration fakt", "error", err, "iter_id", iterID)
+		response.InternalError(c, "Failed to delete iteration")
+		return
+	}
+	if enteredLines > 0 {
+		response.Conflict(c, "Joriy Forma 2 da kiritilgan hajmlar bor — avval ularni tozalang")
+		return
+	}
+
+	// 4. Delete the open iteration (cascade removes its iteration_line rows).
+	if _, err := tx.Exec(`
+		DELETE FROM construction_form2_iteration WHERE id = $1
+	`, iterID); err != nil {
+		h.log.Error("Failed to delete open iteration", "error", err, "iter_id", iterID)
+		response.InternalError(c, "Failed to delete iteration")
+		return
+	}
+
+	// 5. Re-open the frozen predecessor.
+	if _, err := tx.Exec(`
+		UPDATE construction_form2_iteration
+		SET status      = 'open',
+		    frozen_at   = NULL,
+		    frozen_by   = NULL,
+		    snapshot_id = NULL
+		WHERE id = $1
+	`, prevIterID); err != nil {
+		h.log.Error("Failed to re-open iteration", "error", err, "iter_id", prevIterID)
+		response.InternalError(c, "Failed to delete iteration")
+		return
+	}
+
+	// 6. Drop the snapshot the freeze wrote so Formalar tarixi stays in sync.
+	if snapshotID.Valid {
+		if _, err := tx.Exec(`
+			DELETE FROM construction_form2_snapshot
+			WHERE id = $1 AND tenant_id = $2
+		`, snapshotID.Int64, tenantID); err != nil {
+			h.log.Error("Failed to delete freeze snapshot", "error", err, "snapshot_id", snapshotID.Int64)
+			response.InternalError(c, "Failed to delete iteration")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit unfreeze tx", "error", err)
+		response.InternalError(c, "Failed to delete iteration")
+		return
+	}
+	committed = true
+
+	// Audit — reuse form_delete so existing Jurnal filters keep working.
+	h.logSmetaAudit(tenantID, projectID, nil, "form_delete", "", nil,
+		strconv.Itoa(openIterSeq), strconv.Itoa(prevSeq),
+		"Joriy Forma 2 o'chirildi va oldingisi muzlatishdan chiqarildi", userID, userName)
+
+	response.Success(c, gin.H{
+		"reopened_iteration_id":  prevIterID,
+		"reopened_iteration_seq": prevSeq,
+		"deleted_iteration_id":   iterID,
+		"deleted_iteration_seq":  openIterSeq,
+	})
+}
+
 // bootstrapIterationLines inserts a period_fakt = 0 row for every
 // estimate_line in the project's estimates. Used by CreateForm2Iteration
 // (new iteration) and by the defensive "no open iteration" recovery
