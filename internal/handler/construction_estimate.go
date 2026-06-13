@@ -625,14 +625,17 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		return
 	}
 
-	// Pagination — default 50, max 5000 (some callers need all at once)
+	// Pagination — default 20 (mobile/on-demand clients page through in
+	// 20-item chunks), max 5000 (the web Smeta boshqaruvi / Bosqichlar
+	// loaders still request the full set explicitly so their totals,
+	// search and Forma 2 stay correct).
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	if page < 1 {
 		page = 1
 	}
 	if pageSize < 1 || pageSize > 5000 {
-		pageSize = 50
+		pageSize = 20
 	}
 	offset := (page - 1) * pageSize
 
