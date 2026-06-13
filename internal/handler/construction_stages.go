@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -53,6 +55,31 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		}
 	}
 
+	// Optional pagination (opt-in). Mobile always sends page+limit to avoid
+	// loading thousands of stages (and the per-stage N+1) at once. If NEITHER
+	// page nor limit is present we return every stage exactly like before, so
+	// the web client (which sends only building_id) is unaffected.
+	pageStr := c.Query("page")
+	limitStr := c.Query("limit")
+	paginate := pageStr != "" || limitStr != ""
+
+	page := 1
+	limit := 20
+	if paginate {
+		if v, e := strconv.Atoi(pageStr); e == nil && v > 0 {
+			page = v
+		}
+		if v, e := strconv.Atoi(limitStr); e == nil {
+			if v < 1 {
+				v = 20
+			} else if v > 100 {
+				v = 100
+			}
+			limit = v
+		}
+	}
+	offset := (page - 1) * limit
+
 	query := `
 		SELECT s.id, s.tenant_id, s.project_id, s.building_id, s.name, s.stage_order,
 		       s.status, s.planned_budget, s.planned_start, s.planned_end,
@@ -82,6 +109,13 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		ORDER BY s.stage_order ASC, s.id ASC
 	`
 
+	// Page the list only when paginating. args already holds
+	// projectID, tenantID, [buildingID], so the placeholders continue correctly.
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, limit, offset)
+	}
+
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list stages", "error", err)
@@ -90,29 +124,46 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	// SubStage mirrors the shape returned by GET /construction/stages/{id}/sub-stages
+	// (same JSON field names) so mobile can read embedded sub-stages without an
+	// extra request per stage.
+	type SubStage struct {
+		ID             int64   `json:"id"`
+		StageID        int64   `json:"stage_id"`
+		Name           string  `json:"name"`
+		Status         string  `json:"status"`
+		MaterialCount  int     `json:"material_count"`
+		MaterialTotal  float64 `json:"material_total"`
+		EquipmentCount int     `json:"equipment_count"`
+		EquipmentTotal float64 `json:"equipment_total"`
+		LaborCount     int     `json:"labor_count"`
+		LaborTotal     float64 `json:"labor_total"`
+	}
+
 	type Stage struct {
-		ID             int64     `json:"id"`
-		TenantID       string    `json:"tenant_id"`
-		ProjectID      int64     `json:"project_id"`
-		BuildingID     *int64    `json:"building_id"`
-		BuildingName   *string   `json:"building_name"`
-		Name           string    `json:"name"`
-		StageOrder     int       `json:"stage_order"`
-		Status         string    `json:"status"`
-		PlannedBudget  float64   `json:"planned_budget"`
-		PlannedStart   *string   `json:"planned_start"`
-		PlannedEnd     *string   `json:"planned_end"`
-		ActualStart    *string   `json:"actual_start"`
-		ActualEnd      *string   `json:"actual_end"`
-		Notes          *string   `json:"notes"`
-		CreatedAt      time.Time `json:"created_at"`
-		UpdatedAt      time.Time `json:"updated_at"`
-		ActualAmount   float64   `json:"actual_amount"`
-		MaterialTotal  float64   `json:"material_total"`
-		EquipmentTotal float64   `json:"equipment_total"`
-		EquipmentCount int       `json:"equipment_count"`
-		LaborTotal     float64   `json:"labor_total"`
-		LaborCount     int       `json:"labor_count"`
+		ID             int64      `json:"id"`
+		TenantID       string     `json:"tenant_id"`
+		ProjectID      int64      `json:"project_id"`
+		BuildingID     *int64     `json:"building_id"`
+		BuildingName   *string    `json:"building_name"`
+		Name           string     `json:"name"`
+		StageOrder     int        `json:"stage_order"`
+		Status         string     `json:"status"`
+		PlannedBudget  float64    `json:"planned_budget"`
+		PlannedStart   *string    `json:"planned_start"`
+		PlannedEnd     *string    `json:"planned_end"`
+		ActualStart    *string    `json:"actual_start"`
+		ActualEnd      *string    `json:"actual_end"`
+		Notes          *string    `json:"notes"`
+		CreatedAt      time.Time  `json:"created_at"`
+		UpdatedAt      time.Time  `json:"updated_at"`
+		ActualAmount   float64    `json:"actual_amount"`
+		MaterialTotal  float64    `json:"material_total"`
+		EquipmentTotal float64    `json:"equipment_total"`
+		EquipmentCount int        `json:"equipment_count"`
+		LaborTotal     float64    `json:"labor_total"`
+		LaborCount     int        `json:"labor_count"`
+		SubStages      []SubStage `json:"sub_stages"`
 	}
 
 	stages := []Stage{}
@@ -142,7 +193,124 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		stages = append(stages, s)
 	}
 
-	response.Success(c, stages)
+	// Embed sub-stages for the stages on this page in ONE query (no N+1).
+	// The page holds at most `limit` (<=100) stages when paginating, or every
+	// stage for the legacy web path; either way this is a single bounded query.
+	stageIDs := make([]int64, 0, len(stages))
+	for _, s := range stages {
+		stageIDs = append(stageIDs, s.ID)
+	}
+
+	subsByStage := map[int64][]SubStage{}
+	if len(stageIDs) > 0 {
+		subRows, subErr := h.db.Query(`
+			SELECT ss.id, ss.stage_id, ss.name, ss.status,
+			       COALESCE((SELECT COUNT(*) FROM construction_sub_stage_materials m WHERE m.sub_stage_id = ss.id), 0),
+			       COALESCE((SELECT SUM(m.total_cost) FROM construction_sub_stage_materials m WHERE m.sub_stage_id = ss.id), 0),
+			       COALESCE((SELECT COUNT(*) FROM construction_sub_stage_equipment eq WHERE eq.sub_stage_id = ss.id AND COALESCE(eq.resource_type,'equipment') = 'equipment'), 0),
+			       COALESCE((SELECT SUM(eq.plan_quantity * eq.unit_price) FROM construction_sub_stage_equipment eq WHERE eq.sub_stage_id = ss.id AND COALESCE(eq.resource_type,'equipment') = 'equipment'), 0),
+			       COALESCE((SELECT COUNT(*) FROM construction_sub_stage_equipment eq WHERE eq.sub_stage_id = ss.id AND eq.resource_type = 'employee'), 0),
+			       COALESCE((SELECT SUM(eq.plan_quantity * eq.unit_price) FROM construction_sub_stage_equipment eq WHERE eq.sub_stage_id = ss.id AND eq.resource_type = 'employee'), 0)
+			FROM construction_sub_stages ss
+			WHERE ss.stage_id = ANY($1) AND ss.tenant_id = $2
+			ORDER BY ss.sub_order ASC, ss.id ASC
+		`, pq.Array(stageIDs), tenantID)
+		if subErr != nil {
+			h.log.Error("Failed to load sub-stages for stage list", "error", subErr)
+		} else {
+			defer subRows.Close()
+			for subRows.Next() {
+				var ss SubStage
+				if scanErr := subRows.Scan(&ss.ID, &ss.StageID, &ss.Name, &ss.Status,
+					&ss.MaterialCount, &ss.MaterialTotal,
+					&ss.EquipmentCount, &ss.EquipmentTotal,
+					&ss.LaborCount, &ss.LaborTotal); scanErr == nil {
+					subsByStage[ss.StageID] = append(subsByStage[ss.StageID], ss)
+				}
+			}
+		}
+	}
+
+	for i := range stages {
+		if subs, ok := subsByStage[stages[i].ID]; ok {
+			stages[i].SubStages = subs
+		} else {
+			stages[i].SubStages = []SubStage{}
+		}
+	}
+
+	// Legacy / web path: no pagination params → full array, exactly as before
+	// (now with sub_stages embedded too).
+	if !paginate {
+		response.Success(c, stages)
+		return
+	}
+
+	// total count over the same WHERE as the list (without limit/offset).
+	countArgs := []interface{}{projectID, tenantID}
+	if buildingFilter.Valid && buildingFilter.Int64 != 0 {
+		countArgs = append(countArgs, buildingFilter.Int64)
+	}
+	total := len(stages)
+	_ = h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_stages s
+		 WHERE s.project_id = $1 AND s.tenant_id = $2`+buildingClause,
+		countArgs...).Scan(&total)
+
+	// Project-wide totals for the summary cards — computed on the first page
+	// only (mobile keeps it for later pages). Each aggregate is an independent
+	// scalar subquery, so joins do not multiply rows.
+	var summary *gin.H
+	if page == 1 {
+		var planned, actual, material float64
+		var stageCount int
+		err := h.db.QueryRow(`
+			SELECT
+			  (SELECT COUNT(*) FROM construction_stages s
+			     WHERE s.project_id=$1 AND s.tenant_id=$2`+buildingClause+`),
+			  (SELECT COALESCE(SUM(s.planned_budget),0) FROM construction_stages s
+			     WHERE s.project_id=$1 AND s.tenant_id=$2`+buildingClause+`),
+			  (SELECT COALESCE(SUM(el.amount),0) FROM construction_expense_lines el
+			     JOIN construction_stages s ON s.id = el.stage_id
+			     WHERE el.status='approved' AND el.deleted_at IS NULL
+			       AND s.project_id=$1 AND s.tenant_id=$2`+buildingClause+`),
+			  (SELECT COALESCE(SUM(m.total_cost),0) FROM construction_sub_stage_materials m
+			     JOIN construction_sub_stages ss ON ss.id = m.sub_stage_id
+			     JOIN construction_stages s ON s.id = ss.stage_id
+			     WHERE s.project_id=$1 AND s.tenant_id=$2`+buildingClause+`)
+		`, countArgs...).Scan(&stageCount, &planned, &actual, &material)
+		if err == nil {
+			summary = &gin.H{
+				"total_stages":          stageCount,
+				"total_planned_budget":  planned,
+				"total_actual_expenses": actual,
+				"total_material_total":  material,
+			}
+		} else {
+			h.log.Error("Failed to compute stage summary", "error", err)
+		}
+	}
+
+	totalPages := 0
+	if limit > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+	resp := gin.H{
+		"success": true,
+		"data":    stages,
+		"meta": gin.H{
+			"page":        page,
+			"limit":       limit,
+			"total":       total,
+			"total_pages": totalPages,
+			"has_next":    page < totalPages,
+			"has_prev":    page > 1,
+		},
+	}
+	if summary != nil {
+		resp["summary"] = *summary
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // CreateConstructionStage creates a new stage for a project
