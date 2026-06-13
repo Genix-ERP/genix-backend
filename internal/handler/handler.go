@@ -2230,6 +2230,23 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		form2Iters.POST("",
 			h.perm.Require("construction", "estimate", "update"), h.CreateForm2Iteration)
 		form2Iters.GET("/:iter_id/lines", h.GetForm2IterationLines)
+		// Delete (undo) the most recent frozen Forma 2 — re-opens it and
+		// drops the empty open iteration + its snapshot. Gated on the
+		// estimate "delete" action so the frontend can hide the button for
+		// users without it.
+		form2Iters.DELETE("/:iter_id",
+			h.perm.Require("construction", "estimate", "delete"), h.DeleteForm2Iteration)
+	}
+
+	// Project-level Forma 2 snapshot history. Lists every saved Forma 2 for
+	// the whole project (across all blocks/estimates), mirroring the
+	// project-wide iteration strip — used by Smeta boshqaruvi → Formalar
+	// tarixi so freezes made from any block stay visible regardless of which
+	// block is currently selected.
+	projectForm2Snapshots := rg.Group("/construction/projects/:id/form2-snapshots")
+	projectForm2Snapshots.Use(h.perm.Require("construction", "estimate", "read"))
+	{
+		projectForm2Snapshots.GET("", h.ListProjectForm2Snapshots)
 	}
 
 	// v2 Stages workflow — work approval transitions.
