@@ -2038,6 +2038,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 		// Stages
 		constructionProjects.GET("/:id/stages", h.ListConstructionStages)
+		constructionProjects.GET("/:id/stages/overview", h.GetConstructionStagesOverview)
 		constructionProjects.POST("/:id/stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionStage)
 
 		// Flat feed of everything currently in_progress (stages + sub-stages).

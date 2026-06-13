@@ -313,6 +313,111 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
+// GetConstructionStagesOverview returns the 4 summary cards for the mobile
+// "Bosqichlar" tab (Bloklar / Block tayyorligi / Byudjet / Etap-ish), computed
+// server-side and project-wide. GET /construction/projects/:id/stages/overview
+//
+// The figures mirror the web StagesTabV2.jsx but aggregated across the whole
+// project (all blocks' Единич estimates), not the single active block:
+//
+//   - blocks_count            COUNT of construction_buildings for the project
+//                             (no soft-delete column on that table).
+//   - works_count / budget /  derived from "work" estimate-lines in the project's
+//     block_readiness_percent edinich estimates. A work = a top-level row with no
+//                             resource_type (resource_type='' AND parent_line_id=0).
+//                             Scoping to edinich-only avoids double-counting the
+//                             same work across the Единич + ВОР sheets.
+//   - stages_count            distinct section path (parent_item_number) of works.
+//
+// Planned qty per work follows the web priority (imported → original → quantity).
+// Readiness is cost-weighted: Σ(total_amount*min(done/q,1)) / Σ(total_amount).
+//
+// Budget is COST and must never reach a foreman (prorab): for that role we send
+// budget=null and budget_hidden=true (server-side hiding, per the mobile contract).
+func (h *Handler) GetConstructionStagesOverview(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// 1) blocks_count — construction_buildings has no soft-delete column.
+	var blocksCount int
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_buildings WHERE project_id = $1 AND tenant_id = $2`,
+		projectID, tenantID,
+	).Scan(&blocksCount); err != nil {
+		h.log.Error("overview: failed to count buildings", "error", err)
+	}
+
+	// 2) works_count / budget / readiness / stages_count from the project's
+	//    edinich estimate "work" lines (project-wide).
+	var (
+		worksCount  int
+		stagesCount int
+		budget      float64
+		readiness   float64
+	)
+	err = h.db.QueryRow(`
+		WITH works AS (
+			SELECT
+				COALESCE(el.total_amount, 0)  AS total_amount,
+				COALESCE(el.done_quantity, 0) AS done_quantity,
+				CASE
+					WHEN COALESCE(el.imported_quantity, 0) > 0 THEN el.imported_quantity
+					WHEN COALESCE(el.original_quantity, 0) > 0 THEN el.original_quantity
+					ELSE COALESCE(el.quantity, 0)
+				END AS q,
+				NULLIF(COALESCE(el.parent_item_number, ''), '') AS section
+			FROM construction_estimate_line el
+			JOIN construction_estimate e
+			  ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
+			WHERE e.project_id = $1
+			  AND el.tenant_id = $2
+			  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND COALESCE(el.resource_type, '') = ''
+			  AND COALESCE(el.parent_line_id, 0) = 0
+		)
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(total_amount), 0),
+			CASE WHEN SUM(total_amount) > 0
+				 THEN SUM(total_amount * LEAST(done_quantity / NULLIF(q, 0), 1)) / SUM(total_amount) * 100
+				 ELSE 0 END,
+			COUNT(DISTINCT section)
+		FROM works
+	`, projectID, tenantID).Scan(&worksCount, &budget, &readiness, &stagesCount)
+	if err != nil {
+		h.log.Error("overview: failed to aggregate works", "error", err)
+	}
+
+	// 3) Role-based budget hiding — resolve with the same helper as /my-role.
+	role := h.resolveProjectRole(tenantID, userID, projectID)
+	budgetHidden := role == "foreman"
+
+	data := gin.H{
+		"blocks_count":            blocksCount,
+		"block_readiness_percent": readiness,
+		"budget_hidden":           budgetHidden,
+		"stages_count":            stagesCount,
+		"works_count":             worksCount,
+	}
+	if budgetHidden {
+		data["budget"] = nil // never send the cost to a foreman's device
+	} else {
+		data["budget"] = budget
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
 // CreateConstructionStage creates a new stage for a project
 func (h *Handler) CreateConstructionStage(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
