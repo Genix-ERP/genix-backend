@@ -39,6 +39,24 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		scopeFilter = "AND e.subcontract_id IS NOT NULL"
 	}
 
+	// Opt-in pagination — only when the client explicitly asks. Absent →
+	// full list (today's behaviour), which the web Smetalar tab and Smeta
+	// boshqaruvi block selector rely on to build block options / totals.
+	// Mobile sends page+page_size to page the version cards. Mirrors
+	// ListEstimateLines (same response.Paginated envelope).
+	pageStr := c.Query("page")
+	sizeStr := c.Query("page_size")
+	paginate := pageStr != "" || sizeStr != ""
+	page, _ := strconv.Atoi(pageStr)
+	pageSize, _ := strconv.Atoi(sizeStr)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
+
 	// Pre-aggregate line counts in a CTE rather than running a
 	// correlated `(SELECT COUNT(*) ...)` subquery for every estimate
 	// row. On tenants with hundreds of estimates the old per-row form
@@ -50,6 +68,15 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 	// so it only counts the slice we actually render. With migration
 	// 378's covering index (tenant_id, estimate_id) this becomes a
 	// single index-only scan + GROUP BY hash aggregate.
+	//
+	// When paginating, append LIMIT/OFFSET ($3/$4). scopeFilter carries no
+	// placeholders, so the page args stay $3/$4.
+	args := []interface{}{projectID, tenantID}
+	limitClause := ""
+	if paginate {
+		limitClause = " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 	query := fmt.Sprintf(`
 		WITH estimate_line_counts AS (
 		    SELECT l.estimate_id, COUNT(*)::int AS lines_count
@@ -77,10 +104,10 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		LEFT JOIN construction_buildings b ON b.id = e.building_id
 		LEFT JOIN construction_subcontract sc ON sc.id = e.subcontract_id
 		WHERE e.project_id = $1 AND e.tenant_id = $2 %s
-		ORDER BY e.version DESC
-	`, scopeFilter)
+		ORDER BY e.version DESC, e.id DESC%s
+	`, scopeFilter, limitClause)
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list estimates", "error", err)
 		response.InternalError(c, "Failed to list estimates")
@@ -109,7 +136,23 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	response.Success(c, items)
+	// Backward compatible: no page params → full list, bare array (web).
+	if !paginate {
+		response.Success(c, items)
+		return
+	}
+
+	// total count for meta — same project + scope predicate, no joins needed.
+	var total int
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*) FROM construction_estimate e
+		WHERE e.project_id = $1 AND e.tenant_id = $2 %s
+	`, scopeFilter)
+	if err := h.db.QueryRow(countQuery, projectID, tenantID).Scan(&total); err != nil {
+		h.log.Error("Failed to count estimates", "error", err)
+	}
+
+	response.Paginated(c, items, page, pageSize, total)
 }
 
 // GetEstimate returns a single estimate with its lines
