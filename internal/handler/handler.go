@@ -2292,6 +2292,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		constructionStages.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionStage)
 		constructionStages.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionStage)
+		constructionStages.GET("/:id/works", h.GetConstructionStageWorks)
 		constructionStages.GET("/:id/sub-stages", h.ListConstructionSubStages)
 		constructionStages.POST("/:id/sub-stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionSubStage)
 		constructionStages.GET("/:id/materials", h.ListStageMaterials)
