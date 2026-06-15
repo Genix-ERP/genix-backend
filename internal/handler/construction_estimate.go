@@ -12,6 +12,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -728,11 +729,90 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	if !includeManual {
 		countFilter = " AND COALESCE(is_manual, FALSE) = FALSE"
 	}
+
+	// Optional section filter (mobile Stage Works screen). When present, the
+	// endpoint returns only the works of ONE Bosqichlar section (= the stage's
+	// parent_item_number / section_key) PLUS all their descendant resource
+	// lines, and paginates over the WORKS rather than the flat line list. This
+	// lets mobile load one stage's ~200 works instead of looping the whole
+	// block's ~16k lines. A work matches when its parent_item_number equals the
+	// section exactly OR is a nested sub-section ("<section> › …"); the › is
+	// U+203A, the app's path delimiter.
+	section := strings.TrimSpace(c.Query("section"))
+
 	var total int
-	h.db.QueryRow(
-		"SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2"+countFilter,
-		estimateID, tenantID,
-	).Scan(&total)
+	var sectionIDs []int64 // this page's works + ALL their descendants
+	if section == "" {
+		h.db.QueryRow(
+			"SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2"+countFilter,
+			estimateID, tenantID,
+		).Scan(&total)
+	} else {
+		// Predicate that identifies a section's top-level works. countFilter
+		// uses the un-aliased is_manual column, matching these queries.
+		const workPredicate = `
+			AND COALESCE(resource_type, '') = ''
+			AND COALESCE(parent_line_id, 0) = 0
+			AND (parent_item_number = $3 OR parent_item_number LIKE $3 || ' › %')`
+
+		// total = number of matched works (paging is over works).
+		h.db.QueryRow(
+			`SELECT COUNT(*) FROM construction_estimate_line
+			 WHERE estimate_id = $1 AND tenant_id = $2`+countFilter+workPredicate,
+			estimateID, tenantID, section,
+		).Scan(&total)
+
+		// This page's work IDs (ordered like the main list).
+		var workIDs []int64
+		wrows, werr := h.db.Query(
+			`SELECT id FROM construction_estimate_line
+			 WHERE estimate_id = $1 AND tenant_id = $2`+countFilter+workPredicate+`
+			 ORDER BY sort_order ASC, id ASC
+			 LIMIT $4 OFFSET $5`,
+			estimateID, tenantID, section, pageSize, offset,
+		)
+		if werr != nil {
+			h.log.Error("Failed to select section works", "error", werr)
+			response.InternalError(c, "Failed to list estimate lines")
+			return
+		}
+		for wrows.Next() {
+			var id int64
+			if wrows.Scan(&id) == nil {
+				workIDs = append(workIDs, id)
+			}
+		}
+		wrows.Close()
+
+		// Expand to works + all descendants (resources / nested sub-stages) via
+		// the parent_line_id chain, so each work card has its resource breakdown.
+		if len(workIDs) > 0 {
+			trows, terr := h.db.Query(`
+				WITH RECURSIVE tree AS (
+					SELECT id FROM construction_estimate_line
+					WHERE id = ANY($1) AND tenant_id = $2
+					UNION ALL
+					SELECT c.id FROM construction_estimate_line c
+					JOIN tree t ON c.parent_line_id = t.id
+					WHERE c.tenant_id = $2
+				)
+				SELECT id FROM tree`,
+				pq.Array(workIDs), tenantID,
+			)
+			if terr != nil {
+				h.log.Error("Failed to expand section descendants", "error", terr)
+				response.InternalError(c, "Failed to list estimate lines")
+				return
+			}
+			for trows.Next() {
+				var id int64
+				if trows.Scan(&id) == nil {
+					sectionIDs = append(sectionIDs, id)
+				}
+			}
+			trows.Close()
+		}
+	}
 
 	// Hoist the parent estimate's project_id and building_id out to
 	// Go-side parameters. The ВОР fallback subquery below previously
@@ -759,6 +839,24 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		estBuildingArg = estBuildingID.Int64
 	} else {
 		estBuildingArg = nil
+	}
+
+	// Default (no section): page the flat line list with LIMIT $3 OFFSET $4 and
+	// the ВОР fallback's project/building at $5/$6 — unchanged from before.
+	// Section mode: the $3 id-array carries this page's works + descendants, so
+	// LIMIT/OFFSET drop out and $5/$6 shift down to $4/$5 (renumbered below).
+	whereExtra := ""
+	limitClause := "\n\t\tLIMIT $3 OFFSET $4"
+	queryArgs := []interface{}{estimateID, tenantID, pageSize, offset, estProjectID, estBuildingArg}
+	if section != "" {
+		if len(sectionIDs) == 0 {
+			// No works on this page (or empty section) — return empty, keep meta.
+			response.Paginated(c, []entity.ConstructionEstimateLine{}, page, pageSize, total)
+			return
+		}
+		whereExtra = " AND l.id = ANY($3)"
+		limitClause = ""
+		queryArgs = []interface{}{estimateID, tenantID, pq.Array(sectionIDs), estProjectID, estBuildingArg}
 	}
 
 	// Query paginated rows. We group each sub-line immediately after its
@@ -849,15 +947,22 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
 		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
-		WHERE l.estimate_id = $1 AND l.tenant_id = $2` + manualFilter + `
+		WHERE l.estimate_id = $1 AND l.tenant_id = $2` + manualFilter + whereExtra + `
 		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
 		         COALESCE(l.parent_line_id, l.id) ASC,
 		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
 		         COALESCE(l.subline_seq, 0) ASC,
-		         l.id ASC
-		LIMIT $3 OFFSET $4
+		         l.id ASC` + limitClause + `
 	`
-	rows, err := h.db.Query(query, estimateID, tenantID, pageSize, offset, estProjectID, estBuildingArg)
+	if section != "" {
+		// $3/$4 (page LIMIT/OFFSET) collapsed into the single $3 id-array, so
+		// shift the ВОР fallback's project ($5→$4) and building ($6→$5)
+		// placeholders down by one. NewReplacer does a single non-overlapping
+		// pass, so $6→$5 is not re-rewritten. Only the ВОР subquery (and its
+		// comment) reference $5/$6, so nothing else is affected.
+		query = strings.NewReplacer("$5", "$4", "$6", "$5").Replace(query)
+	}
+	rows, err := h.db.Query(query, queryArgs...)
 	if err != nil {
 		h.log.Error("Failed to list estimate lines", "error", err)
 		response.InternalError(c, "Failed to list estimate lines")
