@@ -147,6 +147,14 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		BuildingID     *int64     `json:"building_id"`
 		BuildingName   *string    `json:"building_name"`
 		Name           string     `json:"name"`
+		// SectionKey is the estimate-line parent_item_number this stage groups.
+		// Mobile uses it to map a Bosqichlar stage to its works. stage.name is
+		// set by SmetaImportModal to the section leaf the backend already matches
+		// works against (see construction_reja_fakt.go), so for the common,
+		// non-prefixed data it equals parent_item_number. Mobile should prefer
+		// the dedicated GET /construction/stages/{id}/works endpoint, which does
+		// the leaf match server-side and is robust to "СЕКЦИЯ №N ›" prefixes.
+		SectionKey     string     `json:"section_key"`
 		StageOrder     int        `json:"stage_order"`
 		Status         string     `json:"status"`
 		PlannedBudget  float64    `json:"planned_budget"`
@@ -190,6 +198,7 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 			v := bName.String
 			s.BuildingName = &v
 		}
+		s.SectionKey = s.Name // section grouping key (= parent_item_number leaf)
 		stages = append(stages, s)
 	}
 
@@ -416,6 +425,161 @@ func (h *Handler) GetConstructionStagesOverview(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// GetConstructionStageWorks returns the top-level estimate-line "works" for one
+// Bosqichlar stage, paginated. GET /construction/stages/:id/works?page=&limit=
+//
+// A stage's works are estimate lines (construction_estimate_line) with no
+// resource_type and no parent (resource_type='' AND parent_line_id=0) in the
+// project's edinich estimates, whose section leaf matches the stage name. The
+// leaf strips a "СЕКЦИЯ №N ›" prefix exactly like the web StagesTabV2 and the
+// reja-fakt handler, so this is robust regardless of whether parent_item_number
+// is stored prefixed or bare. Doing the match here lets mobile fetch one stage's
+// works directly instead of loading the whole block and filtering client-side.
+//
+// The work IDs returned are construction_estimate_line ids, so the existing
+// construction/works/* transition + bulk endpoints accept them verbatim.
+func (h *Handler) GetConstructionStageWorks(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	stageID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid stage ID")
+		return
+	}
+
+	// Resolve the stage's section name + project/building scope.
+	var stageName string
+	var projectID int64
+	var buildingID sql.NullInt64
+	err = h.db.QueryRow(`
+		SELECT name, project_id, building_id
+		FROM construction_stages
+		WHERE id = $1 AND tenant_id = $2
+	`, stageID, tenantID).Scan(&stageName, &projectID, &buildingID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Stage")
+		return
+	}
+	if err != nil {
+		h.log.Error("stage works: failed to load stage", "error", err)
+		response.InternalError(c, "Failed to load stage")
+		return
+	}
+
+	// Pagination — defaults page 1 / limit 20 (this endpoint always paginates).
+	page, _ := strconv.Atoi(c.Query("page"))
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
+	offset := (page - 1) * limit
+
+	// Shared WHERE: work rows in the project's edinich estimates whose section
+	// leaf == this stage's name. regexp strips any "… ›" prefix (greedy to the
+	// last ›), matching stageNameFromPath / the web grouping.
+	where := `
+		el.tenant_id = $1
+		AND e.project_id = $2
+		AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		AND COALESCE(el.resource_type, '') = ''
+		AND COALESCE(el.parent_line_id, 0) = 0
+		AND regexp_replace(COALESCE(el.parent_item_number, ''), '^.*›\s*', '') = $3`
+	args := []interface{}{tenantID, projectID, stageName}
+	if buildingID.Valid {
+		where += ` AND e.building_id = $4`
+		args = append(args, buildingID.Int64)
+	}
+
+	var total int
+	if err := h.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
+		WHERE `+where, args...).Scan(&total); err != nil {
+		h.log.Error("stage works: failed to count", "error", err)
+	}
+
+	listArgs := append(append([]interface{}{}, args...), limit, offset)
+	listQuery := `
+		SELECT el.id, el.name, COALESCE(el.uom, ''), COALESCE(el.item_number, ''),
+		       CASE
+		           WHEN COALESCE(el.imported_quantity, 0) > 0 THEN el.imported_quantity
+		           WHEN COALESCE(el.original_quantity, 0) > 0 THEN el.original_quantity
+		           ELSE COALESCE(el.quantity, 0)
+		       END AS quantity,
+		       COALESCE(el.done_quantity, 0),
+		       COALESCE(el.unit_rate, 0),
+		       COALESCE(el.total_amount, 0),
+		       COALESCE(el.parent_item_number, ''),
+		       COALESCE(el.approval_status, 'pending'),
+		       COALESCE(el.material_rate, 0), COALESCE(el.labor_rate, 0), COALESCE(el.equipment_rate, 0),
+		       COALESCE(el.rejection_note, '')
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
+		WHERE ` + where + `
+		ORDER BY el.sort_order ASC, el.id ASC
+		LIMIT $` + strconv.Itoa(len(args)+1) + ` OFFSET $` + strconv.Itoa(len(args)+2)
+
+	rows, err := h.db.Query(listQuery, listArgs...)
+	if err != nil {
+		h.log.Error("stage works: failed to list", "error", err)
+		response.InternalError(c, "Failed to load stage works")
+		return
+	}
+	defer rows.Close()
+
+	type Work struct {
+		ID               int64   `json:"id"`
+		Name             string  `json:"name"`
+		UOM              string  `json:"uom"`
+		ItemNumber       string  `json:"item_number"`
+		Quantity         float64 `json:"quantity"`
+		DoneQuantity     float64 `json:"done_quantity"`
+		UnitRate         float64 `json:"unit_rate"`
+		TotalAmount      float64 `json:"total_amount"`
+		ParentItemNumber string  `json:"parent_item_number"`
+		ApprovalStatus   string  `json:"approval_status"`
+		MaterialRate     float64 `json:"material_rate"`
+		LaborRate        float64 `json:"labor_rate"`
+		EquipmentRate    float64 `json:"equipment_rate"`
+		RejectionNote    string  `json:"rejection_note"`
+	}
+
+	works := []Work{}
+	for rows.Next() {
+		var w Work
+		if err := rows.Scan(&w.ID, &w.Name, &w.UOM, &w.ItemNumber,
+			&w.Quantity, &w.DoneQuantity, &w.UnitRate, &w.TotalAmount,
+			&w.ParentItemNumber, &w.ApprovalStatus,
+			&w.MaterialRate, &w.LaborRate, &w.EquipmentRate, &w.RejectionNote); err != nil {
+			h.log.Error("stage works: failed to scan", "error", err)
+			continue
+		}
+		works = append(works, w)
+	}
+
+	totalPages := 0
+	if limit > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    works,
+		"meta": gin.H{
+			"page": page, "limit": limit, "total": total,
+			"total_pages": totalPages,
+			"has_next":    page < totalPages,
+			"has_prev":    page > 1,
+		},
+	})
 }
 
 // CreateConstructionStage creates a new stage for a project
