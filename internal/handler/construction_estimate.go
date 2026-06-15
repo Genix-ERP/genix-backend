@@ -69,12 +69,29 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 	// 378's covering index (tenant_id, estimate_id) this becomes a
 	// single index-only scan + GROUP BY hash aggregate.
 	//
-	// When paginating, append LIMIT/OFFSET ($3/$4). scopeFilter carries no
-	// placeholders, so the page args stay $3/$4.
+	// Optional building/block filter (mobile Smetalar block selector). When a
+	// numeric building_id is present, scope estimates to that block; absent or
+	// the "Hammasi" chip (no param) → all estimates, as today. Placeholder
+	// indexes are computed dynamically so building_id ($3) and the LIMIT/OFFSET
+	// pagination args compose correctly.
+	var buildingID int
+	hasBuilding := false
+	if bid := strings.TrimSpace(c.Query("building_id")); bid != "" {
+		if id, e := strconv.Atoi(bid); e == nil && id > 0 {
+			buildingID = id
+			hasBuilding = true
+		}
+	}
+
 	args := []interface{}{projectID, tenantID}
+	buildingFilter := ""
+	if hasBuilding {
+		args = append(args, buildingID)
+		buildingFilter = fmt.Sprintf("AND e.building_id = $%d", len(args))
+	}
 	limitClause := ""
 	if paginate {
-		limitClause = " LIMIT $3 OFFSET $4"
+		limitClause = fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
 		args = append(args, pageSize, offset)
 	}
 	query := fmt.Sprintf(`
@@ -103,9 +120,9 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		LEFT JOIN users uc ON uc.id = e.created_by
 		LEFT JOIN construction_buildings b ON b.id = e.building_id
 		LEFT JOIN construction_subcontract sc ON sc.id = e.subcontract_id
-		WHERE e.project_id = $1 AND e.tenant_id = $2 %s
+		WHERE e.project_id = $1 AND e.tenant_id = $2 %s %s
 		ORDER BY e.version DESC, e.id DESC%s
-	`, scopeFilter, limitClause)
+	`, scopeFilter, buildingFilter, limitClause)
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -142,13 +159,20 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		return
 	}
 
-	// total count for meta — same project + scope predicate, no joins needed.
+	// total count for meta — same project + scope + building predicate so
+	// has_next reflects the filtered block, not the whole project.
+	countArgs := []interface{}{projectID, tenantID}
+	countBuildingFilter := ""
+	if hasBuilding {
+		countArgs = append(countArgs, buildingID)
+		countBuildingFilter = fmt.Sprintf("AND e.building_id = $%d", len(countArgs))
+	}
 	var total int
 	countQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM construction_estimate e
-		WHERE e.project_id = $1 AND e.tenant_id = $2 %s
-	`, scopeFilter)
-	if err := h.db.QueryRow(countQuery, projectID, tenantID).Scan(&total); err != nil {
+		WHERE e.project_id = $1 AND e.tenant_id = $2 %s %s
+	`, scopeFilter, countBuildingFilter)
+	if err := h.db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
 		h.log.Error("Failed to count estimates", "error", err)
 	}
 
