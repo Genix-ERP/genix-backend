@@ -2172,6 +2172,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		estimates.DELETE("/:id", h.perm.Require("construction", "estimate", "delete"), h.DeleteEstimate)
 		estimates.POST("/:id/approve", h.perm.Require("construction", "estimate", "update"), h.ApproveEstimate)
 		estimates.POST("/:id/duplicate", h.perm.Require("construction", "estimate", "create"), h.DuplicateEstimate)
+		// Estimate stat-card aggregates (cost breakdown + counts) computed
+		// server-side so mobile doesn't have to download every line to show
+		// the headline numbers. See construction_estimate_summary.go.
+		estimates.GET("/:id/summary", h.GetEstimateSummary)
 		// Estimate Lines
 		estimates.GET("/:id/lines", h.ListEstimateLines)
 		estimates.POST("/:id/lines", h.perm.Require("construction", "estimate", "update"), h.CreateEstimateLine)
