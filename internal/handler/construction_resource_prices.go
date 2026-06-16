@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +54,69 @@ func (h *Handler) ListResourcePrices(c *gin.Context) {
 	// Resurslar tab matches the estimate selected at the top of the page.
 	// When absent the response stays project-wide (every estimate's lines).
 	estimateIDStr := strings.TrimSpace(c.Query("estimate_id"))
+	var estID int64
+	if v, e := strconv.ParseInt(estimateIDStr, 10, 64); e == nil && v > 0 {
+		estID = v
+	}
+	// NEW filters: material subtype + free-text search (name OR uom).
+	matType := strings.ToLower(strings.TrimSpace(c.Query("material_type")))
+	search := strings.TrimSpace(c.Query("q"))
+
+	// Pagination — mobile always sends page_size=20; cap to keep the phone light.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
+
+	// Shared FROM+WHERE for the total and the block-scope aggregates (the page
+	// query keeps its own SELECT but the same predicate). A row is a "resource"
+	// when it carries a real resource_type.
+	const baseFromWhere = `
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id
+		WHERE e.project_id = $1 AND e.tenant_id = $2
+		  AND COALESCE(el.name, '') <> ''
+		  AND COALESCE(el.resource_type, '') <> ''`
+
+	// buildFilter appends the resource filters after the base WHERE, numbering
+	// placeholders from $3. includeActive=true applies type/material_type/q
+	// (page list + total); =false is scope-only (the chips + modified counts
+	// must stay stable regardless of the active filters). The estimate/catalog
+	// scope is ALWAYS applied — catalog rows are the manually-added "+" resources
+	// that must surface for any selected block.
+	buildFilter := func(includeActive bool) (string, []interface{}, int) {
+		s := ""
+		a := []interface{}{projectID, tenantID}
+		i := 3
+		if includeActive {
+			if resType != "" {
+				s += fmt.Sprintf(" AND LOWER(el.resource_type) = $%d", i)
+				a = append(a, resType)
+				i++
+			}
+			if matType != "" {
+				s += fmt.Sprintf(" AND LOWER(COALESCE(el.material_type, 'standard')) = $%d", i)
+				a = append(a, matType)
+				i++
+			}
+			if search != "" {
+				s += fmt.Sprintf(" AND (el.name ILIKE $%d OR el.uom ILIKE $%d)", i, i)
+				a = append(a, "%"+search+"%")
+				i++
+			}
+		}
+		if estID > 0 {
+			s += fmt.Sprintf(" AND (el.estimate_id = $%d OR LOWER(COALESCE(e.source_type, '')) = 'catalog')", i)
+			a = append(a, estID)
+			i++
+		}
+		return s, a, i
+	}
 
 	// Build the resource catalog from estimate_lines. Tenant scoping comes
 	// through `construction_estimate.tenant_id`. We pull the average
@@ -82,31 +146,12 @@ func (h *Handler) ListResourcePrices(c *gin.Context) {
 		  -- with empty resource_type get correctly excluded.
 		  AND COALESCE(el.resource_type, '') <> ''
 	`
-	args := []interface{}{projectID, tenantID}
-	argIdx := 3
-	if resType != "" {
-		q += fmt.Sprintf(" AND LOWER(el.resource_type) = $%d", argIdx)
-		args = append(args, resType)
-		argIdx++
-	}
-	if estimateIDStr != "" {
-		if estID, err := strconv.ParseInt(estimateIDStr, 10, 64); err == nil && estID > 0 {
-			// Scope to the selected estimate, BUT always include rows from
-			// the project's __catalog__ estimate. Catalog rows are the
-			// resources the user manually created via the "+" button on
-			// the AddResourcePickerModal — they live in a hidden estimate
-			// per project so the Resurslar tab can show them regardless
-			// of which block is currently selected. Without this OR clause
-			// a freshly-created resource silently disappears from the tab.
-			q += fmt.Sprintf(" AND (el.estimate_id = $%d OR LOWER(COALESCE(e.source_type, '')) = 'catalog')", argIdx)
-			args = append(args, estID)
-			argIdx++
-		}
-	}
-	q += `
+	listFilter, args, argIdx := buildFilter(true)
+	q += listFilter + `
 		GROUP BY el.name, el.uom, rtype
 		ORDER BY rtype ASC, el.name ASC
-	`
+		LIMIT $` + strconv.Itoa(argIdx) + ` OFFSET $` + strconv.Itoa(argIdx+1)
+	args = append(args, pageSize, offset)
 
 	rows, err := h.db.Query(q, args...)
 	if err != nil {
@@ -177,7 +222,75 @@ func (h *Handler) ListResourcePrices(c *gin.Context) {
 		}
 	}
 
-	response.Success(c, out)
+	// total — number of resource groups after the active filters (drives
+	// meta.has_next / total_pages).
+	totalFilter, totalArgs, _ := buildFilter(true)
+	var total int
+	_ = h.db.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT el.name`+baseFromWhere+totalFilter+`
+			GROUP BY el.name, el.uom, COALESCE(NULLIF(el.resource_type, ''), 'material')
+		) sub
+	`, totalArgs...).Scan(&total)
+
+	// Block-scope aggregates (ignore type/material_type/q so the chips and the
+	// "N o'zgargan" pill stay stable as the user filters/searches).
+	scopeFilter, scopeArgs, _ := buildFilter(false)
+
+	// material_type_counts — distinct material resources (name+uom groups) per
+	// subtype. Returned with all five keys so absent subtypes show 0.
+	matCounts := map[string]int{"standard": 0, "equipment": 0, "cable": 0, "metal": 0, "import": 0}
+	if mcRows, mcErr := h.db.Query(`
+		SELECT COALESCE(NULLIF(sub.material_type, ''), 'standard') AS mat_type, COUNT(*)
+		FROM (
+			SELECT el.name, el.uom, MIN(el.material_type) AS material_type`+baseFromWhere+scopeFilter+`
+			  AND LOWER(COALESCE(el.resource_type, 'material')) = 'material'
+			GROUP BY el.name, el.uom
+		) sub
+		GROUP BY mat_type
+	`, scopeArgs...); mcErr == nil {
+		defer mcRows.Close()
+		for mcRows.Next() {
+			var k string
+			var n int
+			if mcRows.Scan(&k, &n) == nil {
+				matCounts[k] = n
+			}
+		}
+	}
+
+	// modified_count — resource groups whose current price differs from the
+	// original (original > 0 AND |avg-orig| > 0.01).
+	var modifiedCount int
+	_ = h.db.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT el.name`+baseFromWhere+scopeFilter+`
+			GROUP BY el.name, el.uom, COALESCE(NULLIF(el.resource_type, ''), 'material')
+			HAVING AVG(COALESCE(el.original_unit_rate, el.unit_rate)) > 0
+			   AND ABS(AVG(el.unit_rate) - AVG(COALESCE(el.original_unit_rate, el.unit_rate))) > 0.01
+		) sub
+	`, scopeArgs...).Scan(&modifiedCount)
+
+	totalPages := 0
+	if pageSize > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    out,
+		"meta": gin.H{
+			"page":        page,
+			"page_size":   pageSize,
+			"total":       total,
+			"total_pages": totalPages,
+			"has_next":    page < totalPages,
+			"has_prev":    page > 1,
+		},
+		"summary": gin.H{
+			"material_type_counts": matCounts,
+			"modified_count":       modifiedCount,
+		},
+	})
 }
 
 // BulkUpdateResourcePrice — body: { resource_name, uom, resource_type,
