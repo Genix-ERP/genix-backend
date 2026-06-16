@@ -62,34 +62,40 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 		LEFT JOIN users cu ON cu.id = a.created_by
 		WHERE a.project_id = $1 AND a.tenant_id = $2
 	`
+	paginate, page, pageSize, offset := optPagination(c)
+	whereExtra := ""
 	args := []interface{}{projectID, tenantID}
 	argCount := 2
 
 	if actType != "" {
 		argCount++
-		query += fmt.Sprintf(" AND a.act_type = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND a.act_type = $%d", argCount)
 		args = append(args, actType)
 	}
 	if state != "" {
 		argCount++
-		query += fmt.Sprintf(" AND a.state = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND a.state = $%d", argCount)
 		args = append(args, state)
 	}
 	if subcontractIDStr != "" {
 		argCount++
-		query += fmt.Sprintf(" AND a.subcontract_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND a.subcontract_id = $%d", argCount)
 		subID, _ := strconv.ParseInt(subcontractIDStr, 10, 64)
 		args = append(args, subID)
 	}
 	if buildingIDStr != "" {
 		if bID, parseErr := strconv.ParseInt(buildingIDStr, 10, 64); parseErr == nil && bID > 0 {
 			argCount++
-			query += fmt.Sprintf(" AND a.building_id = $%d", argCount)
+			whereExtra += fmt.Sprintf(" AND a.building_id = $%d", argCount)
 			args = append(args, bID)
 		}
 	}
 
-	query += " ORDER BY a.created_date DESC"
+	query += whereExtra + " ORDER BY a.created_date DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -186,7 +192,16 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	response.Success(c, items)
+	if !paginate {
+		response.Success(c, items)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_act a WHERE a.project_id = $1 AND a.tenant_id = $2`+whereExtra,
+		args[:argCount]...,
+	).Scan(&total)
+	response.Paginated(c, items, page, pageSize, total)
 }
 
 // CreateConstructionAct creates a new act (Forma 2 / Forma 19 / other)

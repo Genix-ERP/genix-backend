@@ -1349,10 +1349,15 @@ func (h *Handler) ListSmetaSections(c *gin.Context) {
 		       COALESCE((SELECT COUNT(*) FROM smeta_items WHERE section_id = ss.id), 0) as items_count
 		FROM smeta_sections ss
 		WHERE ss.project_id = $1 AND ss.tenant_id = $2
-		ORDER BY ss.sort_order, ss.code
-	`
+		ORDER BY ss.sort_order, ss.code`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query smeta sections", "error", err)
 		response.InternalError(c, "Failed to query sections")
@@ -1376,7 +1381,13 @@ func (h *Handler) ListSmetaSections(c *gin.Context) {
 		sections = append(sections, s)
 	}
 
-	response.Success(c, sections)
+	if !paginate {
+		response.Success(c, sections)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM smeta_sections ss WHERE ss.project_id = $1 AND ss.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, sections, page, pageSize, total)
 }
 
 // CreateSmetaSection creates a new smeta section
@@ -1638,10 +1649,15 @@ func (h *Handler) ListSmetaItems(c *gin.Context) {
 		FROM smeta_items si
 		JOIN smeta_sections ss ON si.section_id = ss.id
 		WHERE si.section_id = $1 AND si.tenant_id = $2
-		ORDER BY si.sort_order, si.code
-	`
+		ORDER BY si.sort_order, si.code`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{sectionID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, sectionID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query smeta items", "error", err)
 		response.InternalError(c, "Failed to query items")
@@ -1667,7 +1683,13 @@ func (h *Handler) ListSmetaItems(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	response.Success(c, items)
+	if !paginate {
+		response.Success(c, items)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM smeta_items si WHERE si.section_id = $1 AND si.tenant_id = $2`, sectionID, tenantID).Scan(&total)
+	response.Paginated(c, items, page, pageSize, total)
 }
 
 // CreateSmetaItem creates a new smeta item
@@ -2439,10 +2461,15 @@ func (h *Handler) ListPhotoReports(c *gin.Context) {
 		LEFT JOIN employees e ON e.id = pr.reported_by
 		LEFT JOIN employees r ON r.id = pr.reviewed_by
 		WHERE pr.project_id = $1 AND pr.tenant_id = $2
-		ORDER BY pr.report_date DESC, pr.created_date DESC
-	`
+		ORDER BY pr.report_date DESC, pr.created_date DESC`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query photo reports", "error", err)
 		response.InternalError(c, "Failed to query photo reports")
@@ -2513,7 +2540,13 @@ func (h *Handler) ListPhotoReports(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, reports)
+	if !paginate {
+		response.Success(c, reports)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_photo_reports pr WHERE pr.project_id = $1 AND pr.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, reports, page, pageSize, total)
 }
 
 // CreatePhotoReport creates a new photo report
@@ -2837,10 +2870,15 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		LEFT JOIN employees e ON e.id = dr.reported_by
 		LEFT JOIN employees v ON v.id = dr.verified_by
 		WHERE dr.project_id = $1 AND dr.tenant_id = $2
-		ORDER BY dr.report_date DESC
-	`
+		ORDER BY dr.report_date DESC`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query daily reports", "error", err)
 		response.InternalError(c, "Failed to query daily reports")
@@ -2905,7 +2943,13 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 	}
 
 	h.log.Info("Daily reports result", "project_id", projectID, "count", len(reports))
-	response.Success(c, reports)
+	if !paginate {
+		response.Success(c, reports)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_daily_reports dr WHERE dr.project_id = $1 AND dr.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, reports, page, pageSize, total)
 }
 
 // CreateDailyReport creates a new daily report
@@ -3319,10 +3363,15 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		LEFT JOIN construction_subcontract sc ON sc.id = mr.subcontract_id
 		LEFT JOIN construction_buildings bld ON bld.id = mr.building_id
 		WHERE mr.project_id = $1 AND mr.tenant_id = $2
-		ORDER BY mr.request_date DESC
-	`
+		ORDER BY mr.request_date DESC`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query material requests", "error", err)
 		response.InternalError(c, "Failed to query material requests")
@@ -3399,7 +3448,13 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, requests)
+	if !paginate {
+		response.Success(c, requests)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_material_requests mr WHERE mr.project_id = $1 AND mr.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, requests, page, pageSize, total)
 }
 
 // CreateMaterialRequest creates a new material request
@@ -4448,10 +4503,15 @@ func (h *Handler) ListDeliveries(c *gin.Context) {
 		LEFT JOIN organizations o ON o.id = pv.vendor_id
 		LEFT JOIN employees e ON e.id = d.received_by
 		WHERE d.project_id = $1 AND d.tenant_id = $2
-		ORDER BY d.delivery_date DESC
-	`
+		ORDER BY d.delivery_date DESC`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query deliveries", "error", err)
 		response.InternalError(c, "Failed to query deliveries")
@@ -4516,7 +4576,13 @@ func (h *Handler) ListDeliveries(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, deliveries)
+	if !paginate {
+		response.Success(c, deliveries)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_material_deliveries d WHERE d.project_id = $1 AND d.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, deliveries, page, pageSize, total)
 }
 
 // =====================================================
@@ -5597,12 +5663,18 @@ func (h *Handler) ListBuildingFiles(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	paginate, page, pageSize, offset := optPagination(c)
+	query := `
 		SELECT id, building_id, file_id, file_url, filename, file_size, mime_type, description, created_at, created_by
 		FROM building_files
 		WHERE tenant_id = $1 AND building_id = $2
-		ORDER BY created_at DESC
-	`, tenantID, buildingID)
+		ORDER BY created_at DESC`
+	args := []interface{}{tenantID, buildingID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list building files", "error", err)
 		response.InternalServerError(c, "Failed to list files")
@@ -5637,7 +5709,13 @@ func (h *Handler) ListBuildingFiles(c *gin.Context) {
 	if files == nil {
 		files = []BuildingFile{}
 	}
-	response.Success(c, files)
+	if !paginate {
+		response.Success(c, files)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM building_files WHERE tenant_id = $1 AND building_id = $2`, tenantID, buildingID).Scan(&total)
+	response.Paginated(c, files, page, pageSize, total)
 }
 
 // CreateBuildingFile adds a file reference to a building
@@ -5748,12 +5826,18 @@ func (h *Handler) ListProjectFiles(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	paginate, page, pageSize, offset := optPagination(c)
+	query := `
 		SELECT id, project_id, file_id, file_url, filename, file_size, mime_type, description, created_at, created_by
 		FROM project_files
 		WHERE tenant_id = $1 AND project_id = $2
-		ORDER BY created_at DESC
-	`, tenantID, projectID)
+		ORDER BY created_at DESC`
+	args := []interface{}{tenantID, projectID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list project files", "error", err)
 		response.InternalServerError(c, "Failed to list files")
@@ -5788,7 +5872,13 @@ func (h *Handler) ListProjectFiles(c *gin.Context) {
 	if files == nil {
 		files = []ProjectFile{}
 	}
-	response.Success(c, files)
+	if !paginate {
+		response.Success(c, files)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM project_files WHERE tenant_id = $1 AND project_id = $2`, tenantID, projectID).Scan(&total)
+	response.Paginated(c, files, page, pageSize, total)
 }
 
 // CreateProjectFile adds a file reference to a project
