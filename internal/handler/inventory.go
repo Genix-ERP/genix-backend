@@ -5032,24 +5032,32 @@ func (h *Handler) ListStockCounts(c *gin.Context) {
 	`
 	args := []interface{}{tenantID}
 	argCount := 1
+	whereExtra := ""
 
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query += fmt.Sprintf(" AND sc.organization_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND sc.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 	if status := c.Query("status"); status != "" {
 		argCount++
-		query += fmt.Sprintf(" AND sc.status = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND sc.status = $%d", argCount)
 		args = append(args, status)
 	}
 	if warehouseID := c.Query("warehouse_id"); warehouseID != "" {
 		argCount++
-		query += fmt.Sprintf(" AND sc.warehouse_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND sc.warehouse_id = $%d", argCount)
 		args = append(args, warehouseID)
 	}
 
+	query += whereExtra
 	query += " ORDER BY sc.created_at DESC"
+
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -5116,7 +5124,15 @@ func (h *Handler) ListStockCounts(c *gin.Context) {
 		counts = append(counts, sc)
 	}
 
-	response.Success(c, counts)
+	if !paginate {
+		response.Success(c, counts)
+		return
+	}
+
+	var total int
+	countQuery := `SELECT COUNT(*) FROM stock_counts sc WHERE sc.tenant_id = $1` + whereExtra
+	_ = h.db.QueryRow(countQuery, args[:argCount]...).Scan(&total)
+	response.Paginated(c, counts, page, pageSize, total)
 }
 
 func (h *Handler) GetStockCount(c *gin.Context) {

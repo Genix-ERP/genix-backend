@@ -1226,6 +1226,9 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const journalsBaseWhere = "WHERE j.tenant_id = $1 AND j.deleted_at IS NULL"
 	query := `
 		SELECT j.id, j.code, j.name, COALESCE(j.name_uz, ''), COALESCE(j.name_en, ''), j.type,
 			COALESCE(j.description, ''),
@@ -1245,18 +1248,23 @@ func (h *Handler) ListJournals(c *gin.Context) {
 			j.created_at,
 			COALESCE(j.updated_at, j.created_at)
 		FROM journals j
-		WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
-		ORDER BY j.code ASC
-	`
+		` + journalsBaseWhere
 
 	args := []interface{}{tenantID}
 	argCount := 1
+	whereExtra := ""
 
 	// Filter by organization (also include journals with NULL organization_id as they belong to all orgs in the tenant)
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND (j.organization_id = $%d OR j.organization_id IS NULL) ORDER BY", argCount), 1)
+		whereExtra += fmt.Sprintf(" AND (j.organization_id = $%d OR j.organization_id IS NULL)", argCount)
 		args = append(args, orgID)
+	}
+
+	query += whereExtra + " ORDER BY j.code ASC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
 	}
 
 	rows, err := h.db.Query(query, args...)
@@ -1307,7 +1315,14 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		journals = append(journals, j)
 	}
 
-	response.Success(c, journals)
+	if !paginate {
+		response.Success(c, journals)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM journals j `+journalsBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, journals, page, pageSize, total)
 }
 
 // ListPaymentJournals returns only bank/cash journals for payment flows.
@@ -1319,6 +1334,11 @@ func (h *Handler) ListPaymentJournals(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const paymentJournalsBaseWhere = `WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
+		  AND j.type IN ('bank', 'cash')
+		  AND COALESCE(j.is_active, true) = true`
 	query := `
 		SELECT j.id, j.code, j.name, COALESCE(j.name_uz, ''), COALESCE(j.name_en, ''), j.type,
 			COALESCE(j.short_code, ''), COALESCE(j.currency, ''),
@@ -1326,19 +1346,22 @@ func (h *Handler) ListPaymentJournals(c *gin.Context) {
 			j.bank_account_id, j.suspense_account_id,
 			j.profit_account_id, j.loss_account_id
 		FROM journals j
-		WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
-		  AND j.type IN ('bank', 'cash')
-		  AND COALESCE(j.is_active, true) = true
-		ORDER BY j.code ASC
-	`
+		` + paymentJournalsBaseWhere
 
 	args := []interface{}{tenantID}
 	argCount := 1
+	whereExtra := ""
 
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND (j.organization_id = $%d OR j.organization_id IS NULL) ORDER BY", argCount), 1)
+		whereExtra += fmt.Sprintf(" AND (j.organization_id = $%d OR j.organization_id IS NULL)", argCount)
 		args = append(args, orgID)
+	}
+
+	query += whereExtra + " ORDER BY j.code ASC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
 	}
 
 	rows, err := h.db.Query(query, args...)
@@ -1382,7 +1405,14 @@ func (h *Handler) ListPaymentJournals(c *gin.Context) {
 		journals = append(journals, j)
 	}
 
-	response.Success(c, journals)
+	if !paginate {
+		response.Success(c, journals)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM journals j `+paymentJournalsBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, journals, page, pageSize, total)
 }
 
 // GetJournal godoc
@@ -5809,55 +5839,66 @@ func (h *Handler) ListBankTransactions(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const bankTxBaseWhere = "WHERE tenant_id = $1 AND bank_account_id = $2"
 	query := `
 		SELECT id, tenant_id, bank_account_id, transaction_date, value_date,
 		       COALESCE(reference, '') as reference, COALESCE(description, '') as description,
 		       amount, balance_after, transaction_type, COALESCE(status, 'unmatched') as status,
 		       matched_journal_entry_id, created_at, updated_at
 		FROM bank_transactions
-		WHERE tenant_id = $1 AND bank_account_id = $2
-	`
+		` + bankTxBaseWhere
 	args := []interface{}{tenantID, bankAccountID}
 	argIndex := 3
+	whereExtra := ""
 
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		query += fmt.Sprintf(" AND organization_id = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND organization_id = $%d", argIndex)
 		args = append(args, orgID)
 		argIndex++
 	}
 
 	if filter.Search != "" {
-		query += fmt.Sprintf(" AND (reference ILIKE $%d OR description ILIKE $%d)", argIndex, argIndex)
+		whereExtra += fmt.Sprintf(" AND (reference ILIKE $%d OR description ILIKE $%d)", argIndex, argIndex)
 		args = append(args, "%"+filter.Search+"%")
 		argIndex++
 	}
 
 	if filter.Type != "" {
-		query += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
 		args = append(args, filter.Type)
 		argIndex++
 	}
 
 	if filter.Status != "" {
-		query += fmt.Sprintf(" AND status = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND status = $%d", argIndex)
 		args = append(args, filter.Status)
 		argIndex++
 	}
 
 	if filter.DateFrom != "" {
-		query += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
 		args = append(args, filter.DateFrom)
 		argIndex++
 	}
 
 	if filter.DateTo != "" {
-		query += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
 		args = append(args, filter.DateTo)
 		argIndex++
 	}
 
-	query += " ORDER BY transaction_date DESC, created_at DESC"
+	// argCount holds the number of filter args (tenant + bank account + dynamic
+	// filters) before any LIMIT/OFFSET is appended; used to slice args for COUNT.
+	argCount := argIndex - 1
+
+	query += whereExtra + " ORDER BY transaction_date DESC, created_at DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -5899,7 +5940,14 @@ func (h *Handler) ListBankTransactions(c *gin.Context) {
 		transactions = append(transactions, t)
 	}
 
-	response.Success(c, transactions)
+	if !paginate {
+		response.Success(c, transactions)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM bank_transactions `+bankTxBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, transactions, page, pageSize, total)
 }
 
 // CreateBankTransaction godoc
@@ -7114,6 +7162,9 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const cashTxBaseWhere = "WHERE tenant_id = $1"
 	query := `
 		SELECT id, tenant_id, transaction_date, transaction_type, amount,
 		       COALESCE(currency, 'UZS') as currency, COALESCE(description, '') as description,
@@ -7121,49 +7172,57 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 		       COALESCE(cashier, '') as cashier, COALESCE(status, 'posted') as status,
 		       created_at, updated_at
 		FROM cash_transactions
-		WHERE tenant_id = $1
-	`
+		` + cashTxBaseWhere
 	args := []interface{}{tenantID}
 	argIndex := 2
+	whereExtra := ""
 
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		query += fmt.Sprintf(" AND organization_id = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND organization_id = $%d", argIndex)
 		args = append(args, orgID)
 		argIndex++
 	}
 
 	if filter.Search != "" {
-		query += fmt.Sprintf(" AND (description ILIKE $%d OR reference ILIKE $%d OR cashier ILIKE $%d)", argIndex, argIndex, argIndex)
+		whereExtra += fmt.Sprintf(" AND (description ILIKE $%d OR reference ILIKE $%d OR cashier ILIKE $%d)", argIndex, argIndex, argIndex)
 		args = append(args, "%"+filter.Search+"%")
 		argIndex++
 	}
 
 	if filter.Type != "" {
-		query += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
 		args = append(args, filter.Type)
 		argIndex++
 	}
 
 	if filter.Category != "" {
-		query += fmt.Sprintf(" AND category = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND category = $%d", argIndex)
 		args = append(args, filter.Category)
 		argIndex++
 	}
 
 	if filter.DateFrom != "" {
-		query += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
 		args = append(args, filter.DateFrom)
 		argIndex++
 	}
 
 	if filter.DateTo != "" {
-		query += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
 		args = append(args, filter.DateTo)
 		argIndex++
 	}
 
-	query += " ORDER BY transaction_date DESC, created_at DESC"
+	// argCount holds the number of filter args (tenant + dynamic filters) before
+	// any LIMIT/OFFSET is appended; used to slice args for COUNT.
+	argCount := argIndex - 1
+
+	query += whereExtra + " ORDER BY transaction_date DESC, created_at DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -7188,7 +7247,14 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 		transactions = append(transactions, t)
 	}
 
-	response.Success(c, transactions)
+	if !paginate {
+		response.Success(c, transactions)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM cash_transactions `+cashTxBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, transactions, page, pageSize, total)
 }
 
 // GetCashTransaction godoc
@@ -8543,6 +8609,9 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 
 	fiscalYearID := c.Query("fiscal_year_id")
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const budgetsBaseWhere = "WHERE b.tenant_id = $1 AND b.deleted_at IS NULL"
 	query := `
 		SELECT b.id, b.tenant_id, b.organization_id, b.fiscal_year_id, b.code, b.name, b.description,
 		       b.budget_type, b.total_amount, b.status, b.approved_by, b.approved_at,
@@ -8551,26 +8620,30 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		       COALESCE(b.warning_threshold, 80)
 		FROM budgets b
 		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
-		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
-	`
+		` + budgetsBaseWhere
 
 	args := []interface{}{tenantID}
 	argCount := 1
+	whereExtra := ""
 
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query += fmt.Sprintf(" AND b.organization_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND b.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	if fiscalYearID != "" {
 		argCount++
-		query += fmt.Sprintf(" AND b.fiscal_year_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND b.fiscal_year_id = $%d", argCount)
 		args = append(args, fiscalYearID)
 	}
 
-	query += " ORDER BY b.created_at DESC"
+	query += whereExtra + " ORDER BY b.created_at DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -8627,7 +8700,14 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		budgets = append(budgets, &b)
 	}
 
-	response.Success(c, budgets)
+	if !paginate {
+		response.Success(c, budgets)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM budgets b LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id `+budgetsBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, budgets, page, pageSize, total)
 }
 
 // GetBudget godoc
@@ -9189,6 +9269,14 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 
 	budgetID := c.Query("budget_id")
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const budgetLinesFrom = `FROM budget_lines bl
+		JOIN budgets b ON bl.budget_id = b.id
+		LEFT JOIN accounts a ON bl.account_id = a.id
+		LEFT JOIN fiscal_years fy ON b.fiscal_year_id = fy.id
+		WHERE b.tenant_id = $1`
+
 	// Query budget lines with account info and computed actual amounts from journal entries
 	// actual_amount = SUM of debit for expense accounts, SUM of credit for revenue accounts
 	// within the budget's date range
@@ -9212,20 +9300,22 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		       ), 0) as computed_actual,
 		       bl.notes, COALESCE(bl.line_type, 'expense') as line_type, COALESCE(bl.category_name, '') as category_name,
 		       bl.created_at, bl.updated_at
-		FROM budget_lines bl
-		JOIN budgets b ON bl.budget_id = b.id
-		LEFT JOIN accounts a ON bl.account_id = a.id
-		LEFT JOIN fiscal_years fy ON b.fiscal_year_id = fy.id
-		WHERE b.tenant_id = $1
-	`
+		` + budgetLinesFrom
 
 	args := []interface{}{tenantID}
+	argCount := 1
+	whereExtra := ""
 	if budgetID != "" {
-		query += " AND bl.budget_id = $2"
+		argCount++
+		whereExtra += fmt.Sprintf(" AND bl.budget_id = $%d", argCount)
 		args = append(args, budgetID)
 	}
 
-	query += " ORDER BY bl.created_at"
+	query += whereExtra + " ORDER BY bl.created_at"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -9276,7 +9366,14 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		lines = append(lines, &line)
 	}
 
-	response.Success(c, lines)
+	if !paginate {
+		response.Success(c, lines)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) `+budgetLinesFrom+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, lines, page, pageSize, total)
 }
 
 // CreateBudgetLine godoc
