@@ -55,62 +55,10 @@ import (
 //
 // First non-empty match wins.
 func (h *Handler) resolveProjectRole(tenantID, userID uuid.UUID, projectID int64) string {
-	if userID == uuid.Nil {
-		return ""
+	roles := h.resolveProjectRoles(tenantID, userID, projectID)
+	if len(roles) > 0 {
+		return roles[0]
 	}
-
-	// Step 1: per-project team role.
-	var rawRole sql.NullString
-	_ = h.db.QueryRow(`
-		SELECT role
-		FROM construction_project_team
-		WHERE tenant_id = $1 AND project_id = $2 AND employee_id = $3
-		  AND COALESCE(status, 'active') = 'active'
-		ORDER BY created_date DESC
-		LIMIT 1
-	`, tenantID, projectID, userID).Scan(&rawRole)
-	if rawRole.Valid {
-		switch normaliseRole(rawRole.String) {
-		case "foreman":
-			return "foreman"
-		case "supervisor":
-			return "supervisor"
-		case "engineer":
-			return "engineer"
-		}
-	}
-
-	// Step 2: tenant-wide settings fallback. Each role accepts either a
-	// single legacy `*_user_id` string OR a new `*_user_ids` JSON array
-	// so multiple employees can share a role (e.g. several prorabs).
-	// Both formats are queried in one round-trip; legacy values are
-	// kept readable so existing tenants don't need a backfill.
-	var foremanID, supervisorID, engineerID sql.NullString
-	var foremanIDs, supervisorIDs, engineerIDs []byte
-	_ = h.db.QueryRow(`
-		SELECT
-		    settings->'construction'->'roles'->>'foreman_user_id'                            AS foreman_id,
-		    settings->'construction'->'roles'->>'supervisor_user_id'                         AS supervisor_id,
-		    settings->'construction'->'roles'->>'engineer_user_id'                           AS engineer_id,
-		    COALESCE(settings->'construction'->'roles'->'foreman_user_ids',    '[]'::jsonb) AS foreman_ids,
-		    COALESCE(settings->'construction'->'roles'->'supervisor_user_ids', '[]'::jsonb) AS supervisor_ids,
-		    COALESCE(settings->'construction'->'roles'->'engineer_user_ids',   '[]'::jsonb) AS engineer_ids
-		FROM tenant_settings
-		WHERE tenant_id = $1
-	`, tenantID).Scan(&foremanID, &supervisorID, &engineerID,
-		&foremanIDs, &supervisorIDs, &engineerIDs)
-
-	uid := userID.String()
-	if (foremanID.Valid && foremanID.String == uid) || jsonArrayContains(foremanIDs, uid) {
-		return "foreman"
-	}
-	if (supervisorID.Valid && supervisorID.String == uid) || jsonArrayContains(supervisorIDs, uid) {
-		return "supervisor"
-	}
-	if (engineerID.Valid && engineerID.String == uid) || jsonArrayContains(engineerIDs, uid) {
-		return "engineer"
-	}
-
 	return ""
 }
 
@@ -126,6 +74,28 @@ func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int6
 	if userID == uuid.Nil {
 		return nil
 	}
+
+	// Identities to match against. CRITICAL: `users.id` (auth) and
+	// `employees.id` are DIFFERENT id spaces, and the data keys off both —
+	// construction_project_team.employee_id holds an EMPLOYEE id, while the
+	// settings role lists store whatever the Settings UI saved
+	// (`employee.user_id || employee.id`). So we resolve the caller's
+	// employee id(s) from their user id and match either one everywhere;
+	// matching only the user id (as the old resolver did) silently missed
+	// team assignments and any settings entry saved with an employee id.
+	idents := []string{userID.String()}
+	if rows, err := h.db.Query(
+		`SELECT id FROM employees WHERE user_id = $1 AND tenant_id = $2`, userID, tenantID,
+	); err == nil {
+		for rows.Next() {
+			var eid uuid.UUID
+			if rows.Scan(&eid) == nil && eid != uuid.Nil {
+				idents = append(idents, eid.String())
+			}
+		}
+		rows.Close()
+	}
+
 	set := map[string]bool{}
 	mark := func(raw string) {
 		switch normaliseRole(raw) {
@@ -138,20 +108,23 @@ func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int6
 		}
 	}
 
-	// Step 1: per-project team roles — a user may have several team rows.
+	// Step 1: per-project team roles — match by employee_id OR the employee's
+	// linked user_id, so it works regardless of which id the row was keyed on.
 	if rows, err := h.db.Query(`
-		SELECT role
-		FROM construction_project_team
-		WHERE tenant_id = $1 AND project_id = $2 AND employee_id = $3
-		  AND COALESCE(status, 'active') = 'active'
+		SELECT pt.role
+		FROM construction_project_team pt
+		LEFT JOIN employees e ON e.id = pt.employee_id
+		WHERE pt.tenant_id = $1 AND pt.project_id = $2
+		  AND COALESCE(pt.status, 'active') = 'active'
+		  AND (pt.employee_id = $3 OR e.user_id = $3)
 	`, tenantID, projectID, userID); err == nil {
-		defer rows.Close()
 		for rows.Next() {
 			var raw sql.NullString
 			if rows.Scan(&raw) == nil && raw.Valid {
 				mark(raw.String)
 			}
 		}
+		rows.Close()
 	}
 
 	// Step 2: tenant-wide settings (legacy single id OR new *_user_ids array).
@@ -170,14 +143,26 @@ func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int6
 	`, tenantID).Scan(&foremanID, &supervisorID, &engineerID,
 		&foremanIDs, &supervisorIDs, &engineerIDs)
 
-	uid := userID.String()
-	if (foremanID.Valid && foremanID.String == uid) || jsonArrayContains(foremanIDs, uid) {
+	// inList: does the single legacy id OR the JSON array contain ANY of the
+	// caller's identities (user id or employee id)?
+	inList := func(single sql.NullString, arr []byte) bool {
+		for _, id := range idents {
+			if single.Valid && single.String == id {
+				return true
+			}
+			if jsonArrayContains(arr, id) {
+				return true
+			}
+		}
+		return false
+	}
+	if inList(foremanID, foremanIDs) {
 		set["foreman"] = true
 	}
-	if (supervisorID.Valid && supervisorID.String == uid) || jsonArrayContains(supervisorIDs, uid) {
+	if inList(supervisorID, supervisorIDs) {
 		set["supervisor"] = true
 	}
-	if (engineerID.Valid && engineerID.String == uid) || jsonArrayContains(engineerIDs, uid) {
+	if inList(engineerID, engineerIDs) {
 		set["engineer"] = true
 	}
 
