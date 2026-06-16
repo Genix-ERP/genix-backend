@@ -6400,6 +6400,17 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 		return
 	}
 
+	// The project's currently-open Forma 2 iteration. We seed period_fakt
+	// rows for the cloned lines into it so the Bosqichlar BAJARILDI input
+	// shows the carried-over progress (that input reads the open iteration's
+	// period_fakt; the progress bar/status read done_quantity on the line).
+	var openIterID sql.NullInt64
+	_ = tx.QueryRow(`
+		SELECT id FROM construction_form2_iteration
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'open'
+		LIMIT 1
+	`, projectID, tenantID).Scan(&openIterID)
+
 	// 2. For each source estimate, create a fresh estimate row on the
 	//    target building, then clone all of its lines. is_current is
 	//    deliberately set to FALSE on every clone — the source's "v86 is
@@ -6442,7 +6453,8 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 			       COALESCE(material_type, 'standard'),
 			       COALESCE(original_quantity, 0), COALESCE(original_unit_rate, 0),
 			       imported_quantity, imported_total,
-			       COALESCE(sort_order, 0), COALESCE(is_manual, FALSE)
+			       COALESCE(sort_order, 0), COALESCE(is_manual, FALSE),
+			       COALESCE(done_quantity, 0)
 			FROM construction_estimate_line
 			WHERE estimate_id = $1 AND tenant_id = $2
 			ORDER BY (CASE WHEN parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
@@ -6480,6 +6492,7 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 			ImportedTotal    sql.NullFloat64
 			SortOrder        int
 			IsManual         bool
+			DoneQuantity     float64
 		}
 		var srcLines []srcLine
 		for lineRows.Next() {
@@ -6493,7 +6506,7 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 				&l.QuantityOverride, &l.MaterialType,
 				&l.OriginalQuantity, &l.OriginalUnitRate,
 				&l.ImportedQuantity, &l.ImportedTotal,
-				&l.SortOrder, &l.IsManual,
+				&l.SortOrder, &l.IsManual, &l.DoneQuantity,
 			); err != nil {
 				lineRows.Close()
 				h.log.Error("CloneBuildingEstimates: scan source line failed", "error", err)
@@ -6524,6 +6537,17 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 				// one-click "make sibling block match" expectation.
 			}
 
+			// Carry over progress. The HOLAT/approval workflow state is
+			// reset to a clean "pending / in_progress" derived from the
+			// done quantity (so a cloned, partly-done work reads JARAYONDA
+			// and stays editable) rather than copying submitted/confirmed
+			// signatures, which would clone into a locked state with no
+			// reviewer context.
+			approvalStatus := "pending"
+			if sl.DoneQuantity > 0 {
+				approvalStatus = "in_progress"
+			}
+
 			var newLineID int64
 			if err := tx.QueryRow(`
 				INSERT INTO construction_estimate_line (
@@ -6532,14 +6556,14 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 					code, item_number, resource_type, parent_item_number,
 					parent_line_id, norm_rate, subline_seq, quantity_override, material_type,
 					original_quantity, original_unit_rate, imported_quantity, imported_total,
-					sort_order, is_manual, created_date, updated_date
+					sort_order, is_manual, done_quantity, approval_status, created_date, updated_date
 				) VALUES (
 					$1, $2, $3, $4, $5, $6,
 					$7, $8, $9, $10, $11,
 					$12, $13, $14, $15,
 					$16, $17, $18, $19, $20,
 					$21, $22, $23, $24,
-					$25, $26, NOW(), NOW()
+					$25, $26, $27, $28, NOW(), NOW()
 				)
 				RETURNING id
 			`,
@@ -6548,7 +6572,7 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 				sl.Code, sl.ItemNumber, sl.ResourceType, sl.ParentItemNumber,
 				newParent, sl.NormRate, sl.SublineSeq, sl.QuantityOverride, sl.MaterialType,
 				sl.OriginalQuantity, sl.OriginalUnitRate, sl.ImportedQuantity, sl.ImportedTotal,
-				sl.SortOrder, sl.IsManual,
+				sl.SortOrder, sl.IsManual, sl.DoneQuantity, approvalStatus,
 			).Scan(&newLineID); err != nil {
 				h.log.Error("CloneBuildingEstimates: insert clone line failed",
 					"error", err, "source_line_id", sl.ID, "new_estimate_id", newEstID)
@@ -6557,6 +6581,24 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 			}
 			idMap[sl.ID] = newLineID
 			linesCreated++
+
+			// Seed the open Forma 2 iteration with this line's period_fakt so
+			// the BAJARILDI input shows the carried-over progress. The clone
+			// has no frozen-iteration history, so its entire done quantity
+			// lives in the current open iteration — keeping the invariant
+			// done_quantity = Σ period_fakt intact.
+			if openIterID.Valid && sl.DoneQuantity != 0 {
+				if _, err := tx.Exec(`
+					INSERT INTO construction_form2_iteration_line (iteration_id, estimate_line_id, period_fakt)
+					VALUES ($1, $2, $3)
+					ON CONFLICT (iteration_id, estimate_line_id) DO UPDATE SET period_fakt = EXCLUDED.period_fakt
+				`, openIterID.Int64, newLineID, sl.DoneQuantity); err != nil {
+					h.log.Error("CloneBuildingEstimates: seed iteration line failed",
+						"error", err, "new_line_id", newLineID)
+					response.InternalError(c, "Failed to seed cloned progress")
+					return
+				}
+			}
 		}
 	}
 
