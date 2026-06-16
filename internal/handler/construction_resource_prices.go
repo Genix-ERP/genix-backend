@@ -95,9 +95,24 @@ func (h *Handler) ListResourcePrices(c *gin.Context) {
 		i := 3
 		if includeActive {
 			if resType != "" {
-				s += fmt.Sprintf(" AND LOWER(el.resource_type) = $%d", i)
-				a = append(a, resType)
-				i++
+				// Bucket the category filter the same way the frontend
+				// classify() does, so "Mashina" catches every machine
+				// variant (machine/mashina/machinery), "Mehnat" catches
+				// every labour variant, and "Material" is everything else.
+				// An exact `resource_type = $` match dropped rows stored
+				// under synonym values once filtering moved server-side.
+				switch resType {
+				case "labor":
+					s += " AND LOWER(el.resource_type) IN ('labor','ish','ishchi','worker')"
+				case "equipment":
+					s += " AND LOWER(el.resource_type) IN ('equipment','machine','mashina','masina','machinery')"
+				case "material":
+					s += " AND LOWER(el.resource_type) NOT IN ('labor','ish','ishchi','worker','equipment','machine','mashina','masina','machinery')"
+				default:
+					s += fmt.Sprintf(" AND LOWER(el.resource_type) = $%d", i)
+					a = append(a, resType)
+					i++
+				}
 			}
 			if matType != "" {
 				s += fmt.Sprintf(" AND LOWER(COALESCE(el.material_type, 'standard')) = $%d", i)
