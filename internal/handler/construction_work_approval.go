@@ -114,6 +114,92 @@ func (h *Handler) resolveProjectRole(tenantID, userID uuid.UUID, projectID int64
 	return ""
 }
 
+// resolveProjectRoles returns EVERY workflow role the user holds on the
+// project. Unlike resolveProjectRole (which returns a single priority-
+// resolved role for display defaults / budget hiding), this merges the
+// per-project team rows AND the tenant-settings role lists, so a user
+// assigned to more than one role (e.g. both supervisor and engineer) gets
+// all of them. Deduped, returned in canonical order (foreman, supervisor,
+// engineer). An EMPTY slice means "no role assigned" — callers treat that
+// as tenant-admin/demo and skip the role gate.
+func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int64) []string {
+	if userID == uuid.Nil {
+		return nil
+	}
+	set := map[string]bool{}
+	mark := func(raw string) {
+		switch normaliseRole(raw) {
+		case "foreman":
+			set["foreman"] = true
+		case "supervisor":
+			set["supervisor"] = true
+		case "engineer":
+			set["engineer"] = true
+		}
+	}
+
+	// Step 1: per-project team roles — a user may have several team rows.
+	if rows, err := h.db.Query(`
+		SELECT role
+		FROM construction_project_team
+		WHERE tenant_id = $1 AND project_id = $2 AND employee_id = $3
+		  AND COALESCE(status, 'active') = 'active'
+	`, tenantID, projectID, userID); err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var raw sql.NullString
+			if rows.Scan(&raw) == nil && raw.Valid {
+				mark(raw.String)
+			}
+		}
+	}
+
+	// Step 2: tenant-wide settings (legacy single id OR new *_user_ids array).
+	var foremanID, supervisorID, engineerID sql.NullString
+	var foremanIDs, supervisorIDs, engineerIDs []byte
+	_ = h.db.QueryRow(`
+		SELECT
+		    settings->'construction'->'roles'->>'foreman_user_id',
+		    settings->'construction'->'roles'->>'supervisor_user_id',
+		    settings->'construction'->'roles'->>'engineer_user_id',
+		    COALESCE(settings->'construction'->'roles'->'foreman_user_ids',    '[]'::jsonb),
+		    COALESCE(settings->'construction'->'roles'->'supervisor_user_ids', '[]'::jsonb),
+		    COALESCE(settings->'construction'->'roles'->'engineer_user_ids',   '[]'::jsonb)
+		FROM tenant_settings
+		WHERE tenant_id = $1
+	`, tenantID).Scan(&foremanID, &supervisorID, &engineerID,
+		&foremanIDs, &supervisorIDs, &engineerIDs)
+
+	uid := userID.String()
+	if (foremanID.Valid && foremanID.String == uid) || jsonArrayContains(foremanIDs, uid) {
+		set["foreman"] = true
+	}
+	if (supervisorID.Valid && supervisorID.String == uid) || jsonArrayContains(supervisorIDs, uid) {
+		set["supervisor"] = true
+	}
+	if (engineerID.Valid && engineerID.String == uid) || jsonArrayContains(engineerIDs, uid) {
+		set["engineer"] = true
+	}
+
+	out := make([]string, 0, 3)
+	for _, r := range []string{"foreman", "supervisor", "engineer"} {
+		if set[r] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// roleSetHas reports whether the resolved role set contains target.
+func roleSetHas(roles []string, target string) bool {
+	for _, r := range roles {
+		if r == target {
+			return true
+		}
+	}
+	return false
+}
+
 // jsonArrayContains reports whether the given JSON-encoded string array
 // contains target. Returns false on parse error or non-array input —
 // missing/malformed settings fall back to the legacy single-user path.
@@ -233,8 +319,8 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 	// Authorisation. Treat tenant admins (role "") as foreman so a
 	// freshly-imported project where roles haven't been assigned yet
 	// can still be exercised by the project owner.
-	role := h.resolveProjectRole(tenantID, userID, ctx.ProjectID)
-	if role != "foreman" && role != "" {
+	roles := h.resolveProjectRoles(tenantID, userID, ctx.ProjectID)
+	if len(roles) > 0 && !roleSetHas(roles, "foreman") {
 		response.Forbidden(c, "Only the project foreman can update done quantity")
 		return
 	}
@@ -517,11 +603,11 @@ func (h *Handler) transitionWork(
 		return
 	}
 
-	// Authorisation.
-	role := h.resolveProjectRole(tenantID, userID, ctx.ProjectID)
-	if role != requiredRole && role != "" {
-		// Tenant admin (no team-role assigned) is permitted as a
-		// fallback — same logic as UpdateWorkDoneQuantity.
+	// Authorisation — the user may act if ANY of their assigned roles is the
+	// one this transition requires. Tenant admins (empty set) are permitted
+	// as a fallback — same logic as UpdateWorkDoneQuantity.
+	roles := h.resolveProjectRoles(tenantID, userID, ctx.ProjectID)
+	if len(roles) > 0 && !roleSetHas(roles, requiredRole) {
 		response.Forbidden(c, "Action not allowed for your project role")
 		return
 	}
@@ -668,8 +754,8 @@ func (h *Handler) bulkWorksTransition(
 		return
 	}
 
-	role := h.resolveProjectRole(tenantID, userID, projectID)
-	if role != requiredRole && role != "" {
+	roles := h.resolveProjectRoles(tenantID, userID, projectID)
+	if len(roles) > 0 && !roleSetHas(roles, requiredRole) {
 		response.Forbidden(c, "Action not allowed for your project role")
 		return
 	}
@@ -787,9 +873,17 @@ func (h *Handler) GetMyProjectRole(c *gin.Context) {
 		response.BadRequest(c, "Invalid project id")
 		return
 	}
-	role := h.resolveProjectRole(tenantID, userID, projectID)
+	roles := h.resolveProjectRoles(tenantID, userID, projectID)
+	primary := ""
+	if len(roles) > 0 {
+		primary = roles[0]
+	}
+	// `role` stays the single primary for backward-compat; `roles` is the
+	// full set the frontend uses to decide whether to show the role switcher
+	// and which roles to offer.
 	response.Success(c, gin.H{
-		"role":      role,
-		"assigned":  role != "",
+		"role":     primary,
+		"roles":    roles,
+		"assigned": len(roles) > 0,
 	})
 }
