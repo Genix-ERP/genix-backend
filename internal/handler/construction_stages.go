@@ -80,6 +80,35 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 	}
 	offset := (page - 1) * limit
 
+	// §1b — hide auto-import "ghost" stages. finaliseMaterialsForWork
+	// (construction_work_material_engine.go) auto-creates a stage named after a
+	// work's parent_item_number with status='pending'; when that section is
+	// later renamed/re-imported the row is orphaned (no matching works) and
+	// leaks into Bosqichlar as an empty card. We exclude a stage ONLY when it is
+	// such an auto-created orphan: status='pending' AND no sub-stages AND no
+	// estimate-line works whose section maps to it (exact name OR a "name › …"
+	// nested sub-section, › = U+203A — the same join reja-fakt uses). Gating on
+	// status='pending' guarantees we never hide a user-added empty stage (those
+	// default to 'not_started'), which is exactly the failure mode §1b warns of.
+	// A 'pending' stage that still has works/sub-stages is kept.
+	ghostFilter := `
+		AND NOT (
+			s.status = 'pending'
+			AND NOT EXISTS (
+				SELECT 1 FROM construction_sub_stages gss
+				WHERE gss.stage_id = s.id AND gss.tenant_id = s.tenant_id
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM construction_estimate_line gel
+				JOIN construction_estimate ge ON ge.id = gel.estimate_id AND ge.tenant_id = gel.tenant_id
+				WHERE ge.project_id = s.project_id
+				  AND gel.tenant_id = s.tenant_id
+				  AND COALESCE(gel.resource_type, '') = ''
+				  AND COALESCE(gel.parent_line_id, 0) = 0
+				  AND (gel.parent_item_number = s.name OR gel.parent_item_number LIKE s.name || ' › %')
+			)
+		)`
+
 	query := `
 		SELECT s.id, s.tenant_id, s.project_id, s.building_id, s.name, s.stage_order,
 		       s.status, s.planned_budget, s.planned_start, s.planned_end,
@@ -104,7 +133,7 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		FROM construction_stages s
 		LEFT JOIN construction_expense_lines el ON el.stage_id = s.id AND el.deleted_at IS NULL
 		LEFT JOIN construction_buildings b ON b.id = s.building_id
-		WHERE s.project_id = $1 AND s.tenant_id = $2` + buildingClause + `
+		WHERE s.project_id = $1 AND s.tenant_id = $2` + buildingClause + ghostFilter + `
 		GROUP BY s.id, b.name
 		ORDER BY s.stage_order ASC, s.id ASC
 	`
@@ -263,7 +292,7 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 	total := len(stages)
 	_ = h.db.QueryRow(
 		`SELECT COUNT(*) FROM construction_stages s
-		 WHERE s.project_id = $1 AND s.tenant_id = $2`+buildingClause,
+		 WHERE s.project_id = $1 AND s.tenant_id = $2`+buildingClause+ghostFilter,
 		countArgs...).Scan(&total)
 
 	// Project-wide totals for the summary cards — computed on the first page
