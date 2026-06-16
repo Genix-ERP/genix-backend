@@ -362,6 +362,42 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 		h.log.Error("Failed to update customer followup status", "error", err)
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	// Shared FROM + WHERE so the COUNT mirrors the list filters exactly.
+	fromWhere := `
+		FROM customer_followup_status cfs
+		JOIN contacts c ON c.id = cfs.customer_id
+		LEFT JOIN followup_levels fl ON fl.id = cfs.current_level_id
+		WHERE cfs.tenant_id = $1 AND cfs.total_overdue > 0`
+	whereExtra := ""
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if filter.Status != "" && filter.Status != "all" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND cfs.status = $%d", argCount)
+		args = append(args, filter.Status)
+	}
+
+	if filter.Search != "" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND (c.name ILIKE $%d OR c.email ILIKE $%d)", argCount, argCount)
+		args = append(args, "%"+filter.Search+"%")
+	}
+
+	if filter.MinOverdue != nil {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND cfs.total_overdue >= $%d", argCount)
+		args = append(args, *filter.MinOverdue)
+	}
+
+	if filter.LevelID != "" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND cfs.current_level_id = $%d", argCount)
+		args = append(args, filter.LevelID)
+	}
+
 	query := `
 		SELECT
 			cfs.id, cfs.tenant_id, cfs.customer_id,
@@ -370,40 +406,13 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 			cfs.total_overdue, cfs.oldest_due_date, cfs.days_overdue, cfs.status,
 			cfs.last_followup_date, cfs.next_followup_date, cfs.internal_notes,
 			(SELECT COUNT(*) FROM invoices WHERE customer_id = cfs.customer_id AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total > COALESCE(paid_amount, 0)) as overdue_invoice_count,
-			cfs.created_at, cfs.updated_at
-		FROM customer_followup_status cfs
-		JOIN contacts c ON c.id = cfs.customer_id
-		LEFT JOIN followup_levels fl ON fl.id = cfs.current_level_id
-		WHERE cfs.tenant_id = $1 AND cfs.total_overdue > 0
-	`
-	args := []interface{}{tenantID}
-	argCount := 1
+			cfs.created_at, cfs.updated_at` + fromWhere + whereExtra +
+		" ORDER BY cfs.days_overdue DESC, cfs.total_overdue DESC"
 
-	if filter.Status != "" && filter.Status != "all" {
-		argCount++
-		query += fmt.Sprintf(" AND cfs.status = $%d", argCount)
-		args = append(args, filter.Status)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
 	}
-
-	if filter.Search != "" {
-		argCount++
-		query += fmt.Sprintf(" AND (c.name ILIKE $%d OR c.email ILIKE $%d)", argCount, argCount)
-		args = append(args, "%"+filter.Search+"%")
-	}
-
-	if filter.MinOverdue != nil {
-		argCount++
-		query += fmt.Sprintf(" AND cfs.total_overdue >= $%d", argCount)
-		args = append(args, *filter.MinOverdue)
-	}
-
-	if filter.LevelID != "" {
-		argCount++
-		query += fmt.Sprintf(" AND cfs.current_level_id = $%d", argCount)
-		args = append(args, filter.LevelID)
-	}
-
-	query += " ORDER BY cfs.days_overdue DESC, cfs.total_overdue DESC"
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -460,7 +469,14 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 		followups = append(followups, f)
 	}
 
-	response.Success(c, followups)
+	if !paginate {
+		response.Success(c, followups)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow("SELECT COUNT(*)"+fromWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, followups, page, pageSize, total)
 }
 
 // GetCustomerFollowupDetails returns detailed followup info for a customer

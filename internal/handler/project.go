@@ -682,6 +682,8 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
 	query := `
 		SELECT id, tenant_id, project_id, parent_id, task_number, title, description,
 			   assignee_id, assignee_name, priority, status, due_date,
@@ -689,8 +691,13 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 		FROM project_tasks
 		WHERE project_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 		ORDER BY created_at DESC`
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		response.InternalError(c, "Failed to fetch tasks")
 		return
@@ -737,7 +744,13 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 		tasks = append(tasks, t.ToResponse())
 	}
 
-	response.Success(c, tasks)
+	if !paginate {
+		response.Success(c, tasks)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM project_tasks WHERE project_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, tasks, page, pageSize, total)
 }
 
 // CreateProjectTask creates a new task for a project
@@ -1010,13 +1023,20 @@ func (h *Handler) ListProjectMilestones(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
 	query := `
 		SELECT id, tenant_id, project_id, title, description, due_date, status, completed_date, created_at, updated_at
 		FROM project_milestones
 		WHERE project_id = $1 AND tenant_id = $2
 		ORDER BY due_date ASC`
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		response.InternalError(c, "Failed to fetch milestones")
 		return
@@ -1050,7 +1070,13 @@ func (h *Handler) ListProjectMilestones(c *gin.Context) {
 		milestones = append(milestones, m.ToResponse())
 	}
 
-	response.Success(c, milestones)
+	if !paginate {
+		response.Success(c, milestones)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM project_milestones WHERE project_id = $1 AND tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, milestones, page, pageSize, total)
 }
 
 // CreateProjectMilestone creates a new milestone for a project
@@ -1251,6 +1277,8 @@ func (h *Handler) ListTimeEntries(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
 	query := `
 		SELECT id, tenant_id, project_id, task_id, employee_id, employee_name,
 			   entry_date, hours, description, billable, hourly_rate, amount, status,
@@ -1258,8 +1286,13 @@ func (h *Handler) ListTimeEntries(c *gin.Context) {
 		FROM time_entries
 		WHERE project_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 		ORDER BY entry_date DESC`
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		response.InternalError(c, "Failed to fetch time entries")
 		return
@@ -1310,7 +1343,13 @@ func (h *Handler) ListTimeEntries(c *gin.Context) {
 		entries = append(entries, e.ToResponse())
 	}
 
-	response.Success(c, entries)
+	if !paginate {
+		response.Success(c, entries)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM time_entries WHERE project_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, entries, page, pageSize, total)
 }
 
 // CreateTimeEntry creates a new time entry for a project
@@ -1437,6 +1476,8 @@ func (h *Handler) ListProjectExpenses(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
 	query := `
 		SELECT pe.id, pe.tenant_id, pe.project_id, pe.expense_number, pe.category, pe.description,
 			   pe.amount, pe.currency, pe.expense_date, pe.employee_id, pe.employee_name,
@@ -1447,8 +1488,13 @@ func (h *Handler) ListProjectExpenses(c *gin.Context) {
 		LEFT JOIN contacts c ON pe.vendor_id = c.id
 		WHERE pe.project_id = $1 AND pe.tenant_id = $2 AND pe.deleted_at IS NULL
 		ORDER BY pe.expense_date DESC`
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		response.InternalError(c, "Failed to fetch project expenses")
 		return
@@ -1517,7 +1563,13 @@ func (h *Handler) ListProjectExpenses(c *gin.Context) {
 		expenses = append(expenses, e.ToResponse())
 	}
 
-	response.Success(c, expenses)
+	if !paginate {
+		response.Success(c, expenses)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM project_expenses pe WHERE pe.project_id = $1 AND pe.tenant_id = $2 AND pe.deleted_at IS NULL`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, expenses, page, pageSize, total)
 }
 
 // CreateProjectExpense creates a new expense for a project
