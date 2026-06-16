@@ -75,15 +75,22 @@ func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int6
 		return nil
 	}
 
-	// Identities to match against. CRITICAL: `users.id` (auth) and
-	// `employees.id` are DIFFERENT id spaces, and the data keys off both —
-	// construction_project_team.employee_id holds an EMPLOYEE id, while the
-	// settings role lists store whatever the Settings UI saved
-	// (`employee.user_id || employee.id`). So we resolve the caller's
-	// employee id(s) from their user id and match either one everywhere;
-	// matching only the user id (as the old resolver did) silently missed
-	// team assignments and any settings entry saved with an employee id.
+	// Identities to match against. CRITICAL: `users.id` (auth, what
+	// GetUserID returns) and `employees.id` are DIFFERENT id spaces, and the
+	// construction role lists + team rows key off the EMPLOYEE id. The
+	// authoritative link is `users.employee_id → employees.id`
+	// (employees.user_id is frequently NULL, so the reverse lookup misses).
+	// We therefore match against the user id, the user's linked employee id,
+	// AND — as a fallback — any employee row that points back at this user.
 	idents := []string{userID.String()}
+	employeeID := uuid.Nil
+	var linkedEmp uuid.NullUUID
+	if err := h.db.QueryRow(
+		`SELECT employee_id FROM users WHERE id = $1 AND tenant_id = $2`, userID, tenantID,
+	).Scan(&linkedEmp); err == nil && linkedEmp.Valid && linkedEmp.UUID != uuid.Nil {
+		employeeID = linkedEmp.UUID
+		idents = append(idents, employeeID.String())
+	}
 	if rows, err := h.db.Query(
 		`SELECT id FROM employees WHERE user_id = $1 AND tenant_id = $2`, userID, tenantID,
 	); err == nil {
@@ -116,8 +123,8 @@ func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int6
 		LEFT JOIN employees e ON e.id = pt.employee_id
 		WHERE pt.tenant_id = $1 AND pt.project_id = $2
 		  AND COALESCE(pt.status, 'active') = 'active'
-		  AND (pt.employee_id = $3 OR e.user_id = $3)
-	`, tenantID, projectID, userID); err == nil {
+		  AND (pt.employee_id = $3 OR pt.employee_id = $4 OR e.user_id = $3)
+	`, tenantID, projectID, userID, employeeID); err == nil {
 		for rows.Next() {
 			var raw sql.NullString
 			if rows.Scan(&raw) == nil && raw.Valid {
