@@ -6675,15 +6675,35 @@ func (h *Handler) createDuplicateBuildingTx(
 		tryName = fmt.Sprintf("%s Copy (%d)", srcName, n)
 	}
 
-	// Pick a base code with the same suffix dance as CreateConstructionBuilding,
-	// but driven by attempts rather than a pre-scan because the (project_id,
-	// code) unique index gives us a 23505 we can catch and react to.
+	// Pick a free code by PRE-SCANNING for collisions on (project_id, code),
+	// same as the name dedup above. We must NOT rely on catching the unique
+	// 23505 from a failed INSERT and retrying: inside a transaction the first
+	// failed statement aborts the WHOLE tx ("current transaction is aborted,
+	// commands ignored until end of transaction block"), so a retry INSERT
+	// would always fail. That bug surfaced as "Failed to create duplicate
+	// building" on the 2nd+ duplicate of the same source (its "<code>-COPY"
+	// already existed). A SELECT EXISTS check doesn't error, so it's safe.
 	baseCode := strings.TrimSpace(srcCode)
 	if baseCode == "" {
 		baseCode = "BUILDING"
 	}
 	baseCode = baseCode + "-COPY"
 	tryCode := baseCode
+	for n := 2; n <= 200; n++ {
+		var exists bool
+		if err = tx.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM construction_buildings
+				WHERE project_id = $1 AND tenant_id = $2 AND code = $3
+			)
+		`, projectID, tenantID, tryCode).Scan(&exists); err != nil {
+			return 0, "", "", err
+		}
+		if !exists {
+			break
+		}
+		tryCode = fmt.Sprintf("%s-%d", baseCode, n)
+	}
 
 	const query = `
 		INSERT INTO construction_buildings (
@@ -6701,25 +6721,16 @@ func (h *Handler) createDuplicateBuildingTx(
 		          'draft', $20, NOW(), NOW())
 		RETURNING id
 	`
-	const maxAttempts = 50
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		err = tx.QueryRow(query,
-			tenantID, projectID, tryCode, tryName, description,
-			buildingType, buildingPurpose, floorsCount, floorsUnderground,
-			totalArea, livingArea, nonLivingArea,
-			apartmentsCount, commercialUnitsCount, parkingSpots,
-			estimatedCost, currency,
-			plannedStart, plannedEnd,
-			sortOrder,
-		).Scan(&newID)
-		if err == nil {
-			return newID, tryName, tryCode, nil
-		}
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-			tryCode = fmt.Sprintf("%s-%d", baseCode, attempt+1)
-			continue
-		}
+	if err = tx.QueryRow(query,
+		tenantID, projectID, tryCode, tryName, description,
+		buildingType, buildingPurpose, floorsCount, floorsUnderground,
+		totalArea, livingArea, nonLivingArea,
+		apartmentsCount, commercialUnitsCount, parkingSpots,
+		estimatedCost, currency,
+		plannedStart, plannedEnd,
+		sortOrder,
+	).Scan(&newID); err != nil {
 		return 0, "", "", err
 	}
-	return 0, "", "", fmt.Errorf("could not allocate unique code after %d attempts", maxAttempts)
+	return newID, tryName, tryCode, nil
 }
