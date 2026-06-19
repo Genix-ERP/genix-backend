@@ -237,6 +237,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		contacts.GET("/:id/persons", h.ListContactPersons)
 		contacts.POST("/:id/persons", h.CreateContactPerson)
 		contacts.POST("/:id/rate", h.RateSupplier)
+		// CRM "create customer + sales order + manufacture order" in one save,
+		// and the customer's sales history (links to sales detail on the front-end).
+		contacts.POST("/full-order", h.CreateCustomerWithFullOrder)
+		contacts.GET("/:id/sales", h.ListContactSalesHistory)
 	}
 
 	// Call Logs (CRM PBX Integration)
