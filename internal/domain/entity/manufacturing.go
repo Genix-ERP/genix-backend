@@ -334,6 +334,9 @@ type ProductionOrderResponse struct {
 	Stages               []ProductionOrderStageResponse `json:"stages,omitempty"`
 	ManufacturingCategoryID   *uuid.UUID `json:"manufacturing_category_id,omitempty"`
 	ManufacturingCategoryName *string    `json:"manufacturing_category_name,omitempty"`
+	// Customer the production order is for (via po.customer_id → contacts),
+	// shown on the Shop Floor card so operators see who they're building for.
+	CustomerName         *string    `json:"customer_name,omitempty"`
 	// Sales order link (populated when the production order was
 	// created from a sales order — frontend shows the SO number on
 	// the Stage Workflow modal so operators see what they're

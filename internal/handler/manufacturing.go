@@ -923,7 +923,8 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
 			   po.work_center_id, wc.name as work_center_name, po.requires_quality_check, po.quality_status,
 			   po.notes, po.tags, po.created_by, po.confirmed_at, po.completed_at, po.created_at, po.updated_at,
-			   po.manufacturing_category_id, mc.name as manufacturing_category_name
+			   po.manufacturing_category_id, mc.name as manufacturing_category_name,
+			   cust.name as customer_name
 		FROM production_orders po
 		LEFT JOIN products p ON po.product_id = p.id
 		LEFT JOIN product_boms b ON po.bom_id = b.id
@@ -931,6 +932,7 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		LEFT JOIN users u ON po.assigned_to = u.id
 		LEFT JOIN work_centers wc ON po.work_center_id = wc.id
 		LEFT JOIN manufacturing_categories mc ON po.manufacturing_category_id = mc.id
+		LEFT JOIN contacts cust ON po.customer_id = cust.id
 		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
 	`
 
@@ -1065,7 +1067,7 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	orders := []entity.ProductionOrderResponse{}
 	for rows.Next() {
 		var po entity.ProductionOrderResponse
-		var bomName, warehouseName, assignedToName, workCenterName, shift, categoryName sql.NullString
+		var bomName, warehouseName, assignedToName, workCenterName, shift, categoryName, customerName sql.NullString
 		var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 		var tags []byte
 
@@ -1079,7 +1081,7 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 			&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
 			&po.WorkCenterID, &workCenterName, &po.RequiresQualityCheck, &po.QualityStatus,
 			&po.Notes, &tags, &po.CreatedBy, &confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
-			&po.ManufacturingCategoryID, &categoryName,
+			&po.ManufacturingCategoryID, &categoryName, &customerName,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan production order", "error", err)
@@ -1103,6 +1105,9 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		}
 		if categoryName.Valid {
 			po.ManufacturingCategoryName = &categoryName.String
+		}
+		if customerName.Valid {
+			po.CustomerName = &customerName.String
 		}
 		if scheduledStart.Valid {
 			s := scheduledStart.Time.Format("2006-01-02")
