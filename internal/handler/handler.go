@@ -200,6 +200,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		orgs.DELETE("/:id", h.perm.Require("organization", "organization", "delete"), h.DeleteOrganization)
 		// Initialize default accounts for organization
 		orgs.POST("/:id/initialize-accounts", h.perm.Require("organization", "organization", "update"), h.InitializeOrganizationAccounts)
+		// Restore (un-delete) all soft-deleted accounts for an organization.
+		orgs.POST("/:id/restore-accounts", h.perm.Require("organization", "organization", "update"), h.RestoreOrganizationAccounts)
 		// Organization employees
 		orgs.GET("/:id/employees", h.ListOrganizationEmployees)
 	}
@@ -2180,6 +2182,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// server-side so mobile doesn't have to download every line to show
 		// the headline numbers. See construction_estimate_summary.go.
 		estimates.GET("/:id/summary", h.GetEstimateSummary)
+		// Server-side calcs for mobile (which can't replicate the web math):
+		// Bosqichlar progress roll-ups + Forma 2 money summary.
+		estimates.GET("/:id/stages-progress", h.GetEstimateStagesProgress)
+		estimates.GET("/:id/forma2-summary", h.GetEstimateForma2Summary)
 		// Estimate Lines
 		estimates.GET("/:id/lines", h.ListEstimateLines)
 		estimates.POST("/:id/lines", h.perm.Require("construction", "estimate", "update"), h.CreateEstimateLine)
