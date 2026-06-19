@@ -117,14 +117,14 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 
 	// ---- 2. Resolve product's default BOM + cost rollup ----
 	var bomID sql.NullString
-	_ = tx.QueryRow(`
+	_ = h.db.QueryRow(`
 		SELECT id::text FROM product_boms
 		WHERE product_id=$1 AND tenant_id=$2 AND is_active=true AND deleted_at IS NULL
 		ORDER BY is_default DESC, created_at DESC LIMIT 1`, productID, tenantID).Scan(&bomID)
 
 	var bomCost float64
 	if bomID.Valid {
-		_ = tx.QueryRow(`
+		_ = h.db.QueryRow(`
 			SELECT COALESCE(SUM(bl.quantity * COALESCE(p.cost_price,0) * $1
 			       / GREATEST(COALESCE(pb.quantity,1),1) * (1 + COALESCE(bl.scrap_percent,0)/100.0)),0)
 			FROM bom_lines bl
@@ -185,7 +185,10 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 	productionOrderID := uuid.New()
 	moCode := h.nextProductionOrderCode(tenantID)
 	var prodUOM string
-	_ = tx.QueryRow(`SELECT COALESCE(uom,'pcs') FROM products WHERE id=$1 AND tenant_id=$2`, productID, tenantID).Scan(&prodUOM)
+	// products has no `uom` column — the unit lives in units_of_measure via unit_id.
+	_ = h.db.QueryRow(`SELECT COALESCE(u.name, 'pcs') FROM products p
+		LEFT JOIN units_of_measure u ON u.id = p.unit_id
+		WHERE p.id=$1 AND p.tenant_id=$2`, productID, tenantID).Scan(&prodUOM)
 	if prodUOM == "" {
 		prodUOM = "pcs"
 	}
