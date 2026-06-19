@@ -114,7 +114,7 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		SELECT s.id, s.tenant_id, s.project_id, s.building_id, s.name, s.stage_order,
 		       s.status, s.planned_budget, s.planned_start, s.planned_end,
 		       s.actual_start, s.actual_end, s.notes, s.created_at, s.updated_at,
-		       b.name AS building_name, b.id AS building_id,
+		       b.name AS building_name,
 		       COALESCE(SUM(CASE WHEN el.status = 'approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual_amount,
 		       COALESCE((SELECT SUM(m.total_cost) FROM construction_sub_stage_materials m
 		                 JOIN construction_sub_stages ss ON ss.id = m.sub_stage_id
