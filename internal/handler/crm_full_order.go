@@ -212,7 +212,13 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 	// is unsafe; instead call it within this tx is not possible (helper uses h.db).
 	// We therefore defer work-order generation + extra-component attach to AFTER commit.
 
-	// ---- 5. Stash extra components to attach after commit ----
+	// ---- 4b. Upfront payment → posted cash-receipt (DR Cash / CR AR) ----
+	glPosted := false
+	if paid > 0 {
+		glPosted = h.postUpfrontReceipt(tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber, paid, userID, now)
+	}
+
+	// ---- 5. Commit, then generate work orders + attach extras ----
 	if err := tx.Commit(); err != nil {
 		h.log.Error("full-order: commit", "error", err)
 		response.InternalError(c, "Failed to save: "+err.Error())
@@ -240,7 +246,106 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 		"total":               total,
 		"paid":                paid,
 		"remaining":           total - paid,
+		"gl_posted":           glPosted,
 	})
+}
+
+// postUpfrontReceipt posts a cash-receipt journal entry (DR Cash / CR Accounts
+// Receivable) for the upfront amount, inside the given tx, mirroring
+// ConfirmPayment's receipt logic. Best-effort: if the cash/AR account or a
+// journal can't be resolved it logs and returns false — the order still
+// succeeds, just without a GL entry (so a half-configured chart of accounts
+// can't block creating the order).
+func (h *Handler) postUpfrontReceipt(tx *sql.Tx, tenantID, orgID uuid.UUID, orgArg interface{},
+	customerID, salesOrderID uuid.UUID, orderNumber string, amount float64, userID uuid.UUID, now time.Time) bool {
+	if amount <= 0 {
+		return false
+	}
+	var orgPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgPtr = &orgID
+	}
+	// Cash/bank account.
+	cashAccountID := findAccount(tx, tenantID, orgPtr, "kassa", "5010")
+	if cashAccountID == uuid.Nil {
+		cashAccountID = findAccount(tx, tenantID, orgPtr, "bank", "5110")
+	}
+	// AR account: prefer the customer's default, else by name/code.
+	var arStr sql.NullString
+	_ = tx.QueryRow(`SELECT default_receivable_account_id::text FROM contacts WHERE id=$1 AND tenant_id=$2`, customerID, tenantID).Scan(&arStr)
+	var arAccountID uuid.UUID
+	if arStr.Valid && arStr.String != "" {
+		arAccountID, _ = uuid.Parse(arStr.String)
+	}
+	if arAccountID == uuid.Nil {
+		arAccountID = findAccount(tx, tenantID, orgPtr, "debitor", "4010")
+	}
+	if arAccountID == uuid.Nil {
+		arAccountID = findAccount(tx, tenantID, orgPtr, "receivable", "4010")
+	}
+	if cashAccountID == uuid.Nil || arAccountID == uuid.Nil {
+		h.log.Error("full-order: cannot resolve cash/AR account; GL not posted", "cash", cashAccountID, "ar", arAccountID)
+		return false
+	}
+
+	// Journal: prefer a cash journal, then GENERAL, then any — scoped to org.
+	var journalID uuid.UUID
+	var nextNumber int
+	var numberPrefix sql.NullString
+	_ = tx.QueryRow(`
+		SELECT id, COALESCE(next_number,1), number_prefix
+		FROM journals
+		WHERE tenant_id=$1 AND deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR organization_id = $2 OR organization_id IS NULL)
+		ORDER BY CASE WHEN LOWER(COALESCE(type,''))='cash' THEN 0 WHEN code='GENERAL' THEN 1 ELSE 2 END,
+		         CASE WHEN organization_id = $2 THEN 0 ELSE 1 END
+		LIMIT 1`, tenantID, orgArg).Scan(&journalID, &nextNumber, &numberPrefix)
+	if journalID == uuid.Nil {
+		h.log.Error("full-order: no journal found; GL not posted")
+		return false
+	}
+
+	prefix := ""
+	if numberPrefix.Valid {
+		prefix = numberPrefix.String
+	}
+	var maxNum int
+	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number,'[^0-9]','','g') AS BIGINT)),0)
+		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL`, tenantID, journalID).Scan(&maxNum)
+	actualNum := maxNum + 1
+	if nextNumber > actualNum {
+		actualNum = nextNumber
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, actualNum)
+	desc := fmt.Sprintf("%s — oldindan to'lov (upfront)", orderNumber)
+
+	jeID := uuid.New()
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+		                             source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'payment_receipt',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
+		jeID, tenantID, orgArg, journalID, entryNumber, now, orderNumber, desc, salesOrderID.String(), amount, userID, now); err != nil {
+		h.log.Error("full-order: journal entry insert failed; GL not posted", "error", err)
+		return false
+	}
+	// DR Cash (no contact on the cash line).
+	if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+		VALUES ($1,$2,1,$3,NULL,$4,$5,0,1.0,$6)`, uuid.New(), jeID, cashAccountID, desc, amount, now); err != nil {
+		h.log.Error("full-order: cash line insert failed", "error", err)
+		return false
+	}
+	// CR Accounts Receivable (customer on the AR line).
+	if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+		VALUES ($1,$2,2,$3,$4,$5,0,$6,1.0,$7)`, uuid.New(), jeID, arAccountID, customerID, desc, amount, now); err != nil {
+		h.log.Error("full-order: AR line insert failed", "error", err)
+		return false
+	}
+	// Balances + journal counter + denormalized customer balance (prepaid → AR down).
+	tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, amount, now, cashAccountID)
+	tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, amount, now, arAccountID)
+	tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id=$1`, journalID)
+	tx.Exec(`UPDATE contacts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, amount, now, customerID)
+	return true
 }
 
 // attachExtraComponents adds the user-entered extra components to the MO. If a
