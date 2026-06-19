@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -116,7 +117,7 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		SELECT s.id, s.tenant_id, s.project_id, s.building_id, s.name, s.stage_order,
 		       s.status, s.planned_budget, s.planned_start, s.planned_end,
 		       s.actual_start, s.actual_end, s.notes, s.created_at, s.updated_at,
-		       b.name AS building_name,
+		       b.name AS building_name, b.id AS building_id,
 		       COALESCE(SUM(CASE WHEN el.status = 'approved' AND el.deleted_at IS NULL THEN el.amount ELSE 0 END), 0) AS actual_amount,
 		       COALESCE((SELECT SUM(m.total_cost) FROM construction_sub_stage_materials m
 		                 JOIN construction_sub_stages ss ON ss.id = m.sub_stage_id
@@ -1175,7 +1176,7 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		       s.status,
 		       s.planned_start, s.planned_end,
 		       s.actual_start,  s.actual_end,
-		       b.name AS building_name,
+		       b.name AS building_name, b.id AS building_id,
 		       COALESCE((SELECT COUNT(*)
 		                 FROM construction_sub_stages x
 		                 WHERE x.stage_id = s.id AND x.tenant_id = s.tenant_id), 0) AS sub_total,
@@ -1198,7 +1199,7 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		       s.planned_start, s.planned_end,
 		       COALESCE(ss.actual_start, s.actual_start) AS actual_start,
 		       COALESCE(ss.actual_end,   s.actual_end)   AS actual_end,
-		       b.name AS building_name,
+		       b.name AS building_name, b.id AS building_id,
 		       1 AS sub_total,
 		       (CASE WHEN ss.status = 'completed' THEN 1 ELSE 0 END) AS sub_done
 		FROM construction_sub_stages ss
@@ -1224,7 +1225,7 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		       NULL::date AS planned_end,
 		       NULL::date AS actual_start,
 		       NULL::date AS actual_end,
-		       b.name AS building_name,
+		       b.name AS building_name, b.id AS building_id,
 		       -- Use plan/done quantity as the progress source. Mapping
 		       -- onto the existing sub_total/sub_done columns lets the
 		       -- downstream code path stay uniform with stages.
@@ -1265,6 +1266,7 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		ActualStart  *string  `json:"actual_start"`
 		ActualEnd    *string  `json:"actual_end"`
 		BuildingName *string  `json:"building_name"`
+		BuildingID   *int64   `json:"building_id"`
 		ProgressPct  float64  `json:"progress_pct"`
 		Bucket       string   `json:"bucket"` // on_track | behind
 	}
@@ -1276,6 +1278,7 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		var it Item
 		var parentID sql.NullInt64
 		var parentName, buildingName sql.NullString
+		var buildingID sql.NullInt64
 		var plannedStartT, plannedEndT, actualStartT, actualEndT sql.NullTime
 		var subTotal, subDone int64
 		if err := rows.Scan(
@@ -1283,7 +1286,7 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 			&it.Name, &it.Status,
 			&plannedStartT, &plannedEndT,
 			&actualStartT, &actualEndT,
-			&buildingName,
+			&buildingName, &buildingID,
 			&subTotal, &subDone,
 		); err != nil {
 			h.log.Error("Failed to scan in-progress item", "error", err)
@@ -1316,6 +1319,10 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		if buildingName.Valid {
 			v := buildingName.String
 			it.BuildingName = &v
+		}
+		if buildingID.Valid {
+			v := buildingID.Int64
+			it.BuildingID = &v
 		}
 
 		// Progress policy:
@@ -1398,14 +1405,108 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 		avgPct = sumPct / float64(total)
 	}
 
-	response.Success(c, map[string]interface{}{
-		"project_id": projectID,
-		"items":      items,
-		"kpis": map[string]interface{}{
-			"total":    total,
-			"on_track": onTrack,
-			"behind":   behind,
-			"avg_pct":  avgPct,
+	kpis := map[string]interface{}{
+		"total":     total,
+		"on_track":  onTrack,
+		"behind":    behind,
+		"completed": 0,
+		"avg_pct":   avgPct,
+	}
+
+	// Backward compatible: no page_size → today's full-array shape (web client).
+	sizeStr := c.Query("page_size")
+	if sizeStr == "" {
+		response.Success(c, map[string]interface{}{
+			"project_id": projectID,
+			"items":      items,
+			"kpis":       kpis,
+		})
+		return
+	}
+
+	// ── Paginated (mobile, §13): one building's on_track items, 20/page ──
+	page, _ := strconv.Atoi(c.Query("page"))
+	pageSize, _ := strconv.Atoi(sizeStr)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 20
+	}
+
+	// summary.buildings — distinct on_track items that have a building, counted,
+	// sorted by natural building-name order. Drives the block tabs.
+	type bsum struct {
+		name  string
+		count int
+	}
+	bmap := map[int64]*bsum{}
+	var border []int64
+	for _, it := range items {
+		if it.Bucket != "on_track" || it.BuildingID == nil {
+			continue
+		}
+		bid := *it.BuildingID
+		if bmap[bid] == nil {
+			name := ""
+			if it.BuildingName != nil {
+				name = *it.BuildingName
+			}
+			bmap[bid] = &bsum{name: name}
+			border = append(border, bid)
+		}
+		bmap[bid].count++
+	}
+	sort.Slice(border, func(i, j int) bool { return bmap[border[i]].name < bmap[border[j]].name })
+	buildings := make([]map[string]interface{}, 0, len(border))
+	for _, bid := range border {
+		buildings = append(buildings, map[string]interface{}{
+			"building_id": bid, "building_name": bmap[bid].name, "count": bmap[bid].count,
+		})
+	}
+
+	// Resolve the target building: explicit ?building_id, else the first block.
+	var targetBID int64
+	if raw := strings.TrimSpace(c.Query("building_id")); raw != "" {
+		if v, e := strconv.ParseInt(raw, 10, 64); e == nil {
+			targetBID = v
+		}
+	} else if len(border) > 0 {
+		targetBID = border[0]
+	}
+
+	// Filter to that building's on_track items, then slice the page.
+	filtered := []Item{}
+	for _, it := range items {
+		if it.Bucket == "on_track" && it.BuildingID != nil && *it.BuildingID == targetBID {
+			filtered = append(filtered, it)
+		}
+	}
+	totalForBuilding := len(filtered)
+	start := (page - 1) * pageSize
+	if start > totalForBuilding {
+		start = totalForBuilding
+	}
+	end := start + pageSize
+	if end > totalForBuilding {
+		end = totalForBuilding
+	}
+	pageItems := filtered[start:end]
+	totalPages := 0
+	if pageSize > 0 {
+		totalPages = (totalForBuilding + pageSize - 1) / pageSize
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    pageItems,
+		"meta": gin.H{
+			"page": page, "page_size": pageSize, "total": totalForBuilding,
+			"total_pages": totalPages, "has_next": page < totalPages, "building_id": targetBID,
+		},
+		"summary": gin.H{
+			"buildings": buildings,
+			"kpis":      kpis,
 		},
 	})
 }
