@@ -753,7 +753,10 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		const workPredicate = `
 			AND COALESCE(resource_type, '') = ''
 			AND COALESCE(parent_line_id, 0) = 0
-			AND (parent_item_number = $3 OR parent_item_number LIKE $3 || ' › %')`
+			AND (parent_item_number = $3
+			     OR parent_item_number LIKE $3 || ' › %'
+			     OR parent_item_number LIKE '% › ' || $3
+			     OR parent_item_number LIKE '% › ' || $3 || ' › %')`
 
 		// total = number of matched works (paging is over works).
 		h.db.QueryRow(
