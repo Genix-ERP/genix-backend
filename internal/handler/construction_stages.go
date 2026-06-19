@@ -105,7 +105,10 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 				  AND gel.tenant_id = s.tenant_id
 				  AND COALESCE(gel.resource_type, '') = ''
 				  AND COALESCE(gel.parent_line_id, 0) = 0
-				  AND (gel.parent_item_number = s.name OR gel.parent_item_number LIKE s.name || ' › %')
+				  AND (gel.parent_item_number = s.name
+				       OR gel.parent_item_number LIKE s.name || ' › %'
+				       OR gel.parent_item_number LIKE '% › ' || s.name
+				       OR gel.parent_item_number LIKE '% › ' || s.name || ' › %')
 			)
 		)`
 
@@ -520,7 +523,10 @@ func (h *Handler) GetConstructionStageWorks(c *gin.Context) {
 		AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
 		AND COALESCE(el.resource_type, '') = ''
 		AND COALESCE(el.parent_line_id, 0) = 0
-		AND regexp_replace(COALESCE(el.parent_item_number, ''), '^.*›\s*', '') = $3`
+		AND (el.parent_item_number = $3
+		     OR el.parent_item_number LIKE $3 || ' › %'
+		     OR el.parent_item_number LIKE '% › ' || $3
+		     OR el.parent_item_number LIKE '% › ' || $3 || ' › %')`
 	args := []interface{}{tenantID, projectID, stageName}
 	if buildingID.Valid {
 		where += ` AND e.building_id = $4`
