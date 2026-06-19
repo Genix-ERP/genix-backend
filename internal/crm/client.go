@@ -10,13 +10,15 @@
 //	CRM_USERNAME   phone number of the service user (CRM uses phone as the login field)
 //	CRM_PASSWORD   that user's password
 //
-// On first request the client POSTs to /mobile/token/ to get access +
-// refresh tokens. The access token lasts a short while (typically 5–15
-// min); when a request returns 401, the client transparently POSTs to
-// /mobile/token/refresh/ to get a fresh access token. If the refresh
-// token has also expired (or been blacklisted), the client re-logs in
-// with username+password. Tokens are cached in memory only — never on
-// disk — so they vanish on restart and a fresh login happens.
+// On first request the client POSTs to /users/login/ (PasswordLoginView)
+// to get access + refresh tokens — this is the same endpoint the CRM
+// frontend uses, with rate limiting and lockout protection. The access
+// token lasts a short while (typically 5–15 min); when a request
+// returns 401, the client transparently POSTs to /mobile/token/refresh/
+// to get a fresh access token. If the refresh token has also expired
+// (or been blacklisted), the client re-logs in with username+password.
+// Tokens are cached in memory only — never on disk — so they vanish on
+// restart and a fresh login happens.
 //
 // If any of the three env vars are unset, every method returns
 // ErrNotConfigured so callers can short-circuit gracefully (no sync,
@@ -96,19 +98,25 @@ func (c *Client) Configured() bool {
 	return c.baseURL != "" && c.username != "" && c.password != ""
 }
 
-// login POSTs username + password to /mobile/token/ and caches both
-// tokens. Holds c.mu while writing the tokens.
+// login POSTs username + password to /users/login/ (same endpoint the
+// CRM web frontend uses) and caches both tokens. Holds c.mu while
+// writing the tokens.
 func (c *Client) login() error {
 	body, _ := json.Marshal(map[string]string{
 		"phone":    c.username,
 		"password": c.password,
 	})
-	req, err := http.NewRequest("POST", c.baseURL+"/mobile/token/", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", c.baseURL+"/users/login/", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// When CRM_API_BASE is the internal http://yuksalish-backend:8000 URL,
+	// Django's SECURE_SSL_REDIRECT would 301 us to https. Telling it we
+	// already came in via TLS (the way nginx does for browser traffic)
+	// short-circuits that. Harmless when the base is already https://.
+	req.Header.Set("X-Forwarded-Proto", "https")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("crm login: %w", err)
@@ -152,6 +160,7 @@ func (c *Client) tryRefresh() error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Forwarded-Proto", "https")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -221,6 +230,7 @@ func (c *Client) do(reqBuilder func() (*http.Request, error)) (*http.Response, e
 		c.mu.Unlock()
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
+		req.Header.Set("X-Forwarded-Proto", "https")
 		return c.httpClient.Do(req)
 	}
 
@@ -304,8 +314,10 @@ func (c *Client) decodeOrError(resp *http.Response, out interface{}) error {
 }
 
 // ListProjects fetches every CRM project the service user can see.
+// CRM mounts ProjectViewSet at the root of /api/projects/ (the router
+// registers it with r''), not at /api/projects/projects/.
 func (c *Client) ListProjects() ([]Project, error) {
-	resp, err := c.do(jsonReqBuilder("GET", c.baseURL+"/projects/projects/", nil))
+	resp, err := c.do(jsonReqBuilder("GET", c.baseURL+"/projects/", nil))
 	if err != nil {
 		return nil, err
 	}

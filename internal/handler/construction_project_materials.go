@@ -24,7 +24,8 @@ func (h *Handler) ListProjectMaterials(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	paginate, page, pageSize, offset := optPagination(c)
+	query := `
 		SELECT pm.id, pm.tenant_id, pm.project_id, pm.product_id, pm.product_name, pm.uom,
 		       pm.approved_quantity, pm.unit_cost, pm.created_date, pm.updated_date,
 		       COALESCE(
@@ -38,8 +39,13 @@ func (h *Handler) ListProjectMaterials(c *gin.Context) {
 		       0) as assigned_quantity
 		FROM construction_project_materials pm
 		WHERE pm.tenant_id = $1 AND pm.project_id = $2
-		ORDER BY pm.product_name
-	`, tenantID, projectID)
+		ORDER BY pm.product_name`
+	args := []interface{}{tenantID, projectID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list project materials", "error", err)
 		response.InternalError(c, "Failed to list project materials")
@@ -81,5 +87,14 @@ func (h *Handler) ListProjectMaterials(c *gin.Context) {
 		materials = []ProjectMaterial{}
 	}
 
-	response.Success(c, materials)
+	if !paginate {
+		response.Success(c, materials)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_project_materials pm WHERE pm.tenant_id = $1 AND pm.project_id = $2`,
+		tenantID, projectID,
+	).Scan(&total)
+	response.Paginated(c, materials, page, pageSize, total)
 }

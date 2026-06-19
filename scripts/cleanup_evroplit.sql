@@ -57,6 +57,15 @@ DELETE FROM sales_invoices WHERE organization_id = org;
 DELETE FROM sales_order_lines WHERE sales_order_id IN (
     SELECT id FROM sales_orders WHERE organization_id = org
 );
+-- Wipe inventory_transactions that reference these sales_orders BEFORE
+-- the parent rows go. Without this we leave dangling reference_id rows
+-- (production incident: 19 such orphans across 6 products bled −278.75
+-- units off on-hand after one of these scripts ran). The matching
+-- inventory.quantity_on_hand cache will need to be rebuilt after this
+-- cleanup — see comment block at end.
+DELETE FROM inventory_transactions
+WHERE reference_type = 'sales_order'
+  AND reference_id IN (SELECT id FROM sales_orders WHERE organization_id = org);
 DELETE FROM sales_orders WHERE organization_id = org;
 DELETE FROM sales_quotation_items WHERE quotation_id IN (
     SELECT id FROM sales_quotations WHERE organization_id = org

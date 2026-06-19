@@ -50,9 +50,9 @@ var rejaFaktCache sync.Map // map[string]*rejaFaktCacheEntry
 
 const rejaFaktCacheTTL = 15 * time.Second
 
-func rejaFaktCacheKey(tenantID uuid.UUID, projectID int64, buildingFilter, statusFilter, stageFilter string) string {
-	return fmt.Sprintf("%s|%d|%s|%s|%s",
-		tenantID.String(), projectID, buildingFilter, statusFilter, stageFilter)
+func rejaFaktCacheKey(tenantID uuid.UUID, projectID int64, buildingFilter, statusFilter, stageFilter string, page, limit int) string {
+	return fmt.Sprintf("%s|%d|%s|%s|%s|%d|%d",
+		tenantID.String(), projectID, buildingFilter, statusFilter, stageFilter, page, limit)
 }
 
 // stageNameFromPath extracts the human-facing stage name from a row's
@@ -97,11 +97,37 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	statusFilter := c.Query("status")
 	buildingFilter := c.Query("building_id")
 
+	// Optional, opt-in pagination of the top-level stages (mirrors
+	// construction_stages.go). Mobile sends page+limit so the per-block
+	// payload stays small; when NEITHER is present we return the whole block
+	// exactly as before, so the web client (client-side slicing) is unaffected.
+	//
+	// The summary stays BLOCK-WIDE: we still load, assemble and total every
+	// stage in the block, and only the returned `stages` array is sliced to
+	// the page. This guarantees the summary cards keep equalling the sum of
+	// all rows (the plan/fact resolution is intricate; recomputing it over a
+	// page would drift), at the cost of a block-wide assembly per request —
+	// the 15s response cache absorbs repeat reads.
+	pageStr := c.Query("page")
+	limitStr := c.Query("limit")
+	paginate := pageStr != "" || limitStr != ""
+	page, limit := 1, 20
+	if v, e := strconv.Atoi(pageStr); e == nil && v > 0 {
+		page = v
+	}
+	if v, e := strconv.Atoi(limitStr); e == nil && v > 0 {
+		if v > 100 {
+			v = 100
+		}
+		limit = v
+	}
+	offset := (page - 1) * limit
+
 	// Cache check — return memoised JSON when fresh. Skip when the
 	// request carries a `?refresh=1` flag so the user can force-bust
 	// the cache after a YAKUNIY confirm or qty edit if they don't
 	// want to wait the 15s TTL.
-	cacheKey := rejaFaktCacheKey(tenantID, projectID, buildingFilter, statusFilter, stageFilter)
+	cacheKey := rejaFaktCacheKey(tenantID, projectID, buildingFilter, statusFilter, stageFilter, page, limit)
 	if c.Query("refresh") != "1" {
 		if v, ok := rejaFaktCache.Load(cacheKey); ok {
 			entry := v.(*rejaFaktCacheEntry)
@@ -201,7 +227,14 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 				"material_plan_total": 0, "material_fact_total": 0,
 				"equipment_plan_total": 0, "equipment_fact_total": 0,
 				"plan_total": 0, "fact_total": 0, "difference": 0,
+				"completion_pct": 0,
 			},
+		}
+		if paginate {
+			emptyPayload["meta"] = map[string]interface{}{
+				"page": page, "limit": limit, "total": 0,
+				"total_pages": 0, "has_next": false, "has_prev": page > 1,
+			}
 		}
 		// Cache empty results too — projects with no stages render
 		// repeatedly while the user explores filters and shouldn't
@@ -1116,6 +1149,59 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		effectivePlan = importedBudgetTotal
 	}
 
+	// completion_pct — block-wide "Bajarilish" card. Per stage =
+	// completed_sub_stages / total_sub_stages * 100, then averaged across the
+	// stages that have sub-stages (matches the web getSubStageProgress).
+	// Computed over the WHOLE block (subStagesMap holds every block sub-stage),
+	// so it stays correct regardless of which page is returned.
+	var completionPctSum float64
+	var completionStageCount int
+	for _, sid := range stagesOrder {
+		subs := subStagesMap[sid]
+		if len(subs) == 0 {
+			continue
+		}
+		completed := 0
+		for _, ss := range subs {
+			if ss.Status == "completed" {
+				completed++
+			}
+		}
+		completionPctSum += float64(completed) / float64(len(subs)) * 100
+		completionStageCount++
+	}
+	completionPct := 0.0
+	if completionStageCount > 0 {
+		completionPct = completionPctSum / float64(completionStageCount)
+	}
+
+	// Pagination: total = block-wide top-level stage count. Slice the assembled
+	// tree to the requested page; the summary above is unaffected.
+	total := len(stages)
+	var meta map[string]interface{}
+	if paginate {
+		start := offset
+		if start > len(stages) {
+			start = len(stages)
+		}
+		end := start + limit
+		if end > len(stages) {
+			end = len(stages)
+		}
+		stages = stages[start:end]
+
+		totalPages := 0
+		if limit > 0 {
+			totalPages = (total + limit - 1) / limit
+		}
+		meta = map[string]interface{}{
+			"page": page, "limit": limit, "total": total,
+			"total_pages": totalPages,
+			"has_next":    page < totalPages,
+			"has_prev":    page > 1,
+		}
+	}
+
 	payload := map[string]interface{}{
 		"stages": stages,
 		"summary": map[string]interface{}{
@@ -1126,15 +1212,19 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			// plan_total now prefers the imported budget. Frontend can
 			// still distinguish derived vs imported via plan_total_derived
 			// and imported_budget below.
-			"plan_total":           effectivePlan,
-			"plan_total_derived":   planTotal,
-			"imported_budget":      importedBudgetTotal,
-			"imported_material":    importedMaterialBudget,
-			"imported_transport":   importedTransportBudget,
-			"fact_total":           factTotal,
-			"difference":           effectivePlan - factTotal,
-			"budget_used_pct":      budgetPct(factTotal, effectivePlan),
+			"plan_total":         effectivePlan,
+			"plan_total_derived": planTotal,
+			"imported_budget":    importedBudgetTotal,
+			"imported_material":  importedMaterialBudget,
+			"imported_transport": importedTransportBudget,
+			"fact_total":         factTotal,
+			"difference":         effectivePlan - factTotal,
+			"budget_used_pct":    budgetPct(factTotal, effectivePlan),
+			"completion_pct":     completionPct,
 		},
+	}
+	if meta != nil {
+		payload["meta"] = meta
 	}
 	cacheRejaFaktResponse(cacheKey, payload)
 	response.Success(c, payload)

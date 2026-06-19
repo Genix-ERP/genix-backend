@@ -938,7 +938,7 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 	if err == nil {
 		// Odoo-style: Debit Stock Interim Receipt (per category), Credit AP
 		// 1. Try vendor's default payable account
-		apAccountID := getContactDefaultAccount(tx, vendorID, "payable")
+		apAccountID := getContactDefaultAccount(tx, vendorID, "payable", organizationID)
 		// 2. Fallback to standard findAccount
 		if apAccountID == uuid.Nil {
 			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "6010")

@@ -12,6 +12,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -39,6 +40,24 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		scopeFilter = "AND e.subcontract_id IS NOT NULL"
 	}
 
+	// Opt-in pagination — only when the client explicitly asks. Absent →
+	// full list (today's behaviour), which the web Smetalar tab and Smeta
+	// boshqaruvi block selector rely on to build block options / totals.
+	// Mobile sends page+page_size to page the version cards. Mirrors
+	// ListEstimateLines (same response.Paginated envelope).
+	pageStr := c.Query("page")
+	sizeStr := c.Query("page_size")
+	paginate := pageStr != "" || sizeStr != ""
+	page, _ := strconv.Atoi(pageStr)
+	pageSize, _ := strconv.Atoi(sizeStr)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
+
 	// Pre-aggregate line counts in a CTE rather than running a
 	// correlated `(SELECT COUNT(*) ...)` subquery for every estimate
 	// row. On tenants with hundreds of estimates the old per-row form
@@ -50,6 +69,32 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 	// so it only counts the slice we actually render. With migration
 	// 378's covering index (tenant_id, estimate_id) this becomes a
 	// single index-only scan + GROUP BY hash aggregate.
+	//
+	// Optional building/block filter (mobile Smetalar block selector). When a
+	// numeric building_id is present, scope estimates to that block; absent or
+	// the "Hammasi" chip (no param) → all estimates, as today. Placeholder
+	// indexes are computed dynamically so building_id ($3) and the LIMIT/OFFSET
+	// pagination args compose correctly.
+	var buildingID int
+	hasBuilding := false
+	if bid := strings.TrimSpace(c.Query("building_id")); bid != "" {
+		if id, e := strconv.Atoi(bid); e == nil && id > 0 {
+			buildingID = id
+			hasBuilding = true
+		}
+	}
+
+	args := []interface{}{projectID, tenantID}
+	buildingFilter := ""
+	if hasBuilding {
+		args = append(args, buildingID)
+		buildingFilter = fmt.Sprintf("AND e.building_id = $%d", len(args))
+	}
+	limitClause := ""
+	if paginate {
+		limitClause = fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
 	query := fmt.Sprintf(`
 		WITH estimate_line_counts AS (
 		    SELECT l.estimate_id, COUNT(*)::int AS lines_count
@@ -76,11 +121,11 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		LEFT JOIN users uc ON uc.id = e.created_by
 		LEFT JOIN construction_buildings b ON b.id = e.building_id
 		LEFT JOIN construction_subcontract sc ON sc.id = e.subcontract_id
-		WHERE e.project_id = $1 AND e.tenant_id = $2 %s
-		ORDER BY e.version DESC
-	`, scopeFilter)
+		WHERE e.project_id = $1 AND e.tenant_id = $2 %s %s
+		ORDER BY e.version DESC, e.id DESC%s
+	`, scopeFilter, buildingFilter, limitClause)
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list estimates", "error", err)
 		response.InternalError(c, "Failed to list estimates")
@@ -109,7 +154,30 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	response.Success(c, items)
+	// Backward compatible: no page params → full list, bare array (web).
+	if !paginate {
+		response.Success(c, items)
+		return
+	}
+
+	// total count for meta — same project + scope + building predicate so
+	// has_next reflects the filtered block, not the whole project.
+	countArgs := []interface{}{projectID, tenantID}
+	countBuildingFilter := ""
+	if hasBuilding {
+		countArgs = append(countArgs, buildingID)
+		countBuildingFilter = fmt.Sprintf("AND e.building_id = $%d", len(countArgs))
+	}
+	var total int
+	countQuery := fmt.Sprintf(`
+		SELECT COUNT(*) FROM construction_estimate e
+		WHERE e.project_id = $1 AND e.tenant_id = $2 %s %s
+	`, scopeFilter, countBuildingFilter)
+	if err := h.db.QueryRow(countQuery, countArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count estimates", "error", err)
+	}
+
+	response.Paginated(c, items, page, pageSize, total)
 }
 
 // GetEstimate returns a single estimate with its lines
@@ -164,8 +232,17 @@ func (h *Handler) GetEstimate(c *gin.Context) {
 		return
 	}
 
-	// Get lines
-	lines := h.getEstimateLines(id, tenantID)
+	// Get lines — honour `?include_manual=false` so the Smetalar tab can
+	// hide rows added via the Smeta boshqaruvi / Bosqichlar UI (migration
+	// 417). Defaults to TRUE for every other caller so behaviour is
+	// unchanged unless the param is explicitly passed.
+	includeManual := true
+	if raw := strings.TrimSpace(c.Query("include_manual")); raw != "" {
+		if v, err := strconv.ParseBool(raw); err == nil {
+			includeManual = v
+		}
+	}
+	lines := h.getEstimateLines(id, tenantID, includeManual)
 
 	response.Success(c, map[string]interface{}{
 		"estimate": est,
@@ -616,21 +693,126 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		return
 	}
 
-	// Pagination — default 50, max 5000 (some callers need all at once)
+	// Pagination — default 20 (mobile/on-demand clients page through in
+	// 20-item chunks), max 5000 (the web Smeta boshqaruvi / Bosqichlar
+	// loaders still request the full set explicitly so their totals,
+	// search and Forma 2 stay correct).
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	if page < 1 {
 		page = 1
 	}
 	if pageSize < 1 || pageSize > 5000 {
-		pageSize = 50
+		pageSize = 20
 	}
 	offset := (page - 1) * pageSize
 
-	// Count total
+	// include_manual — when "false", hide rows created via the
+	// individual line endpoints (CreateEstimateLine,
+	// CloneEstimateLineByCode, CreateProjectResource — all flagged
+	// is_manual = TRUE by migration 417). Defaults to true so the
+	// Smeta boshqaruvi / Bosqichlar tabs keep seeing everything; the
+	// Smetalar tab passes ?include_manual=false to limit its view to
+	// the file's original imported content.
+	includeManual := true
+	if raw := strings.TrimSpace(c.Query("include_manual")); raw != "" {
+		if v, err := strconv.ParseBool(raw); err == nil {
+			includeManual = v
+		}
+	}
+	manualFilter := ""
+	if !includeManual {
+		manualFilter = " AND COALESCE(l.is_manual, FALSE) = FALSE"
+	}
+	// Count total — respect the same filter so pagination is consistent.
+	countFilter := ""
+	if !includeManual {
+		countFilter = " AND COALESCE(is_manual, FALSE) = FALSE"
+	}
+
+	// Optional section filter (mobile Stage Works screen). When present, the
+	// endpoint returns only the works of ONE Bosqichlar section (= the stage's
+	// parent_item_number / section_key) PLUS all their descendant resource
+	// lines, and paginates over the WORKS rather than the flat line list. This
+	// lets mobile load one stage's ~200 works instead of looping the whole
+	// block's ~16k lines. A work matches when its parent_item_number equals the
+	// section exactly OR is a nested sub-section ("<section> › …"); the › is
+	// U+203A, the app's path delimiter.
+	section := strings.TrimSpace(c.Query("section"))
+
 	var total int
-	h.db.QueryRow(`SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2`,
-		estimateID, tenantID).Scan(&total)
+	var sectionIDs []int64 // this page's works + ALL their descendants
+	if section == "" {
+		h.db.QueryRow(
+			"SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2"+countFilter,
+			estimateID, tenantID,
+		).Scan(&total)
+	} else {
+		// Predicate that identifies a section's top-level works. countFilter
+		// uses the un-aliased is_manual column, matching these queries.
+		const workPredicate = `
+			AND COALESCE(resource_type, '') = ''
+			AND COALESCE(parent_line_id, 0) = 0
+			AND $3 = ANY(string_to_array(parent_item_number, ' › '))`
+
+		// total = number of matched works (paging is over works).
+		h.db.QueryRow(
+			`SELECT COUNT(*) FROM construction_estimate_line
+			 WHERE estimate_id = $1 AND tenant_id = $2`+countFilter+workPredicate,
+			estimateID, tenantID, section,
+		).Scan(&total)
+
+		// This page's work IDs (ordered like the main list).
+		var workIDs []int64
+		wrows, werr := h.db.Query(
+			`SELECT id FROM construction_estimate_line
+			 WHERE estimate_id = $1 AND tenant_id = $2`+countFilter+workPredicate+`
+			 ORDER BY sort_order ASC, id ASC
+			 LIMIT $4 OFFSET $5`,
+			estimateID, tenantID, section, pageSize, offset,
+		)
+		if werr != nil {
+			h.log.Error("Failed to select section works", "error", werr)
+			response.InternalError(c, "Failed to list estimate lines")
+			return
+		}
+		for wrows.Next() {
+			var id int64
+			if wrows.Scan(&id) == nil {
+				workIDs = append(workIDs, id)
+			}
+		}
+		wrows.Close()
+
+		// Expand to works + all descendants (resources / nested sub-stages) via
+		// the parent_line_id chain, so each work card has its resource breakdown.
+		if len(workIDs) > 0 {
+			trows, terr := h.db.Query(`
+				WITH RECURSIVE tree AS (
+					SELECT id FROM construction_estimate_line
+					WHERE id = ANY($1) AND tenant_id = $2
+					UNION ALL
+					SELECT c.id FROM construction_estimate_line c
+					JOIN tree t ON c.parent_line_id = t.id
+					WHERE c.tenant_id = $2
+				)
+				SELECT id FROM tree`,
+				pq.Array(workIDs), tenantID,
+			)
+			if terr != nil {
+				h.log.Error("Failed to expand section descendants", "error", terr)
+				response.InternalError(c, "Failed to list estimate lines")
+				return
+			}
+			for trows.Next() {
+				var id int64
+				if trows.Scan(&id) == nil {
+					sectionIDs = append(sectionIDs, id)
+				}
+			}
+			trows.Close()
+		}
+	}
 
 	// Hoist the parent estimate's project_id and building_id out to
 	// Go-side parameters. The ВОР fallback subquery below previously
@@ -657,6 +839,24 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		estBuildingArg = estBuildingID.Int64
 	} else {
 		estBuildingArg = nil
+	}
+
+	// Default (no section): page the flat line list with LIMIT $3 OFFSET $4 and
+	// the ВОР fallback's project/building at $5/$6 — unchanged from before.
+	// Section mode: the $3 id-array carries this page's works + descendants, so
+	// LIMIT/OFFSET drop out and $5/$6 shift down to $4/$5 (renumbered below).
+	whereExtra := ""
+	limitClause := "\n\t\tLIMIT $3 OFFSET $4"
+	queryArgs := []interface{}{estimateID, tenantID, pageSize, offset, estProjectID, estBuildingArg}
+	if section != "" {
+		if len(sectionIDs) == 0 {
+			// No works on this page (or empty section) — return empty, keep meta.
+			response.Paginated(c, []entity.ConstructionEstimateLine{}, page, pageSize, total)
+			return
+		}
+		whereExtra = " AND l.id = ANY($3)"
+		limitClause = ""
+		queryArgs = []interface{}{estimateID, tenantID, pq.Array(sectionIDs), estProjectID, estBuildingArg}
 	}
 
 	// Query paginated rows. We group each sub-line immediately after its
@@ -740,21 +940,29 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		       l.imported_total,
 		       COALESCE(l.approval_status, 'pending'),
 		       COALESCE(l.done_quantity, 0),
-		       l.sort_order, l.created_date, l.updated_date,
+		       l.sort_order, COALESCE(l.is_manual, FALSE),
+		       l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
 		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
-		WHERE l.estimate_id = $1 AND l.tenant_id = $2
+		WHERE l.estimate_id = $1 AND l.tenant_id = $2` + manualFilter + whereExtra + `
 		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
 		         COALESCE(l.parent_line_id, l.id) ASC,
 		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
 		         COALESCE(l.subline_seq, 0) ASC,
-		         l.id ASC
-		LIMIT $3 OFFSET $4
+		         l.id ASC` + limitClause + `
 	`
-	rows, err := h.db.Query(query, estimateID, tenantID, pageSize, offset, estProjectID, estBuildingArg)
+	if section != "" {
+		// $3/$4 (page LIMIT/OFFSET) collapsed into the single $3 id-array, so
+		// shift the ВОР fallback's project ($5→$4) and building ($6→$5)
+		// placeholders down by one. NewReplacer does a single non-overlapping
+		// pass, so $6→$5 is not re-rewritten. Only the ВОР subquery (and its
+		// comment) reference $5/$6, so nothing else is affected.
+		query = strings.NewReplacer("$5", "$4", "$6", "$5").Replace(query)
+	}
+	rows, err := h.db.Query(query, queryArgs...)
 	if err != nil {
 		h.log.Error("Failed to list estimate lines", "error", err)
 		response.InternalError(c, "Failed to list estimate lines")
@@ -781,7 +989,8 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 			// MarshalJSON emits `null` (not 0) when no file value exists.
 			&line.ImportedQuantity, &line.ImportedTotal,
 			&line.ApprovalStatus, &line.DoneQuantity,
-			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
+			&line.SortOrder, &line.IsManual,
+			&line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
 			continue
@@ -849,22 +1058,37 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 	}
 
 	resourceType := c.Query("type") // "labor", "equipment", "material", or empty for all
+	// Optional name/code substring search — sent by the picker so resources
+	// past the alphabetical LIMIT cap still show up when the user types
+	// their name. Without this, names starting with letters deep in the
+	// Cyrillic alphabet (e.g. С — position 19) get cut off in projects with
+	// hundreds of resources.
+	searchQ := strings.TrimSpace(c.Query("q"))
 
-	// Aggregate across duplicate names by taking the MAX rate — so a resource
+	// Aggregate across duplicate rows by taking the MAX rate — so a resource
 	// that has a non-zero rate in at least one estimate line is returned
 	// with that rate (avoids picking a 0-rate skeleton row).
+	//
+	// Grouping key is (name, uom, resource_type) to match what the Resurslar
+	// tab does, so each variant of the same name surfaces as its own picker
+	// row. Earlier this grouped by name only, which collapsed manually-added
+	// resources sharing a name (different uoms / different types) into one
+	// row — they then "disappeared" from the picker even though the Resurslar
+	// tab still showed them. User report:
+	//     "some still not seeing manually added resources in add resource
+	//      to work modal, but seeing in resources tab"
 	query := `
 		SELECT
 			MIN(el.id) AS id,
 			el.name,
-			MAX(el.uom) AS uom,
+			COALESCE(el.uom, '') AS uom,
 			MAX(el.quantity) AS quantity,
 			MAX(el.material_rate) AS material_rate,
 			MAX(el.labor_rate) AS labor_rate,
 			MAX(el.equipment_rate) AS equipment_rate,
 			MAX(el.unit_rate) AS unit_rate,
 			MAX(COALESCE(el.code, '')) AS code,
-			MAX(COALESCE(el.resource_type, '')) AS resource_type
+			COALESCE(el.resource_type, '') AS resource_type
 		FROM construction_estimate_line el
 		JOIN construction_estimate e ON e.id = el.estimate_id
 		WHERE e.tenant_id = $1
@@ -873,6 +1097,23 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 	`
 	args := []interface{}{tenantID, projectID}
 	argIdx := 3
+
+	if searchQ != "" {
+		// Case-insensitive substring match on name / uom / code. We filter
+		// BEFORE the GROUP BY so groups whose name doesn't match are
+		// excluded — that's what makes the LIMIT useful for narrow
+		// searches and bypasses the alphabetical cap entirely when the
+		// user types a query.
+		query += fmt.Sprintf(`
+			AND (
+			  UPPER(COALESCE(el.name, '')) LIKE UPPER('%%' || $%d || '%%')
+			  OR UPPER(COALESCE(el.uom, '')) LIKE UPPER('%%' || $%d || '%%')
+			  OR UPPER(COALESCE(el.code, '')) LIKE UPPER('%%' || $%d || '%%')
+			)
+		`, argIdx, argIdx, argIdx)
+		args = append(args, searchQ)
+		argIdx++
+	}
 
 	if resourceType != "" {
 		// Filter by resource type or UOM pattern
@@ -894,7 +1135,13 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 		}
 	}
 
-	query += ` GROUP BY el.name ORDER BY UPPER(el.name) LIMIT 500`
+	// Higher cap than before (was 500) — projects with multiple єдинич +
+	// ВОР + Ресурс imports can easily exceed 500 distinct
+	// (name, uom, resource_type) tuples, and the alphabetical sort meant
+	// rows past position 500 (often Cyrillic С/Т/У letters) silently
+	// disappeared from the picker. With server-side `q=` search this cap
+	// is rarely hit anyway.
+	query += ` GROUP BY el.name, COALESCE(el.uom, ''), COALESCE(el.resource_type, '') ORDER BY UPPER(el.name), COALESCE(el.uom, '') LIMIT 5000`
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -979,10 +1226,14 @@ func (h *Handler) CreateProjectResource(c *gin.Context) {
 	req.UOM = strings.TrimSpace(req.UOM)
 	rType := strings.ToLower(strings.TrimSpace(req.ResourceType))
 	switch rType {
-	case "labor", "equipment", "material":
+	case "labor", "equipment", "material", "machinery":
+		// 'machinery' = строительные машины и механизмы (construction
+		// machinery used to BUILD, MAШ.-Ч hours) — added as a separate
+		// bucket alongside 'equipment' (стационарное оборудование). Both
+		// classify into the MASHINA section on the frontend.
 		// ok
 	default:
-		response.BadRequest(c, "resource_type must be one of: labor, equipment, material")
+		response.BadRequest(c, "resource_type must be one of: labor, equipment, material, machinery")
 		return
 	}
 	if req.Name == "" {
@@ -1048,24 +1299,30 @@ func (h *Handler) CreateProjectResource(c *gin.Context) {
 	switch rType {
 	case "labor":
 		labRate = req.UnitPrice
-	case "equipment":
+	case "equipment", "machinery":
+		// Both stationary equipment and construction machinery park
+		// their unit price into equipment_rate — the frontend Form 2
+		// rollups already sum equipment_rate × quantity for both.
 		eqRate = req.UnitPrice
 	case "material":
 		matRate = req.UnitPrice
 	}
 
+	// is_manual = TRUE (migration 417) — CreateProjectResource is only
+	// reachable from the AddResourcePickerModal "+" affordance, so every
+	// row is by definition user-added. The Smetalar tab filters these out.
 	var lineID int64
 	err = h.db.QueryRow(`
 		INSERT INTO construction_estimate_line (
 			tenant_id, estimate_id, name, uom, quantity,
 			material_rate, labor_rate, equipment_rate,
 			unit_rate, total_amount, resource_type, material_type,
-			parent_item_number, sort_order, created_date, updated_date
+			parent_item_number, sort_order, is_manual, created_date, updated_date
 		) VALUES (
 			$1, $2, $3, $4, 0,
 			$5, $6, $7,
 			$8, 0, $9, $10,
-			'__catalog__', 0, NOW(), NOW()
+			'__catalog__', 0, TRUE, NOW(), NOW()
 		)
 		RETURNING id
 	`, tenantID, catalogID, req.Name, req.UOM,
@@ -1152,6 +1409,13 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 	var parentDoneQuantity float64
 	var parentSectionPath string
 	var parentName string
+	// Parent's OWN item_number (e.g. "13"), captured here at the outer
+	// scope so the later tx block can compose the "13-N" suffix once
+	// subline_seq is known. Distinct from `parentItemNumber`, which is
+	// the value stored on the new row's parent_item_number column — for
+	// sub-stages that's the parent's parent_item_number (the SECTION path),
+	// not the parent's item_number.
+	var parentOwnItemNumber string
 	if req.ParentLineID > 0 {
 		var pItem, pUom, pParentItem sql.NullString
 		var pQty float64
@@ -1203,6 +1467,7 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		} else {
 			parentItemNumber = pItem.String
 		}
+		parentOwnItemNumber = pItem.String
 		parentQuantity = pQty
 
 		// Inherit the parent's sort_order so the backend ORDER BY places the
@@ -1214,19 +1479,19 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 			req.SortOrder = pSortOrder
 		}
 
-		// Auto-assign the next subline_seq for this parent
-		if err := h.db.QueryRow(`
-			SELECT COALESCE(MAX(subline_seq), 0) + 1
-			FROM construction_estimate_line
-			WHERE parent_line_id = $1 AND tenant_id = $2
-		`, req.ParentLineID, tenantID).Scan(&sublineSeq); err != nil {
-			sublineSeq = 1
-		}
-
-		// Compose item_number if the client didn't pin one explicitly.
-		if assignedItemNum == "" && pItem.String != "" {
-			assignedItemNum = fmt.Sprintf("%s-%d", pItem.String, sublineSeq)
-		}
+		// subline_seq is auto-assigned inside the same transaction as the
+		// INSERT below (see "tx, err := h.db.Begin()" further down) so
+		// concurrent "+ Qo'shimcha resurs" / "+ Yangi etap" clicks under
+		// the same parent can't both read MAX = N and both insert N+1 —
+		// the second one would otherwise crash on the
+		// uq_estimate_line_parent_seq (parent_line_id, subline_seq) unique
+		// constraint (migration 332) and surface as the intermittent
+		// "adding resource sometimes fails" 500 the field team reported.
+		// The actual SELECT-MAX runs after the FOR UPDATE row lock is
+		// taken so it sees every concurrent sibling.
+		//
+		// item_number composition also moves under the lock — without the
+		// new subline_seq it'd resolve to the wrong "13-N" suffix.
 
 		// Sub-line quantity = parent.quantity × norm_rate, denormalized so
 		// existing reports don't need to know about the sub-line model.
@@ -1257,6 +1522,30 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		}
 	}
 
+	// Top-level work without parent — append to the END of its section
+	// instead of letting sort_order default to 0 (which would put the new
+	// "+ Ish" line ABOVE every imported row in that section, surfaced by
+	// the user as the "123" row appearing at the top of ФУНДАМЕНТЫ before
+	// row #8). We take MAX(sort_order)+1 inside the same estimate AND the
+	// same parent_item_number — scoped this way so:
+	//   • Adding a work to ФУНДАМЕНТЫ doesn't jump it past unrelated
+	//     ЗЕМЛЯННЫЕ work rows that happen to have higher sort_order.
+	//   • Two sections with overlapping sort_order numbers don't fight.
+	// Skip when client pinned a SortOrder explicitly (≥ 1) — that
+	// overrides our default.
+	if req.ParentLineID == 0 && req.SortOrder == 0 {
+		var maxSort int
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(MAX(sort_order), 0)
+			FROM construction_estimate_line
+			WHERE estimate_id = $1
+			  AND tenant_id   = $2
+			  AND parent_line_id IS NULL
+			  AND COALESCE(parent_item_number, '') = $3
+		`, estimateID, tenantID, req.ParentItemNumber).Scan(&maxSort)
+		req.SortOrder = maxSort + 1
+	}
+
 	// UnitPrice convenience: if the caller set it, map it onto the rate column
 	// that matches resource_type. This keeps the existing unit_rate =
 	// material_rate + labor_rate + equipment_rate invariant intact.
@@ -1284,17 +1573,71 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		uom = "шт"
 	}
 
+	// Insert runs in a transaction so the subline_seq MAX+1 assign + INSERT
+	// happen atomically against the parent row. When req.ParentLineID > 0
+	// we take a FOR UPDATE row lock on the parent first; concurrent
+	// "+ Qo'shimcha resurs" / "+ Yangi etap" clicks under the same parent
+	// queue on that lock instead of both reading MAX = N and both inserting
+	// N+1 (the second of which would crash on the uq_estimate_line_parent_seq
+	// unique constraint from migration 332). Sibling inserts under a
+	// DIFFERENT parent take a different row lock and proceed in parallel,
+	// so this doesn't introduce a global bottleneck.
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin estimate line insert tx", "error", err)
+		response.InternalError(c, "Failed to create estimate line")
+		return
+	}
+	txCommitted := false
+	defer func() {
+		if !txCommitted {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if req.ParentLineID > 0 {
+		// FOR UPDATE row lock — serializes concurrent sibling inserts.
+		if _, lockErr := tx.Exec(`
+			SELECT 1 FROM construction_estimate_line
+			WHERE id = $1 AND tenant_id = $2
+			FOR UPDATE
+		`, req.ParentLineID, tenantID); lockErr != nil {
+			h.log.Error("Failed to lock parent line for sub-insert", "error", lockErr, "parent_line_id", req.ParentLineID)
+			response.InternalError(c, "Failed to create estimate line")
+			return
+		}
+
+		// Inside the lock we can safely MAX+1 — no other writer can land a
+		// sibling between this read and our INSERT.
+		if seqErr := tx.QueryRow(`
+			SELECT COALESCE(MAX(subline_seq), 0) + 1
+			FROM construction_estimate_line
+			WHERE parent_line_id = $1 AND tenant_id = $2
+		`, req.ParentLineID, tenantID).Scan(&sublineSeq); seqErr != nil {
+			sublineSeq = 1
+		}
+
+		// Compose item_number now that subline_seq is final. We deliberately
+		// only auto-fill when the client left it blank — explicit values
+		// from the modal still win.
+		if assignedItemNum == "" && parentOwnItemNumber != "" {
+			assignedItemNum = fmt.Sprintf("%s-%d", parentOwnItemNumber, sublineSeq)
+		}
+	}
+
 	var lineID int64
-	err = h.db.QueryRow(`
+	err = tx.QueryRow(`
 		INSERT INTO construction_estimate_line (
 			tenant_id, estimate_id, wbs_id, name, uom, quantity,
 			material_rate, labor_rate, equipment_rate,
 			unit_rate, total_amount, code, item_number,
 			resource_type, parent_item_number, sort_order,
 			parent_line_id, norm_rate, subline_seq, quantity_override,
+			is_manual,
 			created_date, updated_date
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 		          $17, $18, $19, $20,
+		          TRUE,
 		          NOW(), NOW())
 		RETURNING id
 	`, tenantID, estimateID, nullInt64FromVal(req.WBSID),
@@ -1304,12 +1647,23 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		nullStringFromVal(req.ResourceType), nullStringFromVal(parentItemNumber), req.SortOrder,
 		parentLineIDSQL, req.NormRate, sublineSeq, req.QuantityOverride,
 	).Scan(&lineID)
+	// is_manual = TRUE (migration 417) — every CreateEstimateLine call
+	// comes from a UI affordance ("+ Ish", "+ Yangi qo'shimcha etap",
+	// "+ Qo'shimcha resurs"), so the row is by definition user-added.
+	// The Smetalar tab filters by is_manual = FALSE to hide these.
 
 	if err != nil {
 		h.log.Error("Failed to create estimate line", "error", err)
 		response.InternalError(c, "Failed to create estimate line")
 		return
 	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit estimate line insert tx", "error", err)
+		response.InternalError(c, "Failed to create estimate line")
+		return
+	}
+	txCommitted = true
 
 	// Recalculate estimate totals
 	h.recalculateEstimateTotals(estimateID)
@@ -1373,6 +1727,359 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 		"item_number": assignedItemNum,
 		"subline_seq": sublineSeq,
 	})
+}
+
+// CloneEstimateLineByCode — POST /construction/estimates/:id/lines/clone-by-code
+//
+// Creates a new estimate line and, if any existing parent line in the SAME
+// project carries the same `source_code`, copies every one of that line's
+// resource sub-lines onto the new line in one round-trip. The new line itself
+// inherits the source's material/labor/equipment rates, uom and resource_type
+// unless the request explicitly overrides them.
+//
+// When no source line is found, the endpoint just creates the new line with
+// the supplied fields (same as a plain CreateEstimateLine) so the frontend
+// can call this unconditionally on every "+ Ish" / "+ Yangi qo'shimcha etap"
+// submission and let the backend decide whether cloning applies.
+//
+// Body: {
+//   source_code:        string  // required — the code to match against existing lines
+//   parent_line_id?:    int64   // attach the new line as a sub-stage of this work
+//   parent_item_number?: string // top-level: lands the new line under this section
+//   item_number?:       string  // explicit numbering (else auto-derived from parent)
+//   name?:              string  // overrides source's name
+//   uom?:               string  // overrides source's uom
+//   code?:              string  // overrides source's code on the new row (defaults to source_code)
+//   quantity?:          float64 // overrides quantity (defaults to 0)
+// }
+//
+// Returns: { id, cloned_resources, source_id?, source_name? }
+func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	estimateID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid estimate ID")
+		return
+	}
+
+	// Pull the destination estimate so we can scope the code lookup to its
+	// project. Clone semantics are project-wide (the user added a work in
+	// section A and may have shifted to section B keeping the same SHRNK
+	// code), but never cross-tenant or cross-project.
+	var destState string
+	var destProjectID int64
+	err = h.db.QueryRow(`
+		SELECT state, project_id FROM construction_estimate
+		WHERE id = $1 AND tenant_id = $2
+	`, estimateID, tenantID).Scan(&destState, &destProjectID)
+	if err != nil {
+		response.NotFound(c, "Estimate not found")
+		return
+	}
+	if destState != "draft" {
+		response.BadRequest(c, "Only draft estimates can be modified")
+		return
+	}
+
+	var req struct {
+		SourceCode       string   `json:"source_code" binding:"required"`
+		ParentLineID     int64    `json:"parent_line_id"`
+		ParentItemNumber string   `json:"parent_item_number"`
+		ItemNumber       string   `json:"item_number"`
+		Name             string   `json:"name"`
+		UOM              string   `json:"uom"`
+		Code             string   `json:"code"`
+		Quantity         *float64 `json:"quantity"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+	srcCode := strings.TrimSpace(req.SourceCode)
+	if srcCode == "" {
+		response.BadRequest(c, "source_code is required")
+		return
+	}
+
+	// Locate a line in this project whose code matches. We accept BOTH
+	// top-level parents AND sub-stages (sub-stages are sub-lines of a
+	// work but can themselves carry resources — the user's "1122" etap
+	// added via "+ Yangi bosqich qo'shish" is exactly this shape). The
+	// "MOST children" tie-break naturally pushes resource leaf rows
+	// (zero children) to the back, so we never accidentally clone from
+	// a resource row that has no payload to copy.
+	//
+	// Tie-break: prefer the candidate with the MOST direct children —
+	// the user almost certainly wants to clone from a line that already
+	// has resources, not from a blank stub they created earlier under
+	// the same code. Within the same child-count tier we fall back to
+	// the oldest id (earliest import).
+	//
+	// Case- and whitespace-insensitive comparison.
+	var (
+		srcID                                          int64
+		srcName, srcUOM, srcResourceType, srcMaterial string
+		srcMatRate, srcLabRate, srcEqRate             float64
+		srcChildCount                                  int64
+	)
+	err = h.db.QueryRow(`
+		SELECT l.id,
+		       COALESCE(l.name, ''),
+		       COALESCE(l.uom, ''),
+		       COALESCE(l.resource_type, ''),
+		       COALESCE(l.material_type, 'standard'),
+		       COALESCE(l.material_rate, 0),
+		       COALESCE(l.labor_rate, 0),
+		       COALESCE(l.equipment_rate, 0),
+		       (SELECT COUNT(*) FROM construction_estimate_line c
+		         WHERE c.tenant_id = l.tenant_id
+		           AND c.parent_line_id = l.id) AS child_count
+		FROM construction_estimate_line l
+		JOIN construction_estimate e ON e.id = l.estimate_id
+		WHERE e.tenant_id = $1
+		  AND e.project_id = $2
+		  AND UPPER(TRIM(COALESCE(l.code, ''))) = UPPER(TRIM($3))
+		ORDER BY child_count DESC, l.id ASC
+		LIMIT 1
+	`, tenantID, destProjectID, srcCode).Scan(
+		&srcID, &srcName, &srcUOM, &srcResourceType, &srcMaterial,
+		&srcMatRate, &srcLabRate, &srcEqRate, &srcChildCount,
+	)
+	hasSource := err == nil
+
+	// Fill in defaults from the source when the user left a field blank.
+	name := strings.TrimSpace(req.Name)
+	uom := strings.TrimSpace(req.UOM)
+	newCode := strings.TrimSpace(req.Code)
+	if newCode == "" {
+		newCode = srcCode
+	}
+	if hasSource {
+		if name == "" {
+			name = srcName
+		}
+		if uom == "" {
+			uom = srcUOM
+		}
+	}
+	if name == "" {
+		response.BadRequest(c, "name is required")
+		return
+	}
+
+	// Run the clone inside a single transaction so a partial copy never
+	// leaks (either the new work + every cloned resource lands, or none).
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to open clone transaction", "error", err)
+		response.InternalError(c, "Failed to clone line")
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var parentLineArg interface{}
+	if req.ParentLineID > 0 {
+		parentLineArg = req.ParentLineID
+	}
+	var parentItemArg interface{}
+	if strings.TrimSpace(req.ParentItemNumber) != "" {
+		parentItemArg = req.ParentItemNumber
+	}
+	itemNumberArg := strings.TrimSpace(req.ItemNumber)
+	qty := 0.0
+	if req.Quantity != nil {
+		qty = *req.Quantity
+	}
+
+	matRate := srcMatRate
+	labRate := srcLabRate
+	eqRate := srcEqRate
+	if !hasSource {
+		matRate, labRate, eqRate = 0, 0, 0
+	}
+	unitRate := matRate + labRate + eqRate
+
+	// When the new line is a sub-line (parent_line_id set), auto-assign
+	// the next subline_seq for that parent. Without this the column
+	// defaults to 0 and conflicts with the (parent_line_id, subline_seq)
+	// unique index from migration 332 if another sub-line already exists
+	// — surfaces as "duplicate key value violates unique constraint
+	// uq_estimate_line_parent_seq" 500 on the clone endpoint.
+	var newSublineSeq int
+	if req.ParentLineID > 0 {
+		if err := tx.QueryRow(`
+			SELECT COALESCE(MAX(subline_seq), 0) + 1
+			FROM construction_estimate_line
+			WHERE parent_line_id = $1 AND tenant_id = $2
+		`, req.ParentLineID, tenantID).Scan(&newSublineSeq); err != nil {
+			newSublineSeq = 1
+		}
+	}
+
+	// Insert the new line. Mirrors the column set CreateEstimateLine uses
+	// so trigger-set defaults (original_quantity / original_unit_rate from
+	// migration 349) and constraints stay consistent.
+	// is_manual = TRUE (migration 417) — the clone-by-code endpoint is
+	// only ever called from the UI, so the new row is user-added and
+	// must be hidden from the Smetalar tab.
+	var newID int64
+	err = tx.QueryRow(`
+		INSERT INTO construction_estimate_line (
+			tenant_id, estimate_id, parent_line_id, parent_item_number,
+			item_number, code, name, uom,
+			resource_type, material_type,
+			quantity, quantity_override,
+			material_rate, labor_rate, equipment_rate,
+			unit_rate, sort_order,
+			subline_seq,
+			total_amount,
+			norm_rate,
+			is_manual,
+			created_date, updated_date
+		) VALUES (
+			$1, $2, $3, $4,
+			NULLIF($5, ''), NULLIF($6, ''), $7, $8,
+			$9, COALESCE(NULLIF($10, ''), 'standard'),
+			$11, TRUE,
+			$12, $13, $14,
+			$15, 0,
+			$17,
+			$16,
+			0,
+			TRUE,
+			NOW(), NOW()
+		) RETURNING id
+	`,
+		tenantID, estimateID, parentLineArg, parentItemArg,
+		itemNumberArg, newCode, name, uom,
+		srcResourceType, srcMaterial,
+		qty,
+		matRate, labRate, eqRate,
+		unitRate, qty*unitRate,
+		newSublineSeq,
+	).Scan(&newID)
+	if err != nil {
+		h.log.Error("Failed to insert cloned line", "error", err, "source_code", srcCode)
+		response.InternalError(c, "Failed to create line")
+		return
+	}
+
+	// Clone every resource sub-line of the source onto the new line. We
+	// preserve norm_rate, unit_rate, material_type, resource_type, uom and
+	// the per-component rates exactly. quantity is re-derived from the new
+	// parent's qty × norm_rate so the JAMI column matches the new work's
+	// scale (this is the same cascade rule UpdateEstimateLine uses).
+	clonedCount := 0
+	if hasSource {
+		rows, qerr := tx.Query(`
+			SELECT COALESCE(name, ''), COALESCE(uom, ''),
+			       COALESCE(resource_type, ''),
+			       COALESCE(material_type, 'standard'),
+			       COALESCE(material_rate, 0), COALESCE(labor_rate, 0),
+			       COALESCE(equipment_rate, 0), COALESCE(unit_rate, 0),
+			       COALESCE(norm_rate, 0)
+			FROM construction_estimate_line
+			WHERE tenant_id = $1
+			  AND parent_line_id = $2
+			ORDER BY subline_seq ASC, id ASC
+		`, tenantID, srcID)
+		if qerr != nil {
+			h.log.Error("Failed to read source children", "error", qerr, "source_id", srcID)
+			response.InternalError(c, "Failed to clone children")
+			return
+		}
+		type childRow struct {
+			Name, UOM, ResType, MatType                       string
+			MatRate, LabRate, EqRate, UnitRate, NormRate      float64
+		}
+		var children []childRow
+		for rows.Next() {
+			var ch childRow
+			if scanErr := rows.Scan(
+				&ch.Name, &ch.UOM, &ch.ResType, &ch.MatType,
+				&ch.MatRate, &ch.LabRate, &ch.EqRate, &ch.UnitRate, &ch.NormRate,
+			); scanErr != nil {
+				rows.Close()
+				h.log.Error("Failed to scan source child", "error", scanErr)
+				response.InternalError(c, "Failed to clone children")
+				return
+			}
+			children = append(children, ch)
+		}
+		rows.Close()
+
+		for i, ch := range children {
+			childQty := qty * ch.NormRate
+			_, ierr := tx.Exec(`
+				INSERT INTO construction_estimate_line (
+					tenant_id, estimate_id, parent_line_id, parent_item_number,
+					item_number, name, uom,
+					resource_type, material_type,
+					quantity, quantity_override,
+					material_rate, labor_rate, equipment_rate,
+					unit_rate, total_amount,
+					norm_rate, subline_seq, sort_order,
+					is_manual,
+					created_date, updated_date
+				) VALUES (
+					$1, $2, $3, NULL,
+					NULL, $4, $5,
+					$6, $7,
+					$8, FALSE,
+					$9, $10, $11,
+					$12, $13,
+					$14, $15, 0,
+					TRUE,
+					NOW(), NOW()
+				)
+			`,
+				tenantID, estimateID, newID,
+				ch.Name, ch.UOM,
+				ch.ResType, ch.MatType,
+				childQty,
+				ch.MatRate, ch.LabRate, ch.EqRate,
+				ch.UnitRate, childQty*ch.UnitRate,
+				ch.NormRate, i+1,
+			)
+			if ierr != nil {
+				h.log.Error("Failed to insert cloned child", "error", ierr, "source_id", srcID, "i", i)
+				response.InternalError(c, "Failed to clone children")
+				return
+			}
+			clonedCount++
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit clone transaction", "error", err)
+		response.InternalError(c, "Failed to clone line")
+		return
+	}
+	committed = true
+
+	// Recompute estimate totals so the topbar pills and Form 2 rollups
+	// pick up the freshly cloned resources without a manual refresh.
+	h.recalculateEstimateTotals(estimateID)
+
+	out := map[string]interface{}{
+		"id":               newID,
+		"cloned_resources": clonedCount,
+	}
+	if hasSource {
+		out["source_id"] = srcID
+		out["source_name"] = srcName
+	}
+	response.Success(c, out)
 }
 
 // BulkCreateEstimateLines creates multiple estimate lines in a single transaction
@@ -1849,7 +2556,7 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 	isActualAmountOnly := req.ActualAmount != nil && req.WBSID == nil && req.Name == nil && req.UOM == nil &&
 		req.Quantity == nil && req.MaterialRate == nil && req.LaborRate == nil && req.EquipmentRate == nil && req.SortOrder == nil &&
 		req.Code == nil && req.ItemNumber == nil && req.ResourceType == nil && req.NormRate == nil && req.UnitPrice == nil &&
-		req.QuantityOverride == nil
+		req.QuantityOverride == nil && req.OriginalQuantity == nil
 
 	if state != "draft" && !isActualAmountOnly {
 		response.BadRequest(c, "Only draft estimates can be modified")
@@ -1997,6 +2704,11 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("quantity_override = $%d", argCount))
 		args = append(args, *req.QuantityOverride)
 	}
+	if req.OriginalQuantity != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("original_quantity = $%d", argCount))
+		args = append(args, *req.OriginalQuantity)
+	}
 	if req.MaterialType != nil {
 		// Validate against the schema CHECK constraint so we get a 400 instead
 		// of an opaque pq error.
@@ -2051,77 +2763,60 @@ func (h *Handler) UpdateEstimateLine(c *gin.Context) {
 
 	// Cascade quantity changes to non-override children.
 	//
-	// When the user edits ISH HAJMI on a parent work in the Smeta
-	// boshqaruvi → Ishlar tab, every child sub-line whose
-	// quantity_override = FALSE should recompute
+	// When the user edits ISH HAJMI on ANY line that has children — a
+	// top-level work OR a sub-stage (sub-stages have parent_line_id
+	// set, but ALSO carry their own resource children) — every child
+	// sub-line whose quantity_override = FALSE should recompute
 	//     child.quantity     = new_parent_qty × child.norm_rate
 	//     child.total_amount = child.quantity × child.unit_rate
-	// so the JAMI / SUMMA columns and the rollup row at the bottom of
-	// the expanded card pick up the new values. Without this the parent
-	// updates but children stay at the template-mode 0 from import,
-	// which is exactly the "why is SUMMA still 0" report.
+	// so the JAMI / SUMMA columns pick up the new values.
 	//
-	// The same logic already runs on the Reset button (see
-	// ResetLineQuantity below) — this just makes it run on regular
-	// edits too. We only fire when the request actually changed
-	// quantity, and only when the row is a parent (parent_line_id IS
-	// NULL) — children's qty edits don't cascade further.
+	// Earlier this fired only for top-level works (parent_line_id
+	// IS NULL). User report: typing FAKT on a sub-stage left every
+	// inner resource at 0. The cascade UPDATE itself is a no-op when
+	// the line has no children (it just touches zero rows), so we
+	// can fire it unconditionally on any quantity update.
 	if req.Quantity != nil {
-		var isParent bool
-		_ = h.db.QueryRow(`
-			SELECT parent_line_id IS NULL FROM construction_estimate_line
-			WHERE id = $1 AND tenant_id = $2
-		`, lineID, tenantID).Scan(&isParent)
-		if isParent {
-			// Cascade fires on every non-override child PLUS any
-			// "stale-override" child that was created with
-			// quantity_override = TRUE but quantity = 0 — a leftover
-			// from a client bundle that mis-stamped the flag. Healing
-			// those rows here (resetting their override and computing
-			// qty from parent × norm) means the user doesn't have to
-			// delete + re-add the resource after a backend update.
-			if _, cascadeErr := h.db.Exec(`
-				UPDATE construction_estimate_line c
-				SET quantity          = $1 * COALESCE(c.norm_rate, 0),
-				    total_amount      = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
-				    quantity_override = FALSE,
-				    updated_date      = NOW()
-				WHERE c.parent_line_id = $2
-				  AND (
-				    COALESCE(c.quantity_override, FALSE) = FALSE
-				    OR (COALESCE(c.quantity_override, FALSE) = TRUE
-				        AND COALESCE(c.quantity, 0) = 0
-				        AND COALESCE(c.norm_rate, 0) > 0)
-				  )
-			`, *req.Quantity, lineID); cascadeErr != nil {
-				h.log.Error("Failed to cascade quantity to children",
-					"error", cascadeErr, "parent_line_id", lineID)
-			}
-			// Mirror ISH HAJMI → BAJARILDI for the parent so the
-			// Bosqichlar tab's done_quantity column matches the new
-			// plan. Counterpart of the mirror in UpdateWorkDoneQuantity
-			// — the two screens are now bound to a single logical
-			// "work amount" in template-mode workflows. approval_status
-			// also follows: 0 → pending, >0 → in_progress (mirrors the
-			// foreman-side rule so the status badge stays consistent).
-			newStatus := "pending"
-			if *req.Quantity > 0 {
-				newStatus = "in_progress"
-			}
-			if _, mirrorErr := h.db.Exec(`
-				UPDATE construction_estimate_line
-				SET done_quantity   = $1,
-				    approval_status = CASE
-				        WHEN COALESCE(approval_status, 'pending') IN ('pending', 'in_progress')
-				          THEN $2
-				        ELSE approval_status
-				    END,
-				    updated_date = NOW()
-				WHERE id = $3 AND tenant_id = $4
-			`, *req.Quantity, newStatus, lineID, tenantID); mirrorErr != nil {
-				h.log.Error("Failed to mirror plan quantity to done_quantity",
-					"error", mirrorErr, "line_id", lineID)
-			}
+		if _, cascadeErr := h.db.Exec(`
+			UPDATE construction_estimate_line c
+			SET quantity          = $1 * COALESCE(c.norm_rate, 0),
+			    total_amount      = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
+			    quantity_override = FALSE,
+			    updated_date      = NOW()
+			WHERE c.parent_line_id = $2
+			  AND (
+			    COALESCE(c.quantity_override, FALSE) = FALSE
+			    OR (COALESCE(c.quantity_override, FALSE) = TRUE
+			        AND COALESCE(c.quantity, 0) = 0
+			        AND COALESCE(c.norm_rate, 0) > 0)
+			  )
+		`, *req.Quantity, lineID); cascadeErr != nil {
+			h.log.Error("Failed to cascade quantity to children",
+				"error", cascadeErr, "parent_line_id", lineID)
+		}
+
+		// Mirror ISH HAJMI → BAJARILDI on the row itself. For
+		// top-level works this drives the Bosqichlar BAJARILDI column;
+		// for sub-stages it does the same against the sub-stage's own
+		// done_quantity. Approval_status follows: 0 → pending,
+		// >0 → in_progress.
+		newStatus := "pending"
+		if *req.Quantity > 0 {
+			newStatus = "in_progress"
+		}
+		if _, mirrorErr := h.db.Exec(`
+			UPDATE construction_estimate_line
+			SET done_quantity   = $1,
+			    approval_status = CASE
+			        WHEN COALESCE(approval_status, 'pending') IN ('pending', 'in_progress')
+			          THEN $2
+			        ELSE approval_status
+			    END,
+			    updated_date = NOW()
+			WHERE id = $3 AND tenant_id = $4
+		`, *req.Quantity, newStatus, lineID, tenantID); mirrorErr != nil {
+			h.log.Error("Failed to mirror plan quantity to done_quantity",
+				"error", mirrorErr, "line_id", lineID)
 		}
 	}
 
@@ -2416,7 +3111,15 @@ func (h *Handler) ResetAllEstimateQuantities(c *gin.Context) {
 // but silently fails for Ресурс estimates whose item_numbers are SNiP-style
 // codes (e.g. "Э14-1-17"), so podkators created on resurs rows never render
 // as nested children of their parent.
-func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entity.ConstructionEstimateLine {
+func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID, includeManual ...bool) []entity.ConstructionEstimateLine {
+	// Variadic for backwards compatibility — existing callers don't pass
+	// includeManual and default to TRUE (show everything). The
+	// EstimatesTab path passes FALSE so user-added lines are hidden
+	// from the file-derived Smetalar view.
+	wantManual := true
+	if len(includeManual) > 0 {
+		wantManual = includeManual[0]
+	}
 	// Hoist the parent estimate's project_id and building_id out to
 	// Go-side parameters. The ВОР fallback subquery below previously
 	// re-derived these via three nested scalar subqueries
@@ -2493,6 +3196,10 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		             -- once in Go. Migration 378 added a partial index
 		             -- on construction_estimate(project_id, tenant_id)
 		             -- WHERE source_type='vor' that this clause uses.
+		             -- Same priority as the other VOR NORMA fallback
+		             -- (see lines ~713): imported_quantity > original_
+		             -- quantity > live quantity, so this matches what
+		             -- Smetalar tab actually displays.
 		             SELECT vl.quantity
 		             FROM construction_estimate_line vl
 		             JOIN construction_estimate ve ON ve.id = vl.estimate_id
@@ -2523,13 +3230,19 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 		       l.imported_total,
 		       COALESCE(l.approval_status, 'pending'),
 		       COALESCE(l.done_quantity, 0),
-		       l.sort_order, l.created_date, l.updated_date,
+		       l.sort_order, COALESCE(l.is_manual, FALSE),
+		       l.created_date, l.updated_date,
 		       COALESCE(w.code, '') as wbs_code,
 		       COALESCE(w.name, '') as wbs_name
 		FROM construction_estimate_line l
 		LEFT JOIN construction_wbs w ON w.id = l.wbs_id
 		LEFT JOIN construction_estimate_line p ON p.id = l.parent_line_id
-		WHERE l.estimate_id = $1 AND l.tenant_id = $2
+		WHERE l.estimate_id = $1 AND l.tenant_id = $2` + func() string {
+		if !wantManual {
+			return " AND COALESCE(l.is_manual, FALSE) = FALSE"
+		}
+		return ""
+	}() + `
 		ORDER BY COALESCE(p.sort_order, l.sort_order) ASC,
 		         COALESCE(l.parent_line_id, l.id) ASC,
 		         (CASE WHEN l.parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
@@ -2563,7 +3276,8 @@ func (h *Handler) getEstimateLines(estimateID int64, tenantID uuid.UUID) []entit
 			// MarshalJSON emits `null` (not 0) when no file value exists.
 			&line.ImportedQuantity, &line.ImportedTotal,
 			&line.ApprovalStatus, &line.DoneQuantity,
-			&line.SortOrder, &line.CreatedDate, &line.UpdatedDate,
+			&line.SortOrder, &line.IsManual,
+			&line.CreatedDate, &line.UpdatedDate,
 			&line.WBSCode, &line.WBSName,
 		); err != nil {
 			h.log.Error("Failed to scan estimate line", "error", err)

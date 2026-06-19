@@ -126,12 +126,37 @@ func (h *Handler) ListProjectSmetaAudit(c *gin.Context) {
 		return
 	}
 
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "500"))
-	if limit <= 0 || limit > 2000 {
-		limit = 500
+	// Pagination — default 20 per page (the Jurnal scrolls page-by-page),
+	// max 200. `page` is 1-based.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize <= 0 || pageSize > 200 {
+		pageSize = 20
+	}
+	offset := (page - 1) * pageSize
+	action := c.Query("action") // optional filter, matches the per-estimate endpoint
+
+	// Shared WHERE clause for the count + page queries.
+	where := "WHERE tenant_id = $1 AND project_id = $2"
+	args := []interface{}{tenantID, projectID}
+	if action != "" {
+		where += " AND action = $3"
+		args = append(args, action)
 	}
 
-	rows, err := h.db.Query(`
+	var total int
+	if err := h.db.QueryRow(
+		"SELECT COUNT(*) FROM construction_smeta_audit "+where, args...,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count project smeta audit", "error", err)
+		response.InternalError(c, "Failed to list audit log")
+		return
+	}
+
+	q := `
 		SELECT id, tenant_id, project_id, estimate_id,
 		       action, COALESCE(target, ''), line_id,
 		       COALESCE(from_value, ''), COALESCE(to_value, ''),
@@ -139,10 +164,12 @@ func (h *Handler) ListProjectSmetaAudit(c *gin.Context) {
 		       user_id, COALESCE(user_name, ''),
 		       created_at
 		FROM construction_smeta_audit
-		WHERE tenant_id = $1 AND project_id = $2
+		` + where + `
 		ORDER BY created_at DESC
-		LIMIT $3
-	`, tenantID, projectID, limit)
+		LIMIT ` + strconv.Itoa(pageSize) + ` OFFSET ` + strconv.Itoa(offset) + `
+	`
+
+	rows, err := h.db.Query(q, args...)
 	if err != nil {
 		h.log.Error("Failed to list project smeta audit", "error", err)
 		response.InternalError(c, "Failed to list audit log")
@@ -165,7 +192,7 @@ func (h *Handler) ListProjectSmetaAudit(c *gin.Context) {
 		}
 		out = append(out, e)
 	}
-	response.Success(c, out)
+	response.Paginated(c, out, page, pageSize, total)
 }
 
 // =====================================================
