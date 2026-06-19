@@ -173,14 +173,8 @@ func (h *Handler) ScanPurchaseReceipt(c *gin.Context) {
 	})
 }
 
-// extractReceiptLineItems calls Claude (Anthropic) with the image and returns parsed line items.
-func (h *Handler) extractReceiptLineItems(ctx context.Context, imageBase64, mimeType string) ([]receiptLineItem, error) {
-	apiKey := h.config.AI.APIKey
-	if apiKey == "" {
-		return nil, fmt.Errorf("AI API key not configured")
-	}
-
-	prompt := `You are a receipt/invoice scanner. Extract ALL product line items from this receipt or check image.
+// receiptScanPrompt is the shared instruction sent to whichever vision model.
+const receiptScanPrompt = `You are a receipt/invoice scanner. Extract ALL product line items from this receipt or check image.
 
 Return ONLY a valid JSON array with no extra text:
 [
@@ -195,40 +189,91 @@ Rules:
 - Include every line item you can read
 - Return ONLY the JSON array, no explanation`
 
-	requestBody := map[string]interface{}{
-		"model":      "claude-opus-4-6",
-		"max_tokens": 1024,
-		"messages": []map[string]interface{}{
-			{
-				"role": "user",
-				"content": []map[string]interface{}{
-					{
-						"type": "image",
-						"source": map[string]interface{}{
-							"type":       "base64",
-							"media_type": mimeType,
-							"data":       imageBase64,
-						},
-					},
-					{
-						"type": "text",
-						"text": prompt,
-					},
-				},
-			},
-		},
+// extractReceiptLineItems calls the configured AI provider (OpenAI or Anthropic)
+// with the receipt image and returns parsed line items. The provider is taken
+// from config.AI.Provider; if unset it's inferred from the endpoint. This lets
+// the feature work with either an OpenAI (gpt-4o vision) or an Anthropic
+// (Claude) key without code changes.
+func (h *Handler) extractReceiptLineItems(ctx context.Context, imageBase64, mimeType string) ([]receiptLineItem, error) {
+	apiKey := h.config.AI.APIKey
+	if apiKey == "" {
+		return nil, fmt.Errorf("AI API key not configured")
 	}
 
-	body, err := json.Marshal(requestBody)
+	provider := strings.ToLower(strings.TrimSpace(h.config.AI.Provider))
+	endpoint := strings.TrimSpace(h.config.AI.Endpoint)
+	if provider == "" {
+		// Infer from the endpoint; default to OpenAI (also covers OpenAI-compatible).
+		if strings.Contains(endpoint, "anthropic") {
+			provider = "anthropic"
+		} else {
+			provider = "openai"
+		}
+	}
+
+	if provider == "anthropic" {
+		return h.extractReceiptViaAnthropic(ctx, apiKey, endpoint, imageBase64, mimeType)
+	}
+	return h.extractReceiptViaOpenAI(ctx, apiKey, endpoint, imageBase64, mimeType)
+}
+
+// postReceiptAI sends the prepared request, enforces a timeout, and returns the
+// raw body or an error (non-200 included).
+func postReceiptAI(req *http.Request) ([]byte, error) {
+	httpClient := &http.Client{Timeout: 35 * time.Second}
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
+		return nil, fmt.Errorf("send request: %w", err)
 	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+	}
+	return respBody, nil
+}
 
-	endpoint := h.config.AI.Endpoint
+// parseReceiptItemsJSON pulls the first JSON array out of a model text response.
+func parseReceiptItemsJSON(text string) ([]receiptLineItem, error) {
+	start := strings.Index(text, "[")
+	end := strings.LastIndex(text, "]")
+	if start < 0 || end <= start {
+		return nil, fmt.Errorf("no JSON array in AI response")
+	}
+	var items []receiptLineItem
+	if err := json.Unmarshal([]byte(text[start:end+1]), &items); err != nil {
+		return nil, fmt.Errorf("parse items JSON: %w", err)
+	}
+	return items, nil
+}
+
+// extractReceiptViaAnthropic uses Claude's vision messages API.
+func (h *Handler) extractReceiptViaAnthropic(ctx context.Context, apiKey, endpoint, imageBase64, mimeType string) ([]receiptLineItem, error) {
+	model := strings.TrimSpace(h.config.AI.Model)
+	if !strings.HasPrefix(model, "claude") {
+		// config default ("gpt-4") isn't a Claude id — use a valid vision model.
+		model = "claude-opus-4-8"
+	}
 	if endpoint == "" || !strings.Contains(endpoint, "anthropic") {
 		endpoint = "https://api.anthropic.com/v1/messages"
 	}
-
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": []map[string]interface{}{
+				{"type": "image", "source": map[string]interface{}{"type": "base64", "media_type": mimeType, "data": imageBase64}},
+				{"type": "text", "text": receiptScanPrompt},
+			}},
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -237,22 +282,10 @@ Rules:
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
-	httpClient := &http.Client{Timeout: 35 * time.Second}
-	resp, err := httpClient.Do(req)
+	respBody, err := postReceiptAI(req)
 	if err != nil {
-		return nil, fmt.Errorf("send request: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
-	}
-
 	var apiResp struct {
 		Content []struct {
 			Type string `json:"type"`
@@ -265,19 +298,58 @@ Rules:
 	if len(apiResp.Content) == 0 {
 		return nil, fmt.Errorf("empty AI response")
 	}
+	return parseReceiptItemsJSON(apiResp.Content[0].Text)
+}
 
-	text := apiResp.Content[0].Text
-
-	// Extract JSON array from text
-	start := strings.Index(text, "[")
-	end := strings.LastIndex(text, "]")
-	if start < 0 || end <= start {
-		return nil, fmt.Errorf("no JSON array in AI response")
+// extractReceiptViaOpenAI uses OpenAI's (or an OpenAI-compatible) chat
+// completions API with a vision-capable model.
+func (h *Handler) extractReceiptViaOpenAI(ctx context.Context, apiKey, endpoint, imageBase64, mimeType string) ([]receiptLineItem, error) {
+	model := strings.TrimSpace(h.config.AI.Model)
+	// The config default "gpt-4" is text-only; vision needs a 4o/4.1-class model.
+	if model == "" || model == "gpt-4" || model == "gpt-3.5-turbo" || strings.HasPrefix(model, "claude") {
+		model = "gpt-4o"
 	}
-
-	var items []receiptLineItem
-	if err := json.Unmarshal([]byte(text[start:end+1]), &items); err != nil {
-		return nil, fmt.Errorf("parse items JSON: %w", err)
+	if endpoint == "" || strings.Contains(endpoint, "anthropic") {
+		endpoint = "https://api.openai.com/v1/chat/completions"
 	}
-	return items, nil
+	dataURL := "data:" + mimeType + ";base64," + imageBase64
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": []map[string]interface{}{
+				{"type": "text", "text": receiptScanPrompt},
+				{"type": "image_url", "image_url": map[string]interface{}{"url": dataURL}},
+			}},
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	respBody, err := postReceiptAI(req)
+	if err != nil {
+		return nil, err
+	}
+	var apiResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if len(apiResp.Choices) == 0 {
+		return nil, fmt.Errorf("empty AI response")
+	}
+	return parseReceiptItemsJSON(apiResp.Choices[0].Message.Content)
 }

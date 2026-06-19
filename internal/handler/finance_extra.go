@@ -1007,6 +1007,25 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	baseWhere := " WHERE ra.tenant_id = $1 AND ra.deleted_at IS NULL"
+	whereExtra := ""
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND ra.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
+	if status := c.Query("status"); status != "" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND ra.status = $%d", argCount)
+		args = append(args, status)
+	}
+
 	query := `
 		SELECT ra.id, ra.partner_id, COALESCE(ct.name, '') as partner_name,
 			   ra.period_start, ra.period_end,
@@ -1016,25 +1035,12 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 			   ra.sent_at, ra.sent_via, ra.sent_to,
 			   COALESCE(ra.reminder_3d_sent, false), COALESCE(ra.reminder_7d_sent, false)
 		FROM reconciliation_acts ra
-		LEFT JOIN contacts ct ON ra.partner_id = ct.id
-		WHERE ra.tenant_id = $1 AND ra.deleted_at IS NULL
-	`
-	args := []interface{}{tenantID}
-	argCount := 1
+		LEFT JOIN contacts ct ON ra.partner_id = ct.id` + baseWhere + whereExtra + " ORDER BY ra.created_at DESC"
 
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		query += fmt.Sprintf(" AND ra.organization_id = $%d", argCount)
-		args = append(args, orgID)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
 	}
-
-	if status := c.Query("status"); status != "" {
-		argCount++
-		query += fmt.Sprintf(" AND ra.status = $%d", argCount)
-		args = append(args, status)
-	}
-
-	query += " ORDER BY ra.created_at DESC"
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -1115,7 +1121,14 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 		acts = append(acts, a)
 	}
 
-	response.Success(c, acts)
+	if !paginate {
+		response.Success(c, acts)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM reconciliation_acts ra"+baseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, acts, page, pageSize, total)
 }
 
 type createReconciliationActInput struct {
