@@ -1058,7 +1058,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 
 	// Odoo-style: AR + per-category Income + COGS/Interim clearing
 	// 1. Try contact's default receivable account
-	arAccountID := getContactDefaultAccount(tx, customerID, "receivable")
+	arAccountID := getContactDefaultAccount(tx, customerID, "receivable", organizationID)
 	// 2. Fallback to standard findAccount
 	if arAccountID == uuid.Nil {
 		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")

@@ -3987,7 +3987,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	if paymentType == "receipt" {
 		// Inbound: customer pays us → Debit Cash, Credit AR
 		// 1. Try contact's default receivable account
-		counterAccountID = getContactDefaultAccount(tx, contactID, "receivable")
+		counterAccountID = getContactDefaultAccount(tx, contactID, "receivable", orgIDPtr)
 		// 2. Fallback to standard findAccount chain
 		if counterAccountID == uuid.Nil {
 			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "4010")
@@ -4005,7 +4005,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	} else {
 		// Outbound: we pay vendor → Debit AP, Credit Cash
 		// 1. Try contact's default payable account
-		counterAccountID = getContactDefaultAccount(tx, contactID, "payable")
+		counterAccountID = getContactDefaultAccount(tx, contactID, "payable", orgIDPtr)
 		// 2. Fallback to standard findAccount chain
 		if counterAccountID == uuid.Nil {
 			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
