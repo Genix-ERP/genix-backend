@@ -680,7 +680,7 @@ func resolveLeafAccount(q dbQuerier, accountID uuid.UUID) uuid.UUID {
 
 // getContactDefaultAccount returns the contact's default receivable or payable account.
 // accountType should be "receivable" or "payable".
-func getContactDefaultAccount(q dbQuerier, contactID uuid.UUID, accountType string) uuid.UUID {
+func getContactDefaultAccount(q dbQuerier, contactID uuid.UUID, accountType string, orgID *uuid.UUID) uuid.UUID {
 	var id uuid.UUID
 	col := "default_receivable_account_id"
 	if accountType == "payable" {
@@ -690,6 +690,32 @@ func getContactDefaultAccount(q dbQuerier, contactID uuid.UUID, accountType stri
 		fmt.Sprintf(`SELECT %s FROM contacts WHERE id = $1 AND %s IS NOT NULL AND deleted_at IS NULL`, col, col),
 		contactID,
 	).Scan(&id)
+	if id == uuid.Nil {
+		return uuid.Nil
+	}
+	// Organization guard. A contact is tenant-level, but its default AR/AP
+	// account MUST belong to the same organization as the document being
+	// posted (or be a shared, org-less account). Without this, posting an
+	// invoice/payment in org A for a contact whose default account lives in
+	// org B splits the journal entry across two companies — each org's trial
+	// balance then can't balance. Observed in prod: sales invoices crediting
+	// EVROPLIT revenue while debiting a NASAF AVENUE AR (4010), leaving
+	// EVROPLIT short and NASAF long by the same amount. Returning Nil here
+	// makes the caller fall back to its org-scoped findAccount() lookup.
+	if orgID != nil {
+		var matches bool
+		_ = q.QueryRow(
+			`SELECT EXISTS(
+				SELECT 1 FROM accounts
+				WHERE id = $1 AND deleted_at IS NULL
+				  AND (organization_id = $2 OR organization_id IS NULL)
+			)`,
+			id, *orgID,
+		).Scan(&matches)
+		if !matches {
+			return uuid.Nil
+		}
+	}
 	// Same TT §4.2 protection as getCategoryAccounts: if the contact
 	// was configured with a group AR/AP account (e.g. 4010 instead of
 	// a leaf 4010.10), drop down to a leaf descendant rather than
