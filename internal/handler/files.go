@@ -2,17 +2,19 @@ package handler
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // FileUploadResponse represents the response after file upload
@@ -25,7 +27,27 @@ type FileUploadResponse struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// UploadFile handles file upload
+// insertUploadedFile persists an uploaded file's bytes in the database. It is
+// shared by every upload path (generic /files/upload, work-order attachments,
+// etc.) so that file storage is centralized in Postgres rather than on disk.
+// tenantID / userID may be uuid.Nil, in which case they are stored as NULL.
+func (h *Handler) insertUploadedFile(id, filename, mimeType string, size int64, content []byte, tenantID, userID uuid.UUID) error {
+	_, err := h.db.Exec(`
+		INSERT INTO uploaded_files (id, filename, mime_type, size, content, tenant_id, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, id, filename, mimeType, size, content, nullableUUID(tenantID), nullableUUID(userID))
+	return err
+}
+
+// nullableUUID returns nil for the zero UUID so it is stored as SQL NULL.
+func nullableUUID(id uuid.UUID) interface{} {
+	if id == uuid.Nil {
+		return nil
+	}
+	return id
+}
+
+// UploadFile handles file upload, storing the bytes in the database.
 func (h *Handler) UploadFile(c *gin.Context) {
 	// Get the file from the request
 	file, header, err := c.Request.FormFile("file")
@@ -42,14 +64,10 @@ func (h *Handler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Detect MIME type
+	// Detect MIME type from the first 512 bytes
 	buffer := make([]byte, 512)
-	_, err = file.Read(buffer)
-	if err != nil {
-		response.Error(c, http.StatusInternalServerError, "READ_ERROR", "Failed to read file")
-		return
-	}
-	mimeType := http.DetectContentType(buffer)
+	n, _ := file.Read(buffer)
+	mimeType := http.DetectContentType(buffer[:n])
 
 	// Reset file reader position
 	file.Seek(0, io.SeekStart)
@@ -87,77 +105,40 @@ func (h *Handler) UploadFile(c *gin.Context) {
 		}
 	}
 
-	// Generate unique file ID
-	fileID := generateFileID()
-
-	// Get file extension
-	ext := filepath.Ext(header.Filename)
-	if ext == "" {
-		// Try to determine extension from MIME type
-		ext = getExtensionFromMimeType(mimeType)
-	}
-
-	// Create storage directory structure: storage/uploads/YYYY/MM/
-	now := time.Now()
-	subDir := fmt.Sprintf("%d/%02d", now.Year(), now.Month())
-	storageDir := filepath.Join(h.config.Storage.LocalPath, "uploads", subDir)
-
-	// Create directory if it doesn't exist
-	if err := os.MkdirAll(storageDir, 0755); err != nil {
-		h.log.Error("Failed to create storage directory", "error", err)
-		response.Error(c, http.StatusInternalServerError, "STORAGE_ERROR", "Failed to create storage directory")
+	// Read the full content into memory for database storage
+	content, err := io.ReadAll(file)
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "READ_ERROR", "Failed to read file")
 		return
 	}
 
-	// Full filename with ID and extension
-	storedFilename := fileID + ext
-	filePath := filepath.Join(storageDir, storedFilename)
+	// Generate unique file ID (also serves as the public capability token)
+	fileID := generateFileID()
 
-	// Create the destination file
-	dst, err := os.Create(filePath)
-	if err != nil {
-		h.log.Error("Failed to create file", "error", err)
+	// Ownership is optional but normally present (upload requires auth)
+	tenantID, _ := middleware.GetTenantID(c)
+	userID, _ := middleware.GetUserID(c)
+
+	if err := h.insertUploadedFile(fileID, header.Filename, mimeType, int64(len(content)), content, tenantID, userID); err != nil {
+		h.log.Error("Failed to store uploaded file", "error", err)
 		response.Error(c, http.StatusInternalServerError, "STORAGE_ERROR", "Failed to save file")
 		return
 	}
-	defer dst.Close()
-
-	// Copy the uploaded file to destination
-	if _, err := io.Copy(dst, file); err != nil {
-		h.log.Error("Failed to write file", "error", err)
-		response.Error(c, http.StatusInternalServerError, "STORAGE_ERROR", "Failed to write file")
-		return
-	}
-
-	// Generate the URL for the file
-	// URL format: /api/v1/files/{id}
-	fileURL := fmt.Sprintf("/api/v1/files/%s", fileID)
-
-	// Also store file metadata in a simple way (could be moved to DB later)
-	metadataPath := filepath.Join(storageDir, fileID+".meta")
-	metadata := fmt.Sprintf("%s\n%s\n%d\n%s\n%s",
-		header.Filename,
-		mimeType,
-		header.Size,
-		filePath,
-		time.Now().Format(time.RFC3339),
-	)
-	os.WriteFile(metadataPath, []byte(metadata), 0644)
 
 	resp := FileUploadResponse{
 		ID:        fileID,
-		URL:       fileURL,
+		URL:       fmt.Sprintf("/api/v1/files/%s", fileID),
 		Filename:  header.Filename,
-		Size:      header.Size,
+		Size:      int64(len(content)),
 		MimeType:  mimeType,
 		CreatedAt: time.Now().Format(time.RFC3339),
 	}
 
-	h.log.Info("File uploaded successfully", "id", fileID, "filename", header.Filename, "size", header.Size)
+	h.log.Info("File uploaded successfully", "id", fileID, "filename", header.Filename, "size", len(content))
 	response.Created(c, resp)
 }
 
-// GetFile serves a file by ID
+// GetFile serves a file by ID from the database.
 func (h *Handler) GetFile(c *gin.Context) {
 	fileID := c.Param("id")
 	if fileID == "" {
@@ -165,95 +146,38 @@ func (h *Handler) GetFile(c *gin.Context) {
 		return
 	}
 
-	// Search for the file in storage directories
-	// Files are stored in: storage/uploads/YYYY/MM/
-	storageBase := filepath.Join(h.config.Storage.LocalPath, "uploads")
-
-	var filePath string
-	var originalFilename string
-	var mimeType string
-
-	// Walk through the storage directory to find the file
-	err := filepath.Walk(storageBase, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
-		}
-		if info.IsDir() {
-			return nil
-		}
-		// Check if this is a metadata file for our file ID
-		if strings.HasSuffix(info.Name(), ".meta") && strings.HasPrefix(info.Name(), fileID) {
-			// Read metadata
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return nil
-			}
-			lines := strings.Split(string(data), "\n")
-			if len(lines) >= 4 {
-				originalFilename = lines[0]
-				mimeType = lines[1]
-				filePath = lines[3]
-			}
-			return filepath.SkipAll // Found it, stop searching
-		}
-		return nil
-	})
-
-	if err != nil || filePath == "" {
-		// Try to find file directly by pattern
-		err = filepath.Walk(storageBase, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if info.IsDir() {
-				return nil
-			}
-			// Check if filename starts with our file ID (excluding .meta files)
-			if strings.HasPrefix(info.Name(), fileID) && !strings.HasSuffix(info.Name(), ".meta") {
-				filePath = path
-				originalFilename = info.Name()
-				return filepath.SkipAll
-			}
-			return nil
-		})
-	}
-
-	if filePath == "" {
+	var (
+		filename string
+		mimeType string
+		content  []byte
+	)
+	err := h.db.QueryRow(`
+		SELECT filename, mime_type, content FROM uploaded_files WHERE id = $1
+	`, fileID).Scan(&filename, &mimeType, &content)
+	if err == sql.ErrNoRows {
 		response.NotFound(c, "File")
 		return
 	}
-
-	// Check if file exists
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		response.NotFound(c, "File")
+	if err != nil {
+		h.log.Error("Failed to read uploaded file", "error", err, "id", fileID)
+		response.Error(c, http.StatusInternalServerError, "READ_ERROR", "Failed to read file")
 		return
 	}
 
-	// Detect content type if not found in metadata
 	if mimeType == "" {
-		file, err := os.Open(filePath)
-		if err != nil {
-			response.Error(c, http.StatusInternalServerError, "READ_ERROR", "Failed to read file")
-			return
-		}
-		defer file.Close()
-
-		buffer := make([]byte, 512)
-		file.Read(buffer)
-		mimeType = http.DetectContentType(buffer)
+		mimeType = http.DetectContentType(content)
 	}
 
-	// Set headers
-	c.Header("Content-Type", mimeType)
-	if originalFilename != "" {
-		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", originalFilename))
+	if filename != "" {
+		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", filename))
 	}
-
-	// Serve the file
-	c.File(filePath)
+	// Files are immutable (content is addressed by a random id), so allow the
+	// browser to cache them aggressively — important for logos/favicons.
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.Data(http.StatusOK, mimeType, content)
 }
 
-// DeleteFile deletes a file by ID
+// DeleteFile deletes a file by ID from the database.
 func (h *Handler) DeleteFile(c *gin.Context) {
 	fileID := c.Param("id")
 	if fileID == "" {
@@ -261,22 +185,13 @@ func (h *Handler) DeleteFile(c *gin.Context) {
 		return
 	}
 
-	// Search for the file in storage directories
-	storageBase := filepath.Join(h.config.Storage.LocalPath, "uploads")
-	var found bool
-
-	filepath.Walk(storageBase, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
-		}
-		if strings.HasPrefix(info.Name(), fileID) {
-			os.Remove(path)
-			found = true
-		}
-		return nil
-	})
-
-	if !found {
+	res, err := h.db.Exec(`DELETE FROM uploaded_files WHERE id = $1`, fileID)
+	if err != nil {
+		h.log.Error("Failed to delete uploaded file", "error", err, "id", fileID)
+		response.Error(c, http.StatusInternalServerError, "STORAGE_ERROR", "Failed to delete file")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
 		response.NotFound(c, "File")
 		return
 	}
@@ -289,35 +204,6 @@ func generateFileID() string {
 	bytes := make([]byte, 16)
 	rand.Read(bytes)
 	return hex.EncodeToString(bytes)
-}
-
-// getExtensionFromMimeType returns file extension based on MIME type
-func getExtensionFromMimeType(mimeType string) string {
-	mimeToExt := map[string]string{
-		"image/jpeg":      ".jpg",
-		"image/png":       ".png",
-		"image/gif":       ".gif",
-		"image/webp":      ".webp",
-		"image/svg+xml":   ".svg",
-		"application/pdf": ".pdf",
-		"text/plain":      ".txt",
-		"text/html":       ".html",
-		"text/css":        ".css",
-		"application/json": ".json",
-		"application/xml":  ".xml",
-		"application/zip":  ".zip",
-		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-		"application/vnd.ms-excel": ".xls",
-		"application/msword":       ".doc",
-		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-	}
-
-	for prefix, ext := range mimeToExt {
-		if strings.HasPrefix(mimeType, prefix) {
-			return ext
-		}
-	}
-	return ""
 }
 
 // getMimeTypeFromExtension returns the canonical MIME type for a given file extension.
