@@ -215,11 +215,27 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 	// is unsafe; instead call it within this tx is not possible (helper uses h.db).
 	// We therefore defer work-order generation + extra-component attach to AFTER commit.
 
-	// ---- 4b. Upfront payment → posted cash-receipt (DR Cash / CR AR) ----
-	glPosted := false
+	// ---- 4b. Hisob-faktura + GL — ONLY when the customer paid upfront ----
+	// Дониёр's rule: a payment present → auto-create the invoice and post the
+	// full double-entry; no payment → leave the invoice for manual creation.
+	// Two balanced journal entries are posted, net effect:
+	//   Sales Revenue += total
+	//   Cash          += paid
+	//   Accounts Recv += (total - paid)   (the remaining owed)
+	// so the invoice shows total / paid / remaining correctly instead of the
+	// full amount with zero paid.
+	var invoiceID uuid.UUID
+	invoicePosted := false
+	receiptPosted := false
 	if paid > 0 {
-		glPosted = h.postUpfrontReceipt(tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber, paid, userID, now)
+		// Leg 1: issue the invoice — DR Accounts Receivable / CR Sales Revenue.
+		invoiceID, invoicePosted = h.createInvoiceAndPostIssuance(
+			tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber,
+			productID, qty, unitPrice, total, paid, paymentStatus, in.Notes, userID, now)
+		// Leg 2: record the cash receipt — DR Cash / CR Accounts Receivable.
+		receiptPosted = h.postUpfrontReceipt(tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber, paid, userID, now)
 	}
+	glPosted := invoicePosted && receiptPosted
 
 	// ---- 5. Commit, then generate work orders + attach extras ----
 	if err := tx.Commit(); err != nil {
@@ -239,6 +255,10 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 	// Attach extra components to the MO (shop-floor extras).
 	h.attachExtraComponents(tenantID, productionOrderID, in.Components, userID)
 
+	var invoiceIDOut interface{}
+	if invoiceID != uuid.Nil {
+		invoiceIDOut = invoiceID
+	}
 	response.Success(c, gin.H{
 		"customer_id":         customerID,
 		"sales_order_id":      salesOrderID,
@@ -249,8 +269,152 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 		"total":               total,
 		"paid":                paid,
 		"remaining":           total - paid,
+		"invoice_id":          invoiceIDOut, // null when no upfront payment
+		"invoice_created":     invoiceID != uuid.Nil,
 		"gl_posted":           glPosted,
 	})
+}
+
+// createInvoiceAndPostIssuance creates a sales_invoices row (+ one line for the
+// manufactured product) for the full-order total and posts the invoice-issuance
+// journal entry:
+//
+//	DR Accounts Receivable (total)  /  CR Sales Revenue (total)
+//
+// It does NOT post the cash receipt — that's postUpfrontReceipt's job (DR Cash /
+// CR AR). Called only when paid > 0; the two together net to Revenue += total,
+// Cash += paid, AR += (total - paid). The invoice row carries amount_paid/status
+// so the UI shows total / paid / remaining instead of the full amount unpaid.
+//
+// Best-effort GL: the invoice row + line always save (so the hisob-faktura
+// exists with correct paid/remaining); if the sales journal / AR / revenue
+// account can't be resolved we skip the journal, bump only the customer's
+// owed balance, and return false — mirroring how the rest of the full-order
+// flow degrades on a half-configured chart of accounts.
+func (h *Handler) createInvoiceAndPostIssuance(
+	tx *sql.Tx, tenantID, orgID uuid.UUID, orgArg interface{},
+	customerID, salesOrderID uuid.UUID, orderNumber string,
+	productID uuid.UUID, qty, unitPrice, total, paid float64,
+	paymentStatus string, notes string, userID uuid.UUID, now time.Time,
+) (uuid.UUID, bool) {
+	var orgPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgPtr = &orgID
+	}
+
+	// Only 'paid'/'partial' reach here (paid > 0); use it verbatim as the
+	// invoice status (sales_invoices uses the same vocabulary).
+	invStatus := paymentStatus
+
+	invoiceID := uuid.New()
+	invoiceNumber := "INV-" + now.Format("20060102") + "-" + uuid.New().String()[:6]
+	dueDate := now.AddDate(0, 0, 30)
+
+	if _, err := tx.Exec(`
+		INSERT INTO sales_invoices (
+			id, tenant_id, organization_id, invoice_number, customer_id, sales_order_id,
+			invoice_date, due_date, subtotal, discount_amount, tax_amount, total_amount,
+			amount_paid, status, notes, created_by, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,0,$9,$10,$11,$12,$13,$14,$14)`,
+		invoiceID, tenantID, orgArg, invoiceNumber, customerID, salesOrderID,
+		now, dueDate, total, paid, invStatus, nullIfEmpty(notes), userID, now,
+	); err != nil {
+		h.log.Error("full-order: create sales invoice", "error", err)
+		return uuid.Nil, false
+	}
+	// One line for the manufactured product (no tax/discount — net amount).
+	if _, err := tx.Exec(`
+		INSERT INTO sales_invoice_lines (
+			id, sales_invoice_id, line_number, product_id, description,
+			quantity, unit_price, discount_amount, tax_amount, line_total, created_at
+		) VALUES ($1,$2,1,$3,$4,$5,$6,0,0,$7,$8)`,
+		uuid.New(), invoiceID, productID, nullIfEmpty(orderNumber+" — mahsulot"),
+		qty, unitPrice, total, now,
+	); err != nil {
+		h.log.Error("full-order: create sales invoice line", "error", err)
+		// invoice row is saved; fall through to GL best-effort.
+	}
+
+	// ---- Resolve accounts for the issuance leg ----
+	// AR: customer's default receivable, then 4010 (matches postUpfrontReceipt
+	// so both legs hit the same AR account and net cleanly).
+	arAccountID := getContactDefaultAccount(tx, customerID, "receivable", orgPtr)
+	if arAccountID == uuid.Nil {
+		arAccountID = findAccount(tx, tenantID, orgPtr, "debitor", "4010")
+	}
+	if arAccountID == uuid.Nil {
+		arAccountID = findAccount(tx, tenantID, orgPtr, "accounts receivable", "4010")
+	}
+	// Revenue: product category income account, falling back to 9010 internally.
+	revenueAccountID := getCategoryAccounts(tx, tenantID, orgPtr, productID).IncomeAccountID
+	if revenueAccountID == uuid.Nil {
+		revenueAccountID = findAccount(tx, tenantID, orgPtr, "sales revenue", "9010")
+	}
+	if arAccountID == uuid.Nil || revenueAccountID == uuid.Nil {
+		h.log.Error("full-order: cannot resolve AR/Revenue; invoice GL not posted", "ar", arAccountID, "rev", revenueAccountID)
+		// No GL movement, but keep the denormalized customer balance honest.
+		tx.Exec(`UPDATE contacts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, customerID)
+		return invoiceID, false
+	}
+
+	// ---- Journal: prefer SALES/SAL, then GENERAL, scoped to org ----
+	var journalID uuid.UUID
+	var numberPrefix sql.NullString
+	_ = tx.QueryRow(`
+		SELECT id, number_prefix FROM journals
+		WHERE tenant_id=$1 AND deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR organization_id=$2 OR organization_id IS NULL)
+		ORDER BY CASE WHEN code IN ('SALES','SAL') THEN 0 WHEN code='GENERAL' THEN 1 ELSE 2 END,
+		         CASE WHEN organization_id=$2 THEN 0 ELSE 1 END
+		LIMIT 1`, tenantID, orgArg).Scan(&journalID, &numberPrefix)
+	if journalID == uuid.Nil {
+		h.log.Error("full-order: no sales journal; invoice GL not posted")
+		tx.Exec(`UPDATE contacts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, customerID)
+		return invoiceID, false
+	}
+
+	prefix := ""
+	if numberPrefix.Valid {
+		prefix = numberPrefix.String
+	}
+	var nextNumber int
+	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number,'[^0-9]','','g') AS BIGINT)),0)+1
+		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL`, tenantID, journalID).Scan(&nextNumber)
+	if nextNumber < 1 {
+		nextNumber = 1
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+	desc := fmt.Sprintf("%s — hisob-faktura (sales invoice)", invoiceNumber)
+
+	jeID := uuid.New()
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+		                             source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'sales_invoice',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
+		jeID, tenantID, orgArg, journalID, entryNumber, now, invoiceNumber, desc, invoiceID.String(), total, userID, now); err != nil {
+		h.log.Error("full-order: invoice JE insert failed", "error", err)
+		tx.Exec(`UPDATE contacts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, customerID)
+		return invoiceID, false
+	}
+	// DR Accounts Receivable (customer on the AR line).
+	if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+		VALUES ($1,$2,1,$3,$4,$5,$6,0,1.0,$7)`, uuid.New(), jeID, arAccountID, customerID, desc, total, now); err != nil {
+		h.log.Error("full-order: AR debit line failed", "error", err)
+		return invoiceID, false
+	}
+	// CR Sales Revenue (no contact on the revenue line).
+	if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+		VALUES ($1,$2,2,$3,NULL,$4,0,$5,1.0,$6)`, uuid.New(), jeID, revenueAccountID, desc, total, now); err != nil {
+		h.log.Error("full-order: revenue credit line failed", "error", err)
+		return invoiceID, false
+	}
+	// Balances + denormalized customer owed + invoice↔JE link + journal counter.
+	tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, arAccountID)
+	tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, revenueAccountID)
+	tx.Exec(`UPDATE contacts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, customerID)
+	tx.Exec(`UPDATE sales_invoices SET journal_entry_id=$1 WHERE id=$2`, jeID, invoiceID)
+	tx.Exec(`UPDATE journals SET next_number = GREATEST(COALESCE(next_number,1), $1) WHERE id=$2`, nextNumber+1, journalID)
+	return invoiceID, true
 }
 
 // postUpfrontReceipt posts a cash-receipt journal entry (DR Cash / CR Accounts
