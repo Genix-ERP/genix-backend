@@ -1226,6 +1226,9 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const journalsBaseWhere = "WHERE j.tenant_id = $1 AND j.deleted_at IS NULL"
 	query := `
 		SELECT j.id, j.code, j.name, COALESCE(j.name_uz, ''), COALESCE(j.name_en, ''), j.type,
 			COALESCE(j.description, ''),
@@ -1245,18 +1248,23 @@ func (h *Handler) ListJournals(c *gin.Context) {
 			j.created_at,
 			COALESCE(j.updated_at, j.created_at)
 		FROM journals j
-		WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
-		ORDER BY j.code ASC
-	`
+		` + journalsBaseWhere
 
 	args := []interface{}{tenantID}
 	argCount := 1
+	whereExtra := ""
 
 	// Filter by organization (also include journals with NULL organization_id as they belong to all orgs in the tenant)
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND (j.organization_id = $%d OR j.organization_id IS NULL) ORDER BY", argCount), 1)
+		whereExtra += fmt.Sprintf(" AND (j.organization_id = $%d OR j.organization_id IS NULL)", argCount)
 		args = append(args, orgID)
+	}
+
+	query += whereExtra + " ORDER BY j.code ASC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
 	}
 
 	rows, err := h.db.Query(query, args...)
@@ -1307,7 +1315,14 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		journals = append(journals, j)
 	}
 
-	response.Success(c, journals)
+	if !paginate {
+		response.Success(c, journals)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM journals j `+journalsBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, journals, page, pageSize, total)
 }
 
 // ListPaymentJournals returns only bank/cash journals for payment flows.
@@ -1319,6 +1334,11 @@ func (h *Handler) ListPaymentJournals(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const paymentJournalsBaseWhere = `WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
+		  AND j.type IN ('bank', 'cash')
+		  AND COALESCE(j.is_active, true) = true`
 	query := `
 		SELECT j.id, j.code, j.name, COALESCE(j.name_uz, ''), COALESCE(j.name_en, ''), j.type,
 			COALESCE(j.short_code, ''), COALESCE(j.currency, ''),
@@ -1326,19 +1346,22 @@ func (h *Handler) ListPaymentJournals(c *gin.Context) {
 			j.bank_account_id, j.suspense_account_id,
 			j.profit_account_id, j.loss_account_id
 		FROM journals j
-		WHERE j.tenant_id = $1 AND j.deleted_at IS NULL
-		  AND j.type IN ('bank', 'cash')
-		  AND COALESCE(j.is_active, true) = true
-		ORDER BY j.code ASC
-	`
+		` + paymentJournalsBaseWhere
 
 	args := []interface{}{tenantID}
 	argCount := 1
+	whereExtra := ""
 
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query = strings.Replace(query, "ORDER BY", fmt.Sprintf("AND (j.organization_id = $%d OR j.organization_id IS NULL) ORDER BY", argCount), 1)
+		whereExtra += fmt.Sprintf(" AND (j.organization_id = $%d OR j.organization_id IS NULL)", argCount)
 		args = append(args, orgID)
+	}
+
+	query += whereExtra + " ORDER BY j.code ASC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
 	}
 
 	rows, err := h.db.Query(query, args...)
@@ -1382,7 +1405,14 @@ func (h *Handler) ListPaymentJournals(c *gin.Context) {
 		journals = append(journals, j)
 	}
 
-	response.Success(c, journals)
+	if !paginate {
+		response.Success(c, journals)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM journals j `+paymentJournalsBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, journals, page, pageSize, total)
 }
 
 // GetJournal godoc
@@ -2167,12 +2197,16 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 	year := entryDate.Year()
 	yearPrefix := fmt.Sprintf("%s-%d-", prefix, year)
 
+	// Entry numbers are unique per (tenant, org) across ALL journals
+	// (journal_entries_tenant_org_entry_number_key), so the max must be taken
+	// at that scope: journal-scoped numbering collides as soon as two journals
+	// share a number_prefix (e.g. both empty).
 	var maxNumber int
 	_ = h.db.QueryRow(
 		`SELECT COALESCE(MAX(
 			CAST(SUBSTRING(entry_number FROM '[0-9]+$') AS INTEGER)
-		), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
-		tenantID, journalID, yearPrefix+"%",
+		), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
+		tenantID, orgID, yearPrefix+"%",
 	).Scan(&maxNumber)
 
 	actualNext := maxNumber + 1
@@ -2788,12 +2822,13 @@ func (h *Handler) ReverseJournalEntry(c *gin.Context) {
 	reversalYear := time.Now().Year()
 	yearPrefix := fmt.Sprintf("%s-%d-", prefix, reversalYear)
 
+	// Max at (tenant, org) scope to match journal_entries_tenant_org_entry_number_key.
 	var maxNumber int
 	_ = h.db.QueryRow(
 		`SELECT COALESCE(MAX(
 			CAST(SUBSTRING(entry_number FROM '[0-9]+$') AS INTEGER)
-		), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
-		tenantID, journalID, yearPrefix+"%",
+		), 0) FROM journal_entries WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
+		tenantID, organizationID, yearPrefix+"%",
 	).Scan(&maxNumber)
 
 	actualNext := maxNumber + 1
@@ -3901,9 +3936,14 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	var cashAccountID uuid.UUID
 	var cashAccountBalance float64
 
-	// 1. Use explicit bank_account_id if provided
+	// 1. Use explicit bank_account_id if provided. payments.bank_account_id
+	//    references bank_accounts(id), not the GL chart of accounts — resolve
+	//    through the bank account's linked GL account (NULL → fall through).
 	if bankAccountIDStr.Valid {
-		cashAccountID, _ = uuid.Parse(bankAccountIDStr.String)
+		_ = tx.QueryRow(
+			`SELECT COALESCE(account_id, '00000000-0000-0000-0000-000000000000') FROM bank_accounts WHERE id = $1 AND tenant_id = $2`,
+			bankAccountIDStr.String, tenantID,
+		).Scan(&cashAccountID)
 	}
 
 	// 2. Use journal's default account — journal is already linked to its account
@@ -3921,13 +3961,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		if jType.Valid && jType.String == "cash" {
 			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
 		} else if jType.Valid && jType.String == "bank" {
-			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
+			cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "5110")
 		}
 	}
 
 	// 4. Last fallback: find by account code
 	if cashAccountID == uuid.Nil {
-		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank", "5110")
+		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "bank account", "5110")
 	}
 	if cashAccountID == uuid.Nil {
 		cashAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
@@ -3957,7 +3997,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	if paymentType == "receipt" {
 		// Inbound: customer pays us → Debit Cash, Credit AR
 		// 1. Try contact's default receivable account
-		counterAccountID = getContactDefaultAccount(tx, contactID, "receivable")
+		counterAccountID = getContactDefaultAccount(tx, contactID, "receivable", orgIDPtr)
 		// 2. Fallback to standard findAccount chain
 		if counterAccountID == uuid.Nil {
 			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts receivable", "4010")
@@ -3975,7 +4015,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	} else {
 		// Outbound: we pay vendor → Debit AP, Credit Cash
 		// 1. Try contact's default payable account
-		counterAccountID = getContactDefaultAccount(tx, contactID, "payable")
+		counterAccountID = getContactDefaultAccount(tx, contactID, "payable", orgIDPtr)
 		// 2. Fallback to standard findAccount chain
 		if counterAccountID == uuid.Nil {
 			counterAccountID = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
@@ -4011,11 +4051,32 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			).Scan(&journalID, &nextNumber, &numberPrefix)
 		}
 		if journalID == uuid.Nil {
+			// The legacy CASH_RECEIPTS/CASH_DISBURSEMENTS/GENERAL journals don't exist
+			// in the standard seed (codes are CASH, BANK, GEN, ... — see the journal
+			// seeding in organizations.go), so also accept the seeded code matching the
+			// resolved money account, then any journal of that type, then the general
+			// journal.
+			moneyJournalCode, moneyJournalType := "BANK", "bank"
+			var moneyAcctCode sql.NullString
+			_ = tx.QueryRow(`SELECT code FROM accounts WHERE id = $1`, cashAccountID).Scan(&moneyAcctCode)
+			if moneyAcctCode.Valid && strings.HasPrefix(moneyAcctCode.String, "50") {
+				moneyJournalCode, moneyJournalType = "CASH", "cash"
+			}
 			_ = tx.QueryRow(`
 				SELECT id, COALESCE(next_number, 1), number_prefix
-				FROM journals WHERE tenant_id = $1 AND (code = $2 OR code = 'GENERAL') AND deleted_at IS NULL
-				ORDER BY CASE WHEN code = $2 THEN 0 ELSE 1 END LIMIT 1`,
-				tenantID, journalCode,
+				FROM journals
+				WHERE tenant_id = $1 AND deleted_at IS NULL
+				  AND ($5::uuid IS NULL OR organization_id = $5)
+				  AND (code IN ($2, $3, 'GENERAL', 'GEN') OR type IN ($4, 'general'))
+				ORDER BY CASE
+					WHEN code = $2 THEN 0
+					WHEN code = $3 THEN 1
+					WHEN type = $4 THEN 2
+					WHEN code IN ('GENERAL', 'GEN') THEN 3
+					ELSE 4
+				END
+				LIMIT 1`,
+				tenantID, journalCode, moneyJournalCode, moneyJournalType, orgIDPtr,
 			).Scan(&journalID, &nextNumber, &numberPrefix)
 		}
 
@@ -4028,23 +4089,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				prefix = numberPrefix.String
 			}
 
-			// Use journal-scoped max filtered by prefix to avoid date-embedded entry numbers
-			var maxNum int
-			if prefix != "" {
-				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
-					tenantID, journalID, prefix+"%",
-				).Scan(&maxNum)
-			} else {
-				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
-					tenantID, journalID,
-				).Scan(&maxNum)
-			}
-			actualNum := maxNum + 1
-			if nextNumber > actualNum {
-				actualNum = nextNumber
-			}
+			actualNum := nextEntryNumberSeq(tx, tenantID, orgIDPtr, prefix, nextNumber)
 			entryNumber := fmt.Sprintf("%s%06d", prefix, actualNum)
 
 			description := fmt.Sprintf("%s to'lov tasdiqlandi", paymentNumber)
@@ -4063,28 +4108,38 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				h.log.Error("Failed to create payment journal entry, rolling back savepoint", "error", jeErr)
 				tx.Exec("ROLLBACK TO SAVEPOINT create_payment_je")
 			} else {
+				// Any failed statement aborts the savepoint's subtransaction, so track
+				// line failures and ROLLBACK TO SAVEPOINT at the end instead of
+				// RELEASE — otherwise the whole confirmation tx fails to commit.
+				jeOK := true
 				if paymentType == "receipt" {
 					// Receipt: Debit Cash, Credit AR
 					// Only set contact_id on the AR credit line (counter account),
 					// NOT on the cash line — so reconciliation only counts the AR side.
 					line1ID := uuid.New()
-					tx.Exec(`
+					if _, lErr := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
 						line1ID, journalEntryID, 1, cashAccountID, debitDesc,
 						amount, 0.0, 1.0, now,
-					)
+					); lErr != nil {
+						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 1, "account_id", cashAccountID)
+						jeOK = false
+					}
 					line2ID := uuid.New()
-					tx.Exec(`
+					if _, lErr := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 						line2ID, journalEntryID, 2, counterAccountID, contactID, creditDesc,
 						0.0, amount, 1.0, now,
-					)
+					); lErr != nil {
+						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 2, "account_id", counterAccountID)
+						jeOK = false
+					}
 
 					// Update account balances
 					// Cash: debit-normal, debit increases balance
@@ -4102,23 +4157,29 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					// Only set contact_id on the AP debit line (counter account),
 					// NOT on the cash line — so reconciliation only counts the AP side.
 					line1ID := uuid.New()
-					tx.Exec(`
+					if _, lErr := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 						line1ID, journalEntryID, 1, counterAccountID, contactID, debitDesc,
 						amount, 0.0, 1.0, now,
-					)
+					); lErr != nil {
+						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 1, "account_id", counterAccountID)
+						jeOK = false
+					}
 					line2ID := uuid.New()
-					tx.Exec(`
+					if _, lErr := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, contact_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
 						line2ID, journalEntryID, 2, cashAccountID, creditDesc,
 						0.0, amount, 1.0, now,
-					)
+					); lErr != nil {
+						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 2, "account_id", cashAccountID)
+						jeOK = false
+					}
 
 					// Update account balances
 					// AP: credit-normal, debit decreases balance (we're paying off liability)
@@ -4261,7 +4322,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				}
 			}
 
-			tx.Exec("RELEASE SAVEPOINT create_payment_je")
+			if jeOK {
+				tx.Exec("RELEASE SAVEPOINT create_payment_je")
+			} else {
+				// Drop the partial GL entry but keep the confirmation itself.
+				h.log.Error("Payment journal entry incomplete, rolling back GL entry", "payment_id", id)
+				tx.Exec("ROLLBACK TO SAVEPOINT create_payment_je")
+			}
 			}
 		} else {
 			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)
@@ -5809,55 +5876,66 @@ func (h *Handler) ListBankTransactions(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const bankTxBaseWhere = "WHERE tenant_id = $1 AND bank_account_id = $2"
 	query := `
 		SELECT id, tenant_id, bank_account_id, transaction_date, value_date,
 		       COALESCE(reference, '') as reference, COALESCE(description, '') as description,
 		       amount, balance_after, transaction_type, COALESCE(status, 'unmatched') as status,
 		       matched_journal_entry_id, created_at, updated_at
 		FROM bank_transactions
-		WHERE tenant_id = $1 AND bank_account_id = $2
-	`
+		` + bankTxBaseWhere
 	args := []interface{}{tenantID, bankAccountID}
 	argIndex := 3
+	whereExtra := ""
 
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		query += fmt.Sprintf(" AND organization_id = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND organization_id = $%d", argIndex)
 		args = append(args, orgID)
 		argIndex++
 	}
 
 	if filter.Search != "" {
-		query += fmt.Sprintf(" AND (reference ILIKE $%d OR description ILIKE $%d)", argIndex, argIndex)
+		whereExtra += fmt.Sprintf(" AND (reference ILIKE $%d OR description ILIKE $%d)", argIndex, argIndex)
 		args = append(args, "%"+filter.Search+"%")
 		argIndex++
 	}
 
 	if filter.Type != "" {
-		query += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
 		args = append(args, filter.Type)
 		argIndex++
 	}
 
 	if filter.Status != "" {
-		query += fmt.Sprintf(" AND status = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND status = $%d", argIndex)
 		args = append(args, filter.Status)
 		argIndex++
 	}
 
 	if filter.DateFrom != "" {
-		query += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
 		args = append(args, filter.DateFrom)
 		argIndex++
 	}
 
 	if filter.DateTo != "" {
-		query += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
 		args = append(args, filter.DateTo)
 		argIndex++
 	}
 
-	query += " ORDER BY transaction_date DESC, created_at DESC"
+	// argCount holds the number of filter args (tenant + bank account + dynamic
+	// filters) before any LIMIT/OFFSET is appended; used to slice args for COUNT.
+	argCount := argIndex - 1
+
+	query += whereExtra + " ORDER BY transaction_date DESC, created_at DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -5899,7 +5977,14 @@ func (h *Handler) ListBankTransactions(c *gin.Context) {
 		transactions = append(transactions, t)
 	}
 
-	response.Success(c, transactions)
+	if !paginate {
+		response.Success(c, transactions)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM bank_transactions `+bankTxBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, transactions, page, pageSize, total)
 }
 
 // CreateBankTransaction godoc
@@ -6713,8 +6798,19 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	var numberPrefix sql.NullString
 	err = h.db.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH', 'GENERAL') AND deleted_at IS NULL LIMIT 1
-	`, tenantID).Scan(&journalID, &nextNumber, &numberPrefix)
+		FROM journals
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR organization_id = $2)
+		  AND (code IN ('CASH_RECEIPTS', 'CASH', 'GENERAL', 'GEN') OR type IN ('cash', 'general'))
+		ORDER BY CASE
+			WHEN code = 'CASH_RECEIPTS' THEN 0
+			WHEN code = 'CASH' THEN 1
+			WHEN type = 'cash' THEN 2
+			WHEN code IN ('GENERAL', 'GEN') THEN 3
+			ELSE 4
+		END
+		LIMIT 1
+	`, tenantID, orgID).Scan(&journalID, &nextNumber, &numberPrefix)
 	if err != nil || journalID == uuid.Nil {
 		h.log.Error("No journal found for clearing entries", "error", err)
 		return
@@ -6728,7 +6824,7 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	// Create clearing entry for Outstanding Receipts → Bank
 	// DR Bank, CR Outstanding Receipts
 	if receiptsBalance > 0.01 {
-		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
 		journalEntryID := uuid.New()
 		description := fmt.Sprintf("Bank reconciliation clearing - receipts (%s)", statementDate.Format("2006-01-02"))
 
@@ -6777,7 +6873,7 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	// Outstanding Payments has a negative current_balance (credit balance) when payments are pending
 	absPayments := -paymentsBalance // Make positive for the entry amounts
 	if absPayments > 0.01 {
-		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
 		journalEntryID := uuid.New()
 		description := fmt.Sprintf("Bank reconciliation clearing - payments (%s)", statementDate.Format("2006-01-02"))
 
@@ -6841,8 +6937,19 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	var numberPrefix sql.NullString
 	err = h.db.QueryRow(`
 		SELECT id, COALESCE(next_number, 1), number_prefix
-		FROM journals WHERE tenant_id = $1 AND code IN ('GENERAL', 'CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL LIMIT 1
-	`, tenantID).Scan(&journalID, &nextNumber, &numberPrefix)
+		FROM journals
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR organization_id = $2)
+		  AND (code IN ('GENERAL', 'GEN', 'CASH_RECEIPTS', 'CASH') OR type IN ('general', 'cash'))
+		ORDER BY CASE
+			WHEN code IN ('GENERAL', 'GEN') THEN 0
+			WHEN type = 'general' THEN 1
+			WHEN code = 'CASH_RECEIPTS' THEN 2
+			WHEN code = 'CASH' THEN 3
+			ELSE 4
+		END
+		LIMIT 1
+	`, tenantID, orgID).Scan(&journalID, &nextNumber, &numberPrefix)
 	if err != nil || journalID == uuid.Nil {
 		return
 	}
@@ -6851,7 +6958,7 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
-	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
 
 	absDiff := difference
 	if absDiff < 0 {
@@ -7114,6 +7221,9 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const cashTxBaseWhere = "WHERE tenant_id = $1"
 	query := `
 		SELECT id, tenant_id, transaction_date, transaction_type, amount,
 		       COALESCE(currency, 'UZS') as currency, COALESCE(description, '') as description,
@@ -7121,49 +7231,57 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 		       COALESCE(cashier, '') as cashier, COALESCE(status, 'posted') as status,
 		       created_at, updated_at
 		FROM cash_transactions
-		WHERE tenant_id = $1
-	`
+		` + cashTxBaseWhere
 	args := []interface{}{tenantID}
 	argIndex := 2
+	whereExtra := ""
 
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		query += fmt.Sprintf(" AND organization_id = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND organization_id = $%d", argIndex)
 		args = append(args, orgID)
 		argIndex++
 	}
 
 	if filter.Search != "" {
-		query += fmt.Sprintf(" AND (description ILIKE $%d OR reference ILIKE $%d OR cashier ILIKE $%d)", argIndex, argIndex, argIndex)
+		whereExtra += fmt.Sprintf(" AND (description ILIKE $%d OR reference ILIKE $%d OR cashier ILIKE $%d)", argIndex, argIndex, argIndex)
 		args = append(args, "%"+filter.Search+"%")
 		argIndex++
 	}
 
 	if filter.Type != "" {
-		query += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_type = $%d", argIndex)
 		args = append(args, filter.Type)
 		argIndex++
 	}
 
 	if filter.Category != "" {
-		query += fmt.Sprintf(" AND category = $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND category = $%d", argIndex)
 		args = append(args, filter.Category)
 		argIndex++
 	}
 
 	if filter.DateFrom != "" {
-		query += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_date >= $%d", argIndex)
 		args = append(args, filter.DateFrom)
 		argIndex++
 	}
 
 	if filter.DateTo != "" {
-		query += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
+		whereExtra += fmt.Sprintf(" AND transaction_date <= $%d", argIndex)
 		args = append(args, filter.DateTo)
 		argIndex++
 	}
 
-	query += " ORDER BY transaction_date DESC, created_at DESC"
+	// argCount holds the number of filter args (tenant + dynamic filters) before
+	// any LIMIT/OFFSET is appended; used to slice args for COUNT.
+	argCount := argIndex - 1
+
+	query += whereExtra + " ORDER BY transaction_date DESC, created_at DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -7188,7 +7306,14 @@ func (h *Handler) ListCashTransactions(c *gin.Context) {
 		transactions = append(transactions, t)
 	}
 
-	response.Success(c, transactions)
+	if !paginate {
+		response.Success(c, transactions)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM cash_transactions `+cashTxBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, transactions, page, pageSize, total)
 }
 
 // GetCashTransaction godoc
@@ -8543,6 +8668,9 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 
 	fiscalYearID := c.Query("fiscal_year_id")
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const budgetsBaseWhere = "WHERE b.tenant_id = $1 AND b.deleted_at IS NULL"
 	query := `
 		SELECT b.id, b.tenant_id, b.organization_id, b.fiscal_year_id, b.code, b.name, b.description,
 		       b.budget_type, b.total_amount, b.status, b.approved_by, b.approved_at,
@@ -8551,26 +8679,30 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		       COALESCE(b.warning_threshold, 80)
 		FROM budgets b
 		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
-		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL
-	`
+		` + budgetsBaseWhere
 
 	args := []interface{}{tenantID}
 	argCount := 1
+	whereExtra := ""
 
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query += fmt.Sprintf(" AND b.organization_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND b.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	if fiscalYearID != "" {
 		argCount++
-		query += fmt.Sprintf(" AND b.fiscal_year_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND b.fiscal_year_id = $%d", argCount)
 		args = append(args, fiscalYearID)
 	}
 
-	query += " ORDER BY b.created_at DESC"
+	query += whereExtra + " ORDER BY b.created_at DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -8627,7 +8759,14 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		budgets = append(budgets, &b)
 	}
 
-	response.Success(c, budgets)
+	if !paginate {
+		response.Success(c, budgets)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM budgets b LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id `+budgetsBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, budgets, page, pageSize, total)
 }
 
 // GetBudget godoc
@@ -9189,6 +9328,14 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 
 	budgetID := c.Query("budget_id")
 
+	paginate, page, pageSize, offset := optPagination(c)
+
+	const budgetLinesFrom = `FROM budget_lines bl
+		JOIN budgets b ON bl.budget_id = b.id
+		LEFT JOIN accounts a ON bl.account_id = a.id
+		LEFT JOIN fiscal_years fy ON b.fiscal_year_id = fy.id
+		WHERE b.tenant_id = $1`
+
 	// Query budget lines with account info and computed actual amounts from journal entries
 	// actual_amount = SUM of debit for expense accounts, SUM of credit for revenue accounts
 	// within the budget's date range
@@ -9212,20 +9359,22 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		       ), 0) as computed_actual,
 		       bl.notes, COALESCE(bl.line_type, 'expense') as line_type, COALESCE(bl.category_name, '') as category_name,
 		       bl.created_at, bl.updated_at
-		FROM budget_lines bl
-		JOIN budgets b ON bl.budget_id = b.id
-		LEFT JOIN accounts a ON bl.account_id = a.id
-		LEFT JOIN fiscal_years fy ON b.fiscal_year_id = fy.id
-		WHERE b.tenant_id = $1
-	`
+		` + budgetLinesFrom
 
 	args := []interface{}{tenantID}
+	argCount := 1
+	whereExtra := ""
 	if budgetID != "" {
-		query += " AND bl.budget_id = $2"
+		argCount++
+		whereExtra += fmt.Sprintf(" AND bl.budget_id = $%d", argCount)
 		args = append(args, budgetID)
 	}
 
-	query += " ORDER BY bl.created_at"
+	query += whereExtra + " ORDER BY bl.created_at"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -9276,7 +9425,14 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		lines = append(lines, &line)
 	}
 
-	response.Success(c, lines)
+	if !paginate {
+		response.Success(c, lines)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) `+budgetLinesFrom+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, lines, page, pageSize, total)
 }
 
 // CreateBudgetLine godoc

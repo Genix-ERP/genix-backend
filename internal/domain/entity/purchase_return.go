@@ -73,10 +73,6 @@ type PurchaseReturn struct {
 	Lines []PurchaseReturnLine `json:"lines,omitempty" gorm:"foreignKey:ReturnID"`
 }
 
-func (PurchaseReturn) TableName() string {
-	return "purchase_returns"
-}
-
 // PurchaseReturnLine represents a line item in purchase return
 type PurchaseReturnLine struct {
 	ID              uuid.UUID    `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
@@ -101,10 +97,6 @@ type PurchaseReturnLine struct {
 	Notes           string       `json:"notes" gorm:"type:text"`
 	CreatedAt       time.Time    `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt       time.Time    `json:"updated_at" gorm:"autoUpdateTime"`
-}
-
-func (PurchaseReturnLine) TableName() string {
-	return "purchase_return_lines"
 }
 
 // Input/Output structs

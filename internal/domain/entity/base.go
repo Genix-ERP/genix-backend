@@ -27,32 +27,6 @@ type AuditableEntity struct {
 	CreatedBy *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
 }
 
-// NewID generates a new UUID
-func NewID() uuid.UUID {
-	return uuid.New()
-}
-
-// ParseID parses a string into a UUID
-func ParseID(s string) (uuid.UUID, error) {
-	return uuid.Parse(s)
-}
-
-// NullUUID represents a nullable UUID
-type NullUUID struct {
-	UUID  uuid.UUID
-	Valid bool
-}
-
-// Scan implements the sql.Scanner interface
-func (n *NullUUID) Scan(value interface{}) error {
-	if value == nil {
-		n.UUID, n.Valid = uuid.UUID{}, false
-		return nil
-	}
-	n.Valid = true
-	return n.UUID.Scan(value)
-}
-
 // Pagination represents pagination parameters
 type Pagination struct {
 	Page     int `json:"page" form:"page"`
@@ -112,18 +86,6 @@ type ListParams struct {
 	Filters    map[string]interface{}
 }
 
-// NewListParams creates new list parameters with defaults
-func NewListParams(page, limit int, sortField string, sortOrder SortOrder) *ListParams {
-	return &ListParams{
-		Pagination: NewPagination(page, limit),
-		Sort: &Sort{
-			Field: sortField,
-			Order: sortOrder,
-		},
-		Filters: make(map[string]interface{}),
-	}
-}
-
 // Address represents a physical address
 type Address struct {
 	Street1    string `json:"street1,omitempty"`
@@ -148,39 +110,8 @@ type Money struct {
 	Currency string  `json:"currency"`
 }
 
-// NewMoney creates a new Money value
-func NewMoney(amount float64, currency string) Money {
-	return Money{Amount: amount, Currency: currency}
-}
-
-// Add adds two Money values
-func (m Money) Add(other Money) Money {
-	if m.Currency != other.Currency {
-		panic("cannot add different currencies")
-	}
-	return Money{Amount: m.Amount + other.Amount, Currency: m.Currency}
-}
-
-// Subtract subtracts two Money values
-func (m Money) Subtract(other Money) Money {
-	if m.Currency != other.Currency {
-		panic("cannot subtract different currencies")
-	}
-	return Money{Amount: m.Amount - other.Amount, Currency: m.Currency}
-}
-
-// Multiply multiplies Money by a factor
-func (m Money) Multiply(factor float64) Money {
-	return Money{Amount: m.Amount * factor, Currency: m.Currency}
-}
-
 // DateRange represents a date range
 type DateRange struct {
 	From time.Time `json:"from"`
 	To   time.Time `json:"to"`
-}
-
-// Contains checks if a date is within the range
-func (dr DateRange) Contains(date time.Time) bool {
-	return !date.Before(dr.From) && !date.After(dr.To)
 }

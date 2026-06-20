@@ -69,6 +69,7 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 		       cp.status, cp.progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
 		       cp.warehouse_id,
+		       cp.crm_project_id,
 		       cp.created_by, cp.created_date, cp.updated_date,
 		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
@@ -152,6 +153,7 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 			&p.Status, &p.ProgressPercent,
 			&p.ProjectManagerID, &p.ChiefEngineerID,
 			&p.WarehouseID,
+			&p.CRMProjectID,
 			&p.CreatedBy, &p.CreatedDate, &p.UpdatedDate,
 			&p.ProjectManagerName, &p.ChiefEngineerName,
 			&p.WarehouseName,
@@ -206,6 +208,7 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		       cp.status, cp.progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
 		       cp.warehouse_id,
+		       cp.crm_project_id,
 		       cp.created_by, cp.created_date, cp.updated_date,
 		       COALESCE(pm.first_name || ' ' || pm.last_name, '') as project_manager_name,
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
@@ -232,6 +235,7 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		&p.Status, &p.ProgressPercent,
 		&p.ProjectManagerID, &p.ChiefEngineerID,
 		&p.WarehouseID,
+		&p.CRMProjectID,
 		&p.CreatedBy, &p.CreatedDate, &p.UpdatedDate,
 		&p.ProjectManagerName, &p.ChiefEngineerName,
 		&p.WarehouseName,
@@ -961,6 +965,7 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		       b.planned_start_date, b.planned_end_date, b.actual_start_date, b.actual_end_date,
 		       COALESCE(b.status, 'draft'), b.progress_percent, COALESCE(b.gps_coordinates::text, '{}')::text, b.location_description,
 		       COALESCE(b.sort_order, 0), b.created_date, b.updated_date,
+		       b.crm_block_id, b.current_crm_stage, b.crm_auto_sync,
 		       0 as sections_count,
 		       0.0 as total_smeta,
 		       COALESCE(f.cnt, 0) AS files_count
@@ -995,6 +1000,7 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 			&b.PlannedStartDate, &b.PlannedEndDate, &b.ActualStartDate, &b.ActualEndDate,
 			&b.Status, &b.ProgressPercent, &gpsCoordinates, &b.LocationDescription,
 			&b.SortOrder, &b.CreatedDate, &b.UpdatedDate,
+			&b.CRMBlockID, &b.CurrentCRMStage, &b.CRMAutoSync,
 			&b.SectionsCount, &b.TotalSmeta, &b.FilesCount,
 		); err != nil {
 			h.log.Error("Failed to scan building", "error", err, "project_id", projectID)
@@ -1343,10 +1349,15 @@ func (h *Handler) ListSmetaSections(c *gin.Context) {
 		       COALESCE((SELECT COUNT(*) FROM smeta_items WHERE section_id = ss.id), 0) as items_count
 		FROM smeta_sections ss
 		WHERE ss.project_id = $1 AND ss.tenant_id = $2
-		ORDER BY ss.sort_order, ss.code
-	`
+		ORDER BY ss.sort_order, ss.code`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query smeta sections", "error", err)
 		response.InternalError(c, "Failed to query sections")
@@ -1370,7 +1381,13 @@ func (h *Handler) ListSmetaSections(c *gin.Context) {
 		sections = append(sections, s)
 	}
 
-	response.Success(c, sections)
+	if !paginate {
+		response.Success(c, sections)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM smeta_sections ss WHERE ss.project_id = $1 AND ss.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, sections, page, pageSize, total)
 }
 
 // CreateSmetaSection creates a new smeta section
@@ -1632,10 +1649,15 @@ func (h *Handler) ListSmetaItems(c *gin.Context) {
 		FROM smeta_items si
 		JOIN smeta_sections ss ON si.section_id = ss.id
 		WHERE si.section_id = $1 AND si.tenant_id = $2
-		ORDER BY si.sort_order, si.code
-	`
+		ORDER BY si.sort_order, si.code`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{sectionID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, sectionID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query smeta items", "error", err)
 		response.InternalError(c, "Failed to query items")
@@ -1661,7 +1683,13 @@ func (h *Handler) ListSmetaItems(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	response.Success(c, items)
+	if !paginate {
+		response.Success(c, items)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM smeta_items si WHERE si.section_id = $1 AND si.tenant_id = $2`, sectionID, tenantID).Scan(&total)
+	response.Paginated(c, items, page, pageSize, total)
 }
 
 // CreateSmetaItem creates a new smeta item
@@ -2433,10 +2461,15 @@ func (h *Handler) ListPhotoReports(c *gin.Context) {
 		LEFT JOIN employees e ON e.id = pr.reported_by
 		LEFT JOIN employees r ON r.id = pr.reviewed_by
 		WHERE pr.project_id = $1 AND pr.tenant_id = $2
-		ORDER BY pr.report_date DESC, pr.created_date DESC
-	`
+		ORDER BY pr.report_date DESC, pr.created_date DESC`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query photo reports", "error", err)
 		response.InternalError(c, "Failed to query photo reports")
@@ -2507,7 +2540,13 @@ func (h *Handler) ListPhotoReports(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, reports)
+	if !paginate {
+		response.Success(c, reports)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_photo_reports pr WHERE pr.project_id = $1 AND pr.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, reports, page, pageSize, total)
 }
 
 // CreatePhotoReport creates a new photo report
@@ -2558,17 +2597,17 @@ func (h *Handler) CreatePhotoReport(c *gin.Context) {
 
 	query := `
 		INSERT INTO construction_photo_reports (
-			tenant_id, project_id, smeta_item_id, section_id,
+			tenant_id, project_id, smeta_item_id, section_id, building_id,
 			report_date, report_type, title, description, location_description,
 			gps_latitude, gps_longitude, weather, temperature,
 			photos, reported_by, review_status, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'pending', NOW(), NOW())
 		RETURNING id
 	`
 
 	var reportID int64
 	err = h.db.QueryRow(query,
-		tenantID, projectID, nullInt64(req.SmetaItemID), nullInt64(req.SectionID),
+		tenantID, projectID, nullInt64(req.SmetaItemID), nullInt64(req.SectionID), nullInt64(req.BuildingID),
 		reportDate, nullString(req.ReportType), nullString(req.Title), nullString(req.Description), nullString(req.LocationDescription),
 		nullFloat64(req.GpsLatitude), nullFloat64(req.GpsLongitude), nullString(req.Weather), nullFloat64(req.Temperature),
 		photosJSON, nil, // photos, reported_by
@@ -2831,10 +2870,15 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		LEFT JOIN employees e ON e.id = dr.reported_by
 		LEFT JOIN employees v ON v.id = dr.verified_by
 		WHERE dr.project_id = $1 AND dr.tenant_id = $2
-		ORDER BY dr.report_date DESC
-	`
+		ORDER BY dr.report_date DESC`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query daily reports", "error", err)
 		response.InternalError(c, "Failed to query daily reports")
@@ -2899,7 +2943,13 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 	}
 
 	h.log.Info("Daily reports result", "project_id", projectID, "count", len(reports))
-	response.Success(c, reports)
+	if !paginate {
+		response.Success(c, reports)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_daily_reports dr WHERE dr.project_id = $1 AND dr.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, reports, page, pageSize, total)
 }
 
 // CreateDailyReport creates a new daily report
@@ -3313,10 +3363,15 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		LEFT JOIN construction_subcontract sc ON sc.id = mr.subcontract_id
 		LEFT JOIN construction_buildings bld ON bld.id = mr.building_id
 		WHERE mr.project_id = $1 AND mr.tenant_id = $2
-		ORDER BY mr.request_date DESC
-	`
+		ORDER BY mr.request_date DESC`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query material requests", "error", err)
 		response.InternalError(c, "Failed to query material requests")
@@ -3393,7 +3448,13 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, requests)
+	if !paginate {
+		response.Success(c, requests)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_material_requests mr WHERE mr.project_id = $1 AND mr.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, requests, page, pageSize, total)
 }
 
 // CreateMaterialRequest creates a new material request
@@ -4442,10 +4503,15 @@ func (h *Handler) ListDeliveries(c *gin.Context) {
 		LEFT JOIN organizations o ON o.id = pv.vendor_id
 		LEFT JOIN employees e ON e.id = d.received_by
 		WHERE d.project_id = $1 AND d.tenant_id = $2
-		ORDER BY d.delivery_date DESC
-	`
+		ORDER BY d.delivery_date DESC`
+	paginate, page, pageSize, offset := optPagination(c)
+	args := []interface{}{projectID, tenantID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query deliveries", "error", err)
 		response.InternalError(c, "Failed to query deliveries")
@@ -4510,7 +4576,13 @@ func (h *Handler) ListDeliveries(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, deliveries)
+	if !paginate {
+		response.Success(c, deliveries)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_material_deliveries d WHERE d.project_id = $1 AND d.tenant_id = $2`, projectID, tenantID).Scan(&total)
+	response.Paginated(c, deliveries, page, pageSize, total)
 }
 
 // =====================================================
@@ -5591,12 +5663,18 @@ func (h *Handler) ListBuildingFiles(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	paginate, page, pageSize, offset := optPagination(c)
+	query := `
 		SELECT id, building_id, file_id, file_url, filename, file_size, mime_type, description, created_at, created_by
 		FROM building_files
 		WHERE tenant_id = $1 AND building_id = $2
-		ORDER BY created_at DESC
-	`, tenantID, buildingID)
+		ORDER BY created_at DESC`
+	args := []interface{}{tenantID, buildingID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list building files", "error", err)
 		response.InternalServerError(c, "Failed to list files")
@@ -5631,7 +5709,13 @@ func (h *Handler) ListBuildingFiles(c *gin.Context) {
 	if files == nil {
 		files = []BuildingFile{}
 	}
-	response.Success(c, files)
+	if !paginate {
+		response.Success(c, files)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM building_files WHERE tenant_id = $1 AND building_id = $2`, tenantID, buildingID).Scan(&total)
+	response.Paginated(c, files, page, pageSize, total)
 }
 
 // CreateBuildingFile adds a file reference to a building
@@ -5742,12 +5826,18 @@ func (h *Handler) ListProjectFiles(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	paginate, page, pageSize, offset := optPagination(c)
+	query := `
 		SELECT id, project_id, file_id, file_url, filename, file_size, mime_type, description, created_at, created_by
 		FROM project_files
 		WHERE tenant_id = $1 AND project_id = $2
-		ORDER BY created_at DESC
-	`, tenantID, projectID)
+		ORDER BY created_at DESC`
+	args := []interface{}{tenantID, projectID}
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list project files", "error", err)
 		response.InternalServerError(c, "Failed to list files")
@@ -5782,7 +5872,13 @@ func (h *Handler) ListProjectFiles(c *gin.Context) {
 	if files == nil {
 		files = []ProjectFile{}
 	}
-	response.Success(c, files)
+	if !paginate {
+		response.Success(c, files)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM project_files WHERE tenant_id = $1 AND project_id = $2`, tenantID, projectID).Scan(&total)
+	response.Paginated(c, files, page, pageSize, total)
 }
 
 // CreateProjectFile adds a file reference to a project
@@ -5873,4 +5969,768 @@ func (h *Handler) DeleteProjectFile(c *gin.Context) {
 	}
 
 	response.NoContent(c)
+}
+
+// =====================================================
+// BUILDING ESTIMATE CLONE
+// =====================================================
+
+// CloneBuildingEstimates copies every construction_estimate row (with every
+// construction_estimate_line under it) from a source building into the
+// target building referenced in the URL. Same project, same tenant.
+//
+// Why this exists
+// ---------------
+// Projects routinely have several blocks of the same building "type"
+// (Тип 1 / Тип 2 in the screenshots — 1А, 1Б, 1В all share Тип 1). The
+// smeta is identical between siblings, but the existing flow forces the
+// user to re-import the XLSX into each block, which is slow and easy to
+// get wrong. This endpoint clones the source block's full estimate
+// universe — every estimate (ВОР, Единич, Ресурс) and every line under
+// them — into the target with one click from the block card's "..." menu.
+//
+// Safety guarantees
+// -----------------
+//   - Refuses if the target block already has any estimates. The block
+//     card UI greys out the menu entry in that case; this is the
+//     server-side enforcement so a race doesn't silently overwrite
+//     in-progress FAKT data.
+//   - Source ≠ target.
+//   - Both blocks must belong to the same project / tenant.
+//   - Wrapped in a single transaction — either the whole clone lands or
+//     nothing does. No half-cloned blocks.
+//
+// What gets reset (vs. preserved)
+// -------------------------------
+//   Preserved on every line: name, uom, quantity, rates (material / labor /
+//     equipment), unit_rate, total_amount, code, item_number, resource_type,
+//     parent_item_number, parent_line_id (REMAPPED to the new line id),
+//     norm_rate, subline_seq, quantity_override, material_type,
+//     original_quantity, original_unit_rate, imported_quantity,
+//     imported_total, sort_order, is_manual, wbs_id.
+//
+//   Reset to defaults: actual_amount, done_quantity, approval_status,
+//     period_fakt, created_date, updated_date. The clone is a fresh build —
+//     FAKT progress on the source must not bleed into the target's
+//     dashboard, Form 2, or Reja vs Fakt summary. Matches the user's
+//     explicit decision to NOT clone FAKT data when this feature was
+//     scoped.
+//
+// What is NOT cloned
+// ------------------
+//   - construction_stages (Bosqichlar). The user opted out of including
+//     stages — they want the target to start with the imported estimate
+//     content only.
+//   - construction_smeta_audit, resource_topups, resource_price_history.
+//     These are operational history on the source estimate's lines and
+//     don't apply to the target. They'll get fresh rows once the user
+//     starts editing.
+//   - construction_form2_iteration*. Iterations are FAKT snapshots; same
+//     "fresh build" reasoning as above.
+//
+// POST /construction/projects/:id/buildings/:building_id/clone-estimates
+//
+// The :building_id in the URL is the SOURCE — the handler creates a brand
+// new construction_buildings row called "<source name> Copy" (or " Copy
+// (2)", " Copy (3)", … on subsequent duplications) in the same project,
+// inherits all of the source's physical / financial / timeline metadata
+// EXCEPT actuals (progress, actual_cost, actual dates — those belong to
+// the source's history), then copies every estimate, line, stage, and
+// file across in the same transaction. Net effect of one button-press:
+// a new sibling block appears in the project with identical smeta and
+// drawings to the source, ready for the user to start work.
+//
+// 200: { new_building: { id, name, code, … }, estimates_created,
+//        lines_created, stages_created, files_created }
+//
+// (The body parameter `source_building_id` and the old "fail if target
+// not empty" check from the previous implementation are no longer
+// relevant — the target is always a fresh row.)
+func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+	sourceBuildingID, err := strconv.ParseInt(c.Param("building_id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid source building ID")
+		return
+	}
+
+	// Load the source building's metadata so the duplicate carries the
+	// same building_type / floors / area / etc. — these are "what the
+	// block IS" attributes and would normally have to be re-entered by
+	// hand. We deliberately do NOT copy actuals (actual_cost,
+	// progress_percent, actual_start_date, actual_end_date) — those belong
+	// to the source's history and would mis-report progress on the
+	// duplicate.
+	var src struct {
+		Name                 string
+		Code                 string
+		Description          sql.NullString
+		BuildingType         sql.NullString
+		BuildingPurpose      sql.NullString
+		FloorsCount          sql.NullInt64
+		FloorsUnderground    sql.NullInt64
+		TotalArea            sql.NullFloat64
+		LivingArea           sql.NullFloat64
+		NonLivingArea        sql.NullFloat64
+		ApartmentsCount      sql.NullInt64
+		CommercialUnitsCount sql.NullInt64
+		ParkingSpots         sql.NullInt64
+		EstimatedCost        sql.NullFloat64
+		Currency             sql.NullString
+		PlannedStart         sql.NullTime
+		PlannedEnd           sql.NullTime
+		SortOrder            sql.NullInt64
+	}
+	if err := h.db.QueryRow(`
+		SELECT name, code, description, building_type, building_purpose,
+		       floors_count, floors_underground,
+		       total_area, living_area, non_living_area,
+		       apartments_count, commercial_units_count, parking_spots,
+		       estimated_cost, currency,
+		       planned_start_date, planned_end_date, sort_order
+		FROM construction_buildings
+		WHERE id = $1 AND project_id = $2 AND tenant_id = $3
+	`, sourceBuildingID, projectID, tenantID).Scan(
+		&src.Name, &src.Code, &src.Description,
+		&src.BuildingType, &src.BuildingPurpose,
+		&src.FloorsCount, &src.FloorsUnderground,
+		&src.TotalArea, &src.LivingArea, &src.NonLivingArea,
+		&src.ApartmentsCount, &src.CommercialUnitsCount, &src.ParkingSpots,
+		&src.EstimatedCost, &src.Currency,
+		&src.PlannedStart, &src.PlannedEnd, &src.SortOrder,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Source building")
+			return
+		}
+		h.log.Error("CloneBuildingEstimates: load source failed", "error", err)
+		response.InternalError(c, "Failed to read source building")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("CloneBuildingEstimates: begin tx failed", "error", err)
+		response.InternalError(c, "Could not start clone transaction")
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// 0a. Create the duplicate building first — the rest of the clone
+	//     logic INSERTs into construction_estimate, construction_stages
+	//     and building_files using `targetBuildingID` as the foreign key,
+	//     so it has to exist before any of that fires. Generated name is
+	//     "<source name> Copy"; on subsequent duplications it becomes
+	//     " Copy (2)", " Copy (3)", etc. Same retry-suffix pattern for
+	//     the code (the existing CreateConstructionBuilding handler uses
+	//     this to dodge the unique (project_id, code) index when the
+	//     auto-generated code collides). actuals (progress_percent,
+	//     actual_cost, actual_*_date) intentionally left at defaults so
+	//     dashboards don't mis-report the duplicate as already in flight.
+	targetBuildingID, newName, newCode, createErr := h.createDuplicateBuildingTx(
+		tx, tenantID, projectID, src.Name, src.Code,
+		src.Description, src.BuildingType, src.BuildingPurpose,
+		src.FloorsCount, src.FloorsUnderground,
+		src.TotalArea, src.LivingArea, src.NonLivingArea,
+		src.ApartmentsCount, src.CommercialUnitsCount, src.ParkingSpots,
+		src.EstimatedCost, src.Currency,
+		src.PlannedStart, src.PlannedEnd, src.SortOrder,
+	)
+	if createErr != nil {
+		h.log.Error("CloneBuildingEstimates: create duplicate failed", "error", createErr)
+		response.InternalError(c, "Failed to create duplicate building")
+		return
+	}
+
+	// 0. Pull and clone construction_stages for the source block. Stages
+	//    are independent of estimate_line in the schema (lines reference
+	//    stages by name via parent_item_number, not by id) so the order
+	//    relative to the estimate clone doesn't matter — we just do them
+	//    inside the same transaction. The user explicitly asked for
+	//    stages to ride along with the estimate clone because import
+	//    creates both together: an Excel smeta import populates lines
+	//    AND auto-creates stages with matching names, and the Bosqichlar
+	//    tab needs the construction_stages row in addition to the line
+	//    bucket. Without this step the target block would render the
+	//    sections derived from line names but lose:
+	//      - empty user-added stages (no lines, only construction_stages row)
+	//      - stage metadata (planned_start/end, planned_budget,
+	//        requires_f19, notes)
+	//      - the construction_stages.id needed by Forma 19 acts, daily
+	//        logs, sub-stage materials, sub-stage equipment, etc.
+	//
+	// Preserved per-stage: name, stage_order, planned_budget,
+	// planned_start, planned_end, notes, requires_f19.
+	// Reset to defaults: status='not_started', actual_start=NULL,
+	// actual_end=NULL — same "fresh build, no FAKT bleed" reasoning as
+	// the estimate-line reset above.
+	stageRows, err := tx.Query(`
+		SELECT id, name, COALESCE(stage_order, 0),
+		       COALESCE(planned_budget, 0),
+		       planned_start, planned_end, notes,
+		       COALESCE(requires_f19, FALSE)
+		FROM construction_stages
+		WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3
+		ORDER BY COALESCE(stage_order, 0) ASC, id ASC
+	`, projectID, tenantID, sourceBuildingID)
+	if err != nil {
+		h.log.Error("CloneBuildingEstimates: list source stages failed", "error", err)
+		response.InternalError(c, "Failed to list source stages")
+		return
+	}
+	type srcStage struct {
+		ID            int64
+		Name          string
+		StageOrder    int
+		PlannedBudget float64
+		PlannedStart  sql.NullTime
+		PlannedEnd    sql.NullTime
+		Notes         sql.NullString
+		RequiresF19   bool
+	}
+	var srcStages []srcStage
+	for stageRows.Next() {
+		var s srcStage
+		if err := stageRows.Scan(
+			&s.ID, &s.Name, &s.StageOrder, &s.PlannedBudget,
+			&s.PlannedStart, &s.PlannedEnd, &s.Notes, &s.RequiresF19,
+		); err != nil {
+			stageRows.Close()
+			h.log.Error("CloneBuildingEstimates: scan source stage failed", "error", err)
+			response.InternalError(c, "Failed to read source stages")
+			return
+		}
+		srcStages = append(srcStages, s)
+	}
+	stageRows.Close()
+
+	stagesCreated := 0
+	for _, ss := range srcStages {
+		if _, err := tx.Exec(`
+			INSERT INTO construction_stages (
+				tenant_id, project_id, building_id, name, stage_order,
+				status, planned_budget, planned_start, planned_end,
+				actual_start, actual_end, notes, requires_f19,
+				created_at, updated_at
+			) VALUES (
+				$1, $2, $3, $4, $5,
+				'not_started', $6, $7, $8,
+				NULL, NULL, $9, $10,
+				NOW(), NOW()
+			)
+		`,
+			tenantID, projectID, targetBuildingID, ss.Name, ss.StageOrder,
+			ss.PlannedBudget, ss.PlannedStart, ss.PlannedEnd,
+			ss.Notes, ss.RequiresF19,
+		); err != nil {
+			h.log.Error("CloneBuildingEstimates: insert clone stage failed",
+				"error", err, "source_stage_id", ss.ID)
+			response.InternalError(c, "Failed to create cloned stage")
+			return
+		}
+		stagesCreated++
+	}
+
+	// 1. Pull every estimate on the source.
+	estRows, err := tx.Query(`
+		SELECT id, version, name, COALESCE(state, 'draft'), COALESCE(is_current, false),
+		       COALESCE(overhead_pct, 0), COALESCE(profit_pct, 0), COALESCE(vat_pct, 0),
+		       source_type, subcontract_id
+		FROM construction_estimate
+		WHERE building_id = $1 AND project_id = $2 AND tenant_id = $3
+		ORDER BY id ASC
+	`, sourceBuildingID, projectID, tenantID)
+	if err != nil {
+		h.log.Error("CloneBuildingEstimates: list source estimates failed", "error", err)
+		response.InternalError(c, "Failed to list source estimates")
+		return
+	}
+
+	type srcEst struct {
+		ID            int64
+		Version       int
+		Name          string
+		State         string
+		IsCurrent     bool
+		OverheadPct   float64
+		ProfitPct     float64
+		VatPct        float64
+		SourceType    sql.NullString
+		SubcontractID sql.NullInt64
+	}
+	var srcEstimates []srcEst
+	for estRows.Next() {
+		var e srcEst
+		if err := estRows.Scan(
+			&e.ID, &e.Version, &e.Name, &e.State, &e.IsCurrent,
+			&e.OverheadPct, &e.ProfitPct, &e.VatPct,
+			&e.SourceType, &e.SubcontractID,
+		); err != nil {
+			estRows.Close()
+			h.log.Error("CloneBuildingEstimates: scan source estimate failed", "error", err)
+			response.InternalError(c, "Failed to read source estimates")
+			return
+		}
+		srcEstimates = append(srcEstimates, e)
+	}
+	estRows.Close()
+
+	// 0b. Pull and clone building_files for the source block. Files live
+	//     in object storage at file_url; both blocks can safely reference
+	//     the same blob — Delete is per-row, not per-blob, so when the
+	//     user deletes a cloned file from the target it doesn't touch the
+	//     source's row. Cloning the URL keeps the target's "Fayllar 2"
+	//     badge populated immediately, which is what the user expects
+	//     when blocks of the same TIP share architectural drawings.
+	//
+	// Preserved per-file: file_id, file_url, filename, file_size,
+	// mime_type, description.
+	// Reset: created_by (the user doing the clone), created_at (NOW).
+	fileRows, err := tx.Query(`
+		SELECT id, file_id, file_url, filename, COALESCE(file_size, 0),
+		       COALESCE(mime_type, ''), COALESCE(description, '')
+		FROM building_files
+		WHERE tenant_id = $1 AND building_id = $2
+		ORDER BY created_at ASC, id ASC
+	`, tenantID, sourceBuildingID)
+	if err != nil {
+		h.log.Error("CloneBuildingEstimates: list source files failed", "error", err)
+		response.InternalError(c, "Failed to list source files")
+		return
+	}
+	type srcFile struct {
+		ID          int64
+		FileID      string
+		FileURL     string
+		Filename    string
+		FileSize    int64
+		MimeType    string
+		Description string
+	}
+	var srcFiles []srcFile
+	for fileRows.Next() {
+		var f srcFile
+		if err := fileRows.Scan(
+			&f.ID, &f.FileID, &f.FileURL, &f.Filename,
+			&f.FileSize, &f.MimeType, &f.Description,
+		); err != nil {
+			fileRows.Close()
+			h.log.Error("CloneBuildingEstimates: scan source file failed", "error", err)
+			response.InternalError(c, "Failed to read source files")
+			return
+		}
+		srcFiles = append(srcFiles, f)
+	}
+	fileRows.Close()
+
+	// Get the cloning user's email for created_by — matches the format
+	// CreateBuildingFile writes (the column is VARCHAR storing email).
+	clonedByEmail := ""
+	if email, exists := c.Get("user_email"); exists {
+		if s, ok := email.(string); ok {
+			clonedByEmail = s
+		}
+	}
+
+	filesCreated := 0
+	for _, sf := range srcFiles {
+		if _, err := tx.Exec(`
+			INSERT INTO building_files (
+				tenant_id, building_id, file_id, file_url, filename,
+				file_size, mime_type, description, created_by, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+		`,
+			tenantID, targetBuildingID, sf.FileID, sf.FileURL, sf.Filename,
+			sf.FileSize, sf.MimeType, sf.Description, clonedByEmail,
+		); err != nil {
+			h.log.Error("CloneBuildingEstimates: insert clone file failed",
+				"error", err, "source_file_id", sf.ID)
+			response.InternalError(c, "Failed to create cloned file")
+			return
+		}
+		filesCreated++
+	}
+
+	// Refuse only when ALL source pools are empty. A block with stages
+	// or files but no estimates is rare but legal (user pre-created
+	// Bosqichlar or uploaded drawings before importing the smeta) —
+	// still worth cloning.
+	if len(srcEstimates) == 0 && len(srcStages) == 0 && len(srcFiles) == 0 {
+		c.JSON(400, gin.H{
+			"success": false,
+			"error":   "Source building has no estimates, stages or files to clone",
+			"code":    "SOURCE_EMPTY",
+		})
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	estimatesCreated := 0
+	linesCreated := 0
+
+	// Allocate fresh version numbers for the clones. The unique constraint
+	// idx_construction_estimate_version is on (project_id, version), so
+	// re-using the source's version (e.g. v86) collides with the existing
+	// row. Read MAX(version) once and increment per clone — assigning
+	// monotonically increasing versions inside the transaction so they
+	// don't collide with each other either.
+	var nextVersion int
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(version), 0) FROM construction_estimate WHERE project_id = $1 AND tenant_id = $2`,
+		projectID, tenantID,
+	).Scan(&nextVersion); err != nil {
+		h.log.Error("CloneBuildingEstimates: max version lookup failed", "error", err)
+		response.InternalError(c, "Failed to allocate clone version")
+		return
+	}
+
+	// The project's currently-open Forma 2 iteration. We seed period_fakt
+	// rows for the cloned lines into it so the Bosqichlar BAJARILDI input
+	// shows the carried-over progress (that input reads the open iteration's
+	// period_fakt; the progress bar/status read done_quantity on the line).
+	var openIterID sql.NullInt64
+	_ = tx.QueryRow(`
+		SELECT id FROM construction_form2_iteration
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'open'
+		LIMIT 1
+	`, projectID, tenantID).Scan(&openIterID)
+
+	// 2. For each source estimate, create a fresh estimate row on the
+	//    target building, then clone all of its lines. is_current is
+	//    deliberately set to FALSE on every clone — the source's "v86 is
+	//    the active єдинич" flag belongs to the source's version line,
+	//    and forcing it onto the clone would silently demote whichever
+	//    project-wide row currently carries it. The user can mark the
+	//    clone active afterwards if they want.
+	for _, se := range srcEstimates {
+		nextVersion++
+		var newEstID int64
+		if err := tx.QueryRow(`
+			INSERT INTO construction_estimate (
+				tenant_id, project_id, building_id, version, name, state, is_current,
+				overhead_pct, profit_pct, vat_pct,
+				source_type, subcontract_id, created_by, created_date, updated_date
+			) VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+			RETURNING id
+		`,
+			tenantID, projectID, targetBuildingID, nextVersion, se.Name, se.State,
+			se.OverheadPct, se.ProfitPct, se.VatPct,
+			se.SourceType, se.SubcontractID, userID,
+		).Scan(&newEstID); err != nil {
+			h.log.Error("CloneBuildingEstimates: insert clone estimate failed", "error", err, "source_estimate_id", se.ID)
+			response.InternalError(c, "Failed to create cloned estimate")
+			return
+		}
+		estimatesCreated++
+
+		// Pull lines parent-first so child lines find their remapped
+		// parent in idMap. parent_line_id NULL → top-level work, sorted
+		// ahead of sub-lines by the CASE/ORDER below.
+		lineRows, err := tx.Query(`
+			SELECT id, wbs_id, name, COALESCE(uom, ''), COALESCE(quantity, 0),
+			       COALESCE(material_rate, 0), COALESCE(labor_rate, 0), COALESCE(equipment_rate, 0),
+			       COALESCE(unit_rate, 0), COALESCE(total_amount, 0),
+			       COALESCE(code, ''), COALESCE(item_number, ''),
+			       COALESCE(resource_type, ''), COALESCE(parent_item_number, ''),
+			       parent_line_id, COALESCE(norm_rate, 0), COALESCE(subline_seq, 0),
+			       COALESCE(quantity_override, FALSE),
+			       COALESCE(material_type, 'standard'),
+			       COALESCE(original_quantity, 0), COALESCE(original_unit_rate, 0),
+			       imported_quantity, imported_total,
+			       COALESCE(sort_order, 0), COALESCE(is_manual, FALSE),
+			       COALESCE(done_quantity, 0)
+			FROM construction_estimate_line
+			WHERE estimate_id = $1 AND tenant_id = $2
+			ORDER BY (CASE WHEN parent_line_id IS NULL THEN 0 ELSE 1 END) ASC,
+			         COALESCE(sort_order, 0) ASC,
+			         id ASC
+		`, se.ID, tenantID)
+		if err != nil {
+			h.log.Error("CloneBuildingEstimates: list source lines failed", "error", err, "source_estimate_id", se.ID)
+			response.InternalError(c, "Failed to list source lines")
+			return
+		}
+
+		type srcLine struct {
+			ID               int64
+			WBSID            sql.NullInt64
+			Name, UOM        string
+			Quantity         float64
+			MaterialRate     float64
+			LaborRate        float64
+			EquipmentRate    float64
+			UnitRate         float64
+			TotalAmount      float64
+			Code             string
+			ItemNumber       string
+			ResourceType     string
+			ParentItemNumber string
+			ParentLineID     sql.NullInt64
+			NormRate         float64
+			SublineSeq       int
+			QuantityOverride bool
+			MaterialType     string
+			OriginalQuantity float64
+			OriginalUnitRate float64
+			ImportedQuantity sql.NullFloat64
+			ImportedTotal    sql.NullFloat64
+			SortOrder        int
+			IsManual         bool
+			DoneQuantity     float64
+		}
+		var srcLines []srcLine
+		for lineRows.Next() {
+			var l srcLine
+			if err := lineRows.Scan(
+				&l.ID, &l.WBSID, &l.Name, &l.UOM, &l.Quantity,
+				&l.MaterialRate, &l.LaborRate, &l.EquipmentRate,
+				&l.UnitRate, &l.TotalAmount,
+				&l.Code, &l.ItemNumber, &l.ResourceType, &l.ParentItemNumber,
+				&l.ParentLineID, &l.NormRate, &l.SublineSeq,
+				&l.QuantityOverride, &l.MaterialType,
+				&l.OriginalQuantity, &l.OriginalUnitRate,
+				&l.ImportedQuantity, &l.ImportedTotal,
+				&l.SortOrder, &l.IsManual, &l.DoneQuantity,
+			); err != nil {
+				lineRows.Close()
+				h.log.Error("CloneBuildingEstimates: scan source line failed", "error", err)
+				response.InternalError(c, "Failed to read source lines")
+				return
+			}
+			srcLines = append(srcLines, l)
+		}
+		lineRows.Close()
+
+		// Old line id → new line id. Used to remap parent_line_id on
+		// child rows so resource sub-lines still attach to the right
+		// parent work in the clone. Order above guarantees parents are
+		// inserted (and added to the map) before their children.
+		idMap := make(map[int64]int64)
+
+		for _, sl := range srcLines {
+			var newParent sql.NullInt64
+			if sl.ParentLineID.Valid {
+				if mapped, ok := idMap[sl.ParentLineID.Int64]; ok {
+					newParent = sql.NullInt64{Int64: mapped, Valid: true}
+				}
+				// If the parent didn't make it into idMap (orphaned row —
+				// shouldn't happen in practice, but defensive), leave the
+				// new line with NULL parent rather than fail the whole
+				// clone. The line will render as top-level on the target;
+				// not perfect, but better than silently breaking the user's
+				// one-click "make sibling block match" expectation.
+			}
+
+			// Carry over progress. The HOLAT/approval workflow state is
+			// reset to a clean "pending / in_progress" derived from the
+			// done quantity (so a cloned, partly-done work reads JARAYONDA
+			// and stays editable) rather than copying submitted/confirmed
+			// signatures, which would clone into a locked state with no
+			// reviewer context.
+			approvalStatus := "pending"
+			if sl.DoneQuantity > 0 {
+				approvalStatus = "in_progress"
+			}
+
+			var newLineID int64
+			if err := tx.QueryRow(`
+				INSERT INTO construction_estimate_line (
+					tenant_id, estimate_id, wbs_id, name, uom, quantity,
+					material_rate, labor_rate, equipment_rate, unit_rate, total_amount,
+					code, item_number, resource_type, parent_item_number,
+					parent_line_id, norm_rate, subline_seq, quantity_override, material_type,
+					original_quantity, original_unit_rate, imported_quantity, imported_total,
+					sort_order, is_manual, done_quantity, approval_status, created_date, updated_date
+				) VALUES (
+					$1, $2, $3, $4, $5, $6,
+					$7, $8, $9, $10, $11,
+					$12, $13, $14, $15,
+					$16, $17, $18, $19, $20,
+					$21, $22, $23, $24,
+					$25, $26, $27, $28, NOW(), NOW()
+				)
+				RETURNING id
+			`,
+				tenantID, newEstID, sl.WBSID, sl.Name, sl.UOM, sl.Quantity,
+				sl.MaterialRate, sl.LaborRate, sl.EquipmentRate, sl.UnitRate, sl.TotalAmount,
+				sl.Code, sl.ItemNumber, sl.ResourceType, sl.ParentItemNumber,
+				newParent, sl.NormRate, sl.SublineSeq, sl.QuantityOverride, sl.MaterialType,
+				sl.OriginalQuantity, sl.OriginalUnitRate, sl.ImportedQuantity, sl.ImportedTotal,
+				sl.SortOrder, sl.IsManual, sl.DoneQuantity, approvalStatus,
+			).Scan(&newLineID); err != nil {
+				h.log.Error("CloneBuildingEstimates: insert clone line failed",
+					"error", err, "source_line_id", sl.ID, "new_estimate_id", newEstID)
+				response.InternalError(c, "Failed to create cloned line")
+				return
+			}
+			idMap[sl.ID] = newLineID
+			linesCreated++
+
+			// Seed the open Forma 2 iteration with this line's period_fakt so
+			// the BAJARILDI input shows the carried-over progress. The clone
+			// has no frozen-iteration history, so its entire done quantity
+			// lives in the current open iteration — keeping the invariant
+			// done_quantity = Σ period_fakt intact.
+			if openIterID.Valid && sl.DoneQuantity != 0 {
+				if _, err := tx.Exec(`
+					INSERT INTO construction_form2_iteration_line (iteration_id, estimate_line_id, period_fakt)
+					VALUES ($1, $2, $3)
+					ON CONFLICT (iteration_id, estimate_line_id) DO UPDATE SET period_fakt = EXCLUDED.period_fakt
+				`, openIterID.Int64, newLineID, sl.DoneQuantity); err != nil {
+					h.log.Error("CloneBuildingEstimates: seed iteration line failed",
+						"error", err, "new_line_id", newLineID)
+					response.InternalError(c, "Failed to seed cloned progress")
+					return
+				}
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("CloneBuildingEstimates: commit failed", "error", err)
+		response.InternalError(c, "Failed to commit clone")
+		return
+	}
+	committed = true
+
+	// Bump the project's denormalised building count so the UI badge
+	// updates without a separate round-trip. Best-effort; failure to
+	// update the cache shouldn't break the duplication (the buildings
+	// list will recompute it on next load anyway).
+	_, _ = h.db.Exec(`
+		UPDATE construction_projects
+		SET buildings_count = buildings_count + 1, updated_date = NOW()
+		WHERE id = $1
+	`, projectID)
+
+	response.Success(c, gin.H{
+		"message":           "Building duplicated",
+		"estimates_created": estimatesCreated,
+		"lines_created":     linesCreated,
+		"stages_created":    stagesCreated,
+		"files_created":     filesCreated,
+		"source_building_id": sourceBuildingID,
+		"new_building": gin.H{
+			"id":   targetBuildingID,
+			"name": newName,
+			"code": newCode,
+		},
+	})
+}
+
+// createDuplicateBuildingTx inserts a new construction_buildings row
+// inside an existing transaction, named "<sourceName> Copy" (or " Copy
+// (N)" on subsequent duplications). Returns the new building id, name,
+// and code. Mirrors the unique-code retry pattern used by
+// CreateConstructionBuilding so a collision on
+// (project_id, code) doesn't 500 the duplicate.
+func (h *Handler) createDuplicateBuildingTx(
+	tx *sql.Tx,
+	tenantID uuid.UUID, projectID int64,
+	srcName, srcCode string,
+	description, buildingType, buildingPurpose sql.NullString,
+	floorsCount, floorsUnderground sql.NullInt64,
+	totalArea, livingArea, nonLivingArea sql.NullFloat64,
+	apartmentsCount, commercialUnitsCount, parkingSpots sql.NullInt64,
+	estimatedCost sql.NullFloat64,
+	currency sql.NullString,
+	plannedStart, plannedEnd sql.NullTime,
+	sortOrder sql.NullInt64,
+) (newID int64, finalName string, finalCode string, err error) {
+	// Pick a base name. " Copy" first, then " Copy (2)" / " Copy (3)" if
+	// names already exist. We check up-front against the existing names
+	// to avoid hammering the unique index with retries (name has no
+	// uniqueness constraint, but readability matters — the UI would show
+	// two blocks both literally called "Block 1 Copy" which is confusing).
+	tryName := srcName + " Copy"
+	for n := 2; n <= 50; n++ {
+		var exists bool
+		if err = tx.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM construction_buildings
+				WHERE project_id = $1 AND tenant_id = $2 AND name = $3
+			)
+		`, projectID, tenantID, tryName).Scan(&exists); err != nil {
+			return 0, "", "", err
+		}
+		if !exists {
+			break
+		}
+		tryName = fmt.Sprintf("%s Copy (%d)", srcName, n)
+	}
+
+	// Pick a free code by PRE-SCANNING for collisions on (project_id, code),
+	// same as the name dedup above. We must NOT rely on catching the unique
+	// 23505 from a failed INSERT and retrying: inside a transaction the first
+	// failed statement aborts the WHOLE tx ("current transaction is aborted,
+	// commands ignored until end of transaction block"), so a retry INSERT
+	// would always fail. That bug surfaced as "Failed to create duplicate
+	// building" on the 2nd+ duplicate of the same source (its "<code>-COPY"
+	// already existed). A SELECT EXISTS check doesn't error, so it's safe.
+	baseCode := strings.TrimSpace(srcCode)
+	if baseCode == "" {
+		baseCode = "BUILDING"
+	}
+	baseCode = baseCode + "-COPY"
+	tryCode := baseCode
+	for n := 2; n <= 200; n++ {
+		var exists bool
+		if err = tx.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM construction_buildings
+				WHERE project_id = $1 AND tenant_id = $2 AND code = $3
+			)
+		`, projectID, tenantID, tryCode).Scan(&exists); err != nil {
+			return 0, "", "", err
+		}
+		if !exists {
+			break
+		}
+		tryCode = fmt.Sprintf("%s-%d", baseCode, n)
+	}
+
+	const query = `
+		INSERT INTO construction_buildings (
+			tenant_id, project_id, code, name, description,
+			building_type, building_purpose, floors_count, floors_underground,
+			total_area, living_area, non_living_area,
+			apartments_count, commercial_units_count, parking_spots,
+			estimated_cost, currency,
+			planned_start_date, planned_end_date,
+			status, sort_order, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+		          $10, $11, $12, $13, $14, $15,
+		          $16, COALESCE($17, 'UZS'),
+		          $18, $19,
+		          'draft', $20, NOW(), NOW())
+		RETURNING id
+	`
+	if err = tx.QueryRow(query,
+		tenantID, projectID, tryCode, tryName, description,
+		buildingType, buildingPurpose, floorsCount, floorsUnderground,
+		totalArea, livingArea, nonLivingArea,
+		apartmentsCount, commercialUnitsCount, parkingSpots,
+		estimatedCost, currency,
+		plannedStart, plannedEnd,
+		sortOrder,
+	).Scan(&newID); err != nil {
+		return 0, "", "", err
+	}
+	return newID, tryName, tryCode, nil
 }

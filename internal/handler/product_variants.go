@@ -373,21 +373,35 @@ func (h *Handler) ListProductVariants(c *gin.Context) {
 		WHERE pv.tenant_id = $1 AND pv.deleted_at IS NULL
 	`
 	args := []interface{}{tenantID}
+	whereExtra := ""
 
 	// Filter by organization via products table (skip when filtering by specific product)
 	if productID == "" {
 		if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 			args = append(args, orgID)
-			baseQuery += fmt.Sprintf(" AND p.origin_organization_id = $%d", len(args))
+			whereExtra += fmt.Sprintf(" AND p.origin_organization_id = $%d", len(args))
 		}
 	}
 
+	orderBy := ""
 	if productID != "" {
 		args = append(args, productID)
-		baseQuery += fmt.Sprintf(" AND pv.product_id = $%d", len(args))
-		baseQuery += " ORDER BY pv.variant_name"
+		whereExtra += fmt.Sprintf(" AND pv.product_id = $%d", len(args))
+		orderBy = " ORDER BY pv.variant_name"
 	} else {
-		baseQuery += " ORDER BY p.name, pv.variant_name"
+		orderBy = " ORDER BY p.name, pv.variant_name"
+	}
+
+	baseQuery += whereExtra
+	baseQuery += orderBy
+
+	// Number of args that belong to the WHERE/filter clause (excludes LIMIT/OFFSET).
+	filterArgCount := len(args)
+
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		baseQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", filterArgCount+1, filterArgCount+2)
+		args = append(args, pageSize, offset)
 	}
 
 	var rows *sql.Rows
@@ -434,7 +448,19 @@ func (h *Handler) ListProductVariants(c *gin.Context) {
 		variants = append(variants, v)
 	}
 
-	response.Success(c, variants)
+	if !paginate {
+		response.Success(c, variants)
+		return
+	}
+
+	var total int
+	countQuery := `
+		SELECT COUNT(*)
+		FROM product_variants pv
+		JOIN products p ON p.id = pv.product_id
+		WHERE pv.tenant_id = $1 AND pv.deleted_at IS NULL` + whereExtra
+	_ = h.db.QueryRow(countQuery, args[:filterArgCount]...).Scan(&total)
+	response.Paginated(c, variants, page, pageSize, total)
 }
 
 // GetProductVariant returns a single variant

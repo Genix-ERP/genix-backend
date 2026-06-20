@@ -1,7 +1,6 @@
 package database
 
 import (
-	"database/sql"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -163,50 +162,6 @@ func applyMigration(db *DB, m Migration) error {
 		m.Version, m.Name,
 	); err != nil {
 		return fmt.Errorf("failed to record migration: %w", err)
-	}
-
-	return tx.Commit()
-}
-
-// RollbackMigration rolls back the last applied migration
-func RollbackMigration(db *DB) error {
-	var version int
-	var name string
-
-	err := db.QueryRow(
-		"SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 1",
-	).Scan(&version, &name)
-
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("no migrations to rollback")
-	}
-	if err != nil {
-		return fmt.Errorf("failed to get last migration: %w", err)
-	}
-
-	// Look for rollback file
-	rollbackFile := fmt.Sprintf("%03d_%s.down.sql", version, name)
-	content, err := fs.ReadFile(migrationsFS, filepath.Join("migrations", rollbackFile))
-	if err != nil {
-		return fmt.Errorf("rollback file not found: %s", rollbackFile)
-	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-
-	if _, err = tx.Exec(string(content)); err != nil {
-		return fmt.Errorf("failed to execute rollback: %w", err)
-	}
-
-	if _, err = tx.Exec("DELETE FROM schema_migrations WHERE version = $1", version); err != nil {
-		return fmt.Errorf("failed to remove migration record: %w", err)
 	}
 
 	return tx.Commit()

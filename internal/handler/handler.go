@@ -203,6 +203,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		orgs.DELETE("/:id", h.perm.Require("organization", "organization", "delete"), h.DeleteOrganization)
 		// Initialize default accounts for organization
 		orgs.POST("/:id/initialize-accounts", h.perm.Require("organization", "organization", "update"), h.InitializeOrganizationAccounts)
+		// Restore (un-delete) all soft-deleted accounts for an organization.
+		orgs.POST("/:id/restore-accounts", h.perm.Require("organization", "organization", "update"), h.RestoreOrganizationAccounts)
 		// Organization employees
 		orgs.GET("/:id/employees", h.ListOrganizationEmployees)
 	}
@@ -240,6 +242,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		contacts.GET("/:id/persons", h.ListContactPersons)
 		contacts.POST("/:id/persons", h.CreateContactPerson)
 		contacts.POST("/:id/rate", h.RateSupplier)
+		// CRM "create customer + sales order + manufacture order" in one save,
+		// and the customer's sales history (links to sales detail on the front-end).
+		contacts.POST("/full-order", h.CreateCustomerWithFullOrder)
+		contacts.GET("/:id/sales", h.ListContactSalesHistory)
 	}
 
 	// Call Logs (CRM PBX Integration)
@@ -413,6 +419,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.GET("/movements", h.ListInventoryMovements)
 		inventory.GET("/valuation", h.GetInventoryValuation)
 		inventory.GET("/cogs", h.GetCOGSData)
+		// As-of date stock report — replays inventory_transactions up to
+		// the chosen date so the user can see what each warehouse held
+		// (incl. soft-deleted SKUs) on any historical day.
+		inventory.GET("/stock-at-date", h.GetStockAtDate)
+		// Per-(product, warehouse) turnover for a date range: opening
+		// balance, kirim/chiqim within the period, and closing balance +
+		// weighted-average cost. Powers the "Ombor holati" report sub-tab.
+		inventory.GET("/turnover", h.GetInventoryTurnover)
 
 		// Inventory Lots (Partiyalar) - lots are created automatically during Goods Receipt
 		inventory.GET("/lots", h.ListInventoryLots)
@@ -1939,6 +1953,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/buildings", h.perm.Require("construction", "project", "create"), h.CreateConstructionBuilding)
 		constructionProjects.PUT("/:id/buildings/:building_id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionBuilding)
 		constructionProjects.DELETE("/:id/buildings/:building_id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionBuilding)
+		// Clone all estimates (Единич, ВОР, Ресурс) + their lines from a
+		// sibling block. Target must be empty; same project only. Used by
+		// the "Klonlash" entry in the block card "..." menu.
+		constructionProjects.POST("/:id/buildings/:building_id/clone-estimates", h.perm.Require("construction", "smeta", "create"), h.CloneBuildingEstimates)
 		// CRM linkage — set/clear crm_project_id on the project and
 		// crm_block_id / current_crm_stage / auto_sync on the building.
 		constructionProjects.PUT("/:id/crm-link", h.perm.Require("construction", "project", "update"), h.UpdateProjectCRMLink)
@@ -2032,6 +2050,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 		// Stages
 		constructionProjects.GET("/:id/stages", h.ListConstructionStages)
+		constructionProjects.GET("/:id/stages/overview", h.GetConstructionStagesOverview)
 		constructionProjects.POST("/:id/stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionStage)
 
 		// Flat feed of everything currently in_progress (stages + sub-stages).
@@ -2165,10 +2184,22 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		estimates.DELETE("/:id", h.perm.Require("construction", "estimate", "delete"), h.DeleteEstimate)
 		estimates.POST("/:id/approve", h.perm.Require("construction", "estimate", "update"), h.ApproveEstimate)
 		estimates.POST("/:id/duplicate", h.perm.Require("construction", "estimate", "create"), h.DuplicateEstimate)
+		// Estimate stat-card aggregates (cost breakdown + counts) computed
+		// server-side so mobile doesn't have to download every line to show
+		// the headline numbers. See construction_estimate_summary.go.
+		estimates.GET("/:id/summary", h.GetEstimateSummary)
+		// Server-side calcs for mobile (which can't replicate the web math):
+		// Bosqichlar progress roll-ups + Forma 2 money summary.
+		estimates.GET("/:id/stages-progress", h.GetEstimateStagesProgress)
+		estimates.GET("/:id/forma2-summary", h.GetEstimateForma2Summary)
 		// Estimate Lines
 		estimates.GET("/:id/lines", h.ListEstimateLines)
 		estimates.POST("/:id/lines", h.perm.Require("construction", "estimate", "update"), h.CreateEstimateLine)
 		estimates.POST("/:id/lines/bulk", h.perm.Require("construction", "estimate", "update"), h.BulkCreateEstimateLines)
+		// Clone-by-code: create a new line and, if an existing parent line with
+		// the same code lives anywhere in the project, copy all of its
+		// resources (sub-lines) onto the new one. See CloneEstimateLineByCode.
+		estimates.POST("/:id/lines/clone-by-code", h.perm.Require("construction", "estimate", "update"), h.CloneEstimateLineByCode)
 		estimates.POST("/:id/create-products", h.perm.Require("construction", "estimate", "update"), h.CreateProductsFromEstimate)
 		estimates.PUT("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.UpdateEstimateLine)
 		estimates.DELETE("/:id/lines/:line_id", h.perm.Require("construction", "estimate", "update"), h.DeleteEstimateLine)
@@ -2205,6 +2236,38 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		form2Snapshots.GET("/:snapshot_id", h.GetForm2Snapshot)
 		form2Snapshots.DELETE("/:snapshot_id",
 			h.perm.Require("construction", "estimate", "update"), h.DeleteForm2Snapshot)
+	}
+
+	// Forma 2 iterations — multi-run series (migration 419). The iter
+	// header lives at the project level (one open per project); the
+	// Bosqichlar tab uses these to render "Forma 2 #1, #2, #3" tabs.
+	// Freezing an iteration also writes a construction_form2_snapshot
+	// row so the Smeta boshqaruvi → Formalar tarixi list never drifts
+	// out of sync with the iteration tab strip.
+	form2Iters := rg.Group("/construction/projects/:id/form2-iterations")
+	form2Iters.Use(h.perm.Require("construction", "estimate", "read"))
+	{
+		form2Iters.GET("", h.ListForm2Iterations)
+		form2Iters.POST("",
+			h.perm.Require("construction", "estimate", "update"), h.CreateForm2Iteration)
+		form2Iters.GET("/:iter_id/lines", h.GetForm2IterationLines)
+		// Delete (undo) the most recent frozen Forma 2 — re-opens it and
+		// drops the empty open iteration + its snapshot. Gated on the
+		// estimate "delete" action so the frontend can hide the button for
+		// users without it.
+		form2Iters.DELETE("/:iter_id",
+			h.perm.Require("construction", "estimate", "delete"), h.DeleteForm2Iteration)
+	}
+
+	// Project-level Forma 2 snapshot history. Lists every saved Forma 2 for
+	// the whole project (across all blocks/estimates), mirroring the
+	// project-wide iteration strip — used by Smeta boshqaruvi → Formalar
+	// tarixi so freezes made from any block stay visible regardless of which
+	// block is currently selected.
+	projectForm2Snapshots := rg.Group("/construction/projects/:id/form2-snapshots")
+	projectForm2Snapshots.Use(h.perm.Require("construction", "estimate", "read"))
+	{
+		projectForm2Snapshots.GET("", h.ListProjectForm2Snapshots)
 	}
 
 	// v2 Stages workflow — work approval transitions.
@@ -2249,6 +2312,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		constructionStages.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionStage)
 		constructionStages.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteConstructionStage)
+		constructionStages.GET("/:id/works", h.GetConstructionStageWorks)
 		constructionStages.GET("/:id/sub-stages", h.ListConstructionSubStages)
 		constructionStages.POST("/:id/sub-stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionSubStage)
 		constructionStages.GET("/:id/materials", h.ListStageMaterials)

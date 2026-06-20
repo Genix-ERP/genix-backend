@@ -902,6 +902,54 @@ func (h *Handler) InitializeOrganizationAccounts(c *gin.Context) {
 	})
 }
 
+// RestoreOrganizationAccounts un-deletes (restores) every soft-deleted account
+// for one organization. Used by the Finance settings "restore deleted accounts"
+// action when an org's chart of accounts was bulk soft-deleted. Idempotent —
+// re-running it once everything is active changes nothing.
+//
+// POST /api/v1/organizations/:id/restore-accounts
+func (h *Handler) RestoreOrganizationAccounts(c *gin.Context) {
+	tenantIDStr, exists := c.Get(middleware.ContextKeyTenantID)
+	if !exists {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	tenantID, err := uuid.Parse(tenantIDStr.(string))
+	if err != nil {
+		response.BadRequest(c, "Invalid tenant ID")
+		return
+	}
+	orgID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid organization ID")
+		return
+	}
+
+	var orgExists bool
+	if err := h.db.QueryRow(
+		"SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)",
+		orgID, tenantID,
+	).Scan(&orgExists); err != nil || !orgExists {
+		response.NotFound(c, "Organization")
+		return
+	}
+
+	res, err := h.db.Exec(
+		`UPDATE accounts
+		    SET deleted_at = NULL, is_active = true, updated_at = NOW()
+		  WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NOT NULL`,
+		tenantID, orgID,
+	)
+	if err != nil {
+		h.log.Error("Failed to restore organization accounts", "error", err, "org_id", orgID)
+		response.InternalServerError(c, "Failed to restore accounts")
+		return
+	}
+	restored, _ := res.RowsAffected()
+	h.log.Info("Restored soft-deleted accounts", "tenant_id", tenantID, "org_id", orgID, "restored", restored)
+	response.Success(c, gin.H{"restored": restored, "organization_id": orgID})
+}
+
 // createDefaultChartOfAccounts creates a standard chart of accounts for a new organization
 // This follows standard accounting practices similar to Odoo
 func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error {
@@ -986,6 +1034,8 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		{"5010", "Kassa", "CASH", false, false, true, "Naqd pul kassada"},
 		{"5020", "Valyuta kassasi", "CASH", false, false, true, "Chet el valyutasidagi naqd pullar"},
 		{"5110", "Hisob-kitob schyoti", "CASH", true, false, true, "Asosiy bank hisob raqami"},
+		{"5210", "Mamlakat ichidagi valyuta schyotlari", "CASH", true, false, true, "Mamlakat ichidagi banklardagi chet el valyutasi schyotlari"},
+		{"5220", "Chet eldagi valyuta schyotlari", "CASH", true, false, true, "Chet eldagi banklardagi chet el valyutasi schyotlari"},
 
 		// Kreditorlik qarzlari (60xx-69xx)
 		{"6010", "Mol yetkazib beruvchilar va pudratchilar", "AP", false, true, true, "Mol yetkazib beruvchilarga savdo kreditorlik qarzlari"},

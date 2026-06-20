@@ -1058,7 +1058,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 
 	// Odoo-style: AR + per-category Income + COGS/Interim clearing
 	// 1. Try contact's default receivable account
-	arAccountID := getContactDefaultAccount(tx, customerID, "receivable")
+	arAccountID := getContactDefaultAccount(tx, customerID, "receivable", organizationID)
 	// 2. Fallback to standard findAccount
 	if arAccountID == uuid.Nil {
 		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
@@ -1159,26 +1159,13 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		revenueGrouped[fallbackRevenue] = subtotal
 	}
 
-	// Generate entry number from actual max to avoid duplicate key conflicts
+	// Generate entry number from actual max to avoid duplicate key conflicts.
+	// Scoped to (tenant, org) to match journal_entries_tenant_org_entry_number_key.
 	prefix := ""
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
-	var nextNumber int
-	if prefix != "" {
-		_ = tx.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
-			tenantID, salesJournalID, prefix+"%",
-		).Scan(&nextNumber)
-	} else {
-		_ = tx.QueryRow(
-			"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
-			tenantID, salesJournalID,
-		).Scan(&nextNumber)
-	}
-	if nextNumber < 1 {
-		nextNumber = 1
-	}
+	nextNumber := nextEntryNumberSeq(tx, tenantID, organizationID, prefix, 1)
 	entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 
 	// Calculate total debit = AR total + COGS total
@@ -1990,21 +1977,8 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 			if numberPrefix.Valid {
 				prefix = numberPrefix.String
 			}
-			var nextNumber int
-			if prefix != "" {
-				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
-					tenantID, salesJournalID, prefix+"%",
-				).Scan(&nextNumber)
-			} else {
-				_ = tx.QueryRow(
-					"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
-					tenantID, salesJournalID,
-				).Scan(&nextNumber)
-			}
-			if nextNumber < 1 {
-				nextNumber = 1
-			}
+			// Scoped to (tenant, org) to match journal_entries_tenant_org_entry_number_key.
+			nextNumber := nextEntryNumberSeq(tx, tenantID, organizationID, prefix, 1)
 			entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 
 			journalEntryID := uuid.New()
@@ -2290,26 +2264,13 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 			continue
 		}
 
-		// Generate entry number
+		// Generate entry number — scoped to (tenant, org) to match
+		// journal_entries_tenant_org_entry_number_key.
 		prefix := ""
 		if numberPrefix.Valid {
 			prefix = numberPrefix.String
 		}
-		var nextNumber int
-		if prefix != "" {
-			_ = tx.QueryRow(
-				"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND entry_number LIKE $3 AND deleted_at IS NULL",
-				tenantID, salesJournalID, prefix+"%",
-			).Scan(&nextNumber)
-		} else {
-			_ = tx.QueryRow(
-				"SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g') AS BIGINT)), 0) + 1 FROM journal_entries WHERE tenant_id = $1 AND journal_id = $2 AND deleted_at IS NULL",
-				tenantID, salesJournalID,
-			).Scan(&nextNumber)
-		}
-		if nextNumber < 1 {
-			nextNumber = 1
-		}
+		nextNumber := nextEntryNumberSeq(tx, tenantID, mi.OrganizationID, prefix, 1)
 		entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
 
 		jeID := uuid.New()
