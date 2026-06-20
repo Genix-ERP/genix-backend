@@ -62,7 +62,6 @@ services:
         condition: service_healthy
     networks:
       - genix-network
-      - cross-stack
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
       interval: 30s
@@ -152,9 +151,9 @@ volumes:
 networks:
   genix-network:
     driver: bridge
-  # Shared network with the Yuksalish CRM stack (yuksalish-backend container)
-  # so genix-api can reach http://yuksalish-backend:8000 without going through
-  # the public domain (which hits NAT hairpin on this host). Created
-  # manually once: `docker network create cross-stack`.
-  cross-stack:
-    external: true
+  # NOTE: the `cross-stack` external network (shared with the Yuksalish CRM
+  # stack) lives only on the yuksalish branch / Yuksalish server. The prod
+  # Genix deployment (this main branch) has no CRM stack to reach, so it
+  # must NOT declare cross-stack — otherwise `docker compose up` aborts on
+  # the prod host with "network cross-stack declared as external, but could
+  # not be found". Keep this divergence: do not add cross-stack back on main.
