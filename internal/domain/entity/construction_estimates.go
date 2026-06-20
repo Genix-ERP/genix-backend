@@ -198,6 +198,16 @@ type ConstructionEstimateLine struct {
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
 
+	// IsManual (migration 417) — TRUE when the line was created via the
+	// individual line endpoints (CreateEstimateLine, CloneEstimateLineByCode,
+	// CreateProjectResource — "+ Ish", "+ Yangi qo'shimcha etap",
+	// "+ Qo'shimcha resurs", clone-by-code, "+ Resurs" in the picker). FALSE
+	// when the line came from a bulk smeta import. The Smetalar tab passes
+	// ?include_manual=false to hide manuals; SmetaManagementTab consumes this
+	// flag to detect "manual top-level sections" (every line under a section
+	// is is_manual ⇒ user-built section ⇒ pin to top).
+	IsManual bool `json:"is_manual" db:"is_manual"`
+
 	// Computed
 	WBSCode string `json:"wbs_code,omitempty" db:"wbs_code"`
 	WBSName string `json:"wbs_name,omitempty" db:"wbs_name"`
@@ -239,6 +249,7 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		ApprovalStatus   string      `json:"approval_status"`
 		DoneQuantity     float64     `json:"done_quantity"`
 		SortOrder        int         `json:"sort_order"`
+		IsManual      bool            `json:"is_manual"`
 		CreatedDate   time.Time       `json:"created_date"`
 		UpdatedDate   time.Time       `json:"updated_date"`
 		WBSCode       string          `json:"wbs_code,omitempty"`
@@ -277,6 +288,7 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		ApprovalStatus:   l.ApprovalStatus,
 		DoneQuantity:     l.DoneQuantity,
 		SortOrder:        l.SortOrder,
+		IsManual:      l.IsManual,
 		CreatedDate:   l.CreatedDate,
 		UpdatedDate:   l.UpdatedDate,
 		WBSCode:       l.WBSCode,
@@ -390,11 +402,10 @@ type BulkCreateEstimateLinesInput struct {
 	Lines      []CreateEstimateLineInput `json:"lines" binding:"required"`
 	Replace    bool                      `json:"replace"`
 	SourceType string                    `json:"source_type"`
-	// SourceFileName identifies the Excel file the user uploaded. Used by
-	// autoCreateForma2FromEstimate to dedupe Forma 2 drafts: multiple
-	// estimate types extracted from the SAME file produce ONE merged
-	// Forma 2, while imports from different files stay separate. See
-	// migration 339 for the matching column on construction_act.
+	// SourceFileName identifies the Excel file the user uploaded.
+	// Previously used to dedupe auto-created Forma 2 drafts (feature
+	// removed). See migration 339 for the matching column on
+	// construction_act.
 	SourceFileName string `json:"source_file_name"`
 	// Imported budget totals captured from the Ресурс sheet's bottom
 	// summary block (parseResurs in SmetaImportModal.jsx). Persisted onto
@@ -422,6 +433,13 @@ type UpdateEstimateLineInput struct {
 	EquipmentRate *float64 `json:"equipment_rate"`
 	SortOrder     *int     `json:"sort_order"`
 	ActualAmount  *float64 `json:"actual_amount"`
+
+	// OriginalQuantity — the smeta-anchored "NORMA" pill shown on each
+	// work card (migration 349). Defaults to the row's first Quantity at
+	// import time and the UI usually treats it as immutable. The full
+	// edit modal exposes it as a Norma input so the user can correct an
+	// imported figure when the smeta itself was wrong.
+	OriginalQuantity *float64 `json:"original_quantity"`
 
 	// Optional edits to line metadata (used by the full edit modal).
 	Code         *string `json:"code"`

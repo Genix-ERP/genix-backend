@@ -39,13 +39,15 @@ func (h *Handler) ListForma19(c *gin.Context) {
 		FROM construction_act a
 		WHERE a.act_type = 'hidden_work' AND a.project_id = $1 AND a.tenant_id = $2
 	`
+	paginate, page, pageSize, offset := optPagination(c)
+	whereExtra := ""
 	args := []interface{}{projectID, tenantID}
 	argCount := 2
 
 	state := c.Query("state")
 	if state != "" {
 		argCount++
-		query += fmt.Sprintf(" AND a.state = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND a.state = $%d", argCount)
 		args = append(args, state)
 	}
 
@@ -54,7 +56,7 @@ func (h *Handler) ListForma19(c *gin.Context) {
 		buildingID, parseErr := strconv.ParseInt(buildingIDStr, 10, 64)
 		if parseErr == nil {
 			argCount++
-			query += fmt.Sprintf(` AND EXISTS (
+			whereExtra += fmt.Sprintf(` AND EXISTS (
 				SELECT 1 FROM construction_estimate e
 				WHERE e.project_id = a.project_id AND e.tenant_id = a.tenant_id
 				  AND e.building_id = $%d AND e.source_type = 'resurs'
@@ -63,7 +65,11 @@ func (h *Handler) ListForma19(c *gin.Context) {
 		}
 	}
 
-	query += " ORDER BY a.created_date DESC"
+	query += whereExtra + " ORDER BY a.created_date DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -112,7 +118,17 @@ func (h *Handler) ListForma19(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	response.Success(c, items)
+	if !paginate {
+		response.Success(c, items)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_act a
+		 WHERE a.act_type = 'hidden_work' AND a.project_id = $1 AND a.tenant_id = $2`+whereExtra,
+		args[:argCount]...,
+	).Scan(&total)
+	response.Paginated(c, items, page, pageSize, total)
 }
 
 // CreateForma19 creates a new Forma 19 act and populates base rows from estimate

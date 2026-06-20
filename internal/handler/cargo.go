@@ -494,29 +494,35 @@ func (h *Handler) ListCargoCashTransactions(c *gin.Context) {
 	transactionType := c.Query("transaction_type")
 	currency := c.Query("currency")
 
-	query := `
-		SELECT id, tenant_id, transaction_type, amount, currency, category,
-		       shipment_id, distribution_id, related_tenant_id, description, reference_number,
-		       transaction_date, created_by, created_date
-		FROM cargo_cash_transactions
-		WHERE tenant_id = $1
-	`
+	paginate, page, pageSize, offset := optPagination(c)
+
+	baseWhere := " WHERE tenant_id = $1"
+	whereExtra := ""
 	args := []interface{}{tenantID}
 	argCount := 1
 
 	if transactionType != "" {
 		argCount++
-		query += fmt.Sprintf(" AND transaction_type = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND transaction_type = $%d", argCount)
 		args = append(args, transactionType)
 	}
 
 	if currency != "" {
 		argCount++
-		query += fmt.Sprintf(" AND currency = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND currency = $%d", argCount)
 		args = append(args, currency)
 	}
 
-	query += " ORDER BY transaction_date DESC"
+	query := `
+		SELECT id, tenant_id, transaction_type, amount, currency, category,
+		       shipment_id, distribution_id, related_tenant_id, description, reference_number,
+		       transaction_date, created_by, created_date
+		FROM cargo_cash_transactions` + baseWhere + whereExtra + " ORDER BY transaction_date DESC"
+
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -540,7 +546,14 @@ func (h *Handler) ListCargoCashTransactions(c *gin.Context) {
 		transactions = append(transactions, t)
 	}
 
-	response.Success(c, transactions)
+	if !paginate {
+		response.Success(c, transactions)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM cargo_cash_transactions"+baseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, transactions, page, pageSize, total)
 }
 
 // CreateCargoCashTransaction creates a new cash transaction

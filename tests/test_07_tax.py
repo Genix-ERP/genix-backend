@@ -4,7 +4,7 @@ O'zbekiston QQS stavkasi: 12%
 """
 import uuid
 import pytest
-from conftest import today, QQS_RATE
+from conftest import today, find_leaf_account, QQS_RATE
 
 
 class TestVATOnSale:
@@ -14,9 +14,9 @@ class TestVATOnSale:
         base_amount = 10000000  # 10M UZS
         vat_amount = base_amount * QQS_RATE / 100  # 1.2M
 
-        ar_acc = accounts.get("1200") or accounts.get("4010")
-        rev_acc = accounts.get("4000") or accounts.get("9010") or accounts.get("4100")
-        tax_acc = accounts.get("2200") or accounts.get("2210") or accounts.get("4410")
+        ar_acc = find_leaf_account(accounts, "1200", "4010")
+        rev_acc = find_leaf_account(accounts, "4000", "9010", "4100")
+        tax_acc = find_leaf_account(accounts, "2200", "2210", "6420", "4410")
         journal = journals.get("sales") or journals.get("general") or list(journals.values())[0]
 
         if not all([ar_acc, rev_acc, tax_acc]):
@@ -65,9 +65,9 @@ class TestVATOnPurchase:
         base_amount = total_with_vat / (1 + QQS_RATE / 100)
         vat_amount = total_with_vat - base_amount
 
-        ap_acc = accounts.get("2000") or accounts.get("6010")
-        inv_acc = accounts.get("1300") or accounts.get("5000")
-        tax_acc = accounts.get("2200") or accounts.get("2210") or accounts.get("4420")
+        ap_acc = find_leaf_account(accounts, "2000", "6010")
+        inv_acc = find_leaf_account(accounts, "1300", "1010", "5000")
+        tax_acc = find_leaf_account(accounts, "2200", "2210", "4420", "4410")
         journal = journals.get("purchase") or journals.get("general") or list(journals.values())[0]
 
         if not all([ap_acc, inv_acc, tax_acc]):
@@ -125,8 +125,8 @@ class TestZeroVAT:
     """7.5 - QQS siz operatsiya."""
 
     def test_zero_vat_entry(self, api_client, accounts, journals, test_customer):
-        ar_acc = accounts.get("1200") or accounts.get("4010")
-        rev_acc = accounts.get("4000") or accounts.get("4100")
+        ar_acc = find_leaf_account(accounts, "1200", "4010")
+        rev_acc = find_leaf_account(accounts, "4000", "4100", "9010")
         journal = journals.get("sales") or journals.get("general") or list(journals.values())[0]
 
         if not ar_acc or not rev_acc:

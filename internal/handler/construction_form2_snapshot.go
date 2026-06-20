@@ -131,6 +131,83 @@ func (h *Handler) ListForm2Snapshots(c *gin.Context) {
 	response.Success(c, out)
 }
 
+// ListProjectForm2Snapshots returns every saved Forma 2 snapshot for an
+// entire PROJECT, newest first, regardless of which estimate/block each was
+// pinned to at freeze time.
+//
+// Why this exists: Forma 2 iterations are a project-level series (one open
+// iteration per project — migration 419), but each freeze writes its snapshot
+// against a single estimate (whichever block was active). The per-estimate
+// ListForm2Snapshots therefore only surfaces the snapshots that happen to be
+// tied to the currently-selected block, so the Formalar tarixi list looked
+// empty whenever the user viewed a different block than the one they froze
+// from. Scoping the history to the project mirrors the project-wide iteration
+// tab strip; the building_name column lets the UI show which block each
+// snapshot came from.
+//
+// Route: GET /construction/projects/:id/form2-snapshots
+func (h *Handler) ListProjectForm2Snapshots(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT s.id, s.tenant_id, s.project_id, s.estimate_id,
+		       s.period_from, s.period_to,
+		       s.other_costs_pct, s.use_vat,
+		       s.total_with_vat, s.total_without_vat,
+		       s.construction_total, s.equipment_total,
+		       COALESCE(s.act_number, ''),
+		       s.created_by, s.created_at,
+		       COALESCE(u.first_name || ' ' || u.last_name, '') AS created_name,
+		       COALESCE(b.name, '') AS building_name
+		FROM construction_form2_snapshot s
+		LEFT JOIN users u ON u.id = s.created_by
+		LEFT JOIN construction_estimate e ON e.id = s.estimate_id
+		LEFT JOIN construction_buildings b ON b.id = e.building_id
+		WHERE s.project_id = $1 AND s.tenant_id = $2
+		ORDER BY s.created_at DESC
+	`, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to list project form2 snapshots", "error", err)
+		response.InternalError(c, "Failed to list snapshots")
+		return
+	}
+	defer rows.Close()
+
+	out := []Form2Snapshot{}
+	for rows.Next() {
+		var s Form2Snapshot
+		if err := rows.Scan(
+			&s.ID, &s.TenantID, &s.ProjectID, &s.EstimateID,
+			&s.PeriodFrom, &s.PeriodTo,
+			&s.OtherCostsPct, &s.UseVat,
+			&s.TotalWithVat, &s.TotalWithoutVat,
+			&s.ConstructionTotal, &s.EquipmentTotal,
+			&s.ActNumber,
+			&s.CreatedBy, &s.CreatedAt,
+			&s.CreatedByName,
+			&s.BuildingName,
+		); err != nil {
+			h.log.Error("Failed to scan project form2 snapshot row", "error", err)
+			continue
+		}
+		// SnapshotData omitted from list endpoint to keep the payload small.
+		// Frontend requests it via GetForm2Snapshot when re-opening a row.
+		s.SnapshotData = json.RawMessage("null")
+		out = append(out, s)
+	}
+
+	response.Success(c, out)
+}
+
 // GetForm2Snapshot returns a single snapshot including the full JSON payload.
 //
 // Route: GET /construction/form2-snapshots/:snapshot_id

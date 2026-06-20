@@ -65,7 +65,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		) sp ON sp.vendor_id = c.id
 		WHERE c.tenant_id = $1 AND c.deleted_at IS NULL
 	`
-	countQuery := `SELECT COUNT(*) FROM contacts WHERE tenant_id = $1 AND deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM contacts c WHERE c.tenant_id = $1 AND c.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -812,7 +812,14 @@ func (h *Handler) ListContactPersons(c *gin.Context) {
 		ORDER BY is_primary DESC, created_at ASC
 	`
 
-	rows, err := h.db.Query(query, contactID)
+	args := []interface{}{contactID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $2 OFFSET $3"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list contact persons", "error", err)
 		response.InternalError(c, "Failed to list contact persons")
@@ -854,7 +861,14 @@ func (h *Handler) ListContactPersons(c *gin.Context) {
 		persons = append(persons, cp)
 	}
 
-	response.Success(c, persons)
+	if !paginate {
+		response.Success(c, persons)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM contact_persons WHERE contact_id = $1`, contactID).Scan(&total)
+	response.Paginated(c, persons, page, pageSize, total)
 }
 
 // CreateContactPerson creates a new contact person

@@ -60,10 +60,6 @@ type GoodsReceipt struct {
 	Lines []GoodsReceiptLine `json:"lines,omitempty" gorm:"foreignKey:GoodsReceiptID"`
 }
 
-func (GoodsReceipt) TableName() string {
-	return "goods_receipts"
-}
-
 // GoodsReceiptLine represents a line item in goods receipt
 type GoodsReceiptLine struct {
 	ID               uuid.UUID     `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
@@ -87,10 +83,6 @@ type GoodsReceiptLine struct {
 	Notes            string        `json:"notes" gorm:"type:text"`
 	CreatedAt        time.Time     `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt        time.Time     `json:"updated_at" gorm:"autoUpdateTime"`
-}
-
-func (GoodsReceiptLine) TableName() string {
-	return "goods_receipt_lines"
 }
 
 // Input/Output structs

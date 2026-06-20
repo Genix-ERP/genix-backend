@@ -61,7 +61,7 @@ func (h *Handler) ListCallLogs(c *gin.Context) {
 		LEFT JOIN users u ON cl.agent_id = u.id
 		WHERE cl.tenant_id = $1 AND cl.deleted_at IS NULL
 	`
-	countQuery := `SELECT COUNT(*) FROM call_logs cl WHERE cl.tenant_id = $1 AND cl.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM call_logs cl LEFT JOIN contacts c ON cl.contact_id = c.id WHERE cl.tenant_id = $1 AND cl.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1

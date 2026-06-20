@@ -51,6 +51,13 @@ func nullUUIDValue(nu uuid.NullUUID) interface{} {
 	return nil
 }
 
+func nullBoolValue(nb sql.NullBool) interface{} {
+	if nb.Valid {
+		return nb.Bool
+	}
+	return nil
+}
+
 // =====================================================
 // CONSTRUCTION PROJECT
 // =====================================================
@@ -110,6 +117,13 @@ type ConstructionProject struct {
 	// info card so the frontend doesn't need a second round-trip.
 	WarehouseName string `json:"warehouse_name,omitempty" db:"warehouse_name"`
 
+	// CRM linkage — the Yuksalish CRM project id this Genix project mirrors.
+	// NULL means not linked. Set/cleared exclusively via the
+	// PUT /construction/projects/:id/crm-link endpoint; read here so the
+	// edit form can pre-fill the CRMLinkPanel dropdown after reload.
+	// Migration 418 added the column.
+	CRMProjectID sql.NullInt64 `json:"crm_project_id" db:"crm_project_id"`
+
 	// Metadata
 	CreatedBy   *uuid.UUID   `json:"created_by" db:"created_by"`
 	CreatedDate time.Time    `json:"created_date" db:"created_date"`
@@ -153,6 +167,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		ChiefEngineerID  interface{} `json:"chief_engineer_id"`
 		OrganizationID   interface{} `json:"organization_id"`
 		WarehouseID      interface{} `json:"warehouse_id"`
+		CRMProjectID     interface{} `json:"crm_project_id"`
 		ID               int64       `json:"id"`
 		TenantID         uuid.UUID   `json:"tenant_id"`
 		Code             string      `json:"code"`
@@ -193,6 +208,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		ChiefEngineerID:    nullUUIDValue(p.ChiefEngineerID),
 		OrganizationID:     nullUUIDValue(p.OrganizationID),
 		WarehouseID:        nullUUIDValue(p.WarehouseID),
+		CRMProjectID:       nullInt64Value(p.CRMProjectID),
 		ID:                 p.ID,
 		TenantID:           p.TenantID,
 		Code:               p.Code,
@@ -352,6 +368,17 @@ type ConstructionBuilding struct {
 	CreatedDate time.Time `json:"created_date" db:"created_date"`
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
 
+	// CRM linkage — the Yuksalish CRM block id this Genix building mirrors,
+	// the current construction stage that new photo reports for this
+	// building should land on, and the auto-sync toggle. All three are
+	// set/cleared exclusively via PUT /construction/projects/:id/buildings/
+	// :building_id/crm-link; SELECTed here so the edit modal can pre-fill
+	// the CRMLinkPanel block dropdown after reload. Migration 418 added
+	// the columns.
+	CRMBlockID      sql.NullInt64  `json:"crm_block_id" db:"crm_block_id"`
+	CurrentCRMStage sql.NullString `json:"current_crm_stage" db:"current_crm_stage"`
+	CRMAutoSync     sql.NullBool   `json:"crm_auto_sync" db:"crm_auto_sync"`
+
 	// Computed
 	SectionsCount int     `json:"sections_count,omitempty" db:"sections_count"`
 	TotalSmeta    float64 `json:"total_smeta,omitempty" db:"total_smeta"`
@@ -393,6 +420,9 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		SortOrder            int             `json:"sort_order"`
 		CreatedDate          time.Time       `json:"created_date"`
 		UpdatedDate          time.Time       `json:"updated_date"`
+		CRMBlockID           interface{}     `json:"crm_block_id"`
+		CurrentCRMStage      interface{}     `json:"current_crm_stage"`
+		CRMAutoSync          interface{}     `json:"crm_auto_sync"`
 		SectionsCount        int             `json:"sections_count,omitempty"`
 		TotalSmeta           float64         `json:"total_smeta,omitempty"`
 		FilesCount           int             `json:"files_count"`
@@ -427,6 +457,9 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		SortOrder:            b.SortOrder,
 		CreatedDate:          b.CreatedDate,
 		UpdatedDate:          b.UpdatedDate,
+		CRMBlockID:           nullInt64Value(b.CRMBlockID),
+		CurrentCRMStage:      nullStringValue(b.CurrentCRMStage),
+		CRMAutoSync:          nullBoolValue(b.CRMAutoSync),
 		SectionsCount:        b.SectionsCount,
 		TotalSmeta:           b.TotalSmeta,
 		FilesCount:           b.FilesCount,
@@ -862,6 +895,11 @@ type PhotoItem struct {
 type CreatePhotoReportInput struct {
 	SmetaItemID         int64       `json:"smeta_item_id"`
 	SectionID           int64       `json:"section_id"`
+	// BuildingID is the construction_buildings row this report belongs to.
+	// REQUIRED for CRM sync to work — the syncer looks up the linked CRM
+	// block via construction_buildings.crm_block_id. NULL is allowed at
+	// DB level for legacy rows, but the photo modal should always send it.
+	BuildingID          int64       `json:"building_id"`
 	ReportDate          string      `json:"report_date" binding:"required"`
 	ReportType          string      `json:"report_type"`
 	Title               string      `json:"title"`

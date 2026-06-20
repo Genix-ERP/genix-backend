@@ -382,7 +382,7 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 			var paymentAcct uuid.UUID
 			var paymentAcctDesc string
 			if paymentMethod == "card" || paymentMethod == "bank_transfer" {
-				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
+				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 				if paymentAcct == uuid.Nil {
 					paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 				}
@@ -522,7 +522,14 @@ func (h *Handler) ListPayrollEntries(c *gin.Context) {
 		ORDER BY employee_name
 	`
 
-	rows, err := h.db.Query(query, id, tenantID)
+	args := []interface{}{id, tenantID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list payroll entries", "error", err)
 		response.InternalError(c, "Failed to list payroll entries")
@@ -571,7 +578,14 @@ func (h *Handler) ListPayrollEntries(c *gin.Context) {
 		entries = append(entries, entry.ToResponse())
 	}
 
-	response.Success(c, entries)
+	if !paginate {
+		response.Success(c, entries)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM payroll_entries WHERE payroll_period_id = $1 AND tenant_id = $2`, id, tenantID).Scan(&total)
+	response.Paginated(c, entries, page, pageSize, total)
 }
 
 // CreatePayrollEntry creates a payroll entry

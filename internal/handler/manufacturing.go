@@ -923,7 +923,8 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 			   po.labor_cost, po.overhead_cost, po.currency, po.assigned_to, u.first_name || ' ' || u.last_name as assigned_to_name,
 			   po.work_center_id, wc.name as work_center_name, po.requires_quality_check, po.quality_status,
 			   po.notes, po.tags, po.created_by, po.confirmed_at, po.completed_at, po.created_at, po.updated_at,
-			   po.manufacturing_category_id, mc.name as manufacturing_category_name
+			   po.manufacturing_category_id, mc.name as manufacturing_category_name,
+			   cust.name as customer_name
 		FROM production_orders po
 		LEFT JOIN products p ON po.product_id = p.id
 		LEFT JOIN product_boms b ON po.bom_id = b.id
@@ -931,6 +932,7 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		LEFT JOIN users u ON po.assigned_to = u.id
 		LEFT JOIN work_centers wc ON po.work_center_id = wc.id
 		LEFT JOIN manufacturing_categories mc ON po.manufacturing_category_id = mc.id
+		LEFT JOIN contacts cust ON po.customer_id = cust.id
 		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
 	`
 
@@ -1065,7 +1067,7 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 	orders := []entity.ProductionOrderResponse{}
 	for rows.Next() {
 		var po entity.ProductionOrderResponse
-		var bomName, warehouseName, assignedToName, workCenterName, shift, categoryName sql.NullString
+		var bomName, warehouseName, assignedToName, workCenterName, shift, categoryName, customerName sql.NullString
 		var scheduledStart, scheduledEnd, actualStart, actualEnd, confirmedAt, completedAt sql.NullTime
 		var tags []byte
 
@@ -1079,7 +1081,7 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 			&po.LaborCost, &po.OverheadCost, &po.Currency, &po.AssignedTo, &assignedToName,
 			&po.WorkCenterID, &workCenterName, &po.RequiresQualityCheck, &po.QualityStatus,
 			&po.Notes, &tags, &po.CreatedBy, &confirmedAt, &completedAt, &po.CreatedAt, &po.UpdatedAt,
-			&po.ManufacturingCategoryID, &categoryName,
+			&po.ManufacturingCategoryID, &categoryName, &customerName,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan production order", "error", err)
@@ -1103,6 +1105,9 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 		}
 		if categoryName.Valid {
 			po.ManufacturingCategoryName = &categoryName.String
+		}
+		if customerName.Valid {
+			po.CustomerName = &customerName.String
 		}
 		if scheduledStart.Valid {
 			s := scheduledStart.Time.Format("2006-01-02")
@@ -2056,9 +2061,14 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			return
 		}
 
-		// Step 2: Now create work orders from the collected operations
+		// Step 2: Now create work orders from the collected operations.
+		// We use a 1-based loop index in the work-order code instead of
+		// op.Sequence — operators sometimes set the same sequence number
+		// on parallel operations (e.g. two ops both at seq=30), which
+		// used to collide on the (tenant_id, organization_id, code)
+		// unique index inside this transaction and fail the whole confirm.
 		now := time.Now()
-		for _, op := range operations {
+		for woIdx, op := range operations {
 			totalTimeMinutes := op.SetupTime + (op.RunTime * quantityPlanned)
 			totalTimeHours := totalTimeMinutes / 60.0
 
@@ -2089,7 +2099,10 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 			}
 
 			woID := uuid.New()
-			woCode := fmt.Sprintf("WO-%s-%d", id.String()[:8], op.Sequence)
+			// 12-char UUID prefix (instead of 8) drops cross-MO collision risk
+			// to effectively zero; woIdx+1 guarantees uniqueness within this MO
+			// even when two BOM operations share a sequence number.
+			woCode := fmt.Sprintf("WO-%s-%d", id.String()[:12], woIdx+1)
 			woName := fmt.Sprintf("%s - %s", productName, op.OperationName)
 
 			woQuery := `
@@ -2131,7 +2144,7 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 	tx.QueryRow(`SELECT COUNT(*) FROM work_orders WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&confirmWOCount)
 	if confirmWOCount == 0 {
 		woID := uuid.New()
-		woCode := fmt.Sprintf("WO-%s-1", id.String()[:8])
+		woCode := fmt.Sprintf("WO-%s-1", id.String()[:12])
 		woName := productName + " - Ishlab chiqarish"
 		_, err = tx.Exec(`
 			INSERT INTO work_orders (
@@ -2356,7 +2369,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				qty = 1
 			}
 			woID := uuid.New()
-			woCode := fmt.Sprintf("WO-%s-1", id.String()[:8])
+			woCode := fmt.Sprintf("WO-%s-1", id.String()[:12])
 			woName := "Ishlab chiqarish"
 			if poProductName != "" {
 				woName = poProductName + " - Ishlab chiqarish"
@@ -2679,7 +2692,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 								h.db.QueryRow(`SELECT COALESCE(p.name, '') FROM production_orders po JOIN products p ON po.product_id = p.id WHERE po.id = $1`, id).Scan(&prodNameStarted)
 
 								entryID := uuid.New()
-								entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+								entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
 								description := fmt.Sprintf("Production Order %s started - materials consumed", poNumber)
 								if prodNameStarted != "" {
 									description = fmt.Sprintf("Production Order %s started - %s - materials consumed", poNumber, prodNameStarted)
@@ -3258,7 +3271,7 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 			h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, productID).Scan(&productName)
 
 			entryID := uuid.New()
-			entryNumber := fmt.Sprintf("MFG%06d", nextNumber)
+			entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
 			description := fmt.Sprintf("Production Order %s completed - %s (qty: %.2f)", poNumber, productName, producedQty)
 
 			h.log.Info("CompleteProductionOrder: journal creation",

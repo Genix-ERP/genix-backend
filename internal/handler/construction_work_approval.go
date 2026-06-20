@@ -55,63 +55,141 @@ import (
 //
 // First non-empty match wins.
 func (h *Handler) resolveProjectRole(tenantID, userID uuid.UUID, projectID int64) string {
+	roles := h.resolveProjectRoles(tenantID, userID, projectID)
+	if len(roles) > 0 {
+		return roles[0]
+	}
+	return ""
+}
+
+// resolveProjectRoles returns EVERY workflow role the user holds on the
+// project. Unlike resolveProjectRole (which returns a single priority-
+// resolved role for display defaults / budget hiding), this merges the
+// per-project team rows AND the tenant-settings role lists, so a user
+// assigned to more than one role (e.g. both supervisor and engineer) gets
+// all of them. Deduped, returned in canonical order (foreman, supervisor,
+// engineer). An EMPTY slice means "no role assigned" — callers treat that
+// as tenant-admin/demo and skip the role gate.
+func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int64) []string {
 	if userID == uuid.Nil {
-		return ""
+		return nil
 	}
 
-	// Step 1: per-project team role.
-	var rawRole sql.NullString
-	_ = h.db.QueryRow(`
-		SELECT role
-		FROM construction_project_team
-		WHERE tenant_id = $1 AND project_id = $2 AND employee_id = $3
-		  AND COALESCE(status, 'active') = 'active'
-		ORDER BY created_date DESC
-		LIMIT 1
-	`, tenantID, projectID, userID).Scan(&rawRole)
-	if rawRole.Valid {
-		switch normaliseRole(rawRole.String) {
+	// Identities to match against. CRITICAL: `users.id` (auth, what
+	// GetUserID returns) and `employees.id` are DIFFERENT id spaces, and the
+	// construction role lists + team rows key off the EMPLOYEE id. The
+	// authoritative link is `users.employee_id → employees.id`
+	// (employees.user_id is frequently NULL, so the reverse lookup misses).
+	// We therefore match against the user id, the user's linked employee id,
+	// AND — as a fallback — any employee row that points back at this user.
+	idents := []string{userID.String()}
+	employeeID := uuid.Nil
+	var linkedEmp uuid.NullUUID
+	if err := h.db.QueryRow(
+		`SELECT employee_id FROM users WHERE id = $1 AND tenant_id = $2`, userID, tenantID,
+	).Scan(&linkedEmp); err == nil && linkedEmp.Valid && linkedEmp.UUID != uuid.Nil {
+		employeeID = linkedEmp.UUID
+		idents = append(idents, employeeID.String())
+	}
+	if rows, err := h.db.Query(
+		`SELECT id FROM employees WHERE user_id = $1 AND tenant_id = $2`, userID, tenantID,
+	); err == nil {
+		for rows.Next() {
+			var eid uuid.UUID
+			if rows.Scan(&eid) == nil && eid != uuid.Nil {
+				idents = append(idents, eid.String())
+			}
+		}
+		rows.Close()
+	}
+
+	set := map[string]bool{}
+	mark := func(raw string) {
+		switch normaliseRole(raw) {
 		case "foreman":
-			return "foreman"
+			set["foreman"] = true
 		case "supervisor":
-			return "supervisor"
+			set["supervisor"] = true
 		case "engineer":
-			return "engineer"
+			set["engineer"] = true
 		}
 	}
 
-	// Step 2: tenant-wide settings fallback. Each role accepts either a
-	// single legacy `*_user_id` string OR a new `*_user_ids` JSON array
-	// so multiple employees can share a role (e.g. several prorabs).
-	// Both formats are queried in one round-trip; legacy values are
-	// kept readable so existing tenants don't need a backfill.
+	// Step 1: per-project team roles — match by employee_id OR the employee's
+	// linked user_id, so it works regardless of which id the row was keyed on.
+	if rows, err := h.db.Query(`
+		SELECT pt.role
+		FROM construction_project_team pt
+		LEFT JOIN employees e ON e.id = pt.employee_id
+		WHERE pt.tenant_id = $1 AND pt.project_id = $2
+		  AND COALESCE(pt.status, 'active') = 'active'
+		  AND (pt.employee_id = $3 OR pt.employee_id = $4 OR e.user_id = $3)
+	`, tenantID, projectID, userID, employeeID); err == nil {
+		for rows.Next() {
+			var raw sql.NullString
+			if rows.Scan(&raw) == nil && raw.Valid {
+				mark(raw.String)
+			}
+		}
+		rows.Close()
+	}
+
+	// Step 2: tenant-wide settings (legacy single id OR new *_user_ids array).
 	var foremanID, supervisorID, engineerID sql.NullString
 	var foremanIDs, supervisorIDs, engineerIDs []byte
 	_ = h.db.QueryRow(`
 		SELECT
-		    settings->'construction'->'roles'->>'foreman_user_id'                            AS foreman_id,
-		    settings->'construction'->'roles'->>'supervisor_user_id'                         AS supervisor_id,
-		    settings->'construction'->'roles'->>'engineer_user_id'                           AS engineer_id,
-		    COALESCE(settings->'construction'->'roles'->'foreman_user_ids',    '[]'::jsonb) AS foreman_ids,
-		    COALESCE(settings->'construction'->'roles'->'supervisor_user_ids', '[]'::jsonb) AS supervisor_ids,
-		    COALESCE(settings->'construction'->'roles'->'engineer_user_ids',   '[]'::jsonb) AS engineer_ids
+		    settings->'construction'->'roles'->>'foreman_user_id',
+		    settings->'construction'->'roles'->>'supervisor_user_id',
+		    settings->'construction'->'roles'->>'engineer_user_id',
+		    COALESCE(settings->'construction'->'roles'->'foreman_user_ids',    '[]'::jsonb),
+		    COALESCE(settings->'construction'->'roles'->'supervisor_user_ids', '[]'::jsonb),
+		    COALESCE(settings->'construction'->'roles'->'engineer_user_ids',   '[]'::jsonb)
 		FROM tenant_settings
 		WHERE tenant_id = $1
 	`, tenantID).Scan(&foremanID, &supervisorID, &engineerID,
 		&foremanIDs, &supervisorIDs, &engineerIDs)
 
-	uid := userID.String()
-	if (foremanID.Valid && foremanID.String == uid) || jsonArrayContains(foremanIDs, uid) {
-		return "foreman"
+	// inList: does the single legacy id OR the JSON array contain ANY of the
+	// caller's identities (user id or employee id)?
+	inList := func(single sql.NullString, arr []byte) bool {
+		for _, id := range idents {
+			if single.Valid && single.String == id {
+				return true
+			}
+			if jsonArrayContains(arr, id) {
+				return true
+			}
+		}
+		return false
 	}
-	if (supervisorID.Valid && supervisorID.String == uid) || jsonArrayContains(supervisorIDs, uid) {
-		return "supervisor"
+	if inList(foremanID, foremanIDs) {
+		set["foreman"] = true
 	}
-	if (engineerID.Valid && engineerID.String == uid) || jsonArrayContains(engineerIDs, uid) {
-		return "engineer"
+	if inList(supervisorID, supervisorIDs) {
+		set["supervisor"] = true
+	}
+	if inList(engineerID, engineerIDs) {
+		set["engineer"] = true
 	}
 
-	return ""
+	out := make([]string, 0, 3)
+	for _, r := range []string{"foreman", "supervisor", "engineer"} {
+		if set[r] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// roleSetHas reports whether the resolved role set contains target.
+func roleSetHas(roles []string, target string) bool {
+	for _, r := range roles {
+		if r == target {
+			return true
+		}
+	}
+	return false
 }
 
 // jsonArrayContains reports whether the given JSON-encoded string array
@@ -233,8 +311,8 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 	// Authorisation. Treat tenant admins (role "") as foreman so a
 	// freshly-imported project where roles haven't been assigned yet
 	// can still be exercised by the project owner.
-	role := h.resolveProjectRole(tenantID, userID, ctx.ProjectID)
-	if role != "foreman" && role != "" {
+	roles := h.resolveProjectRoles(tenantID, userID, ctx.ProjectID)
+	if len(roles) > 0 && !roleSetHas(roles, "foreman") {
 		response.Forbidden(c, "Only the project foreman can update done quantity")
 		return
 	}
@@ -248,9 +326,80 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 	// number IS the BAJARILDI value — capping at plan would freeze the
 	// foreman at 0. The Smeta boshqaruvi ISH HAJMI mirror below keeps
 	// the two screens in sync regardless of which one was edited last.
-	done := body.DoneQuantity
-	if done < 0 {
-		done = 0
+	//
+	// NOTE on semantics (migration 419 / multi-iteration Forma 2):
+	// `body.DoneQuantity` now represents this OPEN iteration's
+	// period contribution, not the cumulative. The wire field name
+	// stays `done_quantity` so the frontend doesn't need to flip its
+	// payload shape, but conceptually:
+	//
+	//   period_fakt (this iteration)         = body.DoneQuantity
+	//   line.done_quantity (cumulative)      = Σ period_fakt across iters
+	//
+	// Legacy behaviour is preserved because the migration 419 backfill
+	// stamped iteration #1.period_fakt = old done_quantity for every
+	// line, and there's exactly one open iter per project. Until the
+	// first freeze, this endpoint behaves identically to before.
+	periodFakt := body.DoneQuantity
+	if periodFakt < 0 {
+		periodFakt = 0
+	}
+
+	// Resolve the open iteration for this project. If none exists
+	// (shouldn't happen post-backfill, but defence in depth), bootstrap
+	// one so the write doesn't silently no-op.
+	var openIterID int64
+	err = h.db.QueryRow(`
+		SELECT id FROM construction_form2_iteration
+		WHERE project_id = $1 AND tenant_id = $2 AND status = 'open'
+	`, ctx.ProjectID, tenantID).Scan(&openIterID)
+	if err == sql.ErrNoRows {
+		if insertErr := h.db.QueryRow(`
+			INSERT INTO construction_form2_iteration
+			    (tenant_id, project_id, iteration_seq, status, opened_at, opened_by)
+			VALUES ($1, $2, 1, 'open', NOW(), $3)
+			RETURNING id
+		`, tenantID, ctx.ProjectID, userID).Scan(&openIterID); insertErr != nil {
+			h.log.Error("Failed to seed open iteration on fakt write", "error", insertErr)
+			response.InternalError(c, "Failed to update done quantity")
+			return
+		}
+	} else if err != nil {
+		h.log.Error("Failed to resolve open iteration", "error", err)
+		response.InternalError(c, "Failed to update done quantity")
+		return
+	}
+
+	// Upsert this line's period_fakt for the open iteration. Migration
+	// 419 pre-creates iteration_line rows on freeze, but legacy
+	// estimate_lines created BEFORE 419 ran on this DB, or new lines
+	// inserted into an existing project after iteration #N opened, may
+	// not have a row yet — INSERT … ON CONFLICT covers both.
+	if _, err := h.db.Exec(`
+		INSERT INTO construction_form2_iteration_line
+		    (iteration_id, estimate_line_id, period_fakt, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (iteration_id, estimate_line_id)
+		DO UPDATE SET period_fakt = EXCLUDED.period_fakt,
+		              updated_at  = NOW()
+	`, openIterID, lineID, periodFakt); err != nil {
+		h.log.Error("Failed to write period_fakt", "error", err, "line_id", lineID, "iter_id", openIterID)
+		response.InternalError(c, "Failed to update done quantity")
+		return
+	}
+
+	// Recompute the cumulative done_quantity = Σ period_fakt across
+	// every iteration for this line. Frozen iters contribute their
+	// historical numbers, the open iter contributes what we just wrote.
+	var done float64
+	if err := h.db.QueryRow(`
+		SELECT COALESCE(SUM(period_fakt), 0)
+		FROM construction_form2_iteration_line
+		WHERE estimate_line_id = $1
+	`, lineID).Scan(&done); err != nil {
+		h.log.Error("Failed to recompute cumulative done_quantity", "error", err)
+		response.InternalError(c, "Failed to update done quantity")
+		return
 	}
 
 	newStatus := "pending"
@@ -446,11 +595,11 @@ func (h *Handler) transitionWork(
 		return
 	}
 
-	// Authorisation.
-	role := h.resolveProjectRole(tenantID, userID, ctx.ProjectID)
-	if role != requiredRole && role != "" {
-		// Tenant admin (no team-role assigned) is permitted as a
-		// fallback — same logic as UpdateWorkDoneQuantity.
+	// Authorisation — the user may act if ANY of their assigned roles is the
+	// one this transition requires. Tenant admins (empty set) are permitted
+	// as a fallback — same logic as UpdateWorkDoneQuantity.
+	roles := h.resolveProjectRoles(tenantID, userID, ctx.ProjectID)
+	if len(roles) > 0 && !roleSetHas(roles, requiredRole) {
 		response.Forbidden(c, "Action not allowed for your project role")
 		return
 	}
@@ -597,8 +746,8 @@ func (h *Handler) bulkWorksTransition(
 		return
 	}
 
-	role := h.resolveProjectRole(tenantID, userID, projectID)
-	if role != requiredRole && role != "" {
+	roles := h.resolveProjectRoles(tenantID, userID, projectID)
+	if len(roles) > 0 && !roleSetHas(roles, requiredRole) {
 		response.Forbidden(c, "Action not allowed for your project role")
 		return
 	}
@@ -716,9 +865,17 @@ func (h *Handler) GetMyProjectRole(c *gin.Context) {
 		response.BadRequest(c, "Invalid project id")
 		return
 	}
-	role := h.resolveProjectRole(tenantID, userID, projectID)
+	roles := h.resolveProjectRoles(tenantID, userID, projectID)
+	primary := ""
+	if len(roles) > 0 {
+		primary = roles[0]
+	}
+	// `role` stays the single primary for backward-compat; `roles` is the
+	// full set the frontend uses to decide whether to show the role switcher
+	// and which roles to offer.
 	response.Success(c, gin.H{
-		"role":      role,
-		"assigned":  role != "",
+		"role":     primary,
+		"roles":    roles,
+		"assigned": len(roles) > 0,
 	})
 }

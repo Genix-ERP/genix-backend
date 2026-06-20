@@ -53,34 +53,6 @@ func (u *User) IsLocked() bool {
 	return time.Now().Before(*u.LockedUntil)
 }
 
-// CanLogin checks if the user can login
-func (u *User) CanLogin() bool {
-	return u.IsActive && !u.IsLocked()
-}
-
-// HasPermission checks if the user has a specific permission
-func (u *User) HasPermission(module, resource, action string) bool {
-	if u.IsSystemAdmin {
-		return true
-	}
-	for _, p := range u.Permissions {
-		if p.Module == module && p.Resource == resource && p.Action == action {
-			return true
-		}
-	}
-	return false
-}
-
-// HasRole checks if the user has a specific role
-func (u *User) HasRole(roleCode string) bool {
-	for _, r := range u.Roles {
-		if r.Code == roleCode {
-			return true
-		}
-	}
-	return false
-}
-
 // Role represents a role in the RBAC system
 type Role struct {
 	ID          uuid.UUID       `json:"id" db:"id"`
@@ -104,11 +76,6 @@ type Permission struct {
 	CreatedAt   time.Time `json:"created_at" db:"created_at"`
 }
 
-// PermissionKey returns a unique key for the permission
-func (p *Permission) PermissionKey() string {
-	return p.Module + ":" + p.Resource + ":" + p.Action
-}
-
 // RefreshToken represents a refresh token for JWT authentication
 type RefreshToken struct {
 	ID         uuid.UUID       `json:"id" db:"id"`
@@ -119,11 +86,6 @@ type RefreshToken struct {
 	ExpiresAt  time.Time       `json:"expires_at" db:"expires_at"`
 	CreatedAt  time.Time       `json:"created_at" db:"created_at"`
 	RevokedAt  *time.Time      `json:"revoked_at,omitempty" db:"revoked_at"`
-}
-
-// IsValid checks if the refresh token is still valid
-func (rt *RefreshToken) IsValid() bool {
-	return rt.RevokedAt == nil && time.Now().Before(rt.ExpiresAt)
 }
 
 // APIKey represents an API key for programmatic access

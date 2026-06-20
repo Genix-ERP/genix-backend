@@ -397,6 +397,19 @@ def find_account_id(accounts_dict, code):
     return None
 
 
+def find_leaf_account(accounts_dict, *codes):
+    """Birinchi mavjud LEAF schyotni topish (TT §4.2).
+
+    Guruh (sarlavha) schyotlariga provodka taqiqlangan, shuning uchun
+    kod mavjud bo'lsa ham guruh bo'lsa keyingi kodga o'tiladi.
+    """
+    for code in codes:
+        acc = accounts_dict.get(code)
+        if acc and acc.get("is_leaf", True):
+            return acc
+    return None
+
+
 def today():
     """Bugungi sana."""
     return date.today().isoformat()

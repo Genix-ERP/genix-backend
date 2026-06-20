@@ -54,3 +54,8 @@ __debug_bin*
 
 # Agents
 .agents
+
+# Stray build artifacts (built binaries must not be committed)
+/api
+/genix-api
+/main

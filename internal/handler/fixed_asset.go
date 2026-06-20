@@ -484,12 +484,12 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 			}
 			creditDesc = "Accounts Payable"
 		case "bank":
-			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
+			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 			creditDesc = "Bank"
 		default: // cash
 			creditAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 			if creditAcct == uuid.Nil {
-				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
+				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 			}
 			creditDesc = "Cash"
 		}
@@ -891,7 +891,7 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 			var cashAcct uuid.UUID
 			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 			if cashAcct == uuid.Nil {
-				cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
+				cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 			}
 			if cashAcct != uuid.Nil {
 				lineNum++
@@ -1397,7 +1397,7 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 			// Payment account (cash/bank)
 			payAcct := findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 			if input.PaymentAccountCode == "5110" {
-				payAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
+				payAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 			}
 			if payAcct == uuid.Nil {
 				return
@@ -1608,7 +1608,7 @@ func (h *Handler) RecordAssetPayment(c *gin.Context) {
 		}
 		var cashAcct uuid.UUID
 		if input.Method == "bank" {
-			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank", "5110")
+			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 		} else {
 			cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
 		}

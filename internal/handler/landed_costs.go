@@ -278,32 +278,38 @@ func (h *Handler) ListLandedCosts(c *gin.Context) {
 	tenantID, _ := middleware.GetTenantID(c)
 	grID := c.Query("goods_receipt_id")
 
-	query := `
-		SELECT id, tenant_id, landed_cost_number, goods_receipt_id, gr_number,
-			   purchase_order_id, po_number, supplier_id, supplier_name,
-			   cost_date, product_value, total_landed_cost, total_cost,
-			   status, allocation_method, notes, created_by, validated_by,
-			   validated_at, created_at, updated_at
-		FROM landed_costs
-		WHERE tenant_id = $1 AND deleted_at IS NULL`
+	paginate, page, pageSize, offset := optPagination(c)
 
+	baseWhere := " WHERE tenant_id = $1 AND deleted_at IS NULL"
+	whereExtra := ""
 	args := []interface{}{tenantID}
 	argCount := 1
 
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		query += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	if grID != "" {
 		argCount++
-		query += fmt.Sprintf(" AND goods_receipt_id = $%d", argCount)
+		whereExtra += fmt.Sprintf(" AND goods_receipt_id = $%d", argCount)
 		args = append(args, grID)
 	}
 
-	query += " ORDER BY created_at DESC"
+	query := `
+		SELECT id, tenant_id, landed_cost_number, goods_receipt_id, gr_number,
+			   purchase_order_id, po_number, supplier_id, supplier_name,
+			   cost_date, product_value, total_landed_cost, total_cost,
+			   status, allocation_method, notes, created_by, validated_by,
+			   validated_at, created_at, updated_at
+		FROM landed_costs` + baseWhere + whereExtra + " ORDER BY created_at DESC"
+
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -362,7 +368,14 @@ func (h *Handler) ListLandedCosts(c *gin.Context) {
 		costs = append(costs, lc)
 	}
 
-	response.Success(c, costs)
+	if !paginate {
+		response.Success(c, costs)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM landed_costs"+baseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, costs, page, pageSize, total)
 }
 
 // CreateLandedCost creates a new landed cost record

@@ -32,16 +32,26 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		asOfDate = time.Now().Format("2006-01-02")
 	}
 
+	// Aggregate lines in a subquery joined to their entries so the
+	// posted/date/deleted filters actually exclude the lines: filtering in a
+	// second LEFT JOIN condition only nulls the entry columns while the line
+	// amounts still aggregate, leaking draft and deleted entries into the report.
 	query := `
 		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
 			   at.category, at.normal_balance, a.parent_id,
-			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
-			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
+			   COALESCE(jel.total_debit, 0) as total_debit,
+			   COALESCE(jel.total_credit, 0) as total_credit
 		FROM accounts a
 		JOIN account_types at ON a.account_type_id = at.id
-		LEFT JOIN journal_entry_lines jel ON a.id = jel.account_id
-		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
-			AND je.status = 'posted' AND je.entry_date <= $2 AND je.deleted_at IS NULL
+		LEFT JOIN (
+			SELECT l.account_id,
+				   SUM(l.debit_amount) AS total_debit,
+				   SUM(l.credit_amount) AS total_credit
+			FROM journal_entry_lines l
+			JOIN journal_entries je ON l.journal_entry_id = je.id
+			WHERE je.tenant_id = $1 AND je.status = 'posted' AND je.entry_date <= $2 AND je.deleted_at IS NULL
+			GROUP BY l.account_id
+		) jel ON a.id = jel.account_id
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
 	`
 	args := []interface{}{tenantID, asOfDate}
@@ -50,7 +60,6 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		args = append(args, orgID)
 	}
 	query += `
-		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, a.name_ru, at.category, at.normal_balance, a.parent_id
 		ORDER BY a.code
 	`
 
@@ -96,43 +105,69 @@ func (h *Handler) GetTrialBalance(c *gin.Context) {
 		allAccounts = append(allAccounts, acc)
 	}
 
-	// Build parent-child hierarchy (e.g., 1300 = sum of 1310+1320+1330+1340)
-	parentMap := make(map[uuid.UUID]*entity.TrialBalanceAccount)
-	childMap := make(map[uuid.UUID][]entity.TrialBalanceAccount)
+	// Build parent-child hierarchy (e.g., 1300 = sum of 1310+1320+1330+1340).
+	// Rollups must run bottom-up: with multi-level charts (leaf 6420 -> group
+	// 6400 -> section 6000) a parent has to see its child groups' rolled-up
+	// balances, not their raw posted ones, or nested balances drop out of the
+	// report. Each subtree is computed once, children before their parent.
+	accountByID := make(map[uuid.UUID]*entity.TrialBalanceAccount)
 	for i := range allAccounts {
-		parentMap[allAccounts[i].AccountID] = &allAccounts[i]
-		if allAccounts[i].ParentID != nil {
-			childMap[*allAccounts[i].ParentID] = append(childMap[*allAccounts[i].ParentID], allAccounts[i])
+		accountByID[allAccounts[i].AccountID] = &allAccounts[i]
+	}
+	// allAccounts is ordered by code, so children keep code order; an account
+	// whose parent is missing from the result set stays at top level.
+	childIDsByParent := make(map[uuid.UUID][]uuid.UUID)
+	hasParent := make(map[uuid.UUID]bool)
+	for i := range allAccounts {
+		if pid := allAccounts[i].ParentID; pid != nil {
+			if _, ok := accountByID[*pid]; ok {
+				childIDsByParent[*pid] = append(childIDsByParent[*pid], allAccounts[i].AccountID)
+				hasParent[allAccounts[i].AccountID] = true
+			}
 		}
 	}
 
-	// Build final list: parent accounts get children nested, children are excluded from top level
-	accounts := make([]entity.TrialBalanceAccount, 0)
-	childIDs := make(map[uuid.UUID]bool)
-	for parentID, children := range childMap {
-		if parent, ok := parentMap[parentID]; ok {
-			parent.IsParent = true
-			parent.Children = children
-			// Recalculate parent balance as sum of children
+	memo := make(map[uuid.UUID]*entity.TrialBalanceAccount)
+	visiting := make(map[uuid.UUID]bool)
+	var rollup func(id uuid.UUID) *entity.TrialBalanceAccount
+	rollup = func(id uuid.UUID) *entity.TrialBalanceAccount {
+		if node, ok := memo[id]; ok {
+			return node
+		}
+		node := *accountByID[id]
+		// A parent_id cycle (malformed data) would recurse forever; treat the
+		// repeated account as a leaf instead
+		if !visiting[id] && len(childIDsByParent[id]) > 0 {
+			visiting[id] = true
+			childIDs := childIDsByParent[id]
+			node.IsParent = true
+			node.Children = make([]entity.TrialBalanceAccount, 0, len(childIDs))
 			var childDebit, childCredit float64
-			for _, ch := range children {
-				childDebit += ch.DebitBalance
-				childCredit += ch.CreditBalance
+			for _, cid := range childIDs {
+				child := rollup(cid)
+				node.Children = append(node.Children, *child)
+				childDebit += child.DebitBalance
+				childCredit += child.CreditBalance
 			}
+			// A parent's own posted balance is only overridden when its
+			// children carry a balance
 			if childDebit > 0 || childCredit > 0 {
-				parent.DebitBalance = childDebit
-				parent.CreditBalance = childCredit
+				node.DebitBalance = childDebit
+				node.CreditBalance = childCredit
 			}
+			delete(visiting, id)
 		}
-		for _, ch := range children {
-			childIDs[ch.AccountID] = true
-		}
+		memo[id] = &node
+		return &node
 	}
 
-	for _, acc := range allAccounts {
-		if childIDs[acc.AccountID] {
+	// Final list: top-level accounts with children nested, totals from top level only
+	accounts := make([]entity.TrialBalanceAccount, 0)
+	for i := range allAccounts {
+		if hasParent[allAccounts[i].AccountID] {
 			continue // Skip children at top level (they're nested)
 		}
+		acc := *rollup(allAccounts[i].AccountID)
 		if acc.DebitBalance == 0 && acc.CreditBalance == 0 && !acc.IsParent {
 			continue // Skip zero-balance non-parent accounts
 		}

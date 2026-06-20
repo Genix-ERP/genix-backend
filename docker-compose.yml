@@ -62,6 +62,7 @@ services:
         condition: service_healthy
     networks:
       - genix-network
+      - cross-stack
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
       interval: 30s
@@ -151,3 +152,9 @@ volumes:
 networks:
   genix-network:
     driver: bridge
+  # Shared network with the Yuksalish CRM stack (yuksalish-backend container)
+  # so genix-api can reach http://yuksalish-backend:8000 without going through
+  # the public domain (which hits NAT hairpin on this host). Created
+  # manually once: `docker network create cross-stack`.
+  cross-stack:
+    external: true

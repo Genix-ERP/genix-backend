@@ -143,7 +143,42 @@ func (h *Handler) ListBlanketOrders(c *gin.Context) {
 		return
 	}
 
+	paginate, page, pageSize, offset := optPagination(c)
+
 	// Build query with filters
+	baseWhere := " WHERE bo.tenant_id = $1 AND bo.deleted_at IS NULL"
+	whereExtra := ""
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	// Filter by organization
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND bo.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
+	// Filter by status
+	if status := c.Query("status"); status != "" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND bo.status = $%d", argCount)
+		args = append(args, status)
+	}
+
+	// Filter by vendor
+	if vendorID := c.Query("vendor_id"); vendorID != "" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND bo.vendor_id = $%d", argCount)
+		args = append(args, vendorID)
+	}
+
+	// Search
+	if search := c.Query("search"); search != "" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND (bo.blanket_number ILIKE $%d OR bo.title ILIKE $%d OR bo.vendor_name ILIKE $%d)", argCount, argCount, argCount)
+		args = append(args, "%"+search+"%")
+	}
+
 	query := `
 		SELECT bo.id, bo.blanket_number, bo.title, bo.description,
 			   bo.vendor_id, bo.vendor_name, bo.start_date, bo.end_date,
@@ -156,41 +191,7 @@ func (h *Handler) ListBlanketOrders(c *gin.Context) {
 		FROM blanket_orders bo
 		LEFT JOIN warehouses w ON w.id = bo.warehouse_id
 		LEFT JOIN blanket_order_lines bol ON bol.blanket_order_id = bo.id
-		LEFT JOIN blanket_order_releases bor ON bor.blanket_order_id = bo.id
-		WHERE bo.tenant_id = $1 AND bo.deleted_at IS NULL
-	`
-	args := []interface{}{tenantID}
-	argCount := 1
-
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		query += fmt.Sprintf(" AND bo.organization_id = $%d", argCount)
-		args = append(args, orgID)
-	}
-
-	// Filter by status
-	if status := c.Query("status"); status != "" {
-		argCount++
-		query += fmt.Sprintf(" AND bo.status = $%d", argCount)
-		args = append(args, status)
-	}
-
-	// Filter by vendor
-	if vendorID := c.Query("vendor_id"); vendorID != "" {
-		argCount++
-		query += fmt.Sprintf(" AND bo.vendor_id = $%d", argCount)
-		args = append(args, vendorID)
-	}
-
-	// Search
-	if search := c.Query("search"); search != "" {
-		argCount++
-		query += fmt.Sprintf(" AND (bo.blanket_number ILIKE $%d OR bo.title ILIKE $%d OR bo.vendor_name ILIKE $%d)", argCount, argCount, argCount)
-		args = append(args, "%"+search+"%")
-	}
-
-	query += `
+		LEFT JOIN blanket_order_releases bor ON bor.blanket_order_id = bo.id` + baseWhere + whereExtra + `
 		GROUP BY bo.id, bo.blanket_number, bo.title, bo.description,
 				 bo.vendor_id, bo.vendor_name, bo.start_date, bo.end_date,
 				 bo.agreement_type, bo.total_value, bo.released_value, bo.remaining_value,
@@ -198,6 +199,11 @@ func (h *Handler) ListBlanketOrders(c *gin.Context) {
 				 bo.created_at, bo.updated_at
 		ORDER BY bo.created_at DESC
 	`
+
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -263,7 +269,14 @@ func (h *Handler) ListBlanketOrders(c *gin.Context) {
 		orders = append(orders, order)
 	}
 
-	response.Success(c, orders)
+	if !paginate {
+		response.Success(c, orders)
+		return
+	}
+
+	var total int
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM blanket_orders bo"+baseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	response.Paginated(c, orders, page, pageSize, total)
 }
 
 // GetBlanketOrder returns a single blanket order with lines and releases
