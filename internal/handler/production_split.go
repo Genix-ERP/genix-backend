@@ -86,11 +86,24 @@ func (h *Handler) CompleteSplitOutput(c *gin.Context) {
 	var totalFinishedCost float64
 
 	for _, item := range input.Items {
-		// Get product name and weight (kg per unit)
+		// Per-piece bulk consumption factor. The bulk is measured in its own unit
+		// (m, m³, kg…) and each packaged piece consumes `factor` units of it.
+		// Priority: explicit weight (legacy size-factor) > full volume L×W×H >
+		// length alone > 1. So a 5.9 m piece with no weight consumes 5.9 per unit;
+		// once width & height are filled it switches to true volume L×W×H.
+		// (Variable kept as unitWeightKg for diff minimality; it is now a size factor.)
 		var productName string
 		var unitWeightKg float64
 		if scanErr := h.db.QueryRow(`
-			SELECT name, COALESCE(weight, 1) FROM products WHERE id = $1 AND tenant_id = $2
+			SELECT name,
+			       CASE
+			         WHEN COALESCE(weight, 0) > 0 THEN weight
+			         WHEN COALESCE(length, 0) > 0 AND COALESCE(width, 0) > 0 AND COALESCE(height, 0) > 0
+			              THEN length * width * height
+			         WHEN COALESCE(length, 0) > 0 THEN length
+			         ELSE 1
+			       END
+			FROM products WHERE id = $1 AND tenant_id = $2
 		`, item.ProductID, tenantID).Scan(&productName, &unitWeightKg); scanErr != nil {
 			response.BadRequest(c, fmt.Sprintf("Product %s not found", item.ProductID))
 			return

@@ -1735,9 +1735,10 @@ func (h *Handler) UpdateProductionOrder(c *gin.Context) {
 	argCount++
 	args = append(args, tenantID)
 
-	// Allow updates for draft, confirmed, and in_progress status (for manufacturing stage tracking)
+	// Allow updates for draft, confirmed, in_progress and packaging status (for
+	// manufacturing stage tracking + idempotent move-to-packaging before split output)
 	query := fmt.Sprintf(
-		"UPDATE production_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status IN ('draft', 'confirmed', 'in_progress')",
+		"UPDATE production_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status IN ('draft', 'confirmed', 'in_progress', 'packaging')",
 		strings.Join(updates, ", "), argCount-1, argCount,
 	)
 
