@@ -59,3 +59,6 @@ __debug_bin*
 /api
 /genix-api
 /main
+
+# Local file storage — uploads now live in the database (uploaded_files)
+storage/
