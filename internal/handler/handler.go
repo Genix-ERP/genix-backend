@@ -1512,6 +1512,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		adminSettings.POST("/reset", h.perm.Require("settings", "tenant", "update"), h.ResetAllAdminSettings)
 	}
 
+	// Per-tenant AI provider settings (user-supplied API key + model).
+	adminAI := rg.Group("/admin/ai-settings")
+	adminAI.Use(h.perm.Require("settings", "tenant", "read"))
+	{
+		adminAI.GET("", h.GetTenantAISettings)
+		adminAI.PUT("", h.perm.Require("settings", "tenant", "update"), h.UpdateTenantAISettings)
+	}
+
 	// System Admin routes (cross-tenant access)
 	admin := rg.Group("/admin")
 	admin.Use(middleware.RequireSystemAdmin())

@@ -92,7 +92,7 @@ func (h *Handler) ScanPurchaseReceipt(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 40*time.Second)
 	defer cancel()
 
-	items, err := h.extractReceiptLineItems(ctx, imageBase64, mimeType)
+	items, err := h.extractReceiptLineItems(ctx, tenantID, imageBase64, mimeType)
 	if err != nil {
 		h.log.Warn("Receipt AI extraction failed", "error", err)
 		// Return empty result rather than a hard error so UI degrades gracefully
@@ -190,17 +190,18 @@ Rules:
 - Return ONLY the JSON array, no explanation`
 
 // extractReceiptLineItems calls the configured AI provider (OpenAI or Anthropic)
-// with the receipt image and returns parsed line items. The provider is taken
-// from config.AI.Provider; if unset it's inferred from the endpoint. This lets
-// the feature work with either an OpenAI (gpt-4o vision) or an Anthropic
-// (Claude) key without code changes.
-func (h *Handler) extractReceiptLineItems(ctx context.Context, imageBase64, mimeType string) ([]receiptLineItem, error) {
-	apiKey := h.config.AI.APIKey
+// with the receipt image and returns parsed line items. Provider/key/model come
+// from the tenant's own AI settings when set (see resolveTenantAIConfig), and
+// otherwise fall back to the server-wide env config. If the provider is unset it
+// is inferred from the endpoint. This lets the feature work with either an
+// OpenAI (gpt-4o vision) or an Anthropic (Claude) key without code changes.
+func (h *Handler) extractReceiptLineItems(ctx context.Context, tenantID uuid.UUID, imageBase64, mimeType string) ([]receiptLineItem, error) {
+	provider, apiKey, model := h.resolveTenantAIConfig(tenantID)
 	if apiKey == "" {
 		return nil, fmt.Errorf("AI API key not configured")
 	}
 
-	provider := strings.ToLower(strings.TrimSpace(h.config.AI.Provider))
+	provider = strings.ToLower(strings.TrimSpace(provider))
 	endpoint := strings.TrimSpace(h.config.AI.Endpoint)
 	if provider == "" {
 		// Infer from the endpoint; default to OpenAI (also covers OpenAI-compatible).
@@ -212,9 +213,9 @@ func (h *Handler) extractReceiptLineItems(ctx context.Context, imageBase64, mime
 	}
 
 	if provider == "anthropic" {
-		return h.extractReceiptViaAnthropic(ctx, apiKey, endpoint, imageBase64, mimeType)
+		return h.extractReceiptViaAnthropic(ctx, apiKey, endpoint, model, imageBase64, mimeType)
 	}
-	return h.extractReceiptViaOpenAI(ctx, apiKey, endpoint, imageBase64, mimeType)
+	return h.extractReceiptViaOpenAI(ctx, apiKey, endpoint, model, imageBase64, mimeType)
 }
 
 // postReceiptAI sends the prepared request, enforces a timeout, and returns the
@@ -251,8 +252,8 @@ func parseReceiptItemsJSON(text string) ([]receiptLineItem, error) {
 }
 
 // extractReceiptViaAnthropic uses Claude's vision messages API.
-func (h *Handler) extractReceiptViaAnthropic(ctx context.Context, apiKey, endpoint, imageBase64, mimeType string) ([]receiptLineItem, error) {
-	model := strings.TrimSpace(h.config.AI.Model)
+func (h *Handler) extractReceiptViaAnthropic(ctx context.Context, apiKey, endpoint, model, imageBase64, mimeType string) ([]receiptLineItem, error) {
+	model = strings.TrimSpace(model)
 	if !strings.HasPrefix(model, "claude") {
 		// config default ("gpt-4") isn't a Claude id — use a valid vision model.
 		model = "claude-opus-4-8"
@@ -303,8 +304,8 @@ func (h *Handler) extractReceiptViaAnthropic(ctx context.Context, apiKey, endpoi
 
 // extractReceiptViaOpenAI uses OpenAI's (or an OpenAI-compatible) chat
 // completions API with a vision-capable model.
-func (h *Handler) extractReceiptViaOpenAI(ctx context.Context, apiKey, endpoint, imageBase64, mimeType string) ([]receiptLineItem, error) {
-	model := strings.TrimSpace(h.config.AI.Model)
+func (h *Handler) extractReceiptViaOpenAI(ctx context.Context, apiKey, endpoint, model, imageBase64, mimeType string) ([]receiptLineItem, error) {
+	model = strings.TrimSpace(model)
 	// The config default "gpt-4" is text-only; vision needs a 4o/4.1-class model.
 	if model == "" || model == "gpt-4" || model == "gpt-3.5-turbo" || strings.HasPrefix(model, "claude") {
 		model = "gpt-4o"
