@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -1161,9 +1160,9 @@ func (h *Handler) ValidateManufacturingTransfer(c *gin.Context) {
 	// This would move items from source to destination location
 
 	response.Success(c, gin.H{
-		"message":    "Transfer validated successfully",
-		"done_date":  now,
-		"next_step":  getNextStepMessage(transferType),
+		"message":   "Transfer validated successfully",
+		"done_date": now,
+		"next_step": getNextStepMessage(transferType),
 	})
 }
 
@@ -1821,7 +1820,8 @@ func (h *Handler) receiveScrapGoods(poID, tenantID, userID uuid.UUID, productID 
 // createFinishedGoodsJournalEntry creates the WIP → Finished Goods journal entry
 // when production is completed via work orders.
 // Flow: Dt 1320 WIP (machine+labor) / Ct 2590,6720
-//       Dt 1330 Finished Goods    / Ct 1320 WIP = totalCost
+//
+//	Dt 1330 Finished Goods    / Ct 1320 WIP = totalCost
 func (h *Handler) createFinishedGoodsJournalEntry(
 	poID, tenantID uuid.UUID, organizationID *uuid.UUID, productID, userID uuid.UUID,
 	producedQty, unitCost float64, now time.Time,
@@ -2507,48 +2507,39 @@ func (h *Handler) UploadWorkOrderAttachment(c *gin.Context) {
 	mimeType := http.DetectContentType(buffer)
 	file.Seek(0, 0)
 
-	// Generate unique file name
+	// Generate unique file name; storedName is also the public file id served by
+	// GET /files/:id, so it must match the uploaded_files row id below.
 	randomBytes := make([]byte, 16)
 	rand.Read(randomBytes)
 	fileID := hex.EncodeToString(randomBytes)
 	ext := filepath.Ext(header.Filename)
 	storedName := fileID + ext
 
-	// Create directory
-	now := time.Now()
-	dirPath := filepath.Join(h.config.Storage.LocalPath, "uploads", now.Format("2006"), now.Format("01"))
-	os.MkdirAll(dirPath, 0755)
-	filePath := filepath.Join(dirPath, storedName)
-
-	// Save file
-	dst, err := os.Create(filePath)
+	// Read the content and store the file in the database (no filesystem).
+	content, err := io.ReadAll(file)
 	if err != nil {
+		response.InternalError(c, "Failed to read file")
+		return
+	}
+	if err := h.insertUploadedFile(storedName, header.Filename, mimeType, int64(len(content)), content, tenantID, userID); err != nil {
+		h.log.Error("Failed to store attachment file", "error", err)
 		response.InternalError(c, "Failed to save file")
 		return
 	}
-	defer dst.Close()
-
-	if _, err = io.Copy(dst, file); err != nil {
-		response.InternalError(c, "Failed to write file")
-		return
-	}
-
-	// Save metadata file (same pattern as files.go)
-	metaPath := filePath + ".meta"
-	metaContent := fmt.Sprintf("%s\n%s\n%d\n%s\n%d", header.Filename, mimeType, header.Size, filePath, now.Unix())
-	os.WriteFile(metaPath, []byte(metaContent), 0644)
 
 	// Get optional description
 	description := c.PostForm("description")
 	metadata := fmt.Sprintf(`{"description": "%s"}`, description)
 
-	// Insert into attachments table
+	// Insert into attachments table. storage_path holds the uploaded_files id
+	// (no longer a filesystem path) so deletes can clean up the backing row.
+	now := time.Now()
 	attachID := uuid.New()
 	_, err = h.db.Exec(`
 		INSERT INTO attachments (id, tenant_id, uploaded_by, entity_type, entity_id,
 			file_name, original_name, mime_type, file_size, storage_path, metadata)
 		VALUES ($1, $2, $3, 'work_order', $4, $5, $6, $7, $8, $9, $10::jsonb)
-	`, attachID, tenantID, userID, woID, storedName, header.Filename, mimeType, header.Size, filePath, metadata)
+	`, attachID, tenantID, userID, woID, storedName, header.Filename, mimeType, header.Size, storedName, metadata)
 	if err != nil {
 		h.log.Error("Failed to save attachment record", "error", err)
 		response.InternalError(c, "Failed to save attachment")
@@ -2581,7 +2572,7 @@ func (h *Handler) DeleteWorkOrderAttachment(c *gin.Context) {
 		return
 	}
 
-	// Get file path before deleting
+	// storage_path now holds the uploaded_files id (see UploadWorkOrderAttachment)
 	var storagePath string
 	h.db.QueryRow(`SELECT storage_path FROM attachments WHERE id = $1 AND tenant_id = $2`, attachID, tenantID).Scan(&storagePath)
 
@@ -2591,10 +2582,9 @@ func (h *Handler) DeleteWorkOrderAttachment(c *gin.Context) {
 		return
 	}
 
-	// Remove file from disk
+	// Remove the backing file row from the database
 	if storagePath != "" {
-		os.Remove(storagePath)
-		os.Remove(storagePath + ".meta")
+		h.db.Exec(`DELETE FROM uploaded_files WHERE id = $1`, storagePath)
 	}
 
 	response.Success(c, gin.H{"message": "Attachment deleted"})
