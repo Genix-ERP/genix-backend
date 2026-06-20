@@ -1,4 +1,4 @@
--- 424_tenant_ai_settings.sql
+-- 430_tenant_ai_settings.sql
 --
 -- Per-tenant AI provider settings (user-supplied API key + model), used by
 -- features like the purchase-receipt scanner so a tenant can plug in their own
