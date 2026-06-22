@@ -644,7 +644,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		salesOrders.POST("", h.perm.Require("sales", "order", "create"), h.CreateSalesOrder)
 		salesOrders.GET("/:id", h.GetSalesOrder)
 		salesOrders.PUT("/:id", h.perm.Require("sales", "order", "update"), h.UpdateSalesOrder)
-		salesOrders.DELETE("/:id", h.perm.Require("sales", "order", "delete"), h.DeleteSalesOrder)
+		// Deleting a posted sales order is destructive (reverses GL/inventory) — super admins only.
+		salesOrders.DELETE("/:id", h.perm.RequireSuperAdmin(), h.DeleteSalesOrder)
 		salesOrders.POST("/:id/confirm", h.perm.Require("sales", "order", "approve"), h.ConfirmSalesOrder)
 		salesOrders.POST("/:id/cancel", h.CancelSalesOrder)
 		salesOrders.POST("/:id/invoice", h.CreateInvoiceFromOrder)
@@ -671,7 +672,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		invoices.POST("/repair-revenue", h.perm.Require("sales", "invoice", "update"), h.RepairRevenueJournalEntries)
 		invoices.GET("/:id", h.GetSalesInvoice)
 		invoices.PUT("/:id", h.perm.Require("sales", "invoice", "update"), h.UpdateSalesInvoice)
-		invoices.DELETE("/:id", h.perm.Require("sales", "invoice", "delete"), h.DeleteSalesInvoice)
+		// Deleting a posted invoice is destructive (reverses the GL entry) — super admins only.
+		invoices.DELETE("/:id", h.perm.RequireSuperAdmin(), h.DeleteSalesInvoice)
 		invoices.POST("/:id/send", h.SendInvoice)
 		invoices.POST("/:id/record-payment", h.RecordPayment)
 		invoices.POST("/:id/credit-note", h.perm.Require("sales", "invoice", "create"), h.CreateCreditNote)
@@ -1592,7 +1594,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		productionOrders.GET("/stats", h.GetManufacturingStats)
 		productionOrders.GET("/:id", h.GetProductionOrder)
 		productionOrders.PUT("/:id", h.perm.Require("manufacturing", "production_orders", "update"), h.UpdateProductionOrder)
-		productionOrders.DELETE("/:id", h.perm.Require("manufacturing", "production_orders", "delete"), h.DeleteProductionOrder)
+		// Deleting a manufacture order is destructive (reverses work orders/material) — super admins only.
+		productionOrders.DELETE("/:id", h.perm.RequireSuperAdmin(), h.DeleteProductionOrder)
 		productionOrders.POST("/:id/confirm", h.perm.Require("manufacturing", "production_orders", "approve"), h.ConfirmProductionOrder)
 		productionOrders.POST("/:id/start", h.StartProductionOrder)
 		productionOrders.POST("/:id/pause", h.PauseProductionOrder)

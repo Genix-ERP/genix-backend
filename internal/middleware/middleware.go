@@ -711,6 +711,47 @@ func (pc *PermissionChecker) isUserSiteAdminOrOwner(ctx context.Context, tenantI
 	return bypass, nil
 }
 
+// RequireSuperAdmin returns a Gin middleware that allows ONLY system admins,
+// tenant owners, and site admins through. Unlike Require (where owners/admins
+// merely *bypass* a granular permission), this is a hard gate: everyone else is
+// rejected regardless of their module permissions. Used to lock destructive
+// actions — deleting posted sales/manufacturing documents — to super admins.
+func (pc *PermissionChecker) RequireSuperAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		claims, exists := c.Get(ContextKeyClaims)
+		if !exists {
+			response.Unauthorized(c, "Authentication required")
+			c.Abort()
+			return
+		}
+		jwtClaims, ok := claims.(*crypto.Claims)
+		if !ok {
+			response.Unauthorized(c, "Invalid authentication")
+			c.Abort()
+			return
+		}
+		// System admins are always allowed.
+		if jwtClaims.IsSystemAdmin {
+			c.Next()
+			return
+		}
+		ctx := c.Request.Context()
+		isAdmin, err := pc.isUserSiteAdminOrOwner(ctx, jwtClaims.TenantID.String(), jwtClaims.UserID.String())
+		if err != nil {
+			pc.log.Error("RequireSuperAdmin: role check failed", "error", err, "user_id", jwtClaims.UserID.String())
+			response.Forbidden(c, "Permission check failed")
+			c.Abort()
+			return
+		}
+		if !isAdmin {
+			response.Forbidden(c, "Only an owner or admin can perform this action")
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
 // Require returns a Gin middleware that checks whether the authenticated user
 // has the specified permission (module:resource:action). System admins and
 // site admins/owners bypass the check.
