@@ -393,7 +393,7 @@ func (h *Handler) createInvoiceAndPostIssuance(
 		prefix = numberPrefix.String
 	}
 	var nextNumber int
-	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number,'[^0-9]','','g') AS BIGINT)),0)+1
+	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT)),0)+1
 		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL`, tenantID, journalID).Scan(&nextNumber)
 	if nextNumber < 1 {
 		nextNumber = 1
@@ -460,15 +460,13 @@ func (h *Handler) postUpfrontReceipt(tx *sql.Tx, tenantID, orgID uuid.UUID, orgA
 	if orgID != uuid.Nil {
 		orgPtr = &orgID
 	}
-	// Cash/bank account. Charts vary by deployment: NAS-style uses 5010/5110,
-	// but this system's balance-guard trigger (migration 192) treats 1000*/1010*/
-	// 1100* as cash/bank, and the account is usually named Cyrillic "Касса". Try
-	// the common name/code variants so the receipt actually posts.
+	// Cash/bank account. This chart codes cash 5010 ("Kassa") and bank 5110
+	// ("Hisob-kitob schyoti"); some orgs name the till Cyrillic "Касса". NOTE:
+	// 1000*/1010*/1100* are INVENTORY accounts here (not cash), so never fall
+	// back to those codes — that would post the receipt to the wrong account.
 	var cashAccountID uuid.UUID
 	for _, probe := range []struct{ name, code string }{
-		{"kassa", "5010"}, {"bank", "5110"},
-		{"касса", "1000"}, {"касса", "5010"}, {"наличные", "1000"},
-		{"bank", "1010"}, {"банк", "1100"},
+		{"kassa", "5010"}, {"касса", "5010"}, {"bank", "5110"},
 	} {
 		if cashAccountID = findAccount(tx, tenantID, orgPtr, probe.name, probe.code); cashAccountID != uuid.Nil {
 			break
@@ -516,7 +514,7 @@ func (h *Handler) postUpfrontReceipt(tx *sql.Tx, tenantID, orgID uuid.UUID, orgA
 		prefix = numberPrefix.String
 	}
 	var maxNum int
-	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(entry_number,'[^0-9]','','g') AS BIGINT)),0)
+	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT)),0)
 		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL`, tenantID, journalID).Scan(&maxNum)
 	actualNum := maxNum + 1
 	if nextNumber > actualNum {
@@ -615,11 +613,11 @@ func (h *Handler) attachExtraComponents(tenantID, productionOrderID uuid.UUID, c
 func (h *Handler) nextSalesOrderNumber(tenantID, orgID uuid.UUID) string {
 	var maxNum int
 	if orgID != uuid.Nil {
-		h.db.QueryRow(`SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number,'[^0-9]','','g') AS BIGINT)),0)
+		h.db.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(order_number,'[^0-9]','','g'),'') AS BIGINT)),0)
 			FROM sales_orders WHERE tenant_id=$1 AND organization_id=$2 AND order_number ~ '^S[0-9]+$'`,
 			tenantID, orgID).Scan(&maxNum)
 	} else {
-		h.db.QueryRow(`SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number,'[^0-9]','','g') AS BIGINT)),0)
+		h.db.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(order_number,'[^0-9]','','g'),'') AS BIGINT)),0)
 			FROM sales_orders WHERE tenant_id=$1 AND organization_id IS NULL AND order_number ~ '^S[0-9]+$'`,
 			tenantID).Scan(&maxNum)
 	}
