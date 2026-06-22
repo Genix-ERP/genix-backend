@@ -228,12 +228,27 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 	invoicePosted := false
 	receiptPosted := false
 	if paid > 0 {
-		// Leg 1: issue the invoice — DR Accounts Receivable / CR Sales Revenue.
-		invoiceID, invoicePosted = h.createInvoiceAndPostIssuance(
-			tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber,
-			productID, qty, unitPrice, total, paid, paymentStatus, in.Notes, userID, now)
-		// Leg 2: record the cash receipt — DR Cash / CR Accounts Receivable.
-		receiptPosted = h.postUpfrontReceipt(tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber, paid, userID, now)
+		// Isolate both GL legs in a SAVEPOINT. GL posting is best-effort
+		// double-entry, so a half-configured chart of accounts or ANY swallowed
+		// lookup/update error inside the legs must never abort the order. We post
+		// both legs or neither (balanced books); on any failure we ROLLBACK TO the
+		// savepoint — which also clears a possibly-aborted tx state — so the
+		// customer + sales order + manufacture order still commit. The sales order
+		// already carries paid/remaining, so the payment isn't lost from the UI.
+		if _, spErr := tx.Exec(`SAVEPOINT sp_gl`); spErr == nil {
+			// Leg 1: issue the invoice — DR Accounts Receivable / CR Sales Revenue.
+			invoiceID, invoicePosted = h.createInvoiceAndPostIssuance(
+				tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber,
+				productID, qty, unitPrice, total, paid, paymentStatus, in.Notes, userID, now)
+			// Leg 2: record the cash receipt — DR Cash / CR Accounts Receivable.
+			receiptPosted = h.postUpfrontReceipt(tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber, paid, userID, now)
+			if invoicePosted && receiptPosted {
+				tx.Exec(`RELEASE SAVEPOINT sp_gl`)
+			} else {
+				tx.Exec(`ROLLBACK TO SAVEPOINT sp_gl`)
+				invoiceID = uuid.Nil // invoice row was rolled back with the GL
+			}
+		}
 	}
 	glPosted := invoicePosted && receiptPosted
 
@@ -409,11 +424,24 @@ func (h *Handler) createInvoiceAndPostIssuance(
 		return invoiceID, false
 	}
 	// Balances + denormalized customer owed + invoice↔JE link + journal counter.
-	tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, arAccountID)
-	tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, revenueAccountID)
-	tx.Exec(`UPDATE contacts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, total, now, customerID)
-	tx.Exec(`UPDATE sales_invoices SET journal_entry_id=$1 WHERE id=$2`, jeID, invoiceID)
-	tx.Exec(`UPDATE journals SET next_number = GREATEST(COALESCE(next_number,1), $1) WHERE id=$2`, nextNumber+1, journalID)
+	// Checked: a failure here (e.g. a balance-guard trigger) must roll back the
+	// whole GL — the caller rolls back the savepoint — rather than silently
+	// poison the tx and break the order's commit.
+	for _, u := range []struct {
+		q    string
+		args []interface{}
+	}{
+		{`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, []interface{}{total, now, arAccountID}},
+		{`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, []interface{}{total, now, revenueAccountID}},
+		{`UPDATE contacts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, []interface{}{total, now, customerID}},
+		{`UPDATE sales_invoices SET journal_entry_id=$1 WHERE id=$2`, []interface{}{jeID, invoiceID}},
+		{`UPDATE journals SET next_number = GREATEST(COALESCE(next_number,1), $1) WHERE id=$2`, []interface{}{nextNumber + 1, journalID}},
+	} {
+		if _, err := tx.Exec(u.q, u.args...); err != nil {
+			h.log.Error("full-order: invoice GL tail update failed; rolling back GL", "error", err)
+			return invoiceID, false
+		}
+	}
 	return invoiceID, true
 }
 
@@ -432,14 +460,25 @@ func (h *Handler) postUpfrontReceipt(tx *sql.Tx, tenantID, orgID uuid.UUID, orgA
 	if orgID != uuid.Nil {
 		orgPtr = &orgID
 	}
-	// Cash/bank account.
-	cashAccountID := findAccount(tx, tenantID, orgPtr, "kassa", "5010")
-	if cashAccountID == uuid.Nil {
-		cashAccountID = findAccount(tx, tenantID, orgPtr, "bank", "5110")
+	// Cash/bank account. Charts vary by deployment: NAS-style uses 5010/5110,
+	// but this system's balance-guard trigger (migration 192) treats 1000*/1010*/
+	// 1100* as cash/bank, and the account is usually named Cyrillic "Касса". Try
+	// the common name/code variants so the receipt actually posts.
+	var cashAccountID uuid.UUID
+	for _, probe := range []struct{ name, code string }{
+		{"kassa", "5010"}, {"bank", "5110"},
+		{"касса", "1000"}, {"касса", "5010"}, {"наличные", "1000"},
+		{"bank", "1010"}, {"банк", "1100"},
+	} {
+		if cashAccountID = findAccount(tx, tenantID, orgPtr, probe.name, probe.code); cashAccountID != uuid.Nil {
+			break
+		}
 	}
 	// AR account: prefer the customer's default, else by name/code.
 	var arStr sql.NullString
-	_ = tx.QueryRow(`SELECT default_receivable_account_id::text FROM contacts WHERE id=$1 AND tenant_id=$2`, customerID, tenantID).Scan(&arStr)
+	if err := tx.QueryRow(`SELECT default_receivable_account_id::text FROM contacts WHERE id=$1 AND tenant_id=$2`, customerID, tenantID).Scan(&arStr); err != nil && err != sql.ErrNoRows {
+		h.log.Error("full-order: contacts.default_receivable_account_id lookup failed", "error", err)
+	}
 	var arAccountID uuid.UUID
 	if arStr.Valid && arStr.String != "" {
 		arAccountID, _ = uuid.Parse(arStr.String)
@@ -508,10 +547,22 @@ func (h *Handler) postUpfrontReceipt(tx *sql.Tx, tenantID, orgID uuid.UUID, orgA
 		return false
 	}
 	// Balances + journal counter + denormalized customer balance (prepaid → AR down).
-	tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, amount, now, cashAccountID)
-	tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, amount, now, arAccountID)
-	tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id=$1`, journalID)
-	tx.Exec(`UPDATE contacts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, amount, now, customerID)
+	// Checked: see createInvoiceAndPostIssuance — a failure must roll back the GL
+	// via the caller's savepoint, not poison the tx and fail the order's commit.
+	for _, u := range []struct {
+		q    string
+		args []interface{}
+	}{
+		{`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, []interface{}{amount, now, cashAccountID}},
+		{`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, []interface{}{amount, now, arAccountID}},
+		{`UPDATE journals SET next_number = next_number + 1 WHERE id=$1`, []interface{}{journalID}},
+		{`UPDATE contacts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, []interface{}{amount, now, customerID}},
+	} {
+		if _, err := tx.Exec(u.q, u.args...); err != nil {
+			h.log.Error("full-order: receipt GL tail update failed; rolling back GL", "error", err)
+			return false
+		}
+	}
 	return true
 }
 
