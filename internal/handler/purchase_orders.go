@@ -1950,6 +1950,38 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	// Resolve + validate the receiving warehouse BEFORE changing any state.
+	// In a multi-company tenant the warehouse MUST belong to the PO's own
+	// organization. The auto-assign below used to fall back to "any tenant
+	// warehouse", which booked one company's stock into another company's
+	// warehouse — invisible in the owner's warehouse view and impossible to
+	// reconcile (this is what happened to PO-00001 / LUXURYMEBEL).
+	{
+		var poWH sql.NullString
+		var poOrg *uuid.UUID
+		h.db.QueryRow("SELECT warehouse_id, organization_id FROM purchase_orders WHERE id = $1 AND tenant_id = $2", id, tenantID).Scan(&poWH, &poOrg)
+		if poOrg != nil && *poOrg != uuid.Nil {
+			if !poWH.Valid || poWH.String == "" {
+				// No warehouse on the PO — auto-pick one from THIS org only.
+				var orgWH string
+				h.db.QueryRow("SELECT id::text FROM warehouses WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL ORDER BY is_default DESC, created_at ASC LIMIT 1", tenantID, *poOrg).Scan(&orgWH)
+				if orgWH == "" {
+					response.BadRequest(c, "No warehouse found for this company. Create a warehouse in this organization before receiving the order.")
+					return
+				}
+				h.db.Exec("UPDATE purchase_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3", orgWH, id, tenantID)
+			} else {
+				// A warehouse is set — it must belong to the PO's organization.
+				var whOrg sql.NullString
+				h.db.QueryRow("SELECT organization_id::text FROM warehouses WHERE id = $1 AND tenant_id = $2", poWH.String, tenantID).Scan(&whOrg)
+				if !whOrg.Valid || whOrg.String != poOrg.String() {
+					response.BadRequest(c, "The purchase order's warehouse belongs to a different company. Set a warehouse in this organization before receiving.")
+					return
+				}
+			}
+		}
+	}
+
 	// Start transaction
 	tx, err := h.db.Begin()
 	if err != nil {
