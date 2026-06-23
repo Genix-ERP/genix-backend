@@ -34,6 +34,7 @@ type Contact struct {
 	Email              *string         `json:"email,omitempty" db:"email"`
 	Phone              *string         `json:"phone,omitempty" db:"phone"`
 	Fax                *string         `json:"fax,omitempty" db:"fax"`
+	ContactPerson      *string         `json:"contact_person,omitempty" db:"contact_person"`
 	BillingAddress     json.RawMessage `json:"billing_address" db:"billing_address" swaggertype:"object"`
 	ShippingAddress    json.RawMessage `json:"shipping_address" db:"shipping_address" swaggertype:"object"`
 	PaymentTerms       int             `json:"payment_terms" db:"payment_terms"`
@@ -90,6 +91,7 @@ type CreateContactInput struct {
 	Email              string      `json:"email,omitempty" binding:"omitempty,email"`
 	Phone              string      `json:"phone,omitempty"`
 	Fax                string      `json:"fax,omitempty"`
+	ContactPerson      string      `json:"contact_person,omitempty"`
 	BillingAddress     *Address    `json:"billing_address,omitempty"`
 	ShippingAddress    *Address    `json:"shipping_address,omitempty"`
 	PaymentTerms       int         `json:"payment_terms,omitempty"`
@@ -116,6 +118,7 @@ type UpdateContactInput struct {
 	Email              *string                `json:"email,omitempty"`
 	Phone              *string                `json:"phone,omitempty"`
 	Fax                *string                `json:"fax,omitempty"`
+	ContactPerson      *string                `json:"contact_person,omitempty"`
 	BillingAddress     *Address               `json:"billing_address,omitempty"`
 	ShippingAddress    *Address               `json:"shipping_address,omitempty"`
 	PaymentTerms       *int                   `json:"payment_terms,omitempty"`
@@ -165,6 +168,7 @@ type ContactResponse struct {
 	Industry           *string                `json:"industry,omitempty"`
 	Email              *string                `json:"email,omitempty"`
 	Phone              *string                `json:"phone,omitempty"`
+	ContactPerson      *string                `json:"contact_person,omitempty"`
 	BillingAddress     *Address               `json:"billing_address,omitempty"`
 	ShippingAddress    *Address               `json:"shipping_address,omitempty"`
 	PaymentTerms       int                    `json:"payment_terms"`

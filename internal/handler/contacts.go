@@ -55,7 +55,8 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			   COALESCE(sp.avg_rating, 0) AS avg_rating,
 			   COALESCE(sp.rating_count, 0) AS rating_count,
 			   c.source_organization_id,
-			   c.default_receivable_account_id, c.default_payable_account_id
+			   c.default_receivable_account_id, c.default_payable_account_id,
+			   c.contact_person
 		FROM contacts c
 		LEFT JOIN (
 			SELECT vendor_id, AVG(overall_rating) AS avg_rating, COUNT(*) AS rating_count
@@ -140,6 +141,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		var expectedRevenue sql.NullFloat64
 		var sourceOrgID sql.NullString
 		var defaultReceivableAccountID, defaultPayableAccountID sql.NullString
+		var contactPerson sql.NullString
 
 		err := rows.Scan(
 			&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
@@ -149,6 +151,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 			&customFields, &ct.IsActive, &createdBy, &ct.CreatedAt, &ct.UpdatedAt,
 			&avgRating, &ratingCount, &sourceOrgID,
 			&defaultReceivableAccountID, &defaultPayableAccountID,
+			&contactPerson,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan contact", "error", err)
@@ -187,6 +190,9 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		}
 		if phone.Valid {
 			resp.Phone = &phone.String
+		}
+		if contactPerson.Valid {
+			resp.ContactPerson = &contactPerson.String
 		}
 
 		// Parse addresses
@@ -312,6 +318,10 @@ func (h *Handler) CreateContact(c *gin.Context) {
 	if input.Fax != "" {
 		fax = &input.Fax
 	}
+	var contactPerson *string
+	if input.ContactPerson != "" {
+		contactPerson = &input.ContactPerson
+	}
 	if input.Notes != "" {
 		notes = &input.Notes
 	}
@@ -376,8 +386,8 @@ func (h *Handler) CreateContact(c *gin.Context) {
 			billing_address, shipping_address, payment_terms, credit_limit,
 			current_balance, tax_exempt, tags, notes, expected_revenue, custom_fields,
 			is_active, created_by, created_at, updated_at,
-			default_receivable_account_id, default_payable_account_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+			default_receivable_account_id, default_payable_account_id, contact_person
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 		RETURNING id
 	`
 
@@ -387,7 +397,7 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		billingAddr, shippingAddr, input.PaymentTerms, input.CreditLimit,
 		0, input.TaxExempt, tags, notes, input.ExpectedRevenue, customFields,
 		true, userID, now, now,
-		receivableAccountID, payableAccountID,
+		receivableAccountID, payableAccountID, contactPerson,
 	).Scan(&id)
 
 	if err != nil {
@@ -405,6 +415,7 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		TaxID:        taxID,
 		Email:        email,
 		Phone:        phone,
+		ContactPerson: contactPerson,
 		PaymentTerms: input.PaymentTerms,
 		CreditLimit:  input.CreditLimit,
 		TaxExempt:    input.TaxExempt,
@@ -459,7 +470,7 @@ func (h *Handler) GetContact(c *gin.Context) {
 			   billing_address, shipping_address, payment_terms, credit_limit,
 			   current_balance, currency_id, tax_exempt, tags, notes, expected_revenue,
 			   custom_fields, is_active, created_by, created_at, updated_at,
-			   default_receivable_account_id, default_payable_account_id
+			   default_receivable_account_id, default_payable_account_id, contact_person
 		FROM contacts
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`
@@ -470,6 +481,7 @@ func (h *Handler) GetContact(c *gin.Context) {
 	var billingAddr, shippingAddr, tags, customFields []byte
 	var expectedRevenue sql.NullFloat64
 	var defaultReceivableAccountID, defaultPayableAccountID sql.NullString
+	var contactPerson sql.NullString
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
@@ -477,7 +489,7 @@ func (h *Handler) GetContact(c *gin.Context) {
 		&billingAddr, &shippingAddr, &ct.PaymentTerms, &ct.CreditLimit,
 		&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes, &expectedRevenue,
 		&customFields, &ct.IsActive, &createdBy, &ct.CreatedAt, &ct.UpdatedAt,
-		&defaultReceivableAccountID, &defaultPayableAccountID,
+		&defaultReceivableAccountID, &defaultPayableAccountID, &contactPerson,
 	)
 
 	if err == sql.ErrNoRows {
@@ -515,6 +527,9 @@ func (h *Handler) GetContact(c *gin.Context) {
 	}
 	if phone.Valid {
 		resp.Phone = &phone.String
+	}
+	if contactPerson.Valid {
+		resp.ContactPerson = &contactPerson.String
 	}
 
 	if len(billingAddr) > 0 {
@@ -632,6 +647,11 @@ func (h *Handler) UpdateContact(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("fax = $%d", argCount))
 		args = append(args, *input.Fax)
+	}
+	if input.ContactPerson != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contact_person = $%d", argCount))
+		args = append(args, *input.ContactPerson)
 	}
 	if input.BillingAddress != nil {
 		argCount++
