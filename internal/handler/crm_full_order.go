@@ -394,7 +394,8 @@ func (h *Handler) createInvoiceAndPostIssuance(
 	}
 	var nextNumber int
 	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT)),0)+1
-		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL`, tenantID, journalID).Scan(&nextNumber)
+		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL
+		  AND LENGTH(REGEXP_REPLACE(entry_number,'[^0-9]','','g')) <= 9`, tenantID, journalID).Scan(&nextNumber)
 	if nextNumber < 1 {
 		nextNumber = 1
 	}
@@ -515,7 +516,8 @@ func (h *Handler) postUpfrontReceipt(tx *sql.Tx, tenantID, orgID uuid.UUID, orgA
 	}
 	var maxNum int
 	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT)),0)
-		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL`, tenantID, journalID).Scan(&maxNum)
+		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL
+		  AND LENGTH(REGEXP_REPLACE(entry_number,'[^0-9]','','g')) <= 9`, tenantID, journalID).Scan(&maxNum)
 	actualNum := maxNum + 1
 	if nextNumber > actualNum {
 		actualNum = nextNumber
