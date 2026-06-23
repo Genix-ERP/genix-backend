@@ -241,7 +241,7 @@ func (h *Handler) CreateCustomerWithFullOrder(c *gin.Context) {
 				tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber,
 				productID, qty, unitPrice, total, paid, paymentStatus, in.Notes, userID, now)
 			// Leg 2: record the cash receipt — DR Cash / CR Accounts Receivable.
-			receiptPosted = h.postUpfrontReceipt(tx, tenantID, orgID, orgArg, customerID, salesOrderID, orderNumber, paid, userID, now)
+			receiptPosted = h.postUpfrontReceipt(tx, tenantID, orgID, orgArg, customerID, invoiceID, salesOrderID, orderNumber, paid, userID, now)
 			if invoicePosted && receiptPosted {
 				tx.Exec(`RELEASE SAVEPOINT sp_gl`)
 			} else {
@@ -452,7 +452,7 @@ func (h *Handler) createInvoiceAndPostIssuance(
 // succeeds, just without a GL entry (so a half-configured chart of accounts
 // can't block creating the order).
 func (h *Handler) postUpfrontReceipt(tx *sql.Tx, tenantID, orgID uuid.UUID, orgArg interface{},
-	customerID, salesOrderID uuid.UUID, orderNumber string, amount float64, userID uuid.UUID, now time.Time) bool {
+	customerID, invoiceID, salesOrderID uuid.UUID, orderNumber string, amount float64, userID uuid.UUID, now time.Time) bool {
 	if amount <= 0 {
 		return false
 	}
@@ -558,6 +558,45 @@ func (h *Handler) postUpfrontReceipt(tx *sql.Tx, tenantID, orgID uuid.UUID, orgA
 	} {
 		if _, err := tx.Exec(u.q, u.args...); err != nil {
 			h.log.Error("full-order: receipt GL tail update failed; rolling back GL", "error", err)
+			return false
+		}
+	}
+
+	// Record a real, CONFIRMED payment + allocation so the invoice reflects the
+	// upfront amount (paid / remaining) and it's tracked like any other payment
+	// — without this the sales order carried paid_amount but the invoice and the
+	// "confirmed payments" widget (which read payment_allocations) showed 0. The
+	// cash-receipt JE posted above (jeID) IS this payment's journal entry, so
+	// there is no double posting.
+	if invoiceID != uuid.Nil {
+		paymentID := uuid.New()
+		if _, err := tx.Exec(`
+			INSERT INTO payments (
+				id, tenant_id, organization_id, type, payment_number, contact_id, payment_date, amount,
+				currency_id, exchange_rate, reference, notes, status, journal_entry_id, created_by, created_at, updated_at
+			) VALUES ($1,$2,$3,'receipt',$4,$5,$6,$7,NULL,1.0,$8,$9,'confirmed',$10,$11,$12,$12)`,
+			paymentID, tenantID, orgArg, "REC-"+entryNumber, customerID, now, amount,
+			orderNumber, nullIfEmpty(orderNumber+" — oldindan to'lov (upfront)"), jeID, userID, now,
+		); err != nil {
+			h.log.Error("full-order: upfront payment record insert failed; rolling back GL", "error", err)
+			return false
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
+			VALUES ($1,$2,'sales_invoice',$3,$4,$5)`,
+			uuid.New(), paymentID, invoiceID, amount, now,
+		); err != nil {
+			h.log.Error("full-order: payment allocation insert failed; rolling back GL", "error", err)
+			return false
+		}
+		// Reflect the payment on the invoice so it shows paid / remaining.
+		if _, err := tx.Exec(`
+			UPDATE sales_invoices
+			SET amount_paid = $1,
+			    status = CASE WHEN $1 >= total_amount THEN 'paid' ELSE 'partial' END,
+			    updated_at = $2
+			WHERE id = $3 AND tenant_id = $4`, amount, now, invoiceID, tenantID); err != nil {
+			h.log.Error("full-order: invoice amount_paid update failed; rolling back GL", "error", err)
 			return false
 		}
 	}
