@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -788,14 +789,15 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 		return
 	}
 
-	// Fetch employee email before deleting (needed for user cleanup)
-	var empEmail sql.NullString
-	h.db.QueryRow(`SELECT email FROM employees WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&empEmail)
+	// Fetch employee details before delete (for user cleanup and audit trail)
+	var empEmail, empFirst, empLast sql.NullString
+	h.db.QueryRow(`SELECT email, first_name, last_name FROM employees WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&empEmail, &empFirst, &empLast)
 
+	now := time.Now()
 	result, err := h.db.Exec(`
 		UPDATE employees SET deleted_at = $1, updated_at = $1
 		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-	`, time.Now(), id, tenantID)
+	`, now, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete employee", "error", err)
 		response.InternalError(c, "Failed to delete employee")
@@ -808,17 +810,34 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 		return
 	}
 
-	// Delete linked user by employee_id
-	h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
-
-	// Also delete by email as fallback (covers cases where employee_id link was not set)
+	// Soft-delete the linked user so login is disabled while the record stays
+	// recoverable (login queries already filter deleted_at IS NULL).
+	h.db.Exec(`UPDATE users SET deleted_at = $1, updated_at = $1 WHERE tenant_id = $2 AND employee_id = $3 AND deleted_at IS NULL`, now, tenantID, id)
 	if empEmail.Valid && empEmail.String != "" {
-		h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND email = $2`, tenantID, empEmail.String)
+		h.db.Exec(`UPDATE users SET deleted_at = $1, updated_at = $1 WHERE tenant_id = $2 AND email = $3 AND deleted_at IS NULL`, now, tenantID, empEmail.String)
 	}
 
-	// Clean up employee permissions and organization assignments
-	h.db.Exec(`DELETE FROM employee_module_permissions WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
-	h.db.Exec(`DELETE FROM employee_organizations WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
+	// IMPORTANT: we intentionally do NOT hard-delete employee_organizations or
+	// employee_module_permissions. Previously this handler wiped them on every
+	// "soft" delete, which made accidental deletes unrecoverable. Leaving them
+	// in place means undeleting an employee (clearing deleted_at) fully restores
+	// their company assignments and module permissions.
+
+	// Record who performed the delete, for traceability.
+	actorID, _ := middleware.GetUserID(c)
+	var actorArg interface{}
+	if actorID != (uuid.UUID{}) {
+		actorArg = actorID
+	}
+	oldValues, _ := json.Marshal(map[string]interface{}{
+		"first_name": empFirst.String,
+		"last_name":  empLast.String,
+		"email":      empEmail.String,
+	})
+	h.db.Exec(`
+		INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, old_values, ip_address, user_agent, created_at)
+		VALUES ($1, $2, $3, 'delete', 'employee', $4, $5, $6, $7, $8)
+	`, uuid.New(), tenantID, actorArg, id, oldValues, nullIfEmpty(c.ClientIP()), nullIfEmpty(c.Request.UserAgent()), now)
 
 	response.NoContent(c)
 }
