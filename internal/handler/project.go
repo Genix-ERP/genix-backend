@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -688,7 +689,9 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 		SELECT id, tenant_id, project_id, parent_id, milestone_id, task_number, title, description,
 			   assignee_id, assignee_name, priority, status, due_date,
 			   estimated_hours, actual_hours, created_by, created_at, updated_at,
-			   (SELECT COUNT(*) FROM project_task_notes ptn WHERE ptn.task_id = project_tasks.id) AS note_count
+			   (SELECT COUNT(*) FROM project_task_notes ptn WHERE ptn.task_id = project_tasks.id) AS note_count,
+			   (SELECT COALESCE(json_agg(json_build_object('employee_id', ta.employee_id, 'employee_name', ta.employee_name) ORDER BY ta.created_at), '[]'::json)
+			    FROM project_task_assignees ta WHERE ta.task_id = project_tasks.id) AS assignees
 		FROM project_tasks
 		WHERE project_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 		ORDER BY created_at DESC`
@@ -711,11 +714,12 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 		var parentID, milestoneID, assigneeID, createdBy sql.NullString
 		var description, assigneeName sql.NullString
 		var dueDate, updatedAt sql.NullTime
+		var assigneesJSON []byte
 
 		err := rows.Scan(
 			&t.ID, &t.TenantID, &t.ProjectID, &parentID, &milestoneID, &t.TaskNumber, &t.Title, &description,
 			&assigneeID, &assigneeName, &t.Priority, &t.Status, &dueDate,
-			&t.EstimatedHours, &t.ActualHours, &createdBy, &t.CreatedAt, &updatedAt, &t.NoteCount,
+			&t.EstimatedHours, &t.ActualHours, &createdBy, &t.CreatedAt, &updatedAt, &t.NoteCount, &assigneesJSON,
 		)
 		if err != nil {
 			continue
@@ -746,7 +750,14 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 			t.UpdatedAt = updatedAt.Time
 		}
 
-		tasks = append(tasks, t.ToResponse())
+		resp := t.ToResponse()
+		if len(assigneesJSON) > 0 {
+			_ = json.Unmarshal(assigneesJSON, &resp.Assignees)
+		}
+		if resp.Assignees == nil {
+			resp.Assignees = []entity.TaskAssignee{}
+		}
+		tasks = append(tasks, resp)
 	}
 
 	if !paginate {
@@ -814,10 +825,23 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 			estimated_hours, actual_hours, created_by, created_at, updated_at, milestone_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`
 
+	// Determine the assignee set: prefer the multi-assignee list, else the single field.
+	assigneeSet := input.Assignees
+	if len(assigneeSet) == 0 && input.AssigneeID != "" {
+		assigneeSet = []entity.TaskAssignee{{EmployeeID: input.AssigneeID, EmployeeName: input.AssigneeName}}
+	}
+
 	var assigneeID *uuid.UUID
-	if input.AssigneeID != "" {
-		aid, _ := uuid.Parse(input.AssigneeID)
-		assigneeID = &aid
+	var assigneeName *string
+	if len(assigneeSet) > 0 {
+		// Primary assignee = first in the set (kept on the task row for compat)
+		if aid, err := uuid.Parse(assigneeSet[0].EmployeeID); err == nil {
+			assigneeID = &aid
+		}
+		if assigneeSet[0].EmployeeName != "" {
+			n := assigneeSet[0].EmployeeName
+			assigneeName = &n
+		}
 	}
 
 	var milestoneID *uuid.UUID
@@ -826,12 +850,9 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 		milestoneID = &mid
 	}
 
-	var description, assigneeName *string
+	var description *string
 	if input.Description != "" {
 		description = &input.Description
-	}
-	if input.AssigneeName != "" {
-		assigneeName = &input.AssigneeName
 	}
 
 	var createdBy *uuid.UUID
@@ -848,6 +869,17 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 		h.log.Error("Failed to create task", "error", err)
 		response.InternalError(c, "Failed to create task")
 		return
+	}
+
+	// Insert assignee junction rows
+	for _, a := range assigneeSet {
+		eid, perr := uuid.Parse(a.EmployeeID)
+		if perr != nil {
+			continue
+		}
+		h.db.Exec(`INSERT INTO project_task_assignees (id, tenant_id, task_id, employee_id, employee_name, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (task_id, employee_id) DO NOTHING`,
+			uuid.New(), tenantID, taskID, eid, a.EmployeeName, now)
 	}
 
 	task := &entity.ProjectTask{
@@ -870,7 +902,12 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 		UpdatedAt:      now,
 	}
 
-	response.Created(c, task.ToResponse())
+	resp := task.ToResponse()
+	resp.Assignees = assigneeSet
+	if resp.Assignees == nil {
+		resp.Assignees = []entity.TaskAssignee{}
+	}
+	response.Created(c, resp)
 }
 
 // UpdateProjectTask updates an existing task
@@ -930,6 +967,27 @@ func (h *Handler) UpdateProjectTask(c *gin.Context) {
 		if *input.MilestoneID != "" {
 			mid, _ := uuid.Parse(*input.MilestoneID)
 			args = append(args, mid)
+		} else {
+			args = append(args, nil)
+		}
+	}
+	// Keep the primary assignee column in sync with the multi-assignee list
+	if input.Assignees != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("assignee_id = $%d", argCount))
+		if len(input.Assignees) > 0 {
+			if aid, err := uuid.Parse(input.Assignees[0].EmployeeID); err == nil {
+				args = append(args, aid)
+			} else {
+				args = append(args, nil)
+			}
+		} else {
+			args = append(args, nil)
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("assignee_name = $%d", argCount))
+		if len(input.Assignees) > 0 {
+			args = append(args, input.Assignees[0].EmployeeName)
 		} else {
 			args = append(args, nil)
 		}
@@ -994,6 +1052,18 @@ func (h *Handler) UpdateProjectTask(c *gin.Context) {
 	if rowsAffected == 0 {
 		response.NotFound(c, "Task")
 		return
+	}
+
+	// Replace the assignee set when provided
+	if input.Assignees != nil {
+		h.db.Exec(`DELETE FROM project_task_assignees WHERE task_id = $1 AND tenant_id = $2`, taskID, tenantID)
+		for _, a := range input.Assignees {
+			if eid, perr := uuid.Parse(a.EmployeeID); perr == nil {
+				h.db.Exec(`INSERT INTO project_task_assignees (id, tenant_id, task_id, employee_id, employee_name, created_at)
+					VALUES ($1, $2, $3, $4, $5, NOW()) ON CONFLICT (task_id, employee_id) DO NOTHING`,
+					uuid.New(), tenantID, taskID, eid, a.EmployeeName)
+			}
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Task updated successfully"})

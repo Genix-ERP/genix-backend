@@ -172,16 +172,23 @@ type UpdateProjectInput struct {
 }
 
 // CreateProjectTaskInput represents input for creating a project task
+// TaskAssignee is one person assigned to a task
+type TaskAssignee struct {
+	EmployeeID   string `json:"employee_id"`
+	EmployeeName string `json:"employee_name"`
+}
+
 type CreateProjectTaskInput struct {
-	TaskNumber     string  `json:"task_number"`
-	Title          string  `json:"title" binding:"required"`
-	Description    string  `json:"description,omitempty"`
-	AssigneeID     string  `json:"assignee_id,omitempty"`
-	AssigneeName   string  `json:"assignee_name,omitempty"`
-	MilestoneID    string  `json:"milestone_id,omitempty"`
-	Priority       string  `json:"priority"`
-	DueDate        string  `json:"due_date,omitempty"`
-	EstimatedHours float64 `json:"estimated_hours"`
+	TaskNumber     string         `json:"task_number"`
+	Title          string         `json:"title" binding:"required"`
+	Description    string         `json:"description,omitempty"`
+	AssigneeID     string         `json:"assignee_id,omitempty"`
+	AssigneeName   string         `json:"assignee_name,omitempty"`
+	Assignees      []TaskAssignee `json:"assignees,omitempty"`
+	MilestoneID    string         `json:"milestone_id,omitempty"`
+	Priority       string         `json:"priority"`
+	DueDate        string         `json:"due_date,omitempty"`
+	EstimatedHours float64        `json:"estimated_hours"`
 }
 
 // UpdateProjectTaskInput represents input for updating a project task
@@ -190,6 +197,7 @@ type UpdateProjectTaskInput struct {
 	Description    *string  `json:"description,omitempty"`
 	AssigneeID     *string  `json:"assignee_id,omitempty"`
 	AssigneeName   *string  `json:"assignee_name,omitempty"`
+	Assignees      []TaskAssignee `json:"assignees,omitempty"`
 	MilestoneID    *string  `json:"milestone_id,omitempty"`
 	Priority       *string  `json:"priority,omitempty"`
 	Status         *string  `json:"status,omitempty"`
@@ -432,10 +440,11 @@ type ProjectTaskResponse struct {
 	Priority       string    `json:"priority"`
 	Status         string    `json:"status"`
 	DueDate        string    `json:"due_date,omitempty"`
-	EstimatedHours float64   `json:"estimated_hours"`
-	ActualHours    float64   `json:"actual_hours"`
-	NoteCount      int       `json:"note_count"`
-	CreatedAt      time.Time `json:"created_at"`
+	EstimatedHours float64        `json:"estimated_hours"`
+	ActualHours    float64        `json:"actual_hours"`
+	NoteCount      int            `json:"note_count"`
+	Assignees      []TaskAssignee `json:"assignees"`
+	CreatedAt      time.Time      `json:"created_at"`
 }
 
 // ToResponse converts ProjectTask to ProjectTaskResponse
