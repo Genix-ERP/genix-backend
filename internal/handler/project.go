@@ -685,9 +685,10 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 	paginate, page, pageSize, offset := optPagination(c)
 
 	query := `
-		SELECT id, tenant_id, project_id, parent_id, task_number, title, description,
+		SELECT id, tenant_id, project_id, parent_id, milestone_id, task_number, title, description,
 			   assignee_id, assignee_name, priority, status, due_date,
-			   estimated_hours, actual_hours, created_by, created_at, updated_at
+			   estimated_hours, actual_hours, created_by, created_at, updated_at,
+			   (SELECT COUNT(*) FROM project_task_notes ptn WHERE ptn.task_id = project_tasks.id) AS note_count
 		FROM project_tasks
 		WHERE project_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 		ORDER BY created_at DESC`
@@ -707,14 +708,14 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 	var tasks []*entity.ProjectTaskResponse
 	for rows.Next() {
 		var t entity.ProjectTask
-		var parentID, assigneeID, createdBy sql.NullString
+		var parentID, milestoneID, assigneeID, createdBy sql.NullString
 		var description, assigneeName sql.NullString
 		var dueDate, updatedAt sql.NullTime
 
 		err := rows.Scan(
-			&t.ID, &t.TenantID, &t.ProjectID, &parentID, &t.TaskNumber, &t.Title, &description,
+			&t.ID, &t.TenantID, &t.ProjectID, &parentID, &milestoneID, &t.TaskNumber, &t.Title, &description,
 			&assigneeID, &assigneeName, &t.Priority, &t.Status, &dueDate,
-			&t.EstimatedHours, &t.ActualHours, &createdBy, &t.CreatedAt, &updatedAt,
+			&t.EstimatedHours, &t.ActualHours, &createdBy, &t.CreatedAt, &updatedAt, &t.NoteCount,
 		)
 		if err != nil {
 			continue
@@ -726,6 +727,10 @@ func (h *Handler) ListProjectTasks(c *gin.Context) {
 		if parentID.Valid {
 			pid, _ := uuid.Parse(parentID.String)
 			t.ParentID = &pid
+		}
+		if milestoneID.Valid {
+			mid, _ := uuid.Parse(milestoneID.String)
+			t.MilestoneID = &mid
 		}
 		if assigneeID.Valid {
 			aid, _ := uuid.Parse(assigneeID.String)
@@ -806,13 +811,19 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 		INSERT INTO project_tasks (
 			id, tenant_id, project_id, task_number, title, description,
 			assignee_id, assignee_name, priority, status, due_date,
-			estimated_hours, actual_hours, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`
+			estimated_hours, actual_hours, created_by, created_at, updated_at, milestone_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`
 
 	var assigneeID *uuid.UUID
 	if input.AssigneeID != "" {
 		aid, _ := uuid.Parse(input.AssigneeID)
 		assigneeID = &aid
+	}
+
+	var milestoneID *uuid.UUID
+	if input.MilestoneID != "" {
+		mid, _ := uuid.Parse(input.MilestoneID)
+		milestoneID = &mid
 	}
 
 	var description, assigneeName *string
@@ -831,7 +842,7 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 	_, err = h.db.Exec(query,
 		taskID, tenantID, projectID, taskNumber, input.Title, description,
 		assigneeID, assigneeName, priority, "todo", dueDate,
-		input.EstimatedHours, 0.0, createdBy, now, now,
+		input.EstimatedHours, 0.0, createdBy, now, now, milestoneID,
 	)
 	if err != nil {
 		h.log.Error("Failed to create task", "error", err)
@@ -848,6 +859,7 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 		Description:    description,
 		AssigneeID:     assigneeID,
 		AssigneeName:   assigneeName,
+		MilestoneID:    milestoneID,
 		Priority:       priority,
 		Status:         "todo",
 		DueDate:        dueDate,
@@ -911,6 +923,16 @@ func (h *Handler) UpdateProjectTask(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("assignee_name = $%d", argCount))
 		args = append(args, *input.AssigneeName)
+	}
+	if input.MilestoneID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("milestone_id = $%d", argCount))
+		if *input.MilestoneID != "" {
+			mid, _ := uuid.Parse(*input.MilestoneID)
+			args = append(args, mid)
+		} else {
+			args = append(args, nil)
+		}
 	}
 	if input.Priority != nil {
 		argCount++

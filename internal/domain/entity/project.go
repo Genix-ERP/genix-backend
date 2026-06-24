@@ -45,6 +45,7 @@ type ProjectTask struct {
 	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
 	ProjectID      uuid.UUID    `json:"project_id" db:"project_id"`
 	ParentID       *uuid.UUID   `json:"parent_id,omitempty" db:"parent_id"`
+	MilestoneID    *uuid.UUID   `json:"milestone_id,omitempty" db:"milestone_id"`
 	TaskNumber     string       `json:"task_number" db:"task_number"`
 	Title          string       `json:"title" db:"title"`
 	Description    *string      `json:"description,omitempty" db:"description"`
@@ -58,6 +59,7 @@ type ProjectTask struct {
 	CreatedBy      *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
+	NoteCount      int          `json:"note_count" db:"note_count"`
 	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
 }
 
@@ -176,6 +178,7 @@ type CreateProjectTaskInput struct {
 	Description    string  `json:"description,omitempty"`
 	AssigneeID     string  `json:"assignee_id,omitempty"`
 	AssigneeName   string  `json:"assignee_name,omitempty"`
+	MilestoneID    string  `json:"milestone_id,omitempty"`
 	Priority       string  `json:"priority"`
 	DueDate        string  `json:"due_date,omitempty"`
 	EstimatedHours float64 `json:"estimated_hours"`
@@ -187,11 +190,88 @@ type UpdateProjectTaskInput struct {
 	Description    *string  `json:"description,omitempty"`
 	AssigneeID     *string  `json:"assignee_id,omitempty"`
 	AssigneeName   *string  `json:"assignee_name,omitempty"`
+	MilestoneID    *string  `json:"milestone_id,omitempty"`
 	Priority       *string  `json:"priority,omitempty"`
 	Status         *string  `json:"status,omitempty"`
 	DueDate        *string  `json:"due_date,omitempty"`
 	EstimatedHours *float64 `json:"estimated_hours,omitempty"`
 	ActualHours    *float64 `json:"actual_hours,omitempty"`
+}
+
+// ProjectTaskStage represents a kanban column / stage for a project's tasks
+type ProjectTaskStage struct {
+	ID        uuid.UUID `json:"id"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	ProjectID uuid.UUID `json:"project_id"`
+	StageKey  string    `json:"stage_key"`
+	Name      string    `json:"name"`
+	Color     string    `json:"color"`
+	Position  int       `json:"position"`
+	IsDefault bool      `json:"is_default"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// CreateProjectStageInput represents input for creating a task stage
+type CreateProjectStageInput struct {
+	Name  string `json:"name" binding:"required"`
+	Color string `json:"color,omitempty"`
+}
+
+// UpdateProjectStageInput represents input for updating a task stage
+type UpdateProjectStageInput struct {
+	Name     *string `json:"name,omitempty"`
+	Color    *string `json:"color,omitempty"`
+	Position *int    `json:"position,omitempty"`
+}
+
+// ProjectMilestoneSubstage represents a sub-step under a milestone
+type ProjectMilestoneSubstage struct {
+	ID          uuid.UUID `json:"id"`
+	TenantID    uuid.UUID `json:"tenant_id"`
+	ProjectID   uuid.UUID `json:"project_id"`
+	MilestoneID uuid.UUID `json:"milestone_id"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Status      string    `json:"status"`
+	DueDate     string    `json:"due_date,omitempty"`
+	Position    int       `json:"position"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// CreateSubstageInput represents input for creating a substage
+type CreateSubstageInput struct {
+	Title       string `json:"title" binding:"required"`
+	Description string `json:"description,omitempty"`
+	Status      string `json:"status,omitempty"`
+	DueDate     string `json:"due_date,omitempty"`
+}
+
+// UpdateSubstageInput represents input for updating a substage
+type UpdateSubstageInput struct {
+	Title       *string `json:"title,omitempty"`
+	Description *string `json:"description,omitempty"`
+	Status      *string `json:"status,omitempty"`
+	DueDate     *string `json:"due_date,omitempty"`
+}
+
+// ProjectTaskNote represents a note/comment left on a task
+type ProjectTaskNote struct {
+	ID            uuid.UUID  `json:"id"`
+	TenantID      uuid.UUID  `json:"tenant_id"`
+	ProjectID     uuid.UUID  `json:"project_id"`
+	TaskID        uuid.UUID  `json:"task_id"`
+	Note          string     `json:"note"`
+	CreatedBy     *uuid.UUID `json:"created_by,omitempty"`
+	CreatedByName string     `json:"created_by_name"`
+	CreatedAt     time.Time  `json:"created_at"`
+}
+
+// CreateTaskNoteInput represents input for creating a task note
+type CreateTaskNoteInput struct {
+	Note          string `json:"note" binding:"required"`
+	CreatedByName string `json:"created_by_name,omitempty"`
 }
 
 // CreateMilestoneInput represents input for creating a milestone
@@ -348,11 +428,13 @@ type ProjectTaskResponse struct {
 	Description    string    `json:"description,omitempty"`
 	AssigneeID     string    `json:"assignee_id,omitempty"`
 	AssigneeName   string    `json:"assignee_name,omitempty"`
+	MilestoneID    string    `json:"milestone_id,omitempty"`
 	Priority       string    `json:"priority"`
 	Status         string    `json:"status"`
 	DueDate        string    `json:"due_date,omitempty"`
 	EstimatedHours float64   `json:"estimated_hours"`
 	ActualHours    float64   `json:"actual_hours"`
+	NoteCount      int       `json:"note_count"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
@@ -367,6 +449,7 @@ func (t *ProjectTask) ToResponse() *ProjectTaskResponse {
 		Status:         t.Status,
 		EstimatedHours: t.EstimatedHours,
 		ActualHours:    t.ActualHours,
+		NoteCount:      t.NoteCount,
 		CreatedAt:      t.CreatedAt,
 	}
 
@@ -378,6 +461,9 @@ func (t *ProjectTask) ToResponse() *ProjectTaskResponse {
 	}
 	if t.AssigneeName != nil {
 		resp.AssigneeName = *t.AssigneeName
+	}
+	if t.MilestoneID != nil {
+		resp.MilestoneID = t.MilestoneID.String()
 	}
 	if t.DueDate != nil {
 		resp.DueDate = t.DueDate.Format("2006-01-02")

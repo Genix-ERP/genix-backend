@@ -1890,11 +1890,32 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		projects.PUT("/:id/tasks/:taskId", h.perm.Require("projects", "task", "update"), h.UpdateProjectTask)
 		projects.DELETE("/:id/tasks/:taskId", h.perm.Require("projects", "task", "delete"), h.DeleteProjectTask)
 
+		// Project Task Notes
+		projects.GET("/:id/tasks/:taskId/notes", h.ListTaskNotes)
+		projects.POST("/:id/tasks/:taskId/notes", h.perm.Require("projects", "task", "update"), h.CreateTaskNote)
+
+		// Project Task Stages (kanban columns)
+		projects.GET("/:id/stages", h.ListProjectStages)
+		projects.POST("/:id/stages", h.perm.Require("projects", "task", "create"), h.CreateProjectStage)
+		projects.PUT("/:id/stages/:stageId", h.perm.Require("projects", "task", "update"), h.UpdateProjectStage)
+		projects.DELETE("/:id/stages/:stageId", h.perm.Require("projects", "task", "delete"), h.DeleteProjectStage)
+
 		// Project Milestones
 		projects.GET("/:id/milestones", h.ListProjectMilestones)
 		projects.POST("/:id/milestones", h.perm.Require("projects", "milestone", "create"), h.CreateProjectMilestone)
 		projects.PUT("/:id/milestones/:milestoneId", h.perm.Require("projects", "milestone", "update"), h.UpdateProjectMilestone)
 		projects.DELETE("/:id/milestones/:milestoneId", h.perm.Require("projects", "milestone", "delete"), h.DeleteProjectMilestone)
+
+		// Milestone substages
+		projects.GET("/:id/milestones/:milestoneId/substages", h.ListMilestoneSubstages)
+		projects.POST("/:id/milestones/:milestoneId/substages", h.perm.Require("projects", "milestone", "create"), h.CreateMilestoneSubstage)
+		projects.PUT("/:id/milestones/:milestoneId/substages/:substageId", h.perm.Require("projects", "milestone", "update"), h.UpdateMilestoneSubstage)
+		projects.DELETE("/:id/milestones/:milestoneId/substages/:substageId", h.perm.Require("projects", "milestone", "delete"), h.DeleteMilestoneSubstage)
+
+		// Milestone attachments (files)
+		projects.GET("/:id/milestones/:milestoneId/attachments", h.ListMilestoneAttachments)
+		projects.POST("/:id/milestones/:milestoneId/attachments", h.perm.Require("projects", "milestone", "update"), h.UploadMilestoneAttachment)
+		projects.DELETE("/:id/milestones/:milestoneId/attachments/:attachmentId", h.perm.Require("projects", "milestone", "delete"), h.DeleteMilestoneAttachment)
 
 		// Time Entries
 		projects.GET("/:id/time-entries", h.ListTimeEntries)
