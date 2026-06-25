@@ -307,10 +307,15 @@ func (h *Handler) GetSplitOutputs(c *gin.Context) {
 	response.Success(c, result)
 }
 
-// calculateCostPerKg computes (BOM material cost + machine cost) / bulk_qty_kg.
-// bulk_qty_kg is the quantity_produced from the production order (in kg).
+// calculateCostPerKg computes the per-output-unit cost of the bulk product:
+// (BOM material cost + machine cost) / the BOM's own output quantity.
+// bom_lines quantities are defined per `product_boms.quantity` units of output,
+// so the per-unit cost is the BOM total divided by that output quantity — NOT by
+// the production order's quantity_produced. Dividing by quantity_produced (e.g.
+// 129) understated the per-unit cost ~100x. bulkQtyKg is retained for signature
+// compatibility but no longer used as the divisor.
 func (h *Handler) calculateCostPerKg(tenantID uuid.UUID, bomID *uuid.UUID, bulkQtyKg float64) float64 {
-	if bulkQtyKg <= 0 || bomID == nil {
+	if bomID == nil {
 		return 0
 	}
 
@@ -332,7 +337,14 @@ func (h *Handler) calculateCostPerKg(tenantID uuid.UUID, bomID *uuid.UUID, bulkQ
 		WHERE bo.bom_id = $1
 	`, bomID).Scan(&machineCost)
 
-	return (materialCost + machineCost) / bulkQtyKg
+	// Divide by the BOM output quantity (defaults to 1 if unset/zero).
+	var bomQty float64
+	h.db.QueryRow(`SELECT COALESCE(NULLIF(quantity, 0), 1) FROM product_boms WHERE id = $1`, bomID).Scan(&bomQty)
+	if bomQty <= 0 {
+		bomQty = 1
+	}
+
+	return (materialCost + machineCost) / bomQty
 }
 
 // receiveSplitProduct adds inventory for one packaged output product.
