@@ -1638,8 +1638,14 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	// Honor the requested limit (the UI asks for 500 to load all BOMs); only
+	// fall back to the default when missing/invalid, and cap at a high max.
+	// Previously >100 reset to 20, which silently hid newly-created BOMs.
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 1000 {
+		limit = 1000
 	}
 	offset := (page - 1) * limit
 
@@ -1720,7 +1726,7 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 		return
 	}
 
-	baseQuery += " ORDER BY b.code ASC"
+	baseQuery += " ORDER BY b.created_at DESC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
