@@ -382,13 +382,16 @@ func (h *Handler) receiveSplitProduct(
 		return
 	}
 
+	// Set to_warehouse_id so the movement is attributed to the receiving warehouse
+	// (otherwise it is invisible to warehouse-filtered movement history and shows
+	// a blank "To warehouse").
 	if _, txErr := tx.Exec(`
 		INSERT INTO inventory_transactions (
 			id, tenant_id, organization_id, inventory_id, transaction_type,
-			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reference_type, reference_id, to_warehouse_id, quantity, unit_cost, total_cost,
 			reason, notes, transaction_date, created_by, created_at
-		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'split_output','Packaged output from split production',$9,$10,$9)
-	`, uuid.New(), tenantID, organizationID, invID, poID, qty, unitCost, qty*unitCost, now, userID); txErr != nil {
+		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,$9,'split_output','Packaged output from split production',$10,$11,$10)
+	`, uuid.New(), tenantID, organizationID, invID, poID, warehouseID, qty, unitCost, qty*unitCost, now, userID); txErr != nil {
 		h.log.Error("receiveSplitProduct: insert transaction failed", "error", txErr)
 		return
 	}
@@ -456,14 +459,15 @@ func (h *Handler) consumeSplitMaterial(
 			"product_id", productID, "qty", qty)
 	}
 
-	// Create inventory transaction (issue) — always recorded for cost tracking
+	// Create inventory transaction (issue) — always recorded for cost tracking.
+	// Set from_warehouse_id so the issue shows in warehouse-filtered movement history.
 	if _, txErr := tx.Exec(`
 		INSERT INTO inventory_transactions (
 			id, tenant_id, organization_id, inventory_id, transaction_type,
-			reference_type, reference_id, quantity, unit_cost, total_cost,
+			reference_type, reference_id, from_warehouse_id, quantity, unit_cost, total_cost,
 			reason, notes, transaction_date, created_by, created_at
-		) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'split_material_consumption','Additional material consumed during split packaging',$9,$10,$9)
-	`, uuid.New(), tenantID, organizationID, invID, poID, qty, unitCost, qty*unitCost, now, userID); txErr != nil {
+		) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,$9,'split_material_consumption','Additional material consumed during split packaging',$10,$11,$10)
+	`, uuid.New(), tenantID, organizationID, invID, poID, warehouseID, qty, unitCost, qty*unitCost, now, userID); txErr != nil {
 		h.log.Error("consumeSplitMaterial: insert transaction failed", "error", txErr)
 		return
 	}
