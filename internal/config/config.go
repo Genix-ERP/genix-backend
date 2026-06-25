@@ -121,6 +121,8 @@ type AIConfig struct {
 	MaxTokens       int
 	Temperature     float64
 	Endpoint        string
+	TranscribeEndpoint string // optional override for speech-to-text URL
+	TranscribeModel    string // optional override (default whisper-1)
 	RequestTimeout  time.Duration
 	RateLimitPerMin int
 }
@@ -251,6 +253,8 @@ func Load() (*Config, error) {
 			MaxTokens:       getEnvAsInt("AI_MAX_TOKENS", 4096),
 			Temperature:     getEnvAsFloat("AI_TEMPERATURE", 0.7),
 			Endpoint:        getEnv("AI_ENDPOINT", ""),
+			TranscribeEndpoint: getEnv("AI_TRANSCRIBE_ENDPOINT", ""),
+			TranscribeModel:    getEnv("AI_TRANSCRIBE_MODEL", "whisper-1"),
 			RequestTimeout:  getEnvAsDuration("AI_REQUEST_TIMEOUT", 60*time.Second),
 			RateLimitPerMin: getEnvAsInt("AI_RATE_LIMIT_PER_MIN", 60),
 		},

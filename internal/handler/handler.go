@@ -1440,6 +1440,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		ai.GET("/capabilities", h.GetAICapabilities)
 		ai.POST("/chat", h.AIChat)
+		ai.POST("/transcribe", h.TranscribeAudio)
 		ai.GET("/conversations", h.ListAIConversations)
 		ai.POST("/conversations", h.CreateAIConversation)
 		ai.GET("/conversations/:id", h.GetAIConversation)
