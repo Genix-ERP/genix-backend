@@ -42,13 +42,16 @@ func (h *Handler) ListContracts(c *gin.Context) {
 	expiringSoon := c.Query("expiring_soon") == "true"
 
 	baseQuery := `
-		SELECT c.id, c.contract_number, c.title, c.vendor_id, v.name as vendor_name,
+		SELECT c.id, c.contract_number, c.title, c.party_type, c.vendor_id,
+			   COALESCE(v.name, c.vendor_name) as vendor_name, c.asset_id, fa.name as asset_name,
 			   c.contract_type, c.status, c.start_date, c.end_date, c.value,
 			   c.terms, c.description, c.auto_renewal, c.renewal_term_days, c.notes,
 			   CASE WHEN c.end_date IS NOT NULL THEN (c.end_date - CURRENT_DATE) ELSE 0 END as days_to_expiry,
+			   (SELECT COUNT(*) FROM attachments a WHERE a.tenant_id = c.tenant_id AND a.entity_type = 'contract' AND a.entity_id = c.id) as attachment_count,
 			   c.created_at, c.updated_at
 		FROM procurement_contracts c
 		LEFT JOIN contacts v ON c.vendor_id = v.id
+		LEFT JOIN fixed_assets fa ON c.asset_id = fa.id
 		WHERE c.tenant_id = $1 AND c.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM procurement_contracts c WHERE c.tenant_id = $1 AND c.deleted_at IS NULL`
@@ -116,17 +119,29 @@ func (h *Handler) ListContracts(c *gin.Context) {
 	for rows.Next() {
 		var contract entity.ContractResponse
 		var endDate sql.NullTime
-		var terms, description, notes sql.NullString
+		var terms, description, notes, assetName sql.NullString
+		var vendorIDNull, assetIDNull uuid.NullUUID
 
 		err := rows.Scan(
-			&contract.ID, &contract.ContractNumber, &contract.Title, &contract.VendorID, &contract.VendorName,
+			&contract.ID, &contract.ContractNumber, &contract.Title, &contract.PartyType, &vendorIDNull,
+			&contract.VendorName, &assetIDNull, &assetName,
 			&contract.ContractType, &contract.Status, &contract.StartDate, &endDate, &contract.Value,
 			&terms, &description, &contract.AutoRenewal, &contract.RenewalTermDays, &notes,
-			&contract.DaysToExpiry, &contract.CreatedAt, &contract.UpdatedAt,
+			&contract.DaysToExpiry, &contract.AttachmentCount, &contract.CreatedAt, &contract.UpdatedAt,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan contract", "error", err)
 			continue
+		}
+
+		if vendorIDNull.Valid {
+			contract.VendorID = &vendorIDNull.UUID
+		}
+		if assetIDNull.Valid {
+			contract.AssetID = &assetIDNull.UUID
+		}
+		if assetName.Valid {
+			contract.AssetName = assetName.String
 		}
 
 		if endDate.Valid {
@@ -168,23 +183,80 @@ func (h *Handler) CreateContract(c *gin.Context) {
 		return
 	}
 
-	vendorID, err := uuid.Parse(input.VendorID)
-	if err != nil {
-		response.BadRequest(c, "Invalid vendor ID")
-		return
+	// Resolve the counterparty based on the contract's party type.
+	partyType := input.PartyType
+	if partyType == "" {
+		partyType = "vendor"
 	}
 
-	// Verify vendor exists
+	var vendorID, assetID *uuid.UUID
 	var vendorName string
-	err = h.db.QueryRow("SELECT name FROM contacts WHERE id = $1 AND tenant_id = $2 AND type IN ('vendor', 'both') AND deleted_at IS NULL", vendorID, tenantID).Scan(&vendorName)
-	if err == sql.ErrNoRows {
-		response.NotFound(c, "Vendor")
-		return
-	}
-	if err != nil {
-		h.log.Error("Failed to verify vendor", "error", err)
-		response.InternalError(c, "Failed to create contract")
-		return
+	var err error
+
+	if partyType == "lease" {
+		// Lease contracts are tied to a fixed asset; the contact (lessor) is optional.
+		if input.AssetID == "" {
+			response.BadRequest(c, "asset_id is required for a lease contract")
+			return
+		}
+		aid, perr := uuid.Parse(input.AssetID)
+		if perr != nil {
+			response.BadRequest(c, "Invalid asset ID")
+			return
+		}
+		var assetName string
+		err = h.db.QueryRow("SELECT name FROM fixed_assets WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", aid, tenantID).Scan(&assetName)
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Asset")
+			return
+		}
+		if err != nil {
+			h.log.Error("Failed to verify asset", "error", err)
+			response.InternalError(c, "Failed to create contract")
+			return
+		}
+		assetID = &aid
+		vendorName = assetName
+		// Optional lessor contact
+		if input.VendorID != "" {
+			if vid, perr := uuid.Parse(input.VendorID); perr == nil {
+				var n string
+				if h.db.QueryRow("SELECT name FROM contacts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", vid, tenantID).Scan(&n) == nil {
+					vendorID = &vid
+					vendorName = n
+				}
+			}
+		}
+	} else {
+		// customer / vendor / partner all link to a contact.
+		if input.VendorID == "" {
+			response.BadRequest(c, "A counterparty is required")
+			return
+		}
+		vid, perr := uuid.Parse(input.VendorID)
+		if perr != nil {
+			response.BadRequest(c, "Invalid counterparty ID")
+			return
+		}
+		// Restrict by contact type where it matters; partner accepts any contact.
+		typeFilter := ""
+		switch partyType {
+		case "customer":
+			typeFilter = " AND type IN ('customer', 'both')"
+		case "vendor":
+			typeFilter = " AND type IN ('vendor', 'both')"
+		}
+		err = h.db.QueryRow("SELECT name FROM contacts WHERE id = $1 AND tenant_id = $2"+typeFilter+" AND deleted_at IS NULL", vid, tenantID).Scan(&vendorName)
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Counterparty")
+			return
+		}
+		if err != nil {
+			h.log.Error("Failed to verify counterparty", "error", err)
+			response.InternalError(c, "Failed to create contract")
+			return
+		}
+		vendorID = &vid
 	}
 
 	id := uuid.New()
@@ -238,14 +310,14 @@ func (h *Handler) CreateContract(c *gin.Context) {
 
 	query := `
 		INSERT INTO procurement_contracts (
-			id, tenant_id, organization_id, contract_number, title, vendor_id, vendor_name, contract_type, status,
+			id, tenant_id, organization_id, contract_number, title, party_type, vendor_id, asset_id, vendor_name, contract_type, status,
 			start_date, end_date, value, currency_id, terms, description,
 			auto_renewal, renewal_term_days, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 	`
 
 	_, err = h.db.Exec(query,
-		id, tenantID, orgIDPtr, contractNumber, input.Title, vendorID, vendorName, input.ContractType, entity.ContractStatusDraft,
+		id, tenantID, orgIDPtr, contractNumber, input.Title, partyType, vendorID, assetID, vendorName, input.ContractType, entity.ContractStatusDraft,
 		startDate, endDate, input.Value, currencyID, terms, description,
 		input.AutoRenewal, input.RenewalTermDays, notes, userID, now, now,
 	)
@@ -265,7 +337,9 @@ func (h *Handler) CreateContract(c *gin.Context) {
 		ID:              id,
 		ContractNumber:  contractNumber,
 		Title:           input.Title,
+		PartyType:       partyType,
 		VendorID:        vendorID,
+		AssetID:         assetID,
 		VendorName:      vendorName,
 		ContractType:    entity.ContractType(input.ContractType),
 		Status:          entity.ContractStatusDraft,
@@ -301,26 +375,40 @@ func (h *Handler) GetContract(c *gin.Context) {
 	}
 
 	query := `
-		SELECT c.id, c.contract_number, c.title, c.vendor_id, v.name as vendor_name,
+		SELECT c.id, c.contract_number, c.title, c.party_type, c.vendor_id,
+			   COALESCE(v.name, c.vendor_name) as vendor_name, c.asset_id, fa.name as asset_name,
 			   c.contract_type, c.status, c.start_date, c.end_date, c.value,
 			   c.terms, c.description, c.auto_renewal, c.renewal_term_days, c.notes,
 			   CASE WHEN c.end_date IS NOT NULL THEN (c.end_date - CURRENT_DATE) ELSE 0 END as days_to_expiry,
 			   c.created_at, c.updated_at
 		FROM procurement_contracts c
 		LEFT JOIN contacts v ON c.vendor_id = v.id
+		LEFT JOIN fixed_assets fa ON c.asset_id = fa.id
 		WHERE c.id = $1 AND c.tenant_id = $2 AND c.deleted_at IS NULL
 	`
 
 	var contract entity.ContractResponse
 	var endDate sql.NullTime
-	var terms, description, notes sql.NullString
+	var terms, description, notes, assetName sql.NullString
+	var vendorIDNull, assetIDNull uuid.NullUUID
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
-		&contract.ID, &contract.ContractNumber, &contract.Title, &contract.VendorID, &contract.VendorName,
+		&contract.ID, &contract.ContractNumber, &contract.Title, &contract.PartyType, &vendorIDNull,
+		&contract.VendorName, &assetIDNull, &assetName,
 		&contract.ContractType, &contract.Status, &contract.StartDate, &endDate, &contract.Value,
 		&terms, &description, &contract.AutoRenewal, &contract.RenewalTermDays, &notes,
 		&contract.DaysToExpiry, &contract.CreatedAt, &contract.UpdatedAt,
 	)
+
+	if vendorIDNull.Valid {
+		contract.VendorID = &vendorIDNull.UUID
+	}
+	if assetIDNull.Valid {
+		contract.AssetID = &assetIDNull.UUID
+	}
+	if assetName.Valid {
+		contract.AssetName = assetName.String
+	}
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Contract")
@@ -392,6 +480,55 @@ func (h *Handler) UpdateContract(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("contract_type = $%d", argCount))
 		args = append(args, *input.ContractType)
+	}
+	if input.PartyType != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("party_type = $%d", argCount))
+		args = append(args, *input.PartyType)
+	}
+	// Change the counterparty contact (customer/vendor/partner) and refresh the
+	// cached name; switching to a contact clears any asset link.
+	if input.VendorID != nil {
+		if *input.VendorID == "" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("vendor_id = $%d", argCount))
+			args = append(args, nil)
+		} else if vid, perr := uuid.Parse(*input.VendorID); perr == nil {
+			var n string
+			if h.db.QueryRow("SELECT name FROM contacts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", vid, tenantID).Scan(&n) == nil {
+				argCount++
+				updates = append(updates, fmt.Sprintf("vendor_id = $%d", argCount))
+				args = append(args, vid)
+				argCount++
+				updates = append(updates, fmt.Sprintf("vendor_name = $%d", argCount))
+				args = append(args, n)
+				argCount++
+				updates = append(updates, fmt.Sprintf("asset_id = $%d", argCount))
+				args = append(args, nil)
+			}
+		}
+	}
+	// Change the leased asset and refresh the cached name; switching to an asset
+	// clears any contact link.
+	if input.AssetID != nil {
+		if *input.AssetID == "" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("asset_id = $%d", argCount))
+			args = append(args, nil)
+		} else if aid, perr := uuid.Parse(*input.AssetID); perr == nil {
+			var n string
+			if h.db.QueryRow("SELECT name FROM fixed_assets WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", aid, tenantID).Scan(&n) == nil {
+				argCount++
+				updates = append(updates, fmt.Sprintf("asset_id = $%d", argCount))
+				args = append(args, aid)
+				argCount++
+				updates = append(updates, fmt.Sprintf("vendor_name = $%d", argCount))
+				args = append(args, n)
+				argCount++
+				updates = append(updates, fmt.Sprintf("vendor_id = $%d", argCount))
+				args = append(args, nil)
+			}
+		}
 	}
 	if input.EndDate != nil {
 		if ed, err := time.Parse("2006-01-02", *input.EndDate); err == nil {

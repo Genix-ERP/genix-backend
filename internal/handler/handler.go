@@ -852,6 +852,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		contracts.DELETE("/:id", h.perm.Require("purchase", "contract", "delete"), h.DeleteContract)
 		contracts.POST("/:id/activate", h.perm.Require("purchase", "contract", "update"), h.ActivateContract)
 		contracts.POST("/:id/terminate", h.perm.Require("purchase", "contract", "update"), h.TerminateContract)
+		// Contract documents (attachments)
+		contracts.GET("/:id/attachments", h.ListContractAttachments)
+		contracts.POST("/:id/attachments", h.perm.Require("purchase", "contract", "update"), h.UploadContractAttachment)
+		contracts.DELETE("/:id/attachments/:attachmentId", h.perm.Require("purchase", "contract", "delete"), h.DeleteContractAttachment)
 	}
 
 	// Supplier Price History

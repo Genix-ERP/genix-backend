@@ -882,6 +882,15 @@ func (h *Handler) CreateProjectTask(c *gin.Context) {
 			uuid.New(), tenantID, taskID, eid, a.EmployeeName, now)
 	}
 
+	// Workflow: notify assignees a task was assigned to them
+	if len(assigneeSet) > 0 {
+		ids := make([]string, 0, len(assigneeSet))
+		for _, a := range assigneeSet {
+			ids = append(ids, a.EmployeeID)
+		}
+		h.fireProjectTaskAssigned(tenantID, projectID, taskID, input.Title, ids)
+	}
+
 	task := &entity.ProjectTask{
 		ID:             taskID,
 		TenantID:       tenantID,
@@ -930,6 +939,11 @@ func (h *Handler) UpdateProjectTask(c *gin.Context) {
 		response.BadRequest(c, "Invalid input")
 		return
 	}
+
+	// Capture current status/title/project for workflow events
+	var oldStatus, oldTitle string
+	var wfProjectID uuid.UUID
+	h.db.QueryRow(`SELECT status, title, project_id FROM project_tasks WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, taskID, tenantID).Scan(&oldStatus, &oldTitle, &wfProjectID)
 
 	// Build dynamic update query
 	updates := []string{}
@@ -1063,6 +1077,26 @@ func (h *Handler) UpdateProjectTask(c *gin.Context) {
 					VALUES ($1, $2, $3, $4, $5, NOW()) ON CONFLICT (task_id, employee_id) DO NOTHING`,
 					uuid.New(), tenantID, taskID, eid, a.EmployeeName)
 			}
+		}
+	}
+
+	// Workflow events
+	wfTitle := oldTitle
+	if input.Title != nil && *input.Title != "" {
+		wfTitle = *input.Title
+	}
+	if wfProjectID != uuid.Nil {
+		// Status changed
+		if input.Status != nil && *input.Status != oldStatus {
+			h.fireProjectTaskStatusChanged(tenantID, wfProjectID, taskID, wfTitle, *input.Status, h.taskAssigneeEmployeeIDs(tenantID, taskID))
+		}
+		// (Re)assigned
+		if input.Assignees != nil && len(input.Assignees) > 0 {
+			ids := make([]string, 0, len(input.Assignees))
+			for _, a := range input.Assignees {
+				ids = append(ids, a.EmployeeID)
+			}
+			h.fireProjectTaskAssigned(tenantID, wfProjectID, taskID, wfTitle, ids)
 		}
 	}
 
@@ -1256,6 +1290,11 @@ func (h *Handler) UpdateProjectMilestone(c *gin.Context) {
 		return
 	}
 
+	// Capture current status so we only fire the "milestone completed" event on
+	// an actual transition into 'completed' (not on every save of a done one).
+	var oldMilestoneStatus string
+	h.db.QueryRow(`SELECT status FROM project_milestones WHERE id = $1 AND tenant_id = $2`, milestoneID, tenantID).Scan(&oldMilestoneStatus)
+
 	// Build update query
 	updates := []string{}
 	args := []interface{}{}
@@ -1318,6 +1357,15 @@ func (h *Handler) UpdateProjectMilestone(c *gin.Context) {
 	if rowsAffected == 0 {
 		response.NotFound(c, "Milestone")
 		return
+	}
+
+	// Workflow event: milestone completed — only on transition into 'completed'
+	if input.Status != nil && *input.Status == "completed" && oldMilestoneStatus != "completed" {
+		var wfProjectID uuid.UUID
+		var wfTitle string
+		if err := h.db.QueryRow(`SELECT project_id, title FROM project_milestones WHERE id = $1 AND tenant_id = $2`, milestoneID, tenantID).Scan(&wfProjectID, &wfTitle); err == nil && wfProjectID != uuid.Nil {
+			h.fireProjectMilestoneCompleted(tenantID, wfProjectID, milestoneID, wfTitle)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Milestone updated successfully"})

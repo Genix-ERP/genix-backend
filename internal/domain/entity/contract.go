@@ -34,7 +34,9 @@ type Contract struct {
 	TenantID        uuid.UUID       `json:"tenant_id" db:"tenant_id"`
 	ContractNumber  string          `json:"contract_number" db:"contract_number"`
 	Title           string          `json:"title" db:"title"`
-	VendorID        uuid.UUID       `json:"vendor_id" db:"vendor_id"`
+	PartyType       string          `json:"party_type" db:"party_type"`
+	VendorID        *uuid.UUID      `json:"vendor_id,omitempty" db:"vendor_id"`
+	AssetID         *uuid.UUID      `json:"asset_id,omitempty" db:"asset_id"`
 	ContractType    ContractType    `json:"contract_type" db:"contract_type"`
 	Status          ContractStatus  `json:"status" db:"status"`
 	StartDate       time.Time       `json:"start_date" db:"start_date"`
@@ -55,13 +57,16 @@ type Contract struct {
 
 	// Computed
 	VendorName   string `json:"vendor_name,omitempty"`
+	AssetName    string `json:"asset_name,omitempty"`
 	DaysToExpiry int    `json:"days_to_expiry,omitempty"`
 }
 
 // CreateContractInput represents input for creating a contract
 type CreateContractInput struct {
 	Title           string  `json:"title" binding:"required"`
-	VendorID        string  `json:"vendor_id" binding:"required"`
+	PartyType       string  `json:"party_type,omitempty"` // customer, vendor, partner, lease (default vendor)
+	VendorID        string  `json:"vendor_id,omitempty"`  // counterparty contact (customer/vendor/partner; optional lessor for lease)
+	AssetID         string  `json:"asset_id,omitempty"`   // required for lease
 	ContractType    string  `json:"contract_type" binding:"required"`
 	StartDate       string  `json:"start_date" binding:"required"`
 	EndDate         string  `json:"end_date,omitempty"`
@@ -77,6 +82,9 @@ type CreateContractInput struct {
 // UpdateContractInput represents input for updating a contract
 type UpdateContractInput struct {
 	Title           *string  `json:"title,omitempty"`
+	PartyType       *string  `json:"party_type,omitempty"`
+	VendorID        *string  `json:"vendor_id,omitempty"`
+	AssetID         *string  `json:"asset_id,omitempty"`
 	ContractType    *string  `json:"contract_type,omitempty"`
 	EndDate         *string  `json:"end_date,omitempty"`
 	Value           *float64 `json:"value,omitempty"`
@@ -102,8 +110,11 @@ type ContractResponse struct {
 	ID              uuid.UUID      `json:"id"`
 	ContractNumber  string         `json:"contract_number"`
 	Title           string         `json:"title"`
-	VendorID        uuid.UUID      `json:"vendor_id"`
+	PartyType       string         `json:"party_type"`
+	VendorID        *uuid.UUID     `json:"vendor_id,omitempty"`
 	VendorName      string         `json:"vendor_name"`
+	AssetID         *uuid.UUID     `json:"asset_id,omitempty"`
+	AssetName       string         `json:"asset_name,omitempty"`
 	ContractType    ContractType   `json:"contract_type"`
 	Status          ContractStatus `json:"status"`
 	StartDate       time.Time      `json:"start_date"`
@@ -115,6 +126,7 @@ type ContractResponse struct {
 	RenewalTermDays int            `json:"renewal_term_days"`
 	Notes           *string        `json:"notes,omitempty"`
 	DaysToExpiry    int            `json:"days_to_expiry"`
+	AttachmentCount int            `json:"attachment_count"`
 	CreatedAt       time.Time      `json:"created_at"`
 	UpdatedAt       time.Time      `json:"updated_at"`
 }

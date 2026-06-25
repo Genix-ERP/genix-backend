@@ -600,26 +600,89 @@ func (h *Handler) executeAction(tenantID uuid.UUID, action WorkflowAction, trigg
 		return h.actionUpdateStatus(tenantID, action.Config, triggerData)
 	case "create_record":
 		return h.actionCreateRecord(tenantID, action.Config, triggerData)
+	case "update_task_priority":
+		return h.actionUpdateTaskPriority(tenantID, action.Config, triggerData)
+	case "create_followup_task":
+		return h.actionCreateFollowupTask(tenantID, action.Config, triggerData)
 	default:
 		return "", fmt.Errorf("unknown action type: %s", action.Type)
 	}
 }
 
-// actionCreateNotification inserts a notification for users
+// actionCreateNotification inserts in-app notifications for the resolved recipients.
+// Recipients come from data["notify_user_ids"] (array) or config["user_id"].
 func (h *Handler) actionCreateNotification(tenantID uuid.UUID, config map[string]interface{}, data map[string]interface{}) (string, error) {
+	tmpl := func(s string) string {
+		for key, val := range data {
+			s = strings.ReplaceAll(s, "{"+key+"}", fmt.Sprintf("%v", val))
+		}
+		return s
+	}
+
 	message, _ := config["message"].(string)
 	if message == "" {
 		message = "Workflow notification triggered"
 	}
+	message = tmpl(message)
 
-	// Replace placeholders in message like {product_name}
-	for key, val := range data {
-		message = strings.ReplaceAll(message, "{"+key+"}", fmt.Sprintf("%v", val))
+	title, _ := config["title"].(string)
+	if title == "" {
+		title = "Bildirishnoma"
+	}
+	title = tmpl(title)
+
+	notifType, _ := config["type"].(string)
+	if notifType == "" {
+		notifType = "workflow"
 	}
 
-	// Store as a workflow log notification (can be extended to a notifications table later)
-	h.log.Info("Workflow notification", "tenant", tenantID, "message", message)
-	return "Notification: " + message, nil
+	priority, _ := config["priority"].(string)
+	if priority == "" {
+		priority = "normal"
+	}
+
+	// Resolve recipient user ids
+	recipients := map[string]bool{}
+	if list, ok := data["notify_user_ids"].([]string); ok {
+		for _, id := range list {
+			if id != "" {
+				recipients[id] = true
+			}
+		}
+	}
+	if list, ok := data["notify_user_ids"].([]interface{}); ok {
+		for _, v := range list {
+			if s := fmt.Sprintf("%v", v); s != "" && s != "<nil>" {
+				recipients[s] = true
+			}
+		}
+	}
+	if uid, ok := config["user_id"].(string); ok && uid != "" {
+		recipients[uid] = true
+	}
+
+	if len(recipients) == 0 {
+		h.log.Info("Workflow notification (no recipients)", "tenant", tenantID, "message", message)
+		return "Notification (no recipients): " + message, nil
+	}
+
+	dataJSON, _ := json.Marshal(data)
+	now := time.Now()
+	count := 0
+	for uid := range recipients {
+		userID, err := uuid.Parse(uid)
+		if err != nil {
+			continue
+		}
+		_, err = h.db.Exec(`
+			INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', $8, $9)`,
+			uuid.New(), tenantID, userID, notifType, title, message, string(dataJSON), priority, now)
+		if err == nil {
+			count++
+		}
+	}
+	return fmt.Sprintf("Notified %d user(s): %s", count, message), nil
 }
 
 // actionUpdateStatus updates a record's status field
@@ -803,6 +866,7 @@ func (h *Handler) RunWorkflowScheduler(ctx context.Context, interval time.Durati
 				h.log.Debug("Running workflow threshold checks")
 				h.CheckThresholdRules()
 				h.autoRunReplenishment()
+				h.CheckProjectWorkflows()
 			case <-ctx.Done():
 				h.log.Info("Workflow scheduler stopped")
 				return

@@ -63,14 +63,23 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 		SELECT po.id, po.order_number, po.vendor_id, c.name as vendor_name,
 			   po.order_date, po.expected_date, po.subtotal, po.discount_amount,
 			   po.tax_amount, po.shipping_amount, po.total_amount, po.status,
-			   po.payment_status, po.payment_terms, po.vendor_reference, po.notes,
+			   (SELECT CASE
+			        WHEN COUNT(*) = 0 THEN po.payment_status
+			        WHEN SUM(pi.total_amount) > 0 AND SUM(pi.amount_paid) >= SUM(pi.total_amount) THEN 'paid'
+			        WHEN SUM(pi.amount_paid) > 0 THEN 'partial'
+			        ELSE 'unpaid'
+			    END
+			    FROM purchase_invoices pi
+			    WHERE pi.purchase_order_id = po.id AND pi.deleted_at IS NULL) AS payment_status,
+			   po.payment_terms, po.vendor_reference, po.notes,
 			   po.vehicle_number, po.requires_shipping,
-			   po.approved_at, po.created_at, po.updated_at
+			   po.approved_at, po.created_at, po.updated_at,
+			   (SELECT COALESCE(SUM(pol.quantity), 0) FROM purchase_order_lines pol WHERE pol.purchase_order_id = po.id) AS total_quantity
 		FROM purchase_orders po
 		LEFT JOIN contacts c ON po.vendor_id = c.id
 		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
 	`
-	countQuery := `SELECT COUNT(*) FROM purchase_orders po WHERE po.tenant_id = $1 AND po.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM purchase_orders po LEFT JOIN contacts c ON po.vendor_id = c.id WHERE po.tenant_id = $1 AND po.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -119,7 +128,15 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 
 	if search != "" {
 		argCount++
-		searchFilter := fmt.Sprintf(" AND (po.order_number ILIKE $%d OR c.name ILIKE $%d OR po.vendor_reference ILIKE $%d)", argCount, argCount, argCount)
+		// Match PO number, vendor name, vendor reference, OR any product on
+		// the order's lines (by product name or the line description).
+		searchFilter := fmt.Sprintf(` AND (po.order_number ILIKE $%d OR c.name ILIKE $%d OR po.vendor_reference ILIKE $%d
+			OR EXISTS (
+				SELECT 1 FROM purchase_order_lines pol
+				LEFT JOIN products p ON p.id = pol.product_id
+				WHERE pol.purchase_order_id = po.id
+				  AND (p.name ILIKE $%d OR pol.description ILIKE $%d)
+			))`, argCount, argCount, argCount, argCount, argCount)
 		baseQuery += searchFilter
 		countQuery += searchFilter
 		args = append(args, "%"+search+"%")
@@ -163,7 +180,7 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 			&po.TaxAmount, &po.ShippingAmount, &po.TotalAmount, &po.Status,
 			&po.PaymentStatus, &paymentTerms, &vendorReference, &notes,
 			&vehicleNumberList, &po.RequiresShipping,
-			&approvedAt, &po.CreatedAt, &po.UpdatedAt,
+			&approvedAt, &po.CreatedAt, &po.UpdatedAt, &po.TotalQuantity,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan purchase order", "error", err)
@@ -2670,12 +2687,17 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			// even on tenants where the trigger from migration 393
 			// hasn't been applied yet.
 			for inputAcct, amount := range inputGrouped {
+				// NOTE: do NOT tag the inventory/expense debit line with the
+				// vendor's contact_id — only the AP control account (credit)
+				// carries the partner. Tagging this line polluted the vendor
+				// subledger so the partner reconciliation (akt sverka) saw an
+				// offsetting debit and showed unpaid bills as "paid".
 				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, contact_id, warehouse_id, description,
+						id, journal_entry_id, line_number, account_id, warehouse_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-					uuid.New(), jeID, jeLineNumber, inputAcct, vendorID, billWarehouseID, "Stock Interim Receipt",
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					uuid.New(), jeID, jeLineNumber, inputAcct, billWarehouseID, "Stock Interim Receipt",
 					amount, 0.0, 1.0, now,
 				); err != nil {
 					h.log.Error("CreateBillFromPO: failed to insert JE debit line", "error", err, "account", inputAcct, "warehouse", billWarehouseID)

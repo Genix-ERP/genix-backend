@@ -335,6 +335,9 @@ func (h *Handler) Register(c *gin.Context) {
 	// Seed default units of measure
 	h.seedDefaultUnitsOfMeasure(tx, tenantID)
 
+	// Seed built-in project workflow automation rules
+	h.seedDefaultProjectWorkflowRules(tx, tenantID)
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
@@ -2071,6 +2074,9 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 	// Seed default units of measure
 	h.seedDefaultUnitsOfMeasure(tx, tenantID)
 
+	// Seed built-in project workflow automation rules
+	h.seedDefaultProjectWorkflowRules(tx, tenantID)
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
@@ -2508,6 +2514,9 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 	// Seed default units of measure
 	h.seedDefaultUnitsOfMeasure(tx, tenantID)
 
+	// Seed built-in project workflow automation rules
+	h.seedDefaultProjectWorkflowRules(tx, tenantID)
+
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
 		response.InternalServerError(c, "")
@@ -2626,6 +2635,59 @@ func (h *Handler) seedDefaultUnitsOfMeasure(tx *sql.Tx, tenantID uuid.UUID) {
 		`, uuid.New(), tenantID, u.code, u.name, u.category, u.factor)
 		if err != nil {
 			h.log.Error("Failed to seed UoM", "error", err, "code", u.code)
+		}
+	}
+}
+
+// seedDefaultProjectWorkflowRules creates the built-in project automation rules
+// for a new tenant. Mirrors migration 440 so tenants created after the migration
+// ran still get the defaults. Idempotent via the trigger_event guard.
+func (h *Handler) seedDefaultProjectWorkflowRules(tx *sql.Tx, tenantID uuid.UUID) {
+	rules := []struct {
+		name, description, triggerType, event, actions string
+	}{
+		{
+			"Vazifa biriktirilganda bildirishnoma",
+			"Loyiha vazifasi xodimga biriktirilganda unga bildirishnoma yuboriladi",
+			"event", "project.task.assigned",
+			`[{"type":"create_notification","config":{"type":"project_task_assigned","priority":"normal","title":"Yangi vazifa biriktirildi","message":"Sizga \"{task_title}\" vazifasi biriktirildi"}}]`,
+		},
+		{
+			"Vazifa muddati o‘tganda bildirishnoma",
+			"Vazifaning bajarilish muddati o‘tib ketganda mas’ul xodimga ogohlantirish yuboriladi",
+			"scheduled", "project.task.overdue",
+			`[{"type":"create_notification","config":{"type":"project_task_overdue","priority":"high","title":"Vazifa muddati o‘tib ketdi","message":"\"{task_title}\" vazifasi muddatidan kechikdi ({due_date})"}},{"type":"update_task_priority","config":{"priority":"high"}}]`,
+		},
+		{
+			"Vazifa holati o‘zgarganda bildirishnoma",
+			"Loyiha vazifasi holati o‘zgartirilganda mas’ul xodimlarga bildirishnoma yuboriladi",
+			"event", "project.task.status_changed",
+			`[{"type":"create_notification","config":{"type":"project_task_status_changed","priority":"normal","title":"Vazifa holati yangilandi","message":"\"{task_title}\" vazifasi holati: {new_status}"}}]`,
+		},
+		{
+			"Bosqich yakunlanganda bildirishnoma",
+			"Loyiha bosqichi yakunlanganda loyiha rahbariga bildirishnoma yuboriladi",
+			"event", "project.milestone.completed",
+			`[{"type":"create_notification","config":{"type":"project_milestone_completed","priority":"normal","title":"Bosqich yakunlandi","message":"\"{milestone_title}\" bosqichi yakunlandi"}},{"type":"create_followup_task","config":{"title":"{milestone_title} — keyingi qadamlar"}}]`,
+		},
+		{
+			"Loyiha byudjetdan oshganda bildirishnoma",
+			"Loyiha xarajatlari byudjetdan oshib ketganda loyiha rahbariga ogohlantirish yuboriladi",
+			"threshold", "project.over_budget",
+			`[{"type":"create_notification","config":{"type":"project_over_budget","priority":"high","title":"Byudjet oshib ketdi","message":"\"{project_name}\" loyihasi byudjetdan oshdi (sarflangan: {spent} / byudjet: {budget})"}}]`,
+		},
+	}
+	for _, r := range rules {
+		_, err := tx.Exec(`
+			INSERT INTO workflow_rules (id, tenant_id, name, description, category, trigger_type, trigger_event, conditions, actions, is_active, priority, created_at, updated_at)
+			SELECT $1, $2, $3, $4, 'project', $5, $6, '{}'::jsonb, $7::jsonb, true, 0, NOW(), NOW()
+			WHERE NOT EXISTS (
+				SELECT 1 FROM workflow_rules wr
+				WHERE wr.tenant_id = $2 AND wr.trigger_event = $6 AND wr.deleted_at IS NULL
+			)
+		`, uuid.New(), tenantID, r.name, r.description, r.triggerType, r.event, r.actions)
+		if err != nil {
+			h.log.Error("Failed to seed project workflow rule", "error", err, "event", r.event)
 		}
 	}
 }

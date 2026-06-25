@@ -191,6 +191,7 @@ type PurchaseOrderResponse struct {
 	VehicleNumber    *string             `json:"vehicle_number,omitempty"`
 	RequiresShipping bool                `json:"requires_shipping"`
 	Lines            []PurchaseOrderLine `json:"lines,omitempty"`
+	TotalQuantity   float64             `json:"total_quantity"`
 	ApprovedAt       *time.Time          `json:"approved_at,omitempty"`
 	CreatedAt       time.Time           `json:"created_at"`
 	UpdatedAt       time.Time           `json:"updated_at"`

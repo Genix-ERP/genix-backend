@@ -54,12 +54,22 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		SELECT so.id, so.tenant_id, so.organization_id, so.order_number, so.customer_id, so.contact_person_id,
 			   so.order_date, so.expected_date, so.billing_address, so.shipping_address,
 			   so.currency_id, so.exchange_rate, so.subtotal, so.discount_type, so.discount_value, so.discount_amount,
-			   so.tax_amount, so.shipping_amount, so.total_amount, so.status, so.payment_status, so.payment_terms,
+			   so.tax_amount, so.shipping_amount, so.total_amount, so.status,
+			   (SELECT CASE
+			        WHEN COUNT(*) = 0 THEN so.payment_status
+			        WHEN SUM(si.total_amount) > 0 AND SUM(si.amount_paid) >= SUM(si.total_amount) THEN 'paid'
+			        WHEN SUM(si.amount_paid) > 0 THEN 'partial'
+			        ELSE 'unpaid'
+			    END
+			    FROM sales_invoices si
+			    WHERE si.sales_order_id = so.id AND si.deleted_at IS NULL AND si.status != 'cancelled') AS payment_status,
+			   so.payment_terms,
 			   so.payment_term_id,
 			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.vehicle_number, so.sales_rep_id,
 			   so.approved_by, so.approved_at, so.created_by, so.created_at, so.updated_at,
 			   COALESCE(c.name, '') as customer_name,
-			   EXISTS(SELECT 1 FROM sales_invoices si WHERE si.sales_order_id = so.id AND si.tenant_id = so.tenant_id AND si.deleted_at IS NULL AND si.status != 'cancelled') as has_invoice
+			   EXISTS(SELECT 1 FROM sales_invoices si WHERE si.sales_order_id = so.id AND si.tenant_id = so.tenant_id AND si.deleted_at IS NULL AND si.status != 'cancelled') as has_invoice,
+			   (SELECT COALESCE(SUM(sol.quantity), 0) FROM sales_order_lines sol WHERE sol.sales_order_id = so.id) as total_quantity
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL`
@@ -165,6 +175,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 		var paymentTermID sql.NullString
 		var createdAt, updatedAt time.Time
 		var hasInvoice bool
+		var totalQuantity float64
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &orderNumber, &customerID, &contactPersonID,
@@ -174,7 +185,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			&paymentTermID,
 			&reference, &poNumber, &notes, &internalNotes, &warehouseID, &vehicleNumber, &salesRepID,
 			&approvedBy, &approvedAt, &createdBy, &createdAt, &updatedAt,
-			&customerName, &hasInvoice,
+			&customerName, &hasInvoice, &totalQuantity,
 		)
 		if err != nil {
 			continue
@@ -198,6 +209,7 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 			"payment_status":  paymentStatus.String,
 			"payment_terms":   paymentTerms,
 			"has_invoice":     hasInvoice,
+			"total_quantity":  totalQuantity,
 			"created_at":      createdAt,
 			"updated_at":      updatedAt,
 		}

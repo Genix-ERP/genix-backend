@@ -264,6 +264,16 @@ CRITICAL LANGUAGE RULE:
 		}
 		if businessData, ok := context["business_data"].(map[string]interface{}); ok && businessData != nil {
 			prompt += "\n- Real business data is available in context - use it for accurate analysis"
+			// Inject the actual figures so the model grounds on real numbers
+			// rather than inventing them. Prefer the pre-computed analytics block.
+			if ca, ok := businessData["computed_analytics"]; ok && ca != nil {
+				if b, err := json.Marshal(ca); err == nil {
+					prompt += "\n\nThe user's REAL business metrics — use these EXACT figures and do NOT invent numbers:\n" + string(b)
+				}
+			}
+			if b, err := json.Marshal(businessData); err == nil && len(b) < 16000 {
+				prompt += "\n\nUnderlying business records (JSON, for additional context):\n" + string(b)
+			}
 		}
 	}
 
