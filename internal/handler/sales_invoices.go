@@ -985,6 +985,123 @@ func (h *Handler) DeleteSalesInvoice(c *gin.Context) {
 	response.NoContent(c)
 }
 
+// reverseInvoiceJournalEntry reverses a posted journal entry's GL balance impact
+// (exact inverse of posting) and soft-deletes the entry. Used when un-posting an
+// invoice back to draft. The caller MUST already be inside a tx that has set
+// session_replication_role='replica' (to bypass the journal-immutability and
+// negative-balance triggers).
+func (h *Handler) reverseInvoiceJournalEntry(tx *sql.Tx, tenantID, jeID uuid.UUID) error {
+	rows, err := tx.Query(`
+		SELECT jel.account_id, jel.debit_amount, jel.credit_amount, at.normal_balance
+		FROM journal_entry_lines jel
+		JOIN accounts a ON jel.account_id = a.id
+		JOIN account_types at ON a.account_type_id = at.id
+		WHERE jel.journal_entry_id = $1`, jeID)
+	if err != nil {
+		return err
+	}
+	type lu struct {
+		acct   uuid.UUID
+		dr, cr float64
+		nb     string
+	}
+	var lines []lu
+	for rows.Next() {
+		var l lu
+		if scanErr := rows.Scan(&l.acct, &l.dr, &l.cr, &l.nb); scanErr == nil {
+			lines = append(lines, l)
+		}
+	}
+	rows.Close()
+
+	now := time.Now()
+	for _, l := range lines {
+		var change float64
+		if l.nb == "debit" {
+			change = l.dr - l.cr
+		} else {
+			change = l.cr - l.dr
+		}
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`,
+			change, now, l.acct); err != nil {
+			return err
+		}
+	}
+	// Remove the entry from the books — it'll be re-posted fresh when the invoice
+	// is sent/posted again.
+	_, err = tx.Exec(`UPDATE journal_entries SET deleted_at=$1, updated_at=$1 WHERE id=$2 AND tenant_id=$3`, now, jeID, tenantID)
+	return err
+}
+
+// ResetSalesInvoiceToDraft un-posts a sent/posted sales invoice: reverses its GL
+// (DR AR / CR Revenue) and flips status back to draft so it can be edited or
+// deleted. Super-admin only. Refuses if the invoice has payments.
+func (h *Handler) ResetSalesInvoiceToDraft(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid invoice ID")
+		return
+	}
+
+	var status string
+	var amountPaid float64
+	var jeID sql.NullString
+	err = h.db.QueryRow(`SELECT status, COALESCE(amount_paid,0), journal_entry_id::text
+		FROM sales_invoices WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`, id, tenantID).Scan(&status, &amountPaid, &jeID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Sales invoice")
+		return
+	}
+	if err != nil {
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+	if status == string(entity.InvoiceStatusDraft) {
+		response.BadRequest(c, "Invoice is already a draft")
+		return
+	}
+	if amountPaid > 0.001 {
+		response.BadRequest(c, "Cannot reset an invoice that has payments. Remove the payments first.")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SET LOCAL session_replication_role = 'replica'`); err != nil {
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+	if jeID.Valid && jeID.String != "" {
+		if jeUUID, perr := uuid.Parse(jeID.String); perr == nil {
+			if err := h.reverseInvoiceJournalEntry(tx, tenantID, jeUUID); err != nil {
+				h.log.Error("reset sales invoice: reverse JE", "error", err)
+				response.InternalError(c, "Failed to reverse invoice GL")
+				return
+			}
+		}
+	}
+	if _, err := tx.Exec(`UPDATE sales_invoices SET status='draft', journal_entry_id=NULL, sent_at=NULL, updated_at=NOW()
+		WHERE id=$1 AND tenant_id=$2`, id, tenantID); err != nil {
+		h.log.Error("reset sales invoice: status", "error", err)
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+	response.Success(c, gin.H{"message": "Invoice reset to draft", "status": "draft"})
+}
+
 // SendInvoice marks an invoice as sent and creates GL journal entry
 func (h *Handler) SendInvoice(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)

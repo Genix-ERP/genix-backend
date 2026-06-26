@@ -678,6 +678,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		invoices.POST("/:id/record-payment", h.RecordPayment)
 		invoices.POST("/:id/credit-note", h.perm.Require("sales", "invoice", "create"), h.CreateCreditNote)
 		invoices.POST("/:id/confirm-credit-note", h.perm.Require("sales", "invoice", "update"), h.ConfirmCreditNote)
+		// Un-post a sent/posted invoice back to draft (then edit/delete) — super admins only.
+		invoices.POST("/:id/reset-to-draft", h.perm.RequireSuperAdmin(), h.ResetSalesInvoiceToDraft)
 	}
 
 	// Sales Returns
@@ -821,6 +823,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseInvoices.DELETE("/:id", h.perm.Require("purchase", "invoice", "delete"), h.DeletePurchaseInvoice)
 		purchaseInvoices.POST("/:id/confirm", h.perm.Require("purchase", "invoice", "approve"), h.ConfirmPurchaseInvoice)
 		purchaseInvoices.POST("/:id/post", h.perm.Require("purchase", "invoice", "approve"), h.PostPurchaseInvoice)
+		// Un-post a confirmed/posted bill back to draft (then edit/delete) — super admins only.
+		purchaseInvoices.POST("/:id/reset-to-draft", h.perm.RequireSuperAdmin(), h.ResetPurchaseInvoiceToDraft)
 		purchaseInvoices.POST("/:id/pay", h.PayPurchaseInvoice)
 		purchaseInvoices.POST("/:id/debit-note", h.perm.Require("purchase", "invoice", "create"), h.CreateDebitNote)
 		purchaseInvoices.POST("/:id/confirm-debit-note", h.perm.Require("purchase", "invoice", "approve"), h.ConfirmDebitNote)
