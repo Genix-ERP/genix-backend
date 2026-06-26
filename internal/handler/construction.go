@@ -66,7 +66,26 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 		       cp.contract_amount, cp.currency,
 		       cp.contract_date, cp.planned_start_date, cp.planned_end_date,
 		       cp.actual_start_date, cp.actual_end_date,
-		       cp.status, cp.progress_percent,
+		       cp.status,
+		       COALESCE((
+		         SELECT CASE
+		                  WHEN SUM(w.cost) > 0 THEN ROUND(SUM(w.cost * w.ratio) / SUM(w.cost) * 100, 2)
+		                  WHEN COUNT(*) > 0   THEN ROUND(AVG(w.ratio) * 100, 2)
+		                  ELSE NULL
+		                END
+		         FROM (
+		           SELECT COALESCE(l.total_amount, 0) AS cost,
+		                  LEAST(
+		                    CASE WHEN COALESCE(NULLIF(l.imported_quantity,0), NULLIF(l.original_quantity,0), l.quantity) > 0
+		                         THEN l.done_quantity::numeric / COALESCE(NULLIF(l.imported_quantity,0), NULLIF(l.original_quantity,0), l.quantity)
+		                         ELSE 0 END, 1) AS ratio
+		           FROM construction_estimate_line l
+		           JOIN construction_estimate e ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
+		           WHERE e.project_id = cp.id AND l.tenant_id = cp.tenant_id
+		             AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		             AND COALESCE(l.resource_type, '') = '' AND COALESCE(l.parent_line_id, 0) = 0
+		         ) w
+		       ), cp.progress_percent) AS progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
 		       cp.warehouse_id,
 		       cp.crm_project_id,
@@ -205,7 +224,26 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		       cp.contract_amount, cp.currency,
 		       cp.contract_date, cp.planned_start_date, cp.planned_end_date,
 		       cp.actual_start_date, cp.actual_end_date,
-		       cp.status, cp.progress_percent,
+		       cp.status,
+		       COALESCE((
+		         SELECT CASE
+		                  WHEN SUM(w.cost) > 0 THEN ROUND(SUM(w.cost * w.ratio) / SUM(w.cost) * 100, 2)
+		                  WHEN COUNT(*) > 0   THEN ROUND(AVG(w.ratio) * 100, 2)
+		                  ELSE NULL
+		                END
+		         FROM (
+		           SELECT COALESCE(l.total_amount, 0) AS cost,
+		                  LEAST(
+		                    CASE WHEN COALESCE(NULLIF(l.imported_quantity,0), NULLIF(l.original_quantity,0), l.quantity) > 0
+		                         THEN l.done_quantity::numeric / COALESCE(NULLIF(l.imported_quantity,0), NULLIF(l.original_quantity,0), l.quantity)
+		                         ELSE 0 END, 1) AS ratio
+		           FROM construction_estimate_line l
+		           JOIN construction_estimate e ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
+		           WHERE e.project_id = cp.id AND l.tenant_id = cp.tenant_id
+		             AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		             AND COALESCE(l.resource_type, '') = '' AND COALESCE(l.parent_line_id, 0) = 0
+		         ) w
+		       ), cp.progress_percent) AS progress_percent,
 		       cp.project_manager_id, cp.chief_engineer_id,
 		       cp.warehouse_id,
 		       cp.crm_project_id,
