@@ -1250,3 +1250,200 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		},
 	})
 }
+
+// GetResourceConsolidationReport aggregates the NORMA (planned normative)
+// quantities of resources — materials, equipment(machinery) and labor — across
+// every estimate section, per block, for a project. Unlike the material
+// consolidation (which is Fakt / done-scaled and materials-only), this report
+// uses each resource sub-line's PLANNED quantity (parent_qty × norm) and tags
+// every group with its resource `type` so the frontend can let the user filter
+// by material / equipment / labor.
+//
+// GET /construction/projects/:id/reports/resource-consolidation
+func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var projectName, projectAddress string
+	if err := h.db.QueryRow(`
+		SELECT COALESCE(name, ''), COALESCE(address, '')
+		  FROM construction_projects
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectName, &projectAddress); err != nil {
+		h.log.Error("Failed to load project for resource report", "error", err)
+		response.NotFound(c, "Project not found")
+		return
+	}
+
+	// Classify each resource sub-line into material / equipment / labor with
+	// the same precedence Свод uses (explicit resource_type wins; otherwise
+	// fall back to the UOM: ЧЕЛ → labor, МАШ → equipment, else material).
+	// NORMA quantity is the line's own planned quantity (parent_qty × norm).
+	rows, err := h.db.Query(`
+		WITH resource_lines AS (
+		    SELECT
+		        e.building_id                     AS bid,
+		        CASE
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('labor','mehnat','ish','ishchi','worker','трудовой','трудовые') THEN 'labor'
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('equipment','mashina','masina','mexanizm','mexanizmlar','machinery','машина') THEN 'equipment'
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('material','materialy','mat','materiallar','материал','материалы') THEN 'material'
+		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
+		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%МАШ%' THEN 'equipment'
+		            ELSE 'material'
+		        END                               AS rtype,
+		        s.name                            AS name,
+		        COALESCE(s.uom, '')               AS uom,
+		        COALESCE(s.unit_rate, 0)          AS unit_rate,
+		        -- NORMA = the smeta "reja" (plan) requirement, so every work
+		        -- counts at its FULL planned volume regardless of progress.
+		        -- The work card's NORMA badge reads parent.original_quantity
+		        -- (smeta reja); the live quantity is the cumulative/done
+		        -- volume and is 0 for works not yet started — which previously
+		        -- left only the in-progress work showing.
+		        --   manual (quantity_override) → resource's own planned qty;
+		        --   auto                       → norm_rate × parent reja qty.
+		        CASE
+		            WHEN COALESCE(s.quantity_override, false)
+		                THEN COALESCE(NULLIF(s.original_quantity, 0), s.quantity, 0)
+		            ELSE COALESCE(s.norm_rate, 0)
+		                 * COALESCE(NULLIF(p.original_quantity, 0), p.quantity, 0)
+		        END                               AS norma_quantity
+		    FROM construction_estimate_line s
+		    JOIN construction_estimate_line p
+		      ON p.id = s.parent_line_id
+		     AND p.tenant_id = s.tenant_id
+		    JOIN construction_estimate e
+		      ON e.id = s.estimate_id
+		     AND e.tenant_id = s.tenant_id
+		    WHERE e.project_id  = $1
+		      AND e.tenant_id   = $2
+		      AND s.tenant_id   = $2
+		      AND s.parent_line_id IS NOT NULL
+		)
+		SELECT
+		    COALESCE(rl.bid, 0)                 AS building_id,
+		    COALESCE(b.name, b.code, 'Umumiy')  AS building_name,
+		    rl.rtype                            AS rtype,
+		    rl.name                             AS name,
+		    rl.uom                              AS uom,
+		    rl.unit_rate                        AS unit_rate,
+		    SUM(rl.norma_quantity)              AS norma_quantity
+		FROM resource_lines rl
+		LEFT JOIN construction_buildings b ON b.id = rl.bid
+		GROUP BY rl.bid, b.id, b.name, b.code, b.sort_order, rl.rtype, rl.name, rl.uom, rl.unit_rate
+		HAVING SUM(rl.norma_quantity) > 0
+		ORDER BY b.sort_order ASC NULLS LAST, b.id ASC NULLS LAST,
+		         rl.rtype ASC, UPPER(rl.name) ASC, rl.uom ASC, rl.unit_rate ASC
+	`, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query resource consolidation", "error", err)
+		response.InternalError(c, "Failed to compute resource report")
+		return
+	}
+	defer rows.Close()
+
+	type group struct {
+		Type          string  `json:"type"`
+		Name          string  `json:"name"`
+		UOM           string  `json:"uom"`
+		UnitRate      float64 `json:"unit_rate"`
+		NormaQuantity float64 `json:"norma_quantity"`
+		NormaAmount   float64 `json:"norma_amount"`
+	}
+	type block struct {
+		ID          int64   `json:"id"`
+		Name        string  `json:"name"`
+		Groups      []group `json:"groups"`
+		TotalAmount float64 `json:"total_amount"`
+	}
+
+	blockOrder := []int64{}
+	blockMap := map[int64]*block{}
+
+	for rows.Next() {
+		var bid int64
+		var bname, rtype, name, uom string
+		var rate, qty float64
+		if err := rows.Scan(&bid, &bname, &rtype, &name, &uom, &rate, &qty); err != nil {
+			h.log.Error("Failed to scan resource row", "error", err)
+			continue
+		}
+		blk, ok := blockMap[bid]
+		if !ok {
+			b := &block{ID: bid, Name: bname}
+			blockMap[bid] = b
+			blockOrder = append(blockOrder, bid)
+			blk = b
+		}
+		g := group{
+			Type:          rtype,
+			Name:          name,
+			UOM:           uom,
+			UnitRate:      rate,
+			NormaQuantity: qty,
+			NormaAmount:   qty * rate,
+		}
+		blk.Groups = append(blk.Groups, g)
+		blk.TotalAmount += g.NormaAmount
+	}
+
+	// Project-wide total: re-aggregate across blocks on (type, name, uom, rate).
+	type aggKey struct {
+		rtype string
+		name  string
+		uom   string
+		rate  float64
+	}
+	totalAgg := map[aggKey]*group{}
+	totalOrder := []aggKey{}
+	var grandTotal float64
+	for _, blk := range blockMap {
+		for _, g := range blk.Groups {
+			k := aggKey{rtype: g.Type, name: strings.ToUpper(g.Name), uom: g.UOM, rate: g.UnitRate}
+			tg, ok := totalAgg[k]
+			if !ok {
+				ng := group{Type: g.Type, Name: g.Name, UOM: g.UOM, UnitRate: g.UnitRate}
+				totalAgg[k] = &ng
+				tg = &ng
+				totalOrder = append(totalOrder, k)
+			}
+			tg.NormaQuantity += g.NormaQuantity
+			tg.NormaAmount += g.NormaAmount
+			grandTotal += g.NormaAmount
+		}
+	}
+	totalGroups := make([]group, 0, len(totalOrder))
+	for _, k := range totalOrder {
+		totalGroups = append(totalGroups, *totalAgg[k])
+	}
+
+	out := make([]*block, 0, len(blockOrder))
+	for _, bid := range blockOrder {
+		out = append(out, blockMap[bid])
+	}
+
+	response.Success(c, gin.H{
+		"project": gin.H{
+			"id":      projectID,
+			"name":    projectName,
+			"address": projectAddress,
+		},
+		"blocks": out,
+		"total": gin.H{
+			"groups":       totalGroups,
+			"total_amount": grandTotal,
+		},
+	})
+}
