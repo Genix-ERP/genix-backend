@@ -2940,6 +2940,253 @@ func (h *Handler) GetAccountCorrespondenceCounterparts(c *gin.Context) {
 	response.Success(c, gin.H{"in_matrix": true, "group_code": groupCode.Int64, "account_ids": ids})
 }
 
+// RegisterPartnerPayment records a payment for a customer or vendor WITHOUT
+// picking a specific invoice (Odoo-style). It posts the cash entry (customer:
+// DR Cash / CR AR; vendor: DR AP / CR Cash), then auto-allocates the amount to
+// the partner's open invoices/bills OLDEST-FIRST. Any excess stays as a credit
+// on the partner (the AR/AP line carries the full amount, so the balance simply
+// goes into credit) — no allocation row is created for the leftover.
+func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgPtr *uuid.UUID
+	var orgArg interface{}
+	if orgID != uuid.Nil {
+		orgPtr = &orgID
+		orgArg = orgID
+	}
+
+	var input struct {
+		ContactID   string  `json:"contact_id" binding:"required"`
+		Amount      float64 `json:"amount" binding:"required,gt=0"`
+		Direction   string  `json:"direction" binding:"required,oneof=customer vendor"`
+		PaymentDate string  `json:"payment_date,omitempty"`
+		Method      string  `json:"method,omitempty"` // cash | bank
+		Notes       string  `json:"notes,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+	contactID, err := uuid.Parse(input.ContactID)
+	if err != nil {
+		response.BadRequest(c, "Invalid contact_id")
+		return
+	}
+	now := time.Now()
+	if input.PaymentDate != "" {
+		if d, e := time.Parse("2006-01-02", input.PaymentDate); e == nil {
+			now = d
+		}
+	}
+	isCustomer := input.Direction == "customer"
+
+	// Resolve the cash/bank account.
+	var cashAcct uuid.UUID
+	if input.Method == "bank" {
+		cashAcct = findAccount(h.db, tenantID, orgPtr, "bank", "5110")
+		if cashAcct == uuid.Nil {
+			cashAcct = findAccount(h.db, tenantID, orgPtr, "kassa", "5010")
+		}
+	} else {
+		cashAcct = findAccount(h.db, tenantID, orgPtr, "kassa", "5010")
+		if cashAcct == uuid.Nil {
+			cashAcct = findAccount(h.db, tenantID, orgPtr, "bank", "5110")
+		}
+	}
+	// Resolve the partner control account (prefer the contact's default).
+	var partnerAcct uuid.UUID
+	if isCustomer {
+		var s sql.NullString
+		_ = h.db.QueryRow(`SELECT default_receivable_account_id::text FROM contacts WHERE id=$1 AND tenant_id=$2`, contactID, tenantID).Scan(&s)
+		if s.Valid && s.String != "" {
+			partnerAcct, _ = uuid.Parse(s.String)
+		}
+		if partnerAcct == uuid.Nil {
+			partnerAcct = findAccount(h.db, tenantID, orgPtr, "debitor", "4010")
+		}
+		if partnerAcct == uuid.Nil {
+			partnerAcct = findAccount(h.db, tenantID, orgPtr, "receivable", "4010")
+		}
+	} else {
+		var s sql.NullString
+		_ = h.db.QueryRow(`SELECT default_payable_account_id::text FROM contacts WHERE id=$1 AND tenant_id=$2`, contactID, tenantID).Scan(&s)
+		if s.Valid && s.String != "" {
+			partnerAcct, _ = uuid.Parse(s.String)
+		}
+		if partnerAcct == uuid.Nil {
+			partnerAcct = findAccount(h.db, tenantID, orgPtr, "kreditor", "6010")
+		}
+		if partnerAcct == uuid.Nil {
+			partnerAcct = findAccount(h.db, tenantID, orgPtr, "payable", "6010")
+		}
+	}
+	if cashAcct == uuid.Nil || partnerAcct == uuid.Nil {
+		response.BadRequest(c, "Could not resolve the cash or partner (AR/AP) account — configure the chart of accounts first.")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to register payment")
+		return
+	}
+	defer tx.Rollback()
+
+	// Pick a journal (cash, then GENERAL, then any), scoped to org.
+	var journalID uuid.UUID
+	var prefix sql.NullString
+	_ = tx.QueryRow(`SELECT id, number_prefix FROM journals
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2 OR organization_id IS NULL)
+		ORDER BY CASE WHEN LOWER(COALESCE(type,''))='cash' THEN 0 WHEN code='GENERAL' THEN 1 ELSE 2 END LIMIT 1`,
+		tenantID, orgArg).Scan(&journalID, &prefix)
+	if journalID == uuid.Nil {
+		response.BadRequest(c, "No journal is configured for this company.")
+		return
+	}
+	var maxNum int
+	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT)),0)
+		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL
+		  AND LENGTH(REGEXP_REPLACE(entry_number,'[^0-9]','','g')) <= 9`, tenantID, journalID).Scan(&maxNum)
+	px := ""
+	if prefix.Valid {
+		px = prefix.String
+	}
+	entryNumber := fmt.Sprintf("%s%06d", px, maxNum+1)
+	pType := "receipt"
+	if !isCustomer {
+		pType = "payment"
+	}
+	desc := fmt.Sprintf("%s payment", input.Direction)
+
+	// Journal entry header.
+	jeID := uuid.New()
+	if _, err := tx.Exec(`INSERT INTO journal_entries
+		(id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description, source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'payment',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
+		jeID, tenantID, orgArg, journalID, entryNumber, now, nullIfEmpty(input.Notes), desc, contactID.String(), input.Amount, userID, now); err != nil {
+		h.log.Error("register payment: JE header", "error", err)
+		response.InternalError(c, "Failed to post payment")
+		return
+	}
+	jelInsert := func(acct uuid.UUID, contact interface{}, line int, debit, credit float64) error {
+		_, e := tx.Exec(`INSERT INTO journal_entry_lines
+			(id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1.0,$9)`, uuid.New(), jeID, line, acct, contact, desc, debit, credit, now)
+		return e
+	}
+	var e1, e2 error
+	if isCustomer {
+		e1 = jelInsert(cashAcct, nil, 1, input.Amount, 0)         // DR Cash
+		e2 = jelInsert(partnerAcct, contactID, 2, 0, input.Amount) // CR AR (partner)
+	} else {
+		e1 = jelInsert(partnerAcct, contactID, 1, input.Amount, 0) // DR AP (partner)
+		e2 = jelInsert(cashAcct, nil, 2, 0, input.Amount)          // CR Cash
+	}
+	if e1 != nil || e2 != nil {
+		h.log.Error("register payment: JE lines", "e1", e1, "e2", e2)
+		response.InternalError(c, "Failed to post payment lines")
+		return
+	}
+	// Account balances (cash debit-normal; AR debit-normal; AP credit-normal).
+	if isCustomer {
+		tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, input.Amount, now, cashAcct)
+		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, input.Amount, now, partnerAcct)
+	} else {
+		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, input.Amount, now, partnerAcct)
+		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, input.Amount, now, cashAcct)
+	}
+	tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id=$1`, journalID)
+
+	// Payment record.
+	paymentID := uuid.New()
+	if _, err := tx.Exec(`INSERT INTO payments
+		(id, tenant_id, organization_id, type, payment_number, contact_id, payment_date, amount, currency_id, exchange_rate, reference, notes, status, journal_entry_id, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,1.0,$9,$10,'confirmed',$11,$12,$13,$13)`,
+		paymentID, tenantID, orgArg, pType, "PAY-"+entryNumber, contactID, now, input.Amount,
+		nullIfEmpty(input.Notes), nullIfEmpty(input.Notes), jeID, userID, now); err != nil {
+		h.log.Error("register payment: payment row", "error", err)
+		response.InternalError(c, "Failed to record payment")
+		return
+	}
+
+	// FIFO-allocate to open invoices/bills, oldest first.
+	table, contactCol := "sales_invoices", "customer_id"
+	docType := "sales_invoice"
+	if !isCustomer {
+		table, contactCol, docType = "purchase_invoices", "vendor_id", "purchase_invoice"
+	}
+	type openInv struct {
+		id     string
+		number string
+		due    float64
+	}
+	var opens []openInv
+	rows, err := tx.Query(fmt.Sprintf(`SELECT id::text, invoice_number, total_amount - COALESCE(amount_paid,0) AS due
+		FROM %s WHERE %s=$1 AND tenant_id=$2 AND deleted_at IS NULL
+		  AND status NOT IN ('draft','cancelled') AND (total_amount - COALESCE(amount_paid,0)) > 0.001
+		ORDER BY invoice_date ASC, created_at ASC`, table, contactCol), contactID, tenantID)
+	if err != nil {
+		h.log.Error("register payment: load open invoices", "error", err)
+		response.InternalError(c, "Failed to allocate payment")
+		return
+	}
+	for rows.Next() {
+		var o openInv
+		if rows.Scan(&o.id, &o.number, &o.due) == nil {
+			opens = append(opens, o)
+		}
+	}
+	rows.Close()
+
+	remaining := input.Amount
+	allocated := make([]map[string]interface{}, 0)
+	for _, o := range opens {
+		if remaining <= 0.001 {
+			break
+		}
+		alloc := o.due
+		if alloc > remaining {
+			alloc = remaining
+		}
+		invUUID, _ := uuid.Parse(o.id)
+		if _, err := tx.Exec(`INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6)`, uuid.New(), paymentID, docType, invUUID, alloc, now); err != nil {
+			h.log.Error("register payment: allocation", "error", err)
+			response.InternalError(c, "Failed to allocate payment")
+			return
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s
+			SET amount_paid = COALESCE(amount_paid,0) + $1,
+			    status = CASE WHEN COALESCE(amount_paid,0) + $1 >= total_amount - 0.001 THEN 'paid' ELSE 'partial' END,
+			    updated_at = $2
+			WHERE id = $3 AND tenant_id = $4`, table), alloc, now, invUUID, tenantID); err != nil {
+			h.log.Error("register payment: update invoice", "error", err)
+			response.InternalError(c, "Failed to settle invoice")
+			return
+		}
+		allocated = append(allocated, map[string]interface{}{"invoice_number": o.number, "amount": alloc})
+		remaining -= alloc
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("register payment: commit", "error", err)
+		response.InternalError(c, "Failed to register payment")
+		return
+	}
+	response.Success(c, gin.H{
+		"payment_id":       paymentID,
+		"amount":           input.Amount,
+		"allocated":        allocated,
+		"credit_remaining": remaining, // overpayment kept as a credit on the partner
+	})
+}
+
 // ReverseJournalEntry godoc
 // @Summary Reverse a journal entry
 // @Description Create a reversal entry for a posted journal entry

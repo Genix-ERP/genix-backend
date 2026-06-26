@@ -1102,6 +1102,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		payments.GET("", h.ListPayments)
 		payments.POST("", h.perm.Require("finance", "payment", "create"), h.CreatePayment)
+		// Odoo-style: register a payment for a partner (no invoice picked) → auto-settle
+		// their open invoices/bills oldest-first; excess stays as a credit.
+		payments.POST("/register", h.perm.Require("finance", "payment", "create"), h.RegisterPartnerPayment)
 		payments.GET("/:id", h.GetPayment)
 		payments.POST("/:id/confirm", h.perm.Require("finance", "payment", "approve"), h.ConfirmPayment)
 	}
