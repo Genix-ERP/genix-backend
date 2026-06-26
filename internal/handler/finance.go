@@ -2713,6 +2713,124 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Journal entry posted successfully", "posted_at": now})
 }
 
+// ResetJournalEntryToDraft un-posts a posted journal entry (Odoo "Reset to
+// Draft"): it reverses the entry's GL balance impact and flips status back to
+// draft so the lines can be edited and the entry re-posted. Super-admin only.
+// The status-immutability trigger (TT 4.4) forbids posted→draft, so this runs
+// the controlled un-post with session_replication_role='replica'.
+func (h *Handler) ResetJournalEntryToDraft(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid journal entry ID")
+		return
+	}
+
+	var status string
+	var entryDate time.Time
+	err = h.db.QueryRow(`SELECT status, entry_date FROM journal_entries WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`,
+		id, tenantID).Scan(&status, &entryDate)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Journal entry")
+		return
+	}
+	if err != nil {
+		h.log.Error("reset-to-draft: load entry", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+	if status != "posted" {
+		response.BadRequest(c, "Only posted entries can be reset to draft")
+		return
+	}
+	// Don't un-post into a locked period.
+	if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	if errMsg := h.checkPeriodLock(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+	defer tx.Rollback()
+
+	// Bypass the posted→draft immutability trigger for this controlled un-post.
+	if _, err := tx.Exec(`SET LOCAL session_replication_role = 'replica'`); err != nil {
+		h.log.Error("reset-to-draft: set replication role", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+
+	// Reverse the GL balance impact — exact inverse of PostJournalEntry.
+	rows, err := tx.Query(`
+		SELECT jel.account_id, jel.debit_amount, jel.credit_amount, at.normal_balance
+		FROM journal_entry_lines jel
+		JOIN accounts a ON jel.account_id = a.id
+		JOIN account_types at ON a.account_type_id = at.id
+		WHERE jel.journal_entry_id = $1`, id)
+	if err != nil {
+		h.log.Error("reset-to-draft: load lines", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+	type lu struct {
+		acct   uuid.UUID
+		dr, cr float64
+		nb     string
+	}
+	var lines []lu
+	for rows.Next() {
+		var l lu
+		if scanErr := rows.Scan(&l.acct, &l.dr, &l.cr, &l.nb); scanErr == nil {
+			lines = append(lines, l)
+		}
+	}
+	rows.Close()
+
+	now := time.Now()
+	for _, l := range lines {
+		var change float64
+		if l.nb == "debit" {
+			change = l.dr - l.cr
+		} else {
+			change = l.cr - l.dr
+		}
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`,
+			change, now, l.acct); err != nil {
+			h.log.Error("reset-to-draft: balance reversal failed", "error", err, "account_id", l.acct)
+			response.InternalError(c, "Failed to reset journal entry")
+			return
+		}
+	}
+
+	if _, err := tx.Exec(`UPDATE journal_entries SET status='draft', posted_at=NULL, posted_by=NULL, updated_at=$1 WHERE id=$2`,
+		now, id); err != nil {
+		h.log.Error("reset-to-draft: status update failed", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("reset-to-draft: commit failed", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+
+	h.logJournalEntryAction(tenantID, userID, id, "reset_to_draft", "posted", "draft", nil)
+	response.Success(c, gin.H{"message": "Journal entry reset to draft", "status": "draft"})
+}
+
 // ReverseJournalEntry godoc
 // @Summary Reverse a journal entry
 // @Description Create a reversal entry for a posted journal entry

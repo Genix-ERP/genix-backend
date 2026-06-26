@@ -1083,6 +1083,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		journals.POST("/:id/post", h.perm.Require("finance", "journal", "post"), h.PostJournalEntry)
 		journals.POST("/:id/cancel", h.perm.Require("finance", "journal", "create"), h.CancelJournalEntry)
 		journals.POST("/:id/reverse", h.perm.Require("finance", "journal", "reverse"), h.ReverseJournalEntry)
+		// Reset a posted entry to draft (un-post, then edit + re-post) — super admins only.
+		journals.POST("/:id/reset-to-draft", h.perm.RequireSuperAdmin(), h.ResetJournalEntryToDraft)
 		journals.GET("/:id/audit-logs", h.GetJournalEntryAuditLogs)
 	}
 
