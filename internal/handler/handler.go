@@ -1066,6 +1066,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		paymentMethodsGroup.GET("", h.ListPaymentMethods)
 	}
 
+	// Account correspondence (шахматка) — valid counterpart accounts for a given
+	// account when building a journal entry. Read-only, filters the UI dropdowns.
+	rg.GET("/account-correspondences/counterparts", h.GetAccountCorrespondenceCounterparts)
+
 	// Journal Entries.
 	//
 	// Read access (GET) is also ungated — same reason as /journals

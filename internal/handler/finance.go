@@ -2831,6 +2831,115 @@ func (h *Handler) ResetJournalEntryToDraft(c *gin.Context) {
 	response.Success(c, gin.H{"message": "Journal entry reset to draft", "status": "draft"})
 }
 
+// GetAccountCorrespondenceCounterparts returns the leaf account IDs that are
+// valid correspondence counterparts of the given account, per the шахматка
+// matrix (account_correspondences). The account is resolved UP to its matrix
+// group code (nearest ancestor whose numeric code appears in the matrix); the
+// counterparts are the symmetric set of group codes it pairs with; the result
+// is every leaf account UNDER those groups in the same organization. An empty
+// result means the account isn't in the matrix, so the UI applies no filter.
+func (h *Handler) GetAccountCorrespondenceCounterparts(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	accountID, err := uuid.Parse(c.Query("account_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid account_id")
+		return
+	}
+
+	var orgID sql.NullString
+	_ = h.db.QueryRow(`SELECT organization_id::text FROM accounts WHERE id=$1 AND tenant_id=$2`, accountID, tenantID).Scan(&orgID)
+	var orgArg interface{}
+	if orgID.Valid && orgID.String != "" {
+		orgArg = orgID.String
+	}
+
+	// 1. Resolve the account up to its matrix group code.
+	var groupCode sql.NullInt64
+	err = h.db.QueryRow(`
+		WITH RECURSIVE up AS (
+			SELECT id, code, parent_id, 0 AS depth
+			FROM accounts WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL
+			UNION ALL
+			SELECT a.id, a.code, a.parent_id, up.depth+1
+			FROM accounts a JOIN up ON a.id = up.parent_id
+			WHERE up.depth < 12 AND a.deleted_at IS NULL
+		)
+		SELECT CAST(regexp_replace(code,'[^0-9]','','g') AS BIGINT)
+		FROM up
+		WHERE regexp_replace(code,'[^0-9]','','g') <> ''
+		  AND CAST(regexp_replace(code,'[^0-9]','','g') AS BIGINT) IN (
+		      SELECT CAST(debit_code AS BIGINT) FROM account_correspondences
+		      UNION SELECT CAST(credit_code AS BIGINT) FROM account_correspondences)
+		ORDER BY depth ASC LIMIT 1`, accountID, tenantID).Scan(&groupCode)
+	if err == sql.ErrNoRows || !groupCode.Valid {
+		response.Success(c, gin.H{"in_matrix": false, "account_ids": []string{}})
+		return
+	}
+	if err != nil {
+		h.log.Error("correspondence: resolve group", "error", err)
+		response.InternalError(c, "Failed to resolve account group")
+		return
+	}
+
+	// 2. Symmetric counterpart group codes.
+	rows, err := h.db.Query(`
+		SELECT DISTINCT CAST(credit_code AS BIGINT) FROM account_correspondences WHERE CAST(debit_code AS BIGINT) = $1
+		UNION
+		SELECT DISTINCT CAST(debit_code AS BIGINT)  FROM account_correspondences WHERE CAST(credit_code AS BIGINT) = $1`,
+		groupCode.Int64)
+	if err != nil {
+		response.InternalError(c, "Failed to load correspondences")
+		return
+	}
+	var counterpartCodes []int64
+	for rows.Next() {
+		var v int64
+		if rows.Scan(&v) == nil {
+			counterpartCodes = append(counterpartCodes, v)
+		}
+	}
+	rows.Close()
+	if len(counterpartCodes) == 0 {
+		response.Success(c, gin.H{"in_matrix": true, "account_ids": []string{}})
+		return
+	}
+
+	// 3. Leaf accounts under groups whose numeric code is a counterpart, same org.
+	rows2, err := h.db.Query(`
+		WITH RECURSIVE grp AS (
+			SELECT id, parent_id, COALESCE(is_leaf,true) AS leaf
+			FROM accounts
+			WHERE tenant_id = $1 AND deleted_at IS NULL
+			  AND ($3::uuid IS NULL OR organization_id = $3)
+			  AND regexp_replace(code,'[^0-9]','','g') <> ''
+			  AND CAST(regexp_replace(code,'[^0-9]','','g') AS BIGINT) = ANY($2)
+			UNION ALL
+			SELECT a.id, a.parent_id, COALESCE(a.is_leaf,true)
+			FROM accounts a JOIN grp ON a.parent_id = grp.id
+			WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
+		)
+		SELECT DISTINCT id::text FROM grp WHERE leaf = true`,
+		tenantID, pq.Array(counterpartCodes), orgArg)
+	if err != nil {
+		h.log.Error("correspondence: leaf descendants", "error", err)
+		response.InternalError(c, "Failed to load counterpart accounts")
+		return
+	}
+	defer rows2.Close()
+	ids := make([]string, 0)
+	for rows2.Next() {
+		var s string
+		if rows2.Scan(&s) == nil {
+			ids = append(ids, s)
+		}
+	}
+	response.Success(c, gin.H{"in_matrix": true, "group_code": groupCode.Int64, "account_ids": ids})
+}
+
 // ReverseJournalEntry godoc
 // @Summary Reverse a journal entry
 // @Description Create a reversal entry for a posted journal entry
