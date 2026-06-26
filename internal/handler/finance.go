@@ -221,7 +221,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			).Scan(&journalCount)
 
 			needsAccountSeed := totalAccounts == 0 || groupAccounts < 30 // legacy orgs have 40 groups
-			needsJournalSeed := journalCount < 5                          // 11 defaults; under 5 means broken
+			needsJournalSeed := journalCount < 5                         // 11 defaults; under 5 means broken
 
 			if needsAccountSeed || needsJournalSeed {
 				var orgExists bool
@@ -3082,7 +3082,7 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	}
 	var e1, e2 error
 	if isCustomer {
-		e1 = jelInsert(cashAcct, nil, 1, input.Amount, 0)         // DR Cash
+		e1 = jelInsert(cashAcct, nil, 1, input.Amount, 0)          // DR Cash
 		e2 = jelInsert(partnerAcct, contactID, 2, 0, input.Amount) // CR AR (partner)
 	} else {
 		e1 = jelInsert(partnerAcct, contactID, 1, input.Amount, 0) // DR AP (partner)
@@ -3184,6 +3184,317 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 		"amount":           input.Amount,
 		"allocated":        allocated,
 		"credit_remaining": remaining, // overpayment kept as a credit on the partner
+	})
+}
+
+// partnerDocConfig maps a direction (customer|vendor) to its invoice table,
+// contact column, payment type, and allocation document_type.
+func partnerDocConfig(direction string) (invTable, contactCol, payType, docType string) {
+	if direction == "vendor" {
+		return "purchase_invoices", "vendor_id", "payment", "purchase_invoice"
+	}
+	return "sales_invoices", "customer_id", "receipt", "sales_invoice"
+}
+
+// GetPartnerBalances returns, per customer or vendor, their invoiced / paid /
+// due totals plus any unallocated payment credit (Odoo-style partner list).
+// Query: ?direction=customer|vendor
+func (h *Handler) GetPartnerBalances(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgArg interface{}
+	if orgID != uuid.Nil {
+		orgArg = orgID
+	}
+	direction := c.Query("direction")
+	if direction != "vendor" {
+		direction = "customer"
+	}
+	invTable, contactCol, payType, _ := partnerDocConfig(direction)
+
+	q := fmt.Sprintf(`
+		WITH inv AS (
+			SELECT %s AS cid,
+			       SUM(total_amount) AS invoiced,
+			       SUM(COALESCE(amount_paid,0)) AS paid,
+			       SUM(total_amount - COALESCE(amount_paid,0)) AS due
+			FROM %s
+			WHERE tenant_id=$1 AND deleted_at IS NULL AND status NOT IN ('draft','cancelled')
+			  AND ($2::uuid IS NULL OR organization_id=$2)
+			GROUP BY %s
+		),
+		pay AS (
+			SELECT p.contact_id AS cid,
+			       SUM(p.amount) AS ptotal,
+			       COALESCE(SUM(al.alloc),0) AS allocated
+			FROM payments p
+			LEFT JOIN (SELECT payment_id, SUM(amount) AS alloc FROM payment_allocations GROUP BY payment_id) al ON al.payment_id=p.id
+			WHERE p.tenant_id=$1 AND p.type=$3 AND p.status IN ('confirmed','posted')
+			  AND ($2::uuid IS NULL OR p.organization_id=$2)
+			GROUP BY p.contact_id
+		)
+		SELECT c.id::text, COALESCE(NULLIF(c.name,''),'-') AS name,
+		       COALESCE(inv.invoiced,0), COALESCE(inv.paid,0), COALESCE(inv.due,0),
+		       GREATEST(COALESCE(pay.ptotal,0)-COALESCE(pay.allocated,0),0) AS credit
+		FROM contacts c
+		LEFT JOIN inv ON inv.cid=c.id
+		LEFT JOIN pay ON pay.cid=c.id
+		WHERE c.tenant_id=$1 AND (inv.cid IS NOT NULL OR pay.cid IS NOT NULL)
+		ORDER BY COALESCE(inv.due,0) DESC, name ASC`, contactCol, invTable, contactCol)
+
+	rows, err := h.db.Query(q, tenantID, orgArg, payType)
+	if err != nil {
+		h.log.Error("partner balances", "error", err)
+		response.InternalError(c, "Failed to load partner balances")
+		return
+	}
+	defer rows.Close()
+	out := make([]gin.H, 0)
+	for rows.Next() {
+		var id, name string
+		var invoiced, paid, due, credit float64
+		if rows.Scan(&id, &name, &invoiced, &paid, &due, &credit) == nil {
+			out = append(out, gin.H{
+				"contact_id": id, "name": name,
+				"invoiced": invoiced, "paid": paid, "due": due,
+				"credit": credit, "net_balance": due - credit,
+			})
+		}
+	}
+	response.Success(c, out)
+}
+
+// GetPartnerLedger returns one partner's open invoices/bills, their available
+// (unallocated) payment credit, and the payments that make up that credit.
+// Query: ?contact_id=&direction=customer|vendor
+func (h *Handler) GetPartnerLedger(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgArg interface{}
+	if orgID != uuid.Nil {
+		orgArg = orgID
+	}
+	contactID, err := uuid.Parse(c.Query("contact_id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid contact_id")
+		return
+	}
+	direction := c.Query("direction")
+	if direction != "vendor" {
+		direction = "customer"
+	}
+	invTable, contactCol, payType, _ := partnerDocConfig(direction)
+
+	// Open documents (due > 0), oldest first.
+	openDocs := make([]gin.H, 0)
+	var totalDue float64
+	drows, err := h.db.Query(fmt.Sprintf(`
+		SELECT id::text, invoice_number, invoice_date,
+		       total_amount, COALESCE(amount_paid,0),
+		       total_amount - COALESCE(amount_paid,0) AS due, status
+		FROM %s
+		WHERE %s=$1 AND tenant_id=$2 AND deleted_at IS NULL
+		  AND status NOT IN ('draft','cancelled')
+		  AND (total_amount - COALESCE(amount_paid,0)) > 0.001
+		  AND ($3::uuid IS NULL OR organization_id=$3)
+		ORDER BY invoice_date ASC, created_at ASC`, invTable, contactCol), contactID, tenantID, orgArg)
+	if err != nil {
+		h.log.Error("partner ledger: open docs", "error", err)
+		response.InternalError(c, "Failed to load partner ledger")
+		return
+	}
+	for drows.Next() {
+		var id, number, status string
+		var date time.Time
+		var total, paid, due float64
+		if drows.Scan(&id, &number, &date, &total, &paid, &due, &status) == nil {
+			openDocs = append(openDocs, gin.H{
+				"id": id, "invoice_number": number, "invoice_date": date,
+				"total_amount": total, "amount_paid": paid, "due": due, "status": status,
+			})
+			totalDue += due
+		}
+	}
+	drows.Close()
+
+	// Payments with their unallocated remainder.
+	payments := make([]gin.H, 0)
+	var creditAvailable float64
+	prows, err := h.db.Query(`
+		SELECT p.id::text, COALESCE(p.payment_number,''), p.payment_date, p.amount,
+		       p.amount - COALESCE(al.alloc,0) AS unallocated
+		FROM payments p
+		LEFT JOIN (SELECT payment_id, SUM(amount) AS alloc FROM payment_allocations GROUP BY payment_id) al ON al.payment_id=p.id
+		WHERE p.contact_id=$1 AND p.tenant_id=$2 AND p.type=$3 AND p.status IN ('confirmed','posted')
+		  AND ($4::uuid IS NULL OR p.organization_id=$4)
+		  AND p.amount - COALESCE(al.alloc,0) > 0.001
+		ORDER BY p.payment_date ASC, p.created_at ASC`, contactID, tenantID, payType, orgArg)
+	if err != nil {
+		h.log.Error("partner ledger: payments", "error", err)
+		response.InternalError(c, "Failed to load partner ledger")
+		return
+	}
+	for prows.Next() {
+		var id, number string
+		var date time.Time
+		var amount, unalloc float64
+		if prows.Scan(&id, &number, &date, &amount, &unalloc) == nil {
+			payments = append(payments, gin.H{
+				"id": id, "payment_number": number, "payment_date": date,
+				"amount": amount, "unallocated": unalloc,
+			})
+			creditAvailable += unalloc
+		}
+	}
+	prows.Close()
+
+	response.Success(c, gin.H{
+		"open_docs":        openDocs,
+		"total_due":        totalDue,
+		"credit_available": creditAvailable,
+		"payments":         payments,
+	})
+}
+
+// ReconcilePartnerCredit applies a partner's existing unallocated payment credit
+// to one of their open invoices/bills — pure matching, no new GL is posted (the
+// cash and AR/AP legs were booked when each payment was registered). It consumes
+// the partner's unallocated payments oldest-first.
+// Body: { contact_id, direction, document_id, amount }
+func (h *Handler) ReconcilePartnerCredit(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgArg interface{}
+	if orgID != uuid.Nil {
+		orgArg = orgID
+	}
+	var input struct {
+		ContactID  string  `json:"contact_id" binding:"required"`
+		Direction  string  `json:"direction" binding:"required,oneof=customer vendor"`
+		DocumentID string  `json:"document_id" binding:"required"`
+		Amount     float64 `json:"amount"` // optional; 0 = settle as much as possible
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+	contactID, err := uuid.Parse(input.ContactID)
+	if err != nil {
+		response.BadRequest(c, "Invalid contact_id")
+		return
+	}
+	docID, err := uuid.Parse(input.DocumentID)
+	if err != nil {
+		response.BadRequest(c, "Invalid document_id")
+		return
+	}
+	invTable, _, payType, docType := partnerDocConfig(input.Direction)
+	now := time.Now()
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to reconcile")
+		return
+	}
+	defer tx.Rollback()
+
+	// Document due.
+	var docTotal, docPaid float64
+	if err := tx.QueryRow(fmt.Sprintf(`SELECT total_amount, COALESCE(amount_paid,0)
+		FROM %s WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`, invTable), docID, tenantID).Scan(&docTotal, &docPaid); err != nil {
+		response.BadRequest(c, "Document not found")
+		return
+	}
+	docDue := docTotal - docPaid
+	if docDue <= 0.001 {
+		response.BadRequest(c, "Document is already fully paid")
+		return
+	}
+	target := docDue
+	if input.Amount > 0.001 && input.Amount < target {
+		target = input.Amount
+	}
+
+	// Partner payments with an unallocated remainder, oldest first.
+	type credLine struct {
+		id     uuid.UUID
+		unallo float64
+	}
+	var creds []credLine
+	rows, err := tx.Query(`
+		SELECT p.id, p.amount - COALESCE(al.alloc,0) AS unallocated
+		FROM payments p
+		LEFT JOIN (SELECT payment_id, SUM(amount) AS alloc FROM payment_allocations GROUP BY payment_id) al ON al.payment_id=p.id
+		WHERE p.contact_id=$1 AND p.tenant_id=$2 AND p.type=$3 AND p.status IN ('confirmed','posted')
+		  AND ($4::uuid IS NULL OR p.organization_id=$4)
+		  AND p.amount - COALESCE(al.alloc,0) > 0.001
+		ORDER BY p.payment_date ASC, p.created_at ASC`, contactID, tenantID, payType, orgArg)
+	if err != nil {
+		h.log.Error("reconcile: load credit", "error", err)
+		response.InternalError(c, "Failed to reconcile")
+		return
+	}
+	for rows.Next() {
+		var cl credLine
+		if rows.Scan(&cl.id, &cl.unallo) == nil {
+			creds = append(creds, cl)
+		}
+	}
+	rows.Close()
+
+	applied := 0.0
+	for _, cl := range creds {
+		if target-applied <= 0.001 {
+			break
+		}
+		take := cl.unallo
+		if take > target-applied {
+			take = target - applied
+		}
+		if _, err := tx.Exec(`INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6)`, uuid.New(), cl.id, docType, docID, take, now); err != nil {
+			h.log.Error("reconcile: allocation", "error", err)
+			response.InternalError(c, "Failed to reconcile")
+			return
+		}
+		applied += take
+	}
+
+	if applied <= 0.001 {
+		response.BadRequest(c, "No available credit to reconcile")
+		return
+	}
+
+	if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s
+		SET amount_paid = COALESCE(amount_paid,0) + $1,
+		    status = CASE WHEN COALESCE(amount_paid,0) + $1 >= total_amount - 0.001 THEN 'paid' ELSE 'partial' END,
+		    updated_at = $2
+		WHERE id = $3 AND tenant_id = $4`, invTable), applied, now, docID, tenantID); err != nil {
+		h.log.Error("reconcile: update doc", "error", err)
+		response.InternalError(c, "Failed to reconcile")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to reconcile")
+		return
+	}
+	response.Success(c, gin.H{
+		"applied":       applied,
+		"due_remaining": docDue - applied,
+		"fully_paid":    docDue-applied <= 0.001,
 	})
 }
 
@@ -4338,10 +4649,10 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	// Collect allocations first, then close rows before executing updates
 	// (lib/pq does not support interleaved queries on the same connection)
 	type allocation struct {
-		ID     uuid.UUID
+		ID      uuid.UUID
 		DocType string
-		DocID  uuid.UUID
-		Amount float64
+		DocID   uuid.UUID
+		Amount  float64
 	}
 	var allocations []allocation
 
@@ -4644,128 +4955,128 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				tx.Exec("UPDATE payments SET journal_entry_id = $1 WHERE id = $2", journalEntryID, id)
 
 				// --- Exchange difference calculation ---
-			// For each allocation, check if invoice has a foreign currency rate
-			// diff = allocation_amount_foreign * (invoice_rate - payment_rate)
-			var totalExchangeDiff float64
-			var totalForeignAmount float64
-			var weightedInvoiceRate float64
-			for _, a := range allocations {
-				var invoiceRate float64
-				var invoiceCurrencyID sql.NullString
-				if a.DocType == "sales_invoice" {
-					_ = tx.QueryRow(
-						`SELECT COALESCE(exchange_rate, 1), currency_id FROM sales_invoices WHERE id = $1`,
-						a.DocID,
-					).Scan(&invoiceRate, &invoiceCurrencyID)
-				} else if a.DocType == "purchase_invoice" {
-					_ = tx.QueryRow(
-						`SELECT COALESCE(exchange_rate, 1), currency_id FROM purchase_invoices WHERE id = $1`,
-						a.DocID,
-					).Scan(&invoiceRate, &invoiceCurrencyID)
-				}
-				if invoiceRate > 1 && paymentExchangeRate > 1 && invoiceRate != paymentExchangeRate {
-					// allocation amount is in foreign currency; diff in base currency (UZS)
-					diff := a.Amount * (paymentExchangeRate - invoiceRate)
-					totalExchangeDiff += diff
-					totalForeignAmount += a.Amount
-					weightedInvoiceRate += a.Amount * invoiceRate
-				}
-			}
-			// Calculate weighted average initial rate
-			if totalForeignAmount > 0 {
-				weightedInvoiceRate = weightedInvoiceRate / totalForeignAmount
-			}
-
-			if totalExchangeDiff != 0 {
-				// Find exchange gain/loss accounts
-				var exchangeAccountID uuid.UUID
-				var exchangeDiffDesc string
-				var exchangeDiffType string
-				if (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0) {
-					// Exchange gain
-					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "9540")
-					exchangeDiffDesc = "Valyuta kursi bo'yicha foyda"
-					exchangeDiffType = "positive"
-				} else {
-					// Exchange loss
-					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "9630")
-					exchangeDiffDesc = "Valyuta kursi bo'yicha zarar"
-					exchangeDiffType = "negative"
-				}
-
-				absDiff := totalExchangeDiff
-				if absDiff < 0 {
-					absDiff = -absDiff
-				}
-
-				if exchangeAccountID != uuid.Nil {
-					lineNum := 3
-					exchangeLineID := uuid.New()
-					if totalExchangeDiff > 0 {
-						// Positive diff: credit exchange gain account
-						tx.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, line_number, account_id, description,
-								debit_amount, credit_amount, exchange_rate, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-							exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
-							0.0, absDiff, 1.0, now,
-						)
-						// Also adjust the debit side (cash got more in base currency)
-						tx.Exec("UPDATE journal_entry_lines SET debit_amount = debit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 1", absDiff, journalEntryID)
-						tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
-					} else {
-						// Negative diff: debit exchange loss account
-						tx.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, line_number, account_id, description,
-								debit_amount, credit_amount, exchange_rate, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-							exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
-							absDiff, 0.0, 1.0, now,
-						)
-						// Adjust credit side (cash received less in base currency)
-						tx.Exec("UPDATE journal_entry_lines SET credit_amount = credit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 2", absDiff, journalEntryID)
-						tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
+				// For each allocation, check if invoice has a foreign currency rate
+				// diff = allocation_amount_foreign * (invoice_rate - payment_rate)
+				var totalExchangeDiff float64
+				var totalForeignAmount float64
+				var weightedInvoiceRate float64
+				for _, a := range allocations {
+					var invoiceRate float64
+					var invoiceCurrencyID sql.NullString
+					if a.DocType == "sales_invoice" {
+						_ = tx.QueryRow(
+							`SELECT COALESCE(exchange_rate, 1), currency_id FROM sales_invoices WHERE id = $1`,
+							a.DocID,
+						).Scan(&invoiceRate, &invoiceCurrencyID)
+					} else if a.DocType == "purchase_invoice" {
+						_ = tx.QueryRow(
+							`SELECT COALESCE(exchange_rate, 1), currency_id FROM purchase_invoices WHERE id = $1`,
+							a.DocID,
+						).Scan(&invoiceRate, &invoiceCurrencyID)
 					}
-					// Update exchange account balance
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3",
-						func() float64 {
-							if totalExchangeDiff > 0 {
-								return -absDiff // credit-normal income
-							}
-							return absDiff // debit-normal expense
-						}(), now, exchangeAccountID)
+					if invoiceRate > 1 && paymentExchangeRate > 1 && invoiceRate != paymentExchangeRate {
+						// allocation amount is in foreign currency; diff in base currency (UZS)
+						diff := a.Amount * (paymentExchangeRate - invoiceRate)
+						totalExchangeDiff += diff
+						totalForeignAmount += a.Amount
+						weightedInvoiceRate += a.Amount * invoiceRate
+					}
+				}
+				// Calculate weighted average initial rate
+				if totalForeignAmount > 0 {
+					weightedInvoiceRate = weightedInvoiceRate / totalForeignAmount
+				}
 
-					// Record in exchange_diffs table
-					if paymentCurrencyID.Valid {
-						currencyUUID, _ := uuid.Parse(paymentCurrencyID.String)
-						if currencyUUID != uuid.Nil {
-							var edContactName string
-							var edCurrencyCode string
-							tx.QueryRow("SELECT name FROM contacts WHERE id = $1", contactID).Scan(&edContactName)
-							tx.QueryRow("SELECT code FROM currencies WHERE id = $1", currencyUUID).Scan(&edCurrencyCode)
+				if totalExchangeDiff != 0 {
+					// Find exchange gain/loss accounts
+					var exchangeAccountID uuid.UUID
+					var exchangeDiffDesc string
+					var exchangeDiffType string
+					if (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0) {
+						// Exchange gain
+						exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "9540")
+						exchangeDiffDesc = "Valyuta kursi bo'yicha foyda"
+						exchangeDiffType = "positive"
+					} else {
+						// Exchange loss
+						exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "9630")
+						exchangeDiffDesc = "Valyuta kursi bo'yicha zarar"
+						exchangeDiffType = "negative"
+					}
+
+					absDiff := totalExchangeDiff
+					if absDiff < 0 {
+						absDiff = -absDiff
+					}
+
+					if exchangeAccountID != uuid.Nil {
+						lineNum := 3
+						exchangeLineID := uuid.New()
+						if totalExchangeDiff > 0 {
+							// Positive diff: credit exchange gain account
 							tx.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, line_number, account_id, description,
+								debit_amount, credit_amount, exchange_rate, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+								exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
+								0.0, absDiff, 1.0, now,
+							)
+							// Also adjust the debit side (cash got more in base currency)
+							tx.Exec("UPDATE journal_entry_lines SET debit_amount = debit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 1", absDiff, journalEntryID)
+							tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
+						} else {
+							// Negative diff: debit exchange loss account
+							tx.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, line_number, account_id, description,
+								debit_amount, credit_amount, exchange_rate, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+								exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
+								absDiff, 0.0, 1.0, now,
+							)
+							// Adjust credit side (cash received less in base currency)
+							tx.Exec("UPDATE journal_entry_lines SET credit_amount = credit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 2", absDiff, journalEntryID)
+							tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
+						}
+						// Update exchange account balance
+						tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3",
+							func() float64 {
+								if totalExchangeDiff > 0 {
+									return -absDiff // credit-normal income
+								}
+								return absDiff // debit-normal expense
+							}(), now, exchangeAccountID)
+
+						// Record in exchange_diffs table
+						if paymentCurrencyID.Valid {
+							currencyUUID, _ := uuid.Parse(paymentCurrencyID.String)
+							if currencyUUID != uuid.Nil {
+								var edContactName string
+								var edCurrencyCode string
+								tx.QueryRow("SELECT name FROM contacts WHERE id = $1", contactID).Scan(&edContactName)
+								tx.QueryRow("SELECT code FROM currencies WHERE id = $1", currencyUUID).Scan(&edCurrencyCode)
+								tx.Exec(`
 								INSERT INTO exchange_diffs (id, tenant_id, organization_id, currency_id, amount_uzs, diff_type, period_start, period_end, journal_entry_id, description, created_by, created_at, updated_at,
 									document_number, counterparty_id, counterparty_name, foreign_amount, initial_rate, final_rate)
 								VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
 									$14, $15, $16, $17, $18, $19)`,
-								uuid.New(), tenantID, orgIDPtr, currencyUUID, absDiff, exchangeDiffType,
-								paymentDate, paymentDate, journalEntryID,
-								fmt.Sprintf("Kurs farqi — %s — %s — %s", paymentNumber, edCurrencyCode, paymentDate.Format("02.01.2006")),
-								userID, now, now,
-								paymentNumber, contactID, edContactName, totalForeignAmount, weightedInvoiceRate, paymentExchangeRate,
-							)
+									uuid.New(), tenantID, orgIDPtr, currencyUUID, absDiff, exchangeDiffType,
+									paymentDate, paymentDate, journalEntryID,
+									fmt.Sprintf("Kurs farqi — %s — %s — %s", paymentNumber, edCurrencyCode, paymentDate.Format("02.01.2006")),
+									userID, now, now,
+									paymentNumber, contactID, edContactName, totalForeignAmount, weightedInvoiceRate, paymentExchangeRate,
+								)
+							}
 						}
+
+						h.log.Info("Exchange difference recorded",
+							"payment_id", id, "diff", totalExchangeDiff, "type", exchangeDiffType,
+							"invoice_rate_sample", "varies", "payment_rate", paymentExchangeRate)
 					}
-
-					h.log.Info("Exchange difference recorded",
-						"payment_id", id, "diff", totalExchangeDiff, "type", exchangeDiffType,
-						"invoice_rate_sample", "varies", "payment_rate", paymentExchangeRate)
 				}
-			}
 
-			tx.Exec("RELEASE SAVEPOINT create_payment_je")
+				tx.Exec("RELEASE SAVEPOINT create_payment_je")
 			}
 		} else {
 			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)
@@ -5761,16 +6072,16 @@ func (h *Handler) ListExchangeRates(c *gin.Context) {
 	defer rows.Close()
 
 	type ExchangeRateResponse struct {
-		ID                 uuid.UUID `json:"id"`
-		FromCurrency       string    `json:"from_currency"`
-		ToCurrency         string    `json:"to_currency"`
-		Rate               float64   `json:"rate"`
-		EffectiveDate      string    `json:"effective_date"`
-		Source             string    `json:"source"`
-		CreatedAt          time.Time `json:"created_at"`
-		PreviousRate       float64   `json:"previous_rate,omitempty"`
-		RateChange         float64   `json:"rate_change,omitempty"`
-		RateChangePercent  float64   `json:"rate_change_percent,omitempty"`
+		ID                uuid.UUID `json:"id"`
+		FromCurrency      string    `json:"from_currency"`
+		ToCurrency        string    `json:"to_currency"`
+		Rate              float64   `json:"rate"`
+		EffectiveDate     string    `json:"effective_date"`
+		Source            string    `json:"source"`
+		CreatedAt         time.Time `json:"created_at"`
+		PreviousRate      float64   `json:"previous_rate,omitempty"`
+		RateChange        float64   `json:"rate_change,omitempty"`
+		RateChangePercent float64   `json:"rate_change_percent,omitempty"`
 	}
 
 	rates := make([]ExchangeRateResponse, 0)
@@ -6641,19 +6952,19 @@ func (h *Handler) ListBankReconciliations(c *gin.Context) {
 	defer rows.Close()
 
 	type Reconciliation struct {
-		ID                    uuid.UUID  `json:"id"`
-		BankAccountID         uuid.UUID  `json:"bank_account_id"`
-		StatementDate         string     `json:"statement_date"`
-		StatementEndingBalance float64   `json:"statement_ending_balance"`
-		BookBalance           float64    `json:"book_balance"`
-		ReconciledBalance     *float64   `json:"reconciled_balance"`
-		Difference            *float64   `json:"difference"`
-		Status                string     `json:"status"`
-		CompletedAt           *time.Time `json:"completed_at"`
-		CompletedBy           *uuid.UUID `json:"completed_by"`
-		CompletedByName       string     `json:"completed_by_name"`
-		Notes                 *string    `json:"notes"`
-		CreatedAt             time.Time  `json:"created_at"`
+		ID                     uuid.UUID  `json:"id"`
+		BankAccountID          uuid.UUID  `json:"bank_account_id"`
+		StatementDate          string     `json:"statement_date"`
+		StatementEndingBalance float64    `json:"statement_ending_balance"`
+		BookBalance            float64    `json:"book_balance"`
+		ReconciledBalance      *float64   `json:"reconciled_balance"`
+		Difference             *float64   `json:"difference"`
+		Status                 string     `json:"status"`
+		CompletedAt            *time.Time `json:"completed_at"`
+		CompletedBy            *uuid.UUID `json:"completed_by"`
+		CompletedByName        string     `json:"completed_by_name"`
+		Notes                  *string    `json:"notes"`
+		CreatedAt              time.Time  `json:"created_at"`
 	}
 
 	reconciliations := make([]Reconciliation, 0)
@@ -7074,9 +7385,9 @@ func (h *Handler) UpdateBankReconciliation(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"message":           "Reconciliation updated",
-		"cleared_bank":      len(input.ClearedBankTransactions),
-		"cleared_journal":   len(input.ClearedJournalEntries),
+		"message":            "Reconciliation updated",
+		"cleared_bank":       len(input.ClearedBankTransactions),
+		"cleared_journal":    len(input.ClearedJournalEntries),
 		"reconciled_balance": clearedBookTotal,
 	})
 }
@@ -8235,13 +8546,13 @@ func (h *Handler) GetFiscalYear(c *gin.Context) {
 
 // CreateFiscalYearInput represents the input for creating a fiscal year
 type CreateFiscalYearInput struct {
-	Name           string    `json:"name" binding:"required"`
-	Code           string    `json:"code"`
-	StartDate      string    `json:"start_date" binding:"required"`
-	EndDate        string    `json:"end_date" binding:"required"`
-	OrganizationID *string   `json:"organization_id,omitempty"`
-	AutoGenerate   bool      `json:"auto_generate"`
-	PeriodType     string    `json:"period_type"` // monthly, quarterly
+	Name           string  `json:"name" binding:"required"`
+	Code           string  `json:"code"`
+	StartDate      string  `json:"start_date" binding:"required"`
+	EndDate        string  `json:"end_date" binding:"required"`
+	OrganizationID *string `json:"organization_id,omitempty"`
+	AutoGenerate   bool    `json:"auto_generate"`
+	PeriodType     string  `json:"period_type"` // monthly, quarterly
 }
 
 // CreateFiscalYear godoc
@@ -9036,29 +9347,29 @@ func (h *Handler) UnlockFiscalPeriod(c *gin.Context) {
 // ==================== BUDGETS ====================
 
 type CreateBudgetInput struct {
-	OrganizationID   *string  `json:"organization_id"`
-	FiscalYearID     string   `json:"fiscal_year_id" binding:"required"`
-	Code             string   `json:"code" binding:"required"`
-	Name             string   `json:"name" binding:"required"`
-	Description      *string  `json:"description"`
-	BudgetType       string   `json:"budget_type"` // expense, revenue, combined
-	TotalAmount      float64  `json:"total_amount"`
-	Status           string   `json:"status"`
-	StartDate        *string  `json:"start_date"`
-	EndDate          *string  `json:"end_date"`
-	WarningThreshold *float64 `json:"warning_threshold"`
+	OrganizationID   *string                 `json:"organization_id"`
+	FiscalYearID     string                  `json:"fiscal_year_id" binding:"required"`
+	Code             string                  `json:"code" binding:"required"`
+	Name             string                  `json:"name" binding:"required"`
+	Description      *string                 `json:"description"`
+	BudgetType       string                  `json:"budget_type"` // expense, revenue, combined
+	TotalAmount      float64                 `json:"total_amount"`
+	Status           string                  `json:"status"`
+	StartDate        *string                 `json:"start_date"`
+	EndDate          *string                 `json:"end_date"`
+	WarningThreshold *float64                `json:"warning_threshold"`
 	Lines            []CreateBudgetLineInput `json:"lines"`
 }
 
 type CreateBudgetLineInput struct {
-	BudgetID       string   `json:"budget_id" binding:"required"`
-	AccountID      string   `json:"account_id" binding:"required"`
-	FiscalPeriodID *string  `json:"fiscal_period_id"`
-	DepartmentID   *string  `json:"department_id"`
-	BudgetedAmount float64  `json:"budgeted_amount"`
-	PlannedAmount  float64  `json:"planned_amount"` // alias from frontend
-	ActualAmount   float64  `json:"actual_amount"`
-	Notes          *string  `json:"notes"`
+	BudgetID       string  `json:"budget_id" binding:"required"`
+	AccountID      string  `json:"account_id" binding:"required"`
+	FiscalPeriodID *string `json:"fiscal_period_id"`
+	DepartmentID   *string `json:"department_id"`
+	BudgetedAmount float64 `json:"budgeted_amount"`
+	PlannedAmount  float64 `json:"planned_amount"` // alias from frontend
+	ActualAmount   float64 `json:"actual_amount"`
+	Notes          *string `json:"notes"`
 }
 
 // ListBudgets godoc
@@ -11023,12 +11334,12 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	`, tenantID)
 
 	type AccountBalance struct {
-		ID           string  `json:"id"`
-		Code         string  `json:"code"`
-		Name         string  `json:"name"`
-		Currency     string  `json:"currency"`
-		Balance      float64 `json:"balance"`
-		IsNegative   bool    `json:"is_negative"`
+		ID         string  `json:"id"`
+		Code       string  `json:"code"`
+		Name       string  `json:"name"`
+		Currency   string  `json:"currency"`
+		Balance    float64 `json:"balance"`
+		IsNegative bool    `json:"is_negative"`
 	}
 
 	accountBalances := make([]AccountBalance, 0)
@@ -11141,11 +11452,11 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 
 	// 4. Build 30-day payment calendar
 	type CalendarDay struct {
-		Date           string  `json:"date"`
-		Inflows        float64 `json:"inflows"`
-		Outflows       float64 `json:"outflows"`
-		RunningBalance float64 `json:"running_balance"`
-		IsNegative     bool    `json:"is_negative"`
+		Date           string                   `json:"date"`
+		Inflows        float64                  `json:"inflows"`
+		Outflows       float64                  `json:"outflows"`
+		RunningBalance float64                  `json:"running_balance"`
+		IsNegative     bool                     `json:"is_negative"`
 		Events         []map[string]interface{} `json:"events,omitempty"`
 	}
 
@@ -11197,19 +11508,19 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"account_balances": accountBalances,
-		"total_cash":       totalCash,
-		"receivables":      receivables,
-		"payables":         payables,
+		"account_balances":  accountBalances,
+		"total_cash":        totalCash,
+		"receivables":       receivables,
+		"payables":          payables,
 		"total_receivables": totalReceivables,
 		"total_payables":    totalPayables,
-		"net_position":     totalCash + totalReceivables - totalPayables,
-		"calendar":         calendar,
+		"net_position":      totalCash + totalReceivables - totalPayables,
+		"calendar":          calendar,
 		"summary": gin.H{
-			"current_balance":     totalCash,
-			"expected_inflows":    totalReceivables,
-			"expected_outflows":   totalPayables,
-			"forecast_30d":        totalCash + totalReceivables - totalPayables,
+			"current_balance":   totalCash,
+			"expected_inflows":  totalReceivables,
+			"expected_outflows": totalPayables,
+			"forecast_30d":      totalCash + totalReceivables - totalPayables,
 			"has_negative_accounts": func() bool {
 				for _, ab := range accountBalances {
 					if ab.IsNegative {
@@ -11240,11 +11551,11 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 
 	// Get budget details
 	var budget struct {
-		ID        string  `json:"id"`
-		Name      string  `json:"name"`
-		StartDate string  `json:"start_date"`
-		EndDate   string  `json:"end_date"`
-		Type      string  `json:"type"`
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		StartDate string `json:"start_date"`
+		EndDate   string `json:"end_date"`
+		Type      string `json:"type"`
 	}
 	h.db.QueryRow(`
 		SELECT b.id::text, b.name,
@@ -11348,8 +11659,8 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 	_ = groupBy // TODO: implement groupBy logic
 
 	response.Success(c, gin.H{
-		"budget":    budget,
-		"items":     items,
+		"budget": budget,
+		"items":  items,
 		"totals": gin.H{
 			"planned_revenue":  totalPlannedRevenue,
 			"actual_revenue":   totalActualRevenue,

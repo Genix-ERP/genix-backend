@@ -1105,6 +1105,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Odoo-style: register a payment for a partner (no invoice picked) → auto-settle
 		// their open invoices/bills oldest-first; excess stays as a credit.
 		payments.POST("/register", h.perm.Require("finance", "payment", "create"), h.RegisterPartnerPayment)
+		// Odoo-style partner reconciliation: list partner balances, drill into a
+		// partner's open docs + unallocated credit, and apply credit to a document.
+		payments.GET("/partner-balances", h.GetPartnerBalances)
+		payments.GET("/partner-ledger", h.GetPartnerLedger)
+		payments.POST("/reconcile", h.perm.Require("finance", "payment", "create"), h.ReconcilePartnerCredit)
 		payments.GET("/:id", h.GetPayment)
 		payments.POST("/:id/confirm", h.perm.Require("finance", "payment", "approve"), h.ConfirmPayment)
 	}
