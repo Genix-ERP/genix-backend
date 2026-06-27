@@ -20,6 +20,8 @@ package handler
 // bank Debet (money out) -> Cr 5110. amount = Kredit - Debet.
 
 import (
+	"database/sql"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/xuri/excelize/v2"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -36,6 +39,7 @@ import (
 const vipiskaBankAccountCode = "5110" // ERP settlement (bank) account
 
 type vipiskaTxn struct {
+	ID                  string  `json:"id"`
 	LineNumber          int     `json:"line_number"`
 	DocNumber           string  `json:"doc_number"`
 	DocDate             string  `json:"doc_date"`
@@ -55,6 +59,9 @@ type vipiskaTxn struct {
 	DebetCode           string  `json:"debet_account_code"`
 	KreditCode          string  `json:"kredit_account_code"`
 	Status              string  `json:"status"` // suggested | unmatched
+	MatchedContactName  string  `json:"matched_contact_name"`
+	DebetAccountID      string  `json:"debet_account_id"`
+	KreditAccountID     string  `json:"kredit_account_id"`
 
 	docDateT     time.Time
 	targetCode   string
@@ -148,49 +155,66 @@ func (h *Handler) ImportBankVipiska(c *gin.Context) {
 	// Load classification rules (tenant-specific first, then global defaults).
 	rules := h.loadClassificationRules(tenantID)
 
-	// Classify + resolve accounts.
+	// Classify + resolve accounts. An operation is "Detected" only when BOTH the
+	// bank account and the classified target account actually exist in this
+	// org's chart — otherwise the accounts are left BLANK for manual selection
+	// (never defaulted to a code that has no real account behind it).
 	for i := range txns {
 		t := &txns[i]
+		t.ID = uuid.New().String()
 		classifyVipiska(t, rules)
+
+		var tid uuid.UUID
+		var tcode string
 		if t.targetCode != "" {
-			tid, tcode := h.resolveAccountIDByCode(tenantID, orgArg, t.targetCode)
-			if t.Direction == "in" {
-				// money in: Dt bank / Cr target
-				t.DebetCode, t.KreditCode = bankCode, tcode
-				if bankID != uuid.Nil {
-					b := bankID
-					t.debetAcctID = &b
-				}
-				if tid != uuid.Nil {
-					t.kreditAcctID = &tid
-				}
-			} else {
-				// money out: Dt target / Cr bank
-				t.DebetCode, t.KreditCode = tcode, bankCode
-				if tid != uuid.Nil {
-					t.debetAcctID = &tid
-				}
-				if bankID != uuid.Nil {
-					b := bankID
-					t.kreditAcctID = &b
-				}
-			}
-			if t.DebetCode == "" {
-				t.DebetCode = ternaryStr(t.Direction == "in", bankCode, t.targetCode)
-			}
-			if t.KreditCode == "" {
-				t.KreditCode = ternaryStr(t.Direction == "in", t.targetCode, bankCode)
-			}
-			t.Status = "suggested"
-		} else {
-			t.Status = "unmatched"
+			tid, tcode = h.resolveAccountIDByCode(tenantID, orgArg, t.targetCode)
 		}
-		// Best-effort contact match by INN (for display + later posting).
+		if t.Direction == "in" {
+			// money in: Dt bank / Cr target
+			if bankID != uuid.Nil {
+				b := bankID
+				t.debetAcctID = &b
+				t.DebetCode = bankCode
+			}
+			if tid != uuid.Nil {
+				k := tid
+				t.kreditAcctID = &k
+				t.KreditCode = tcode
+			}
+		} else {
+			// money out: Dt target / Cr bank
+			if tid != uuid.Nil {
+				d := tid
+				t.debetAcctID = &d
+				t.DebetCode = tcode
+			}
+			if bankID != uuid.Nil {
+				b := bankID
+				t.kreditAcctID = &b
+				t.KreditCode = bankCode
+			}
+		}
+		if t.debetAcctID != nil {
+			t.DebetAccountID = t.debetAcctID.String()
+		}
+		if t.kreditAcctID != nil {
+			t.KreditAccountID = t.kreditAcctID.String()
+		}
+		if t.debetAcctID != nil && t.kreditAcctID != nil {
+			t.Status = "suggested" // Detected — both accounts resolved
+		} else {
+			t.Status = "unmatched" // Undetected — needs a manual account
+		}
+
+		// Best-effort contact match by INN (links the bank line to a known
+		// customer/vendor record so later posting can attribute the partner).
 		if t.CounterpartyINN != "" {
 			var cid uuid.UUID
-			if e := h.db.QueryRow(`SELECT id FROM contacts WHERE tenant_id=$1 AND tax_id=$2 AND deleted_at IS NULL LIMIT 1`,
-				tenantID, t.CounterpartyINN).Scan(&cid); e == nil {
+			var cname string
+			if e := h.db.QueryRow(`SELECT id, COALESCE(name,'') FROM contacts WHERE tenant_id=$1 AND tax_id=$2 AND deleted_at IS NULL LIMIT 1`,
+				tenantID, t.CounterpartyINN).Scan(&cid, &cname); e == nil {
 				t.contactID = &cid
+				t.MatchedContactName = cname
 			}
 		}
 	}
@@ -239,7 +263,7 @@ func (h *Handler) ImportBankVipiska(c *gin.Context) {
 				debet_account_id, kredit_account_id, debet_account_code, kredit_account_code,
 				matched_contact_id, match_status, created_at
 			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
-			uuid.New(), importID, t.LineNumber, t.DocNumber, docDateArg,
+			t.ID, importID, t.LineNumber, t.DocNumber, docDateArg,
 			t.CounterpartyName, t.CounterpartyINN, t.CounterpartyAccount,
 			t.OpCode, t.MFO, t.AccountPrefix, t.Amount, t.Direction,
 			t.Purpose, t.PurposeCode, nullIfEmpty(t.Category),
@@ -290,12 +314,16 @@ func (h *Handler) GetBankVipiskaTransactions(c *gin.Context) {
 		return
 	}
 	rows, err := h.db.Query(`
-		SELECT line_number, doc_number, doc_date, counterparty_name, counterparty_inn,
-		       counterparty_account, COALESCE(op_code,''), COALESCE(mfo,''), COALESCE(account_prefix,''),
-		       amount, direction, COALESCE(purpose,''), COALESCE(purpose_code,''), COALESCE(category,''),
-		       COALESCE(debet_account_code,''), COALESCE(kredit_account_code,''), match_status
-		FROM bank_statement_transactions
-		WHERE import_id=$1 ORDER BY line_number ASC`, importID)
+		SELECT t.id::text, t.line_number, t.doc_number, t.doc_date, t.counterparty_name, t.counterparty_inn,
+		       t.counterparty_account, COALESCE(t.op_code,''), COALESCE(t.mfo,''), COALESCE(t.account_prefix,''),
+		       t.amount, t.direction, COALESCE(t.purpose,''), COALESCE(t.purpose_code,''), COALESCE(t.category,''),
+		       COALESCE(t.debet_account_id::text,''), COALESCE(t.kredit_account_id::text,''),
+		       COALESCE(t.debet_account_code,''), COALESCE(t.kredit_account_code,''),
+		       t.match_status, (t.matched_journal_entry_id IS NOT NULL) AS posted,
+		       COALESCE(c.name,'')
+		FROM bank_statement_transactions t
+		LEFT JOIN contacts c ON c.id = t.matched_contact_id
+		WHERE t.import_id=$1 ORDER BY t.line_number ASC`, importID)
 	if err != nil {
 		response.InternalError(c, "Failed to load transactions")
 		return
@@ -304,22 +332,26 @@ func (h *Handler) GetBankVipiskaTransactions(c *gin.Context) {
 	out := make([]gin.H, 0)
 	for rows.Next() {
 		var (
-			ln                                         int
-			doc, name, inn, acct, op, mfo, pfx         string
-			amount                                     float64
-			dir, purpose, pcode, cat, dcode, kcode, st string
-			docDate                                    *time.Time
+			id, doc, name, inn, acct, op, mfo, pfx                 string
+			ln                                                     int
+			amount                                                 float64
+			dir, purpose, pcode, cat, daid, kaid, dcode, kcode, st string
+			posted                                                 bool
+			cname                                                  string
+			docDate                                                *time.Time
 		)
-		if rows.Scan(&ln, &doc, &docDate, &name, &inn, &acct, &op, &mfo, &pfx,
-			&amount, &dir, &purpose, &pcode, &cat, &dcode, &kcode, &st) != nil {
+		if rows.Scan(&id, &ln, &doc, &docDate, &name, &inn, &acct, &op, &mfo, &pfx,
+			&amount, &dir, &purpose, &pcode, &cat, &daid, &kaid, &dcode, &kcode, &st, &posted, &cname) != nil {
 			continue
 		}
 		row := gin.H{
-			"line_number": ln, "doc_number": doc, "counterparty_name": name,
+			"id": id, "line_number": ln, "doc_number": doc, "counterparty_name": name,
 			"counterparty_inn": inn, "counterparty_account": acct, "op_code": op, "mfo": mfo,
 			"account_prefix": pfx, "amount": amount, "direction": dir, "purpose": purpose,
-			"purpose_code": pcode, "category": cat, "debet_account_code": dcode,
-			"kredit_account_code": kcode, "status": st,
+			"purpose_code": pcode, "category": cat,
+			"debet_account_id": daid, "kredit_account_id": kaid,
+			"debet_account_code": dcode, "kredit_account_code": kcode,
+			"status": st, "posted": posted, "matched_contact_name": cname,
 		}
 		if docDate != nil {
 			row["doc_date"] = docDate.Format("2006-01-02")
@@ -327,6 +359,291 @@ func (h *Handler) GetBankVipiskaTransactions(c *gin.Context) {
 		out = append(out, row)
 	}
 	response.Success(c, out)
+}
+
+// UpdateBankVipiskaLineAccounts lets the user override the auto-detected Dt/Cr
+// accounts on a single line before posting. Recomputes the detected status.
+func (h *Handler) UpdateBankVipiskaLineAccounts(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	lineID, err := uuid.Parse(c.Param("lineId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid line id")
+		return
+	}
+	var input struct {
+		DebetAccountID  string `json:"debet_account_id"`
+		KreditAccountID string `json:"kredit_account_id"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+	var posted bool
+	if e := h.db.QueryRow(`
+		SELECT (t.matched_journal_entry_id IS NOT NULL)
+		FROM bank_statement_transactions t JOIN bank_statement_imports i ON i.id=t.import_id
+		WHERE t.id=$1 AND i.tenant_id=$2`, lineID, tenantID).Scan(&posted); e != nil {
+		response.NotFound(c, "Line not found")
+		return
+	}
+	if posted {
+		response.BadRequest(c, "This operation is already posted")
+		return
+	}
+
+	deb := nullUUID(input.DebetAccountID)
+	kre := nullUUID(input.KreditAccountID)
+	var debCode, kreCode interface{}
+	if input.DebetAccountID != "" {
+		var cc string
+		_ = h.db.QueryRow(`SELECT code FROM accounts WHERE id=$1 AND tenant_id=$2`, input.DebetAccountID, tenantID).Scan(&cc)
+		debCode = nullIfEmpty(cc)
+	}
+	if input.KreditAccountID != "" {
+		var cc string
+		_ = h.db.QueryRow(`SELECT code FROM accounts WHERE id=$1 AND tenant_id=$2`, input.KreditAccountID, tenantID).Scan(&cc)
+		kreCode = nullIfEmpty(cc)
+	}
+	status := "unmatched"
+	if deb.Valid && kre.Valid {
+		status = "suggested"
+	}
+	if _, err := h.db.Exec(`
+		UPDATE bank_statement_transactions
+		SET debet_account_id=$1, kredit_account_id=$2, debet_account_code=$3, kredit_account_code=$4,
+		    match_status = CASE WHEN match_status='matched' THEN match_status ELSE $5 END
+		WHERE id=$6`, deb, kre, debCode, kreCode, status, lineID); err != nil {
+		h.log.Error("vipiska: update line accounts", "error", err)
+		response.InternalError(c, "Failed to update")
+		return
+	}
+	response.Success(c, gin.H{"status": status})
+}
+
+// ConfirmBankVipiskaLine verifies and POSTS a single operation: it creates a
+// balanced journal entry (Dt debet / Cr kredit) for the line's amount, updates
+// account balances, and marks the line as posted. (TZ §5.4 "Ha" / approve.)
+func (h *Handler) ConfirmBankVipiskaLine(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	lineID, err := uuid.Parse(c.Param("lineId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid line id")
+		return
+	}
+
+	var (
+		amount                         float64
+		dir, docNum, cpName            string
+		debStr, kreStr, orgStr, conStr sql.NullString
+		docDate                        *time.Time
+		posted                         bool
+	)
+	err = h.db.QueryRow(`
+		SELECT t.amount, t.direction, COALESCE(t.doc_number,''), COALESCE(t.counterparty_name,''),
+		       t.debet_account_id::text, t.kredit_account_id::text, t.doc_date,
+		       i.organization_id::text, t.matched_contact_id::text,
+		       (t.matched_journal_entry_id IS NOT NULL)
+		FROM bank_statement_transactions t JOIN bank_statement_imports i ON i.id=t.import_id
+		WHERE t.id=$1 AND i.tenant_id=$2`, lineID, tenantID).Scan(
+		&amount, &dir, &docNum, &cpName, &debStr, &kreStr, &docDate, &orgStr, &conStr, &posted)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Line not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("vipiska confirm: load line", "error", err)
+		response.InternalError(c, "Failed to post")
+		return
+	}
+	if posted {
+		response.BadRequest(c, "This operation is already posted")
+		return
+	}
+	if !debStr.Valid || !kreStr.Valid || debStr.String == "" || kreStr.String == "" {
+		response.BadRequest(c, "Avval Dt va Kt hisob raqamlarini tanlang / select both Dt and Kt accounts first")
+		return
+	}
+	if amount <= 0.001 {
+		response.BadRequest(c, "Amount must be greater than zero")
+		return
+	}
+	debID, _ := uuid.Parse(debStr.String)
+	kreID, _ := uuid.Parse(kreStr.String)
+	var orgArg interface{}
+	if orgStr.Valid && orgStr.String != "" {
+		orgArg = orgStr.String
+	}
+	var conArg interface{}
+	if conStr.Valid && conStr.String != "" {
+		conArg = conStr.String
+	}
+	entryDate := time.Now()
+	if docDate != nil {
+		entryDate = *docDate
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to post")
+		return
+	}
+	defer tx.Rollback()
+
+	var journalID uuid.UUID
+	var jprefix sql.NullString
+	_ = tx.QueryRow(`SELECT id, number_prefix FROM journals
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2 OR organization_id IS NULL)
+		ORDER BY CASE WHEN LOWER(COALESCE(type,''))='bank' THEN 0 WHEN code='GENERAL' THEN 1 ELSE 2 END LIMIT 1`,
+		tenantID, orgArg).Scan(&journalID, &jprefix)
+	if journalID == uuid.Nil {
+		response.BadRequest(c, "No journal is configured for this company.")
+		return
+	}
+	var maxNum int
+	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT)),0)
+		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL
+		  AND LENGTH(REGEXP_REPLACE(entry_number,'[^0-9]','','g')) <= 9`, tenantID, journalID).Scan(&maxNum)
+	px := ""
+	if jprefix.Valid {
+		px = jprefix.String
+	}
+	entryNumber := fmt.Sprintf("%s%06d", px, maxNum+1)
+	desc := "Bank vipiska: " + docNum
+	if cpName != "" {
+		desc += " — " + cpName
+	}
+
+	jeID := uuid.New()
+	now := time.Now()
+	if _, err := tx.Exec(`INSERT INTO journal_entries
+		(id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description, source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'bank_vipiska',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
+		jeID, tenantID, orgArg, journalID, entryNumber, entryDate, nullIfEmpty(docNum), desc, lineID.String(), amount, userID, now); err != nil {
+		h.log.Error("vipiska confirm: JE header", "error", err)
+		response.InternalError(c, "Failed to post")
+		return
+	}
+
+	// Attribute the contact to the partner (non-bank) leg.
+	var debContact, kreContact interface{}
+	if dir == "in" {
+		kreContact = conArg
+	} else {
+		debContact = conArg
+	}
+	jel := func(acct uuid.UUID, contact interface{}, line int, debit, credit float64) error {
+		_, e := tx.Exec(`INSERT INTO journal_entry_lines
+			(id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1.0,$9)`, uuid.New(), jeID, line, acct, contact, desc, debit, credit, now)
+		return e
+	}
+	if err := jel(debID, debContact, 1, amount, 0); err != nil {
+		h.log.Error("vipiska confirm: Dt line", "error", err)
+		response.InternalError(c, "Failed to post")
+		return
+	}
+	if err := jel(kreID, kreContact, 2, 0, amount); err != nil {
+		h.log.Error("vipiska confirm: Cr line", "error", err)
+		response.InternalError(c, "Failed to post")
+		return
+	}
+
+	// Update account balances (normal_balance aware), like PostJournalEntry.
+	if err := updateAccountBalanceTx(tx, debID, amount, 0); err != nil {
+		if friendly := negativeBalanceMessage(h, err, debID); friendly != "" {
+			response.BadRequest(c, friendly)
+			return
+		}
+		response.InternalError(c, "Failed to post")
+		return
+	}
+	if err := updateAccountBalanceTx(tx, kreID, 0, amount); err != nil {
+		if friendly := negativeBalanceMessage(h, err, kreID); friendly != "" {
+			response.BadRequest(c, friendly)
+			return
+		}
+		response.InternalError(c, "Failed to post")
+		return
+	}
+
+	if _, err := tx.Exec(`UPDATE bank_statement_transactions
+		SET matched_journal_entry_id=$1, match_status='matched' WHERE id=$2`, jeID, lineID); err != nil {
+		h.log.Error("vipiska confirm: mark line", "error", err)
+		response.InternalError(c, "Failed to post")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("vipiska confirm: commit", "error", err)
+		response.InternalError(c, "Failed to post")
+		return
+	}
+	response.Success(c, gin.H{"journal_entry_id": jeID, "entry_number": entryNumber})
+}
+
+// RejectBankVipiskaLine marks an operation as not-to-post ("Yo'q"). It stays in
+// the statement and can be reviewed/posted later. (TZ §5.3 "Yo'q".)
+func (h *Handler) RejectBankVipiskaLine(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	lineID, err := uuid.Parse(c.Param("lineId"))
+	if err != nil {
+		response.BadRequest(c, "Invalid line id")
+		return
+	}
+	res, err := h.db.Exec(`UPDATE bank_statement_transactions t
+		SET match_status='ignored'
+		FROM bank_statement_imports i
+		WHERE t.import_id=i.id AND t.id=$1 AND i.tenant_id=$2 AND t.matched_journal_entry_id IS NULL`, lineID, tenantID)
+	if err != nil {
+		response.InternalError(c, "Failed to update")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.BadRequest(c, "Line not found or already posted")
+		return
+	}
+	response.Success(c, gin.H{"status": "ignored"})
+}
+
+// updateAccountBalanceTx applies a posting to current_balance using the
+// account's normal balance side (debit-normal: +debit-credit; credit-normal:
+// +credit-debit) — identical to PostJournalEntry.
+func updateAccountBalanceTx(tx *sql.Tx, accountID uuid.UUID, debit, credit float64) error {
+	var nb string
+	if err := tx.QueryRow(`SELECT at.normal_balance FROM accounts a JOIN account_types at ON a.account_type_id=at.id WHERE a.id=$1`, accountID).Scan(&nb); err != nil {
+		nb = "debit"
+	}
+	change := debit - credit
+	if nb != "debit" {
+		change = credit - debit
+	}
+	_, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = now() WHERE id=$2`, change, accountID)
+	return err
+}
+
+// negativeBalanceMessage returns a friendly message if err is the cash/bank
+// negative-balance trigger (CHECK violation), else "".
+func negativeBalanceMessage(h *Handler, err error, accountID uuid.UUID) string {
+	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23514" {
+		var name, code string
+		var bal float64
+		_ = h.db.QueryRow(`SELECT name, code, current_balance FROM accounts WHERE id=$1`, accountID).Scan(&name, &code, &bal)
+		return fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas.", name, code)
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +838,9 @@ func (h *Handler) resolveAccountIDByCode(tenantID uuid.UUID, orgArg interface{},
 		ORDER BY COALESCE(is_leaf,true) DESC
 		LIMIT 1`, tenantID, orgArg, code).Scan(&id, &realCode)
 	if err != nil {
-		return uuid.Nil, code // fall back to the bare code for display
+		// Account not in this org's chart — leave BLANK (per TZ: undetermined
+		// operations are chosen by hand, never defaulted).
+		return uuid.Nil, ""
 	}
 	return id, realCode
 }
@@ -559,11 +878,4 @@ func absf(v float64) float64 {
 		return -v
 	}
 	return v
-}
-
-func ternaryStr(cond bool, a, b string) string {
-	if cond {
-		return a
-	}
-	return b
 }
