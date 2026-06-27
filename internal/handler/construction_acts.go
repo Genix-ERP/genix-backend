@@ -2108,8 +2108,16 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 	// Get act details
 	var actType string
 	var projectID int64
-	err = h.db.QueryRow(`SELECT act_type, project_id FROM construction_act WHERE id = $1 AND tenant_id = $2`,
-		actID, tenantID).Scan(&actType, &projectID)
+	var f3WorksDriven bool
+	var f3SubID sql.NullInt64
+	var f3PeriodFrom, f3CreatedDate sql.NullTime
+	var f3PeriodMonthFrom sql.NullInt16
+	err = h.db.QueryRow(`
+		SELECT act_type, project_id, COALESCE(f3_works_driven, FALSE),
+		       subcontract_id, period_from, period_month_from, created_date
+		FROM construction_act WHERE id = $1 AND tenant_id = $2`,
+		actID, tenantID).Scan(&actType, &projectID, &f3WorksDriven,
+		&f3SubID, &f3PeriodFrom, &f3PeriodMonthFrom, &f3CreatedDate)
 	if err != nil {
 		response.NotFound(c, "Act not found")
 		return
@@ -2130,7 +2138,15 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 		case "ks2":
 			xlsxBytes, xlsxErr = h.GenerateForma2XLSXBytes(actID, tenantID)
 		case "ks3":
-			xlsxBytes, xlsxErr = h.GenerateForma3XLSXBytes(actID, tenantID)
+			if f3WorksDriven {
+				// Re-derive from the current engineer-confirmed works for the
+				// stored subcontract + reporting period (always fresh data).
+				xlsxBytes, xlsxErr = h.regenerateWorksDrivenForma3(
+					tenantID, projectID, f3SubID, f3PeriodFrom, f3PeriodMonthFrom, f3CreatedDate,
+					normalizeF3Lang(c.Query("lang")))
+			} else {
+				xlsxBytes, xlsxErr = h.GenerateForma3XLSXBytes(actID, tenantID)
+			}
 		case "hidden_work":
 			xlsxBytes, xlsxErr = h.GenerateForma19XLSXBytes(actID, tenantID)
 		default:
@@ -2183,6 +2199,175 @@ func (h *Handler) ExportActDocument(c *gin.Context) {
 	filename := fmt.Sprintf("act_%s_%d.pdf", actType, actID)
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	c.Data(http.StatusOK, "application/pdf", pdfBytes)
+}
+
+// GenerateForma3FromWorksXLSX builds a КС-3 (Forma 3) certificate directly from
+// the engineer-confirmed (YAKUNIY) works of a project and streams it as .xlsx.
+//
+// Query params:
+//   subcontract_id : 0 = in-house (project) works, >0 = a specific subcontractor
+//   building_id    : 0 = all blocks, >0 = a single block
+//   cert_date      : Дата составления, YYYY-MM-DD (default = today)
+//   period_month   : reporting month 1..12 (default = cert_date month)
+//   period_year    : reporting year      (default = cert_date year)
+//
+// The three КС-3 windows are derived from each work's confirmed_engineer_at
+// relative to the reporting month — no separate act record is required.
+func (h *Handler) GenerateForma3FromWorksXLSX(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	subcontractID, _ := strconv.ParseInt(c.DefaultQuery("subcontract_id", "0"), 10, 64)
+	if subcontractID <= 0 {
+		response.BadRequest(c, "Forma 3 faqat pudratchi uchun tuziladi — pudratchini tanlang")
+		return
+	}
+	buildingID, _ := strconv.ParseInt(c.DefaultQuery("building_id", "0"), 10, 64)
+
+	certDate := time.Now()
+	if cd := c.Query("cert_date"); cd != "" {
+		if parsed, perr := time.Parse("2006-01-02", cd); perr == nil {
+			certDate = parsed
+		}
+	}
+
+	periodMonth := int(certDate.Month())
+	periodYear := certDate.Year()
+	if pm, perr := strconv.Atoi(c.Query("period_month")); perr == nil && pm >= 1 && pm <= 12 {
+		periodMonth = pm
+	}
+	if py, perr := strconv.Atoi(c.Query("period_year")); perr == nil && py > 2000 {
+		periodYear = py
+	}
+
+	lang := normalizeF3Lang(c.Query("lang"))
+
+	d, err := h.loadForma3FromWorks(tenantID, projectID, subcontractID, buildingID, certDate, periodMonth, periodYear, lang)
+	if err != nil {
+		h.log.Error("Failed to load Forma 3 works data", "error", err, "projectID", projectID)
+		response.InternalError(c, "Failed to build Forma 3")
+		return
+	}
+
+	// Persist a lightweight КС-3 record so it appears in Hujjatlar → Formalar.
+	// It carries no act lines — the xlsx is re-derived from the live works on
+	// every export (f3_works_driven = TRUE). Repeated downloads for the same
+	// subcontract + reporting period update one record instead of piling up.
+	h.persistWorksDrivenForma3(c, tenantID, projectID, subcontractID, certDate, periodMonth, periodYear, d)
+
+	xlsxBytes, xerr := renderForma3XLSX(d)
+	if xerr != nil {
+		h.log.Error("Failed to render Forma 3 XLSX", "error", xerr)
+		response.InternalError(c, "Failed to render Forma 3")
+		return
+	}
+
+	filename := fmt.Sprintf("forma3_%d_%04d_%02d.xlsx", projectID, periodYear, periodMonth)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	c.Data(http.StatusOK, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", xlsxBytes)
+}
+
+// normalizeF3Lang clamps a UI language code to the set Forma 3 supports,
+// defaulting to Russian (the regulated source language) for anything else.
+func normalizeF3Lang(lang string) string {
+	switch lang {
+	case "uz", "ru", "en":
+		return lang
+	default:
+		return "ru"
+	}
+}
+
+// regenerateWorksDrivenForma3 rebuilds a works-driven КС-3 .xlsx from the live
+// engineer-confirmed works using the stored subcontract + reporting period.
+func (h *Handler) regenerateWorksDrivenForma3(tenantID uuid.UUID, projectID int64, subID sql.NullInt64, periodFrom sql.NullTime, periodMonthFrom sql.NullInt16, createdDate sql.NullTime, lang string) ([]byte, error) {
+	subcontractID := int64(0)
+	if subID.Valid {
+		subcontractID = subID.Int64
+	}
+	periodMonth := int(time.Now().Month())
+	periodYear := time.Now().Year()
+	if periodFrom.Valid {
+		periodMonth = int(periodFrom.Time.Month())
+		periodYear = periodFrom.Time.Year()
+	} else if periodMonthFrom.Valid {
+		periodMonth = int(periodMonthFrom.Int16)
+	}
+	certDate := time.Now()
+	if createdDate.Valid {
+		certDate = createdDate.Time
+	}
+	d, err := h.loadForma3FromWorks(tenantID, projectID, subcontractID, 0, certDate, periodMonth, periodYear, lang)
+	if err != nil {
+		return nil, err
+	}
+	return renderForma3XLSX(d)
+}
+
+// persistWorksDrivenForma3 upserts the listing record for a works-driven КС-3.
+// Failures are logged but non-fatal — the user still gets their file.
+func (h *Handler) persistWorksDrivenForma3(c *gin.Context, tenantID uuid.UUID, projectID, subcontractID int64, certDate time.Time, periodMonth, periodYear int, d *forma3Data) {
+	// Window totals in сум (d.Rows values are тыс. сум).
+	var lifeVal, yearVal, monthVal float64
+	for _, r := range d.Rows {
+		lifeVal += r.DoneFromStartVal
+		yearVal += r.DoneFromYearVal
+		monthVal += r.DoneThisPeriodVal
+	}
+	lifeSum := lifeVal * 1000.0
+	yearSum := yearVal * 1000.0
+	monthSum := monthVal * 1000.0
+
+	periodFrom := time.Date(periodYear, time.Month(periodMonth), 1, 0, 0, 0, 0, time.UTC)
+	periodTo := periodFrom.AddDate(0, 1, -1)
+
+	userID, _ := middleware.GetUserID(c)
+
+	// One record per (subcontract, reporting period) — drop the prior one first.
+	_, _ = h.db.Exec(`
+		DELETE FROM construction_act
+		WHERE tenant_id = $1 AND project_id = $2 AND subcontract_id = $3
+		  AND act_type = 'ks3' AND f3_works_driven = TRUE AND period_from = $4
+	`, tenantID, projectID, subcontractID, periodFrom)
+
+	var actNumber int
+	_ = h.db.QueryRow(`SELECT COALESCE(MAX(act_number), 0) + 1 FROM construction_act WHERE subcontract_id = $1 AND act_type = 'ks3' AND tenant_id = $2`,
+		subcontractID, tenantID).Scan(&actNumber)
+	var cnt int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_act WHERE project_id = $1 AND tenant_id = $2 AND act_type = 'ks3'`,
+		projectID, tenantID).Scan(&cnt)
+	actName := fmt.Sprintf("Forma 3-%03d", cnt+1)
+
+	_, perr := h.db.Exec(`
+		INSERT INTO construction_act (
+			tenant_id, project_id, subcontract_id, name, act_type,
+			period_from, period_to, period_month_from, period_month_to,
+			amount_total, vat_pct, vat_amount, amount_total_with_vat,
+			currency, state, created_by, created_date, updated_date,
+			act_number, cumul_from_start, cumul_from_year_start, cumul_previous_period,
+			smr_amount, equipment_amount, other_amount, f3_works_driven
+		) VALUES ($1, $2, $3, $4, 'ks3',
+			$5, $6, $7, $7,
+			$8, 0, 0, $8,
+			'UZS', 'draft', $9, $10, NOW(),
+			$11, $12, $13, $14,
+			$8, 0, 0, TRUE)
+	`, tenantID, projectID, subcontractID, actName,
+		periodFrom, periodTo, periodMonth,
+		monthSum, userID, certDate,
+		actNumber, lifeSum, yearSum, lifeSum-monthSum)
+	if perr != nil {
+		h.log.Error("Failed to persist works-driven Forma 3 act", "error", perr, "projectID", projectID)
+	}
 }
 
 // DeleteConstructionAct deletes a draft act

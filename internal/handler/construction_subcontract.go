@@ -35,6 +35,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 
 	query := `
 		SELECT s.id, s.name, s.project_id, s.partner_name, s.work_description,
+		       COALESCE(s.contract_number, ''),
 		       s.amount, s.currency, s.start_date, s.end_date,
 		       s.retention_pct, s.state, s.rating,
 		       s.contact_person, s.contact_phone, s.notes,
@@ -77,6 +78,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		var id, projectIDVal int64
 		var name string
 		var partnerName sql.NullString
+		var contractNumber string
 		var workDescription, notes sql.NullString
 		var amount float64
 		var currency string
@@ -91,6 +93,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 
 		if err := rows.Scan(
 			&id, &name, &projectIDVal, &partnerName, &workDescription,
+			&contractNumber,
 			&amount, &currency, &startDate, &endDate,
 			&retentionPct, &state, &rating,
 			&contactPerson, &contactPhone, &notes,
@@ -149,6 +152,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			"name":                  name,
 			"project_id":            projectIDVal,
 			"partner_name":          nullStringVal(partnerName),
+			"contract_number":       contractNumber,
 			"work_description":      nullStringVal(workDescription),
 			"amount":                amount,
 			"currency":              currency,
@@ -198,6 +202,7 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 	}
 
 	var req struct {
+		ContractNumber  string  `json:"contract_number"`
 		PartnerName     string  `json:"partner_name"`
 		WorkDescription string  `json:"work_description"`
 		Amount          float64 `json:"amount"`
@@ -255,10 +260,10 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 			state, rating, contact_person, contact_phone, notes,
 			address, phone, bank_name, bank_account, mfo, stir, okonh,
 			director_name, chief_accountant_name,
-			created_by, created_date, updated_date
+			created_by, created_date, updated_date, contract_number
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', 0, $11, $12, $13,
 			$14, $15, $16, $17, $18, $19, $20, $21, $22,
-			$23, NOW(), NOW())
+			$23, NOW(), NOW(), $24)
 		RETURNING id
 	`, tenantID, projectID, nullStringFromVal(req.PartnerName), name, nullStringFromVal(req.WorkDescription),
 		req.Amount, currency, startDate, endDate, req.RetentionPct,
@@ -268,7 +273,7 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		nullStringFromVal(req.BankName), nullStringFromVal(req.BankAccount),
 		nullStringFromVal(req.MFO), nullStringFromVal(req.STIR), nullStringFromVal(req.OKONH),
 		nullStringFromVal(req.DirectorName), nullStringFromVal(req.ChiefAccountantName),
-		userID,
+		userID, nullStringFromVal(req.ContractNumber),
 	).Scan(&id)
 
 	if err != nil {
@@ -316,6 +321,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 	var id, projectIDVal int64
 	var name, state, currency string
 	var partnerNameVal sql.NullString
+	var contractNumberVal string
 	var workDescription, notes, contactPerson, contactPhone sql.NullString
 	var address, phone, bankName, bankAccount, mfo, stir, okonh, directorName, chiefAccName sql.NullString
 	var amount, retentionPct, rating float64
@@ -325,6 +331,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 
 	err = h.db.QueryRow(`
 		SELECT s.id, s.name, s.project_id, s.partner_name, s.work_description,
+		       COALESCE(s.contract_number, ''),
 		       s.amount, s.currency, s.start_date, s.end_date,
 		       s.retention_pct, s.state, s.rating,
 		       s.contact_person, s.contact_phone, s.notes,
@@ -335,6 +342,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		WHERE s.id = $1 AND s.tenant_id = $2
 	`, subID, tenantID).Scan(
 		&id, &name, &projectIDVal, &partnerNameVal, &workDescription,
+		&contractNumberVal,
 		&amount, &currency, &startDate, &endDate,
 		&retentionPct, &state, &rating,
 		&contactPerson, &contactPhone, &notes,
@@ -383,6 +391,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		"name":                  name,
 		"project_id":            projectIDVal,
 		"partner_name":          nullStringVal(partnerNameVal),
+		"contract_number":       contractNumberVal,
 		"work_description":      nullStringVal(workDescription),
 		"amount":                amount,
 		"currency":              currency,
@@ -433,6 +442,7 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 	}
 
 	var req struct {
+		ContractNumber  *string  `json:"contract_number"`
 		PartnerName     *string  `json:"partner_name"`
 		WorkDescription *string  `json:"work_description"`
 		Amount          *float64 `json:"amount"`
@@ -466,6 +476,11 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 	args := []interface{}{}
 	argCount := 0
 
+	if req.ContractNumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contract_number = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.ContractNumber))
+	}
 	if req.PartnerName != nil {
 		argCount++
 		updates = append(updates, fmt.Sprintf("partner_name = $%d", argCount))
@@ -754,6 +769,144 @@ func (h *Handler) UpdateSubcontractState(c *gin.Context) {
 		"state":   req.State,
 		"message": "State updated successfully",
 	})
+}
+
+// =====================================================
+// SUBCONTRACT FILE ATTACHMENTS
+// =====================================================
+
+type subcontractFile struct {
+	ID          int    `json:"id"`
+	FileID      string `json:"file_id"`
+	FileURL     string `json:"file_url"`
+	Filename    string `json:"filename"`
+	FileSize    int64  `json:"file_size"`
+	MimeType    string `json:"mime_type"`
+	Description string `json:"description"`
+	CreatedAt   string `json:"created_at"`
+	CreatedBy   string `json:"created_by"`
+}
+
+// ListSubcontractFiles returns the documents attached to a subcontractor.
+func (h *Handler) ListSubcontractFiles(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	subID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid subcontractor ID")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		SELECT id, file_id, file_url, filename, file_size, mime_type, description, created_at, created_by
+		FROM subcontract_files
+		WHERE tenant_id = $1 AND subcontract_id = $2
+		ORDER BY created_at DESC`, tenantID, subID)
+	if err != nil {
+		h.log.Error("Failed to list subcontract files", "error", err)
+		response.InternalError(c, "Failed to list files")
+		return
+	}
+	defer rows.Close()
+
+	files := []subcontractFile{}
+	for rows.Next() {
+		var f subcontractFile
+		var createdAt time.Time
+		if err := rows.Scan(&f.ID, &f.FileID, &f.FileURL, &f.Filename, &f.FileSize, &f.MimeType, &f.Description, &createdAt, &f.CreatedBy); err != nil {
+			continue
+		}
+		f.CreatedAt = createdAt.Format(time.RFC3339)
+		files = append(files, f)
+	}
+	response.Success(c, files)
+}
+
+// CreateSubcontractFile stores a file reference (after the raw file is uploaded
+// via POST /files/upload) against a subcontractor.
+func (h *Handler) CreateSubcontractFile(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	subID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid subcontractor ID")
+		return
+	}
+
+	var input struct {
+		FileID      string `json:"file_id" binding:"required"`
+		FileURL     string `json:"file_url" binding:"required"`
+		Filename    string `json:"filename" binding:"required"`
+		FileSize    int64  `json:"file_size"`
+		MimeType    string `json:"mime_type"`
+		Description string `json:"description"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	createdBy := ""
+	if email, exists := c.Get("user_email"); exists {
+		if s, ok := email.(string); ok {
+			createdBy = s
+		}
+	}
+
+	var id int
+	err = h.db.QueryRow(`
+		INSERT INTO subcontract_files (tenant_id, subcontract_id, file_id, file_url, filename, file_size, mime_type, description, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING id
+	`, tenantID, subID, input.FileID, input.FileURL, input.Filename, input.FileSize, input.MimeType, input.Description, createdBy).Scan(&id)
+	if err != nil {
+		h.log.Error("Failed to create subcontract file", "error", err)
+		response.InternalError(c, "Failed to save file")
+		return
+	}
+
+	response.Created(c, gin.H{
+		"id":          id,
+		"file_id":     input.FileID,
+		"file_url":    input.FileURL,
+		"filename":    input.Filename,
+		"file_size":   input.FileSize,
+		"mime_type":   input.MimeType,
+		"description": input.Description,
+		"created_by":  createdBy,
+	})
+}
+
+// DeleteSubcontractFile removes a subcontractor file reference.
+func (h *Handler) DeleteSubcontractFile(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	fileID, err := strconv.ParseInt(c.Param("fileId"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid file ID")
+		return
+	}
+
+	result, err := h.db.Exec(`DELETE FROM subcontract_files WHERE id = $1 AND tenant_id = $2`, fileID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to delete subcontract file", "error", err)
+		response.InternalError(c, "Failed to delete file")
+		return
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		response.NotFound(c, "File not found")
+		return
+	}
+	response.Success(c, gin.H{"message": "File deleted"})
 }
 
 // Helper for nullable time in maps

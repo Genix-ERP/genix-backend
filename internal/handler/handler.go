@@ -2136,6 +2136,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/acts/generate-ks2/preview", h.perm.Require("construction", "project", "read"), h.PreviewAutoGenerateKS2)
 		constructionProjects.POST("/:id/acts/generate-ks2", h.perm.Require("construction", "project", "update"), h.AutoGenerateKS2)
 		constructionProjects.POST("/:id/acts/generate-ks3", h.perm.Require("construction", "project", "update"), h.GenerateForma3)
+		// Works-driven КС-3: built from engineer-confirmed (YAKUNIY) works, no act record.
+		constructionProjects.GET("/:id/f3/generate-works-xlsx", h.perm.Require("construction", "project", "read"), h.GenerateForma3FromWorksXLSX)
 
 		// Forma 19 — Material consumption tracking
 		constructionProjects.GET("/:id/f19", h.ListForma19)
@@ -2477,6 +2479,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		subcontracts.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateSubcontract)
 		subcontracts.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteSubcontract)
 		subcontracts.PUT("/:id/state", h.perm.Require("construction", "project", "update"), h.UpdateSubcontractState)
+		// Subcontractor document attachments
+		subcontracts.GET("/:id/files", h.ListSubcontractFiles)
+		subcontracts.POST("/:id/files", h.perm.Require("construction", "project", "update"), h.CreateSubcontractFile)
+		subcontracts.DELETE("/:id/files/:fileId", h.perm.Require("construction", "project", "delete"), h.DeleteSubcontractFile)
 	}
 
 	// Act Types (user-manageable list of act types)
