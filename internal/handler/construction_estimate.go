@@ -33,11 +33,16 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		return
 	}
 
-	scope := c.Query("scope") // "subcontract" to get subcontract-linked estimates only
+	scope := c.Query("scope") // "subcontract" = subcontractor estimates only; "all" = both
 
 	scopeFilter := "AND e.subcontract_id IS NULL"
 	if scope == "subcontract" {
 		scopeFilter = "AND e.subcontract_id IS NOT NULL"
+	} else if scope == "all" {
+		// Both in-house (subcontract_id NULL) and subcontractor estimates —
+		// the web Smeta boshqaruvi / Bosqichlar views load this and filter
+		// by subcontractor client-side.
+		scopeFilter = ""
 	}
 
 	// Opt-in pagination — only when the client explicitly asks. Absent →
@@ -114,7 +119,7 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 		       COALESCE(ua.first_name || ' ' || ua.last_name, '') as approved_name,
 		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name,
 		       COALESCE(b.name, '') as building_name,
-		       COALESCE(sc.name, '') as subcontract_name
+		       COALESCE(NULLIF(sc.partner_name, ''), sc.name, '') as subcontract_name
 		FROM construction_estimate e
 		LEFT JOIN estimate_line_counts elc ON elc.estimate_id = e.id
 		LEFT JOIN users ua ON ua.id = e.approved_by
@@ -208,7 +213,7 @@ func (h *Handler) GetEstimate(c *gin.Context) {
 		       COALESCE(ua.first_name || ' ' || ua.last_name, '') as approved_name,
 		       COALESCE(uc.first_name || ' ' || uc.last_name, '') as created_name,
 		       COALESCE(b.name, '') as building_name,
-		       COALESCE(sc.name, '') as subcontract_name
+		       COALESCE(NULLIF(sc.partner_name, ''), sc.name, '') as subcontract_name
 		FROM construction_estimate e
 		LEFT JOIN users ua ON ua.id = e.approved_by
 		LEFT JOIN users uc ON uc.id = e.created_by

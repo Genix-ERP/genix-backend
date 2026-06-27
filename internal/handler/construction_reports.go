@@ -1031,7 +1031,22 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		            WHEN COALESCE(p.original_quantity, 0) > 0 THEN
 		                COALESCE(s.quantity, 0) * (p.done_quantity::numeric / p.original_quantity)
 		            ELSE COALESCE(s.quantity, 0)
-		        END                               AS fakt_quantity
+		        END                               AS fakt_quantity,
+		        -- Name of the subcontractor assigned to this material's parent
+		        -- work (matched by section+name+uom), NULL when in-house only.
+		        (SELECT COALESCE(NULLIF(sc.partner_name, ''), sc.name)
+		           FROM construction_estimate_line sl
+		           JOIN construction_estimate se ON se.id = sl.estimate_id AND se.tenant_id = s.tenant_id
+		           JOIN construction_subcontract sc ON sc.id = se.subcontract_id AND sc.tenant_id = s.tenant_id
+		          WHERE se.project_id = e.project_id
+		            AND se.subcontract_id IS NOT NULL
+		            AND LOWER(COALESCE(se.source_type, '')) = 'edinich'
+		            AND se.building_id IS NOT DISTINCT FROM e.building_id
+		            AND sl.parent_line_id IS NULL AND COALESCE(sl.resource_type, '') = ''
+		            AND TRIM(COALESCE(sl.parent_item_number, '')) = TRIM(COALESCE(p.parent_item_number, ''))
+		            AND LOWER(TRIM(COALESCE(sl.name, ''))) = LOWER(TRIM(COALESCE(p.name, '')))
+		            AND TRIM(COALESCE(sl.uom, '')) = TRIM(COALESCE(p.uom, ''))
+		          LIMIT 1)                        AS subcontractor
 		    FROM construction_estimate_line s
 		    JOIN construction_estimate_line p
 		      ON p.id = s.parent_line_id
@@ -1042,6 +1057,9 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		    WHERE e.project_id  = $1
 		      AND e.tenant_id   = $2
 		      AND s.tenant_id   = $2
+		      -- In-house master estimate only; subcontractor copies are mirrored
+		      -- onto it via the FAKT sync, so including them would double-count.
+		      AND e.subcontract_id IS NULL
 		      AND s.parent_line_id IS NOT NULL
 		      AND (
 		          LOWER(COALESCE(s.resource_type, '')) IN ('material', 'materialy', 'mat', 'materiallar', 'материал', 'материалы')
@@ -1062,7 +1080,9 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		    ml.uom                              AS uom,
 		    ml.unit_rate                        AS unit_rate,
 		    SUM(ml.fakt_quantity)               AS fakt_quantity,
-		    ARRAY_AGG(ml.line_id)               AS line_ids
+		    ARRAY_AGG(ml.line_id)               AS line_ids,
+		    COALESCE(STRING_AGG(DISTINCT ml.subcontractor, ', ')
+		             FILTER (WHERE ml.subcontractor IS NOT NULL AND ml.subcontractor <> ''), '') AS subcontractors
 		FROM material_lines ml
 		LEFT JOIN construction_buildings b ON b.id = ml.bid
 		GROUP BY ml.bid, b.id, b.name, b.code, b.sort_order, ml.name, ml.uom, ml.unit_rate
@@ -1095,13 +1115,14 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		Note          string  `json:"note"`
 	}
 	type group struct {
-		Name         string  `json:"name"`
-		UOM          string  `json:"uom"`
-		UnitRate     float64 `json:"unit_rate"`
-		FaktQuantity float64 `json:"fakt_quantity"`
-		FaktAmount   float64 `json:"fakt_amount"`
-		Topups       []topup `json:"topups"`
-		LineIDs      []int64 `json:"-"`
+		Name          string  `json:"name"`
+		UOM           string  `json:"uom"`
+		UnitRate      float64 `json:"unit_rate"`
+		FaktQuantity  float64 `json:"fakt_quantity"`
+		FaktAmount    float64 `json:"fakt_amount"`
+		Subcontractor string  `json:"subcontractor"`
+		Topups        []topup `json:"topups"`
+		LineIDs       []int64 `json:"-"`
 	}
 	type block struct {
 		ID          int64   `json:"id"`
@@ -1118,10 +1139,10 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 
 	for rows.Next() {
 		var bid int64
-		var bname, name, uom string
+		var bname, name, uom, subcontractor string
 		var rate, qty float64
 		var lineIDs pq.Int64Array
-		if err := rows.Scan(&bid, &bname, &name, &uom, &rate, &qty, &lineIDs); err != nil {
+		if err := rows.Scan(&bid, &bname, &name, &uom, &rate, &qty, &lineIDs, &subcontractor); err != nil {
 			h.log.Error("Failed to scan material row", "error", err)
 			continue
 		}
@@ -1133,13 +1154,14 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 			blk = b
 		}
 		g := group{
-			Name:         name,
-			UOM:          uom,
-			UnitRate:     rate,
-			FaktQuantity: qty,
-			FaktAmount:   qty * rate,
-			Topups:       []topup{},
-			LineIDs:      []int64(lineIDs),
+			Name:          name,
+			UOM:           uom,
+			UnitRate:      rate,
+			FaktQuantity:  qty,
+			FaktAmount:    qty * rate,
+			Subcontractor: subcontractor,
+			Topups:        []topup{},
+			LineIDs:       []int64(lineIDs),
 		}
 		blk.Groups = append(blk.Groups, g)
 		blk.TotalAmount += g.FaktAmount
@@ -1211,11 +1233,15 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 			if !ok {
 				ng := group{
 					Name: g.Name, UOM: g.UOM, UnitRate: g.UnitRate,
-					Topups: []topup{},
+					Subcontractor: g.Subcontractor,
+					Topups:        []topup{},
 				}
 				totalAgg[k] = &ng
 				tg = &ng
 				totalOrder = append(totalOrder, k)
+			}
+			if tg.Subcontractor == "" {
+				tg.Subcontractor = g.Subcontractor
 			}
 			tg.FaktQuantity += g.FaktQuantity
 			tg.FaktAmount += g.FaktAmount
@@ -1290,6 +1316,41 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 	// NORMA quantity is the line's own planned quantity (parent_qty × norm).
 	rows, err := h.db.Query(`
 		WITH resource_lines AS (
+		    -- (1) Ресурс (resource) estimate — the authoritative resource norms,
+		    --     stored as flat resource lines with the file's Количество in
+		    --     imported_quantity. This is what the user sees on the Smetalar
+		    --     Ресурс tab (e.g. ЗАТРАТЫ ТРУДА = 83 411 ЧЕЛ-Ч).
+		    SELECT
+		        e.building_id                     AS bid,
+		        CASE
+		            WHEN LOWER(COALESCE(l.resource_type, '')) IN
+		                 ('labor','mehnat','ish','ishchi','worker','трудовой','трудовые') THEN 'labor'
+		            WHEN LOWER(COALESCE(l.resource_type, '')) IN
+		                 ('equipment','mashina','masina','mexanizm','mexanizmlar','machinery','машина') THEN 'equipment'
+		            WHEN LOWER(COALESCE(l.resource_type, '')) IN
+		                 ('material','materialy','mat','materiallar','материал','материалы') THEN 'material'
+		            WHEN UPPER(COALESCE(l.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
+		            WHEN UPPER(COALESCE(l.uom, '')) LIKE '%МАШ%' THEN 'equipment'
+		            ELSE 'material'
+		        END                               AS rtype,
+		        l.name                            AS name,
+		        COALESCE(l.uom, '')               AS uom,
+		        COALESCE(NULLIF(l.unit_rate, 0),
+		                 COALESCE(l.material_rate,0) + COALESCE(l.labor_rate,0) + COALESCE(l.equipment_rate,0)) AS unit_rate,
+		        COALESCE(NULLIF(l.imported_quantity, 0), NULLIF(l.original_quantity, 0), l.quantity, 0) AS norma_quantity,
+		        NULL::text                        AS subcontractor
+		    FROM construction_estimate_line l
+		    JOIN construction_estimate e ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
+		    WHERE e.project_id = $1 AND e.tenant_id = $2 AND l.tenant_id = $2
+		      AND e.subcontract_id IS NULL
+		      AND LOWER(COALESCE(e.source_type, '')) = 'resurs'
+		      AND COALESCE(l.resource_type, '') <> ''
+
+		    UNION ALL
+
+		    -- (2) Едиinич sub-line resources (norm_rate × parent reja qty) — used
+		    --     ONLY for buildings that have NO Ресурс estimate, so the two
+		    --     representations never double-count.
 		    SELECT
 		        e.building_id                     AS bid,
 		        CASE
@@ -1306,20 +1367,25 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		        s.name                            AS name,
 		        COALESCE(s.uom, '')               AS uom,
 		        COALESCE(s.unit_rate, 0)          AS unit_rate,
-		        -- NORMA = the smeta "reja" (plan) requirement, so every work
-		        -- counts at its FULL planned volume regardless of progress.
-		        -- The work card's NORMA badge reads parent.original_quantity
-		        -- (smeta reja); the live quantity is the cumulative/done
-		        -- volume and is 0 for works not yet started — which previously
-		        -- left only the in-progress work showing.
-		        --   manual (quantity_override) → resource's own planned qty;
-		        --   auto                       → norm_rate × parent reja qty.
 		        CASE
 		            WHEN COALESCE(s.quantity_override, false)
 		                THEN COALESCE(NULLIF(s.original_quantity, 0), s.quantity, 0)
 		            ELSE COALESCE(s.norm_rate, 0)
 		                 * COALESCE(NULLIF(p.original_quantity, 0), p.quantity, 0)
-		        END                               AS norma_quantity
+		        END                               AS norma_quantity,
+		        (SELECT COALESCE(NULLIF(sc.partner_name, ''), sc.name)
+		           FROM construction_estimate_line sl
+		           JOIN construction_estimate se ON se.id = sl.estimate_id AND se.tenant_id = s.tenant_id
+		           JOIN construction_subcontract sc ON sc.id = se.subcontract_id AND sc.tenant_id = s.tenant_id
+		          WHERE se.project_id = e.project_id
+		            AND se.subcontract_id IS NOT NULL
+		            AND LOWER(COALESCE(se.source_type, '')) = 'edinich'
+		            AND se.building_id IS NOT DISTINCT FROM e.building_id
+		            AND sl.parent_line_id IS NULL AND COALESCE(sl.resource_type, '') = ''
+		            AND TRIM(COALESCE(sl.parent_item_number, '')) = TRIM(COALESCE(p.parent_item_number, ''))
+		            AND LOWER(TRIM(COALESCE(sl.name, ''))) = LOWER(TRIM(COALESCE(p.name, '')))
+		            AND TRIM(COALESCE(sl.uom, '')) = TRIM(COALESCE(p.uom, ''))
+		          LIMIT 1)                        AS subcontractor
 		    FROM construction_estimate_line s
 		    JOIN construction_estimate_line p
 		      ON p.id = s.parent_line_id
@@ -1330,7 +1396,16 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		    WHERE e.project_id  = $1
 		      AND e.tenant_id   = $2
 		      AND s.tenant_id   = $2
+		      AND e.subcontract_id IS NULL
+		      AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
 		      AND s.parent_line_id IS NOT NULL
+		      AND NOT EXISTS (
+		          SELECT 1 FROM construction_estimate re
+		          WHERE re.project_id = e.project_id AND re.tenant_id = e.tenant_id
+		            AND re.subcontract_id IS NULL
+		            AND LOWER(COALESCE(re.source_type, '')) = 'resurs'
+		            AND re.building_id IS NOT DISTINCT FROM e.building_id
+		      )
 		)
 		SELECT
 		    COALESCE(rl.bid, 0)                 AS building_id,
@@ -1339,7 +1414,9 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		    rl.name                             AS name,
 		    rl.uom                              AS uom,
 		    rl.unit_rate                        AS unit_rate,
-		    SUM(rl.norma_quantity)              AS norma_quantity
+		    SUM(rl.norma_quantity)              AS norma_quantity,
+		    COALESCE(STRING_AGG(DISTINCT rl.subcontractor, ', ')
+		             FILTER (WHERE rl.subcontractor IS NOT NULL AND rl.subcontractor <> ''), '') AS subcontractors
 		FROM resource_lines rl
 		LEFT JOIN construction_buildings b ON b.id = rl.bid
 		GROUP BY rl.bid, b.id, b.name, b.code, b.sort_order, rl.rtype, rl.name, rl.uom, rl.unit_rate
@@ -1361,6 +1438,7 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		UnitRate      float64 `json:"unit_rate"`
 		NormaQuantity float64 `json:"norma_quantity"`
 		NormaAmount   float64 `json:"norma_amount"`
+		Subcontractor string  `json:"subcontractor"`
 	}
 	type block struct {
 		ID          int64   `json:"id"`
@@ -1374,9 +1452,9 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 
 	for rows.Next() {
 		var bid int64
-		var bname, rtype, name, uom string
+		var bname, rtype, name, uom, subcontractor string
 		var rate, qty float64
-		if err := rows.Scan(&bid, &bname, &rtype, &name, &uom, &rate, &qty); err != nil {
+		if err := rows.Scan(&bid, &bname, &rtype, &name, &uom, &rate, &qty, &subcontractor); err != nil {
 			h.log.Error("Failed to scan resource row", "error", err)
 			continue
 		}
@@ -1394,6 +1472,7 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 			UnitRate:      rate,
 			NormaQuantity: qty,
 			NormaAmount:   qty * rate,
+			Subcontractor: subcontractor,
 		}
 		blk.Groups = append(blk.Groups, g)
 		blk.TotalAmount += g.NormaAmount
@@ -1414,10 +1493,13 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 			k := aggKey{rtype: g.Type, name: strings.ToUpper(g.Name), uom: g.UOM, rate: g.UnitRate}
 			tg, ok := totalAgg[k]
 			if !ok {
-				ng := group{Type: g.Type, Name: g.Name, UOM: g.UOM, UnitRate: g.UnitRate}
+				ng := group{Type: g.Type, Name: g.Name, UOM: g.UOM, UnitRate: g.UnitRate, Subcontractor: g.Subcontractor}
 				totalAgg[k] = &ng
 				tg = &ng
 				totalOrder = append(totalOrder, k)
+			}
+			if tg.Subcontractor == "" {
+				tg.Subcontractor = g.Subcontractor
 			}
 			tg.NormaQuantity += g.NormaQuantity
 			tg.NormaAmount += g.NormaAmount

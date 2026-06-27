@@ -448,12 +448,107 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 			"error", err, "parent_line_id", lineID)
 	}
 
+	// If this work belongs to a subcontractor's estimate, propagate the
+	// aggregated progress onto the matching work in the project's own
+	// (in-house) estimate so the consolidated project view stays in sync.
+	h.syncSubcontractorWorkToProject(tenantID, ctx.ProjectID, lineID)
+
 	h.logSmetaAudit(tenantID, ctx.ProjectID, &ctx.EstimateID, "qty_change", ctx.Name, &lineID,
 		strconv.FormatFloat(ctx.DoneQty, 'f', -1, 64),
 		strconv.FormatFloat(done, 'f', -1, 64),
 		"Bajarilgan hajm yangilandi", userID, userName)
 
 	response.Success(c, gin.H{"done_quantity": done, "approval_status": newStatus, "quantity": done})
+}
+
+// syncSubcontractorWorkToProject mirrors a subcontractor work's progress onto
+// the matching work in the project's own (in-house) estimate. Matching is by
+// section (parent_item_number) + name + uom within the same building. The
+// project work's done becomes the SUM of every subcontractor's done for that
+// work, so multiple subcontractors splitting one project work aggregate
+// correctly. No-op when the edited line isn't a subcontractor work or has no
+// in-house counterpart.
+func (h *Handler) syncSubcontractorWorkToProject(tenantID uuid.UUID, projectID, lineID int64) {
+	var isSub bool
+	var buildingID sql.NullInt64
+	var section, name, uom string
+	err := h.db.QueryRow(`
+		SELECT (e.subcontract_id IS NOT NULL), e.building_id,
+		       TRIM(COALESCE(l.parent_item_number, '')), TRIM(COALESCE(l.name, '')), TRIM(COALESCE(l.uom, ''))
+		FROM construction_estimate_line l
+		JOIN construction_estimate e ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
+		WHERE l.id = $1 AND l.tenant_id = $2
+		  AND l.parent_line_id IS NULL AND COALESCE(l.resource_type, '') = ''
+	`, lineID, tenantID).Scan(&isSub, &buildingID, &section, &name, &uom)
+	if err != nil || !isSub {
+		return // not a subcontractor work (or not found) — nothing to sync
+	}
+
+	// Sum done across ALL subcontractor edinich works matching the key, then
+	// write it onto the matching project (in-house) edinich work(s).
+	rows, err := h.db.Query(`
+		WITH sub_sum AS (
+			SELECT COALESCE(SUM(l.done_quantity), 0) AS total
+			FROM construction_estimate_line l
+			JOIN construction_estimate e ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
+			WHERE e.tenant_id = $1 AND e.project_id = $2
+			  AND e.subcontract_id IS NOT NULL
+			  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND e.building_id IS NOT DISTINCT FROM $3
+			  AND l.parent_line_id IS NULL AND COALESCE(l.resource_type, '') = ''
+			  AND TRIM(COALESCE(l.parent_item_number, '')) = $4
+			  AND LOWER(TRIM(COALESCE(l.name, ''))) = LOWER($5)
+			  AND TRIM(COALESCE(l.uom, '')) = $6
+		)
+		UPDATE construction_estimate_line p
+		SET done_quantity   = (SELECT total FROM sub_sum),
+		    quantity        = (SELECT total FROM sub_sum),
+		    total_amount    = (SELECT total FROM sub_sum) * COALESCE(p.unit_rate, 0),
+		    approval_status = CASE WHEN (SELECT total FROM sub_sum) > 0 THEN 'in_progress' ELSE 'pending' END,
+		    updated_date    = NOW()
+		FROM construction_estimate e
+		WHERE p.estimate_id = e.id AND p.tenant_id = $1 AND e.tenant_id = $1
+		  AND e.project_id = $2
+		  AND e.subcontract_id IS NULL
+		  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		  AND e.building_id IS NOT DISTINCT FROM $3
+		  AND p.parent_line_id IS NULL AND COALESCE(p.resource_type, '') = ''
+		  AND TRIM(COALESCE(p.parent_item_number, '')) = $4
+		  AND LOWER(TRIM(COALESCE(p.name, ''))) = LOWER($5)
+		  AND TRIM(COALESCE(p.uom, '')) = $6
+		RETURNING p.id, p.done_quantity
+	`, tenantID, projectID, buildingID, section, name, uom)
+	if err != nil {
+		h.log.Error("Failed to sync subcontractor done to project", "error", err, "line_id", lineID)
+		return
+	}
+	defer rows.Close()
+	type pl struct {
+		id   int64
+		done float64
+	}
+	var updated []pl
+	for rows.Next() {
+		var x pl
+		if rows.Scan(&x.id, &x.done) == nil {
+			updated = append(updated, x)
+		}
+	}
+	rows.Close()
+	// Cascade each updated project parent's new plan to its non-override
+	// sub-lines (resource qty = parent.done × norm_rate).
+	for _, x := range updated {
+		if _, err := h.db.Exec(`
+			UPDATE construction_estimate_line c
+			SET quantity     = $1 * COALESCE(c.norm_rate, 0),
+			    total_amount = ($1 * COALESCE(c.norm_rate, 0)) * COALESCE(c.unit_rate, 0),
+			    updated_date = NOW()
+			WHERE c.parent_line_id = $2
+			  AND COALESCE(c.quantity_override, FALSE) = FALSE
+		`, x.done, x.id); err != nil {
+			h.log.Error("Failed to cascade project plan to children", "error", err, "parent_line_id", x.id)
+		}
+	}
 }
 
 // SubmitWork — POST /construction/works/:id/submit
