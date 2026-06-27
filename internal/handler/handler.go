@@ -1226,6 +1226,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		bankImport.POST("", h.ImportBankStatement1C)
 		bankImport.GET("", h.ListBankImports)
+		// Excel vipiska (Turonbank) import — parse + auto-classify + review (Phase 1).
+		bankImport.POST("/vipiska", h.ImportBankVipiska)
+		bankImport.GET("/:id/transactions", h.GetBankVipiskaTransactions)
 	}
 
 	// E-invoice (TT Buxgalteriya §8.2)
