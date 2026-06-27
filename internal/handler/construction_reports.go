@@ -1325,12 +1325,14 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		        CASE
 		            WHEN LOWER(COALESCE(l.resource_type, '')) IN
 		                 ('labor','mehnat','ish','ishchi','worker','трудовой','трудовые') THEN 'labor'
+		            WHEN UPPER(COALESCE(l.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
 		            WHEN LOWER(COALESCE(l.resource_type, '')) IN
 		                 ('equipment','mashina','masina','mexanizm','mexanizmlar','machinery','машина') THEN 'equipment'
-		            WHEN LOWER(COALESCE(l.resource_type, '')) IN
-		                 ('material','materialy','mat','materiallar','материал','материалы') THEN 'material'
-		            WHEN UPPER(COALESCE(l.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
 		            WHEN UPPER(COALESCE(l.uom, '')) LIKE '%МАШ%' THEN 'equipment'
+		            -- Material family — split by material_type so Кабель / Оборудование
+		            -- match the Excel's separate subtotals.
+		            WHEN LOWER(COALESCE(l.material_type, '')) = 'cable' THEN 'cable'
+		            WHEN LOWER(COALESCE(l.material_type, '')) = 'equipment' THEN 'installed'
 		            ELSE 'material'
 		        END                               AS rtype,
 		        l.name                            AS name,
@@ -1352,6 +1354,15 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		      AND e.subcontract_id IS NULL
 		      AND LOWER(COALESCE(e.source_type, '')) = 'resurs'
 		      AND COALESCE(l.resource_type, '') <> ''
+		      -- Type/unit consistency: a machine MUST be МАШ-Ч and labor ЧЕЛ-Ч.
+		      -- Lines tagged machine/labor with a work-volume unit (e.g. 1000М2)
+		      -- are the "parent unit leaked onto the resource" anomaly — drop them.
+		      AND NOT (LOWER(COALESCE(l.resource_type, '')) IN
+		               ('equipment','mashina','masina','mexanizm','mexanizmlar','machinery','машина')
+		               AND UPPER(COALESCE(l.uom, '')) NOT LIKE '%МАШ%')
+		      AND NOT (LOWER(COALESCE(l.resource_type, '')) IN
+		               ('labor','mehnat','ish','ishchi','worker','трудовой','трудовые')
+		               AND UPPER(COALESCE(l.uom, '')) NOT LIKE '%ЧЕЛ%')
 
 		    UNION ALL
 
@@ -1363,12 +1374,12 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		        CASE
 		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
 		                 ('labor','mehnat','ish','ishchi','worker','трудовой','трудовые') THEN 'labor'
+		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
 		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
 		                 ('equipment','mashina','masina','mexanizm','mexanizmlar','machinery','машина') THEN 'equipment'
-		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
-		                 ('material','materialy','mat','materiallar','материал','материалы') THEN 'material'
-		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
 		            WHEN UPPER(COALESCE(s.uom, '')) LIKE '%МАШ%' THEN 'equipment'
+		            WHEN LOWER(COALESCE(s.material_type, '')) = 'cable' THEN 'cable'
+		            WHEN LOWER(COALESCE(s.material_type, '')) = 'equipment' THEN 'installed'
 		            ELSE 'material'
 		        END                               AS rtype,
 		        s.name                            AS name,
@@ -1412,6 +1423,15 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		      AND e.subcontract_id IS NULL
 		      AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
 		      AND s.parent_line_id IS NOT NULL
+		      -- Same type/unit consistency guard as the Ресурс branch: drop
+		      -- machine/labor resources whose unit isn't МАШ-Ч / ЧЕЛ-Ч (parent
+		      -- work unit leaked onto the resource, e.g. 1000М2 graders).
+		      AND NOT (LOWER(COALESCE(s.resource_type, '')) IN
+		               ('equipment','mashina','masina','mexanizm','mexanizmlar','machinery','машина')
+		               AND UPPER(COALESCE(s.uom, '')) NOT LIKE '%МАШ%')
+		      AND NOT (LOWER(COALESCE(s.resource_type, '')) IN
+		               ('labor','mehnat','ish','ishchi','worker','трудовой','трудовые')
+		               AND UPPER(COALESCE(s.uom, '')) NOT LIKE '%ЧЕЛ%')
 		      AND NOT EXISTS (
 		          SELECT 1 FROM construction_estimate re
 		          WHERE re.project_id = e.project_id AND re.tenant_id = e.tenant_id
