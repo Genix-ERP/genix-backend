@@ -1338,6 +1338,13 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		        COALESCE(NULLIF(l.unit_rate, 0),
 		                 COALESCE(l.material_rate,0) + COALESCE(l.labor_rate,0) + COALESCE(l.equipment_rate,0)) AS unit_rate,
 		        COALESCE(NULLIF(l.imported_quantity, 0), NULLIF(l.original_quantity, 0), l.quantity, 0) AS norma_quantity,
+		        -- Amount = the file's own Сумма (с транспортом) when present, so
+		        -- the report matches the Excel exactly instead of re-deriving
+		        -- qty × price (which omits transport/coefficients).
+		        COALESCE(NULLIF(l.imported_total, 0),
+		                 COALESCE(NULLIF(l.imported_quantity, 0), NULLIF(l.original_quantity, 0), l.quantity, 0)
+		                 * COALESCE(NULLIF(l.unit_rate, 0),
+		                            COALESCE(l.material_rate,0) + COALESCE(l.labor_rate,0) + COALESCE(l.equipment_rate,0))) AS norma_amount,
 		        NULL::text                        AS subcontractor
 		    FROM construction_estimate_line l
 		    JOIN construction_estimate e ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
@@ -1373,6 +1380,12 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		            ELSE COALESCE(s.norm_rate, 0)
 		                 * COALESCE(NULLIF(p.original_quantity, 0), p.quantity, 0)
 		        END                               AS norma_quantity,
+		        (CASE
+		            WHEN COALESCE(s.quantity_override, false)
+		                THEN COALESCE(NULLIF(s.original_quantity, 0), s.quantity, 0)
+		            ELSE COALESCE(s.norm_rate, 0)
+		                 * COALESCE(NULLIF(p.original_quantity, 0), p.quantity, 0)
+		        END) * COALESCE(s.unit_rate, 0)   AS norma_amount,
 		        (SELECT COALESCE(NULLIF(sc.partner_name, ''), sc.name)
 		           FROM construction_estimate_line sl
 		           JOIN construction_estimate se ON se.id = sl.estimate_id AND se.tenant_id = s.tenant_id
@@ -1415,6 +1428,7 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		    rl.uom                              AS uom,
 		    rl.unit_rate                        AS unit_rate,
 		    SUM(rl.norma_quantity)              AS norma_quantity,
+		    SUM(rl.norma_amount)                AS norma_amount,
 		    COALESCE(STRING_AGG(DISTINCT rl.subcontractor, ', ')
 		             FILTER (WHERE rl.subcontractor IS NOT NULL AND rl.subcontractor <> ''), '') AS subcontractors
 		FROM resource_lines rl
@@ -1453,8 +1467,8 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 	for rows.Next() {
 		var bid int64
 		var bname, rtype, name, uom, subcontractor string
-		var rate, qty float64
-		if err := rows.Scan(&bid, &bname, &rtype, &name, &uom, &rate, &qty, &subcontractor); err != nil {
+		var rate, qty, amount float64
+		if err := rows.Scan(&bid, &bname, &rtype, &name, &uom, &rate, &qty, &amount, &subcontractor); err != nil {
 			h.log.Error("Failed to scan resource row", "error", err)
 			continue
 		}
@@ -1471,7 +1485,7 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 			UOM:           uom,
 			UnitRate:      rate,
 			NormaQuantity: qty,
-			NormaAmount:   qty * rate,
+			NormaAmount:   amount, // file's Сумма (с транспортом) — matches Excel
 			Subcontractor: subcontractor,
 		}
 		blk.Groups = append(blk.Groups, g)
