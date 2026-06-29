@@ -173,11 +173,11 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 
 	// Sorting
 	validSortColumns := map[string]string{
-		"name":         "wc.name",
-		"code":         "wc.code",
-		"status":       "wc.status",
-		"utilization":  "wc.current_utilization",
-		"created_at":   "wc.created_at",
+		"name":        "wc.name",
+		"code":        "wc.code",
+		"status":      "wc.status",
+		"utilization": "wc.current_utilization",
+		"created_at":  "wc.created_at",
 	}
 	sortColumn := validSortColumns[filter.SortBy]
 	if sortColumn == "" {
@@ -718,15 +718,33 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 			&cur.PowerKW, &cur.ElectricityRate, &cur.AnnualMaintenance,
 			&cur.OperatorMonthlySalary, &cur.OverheadCost, &cur.LaborRateType)
 
-		if input.AssetValue != nil { cur.AssetValue = *input.AssetValue }
-		if input.UsefulLifeYears != nil { cur.UsefulLifeYears = *input.UsefulLifeYears }
-		if input.WorkingHoursPerDay != nil { cur.WorkingHoursPerDay = *input.WorkingHoursPerDay }
-		if input.PowerKW != nil { cur.PowerKW = *input.PowerKW }
-		if input.ElectricityRate != nil { cur.ElectricityRate = *input.ElectricityRate }
-		if input.AnnualMaintenance != nil { cur.AnnualMaintenance = *input.AnnualMaintenance }
-		if input.OperatorMonthlySalary != nil { cur.OperatorMonthlySalary = *input.OperatorMonthlySalary }
-		if input.OverheadCost != nil { cur.OverheadCost = *input.OverheadCost }
-		if input.LaborRateType != nil { cur.LaborRateType = *input.LaborRateType }
+		if input.AssetValue != nil {
+			cur.AssetValue = *input.AssetValue
+		}
+		if input.UsefulLifeYears != nil {
+			cur.UsefulLifeYears = *input.UsefulLifeYears
+		}
+		if input.WorkingHoursPerDay != nil {
+			cur.WorkingHoursPerDay = *input.WorkingHoursPerDay
+		}
+		if input.PowerKW != nil {
+			cur.PowerKW = *input.PowerKW
+		}
+		if input.ElectricityRate != nil {
+			cur.ElectricityRate = *input.ElectricityRate
+		}
+		if input.AnnualMaintenance != nil {
+			cur.AnnualMaintenance = *input.AnnualMaintenance
+		}
+		if input.OperatorMonthlySalary != nil {
+			cur.OperatorMonthlySalary = *input.OperatorMonthlySalary
+		}
+		if input.OverheadCost != nil {
+			cur.OverheadCost = *input.OverheadCost
+		}
+		if input.LaborRateType != nil {
+			cur.LaborRateType = *input.LaborRateType
+		}
 
 		hasDetailed := cur.AssetValue > 0 || cur.PowerKW > 0 || cur.AnnualMaintenance > 0 || cur.OperatorMonthlySalary > 0
 		if hasDetailed {
@@ -1035,11 +1053,11 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 
 	// Sorting
 	validSortColumns := map[string]string{
-		"code":           "po.code",
-		"status":         "po.status",
-		"priority":       "po.priority",
+		"code":            "po.code",
+		"status":          "po.status",
+		"priority":        "po.priority",
 		"scheduled_start": "po.scheduled_start",
-		"created_at":     "po.created_at",
+		"created_at":      "po.created_at",
 	}
 	sortColumn := validSortColumns[filter.SortBy]
 	if sortColumn == "" {
@@ -1829,56 +1847,68 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 			  AND deleted_at IS NULL
 		`, now, tenantID, poCode)
 
-		// 2. Reverse inventory deductions: for every 'issue' transaction tied
-		//    to this PO, add the quantity back to its inventory row, then soft-
-		//    delete the transaction so we don't double-undo on a retry.
-		h.db.Exec(`
+		// 2. Reverse inventory deductions: add back the magnitude of every 'issue'
+		//    tied to this PO, then hard-delete those transactions so the stock can
+		//    never be double-undone. We aggregate per inventory row (so multiple
+		//    issues on the same row sum correctly) and use ABS() so it restores
+		//    regardless of whether the issue was stored as +qty or -qty.
+		//    (inventory_transactions has no deleted_at column — the previous
+		//    soft-delete version errored out and silently restored nothing.)
+		if _, rerr := h.db.Exec(`
 			WITH issues AS (
-				SELECT id, inventory_id, quantity
+				SELECT inventory_id, SUM(ABS(quantity)) AS qty
 				FROM inventory_transactions
 				WHERE tenant_id = $1
 				  AND reference_type = 'production_order'
 				  AND reference_id = $2
 				  AND transaction_type = 'issue'
-				  AND deleted_at IS NULL
-			), restore AS (
-				UPDATE inventory inv
-				SET quantity_on_hand = inv.quantity_on_hand + i.quantity,
-				    last_movement_date = $3,
-				    updated_at = $3
-				FROM issues i
-				WHERE inv.id = i.inventory_id
-				RETURNING inv.id
+				GROUP BY inventory_id
 			)
-			UPDATE inventory_transactions
-			SET deleted_at = $3, updated_at = $3
-			WHERE id IN (SELECT id FROM issues);
-		`, tenantID, id, now)
+			UPDATE inventory inv
+			SET quantity_on_hand = inv.quantity_on_hand + i.qty,
+			    last_movement_date = $3,
+			    updated_at = $3
+			FROM issues i
+			WHERE inv.id = i.inventory_id;
+		`, tenantID, id, now); rerr != nil {
+			h.log.Error("DeleteProductionOrder: restore issued materials failed", "error", rerr, "po_id", id)
+		}
+		if _, derr := h.db.Exec(`
+			DELETE FROM inventory_transactions
+			WHERE tenant_id = $1 AND reference_type = 'production_order'
+			  AND reference_id = $2 AND transaction_type = 'issue';
+		`, tenantID, id); derr != nil {
+			h.log.Error("DeleteProductionOrder: delete issue transactions failed", "error", derr, "po_id", id)
+		}
 
-		// 3. Reverse finished-goods receipts: subtract what was received back
-		//    out of the warehouse, then soft-delete the receipt transactions.
-		h.db.Exec(`
+		// 3. Reverse finished-goods receipts: subtract their magnitude back out of
+		//    the warehouse (aggregated per row, clamped at 0), then hard-delete them.
+		if _, rerr := h.db.Exec(`
 			WITH receipts AS (
-				SELECT id, inventory_id, quantity
+				SELECT inventory_id, SUM(ABS(quantity)) AS qty
 				FROM inventory_transactions
 				WHERE tenant_id = $1
 				  AND reference_type = 'production_order'
 				  AND reference_id = $2
 				  AND transaction_type = 'receipt'
-				  AND deleted_at IS NULL
-			), restore AS (
-				UPDATE inventory inv
-				SET quantity_on_hand = GREATEST(inv.quantity_on_hand - r.quantity, 0),
-				    last_movement_date = $3,
-				    updated_at = $3
-				FROM receipts r
-				WHERE inv.id = r.inventory_id
-				RETURNING inv.id
+				GROUP BY inventory_id
 			)
-			UPDATE inventory_transactions
-			SET deleted_at = $3, updated_at = $3
-			WHERE id IN (SELECT id FROM receipts);
-		`, tenantID, id, now)
+			UPDATE inventory inv
+			SET quantity_on_hand = GREATEST(inv.quantity_on_hand - r.qty, 0),
+			    last_movement_date = $3,
+			    updated_at = $3
+			FROM receipts r
+			WHERE inv.id = r.inventory_id;
+		`, tenantID, id, now); rerr != nil {
+			h.log.Error("DeleteProductionOrder: reverse FG receipts failed", "error", rerr, "po_id", id)
+		}
+		if _, derr := h.db.Exec(`
+			DELETE FROM inventory_transactions
+			WHERE tenant_id = $1 AND reference_type = 'production_order'
+			  AND reference_id = $2 AND transaction_type = 'receipt';
+		`, tenantID, id); derr != nil {
+			h.log.Error("DeleteProductionOrder: delete receipt transactions failed", "error", derr, "po_id", id)
+		}
 
 		// 4. Soft-delete the finished-goods lot(s) created for this PO so they
 		//    don't keep showing on the lot tracking screen.
@@ -2007,18 +2037,18 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		// Step 1: Read all BOM operations into a slice first
 		// (lib/pq doesn't support executing queries while iterating rows on the same transaction)
 		type bomOp struct {
-			ID              uuid.UUID
-			Sequence        int
-			OperationName   string
-			WorkCenterID    *uuid.UUID
-			SetupTime       float64
-			RunTime         float64
-			LaborCost       float64
-			OverheadCost    float64
-			Notes           *string
-			WCHourlyCost    float64
-			WCSetupCost     float64
-			WCOverheadCost  float64
+			ID             uuid.UUID
+			Sequence       int
+			OperationName  string
+			WorkCenterID   *uuid.UUID
+			SetupTime      float64
+			RunTime        float64
+			LaborCost      float64
+			OverheadCost   float64
+			Notes          *string
+			WCHourlyCost   float64
+			WCSetupCost    float64
+			WCOverheadCost float64
 		}
 
 		opsQuery := `
@@ -3110,79 +3140,79 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	}
 
 	if !alreadyReceived {
-	tx, txErr := h.db.Begin()
-	if txErr != nil {
-		h.log.Error("Failed to start inventory transaction", "error", txErr)
-		h.GetProductionOrder(c)
-		return
-	}
-	defer tx.Rollback()
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to start inventory transaction", "error", txErr)
+			h.GetProductionOrder(c)
+			return
+		}
+		defer tx.Rollback()
 
-	// Add finished product to inventory
-	var invID uuid.UUID
-	err = tx.QueryRow(`
+		// Add finished product to inventory
+		var invID uuid.UUID
+		err = tx.QueryRow(`
 		SELECT id FROM inventory
 		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
 		AND lot_number IS NULL AND serial_number IS NULL
 	`, tenantID, productID, warehouseID).Scan(&invID)
 
-	if err == sql.ErrNoRows {
-		invID = uuid.New()
-		_, err = tx.Exec(`
+		if err == sql.ErrNoRows {
+			invID = uuid.New()
+			_, err = tx.Exec(`
 			INSERT INTO inventory (
 				id, tenant_id, organization_id, product_id, warehouse_id,
 				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8, $8)
 		`, invID, tenantID, organizationID, productID, warehouseID, producedQty, unitCost, now)
-	} else if err == nil {
-		_, err = tx.Exec(`
+		} else if err == nil {
+			_, err = tx.Exec(`
 			UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2
 			WHERE id = $3
 		`, producedQty, now, invID)
-	}
-	if err != nil {
-		h.log.Error("Failed to update finished product inventory", "error", err)
-		h.GetProductionOrder(c)
-		return
-	}
+		}
+		if err != nil {
+			h.log.Error("Failed to update finished product inventory", "error", err)
+			h.GetProductionOrder(c)
+			return
+		}
 
-	// Create receipt transaction for finished product
-	_, err = tx.Exec(`
+		// Create receipt transaction for finished product
+		_, err = tx.Exec(`
 		INSERT INTO inventory_transactions (
 			id, tenant_id, organization_id, inventory_id, transaction_type,
 			reference_type, reference_id, quantity, unit_cost, total_cost,
 			reason, notes, transaction_date, created_by, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
 	`, uuid.New(), tenantID, organizationID, invID, entity.TransactionTypeReceipt,
-		"production_order", id, producedQty, unitCost, producedQty*unitCost,
-		"production_complete", "Auto-generated from production order completion", now, userID)
-	if err != nil {
-		h.log.Error("Failed to create receipt transaction", "error", err)
-		h.GetProductionOrder(c)
-		return
-	}
+			"production_order", id, producedQty, unitCost, producedQty*unitCost,
+			"production_complete", "Auto-generated from production order completion", now, userID)
+		if err != nil {
+			h.log.Error("Failed to create receipt transaction", "error", err)
+			h.GetProductionOrder(c)
+			return
+		}
 
-	// Note: BOM component consumption is handled in StartProductionOrder (when production begins)
+		// Note: BOM component consumption is handled in StartProductionOrder (when production begins)
 
-	if commitErr := tx.Commit(); commitErr != nil {
-		h.log.Error("Failed to commit inventory transaction", "error", commitErr)
-	}
+		if commitErr := tx.Commit(); commitErr != nil {
+			h.log.Error("Failed to commit inventory transaction", "error", commitErr)
+		}
 
-	// Lot insert lives OUTSIDE the transaction — in PostgreSQL any error
-	// inside a tx poisons it and makes COMMIT fail, so a lot-insert failure
-	// was silently rolling back the inventory update above.
-	lotID := uuid.New()
-	lotNumber := fmt.Sprintf("MFG-%s", id.String()[:8])
-	if _, lotErr := h.db.Exec(`
+		// Lot insert lives OUTSIDE the transaction — in PostgreSQL any error
+		// inside a tx poisons it and makes COMMIT fail, so a lot-insert failure
+		// was silently rolling back the inventory update above.
+		lotID := uuid.New()
+		lotNumber := fmt.Sprintf("MFG-%s", id.String()[:8])
+		if _, lotErr := h.db.Exec(`
 		INSERT INTO inventory_lots (
 			id, tenant_id, product_id, warehouse_id, lot_number,
 			received_date, initial_quantity, remaining_quantity,
 			unit_cost, status, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6::date, $7, $7, $8, 'available', $9, $9)
 	`, lotID, tenantID, productID, warehouseID, lotNumber,
-		now, producedQty, unitCost, now); lotErr != nil {
-		h.log.Error("CompleteProductionOrder: lot insert failed (non-fatal)", "error", lotErr, "po_id", id)
-	}
+			now, producedQty, unitCost, now); lotErr != nil {
+			h.log.Error("CompleteProductionOrder: lot insert failed (non-fatal)", "error", lotErr, "po_id", id)
+		}
 	} // end if !alreadyReceived
 
 	// ============================================
@@ -4059,29 +4089,29 @@ func (h *Handler) ListEquipment(c *gin.Context) {
 	defer rows.Close()
 
 	type EquipmentItem struct {
-		ID                     uuid.UUID  `json:"id"`
-		Code                   string     `json:"code"`
-		Name                   string     `json:"name"`
-		Description            *string    `json:"description,omitempty"`
-		EquipmentType          string     `json:"equipment_type"`
-		Category               *string    `json:"category,omitempty"`
-		WorkCenterID           *uuid.UUID `json:"work_center_id,omitempty"`
-		WorkCenterName         *string    `json:"work_center_name,omitempty"`
-		Manufacturer           *string    `json:"manufacturer,omitempty"`
-		Model                  *string    `json:"model,omitempty"`
-		SerialNumber           *string    `json:"serial_number,omitempty"`
-		PurchaseDate           *string    `json:"purchase_date,omitempty"`
-		WarrantyExpiry         *string    `json:"warranty_expiry,omitempty"`
-		Status                 string     `json:"status"`
-		LastMaintenanceDate    *string    `json:"last_maintenance_date,omitempty"`
-		NextMaintenanceDate    *string    `json:"next_maintenance_date,omitempty"`
-		MaintenanceIntervalDays *int      `json:"maintenance_interval_days,omitempty"`
-		PurchaseCost           float64    `json:"purchase_cost"`
-		CurrentValue           float64    `json:"current_value"`
-		HourlyRate             float64    `json:"hourly_rate"`
-		Notes                  *string    `json:"notes,omitempty"`
-		CreatedAt              time.Time  `json:"created_at"`
-		UpdatedAt              time.Time  `json:"updated_at"`
+		ID                      uuid.UUID  `json:"id"`
+		Code                    string     `json:"code"`
+		Name                    string     `json:"name"`
+		Description             *string    `json:"description,omitempty"`
+		EquipmentType           string     `json:"equipment_type"`
+		Category                *string    `json:"category,omitempty"`
+		WorkCenterID            *uuid.UUID `json:"work_center_id,omitempty"`
+		WorkCenterName          *string    `json:"work_center_name,omitempty"`
+		Manufacturer            *string    `json:"manufacturer,omitempty"`
+		Model                   *string    `json:"model,omitempty"`
+		SerialNumber            *string    `json:"serial_number,omitempty"`
+		PurchaseDate            *string    `json:"purchase_date,omitempty"`
+		WarrantyExpiry          *string    `json:"warranty_expiry,omitempty"`
+		Status                  string     `json:"status"`
+		LastMaintenanceDate     *string    `json:"last_maintenance_date,omitempty"`
+		NextMaintenanceDate     *string    `json:"next_maintenance_date,omitempty"`
+		MaintenanceIntervalDays *int       `json:"maintenance_interval_days,omitempty"`
+		PurchaseCost            float64    `json:"purchase_cost"`
+		CurrentValue            float64    `json:"current_value"`
+		HourlyRate              float64    `json:"hourly_rate"`
+		Notes                   *string    `json:"notes,omitempty"`
+		CreatedAt               time.Time  `json:"created_at"`
+		UpdatedAt               time.Time  `json:"updated_at"`
 	}
 
 	equipment := []EquipmentItem{}
@@ -4105,22 +4135,51 @@ func (h *Handler) ListEquipment(c *gin.Context) {
 			h.log.Error("Failed to scan equipment", "error", err)
 			continue
 		}
-		if description.Valid { e.Description = &description.String }
-		if category.Valid { e.Category = &category.String }
+		if description.Valid {
+			e.Description = &description.String
+		}
+		if category.Valid {
+			e.Category = &category.String
+		}
 		if workCenterID.Valid {
 			id, _ := uuid.Parse(workCenterID.String)
 			e.WorkCenterID = &id
 		}
-		if workCenterName.Valid { e.WorkCenterName = &workCenterName.String }
-		if manufacturer.Valid { e.Manufacturer = &manufacturer.String }
-		if model.Valid { e.Model = &model.String }
-		if serialNumber.Valid { e.SerialNumber = &serialNumber.String }
-		if notes.Valid { e.Notes = &notes.String }
-		if purchaseDate.Valid { s := purchaseDate.Time.Format("2006-01-02"); e.PurchaseDate = &s }
-		if warrantyExpiry.Valid { s := warrantyExpiry.Time.Format("2006-01-02"); e.WarrantyExpiry = &s }
-		if lastMaint.Valid { s := lastMaint.Time.Format("2006-01-02"); e.LastMaintenanceDate = &s }
-		if nextMaint.Valid { s := nextMaint.Time.Format("2006-01-02"); e.NextMaintenanceDate = &s }
-		if maintInterval.Valid { v := int(maintInterval.Int64); e.MaintenanceIntervalDays = &v }
+		if workCenterName.Valid {
+			e.WorkCenterName = &workCenterName.String
+		}
+		if manufacturer.Valid {
+			e.Manufacturer = &manufacturer.String
+		}
+		if model.Valid {
+			e.Model = &model.String
+		}
+		if serialNumber.Valid {
+			e.SerialNumber = &serialNumber.String
+		}
+		if notes.Valid {
+			e.Notes = &notes.String
+		}
+		if purchaseDate.Valid {
+			s := purchaseDate.Time.Format("2006-01-02")
+			e.PurchaseDate = &s
+		}
+		if warrantyExpiry.Valid {
+			s := warrantyExpiry.Time.Format("2006-01-02")
+			e.WarrantyExpiry = &s
+		}
+		if lastMaint.Valid {
+			s := lastMaint.Time.Format("2006-01-02")
+			e.LastMaintenanceDate = &s
+		}
+		if nextMaint.Valid {
+			s := nextMaint.Time.Format("2006-01-02")
+			e.NextMaintenanceDate = &s
+		}
+		if maintInterval.Valid {
+			v := int(maintInterval.Int64)
+			e.MaintenanceIntervalDays = &v
+		}
 		equipment = append(equipment, e)
 	}
 
@@ -4256,35 +4315,95 @@ func (h *Handler) UpdateEquipment(c *gin.Context) {
 	args := []interface{}{}
 	argCount := 0
 
-	if input.Name != nil { argCount++; updates = append(updates, fmt.Sprintf("name = $%d", argCount)); args = append(args, *input.Name) }
-	if input.Description != nil { argCount++; updates = append(updates, fmt.Sprintf("description = $%d", argCount)); args = append(args, *input.Description) }
-	if input.EquipmentType != nil { argCount++; updates = append(updates, fmt.Sprintf("equipment_type = $%d", argCount)); args = append(args, *input.EquipmentType) }
-	if input.Category != nil { argCount++; updates = append(updates, fmt.Sprintf("category = $%d", argCount)); args = append(args, *input.Category) }
+	if input.Name != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
+		args = append(args, *input.Name)
+	}
+	if input.Description != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, *input.Description)
+	}
+	if input.EquipmentType != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("equipment_type = $%d", argCount))
+		args = append(args, *input.EquipmentType)
+	}
+	if input.Category != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("category = $%d", argCount))
+		args = append(args, *input.Category)
+	}
 	if input.WorkCenterID != nil {
 		if *input.WorkCenterID == "" {
-			argCount++; updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount)); args = append(args, nil)
+			argCount++
+			updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount))
+			args = append(args, nil)
 		} else if id, err := uuid.Parse(*input.WorkCenterID); err == nil {
-			argCount++; updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount)); args = append(args, id)
+			argCount++
+			updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount))
+			args = append(args, id)
 		}
 	}
-	if input.Manufacturer != nil { argCount++; updates = append(updates, fmt.Sprintf("manufacturer = $%d", argCount)); args = append(args, *input.Manufacturer) }
-	if input.Model != nil { argCount++; updates = append(updates, fmt.Sprintf("model = $%d", argCount)); args = append(args, *input.Model) }
-	if input.SerialNumber != nil { argCount++; updates = append(updates, fmt.Sprintf("serial_number = $%d", argCount)); args = append(args, *input.SerialNumber) }
-	if input.Status != nil { argCount++; updates = append(updates, fmt.Sprintf("status = $%d", argCount)); args = append(args, *input.Status) }
-	if input.PurchaseCost != nil { argCount++; updates = append(updates, fmt.Sprintf("purchase_cost = $%d", argCount)); args = append(args, *input.PurchaseCost) }
-	if input.CurrentValue != nil { argCount++; updates = append(updates, fmt.Sprintf("current_value = $%d", argCount)); args = append(args, *input.CurrentValue) }
-	if input.HourlyRate != nil { argCount++; updates = append(updates, fmt.Sprintf("hourly_rate = $%d", argCount)); args = append(args, *input.HourlyRate) }
-	if input.MaintenanceIntervalDays != nil { argCount++; updates = append(updates, fmt.Sprintf("maintenance_interval_days = $%d", argCount)); args = append(args, *input.MaintenanceIntervalDays) }
-	if input.Notes != nil { argCount++; updates = append(updates, fmt.Sprintf("notes = $%d", argCount)); args = append(args, *input.Notes) }
+	if input.Manufacturer != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("manufacturer = $%d", argCount))
+		args = append(args, *input.Manufacturer)
+	}
+	if input.Model != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("model = $%d", argCount))
+		args = append(args, *input.Model)
+	}
+	if input.SerialNumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("serial_number = $%d", argCount))
+		args = append(args, *input.SerialNumber)
+	}
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+	}
+	if input.PurchaseCost != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("purchase_cost = $%d", argCount))
+		args = append(args, *input.PurchaseCost)
+	}
+	if input.CurrentValue != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("current_value = $%d", argCount))
+		args = append(args, *input.CurrentValue)
+	}
+	if input.HourlyRate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("hourly_rate = $%d", argCount))
+		args = append(args, *input.HourlyRate)
+	}
+	if input.MaintenanceIntervalDays != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("maintenance_interval_days = $%d", argCount))
+		args = append(args, *input.MaintenanceIntervalDays)
+	}
+	if input.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		args = append(args, *input.Notes)
+	}
 
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")
 		return
 	}
 
-	argCount++; updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount)); args = append(args, time.Now())
-	argCount++; args = append(args, equipID)
-	argCount++; args = append(args, tenantID)
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+	argCount++
+	args = append(args, equipID)
+	argCount++
+	args = append(args, tenantID)
 
 	query := fmt.Sprintf("UPDATE manufacturing_equipment SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
 		strings.Join(updates, ", "), argCount-1, argCount)
@@ -4394,12 +4513,27 @@ func (h *Handler) ListMaintenanceTasks(c *gin.Context) {
 			h.log.Error("Failed to scan maintenance task", "error", err)
 			continue
 		}
-		if workCenterID.Valid { id, _ := uuid.Parse(workCenterID.String); t.WorkCenterID = &id }
-		if scheduledDate.Valid { s := scheduledDate.Time.Format("2006-01-02"); t.ScheduledDate = &s }
-		if actualDate.Valid { s := actualDate.Time.Format("2006-01-02"); t.ActualDate = &s }
-		if description.Valid { t.Description = &description.String }
-		if workPerformed.Valid { t.WorkPerformed = &workPerformed.String }
-		if notes.Valid { t.Notes = &notes.String }
+		if workCenterID.Valid {
+			id, _ := uuid.Parse(workCenterID.String)
+			t.WorkCenterID = &id
+		}
+		if scheduledDate.Valid {
+			s := scheduledDate.Time.Format("2006-01-02")
+			t.ScheduledDate = &s
+		}
+		if actualDate.Valid {
+			s := actualDate.Time.Format("2006-01-02")
+			t.ActualDate = &s
+		}
+		if description.Valid {
+			t.Description = &description.String
+		}
+		if workPerformed.Valid {
+			t.WorkPerformed = &workPerformed.String
+		}
+		if notes.Valid {
+			t.Notes = &notes.String
+		}
 		tasks = append(tasks, t)
 	}
 
@@ -4547,21 +4681,46 @@ func (h *Handler) UpdateMaintenanceTask(c *gin.Context) {
 	args := []interface{}{}
 	argCount := 0
 
-	if input.MaintenanceType != nil { argCount++; updates = append(updates, fmt.Sprintf("maintenance_type = $%d", argCount)); args = append(args, *input.MaintenanceType) }
-	if input.ScheduledDate != nil { argCount++; updates = append(updates, fmt.Sprintf("scheduled_date = $%d", argCount)); args = append(args, *input.ScheduledDate) }
-	if input.DurationHours != nil { argCount++; updates = append(updates, fmt.Sprintf("duration_hours = $%d", argCount)); args = append(args, *input.DurationHours) }
-	if input.Description != nil { argCount++; updates = append(updates, fmt.Sprintf("description = $%d", argCount)); args = append(args, *input.Description) }
-	if input.Notes != nil { argCount++; updates = append(updates, fmt.Sprintf("notes = $%d", argCount)); args = append(args, *input.Notes) }
+	if input.MaintenanceType != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("maintenance_type = $%d", argCount))
+		args = append(args, *input.MaintenanceType)
+	}
+	if input.ScheduledDate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("scheduled_date = $%d", argCount))
+		args = append(args, *input.ScheduledDate)
+	}
+	if input.DurationHours != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("duration_hours = $%d", argCount))
+		args = append(args, *input.DurationHours)
+	}
+	if input.Description != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, *input.Description)
+	}
+	if input.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		args = append(args, *input.Notes)
+	}
 
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")
 		return
 	}
 
-	argCount++; updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount)); args = append(args, time.Now())
-	argCount++; args = append(args, taskID)
-	argCount++; args = append(args, tenantID)
-	argCount++; args = append(args, equipID)
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+	argCount++
+	args = append(args, taskID)
+	argCount++
+	args = append(args, tenantID)
+	argCount++
+	args = append(args, equipID)
 
 	query := fmt.Sprintf(
 		"UPDATE equipment_maintenance SET %s WHERE id = $%d AND tenant_id = $%d AND equipment_id = $%d",
@@ -4617,14 +4776,14 @@ func (h *Handler) ListManufacturingCategories(c *gin.Context) {
 	defer rows.Close()
 
 	type CategoryResponse struct {
-		ID          uuid.UUID  `json:"id"`
-		Name        string     `json:"name"`
-		Description *string    `json:"description"`
-		Color       *string    `json:"color"`
-		IsActive    bool       `json:"is_active"`
-		SortOrder   int        `json:"sort_order"`
-		CreatedAt   time.Time  `json:"created_at"`
-		UpdatedAt   time.Time  `json:"updated_at"`
+		ID          uuid.UUID `json:"id"`
+		Name        string    `json:"name"`
+		Description *string   `json:"description"`
+		Color       *string   `json:"color"`
+		IsActive    bool      `json:"is_active"`
+		SortOrder   int       `json:"sort_order"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
 	}
 
 	categories := []CategoryResponse{}
