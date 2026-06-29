@@ -1465,6 +1465,28 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	// Transport-overhead percentages by resource type, added to the totals
+	// (not to the resource rows) so the report matches the Excel Свод
+	// "Строительные материалы" / "Оборудование" lines. Defaults follow the
+	// Госкомархитектстрой norms (materials 5% / cable 1.5% / оборудование 2%);
+	// machines & labour carry none. Overridable per request so the web modal
+	// and mobile can pass project-specific rates.
+	parsePct := func(key string, def float64) float64 {
+		if v := c.Query(key); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+				return f
+			}
+		}
+		return def
+	}
+	transportPct := map[string]float64{
+		"material":  parsePct("tp_material", 5),
+		"cable":     parsePct("tp_cable", 1.5),
+		"installed": parsePct("tp_installed", 2),
+		"equipment": parsePct("tp_equipment", 0),
+		"labor":     parsePct("tp_labor", 0),
+	}
+
 	type group struct {
 		Type          string  `json:"type"`
 		Name          string  `json:"name"`
@@ -1475,10 +1497,19 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		Subcontractor string  `json:"subcontractor"`
 	}
 	type block struct {
-		ID          int64   `json:"id"`
-		Name        string  `json:"name"`
-		Groups      []group `json:"groups"`
-		TotalAmount float64 `json:"total_amount"`
+		ID                 int64   `json:"id"`
+		Name               string  `json:"name"`
+		Groups             []group `json:"groups"`
+		TotalAmount        float64 `json:"total_amount"`
+		TransportAmount    float64 `json:"transport_amount"`
+		TotalWithTransport float64 `json:"total_with_transport"`
+	}
+	transportOf := func(gs []group) float64 {
+		var s float64
+		for _, g := range gs {
+			s += g.NormaAmount * (transportPct[g.Type] / 100.0)
+		}
+		return s
 	}
 
 	blockOrder := []int64{}
@@ -1547,8 +1578,13 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 
 	out := make([]*block, 0, len(blockOrder))
 	for _, bid := range blockOrder {
-		out = append(out, blockMap[bid])
+		blk := blockMap[bid]
+		blk.TransportAmount = transportOf(blk.Groups)
+		blk.TotalWithTransport = blk.TotalAmount + blk.TransportAmount
+		out = append(out, blk)
 	}
+
+	grandTransport := transportOf(totalGroups)
 
 	response.Success(c, gin.H{
 		"project": gin.H{
@@ -1556,10 +1592,13 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 			"name":    projectName,
 			"address": projectAddress,
 		},
-		"blocks": out,
+		"blocks":        out,
+		"transport_pct": transportPct,
 		"total": gin.H{
-			"groups":       totalGroups,
-			"total_amount": grandTotal,
+			"groups":               totalGroups,
+			"total_amount":         grandTotal,
+			"transport_amount":     grandTransport,
+			"total_with_transport": grandTotal + grandTransport,
 		},
 	})
 }
