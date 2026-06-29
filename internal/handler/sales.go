@@ -2126,6 +2126,12 @@ func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.
 		WHERE sol.sales_order_id = $1
 		  AND p.is_manufacturable = true
 		  AND p.auto_manufacture = true
+		  AND NOT EXISTS (
+		      SELECT 1 FROM production_orders po
+		      WHERE po.sales_order_id = sol.sales_order_id
+		        AND po.product_id = sol.product_id
+		        AND po.deleted_at IS NULL
+		  )
 	`, orderID)
 	if err != nil {
 		h.log.Error("Auto MO: failed to fetch SO lines", "error", err)
@@ -2819,6 +2825,21 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		h.log.Error("CreateInvoiceFromOrder: commit failed", "error", err)
 		response.InternalError(c, "Failed to commit transaction")
 		return
+	}
+
+	// The order is now in 'processing'. Auto-create production orders for any
+	// manufacturable line that doesn't already have one (idempotent — the dedup
+	// guard means this never double-creates with the confirm-time trigger).
+	{
+		var whStr sql.NullString
+		_ = h.db.QueryRow(`SELECT warehouse_id::text FROM sales_orders WHERE id=$1 AND tenant_id=$2`, orderID, tenantID).Scan(&whStr)
+		var whPtr *uuid.UUID
+		if whStr.Valid && whStr.String != "" {
+			if w, e := uuid.Parse(whStr.String); e == nil {
+				whPtr = &w
+			}
+		}
+		h.autoCreateProductionOrders(tenantID, orderID, customerID, whPtr, organizationID, userID, time.Now())
 	}
 
 	invoiceStatus := string(entity.InvoiceStatusSent)
