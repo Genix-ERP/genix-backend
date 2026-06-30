@@ -282,6 +282,14 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 		return
 	}
 
+	// Freezing/advancing the Forma 2 period is owner-only. A subcontractor
+	// company on this project enters its FAKT, but the hiring company locks the
+	// period — same authority model as the final YAKUNIY and block management.
+	if !h.isProjectOwnerOrg(c, tenantID, projectID) {
+		response.Forbidden(c, "Forma 2 ni muzlatishni faqat bosh tashkilot amalga oshiradi")
+		return
+	}
+
 	var in CreateForm2IterationInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		// The body is optional — an empty POST is "just freeze and
@@ -368,6 +376,17 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 			return
 		}
 		h.log.Error("Failed to lock open iteration", "error", err, "project_id", projectID)
+		response.InternalError(c, "Failed to freeze iteration")
+		return
+	}
+
+	// 1b. Backfill the closing iteration so it covers EVERY estimate line in
+	// the project — including subcontractor estimates that were imported after
+	// this iteration was opened. This guarantees the freeze locks subcontractor
+	// works too, even those that never received FAKT this period. Idempotent
+	// (ON CONFLICT DO NOTHING), so existing period_fakt values are untouched.
+	if err := h.bootstrapIterationLines(tx, projectID, openIterID); err != nil {
+		h.log.Error("Failed to backfill open iteration before freeze", "error", err)
 		response.InternalError(c, "Failed to freeze iteration")
 		return
 	}
@@ -527,6 +546,12 @@ func (h *Handler) DeleteForm2Iteration(c *gin.Context) {
 	iterID, err := strconv.ParseInt(c.Param("iter_id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid iteration id")
+		return
+	}
+
+	// Unfreezing (rolling the period chain back) is owner-only, like freezing.
+	if !h.isProjectOwnerOrg(c, tenantID, projectID) {
+		response.Forbidden(c, "Forma 2 iteratsiyasini faqat bosh tashkilot o'zgartiradi")
 		return
 	}
 

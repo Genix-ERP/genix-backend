@@ -230,6 +230,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		SectionsCount:      p.SectionsCount,
 		TotalSmeta:         p.TotalSmeta,
 		FilesCount:         p.FilesCount,
+		ViewerRole:         p.ViewerRole,
 	})
 }
 

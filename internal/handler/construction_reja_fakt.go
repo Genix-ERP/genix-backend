@@ -96,6 +96,21 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	stageFilter := c.Query("stage_id")
 	statusFilter := c.Query("status")
 	buildingFilter := c.Query("building_id")
+	subFilter := c.Query("subcontract_id")
+	// Cross-company scope for the work rows: "" / "own" = in-house master
+	// estimate; "all" = in-house + every subcontractor; <id> = that
+	// subcontractor only. The id is parsed to int64, so inlining is safe.
+	subCond := func(col string) string {
+		if subFilter == "all" {
+			return ""
+		}
+		if subFilter != "" && subFilter != "own" {
+			if sid, err := strconv.ParseInt(subFilter, 10, 64); err == nil && sid > 0 {
+				return fmt.Sprintf(" AND %s = %d", col, sid)
+			}
+		}
+		return " AND " + col + " IS NULL"
+	}
 
 	// Optional, opt-in pagination of the top-level stages (mirrors
 	// construction_stages.go). Mobile sends page+limit so the per-block
@@ -127,7 +142,7 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	// request carries a `?refresh=1` flag so the user can force-bust
 	// the cache after a YAKUNIY confirm or qty edit if they don't
 	// want to wait the 15s TTL.
-	cacheKey := rejaFaktCacheKey(tenantID, projectID, buildingFilter, statusFilter, stageFilter, page, limit)
+	cacheKey := rejaFaktCacheKey(tenantID, projectID, buildingFilter+"|s="+subFilter, statusFilter, stageFilter, page, limit)
 	if c.Query("refresh") != "1" {
 		if v, ok := rejaFaktCache.Load(cacheKey); ok {
 			entry := v.(*rejaFaktCacheEntry)
@@ -463,9 +478,21 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 	workByID := map[int64]workMeta{}
 	subsByWork := map[int64][]subResRow{}
 	{
+		// In-house estimates only. Subcontractor estimates carry the same work
+		// names and their FAKT is already mirrored onto the in-house master via
+		// the FAKT sync, so including them here double-counts and lets a
+		// subcontractor line's done/qty collide with an in-house line's rate
+		// (the "252 bln fact / ЩЕБЕНЬ-as-work" bug).
+		// In-house EDINICH estimate only. Works (and their plan qty, done, and
+		// rate) must all come from the единич work-breakdown lines — the same
+		// basis Stages/Estimates use (quantity × unit_rate). Pulling the plan
+		// quantity from the ВОР estimate (a different unit scale) while the
+		// done came from единич caused the ~1000× "252 bln fact" blow-up, and
+		// ВОР flat resources (e.g. ЩЕБЕНЬ) leaked in as fake work rows.
 		estimateScopeQ := `
 			SELECT id FROM construction_estimate
 			WHERE project_id = $1 AND tenant_id = $2
+			  AND LOWER(COALESCE(source_type, '')) NOT IN ('resurs', 'vor')` + subCond("subcontract_id") + `
 		`
 		estimateScopeArgs := []interface{}{projectID, tenantID}
 		if buildingFilter != "" {
@@ -570,6 +597,7 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			      ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
 			    WHERE e.project_id = $1
 			      AND l.tenant_id = $2
+			      AND LOWER(COALESCE(e.source_type, '')) NOT IN ('resurs', 'vor')` + subCond("e.subcontract_id") + `
 			      AND COALESCE(l.resource_type, '') = ''
 			      AND COALESCE(l.parent_line_id, 0) = 0
 			      ` + perLineBuildingFilter + `
@@ -949,15 +977,22 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 			//      while Bosqichlar showed real numbers — exactly the
 			//      bug the user reported as "Reja va Fakt section is not
 			//      showing".
-			noPricedSubs := len(vsub.Materials) == 0 && len(vsub.Equipment) == 0
-			zeroSubAmounts := vsub.MaterialPlanTotal == 0 && vsub.EquipPlanTotal == 0 &&
-				vsub.MaterialFactTotal == 0 && vsub.EquipFactTotal == 0
-			if (noPricedSubs || zeroSubAmounts) && (w.plan > 0 || w.fact > 0) {
-				vsub.MaterialPlanTotal = w.plan
-				vsub.MaterialFactTotal = w.fact
-			}
-			vsub.PlanTotal = vsub.MaterialPlanTotal + vsub.EquipPlanTotal
-			vsub.FactTotal = vsub.MaterialFactTotal + vsub.EquipFactTotal
+			// Work money total is ALWAYS quantity x unit_rate (plan) and done x
+			// unit_rate (fact) - the exact basis Stages and Estimates use. Summing
+			// the resource norm rows (norm x qty x unit_rate) uses a per-resource
+			// unit base different from the work's own unit, which inflated the fact
+			// ~1000x (the "252 bln fact" bug). w.plan / w.fact already fall back to
+			// the resource-derived rate when the work carries no own rate, so this
+			// stays correct for pure-resource works too. The per-resource money
+			// breakdown is dropped so its rows can't disagree with the work total.
+			vsub.Materials = []MaterialRow{}
+			vsub.Equipment = []EquipmentRow{}
+			vsub.MaterialPlanTotal = w.plan
+			vsub.MaterialFactTotal = w.fact
+			vsub.EquipPlanTotal = 0
+			vsub.EquipFactTotal = 0
+			vsub.PlanTotal = w.plan
+			vsub.FactTotal = w.fact
 			vsub.Difference = vsub.PlanTotal - vsub.FactTotal
 
 			sr.SubStages = append(sr.SubStages, vsub)
@@ -1093,6 +1128,14 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 				sr.Status = "in_progress"
 			}
 			// else: leave whatever stg.Status was (usually "not_started").
+		}
+
+		// Hide stages that have no works in the current (block + subcontractor)
+		// scope. A subcontractor-only stage (e.g. БУРОНАБИВНЫЕ ФУНДАМЕНТЫ) would
+		// otherwise render as a confusing 0/0 row in the in-house ("own") view,
+		// and likewise an in-house stage when a single subcontractor is picked.
+		if len(sr.SubStages) == 0 {
+			continue
 		}
 
 		totalMaterialPlan += sr.MaterialPlanTotal
