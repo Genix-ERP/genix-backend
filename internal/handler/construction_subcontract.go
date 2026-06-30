@@ -36,6 +36,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 	query := `
 		SELECT s.id, s.name, s.project_id, s.partner_name, s.work_description,
 		       COALESCE(s.contract_number, ''),
+		       COALESCE(s.subcontractor_organization_id::text, ''), COALESCE(subo.name, ''),
 		       s.amount, s.currency, s.start_date, s.end_date,
 		       s.retention_pct, s.state, s.rating,
 		       s.contact_person, s.contact_phone, s.notes,
@@ -47,6 +48,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		       COALESCE(acts.completed_amount, 0) as completed_amount,
 		       COALESCE(acts.paid_amount, 0) as paid_amount
 		FROM construction_subcontract s
+		LEFT JOIN organizations subo ON subo.id = s.subcontractor_organization_id AND subo.tenant_id = s.tenant_id
 		LEFT JOIN LATERAL (
 			SELECT COALESCE(SUM(CASE WHEN a.state = 'approved' AND a.act_type = 'ks2' THEN a.amount_total ELSE 0 END), 0) as completed_amount,
 			       COALESCE(SUM(CASE WHEN a.state = 'approved' AND a.act_type = 'ks3' THEN a.amount_total ELSE 0 END), 0) as paid_amount
@@ -79,6 +81,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		var name string
 		var partnerName sql.NullString
 		var contractNumber string
+		var subOrgID, subOrgName string
 		var workDescription, notes sql.NullString
 		var amount float64
 		var currency string
@@ -94,6 +97,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		if err := rows.Scan(
 			&id, &name, &projectIDVal, &partnerName, &workDescription,
 			&contractNumber,
+			&subOrgID, &subOrgName,
 			&amount, &currency, &startDate, &endDate,
 			&retentionPct, &state, &rating,
 			&contactPerson, &contactPhone, &notes,
@@ -153,6 +157,8 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			"project_id":            projectIDVal,
 			"partner_name":          nullStringVal(partnerName),
 			"contract_number":       contractNumber,
+			"subcontractor_organization_id":   subOrgID,
+			"subcontractor_organization_name": subOrgName,
 			"work_description":      nullStringVal(workDescription),
 			"amount":                amount,
 			"currency":              currency,
@@ -202,7 +208,8 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 	}
 
 	var req struct {
-		ContractNumber  string  `json:"contract_number"`
+		ContractNumber               string `json:"contract_number"`
+		SubcontractorOrganizationID  string `json:"subcontractor_organization_id"`
 		PartnerName     string  `json:"partner_name"`
 		WorkDescription string  `json:"work_description"`
 		Amount          float64 `json:"amount"`
@@ -244,6 +251,14 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		currency = "UZS"
 	}
 
+	// Optional link to another tenant company acting as the subcontractor.
+	var subOrg interface{}
+	if req.SubcontractorOrganizationID != "" {
+		if oid, perr := uuid.Parse(req.SubcontractorOrganizationID); perr == nil {
+			subOrg = oid
+		}
+	}
+
 	var startDate, endDate interface{}
 	if req.StartDate != "" {
 		startDate = req.StartDate
@@ -260,10 +275,11 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 			state, rating, contact_person, contact_phone, notes,
 			address, phone, bank_name, bank_account, mfo, stir, okonh,
 			director_name, chief_accountant_name,
-			created_by, created_date, updated_date, contract_number
+			created_by, created_date, updated_date, contract_number,
+			subcontractor_organization_id
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', 0, $11, $12, $13,
 			$14, $15, $16, $17, $18, $19, $20, $21, $22,
-			$23, NOW(), NOW(), $24)
+			$23, NOW(), NOW(), $24, $25)
 		RETURNING id
 	`, tenantID, projectID, nullStringFromVal(req.PartnerName), name, nullStringFromVal(req.WorkDescription),
 		req.Amount, currency, startDate, endDate, req.RetentionPct,
@@ -273,7 +289,7 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		nullStringFromVal(req.BankName), nullStringFromVal(req.BankAccount),
 		nullStringFromVal(req.MFO), nullStringFromVal(req.STIR), nullStringFromVal(req.OKONH),
 		nullStringFromVal(req.DirectorName), nullStringFromVal(req.ChiefAccountantName),
-		userID, nullStringFromVal(req.ContractNumber),
+		userID, nullStringFromVal(req.ContractNumber), subOrg,
 	).Scan(&id)
 
 	if err != nil {
@@ -322,6 +338,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 	var name, state, currency string
 	var partnerNameVal sql.NullString
 	var contractNumberVal string
+	var subOrgIDVal, subOrgNameVal string
 	var workDescription, notes, contactPerson, contactPhone sql.NullString
 	var address, phone, bankName, bankAccount, mfo, stir, okonh, directorName, chiefAccName sql.NullString
 	var amount, retentionPct, rating float64
@@ -332,6 +349,7 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 	err = h.db.QueryRow(`
 		SELECT s.id, s.name, s.project_id, s.partner_name, s.work_description,
 		       COALESCE(s.contract_number, ''),
+		       COALESCE(s.subcontractor_organization_id::text, ''), COALESCE(subo.name, ''),
 		       s.amount, s.currency, s.start_date, s.end_date,
 		       s.retention_pct, s.state, s.rating,
 		       s.contact_person, s.contact_phone, s.notes,
@@ -339,10 +357,12 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		       s.mfo, s.stir, s.okonh, s.director_name, s.chief_accountant_name,
 		       s.created_by, s.created_date, s.updated_date
 		FROM construction_subcontract s
+		LEFT JOIN organizations subo ON subo.id = s.subcontractor_organization_id AND subo.tenant_id = s.tenant_id
 		WHERE s.id = $1 AND s.tenant_id = $2
 	`, subID, tenantID).Scan(
 		&id, &name, &projectIDVal, &partnerNameVal, &workDescription,
 		&contractNumberVal,
+		&subOrgIDVal, &subOrgNameVal,
 		&amount, &currency, &startDate, &endDate,
 		&retentionPct, &state, &rating,
 		&contactPerson, &contactPhone, &notes,
@@ -392,6 +412,8 @@ func (h *Handler) GetSubcontract(c *gin.Context) {
 		"project_id":            projectIDVal,
 		"partner_name":          nullStringVal(partnerNameVal),
 		"contract_number":       contractNumberVal,
+		"subcontractor_organization_id":   subOrgIDVal,
+		"subcontractor_organization_name": subOrgNameVal,
 		"work_description":      nullStringVal(workDescription),
 		"amount":                amount,
 		"currency":              currency,
@@ -442,7 +464,8 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 	}
 
 	var req struct {
-		ContractNumber  *string  `json:"contract_number"`
+		ContractNumber              *string `json:"contract_number"`
+		SubcontractorOrganizationID *string `json:"subcontractor_organization_id"`
 		PartnerName     *string  `json:"partner_name"`
 		WorkDescription *string  `json:"work_description"`
 		Amount          *float64 `json:"amount"`
@@ -480,6 +503,15 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("contract_number = $%d", argCount))
 		args = append(args, nullStringFromVal(*req.ContractNumber))
+	}
+	if req.SubcontractorOrganizationID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("subcontractor_organization_id = $%d", argCount))
+		if oid, perr := uuid.Parse(*req.SubcontractorOrganizationID); *req.SubcontractorOrganizationID != "" && perr == nil {
+			args = append(args, oid)
+		} else {
+			args = append(args, nil)
+		}
 	}
 	if req.PartnerName != nil {
 		argCount++

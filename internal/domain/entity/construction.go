@@ -138,6 +138,10 @@ type ConstructionProject struct {
 	// FilesCount drives the badge on the "Fayllar" button on each
 	// project card. Computed via a subquery against project_files.
 	FilesCount int `json:"files_count" db:"files_count"`
+	// ViewerRole = "owner" when the active company owns the project, or
+	// "subcontractor" when the active company is only a subcontractor on it
+	// (drives the "Subpudratchi" badge + scoped access). Not a DB column.
+	ViewerRole string `json:"viewer_role,omitempty"`
 }
 
 // MarshalJSON custom marshaler for ConstructionProject to handle sql.Null* types
@@ -184,6 +188,7 @@ func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 		SectionsCount      int       `json:"sections_count,omitempty"`
 		TotalSmeta         float64   `json:"total_smeta,omitempty"`
 		FilesCount         int       `json:"files_count"`
+		ViewerRole         string    `json:"viewer_role,omitempty"`
 	}{
 		Description:        nullStringValue(p.Description),
 		Address:            nullStringValue(p.Address),
@@ -385,6 +390,9 @@ type ConstructionBuilding struct {
 	// FilesCount is the number of rows in building_files linked to this
 	// building. Drives the badge on the "Fayllar" button in the UI.
 	FilesCount int `json:"files_count" db:"files_count"`
+	// SubcontractorOrgIDs are the companies (tenant orgs) assigned to this block
+	// as subcontractors. Populated separately, not a DB column.
+	SubcontractorOrgIDs []string `json:"subcontractor_org_ids" db:"-"`
 }
 
 // MarshalJSON custom marshaler for ConstructionBuilding to handle sql.Null* types
@@ -426,6 +434,7 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		SectionsCount        int             `json:"sections_count,omitempty"`
 		TotalSmeta           float64         `json:"total_smeta,omitempty"`
 		FilesCount           int             `json:"files_count"`
+		SubcontractorOrgIDs  []string        `json:"subcontractor_org_ids"`
 	}{
 		ID:                   b.ID,
 		TenantID:             b.TenantID,
@@ -463,6 +472,7 @@ func (b ConstructionBuilding) MarshalJSON() ([]byte, error) {
 		SectionsCount:        b.SectionsCount,
 		TotalSmeta:           b.TotalSmeta,
 		FilesCount:           b.FilesCount,
+		SubcontractorOrgIDs:  b.SubcontractorOrgIDs,
 	})
 }
 
@@ -485,6 +495,10 @@ type CreateConstructionBuildingInput struct {
 	PlannedStartDate     string  `json:"planned_start_date"`
 	PlannedEndDate       string  `json:"planned_end_date"`
 	SortOrder            int     `json:"sort_order"`
+	// Companies (tenant organizations) assigned to this block as subcontractors.
+	// The handler find-or-creates a subcontract per company so imports have a
+	// subcontract to attach to. Many-to-many.
+	SubcontractorOrgIDs  []string `json:"subcontractor_org_ids"`
 }
 
 // UpdateConstructionBuildingInput represents input for updating a building
@@ -509,6 +523,10 @@ type UpdateConstructionBuildingInput struct {
 	Status               *string  `json:"status"`
 	ProgressPercent      *float64 `json:"progress_percent"`
 	SortOrder            *int     `json:"sort_order"`
+	// nil = leave block↔subcontractor assignments untouched; non-nil (even
+	// empty) = replace the block's assigned subcontractor companies with this
+	// set (find-or-creating a subcontract per company).
+	SubcontractorOrgIDs  *[]string `json:"subcontractor_org_ids"`
 }
 
 // =====================================================

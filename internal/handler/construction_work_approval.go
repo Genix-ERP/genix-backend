@@ -664,6 +664,26 @@ func (h *Handler) BulkConfirmEngineer(c *gin.Context) {
 // Validates role, current status, then runs the UPDATE with the
 // caller-supplied `extraSet` clause (which may reference $userID and
 // $note). Writes one audit row using the supplied description.
+// engineerLockBlockedForOrg reports whether the active organization is a
+// subcontractor on this project (i.e. NOT the project owner). When true, the
+// final confirmed_engineer (YAKUNIY/lock) transition must be refused — only the
+// hiring/owning company can give the final acceptance. Legacy projects with no
+// owner org, and requests with no active org header, are left unrestricted.
+func (h *Handler) engineerLockBlockedForOrg(c *gin.Context, tenantID uuid.UUID, projectID int64) bool {
+	activeOrg, hasOrg := middleware.GetOrganizationID(c)
+	if !hasOrg || activeOrg == uuid.Nil {
+		return false
+	}
+	var ownerOrg uuid.NullUUID
+	if err := h.db.QueryRow(
+		`SELECT organization_id FROM construction_projects WHERE id = $1 AND tenant_id = $2`,
+		projectID, tenantID,
+	).Scan(&ownerOrg); err != nil {
+		return false
+	}
+	return ownerOrg.Valid && ownerOrg.UUID != activeOrg
+}
+
 func (h *Handler) transitionWork(
 	c *gin.Context,
 	newStatus string,
@@ -703,6 +723,15 @@ func (h *Handler) transitionWork(
 	roles := h.resolveProjectRoles(tenantID, userID, ctx.ProjectID)
 	if len(roles) > 0 && !roleSetHas(roles, requiredRole) {
 		response.Forbidden(c, "Action not allowed for your project role")
+		return
+	}
+
+	// Phase 3 (cross-company subcontracting): the FINAL engineer confirmation
+	// (YAKUNIY / lock) is reserved for the project-owner organization. A
+	// subcontractor org may take a work all the way to confirmed_supervisor
+	// but the hiring company gives the final acceptance.
+	if newStatus == "confirmed_engineer" && h.engineerLockBlockedForOrg(c, tenantID, ctx.ProjectID) {
+		response.Forbidden(c, "Yakuniy tasdiqlash faqat bosh tashkilotga ruxsat etilgan")
 		return
 	}
 
@@ -851,6 +880,12 @@ func (h *Handler) bulkWorksTransition(
 	roles := h.resolveProjectRoles(tenantID, userID, projectID)
 	if len(roles) > 0 && !roleSetHas(roles, requiredRole) {
 		response.Forbidden(c, "Action not allowed for your project role")
+		return
+	}
+
+	// Phase 3: only the project-owner org may perform the final YAKUNIY lock.
+	if newStatus == "confirmed_engineer" && h.engineerLockBlockedForOrg(c, tenantID, projectID) {
+		response.Forbidden(c, "Yakuniy tasdiqlash faqat bosh tashkilotga ruxsat etilgan")
 		return
 	}
 

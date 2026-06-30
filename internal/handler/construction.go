@@ -107,11 +107,20 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+	activeOrgID, hasOrg := middleware.GetOrganizationID(c)
+	if hasOrg && activeOrgID != uuid.Nil {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND cp.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
-		args = append(args, orgID)
+		// Show projects the active company OWNS, plus projects where it is a
+		// linked subcontractor (Company B working on Company A's project).
+		baseQuery += fmt.Sprintf(` AND (cp.organization_id IS NULL OR cp.organization_id = $%d OR EXISTS (
+			SELECT 1 FROM construction_subcontract sc
+			WHERE sc.tenant_id = cp.tenant_id AND sc.project_id = cp.id
+			  AND sc.subcontractor_organization_id = $%d))`, argCount, argCount)
+		countQuery += fmt.Sprintf(` AND (organization_id IS NULL OR organization_id = $%d OR EXISTS (
+			SELECT 1 FROM construction_subcontract sc
+			WHERE sc.tenant_id = construction_projects.tenant_id AND sc.project_id = construction_projects.id
+			  AND sc.subcontractor_organization_id = $%d))`, argCount, argCount)
+		args = append(args, activeOrgID)
 	}
 
 	if status != "" {
@@ -180,6 +189,14 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 		); err != nil {
 			h.log.Error("Failed to scan construction project", "error", err)
 			continue
+		}
+		// owner vs subcontractor (drives the "Subpudratchi" badge + scoping).
+		p.ViewerRole = "owner"
+		// Only a project explicitly owned by a DIFFERENT org is shown as
+		// subcontracted. Legacy/unassigned projects (NULL org) stay "owner"
+		// so they don't get a stray "Subpudratchi" badge.
+		if hasOrg && activeOrgID != uuid.Nil && p.OrganizationID.Valid && p.OrganizationID.UUID != activeOrgID {
+			p.ViewerRole = "subcontractor"
 		}
 		projects = append(projects, p)
 	}
@@ -287,6 +304,20 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		h.log.Error("Failed to query construction project", "error", err)
 		response.InternalError(c, "Failed to query project")
 		return
+	}
+
+	// Mark whether the active company owns this project or is only a
+	// subcontractor on it (drives the badge + scoped working in the UI).
+	p.ViewerRole = "owner"
+	if aOrg, aOk := middleware.GetOrganizationID(c); aOk && aOrg != uuid.Nil &&
+		p.OrganizationID.Valid && p.OrganizationID.UUID != aOrg {
+		var isSub bool
+		_ = h.db.QueryRow(`SELECT EXISTS (SELECT 1 FROM construction_subcontract
+			WHERE tenant_id = $1 AND project_id = $2 AND subcontractor_organization_id = $3)`,
+			tenantID, id, aOrg).Scan(&isSub)
+		if isSub {
+			p.ViewerRole = "subcontractor"
+		}
 	}
 
 	// Load Forma 2 / Forma 3 client banking & legal identity fields
@@ -1014,10 +1045,40 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		    GROUP BY building_id
 		) f ON f.building_id = b.id
 		WHERE b.project_id = $1 AND b.tenant_id = $2
-		ORDER BY COALESCE(b.sort_order, 0), b.code
 	`
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	queryArgs := []interface{}{projectID, tenantID}
+
+	// Block-level scoping for cross-company subcontractors: when the active
+	// company is a subcontractor on this project (not the owner) AND its
+	// subcontracts assign specific blocks, restrict the list to those blocks.
+	// If it has no block assignments at all, it sees every block (fallback).
+	if activeOrg, hasOrg := middleware.GetOrganizationID(c); hasOrg && activeOrg != uuid.Nil {
+		var ownerOrg uuid.NullUUID
+		_ = h.db.QueryRow(`SELECT organization_id FROM construction_projects WHERE id = $1 AND tenant_id = $2`,
+			projectID, tenantID).Scan(&ownerOrg)
+		if ownerOrg.Valid && ownerOrg.UUID != activeOrg {
+			queryArgs = append(queryArgs, activeOrg)
+			query += `
+		AND (
+		    NOT EXISTS (
+		        SELECT 1 FROM construction_subcontract_buildings sb
+		        JOIN construction_subcontract s ON s.id = sb.subcontract_id
+		        WHERE s.tenant_id = b.tenant_id AND s.project_id = b.project_id
+		          AND s.subcontractor_organization_id = $3
+		    )
+		    OR b.id IN (
+		        SELECT sb.building_id FROM construction_subcontract_buildings sb
+		        JOIN construction_subcontract s ON s.id = sb.subcontract_id
+		        WHERE s.tenant_id = b.tenant_id AND s.subcontractor_organization_id = $3
+		    )
+		)`
+		}
+	}
+
+	query += "\n\t\tORDER BY COALESCE(b.sort_order, 0), b.code"
+
+	rows, err := h.db.Query(query, queryArgs...)
 	if err != nil {
 		h.log.Error("Failed to query buildings", "error", err)
 		response.InternalError(c, "Failed to query buildings")
@@ -1045,7 +1106,35 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 			continue
 		}
 		b.GpsCoordinates = json.RawMessage(gpsCoordinates)
+		b.SubcontractorOrgIDs = []string{}
 		buildings = append(buildings, b)
+	}
+
+	// Attach each block's assigned subcontractor companies (org-backed links).
+	if len(buildings) > 0 {
+		idx := make(map[int64]int, len(buildings))
+		for i := range buildings {
+			idx[buildings[i].ID] = i
+		}
+		linkRows, lerr := h.db.Query(`
+			SELECT sb.building_id, s.subcontractor_organization_id::text
+			FROM construction_subcontract_buildings sb
+			JOIN construction_subcontract s ON s.id = sb.subcontract_id
+			WHERE s.tenant_id = $1 AND s.project_id = $2
+			  AND s.subcontractor_organization_id IS NOT NULL`, tenantID, projectID)
+		if lerr == nil {
+			defer linkRows.Close()
+			for linkRows.Next() {
+				var bID int64
+				var orgID string
+				if err := linkRows.Scan(&bID, &orgID); err != nil {
+					continue
+				}
+				if i, ok := idx[bID]; ok {
+					buildings[i].SubcontractorOrgIDs = append(buildings[i].SubcontractorOrgIDs, orgID)
+				}
+			}
+		}
 	}
 
 	response.Success(c, buildings)
@@ -1076,6 +1165,13 @@ func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Block management is owner-only — a subcontractor company on this project
+	// may not add blocks.
+	if !h.isProjectOwnerOrg(c, tenantID, projectID) {
+		response.Forbidden(c, "Bloklarni faqat bosh tashkilot boshqaradi")
 		return
 	}
 
@@ -1163,12 +1259,98 @@ func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 	// Update project buildings count
 	h.db.Exec(`UPDATE construction_projects SET buildings_count = buildings_count + 1, updated_date = NOW() WHERE id = $1`, projectID)
 
+	// Assign subcontractor companies to the new block (owner-controlled).
+	if len(req.SubcontractorOrgIDs) > 0 {
+		h.setBuildingSubcontractorOrgs(tenantID, projectID, buildingID, req.SubcontractorOrgIDs)
+	}
+
 	response.Created(c, map[string]interface{}{
 		"id":           buildingID,
 		"code":         req.Code,
 		"name":         req.Name,
 		"created_date": createdDate,
 	})
+}
+
+// isProjectOwnerOrg reports whether the active organization owns the project
+// (or there is no org context / the project is unassigned). Used to keep block
+// management — including block↔subcontractor assignment — owner-only, so a
+// subcontractor company can't assign itself to blocks it shouldn't work.
+func (h *Handler) isProjectOwnerOrg(c *gin.Context, tenantID uuid.UUID, projectID int64) bool {
+	activeOrg, hasOrg := middleware.GetOrganizationID(c)
+	if !hasOrg || activeOrg == uuid.Nil {
+		return true
+	}
+	var ownerOrg uuid.NullUUID
+	if err := h.db.QueryRow(`SELECT organization_id FROM construction_projects WHERE id = $1 AND tenant_id = $2`,
+		projectID, tenantID).Scan(&ownerOrg); err != nil {
+		return true
+	}
+	return !ownerOrg.Valid || ownerOrg.UUID == activeOrg
+}
+
+// setBuildingSubcontractorOrgs assigns subcontractor COMPANIES to a block. For
+// each company it find-or-creates a subcontract on this project (so imports
+// have a subcontract to attach to), then links the block to those subcontracts.
+// Only org-backed (internal) links are reconciled — external subcontract↔block
+// links are left untouched.
+func (h *Handler) setBuildingSubcontractorOrgs(tenantID uuid.UUID, projectID, buildingID int64, orgIDs []string) {
+	targetSubIDs := map[int64]bool{}
+	for _, raw := range orgIDs {
+		orgID, perr := uuid.Parse(raw)
+		if perr != nil {
+			continue
+		}
+		// Must be a real organization of this tenant.
+		var orgName string
+		if err := h.db.QueryRow(`SELECT name FROM organizations WHERE id = $1 AND tenant_id = $2`,
+			orgID, tenantID).Scan(&orgName); err != nil {
+			continue
+		}
+		// Find-or-create the subcontract for this company on this project.
+		var subID int64
+		err := h.db.QueryRow(`SELECT id FROM construction_subcontract
+			WHERE tenant_id = $1 AND project_id = $2 AND subcontractor_organization_id = $3
+			ORDER BY id LIMIT 1`, tenantID, projectID, orgID).Scan(&subID)
+		if err != nil {
+			if cerr := h.db.QueryRow(`INSERT INTO construction_subcontract
+				(tenant_id, project_id, subcontractor_organization_id, name, partner_name, state, created_date, updated_date)
+				VALUES ($1, $2, $3, $4, $4, 'draft', NOW(), NOW()) RETURNING id`,
+				tenantID, projectID, orgID, orgName).Scan(&subID); cerr != nil {
+				continue
+			}
+		}
+		targetSubIDs[subID] = true
+	}
+
+	// Collect existing internal (org-backed) links for this block.
+	var existing []int64
+	if rows, qerr := h.db.Query(`
+		SELECT sb.subcontract_id
+		FROM construction_subcontract_buildings sb
+		JOIN construction_subcontract s ON s.id = sb.subcontract_id
+		WHERE sb.building_id = $1 AND s.subcontractor_organization_id IS NOT NULL`, buildingID); qerr == nil {
+		for rows.Next() {
+			var sid int64
+			if rows.Scan(&sid) == nil {
+				existing = append(existing, sid)
+			}
+		}
+		rows.Close()
+	}
+
+	// Remove internal links that are no longer selected.
+	for _, sid := range existing {
+		if !targetSubIDs[sid] {
+			h.db.Exec(`DELETE FROM construction_subcontract_buildings WHERE building_id = $1 AND subcontract_id = $2`,
+				buildingID, sid)
+		}
+	}
+	// Insert the selected links.
+	for sid := range targetSubIDs {
+		h.db.Exec(`INSERT INTO construction_subcontract_buildings (subcontract_id, building_id)
+			VALUES ($1, $2) ON CONFLICT DO NOTHING`, sid, buildingID)
+	}
 }
 
 // UpdateConstructionBuilding updates a building
@@ -1197,6 +1379,18 @@ func (h *Handler) UpdateConstructionBuilding(c *gin.Context) {
 	buildingID, err := strconv.ParseInt(c.Param("building_id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid building ID")
+		return
+	}
+
+	// Resolve the owning project so we can enforce owner-only block management.
+	var ownerProjectID int64
+	if err := h.db.QueryRow(`SELECT project_id FROM construction_buildings WHERE id = $1 AND tenant_id = $2`,
+		buildingID, tenantID).Scan(&ownerProjectID); err != nil {
+		response.NotFound(c, "Building not found")
+		return
+	}
+	if !h.isProjectOwnerOrg(c, tenantID, ownerProjectID) {
+		response.Forbidden(c, "Bloklarni faqat bosh tashkilot boshqaradi")
 		return
 	}
 
@@ -1262,33 +1456,42 @@ func (h *Handler) UpdateConstructionBuilding(c *gin.Context) {
 		args = append(args, *req.ProgressPercent)
 	}
 
-	if len(updates) == 0 {
+	if len(updates) == 0 && req.SubcontractorOrgIDs == nil {
 		response.BadRequest(c, "No fields to update")
 		return
 	}
 
-	argCount++
-	updates = append(updates, fmt.Sprintf("updated_date = NOW()"))
-	args = append(args, buildingID)
-	args = append(args, tenantID)
+	// Apply column updates only when there are any (a subcontractor-only edit
+	// touches just the junction table below).
+	if len(updates) > 0 {
+		argCount++
+		updates = append(updates, fmt.Sprintf("updated_date = NOW()"))
+		args = append(args, buildingID)
+		args = append(args, tenantID)
 
-	query := fmt.Sprintf(`
-		UPDATE construction_buildings
-		SET %s
-		WHERE id = $%d AND tenant_id = $%d
-	`, strings.Join(updates, ", "), argCount, argCount+1)
+		query := fmt.Sprintf(`
+			UPDATE construction_buildings
+			SET %s
+			WHERE id = $%d AND tenant_id = $%d
+		`, strings.Join(updates, ", "), argCount, argCount+1)
 
-	result, err := h.db.Exec(query, args...)
-	if err != nil {
-		h.log.Error("Failed to update building", "error", err)
-		response.InternalError(c, "Failed to update building")
-		return
+		result, err := h.db.Exec(query, args...)
+		if err != nil {
+			h.log.Error("Failed to update building", "error", err)
+			response.InternalError(c, "Failed to update building")
+			return
+		}
+
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			response.NotFound(c, "Building not found")
+			return
+		}
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		response.NotFound(c, "Building not found")
-		return
+	// Replace the block's subcontractor-company assignments when provided.
+	if req.SubcontractorOrgIDs != nil {
+		h.setBuildingSubcontractorOrgs(tenantID, ownerProjectID, buildingID, *req.SubcontractorOrgIDs)
 	}
 
 	response.Success(c, map[string]interface{}{"message": "Building updated successfully"})
