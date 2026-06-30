@@ -117,11 +117,16 @@ func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int6
 
 	// Step 1: per-project team roles — match by employee_id OR the employee's
 	// linked user_id, so it works regardless of which id the row was keyed on.
+	// construction_project_team has no tenant_id column — scope the tenant via
+	// construction_projects (which does), like the team-list handler. Filtering
+	// on the non-existent pt.tenant_id errored at runtime and silently yielded
+	// zero rows, so per-project team roles never took effect.
 	if rows, err := h.db.Query(`
 		SELECT pt.role
 		FROM construction_project_team pt
+		JOIN construction_projects p ON p.id = pt.project_id AND p.tenant_id = $1
 		LEFT JOIN employees e ON e.id = pt.employee_id
-		WHERE pt.tenant_id = $1 AND pt.project_id = $2
+		WHERE pt.project_id = $2
 		  AND COALESCE(pt.status, 'active') = 'active'
 		  AND (pt.employee_id = $3 OR pt.employee_id = $4 OR e.user_id = $3)
 	`, tenantID, projectID, userID, employeeID); err == nil {
@@ -228,12 +233,14 @@ func normaliseRole(s string) string {
 		}
 	}
 	switch x {
-	case "foreman", "прораб", "proraq", "qurilishboshchisi", "ustaqurilishchi":
+	case "foreman", "прораб", "prorab", "proraq", "qurilishboshchisi", "ustaqurilishchi":
 		return "foreman"
-	case "supervisor", "технадзор", "tehnadzor", "texnadzor", "nazoratchi":
+	case "supervisor", "технадзор", "tehnadzor", "texnadzor", "nazoratchi",
+		"texnik_nazoratchi", "texniknazoratchi":
 		return "supervisor"
 	case "engineer", "инженер", "главныйинженер", "глинженер",
-		"bosh-injener", "boshinjener", "muhandis", "boshmuhandis":
+		"bosh-injener", "boshinjener", "muhandis", "boshmuhandis",
+		"chief_engineer", "chiefengineer", "site_engineer", "siteengineer":
 		return "engineer"
 	}
 	return x // returned as-is so the handler can decide it doesn't match
@@ -243,13 +250,13 @@ func normaliseRole(s string) string {
 // transition: the estimate id, project id, current status, plan + done
 // quantity, and the line's display name.
 type workCtx struct {
-	LineID         int64
-	EstimateID     int64
-	ProjectID      int64
-	Status         string
-	PlanQty        float64
-	DoneQty        float64
-	Name           string
+	LineID     int64
+	EstimateID int64
+	ProjectID  int64
+	Status     string
+	PlanQty    float64
+	DoneQty    float64
+	Name       string
 }
 
 func (h *Handler) loadWorkContext(tenantID uuid.UUID, lineID int64) (*workCtx, error) {
