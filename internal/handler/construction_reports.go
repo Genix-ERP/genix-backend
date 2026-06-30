@@ -1072,6 +1072,65 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		                   'трудовой', 'трудовые', 'машина')
 		          )
 		      )
+		),
+		-- Subcontractor-ONLY materials: pulled straight from each
+		-- subcontractor estimate, tagged with that subcontractor. The
+		-- NOT EXISTS guard keeps only works that are ABSENT from the
+		-- in-house master estimate, so materials whose FAKT is already
+		-- mirrored onto the in-house estimate aren't double-counted.
+		sub_material_lines AS (
+		    SELECT
+		        e.building_id                     AS bid,
+		        s.name                            AS name,
+		        COALESCE(s.uom, '')               AS uom,
+		        COALESCE(s.unit_rate, 0)          AS unit_rate,
+		        s.id                              AS line_id,
+		        CASE
+		            WHEN COALESCE(p.done_quantity, 0) <= 0 THEN 0
+		            WHEN COALESCE(p.quantity, 0) > 0 THEN
+		                COALESCE(s.quantity, 0) * (p.done_quantity::numeric / p.quantity)
+		            WHEN COALESCE(p.original_quantity, 0) > 0 THEN
+		                COALESCE(s.quantity, 0) * (p.done_quantity::numeric / p.original_quantity)
+		            ELSE COALESCE(s.quantity, 0)
+		        END                               AS fakt_quantity,
+		        (SELECT COALESCE(NULLIF(sc.partner_name, ''), sc.name)
+		           FROM construction_subcontract sc
+		          WHERE sc.id = e.subcontract_id AND sc.tenant_id = e.tenant_id) AS subcontractor
+		    FROM construction_estimate_line s
+		    JOIN construction_estimate_line p
+		      ON p.id = s.parent_line_id AND p.tenant_id = s.tenant_id
+		    JOIN construction_estimate e
+		      ON e.id = s.estimate_id AND e.tenant_id = s.tenant_id
+		    WHERE e.project_id = $1
+		      AND e.tenant_id  = $2
+		      AND s.tenant_id  = $2
+		      AND e.subcontract_id IS NOT NULL
+		      AND s.parent_line_id IS NOT NULL
+		      AND (
+		          LOWER(COALESCE(s.resource_type, '')) IN ('material', 'materialy', 'mat', 'materiallar', 'материал', 'материалы')
+		          OR (
+		              UPPER(COALESCE(s.uom, '')) NOT LIKE '%ЧЕЛ%'
+		              AND UPPER(COALESCE(s.uom, '')) NOT LIKE '%МАШ%'
+		              AND LOWER(COALESCE(s.resource_type, '')) NOT IN
+		                  ('labor', 'mehnat', 'ish', 'ishchi', 'worker',
+		                   'equipment', 'mashina', 'masina', 'mexanizm', 'mexanizmlar', 'machinery',
+		                   'трудовой', 'трудовые', 'машина')
+		          )
+		      )
+		      AND NOT EXISTS (
+		          SELECT 1
+		          FROM construction_estimate_line ip
+		          JOIN construction_estimate ie ON ie.id = ip.estimate_id AND ie.tenant_id = ip.tenant_id
+		          WHERE ie.project_id = e.project_id
+		            AND ie.tenant_id  = e.tenant_id
+		            AND ie.subcontract_id IS NULL
+		            AND ie.building_id IS NOT DISTINCT FROM e.building_id
+		            AND ip.parent_line_id IS NULL
+		            AND COALESCE(ip.resource_type, '') = ''
+		            AND TRIM(COALESCE(ip.parent_item_number, '')) = TRIM(COALESCE(p.parent_item_number, ''))
+		            AND LOWER(TRIM(COALESCE(ip.name, ''))) = LOWER(TRIM(COALESCE(p.name, '')))
+		            AND TRIM(COALESCE(ip.uom, '')) = TRIM(COALESCE(p.uom, ''))
+		      )
 		)
 		SELECT
 		    COALESCE(ml.bid, 0)                 AS building_id,
@@ -1083,7 +1142,11 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		    ARRAY_AGG(ml.line_id)               AS line_ids,
 		    COALESCE(STRING_AGG(DISTINCT ml.subcontractor, ', ')
 		             FILTER (WHERE ml.subcontractor IS NOT NULL AND ml.subcontractor <> ''), '') AS subcontractors
-		FROM material_lines ml
+		FROM (
+		    SELECT bid, name, uom, unit_rate, line_id, fakt_quantity, subcontractor FROM material_lines
+		    UNION ALL
+		    SELECT bid, name, uom, unit_rate, line_id, fakt_quantity, subcontractor FROM sub_material_lines
+		) ml
 		LEFT JOIN construction_buildings b ON b.id = ml.bid
 		GROUP BY ml.bid, b.id, b.name, b.code, b.sort_order, ml.name, ml.uom, ml.unit_rate
 		-- Drop materials that haven't actually been consumed. The
@@ -1438,6 +1501,57 @@ func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
 		            AND re.subcontract_id IS NULL
 		            AND LOWER(COALESCE(re.source_type, '')) = 'resurs'
 		            AND re.building_id IS NOT DISTINCT FROM e.building_id
+		      )
+
+		    UNION ALL
+
+		    -- (3) Subcontractor Ресурс estimates — each subcontractor's own
+		    --     resource norms, tagged with that subcontractor. Included only
+		    --     for buildings that have NO in-house Ресурс estimate, so shared
+		    --     buildings (already covered by branch 1) aren't double-counted.
+		    SELECT
+		        e.building_id                     AS bid,
+		        CASE
+		            WHEN LOWER(COALESCE(l.resource_type, '')) IN
+		                 ('labor','mehnat','ish','ishchi','worker','трудовой','трудовые') THEN 'labor'
+		            WHEN UPPER(COALESCE(l.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
+		            WHEN LOWER(COALESCE(l.resource_type, '')) IN
+		                 ('equipment','mashina','masina','mexanizm','mexanizmlar','machinery','машина') THEN 'equipment'
+		            WHEN UPPER(COALESCE(l.uom, '')) LIKE '%МАШ%' THEN 'equipment'
+		            WHEN LOWER(COALESCE(l.material_type, '')) = 'cable' THEN 'cable'
+		            WHEN LOWER(COALESCE(l.material_type, '')) = 'equipment' THEN 'installed'
+		            ELSE 'material'
+		        END                               AS rtype,
+		        l.name                            AS name,
+		        COALESCE(l.uom, '')               AS uom,
+		        COALESCE(NULLIF(l.unit_rate, 0),
+		                 COALESCE(l.material_rate,0) + COALESCE(l.labor_rate,0) + COALESCE(l.equipment_rate,0)) AS unit_rate,
+		        COALESCE(NULLIF(l.imported_quantity, 0), NULLIF(l.original_quantity, 0), l.quantity, 0) AS norma_quantity,
+		        COALESCE(NULLIF(l.imported_total, 0),
+		                 COALESCE(NULLIF(l.imported_quantity, 0), NULLIF(l.original_quantity, 0), l.quantity, 0)
+		                 * COALESCE(NULLIF(l.unit_rate, 0),
+		                            COALESCE(l.material_rate,0) + COALESCE(l.labor_rate,0) + COALESCE(l.equipment_rate,0))) AS norma_amount,
+		        (SELECT COALESCE(NULLIF(sc.partner_name, ''), sc.name)
+		           FROM construction_subcontract sc
+		          WHERE sc.id = e.subcontract_id AND sc.tenant_id = e.tenant_id) AS subcontractor
+		    FROM construction_estimate_line l
+		    JOIN construction_estimate e ON e.id = l.estimate_id AND e.tenant_id = l.tenant_id
+		    WHERE e.project_id = $1 AND e.tenant_id = $2 AND l.tenant_id = $2
+		      AND e.subcontract_id IS NOT NULL
+		      AND LOWER(COALESCE(e.source_type, '')) = 'resurs'
+		      AND COALESCE(l.resource_type, '') <> ''
+		      AND NOT (LOWER(COALESCE(l.resource_type, '')) IN
+		               ('equipment','mashina','masina','mexanizm','mexanizmlar','machinery','машина')
+		               AND UPPER(COALESCE(l.uom, '')) NOT LIKE '%МАШ%')
+		      AND NOT (LOWER(COALESCE(l.resource_type, '')) IN
+		               ('labor','mehnat','ish','ishchi','worker','трудовой','трудовые')
+		               AND UPPER(COALESCE(l.uom, '')) NOT LIKE '%ЧЕЛ%')
+		      AND NOT EXISTS (
+		          SELECT 1 FROM construction_estimate ire
+		          WHERE ire.project_id = e.project_id AND ire.tenant_id = e.tenant_id
+		            AND ire.subcontract_id IS NULL
+		            AND LOWER(COALESCE(ire.source_type, '')) = 'resurs'
+		            AND ire.building_id IS NOT DISTINCT FROM e.building_id
 		      )
 		)
 		SELECT
