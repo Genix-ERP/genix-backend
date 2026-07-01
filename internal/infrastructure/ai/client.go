@@ -7,10 +7,35 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/config"
 )
+
+// RequireSecureEndpoint refuses to send data to a non-HTTPS AI endpoint so the
+// tenant's business data is always encrypted in transit (TLS). Plain http is
+// allowed ONLY for localhost (local dev). An empty endpoint means the provider's
+// default, which is always https.
+func RequireSecureEndpoint(endpoint string) error {
+	if endpoint == "" {
+		return nil
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid AI endpoint: %w", err)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" {
+		switch u.Hostname() {
+		case "localhost", "127.0.0.1", "::1":
+			return nil // local development only
+		}
+	}
+	return fmt.Errorf("refusing to send data to a non-HTTPS AI endpoint (%q): configure an https:// URL so data is encrypted in transit", endpoint)
+}
 
 // Provider represents an AI provider
 type Provider string
@@ -154,6 +179,9 @@ func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 	if endpoint == "" {
 		endpoint = "https://api.openai.com/v1/chat/completions"
 	}
+	if err := RequireSecureEndpoint(endpoint); err != nil {
+		return nil, err
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -291,6 +319,9 @@ func (c *AnthropicClient) Chat(ctx context.Context, req *ChatRequest) (*ChatResp
 	endpoint := c.config.Endpoint
 	if endpoint == "" {
 		endpoint = "https://api.anthropic.com/v1/messages"
+	}
+	if err := RequireSecureEndpoint(endpoint); err != nil {
+		return nil, err
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
