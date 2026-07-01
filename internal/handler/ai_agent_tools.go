@@ -66,6 +66,42 @@ func agentTools() []agentTool {
 			parameters:  obj(map[string]interface{}{}),
 			exec:        toolLowStock,
 		},
+		{
+			name:        "list_purchase_orders",
+			description: "List recent purchase orders (procurement) for the active company, with vendor and total. Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListPurchaseOrders,
+		},
+		{
+			name:        "list_vendor_bills",
+			description: "List vendor bills (purchase invoices) with paid/due amounts. Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListVendorBills,
+		},
+		{
+			name:        "list_production_orders",
+			description: "List manufacturing/production orders (code, product, planned vs produced qty, status). Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListProductionOrders,
+		},
+		{
+			name:        "find_employees",
+			description: "Search employees by name. Returns name, job title, phone and status.",
+			parameters:  obj(map[string]interface{}{"query": str("Part of the employee name.")}, "query"),
+			exec:        toolFindEmployees,
+		},
+		{
+			name:        "list_expenses",
+			description: "List recent expenses (amount, description, vendor/employee, status). Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListExpenses,
+		},
+		{
+			name:        "list_projects",
+			description: "List construction projects for the active company (code, name, client, status, contract amount, progress %).",
+			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListProjects,
+		},
 		// ---- write tools (confirmation required) ----
 		{
 			name:        "create_contact",
@@ -118,6 +154,18 @@ func agentTools() []agentTool {
 				}, "product", "quantity")},
 			}, "customer", "lines"),
 			exec: toolCreateSalesInvoice,
+		},
+		{
+			name:        "create_vendor_bill",
+			description: "Create a DRAFT vendor bill (purchase invoice) for a vendor with a total amount. Stays draft — the user posts it in the app. Requires confirmation.",
+			mutating:    true,
+			parameters: obj(map[string]interface{}{
+				"vendor":                str("Vendor name (must exist)."),
+				"amount":                map[string]interface{}{"type": "number", "description": "Bill total in so'm."},
+				"vendor_invoice_number": str("Optional vendor's own invoice number."),
+				"description":           str("Optional notes."),
+			}, "vendor", "amount"),
+			exec: toolCreateVendorBill,
 		},
 		{
 			name:        "stock_adjust",
@@ -276,15 +324,15 @@ func argInt(args map[string]interface{}, k string, def, max int) int {
 func toolFindContacts(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	q := argStr(args, "query")
 	typ := argStr(args, "type")
-	sql := `SELECT id::text, COALESCE(name,''), COALESCE(type,''), COALESCE(phone,''), COALESCE(tax_id,''), COALESCE(current_balance,0)
+	qry := `SELECT id::text, COALESCE(name,''), COALESCE(type,''), COALESCE(phone,''), COALESCE(tax_id,''), COALESCE(current_balance,0)
 	        FROM contacts WHERE tenant_id=$1 AND deleted_at IS NULL AND name ILIKE '%'||$2||'%'`
 	qargs := []interface{}{tenantID, q}
 	if typ == "customer" || typ == "vendor" {
-		sql += " AND type=$3"
+		qry += " AND type=$3"
 		qargs = append(qargs, typ)
 	}
-	sql += " ORDER BY name ASC LIMIT 10"
-	rows, err := h.db.Query(sql, qargs...)
+	qry += " ORDER BY name ASC LIMIT 10"
+	rows, err := h.db.Query(qry, qargs...)
 	if err != nil {
 		return nil, err
 	}
@@ -352,15 +400,15 @@ func toolCheckStock(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg inter
 func toolListSalesOrders(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	limit := argInt(args, "limit", 10, 50)
 	status := argStr(args, "status")
-	sql := `SELECT order_number, COALESCE(customer_name,''), COALESCE(status,''), COALESCE(total_amount,0), order_date
+	qry := `SELECT order_number, COALESCE(customer_name,''), COALESCE(status,''), COALESCE(total_amount,0), order_date
 	        FROM sales_orders WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
 	qargs := []interface{}{tenantID, orgArg}
 	if status != "" {
-		sql += " AND status=$3"
+		qry += " AND status=$3"
 		qargs = append(qargs, status)
 	}
-	sql += fmt.Sprintf(" ORDER BY order_date DESC NULLS LAST LIMIT %d", limit)
-	rows, err := h.db.Query(sql, qargs...)
+	qry += fmt.Sprintf(" ORDER BY order_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qargs...)
 	if err != nil {
 		return nil, err
 	}
@@ -380,16 +428,16 @@ func toolListSalesOrders(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg 
 func toolListSalesInvoices(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	limit := argInt(args, "limit", 10, 50)
 	status := argStr(args, "status")
-	sql := `SELECT invoice_number, COALESCE(customer_name,''), COALESCE(status,''), COALESCE(total_amount,0), COALESCE(amount_paid,0),
+	qry := `SELECT invoice_number, COALESCE(customer_name,''), COALESCE(status,''), COALESCE(total_amount,0), COALESCE(amount_paid,0),
 	               COALESCE(total_amount,0)-COALESCE(amount_paid,0) AS due, invoice_date
 	        FROM sales_invoices WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
 	qargs := []interface{}{tenantID, orgArg}
 	if status != "" {
-		sql += " AND status=$3"
+		qry += " AND status=$3"
 		qargs = append(qargs, status)
 	}
-	sql += fmt.Sprintf(" ORDER BY invoice_date DESC NULLS LAST LIMIT %d", limit)
-	rows, err := h.db.Query(sql, qargs...)
+	qry += fmt.Sprintf(" ORDER BY invoice_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qargs...)
 	if err != nil {
 		return nil, err
 	}
@@ -656,4 +704,173 @@ func toolStockTransfer(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg in
 		return nil, err
 	}
 	return gin.H{"product": pname, "from": fromName, "to": toName, "quantity": qty}, nil
+}
+
+// ---- extra module read execs ----------------------------------------------
+
+func rowsToList(rows *sql.Rows, err error, scan func(*sql.Rows) (gin.H, bool)) (interface{}, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []gin.H{}
+	for rows.Next() {
+		if h, ok := scan(rows); ok {
+			out = append(out, h)
+		}
+	}
+	return out, nil
+}
+
+func toolListPurchaseOrders(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT po.order_number, COALESCE(v.name,''), COALESCE(po.status,''), COALESCE(po.total_amount,0), po.order_date
+	        FROM purchase_orders po LEFT JOIN contacts v ON v.id=po.vendor_id
+	        WHERE po.tenant_id=$1 AND po.deleted_at IS NULL AND ($2::uuid IS NULL OR po.organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND po.status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY po.order_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, vend, st string
+		var total float64
+		var dt interface{}
+		if r.Scan(&num, &vend, &st, &total, &dt) != nil {
+			return nil, false
+		}
+		return gin.H{"order_number": num, "vendor": vend, "status": st, "total": total, "date": dt}, true
+	})
+}
+
+func toolListVendorBills(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT pi.invoice_number, COALESCE(v.name,''), COALESCE(pi.status,''), COALESCE(pi.total_amount,0), COALESCE(pi.amount_paid,0),
+	               COALESCE(pi.total_amount,0)-COALESCE(pi.amount_paid,0), pi.invoice_date
+	        FROM purchase_invoices pi LEFT JOIN contacts v ON v.id=pi.vendor_id
+	        WHERE pi.tenant_id=$1 AND pi.deleted_at IS NULL AND ($2::uuid IS NULL OR pi.organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND pi.status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY pi.invoice_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, vend, st string
+		var total, paid, due float64
+		var dt interface{}
+		if r.Scan(&num, &vend, &st, &total, &paid, &due, &dt) != nil {
+			return nil, false
+		}
+		return gin.H{"invoice_number": num, "vendor": vend, "status": st, "total": total, "paid": paid, "due": due, "date": dt}, true
+	})
+}
+
+func toolListProductionOrders(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT po.code, COALESCE(p.name,''), COALESCE(po.status,''), COALESCE(po.quantity_planned,0), COALESCE(po.quantity_produced,0)
+	        FROM production_orders po LEFT JOIN products p ON p.id=po.product_id
+	        WHERE po.tenant_id=$1 AND po.deleted_at IS NULL AND ($2::uuid IS NULL OR po.organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND po.status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY po.created_at DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var code, prod, st string
+		var planned, produced float64
+		if r.Scan(&code, &prod, &st, &planned, &produced) != nil {
+			return nil, false
+		}
+		return gin.H{"code": code, "product": prod, "status": st, "planned": planned, "produced": produced}, true
+	})
+}
+
+func toolFindEmployees(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	q := argStr(args, "query")
+	rows, err := h.db.Query(`
+		SELECT TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')), COALESCE(job_title,''), COALESCE(phone,''), COALESCE(status,'')
+		FROM employees
+		WHERE tenant_id=$1 AND ($3::uuid IS NULL OR organization_id=$3)
+		  AND (COALESCE(first_name,'')||' '||COALESCE(last_name,'')) ILIKE '%'||$2||'%'
+		ORDER BY first_name ASC LIMIT 10`, tenantID, q, orgArg)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var name, title, phone, st string
+		if r.Scan(&name, &title, &phone, &st) != nil {
+			return nil, false
+		}
+		return gin.H{"name": name, "job_title": title, "phone": phone, "status": st}, true
+	})
+}
+
+func toolListExpenses(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(expense_number,''), COALESCE(description,''), COALESCE(NULLIF(vendor_name,''), employee_name, ''),
+	               COALESCE(total_amount, amount, 0), COALESCE(status,''), expense_date
+	        FROM expenses WHERE tenant_id=$1 AND deleted_at IS NULL`
+	qa := []interface{}{tenantID}
+	if status != "" {
+		qry += " AND status=$2"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY expense_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, desc, who, st string
+		var amt float64
+		var dt interface{}
+		if r.Scan(&num, &desc, &who, &amt, &st, &dt) != nil {
+			return nil, false
+		}
+		return gin.H{"expense_number": num, "description": desc, "party": who, "amount": amt, "status": st, "date": dt}, true
+	})
+}
+
+func toolListProjects(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	rows, err := h.db.Query(fmt.Sprintf(`
+		SELECT COALESCE(code,''), COALESCE(name,''), COALESCE(client_name,''), COALESCE(status,''),
+		       COALESCE(contract_amount,0), COALESCE(progress_percent,0)
+		FROM construction_projects
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)
+		ORDER BY created_date DESC NULLS LAST LIMIT %d`, limit), tenantID, orgArg)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var code, name, client, st string
+		var amount, progress float64
+		if r.Scan(&code, &name, &client, &st, &amount, &progress) != nil {
+			return nil, false
+		}
+		return gin.H{"code": code, "name": name, "client": client, "status": st, "contract_amount": amount, "progress_percent": progress}, true
+	})
+}
+
+func toolCreateVendorBill(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	venID, venName, err := resolveContactID(h, tenantID, argStr(args, "vendor"), "vendor")
+	if err != nil {
+		return nil, err
+	}
+	amount := toFloat(args["amount"])
+	if amount <= 0 {
+		return nil, fmt.Errorf("amount must be greater than zero")
+	}
+	num := docNumber("BILL")
+	if _, err := h.db.Exec(`INSERT INTO purchase_invoices
+		(id, tenant_id, organization_id, invoice_number, vendor_id, vendor_invoice_number, invoice_date, due_date,
+		 subtotal, discount_amount, tax_rate_id, tax_amount, total_amount, amount_paid, status, three_way_match_status,
+		 notes, currency_id, exchange_rate, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,CURRENT_DATE,CURRENT_DATE+30,$7,0,NULL,0,$7,0,'draft',NULL,$8,NULL,1,$9,now(),now())`,
+		uuid.New(), tenantID, orgArg, num, venID, nullIfEmpty(argStr(args, "vendor_invoice_number")),
+		amount, nullIfEmpty(argStr(args, "description")), userID); err != nil {
+		return nil, err
+	}
+	return gin.H{"bill_number": num, "vendor": venName, "amount": amount, "status": "draft"}, nil
 }

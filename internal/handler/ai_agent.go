@@ -236,6 +236,8 @@ func summariseAction(tool string, args map[string]interface{}) string {
 		return fmt.Sprintf("Record a DRAFT %v payment of %v for %v", args["direction"], args["amount"], args["contact"])
 	case "create_sales_invoice":
 		return fmt.Sprintf("Create a DRAFT sales invoice for %v", args["customer"])
+	case "create_vendor_bill":
+		return fmt.Sprintf("Create a DRAFT vendor bill of %v for %v", args["amount"], args["vendor"])
 	case "stock_adjust":
 		return fmt.Sprintf("Set %v stock in %v to %v", args["product"], args["warehouse"], args["new_quantity"])
 	case "stock_transfer":
