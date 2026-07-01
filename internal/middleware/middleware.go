@@ -741,6 +741,43 @@ func (pc *PermissionChecker) Require(module, resource, action string) gin.Handle
 	}
 }
 
+// Can reports whether the current request's user holds module:resource:action.
+// It mirrors Require's logic exactly — system admins and site admins/owners
+// bypass, otherwise the permission map is checked with the module:*:action
+// wildcard fallback — but returns a bool instead of aborting the request. It is
+// for callers that gate individual operations (e.g. the AI agent gating each
+// tool) rather than whole routes. On any error it fails closed (returns false).
+func (pc *PermissionChecker) Can(c *gin.Context, module, resource, action string) bool {
+	claims, exists := c.Get(ContextKeyClaims)
+	if !exists {
+		return false
+	}
+	jwtClaims, ok := claims.(*crypto.Claims)
+	if !ok {
+		return false
+	}
+	if jwtClaims.IsSystemAdmin {
+		return true
+	}
+	ctx := c.Request.Context()
+	userID := jwtClaims.UserID.String()
+	tenantID := jwtClaims.TenantID.String()
+	bypass, err := pc.isUserSiteAdminOrOwner(ctx, tenantID, userID)
+	if err != nil {
+		pc.log.Error("agent perm: role check failed", "error", err, "user_id", userID)
+		return false
+	}
+	if bypass {
+		return true
+	}
+	perms, err := pc.getUserPermissions(ctx, tenantID, userID)
+	if err != nil {
+		pc.log.Error("agent perm: load failed", "error", err, "user_id", userID)
+		return false
+	}
+	return perms[module+":"+resource+":"+action] || perms[module+":*:"+action]
+}
+
 // InvalidatePermissionCache removes cached permissions for a user so that
 // changes (e.g., role assignment) take effect immediately.
 func (pc *PermissionChecker) InvalidatePermissionCache(ctx context.Context, tenantID, userID string) {
