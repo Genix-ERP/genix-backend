@@ -205,6 +205,30 @@ func agentTools() []agentTool {
 			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
 			exec:        toolListJournalEntries,
 		},
+		{
+			name:        "tax_summary",
+			description: "VAT/NDS position for a period: output VAT collected on sales, input VAT paid on purchases, and the net VAT payable. Use for 'how much VAT/NDS do we owe', 'tax this month'.",
+			parameters:  obj(map[string]interface{}{"period": map[string]interface{}{"type": "string", "enum": []string{"this_month", "this_year", "last_30_days", "this_quarter"}, "description": "Time window. Default this_month."}}),
+			exec:        toolTaxSummary,
+		},
+		{
+			name:        "list_leave_requests",
+			description: "Employee leave/time-off requests (employee, type, dates, days, status). Use for 'who is on leave', 'pending leave requests'. Optional status filter (pending, approved, rejected).",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListLeaveRequests,
+		},
+		{
+			name:        "list_attendance",
+			description: "Recent employee attendance records (employee, date, clock in/out, status, department). Use for 'today's attendance', 'who clocked in'.",
+			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 15, max 50).")}),
+			exec:        toolListAttendance,
+		},
+		{
+			name:        "list_payroll_periods",
+			description: "Payroll periods/runs (code, name, dates, pay date, status, employee count, gross/net totals). Use for 'payroll this month', 'last payroll run'.",
+			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListPayrollPeriods,
+		},
 		// ---- write tools (confirmation required) ----
 		{
 			name:        "create_contact",
@@ -1542,5 +1566,103 @@ func toolListJournalEntries(h *Handler, c *gin.Context, tenantID uuid.UUID, orgA
 		}
 		return gin.H{"entry_number": num, "date": dt, "description": desc, "reference": ref,
 			"total_debit": debit, "total_credit": credit, "status": st}, true
+	})
+}
+
+// periodLowerBound maps a period keyword to a SQL lower bound on a date column.
+func periodLowerBound(period string) string {
+	switch period {
+	case "this_year":
+		return "date_trunc('year', CURRENT_DATE)"
+	case "this_quarter":
+		return "date_trunc('quarter', CURRENT_DATE)"
+	case "last_30_days":
+		return "CURRENT_DATE - INTERVAL '30 days'"
+	default: // this_month
+		return "date_trunc('month', CURRENT_DATE)"
+	}
+}
+
+func toolTaxSummary(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	lower := periodLowerBound(argStr(args, "period"))
+	f := func(table string) float64 {
+		var v float64
+		_ = h.db.QueryRow(fmt.Sprintf(`SELECT COALESCE(SUM(tax_amount),0) FROM %s
+			WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)
+			  AND invoice_date >= %s`, table, lower), tenantID, orgArg).Scan(&v)
+		return v
+	}
+	output := f("sales_invoices")   // VAT collected on sales
+	input := f("purchase_invoices") // VAT paid on purchases
+	period := argStr(args, "period")
+	if period == "" {
+		period = "this_month"
+	}
+	return gin.H{
+		"period": period, "output_vat_on_sales": output, "input_vat_on_purchases": input,
+		"net_vat_payable": output - input,
+		"note":            "VAT/NDS only, from invoice tax_amount (so'm). Excludes payroll/profit/turnover taxes.",
+	}, nil
+}
+
+func toolListLeaveRequests(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	// leave_requests is tenant-scoped (no organization_id).
+	qry := `SELECT COALESCE(employee_name,''), COALESCE(leave_type,''), start_date, end_date,
+	               COALESCE(days,0)::float8, COALESCE(status,''), COALESCE(reason,'')
+	        FROM leave_requests WHERE tenant_id=$1 AND deleted_at IS NULL`
+	qa := []interface{}{tenantID}
+	if status != "" {
+		qry += " AND status=$2"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY start_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var emp, ltype, st, reason string
+		var days float64
+		var start, end interface{}
+		if r.Scan(&emp, &ltype, &start, &end, &days, &st, &reason) != nil {
+			return nil, false
+		}
+		return gin.H{"employee": emp, "leave_type": ltype, "start_date": start, "end_date": end,
+			"days": days, "status": st, "reason": reason}, true
+	})
+}
+
+func toolListAttendance(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 15, 50)
+	rows, err := h.db.Query(fmt.Sprintf(`
+		SELECT COALESCE(employee_name,''), date, clock_in, clock_out, COALESCE(status,''), COALESCE(department,'')
+		FROM attendance_records WHERE tenant_id=$1 AND deleted_at IS NULL
+		ORDER BY date DESC NULLS LAST, employee_name ASC LIMIT %d`, limit), tenantID)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var emp, st, dept string
+		var date, in, out interface{}
+		if r.Scan(&emp, &date, &in, &out, &st, &dept) != nil {
+			return nil, false
+		}
+		return gin.H{"employee": emp, "date": date, "clock_in": in, "clock_out": out, "status": st, "department": dept}, true
+	})
+}
+
+func toolListPayrollPeriods(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	rows, err := h.db.Query(fmt.Sprintf(`
+		SELECT COALESCE(period_code,''), COALESCE(period_name,''), start_date, end_date, pay_date,
+		       COALESCE(status,''), COALESCE(employee_count,0)::int, COALESCE(total_gross,0)::float8, COALESCE(total_net,0)::float8
+		FROM payroll_periods WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)
+		ORDER BY start_date DESC NULLS LAST LIMIT %d`, limit), tenantID, orgArg)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var code, name, st string
+		var start, end, pay interface{}
+		var cnt int
+		var gross, net float64
+		if r.Scan(&code, &name, &start, &end, &pay, &st, &cnt, &gross, &net) != nil {
+			return nil, false
+		}
+		return gin.H{"period_code": code, "period_name": name, "start_date": start, "end_date": end,
+			"pay_date": pay, "status": st, "employee_count": cnt, "total_gross": gross, "total_net": net}, true
 	})
 }
