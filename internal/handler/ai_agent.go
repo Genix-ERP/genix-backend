@@ -42,7 +42,7 @@ type agentTool struct {
 	exec        func(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error)
 }
 
-const agentMaxIterations = 8
+const agentMaxIterations = 12
 
 // obj/str/arr are tiny helpers to keep the JSON-schema literals readable.
 func obj(props map[string]interface{}, required ...string) map[string]interface{} {
