@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/genixerp/genix-backend/internal/config"
+	"github.com/genixerp/genix-backend/internal/infrastructure/ai"
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
@@ -111,6 +112,12 @@ func (h *Handler) UpdateTenantAISettings(c *gin.Context) {
 	}
 	model := strings.TrimSpace(in.Model)
 	endpoint := strings.TrimSpace(in.Endpoint)
+	// Reject a non-HTTPS endpoint up front so tenant data is never sent in the
+	// clear (same rule the AI client enforces at request time).
+	if err := ai.RequireSecureEndpoint(endpoint); err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
 	newKey := strings.TrimSpace(in.APIKey)
 	if in.ClearKey {
 		newKey = ""
