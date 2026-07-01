@@ -159,6 +159,12 @@ func agentTools() []agentTool {
 			parameters:  obj(map[string]interface{}{"order_number": str("The purchase order number.")}, "order_number"),
 			exec:        toolGetPurchaseOrder,
 		},
+		{
+			name:        "list_workflows",
+			description: "List automation workflows (name, category, trigger, status active/paused/draft, automation level, success rate, monthly cost savings). Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter (active, paused, draft)."), "limit": intp("Max rows (default 15, max 50).")}),
+			exec:        toolListWorkflows,
+		},
 		// ---- write tools (confirmation required) ----
 		{
 			name:        "create_contact",
@@ -247,6 +253,29 @@ func agentTools() []agentTool {
 				"quantity":       map[string]interface{}{"type": "number", "description": "Quantity to move."},
 			}, "product", "from_warehouse", "to_warehouse", "quantity"),
 			exec: toolStockTransfer,
+		},
+		{
+			name:        "create_workflow",
+			description: "Create a DRAFT automation workflow. It stays draft until activated. Requires confirmation.",
+			mutating:    true,
+			parameters: obj(map[string]interface{}{
+				"name":             str("Workflow name."),
+				"category":         map[string]interface{}{"type": "string", "enum": []string{"hr", "procurement", "customer_support", "sales", "inventory", "finance", "marketing"}, "description": "Business area."},
+				"trigger":          map[string]interface{}{"type": "string", "enum": []string{"manual", "scheduled", "event_based", "ai_triggered"}, "description": "What starts it. Default manual."},
+				"automation_level": map[string]interface{}{"type": "string", "enum": []string{"manual", "semi_automated", "fully_automated"}, "description": "Default manual."},
+				"description":      str("Optional description."),
+			}, "name", "category"),
+			exec: toolCreateWorkflow,
+		},
+		{
+			name:        "set_workflow_status",
+			description: "Activate, pause, or set to draft an existing workflow (by name). Requires confirmation.",
+			mutating:    true,
+			parameters: obj(map[string]interface{}{
+				"name":   str("Workflow name (must exist)."),
+				"status": map[string]interface{}{"type": "string", "enum": []string{"active", "paused", "draft"}, "description": "New status."},
+			}, "name", "status"),
+			exec: toolSetWorkflowStatus,
 		},
 	}
 }
@@ -1225,4 +1254,92 @@ func toolGetPurchaseOrder(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg
 		return nil, lerr
 	}
 	return gin.H{"order_number": num, "vendor": vend, "status": st, "total": total, "date": dt, "lines": lines}, nil
+}
+
+// ---- workflow tools --------------------------------------------------------
+
+func resolveWorkflow(h *Handler, tenantID uuid.UUID, name string) (uuid.UUID, string, error) {
+	var id uuid.UUID
+	var nm string
+	if err := h.db.QueryRow(`SELECT id, name FROM workflows
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND name ILIKE '%'||$2||'%'
+		ORDER BY name ASC LIMIT 1`, tenantID, name).Scan(&id, &nm); err != nil {
+		return uuid.Nil, "", fmt.Errorf("no workflow found matching %q", name)
+	}
+	return id, nm, nil
+}
+
+func toolListWorkflows(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 15, 50)
+	status := argStr(args, "status")
+	qry := `SELECT name, COALESCE(category,''), COALESCE(trigger,''), COALESCE(status,''),
+	               COALESCE(automation_level,''), COALESCE(success_rate,0), COALESCE(cost_savings,0)
+	        FROM workflows WHERE tenant_id=$1 AND deleted_at IS NULL`
+	qa := []interface{}{tenantID}
+	if status != "" {
+		qry += " AND status=$2"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY created_at DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var name, cat, trig, st, auto string
+		var succ, savings float64
+		if r.Scan(&name, &cat, &trig, &st, &auto, &succ, &savings) != nil {
+			return nil, false
+		}
+		return gin.H{"name": name, "category": cat, "trigger": trig, "status": st,
+			"automation_level": auto, "success_rate": succ, "cost_savings": savings}, true
+	})
+}
+
+func toolCreateWorkflow(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	name := argStr(args, "name")
+	category := strings.ToLower(argStr(args, "category"))
+	if name == "" || category == "" {
+		return nil, fmt.Errorf("name and category are required")
+	}
+	validCat := map[string]bool{"hr": true, "procurement": true, "customer_support": true, "sales": true, "inventory": true, "finance": true, "marketing": true}
+	if !validCat[category] {
+		return nil, fmt.Errorf("category must be one of hr, procurement, customer_support, sales, inventory, finance, marketing")
+	}
+	trigger := strings.ToLower(argStr(args, "trigger"))
+	if trigger == "" {
+		trigger = "manual"
+	}
+	if !map[string]bool{"manual": true, "scheduled": true, "event_based": true, "ai_triggered": true}[trigger] {
+		return nil, fmt.Errorf("trigger must be one of manual, scheduled, event_based, ai_triggered")
+	}
+	auto := strings.ToLower(argStr(args, "automation_level"))
+	if auto == "" {
+		auto = "manual"
+	}
+	if !map[string]bool{"manual": true, "semi_automated": true, "fully_automated": true}[auto] {
+		return nil, fmt.Errorf("automation_level must be one of manual, semi_automated, fully_automated")
+	}
+	id := uuid.New()
+	if _, err := h.db.Exec(`INSERT INTO workflows
+		(id, tenant_id, name, description, category, trigger, status, automation_level, steps, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,'draft',$7,'[]',now(),now())`,
+		id, tenantID, name, nullIfEmpty(argStr(args, "description")), category, trigger, auto); err != nil {
+		return nil, err
+	}
+	return gin.H{"id": id.String(), "name": name, "category": category, "trigger": trigger, "automation_level": auto, "status": "draft"}, nil
+}
+
+func toolSetWorkflowStatus(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	wfID, wfName, err := resolveWorkflow(h, tenantID, argStr(args, "name"))
+	if err != nil {
+		return nil, err
+	}
+	status := strings.ToLower(argStr(args, "status"))
+	if !map[string]bool{"active": true, "paused": true, "draft": true}[status] {
+		return nil, fmt.Errorf("status must be one of active, paused, draft")
+	}
+	var old string
+	_ = h.db.QueryRow(`SELECT status FROM workflows WHERE id=$1`, wfID).Scan(&old)
+	if _, err := h.db.Exec(`UPDATE workflows SET status=$1, updated_at=now() WHERE id=$2 AND tenant_id=$3`, status, wfID, tenantID); err != nil {
+		return nil, err
+	}
+	return gin.H{"workflow": wfName, "from": old, "to": status}, nil
 }
