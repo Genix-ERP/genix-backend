@@ -165,6 +165,46 @@ func agentTools() []agentTool {
 			parameters:  obj(map[string]interface{}{"status": str("Optional status filter (active, paused, draft)."), "limit": intp("Max rows (default 15, max 50).")}),
 			exec:        toolListWorkflows,
 		},
+		{
+			name:        "business_overview",
+			description: "One-glance snapshot of the whole business for the active company: cash/bank total, receivables & payables outstanding, sales this month, open sales orders, out-of-stock products, active workflows. Use for 'how is my business', 'give me a summary'.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolBusinessOverview,
+		},
+		{
+			name:        "list_payments",
+			description: "List recorded payments (money in from customers / out to vendors): number, direction, party, amount, status, date. Use for 'recent payments', 'what did we receive/pay'.",
+			parameters: obj(map[string]interface{}{
+				"direction": map[string]interface{}{"type": "string", "enum": []string{"in", "out"}, "description": "in = customer receipts, out = vendor payments. Optional."},
+				"status":    str("Optional status filter (draft, confirmed, cancelled)."),
+				"limit":     intp("Max rows (default 10, max 50)."),
+			}),
+			exec: toolListPayments,
+		},
+		{
+			name:        "list_quotations",
+			description: "List sales quotations (quote number, title, customer, status, total, dates). Optional status filter (draft, sent, accepted, rejected, expired).",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListQuotations,
+		},
+		{
+			name:        "list_leads",
+			description: "List CRM leads (company, contact, phone/email, source, status, score, expected value). Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListLeads,
+		},
+		{
+			name:        "list_opportunities",
+			description: "List sales opportunities / pipeline (name, customer, stage, expected revenue, probability, expected close date). Use for 'sales pipeline', 'deals in progress'.",
+			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListOpportunities,
+		},
+		{
+			name:        "list_journal_entries",
+			description: "List general-ledger journal entries (entry number, date, description, debit/credit totals, status). Use for accounting/audit questions. Optional status filter (draft, posted, cancelled).",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListJournalEntries,
+		},
 		// ---- write tools (confirmation required) ----
 		{
 			name:        "create_contact",
@@ -1342,4 +1382,165 @@ func toolSetWorkflowStatus(h *Handler, c *gin.Context, tenantID uuid.UUID, orgAr
 		return nil, err
 	}
 	return gin.H{"workflow": wfName, "from": old, "to": status}, nil
+}
+
+// ---- business snapshot & remaining read execs -------------------------------
+
+func toolBusinessOverview(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	f := func(q string, a ...interface{}) float64 { var v float64; _ = h.db.QueryRow(q, a...).Scan(&v); return v }
+	i := func(q string, a ...interface{}) int { var v int; _ = h.db.QueryRow(q, a...).Scan(&v); return v }
+	cash := f(`SELECT COALESCE(SUM(balance),0) FROM bank_accounts
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2) AND COALESCE(is_active,true)=true`, tenantID, orgArg)
+	ar := f(`SELECT COALESCE(SUM(total_amount-amount_paid),0) FROM sales_invoices
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2) AND total_amount-amount_paid > 0.005`, tenantID, orgArg)
+	ap := f(`SELECT COALESCE(SUM(total_amount-amount_paid),0) FROM purchase_invoices
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2) AND total_amount-amount_paid > 0.005`, tenantID, orgArg)
+	salesMonth := f(`SELECT COALESCE(SUM(total_amount),0) FROM sales_invoices
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2) AND invoice_date >= date_trunc('month', CURRENT_DATE)`, tenantID, orgArg)
+	openSO := i(`SELECT COUNT(*) FROM sales_orders
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2) AND status NOT IN ('delivered','cancelled','completed','draft')`, tenantID, orgArg)
+	outOfStock := i(`SELECT COUNT(*) FROM (
+		SELECT p.id FROM products p WHERE p.tenant_id=$1 AND p.deleted_at IS NULL
+		AND COALESCE((SELECT SUM(inv.quantity_on_hand) FROM inventory inv JOIN warehouses w ON w.id=inv.warehouse_id
+			WHERE inv.product_id=p.id AND ($2::uuid IS NULL OR w.organization_id=$2)),0) <= 0) t`, tenantID, orgArg)
+	activeWf := i(`SELECT COUNT(*) FROM workflows WHERE tenant_id=$1 AND deleted_at IS NULL AND status='active'`, tenantID)
+	return gin.H{
+		"cash_and_bank":           cash,
+		"receivables_outstanding": ar,
+		"payables_outstanding":    ap,
+		"sales_this_month":        salesMonth,
+		"open_sales_orders":       openSO,
+		"out_of_stock_products":   outOfStock,
+		"active_workflows":        activeWf,
+		"note":                    "Amounts in so'm; cash is the raw sum of bank/cash account balances.",
+	}, nil
+}
+
+func toolListPayments(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	// payments has no deleted_at column.
+	qry := `SELECT p.payment_number, COALESCE(p.type,''), COALESCE(v.name,''), COALESCE(p.amount,0),
+	               COALESCE(p.status,''), p.payment_date, COALESCE(p.reference,'')
+	        FROM payments p LEFT JOIN contacts v ON v.id=p.contact_id
+	        WHERE p.tenant_id=$1 AND ($2::uuid IS NULL OR p.organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if dir := argStr(args, "direction"); dir == "in" {
+		qry += " AND p.type='receipt'"
+	} else if dir == "out" {
+		qry += " AND p.type='payment'"
+	}
+	if status := argStr(args, "status"); status != "" {
+		qry += fmt.Sprintf(" AND p.status=$%d", len(qa)+1)
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY p.payment_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, typ, party, st, ref string
+		var amt float64
+		var dt interface{}
+		if r.Scan(&num, &typ, &party, &amt, &st, &dt, &ref) != nil {
+			return nil, false
+		}
+		dir := "in"
+		if typ == "payment" {
+			dir = "out"
+		}
+		return gin.H{"payment_number": num, "direction": dir, "party": party, "amount": amt, "status": st, "date": dt, "reference": ref}, true
+	})
+}
+
+func toolListQuotations(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT q.quotation_number, COALESCE(q.title,''), COALESCE(v.name,''), COALESCE(q.status,''),
+	               COALESCE(q.total_amount,0), q.quotation_date, q.expiry_date
+	        FROM quotations q LEFT JOIN contacts v ON v.id=q.contact_id
+	        WHERE q.tenant_id=$1 AND q.deleted_at IS NULL AND ($2::uuid IS NULL OR q.organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND q.status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY q.quotation_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, title, cust, st string
+		var total float64
+		var qdate, expiry interface{}
+		if r.Scan(&num, &title, &cust, &st, &total, &qdate, &expiry) != nil {
+			return nil, false
+		}
+		return gin.H{"quotation_number": num, "title": title, "customer": cust, "status": st, "total": total, "date": qdate, "expiry_date": expiry}, true
+	})
+}
+
+func toolListLeads(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(company_name,''), COALESCE(contact_name,''), COALESCE(phone,''), COALESCE(email,''),
+	               COALESCE(source,''), COALESCE(status,''), COALESCE(score,0)::float8, COALESCE(expected_value,0)::float8
+	        FROM leads WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY created_at DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var company, contact, phone, email, source, st string
+		var score, value float64
+		if r.Scan(&company, &contact, &phone, &email, &source, &st, &score, &value) != nil {
+			return nil, false
+		}
+		return gin.H{"company": company, "contact": contact, "phone": phone, "email": email,
+			"source": source, "status": st, "score": score, "expected_value": value}, true
+	})
+}
+
+func toolListOpportunities(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	rows, err := h.db.Query(fmt.Sprintf(`
+		SELECT COALESCE(o.name,''), COALESCE(v.name,''), COALESCE(o.stage,''),
+		       COALESCE(o.expected_revenue,0)::float8, COALESCE(o.probability,0)::float8, o.expected_close_date
+		FROM opportunities o LEFT JOIN contacts v ON v.id=o.contact_id
+		WHERE o.tenant_id=$1 AND o.deleted_at IS NULL AND ($2::uuid IS NULL OR o.organization_id=$2)
+		ORDER BY o.expected_close_date ASC NULLS LAST LIMIT %d`, limit), tenantID, orgArg)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var name, cust, stage string
+		var revenue, prob float64
+		var closeDate interface{}
+		if r.Scan(&name, &cust, &stage, &revenue, &prob, &closeDate) != nil {
+			return nil, false
+		}
+		return gin.H{"name": name, "customer": cust, "stage": stage, "expected_revenue": revenue,
+			"probability": prob, "expected_close_date": closeDate}, true
+	})
+}
+
+func toolListJournalEntries(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT je.entry_number, je.entry_date, COALESCE(je.description,''), COALESCE(je.reference,''),
+	               COALESCE(je.total_debit,0), COALESCE(je.total_credit,0), COALESCE(je.status,'')
+	        FROM journal_entries je
+	        WHERE je.tenant_id=$1 AND je.deleted_at IS NULL AND ($2::uuid IS NULL OR je.organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND je.status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY je.entry_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, desc, ref, st string
+		var debit, credit float64
+		var dt interface{}
+		if r.Scan(&num, &dt, &desc, &ref, &debit, &credit, &st) != nil {
+			return nil, false
+		}
+		return gin.H{"entry_number": num, "date": dt, "description": desc, "reference": ref,
+			"total_debit": debit, "total_credit": credit, "status": st}, true
+	})
 }
