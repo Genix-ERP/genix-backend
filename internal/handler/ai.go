@@ -8,6 +8,7 @@ import (
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/genixerp/genix-backend/internal/infrastructure/ai"
+	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -81,25 +82,29 @@ func detectLanguage(message string) string {
 	return "" // Could not detect with confidence
 }
 
-// NewAIService creates a new AI service
-func (h *Handler) getAIService() *AIService {
-	if h.config.AI.APIKey == "" {
+// getAIService builds the AI client for a tenant, using that tenant's own
+// provider/model/key/endpoint from Admin → AI settings when configured, and
+// falling back to the server-wide env config otherwise. Pass uuid.Nil for the
+// pure env config. Returns nil (→ demo mode) when no usable API key resolves.
+func (h *Handler) getAIService(tenantID uuid.UUID) *AIService {
+	cfg := h.tenantAIConfig(tenantID)
+	if cfg.APIKey == "" {
 		return nil
 	}
 	return &AIService{
-		client:      ai.NewClient(h.config.AI),
-		rateLimiter: ai.NewRateLimiter(h.config.AI.RateLimitPerMin),
+		client:      ai.NewClient(cfg),
+		rateLimiter: ai.NewRateLimiter(cfg.RateLimitPerMin),
 	}
 }
 
 // AIChatRequest represents a chat request
 type AIChatRequest struct {
-	Message       string                 `json:"message" binding:"required"`
-	Context       map[string]interface{} `json:"context,omitempty"`
-	SystemPrompt  string                 `json:"system_prompt,omitempty"`
-	Model         string                 `json:"model,omitempty"`
-	MaxTokens     int                    `json:"max_tokens,omitempty"`
-	Temperature   float64                `json:"temperature,omitempty"`
+	Message      string                 `json:"message" binding:"required"`
+	Context      map[string]interface{} `json:"context,omitempty"`
+	SystemPrompt string                 `json:"system_prompt,omitempty"`
+	Model        string                 `json:"model,omitempty"`
+	MaxTokens    int                    `json:"max_tokens,omitempty"`
+	Temperature  float64                `json:"temperature,omitempty"`
 }
 
 // AIChat handles AI chat requests
@@ -111,7 +116,8 @@ func (h *Handler) AIChat(c *gin.Context) {
 		return
 	}
 
-	aiService := h.getAIService()
+	tenantID, _ := middleware.GetTenantID(c)
+	aiService := h.getAIService(tenantID)
 
 	// If no AI API key configured, return demo response
 	if aiService == nil {
@@ -121,7 +127,7 @@ func (h *Handler) AIChat(c *gin.Context) {
 				"role":    "assistant",
 				"content": demoResponse,
 			},
-			"model":  "demo",
+			"model": "demo",
 			"usage": gin.H{
 				"prompt_tokens":     0,
 				"completion_tokens": 0,
@@ -185,8 +191,8 @@ func (h *Handler) AIChat(c *gin.Context) {
 				"role":    "assistant",
 				"content": demoResponse,
 			},
-			"model":  "demo-fallback",
-			"error":  "AI service temporarily unavailable, using fallback",
+			"model": "demo-fallback",
+			"error": "AI service temporarily unavailable, using fallback",
 			"usage": gin.H{
 				"prompt_tokens":     0,
 				"completion_tokens": 0,
@@ -363,20 +369,23 @@ I can help you with:
 *Note: For full AI capabilities, configure your OpenAI or Anthropic API key in the backend settings.*`
 }
 
-// GetAICapabilities returns available AI capabilities
+// GetAICapabilities returns available AI capabilities and the tenant's effective
+// AI config (its own settings when configured, else the server-wide defaults).
 func (h *Handler) GetAICapabilities(c *gin.Context) {
 	capabilities := entity.GetAICapabilities()
 
-	// Add status info
+	tenantID, _ := middleware.GetTenantID(c)
+	cfg := h.tenantAIConfig(tenantID)
+
 	aiStatus := "demo"
-	if h.config.AI.APIKey != "" {
+	if cfg.APIKey != "" {
 		aiStatus = "active"
 	}
 
 	response.Success(c, gin.H{
 		"status":       aiStatus,
-		"provider":     h.config.AI.Provider,
-		"model":        h.config.AI.Model,
+		"provider":     cfg.Provider,
+		"model":        cfg.Model,
 		"capabilities": capabilities,
 	})
 }
@@ -523,7 +532,7 @@ type InvoiceExtractionResponse struct {
 		UnitPrice   float64 `json:"unit_price"`
 		Amount      float64 `json:"amount"`
 	} `json:"line_items"`
-	Notes      string `json:"notes"`
+	Notes      string  `json:"notes"`
 	Confidence float64 `json:"confidence"`
 }
 
@@ -551,7 +560,8 @@ func (h *Handler) ExtractInvoice(c *gin.Context) {
 		return
 	}
 
-	aiService := h.getAIService()
+	tenantUUID, _ := middleware.GetTenantID(c)
+	aiService := h.getAIService(tenantUUID)
 
 	// If no AI API key configured, return demo response
 	if aiService == nil {

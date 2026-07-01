@@ -196,13 +196,13 @@ Rules:
 // is inferred from the endpoint. This lets the feature work with either an
 // OpenAI (gpt-4o vision) or an Anthropic (Claude) key without code changes.
 func (h *Handler) extractReceiptLineItems(ctx context.Context, tenantID uuid.UUID, imageBase64, mimeType string) ([]receiptLineItem, error) {
-	provider, apiKey, model := h.resolveTenantAIConfig(tenantID)
+	provider, apiKey, model, endpoint := h.resolveTenantAIConfig(tenantID)
 	if apiKey == "" {
 		return nil, fmt.Errorf("AI API key not configured")
 	}
 
 	provider = strings.ToLower(strings.TrimSpace(provider))
-	endpoint := strings.TrimSpace(h.config.AI.Endpoint)
+	endpoint = strings.TrimSpace(endpoint)
 	if provider == "" {
 		// Infer from the endpoint; default to OpenAI (also covers OpenAI-compatible).
 		if strings.Contains(endpoint, "anthropic") {

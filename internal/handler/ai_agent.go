@@ -87,7 +87,7 @@ func (h *Handler) AIAgentChat(c *gin.Context) {
 		return
 	}
 
-	svc := h.getAIService()
+	svc := h.getAIService(tenantID)
 	if svc == nil {
 		response.Success(c, gin.H{"type": "message", "message": "AI is not configured. Set the tenant's AI provider/key in Admin → AI settings.", "model": "demo"})
 		return
