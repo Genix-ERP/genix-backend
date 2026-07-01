@@ -532,13 +532,20 @@ func toolFinancialSummary(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg
 }
 
 func toolLowStock(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	// Stock is summed only over warehouses in the active organization, so a
+	// multi-company tenant doesn't mix another company's stock into the total.
 	rows, err := h.db.Query(`
-		SELECT p.name, COALESCE(SUM(i.quantity_on_hand),0) AS stock
-		FROM products p LEFT JOIN inventory i ON i.product_id=p.id
-		WHERE p.tenant_id=$1 AND p.deleted_at IS NULL
-		GROUP BY p.id, p.name
-		HAVING COALESCE(SUM(i.quantity_on_hand),0) <= 0
-		ORDER BY stock ASC LIMIT 15`, tenantID)
+		SELECT name, stock FROM (
+			SELECT p.name AS name, COALESCE((
+				SELECT SUM(i.quantity_on_hand)
+				FROM inventory i JOIN warehouses w ON w.id=i.warehouse_id
+				WHERE i.product_id=p.id AND ($2::uuid IS NULL OR w.organization_id=$2)
+			),0) AS stock
+			FROM products p
+			WHERE p.tenant_id=$1 AND p.deleted_at IS NULL
+		) t
+		WHERE stock <= 0
+		ORDER BY stock ASC LIMIT 15`, tenantID, orgArg)
 	if err != nil {
 		return nil, err
 	}
@@ -653,10 +660,10 @@ func toolCreateSalesInvoice(h *Handler, c *gin.Context, tenantID uuid.UUID, orgA
 	invID := uuid.New()
 	num := docNumber("INV")
 	if _, err := tx.Exec(`INSERT INTO sales_invoices
-		(id, tenant_id, organization_id, invoice_number, customer_id, sales_order_id, invoice_date, due_date,
+		(id, tenant_id, organization_id, invoice_number, customer_id, customer_name, sales_order_id, invoice_date, due_date,
 		 subtotal, discount_amount, tax_amount, total_amount, amount_paid, status, notes, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,NULL,CURRENT_DATE,CURRENT_DATE+30,$6,0,0,$6,0,'draft',$7,$8,now(),now())`,
-		invID, tenantID, orgArg, num, custID, subtotal, "Created by AI agent", userID); err != nil {
+		VALUES ($1,$2,$3,$4,$5,$6,NULL,CURRENT_DATE,CURRENT_DATE+30,$7,0,0,$7,0,'draft',$8,$9,now(),now())`,
+		invID, tenantID, orgArg, num, custID, custName, subtotal, "Created by AI agent", userID); err != nil {
 		return nil, err
 	}
 	for i, l := range lines {
@@ -925,7 +932,7 @@ func toolCreateVendorBill(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg
 		(id, tenant_id, organization_id, invoice_number, vendor_id, vendor_invoice_number, invoice_date, due_date,
 		 subtotal, discount_amount, tax_rate_id, tax_amount, total_amount, amount_paid, status, three_way_match_status,
 		 notes, currency_id, exchange_rate, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,CURRENT_DATE,CURRENT_DATE+30,$7,0,NULL,0,$7,0,'draft',NULL,$8,NULL,1,$9,now(),now())`,
+		VALUES ($1,$2,$3,$4,$5,$6,CURRENT_DATE,CURRENT_DATE+30,$7,0,NULL,0,$7,0,'draft','pending',$8,NULL,1,$9,now(),now())`,
 		uuid.New(), tenantID, orgArg, num, venID, nullIfEmpty(argStr(args, "vendor_invoice_number")),
 		amount, nullIfEmpty(argStr(args, "description")), userID); err != nil {
 		return nil, err
