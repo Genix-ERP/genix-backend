@@ -132,6 +132,33 @@ func agentTools() []agentTool {
 			parameters:  obj(map[string]interface{}{"period": map[string]interface{}{"type": "string", "enum": []string{"today", "this_week", "this_month", "this_year", "last_30_days"}, "description": "Time window. Default this_month."}}),
 			exec:        toolSalesSummary,
 		},
+		{
+			name:        "list_bank_accounts",
+			description: "List the company's bank/cash accounts with their current balance and currency. Use to answer 'how much money do we have', 'cash position', 'bank balances'.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolListBankAccounts,
+		},
+		{
+			name:        "list_fixed_assets",
+			description: "The fixed-asset register: code, name, category, acquisition cost, accumulated depreciation, current book value, status and custodian. Optional status filter (active, disposed, under_maintenance, written_off).",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 15, max 50).")}),
+			exec:        toolListFixedAssets,
+		},
+		{
+			name:        "list_contracts",
+			description: "Procurement contracts with vendors (number, vendor, title, type, start/end dates, value, status). Set expiring_within_days to only show active contracts ending soon (renewal watch).",
+			parameters: obj(map[string]interface{}{
+				"expiring_within_days": intp("Only active contracts whose end_date is within this many days from today."),
+				"limit":                intp("Max rows (default 15, max 50)."),
+			}),
+			exec: toolListContracts,
+		},
+		{
+			name:        "get_purchase_order",
+			description: "Full detail of ONE purchase order by its number, including every product line (qty, unit price, line total, quantity received). Use after list_purchase_orders to drill in.",
+			parameters:  obj(map[string]interface{}{"order_number": str("The purchase order number.")}, "order_number"),
+			exec:        toolGetPurchaseOrder,
+		},
 		// ---- write tools (confirmation required) ----
 		{
 			name:        "create_contact",
@@ -1085,4 +1112,108 @@ func toolSalesSummary(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg int
 		period = "this_month"
 	}
 	return gin.H{"period": period, "invoice_count": cnt, "invoiced": invoiced, "collected": collected, "outstanding": invoiced - collected}, nil
+}
+
+func toolListBankAccounts(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	rows, err := h.db.Query(`
+		SELECT COALESCE(NULLIF(name,''), bank_name, ''), COALESCE(bank_name,''), COALESCE(account_number,''),
+		       COALESCE(currency,'UZS'), COALESCE(account_type,''), COALESCE(balance,0)
+		FROM bank_accounts
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)
+		  AND COALESCE(is_active,true)=true
+		ORDER BY balance DESC`, tenantID, orgArg)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var name, bank, acct, cur, atype string
+		var bal float64
+		if r.Scan(&name, &bank, &acct, &cur, &atype, &bal) != nil {
+			return nil, false
+		}
+		return gin.H{"name": name, "bank": bank, "account_number": acct, "currency": cur, "type": atype, "balance": bal}, true
+	})
+}
+
+func toolListFixedAssets(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 15, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(asset_code,''), COALESCE(name,''), COALESCE(category_name,''), COALESCE(acquisition_cost,0),
+	               COALESCE(accumulated_depreciation,0), COALESCE(book_value, current_value, 0), COALESCE(status,''),
+	               COALESCE(custodian_name,''), COALESCE(location,'')
+	        FROM fixed_assets WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY acquisition_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var code, name, cat, st, custodian, loc string
+		var cost, accDep, bookVal float64
+		if r.Scan(&code, &name, &cat, &cost, &accDep, &bookVal, &st, &custodian, &loc) != nil {
+			return nil, false
+		}
+		return gin.H{"asset_code": code, "name": name, "category": cat, "acquisition_cost": cost,
+			"accumulated_depreciation": accDep, "book_value": bookVal, "status": st, "custodian": custodian, "location": loc}, true
+	})
+}
+
+func toolListContracts(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 15, 50)
+	qry := `SELECT COALESCE(contract_number,''), COALESCE(vendor_name,''), COALESCE(title,''), COALESCE(contract_type,''),
+	               start_date, end_date, COALESCE(value,0), COALESCE(currency,'UZS'), COALESCE(status,'')
+	        FROM procurement_contracts WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if d := argInt(args, "expiring_within_days", 0, 3650); d > 0 {
+		qry += fmt.Sprintf(" AND status='active' AND end_date IS NOT NULL AND end_date <= CURRENT_DATE + %d", d)
+	}
+	qry += fmt.Sprintf(" ORDER BY end_date ASC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, vend, title, ctype, cur, st string
+		var start, end interface{}
+		var val float64
+		if r.Scan(&num, &vend, &title, &ctype, &start, &end, &val, &cur, &st) != nil {
+			return nil, false
+		}
+		return gin.H{"contract_number": num, "vendor": vend, "title": title, "type": ctype,
+			"start_date": start, "end_date": end, "value": val, "currency": cur, "status": st}, true
+	})
+}
+
+func toolGetPurchaseOrder(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	num := argStr(args, "order_number")
+	if num == "" {
+		return nil, fmt.Errorf("order_number is required")
+	}
+	var poID uuid.UUID
+	var vend, st string
+	var total float64
+	var dt interface{}
+	err := h.db.QueryRow(`SELECT po.id, COALESCE(v.name,''), COALESCE(po.status,''), COALESCE(po.total_amount,0), po.order_date
+		FROM purchase_orders po LEFT JOIN contacts v ON v.id=po.vendor_id
+		WHERE po.tenant_id=$1 AND po.deleted_at IS NULL AND po.order_number=$2
+		  AND ($3::uuid IS NULL OR po.organization_id=$3) LIMIT 1`, tenantID, num, orgArg).
+		Scan(&poID, &vend, &st, &total, &dt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("no purchase order found with number %q", num)
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := h.db.Query(`SELECT COALESCE(p.name,''), COALESCE(pol.quantity,0), COALESCE(pol.unit_price,0),
+		COALESCE(pol.line_total,0), COALESCE(pol.quantity_received,0)
+		FROM purchase_order_lines pol LEFT JOIN products p ON p.id=pol.product_id
+		WHERE pol.purchase_order_id=$1 ORDER BY pol.line_number ASC`, poID)
+	lines, lerr := rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var pn string
+		var qty, price, lt, recv float64
+		if r.Scan(&pn, &qty, &price, &lt, &recv) != nil {
+			return nil, false
+		}
+		return gin.H{"product": pn, "quantity": qty, "unit_price": price, "line_total": lt, "quantity_received": recv}, true
+	})
+	if lerr != nil {
+		return nil, lerr
+	}
+	return gin.H{"order_number": num, "vendor": vend, "status": st, "total": total, "date": dt, "lines": lines}, nil
 }
