@@ -457,14 +457,15 @@ func toolCheckStock(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg inter
 func toolListSalesOrders(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	limit := argInt(args, "limit", 10, 50)
 	status := argStr(args, "status")
-	qry := `SELECT order_number, COALESCE(customer_name,''), COALESCE(status,''), COALESCE(total_amount,0), order_date
-	        FROM sales_orders WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qry := `SELECT so.order_number, COALESCE(v.name,''), COALESCE(so.status,''), COALESCE(so.total_amount,0), so.order_date
+	        FROM sales_orders so LEFT JOIN contacts v ON v.id=so.customer_id
+	        WHERE so.tenant_id=$1 AND so.deleted_at IS NULL AND ($2::uuid IS NULL OR so.organization_id=$2)`
 	qargs := []interface{}{tenantID, orgArg}
 	if status != "" {
-		qry += " AND status=$3"
+		qry += " AND so.status=$3"
 		qargs = append(qargs, status)
 	}
-	qry += fmt.Sprintf(" ORDER BY order_date DESC NULLS LAST LIMIT %d", limit)
+	qry += fmt.Sprintf(" ORDER BY so.order_date DESC NULLS LAST LIMIT %d", limit)
 	rows, err := h.db.Query(qry, qargs...)
 	if err != nil {
 		return nil, err
@@ -943,10 +944,11 @@ func toolGetSalesOrder(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg in
 	var cust, st, payst, notes string
 	var subtotal, total, paid float64
 	var dt interface{}
-	err := h.db.QueryRow(`SELECT id, COALESCE(customer_name,''), COALESCE(status,''), COALESCE(payment_status,''),
-		COALESCE(notes,''), COALESCE(subtotal,0), COALESCE(total_amount,0), COALESCE(paid_amount,0), order_date
-		FROM sales_orders WHERE tenant_id=$1 AND deleted_at IS NULL AND order_number=$2
-		  AND ($3::uuid IS NULL OR organization_id=$3) LIMIT 1`, tenantID, num, orgArg).
+	err := h.db.QueryRow(`SELECT so.id, COALESCE(v.name,''), COALESCE(so.status,''), COALESCE(so.payment_status,''),
+		COALESCE(so.notes,''), COALESCE(so.subtotal,0), COALESCE(so.total_amount,0), COALESCE(so.paid_amount,0), so.order_date
+		FROM sales_orders so LEFT JOIN contacts v ON v.id=so.customer_id
+		WHERE so.tenant_id=$1 AND so.deleted_at IS NULL AND so.order_number=$2
+		  AND ($3::uuid IS NULL OR so.organization_id=$3) LIMIT 1`, tenantID, num, orgArg).
 		Scan(&soID, &cust, &st, &payst, &notes, &subtotal, &total, &paid, &dt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("no sales order found with number %q", num)
