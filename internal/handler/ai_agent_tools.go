@@ -102,6 +102,36 @@ func agentTools() []agentTool {
 			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 10, max 50).")}),
 			exec:        toolListProjects,
 		},
+		{
+			name:        "get_sales_order",
+			description: "Full detail of ONE sales order by its number, including every product line (qty, price, line total) and payment status. Use after list_sales_orders to drill in.",
+			parameters:  obj(map[string]interface{}{"order_number": str("The sales order number, e.g. SO-000123.")}, "order_number"),
+			exec:        toolGetSalesOrder,
+		},
+		{
+			name:        "customer_statement",
+			description: "A customer's account statement: current balance plus recent invoices and payments. Use to answer 'how much does X owe us' or 'show X's history'.",
+			parameters:  obj(map[string]interface{}{"customer": str("Customer name (must exist)."), "limit": intp("Rows per section (default 10, max 30).")}, "customer"),
+			exec:        toolCustomerStatement,
+		},
+		{
+			name:        "aged_receivables",
+			description: "Accounts receivable aging: unpaid sales invoices bucketed by how overdue they are (current, 1-30, 31-60, 61-90, 90+ days) with per-customer outstanding totals.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolAgedReceivables,
+		},
+		{
+			name:        "aged_payables",
+			description: "Accounts payable aging: unpaid vendor bills bucketed by how overdue they are, with per-vendor outstanding totals. Use to answer 'who do we owe'.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolAgedPayables,
+		},
+		{
+			name:        "sales_summary",
+			description: "Totals of sales invoices over a period: count, invoiced amount, collected amount and outstanding. Use for 'how much did we sell this month'.",
+			parameters:  obj(map[string]interface{}{"period": map[string]interface{}{"type": "string", "enum": []string{"today", "this_week", "this_month", "this_year", "last_30_days"}, "description": "Time window. Default this_month."}}),
+			exec:        toolSalesSummary,
+		},
 		// ---- write tools (confirmation required) ----
 		{
 			name:        "create_contact",
@@ -873,4 +903,186 @@ func toolCreateVendorBill(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg
 		return nil, err
 	}
 	return gin.H{"bill_number": num, "vendor": venName, "amount": amount, "status": "draft"}, nil
+}
+
+// ---- drill-down & report read execs ----------------------------------------
+
+func toolGetSalesOrder(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	num := argStr(args, "order_number")
+	if num == "" {
+		return nil, fmt.Errorf("order_number is required")
+	}
+	var soID uuid.UUID
+	var cust, st, payst, notes string
+	var subtotal, total, paid float64
+	var dt interface{}
+	err := h.db.QueryRow(`SELECT id, COALESCE(customer_name,''), COALESCE(status,''), COALESCE(payment_status,''),
+		COALESCE(notes,''), COALESCE(subtotal,0), COALESCE(total_amount,0), COALESCE(paid_amount,0), order_date
+		FROM sales_orders WHERE tenant_id=$1 AND deleted_at IS NULL AND order_number=$2
+		  AND ($3::uuid IS NULL OR organization_id=$3) LIMIT 1`, tenantID, num, orgArg).
+		Scan(&soID, &cust, &st, &payst, &notes, &subtotal, &total, &paid, &dt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("no sales order found with number %q", num)
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := h.db.Query(`SELECT COALESCE(p.name,''), COALESCE(sol.quantity,0), COALESCE(sol.unit_price,0), COALESCE(sol.line_total,0)
+		FROM sales_order_lines sol LEFT JOIN products p ON p.id=sol.product_id
+		WHERE sol.sales_order_id=$1 ORDER BY sol.line_number ASC`, soID)
+	lines, lerr := rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var pn string
+		var qty, price, lt float64
+		if r.Scan(&pn, &qty, &price, &lt) != nil {
+			return nil, false
+		}
+		return gin.H{"product": pn, "quantity": qty, "unit_price": price, "line_total": lt}, true
+	})
+	if lerr != nil {
+		return nil, lerr
+	}
+	return gin.H{
+		"order_number": num, "customer": cust, "status": st, "payment_status": payst,
+		"subtotal": subtotal, "total": total, "paid": paid, "due": total - paid,
+		"notes": notes, "date": dt, "lines": lines,
+	}, nil
+}
+
+func toolCustomerStatement(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	custID, custName, err := resolveContactID(h, tenantID, argStr(args, "customer"), "customer")
+	if err != nil {
+		return nil, err
+	}
+	limit := argInt(args, "limit", 10, 30)
+	var balance float64
+	_ = h.db.QueryRow(`SELECT COALESCE(current_balance,0) FROM contacts WHERE id=$1`, custID).Scan(&balance)
+
+	invRows, ierr := h.db.Query(fmt.Sprintf(`SELECT invoice_number, COALESCE(status,''), COALESCE(total_amount,0),
+		COALESCE(amount_paid,0), COALESCE(total_amount,0)-COALESCE(amount_paid,0), invoice_date
+		FROM sales_invoices WHERE tenant_id=$1 AND deleted_at IS NULL AND customer_id=$2
+		ORDER BY invoice_date DESC NULLS LAST LIMIT %d`, limit), tenantID, custID)
+	invoices, err := rowsToList(invRows, ierr, func(r *sql.Rows) (gin.H, bool) {
+		var num, st string
+		var total, paid, due float64
+		var dt interface{}
+		if r.Scan(&num, &st, &total, &paid, &due, &dt) != nil {
+			return nil, false
+		}
+		return gin.H{"invoice_number": num, "status": st, "total": total, "paid": paid, "due": due, "date": dt}, true
+	})
+	if err != nil {
+		return nil, err
+	}
+	payRows, perr := h.db.Query(fmt.Sprintf(`SELECT payment_number, COALESCE(type,''), COALESCE(amount,0), payment_date, COALESCE(reference,'')
+		FROM payments WHERE tenant_id=$1 AND contact_id=$2
+		ORDER BY payment_date DESC NULLS LAST LIMIT %d`, limit), tenantID, custID)
+	payments, err := rowsToList(payRows, perr, func(r *sql.Rows) (gin.H, bool) {
+		var num, typ, ref string
+		var amt float64
+		var dt interface{}
+		if r.Scan(&num, &typ, &amt, &dt, &ref) != nil {
+			return nil, false
+		}
+		return gin.H{"payment_number": num, "type": typ, "amount": amt, "date": dt, "reference": ref}, true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return gin.H{"customer": custName, "current_balance": balance, "invoices": invoices, "payments": payments}, nil
+}
+
+// agingBuckets runs an aging query over an invoice table and returns bucket
+// totals plus the top outstanding parties. party = the joined contact name.
+func agingBuckets(h *Handler, tenantID uuid.UUID, orgArg interface{}, table, partyCol string) (interface{}, error) {
+	qry := fmt.Sprintf(`
+		SELECT COALESCE(v.name,''), COALESCE(t.total_amount,0)-COALESCE(t.amount_paid,0) AS due,
+		       CASE
+		         WHEN t.due_date IS NULL OR t.due_date >= CURRENT_DATE THEN 'current'
+		         WHEN CURRENT_DATE - t.due_date <= 30 THEN '1_30'
+		         WHEN CURRENT_DATE - t.due_date <= 60 THEN '31_60'
+		         WHEN CURRENT_DATE - t.due_date <= 90 THEN '61_90'
+		         ELSE '90_plus'
+		       END AS bucket
+		FROM %s t LEFT JOIN contacts v ON v.id=t.%s
+		WHERE t.tenant_id=$1 AND t.deleted_at IS NULL AND ($2::uuid IS NULL OR t.organization_id=$2)
+		  AND COALESCE(t.total_amount,0)-COALESCE(t.amount_paid,0) > 0.005`, table, partyCol)
+	rows, err := h.db.Query(qry, tenantID, orgArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	buckets := map[string]float64{"current": 0, "1_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0}
+	perParty := map[string]float64{}
+	var totalDue float64
+	for rows.Next() {
+		var party, bucket string
+		var due float64
+		if rows.Scan(&party, &due, &bucket) != nil {
+			continue
+		}
+		buckets[bucket] += due
+		if party == "" {
+			party = "(unknown)"
+		}
+		perParty[party] += due
+		totalDue += due
+	}
+	// Top parties by outstanding.
+	type kv struct {
+		Name string  `json:"name"`
+		Due  float64 `json:"due"`
+	}
+	top := []kv{}
+	for k, v := range perParty {
+		top = append(top, kv{k, v})
+	}
+	for i := 0; i < len(top); i++ {
+		for j := i + 1; j < len(top); j++ {
+			if top[j].Due > top[i].Due {
+				top[i], top[j] = top[j], top[i]
+			}
+		}
+	}
+	if len(top) > 10 {
+		top = top[:10]
+	}
+	return gin.H{"total_outstanding": totalDue, "buckets": buckets, "top": top}, nil
+}
+
+func toolAgedReceivables(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	return agingBuckets(h, tenantID, orgArg, "sales_invoices", "customer_id")
+}
+
+func toolAgedPayables(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	return agingBuckets(h, tenantID, orgArg, "purchase_invoices", "vendor_id")
+}
+
+func toolSalesSummary(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	// Map the period to a SQL lower bound on invoice_date.
+	lower := "date_trunc('month', CURRENT_DATE)"
+	switch argStr(args, "period") {
+	case "today":
+		lower = "CURRENT_DATE"
+	case "this_week":
+		lower = "date_trunc('week', CURRENT_DATE)"
+	case "this_year":
+		lower = "date_trunc('year', CURRENT_DATE)"
+	case "last_30_days":
+		lower = "CURRENT_DATE - INTERVAL '30 days'"
+	case "this_month", "":
+		lower = "date_trunc('month', CURRENT_DATE)"
+	}
+	var cnt int
+	var invoiced, collected float64
+	err := h.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*), COALESCE(SUM(total_amount),0), COALESCE(SUM(amount_paid),0)
+		FROM sales_invoices WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)
+		  AND invoice_date >= %s`, lower), tenantID, orgArg).Scan(&cnt, &invoiced, &collected)
+	if err != nil {
+		return nil, err
+	}
+	period := argStr(args, "period")
+	if period == "" {
+		period = "this_month"
+	}
+	return gin.H{"period": period, "invoice_count": cnt, "invoiced": invoiced, "collected": collected, "outstanding": invoiced - collected}, nil
 }
