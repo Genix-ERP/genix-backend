@@ -115,6 +115,10 @@ func (h *Handler) AIAgentChat(c *gin.Context) {
 			response.BadRequest(c, "Unknown or non-executable action")
 			return
 		}
+		if reason := h.agentToolDenied(c, tool.name); reason != "" {
+			response.Forbidden(c, "You do not have permission for this action ("+reason+")")
+			return
+		}
 		result, execErr := tool.exec(h, c, tenantID, orgArg, userID, req.Approved.Args)
 		var note string
 		if execErr != nil {
@@ -171,6 +175,16 @@ func (h *Handler) AIAgentChat(c *gin.Context) {
 
 			if tool == nil {
 				msgs = append(msgs, aipkg.Message{Role: "tool", ToolCallID: tc.ID, Content: `{"error":"unknown tool"}`})
+				continue
+			}
+
+			// Permission gate — the agent may only do what THIS user could do in
+			// the ERP. Denied tools (read or write) never execute and a write never
+			// reaches the confirmation card.
+			if reason := h.agentToolDenied(c, tool.name); reason != "" {
+				msgs = append(msgs, aipkg.Message{Role: "tool", ToolCallID: tc.ID,
+					Content: fmt.Sprintf(`{"error":"permission denied: the user does not have the %q permission. Do not retry; tell them they don't have access to this."}`, reason)})
+				steps = append(steps, gin.H{"tool": tool.name, "args": args, "ok": false, "denied": true})
 				continue
 			}
 
@@ -236,6 +250,10 @@ func (h *Handler) AIAgentExecute(c *gin.Context) {
 		response.BadRequest(c, "Unknown or non-executable action")
 		return
 	}
+	if reason := h.agentToolDenied(c, tool.name); reason != "" {
+		response.Forbidden(c, "You do not have permission for this action ("+reason+")")
+		return
+	}
 	result, err := tool.exec(h, c, tenantID, orgArg, userID, req.Args)
 	if err != nil {
 		response.BadRequest(c, err.Error())
@@ -253,6 +271,79 @@ func findTool(tools []agentTool, name string) *agentTool {
 	return nil
 }
 
+// toolPerms maps each tool to the RBAC node it requires (module, resource,
+// action) — the SAME permission the corresponding ERP route enforces. A tool
+// absent from this map corresponds to an ERP route that has no perm.Require
+// guard (contacts, leads, opportunities) and so is available to any tenant
+// user. The agent mirrors the ERP's own gating exactly: never stricter, never
+// looser than what the user could already do through the normal UI/API.
+var toolPerms = map[string][3]string{
+	// ---- reads ----
+	"find_products":              {"inventory", "product", "read"},
+	"check_stock":                {"inventory", "stock", "read"},
+	"low_stock_products":         {"inventory", "stock", "read"},
+	"list_stock_counts":          {"inventory", "stock", "read"},
+	"list_boms":                  {"inventory", "bom", "read"},
+	"get_bom":                    {"inventory", "bom", "read"},
+	"list_sales_orders":          {"sales", "order", "read"},
+	"get_sales_order":            {"sales", "order", "read"},
+	"list_sales_invoices":        {"sales", "invoice", "read"},
+	"customer_statement":         {"sales", "invoice", "read"},
+	"aged_receivables":           {"sales", "invoice", "read"},
+	"sales_summary":              {"sales", "invoice", "read"},
+	"list_quotations":            {"sales", "quotation", "read"},
+	"list_sales_returns":         {"sales", "return", "read"},
+	"list_purchase_orders":       {"purchase", "order", "read"},
+	"get_purchase_order":         {"purchase", "order", "read"},
+	"list_vendor_bills":          {"purchase", "invoice", "read"},
+	"aged_payables":              {"purchase", "invoice", "read"},
+	"list_contracts":             {"purchase", "contract", "read"},
+	"list_goods_receipts":        {"purchase", "receipt", "read"},
+	"list_purchase_requisitions": {"purchase", "requisition", "read"},
+	"list_rfqs":                  {"purchase", "rfq", "read"},
+	"list_purchase_returns":      {"purchase", "return", "read"},
+	"financial_summary":          {"finance", "account", "read"},
+	"business_overview":          {"finance", "report", "read"},
+	"list_bank_accounts":         {"finance", "bank_account", "read"},
+	"list_payments":              {"finance", "payment", "read"},
+	"list_expenses":              {"finance", "expense", "read"},
+	"list_journal_entries":       {"finance", "journal_entry", "read"},
+	"list_fixed_assets":          {"finance", "asset", "read"},
+	"tax_summary":                {"finance", "tax_report", "read"},
+	"list_production_orders":     {"manufacturing", "production_orders", "read"},
+	"list_work_orders":           {"manufacturing", "work_orders", "read"},
+	"find_employees":             {"hr", "employee", "read"},
+	"list_leave_requests":        {"hr", "leave", "read"},
+	"list_attendance":            {"hr", "attendance", "read"},
+	"list_payroll_periods":       {"hr", "payroll", "read"},
+	"list_projects":              {"construction", "project", "read"},
+	"list_workflows":             {"workflow", "workflow", "read"},
+	// ---- writes ----
+	"create_sales_order":   {"sales", "order", "create"},
+	"create_sales_invoice": {"sales", "invoice", "create"},
+	"create_vendor_bill":   {"purchase", "invoice", "create"},
+	"record_payment":       {"finance", "payment", "create"},
+	"stock_adjust":         {"inventory", "stock", "adjust"},
+	"stock_transfer":       {"inventory", "stock", "transfer"},
+	"create_workflow":      {"workflow", "workflow", "create"},
+	"set_workflow_status":  {"workflow", "workflow", "update"},
+}
+
+// agentToolDenied returns the required permission node (module:resource:action)
+// if the caller may NOT run the named tool, or "" if allowed. Fails closed when
+// a checker is present and denies; allows only when the tool is ungated in the
+// ERP or no checker is configured (dev/test).
+func (h *Handler) agentToolDenied(c *gin.Context, name string) string {
+	p, ok := toolPerms[name]
+	if !ok {
+		return "" // ungated ERP route → available to any tenant user
+	}
+	if h.perm == nil || h.perm.Can(c, p[0], p[1], p[2]) {
+		return ""
+	}
+	return fmt.Sprintf("%s:%s:%s", p[0], p[1], p[2])
+}
+
 func (h *Handler) agentSystemPrompt(c *gin.Context) string {
 	return `You are the Genix ERP Agent — an assistant embedded INSIDE the Genix ERP, working for THIS specific company and its currently active organization. You call TOOLS to read the company's real data and to carry out work.
 
@@ -267,6 +358,7 @@ How to work:
 - Before ANY write, resolve names to real records with a find_/list_ tool first (e.g. find the customer and each product), so the action targets the right ids.
 - When the user asks you to DO something (create, record, adjust, transfer), actually CALL the write tool with precise arguments — do not merely describe it. The system then shows the user a confirmation card; on approval it runs and you continue. State clearly what you are about to do.
 - Writes you create are DRAFTS: tell the user to review and confirm them in the app to post the accounting/inventory effects.
+- You act with the SAME permissions as the user. A tool may return a "permission denied" error — if so, briefly tell the user they don't have access to that area; do NOT retry it or try another tool to get around it.
 - Only handle THIS company's ERP work; politely decline unrelated requests.
 - Reply in the SAME language as the user (Uzbek, Russian, or English). Be concise; use short markdown and tables for lists.
 - Money is in so'm unless a currency is given. Today's data is whatever the tools return.`
