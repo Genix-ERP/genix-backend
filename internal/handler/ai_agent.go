@@ -7,12 +7,17 @@ package handler
 // automatically inside the reasoning loop (the model can chain them:
 // find_contacts -> list_sales_orders -> financial_summary). WRITE tools are
 // never executed inside the loop: when the model asks for one, the loop stops
-// and returns a `confirmation_required` payload; the client shows it and, only
-// on explicit user approval, calls POST /ai/agent/execute to run that single
-// action. This keeps a misunderstanding from writing straight to the DB.
+// and returns a `confirmation_required` payload together with the resumable
+// conversation history. The client shows the confirmation card and, only on
+// explicit user approval, re-calls POST /ai/agent with that history + an
+// `approved` action. The handler executes the single write, feeds the result
+// back to the model, and lets it continue reasoning (e.g. confirm + suggest a
+// next step). This keeps a misunderstanding from writing straight to the DB
+// while still giving one continuous agentic conversation.
 //
-// Phase 1 ships the framework + read tools + create_contact (a safe write to
-// prove the confirm flow). Adding more write tools = one entry in agentTools().
+// Adding a capability = one entry in agentTools(): read tools are pure SELECTs;
+// write tools set mutating:true and go through the confirm-then-continue flow.
+// (POST /ai/agent/execute remains as a stateless single-shot executor.)
 
 import (
 	"context"
@@ -70,11 +75,15 @@ func (h *Handler) AIAgentChat(c *gin.Context) {
 	}
 
 	var req struct {
-		Message string          `json:"message"`
-		History []aipkg.Message `json:"history"`
+		Message  string          `json:"message"`
+		History  []aipkg.Message `json:"history"`
+		Approved *struct {
+			Tool string                 `json:"tool"`
+			Args map[string]interface{} `json:"args"`
+		} `json:"approved"` // a write the user just confirmed — execute then continue
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Message) == "" {
-		response.BadRequest(c, "message is required")
+	if err := c.ShouldBindJSON(&req); err != nil || (req.Approved == nil && strings.TrimSpace(req.Message) == "") {
+		response.BadRequest(c, "message or approved action is required")
 		return
 	}
 
@@ -92,15 +101,38 @@ func (h *Handler) AIAgentChat(c *gin.Context) {
 		}})
 	}
 
-	// Build the running message list: system + prior history + new user turn.
+	// Build the running message list: system + prior history + the new turn.
 	msgs := []aipkg.Message{{Role: "system", Content: h.agentSystemPrompt(c)}}
 	msgs = append(msgs, req.History...)
-	msgs = append(msgs, aipkg.Message{Role: "user", Content: req.Message})
+
+	steps := make([]gin.H, 0) // trace of tool calls, surfaced to the UI
+
+	if req.Approved != nil {
+		// The user approved a write in the confirmation card — execute it now,
+		// then let the model continue reasoning from the result.
+		tool := findTool(tools, req.Approved.Tool)
+		if tool == nil || !tool.mutating {
+			response.BadRequest(c, "Unknown or non-executable action")
+			return
+		}
+		result, execErr := tool.exec(h, c, tenantID, orgArg, userID, req.Approved.Args)
+		var note string
+		if execErr != nil {
+			note = fmt.Sprintf("[system: the approved action %q FAILED: %s. Explain this to the user.]", req.Approved.Tool, execErr.Error())
+			steps = append(steps, gin.H{"tool": req.Approved.Tool, "args": req.Approved.Args, "ok": false, "executed": true})
+		} else {
+			b, _ := json.Marshal(result)
+			note = fmt.Sprintf("[system: the user approved and you executed %q. Result: %s. Confirm it briefly and ask if anything else is needed.]", req.Approved.Tool, string(b))
+			steps = append(steps, gin.H{"tool": req.Approved.Tool, "args": req.Approved.Args, "ok": true, "executed": true})
+		}
+		msgs = append(msgs, aipkg.Message{Role: "user", Content: note})
+	} else {
+		msgs = append(msgs, aipkg.Message{Role: "user", Content: req.Message})
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), h.config.AI.RequestTimeout)
 	defer cancel()
 
-	steps := make([]gin.H, 0) // trace of tool calls, surfaced to the UI
 	for i := 0; i < agentMaxIterations; i++ {
 		if err := svc.rateLimiter.Wait(ctx); err != nil {
 			response.TooManyRequests(c, "Rate limit exceeded")
@@ -123,7 +155,13 @@ func (h *Handler) AIAgentChat(c *gin.Context) {
 			return
 		}
 
-		// Record the assistant's tool-call turn in the history.
+		// preTurn = history up to (excluding) this assistant tool-call turn. If we
+		// hit a write we return THIS as the resumable history, so it never carries
+		// a dangling tool_call the API would reject on resume.
+		preTurn := make([]aipkg.Message, len(msgs[1:]))
+		copy(preTurn, msgs[1:])
+
+		// Record the assistant's tool-call turn in the running list.
 		msgs = append(msgs, aipkg.Message{Role: "assistant", Content: resp.Message.Content, ToolCalls: resp.ToolCalls})
 
 		for _, tc := range resp.ToolCalls {
@@ -136,7 +174,8 @@ func (h *Handler) AIAgentChat(c *gin.Context) {
 				continue
 			}
 
-			// WRITE tool → stop and ask the user to confirm.
+			// WRITE tool → stop and ask the user to confirm. On approval the client
+			// resends `preTurn` as history + the approved action.
 			if tool.mutating {
 				response.Success(c, gin.H{
 					"type": "confirmation_required",
@@ -147,6 +186,7 @@ func (h *Handler) AIAgentChat(c *gin.Context) {
 					},
 					"assistant_note": resp.Message.Content,
 					"steps":          steps,
+					"history":        preTurn,
 				})
 				return
 			}
@@ -218,6 +258,7 @@ func (h *Handler) agentSystemPrompt(c *gin.Context) string {
 
 Rules:
 - ALWAYS use tools to get real data; never invent numbers, names, ids, or stock levels. If a tool returns nothing, say so.
+- Call ONE tool per step and wait for its result before the next.
 - Chain read tools as needed (e.g. find the customer, then list their orders).
 - For any action that CHANGES data, call the matching write tool with precise arguments; the system will pause and ask the user to confirm before it runs — so state clearly what you're about to do.
 - Only answer questions about THIS company's ERP (sales, purchases, inventory, finance, manufacturing, customers/vendors). Politely decline unrelated requests.
