@@ -230,6 +230,16 @@ func summariseAction(tool string, args map[string]interface{}) string {
 	switch tool {
 	case "create_contact":
 		return fmt.Sprintf("Create a new %v named %q", args["type"], args["name"])
+	case "create_sales_order":
+		return fmt.Sprintf("Create a DRAFT sales order for %v", args["customer"])
+	case "record_payment":
+		return fmt.Sprintf("Record a DRAFT %v payment of %v for %v", args["direction"], args["amount"], args["contact"])
+	case "create_sales_invoice":
+		return fmt.Sprintf("Create a DRAFT sales invoice for %v", args["customer"])
+	case "stock_adjust":
+		return fmt.Sprintf("Set %v stock in %v to %v", args["product"], args["warehouse"], args["new_quantity"])
+	case "stock_transfer":
+		return fmt.Sprintf("Transfer %v %v from %v to %v", args["quantity"], args["product"], args["from_warehouse"], args["to_warehouse"])
 	}
 	return "Run " + tool
 }
