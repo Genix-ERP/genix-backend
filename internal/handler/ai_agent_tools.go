@@ -229,6 +229,60 @@ func agentTools() []agentTool {
 			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 10, max 50).")}),
 			exec:        toolListPayrollPeriods,
 		},
+		{
+			name:        "list_boms",
+			description: "List bills of materials / manufacturing recipes (code, name, finished product, version, type, output quantity, default/active). Use for 'what BOMs exist', 'recipe for X'.",
+			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 15, max 50).")}),
+			exec:        toolListBOMs,
+		},
+		{
+			name:        "get_bom",
+			description: "Full detail of ONE bill of materials (by code or product name), including every component line (component, quantity, unit, scrap %). Use to see what a product is made of.",
+			parameters:  obj(map[string]interface{}{"bom": str("BOM code, BOM name, or the finished product's name.")}, "bom"),
+			exec:        toolGetBOM,
+		},
+		{
+			name:        "list_work_orders",
+			description: "Manufacturing work orders / shop-floor tasks (number, name, work center, status, qty to produce vs produced, progress %). Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListWorkOrders,
+		},
+		{
+			name:        "list_stock_counts",
+			description: "Inventory stock counts / audits (count number, date, warehouse, type, status, total variance value). Use for 'recent stock counts', 'inventory audit results'.",
+			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListStockCounts,
+		},
+		{
+			name:        "list_goods_receipts",
+			description: "Goods receipts (incoming deliveries against POs): GR number, PO, supplier, warehouse, status, quality status, quantity, date. Use for 'what came in', 'recent deliveries'.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListGoodsReceipts,
+		},
+		{
+			name:        "list_purchase_requisitions",
+			description: "Internal purchase requisitions (PR number, dates, department, priority, status, total, purpose). Use for 'pending purchase requests'. Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListPurchaseRequisitions,
+		},
+		{
+			name:        "list_rfqs",
+			description: "Requests for quotation to vendors (RFQ number, title, status, deadline). Use for 'open RFQs', 'sourcing requests'. Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListRFQs,
+		},
+		{
+			name:        "list_sales_returns",
+			description: "Customer sales returns (return number, customer, date, status, refund status, total, reason). Use for 'recent returns from customers'. Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListSalesReturns,
+		},
+		{
+			name:        "list_purchase_returns",
+			description: "Returns to vendors (return number, supplier, date, status, credit/total value, reason). Use for 'returns to suppliers'. Optional status filter.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			exec:        toolListPurchaseReturns,
+		},
 		// ---- write tools (confirmation required) ----
 		{
 			name:        "create_contact",
@@ -1664,5 +1718,231 @@ func toolListPayrollPeriods(h *Handler, c *gin.Context, tenantID uuid.UUID, orgA
 		}
 		return gin.H{"period_code": code, "period_name": name, "start_date": start, "end_date": end,
 			"pay_date": pay, "status": st, "employee_count": cnt, "total_gross": gross, "total_net": net}, true
+	})
+}
+
+// ---- operations read execs (manufacturing, inventory ops, procurement) ------
+
+func toolListBOMs(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 15, 50)
+	rows, err := h.db.Query(fmt.Sprintf(`
+		SELECT COALESCE(b.code,''), COALESCE(b.name,''), COALESCE(p.name,''), COALESCE(b.version::text,''),
+		       COALESCE(b.bom_type,''), COALESCE(b.quantity,0), COALESCE(b.is_default,false), COALESCE(b.is_active,true)
+		FROM product_boms b LEFT JOIN products p ON p.id=b.product_id
+		WHERE b.tenant_id=$1 AND b.deleted_at IS NULL AND ($2::uuid IS NULL OR b.organization_id=$2)
+		ORDER BY b.created_at DESC NULLS LAST LIMIT %d`, limit), tenantID, orgArg)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var code, name, prod, ver, btype string
+		var qty float64
+		var isDefault, isActive bool
+		if r.Scan(&code, &name, &prod, &ver, &btype, &qty, &isDefault, &isActive) != nil {
+			return nil, false
+		}
+		return gin.H{"code": code, "name": name, "product": prod, "version": ver, "type": btype,
+			"output_quantity": qty, "is_default": isDefault, "is_active": isActive}, true
+	})
+}
+
+func toolGetBOM(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	q := argStr(args, "bom")
+	if q == "" {
+		return nil, fmt.Errorf("bom (code, name or product) is required")
+	}
+	var bomID uuid.UUID
+	var code, name, prod string
+	var qty float64
+	err := h.db.QueryRow(`SELECT b.id, COALESCE(b.code,''), COALESCE(b.name,''), COALESCE(p.name,''), COALESCE(b.quantity,0)
+		FROM product_boms b LEFT JOIN products p ON p.id=b.product_id
+		WHERE b.tenant_id=$1 AND b.deleted_at IS NULL AND ($3::uuid IS NULL OR b.organization_id=$3)
+		  AND (b.code ILIKE '%'||$2||'%' OR b.name ILIKE '%'||$2||'%' OR p.name ILIKE '%'||$2||'%')
+		ORDER BY b.is_default DESC NULLS LAST LIMIT 1`, tenantID, q, orgArg).Scan(&bomID, &code, &name, &prod, &qty)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("no BOM found matching %q", q)
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := h.db.Query(`SELECT COALESCE(cp.name,''), COALESCE(l.quantity,0),
+		COALESCE(l.unit_of_measure,''), COALESCE(l.scrap_percent,0)
+		FROM bom_lines l LEFT JOIN products cp ON cp.id=l.component_id
+		WHERE l.bom_id=$1 ORDER BY l.line_number ASC NULLS LAST`, bomID)
+	comps, lerr := rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var cname, uom string
+		var cqty, scrap float64
+		if r.Scan(&cname, &cqty, &uom, &scrap) != nil {
+			return nil, false
+		}
+		return gin.H{"component": cname, "quantity": cqty, "unit": uom, "scrap_percent": scrap}, true
+	})
+	if lerr != nil {
+		return nil, lerr
+	}
+	return gin.H{"code": code, "name": name, "product": prod, "output_quantity": qty, "components": comps}, nil
+}
+
+func toolListWorkOrders(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(w.work_order_number,''), COALESCE(w.name,''), COALESCE(w.work_center_name,''),
+	               COALESCE(w.status,''), COALESCE(w.quantity_to_produce,0), COALESCE(w.quantity_produced,0),
+	               COALESCE(w.progress_percent,0)::float8, w.scheduled_start
+	        FROM work_orders w WHERE w.tenant_id=$1 AND w.deleted_at IS NULL AND ($2::uuid IS NULL OR w.organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND w.status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY w.created_at DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, name, wc, st string
+		var toProduce, produced, progress float64
+		var sched interface{}
+		if r.Scan(&num, &name, &wc, &st, &toProduce, &produced, &progress, &sched) != nil {
+			return nil, false
+		}
+		return gin.H{"work_order_number": num, "name": name, "work_center": wc, "status": st,
+			"quantity_to_produce": toProduce, "quantity_produced": produced, "progress_percent": progress, "scheduled_start": sched}, true
+	})
+}
+
+func toolListStockCounts(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	// stock_counts has no deleted_at column.
+	rows, err := h.db.Query(fmt.Sprintf(`
+		SELECT COALESCE(sc.count_number,''), sc.count_date, COALESCE(w.name,''), COALESCE(sc.count_type,''),
+		       COALESCE(sc.status,''), COALESCE(sc.total_variance_value,0)
+		FROM stock_counts sc LEFT JOIN warehouses w ON w.id=sc.warehouse_id
+		WHERE sc.tenant_id=$1 AND ($2::uuid IS NULL OR sc.organization_id=$2)
+		ORDER BY sc.count_date DESC NULLS LAST LIMIT %d`, limit), tenantID, orgArg)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, wh, ctype, st string
+		var variance float64
+		var dt interface{}
+		if r.Scan(&num, &dt, &wh, &ctype, &st, &variance) != nil {
+			return nil, false
+		}
+		return gin.H{"count_number": num, "date": dt, "warehouse": wh, "type": ctype, "status": st, "variance_value": variance}, true
+	})
+}
+
+func toolListGoodsReceipts(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(gr_number,''), COALESCE(po_number,''), COALESCE(supplier_name,''), COALESCE(warehouse_name,''),
+	               COALESCE(status,''), COALESCE(quality_status,''), COALESCE(total_quantity,0), receipt_date
+	        FROM goods_receipts WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY receipt_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, po, sup, wh, st, qual string
+		var qty float64
+		var dt interface{}
+		if r.Scan(&num, &po, &sup, &wh, &st, &qual, &qty, &dt) != nil {
+			return nil, false
+		}
+		return gin.H{"gr_number": num, "po_number": po, "supplier": sup, "warehouse": wh,
+			"status": st, "quality_status": qual, "quantity": qty, "date": dt}, true
+	})
+}
+
+func toolListPurchaseRequisitions(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(pr_number,''), request_date, required_date, COALESCE(department,''),
+	               COALESCE(priority,''), COALESCE(status,''), COALESCE(total_amount,0), COALESCE(purpose,'')
+	        FROM purchase_requisitions WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY request_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, dept, prio, st, purpose string
+		var total float64
+		var req, need interface{}
+		if r.Scan(&num, &req, &need, &dept, &prio, &st, &total, &purpose) != nil {
+			return nil, false
+		}
+		return gin.H{"pr_number": num, "request_date": req, "required_date": need, "department": dept,
+			"priority": prio, "status": st, "total": total, "purpose": purpose}, true
+	})
+}
+
+func toolListRFQs(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(rfq_number,''), COALESCE(title,''), COALESCE(status,''), deadline
+	        FROM rfqs WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY created_at DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, title, st string
+		var deadline interface{}
+		if r.Scan(&num, &title, &st, &deadline) != nil {
+			return nil, false
+		}
+		return gin.H{"rfq_number": num, "title": title, "status": st, "deadline": deadline}, true
+	})
+}
+
+func toolListSalesReturns(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(return_number,''), COALESCE(customer_name,''), return_date, COALESCE(status,''),
+	               COALESCE(refund_status,''), COALESCE(total_amount,0), COALESCE(reason,'')
+	        FROM sales_returns WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY return_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, cust, st, refund, reason string
+		var total float64
+		var dt interface{}
+		if r.Scan(&num, &cust, &dt, &st, &refund, &total, &reason) != nil {
+			return nil, false
+		}
+		return gin.H{"return_number": num, "customer": cust, "date": dt, "status": st,
+			"refund_status": refund, "total": total, "reason": reason}, true
+	})
+}
+
+func toolListPurchaseReturns(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 10, 50)
+	status := argStr(args, "status")
+	qry := `SELECT COALESCE(return_number,''), COALESCE(supplier_name,''), return_date, COALESCE(status,''),
+	               COALESCE(total_value,0), COALESCE(return_reason,'')
+	        FROM purchase_returns WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
+	if status != "" {
+		qry += " AND status=$3"
+		qa = append(qa, status)
+	}
+	qry += fmt.Sprintf(" ORDER BY return_date DESC NULLS LAST LIMIT %d", limit)
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var num, sup, st, reason string
+		var total float64
+		var dt interface{}
+		if r.Scan(&num, &sup, &dt, &st, &total, &reason) != nil {
+			return nil, false
+		}
+		return gin.H{"return_number": num, "supplier": sup, "date": dt, "status": st, "credit_value": total, "reason": reason}, true
 	})
 }
