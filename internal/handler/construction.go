@@ -6660,16 +6660,18 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 		return
 	}
 
-	// The project's currently-open Forma 2 iteration. We seed period_fakt
+	// The TARGET block's currently-open Forma 2 iteration. We seed period_fakt
 	// rows for the cloned lines into it so the Bosqichlar BAJARILDI input
 	// shows the carried-over progress (that input reads the open iteration's
 	// period_fakt; the progress bar/status read done_quantity on the line).
+	// Iterations are per-block (migration 451), so the cloned lines (which live
+	// on targetBuildingID) must seed that block's iteration — not the project's.
 	var openIterID sql.NullInt64
 	_ = tx.QueryRow(`
 		SELECT id FROM construction_form2_iteration
-		WHERE project_id = $1 AND tenant_id = $2 AND status = 'open'
+		WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3 AND status = 'open'
 		LIMIT 1
-	`, projectID, tenantID).Scan(&openIterID)
+	`, projectID, tenantID, targetBuildingID).Scan(&openIterID)
 
 	// 2. For each source estimate, create a fresh estimate row on the
 	//    target building, then clone all of its lines. is_current is

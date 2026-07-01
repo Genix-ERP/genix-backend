@@ -46,6 +46,7 @@ type Form2Iteration struct {
 	ID           int64      `json:"id"`
 	TenantID     uuid.UUID  `json:"tenant_id"`
 	ProjectID    int64      `json:"project_id"`
+	BuildingID   int64      `json:"building_id"`
 	IterationSeq int        `json:"iteration_seq"`
 	Status       string     `json:"status"`
 	SnapshotID   *int64     `json:"snapshot_id,omitempty"`
@@ -78,13 +79,24 @@ func (h *Handler) ListForm2Iterations(c *gin.Context) {
 		return
 	}
 
+	// Per-block strip (migration 451): filter to the block the frontend is
+	// viewing. building_id=0 is the whole-project/unassigned bucket. When the
+	// param is absent we default to 0 so old callers keep getting a coherent
+	// (single-block) strip rather than a mix of every block's iterations.
+	buildingID := int64(0)
+	if raw := c.Query("building_id"); raw != "" {
+		if v, perr := strconv.ParseInt(raw, 10, 64); perr == nil {
+			buildingID = v
+		}
+	}
+
 	rows, err := h.db.Query(`
-		SELECT id, tenant_id, project_id, iteration_seq, status,
+		SELECT id, tenant_id, project_id, building_id, iteration_seq, status,
 		       snapshot_id, opened_at, opened_by, frozen_at, frozen_by
 		FROM construction_form2_iteration
-		WHERE project_id = $1 AND tenant_id = $2
+		WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3
 		ORDER BY iteration_seq ASC
-	`, projectID, tenantID)
+	`, projectID, tenantID, buildingID)
 	if err != nil {
 		h.log.Error("Failed to list form2 iterations", "error", err, "project_id", projectID)
 		response.InternalError(c, "Failed to list iterations")
@@ -96,7 +108,7 @@ func (h *Handler) ListForm2Iterations(c *gin.Context) {
 	for rows.Next() {
 		var it Form2Iteration
 		if scanErr := rows.Scan(
-			&it.ID, &it.TenantID, &it.ProjectID, &it.IterationSeq, &it.Status,
+			&it.ID, &it.TenantID, &it.ProjectID, &it.BuildingID, &it.IterationSeq, &it.Status,
 			&it.SnapshotID, &it.OpenedAt, &it.OpenedBy, &it.FrozenAt, &it.FrozenBy,
 		); scanErr != nil {
 			h.log.Error("Failed to scan form2 iteration", "error", scanErr)
@@ -229,6 +241,11 @@ type CreateForm2IterationInput struct {
 	// through.
 	EstimateID int64 `json:"estimate_id"`
 
+	// The block this freeze belongs to. Since migration 451 iterations are
+	// per-block. When omitted we derive it from EstimateID's building (or 0 =
+	// whole-project bucket), so legacy single-estimate callers keep working.
+	BuildingID *int64 `json:"building_id"`
+
 	// Snapshot fields, mirror CreateForm2SnapshotInput.
 	PeriodFrom        *string         `json:"period_from"`
 	PeriodTo          *string         `json:"period_to"`
@@ -295,6 +312,16 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 		// The body is optional — an empty POST is "just freeze and
 		// open next", which is a valid use case. Treat parse failure
 		// on an empty body as an empty body.
+		//
+		// WARNING: a NON-empty but mistyped body (e.g. estimate_id sent as a
+		// JSON string instead of a number) also lands here and silently drops
+		// snapshot_data/estimate_id/building_id — which previously saved empty
+		// snapshots against the wrong block. Log it so that class of bug is
+		// visible instead of vanishing.
+		if err.Error() != "EOF" {
+			h.log.Warn("CreateForm2Iteration: request body failed to bind — snapshot fields dropped",
+				"error", err, "project_id", projectID)
+		}
 		in = CreateForm2IterationInput{}
 	}
 
@@ -318,6 +345,20 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 		createdByVal = userID
 	}
 
+	// Resolve which block this freeze belongs to (migration 451: per-block
+	// iterations). Priority: explicit building_id → the estimate's building →
+	// 0 (whole-project bucket). Deriving from the estimate keeps legacy callers
+	// that only send estimate_id working.
+	buildingID := int64(0)
+	if in.BuildingID != nil {
+		buildingID = *in.BuildingID
+	} else if in.EstimateID > 0 {
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(building_id, 0) FROM construction_estimate
+			WHERE id = $1 AND tenant_id = $2
+		`, in.EstimateID, tenantID).Scan(&buildingID)
+	}
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		h.log.Error("Failed to open freeze tx", "error", err)
@@ -337,26 +378,26 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 	if err := tx.QueryRow(`
 		SELECT id, iteration_seq
 		FROM construction_form2_iteration
-		WHERE project_id = $1 AND tenant_id = $2 AND status = 'open'
+		WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3 AND status = 'open'
 		FOR UPDATE
-	`, projectID, tenantID).Scan(&openIterID, &openIterSeq); err != nil {
+	`, projectID, tenantID, buildingID).Scan(&openIterID, &openIterSeq); err != nil {
 		if err == sql.ErrNoRows {
-			// No open iteration — shouldn't happen post-backfill, but
-			// be defensive. Create iteration #1 as 'open' so the next
+			// No open iteration for this block — shouldn't happen post-backfill,
+			// but be defensive. Create iteration #1 as 'open' so the next
 			// caller can freeze it.
 			seq := 1
 			var newID int64
 			if insertErr := tx.QueryRow(`
 				INSERT INTO construction_form2_iteration
-				    (tenant_id, project_id, iteration_seq, status, opened_at, opened_by)
-				VALUES ($1, $2, $3, 'open', NOW(), $4)
+				    (tenant_id, project_id, building_id, iteration_seq, status, opened_at, opened_by)
+				VALUES ($1, $2, $3, $4, 'open', NOW(), $5)
 				RETURNING id
-			`, tenantID, projectID, seq, createdByVal).Scan(&newID); insertErr != nil {
+			`, tenantID, projectID, buildingID, seq, createdByVal).Scan(&newID); insertErr != nil {
 				h.log.Error("Failed to seed open iteration", "error", insertErr)
 				response.InternalError(c, "Failed to freeze iteration")
 				return
 			}
-			if err := h.bootstrapIterationLines(tx, projectID, newID); err != nil {
+			if err := h.bootstrapIterationLines(tx, projectID, buildingID, newID); err != nil {
 				h.log.Error("Failed to bootstrap iteration lines", "error", err)
 				response.InternalError(c, "Failed to freeze iteration")
 				return
@@ -385,7 +426,7 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 	// this iteration was opened. This guarantees the freeze locks subcontractor
 	// works too, even those that never received FAKT this period. Idempotent
 	// (ON CONFLICT DO NOTHING), so existing period_fakt values are untouched.
-	if err := h.bootstrapIterationLines(tx, projectID, openIterID); err != nil {
+	if err := h.bootstrapIterationLines(tx, projectID, buildingID, openIterID); err != nil {
 		h.log.Error("Failed to backfill open iteration before freeze", "error", err)
 		response.InternalError(c, "Failed to freeze iteration")
 		return
@@ -393,18 +434,19 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 
 	// 2. Resolve estimate_id for the snapshot row. The snapshot table
 	// is per-estimate (migration 351), so we have to pick one. Caller
-	// can pin it explicitly; otherwise default to the project's first
-	// estimate (legacy single-estimate setup).
+	// can pin it explicitly; otherwise default to the FIRST estimate OF THIS
+	// BLOCK (migration 451) — never the project's first estimate, which was
+	// the bug that recorded a Block 4 freeze under Block 2.
 	var estimateID int64
 	if in.EstimateID > 0 {
 		estimateID = in.EstimateID
 	} else {
 		if err := tx.QueryRow(`
 			SELECT id FROM construction_estimate
-			WHERE project_id = $1 AND tenant_id = $2
+			WHERE project_id = $1 AND tenant_id = $2 AND COALESCE(building_id, 0) = $3
 			ORDER BY id ASC
 			LIMIT 1
-		`, projectID, tenantID).Scan(&estimateID); err != nil {
+		`, projectID, tenantID, buildingID).Scan(&estimateID); err != nil {
 			h.log.Error("Failed to resolve estimate for snapshot", "error", err, "project_id", projectID)
 			response.InternalError(c, "Failed to freeze iteration: no estimate in this project")
 			return
@@ -460,10 +502,10 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 	var newIterID int64
 	if err := tx.QueryRow(`
 		INSERT INTO construction_form2_iteration
-		    (tenant_id, project_id, iteration_seq, status, opened_at, opened_by)
-		VALUES ($1, $2, $3, 'open', NOW(), $4)
+		    (tenant_id, project_id, building_id, iteration_seq, status, opened_at, opened_by)
+		VALUES ($1, $2, $3, $4, 'open', NOW(), $5)
 		RETURNING id
-	`, tenantID, projectID, newSeq, createdByVal).Scan(&newIterID); err != nil {
+	`, tenantID, projectID, buildingID, newSeq, createdByVal).Scan(&newIterID); err != nil {
 		h.log.Error("Failed to open next iteration", "error", err)
 		response.InternalError(c, "Failed to freeze iteration")
 		return
@@ -474,7 +516,7 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 	// lines already at 100% reja are still included — they'll appear
 	// read-only-ish in the new tab (cumulative bar full) but the
 	// foreman can still see them.
-	if err := h.bootstrapIterationLines(tx, projectID, newIterID); err != nil {
+	if err := h.bootstrapIterationLines(tx, projectID, buildingID, newIterID); err != nil {
 		h.log.Error("Failed to bootstrap new iteration lines", "error", err)
 		response.InternalError(c, "Failed to freeze iteration")
 		return
@@ -571,15 +613,16 @@ func (h *Handler) DeleteForm2Iteration(c *gin.Context) {
 	// 1. Load + lock the target iteration. Must be the OPEN (joriy) one and
 	//    belong to this tenant+project.
 	var (
-		openIterSeq  int
-		targetStatus string
+		openIterSeq    int
+		targetStatus   string
+		targetBuilding int64
 	)
 	if err := tx.QueryRow(`
-		SELECT iteration_seq, status
+		SELECT iteration_seq, status, building_id
 		FROM construction_form2_iteration
 		WHERE id = $1 AND project_id = $2 AND tenant_id = $3
 		FOR UPDATE
-	`, iterID, projectID, tenantID).Scan(&openIterSeq, &targetStatus); err != nil {
+	`, iterID, projectID, tenantID).Scan(&openIterSeq, &targetStatus, &targetBuilding); err != nil {
 		if err == sql.ErrNoRows {
 			response.NotFound(c, "Iteration not found")
 			return
@@ -604,10 +647,10 @@ func (h *Handler) DeleteForm2Iteration(c *gin.Context) {
 	if err := tx.QueryRow(`
 		SELECT id, iteration_seq, snapshot_id
 		FROM construction_form2_iteration
-		WHERE project_id = $1 AND tenant_id = $2 AND status = 'frozen'
-		      AND iteration_seq = $3
+		WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3 AND status = 'frozen'
+		      AND iteration_seq = $4
 		FOR UPDATE
-	`, projectID, tenantID, openIterSeq-1).Scan(&prevIterID, &prevSeq, &snapshotID); err != nil {
+	`, projectID, tenantID, targetBuilding, openIterSeq-1).Scan(&prevIterID, &prevSeq, &snapshotID); err != nil {
 		if err == sql.ErrNoRows {
 			response.BadRequest(c, "No frozen Forma 2 to unfreeze")
 			return
@@ -690,17 +733,23 @@ func (h *Handler) DeleteForm2Iteration(c *gin.Context) {
 }
 
 // bootstrapIterationLines inserts a period_fakt = 0 row for every
-// estimate_line in the project's estimates. Used by CreateForm2Iteration
+// estimate_line in the block's estimates. Used by CreateForm2Iteration
 // (new iteration) and by the defensive "no open iteration" recovery
 // branch. Idempotent via ON CONFLICT.
-func (h *Handler) bootstrapIterationLines(tx *sql.Tx, projectID int64, iterID int64) error {
+//
+// buildingID scopes to one block (sentinel 0 = whole-project/unassigned
+// bucket, i.e. estimates whose building_id is NULL). Since migration 451 the
+// iteration series is per-block, so a freeze on Block 4 must only touch Block
+// 4's lines — never Block 1's.
+func (h *Handler) bootstrapIterationLines(tx *sql.Tx, projectID int64, buildingID int64, iterID int64) error {
 	_, err := tx.Exec(`
 		INSERT INTO construction_form2_iteration_line (iteration_id, estimate_line_id, period_fakt)
 		SELECT $1, el.id, 0
 		FROM construction_estimate          e
 		JOIN construction_estimate_line     el ON el.estimate_id = e.id
 		WHERE e.project_id = $2
+		  AND COALESCE(e.building_id, 0) = $3
 		ON CONFLICT (iteration_id, estimate_line_id) DO NOTHING
-	`, iterID, projectID)
+	`, iterID, projectID, buildingID)
 	return err
 }

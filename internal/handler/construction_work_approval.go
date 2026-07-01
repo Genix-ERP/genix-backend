@@ -352,21 +352,37 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 		periodFakt = 0
 	}
 
-	// Resolve the open iteration for this project. If none exists
+	// Which block does this line belong to? Iterations are per-block
+	// (migration 451), so a FAKT write must land in THIS line's block's open
+	// iteration — not whichever block happens to be open project-wide.
+	// Sentinel 0 = whole-project/unassigned bucket (building_id NULL).
+	var lineBuilding int64
+	if bErr := h.db.QueryRow(`
+		SELECT COALESCE(e.building_id, 0)
+		FROM construction_estimate_line el
+		JOIN construction_estimate      e ON e.id = el.estimate_id
+		WHERE el.id = $1
+	`, lineID).Scan(&lineBuilding); bErr != nil {
+		h.log.Error("Failed to resolve line building for fakt write", "error", bErr, "line_id", lineID)
+		response.InternalError(c, "Failed to update done quantity")
+		return
+	}
+
+	// Resolve the open iteration for this block. If none exists
 	// (shouldn't happen post-backfill, but defence in depth), bootstrap
 	// one so the write doesn't silently no-op.
 	var openIterID int64
 	err = h.db.QueryRow(`
 		SELECT id FROM construction_form2_iteration
-		WHERE project_id = $1 AND tenant_id = $2 AND status = 'open'
-	`, ctx.ProjectID, tenantID).Scan(&openIterID)
+		WHERE project_id = $1 AND tenant_id = $2 AND building_id = $3 AND status = 'open'
+	`, ctx.ProjectID, tenantID, lineBuilding).Scan(&openIterID)
 	if err == sql.ErrNoRows {
 		if insertErr := h.db.QueryRow(`
 			INSERT INTO construction_form2_iteration
-			    (tenant_id, project_id, iteration_seq, status, opened_at, opened_by)
-			VALUES ($1, $2, 1, 'open', NOW(), $3)
+			    (tenant_id, project_id, building_id, iteration_seq, status, opened_at, opened_by)
+			VALUES ($1, $2, $3, 1, 'open', NOW(), $4)
 			RETURNING id
-		`, tenantID, ctx.ProjectID, userID).Scan(&openIterID); insertErr != nil {
+		`, tenantID, ctx.ProjectID, lineBuilding, userID).Scan(&openIterID); insertErr != nil {
 			h.log.Error("Failed to seed open iteration on fakt write", "error", insertErr)
 			response.InternalError(c, "Failed to update done quantity")
 			return
