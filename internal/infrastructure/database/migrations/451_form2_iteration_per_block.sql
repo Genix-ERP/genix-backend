@@ -64,6 +64,12 @@ FROM construction_estimate e
 WHERE EXISTS (
     SELECT 1 FROM construction_estimate_line el WHERE el.estimate_id = e.id
 )
+-- Skip orphaned estimates whose project was deleted: construction_form2_iteration
+-- has a NOT-NULL FK to construction_projects, so seeding a dangling project_id
+-- aborts the whole migration (construction_form2_iteration_project_id_fkey).
+AND EXISTS (
+    SELECT 1 FROM construction_projects p WHERE p.id = e.project_id
+)
 GROUP BY e.tenant_id, e.project_id, COALESCE(e.building_id, 0);
 
 -- ── 5. seed iteration #1 lines with the cumulative done_quantity ──────────
