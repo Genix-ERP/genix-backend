@@ -7,10 +7,35 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/config"
 )
+
+// RequireSecureEndpoint refuses to send data to a non-HTTPS AI endpoint so the
+// tenant's business data is always encrypted in transit (TLS). Plain http is
+// allowed ONLY for localhost (local dev). An empty endpoint means the provider's
+// default, which is always https.
+func RequireSecureEndpoint(endpoint string) error {
+	if endpoint == "" {
+		return nil
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid AI endpoint: %w", err)
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" {
+		switch u.Hostname() {
+		case "localhost", "127.0.0.1", "::1":
+			return nil // local development only
+		}
+	}
+	return fmt.Errorf("refusing to send data to a non-HTTPS AI endpoint (%q): configure an https:// URL so data is encrypted in transit", endpoint)
+}
 
 // Provider represents an AI provider
 type Provider string
@@ -35,31 +60,50 @@ type ChatRequest struct {
 	MaxTokens   int        `json:"max_tokens,omitempty"`
 	Temperature float64    `json:"temperature,omitempty"`
 	Stream      bool       `json:"stream,omitempty"`
-	Functions   []Function `json:"functions,omitempty"`
+	Functions   []Function `json:"functions,omitempty"` // legacy
+	Tools       []Tool     `json:"tools,omitempty"`     // modern function/tool calling
 }
 
-// Message represents a chat message
+// Message represents a chat message. For the agent loop it also carries an
+// assistant's tool_calls (when the model wants to call tools) and, on a tool
+// result message, the tool_call_id it answers.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-	Name    string `json:"name,omitempty"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	Name       string     `json:"name,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
-// Function represents a function that can be called
+// Function represents a callable function's schema.
 type Function struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description"`
 	Parameters  map[string]interface{} `json:"parameters"`
 }
 
+// Tool wraps a Function for the modern "tools" API.
+type Tool struct {
+	Type     string   `json:"type"` // always "function"
+	Function Function `json:"function"`
+}
+
+// ToolCall is one tool invocation the model asked for.
+type ToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"` // "function"
+	Function FunctionCall `json:"function"`
+}
+
 // ChatResponse represents a chat completion response
 type ChatResponse struct {
-	ID           string         `json:"id"`
-	Model        string         `json:"model"`
-	Message      Message        `json:"message"`
-	Usage        Usage          `json:"usage"`
-	FinishReason string         `json:"finish_reason"`
-	FunctionCall *FunctionCall  `json:"function_call,omitempty"`
+	ID           string        `json:"id"`
+	Model        string        `json:"model"`
+	Message      Message       `json:"message"`
+	Usage        Usage         `json:"usage"`
+	FinishReason string        `json:"finish_reason"`
+	FunctionCall *FunctionCall `json:"function_call,omitempty"` // legacy
+	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"`    // modern
 }
 
 // Usage represents token usage
@@ -122,6 +166,9 @@ func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 	if len(req.Functions) > 0 {
 		openaiReq["functions"] = req.Functions
 	}
+	if len(req.Tools) > 0 {
+		openaiReq["tools"] = req.Tools
+	}
 
 	body, err := json.Marshal(openaiReq)
 	if err != nil {
@@ -131,6 +178,9 @@ func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 	endpoint := c.config.Endpoint
 	if endpoint == "" {
 		endpoint = "https://api.openai.com/v1/chat/completions"
+	}
+	if err := RequireSecureEndpoint(endpoint); err != nil {
+		return nil, err
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
@@ -156,9 +206,8 @@ func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 		ID      string `json:"id"`
 		Model   string `json:"model"`
 		Choices []struct {
-			Message      Message       `json:"message"`
-			FinishReason string        `json:"finish_reason"`
-			FunctionCall *FunctionCall `json:"function_call,omitempty"`
+			Message      Message `json:"message"`
+			FinishReason string  `json:"finish_reason"`
 		} `json:"choices"`
 		Usage Usage `json:"usage"`
 	}
@@ -178,7 +227,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 		Message:      choice.Message,
 		Usage:        openaiResp.Usage,
 		FinishReason: choice.FinishReason,
-		FunctionCall: choice.FunctionCall,
+		ToolCalls:    choice.Message.ToolCalls, // tool_calls live inside message
 	}, nil
 }
 
@@ -270,6 +319,9 @@ func (c *AnthropicClient) Chat(ctx context.Context, req *ChatRequest) (*ChatResp
 	endpoint := c.config.Endpoint
 	if endpoint == "" {
 		endpoint = "https://api.anthropic.com/v1/messages"
+	}
+	if err := RequireSecureEndpoint(endpoint); err != nil {
+		return nil, err
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
