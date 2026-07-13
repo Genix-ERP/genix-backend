@@ -18,6 +18,7 @@ package handler
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"strconv"
@@ -31,6 +32,20 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 )
 
+// parseMoney parses an amount from a 1C export, tolerating thousands
+// separators (regular space, non-breaking space, narrow no-break space) and a
+// comma decimal separator. The old code only swapped "," for "." so values
+// like "1 234,56" failed to parse and were silently saved as 0.
+func parseMoney(val string) (float64, error) {
+	r := strings.NewReplacer(
+		" ", "",
+		" ", "", // non-breaking space
+		" ", "", // narrow no-break space
+		",", ".",
+	)
+	return strconv.ParseFloat(r.Replace(strings.TrimSpace(val)), 64)
+}
+
 type parsedBankTxn struct {
 	LineNumber          int
 	DocNumber           string
@@ -43,6 +58,13 @@ type parsedBankTxn struct {
 	Amount              float64
 	Direction           string // in | out
 	Purpose             string
+
+	// Raw payer/recipient parties. Direction and the counterparty are resolved
+	// from these at end-of-document by matching against our own account, so
+	// that our own INN/account is never mistaken for the counterparty's.
+	payerName, payerINN, payerAccount             string
+	recipientName, recipientINN, recipientAccount string
+	payerBank, payerBIC, recipientBank, recipientBIC string
 }
 
 type bankImportResponse struct {
@@ -86,6 +108,24 @@ func (h *Handler) ImportBankStatement1C(c *gin.Context) {
 
 	parsed, meta, warnings := parseBankClientTxt(string(content))
 
+	// Duplicate-statement guard: reject a re-upload of the same file (same
+	// content hash for this tenant) instead of doubling every transaction.
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(content))
+	var existingImportID uuid.UUID
+	if err := h.db.QueryRow(
+		`SELECT id FROM bank_statement_imports WHERE tenant_id = $1 AND content_hash = $2 ORDER BY created_at DESC LIMIT 1`,
+		tenantID, contentHash,
+	).Scan(&existingImportID); err == nil {
+		response.Success(c, bankImportResponse{
+			ImportID:         existingImportID,
+			OpeningBalance:   meta.OpeningBalance,
+			ClosingBalance:   meta.ClosingBalance,
+			Warnings:         append(warnings, "Bu fayl allaqachon import qilingan (dublikat). Mavjud import qaytarildi."),
+			TransactionCount: len(parsed),
+		})
+		return
+	}
+
 	importID := uuid.New()
 	now := time.Now()
 
@@ -111,12 +151,12 @@ func (h *Handler) ImportBankStatement1C(c *gin.Context) {
 			id, tenant_id, organization_id, format, file_name, file_size, raw_content,
 			statement_date, opening_balance, closing_balance,
 			total_credit, total_debit, transaction_count,
-			status, imported_by, imported_at, created_at
-		) VALUES ($1, $2, $3, '1c_txt', $4, $5, $6, $7, $8, $9, $10, $11, $12, 'imported', $13, $14, $14)
+			status, imported_by, imported_at, created_at, content_hash
+		) VALUES ($1, $2, $3, '1c_txt', $4, $5, $6, $7, $8, $9, $10, $11, $12, 'imported', $13, $14, $14, $15)
 	`, importID, tenantID, orgPtr, fileHeader.Filename, len(content), raw,
 		stmtDate, meta.OpeningBalance, meta.ClosingBalance,
 		meta.TotalCredit, meta.TotalDebit, len(parsed),
-		userID, now)
+		userID, now, contentHash)
 	if err != nil {
 		h.log.Error("ImportBankStatement: insert import failed", "error", err)
 		response.InternalError(c, "Failed to save import")
@@ -303,22 +343,43 @@ func parseBankClientTxt(content string) ([]parsedBankTxn, bankStatementMeta, []s
 				continue
 			}
 			inDoc = false
-			// Decide direction by comparing accounts to myAccount
-			if myAccount != "" {
-				if cur.CounterpartyAccount == myAccount || cur.CounterpartyAccount == "" {
-					// Our account on receive side → money IN
-					// heuristic: if we are the payer, direction=out, else in
-				}
-			}
-			if cur.Direction == "" {
-				// Best-effort: if purpose starts with "Оплата" / "To'lov" we sent, else received
+
+			// Resolve direction and counterparty by matching our own account.
+			// If we are the payer → money OUT, counterparty is the recipient.
+			// If we are the recipient → money IN, counterparty is the payer.
+			switch {
+			case myAccount != "" && cur.payerAccount == myAccount:
+				cur.Direction = "out"
+				cur.CounterpartyName = cur.recipientName
+				cur.CounterpartyINN = cur.recipientINN
+				cur.CounterpartyAccount = cur.recipientAccount
+				cur.BankName = cur.recipientBank
+				cur.BankBIC = cur.recipientBIC
+			case myAccount != "" && cur.recipientAccount == myAccount:
+				cur.Direction = "in"
+				cur.CounterpartyName = cur.payerName
+				cur.CounterpartyINN = cur.payerINN
+				cur.CounterpartyAccount = cur.payerAccount
+				cur.BankName = cur.payerBank
+				cur.BankBIC = cur.payerBIC
+			default:
+				// Neither side matched our account (or we don't know it):
+				// fall back to the purpose text, and pick the counterparty as
+				// the opposite party to the inferred direction.
 				if strings.HasPrefix(strings.ToLower(cur.Purpose), "оплата") ||
 					strings.HasPrefix(strings.ToLower(cur.Purpose), "to'lov") {
 					cur.Direction = "out"
+					cur.CounterpartyName = cur.recipientName
+					cur.CounterpartyINN = cur.recipientINN
+					cur.CounterpartyAccount = cur.recipientAccount
 				} else {
 					cur.Direction = "in"
+					cur.CounterpartyName = cur.payerName
+					cur.CounterpartyINN = cur.payerINN
+					cur.CounterpartyAccount = cur.payerAccount
 				}
 			}
+
 			if cur.Direction == "in" {
 				meta.TotalCredit += cur.Amount
 			} else {
@@ -334,11 +395,11 @@ func parseBankClientTxt(content string) ([]parsedBankTxn, bankStatementMeta, []s
 					meta.StatementDate = t
 				}
 			case "НачальныйОстаток":
-				if v, err := strconv.ParseFloat(strings.ReplaceAll(val, ",", "."), 64); err == nil {
+				if v, err := parseMoney(val); err == nil {
 					meta.OpeningBalance = v
 				}
 			case "КонечныйОстаток":
-				if v, err := strconv.ParseFloat(strings.ReplaceAll(val, ",", "."), 64); err == nil {
+				if v, err := parseMoney(val); err == nil {
 					meta.ClosingBalance = v
 				}
 			case "РасчСчет":
@@ -356,42 +417,32 @@ func parseBankClientTxt(content string) ([]parsedBankTxn, bankStatementMeta, []s
 					cur.DocDate = t
 				}
 			case "Сумма":
-				if v, err := strconv.ParseFloat(strings.ReplaceAll(val, ",", "."), 64); err == nil {
+				if v, err := parseMoney(val); err == nil {
 					cur.Amount = v
 				}
 			case "Плательщик":
-				cur.CounterpartyName = val
+				cur.payerName = val
 			case "ПлательщикИНН":
-				if cur.CounterpartyINN == "" {
-					cur.CounterpartyINN = val
-				}
+				cur.payerINN = val
 			case "ПлательщикРасчСчет":
-				if cur.CounterpartyAccount == "" && val != myAccount {
-					cur.CounterpartyAccount = val
-				}
+				cur.payerAccount = val
 			case "ПлательщикБанк1":
-				cur.BankName = val
+				cur.payerBank = val
 			case "ПлательщикБИК":
-				cur.BankBIC = val
+				cur.payerBIC = val
 			case "Получатель":
-				if cur.CounterpartyName == "" {
-					cur.CounterpartyName = val
-				}
+				cur.recipientName = val
 			case "ПолучательИНН":
-				cur.CounterpartyINN = val
+				cur.recipientINN = val
 			case "ПолучательРасчСчет":
-				if val != myAccount {
-					cur.CounterpartyAccount = val
-				} else if cur.Direction == "" {
-					cur.Direction = "in"
-				}
+				cur.recipientAccount = val
 			case "ПолучательБанк1":
-				if cur.BankName == "" {
-					cur.BankName = val
+				if cur.recipientBank == "" {
+					cur.recipientBank = val
 				}
 			case "ПолучательБИК":
-				if cur.BankBIC == "" {
-					cur.BankBIC = val
+				if cur.recipientBIC == "" {
+					cur.recipientBIC = val
 				}
 			case "НазначениеПлатежа":
 				cur.Purpose = val

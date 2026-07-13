@@ -511,27 +511,54 @@ func runAutoDepreciation(db *database.DB, log logger.Logger) {
 				WHERE id = $8`,
 				newAccumulated, newBookValue, newCurrentValue, newRemaining, newMonthlyDepr, deprDate, now, assetID)
 
-			// Create journal entry
+			// Create journal entry (header + lines + balances in one tx; migration
+			// 416's deferred trigger rejects imbalanced single-line inserts).
 			if deprExpenseAcct != uuid.Nil && accumDeprAcct != uuid.Nil && journalID != uuid.Nil {
 				jeID := uuid.New()
 				entryNumber := fmt.Sprintf("DEP%06d", nextNumber)
 				nextNumber++
 
-				db.Exec(`
-					INSERT INTO journal_entries (
-						id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-						source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'depreciation', $9, 1.0, $10, $10, 'posted', $11, $11)`,
-					jeID, tenantID, orgID, journalID, entryNumber, deprDate,
-					period, fmt.Sprintf("Auto amortizatsiya %s", period),
-					assetID.String(), depAmount, now)
-				db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-					VALUES ($1, $2, 1, $3, 'Amortizatsiya xarajati', $4, 0, 1.0, $5)`, uuid.New(), jeID, deprExpenseAcct, depAmount, now)
-				db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-					VALUES ($1, $2, 2, $3, 'Yig''ilgan amortizatsiya', 0, $4, 1.0, $5)`, uuid.New(), jeID, accumDeprAcct, depAmount, now)
-				db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, deprExpenseAcct)
-				db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, accumDeprAcct)
-				db.Exec("UPDATE depreciation_entries SET journal_entry_id = $1 WHERE id = $2", jeID, entryID)
+				if tx, txErr := db.Begin(); txErr == nil {
+					committed := false
+					func() {
+						defer func() {
+							if !committed {
+								tx.Rollback()
+							}
+						}()
+						if _, e := tx.Exec(`
+							INSERT INTO journal_entries (
+								id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+								source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'depreciation', $9, 1.0, $10, $10, 'posted', $11, $11)`,
+							jeID, tenantID, orgID, journalID, entryNumber, deprDate,
+							period, fmt.Sprintf("Auto amortizatsiya %s", period),
+							assetID.String(), depAmount, now); e != nil {
+							return
+						}
+						if _, e := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+							VALUES ($1, $2, 1, $3, 'Amortizatsiya xarajati', $4, 0, 1.0, $5)`, uuid.New(), jeID, deprExpenseAcct, depAmount, now); e != nil {
+							return
+						}
+						if _, e := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+							VALUES ($1, $2, 2, $3, 'Yig''ilgan amortizatsiya', 0, $4, 1.0, $5)`, uuid.New(), jeID, accumDeprAcct, depAmount, now); e != nil {
+							return
+						}
+						// Debit-positive convention (migration 407): expense +, accumulated depreciation (contra-asset) −.
+						if _, e := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, deprExpenseAcct); e != nil {
+							return
+						}
+						if _, e := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", depAmount, now, accumDeprAcct); e != nil {
+							return
+						}
+						if _, e := tx.Exec("UPDATE depreciation_entries SET journal_entry_id = $1 WHERE id = $2", jeID, entryID); e != nil {
+							return
+						}
+						if e := tx.Commit(); e == nil {
+							committed = true
+						}
+					}()
+				}
 			}
 
 			totalProcessed++

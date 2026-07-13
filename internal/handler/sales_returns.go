@@ -564,27 +564,40 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 
 		// Create journal entry (Credit Note)
 		entryID := uuid.New()
-		_, err = h.db.Exec(`
-			INSERT INTO journal_entries (
-				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-				source_type, source_id, total_debit, total_credit, status, created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
-			entryID, tenantID, returnOrgID, journalID, entryNumber, now, returnNumber,
-			fmt.Sprintf("Credit Note for Sales Return %s - %s", returnNumber, customerName),
-			"sales_return", returnID, totalAmount, totalAmount, approvedBy, now, now,
-		)
-		if err != nil {
-			h.log.Error("Failed to create credit note journal entry", "error", err)
-		} else {
+
+		func() {
+			tx, txErr := h.db.Begin()
+			if txErr != nil {
+				h.log.Error("Failed to begin credit note JE tx", "error", txErr)
+				return
+			}
+			defer tx.Rollback()
+
+			if _, err := tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
+				entryID, tenantID, returnOrgID, journalID, entryNumber, now, returnNumber,
+				fmt.Sprintf("Credit Note for Sales Return %s - %s", returnNumber, customerName),
+				"sales_return", returnID, totalAmount, totalAmount, approvedBy, now, now,
+			); err != nil {
+				h.log.Error("Failed to create credit note journal entry", "error", err)
+				return
+			}
+
 			// Create journal entry lines
 			// Line 1: Debit Sales Revenue (reduce revenue)
 			line1ID := uuid.New()
-			h.db.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 				line1ID, entryID, revenueAccountID, "Sales Return - Revenue Reversal", totalAmount, 0, 1, now,
-			)
+			); err != nil {
+				h.log.Error("Failed to insert credit note revenue line", "error", err)
+				return
+			}
 
 			// Line 2: Credit Accounts Receivable (reduce what customer owes)
 			line2ID := uuid.New()
@@ -593,19 +606,33 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 				cid, _ := uuid.Parse(customerID.String)
 				contactID = &cid
 			}
-			h.db.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, account_id, contact_id, description, debit_amount, credit_amount, line_number, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 				line2ID, entryID, arAccountID, contactID, "Sales Return - AR Reduction", 0, totalAmount, 2, now,
-			)
+			); err != nil {
+				h.log.Error("Failed to insert credit note AR line", "error", err)
+				return
+			}
 
 			// Update account balances
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, revenueAccountID)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, revenueAccountID); err != nil {
+				h.log.Error("Failed to update revenue balance for credit note", "error", err)
+				return
+			}
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID); err != nil {
+				h.log.Error("Failed to update AR balance for credit note", "error", err)
+				return
+			}
+
+			if err := tx.Commit(); err != nil {
+				h.log.Error("Failed to commit credit note journal entry", "error", err)
+				return
+			}
 
 			h.log.Info("Credit Note created for sales return", "return_id", returnID, "entry_number", entryNumber, "amount", totalAmount)
-		}
+		}()
 	} else {
 		h.log.Warn("Could not create credit note - missing accounts or journal", "ar_account", arAccountID, "revenue_account", revenueAccountID, "journal", journalID)
 	}
@@ -722,28 +749,55 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 		if inventoryAcctID != uuid.Nil && cogsAcctID != uuid.Nil && invJournalID != uuid.Nil {
 			invEntryNumber := fmt.Sprintf("INV-CN-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
 			invEntryID := uuid.New()
-			_, err := h.db.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-					source_type, source_id, total_debit, total_credit, status, created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
-				invEntryID, tenantID, returnOrgID, invJournalID, invEntryNumber, now, returnNumber,
-				fmt.Sprintf("Inventory restock from Sales Return %s - %s", returnNumber, customerName),
-				"sales_return_inventory", returnID, totalCostReversal, totalCostReversal, approvedBy, now, now,
-			)
-			if err != nil {
-				h.log.Error("Failed to create inventory reversal journal entry", "error", err)
-			} else {
-				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			func() {
+				tx, txErr := h.db.Begin()
+				if txErr != nil {
+					h.log.Error("Failed to begin inventory reversal JE tx", "error", txErr)
+					return
+				}
+				defer tx.Rollback()
+
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+						source_type, source_id, total_debit, total_credit, status, created_by, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $15)`,
+					invEntryID, tenantID, returnOrgID, invJournalID, invEntryNumber, now, returnNumber,
+					fmt.Sprintf("Inventory restock from Sales Return %s - %s", returnNumber, customerName),
+					"sales_return_inventory", returnID, totalCostReversal, totalCostReversal, approvedBy, now, now,
+				); err != nil {
+					h.log.Error("Failed to create inventory reversal journal entry", "error", err)
+					return
+				}
+
+				if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 					uuid.New(), invEntryID, inventoryAcctID, "Inventory Restock - Sales Return", totalCostReversal, 0, 1, now,
-				)
-				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				); err != nil {
+					h.log.Error("Failed to insert inventory restock line", "error", err)
+					return
+				}
+				if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 					uuid.New(), invEntryID, cogsAcctID, "COGS Reversal - Sales Return", 0, totalCostReversal, 2, now,
-				)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCostReversal, now, inventoryAcctID)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCostReversal, now, cogsAcctID)
+				); err != nil {
+					h.log.Error("Failed to insert COGS reversal line", "error", err)
+					return
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCostReversal, now, inventoryAcctID); err != nil {
+					h.log.Error("Failed to update inventory balance for reversal", "error", err)
+					return
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCostReversal, now, cogsAcctID); err != nil {
+					h.log.Error("Failed to update COGS balance for reversal", "error", err)
+					return
+				}
+
+				if err := tx.Commit(); err != nil {
+					h.log.Error("Failed to commit inventory reversal journal entry", "error", err)
+					return
+				}
+
 				h.log.Info("Inventory reversal journal created", "return_id", returnID, "entry_number", invEntryNumber, "amount", totalCostReversal)
-			}
+			}()
 		} else {
 			h.log.Warn("Could not create inventory reversal journal - missing accounts/journal",
 				"inventory_account", inventoryAcctID, "cogs_account", cogsAcctID, "journal", invJournalID)
@@ -1177,18 +1231,27 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 
 			// Create journal entry (Cash Refund Payment)
 			entryID := uuid.New()
-			_, err = h.db.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-					source_type, source_id, total_debit, total_credit, status, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14)`,
-				entryID, tenantID, refundOrgID, journalID, entryNumber, now, returnNumber,
-				fmt.Sprintf("Cash Refund for Sales Return %s - %s", returnNumber, customerName),
-				"sales_return_refund", returnID, totalAmount, totalAmount, now, now,
-			)
-			if err != nil {
-				h.log.Error("Failed to create refund journal entry", "error", err)
-			} else {
+			func() {
+				tx, txErr := h.db.Begin()
+				if txErr != nil {
+					h.log.Error("Failed to begin cash refund JE tx", "error", txErr)
+					return
+				}
+				defer tx.Rollback()
+
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+						source_type, source_id, total_debit, total_credit, status, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14)`,
+					entryID, tenantID, refundOrgID, journalID, entryNumber, now, returnNumber,
+					fmt.Sprintf("Cash Refund for Sales Return %s - %s", returnNumber, customerName),
+					"sales_return_refund", returnID, totalAmount, totalAmount, now, now,
+				); err != nil {
+					h.log.Error("Failed to create refund journal entry", "error", err)
+					return
+				}
+
 				// Line 1: Debit Accounts Receivable (clear the credit note)
 				line1ID := uuid.New()
 				var contactID *uuid.UUID
@@ -1196,28 +1259,45 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 					cid, _ := uuid.Parse(customerID.String)
 					contactID = &cid
 				}
-				h.db.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, account_id, contact_id, description, debit_amount, credit_amount, line_number, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 					line1ID, entryID, arAccountID, contactID, "Cash Refund - Clear AR Credit", totalAmount, 0, 1, now,
-				)
+				); err != nil {
+					h.log.Error("Failed to insert cash refund AR line", "error", err)
+					return
+				}
 
 				// Line 2: Credit Cash (money goes out)
 				line2ID := uuid.New()
-				h.db.Exec(`
+				if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 					line2ID, entryID, cashAccountID, "Cash Refund Payment", 0, totalAmount, 2, now,
-				)
+				); err != nil {
+					h.log.Error("Failed to insert cash refund cash line", "error", err)
+					return
+				}
 
 				// Update account balances
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, cashAccountID)
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID); err != nil {
+					h.log.Error("Failed to update AR balance for cash refund", "error", err)
+					return
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, cashAccountID); err != nil {
+					h.log.Error("Failed to update cash balance for cash refund", "error", err)
+					return
+				}
+
+				if err := tx.Commit(); err != nil {
+					h.log.Error("Failed to commit cash refund journal entry", "error", err)
+					return
+				}
 
 				h.log.Info("Cash refund payment recorded", "return_id", returnID, "entry_number", entryNumber, "amount", totalAmount)
-			}
+			}()
 		}
 	}
 	// For "credit_note" refund method, create an actual credit note document

@@ -1145,44 +1145,73 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 			return
 		}
 
-		entryNumber := fmt.Sprintf("EXP%06d", nextNumber)
 		journalEntryID := uuid.New()
 		jeDescription := "Expense: " + expenseNumber + " - " + description
 
-		_, err = h.db.Exec(`
+		// Header + both lines + balance updates in ONE transaction: migration
+		// 416's deferred balance trigger rejects imbalanced single-line
+		// autocommit inserts, which previously left 0-line "posted" JEs.
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to begin expense journal tx", "error", txErr)
+			return
+		}
+		defer tx.Rollback()
+
+		entryNumber := fmt.Sprintf("EXP%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "EXP", nextNumber))
+
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'expense', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
 			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, expenseDate, expenseNumber, jeDescription,
 			id.String(), totalAmount, userID, now,
-		)
-		if err != nil {
+		); err != nil {
 			h.log.Error("Failed to create expense journal entry", "error", err)
 			return
 		}
 
 		// Debit: Expense account
-		h.db.Exec(`
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
 			) VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
 			uuid.New(), journalEntryID, expenseAccountID, "Expense", totalAmount, now,
-		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, expenseAccountID)
+		); err != nil {
+			h.log.Error("Failed to insert expense debit line", "error", err)
+			return
+		}
 
 		// Credit: Cash or AP
-		h.db.Exec(`
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
 			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
 			uuid.New(), journalEntryID, creditAccountID, "Cash/Payable", totalAmount, now,
-		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, creditAccountID)
+		); err != nil {
+			h.log.Error("Failed to insert expense credit line", "error", err)
+			return
+		}
 
-		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, expenseAccountID); err != nil {
+			h.log.Error("Failed to update expense account balance", "error", err)
+			return
+		}
+		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, creditAccountID); err != nil {
+			h.log.Error("Failed to update credit account balance", "error", err)
+			return
+		}
+		if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+			h.log.Error("Failed to bump journal next_number", "error", err)
+			return
+		}
+
+		if err = tx.Commit(); err != nil {
+			h.log.Error("Failed to commit expense journal entry", "error", err)
+		}
 	}()
 
 	// Notify: expense approved

@@ -2351,7 +2351,7 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 					"error", contractErr, "vendor_id", vendorID)
 			}
 
-			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
+			taxAccountID := findAccount(tx, tenantID, organizationID, "soliqlar bo'yicha bo'nak", "4410")
 			taxAccountID = resolveLeafAccount(tx, taxAccountID)
 
 			// Per-category accounting: resolve Stock Interim Receipt per product

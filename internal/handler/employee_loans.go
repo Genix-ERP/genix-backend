@@ -654,25 +654,54 @@ func (h *Handler) createLoanJournalEntry(tenantID uuid.UUID, orgID uuid.UUID, ca
 	entryNumber := fmt.Sprintf("JE-LOAN-%s", loanNumber)
 	jeID := uuid.New()
 
-	h.db.Exec(`
+	// Header + both lines + balance updates must be in ONE transaction:
+	// migration 416's deferred balance trigger rejects any single-line
+	// autocommit insert as imbalanced (leaving 0-line "posted" headers).
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to begin loan journal tx", "error", err)
+		return
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
 		INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
 			entry_date, description, status, total_debit, total_credit, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
-	`, jeID, tenantID, orgID, journalID, entryNumber, now, fmt.Sprintf("Xodimga qarz: %s - %s", empName, loanNumber), amount, now)
+	`, jeID, tenantID, orgID, journalID, entryNumber, now, fmt.Sprintf("Xodimga qarz: %s - %s", empName, loanNumber), amount, now); err != nil {
+		h.log.Error("Failed to insert loan journal entry", "error", err)
+		return
+	}
 
 	// Debit: 4720 (Employee Loans Receivable)
-	h.db.Exec(`
-		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit, credit, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, 0, $6, $6)
-	`, uuid.New(), jeID, loanAccountID, fmt.Sprintf("Qarz: %s", empName), amount, now)
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, description, debit_amount, credit_amount, created_at)
+		VALUES ($1, $2, $3, 1, $4, $5, 0, $6)
+	`, uuid.New(), jeID, loanAccountID, fmt.Sprintf("Qarz: %s", empName), amount, now); err != nil {
+		h.log.Error("Failed to insert loan debit line", "error", err)
+		return
+	}
 
 	// Credit: Cash/Bank account
-	h.db.Exec(`
-		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit, credit, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 0, $5, $6, $6)
-	`, uuid.New(), jeID, cashAccountID, fmt.Sprintf("Qarz to'lovi: %s", empName), amount, now)
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, description, debit_amount, credit_amount, created_at)
+		VALUES ($1, $2, $3, 2, $4, 0, $5, $6)
+	`, uuid.New(), jeID, cashAccountID, fmt.Sprintf("Qarz to'lovi: %s", empName), amount, now); err != nil {
+		h.log.Error("Failed to insert loan credit line", "error", err)
+		return
+	}
 
-	// Update account balances
-	h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, loanAccountID)
-	h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, cashAccountID)
+	// Update account balances (inside the same tx so they roll back on failure)
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, loanAccountID); err != nil {
+		h.log.Error("Failed to update loan receivable balance", "error", err)
+		return
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, cashAccountID); err != nil {
+		h.log.Error("Failed to update cash balance for loan", "error", err)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit loan journal entry", "error", err)
+	}
 }

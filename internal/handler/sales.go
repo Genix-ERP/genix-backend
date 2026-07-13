@@ -1575,49 +1575,72 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						}
 					}
 
-					if _, err := h.db.Exec(`
-						INSERT INTO journal_entries (
-							id, tenant_id, organization_id, journal_id, entry_number,
-							entry_date, description, source_type, source_id, status, total_debit, total_credit,
-							created_at, updated_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'sales_order', $8, 'posted', $9, $9, $10, $10)
-					`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
-						now, description, orderID.String(), totalCost, now); err != nil {
-						h.log.Error("Stock movement JE INSERT failed", "error", err, "entry_number", entryNumber)
-					} else {
-					lineNumber := 1
-					for pair, amount := range grouped {
-						// Debit: Stock Interim Delivery
-						debitLineID := uuid.New()
-						if _, err := h.db.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, account_id, contact_id, description,
-								debit_amount, credit_amount, line_number, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
-						`, debitLineID, entryID, pair.Debit, contactID, "Stock Interim Delivery", amount, lineNumber, now); err != nil {
-							h.log.Error("Stock movement JE debit line INSERT failed", "error", err)
+					func() {
+						tx, txErr := h.db.Begin()
+						if txErr != nil {
+							h.log.Error("Failed to begin stock movement JE tx", "error", txErr)
+							return
 						}
-						lineNumber++
+						defer tx.Rollback()
 
-						// Credit: Stock Valuation
-						creditLineID := uuid.New()
-						if _, err := h.db.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, account_id, contact_id, description,
-								debit_amount, credit_amount, line_number, created_at
-							) VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)
-						`, creditLineID, entryID, pair.Credit, contactID, "Stock Valuation", amount, lineNumber, now); err != nil {
-							h.log.Error("Stock movement JE credit line INSERT failed", "error", err)
+						if _, err := tx.Exec(`
+							INSERT INTO journal_entries (
+								id, tenant_id, organization_id, journal_id, entry_number,
+								entry_date, description, source_type, source_id, status, total_debit, total_credit,
+								created_at, updated_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, 'sales_order', $8, 'posted', $9, $9, $10, $10)
+						`, entryID, tenantID, orgIDPtr, journalID, entryNumber,
+							now, description, orderID.String(), totalCost, now); err != nil {
+							h.log.Error("Stock movement JE INSERT failed", "error", err, "entry_number", entryNumber)
+							return
 						}
-						lineNumber++
 
-						// Update account balances
-						h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Debit)
-						h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Credit)
-					}
+						lineNumber := 1
+						for pair, amount := range grouped {
+							// Debit: Stock Interim Delivery
+							debitLineID := uuid.New()
+							if _, err := tx.Exec(`
+								INSERT INTO journal_entry_lines (
+									id, journal_entry_id, account_id, contact_id, description,
+									debit_amount, credit_amount, line_number, created_at
+								) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
+							`, debitLineID, entryID, pair.Debit, contactID, "Stock Interim Delivery", amount, lineNumber, now); err != nil {
+								h.log.Error("Stock movement JE debit line INSERT failed", "error", err)
+								return
+							}
+							lineNumber++
 
-					h.log.Info("Stock movement JE created for SO shipped (Odoo-style)", "entry_id", entryID, "cost", totalCost)
-					}
+							// Credit: Stock Valuation
+							creditLineID := uuid.New()
+							if _, err := tx.Exec(`
+								INSERT INTO journal_entry_lines (
+									id, journal_entry_id, account_id, contact_id, description,
+									debit_amount, credit_amount, line_number, created_at
+								) VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8)
+							`, creditLineID, entryID, pair.Credit, contactID, "Stock Valuation", amount, lineNumber, now); err != nil {
+								h.log.Error("Stock movement JE credit line INSERT failed", "error", err)
+								return
+							}
+							lineNumber++
+
+							// Update account balances
+							if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Debit); err != nil {
+								h.log.Error("Stock movement JE debit balance update failed", "error", err)
+								return
+							}
+							if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, pair.Credit); err != nil {
+								h.log.Error("Stock movement JE credit balance update failed", "error", err)
+								return
+							}
+						}
+
+						if err := tx.Commit(); err != nil {
+							h.log.Error("Failed to commit stock movement JE", "error", err)
+							return
+						}
+
+						h.log.Info("Stock movement JE created for SO shipped (Odoo-style)", "entry_id", entryID, "cost", totalCost)
+					}()
 				}
 			}
 		}
@@ -2592,7 +2615,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 
 		if arAccountID != uuid.Nil {
-			taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
+			taxAccountID := findAccount(tx, tenantID, organizationID, "QQS bo'yicha qarz", "6420")
 
 			// Get invoice lines for per-category accounting
 			type invoiceLineAcct struct {

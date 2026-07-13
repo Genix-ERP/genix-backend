@@ -943,7 +943,7 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 		if apAccountID == uuid.Nil {
 			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
 		}
-		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "soliqlar bo'yicha bo'nak", "4410")
 
 		// Get invoice lines for per-category accounting
 		type billLineAcct struct {
@@ -1332,75 +1332,108 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 			}
 
 			journalEntryID := uuid.New()
-			jeTotal := paymentAmount + input.WriteOffAmount
-			_, err = h.db.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15)`,
-				journalEntryID, tenantID, organizationID, payJournalID, entryNumber, now, invoiceID.String()[:8], description,
-				"purchase_invoice_payment", invoiceID.String(), 1.0, jeTotal, jeTotal, now, now,
-			)
 
-			if err != nil {
-				h.log.Error("Failed to create journal entry for payment", "error", err)
+			// Resolve the write-off income account up front. If a write-off is
+			// requested but no income account exists, treat write-off as 0 so the
+			// JE stays balanced (DR AP = CR Cash) rather than being rejected by
+			// the deferred balance trigger and lost entirely.
+			var otherIncomeID uuid.UUID
+			effectiveWriteOff := 0.0
+			if input.WriteOffAmount > 0 {
+				otherIncomeID = findAccount(h.db, tenantID, organizationID, "other income", "9310")
+				if otherIncomeID == uuid.Nil {
+					otherIncomeID = findAccount(h.db, tenantID, organizationID, "payment difference write-off", "9690")
+				}
+				if otherIncomeID != uuid.Nil {
+					effectiveWriteOff = input.WriteOffAmount
+				} else {
+					h.log.Warn("Write-off requested but no income account found; posting payment without write-off", "invoice_id", invoiceID)
+				}
+			}
+			apDebitAmount := paymentAmount + effectiveWriteOff
+			jeTotal := apDebitAmount
+
+			// Header + all lines + balance updates in ONE transaction (migration 416).
+			tx, txErr := h.db.Begin()
+			if txErr != nil {
+				h.log.Error("Failed to begin payment journal tx", "error", txErr)
 			} else {
-				// Debit AP (payment + write-off reduces AP)
-				apDebitAmount := paymentAmount + input.WriteOffAmount
-				apLineID := uuid.New()
-				h.db.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, contact_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-					apLineID, journalEntryID, 1, apAcctID, contactUUID, "Accounts Payable",
-					apDebitAmount, 0.0, 1.0, now,
-				)
-				// Credit Cash/Outstanding Payments
-				cashLineID := uuid.New()
-				h.db.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-					cashLineID, journalEntryID, 2, cashAcctID, "Outstanding Payment",
-					0.0, paymentAmount, 1.0, now,
-				)
-
-				// Write-off line: CR Other Income (vendor owes less = gain for us)
-				if input.WriteOffAmount > 0 {
-					otherIncomeID := findAccount(h.db, tenantID, organizationID, "other income", "9310")
-					if otherIncomeID == uuid.Nil {
-						otherIncomeID = findAccount(h.db, tenantID, organizationID, "payment difference write-off", "9690")
+				committed := false
+				defer func() {
+					if !committed {
+						tx.Rollback()
 					}
-					if otherIncomeID != uuid.Nil {
+				}()
+
+				if _, err = tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+						source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15)`,
+					journalEntryID, tenantID, organizationID, payJournalID, entryNumber, now, invoiceID.String()[:8], description,
+					"purchase_invoice_payment", invoiceID.String(), 1.0, jeTotal, jeTotal, now, now,
+				); err != nil {
+					h.log.Error("Failed to create journal entry for payment", "error", err)
+				} else {
+					// Debit AP (payment + write-off reduces AP)
+					apLineID := uuid.New()
+					_, err = tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, contact_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+						apLineID, journalEntryID, 1, apAcctID, contactUUID, "Accounts Payable",
+						apDebitAmount, 0.0, 1.0, now,
+					)
+					// Credit Cash/Outstanding Payments
+					if err == nil {
+						cashLineID := uuid.New()
+						_, err = tx.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, line_number, account_id, description,
+								debit_amount, credit_amount, exchange_rate, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+							cashLineID, journalEntryID, 2, cashAcctID, "Outstanding Payment",
+							0.0, paymentAmount, 1.0, now,
+						)
+					}
+
+					// Write-off line: CR Other Income (vendor owes less = gain for us)
+					if err == nil && effectiveWriteOff > 0 {
 						writeOffLineID := uuid.New()
-						h.db.Exec(`
+						if _, err = tx.Exec(`
 							INSERT INTO journal_entry_lines (
 								id, journal_entry_id, line_number, account_id, description,
 								debit_amount, credit_amount, exchange_rate, created_at
 							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 							writeOffLineID, journalEntryID, 3, otherIncomeID, "Payment Difference Write-off",
-							0.0, input.WriteOffAmount, 1.0, now,
-						)
-						// Update write-off account balance (credit-normal income: credit increases)
-						h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.WriteOffAmount, now, otherIncomeID)
+							0.0, effectiveWriteOff, 1.0, now,
+						); err == nil {
+							_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", effectiveWriteOff, now, otherIncomeID)
+						}
 					}
-				}
 
-				// Update journal next number
-				h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", payJournalID)
+					// Update journal next number + account balances
+					if err == nil {
+						_, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", payJournalID)
+					}
+					if err == nil {
+						// Debit AP (credit-normal: debit decreases) — includes write-off
+						_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID)
+					}
+					if err == nil {
+						// Credit Cash/Bank (debit-normal: credit decreases)
+						_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
+					}
 
-				// Update account balances
-				// Debit AP (credit-normal: debit decreases) — includes write-off
-				if _, apErr := h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID); apErr != nil {
-					h.log.Error("Failed to update AP account balance", "error", apErr, "account_id", apAcctID, "amount", apDebitAmount)
-				}
-				// Credit Cash/Bank (debit-normal: credit decreases)
-				if _, cashErr := h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID); cashErr != nil {
-					h.log.Error("Failed to update Cash/Bank account balance", "error", cashErr, "account_id", cashAcctID, "amount", paymentAmount)
-				} else {
-					h.log.Info("Vendor payment: account balances updated", "ap_account", apAcctID, "cash_account", cashAcctID, "amount", paymentAmount)
+					if err != nil {
+						h.log.Error("Failed to post vendor payment journal entry", "error", err)
+					} else if err = tx.Commit(); err != nil {
+						h.log.Error("Failed to commit vendor payment journal entry", "error", err)
+					} else {
+						committed = true
+						h.log.Info("Vendor payment: account balances updated", "ap_account", apAcctID, "cash_account", cashAcctID, "amount", paymentAmount)
+					}
 				}
 			}
 		}
@@ -1588,7 +1621,7 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 	if err == nil {
 		apAccountID := findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
 		expenseAccountID := findAccount(tx, tenantID, organizationID, "expense", "9420")
-		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "soliqlar bo'yicha bo'nak", "4410")
 
 		if apAccountID != uuid.Nil {
 			prefix := ""

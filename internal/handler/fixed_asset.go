@@ -999,7 +999,15 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 	defer rows.Close()
 
 	now := time.Now()
+	// Depreciation is dated to the LAST DAY of the requested period, not today,
+	// so a back-run (e.g. period "2025-12" processed in 2026) books the expense
+	// into the correct accounting month. Accept both "2006-01" and "2006-1".
 	deprecationDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	if pt, perr := time.Parse("2006-01", input.Period); perr == nil {
+		deprecationDate = pt.AddDate(0, 1, -1)
+	} else if pt2, perr2 := time.Parse("2006-1", input.Period); perr2 == nil {
+		deprecationDate = pt2.AddDate(0, 1, -1)
+	}
 	newEntries := make([]*entity.DepreciationEntryResponse, 0)
 
 	// Look up accounts for journal entries: Dt 6500 Depr Expense / Kt 1510 Accum Depr
@@ -1044,20 +1052,23 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 			continue
 		}
 
+		// Compute by the asset's method. Declining-balance methods apply the
+		// rate to net book value (cost − accumulated), not the depreciable base,
+		// and must be recomputed each period — so they cannot use the stored
+		// straight-line monthly_depr (that made every method behave straight-line).
 		var depAmount float64
-		if monthlyDeprAmt > 0 {
-			depAmount = monthlyDeprAmt
-		} else {
-			switch depreciationMethod {
-			case "straight_line":
-				depAmount = depreciableAmount / float64(usefulLifeMonths)
-			case "declining_balance":
-				rate := 1.0 / float64(usefulLifeMonths)
-				depAmount = curValue * rate
-			case "double_declining":
-				rate := 2.0 / float64(usefulLifeMonths)
-				depAmount = curValue * rate
-			default:
+		nbv := acquisitionCost - accumulatedDepreciation
+		switch depreciationMethod {
+		case "declining_balance":
+			depAmount = nbv * (1.0 / float64(usefulLifeMonths))
+		case "double_declining":
+			depAmount = nbv * (2.0 / float64(usefulLifeMonths))
+		case "straight_line":
+			depAmount = depreciableAmount / float64(usefulLifeMonths)
+		default:
+			if monthlyDeprAmt > 0 {
+				depAmount = monthlyDeprAmt
+			} else {
 				depAmount = depreciableAmount / float64(usefulLifeMonths)
 			}
 		}
@@ -1102,30 +1113,66 @@ func (h *Handler) RunDepreciation(c *gin.Context) {
 			h.log.Error("Failed to update asset depreciation", "error", err)
 		}
 
-		// Create journal entry: Dt 6500 Depreciation Expense / Kt 1510 Accumulated Depreciation
+		// Create journal entry: Dt Depreciation Expense / Kt Accumulated Depreciation.
+		// Header + lines + balances in ONE tx (migration 416 rejects imbalanced
+		// single-line autocommit inserts, leaving 0-line "posted" JEs otherwise).
 		if deprExpenseAcct != uuid.Nil && accumDeprAcct != uuid.Nil && journalID != uuid.Nil {
 			jeID := uuid.New()
 			entryNumber := fmt.Sprintf("DEP%06d", nextNumber)
 			nextNumber++
 
-			h.db.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'depreciation', $9, 1.0, $10, $10, 'posted', $11, $11)`,
-				jeID, tenantID, orgIDPtr, journalID, entryNumber, deprecationDate,
-				input.Period, fmt.Sprintf("Depreciation %s", input.Period),
-				assetID.String(), depAmount, now,
-			)
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-				VALUES ($1, $2, 1, $3, 'Depreciation Expense', $4, 0, 1.0, $5)`, uuid.New(), jeID, deprExpenseAcct, depAmount, now)
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-				VALUES ($1, $2, 2, $3, 'Accumulated Depreciation', 0, $4, 1.0, $5)`, uuid.New(), jeID, accumDeprAcct, depAmount, now)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, deprExpenseAcct)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, accumDeprAcct)
-
-			// Update depreciation entry with journal reference
-			h.db.Exec("UPDATE depreciation_entries SET journal_entry_id = $1 WHERE id = $2", jeID, entryID)
+			if tx, txErr := h.db.Begin(); txErr != nil {
+				h.log.Error("Failed to begin depreciation journal tx", "error", txErr)
+			} else {
+				committed := false
+				func() {
+					defer func() {
+						if !committed {
+							tx.Rollback()
+						}
+					}()
+					if _, e := tx.Exec(`
+						INSERT INTO journal_entries (
+							id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+							source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'depreciation', $9, 1.0, $10, $10, 'posted', $11, $11)`,
+						jeID, tenantID, orgIDPtr, journalID, entryNumber, deprecationDate,
+						input.Period, fmt.Sprintf("Depreciation %s", input.Period),
+						assetID.String(), depAmount, now); e != nil {
+						h.log.Error("Failed to create depreciation journal entry", "error", e)
+						return
+					}
+					if _, e := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+						VALUES ($1, $2, 1, $3, 'Depreciation Expense', $4, 0, 1.0, $5)`, uuid.New(), jeID, deprExpenseAcct, depAmount, now); e != nil {
+						h.log.Error("Failed to insert depreciation expense line", "error", e)
+						return
+					}
+					if _, e := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+						VALUES ($1, $2, 2, $3, 'Accumulated Depreciation', 0, $4, 1.0, $5)`, uuid.New(), jeID, accumDeprAcct, depAmount, now); e != nil {
+						h.log.Error("Failed to insert accumulated depreciation line", "error", e)
+						return
+					}
+					// Debit-positive convention (migration 407): expense (debit) +,
+					// accumulated depreciation (credit-normal contra-asset) −.
+					if _, e := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, deprExpenseAcct); e != nil {
+						h.log.Error("Failed to update depreciation expense balance", "error", e)
+						return
+					}
+					if _, e := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", depAmount, now, accumDeprAcct); e != nil {
+						h.log.Error("Failed to update accumulated depreciation balance", "error", e)
+						return
+					}
+					if _, e := tx.Exec("UPDATE depreciation_entries SET journal_entry_id = $1 WHERE id = $2", jeID, entryID); e != nil {
+						h.log.Error("Failed to link depreciation journal", "error", e)
+						return
+					}
+					if e := tx.Commit(); e != nil {
+						h.log.Error("Failed to commit depreciation journal entry", "error", e)
+					} else {
+						committed = true
+					}
+				}()
+			}
 		}
 
 		entry := &entity.DepreciationEntry{

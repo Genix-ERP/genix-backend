@@ -965,42 +965,72 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 
 		// Create journal entry (Debit Note)
 		entryID := uuid.New()
-		_, err = h.db.Exec(`
-			INSERT INTO journal_entries (
-				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-				source_type, source_id, total_debit, total_credit, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14)`,
-			entryID, tenantID, prOrgID, journalID, entryNumber, now, returnNumber,
-			fmt.Sprintf("Debit Note for Purchase Return %s - %s", returnNumber, supplierName),
-			"purchase_return", returnID, totalValue, totalValue, now, now,
-		)
-		if err != nil {
-			h.log.Error("Failed to create debit note journal entry", "error", err)
-		} else {
+
+		// Header + both lines + balance updates in ONE transaction: migration
+		// 416's deferred balance trigger rejects imbalanced single-line
+		// autocommit inserts, which previously left 0-line "posted" JEs.
+		func() {
+			tx, txErr := h.db.Begin()
+			if txErr != nil {
+				h.log.Error("Failed to begin debit note journal tx", "error", txErr)
+				return
+			}
+			defer tx.Rollback()
+
+			if _, err = tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, total_debit, total_credit, status, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14)`,
+				entryID, tenantID, prOrgID, journalID, entryNumber, now, returnNumber,
+				fmt.Sprintf("Debit Note for Purchase Return %s - %s", returnNumber, supplierName),
+				"purchase_return", returnID, totalValue, totalValue, now, now,
+			); err != nil {
+				h.log.Error("Failed to create debit note journal entry", "error", err)
+				return
+			}
+
 			// Line 1: Debit Accounts Payable (reduce what we owe)
 			line1ID := uuid.New()
-			h.db.Exec(`
+			if _, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, account_id, contact_id, description, debit_amount, credit_amount, line_number, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 				line1ID, entryID, apAccountID, supplierID, "Purchase Return - AP Reduction", totalValue, 0, 1, now,
-			)
+			); err != nil {
+				h.log.Error("Failed to insert debit note AP JE line", "error", err)
+				return
+			}
 
 			// Line 2: Credit Inventory (reduce inventory value)
 			line2ID := uuid.New()
-			h.db.Exec(`
+			if _, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 				line2ID, entryID, inventoryAccountID, "Purchase Return - Inventory Reduction", 0, totalValue, 2, now,
-			)
+			); err != nil {
+				h.log.Error("Failed to insert debit note inventory JE line", "error", err)
+				return
+			}
 
 			// Update account balances
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, apAccountID)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, inventoryAccountID)
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, apAccountID); err != nil {
+				h.log.Error("Failed to update AP account balance for debit note JE", "error", err)
+				return
+			}
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, inventoryAccountID); err != nil {
+				h.log.Error("Failed to update inventory account balance for debit note JE", "error", err)
+				return
+			}
+
+			if err = tx.Commit(); err != nil {
+				h.log.Error("Failed to commit debit note journal entry", "error", err)
+				return
+			}
 
 			h.log.Info("Debit Note created for purchase return", "return_id", returnID, "entry_number", entryNumber, "amount", totalValue)
-		}
+		}()
 	} else {
 		h.log.Warn("Could not create debit note - missing accounts or journal", "ap_account", apAccountID, "inventory_account", inventoryAccountID, "journal", journalID)
 	}

@@ -2679,16 +2679,25 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 		}
 	}
 
-	// Update entry status
+	// Update entry status. The AND status='draft' guard makes this a no-op
+	// if a concurrent request already posted the entry — the account-balance
+	// UPDATEs above take row locks that serialize the two transactions, so the
+	// loser sees rows==0 here and rolls back (discarding its balance changes)
+	// instead of double-applying them.
 	now := time.Now()
-	_, err = tx.Exec(`
+	postRes, err := tx.Exec(`
 		UPDATE journal_entries SET status = 'posted', posted_at = $1, posted_by = $2, updated_at = $1
-		WHERE id = $3
+		WHERE id = $3 AND status = 'draft'
 	`, now, userID, id)
 
 	if err != nil {
 		h.log.Error("Failed to update entry status", "error", err)
 		response.InternalError(c, "Failed to post journal entry")
+		return
+	}
+	if rows, _ := postRes.RowsAffected(); rows == 0 {
+		// Another request already posted this entry — abort without committing.
+		response.BadRequest(c, "Only draft entries can be posted")
 		return
 	}
 
@@ -3618,19 +3627,23 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	// Try inserting with incrementing payment number, retry on duplicate
 	var paymentNumber string
 	for attempt := 0; attempt < 5; attempt++ {
-		var lastNum int
+		// Cast to BIGINT (not INTEGER) and match only sequential-width numbers
+		// (≤10 digits): timestamp-format numbers like PAY-20260713165122 written
+		// by other payment endpoints are 14 digits and would overflow INTEGER,
+		// erroring the query and forcing a duplicate PAY-000001.
+		var lastNum int64
 		if orgIDPtr != nil {
 			h.db.QueryRow(`
-				SELECT COALESCE(MAX(CAST(SUBSTRING(payment_number FROM '[0-9]+$') AS INTEGER)), 0)
-				FROM payments WHERE tenant_id = $1 AND type = $2 AND organization_id = $3 AND payment_number ~ ('^' || $4 || '-[0-9]+$')
+				SELECT COALESCE(MAX(CAST(SUBSTRING(payment_number FROM '[0-9]+$') AS BIGINT)), 0)
+				FROM payments WHERE tenant_id = $1 AND type = $2 AND organization_id = $3 AND payment_number ~ ('^' || $4 || '-[0-9]{1,10}$')
 			`, tenantID, input.Type, *orgIDPtr, prefix).Scan(&lastNum)
 		} else {
 			h.db.QueryRow(`
-				SELECT COALESCE(MAX(CAST(SUBSTRING(payment_number FROM '[0-9]+$') AS INTEGER)), 0)
-				FROM payments WHERE tenant_id = $1 AND type = $2 AND organization_id IS NULL AND payment_number ~ ('^' || $3 || '-[0-9]+$')
+				SELECT COALESCE(MAX(CAST(SUBSTRING(payment_number FROM '[0-9]+$') AS BIGINT)), 0)
+				FROM payments WHERE tenant_id = $1 AND type = $2 AND organization_id IS NULL AND payment_number ~ ('^' || $3 || '-[0-9]{1,10}$')
 			`, tenantID, input.Type, prefix).Scan(&lastNum)
 		}
-		paymentNumber = fmt.Sprintf("%s-%06d", prefix, lastNum+1+attempt)
+		paymentNumber = fmt.Sprintf("%s-%06d", prefix, lastNum+1+int64(attempt))
 
 		_, err = h.db.Exec(query,
 			id, tenantID, orgIDPtr, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
@@ -3654,7 +3667,27 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	if len(input.Allocations) > 0 {
 		for _, alloc := range input.Allocations {
 			allocID := uuid.New()
-			docID, _ := uuid.Parse(alloc.DocumentID)
+			docID, parseErr := uuid.Parse(alloc.DocumentID)
+			if parseErr != nil {
+				h.log.Warn("Skipping allocation with invalid document_id", "document_id", alloc.DocumentID)
+				continue
+			}
+
+			// Verify the target document belongs to this tenant before allocating —
+			// otherwise ConfirmPayment would later mutate another tenant's invoice.
+			var owned bool
+			switch alloc.DocumentType {
+			case "sales_invoice":
+				h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)`, docID, tenantID).Scan(&owned)
+			case "purchase_invoice":
+				h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM purchase_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)`, docID, tenantID).Scan(&owned)
+			default:
+				owned = true // non-invoice allocations carry no cross-tenant mutation risk here
+			}
+			if !owned {
+				h.log.Warn("Skipping allocation to document not owned by tenant", "doc_type", alloc.DocumentType, "doc_id", docID)
+				continue
+			}
 
 			_, err = h.db.Exec(`
 				INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
@@ -3853,15 +3886,21 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Update payment status
-	_, err = tx.Exec(`
+	// Update payment status. AND status='draft' guards against a concurrent
+	// confirm — the loser gets rows==0 and aborts before any invoice update or
+	// JE, so amount_paid and cash balances are never double-applied.
+	confRes, err := tx.Exec(`
 		UPDATE payments SET status = 'confirmed', approved_by = $1, approved_at = $2, updated_at = $2
-		WHERE id = $3
+		WHERE id = $3 AND status = 'draft'
 	`, userID, now, id)
 
 	if err != nil {
 		h.log.Error("Failed to confirm payment", "error", err)
 		response.InternalError(c, "Failed to confirm payment")
+		return
+	}
+	if rows, _ := confRes.RowsAffected(); rows == 0 {
+		response.BadRequest(c, "Only draft payments can be confirmed")
 		return
 	}
 
@@ -3898,13 +3937,15 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 		h.log.Info("Processing payment allocation", "alloc_id", a.ID, "doc_type", a.DocType, "doc_id", a.DocID, "amount", a.Amount)
 
 		if a.DocType == "sales_invoice" {
+			// WHERE must be tenant-scoped — otherwise a payment allocated to
+			// another tenant's invoice UUID would flip that invoice to paid.
 			res, updErr := tx.Exec(`
 				UPDATE sales_invoices SET
 					amount_paid = amount_paid + $1,
 					status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
 					updated_at = $2
-				WHERE id = $3
-			`, a.Amount, now, a.DocID)
+				WHERE id = $3 AND tenant_id = $4
+			`, a.Amount, now, a.DocID, tenantID)
 			if updErr != nil {
 				h.log.Error("Failed to update sales invoice amount_paid", "error", updErr, "invoice_id", a.DocID, "amount", a.Amount)
 			} else if rows, _ := res.RowsAffected(); rows == 0 {
@@ -3919,8 +3960,8 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
 					payment_status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
 					updated_at = $2
-				WHERE id = $3
-			`, a.Amount, now, a.DocID)
+				WHERE id = $3 AND tenant_id = $4
+			`, a.Amount, now, a.DocID, tenantID)
 			if updErr != nil {
 				h.log.Error("Failed to update purchase invoice amount_paid", "error", updErr, "invoice_id", a.DocID, "amount", a.Amount)
 			} else if rows, _ := res.RowsAffected(); rows == 0 {
@@ -8052,8 +8093,10 @@ func (h *Handler) CloseFiscalYear(c *gin.Context) {
 
 	now := time.Now()
 
-	// Close the fiscal year
-	_, err := h.db.Exec(`
+	// Close the fiscal year — tenant-scoped; verify a row was actually closed
+	// before touching its periods so a foreign fiscal_year UUID can't close
+	// another tenant's periods.
+	result, err := h.db.Exec(`
 		UPDATE fiscal_years
 		SET status = 'closed', updated_at = $1
 		WHERE id = $2 AND tenant_id = $3
@@ -8064,13 +8107,18 @@ func (h *Handler) CloseFiscalYear(c *gin.Context) {
 		response.InternalError(c, "Failed to close fiscal year")
 		return
 	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		response.NotFound(c, "Fiscal year not found")
+		return
+	}
 
-	// Close all periods of this fiscal year
+	// Close all periods of this fiscal year (restricted to the caller's tenant)
 	_, err = h.db.Exec(`
 		UPDATE fiscal_periods
 		SET status = 'closed', updated_at = $1
 		WHERE fiscal_year_id = $2
-	`, now, id)
+		  AND fiscal_year_id IN (SELECT id FROM fiscal_years WHERE tenant_id = $3)
+	`, now, id, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to close fiscal periods", "error", err)
@@ -8106,25 +8154,43 @@ func (h *Handler) DeleteFiscalYear(c *gin.Context) {
 		return
 	}
 
-	// Delete periods first
-	_, err := h.db.Exec(`DELETE FROM fiscal_periods WHERE fiscal_year_id = $1`, id)
+	tx, err := h.db.Begin()
 	if err != nil {
+		response.InternalError(c, "Failed to delete fiscal year")
+		return
+	}
+	defer tx.Rollback()
+
+	// Verify ownership and lock the fiscal year row before touching its periods —
+	// prevents cross-tenant deletion via a foreign fiscal_year UUID.
+	var ownerTenant uuid.UUID
+	err = tx.QueryRow(`SELECT tenant_id FROM fiscal_years WHERE id = $1 FOR UPDATE`, id).Scan(&ownerTenant)
+	if err == sql.ErrNoRows || ownerTenant != tenantID {
+		response.NotFound(c, "Fiscal year not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to load fiscal year", "error", err)
+		response.InternalError(c, "Failed to delete fiscal year")
+		return
+	}
+
+	// Delete periods first (tenant-scoped via the verified fiscal year)
+	if _, err := tx.Exec(`DELETE FROM fiscal_periods WHERE fiscal_year_id = $1`, id); err != nil {
 		h.log.Error("Failed to delete fiscal periods", "error", err)
 		response.InternalError(c, "Failed to delete fiscal year")
 		return
 	}
 
-	// Delete fiscal year
-	result, err := h.db.Exec(`DELETE FROM fiscal_years WHERE id = $1 AND tenant_id = $2`, id, tenantID)
-	if err != nil {
+	if _, err := tx.Exec(`DELETE FROM fiscal_years WHERE id = $1 AND tenant_id = $2`, id, tenantID); err != nil {
 		h.log.Error("Failed to delete fiscal year", "error", err)
 		response.InternalError(c, "Failed to delete fiscal year")
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		response.NotFound(c, "Fiscal year not found")
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit fiscal year deletion", "error", err)
+		response.InternalError(c, "Failed to delete fiscal year")
 		return
 	}
 
@@ -10851,7 +10917,14 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 			COALESCE(bl.line_type, 'expense') as line_type,
 			COALESCE(bl.budgeted_amount, 0) as planned,
 			COALESCE(
-				(SELECT SUM(jl.debit_amount - jl.credit_amount)
+				(SELECT
+					-- Revenue lines are credit-normal, so actual = credit - debit;
+					-- expense/other lines are debit-normal. Using a single
+					-- debit - credit made every revenue actual negative (always
+					-- "critical").
+					CASE WHEN COALESCE(bl.line_type, 'expense') = 'revenue'
+						THEN SUM(jl.credit_amount - jl.debit_amount)
+						ELSE SUM(jl.debit_amount - jl.credit_amount) END
 				 FROM journal_entry_lines jl
 				 JOIN journal_entries je ON je.id = jl.journal_entry_id
 				 WHERE jl.account_id = bl.account_id

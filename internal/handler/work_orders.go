@@ -1541,7 +1541,16 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 		// actually consumed (acc.cost / acc.qty). This matches the
 		// inventory_transactions rows that were just written.
 		effectiveUnitCost := acc.cost / acc.qty
-		h.postInventoryConsumptionJE(h.db, postInventoryConsumptionArgs{
+		// Post each component's consumption JE in its own transaction so the
+		// deferred balance trigger (migration 416) validates the header + both
+		// lines atomically at COMMIT; an imbalanced/partial JE is rolled back
+		// instead of leaving an orphan posted header.
+		jeTx, jeErr := h.db.Begin()
+		if jeErr != nil {
+			h.log.Error("consumeBOMComponents: failed to begin consumption JE tx", "error", jeErr, "po_id", poID, "component_id", acc.componentID)
+			continue
+		}
+		h.postInventoryConsumptionJE(jeTx, postInventoryConsumptionArgs{
 			TenantID:       tenantID,
 			OrganizationID: organizationID,
 			ProductID:      acc.componentID,
@@ -1553,6 +1562,10 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 			Description: fmt.Sprintf("Production order %s — BOM component consumption",
 				poID.String()[:8]),
 		})
+		if commitErr := jeTx.Commit(); commitErr != nil {
+			h.log.Error("consumeBOMComponents: failed to commit consumption JE", "error", commitErr, "po_id", poID, "component_id", acc.componentID)
+			jeTx.Rollback()
+		}
 	}
 }
 
@@ -1911,15 +1924,22 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 	entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
 	description := fmt.Sprintf("Ishlab chiqarish yakunlandi: %s - %s (soni: %.0f)", poNumber, productName, producedQty)
 
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("createFinishedGoodsJE: failed to begin journal tx", "error", txErr, "po_id", poID)
+		return
+	}
+	defer tx.Rollback()
+
 	if useDetailedFlow {
 		// Check if material consumption JE was already created at production start
 		var materialJEExists int
 		h.db.QueryRow(`
-			SELECT COUNT(*) FROM journal_entries
-			WHERE tenant_id = $1 AND organization_id = $2
-			AND description LIKE '%' || $3 || '%started - materials consumed%'
-			AND status = 'posted'
-		`, tenantID, organizationID, poNumber).Scan(&materialJEExists)
+        SELECT COUNT(*) FROM journal_entries
+        WHERE tenant_id = $1 AND organization_id = $2
+        AND description LIKE '%' || $3 || '%started - materials consumed%'
+        AND status = 'posted'
+    `, tenantID, organizationID, poNumber).Scan(&materialJEExists)
 		materialAlreadyJournalized := materialJEExists > 0
 
 		// Calculate entry total
@@ -1935,63 +1955,114 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 		}
 		entryTotal := wipInflow + totalCost
 
-		h.db.Exec(`
-			INSERT INTO journal_entries (
-				id, tenant_id, organization_id, journal_id, entry_number,
-				entry_date, description, source_type, source_id, status, total_debit, total_credit,
-				created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'production_complete', $8, 'posted', $9, $9, $10, $11, $11)
-		`, entryID, tenantID, organizationID, journalID, entryNumber,
-			now, description, poID.String(), entryTotal, userID, now)
+		if _, err := tx.Exec(`
+        INSERT INTO journal_entries (
+            id, tenant_id, organization_id, journal_id, entry_number,
+            entry_date, description, source_type, source_id, status, total_debit, total_credit,
+            created_by, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'production_complete', $8, 'posted', $9, $9, $10, $11, $11)
+    `, entryID, tenantID, organizationID, journalID, entryNumber,
+			now, description, poID.String(), entryTotal, userID, now); err != nil {
+			h.log.Error("createFinishedGoodsJE: failed to insert detailed journal entry", "error", err, "po_id", poID)
+			return
+		}
 
 		lineNum := 1
 
 		// Line 1: Dt WIP / Kt Raw Materials (skip if already done at start)
 		if totalMaterialCost > 0 && !materialAlreadyJournalized {
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-				VALUES ($1, $2, $3, 'NJI: xom ashyo sarflandi', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalMaterialCost, lineNum, now)
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+            VALUES ($1, $2, $3, 'NJI: xom ashyo sarflandi', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalMaterialCost, lineNum, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert WIP material debit line", "error", err, "po_id", poID)
+				return
+			}
 			lineNum++
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-				VALUES ($1, $2, $3, 'NJI: xom ashyo sarflandi', 0, $4, $5, $6)`, uuid.New(), entryID, rawAcct, totalMaterialCost, lineNum, now)
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+            VALUES ($1, $2, $3, 'NJI: xom ashyo sarflandi', 0, $4, $5, $6)`, uuid.New(), entryID, rawAcct, totalMaterialCost, lineNum, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert raw materials credit line", "error", err, "po_id", poID)
+				return
+			}
 			lineNum++
-			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct)
-			h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct)
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to update WIP balance (material)", "error", err, "po_id", poID)
+				return
+			}
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to update raw materials balance", "error", err, "po_id", poID)
+				return
+			}
 		}
 
 		// Line 2: Dt WIP / Kt Accrued Machine
 		if totalMachineCost > 0 && machineAcct != uuid.Nil {
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-				VALUES ($1, $2, $3, 'NJI: stanok xarajatlari', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalMachineCost, lineNum, now)
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+            VALUES ($1, $2, $3, 'NJI: stanok xarajatlari', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalMachineCost, lineNum, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert WIP machine debit line", "error", err, "po_id", poID)
+				return
+			}
 			lineNum++
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-				VALUES ($1, $2, $3, 'NJI: stanok xarajatlari', 0, $4, $5, $6)`, uuid.New(), entryID, machineAcct, totalMachineCost, lineNum, now)
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+            VALUES ($1, $2, $3, 'NJI: stanok xarajatlari', 0, $4, $5, $6)`, uuid.New(), entryID, machineAcct, totalMachineCost, lineNum, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert machine credit line", "error", err, "po_id", poID)
+				return
+			}
 			lineNum++
-			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, wipAcct)
-			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, machineAcct)
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, wipAcct); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to update WIP balance (machine)", "error", err, "po_id", poID)
+				return
+			}
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, machineAcct); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to update machine balance", "error", err, "po_id", poID)
+				return
+			}
 		}
 
 		// Line 3: Dt WIP / Kt Accrued Salary
 		if totalLaborCost > 0 && salaryAcct != uuid.Nil {
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-				VALUES ($1, $2, $3, 'NJI: ish haqi xarajatlari', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalLaborCost, lineNum, now)
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+            VALUES ($1, $2, $3, 'NJI: ish haqi xarajatlari', $4, 0, $5, $6)`, uuid.New(), entryID, wipAcct, totalLaborCost, lineNum, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert WIP labor debit line", "error", err, "po_id", poID)
+				return
+			}
 			lineNum++
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-				VALUES ($1, $2, $3, 'NJI: ish haqi xarajatlari', 0, $4, $5, $6)`, uuid.New(), entryID, salaryAcct, totalLaborCost, lineNum, now)
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+            VALUES ($1, $2, $3, 'NJI: ish haqi xarajatlari', 0, $4, $5, $6)`, uuid.New(), entryID, salaryAcct, totalLaborCost, lineNum, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert salary credit line", "error", err, "po_id", poID)
+				return
+			}
 			lineNum++
-			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, wipAcct)
-			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, salaryAcct)
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, wipAcct); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to update WIP balance (labor)", "error", err, "po_id", poID)
+				return
+			}
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, salaryAcct); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to update salary balance", "error", err, "po_id", poID)
+				return
+			}
 		}
 
 		// Line 4: Dt 1330 Finished Goods / Kt 1320 WIP = totalCost
-		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-			VALUES ($1, $2, $3, 'Tayyor mahsulot ishlab chiqarishdan', $4, 0, $5, $6)`, uuid.New(), entryID, finishedAcct, totalCost, lineNum, now)
+		if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+        VALUES ($1, $2, $3, 'Tayyor mahsulot ishlab chiqarishdan', $4, 0, $5, $6)`, uuid.New(), entryID, finishedAcct, totalCost, lineNum, now); err != nil {
+			h.log.Error("createFinishedGoodsJE: failed to insert finished goods debit line", "error", err, "po_id", poID)
+			return
+		}
 		lineNum++
-		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-			VALUES ($1, $2, $3, 'Tayyor mahsulot ishlab chiqarishdan', 0, $4, $5, $6)`, uuid.New(), entryID, wipAcct, totalCost, lineNum, now)
+		if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+        VALUES ($1, $2, $3, 'Tayyor mahsulot ishlab chiqarishdan', 0, $4, $5, $6)`, uuid.New(), entryID, wipAcct, totalCost, lineNum, now); err != nil {
+			h.log.Error("createFinishedGoodsJE: failed to insert WIP transfer credit line", "error", err, "po_id", poID)
+			return
+		}
 
 		// Update balances: Finished Goods up, WIP down
-		h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, finishedAcct)
-		h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, wipAcct)
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, finishedAcct); err != nil {
+			h.log.Error("createFinishedGoodsJE: failed to update finished goods balance", "error", err, "po_id", poID)
+			return
+		}
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, wipAcct); err != nil {
+			h.log.Error("createFinishedGoodsJE: failed to update WIP balance (transfer)", "error", err, "po_id", poID)
+			return
+		}
 
 	} else {
 		// Fallback: Dt Inventory / Kt COGS
@@ -2006,27 +2077,50 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 		}
 
 		if inventoryAcct != uuid.Nil && cogsAcct != uuid.Nil {
-			h.db.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number,
-					entry_date, description, source_type, source_id, status, total_debit, total_credit,
-					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'production_complete', $8, 'posted', $9, $9, $10, $11, $11)
-			`, entryID, tenantID, organizationID, journalID, entryNumber,
-				now, description, poID.String(), totalCost, userID, now)
+			if _, err := tx.Exec(`
+            INSERT INTO journal_entries (
+                id, tenant_id, organization_id, journal_id, entry_number,
+                entry_date, description, source_type, source_id, status, total_debit, total_credit,
+                created_by, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'production_complete', $8, 'posted', $9, $9, $10, $11, $11)
+        `, entryID, tenantID, organizationID, journalID, entryNumber,
+				now, description, poID.String(), totalCost, userID, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert fallback journal entry", "error", err, "po_id", poID)
+				return
+			}
 
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-				VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`, uuid.New(), entryID, inventoryAcct, description, totalCost, now)
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-				VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`, uuid.New(), entryID, cogsAcct, description, totalCost, now)
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+            VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`, uuid.New(), entryID, inventoryAcct, description, totalCost, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert fallback inventory line", "error", err, "po_id", poID)
+				return
+			}
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+            VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`, uuid.New(), entryID, cogsAcct, description, totalCost, now); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to insert fallback COGS line", "error", err, "po_id", poID)
+				return
+			}
 
-			h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAcct)
-			h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAcct)
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAcct); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to update fallback inventory balance", "error", err, "po_id", poID)
+				return
+			}
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAcct); err != nil {
+				h.log.Error("createFinishedGoodsJE: failed to update fallback COGS balance", "error", err, "po_id", poID)
+				return
+			}
 		}
 	}
 
 	// Update journal next_number
-	h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+	if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
+		h.log.Error("createFinishedGoodsJE: failed to bump journal next_number", "error", err, "po_id", poID)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("createFinishedGoodsJE: failed to commit journal entry", "error", err, "po_id", poID)
+		return
+	}
 	h.log.Info("createFinishedGoodsJE: journal entry created", "po_id", poID, "entry_id", entryID, "total_cost", totalCost)
 }
 
@@ -2295,18 +2389,27 @@ func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
 			if effectiveUnitCost == 0 {
 				effectiveUnitCost = unitCost
 			}
-			h.postInventoryConsumptionJE(h.db, postInventoryConsumptionArgs{
-				TenantID:       tenantID,
-				OrganizationID: organizationID,
-				ProductID:      input.ProductID,
-				Quantity:       input.Quantity,
-				UnitCost:       effectiveUnitCost,
-				SourceType:     "work_order_material_add",
-				SourceID:       id,
-				IdempotencyKey: fmt.Sprintf("WO-MAT-%s", id.String()),
-				Description: fmt.Sprintf("Work order material — %s × %.2f %s",
-					productName, input.Quantity, input.UOM),
-			})
+			jeTx, jeErr := h.db.Begin()
+			if jeErr != nil {
+				h.log.Error("AddWorkOrderMaterial: failed to begin consumption JE tx", "error", jeErr, "po_id", poID)
+			} else {
+				h.postInventoryConsumptionJE(jeTx, postInventoryConsumptionArgs{
+					TenantID:       tenantID,
+					OrganizationID: organizationID,
+					ProductID:      input.ProductID,
+					Quantity:       input.Quantity,
+					UnitCost:       effectiveUnitCost,
+					SourceType:     "work_order_material_add",
+					SourceID:       id,
+					IdempotencyKey: fmt.Sprintf("WO-MAT-%s", id.String()),
+					Description: fmt.Sprintf("Work order material — %s × %.2f %s",
+						productName, input.Quantity, input.UOM),
+				})
+				if commitErr := jeTx.Commit(); commitErr != nil {
+					h.log.Error("AddWorkOrderMaterial: failed to commit consumption JE", "error", commitErr, "po_id", poID)
+					jeTx.Rollback()
+				}
+			}
 		}
 	}
 

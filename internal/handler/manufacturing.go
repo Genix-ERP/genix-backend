@@ -173,11 +173,11 @@ func (h *Handler) ListWorkCenters(c *gin.Context) {
 
 	// Sorting
 	validSortColumns := map[string]string{
-		"name":         "wc.name",
-		"code":         "wc.code",
-		"status":       "wc.status",
-		"utilization":  "wc.current_utilization",
-		"created_at":   "wc.created_at",
+		"name":        "wc.name",
+		"code":        "wc.code",
+		"status":      "wc.status",
+		"utilization": "wc.current_utilization",
+		"created_at":  "wc.created_at",
 	}
 	sortColumn := validSortColumns[filter.SortBy]
 	if sortColumn == "" {
@@ -718,15 +718,33 @@ func (h *Handler) UpdateWorkCenter(c *gin.Context) {
 			&cur.PowerKW, &cur.ElectricityRate, &cur.AnnualMaintenance,
 			&cur.OperatorMonthlySalary, &cur.OverheadCost, &cur.LaborRateType)
 
-		if input.AssetValue != nil { cur.AssetValue = *input.AssetValue }
-		if input.UsefulLifeYears != nil { cur.UsefulLifeYears = *input.UsefulLifeYears }
-		if input.WorkingHoursPerDay != nil { cur.WorkingHoursPerDay = *input.WorkingHoursPerDay }
-		if input.PowerKW != nil { cur.PowerKW = *input.PowerKW }
-		if input.ElectricityRate != nil { cur.ElectricityRate = *input.ElectricityRate }
-		if input.AnnualMaintenance != nil { cur.AnnualMaintenance = *input.AnnualMaintenance }
-		if input.OperatorMonthlySalary != nil { cur.OperatorMonthlySalary = *input.OperatorMonthlySalary }
-		if input.OverheadCost != nil { cur.OverheadCost = *input.OverheadCost }
-		if input.LaborRateType != nil { cur.LaborRateType = *input.LaborRateType }
+		if input.AssetValue != nil {
+			cur.AssetValue = *input.AssetValue
+		}
+		if input.UsefulLifeYears != nil {
+			cur.UsefulLifeYears = *input.UsefulLifeYears
+		}
+		if input.WorkingHoursPerDay != nil {
+			cur.WorkingHoursPerDay = *input.WorkingHoursPerDay
+		}
+		if input.PowerKW != nil {
+			cur.PowerKW = *input.PowerKW
+		}
+		if input.ElectricityRate != nil {
+			cur.ElectricityRate = *input.ElectricityRate
+		}
+		if input.AnnualMaintenance != nil {
+			cur.AnnualMaintenance = *input.AnnualMaintenance
+		}
+		if input.OperatorMonthlySalary != nil {
+			cur.OperatorMonthlySalary = *input.OperatorMonthlySalary
+		}
+		if input.OverheadCost != nil {
+			cur.OverheadCost = *input.OverheadCost
+		}
+		if input.LaborRateType != nil {
+			cur.LaborRateType = *input.LaborRateType
+		}
 
 		hasDetailed := cur.AssetValue > 0 || cur.PowerKW > 0 || cur.AnnualMaintenance > 0 || cur.OperatorMonthlySalary > 0
 		if hasDetailed {
@@ -1035,11 +1053,11 @@ func (h *Handler) ListProductionOrders(c *gin.Context) {
 
 	// Sorting
 	validSortColumns := map[string]string{
-		"code":           "po.code",
-		"status":         "po.status",
-		"priority":       "po.priority",
+		"code":            "po.code",
+		"status":          "po.status",
+		"priority":        "po.priority",
 		"scheduled_start": "po.scheduled_start",
-		"created_at":     "po.created_at",
+		"created_at":      "po.created_at",
 	}
 	sortColumn := validSortColumns[filter.SortBy]
 	if sortColumn == "" {
@@ -2007,18 +2025,18 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		// Step 1: Read all BOM operations into a slice first
 		// (lib/pq doesn't support executing queries while iterating rows on the same transaction)
 		type bomOp struct {
-			ID              uuid.UUID
-			Sequence        int
-			OperationName   string
-			WorkCenterID    *uuid.UUID
-			SetupTime       float64
-			RunTime         float64
-			LaborCost       float64
-			OverheadCost    float64
-			Notes           *string
-			WCHourlyCost    float64
-			WCSetupCost     float64
-			WCOverheadCost  float64
+			ID             uuid.UUID
+			Sequence       int
+			OperationName  string
+			WorkCenterID   *uuid.UUID
+			SetupTime      float64
+			RunTime        float64
+			LaborCost      float64
+			OverheadCost   float64
+			Notes          *string
+			WCHourlyCost   float64
+			WCSetupCost    float64
+			WCOverheadCost float64
 		}
 
 		opsQuery := `
@@ -2699,39 +2717,71 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 									description = fmt.Sprintf("Production Order %s started - %s - materials consumed", poNumber, prodNameStarted)
 								}
 
-								h.db.Exec(`
-									INSERT INTO journal_entries (
-										id, tenant_id, organization_id, journal_id, entry_number,
-										entry_date, description, status, total_debit, total_credit,
-										created_at, updated_at
-									) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
-								`, entryID, tenantID, organizationID, journalID, entryNumber,
-									now, description, totalMaterialCost, now)
+								func() {
+									jeTx, jeErr := h.db.Begin()
+									if jeErr != nil {
+										h.log.Error("Failed to begin start material consumption journal tx", "error", jeErr, "order_id", id)
+										return
+									}
+									defer jeTx.Rollback()
 
-								// Dt 1320 WIP
-								h.db.Exec(`
-									INSERT INTO journal_entry_lines (
-										id, journal_entry_id, account_id, description,
-										debit_amount, credit_amount, line_number, created_at
-									) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
-								`, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, now)
+									if _, err := jeTx.Exec(`
+        INSERT INTO journal_entries (
+            id, tenant_id, organization_id, journal_id, entry_number,
+            entry_date, description, status, total_debit, total_credit,
+            created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
+    `, entryID, tenantID, organizationID, journalID, entryNumber,
+										now, description, totalMaterialCost, now); err != nil {
+										h.log.Error("Failed to insert start material consumption journal entry", "error", err, "order_id", id)
+										return
+									}
 
-								// Kt 1310 Raw Materials
-								h.db.Exec(`
-									INSERT INTO journal_entry_lines (
-										id, journal_entry_id, account_id, description,
-										debit_amount, credit_amount, line_number, created_at
-									) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
-								`, uuid.New(), entryID, rawAcct, "Raw materials issued to production", totalMaterialCost, now)
+									// Dt 1320 WIP
+									if _, err := jeTx.Exec(`
+        INSERT INTO journal_entry_lines (
+            id, journal_entry_id, account_id, description,
+            debit_amount, credit_amount, line_number, created_at
+        ) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+    `, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, now); err != nil {
+										h.log.Error("Failed to insert WIP debit line", "error", err, "order_id", id)
+										return
+									}
 
-								// Update account balances
-								h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct)
-								h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct)
+									// Kt 1310 Raw Materials
+									if _, err := jeTx.Exec(`
+        INSERT INTO journal_entry_lines (
+            id, journal_entry_id, account_id, description,
+            debit_amount, credit_amount, line_number, created_at
+        ) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+    `, uuid.New(), entryID, rawAcct, "Raw materials issued to production", totalMaterialCost, now); err != nil {
+										h.log.Error("Failed to insert raw materials credit line", "error", err, "order_id", id)
+										return
+									}
 
-								// Increment journal number
-								h.db.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID)
+									// Update account balances
+									if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct); err != nil {
+										h.log.Error("Failed to update WIP account balance", "error", err, "order_id", id)
+										return
+									}
+									if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct); err != nil {
+										h.log.Error("Failed to update raw materials account balance", "error", err, "order_id", id)
+										return
+									}
 
-								h.log.Info("Created material consumption journal entry", "order_id", id, "amount", totalMaterialCost)
+									// Increment journal number
+									if _, err := jeTx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID); err != nil {
+										h.log.Error("Failed to bump journal next_number", "error", err, "order_id", id)
+										return
+									}
+
+									if err := jeTx.Commit(); err != nil {
+										h.log.Error("Failed to commit start material consumption journal entry", "error", err, "order_id", id)
+										return
+									}
+
+									h.log.Info("Created material consumption journal entry", "order_id", id, "amount", totalMaterialCost)
+								}()
 							}
 						}
 					}
@@ -3110,79 +3160,79 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 	}
 
 	if !alreadyReceived {
-	tx, txErr := h.db.Begin()
-	if txErr != nil {
-		h.log.Error("Failed to start inventory transaction", "error", txErr)
-		h.GetProductionOrder(c)
-		return
-	}
-	defer tx.Rollback()
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to start inventory transaction", "error", txErr)
+			h.GetProductionOrder(c)
+			return
+		}
+		defer tx.Rollback()
 
-	// Add finished product to inventory
-	var invID uuid.UUID
-	err = tx.QueryRow(`
+		// Add finished product to inventory
+		var invID uuid.UUID
+		err = tx.QueryRow(`
 		SELECT id FROM inventory
 		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
 		AND lot_number IS NULL AND serial_number IS NULL
 	`, tenantID, productID, warehouseID).Scan(&invID)
 
-	if err == sql.ErrNoRows {
-		invID = uuid.New()
-		_, err = tx.Exec(`
+		if err == sql.ErrNoRows {
+			invID = uuid.New()
+			_, err = tx.Exec(`
 			INSERT INTO inventory (
 				id, tenant_id, organization_id, product_id, warehouse_id,
 				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8, $8)
 		`, invID, tenantID, organizationID, productID, warehouseID, producedQty, unitCost, now)
-	} else if err == nil {
-		_, err = tx.Exec(`
+		} else if err == nil {
+			_, err = tx.Exec(`
 			UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2
 			WHERE id = $3
 		`, producedQty, now, invID)
-	}
-	if err != nil {
-		h.log.Error("Failed to update finished product inventory", "error", err)
-		h.GetProductionOrder(c)
-		return
-	}
+		}
+		if err != nil {
+			h.log.Error("Failed to update finished product inventory", "error", err)
+			h.GetProductionOrder(c)
+			return
+		}
 
-	// Create receipt transaction for finished product
-	_, err = tx.Exec(`
+		// Create receipt transaction for finished product
+		_, err = tx.Exec(`
 		INSERT INTO inventory_transactions (
 			id, tenant_id, organization_id, inventory_id, transaction_type,
 			reference_type, reference_id, quantity, unit_cost, total_cost,
 			reason, notes, transaction_date, created_by, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
 	`, uuid.New(), tenantID, organizationID, invID, entity.TransactionTypeReceipt,
-		"production_order", id, producedQty, unitCost, producedQty*unitCost,
-		"production_complete", "Auto-generated from production order completion", now, userID)
-	if err != nil {
-		h.log.Error("Failed to create receipt transaction", "error", err)
-		h.GetProductionOrder(c)
-		return
-	}
+			"production_order", id, producedQty, unitCost, producedQty*unitCost,
+			"production_complete", "Auto-generated from production order completion", now, userID)
+		if err != nil {
+			h.log.Error("Failed to create receipt transaction", "error", err)
+			h.GetProductionOrder(c)
+			return
+		}
 
-	// Note: BOM component consumption is handled in StartProductionOrder (when production begins)
+		// Note: BOM component consumption is handled in StartProductionOrder (when production begins)
 
-	if commitErr := tx.Commit(); commitErr != nil {
-		h.log.Error("Failed to commit inventory transaction", "error", commitErr)
-	}
+		if commitErr := tx.Commit(); commitErr != nil {
+			h.log.Error("Failed to commit inventory transaction", "error", commitErr)
+		}
 
-	// Lot insert lives OUTSIDE the transaction — in PostgreSQL any error
-	// inside a tx poisons it and makes COMMIT fail, so a lot-insert failure
-	// was silently rolling back the inventory update above.
-	lotID := uuid.New()
-	lotNumber := fmt.Sprintf("MFG-%s", id.String()[:8])
-	if _, lotErr := h.db.Exec(`
+		// Lot insert lives OUTSIDE the transaction — in PostgreSQL any error
+		// inside a tx poisons it and makes COMMIT fail, so a lot-insert failure
+		// was silently rolling back the inventory update above.
+		lotID := uuid.New()
+		lotNumber := fmt.Sprintf("MFG-%s", id.String()[:8])
+		if _, lotErr := h.db.Exec(`
 		INSERT INTO inventory_lots (
 			id, tenant_id, product_id, warehouse_id, lot_number,
 			received_date, initial_quantity, remaining_quantity,
 			unit_cost, status, created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6::date, $7, $7, $8, 'available', $9, $9)
 	`, lotID, tenantID, productID, warehouseID, lotNumber,
-		now, producedQty, unitCost, now); lotErr != nil {
-		h.log.Error("CompleteProductionOrder: lot insert failed (non-fatal)", "error", lotErr, "po_id", id)
-	}
+			now, producedQty, unitCost, now); lotErr != nil {
+			h.log.Error("CompleteProductionOrder: lot insert failed (non-fatal)", "error", lotErr, "po_id", id)
+		}
 	} // end if !alreadyReceived
 
 	// ============================================
@@ -3278,193 +3328,269 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 			h.log.Info("CompleteProductionOrder: journal creation",
 				"useDetailedFlow", useDetailedFlow, "journalID", journalID, "entryID", entryID, "entryNumber", entryNumber)
 
-			if useDetailedFlow {
-				// ---- Detailed WIP journal entry ----
-
-				// Check if material consumption JE was already created at confirm or start
-				var materialJEExists int
-				h.db.QueryRow(`
-					SELECT COUNT(*) FROM journal_entries
-					WHERE tenant_id = $1 AND organization_id = $2
-					AND (description LIKE '%' || $3 || '%started - materials consumed%'
-					     OR description LIKE '%' || $3 || '%confirmed - planned material cost%')
-					AND status = 'posted'
-				`, tenantID, organizationID, poNumber).Scan(&materialJEExists)
-				materialAlreadyJournalized := materialJEExists > 0
-
-				// Compute actual entry total: sum of all debit amounts that will be posted
-				// Lines 1-3 flow into WIP, Line 4 transfers WIP to Finished Goods
-				wipInflow := float64(0)
-				if totalMaterialCost > 0 && !materialAlreadyJournalized {
-					wipInflow += totalMaterialCost
+			func() {
+				jeTx, jeErr := h.db.Begin()
+				if jeErr != nil {
+					h.log.Error("CompleteProductionOrder: failed to begin journal tx", "error", jeErr, "po_id", id)
+					return
 				}
-				if totalMachineCost > 0 && machineAcct != uuid.Nil {
-					wipInflow += totalMachineCost
-				}
-				if totalLaborCost > 0 && salaryAcct != uuid.Nil {
-					wipInflow += totalLaborCost
-				}
-				entryTotal := wipInflow + totalCost // WIP debits + Finished Goods debit
+				defer jeTx.Rollback()
 
-				h.db.Exec(`
-					INSERT INTO journal_entries (
-						id, tenant_id, organization_id, journal_id, entry_number,
-						entry_date, description, status, total_debit, total_credit,
-						created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
-				`, entryID, tenantID, organizationID, journalID, entryNumber,
-					now, description, entryTotal, now)
+				if useDetailedFlow {
+					// ---- Detailed WIP journal entry ----
 
-				lineNum := 1
+					// Check if material consumption JE was already created at confirm or start
+					var materialJEExists int
+					h.db.QueryRow(`
+            SELECT COUNT(*) FROM journal_entries
+            WHERE tenant_id = $1 AND organization_id = $2
+            AND (description LIKE '%' || $3 || '%started - materials consumed%'
+                 OR description LIKE '%' || $3 || '%confirmed - planned material cost%')
+            AND status = 'posted'
+        `, tenantID, organizationID, poNumber).Scan(&materialJEExists)
+					materialAlreadyJournalized := materialJEExists > 0
 
-				// Line 1: Dt WIP / Kt Raw Materials = materialCost (skip if already journalized at start)
-				if totalMaterialCost > 0 && !materialAlreadyJournalized {
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
-					`, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, lineNum, now)
+					// Compute actual entry total: sum of all debit amounts that will be posted
+					wipInflow := float64(0)
+					if totalMaterialCost > 0 && !materialAlreadyJournalized {
+						wipInflow += totalMaterialCost
+					}
+					if totalMachineCost > 0 && machineAcct != uuid.Nil {
+						wipInflow += totalMachineCost
+					}
+					if totalLaborCost > 0 && salaryAcct != uuid.Nil {
+						wipInflow += totalLaborCost
+					}
+					entryTotal := wipInflow + totalCost // WIP debits + Finished Goods debit
+
+					if _, err := jeTx.Exec(`
+            INSERT INTO journal_entries (
+                id, tenant_id, organization_id, journal_id, entry_number,
+                entry_date, description, status, total_debit, total_credit,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
+        `, entryID, tenantID, organizationID, journalID, entryNumber,
+						now, description, entryTotal, now); err != nil {
+						h.log.Error("CompleteProductionOrder: failed to insert detailed journal entry", "error", err, "po_id", id)
+						return
+					}
+
+					lineNum := 1
+
+					// Line 1: Dt WIP / Kt Raw Materials = materialCost (skip if already journalized at start)
+					if totalMaterialCost > 0 && !materialAlreadyJournalized {
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entry_lines (
+                    id, journal_entry_id, account_id, description,
+                    debit_amount, credit_amount, line_number, created_at
+                ) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+            `, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, lineNum, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert WIP material debit line", "error", err, "po_id", id)
+							return
+						}
+						lineNum++
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entry_lines (
+                    id, journal_entry_id, account_id, description,
+                    debit_amount, credit_amount, line_number, created_at
+                ) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
+            `, uuid.New(), entryID, rawAcct, "WIP: raw materials consumed", totalMaterialCost, lineNum, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert raw materials credit line", "error", err, "po_id", id)
+							return
+						}
+						lineNum++
+						if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to update WIP balance (material)", "error", err, "po_id", id)
+							return
+						}
+						if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to update raw materials balance", "error", err, "po_id", id)
+							return
+						}
+					}
+
+					// Line 2: Dt WIP / Kt Accrued Machine = machineCost
+					if totalMachineCost > 0 && machineAcct != uuid.Nil {
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entry_lines (
+                    id, journal_entry_id, account_id, description,
+                    debit_amount, credit_amount, line_number, created_at
+                ) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+            `, uuid.New(), entryID, wipAcct, "WIP: machine costs accrued", totalMachineCost, lineNum, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert WIP machine debit line", "error", err, "po_id", id)
+							return
+						}
+						lineNum++
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entry_lines (
+                    id, journal_entry_id, account_id, description,
+                    debit_amount, credit_amount, line_number, created_at
+                ) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
+            `, uuid.New(), entryID, machineAcct, "WIP: machine costs accrued", totalMachineCost, lineNum, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert machine credit line", "error", err, "po_id", id)
+							return
+						}
+						lineNum++
+						if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, wipAcct); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to update WIP balance (machine)", "error", err, "po_id", id)
+							return
+						}
+						if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, machineAcct); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to update machine balance", "error", err, "po_id", id)
+							return
+						}
+					}
+
+					// Line 3: Dt WIP / Kt Accrued Salary = laborCost
+					if totalLaborCost > 0 && salaryAcct != uuid.Nil {
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entry_lines (
+                    id, journal_entry_id, account_id, description,
+                    debit_amount, credit_amount, line_number, created_at
+                ) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+            `, uuid.New(), entryID, wipAcct, "WIP: labor costs accrued", totalLaborCost, lineNum, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert WIP labor debit line", "error", err, "po_id", id)
+							return
+						}
+						lineNum++
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entry_lines (
+                    id, journal_entry_id, account_id, description,
+                    debit_amount, credit_amount, line_number, created_at
+                ) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
+            `, uuid.New(), entryID, salaryAcct, "WIP: labor costs accrued", totalLaborCost, lineNum, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert salary credit line", "error", err, "po_id", id)
+							return
+						}
+						lineNum++
+						if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, wipAcct); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to update WIP balance (labor)", "error", err, "po_id", id)
+							return
+						}
+						if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, salaryAcct); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to update salary balance", "error", err, "po_id", id)
+							return
+						}
+					}
+
+					// Line 4: Dt Finished Goods / Kt WIP = totalCost
+					if _, err := jeTx.Exec(`
+            INSERT INTO journal_entry_lines (
+                id, journal_entry_id, account_id, description,
+                debit_amount, credit_amount, line_number, created_at
+            ) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
+        `, uuid.New(), entryID, finishedAcct, "Finished goods from production", totalCost, lineNum, now); err != nil {
+						h.log.Error("CompleteProductionOrder: failed to insert finished goods debit line", "error", err, "po_id", id)
+						return
+					}
 					lineNum++
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
-					`, uuid.New(), entryID, rawAcct, "WIP: raw materials consumed", totalMaterialCost, lineNum, now)
-					lineNum++
+					if _, err := jeTx.Exec(`
+            INSERT INTO journal_entry_lines (
+                id, journal_entry_id, account_id, description,
+                debit_amount, credit_amount, line_number, created_at
+            ) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
+        `, uuid.New(), entryID, wipAcct, "Finished goods from production", totalCost, lineNum, now); err != nil {
+						h.log.Error("CompleteProductionOrder: failed to insert WIP transfer credit line", "error", err, "po_id", id)
+						return
+					}
+					if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, finishedAcct); err != nil {
+						h.log.Error("CompleteProductionOrder: failed to update finished goods balance", "error", err, "po_id", id)
+						return
+					}
+					if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, wipAcct); err != nil {
+						h.log.Error("CompleteProductionOrder: failed to update WIP balance (transfer)", "error", err, "po_id", id)
+						return
+					}
 
-					// Update account balances
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, rawAcct)
-				}
-
-				// Line 2: Dt WIP / Kt Accrued Machine = machineCost
-				if totalMachineCost > 0 && machineAcct != uuid.Nil {
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
-					`, uuid.New(), entryID, wipAcct, "WIP: machine costs accrued", totalMachineCost, lineNum, now)
-					lineNum++
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
-					`, uuid.New(), entryID, machineAcct, "WIP: machine costs accrued", totalMachineCost, lineNum, now)
-					lineNum++
-
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, wipAcct)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMachineCost, now, machineAcct)
-				}
-
-				// Line 3: Dt WIP / Kt Accrued Salary = laborCost
-				if totalLaborCost > 0 && salaryAcct != uuid.Nil {
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
-					`, uuid.New(), entryID, wipAcct, "WIP: labor costs accrued", totalLaborCost, lineNum, now)
-					lineNum++
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
-					`, uuid.New(), entryID, salaryAcct, "WIP: labor costs accrued", totalLaborCost, lineNum, now)
-					lineNum++
-
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, wipAcct)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalLaborCost, now, salaryAcct)
-				}
-
-				// Line 4: Dt Finished Goods / Kt WIP = totalCost
-				h.db.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, account_id, description,
-						debit_amount, credit_amount, line_number, created_at
-					) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)
-				`, uuid.New(), entryID, finishedAcct, "Finished goods from production", totalCost, lineNum, now)
-				lineNum++
-				h.db.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, account_id, description,
-						debit_amount, credit_amount, line_number, created_at
-					) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)
-				`, uuid.New(), entryID, wipAcct, "Finished goods from production", totalCost, lineNum, now)
-
-				// Update account balances for the WIP→Finished transfer
-				h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, finishedAcct)
-				h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, wipAcct)
-
-			} else {
-				// ---- Fallback: simplified Dt Inventory / Kt COGS (original behaviour) ----
-				ca := getCategoryAccounts(h.db, tenantID, organizationID, productID)
-				inventoryAccountID := ca.StockValuationAccountID
-				cogsAccountID := ca.ExpenseAccountID
-				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "9120")
-				}
-				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "9110")
-				}
-				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "ishlab chiqarish", "9120")
-				}
-				if cogsAccountID == uuid.Nil {
-					cogsAccountID = findAccount(h.db, tenantID, organizationID, "tannarx", "9110")
-				}
-				if inventoryAccountID == uuid.Nil {
-					inventoryAccountID = getInventoryAccountByType(h.db, tenantID, organizationID, productID)
-				}
-				if inventoryAccountID == uuid.Nil {
-					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "inventory", "1010")
-				}
-				if inventoryAccountID == uuid.Nil {
-					inventoryAccountID = findAccount(h.db, tenantID, organizationID, "tovar-moddiy", "1010")
-				}
-
-				h.log.Info("CompleteProductionOrder: fallback accounting",
-					"inventoryAccountID", inventoryAccountID, "cogsAccountID", cogsAccountID)
-
-				if inventoryAccountID != uuid.Nil && cogsAccountID != uuid.Nil {
-					h.db.Exec(`
-						INSERT INTO journal_entries (
-							id, tenant_id, organization_id, journal_id, entry_number,
-							entry_date, description, status, total_debit, total_credit,
-							created_at, updated_at
-						) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
-					`, entryID, tenantID, organizationID, journalID, entryNumber,
-						now, description, totalCost, now)
-
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
-					`, uuid.New(), entryID, inventoryAccountID, description, totalCost, now)
-
-					h.db.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, account_id, description,
-							debit_amount, credit_amount, line_number, created_at
-						) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
-					`, uuid.New(), entryID, cogsAccountID, description, totalCost, now)
-
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAccountID)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAccountID)
 				} else {
-					h.log.Warn("CompleteProductionOrder: SKIPPED journal entry - missing accounts in fallback",
-						"inventoryAccountID", inventoryAccountID, "cogsAccountID", cogsAccountID,
-						"productID", productID, "totalCost", totalCost)
-				}
-			}
+					// ---- Fallback: simplified Dt Inventory / Kt COGS (original behaviour) ----
+					ca := getCategoryAccounts(h.db, tenantID, organizationID, productID)
+					inventoryAccountID := ca.StockValuationAccountID
+					cogsAccountID := ca.ExpenseAccountID
+					if cogsAccountID == uuid.Nil {
+						cogsAccountID = findAccount(h.db, tenantID, organizationID, "manufacturing", "9120")
+					}
+					if cogsAccountID == uuid.Nil {
+						cogsAccountID = findAccount(h.db, tenantID, organizationID, "cost of production", "9110")
+					}
+					if cogsAccountID == uuid.Nil {
+						cogsAccountID = findAccount(h.db, tenantID, organizationID, "ishlab chiqarish", "9120")
+					}
+					if cogsAccountID == uuid.Nil {
+						cogsAccountID = findAccount(h.db, tenantID, organizationID, "tannarx", "9110")
+					}
+					if inventoryAccountID == uuid.Nil {
+						inventoryAccountID = getInventoryAccountByType(h.db, tenantID, organizationID, productID)
+					}
+					if inventoryAccountID == uuid.Nil {
+						inventoryAccountID = findAccount(h.db, tenantID, organizationID, "inventory", "1010")
+					}
+					if inventoryAccountID == uuid.Nil {
+						inventoryAccountID = findAccount(h.db, tenantID, organizationID, "tovar-moddiy", "1010")
+					}
 
-			// Update journal next_number
-			h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+					h.log.Info("CompleteProductionOrder: fallback accounting",
+						"inventoryAccountID", inventoryAccountID, "cogsAccountID", cogsAccountID)
+
+					if inventoryAccountID != uuid.Nil && cogsAccountID != uuid.Nil {
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entries (
+                    id, tenant_id, organization_id, journal_id, entry_number,
+                    entry_date, description, status, total_debit, total_credit,
+                    created_at, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
+            `, entryID, tenantID, organizationID, journalID, entryNumber,
+							now, description, totalCost, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert fallback journal entry", "error", err, "po_id", id)
+							return
+						}
+
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entry_lines (
+                    id, journal_entry_id, account_id, description,
+                    debit_amount, credit_amount, line_number, created_at
+                ) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
+            `, uuid.New(), entryID, inventoryAccountID, description, totalCost, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert fallback inventory line", "error", err, "po_id", id)
+							return
+						}
+
+						if _, err := jeTx.Exec(`
+                INSERT INTO journal_entry_lines (
+                    id, journal_entry_id, account_id, description,
+                    debit_amount, credit_amount, line_number, created_at
+                ) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
+            `, uuid.New(), entryID, cogsAccountID, description, totalCost, now); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to insert fallback COGS line", "error", err, "po_id", id)
+							return
+						}
+
+						if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, inventoryAccountID); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to update fallback inventory balance", "error", err, "po_id", id)
+							return
+						}
+						if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, cogsAccountID); err != nil {
+							h.log.Error("CompleteProductionOrder: failed to update fallback COGS balance", "error", err, "po_id", id)
+							return
+						}
+					} else {
+						h.log.Warn("CompleteProductionOrder: SKIPPED journal entry - missing accounts in fallback",
+							"inventoryAccountID", inventoryAccountID, "cogsAccountID", cogsAccountID,
+							"productID", productID, "totalCost", totalCost)
+					}
+				}
+
+				// Update journal next_number
+				if _, err := jeTx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
+					h.log.Error("CompleteProductionOrder: failed to bump journal next_number", "error", err, "po_id", id)
+					return
+				}
+
+				if err := jeTx.Commit(); err != nil {
+					h.log.Error("CompleteProductionOrder: failed to commit journal entry", "error", err, "po_id", id)
+					return
+				}
+			}()
 
 			h.log.Info("Journal entry created for production order completion",
 				"entry_id", entryID, "total_cost", totalCost,
@@ -3635,27 +3761,51 @@ func (h *Handler) returnUnusedComponents(
 				description := fmt.Sprintf("Material return - %s shortfall %.2f (produced %.2f / planned %.2f)",
 					poNumber, shortfall, qtyProduced, qtyPlanned)
 
-				h.db.Exec(`
-					INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
-						date, description, status, created_by, created_at, updated_at)
-					VALUES ($1,$2,$3,$4,$5,$6,$7,'posted',$8,$6,$6)
-				`, entryID, tenantID, organizationID, journalID, entryNumber, now, description, userID)
+				jeTx, jeErr := h.db.Begin()
+				if jeErr != nil {
+					h.log.Error("returnUnusedComponents: failed to begin journal tx", "error", jeErr, "po_id", poID)
+					return
+				}
+				defer jeTx.Rollback()
+
+				if _, err := jeTx.Exec(`
+    INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
+        entry_date, description, status, created_by, created_at, updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,'posted',$8,$6,$6)
+`, entryID, tenantID, organizationID, journalID, entryNumber, now, description, userID); err != nil {
+					h.log.Error("returnUnusedComponents: failed to insert journal entry", "error", err, "po_id", poID)
+					return
+				}
 
 				// Dt Raw Materials (return materials to inventory account)
-				h.db.Exec(`
-					INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description,
-						debit_amount, credit_amount, created_at, updated_at)
-					VALUES ($1,$2,$3,$4,$5,0,$6,$6)
-				`, uuid.New(), entryID, rawAcct, "Unused materials returned", totalReturnCost, now)
+				if _, err := jeTx.Exec(`
+    INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description,
+        debit_amount, credit_amount, line_number, created_at)
+    VALUES ($1,$2,$3,$4,$5,0,1,$6)
+`, uuid.New(), entryID, rawAcct, "Unused materials returned", totalReturnCost, now); err != nil {
+					h.log.Error("returnUnusedComponents: failed to insert raw materials debit line", "error", err, "po_id", poID)
+					return
+				}
 
 				// Kt WIP (reduce WIP by returned amount)
-				h.db.Exec(`
-					INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description,
-						debit_amount, credit_amount, created_at, updated_at)
-					VALUES ($1,$2,$3,$4,0,$5,$6,$6)
-				`, uuid.New(), entryID, wipAcct, "WIP reduced for returned materials", totalReturnCost, now)
+				if _, err := jeTx.Exec(`
+    INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description,
+        debit_amount, credit_amount, line_number, created_at)
+    VALUES ($1,$2,$3,$4,0,$5,2,$6)
+`, uuid.New(), entryID, wipAcct, "WIP reduced for returned materials", totalReturnCost, now); err != nil {
+					h.log.Error("returnUnusedComponents: failed to insert WIP credit line", "error", err, "po_id", poID)
+					return
+				}
 
-				h.db.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID)
+				if _, err := jeTx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID); err != nil {
+					h.log.Error("returnUnusedComponents: failed to bump journal next_number", "error", err, "po_id", poID)
+					return
+				}
+
+				if err := jeTx.Commit(); err != nil {
+					h.log.Error("returnUnusedComponents: failed to commit journal entry", "error", err, "po_id", poID)
+					return
+				}
 
 				h.log.Info("returnUnusedComponents: journal entry created",
 					"entryID", entryID, "totalReturnCost", totalReturnCost)
@@ -4059,29 +4209,29 @@ func (h *Handler) ListEquipment(c *gin.Context) {
 	defer rows.Close()
 
 	type EquipmentItem struct {
-		ID                     uuid.UUID  `json:"id"`
-		Code                   string     `json:"code"`
-		Name                   string     `json:"name"`
-		Description            *string    `json:"description,omitempty"`
-		EquipmentType          string     `json:"equipment_type"`
-		Category               *string    `json:"category,omitempty"`
-		WorkCenterID           *uuid.UUID `json:"work_center_id,omitempty"`
-		WorkCenterName         *string    `json:"work_center_name,omitempty"`
-		Manufacturer           *string    `json:"manufacturer,omitempty"`
-		Model                  *string    `json:"model,omitempty"`
-		SerialNumber           *string    `json:"serial_number,omitempty"`
-		PurchaseDate           *string    `json:"purchase_date,omitempty"`
-		WarrantyExpiry         *string    `json:"warranty_expiry,omitempty"`
-		Status                 string     `json:"status"`
-		LastMaintenanceDate    *string    `json:"last_maintenance_date,omitempty"`
-		NextMaintenanceDate    *string    `json:"next_maintenance_date,omitempty"`
-		MaintenanceIntervalDays *int      `json:"maintenance_interval_days,omitempty"`
-		PurchaseCost           float64    `json:"purchase_cost"`
-		CurrentValue           float64    `json:"current_value"`
-		HourlyRate             float64    `json:"hourly_rate"`
-		Notes                  *string    `json:"notes,omitempty"`
-		CreatedAt              time.Time  `json:"created_at"`
-		UpdatedAt              time.Time  `json:"updated_at"`
+		ID                      uuid.UUID  `json:"id"`
+		Code                    string     `json:"code"`
+		Name                    string     `json:"name"`
+		Description             *string    `json:"description,omitempty"`
+		EquipmentType           string     `json:"equipment_type"`
+		Category                *string    `json:"category,omitempty"`
+		WorkCenterID            *uuid.UUID `json:"work_center_id,omitempty"`
+		WorkCenterName          *string    `json:"work_center_name,omitempty"`
+		Manufacturer            *string    `json:"manufacturer,omitempty"`
+		Model                   *string    `json:"model,omitempty"`
+		SerialNumber            *string    `json:"serial_number,omitempty"`
+		PurchaseDate            *string    `json:"purchase_date,omitempty"`
+		WarrantyExpiry          *string    `json:"warranty_expiry,omitempty"`
+		Status                  string     `json:"status"`
+		LastMaintenanceDate     *string    `json:"last_maintenance_date,omitempty"`
+		NextMaintenanceDate     *string    `json:"next_maintenance_date,omitempty"`
+		MaintenanceIntervalDays *int       `json:"maintenance_interval_days,omitempty"`
+		PurchaseCost            float64    `json:"purchase_cost"`
+		CurrentValue            float64    `json:"current_value"`
+		HourlyRate              float64    `json:"hourly_rate"`
+		Notes                   *string    `json:"notes,omitempty"`
+		CreatedAt               time.Time  `json:"created_at"`
+		UpdatedAt               time.Time  `json:"updated_at"`
 	}
 
 	equipment := []EquipmentItem{}
@@ -4105,22 +4255,51 @@ func (h *Handler) ListEquipment(c *gin.Context) {
 			h.log.Error("Failed to scan equipment", "error", err)
 			continue
 		}
-		if description.Valid { e.Description = &description.String }
-		if category.Valid { e.Category = &category.String }
+		if description.Valid {
+			e.Description = &description.String
+		}
+		if category.Valid {
+			e.Category = &category.String
+		}
 		if workCenterID.Valid {
 			id, _ := uuid.Parse(workCenterID.String)
 			e.WorkCenterID = &id
 		}
-		if workCenterName.Valid { e.WorkCenterName = &workCenterName.String }
-		if manufacturer.Valid { e.Manufacturer = &manufacturer.String }
-		if model.Valid { e.Model = &model.String }
-		if serialNumber.Valid { e.SerialNumber = &serialNumber.String }
-		if notes.Valid { e.Notes = &notes.String }
-		if purchaseDate.Valid { s := purchaseDate.Time.Format("2006-01-02"); e.PurchaseDate = &s }
-		if warrantyExpiry.Valid { s := warrantyExpiry.Time.Format("2006-01-02"); e.WarrantyExpiry = &s }
-		if lastMaint.Valid { s := lastMaint.Time.Format("2006-01-02"); e.LastMaintenanceDate = &s }
-		if nextMaint.Valid { s := nextMaint.Time.Format("2006-01-02"); e.NextMaintenanceDate = &s }
-		if maintInterval.Valid { v := int(maintInterval.Int64); e.MaintenanceIntervalDays = &v }
+		if workCenterName.Valid {
+			e.WorkCenterName = &workCenterName.String
+		}
+		if manufacturer.Valid {
+			e.Manufacturer = &manufacturer.String
+		}
+		if model.Valid {
+			e.Model = &model.String
+		}
+		if serialNumber.Valid {
+			e.SerialNumber = &serialNumber.String
+		}
+		if notes.Valid {
+			e.Notes = &notes.String
+		}
+		if purchaseDate.Valid {
+			s := purchaseDate.Time.Format("2006-01-02")
+			e.PurchaseDate = &s
+		}
+		if warrantyExpiry.Valid {
+			s := warrantyExpiry.Time.Format("2006-01-02")
+			e.WarrantyExpiry = &s
+		}
+		if lastMaint.Valid {
+			s := lastMaint.Time.Format("2006-01-02")
+			e.LastMaintenanceDate = &s
+		}
+		if nextMaint.Valid {
+			s := nextMaint.Time.Format("2006-01-02")
+			e.NextMaintenanceDate = &s
+		}
+		if maintInterval.Valid {
+			v := int(maintInterval.Int64)
+			e.MaintenanceIntervalDays = &v
+		}
 		equipment = append(equipment, e)
 	}
 
@@ -4256,35 +4435,95 @@ func (h *Handler) UpdateEquipment(c *gin.Context) {
 	args := []interface{}{}
 	argCount := 0
 
-	if input.Name != nil { argCount++; updates = append(updates, fmt.Sprintf("name = $%d", argCount)); args = append(args, *input.Name) }
-	if input.Description != nil { argCount++; updates = append(updates, fmt.Sprintf("description = $%d", argCount)); args = append(args, *input.Description) }
-	if input.EquipmentType != nil { argCount++; updates = append(updates, fmt.Sprintf("equipment_type = $%d", argCount)); args = append(args, *input.EquipmentType) }
-	if input.Category != nil { argCount++; updates = append(updates, fmt.Sprintf("category = $%d", argCount)); args = append(args, *input.Category) }
+	if input.Name != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("name = $%d", argCount))
+		args = append(args, *input.Name)
+	}
+	if input.Description != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, *input.Description)
+	}
+	if input.EquipmentType != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("equipment_type = $%d", argCount))
+		args = append(args, *input.EquipmentType)
+	}
+	if input.Category != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("category = $%d", argCount))
+		args = append(args, *input.Category)
+	}
 	if input.WorkCenterID != nil {
 		if *input.WorkCenterID == "" {
-			argCount++; updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount)); args = append(args, nil)
+			argCount++
+			updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount))
+			args = append(args, nil)
 		} else if id, err := uuid.Parse(*input.WorkCenterID); err == nil {
-			argCount++; updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount)); args = append(args, id)
+			argCount++
+			updates = append(updates, fmt.Sprintf("work_center_id = $%d", argCount))
+			args = append(args, id)
 		}
 	}
-	if input.Manufacturer != nil { argCount++; updates = append(updates, fmt.Sprintf("manufacturer = $%d", argCount)); args = append(args, *input.Manufacturer) }
-	if input.Model != nil { argCount++; updates = append(updates, fmt.Sprintf("model = $%d", argCount)); args = append(args, *input.Model) }
-	if input.SerialNumber != nil { argCount++; updates = append(updates, fmt.Sprintf("serial_number = $%d", argCount)); args = append(args, *input.SerialNumber) }
-	if input.Status != nil { argCount++; updates = append(updates, fmt.Sprintf("status = $%d", argCount)); args = append(args, *input.Status) }
-	if input.PurchaseCost != nil { argCount++; updates = append(updates, fmt.Sprintf("purchase_cost = $%d", argCount)); args = append(args, *input.PurchaseCost) }
-	if input.CurrentValue != nil { argCount++; updates = append(updates, fmt.Sprintf("current_value = $%d", argCount)); args = append(args, *input.CurrentValue) }
-	if input.HourlyRate != nil { argCount++; updates = append(updates, fmt.Sprintf("hourly_rate = $%d", argCount)); args = append(args, *input.HourlyRate) }
-	if input.MaintenanceIntervalDays != nil { argCount++; updates = append(updates, fmt.Sprintf("maintenance_interval_days = $%d", argCount)); args = append(args, *input.MaintenanceIntervalDays) }
-	if input.Notes != nil { argCount++; updates = append(updates, fmt.Sprintf("notes = $%d", argCount)); args = append(args, *input.Notes) }
+	if input.Manufacturer != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("manufacturer = $%d", argCount))
+		args = append(args, *input.Manufacturer)
+	}
+	if input.Model != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("model = $%d", argCount))
+		args = append(args, *input.Model)
+	}
+	if input.SerialNumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("serial_number = $%d", argCount))
+		args = append(args, *input.SerialNumber)
+	}
+	if input.Status != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
+		args = append(args, *input.Status)
+	}
+	if input.PurchaseCost != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("purchase_cost = $%d", argCount))
+		args = append(args, *input.PurchaseCost)
+	}
+	if input.CurrentValue != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("current_value = $%d", argCount))
+		args = append(args, *input.CurrentValue)
+	}
+	if input.HourlyRate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("hourly_rate = $%d", argCount))
+		args = append(args, *input.HourlyRate)
+	}
+	if input.MaintenanceIntervalDays != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("maintenance_interval_days = $%d", argCount))
+		args = append(args, *input.MaintenanceIntervalDays)
+	}
+	if input.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		args = append(args, *input.Notes)
+	}
 
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")
 		return
 	}
 
-	argCount++; updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount)); args = append(args, time.Now())
-	argCount++; args = append(args, equipID)
-	argCount++; args = append(args, tenantID)
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+	argCount++
+	args = append(args, equipID)
+	argCount++
+	args = append(args, tenantID)
 
 	query := fmt.Sprintf("UPDATE manufacturing_equipment SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL",
 		strings.Join(updates, ", "), argCount-1, argCount)
@@ -4394,12 +4633,27 @@ func (h *Handler) ListMaintenanceTasks(c *gin.Context) {
 			h.log.Error("Failed to scan maintenance task", "error", err)
 			continue
 		}
-		if workCenterID.Valid { id, _ := uuid.Parse(workCenterID.String); t.WorkCenterID = &id }
-		if scheduledDate.Valid { s := scheduledDate.Time.Format("2006-01-02"); t.ScheduledDate = &s }
-		if actualDate.Valid { s := actualDate.Time.Format("2006-01-02"); t.ActualDate = &s }
-		if description.Valid { t.Description = &description.String }
-		if workPerformed.Valid { t.WorkPerformed = &workPerformed.String }
-		if notes.Valid { t.Notes = &notes.String }
+		if workCenterID.Valid {
+			id, _ := uuid.Parse(workCenterID.String)
+			t.WorkCenterID = &id
+		}
+		if scheduledDate.Valid {
+			s := scheduledDate.Time.Format("2006-01-02")
+			t.ScheduledDate = &s
+		}
+		if actualDate.Valid {
+			s := actualDate.Time.Format("2006-01-02")
+			t.ActualDate = &s
+		}
+		if description.Valid {
+			t.Description = &description.String
+		}
+		if workPerformed.Valid {
+			t.WorkPerformed = &workPerformed.String
+		}
+		if notes.Valid {
+			t.Notes = &notes.String
+		}
 		tasks = append(tasks, t)
 	}
 
@@ -4547,21 +4801,46 @@ func (h *Handler) UpdateMaintenanceTask(c *gin.Context) {
 	args := []interface{}{}
 	argCount := 0
 
-	if input.MaintenanceType != nil { argCount++; updates = append(updates, fmt.Sprintf("maintenance_type = $%d", argCount)); args = append(args, *input.MaintenanceType) }
-	if input.ScheduledDate != nil { argCount++; updates = append(updates, fmt.Sprintf("scheduled_date = $%d", argCount)); args = append(args, *input.ScheduledDate) }
-	if input.DurationHours != nil { argCount++; updates = append(updates, fmt.Sprintf("duration_hours = $%d", argCount)); args = append(args, *input.DurationHours) }
-	if input.Description != nil { argCount++; updates = append(updates, fmt.Sprintf("description = $%d", argCount)); args = append(args, *input.Description) }
-	if input.Notes != nil { argCount++; updates = append(updates, fmt.Sprintf("notes = $%d", argCount)); args = append(args, *input.Notes) }
+	if input.MaintenanceType != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("maintenance_type = $%d", argCount))
+		args = append(args, *input.MaintenanceType)
+	}
+	if input.ScheduledDate != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("scheduled_date = $%d", argCount))
+		args = append(args, *input.ScheduledDate)
+	}
+	if input.DurationHours != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("duration_hours = $%d", argCount))
+		args = append(args, *input.DurationHours)
+	}
+	if input.Description != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("description = $%d", argCount))
+		args = append(args, *input.Description)
+	}
+	if input.Notes != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
+		args = append(args, *input.Notes)
+	}
 
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")
 		return
 	}
 
-	argCount++; updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount)); args = append(args, time.Now())
-	argCount++; args = append(args, taskID)
-	argCount++; args = append(args, tenantID)
-	argCount++; args = append(args, equipID)
+	argCount++
+	updates = append(updates, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+	argCount++
+	args = append(args, taskID)
+	argCount++
+	args = append(args, tenantID)
+	argCount++
+	args = append(args, equipID)
 
 	query := fmt.Sprintf(
 		"UPDATE equipment_maintenance SET %s WHERE id = $%d AND tenant_id = $%d AND equipment_id = $%d",
@@ -4617,14 +4896,14 @@ func (h *Handler) ListManufacturingCategories(c *gin.Context) {
 	defer rows.Close()
 
 	type CategoryResponse struct {
-		ID          uuid.UUID  `json:"id"`
-		Name        string     `json:"name"`
-		Description *string    `json:"description"`
-		Color       *string    `json:"color"`
-		IsActive    bool       `json:"is_active"`
-		SortOrder   int        `json:"sort_order"`
-		CreatedAt   time.Time  `json:"created_at"`
-		UpdatedAt   time.Time  `json:"updated_at"`
+		ID          uuid.UUID `json:"id"`
+		Name        string    `json:"name"`
+		Description *string   `json:"description"`
+		Color       *string   `json:"color"`
+		IsActive    bool      `json:"is_active"`
+		SortOrder   int       `json:"sort_order"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
 	}
 
 	categories := []CategoryResponse{}
