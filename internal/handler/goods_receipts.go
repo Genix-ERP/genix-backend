@@ -1030,16 +1030,26 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 		journalEntryID := uuid.New()
 		description := "Goods Receipt: " + grNumber
 
+		// Header + all its lines + balance updates for this receipt's single JE
+		// go in ONE transaction: migration 416's deferred balance trigger rejects
+		// imbalanced single-line autocommit inserts, which previously left 0-line
+		// "posted" JEs and drifted account balances.
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to begin goods receipt journal tx", "error", txErr)
+			return
+		}
+		defer tx.Rollback()
+
 		// Insert journal entry
-		_, err = h.db.Exec(`
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'goods_receipt', $9, 1.0, $10, $10, 'posted', $11, $11)`,
 			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, receiptDate, grNumber, description,
 			grID.String(), totalAmount, now,
-		)
-		if err != nil {
+		); err != nil {
 			h.log.Error("Failed to create GR journal entry", "error", err)
 			return
 		}
@@ -1069,30 +1079,49 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 			}
 
 			// Debit: Stock Valuation (TT §4.5 — warehouse subkonto required on inventory accounts)
-			h.db.Exec(`
+			if _, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, warehouse_id, description,
 					debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 1.0, $7, '{}'::jsonb, $8)`,
 				uuid.New(), journalEntryID, lineNumber, debitAcct, warehouseIDPtr, "Stock Valuation", line.amount, now,
-			)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", line.amount, now, debitAcct)
+			); err != nil {
+				h.log.Error("Failed to insert GR debit JE line", "error", err)
+				return
+			}
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", line.amount, now, debitAcct); err != nil {
+				h.log.Error("Failed to update debit account balance for GR JE", "error", err)
+				return
+			}
 			lineNumber++
 
 			// Credit: Accounts Payable / Stock Interim Receipt (TT §4.5 — kontragent subkonto required)
-			h.db.Exec(`
+			if _, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 1.0, $7, '{}'::jsonb, $8)`,
 				uuid.New(), journalEntryID, lineNumber, creditAcct, supplierIDPtr, "Accounts Payable", line.amount, now,
-			)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", line.amount, now, creditAcct)
+			); err != nil {
+				h.log.Error("Failed to insert GR credit JE line", "error", err)
+				return
+			}
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", line.amount, now, creditAcct); err != nil {
+				h.log.Error("Failed to update credit account balance for GR JE", "error", err)
+				return
+			}
 			lineNumber++
 		}
 
 		// Update journal next_number
-		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+		if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+			h.log.Error("Failed to update journal next_number for GR JE", "error", err)
+			return
+		}
+
+		if err = tx.Commit(); err != nil {
+			h.log.Error("Failed to commit goods receipt journal entry", "error", err)
+		}
 	}()
 
 	h.GetGoodsReceipt(c)

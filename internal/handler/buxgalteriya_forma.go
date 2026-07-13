@@ -173,7 +173,10 @@ type formaLineDef struct {
 
 var forma1Assets = []formaLineDef{
 	{"010", "01%", "Asosiy vositalar (dastlabki qiymati)", "Основные средства (первоначальная стоимость)", true},
-	{"020", "02%", "Asosiy vositalar eskirishi (ayriladi)", "Амортизация основных средств", false},
+	// Accumulated depreciation is a contra-asset: read as debit-normal (dt-kt)
+	// so its credit balance comes through NEGATIVE and reduces total assets
+	// (the line is labelled "ayriladi" / to be deducted).
+	{"020", "02%", "Asosiy vositalar eskirishi (ayriladi)", "Амортизация основных средств", true},
 	{"040", "04%", "Nomoddiy aktivlar", "Нематериальные активы", true},
 	{"080", "08%", "Kapital qo'yilmalar (tugallanmagan qurilish)", "Капитальные вложения", true},
 	{"100", "1%", "Tovar-moddiy zaxiralar", "Товарно-материальные запасы", true},
@@ -190,7 +193,12 @@ var forma1Liabs = []formaLineDef{
 
 var forma1Equity = []formaLineDef{
 	{"800", "8%", "Kapital (ustav, zaxira, taqsimlanmagan foyda)", "Собственный капитал", false},
-	{"990", "9900%", "Yakuniy moliyaviy natija (foyda/zarar)", "Финансовый результат", false},
+	// Current financial result = net of ALL 9xxx accounts (kt-dt): revenue less
+	// expenses. Matching only "9900%"/9910 missed the current-year profit that
+	// is still open in 9000-9899 (not yet closed to 9910), so the balance never
+	// tied. Netting all 9xxx captures both the closed (9910) and open portions
+	// without double counting, since closing just moves balances within 9xxx.
+	{"990", "9%", "Yakuniy moliyaviy natija (foyda/zarar)", "Финансовый результат", false},
 }
 
 // loadForma1 computes the balance sheet as of `asOf` for the given tenant/org.

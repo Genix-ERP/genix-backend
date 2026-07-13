@@ -425,28 +425,63 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 					entryNumber := fmt.Sprintf("PAYPMT%05d", nextNumber)
 					description := fmt.Sprintf("Salary Payment: %s (%s)", periodName, paymentMethod)
 
-					h.db.Exec(`
-						INSERT INTO journal_entries (
-							id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-							description, source_type, source_id, exchange_rate,
-							total_debit, total_credit, status, created_by, created_at, updated_at
-						) VALUES ($1,$2,$3,$4,$5,$6,$7,'payroll_payment',$8,1.0,$9,$9,'posted',$10,$11,$11)`,
-						jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
-						description, id.String(), totalNet, userID, now)
+					// Post header + both lines + balance updates in ONE transaction so
+					// the deferred balance-check trigger sees the complete, balanced JE
+					// at COMMIT. Wrapped in an IIFE so a failure rolls back (via defer)
+					// and control still falls through to h.GetPayrollPeriod(c) below.
+					func() {
+						tx, txErr := h.db.Begin()
+						if txErr != nil {
+							h.log.Error("Failed to begin payroll payment tx", "error", txErr)
+							return
+						}
+						defer tx.Rollback()
 
-					// Dt: Wages Payable (liability cleared)
-					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-						VALUES ($1,$2,$3,'Wages Payable',$4,0,1,$5)`,
-						uuid.New(), jeID, wagesPayableAcct, totalNet, now)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, wagesPayableAcct)
+						if _, err := tx.Exec(`
+							INSERT INTO journal_entries (
+								id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+								description, source_type, source_id, exchange_rate,
+								total_debit, total_credit, status, created_by, created_at, updated_at
+							) VALUES ($1,$2,$3,$4,$5,$6,$7,'payroll_payment',$8,1.0,$9,$9,'posted',$10,$11,$11)`,
+							jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+							description, id.String(), totalNet, userID, now); err != nil {
+							h.log.Error("Failed to create payroll payment journal entry", "error", err)
+							return
+						}
 
-					// Kt: Cash or Bank (money goes out)
-					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-						VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
-						uuid.New(), jeID, paymentAcct, paymentAcctDesc, totalNet, now)
-					h.db.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, paymentAcct)
+						// Dt: Wages Payable (liability cleared)
+						if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+							VALUES ($1,$2,$3,'Wages Payable',$4,0,1,$5)`,
+							uuid.New(), jeID, wagesPayableAcct, totalNet, now); err != nil {
+							h.log.Error("Failed to insert wages payable line", "error", err)
+							return
+						}
+						if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, wagesPayableAcct); err != nil {
+							h.log.Error("Failed to update wages payable balance", "error", err)
+							return
+						}
 
-					h.db.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+						// Kt: Cash or Bank (money goes out)
+						if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+							VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
+							uuid.New(), jeID, paymentAcct, paymentAcctDesc, totalNet, now); err != nil {
+							h.log.Error("Failed to insert cash/bank line", "error", err)
+							return
+						}
+						if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, paymentAcct); err != nil {
+							h.log.Error("Failed to update cash/bank balance", "error", err)
+							return
+						}
+
+						if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
+							h.log.Error("Failed to bump journal next_number for payroll payment", "error", err)
+							return
+						}
+
+						if err := tx.Commit(); err != nil {
+							h.log.Error("Failed to commit payroll payment journal entry", "error", err)
+						}
+					}()
 				}
 			}
 		}
@@ -1190,7 +1225,7 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		// Get period details and total gross salary
 		var periodName string
 		var orgID sql.NullString
-		h.db.QueryRow(`SELECT name, organization_id FROM payroll_periods WHERE id = $1`, id).Scan(&periodName, &orgID)
+		h.db.QueryRow(`SELECT period_name, organization_id FROM payroll_periods WHERE id = $1`, id).Scan(&periodName, &orgID)
 
 		var totalGross float64
 		h.db.QueryRow(`
@@ -1308,78 +1343,91 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 			taxRows.Close()
 		}
 
-		// Debit totals = gross salary (to salary expense) + employer-paid tax expenses
-		// Credit totals = wages payable (net) + tax liability credits
-		totalDebit := totalGross + totalEmployerTaxExpense
-		totalCredit := totalDebit // balanced by construction
+		// Build every journal line FIRST, then derive the header totals from the
+		// lines actually inserted. An account snapshot that is NULL means its line
+		// is skipped, so its amount must NOT be counted in total_debit/total_credit
+		// (otherwise the JE is imbalanced and migration 416's deferred trigger
+		// rejects it at COMMIT). Only amounts that get a real line are summed.
+		type jeLine struct {
+			accountID   uuid.UUID
+			description string
+			debit       float64
+			credit      float64
+		}
+		var lines []jeLine
 
-		_, err = h.db.Exec(`
+		// Dr: Salary Expense
+		lines = append(lines, jeLine{salaryAcct, "Salary Expense", totalGross, 0})
+
+		// Dr: Employer tax expense(s)
+		for acctID, b := range taxExpenseByAcct {
+			lines = append(lines, jeLine{acctID, b.description, b.amount, 0})
+		}
+
+		// Cr: Wages Payable (net pay to employees, after employee-paid taxes withheld)
+		netPayable := totalGross - totalEmployeeTaxWithdrawn
+		if netPayable > 0 {
+			lines = append(lines, jeLine{payableAcct, "Wages Payable", 0, netPayable})
+		}
+
+		// Cr: Tax Liability account(s) — one line per distinct liability account
+		for acctID, b := range taxLiabilityByAcct {
+			lines = append(lines, jeLine{acctID, b.description, 0, b.amount})
+		}
+
+		// Header totals = sum of the lines actually inserted (keeps Dr == Cr).
+		var totalDebit, totalCredit float64
+		for _, ln := range lines {
+			totalDebit += ln.debit
+			totalCredit += ln.credit
+		}
+
+		// Post header + all lines + balance updates in ONE transaction so the
+		// deferred balance-check trigger sees the complete, balanced JE at COMMIT.
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to begin payroll accrual tx", "error", txErr)
+			return
+		}
+		defer tx.Rollback()
+
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'payroll', $9, 1.0, $10, $11, 'posted', $12, $13, $13)`,
 			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, now, periodName, description,
 			id.String(), totalDebit, totalCredit, userID, now,
-		)
-		if err != nil {
+		); err != nil {
 			h.log.Error("Failed to create payroll journal entry", "error", err)
 			return
 		}
 
-		lineNo := 1
-
-		// Dr: Salary Expense
-		h.db.Exec(`
-			INSERT INTO journal_entry_lines (
-				id, journal_entry_id, line_number, account_id, description,
-				debit_amount, credit_amount, exchange_rate, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, 0, 1.0, $7)`,
-			uuid.New(), journalEntryID, lineNo, salaryAcct, "Salary Expense", totalGross, now,
-		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalGross, now, salaryAcct)
-		lineNo++
-
-		// Dr: Employer tax expense(s)
-		for acctID, b := range taxExpenseByAcct {
-			h.db.Exec(`
+		for i, ln := range lines {
+			if _, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, 0, 1.0, $7)`,
-				uuid.New(), journalEntryID, lineNo, acctID, b.description, b.amount, now,
-			)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", b.amount, now, acctID)
-			lineNo++
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8)`,
+				uuid.New(), journalEntryID, i+1, ln.accountID, ln.description, ln.debit, ln.credit, now,
+			); err != nil {
+				h.log.Error("Failed to insert payroll journal line", "error", err)
+				return
+			}
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", ln.debit+ln.credit, now, ln.accountID); err != nil {
+				h.log.Error("Failed to update account balance for payroll accrual", "error", err)
+				return
+			}
 		}
 
-		// Cr: Wages Payable (net pay to employees, after employee-paid taxes withheld)
-		netPayable := totalGross - totalEmployeeTaxWithdrawn
-		if netPayable > 0 {
-			h.db.Exec(`
-				INSERT INTO journal_entry_lines (
-					id, journal_entry_id, line_number, account_id, description,
-					debit_amount, credit_amount, exchange_rate, created_at
-				) VALUES ($1, $2, $3, $4, $5, 0, $6, 1.0, $7)`,
-				uuid.New(), journalEntryID, lineNo, payableAcct, "Wages Payable", netPayable, now,
-			)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", netPayable, now, payableAcct)
-			lineNo++
+		if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+			h.log.Error("Failed to bump journal next_number for payroll accrual", "error", err)
+			return
 		}
 
-		// Cr: Tax Liability account(s) — one line per distinct liability account
-		for acctID, b := range taxLiabilityByAcct {
-			h.db.Exec(`
-				INSERT INTO journal_entry_lines (
-					id, journal_entry_id, line_number, account_id, description,
-					debit_amount, credit_amount, exchange_rate, created_at
-				) VALUES ($1, $2, $3, $4, $5, 0, $6, 1.0, $7)`,
-				uuid.New(), journalEntryID, lineNo, acctID, b.description, b.amount, now,
-			)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", b.amount, now, acctID)
-			lineNo++
+		if err = tx.Commit(); err != nil {
+			h.log.Error("Failed to commit payroll journal entry", "error", err)
 		}
-
-		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
 	}()
 
 	response.Success(c, gin.H{"message": "Payroll processed successfully"})

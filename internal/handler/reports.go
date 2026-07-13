@@ -205,8 +205,12 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		SELECT a.id, a.code, a.name, COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
 			   at.category, at.normal_balance,
 			   a.opening_balance,
-			   COALESCE(SUM(jel.debit_amount), 0) as total_debit,
-			   COALESCE(SUM(jel.credit_amount), 0) as total_credit
+			   -- Only sum lines whose journal entry actually qualifies (posted, not
+			   -- deleted, on/before as-of date). The filter lives on the je join, so
+			   -- an unconditional SUM(jel.*) would also count draft/deleted/future
+			   -- lines because jel is joined straight to the account.
+			   COALESCE(SUM(CASE WHEN je.id IS NOT NULL THEN jel.debit_amount ELSE 0 END), 0) as total_debit,
+			   COALESCE(SUM(CASE WHEN je.id IS NOT NULL THEN jel.credit_amount ELSE 0 END), 0) as total_credit
 		FROM accounts a
 		JOIN account_types at ON a.account_type_id = at.id
 		LEFT JOIN journal_entry_lines jel ON a.id = jel.account_id
@@ -283,16 +287,27 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 			Balance:       math.Round(balance*100) / 100,
 		}
 
+		// Each section is totalled on its natural side so contra accounts net
+		// correctly: assets are debit-positive (a credit-normal contra-asset like
+		// accumulated depreciation reduces total assets instead of inflating it);
+		// liabilities and equity are credit-positive (a debit-normal contra-equity
+		// reduces equity).
 		switch category {
 		case "asset":
+			sectionVal := openingBalance + debitSum - creditSum
+			acc.Balance = math.Round(sectionVal*100) / 100
 			assetAccounts = append(assetAccounts, acc)
-			totalAssets += balance
+			totalAssets += sectionVal
 		case "liability":
+			sectionVal := openingBalance + creditSum - debitSum
+			acc.Balance = math.Round(sectionVal*100) / 100
 			liabilityAccounts = append(liabilityAccounts, acc)
-			totalLiabilities += balance
+			totalLiabilities += sectionVal
 		case "equity":
+			sectionVal := openingBalance + creditSum - debitSum
+			acc.Balance = math.Round(sectionVal*100) / 100
 			equityAccounts = append(equityAccounts, acc)
-			totalEquity += balance
+			totalEquity += sectionVal
 		}
 	}
 
@@ -507,10 +522,13 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 	operatingProfit := grossProfit - totalOpex
 	preTaxProfit := operatingProfit + totalOtherIncome - totalOtherExpenses
 
-	// Income tax at 15% (Uzbekistan standard rate) — only if profit is positive
+	// Income tax at the tenant's configured profit-tax rate (falls back to the
+	// 15% Uzbekistan standard) — only if profit is positive. Using the configured
+	// rate keeps the income statement consistent with the Taxes module.
 	var incomeTax float64
 	if preTaxProfit > 0 {
-		incomeTax = preTaxProfit * 0.15
+		profitTaxPct := h.getCompanyTaxRatePct(tenantID, "profit", 15.0)
+		incomeTax = preTaxProfit * profitTaxPct / 100.0
 	}
 	netIncome := preTaxProfit - incomeTax
 	totalExpenses := totalCOGS + totalOpex + totalOtherExpenses
@@ -737,29 +755,38 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 		periodTo = now.Format("2006-01-02")
 	}
 
-	// Get cash/bank account balances (opening balance)
-	cashQuery := `
-		SELECT
-			COALESCE(SUM(CASE WHEN je.entry_date < $2 THEN
-				CASE WHEN at.normal_balance = 'debit' THEN jel.debit_amount - jel.credit_amount
-				ELSE jel.credit_amount - jel.debit_amount END
-			ELSE 0 END), 0) + COALESCE(SUM(a.opening_balance), 0) as opening_balance,
-			COALESCE(SUM(CASE WHEN je.entry_date BETWEEN $2 AND $3 THEN jel.debit_amount ELSE 0 END), 0) as period_debits,
-			COALESCE(SUM(CASE WHEN je.entry_date BETWEEN $2 AND $3 THEN jel.credit_amount ELSE 0 END), 0) as period_credits
-		FROM accounts a
-		JOIN account_types at ON a.account_type_id = at.id
-		LEFT JOIN journal_entry_lines jel ON a.id = jel.account_id
-		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id AND je.status = 'posted' AND je.deleted_at IS NULL
-		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
-			AND (a.is_bank_account = true OR at.code IN ('CASH'))
-	`
+	// Get cash/bank account balances (opening balance).
+	// Aggregate per account FIRST (inner query), then sum across accounts —
+	// otherwise a.opening_balance, joined once per journal line, would be
+	// multiplied by each account's line count.
 	cashArgs := []interface{}{tenantID, periodFrom, periodTo}
-	orgFilter := ""
+	cashOrgFilter := ""
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		orgFilter = fmt.Sprintf(" AND a.organization_id = $%d", len(cashArgs)+1)
-		cashQuery += orgFilter
+		cashOrgFilter = fmt.Sprintf(" AND a.organization_id = $%d", len(cashArgs)+1)
 		cashArgs = append(cashArgs, orgID)
 	}
+	cashQuery := `
+		SELECT
+			COALESCE(SUM(acct.opening_balance + acct.pre_movement), 0) as opening_balance,
+			COALESCE(SUM(acct.period_debits), 0) as period_debits,
+			COALESCE(SUM(acct.period_credits), 0) as period_credits
+		FROM (
+			SELECT a.id, a.opening_balance,
+				COALESCE(SUM(CASE WHEN je.entry_date < $2 THEN
+					CASE WHEN at.normal_balance = 'debit' THEN jel.debit_amount - jel.credit_amount
+					ELSE jel.credit_amount - jel.debit_amount END
+				ELSE 0 END), 0) as pre_movement,
+				COALESCE(SUM(CASE WHEN je.entry_date BETWEEN $2 AND $3 THEN jel.debit_amount ELSE 0 END), 0) as period_debits,
+				COALESCE(SUM(CASE WHEN je.entry_date BETWEEN $2 AND $3 THEN jel.credit_amount ELSE 0 END), 0) as period_credits
+			FROM accounts a
+			JOIN account_types at ON a.account_type_id = at.id
+			LEFT JOIN journal_entry_lines jel ON a.id = jel.account_id
+			LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id AND je.status = 'posted' AND je.deleted_at IS NULL
+			WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
+				AND (a.is_bank_account = true OR at.code IN ('CASH'))` + cashOrgFilter + `
+			GROUP BY a.id, a.opening_balance
+		) acct
+	`
 
 	var openingCash, periodDebits, periodCredits float64
 	err := h.db.QueryRow(cashQuery, cashArgs...).Scan(&openingCash, &periodDebits, &periodCredits)
@@ -813,13 +840,14 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 				continue
 			}
 
-			// Calculate net cash impact
-			var amount float64
-			if normalBalance == "debit" {
-				amount = debit - credit
-			} else {
-				amount = credit - debit
-			}
+			// Cash impact of a counter-account is always (credit - debit),
+			// regardless of the account's own normal balance: a credit on the
+			// other side means cash came in (Dr cash / Cr revenue), a debit
+			// means cash went out (Dr expense / Cr cash). The previous
+			// normal-balance branch inverted the sign for every debit-normal
+			// account, making expenses and asset purchases look like inflows.
+			_ = normalBalance
+			amount := credit - debit
 
 			if math.Abs(amount) < 0.01 {
 				continue

@@ -346,12 +346,32 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	invoiceID := uuid.New()
 	now := time.Now()
 
-	// Calculate totals from lines
+	// Calculate totals from lines, resolving VAT per line from its tax_id.
+	// Rates are cached per tax_id so a multi-line invoice makes at most one
+	// lookup per distinct tax. lineTaxAmounts is reused when inserting lines
+	// so the stored per-line tax matches the header total.
 	var subtotal, taxAmount, discountAmount float64
-	for _, line := range input.Lines {
-		lineTotal := line.Quantity * line.UnitPrice
-		subtotal += lineTotal - line.DiscountAmount
-		// Tax calculation would need tax rate lookup
+	taxRateCache := make(map[string]float64)
+	lineTaxAmounts := make([]float64, len(input.Lines))
+	for i, line := range input.Lines {
+		lineNet := line.Quantity*line.UnitPrice - line.DiscountAmount
+		subtotal += lineNet
+
+		if line.TaxID != "" {
+			rate, cached := taxRateCache[line.TaxID]
+			if !cached {
+				if tid, perr := uuid.Parse(line.TaxID); perr == nil {
+					_ = h.db.QueryRow(
+						`SELECT rate FROM tax_rates WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+						tid, tenantID,
+					).Scan(&rate)
+				}
+				taxRateCache[line.TaxID] = rate
+			}
+			lineTax := lineNet * rate / 100.0
+			lineTaxAmounts[i] = lineTax
+			taxAmount += lineTax
+		}
 	}
 
 	totalAmount := subtotal - discountAmount + taxAmount
@@ -475,7 +495,7 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 		h.db.Exec(lineQuery,
 			lineID, invoiceID, salesOrderLineID, i+1, productID, line.Description,
 			line.Quantity, unitID, line.UnitPrice, line.DiscountAmount,
-			taxID, 0.0, lineTotal, accountID, now,
+			taxID, lineTaxAmounts[i], lineTotal, accountID, now,
 		)
 	}
 
@@ -1069,7 +1089,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		return
 	}
 
-	taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
+	taxAccountID := findAccount(tx, tenantID, organizationID, "QQS bo'yicha qarz", "6420")
 
 	// Get invoice lines for per-category accounting
 	type invoiceLineAcct struct {
@@ -1970,7 +1990,7 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	if err == nil {
 		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 		revenueAccountID := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
-		taxAccountID := findAccount(tx, tenantID, organizationID, "tax", "6990")
+		taxAccountID := findAccount(tx, tenantID, organizationID, "QQS bo'yicha qarz", "6420")
 
 		if arAccountID != uuid.Nil {
 			prefix := ""
@@ -2177,7 +2197,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 		}
 
 		arAccountID := findAccount(h.db, tenantID, orgPtr, "accounts receivable", "4010")
-		taxAccountID := findAccount(h.db, tenantID, orgPtr, "tax", "6990")
+		taxAccountID := findAccount(h.db, tenantID, orgPtr, "QQS bo'yicha qarz", "6420")
 		revenueAccountID := findAccount(h.db, tenantID, orgPtr, "sales revenue", "9010")
 
 		if arAccountID == uuid.Nil || revenueAccountID == uuid.Nil {

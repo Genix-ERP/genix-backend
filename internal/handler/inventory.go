@@ -5615,12 +5615,15 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 			"Inventory count adjustment: "+countNumber, now, userID)
 	}
 
-	// Create journal entry for total variance
-	totalVarianceValue := 0.0
+	// Create journal entry for the NET variance. Net (signed) matters: a
+	// surplus increases inventory (DR 1010) while a shortage decreases it
+	// (CR 1010). The old code summed math.Abs and always CR'd inventory, so a
+	// surplus raised the physical quantity but lowered the GL valuation.
+	netVarianceValue := 0.0
 	for _, line := range lines {
-		totalVarianceValue += math.Abs(line.Variance) * line.UnitCost
+		netVarianceValue += line.Variance * line.UnitCost
 	}
-	if totalVarianceValue > 0 {
+	if math.Abs(netVarianceValue) > 0.005 {
 		var orgIDPtr *uuid.UUID
 		if orgID != uuid.Nil {
 			orgIDPtr = &orgID
@@ -5630,42 +5633,87 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 		var nextNumber int
 		h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
-		if journalID != uuid.Nil {
+		// Debit: Stock Adjustment Expense
+		adjustAcct := findAccount(h.db, tenantID, orgIDPtr, "stock adjustment", "6910")
+		if adjustAcct == uuid.Nil {
+			adjustAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory adjustment", "6910")
+		}
+		// Credit: Stock Valuation
+		stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
+		if stockAcct == uuid.Nil {
+			stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1010")
+		}
+
+		if journalID != uuid.Nil && adjustAcct != uuid.Nil && stockAcct != uuid.Nil {
 			entryID := uuid.New()
-			entryNumber := fmt.Sprintf("ADJ%06d", nextNumber)
 			description := fmt.Sprintf("Inventory Count Adjustment: %s", countNumber)
+			amount := math.Abs(netVarianceValue)
 
-			h.db.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-					description, source_type, source_id, status, total_debit, total_credit,
-					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_count', $8, 'posted', $9, $9, $10, $11, $11)
-			`, entryID, tenantID, orgIDPtr, journalID, entryNumber, now,
-				description, countID.String(), totalVarianceValue, userID, now)
-
-			// Debit: Stock Adjustment Expense
-			adjustAcct := findAccount(h.db, tenantID, orgIDPtr, "stock adjustment", "6910")
-			if adjustAcct == uuid.Nil {
-				adjustAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory adjustment", "6910")
-			}
-			// Credit: Stock Valuation
-			stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
-			if stockAcct == uuid.Nil {
-				stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1010")
+			// Inventory GL moves with the physical quantity; the adjustment
+			// account takes the opposite side (expense on loss, gain on surplus).
+			var stockDr, stockCr, adjDr, adjCr float64
+			if netVarianceValue >= 0 {
+				stockDr, adjCr = amount, amount // surplus: DR inventory, CR adjustment (gain)
+			} else {
+				adjDr, stockCr = amount, amount // shortage: DR adjustment (loss), CR inventory
 			}
 
-			if adjustAcct != uuid.Nil && stockAcct != uuid.Nil {
-				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Count Adjustment', $4, 0, 1, $5)`,
-					uuid.New(), entryID, adjustAcct, totalVarianceValue, now)
-				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Valuation', 0, $4, 2, $5)`,
-					uuid.New(), entryID, stockAcct, totalVarianceValue, now)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalVarianceValue, now, adjustAcct)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalVarianceValue, now, stockAcct)
-			}
+			tx, txErr := h.db.Begin()
+			if txErr != nil {
+				h.log.Error("Failed to begin stock-count journal tx", "error", txErr)
+			} else {
+				committed := false
+				defer func() {
+					if !committed {
+						tx.Rollback()
+					}
+				}()
 
-			h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
-			h.db.Exec("UPDATE stock_counts SET adjustment_journal_id = $1 WHERE id = $2", entryID, countID)
+				entryNumber := fmt.Sprintf("ADJ%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "ADJ", nextNumber))
+				if _, err = tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+						description, source_type, source_id, status, total_debit, total_credit,
+						created_by, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_count', $8, 'posted', $9, $9, $10, $11, $11)
+				`, entryID, tenantID, orgIDPtr, journalID, entryNumber, now,
+					description, countID.String(), amount, userID, now); err != nil {
+					h.log.Error("Failed to create stock-count journal entry", "error", err)
+					return
+				}
+				if _, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Valuation', $4, $5, 1, $6)`,
+					uuid.New(), entryID, stockAcct, stockDr, stockCr, now); err != nil {
+					h.log.Error("Failed to insert stock-count inventory line", "error", err)
+					return
+				}
+				if _, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Count Adjustment', $4, $5, 2, $6)`,
+					uuid.New(), entryID, adjustAcct, adjDr, adjCr, now); err != nil {
+					h.log.Error("Failed to insert stock-count adjustment line", "error", err)
+					return
+				}
+				// Balance updates (both accounts debit-normal): += (debit - credit)
+				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", stockDr-stockCr, now, stockAcct); err != nil {
+					h.log.Error("Failed to update stock account balance", "error", err)
+					return
+				}
+				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", adjDr-adjCr, now, adjustAcct); err != nil {
+					h.log.Error("Failed to update adjustment account balance", "error", err)
+					return
+				}
+				if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+					h.log.Error("Failed to bump journal next_number", "error", err)
+					return
+				}
+				if _, err = tx.Exec("UPDATE stock_counts SET adjustment_journal_id = $1 WHERE id = $2", entryID, countID); err != nil {
+					h.log.Error("Failed to link stock-count journal", "error", err)
+					return
+				}
+				if err = tx.Commit(); err != nil {
+					h.log.Error("Failed to commit stock-count journal entry", "error", err)
+				} else {
+					committed = true
+				}
+			}
 		}
 	}
 
@@ -6623,40 +6671,82 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 						h.db.QueryRow("SELECT name FROM stock_operations WHERE id=$1", id).Scan(&opName)
 						description := fmt.Sprintf("Stock Operation: %s", opName)
 
-						h.db.Exec(`
-							INSERT INTO journal_entries (
-								id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-								description, source_type, source_id, status, total_debit, total_credit,
-								created_by, created_at, updated_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_operation', $8, 'posted', $9, $9, $10, $11, $11)
-						`, entryID, tenantID, op.OrgID, journalID, entryNumber, now,
-							description, id.String(), totalValue, userID, now)
+						tx, txErr := h.db.Begin()
+						if txErr != nil {
+							h.log.Error("Failed to begin stock-operation journal tx", "error", txErr)
+						} else {
+							committed := false
+							func() {
+								defer func() {
+									if !committed {
+										tx.Rollback()
+									}
+								}()
 
-						h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
-							uuid.New(), entryID, debitAcct, description, totalValue, now)
-						h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
-							uuid.New(), entryID, creditAcct, description, totalValue, now)
+								if _, err := tx.Exec(`
+									INSERT INTO journal_entries (
+										id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+										description, source_type, source_id, status, total_debit, total_credit,
+										created_by, created_at, updated_at
+									) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_operation', $8, 'posted', $9, $9, $10, $11, $11)
+								`, entryID, tenantID, op.OrgID, journalID, entryNumber, now,
+									description, id.String(), totalValue, userID, now); err != nil {
+									h.log.Error("Failed to create stock-operation journal entry", "error", err)
+									return
+								}
+								if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
+									uuid.New(), entryID, debitAcct, description, totalValue, now); err != nil {
+									h.log.Error("Failed to insert stock-operation debit line", "error", err)
+									return
+								}
+								if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
+									uuid.New(), entryID, creditAcct, description, totalValue, now); err != nil {
+									h.log.Error("Failed to insert stock-operation credit line", "error", err)
+									return
+								}
+								if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalValue, now, debitAcct); err != nil {
+									h.log.Error("Failed to update debit account balance", "error", err)
+									return
+								}
+								if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, creditAcct); err != nil {
+									h.log.Error("Failed to update credit account balance", "error", err)
+									return
+								}
+								if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+									h.log.Error("Failed to bump journal next_number", "error", err)
+									return
+								}
+								if _, err := tx.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, id); err != nil {
+									h.log.Error("Failed to mark stock operation posted", "error", err)
+									return
+								}
 
-						h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalValue, now, debitAcct)
-						h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, creditAcct)
-						h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
-						h.db.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, id)
+								// TT 12.3: Write-offs affect budget — update budget_lines.actual_amount
+								// for the debit account (expense account) if tracked in an active budget
+								if op.Direction == "write_off" && totalValue > 0 {
+									if _, err := tx.Exec(`
+										UPDATE budget_lines bl
+										SET actual_amount = actual_amount + $1, updated_at = NOW()
+										FROM budgets b
+										WHERE bl.budget_id = b.id
+										  AND b.tenant_id = $2
+										  AND b.status = 'approved'
+										  AND b.deleted_at IS NULL
+										  AND bl.account_id = $3
+										  AND (b.start_date IS NULL OR b.start_date <= $4)
+										  AND (b.end_date IS NULL OR b.end_date >= $4)
+									`, totalValue, tenantID, debitAcct, now); err != nil {
+										h.log.Error("Failed to update budget actuals", "error", err)
+										return
+									}
+								}
 
-						// TT 12.3: Write-offs affect budget — update budget_lines.actual_amount
-						// for the debit account (expense account) if tracked in an active budget
-						if op.Direction == "write_off" && totalValue > 0 {
-							h.db.Exec(`
-								UPDATE budget_lines bl
-								SET actual_amount = actual_amount + $1, updated_at = NOW()
-								FROM budgets b
-								WHERE bl.budget_id = b.id
-								  AND b.tenant_id = $2
-								  AND b.status = 'approved'
-								  AND b.deleted_at IS NULL
-								  AND bl.account_id = $3
-								  AND (b.start_date IS NULL OR b.start_date <= $4)
-								  AND (b.end_date IS NULL OR b.end_date >= $4)
-							`, totalValue, tenantID, debitAcct, now)
+								if err := tx.Commit(); err != nil {
+									h.log.Error("Failed to commit stock-operation journal entry", "error", err)
+								} else {
+									committed = true
+								}
+							}()
 						}
 					}
 				}
@@ -7421,31 +7511,64 @@ func (h *Handler) postIntercompanyStockAccounting(tenantID uuid.UUID, opID uuid.
 	h.db.QueryRow("SELECT name FROM stock_operations WHERE id=$1", opID).Scan(&opName)
 	description := fmt.Sprintf("Intercompany Stock: %s", opName)
 
-	h.db.Exec(`
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to begin intercompany journal tx", "error", txErr)
+		return
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number, entry_date,
 			description, source_type, source_id, status, total_debit, total_credit,
 			created_at, updated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_operation', $8, 'posted', $9, $9, $10, $10)
 	`, entryID, tenantID, orgID, journalID, entryNumber, now,
-		description, opID.String(), totalValue, now)
+		description, opID.String(), totalValue, now); err != nil {
+		h.log.Error("Failed to create intercompany journal entry", "error", err)
+		return
+	}
 
 	lineNum := 0
 	for _, e := range entries {
 		lineDesc := fmt.Sprintf("%s: %s", description, e.prodName)
 		lineNum++
-		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)`,
-			uuid.New(), entryID, e.debitAcct, lineDesc, e.amount, lineNum, now)
+		if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, $6, $7)`,
+			uuid.New(), entryID, e.debitAcct, lineDesc, e.amount, lineNum, now); err != nil {
+			h.log.Error("Failed to insert intercompany debit line", "error", err)
+			return
+		}
 		lineNum++
-		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)`,
-			uuid.New(), entryID, e.creditAcct, lineDesc, e.amount, lineNum, now)
+		if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)`,
+			uuid.New(), entryID, e.creditAcct, lineDesc, e.amount, lineNum, now); err != nil {
+			h.log.Error("Failed to insert intercompany credit line", "error", err)
+			return
+		}
 
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", e.amount, now, e.debitAcct)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", e.amount, now, e.creditAcct)
+		if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", e.amount, now, e.debitAcct); err != nil {
+			h.log.Error("Failed to update intercompany debit balance", "error", err)
+			return
+		}
+		if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", e.amount, now, e.creditAcct); err != nil {
+			h.log.Error("Failed to update intercompany credit balance", "error", err)
+			return
+		}
 	}
 
-	h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
-	h.db.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, opID)
+	if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+		h.log.Error("Failed to bump journal next_number", "error", err)
+		return
+	}
+	if _, err := tx.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, opID); err != nil {
+		h.log.Error("Failed to mark stock operation posted", "error", err)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit intercompany journal entry", "error", err)
+		return
+	}
 
 	h.log.Info("Intercompany: posted GL entry", "direction", direction, "entry_id", entryID, "amount", totalValue)
 }

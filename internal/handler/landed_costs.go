@@ -856,40 +856,68 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 		journalEntryID := uuid.New()
 		description := fmt.Sprintf("Landed Cost Allocation: LC-%s", id.String()[:8])
 
-		_, err = h.db.Exec(`
+		// Header + both lines + balance updates in ONE transaction: migration
+		// 416's deferred balance trigger rejects imbalanced single-line
+		// autocommit inserts, which previously left 0-line "posted" JEs.
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to begin landed cost journal tx", "error", txErr)
+			return
+		}
+		defer tx.Rollback()
+
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'landed_cost', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
 			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, now, entryNumber, description,
 			id.String(), totalLandedCost, userID, now,
-		)
-		if err != nil {
+		); err != nil {
 			h.log.Error("Failed to create landed cost journal entry", "error", err)
 			return
 		}
 
 		// Debit: Inventory / Stock Valuation
-		h.db.Exec(`
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
 			) VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
 			uuid.New(), journalEntryID, invAcct, "Stock Valuation (Landed Cost)", totalLandedCost, now,
-		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalLandedCost, now, invAcct)
+		); err != nil {
+			h.log.Error("Failed to insert landed cost debit JE line", "error", err)
+			return
+		}
+		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalLandedCost, now, invAcct); err != nil {
+			h.log.Error("Failed to update inventory account balance for landed cost JE", "error", err)
+			return
+		}
 
 		// Credit: Accounts Payable
-		h.db.Exec(`
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
 			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
 			uuid.New(), journalEntryID, apAcct, "Accounts Payable (Landed Cost)", totalLandedCost, now,
-		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalLandedCost, now, apAcct)
+		); err != nil {
+			h.log.Error("Failed to insert landed cost credit JE line", "error", err)
+			return
+		}
+		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalLandedCost, now, apAcct); err != nil {
+			h.log.Error("Failed to update AP account balance for landed cost JE", "error", err)
+			return
+		}
 
-		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+		if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+			h.log.Error("Failed to update journal next_number for landed cost JE", "error", err)
+			return
+		}
+
+		if err = tx.Commit(); err != nil {
+			h.log.Error("Failed to commit landed cost journal entry", "error", err)
+		}
 	}()
 
 	// Update status

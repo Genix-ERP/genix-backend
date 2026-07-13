@@ -80,8 +80,8 @@ func (h *Handler) GetTaxSummaryCombined(c *gin.Context) {
 		JOIN payroll_entries pe ON pe.id = pet.payroll_entry_id
 		JOIN payroll_periods pp ON pp.id = pe.payroll_period_id
 		WHERE pet.tenant_id = $1
-		  AND pp.period_end   >= $2::date
-		  AND pp.period_start <= $3::date
+		  AND pp.end_date   >= $2::date
+		  AND pp.start_date <= $3::date
 		GROUP BY pet.tax_code_snapshot, name, pet.rate_snapshot
 		ORDER BY pet.tax_code_snapshot ASC
 	`, tenantID, start, end)

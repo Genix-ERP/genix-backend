@@ -530,16 +530,16 @@ func (h *Handler) createSplitOutputJournalEntry(
 
 	// Debit Finished Goods
 	if _, err := tx.Exec(`
-		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, debit, credit, description, created_at)
-		VALUES ($1,$2,$3,$4,0,$5,$6)
+		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, debit_amount, credit_amount, description, created_at)
+		VALUES ($1,$2,$3,1,$4,0,$5,$6)
 	`, uuid.New(), entryID, finishedAcct, totalCost, description, now); err != nil {
 		return
 	}
 
 	// Credit WIP
 	if _, err := tx.Exec(`
-		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, debit, credit, description, created_at)
-		VALUES ($1,$2,$3,0,$4,$5,$6)
+		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, debit_amount, credit_amount, description, created_at)
+		VALUES ($1,$2,$3,2,0,$4,$5,$6)
 	`, uuid.New(), entryID, wipAcct, totalCost, description, now); err != nil {
 		return
 	}
