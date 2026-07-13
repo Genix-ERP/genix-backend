@@ -1437,6 +1437,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		ai.GET("/capabilities", h.GetAICapabilities)
 		ai.POST("/chat", h.AIChat)
+		// Agentic chat — reads real ERP data via tools; proposes writes for
+		// confirmation (executed via /ai/agent/execute after user approval).
+		ai.POST("/agent", h.AIAgentChat)
+		ai.POST("/agent/execute", h.AIAgentExecute)
 		ai.GET("/conversations", h.ListAIConversations)
 		ai.POST("/conversations", h.CreateAIConversation)
 		ai.GET("/conversations/:id", h.GetAIConversation)
