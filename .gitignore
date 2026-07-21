@@ -62,3 +62,6 @@ __debug_bin*
 
 # Local file storage — uploads now live in the database (uploaded_files)
 storage/
+
+# Secrets mounted into the container (e.g. FCM service-account JSON) — never commit
+secrets/

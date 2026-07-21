@@ -26,6 +26,7 @@ type Config struct {
 	Queue     QueueConfig
 	Google     GoogleConfig
 	Multicard  MulticardConfig
+	FCM        FCMConfig
 }
 
 // MulticardConfig holds Multicard payment gateway settings
@@ -172,6 +173,18 @@ type QueueConfig struct {
 	Workers  int
 }
 
+// FCMConfig holds Firebase Cloud Messaging (mobile push) settings.
+// Enabled is derived: push is on only when a project id and credentials are
+// present. CredentialsJSON is the raw service-account JSON; if empty we read it
+// from CredentialsFile. ProjectID may be left blank and is then taken from the
+// service-account JSON's "project_id".
+type FCMConfig struct {
+	Enabled         bool
+	ProjectID       string
+	CredentialsFile string
+	CredentialsJSON string
+}
+
 // Load loads configuration from environment variables
 func Load() (*Config, error) {
 	// Load .env file if it exists (ignore error if not found)
@@ -314,7 +327,23 @@ func Load() (*Config, error) {
 			PricePerUserMonthly: getEnvAsInt64("PRICE_PER_USER_MONTHLY", 199000),
 			PricePerUserYearly:  getEnvAsInt64("PRICE_PER_USER_YEARLY", 169000),
 		},
+		FCM: FCMConfig{
+			ProjectID:       getEnv("FCM_PROJECT_ID", ""),
+			CredentialsFile: getEnv("FCM_CREDENTIALS_FILE", ""),
+			CredentialsJSON: getEnv("FCM_CREDENTIALS_JSON", ""),
+		},
 	}
+
+	// Resolve FCM credentials: prefer inline JSON, else read the file path.
+	// Push is enabled only when we actually have a service-account JSON to
+	// sign requests with — otherwise the sender no-ops and the rest of the app
+	// (device registration, in-app notifications) keeps working.
+	if cfg.FCM.CredentialsJSON == "" && cfg.FCM.CredentialsFile != "" {
+		if b, err := os.ReadFile(cfg.FCM.CredentialsFile); err == nil {
+			cfg.FCM.CredentialsJSON = string(b)
+		}
+	}
+	cfg.FCM.Enabled = cfg.FCM.CredentialsJSON != ""
 
 	// Validate required configuration
 	if err := cfg.Validate(); err != nil {

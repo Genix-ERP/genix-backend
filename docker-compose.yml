@@ -53,8 +53,14 @@ services:
       - CRM_API_BASE=${CRM_API_BASE:-}
       - CRM_USERNAME=${CRM_USERNAME:-}
       - CRM_PASSWORD=${CRM_PASSWORD:-}
+      - FCM_PROJECT_ID=${FCM_PROJECT_ID:-}
+      - FCM_CREDENTIALS_FILE=${FCM_CREDENTIALS_FILE:-/app/secrets/fcm-service-account.json}
+      - FCM_CREDENTIALS_JSON=${FCM_CREDENTIALS_JSON:-}
     volumes:
       - genix_storage:/app/storage
+      # FCM service-account key (host ./secrets -> /app/secrets, read-only).
+      # Put the JSON at ./secrets/fcm-service-account.json on the host.
+      - ./secrets:/app/secrets:ro
     depends_on:
       postgres:
         condition: service_healthy
