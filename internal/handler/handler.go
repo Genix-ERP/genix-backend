@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"context"
+
 	"github.com/genixerp/genix-backend/internal/config"
 	"github.com/genixerp/genix-backend/internal/crm"
 	"github.com/genixerp/genix-backend/internal/infrastructure/cache"
@@ -11,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/crypto"
 	"github.com/genixerp/genix-backend/internal/pkg/logger"
+	"github.com/genixerp/genix-backend/internal/pkg/push"
 	"github.com/genixerp/genix-backend/internal/service"
 	"github.com/gin-gonic/gin"
 )
@@ -32,10 +35,24 @@ type Handler struct {
 	// aren't set, syncer is constructed but reports itself as
 	// not-configured and every Enqueue is a no-op.
 	crmSync         *crm.Syncer
+	// fcm sends mobile push notifications. Always non-nil; when FCM isn't
+	// configured it reports Enabled()==false and every Send is a no-op.
+	fcm             *push.Sender
 }
 
 // NewHandler creates a new handler instance
 func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, log logger.Logger) *Handler {
+	// Build the FCM sender once. On a bad credentials JSON we log and fall back
+	// to a disabled sender so a push misconfig never blocks server startup.
+	fcmSender, err := push.NewSender(context.Background(), cfg.FCM.CredentialsJSON, cfg.FCM.ProjectID)
+	if err != nil {
+		log.Error("FCM sender init failed; push disabled", "error", err)
+		fcmSender = &push.Sender{}
+	}
+	if fcmSender.Enabled() {
+		log.Info("FCM push enabled")
+	}
+
 	return &Handler{
 		db:             db,
 		redis:          redis,
@@ -53,6 +70,7 @@ func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, l
 			cfg.Multicard.BaseURL,
 		),
 		crmSync: crm.NewSyncer(db.DB, log),
+		fcm:     fcmSender,
 	}
 }
 
@@ -1575,6 +1593,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		notifications.PUT("/:id/read", h.MarkNotificationRead)
 		notifications.DELETE("/:id", h.DeleteNotification)
 		notifications.PUT("/read-all", h.MarkAllNotificationsRead)
+	}
+
+	// Mobile push device tokens (FCM). Authenticated; every user manages their
+	// own device tokens — no extra permission needed.
+	devices := rg.Group("/devices")
+	{
+		devices.POST("", h.RegisterDevice)
+		devices.DELETE("", h.UnregisterDevice)
+		devices.POST("/test", h.TestPush)
 	}
 
 	// Attachments/Files (upload and delete require auth, GET is public - see registerPublicRoutes)

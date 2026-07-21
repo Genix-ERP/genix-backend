@@ -122,6 +122,17 @@ func (h *Handler) createNotification(tenantID, userID uuid.UUID, notifType, titl
 		INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', 'normal', $8)
 	`, uuid.New(), tenantID, userID, notifType, title, message, dataJSON, time.Now())
+
+	// Fan out a mobile push (async, best-effort). This is the single funnel for
+	// notifications, so wiring it here covers every notification path. No-op
+	// when FCM isn't configured or the user has no registered device.
+	if h.fcm.Enabled() {
+		pushData := map[string]string{"type": notifType}
+		for k, v := range data {
+			pushData[k] = fmt.Sprintf("%v", v)
+		}
+		go h.pushToUser(tenantID, userID, title, message, pushData)
+	}
 }
 
 // createTranslatedNotification inserts a notification with auto-translated content based on user's language
