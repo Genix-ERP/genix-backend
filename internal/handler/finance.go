@@ -2533,6 +2533,42 @@ func (h *Handler) GetJournalEntry(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Security BearerAuth
 // @Router /finance/journal-entries/{id}/post [post]
+// checkSelfCorrespondence enforces UZ NSBU correspondence rule (reference spec
+// sheet "О файле", item 3): an entry must not debit AND credit the SAME account
+// with the SAME analytics (e.g. Dr 1010 / Cr 1010) — that self-cancels and
+// books nothing. The sanctioned exception is an internal transfer of one
+// account across analytics (e.g. inventory moved between two warehouses), where
+// the debit and credit legs carry a DIFFERENT warehouse_id; those are allowed.
+// Returns a user-facing message when violated, "" when clean.
+func (h *Handler) checkSelfCorrespondence(entryID uuid.UUID) string {
+	var code, name string
+	err := h.db.QueryRow(`
+		SELECT a.code, a.name
+		FROM journal_entry_lines d
+		JOIN journal_entry_lines c
+		  ON c.journal_entry_id = d.journal_entry_id
+		 AND c.account_id = d.account_id
+		 AND c.id <> d.id
+		 AND COALESCE(c.warehouse_id::text, '') = COALESCE(d.warehouse_id::text, '')
+		JOIN accounts a ON a.id = d.account_id
+		WHERE d.journal_entry_id = $1
+		  AND d.debit_amount > 0
+		  AND c.credit_amount > 0
+		LIMIT 1
+	`, entryID).Scan(&code, &name)
+	if err == sql.ErrNoRows {
+		return ""
+	}
+	if err != nil {
+		// Fail open on an unexpected query error: never block a valid posting
+		// because the guard itself hiccuped, but record it for investigation.
+		h.log.Error("self-correspondence check failed", "error", err, "entry_id", entryID)
+		return ""
+	}
+	return fmt.Sprintf("Bir xil hisobni (%s — %s) bir vaqtda debet va kreditga yozib bo'lmaydi. "+
+		"Kredit tomonini to'g'ri korrespondent hisobga (masalan, ta'minotchiga qarz — 6010) o'zgartiring.", code, name)
+}
+
 func (h *Handler) PostJournalEntry(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -2586,6 +2622,13 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	// Verify balanced
 	if math.Abs(totalDebit-totalCredit) > 0.001 {
 		response.BadRequest(c, "Journal entry is not balanced")
+		return
+	}
+
+	// UZ NSBU correspondence rule: forbid a same-account debit+credit
+	// (Dr 1010 / Cr 1010), unless it is an inter-warehouse analytics transfer.
+	if msg := h.checkSelfCorrespondence(id); msg != "" {
+		response.BadRequest(c, msg)
 		return
 	}
 
@@ -2724,6 +2767,193 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	})
 
 	response.Success(c, gin.H{"message": "Journal entry posted successfully", "posted_at": now})
+}
+
+// ResetJournalEntryToDraft godoc
+// @Summary Reset a posted journal entry back to draft
+// @Description Un-applies the entry's effect on account balances and returns it
+// to draft so it can be edited/corrected. Exact inverse of PostJournalEntry.
+// @Tags Finance - Journal Entries
+// @Param id path string true "Journal Entry ID"
+// @Security BearerAuth
+// @Router /finance/journal-entries/{id}/reset-to-draft [post]
+func (h *Handler) ResetJournalEntryToDraft(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	userID, _ := middleware.GetUserID(c)
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid journal entry ID")
+		return
+	}
+
+	// Load the entry with its reversal linkage.
+	var status string
+	var entryDate time.Time
+	var totalDebit, totalCredit float64
+	var reversedEntryID, reversalOfID *uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT status, entry_date, total_debit, total_credit, reversed_entry_id, reversal_of_id
+		FROM journal_entries
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&status, &entryDate, &totalDebit, &totalCredit, &reversedEntryID, &reversalOfID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Journal entry")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get journal entry", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+
+	if status != "posted" {
+		response.BadRequest(c, "Only posted entries can be reset to draft")
+		return
+	}
+
+	// An entry that has itself been reversed must not be un-posted: its
+	// reversal already offset these balances, so un-applying them here would
+	// double-count. The reversal must be handled first. (The UI hides the
+	// button in this case; enforce it server-side too.)
+	if reversedEntryID != nil {
+		response.BadRequest(c, "This entry has been reversed; reset its reversal first")
+		return
+	}
+
+	// Same lock-date / period-lock rules as posting: cannot un-post into a
+	// locked period.
+	if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	if errMsg := h.checkPeriodLock(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+	defer tx.Rollback()
+
+	// Identical join to PostJournalEntry so the sign rule matches exactly.
+	rows, err := tx.Query(`
+		SELECT jel.account_id, jel.debit_amount, jel.credit_amount, at.normal_balance
+		FROM journal_entry_lines jel
+		JOIN accounts a ON jel.account_id = a.id
+		JOIN account_types at ON a.account_type_id = at.id
+		WHERE jel.journal_entry_id = $1
+	`, id)
+	if err != nil {
+		h.log.Error("Failed to get journal lines", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+
+	type lineUpdate struct {
+		accountID     uuid.UUID
+		debitAmount   float64
+		creditAmount  float64
+		normalBalance string
+	}
+
+	lines := make([]lineUpdate, 0)
+	for rows.Next() {
+		var l lineUpdate
+		if err := rows.Scan(&l.accountID, &l.debitAmount, &l.creditAmount, &l.normalBalance); err != nil {
+			continue
+		}
+		lines = append(lines, l)
+	}
+	rows.Close()
+
+	// Un-apply the exact delta posting added: subtract balanceChange.
+	now := time.Now()
+	for _, line := range lines {
+		var balanceChange float64
+		if line.normalBalance == "debit" {
+			balanceChange = line.debitAmount - line.creditAmount
+		} else {
+			balanceChange = line.creditAmount - line.debitAmount
+		}
+
+		_, err = tx.Exec(`
+			UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2
+			WHERE id = $3
+		`, balanceChange, now, line.accountID)
+
+		if err != nil {
+			// Mirror PostJournalEntry: the cash/bank negative-balance trigger
+			// (migration 192) raises 23514 if un-posting would push a
+			// 50xx/51xx account below zero.
+			if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23514" {
+				var accountName, accountCode string
+				var currentBalance float64
+				if scanErr := h.db.QueryRow(`SELECT name, code, current_balance FROM accounts WHERE id = $1`, line.accountID).Scan(&accountName, &accountCode, &currentBalance); scanErr == nil {
+					response.BadRequest(c, fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas. Joriy balans: %s so'm",
+						accountName, accountCode, formatAmount(currentBalance)))
+				} else {
+					response.BadRequest(c, pqErr.Message)
+				}
+				return
+			}
+			h.log.Error("Failed to update account balance", "error", err, "account_id", line.accountID)
+			response.InternalError(c, "Failed to reset journal entry")
+			return
+		}
+	}
+
+	// Flip status back to draft (guard against a concurrent reset/reverse) and
+	// clear the posting stamps.
+	res, err := tx.Exec(`
+		UPDATE journal_entries
+		SET status = 'draft', posted_at = NULL, posted_by = NULL, updated_at = $1
+		WHERE id = $2 AND status = 'posted'
+	`, now, id)
+	if err != nil {
+		h.log.Error("Failed to update entry status", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.BadRequest(c, "Only posted entries can be reset to draft")
+		return
+	}
+
+	// If this entry is itself a reversal, the original it reversed is no longer
+	// offset — clear its reversed pointer so it isn't stuck as "reversed" and
+	// can be reversed again once this draft is corrected and re-posted.
+	if reversalOfID != nil {
+		if _, err = tx.Exec(`UPDATE journal_entries SET reversed_entry_id = NULL, updated_at = $1 WHERE id = $2 AND tenant_id = $3`,
+			now, *reversalOfID, tenantID); err != nil {
+			h.log.Error("Failed to clear original reversed pointer", "error", err)
+			response.InternalError(c, "Failed to reset journal entry")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit transaction", "error", err)
+		response.InternalError(c, "Failed to reset journal entry")
+		return
+	}
+
+	h.logJournalEntryAction(tenantID, userID, id, "reset_to_draft", "posted", "draft", map[string]interface{}{
+		"total_debit":  totalDebit,
+		"total_credit": totalCredit,
+	})
+
+	response.Success(c, gin.H{"message": "Journal entry reset to draft", "status": "draft"})
 }
 
 // ReverseJournalEntry godoc
