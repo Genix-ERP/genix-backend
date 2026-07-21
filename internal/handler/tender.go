@@ -1149,4 +1149,10 @@ func (h *Handler) createTenderNotification(userID uuid.UUID, notifType, title, m
 	if err != nil {
 		h.log.Error("Failed to create notification", "error", err)
 	}
+
+	// tender_notifications is a separate table (not covered by the notifications
+	// push dispatcher), so fan out the mobile push inline here. Best-effort.
+	if h.fcm.Enabled() {
+		go h.pushToUser(uuid.Nil, userID, title, message, map[string]string{"type": notifType})
+	}
 }
