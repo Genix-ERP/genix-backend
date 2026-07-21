@@ -135,6 +135,10 @@ func main() {
 	// aren't configured, so safe to run unconditionally.
 	go h.CRMSyncer().RunWorker(shutdownCtx)
 
+	// Deliver mobile push for notifications inserted by non-central paths
+	// (background jobs / scheduler reminders). No-op when FCM isn't configured.
+	h.RunPushDispatcher(shutdownCtx)
+
 	// Create HTTP server
 	server := &http.Server{
 		Addr:           fmt.Sprintf(":%d", cfg.App.Port),

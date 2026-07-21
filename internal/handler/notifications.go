@@ -118,14 +118,18 @@ func (h *Handler) createNotification(tenantID, userID uuid.UUID, notifType, titl
 		}
 	}
 
+	// push_sent_at is stamped here because we deliver the push inline just
+	// below — that keeps this row out of the background push dispatcher (which
+	// only handles notifications inserted by paths that DON'T push, i.e.
+	// background_jobs.go / scheduler_reminders.go).
+	now := time.Now()
 	h.db.Exec(`
-		INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', 'normal', $8)
-	`, uuid.New(), tenantID, userID, notifType, title, message, dataJSON, time.Now())
+		INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at, push_sent_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', 'normal', $8, $8)
+	`, uuid.New(), tenantID, userID, notifType, title, message, dataJSON, now)
 
-	// Fan out a mobile push (async, best-effort). This is the single funnel for
-	// notifications, so wiring it here covers every notification path. No-op
-	// when FCM isn't configured or the user has no registered device.
+	// Fan out a mobile push (async, best-effort). No-op when FCM isn't
+	// configured or the user has no registered device.
 	if h.fcm.Enabled() {
 		pushData := map[string]string{"type": notifType}
 		for k, v := range data {
