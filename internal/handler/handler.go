@@ -106,6 +106,9 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 	// Public info
 	rg.GET("/info", h.GetAPIInfo)
 
+	// Mobile app version gate (public - the app checks this on launch, before login)
+	rg.GET("/mobile/version", h.CheckMobileVersion)
+
 	// Contact form (public - no auth needed)
 	rg.POST("/contact", h.SubmitContactForm)
 
@@ -1078,6 +1081,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		journals.PUT("/:id", h.perm.Require("finance", "journal", "create"), h.UpdateJournalEntry)
 		journals.DELETE("/:id", h.perm.Require("finance", "journal", "delete"), h.DeleteJournalEntry)
 		journals.POST("/:id/post", h.perm.Require("finance", "journal", "post"), h.PostJournalEntry)
+		journals.POST("/:id/reset-to-draft", h.perm.Require("finance", "journal", "post"), h.ResetJournalEntryToDraft)
 		journals.POST("/:id/cancel", h.perm.Require("finance", "journal", "create"), h.CancelJournalEntry)
 		journals.POST("/:id/reverse", h.perm.Require("finance", "journal", "reverse"), h.ReverseJournalEntry)
 		journals.GET("/:id/audit-logs", h.GetJournalEntryAuditLogs)
@@ -1534,6 +1538,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		admin.PUT("/tenants/:id/activate", h.ActivateTenantSubscription)
 		admin.DELETE("/users/:id", h.DeleteSystemUser)
 		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
+
+		// Mobile app version gate — global config (one app for all tenants),
+		// managed from Settings → "Mobile App". Read/write is system-admin only
+		// (this group is gated by RequireSystemAdmin above).
+		admin.GET("/mobile-versions", h.ListMobileVersions)
+		admin.PUT("/mobile-versions/:platform", h.UpsertMobileVersion)
 		// /admin/migrations — read-only view over schema_migrations so a
 		// system admin can verify which DB migrations are applied on the
 		// running backend without needing direct psql access. Intended
