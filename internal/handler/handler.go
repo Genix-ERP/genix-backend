@@ -20,24 +20,24 @@ import (
 
 // Handler holds all handler dependencies
 type Handler struct {
-	db             *database.DB
-	redis          *cache.RedisClient
-	config         *config.Config
-	log            logger.Logger
-	jwtManager     *crypto.JWTManager
-	emailService   *email.Service
-	smsService     *sms.Service
-	icSync         *service.IntercompanySyncService
-	perm           *middleware.PermissionChecker
+	db              *database.DB
+	redis           *cache.RedisClient
+	config          *config.Config
+	log             logger.Logger
+	jwtManager      *crypto.JWTManager
+	emailService    *email.Service
+	smsService      *sms.Service
+	icSync          *service.IntercompanySyncService
+	perm            *middleware.PermissionChecker
 	multicardClient *payment.Client
 	// crmSync pushes construction photo reports into the Yuksalish CRM.
 	// nil-safe at the call sites (see CreatePhotoReport): if env vars
 	// aren't set, syncer is constructed but reports itself as
 	// not-configured and every Enqueue is a no-op.
-	crmSync         *crm.Syncer
+	crmSync *crm.Syncer
 	// fcm sends mobile push notifications. Always non-nil; when FCM isn't
 	// configured it reports Enabled()==false and every Send is a no-op.
-	fcm             *push.Sender
+	fcm *push.Sender
 }
 
 // NewHandler creates a new handler instance
@@ -54,15 +54,15 @@ func NewHandler(db *database.DB, redis *cache.RedisClient, cfg *config.Config, l
 	}
 
 	return &Handler{
-		db:             db,
-		redis:          redis,
-		config:         cfg,
-		log:            log,
-		jwtManager:     crypto.NewJWTManager(cfg.JWT),
-		emailService:   email.NewService(&cfg.Email),
-		smsService:     sms.NewService(&cfg.SMS),
-		icSync:         service.NewIntercompanySyncService(db.DB),
-		perm:           middleware.NewPermissionChecker(db, redis, log),
+		db:           db,
+		redis:        redis,
+		config:       cfg,
+		log:          log,
+		jwtManager:   crypto.NewJWTManager(cfg.JWT),
+		emailService: email.NewService(&cfg.Email),
+		smsService:   sms.NewService(&cfg.SMS),
+		icSync:       service.NewIntercompanySyncService(db.DB),
+		perm:         middleware.NewPermissionChecker(db, redis, log),
 		multicardClient: payment.NewClient(
 			cfg.Multicard.ApplicationID,
 			cfg.Multicard.Secret,
@@ -117,8 +117,8 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 		auth.POST("/verify-phone-otp", h.VerifyPasswordResetOTP)     // Verify phone OTP for password reset
 		auth.POST("/reset-password-phone", h.ResetPasswordWithPhone) // Reset password with phone OTP
 		auth.POST("/verify-email", h.VerifyEmail)
-		auth.GET("/validate-invite", h.ValidateInvite)  // Public - validate invite token
-		auth.POST("/accept-invite", h.AcceptInvite)     // Public - accept invite and set password
+		auth.GET("/validate-invite", h.ValidateInvite) // Public - validate invite token
+		auth.POST("/accept-invite", h.AcceptInvite)    // Public - accept invite and set password
 	}
 
 	// Public info
@@ -171,7 +171,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		auth.PUT("/me/email", h.UpdateCurrentUserEmail)
 		auth.POST("/me/phone/send-otp", h.SendPhoneOTP)
 		auth.POST("/me/phone/verify-otp", h.VerifyPhoneOTP)
-		auth.POST("/send-invite", h.SendInvite) // Send invitation to a user
+		auth.POST("/send-invite", h.SendInvite)                  // Send invitation to a user
 		auth.GET("/me/permissions", h.GetCurrentUserPermissions) // Get current user's module permissions
 		auth.GET("/me/organizations", h.GetCurrentUserOrganizations)
 	}
@@ -1505,6 +1505,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// ASQ per TT Buxgalteriya §6.1 — opening/turnover/closing + Excel export
 		reports.GET("/trial-balance/turnover", h.GetTrialBalanceWithTurnover)
 		reports.GET("/trial-balance/excel", h.ExportTrialBalanceExcel)
+		// Diagnostics (genix_diagnostika §2.4) — anomaly scan over the trial balance
+		reports.GET("/trial-balance/anomalies", h.GetTrialBalanceAnomalies)
 		reports.GET("/general-ledger", h.GetGeneralLedger)
 		// Bosh kitob — monthly breakdown per TT Buxgalteriya §6.2
 		reports.GET("/general-ledger/monthly", h.GetGeneralLedgerMonthly)
@@ -2327,17 +2329,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	works.Use(h.perm.Require("construction", "estimate", "update"))
 	{
 		// Foreman.
-		works.POST("/:id/done-quantity",      h.UpdateWorkDoneQuantity)
-		works.POST("/:id/submit",             h.SubmitWork)
-		works.POST("/bulk-submit",            h.BulkSubmitWorks)
+		works.POST("/:id/done-quantity", h.UpdateWorkDoneQuantity)
+		works.POST("/:id/submit", h.SubmitWork)
+		works.POST("/bulk-submit", h.BulkSubmitWorks)
 		// Supervisor.
 		works.POST("/:id/confirm-supervisor", h.ConfirmWorkSupervisor)
-		works.POST("/:id/reject-supervisor",  h.RejectWorkSupervisor)
+		works.POST("/:id/reject-supervisor", h.RejectWorkSupervisor)
 		works.POST("/bulk-confirm-supervisor", h.BulkConfirmSupervisor)
 		// Engineer (final).
-		works.POST("/:id/confirm-engineer",   h.ConfirmWorkEngineer)
-		works.POST("/:id/reject-engineer",    h.RejectWorkEngineer)
-		works.POST("/bulk-confirm-engineer",  h.BulkConfirmEngineer)
+		works.POST("/:id/confirm-engineer", h.ConfirmWorkEngineer)
+		works.POST("/:id/reject-engineer", h.RejectWorkEngineer)
+		works.POST("/bulk-confirm-engineer", h.BulkConfirmEngineer)
 	}
 
 	// Estimate Summary (direct access)
