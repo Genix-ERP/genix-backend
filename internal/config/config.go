@@ -24,19 +24,19 @@ type Config struct {
 	Email     EmailConfig
 	SMS       SMSConfig
 	Queue     QueueConfig
-	Google     GoogleConfig
-	Multicard  MulticardConfig
-	FCM        FCMConfig
+	Google    GoogleConfig
+	Multicard MulticardConfig
+	FCM       FCMConfig
 }
 
 // MulticardConfig holds Multicard payment gateway settings
 type MulticardConfig struct {
-	ApplicationID        string
-	Secret               string
-	StoreID              int
-	BaseURL              string
-	PricePerUserMonthly  int64 // UZS per user per month
-	PricePerUserYearly   int64 // UZS per user per month when billed yearly
+	ApplicationID       string
+	Secret              string
+	StoreID             int
+	BaseURL             string
+	PricePerUserMonthly int64 // UZS per user per month
+	PricePerUserYearly  int64 // UZS per user per month when billed yearly
 }
 
 // GoogleConfig holds Google OAuth settings
@@ -135,26 +135,26 @@ type LogConfig struct {
 
 // StorageConfig holds file storage settings
 type StorageConfig struct {
-	Provider        string // local, s3, gcs, azure
-	LocalPath       string
-	S3Bucket        string
-	S3Region        string
-	S3AccessKey     string
-	S3SecretKey     string
-	MaxFileSize     int64
+	Provider         string // local, s3, gcs, azure
+	LocalPath        string
+	S3Bucket         string
+	S3Region         string
+	S3AccessKey      string
+	S3SecretKey      string
+	MaxFileSize      int64
 	AllowedMimeTypes []string
 }
 
 // EmailConfig holds email settings
 type EmailConfig struct {
-	Provider   string // smtp, sendgrid, ses
-	SMTPHost   string
-	SMTPPort   int
-	Username   string
-	Password   string
-	FromEmail  string
-	FromName   string
-	APIKey     string
+	Provider  string // smtp, sendgrid, ses
+	SMTPHost  string
+	SMTPPort  int
+	Username  string
+	Password  string
+	FromEmail string
+	FromName  string
+	APIKey    string
 }
 
 // SMSConfig holds SMS provider settings
@@ -192,11 +192,11 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		App: AppConfig{
-			Name:           getEnv("APP_NAME", "GenixERP"),
-			Env:            getEnv("APP_ENV", "development"),
-			Port:           getEnvAsInt("APP_PORT", 8080),
-			BaseURL:        getEnv("APP_BASE_URL", "http://localhost:8080"),
-			FrontendURL:    getEnv("FRONTEND_URL", "http://localhost:5173"),
+			Name:        getEnv("APP_NAME", "GenixERP"),
+			Env:         getEnv("APP_ENV", "development"),
+			Port:        getEnvAsInt("APP_PORT", 8080),
+			BaseURL:     getEnv("APP_BASE_URL", "http://localhost:8080"),
+			FrontendURL: getEnv("FRONTEND_URL", "http://localhost:5173"),
 			// Read/Write timeouts cover the WHOLE request lifecycle including
 			// body upload, so on slow connections they need to be generous
 			// enough for big uploads (e.g. a 3000-line resurs import is
@@ -273,13 +273,13 @@ func Load() (*Config, error) {
 			Output: getEnv("LOG_OUTPUT", "stdout"),
 		},
 		Storage: StorageConfig{
-			Provider:        getEnv("STORAGE_PROVIDER", "local"),
-			LocalPath:       getEnv("STORAGE_LOCAL_PATH", "./storage"),
-			S3Bucket:        getEnv("STORAGE_S3_BUCKET", ""),
-			S3Region:        getEnv("STORAGE_S3_REGION", "us-east-1"),
-			S3AccessKey:     getEnv("STORAGE_S3_ACCESS_KEY", ""),
-			S3SecretKey:     getEnv("STORAGE_S3_SECRET_KEY", ""),
-			MaxFileSize:     getEnvAsInt64("STORAGE_MAX_FILE_SIZE", 100*1024*1024), // 100MB
+			Provider:    getEnv("STORAGE_PROVIDER", "local"),
+			LocalPath:   getEnv("STORAGE_LOCAL_PATH", "./storage"),
+			S3Bucket:    getEnv("STORAGE_S3_BUCKET", ""),
+			S3Region:    getEnv("STORAGE_S3_REGION", "us-east-1"),
+			S3AccessKey: getEnv("STORAGE_S3_ACCESS_KEY", ""),
+			S3SecretKey: getEnv("STORAGE_S3_SECRET_KEY", ""),
+			MaxFileSize: getEnvAsInt64("STORAGE_MAX_FILE_SIZE", 100*1024*1024), // 100MB
 			AllowedMimeTypes: getEnvAsSlice("STORAGE_ALLOWED_MIME_TYPES", []string{
 				"image/jpeg", "image/png", "image/gif", "image/webp",
 				"application/pdf", "application/msword",

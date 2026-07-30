@@ -1919,6 +1919,44 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// Run Depreciation (batch operation)
 	rg.POST("/run-depreciation", h.perm.Require("finance", "asset", "approve"), h.RunDepreciation)
 
+	// =====================================================
+	// FIXED ASSETS v2 — register, lifecycle, auto-depreciation (TZ v1.0)
+	// =====================================================
+	assetsV2 := rg.Group("/assets")
+	assetsV2.Use(h.perm.Require("finance", "asset", "read"))
+	{
+		assetsV2.GET("", h.ListAssets)
+		assetsV2.POST("", h.perm.Require("finance", "asset", "create"), h.CreateAsset)
+		assetsV2.GET("/:id", h.GetAsset)
+		assetsV2.GET("/:id/schedule", h.GetAssetSchedule)
+		assetsV2.POST("/:id/commission", h.perm.Require("finance", "asset", "update"), h.CommissionAsset)
+		assetsV2.POST("/:id/conserve", h.perm.Require("finance", "asset", "update"), h.ConserveAsset)
+		assetsV2.POST("/:id/reactivate", h.perm.Require("finance", "asset", "update"), h.ReactivateAsset)
+		assetsV2.POST("/:id/dispose", h.perm.Require("finance", "asset", "approve"), h.DisposeAsset)
+		assetsV2.POST("/:id/change-params", h.perm.Require("finance", "asset", "update"), h.ChangeAssetParams)
+		// Per-asset GL override — gated by the dedicated accounting permission (§2.6).
+		assetsV2.PATCH("/:id/accounts", h.perm.Require("accounting", "asset_accounts", "override"), h.PatchAssetAccounts)
+	}
+
+	depreciation := rg.Group("/depreciation/runs")
+	depreciation.Use(h.perm.Require("finance", "asset", "read"))
+	{
+		depreciation.POST("", h.perm.Require("finance", "asset", "approve"), h.CreateDepreciationRunHandler)
+		depreciation.GET("/:id", h.GetDepreciationRun)
+		depreciation.POST("/:id/exclude", h.perm.Require("finance", "asset", "approve"), h.ExcludeFromRun)
+		depreciation.POST("/:id/post", h.perm.Require("finance", "asset", "approve"), h.PostDepreciationRun)
+		depreciation.POST("/:id/reverse", h.perm.Require("finance", "asset", "approve"), h.ReverseDepreciationRun)
+	}
+
+	// Asset account mapping (§2.5) — read for form population, edit gated by
+	// the accounting.edit_mapping permission.
+	assetMapping := rg.Group("/settings/asset-mapping")
+	{
+		assetMapping.GET("", h.GetAssetMapping)
+		assetMapping.PUT("", h.perm.Require("accounting", "asset_mapping", "edit"), h.UpdateAssetMapping)
+	}
+	rg.GET("/asset-mapping/accounts", h.ListChartAccountsFiltered)
+
 	// Projects
 	projects := rg.Group("/projects")
 	projects.Use(h.perm.Require("projects", "project", "read"))

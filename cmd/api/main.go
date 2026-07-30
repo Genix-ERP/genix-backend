@@ -17,9 +17,9 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/logger"
 	"github.com/gin-gonic/gin"
 
+	_ "github.com/genixerp/genix-backend/docs" // swagger docs
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
-	_ "github.com/genixerp/genix-backend/docs" // swagger docs
 )
 
 // @title GenixERP API
@@ -138,6 +138,11 @@ func main() {
 	// Deliver mobile push for notifications inserted by non-central paths
 	// (background jobs / scheduler reminders). No-op when FCM isn't configured.
 	h.RunPushDispatcher(shutdownCtx)
+
+	// Fixed Assets v2 auto-depreciation: on the 1st of each month, create (and
+	// auto-post when the tenant enabled it) the depreciation run for the month
+	// that just ended. Same code path as the "Amortizatsiyani hisoblash" button.
+	h.RunDepreciationCron(shutdownCtx)
 
 	// Create HTTP server
 	server := &http.Server{
