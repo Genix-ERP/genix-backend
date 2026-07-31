@@ -687,30 +687,48 @@ func (h *Handler) ApproveExpenseLine(c *gin.Context) {
 				tx.Exec(`ROLLBACK TO SAVEPOINT sp_je_expense`)
 			} else {
 				// Debit line
-				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,$5,0,1,$6)`,
+				_, jeErr = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,$5,0,1,$6)`,
 					uuid.New(), entryID, *debitAccID, ld.Description, ld.Amount, now)
 				// Credit line
-				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
-					uuid.New(), entryID, *creditAccID, ld.Description, ld.Amount, now)
+				if jeErr == nil {
+					_, jeErr = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
+						uuid.New(), entryID, *creditAccID, ld.Description, ld.Amount, now)
+				}
 				// Update account balances
-				tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *debitAccID)
-				tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *creditAccID)
-				tx.Exec(`RELEASE SAVEPOINT sp_je_expense`)
-				journalEntryID = &entryID
+				if jeErr == nil {
+					_, jeErr = tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *debitAccID)
+				}
+				if jeErr == nil {
+					_, jeErr = tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *creditAccID)
+				}
+				if jeErr != nil {
+					// Any failed line/balance write must take the whole JE with
+					// it — a partially written 'posted' entry (0-line JE) is
+					// worse than none.
+					h.log.Error("Journal entry line/balance write failed", "error", jeErr)
+					tx.Exec(`ROLLBACK TO SAVEPOINT sp_je_expense`)
+				} else {
+					tx.Exec(`RELEASE SAVEPOINT sp_je_expense`)
+					journalEntryID = &entryID
+				}
 			}
 		}
 	}
 
-	// Mark expense line as approved
+	// Mark expense line as approved. Persist the resolved debit/credit
+	// accounts on the row so a later cancellation reverses against the same
+	// accounts instead of skipping the storno.
 	_, err = tx.Exec(`
 		UPDATE construction_expense_lines
 		SET status = 'approved',
 		    approved_by = $1,
 		    approved_at = $2,
 		    journal_entry_id = $3,
+		    debit_account_id = COALESCE($4, debit_account_id),
+		    credit_account_id = COALESCE($5, credit_account_id),
 		    updated_at = $2
-		WHERE id = $4 AND tenant_id = $5
-	`, approverEmpID, now, journalEntryID, lineID, tenantID)
+		WHERE id = $6 AND tenant_id = $7
+	`, approverEmpID, now, journalEntryID, debitAccID, creditAccID, lineID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to approve expense line", "error", err)
 		response.InternalError(c, "Failed to approve expense line")
@@ -757,6 +775,7 @@ func (h *Handler) CancelExpenseLine(c *gin.Context) {
 
 	type lineData struct {
 		ProjectID       int64
+		CostCategoryID  *int64
 		Amount          float64
 		Description     string
 		Status          string
@@ -766,12 +785,12 @@ func (h *Handler) CancelExpenseLine(c *gin.Context) {
 	}
 	var ld lineData
 	err = h.db.QueryRow(`
-		SELECT project_id, amount, description, status,
+		SELECT project_id, cost_category_id, amount, description, status,
 		       debit_account_id, credit_account_id, journal_entry_id
 		FROM construction_expense_lines
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, lineID, tenantID).Scan(
-		&ld.ProjectID, &ld.Amount, &ld.Description, &ld.Status,
+		&ld.ProjectID, &ld.CostCategoryID, &ld.Amount, &ld.Description, &ld.Status,
 		&ld.DebitAccountID, &ld.CreditAccountID, &ld.JournalEntryID,
 	)
 	if err != nil {
@@ -788,6 +807,37 @@ func (h *Handler) CancelExpenseLine(c *gin.Context) {
 		orgIDPtr = &organizationID
 	}
 
+	// Resolve reversal accounts with the same fallback chain as
+	// ApproveExpenseLine: line → category default → WIP/cash mapping. Lines
+	// approved before the accounts were persisted on the row would otherwise
+	// be cancelled without a storno, leaving the original JE uncorrected.
+	debitAccID := ld.DebitAccountID
+	creditAccID := ld.CreditAccountID
+	if ld.Status == "approved" {
+		if (debitAccID == nil || *debitAccID == uuid.Nil) && ld.CostCategoryID != nil {
+			var catAccID uuid.UUID
+			h.db.QueryRow(`SELECT default_debit_account_id FROM construction_cost_categories WHERE id = $1 AND tenant_id = $2 AND default_debit_account_id IS NOT NULL`, *ld.CostCategoryID, tenantID).Scan(&catAccID)
+			if catAccID != uuid.Nil {
+				debitAccID = &catAccID
+			}
+		}
+		if debitAccID == nil || *debitAccID == uuid.Nil {
+			wipAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "wip_0810", "tugallanmagan qurilish", "0810")
+			if wipAcct != uuid.Nil {
+				debitAccID = &wipAcct
+			}
+		}
+		if creditAccID == nil || *creditAccID == uuid.Nil {
+			cashAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "cash_5010", "kassa", "5010")
+			if cashAcct == uuid.Nil {
+				cashAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+			}
+			if cashAcct != uuid.Nil {
+				creditAccID = &cashAcct
+			}
+		}
+	}
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		response.InternalError(c, "Failed to cancel expense")
@@ -798,7 +848,7 @@ func (h *Handler) CancelExpenseLine(c *gin.Context) {
 	now := time.Now()
 
 	// If approved, create reversal journal entry
-	if ld.Status == "approved" && ld.DebitAccountID != nil && ld.CreditAccountID != nil && *ld.CreditAccountID != uuid.Nil {
+	if ld.Status == "approved" && debitAccID != nil && *debitAccID != uuid.Nil && creditAccID != nil && *creditAccID != uuid.Nil {
 		journalID := h.ensureConstructionJournal(tenantID, orgIDPtr)
 		if journalID != uuid.Nil {
 			tx.Exec(`SAVEPOINT sp_je_reversal`)
@@ -819,13 +869,26 @@ func (h *Handler) CancelExpenseLine(c *gin.Context) {
 				tx.Exec(`ROLLBACK TO SAVEPOINT sp_je_reversal`)
 			} else {
 				// Reverse: Debit credit account, Credit debit account
-				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,$5,0,1,$6)`,
-					uuid.New(), reversalID, *ld.CreditAccountID, "Reversal", ld.Amount, now)
-				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
-					uuid.New(), reversalID, *ld.DebitAccountID, "Reversal", ld.Amount, now)
-				tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *ld.DebitAccountID)
-				tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *ld.CreditAccountID)
-				tx.Exec(`RELEASE SAVEPOINT sp_je_reversal`)
+				_, revErr = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,$5,0,1,$6)`,
+					uuid.New(), reversalID, *creditAccID, "Reversal", ld.Amount, now)
+				if revErr == nil {
+					_, revErr = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
+						uuid.New(), reversalID, *debitAccID, "Reversal", ld.Amount, now)
+				}
+				if revErr == nil {
+					_, revErr = tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *debitAccID)
+				}
+				if revErr == nil {
+					_, revErr = tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, ld.Amount, now, *creditAccID)
+				}
+				if revErr != nil {
+					// Roll the whole reversal back — never leave a 0-line
+					// or half-written 'posted' entry behind.
+					h.log.Error("Reversal line/balance write failed", "error", revErr)
+					tx.Exec(`ROLLBACK TO SAVEPOINT sp_je_reversal`)
+				} else {
+					tx.Exec(`RELEASE SAVEPOINT sp_je_reversal`)
+				}
 			}
 		}
 	}

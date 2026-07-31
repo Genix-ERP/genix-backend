@@ -751,19 +751,20 @@ func (h *Handler) RecordEmployeeTaxPayment(c *gin.Context) {
 	// hasn't configured a payroll-specific one yet. Same lookup pattern
 	// payroll.go uses for the period-level entry.
 	var journalID uuid.UUID
+	var nextNumber int
 	h.db.QueryRow(`
-		SELECT id FROM journals
+		SELECT id, COALESCE(next_number, 1) FROM journals
 		WHERE tenant_id = $1 AND COALESCE(is_payroll_journal, false) = true
 		  AND COALESCE(is_active, true) = true AND deleted_at IS NULL
 		LIMIT 1
-	`, tenantID).Scan(&journalID)
+	`, tenantID).Scan(&journalID, &nextNumber)
 	if journalID == uuid.Nil {
 		h.db.QueryRow(`
-			SELECT id FROM journals
+			SELECT id, COALESCE(next_number, 1) FROM journals
 			WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
 			ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END
 			LIMIT 1
-		`, tenantID).Scan(&journalID)
+		`, tenantID).Scan(&journalID, &nextNumber)
 	}
 	if journalID == uuid.Nil {
 		response.BadRequest(c,
@@ -779,9 +780,11 @@ func (h *Handler) RecordEmployeeTaxPayment(c *gin.Context) {
 	defer tx.Rollback()
 
 	// Allocate journal entry id + number first so we can FK the payment row.
+	// Entry numbers are unique per (tenant, org) — derive the suffix with
+	// nextEntryNumberSeq instead of a timestamp.
 	jeID := uuid.New()
 	now := time.Now()
-	entryNumber := fmt.Sprintf("PAY-TAX-%s-%d", in.TaxCode, now.Unix())
+	entryNumber := fmt.Sprintf("PTX%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "PTX", nextNumber))
 	desc := fmt.Sprintf("%s ushlash to'lovi (%s — %s)",
 		taxName, in.PeriodStart, in.PeriodEnd)
 	_, err = tx.Exec(`
@@ -822,6 +825,29 @@ func (h *Handler) RecordEmployeeTaxPayment(c *gin.Context) {
 	if err != nil {
 		h.log.Error("Failed to insert credit line", "error", err)
 		response.InternalError(c, "Failed to insert journal line")
+		return
+	}
+
+	// Mirror the lines into account balances (debit +, credit −) and bump
+	// the journal counter — all inside the same tx as the JE.
+	_, err = tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`,
+		in.Amount, now, liabilityUUID)
+	if err != nil {
+		h.log.Error("Failed to update tax liability balance", "error", err)
+		response.InternalError(c, "Failed to update account balance")
+		return
+	}
+	_, err = tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`,
+		in.Amount, now, creditAcctID)
+	if err != nil {
+		h.log.Error("Failed to update cash/bank balance", "error", err)
+		response.InternalError(c, "Failed to update account balance")
+		return
+	}
+	_, err = tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID)
+	if err != nil {
+		h.log.Error("Failed to bump journal next_number for tax payment", "error", err)
+		response.InternalError(c, "Failed to update journal")
 		return
 	}
 

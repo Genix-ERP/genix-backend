@@ -3223,9 +3223,11 @@ func (h *Handler) UpdateJournalEntry(c *gin.Context) {
 		return
 	}
 
-	// Check entry exists and is draft
+	// Check entry exists and is draft (organization_id is needed for the FX
+	// balancing account lookup below)
 	var status string
-	err = h.db.QueryRow(`SELECT status FROM journal_entries WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&status)
+	var entryOrgStr sql.NullString
+	err = h.db.QueryRow(`SELECT status, organization_id FROM journal_entries WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&status, &entryOrgStr)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Journal entry")
 		return
@@ -3286,6 +3288,20 @@ func (h *Handler) UpdateJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// TT Buxgalteriya §4.2 + §4.5: same is_leaf / mandatory-analytics validation
+	// as CreateJournalEntry — rewriting the lines must not bypass it.
+	if errMsg := h.validateJournalLines(tenantID, input.Lines); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
+	var entryOrgID *uuid.UUID
+	if entryOrgStr.Valid {
+		if parsed, perr := uuid.Parse(entryOrgStr.String); perr == nil && parsed != uuid.Nil {
+			entryOrgID = &parsed
+		}
+	}
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		h.log.Error("Failed to start transaction", "error", err)
@@ -3344,17 +3360,64 @@ func (h *Handler) UpdateJournalEntry(c *gin.Context) {
 		if line.Description != "" {
 			lineDesc = &line.Description
 		}
-		var contactID *uuid.UUID
-		if line.ContactID != nil && *line.ContactID != "" {
-			cid, _ := uuid.Parse(*line.ContactID)
-			contactID = &cid
+
+		contactID := parseOptionalUUID(line.ContactID)
+		warehouseID := parseOptionalUUID(line.WarehouseID)
+		employeeID := parseOptionalUUID(line.EmployeeID)
+		contractID := parseOptionalUUID(line.ContractID)
+		currencyID := parseOptionalUUID(line.CurrencyID)
+
+		// TT 4.6: compute UZS equivalent. Line-level exchange_rate overrides entry-level.
+		lineRate := exchangeRate
+		if line.ExchangeRate != nil && *line.ExchangeRate > 0 {
+			lineRate = *line.ExchangeRate
 		}
+		lineGross := line.DebitAmount + line.CreditAmount
+		amountBase := lineGross * lineRate
+
 		_, err = tx.Exec(`
-			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		`, lineID, id, i+1, accountID, contactID, lineDesc, line.DebitAmount, line.CreditAmount, exchangeRate, now)
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, contact_id,
+				warehouse_id, employee_id, contract_id, analytics_json,
+				currency_id, currency_amount,
+				description, debit_amount, credit_amount,
+				exchange_rate, amount_base, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9::jsonb, '{}'::jsonb),
+				$10, $11, $12, $13, $14, $15, $16, $17)
+		`, lineID, id, i+1, accountID, contactID,
+			warehouseID, employeeID, contractID, line.AnalyticsJSON,
+			currencyID, line.CurrencyAmount,
+			lineDesc, line.DebitAmount, line.CreditAmount,
+			lineRate, amountBase, now)
 		if err != nil {
 			h.log.Error("Failed to create journal entry line", "error", err)
+			// Surface trigger errors to the client so the buxgalter sees which rule fired
+			if strings.HasPrefix(err.Error(), "pq: TT ") {
+				response.BadRequest(c, strings.TrimPrefix(err.Error(), "pq: "))
+				return
+			}
+			response.InternalError(c, "Failed to update journal entry")
+			return
+		}
+	}
+
+	// TT §4.6 — same FX auto-balancing as CreateJournalEntry: if base-currency
+	// totals don't tie because of mixed exchange rates across lines, auto-append
+	// an FX gain (9540) or loss (9630) line and refresh the header totals.
+	fxRes, err := h.appendFXBalancingLine(tx, tenantID, entryOrgID, id, len(input.Lines)+1, now)
+	if err != nil {
+		h.log.Error("Failed to append FX balancing line", "error", err)
+		response.InternalError(c, "Failed to update journal entry")
+		return
+	}
+	if fxRes.AppendedLine {
+		totalDebit += fxRes.DebitAdded
+		totalCredit += fxRes.CreditAdded
+		if _, uerr := tx.Exec(
+			`UPDATE journal_entries SET total_debit = $1, total_credit = $2, updated_at = $3 WHERE id = $4`,
+			totalDebit, totalCredit, now, id,
+		); uerr != nil {
+			h.log.Error("Failed to update totals after FX adjust", "error", uerr)
 			response.InternalError(c, "Failed to update journal entry")
 			return
 		}
@@ -4505,11 +4568,16 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			}
 
 			if totalExchangeDiff != 0 {
-				// Find exchange gain/loss accounts
+				// Find exchange gain/loss accounts.
+				// The sign is direction-dependent: for a receipt, payment rate >
+				// invoice rate (diff > 0) means MORE UZS received → gain; for an
+				// outbound payment the same positive diff means MORE UZS paid →
+				// LOSS, so the sign is interpreted in reverse.
 				var exchangeAccountID uuid.UUID
 				var exchangeDiffDesc string
 				var exchangeDiffType string
-				if (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0) {
+				isGain := (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0)
+				if isGain {
 					// Exchange gain
 					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "9540")
 					exchangeDiffDesc = "Valyuta kursi bo'yicha foyda"
@@ -4529,8 +4597,10 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				if exchangeAccountID != uuid.Nil {
 					lineNum := 3
 					exchangeLineID := uuid.New()
-					if totalExchangeDiff > 0 {
-						// Positive diff: credit exchange gain account
+					if isGain {
+						// Gain: credit 9540 and debit-adjust line 1
+						// (receipt: cash received more in base currency;
+						// payment: AP relieved at the higher invoice rate)
 						tx.Exec(`
 							INSERT INTO journal_entry_lines (
 								id, journal_entry_id, line_number, account_id, description,
@@ -4539,11 +4609,12 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 							exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
 							0.0, absDiff, 1.0, now,
 						)
-						// Also adjust the debit side (cash got more in base currency)
 						tx.Exec("UPDATE journal_entry_lines SET debit_amount = debit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 1", absDiff, journalEntryID)
 						tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
 					} else {
-						// Negative diff: debit exchange loss account
+						// Loss: debit 9630 and credit-adjust line 2
+						// (receipt: cash received less in base currency than the AR relieved;
+						// payment: cash paid more in base currency)
 						tx.Exec(`
 							INSERT INTO journal_entry_lines (
 								id, journal_entry_id, line_number, account_id, description,
@@ -4552,17 +4623,16 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 							exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
 							absDiff, 0.0, 1.0, now,
 						)
-						// Adjust credit side (cash received less in base currency)
 						tx.Exec("UPDATE journal_entry_lines SET credit_amount = credit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 2", absDiff, journalEntryID)
 						tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
 					}
 					// Update exchange account balance
 					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3",
 						func() float64 {
-							if totalExchangeDiff > 0 {
-								return -absDiff // credit-normal income
+							if isGain {
+								return -absDiff // credit-normal income (9540 credited)
 							}
-							return absDiff // debit-normal expense
+							return absDiff // debit-normal expense (9630 debited)
 						}(), now, exchangeAccountID)
 
 					// Record in exchange_diffs table
@@ -7094,12 +7164,21 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 
 	// Create clearing entry for Outstanding Receipts → Bank
 	// DR Bank, CR Outstanding Receipts
+	// One-transaction rule: header + lines + balance updates + next_number must
+	// commit atomically — otherwise the deferred Dt=Kt trigger (migration 416)
+	// rejects each standalone statement and a 0-line posted JE survives.
 	if receiptsBalance > 0.01 {
-		entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to start receipts clearing transaction", "error", txErr)
+			return
+		}
+
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(tx, tenantID, orgID, prefix, nextNumber))
 		journalEntryID := uuid.New()
 		description := fmt.Sprintf("Bank reconciliation clearing - receipts (%s)", statementDate.Format("2006-01-02"))
 
-		_, err = h.db.Exec(`
+		_, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
@@ -7107,12 +7186,9 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 			journalEntryID, tenantID, orgID, journalID, entryNumber, statementDate, reconciliationID, description,
 			"bank_reconciliation", reconciliationID, 1.0, receiptsBalance, receiptsBalance, userID, now, now,
 		)
-
-		if err != nil {
-			h.log.Error("Failed to create receipts clearing journal entry", "error", err)
-		} else {
+		if err == nil {
 			// Line 1: Debit Bank
-			h.db.Exec(`
+			_, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
@@ -7120,8 +7196,10 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 				uuid.New(), journalEntryID, 1, bankGLAccountID, "Bank - Cleared Receipts",
 				receiptsBalance, 0.0, 1.0, now,
 			)
+		}
+		if err == nil {
 			// Line 2: Credit Outstanding Receipts
-			h.db.Exec(`
+			_, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
@@ -7129,13 +7207,25 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 				uuid.New(), journalEntryID, 2, outReceiptsID, "Outstanding Receipts - Cleared",
 				0.0, receiptsBalance, 1.0, now,
 			)
-
-			// Update account balances
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", receiptsBalance, now, bankGLAccountID)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", receiptsBalance, now, outReceiptsID)
-
+		}
+		// Update account balances
+		if err == nil {
+			_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", receiptsBalance, now, bankGLAccountID)
+		}
+		if err == nil {
+			_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", receiptsBalance, now, outReceiptsID)
+		}
+		if err == nil {
+			_, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
+			h.log.Error("Failed to create receipts clearing journal entry", "error", err)
+			tx.Rollback()
+		} else {
 			nextNumber++
-			h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
 		}
 	}
 
@@ -7144,11 +7234,17 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 	// Outstanding Payments has a negative current_balance (credit balance) when payments are pending
 	absPayments := -paymentsBalance // Make positive for the entry amounts
 	if absPayments > 0.01 {
-		entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to start payments clearing transaction", "error", txErr)
+			return
+		}
+
+		entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(tx, tenantID, orgID, prefix, nextNumber))
 		journalEntryID := uuid.New()
 		description := fmt.Sprintf("Bank reconciliation clearing - payments (%s)", statementDate.Format("2006-01-02"))
 
-		_, err = h.db.Exec(`
+		_, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
@@ -7156,12 +7252,9 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 			journalEntryID, tenantID, orgID, journalID, entryNumber, statementDate, reconciliationID, description,
 			"bank_reconciliation", reconciliationID, 1.0, absPayments, absPayments, userID, now, now,
 		)
-
-		if err != nil {
-			h.log.Error("Failed to create payments clearing journal entry", "error", err)
-		} else {
+		if err == nil {
 			// Line 1: Debit Outstanding Payments (clears the credit balance)
-			h.db.Exec(`
+			_, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
@@ -7169,8 +7262,10 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 				uuid.New(), journalEntryID, 1, outPaymentsID, "Outstanding Payments - Cleared",
 				absPayments, 0.0, 1.0, now,
 			)
+		}
+		if err == nil {
 			// Line 2: Credit Bank
-			h.db.Exec(`
+			_, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
@@ -7178,12 +7273,23 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 				uuid.New(), journalEntryID, 2, bankGLAccountID, "Bank - Cleared Payments",
 				0.0, absPayments, 1.0, now,
 			)
-
-			// Update account balances
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absPayments, now, outPaymentsID)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", absPayments, now, bankGLAccountID)
-
-			h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
+		}
+		// Update account balances
+		if err == nil {
+			_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absPayments, now, outPaymentsID)
+		}
+		if err == nil {
+			_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", absPayments, now, bankGLAccountID)
+		}
+		if err == nil {
+			_, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
+			h.log.Error("Failed to create payments clearing journal entry", "error", err)
+			tx.Rollback()
 		}
 	}
 }
@@ -7229,17 +7335,47 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String
 	}
-	entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, orgID, prefix, nextNumber))
 
 	absDiff := difference
 	if absDiff < 0 {
 		absDiff = -absDiff
 	}
 
+	// Resolve the write-off account BEFORE writing anything: if it's missing we
+	// must not create the entry at all — a header inserted first would survive
+	// as a 0-line posted JE when the lookup fails.
+	var writeOffAccountID uuid.UUID
+	if difference > 0 {
+		// Statement > book: bank has more than expected (e.g., interest earned)
+		// DR Bank, CR Other Income
+		writeOffAccountID = findAccount(h.db, tenantUUID, orgID, "other income", "9310")
+	} else {
+		// Book > statement: bank has less than expected (e.g., bank charges)
+		// DR Bank Charges, CR Bank
+		writeOffAccountID = findAccount(h.db, tenantUUID, orgID, "bank charges", "9620")
+		if writeOffAccountID == uuid.Nil {
+			writeOffAccountID = findAccount(h.db, tenantUUID, orgID, "payment difference write-off", "9690")
+		}
+	}
+	if writeOffAccountID == uuid.Nil {
+		h.log.Error("No write-off account found for reconciliation difference", "difference", difference)
+		return
+	}
+
+	// One-transaction rule: header + lines + balance updates + next_number must
+	// commit atomically — otherwise the deferred Dt=Kt trigger (migration 416)
+	// rejects each standalone statement and a 0-line posted JE survives.
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to start reconciliation write-off transaction", "error", txErr)
+		return
+	}
+
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(tx, tenantID, orgID, prefix, nextNumber))
 	journalEntryID := uuid.New()
 	description := fmt.Sprintf("Reconciliation write-off (%.2f) - %s", difference, statementDate.Format("2006-01-02"))
 
-	_, err = h.db.Exec(`
+	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
@@ -7247,53 +7383,61 @@ func (h *Handler) createReconciliationWriteOff(tenantID string, tenantUUID uuid.
 		journalEntryID, tenantID, orgID, journalID, entryNumber, statementDate, reconciliationID, description,
 		"bank_reconciliation_writeoff", reconciliationID, 1.0, absDiff, absDiff, userID, now, now,
 	)
-	if err != nil {
-		h.log.Error("Failed to create reconciliation write-off entry", "error", err)
-		return
-	}
 
 	if difference > 0 {
-		// Statement > book: bank has more than expected (e.g., interest earned)
 		// DR Bank, CR Other Income
-		otherIncomeID := findAccount(h.db, tenantUUID, orgID, "other income", "9310")
-		if otherIncomeID == uuid.Nil {
-			return
+		if err == nil {
+			_, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, 1, $3, 'Bank - Reconciliation Adjustment', $4, 0, 1.0, $5)`,
+				uuid.New(), journalEntryID, bankGLAccountID, absDiff, now)
 		}
-		h.db.Exec(`
-			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1, $2, 1, $3, 'Bank - Reconciliation Adjustment', $4, 0, 1.0, $5)`,
-			uuid.New(), journalEntryID, bankGLAccountID, absDiff, now)
-		h.db.Exec(`
-			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1, $2, 2, $3, 'Reconciliation Write-off', 0, $4, 1.0, $5)`,
-			uuid.New(), journalEntryID, otherIncomeID, absDiff, now)
+		if err == nil {
+			_, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, 2, $3, 'Reconciliation Write-off', 0, $4, 1.0, $5)`,
+				uuid.New(), journalEntryID, writeOffAccountID, absDiff, now)
+		}
 		// Update balances
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, bankGLAccountID)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, otherIncomeID)
+		if err == nil {
+			_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, bankGLAccountID)
+		}
+		if err == nil {
+			_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, writeOffAccountID)
+		}
 	} else {
-		// Book > statement: bank has less than expected (e.g., bank charges)
 		// DR Bank Charges, CR Bank
-		bankChargesID := findAccount(h.db, tenantUUID, orgID, "bank charges", "9620")
-		if bankChargesID == uuid.Nil {
-			bankChargesID = findAccount(h.db, tenantUUID, orgID, "payment difference write-off", "9690")
+		if err == nil {
+			_, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, 1, $3, 'Bank Charges - Reconciliation', $4, 0, 1.0, $5)`,
+				uuid.New(), journalEntryID, writeOffAccountID, absDiff, now)
 		}
-		if bankChargesID == uuid.Nil {
-			return
+		if err == nil {
+			_, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, 2, $3, 'Bank - Reconciliation Adjustment', 0, $4, 1.0, $5)`,
+				uuid.New(), journalEntryID, bankGLAccountID, absDiff, now)
 		}
-		h.db.Exec(`
-			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1, $2, 1, $3, 'Bank Charges - Reconciliation', $4, 0, 1.0, $5)`,
-			uuid.New(), journalEntryID, bankChargesID, absDiff, now)
-		h.db.Exec(`
-			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1, $2, 2, $3, 'Bank - Reconciliation Adjustment', 0, $4, 1.0, $5)`,
-			uuid.New(), journalEntryID, bankGLAccountID, absDiff, now)
 		// Update balances
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, bankChargesID)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", absDiff, now, bankGLAccountID)
+		if err == nil {
+			_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", absDiff, now, writeOffAccountID)
+		}
+		if err == nil {
+			_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", absDiff, now, bankGLAccountID)
+		}
 	}
 
-	h.db.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
+	if err == nil {
+		_, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", journalID)
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		h.log.Error("Failed to create reconciliation write-off entry", "error", err)
+		tx.Rollback()
+	}
 }
 
 // DeleteBankReconciliation godoc
@@ -10682,6 +10826,16 @@ func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 		}
 	}
 
+	// Check lock date and period lock — same guards as CreateJournalEntry
+	if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+	if errMsg := h.checkPeriodLock(tenantID, entryDate); errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
 	var template struct {
 		ID          uuid.UUID
 		OrgID       *uuid.UUID
@@ -10740,6 +10894,15 @@ func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 		lines = append(lines, l)
 	}
 
+	// Journal's counter/prefix seed the shared entry-number helper below
+	var journalNextNumber int
+	var journalNumberPrefix sql.NullString
+	_ = h.db.QueryRow(`SELECT COALESCE(next_number, 1), number_prefix FROM journals WHERE id = $1 AND tenant_id = $2`,
+		template.JournalID, tenantID).Scan(&journalNextNumber, &journalNumberPrefix)
+	if journalNextNumber < 1 {
+		journalNextNumber = 1
+	}
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		response.InternalError(c, "Failed to start transaction")
@@ -10747,10 +10910,14 @@ func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	var entryNumber string
-	var count int
-	tx.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND entry_date = $2`, tenantID, entryDate.Format("2006-01-02")).Scan(&count)
-	entryNumber = fmt.Sprintf("JE-%s-%04d", entryDate.Format("20060102"), count+1)
+	// Entry numbers are unique per (tenant, org) across ALL journals — use the
+	// shared helper instead of a COUNT-based number that ignores organization
+	// and collides on concurrent/deleted entries.
+	prefix := ""
+	if journalNumberPrefix.Valid {
+		prefix = journalNumberPrefix.String
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(tx, tenantID, template.OrgID, prefix, journalNextNumber))
 
 	status := "draft"
 	if template.AutoPost {
@@ -10790,6 +10957,44 @@ func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 			response.InternalError(c, "Failed to create journal entry line")
 			return
 		}
+	}
+
+	// auto_post writes the entry directly as 'posted', so account balances must
+	// be applied here too — same convention as PostJournalEntry (debit-normal:
+	// +debit −credit; credit-normal: +credit −debit).
+	if template.AutoPost {
+		for _, line := range lines {
+			var normalBalance string
+			if err = tx.QueryRow(`
+				SELECT at.normal_balance FROM accounts a
+				JOIN account_types at ON a.account_type_id = at.id
+				WHERE a.id = $1
+			`, line.AccountID).Scan(&normalBalance); err != nil {
+				h.log.Error("Failed to get account normal balance", "error", err, "account_id", line.AccountID)
+				response.InternalError(c, "Failed to create journal entry")
+				return
+			}
+
+			balanceChange := line.DebitAmount - line.CreditAmount
+			if normalBalance != "debit" {
+				balanceChange = line.CreditAmount - line.DebitAmount
+			}
+
+			if _, err = tx.Exec(`
+				UPDATE accounts SET current_balance = current_balance + $1, updated_at = NOW()
+				WHERE id = $2
+			`, balanceChange, line.AccountID); err != nil {
+				h.log.Error("Failed to update account balance", "error", err, "account_id", line.AccountID)
+				response.InternalError(c, "Failed to create journal entry")
+				return
+			}
+		}
+	}
+
+	if _, err = tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, template.JournalID); err != nil {
+		h.log.Error("Failed to update journal next number", "error", err)
+		response.InternalError(c, "Failed to create journal entry")
+		return
 	}
 
 	tx.Exec(`

@@ -1084,11 +1084,13 @@ func (h *Handler) PayTaxPeriod(c *gin.Context) {
 	entryNumber := fmt.Sprintf("MISC-%d-%04d", now.Year(), nextNumber)
 
 	// Calculate total debit/credit for the journal entry
-	// Dt: OutputVAT (TotalSalesTax), Kt: InputVAT (TotalPurchaseTax) + Bank (NetTaxLiability)
-	// Total = TotalSalesTax (which equals TotalPurchaseTax + NetTaxLiability)
-	entryTotal := period.TotalSalesTax
-	if entryTotal < period.NetTaxLiability {
-		entryTotal = period.NetTaxLiability
+	// Dt: OutputVAT, Kt: InputVAT (agar 4410 topilsa) + Bank (NetTaxLiability)
+	// Debet summasi amalda yoziladigan kredit qatorlari yig'indisidan olinadi,
+	// shunda Dt = Kt har doim ta'minlanadi (4410 topilmasa faqat NetTaxLiability)
+	writeInputVAT := period.TotalPurchaseTax > 0 && inputVATAccountID != uuid.Nil
+	entryTotal := period.NetTaxLiability
+	if writeInputVAT {
+		entryTotal += period.TotalPurchaseTax
 	}
 
 	// Create journal entry
@@ -1111,44 +1113,73 @@ func (h *Handler) PayTaxPeriod(c *gin.Context) {
 
 	lineNumber := 1
 
-	// Dt Output VAT (clear the liability)
-	if period.TotalSalesTax > 0 && outputVATAccountID != uuid.Nil {
-		tx.Exec(`
-			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			uuid.New(), journalEntryID, lineNumber, outputVATAccountID, "Chiquvchi QQS yopish",
-			period.TotalSalesTax, 0.0, now,
-		)
-		tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
-			period.TotalSalesTax, now, outputVATAccountID)
-		lineNumber++
+	// Dt Output VAT (clear the liability) — summa amaldagi kredit qatorlari yig'indisiga teng
+	_, err = tx.Exec(`
+		INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		uuid.New(), journalEntryID, lineNumber, outputVATAccountID, "Chiquvchi QQS yopish",
+		entryTotal, 0.0, now,
+	)
+	if err != nil {
+		h.log.Error("Failed to create tax payment journal entry line", "error", err)
+		response.InternalError(c, "Jurnal yozuvi qatorini yaratishda xato")
+		return
 	}
+	if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
+		entryTotal, now, outputVATAccountID); err != nil {
+		h.log.Error("Failed to update output VAT account balance", "error", err)
+		response.InternalError(c, "Hisob balansini yangilashda xato")
+		return
+	}
+	lineNumber++
 
 	// Kt Input VAT (clear the receivable)
-	if period.TotalPurchaseTax > 0 && inputVATAccountID != uuid.Nil {
-		tx.Exec(`
+	if writeInputVAT {
+		_, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 			uuid.New(), journalEntryID, lineNumber, inputVATAccountID, "Kiruvchi QQS yopish",
 			0.0, period.TotalPurchaseTax, now,
 		)
-		tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
-			period.TotalPurchaseTax, now, inputVATAccountID)
+		if err != nil {
+			h.log.Error("Failed to create tax payment journal entry line", "error", err)
+			response.InternalError(c, "Jurnal yozuvi qatorini yaratishda xato")
+			return
+		}
+		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
+			period.TotalPurchaseTax, now, inputVATAccountID); err != nil {
+			h.log.Error("Failed to update input VAT account balance", "error", err)
+			response.InternalError(c, "Hisob balansini yangilashda xato")
+			return
+		}
 		lineNumber++
 	}
 
 	// Kt Bank/Cash (net payment)
-	tx.Exec(`
+	_, err = tx.Exec(`
 		INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		uuid.New(), journalEntryID, lineNumber, bankAccountID, "Soliq to'lovi",
 		0.0, period.NetTaxLiability, now,
 	)
-	tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
-		period.NetTaxLiability, now, bankAccountID)
+	if err != nil {
+		h.log.Error("Failed to create tax payment journal entry line", "error", err)
+		response.InternalError(c, "Jurnal yozuvi qatorini yaratishda xato")
+		return
+	}
+	if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3",
+		period.NetTaxLiability, now, bankAccountID); err != nil {
+		h.log.Error("Failed to update bank account balance", "error", err)
+		response.InternalError(c, "Hisob balansini yangilashda xato")
+		return
+	}
 
 	// Update journal next_number
-	tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+	if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+		h.log.Error("Failed to update journal next_number", "error", err)
+		response.InternalError(c, "Jurnal raqamini yangilashda xato")
+		return
+	}
 
 	// Mark period as paid
 	_, err = tx.Exec(`

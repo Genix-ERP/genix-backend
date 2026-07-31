@@ -2645,11 +2645,17 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 					}
 				}
 				acctRows.Close()
+				// Prefer inventory-type account for COGS credit, fallback to category (same as SendInvoice)
 				for i := range acctLines {
 					ca := getCategoryAccounts(tx, tenantID, organizationID, acctLines[i].ProductID)
 					acctLines[i].IncomeAcct = ca.IncomeAccountID
 					acctLines[i].ExpenseAcct = ca.ExpenseAccountID
-					acctLines[i].OutputAcct = ca.StockOutputAccountID
+					invAcct := getInventoryAccountByType(tx, tenantID, organizationID, acctLines[i].ProductID)
+					if invAcct != uuid.Nil {
+						acctLines[i].OutputAcct = invAcct
+					} else {
+						acctLines[i].OutputAcct = ca.StockOutputAccountID
+					}
 				}
 			}
 
@@ -2664,6 +2670,19 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			// Resolve fallback revenue account for products without category income account
 			fallbackRevenue := findAccount(tx, tenantID, organizationID, "sales revenue", "9010")
 
+			// Check if a delivery stock operation already posted COGS for this sales order
+			// to avoid double-counting COGS (once from stock operation, once from invoice)
+			deliveryAlreadyPostedCOGS := false
+			var cogsPosted int
+			tx.QueryRow(`
+				SELECT COUNT(*) FROM journal_entries je
+				JOIN stock_operations so ON so.id::text = je.source_id
+				WHERE je.source_type = 'stock_operation' AND je.status = 'posted' AND je.deleted_at IS NULL
+				  AND so.source_type = 'sales_order' AND so.source_id = $1
+				  AND so.direction = 'delivery' AND so.state = 'done'
+			`, orderID.String()).Scan(&cogsPosted)
+			deliveryAlreadyPostedCOGS = cogsPosted > 0
+
 			for _, al := range acctLines {
 				if al.LineTotal > 0 {
 					if al.IncomeAcct != uuid.Nil {
@@ -2672,9 +2691,12 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 						revenueGrouped[fallbackRevenue] += al.LineTotal
 					}
 				}
-				costAmount := al.Quantity * al.CostPrice
-				if costAmount > 0 && al.ExpenseAcct != uuid.Nil && al.OutputAcct != uuid.Nil {
-					cogsGrouped[cogsPair{Expense: al.ExpenseAcct, Output: al.OutputAcct}] += costAmount
+				// Only post COGS if no delivery stock operation already did
+				if !deliveryAlreadyPostedCOGS {
+					costAmount := al.Quantity * al.CostPrice
+					if costAmount > 0 && al.ExpenseAcct != uuid.Nil && al.OutputAcct != uuid.Nil {
+						cogsGrouped[cogsPair{Expense: al.ExpenseAcct, Output: al.OutputAcct}] += costAmount
+					}
 				}
 			}
 

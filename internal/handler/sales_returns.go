@@ -504,12 +504,12 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 	// Get return details for journal entry
 	var returnNumber, customerName string
 	var customerID, returnSalesOrderID sql.NullString
-	var totalAmount float64
+	var totalAmount, returnTaxAmount float64
 	err = h.db.QueryRow(`
-		SELECT return_number, customer_id, customer_name, total_amount, sales_order_id
+		SELECT return_number, customer_id, customer_name, total_amount, COALESCE(tax_amount, 0), sales_order_id
 		FROM sales_returns WHERE id = $1 AND tenant_id = $2 AND status = 'pending' AND deleted_at IS NULL`,
 		returnID, tenantID,
-	).Scan(&returnNumber, &customerID, &customerName, &totalAmount, &returnSalesOrderID)
+	).Scan(&returnNumber, &customerID, &customerName, &totalAmount, &returnTaxAmount, &returnSalesOrderID)
 	if err == sql.ErrNoRows {
 		response.BadRequest(c, "Return not found or not in pending status")
 		return
@@ -540,7 +540,8 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 
 	// =====================================================
 	// CREATE CREDIT NOTE (Journal Entry) - Reduces AR
-	// Debit: Sales Revenue (reduce revenue)
+	// Debit: Sales Revenue (reduce revenue, net of VAT)
+	// Debit: VAT Payable 6420 (reverse VAT liability), when tax is known
 	// Credit: Accounts Receivable (reduce what customer owes)
 	// =====================================================
 
@@ -550,9 +551,46 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 		JOIN sales_returns sr ON sr.sales_invoice_id = si.id
 		WHERE sr.id = $1`, returnID).Scan(&returnOrgID)
 
+	// If the return carries no explicit tax_amount, derive VAT proportionally
+	// from the linked invoice (direct link first, then via sales order) so the
+	// credit note reverses revenue net of VAT instead of overstating it.
+	if returnTaxAmount <= 0 {
+		var invTax, invTotal float64
+		taxErr := h.db.QueryRow(`
+			SELECT COALESCE(si.tax_amount, 0), COALESCE(si.total_amount, 0)
+			FROM sales_invoices si
+			JOIN sales_returns sr ON sr.sales_invoice_id = si.id
+			WHERE sr.id = $1 AND si.deleted_at IS NULL`, returnID,
+		).Scan(&invTax, &invTotal)
+		if taxErr != nil && returnSalesOrderID.Valid {
+			if soUUID, perr := uuid.Parse(returnSalesOrderID.String); perr == nil {
+				taxErr = h.db.QueryRow(`
+					SELECT COALESCE(tax_amount, 0), COALESCE(total_amount, 0)
+					FROM sales_invoices
+					WHERE tenant_id = $1 AND sales_order_id = $2 AND deleted_at IS NULL
+					  AND COALESCE(invoice_type, 'invoice') = 'invoice'
+					ORDER BY created_at ASC LIMIT 1`,
+					tenantID, soUUID,
+				).Scan(&invTax, &invTotal)
+			}
+		}
+		if taxErr == nil && invTax > 0 && invTotal > 0 {
+			returnTaxAmount = totalAmount * invTax / invTotal
+		}
+	}
+
 	// Get accounts — lookup by name first, then code fallback
 	arAccountID := findAccount(h.db, tenantID, returnOrgID, "accounts receivable", "4010")
 	revenueAccountID := findAccount(h.db, tenantID, returnOrgID, "sales revenue", "9010")
+	vatAccountID := findAccount(h.db, tenantID, returnOrgID, "QQS bo'yicha qarz", "6420")
+
+	// Split VAT out of the credit note only when tax info and the 6420 account
+	// are both available; otherwise fall back to the full-amount reversal.
+	splitVAT := returnTaxAmount > 0.005 && returnTaxAmount < totalAmount && vatAccountID != uuid.Nil
+	revenueReversal := totalAmount
+	if splitVAT {
+		revenueReversal = totalAmount - returnTaxAmount
+	}
 
 	// Get journal
 	var journalID uuid.UUID
@@ -587,19 +625,35 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 			}
 
 			// Create journal entry lines
-			// Line 1: Debit Sales Revenue (reduce revenue)
+			// Line 1: Debit Sales Revenue (reduce revenue, net of VAT when split)
 			line1ID := uuid.New()
 			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-				line1ID, entryID, revenueAccountID, "Sales Return - Revenue Reversal", totalAmount, 0, 1, now,
+				line1ID, entryID, revenueAccountID, "Sales Return - Revenue Reversal", revenueReversal, 0, 1, now,
 			); err != nil {
 				h.log.Error("Failed to insert credit note revenue line", "error", err)
 				return
 			}
 
-			// Line 2: Credit Accounts Receivable (reduce what customer owes)
+			// Optional line: Debit VAT Payable (reverse VAT liability on return)
+			arLineNumber := 2
+			if splitVAT {
+				vatLineID := uuid.New()
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					vatLineID, entryID, vatAccountID, "Sales Return - VAT Reversal", returnTaxAmount, 0, 2, now,
+				); err != nil {
+					h.log.Error("Failed to insert credit note VAT line", "error", err)
+					return
+				}
+				arLineNumber = 3
+			}
+
+			// Last line: Credit Accounts Receivable (reduce what customer owes)
 			line2ID := uuid.New()
 			var contactID *uuid.UUID
 			if customerID.Valid {
@@ -610,16 +664,22 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, account_id, contact_id, description, debit_amount, credit_amount, line_number, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-				line2ID, entryID, arAccountID, contactID, "Sales Return - AR Reduction", 0, totalAmount, 2, now,
+				line2ID, entryID, arAccountID, contactID, "Sales Return - AR Reduction", 0, totalAmount, arLineNumber, now,
 			); err != nil {
 				h.log.Error("Failed to insert credit note AR line", "error", err)
 				return
 			}
 
 			// Update account balances
-			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, revenueAccountID); err != nil {
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", revenueReversal, now, revenueAccountID); err != nil {
 				h.log.Error("Failed to update revenue balance for credit note", "error", err)
 				return
+			}
+			if splitVAT {
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", returnTaxAmount, now, vatAccountID); err != nil {
+					h.log.Error("Failed to update VAT balance for credit note", "error", err)
+					return
+				}
 			}
 			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID); err != nil {
 				h.log.Error("Failed to update AR balance for credit note", "error", err)
@@ -668,7 +728,6 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 			continue
 		}
 		quantity, _ := item["quantity"].(float64)
-		unitPrice, _ := item["unit_price"].(float64)
 		if quantity <= 0 {
 			continue
 		}
@@ -719,7 +778,8 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 			continue
 		}
 
-		// Audit trail row
+		// Audit trail row — unit_cost is the product's cost basis, not the
+		// sales price, so inventory valuation reports stay at cost.
 		txID := uuid.New()
 		h.db.Exec(`
 			INSERT INTO inventory_transactions (
@@ -727,7 +787,7 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 				unit_cost, total_cost, reference_type, reference_id,
 				reason, transaction_date, created_at
 			) VALUES ($1, $2, $3, 'return', $4, $5, $6, 'sales_return', $7, 'Sales Return - Customer Return', $8, $8)
-		`, txID, tenantID, inventoryID, quantity, unitPrice, quantity*unitPrice, returnID, now)
+		`, txID, tenantID, inventoryID, quantity, costPrice, quantity*costPrice, returnID, now)
 	}
 
 	// Inventory/COGS reversal journal entry
@@ -1044,8 +1104,8 @@ func (h *Handler) RejectSalesReturn(c *gin.Context) {
 	response.Success(c, ret)
 }
 
-// ProcessRefund processes the refund for an approved return
-// This also INCREASES inventory (products come back from customer)
+// ProcessRefund processes the refund for an approved/completed return.
+// Inventory restock is handled by ApproveSalesReturn; this only moves money.
 func (h *Handler) ProcessRefund(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok {
@@ -1071,7 +1131,9 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 
 	now := time.Now()
 
-	// First check if return exists and is approved
+	// First check if return exists and is approved or completed.
+	// ApproveSalesReturn moves returns straight to 'completed', so refunds are
+	// processed from either state; 'refunded' blocks a second pass.
 	var currentStatus string
 	err = h.db.QueryRow(
 		"SELECT status FROM sales_returns WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
@@ -1081,7 +1143,11 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 		response.NotFound(c, "Sales Return")
 		return
 	}
-	if currentStatus != "approved" {
+	if currentStatus == "refunded" {
+		response.BadRequest(c, "Refund has already been processed for this return")
+		return
+	}
+	if currentStatus != "approved" && currentStatus != "completed" {
 		response.BadRequest(c, "Return must be approved before processing refund")
 		return
 	}
@@ -1092,88 +1158,9 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 		return
 	}
 
-	// Get return items for inventory update
-	items := h.loadSalesReturnItems(returnID)
-	h.log.Info("Processing refund inventory update", "return_id", returnID, "items_count", len(items))
-
-	// Update inventory for each item (increase stock - products returned)
-	for _, item := range items {
-		productIDStr, ok := item["product_id"].(string)
-		if !ok || productIDStr == "" {
-			h.log.Warn("Return item missing product_id", "item", item)
-			continue // Skip items without product_id
-		}
-
-		productID, err := uuid.Parse(productIDStr)
-		if err != nil {
-			continue
-		}
-
-		quantity, _ := item["quantity"].(float64)
-		unitPrice, _ := item["unit_price"].(float64)
-		if quantity <= 0 {
-			continue
-		}
-
-		// Find or create inventory record
-		// First try to find existing inventory for this product
-		var inventoryID uuid.UUID
-		var currentQty float64
-		var warehouseID uuid.UUID
-
-		// If warehouse specified, use it; otherwise find default
-		if input.WarehouseID != "" {
-			warehouseID, _ = uuid.Parse(input.WarehouseID)
-		}
-
-		err = h.db.QueryRow(`
-			SELECT id, quantity_on_hand, warehouse_id FROM inventory
-			WHERE tenant_id = $1 AND product_id = $2
-			LIMIT 1`,
-			tenantID, productID,
-		).Scan(&inventoryID, &currentQty, &warehouseID)
-
-		if err == sql.ErrNoRows {
-			// No inventory record exists, create one
-			inventoryID = uuid.New()
-			if warehouseID == uuid.Nil {
-				// Get default warehouse
-				h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 LIMIT 1", tenantID).Scan(&warehouseID)
-			}
-
-			_, err = h.db.Exec(`
-				INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $6)`,
-				inventoryID, tenantID, productID, warehouseID, quantity, now,
-			)
-			if err != nil {
-				h.log.Error("Failed to create inventory record for return", "error", err, "product_id", productID)
-				continue
-			}
-		} else if err == nil {
-			// Update existing inventory - INCREASE quantity (return from customer)
-			// Note: quantity_available is a generated column, only update quantity_on_hand
-			_, err = h.db.Exec(`
-				UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, updated_at = $2
-				WHERE id = $3`,
-				quantity, now, inventoryID,
-			)
-			if err != nil {
-				h.log.Error("Failed to update inventory for return", "error", err, "inventory_id", inventoryID)
-				continue
-			}
-		}
-
-		// Create inventory transaction for audit trail
-		txID := uuid.New()
-		h.db.Exec(`
-			INSERT INTO inventory_transactions (
-				id, tenant_id, inventory_id, transaction_type, quantity,
-				unit_cost, total_cost, reference_type, reference_id,
-				reason, transaction_date, created_at
-			) VALUES ($1, $2, $3, 'return', $4, $5, $6, 'sales_return', $7, 'Sales Return - Customer Return', $8, $8)
-		`, txID, tenantID, inventoryID, quantity, unitPrice, quantity*unitPrice, returnID, now)
-	}
+	// NOTE: inventory restock (and its inventory_transactions audit row)
+	// already happened in ApproveSalesReturn — repeating it here would
+	// double-count the returned stock, so this handler only records money.
 
 	// Get return details for payment entry
 	var returnNumber, customerName string
@@ -1185,10 +1172,10 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 		returnID, tenantID,
 	).Scan(&returnNumber, &customerID, &customerName, &totalAmount, &returnTaxAmount)
 
-	// Update return status
+	// Update return status — 'refunded' is terminal and blocks repeat refunds
 	result, err := h.db.Exec(`
-		UPDATE sales_returns SET refund_status = 'processed', refund_method = $1, refund_date = $2, status = 'completed', updated_at = $3
-		WHERE id = $4 AND tenant_id = $5 AND status = 'approved' AND deleted_at IS NULL`,
+		UPDATE sales_returns SET refund_status = 'processed', refund_method = $1, refund_date = $2, status = 'refunded', updated_at = $3
+		WHERE id = $4 AND tenant_id = $5 AND status IN ('approved', 'completed') AND deleted_at IS NULL`,
 		input.RefundMethod, now, now, returnID, tenantID,
 	)
 	if err != nil {
@@ -1199,7 +1186,7 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		response.BadRequest(c, "Return not found or not in approved status")
+		response.BadRequest(c, "Return not found or not in approved/completed status")
 		return
 	}
 
@@ -1344,7 +1331,7 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 		}
 	}
 
-	h.log.Info("Sales return processed with inventory update", "return_id", returnID, "items_count", len(items))
+	h.log.Info("Sales return refund processed", "return_id", returnID, "refund_method", input.RefundMethod)
 
 	ret, _ := h.getSalesReturnByID(tenantID, returnID)
 	response.Success(c, ret)

@@ -3632,63 +3632,94 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 		tx.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 		if journalID != uuid.Nil {
-			entryID := uuid.New()
-			entryNumber := fmt.Sprintf("SCP%06d", nextNumber)
-			description := fmt.Sprintf("Scrap Order: %s", scrapNumber)
+			// Resolve both accounts BEFORE inserting the JE header: writing the
+			// header first would leave a 0-line 'posted' entry when an account
+			// is missing (migration 416 deferred trigger issue).
+			// Debit: Scrap/Inventory Loss Expense
+			scrapAcct := findAccount(tx, tenantID, orgIDPtr, "scrap", "6920")
+			if scrapAcct == uuid.Nil {
+				scrapAcct = findAccount(tx, tenantID, orgIDPtr, "inventory loss", "6910")
+			}
+			if scrapAcct == uuid.Nil {
+				scrapAcct = findAccount(tx, tenantID, orgIDPtr, "stock adjustment", "6910")
+			}
 
-			_, err = tx.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-					description, source_type, source_id, status, total_debit, total_credit,
-					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'scrap', $8, 'posted', $9, $9, $10, $11, $11)
-			`, entryID, tenantID, orgIDPtr, journalID, entryNumber, now,
-				description, orderID.String(), totalCost, userID, now)
+			// Credit: Inventory Asset
+			inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
+			if inventoryAcct == uuid.Nil {
+				inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
+			}
 
-			if err != nil {
-				h.log.Error("Failed to create scrap journal entry", "error", err)
+			if scrapAcct == uuid.Nil || inventoryAcct == uuid.Nil {
+				h.log.Error("Cannot find accounts for scrap journal entry, skipping JE", "scrap_number", scrapNumber)
 			} else {
-				// Debit: Scrap/Inventory Loss Expense
-				scrapAcct := findAccount(tx, tenantID, orgIDPtr, "scrap", "6920")
-				if scrapAcct == uuid.Nil {
-					scrapAcct = findAccount(tx, tenantID, orgIDPtr, "inventory loss", "6910")
-				}
-				if scrapAcct == uuid.Nil {
-					scrapAcct = findAccount(tx, tenantID, orgIDPtr, "stock adjustment", "6910")
+				entryID := uuid.New()
+				entryNumber := fmt.Sprintf("SCP%06d", nextNumber)
+				description := fmt.Sprintf("Scrap Order: %s", scrapNumber)
+
+				if _, err = tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+						description, source_type, source_id, status, total_debit, total_credit,
+						created_by, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'scrap', $8, 'posted', $9, $9, $10, $11, $11)
+				`, entryID, tenantID, orgIDPtr, journalID, entryNumber, now,
+					description, orderID.String(), totalCost, userID, now); err != nil {
+					h.log.Error("Failed to create scrap journal entry", "error", err)
+					response.InternalError(c, "Failed to confirm scrap order")
+					return
 				}
 
-				// Credit: Inventory Asset
-				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
-				if inventoryAcct == uuid.Nil {
-					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
+				if _, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Scrap Loss', $4, 0, 1, $5)`,
+					uuid.New(), entryID, scrapAcct, totalCost, now); err != nil {
+					h.log.Error("Failed to insert scrap debit line", "error", err)
+					response.InternalError(c, "Failed to confirm scrap order")
+					return
+				}
+				if _, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Inventory Reduction', 0, $4, 2, $5)`,
+					uuid.New(), entryID, inventoryAcct, totalCost, now); err != nil {
+					h.log.Error("Failed to insert scrap credit line", "error", err)
+					response.InternalError(c, "Failed to confirm scrap order")
+					return
+				}
+				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCost, now, scrapAcct); err != nil {
+					h.log.Error("Failed to update scrap account balance", "error", err)
+					response.InternalError(c, "Failed to confirm scrap order")
+					return
+				}
+				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCost, now, inventoryAcct); err != nil {
+					h.log.Error("Failed to update inventory account balance", "error", err)
+					response.InternalError(c, "Failed to confirm scrap order")
+					return
 				}
 
-				if scrapAcct != uuid.Nil && inventoryAcct != uuid.Nil {
-					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Scrap Loss', $4, 0, 1, $5)`,
-						uuid.New(), entryID, scrapAcct, totalCost, now)
-					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Inventory Reduction', 0, $4, 2, $5)`,
-						uuid.New(), entryID, inventoryAcct, totalCost, now)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCost, now, scrapAcct)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCost, now, inventoryAcct)
+				if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+					h.log.Error("Failed to bump journal next_number", "error", err)
+					response.InternalError(c, "Failed to confirm scrap order")
+					return
 				}
-
-				tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
-				tx.Exec("UPDATE scrap_orders SET journal_entry_id = $1 WHERE id = $2", entryID, orderID)
+				if _, err = tx.Exec("UPDATE scrap_orders SET journal_entry_id = $1 WHERE id = $2", entryID, orderID); err != nil {
+					h.log.Error("Failed to link journal entry to scrap order", "error", err)
+					response.InternalError(c, "Failed to confirm scrap order")
+					return
+				}
 
 				// TT 12.3: Scrap/write-offs affect budget
-				if scrapAcct != uuid.Nil && totalCost > 0 {
-					tx.Exec(`
-						UPDATE budget_lines bl
-						SET actual_amount = actual_amount + $1, updated_at = NOW()
-						FROM budgets b
-						WHERE bl.budget_id = b.id
-						  AND b.tenant_id = $2
-						  AND b.status = 'approved'
-						  AND b.deleted_at IS NULL
-						  AND bl.account_id = $3
-						  AND (b.start_date IS NULL OR b.start_date <= $4)
-						  AND (b.end_date IS NULL OR b.end_date >= $4)
-					`, totalCost, tenantID, scrapAcct, now)
+				if _, err = tx.Exec(`
+					UPDATE budget_lines bl
+					SET actual_amount = actual_amount + $1, updated_at = NOW()
+					FROM budgets b
+					WHERE bl.budget_id = b.id
+					  AND b.tenant_id = $2
+					  AND b.status = 'approved'
+					  AND b.deleted_at IS NULL
+					  AND bl.account_id = $3
+					  AND (b.start_date IS NULL OR b.start_date <= $4)
+					  AND (b.end_date IS NULL OR b.end_date >= $4)
+				`, totalCost, tenantID, scrapAcct, now); err != nil {
+					h.log.Error("Failed to update budget actuals for scrap", "error", err)
+					response.InternalError(c, "Failed to confirm scrap order")
+					return
 				}
 			}
 		}
@@ -8686,40 +8717,67 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 		tx.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 		if journalID != uuid.Nil {
-			jeID := uuid.New()
-			entryNumber := fmt.Sprintf("SHR%06d", nextNumber)
-			jeDesc := fmt.Sprintf("Kamomad: %s", reason)
+			// Resolve both accounts BEFORE inserting the JE header: writing the
+			// header first would leave a 0-line 'posted' entry when an account
+			// is missing (migration 416 deferred trigger issue).
+			// Dt 9430 - Shortages and losses from damage of valuables
+			shortageAcct := findAccount(tx, tenantID, orgIDPtr, "shortage", "9430")
+			if shortageAcct == uuid.Nil {
+				shortageAcct = findAccount(tx, tenantID, orgIDPtr, "kamomad", "9430")
+			}
+			// Kt - product inventory account (1010-series)
+			inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
+			if inventoryAcct == uuid.Nil {
+				inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
+			}
 
-			_, jeErr := tx.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-					description, source_type, source_id, status, total_debit, total_credit,
-					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'inventory_shortage', $8, 'posted', $9, $9, $10, $11, $11)
-			`, jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
-				jeDesc, lineID.String(), shortageAmount, userID, now)
+			if shortageAcct == uuid.Nil || inventoryAcct == uuid.Nil {
+				h.log.Error("Cannot find accounts for shortage journal entry, skipping JE", "line_id", lineID)
+			} else {
+				jeID := uuid.New()
+				entryNumber := fmt.Sprintf("SHR%06d", nextNumber)
+				jeDesc := fmt.Sprintf("Kamomad: %s", reason)
 
-			if jeErr == nil {
-				// Dt 9430 - Shortages and losses from damage of valuables
-				shortageAcct := findAccount(tx, tenantID, orgIDPtr, "shortage", "9430")
-				if shortageAcct == uuid.Nil {
-					shortageAcct = findAccount(tx, tenantID, orgIDPtr, "kamomad", "9430")
-				}
-				// Kt - product inventory account (1010-series)
-				inventoryAcct := findAccount(tx, tenantID, orgIDPtr, "inventory", "1010")
-				if inventoryAcct == uuid.Nil {
-					inventoryAcct = findAccount(tx, tenantID, orgIDPtr, "stock valuation", "1010")
+				if _, err = tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+						description, source_type, source_id, status, total_debit, total_credit,
+						created_by, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'inventory_shortage', $8, 'posted', $9, $9, $10, $11, $11)
+				`, jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+					jeDesc, lineID.String(), shortageAmount, userID, now); err != nil {
+					h.log.Error("Failed to create shortage journal entry", "error", err)
+					response.InternalError(c, "Failed to create journal entry")
+					return
 				}
 
-				if shortageAcct != uuid.Nil && inventoryAcct != uuid.Nil {
-					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
-						uuid.New(), jeID, shortageAcct, jeDesc, shortageAmount, now)
-					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
-						uuid.New(), jeID, inventoryAcct, "Tovar hisobi", shortageAmount, now)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", shortageAmount, now, shortageAcct)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", shortageAmount, now, inventoryAcct)
+				if _, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
+					uuid.New(), jeID, shortageAcct, jeDesc, shortageAmount, now); err != nil {
+					h.log.Error("Failed to insert shortage debit line", "error", err)
+					response.InternalError(c, "Failed to create journal entry")
+					return
 				}
-				tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+				if _, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
+					uuid.New(), jeID, inventoryAcct, "Tovar hisobi", shortageAmount, now); err != nil {
+					h.log.Error("Failed to insert shortage credit line", "error", err)
+					response.InternalError(c, "Failed to create journal entry")
+					return
+				}
+				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", shortageAmount, now, shortageAcct); err != nil {
+					h.log.Error("Failed to update shortage account balance", "error", err)
+					response.InternalError(c, "Failed to create journal entry")
+					return
+				}
+				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", shortageAmount, now, inventoryAcct); err != nil {
+					h.log.Error("Failed to update inventory account balance", "error", err)
+					response.InternalError(c, "Failed to create journal entry")
+					return
+				}
+				if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+					h.log.Error("Failed to bump journal next_number", "error", err)
+					response.InternalError(c, "Failed to create journal entry")
+					return
+				}
 			}
 		}
 	}

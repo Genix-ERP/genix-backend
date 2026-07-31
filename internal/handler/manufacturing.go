@@ -2661,14 +2661,17 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 				h.log.Info("[v2] SUCCESS: Materials consumed for production order start", "order_id", id, "components", len(components))
 
 				// --- Create journal entry: Dt 1320 WIP / Kt 1310 Raw Materials ---
-				// Skip if journal was already created at confirm step
+				// Skip if a start JE already exists for this PO (source_type match)
+				// or the journal was already created at confirm step (legacy
+				// entries carry no source_type, so keep the description LIKE)
 				var existingConfirmJE int
 				h.db.QueryRow(`
 					SELECT COUNT(*) FROM journal_entries
-					WHERE tenant_id = $1 AND description LIKE '%confirmed - planned material cost%'
-					AND description LIKE '%' || (SELECT code FROM production_orders WHERE id = $2) || '%'
-					AND status = 'posted'
-				`, tenantID, id).Scan(&existingConfirmJE)
+					WHERE tenant_id = $1 AND status = 'posted'
+					AND ((source_type = 'production_start' AND source_id = $2)
+						OR (description LIKE '%confirmed - planned material cost%'
+							AND description LIKE '%' || (SELECT code FROM production_orders WHERE id = $3) || '%'))
+				`, tenantID, id.String(), id).Scan(&existingConfirmJE)
 
 				if existingConfirmJE == 0 {
 					var totalMaterialCost float64
@@ -2728,11 +2731,11 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 									if _, err := jeTx.Exec(`
         INSERT INTO journal_entries (
             id, tenant_id, organization_id, journal_id, entry_number,
-            entry_date, description, status, total_debit, total_credit,
+            entry_date, description, source_type, source_id, status, total_debit, total_credit,
             created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
+        ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'production_start', $8, 'posted', $9, $9, $10, $10)
     `, entryID, tenantID, organizationID, journalID, entryNumber,
-										now, description, totalMaterialCost, now); err != nil {
+										now, description, id.String(), totalMaterialCost, now); err != nil {
 										h.log.Error("Failed to insert start material consumption journal entry", "error", err, "order_id", id)
 										return
 									}
@@ -2786,7 +2789,7 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 						}
 					}
 				} else {
-					h.log.Info("Skipping start journal entry - already created at confirm step", "order_id", id)
+					h.log.Info("Skipping start journal entry - already exists (start or confirm step)", "order_id", id)
 				}
 			}
 		}
@@ -3314,7 +3317,18 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 			`, tenantID).Scan(&journalID, &nextNumber)
 		}
 
-		if journalID != uuid.Nil {
+		// Prevent duplicate: the work-order completion path
+		// (createFinishedGoodsJournalEntry) writes the same JE with
+		// source_type='production_complete' — skip if one already exists.
+		var existingCompleteJE int
+		h.db.QueryRow(`
+			SELECT COUNT(*) FROM journal_entries
+			WHERE tenant_id = $1 AND source_type = 'production_complete' AND source_id = $2
+		`, tenantID, id.String()).Scan(&existingCompleteJE)
+
+		if existingCompleteJE > 0 {
+			h.log.Info("CompleteProductionOrder: SKIPPED journal entry - completion JE already exists", "po_id", id)
+		} else if journalID != uuid.Nil {
 			// Get production order number & product name
 			var poNumber string
 			h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, id).Scan(&poNumber)
@@ -3344,10 +3358,11 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 					h.db.QueryRow(`
             SELECT COUNT(*) FROM journal_entries
             WHERE tenant_id = $1 AND organization_id = $2
-            AND (description LIKE '%' || $3 || '%started - materials consumed%'
+            AND ((source_type = 'production_start' AND source_id = $4)
+                 OR description LIKE '%' || $3 || '%started - materials consumed%'
                  OR description LIKE '%' || $3 || '%confirmed - planned material cost%')
             AND status = 'posted'
-        `, tenantID, organizationID, poNumber).Scan(&materialJEExists)
+        `, tenantID, organizationID, poNumber, id.String()).Scan(&materialJEExists)
 					materialAlreadyJournalized := materialJEExists > 0
 
 					// Compute actual entry total: sum of all debit amounts that will be posted
@@ -3366,11 +3381,11 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 					if _, err := jeTx.Exec(`
             INSERT INTO journal_entries (
                 id, tenant_id, organization_id, journal_id, entry_number,
-                entry_date, description, status, total_debit, total_credit,
+                entry_date, description, source_type, source_id, status, total_debit, total_credit,
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
+            ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'production_complete', $8, 'posted', $9, $9, $10, $10)
         `, entryID, tenantID, organizationID, journalID, entryNumber,
-						now, description, entryTotal, now); err != nil {
+						now, description, id.String(), entryTotal, now); err != nil {
 						h.log.Error("CompleteProductionOrder: failed to insert detailed journal entry", "error", err, "po_id", id)
 						return
 					}
@@ -3536,11 +3551,11 @@ func (h *Handler) CompleteProductionOrder(c *gin.Context) {
 						if _, err := jeTx.Exec(`
                 INSERT INTO journal_entries (
                     id, tenant_id, organization_id, journal_id, entry_number,
-                    entry_date, description, status, total_debit, total_credit,
+                    entry_date, description, source_type, source_id, status, total_debit, total_credit,
                     created_at, updated_at
-                ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'posted', $8, $8, $9, $9)
+                ) VALUES ($1, $2, $3, $4, $5, $6::date, $7, 'production_complete', $8, 'posted', $9, $9, $10, $10)
             `, entryID, tenantID, organizationID, journalID, entryNumber,
-							now, description, totalCost, now); err != nil {
+							now, description, id.String(), totalCost, now); err != nil {
 							h.log.Error("CompleteProductionOrder: failed to insert fallback journal entry", "error", err, "po_id", id)
 							return
 						}
@@ -3757,7 +3772,7 @@ func (h *Handler) returnUnusedComponents(
 				h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, poID).Scan(&poNumber)
 
 				entryID := uuid.New()
-				entryNumber := fmt.Sprintf("MRT%06d", nextNumber)
+				entryNumber := fmt.Sprintf("MRT%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MRT", nextNumber))
 				description := fmt.Sprintf("Material return - %s shortfall %.2f (produced %.2f / planned %.2f)",
 					poNumber, shortfall, qtyProduced, qtyPlanned)
 
@@ -3794,6 +3809,16 @@ func (h *Handler) returnUnusedComponents(
     VALUES ($1,$2,$3,$4,0,$5,2,$6)
 `, uuid.New(), entryID, wipAcct, "WIP reduced for returned materials", totalReturnCost, now); err != nil {
 					h.log.Error("returnUnusedComponents: failed to insert WIP credit line", "error", err, "po_id", poID)
+					return
+				}
+
+				// Update account balances: raw materials up (debit), WIP down (credit)
+				if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalReturnCost, now, rawAcct); err != nil {
+					h.log.Error("returnUnusedComponents: failed to update raw materials balance", "error", err, "po_id", poID)
+					return
+				}
+				if _, err := jeTx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalReturnCost, now, wipAcct); err != nil {
+					h.log.Error("returnUnusedComponents: failed to update WIP balance", "error", err, "po_id", poID)
 					return
 				}
 

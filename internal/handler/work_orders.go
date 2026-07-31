@@ -1937,9 +1937,10 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 		h.db.QueryRow(`
         SELECT COUNT(*) FROM journal_entries
         WHERE tenant_id = $1 AND organization_id = $2
-        AND description LIKE '%' || $3 || '%started - materials consumed%'
+        AND ((source_type = 'production_start' AND source_id = $4)
+             OR description LIKE '%' || $3 || '%started - materials consumed%')
         AND status = 'posted'
-    `, tenantID, organizationID, poNumber).Scan(&materialJEExists)
+    `, tenantID, organizationID, poNumber, poID.String()).Scan(&materialJEExists)
 		materialAlreadyJournalized := materialJEExists > 0
 
 		// Calculate entry total

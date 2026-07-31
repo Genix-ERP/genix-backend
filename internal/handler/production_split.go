@@ -468,6 +468,78 @@ func (h *Handler) consumeSplitMaterial(
 		return
 	}
 
+	// GL: Dt 2010 WIP / Kt material stock account, so the stock GL is
+	// credited alongside the inventory issue (the later 2810/2010 transfer
+	// then zeroes WIP out, packaging cost included).
+	matTotalCost := qty * unitCost
+	if matTotalCost > 0 {
+		wipAcct := findAccount(h.db, tenantID, organizationID, "work in progress", "2010")
+		stockAcct := getCategoryAccounts(h.db, tenantID, organizationID, productID).StockValuationAccountID
+		if stockAcct == uuid.Nil {
+			stockAcct = findAccount(h.db, tenantID, organizationID, "xom ashyo", "1010")
+		}
+
+		var journalID uuid.UUID
+		var nextNumber int
+		h.db.QueryRow(`
+			SELECT id, next_number FROM journals
+			WHERE tenant_id = $1 AND type = 'general' AND is_active = true
+			ORDER BY created_at ASC LIMIT 1
+		`, tenantID).Scan(&journalID, &nextNumber)
+
+		if wipAcct != uuid.Nil && stockAcct != uuid.Nil && journalID != uuid.Nil {
+			var poCode string
+			h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, poID).Scan(&poCode)
+
+			entryID := uuid.New()
+			entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
+			description := fmt.Sprintf("Split packaging material consumed — %s", poCode)
+
+			if _, jeErr := tx.Exec(`
+				INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
+					entry_date, description, source_type, source_id, status, created_by, created_at, updated_at)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,'split_material_consumption',$8,'posted',$9,$10,$10)
+			`, entryID, tenantID, organizationID, journalID, entryNumber,
+				now, description, poID.String(), userID, now); jeErr != nil {
+				h.log.Error("consumeSplitMaterial: insert journal entry failed", "error", jeErr)
+				return
+			}
+
+			// Debit WIP
+			if _, jeErr := tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, debit_amount, credit_amount, description, created_at)
+				VALUES ($1,$2,$3,1,$4,0,$5,$6)
+			`, uuid.New(), entryID, wipAcct, matTotalCost, description, now); jeErr != nil {
+				h.log.Error("consumeSplitMaterial: insert WIP debit line failed", "error", jeErr)
+				return
+			}
+
+			// Credit material stock
+			if _, jeErr := tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, debit_amount, credit_amount, description, created_at)
+				VALUES ($1,$2,$3,2,0,$4,$5,$6)
+			`, uuid.New(), entryID, stockAcct, matTotalCost, description, now); jeErr != nil {
+				h.log.Error("consumeSplitMaterial: insert stock credit line failed", "error", jeErr)
+				return
+			}
+
+			// Update account balances: WIP up (debit), stock down (credit)
+			if _, jeErr := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, matTotalCost, now, wipAcct); jeErr != nil {
+				h.log.Error("consumeSplitMaterial: update WIP balance failed", "error", jeErr)
+				return
+			}
+			if _, jeErr := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, matTotalCost, now, stockAcct); jeErr != nil {
+				h.log.Error("consumeSplitMaterial: update stock balance failed", "error", jeErr)
+				return
+			}
+
+			if _, jeErr := tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID); jeErr != nil {
+				h.log.Error("consumeSplitMaterial: bump journal next_number failed", "error", jeErr)
+				return
+			}
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		h.log.Error("consumeSplitMaterial: commit failed", "error", err)
 	}
@@ -544,6 +616,16 @@ func (h *Handler) createSplitOutputJournalEntry(
 		return
 	}
 
-	tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID)
+	// Update account balances: Finished Goods up (debit), WIP down (credit)
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalCost, now, finishedAcct); err != nil {
+		return
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalCost, now, wipAcct); err != nil {
+		return
+	}
+
+	if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID); err != nil {
+		return
+	}
 	tx.Commit()
 }

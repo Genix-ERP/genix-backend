@@ -461,18 +461,24 @@ func runAutoDepreciation(db *database.DB, log logger.Logger) {
 				continue
 			}
 
+			// Compute by the asset's method — same logic as RunDepreciation
+			// (fixed_asset.go). Declining-balance methods apply the rate to net
+			// book value (cost − accumulated) and must be recomputed each
+			// period, so the stored straight-line monthly_depr must not
+			// override them (that made every method behave straight-line).
 			var depAmount float64
-			if monthlyDeprAmt > 0 {
-				depAmount = monthlyDeprAmt
-			} else {
-				switch deprMethod {
-				case "straight_line":
-					depAmount = depreciableAmount / float64(usefulLifeMonths)
-				case "declining_balance":
-					depAmount = curValue * (1.0 / float64(usefulLifeMonths))
-				case "double_declining":
-					depAmount = curValue * (2.0 / float64(usefulLifeMonths))
-				default:
+			nbv := acquisitionCost - accumulatedDepr
+			switch deprMethod {
+			case "declining_balance":
+				depAmount = nbv * (1.0 / float64(usefulLifeMonths))
+			case "double_declining":
+				depAmount = nbv * (2.0 / float64(usefulLifeMonths))
+			case "straight_line":
+				depAmount = depreciableAmount / float64(usefulLifeMonths)
+			default:
+				if monthlyDeprAmt > 0 {
+					depAmount = monthlyDeprAmt
+				} else {
 					depAmount = depreciableAmount / float64(usefulLifeMonths)
 				}
 			}
