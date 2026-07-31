@@ -2132,7 +2132,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 	// ===== PART 1: Create journal entries for invoices that have none =====
 	missingRows, err := h.db.Query(`
 		SELECT si.id, si.invoice_number, si.total_amount, si.subtotal, si.tax_amount,
-			   si.customer_id, si.organization_id, si.invoice_date
+			   si.customer_id, si.organization_id, si.invoice_date, si.sales_order_id
 		FROM sales_invoices si
 		WHERE si.tenant_id = $1
 			AND si.journal_entry_id IS NULL
@@ -2171,6 +2171,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 		CustomerID     uuid.UUID
 		OrganizationID uuid.UUID
 		InvoiceDate    time.Time
+		SalesOrderID   sql.NullString
 	}
 
 	var missing []missingInvoice
@@ -2178,7 +2179,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 		var mi missingInvoice
 		var invoiceDate sql.NullTime
 		if err := missingRows.Scan(&mi.ID, &mi.InvoiceNumber, &mi.TotalAmount, &mi.Subtotal,
-			&mi.TaxAmount, &mi.CustomerID, &mi.OrganizationID, &invoiceDate); err != nil {
+			&mi.TaxAmount, &mi.CustomerID, &mi.OrganizationID, &invoiceDate, &mi.SalesOrderID); err != nil {
 			continue
 		}
 		if invoiceDate.Valid {
@@ -2250,6 +2251,21 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 		}
 		cogsGrouped := make(map[cogsPair]float64)
 
+		// Check if a delivery stock operation already posted COGS for this sales order
+		// to avoid double-counting COGS (once from stock operation, once from invoice) — same as SendInvoice
+		deliveryAlreadyPostedCOGS := false
+		if mi.SalesOrderID.Valid {
+			var cogsPosted int
+			h.db.QueryRow(`
+				SELECT COUNT(*) FROM journal_entries je
+				JOIN stock_operations so ON so.id::text = je.source_id
+				WHERE je.source_type = 'stock_operation' AND je.status = 'posted' AND je.deleted_at IS NULL
+				  AND so.source_type = 'sales_order' AND so.source_id = $1
+				  AND so.direction = 'delivery' AND so.state = 'done'
+			`, mi.SalesOrderID.String).Scan(&cogsPosted)
+			deliveryAlreadyPostedCOGS = cogsPosted > 0
+		}
+
 		for _, al := range acctLines {
 			if al.LineTotal > 0 {
 				if al.IncomeAcct != uuid.Nil {
@@ -2258,9 +2274,12 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 					revenueGrouped[revenueAccountID] += al.LineTotal
 				}
 			}
-			costAmount := al.Quantity * al.CostPrice
-			if costAmount > 0 && al.ExpenseAcct != uuid.Nil && al.OutputAcct != uuid.Nil {
-				cogsGrouped[cogsPair{Expense: al.ExpenseAcct, Output: al.OutputAcct}] += costAmount
+			// Only post COGS if no delivery stock operation already did
+			if !deliveryAlreadyPostedCOGS {
+				costAmount := al.Quantity * al.CostPrice
+				if costAmount > 0 && al.ExpenseAcct != uuid.Nil && al.OutputAcct != uuid.Nil {
+					cogsGrouped[cogsPair{Expense: al.ExpenseAcct, Output: al.OutputAcct}] += costAmount
+				}
 			}
 		}
 

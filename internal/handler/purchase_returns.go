@@ -955,6 +955,41 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 	apAccountID := findAccount(h.db, tenantID, prOrgID, "accounts payable", "6010")
 	inventoryAccountID := findAccount(h.db, tenantID, prOrgID, "inventory", "1010")
 
+	// Input VAT (4410) reversal — mirrors the bill posting in
+	// CreateBillFromPO (Dt stock net / Dt 4410 VAT / Kt 6010 gross).
+	// Return lines carry the VAT-exclusive PO unit_price, so total_value
+	// is the net value; the VAT portion for the returned quantity is
+	// derived proportionally from the linked PO lines (po_line_id when
+	// set, otherwise matched by product within the linked PO).
+	vatAccountID := findAccount(h.db, tenantID, prOrgID, "soliqlar bo'yicha bo'nak", "4410")
+	var vatPortion float64
+	h.db.QueryRow(`
+		SELECT COALESCE(SUM(
+			CASE WHEN COALESCE(pol.quantity, 0) > 0
+			     THEN COALESCE(pol.tax_amount, 0) * prl.return_quantity / pol.quantity
+			     ELSE 0 END), 0)
+		FROM purchase_return_lines prl
+		JOIN purchase_returns pr ON pr.id = prl.return_id
+		LEFT JOIN LATERAL (
+			SELECT pol.quantity, pol.tax_amount
+			FROM purchase_order_lines pol
+			WHERE pol.id = prl.po_line_id
+			   OR (prl.po_line_id IS NULL
+			       AND pr.purchase_order_id IS NOT NULL
+			       AND pol.purchase_order_id = pr.purchase_order_id
+			       AND pol.product_id = prl.product_id)
+			ORDER BY (pol.id = prl.po_line_id) DESC NULLS LAST, pol.line_number
+			LIMIT 1
+		) pol ON true
+		WHERE prl.return_id = $1`, returnID).Scan(&vatPortion)
+	if vatPortion > 0 && vatAccountID == uuid.Nil {
+		h.log.Warn("Input VAT account (4410) not found — debit note posted without VAT reversal", "return_id", returnID, "vat_portion", vatPortion)
+		vatPortion = 0
+	}
+	// Debit note total: net inventory value plus the input VAT being
+	// reversed — this is the gross amount the supplier owes us back.
+	grossValue := totalValue + vatPortion
+
 	// Get journal (use GENERAL or PURCHASE journal)
 	var journalID uuid.UUID
 	h.db.QueryRow("SELECT id FROM journals WHERE tenant_id = $1 AND code IN ('PURCH', 'PURCHASE', 'PUR', 'GENERAL', 'GEN') AND deleted_at IS NULL ORDER BY CASE code WHEN 'PURCH' THEN 0 WHEN 'PURCHASE' THEN 1 WHEN 'PUR' THEN 2 ELSE 3 END LIMIT 1", tenantID).Scan(&journalID)
@@ -984,25 +1019,25 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14)`,
 				entryID, tenantID, prOrgID, journalID, entryNumber, now, returnNumber,
 				fmt.Sprintf("Debit Note for Purchase Return %s - %s", returnNumber, supplierName),
-				"purchase_return", returnID, totalValue, totalValue, now, now,
+				"purchase_return", returnID, grossValue, grossValue, now, now,
 			); err != nil {
 				h.log.Error("Failed to create debit note journal entry", "error", err)
 				return
 			}
 
-			// Line 1: Debit Accounts Payable (reduce what we owe)
+			// Line 1: Debit Accounts Payable (reduce what we owe — gross incl. VAT)
 			line1ID := uuid.New()
 			if _, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, account_id, contact_id, description, debit_amount, credit_amount, line_number, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-				line1ID, entryID, apAccountID, supplierID, "Purchase Return - AP Reduction", totalValue, 0, 1, now,
+				line1ID, entryID, apAccountID, supplierID, "Purchase Return - AP Reduction", grossValue, 0, 1, now,
 			); err != nil {
 				h.log.Error("Failed to insert debit note AP JE line", "error", err)
 				return
 			}
 
-			// Line 2: Credit Inventory (reduce inventory value)
+			// Line 2: Credit Inventory (reduce inventory value — net purchase cost)
 			line2ID := uuid.New()
 			if _, err = tx.Exec(`
 				INSERT INTO journal_entry_lines (
@@ -1014,8 +1049,22 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 				return
 			}
 
+			// Line 3: Credit Input VAT (reverse the 4410 claimed on the bill)
+			if vatPortion > 0 {
+				line3ID := uuid.New()
+				if _, err = tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+					line3ID, entryID, vatAccountID, "Purchase Return - Input VAT Reversal", 0, vatPortion, 3, now,
+				); err != nil {
+					h.log.Error("Failed to insert debit note VAT JE line", "error", err)
+					return
+				}
+			}
+
 			// Update account balances
-			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, apAccountID); err != nil {
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", grossValue, now, apAccountID); err != nil {
 				h.log.Error("Failed to update AP account balance for debit note JE", "error", err)
 				return
 			}
@@ -1023,13 +1072,19 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 				h.log.Error("Failed to update inventory account balance for debit note JE", "error", err)
 				return
 			}
+			if vatPortion > 0 {
+				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", vatPortion, now, vatAccountID); err != nil {
+					h.log.Error("Failed to update VAT account balance for debit note JE", "error", err)
+					return
+				}
+			}
 
 			if err = tx.Commit(); err != nil {
 				h.log.Error("Failed to commit debit note journal entry", "error", err)
 				return
 			}
 
-			h.log.Info("Debit Note created for purchase return", "return_id", returnID, "entry_number", entryNumber, "amount", totalValue)
+			h.log.Info("Debit Note created for purchase return", "return_id", returnID, "entry_number", entryNumber, "amount", grossValue, "vat_portion", vatPortion)
 		}()
 	} else {
 		h.log.Warn("Could not create debit note - missing accounts or journal", "ap_account", apAccountID, "inventory_account", inventoryAccountID, "journal", journalID)

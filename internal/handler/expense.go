@@ -841,6 +841,17 @@ func (h *Handler) GetExpense(c *gin.Context) {
 		expense.Notes = &notes.String
 	}
 
+	// Surface a GL posting warning set by ApproveExpense (JE skipped/failed).
+	if w, exists := c.Get("gl_warning"); exists {
+		if warn, ok := w.(string); ok && warn != "" {
+			response.Success(c, struct {
+				*entity.ExpenseResponse
+				GLWarning string `json:"gl_warning"`
+			}{expense.ToResponse(), warn})
+			return
+		}
+	}
+
 	response.Success(c, expense.ToResponse())
 }
 
@@ -1092,7 +1103,9 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 	// ============================================
 	// CREATE JOURNAL ENTRY FOR EXPENSE
 	// ============================================
-	func() {
+	// Returns a non-empty warning when the JE was skipped/failed so the
+	// response can disclose it (status still stays 'approved').
+	glWarning := func() string {
 		var expenseNumber, description string
 		var totalAmount float64
 		var reimbursable bool
@@ -1104,7 +1117,7 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 			FROM expenses WHERE id = $1 AND tenant_id = $2`,
 			id, tenantID).Scan(&expenseNumber, &description, &totalAmount, &reimbursable, &orgID, &expenseDate)
 		if err != nil || totalAmount <= 0 {
-			return
+			return "" // nothing to post
 		}
 
 		var orgIDPtr *uuid.UUID
@@ -1129,8 +1142,8 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 		}
 
 		if expenseAccountID == uuid.Nil || creditAccountID == uuid.Nil {
-			h.log.Error("Cannot find accounts for expense JE")
-			return
+			h.log.Error("Cannot find accounts for expense JE", "expense_id", id)
+			return "journal entry not created: expense (9410) or cash/payable account not found"
 		}
 
 		// Look up journal
@@ -1142,7 +1155,8 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 			ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`,
 			tenantID).Scan(&journalID, &nextNumber)
 		if err != nil {
-			return
+			h.log.Error("Expense JE skipped: no MISC/GENERAL journal found", "expense_id", id)
+			return "journal entry not created: no MISC/GENERAL journal found"
 		}
 
 		journalEntryID := uuid.New()
@@ -1154,7 +1168,7 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 		tx, txErr := h.db.Begin()
 		if txErr != nil {
 			h.log.Error("Failed to begin expense journal tx", "error", txErr)
-			return
+			return "journal entry not created: database error"
 		}
 		defer tx.Rollback()
 
@@ -1169,7 +1183,7 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 			id.String(), totalAmount, userID, now,
 		); err != nil {
 			h.log.Error("Failed to create expense journal entry", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 
 		// Debit: Expense account
@@ -1181,7 +1195,7 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 			uuid.New(), journalEntryID, expenseAccountID, "Expense", totalAmount, now,
 		); err != nil {
 			h.log.Error("Failed to insert expense debit line", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 
 		// Credit: Cash or AP
@@ -1193,25 +1207,27 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 			uuid.New(), journalEntryID, creditAccountID, "Cash/Payable", totalAmount, now,
 		); err != nil {
 			h.log.Error("Failed to insert expense credit line", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 
 		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, expenseAccountID); err != nil {
 			h.log.Error("Failed to update expense account balance", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, creditAccountID); err != nil {
 			h.log.Error("Failed to update credit account balance", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 		if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
 			h.log.Error("Failed to bump journal next_number", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 
 		if err = tx.Commit(); err != nil {
 			h.log.Error("Failed to commit expense journal entry", "error", err)
+			return "journal entry not created: database error"
 		}
+		return ""
 	}()
 
 	// Notify: expense approved
@@ -1229,6 +1245,10 @@ func (h *Handler) ApproveExpense(c *gin.Context) {
 			expNum, amountStr,
 		)
 	}()
+
+	if glWarning != "" {
+		c.Set("gl_warning", glWarning)
+	}
 
 	h.GetExpense(c)
 }

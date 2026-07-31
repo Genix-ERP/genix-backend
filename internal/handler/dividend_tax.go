@@ -272,7 +272,11 @@ func (h *Handler) CreateDividendDistribution(c *gin.Context) {
 		response.InternalError(c, "Failed to post dividend")
 		return
 	}
-	tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, in.Amount, now, retainedID)
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, in.Amount, now, retainedID); err != nil {
+		h.log.Error("Failed to update retained earnings balance", "error", err)
+		response.InternalError(c, "Failed to post dividend")
+		return
+	}
 
 	// Cr Cash / Bank = net_to_shareholder
 	if net > 0 {
@@ -288,7 +292,11 @@ func (h *Handler) CreateDividendDistribution(c *gin.Context) {
 			response.InternalError(c, "Failed to post dividend")
 			return
 		}
-		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, net, now, cashID)
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, net, now, cashID); err != nil {
+			h.log.Error("Failed to update cash balance for dividend", "error", err)
+			response.InternalError(c, "Failed to post dividend")
+			return
+		}
 	}
 
 	// Cr Tax Liability = tax_amount (5% withheld)
@@ -305,7 +313,11 @@ func (h *Handler) CreateDividendDistribution(c *gin.Context) {
 			response.InternalError(c, "Failed to post dividend")
 			return
 		}
-		tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, taxAmount, now, taxLiabID)
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, taxAmount, now, taxLiabID); err != nil {
+			h.log.Error("Failed to update tax liability balance for dividend", "error", err)
+			response.InternalError(c, "Failed to post dividend")
+			return
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

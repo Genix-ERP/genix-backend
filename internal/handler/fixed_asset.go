@@ -497,44 +497,74 @@ func (h *Handler) CreateFixedAsset(c *gin.Context) {
 			return
 		}
 
-		entryNumber := fmt.Sprintf("FA%06d", nextNumber)
 		journalEntryID := uuid.New()
 		jeDescription := "Fixed Asset Acquisition: " + assetCode + " - " + input.Name
 
-		_, err = h.db.Exec(`
+		// Header + lines + balance updates in ONE transaction: migration 416's
+		// deferred balance trigger rejects imbalanced single-line autocommit
+		// inserts, which previously left 0-line "posted" JEs. The asset row is
+		// already committed; a JE failure here is logged only.
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to begin fixed asset journal tx", "error", txErr)
+			return
+		}
+		defer tx.Rollback()
+
+		entryNumber := fmt.Sprintf("FA%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "FA", nextNumber))
+
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'fixed_asset', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
 			journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, acquisitionDate, assetCode, jeDescription,
 			id.String(), input.AcquisitionCost, userID, now,
-		)
-		if err != nil {
+		); err != nil {
 			h.log.Error("Failed to create fixed asset journal entry", "error", err)
 			return
 		}
 
 		// Debit: Fixed Asset
-		h.db.Exec(`
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
 			) VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
 			uuid.New(), journalEntryID, faAcct, "Fixed Asset", input.AcquisitionCost, now,
-		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, faAcct)
+		); err != nil {
+			h.log.Error("Failed to insert fixed asset debit line", "error", err)
+			return
+		}
+		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, faAcct); err != nil {
+			h.log.Error("Failed to update fixed asset account balance", "error", err)
+			return
+		}
 
 		// Credit: Cash/Bank/AP
-		h.db.Exec(`
+		if _, err = tx.Exec(`
 			INSERT INTO journal_entry_lines (
 				id, journal_entry_id, line_number, account_id, description,
 				debit_amount, credit_amount, exchange_rate, created_at
 			) VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
 			uuid.New(), journalEntryID, creditAcct, creditDesc, input.AcquisitionCost, now,
-		)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, creditAcct)
+		); err != nil {
+			h.log.Error("Failed to insert fixed asset credit line", "error", err)
+			return
+		}
+		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.AcquisitionCost, now, creditAcct); err != nil {
+			h.log.Error("Failed to update credit account balance", "error", err)
+			return
+		}
 
-		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+		if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+			h.log.Error("Failed to bump journal next_number", "error", err)
+			return
+		}
+
+		if err = tx.Commit(); err != nil {
+			h.log.Error("Failed to commit fixed asset journal entry", "error", err)
+		}
 	}()
 
 	asset := &entity.FixedAsset{
@@ -861,29 +891,22 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 			return
 		}
 
-		jeID := uuid.New()
-		entryNumber := fmt.Sprintf("DSP%06d", nextNum)
-		desc := fmt.Sprintf("Asset Disposal (%s): %s", input.DisposalReason, assetName)
-		lineNum := 0
-
-		_, err := h.db.Exec(`
-			INSERT INTO journal_entries (
-				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'disposal',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
-			jeID, tenantID, orgIDPtr, journalID, entryNumber, disposalDate, id.String(), desc,
-			id.String(), acquisitionCost, userID, now,
-		)
-		if err != nil {
-			return
+		// Build the lines first so header total_debit/total_credit can be
+		// computed from what is actually posted — a 'sold' disposal's line
+		// sums are not acquisition_cost. balDelta is the signed change applied
+		// to accounts.current_balance, matching this file's per-account signs.
+		type jeLine struct {
+			acct     uuid.UUID
+			desc     string
+			debit    float64
+			credit   float64
+			balDelta float64
 		}
+		lines := make([]jeLine, 0, 4)
 
 		// Dt: Accumulated Depreciation (clear it out)
 		if accumDeprAcct != uuid.Nil && accumDepr > 0 {
-			lineNum++
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-				VALUES ($1,$2,$3,$4,'Accumulated Depreciation',$5,0,1.0,$6)`, uuid.New(), jeID, lineNum, accumDeprAcct, accumDepr, now)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", accumDepr, now, accumDeprAcct)
+			lines = append(lines, jeLine{accumDeprAcct, "Accumulated Depreciation", accumDepr, 0, -accumDepr})
 		}
 
 		if input.DisposalReason == "sold" && input.DisposalAmount > 0 {
@@ -894,10 +917,7 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 				cashAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
 			}
 			if cashAcct != uuid.Nil {
-				lineNum++
-				h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-					VALUES ($1,$2,$3,$4,'Sale Proceeds',$5,0,1.0,$6)`, uuid.New(), jeID, lineNum, cashAcct, input.DisposalAmount, now)
-				h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.DisposalAmount, now, cashAcct)
+				lines = append(lines, jeLine{cashAcct, "Sale Proceeds", input.DisposalAmount, 0, input.DisposalAmount})
 			}
 
 			// If sold at loss, debit loss account
@@ -909,10 +929,7 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 					lossAcct = findAccount(h.db, tenantID, orgIDPtr, "other expense", "9400")
 				}
 				if lossAcct != uuid.Nil {
-					lineNum++
-					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-						VALUES ($1,$2,$3,$4,'Loss on Disposal',$5,0,1.0,$6)`, uuid.New(), jeID, lineNum, lossAcct, lossAmt, now)
-					h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", lossAmt, now, lossAcct)
+					lines = append(lines, jeLine{lossAcct, "Loss on Disposal", lossAmt, 0, lossAmt})
 				}
 			} else if input.DisposalAmount > bookVal {
 				// Gain on disposal
@@ -922,10 +939,7 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 					gainAcct = findAccount(h.db, tenantID, orgIDPtr, "other income", "9000")
 				}
 				if gainAcct != uuid.Nil {
-					lineNum++
-					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-						VALUES ($1,$2,$3,$4,'Gain on Disposal',0,$5,1.0,$6)`, uuid.New(), jeID, lineNum, gainAcct, gainAmt, now)
-					h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", gainAmt, now, gainAcct)
+					lines = append(lines, jeLine{gainAcct, "Gain on Disposal", 0, gainAmt, gainAmt})
 				}
 			}
 		} else {
@@ -937,21 +951,67 @@ func (h *Handler) DisposeFixedAsset(c *gin.Context) {
 					lossAcct = findAccount(h.db, tenantID, orgIDPtr, "other expense", "9400")
 				}
 				if lossAcct != uuid.Nil {
-					lineNum++
-					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-						VALUES ($1,$2,$3,$4,'Write-off Loss',$5,0,1.0,$6)`, uuid.New(), jeID, lineNum, lossAcct, bookVal, now)
-					h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", bookVal, now, lossAcct)
+					lines = append(lines, jeLine{lossAcct, "Write-off Loss", bookVal, 0, bookVal})
 				}
 			}
 		}
 
 		// Kt: Fixed Asset (remove from books)
-		lineNum++
-		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1,$2,$3,$4,'Fixed Asset',0,$5,1.0,$6)`, uuid.New(), jeID, lineNum, faAcct, acquisitionCost, now)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", acquisitionCost, now, faAcct)
+		lines = append(lines, jeLine{faAcct, "Fixed Asset", 0, acquisitionCost, -acquisitionCost})
 
-		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+		var totalDebit, totalCredit float64
+		for _, l := range lines {
+			totalDebit += l.debit
+			totalCredit += l.credit
+		}
+
+		jeID := uuid.New()
+		desc := fmt.Sprintf("Asset Disposal (%s): %s", input.DisposalReason, assetName)
+
+		// Header + lines + balance updates in ONE transaction: migration 416's
+		// deferred balance trigger rejects imbalanced single-line autocommit
+		// inserts, which previously left 0-line "posted" JEs.
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to begin disposal journal tx", "error", txErr)
+			return
+		}
+		defer tx.Rollback()
+
+		entryNumber := fmt.Sprintf("DSP%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "DSP", nextNum))
+
+		if _, err := tx.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'disposal',$9,1.0,$10,$11,'posted',$12,$13,$13)`,
+			jeID, tenantID, orgIDPtr, journalID, entryNumber, disposalDate, id.String(), desc,
+			id.String(), totalDebit, totalCredit, userID, now,
+		); err != nil {
+			h.log.Error("Failed to create disposal journal entry", "error", err)
+			return
+		}
+
+		for i, l := range lines {
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,1.0,$8)`, uuid.New(), jeID, i+1, l.acct, l.desc, l.debit, l.credit, now); err != nil {
+				h.log.Error("Failed to insert disposal journal line", "error", err)
+				return
+			}
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", l.balDelta, now, l.acct); err != nil {
+				h.log.Error("Failed to update account balance for disposal", "error", err)
+				return
+			}
+		}
+
+		if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+			h.log.Error("Failed to bump journal next_number", "error", err)
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			h.log.Error("Failed to commit disposal journal entry", "error", err)
+		}
 	}()
 
 	h.GetFixedAsset(c)
@@ -1473,8 +1533,20 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 			}
 
 			jeID := uuid.New()
-			entryNumber := fmt.Sprintf("MNT%06d", nextNum)
-			_, err := h.db.Exec(`
+
+			// Header + lines + balance updates in ONE transaction: migration
+			// 416's deferred balance trigger rejects imbalanced single-line
+			// autocommit inserts, which previously left 0-line "posted" JEs.
+			tx, txErr := h.db.Begin()
+			if txErr != nil {
+				h.log.Error("Failed to begin maintenance journal tx", "error", txErr)
+				return
+			}
+			defer tx.Rollback()
+
+			entryNumber := fmt.Sprintf("MNT%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "MNT", nextNum))
+
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
@@ -1482,19 +1554,38 @@ func (h *Handler) RecordMaintenance(c *gin.Context) {
 				jeID, tenantID, orgIDPtr, journalID, entryNumber, serviceDate,
 				m.DocumentNumber, fmt.Sprintf("Maintenance: %s", input.MaintenanceType),
 				assetID.String(), input.Cost, now,
-			)
-			if err != nil {
+			); err != nil {
+				h.log.Error("Failed to create maintenance journal entry", "error", err)
 				return
 			}
 
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-				VALUES ($1,$2,1,$3,$4,$5,0,1.0,$6)`, uuid.New(), jeID, debitAcct, debitDesc, input.Cost, now)
-			h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-				VALUES ($1,$2,2,$3,'Cash/Bank',0,$4,1.0,$5)`, uuid.New(), jeID, payAcct, input.Cost, now)
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1,$2,1,$3,$4,$5,0,1.0,$6)`, uuid.New(), jeID, debitAcct, debitDesc, input.Cost, now); err != nil {
+				h.log.Error("Failed to insert maintenance debit line", "error", err)
+				return
+			}
+			if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1,$2,2,$3,'Cash/Bank',0,$4,1.0,$5)`, uuid.New(), jeID, payAcct, input.Cost, now); err != nil {
+				h.log.Error("Failed to insert maintenance credit line", "error", err)
+				return
+			}
 
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Cost, now, debitAcct)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Cost, now, payAcct)
-			h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Cost, now, debitAcct); err != nil {
+				h.log.Error("Failed to update maintenance debit account balance", "error", err)
+				return
+			}
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Cost, now, payAcct); err != nil {
+				h.log.Error("Failed to update payment account balance", "error", err)
+				return
+			}
+			if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+				h.log.Error("Failed to bump journal next_number", "error", err)
+				return
+			}
+
+			if err := tx.Commit(); err != nil {
+				h.log.Error("Failed to commit maintenance journal entry", "error", err)
+			}
 		}()
 	}
 
@@ -1664,26 +1755,61 @@ func (h *Handler) RecordAssetPayment(c *gin.Context) {
 		}
 
 		jeID := uuid.New()
-		journalEntryID = &jeID
-		entryNumber := fmt.Sprintf("APY%06d", nextNum)
 		desc := fmt.Sprintf("Asset Payment: %s", assetName)
 
-		h.db.Exec(`
+		// Header + lines + balance updates in ONE transaction: migration 416's
+		// deferred balance trigger rejects imbalanced single-line autocommit
+		// inserts, which previously left 0-line "posted" JEs. journalEntryID is
+		// only set on commit so asset_payments never references a missing JE.
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			h.log.Error("Failed to begin asset payment journal tx", "error", txErr)
+			return
+		}
+		defer tx.Rollback()
+
+		entryNumber := fmt.Sprintf("APY%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "APY", nextNum))
+
+		if _, err := tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'asset_payment',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
 			jeID, tenantID, orgIDPtr, journalID, entryNumber, paidAt, assetID.String(), desc,
 			paymentID.String(), input.Amount, userID, now,
-		)
-		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1,$2,1,$3,'Accounts Payable',$4,0,1.0,$5)`, uuid.New(), jeID, apAcct, input.Amount, now)
-		h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1,$2,2,$3,'Cash/Bank',0,$4,1.0,$5)`, uuid.New(), jeID, cashAcct, input.Amount, now)
+		); err != nil {
+			h.log.Error("Failed to create asset payment journal entry", "error", err)
+			return
+		}
+		if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1,$2,1,$3,'Accounts Payable',$4,0,1.0,$5)`, uuid.New(), jeID, apAcct, input.Amount, now); err != nil {
+			h.log.Error("Failed to insert asset payment debit line", "error", err)
+			return
+		}
+		if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+			VALUES ($1,$2,2,$3,'Cash/Bank',0,$4,1.0,$5)`, uuid.New(), jeID, cashAcct, input.Amount, now); err != nil {
+			h.log.Error("Failed to insert asset payment credit line", "error", err)
+			return
+		}
 
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, apAcct)
-		h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAcct)
-		h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+		if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", input.Amount, now, apAcct); err != nil {
+			h.log.Error("Failed to update payable account balance", "error", err)
+			return
+		}
+		if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", input.Amount, now, cashAcct); err != nil {
+			h.log.Error("Failed to update cash account balance", "error", err)
+			return
+		}
+		if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+			h.log.Error("Failed to bump journal next_number", "error", err)
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			h.log.Error("Failed to commit asset payment journal entry", "error", err)
+			return
+		}
+		journalEntryID = &jeID
 	}()
 
 	// Insert payment record

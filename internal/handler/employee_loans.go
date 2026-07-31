@@ -321,7 +321,7 @@ func (h *Handler) CreateEmployeeLoan(c *gin.Context) {
 
 	// Create journal entry for loan disbursement (Dt 4720 Employee Loans / Kt Cash Account)
 	if cashAccountID != nil {
-		h.createLoanJournalEntry(tenantID, orgID, *cashAccountID, input.Amount, employeeID, empName, loanNumber)
+		h.createLoanJournalEntry(tenantID, orgID, *cashAccountID, input.Amount, employeeID, empName, loanNumber, userID)
 	}
 
 	// SMS: Qarz berilganda
@@ -626,7 +626,7 @@ func (h *Handler) getEmployeeIDFromUser(c *gin.Context, tenantID uuid.UUID) uuid
 
 // --- Helper: create journal entry for loan ---
 
-func (h *Handler) createLoanJournalEntry(tenantID uuid.UUID, orgID uuid.UUID, cashAccountID uuid.UUID, amount float64, employeeID uuid.UUID, empName string, loanNumber string) {
+func (h *Handler) createLoanJournalEntry(tenantID uuid.UUID, orgID uuid.UUID, cashAccountID uuid.UUID, amount float64, employeeID uuid.UUID, empName string, loanNumber string, createdBy uuid.UUID) {
 	// Find loan receivable account (4720) or any receivable
 	var loanAccountID uuid.UUID
 	err := h.db.QueryRow(`
@@ -666,9 +666,9 @@ func (h *Handler) createLoanJournalEntry(tenantID uuid.UUID, orgID uuid.UUID, ca
 
 	if _, err := tx.Exec(`
 		INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
-			entry_date, description, status, total_debit, total_credit, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'posted', $8, $8, $9, $9)
-	`, jeID, tenantID, orgID, journalID, entryNumber, now, fmt.Sprintf("Xodimga qarz: %s - %s", empName, loanNumber), amount, now); err != nil {
+			entry_date, description, source_type, status, total_debit, total_credit, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'employee_loan', 'posted', $8, $8, $9, $10, $10)
+	`, jeID, tenantID, orgID, journalID, entryNumber, now, fmt.Sprintf("Xodimga qarz: %s - %s", empName, loanNumber), amount, createdBy, now); err != nil {
 		h.log.Error("Failed to insert loan journal entry", "error", err)
 		return
 	}

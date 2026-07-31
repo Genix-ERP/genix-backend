@@ -4311,22 +4311,17 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 		}
 	}
 
-	// Auto-create expense lines for each material item + journal entries for category account
+	// Auto-create expense lines for each material item. These rows feed the
+	// project WIP rollup (7.8/7.9 capitalization at commissioning), so they
+	// must be written even though no journal entry is created here: the
+	// per-item Dt expense / Kt stock-valuation JE above already records the
+	// accounting for the warehouse issue. A second category-account/Kt 5010
+	// entry would double the expense and wrongly credit cash — the material
+	// leaves the warehouse, no money is paid.
 	if totalExpense > 0 {
-		// Find "materials" cost category and its assigned account
+		// Find "materials" cost category for tagging the expense lines
 		var materialsCatID sql.NullInt64
-		var catDebitAccountID uuid.UUID
-		tx.QueryRow(`SELECT id, COALESCE(default_debit_account_id, '00000000-0000-0000-0000-000000000000') FROM construction_cost_categories WHERE tenant_id = $1 AND code = 'materials' AND is_active = true LIMIT 1`, tenantID).Scan(&materialsCatID, &catDebitAccountID)
-
-		// Resolve credit account (cash/bank fallback)
-		var creditAccountID uuid.UUID
-		creditAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
-		if creditAccountID == uuid.Nil {
-			creditAccountID = findAccount(tx, tenantID, orgIDPtr, "cash", "5010")
-		}
-
-		// Get construction journal for journal entries
-		constJournalID := h.ensureConstructionJournal(tenantID, orgIDPtr)
+		tx.QueryRow(`SELECT id FROM construction_cost_categories WHERE tenant_id = $1 AND code = 'materials' AND is_active = true LIMIT 1`, tenantID).Scan(&materialsCatID)
 
 		for _, item := range items {
 			productIDStr, _ := item["product_id"].(string)
@@ -4390,40 +4385,6 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 				tx.Exec(`ROLLBACK TO SAVEPOINT sp_exp_line`)
 			} else {
 				tx.Exec(`RELEASE SAVEPOINT sp_exp_line`)
-			}
-
-			// Create journal entry to record in category's account
-			if catDebitAccountID != uuid.Nil && creditAccountID != uuid.Nil && constJournalID != uuid.Nil && lineCost > 0 {
-				tx.Exec(`SAVEPOINT sp_je_cat`)
-				jeNum := h.getNextJournalNumber(tx, constJournalID)
-				entryID := uuid.New()
-				entryNumber := fmt.Sprintf("CE%06d", jeNum)
-
-				_, jeErr := tx.Exec(`
-					INSERT INTO journal_entries (
-						id, tenant_id, organization_id, journal_id, entry_number,
-						entry_date, description, source_type, source_id,
-						status, total_debit, total_credit, created_at, updated_at
-					) VALUES ($1,$2,$3,$4,$5,$6,$7,'construction_expense',NULL,'posted',$8,$8,$9,$9)
-				`, entryID, tenantID, organizationID, constJournalID, entryNumber,
-					now, fmt.Sprintf("Construction Expense: %s", description),
-					lineCost, now)
-
-				if jeErr != nil {
-					h.log.Error("category journal entry failed", "error", jeErr)
-					tx.Exec(`ROLLBACK TO SAVEPOINT sp_je_cat`)
-				} else {
-					// Debit: category's expense account
-					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,$5,0,1,$6)`,
-						uuid.New(), entryID, catDebitAccountID, description, lineCost, now)
-					// Credit: cash/bank account
-					tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
-						uuid.New(), entryID, creditAccountID, description, lineCost, now)
-					// Update account balances
-					tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, lineCost, now, catDebitAccountID)
-					tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, lineCost, now, creditAccountID)
-					tx.Exec(`RELEASE SAVEPOINT sp_je_cat`)
-				}
 			}
 		}
 	}
@@ -5569,6 +5530,32 @@ func (h *Handler) createProjectCompletionJournalEntry(tenantID, organizationID u
 		return
 	}
 
+	// Guard against double capitalization: CommissionProject writes the same
+	// Dt 0100 / Kt 0810 entry (storing its id in commission_journal_entry_id),
+	// and a repeated completed→active→completed status flip would re-run this
+	// goroutine. Skip when the project already carries a commission JE or a
+	// commission/completion entry for this project already exists.
+	var alreadyCapitalized bool
+	_ = h.db.QueryRow(`
+		SELECT EXISTS (
+			SELECT 1 FROM construction_projects
+			WHERE id = $1 AND tenant_id = $2 AND commission_journal_entry_id IS NOT NULL
+		) OR EXISTS (
+			SELECT 1 FROM journal_entries
+			WHERE tenant_id = $2
+			  AND source_type IN ('project_commission','construction_completion')
+			  AND deleted_at IS NULL
+			  AND (reference = $3 OR description = $4)
+		)
+	`, projectID, tenantID,
+		fmt.Sprintf("construction_project:%d", projectID),
+		fmt.Sprintf("Foydalanishga topshirish: project #%d", projectID),
+	).Scan(&alreadyCapitalized)
+	if alreadyCapitalized {
+		h.log.Info("Skipping completion journal entry: project already capitalized", "project_id", projectID)
+		return
+	}
+
 	// Resolve accounts: Dt 0100 (Fixed Assets), Kt 0810 (WIP / Capital Investments)
 	fixedAssetAcct := h.getConstructionMappedAccount(tenantID, orgIDPtr, "fixed_assets_0100", "asosiy vosita", "0100")
 	if fixedAssetAcct == uuid.Nil {
@@ -5602,14 +5589,17 @@ func (h *Handler) createProjectCompletionJournalEntry(tenantID, organizationID u
 	entryNumber := fmt.Sprintf("CC%06d", nextNum)
 	description := fmt.Sprintf("Qurilish tugallandi: %s — Asosiy vositalarga kiritish", projectName)
 
+	// reference carries the project id so the double-capitalization guard
+	// above can find this entry (source_id is a UUID column, the bigint
+	// project id can't go there).
 	_, err = tx.Exec(`
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number,
-			entry_date, description, source_type, source_id,
+			entry_date, description, reference, source_type, source_id,
 			status, total_debit, total_credit, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,'construction_completion',NULL,'posted',$8,$8,$9,$9)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'construction_completion',NULL,'posted',$9,$9,$10,$10)
 	`, entryID, tenantID, organizationID, journalID, entryNumber,
-		now, description, totalActualCost, now)
+		now, description, fmt.Sprintf("construction_project:%d", projectID), totalActualCost, now)
 	if err != nil {
 		h.log.Error("Failed to create completion journal entry", "error", err)
 		return
@@ -5636,6 +5626,19 @@ func (h *Handler) createProjectCompletionJournalEntry(tenantID, organizationID u
 	// Update account balances
 	tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalActualCost, now, fixedAssetAcct)
 	tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalActualCost, now, wipAcct)
+
+	// Remember the capitalization entry on the project (same column
+	// CommissionProject uses) so both paths — and repeated runs of this
+	// goroutine — see the guard and never capitalize twice.
+	_, err = tx.Exec(`
+		UPDATE construction_projects
+		SET commission_journal_entry_id = $1, updated_date = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND commission_journal_entry_id IS NULL
+	`, entryID, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to store completion JE on project", "error", err)
+		return
+	}
 
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit completion journal entry", "error", err)

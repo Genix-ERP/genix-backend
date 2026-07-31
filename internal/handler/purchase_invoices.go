@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -1106,6 +1107,14 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 		return
 	}
 
+	// The route group only enforces purchase:invoice:read; recording a payment
+	// mutates the invoice, so require update here (mirrors the h.perm.Require
+	// checks the other mutating purchase-invoice endpoints get at the route level).
+	if h.perm != nil && !h.perm.Can(c, "purchase", "invoice", "update") {
+		response.Forbidden(c, "Missing required permission: purchase:invoice:update")
+		return
+	}
+
 	invoiceID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid invoice ID")
@@ -1182,7 +1191,9 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 		}
 	}
 
-	// Create Payment record so it appears in Payments section
+	// Payment record details. The payments/payment_allocations INSERTs happen
+	// inside the journal-entry transaction below so the payment, its
+	// allocation, the JE and the balance updates commit (or roll back) together.
 	paymentID := uuid.New()
 	paymentNumber := fmt.Sprintf("PAY-%s", now.Format("20060102150405"))
 
@@ -1198,42 +1209,6 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	reference := fmt.Sprintf("Payment for %s", invoiceID.String()[:8])
 	if vendorName.Valid {
 		reference = fmt.Sprintf("Payment to %s", vendorName.String)
-	}
-
-	// Only create payment if we have a valid contact_id (required by schema)
-	if vendorID.Valid {
-		contactUUID, parseErr := uuid.Parse(vendorID.String)
-		if parseErr == nil {
-			_, err = h.db.Exec(`
-				INSERT INTO payments (
-					id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
-					exchange_rate, reference, notes, status, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, 'payment', $5, $6, $7, 1, $8, $9, 'confirmed', $10, $10)
-			`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, func() string {
-					if vendorName.Valid && vendorName.String != "" {
-						return fmt.Sprintf("Payment for invoice %s — %s", invoiceID.String()[:8], vendorName.String)
-					}
-					return fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
-				}(), now)
-
-			if err != nil {
-				h.log.Error("Failed to create payment record", "error", err)
-			} else {
-				h.log.Info("Payment record created", "payment_id", paymentID, "invoice_id", invoiceID)
-
-				// Create payment allocation linking payment to this invoice
-				allocID := uuid.New()
-				_, allocErr := h.db.Exec(`
-					INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
-					VALUES ($1, $2, 'purchase_invoice', $3, $4, $5)
-				`, allocID, paymentID, invoiceID, paymentAmount, now)
-				if allocErr != nil {
-					h.log.Error("Failed to create payment allocation", "error", allocErr)
-				}
-			}
-		}
-	} else {
-		h.log.Warn("Cannot create payment record: no vendor_id on invoice", "invoice_id", invoiceID)
 	}
 
 	// Create journal entry for payment: Debit AP, Credit Cash/Bank
@@ -1426,13 +1401,40 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 						_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
 					}
 
+					// Payment record + allocation in the same tx so they only
+					// commit together with the journal entry.
+					// Only create payment if we have a valid contact_id (required by schema)
+					if err == nil {
+						if contactUUID != uuid.Nil {
+							if _, err = tx.Exec(`
+								INSERT INTO payments (
+									id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
+									exchange_rate, reference, notes, status, created_at, updated_at
+								) VALUES ($1, $2, $3, $4, 'payment', $5, $6, $7, 1, $8, $9, 'confirmed', $10, $10)
+							`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, description, now); err != nil {
+								h.log.Error("Failed to create payment record", "error", err)
+							} else {
+								// Payment allocation linking payment to this invoice
+								allocID := uuid.New()
+								if _, err = tx.Exec(`
+									INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
+									VALUES ($1, $2, 'purchase_invoice', $3, $4, $5)
+								`, allocID, paymentID, invoiceID, paymentAmount, now); err != nil {
+									h.log.Error("Failed to create payment allocation", "error", err)
+								}
+							}
+						} else {
+							h.log.Warn("Cannot create payment record: no vendor_id on invoice", "invoice_id", invoiceID)
+						}
+					}
+
 					if err != nil {
 						h.log.Error("Failed to post vendor payment journal entry", "error", err)
 					} else if err = tx.Commit(); err != nil {
 						h.log.Error("Failed to commit vendor payment journal entry", "error", err)
 					} else {
 						committed = true
-						h.log.Info("Vendor payment: account balances updated", "ap_account", apAcctID, "cash_account", cashAcctID, "amount", paymentAmount)
+						h.log.Info("Vendor payment posted", "payment_id", paymentID, "invoice_id", invoiceID, "ap_account", apAcctID, "cash_account", cashAcctID, "amount", paymentAmount)
 					}
 				}
 			}
@@ -1623,6 +1625,93 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 		expenseAccountID := findAccount(tx, tenantID, organizationID, "expense", "9420")
 		taxAccountID := findAccount(tx, tenantID, organizationID, "soliqlar bo'yicha bo'nak", "4410")
 
+		// Mirror PostPurchaseInvoice's debit-side account selection so the
+		// reversal credits the same stock-input/interim accounts the original
+		// bill was debited on (per-line inventory/category stock input, then
+		// the 6015→9110→1010 fallback chain). The 9420 expense account stays
+		// as the last-resort fallback for documents without product lines.
+		type dnLineAcct struct {
+			ProductID uuid.UUID
+			LineTotal float64
+			InputAcct uuid.UUID
+		}
+		var dnLines []dnLineAcct
+		origLinesTotal := 0.0
+		if originalInvoiceID != nil && dnSubtotal > 0 {
+			lineRows, lineErr := tx.Query(`
+				SELECT product_id, COALESCE(line_total, 0)
+				FROM purchase_invoice_lines
+				WHERE purchase_invoice_id = $1 AND product_id IS NOT NULL
+			`, *originalInvoiceID)
+			if lineErr == nil {
+				for lineRows.Next() {
+					var dl dnLineAcct
+					if scanErr := lineRows.Scan(&dl.ProductID, &dl.LineTotal); scanErr == nil && dl.LineTotal > 0 {
+						dnLines = append(dnLines, dl)
+						origLinesTotal += dl.LineTotal
+					}
+				}
+				lineRows.Close()
+				// Resolve accounts after closing rows: prefer inventory-type account, fallback to category
+				for i := range dnLines {
+					invAcct := getInventoryAccountByType(tx, tenantID, organizationID, dnLines[i].ProductID)
+					if invAcct != uuid.Nil {
+						dnLines[i].InputAcct = invAcct
+					} else {
+						ca := getCategoryAccounts(tx, tenantID, organizationID, dnLines[i].ProductID)
+						dnLines[i].InputAcct = ca.StockInputAccountID
+					}
+				}
+			}
+		}
+
+		// Group by stock input account, scaled to the debit note subtotal
+		// (partial debit notes). One group absorbs the rounding remainder so
+		// the credit side sums exactly to dnSubtotal (deferred Dt=Kt trigger
+		// from migration 416 rejects the commit otherwise).
+		creditGrouped := make(map[uuid.UUID]float64)
+		if len(dnLines) > 0 && origLinesTotal > 0 {
+			ratio := dnSubtotal / origLinesTotal
+			for _, dl := range dnLines {
+				acct := dl.InputAcct
+				if acct == uuid.Nil {
+					acct = expenseAccountID
+				}
+				if acct == uuid.Nil {
+					continue
+				}
+				creditGrouped[acct] += math.Round(dl.LineTotal*ratio*100) / 100
+			}
+			roundedSum := 0.0
+			for _, amount := range creditGrouped {
+				roundedSum += amount
+			}
+			if diff := dnSubtotal - roundedSum; diff != 0 {
+				for acct := range creditGrouped {
+					creditGrouped[acct] += diff
+					break
+				}
+			}
+		}
+
+		// Fallback: no product lines on the original bill — same account chain
+		// PostPurchaseInvoice falls back to, then the pre-existing 9420 expense
+		if len(creditGrouped) == 0 && dnSubtotal > 0 {
+			fallbackInput := findAccount(tx, tenantID, organizationID, "stock interim receipt", "6015")
+			if fallbackInput == uuid.Nil {
+				fallbackInput = findAccount(tx, tenantID, organizationID, "cost of goods", "9110")
+				if fallbackInput == uuid.Nil {
+					fallbackInput = findAccount(tx, tenantID, organizationID, "inventory", "1010")
+				}
+			}
+			if fallbackInput == uuid.Nil {
+				fallbackInput = expenseAccountID
+			}
+			if fallbackInput != uuid.Nil {
+				creditGrouped[fallbackInput] = dnSubtotal
+			}
+		}
+
 		if apAccountID != uuid.Nil {
 			prefix := ""
 			if numberPrefix.Valid {
@@ -1661,16 +1750,17 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 			)
 			lineNumber++
 
-			// Credit Expense/COGS (reversal)
-			if expenseAccountID != uuid.Nil && dnSubtotal > 0 {
+			// Credit: reverse the same stock-input accounts the original bill
+			// debited (grouped per account)
+			for creditAcct, amount := range creditGrouped {
 				lineID := uuid.New()
 				tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-					lineID, journalEntryID, lineNumber, expenseAccountID, "Expense Reversal (Debit Note)",
-					0.0, dnSubtotal, 1.0, now,
+					lineID, journalEntryID, lineNumber, creditAcct, "Purchase Reversal (Debit Note)",
+					0.0, amount, 1.0, now,
 				)
 				lineNumber++
 			}
@@ -1690,8 +1780,8 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 
 			// Update account balances
 			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
-			if expenseAccountID != uuid.Nil {
-				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", dnSubtotal, now, expenseAccountID)
+			for creditAcct, amount := range creditGrouped {
+				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, creditAcct)
 			}
 			if taxAccountID != uuid.Nil && taxAmount > 0 {
 				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)

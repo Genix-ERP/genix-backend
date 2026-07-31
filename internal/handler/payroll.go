@@ -1265,13 +1265,18 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		if salaryAcct == uuid.Nil {
 			salaryAcct = findAccount(h.db, tenantID, orgIDPtr, "salary", "9420")
 		}
-		// Credit: AP / Wages Payable
-		payableAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
+		// Credit: Wages Payable (6710); fall back to AP (6010). No cash
+		// fallback — crediting 5010 for an accrual would misstate cash.
+		payableAcct := findAccount(h.db, tenantID, orgIDPtr, "wages payable", "6710")
 		if payableAcct == uuid.Nil {
-			payableAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+			payableAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 		}
 
 		if salaryAcct == uuid.Nil || payableAcct == uuid.Nil {
+			h.log.Error("Payroll accrual JE skipped: required GL account not found",
+				"salary_account_found", salaryAcct != uuid.Nil,
+				"payable_account_found", payableAcct != uuid.Nil,
+				"period_id", id)
 			return
 		}
 
@@ -1414,7 +1419,7 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 				h.log.Error("Failed to insert payroll journal line", "error", err)
 				return
 			}
-			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", ln.debit+ln.credit, now, ln.accountID); err != nil {
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", ln.debit-ln.credit, now, ln.accountID); err != nil {
 				h.log.Error("Failed to update account balance for payroll accrual", "error", err)
 				return
 			}
@@ -1676,19 +1681,6 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 		`, tenantID).Scan(&journalID, &nextNumber)
 
 		if err == nil && journalID != uuid.Nil {
-			jeID := uuid.New()
-			entryNumber := fmt.Sprintf("DED%06d", nextNumber)
-			description := fmt.Sprintf("Ish haqi kamomad ushlab qolish: %s", entryID.String()[:8])
-
-			tx.Exec(`
-				INSERT INTO journal_entries (
-					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-					description, source_type, source_id, status, total_debit, total_credit,
-					created_by, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'salary_deduction', $8, 'posted', $9, $9, $10, $11, $11)
-			`, jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
-				description, entryID.String(), totalDeducted, userID, now)
-
 			// Dt 6710 — Salary expense
 			salaryAcct := findAccount(h.db, tenantID, orgIDPtr, "ish haqi", "6710")
 			if salaryAcct == uuid.Nil {
@@ -1700,20 +1692,59 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 				deductAcct = findAccount(h.db, tenantID, orgIDPtr, "employee receivable", "4730")
 			}
 
+			// Only post when both accounts exist — inserting the header alone
+			// would leave a line-less 'posted' JE behind.
 			if salaryAcct != uuid.Nil && deductAcct != uuid.Nil {
+				jeID := uuid.New()
+				entryNumber := fmt.Sprintf("DED%06d", nextNumber)
+				description := fmt.Sprintf("Ish haqi kamomad ushlab qolish: %s", entryID.String()[:8])
+
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+						description, source_type, source_id, status, total_debit, total_credit,
+						created_by, created_at, updated_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'salary_deduction', $8, 'posted', $9, $9, $10, $11, $11)
+				`, jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+					description, entryID.String(), totalDeducted, userID, now); err != nil {
+					h.log.Error("Failed to insert deduction journal entry", "error", err)
+					response.InternalError(c, "Failed to create deduction journal entry")
+					return
+				}
+
 				// TT §4.5 — 6710 and 4730 both require xodim (employee) subkonto
-				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, employee_id, description, debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, line_number, created_at)
+				if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, employee_id, description, debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, line_number, created_at)
 					VALUES ($1, $2, $3, $4, 'Ish haqi xarajat', $5, 0, 1.0, $5, '{}'::jsonb, 1, $6)`,
-					uuid.New(), jeID, salaryAcct, employeeID, totalDeducted, now)
-				tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, employee_id, description, debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, line_number, created_at)
+					uuid.New(), jeID, salaryAcct, employeeID, totalDeducted, now); err != nil {
+					h.log.Error("Failed to insert deduction debit line", "error", err)
+					response.InternalError(c, "Failed to create deduction journal entry")
+					return
+				}
+				if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, employee_id, description, debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, line_number, created_at)
 					VALUES ($1, $2, $3, $4, 'Kamomad ushlab qolish', 0, $5, 1.0, $5, '{}'::jsonb, 2, $6)`,
-					uuid.New(), jeID, deductAcct, employeeID, totalDeducted, now)
+					uuid.New(), jeID, deductAcct, employeeID, totalDeducted, now); err != nil {
+					h.log.Error("Failed to insert deduction credit line", "error", err)
+					response.InternalError(c, "Failed to create deduction journal entry")
+					return
+				}
 
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalDeducted, now, salaryAcct)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalDeducted, now, deductAcct)
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalDeducted, now, salaryAcct); err != nil {
+					h.log.Error("Failed to update salary expense balance for deduction", "error", err)
+					response.InternalError(c, "Failed to update account balance")
+					return
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalDeducted, now, deductAcct); err != nil {
+					h.log.Error("Failed to update employee receivable balance for deduction", "error", err)
+					response.InternalError(c, "Failed to update account balance")
+					return
+				}
+
+				if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+					h.log.Error("Failed to bump journal next_number for deduction JE", "error", err)
+					response.InternalError(c, "Failed to update journal")
+					return
+				}
 			}
-
-			h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
 		}
 	}
 

@@ -217,6 +217,7 @@ type LandedCost struct {
 	Lines            []LandedCostLine      `json:"lines,omitempty"`
 	Allocations      []LandedCostAllocSum  `json:"allocations,omitempty"`
 	GRLines          []GRLineForAllocation `json:"gr_lines,omitempty"`
+	GLWarning        string                `json:"gl_warning,omitempty"`
 }
 
 type LandedCostLine struct {
@@ -713,6 +714,13 @@ func (h *Handler) GetLandedCost(c *gin.Context) {
 		}
 	}
 
+	// Surface a GL posting warning set by ValidateLandedCost (JE skipped/failed).
+	if w, exists := c.Get("gl_warning"); exists {
+		if warn, ok := w.(string); ok {
+			lc.GLWarning = warn
+		}
+	}
+
 	response.Success(c, lc)
 }
 
@@ -808,13 +816,15 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 	// ============================================
 	// CREATE JOURNAL ENTRY FOR LANDED COST
 	// ============================================
-	func() {
+	// Returns a non-empty warning when the JE was skipped/failed so the
+	// response can disclose it (status still becomes 'validated').
+	glWarning := func() string {
 		// Get total landed cost amount
 		var totalLandedCost float64
 		h.db.QueryRow(`SELECT COALESCE(SUM(amount), 0) FROM landed_cost_lines WHERE landed_cost_id = $1`, id).Scan(&totalLandedCost)
 
 		if totalLandedCost <= 0 {
-			return
+			return "" // nothing to post
 		}
 
 		// Get organization_id from landed cost
@@ -837,7 +847,8 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 			ORDER BY CASE WHEN code='INVENTORY' THEN 0 ELSE 1 END LIMIT 1`,
 			tenantID).Scan(&journalID, &nextNumber)
 		if err != nil {
-			return
+			h.log.Error("Landed cost JE skipped: no INVENTORY/GENERAL journal found", "landed_cost_id", id)
+			return "journal entry not created: no INVENTORY/GENERAL journal found"
 		}
 
 		// Debit: Stock Valuation (inventory)
@@ -849,7 +860,8 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 		apAcct := findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 
 		if invAcct == uuid.Nil || apAcct == uuid.Nil {
-			return
+			h.log.Error("Landed cost JE skipped: inventory (1010) or accounts payable (6010) account not found", "landed_cost_id", id)
+			return "journal entry not created: inventory (1010) or accounts payable (6010) account not found"
 		}
 
 		entryNumber := fmt.Sprintf("LC%06d", nextNumber)
@@ -862,7 +874,7 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 		tx, txErr := h.db.Begin()
 		if txErr != nil {
 			h.log.Error("Failed to begin landed cost journal tx", "error", txErr)
-			return
+			return "journal entry not created: database error"
 		}
 		defer tx.Rollback()
 
@@ -875,7 +887,7 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 			id.String(), totalLandedCost, userID, now,
 		); err != nil {
 			h.log.Error("Failed to create landed cost journal entry", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 
 		// Debit: Inventory / Stock Valuation
@@ -887,11 +899,11 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 			uuid.New(), journalEntryID, invAcct, "Stock Valuation (Landed Cost)", totalLandedCost, now,
 		); err != nil {
 			h.log.Error("Failed to insert landed cost debit JE line", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalLandedCost, now, invAcct); err != nil {
 			h.log.Error("Failed to update inventory account balance for landed cost JE", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 
 		// Credit: Accounts Payable
@@ -903,21 +915,24 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 			uuid.New(), journalEntryID, apAcct, "Accounts Payable (Landed Cost)", totalLandedCost, now,
 		); err != nil {
 			h.log.Error("Failed to insert landed cost credit JE line", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
+		// Credit line: debit-positive convention (migration 407) — balance -= credit.
 		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalLandedCost, now, apAcct); err != nil {
 			h.log.Error("Failed to update AP account balance for landed cost JE", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 
 		if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
 			h.log.Error("Failed to update journal next_number for landed cost JE", "error", err)
-			return
+			return "journal entry not created: database error"
 		}
 
 		if err = tx.Commit(); err != nil {
 			h.log.Error("Failed to commit landed cost journal entry", "error", err)
+			return "journal entry not created: database error"
 		}
+		return ""
 	}()
 
 	// Update status
@@ -931,6 +946,10 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 		h.log.Error("Failed to validate landed cost", "error", err)
 		response.InternalError(c, "Failed to validate landed cost")
 		return
+	}
+
+	if glWarning != "" {
+		c.Set("gl_warning", glWarning)
 	}
 
 	h.GetLandedCost(c)

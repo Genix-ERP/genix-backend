@@ -206,29 +206,70 @@ func (h *Handler) CreateSubStageMaterial(c *gin.Context) {
 				creditAcct := findAccount(h.db, tenantID, orgID, "inventory", "1010")
 
 				if debitAcct != uuid.Nil && creditAcct != uuid.Nil {
-					entryID := uuid.New()
-					entryNumber := fmt.Sprintf("STG%06d", nextNumber)
 					description := fmt.Sprintf("Stage material usage: %s x%.0f", req.ProductName, req.Quantity)
 
-					h.db.Exec(`
-						INSERT INTO journal_entries (
-							id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-							description, source_type, source_id, status, total_debit, total_credit,
-							created_by, created_at, updated_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stage_material', $8, 'posted', $9, $9, $10, $11, $11)
-					`, entryID, tenantID, orgID, journalID, entryNumber, now,
-						description, fmt.Sprintf("%d", id), totalCost, userID, now)
+					// Header + lines + balance updates + journal counter in ONE
+					// transaction with every error checked: migration 416's
+					// deferred balance trigger rejects standalone autocommit
+					// line inserts, which previously left 0-line "posted" JEs.
+					// Best-effort — a JE failure must not fail material creation.
+					func() {
+						tx, txErr := h.db.Begin()
+						if txErr != nil {
+							h.log.Error("Failed to begin stage material JE tx", "error", txErr)
+							return
+						}
+						defer tx.Rollback()
 
-					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
-						uuid.New(), entryID, debitAcct, description, totalCost, now)
-					h.db.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
-						uuid.New(), entryID, creditAcct, description, totalCost, now)
+						entryID := uuid.New()
+						entryNumber := fmt.Sprintf("STG%06d", nextEntryNumberSeq(tx, tenantID, orgID, "STG", nextNumber))
 
-					h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCost, now, debitAcct)
-					h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCost, now, creditAcct)
-					h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+						// source_id is a UUID column — the bigint material id
+						// can't go there (the old insert failed the cast every
+						// time); the description keeps the material context.
+						if _, jeErr := tx.Exec(`
+							INSERT INTO journal_entries (
+								id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+								description, source_type, source_id, status, total_debit, total_credit,
+								created_by, created_at, updated_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stage_material', NULL, 'posted', $8, $8, $9, $10, $10)
+						`, entryID, tenantID, orgID, journalID, entryNumber, now,
+							description, totalCost, userID, now); jeErr != nil {
+							h.log.Error("Failed to create stage material journal entry", "error", jeErr)
+							return
+						}
 
-					h.log.Info("Stage material accounting entry created", "entry_id", entryID, "product", req.ProductName, "amount", totalCost)
+						if _, jeErr := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
+							uuid.New(), entryID, debitAcct, description, totalCost, now); jeErr != nil {
+							h.log.Error("Failed to insert stage material debit line", "error", jeErr)
+							return
+						}
+						if _, jeErr := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
+							uuid.New(), entryID, creditAcct, description, totalCost, now); jeErr != nil {
+							h.log.Error("Failed to insert stage material credit line", "error", jeErr)
+							return
+						}
+
+						if _, jeErr := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalCost, now, debitAcct); jeErr != nil {
+							h.log.Error("Failed to update stage material debit balance", "error", jeErr)
+							return
+						}
+						if _, jeErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalCost, now, creditAcct); jeErr != nil {
+							h.log.Error("Failed to update stage material credit balance", "error", jeErr)
+							return
+						}
+						if _, jeErr := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); jeErr != nil {
+							h.log.Error("Failed to bump journal next_number", "error", jeErr)
+							return
+						}
+
+						if jeErr := tx.Commit(); jeErr != nil {
+							h.log.Error("Failed to commit stage material journal entry", "error", jeErr)
+							return
+						}
+
+						h.log.Info("Stage material accounting entry created", "entry_id", entryID, "product", req.ProductName, "amount", totalCost)
+					}()
 				}
 			}
 		}
