@@ -212,9 +212,10 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 	orgID, _ := middleware.GetOrganizationID(c)
 
 	var input struct {
-		Phone      string `json:"phone" binding:"required"`
-		Extension  string `json:"extension"`
-		ContactID  string `json:"contact_id"`
+		Phone     string `json:"phone" binding:"required"`
+		Extension string `json:"extension"`
+		ContactID string `json:"contact_id"`
+		LeadID    string `json:"lead_id"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -321,13 +322,19 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 			contactID = &cid
 		}
 	}
+	var leadIDPtr *uuid.UUID
+	if input.LeadID != "" {
+		if lid, err := uuid.Parse(input.LeadID); err == nil {
+			leadIDPtr = &lid
+		}
+	}
 
 	logQuery := `
 		INSERT INTO call_logs (
-			id, tenant_id, organization_id, contact_id, caller_number, receiver_number,
+			id, tenant_id, organization_id, contact_id, lead_id, caller_number, receiver_number,
 			call_type, call_start_time, call_duration, call_outcome,
 			pbx_call_id, agent_id, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, 'outbound', $7, 0, 'initiated', $8, $9, $9, $10, $10)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'outbound', $8, 0, 'initiated', $9, $10, $10, $11, $11)
 	`
 
 	var orgIDPtr *uuid.UUID
@@ -336,11 +343,14 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 	}
 
 	_, err = h.db.Exec(logQuery,
-		callLogID, tenantID, orgIDPtr, contactID, fromExt, cleanPhone,
+		callLogID, tenantID, orgIDPtr, contactID, leadIDPtr, fromExt, cleanPhone,
 		now, pbxNullString(pbxCallID), userID, now,
 	)
 	if err != nil {
 		h.log.Error("Failed to create call log", "error", err)
+	}
+	if leadIDPtr != nil {
+		h.db.Exec(`UPDATE leads SET last_activity_at = NOW() WHERE id = $1 AND tenant_id = $2`, *leadIDPtr, tenantID)
 	}
 
 	response.Success(c, gin.H{
@@ -454,7 +464,10 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 			return
 		}
 	} else {
-		// Fallback: tenant_id in query param
+		// Fallback: tenant_id in query param — accepted ONLY while the tenant
+		// has no webhook_token configured. Once a token exists, tokenless
+		// posts are rejected; before 446 anyone knowing a tenant UUID could
+		// inject call logs through this branch.
 		tenantIDStr := c.Query("tenant_id")
 		if tenantIDStr == "" {
 			tenantIDStr = getStr(data, "tenant_id")
@@ -464,6 +477,15 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 		if err != nil {
 			h.log.Warn("PBX webhook: no token and no valid tenant_id", "tenant_id", tenantIDStr)
 			c.String(http.StatusOK, "ok")
+			return
+		}
+		var configuredToken sql.NullString
+		h.db.QueryRow(`
+			SELECT settings->'pbx'->>'webhook_token' FROM tenant_settings WHERE tenant_id = $1
+		`, tenantID).Scan(&configuredToken)
+		if configuredToken.Valid && configuredToken.String != "" {
+			h.log.Warn("PBX webhook: tokenless request for a token-protected tenant rejected", "tenant_id", tenantID)
+			c.String(http.StatusForbidden, "webhook token required")
 			return
 		}
 	}
@@ -594,36 +616,45 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 		newID := uuid.New()
 		now := time.Now()
 
-		// Try to match caller to a contact (last 10 digits)
-		var contactID *uuid.UUID
-		cleanNum := strings.Map(func(r rune) rune {
-			if r >= '0' && r <= '9' {
-				return r
-			}
-			return -1
-		}, callerNumber)
-
-		if len(cleanNum) >= 10 {
-			last10 := cleanNum[len(cleanNum)-10:]
+		// Attribute the call: contact first, then an open lead — both by
+		// normalized last-9-digit phone match (same normalization as the
+		// CRM dedupe, uses the 446 expression indexes). The remote party's
+		// number is the caller for inbound and the callee for outbound.
+		var contactID, leadID *uuid.UUID
+		remoteNumber := callerNumber
+		if callType == "outbound" {
+			remoteNumber = recipientNumber
+		}
+		digits := normalizePhoneDigits(remoteNumber)
+		if len(digits) >= 7 {
 			var cid uuid.UUID
-			qErr := h.db.QueryRow(`
+			if qErr := h.db.QueryRow(`
 				SELECT id FROM contacts
-				WHERE tenant_id = $1 AND (phone LIKE '%' || $2 OR phone LIKE '%' || $2 || '%')
-				AND deleted_at IS NULL
-				LIMIT 1
-			`, tenantID, last10).Scan(&cid)
-			if qErr == nil {
+				WHERE tenant_id = $1 AND deleted_at IS NULL
+				  AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g'), 9) = $2
+				ORDER BY created_at LIMIT 1
+			`, tenantID, digits).Scan(&cid); qErr == nil {
 				contactID = &cid
+			}
+			var lid uuid.UUID
+			if qErr := h.db.QueryRow(`
+				SELECT id FROM leads
+				WHERE tenant_id = $1 AND deleted_at IS NULL
+				  AND won_at IS NULL AND lost_at IS NULL
+				  AND RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g'), 9) = $2
+				ORDER BY created_at DESC LIMIT 1
+			`, tenantID, digits).Scan(&lid); qErr == nil {
+				leadID = &lid
 			}
 		}
 
 		query := `
 			INSERT INTO call_logs (
-				id, tenant_id, contact_id, caller_number, receiver_number,
+				id, tenant_id, contact_id, lead_id, caller_number, receiver_number,
 				call_type, call_start_time, call_end_time, call_duration,
 				call_outcome, recording_url, pbx_call_id,
 				created_by, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
 		`
 
 		var endTime *time.Time
@@ -633,7 +664,7 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 		}
 
 		_, execErr := h.db.Exec(query,
-			newID, tenantID, contactID, callerNumber, recipientNumber,
+			newID, tenantID, contactID, leadID, callerNumber, recipientNumber,
 			callType, now, endTime, duration,
 			callStatus, pbxNullString(recordingURL), pbxNullString(callSID),
 			uuid.Nil, now,
@@ -641,7 +672,11 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 		if execErr != nil {
 			h.log.Error("PBX webhook: failed to create call log", "error", execErr)
 		} else {
-			h.log.Info("PBX webhook created call log", "id", newID, "event", event, "call_sid", callSID, "direction", direction)
+			h.log.Info("PBX webhook created call log", "id", newID, "event", event, "call_sid", callSID, "direction", direction, "lead_matched", leadID != nil)
+			// a real call is activity on the lead
+			if leadID != nil {
+				h.db.Exec(`UPDATE leads SET last_activity_at = NOW() WHERE id = $1 AND tenant_id = $2`, *leadID, tenantID)
+			}
 		}
 	}
 

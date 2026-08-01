@@ -1364,3 +1364,124 @@ BEGIN
     RAISE NOTICE '  payroll demo seed tayyor: Iyun (paid) + Iyul (approved), qarz + ushlab qolish';
 END;
 $$;
+
+-- ============================================================================
+-- CRM v2 demo: ~12 leads across the funnel with amounts, sources,
+-- responsibles; a few won (partner-linked) / lost (with reasons); stage
+-- history so the board and all four Hisobotlar look alive. Idempotent —
+-- skips when demo leads exist.
+-- ============================================================================
+DO $$
+DECLARE
+    v_tid UUID := 'df372dc3-0b77-4ec6-aef3-c1145ecbeaac';
+    v_org_id UUID;
+    v_user_id UUID;
+    v_emp UUID;
+    v_pipeline UUID;
+    s_new UUID; s_contacted UUID; s_progress UUID; s_negotiation UUID; s_won UUID; s_lost UUID;
+    r_price UUID; r_competitor UUID; r_noreply UUID;
+    v_partner UUID;
+    v_partner2 UUID;
+BEGIN
+    SELECT id INTO v_org_id FROM organizations WHERE tenant_id = v_tid AND deleted_at IS NULL ORDER BY created_at LIMIT 1;
+    SELECT id INTO v_user_id FROM users WHERE tenant_id = v_tid AND deleted_at IS NULL ORDER BY created_at LIMIT 1;
+    SELECT id INTO v_emp FROM employees WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active' ORDER BY created_at LIMIT 1;
+    IF v_org_id IS NULL THEN RAISE NOTICE 'CRM demo seed: org topilmadi — o''tkazib yuborildi'; RETURN; END IF;
+
+    SELECT id INTO v_pipeline FROM pipelines WHERE tenant_id = v_tid AND organization_id = v_org_id AND is_default LIMIT 1;
+    IF v_pipeline IS NULL THEN RAISE NOTICE 'CRM demo seed: pipeline topilmadi — o''tkazib yuborildi'; RETURN; END IF;
+    SELECT id INTO s_new FROM pipeline_stages WHERE pipeline_id = v_pipeline AND code = 'new';
+    SELECT id INTO s_contacted FROM pipeline_stages WHERE pipeline_id = v_pipeline AND code = 'contacted';
+    SELECT id INTO s_progress FROM pipeline_stages WHERE pipeline_id = v_pipeline AND code = 'in_progress';
+    SELECT id INTO s_negotiation FROM pipeline_stages WHERE pipeline_id = v_pipeline AND code = 'qualified';
+    SELECT id INTO s_won FROM pipeline_stages WHERE pipeline_id = v_pipeline AND is_won LIMIT 1;
+    SELECT id INTO s_lost FROM pipeline_stages WHERE pipeline_id = v_pipeline AND is_lost LIMIT 1;
+
+    SELECT id INTO r_price FROM lost_reasons WHERE tenant_id = v_tid AND name = 'Narx qimmat';
+    SELECT id INTO r_competitor FROM lost_reasons WHERE tenant_id = v_tid AND name = 'Raqobatchini tanladi';
+    SELECT id INTO r_noreply FROM lost_reasons WHERE tenant_id = v_tid AND name = 'Javob bermadi';
+
+    IF EXISTS (SELECT 1 FROM leads WHERE tenant_id = v_tid AND notes = 'CRM demo seed' AND deleted_at IS NULL) THEN
+        RAISE NOTICE 'CRM demo seed: allaqachon mavjud';
+        RETURN;
+    END IF;
+
+    -- open leads across the funnel
+    INSERT INTO leads (id, tenant_id, organization_id, contact_name, company_name, email, phone, status, source,
+                       notes, expected_value, currency, pipeline_id, stage_id, responsible_employee_id,
+                       assigned_to, last_activity_at, created_by, created_at, updated_at)
+    SELECT uuid_generate_v4(), v_tid, v_org_id, d.cname, d.company, d.email, d.phone, d.scode, d.src,
+           'CRM demo seed', d.amount, 'UZS', v_pipeline,
+           CASE d.scode WHEN 'new' THEN s_new WHEN 'contacted' THEN s_contacted
+                        WHEN 'in_progress' THEN s_progress ELSE s_negotiation END,
+           v_emp, v_user_id,
+           NOW() - (d.silent_days || ' days')::interval, v_user_id,
+           NOW() - (d.age_days || ' days')::interval, NOW() - (d.silent_days || ' days')::interval
+    FROM (VALUES
+        ('Alisher Qodirov',  'Qodirov Qurilish',   'alisher@qodirov.uz',  '+998901234501', 'new',         'telegram',      45000000::numeric, 0,  1),
+        ('Madina Yusupova',  'Yusupova Dizayn',    'madina@ydesign.uz',   '+998901234502', 'new',         'website',       12000000, 1,  2),
+        ('Bobur Toshmatov',  NULL,                 'bobur.t@mail.uz',     '+998901234503', 'new',         'referral',      8000000,  2,  3),
+        ('Sardor Alimov',    'Alimov Invest',      'sardor@alimov.uz',    '+998901234504', 'contacted',   'cold_call',     150000000, 1,  6),
+        ('Nilufar Karimova', 'NK Interiors',       'nilufar@nk.uz',       '+998901234505', 'contacted',   'telegram',      25000000, 3,  5),
+        ('Jasur Nazarov',    'Nazarov Stroy',      'jasur@nstroy.uz',     '+998901234506', 'in_progress', 'website',       95000000, 2,  10),
+        ('Dilshod Ergashev', NULL,                 'dilshod.e@mail.uz',   '+998901234507', 'in_progress', 'advertisement', 30000000, 9,  14),
+        ('Kamola Rashidova', 'Rashidova Group',    'kamola@rgroup.uz',    '+998901234508', 'qualified',   'referral',      210000000, 1,  20),
+        ('Otabek Salimov',   'Salimov Development','otabek@salimov.uz',   '+998901234509', 'qualified',   'telegram',      78000000, 4,  16)
+    ) AS d(cname, company, email, phone, scode, src, amount, silent_days, age_days);
+
+    -- history: initial stage row per open lead
+    INSERT INTO lead_stage_history (id, tenant_id, lead_id, from_stage_id, to_stage_id, changed_by, changed_at)
+    SELECT uuid_generate_v4(), v_tid, l.id, NULL, l.stage_id, v_user_id, l.created_at
+    FROM leads l WHERE l.tenant_id = v_tid AND l.notes = 'CRM demo seed';
+
+    -- two won deals → partner created/linked
+    INSERT INTO contacts (id, tenant_id, organization_id, type, code, name, email, phone, is_active, created_by, created_at, updated_at)
+    VALUES (uuid_generate_v4(), v_tid, v_org_id, 'customer', 'C-DEMO-CRM1', 'Karimov Stroy MChJ', 'info@karimovstroy.uz', '+998901234510', true, v_user_id, NOW(), NOW())
+    RETURNING id INTO v_partner;
+    INSERT INTO contacts (id, tenant_id, organization_id, type, code, name, email, phone, is_active, created_by, created_at, updated_at)
+    VALUES (uuid_generate_v4(), v_tid, v_org_id, 'customer', 'C-DEMO-CRM2', 'Mirzaeva Design MChJ', 'info@mdesign.uz', '+998901234511', true, v_user_id, NOW(), NOW())
+    RETURNING id INTO v_partner2;
+
+    INSERT INTO leads (id, tenant_id, organization_id, contact_name, company_name, email, phone, status, source,
+                       notes, expected_value, currency, pipeline_id, stage_id, responsible_employee_id, partner_id,
+                       converted_to, converted_at, won_at, assigned_to, last_activity_at, created_by, created_at, updated_at)
+    VALUES
+        (uuid_generate_v4(), v_tid, v_org_id, 'Aziz Karimov', 'Karimov Stroy', 'aziz@karimovstroy.uz', '+998901234510',
+         'won', 'telegram', 'CRM demo seed', 120000000, 'UZS', v_pipeline, s_won, v_emp, v_partner,
+         v_partner, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days', v_user_id, NOW() - INTERVAL '5 days',
+         v_user_id, NOW() - INTERVAL '30 days', NOW() - INTERVAL '5 days'),
+        (uuid_generate_v4(), v_tid, v_org_id, 'Zilola Mirzaeva', 'Mirzaeva Design', 'zilola@mdesign.uz', '+998901234511',
+         'won', 'website', 'CRM demo seed', 36000000, 'UZS', v_pipeline, s_won, v_emp, v_partner2,
+         v_partner2, NOW() - INTERVAL '12 days', NOW() - INTERVAL '12 days', v_user_id, NOW() - INTERVAL '12 days',
+         v_user_id, NOW() - INTERVAL '45 days', NOW() - INTERVAL '12 days');
+
+    -- three lost deals with reasons
+    INSERT INTO leads (id, tenant_id, organization_id, contact_name, company_name, email, phone, status, source,
+                       notes, expected_value, currency, pipeline_id, stage_id, responsible_employee_id,
+                       lost_reason_id, lost_note, lost_at, assigned_to, last_activity_at, created_by, created_at, updated_at)
+    VALUES
+        (uuid_generate_v4(), v_tid, v_org_id, 'Rustam Xolmatov', 'Xolmatov Trade', 'rustam@xtrade.uz', '+998901234512',
+         'lost', 'cold_call', 'CRM demo seed', 55000000, 'UZS', v_pipeline, s_lost, v_emp,
+         r_price, 'Byudjet yetmadi', NOW() - INTERVAL '8 days', v_user_id, NOW() - INTERVAL '8 days',
+         v_user_id, NOW() - INTERVAL '40 days', NOW() - INTERVAL '8 days'),
+        (uuid_generate_v4(), v_tid, v_org_id, 'Gulnora Sattorova', NULL, 'gulnora.s@mail.uz', '+998901234513',
+         'lost', 'website', 'CRM demo seed', 18000000, 'UZS', v_pipeline, s_lost, v_emp,
+         r_competitor, NULL, NOW() - INTERVAL '15 days', v_user_id, NOW() - INTERVAL '15 days',
+         v_user_id, NOW() - INTERVAL '50 days', NOW() - INTERVAL '15 days'),
+        (uuid_generate_v4(), v_tid, v_org_id, 'Farhod Umarov', 'Umarov Logistics', 'farhod@ulog.uz', '+998901234514',
+         'lost', 'telegram', 'CRM demo seed', 27000000, 'UZS', v_pipeline, s_lost, v_emp,
+         r_noreply, NULL, NOW() - INTERVAL '3 days', v_user_id, NOW() - INTERVAL '3 days',
+         v_user_id, NOW() - INTERVAL '20 days', NOW() - INTERVAL '3 days');
+
+    -- history rows for terminal leads (created → terminal stage)
+    INSERT INTO lead_stage_history (id, tenant_id, lead_id, from_stage_id, to_stage_id, changed_by, changed_at)
+    SELECT uuid_generate_v4(), v_tid, l.id, NULL, s_new, v_user_id, l.created_at
+    FROM leads l WHERE l.tenant_id = v_tid AND l.notes = 'CRM demo seed' AND (l.won_at IS NOT NULL OR l.lost_at IS NOT NULL)
+      AND NOT EXISTS (SELECT 1 FROM lead_stage_history h WHERE h.lead_id = l.id);
+    INSERT INTO lead_stage_history (id, tenant_id, lead_id, from_stage_id, to_stage_id, changed_by, changed_at)
+    SELECT uuid_generate_v4(), v_tid, l.id, s_new, l.stage_id, v_user_id, COALESCE(l.won_at, l.lost_at)
+    FROM leads l WHERE l.tenant_id = v_tid AND l.notes = 'CRM demo seed' AND (l.won_at IS NOT NULL OR l.lost_at IS NOT NULL);
+
+    RAISE NOTICE '  CRM demo seed tayyor: 9 ochiq + 2 yutilgan + 3 yo''qotilgan lid';
+END;
+$$;

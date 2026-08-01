@@ -844,6 +844,16 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 	var grWarehouseID sql.NullString
 	h.db.QueryRow("SELECT warehouse_id FROM goods_receipts WHERE id = $1 AND tenant_id = $2", grID, tenantID).Scan(&grWarehouseID)
 
+	// Cross-path dedupe (audit finding #4): if the PO-approve auto-receive
+	// or a receipt stock operation already added this PO's stock, the goods
+	// receipt must not add it AGAIN. The GL entry below still posts — those
+	// paths post no JE, so the goods receipt supplies the missing GL leg.
+	skipPhysicalStock := false
+	if purchaseOrderID != uuid.Nil && h.poStockReceivedVia(tenantID, purchaseOrderID, "purchase_order", "stock_operation") {
+		skipPhysicalStock = true
+		h.log.Info("Goods receipt: PO stock already received via another path — posting GL only", "gr_id", grID, "po_id", purchaseOrderID)
+	}
+
 	// Get GR lines with product info for inventory update (including batch/expiry for lot creation)
 	grLinesForInventory, err := h.db.Query(`
 		SELECT grl.product_id, grl.accepted_quantity, grl.unit_price,
@@ -852,104 +862,104 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 		WHERE grl.goods_receipt_id = $1 AND grl.product_id IS NOT NULL AND grl.accepted_quantity > 0
 	`, grID)
 
-	if err == nil {
-		defer grLinesForInventory.Close()
-
+	if err == nil && skipPhysicalStock {
+		grLinesForInventory.Close()
+	}
+	if err == nil && !skipPhysicalStock {
+		// Collect lines first, then apply in ONE tx per document via
+		// applyStockDelta (AVECO on the balance row, self-contained ledger
+		// row — the old loop overwrote unit_cost with the latest price and
+		// wrote per-line with h.db, half-applying on failure).
+		type grInvLine struct {
+			ProductID   uuid.UUID
+			AcceptedQty float64
+			UnitPrice   float64
+			BatchNumber string
+			Expiry      sql.NullTime
+		}
+		var grInvLines []grInvLine
 		for grLinesForInventory.Next() {
-			var productID uuid.UUID
-			var acceptedQty, unitPrice float64
-			var batchNumber string
-			var expiryDate sql.NullTime
-
-			if err := grLinesForInventory.Scan(&productID, &acceptedQty, &unitPrice, &batchNumber, &expiryDate); err != nil {
-				continue
+			var l grInvLine
+			if err := grLinesForInventory.Scan(&l.ProductID, &l.AcceptedQty, &l.UnitPrice, &l.BatchNumber, &l.Expiry); err == nil {
+				grInvLines = append(grInvLines, l)
 			}
+		}
+		grLinesForInventory.Close()
 
-			// Skip if no warehouse specified
-			if !grWarehouseID.Valid || grWarehouseID.String == "" {
-				continue
-			}
-
-			warehouseID, err := uuid.Parse(grWarehouseID.String)
-			if err != nil {
-				continue
-			}
-
-			// 1. Get or create inventory record for this product+warehouse
-			var inventoryID uuid.UUID
-			err = h.db.QueryRow(`
-				SELECT id FROM inventory
-				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-			`, tenantID, productID, warehouseID).Scan(&inventoryID)
-
-			if err == sql.ErrNoRows {
-				// Create new inventory record (quantity_available and total_value are generated columns)
-				inventoryID = uuid.New()
-				// Get organization_id from the warehouse
+		if grWarehouseID.Valid && grWarehouseID.String != "" {
+			warehouseID, whParseErr := uuid.Parse(grWarehouseID.String)
+			if whParseErr == nil && len(grInvLines) > 0 {
 				var whOrgID *uuid.UUID
 				h.db.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", warehouseID, tenantID).Scan(&whOrgID)
-				h.db.Exec(`
-					INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-					VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-				`, inventoryID, tenantID, whOrgID, productID, warehouseID, unitPrice, now)
-			}
 
-			// 2. Update inventory quantity
-			// Note: quantity_available and total_value are GENERATED columns - don't update them directly
-			_, err = h.db.Exec(`
-				UPDATE inventory
-				SET quantity_on_hand = quantity_on_hand + $1,
-					unit_cost = $2,
-					last_movement_date = $3,
-					updated_at = $3
-				WHERE id = $4
-			`, acceptedQty, unitPrice, now, inventoryID)
-			if err != nil {
-				h.log.Error("Failed to update inventory", "error", err, "inventory_id", inventoryID)
-			}
+				// Vendor from PO for lot rows
+				var vendorID *uuid.UUID
+				var poIDPtr *uuid.UUID
+				if purchaseOrderID != uuid.Nil {
+					poIDPtr = &purchaseOrderID
+					var vid uuid.UUID
+					if err := h.db.QueryRow("SELECT vendor_id FROM purchase_orders WHERE id = $1", purchaseOrderID).Scan(&vid); err == nil {
+						vendorID = &vid
+					}
+				}
+				grUserID, _ := middleware.GetUserID(c)
 
-			// 3. Create inventory transaction for audit trail
-			txID := uuid.New()
-			h.db.Exec(`
-				INSERT INTO inventory_transactions (
-					id, tenant_id, inventory_id, transaction_type, quantity,
-					unit_cost, total_cost, reference_type, reference_id,
-					reason, transaction_date, created_at
-				) VALUES ($1, $2, $3, 'receipt', $4, $5, $6, 'goods_receipt', $7, 'Goods Receipt', $8, $8)
-			`, txID, tenantID, inventoryID, acceptedQty, unitPrice, acceptedQty*unitPrice, grID, now)
+				grErr := func() error {
+					tx, txErr := h.db.Begin()
+					if txErr != nil {
+						return txErr
+					}
+					defer tx.Rollback()
+					for _, l := range grInvLines {
+						if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+							TenantID: tenantID, OrgID: whOrgID, ProductID: l.ProductID,
+							WarehouseID: warehouseID, Qty: l.AcceptedQty, UnitCost: l.UnitPrice,
+							TxType: "receipt", RefType: "goods_receipt", RefID: grID.String(),
+							Reason: "Goods Receipt", ToWH: &warehouseID,
+							CreatedBy: grUserID, When: now,
+						}); dErr != nil {
+							return dErr
+						}
 
-			// 4. Auto-create inventory lot record
-			lotNumber := batchNumber
-			if lotNumber == "" {
-				lotNumber = h.generateLotNumber(tenantID)
-			}
-			lotID := uuid.New()
-			var expDate *time.Time
-			if expiryDate.Valid {
-				expDate = &expiryDate.Time
-			}
-			// Get vendor from PO
-			var vendorID *uuid.UUID
-			var poID *uuid.UUID
-			if purchaseOrderID != uuid.Nil {
-				poID = &purchaseOrderID
-				var vid uuid.UUID
-				if err := h.db.QueryRow("SELECT vendor_id FROM purchase_orders WHERE id = $1", purchaseOrderID).Scan(&vid); err == nil {
-					vendorID = &vid
+						lotNumber := l.BatchNumber
+						if lotNumber == "" {
+							lotNumber = h.generateLotNumber(tenantID)
+						}
+						var expDate *time.Time
+						if l.Expiry.Valid {
+							expDate = &l.Expiry.Time
+						}
+						if _, lErr := tx.Exec(`
+							INSERT INTO inventory_lots (
+								id, tenant_id, product_id, warehouse_id, lot_number,
+								received_date, expiry_date, initial_quantity, remaining_quantity,
+								unit_cost, vendor_id, purchase_order_id, status, created_at, updated_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
+						`, uuid.New(), tenantID, l.ProductID, warehouseID, lotNumber,
+							now, expDate, l.AcceptedQty, l.UnitPrice, vendorID, poIDPtr, now); lErr != nil {
+							return lErr
+						}
+
+						// FIFO: cost_price tracks the OLDEST available lot
+						// (consistent with the PO-receive paths — the old code
+						// overwrote with the latest price here)
+						fifoCost := l.UnitPrice
+						var oldestCost float64
+						if tx.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
+							tenantID, l.ProductID).Scan(&oldestCost) == nil && oldestCost > 0 {
+							fifoCost = oldestCost
+						}
+						if _, pErr := tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+							fifoCost, now, l.ProductID, tenantID); pErr != nil {
+							return pErr
+						}
+					}
+					return tx.Commit()
+				}()
+				if grErr != nil {
+					h.log.Error("Goods receipt stock movement failed; NOTHING moved", "error", grErr, "gr_id", grID)
 				}
 			}
-			h.db.Exec(`
-				INSERT INTO inventory_lots (
-					id, tenant_id, product_id, warehouse_id, lot_number,
-					received_date, expiry_date, initial_quantity, remaining_quantity,
-					unit_cost, vendor_id, purchase_order_id, status, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
-			`, lotID, tenantID, productID, warehouseID, lotNumber,
-				now, expDate, acceptedQty, unitPrice, vendorID, poID, now)
-
-			// Update product cost_price with the latest purchase price
-			h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-				unitPrice, now, productID, tenantID)
 		}
 	}
 

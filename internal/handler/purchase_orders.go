@@ -1618,7 +1618,22 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 			h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&whID)
 		}
 
+		// Cross-path dedupe: skip if a goods receipt or receipt stock
+		// operation already put this PO's stock in (audit finding #4).
+		if h.poStockReceivedVia(tenantID, poID, "goods_receipt", "stock_operation", "purchase_order") {
+			h.log.Info("PO approve auto-receive skipped — stock already received via another path", "po_id", poID)
+			whID = uuid.Nil
+		}
+
 		if whID != uuid.Nil {
+			// Collect lines first, then apply in ONE tx (balance + ledger +
+			// lot per line via applyStockDelta — AVECO, no unit_cost overwrite)
+			type poRecvLine struct {
+				ProdID    uuid.UUID
+				Qty       float64
+				UnitPrice float64
+			}
+			var recvLines []poRecvLine
 			lineRows, _ := h.db.Query(`
 				SELECT pol.product_id, pol.quantity, pol.unit_price
 				FROM purchase_order_lines pol
@@ -1626,40 +1641,39 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 			`, poID)
 			if lineRows != nil {
 				for lineRows.Next() {
-					var prodID uuid.UUID
-					var qty, unitPrice float64
-					if lineRows.Scan(&prodID, &qty, &unitPrice) != nil {
-						continue
+					var l poRecvLine
+					if lineRows.Scan(&l.ProdID, &l.Qty, &l.UnitPrice) == nil {
+						recvLines = append(recvLines, l)
 					}
-
-					// Upsert inventory
-					var invID uuid.UUID
-					err := h.db.QueryRow(`
-						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-						ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET updated_at = NOW()
-						RETURNING id
-					`, uuid.New(), tenantID, prodID, whID, orgID, unitPrice, now).Scan(&invID)
-					if err != nil {
-						continue
-					}
-
-					// Add quantity
-					h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, unit_cost = $2, last_movement_date = $3, updated_at = $3 WHERE id = $4`,
-						qty, unitPrice, now, invID)
-
-					// Create transaction
-					h.db.Exec(`INSERT INTO inventory_transactions (id, tenant_id, organization_id, inventory_id, transaction_type, quantity, unit_cost, total_cost, reference_type, reference_id, reason, transaction_date, created_at)
-						VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, 'purchase_order', $8, 'PO Auto-Receipt', $9, $9)`,
-						uuid.New(), tenantID, orgID, invID, qty, unitPrice, qty*unitPrice, poID, now)
-
-					// Create lot for FIFO
-					lotNumber := fmt.Sprintf("PO-%s", poID.String()[:8])
-					h.db.Exec(`INSERT INTO inventory_lots (id, tenant_id, product_id, warehouse_id, lot_number, received_date, initial_quantity, remaining_quantity, unit_cost, purchase_order_id, status, created_at, updated_at)
-						VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)`,
-						uuid.New(), tenantID, prodID, whID, lotNumber, now, qty, unitPrice, poID)
 				}
 				lineRows.Close()
+			}
+
+			autoErr := func() error {
+				tx, txErr := h.db.Begin()
+				if txErr != nil {
+					return txErr
+				}
+				defer tx.Rollback()
+				for _, l := range recvLines {
+					if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+						TenantID: tenantID, OrgID: orgID, ProductID: l.ProdID,
+						WarehouseID: whID, Qty: l.Qty, UnitCost: l.UnitPrice,
+						TxType: "receipt", RefType: "purchase_order", RefID: poID.String(),
+						Reason: "PO Auto-Receipt", ToWH: &whID, When: now,
+					}); dErr != nil {
+						return dErr
+					}
+					if _, lErr := tx.Exec(`INSERT INTO inventory_lots (id, tenant_id, product_id, warehouse_id, lot_number, received_date, initial_quantity, remaining_quantity, unit_cost, purchase_order_id, status, created_at, updated_at)
+						VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)`,
+						uuid.New(), tenantID, l.ProdID, whID, fmt.Sprintf("PO-%s", poID.String()[:8]), now, l.Qty, l.UnitPrice, poID); lErr != nil {
+						return lErr
+					}
+				}
+				return tx.Commit()
+			}()
+			if autoErr != nil {
+				h.log.Error("PO auto-receive stock movement failed; NOTHING moved", "error", autoErr, "po_id", poID)
 			}
 
 			// Update PO status to received
@@ -1965,6 +1979,15 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		}
 	}
 
+	// Cross-path dedupe: if a goods receipt or a receipt stock operation
+	// already put this PO's stock in, /receive must not add it again
+	// (audit finding #4). Within-path partial receives keep working —
+	// only OTHER paths' ledger rows block this one.
+	skipStockUpdate := h.poStockReceivedVia(tenantID, id, "goods_receipt", "stock_operation")
+	if skipStockUpdate {
+		h.log.Info("PO /receive: stock already received via goods receipt or stock operation — updating quantities/status only", "po_id", id)
+	}
+
 	for _, line := range input.Lines {
 		lineID, err := uuid.Parse(line.LineID)
 		if err != nil {
@@ -1979,6 +2002,10 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 			FROM purchase_order_lines WHERE id = $1 AND purchase_order_id = $2
 		`, lineID, id).Scan(&productID, &unitPrice, &lineWarehouseID)
 		if err != nil {
+			continue
+		}
+
+		if skipStockUpdate {
 			continue
 		}
 
@@ -1999,64 +2026,55 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 			continue
 		}
 
-		// Get or create inventory record
-		var inventoryID uuid.UUID
-		err = h.db.QueryRow(`
-			SELECT id FROM inventory
-			WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-		`, tenantID, productID, warehouseID).Scan(&inventoryID)
+		// Balance + ledger + lot in ONE tx per line via applyStockDelta:
+		// AVECO on the balance row, self-contained ledger row, no more
+		// blind unit_cost overwrite (docs/ombor-audit.md finding #7).
+		recvUserID, _ := middleware.GetUserID(c)
+		lineErr := func() error {
+			tx, txErr := h.db.Begin()
+			if txErr != nil {
+				return txErr
+			}
+			defer tx.Rollback()
 
-		if err == sql.ErrNoRows {
-			inventoryID = uuid.New()
-			h.db.Exec(`
-				INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-			`, inventoryID, tenantID, productID, warehouseID, poOrgID, unitPrice, now)
+			if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+				TenantID: tenantID, OrgID: poOrgID, ProductID: productID,
+				WarehouseID: warehouseID, Qty: line.QuantityReceived, UnitCost: unitPrice,
+				TxType: "receipt", RefType: "purchase_order", RefID: id.String(),
+				Reason: "PO Goods Receipt", ToWH: &warehouseID,
+				CreatedBy: recvUserID, When: now,
+			}); dErr != nil {
+				return dErr
+			}
+
+			// Auto-create inventory lot for received goods
+			if _, lErr := tx.Exec(`
+				INSERT INTO inventory_lots (
+					id, tenant_id, product_id, warehouse_id, lot_number,
+					received_date, initial_quantity, remaining_quantity,
+					unit_cost, vendor_id, purchase_order_id, status, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, 'available', $11, $11)
+			`, uuid.New(), tenantID, productID, warehouseID, h.generateLotNumber(tenantID),
+				now, line.QuantityReceived, unitPrice, poVendorID, id, now); lErr != nil {
+				return lErr
+			}
+
+			// FIFO: set cost_price to oldest available lot's cost (not latest purchase)
+			fifoCostRcv := unitPrice
+			var oldestCost float64
+			if tx.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
+				tenantID, productID).Scan(&oldestCost) == nil && oldestCost > 0 {
+				fifoCostRcv = oldestCost
+			}
+			if _, pErr := tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+				fifoCostRcv, now, productID, tenantID); pErr != nil {
+				return pErr
+			}
+			return tx.Commit()
+		}()
+		if lineErr != nil {
+			h.log.Error("Failed to receive PO line into stock", "error", lineErr, "po_id", id, "product_id", productID)
 		}
-
-		// Update inventory quantity
-		_, err = h.db.Exec(`
-			UPDATE inventory
-			SET quantity_on_hand = quantity_on_hand + $1,
-				unit_cost = $2,
-				last_movement_date = $3,
-				updated_at = $3
-			WHERE id = $4
-		`, line.QuantityReceived, unitPrice, now, inventoryID)
-		if err != nil {
-			h.log.Error("Failed to update inventory from PO receive", "error", err, "inventory_id", inventoryID)
-		}
-
-		// Create inventory transaction for audit trail
-		txnID := uuid.New()
-		h.db.Exec(`
-			INSERT INTO inventory_transactions (
-				id, tenant_id, inventory_id, organization_id, transaction_type, quantity,
-				unit_cost, total_cost, reference_type, reference_id,
-				reason, transaction_date, created_at
-			) VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, 'purchase_order', $8, 'PO Goods Receipt', $9, $9)
-		`, txnID, tenantID, inventoryID, poOrgID, line.QuantityReceived, unitPrice, line.QuantityReceived*unitPrice, id, now)
-
-		// FIFO: set cost_price to oldest available lot's cost (not latest purchase)
-		var fifoCostRcv float64
-		if h.db.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
-			tenantID, productID).Scan(&fifoCostRcv) != nil || fifoCostRcv <= 0 {
-			fifoCostRcv = unitPrice // first purchase, use current price
-		}
-		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-			fifoCostRcv, now, productID, tenantID)
-
-		// Auto-create inventory lot for received goods
-		lotNumber := h.generateLotNumber(tenantID)
-		lotID := uuid.New()
-		h.db.Exec(`
-			INSERT INTO inventory_lots (
-				id, tenant_id, product_id, warehouse_id, lot_number,
-				received_date, initial_quantity, remaining_quantity,
-				unit_cost, vendor_id, purchase_order_id, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, $10, 'available', $11, $11)
-		`, lotID, tenantID, productID, warehouseID, lotNumber,
-			now, line.QuantityReceived, unitPrice, poVendorID, id, now)
 	}
 
 	go func() {
