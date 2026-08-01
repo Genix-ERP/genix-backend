@@ -232,12 +232,32 @@ class TestPurchaseInvoiceGL:
 # ============================================
 
 class TestExpenseGL:
-    def _create_and_approve(self, api_client, amount, tag):
+    """Expenses v2 (migration 444): JE endi APPROVE emas, PAY paytida
+    yoziladi (docs/xarajatlar-audit.md §2.6). Kategoriya majburiy."""
+
+    def _create_and_approve(self, api_client, db_read, amount, tag):
+        # v2: category_id majburiy — tenantning istalgan kategoriyasi.
+        resp = api_client.get("/expense-categories")
+        assert resp.status_code == 200, resp.text
+        cats = api_data(resp)
+        assert cats, "expense categories must be seeded (migration 444)"
+
+        # v2: xarajat xodimga bog'lanadi (employee_id yoki user→employee).
+        db_read.execute(
+            "SELECT id FROM employees WHERE tenant_id = (SELECT tenant_id FROM expense_categories WHERE id = %s) LIMIT 1",
+            (cats[0]["id"],),
+        )
+        emp = db_read.fetchone()
+        if not emp:
+            pytest.skip("Test tenantda xodim yo'q")
+
         resp = api_client.post("/expenses", json={
             "date": today(),
             "description": f"Test xarajat {tag}",
             "amount": amount,
             "reimbursable": False,
+            "category_id": str(cats[0]["id"]),
+            "employee_id": str(emp["id"]),
         })
         if resp.status_code == 403:
             pytest.skip("expense create: permission yo'q")
@@ -247,15 +267,38 @@ class TestExpenseGL:
         assert resp.status_code in (200, 201), f"Approve failed: {resp.status_code} {resp.text[:300]}"
         return exp
 
-    def test_two_sequential_approvals_both_get_je(self, api_client, db_read):
-        """Ketma-ket 2 ta xarajat tasdiqlansa, ikkalasi ham JE olishi shart.
+    def _money_account(self, db_read, tenant_id, min_balance):
+        db_read.execute(
+            """SELECT id FROM accounts
+               WHERE tenant_id = %s AND (code LIKE '50%%' OR code LIKE '51%%')
+                 AND COALESCE(is_leaf, true) = true AND deleted_at IS NULL
+                 AND COALESCE(current_balance, 0) >= %s
+               ORDER BY code LIMIT 1""",
+            (tenant_id, min_balance),
+        )
+        return db_read.fetchone()
 
-        Regressiya: ApproveExpense JE raqamini journals.next_number dan
-        oladi va insert xatosini yutib yuboradi — dublikat raqam bo'lsa
-        ikkinchi xarajat JE siz qoladi.
+    def test_two_sequential_payments_both_get_je(self, api_client, db_read, auth_token):
+        """Ketma-ket 2 ta xarajat to'lansa, ikkalasi ham balanslangan JE
+        olishi shart.
+
+        Regressiya (v1 davridan meros): JE raqami journals.next_number dan
+        olinardi va insert xatosi yutilardi — dublikat raqam bo'lsa
+        ikkinchi xarajat JE siz qolardi. v2 da nextEntryNumberSeq + bitta
+        tranzaksiya buni istisno qiladi; test buni PAY oqimida tekshiradi.
         """
-        exp_a = self._create_and_approve(api_client, 150_000, f"A-{uuid.uuid4().hex[:4]}")
-        exp_b = self._create_and_approve(api_client, 250_000, f"B-{uuid.uuid4().hex[:4]}")
+        account = self._money_account(db_read, auth_token["tenant_id"], 400_000)
+        if not account:
+            pytest.skip("Yetarli balansli kassa/bank hisobi yo'q (chiqim balans-qo'riqchisi rad etadi)")
+
+        exp_a = self._create_and_approve(api_client, db_read, 150_000, f"A-{uuid.uuid4().hex[:4]}")
+        exp_b = self._create_and_approve(api_client, db_read, 250_000, f"B-{uuid.uuid4().hex[:4]}")
+
+        for exp in (exp_a, exp_b):
+            resp = api_client.post(f"/expenses/{exp['id']}/pay", json={
+                "payment_account_id": str(account["id"]),
+            })
+            assert resp.status_code == 200, f"Pay failed: {resp.status_code} {resp.text[:300]}"
 
         missing = []
         for exp, amount in ((exp_a, 150_000.0), (exp_b, 250_000.0)):
@@ -270,7 +313,7 @@ class TestExpenseGL:
             else:
                 assert_je_balanced_and_leaf(db_read, row["id"], expect_total=amount)
         assert not missing, (
-            f"Tasdiqlangan xarajat(lar) GL provodkasiz qoldi: {missing} — "
+            f"To'langan xarajat(lar) GL provodkasiz qoldi: {missing} — "
             "JE raqami to'qnashuvi xatosi yutilgan bo'lishi ehtimol"
         )
 

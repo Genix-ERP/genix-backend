@@ -312,7 +312,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 	}
 
 	// Net income = Revenue - Expenses (this is the current year's undistributed profit)
-	netIncome := math.Round((totalRevenue - totalExpenses) * 100) / 100
+	netIncome := math.Round((totalRevenue-totalExpenses)*100) / 100
 
 	// Add net income as a line item in equity if it's non-zero
 	// This represents "Joriy yil foydasi" (Current Year Profit/Loss)
@@ -2007,8 +2007,15 @@ type directorCompanySummary struct {
 	TotalEmployees       int                          `json:"total_employees"`
 	ActiveEmployees      int                          `json:"active_employees"`
 	SalaryFund           float64                      `json:"salary_fund"`
+	PayrollFund          float64                      `json:"payroll_fund"`
+	PayrollUnpaid        float64                      `json:"payroll_unpaid"`
 	TopStockProducts     []directorTopStockProduct    `json:"top_stock_products"`
 	ConstructionProjects []directorConstructionProjct `json:"construction_projects"`
+	// Shartnomalar aggregates (active = amaldagi, expiring = ≤30 days)
+	ActiveContracts      int     `json:"active_contracts"`
+	ActiveContractsValue float64 `json:"active_contracts_value"`
+	ExpiringContracts    int     `json:"expiring_contracts"`
+	ContractsOutstanding float64 `json:"contracts_outstanding"`
 }
 
 type directorTopStockProduct struct {
@@ -2179,13 +2186,17 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 	// 3. Expenses — scoped to the selected period window.
 	//    The donut breakdown is "current bucket" (latest = today's
 	//    period segment, e.g. this month / this quarter / this year).
+	//    v2: drafts and rejected/cancelled rows no longer count — the
+	//    director sees committed spending (submitted/approved/paid),
+	//    and total_amount (with tax) instead of the net amount.
 	expRows, err := h.db.Query(`
-		SELECT e.organization_id, COALESCE(e.amount, 0),
+		SELECT e.organization_id, COALESCE(e.total_amount, 0),
 		       COALESCE(ec.name, 'Other') AS category,
 		       e.expense_date
 		FROM expenses e
 		LEFT JOIN expense_categories ec ON ec.id = e.category_id
 		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND e.organization_id IS NOT NULL
+		  AND e.status IN ('submitted', 'approved', 'paid')
 		  AND e.expense_date >= $2 AND e.expense_date < $3`,
 		tenantID, rangeStart, rangeEnd,
 	)
@@ -2323,6 +2334,61 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		empRows.Close()
 	}
 
+	// 6b. Payroll — actual calculated wage fund per org from payroll_periods
+	//     (periods whose end_date falls inside the selected window; cancelled
+	//     periods excluded), unlike SalaryFund which is a static headcount
+	//     snapshot from employees.base_salary.
+	pfRows, err := h.db.Query(`
+		SELECT pp.organization_id, COALESCE(SUM(pp.total_net), 0)
+		FROM payroll_periods pp
+		WHERE pp.tenant_id = $1 AND pp.deleted_at IS NULL AND pp.organization_id IS NOT NULL
+		  AND pp.status <> 'cancelled'
+		  AND pp.end_date >= $2 AND pp.end_date <= $3
+		GROUP BY pp.organization_id`,
+		tenantID, rangeStart, rangeEnd,
+	)
+	if err == nil {
+		for pfRows.Next() {
+			var orgID uuid.UUID
+			var total float64
+			if err := pfRows.Scan(&orgID, &total); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.PayrollFund = total
+		}
+		pfRows.Close()
+	}
+
+	// 6c. Payroll unpaid — confirmed (approved) but not yet paid periods,
+	//     all time: the remainder the director still owes as wages.
+	puRows, err := h.db.Query(`
+		SELECT pp.organization_id, COALESCE(SUM(pp.total_net), 0)
+		FROM payroll_periods pp
+		WHERE pp.tenant_id = $1 AND pp.deleted_at IS NULL AND pp.organization_id IS NOT NULL
+		  AND pp.status = 'approved'
+		GROUP BY pp.organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for puRows.Next() {
+			var orgID uuid.UUID
+			var total float64
+			if err := puRows.Scan(&orgID, &total); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.PayrollUnpaid = total
+		}
+		puRows.Close()
+	}
+
 	// 7. Top stock products per org (top 8 by value) — for warehouse diagram
 	topRows, err := h.db.Query(`
 		SELECT org_id, name, qty, value FROM (
@@ -2388,6 +2454,54 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		projRows.Close()
 	}
 
+	// 9. Shartnomalar aggregates per org — amaldagi shartnomalar summasi,
+	// muddati tugayotganlar soni, to'lanmagan qoldiq.
+	contractRows, err := h.db.Query(`
+		SELECT c.organization_id,
+		       COUNT(*) FILTER (WHERE c.status = 'active'),
+		       COALESCE(SUM(COALESCE(c.value, 0) + am.delta_sum) FILTER (WHERE c.status = 'active'), 0),
+		       COUNT(*) FILTER (WHERE c.status = 'active' AND c.end_date IS NOT NULL
+		           AND c.end_date >= CURRENT_DATE AND c.end_date <= CURRENT_DATE + INTERVAL '30 days'),
+		       COALESCE(SUM(COALESCE(c.value, 0) + am.delta_sum - inv.paid_total) FILTER (WHERE c.status = 'active'), 0)
+		FROM procurement_contracts c
+		LEFT JOIN LATERAL (
+			SELECT COALESCE(SUM(a.amount_delta), 0) AS delta_sum
+			FROM contract_amendments a WHERE a.contract_id = c.id AND a.deleted_at IS NULL
+		) am ON true
+		LEFT JOIN LATERAL (
+			SELECT COALESCE(SUM(x.amount_paid), 0) AS paid_total FROM (
+				SELECT si.amount_paid FROM sales_invoices si
+				WHERE si.contract_id = c.id AND si.deleted_at IS NULL AND si.status <> 'cancelled'
+				UNION ALL
+				SELECT pi.amount_paid FROM purchase_invoices pi
+				WHERE pi.contract_id = c.id AND pi.deleted_at IS NULL AND pi.status <> 'cancelled'
+			) x
+		) inv ON true
+		WHERE c.tenant_id = $1 AND c.deleted_at IS NULL AND c.archived_at IS NULL
+		  AND c.organization_id IS NOT NULL
+		GROUP BY c.organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for contractRows.Next() {
+			var orgID uuid.UUID
+			var active, expiring int
+			var activeValue, outstanding float64
+			if err := contractRows.Scan(&orgID, &active, &activeValue, &expiring, &outstanding); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.ActiveContracts = active
+			s.ActiveContractsValue = activeValue
+			s.ExpiringContracts = expiring
+			s.ContractsOutstanding = outstanding
+		}
+		contractRows.Close()
+	}
+
 	// Compute profit and round output
 	companies := make([]directorCompanySummary, 0, len(order))
 	round2 := func(v float64) float64 { return math.Round(v*100) / 100 }
@@ -2401,6 +2515,8 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		s.Creditors = round2(s.Creditors)
 		s.StockValue = round2(s.StockValue)
 		s.SalaryFund = round2(s.SalaryFund)
+		s.PayrollFund = round2(s.PayrollFund)
+		s.PayrollUnpaid = round2(s.PayrollUnpaid)
 		for i, v := range s.MonthlyRevenue {
 			s.MonthlyRevenue[i] = round2(v)
 		}
@@ -2412,6 +2528,7 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 
 	// Grand totals
 	var totRev, totExp, totDeb, totCred, totStockVal, totSalary float64
+	var totPayrollFund, totPayrollUnpaid float64
 	var totStockUnits float64
 	var totLow, totEmps, totActive int
 	for _, s := range companies {
@@ -2425,6 +2542,8 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		totEmps += s.TotalEmployees
 		totActive += s.ActiveEmployees
 		totSalary += s.SalaryFund
+		totPayrollFund += s.PayrollFund
+		totPayrollUnpaid += s.PayrollUnpaid
 	}
 
 	response.Success(c, gin.H{
@@ -2442,6 +2561,8 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 			"total_employees":  totEmps,
 			"active_employees": totActive,
 			"salary_fund":      round2(totSalary),
+			"payroll_fund":     round2(totPayrollFund),
+			"payroll_unpaid":   round2(totPayrollUnpaid),
 		},
 	})
 }

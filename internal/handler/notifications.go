@@ -70,6 +70,16 @@ var notificationTemplates = map[string]map[string]struct{ Title, Message string 
 		"uz": {Title: "Xarajat tasdiqlandi", Message: "%s xarajat %s miqdorida tasdiqlandi"},
 		"ru": {Title: "Расход одобрен", Message: "Расход %s на сумму %s одобрен"},
 	},
+	"expense_rejected": {
+		"en": {Title: "Expense Rejected", Message: "Expense %s for %s has been rejected"},
+		"uz": {Title: "Xarajat rad etildi", Message: "%s xarajat %s miqdorida rad etildi"},
+		"ru": {Title: "Расход отклонён", Message: "Расход %s на сумму %s отклонён"},
+	},
+	"expense_paid": {
+		"en": {Title: "Expense Paid", Message: "Expense %s for %s has been paid"},
+		"uz": {Title: "Xarajat to'landi", Message: "%s xarajat %s miqdorida to'landi"},
+		"ru": {Title: "Расход оплачен", Message: "Расход %s на сумму %s оплачен"},
+	},
 	// ── Payroll ──
 	"salary_confirmed": {
 		"en": {Title: "Salary Payment Confirmed", Message: "Salary payment of %s has been confirmed for %s"},
@@ -96,6 +106,38 @@ var notificationTemplates = map[string]map[string]struct{ Title, Message string 
 		"en": {Title: "Material Reservation Request", Message: "Reservation request for %s (qty: %s)"},
 		"uz": {Title: "Material bron qilish so'rovi", Message: "%s uchun bron qilish so'rovi (miqdori: %s)"},
 		"ru": {Title: "Запрос на резервирование материала", Message: "Запрос на резервирование %s (количество: %s)"},
+	},
+	// ── Vazifalar (task management) ──
+	"task_assigned": {
+		"en": {Title: "New Task Assigned", Message: "You were assigned to \"%s\" (board: %s)"},
+		"uz": {Title: "Yangi vazifa tayinlandi", Message: "Sizga \"%s\" vazifasi tayinlandi (doska: %s)"},
+		"ru": {Title: "Назначена новая задача", Message: "Вам назначена задача «%s» (доска: %s)"},
+	},
+	"task_comment_mention": {
+		"en": {Title: "You Were Mentioned", Message: "%s mentioned you in a comment on task \"%s\""},
+		"uz": {Title: "Sizni tilga olishdi", Message: "%s sizni \"%s\" vazifasidagi izohda tilga oldi"},
+		"ru": {Title: "Вас упомянули", Message: "%s упомянул(а) вас в комментарии к задаче «%s»"},
+	},
+	"task_overdue": {
+		"en": {Title: "Task Overdue", Message: "Task \"%s\" is overdue (due: %s)"},
+		"uz": {Title: "Vazifa muddati o'tdi", Message: "\"%s\" vazifasining muddati o'tdi (muddat: %s)"},
+		"ru": {Title: "Задача просрочена", Message: "Срок задачи «%s» истёк (срок: %s)"},
+	},
+	"workflow_rule_paused": {
+		"en": {Title: "Automation rule paused", Message: "Rule \"%s\" was paused automatically: it fired or failed too many times. Review and re-enable it."},
+		"uz": {Title: "Qoida vaqtincha to'xtatildi", Message: "\"%s\" qoidasi avtomatik to'xtatildi: juda ko'p ishga tushdi yoki xatolik berdi. Tekshirib, qayta yoqing."},
+		"ru": {Title: "Правило приостановлено", Message: "Правило «%s» приостановлено автоматически: слишком много срабатываний или ошибок. Проверьте и включите снова."},
+	},
+	// ── Shartnomalar (contracts) ──
+	"contract_expiring": {
+		"en": {Title: "Contract Expiring Soon", Message: "Contract %s \"%s\" expires in %d days (%s)"},
+		"uz": {Title: "Shartnoma muddati tugayapti", Message: "%s \"%s\" shartnomasi muddati %d kundan keyin tugaydi (%s)"},
+		"ru": {Title: "Срок договора истекает", Message: "Срок договора %s «%s» истекает через %d дней (%s)"},
+	},
+	"contract_expired": {
+		"en": {Title: "Contract Expired", Message: "Contract %s \"%s\" expired on %s"},
+		"uz": {Title: "Shartnoma muddati tugadi", Message: "%s \"%s\" shartnomasining muddati %s da tugadi"},
+		"ru": {Title: "Срок договора истёк", Message: "Срок договора %s «%s» истёк %s"},
 	},
 }
 

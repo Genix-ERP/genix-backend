@@ -298,6 +298,8 @@ var toolPerms = map[string][3]string{
 	"list_vendor_bills":          {"purchase", "invoice", "read"},
 	"aged_payables":              {"purchase", "invoice", "read"},
 	"list_contracts":             {"purchase", "contract", "read"},
+	"get_contract":               {"purchase", "contract", "read"},
+	"create_contract":            {"purchase", "contract", "create"},
 	"list_goods_receipts":        {"purchase", "receipt", "read"},
 	"list_purchase_requisitions": {"purchase", "requisition", "read"},
 	"list_rfqs":                  {"purchase", "rfq", "read"},

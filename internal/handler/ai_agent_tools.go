@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -146,12 +147,20 @@ func agentTools() []agentTool {
 		},
 		{
 			name:        "list_contracts",
-			description: "Procurement contracts with vendors (number, vendor, title, type, start/end dates, value, status). Set expiring_within_days to only show active contracts ending soon (renewal watch).",
+			description: "Contracts registry (number, counterparty, title, direction kirim/chiqim, start/end dates, value, status). Filter by status or counterparty name; set expiring_within_days to only show active contracts ending soon (renewal watch).",
 			parameters: obj(map[string]interface{}{
+				"status":               str("Optional status filter: draft, negotiation, signing, active, completed, cancelled, expired."),
+				"counterparty":         str("Optional counterparty (contact) name filter."),
 				"expiring_within_days": intp("Only active contracts whose end_date is within this many days from today."),
 				"limit":                intp("Max rows (default 15, max 50)."),
 			}),
 			exec: toolListContracts,
+		},
+		{
+			name:        "get_contract",
+			description: "Full detail of ONE contract by its number: counterparty, direction, status, dates, value, effective amount (with amendments), paid total and outstanding balance.",
+			parameters:  obj(map[string]interface{}{"contract_number": str("The contract number.")}, "contract_number"),
+			exec:        toolGetContract,
 		},
 		{
 			name:        "get_purchase_order",
@@ -295,6 +304,21 @@ func agentTools() []agentTool {
 				"inn":   str("Optional tax id / INN."),
 			}, "name", "type"),
 			exec: toolCreateContact,
+		},
+		{
+			name:        "create_contract",
+			description: "Create a new DRAFT contract with an existing counterparty. Requires confirmation before it runs. The contract number is auto-generated.",
+			mutating:    true,
+			parameters: obj(map[string]interface{}{
+				"title":        str("Contract title/name."),
+				"counterparty": str("Existing contact name (the counterparty)."),
+				"direction":    map[string]interface{}{"type": "string", "enum": []string{"income", "expense"}, "description": "income = kirim (customer pays us), expense = chiqim (we pay). Default expense."},
+				"start_date":   str("Start date YYYY-MM-DD (default today)."),
+				"end_date":     str("Optional end date YYYY-MM-DD (omit for muddatsiz)."),
+				"value":        map[string]interface{}{"type": "number", "description": "Contract amount."},
+				"currency":     str("Currency code, default UZS."),
+			}, "title", "counterparty"),
+			exec: toolCreateContract,
 		},
 		{
 			name:        "create_sales_order",
@@ -1315,25 +1339,144 @@ func toolListFixedAssets(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg 
 
 func toolListContracts(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	limit := argInt(args, "limit", 15, 50)
-	qry := `SELECT COALESCE(contract_number,''), COALESCE(vendor_name,''), COALESCE(title,''), COALESCE(contract_type,''),
+	qry := `SELECT COALESCE(contract_number,''), COALESCE(vendor_name,''), COALESCE(title,''), COALESCE(direction,'expense'),
 	               start_date, end_date, COALESCE(value,0), COALESCE(currency,'UZS'), COALESCE(status,'')
-	        FROM procurement_contracts WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	        FROM procurement_contracts WHERE tenant_id=$1 AND deleted_at IS NULL AND archived_at IS NULL
+	          AND ($2::uuid IS NULL OR organization_id=$2)`
 	qa := []interface{}{tenantID, orgArg}
+	if st := argStr(args, "status"); st != "" {
+		qa = append(qa, st)
+		qry += fmt.Sprintf(" AND status=$%d", len(qa))
+	}
+	if cp := argStr(args, "counterparty"); cp != "" {
+		qa = append(qa, cp)
+		qry += fmt.Sprintf(" AND vendor_name ILIKE '%%'||$%d||'%%'", len(qa))
+	}
 	if d := argInt(args, "expiring_within_days", 0, 3650); d > 0 {
 		qry += fmt.Sprintf(" AND status='active' AND end_date IS NOT NULL AND end_date <= CURRENT_DATE + %d", d)
 	}
 	qry += fmt.Sprintf(" ORDER BY end_date ASC NULLS LAST LIMIT %d", limit)
 	rows, err := h.db.Query(qry, qa...)
 	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
-		var num, vend, title, ctype, cur, st string
+		var num, vend, title, direction, cur, st string
 		var start, end interface{}
 		var val float64
-		if r.Scan(&num, &vend, &title, &ctype, &start, &end, &val, &cur, &st) != nil {
+		if r.Scan(&num, &vend, &title, &direction, &start, &end, &val, &cur, &st) != nil {
 			return nil, false
 		}
-		return gin.H{"contract_number": num, "vendor": vend, "title": title, "type": ctype,
+		return gin.H{"contract_number": num, "counterparty": vend, "title": title, "direction": direction,
 			"start_date": start, "end_date": end, "value": val, "currency": cur, "status": st}, true
 	})
+}
+
+func toolGetContract(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	num := argStr(args, "contract_number")
+	if num == "" {
+		return nil, fmt.Errorf("contract_number is required")
+	}
+	var (
+		id                                       uuid.UUID
+		title, vendor, direction, status, cur    string
+		value, effective, paid                   float64
+		start                                    interface{}
+		end, signed                              interface{}
+		respName                                 sql.NullString
+	)
+	err := h.db.QueryRow(`
+		SELECT c.id, COALESCE(c.title,''), COALESCE(v.name, c.vendor_name, ''), COALESCE(c.direction,'expense'),
+		       COALESCE(c.status,''), COALESCE(c.currency,'UZS'), COALESCE(c.value,0),
+		       COALESCE(c.value,0) + COALESCE((SELECT SUM(a.amount_delta) FROM contract_amendments a
+		           WHERE a.contract_id = c.id AND a.deleted_at IS NULL), 0),
+		       COALESCE((SELECT SUM(x.amount_paid) FROM (
+		           SELECT si.amount_paid FROM sales_invoices si WHERE si.contract_id=c.id AND si.deleted_at IS NULL AND si.status<>'cancelled'
+		           UNION ALL
+		           SELECT pi.amount_paid FROM purchase_invoices pi WHERE pi.contract_id=c.id AND pi.deleted_at IS NULL AND pi.status<>'cancelled') x), 0),
+		       c.start_date, c.end_date, c.signed_date,
+		       TRIM(COALESCE(e.first_name,'')||' '||COALESCE(e.last_name,''))
+		FROM procurement_contracts c
+		LEFT JOIN contacts v ON v.id = c.vendor_id AND v.tenant_id = c.tenant_id
+		LEFT JOIN employees e ON e.id = c.responsible_employee_id AND e.tenant_id = c.tenant_id
+		WHERE c.tenant_id=$1 AND c.contract_number=$2 AND c.deleted_at IS NULL
+		  AND ($3::uuid IS NULL OR c.organization_id=$3)
+	`, tenantID, num, orgArg).Scan(&id, &title, &vendor, &direction, &status, &cur, &value,
+		&effective, &paid, &start, &end, &signed, &respName)
+	if err == sql.ErrNoRows {
+		return gin.H{"found": false, "contract_number": num}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return gin.H{
+		"found": true, "id": id.String(), "contract_number": num, "title": title,
+		"counterparty": vendor, "direction": direction, "status": status,
+		"value": value, "effective_amount": effective, "paid_total": paid,
+		"outstanding": effective - paid, "currency": cur,
+		"start_date": start, "end_date": end, "signed_date": signed,
+		"responsible": respName.String,
+	}, nil
+}
+
+func toolCreateContract(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	title := argStr(args, "title")
+	if title == "" {
+		return nil, fmt.Errorf("title is required")
+	}
+	contactID, contactName, err := resolveContactID(h, tenantID, argStr(args, "counterparty"), "")
+	if err != nil {
+		return nil, err
+	}
+	direction := argStr(args, "direction")
+	if direction != "income" && direction != "expense" {
+		direction = "expense"
+	}
+	startDate := time.Now()
+	if s := argStr(args, "start_date"); s != "" {
+		if d, perr := time.Parse("2006-01-02", s); perr == nil {
+			startDate = d
+		} else {
+			return nil, fmt.Errorf("invalid start_date, expected YYYY-MM-DD")
+		}
+	}
+	var endDate interface{}
+	if s := argStr(args, "end_date"); s != "" {
+		d, perr := time.Parse("2006-01-02", s)
+		if perr != nil {
+			return nil, fmt.Errorf("invalid end_date, expected YYYY-MM-DD")
+		}
+		endDate = d
+	}
+	value := 0.0
+	if v, okV := args["value"].(float64); okV && v >= 0 {
+		value = v
+	}
+	currency := argStr(args, "currency")
+	if currency == "" {
+		currency = "UZS"
+	}
+
+	id := uuid.New()
+	number := h.nextContractNumber(tenantID)
+	if _, err := h.db.Exec(`
+		INSERT INTO procurement_contracts (
+			id, tenant_id, organization_id, contract_number, title, vendor_id, vendor_name,
+			direction, contract_type, status, start_date, end_date, value, currency,
+			created_by, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'fixed','draft',$9,$10,$11,$12,$13,NOW(),NOW())
+	`, id, tenantID, orgArg, number, title, contactID, contactName,
+		direction, startDate, endDate, value, currency, userID); err != nil {
+		return nil, err
+	}
+
+	h.contractAudit(tenantID, userID, id, "create", nil, map[string]interface{}{
+		"contract_number": number, "title": title, "vendor_name": contactName, "via": "ai_assistant",
+	})
+	h.EmitWorkflowEvent(tenantID, "contracts.created", map[string]interface{}{
+		"record_id": id.String(), "contract_number": number, "title": title,
+		"contact_name": contactName, "value": value, "direction": direction,
+	})
+
+	return gin.H{"id": id.String(), "contract_number": number, "title": title,
+		"counterparty": contactName, "status": "draft", "created": true}, nil
 }
 
 func toolGetPurchaseOrder(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {

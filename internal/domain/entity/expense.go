@@ -17,6 +17,9 @@ type ExpenseCategory struct {
 	ParentID    *uuid.UUID   `json:"parent_id,omitempty" db:"parent_id"`
 	AccountID   *uuid.UUID   `json:"account_id,omitempty" db:"account_id"`
 	IsActive    bool         `json:"is_active" db:"is_active"`
+	Color       string       `json:"color" db:"color"`
+	Icon        string       `json:"icon" db:"icon"`
+	Position    int          `json:"position" db:"position"`
 	CreatedAt   time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt   time.Time    `json:"updated_at" db:"updated_at"`
 }
@@ -51,6 +54,15 @@ type Expense struct {
 	ReimbursedDate *time.Time  `json:"reimbursed_date,omitempty" db:"reimbursed_date"`
 	ApprovedBy    *uuid.UUID   `json:"approved_by,omitempty" db:"approved_by"`
 	ApprovedAt    *time.Time   `json:"approved_at,omitempty" db:"approved_at"`
+	// Lifecycle v2 (migration 444)
+	SubmittedAt      *time.Time `json:"submitted_at,omitempty" db:"submitted_at"`
+	RejectedBy       *uuid.UUID `json:"rejected_by,omitempty" db:"rejected_by"`
+	RejectedAt       *time.Time `json:"rejected_at,omitempty" db:"rejected_at"`
+	RejectionReason  *string    `json:"rejection_reason,omitempty" db:"rejection_reason"`
+	PaidAt           *time.Time `json:"paid_at,omitempty" db:"paid_at"`
+	PaidBy           *uuid.UUID `json:"paid_by,omitempty" db:"paid_by"`
+	PaymentAccountID *uuid.UUID `json:"payment_account_id,omitempty" db:"payment_account_id"`
+	JournalEntryID   *uuid.UUID `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
 	Notes         *string      `json:"notes,omitempty" db:"notes"`
 	CreatedBy     *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt     time.Time    `json:"created_at" db:"created_at"`
@@ -58,13 +70,19 @@ type Expense struct {
 	DeletedAt     sql.NullTime `json:"-" db:"deleted_at"`
 
 	// Computed fields
-	CategoryName string `json:"category_name,omitempty"`
+	CategoryName  string `json:"category_name,omitempty"`
+	CategoryColor string `json:"category_color,omitempty"`
+	CategoryIcon  string `json:"category_icon,omitempty"`
 }
 
-// CreateExpenseInput represents input for creating an expense
+// CreateExpenseInput represents input for creating an expense.
+// v2: CategoryID is validated as required in the handler (kept optional
+// here so the error message is friendlier than gin's binding error).
+// Status may be "draft" or "submitted" (default "submitted").
 type CreateExpenseInput struct {
 	CategoryID    string  `json:"category_id,omitempty"`
 	CategoryName  string  `json:"category,omitempty"` // Allow passing category name
+	Status        string  `json:"status,omitempty"`
 	EmployeeID    string  `json:"employee_id,omitempty"`
 	EmployeeName  string  `json:"employee_name,omitempty"`
 	VendorID      string  `json:"vendor_id,omitempty"`
@@ -84,7 +102,10 @@ type CreateExpenseInput struct {
 	Notes         string  `json:"notes,omitempty"`
 }
 
-// UpdateExpenseInput represents input for updating an expense
+// UpdateExpenseInput represents input for updating an expense.
+// v2: Status was removed on purpose — lifecycle transitions go through
+// the dedicated /submit, /approve, /reject, /pay endpoints so the
+// server-side rules can't be bypassed with a bare PUT.
 type UpdateExpenseInput struct {
 	CategoryID    *string  `json:"category_id,omitempty"`
 	CategoryName  *string  `json:"category,omitempty"`
@@ -100,20 +121,25 @@ type UpdateExpenseInput struct {
 	PaymentMethod *string  `json:"payment_method,omitempty"`
 	Reference     *string  `json:"reference,omitempty"`
 	ReceiptURL    *string  `json:"receipt_url,omitempty"`
-	Status        *string  `json:"status,omitempty"`
 	Reimbursable  *bool    `json:"reimbursable,omitempty"`
 	IsRecognized  *bool    `json:"is_recognized,omitempty"`
 	Notes         *string  `json:"notes,omitempty"`
 }
 
-// ExpenseResponse represents the API response for an expense
+// ExpenseResponse represents the API response for an expense.
+// v2 note: "category" and "employee_name" are ALWAYS serialized (no
+// omitempty) — the old omitempty made empty categories vanish from the
+// JSON, which the frontend then coerced to a fake "Boshqa" category
+// (the one-slice donut bug, audit §2.1).
 type ExpenseResponse struct {
 	ID            uuid.UUID `json:"id"`
 	ExpenseNumber string    `json:"expense_number"`
 	CategoryID    string    `json:"category_id,omitempty"`
-	CategoryName  string    `json:"category,omitempty"`
+	CategoryName  string    `json:"category"`
+	CategoryColor string    `json:"category_color,omitempty"`
+	CategoryIcon  string    `json:"category_icon,omitempty"`
 	EmployeeID    string    `json:"employee_id,omitempty"`
-	EmployeeName  string    `json:"employee_name,omitempty"`
+	EmployeeName  string    `json:"employee_name"`
 	VendorID      string    `json:"vendor_id,omitempty"`
 	VendorName    string    `json:"vendor_name,omitempty"`
 	ExpenseDate   string    `json:"date"`
@@ -129,8 +155,19 @@ type ExpenseResponse struct {
 	Reimbursable  bool      `json:"reimbursable"`
 	IsRecognized  bool      `json:"is_recognized"`
 	Notes         string    `json:"notes,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	// Lifecycle v2
+	SubmittedAt        *time.Time `json:"submitted_at,omitempty"`
+	ApprovedAt         *time.Time `json:"approved_at,omitempty"`
+	RejectedAt         *time.Time `json:"rejected_at,omitempty"`
+	RejectionReason    string     `json:"rejection_reason,omitempty"`
+	PaidAt             *time.Time `json:"paid_at,omitempty"`
+	PaymentAccountID   string     `json:"payment_account_id,omitempty"`
+	PaymentAccountName string     `json:"payment_account_name,omitempty"`
+	JournalEntryID     string     `json:"journal_entry_id,omitempty"`
+	JournalEntryNumber string     `json:"journal_entry_number,omitempty"`
+	CreatedBy          string     `json:"created_by,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 // ToResponse converts Expense to ExpenseResponse
@@ -148,6 +185,12 @@ func (e *Expense) ToResponse() *ExpenseResponse {
 		Reimbursable:  e.Reimbursable,
 		IsRecognized:  e.IsRecognized,
 		CategoryName:  e.CategoryName,
+		CategoryColor: e.CategoryColor,
+		CategoryIcon:  e.CategoryIcon,
+		SubmittedAt:   e.SubmittedAt,
+		ApprovedAt:    e.ApprovedAt,
+		RejectedAt:    e.RejectedAt,
+		PaidAt:        e.PaidAt,
 		CreatedAt:     e.CreatedAt,
 		UpdatedAt:     e.UpdatedAt,
 	}
@@ -179,6 +222,18 @@ func (e *Expense) ToResponse() *ExpenseResponse {
 	if e.Notes != nil {
 		resp.Notes = *e.Notes
 	}
+	if e.RejectionReason != nil {
+		resp.RejectionReason = *e.RejectionReason
+	}
+	if e.PaymentAccountID != nil {
+		resp.PaymentAccountID = e.PaymentAccountID.String()
+	}
+	if e.JournalEntryID != nil {
+		resp.JournalEntryID = e.JournalEntryID.String()
+	}
+	if e.CreatedBy != nil {
+		resp.CreatedBy = e.CreatedBy.String()
+	}
 
 	return resp
 }
@@ -197,6 +252,9 @@ type ExpenseCategoryResponse struct {
 	AccountCode string    `json:"account_code,omitempty"`
 	AccountName string    `json:"account_name,omitempty"`
 	IsActive    bool      `json:"is_active"`
+	Color       string    `json:"color,omitempty"`
+	Icon        string    `json:"icon,omitempty"`
+	Position    int       `json:"position"`
 	UsageCount  int       `json:"usage_count"`
 }
 
@@ -207,6 +265,9 @@ func (c *ExpenseCategory) ToResponse() *ExpenseCategoryResponse {
 		Code:     c.Code,
 		Name:     c.Name,
 		IsActive: c.IsActive,
+		Color:    c.Color,
+		Icon:     c.Icon,
+		Position: c.Position,
 	}
 	if c.Description != nil {
 		resp.Description = *c.Description

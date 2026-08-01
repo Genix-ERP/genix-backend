@@ -477,6 +477,12 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		UpdatedAt:        now,
 	}
 
+	h.EmitWorkflowEvent(tenantID, "employee.created", map[string]interface{}{
+		"record_id":     id.String(),
+		"employee_name": strings.TrimSpace(firstName + " " + lastName),
+		"position":      jobTitle,
+	})
+
 	response.Created(c, emp.ToResponse())
 }
 
