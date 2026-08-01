@@ -38,6 +38,9 @@ BEGIN
     DELETE FROM journal_entries WHERE tenant_id = v_tid;
     DELETE FROM products WHERE tenant_id = v_tid;
     DELETE FROM product_categories WHERE tenant_id = v_tid;
+    DELETE FROM workflow_logs WHERE tenant_id = v_tid;
+    DELETE FROM workflow_fired_markers WHERE tenant_id = v_tid;
+    DELETE FROM workflow_rules WHERE tenant_id = v_tid;
     DELETE FROM bank_accounts WHERE tenant_id = v_tid;
     DELETE FROM payment_methods WHERE tenant_id = v_tid;
     DELETE FROM contacts WHERE tenant_id = v_tid;
@@ -264,7 +267,7 @@ BEGIN
         "inventory": {"view": true, "create": true, "delete": true, "update": true},
         "financials": {"view": true, "create": true, "delete": true, "update": true},
         "manufacturing": {"view": true, "create": true, "delete": true, "update": true},
-        "projects": {"view": true, "create": true, "delete": true, "update": true},
+        "tasks": {"view": true, "create": true, "delete": true, "update": true},
         "settings": {"view": true, "create": true, "delete": true, "update": true}
     }'::jsonb, updated_at = NOW()
     WHERE tenant_id = v_tenant_id AND code = 'owner';
@@ -839,6 +842,113 @@ BEGIN
     RAISE NOTICE '  Account balances recalculated';
     RAISE NOTICE '================================================';
 
+END;
+$$;
+
+-- ============================================================================
+-- ISH JARAYONLARI: demo automation rules
+-- ============================================================================
+DO $$
+DECLARE
+    v_tid UUID := 'df372dc3-0b77-4ec6-aef3-c1145ecbeaac';
+    v_user_id UUID := '43aa617b-1df4-463e-84cf-baf71a982e20';
+BEGIN
+    INSERT INTO workflow_rules (id, tenant_id, name, description, category, trigger_type,
+        trigger_event, conditions, actions, is_active, priority, created_by, created_at, updated_at)
+    VALUES
+    (uuid_generate_v4(), v_tid,
+     'Zaxira kamaysa — bildirishnoma',
+     'Mahsulot zaxirasi qayta buyurtma nuqtasidan pastga tushganda barcha foydalanuvchilarga bildirishnoma yuboradi',
+     'inventory', 'event', 'inventory.low_stock',
+     '{}',
+     '[{"type":"create_notification","config":{"recipient_type":"all","title":"Zaxira kam: {{product_name}}","message":"{{product_name}} ({{product_code}}) zaxirasi {{available}} donagacha kamaydi (chegara: {{reorder_point}})."}}]',
+     true, 0, v_user_id, NOW(), NOW()),
+    (uuid_generate_v4(), v_tid,
+     'Yangi lid — sotuv jamoasiga xabar',
+     'CRM''da yangi lid yaratilganda administratorlarga bildirishnoma yuboradi',
+     'crm', 'event', 'lead.created',
+     '{}',
+     '[{"type":"create_notification","config":{"recipient_type":"roles","roles":["owner","admin"],"title":"Yangi lid: {{contact_name}}","message":"{{company_name}} kompaniyasidan yangi lid keldi ({{source}}). Kutilayotgan qiymat: {{expected_value}} so''m."}}]',
+     true, 0, v_user_id, NOW(), NOW()),
+    (uuid_generate_v4(), v_tid,
+     'Hisob-faktura muddati o''tdi — eslatma',
+     'To''lanmagan hisob-faktura muddati o''tganda (har bir faktura uchun bir marta) egasiga bildirishnoma yuboradi',
+     'sales', 'scheduled', 'invoice.overdue',
+     '{"logic":"and","conditions":[{"field":"total_amount","operator":"gt","value":0}]}',
+     '[{"type":"create_notification","config":{"recipient_type":"roles","roles":["owner","admin"],"title":"Muddati o''tgan faktura: {{invoice_number}}","message":"{{customer_name}} uchun {{invoice_number}} fakturaning muddati {{days_overdue}} kun oldin o''tgan. Summa: {{total_amount}} so''m."}}]',
+     true, 0, v_user_id, NOW(), NOW());
+
+    RAISE NOTICE '  3 demo automation rules created';
+END;
+$$;
+
+-- ============================================================================
+-- SHARTNOMALAR: demo contracts (statuses across the lifecycle; one expiring
+-- soon, one with an amendment) — see docs/shartnomalar-changelog.md
+-- ============================================================================
+DO $$
+DECLARE
+    v_tid UUID := 'df372dc3-0b77-4ec6-aef3-c1145ecbeaac';
+    v_org_id UUID := '043e7051-6765-4431-92ac-015773fe9e0b';
+    v_user_id UUID := '43aa617b-1df4-463e-84cf-baf71a982e20';
+    v_customer1 UUID;
+    v_customer2 UUID;
+    v_vendor1 UUID;
+    v_vendor2 UUID;
+    v_resp UUID;
+    v_c1 UUID := uuid_generate_v4();
+    v_c2 UUID := uuid_generate_v4();
+    v_c3 UUID := uuid_generate_v4();
+    v_c4 UUID := uuid_generate_v4();
+BEGIN
+    -- Reset previous demo contracts (children cascade).
+    DELETE FROM procurement_contracts WHERE tenant_id = v_tid;
+
+    SELECT id INTO v_customer1 FROM contacts WHERE tenant_id = v_tid AND code = 'C-001';
+    SELECT id INTO v_customer2 FROM contacts WHERE tenant_id = v_tid AND code = 'C-002';
+    SELECT id INTO v_vendor1   FROM contacts WHERE tenant_id = v_tid AND code = 'V-001';
+    SELECT id INTO v_vendor2   FROM contacts WHERE tenant_id = v_tid AND code = 'V-002';
+    SELECT id INTO v_resp      FROM employees WHERE tenant_id = v_tid AND deleted_at IS NULL ORDER BY created_at LIMIT 1;
+
+    IF v_customer1 IS NULL OR v_vendor1 IS NULL THEN
+        RAISE NOTICE '  Shartnomalar seed skipped: demo contacts missing';
+        RETURN;
+    END IF;
+
+    INSERT INTO procurement_contracts (
+        id, tenant_id, organization_id, contract_number, title, vendor_id, vendor_name,
+        direction, contract_type, status, start_date, end_date, signed_date,
+        value, currency, description, responsible_employee_id, created_by, created_at, updated_at
+    ) VALUES
+    -- 1. Amaldagi bosh pudrat (income) with an amendment below
+    (v_c1, v_tid, v_org_id, 'CNT-2026-0001', 'Bosh pudrat shartnomasi — Yunusobod TJM',
+     v_customer1, 'Toshkent Savdo LLC', 'income', 'project', 'active',
+     CURRENT_DATE - 60, CURRENT_DATE + 200, CURRENT_DATE - 58,
+     250000000, 'UZS', 'Yunusobod savdo markazi qurilishi bo''yicha bosh pudrat',
+     v_resp, v_user_id, NOW() - INTERVAL '60 days', NOW()),
+    -- 2. Ta'minot shartnomasi (expense) — expiring within 30 days
+    (v_c2, v_tid, v_org_id, 'CNT-2026-0002', 'Qurilish materiallari ta''minoti',
+     v_vendor1, 'China Import Group', 'expense', 'annual', 'active',
+     CURRENT_DATE - 340, CURRENT_DATE + 20, CURRENT_DATE - 338,
+     80000000, 'UZS', 'Sement va armatura yetkazib berish bo''yicha yillik shartnoma',
+     v_resp, v_user_id, NOW() - INTERVAL '340 days', NOW()),
+    -- 3. Qoralama (income, muddatsiz)
+    (v_c3, v_tid, v_org_id, 'CNT-2026-0003', 'Servis xizmatlari shartnomasi',
+     v_customer2, 'Samarkand Electronics', 'income', 'monthly', 'draft',
+     CURRENT_DATE + 7, NULL, NULL,
+     45000000, 'UZS', 'Oylik texnik xizmat ko''rsatish', v_resp, v_user_id, NOW() - INTERVAL '3 days', NOW()),
+    -- 4. Yakunlangan (expense)
+    (v_c4, v_tid, v_org_id, 'CNT-2025-0090', 'Uskunalar xaridi shartnomasi',
+     v_vendor2, 'Korea Tech Supply', 'expense', 'fixed', 'completed',
+     CURRENT_DATE - 400, CURRENT_DATE - 40, CURRENT_DATE - 398,
+     30000000, 'UZS', 'Ishlab chiqarish uskunalari xaridi', v_resp, v_user_id, NOW() - INTERVAL '400 days', NOW());
+
+    -- Amendment on the bosh pudrat: scope extension +25M
+    INSERT INTO contract_amendments (id, tenant_id, contract_id, number, date, amount_delta, description, created_by)
+    VALUES (uuid_generate_v4(), v_tid, v_c1, 'Ilova 1', CURRENT_DATE - 20, 25000000,
+            'Qo''shimcha qavat pardozlash ishlari', v_user_id);
+
+    RAISE NOTICE '  4 demo contracts + 1 amendment created';
 END;
 $$;
 

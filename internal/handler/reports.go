@@ -2009,6 +2009,11 @@ type directorCompanySummary struct {
 	SalaryFund           float64                      `json:"salary_fund"`
 	TopStockProducts     []directorTopStockProduct    `json:"top_stock_products"`
 	ConstructionProjects []directorConstructionProjct `json:"construction_projects"`
+	// Shartnomalar aggregates (active = amaldagi, expiring = ≤30 days)
+	ActiveContracts      int     `json:"active_contracts"`
+	ActiveContractsValue float64 `json:"active_contracts_value"`
+	ExpiringContracts    int     `json:"expiring_contracts"`
+	ContractsOutstanding float64 `json:"contracts_outstanding"`
 }
 
 type directorTopStockProduct struct {
@@ -2386,6 +2391,54 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 			})
 		}
 		projRows.Close()
+	}
+
+	// 9. Shartnomalar aggregates per org — amaldagi shartnomalar summasi,
+	// muddati tugayotganlar soni, to'lanmagan qoldiq.
+	contractRows, err := h.db.Query(`
+		SELECT c.organization_id,
+		       COUNT(*) FILTER (WHERE c.status = 'active'),
+		       COALESCE(SUM(COALESCE(c.value, 0) + am.delta_sum) FILTER (WHERE c.status = 'active'), 0),
+		       COUNT(*) FILTER (WHERE c.status = 'active' AND c.end_date IS NOT NULL
+		           AND c.end_date >= CURRENT_DATE AND c.end_date <= CURRENT_DATE + INTERVAL '30 days'),
+		       COALESCE(SUM(COALESCE(c.value, 0) + am.delta_sum - inv.paid_total) FILTER (WHERE c.status = 'active'), 0)
+		FROM procurement_contracts c
+		LEFT JOIN LATERAL (
+			SELECT COALESCE(SUM(a.amount_delta), 0) AS delta_sum
+			FROM contract_amendments a WHERE a.contract_id = c.id AND a.deleted_at IS NULL
+		) am ON true
+		LEFT JOIN LATERAL (
+			SELECT COALESCE(SUM(x.amount_paid), 0) AS paid_total FROM (
+				SELECT si.amount_paid FROM sales_invoices si
+				WHERE si.contract_id = c.id AND si.deleted_at IS NULL AND si.status <> 'cancelled'
+				UNION ALL
+				SELECT pi.amount_paid FROM purchase_invoices pi
+				WHERE pi.contract_id = c.id AND pi.deleted_at IS NULL AND pi.status <> 'cancelled'
+			) x
+		) inv ON true
+		WHERE c.tenant_id = $1 AND c.deleted_at IS NULL AND c.archived_at IS NULL
+		  AND c.organization_id IS NOT NULL
+		GROUP BY c.organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for contractRows.Next() {
+			var orgID uuid.UUID
+			var active, expiring int
+			var activeValue, outstanding float64
+			if err := contractRows.Scan(&orgID, &active, &activeValue, &expiring, &outstanding); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.ActiveContracts = active
+			s.ActiveContractsValue = activeValue
+			s.ExpiringContracts = expiring
+			s.ContractsOutstanding = outstanding
+		}
+		contractRows.Close()
 	}
 
 	// Compute profit and round output

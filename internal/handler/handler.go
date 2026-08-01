@@ -863,17 +863,44 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		rfqs.POST("/:id/convert-to-po", h.perm.Require("purchase", "purchase_order", "create"), h.ConvertRFQToPO)
 	}
 
-	// Procurement Contracts
+	// Shartnomalar (Contracts) — registry, lifecycle, amendments, files,
+	// links, invoices rollup, tasks, activity, AI. See handler/contracts*.go.
 	contracts := rg.Group("/contracts")
 	contracts.Use(h.perm.Require("purchase", "contract", "read"))
 	{
 		contracts.GET("", h.ListContracts)
+		contracts.GET("/stats", h.GetContractStats)
+		contracts.GET("/next-number", h.GetNextContractNumber)
 		contracts.POST("", h.perm.Require("purchase", "contract", "create"), h.CreateContract)
+		contracts.POST("/ai/extract", h.perm.Require("purchase", "contract", "create"), h.ExtractContractFromDocument)
 		contracts.GET("/:id", h.GetContract)
 		contracts.PUT("/:id", h.perm.Require("purchase", "contract", "update"), h.UpdateContract)
 		contracts.DELETE("/:id", h.perm.Require("purchase", "contract", "delete"), h.DeleteContract)
+		contracts.POST("/:id/status", h.perm.Require("purchase", "contract", "update"), h.ChangeContractStatus)
+		contracts.POST("/:id/archive", h.perm.Require("purchase", "contract", "delete"), h.ArchiveContract)
+		contracts.POST("/:id/unarchive", h.perm.Require("purchase", "contract", "delete"), h.UnarchiveContract)
+		// legacy aliases (map onto the validated transition path)
 		contracts.POST("/:id/activate", h.perm.Require("purchase", "contract", "update"), h.ActivateContract)
 		contracts.POST("/:id/terminate", h.perm.Require("purchase", "contract", "update"), h.TerminateContract)
+		// amendments (ilova / qo'shimcha kelishuv)
+		contracts.GET("/:id/amendments", h.ListContractAmendments)
+		contracts.POST("/:id/amendments", h.perm.Require("purchase", "contract", "update"), h.CreateContractAmendment)
+		contracts.PUT("/:id/amendments/:amendmentId", h.perm.Require("purchase", "contract", "update"), h.UpdateContractAmendment)
+		contracts.DELETE("/:id/amendments/:amendmentId", h.perm.Require("purchase", "contract", "update"), h.DeleteContractAmendment)
+		// versioned files
+		contracts.GET("/:id/files", h.ListContractFiles)
+		contracts.POST("/:id/files", h.perm.Require("purchase", "contract", "update"), h.UploadContractFile)
+		contracts.GET("/:id/files/:fileId/download", h.DownloadContractFile)
+		contracts.POST("/:id/files/:fileId/summary", h.SummarizeContractFile)
+		contracts.DELETE("/:id/files/:fileId", h.perm.Require("purchase", "contract", "delete"), h.DeleteContractFile)
+		// cross-module links, payments, tasks, history
+		contracts.GET("/:id/links", h.ListContractLinks)
+		contracts.POST("/:id/links", h.perm.Require("purchase", "contract", "update"), h.CreateContractLink)
+		contracts.DELETE("/:id/links/:linkId", h.perm.Require("purchase", "contract", "update"), h.DeleteContractLink)
+		contracts.GET("/:id/invoices", h.ListContractInvoices)
+		contracts.POST("/:id/invoices", h.perm.Require("purchase", "contract", "update"), h.AttachContractInvoice)
+		contracts.GET("/:id/tasks", h.ListContractTasks)
+		contracts.GET("/:id/activity", h.GetContractActivity)
 	}
 
 	// Supplier Price History
@@ -1370,6 +1397,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		employees.PUT("/:id/permissions/module", h.perm.Require("hr", "employee", "update"), h.UpdateEmployeeModulePermission)
 		employees.DELETE("/:id/permissions", h.perm.Require("hr", "employee", "delete"), h.DeleteEmployeePermissions)
 		// Employee deductions
+		// Vazifalar integration — open tasks for the HR profile "Vazifalar" tab
+		employees.GET("/:id/tasks", h.ListEmployeeTasks)
+
 		employees.GET("/:id/deductions", h.ListEmployeeDeductions)
 		employees.POST("/:id/deductions/:did/cancel", h.perm.Require("hr", "employee", "update"), h.CancelDeduction)
 		// Salary calculation with deductions
@@ -1449,10 +1479,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workflowRules.GET("/:id", h.GetWorkflowRule)
 		workflowRules.PUT("/:id", h.perm.Require("workflow", "workflow", "update"), h.UpdateWorkflowRule)
 		workflowRules.DELETE("/:id", h.perm.Require("workflow", "workflow", "delete"), h.DeleteWorkflowRule)
+		workflowRules.POST("/:id/test", h.perm.Require("workflow", "workflow", "update"), h.TestWorkflowRule)
+		workflowRules.POST("/:id/duplicate", h.perm.Require("workflow", "workflow", "create"), h.DuplicateWorkflowRule)
 	}
+
+	// Workflow trigger-event catalog
+	rg.GET("/workflow-events", h.perm.Require("workflow", "workflow", "read"), h.ListWorkflowEvents)
 
 	// Workflow Logs
 	rg.GET("/workflow-logs", h.perm.Require("workflow", "workflow", "read"), h.ListWorkflowLogs)
+	rg.POST("/workflow-logs/:id/retry", h.perm.Require("workflow", "workflow", "update"), h.RetryWorkflowLog)
 
 	// AI Assistant — accessible to all authenticated users
 	ai := rg.Group("/ai")
@@ -1957,42 +1993,59 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 	rg.GET("/asset-mapping/accounts", h.ListChartAccountsFiltered)
 
-	// Projects
-	projects := rg.Group("/projects")
-	projects.Use(h.perm.Require("projects", "project", "read"))
+	// =====================================================
+	// VAZIFALAR (TASK MANAGEMENT) MODULE ROUTES
+	// =====================================================
+	// /api/v1/tasks is occupied by CRM tasks, hence /task-boards.
+
+	// "My tasks" — cross-board list for the calling user
+	rg.GET("/my-tasks", h.perm.Require("tasks", "task", "read"), h.ListMyTasks)
+
+	taskBoards := rg.Group("/task-boards")
+	taskBoards.Use(h.perm.Require("tasks", "board", "read"))
 	{
-		projects.GET("", h.ListProjects)
-		projects.GET("/by-organization", h.ListProjectsByOrganization)
-		projects.POST("", h.perm.Require("projects", "project", "create"), h.CreateProject)
-		projects.GET("/:id", h.GetProject)
-		projects.PUT("/:id", h.perm.Require("projects", "project", "update"), h.UpdateProject)
-		projects.DELETE("/:id", h.perm.Require("projects", "project", "delete"), h.DeleteProject)
+		taskBoards.GET("", h.ListTaskBoards)
+		taskBoards.GET("/stats", h.GetTaskModuleStats)
+		taskBoards.POST("", h.perm.Require("tasks", "board", "create"), h.CreateTaskBoard)
+		taskBoards.GET("/:id", h.GetTaskBoard)
+		taskBoards.PUT("/:id", h.perm.Require("tasks", "board", "update"), h.UpdateTaskBoard)
+		taskBoards.DELETE("/:id", h.perm.Require("tasks", "board", "delete"), h.DeleteTaskBoard)
 
-		// Project Tasks
-		projects.GET("/:id/tasks", h.ListProjectTasks)
-		projects.POST("/:id/tasks", h.perm.Require("projects", "task", "create"), h.CreateProjectTask)
-		projects.PUT("/:id/tasks/:taskId", h.perm.Require("projects", "task", "update"), h.UpdateProjectTask)
-		projects.DELETE("/:id/tasks/:taskId", h.perm.Require("projects", "task", "delete"), h.DeleteProjectTask)
+		// Columns — dynamic, server-side gated ("manage board" capability)
+		taskBoards.POST("/:id/columns", h.perm.Require("tasks", "column", "create"), h.CreateTaskColumn)
+		taskBoards.PUT("/:id/columns/reorder", h.perm.Require("tasks", "column", "update"), h.ReorderTaskColumns)
+		taskBoards.PUT("/:id/columns/:columnId", h.perm.Require("tasks", "column", "update"), h.UpdateTaskColumn)
+		taskBoards.DELETE("/:id/columns/:columnId", h.perm.Require("tasks", "column", "delete"), h.DeleteTaskColumn)
 
-		// Project Milestones
-		projects.GET("/:id/milestones", h.ListProjectMilestones)
-		projects.POST("/:id/milestones", h.perm.Require("projects", "milestone", "create"), h.CreateProjectMilestone)
-		projects.PUT("/:id/milestones/:milestoneId", h.perm.Require("projects", "milestone", "update"), h.UpdateProjectMilestone)
-		projects.DELETE("/:id/milestones/:milestoneId", h.perm.Require("projects", "milestone", "delete"), h.DeleteProjectMilestone)
+		// Tasks
+		taskBoards.GET("/:id/tasks", h.ListBoardTasks)
+		taskBoards.POST("/:id/tasks", h.perm.Require("tasks", "task", "create"), h.CreateBoardTask)
+		taskBoards.GET("/:id/tasks/:taskId", h.GetBoardTask)
+		taskBoards.PUT("/:id/tasks/:taskId", h.perm.Require("tasks", "task", "update"), h.UpdateBoardTask)
+		taskBoards.POST("/:id/tasks/:taskId/move", h.perm.Require("tasks", "task", "update"), h.MoveBoardTask)
+		taskBoards.DELETE("/:id/tasks/:taskId", h.perm.Require("tasks", "task", "delete"), h.DeleteBoardTask)
+		taskBoards.PUT("/:id/tasks/:taskId/assignees", h.perm.Require("tasks", "task", "update"), h.SetTaskAssignees)
 
-		// Time Entries
-		projects.GET("/:id/time-entries", h.ListTimeEntries)
-		projects.POST("/:id/time-entries", h.perm.Require("projects", "time_entry", "create"), h.CreateTimeEntry)
+		// Checklist
+		taskBoards.POST("/:id/tasks/:taskId/checklist", h.perm.Require("tasks", "task", "update"), h.CreateChecklistItem)
+		taskBoards.PUT("/:id/tasks/:taskId/checklist/:itemId", h.perm.Require("tasks", "task", "update"), h.UpdateChecklistItem)
+		taskBoards.DELETE("/:id/tasks/:taskId/checklist/:itemId", h.perm.Require("tasks", "task", "update"), h.DeleteChecklistItem)
 
-		// Project Expenses
-		projects.GET("/:id/expenses", h.ListProjectExpenses)
-		projects.POST("/:id/expenses", h.perm.Require("projects", "expense", "create"), h.CreateProjectExpense)
-		projects.DELETE("/:id/expenses/:expenseId", h.perm.Require("projects", "expense", "delete"), h.DeleteProjectExpense)
+		// Comments — any viewer may read and write; delete is author-or-permission
+		taskBoards.GET("/:id/tasks/:taskId/comments", h.ListTaskComments)
+		taskBoards.POST("/:id/tasks/:taskId/comments", h.CreateTaskComment)
+		taskBoards.DELETE("/:id/tasks/:taskId/comments/:commentId", h.DeleteTaskComment)
 
-		// Project Team Members
-		projects.GET("/:id/team-members", h.ListProjectTeamMembers)
-		projects.POST("/:id/team-members", h.perm.Require("projects", "project", "update"), h.AddProjectTeamMember)
-		projects.DELETE("/:id/team-members/:memberId", h.perm.Require("projects", "project", "update"), h.RemoveProjectTeamMember)
+		// Attachments (shared attachments table, entity_type='task')
+		taskBoards.POST("/:id/tasks/:taskId/attachments", h.perm.Require("tasks", "task", "update"), h.UploadTaskAttachment)
+		taskBoards.DELETE("/:id/tasks/:taskId/attachments/:attachmentId", h.perm.Require("tasks", "task", "update"), h.DeleteTaskAttachment)
+
+		// Activity trail
+		taskBoards.GET("/:id/tasks/:taskId/activity", h.ListTaskActivity)
+
+		// Cross-module links (scaffold)
+		taskBoards.POST("/:id/tasks/:taskId/links", h.perm.Require("tasks", "task", "update"), h.CreateTaskLink)
+		taskBoards.DELETE("/:id/tasks/:taskId/links/:linkId", h.perm.Require("tasks", "task", "update"), h.DeleteTaskLink)
 	}
 
 	// =====================================================
@@ -2032,6 +2085,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	constructionProjects.Use(h.perm.Require("construction", "project", "read"))
 	{
 		constructionProjects.GET("", h.ListConstructionProjects)
+		// Intercompany sales-order flow (moved from the retired /projects module)
+		constructionProjects.GET("/by-organization", h.ListConstructionProjectsByOrganization)
 		constructionProjects.POST("", h.perm.Require("construction", "project", "create"), h.CreateConstructionProject)
 		constructionProjects.GET("/:id", h.GetConstructionProject)
 		constructionProjects.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateConstructionProject)
@@ -2065,10 +2120,6 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Project Vendors
 		constructionProjects.GET("/:id/vendors", h.ListProjectVendors)
 		constructionProjects.POST("/:id/vendors", h.perm.Require("construction", "projects", "update"), h.CreateProjectVendor)
-
-		// Photo Reports
-		constructionProjects.GET("/:id/photo-reports", h.ListPhotoReports)
-		constructionProjects.POST("/:id/photo-reports", h.perm.Require("construction", "reports", "submit"), h.CreatePhotoReport)
 
 		// Daily Reports
 		constructionProjects.GET("/:id/daily-reports", h.ListDailyReports)
@@ -2469,18 +2520,6 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionSettings.PUT("/account-mapping", h.perm.Require("construction", "project", "update"), h.UpsertAccountMapping)
 		// Portfolio dashboard (cross-project)
 		constructionSettings.GET("/dashboard", h.GetConstructionPortfolioDashboard)
-	}
-
-	// Photo Reports (direct access)
-	photoReports := rg.Group("/construction/photo-reports")
-	photoReports.Use(h.perm.Require("construction", "reports", "read"))
-	{
-		photoReports.GET("/:id", h.GetPhotoReport)
-		photoReports.PUT("/:id", h.perm.Require("construction", "reports", "submit"), h.UpdatePhotoReport)
-		photoReports.DELETE("/:id", h.perm.Require("construction", "reports", "submit"), h.DeletePhotoReport)
-		// Manual re-sync to CRM (used after a failure or when the building
-		// was re-linked after the report was created).
-		photoReports.POST("/:id/resync-crm", h.perm.Require("construction", "reports", "submit"), h.ResyncPhotoReportToCRM)
 	}
 
 	// CRM proxy + linkage endpoints (used by the construction page UI to

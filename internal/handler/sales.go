@@ -698,6 +698,14 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		orderResponse["delivery_date"] = input.DeliveryDate
 	}
 
+	h.EmitWorkflowEvent(tenantID, "sales_order.created", map[string]interface{}{
+		"record_id":     orderID.String(),
+		"order_number":  orderNumber,
+		"customer_name": customerName,
+		"total_amount":  totalAmount,
+		"status":        orderStatus,
+	})
+
 	response.Created(c, orderResponse)
 }
 

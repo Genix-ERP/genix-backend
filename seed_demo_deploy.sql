@@ -627,7 +627,7 @@ BEGIN
         "inventory": {"view": true, "create": true, "delete": true, "update": true},
         "financials": {"view": true, "create": true, "delete": true, "update": true},
         "manufacturing": {"view": true, "create": true, "delete": true, "update": true},
-        "projects": {"view": true, "create": true, "delete": true, "update": true},
+        "tasks": {"view": true, "create": true, "delete": true, "update": true},
         "settings": {"view": true, "create": true, "delete": true, "update": true}
     }'::jsonb, updated_at = NOW()
     WHERE tenant_id = v_tenant_id AND code = 'owner';

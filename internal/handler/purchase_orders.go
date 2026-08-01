@@ -1776,6 +1776,13 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 			},
 			poNumber, vendorName, amountStr,
 		)
+
+		h.EmitWorkflowEvent(tenantID, "purchase_order.confirmed", map[string]interface{}{
+			"record_id":    id.String(),
+			"order_number": poNumber,
+			"vendor_name":  vendorName,
+			"total_amount": totalAmt,
+		})
 	}()
 
 	response.Success(c, gin.H{"message": "Purchase order approved successfully", "status": entity.POStatusApproved})
@@ -2052,6 +2059,20 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 			now, line.QuantityReceived, unitPrice, poVendorID, id, now)
 	}
 
+	go func() {
+		var poNumber, vendorName string
+		h.db.QueryRow(`
+			SELECT po.order_number, COALESCE(ct.name, '')
+			FROM purchase_orders po LEFT JOIN contacts ct ON po.vendor_id = ct.id
+			WHERE po.id = $1`, id).Scan(&poNumber, &vendorName)
+		h.EmitWorkflowEvent(tenantID, "purchase_order.received", map[string]interface{}{
+			"record_id":    id.String(),
+			"order_number": poNumber,
+			"vendor_name":  vendorName,
+			"status":       newStatus,
+		})
+	}()
+
 	response.Success(c, gin.H{
 		"message": "Goods received successfully",
 		"status":  newStatus,
@@ -2281,29 +2302,22 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 		if apAccountID != uuid.Nil {
 			// TT §4.5 requires every 6010 (Mol yetkazib beruvchilar va
-			// pudratchilar) line to carry a contract reference. The
-			// `journal_entry_lines.contract_id` column has a foreign key
-			// to **contracts(id)** (migration 318), NOT to
-			// procurement_contracts(id) — those are two separate tables
-			// that happen to share part of the schema. The enrichment
-			// trigger (migration 385) looks up `contracts` for the
-			// vendor-level fallback, so we have to write spot contracts
-			// there too. Otherwise the trigger fills in a UUID that
-			// belongs to procurement_contracts and the FK on the JE
-			// line rejects with `fk_jel_contract` violation.
-			//
-			// Lookup column mapping is `contracts.supplier_id` (not
-			// `vendor_id` like procurement_contracts uses).
+			// pudratchilar) line to carry a contract reference. Since
+			// migration 443 the `journal_entry_lines.contract_id` FK and
+			// the enrichment trigger's vendor-level fallback both target
+			// **procurement_contracts** (the Shartnomalar module table),
+			// so spot contracts are written there and show up in the
+			// contracts registry like any other chiqim contract.
 			//
 			// Idempotent: re-running the bill flow finds the spot
 			// contract created on a previous attempt instead of
 			// inserting a duplicate.
 			var existingContractID uuid.UUID
 			contractErr := tx.QueryRow(`
-				SELECT id FROM contracts
+				SELECT id FROM procurement_contracts
 				WHERE tenant_id = $1
-				  AND supplier_id = $2
-				  AND COALESCE(status, 'active') IN ('active', 'draft', 'approved')
+				  AND vendor_id = $2
+				  AND COALESCE(status, 'active') IN ('active', 'draft', 'negotiation', 'signing')
 				  AND deleted_at IS NULL
 				ORDER BY created_at DESC
 				LIMIT 1
@@ -2311,8 +2325,8 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 
 			if contractErr == sql.ErrNoRows {
 				// No master contract exists — create a Spot Purchase
-				// stub. contracts(supplier_name) is NOT NULL so we
-				// look it up from the contacts table.
+				// stub. procurement_contracts(vendor_name) is NOT NULL
+				// so we look it up from the contacts table.
 				spotID := uuid.New()
 				spotNumber := fmt.Sprintf("SPOT-%s", poNumber)
 				spotTitle := fmt.Sprintf("Spot purchase via PO %s", poNumber)
@@ -2328,13 +2342,13 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 				spotStart := now
 				spotEnd := now.AddDate(5, 0, 0)
 				if _, ccErr := tx.Exec(`
-					INSERT INTO contracts (
-						id, tenant_id, contract_number, supplier_id, supplier_name,
-						title, contract_type, start_date, end_date, value, currency,
+					INSERT INTO procurement_contracts (
+						id, tenant_id, contract_number, vendor_id, vendor_name,
+						title, contract_type, direction, start_date, end_date, value, currency,
 						status, created_by, created_at, updated_at
 					) VALUES (
 						$1, $2, $3, $4, $5,
-						$6, 'fixed', $7, $8, $9, 'UZS',
+						$6, 'fixed', 'expense', $7, $8, $9, 'UZS',
 						'active', $10, NOW(), NOW()
 					)
 				`, spotID, tenantID, spotNumber, vendorID, vendorName,
@@ -2345,10 +2359,23 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 					// message rather than masking a deeper data issue.
 					h.log.Warn("CreateBillFromPO: failed to auto-create spot contract",
 						"error", ccErr, "vendor_id", vendorID)
+				} else {
+					existingContractID = spotID
 				}
 			} else if contractErr != nil {
 				h.log.Warn("CreateBillFromPO: contract lookup failed",
 					"error", contractErr, "vendor_id", vendorID)
+			}
+
+			// Stamp the bill with the resolved contract so the payments
+			// rollup on the contract page and the JE enrichment's direct
+			// lookup (migration 443) both see it without the vendor-level
+			// fallback.
+			if existingContractID != uuid.Nil {
+				if _, linkErr := tx.Exec(`UPDATE purchase_invoices SET contract_id = $1 WHERE id = $2 AND tenant_id = $3`,
+					existingContractID, billID, tenantID); linkErr != nil {
+					h.log.Warn("CreateBillFromPO: failed to link bill to contract", "error", linkErr)
+				}
 			}
 
 			taxAccountID := findAccount(tx, tenantID, organizationID, "soliqlar bo'yicha bo'nak", "4410")

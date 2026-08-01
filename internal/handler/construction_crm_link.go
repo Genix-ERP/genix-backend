@@ -190,37 +190,5 @@ func (h *Handler) UpdateBuildingCRMLink(c *gin.Context) {
 	response.Success(c, map[string]string{"message": "Link updated"})
 }
 
-// ResyncPhotoReportToCRM lets the operator manually re-trigger a sync.
-// Used by the "Re-send" button after a failure (or after the building
-// was linked to a different CRM block after the report was created).
-//
-// @Router /construction/photo-reports/{id}/resync-crm [post]
-func (h *Handler) ResyncPhotoReportToCRM(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
-	reportID, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		response.BadRequest(c, "Invalid report ID")
-		return
-	}
-
-	// Clear the synced-at marker so the syncer doesn't short-circuit on
-	// the "already synced" check.
-	_, _ = h.db.Exec(`
-		UPDATE construction_photo_reports
-		SET crm_synced_at = NULL, crm_sync_error = NULL, updated_date = NOW()
-		WHERE id = $1 AND tenant_id = $2
-	`, reportID, tenantID)
-
-	if h.crmSync != nil {
-		h.crmSync.Enqueue(c.Request.Context(), tenantID, reportID)
-	}
-	response.Success(c, map[string]string{"message": "Re-sync queued"})
-}
-
-
 // suppress unused import in case http isn't referenced after future refactors
 var _ = http.StatusOK

@@ -22,7 +22,6 @@ type AdminSettingsResponse struct {
 	Manufacturing map[string]interface{} `json:"manufacturing"`
 	HR            map[string]interface{} `json:"hr"`
 	Finance       map[string]interface{} `json:"finance"`
-	Projects      map[string]interface{} `json:"projects"`
 	Construction  map[string]interface{} `json:"construction"`
 	UpdatedAt     *time.Time             `json:"updated_at,omitempty"`
 	UpdatedBy     *uuid.UUID             `json:"updated_by,omitempty"`
@@ -146,14 +145,6 @@ func getDefaultAdminSettings() AdminSettingsResponse {
 			"lock_date": map[string]interface{}{
 				"date":    nil,
 				"enabled": false,
-			},
-		},
-		Projects: map[string]interface{}{
-			"billing": map[string]interface{}{
-				"default_type": "fixed",
-			},
-			"timesheet": map[string]interface{}{
-				"approval_required": true,
 			},
 		},
 		Construction: map[string]interface{}{

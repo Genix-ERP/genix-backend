@@ -1178,19 +1178,6 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 		return
 	}
 
-	// If invoice is fully paid, update linked project expense status to 'paid'
-	if newStatus == "paid" {
-		_, err = h.db.Exec(
-			"UPDATE project_expenses SET status = 'paid', updated_at = $1 WHERE purchase_invoice_id = $2 AND tenant_id = $3",
-			now, invoiceID, tenantID,
-		)
-		if err != nil {
-			h.log.Error("Failed to update project expense status", "error", err, "invoice_id", invoiceID)
-		} else {
-			h.log.Info("Project expense status updated to paid", "invoice_id", invoiceID)
-		}
-	}
-
 	// Payment record details. The payments/payment_allocations INSERTs happen
 	// inside the journal-entry transaction below so the payment, its
 	// allocation, the JE and the balance updates commit (or roll back) together.

@@ -1720,6 +1720,13 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		var customerName string
 		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM contacts WHERE id = $1`, customerID).Scan(&customerName)
 		amountStr := fmt.Sprintf("%.0f", input.Amount)
+
+		h.EmitWorkflowEvent(tenantID, "payment.received", map[string]interface{}{
+			"record_id":      invoiceID.String(),
+			"invoice_number": invoiceNumber,
+			"customer_name":  customerName,
+			"amount":         input.Amount,
+		})
 		// `customer_name` added to data so the web renderer (notificationCatalog.js)
 		// can rebuild the body in the current UI language. Additive — mobile-safe.
 		h.createTranslatedNotification(tenantID, userID, "payment_recorded",
