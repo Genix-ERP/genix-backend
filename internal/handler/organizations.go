@@ -1027,6 +1027,8 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		{"4310", "TMQ uchun berilgan bo'naklar", "OA", false, false, false, "Mol yetkazib beruvchilarga bo'naklar"},
 		{"4410", "Byudjetga soliqlar bo'yicha bo'nak to'lovlari", "OA", false, false, false, "QQS kirim (olinadigan)"},
 		{"4710", "Hisobdor shaxslar", "OA", false, false, false, "Hisobdor shaxslarga berilgan summa"},
+		{"4720", "Xodimlarga berilgan qarzlar", "OA", false, false, false, "Xodimlarga berilgan qarzlar (ssudalar) bo'yicha hisob-kitoblar"},
+		{"4730", "Moddiy zararni qoplash bo'yicha hisob-kitoblar", "OA", false, false, false, "Kamomad va moddiy zarar bo'yicha xodimlardan undirishlar"},
 		{"4790", "Boshqa debitorlik qarzlari", "AR", false, false, false, "Boshqa debitorlik qarzlari"},
 		{"4910", "Shubhali qarzlar bo'yicha zaxira", "CONTRA_ASSET", false, false, false, "Shubhali qarzlar uchun zaxira"},
 

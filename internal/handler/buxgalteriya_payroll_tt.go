@@ -297,45 +297,82 @@ func (h *Handler) GetOrCreateCurrentMonthPayroll(c *gin.Context) {
 	}
 	rows.Close()
 
+	// Same tax engine as CreatePayrollEntry / CalculateAllPayroll: with no
+	// active tenant taxes the result is net == gross (the original TT simple
+	// model); with configured taxes all three creation paths now agree.
 	created := 0
-	var totalSalary float64
+	var totalGross, totalDeductions, totalNet float64
+	type entryTaxes struct {
+		entryID uuid.UUID
+		applied []entity.PayrollEntryTax
+	}
+	var taxWrites []entryTaxes
 	for _, e := range emps {
 		advance := math.Round(e.salary * settings.AdvancePercent / 100)
 		remainder := e.salary - advance
 
+		applied, taxTotals, tErr := h.computeEmployeeTaxesForEntry(tenantID, e.salary, 0, 0, 0, nil)
+		if tErr != nil {
+			h.log.Warn("TT auto-create: tax compute failed, entry gets no taxes", "employee", e.id, "error", tErr)
+			applied, taxTotals = nil, payrollTaxTotals{}
+		}
+		var incomeTax, socialSecurity, pension float64
+		if len(applied) > 0 {
+			incomeTax, socialSecurity, pension = legacyBucketsFromTaxes(applied)
+		}
+		employeeTax := taxTotals.Employee
+		netSalary := e.salary - employeeTax
+
+		entryID := uuid.New()
 		_, err := tx.Exec(`
 			INSERT INTO payroll_entries (
 				id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name,
 				position_snapshot,
-				base_salary, gross_salary, net_salary,
+				base_salary, gross_salary,
+				income_tax, social_security, pension, total_deductions, net_salary,
 				advance_amount, remainder_amount, advance_percent_used,
 				advance_paid, remainder_paid,
 				payment_method, status, created_at, updated_at
 			) VALUES (
-				gen_random_uuid(), $1, $2, $3, $4, $5,
-				$6, $7, $7, $7, $8, $9, $10,
+				$1, $2, $3, $4, $5, $6,
+				$7, $8, $8,
+				$9, $10, $11, $12, $13,
+				$14, $15, $16,
 				false, false,
-				'bank_transfer', 'pending', $11, $11
+				'bank_transfer', 'pending', $17, $17
 			)
-		`, tenantID, orgIDPtr, periodID, e.id, e.fullName, e.position, e.salary,
+		`, entryID, tenantID, orgIDPtr, periodID, e.id, e.fullName, e.position, e.salary,
+			incomeTax, socialSecurity, pension, employeeTax, netSalary,
 			advance, remainder, settings.AdvancePercent, now)
 		if err != nil {
 			h.log.Error("Auto-create entry failed", "error", err, "employee", e.id)
 			continue
 		}
 		created++
-		totalSalary += e.salary
+		totalGross += e.salary
+		totalDeductions += employeeTax
+		totalNet += netSalary
+		if len(applied) > 0 {
+			taxWrites = append(taxWrites, entryTaxes{entryID: entryID, applied: applied})
+		}
 	}
 
 	// Update period totals
 	_, _ = tx.Exec(`
-		UPDATE payroll_periods SET total_gross = $1, total_net = $1, employee_count = $2, updated_at = NOW()
-		WHERE id = $3
-	`, totalSalary, created, periodID)
+		UPDATE payroll_periods SET total_gross = $1, total_deductions = $2, total_net = $3, employee_count = $4, updated_at = NOW()
+		WHERE id = $5
+	`, totalGross, totalDeductions, totalNet, created, periodID)
 
 	if err := tx.Commit(); err != nil {
 		response.InternalError(c, "Failed to commit")
 		return
+	}
+
+	// Snapshot applied taxes (uses h.db, so after commit — entries exist now).
+	for _, w := range taxWrites {
+		if err := h.writePayrollEntryTaxes(tenantID, orgIDPtr, w.entryID, w.applied); err != nil {
+			h.log.Error("TT auto-create: tax snapshot write failed", "entry", w.entryID, "error", err)
+		}
 	}
 
 	h.respondPayrollPeriodWithEntries(c, tenantID, periodID, true)
@@ -388,6 +425,7 @@ func (h *Handler) markPaidFlag(c *gin.Context, flagCol, dayCol string) {
 		response.Unauthorized(c, "Tenant not found")
 		return
 	}
+	userID, _ := middleware.GetUserID(c)
 	idStr := c.Param("id")
 	entryID, err := uuid.Parse(idStr)
 	if err != nil {
@@ -400,13 +438,23 @@ func (h *Handler) markPaidFlag(c *gin.Context, flagCol, dayCol string) {
 		return
 	}
 
-	// Look up the entry's period to clamp day to the period's month length.
+	// Look up the entry's period to clamp day to the period's month length,
+	// plus everything the GL leg below needs.
 	var periodStart time.Time
-	err = h.db.QueryRow(`
-		SELECT p.start_date FROM payroll_entries e
+	var periodID uuid.UUID
+	var periodName, employeeName, paymentMethod string
+	var curPaid bool
+	var advanceAmt, remainderAmt float64
+	var orgIDStr sql.NullString
+	err = h.db.QueryRow(fmt.Sprintf(`
+		SELECT p.start_date, p.id, p.period_name, e.employee_name,
+		       COALESCE(e.payment_method, 'cash'), COALESCE(e.%s, false),
+		       COALESCE(e.advance_amount, 0), COALESCE(e.remainder_amount, 0), e.organization_id
+		FROM payroll_entries e
 		JOIN payroll_periods p ON p.id = e.payroll_period_id
 		WHERE e.id = $1 AND e.tenant_id = $2
-	`, entryID, tenantID).Scan(&periodStart)
+	`, flagCol), entryID, tenantID).Scan(&periodStart, &periodID, &periodName, &employeeName,
+		&paymentMethod, &curPaid, &advanceAmt, &remainderAmt, &orgIDStr)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Payroll entry")
 		return
@@ -414,6 +462,18 @@ func (h *Handler) markPaidFlag(c *gin.Context, flagCol, dayCol string) {
 	if err != nil {
 		response.InternalError(c, "Lookup failed")
 		return
+	}
+	var orgIDPtr *uuid.UUID
+	if orgIDStr.Valid {
+		if parsed, perr := uuid.Parse(orgIDStr.String); perr == nil {
+			orgIDPtr = &parsed
+		}
+	}
+	kind := "advance"
+	amount := advanceAmt
+	if flagCol == "remainder_paid" {
+		kind = "remainder"
+		amount = remainderAmt
 	}
 
 	// Month length — last day of period's month
@@ -449,14 +509,44 @@ func (h *Handler) markPaidFlag(c *gin.Context, flagCol, dayCol string) {
 		dayVal = nil
 	}
 
+	// Flag flip + GL leg in ONE transaction: marking a salary leg paid is a
+	// cash outflow and must hit the books (same standard as expenses' /pay);
+	// un-marking reverses the posted entry. A GL failure fails the request
+	// and the flag stays untouched.
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("markPaidFlag: begin tx", "error", txErr)
+		response.InternalError(c, "Failed to update")
+		return
+	}
+	defer tx.Rollback()
+
+	if in.Paid && !curPaid && amount > 0 {
+		if msg := h.postTTSalaryPaymentJE(tx, tenantID, orgIDPtr, userID, entryID, periodID, kind, employeeName, paymentMethod, periodName, amount); msg != "" {
+			response.BadRequest(c, msg)
+			return
+		}
+	} else if !in.Paid && curPaid {
+		if msg := h.reverseTTSalaryPaymentJE(tx, tenantID, orgIDPtr, userID, entryID, kind); msg != "" {
+			response.BadRequest(c, msg)
+			return
+		}
+	}
+
 	query := fmt.Sprintf(`
 		UPDATE payroll_entries
 		SET %s = $1, %s = $2, updated_at = NOW()
 		WHERE id = $3 AND tenant_id = $4
 	`, flagCol, dayCol)
-	_, err = h.db.Exec(query, in.Paid, dayVal, entryID, tenantID)
+	_, err = tx.Exec(query, in.Paid, dayVal, entryID, tenantID)
 	if err != nil {
 		h.log.Error("markPaidFlag", "error", err)
+		response.InternalError(c, "Failed to update")
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		h.log.Error("markPaidFlag: commit", "error", err)
 		response.InternalError(c, "Failed to update")
 		return
 	}
@@ -624,4 +714,259 @@ func (h *Handler) ExportPayrollBackup(c *gin.Context) {
 	c.Header("Content-Disposition", "attachment; filename="+filename)
 	c.Status(http.StatusOK)
 	_, _ = c.Writer.Write(body)
+}
+
+// ---------------------------------------------------------------------------
+// GL wiring for TT advance/remainder payments
+// ---------------------------------------------------------------------------
+
+// postTTSalaryPaymentJE posts the cash leg for a TT advance/remainder payment
+// inside the caller's transaction. Returns a user-facing error message, or ""
+// on success.
+//
+// Debit side depends on whether the period was processed (accrued):
+//   - accrual JE exists  -> Dt 6710 Wages Payable (liability cleared)
+//   - no accrual (pure TT simple mode) -> Dt 9420 Salary Expense (cash-basis)
+//
+// Credit side: 5110 bank for card/bank_transfer, else 5010 kassa. Same
+// insufficient-balance guard as expenses' /pay.
+func (h *Handler) postTTSalaryPaymentJE(tx *sql.Tx, tenantID uuid.UUID, orgIDPtr *uuid.UUID, userID uuid.UUID, entryID, periodID uuid.UUID, kind, employeeName, paymentMethod, periodName string, amount float64) string {
+	// Idempotency: one active (non-reversed) JE per entry+leg.
+	var active int
+	_ = tx.QueryRow(`
+		SELECT COUNT(*) FROM journal_entries
+		WHERE tenant_id = $1 AND source_type = 'payroll_payment' AND source_id = $2
+		  AND reference = $3 AND status = 'posted' AND reversed_entry_id IS NULL AND deleted_at IS NULL
+	`, tenantID, entryID.String(), kind).Scan(&active)
+	if active > 0 {
+		return ""
+	}
+
+	// Debit account: 6710 if the period is accrued, else 9420 (simple mode).
+	var accrued int
+	_ = tx.QueryRow(`
+		SELECT COUNT(*) FROM journal_entries
+		WHERE tenant_id = $1 AND source_type = 'payroll' AND source_id = $2 AND status = 'posted' AND deleted_at IS NULL
+	`, tenantID, periodID.String()).Scan(&accrued)
+
+	var debitAcct uuid.UUID
+	var debitDesc string
+	if accrued > 0 {
+		debitAcct = findAccount(tx, tenantID, orgIDPtr, "wages payable", "6710")
+		debitDesc = "Wages Payable"
+	} else {
+		debitAcct = findAccount(tx, tenantID, orgIDPtr, "salaries", "9420")
+		if debitAcct == uuid.Nil {
+			debitAcct = findAccount(tx, tenantID, orgIDPtr, "salary", "9420")
+		}
+		debitDesc = "Salary Expense"
+	}
+	if debitAcct == uuid.Nil {
+		return "Ish haqi schyoti topilmadi — hisoblar rejasini tekshiring (9420/6710)"
+	}
+
+	var creditAcct uuid.UUID
+	var creditDesc string
+	if paymentMethod == "card" || paymentMethod == "bank_transfer" {
+		creditAcct = findAccount(tx, tenantID, orgIDPtr, "bank account", "5110")
+		creditDesc = "Bank Account"
+	} else {
+		creditAcct = findAccount(tx, tenantID, orgIDPtr, "cash", "5010")
+		if creditAcct == uuid.Nil {
+			creditAcct = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
+		}
+		creditDesc = "Cash"
+	}
+	if creditAcct == uuid.Nil {
+		return "To'lov hisobi topilmadi — kassa/bank schyotini sozlang (5010/5110)"
+	}
+
+	// Balance guard (same standard as expenses' /pay).
+	var balance float64
+	_ = tx.QueryRow(`SELECT COALESCE(current_balance, 0) FROM accounts WHERE id = $1`, creditAcct).Scan(&balance)
+	if balance < amount {
+		return fmt.Sprintf("Hisobda mablag' yetarli emas: mavjud %.0f, to'lov %.0f", balance, amount)
+	}
+
+	var journalID uuid.UUID
+	var nextNumber int
+	_ = tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1) FROM journals
+		WHERE tenant_id = $1 AND COALESCE(is_payroll_journal, false) = true
+		  AND COALESCE(is_active, true) = true AND deleted_at IS NULL
+		LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+	if journalID == uuid.Nil {
+		_ = tx.QueryRow(`
+			SELECT id, COALESCE(next_number, 1) FROM journals
+			WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
+			ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
+			tenantID).Scan(&journalID, &nextNumber)
+	}
+	if journalID == uuid.Nil {
+		return "Jurnal topilmadi — PAYROLL jurnalini sozlang"
+	}
+
+	now := time.Now()
+	jeID := uuid.New()
+	var orgVal interface{}
+	if orgIDPtr != nil {
+		orgVal = *orgIDPtr
+	}
+	entryNumber := fmt.Sprintf("PAYPMT%05d", nextEntryNumberSeq(tx, tenantID, orgVal, "PAYPMT", nextNumber))
+	kindLabel := "avans"
+	if kind == "remainder" {
+		kindLabel = "qoldiq"
+	}
+	description := fmt.Sprintf("Ish haqi to'lovi (%s): %s — %s", kindLabel, employeeName, periodName)
+
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+			reference, description, source_type, source_id, exchange_rate,
+			total_debit, total_credit, status, created_by, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'payroll_payment',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
+		jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+		kind, description, entryID.String(), amount, userID, now); err != nil {
+		h.log.Error("postTTSalaryPaymentJE: header insert", "error", err)
+		return "To'lov yozuvini yaratib bo'lmadi"
+	}
+
+	// Resolve employee_id for the 6710 subkonto requirement (TT §4.5).
+	var employeeID uuid.UUID
+	_ = tx.QueryRow(`SELECT employee_id FROM payroll_entries WHERE id = $1 AND tenant_id = $2`, entryID, tenantID).Scan(&employeeID)
+	var empVal interface{}
+	if employeeID != uuid.Nil {
+		empVal = employeeID
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, employee_id, created_at)
+		VALUES ($1,$2,$3,$4,$5,0,1,$6,$7)`,
+		uuid.New(), jeID, debitAcct, debitDesc, amount, empVal, now); err != nil {
+		h.log.Error("postTTSalaryPaymentJE: debit line", "error", err)
+		return "To'lov yozuvini yaratib bo'lmadi"
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, debitAcct); err != nil {
+		h.log.Error("postTTSalaryPaymentJE: debit balance", "error", err)
+		return "To'lov yozuvini yaratib bo'lmadi"
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, employee_id, created_at)
+		VALUES ($1,$2,$3,$4,0,$5,2,$6,$7)`,
+		uuid.New(), jeID, creditAcct, creditDesc, amount, empVal, now); err != nil {
+		h.log.Error("postTTSalaryPaymentJE: credit line", "error", err)
+		return "To'lov yozuvini yaratib bo'lmadi"
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, creditAcct); err != nil {
+		h.log.Error("postTTSalaryPaymentJE: credit balance", "error", err)
+		return "To'lov yozuvini yaratib bo'lmadi"
+	}
+
+	if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
+		h.log.Error("postTTSalaryPaymentJE: bump journal", "error", err)
+		return "To'lov yozuvini yaratib bo'lmadi"
+	}
+	return ""
+}
+
+// reverseTTSalaryPaymentJE reverses the active payment JE for an entry+leg
+// when the paid flag is un-checked. Posts an immediate posted reversal (swap
+// debit/credit) and links it via reversed_entry_id. No active JE -> no-op
+// (legacy rows marked paid before GL wiring existed).
+func (h *Handler) reverseTTSalaryPaymentJE(tx *sql.Tx, tenantID uuid.UUID, orgIDPtr *uuid.UUID, userID uuid.UUID, entryID uuid.UUID, kind string) string {
+	var origID, journalID uuid.UUID
+	var origNumber string
+	err := tx.QueryRow(`
+		SELECT id, entry_number, journal_id FROM journal_entries
+		WHERE tenant_id = $1 AND source_type = 'payroll_payment' AND source_id = $2
+		  AND reference = $3 AND status = 'posted' AND reversed_entry_id IS NULL AND deleted_at IS NULL
+		ORDER BY created_at DESC LIMIT 1
+	`, tenantID, entryID.String(), kind).Scan(&origID, &origNumber, &journalID)
+	if err == sql.ErrNoRows {
+		return ""
+	}
+	if err != nil {
+		h.log.Error("reverseTTSalaryPaymentJE: lookup", "error", err)
+		return "To'lov yozuvini topib bo'lmadi"
+	}
+
+	now := time.Now()
+	reversalID := uuid.New()
+	var orgVal interface{}
+	if orgIDPtr != nil {
+		orgVal = *orgIDPtr
+	}
+	var nextNumber int
+	_ = tx.QueryRow(`SELECT COALESCE(next_number, 1) FROM journals WHERE id = $1`, journalID).Scan(&nextNumber)
+	reversalNumber := fmt.Sprintf("PAYPMT%05d", nextEntryNumberSeq(tx, tenantID, orgVal, "PAYPMT", nextNumber))
+
+	var totalDebit, totalCredit float64
+	_ = tx.QueryRow(`SELECT total_debit, total_credit FROM journal_entries WHERE id = $1`, origID).Scan(&totalDebit, &totalCredit)
+
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+			reference, description, source_type, source_id, exchange_rate,
+			total_debit, total_credit, status, is_reversal, reversal_of_id,
+			created_by, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'reversal',$9,1.0,$10,$11,'posted',true,$12,$13,$14,$14)`,
+		reversalID, tenantID, orgIDPtr, journalID, reversalNumber, now,
+		"REV-"+origNumber, "Teskari: "+origNumber, entryID.String(),
+		totalCredit, totalDebit, origID, userID, now); err != nil {
+		h.log.Error("reverseTTSalaryPaymentJE: header insert", "error", err)
+		return "Teskari yozuvni yaratib bo'lmadi"
+	}
+
+	rows, err := tx.Query(`
+		SELECT account_id, description, debit_amount, credit_amount, employee_id
+		FROM journal_entry_lines WHERE journal_entry_id = $1 ORDER BY line_number`, origID)
+	if err != nil {
+		h.log.Error("reverseTTSalaryPaymentJE: lines query", "error", err)
+		return "Teskari yozuvni yaratib bo'lmadi"
+	}
+	type revLine struct {
+		accountID uuid.UUID
+		desc      sql.NullString
+		debit     float64
+		credit    float64
+		empID     sql.NullString
+	}
+	var origLines []revLine
+	for rows.Next() {
+		var l revLine
+		if err := rows.Scan(&l.accountID, &l.desc, &l.debit, &l.credit, &l.empID); err == nil {
+			origLines = append(origLines, l)
+		}
+	}
+	rows.Close()
+
+	for i, l := range origLines {
+		var empVal interface{}
+		if l.empID.Valid {
+			empVal = l.empID.String
+		}
+		// Swap debit and credit
+		if _, err := tx.Exec(`
+			INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, employee_id, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			uuid.New(), reversalID, l.accountID, l.desc.String, l.credit, l.debit, i+1, empVal, now); err != nil {
+			h.log.Error("reverseTTSalaryPaymentJE: line insert", "error", err)
+			return "Teskari yozuvni yaratib bo'lmadi"
+		}
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, l.credit-l.debit, now, l.accountID); err != nil {
+			h.log.Error("reverseTTSalaryPaymentJE: balance", "error", err)
+			return "Teskari yozuvni yaratib bo'lmadi"
+		}
+	}
+
+	if _, err := tx.Exec(`UPDATE journal_entries SET reversed_entry_id = $1, updated_at = $2 WHERE id = $3`, reversalID, now, origID); err != nil {
+		h.log.Error("reverseTTSalaryPaymentJE: mark reversed", "error", err)
+		return "Teskari yozuvni yaratib bo'lmadi"
+	}
+	if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
+		h.log.Error("reverseTTSalaryPaymentJE: bump journal", "error", err)
+		return "Teskari yozuvni yaratib bo'lmadi"
+	}
+	return ""
 }

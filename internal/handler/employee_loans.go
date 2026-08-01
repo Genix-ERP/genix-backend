@@ -520,10 +520,13 @@ func (h *Handler) GetMyEmployeeProfile(c *gin.Context) {
 		HireDate     string    `json:"hire_date"`
 	}
 
+	// employees has employee_number/job_title — the old employee_code/position
+	// columns never existed, so this query always errored and the cabinet
+	// profile 404'd for every user.
 	var hireDate sql.NullTime
 	err := h.db.QueryRow(`
-		SELECT e.id, COALESCE(e.employee_code, ''), COALESCE(e.first_name, ''), COALESCE(e.last_name, ''),
-			COALESCE(e.position, ''), COALESCE(d.name, ''), COALESCE(e.base_salary, 0),
+		SELECT e.id, COALESCE(e.employee_number, ''), COALESCE(e.first_name, ''), COALESCE(e.last_name, ''),
+			COALESCE(e.job_title, ''), COALESCE(d.name, ''), COALESCE(e.base_salary, 0),
 			COALESCE(e.email, ''), COALESCE(e.phone, ''), e.hire_date
 		FROM employees e
 		LEFT JOIN departments d ON e.department_id = d.id
@@ -562,6 +565,24 @@ func (h *Handler) MarkLoanPaymentPaid(c *gin.Context) {
 		return
 	}
 
+	// Optional link to the payroll entry the deduction was withheld from
+	// (281's payroll_entry_id column; feeds /my/payroll-history's
+	// loan_deduction join and the confirm-SMS text).
+	var body struct {
+		PayrollEntryID *string `json:"payroll_entry_id"`
+	}
+	_ = c.ShouldBindJSON(&body)
+	var payrollEntryID *uuid.UUID
+	if body.PayrollEntryID != nil {
+		if parsed, perr := uuid.Parse(*body.PayrollEntryID); perr == nil {
+			var cnt int
+			_ = h.db.QueryRow(`SELECT COUNT(*) FROM payroll_entries WHERE id = $1 AND tenant_id = $2`, parsed, tenantID).Scan(&cnt)
+			if cnt > 0 {
+				payrollEntryID = &parsed
+			}
+		}
+	}
+
 	// Get payment amount
 	var payAmount float64
 	err = h.db.QueryRow(`SELECT amount FROM employee_loan_payments WHERE id = $1 AND loan_id = $2 AND tenant_id = $3 AND status = 'pending'`,
@@ -571,17 +592,60 @@ func (h *Handler) MarkLoanPaymentPaid(c *gin.Context) {
 		return
 	}
 
-	// Update payment
-	h.db.Exec(`UPDATE employee_loan_payments SET status = 'paid', paid_at = NOW(), updated_at = NOW() WHERE id = $1`, paymentID)
+	// Payment flag + loan totals must move together (a crash between the two
+	// autocommit statements used to desync paid_amount from the schedule).
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("MarkLoanPaymentPaid: begin tx", "error", txErr)
+		response.InternalError(c, "Failed to mark payment paid")
+		return
+	}
+	defer tx.Rollback()
 
-	// Update loan totals
-	h.db.Exec(`UPDATE employee_loans SET paid_amount = paid_amount + $1, remaining_amount = remaining_amount - $1, updated_at = NOW() WHERE id = $2`, payAmount, loanID)
+	if _, err := tx.Exec(`UPDATE employee_loan_payments SET status = 'paid', paid_at = NOW(), payroll_entry_id = COALESCE($3, payroll_entry_id), updated_at = NOW() WHERE id = $1 AND tenant_id = $2`, paymentID, tenantID, payrollEntryID); err != nil {
+		h.log.Error("MarkLoanPaymentPaid: payment update", "error", err)
+		response.InternalError(c, "Failed to mark payment paid")
+		return
+	}
+
+	if _, err := tx.Exec(`UPDATE employee_loans SET paid_amount = paid_amount + $1, remaining_amount = remaining_amount - $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3`, payAmount, loanID, tenantID); err != nil {
+		h.log.Error("MarkLoanPaymentPaid: loan totals update", "error", err)
+		response.InternalError(c, "Failed to mark payment paid")
+		return
+	}
+
+	// Repayment relieves the loans-receivable account posted at disbursement
+	// (Dt cash / Kt 4720). Only posts if the disbursement JE exists — loans
+	// granted without a cash account never hit the GL, so their repayments
+	// must not either.
+	if err := h.postLoanRepaymentJE(tx, tenantID, loanID, paymentID, payAmount); err != nil {
+		h.log.Error("MarkLoanPaymentPaid: repayment JE", "error", err)
+		response.InternalError(c, "Failed to post repayment journal entry")
+		return
+	}
 
 	// Check if loan is fully paid
 	var remaining float64
-	h.db.QueryRow(`SELECT remaining_amount FROM employee_loans WHERE id = $1`, loanID).Scan(&remaining)
+	if err := tx.QueryRow(`SELECT remaining_amount FROM employee_loans WHERE id = $1 AND tenant_id = $2`, loanID, tenantID).Scan(&remaining); err != nil {
+		h.log.Error("MarkLoanPaymentPaid: remaining lookup", "error", err)
+		response.InternalError(c, "Failed to mark payment paid")
+		return
+	}
 	if remaining <= 0 {
-		h.db.Exec(`UPDATE employee_loans SET status = 'completed', remaining_amount = 0, updated_at = NOW() WHERE id = $1`, loanID)
+		if _, err := tx.Exec(`UPDATE employee_loans SET status = 'completed', remaining_amount = 0, updated_at = NOW() WHERE id = $1 AND tenant_id = $2`, loanID, tenantID); err != nil {
+			h.log.Error("MarkLoanPaymentPaid: completion update", "error", err)
+			response.InternalError(c, "Failed to mark payment paid")
+			return
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("MarkLoanPaymentPaid: commit", "error", err)
+		response.InternalError(c, "Failed to mark payment paid")
+		return
+	}
+
+	if remaining <= 0 {
 
 		// SMS: Qarz yopilganda
 		go func() {
@@ -609,19 +673,111 @@ func (h *Handler) getEmployeeIDFromUser(c *gin.Context, tenantID uuid.UUID) uuid
 		return uuid.Nil
 	}
 
+	// Explicit link first (users.employee_id, migration 031) — the email
+	// fallback below is non-unique across employees, so it must come last
+	// and be deterministic.
 	var employeeID uuid.UUID
 	err := h.db.QueryRow(`
 		SELECT e.id FROM employees e
-		JOIN users u ON u.email = e.email OR u.id::text = e.user_id::text
+		JOIN users u ON u.employee_id = e.id
 		WHERE u.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
 		LIMIT 1
 	`, userID, tenantID).Scan(&employeeID)
 	if err != nil {
-		// Try direct user_id match
-		h.db.QueryRow(`SELECT id FROM employees WHERE user_id = $1 AND tenant_id = $2 AND deleted_at IS NULL LIMIT 1`,
+		h.db.QueryRow(`SELECT id FROM employees WHERE user_id = $1 AND tenant_id = $2 AND deleted_at IS NULL ORDER BY created_at LIMIT 1`,
 			userID, tenantID).Scan(&employeeID)
 	}
+	if employeeID == uuid.Nil {
+		h.db.QueryRow(`
+			SELECT e.id FROM employees e
+			JOIN users u ON u.email = e.email
+			WHERE u.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
+			ORDER BY e.created_at LIMIT 1
+		`, userID, tenantID).Scan(&employeeID)
+	}
 	return employeeID
+}
+
+// postLoanRepaymentJE posts Dt cash / Kt 4720 for a loan repayment inside the
+// caller's transaction, mirroring the disbursement entry. Skips (nil) when the
+// loan never hit the GL — no disbursement JE, no cash account, or no 4720.
+func (h *Handler) postLoanRepaymentJE(tx *sql.Tx, tenantID, loanID, paymentID uuid.UUID, amount float64) error {
+	var loanNumber, empName string
+	var orgIDStr, cashAcctStr sql.NullString
+	err := tx.QueryRow(`
+		SELECT COALESCE(l.loan_number, ''), COALESCE(e.first_name,'') || ' ' || COALESCE(e.last_name,''),
+		       l.organization_id, l.cash_account_id
+		FROM employee_loans l JOIN employees e ON e.id = l.employee_id
+		WHERE l.id = $1 AND l.tenant_id = $2
+	`, loanID, tenantID).Scan(&loanNumber, &empName, &orgIDStr, &cashAcctStr)
+	if err != nil || !cashAcctStr.Valid {
+		return nil
+	}
+	cashAccountID, err := uuid.Parse(cashAcctStr.String)
+	if err != nil {
+		return nil
+	}
+
+	// Only relieve 4720 if the disbursement actually posted.
+	var disbursed int
+	_ = tx.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND entry_number = $2 AND status = 'posted' AND deleted_at IS NULL`,
+		tenantID, "JE-LOAN-"+loanNumber).Scan(&disbursed)
+	if disbursed == 0 {
+		return nil
+	}
+
+	var loanAccountID uuid.UUID
+	_ = tx.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND code = '4720' AND deleted_at IS NULL ORDER BY organization_id NULLS LAST LIMIT 1`, tenantID).Scan(&loanAccountID)
+	if loanAccountID == uuid.Nil {
+		return nil
+	}
+
+	var journalID uuid.UUID
+	_ = tx.QueryRow(`SELECT id FROM journals WHERE tenant_id = $1 AND code = 'MISC' AND deleted_at IS NULL LIMIT 1`, tenantID).Scan(&journalID)
+	if journalID == uuid.Nil {
+		return nil
+	}
+
+	var orgVal interface{}
+	var orgIDPtr *uuid.UUID
+	if orgIDStr.Valid {
+		if parsed, perr := uuid.Parse(orgIDStr.String); perr == nil {
+			orgVal = parsed
+			orgIDPtr = &parsed
+		}
+	}
+
+	now := time.Now()
+	jeID := uuid.New()
+	entryNumber := fmt.Sprintf("LOANPMT%05d", nextEntryNumberSeq(tx, tenantID, orgVal, "LOANPMT", 1))
+
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
+			entry_date, description, source_type, source_id, status, total_debit, total_credit, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'employee_loan_repayment', $8, 'posted', $9, $9, $10, $10)
+	`, jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+		fmt.Sprintf("Qarz qaytarildi: %s - %s", empName, loanNumber), paymentID.String(), amount, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, description, debit_amount, credit_amount, created_at)
+		VALUES ($1, $2, $3, 1, $4, $5, 0, $6)
+	`, uuid.New(), jeID, cashAccountID, fmt.Sprintf("Qarz qaytarildi: %s", empName), amount, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, description, debit_amount, credit_amount, created_at)
+		VALUES ($1, $2, $3, 2, $4, 0, $5, $6)
+	`, uuid.New(), jeID, loanAccountID, fmt.Sprintf("Qarz qoldig'i kamaydi: %s", empName), amount, now); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, cashAccountID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, loanAccountID); err != nil {
+		return err
+	}
+	return nil
 }
 
 // --- Helper: create journal entry for loan ---

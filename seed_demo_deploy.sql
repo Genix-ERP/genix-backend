@@ -100,7 +100,7 @@ BEGIN
 
     -- === Dropshipping (references products, contacts) ===
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'dropship_order_lines') THEN
-        EXECUTE 'DELETE FROM dropship_order_lines WHERE order_id IN (SELECT id FROM dropship_orders WHERE tenant_id = $1)' USING v_tid;
+        EXECUTE 'DELETE FROM dropship_order_lines WHERE dropship_order_id IN (SELECT id FROM dropship_orders WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'dropship_orders') THEN
         EXECUTE 'DELETE FROM dropship_orders WHERE tenant_id = $1' USING v_tid;
@@ -144,7 +144,7 @@ BEGIN
 
     -- === Sales Returns (references products, contacts) ===
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'sales_return_items') THEN
-        EXECUTE 'DELETE FROM sales_return_items WHERE return_id IN (SELECT id FROM sales_returns WHERE tenant_id = $1)' USING v_tid;
+        EXECUTE 'DELETE FROM sales_return_items WHERE sales_return_id IN (SELECT id FROM sales_returns WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'sales_returns') THEN
         EXECUTE 'DELETE FROM sales_returns WHERE tenant_id = $1' USING v_tid;
@@ -193,7 +193,7 @@ BEGIN
         EXECUTE 'DELETE FROM blanket_order_releases WHERE tenant_id = $1' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'blanket_order_lines') THEN
-        EXECUTE 'DELETE FROM blanket_order_lines WHERE order_id IN (SELECT id FROM blanket_orders WHERE tenant_id = $1)' USING v_tid;
+        EXECUTE 'DELETE FROM blanket_order_lines WHERE blanket_order_id IN (SELECT id FROM blanket_orders WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'blanket_orders') THEN
         EXECUTE 'DELETE FROM blanket_orders WHERE tenant_id = $1' USING v_tid;
@@ -241,7 +241,7 @@ BEGIN
         EXECUTE 'DELETE FROM product_packagings WHERE product_id IN (SELECT id FROM products WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'package_contents') THEN
-        EXECUTE 'DELETE FROM package_contents WHERE tenant_id = $1' USING v_tid;
+        EXECUTE 'DELETE FROM package_contents WHERE package_id IN (SELECT id FROM packages WHERE tenant_id = $1)' USING v_tid;
     END IF;
 
     -- === CRM (references contacts) ===
@@ -255,10 +255,10 @@ BEGIN
         EXECUTE 'DELETE FROM email_messages WHERE tenant_id = $1' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'segment_members') THEN
-        EXECUTE 'DELETE FROM segment_members WHERE tenant_id = $1' USING v_tid;
+        EXECUTE 'DELETE FROM segment_members WHERE segment_id IN (SELECT id FROM customer_segments WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'campaign_members') THEN
-        EXECUTE 'DELETE FROM campaign_members WHERE tenant_id = $1' USING v_tid;
+        EXECUTE 'DELETE FROM campaign_members WHERE campaign_id IN (SELECT id FROM campaigns WHERE tenant_id = $1)' USING v_tid;
     END IF;
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'crm_tasks') THEN
         EXECUTE 'DELETE FROM crm_tasks WHERE tenant_id = $1' USING v_tid;
@@ -609,6 +609,13 @@ DECLARE
     wl_stock UUID := 'c0802022-1003-42aa-93b1-ad11e638dd32';
 
 BEGIN
+
+    -- Skip gracefully when the hardcoded demo tenant is absent (e.g. local
+    -- dev DBs) — the payroll block below resolves the tenant on its own.
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tenant_id) THEN
+        RAISE NOTICE 'demo tenant % not found — main demo seed skipped', v_tenant_id;
+        RETURN;
+    END IF;
 
     -- ============================================================================
     -- 1. UPDATE USER ROLE & PERMISSIONS
@@ -1216,3 +1223,255 @@ END;
 $$;
 
 COMMIT;
+
+-- ============================================================================
+-- PAYROLL (Ish haqi) demo seed — 2 periods (June 2026 paid + July 2026
+-- approved/awaiting payment), one employee loan, one pending deduction.
+-- Deliberately placed AFTER COMMIT: the block runs in its own transaction,
+-- so the deferred JE-balance trigger (migration 416) validates at the end
+-- of this block, and the block survives even if an earlier part of the
+-- file aborts. Re-running changes nothing (NOT EXISTS / ON CONFLICT guards).
+-- ============================================================================
+DO $$
+DECLARE
+    v_tid UUID := '554423dd-5013-40a5-b3cf-1c800c2b139c';
+    v_org_id UUID := 'f196eea8-46a8-4836-bee9-96dd9fa3ebb7';
+    v_user_id UUID;
+    v_emp_count INTEGER;
+    v_emp1 UUID;
+    v_emp2 UUID;
+    v_pp UUID;
+    v_journal UUID;
+    a_9420 UUID; a_6710 UUID; a_6410 UUID; a_5110 UUID;
+    v_gross NUMERIC; v_ded NUMERIC; v_net NUMERIC;
+    v_je UUID;
+    v_loan UUID;
+BEGIN
+    -- Tenant: first the ID the rest of this file uses, then the demo user's
+    -- email, then the tenant named 'Demo Company'. If nothing resolves,
+    -- exit silently.
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tid) THEN
+        SELECT u.tenant_id INTO v_tid FROM users u WHERE u.email = 'demo@genixerp.com' LIMIT 1;
+    END IF;
+    IF v_tid IS NULL OR NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tid) THEN
+        SELECT id INTO v_tid FROM tenants WHERE name = 'Demo Company' ORDER BY created_at LIMIT 1;
+    END IF;
+    IF v_tid IS NULL THEN
+        RAISE NOTICE '  demo tenant not found — payroll seed skipped';
+        RETURN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM organizations WHERE id = v_org_id AND tenant_id = v_tid) THEN
+        SELECT id INTO v_org_id FROM organizations WHERE tenant_id = v_tid ORDER BY created_at LIMIT 1;
+    END IF;
+    SELECT id INTO v_user_id FROM users WHERE tenant_id = v_tid ORDER BY created_at LIMIT 1;
+
+    -- ── 1. Employees: ensure at least 5 active employees with non-zero salary ──
+    -- Existing employees with NULL/0 salary get updated (no duplicates created)
+    UPDATE employees e
+    SET base_salary = 3500000 + ((x.rn - 1) % 10) * 500000,
+        updated_at = NOW()
+    FROM (SELECT id, row_number() OVER (ORDER BY created_at, id) AS rn
+          FROM employees
+          WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+            AND COALESCE(base_salary, 0) = 0) x
+    WHERE e.id = x.id;
+
+    UPDATE employees SET job_title = 'Mutaxassis', updated_at = NOW()
+    WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+      AND (job_title IS NULL OR btrim(job_title) = '');
+
+    SELECT COUNT(*) INTO v_emp_count FROM employees
+    WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+      AND COALESCE(base_salary, 0) > 0;
+
+    IF v_emp_count < 5 THEN
+        INSERT INTO employees (id, tenant_id, organization_id, employee_number, first_name, last_name,
+                               job_title, hire_date, base_salary, status, created_at, updated_at)
+        SELECT gen_random_uuid(), v_tid, v_org_id, d.emp_no, d.fn, d.ln, d.title, d.hired, d.salary,
+               'active', NOW(), NOW()
+        FROM (VALUES
+            ('DEMO-EMP-001', 'Dilshod', 'Rahimov',   'Bosh muhandis', DATE '2025-02-10', 8000000::numeric),
+            ('DEMO-EMP-002', 'Aziza',   'Karimova',  'Buxgalter',     DATE '2025-03-03', 6500000),
+            ('DEMO-EMP-003', 'Jasur',   'Toshmatov', 'Prorab',        DATE '2025-04-14', 5500000),
+            ('DEMO-EMP-004', 'Malika',  'Yusupova',  'Menejer',       DATE '2025-06-02', 4500000),
+            ('DEMO-EMP-005', 'Sardor',  'Aliyev',    'Usta',          DATE '2025-09-15', 3500000)
+        ) AS d(emp_no, fn, ln, title, hired, salary)
+        WHERE NOT EXISTS (SELECT 1 FROM employees ex
+                          WHERE ex.tenant_id = v_tid AND ex.employee_number = d.emp_no)
+        ORDER BY d.emp_no
+        LIMIT (5 - v_emp_count);
+    END IF;
+
+    -- ── 2. Payroll settings ──
+    INSERT INTO payroll_settings (tenant_id, organization_id, advance_percent, currency, company_name, created_at, updated_at)
+    VALUES (v_tid, v_org_id, 40, 'so''m', 'Demo Company', NOW(), NOW())
+    ON CONFLICT (tenant_id) DO NOTHING;
+
+    -- ── 3. June 2026 period (paid) ──
+    SELECT id INTO v_pp FROM payroll_periods
+    WHERE tenant_id = v_tid AND period_code = 'DEMO-2026-06' AND deleted_at IS NULL LIMIT 1;
+    IF v_pp IS NULL THEN
+        v_pp := gen_random_uuid();
+        INSERT INTO payroll_periods (id, tenant_id, organization_id, period_code, period_name,
+            start_date, end_date, pay_date, status, approved_by, approved_at, created_by, created_at, updated_at)
+        VALUES (v_pp, v_tid, v_org_id, 'DEMO-2026-06', 'Iyun 2026',
+            '2026-06-01', '2026-06-30', '2026-07-05', 'paid', v_user_id, '2026-06-30', v_user_id, NOW(), NOW());
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM payroll_entries WHERE payroll_period_id = v_pp AND deleted_at IS NULL) THEN
+        -- gross = base; tax = 12% (rounded); net = gross - tax;
+        -- advance = 40% (paid on the 15th), remainder paid on the 30th
+        INSERT INTO payroll_entries (id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name,
+            base_salary, gross_salary, income_tax, total_deductions, net_salary,
+            advance_amount, remainder_amount, advance_paid, advance_paid_day, remainder_paid, remainder_paid_day,
+            payment_method, status, position_snapshot, advance_percent_used, created_at, updated_at)
+        SELECT gen_random_uuid(), v_tid, v_org_id, v_pp, e.id, btrim(e.first_name || ' ' || e.last_name),
+            e.base_salary, e.base_salary, round(e.base_salary * 0.12), round(e.base_salary * 0.12),
+            e.base_salary - round(e.base_salary * 0.12),
+            round(e.base_salary * 0.40), e.base_salary - round(e.base_salary * 0.40),
+            true, 15, true, 30, 'bank_transfer', 'paid', e.job_title, 40, NOW(), NOW()
+        FROM (SELECT id, first_name, last_name, job_title, base_salary FROM employees
+              WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+                AND COALESCE(base_salary, 0) > 0
+              ORDER BY created_at, id LIMIT 5) e
+        ON CONFLICT (payroll_period_id, employee_id) DO NOTHING;
+
+        UPDATE payroll_periods p
+        SET total_gross = s.g, total_deductions = s.d, total_net = s.n, employee_count = s.c, updated_at = NOW()
+        FROM (SELECT COALESCE(SUM(gross_salary), 0) g, COALESCE(SUM(total_deductions), 0) d,
+                     COALESCE(SUM(net_salary), 0) n, COUNT(*) c
+              FROM payroll_entries WHERE payroll_period_id = v_pp AND deleted_at IS NULL) s
+        WHERE p.id = v_pp;
+    END IF;
+
+    -- ── 3a. Journal entries for June (PAYROLL journal, fallback MISC) ──
+    SELECT id INTO v_journal FROM journals
+    WHERE tenant_id = v_tid AND code = 'PAYROLL' AND is_active = true LIMIT 1;
+    IF v_journal IS NULL THEN
+        SELECT id INTO v_journal FROM journals
+        WHERE tenant_id = v_tid AND code = 'MISC' AND is_active = true LIMIT 1;
+    END IF;
+    SELECT id INTO a_9420 FROM accounts WHERE tenant_id = v_tid AND code = '9420' AND deleted_at IS NULL LIMIT 1;
+    SELECT id INTO a_6710 FROM accounts WHERE tenant_id = v_tid AND code = '6710' AND deleted_at IS NULL LIMIT 1;
+    SELECT id INTO a_6410 FROM accounts WHERE tenant_id = v_tid AND code = '6410' AND deleted_at IS NULL LIMIT 1;
+    SELECT id INTO a_5110 FROM accounts WHERE tenant_id = v_tid AND code = '5110' AND deleted_at IS NULL LIMIT 1;
+
+    SELECT total_gross, total_deductions, total_net INTO v_gross, v_ded, v_net
+    FROM payroll_periods WHERE id = v_pp;
+
+    IF v_journal IS NULL OR a_9420 IS NULL OR a_6710 IS NULL OR a_6410 IS NULL OR a_5110 IS NULL
+       OR COALESCE(v_gross, 0) = 0 THEN
+        RAISE NOTICE '  payroll JE part skipped (journal or accounts missing / empty period)';
+    ELSE
+        -- Accrual: Dt 9420 (gross) / Kt 6710 (net) + Kt 6410 (tax)
+        IF NOT EXISTS (SELECT 1 FROM journal_entries
+                       WHERE tenant_id = v_tid AND entry_number = 'PAY-DEMO-2606' AND deleted_at IS NULL) THEN
+            v_je := gen_random_uuid();
+            INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+                description, source_type, source_id, status, total_debit, total_credit,
+                posted_at, posted_by, created_by, created_at, updated_at)
+            VALUES (v_je, v_tid, v_org_id, v_journal, 'PAY-DEMO-2606', '2026-06-30',
+                'Ish haqi hisoblash — Iyun 2026 (demo)', 'payroll', v_pp, 'posted', v_gross, v_gross,
+                '2026-06-30', v_user_id, v_user_id, NOW(), NOW());
+            INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES
+            (gen_random_uuid(), v_je, a_9420, 'Mehnat haqi xarajatlari',   v_gross, 0,     1, NOW()),
+            (gen_random_uuid(), v_je, a_6710, 'Xodimlarga ish haqi qarzi', 0,       v_net, 2, NOW()),
+            (gen_random_uuid(), v_je, a_6410, 'Daromad solig''i (12%)',    0,       v_ded, 3, NOW());
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) + v_gross, updated_at = NOW() WHERE id = a_9420;
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) - v_net,   updated_at = NOW() WHERE id = a_6710;
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) - v_ded,   updated_at = NOW() WHERE id = a_6410;
+        END IF;
+
+        -- Payment: Dt 6710 / Kt 5110 (net)
+        IF NOT EXISTS (SELECT 1 FROM journal_entries
+                       WHERE tenant_id = v_tid AND entry_number = 'PAYPMT-DEMO-2606' AND deleted_at IS NULL) THEN
+            v_je := gen_random_uuid();
+            INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+                description, source_type, source_id, status, total_debit, total_credit,
+                posted_at, posted_by, created_by, created_at, updated_at)
+            VALUES (v_je, v_tid, v_org_id, v_journal, 'PAYPMT-DEMO-2606', '2026-07-05',
+                'Ish haqi to''lovi — Iyun 2026 (demo)', 'payroll_payment', v_pp, 'posted', v_net, v_net,
+                '2026-07-05', v_user_id, v_user_id, NOW(), NOW());
+            INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES
+            (gen_random_uuid(), v_je, a_6710, 'Xodimlarga ish haqi qarzi', v_net, 0,     1, NOW()),
+            (gen_random_uuid(), v_je, a_5110, 'Hisob-kitob schyoti',       0,     v_net, 2, NOW());
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) + v_net, updated_at = NOW() WHERE id = a_6710;
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) - v_net, updated_at = NOW() WHERE id = a_5110;
+        END IF;
+    END IF;
+
+    -- ── 4. July 2026 period (approved, awaiting payment) ──
+    SELECT id INTO v_pp FROM payroll_periods
+    WHERE tenant_id = v_tid AND period_code = 'DEMO-2026-07' AND deleted_at IS NULL LIMIT 1;
+    IF v_pp IS NULL THEN
+        v_pp := gen_random_uuid();
+        INSERT INTO payroll_periods (id, tenant_id, organization_id, period_code, period_name,
+            start_date, end_date, pay_date, status, approved_by, approved_at, created_by, created_at, updated_at)
+        VALUES (v_pp, v_tid, v_org_id, 'DEMO-2026-07', 'Iyul 2026',
+            '2026-07-01', '2026-07-31', '2026-08-05', 'approved', v_user_id, '2026-07-31', v_user_id, NOW(), NOW());
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM payroll_entries WHERE payroll_period_id = v_pp AND deleted_at IS NULL) THEN
+        INSERT INTO payroll_entries (id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name,
+            base_salary, gross_salary, income_tax, total_deductions, net_salary,
+            advance_amount, remainder_amount, advance_paid, advance_paid_day, remainder_paid, remainder_paid_day,
+            payment_method, status, position_snapshot, advance_percent_used, created_at, updated_at)
+        SELECT gen_random_uuid(), v_tid, v_org_id, v_pp, e.id, btrim(e.first_name || ' ' || e.last_name),
+            e.base_salary, e.base_salary, round(e.base_salary * 0.12), round(e.base_salary * 0.12),
+            e.base_salary - round(e.base_salary * 0.12),
+            round(e.base_salary * 0.40), e.base_salary - round(e.base_salary * 0.40),
+            false, NULL, false, NULL, 'bank_transfer', 'approved', e.job_title, 40, NOW(), NOW()
+        FROM (SELECT id, first_name, last_name, job_title, base_salary FROM employees
+              WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+                AND COALESCE(base_salary, 0) > 0
+              ORDER BY created_at, id LIMIT 5) e
+        ON CONFLICT (payroll_period_id, employee_id) DO NOTHING;
+
+        UPDATE payroll_periods p
+        SET total_gross = s.g, total_deductions = s.d, total_net = s.n, employee_count = s.c, updated_at = NOW()
+        FROM (SELECT COALESCE(SUM(gross_salary), 0) g, COALESCE(SUM(total_deductions), 0) d,
+                     COALESCE(SUM(net_salary), 0) n, COUNT(*) c
+              FROM payroll_entries WHERE payroll_period_id = v_pp AND deleted_at IS NULL) s
+        WHERE p.id = v_pp;
+    END IF;
+
+    -- ── 5. Employee loan (DEMO-LOAN-001) + 4-month payment schedule ──
+    SELECT id INTO v_emp1 FROM employees
+    WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active' AND COALESCE(base_salary, 0) > 0
+    ORDER BY created_at, id LIMIT 1;
+    SELECT id INTO v_emp2 FROM employees
+    WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active' AND COALESCE(base_salary, 0) > 0
+    ORDER BY created_at, id OFFSET 1 LIMIT 1;
+    IF v_emp2 IS NULL THEN v_emp2 := v_emp1; END IF;
+
+    IF v_emp1 IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM employee_loans
+        WHERE tenant_id = v_tid AND loan_number = 'DEMO-LOAN-001' AND deleted_at IS NULL) THEN
+        v_loan := gen_random_uuid();
+        INSERT INTO employee_loans (id, tenant_id, organization_id, employee_id, loan_number, amount,
+            monthly_payment, duration_months, paid_amount, remaining_amount, start_date, end_date,
+            reason, status, created_by, approved_by, created_at, updated_at)
+        VALUES (v_loan, v_tid, v_org_id, v_emp1, 'DEMO-LOAN-001', 2000000,
+            500000, 4, 500000, 1500000, '2026-06-01', '2026-09-30',
+            'Demo: shaxsiy ehtiyoj uchun qarz', 'active', v_user_id, v_user_id, NOW(), NOW());
+        INSERT INTO employee_loan_payments (id, tenant_id, loan_id, employee_id, month_label, due_date,
+            amount, remaining_after, status, paid_at, created_at, updated_at) VALUES
+        (gen_random_uuid(), v_tid, v_loan, v_emp1, 'Iyun 2026',    '2026-06-30', 500000, 1500000, 'paid',    '2026-06-30', NOW(), NOW()),
+        (gen_random_uuid(), v_tid, v_loan, v_emp1, 'Iyul 2026',    '2026-07-31', 500000, 1000000, 'pending', NULL,         NOW(), NOW()),
+        (gen_random_uuid(), v_tid, v_loan, v_emp1, 'Avgust 2026',  '2026-08-31', 500000, 500000,  'pending', NULL,         NOW(), NOW()),
+        (gen_random_uuid(), v_tid, v_loan, v_emp1, 'Sentabr 2026', '2026-09-30', 500000, 0,       'pending', NULL,         NOW(), NOW());
+    END IF;
+
+    -- ── 6. Pending deduction (inventory shortage) ──
+    IF v_emp2 IS NOT NULL AND v_user_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM employee_deductions WHERE tenant_id = v_tid AND reason = 'Demo: ombor kamomadi') THEN
+        INSERT INTO employee_deductions (id, tenant_id, organization_id, employee_id, amount, reason,
+            source_type, status, created_by, created_at, updated_at)
+        VALUES (gen_random_uuid(), v_tid, v_org_id, v_emp2, 150000, 'Demo: ombor kamomadi',
+            'inventory_shortage', 'pending', v_user_id, NOW(), NOW());
+    END IF;
+
+    RAISE NOTICE '  payroll demo seed done: June (paid) + July (approved), loan + pending deduction';
+END;
+$$;

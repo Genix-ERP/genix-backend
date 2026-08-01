@@ -102,6 +102,9 @@ func (h *Handler) computeProfitTaxExpenses(tenantID uuid.UUID, orgID uuid.UUID, 
 		args = append(args, orgID)
 		orgClause = " AND organization_id = $4"
 	}
+	// Status filter (expenses v2, migration 444): drafts and rejected/
+	// cancelled expenses never happened for tax purposes — only
+	// submitted/approved/paid rows enter the tax-base computation.
 	q := fmt.Sprintf(`
 		SELECT
 		  COALESCE(SUM(CASE WHEN is_recognized      THEN total_amount ELSE 0 END), 0) AS recognized,
@@ -109,6 +112,7 @@ func (h *Handler) computeProfitTaxExpenses(tenantID uuid.UUID, orgID uuid.UUID, 
 		FROM expenses
 		WHERE tenant_id   = $1
 		  AND deleted_at  IS NULL
+		  AND status IN ('submitted', 'approved', 'paid')
 		  AND expense_date BETWEEN $2 AND $3
 		  %s
 	`, orgClause)
