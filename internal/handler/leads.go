@@ -565,7 +565,7 @@ func (h *Handler) CreateLead(c *gin.Context) {
 	}
 
 	// Trigger workflow rules for new lead
-	go h.EvaluateWorkflowRules(tenantID, "lead.created", map[string]interface{}{
+	h.EmitWorkflowEvent(tenantID, "lead.created", map[string]interface{}{
 		"record_id":      id.String(),
 		"contact_name":   input.ContactName,
 		"company_name":   input.CompanyName,
@@ -783,6 +783,20 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 	if rowsAffected == 0 {
 		response.NotFound(c, "Lead")
 		return
+	}
+
+	// Trigger workflow rules on stage/status change
+	if input.Status != nil && oldStatus.String != string(*input.Status) {
+		contactName := oldContactName.String
+		if input.ContactName != nil {
+			contactName = *input.ContactName
+		}
+		h.EmitWorkflowEvent(tenantID, "lead.status_changed", map[string]interface{}{
+			"record_id":    id.String(),
+			"contact_name": contactName,
+			"old_status":   oldStatus.String,
+			"new_status":   string(*input.Status),
+		})
 	}
 
 	// Write audit log for changed fields

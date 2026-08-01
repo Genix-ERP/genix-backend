@@ -767,6 +767,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 
 		if reorderPoint > 0 && newBalance <= reorderPoint {
 			h.EvaluateWorkflowRules(tenantID, "inventory.low_stock", map[string]interface{}{
+				"record_id":     input.ProductID,
 				"product_id":    input.ProductID,
 				"product_name":  productName,
 				"product_code":  productCode,
@@ -787,6 +788,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 		}
 
 		h.EvaluateWorkflowRules(tenantID, "inventory.adjusted", map[string]interface{}{
+			"record_id":    input.ProductID,
 			"product_id":   input.ProductID,
 			"product_name": productName,
 			"product_code": productCode,

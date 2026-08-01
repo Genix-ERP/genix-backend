@@ -38,6 +38,21 @@ func StartBackgroundJobs(db *database.DB, log logger.Logger) {
 		}
 	}()
 
+	// Contract expiry notifications — responsible employee gets an in-app
+	// notification at 30/14/3 days before end_date, de-duplicated per
+	// threshold via contract_expiry_notifications (migration 443).
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+
+		time.Sleep(90 * time.Second)
+		checkContractExpiryNotifications(db, log)
+
+		for range ticker.C {
+			checkContractExpiryNotifications(db, log)
+		}
+	}()
+
 	// Auto depreciation scheduler — runs every hour, processes on 1st of each month
 	go func() {
 		ticker := time.NewTicker(1 * time.Hour)
@@ -69,7 +84,121 @@ func StartBackgroundJobs(db *database.DB, log logger.Logger) {
 		}
 	}()
 
-	log.Info("Background jobs started (step timeout checker every 15 min, reconciliation reminders every 1 hour, auto depreciation hourly, activity reminders every 1 min)")
+	// Vazifalar overdue scanner — hourly. Notifies each assignee once when a
+	// task's due_date passes; overdue_notified_at makes it one-shot (a changed
+	// due date re-arms it, see UpdateBoardTask).
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+
+		time.Sleep(90 * time.Second)
+		checkOverdueTasks(db, log)
+
+		for range ticker.C {
+			checkOverdueTasks(db, log)
+		}
+	}()
+
+	log.Info("Background jobs started (step timeout checker every 15 min, reconciliation reminders every 1 hour, auto depreciation hourly, activity reminders every 1 min, overdue tasks hourly)")
+}
+
+// checkOverdueTasks finds open tasks whose due_date has passed and that have
+// not been notified yet, then notifies every assignee's linked user (falling
+// back to the task creator when there are no assignees). The task is stamped
+// overdue_notified_at even when nobody could be notified so it isn't
+// re-scanned forever. Notifications are inserted with push_sent_at NULL so the
+// background push dispatcher delivers the mobile push.
+func checkOverdueTasks(db *database.DB, log logger.Logger) {
+	rows, err := db.Query(`
+		SELECT t.id, t.tenant_id, t.board_id, t.title, t.due_date, t.created_by
+		FROM tasks t
+		JOIN task_boards b ON b.id = t.board_id
+		WHERE t.due_date < CURRENT_DATE
+		  AND t.completed_at IS NULL
+		  AND t.archived_at IS NULL
+		  AND t.overdue_notified_at IS NULL
+		  AND b.archived_at IS NULL
+		LIMIT 200
+	`)
+	if err != nil {
+		log.Error("Failed to query overdue tasks", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	type overdueTask struct {
+		id, tenantID, boardID uuid.UUID
+		title                 string
+		dueDate               time.Time
+		createdBy             *uuid.UUID
+	}
+	tasks := []overdueTask{}
+	for rows.Next() {
+		var t overdueTask
+		if err := rows.Scan(&t.id, &t.tenantID, &t.boardID, &t.title, &t.dueDate, &t.createdBy); err != nil {
+			log.Error("Failed to scan overdue task", "error", err)
+			continue
+		}
+		tasks = append(tasks, t)
+	}
+	rows.Close()
+
+	now := time.Now()
+	notified := 0
+	for _, t := range tasks {
+		// Recipients: linked users of all assignees; fall back to the creator.
+		recipients := map[uuid.UUID]bool{}
+		aRows, err := db.Query(`
+			SELECT e.user_id FROM task_assignees ta
+			JOIN employees e ON e.id = ta.employee_id
+			WHERE ta.task_id = $1 AND e.user_id IS NOT NULL AND e.deleted_at IS NULL
+		`, t.id)
+		if err == nil {
+			for aRows.Next() {
+				var uid uuid.UUID
+				if err := aRows.Scan(&uid); err == nil && uid != uuid.Nil {
+					recipients[uid] = true
+				}
+			}
+			aRows.Close()
+		}
+		if len(recipients) == 0 && t.createdBy != nil && *t.createdBy != uuid.Nil {
+			recipients[*t.createdBy] = true
+		}
+
+		dueStr := t.dueDate.Format("2006-01-02")
+		for uid := range recipients {
+			var lang string
+			if err := db.QueryRow(`SELECT COALESCE(language, 'en') FROM users WHERE id = $1`, uid).Scan(&lang); err != nil || lang == "" {
+				lang = "en"
+			}
+			tmpl, okT := notificationTemplates["task_overdue"][lang]
+			if !okT {
+				tmpl = notificationTemplates["task_overdue"]["en"]
+			}
+			dataJSON, _ := json.Marshal(map[string]interface{}{
+				"task_id":    t.id.String(),
+				"board_id":   t.boardID.String(),
+				"task_title": t.title,
+				"due_date":   dueStr,
+			})
+			if _, err := db.Exec(`
+				INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
+				VALUES ($1, $2, $3, 'task_overdue', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
+			`, uuid.New(), t.tenantID, uid, tmpl.Title, fmt.Sprintf(tmpl.Message, t.title, dueStr), string(dataJSON), now); err != nil {
+				log.Error("Failed to insert overdue notification", "error", err, "task_id", t.id.String())
+				continue
+			}
+			notified++
+		}
+
+		// One-shot stamp — with or without recipients.
+		db.Exec(`UPDATE tasks SET overdue_notified_at = $2 WHERE id = $1`, t.id, now)
+	}
+
+	if len(tasks) > 0 {
+		log.Info("Overdue task scan complete", "tasks", len(tasks), "notifications", notified)
+	}
 }
 
 // checkStepTimeouts finds step logs that have exceeded their max_duration_hours
@@ -767,5 +896,115 @@ func checkActivityReminders(db *database.DB, log logger.Logger) {
 		log.Info("CRM activity reminders processed",
 			"sent", count,
 			"skipped_no_recipient", skippedNoRecipient)
+	}
+}
+
+// checkContractExpiryNotifications notifies the responsible employee (or
+// the contract's creator when no responsible is set) at 30/14/3 days
+// before an active contract's end_date. Each contract+threshold pair
+// notifies exactly once — the contract_expiry_notifications table is the
+// dedupe ledger, so a restart or a re-run never double-sends.
+func checkContractExpiryNotifications(db *database.DB, log logger.Logger) {
+	rows, err := db.Query(`
+		SELECT c.id, c.tenant_id, c.contract_number, c.title, c.end_date,
+		       (c.end_date - CURRENT_DATE) AS days_left,
+		       e.user_id, c.created_by
+		FROM procurement_contracts c
+		LEFT JOIN employees e ON e.id = c.responsible_employee_id AND e.tenant_id = c.tenant_id
+		WHERE c.status = 'active' AND c.deleted_at IS NULL AND c.archived_at IS NULL
+		  AND c.end_date IS NOT NULL
+		  AND c.end_date >= CURRENT_DATE
+		  AND c.end_date <= CURRENT_DATE + INTERVAL '30 days'
+	`)
+	if err != nil {
+		log.Error("Failed to scan contracts for expiry notifications", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	type row struct {
+		id             uuid.UUID
+		tenantID       uuid.UUID
+		contractNumber string
+		title          string
+		endDate        time.Time
+		daysLeft       int
+		recipient      uuid.UUID
+	}
+	var contracts []row
+	for rows.Next() {
+		var (
+			r          row
+			userID     *uuid.UUID
+			createdBy  *uuid.UUID
+		)
+		if err := rows.Scan(&r.id, &r.tenantID, &r.contractNumber, &r.title, &r.endDate, &r.daysLeft, &userID, &createdBy); err != nil {
+			continue
+		}
+		if userID != nil && *userID != uuid.Nil {
+			r.recipient = *userID
+		} else if createdBy != nil && *createdBy != uuid.Nil {
+			r.recipient = *createdBy
+		} else {
+			continue // nobody to notify
+		}
+		contracts = append(contracts, r)
+	}
+	rows.Close()
+
+	thresholds := []int{30, 14, 3}
+	now := time.Now()
+	sent := 0
+	for _, ct := range contracts {
+		for _, threshold := range thresholds {
+			if ct.daysLeft > threshold {
+				continue
+			}
+			// Claim the threshold first; if another instance already sent
+			// it, the unique constraint makes this a no-op.
+			res, err := db.Exec(`
+				INSERT INTO contract_expiry_notifications (id, tenant_id, contract_id, threshold_days, sent_at)
+				VALUES ($1, $2, $3, $4, $5)
+				ON CONFLICT (contract_id, threshold_days) DO NOTHING
+			`, uuid.New(), ct.tenantID, ct.id, threshold, now)
+			if err != nil {
+				log.Error("Failed to claim contract expiry threshold", "error", err, "contract_id", ct.id.String())
+				continue
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				continue // already notified for this threshold
+			}
+
+			var lang string
+			if err := db.QueryRow(`SELECT COALESCE(language, 'en') FROM users WHERE id = $1`, ct.recipient).Scan(&lang); err != nil || lang == "" {
+				lang = "en"
+			}
+			tmpl, okT := notificationTemplates["contract_expiring"][lang]
+			if !okT {
+				tmpl = notificationTemplates["contract_expiring"]["en"]
+			}
+			endStr := ct.endDate.Format("2006-01-02")
+			dataJSON, _ := json.Marshal(map[string]interface{}{
+				"contract_id":     ct.id.String(),
+				"contract_number": ct.contractNumber,
+				"end_date":        endStr,
+				"days_left":       ct.daysLeft,
+				"threshold_days":  threshold,
+			})
+			if _, err := db.Exec(`
+				INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
+				VALUES ($1, $2, $3, 'contract_expiring', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
+			`, uuid.New(), ct.tenantID, ct.recipient, tmpl.Title,
+				fmt.Sprintf(tmpl.Message, ct.contractNumber, ct.title, ct.daysLeft, endStr),
+				string(dataJSON), now); err != nil {
+				log.Error("Failed to insert contract expiry notification", "error", err, "contract_id", ct.id.String())
+				continue
+			}
+			sent++
+		}
+	}
+
+	if sent > 0 {
+		log.Info("Contract expiry notifications sent", "count", sent)
 	}
 }

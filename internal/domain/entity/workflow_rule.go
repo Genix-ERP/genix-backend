@@ -23,19 +23,24 @@ type WorkflowRule struct {
 	Priority        int             `json:"priority" db:"priority"`
 	LastTriggeredAt *time.Time      `json:"last_triggered_at,omitempty" db:"last_triggered_at"`
 	TriggerCount    int             `json:"trigger_count" db:"trigger_count"`
+	LastStatus      *string         `json:"last_status,omitempty" db:"-"`
+	AutoPausedAt    *time.Time      `json:"auto_paused_at,omitempty" db:"auto_paused_at"`
+	PausedReason    *string         `json:"paused_reason,omitempty" db:"paused_reason"`
 	CreatedBy       *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
 	CreatedAt       time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time       `json:"updated_at" db:"updated_at"`
 	DeletedAt       sql.NullTime    `json:"-" db:"deleted_at"`
 }
 
-// CreateWorkflowRuleInput represents input for creating a workflow rule
+// CreateWorkflowRuleInput represents input for creating a workflow rule.
+// category and trigger_type are derived server-side from trigger_event; the
+// fields are still accepted for backward compatibility but ignored.
 type CreateWorkflowRuleInput struct {
 	Name         string          `json:"name" binding:"required"`
 	Description  string          `json:"description,omitempty"`
-	Category     string          `json:"category" binding:"required"`
-	TriggerType  string          `json:"trigger_type" binding:"required"`
-	TriggerEvent string          `json:"trigger_event,omitempty"`
+	Category     string          `json:"category,omitempty"`
+	TriggerType  string          `json:"trigger_type,omitempty"`
+	TriggerEvent string          `json:"trigger_event" binding:"required"`
 	Conditions   json.RawMessage `json:"conditions"`
 	Actions      json.RawMessage `json:"actions" binding:"required"`
 	IsActive     *bool           `json:"is_active,omitempty"`
@@ -69,6 +74,9 @@ type WorkflowRuleResponse struct {
 	Priority        int             `json:"priority"`
 	LastTriggeredAt *string         `json:"last_triggered_at,omitempty"`
 	TriggerCount    int             `json:"trigger_count"`
+	LastStatus      *string         `json:"last_status,omitempty"`
+	AutoPausedAt    *string         `json:"auto_paused_at,omitempty"`
+	PausedReason    *string         `json:"paused_reason,omitempty"`
 	CreatedAt       string          `json:"created_at"`
 	UpdatedAt       string          `json:"updated_at"`
 }
@@ -94,6 +102,12 @@ func (r *WorkflowRule) ToResponse() *WorkflowRuleResponse {
 		t := r.LastTriggeredAt.Format(time.RFC3339)
 		resp.LastTriggeredAt = &t
 	}
+	resp.LastStatus = r.LastStatus
+	if r.AutoPausedAt != nil {
+		t := r.AutoPausedAt.Format(time.RFC3339)
+		resp.AutoPausedAt = &t
+	}
+	resp.PausedReason = r.PausedReason
 	return resp
 }
 
@@ -111,12 +125,17 @@ type WorkflowLog struct {
 
 // WorkflowLogResponse represents the API response for a workflow log
 type WorkflowLogResponse struct {
-	ID              string          `json:"id"`
-	RuleID          string          `json:"rule_id"`
-	RuleName        string          `json:"rule_name,omitempty"`
-	TriggerData     json.RawMessage `json:"trigger_data"`
-	ActionsExecuted json.RawMessage `json:"actions_executed"`
-	Status          string          `json:"status"`
-	ErrorMessage    *string         `json:"error_message,omitempty"`
-	ExecutedAt      string          `json:"executed_at"`
+	ID               string          `json:"id"`
+	RuleID           string          `json:"rule_id"`
+	RuleName         string          `json:"rule_name,omitempty"`
+	TriggerData      json.RawMessage `json:"trigger_data"`
+	ActionsExecuted  json.RawMessage `json:"actions_executed"`
+	ConditionResults json.RawMessage `json:"condition_results,omitempty"`
+	Status           string          `json:"status"`
+	ErrorMessage     *string         `json:"error_message,omitempty"`
+	TriggerEvent     *string         `json:"trigger_event,omitempty"`
+	RelatedType      *string         `json:"related_type,omitempty"`
+	RelatedID        *string         `json:"related_id,omitempty"`
+	DurationMs       *int            `json:"duration_ms,omitempty"`
+	ExecutedAt       string          `json:"executed_at"`
 }
