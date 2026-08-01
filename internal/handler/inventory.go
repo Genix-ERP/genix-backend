@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -651,10 +652,12 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 
 	_, err = tx.Exec(`
 		INSERT INTO inventory_transactions (
-			id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
+			id, tenant_id, organization_id, inventory_id, product_id, warehouse_id,
+			transaction_type, quantity,
 			unit_cost, total_cost, reason, notes, transaction_date, created_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $11)
-	`, transactionID, tenantID, organizationID, inventoryID, transactionType, input.Quantity,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $13)
+	`, transactionID, tenantID, organizationID, inventoryID, productID, warehouseID,
+		transactionType, input.Quantity,
 		unitCost, input.Quantity*unitCost, reason, notes, now, userID)
 
 	if err != nil {
@@ -1007,11 +1010,13 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 	// Source (outbound) transaction
 	_, err = tx.Exec(`
 		INSERT INTO inventory_transactions (
-			id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
+			id, tenant_id, organization_id, inventory_id, product_id, warehouse_id,
+			transaction_type, quantity,
 			unit_cost, total_cost, from_warehouse_id, to_warehouse_id,
 			from_location_id, to_location_id, notes, transaction_date, created_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $14)
-	`, uuid.New(), tenantID, organizationID, sourceInventoryID, transactionType, -input.Quantity,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $16)
+	`, uuid.New(), tenantID, organizationID, sourceInventoryID, productID, fromWarehouseID,
+		transactionType, -input.Quantity,
 		unitCost, -input.Quantity*unitCost, fromWarehouseID, toWarehouseID,
 		fromLocationID, toLocationID, notes, now, userID)
 
@@ -1024,11 +1029,13 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 	// Destination (inbound) transaction
 	_, err = tx.Exec(`
 		INSERT INTO inventory_transactions (
-			id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
+			id, tenant_id, organization_id, inventory_id, product_id, warehouse_id,
+			transaction_type, quantity,
 			unit_cost, total_cost, from_warehouse_id, to_warehouse_id,
 			from_location_id, to_location_id, notes, transaction_date, created_by, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $14)
-	`, uuid.New(), tenantID, organizationID, destInventoryID, transactionType, input.Quantity,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $16)
+	`, uuid.New(), tenantID, organizationID, destInventoryID, productID, toWarehouseID,
+		transactionType, input.Quantity,
 		unitCost, input.Quantity*unitCost, fromWarehouseID, toWarehouseID,
 		fromLocationID, toLocationID, notes, now, userID)
 
@@ -1329,22 +1336,30 @@ func (h *Handler) GetInventoryValuation(c *gin.Context) {
 	warehouseID := c.Query("warehouse_id")
 	categoryID := c.Query("category_id")
 
+	// average_cost is QUANTITY-WEIGHTED (Σqty×cost / Σqty), not a plain AVG
+	// over warehouse rows — a 1-unit row must not weigh as much as a
+	// 1000-unit row (audit §2). The inventory join is tenant-scoped: the
+	// old bare `p.id = i.product_id` join let another tenant's rows leak
+	// into the aggregate.
 	baseQuery := `
 		SELECT p.id as product_id, p.code as product_code, p.name as product_name,
 			   COALESCE(pc.name, 'Uncategorized') as category_name,
 			   COALESCE(SUM(i.quantity_on_hand), 0) as quantity_on_hand,
-			   COALESCE(AVG(i.unit_cost), p.cost_price) as average_cost,
+			   COALESCE(
+			       SUM(i.quantity_on_hand * i.unit_cost) / NULLIF(SUM(i.quantity_on_hand), 0),
+			       p.cost_price
+			   ) as average_cost,
 			   COALESCE(SUM(i.total_value), 0) as total_value,
 			   p.cost_price as last_purchase_price
 		FROM products p
 		LEFT JOIN product_categories pc ON p.category_id = pc.id
-		LEFT JOIN inventory i ON p.id = i.product_id
+		LEFT JOIN inventory i ON p.id = i.product_id AND i.tenant_id = p.tenant_id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL AND p.is_active = true AND p.is_stockable = true
 	`
 	countQuery := `
 		SELECT COUNT(DISTINCT p.id)
 		FROM products p
-		LEFT JOIN inventory i ON p.id = i.product_id
+		LEFT JOIN inventory i ON p.id = i.product_id AND i.tenant_id = p.tenant_id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL AND p.is_active = true AND p.is_stockable = true
 	`
 
@@ -5611,73 +5626,68 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 	}
 
 	now := time.Now()
-
-	// Create inventory adjustments for each variance line
-	for _, line := range lines {
-		var orgIDPtr *uuid.UUID
-		if orgID != uuid.Nil {
-			orgIDPtr = &orgID
-		}
-
-		// Find or create inventory record (upsert to prevent duplicates)
-		var inventoryID uuid.UUID
-		newInvID := uuid.New()
-		err = h.db.QueryRow(`
-			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8, $8)
-			ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET
-				quantity_on_hand = inventory.quantity_on_hand + EXCLUDED.quantity_on_hand,
-				last_movement_date = $8,
-				updated_at = $8
-			RETURNING id
-		`, newInvID, tenantID, orgIDPtr, line.ProductID, warehouseID, line.Variance, line.UnitCost, now).Scan(&inventoryID)
-		if err != nil {
-			h.log.Error("Failed to upsert inventory for stock count adjustment", "error", err, "product_id", line.ProductID)
-		}
-
-		// Create inventory transaction
-		transactionID := uuid.New()
-		reason := fmt.Sprintf("Stock count %s", countNumber)
-		h.db.Exec(`
-			INSERT INTO inventory_transactions (
-				id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
-				unit_cost, total_cost, reason, notes, transaction_date, created_by, created_at
-			) VALUES ($1, $2, $3, $4, 'adjustment', $5, $6, $7, $8, $9, $10, $11, $10)
-		`, transactionID, tenantID, orgIDPtr, inventoryID, line.Variance,
-			line.UnitCost, math.Abs(line.Variance)*line.UnitCost, reason,
-			"Inventory count adjustment: "+countNumber, now, userID)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
 	}
 
-	// Create journal entry for the NET variance. Net (signed) matters: a
-	// surplus increases inventory (DR 1010) while a shortage decreases it
-	// (CR 1010). The old code summed math.Abs and always CR'd inventory, so a
-	// surplus raised the physical quantity but lowered the GL valuation.
+	// Net (signed) variance matters: a surplus increases inventory (DR 1010)
+	// while a shortage decreases it (CR 1010). The old code summed math.Abs
+	// and always CR'd inventory, so a surplus raised the physical quantity
+	// but lowered the GL valuation.
 	netVarianceValue := 0.0
 	for _, line := range lines {
 		netVarianceValue += line.Variance * line.UnitCost
 	}
-	if math.Abs(netVarianceValue) > 0.005 {
-		var orgIDPtr *uuid.UUID
-		if orgID != uuid.Nil {
-			orgIDPtr = &orgID
-		}
 
-		var journalID uuid.UUID
-		var nextNumber int
+	// Resolve journal + accounts before the tx (plain reads)
+	var journalID uuid.UUID
+	var nextNumber int
+	var adjustAcct, stockAcct uuid.UUID
+	postJE := math.Abs(netVarianceValue) > 0.005
+	if postJE {
 		h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 
 		// Debit: Stock Adjustment Expense
-		adjustAcct := findAccount(h.db, tenantID, orgIDPtr, "stock adjustment", "6910")
+		adjustAcct = findAccount(h.db, tenantID, orgIDPtr, "stock adjustment", "6910")
 		if adjustAcct == uuid.Nil {
 			adjustAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory adjustment", "6910")
 		}
 		// Credit: Stock Valuation
-		stockAcct := findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
+		stockAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
 		if stockAcct == uuid.Nil {
 			stockAcct = findAccount(h.db, tenantID, orgIDPtr, "stock valuation", "1010")
 		}
+		postJE = journalID != uuid.Nil && adjustAcct != uuid.Nil && stockAcct != uuid.Nil
+	}
 
-		if journalID != uuid.Nil && adjustAcct != uuid.Nil && stockAcct != uuid.Nil {
+	// Everything the completion changes — variance stock deltas, their ledger
+	// rows, the net-variance JE and the 'completed' status — lands in ONE
+	// transaction. The old flow applied stock via h.db, posted the JE in a
+	// separate tx and flipped the status last: a failure mid-way left stock
+	// applied with the count still open, and re-completing double-applied
+	// the variances (docs/ombor-audit.md §4).
+	completeErr := func() error {
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback()
+
+		for _, line := range lines {
+			if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+				TenantID: tenantID, OrgID: orgIDPtr, ProductID: line.ProductID,
+				WarehouseID: warehouseID, Qty: line.Variance, UnitCost: line.UnitCost,
+				TxType: "count", RefType: "stock_count", RefID: countID.String(),
+				Reason: fmt.Sprintf("Stock count %s", countNumber),
+				Notes:  "Inventory count adjustment: " + countNumber,
+				CreatedBy: userID, When: now, AllowNeg: true,
+			}); dErr != nil {
+				return dErr
+			}
+		}
+
+		if postJE {
 			entryID := uuid.New()
 			description := fmt.Sprintf("Inventory Count Adjustment: %s", countNumber)
 			amount := math.Abs(netVarianceValue)
@@ -5691,78 +5701,71 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 				adjDr, stockCr = amount, amount // shortage: DR adjustment (loss), CR inventory
 			}
 
-			tx, txErr := h.db.Begin()
-			if txErr != nil {
-				h.log.Error("Failed to begin stock-count journal tx", "error", txErr)
-			} else {
-				committed := false
-				defer func() {
-					if !committed {
-						tx.Rollback()
-					}
-				}()
-
-				entryNumber := fmt.Sprintf("ADJ%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "ADJ", nextNumber))
-				if _, err = tx.Exec(`
-					INSERT INTO journal_entries (
-						id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-						description, source_type, source_id, status, total_debit, total_credit,
-						created_by, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_count', $8, 'posted', $9, $9, $10, $11, $11)
-				`, entryID, tenantID, orgIDPtr, journalID, entryNumber, now,
-					description, countID.String(), amount, userID, now); err != nil {
-					h.log.Error("Failed to create stock-count journal entry", "error", err)
-					return
-				}
-				if _, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Valuation', $4, $5, 1, $6)`,
-					uuid.New(), entryID, stockAcct, stockDr, stockCr, now); err != nil {
-					h.log.Error("Failed to insert stock-count inventory line", "error", err)
-					return
-				}
-				if _, err = tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Count Adjustment', $4, $5, 2, $6)`,
-					uuid.New(), entryID, adjustAcct, adjDr, adjCr, now); err != nil {
-					h.log.Error("Failed to insert stock-count adjustment line", "error", err)
-					return
-				}
-				// Balance updates (both accounts debit-normal): += (debit - credit)
-				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", stockDr-stockCr, now, stockAcct); err != nil {
-					h.log.Error("Failed to update stock account balance", "error", err)
-					return
-				}
-				if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", adjDr-adjCr, now, adjustAcct); err != nil {
-					h.log.Error("Failed to update adjustment account balance", "error", err)
-					return
-				}
-				if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
-					h.log.Error("Failed to bump journal next_number", "error", err)
-					return
-				}
-				if _, err = tx.Exec("UPDATE stock_counts SET adjustment_journal_id = $1 WHERE id = $2", entryID, countID); err != nil {
-					h.log.Error("Failed to link stock-count journal", "error", err)
-					return
-				}
-				if err = tx.Commit(); err != nil {
-					h.log.Error("Failed to commit stock-count journal entry", "error", err)
-				} else {
-					committed = true
-				}
+			entryNumber := fmt.Sprintf("ADJ%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "ADJ", nextNumber))
+			if _, jErr := tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+					description, source_type, source_id, status, total_debit, total_credit,
+					created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_count', $8, 'posted', $9, $9, $10, $11, $11)
+			`, entryID, tenantID, orgIDPtr, journalID, entryNumber, now,
+				description, countID.String(), amount, userID, now); jErr != nil {
+				return jErr
+			}
+			if _, jErr := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Valuation', $4, $5, 1, $6)`,
+				uuid.New(), entryID, stockAcct, stockDr, stockCr, now); jErr != nil {
+				return jErr
+			}
+			if _, jErr := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, 'Stock Count Adjustment', $4, $5, 2, $6)`,
+				uuid.New(), entryID, adjustAcct, adjDr, adjCr, now); jErr != nil {
+				return jErr
+			}
+			// Balance updates (both accounts debit-normal): += (debit - credit)
+			if _, jErr := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", stockDr-stockCr, now, stockAcct); jErr != nil {
+				return jErr
+			}
+			if _, jErr := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", adjDr-adjCr, now, adjustAcct); jErr != nil {
+				return jErr
+			}
+			if _, jErr := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); jErr != nil {
+				return jErr
+			}
+			if _, jErr := tx.Exec("UPDATE stock_counts SET adjustment_journal_id = $1 WHERE id = $2", entryID, countID); jErr != nil {
+				return jErr
 			}
 		}
+
+		// Totals + completed status — in the same tx, so a retry after any
+		// failure re-runs everything from a clean state.
+		if _, uErr := tx.Exec(`
+			UPDATE stock_counts SET
+				status = 'completed', completed_at = $1, completed_by = $2,
+				total_system_value = COALESCE((SELECT SUM(COALESCE(system_value,0)) FROM stock_count_lines WHERE stock_count_id = $3), 0),
+				total_counted_value = COALESCE((SELECT SUM(COALESCE(counted_value, counted_quantity * COALESCE(unit_cost,0), 0)) FROM stock_count_lines WHERE stock_count_id = $3), 0),
+				total_variance_value = COALESCE((SELECT SUM(ABS(variance_quantity) * COALESCE(unit_cost,0)) FROM stock_count_lines WHERE stock_count_id = $3 AND variance_quantity != 0), 0),
+				updated_at = $1
+			WHERE id = $3
+		`, now, userID, countID); uErr != nil {
+			return uErr
+		}
+		if _, uErr := tx.Exec("UPDATE stock_count_lines SET status = 'adjusted' WHERE stock_count_id = $1 AND variance_quantity != 0 AND counted_quantity IS NOT NULL", countID); uErr != nil {
+			return uErr
+		}
+		return tx.Commit()
+	}()
+	if completeErr != nil {
+		h.log.Error("Failed to complete stock count atomically", "error", completeErr, "count_id", countID)
+		response.InternalError(c, "Failed to complete stock count")
+		return
 	}
 
-	// Update totals on stock count
-	h.db.Exec(`
-		UPDATE stock_counts SET
-			status = 'completed', completed_at = $1, completed_by = $2,
-			total_system_value = COALESCE((SELECT SUM(COALESCE(system_value,0)) FROM stock_count_lines WHERE stock_count_id = $3), 0),
-			total_counted_value = COALESCE((SELECT SUM(COALESCE(counted_value, counted_quantity * COALESCE(unit_cost,0), 0)) FROM stock_count_lines WHERE stock_count_id = $3), 0),
-			total_variance_value = COALESCE((SELECT SUM(ABS(variance_quantity) * COALESCE(unit_cost,0)) FROM stock_count_lines WHERE stock_count_id = $3 AND variance_quantity != 0), 0),
-			updated_at = $1
-		WHERE id = $3
-	`, now, userID, countID)
-
-	// Update line statuses
-	h.db.Exec("UPDATE stock_count_lines SET status = 'adjusted' WHERE stock_count_id = $1 AND variance_quantity != 0 AND counted_quantity IS NOT NULL", countID)
+	// Post-commit: notify workflow rules about the applied variances
+	for _, line := range lines {
+		var bal float64
+		_ = h.db.QueryRow(`SELECT quantity_on_hand FROM inventory WHERE tenant_id=$1 AND product_id=$2 AND warehouse_id=$3`,
+			tenantID, line.ProductID, warehouseID).Scan(&bal)
+		h.emitInventoryAdjusted(tenantID, line.ProductID, line.Variance, bal)
+	}
 
 	c.Params = append(c.Params, gin.Param{Key: "id", Value: countID.String()})
 	h.GetStockCount(c)
@@ -6363,20 +6366,15 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					if err := checkLines.Scan(&prodID, &doneQty, &productName); err != nil {
 						continue
 					}
+					// Availability is checked against the operation's warehouse
+					// ONLY — the old tenant-wide fallback let a delivery drain
+					// a warehouse it had no stock in (audit finding #7).
 					var qtyAvailable float64
 					h.db.QueryRow(`
 						SELECT COALESCE(SUM(quantity_on_hand), 0)
 						FROM inventory
 						WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
 					`, tenantID, prodID, warehouseIDCheck).Scan(&qtyAvailable)
-					// If no stock found in the specific warehouse, check total across all warehouses
-					if qtyAvailable <= 0 {
-						h.db.QueryRow(`
-							SELECT COALESCE(SUM(quantity_on_hand), 0)
-							FROM inventory
-							WHERE tenant_id = $1 AND product_id = $2
-						`, tenantID, prodID).Scan(&qtyAvailable)
-					}
 
 					if qtyAvailable < doneQty {
 						insufficientItems = append(insufficientItems, insufficientItem{
@@ -6605,16 +6603,20 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			}
 		}
 
-		// All steps done — mark operation as done
-		newState = "done"
-		h.db.Exec(`
-			UPDATE stock_operations
-			SET state='done', done_at=$1, updated_at=$1
-			WHERE id=$2 AND tenant_id=$3
-		`, now, id, tenantID)
+		// All steps done. The operation is marked done and the JE posts only
+		// AFTER the stock movement below succeeds — the old order marked the
+		// document done and touched the GL even when the stock write then
+		// failed halfway.
+		markDoneAndPostJE := func() {
+			newState = "done"
+			h.db.Exec(`
+				UPDATE stock_operations
+				SET state='done', done_at=$1, updated_at=$1
+				WHERE id=$2 AND tenant_id=$3
+			`, now, id, tenantID)
 
-		// Create journal entry if auto_post_accounting is enabled
-		var autoPost bool
+			// Create journal entry if auto_post_accounting is enabled
+			var autoPost bool
 		var cfgJournalID, cfgDebitAcct, cfgCreditAcct *uuid.UUID
 		h.db.QueryRow(`
 			SELECT wot.auto_post_accounting, wot.journal_id, wot.debit_account_id, wot.credit_account_id
@@ -6785,8 +6787,14 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 				}
 			}
 		}
+		}
 
 		// ── Inventory movement: adjust quantity_on_hand based on direction ──
+		// All lines of the operation apply in ONE transaction (a document is
+		// all-or-nothing; the old per-line h.db.Exec loop could stop halfway
+		// and leave balance ≠ ledger — audit finding #1). 'internal' now
+		// moves stock too: the old guard excluded it, so internal transfer
+		// operations completed without touching inventory (audit finding #2).
 		// Skip if source SO already shipped (Sales page already deducted inventory)
 		skipInventory := false
 		if op.SourceType != nil && *op.SourceType == "sales_order" && op.SourceID != nil {
@@ -6812,133 +6820,217 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			}
 		}
 
+		// Internal transfers: source/destination warehouses come from the
+		// operation's locations; the op-type warehouse is the source fallback.
+		var srcWH, dstWH uuid.UUID
+		if op.Direction == "internal" {
+			h.db.QueryRow(`
+				SELECT COALESCE(slw.warehouse_id, $3),
+				       COALESCE(dlw.warehouse_id, '00000000-0000-0000-0000-000000000000'::uuid)
+				FROM stock_operations so
+				LEFT JOIN warehouse_locations slw ON slw.id = so.source_location_id
+				LEFT JOIN warehouse_locations dlw ON dlw.id = so.dest_location_id
+				WHERE so.id = $1 AND so.tenant_id = $2
+			`, id, tenantID, warehouseID).Scan(&srcWH, &dstWH)
+		}
+
 		h.log.Info("Stock op inventory check",
 			"op_id", id, "direction", op.Direction, "op_type_id", op.OpTypeID,
 			"warehouse_id", warehouseID, "warehouse_query_err", whErr,
-			"skip_inventory", skipInventory, "org_id", op.OrgID)
+			"skip_inventory", skipInventory, "org_id", op.OrgID, "src_wh", srcWH, "dst_wh", dstWH)
 
-		if !skipInventory && warehouseID != uuid.Nil && (op.Direction == "delivery" || op.Direction == "receipt" || op.Direction == "write_off") {
-			invLines, _ := h.db.Query(`
+		movesStock := (warehouseID != uuid.Nil && (op.Direction == "delivery" || op.Direction == "receipt" || op.Direction == "write_off")) ||
+			(op.Direction == "internal" && srcWH != uuid.Nil && dstWH != uuid.Nil && srcWH != dstWH)
+		if op.Direction == "internal" && (srcWH == uuid.Nil || dstWH == uuid.Nil || srcWH == dstWH) {
+			h.log.Warn("Internal stock operation without resolvable src/dst warehouses — no stock moved",
+				"op_id", id, "src_wh", srcWH, "dst_wh", dstWH)
+		}
+
+		type movedLine struct {
+			ProdID     uuid.UUID
+			Qty        float64
+			NewBalance float64
+		}
+		var movedLines []movedLine
+
+		if !skipInventory && movesStock {
+			// Collect lines first — we cannot iterate a result set while
+			// issuing other statements on the same tx connection.
+			type opMoveLine struct {
+				ProdID    uuid.UUID
+				DoneQty   float64
+				UnitPrice float64
+				LotNumber string
+				Expiry    sql.NullTime
+			}
+			var moveLines []opMoveLine
+			invLines, qErr := h.db.Query(`
 				SELECT product_id, done_qty, COALESCE(unit_price, 0),
 				       COALESCE(lot_number, ''), expiry_date
 				FROM stock_operation_lines
 				WHERE operation_id = $1 AND tenant_id = $2 AND done_qty > 0
 			`, id, tenantID)
-			if invLines != nil {
-				defer invLines.Close()
-				for invLines.Next() {
-					var prodID uuid.UUID
-					var doneQty, unitPrice float64
-					var lotNumber string
-					var expiryDate sql.NullTime
-					if scanErr := invLines.Scan(&prodID, &doneQty, &unitPrice, &lotNumber, &expiryDate); scanErr != nil {
-						continue
-					}
-					h.log.Info("Processing inventory line", "product_id", prodID, "done_qty", doneQty, "direction", op.Direction, "warehouse_id", warehouseID)
+			if qErr != nil {
+				h.log.Error("Failed to load stock operation lines", "error", qErr)
+				response.InternalError(c, "Failed to load operation lines")
+				return
+			}
+			for invLines.Next() {
+				var l opMoveLine
+				if scanErr := invLines.Scan(&l.ProdID, &l.DoneQty, &l.UnitPrice, &l.LotNumber, &l.Expiry); scanErr == nil {
+					moveLines = append(moveLines, l)
+				}
+			}
+			invLines.Close()
 
-					// Find or create inventory record (upsert to prevent duplicates)
-					var invID uuid.UUID
-					newID := uuid.New()
-					err := h.db.QueryRow(`
-						INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-						VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $7)
-						ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET updated_at = NOW()
-						RETURNING id
-					`, newID, tenantID, prodID, warehouseID, op.OrgID, unitPrice, now).Scan(&invID)
-					if err != nil {
-						h.log.Error("Failed to upsert inventory record", "error", err, "product_id", prodID, "warehouse_id", warehouseID)
-						continue
-					}
-					// Backfill organization_id if missing
-					if op.OrgID != nil {
-						h.db.Exec("UPDATE inventory SET organization_id = $1 WHERE id = $2 AND organization_id IS NULL", *op.OrgID, invID)
-					}
+			// Vendor for lot rows (receipts sourced from POs)
+			var vendorID *uuid.UUID
+			if op.Direction == "receipt" && op.SourceType != nil && *op.SourceType == "purchase_order" && op.SourceID != nil {
+				var vid uuid.UUID
+				if err := h.db.QueryRow("SELECT vendor_id FROM purchase_orders WHERE id = $1", *op.SourceID).Scan(&vid); err == nil {
+					vendorID = &vid
+				}
+			}
 
-					if op.Direction == "receipt" {
-						// Receipt: increase inventory
-						_, updErr := h.db.Exec(`
-							UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
-						`, doneQty, now, invID)
-						h.log.Info("Inventory receipt update", "inv_id", invID, "product_id", prodID, "done_qty", doneQty, "error", updErr)
+			moveErr := func() error {
+				tx, txErr := h.db.Begin()
+				if txErr != nil {
+					return txErr
+				}
+				defer tx.Rollback()
 
-						// Auto-create inventory lot record for receipt operations
+				for _, l := range moveLines {
+					switch op.Direction {
+					case "receipt":
+						newBal, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+							TenantID: tenantID, OrgID: op.OrgID, ProductID: l.ProdID,
+							WarehouseID: warehouseID, Qty: l.DoneQty, UnitCost: l.UnitPrice,
+							TxType: "receipt", RefType: "stock_operation", RefID: id.String(),
+							Notes: "Qabul qilish", ToWH: &warehouseID,
+							CreatedBy: userID, When: now,
+						})
+						if dErr != nil {
+							return dErr
+						}
+						movedLines = append(movedLines, movedLine{l.ProdID, l.DoneQty, newBal})
+
+						// Lot record for FIFO layers
+						lotNumber := l.LotNumber
 						if lotNumber == "" {
 							lotNumber = h.generateLotNumber(tenantID)
 						}
-						lotID := uuid.New()
 						var expDate *time.Time
-						if expiryDate.Valid {
-							expDate = &expiryDate.Time
+						if l.Expiry.Valid {
+							expDate = &l.Expiry.Time
 						}
-						// Get vendor from stock operation
-						var vendorID *uuid.UUID
-						if op.SourceType != nil && *op.SourceType == "purchase_order" && op.SourceID != nil {
-							var vid uuid.UUID
-							if err := h.db.QueryRow("SELECT vendor_id FROM purchase_orders WHERE id = $1", *op.SourceID).Scan(&vid); err == nil {
-								vendorID = &vid
-							}
-						}
-						h.db.Exec(`
+						if _, lErr := tx.Exec(`
 							INSERT INTO inventory_lots (
 								id, tenant_id, product_id, warehouse_id, lot_number,
 								received_date, expiry_date, initial_quantity, remaining_quantity,
 								unit_cost, vendor_id, purchase_order_id, status, created_at, updated_at
 							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $9, $10, $11, 'available', $12, $12)
-						`, lotID, tenantID, prodID, warehouseID, lotNumber,
-							now, expDate, doneQty, unitPrice, vendorID, op.SourceID, now)
+						`, uuid.New(), tenantID, l.ProdID, warehouseID, lotNumber,
+							now, expDate, l.DoneQty, l.UnitPrice, vendorID, op.SourceID, now); lErr != nil {
+							return lErr
+						}
 
 						// FIFO: set cost_price to the OLDEST available lot's cost (not latest purchase)
-						var fifoCost float64
-						if h.db.QueryRow(`
+						fifoCost := l.UnitPrice
+						var oldestCost float64
+						if tx.QueryRow(`
 							SELECT unit_cost FROM inventory_lots
 							WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
 							ORDER BY received_date ASC LIMIT 1
-						`, tenantID, prodID).Scan(&fifoCost) != nil || fifoCost <= 0 {
-							fifoCost = unitPrice // fallback to current purchase price if no lots
+						`, tenantID, l.ProdID).Scan(&oldestCost) == nil && oldestCost > 0 {
+							fifoCost = oldestCost
 						}
-						h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-							fifoCost, now, prodID, tenantID)
+						if _, pErr := tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+							fifoCost, now, l.ProdID, tenantID); pErr != nil {
+							return pErr
+						}
 						if op.OrgID != nil {
-							h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
-								fifoCost, now, prodID, *op.OrgID)
+							if _, pErr := tx.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+								fifoCost, now, l.ProdID, *op.OrgID); pErr != nil {
+								return pErr
+							}
 						}
-						h.log.Info("[v2] Updated product cost_price from stock receipt", "product_id", prodID, "cost_price", unitPrice, "org_id", op.OrgID)
-					} else {
-						// Delivery or write-off: decrease inventory
-						h.db.Exec(`
-							UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
-						`, doneQty, now, invID)
-					}
 
-					// Create inventory transaction
-					txType := "issue"
-					txNotes := "Yetkazib berish"
-					var fromWH, toWH *uuid.UUID
-					if op.Direction == "receipt" {
-						txType = "receipt"
-						txNotes = "Qabul qilish"
-						toWH = &warehouseID
-					} else if op.Direction == "write_off" {
-						txType = "adjustment"
-						txNotes = "Hisobdan chiqarish"
-						fromWH = &warehouseID
-					} else {
-						fromWH = &warehouseID
+					case "delivery", "write_off":
+						txType := "issue"
+						txNotes := "Yetkazib berish"
+						if op.Direction == "write_off" {
+							txType = "write_off"
+							txNotes = "Hisobdan chiqarish"
+						}
+						newBal, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+							TenantID: tenantID, OrgID: op.OrgID, ProductID: l.ProdID,
+							WarehouseID: warehouseID, Qty: -l.DoneQty, UnitCost: l.UnitPrice,
+							TxType: txType, RefType: "stock_operation", RefID: id.String(),
+							Notes: txNotes, FromWH: &warehouseID,
+							CreatedBy: userID, When: now,
+						})
+						if dErr != nil {
+							return dErr
+						}
+						movedLines = append(movedLines, movedLine{l.ProdID, -l.DoneQty, newBal})
+
+					case "internal":
+						// Two legs, one tx: stock can never sit in neither
+						// warehouse nor be double-counted.
+						newBal, cost, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+							TenantID: tenantID, OrgID: op.OrgID, ProductID: l.ProdID,
+							WarehouseID: srcWH, Qty: -l.DoneQty, UnitCost: 0,
+							TxType: "transfer", RefType: "stock_operation", RefID: id.String(),
+							Notes: "Ichki ko'chirish (chiqim)", FromWH: &srcWH, ToWH: &dstWH,
+							CreatedBy: userID, When: now,
+						})
+						if dErr != nil {
+							return dErr
+						}
+						if _, _, dErr = h.applyStockDelta(tx, stockDeltaArgs{
+							TenantID: tenantID, OrgID: op.OrgID, ProductID: l.ProdID,
+							WarehouseID: dstWH, Qty: l.DoneQty, UnitCost: cost,
+							TxType: "transfer", RefType: "stock_operation", RefID: id.String(),
+							Notes: "Ichki ko'chirish (kirim)", FromWH: &srcWH, ToWH: &dstWH,
+							CreatedBy: userID, When: now,
+						}); dErr != nil {
+							return dErr
+						}
+						movedLines = append(movedLines, movedLine{l.ProdID, -l.DoneQty, newBal})
 					}
-					txQty := doneQty
-					if op.Direction != "receipt" {
-						txQty = -doneQty
-					}
-					h.db.Exec(`
-						INSERT INTO inventory_transactions (
-							id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
-							unit_cost, total_cost, from_warehouse_id, to_warehouse_id,
-							reference_type, reference_id, notes, transaction_date, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'stock_operation', $11, $12, $13, $13)
-					`, uuid.New(), tenantID, op.OrgID, invID, txType, txQty, unitPrice, math.Abs(txQty)*unitPrice, fromWH, toWH, id.String(), txNotes, now)
 				}
+				return tx.Commit()
+			}()
+
+			if moveErr != nil {
+				// Put the step back so the operation can be re-advanced after
+				// the stock problem is fixed.
+				h.db.Exec(`
+					UPDATE stock_operation_step_log
+					SET state='ready', completed_at=NULL, completed_by=NULL
+					WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
+				`, id, op.CurrentStep, tenantID)
+				if errors.Is(moveErr, errInsufficientStock) {
+					c.JSON(422, gin.H{
+						"success": false,
+						"message": "Insufficient stock for this operation",
+					})
+					return
+				}
+				h.log.Error("Failed to apply stock movement for operation", "error", moveErr, "op_id", id)
+				response.InternalError(c, "Failed to apply stock movement")
+				return
+			}
+
+			// Post-commit: workflow events for rules bound to inventory.adjusted
+			for _, ml := range movedLines {
+				h.emitInventoryAdjusted(tenantID, ml.ProdID, ml.Qty, ml.NewBalance)
 			}
 		}
+
+		// Stock applied (or nothing to move) — now the operation may be
+		// marked done and the auto-post JE created.
+		markDoneAndPostJE()
 
 		// Sync: when a receipt operation from a PO completes, mark PO as received
 		if op.SourceType != nil && *op.SourceType == "purchase_order" && op.SourceID != nil && *op.SourceID != uuid.Nil {

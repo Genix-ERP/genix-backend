@@ -917,92 +917,182 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		createdBy = &userID
 	}
 
+	var doOrgPtr *uuid.UUID
+	if doOrgID.Valid && doOrgID.String != "" {
+		if parsed, pErr := uuid.Parse(doOrgID.String); pErr == nil && parsed != uuid.Nil {
+			doOrgPtr = &parsed
+		}
+	}
+
+	// All stock work — FIFO lot consumption, balance decrement and the
+	// ledger row via applyStockDelta — lands in ONE transaction for the
+	// whole document. The old per-line h.db loop could stop halfway and
+	// leave balance ≠ ledger (audit finding #1). COGS JEs post after
+	// commit with the ACTUAL FIFO cost consumed, so the GL finally sees
+	// stock leave at shipment time, not at invoicing with a stale price.
+	type shippedCost struct {
+		ProductID uuid.UUID
+		Qty       float64
+		UnitCost  float64
+	}
+	var shippedCosts []shippedCost
+
+	// Tenant valuation method: FIFO values the movement at the consumed
+	// lots' weighted cost; AVECO (default) values at the balance row's
+	// stored average (UnitCost=0 → applyStockDelta uses the average).
+	useFIFO := h.tenantUsesFIFO(h.db, tenantID)
+
+	shipErr := func() error {
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback()
+
+		for _, action := range actions {
+			if action.QtyToShip <= 0 {
+				continue
+			}
+
+			stock := stockMap[action.Line.ProductID]
+			if stock.WarehouseID == "" {
+				h.log.Warn("No warehouse resolved for delivery line", "product_id", action.Line.ProductID)
+				continue
+			}
+			whID, whErr := uuid.Parse(stock.WarehouseID)
+			if whErr != nil {
+				continue
+			}
+
+			// FIFO: consume from oldest lots first (collect, then update —
+			// no other statements while a result set is open on the tx).
+			type lotSlice struct {
+				ID   uuid.UUID
+				Qty  float64
+				Cost float64
+			}
+			var lots []lotSlice
+			lotRows, lotErr := tx.Query(`
+				SELECT id, remaining_quantity, unit_cost FROM inventory_lots
+				WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+				ORDER BY received_date ASC
+			`, tenantID, action.Line.ProductID)
+			if lotErr == nil {
+				for lotRows.Next() {
+					var l lotSlice
+					if lotRows.Scan(&l.ID, &l.Qty, &l.Cost) == nil {
+						lots = append(lots, l)
+					}
+				}
+				lotRows.Close()
+			}
+
+			remainingToConsume := action.QtyToShip
+			var fifoValue float64 // Σ consumed qty × that lot's cost
+			var fifoConsumed float64
+			for _, l := range lots {
+				if remainingToConsume <= 0 {
+					break
+				}
+				consume := remainingToConsume
+				if consume > l.Qty {
+					consume = l.Qty
+				}
+				remainingToConsume -= consume
+				fifoValue += consume * l.Cost
+				fifoConsumed += consume
+
+				if _, uErr := tx.Exec(`UPDATE inventory_lots SET remaining_quantity = remaining_quantity - $1, updated_at = $2 WHERE id = $3`,
+					consume, now, l.ID); uErr != nil {
+					return uErr
+				}
+				if _, uErr := tx.Exec(`UPDATE inventory_lots SET status = 'depleted' WHERE id = $1 AND remaining_quantity <= 0`, l.ID); uErr != nil {
+					return uErr
+				}
+			}
+
+			// Weighted FIFO cost across ALL consumed lots (the old code
+			// valued the whole movement at the LAST lot's cost). Under
+			// AVECO the movement is valued at the stored average instead.
+			txUnitCost := 0.0
+			if useFIFO && fifoConsumed > 0 {
+				txUnitCost = fifoValue / fifoConsumed
+			}
+
+			_, valuedCost, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+				TenantID: tenantID, OrgID: doOrgPtr, ProductID: action.Line.ProductID,
+				WarehouseID: whID, Qty: -action.QtyToShip, UnitCost: txUnitCost,
+				TxType: "issue", RefType: "sales_delivery", RefID: doID.String(),
+				Reason: "Sales Delivery", FromWH: &whID,
+				CreatedBy: userID, When: now,
+				AllowNeg: true, // backorders may legitimately go negative
+			})
+			if dErr != nil {
+				return dErr
+			}
+
+			// FIFO only: roll product cost_price forward to the next
+			// available lot's cost
+			if useFIFO {
+				var nextLotCost float64
+				if tx.QueryRow(`
+					SELECT unit_cost FROM inventory_lots
+					WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
+					ORDER BY received_date ASC LIMIT 1
+				`, tenantID, action.Line.ProductID).Scan(&nextLotCost) == nil && nextLotCost > 0 {
+					if _, uErr := tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+						nextLotCost, now, action.Line.ProductID, tenantID); uErr != nil {
+						return uErr
+					}
+					if doOrgPtr != nil {
+						if _, uErr := tx.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+							nextLotCost, now, action.Line.ProductID, *doOrgPtr); uErr != nil {
+							return uErr
+						}
+					}
+				}
+			}
+
+			shippedCosts = append(shippedCosts, shippedCost{
+				ProductID: action.Line.ProductID,
+				Qty:       action.QtyToShip,
+				UnitCost:  valuedCost,
+			})
+		}
+		return tx.Commit()
+	}()
+	if shipErr != nil {
+		h.log.Error("Delivery stock movement failed; NOTHING moved", "error", shipErr, "do_id", doID)
+		response.InternalError(c, "Failed to apply stock movement for delivery")
+		return
+	}
+
+	// COGS at shipment: DR cost-of-goods / CR inventory per shipped line,
+	// valued at the actual FIFO cost. Idempotency-keyed per (DO, product) —
+	// CreateInvoiceFromOrder checks these keys and skips its own COGS leg
+	// so the same shipment is never expensed twice.
+	for _, sc := range shippedCosts {
+		h.postInventoryConsumptionJE(h.db, postInventoryConsumptionArgs{
+			TenantID:       tenantID,
+			OrganizationID: doOrgPtr,
+			ProductID:      sc.ProductID,
+			Quantity:       sc.Qty,
+			UnitCost:       sc.UnitCost,
+			SourceType:     "sales_delivery",
+			SourceID:       &doID,
+			IdempotencyKey: fmt.Sprintf("DO-COGS-%s-%s", doID, sc.ProductID),
+			Description:    "Yetkazib berish tannarxi (COGS)",
+		})
+		var bal float64
+		_ = h.db.QueryRow(`SELECT COALESCE(SUM(quantity_on_hand),0) FROM inventory WHERE tenant_id=$1 AND product_id=$2`,
+			tenantID, sc.ProductID).Scan(&bal)
+		h.emitInventoryAdjusted(tenantID, sc.ProductID, -sc.Qty, bal)
+	}
+
+	// Document-line status updates (outside the stock tx, as before)
 	for _, action := range actions {
 		if action.QtyToShip <= 0 {
 			continue
-		}
-
-		stock := stockMap[action.Line.ProductID]
-		if stock.InventoryID == uuid.Nil {
-			h.log.Warn("No inventory found for product", "product_id", action.Line.ProductID)
-			continue
-		}
-
-		// Decrease inventory
-		_, err := h.db.Exec(`
-			UPDATE inventory
-			SET quantity_on_hand = quantity_on_hand - $1,
-				last_movement_date = $2,
-				updated_at = $2
-			WHERE id = $3
-		`, action.QtyToShip, now, stock.InventoryID)
-		if err != nil {
-			h.log.Error("Failed to update inventory", "error", err)
-			continue
-		}
-
-		// FIFO: consume from oldest lots first
-		remainingToConsume := action.QtyToShip
-		var fifoCostPerUnit float64
-		lotRows, lotErr := h.db.Query(`
-			SELECT id, remaining_quantity, unit_cost FROM inventory_lots
-			WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
-			ORDER BY received_date ASC
-		`, tenantID, action.Line.ProductID)
-		if lotErr == nil {
-			for lotRows.Next() && remainingToConsume > 0 {
-				var lotID uuid.UUID
-				var lotQty, lotCost float64
-				lotRows.Scan(&lotID, &lotQty, &lotCost)
-
-				consume := remainingToConsume
-				if consume > lotQty {
-					consume = lotQty
-				}
-				remainingToConsume -= consume
-				fifoCostPerUnit = lotCost // track last consumed lot's cost
-
-				h.db.Exec(`UPDATE inventory_lots SET remaining_quantity = remaining_quantity - $1, updated_at = $2 WHERE id = $3`,
-					consume, now, lotID)
-
-				// Mark lot as depleted if empty
-				h.db.Exec(`UPDATE inventory_lots SET status = 'depleted' WHERE id = $1 AND remaining_quantity <= 0`, lotID)
-			}
-			lotRows.Close()
-		}
-
-		// Update product cost_price to the next available lot's cost (FIFO)
-		var nextLotCost float64
-		if h.db.QueryRow(`
-			SELECT unit_cost FROM inventory_lots
-			WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
-			ORDER BY received_date ASC LIMIT 1
-		`, tenantID, action.Line.ProductID).Scan(&nextLotCost) == nil && nextLotCost > 0 {
-			h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-				nextLotCost, now, action.Line.ProductID, tenantID)
-			// Also update org-specific settings
-			h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = (
-				SELECT organization_id FROM inventory WHERE id = $4 LIMIT 1
-			)`, nextLotCost, now, action.Line.ProductID, stock.InventoryID)
-		}
-
-		// Use FIFO cost for the transaction if available
-		txUnitCost := stock.UnitCost
-		if fifoCostPerUnit > 0 {
-			txUnitCost = fifoCostPerUnit
-		}
-
-		// Create inventory transaction (outbound)
-		transactionID := uuid.New()
-		_, err = h.db.Exec(`
-			INSERT INTO inventory_transactions (
-				id, tenant_id, inventory_id, transaction_type, quantity,
-				unit_cost, total_cost, reference_type, reference_id,
-				reason, transaction_date, created_by, created_at
-			) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'sales_delivery', $7, 'Sales Delivery', $8, $9, $8)
-		`, transactionID, tenantID, stock.InventoryID, -action.QtyToShip, txUnitCost, action.QtyToShip*txUnitCost, doID, now, createdBy)
-		if err != nil {
-			h.log.Error("Failed to create inventory transaction", "error", err)
 		}
 
 		// Update DO line: set quantity_delivered to what was actually shipped

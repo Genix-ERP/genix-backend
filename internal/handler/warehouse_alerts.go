@@ -61,15 +61,16 @@ func (h *Handler) GetWarehouseAlerts(c *gin.Context) {
 
 	// 2. Expiring lots (lots expiring within 30 days)
 	expiringRows, err := h.db.Query(`
-		SELECT l.id, l.lot_number, l.expiration_date, p.name AS product_name,
-		       l.expiration_date - CURRENT_DATE AS days_left
-		FROM lots l
+		SELECT l.id, l.lot_number, l.expiry_date, p.name AS product_name,
+		       l.expiry_date - CURRENT_DATE AS days_left
+		FROM inventory_lots l
 		JOIN products p ON p.id = l.product_id AND p.tenant_id = l.tenant_id
 		WHERE l.tenant_id = $1
-		  AND l.expiration_date IS NOT NULL
-		  AND l.expiration_date <= CURRENT_DATE + INTERVAL '30 days'
-		  AND l.expiration_date >= CURRENT_DATE
-		ORDER BY l.expiration_date ASC
+		  AND l.expiry_date IS NOT NULL
+		  AND l.remaining_quantity > 0
+		  AND l.expiry_date <= CURRENT_DATE + INTERVAL '30 days'
+		  AND l.expiry_date >= CURRENT_DATE
+		ORDER BY l.expiry_date ASC
 		LIMIT 20
 	`, tenantID)
 	if err == nil {
@@ -176,7 +177,7 @@ func (h *Handler) GetWarehouseAlerts(c *gin.Context) {
 		WHERE so.tenant_id = $1
 		  AND so.direction = 'write_off'
 		  AND so.state = 'done'
-		  AND so.completed_at >= CURRENT_DATE - INTERVAL '7 days'
+		  AND so.done_at >= CURRENT_DATE - INTERVAL '7 days'
 		  AND so.deleted_at IS NULL
 		GROUP BY so.id, so.name, so.write_off_reason
 		HAVING COALESCE(SUM(sol.done_qty), 0) > 100

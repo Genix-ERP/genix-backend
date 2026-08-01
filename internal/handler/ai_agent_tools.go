@@ -6,6 +6,7 @@ package handler
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -66,6 +67,22 @@ func agentTools() []agentTool {
 			description: "Products with the lowest total on-hand stock (potential shortages). Returns up to 15.",
 			parameters:  obj(map[string]interface{}{}),
 			exec:        toolLowStock,
+		},
+		{
+			name:        "inventory_valuation",
+			description: "Total stock value and value per warehouse for the active company; answers 'omborda qancha pul turibdi'. Also returns the top products by value.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolInventoryValuation,
+		},
+		{
+			name:        "stock_movements",
+			description: "Recent stock movements (kirim/chiqim/ko'chirish) from the movement ledger, newest first. Optional product-name filter and days window; answers 'X bilan nima bo'ldi', 'qaysi mahsulotlar qimirlamayapti' (compare against this list).",
+			parameters: obj(map[string]interface{}{
+				"query": str("Optional: part of a product name to filter by."),
+				"days":  intp("Look-back window in days (default 30, max 365)."),
+				"limit": intp("Max rows (default 20, max 100)."),
+			}),
+			exec: toolStockMovements,
 		},
 		{
 			name:        "list_purchase_orders",
@@ -198,9 +215,15 @@ func agentTools() []agentTool {
 		},
 		{
 			name:        "list_leads",
-			description: "List CRM leads (company, contact, phone/email, source, status, score, expected value). Optional status filter.",
-			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 10, max 50).")}),
+			description: "List CRM leads/deals (company, contact, phone/email, source, stage, amount, responsible, won/lost). Optional status filter (stage code, e.g. new, in_progress, won, lost) and open_only flag.",
+			parameters:  obj(map[string]interface{}{"status": str("Optional stage-code filter."), "open_only": map[string]interface{}{"type": "boolean", "description": "Only open (not won/lost) leads."}, "limit": intp("Max rows (default 10, max 50).")}),
 			exec:        toolListLeads,
+		},
+		{
+			name:        "crm_summary",
+			description: "CRM pipeline summary: open leads count + value, won this month (count + value), conversion %, top loss reasons. Use for 'bu oy nechta lid yutdik', 'voronka holati', 'nega yo'qotyapmiz'.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolCRMSummary,
 		},
 		{
 			name:        "list_opportunities",
@@ -293,6 +316,21 @@ func agentTools() []agentTool {
 			exec:        toolListPurchaseReturns,
 		},
 		// ---- write tools (confirmation required) ----
+		{
+			name:        "create_lead",
+			description: "Create a new CRM lead (potential deal). Requires confirmation before it runs.",
+			mutating:    true,
+			parameters: obj(map[string]interface{}{
+				"contact_name": str("Person's name."),
+				"company_name": str("Optional company name."),
+				"phone":        str("Optional phone number."),
+				"email":        str("Optional email."),
+				"amount":       map[string]interface{}{"type": "number", "description": "Optional expected deal amount (UZS)."},
+				"source":       str("Optional source (telegram, website, referral, cold_call, other)."),
+				"notes":        str("Optional note about what the client needs."),
+			}, "contact_name"),
+			exec: toolCreateLead,
+		},
 		{
 			name:        "create_contact",
 			description: "Create a new customer or vendor. Requires confirmation before it runs.",
@@ -732,6 +770,90 @@ func toolLowStock(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interfa
 	return out, nil
 }
 
+func toolInventoryValuation(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	// Same value formula as GET /inventory/stats (and the reconcile
+	// endpoint): qty × COALESCE(NULLIF(unit_cost,0), cost_price, 0),
+	// scrap warehouses excluded.
+	whRows, whErr := h.db.Query(`
+		SELECT w.name, COALESCE(SUM(i.quantity_on_hand * COALESCE(NULLIF(i.unit_cost,0), p.cost_price, 0)), 0) AS v
+		FROM inventory i
+		JOIN warehouses w ON w.id = i.warehouse_id AND w.deleted_at IS NULL
+			AND COALESCE(w.warehouse_type,'regular') != 'scrap'
+		LEFT JOIN products p ON p.id = i.product_id
+		WHERE i.tenant_id = $1 AND ($2::uuid IS NULL OR w.organization_id = $2)
+		GROUP BY w.name ORDER BY v DESC`, tenantID, orgArg)
+	perWH, err := rowsToList(whRows, whErr, func(r *sql.Rows) (gin.H, bool) {
+		var name string
+		var v float64
+		if r.Scan(&name, &v) != nil {
+			return nil, false
+		}
+		return gin.H{"warehouse": name, "value": v}, true
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	tpRows, tpErr := h.db.Query(`
+		SELECT p.name, COALESCE(SUM(i.quantity_on_hand), 0) AS qty,
+		       COALESCE(SUM(i.quantity_on_hand * COALESCE(NULLIF(i.unit_cost,0), p.cost_price, 0)), 0) AS v
+		FROM inventory i
+		JOIN warehouses w ON w.id = i.warehouse_id AND COALESCE(w.warehouse_type,'regular') != 'scrap'
+		JOIN products p ON p.id = i.product_id AND p.deleted_at IS NULL
+		WHERE i.tenant_id = $1 AND i.quantity_on_hand > 0
+		  AND ($2::uuid IS NULL OR w.organization_id = $2)
+		GROUP BY p.name ORDER BY v DESC LIMIT 10`, tenantID, orgArg)
+	topProducts, err := rowsToList(tpRows, tpErr, func(r *sql.Rows) (gin.H, bool) {
+		var name string
+		var qty, v float64
+		if r.Scan(&name, &qty, &v) != nil {
+			return nil, false
+		}
+		return gin.H{"product": name, "qty": qty, "value": v}, true
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	total := 0.0
+	if list, ok := perWH.([]gin.H); ok {
+		for _, r := range list {
+			if v, ok := r["value"].(float64); ok {
+				total += v
+			}
+		}
+	}
+	return gin.H{"total_value": total, "per_warehouse": perWH, "top_products_by_value": topProducts}, nil
+}
+
+func toolStockMovements(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	days := argInt(args, "days", 30, 365)
+	limit := argInt(args, "limit", 20, 100)
+	query := "%" + argStr(args, "query") + "%"
+	mvRows, mvErr := h.db.Query(`
+		SELECT COALESCE(p.name,'—'), COALESCE(w.name,'—'), sl.transaction_type,
+		       sl.qty_delta, COALESCE(sl.total_cost,0), COALESCE(sl.reference_type,''),
+		       to_char(sl.transaction_date, 'YYYY-MM-DD')
+		FROM stock_ledger sl
+		LEFT JOIN products p ON p.id = sl.product_id
+		LEFT JOIN warehouses w ON w.id = sl.warehouse_id
+		WHERE sl.tenant_id = $1
+		  AND sl.transaction_date >= NOW() - ($2 || ' days')::interval
+		  AND ($3::uuid IS NULL OR sl.organization_id = $3)
+		  AND ($4 = '%%' OR p.name ILIKE $4)
+		ORDER BY sl.transaction_date DESC LIMIT $5`,
+		tenantID, days, orgArg, query, limit)
+	return rowsToList(mvRows, mvErr, func(r *sql.Rows) (gin.H, bool) {
+		var product, warehouse, txType, refType, date string
+		var qty, cost float64
+		if r.Scan(&product, &warehouse, &txType, &qty, &cost, &refType, &date) != nil {
+			return nil, false
+		}
+		return gin.H{"product": product, "warehouse": warehouse, "type": txType,
+			"qty": qty, "value": cost, "source": refType, "date": date}, true
+	})
+}
+
 func toolCreateContact(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	name := argStr(args, "name")
 	typ := argStr(args, "type")
@@ -861,28 +983,36 @@ func toolStockAdjust(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg inte
 		return nil, err
 	}
 	newQty := toFloat(args["new_quantity"])
-	var invID uuid.UUID
 	var cur float64
-	e := h.db.QueryRow(`SELECT id, quantity_on_hand FROM inventory
-		WHERE tenant_id=$1 AND product_id=$2 AND warehouse_id=$3 AND (lot_number IS NULL OR lot_number='')
-		ORDER BY quantity_on_hand DESC LIMIT 1`, tenantID, pid, whid).Scan(&invID, &cur)
-	if e == sql.ErrNoRows {
-		invID = uuid.New()
-		if _, err := h.db.Exec(`INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,0,0,now(),now())`, invID, tenantID, pid, whid); err != nil {
-			return nil, err
-		}
-	} else if e != nil {
-		return nil, e
-	}
+	_ = h.db.QueryRow(`SELECT COALESCE(SUM(quantity_on_hand),0) FROM inventory
+		WHERE tenant_id=$1 AND product_id=$2 AND warehouse_id=$3`, tenantID, pid, whid).Scan(&cur)
 	delta := newQty - cur
-	if _, err := h.db.Exec(`UPDATE inventory SET quantity_on_hand=$1, last_movement_date=now(), updated_at=now() WHERE id=$2`, newQty, invID); err != nil {
+	if delta == 0 {
+		return gin.H{"product": pname, "warehouse": whname, "from": cur, "to": newQty, "delta": 0.0}, nil
+	}
+
+	// Routed through applyStockDelta so the AI path gets the same balance+
+	// ledger atomicity, self-contained ledger row and AVECO handling as the
+	// UI path (the old direct writes skipped unit_cost, created_by and events).
+	tx, err := h.db.Begin()
+	if err != nil {
 		return nil, err
 	}
-	h.db.Exec(`INSERT INTO inventory_transactions
-		(id, tenant_id, organization_id, inventory_id, transaction_type, reference_type, quantity, reason, transaction_date, created_at)
-		VALUES ($1,$2,$3,$4,'adjustment','ai_agent',$5,$6,now(),now())`,
-		uuid.New(), tenantID, orgArg, invID, delta, nullIfEmpty(argStr(args, "reason")))
+	defer tx.Rollback()
+	newBal, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+		TenantID: tenantID, OrgID: aiOrgPtr(orgArg), ProductID: pid,
+		WarehouseID: whid, Qty: delta, UnitCost: 0,
+		TxType: "adjustment", RefType: "ai_agent",
+		Reason:    argStr(args, "reason"),
+		CreatedBy: userID, AllowNeg: true,
+	})
+	if dErr != nil {
+		return nil, dErr
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	h.emitInventoryAdjusted(tenantID, pid, delta, newBal)
 	return gin.H{"product": pname, "warehouse": whname, "from": cur, "to": newQty, "delta": delta}, nil
 }
 
@@ -908,38 +1038,52 @@ func toolStockTransfer(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg in
 		return nil, err
 	}
 	defer tx.Rollback()
-	var srcID uuid.UUID
-	if err := tx.QueryRow(`SELECT id FROM inventory WHERE tenant_id=$1 AND product_id=$2 AND warehouse_id=$3 AND (lot_number IS NULL OR lot_number='') LIMIT 1`,
-		tenantID, pid, fromWh).Scan(&srcID); err != nil {
-		return nil, fmt.Errorf("no stock of %q in %q to transfer", pname, fromName)
-	}
-	var dstID uuid.UUID
-	e := tx.QueryRow(`SELECT id FROM inventory WHERE tenant_id=$1 AND product_id=$2 AND warehouse_id=$3 AND (lot_number IS NULL OR lot_number='') LIMIT 1`,
-		tenantID, pid, toWh).Scan(&dstID)
-	if e == sql.ErrNoRows {
-		dstID = uuid.New()
-		if _, err := tx.Exec(`INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, quantity_reserved, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,0,0,now(),now())`, dstID, tenantID, pid, toWh); err != nil {
-			return nil, err
-		}
-	} else if e != nil {
-		return nil, e
-	}
-	if _, err := tx.Exec(`UPDATE inventory SET quantity_on_hand=quantity_on_hand-$1, last_movement_date=now(), updated_at=now() WHERE id=$2`, qty, srcID); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(`UPDATE inventory SET quantity_on_hand=quantity_on_hand+$1, last_movement_date=now(), updated_at=now() WHERE id=$2`, qty, dstID); err != nil {
-		return nil, err
-	}
 	reason := fmt.Sprintf("AI agent transfer %s -> %s", fromName, toName)
-	tx.Exec(`INSERT INTO inventory_transactions (id, tenant_id, organization_id, inventory_id, transaction_type, reference_type, quantity, reason, transaction_date, created_at)
-		VALUES ($1,$2,$3,$4,'transfer','ai_agent',$5,$6,now(),now())`, uuid.New(), tenantID, orgArg, srcID, -qty, reason)
-	tx.Exec(`INSERT INTO inventory_transactions (id, tenant_id, organization_id, inventory_id, transaction_type, reference_type, quantity, reason, transaction_date, created_at)
-		VALUES ($1,$2,$3,$4,'transfer','ai_agent',$5,$6,now(),now())`, uuid.New(), tenantID, orgArg, dstID, qty, reason)
+	// Both legs through applyStockDelta in one tx: negative-stock guard on
+	// the source, destination valued at the source's average cost.
+	newBal, cost, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+		TenantID: tenantID, OrgID: aiOrgPtr(orgArg), ProductID: pid,
+		WarehouseID: fromWh, Qty: -qty, UnitCost: 0,
+		TxType: "transfer", RefType: "ai_agent",
+		Reason: reason, FromWH: &fromWh, ToWH: &toWh,
+		CreatedBy: userID,
+	})
+	if errors.Is(dErr, errInsufficientStock) {
+		return nil, fmt.Errorf("not enough stock of %q in %q to transfer %v", pname, fromName, qty)
+	}
+	if dErr != nil {
+		return nil, dErr
+	}
+	if _, _, dErr = h.applyStockDelta(tx, stockDeltaArgs{
+		TenantID: tenantID, OrgID: aiOrgPtr(orgArg), ProductID: pid,
+		WarehouseID: toWh, Qty: qty, UnitCost: cost,
+		TxType: "transfer", RefType: "ai_agent",
+		Reason: reason, FromWH: &fromWh, ToWH: &toWh,
+		CreatedBy: userID,
+	}); dErr != nil {
+		return nil, dErr
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	h.emitInventoryAdjusted(tenantID, pid, -qty, newBal)
 	return gin.H{"product": pname, "from": fromName, "to": toName, "quantity": qty}, nil
+}
+
+// aiOrgPtr converts the loosely-typed orgArg the agent tools carry into the
+// *uuid.UUID applyStockDelta expects.
+func aiOrgPtr(orgArg interface{}) *uuid.UUID {
+	switch v := orgArg.(type) {
+	case uuid.UUID:
+		if v != uuid.Nil {
+			return &v
+		}
+	case *uuid.UUID:
+		if v != nil && *v != uuid.Nil {
+			return v
+		}
+	}
+	return nil
 }
 
 // ---- extra module read execs ----------------------------------------------
@@ -1699,25 +1843,132 @@ func toolListQuotations(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg i
 func toolListLeads(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	limit := argInt(args, "limit", 10, 50)
 	status := argStr(args, "status")
-	qry := `SELECT COALESCE(company_name,''), COALESCE(contact_name,''), COALESCE(phone,''), COALESCE(email,''),
-	               COALESCE(source,''), COALESCE(status,''), COALESCE(score,0)::float8, COALESCE(expected_value,0)::float8
-	        FROM leads WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	openOnly, _ := args["open_only"].(bool)
+	qry := `SELECT COALESCE(l.company_name,''), COALESCE(l.contact_name,''), COALESCE(l.phone,''), COALESCE(l.email,''),
+	               COALESCE(l.source,''), COALESCE(l.status,''), COALESCE(l.expected_value,0)::float8, COALESCE(l.currency,'UZS'),
+	               COALESCE(TRIM(e.first_name || ' ' || e.last_name), ''),
+	               (l.won_at IS NOT NULL), (l.lost_at IS NOT NULL)
+	        FROM leads l
+	        LEFT JOIN employees e ON e.id = l.responsible_employee_id
+	        WHERE l.tenant_id=$1 AND l.deleted_at IS NULL AND ($2::uuid IS NULL OR l.organization_id=$2)`
 	qa := []interface{}{tenantID, orgArg}
 	if status != "" {
-		qry += " AND status=$3"
+		qry += " AND l.status=$3"
 		qa = append(qa, status)
 	}
-	qry += fmt.Sprintf(" ORDER BY created_at DESC NULLS LAST LIMIT %d", limit)
+	if openOnly {
+		qry += " AND l.won_at IS NULL AND l.lost_at IS NULL"
+	}
+	qry += fmt.Sprintf(" ORDER BY l.created_at DESC NULLS LAST LIMIT %d", limit)
 	rows, err := h.db.Query(qry, qa...)
 	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
-		var company, contact, phone, email, source, st string
-		var score, value float64
-		if r.Scan(&company, &contact, &phone, &email, &source, &st, &score, &value) != nil {
+		var company, contact, phone, email, source, st, currency, responsible string
+		var value float64
+		var won, lost bool
+		if r.Scan(&company, &contact, &phone, &email, &source, &st, &value, &currency, &responsible, &won, &lost) != nil {
 			return nil, false
 		}
 		return gin.H{"company": company, "contact": contact, "phone": phone, "email": email,
-			"source": source, "status": st, "score": score, "expected_value": value}, true
+			"source": source, "stage": st, "amount": value, "currency": currency,
+			"responsible": responsible, "won": won, "lost": lost}, true
 	})
+}
+
+func toolCRMSummary(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	var open, wonMonth, lostMonth int
+	var openValue, wonValueMonth, conversion float64
+	err := h.db.QueryRow(`
+		SELECT COUNT(*) FILTER (WHERE won_at IS NULL AND lost_at IS NULL),
+		       COALESCE(SUM(expected_value) FILTER (WHERE won_at IS NULL AND lost_at IS NULL), 0),
+		       COUNT(*) FILTER (WHERE won_at >= date_trunc('month', CURRENT_DATE)),
+		       COALESCE(SUM(expected_value) FILTER (WHERE won_at >= date_trunc('month', CURRENT_DATE)), 0),
+		       COUNT(*) FILTER (WHERE lost_at >= date_trunc('month', CURRENT_DATE)),
+		       COALESCE(COUNT(*) FILTER (WHERE won_at IS NOT NULL)::float /
+		                NULLIF(COUNT(*) FILTER (WHERE won_at IS NOT NULL OR lost_at IS NOT NULL), 0) * 100, 0)
+		FROM leads
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)
+	`, tenantID, orgArg).Scan(&open, &openValue, &wonMonth, &wonValueMonth, &lostMonth, &conversion)
+	if err != nil {
+		return nil, err
+	}
+	reasons := []gin.H{}
+	rows, err := h.db.Query(`
+		SELECT r.name, COUNT(*)
+		FROM leads l JOIN lost_reasons r ON r.id = l.lost_reason_id
+		WHERE l.tenant_id=$1 AND l.deleted_at IS NULL AND l.lost_at IS NOT NULL
+		  AND ($2::uuid IS NULL OR l.organization_id=$2)
+		GROUP BY r.name ORDER BY COUNT(*) DESC LIMIT 5
+	`, tenantID, orgArg)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			var cnt int
+			if rows.Scan(&name, &cnt) == nil {
+				reasons = append(reasons, gin.H{"reason": name, "count": cnt})
+			}
+		}
+	}
+	return gin.H{
+		"open_leads": open, "open_value": openValue,
+		"won_this_month": wonMonth, "won_value_this_month": wonValueMonth,
+		"lost_this_month": lostMonth, "conversion_percent": conversion,
+		"top_loss_reasons": reasons,
+	}, nil
+}
+
+func toolCreateLead(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	contactName := argStr(args, "contact_name")
+	if contactName == "" {
+		return nil, fmt.Errorf("contact_name is required")
+	}
+	source := argStr(args, "source")
+	if source == "" {
+		source = "other"
+	}
+	amount := 0.0
+	if v, ok := args["amount"].(float64); ok {
+		amount = v
+	}
+	// first open stage of the org's default pipeline
+	var stageID, pipelineID interface{}
+	var sid, pid uuid.UUID
+	if err := h.db.QueryRow(`
+		SELECT ps.id, p.id
+		FROM pipeline_stages ps
+		JOIN pipelines p ON p.id = ps.pipeline_id AND p.is_default
+		WHERE ps.tenant_id = $1 AND ps.pipeline_type = 'lead' AND ps.is_active
+		  AND NOT ps.is_won AND NOT ps.is_lost
+		  AND ($2::uuid IS NULL OR p.organization_id = $2 OR p.organization_id IS NULL)
+		ORDER BY ps.sequence LIMIT 1
+	`, tenantID, orgArg).Scan(&sid, &pid); err == nil {
+		stageID, pipelineID = sid, pid
+	}
+	id := uuid.New()
+	var amountArg interface{}
+	if amount > 0 {
+		amountArg = amount
+	}
+	if _, err := h.db.Exec(`
+		INSERT INTO leads (id, tenant_id, organization_id, contact_name, company_name, email, phone,
+			status, source, notes, expected_value, currency, pipeline_id, stage_id,
+			assigned_to, last_activity_at, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,'new',$8,$9,$10,'UZS',$11,$12,$13,NOW(),$13,NOW(),NOW())`,
+		id, tenantID, orgArg, contactName, nullIfEmpty(argStr(args, "company_name")),
+		argStr(args, "email"), nullIfEmpty(argStr(args, "phone")),
+		source, nullIfEmpty(argStr(args, "notes")), amountArg, pipelineID, stageID, userID); err != nil {
+		return nil, err
+	}
+	if sid != uuid.Nil {
+		h.recordLeadStageChange(h.db, tenantID, id, nil, &sid, userID)
+	}
+	h.EmitWorkflowEvent(tenantID, "lead.created", map[string]interface{}{
+		"record_id":    id.String(),
+		"contact_name": contactName,
+		"company_name": argStr(args, "company_name"),
+		"source":       source,
+	})
+	return gin.H{"id": id.String(), "contact_name": contactName, "created": true}, nil
 }
 
 func toolListOpportunities(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {

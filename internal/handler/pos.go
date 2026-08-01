@@ -698,6 +698,18 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 		return
 	}
 
+	// Warehouse org scopes the inventory row and the consumption JE
+	var warehouseOrgID *uuid.UUID
+	_ = h.db.QueryRow(`SELECT organization_id FROM warehouses WHERE id = $1`, warehouseID).Scan(&warehouseOrgID)
+
+	// COGS lines collected during the tx, posted to the GL after commit
+	type posConsumedLine struct {
+		ProductID uuid.UUID
+		Quantity  float64
+		UnitCost  float64
+	}
+	var consumedLines []posConsumedLine
+
 	// Start transaction
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -769,7 +781,7 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 		var barcode sql.NullString
 		var unitCost float64
 		err := tx.QueryRow(`
-			SELECT name, COALESCE(code, ''), barcode, COALESCE(cost, 0)
+			SELECT name, COALESCE(code, ''), barcode, COALESCE(cost_price, 0)
 			FROM products WHERE id = $1
 		`, line.ProductID).Scan(&productName, &productCode, &barcode, &unitCost)
 
@@ -805,35 +817,56 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 			return
 		}
 
-		// Update inventory if enabled
+		// Update inventory if enabled. Upsert-decrement: a POS sale of a
+		// product with no inventory row books a negative balance instead of
+		// silently updating zero rows (the old UPDATE also wrote the
+		// GENERATED quantity_available column, so this path always errored).
 		if updateStock {
-			_, err = tx.Exec(`
-				UPDATE inventory SET
-					quantity_on_hand = quantity_on_hand - $1,
-					quantity_available = quantity_available - $1,
+			var inventoryID uuid.UUID
+			var invUnitCost float64
+			err = tx.QueryRow(`
+				INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id,
+					quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, 0, $7, NOW(), NOW(), NOW())
+				ON CONFLICT (tenant_id, product_id, warehouse_id) DO UPDATE SET
+					quantity_on_hand = inventory.quantity_on_hand + EXCLUDED.quantity_on_hand,
+					last_movement_date = NOW(),
 					updated_at = NOW()
-				WHERE product_id = $2 AND warehouse_id = $3 AND tenant_id = $4
-			`, line.Quantity, line.ProductID, warehouseID, tenantID)
+				RETURNING id, unit_cost
+			`, uuid.New(), tenantID, warehouseOrgID, line.ProductID, warehouseID,
+				-line.Quantity, unitCost).Scan(&inventoryID, &invUnitCost)
 
 			if err != nil {
 				h.log.Error("Failed to update inventory", "error", err)
 				response.InternalError(c, "Failed to update inventory")
 				return
 			}
+			if invUnitCost == 0 {
+				invUnitCost = unitCost
+			}
 
-			// Create inventory transaction
+			// Create inventory transaction (ledger row; quantity stored
+			// negative + type 'issue' — stock_ledger normalizes either way)
 			_, err = tx.Exec(`
 				INSERT INTO inventory_transactions (
-					id, tenant_id, product_id, warehouse_id, transaction_type, quantity,
-					reference_type, reference_id, notes
-				) VALUES ($1, $2, $3, $4, 'issue', $5, 'pos_order', $6, $7)
-			`, uuid.New(), tenantID, line.ProductID, warehouseID, -line.Quantity, orderID, "POS Sale: "+orderNumber)
+					id, tenant_id, organization_id, inventory_id, product_id, warehouse_id,
+					transaction_type, quantity, unit_cost, total_cost,
+					reference_type, reference_id, notes, transaction_date, created_by, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, 'issue', $7, $8, $9, 'pos_order', $10, $11, NOW(), $12, NOW())
+			`, uuid.New(), tenantID, warehouseOrgID, inventoryID, line.ProductID, warehouseID,
+				-line.Quantity, invUnitCost, line.Quantity*invUnitCost, orderID, "POS Sale: "+orderNumber, userID)
 
 			if err != nil {
 				h.log.Error("Failed to create inventory transaction", "error", err)
 				response.InternalError(c, "Failed to create inventory transaction")
 				return
 			}
+
+			consumedLines = append(consumedLines, posConsumedLine{
+				ProductID: line.ProductID,
+				Quantity:  line.Quantity,
+				UnitCost:  invUnitCost,
+			})
 		}
 	}
 
@@ -887,6 +920,29 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 		h.log.Error("Failed to commit transaction", "error", err)
 		response.InternalError(c, "Failed to commit transaction")
 		return
+	}
+
+	// Revenue side: DR kassa/karta, CR savdo daromadi (+ CR QQS). POS sales
+	// previously never touched the GL at all (docs/ombor-audit.md §2).
+	h.postPOSRevenueJE(tenantID, warehouseOrgID, orderID, orderNumber, userID,
+		totalCash-amountReturn, totalCard+totalOther, totalAmount, taxAmount)
+
+	// Post COGS to the GL (DR cost-of-goods / CR inventory) per consumed
+	// line. Best-effort + idempotency-keyed — POS sales previously never
+	// touched the GL at all (docs/ombor-audit.md §2, finding: POS never
+	// hits the GL), which was one source of the Ombor↔Buxgalteriya drift.
+	for _, cl := range consumedLines {
+		h.postInventoryConsumptionJE(h.db, postInventoryConsumptionArgs{
+			TenantID:       tenantID,
+			OrganizationID: warehouseOrgID,
+			ProductID:      cl.ProductID,
+			Quantity:       cl.Quantity,
+			UnitCost:       cl.UnitCost,
+			SourceType:     "pos_order",
+			SourceID:       &orderID,
+			IdempotencyKey: fmt.Sprintf("POS-CONS-%s-%s", orderID, cl.ProductID),
+			Description:    "POS sotuv tannarxi: " + orderNumber,
+		})
 	}
 
 	// Return order with lines
@@ -1238,4 +1294,128 @@ func (h *Handler) GetSessionSummary(c *gin.Context) {
 	}
 
 	response.Success(c, summary)
+}
+
+// postPOSRevenueJE posts the sale-side entry for a POS order:
+//
+//	DR  Kassa (5010)            cash received minus change
+//	DR  Bank/karta (5110)       card + other payments
+//	CR  Savdo daromadi (9020)   net of tax
+//	CR  QQS (6410)              tax portion, if any
+//
+// Idempotency-keyed on POS-REV-<orderID> (journal_entries.reference), all
+// legs + account-balance bumps in one tx (migration 416 balance trigger).
+// Best-effort: failures are logged, the sale itself is already committed.
+func (h *Handler) postPOSRevenueJE(tenantID uuid.UUID, orgID *uuid.UUID, orderID uuid.UUID, orderNumber string, userID uuid.UUID, cashLeg, cardLeg, totalAmount, taxAmount float64) {
+	if totalAmount <= 0 {
+		return
+	}
+
+	ref := fmt.Sprintf("POS-REV-%s", orderID)
+	var existing int
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE reference = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		ref, tenantID).Scan(&existing)
+	if existing > 0 {
+		return
+	}
+
+	revenueNet := totalAmount - taxAmount
+
+	cashAcct := findAccount(h.db, tenantID, orgID, "kassa", "5010")
+	if cashAcct == uuid.Nil {
+		cashAcct = findAccount(h.db, tenantID, orgID, "cash", "5010")
+	}
+	var cardAcct uuid.UUID
+	if cardLeg > 0 {
+		cardAcct = findAccount(h.db, tenantID, orgID, "bank account", "5110")
+	}
+	revenueAcct := findAccount(h.db, tenantID, orgID, "sales revenue", "9020")
+	if revenueAcct == uuid.Nil {
+		revenueAcct = findAccount(h.db, tenantID, orgID, "revenue", "9010")
+	}
+	var taxAcct uuid.UUID
+	if taxAmount > 0 {
+		taxAcct = findAccount(h.db, tenantID, orgID, "qqs", "6410")
+		if taxAcct == uuid.Nil {
+			taxAcct = findAccount(h.db, tenantID, orgID, "tax payable", "6410")
+		}
+	}
+
+	if cashAcct == uuid.Nil || revenueAcct == uuid.Nil || (cardLeg > 0 && cardAcct == uuid.Nil) || (taxAmount > 0 && taxAcct == uuid.Nil) {
+		h.log.Warn("POS revenue JE skipped — accounts unresolved", "order", orderNumber,
+			"cash", cashAcct, "card", cardAcct, "revenue", revenueAcct, "tax", taxAcct)
+		return
+	}
+
+	var journalID uuid.UUID
+	var nextNumber int
+	h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('CASH','GEN','GENERAL','MISC') AND deleted_at IS NULL ORDER BY CASE code WHEN 'CASH' THEN 0 WHEN 'GEN' THEN 1 WHEN 'GENERAL' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
+	if journalID == uuid.Nil {
+		h.log.Warn("POS revenue JE skipped — no journal found", "order", orderNumber)
+		return
+	}
+
+	now := time.Now()
+	tx, err := h.db.Begin()
+	if err != nil {
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+
+	entryID := uuid.New()
+	entryNumber := fmt.Sprintf("POS%06d", nextEntryNumberSeq(tx, tenantID, orgID, "POS", nextNumber))
+	description := "POS sotuv: " + orderNumber
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+			description, reference, source_type, source_id, status, total_debit, total_credit,
+			created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pos_order', $9, 'posted', $10, $10, $11, $12, $12)
+	`, entryID, tenantID, orgID, journalID, entryNumber, now,
+		description, ref, orderID.String(), totalAmount, nilIfZeroUUID(userID), now); err != nil {
+		h.log.Error("POS revenue JE header failed", "error", err)
+		return
+	}
+
+	lineNo := 1
+	addLine := func(acct uuid.UUID, dr, cr float64, desc string) bool {
+		if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			uuid.New(), entryID, acct, desc, dr, cr, lineNo, now); err != nil {
+			h.log.Error("POS revenue JE line failed", "error", err, "line", desc)
+			return false
+		}
+		lineNo++
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`,
+			dr-cr, now, acct); err != nil {
+			h.log.Error("POS revenue JE balance bump failed", "error", err)
+			return false
+		}
+		return true
+	}
+
+	if cashLeg > 0 && !addLine(cashAcct, cashLeg, 0, "Kassa tushumi") {
+		return
+	}
+	if cardLeg > 0 && !addLine(cardAcct, cardLeg, 0, "Karta/bank tushumi") {
+		return
+	}
+	if !addLine(revenueAcct, 0, revenueNet, "Savdo daromadi") {
+		return
+	}
+	if taxAmount > 0 && !addLine(taxAcct, 0, taxAmount, "QQS") {
+		return
+	}
+	if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("POS revenue JE commit failed", "error", err)
+		return
+	}
+	committed = true
 }

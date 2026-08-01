@@ -807,7 +807,7 @@ type WorkflowAction struct {
 func (h *Handler) CheckThresholdRules() {
 	rows, err := h.db.Query(`
 		SELECT DISTINCT tenant_id, trigger_event FROM workflow_rules
-		WHERE trigger_event IN ('inventory.low_stock', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon')
+		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale')
 		  AND is_active = true AND deleted_at IS NULL
 	`)
 	if err != nil {
@@ -833,13 +833,62 @@ func (h *Handler) CheckThresholdRules() {
 		switch s.event {
 		case "inventory.low_stock":
 			h.checkInventoryThresholds(s.tenantID)
+		case "inventory.transfer_stuck":
+			h.checkStuckTransfers(s.tenantID)
 		case "invoice.overdue":
 			h.checkOverdueInvoices(s.tenantID)
 		case "task.overdue":
 			h.checkOverdueTaskEvents(s.tenantID)
 		case "contracts.expiring_soon":
 			h.checkExpiringContracts(s.tenantID)
+		case "lead.stale":
+			h.checkStaleLeads(s.tenantID)
 		}
+	}
+}
+
+// checkStuckTransfers emits inventory.transfer_stuck for intercompany
+// transfers sitting in_transit for more than 3 days — that stock is out of
+// the source warehouse and not yet in the destination, so nobody's on-hand
+// includes it. Re-fires per transfer at most once per 24h.
+func (h *Handler) checkStuckTransfers(tenantID uuid.UUID) {
+	rows, err := h.db.Query(`
+		SELECT t.id, COALESCE(t.transfer_number, ''),
+		       COALESCE(wf.name, ''), COALESCE(wt.name, ''),
+		       EXTRACT(DAY FROM NOW() - t.shipped_at)::int AS days_in_transit
+		FROM intercompany_transfers t
+		LEFT JOIN warehouses wf ON wf.id = t.from_warehouse_id
+		LEFT JOIN warehouses wt ON wt.id = t.to_warehouse_id
+		WHERE t.tenant_id = $1 AND t.deleted_at IS NULL
+		  AND t.status = 'in_transit'
+		  AND t.shipped_at < NOW() - INTERVAL '3 days'
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to check stuck transfers", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var transferID uuid.UUID
+		var transferNumber, fromWH, toWH string
+		var days int
+		if err := rows.Scan(&transferID, &transferNumber, &fromWH, &toWH, &days); err != nil {
+			continue
+		}
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: tenantID,
+			Event:    "inventory.transfer_stuck",
+			Data: map[string]interface{}{
+				"record_id":       transferID.String(),
+				"transfer_number": transferNumber,
+				"from_warehouse":  fromWH,
+				"to_warehouse":    toWH,
+				"days_in_transit": days,
+			},
+			DedupeKey: transferID.String(),
+			Cooldown:  24 * time.Hour,
+		})
 	}
 }
 

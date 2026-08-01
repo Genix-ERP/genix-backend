@@ -274,14 +274,18 @@ func findTool(tools []agentTool, name string) *agentTool {
 // toolPerms maps each tool to the RBAC node it requires (module, resource,
 // action) — the SAME permission the corresponding ERP route enforces. A tool
 // absent from this map corresponds to an ERP route that has no perm.Require
-// guard (contacts, leads, opportunities) and so is available to any tenant
-// user. The agent mirrors the ERP's own gating exactly: never stricter, never
-// looser than what the user could already do through the normal UI/API.
+// guard (contact reads stay open — every module's partner picker needs them)
+// and so is available to any tenant user. The agent mirrors the ERP's own
+// gating exactly: never stricter, never looser than what the user could
+// already do through the normal UI/API. CRM lead/opportunity/report routes
+// are gated since migration 446.
 var toolPerms = map[string][3]string{
 	// ---- reads ----
 	"find_products":              {"inventory", "product", "read"},
 	"check_stock":                {"inventory", "stock", "read"},
 	"low_stock_products":         {"inventory", "stock", "read"},
+	"inventory_valuation":        {"inventory", "stock", "read"},
+	"stock_movements":            {"inventory", "stock", "read"},
 	"list_stock_counts":          {"inventory", "stock", "read"},
 	"list_boms":                  {"inventory", "bom", "read"},
 	"get_bom":                    {"inventory", "bom", "read"},
@@ -320,7 +324,13 @@ var toolPerms = map[string][3]string{
 	"list_payroll_periods":       {"hr", "payroll", "read"},
 	"list_projects":              {"construction", "project", "read"},
 	"list_workflows":             {"workflow", "workflow", "read"},
+	// CRM routes are gated since migration 446 — the tools mirror that.
+	"list_leads":         {"crm", "lead", "read"},
+	"list_opportunities": {"crm", "opportunity", "read"},
+	"crm_summary":        {"crm", "report", "read"},
 	// ---- writes ----
+	"create_contact":       {"crm", "contact", "create"},
+	"create_lead":          {"crm", "lead", "create"},
 	"create_sales_order":   {"sales", "order", "create"},
 	"create_sales_invoice": {"sales", "invoice", "create"},
 	"create_vendor_bill":   {"purchase", "invoice", "create"},

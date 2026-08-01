@@ -580,6 +580,10 @@ func (h *Handler) resolveContractLinkTitle(tenantID uuid.UUID, module, linkedID 
 	switch module {
 	case "crm_deal":
 		err = h.db.QueryRow(`SELECT name FROM opportunities WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, linkedID, tenantID).Scan(&title)
+	case "crm_lead":
+		err = h.db.QueryRow(`
+			SELECT contact_name || COALESCE(' · ' || NULLIF(company_name, ''), '')
+			FROM leads WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, linkedID, tenantID).Scan(&title)
 	case "construction_object":
 		intID, convErr := strconv.ParseInt(linkedID, 10, 64)
 		if convErr != nil {

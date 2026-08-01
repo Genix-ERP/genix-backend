@@ -2016,6 +2016,13 @@ type directorCompanySummary struct {
 	ActiveContractsValue float64 `json:"active_contracts_value"`
 	ExpiringContracts    int     `json:"expiring_contracts"`
 	ContractsOutstanding float64 `json:"contracts_outstanding"`
+	// CRM aggregates (open pipeline, bu oy yutilgan, konversiya %)
+	CRMOpenLeads     int     `json:"crm_open_leads"`
+	CRMPipelineValue float64 `json:"crm_pipeline_value"`
+	CRMWonMonth      int     `json:"crm_won_month"`
+	CRMWonValueMonth float64 `json:"crm_won_value_month"`
+	CRMConversion    float64 `json:"crm_conversion"`
+	CRMTopLossReason string  `json:"crm_top_loss_reason"`
 }
 
 type directorTopStockProduct struct {
@@ -2502,6 +2509,65 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		contractRows.Close()
 	}
 
+	// 10. CRM aggregates per org — ochiq voronka (soni + summasi), bu oy
+	// yutilganlar, umumiy konversiya %, eng ko'p yo'qotish sababi.
+	crmRows, err := h.db.Query(`
+		SELECT l.organization_id,
+		       COUNT(*) FILTER (WHERE l.won_at IS NULL AND l.lost_at IS NULL),
+		       COALESCE(SUM(l.expected_value) FILTER (WHERE l.won_at IS NULL AND l.lost_at IS NULL), 0),
+		       COUNT(*) FILTER (WHERE l.won_at >= date_trunc('month', CURRENT_DATE)),
+		       COALESCE(SUM(l.expected_value) FILTER (WHERE l.won_at >= date_trunc('month', CURRENT_DATE)), 0),
+		       COALESCE(COUNT(*) FILTER (WHERE l.won_at IS NOT NULL)::float /
+		                NULLIF(COUNT(*) FILTER (WHERE l.won_at IS NOT NULL OR l.lost_at IS NOT NULL), 0) * 100, 0)
+		FROM leads l
+		WHERE l.tenant_id = $1 AND l.deleted_at IS NULL AND l.organization_id IS NOT NULL
+		GROUP BY l.organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for crmRows.Next() {
+			var orgID uuid.UUID
+			var open, wonMonth int
+			var pipelineValue, wonValueMonth, conversion float64
+			if err := crmRows.Scan(&orgID, &open, &pipelineValue, &wonMonth, &wonValueMonth, &conversion); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.CRMOpenLeads = open
+			s.CRMPipelineValue = pipelineValue
+			s.CRMWonMonth = wonMonth
+			s.CRMWonValueMonth = wonValueMonth
+			s.CRMConversion = math.Round(conversion*10) / 10
+		}
+		crmRows.Close()
+	}
+	lossRows, err := h.db.Query(`
+		SELECT DISTINCT ON (l.organization_id) l.organization_id, r.name
+		FROM leads l
+		JOIN lost_reasons r ON r.id = l.lost_reason_id
+		WHERE l.tenant_id = $1 AND l.deleted_at IS NULL AND l.lost_at IS NOT NULL
+		  AND l.organization_id IS NOT NULL
+		GROUP BY l.organization_id, r.name
+		ORDER BY l.organization_id, COUNT(*) DESC`,
+		tenantID,
+	)
+	if err == nil {
+		for lossRows.Next() {
+			var orgID uuid.UUID
+			var reason string
+			if err := lossRows.Scan(&orgID, &reason); err != nil {
+				continue
+			}
+			if s := touch(orgID.String()); s != nil {
+				s.CRMTopLossReason = reason
+			}
+		}
+		lossRows.Close()
+	}
+
 	// Compute profit and round output
 	companies := make([]directorCompanySummary, 0, len(order))
 	round2 := func(v float64) float64 { return math.Round(v*100) / 100 }
@@ -2517,6 +2583,8 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		s.SalaryFund = round2(s.SalaryFund)
 		s.PayrollFund = round2(s.PayrollFund)
 		s.PayrollUnpaid = round2(s.PayrollUnpaid)
+		s.CRMPipelineValue = round2(s.CRMPipelineValue)
+		s.CRMWonValueMonth = round2(s.CRMWonValueMonth)
 		for i, v := range s.MonthlyRevenue {
 			s.MonthlyRevenue[i] = round2(v)
 		}

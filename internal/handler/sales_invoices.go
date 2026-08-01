@@ -1155,6 +1155,17 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 			  AND so.direction = 'delivery' AND so.state = 'done'
 		`, salesOrderID.String).Scan(&cogsPosted)
 		deliveryAlreadyPostedCOGS = cogsPosted > 0
+		if !deliveryAlreadyPostedCOGS {
+			// Ombor v2: ValidateDeliveryOrder posts per-line COGS at shipment
+			// (source_type='sales_delivery', DO-COGS-* keys) — skip too.
+			var doCogs int
+			tx.QueryRow(`
+				SELECT COUNT(*) FROM journal_entries je
+				WHERE je.source_type = 'sales_delivery' AND je.status = 'posted' AND je.deleted_at IS NULL
+				  AND je.source_id IN (SELECT id::text FROM sales_delivery_orders WHERE sales_order_id = $1)
+			`, salesOrderID.String).Scan(&doCogs)
+			deliveryAlreadyPostedCOGS = doCogs > 0
+		}
 	}
 
 	for _, il := range invoiceLines {
@@ -2271,6 +2282,16 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 				  AND so.direction = 'delivery' AND so.state = 'done'
 			`, mi.SalesOrderID.String).Scan(&cogsPosted)
 			deliveryAlreadyPostedCOGS = cogsPosted > 0
+			if !deliveryAlreadyPostedCOGS {
+				// Ombor v2: shipment-time COGS from ValidateDeliveryOrder
+				var doCogs int
+				h.db.QueryRow(`
+					SELECT COUNT(*) FROM journal_entries je
+					WHERE je.source_type = 'sales_delivery' AND je.status = 'posted' AND je.deleted_at IS NULL
+					  AND je.source_id IN (SELECT id::text FROM sales_delivery_orders WHERE sales_order_id = $1)
+				`, mi.SalesOrderID.String).Scan(&doCogs)
+				deliveryAlreadyPostedCOGS = doCogs > 0
+			}
 		}
 
 		for _, al := range acctLines {
