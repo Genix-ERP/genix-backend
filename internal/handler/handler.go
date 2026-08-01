@@ -1783,21 +1783,23 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// ────────────── Employee Taxes (migration 330) ──────────────
 	// Configurable per-tenant catalog of employee taxes. Drives the Settings →
 	// Finance → Employee Taxes UI, the create-payroll modal's tax picker, and
-	// the Tax Reports → Employee Taxes section. Matches the loose auth pattern
-	// of the existing /tax-rates group (auth-only, no extra permission check).
+	// the Tax Reports → Employee Taxes section. Reads stay auth-only (the
+	// catalog holds tenant config, not personal data, and several modules'
+	// pickers need it); mutations change every subsequent payroll calculation
+	// and the payments endpoint posts journal entries, so both are gated.
 	employeeTaxes := rg.Group("/employee-taxes")
 	{
 		employeeTaxes.GET("", h.ListEmployeeTaxes)
-		employeeTaxes.POST("", h.CreateEmployeeTax)
-		employeeTaxes.PUT("/:id", h.UpdateEmployeeTax)
-		employeeTaxes.DELETE("/:id", h.DeleteEmployeeTax)
+		employeeTaxes.POST("", h.perm.Require("hr", "payroll", "update"), h.CreateEmployeeTax)
+		employeeTaxes.PUT("/:id", h.perm.Require("hr", "payroll", "update"), h.UpdateEmployeeTax)
+		employeeTaxes.DELETE("/:id", h.perm.Require("hr", "payroll", "update"), h.DeleteEmployeeTax)
 		employeeTaxes.POST("/preview", h.PreviewPayrollTaxes)
 		// Record a payment against a tax-period liability (migration 360).
 		// Posts a Dr-liability / Cr-cash journal entry and inserts a
 		// row in employee_tax_payments so the Tax Reports → Employee
 		// Taxes tab can subtract it from the accrued total to display
 		// the running pending balance.
-		employeeTaxes.POST("/payments", h.RecordEmployeeTaxPayment)
+		employeeTaxes.POST("/payments", h.perm.Require("finance", "tax_report", "update"), h.RecordEmployeeTaxPayment)
 	}
 
 	// ────────────── Company Tax Rates (migration 340) ──────────────
@@ -1829,8 +1831,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payrollTT.GET("/export", h.ExportPayrollBackup)
 	}
 
-	// Employee Loans
+	// Employee Loans. Loan lists carry every employee's debt with names and
+	// balances — sensitive payroll data, so the whole group requires payroll
+	// read (the employee cabinet reads its own loan via /my/loan instead).
 	loans := rg.Group("/employee-loans")
+	loans.Use(h.perm.Require("hr", "payroll", "read"))
 	{
 		loans.GET("", h.ListEmployeeLoans)
 		loans.POST("", h.perm.Require("hr", "payroll", "create"), h.CreateEmployeeLoan)
@@ -1847,31 +1852,44 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// Expense Categories — list is open to anyone with read on expenses
-	// (foremen need it for the submit-claim dropdown). Mutations are
-	// gated to the same write permission as the rest of the expense
-	// admin surface.
+	// (foremen need it for the expense-form dropdown). Mutations were
+	// gated on the action "write", which NOTHING ever grants (seeded
+	// actions are read/create/update/delete/approve — audit §2.7.3), so
+	// category CRUD only worked for owner/site_admin. Now "update".
 	expenseCategories := rg.Group("/expense-categories")
 	{
 		expenseCategories.GET("", h.ListExpenseCategories)
-		expenseCategories.POST("", h.perm.Require("finance", "expense", "write"), h.CreateExpenseCategory)
-		expenseCategories.PUT("/:id", h.perm.Require("finance", "expense", "write"), h.UpdateExpenseCategory)
-		expenseCategories.DELETE("/:id", h.perm.Require("finance", "expense", "write"), h.DeleteExpenseCategory)
+		expenseCategories.POST("", h.perm.Require("finance", "expense", "update"), h.CreateExpenseCategory)
+		expenseCategories.PUT("/:id", h.perm.Require("finance", "expense", "update"), h.UpdateExpenseCategory)
+		expenseCategories.DELETE("/:id", h.perm.Require("finance", "expense", "update"), h.DeleteExpenseCategory)
 	}
 
-	// Expenses
+	// Expenses — lifecycle v2 (migration 444, docs/xarajatlar-audit.md):
+	// draft → submitted → approved → paid (+ rejected). Transitions go
+	// through the dedicated POST endpoints below; PUT can no longer
+	// change status.
 	expenses := rg.Group("/expenses")
 	expenses.Use(h.perm.Require("finance", "expense", "read"))
 	{
 		expenses.GET("", h.ListExpenses)
+		expenses.GET("/stats", h.GetExpenseStats)
 		expenses.POST("", h.perm.Require("finance", "expense", "create"), h.CreateExpense)
 		expenses.GET("/:id", h.GetExpense)
 		expenses.PUT("/:id", h.perm.Require("finance", "expense", "update"), h.UpdateExpense)
 		expenses.DELETE("/:id", h.perm.Require("finance", "expense", "delete"), h.DeleteExpense)
+		expenses.POST("/:id/submit", h.perm.Require("finance", "expense", "create"), h.SubmitExpense)
 		expenses.POST("/:id/approve", h.perm.Require("finance", "expense", "approve"), h.ApproveExpense)
+		expenses.POST("/:id/reject", h.perm.Require("finance", "expense", "approve"), h.RejectExpense)
+		// Paying posts the GL entry — gate on approve (finance staff).
+		expenses.POST("/:id/pay", h.perm.Require("finance", "expense", "approve"), h.PayExpense)
 		// Dedicated recognition toggle — see RecognizeExpense / §7.2 of
 		// ТЗ_Ish_Haqi_Soliq_Tolik.docx. Re-uses the generic "update"
 		// permission; wire to its own perm node if/when RBAC grows.
 		expenses.PATCH("/:id/recognize", h.perm.Require("finance", "expense", "update"), h.RecognizeExpense)
+		// Polymorphic links to Qurilish / Shartnomalar / CRM records
+		expenses.GET("/:id/links", h.ListExpenseLinks)
+		expenses.POST("/:id/links", h.perm.Require("finance", "expense", "update"), h.CreateExpenseLink)
+		expenses.DELETE("/:id/links/:linkId", h.perm.Require("finance", "expense", "update"), h.DeleteExpenseLink)
 	}
 
 	// Profit-tax calculation + snapshots (migrations 336/337)

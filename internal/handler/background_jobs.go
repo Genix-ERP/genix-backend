@@ -167,6 +167,7 @@ func checkOverdueTasks(db *database.DB, log logger.Logger) {
 		}
 
 		dueStr := t.dueDate.Format("2006-01-02")
+		dueDisplay := t.dueDate.Format("02.01.2006")
 		for uid := range recipients {
 			var lang string
 			if err := db.QueryRow(`SELECT COALESCE(language, 'en') FROM users WHERE id = $1`, uid).Scan(&lang); err != nil || lang == "" {
@@ -185,7 +186,7 @@ func checkOverdueTasks(db *database.DB, log logger.Logger) {
 			if _, err := db.Exec(`
 				INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 				VALUES ($1, $2, $3, 'task_overdue', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
-			`, uuid.New(), t.tenantID, uid, tmpl.Title, fmt.Sprintf(tmpl.Message, t.title, dueStr), string(dataJSON), now); err != nil {
+			`, uuid.New(), t.tenantID, uid, tmpl.Title, fmt.Sprintf(tmpl.Message, t.title, dueDisplay), string(dataJSON), now); err != nil {
 				log.Error("Failed to insert overdue notification", "error", err, "task_id", t.id.String())
 				continue
 			}
@@ -984,6 +985,7 @@ func checkContractExpiryNotifications(db *database.DB, log logger.Logger) {
 				tmpl = notificationTemplates["contract_expiring"]["en"]
 			}
 			endStr := ct.endDate.Format("2006-01-02")
+			endDisplay := ct.endDate.Format("02.01.2006")
 			dataJSON, _ := json.Marshal(map[string]interface{}{
 				"contract_id":     ct.id.String(),
 				"contract_number": ct.contractNumber,
@@ -995,7 +997,7 @@ func checkContractExpiryNotifications(db *database.DB, log logger.Logger) {
 				INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 				VALUES ($1, $2, $3, 'contract_expiring', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
 			`, uuid.New(), ct.tenantID, ct.recipient, tmpl.Title,
-				fmt.Sprintf(tmpl.Message, ct.contractNumber, ct.title, ct.daysLeft, endStr),
+				fmt.Sprintf(tmpl.Message, ct.contractNumber, ct.title, ct.daysLeft, endDisplay),
 				string(dataJSON), now); err != nil {
 				log.Error("Failed to insert contract expiry notification", "error", err, "contract_id", ct.id.String())
 				continue

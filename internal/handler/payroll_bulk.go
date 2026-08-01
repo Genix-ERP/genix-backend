@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"math"
 	"strings"
 	"time"
 
@@ -51,11 +52,12 @@ func (h *Handler) CalculateAllPayroll(c *gin.Context) {
 	// calculation is only allowed for draft and processing — once a period
 	// is approved/paid the entries are locked.
 	var status sql.NullString
+	var periodOrgStr sql.NullString
 	if err := h.db.QueryRow(`
-		SELECT COALESCE(status, 'draft')
+		SELECT COALESCE(status, 'draft'), organization_id
 		FROM payroll_periods
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, periodID, tenantID).Scan(&status); err != nil {
+	`, periodID, tenantID).Scan(&status, &periodOrgStr); err != nil {
 		response.NotFound(c, "Payroll period not found")
 		return
 	}
@@ -63,6 +65,15 @@ func (h *Handler) CalculateAllPayroll(c *gin.Context) {
 	if st == "approved" || st == "paid" || st == "cancelled" {
 		response.BadRequest(c, "Period is already approved/paid; cannot recalculate")
 		return
+	}
+
+	// The period's own organization drives both the employee filter and the
+	// org stamped on created entries — in a multi-company tenant the caller's
+	// active org may differ from the period's.
+	if periodOrgStr.Valid {
+		if parsed, perr := uuid.Parse(periodOrgStr.String); perr == nil {
+			orgID = parsed
+		}
 	}
 
 	// Pull every active employee with a positive base_salary. Column
@@ -76,7 +87,10 @@ func (h *Handler) CalculateAllPayroll(c *gin.Context) {
 		JobTitle   sql.NullString
 		BaseSalary float64
 	}
-	rows, err := h.db.Query(`
+	// Same org filter as the TT auto-create flow: primary org column OR the
+	// employee_organizations junction. Without it a multi-company tenant
+	// pulls every company's employees into one company's period.
+	empQuery := `
 		SELECT e.id,
 		       COALESCE(e.first_name, ''),
 		       COALESCE(e.last_name, ''),
@@ -86,9 +100,20 @@ func (h *Handler) CalculateAllPayroll(c *gin.Context) {
 		WHERE e.tenant_id = $1
 		  AND COALESCE(e.status, 'active') = 'active'
 		  AND e.deleted_at IS NULL
-		  AND COALESCE(e.base_salary, 0) > 0
-		ORDER BY e.last_name, e.first_name
-	`, tenantID)
+		  AND COALESCE(e.base_salary, 0) > 0`
+	empArgs := []interface{}{tenantID}
+	if orgID != uuid.Nil {
+		empQuery += `
+		  AND (e.organization_id = $2
+		       OR e.id IN (
+		           SELECT employee_id FROM employee_organizations
+		           WHERE tenant_id = $1 AND organization_id = $2
+		       ))`
+		empArgs = append(empArgs, orgID)
+	}
+	empQuery += `
+		ORDER BY e.last_name, e.first_name`
+	rows, err := h.db.Query(empQuery, empArgs...)
 	if err != nil {
 		h.log.Error("Failed to list employees for bulk payroll calc", "error", err)
 		response.InternalError(c, "Failed to list employees")
@@ -131,6 +156,13 @@ func (h *Handler) CalculateAllPayroll(c *gin.Context) {
 	}
 	now := time.Now()
 
+	// Advance split percentage from tenant payroll settings (fallback 40).
+	advancePct := 40.0
+	if settings, sErr := h.getOrInitPayrollSettings(tenantID); sErr == nil && settings != nil &&
+		settings.AdvancePercent > 0 && settings.AdvancePercent <= 100 {
+		advancePct = settings.AdvancePercent
+	}
+
 	createdIDs := []uuid.UUID{}
 	skippedExisting := 0
 	failed := 0
@@ -166,6 +198,11 @@ func (h *Handler) CalculateAllPayroll(c *gin.Context) {
 		grossSalary := e.BaseSalary
 		netSalary := grossSalary - totalEmployeeTax
 
+		// TT §2.3.2 advance split from tenant settings — this path used to
+		// force 0/100%, diverging from the per-entry and TT-create paths.
+		advanceAmount := math.Round(e.BaseSalary * advancePct / 100)
+		remainderAmount := e.BaseSalary - advanceAmount
+
 		entryID := uuid.New()
 		if _, err := h.db.Exec(`
 			INSERT INTO payroll_entries (
@@ -180,12 +217,13 @@ func (h *Handler) CalculateAllPayroll(c *gin.Context) {
 				$7, $8,
 				0, 0, 0, 0, $8, $9,
 				$10, $11, 0, $12, $13,
-				0, $8, 100, FALSE, FALSE,
-				'bank_transfer', 'pending', $14, $14
+				$14, $15, $16, FALSE, FALSE,
+				'bank_transfer', 'pending', $17, $17
 			)
 		`, entryID, tenantID, orgIDPtr, periodID, e.ID, employeeName,
 			positionSnapshot, grossSalary,
 			effectiveIncomeTax, effectiveSocialSecurity, effectivePension, totalEmployeeTax, netSalary,
+			advanceAmount, remainderAmount, advancePct,
 			now,
 		); err != nil {
 			h.log.Warn("Failed to insert bulk payroll entry — skipping", "employee_id", e.ID, "error", err)

@@ -182,6 +182,15 @@ type PayrollPeriodResponse struct {
 	EmployeeCount   int        `json:"employee_count"`
 	Notes           string     `json:"notes,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
+
+	// First-entry TT payment state, populated only for single-employee
+	// periods so the period list can drive the advance/remainder toggles
+	// (they operate on payroll_entries, not periods).
+	FirstEntryID     *uuid.UUID `json:"first_entry_id,omitempty"`
+	AdvancePaid      *bool      `json:"advance_paid,omitempty"`
+	AdvancePaidDay   *int       `json:"advance_paid_day,omitempty"`
+	RemainderPaid    *bool      `json:"remainder_paid,omitempty"`
+	RemainderPaidDay *int       `json:"remainder_paid_day,omitempty"`
 }
 
 // ToResponse converts PayrollPeriod to PayrollPeriodResponse

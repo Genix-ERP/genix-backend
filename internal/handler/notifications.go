@@ -70,6 +70,16 @@ var notificationTemplates = map[string]map[string]struct{ Title, Message string 
 		"uz": {Title: "Xarajat tasdiqlandi", Message: "%s xarajat %s miqdorida tasdiqlandi"},
 		"ru": {Title: "Расход одобрен", Message: "Расход %s на сумму %s одобрен"},
 	},
+	"expense_rejected": {
+		"en": {Title: "Expense Rejected", Message: "Expense %s for %s has been rejected"},
+		"uz": {Title: "Xarajat rad etildi", Message: "%s xarajat %s miqdorida rad etildi"},
+		"ru": {Title: "Расход отклонён", Message: "Расход %s на сумму %s отклонён"},
+	},
+	"expense_paid": {
+		"en": {Title: "Expense Paid", Message: "Expense %s for %s has been paid"},
+		"uz": {Title: "Xarajat to'landi", Message: "%s xarajat %s miqdorida to'landi"},
+		"ru": {Title: "Расход оплачен", Message: "Расход %s на сумму %s оплачен"},
+	},
 	// ── Payroll ──
 	"salary_confirmed": {
 		"en": {Title: "Salary Payment Confirmed", Message: "Salary payment of %s has been confirmed for %s"},

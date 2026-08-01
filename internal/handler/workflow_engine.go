@@ -82,6 +82,18 @@ var workflowEventCatalog = map[string]workflowEventDef{
 		"record_id": "", "contract_number": "CNT-2026-0014", "contact_name": "Qurilish Invest MChJ", "end_date": "2026-08-20", "days_to_expiry": 19, "threshold_days": 30}},
 	"contracts.expired": {Category: "contracts", RelatedType: "contract", Scheduled: true, SampleData: map[string]interface{}{
 		"record_id": "", "contract_number": "CNT-2026-0014", "contact_name": "Qurilish Invest MChJ", "end_date": "2026-07-20"}},
+	"expenses.submitted": {Category: "expenses", RelatedType: "expense", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "expense_number": "EXP-2026-0018", "employee_name": "Dilshod Rahimov", "category_name": "Transport", "total_amount": 250000.0}},
+	"expenses.approved": {Category: "expenses", RelatedType: "expense", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "expense_number": "EXP-2026-0018", "employee_name": "Dilshod Rahimov", "category_name": "Transport", "total_amount": 250000.0}},
+	"expenses.rejected": {Category: "expenses", RelatedType: "expense", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "expense_number": "EXP-2026-0018", "employee_name": "Dilshod Rahimov", "total_amount": 250000.0, "reason": "Chek ilova qilinmagan"}},
+	"expenses.paid": {Category: "expenses", RelatedType: "expense", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "expense_number": "EXP-2026-0018", "employee_name": "Dilshod Rahimov", "category_name": "Transport", "total_amount": 250000.0}},
+	"payroll.period_confirmed": {Category: "hr", RelatedType: "payroll_period", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "period_name": "Iyul 2026", "total_net": 45000000.0}},
+	"payroll.paid": {Category: "hr", RelatedType: "payroll_period", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "period_name": "Iyul 2026", "total_net": 45000000.0}},
 }
 
 // workflowActionTypes is the set of executable action types. Legacy types

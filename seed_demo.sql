@@ -250,6 +250,13 @@ DECLARE
 
 BEGIN
 
+    -- Skip gracefully when the hardcoded demo tenant is absent (e.g. local
+    -- dev DBs) — same convention as the appended blocks below.
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tenant_id) THEN
+        RAISE NOTICE 'demo tenant % not found — main demo seed skipped', v_tenant_id;
+        RETURN;
+    END IF;
+
     -- ============================================================================
     -- 1. UPDATE USER ROLE & PERMISSIONS
     -- ============================================================================
@@ -853,6 +860,11 @@ DECLARE
     v_tid UUID := 'df372dc3-0b77-4ec6-aef3-c1145ecbeaac';
     v_user_id UUID := '43aa617b-1df4-463e-84cf-baf71a982e20';
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tid) THEN
+        RAISE NOTICE '  demo tenant not found — workflow rules seed skipped';
+        RETURN;
+    END IF;
+
     INSERT INTO workflow_rules (id, tenant_id, name, description, category, trigger_type,
         trigger_event, conditions, actions, is_active, priority, created_by, created_at, updated_at)
     VALUES
@@ -952,4 +964,403 @@ BEGIN
 END;
 $$;
 
+-- ============================================================================
+-- XARAJATLAR (Expenses v2, migration 444) — 15 ta xarajat, 6 kategoriya,
+-- 3 oy, aralash statuslar: shu bilan kategoriya donuti va oylik bar chart
+-- Demo Company da mazmunli ko'rinadi. Raqamlar 09xx blokida — API
+-- yaratadigan raqamlar bilan to'qnashmasligi uchun.
+-- ============================================================================
+DO $$
+DECLARE
+    v_tid UUID := 'df372dc3-0b77-4ec6-aef3-c1145ecbeaac';
+    v_org_id UUID := '043e7051-6765-4431-92ac-015773fe9e0b';
+    v_user_id UUID;
+    v_year TEXT := to_char(CURRENT_DATE, 'YYYY');
+    v_emp_id UUID; v_emp_name TEXT;
+    v_emp2_id UUID; v_emp2_name TEXT;
+    c_transport UUID; c_ijara UUID; c_kommunal UUID;
+    c_ofis UUID; c_reklama UUID; c_safar UUID;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tid) THEN
+        RAISE NOTICE '  demo tenant not found — expenses seed skipped';
+        RETURN;
+    END IF;
+
+    SELECT id INTO v_user_id FROM users WHERE tenant_id = v_tid LIMIT 1;
+
+    -- Default kategoriyalar (444-migratsiya seedi bilan bir xil) — yangi
+    -- bazada seed migratsiyadan oldin yurgan bo'lsa ham ishlashi uchun.
+    INSERT INTO expense_categories (tenant_id, code, name, description, is_active, color, icon, position)
+    VALUES
+        (v_tid, 'TRANSPORT', 'Transport',        'Yoqilg''i, taksi, yo''l xarajatlari',         true, '#185FA5', 'Car',            1),
+        (v_tid, 'IJARA',     'Ijara',            'Ofis va ombor ijarasi',                       true, '#534AB7', 'Building2',      2),
+        (v_tid, 'KOMMUNAL',  'Kommunal',         'Elektr, suv, gaz, internet, aloqa',           true, '#1D9E75', 'Zap',            3),
+        (v_tid, 'OFIS',      'Ofis xarajatlari', 'Kanselyariya, jihozlar, xo''jalik buyumlari', true, '#EF9F27', 'Briefcase',      4),
+        (v_tid, 'SAFAR',     'Safar',            'Xizmat safari, mehmonxona, chipta',           true, '#0E9AA7', 'Plane',          5),
+        (v_tid, 'REKLAMA',   'Reklama',          'Marketing va reklama xarajatlari',            true, '#D9534F', 'Megaphone',      6),
+        (v_tid, 'MATERIAL',  'Materiallar',      'Xom ashyo va materiallar',                    true, '#8A6D3B', 'Package',        7),
+        (v_tid, 'BOSHQA',    'Boshqa',           'Boshqa turdagi xarajatlar',                   true, '#888780', 'MoreHorizontal', 8)
+    ON CONFLICT (tenant_id, code) DO NOTHING;
+
+    SELECT id INTO c_transport FROM expense_categories WHERE tenant_id = v_tid AND code = 'TRANSPORT';
+    SELECT id INTO c_ijara     FROM expense_categories WHERE tenant_id = v_tid AND code = 'IJARA';
+    SELECT id INTO c_kommunal  FROM expense_categories WHERE tenant_id = v_tid AND code = 'KOMMUNAL';
+    SELECT id INTO c_ofis      FROM expense_categories WHERE tenant_id = v_tid AND code = 'OFIS';
+    SELECT id INTO c_reklama   FROM expense_categories WHERE tenant_id = v_tid AND code = 'REKLAMA';
+    SELECT id INTO c_safar     FROM expense_categories WHERE tenant_id = v_tid AND code = 'SAFAR';
+
+    -- Xodimlar: mavjud bo'lsa FK bilan bog'laymiz, bo'lmasa nom snapshoti
+    SELECT id, btrim(first_name || ' ' || last_name) INTO v_emp_id, v_emp_name
+    FROM employees WHERE tenant_id = v_tid ORDER BY created_at LIMIT 1;
+    SELECT id, btrim(first_name || ' ' || last_name) INTO v_emp2_id, v_emp2_name
+    FROM employees WHERE tenant_id = v_tid ORDER BY created_at OFFSET 1 LIMIT 1;
+    IF v_emp_name IS NULL OR v_emp_name = '' THEN v_emp_name := 'Dilshod Rahimov'; END IF;
+    IF v_emp2_name IS NULL OR v_emp2_name = '' THEN v_emp2_id := v_emp_id; v_emp2_name := 'Aziza Karimova'; END IF;
+
+    -- Qayta yurgizish uchun: faqat shu seed yaratgan 09xx raqamlarni tozalash
+    DELETE FROM expenses WHERE tenant_id = v_tid AND expense_number LIKE 'EXP-%-09__';
+
+    INSERT INTO expenses (
+        id, tenant_id, organization_id, expense_number, category_id, category_name,
+        employee_id, employee_name, expense_date, description,
+        amount, tax_amount, total_amount, currency, status,
+        submitted_at, approved_at, approved_by, paid_at, paid_by,
+        rejected_at, rejected_by, rejection_reason,
+        is_recognized, created_by, created_at, updated_at
+    ) VALUES
+    -- ── 2 oy avval (hammasi to'langan) ──
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0901', c_ijara, 'Ijara',
+     v_emp_id, v_emp_name, CURRENT_DATE - 70, 'Ofis ijarasi (2 oy avvalgi)',
+     3500000, 0, 3500000, 'UZS', 'paid',
+     NOW() - INTERVAL '70 days', NOW() - INTERVAL '69 days', v_user_id, NOW() - INTERVAL '68 days', v_user_id,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '70 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0902', c_kommunal, 'Kommunal',
+     v_emp_id, v_emp_name, CURRENT_DATE - 66, 'Elektr va suv to''lovi',
+     460000, 0, 460000, 'UZS', 'paid',
+     NOW() - INTERVAL '66 days', NOW() - INTERVAL '65 days', v_user_id, NOW() - INTERVAL '64 days', v_user_id,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '66 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0903', c_transport, 'Transport',
+     v_emp2_id, v_emp2_name, CURRENT_DATE - 62, 'Obyektga material tashish (yoqilg''i)',
+     420000, 0, 420000, 'UZS', 'paid',
+     NOW() - INTERVAL '62 days', NOW() - INTERVAL '61 days', v_user_id, NOW() - INTERVAL '60 days', v_user_id,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '62 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0904', c_reklama, 'Reklama',
+     v_emp2_id, v_emp2_name, CURRENT_DATE - 75, 'Instagram reklama kampaniyasi',
+     1200000, 0, 1200000, 'UZS', 'paid',
+     NOW() - INTERVAL '75 days', NOW() - INTERVAL '74 days', v_user_id, NOW() - INTERVAL '72 days', v_user_id,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '75 days', NOW()),
+    -- ── O'tgan oy ──
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0905', c_ijara, 'Ijara',
+     v_emp_id, v_emp_name, CURRENT_DATE - 40, 'Ofis ijarasi (o''tgan oy)',
+     3500000, 0, 3500000, 'UZS', 'paid',
+     NOW() - INTERVAL '40 days', NOW() - INTERVAL '39 days', v_user_id, NOW() - INTERVAL '38 days', v_user_id,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '40 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0906', c_kommunal, 'Kommunal',
+     v_emp_id, v_emp_name, CURRENT_DATE - 36, 'Internet va telefon aloqasi',
+     510000, 0, 510000, 'UZS', 'paid',
+     NOW() - INTERVAL '36 days', NOW() - INTERVAL '35 days', v_user_id, NOW() - INTERVAL '34 days', v_user_id,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '36 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0907', c_safar, 'Safar',
+     v_emp2_id, v_emp2_name, CURRENT_DATE - 33, 'Samarqandga xizmat safari (mehmonxona, yo''l)',
+     950000, 0, 950000, 'UZS', 'paid',
+     NOW() - INTERVAL '33 days', NOW() - INTERVAL '32 days', v_user_id, NOW() - INTERVAL '31 days', v_user_id,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '33 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0908', c_ofis, 'Ofis xarajatlari',
+     v_emp2_id, v_emp2_name, CURRENT_DATE - 45, 'Kanselyariya buyumlari',
+     275000, 0, 275000, 'UZS', 'approved',
+     NOW() - INTERVAL '45 days', NOW() - INTERVAL '44 days', v_user_id, NULL, NULL,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '45 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0909', c_transport, 'Transport',
+     v_emp_id, v_emp_name, CURRENT_DATE - 38, 'Taksi (mijoz uchrashuvlari)',
+     150000, 0, 150000, 'UZS', 'rejected',
+     NOW() - INTERVAL '38 days', NULL, NULL, NULL, NULL,
+     NOW() - INTERVAL '37 days', v_user_id, 'Chek ilova qilinmagan', false, v_user_id, NOW() - INTERVAL '38 days', NOW()),
+    -- ── Joriy oy ──
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0910', c_ijara, 'Ijara',
+     v_emp_id, v_emp_name, CURRENT_DATE - 8, 'Ofis ijarasi (joriy oy)',
+     3500000, 0, 3500000, 'UZS', 'approved',
+     NOW() - INTERVAL '8 days', NOW() - INTERVAL '7 days', v_user_id, NULL, NULL,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '8 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0911', c_kommunal, 'Kommunal',
+     v_emp_id, v_emp_name, CURRENT_DATE - 6, 'Elektr energiyasi to''lovi',
+     480000, 0, 480000, 'UZS', 'submitted',
+     NOW() - INTERVAL '6 days', NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '6 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0912', c_transport, 'Transport',
+     v_emp2_id, v_emp2_name, CURRENT_DATE - 4, 'Yoqilg''i (xizmat avtomobili)',
+     250000, 0, 250000, 'UZS', 'submitted',
+     NOW() - INTERVAL '4 days', NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '4 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0913', c_reklama, 'Reklama',
+     v_emp2_id, v_emp2_name, CURRENT_DATE - 3, 'Banner chop etish',
+     800000, 0, 800000, 'UZS', 'submitted',
+     NOW() - INTERVAL '3 days', NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '3 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0914', c_ofis, 'Ofis xarajatlari',
+     v_emp_id, v_emp_name, CURRENT_DATE - 2, 'Printer kartriji',
+     320000, 0, 320000, 'UZS', 'draft',
+     NULL, NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '2 days', NOW()),
+    (uuid_generate_v4(), v_tid, v_org_id, 'EXP-' || v_year || '-0915', c_safar, 'Safar',
+     v_emp2_id, v_emp2_name, CURRENT_DATE - 1, 'Buxoroga aviabilet (loyiha ko''rigi)',
+     1100000, 0, 1100000, 'UZS', 'draft',
+     NULL, NULL, NULL, NULL, NULL,
+     NULL, NULL, NULL, true, v_user_id, NOW() - INTERVAL '1 day', NOW());
+
+    RAISE NOTICE '  15 demo expenses created (6 categories, 3 months, mixed statuses)';
+END;
+$$;
+
 COMMIT;
+
+-- ============================================================================
+-- ISH HAQI (Payroll) demo seed — 2 davr (Iyun 2026 to'langan + Iyul 2026
+-- tasdiqlangan), xodim qarzi va kutilayotgan ushlab qolish. Ataylab COMMIT
+-- dan KEYIN turadi: blok o'z tranzaksiyasida ishlaydi, shu bois 416-migratsiya
+-- qo'ygan deferred balans triggeri aynan shu blok oxirida tekshiradi va fayl
+-- boshqa joyda xato bersa ham bu blok saqlanib qoladi. Qayta yurgizish hech
+-- narsani o'zgartirmaydi (NOT EXISTS / ON CONFLICT qo'riqlari).
+-- ============================================================================
+DO $$
+DECLARE
+    v_tid UUID := 'df372dc3-0b77-4ec6-aef3-c1145ecbeaac';
+    v_org_id UUID := '043e7051-6765-4431-92ac-015773fe9e0b';
+    v_user_id UUID;
+    v_emp_count INTEGER;
+    v_emp1 UUID;
+    v_emp2 UUID;
+    v_pp UUID;
+    v_journal UUID;
+    a_9420 UUID; a_6710 UUID; a_6410 UUID; a_5110 UUID;
+    v_gross NUMERIC; v_ded NUMERIC; v_net NUMERIC;
+    v_je UUID;
+    v_loan UUID;
+BEGIN
+    -- Tenant: avval faylning qolgan qismi ishlatadigan ID, topilmasa demo
+    -- foydalanuvchi email'i, so'ng 'Demo Company' nomi orqali. Hech biri
+    -- topilmasa — jimgina chiqamiz.
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tid) THEN
+        SELECT u.tenant_id INTO v_tid FROM users u WHERE u.email = 'demo@genixerp.com' LIMIT 1;
+    END IF;
+    IF v_tid IS NULL OR NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tid) THEN
+        SELECT id INTO v_tid FROM tenants WHERE name = 'Demo Company' ORDER BY created_at LIMIT 1;
+    END IF;
+    IF v_tid IS NULL THEN
+        RAISE NOTICE '  demo tenant not found — payroll seed skipped';
+        RETURN;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM organizations WHERE id = v_org_id AND tenant_id = v_tid) THEN
+        SELECT id INTO v_org_id FROM organizations WHERE tenant_id = v_tid ORDER BY created_at LIMIT 1;
+    END IF;
+    SELECT id INTO v_user_id FROM users WHERE tenant_id = v_tid ORDER BY created_at LIMIT 1;
+
+    -- ── 1. Xodimlar: kamida 5 ta faol xodimda nolmas oylik bo'lsin ──
+    -- Mavjud xodimlarda oylik NULL/0 bo'lsa — yangilaymiz (dublikat yaratmaymiz)
+    UPDATE employees e
+    SET base_salary = 3500000 + ((x.rn - 1) % 10) * 500000,
+        updated_at = NOW()
+    FROM (SELECT id, row_number() OVER (ORDER BY created_at, id) AS rn
+          FROM employees
+          WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+            AND COALESCE(base_salary, 0) = 0) x
+    WHERE e.id = x.id;
+
+    UPDATE employees SET job_title = 'Mutaxassis', updated_at = NOW()
+    WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+      AND (job_title IS NULL OR btrim(job_title) = '');
+
+    SELECT COUNT(*) INTO v_emp_count FROM employees
+    WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+      AND COALESCE(base_salary, 0) > 0;
+
+    IF v_emp_count < 5 THEN
+        INSERT INTO employees (id, tenant_id, organization_id, employee_number, first_name, last_name,
+                               job_title, hire_date, base_salary, status, created_at, updated_at)
+        SELECT uuid_generate_v4(), v_tid, v_org_id, d.emp_no, d.fn, d.ln, d.title, d.hired, d.salary,
+               'active', NOW(), NOW()
+        FROM (VALUES
+            ('DEMO-EMP-001', 'Dilshod', 'Rahimov',   'Bosh muhandis', DATE '2025-02-10', 8000000::numeric),
+            ('DEMO-EMP-002', 'Aziza',   'Karimova',  'Buxgalter',     DATE '2025-03-03', 6500000),
+            ('DEMO-EMP-003', 'Jasur',   'Toshmatov', 'Prorab',        DATE '2025-04-14', 5500000),
+            ('DEMO-EMP-004', 'Malika',  'Yusupova',  'Menejer',       DATE '2025-06-02', 4500000),
+            ('DEMO-EMP-005', 'Sardor',  'Aliyev',    'Usta',          DATE '2025-09-15', 3500000)
+        ) AS d(emp_no, fn, ln, title, hired, salary)
+        WHERE NOT EXISTS (SELECT 1 FROM employees ex
+                          WHERE ex.tenant_id = v_tid AND ex.employee_number = d.emp_no)
+        ORDER BY d.emp_no
+        LIMIT (5 - v_emp_count);
+    END IF;
+
+    -- ── 2. Payroll sozlamalari ──
+    INSERT INTO payroll_settings (tenant_id, organization_id, advance_percent, currency, company_name, created_at, updated_at)
+    VALUES (v_tid, v_org_id, 40, 'so''m', 'Demo Company', NOW(), NOW())
+    ON CONFLICT (tenant_id) DO NOTHING;
+
+    -- ── 3. Iyun 2026 davri (to'langan) ──
+    SELECT id INTO v_pp FROM payroll_periods
+    WHERE tenant_id = v_tid AND period_code = 'DEMO-2026-06' AND deleted_at IS NULL LIMIT 1;
+    IF v_pp IS NULL THEN
+        v_pp := uuid_generate_v4();
+        INSERT INTO payroll_periods (id, tenant_id, organization_id, period_code, period_name,
+            start_date, end_date, pay_date, status, approved_by, approved_at, created_by, created_at, updated_at)
+        VALUES (v_pp, v_tid, v_org_id, 'DEMO-2026-06', 'Iyun 2026',
+            '2026-06-01', '2026-06-30', '2026-07-05', 'paid', v_user_id, '2026-06-30', v_user_id, NOW(), NOW());
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM payroll_entries WHERE payroll_period_id = v_pp AND deleted_at IS NULL) THEN
+        -- gross = base; soliq = 12% (yaxlitlangan); net = gross - soliq;
+        -- avans = 40% (15-kuni to'langan), qoldiq 30-kuni to'langan
+        INSERT INTO payroll_entries (id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name,
+            base_salary, gross_salary, income_tax, total_deductions, net_salary,
+            advance_amount, remainder_amount, advance_paid, advance_paid_day, remainder_paid, remainder_paid_day,
+            payment_method, status, position_snapshot, advance_percent_used, created_at, updated_at)
+        SELECT uuid_generate_v4(), v_tid, v_org_id, v_pp, e.id, btrim(e.first_name || ' ' || e.last_name),
+            e.base_salary, e.base_salary, round(e.base_salary * 0.12), round(e.base_salary * 0.12),
+            e.base_salary - round(e.base_salary * 0.12),
+            round(e.base_salary * 0.40), e.base_salary - round(e.base_salary * 0.40),
+            true, 15, true, 30, 'bank_transfer', 'paid', e.job_title, 40, NOW(), NOW()
+        FROM (SELECT id, first_name, last_name, job_title, base_salary FROM employees
+              WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+                AND COALESCE(base_salary, 0) > 0
+              ORDER BY created_at, id LIMIT 5) e
+        ON CONFLICT (payroll_period_id, employee_id) DO NOTHING;
+
+        UPDATE payroll_periods p
+        SET total_gross = s.g, total_deductions = s.d, total_net = s.n, employee_count = s.c, updated_at = NOW()
+        FROM (SELECT COALESCE(SUM(gross_salary), 0) g, COALESCE(SUM(total_deductions), 0) d,
+                     COALESCE(SUM(net_salary), 0) n, COUNT(*) c
+              FROM payroll_entries WHERE payroll_period_id = v_pp AND deleted_at IS NULL) s
+        WHERE p.id = v_pp;
+    END IF;
+
+    -- ── 3a. Iyun uchun jurnal yozuvlari (PAYROLL jurnali, bo'lmasa MISC) ──
+    SELECT id INTO v_journal FROM journals
+    WHERE tenant_id = v_tid AND code = 'PAYROLL' AND is_active = true LIMIT 1;
+    IF v_journal IS NULL THEN
+        SELECT id INTO v_journal FROM journals
+        WHERE tenant_id = v_tid AND code = 'MISC' AND is_active = true LIMIT 1;
+    END IF;
+    SELECT id INTO a_9420 FROM accounts WHERE tenant_id = v_tid AND code = '9420' AND deleted_at IS NULL LIMIT 1;
+    SELECT id INTO a_6710 FROM accounts WHERE tenant_id = v_tid AND code = '6710' AND deleted_at IS NULL LIMIT 1;
+    SELECT id INTO a_6410 FROM accounts WHERE tenant_id = v_tid AND code = '6410' AND deleted_at IS NULL LIMIT 1;
+    SELECT id INTO a_5110 FROM accounts WHERE tenant_id = v_tid AND code = '5110' AND deleted_at IS NULL LIMIT 1;
+
+    SELECT total_gross, total_deductions, total_net INTO v_gross, v_ded, v_net
+    FROM payroll_periods WHERE id = v_pp;
+
+    IF v_journal IS NULL OR a_9420 IS NULL OR a_6710 IS NULL OR a_6410 IS NULL OR a_5110 IS NULL
+       OR COALESCE(v_gross, 0) = 0 THEN
+        RAISE NOTICE '  payroll JE part skipped (journal yoki schyotlar topilmadi / davr bo''sh)';
+    ELSE
+        -- Hisoblash (accrual): Dt 9420 (gross) / Kt 6710 (net) + Kt 6410 (soliq)
+        IF NOT EXISTS (SELECT 1 FROM journal_entries
+                       WHERE tenant_id = v_tid AND entry_number = 'PAY-DEMO-2606' AND deleted_at IS NULL) THEN
+            v_je := uuid_generate_v4();
+            INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+                description, source_type, source_id, status, total_debit, total_credit,
+                posted_at, posted_by, created_by, created_at, updated_at)
+            VALUES (v_je, v_tid, v_org_id, v_journal, 'PAY-DEMO-2606', '2026-06-30',
+                'Ish haqi hisoblash — Iyun 2026 (demo)', 'payroll', v_pp, 'posted', v_gross, v_gross,
+                '2026-06-30', v_user_id, v_user_id, NOW(), NOW());
+            INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES
+            (uuid_generate_v4(), v_je, a_9420, 'Mehnat haqi xarajatlari',   v_gross, 0,     1, NOW()),
+            (uuid_generate_v4(), v_je, a_6710, 'Xodimlarga ish haqi qarzi', 0,       v_net, 2, NOW()),
+            (uuid_generate_v4(), v_je, a_6410, 'Daromad solig''i (12%)',    0,       v_ded, 3, NOW());
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) + v_gross, updated_at = NOW() WHERE id = a_9420;
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) - v_net,   updated_at = NOW() WHERE id = a_6710;
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) - v_ded,   updated_at = NOW() WHERE id = a_6410;
+        END IF;
+
+        -- To'lov (payment): Dt 6710 / Kt 5110 (net)
+        IF NOT EXISTS (SELECT 1 FROM journal_entries
+                       WHERE tenant_id = v_tid AND entry_number = 'PAYPMT-DEMO-2606' AND deleted_at IS NULL) THEN
+            v_je := uuid_generate_v4();
+            INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+                description, source_type, source_id, status, total_debit, total_credit,
+                posted_at, posted_by, created_by, created_at, updated_at)
+            VALUES (v_je, v_tid, v_org_id, v_journal, 'PAYPMT-DEMO-2606', '2026-07-05',
+                'Ish haqi to''lovi — Iyun 2026 (demo)', 'payroll_payment', v_pp, 'posted', v_net, v_net,
+                '2026-07-05', v_user_id, v_user_id, NOW(), NOW());
+            INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES
+            (uuid_generate_v4(), v_je, a_6710, 'Xodimlarga ish haqi qarzi', v_net, 0,     1, NOW()),
+            (uuid_generate_v4(), v_je, a_5110, 'Hisob-kitob schyoti',       0,     v_net, 2, NOW());
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) + v_net, updated_at = NOW() WHERE id = a_6710;
+            UPDATE accounts SET current_balance = COALESCE(current_balance, 0) - v_net, updated_at = NOW() WHERE id = a_5110;
+        END IF;
+    END IF;
+
+    -- ── 4. Iyul 2026 davri (tasdiqlangan, hali to'lanmagan) ──
+    SELECT id INTO v_pp FROM payroll_periods
+    WHERE tenant_id = v_tid AND period_code = 'DEMO-2026-07' AND deleted_at IS NULL LIMIT 1;
+    IF v_pp IS NULL THEN
+        v_pp := uuid_generate_v4();
+        INSERT INTO payroll_periods (id, tenant_id, organization_id, period_code, period_name,
+            start_date, end_date, pay_date, status, approved_by, approved_at, created_by, created_at, updated_at)
+        VALUES (v_pp, v_tid, v_org_id, 'DEMO-2026-07', 'Iyul 2026',
+            '2026-07-01', '2026-07-31', '2026-08-05', 'approved', v_user_id, '2026-07-31', v_user_id, NOW(), NOW());
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM payroll_entries WHERE payroll_period_id = v_pp AND deleted_at IS NULL) THEN
+        INSERT INTO payroll_entries (id, tenant_id, organization_id, payroll_period_id, employee_id, employee_name,
+            base_salary, gross_salary, income_tax, total_deductions, net_salary,
+            advance_amount, remainder_amount, advance_paid, advance_paid_day, remainder_paid, remainder_paid_day,
+            payment_method, status, position_snapshot, advance_percent_used, created_at, updated_at)
+        SELECT uuid_generate_v4(), v_tid, v_org_id, v_pp, e.id, btrim(e.first_name || ' ' || e.last_name),
+            e.base_salary, e.base_salary, round(e.base_salary * 0.12), round(e.base_salary * 0.12),
+            e.base_salary - round(e.base_salary * 0.12),
+            round(e.base_salary * 0.40), e.base_salary - round(e.base_salary * 0.40),
+            false, NULL, false, NULL, 'bank_transfer', 'approved', e.job_title, 40, NOW(), NOW()
+        FROM (SELECT id, first_name, last_name, job_title, base_salary FROM employees
+              WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active'
+                AND COALESCE(base_salary, 0) > 0
+              ORDER BY created_at, id LIMIT 5) e
+        ON CONFLICT (payroll_period_id, employee_id) DO NOTHING;
+
+        UPDATE payroll_periods p
+        SET total_gross = s.g, total_deductions = s.d, total_net = s.n, employee_count = s.c, updated_at = NOW()
+        FROM (SELECT COALESCE(SUM(gross_salary), 0) g, COALESCE(SUM(total_deductions), 0) d,
+                     COALESCE(SUM(net_salary), 0) n, COUNT(*) c
+              FROM payroll_entries WHERE payroll_period_id = v_pp AND deleted_at IS NULL) s
+        WHERE p.id = v_pp;
+    END IF;
+
+    -- ── 5. Xodim qarzi (DEMO-LOAN-001) + 4 oylik to'lov jadvali ──
+    SELECT id INTO v_emp1 FROM employees
+    WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active' AND COALESCE(base_salary, 0) > 0
+    ORDER BY created_at, id LIMIT 1;
+    SELECT id INTO v_emp2 FROM employees
+    WHERE tenant_id = v_tid AND deleted_at IS NULL AND status = 'active' AND COALESCE(base_salary, 0) > 0
+    ORDER BY created_at, id OFFSET 1 LIMIT 1;
+    IF v_emp2 IS NULL THEN v_emp2 := v_emp1; END IF;
+
+    IF v_emp1 IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM employee_loans
+        WHERE tenant_id = v_tid AND loan_number = 'DEMO-LOAN-001' AND deleted_at IS NULL) THEN
+        v_loan := uuid_generate_v4();
+        INSERT INTO employee_loans (id, tenant_id, organization_id, employee_id, loan_number, amount,
+            monthly_payment, duration_months, paid_amount, remaining_amount, start_date, end_date,
+            reason, status, created_by, approved_by, created_at, updated_at)
+        VALUES (v_loan, v_tid, v_org_id, v_emp1, 'DEMO-LOAN-001', 2000000,
+            500000, 4, 500000, 1500000, '2026-06-01', '2026-09-30',
+            'Demo: shaxsiy ehtiyoj uchun qarz', 'active', v_user_id, v_user_id, NOW(), NOW());
+        INSERT INTO employee_loan_payments (id, tenant_id, loan_id, employee_id, month_label, due_date,
+            amount, remaining_after, status, paid_at, created_at, updated_at) VALUES
+        (uuid_generate_v4(), v_tid, v_loan, v_emp1, 'Iyun 2026',    '2026-06-30', 500000, 1500000, 'paid',    '2026-06-30', NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_loan, v_emp1, 'Iyul 2026',    '2026-07-31', 500000, 1000000, 'pending', NULL,         NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_loan, v_emp1, 'Avgust 2026',  '2026-08-31', 500000, 500000,  'pending', NULL,         NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_loan, v_emp1, 'Sentabr 2026', '2026-09-30', 500000, 0,       'pending', NULL,         NOW(), NOW());
+    END IF;
+
+    -- ── 6. Kutilayotgan ushlab qolish (ombor kamomadi) ──
+    IF v_emp2 IS NOT NULL AND v_user_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM employee_deductions WHERE tenant_id = v_tid AND reason = 'Demo: ombor kamomadi') THEN
+        INSERT INTO employee_deductions (id, tenant_id, organization_id, employee_id, amount, reason,
+            source_type, status, created_by, created_at, updated_at)
+        VALUES (uuid_generate_v4(), v_tid, v_org_id, v_emp2, 150000, 'Demo: ombor kamomadi',
+            'inventory_shortage', 'pending', v_user_id, NOW(), NOW());
+    END IF;
+
+    RAISE NOTICE '  payroll demo seed tayyor: Iyun (paid) + Iyul (approved), qarz + ushlab qolish';
+END;
+$$;
