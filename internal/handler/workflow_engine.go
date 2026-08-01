@@ -48,16 +48,31 @@ type workflowEventDef struct {
 // workflowEventCatalog is the server-side source of truth for valid trigger
 // events. The frontend catalog must stay a subset of this.
 var workflowEventCatalog = map[string]workflowEventDef{
-	"inventory.low_stock": {Category: "inventory", RelatedType: "product", Scheduled: false, SampleData: map[string]interface{}{
+	// Scheduled: the 15-minute workflow scheduler scans thresholds and emits
+	// this with a 24h per-product dedupe (workflow_rules.go
+	// checkInventoryThresholds); it also fires inline from AdjustInventory.
+	// The flag was false, which contradicted the scheduler and confused
+	// rule validation (docs/ombor-audit.md §3).
+	"inventory.low_stock": {Category: "inventory", RelatedType: "product", Scheduled: true, SampleData: map[string]interface{}{
 		"record_id": "", "product_name": "Sement M400", "product_code": "SEM-400", "reorder_point": 50.0, "available": 12.0}},
 	"inventory.adjusted": {Category: "inventory", RelatedType: "product", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "product_name": "Sement M400", "product_code": "SEM-400", "quantity": -5.0, "new_balance": 45.0}},
+	// Scheduler scan (workflow_rules.go checkStuckTransfers): intercompany
+	// transfers in_transit > 3 days — stock is in neither warehouse.
+	"inventory.transfer_stuck": {Category: "inventory", RelatedType: "intercompany_transfer", Scheduled: true, SampleData: map[string]interface{}{
+		"record_id": "", "transfer_number": "ICT-0007", "from_warehouse": "Asosiy ombor", "to_warehouse": "Filial ombori", "days_in_transit": 5}},
 	"invoice.overdue": {Category: "sales", RelatedType: "sales_invoice", Scheduled: true, SampleData: map[string]interface{}{
 		"record_id": "", "invoice_number": "INV-2026-0042", "customer_name": "Qurilish Invest MChJ", "total_amount": 12500000.0, "days_overdue": 3}},
 	"lead.created": {Category: "crm", RelatedType: "lead", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "contact_name": "Aziz Karimov", "company_name": "Karimov Stroy", "source": "website", "expected_value": 5000000.0}},
 	"lead.status_changed": {Category: "crm", RelatedType: "lead", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "contact_name": "Aziz Karimov", "old_status": "new", "new_status": "qualified"}},
+	"lead.won": {Category: "crm", RelatedType: "lead", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "contact_name": "Aziz Karimov", "company_name": "Karimov Stroy", "amount": 5000000.0, "currency": "UZS", "partner_id": ""}},
+	"lead.lost": {Category: "crm", RelatedType: "lead", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "contact_name": "Aziz Karimov", "company_name": "Karimov Stroy", "amount": 5000000.0, "currency": "UZS", "lost_reason": "Narx qimmat"}},
+	"lead.stale": {Category: "crm", RelatedType: "lead", Scheduled: true, SampleData: map[string]interface{}{
+		"record_id": "", "contact_name": "Aziz Karimov", "company_name": "Karimov Stroy", "amount": 5000000.0, "currency": "UZS", "stage": "in_progress", "stale_days": 7}},
 	"task.assigned": {Category: "tasks", RelatedType: "task", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "task_title": "Smeta tayyorlash", "board_name": "Qurilish obyekti", "priority": "high", "assignee_names": "Dilshod Rahimov"}},
 	"task.status_changed": {Category: "tasks", RelatedType: "task", Scheduled: false, SampleData: map[string]interface{}{
@@ -114,7 +129,7 @@ var workflowActionTypes = map[string]bool{
 var workflowUpdatableFields = map[string]map[string]bool{
 	"leads":           {"status": true, "source": true},
 	"tasks":           {"priority": true},
-	"contacts":        {"status": true},
+	"contacts":        {"is_active": true}, // `status` column doesn't exist on contacts
 	"sales_invoices":  {"status": true},
 	"sales_orders":    {"status": true},
 	"purchase_orders": {"status": true},

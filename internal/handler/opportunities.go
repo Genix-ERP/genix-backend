@@ -1030,19 +1030,40 @@ func (h *Handler) CreatePipelineStage(c *gin.Context) {
 		}
 	}
 
+	// CRM v2: attach lead stages to a pipeline — explicit pipeline_id, else
+	// the org's default lead pipeline.
+	var pipelineIDPtr *uuid.UUID
+	if input.PipelineID != "" {
+		if pid, err := uuid.Parse(input.PipelineID); err == nil {
+			var owned bool
+			if err := h.db.QueryRow(`SELECT true FROM pipelines WHERE id = $1 AND tenant_id = $2`, pid, tenantID).Scan(&owned); err == nil && owned {
+				pipelineIDPtr = &pid
+			}
+		}
+	}
+	if pipelineIDPtr == nil && pipelineType == "lead" {
+		var pid uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT id FROM pipelines WHERE tenant_id = $1 AND is_default AND is_active
+			  AND organization_id IS NOT DISTINCT FROM $2 LIMIT 1
+		`, tenantID, orgIDPtr).Scan(&pid); err == nil {
+			pipelineIDPtr = &pid
+		}
+	}
+
 	query := `
 		INSERT INTO pipeline_stages (
 			id, tenant_id, name, code, sequence, probability,
-			is_won, is_lost, color, is_active, pipeline_type, organization_id,
+			is_won, is_lost, color, is_active, pipeline_type, organization_id, pipeline_id,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12, $13)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $11, $12, $13, $14)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
 		id, tenantID, input.Name, input.Code, input.Sequence,
 		input.Probability, input.IsWon, input.IsLost, color,
-		pipelineType, orgIDPtr, now, now,
+		pipelineType, orgIDPtr, pipelineIDPtr, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -1221,6 +1242,16 @@ func (h *Handler) DeletePipelineStage(c *gin.Context) {
 	).Scan(&count)
 	if err == nil && count > 0 {
 		response.BadRequest(c, "Cannot delete pipeline stage with existing opportunities")
+		return
+	}
+
+	// CRM v2: leads reference stages too — refuse to orphan them
+	var leadCount int
+	if err := h.db.QueryRow(
+		"SELECT COUNT(*) FROM leads WHERE stage_id = $1 AND deleted_at IS NULL",
+		id,
+	).Scan(&leadCount); err == nil && leadCount > 0 {
+		response.ConflictWithData(c, "STAGE_NOT_EMPTY", "Stage has leads", gin.H{"lead_count": leadCount})
 		return
 	}
 

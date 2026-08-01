@@ -1236,8 +1236,8 @@ func (h *Handler) DeleteWarehouseLocation(c *gin.Context) {
 	// silently affect aggregate stock totals.
 	var hasInventory bool
 	h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM inventory WHERE location_id = $1 AND quantity_on_hand <> 0)
-	`, locationID).Scan(&hasInventory)
+		SELECT EXISTS(SELECT 1 FROM inventory WHERE location_id = $1 AND tenant_id = $2 AND quantity_on_hand <> 0)
+	`, locationID, tenantID).Scan(&hasInventory)
 
 	if hasInventory {
 		response.BadRequest(c, "Cannot delete location with non-zero inventory (positive or negative). Move or reconcile inventory first.")
