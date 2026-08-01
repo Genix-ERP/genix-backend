@@ -88,7 +88,9 @@ func detectLanguage(message string) string {
 // pure env config. Returns nil (→ demo mode) when no usable API key resolves.
 func (h *Handler) getAIService(tenantID uuid.UUID) *AIService {
 	cfg := h.tenantAIConfig(tenantID)
-	if cfg.APIKey == "" {
+	// .env.example ships "your-openai-api-key"-style placeholders; treat them
+	// as unconfigured instead of sending doomed requests to the provider.
+	if cfg.APIKey == "" || strings.HasPrefix(cfg.APIKey, "your-") {
 		return nil
 	}
 	return &AIService{
