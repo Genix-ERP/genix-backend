@@ -5,8 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -31,26 +32,30 @@ func (h *Handler) ListWorkflowRules(c *gin.Context) {
 	activeOnly := c.Query("active") == "true"
 
 	query := `
-		SELECT id, tenant_id, name, description, category, trigger_type, trigger_event,
-			   conditions, actions, is_active, priority, last_triggered_at, trigger_count,
-			   created_by, created_at, updated_at
-		FROM workflow_rules
-		WHERE tenant_id = $1 AND deleted_at IS NULL
+		SELECT r.id, r.tenant_id, r.name, r.description, r.category, r.trigger_type, r.trigger_event,
+			   r.conditions, r.actions, r.is_active, r.priority, r.last_triggered_at, r.trigger_count,
+			   r.created_by, r.created_at, r.updated_at, r.auto_paused_at, r.paused_reason, ll.status
+		FROM workflow_rules r
+		LEFT JOIN LATERAL (
+			SELECT status FROM workflow_logs wl
+			WHERE wl.rule_id = r.id ORDER BY wl.executed_at DESC LIMIT 1
+		) ll ON true
+		WHERE r.tenant_id = $1 AND r.deleted_at IS NULL
 	`
 	args := []interface{}{tenantID}
 	argCount := 1
 
 	if category != "" {
 		argCount++
-		query += fmt.Sprintf(" AND category = $%d", argCount)
+		query += fmt.Sprintf(" AND r.category = $%d", argCount)
 		args = append(args, category)
 	}
 
 	if activeOnly {
-		query += " AND is_active = true"
+		query += " AND r.is_active = true"
 	}
 
-	query += " ORDER BY priority DESC, created_at DESC"
+	query += " ORDER BY r.created_at DESC"
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -64,14 +69,14 @@ func (h *Handler) ListWorkflowRules(c *gin.Context) {
 	for rows.Next() {
 		var r entity.WorkflowRule
 		var description, triggerEvent sql.NullString
-		var lastTriggered sql.NullTime
-		var createdBy sql.NullString
+		var lastTriggered, autoPaused sql.NullTime
+		var createdBy, pausedReason, lastStatus sql.NullString
 
 		err := rows.Scan(
 			&r.ID, &r.TenantID, &r.Name, &description, &r.Category,
 			&r.TriggerType, &triggerEvent, &r.Conditions, &r.Actions,
 			&r.IsActive, &r.Priority, &lastTriggered, &r.TriggerCount,
-			&createdBy, &r.CreatedAt, &r.UpdatedAt,
+			&createdBy, &r.CreatedAt, &r.UpdatedAt, &autoPaused, &pausedReason, &lastStatus,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan workflow rule", "error", err)
@@ -86,6 +91,15 @@ func (h *Handler) ListWorkflowRules(c *gin.Context) {
 		}
 		if lastTriggered.Valid {
 			r.LastTriggeredAt = &lastTriggered.Time
+		}
+		if autoPaused.Valid {
+			r.AutoPausedAt = &autoPaused.Time
+		}
+		if pausedReason.Valid {
+			r.PausedReason = &pausedReason.String
+		}
+		if lastStatus.Valid {
+			r.LastStatus = &lastStatus.String
 		}
 
 		rules = append(rules, r.ToResponse())
@@ -111,11 +125,18 @@ func (h *Handler) CreateWorkflowRule(c *gin.Context) {
 		return
 	}
 
-	// Validate trigger type
-	validTriggerTypes := map[string]bool{"event": true, "scheduled": true, "threshold": true}
-	if !validTriggerTypes[input.TriggerType] {
-		response.BadRequest(c, "Invalid trigger_type. Must be: event, scheduled, or threshold")
+	// Validate against the event catalog; category and trigger_type are
+	// derived server-side so a client can't create a dead rule (the old UI's
+	// event/threshold/scheduled picker foot-gun).
+	category, scheduled, vErr := validateWorkflowRuleConfig(input.TriggerEvent, input.Conditions, input.Actions)
+	if vErr != nil {
+		response.BadRequest(c, vErr.Error())
 		return
+	}
+	input.Category = category
+	input.TriggerType = "event"
+	if scheduled {
+		input.TriggerType = "scheduled"
 	}
 
 	id := uuid.New()
@@ -259,6 +280,52 @@ func (h *Handler) UpdateWorkflowRule(c *gin.Context) {
 		return
 	}
 
+	// Validate the effective (merged) config when anything engine-relevant changes
+	if input.TriggerEvent != nil || input.Conditions != nil || input.Actions != nil {
+		var curEvent sql.NullString
+		var curConditions, curActions json.RawMessage
+		err := h.db.QueryRow(`
+			SELECT trigger_event, conditions, actions FROM workflow_rules
+			WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		`, id, tenantID).Scan(&curEvent, &curConditions, &curActions)
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Workflow rule")
+			return
+		}
+		if err != nil {
+			h.log.Error("Failed to load workflow rule for validation", "error", err)
+			response.InternalError(c, "Failed to update workflow rule")
+			return
+		}
+
+		effEvent := curEvent.String
+		if input.TriggerEvent != nil {
+			effEvent = *input.TriggerEvent
+		}
+		effConditions := curConditions
+		if input.Conditions != nil {
+			effConditions = *input.Conditions
+		}
+		effActions := curActions
+		if input.Actions != nil {
+			effActions = *input.Actions
+		}
+
+		category, scheduled, vErr := validateWorkflowRuleConfig(effEvent, effConditions, effActions)
+		if vErr != nil {
+			response.BadRequest(c, vErr.Error())
+			return
+		}
+		// keep derived columns in sync with the (possibly new) event
+		cat := category
+		input.Category = &cat
+		tt := "event"
+		if scheduled {
+			tt = "scheduled"
+		}
+		input.TriggerType = &tt
+	}
+
 	updates := make([]string, 0)
 	args := make([]interface{}, 0)
 	argCount := 0
@@ -292,6 +359,10 @@ func (h *Handler) UpdateWorkflowRule(c *gin.Context) {
 	}
 	if input.IsActive != nil {
 		addUpdate("is_active", *input.IsActive)
+		if *input.IsActive {
+			// manual re-activation clears the auto-pause flag
+			updates = append(updates, "auto_paused_at = NULL", "paused_reason = NULL")
+		}
 	}
 	if input.Priority != nil {
 		addUpdate("priority", *input.Priority)
@@ -364,7 +435,8 @@ func (h *Handler) DeleteWorkflowRule(c *gin.Context) {
 	response.NoContent(c)
 }
 
-// ListWorkflowLogs returns execution logs for workflow rules
+// ListWorkflowLogs returns execution logs for workflow rules.
+// Filters: rule_id, status, event, date_from, date_to (YYYY-MM-DD), limit.
 func (h *Handler) ListWorkflowLogs(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -372,27 +444,41 @@ func (h *Handler) ListWorkflowLogs(c *gin.Context) {
 		return
 	}
 
-	ruleID := c.Query("rule_id")
-	limitStr := c.DefaultQuery("limit", "50")
-	limit, _ := strconv.Atoi(limitStr)
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	if limit < 1 || limit > 200 {
 		limit = 50
 	}
 
 	query := `
 		SELECT wl.id, wl.rule_id, wr.name as rule_name, wl.trigger_data,
-			   wl.actions_executed, wl.status, wl.error_message, wl.executed_at
+			   wl.actions_executed, wl.condition_results, wl.status, wl.error_message,
+			   wl.trigger_event, wl.related_type, wl.related_id, wl.duration_ms, wl.executed_at
 		FROM workflow_logs wl
 		JOIN workflow_rules wr ON wl.rule_id = wr.id
 		WHERE wl.tenant_id = $1
 	`
 	args := []interface{}{tenantID}
 	argCount := 1
-
-	if ruleID != "" {
+	addFilter := func(clause string, value interface{}) {
 		argCount++
-		query += fmt.Sprintf(" AND wl.rule_id = $%d", argCount)
-		args = append(args, ruleID)
+		query += fmt.Sprintf(clause, argCount)
+		args = append(args, value)
+	}
+
+	if v := c.Query("rule_id"); v != "" {
+		addFilter(" AND wl.rule_id = $%d", v)
+	}
+	if v := c.Query("status"); v != "" {
+		addFilter(" AND wl.status = $%d", v)
+	}
+	if v := c.Query("event"); v != "" {
+		addFilter(" AND wl.trigger_event = $%d", v)
+	}
+	if v := c.Query("date_from"); v != "" {
+		addFilter(" AND wl.executed_at >= $%d::date", v)
+	}
+	if v := c.Query("date_to"); v != "" {
+		addFilter(" AND wl.executed_at < ($%d::date + INTERVAL '1 day')", v)
 	}
 
 	query += fmt.Sprintf(" ORDER BY wl.executed_at DESC LIMIT %d", limit)
@@ -408,12 +494,15 @@ func (h *Handler) ListWorkflowLogs(c *gin.Context) {
 	logs := make([]*entity.WorkflowLogResponse, 0)
 	for rows.Next() {
 		var log entity.WorkflowLogResponse
-		var errorMsg sql.NullString
+		var errorMsg, triggerEvent, relatedType, relatedID sql.NullString
+		var conditionResults []byte
+		var durationMs sql.NullInt64
 		var executedAt time.Time
 
 		err := rows.Scan(
 			&log.ID, &log.RuleID, &log.RuleName, &log.TriggerData,
-			&log.ActionsExecuted, &log.Status, &errorMsg, &executedAt,
+			&log.ActionsExecuted, &conditionResults, &log.Status, &errorMsg,
+			&triggerEvent, &relatedType, &relatedID, &durationMs, &executedAt,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan workflow log", "error", err)
@@ -423,6 +512,22 @@ func (h *Handler) ListWorkflowLogs(c *gin.Context) {
 		if errorMsg.Valid {
 			log.ErrorMessage = &errorMsg.String
 		}
+		if triggerEvent.Valid {
+			log.TriggerEvent = &triggerEvent.String
+		}
+		if relatedType.Valid {
+			log.RelatedType = &relatedType.String
+		}
+		if relatedID.Valid {
+			log.RelatedID = &relatedID.String
+		}
+		if durationMs.Valid {
+			d := int(durationMs.Int64)
+			log.DurationMs = &d
+		}
+		if len(conditionResults) > 0 {
+			log.ConditionResults = conditionResults
+		}
 		log.ExecutedAt = executedAt.Format(time.RFC3339)
 		logs = append(logs, &log)
 	}
@@ -430,294 +535,316 @@ func (h *Handler) ListWorkflowLogs(c *gin.Context) {
 	response.Success(c, logs)
 }
 
-// ===== Rule Evaluation Engine =====
+// ListWorkflowEvents returns the server-side trigger-event catalog: event id,
+// category, whether it is scheduler-emitted, and the payload variables
+// available for conditions and {{templates}}.
+func (h *Handler) ListWorkflowEvents(c *gin.Context) {
+	type eventInfo struct {
+		Event     string   `json:"event"`
+		Category  string   `json:"category"`
+		Scheduled bool     `json:"scheduled"`
+		Variables []string `json:"variables"`
+	}
+	events := make([]eventInfo, 0, len(workflowEventCatalog))
+	for name, def := range workflowEventCatalog {
+		vars := make([]string, 0, len(def.SampleData))
+		for k := range def.SampleData {
+			if k != "record_id" {
+				vars = append(vars, k)
+			}
+		}
+		sort.Strings(vars)
+		events = append(events, eventInfo{Event: name, Category: def.Category, Scheduled: def.Scheduled, Variables: vars})
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].Category != events[j].Category {
+			return events[i].Category < events[j].Category
+		}
+		return events[i].Event < events[j].Event
+	})
+	response.Success(c, events)
+}
+
+// TestWorkflowRule dry-runs a rule: evaluates its conditions against sample
+// (or provided) data and reports what each action WOULD do — no side effects.
+func (h *Handler) TestWorkflowRule(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid rule ID")
+		return
+	}
+
+	var triggerEvent sql.NullString
+	var conditionsJSON, actionsJSON json.RawMessage
+	err = h.db.QueryRow(`
+		SELECT trigger_event, conditions, actions FROM workflow_rules
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&triggerEvent, &conditionsJSON, &actionsJSON)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Workflow rule")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to load workflow rule for test", "error", err)
+		response.InternalError(c, "Failed to test workflow rule")
+		return
+	}
+
+	// Sample payload from the catalog, overridable from the request body
+	data := map[string]interface{}{}
+	if def, ok := workflowEventCatalog[triggerEvent.String]; ok {
+		for k, v := range def.SampleData {
+			data[k] = v
+		}
+	}
+	var body struct {
+		Data map[string]interface{} `json:"data"`
+	}
+	if c.Request.ContentLength > 0 {
+		if err := c.ShouldBindJSON(&body); err == nil {
+			for k, v := range body.Data {
+				data[k] = v
+			}
+		}
+	}
+
+	matched, condResults := evaluateWorkflowConditions(conditionsJSON, data)
+
+	type actionPreview struct {
+		Type    string `json:"type"`
+		Preview string `json:"preview"`
+		Error   string `json:"error,omitempty"`
+	}
+	previews := []actionPreview{}
+	var actions []WorkflowAction
+	if err := json.Unmarshal(actionsJSON, &actions); err == nil {
+		for _, a := range actions {
+			p := actionPreview{Type: a.Type}
+			switch a.Type {
+			case "create_notification":
+				msg, _ := a.Config["message"].(string)
+				title, _ := a.Config["title"].(string)
+				recipients, rErr := h.resolveWorkflowRecipients(tenantID, a.Config)
+				if rErr != nil {
+					p.Error = rErr.Error()
+				}
+				p.Preview = fmt.Sprintf("%s — %s (→ %d recipient(s))",
+					renderWorkflowTemplate(title, data), renderWorkflowTemplate(msg, data), len(recipients))
+			case "create_task", "create_followup_task":
+				title, _ := a.Config["title"].(string)
+				boardID, _ := a.Config["board_id"].(string)
+				var boardName string
+				if boardID != "" {
+					h.db.QueryRow(`SELECT name FROM task_boards WHERE id = $1 AND tenant_id = $2`, boardID, tenantID).Scan(&boardName)
+				}
+				if boardName == "" {
+					p.Error = "board not found"
+				}
+				p.Preview = fmt.Sprintf("Task: %s → %s", renderWorkflowTemplate(title, data), boardName)
+			case "update_field":
+				target, _ := a.Config["target"].(string)
+				field, _ := a.Config["field"].(string)
+				p.Preview = fmt.Sprintf("%s.%s = %v", target, field, renderWorkflowTemplate(fmt.Sprintf("%v", a.Config["value"]), data))
+			case "update_status":
+				p.Preview = fmt.Sprintf("%v.status = %v", a.Config["table"], a.Config["status"])
+			case "send_telegram":
+				p.Error = "telegram_not_configured"
+			default:
+				p.Preview = a.Type
+			}
+			previews = append(previews, p)
+		}
+	}
+
+	response.Success(c, gin.H{
+		"matched":           matched,
+		"sample_data":       data,
+		"condition_results": condResults,
+		"actions":           previews,
+	})
+}
+
+// DuplicateWorkflowRule copies a rule (inactive) so it can be tweaked safely.
+func (h *Handler) DuplicateWorkflowRule(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	claims, _ := middleware.GetClaims(c)
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid rule ID")
+		return
+	}
+
+	newID := uuid.New()
+	err = h.db.QueryRow(`
+		INSERT INTO workflow_rules (id, tenant_id, name, description, category, trigger_type,
+			trigger_event, conditions, actions, is_active, priority, created_by, created_at, updated_at)
+		SELECT $1, tenant_id, name || ' (nusxa)', description, category, trigger_type,
+			trigger_event, conditions, actions, false, priority, $2, NOW(), NOW()
+		FROM workflow_rules WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+		RETURNING id
+	`, newID, claims.UserID, id, tenantID).Scan(&newID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Workflow rule")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to duplicate workflow rule", "error", err)
+		response.InternalError(c, "Failed to duplicate workflow rule")
+		return
+	}
+
+	response.Created(c, gin.H{"id": newID.String()})
+}
+
+// RetryWorkflowLog re-executes a failed/partial run's actions with the stored
+// trigger payload and writes a fresh log entry.
+func (h *Handler) RetryWorkflowLog(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid log ID")
+		return
+	}
+
+	var ruleID uuid.UUID
+	var ruleName string
+	var triggerEvent sql.NullString
+	var triggerData, conditionsJSON, actionsJSON json.RawMessage
+	var createdBy sql.NullString
+	err = h.db.QueryRow(`
+		SELECT wl.rule_id, wr.name, wl.trigger_event, wl.trigger_data, wr.conditions, wr.actions, wr.created_by
+		FROM workflow_logs wl
+		JOIN workflow_rules wr ON wr.id = wl.rule_id
+		WHERE wl.id = $1 AND wl.tenant_id = $2 AND wr.deleted_at IS NULL
+	`, id, tenantID).Scan(&ruleID, &ruleName, &triggerEvent, &triggerData, &conditionsJSON, &actionsJSON, &createdBy)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Workflow log")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to load workflow log for retry", "error", err)
+		response.InternalError(c, "Failed to retry workflow run")
+		return
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(triggerData, &data); err != nil {
+		response.BadRequest(c, "Stored trigger data is not replayable")
+		return
+	}
+	data["retried_from"] = id.String()
+
+	var creator *uuid.UUID
+	if createdBy.Valid {
+		if uid, err := uuid.Parse(createdBy.String); err == nil {
+			creator = &uid
+		}
+	}
+
+	ctx := workflowEventCtx{TenantID: tenantID, Event: triggerEvent.String, Data: data}
+	h.executeWorkflowRule(ctx, ruleID, ruleName, conditionsJSON, actionsJSON, creator)
+
+	// Return the fresh log entry for immediate display
+	var newLog entity.WorkflowLogResponse
+	var errorMsg sql.NullString
+	var durationMs sql.NullInt64
+	var executedAt time.Time
+	err = h.db.QueryRow(`
+		SELECT id, status, error_message, duration_ms, executed_at
+		FROM workflow_logs
+		WHERE tenant_id = $1 AND rule_id = $2
+		ORDER BY executed_at DESC LIMIT 1
+	`, tenantID, ruleID).Scan(&newLog.ID, &newLog.Status, &errorMsg, &durationMs, &executedAt)
+	if err != nil {
+		response.Success(c, gin.H{"status": "executed"})
+		return
+	}
+	if errorMsg.Valid {
+		newLog.ErrorMessage = &errorMsg.String
+	}
+	if durationMs.Valid {
+		d := int(durationMs.Int64)
+		newLog.DurationMs = &d
+	}
+	newLog.ExecutedAt = executedAt.Format(time.RFC3339)
+	response.Success(c, newLog)
+}
+
+// ===== Engine types =====
+// The evaluation engine itself lives in workflow_engine.go.
 
 // WorkflowAction represents a single action to execute
 type WorkflowAction struct {
-	Type   string                 `json:"type"`   // notify, create_record, update_field, send_email
+	Type   string                 `json:"type"`   // create_notification, create_task, update_field, send_telegram
 	Config map[string]interface{} `json:"config"` // action-specific configuration
 }
 
-// EvaluateWorkflowRules checks and executes matching rules for a given event
-func (h *Handler) EvaluateWorkflowRules(tenantID uuid.UUID, event string, data map[string]interface{}) {
-	// Find active rules matching this event
-	rows, err := h.db.Query(`
-		SELECT id, name, conditions, actions
-		FROM workflow_rules
-		WHERE tenant_id = $1 AND trigger_event = $2 AND is_active = true AND deleted_at IS NULL
-		ORDER BY priority DESC
-	`, tenantID, event)
-	if err != nil {
-		h.log.Error("Failed to query workflow rules", "error", err, "event", event)
-		return
-	}
-	defer rows.Close()
+// ===== Scheduled trigger scans =====
+//
+// Time-based triggers (overdue invoice/task, expiring contract, low stock)
+// are not events — nothing "happens" at the overdue moment, so a periodic
+// scan emits them. Every emission goes through the fired-marker dedupe in
+// workflow_engine.go so a rule fires once per record, not once per scan.
 
-	for rows.Next() {
-		var ruleID uuid.UUID
-		var ruleName string
-		var conditionsJSON, actionsJSON json.RawMessage
-
-		if err := rows.Scan(&ruleID, &ruleName, &conditionsJSON, &actionsJSON); err != nil {
-			h.log.Error("Failed to scan workflow rule", "error", err)
-			continue
-		}
-
-		// Check conditions
-		if !h.evaluateConditions(conditionsJSON, data) {
-			continue
-		}
-
-		// Parse and execute actions
-		var actions []WorkflowAction
-		if err := json.Unmarshal(actionsJSON, &actions); err != nil {
-			h.log.Error("Failed to parse workflow actions", "error", err, "rule", ruleName)
-			h.logWorkflowExecution(tenantID, ruleID, data, nil, "failed", "Failed to parse actions: "+err.Error())
-			continue
-		}
-
-		executedActions := make([]map[string]interface{}, 0)
-		allSuccess := true
-		var lastError string
-
-		for _, action := range actions {
-			result, err := h.executeAction(tenantID, action, data)
-			actionLog := map[string]interface{}{
-				"type":   action.Type,
-				"config": action.Config,
-				"result": result,
-			}
-			if err != nil {
-				actionLog["error"] = err.Error()
-				allSuccess = false
-				lastError = err.Error()
-			}
-			executedActions = append(executedActions, actionLog)
-		}
-
-		status := "success"
-		if !allSuccess {
-			status = "partial"
-		}
-
-		h.logWorkflowExecution(tenantID, ruleID, data, executedActions, status, lastError)
-
-		// Update rule stats
-		h.db.Exec(`
-			UPDATE workflow_rules SET last_triggered_at = $1, trigger_count = trigger_count + 1
-			WHERE id = $2
-		`, time.Now(), ruleID)
-
-		h.log.Info("Workflow rule executed", "rule", ruleName, "event", event, "status", status)
-	}
-}
-
-// evaluateConditions checks if the data matches the rule conditions
-func (h *Handler) evaluateConditions(conditionsJSON json.RawMessage, data map[string]interface{}) bool {
-	if len(conditionsJSON) == 0 || string(conditionsJSON) == "{}" || string(conditionsJSON) == "null" {
-		return true // No conditions = always match
-	}
-
-	var conditions map[string]interface{}
-	if err := json.Unmarshal(conditionsJSON, &conditions); err != nil {
-		return false
-	}
-
-	// Simple condition evaluation: each key in conditions must match data
-	for key, expected := range conditions {
-		actual, exists := data[key]
-		if !exists {
-			return false
-		}
-
-		// Handle comparison operators
-		switch exp := expected.(type) {
-		case map[string]interface{}:
-			// Operator-based comparison: {"quantity": {"$lte": 10}}
-			for op, val := range exp {
-				if !h.compareValues(op, actual, val) {
-					return false
-				}
-			}
-		default:
-			// Direct equality
-			if fmt.Sprintf("%v", actual) != fmt.Sprintf("%v", expected) {
-				return false
-			}
-		}
-	}
-
-	return true
-}
-
-// compareValues performs operator-based comparison
-func (h *Handler) compareValues(op string, actual, expected interface{}) bool {
-	actualFloat := toFloat64(actual)
-	expectedFloat := toFloat64(expected)
-
-	switch op {
-	case "$eq":
-		return actualFloat == expectedFloat
-	case "$ne":
-		return actualFloat != expectedFloat
-	case "$gt":
-		return actualFloat > expectedFloat
-	case "$gte":
-		return actualFloat >= expectedFloat
-	case "$lt":
-		return actualFloat < expectedFloat
-	case "$lte":
-		return actualFloat <= expectedFloat
-	default:
-		return false
-	}
-}
-
-func toFloat64(v interface{}) float64 {
-	switch val := v.(type) {
-	case float64:
-		return val
-	case float32:
-		return float64(val)
-	case int:
-		return float64(val)
-	case int64:
-		return float64(val)
-	case string:
-		f, _ := strconv.ParseFloat(val, 64)
-		return f
-	default:
-		return 0
-	}
-}
-
-// executeAction executes a single workflow action
-func (h *Handler) executeAction(tenantID uuid.UUID, action WorkflowAction, triggerData map[string]interface{}) (string, error) {
-	switch action.Type {
-	case "create_notification":
-		return h.actionCreateNotification(tenantID, action.Config, triggerData)
-	case "update_status":
-		return h.actionUpdateStatus(tenantID, action.Config, triggerData)
-	case "create_record":
-		return h.actionCreateRecord(tenantID, action.Config, triggerData)
-	default:
-		return "", fmt.Errorf("unknown action type: %s", action.Type)
-	}
-}
-
-// actionCreateNotification inserts a notification for users
-func (h *Handler) actionCreateNotification(tenantID uuid.UUID, config map[string]interface{}, data map[string]interface{}) (string, error) {
-	message, _ := config["message"].(string)
-	if message == "" {
-		message = "Workflow notification triggered"
-	}
-
-	// Replace placeholders in message like {product_name}
-	for key, val := range data {
-		message = strings.ReplaceAll(message, "{"+key+"}", fmt.Sprintf("%v", val))
-	}
-
-	// Store as a workflow log notification (can be extended to a notifications table later)
-	h.log.Info("Workflow notification", "tenant", tenantID, "message", message)
-	return "Notification: " + message, nil
-}
-
-// actionUpdateStatus updates a record's status field
-func (h *Handler) actionUpdateStatus(tenantID uuid.UUID, config map[string]interface{}, data map[string]interface{}) (string, error) {
-	table, _ := config["table"].(string)
-	newStatus, _ := config["status"].(string)
-	if table == "" || newStatus == "" {
-		return "", fmt.Errorf("table and status are required for update_status action")
-	}
-
-	// Validate table name to prevent SQL injection
-	validTables := map[string]bool{
-		"leads": true, "contacts": true, "sales_invoices": true,
-		"purchase_invoices": true, "sales_orders": true, "purchase_orders": true,
-	}
-	if !validTables[table] {
-		return "", fmt.Errorf("invalid table: %s", table)
-	}
-
-	recordID, ok := data["record_id"]
-	if !ok {
-		return "", fmt.Errorf("record_id not found in trigger data")
-	}
-
-	query := fmt.Sprintf("UPDATE %s SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", table)
-	_, err := h.db.Exec(query, newStatus, time.Now(), recordID, tenantID)
-	if err != nil {
-		return "", fmt.Errorf("failed to update status: %w", err)
-	}
-
-	return fmt.Sprintf("Updated %s status to %s", table, newStatus), nil
-}
-
-// actionCreateRecord creates a new record in a target table
-func (h *Handler) actionCreateRecord(tenantID uuid.UUID, config map[string]interface{}, data map[string]interface{}) (string, error) {
-	recordType, _ := config["record_type"].(string)
-
-	switch recordType {
-	case "purchase_order_draft":
-		// Auto-create draft purchase order for low stock items
-		productName, _ := data["product_name"].(string)
-		h.log.Info("Auto-creating PO draft for low stock", "product", productName, "tenant", tenantID)
-		return fmt.Sprintf("Draft PO created for: %s", productName), nil
-	default:
-		return "", fmt.Errorf("unknown record_type: %s", recordType)
-	}
-}
-
-// logWorkflowExecution records a workflow execution in the logs table
-func (h *Handler) logWorkflowExecution(tenantID, ruleID uuid.UUID, triggerData map[string]interface{}, actionsExecuted interface{}, status, errorMessage string) {
-	triggerJSON, _ := json.Marshal(triggerData)
-	actionsJSON, _ := json.Marshal(actionsExecuted)
-
-	var errMsg *string
-	if errorMessage != "" {
-		errMsg = &errorMessage
-	}
-
-	_, err := h.db.Exec(`
-		INSERT INTO workflow_logs (id, tenant_id, rule_id, trigger_data, actions_executed, status, error_message, executed_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, uuid.New(), tenantID, ruleID, triggerJSON, actionsJSON, status, errMsg, time.Now())
-
-	if err != nil {
-		h.log.Error("Failed to log workflow execution", "error", err)
-	}
-}
-
-// ===== Background Threshold Checker =====
-
-// CheckThresholdRules runs all threshold-type rules (called periodically)
+// CheckThresholdRules scans all tenants that have active rules on scheduled
+// events and emits the matching events with per-record dedupe.
 func (h *Handler) CheckThresholdRules() {
-	// Get all tenants with active threshold rules
 	rows, err := h.db.Query(`
-		SELECT DISTINCT tenant_id FROM workflow_rules
-		WHERE trigger_type = 'threshold' AND is_active = true AND deleted_at IS NULL
+		SELECT DISTINCT tenant_id, trigger_event FROM workflow_rules
+		WHERE trigger_event IN ('inventory.low_stock', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon')
+		  AND is_active = true AND deleted_at IS NULL
 	`)
 	if err != nil {
-		h.log.Error("Failed to query tenants for threshold rules", "error", err)
+		h.log.Error("Failed to query tenants for scheduled workflow rules", "error", err)
 		return
 	}
 	defer rows.Close()
 
-	var tenantIDs []uuid.UUID
+	type scan struct {
+		tenantID uuid.UUID
+		event    string
+	}
+	var scans []scan
 	for rows.Next() {
-		var tid uuid.UUID
-		if err := rows.Scan(&tid); err == nil {
-			tenantIDs = append(tenantIDs, tid)
+		var s scan
+		if err := rows.Scan(&s.tenantID, &s.event); err == nil {
+			scans = append(scans, s)
 		}
 	}
+	rows.Close()
 
-	for _, tenantID := range tenantIDs {
-		h.checkInventoryThresholds(tenantID)
-		h.checkOverdueInvoices(tenantID)
+	for _, s := range scans {
+		switch s.event {
+		case "inventory.low_stock":
+			h.checkInventoryThresholds(s.tenantID)
+		case "invoice.overdue":
+			h.checkOverdueInvoices(s.tenantID)
+		case "task.overdue":
+			h.checkOverdueTaskEvents(s.tenantID)
+		case "contracts.expiring_soon":
+			h.checkExpiringContracts(s.tenantID)
+		}
 	}
 }
 
-// checkInventoryThresholds checks for low stock items and triggers rules
+// checkInventoryThresholds emits inventory.low_stock for products at/below
+// their reorder point. Re-fires per product at most once per 24h.
 func (h *Handler) checkInventoryThresholds(tenantID uuid.UUID) {
 	rows, err := h.db.Query(`
 		SELECT p.id, p.name, p.code, p.reorder_point,
@@ -739,24 +866,28 @@ func (h *Handler) checkInventoryThresholds(tenantID uuid.UUID) {
 		var productID uuid.UUID
 		var productName, productCode string
 		var reorderPoint, available float64
-
 		if err := rows.Scan(&productID, &productName, &productCode, &reorderPoint, &available); err != nil {
 			continue
 		}
-
-		data := map[string]interface{}{
-			"product_id":    productID.String(),
-			"product_name":  productName,
-			"product_code":  productCode,
-			"reorder_point": reorderPoint,
-			"available":     available,
-		}
-
-		h.EvaluateWorkflowRules(tenantID, "inventory.low_stock", data)
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: tenantID,
+			Event:    "inventory.low_stock",
+			Data: map[string]interface{}{
+				"record_id":     productID.String(),
+				"product_id":    productID.String(),
+				"product_name":  productName,
+				"product_code":  productCode,
+				"reorder_point": reorderPoint,
+				"available":     available,
+			},
+			DedupeKey: productID.String(),
+			Cooldown:  24 * time.Hour,
+		})
 	}
 }
 
-// checkOverdueInvoices checks for overdue invoices and triggers rules
+// checkOverdueInvoices emits invoice.overdue once per invoice+rule (30-day
+// re-fire window covers the partial-payment → overdue-again edge case).
 func (h *Handler) checkOverdueInvoices(tenantID uuid.UUID) {
 	rows, err := h.db.Query(`
 		SELECT id, invoice_number, customer_name, total_amount, due_date
@@ -774,35 +905,232 @@ func (h *Handler) checkOverdueInvoices(tenantID uuid.UUID) {
 		var invoiceNumber, customerName string
 		var totalAmount float64
 		var dueDate time.Time
-
 		if err := rows.Scan(&invoiceID, &invoiceNumber, &customerName, &totalAmount, &dueDate); err != nil {
 			continue
 		}
-
-		data := map[string]interface{}{
-			"record_id":      invoiceID.String(),
-			"invoice_number": invoiceNumber,
-			"customer_name":  customerName,
-			"total_amount":   totalAmount,
-			"due_date":       dueDate.Format("2006-01-02"),
-			"days_overdue":   int(time.Since(dueDate).Hours() / 24),
-		}
-
-		h.EvaluateWorkflowRules(tenantID, "invoice.overdue", data)
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: tenantID,
+			Event:    "invoice.overdue",
+			Data: map[string]interface{}{
+				"record_id":      invoiceID.String(),
+				"invoice_number": invoiceNumber,
+				"customer_name":  customerName,
+				"total_amount":   totalAmount,
+				"due_date":       dueDate.Format("2006-01-02"),
+				"days_overdue":   int(time.Since(dueDate).Hours() / 24),
+			},
+			DedupeKey: invoiceID.String(),
+			Cooldown:  30 * 24 * time.Hour,
+		})
 	}
 }
 
-// RunWorkflowScheduler starts a background ticker for periodic checks
+// checkOverdueTaskEvents emits task.overdue for open Vazifalar tasks past
+// their due date. The marker key includes the due date, so a rescheduled task
+// fires again when it becomes newly overdue.
+func (h *Handler) checkOverdueTaskEvents(tenantID uuid.UUID) {
+	rows, err := h.db.Query(`
+		SELECT t.id, t.title, t.due_date, b.id, b.name
+		FROM tasks t
+		JOIN task_boards b ON b.id = t.board_id
+		WHERE t.tenant_id = $1 AND t.due_date < CURRENT_DATE
+		  AND t.completed_at IS NULL AND t.archived_at IS NULL AND b.archived_at IS NULL
+		LIMIT 500
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to check overdue tasks for workflows", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var taskID, boardID uuid.UUID
+		var title, boardName string
+		var dueDate time.Time
+		if err := rows.Scan(&taskID, &title, &dueDate, &boardID, &boardName); err != nil {
+			continue
+		}
+		dueStr := dueDate.Format("2006-01-02")
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: tenantID,
+			Event:    "task.overdue",
+			Data: map[string]interface{}{
+				"record_id":    taskID.String(),
+				"task_title":   title,
+				"board_id":     boardID.String(),
+				"board_name":   boardName,
+				"due_date":     dueStr,
+				"days_overdue": int(time.Since(dueDate).Hours() / 24),
+			},
+			DedupeKey: taskID.String() + ":" + dueStr,
+			Cooldown:  0, // one-shot per task+due_date
+		})
+	}
+}
+
+// contractExpiryThresholds are the "N days before end_date" marks at which
+// contracts.expiring_soon fires — once per contract per threshold.
+var contractExpiryThresholds = []int{30, 14, 3}
+
+// checkExpiringContracts emits contracts.expiring_soon for active contracts
+// approaching end_date. Reads procurement_contracts (the Shartnomalar module
+// table — the pre-443 version scanned the orphaned legacy `contracts` table,
+// so UI-created contracts were never seen). One-shot per
+// contract+end_date+threshold via the fired-marker dedupe.
+func (h *Handler) checkExpiringContracts(tenantID uuid.UUID) {
+	rows, err := h.db.Query(`
+		SELECT c.id, c.contract_number, COALESCE(v.name, c.vendor_name, ''), c.end_date,
+		       (c.end_date - CURRENT_DATE) as days_to_expiry
+		FROM procurement_contracts c
+		LEFT JOIN contacts v ON v.id = c.vendor_id AND v.tenant_id = c.tenant_id
+		WHERE c.tenant_id = $1 AND c.deleted_at IS NULL AND c.archived_at IS NULL
+		  AND c.end_date IS NOT NULL
+		  AND c.end_date >= CURRENT_DATE
+		  AND c.end_date <= CURRENT_DATE + INTERVAL '30 days'
+		  AND c.status = 'active'
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to check expiring contracts for workflows", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var contractID uuid.UUID
+		var contractNumber, contactName string
+		var endDate time.Time
+		var daysToExpiry int
+		if err := rows.Scan(&contractID, &contractNumber, &contactName, &endDate, &daysToExpiry); err != nil {
+			continue
+		}
+		endStr := endDate.Format("2006-01-02")
+		for _, threshold := range contractExpiryThresholds {
+			if daysToExpiry > threshold {
+				continue
+			}
+			h.runWorkflowEvent(workflowEventCtx{
+				TenantID: tenantID,
+				Event:    "contracts.expiring_soon",
+				Data: map[string]interface{}{
+					"record_id":       contractID.String(),
+					"contract_number": contractNumber,
+					"contact_name":    contactName,
+					"end_date":        endStr,
+					"days_to_expiry":  daysToExpiry,
+					"threshold_days":  threshold,
+				},
+				DedupeKey: contractID.String() + ":" + endStr + ":" + strconv.Itoa(threshold),
+				Cooldown:  0, // one-shot per contract+end_date+threshold
+			})
+		}
+	}
+}
+
+// markExpiredContracts flips active contracts past their end_date to
+// 'expired' (all tenants) and emits contracts.expired for each. Runs from
+// the workflow scheduler tick; the status change happens regardless of
+// whether any automation rule listens.
+func (h *Handler) markExpiredContracts() {
+	rows, err := h.db.Query(`
+		UPDATE procurement_contracts c
+		SET status = 'expired', updated_at = NOW()
+		WHERE c.status = 'active' AND c.deleted_at IS NULL
+		  AND c.end_date IS NOT NULL AND c.end_date < CURRENT_DATE
+		RETURNING c.id, c.tenant_id, c.contract_number, COALESCE(c.vendor_name, ''), c.end_date
+	`)
+	if err != nil {
+		h.log.Error("Failed to mark expired contracts", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	type expired struct {
+		id             uuid.UUID
+		tenantID       uuid.UUID
+		contractNumber string
+		contactName    string
+		endDate        time.Time
+	}
+	var items []expired
+	for rows.Next() {
+		var e expired
+		if err := rows.Scan(&e.id, &e.tenantID, &e.contractNumber, &e.contactName, &e.endDate); err == nil {
+			items = append(items, e)
+		}
+	}
+	rows.Close()
+
+	for _, e := range items {
+		endStr := e.endDate.Format("2006-01-02")
+		h.contractAudit(e.tenantID, uuid.Nil, e.id, "status_change",
+			map[string]interface{}{"status": "active"},
+			map[string]interface{}{"status": "expired", "by": "scheduler"})
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: e.tenantID,
+			Event:    "contracts.expired",
+			Data: map[string]interface{}{
+				"record_id":       e.id.String(),
+				"contract_number": e.contractNumber,
+				"contact_name":    e.contactName,
+				"end_date":        endStr,
+			},
+			DedupeKey: e.id.String() + ":" + endStr,
+			Cooldown:  0, // one-shot per contract+end_date
+		})
+	}
+	if len(items) > 0 {
+		h.log.Info("Marked expired contracts", "count", len(items))
+	}
+}
+
+// cleanupWorkflowLogs enforces the retention policy (logs 90 days, markers
+// 400 days). Called once per scheduler day.
+func (h *Handler) cleanupWorkflowLogs() {
+	if _, err := h.db.Exec(`DELETE FROM workflow_logs WHERE executed_at < NOW() - make_interval(secs => $1)`,
+		workflowLogRetention.Seconds()); err != nil {
+		h.log.Error("Workflow log retention cleanup failed", "error", err)
+	}
+	if _, err := h.db.Exec(`DELETE FROM workflow_fired_markers WHERE fired_at < NOW() - make_interval(secs => $1)`,
+		markerRetention.Seconds()); err != nil {
+		h.log.Error("Workflow marker cleanup failed", "error", err)
+	}
+}
+
+// RunWorkflowScheduler starts the background ticker for scheduled-event scans,
+// auto-replenishment and log retention. Runs an initial pass shortly after
+// boot so a restart doesn't delay overdue checks by a full interval.
 func (h *Handler) RunWorkflowScheduler(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
 	go func() {
+		runAll := func() {
+			defer func() {
+				if r := recover(); r != nil {
+					h.log.Error("Workflow scheduler panic recovered", "panic", fmt.Sprintf("%v", r))
+				}
+			}()
+			h.CheckThresholdRules()
+			h.markExpiredContracts()
+			h.autoRunReplenishment()
+		}
+
+		select {
+		case <-time.After(30 * time.Second):
+			runAll()
+			h.cleanupWorkflowLogs()
+		case <-ctx.Done():
+			return
+		}
+
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		lastCleanup := time.Now()
 		for {
 			select {
 			case <-ticker.C:
-				h.log.Debug("Running workflow threshold checks")
-				h.CheckThresholdRules()
-				h.autoRunReplenishment()
+				runAll()
+				if time.Since(lastCleanup) > 24*time.Hour {
+					h.cleanupWorkflowLogs()
+					lastCleanup = time.Now()
+				}
 			case <-ctx.Done():
 				h.log.Info("Workflow scheduler stopped")
 				return

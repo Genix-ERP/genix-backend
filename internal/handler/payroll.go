@@ -44,7 +44,12 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 			   COALESCE((SELECT COUNT(*) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.employee_count) as employee_count,
 			   pp.notes, pp.created_at,
 			   (SELECT pe.employee_name FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_name,
-			   (SELECT pe.employee_id FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_id
+			   (SELECT pe.employee_id FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_id,
+			   (SELECT pe.id FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_entry_id,
+			   (SELECT COALESCE(pe.advance_paid, false) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_advance_paid,
+			   (SELECT pe.advance_paid_day FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_advance_paid_day,
+			   (SELECT COALESCE(pe.remainder_paid, false) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_remainder_paid,
+			   (SELECT pe.remainder_paid_day FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_remainder_paid_day
 		FROM payroll_periods pp
 		WHERE pp.tenant_id = $1 AND pp.deleted_at IS NULL
 	`
@@ -88,14 +93,17 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 	periods := make([]*entity.PayrollPeriodResponse, 0)
 	for rows.Next() {
 		var period entity.PayrollPeriod
-		var notes, firstEmployeeName, firstEmployeeID sql.NullString
+		var notes, firstEmployeeName, firstEmployeeID, firstEntryID sql.NullString
+		var firstAdvancePaid, firstRemainderPaid sql.NullBool
+		var firstAdvanceDay, firstRemainderDay sql.NullInt64
 
 		if err := rows.Scan(
 			&period.ID, &period.TenantID, &period.PeriodCode, &period.PeriodName,
 			&period.StartDate, &period.EndDate, &period.PayDate, &period.Status,
 			&period.TotalGross, &period.TotalDeductions, &period.TotalNet,
 			&period.EmployeeCount, &notes, &period.CreatedAt, &firstEmployeeName,
-			&firstEmployeeID,
+			&firstEmployeeID, &firstEntryID,
+			&firstAdvancePaid, &firstAdvanceDay, &firstRemainderPaid, &firstRemainderDay,
 		); err != nil {
 			h.log.Error("Failed to scan payroll period", "error", err)
 			continue
@@ -106,7 +114,9 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 		}
 
 		resp := period.ToResponse()
-		// If there's only one employee, include their name and ID
+		// If there's only one employee, include their name, ID, and the TT
+		// payment state of the single entry (the advance/remainder toggles in
+		// the period table operate on that entry).
 		if period.EmployeeCount == 1 {
 			if firstEmployeeName.Valid {
 				resp.EmployeeName = firstEmployeeName.String
@@ -116,6 +126,27 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 				if err == nil {
 					resp.EmployeeID = &empUUID
 				}
+			}
+			if firstEntryID.Valid {
+				if entryUUID, err := uuid.Parse(firstEntryID.String); err == nil {
+					resp.FirstEntryID = &entryUUID
+				}
+			}
+			if firstAdvancePaid.Valid {
+				v := firstAdvancePaid.Bool
+				resp.AdvancePaid = &v
+			}
+			if firstAdvanceDay.Valid {
+				d := int(firstAdvanceDay.Int64)
+				resp.AdvancePaidDay = &d
+			}
+			if firstRemainderPaid.Valid {
+				v := firstRemainderPaid.Bool
+				resp.RemainderPaid = &v
+			}
+			if firstRemainderDay.Valid {
+				d := int(firstRemainderDay.Int64)
+				resp.RemainderPaidDay = &d
 			}
 		}
 		periods = append(periods, resp)
@@ -323,6 +354,54 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 		addUpdate("notes", *input.Notes)
 	}
 
+	// Snapshot the pre-update status: the paid-transition JE below must fire
+	// only on the first transition into 'paid', not on repeat PUTs.
+	wasAlreadyPaid := false
+	if input.Status != nil && *input.Status == "paid" {
+		var curStatus string
+		if err := h.db.QueryRow(`SELECT status FROM payroll_periods WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&curStatus); err == nil {
+			wasAlreadyPaid = curStatus == "paid"
+		}
+
+		// Balance guard (same standard as expenses' /pay), checked BEFORE the
+		// status flip since the flip and the JE below aren't atomic. Without
+		// it, paying periods drives the kassa/bank cache negative.
+		if !wasAlreadyPaid {
+			var totalNet float64
+			var orgStr sql.NullString
+			_ = h.db.QueryRow(`SELECT COALESCE(total_net, 0), organization_id FROM payroll_periods WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&totalNet, &orgStr)
+			if totalNet > 0 {
+				var guardOrgPtr *uuid.UUID
+				if orgStr.Valid {
+					if parsed, perr := uuid.Parse(orgStr.String); perr == nil {
+						guardOrgPtr = &parsed
+					}
+				}
+				paymentMethod := "cash"
+				if input.PaymentMethod != nil {
+					paymentMethod = *input.PaymentMethod
+				}
+				var payAcct uuid.UUID
+				if paymentMethod == "card" || paymentMethod == "bank_transfer" {
+					payAcct = findAccount(h.db, tenantID, guardOrgPtr, "bank account", "5110")
+				} else {
+					payAcct = findAccount(h.db, tenantID, guardOrgPtr, "cash", "5010")
+					if payAcct == uuid.Nil {
+						payAcct = findAccount(h.db, tenantID, guardOrgPtr, "kassa", "5010")
+					}
+				}
+				if payAcct != uuid.Nil {
+					var bal float64
+					_ = h.db.QueryRow(`SELECT COALESCE(current_balance, 0) FROM accounts WHERE id = $1`, payAcct).Scan(&bal)
+					if bal < totalNet {
+						response.BadRequest(c, fmt.Sprintf("Hisobda mablag' yetarli emas: mavjud %.0f, to'lov %.0f", bal, totalNet))
+						return
+					}
+				}
+			}
+		}
+	}
+
 	if len(updates) == 0 {
 		response.BadRequest(c, "No fields to update")
 		return
@@ -352,15 +431,24 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 	}
 
 	// If marking as paid, create payment journal entry (Dt: Wages Payable / Kt: Cash or Bank)
-	if input.Status != nil && *input.Status == "paid" {
+	if input.Status != nil && *input.Status == "paid" && !wasAlreadyPaid {
 		userID, _ := middleware.GetUserID(c)
 		orgID, _ := middleware.GetOrganizationID(c)
 		now := time.Now()
 
+		// Belt-and-braces idempotency: skip if a payment JE for this period
+		// already exists (e.g. the period was paid, reopened, and re-paid).
+		var existingJE int
+		h.db.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND source_type = 'payroll_payment' AND source_id = $2 AND status = 'posted'`, tenantID, id.String()).Scan(&existingJE)
+		if existingJE > 0 {
+			h.GetPayrollPeriod(c)
+			return
+		}
+
 		var periodName string
 		var orgIDStr sql.NullString
 		var totalNet float64
-		h.db.QueryRow(`SELECT period_name, organization_id, COALESCE(total_net, 0) FROM payroll_periods WHERE id = $1`, id).Scan(&periodName, &orgIDStr, &totalNet)
+		h.db.QueryRow(`SELECT period_name, organization_id, COALESCE(total_net, 0) FROM payroll_periods WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&periodName, &orgIDStr, &totalNet)
 		if orgIDStr.Valid {
 			if parsed, err2 := uuid.Parse(orgIDStr.String); err2 == nil {
 				orgID = parsed
@@ -383,9 +471,6 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 			var paymentAcctDesc string
 			if paymentMethod == "card" || paymentMethod == "bank_transfer" {
 				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
-				if paymentAcct == uuid.Nil {
-					paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
-				}
 				paymentAcctDesc = "Bank Account"
 			} else {
 				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
@@ -456,7 +541,9 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 							h.log.Error("Failed to insert wages payable line", "error", err)
 							return
 						}
-						if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, wagesPayableAcct); err != nil {
+						// Debit leg: balance convention is SUM(debit) - SUM(credit)
+						// (migration 407), so a debit ADDS to the stored balance.
+						if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalNet, now, wagesPayableAcct); err != nil {
 							h.log.Error("Failed to update wages payable balance", "error", err)
 							return
 						}
@@ -485,6 +572,12 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 				}
 			}
 		}
+
+		h.EmitWorkflowEvent(tenantID, "payroll.paid", map[string]interface{}{
+			"record_id":   id.String(),
+			"period_name": periodName,
+			"total_net":   totalNet,
+		})
 	}
 
 	h.GetPayrollPeriod(c)
@@ -1196,6 +1289,27 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 
 	now := time.Now()
 
+	// Idempotency: processing posts the accrual JE, so a period may only be
+	// processed once. Re-posting would duplicate salary expense (migration 360
+	// added taxes_journal_entry_id for this; the JE-existence check below is
+	// the working guard).
+	var curStatus string
+	if err := h.db.QueryRow(`SELECT status FROM payroll_periods WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&curStatus); err != nil {
+		if err == sql.ErrNoRows {
+			response.NotFound(c, "Payroll period")
+		} else {
+			h.log.Error("Failed to load payroll period status", "error", err)
+			response.InternalError(c, "Failed to process payroll")
+		}
+		return
+	}
+	var accrualJEs int
+	h.db.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND source_type = 'payroll' AND source_id = $2 AND status = 'posted'`, tenantID, id.String()).Scan(&accrualJEs)
+	if curStatus == "approved" || curStatus == "paid" || accrualJEs > 0 {
+		response.Success(c, gin.H{"message": "Payroll already processed"})
+		return
+	}
+
 	// Update all entries to approved
 	entryQuery := `
 		UPDATE payroll_entries SET status = 'approved', updated_at = $1
@@ -1435,6 +1549,15 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		}
 	}()
 
+	var periodName string
+	var totalNet float64
+	h.db.QueryRow(`SELECT period_name, COALESCE(total_net, 0) FROM payroll_periods WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&periodName, &totalNet)
+	h.EmitWorkflowEvent(tenantID, "payroll.period_confirmed", map[string]interface{}{
+		"record_id":   id.String(),
+		"period_name": periodName,
+		"total_net":   totalNet,
+	})
+
 	response.Success(c, gin.H{"message": "Payroll processed successfully"})
 }
 
@@ -1590,10 +1713,13 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 			response.InternalError(c, "Failed to update deductions")
 			return
 		}
+		// Only what THIS confirmation deducted (deducted_at = now) — the
+		// creation-time splitter attaches rows to the same entry, and those
+		// are already reflected in other_deductions/net_salary.
 		tx.QueryRow(`
 			SELECT COALESCE(SUM(amount), 0) FROM employee_deductions
-			WHERE payroll_entry_id=$1 AND status='deducted'
-		`, entryID).Scan(&totalDeducted)
+			WHERE payroll_entry_id=$1 AND tenant_id=$2 AND status='deducted' AND deducted_at=$3
+		`, entryID, tenantID, now).Scan(&totalDeducted)
 	} else if deductionPercent > 0 {
 		// Partial deduction: split each pending deduction
 		rows, err := tx.Query(`
@@ -1664,6 +1790,23 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 		}
 	}
 	// else deductionPercent == 0: no deductions applied
+
+	// The deduction must actually reduce what the employee is owed — before
+	// this fix it was booked to the GL but never subtracted from net_salary
+	// (audit §2.4).
+	if totalDeducted > 0 {
+		if _, err = tx.Exec(`
+			UPDATE payroll_entries
+			SET other_deductions = COALESCE(other_deductions, 0) + $1,
+			    total_deductions = COALESCE(total_deductions, 0) + $1,
+			    net_salary = GREATEST(COALESCE(net_salary, 0) - $1, 0),
+			    updated_at = $2
+			WHERE id = $3 AND tenant_id = $4
+		`, totalDeducted, now, entryID, tenantID); err != nil {
+			response.InternalError(c, "Failed to apply deduction to entry")
+			return
+		}
+	}
 
 	if totalDeducted > 0 {
 		var orgIDPtr *uuid.UUID
@@ -1753,6 +1896,14 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 		return
 	}
 
+	// The entry's net changed — refresh the cached period totals.
+	if totalDeducted > 0 {
+		var periodID uuid.UUID
+		if err := h.db.QueryRow(`SELECT payroll_period_id FROM payroll_entries WHERE id = $1 AND tenant_id = $2`, entryID, tenantID).Scan(&periodID); err == nil {
+			h.updatePayrollPeriodTotals(periodID, tenantID)
+		}
+	}
+
 	// In-app notification: salary confirmed
 	go func() {
 		var empName string
@@ -1787,9 +1938,11 @@ func (h *Handler) ConfirmSalaryPayment(c *gin.Context) {
 			WHERE pe.id = $1 AND pe.tenant_id = $2
 		`, entryID, tenantID).Scan(&phone, &grossSalary, &totalDed, &netSal)
 		if phone != "" {
-			// Check if employee has active loan payment deduction
-			h.db.QueryRow(`SELECT COALESCE(monthly_payment, 0) FROM employee_loans WHERE employee_id = $1 AND tenant_id = $2 AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
-				employeeID, tenantID).Scan(&loanDeduction)
+			// Only report a loan withholding that was actually linked to this
+			// entry — the old query quoted the loan's monthly_payment whether
+			// or not anything was withheld (audit §2.4).
+			h.db.QueryRow(`SELECT COALESCE(SUM(amount), 0) FROM employee_loan_payments WHERE payroll_entry_id = $1 AND tenant_id = $2 AND status = 'paid'`,
+				entryID, tenantID).Scan(&loanDeduction)
 			// Check remaining loan
 			var loanRemaining float64
 			h.db.QueryRow(`SELECT COALESCE(remaining_amount, 0) FROM employee_loans WHERE employee_id = $1 AND tenant_id = $2 AND status = 'active' AND deleted_at IS NULL LIMIT 1`,
@@ -1835,9 +1988,22 @@ func formatSMSAmount(n float64) string {
 	return string(result)
 }
 
-// ConfirmSalaryPaymentByEntry is a route adapter that reads :eid param instead of :id
+// ConfirmSalaryPaymentByEntry is a route adapter that reads :eid param instead
+// of :id. It must REPLACE the existing :id param (the period id) — gin's
+// c.Param returns the first match, so the old append-only version always fed
+// ConfirmSalaryPayment the period id and the endpoint 404'd on every call.
 func (h *Handler) ConfirmSalaryPaymentByEntry(c *gin.Context) {
 	eid := c.Param("eid")
-	c.Params = append(c.Params, gin.Param{Key: "id", Value: eid})
+	replaced := false
+	for i := range c.Params {
+		if c.Params[i].Key == "id" {
+			c.Params[i].Value = eid
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		c.Params = append(c.Params, gin.Param{Key: "id", Value: eid})
+	}
 	h.ConfirmSalaryPayment(c)
 }

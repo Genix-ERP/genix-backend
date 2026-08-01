@@ -480,7 +480,7 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"crm":           {"contact", "lead", "opportunity", "pipeline"},
 		"organization":  {"organization", "department"},
 		"users":         {"user", "role"},
-		"projects":      {"project", "task", "milestone", "expense", "time_entry"},
+		"tasks":         {"board", "column", "task"},
 		"manufacturing": {"production_orders", "work_orders", "work_centers", "transfers"},
 		"assets":        {"asset", "category", "depreciation"},
 		"expenses":      {"expense", "report", "category"},
@@ -509,6 +509,8 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"expenses":      {"finance:expense", "finance:report"},
 		"payroll":       {"hr:employee", "hr:payroll"},
 		"contracts":     {"purchase:contract", "purchase:order"},
+		// Task management needs the HR employee list for the assignee picker.
+		"tasks":         {"hr:employee"},
 	}
 
 	for empRows.Next() {
