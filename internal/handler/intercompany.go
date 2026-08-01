@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -680,7 +681,7 @@ func (h *Handler) DeleteIntercompanyTransfer(c *gin.Context) {
 	}
 
 	if currentStatus != "draft" {
-		response.BadRequest(c, "Can only delete transfers in draft status")
+		response.BadRequest(c, "Can only delete transfers in draft status. Use /cancel for in-transit transfers.")
 		return
 	}
 
@@ -808,7 +809,16 @@ func (h *Handler) ShipIntercompanyTransfer(c *gin.Context) {
 		return
 	}
 
-	// Deduct inventory from source warehouse
+	// Deduct inventory from source warehouse. Lines are collected FIRST —
+	// the old code ran tx.Exec while the tx's result set was still open,
+	// which lib/pq rejects, so the deducts could silently never apply.
+	// The ledger leg is 'transfer_out': in-transit stock is out of the
+	// source and not yet anywhere else until receive posts 'transfer_in'.
+	type icShipLine struct {
+		ProductID uuid.UUID
+		Qty       float64
+	}
+	var shipLines []icShipLine
 	rows, err := tx.Query(`
 		SELECT product_id, quantity_requested FROM intercompany_transfer_lines
 		WHERE intercompany_transfer_id = $1
@@ -818,43 +828,35 @@ func (h *Handler) ShipIntercompanyTransfer(c *gin.Context) {
 		response.InternalError(c, "Failed to ship transfer")
 		return
 	}
-	defer rows.Close()
-
 	for rows.Next() {
-		var productID uuid.UUID
-		var quantity float64
-		if err := rows.Scan(&productID, &quantity); err != nil {
-			continue
+		var l icShipLine
+		if rows.Scan(&l.ProductID, &l.Qty) == nil {
+			shipLines = append(shipLines, l)
 		}
+	}
+	rows.Close()
 
-		// Deduct from inventory
-		_, err = tx.Exec(`
-			UPDATE inventory
-			SET quantity_on_hand = quantity_on_hand - $1,
-				last_movement_date = CURRENT_TIMESTAMP,
-				updated_at = CURRENT_TIMESTAMP
-			WHERE product_id = $2 AND warehouse_id = $3 AND tenant_id = $4
-		`, quantity, productID, fromWarehouseID, tenantID)
-		if err != nil {
-			h.log.Error("Failed to deduct inventory", "error", err, "product_id", productID)
-		}
+	var srcOrgID *uuid.UUID
+	tx.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", fromWarehouseID, tenantID).Scan(&srcOrgID)
 
-		// Create inventory transaction
-		_, err = tx.Exec(`
-			INSERT INTO inventory_transactions (
-				id, tenant_id, inventory_id, transaction_type,
-				reference_type, reference_id, quantity,
-				from_warehouse_id, reason, transaction_date, created_by
-			)
-			SELECT gen_random_uuid(), $1, i.id, 'issue',
-				'intercompany_transfer', $2, $3,
-				$4, 'Inter-company transfer shipment', CURRENT_TIMESTAMP, $5
-			FROM inventory i
-			WHERE i.product_id = $6 AND i.warehouse_id = $4 AND i.tenant_id = $1
-			LIMIT 1
-		`, tenantID, id, quantity, fromWarehouseID, userID, productID)
-		if err != nil {
-			h.log.Error("Failed to create inventory transaction", "error", err)
+	for _, l := range shipLines {
+		if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+			TenantID: tenantID, OrgID: srcOrgID, ProductID: l.ProductID,
+			WarehouseID: fromWarehouseID, Qty: -l.Qty, UnitCost: 0,
+			TxType: "transfer_out", RefType: "intercompany_transfer", RefID: id.String(),
+			Reason: "Inter-company transfer shipment", FromWH: &fromWarehouseID,
+			CreatedBy: userID,
+		}); dErr != nil {
+			if errors.Is(dErr, errInsufficientStock) {
+				c.JSON(422, gin.H{
+					"success": false,
+					"message": "Insufficient stock in source warehouse for transfer",
+				})
+				return
+			}
+			h.log.Error("Failed to deduct inventory for IC ship", "error", dErr, "product_id", l.ProductID)
+			response.InternalError(c, "Failed to ship transfer")
+			return
 		}
 	}
 
@@ -939,7 +941,14 @@ func (h *Handler) ReceiveIntercompanyTransfer(c *gin.Context) {
 		return
 	}
 
-	// Add inventory to destination warehouse
+	// Add inventory to destination warehouse. Collect first (see ship),
+	// then post 'transfer_in' legs via applyStockDelta.
+	type icRecvLine struct {
+		ProductID uuid.UUID
+		Qty       float64
+		Price     float64
+	}
+	var recvLines []icRecvLine
 	rows, err := tx.Query(`
 		SELECT product_id, quantity_shipped, transfer_price FROM intercompany_transfer_lines
 		WHERE intercompany_transfer_id = $1
@@ -949,64 +958,28 @@ func (h *Handler) ReceiveIntercompanyTransfer(c *gin.Context) {
 		response.InternalError(c, "Failed to receive transfer")
 		return
 	}
-	defer rows.Close()
-
 	for rows.Next() {
-		var productID uuid.UUID
-		var quantity, transferPrice float64
-		if err := rows.Scan(&productID, &quantity, &transferPrice); err != nil {
-			continue
+		var l icRecvLine
+		if rows.Scan(&l.ProductID, &l.Qty, &l.Price) == nil {
+			recvLines = append(recvLines, l)
 		}
+	}
+	rows.Close()
 
-		// Check if inventory record exists
-		var existingID uuid.UUID
-		err = tx.QueryRow(`
-			SELECT id FROM inventory
-			WHERE product_id = $1 AND warehouse_id = $2 AND tenant_id = $3
-		`, productID, toWarehouseID, tenantID).Scan(&existingID)
+	var dstOrgID *uuid.UUID
+	tx.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", toWarehouseID, tenantID).Scan(&dstOrgID)
 
-		if err == sql.ErrNoRows {
-			// Create new inventory record
-			// Get organization_id from the destination warehouse
-			var toWhOrgID *uuid.UUID
-			tx.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", toWarehouseID, tenantID).Scan(&toWhOrgID)
-			_, err = tx.Exec(`
-				INSERT INTO inventory (
-					id, tenant_id, organization_id, product_id, warehouse_id,
-					quantity_on_hand, quantity_reserved, unit_cost,
-					last_movement_date, created_at, updated_at
-				) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-			`, uuid.New(), tenantID, toWhOrgID, productID, toWarehouseID, quantity, transferPrice)
-		} else if err == nil {
-			// Update existing inventory record
-			_, err = tx.Exec(`
-				UPDATE inventory
-				SET quantity_on_hand = quantity_on_hand + $1,
-					last_movement_date = CURRENT_TIMESTAMP,
-					updated_at = CURRENT_TIMESTAMP
-				WHERE id = $2
-			`, quantity, existingID)
-		}
-		if err != nil {
-			h.log.Error("Failed to add inventory", "error", err, "product_id", productID)
-		}
-
-		// Create inventory transaction
-		_, err = tx.Exec(`
-			INSERT INTO inventory_transactions (
-				id, tenant_id, inventory_id, transaction_type,
-				reference_type, reference_id, quantity,
-				to_warehouse_id, reason, transaction_date, created_by
-			)
-			SELECT gen_random_uuid(), $1, i.id, 'receipt',
-				'intercompany_transfer', $2, $3,
-				$4, 'Inter-company transfer receipt', CURRENT_TIMESTAMP, $5
-			FROM inventory i
-			WHERE i.product_id = $6 AND i.warehouse_id = $4 AND i.tenant_id = $1
-			LIMIT 1
-		`, tenantID, id, quantity, toWarehouseID, userID, productID)
-		if err != nil {
-			h.log.Error("Failed to create inventory transaction", "error", err)
+	for _, l := range recvLines {
+		if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+			TenantID: tenantID, OrgID: dstOrgID, ProductID: l.ProductID,
+			WarehouseID: toWarehouseID, Qty: l.Qty, UnitCost: l.Price,
+			TxType: "transfer_in", RefType: "intercompany_transfer", RefID: id.String(),
+			Reason: "Inter-company transfer receipt", ToWH: &toWarehouseID,
+			CreatedBy: userID,
+		}); dErr != nil {
+			h.log.Error("Failed to add inventory for IC receive", "error", dErr, "product_id", l.ProductID)
+			response.InternalError(c, "Failed to receive transfer")
+			return
 		}
 	}
 
@@ -1030,6 +1003,112 @@ func (h *Handler) ReceiveIntercompanyTransfer(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"message": "Transfer received successfully", "status": "received"})
+}
+
+// CancelIntercompanyTransfer cancels a transfer. For in_transit transfers
+// the shipped quantity is returned to the SOURCE warehouse with a
+// compensating 'transfer_in' leg — before this endpoint existed, cancelling
+// (or abandoning) an in-transit transfer lost the stock permanently: it had
+// left the source and never arrived anywhere (docs/ombor-audit.md finding #6).
+func (h *Handler) CancelIntercompanyTransfer(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid transfer ID")
+		return
+	}
+
+	var currentStatus string
+	var fromWarehouseID uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT status, from_warehouse_id FROM intercompany_transfers
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, id, tenantID).Scan(&currentStatus, &fromWarehouseID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Transfer not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to get IC transfer status", "error", err)
+		response.InternalError(c, "Failed to cancel transfer")
+		return
+	}
+
+	switch currentStatus {
+	case "received", "cancelled":
+		response.BadRequest(c, "Cannot cancel a "+currentStatus+" transfer")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to cancel transfer")
+		return
+	}
+	defer tx.Rollback()
+
+	if currentStatus == "in_transit" {
+		// Return the shipped quantity to the source warehouse
+		type icLine struct {
+			ProductID uuid.UUID
+			Qty       float64
+		}
+		var lines []icLine
+		rows, qErr := tx.Query(`
+			SELECT product_id, COALESCE(quantity_shipped, quantity_requested)
+			FROM intercompany_transfer_lines
+			WHERE intercompany_transfer_id = $1
+		`, id)
+		if qErr != nil {
+			response.InternalError(c, "Failed to cancel transfer")
+			return
+		}
+		for rows.Next() {
+			var l icLine
+			if rows.Scan(&l.ProductID, &l.Qty) == nil && l.Qty > 0 {
+				lines = append(lines, l)
+			}
+		}
+		rows.Close()
+
+		var srcOrgID *uuid.UUID
+		tx.QueryRow("SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2", fromWarehouseID, tenantID).Scan(&srcOrgID)
+
+		for _, l := range lines {
+			if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+				TenantID: tenantID, OrgID: srcOrgID, ProductID: l.ProductID,
+				WarehouseID: fromWarehouseID, Qty: l.Qty, UnitCost: 0,
+				TxType: "transfer_in", RefType: "intercompany_transfer", RefID: id.String(),
+				Reason: "Inter-company transfer cancelled — stock returned to source",
+				ToWH:   &fromWarehouseID, CreatedBy: userID,
+			}); dErr != nil {
+				h.log.Error("Failed to return in-transit stock on IC cancel", "error", dErr, "product_id", l.ProductID)
+				response.InternalError(c, "Failed to cancel transfer")
+				return
+			}
+		}
+	}
+
+	if _, uErr := tx.Exec(`
+		UPDATE intercompany_transfers
+		SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+		WHERE id = $1 AND tenant_id = $2
+	`, id, tenantID); uErr != nil {
+		response.InternalError(c, "Failed to cancel transfer")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to cancel transfer")
+		return
+	}
+	response.Success(c, gin.H{"message": "Transfer cancelled", "status": "cancelled"})
 }
 
 // =====================================================

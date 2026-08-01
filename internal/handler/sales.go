@@ -1330,104 +1330,46 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 						WHERE id = ANY($2)
 					`, now, pq.Array(solIDs))
 
-					// ONE query: get all existing inventory records for these products
-					invMap := make(map[uuid.UUID]uuid.UUID) // productID -> inventoryID
-					invRows, invErr := h.db.Query(`
-						SELECT DISTINCT ON (product_id) id, product_id FROM inventory
-						WHERE tenant_id = $1 AND product_id = ANY($2) AND warehouse_id = $3
-						ORDER BY product_id, created_at ASC
-					`, tenantID, pq.Array(allProductIDs), warehouseID)
-					if invErr == nil {
-						for invRows.Next() {
-							var invID, pid uuid.UUID
-							if err := invRows.Scan(&invID, &pid); err == nil {
-								invMap[pid] = invID
+					// Balance + ledger now land in ONE transaction via
+					// applyStockDelta (docs/ombor-audit.md finding #1): either
+					// every line's decrement AND its ledger row commit, or
+					// nothing does. The old code decremented per-line with
+					// h.db.Exec and batch-inserted the ledger separately —
+					// that's how the May-6 −14.46 Rodbond MP-75 ledger row
+					// landed without touching on-hand (D4 drift). Outbound
+					// rows are now valued at the stored average cost, not the
+					// sales price the old batch insert recorded.
+					var orgIDPtr *uuid.UUID
+					if soOrgID.Valid && soOrgID.String != "" {
+						if parsed, _ := uuid.Parse(soOrgID.String); parsed != uuid.Nil {
+							orgIDPtr = &parsed
+						}
+					}
+					shipUserID, _ := middleware.GetUserID(c)
+
+					shipErr := func() error {
+						tx, txErr := h.db.Begin()
+						if txErr != nil {
+							return txErr
+						}
+						defer tx.Rollback()
+						for _, l := range lines {
+							if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+								TenantID: tenantID, OrgID: orgIDPtr, ProductID: l.ProductID,
+								WarehouseID: warehouseID, Qty: -l.Qty, UnitCost: 0,
+								TxType: "issue", RefType: "sales_order", RefID: orderID.String(),
+								Reason: "Sales Order Shipped",
+								FromWH: &warehouseID, CreatedBy: shipUserID, When: now,
+								AllowNeg: true, // ship must not block mid-status-change; drift surfaces in reports
+							}); dErr != nil {
+								return dErr
 							}
 						}
-						invRows.Close()
-					}
-
-					// Determine orgID once for potential inserts
-					var orgIDVal interface{}
-					if soOrgID.Valid && soOrgID.String != "" {
-						orgIDVal, _ = uuid.Parse(soOrgID.String)
-					}
-
-					// Batch INSERT for missing inventory records
-					var newInvValues []string
-					var newInvArgs []interface{}
-					newInvArgIdx := 0
-					for _, l := range lines {
-						if _, ok := invMap[l.ProductID]; !ok {
-							newID := uuid.New()
-							invMap[l.ProductID] = newID
-							newInvValues = append(newInvValues, fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,0,0,$%d,$%d,$%d)",
-								newInvArgIdx+1, newInvArgIdx+2, newInvArgIdx+3, newInvArgIdx+4, newInvArgIdx+5, newInvArgIdx+6, newInvArgIdx+7, newInvArgIdx+8))
-							newInvArgs = append(newInvArgs, newID, tenantID, l.ProductID, warehouseID, orgIDVal, l.UnitPrice, now, now)
-							newInvArgIdx += 8
-						}
-					}
-					if len(newInvValues) > 0 {
-						h.db.Exec(`
-							INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, organization_id, quantity_on_hand, quantity_reserved, unit_cost, created_at, updated_at)
-							VALUES `+strings.Join(newInvValues, ","), newInvArgs...)
-					}
-
-					// Batch UPDATE inventory quantities and batch INSERT inventory transactions
-					//
-					// Previously these Exec calls discarded errors. When the
-					// UPDATE failed (deadlock, constraint, etc.) the INSERT
-					// inventory_transactions still ran, so the ledger grew
-					// while inventory.quantity_on_hand stayed put — that's
-					// exactly how the May-6 −14.46 row landed on the ledger
-					// for Rodbond MP-75 without ever touching the on-hand
-					// (D4 drift). Errors are now checked: if the UPDATE
-					// fails we skip its matching transaction row so the two
-					// stay in lock-step.
-					var txValues []string
-					var txArgs []interface{}
-					txArgIdx := 0
-					for _, l := range lines {
-						inventoryID, ok := invMap[l.ProductID]
-						if !ok {
-							continue
-						}
-
-						// Individual UPDATE for inventory (each has different qty)
-						if _, updErr := h.db.Exec(`
-							UPDATE inventory
-							SET quantity_on_hand = quantity_on_hand - $1,
-								last_movement_date = $2,
-								updated_at = $2
-							WHERE id = $3
-						`, l.Qty, now, inventoryID); updErr != nil {
-							h.log.Error("Failed to decrement inventory on SO ship; skipping matching ledger row",
-								"error", updErr, "inventory_id", inventoryID, "qty", l.Qty, "so_id", orderID)
-							continue
-						}
-
-						txID := uuid.New()
-						txValues = append(txValues, fmt.Sprintf("($%d,$%d,$%d,'issue',$%d,$%d,$%d,'sales_order',$%d,'Sales Order Shipped',$%d,$%d)",
-							txArgIdx+1, txArgIdx+2, txArgIdx+3, txArgIdx+4, txArgIdx+5, txArgIdx+6, txArgIdx+7, txArgIdx+8, txArgIdx+9))
-						txArgs = append(txArgs, txID, tenantID, inventoryID, -l.Qty, l.UnitPrice, l.Qty*l.UnitPrice, orderID, now, now)
-						txArgIdx += 9
-					}
-
-					// ONE INSERT for all inventory transactions
-					if len(txValues) > 0 {
-						if _, insErr := h.db.Exec(`
-							INSERT INTO inventory_transactions (
-								id, tenant_id, inventory_id, transaction_type, quantity,
-								unit_cost, total_cost, reference_type, reference_id,
-								reason, transaction_date, created_at
-							) VALUES `+strings.Join(txValues, ","), txArgs...); insErr != nil {
-							// Cache was already decremented above. If the
-							// ledger insert fails, log loudly so the drift
-							// is fixable from D4 instead of silently
-							// disappearing.
-							h.log.Error("Failed to write inventory_transactions for SO ship; on-hand decremented WITHOUT ledger rows — manual reconcile needed",
-								"error", insErr, "so_id", orderID, "rows", len(txValues))
-						}
+						return tx.Commit()
+					}()
+					if shipErr != nil {
+						h.log.Error("SO ship stock movement failed; NOTHING moved (balance and ledger stay consistent)",
+							"error", shipErr, "so_id", orderID)
 					}
 				}
 			}
@@ -2690,6 +2632,16 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				  AND so.direction = 'delivery' AND so.state = 'done'
 			`, orderID.String()).Scan(&cogsPosted)
 			deliveryAlreadyPostedCOGS = cogsPosted > 0
+			if !deliveryAlreadyPostedCOGS {
+				// Ombor v2: shipment-time COGS from ValidateDeliveryOrder
+				var doCogs int
+				tx.QueryRow(`
+					SELECT COUNT(*) FROM journal_entries je
+					WHERE je.source_type = 'sales_delivery' AND je.status = 'posted' AND je.deleted_at IS NULL
+					  AND je.source_id IN (SELECT id::text FROM sales_delivery_orders WHERE sales_order_id = $1)
+				`, orderID.String()).Scan(&doCogs)
+				deliveryAlreadyPostedCOGS = doCogs > 0
+			}
 
 			for _, al := range acctLines {
 				if al.LineTotal > 0 {

@@ -212,6 +212,7 @@ type CreatePipelineStageInput struct {
 	IsLost         bool    `json:"is_lost"`
 	Color          string  `json:"color"`
 	PipelineType   string  `json:"pipeline_type"`
+	PipelineID     string  `json:"pipeline_id,omitempty"` // CRM v2: which funnel the stage belongs to
 	OrganizationID string  `json:"organization_id"`
 }
 

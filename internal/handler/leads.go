@@ -45,17 +45,39 @@ func (h *Handler) ListLeads(c *gin.Context) {
 	assignedTo := c.Query("assigned_to")
 	dateFrom := c.Query("date_from")
 	dateTo := c.Query("date_to")
+	stageID := c.Query("stage_id")
+	pipelineID := c.Query("pipeline_id")
+	responsibleID := c.Query("responsible_employee_id")
+	openOnly := c.Query("open") == "1" || c.Query("open") == "true"
 
 	// Build query
 	baseQuery := `
 		SELECT l.id, l.tenant_id, l.contact_name, l.company_name,
 			   l.email, l.phone, l.status, l.source, l.notes,
-			   l.expected_value, l.assigned_to, l.converted_to,
+			   l.expected_value, COALESCE(l.currency, 'UZS'),
+			   l.pipeline_id, l.stage_id, ps.code, COALESCE(ps.custom_name, ps.name),
+			   l.responsible_employee_id, TRIM(e.first_name || ' ' || e.last_name),
+			   l.partner_id, ct.name,
+			   l.lost_reason_id, lr.name, l.lost_note,
+			   l.won_at, l.lost_at, l.last_activity_at,
+			   l.assigned_to, l.converted_to,
 			   l.converted_at, l.created_at, l.updated_at,
 			   u.first_name || ' ' || u.last_name as assigned_to_name,
+			   COALESCE(tk.open_tasks, 0),
 			   al.modifier_name, al.modified_at
 		FROM leads l
 		LEFT JOIN users u ON l.assigned_to = u.id
+		LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
+		LEFT JOIN employees e ON e.id = l.responsible_employee_id
+		LEFT JOIN contacts ct ON ct.id = l.partner_id
+		LEFT JOIN lost_reasons lr ON lr.id = l.lost_reason_id
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS open_tasks
+			FROM task_links tl
+			JOIN tasks t ON t.id = tl.task_id
+			WHERE tl.linked_module = 'crm_lead' AND tl.linked_id = l.id::text
+			  AND t.completed_at IS NULL AND t.archived_at IS NULL
+		) tk ON true
 		LEFT JOIN LATERAL (
 			SELECT au.first_name || ' ' || au.last_name as modifier_name, a.created_at as modified_at
 			FROM audit_logs a
@@ -103,6 +125,32 @@ func (h *Handler) ListLeads(c *gin.Context) {
 		baseQuery += fmt.Sprintf(" AND l.assigned_to = $%d", argCount)
 		countQuery += fmt.Sprintf(" AND l.assigned_to = $%d", argCount)
 		args = append(args, assignedTo)
+	}
+
+	if stageID != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND l.stage_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND l.stage_id = $%d", argCount)
+		args = append(args, stageID)
+	}
+
+	if pipelineID != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND l.pipeline_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND l.pipeline_id = $%d", argCount)
+		args = append(args, pipelineID)
+	}
+
+	if responsibleID != "" {
+		argCount++
+		baseQuery += fmt.Sprintf(" AND l.responsible_employee_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND l.responsible_employee_id = $%d", argCount)
+		args = append(args, responsibleID)
+	}
+
+	if openOnly {
+		baseQuery += " AND l.won_at IS NULL AND l.lost_at IS NULL"
+		countQuery += " AND l.won_at IS NULL AND l.lost_at IS NULL"
 	}
 
 	if dateFrom != "" {
@@ -157,18 +205,30 @@ func (h *Handler) ListLeads(c *gin.Context) {
 		var l entity.Lead
 		var companyName, phone, notes sql.NullString
 		var expectedValue sql.NullFloat64
+		var currency string
+		var pipelineID, leadStageID, responsibleID, partnerID, lostReasonID *uuid.UUID
+		var stageCode, stageName, responsibleName, partnerName, lostReasonName, lostNote sql.NullString
+		var wonAt, lostAt, lastActivityAt sql.NullTime
 		var assignedTo, convertedTo sql.NullString
 		var convertedAt sql.NullTime
 		var assignedToName sql.NullString
+		var openTaskCount int
 		var lastModifiedBy sql.NullString
 		var lastModifiedAt sql.NullTime
 
 		err := rows.Scan(
 			&l.ID, &l.TenantID, &l.ContactName, &companyName,
 			&l.Email, &phone, &l.Status, &l.Source, &notes,
-			&expectedValue, &assignedTo, &convertedTo,
+			&expectedValue, &currency,
+			&pipelineID, &leadStageID, &stageCode, &stageName,
+			&responsibleID, &responsibleName,
+			&partnerID, &partnerName,
+			&lostReasonID, &lostReasonName, &lostNote,
+			&wonAt, &lostAt, &lastActivityAt,
+			&assignedTo, &convertedTo,
 			&convertedAt, &l.CreatedAt, &l.UpdatedAt,
 			&assignedToName,
+			&openTaskCount,
 			&lastModifiedBy, &lastModifiedAt,
 		)
 		if err != nil {
@@ -177,13 +237,20 @@ func (h *Handler) ListLeads(c *gin.Context) {
 		}
 
 		resp := &entity.LeadResponse{
-			ID:          l.ID,
-			ContactName: l.ContactName,
-			Email:       l.Email,
-			Status:      l.Status,
-			Source:      l.Source,
-			CreatedAt:   l.CreatedAt,
-			UpdatedAt:   l.UpdatedAt,
+			ID:                    l.ID,
+			ContactName:           l.ContactName,
+			Email:                 l.Email,
+			Status:                l.Status,
+			Source:                l.Source,
+			Currency:              currency,
+			PipelineID:            pipelineID,
+			StageID:               leadStageID,
+			ResponsibleEmployeeID: responsibleID,
+			PartnerID:             partnerID,
+			LostReasonID:          lostReasonID,
+			OpenTaskCount:         openTaskCount,
+			CreatedAt:             l.CreatedAt,
+			UpdatedAt:             l.UpdatedAt,
 		}
 
 		if companyName.Valid {
@@ -197,6 +264,36 @@ func (h *Handler) ListLeads(c *gin.Context) {
 		}
 		if expectedValue.Valid {
 			resp.ExpectedValue = &expectedValue.Float64
+		}
+		if stageCode.Valid {
+			resp.StageCode = &stageCode.String
+		}
+		if stageName.Valid {
+			resp.StageName = &stageName.String
+		}
+		if responsibleName.Valid && responsibleName.String != "" {
+			resp.ResponsibleName = &responsibleName.String
+		}
+		if partnerName.Valid {
+			resp.PartnerName = &partnerName.String
+		}
+		if lostReasonName.Valid {
+			resp.LostReasonName = &lostReasonName.String
+		}
+		if lostNote.Valid {
+			resp.LostNote = &lostNote.String
+		}
+		if wonAt.Valid {
+			t := wonAt.Time
+			resp.WonAt = &t
+		}
+		if lostAt.Valid {
+			t := lostAt.Time
+			resp.LostAt = &t
+		}
+		if lastActivityAt.Valid {
+			t := lastActivityAt.Time
+			resp.LastActivityAt = &t
 		}
 		if assignedTo.Valid {
 			aid, _ := uuid.Parse(assignedTo.String)
@@ -280,10 +377,12 @@ func (h *Handler) checkLeadDuplicates(tenantID uuid.UUID, email, phone, companyN
 				args = append(args, email)
 			}
 		case "phone":
-			if phone != "" {
+			// normalized match (last 9 digits) — `+998 90 123 45 67` and
+			// `901234567` are the same lead; uses idx_leads_phone_digits
+			if digits := normalizePhoneDigits(phone); len(digits) >= 7 {
 				argIdx++
-				conditions = append(conditions, fmt.Sprintf("phone = $%d", argIdx))
-				args = append(args, phone)
+				conditions = append(conditions, fmt.Sprintf("RIGHT(REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g'), 9) = $%d", argIdx))
+				args = append(args, digits)
 			}
 		case "company_name":
 			if companyName != "" {
@@ -328,7 +427,7 @@ func (h *Handler) checkLeadDuplicates(tenantID uuid.UUID, email, phone, companyN
 					matchedFields = append(matchedFields, "email")
 				}
 			case "phone":
-				if phone != "" && ph == phone {
+				if d := normalizePhoneDigits(phone); len(d) >= 7 && d == normalizePhoneDigits(ph) {
 					matchedFields = append(matchedFields, "phone")
 				}
 			case "company_name":
@@ -492,18 +591,18 @@ func (h *Handler) CreateLead(c *gin.Context) {
 		}
 	}
 
-	// Set defaults
-	status := entity.LeadStatusNew
-	if input.Status != "" {
-		status = input.Status
-	}
-
 	source := entity.LeadSourceWebsite
 	if input.Source != "" {
 		source = input.Source
 	}
 
-	// Check for duplicates before creating
+	currency := strings.ToUpper(strings.TrimSpace(input.Currency))
+	if currency == "" {
+		currency = "UZS"
+	}
+
+	// Check for duplicates before creating (normalized phone — see
+	// checkLeadDuplicates)
 	if enabled, checkFields := h.getDuplicateDetectionSettings(tenantID); enabled {
 		duplicates := h.checkLeadDuplicates(tenantID, input.Email, input.Phone, input.CompanyName, checkFields)
 		if len(duplicates) > 0 {
@@ -511,6 +610,68 @@ func (h *Handler) CreateLead(c *gin.Context) {
 				"duplicates": duplicates,
 			})
 			return
+		}
+	}
+
+	// Resolve the stage: explicit stage_id, else the first open stage of the
+	// org's default (or requested) pipeline. status mirrors the stage code.
+	var stagePtr, pipelinePtr *uuid.UUID
+	status := entity.LeadStatusNew
+	if input.StageID != "" {
+		if sid, err := uuid.Parse(input.StageID); err == nil {
+			var code string
+			var pid *uuid.UUID
+			if err := h.db.QueryRow(`
+				SELECT code, pipeline_id FROM pipeline_stages
+				WHERE id = $1 AND tenant_id = $2 AND pipeline_type = 'lead'
+			`, sid, tenantID).Scan(&code, &pid); err == nil {
+				stagePtr = &sid
+				pipelinePtr = pid
+				status = entity.LeadStatus(code)
+			}
+		}
+	}
+	if stagePtr == nil {
+		q := `
+			SELECT ps.id, ps.code, ps.pipeline_id
+			FROM pipeline_stages ps
+			JOIN pipelines p ON p.id = ps.pipeline_id
+			WHERE ps.tenant_id = $1 AND ps.pipeline_type = 'lead' AND ps.is_active
+			  AND NOT ps.is_won AND NOT ps.is_lost
+			  AND p.organization_id IS NOT DISTINCT FROM $2`
+		args := []interface{}{tenantID, orgIDPtr}
+		if input.PipelineID != "" {
+			if pid, err := uuid.Parse(input.PipelineID); err == nil {
+				q += " AND p.id = $3"
+				args = append(args, pid)
+			}
+		} else {
+			q += " AND p.is_default"
+		}
+		q += " ORDER BY ps.sequence LIMIT 1"
+		var sid uuid.UUID
+		var code string
+		var pid *uuid.UUID
+		if err := h.db.QueryRow(q, args...).Scan(&sid, &code, &pid); err == nil {
+			stagePtr = &sid
+			pipelinePtr = pid
+			status = entity.LeadStatus(code)
+		} else if input.Status != "" {
+			status = input.Status
+		}
+	}
+
+	// Responsible: explicit employee, else the creator's employee record.
+	var responsiblePtr *uuid.UUID
+	if input.ResponsibleEmployeeID != "" {
+		if eid, err := uuid.Parse(input.ResponsibleEmployeeID); err == nil {
+			responsiblePtr = &eid
+		}
+	}
+	if responsiblePtr == nil && userID != uuid.Nil {
+		var eid uuid.UUID
+		if err := h.db.QueryRow(`SELECT employee_id FROM users WHERE id = $1 AND employee_id IS NOT NULL`, userID).Scan(&eid); err == nil {
+			responsiblePtr = &eid
 		}
 	}
 
@@ -530,16 +691,18 @@ func (h *Handler) CreateLead(c *gin.Context) {
 		INSERT INTO leads (
 			id, tenant_id, organization_id, contact_name, company_name,
 			email, phone, status, source, notes,
-			expected_value, assigned_to,
+			expected_value, currency, pipeline_id, stage_id, responsible_employee_id,
+			assigned_to, last_activity_at,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
 		id, tenantID, orgIDPtr, input.ContactName, companyName,
 		input.Email, phone, status, source, notes,
-		input.ExpectedValue, assignedTo,
+		input.ExpectedValue, currency, pipelinePtr, stagePtr, responsiblePtr,
+		assignedTo, now,
 		userID, now, now,
 	).Scan(&id)
 
@@ -549,19 +712,27 @@ func (h *Handler) CreateLead(c *gin.Context) {
 		return
 	}
 
+	if stagePtr != nil {
+		h.recordLeadStageChange(h.db, tenantID, id, nil, stagePtr, userID)
+	}
+
 	resp := &entity.LeadResponse{
-		ID:            id,
-		ContactName:   input.ContactName,
-		CompanyName:   companyName,
-		Email:         input.Email,
-		Phone:         phone,
-		Status:        status,
-		Source:        source,
-		Notes:         notes,
-		ExpectedValue: input.ExpectedValue,
-		AssignedTo:    assignedTo,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:                    id,
+		ContactName:           input.ContactName,
+		CompanyName:           companyName,
+		Email:                 input.Email,
+		Phone:                 phone,
+		Status:                status,
+		Source:                source,
+		Notes:                 notes,
+		ExpectedValue:         input.ExpectedValue,
+		Currency:              currency,
+		PipelineID:            pipelinePtr,
+		StageID:               stagePtr,
+		ResponsibleEmployeeID: responsiblePtr,
+		AssignedTo:            assignedTo,
+		CreatedAt:             now,
+		UpdatedAt:             now,
 	}
 
 	// Trigger workflow rules for new lead
@@ -595,27 +766,52 @@ func (h *Handler) GetLead(c *gin.Context) {
 	query := `
 		SELECT l.id, l.tenant_id, l.contact_name, l.company_name,
 			   l.email, l.phone, l.status, l.source, l.notes,
-			   l.expected_value, l.assigned_to, l.converted_to,
+			   l.expected_value, COALESCE(l.currency, 'UZS'),
+			   l.pipeline_id, l.stage_id, ps.code, COALESCE(ps.custom_name, ps.name),
+			   l.responsible_employee_id, TRIM(e.first_name || ' ' || e.last_name),
+			   l.partner_id, ct.name,
+			   l.lost_reason_id, lr.name, l.lost_note,
+			   l.won_at, l.lost_at, l.last_activity_at,
+			   l.assigned_to, l.converted_to,
 			   l.converted_at, l.created_at, l.updated_at,
-			   u.first_name || ' ' || u.last_name as assigned_to_name
+			   u.first_name || ' ' || u.last_name as assigned_to_name,
+			   COALESCE((SELECT COUNT(*) FROM task_links tl JOIN tasks t ON t.id = tl.task_id
+			             WHERE tl.linked_module = 'crm_lead' AND tl.linked_id = l.id::text
+			               AND t.completed_at IS NULL AND t.archived_at IS NULL), 0)
 		FROM leads l
 		LEFT JOIN users u ON l.assigned_to = u.id
+		LEFT JOIN pipeline_stages ps ON ps.id = l.stage_id
+		LEFT JOIN employees e ON e.id = l.responsible_employee_id
+		LEFT JOIN contacts ct ON ct.id = l.partner_id
+		LEFT JOIN lost_reasons lr ON lr.id = l.lost_reason_id
 		WHERE l.id = $1 AND l.tenant_id = $2 AND l.deleted_at IS NULL
 	`
 
 	var l entity.Lead
 	var companyName, phone, notes sql.NullString
 	var expectedValue sql.NullFloat64
+	var currency string
+	var pipelineID, leadStageID, responsibleID, partnerID, lostReasonID *uuid.UUID
+	var stageCode, stageName, responsibleName, partnerName, lostReasonName, lostNote sql.NullString
+	var wonAt, lostAt, lastActivityAt sql.NullTime
 	var assignedTo, convertedTo sql.NullString
 	var convertedAt sql.NullTime
 	var assignedToName sql.NullString
+	var openTaskCount int
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&l.ID, &l.TenantID, &l.ContactName, &companyName,
 		&l.Email, &phone, &l.Status, &l.Source, &notes,
-		&expectedValue, &assignedTo, &convertedTo,
+		&expectedValue, &currency,
+		&pipelineID, &leadStageID, &stageCode, &stageName,
+		&responsibleID, &responsibleName,
+		&partnerID, &partnerName,
+		&lostReasonID, &lostReasonName, &lostNote,
+		&wonAt, &lostAt, &lastActivityAt,
+		&assignedTo, &convertedTo,
 		&convertedAt, &l.CreatedAt, &l.UpdatedAt,
 		&assignedToName,
+		&openTaskCount,
 	)
 
 	if err == sql.ErrNoRows {
@@ -629,13 +825,20 @@ func (h *Handler) GetLead(c *gin.Context) {
 	}
 
 	resp := &entity.LeadResponse{
-		ID:          l.ID,
-		ContactName: l.ContactName,
-		Email:       l.Email,
-		Status:      l.Status,
-		Source:      l.Source,
-		CreatedAt:   l.CreatedAt,
-		UpdatedAt:   l.UpdatedAt,
+		ID:                    l.ID,
+		ContactName:           l.ContactName,
+		Email:                 l.Email,
+		Status:                l.Status,
+		Source:                l.Source,
+		Currency:              currency,
+		PipelineID:            pipelineID,
+		StageID:               leadStageID,
+		ResponsibleEmployeeID: responsibleID,
+		PartnerID:             partnerID,
+		LostReasonID:          lostReasonID,
+		OpenTaskCount:         openTaskCount,
+		CreatedAt:             l.CreatedAt,
+		UpdatedAt:             l.UpdatedAt,
 	}
 
 	if companyName.Valid {
@@ -649,6 +852,36 @@ func (h *Handler) GetLead(c *gin.Context) {
 	}
 	if expectedValue.Valid {
 		resp.ExpectedValue = &expectedValue.Float64
+	}
+	if stageCode.Valid {
+		resp.StageCode = &stageCode.String
+	}
+	if stageName.Valid {
+		resp.StageName = &stageName.String
+	}
+	if responsibleName.Valid && responsibleName.String != "" {
+		resp.ResponsibleName = &responsibleName.String
+	}
+	if partnerName.Valid {
+		resp.PartnerName = &partnerName.String
+	}
+	if lostReasonName.Valid {
+		resp.LostReasonName = &lostReasonName.String
+	}
+	if lostNote.Valid {
+		resp.LostNote = &lostNote.String
+	}
+	if wonAt.Valid {
+		t := wonAt.Time
+		resp.WonAt = &t
+	}
+	if lostAt.Valid {
+		t := lostAt.Time
+		resp.LostAt = &t
+	}
+	if lastActivityAt.Valid {
+		t := lastActivityAt.Time
+		resp.LastActivityAt = &t
 	}
 	if assignedTo.Valid {
 		aid, _ := uuid.Parse(assignedTo.String)
@@ -687,10 +920,11 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 	var oldContactName, oldCompanyName, oldEmail, oldPhone, oldStatus, oldSource, oldNotes sql.NullString
 	var oldAssignedTo sql.NullString
 	var oldExpectedValue sql.NullFloat64
+	var oldStageID *uuid.UUID
 	h.db.QueryRow(`
-		SELECT contact_name, company_name, email, phone, status, source, notes, assigned_to, expected_value
+		SELECT contact_name, company_name, email, phone, status, source, notes, assigned_to, expected_value, stage_id
 		FROM leads WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, id, tenantID).Scan(&oldContactName, &oldCompanyName, &oldEmail, &oldPhone, &oldStatus, &oldSource, &oldNotes, &oldAssignedTo, &oldExpectedValue)
+	`, id, tenantID).Scan(&oldContactName, &oldCompanyName, &oldEmail, &oldPhone, &oldStatus, &oldSource, &oldNotes, &oldAssignedTo, &oldExpectedValue, &oldStageID)
 
 	// Build update query dynamically
 	updates := []string{}
@@ -721,6 +955,21 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
 		args = append(args, *input.Status)
+		// keep stage_id in sync when a legacy client writes status directly
+		// (the board uses POST /leads/:id/move; this covers old consumers)
+		var sid uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT ps.id FROM pipeline_stages ps
+			JOIN leads l ON l.tenant_id = ps.tenant_id
+			WHERE l.id = $1 AND ps.tenant_id = $2 AND ps.pipeline_type = 'lead'
+			  AND ps.code = $3
+			  AND (ps.pipeline_id = l.pipeline_id OR l.pipeline_id IS NULL)
+			ORDER BY (ps.pipeline_id = l.pipeline_id) DESC NULLS LAST LIMIT 1
+		`, id, tenantID, string(*input.Status)).Scan(&sid); err == nil {
+			argCount++
+			updates = append(updates, fmt.Sprintf("stage_id = $%d", argCount))
+			args = append(args, sid)
+		}
 	}
 	if input.Source != nil {
 		argCount++
@@ -736,6 +985,23 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("expected_value = $%d", argCount))
 		args = append(args, *input.ExpectedValue)
+	}
+	if input.Currency != nil && *input.Currency != "" {
+		argCount++
+		updates = append(updates, fmt.Sprintf("currency = $%d", argCount))
+		args = append(args, strings.ToUpper(strings.TrimSpace(*input.Currency)))
+	}
+	if input.ResponsibleEmployeeID != nil {
+		argCount++
+		if *input.ResponsibleEmployeeID == "" {
+			updates = append(updates, fmt.Sprintf("responsible_employee_id = $%d", argCount))
+			args = append(args, nil)
+		} else if eid, err := uuid.Parse(*input.ResponsibleEmployeeID); err == nil {
+			updates = append(updates, fmt.Sprintf("responsible_employee_id = $%d", argCount))
+			args = append(args, eid)
+		} else {
+			argCount--
+		}
 	}
 	if input.AssignedTo != nil {
 		argCount++
@@ -755,6 +1021,9 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 		response.BadRequest(c, "No fields to update")
 		return
 	}
+
+	// Any edit counts as activity (rotting badge & stale scanner read this)
+	updates = append(updates, "last_activity_at = NOW()")
 
 	// Add updated_at
 	argCount++
@@ -797,6 +1066,13 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 			"old_status":   oldStatus.String,
 			"new_status":   string(*input.Status),
 		})
+		// mirror into stage history for funnel/cycle reports
+		var newStageID *uuid.UUID
+		h.db.QueryRow(`SELECT stage_id FROM leads WHERE id = $1`, id).Scan(&newStageID)
+		if newStageID != nil && (oldStageID == nil || *oldStageID != *newStageID) {
+			actorID, _ := middleware.GetUserID(c)
+			h.recordLeadStageChange(h.db, tenantID, id, oldStageID, newStageID, actorID)
+		}
 	}
 
 	// Write audit log for changed fields
@@ -907,17 +1183,29 @@ func (h *Handler) GetLeadStats(c *gin.Context) {
 	query := `
 		SELECT
 			COUNT(*) as total_leads,
+			COUNT(*) FILTER (WHERE won_at IS NULL AND lost_at IS NULL) as open_leads,
+			COALESCE(SUM(expected_value) FILTER (WHERE won_at IS NULL AND lost_at IS NULL), 0) as open_value,
+			COUNT(*) FILTER (WHERE won_at IS NOT NULL) as won_leads,
+			COUNT(*) FILTER (WHERE lost_at IS NOT NULL) as lost_leads,
+			COUNT(*) FILTER (WHERE won_at >= date_trunc('month', CURRENT_DATE)) as won_this_month,
+			COALESCE(SUM(expected_value) FILTER (WHERE won_at >= date_trunc('month', CURRENT_DATE)), 0) as won_value_month,
+			COALESCE(
+				COUNT(*) FILTER (WHERE won_at IS NOT NULL)::float /
+				NULLIF(COUNT(*) FILTER (WHERE won_at IS NOT NULL OR lost_at IS NOT NULL), 0) * 100,
+				0
+			) as conversion_rate,
+			COALESCE(
+				COUNT(*) FILTER (WHERE won_at >= date_trunc('month', CURRENT_DATE))::float /
+				NULLIF(COUNT(*) FILTER (WHERE won_at >= date_trunc('month', CURRENT_DATE)
+				                            OR lost_at >= date_trunc('month', CURRENT_DATE)), 0) * 100,
+				0
+			) as conversion_month,
+			COALESCE(AVG(expected_value) FILTER (WHERE won_at IS NOT NULL AND expected_value > 0), 0) as avg_deal_size,
+			COALESCE(SUM(expected_value) FILTER (WHERE lost_at IS NULL), 0) as total_value,
 			COUNT(*) FILTER (WHERE status = 'new') as new_leads,
 			COUNT(*) FILTER (WHERE status = 'contacted') as contacted_leads,
 			COUNT(*) FILTER (WHERE status = 'in_progress') as in_progress_leads,
-			COUNT(*) FILTER (WHERE status = 'qualified') as qualified_leads,
-			COUNT(*) FILTER (WHERE status = 'lost') as lost_leads,
-			COALESCE(
-				COUNT(*) FILTER (WHERE status = 'qualified')::float /
-				NULLIF(COUNT(*), 0) * 100,
-				0
-			) as conversion_rate,
-			COALESCE(SUM(expected_value) FILTER (WHERE status != 'lost'), 0) as total_value
+			COUNT(*) FILTER (WHERE status = 'qualified') as qualified_leads
 		FROM leads
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 	`
@@ -931,13 +1219,20 @@ func (h *Handler) GetLeadStats(c *gin.Context) {
 	var stats entity.LeadStats
 	err := h.db.QueryRow(query, args...).Scan(
 		&stats.TotalLeads,
+		&stats.OpenLeads,
+		&stats.OpenValue,
+		&stats.WonLeads,
+		&stats.LostLeads,
+		&stats.WonThisMonth,
+		&stats.WonValueMonth,
+		&stats.ConversionRate,
+		&stats.ConversionMonth,
+		&stats.AvgDealSize,
+		&stats.TotalValue,
 		&stats.NewLeads,
 		&stats.ContactedLeads,
 		&stats.InProgressLeads,
 		&stats.QualifiedLeads,
-		&stats.LostLeads,
-		&stats.ConversionRate,
-		&stats.TotalValue,
 	)
 
 	if err != nil {
@@ -1171,9 +1466,16 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 			RETURNING id
 		`
 
+		// currency follows the lead (UZS-denominated ERP; the old code
+		// hardcoded USD)
+		var leadCurrency string
+		if err := tx.QueryRow(`SELECT COALESCE(currency, 'UZS') FROM leads WHERE id = $1`, id).Scan(&leadCurrency); err != nil || leadCurrency == "" {
+			leadCurrency = "UZS"
+		}
+
 		err = tx.QueryRow(oppQuery,
 			newOpportunityID, tenantID, orgIDPtr, oppName, oppCode, contactID, id,
-			"qualification", 10.0, expectedRevenue, "USD",
+			"qualification", 10.0, expectedRevenue, leadCurrency,
 			expectedCloseDate, "lead_conversion", "medium", assignedTo,
 			[]byte("[]"), userID, now, now,
 		).Scan(&newOpportunityID)
@@ -1188,19 +1490,18 @@ func (h *Handler) ConvertLead(c *gin.Context) {
 		result["opportunity_id"] = newOpportunityID
 	}
 
-	// Update lead as converted
+	// Update lead as converted. converted_to is an FK to contacts(id) —
+	// it must stay NULL when only an opportunity was created (the old code
+	// wrote the opportunity UUID here, corrupting the reference).
+	_ = opportunityID
 	updateQuery := `
 		UPDATE leads
-		SET status = 'qualified', converted_to = $1, converted_at = $2, updated_at = $2
+		SET status = 'qualified', converted_to = $1, partner_id = COALESCE(partner_id, $1),
+		    converted_at = $2, last_activity_at = $2, updated_at = $2
 		WHERE id = $3 AND tenant_id = $4
 	`
 
-	convertedTo := contactID
-	if convertedTo == nil {
-		convertedTo = opportunityID
-	}
-
-	_, err = tx.Exec(updateQuery, convertedTo, now, id, tenantID)
+	_, err = tx.Exec(updateQuery, contactID, now, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to update lead conversion status", "error", err)
 		response.InternalError(c, "Failed to update lead")
@@ -1346,17 +1647,51 @@ func (h *Handler) PublicCreateLead(c *gin.Context) {
 	leadID := uuid.New()
 	now := time.Now()
 
+	// land in the first open stage of the org's default pipeline
+	var stagePtr, pipelinePtr *uuid.UUID
+	{
+		var sid uuid.UUID
+		var pid *uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT ps.id, ps.pipeline_id
+			FROM pipeline_stages ps
+			JOIN pipelines p ON p.id = ps.pipeline_id AND p.is_default
+			WHERE ps.tenant_id = $1 AND ps.pipeline_type = 'lead' AND ps.is_active
+			  AND NOT ps.is_won AND NOT ps.is_lost
+			  AND p.organization_id IS NOT DISTINCT FROM $2
+			ORDER BY ps.sequence LIMIT 1
+		`, tenantID, orgID).Scan(&sid, &pid); err == nil {
+			stagePtr = &sid
+			pipelinePtr = pid
+		}
+	}
+
 	_, err = h.db.Exec(`
 		INSERT INTO leads (id, tenant_id, organization_id, contact_name, company_name, email, phone,
-			status, source, notes, assigned_to, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'new', $8, $9, $10, $11, $11)
+			status, source, notes, assigned_to, pipeline_id, stage_id, last_activity_at, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'new', $8, $9, $10, $11, $12, $13, $13, $13)
 	`, leadID, tenantID, orgID, input.ContactName, input.CompanyName, input.Email, input.Phone,
-		source, notes, assignedTo, now)
+		source, notes, assignedTo, pipelinePtr, stagePtr, now)
 	if err != nil {
 		h.log.Error("PublicCreateLead: failed to create lead", "error", err)
 		c.JSON(500, gin.H{"success": false, "error": "Failed to create lead"})
 		return
 	}
+
+	if stagePtr != nil {
+		h.recordLeadStageChange(h.db, tenantID, leadID, nil, stagePtr, uuid.Nil)
+	}
+
+	// Website leads must trigger the same automations as manual ones —
+	// the old handler skipped this, so auto-assign/notify rules never ran
+	// for the highest-volume entry point.
+	h.EmitWorkflowEvent(tenantID, "lead.created", map[string]interface{}{
+		"record_id":    leadID.String(),
+		"contact_name": input.ContactName,
+		"company_name": input.CompanyName,
+		"email":        input.Email,
+		"source":       source,
+	})
 
 	h.log.Info("PublicCreateLead: lead created from website", "tenant_code", input.TenantCode, "lead_id", leadID, "email", input.Email)
 	c.JSON(200, gin.H{"success": true, "lead_id": leadID})

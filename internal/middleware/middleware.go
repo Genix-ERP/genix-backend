@@ -477,7 +477,7 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"purchase":      {"order", "vendor", "bill", "rfq", "contract", "invoice", "price_history", "purchase_order", "receipt", "requisition", "return", "rule"},
 		"hr":            {"employee", "department", "payroll", "contract", "attendance", "leave"},
 		"finance":       {"account", "journal", "journal_entry", "transaction", "report", "budget", "asset", "bank_account", "cash", "cash_transaction", "currency", "expense", "followup", "followup_level", "payment", "reconciliation", "tax_report"},
-		"crm":           {"contact", "lead", "opportunity", "pipeline"},
+		"crm":           {"contact", "lead", "opportunity", "pipeline", "call", "activity", "report"},
 		"organization":  {"organization", "department"},
 		"users":         {"user", "role"},
 		"tasks":         {"board", "column", "task"},
@@ -500,8 +500,8 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 	crossModuleGrants := map[string][]string{
 		"hr":            {"organization:department", "organization:organization", "users:role", "users:user"},
 		"inventory":     {"settings:tenant"},
-		"sales":         {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "inventory:product_attribute", "users:user"},
-		"purchase":      {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "users:user"},
+		"sales":         {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "inventory:product_attribute", "users:user", "crm:contact"},
+		"purchase":      {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "users:user", "crm:contact"},
 		"finance":       {"settings:tenant"},
 		"manufacturing": {"inventory:product", "inventory:bom", "inventory:warehouse"},
 		"construction":  {"organization:organization", "hr:employee", "inventory:product", "inventory:warehouse"},
@@ -511,6 +511,9 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"contracts":     {"purchase:contract", "purchase:order"},
 		// Task management needs the HR employee list for the assignee picker.
 		"tasks":         {"hr:employee"},
+		// CRM needs the employee list (responsible picker) and task boards
+		// ("Vazifa qo'yish" quick action + the no-task marker).
+		"crm":           {"hr:employee", "tasks:board", "tasks:task"},
 	}
 
 	for empRows.Next() {

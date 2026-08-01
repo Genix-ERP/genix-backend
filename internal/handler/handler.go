@@ -253,86 +253,133 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// Contacts (Customers & Vendors)
+	// Reads stay open — every module's partner picker (sales, purchase,
+	// finance, contracts) needs the list; mutations are CRM-gated since 446.
 	contacts := rg.Group("/contacts")
 	{
 		contacts.GET("", h.ListContacts)
-		contacts.POST("", h.CreateContact)
+		contacts.POST("", h.perm.Require("crm", "contact", "create"), h.CreateContact)
 		contacts.GET("/:id", h.GetContact)
-		contacts.PUT("/:id", h.UpdateContact)
-		contacts.DELETE("/:id", h.DeleteContact)
+		contacts.PUT("/:id", h.perm.Require("crm", "contact", "update"), h.UpdateContact)
+		contacts.DELETE("/:id", h.perm.Require("crm", "contact", "delete"), h.DeleteContact)
 		contacts.GET("/:id/persons", h.ListContactPersons)
-		contacts.POST("/:id/persons", h.CreateContactPerson)
+		contacts.POST("/:id/persons", h.perm.Require("crm", "contact", "update"), h.CreateContactPerson)
 		contacts.POST("/:id/rate", h.RateSupplier)
 		// CRM "create customer + sales order + manufacture order" in one save,
 		// and the customer's sales history (links to sales detail on the front-end).
-		contacts.POST("/full-order", h.CreateCustomerWithFullOrder)
+		contacts.POST("/full-order", h.perm.Require("crm", "contact", "create"), h.CreateCustomerWithFullOrder)
 		contacts.GET("/:id/sales", h.ListContactSalesHistory)
 	}
 
 	// Call Logs (CRM PBX Integration)
 	callLogs := rg.Group("/call-logs")
+	callLogs.Use(h.perm.Require("crm", "call", "read"))
 	{
 		callLogs.GET("", h.ListCallLogs)
-		callLogs.POST("", h.CreateCallLog)
+		callLogs.POST("", h.perm.Require("crm", "call", "create"), h.CreateCallLog)
 		callLogs.GET("/stats", h.GetCallLogStats)
 		callLogs.GET("/:id", h.GetCallLog)
-		callLogs.PUT("/:id", h.UpdateCallLog)
-		callLogs.DELETE("/:id", h.DeleteCallLog)
+		callLogs.PUT("/:id", h.perm.Require("crm", "call", "update"), h.UpdateCallLog)
+		callLogs.DELETE("/:id", h.perm.Require("crm", "call", "delete"), h.DeleteCallLog)
 	}
 
 	// PBX Integration (OnlinePBX)
 	pbx := rg.Group("/pbx")
+	pbx.Use(h.perm.Require("crm", "call", "read"))
 	{
 		pbx.GET("/config", h.GetPBXConfig)
-		pbx.POST("/config", h.SavePBXConfig)
-		pbx.POST("/test-connection", h.TestPBXConnection)
-		pbx.POST("/call", h.InitiateCall)
+		pbx.POST("/config", h.perm.Require("crm", "call", "update"), h.SavePBXConfig)
+		pbx.POST("/test-connection", h.perm.Require("crm", "call", "update"), h.TestPBXConnection)
+		pbx.POST("/call", h.perm.Require("crm", "call", "create"), h.InitiateCall)
 	}
 
-	// Leads (CRM Lead Management)
+	// Leads (CRM v2 — the lead IS the deal; see docs/crm-audit.md)
 	leads := rg.Group("/leads")
+	leads.Use(h.perm.Require("crm", "lead", "read"))
 	{
 		leads.GET("", h.ListLeads)
-		leads.POST("", h.CreateLead)
+		leads.POST("", h.perm.Require("crm", "lead", "create"), h.CreateLead)
 		leads.GET("/stats", h.GetLeadStats)
+		leads.POST("/ai/extract", h.perm.Require("crm", "lead", "create"), h.ExtractLeadFromText)
 		leads.GET("/:id", h.GetLead)
 		leads.GET("/:id/audit-logs", h.GetLeadAuditLogs)
-		leads.PUT("/:id", h.UpdateLead)
-		leads.DELETE("/:id", h.DeleteLead)
-		leads.POST("/:id/convert", h.ConvertLead)
+		leads.GET("/:id/timeline", h.GetLeadTimeline)
+		leads.GET("/:id/tasks", h.ListLeadTasks)
+		leads.PUT("/:id", h.perm.Require("crm", "lead", "update"), h.UpdateLead)
+		leads.DELETE("/:id", h.perm.Require("crm", "lead", "delete"), h.DeleteLead)
+		leads.POST("/:id/convert", h.perm.Require("crm", "lead", "update"), h.ConvertLead)
+		leads.POST("/:id/move", h.perm.Require("crm", "lead", "update"), h.MoveLead)
+		leads.POST("/:id/won", h.perm.Require("crm", "lead", "update"), h.WinLead)
+		leads.POST("/:id/lost", h.perm.Require("crm", "lead", "update"), h.LoseLead)
+		leads.POST("/:id/ai/next-step", h.SuggestLeadNextStep)
 	}
 
-	// Opportunities (CRM Sales Pipeline)
+	// CRM reports (Hisobotlar tab)
+	crmReports := rg.Group("/crm/reports")
+	crmReports.Use(h.perm.Require("crm", "report", "read"))
+	{
+		crmReports.GET("/funnel", h.GetCRMFunnelReport)
+		crmReports.GET("/sources", h.GetCRMSourcesReport)
+		crmReports.GET("/managers", h.GetCRMManagersReport)
+		crmReports.GET("/loss-reasons", h.GetCRMLossReasonsReport)
+	}
+
+	// Pipelines (CRM v2 — several funnels per org)
+	pipelines := rg.Group("/pipelines")
+	pipelines.Use(h.perm.Require("crm", "lead", "read"))
+	{
+		pipelines.GET("", h.ListPipelines)
+		pipelines.POST("", h.perm.Require("crm", "pipeline", "create"), h.CreatePipeline)
+		pipelines.PUT("/:id", h.perm.Require("crm", "pipeline", "update"), h.UpdatePipeline)
+		pipelines.DELETE("/:id", h.perm.Require("crm", "pipeline", "delete"), h.DeletePipeline)
+	}
+
+	// Lost reasons (tenant catalog, required on loss)
+	lostReasons := rg.Group("/lost-reasons")
+	lostReasons.Use(h.perm.Require("crm", "lead", "read"))
+	{
+		lostReasons.GET("", h.ListLostReasons)
+		lostReasons.POST("", h.perm.Require("crm", "pipeline", "update"), h.CreateLostReason)
+		lostReasons.PUT("/:id", h.perm.Require("crm", "pipeline", "update"), h.UpdateLostReason)
+		lostReasons.DELETE("/:id", h.perm.Require("crm", "pipeline", "update"), h.DeleteLostReason)
+	}
+
+	// Opportunities (legacy CRM deals — frozen; kept for contract_links back-compat)
 	opportunities := rg.Group("/opportunities")
+	opportunities.Use(h.perm.Require("crm", "opportunity", "read"))
 	{
 		opportunities.GET("", h.ListOpportunities)
-		opportunities.POST("", h.CreateOpportunity)
+		opportunities.POST("", h.perm.Require("crm", "opportunity", "create"), h.CreateOpportunity)
 		opportunities.GET("/stats", h.GetOpportunityStats)
 		opportunities.GET("/by-stage", h.GetOpportunitiesByStage)
 		opportunities.GET("/:id", h.GetOpportunity)
-		opportunities.PUT("/:id", h.UpdateOpportunity)
-		opportunities.DELETE("/:id", h.DeleteOpportunity)
+		opportunities.PUT("/:id", h.perm.Require("crm", "opportunity", "update"), h.UpdateOpportunity)
+		opportunities.DELETE("/:id", h.perm.Require("crm", "opportunity", "delete"), h.DeleteOpportunity)
 	}
 
-	// Pipeline Stages
+	// Pipeline Stages (stage CRUD = the manage-pipeline right, enforced
+	// server-side; the old routes let any tenant user delete stages)
 	pipelineStages := rg.Group("/pipeline-stages")
+	pipelineStages.Use(h.perm.Require("crm", "lead", "read"))
 	{
 		pipelineStages.GET("", h.ListPipelineStages)
-		pipelineStages.POST("", h.CreatePipelineStage)
-		pipelineStages.PUT("/:id", h.UpdatePipelineStage)
-		pipelineStages.DELETE("/:id", h.DeletePipelineStage)
+		pipelineStages.POST("", h.perm.Require("crm", "pipeline", "create"), h.CreatePipelineStage)
+		pipelineStages.POST("/reorder", h.perm.Require("crm", "pipeline", "update"), h.ReorderPipelineStages)
+		pipelineStages.PUT("/:id", h.perm.Require("crm", "pipeline", "update"), h.UpdatePipelineStage)
+		pipelineStages.DELETE("/:id", h.perm.Require("crm", "pipeline", "delete"), h.DeletePipelineStage)
 	}
 
 	// Activities (CRM Activities)
 	activities := rg.Group("/activities")
+	activities.Use(h.perm.Require("crm", "activity", "read"))
 	{
 		activities.GET("", h.ListActivities)
-		activities.POST("", h.CreateActivity)
+		activities.POST("", h.perm.Require("crm", "activity", "create"), h.CreateActivity)
 		activities.GET("/stats", h.GetActivityStats)
 		activities.GET("/timeline", h.GetActivityTimeline)
 		activities.GET("/:id", h.GetActivity)
-		activities.PUT("/:id", h.UpdateActivity)
-		activities.DELETE("/:id", h.DeleteActivity)
+		activities.PUT("/:id", h.perm.Require("crm", "activity", "update"), h.UpdateActivity)
+		activities.DELETE("/:id", h.perm.Require("crm", "activity", "delete"), h.DeleteActivity)
 	}
 
 	// Tasks (CRM Tasks)
@@ -435,6 +482,13 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		inventory.GET("", h.ListInventory)
 		inventory.GET("/summary", h.GetInventorySummary)
+		// Single-call dashboard payload for the rebuilt Asosiy panel
+		// (tiles + 6-month value chart + category chart + low-stock +
+		// recent moves) — see inventory_stats.go
+		inventory.GET("/stats", h.GetInventoryStats)
+		// Tannarx usuli (AVECO/FIFO) — tenant-level, history-preserving
+		inventory.GET("/valuation-settings", h.GetInventoryValuationSettings)
+		inventory.PUT("/valuation-settings", h.perm.Require("inventory", "warehouse", "manage"), h.UpdateInventoryValuationSettings)
 		inventory.POST("/adjust", h.perm.Require("inventory", "stock", "adjust"), h.AdjustInventory)
 		inventory.POST("/transfer", h.perm.Require("inventory", "stock", "transfer"), h.TransferInventory)
 		inventory.GET("/movements", h.ListInventoryMovements)
@@ -2697,6 +2751,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		icTransfers.POST("/:id/approve", h.perm.Require("inventory", "stock", "transfer"), h.ApproveIntercompanyTransfer)
 		icTransfers.POST("/:id/ship", h.perm.Require("inventory", "stock", "transfer"), h.ShipIntercompanyTransfer)
 		icTransfers.POST("/:id/receive", h.perm.Require("inventory", "stock", "transfer"), h.ReceiveIntercompanyTransfer)
+		// Cancel returns in-transit stock to the source warehouse
+		icTransfers.POST("/:id/cancel", h.perm.Require("inventory", "stock", "transfer"), h.CancelIntercompanyTransfer)
 	}
 
 	// Intercompany Payments (Money)
