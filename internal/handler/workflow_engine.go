@@ -87,6 +87,10 @@ var workflowEventCatalog = map[string]workflowEventDef{
 		"record_id": "", "order_number": "PO-20260731-0003", "vendor_name": "Metall Servis", "total_amount": 15200000.0}},
 	"purchase_order.received": {Category: "purchase", RelatedType: "purchase_order", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "order_number": "PO-20260731-0003", "vendor_name": "Metall Servis"}},
+	"purchase_order.approval_required": {Category: "purchase", RelatedType: "purchase_order", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "order_number": "PO-20260731-0003", "vendor_name": "Metall Servis", "total_amount": 15200000.0}},
+	"purchase_order.delivery_overdue": {Category: "purchase", RelatedType: "purchase_order", Scheduled: true, SampleData: map[string]interface{}{
+		"record_id": "", "order_number": "PO-20260731-0003", "vendor_name": "Metall Servis", "expected_date": "2026-07-30", "days_overdue": 3}},
 	"employee.created": {Category: "hr", RelatedType: "employee", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "employee_name": "Dilshod Rahimov", "position": "Prorab"}},
 	"contracts.created": {Category: "contracts", RelatedType: "contract", Scheduled: false, SampleData: map[string]interface{}{
