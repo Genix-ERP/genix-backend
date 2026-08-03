@@ -6795,12 +6795,24 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		// and leave balance ≠ ledger — audit finding #1). 'internal' now
 		// moves stock too: the old guard excluded it, so internal transfer
 		// operations completed without touching inventory (audit finding #2).
-		// Skip if source SO already shipped (Sales page already deducted inventory)
+		// Skip if the SO's stock already left through another path. Checking only
+		// "SO fully shipped" left a hole: a PARTIAL sales-delivery keeps the SO at
+		// 'processing', and this legacy stock-op chain would then issue the same
+		// goods a second time (audit §2/§6) — so any validated DO also skips.
 		skipInventory := false
 		if op.SourceType != nil && *op.SourceType == "sales_order" && op.SourceID != nil {
 			var soStatus string
 			if err := h.db.QueryRow("SELECT status FROM sales_orders WHERE id = $1 AND tenant_id = $2", *op.SourceID, tenantID).Scan(&soStatus); err == nil {
 				if soStatus == "shipped" || soStatus == "delivered" {
+					skipInventory = true
+				}
+			}
+			if !skipInventory {
+				var shippedDOs int
+				if err := h.db.QueryRow(`
+					SELECT COUNT(*) FROM sales_delivery_orders
+					WHERE sales_order_id = $1 AND tenant_id = $2 AND status = 'shipped' AND deleted_at IS NULL`,
+					*op.SourceID, tenantID).Scan(&shippedDOs); err == nil && shippedDOs > 0 {
 					skipInventory = true
 				}
 			}

@@ -215,6 +215,7 @@ type CreateSalesOrderInput struct {
 	InternalNotes   string                      `json:"internal_notes,omitempty"`
 	WarehouseID     string                      `json:"warehouse_id,omitempty"`
 	SalesRepID      string                      `json:"sales_rep_id,omitempty"`
+	ContractID      string                      `json:"contract_id,omitempty"`
 	Lines           []CreateSalesOrderLineInput `json:"lines" binding:"required,min=1"`
 }
 
@@ -256,6 +257,7 @@ type UpdateSalesOrderInput struct {
 	SalesRepID      *string  `json:"sales_rep_id,omitempty"`
 	ProjectID       *string  `json:"project_id,omitempty"`
 	ProjectName     *string  `json:"project_name,omitempty"`
+	ContractID      *string  `json:"contract_id,omitempty"`
 	Status          *string  `json:"status,omitempty"`
 	PaymentStatus   *string  `json:"payment_status,omitempty"`
 }
@@ -279,7 +281,7 @@ type CreateSalesInvoiceInput struct {
 	OrganizationID  string                        `json:"organization_id,omitempty"`
 	SalesOrderID    string                        `json:"sales_order_id,omitempty"`
 	InvoiceDate     string                        `json:"invoice_date" binding:"required"`
-	DueDate         string                        `json:"due_date" binding:"required"`
+	DueDate         string                        `json:"due_date"` // optional: computed from the customer's payment term when omitted
 	BillingAddress  *Address                      `json:"billing_address,omitempty"`
 	ShippingAddress *Address                      `json:"shipping_address,omitempty"`
 	CurrencyID      string                        `json:"currency_id,omitempty"`

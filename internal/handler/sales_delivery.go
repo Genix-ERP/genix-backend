@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,6 +13,29 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+var (
+	errDeliveryAlreadyProcessed = errors.New("delivery order already validated or cancelled")
+	errOverDelivery             = errors.New("over-delivery: shipped quantity would exceed ordered quantity")
+)
+
+// nextDeliveryNumber generates DO##### from the numeric MAX per tenant. The old
+// COUNT(*)+1 raced under concurrency and reused numbers after soft-deletes; the
+// regex filter keeps legacy timestamp-style numbers (DO-YYYYMMDD...) out of the MAX.
+func nextDeliveryNumber(q interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+}, tenantID uuid.UUID) string {
+	var n int64
+	_ = q.QueryRow(`
+		SELECT COALESCE(MAX(CAST(SUBSTRING(delivery_number FROM 3) AS BIGINT)), 0) + 1
+		FROM sales_delivery_orders
+		WHERE tenant_id = $1 AND delivery_number ~ '^DO[0-9]+$'`,
+		tenantID).Scan(&n)
+	if n < 1 {
+		n = 1
+	}
+	return fmt.Sprintf("DO%05d", n)
+}
 
 // ListDeliveryOrders returns paginated list of sales delivery orders
 func (h *Handler) ListDeliveryOrders(c *gin.Context) {
@@ -268,9 +292,7 @@ func (h *Handler) CreateDeliveryOrder(c *gin.Context) {
 
 	// Generate delivery number
 	now := time.Now()
-	var doCount int
-	h.db.QueryRow("SELECT COUNT(*) FROM sales_delivery_orders WHERE tenant_id = $1", tenantID).Scan(&doCount)
-	deliveryNumber := fmt.Sprintf("DO%05d", doCount+1)
+	deliveryNumber := nextDeliveryNumber(h.db, tenantID)
 
 	// Use provided warehouse or SO warehouse
 	warehouseID := input.WarehouseID
@@ -387,6 +409,10 @@ func (h *Handler) GetDeliveryOrder(c *gin.Context) {
 	doID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid delivery order ID")
+		return
+	}
+	if !h.salesOrgScopeOK(c, "sales_delivery_orders", doID, tenantID) {
+		response.NotFound(c, "Delivery order")
 		return
 	}
 
@@ -541,6 +567,10 @@ func (h *Handler) UpdateDeliveryOrder(c *gin.Context) {
 		response.BadRequest(c, "Invalid delivery order ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_delivery_orders", doID, tenantID) {
+		response.NotFound(c, "Delivery order")
+		return
+	}
 
 	var input struct {
 		DeliveryDate   string `json:"delivery_date"`
@@ -652,6 +682,10 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		response.BadRequest(c, "Invalid delivery order ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_delivery_orders", doID, tenantID) {
+		response.NotFound(c, "Delivery order")
+		return
+	}
 
 	// Get delivery order details
 	var currentStatus string
@@ -761,9 +795,11 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 
 		var qtyAvailable float64
 		var productName string
-		// Sum available quantity across all inventory records for this product+warehouse (handles multiple lots/serials)
+		// On-hand, NOT quantity_available: this order's own confirm-time reservation
+		// sits in quantity_reserved, so "available" would block the very order the
+		// stock is reserved FOR. The hard floor stays applyStockDelta (on-hand >= 0).
 		err := h.db.QueryRow(`
-			SELECT COALESCE(SUM(i.quantity_available), 0), COALESCE(MAX(p.name), 'Unknown')
+			SELECT COALESCE(SUM(i.quantity_on_hand), 0), COALESCE(MAX(p.name), 'Unknown')
 			FROM products p
 			LEFT JOIN inventory i ON i.product_id = p.id AND i.tenant_id = p.tenant_id AND i.warehouse_id = $3
 			WHERE p.id = $1 AND p.tenant_id = $2
@@ -834,8 +870,10 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		var qtyOnHand, qtyAvailable, unitCost float64
 		var productName string
 
+		// quantity_available intentionally replaced by on-hand here too — see the
+		// pre-check note above (own reservation must not block own shipment).
 		err := h.db.QueryRow(`
-			SELECT i.id, i.quantity_on_hand, COALESCE(i.quantity_available, i.quantity_on_hand), i.unit_cost, COALESCE(p.name, 'Unknown')
+			SELECT i.id, i.quantity_on_hand, i.quantity_on_hand, i.unit_cost, COALESCE(p.name, 'Unknown')
 			FROM inventory i
 			JOIN products p ON p.id = i.product_id AND p.tenant_id = i.tenant_id
 			WHERE i.tenant_id = $1 AND i.product_id = $2 AND i.warehouse_id = $3
@@ -949,6 +987,20 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		}
 		defer tx.Rollback()
 
+		// Atomic claim: flip the status INSIDE the stock transaction. Two concurrent
+		// validates both used to pass the plain status read at the top of the handler
+		// and ship twice (audit §5); the second one now sees 0 rows and aborts.
+		claimRes, claimErr := tx.Exec(`
+			UPDATE sales_delivery_orders SET status = 'shipped', updated_at = $1
+			WHERE id = $2 AND tenant_id = $3 AND status IN ('draft','ready')`,
+			now, doID, tenantID)
+		if claimErr != nil {
+			return claimErr
+		}
+		if n, _ := claimRes.RowsAffected(); n == 0 {
+			return errDeliveryAlreadyProcessed
+		}
+
 		for _, action := range actions {
 			if action.QtyToShip <= 0 {
 				continue
@@ -1025,10 +1077,38 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 				TxType: "issue", RefType: "sales_delivery", RefID: doID.String(),
 				Reason: "Sales Delivery", FromWH: &whID,
 				CreatedBy: userID, When: now,
-				AllowNeg: true, // backorders may legitimately go negative
+				// The pre-check above 422s (or, with ?partial, clamps to available), so a
+				// negative here means a concurrent movement won the race — fail, don't drift.
+				AllowNeg: false,
 			})
 			if dErr != nil {
 				return dErr
+			}
+
+			// Over-delivery guard on the order line, enforced in the SAME transaction as
+			// the stock movement: two pre-created DOs each carrying the full remaining
+			// quantity can no longer both ship it (audit §2, §10).
+			if action.Line.SOLineID.Valid {
+				clampRes, clampErr := tx.Exec(`
+					UPDATE sales_order_lines
+					SET quantity_delivered = COALESCE(quantity_delivered, 0) + $1, updated_at = $2
+					WHERE id = $3 AND COALESCE(quantity_delivered, 0) + $1 <= quantity + 0.0001`,
+					action.QtyToShip, now, action.Line.SOLineID.String)
+				if clampErr != nil {
+					return clampErr
+				}
+				if n, _ := clampRes.RowsAffected(); n == 0 {
+					return fmt.Errorf("%w: order line %s", errOverDelivery, action.Line.SOLineID.String)
+				}
+			}
+
+			// Release the confirm-time reservation for what actually shipped
+			// (floored at zero — pre-reservation orders have nothing booked).
+			if _, rErr := tx.Exec(`
+				UPDATE inventory SET quantity_reserved = GREATEST(0, quantity_reserved - $1), updated_at = $2
+				WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5`,
+				action.QtyToShip, now, tenantID, action.Line.ProductID, whID); rErr != nil {
+				return rErr
 			}
 
 			// FIFO only: roll product cost_price forward to the next
@@ -1063,7 +1143,16 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 	}()
 	if shipErr != nil {
 		h.log.Error("Delivery stock movement failed; NOTHING moved", "error", shipErr, "do_id", doID)
-		response.InternalError(c, "Failed to apply stock movement for delivery")
+		switch {
+		case errors.Is(shipErr, errDeliveryAlreadyProcessed):
+			response.BadRequest(c, "ALREADY_SHIPPED: delivery order was already validated")
+		case errors.Is(shipErr, errOverDelivery):
+			response.BadRequest(c, "OVER_DELIVERY: shipped quantity would exceed the ordered quantity")
+		case errors.Is(shipErr, errInsufficientStock):
+			c.JSON(422, gin.H{"success": false, "error": gin.H{"code": "INSUFFICIENT_STOCK", "message": "Insufficient stock for delivery"}})
+		default:
+			response.InternalError(c, "Failed to apply stock movement for delivery")
+		}
 		return
 	}
 
@@ -1114,18 +1203,8 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 			h.log.Error("Failed to update DO line", "error", err)
 		}
 
-		// Update SO line quantity_delivered
-		if action.Line.SOLineID.Valid {
-			_, err = h.db.Exec(`
-				UPDATE sales_order_lines
-				SET quantity_delivered = COALESCE(quantity_delivered, 0) + $1,
-					updated_at = $2
-				WHERE id = $3
-			`, action.QtyToShip, now, action.Line.SOLineID.String)
-			if err != nil {
-				h.log.Error("Failed to update SO line", "error", err)
-			}
-		}
+		// SO line quantity_delivered is updated inside the stock transaction above
+		// (with the over-delivery clamp) — not repeated here.
 	}
 
 	// For lines with 0 qty to ship in partial mode, remove them from this DO
@@ -1138,23 +1217,12 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 		}
 	}
 
-	// Update DO status to shipped
-	_, err = h.db.Exec(`
-		UPDATE sales_delivery_orders
-		SET status = 'shipped', updated_at = $1
-		WHERE id = $2
-	`, now, doID)
-	if err != nil {
-		response.InternalError(c, "Failed to update delivery order status")
-		return
-	}
+	// DO status was already flipped to 'shipped' by the atomic claim inside the stock tx.
 
 	// Create backorder DO if partial delivery
 	var backorderNumber string
 	if isPartial && hasBackorder {
-		var doCount int
-		h.db.QueryRow("SELECT COUNT(*) FROM sales_delivery_orders WHERE tenant_id = $1", tenantID).Scan(&doCount)
-		backorderNumber = fmt.Sprintf("DO%05d", doCount+1)
+		backorderNumber = nextDeliveryNumber(h.db, tenantID)
 
 		backorderID := uuid.New()
 
@@ -1174,7 +1242,7 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $10, $11, $12, $13, 'draft', $14, $9, $9)
 		`, backorderID, tenantID, orgID, backorderNumber, salesOrderID, soNumber,
 			customerID, customerName, now, warehouseID, shippingMethod, carrier,
-			sql.NullString{String: "Kutilmoqda: qoldiq yetkazma / Backorder from " + fmt.Sprintf("DO%05d", doCount), Valid: true},
+			sql.NullString{String: "Kutilmoqda: qoldiq yetkazma / Backorder from DO " + doID.String()[:8], Valid: true},
 			createdBy)
 
 		if err != nil {
@@ -1257,6 +1325,10 @@ func (h *Handler) CancelDeliveryOrder(c *gin.Context) {
 	doID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid delivery order ID")
+		return
+	}
+	if !h.salesOrgScopeOK(c, "sales_delivery_orders", doID, tenantID) {
+		response.NotFound(c, "Delivery order")
 		return
 	}
 

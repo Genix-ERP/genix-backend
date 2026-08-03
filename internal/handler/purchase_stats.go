@@ -247,3 +247,101 @@ func (h *Handler) GetPurchaseOrderStats(c *gin.Context) {
 		"upcoming_deliveries": upcoming,
 	})
 }
+
+// GetSupplierKPIs — GET /purchase-orders/supplier-kpis. One row per supplier
+// with the aggregates the Yetkazib beruvchilar surfaces need: total spend,
+// open pipeline, AP balance (GL 6010 by contact — the akt-sverka source),
+// average delivery days (order_date → completed GR receipt_date), on-time
+// rate against expected_date, returns count and the manual rating. The old
+// SupplierPerformance tab recomputed a subset of this client-side over the
+// whole PO list; its issues/lead-time columns were structurally empty.
+func (h *Handler) GetSupplierKPIs(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	var orgArg interface{}
+	if orgID, okOrg := middleware.GetOrganizationID(c); okOrg && orgID != uuid.Nil {
+		orgArg = orgID
+	}
+
+	type supplierKPI struct {
+		VendorID        uuid.UUID  `json:"vendor_id"`
+		Name            string     `json:"name"`
+		TotalSpend      float64    `json:"total_spend"`
+		OrdersCount     int        `json:"orders_count"`
+		OpenPOs         int        `json:"open_pos"`
+		OpenAmount      float64    `json:"open_amount"`
+		APBalance       float64    `json:"ap_balance"`
+		AvgDeliveryDays *float64   `json:"avg_delivery_days"`
+		OnTimeRate      *float64   `json:"on_time_rate"`
+		ReturnsCount    int        `json:"returns_count"`
+		Rating          *float64   `json:"rating"`
+		LastOrderDate   *time.Time `json:"last_order_date"`
+	}
+
+	kpis := []supplierKPI{}
+	rows, err := h.db.Query(`
+		SELECT ct.id, ct.name,
+		       COALESCE(agg.total_spend, 0), COALESCE(agg.orders_count, 0),
+		       COALESCE(agg.open_pos, 0), COALESCE(agg.open_amount, 0),
+		       COALESCE(ap.balance, 0),
+		       gr.avg_days, gr.on_time_rate,
+		       COALESCE(ret.cnt, 0), perf.rating, agg.last_order_date
+		FROM contacts ct
+		LEFT JOIN LATERAL (
+			SELECT SUM(po.total_amount) FILTER (WHERE po.status != 'cancelled') AS total_spend,
+			       COUNT(*) FILTER (WHERE po.status != 'cancelled') AS orders_count,
+			       COUNT(*) FILTER (WHERE po.status IN `+openPOStatuses+`) AS open_pos,
+			       SUM(po.total_amount) FILTER (WHERE po.status IN `+openPOStatuses+`) AS open_amount,
+			       MAX(po.order_date) FILTER (WHERE po.status != 'cancelled') AS last_order_date
+			FROM purchase_orders po
+			WHERE po.vendor_id = ct.id AND po.tenant_id = $1 AND po.deleted_at IS NULL
+			  AND ($2::uuid IS NULL OR po.organization_id = $2)
+		) agg ON true
+		LEFT JOIN LATERAL (
+			SELECT SUM(jel.credit_amount - jel.debit_amount) AS balance
+			FROM journal_entry_lines jel
+			JOIN journal_entries je ON je.id = jel.journal_entry_id AND je.status = 'posted'
+			JOIN accounts a ON a.id = jel.account_id
+			WHERE je.tenant_id = $1 AND jel.contact_id = ct.id AND a.code = '6010'
+			  AND ($2::uuid IS NULL OR je.organization_id = $2)
+		) ap ON true
+		LEFT JOIN LATERAL (
+			SELECT AVG(g.receipt_date::date - po.order_date::date)::float AS avg_days,
+			       (COUNT(*) FILTER (WHERE po.expected_date IS NULL OR g.receipt_date::date <= po.expected_date::date))::float
+			           / NULLIF(COUNT(*), 0) * 100 AS on_time_rate
+			FROM goods_receipts g
+			JOIN purchase_orders po ON po.id = g.purchase_order_id
+			WHERE g.supplier_id = ct.id AND g.tenant_id = $1
+			  AND g.status = 'completed' AND g.deleted_at IS NULL
+		) gr ON true
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS cnt FROM purchase_returns pr
+			WHERE pr.supplier_id = ct.id AND pr.tenant_id = $1 AND pr.deleted_at IS NULL
+			  AND pr.status NOT IN ('cancelled', 'rejected')
+		) ret ON true
+		LEFT JOIN LATERAL (
+			SELECT AVG(sp.overall_rating)::float AS rating FROM supplier_performance sp
+			WHERE sp.vendor_id = ct.id AND sp.tenant_id = $1
+		) perf ON true
+		WHERE ct.tenant_id = $1 AND ct.type IN ('vendor', 'both') AND ct.deleted_at IS NULL
+		ORDER BY COALESCE(agg.total_spend, 0) DESC, ct.name ASC
+	`, tenantID, orgArg)
+	if err != nil {
+		h.log.Error("Failed to load supplier KPIs", "error", err)
+		response.InternalError(c, "Failed to load supplier KPIs")
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k supplierKPI
+		if rows.Scan(&k.VendorID, &k.Name, &k.TotalSpend, &k.OrdersCount, &k.OpenPOs, &k.OpenAmount,
+			&k.APBalance, &k.AvgDeliveryDays, &k.OnTimeRate, &k.ReturnsCount, &k.Rating, &k.LastOrderDate) == nil {
+			kpis = append(kpis, k)
+		}
+	}
+
+	response.Success(c, kpis)
+}

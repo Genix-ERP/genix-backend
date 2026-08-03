@@ -243,6 +243,103 @@ class TestStatsEndpoint:
         assert any(r["order_number"] for r in data["recent_orders"])
 
 
+class TestSupplierKPIs:
+    def test_contract_and_spend_visibility(self, api_client, db_read, test_supplier, warehouse_id):
+        product_id = _make_product(api_client, uuid.uuid4().hex[:6].upper())
+        _create_po(api_client, test_supplier["id"], warehouse_id, product_id, qty=2, price=70000)
+
+        resp = api_client.get("/purchase-orders/supplier-kpis")
+        assert resp.status_code == 200, resp.text
+        rows = resp.json()["data"]
+        assert isinstance(rows, list) and rows
+
+        mine = next((r for r in rows if r["vendor_id"] == test_supplier["id"]), None)
+        assert mine is not None, "test supplier missing from KPI list"
+        for key in ("total_spend", "orders_count", "open_pos", "open_amount",
+                    "ap_balance", "avg_delivery_days", "on_time_rate", "returns_count"):
+            assert key in mine, f"missing {key}"
+        assert mine["total_spend"] >= 140000
+
+
+class TestDirectorSummaryPurchases:
+    def test_purchase_fields_present(self, api_client):
+        resp = api_client.get("/reports/director-summary")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        companies = data.get("companies") or data.get("organizations") or data
+        if isinstance(companies, dict):
+            companies = list(companies.values())
+        assert isinstance(companies, list) and companies, f"unexpected shape: {type(companies)}"
+        row = companies[0]
+        for key in ("purchases_period_total", "purchases_period_count",
+                    "purchase_ap_total", "purchase_overdue_deliveries"):
+            assert key in row, f"missing {key} in director summary"
+
+
+class TestObjectCost:
+    def test_receipt_writes_construction_expense_line(self, api_client, db_read, test_supplier, warehouse_id):
+        import psycopg2.extras
+
+        # A minimal construction project via SQL (BIGSERIAL PK; the projects
+        # API needs a longer setup than this invariant deserves).
+        db_read.execute(
+            """INSERT INTO construction_projects (tenant_id, code, name, status)
+               VALUES (%s, %s, 'XARIDTEST obyekt', 'active')
+               RETURNING id""",
+            (api_client.tenant_id, f"XRD-OBJ-{uuid.uuid4().hex[:6].upper()}"),
+        )
+        project_id = db_read.fetchone()["id"]
+
+        product_id = _make_product(api_client, uuid.uuid4().hex[:6].upper())
+        resp = api_client.post("/purchase-orders", json={
+            "vendor_id": test_supplier["id"],
+            "warehouse_id": warehouse_id,
+            "construction_project_id": project_id,
+            "lines": [{
+                "product_id": product_id,
+                "description": "Obyekt uchun material",
+                "quantity": 4,
+                "unit_price": 30000,
+            }],
+        })
+        assert resp.status_code in (200, 201), resp.text
+        po = resp.json()["data"]
+
+        api_client.post(f"/purchase-orders/{po['id']}/approve")
+        line_id = str(_line_rows(db_read, po["id"])[0]["id"])
+        r = api_client.post(f"/purchase-orders/{po['id']}/receive", json={
+            "lines": [{"line_id": line_id, "quantity_received": 4}],
+        })
+        assert r.status_code == 200, r.text
+
+        db_read.execute(
+            """SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS n
+               FROM construction_expense_lines
+               WHERE tenant_id = %s AND project_id = %s AND product_id = %s
+                 AND deleted_at IS NULL""",
+            (api_client.tenant_id, project_id, product_id),
+        )
+        row = db_read.fetchone()
+        assert row["n"] == 1, "receipt must write exactly one object-cost row"
+        assert float(row["total"]) == 4 * 30000
+
+    def test_unlinked_po_writes_no_object_cost(self, api_client, db_read, test_supplier, warehouse_id):
+        product_id = _make_product(api_client, uuid.uuid4().hex[:6].upper())
+        po = _create_po(api_client, test_supplier["id"], warehouse_id, product_id, qty=2)
+        api_client.post(f"/purchase-orders/{po['id']}/approve")
+        line_id = str(_line_rows(db_read, po["id"])[0]["id"])
+        api_client.post(f"/purchase-orders/{po['id']}/receive", json={
+            "lines": [{"line_id": line_id, "quantity_received": 2}],
+        })
+
+        db_read.execute(
+            """SELECT COUNT(*) AS n FROM construction_expense_lines
+               WHERE tenant_id = %s AND product_id = %s""",
+            (api_client.tenant_id, product_id),
+        )
+        assert db_read.fetchone()["n"] == 0
+
+
 class TestStatusConstraint:
     def test_unknown_status_refused_by_db(self, db_read, api_client, test_supplier, warehouse_id):
         product_id = _make_product(api_client, uuid.uuid4().hex[:6].upper())

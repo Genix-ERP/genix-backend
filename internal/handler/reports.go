@@ -532,11 +532,16 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 	}
 	netIncome := preTaxProfit - incomeTax
 	totalExpenses := totalCOGS + totalOpex + totalOtherExpenses
+	// total_revenue includes other income so the published fields stay an
+	// identity: net = total_revenue − total_expenses − income_tax. Before, a
+	// disposal gain (9310) broke that contract — it was in net but not in
+	// total_revenue (surfaced by the Aktivlar disposal tests, 2026-08-03).
+	totalIncome := totalRevenue + totalOtherIncome
 
 	report := entity.IncomeStatementReport{
 		PeriodFrom:        periodFrom,
 		PeriodTo:          periodTo,
-		TotalRevenue:      math.Round(totalRevenue*100) / 100,
+		TotalRevenue:      math.Round(totalIncome*100) / 100,
 		TotalExpenses:     math.Round(totalExpenses*100) / 100,
 		GrossProfit:       math.Round(grossProfit*100) / 100,
 		OperatingProfit:   math.Round(operatingProfit*100) / 100,
@@ -2016,6 +2021,11 @@ type directorCompanySummary struct {
 	ActiveContractsValue float64 `json:"active_contracts_value"`
 	ExpiringContracts    int     `json:"expiring_contracts"`
 	ContractsOutstanding float64 `json:"contracts_outstanding"`
+	// Xarid aggregates (davr xaridi, ta'minotchi AP, kechikkan yetkazmalar)
+	PurchasesPeriodTotal      float64 `json:"purchases_period_total"`
+	PurchasesPeriodCount      int     `json:"purchases_period_count"`
+	PurchaseAPTotal           float64 `json:"purchase_ap_total"`
+	PurchaseOverdueDeliveries int     `json:"purchase_overdue_deliveries"`
 	// CRM aggregates (open pipeline, bu oy yutilgan, konversiya %)
 	CRMOpenLeads     int     `json:"crm_open_leads"`
 	CRMPipelineValue float64 `json:"crm_pipeline_value"`
@@ -2541,6 +2551,64 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		contractRows.Close()
 	}
 
+	// 9b. Xarid aggregates per org — davr xaridi (tanlangan period oynasida),
+	// kechikkan yetkazmalar; AP alohida so'rovda GL 6010 dan.
+	poAggRows, err := h.db.Query(`
+		SELECT po.organization_id,
+		       COALESCE(SUM(po.total_amount) FILTER (WHERE po.order_date >= $2 AND po.order_date < $3), 0),
+		       COUNT(*) FILTER (WHERE po.order_date >= $2 AND po.order_date < $3),
+		       COUNT(*) FILTER (WHERE po.status IN ('approved', 'ordered', 'partial')
+		           AND po.expected_date IS NOT NULL AND po.expected_date < CURRENT_DATE)
+		FROM purchase_orders po
+		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL AND po.status != 'cancelled'
+		  AND po.organization_id IS NOT NULL
+		GROUP BY po.organization_id`,
+		tenantID, rangeStart, rangeEnd,
+	)
+	if err == nil {
+		for poAggRows.Next() {
+			var orgID uuid.UUID
+			var total float64
+			var count, overdue int
+			if err := poAggRows.Scan(&orgID, &total, &count, &overdue); err != nil {
+				continue
+			}
+			s := touch(orgID.String())
+			if s == nil {
+				continue
+			}
+			s.PurchasesPeriodTotal = total
+			s.PurchasesPeriodCount = count
+			s.PurchaseOverdueDeliveries = overdue
+		}
+		poAggRows.Close()
+	}
+
+	// Supplier AP from posted GL lines on 6010 (same source as
+	// /purchase-orders/stats — NOT contacts.current_balance).
+	apRows, err := h.db.Query(`
+		SELECT je.organization_id, COALESCE(SUM(jel.credit_amount - jel.debit_amount), 0)
+		FROM journal_entry_lines jel
+		JOIN journal_entries je ON je.id = jel.journal_entry_id AND je.status = 'posted'
+		JOIN accounts a ON a.id = jel.account_id
+		WHERE je.tenant_id = $1 AND a.code = '6010' AND je.organization_id IS NOT NULL
+		GROUP BY je.organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for apRows.Next() {
+			var orgID uuid.UUID
+			var ap float64
+			if err := apRows.Scan(&orgID, &ap); err != nil {
+				continue
+			}
+			if s := touch(orgID.String()); s != nil {
+				s.PurchaseAPTotal = ap
+			}
+		}
+		apRows.Close()
+	}
+
 	// 10. CRM aggregates per org — ochiq voronka (soni + summasi), bu oy
 	// yutilganlar, umumiy konversiya %, eng ko'p yo'qotish sababi.
 	crmRows, err := h.db.Query(`
@@ -2646,9 +2714,62 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		totPayrollUnpaid += s.PayrollUnpaid
 	}
 
+	// Savdo bloki (savdo-audit §6.7): the director previously saw revenue (GL) and
+	// debtors, but no order flow at all — a confirmed-but-uninvoiced order was
+	// invisible. Period scope matches the report's selected range.
+	var salesOrdersCount, salesOverdueCount int
+	var salesOrdersSum, salesOverdueSum float64
+	h.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(total_amount), 0)
+		FROM sales_orders
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		  AND status NOT IN ('cancelled', 'quotation')
+		  AND order_date >= $2 AND order_date < $3`,
+		tenantID, rangeStart, rangeEnd).Scan(&salesOrdersCount, &salesOrdersSum)
+	h.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(amount_due), 0)
+		FROM sales_invoices
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		  AND status IN ('sent', 'partial', 'overdue') AND amount_due > 0
+		  AND due_date < CURRENT_DATE`,
+		tenantID).Scan(&salesOverdueCount, &salesOverdueSum)
+
+	// Aktivlar bloki (aktivlar-audit §10): the director saw no fixed-asset
+	// numbers at all — NBV, this-month depreciation and the fleet status were
+	// invisible outside the GL expense total.
+	var assetsCount, assetsInService, assetsConserved int
+	var assetsCost, assetsBook float64
+	h.db.QueryRow(`
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE status = 'in_service'),
+		       COUNT(*) FILTER (WHERE status = 'conserved'),
+		       COALESCE(SUM(cost) FILTER (WHERE status <> 'disposed'), 0),
+		       COALESCE(SUM(cost - accumulated_depreciation) FILTER (WHERE status <> 'disposed'), 0)
+		FROM fa_assets WHERE tenant_id = $1 AND deleted_at IS NULL`,
+		tenantID).Scan(&assetsCount, &assetsInService, &assetsConserved, &assetsCost, &assetsBook)
+	var assetsMonthDepr float64
+	h.db.QueryRow(`
+		SELECT COALESCE(SUM(amount), 0) FROM fa_depreciation_entries
+		WHERE tenant_id = $1 AND status = 'active' AND journal_entry_id IS NOT NULL
+		  AND period = to_char(NOW(), 'YYYY-MM')`, tenantID).Scan(&assetsMonthDepr)
+
 	response.Success(c, gin.H{
 		"companies":    companies,
 		"month_labels": labels,
+		"sales": gin.H{
+			"orders_count":        salesOrdersCount,
+			"orders_sum":          round2(salesOrdersSum),
+			"overdue_invoices":    salesOverdueCount,
+			"overdue_receivables": round2(salesOverdueSum),
+		},
+		"assets": gin.H{
+			"total_count":        assetsCount,
+			"in_service":         assetsInService,
+			"conserved":          assetsConserved,
+			"total_cost":         round2(assetsCost),
+			"total_book_value":   round2(assetsBook),
+			"month_depreciation": round2(assetsMonthDepr),
+		},
 		"totals": gin.H{
 			"revenue":          round2(totRev),
 			"expenses":         round2(totExp),

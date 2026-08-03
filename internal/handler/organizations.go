@@ -995,6 +995,8 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		{"0200", "Asosiy vositalar eskirishi", "CONTRA_ASSET", false, false, false, "Yig'ilgan eskirish"},
 		{"0220", "Bino va inshootlarning eskirishi", "CONTRA_ASSET", false, false, false, "Bino va inshootlar eskirishi"},
 		{"0230", "Mashina va asbob-uskunalarning eskirishi", "CONTRA_ASSET", false, false, false, "Mashina uskunalar eskirishi"},
+		{"0240", "Mebel va ofis jihozlarining eskirishi", "CONTRA_ASSET", false, false, false, "Mebel va jihozlar eskirishi"},
+		{"0250", "Kompyuter jihozlarining eskirishi", "CONTRA_ASSET", false, false, false, "Kompyuter jihozlari eskirishi"},
 		{"0260", "Transport vositalarining eskirishi", "CONTRA_ASSET", false, false, false, "Transport eskirishi"},
 
 		// Nomoddiy aktivlar (04xx)
@@ -1075,6 +1077,7 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		{"9540", "Valyuta kursi farqlaridan daromadlar", "OTHER_INC", false, false, false, "Valyuta ayirboshlash bo'yicha foyda"},
 
 		// Xarajatlar (91xx-96xx)
+		{"9210", "Asosiy vositalarning chiqib ketishi", "OTHER_EXP", false, false, false, "Aktiv chiqib ketishi tranzit hisobi"},
 		{"9110", "Sotilgan tayyor mahsulot tannarxi", "COGS", false, false, false, "Sotilgan tovarlarning to'g'ridan-to'g'ri tannarxi"},
 		{"9120", "Sotilgan tovarlar tannarxi", "COGS", false, false, false, "Ishlatilgan xom ashyo tannarxi"},
 		{"9130", "Ishlab chiqarish xarajatlari", "COGS", false, false, false, "Bevosita mehnat xarajatlari"},

@@ -962,6 +962,16 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 				}()
 				if grErr != nil {
 					h.log.Error("Goods receipt stock movement failed; NOTHING moved", "error", grErr, "gr_id", grID)
+				} else if purchaseOrderID != uuid.Nil {
+					// Object cost: PO linked to a construction project
+					// contributes each accepted line (migration 450).
+					costLines := make([]poCostLine, 0, len(grInvLines))
+					for _, l := range grInvLines {
+						costLines = append(costLines, poCostLine{
+							ProductID: l.ProductID, Qty: l.AcceptedQty, UnitPrice: l.UnitPrice,
+						})
+					}
+					h.addPOReceiptToObjectCost(tenantID, purchaseOrderID, costLines, grUserID)
 				}
 			}
 		}

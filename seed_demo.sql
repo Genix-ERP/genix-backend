@@ -777,12 +777,9 @@ BEGIN
     (gen_random_uuid(), pay7, 'purchase_invoice', pi4, 5600000,  NOW());
 
     -- ============================================================================
-    -- 14. FIXED ASSETS
+    -- 14. FIXED ASSETS — moved to the unified v2 register (fa_assets); see the
+    --     "AKTIVLAR v2 DEMO" DO block at the end of this file (2026-08-03).
     -- ============================================================================
-    INSERT INTO fixed_assets (id, tenant_id, organization_id, asset_code, name, description, category_name, acquisition_date, acquisition_cost, salvage_value, useful_life_months, depreciation_method, accumulated_depreciation, book_value, location, status, created_by, created_at, updated_at) VALUES
-    (fa1, v_tenant_id, v_org_id, 'FA-001', 'Office Building',  'Main office building',            'Buildings',  '2025-01-01', 300000000, 30000000, 240, 'straight_line', 15000000, 285000000, 'Tashkent', 'active', v_user_id, NOW(), NOW()),
-    (fa2, v_tenant_id, v_org_id, 'FA-002', 'Delivery Truck',   'Isuzu NPR delivery truck',        'Vehicles',   '2025-06-01', 120000000, 12000000, 120, 'straight_line', 9000000,  111000000, 'Tashkent', 'active', v_user_id, NOW(), NOW()),
-    (fa3, v_tenant_id, v_org_id, 'FA-003', 'Server Equipment', 'Dell PowerEdge R750 server rack', 'Equipment',  '2025-09-01', 80000000,  8000000,  60,  'straight_line', 8000000,  72000000,  'Tashkent', 'active', v_user_id, NOW(), NOW());
 
     -- ============================================================================
     -- 22. INVENTORY TRANSACTIONS (stock movements)
@@ -1483,5 +1480,112 @@ BEGIN
     FROM leads l WHERE l.tenant_id = v_tid AND l.notes = 'CRM demo seed' AND (l.won_at IS NOT NULL OR l.lost_at IS NOT NULL);
 
     RAISE NOTICE '  CRM demo seed tayyor: 9 ochiq + 2 yutilgan + 3 yo''qotilgan lid';
+END;
+$$;
+
+-- ============================================================================
+-- AKTIVLAR v2 DEMO — unified fixed-asset register (2026-08-03 rebuild).
+-- 7 construction assets across every status, 3 posted depreciation periods,
+-- one sale-disposal. Idempotent: wipes and re-seeds the demo tenant's fa_* data.
+-- ============================================================================
+DO $$
+DECLARE
+    v_tid   UUID;
+    v_org   UUID;
+    v_user  UUID;
+    cat_mach UUID; cat_veh UUID; cat_comp UUID; cat_furn UUID;
+    dep_prod UUID; dep_admin UUID;
+    a_eks UUID := gen_random_uuid();  -- ekskavator (in_service)
+    a_kran UUID := gen_random_uuid(); -- avtokran (in_service)
+    a_miks UUID := gen_random_uuid(); -- beton mikser (conserved)
+    a_kamaz UUID := gen_random_uuid();-- samosval (in_service)
+    a_damas UUID := gen_random_uuid();-- eski Damas (disposed / sotilgan)
+    a_comp UUID := gen_random_uuid(); -- ofis kompyuterlari (in_service)
+    a_kran2 UUID := gen_random_uuid();-- yangi minora kran (draft)
+    r_may UUID := gen_random_uuid();
+    r_jun UUID := gen_random_uuid();
+    r_jul UUID := gen_random_uuid();
+BEGIN
+    SELECT u.tenant_id INTO v_tid FROM users u WHERE u.email = 'demo@genixerp.com' LIMIT 1;
+    IF v_tid IS NULL THEN
+        SELECT id INTO v_tid FROM tenants WHERE name = 'Demo Company' ORDER BY created_at LIMIT 1;
+    END IF;
+    IF v_tid IS NULL THEN
+        RAISE NOTICE 'Demo tenant topilmadi — Aktivlar v2 seed o''tkazib yuborildi';
+        RETURN;
+    END IF;
+    SELECT id INTO v_org  FROM organizations WHERE tenant_id = v_tid AND deleted_at IS NULL ORDER BY created_at LIMIT 1;
+    SELECT id INTO v_user FROM users WHERE tenant_id = v_tid ORDER BY created_at LIMIT 1;
+
+    SELECT id INTO cat_mach FROM fa_categories WHERE tenant_id = v_tid AND code = 'machinery';
+    SELECT id INTO cat_veh  FROM fa_categories WHERE tenant_id = v_tid AND code = 'vehicles';
+    SELECT id INTO cat_comp FROM fa_categories WHERE tenant_id = v_tid AND code = 'computers';
+    SELECT id INTO cat_furn FROM fa_categories WHERE tenant_id = v_tid AND code = 'furniture';
+    SELECT id INTO dep_prod  FROM fa_departments WHERE tenant_id = v_tid AND code = 'production';
+    SELECT id INTO dep_admin FROM fa_departments WHERE tenant_id = v_tid AND code = 'admin';
+    IF cat_mach IS NULL OR dep_prod IS NULL THEN
+        RAISE NOTICE 'fa_categories/fa_departments seedi yo''q — Aktivlar v2 seed o''tkazib yuborildi';
+        RETURN;
+    END IF;
+
+    DELETE FROM fa_depreciation_entries WHERE tenant_id = v_tid;
+    DELETE FROM fa_depreciation_runs    WHERE tenant_id = v_tid;
+    DELETE FROM fa_assets               WHERE tenant_id = v_tid;
+    INSERT INTO fa_number_counters (tenant_id, next_inventory) VALUES (v_tid, 8)
+        ON CONFLICT (tenant_id) DO UPDATE SET next_inventory = 8;
+
+    -- Assets. Monthly straight-line accruals (cost/life, salvage 0 for round
+    -- numbers): eks 8M, kran 6.25M, kamaz 3.5M, damas 1.2M, comp 1.5M.
+    -- accumulated = seeded posted entries below.
+    INSERT INTO fa_assets (id, tenant_id, organization_id, inventory_number, name, category_id, department_id,
+        serial_number, location, purchase_date, commissioning_date, disposal_date, cost, salvage_value,
+        useful_life_months, method, status, accumulated_depreciation, disposal_amount, disposal_reason,
+        notes, created_by, created_at, updated_at) VALUES
+    (a_eks,  v_tid, v_org, 'FA-000001', 'Ekskavator CAT 320',        cat_mach, dep_prod, 'CAT320-2211', 'Yunusobod obyekt',  '2026-04-10', '2026-04-10', NULL, 768000000, 0, 96,  'straight_line', 'in_service', 24000000, NULL, NULL, 'Demo seed', v_user, NOW(), NOW()),
+    (a_kran, v_tid, v_org, 'FA-000002', 'Avtokran XCMG QY25',        cat_mach, dep_prod, 'XCMG-25-889', 'Sergeli obyekt',    '2026-04-15', '2026-04-15', NULL, 600000000, 0, 96,  'straight_line', 'in_service', 18750000, NULL, NULL, 'Demo seed', v_user, NOW(), NOW()),
+    (a_miks, v_tid, v_org, 'FA-000003', 'Beton mikser FIORI DB460',  cat_mach, dep_prod, 'FIORI-460-3', 'Bosh ombor',        '2026-01-20', '2026-02-01', NULL, 384000000, 0, 96,  'straight_line', 'conserved',  20000000, NULL, NULL, 'Mavsumiy konservatsiya. Demo seed', v_user, NOW(), NOW()),
+    (a_kamaz,v_tid, v_org, 'FA-000004', 'KamAZ 65115 samosval',      cat_veh,  dep_prod, 'KMZ-65115-7', 'Yunusobod obyekt',  '2026-04-01', '2026-04-20', NULL, 294000000, 0, 84,  'straight_line', 'in_service', 10500000, NULL, NULL, 'Demo seed', v_user, NOW(), NOW()),
+    (a_damas,v_tid, v_org, 'FA-000005', 'Damas yuk (eski)',          cat_veh,  dep_admin,'DMS-2019-44', 'Ofis',              '2026-01-05', '2026-02-01', '2026-07-15', 100800000, 0, 84, 'straight_line', 'disposed', 6000000, 82000000, 'Yangisiga almashtirildi (sotildi)', 'Demo seed', v_user, NOW(), NOW()),
+    (a_comp, v_tid, v_org, 'FA-000006', 'Ofis kompyuterlari (5 dona)', cat_comp, dep_admin, NULL, 'Ofis',                   '2026-04-25', '2026-04-25', NULL, 54000000,  0, 36,  'straight_line', 'in_service', 4500000,  NULL, NULL, 'Demo seed', v_user, NOW(), NOW()),
+    (a_kran2,v_tid, v_org, 'FA-000007', 'Minora kran ZOOMLION (yangi)', cat_mach, dep_prod, 'ZLN-T6013',  NULL,              '2026-07-28', NULL, NULL, 900000000, 0, 120, 'straight_line', 'draft', 0, NULL, NULL, 'Montaj kutilmoqda. Demo seed', v_user, NOW(), NOW());
+
+    -- Three posted monthly runs (2026-05/06/07).
+    INSERT INTO fa_depreciation_runs (id, tenant_id, period, status, skipped, created_by, posted_by, created_at, posted_at) VALUES
+    (r_may, v_tid, '2026-05', 'posted', '[]', v_user, v_user, '2026-06-01 09:00+05', '2026-06-01 09:05+05'),
+    (r_jun, v_tid, '2026-06', 'posted', '[]', v_user, v_user, '2026-07-01 09:00+05', '2026-07-01 09:05+05'),
+    (r_jul, v_tid, '2026-07', 'posted', '[]', v_user, v_user, '2026-08-01 09:00+05', '2026-08-01 09:05+05');
+
+    -- Per-asset accruals. Depreciation starts the month AFTER commissioning.
+    INSERT INTO fa_depreciation_entries (tenant_id, run_id, asset_id, period, amount, debit_account, credit_account, status) VALUES
+    -- Ekskavator (comm 2026-04): may..jul = 3 × 8,000,000
+    (v_tid, r_may, a_eks, '2026-05', 8000000, '2010', '0230', 'active'),
+    (v_tid, r_jun, a_eks, '2026-06', 8000000, '2010', '0230', 'active'),
+    (v_tid, r_jul, a_eks, '2026-07', 8000000, '2010', '0230', 'active'),
+    -- Avtokran: 3 × 6,250,000
+    (v_tid, r_may, a_kran, '2026-05', 6250000, '2010', '0230', 'active'),
+    (v_tid, r_jun, a_kran, '2026-06', 6250000, '2010', '0230', 'active'),
+    (v_tid, r_jul, a_kran, '2026-07', 6250000, '2010', '0230', 'active'),
+    -- Mikser (comm 2026-02, konservatsiyadan oldin 5 oy): mar..jul = 5 × 4,000,000
+    (v_tid, NULL,  a_miks, '2026-03', 4000000, '2010', '0230', 'active'),
+    (v_tid, NULL,  a_miks, '2026-04', 4000000, '2010', '0230', 'active'),
+    (v_tid, r_may, a_miks, '2026-05', 4000000, '2010', '0230', 'active'),
+    (v_tid, r_jun, a_miks, '2026-06', 4000000, '2010', '0230', 'active'),
+    (v_tid, r_jul, a_miks, '2026-07', 4000000, '2010', '0230', 'active'),
+    -- KamAZ (comm 2026-04-20): may..jul = 3 × 3,500,000
+    (v_tid, r_may, a_kamaz, '2026-05', 3500000, '2010', '0260', 'active'),
+    (v_tid, r_jun, a_kamaz, '2026-06', 3500000, '2010', '0260', 'active'),
+    (v_tid, r_jul, a_kamaz, '2026-07', 3500000, '2010', '0260', 'active'),
+    -- Damas (comm 2026-02, sotilgan 2026-07-15; mar..jul = 5 × 1,200,000)
+    (v_tid, NULL,  a_damas, '2026-03', 1200000, '9420', '0260', 'active'),
+    (v_tid, NULL,  a_damas, '2026-04', 1200000, '9420', '0260', 'active'),
+    (v_tid, r_may, a_damas, '2026-05', 1200000, '9420', '0260', 'active'),
+    (v_tid, r_jun, a_damas, '2026-06', 1200000, '9420', '0260', 'active'),
+    (v_tid, r_jul, a_damas, '2026-07', 1200000, '9420', '0260', 'active'),
+    -- Kompyuterlar (comm 2026-04-25): may..jul = 3 × 1,500,000
+    (v_tid, r_may, a_comp, '2026-05', 1500000, '9420', '0250', 'active'),
+    (v_tid, r_jun, a_comp, '2026-06', 1500000, '9420', '0250', 'active'),
+    (v_tid, r_jul, a_comp, '2026-07', 1500000, '9420', '0250', 'active');
+
+    RAISE NOTICE '  Aktivlar v2 demo seed tayyor: 7 aktiv, 3 posted reglament, 1 sotish';
 END;
 $$;

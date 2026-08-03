@@ -837,82 +837,90 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 
 	now := time.Now()
 
-	// Get return lines for inventory update
-	linesQuery := `
+	// Stock-out via applyStockDelta (balance + self-contained ledger row in
+	// ONE tx per line, negative-stock guard). The old path picked the
+	// inventory row warehouse-blind (LIMIT 1) and wrote balance and ledger
+	// separately without a transaction (docs/xarid-audit.md finding #9).
+	// purchase_returns has no warehouse_id column — derive per line: the
+	// linked goods receipt's warehouse first, else the warehouse holding
+	// the product's stock.
+	var retOrgID *uuid.UUID
+	var retGRWarehouseID *uuid.UUID
+	retCreatedBy, _ := middleware.GetUserID(c)
+	h.db.QueryRow(`
+		SELECT pr.organization_id, gr.warehouse_id
+		FROM purchase_returns pr
+		LEFT JOIN goods_receipts gr ON gr.id = pr.goods_receipt_id
+		WHERE pr.id = $1 AND pr.tenant_id = $2
+	`, returnID, tenantID).Scan(&retOrgID, &retGRWarehouseID)
+
+	type retLine struct {
+		ProdID    uuid.UUID
+		Qty       float64
+		UnitPrice float64
+	}
+	var retLines []retLine
+	rows, err := h.db.Query(`
 		SELECT product_id, return_quantity, unit_price
 		FROM purchase_return_lines
-		WHERE return_id = $1`
-
-	rows, err := h.db.Query(linesQuery, returnID)
+		WHERE return_id = $1 AND product_id IS NOT NULL AND return_quantity > 0
+	`, returnID)
 	if err != nil {
 		h.log.Error("Failed to get purchase return lines", "error", err)
 	} else {
-		defer rows.Close()
-
 		for rows.Next() {
-			var productID sql.NullString
-			var returnQty, unitPrice float64
-
-			if err := rows.Scan(&productID, &returnQty, &unitPrice); err != nil {
-				continue
+			var l retLine
+			if rows.Scan(&l.ProdID, &l.Qty, &l.UnitPrice) == nil {
+				retLines = append(retLines, l)
 			}
+		}
+		rows.Close()
+	}
 
-			if !productID.Valid || returnQty <= 0 {
-				continue
+	for _, l := range retLines {
+		// Warehouse: the linked GR's warehouse first; else the warehouse that
+		// actually holds this product's stock — never a blind LIMIT 1.
+		whID := uuid.Nil
+		if retGRWarehouseID != nil {
+			whID = *retGRWarehouseID
+		}
+		if whID == uuid.Nil {
+			h.db.QueryRow(`
+				SELECT warehouse_id FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2 AND quantity_on_hand > 0
+				ORDER BY quantity_on_hand DESC LIMIT 1
+			`, tenantID, l.ProdID).Scan(&whID)
+		}
+		if whID == uuid.Nil {
+			h.log.Warn("No warehouse with stock for purchase return line", "product_id", l.ProdID)
+			continue
+		}
+
+		lineErr := func() error {
+			tx, txErr := h.db.Begin()
+			if txErr != nil {
+				return txErr
 			}
-
-			pid, err := uuid.Parse(productID.String)
-			if err != nil {
-				continue
+			defer tx.Rollback()
+			if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+				TenantID: tenantID, OrgID: retOrgID, ProductID: l.ProdID,
+				WarehouseID: whID, Qty: -l.Qty,
+				TxType: "return", RefType: "purchase_return", RefID: returnID.String(),
+				Reason: "Purchase Return - Return to Supplier", FromWH: &whID,
+				CreatedBy: retCreatedBy, When: now,
+			}); dErr != nil {
+				return dErr
 			}
-
-			// Find inventory record for this product
-			var inventoryID uuid.UUID
-			var currentQty float64
-
-			err = h.db.QueryRow(`
-				SELECT id, quantity_on_hand FROM inventory
-				WHERE tenant_id = $1 AND product_id = $2
-				LIMIT 1`,
-				tenantID, pid,
-			).Scan(&inventoryID, &currentQty)
-
-			if err == sql.ErrNoRows {
-				// No inventory record - can't decrease what doesn't exist
-				h.log.Warn("No inventory record found for purchase return item", "product_id", pid)
-				continue
-			} else if err != nil {
-				h.log.Error("Failed to get inventory for purchase return", "error", err)
-				continue
+			return tx.Commit()
+		}()
+		if lineErr != nil {
+			if lineErr == errInsufficientStock {
+				response.BadRequest(c, "INSUFFICIENT_STOCK: not enough on hand to ship this return")
+				return
 			}
-
-			// Check if we have enough stock
-			if currentQty < returnQty {
-				h.log.Warn("Insufficient stock for purchase return", "product_id", pid, "current", currentQty, "return_qty", returnQty)
-				// Continue anyway - in practice returns should not be approved without stock
-			}
-
-			// Update inventory - DECREASE quantity (sending back to supplier)
-			// Note: quantity_available is a generated column, only update quantity_on_hand
-			_, err = h.db.Exec(`
-				UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, updated_at = $2
-				WHERE id = $3`,
-				returnQty, now, inventoryID,
-			)
-			if err != nil {
-				h.log.Error("Failed to update inventory for purchase return", "error", err, "inventory_id", inventoryID)
-				continue
-			}
-
-			// Create inventory transaction for audit trail
-			txID := uuid.New()
-			h.db.Exec(`
-				INSERT INTO inventory_transactions (
-					id, tenant_id, inventory_id, transaction_type, quantity,
-					unit_cost, total_cost, reference_type, reference_id,
-					reason, transaction_date, created_at
-				) VALUES ($1, $2, $3, 'issue', $4, $5, $6, 'purchase_return', $7, 'Purchase Return - Return to Supplier', $8, $8)
-			`, txID, tenantID, inventoryID, -returnQty, unitPrice, returnQty*unitPrice, returnID, now)
+			h.log.Error("Failed to apply purchase return stock-out", "error", lineErr, "product_id", l.ProdID)
+			response.InternalError(c, "Failed to ship purchase return")
+			return
 		}
 	}
 
