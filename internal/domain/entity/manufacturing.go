@@ -83,6 +83,9 @@ type WorkCenterInput struct {
 	IsAvailable         *bool      `json:"is_available,omitempty"`
 	NextMaintenanceDate *string    `json:"next_maintenance_date,omitempty"`
 	Notes               *string    `json:"notes,omitempty"`
+	// AssetID links the work center to the fa_assets register (migration
+	// 465, integration map §6). uuid.Nil clears the link.
+	AssetID *uuid.UUID `json:"asset_id,omitempty"`
 }
 
 type WorkCenterResponse struct {
@@ -92,6 +95,8 @@ type WorkCenterResponse struct {
 	Description         *string    `json:"description,omitempty"`
 	WarehouseID         *uuid.UUID `json:"warehouse_id,omitempty"`
 	WarehouseName       *string    `json:"warehouse_name,omitempty"`
+	AssetID             *uuid.UUID `json:"asset_id,omitempty"`
+	AssetName           *string    `json:"asset_name,omitempty"`
 	Department          *string    `json:"department,omitempty"`
 	CapacityPerHour     float64    `json:"capacity_per_hour"`
 	EfficiencyFactor    float64    `json:"efficiency_factor"`

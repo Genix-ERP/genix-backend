@@ -16,6 +16,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -30,7 +31,15 @@ func (h *Handler) ListWorkOrders(c *gin.Context) {
 		return
 	}
 
-	organizationID := c.Query("organization_id")
+	// Org scoping: the resolver header is authoritative (audit §2.10 — the
+	// query param alone let a caller see the whole tenant by omitting it);
+	// the query param stays as a back-compat fallback.
+	organizationID := ""
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		organizationID = orgID.String()
+	} else {
+		organizationID = c.Query("organization_id")
+	}
 
 	// Parse pagination
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -423,6 +432,11 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 		return
 	}
 
+	// Ishbay (B6): operation piece_rate × good output → the
+	// production_piecework HR handoff register. UNIQUE(work_order_id,
+	// employee_id) makes retries safe; no payroll_entries writes here.
+	h.recordPiecework(tenantID, woID, userID, input.QuantityProduced, now)
+
 	// Log time end - use migration 010 columns: duration_hours
 	h.db.Exec(`
 		UPDATE work_order_time_logs
@@ -769,14 +783,25 @@ func (h *Handler) RecordWorkOrderTime(c *gin.Context) {
 		durationHours = input.EndTime.Sub(startTime).Hours()
 	}
 
-	// Use migration 010 columns: worker_id, worker_name, duration_hours
+	// Use migration 010 columns: worker_id, worker_name, duration_hours.
+	// employee_id (migration 459) is the payroll-link groundwork: accepted
+	// from the input, or resolved from the caller's user → employee link.
+	var employeeID interface{}
+	if input.EmployeeID != nil && *input.EmployeeID != uuid.Nil {
+		employeeID = *input.EmployeeID
+	} else {
+		var linked uuid.UUID
+		if h.db.QueryRow(`SELECT employee_id FROM users WHERE id = $1 AND employee_id IS NOT NULL`, userID).Scan(&linked) == nil && linked != uuid.Nil {
+			employeeID = linked
+		}
+	}
 	_, err = h.db.Exec(`
 		INSERT INTO work_order_time_logs (
 			id, tenant_id, work_order_id, start_time, end_time, duration_hours,
-			log_type, worker_id, worker_name, notes
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			log_type, worker_id, worker_name, employee_id, notes
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 	`, logID, tenantID, woID, startTime, endTime, durationHours,
-		input.LogType, userID, userName, input.Notes)
+		input.LogType, userID, userName, employeeID, input.Notes)
 	if err != nil {
 		h.log.Error("Failed to record time", "error", err)
 		response.InternalError(c, "Failed to record time")
@@ -1308,12 +1333,23 @@ func getNextStepMessage(transferType string) string {
 
 // consumeBOMComponents deducts BOM component quantities from inventory for a production order.
 // It is idempotent — if Issue transactions already exist for this PO it does nothing.
+// consumeBOMComponents issues the BOM components for a production order when
+// production starts via the work-order path (StartWorkOrder). v2: every
+// stock leg goes through applyStockDelta (TxType production_out) and the
+// per-component consumption JEs post in the SAME transaction — stock and GL
+// land or fail together (docs/production-integration-map.md §3). Greedy
+// multi-warehouse sourcing and the shortfall-to-PO-warehouse booking match
+// StartProductionOrder.
 func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now time.Time) {
-	// Guard: skip if already consumed
+	// Guard: skip if already consumed. Covers the legacy 'issue' rows and
+	// the 'production_out' rows both this path and StartProductionOrder
+	// write via applyStockDelta — otherwise starting the MO and then a work
+	// order would double-issue materials.
 	var existing int
 	h.db.QueryRow(`
 		SELECT COUNT(*) FROM inventory_transactions
-		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2 AND transaction_type = 'issue'
+		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2
+		  AND transaction_type IN ('issue', 'production_out') AND deleted_at IS NULL
 	`, tenantID, poID).Scan(&existing)
 	if existing > 0 {
 		return
@@ -1346,8 +1382,6 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 	if err != nil {
 		return
 	}
-	defer rows.Close()
-
 	var components []bomComponent
 	for rows.Next() {
 		var c bomComponent
@@ -1363,23 +1397,25 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 	}
 	defer tx.Rollback()
 
-	// Accumulate per-component consumption (qty × cost) during the
-	// loop so we can post one GL JE per component AFTER the tx commits.
-	// Posting after commit (rather than inside the tx) means a GL
-	// failure never rolls back the production-order consumption — the
-	// reconcile admin endpoint will surface any residual gap and a
-	// backfill keyed by `WO-CONS-<poID>-<componentID>` can re-attempt.
-	//
-	// We collect per-component because BOM consumption may pull from
-	// multiple lots/warehouses for one component; aggregating to a
-	// single JE per component keeps GL output proportional to BOM
-	// granularity rather than lot granularity.
+	// Per-component consumption accumulator (qty + cost) — BOM consumption
+	// may pull from multiple warehouses for one component; aggregating to
+	// one JE per component keeps GL output proportional to BOM granularity
+	// rather than source granularity.
 	type consAcc struct {
 		componentID uuid.UUID
 		qty         float64
-		cost        float64 // accumulated total_cost across all sources
+		cost        float64
 	}
 	consAggMap := make(map[uuid.UUID]*consAcc, len(components))
+	accumulate := func(compID uuid.UUID, qty, cost float64) {
+		acc, ok := consAggMap[compID]
+		if !ok {
+			acc = &consAcc{componentID: compID}
+			consAggMap[compID] = acc
+		}
+		acc.qty += qty
+		acc.cost += cost
+	}
 
 	for _, comp := range components {
 		bomOutputQty := comp.BOMOutputQty
@@ -1387,29 +1423,26 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 			bomOutputQty = 1
 		}
 		totalNeeded := comp.Quantity * (1 + comp.ScrapPercent/100) * (qtyPlanned / bomOutputQty)
+		if totalNeeded <= 0 {
+			continue
+		}
 
 		var compCost float64
 		tx.QueryRow("SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1", comp.ComponentID).Scan(&compCost)
 
-		// Greedy multi-warehouse consumption (see StartProductionOrder for
-		// the full rationale): consume from any warehouse in the org that
-		// has stock, biggest first; fall back to the PO's warehouse for
-		// any remaining shortfall.
+		// Greedy multi-warehouse consumption: any warehouse in the org with
+		// stock, biggest balance first.
 		type src struct {
-			invID    uuid.UUID
 			whID     uuid.UUID
 			unitCost float64
 			onHand   float64
 		}
 		var sources []src
-
 		srcQuery := `
-			SELECT i.id, i.warehouse_id, COALESCE(i.unit_cost, 0), COALESCE(i.quantity_on_hand, 0)
+			SELECT i.warehouse_id, COALESCE(i.unit_cost, 0), COALESCE(i.quantity_on_hand, 0)
 			FROM inventory i
 			JOIN warehouses w ON w.id = i.warehouse_id
 			WHERE i.tenant_id = $1 AND i.product_id = $2
-			  AND (i.lot_number IS NULL OR i.lot_number = '')
-			  AND (i.serial_number IS NULL OR i.serial_number = '')
 			  AND i.quantity_on_hand > 0
 			  AND w.deleted_at IS NULL`
 		srcArgs := []interface{}{tenantID, comp.ComponentID}
@@ -1418,11 +1451,10 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 			srcArgs = append(srcArgs, *organizationID)
 		}
 		srcQuery += ` ORDER BY i.quantity_on_hand DESC`
-
 		if sRows, sErr := tx.Query(srcQuery, srcArgs...); sErr == nil {
 			for sRows.Next() {
 				var s src
-				if scanErr := sRows.Scan(&s.invID, &s.whID, &s.unitCost, &s.onHand); scanErr == nil {
+				if sRows.Scan(&s.whID, &s.unitCost, &s.onHand) == nil {
 					sources = append(sources, s)
 				}
 			}
@@ -1438,145 +1470,112 @@ func (h *Handler) consumeBOMComponents(poID, tenantID, userID uuid.UUID, now tim
 			if take > remaining {
 				take = remaining
 			}
-			tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-				take, now, s.invID)
 			unitCost := s.unitCost
 			if unitCost == 0 {
 				unitCost = compCost
 			}
-			tx.Exec(`
-				INSERT INTO inventory_transactions (
-					id, tenant_id, organization_id, inventory_id, transaction_type,
-					reference_type, reference_id, quantity, unit_cost, total_cost,
-					reason, notes, transaction_date, created_by, created_at
-				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Materials consumed for production',$9,$10,$9)
-			`, uuid.New(), tenantID, organizationID, s.invID, poID, take, unitCost, take*unitCost, now, userID)
-			// Accumulate this lot's consumption into the per-component
-			// total for post-commit GL posting.
-			acc, ok := consAggMap[comp.ComponentID]
-			if !ok {
-				acc = &consAcc{componentID: comp.ComponentID}
-				consAggMap[comp.ComponentID] = acc
+			_, valuedCost, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+				TenantID:    tenantID,
+				OrgID:       organizationID,
+				ProductID:   comp.ComponentID,
+				WarehouseID: s.whID,
+				Qty:         -take,
+				UnitCost:    unitCost,
+				TxType:      "production_out",
+				RefType:     "production_order",
+				RefID:       poID.String(),
+				Reason:      "material_consumption",
+				Notes:       "Materials consumed for production",
+				CreatedBy:   userID,
+				When:        now,
+				AllowNeg:    false,
+			})
+			if dErr != nil {
+				h.log.Error("consumeBOMComponents: stock issue failed — rolling back",
+					"error", dErr, "po_id", poID, "component_id", comp.ComponentID)
+				return
 			}
-			acc.qty += take
-			acc.cost += take * unitCost
+			accumulate(comp.ComponentID, take, take*valuedCost)
 			remaining -= take
 		}
 
 		// Shortfall: book the remainder against the PO's warehouse so the
 		// missing stock is visible there and the planned material cost on
 		// the PO still matches the journal entries.
-		if remaining > 0 && warehouseID != nil {
-			var invID uuid.UUID
-			var unitCost float64
-			lookupErr := tx.QueryRow(`
-				SELECT id, COALESCE(unit_cost, 0) FROM inventory
-				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-				AND lot_number IS NULL AND serial_number IS NULL
-			`, tenantID, comp.ComponentID, warehouseID).Scan(&invID, &unitCost)
-			if lookupErr == sql.ErrNoRows {
-				invID = uuid.New()
-				if _, createErr := tx.Exec(`
-					INSERT INTO inventory (
-						id, tenant_id, product_id, warehouse_id,
-						quantity_on_hand, quantity_reserved,
-						last_movement_date, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, 0, 0, $5, $5, $5)
-				`, invID, tenantID, comp.ComponentID, warehouseID, now); createErr != nil {
-					h.log.Error("Failed to create fallback inventory row",
-						"error", createErr, "component_id", comp.ComponentID,
-						"warehouse_id", warehouseID)
-					continue
-				}
-				unitCost = compCost
-			} else if lookupErr != nil {
-				continue
+		if remaining > 0.0001 {
+			_, valuedCost, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+				TenantID:    tenantID,
+				OrgID:       organizationID,
+				ProductID:   comp.ComponentID,
+				WarehouseID: *warehouseID,
+				Qty:         -remaining,
+				UnitCost:    compCost,
+				TxType:      "production_out",
+				RefType:     "production_order",
+				RefID:       poID.String(),
+				Reason:      "material_consumption",
+				Notes:       "Materials shortfall — booked to PO warehouse",
+				CreatedBy:   userID,
+				When:        now,
+				AllowNeg:    true,
+			})
+			if dErr != nil {
+				h.log.Error("consumeBOMComponents: shortfall booking failed — rolling back",
+					"error", dErr, "po_id", poID, "component_id", comp.ComponentID)
+				return
 			}
-			if unitCost == 0 {
-				unitCost = compCost
-			}
-
-			tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-				remaining, now, invID)
-			tx.Exec(`
-				INSERT INTO inventory_transactions (
-					id, tenant_id, organization_id, inventory_id, transaction_type,
-					reference_type, reference_id, quantity, unit_cost, total_cost,
-					reason, notes, transaction_date, created_by, created_at
-				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Materials shortfall — booked to PO warehouse',$9,$10,$9)
-			`, uuid.New(), tenantID, organizationID, invID, poID, remaining, unitCost, remaining*unitCost, now, userID)
-			// Accumulate shortfall consumption for post-commit GL posting.
-			acc, ok := consAggMap[comp.ComponentID]
-			if !ok {
-				acc = &consAcc{componentID: comp.ComponentID}
-				consAggMap[comp.ComponentID] = acc
-			}
-			acc.qty += remaining
-			acc.cost += remaining * unitCost
+			accumulate(comp.ComponentID, remaining, remaining*valuedCost)
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
-		h.log.Error("consumeBOMComponents: tx commit failed",
-			"error", err, "po_id", poID)
-		return
-	}
-
-	// POST-COMMIT GL POSTING — DR cost-of-materials / CR inventory, one
-	// JE per consumed component. Sister handler StartProductionOrder in
-	// manufacturing.go already posts this leg; consumeBOMComponents
-	// (called from StartWorkOrder) historically didn't, which is what
-	// produced the LUXURYMEBEL part of the +334M Buxgalteriya-vs-Ombor
-	// drift by mid-2026 (LUXURYMEBEL uses the work-order start path).
-	//
-	// Posting after commit keeps a GL failure from rolling back the
-	// production consumption — the reconcile admin endpoint will
-	// surface any residual gap, and the idempotency key
-	// (`WO-CONS-<poID>-<componentID>`) makes a backfill safe.
+	// GL: one consumption JE per component, in the SAME tx as the stock
+	// legs (previously post-commit — a GL failure left exactly the
+	// Buxgalteriya-vs-Ombor drift the reconcile endpoint kept surfacing).
+	// SourceType 'production_order_consume' + source_id=PO is what the
+	// MO-complete material-JE dedupe matches; the idempotency key
+	// `WO-CONS-<poID>-<componentID>` keeps re-runs safe. A JE failure
+	// poisons the tx so the commit below fails and the stock legs roll
+	// back with it — stock never moves without its GL.
 	for _, acc := range consAggMap {
 		if acc.qty <= 0 || acc.cost <= 0 {
 			continue
 		}
-		// Effective unit cost = weighted average across the lots we
-		// actually consumed (acc.cost / acc.qty). This matches the
-		// inventory_transactions rows that were just written.
-		effectiveUnitCost := acc.cost / acc.qty
-		// Post each component's consumption JE in its own transaction so the
-		// deferred balance trigger (migration 416) validates the header + both
-		// lines atomically at COMMIT; an imbalanced/partial JE is rolled back
-		// instead of leaving an orphan posted header.
-		jeTx, jeErr := h.db.Begin()
-		if jeErr != nil {
-			h.log.Error("consumeBOMComponents: failed to begin consumption JE tx", "error", jeErr, "po_id", poID, "component_id", acc.componentID)
-			continue
-		}
-		h.postInventoryConsumptionJE(jeTx, postInventoryConsumptionArgs{
+		h.postInventoryConsumptionJE(tx, postInventoryConsumptionArgs{
 			TenantID:       tenantID,
 			OrganizationID: organizationID,
 			ProductID:      acc.componentID,
 			Quantity:       acc.qty,
-			UnitCost:       effectiveUnitCost,
+			UnitCost:       acc.cost / acc.qty,
 			SourceType:     "production_order_consume",
 			SourceID:       poID,
 			IdempotencyKey: fmt.Sprintf("WO-CONS-%s-%s", poID.String(), acc.componentID.String()),
 			Description: fmt.Sprintf("Production order %s — BOM component consumption",
 				poID.String()[:8]),
 		})
-		if commitErr := jeTx.Commit(); commitErr != nil {
-			h.log.Error("consumeBOMComponents: failed to commit consumption JE", "error", commitErr, "po_id", poID, "component_id", acc.componentID)
-			jeTx.Rollback()
-		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("consumeBOMComponents: tx commit failed", "error", err, "po_id", poID)
 	}
 }
 
-// receiveFinishedGoods adds the produced quantity of the finished product to inventory.
-// It is idempotent — if Receipt transactions already exist for this PO it does nothing.
+// receiveFinishedGoods adds the produced quantity of the finished product to
+// inventory via applyStockDelta (TxType production_in) inside one
+// transaction (docs/production-integration-map.md §3). It is idempotent —
+// if a production_complete receipt already exists for this PO it does nothing.
 func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, producedQty float64, now time.Time) float64 {
-	// Guard: skip if already received
+	// Guard: skip if the finished goods were already received. The reason
+	// filter is load-bearing (audit §2.2): without it, a prior
+	// material_return receipt for the same PO silently suppressed the FG
+	// receipt (returned 0 → unitCost 0 → the completion JE never posted).
+	// Covers the legacy 'receipt' rows and the v2 'production_in' rows;
+	// mirrors the guard in CompleteProductionOrder.
 	var existing int
 	h.db.QueryRow(`
 		SELECT COUNT(*) FROM inventory_transactions
-		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2 AND transaction_type = 'receipt'
+		WHERE tenant_id = $1 AND reference_type = 'production_order' AND reference_id = $2
+		  AND transaction_type IN ('receipt', 'production_in') AND reason = 'production_complete'
+		  AND deleted_at IS NULL
 	`, tenantID, poID).Scan(&existing)
 	if existing > 0 {
 		return 0
@@ -1615,19 +1614,13 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 				WHERE bl.bom_id = $1
 			`, bomID).Scan(&materialCost)
 
-			// Machine cost from BOM operations (hourly_cost / capacity_per_hour per operation)
-			var machineCost float64
-			h.db.QueryRow(`
-				SELECT COALESCE(SUM(
-					COALESCE(wc.hourly_cost, 0)
-					/ GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)
-				), 0)
-				FROM bom_operations bo
-				LEFT JOIN work_centers wc ON bo.work_center_id = wc.id
-				WHERE bo.bom_id = $1
-			`, bomID).Scan(&machineCost)
+			// Machine + labor via the ONE shared costing helper (B4). This
+			// path previously used a capacity-only formula with no labor at
+			// all, so the FG valuation (and the downstream JE) differed from
+			// the CompleteProductionOrder path.
+			machineCost, laborCost := h.computeMOMachineAndLaborCost(*bomID, bomOutputQty, poID, producedQty)
 
-			unitCost = (materialCost + machineCost) / bomOutputQty
+			unitCost = materialCost/bomOutputQty + machineCost + laborCost
 		}
 	}
 	// Add per-unit cost of extras added in shop floor (work_order_materials
@@ -1685,42 +1678,22 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 	}
 	defer tx.Rollback()
 
-	var invID uuid.UUID
-	err = tx.QueryRow(`
-		SELECT id FROM inventory
-		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-		AND lot_number IS NULL AND serial_number IS NULL
-	`, tenantID, productID, warehouseID).Scan(&invID)
-
-	if err == sql.ErrNoRows {
-		invID = uuid.New()
-		if _, insertErr := tx.Exec(`
-			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id,
-				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$8,$8)
-		`, invID, tenantID, organizationID, productID, warehouseID, producedQty, unitCost, now); insertErr != nil {
-			h.log.Error("receiveFinishedGoods: failed to insert inventory record", "error", insertErr, "po_id", poID)
-			return 0
-		}
-	} else if err == nil {
-		if _, updateErr := tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-			producedQty, now, invID); updateErr != nil {
-			h.log.Error("receiveFinishedGoods: failed to update inventory", "error", updateErr, "inv_id", invID)
-			return 0
-		}
-	} else {
-		h.log.Error("receiveFinishedGoods: failed to query inventory", "error", err, "po_id", poID)
-		return 0
-	}
-
-	if _, txErr := tx.Exec(`
-		INSERT INTO inventory_transactions (
-			id, tenant_id, organization_id, inventory_id, transaction_type,
-			reference_type, reference_id, quantity, unit_cost, total_cost,
-			reason, notes, transaction_date, created_by, created_at
-		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'production_complete','Finished goods from production order',$9,$10,$9)
-	`, uuid.New(), tenantID, organizationID, invID, poID, producedQty, unitCost, producedQty*unitCost, now, userID); txErr != nil {
-		h.log.Error("receiveFinishedGoods: failed to insert inventory_transaction", "error", txErr, "po_id", poID)
+	if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+		TenantID:    tenantID,
+		OrgID:       organizationID,
+		ProductID:   productID,
+		WarehouseID: *warehouseID,
+		Qty:         producedQty,
+		UnitCost:    unitCost,
+		TxType:      "production_in",
+		RefType:     "production_order",
+		RefID:       poID.String(),
+		Reason:      "production_complete",
+		Notes:       "Finished goods from production order",
+		CreatedBy:   userID,
+		When:        now,
+	}); dErr != nil {
+		h.log.Error("receiveFinishedGoods: stock receipt failed", "error", dErr, "po_id", poID)
 		return 0
 	}
 
@@ -1782,44 +1755,25 @@ func (h *Handler) receiveScrapGoods(poID, tenantID, userID uuid.UUID, productID 
 	}
 	defer tx.Rollback()
 
-	// Find or create inventory record in scrap warehouse
-	var invID uuid.UUID
-	err = tx.QueryRow(`
-		SELECT id FROM inventory
-		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-		AND lot_number IS NULL AND serial_number IS NULL
-	`, tenantID, productID, scrapWarehouseID).Scan(&invID)
-
-	if err == sql.ErrNoRows {
-		invID = uuid.New()
-		if _, insertErr := tx.Exec(`
-			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id,
-				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$8,$8)
-		`, invID, tenantID, organizationID, productID, scrapWarehouseID, scrapQty, unitCost, now); insertErr != nil {
-			h.log.Error("receiveScrapGoods: failed to insert inventory", "error", insertErr)
-			return
-		}
-	} else if err == nil {
-		if _, updateErr := tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-			scrapQty, now, invID); updateErr != nil {
-			h.log.Error("receiveScrapGoods: failed to update inventory", "error", updateErr)
-			return
-		}
-	} else {
-		h.log.Error("receiveScrapGoods: failed to query inventory", "error", err)
-		return
-	}
-
-	// Create inventory transaction for scrap
-	if _, txErr := tx.Exec(`
-		INSERT INTO inventory_transactions (
-			id, tenant_id, organization_id, inventory_id, transaction_type,
-			reference_type, reference_id, quantity, unit_cost, total_cost,
-			reason, notes, transaction_date, created_by, created_at
-		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'production_scrap','Scrapped items from production',$9,$10,$9)
-	`, uuid.New(), tenantID, organizationID, invID, poID, scrapQty, unitCost, scrapQty*unitCost, now, userID); txErr != nil {
-		h.log.Error("receiveScrapGoods: failed to insert transaction", "error", txErr)
+	// Scrap receipt via applyStockDelta (TxType production_scrap —
+	// integration map §3). The delete-cascade reversal in
+	// DeleteProductionOrder includes 'production_scrap' in its receipt list.
+	if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+		TenantID:    tenantID,
+		OrgID:       organizationID,
+		ProductID:   productID,
+		WarehouseID: scrapWarehouseID,
+		Qty:         scrapQty,
+		UnitCost:    unitCost,
+		TxType:      "production_scrap",
+		RefType:     "production_order",
+		RefID:       poID.String(),
+		Reason:      "production_scrap",
+		Notes:       "Scrapped items from production",
+		CreatedBy:   userID,
+		When:        now,
+	}); dErr != nil {
+		h.log.Error("receiveScrapGoods: stock receipt failed", "error", dErr, "po_id", poID)
 		return
 	}
 
@@ -1868,17 +1822,11 @@ func (h *Handler) createFinishedGoodsJournalEntry(
 			`, bomID).Scan(&materialCost)
 			materialCost = materialCost / bomOutputQty
 
-			h.db.QueryRow(`
-				SELECT COALESCE(SUM(COALESCE(wc.hourly_cost, 0) / GREATEST(COALESCE(wc.capacity_per_hour, 1), 1)), 0)
-				FROM bom_operations bo LEFT JOIN work_centers wc ON bo.work_center_id = wc.id WHERE bo.bom_id = $1
-			`, bomID).Scan(&machineCost)
-			machineCost = machineCost / bomOutputQty
-
-			// Labor cost = total - material - machine
-			laborCost = unitCost - materialCost - machineCost
-			if laborCost < 0 {
-				laborCost = 0
-			}
+			// Machine + labor via the ONE shared costing helper (B4). This
+			// path previously used a capacity-only machine formula and
+			// derived labor as the residual (unitCost − material − machine),
+			// so the WIP legs differed from the MO-complete path's split.
+			machineCost, laborCost = h.computeMOMachineAndLaborCost(*bomID, bomOutputQty, poID, producedQty)
 		}
 	}
 
@@ -2159,59 +2107,57 @@ func (h *Handler) transferToFinishedGoodsWarehouse(
 		return
 	}
 
+	// Both legs via applyStockDelta in ONE tx (transfer_out / transfer_in,
+	// stored sign preserved by the stock_ledger view). The delete-cascade
+	// reversal in DeleteProductionOrder includes both types. A failed out-leg
+	// (e.g. insufficient stock) aborts the transfer — goods stay put.
 	tx, txErr := h.db.Begin()
 	if txErr != nil {
 		return
 	}
 	defer tx.Rollback()
 
-	// 1. Deduct from production warehouse
-	tx.Exec(`
-		UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2
-		WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5
-	`, qty, now, tenantID, productID, productionWarehouseID)
-
-	// Create issue transaction from production warehouse
-	var srcInvID uuid.UUID
-	h.db.QueryRow(`SELECT id FROM inventory WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3 LIMIT 1`,
-		tenantID, productID, productionWarehouseID).Scan(&srcInvID)
-
-	tx.Exec(`
-		INSERT INTO inventory_transactions (
-			id, tenant_id, organization_id, inventory_id, transaction_type,
-			reference_type, reference_id, quantity, unit_cost, total_cost,
-			reason, notes, transaction_date, created_by, created_at
-		) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'fg_transfer','Tayyor mahsulot omboriga o''tkazildi',$9,$10,$9)
-	`, uuid.New(), tenantID, organizationID, srcInvID, poID, qty, unitCost, qty*unitCost, now, userID)
-
-	// 2. Add to finished goods warehouse
-	var fgInvID uuid.UUID
-	err = tx.QueryRow(`
-		SELECT id FROM inventory
-		WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-		AND lot_number IS NULL AND serial_number IS NULL
-	`, tenantID, productID, fgWarehouseID).Scan(&fgInvID)
-
-	if err == sql.ErrNoRows {
-		fgInvID = uuid.New()
-		tx.Exec(`
-			INSERT INTO inventory (id, tenant_id, organization_id, product_id, warehouse_id,
-				quantity_on_hand, quantity_reserved, unit_cost, last_movement_date, created_at, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$8,$8)
-		`, fgInvID, tenantID, organizationID, productID, fgWarehouseID, qty, unitCost, now)
-	} else if err == nil {
-		tx.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-			qty, now, fgInvID)
+	if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+		TenantID:    tenantID,
+		OrgID:       organizationID,
+		ProductID:   productID,
+		WarehouseID: productionWarehouseID,
+		Qty:         -qty,
+		UnitCost:    unitCost,
+		TxType:      "transfer_out",
+		RefType:     "production_order",
+		RefID:       poID.String(),
+		Reason:      "fg_transfer",
+		Notes:       "Tayyor mahsulot omboriga o'tkazildi",
+		FromWH:      &productionWarehouseID,
+		ToWH:        &fgWarehouseID,
+		CreatedBy:   userID,
+		When:        now,
+	}); dErr != nil {
+		h.log.Error("transferToFG: out-leg failed, transfer skipped", "error", dErr, "po_id", poID)
+		return
 	}
 
-	// Create receipt transaction in FG warehouse
-	tx.Exec(`
-		INSERT INTO inventory_transactions (
-			id, tenant_id, organization_id, inventory_id, transaction_type,
-			reference_type, reference_id, quantity, unit_cost, total_cost,
-			reason, notes, transaction_date, created_by, created_at
-		) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,$7,$8,'fg_transfer','Ishlab chiqarishdan tayyor mahsulot qabul qilindi',$9,$10,$9)
-	`, uuid.New(), tenantID, organizationID, fgInvID, poID, qty, unitCost, qty*unitCost, now, userID)
+	if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+		TenantID:    tenantID,
+		OrgID:       organizationID,
+		ProductID:   productID,
+		WarehouseID: fgWarehouseID,
+		Qty:         qty,
+		UnitCost:    unitCost,
+		TxType:      "transfer_in",
+		RefType:     "production_order",
+		RefID:       poID.String(),
+		Reason:      "fg_transfer",
+		Notes:       "Ishlab chiqarishdan tayyor mahsulot qabul qilindi",
+		FromWH:      &productionWarehouseID,
+		ToWH:        &fgWarehouseID,
+		CreatedBy:   userID,
+		When:        now,
+	}); dErr != nil {
+		h.log.Error("transferToFG: in-leg failed, transfer rolled back", "error", dErr, "po_id", poID)
+		return
+	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
 		h.log.Error("transferToFG: commit failed", "error", commitErr)
@@ -2328,98 +2274,119 @@ func (h *Handler) AddWorkOrderMaterial(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 	now := time.Now()
-
 	id := uuid.New()
-	_, err = h.db.Exec(`
+
+	// Resolve the source warehouse for the stock issue: the PO's warehouse
+	// when it has an inventory row for this product, else the warehouse
+	// holding the biggest balance (same preference the old lookup had).
+	var srcWarehouseID *uuid.UUID
+	var invUnitCost float64
+	{
+		var wh uuid.UUID
+		lookupErr := sql.ErrNoRows
+		if warehouseID != nil {
+			lookupErr = h.db.QueryRow(`
+				SELECT warehouse_id, COALESCE(unit_cost, 0) FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+				LIMIT 1
+			`, tenantID, input.ProductID, warehouseID).Scan(&wh, &invUnitCost)
+		}
+		if lookupErr != nil {
+			lookupErr = h.db.QueryRow(`
+				SELECT warehouse_id, COALESCE(unit_cost, 0) FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2
+				ORDER BY quantity_on_hand DESC LIMIT 1
+			`, tenantID, input.ProductID).Scan(&wh, &invUnitCost)
+		}
+		if lookupErr == nil {
+			srcWarehouseID = &wh
+		}
+	}
+
+	// ── ONE tx: material row + stock issue (applyStockDelta) + consumption
+	// JE + cost rollup (integration map §3). ─────────────────────────────
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("AddWorkOrderMaterial: failed to begin tx", "error", txErr)
+		response.InternalError(c, "Failed to add material")
+		return
+	}
+	defer tx.Rollback()
+
+	if _, err = tx.Exec(`
 		INSERT INTO work_order_materials (id, tenant_id, work_order_id, production_order_id, product_id, product_name, quantity, uom, unit_cost, total_cost, notes, created_by)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-		id, tenantID, woID, poID, input.ProductID, productName, input.Quantity, input.UOM, unitCost, totalCost, input.Notes, userID)
-	if err != nil {
+		id, tenantID, woID, poID, input.ProductID, productName, input.Quantity, input.UOM, unitCost, totalCost, input.Notes, userID); err != nil {
 		response.InternalError(c, "Failed to add material: "+err.Error())
 		return
 	}
 
-	// Deduct from inventory (same pattern as consumeBOMComponents)
-	{
-		var invID uuid.UUID
-		var invUnitCost float64
-		var invErr error
-		if warehouseID != nil {
-			invErr = h.db.QueryRow(`
-				SELECT id, COALESCE(unit_cost, 0) FROM inventory
-				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-				AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
-				LIMIT 1
-			`, tenantID, input.ProductID, warehouseID).Scan(&invID, &invUnitCost)
+	if srcWarehouseID != nil {
+		effectiveUnitCost := invUnitCost
+		if effectiveUnitCost == 0 {
+			effectiveUnitCost = unitCost
 		}
-		// Fallback: find any inventory record for this product
-		if invErr != nil || warehouseID == nil {
-			invErr = h.db.QueryRow(`
-				SELECT id, COALESCE(unit_cost, 0) FROM inventory
-				WHERE tenant_id = $1 AND product_id = $2
-				AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
-				ORDER BY quantity_on_hand DESC LIMIT 1
-			`, tenantID, input.ProductID).Scan(&invID, &invUnitCost)
+		// AllowNeg matches the old behavior: shop-floor extras were always
+		// deducted even past zero (reconcilable via stock count).
+		_, valuedCost, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+			TenantID:    tenantID,
+			OrgID:       organizationID,
+			ProductID:   input.ProductID,
+			WarehouseID: *srcWarehouseID,
+			Qty:         -input.Quantity,
+			UnitCost:    effectiveUnitCost,
+			TxType:      "issue",
+			RefType:     "production_order",
+			RefID:       poID.String(),
+			Reason:      "material_consumption",
+			Notes:       "Work order material consumption",
+			CreatedBy:   userID,
+			When:        now,
+			AllowNeg:    true,
+		})
+		if dErr != nil {
+			h.log.Error("AddWorkOrderMaterial: stock issue failed", "error", dErr, "po_id", poID)
+			response.InternalError(c, "Failed to deduct material from stock")
+			return
 		}
 
-		if invErr == nil {
-			h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-				input.Quantity, now, invID)
-
-			h.db.Exec(`
-				INSERT INTO inventory_transactions (
-					id, tenant_id, organization_id, inventory_id, transaction_type,
-					reference_type, reference_id, quantity, unit_cost, total_cost,
-					reason, notes, transaction_date, created_by, created_at
-				) VALUES ($1,$2,$3,$4,'issue','production_order',$5,$6,$7,$8,'material_consumption','Work order material consumption',$9,$10,$9)
-			`, uuid.New(), tenantID, organizationID, invID, poID, input.Quantity, invUnitCost, input.Quantity*invUnitCost, now, userID)
-
-			// GL posting — DR cost-of-materials / CR inventory. Before
-			// this call, AddWorkOrderMaterial decremented inventory and
-			// wrote an inventory_transactions row but never posted the
-			// offsetting JE, contributing to the Buxgalteriya-vs-Ombor
-			// drift on LUXURYMEBEL. Idempotency key uses the new
-			// work_order_materials row id (`id`) which is fresh on
-			// every successful add.
-			//
-			// Unit cost preference: stored inventory unit_cost ↦
-			// fallback to the input/product cost we already resolved
-			// above. Matches the cost basis written to
-			// inventory_transactions.
-			effectiveUnitCost := invUnitCost
-			if effectiveUnitCost == 0 {
-				effectiveUnitCost = unitCost
-			}
-			jeTx, jeErr := h.db.Begin()
-			if jeErr != nil {
-				h.log.Error("AddWorkOrderMaterial: failed to begin consumption JE tx", "error", jeErr, "po_id", poID)
-			} else {
-				h.postInventoryConsumptionJE(jeTx, postInventoryConsumptionArgs{
-					TenantID:       tenantID,
-					OrganizationID: organizationID,
-					ProductID:      input.ProductID,
-					Quantity:       input.Quantity,
-					UnitCost:       effectiveUnitCost,
-					SourceType:     "work_order_material_add",
-					SourceID:       id,
-					IdempotencyKey: fmt.Sprintf("WO-MAT-%s", id.String()),
-					Description: fmt.Sprintf("Work order material — %s × %.2f %s",
-						productName, input.Quantity, input.UOM),
-				})
-				if commitErr := jeTx.Commit(); commitErr != nil {
-					h.log.Error("AddWorkOrderMaterial: failed to commit consumption JE", "error", commitErr, "po_id", poID)
-					jeTx.Rollback()
-				}
-			}
-		}
+		// GL posting in the SAME tx — DR cost-of-materials / CR inventory.
+		// Idempotency key uses the fresh work_order_materials row id; the
+		// removal path reverses by this same key. A JE failure poisons the
+		// tx so everything above rolls back together.
+		h.postInventoryConsumptionJE(tx, postInventoryConsumptionArgs{
+			TenantID:       tenantID,
+			OrganizationID: organizationID,
+			ProductID:      input.ProductID,
+			Quantity:       input.Quantity,
+			UnitCost:       valuedCost,
+			SourceType:     "work_order_material_add",
+			SourceID:       id,
+			IdempotencyKey: fmt.Sprintf("WO-MAT-%s", id.String()),
+			Description: fmt.Sprintf("Work order material — %s × %.2f %s",
+				productName, input.Quantity, input.UOM),
+		})
+	} else {
+		h.log.Warn("AddWorkOrderMaterial: no inventory row found — material recorded without stock deduction",
+			"product_id", input.ProductID, "po_id", poID)
 	}
 
 	// Update production order material_cost and actual_cost
-	h.db.Exec(`
+	if _, err = tx.Exec(`
 		UPDATE production_orders SET
 			material_cost = COALESCE((SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0),
 			actual_cost = COALESCE((SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0)
-		WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
+		WHERE id = $1 AND tenant_id = $2`, poID, tenantID); err != nil {
+		h.log.Error("AddWorkOrderMaterial: cost rollup failed", "error", err, "po_id", poID)
+		response.InternalError(c, "Failed to add material")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("AddWorkOrderMaterial: commit failed", "error", err, "po_id", poID)
+		response.InternalError(c, "Failed to add material")
+		return
+	}
 
 	response.Success(c, gin.H{
 		"id":           id,
@@ -2446,6 +2413,9 @@ func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
 		return
 	}
 
+	userID, _ := middleware.GetUserID(c)
+	now := time.Now()
+
 	// Get material details before deleting (for inventory restoration)
 	var poID uuid.UUID
 	var productID uuid.UUID
@@ -2456,66 +2426,152 @@ func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
 		return
 	}
 
-	result, err := h.db.Exec(`DELETE FROM work_order_materials WHERE id = $1 AND tenant_id = $2`, materialID, tenantID)
+	var warehouseID *uuid.UUID
+	var organizationID *uuid.UUID
+	h.db.QueryRow(`SELECT warehouse_id, organization_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&warehouseID, &organizationID)
+
+	// Resolve the warehouse the material goes back to (mirror of the add
+	// path's source resolution).
+	var dstWarehouseID *uuid.UUID
+	{
+		var wh uuid.UUID
+		lookupErr := sql.ErrNoRows
+		if warehouseID != nil {
+			lookupErr = h.db.QueryRow(`
+				SELECT warehouse_id FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+				LIMIT 1
+			`, tenantID, productID, warehouseID).Scan(&wh)
+		}
+		if lookupErr != nil {
+			lookupErr = h.db.QueryRow(`
+				SELECT warehouse_id FROM inventory
+				WHERE tenant_id = $1 AND product_id = $2
+				ORDER BY quantity_on_hand DESC LIMIT 1
+			`, tenantID, productID).Scan(&wh)
+		}
+		if lookupErr == nil {
+			dstWarehouseID = &wh
+		}
+	}
+
+	// ── ONE tx: row delete + stock return (applyStockDelta) + reversal of
+	// the add-path consumption JE + cost rollup. ─────────────────────────
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("RemoveWorkOrderMaterial: failed to begin tx", "error", txErr)
+		response.InternalError(c, "Failed to remove material")
+		return
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`DELETE FROM work_order_materials WHERE id = $1 AND tenant_id = $2`, materialID, tenantID)
 	if err != nil {
 		response.InternalError(c, "Failed to remove material")
 		return
 	}
-
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
 		response.NotFound(c, "Material not found")
 		return
 	}
 
-	// Restore inventory
+	if dstWarehouseID != nil {
+		// UnitCost 0 → valued at the stored average; the balance row's
+		// AVECO cost is untouched by design (positive deltas with zero
+		// cost never fold into the average).
+		if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+			TenantID:    tenantID,
+			OrgID:       organizationID,
+			ProductID:   productID,
+			WarehouseID: *dstWarehouseID,
+			Qty:         quantity,
+			UnitCost:    0,
+			TxType:      "return",
+			RefType:     "production_order",
+			RefID:       poID.String(),
+			Reason:      "material_return",
+			Notes:       "Work order material removed",
+			CreatedBy:   userID,
+			When:        now,
+		}); dErr != nil {
+			h.log.Error("RemoveWorkOrderMaterial: stock return failed", "error", dErr, "po_id", poID)
+			response.InternalError(c, "Failed to restore stock")
+			return
+		}
+	}
+
+	// Reverse the add-path consumption JE (keyed WO-MAT-<materialID>): the
+	// stock came back, so the DR-expense/CR-inventory entry must go too, or
+	// the Buxgalteriya-vs-Ombor drift reappears. Soft-delete the entry and
+	// recompute exactly the accounts its lines touched.
 	{
-		var warehouseID *uuid.UUID
-		h.db.QueryRow(`SELECT warehouse_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&warehouseID)
-
-		var invID uuid.UUID
-		var invErr error
-		if warehouseID != nil {
-			invErr = h.db.QueryRow(`
-				SELECT id FROM inventory
-				WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
-				AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
-				LIMIT 1
-			`, tenantID, productID, warehouseID).Scan(&invID)
-		}
-		if invErr != nil || warehouseID == nil {
-			invErr = h.db.QueryRow(`
-				SELECT id FROM inventory
-				WHERE tenant_id = $1 AND product_id = $2
-				AND (lot_number IS NULL OR lot_number = '') AND (serial_number IS NULL OR serial_number = '')
-				ORDER BY quantity_on_hand DESC LIMIT 1
-			`, tenantID, productID).Scan(&invID)
-		}
-		if invErr == nil {
-			now := time.Now()
-			h.db.Exec(`UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, last_movement_date = $2, updated_at = $2 WHERE id = $3`,
-				quantity, now, invID)
-
-			userID, _ := middleware.GetUserID(c)
-			var organizationID *uuid.UUID
-			h.db.QueryRow(`SELECT organization_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&organizationID)
-
-			h.db.Exec(`
-				INSERT INTO inventory_transactions (
-					id, tenant_id, organization_id, inventory_id, transaction_type,
-					reference_type, reference_id, quantity, unit_cost, total_cost,
-					reason, notes, transaction_date, created_by, created_at
-				) VALUES ($1,$2,$3,$4,'receipt','production_order',$5,$6,0,0,'material_return','Work order material removed',$7,$8,$7)
-			`, uuid.New(), tenantID, organizationID, invID, poID, quantity, now, userID)
+		var origJE uuid.UUID
+		tx.QueryRow(`
+			SELECT id FROM journal_entries
+			WHERE tenant_id = $1 AND reference = $2 AND deleted_at IS NULL
+		`, tenantID, fmt.Sprintf("WO-MAT-%s", materialID.String())).Scan(&origJE)
+		if origJE != uuid.Nil {
+			touched := []string{}
+			if aRows, aErr := tx.Query(`SELECT DISTINCT account_id::text FROM journal_entry_lines WHERE journal_entry_id = $1`, origJE); aErr == nil {
+				for aRows.Next() {
+					var acctID string
+					if aRows.Scan(&acctID) == nil {
+						touched = append(touched, acctID)
+					}
+				}
+				aRows.Close()
+			}
+			if _, jeErr := tx.Exec(`UPDATE journal_entries SET deleted_at = $1, updated_at = $1 WHERE id = $2`, now, origJE); jeErr != nil {
+				h.log.Error("RemoveWorkOrderMaterial: failed to reverse consumption JE", "error", jeErr, "material_id", materialID)
+				response.InternalError(c, "Failed to reverse material journal entry")
+				return
+			}
+			if len(touched) > 0 {
+				if _, recErr := tx.Exec(`
+					UPDATE accounts a
+					SET current_balance = CASE
+						WHEN at.normal_balance = 'debit' THEN s.dt - s.kt
+						ELSE                                  s.kt - s.dt
+					END,
+					    updated_at = NOW()
+					FROM account_types at,
+					     (SELECT acc.id AS account_id,
+					             COALESCE(SUM(jel.debit_amount)  FILTER (WHERE je.status = 'posted' AND je.deleted_at IS NULL), 0) AS dt,
+					             COALESCE(SUM(jel.credit_amount) FILTER (WHERE je.status = 'posted' AND je.deleted_at IS NULL), 0) AS kt
+					      FROM accounts acc
+					      LEFT JOIN journal_entry_lines jel ON jel.account_id = acc.id
+					      LEFT JOIN journal_entries je ON je.id = jel.journal_entry_id
+					      WHERE acc.tenant_id = $1 AND acc.id = ANY($2::uuid[])
+					      GROUP BY acc.id) s
+					WHERE a.account_type_id = at.id
+					  AND s.account_id = a.id
+					  AND a.tenant_id = $1;
+				`, tenantID, pq.Array(touched)); recErr != nil {
+					h.log.Error("RemoveWorkOrderMaterial: balance recompute failed", "error", recErr, "material_id", materialID)
+					response.InternalError(c, "Failed to reverse material journal entry")
+					return
+				}
+			}
 		}
 	}
 
 	// Update production order material_cost and actual_cost
-	h.db.Exec(`
+	if _, err = tx.Exec(`
 		UPDATE production_orders SET
 			material_cost = COALESCE((SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0),
 			actual_cost = COALESCE((SELECT SUM(total_cost) FROM work_order_materials WHERE production_order_id = $1 AND tenant_id = $2), 0)
-		WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
+		WHERE id = $1 AND tenant_id = $2`, poID, tenantID); err != nil {
+		h.log.Error("RemoveWorkOrderMaterial: cost rollup failed", "error", err, "po_id", poID)
+		response.InternalError(c, "Failed to remove material")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("RemoveWorkOrderMaterial: commit failed", "error", err, "po_id", poID)
+		response.InternalError(c, "Failed to remove material")
+		return
+	}
 
 	response.Success(c, gin.H{"message": "Material removed"})
 }
@@ -2692,4 +2748,277 @@ func (h *Handler) DeleteWorkOrderAttachment(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{"message": "Attachment deleted"})
+}
+
+// =====================================================
+// QUALITY CAPTURE (B5) + ISHBAY / PIECE-RATE (B6)
+// =====================================================
+
+// CreateWorkOrderQualityCheck — POST /work-orders/:id/quality-check.
+// Makes the 011 quality_checks table real: one inspection row per call,
+// result derived from the quantities, production_order_id/product_id
+// resolved from the work order. RBAC: manufacturing:quality_checks:create.
+func (h *Handler) CreateWorkOrderQualityCheck(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	woID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	var input struct {
+		QuantityInspected float64 `json:"quantity_inspected" binding:"required,gt=0"`
+		QuantityPassed    float64 `json:"quantity_passed"`
+		QuantityFailed    float64 `json:"quantity_failed"`
+		DefectReason      string  `json:"defect_reason,omitempty"`
+		Notes             string  `json:"notes,omitempty"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input: "+err.Error())
+		return
+	}
+	if input.QuantityPassed < 0 || input.QuantityFailed < 0 {
+		response.BadRequest(c, "Miqdorlar manfiy bo'lishi mumkin emas")
+		return
+	}
+	// Neither split given → everything not failed passed.
+	if input.QuantityPassed == 0 && input.QuantityFailed >= 0 && input.QuantityFailed <= input.QuantityInspected {
+		if input.QuantityPassed == 0 && input.QuantityFailed == 0 {
+			input.QuantityPassed = input.QuantityInspected
+		} else if input.QuantityPassed == 0 {
+			input.QuantityPassed = input.QuantityInspected - input.QuantityFailed
+		}
+	}
+	if input.QuantityPassed+input.QuantityFailed > input.QuantityInspected*1.0001 {
+		response.BadRequest(c, fmt.Sprintf(
+			"O'tgan + brak miqdori tekshirilganidan oshib ketadi: %.2f + %.2f > %.2f",
+			input.QuantityPassed, input.QuantityFailed, input.QuantityInspected))
+		return
+	}
+
+	// Work order lookup, org-scoped (audit §2.9 convention).
+	var orgArg interface{}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgArg = orgID
+	}
+	var poID *uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT production_order_id FROM work_orders
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		  AND (organization_id IS NULL OR $3::uuid IS NULL OR organization_id = $3)
+	`, woID, tenantID, orgArg).Scan(&poID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Work order not found")
+		return
+	}
+	if err != nil {
+		h.log.Error("CreateWorkOrderQualityCheck: WO lookup failed", "error", err)
+		response.InternalError(c, "Failed to record quality check")
+		return
+	}
+
+	var productID *uuid.UUID
+	if poID != nil {
+		h.db.QueryRow(`SELECT product_id FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&productID)
+	}
+
+	// Derived result + pass rate.
+	result := "partial"
+	if input.QuantityFailed <= 0 {
+		result = "passed"
+	} else if input.QuantityPassed <= 0 {
+		result = "failed"
+	}
+	passRate := input.QuantityPassed / input.QuantityInspected * 100
+
+	var inspectorName string
+	h.db.QueryRow(`SELECT COALESCE(first_name || ' ' || last_name, email) FROM users WHERE id = $1`, userID).Scan(&inspectorName)
+
+	// defect_reason: short form into defect_type (VARCHAR(100), the most
+	// fitting column), full text into failure_reason.
+	defectType := input.DefectReason
+	if len(defectType) > 100 {
+		defectType = defectType[:100]
+	}
+
+	now := time.Now()
+	qcID := uuid.New()
+	qcCode := "QC-" + now.Format("20060102") + "-" + uuid.New().String()[:6]
+
+	if _, err := h.db.Exec(`
+		INSERT INTO quality_checks (
+			id, tenant_id, code, production_order_id, work_order_id, product_id,
+			inspection_date, inspector_id, inspector_name,
+			quantity_inspected, quantity_passed, quantity_failed,
+			result, pass_rate, defect_type, failure_reason, notes,
+			created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+		          NULLIF($15, ''), NULLIF($16, ''), NULLIF($17, ''), $7, $7)
+	`, qcID, tenantID, qcCode, poID, woID, productID,
+		now, nullableUUID(userID), inspectorName,
+		input.QuantityInspected, input.QuantityPassed, input.QuantityFailed,
+		result, passRate, defectType, input.DefectReason, input.Notes); err != nil {
+		h.log.Error("CreateWorkOrderQualityCheck: insert failed", "error", err, "wo_id", woID)
+		response.InternalError(c, "Failed to record quality check")
+		return
+	}
+
+	response.Created(c, gin.H{
+		"id":        qcID,
+		"code":      qcCode,
+		"result":    result,
+		"pass_rate": passRate,
+	})
+}
+
+// recordPiecework writes the ishbay (piece-rate) HR handoff row when the
+// completed operation carries a piece_rate (B6, integration map §6). NO
+// payroll_entries writes — payroll consumes production_piecework in its own
+// phase. The UNIQUE (work_order_id, employee_id) constraint is the
+// double-post guard.
+func (h *Handler) recordPiecework(tenantID, woID, userID uuid.UUID, goodQty float64, now time.Time) {
+	if goodQty <= 0 {
+		return
+	}
+
+	var poID *uuid.UUID
+	var orgID *uuid.UUID
+	var operationName string
+	var pieceRate float64
+	if err := h.db.QueryRow(`
+		SELECT wo.production_order_id, wo.organization_id,
+		       COALESCE(bo.operation_name, wo.name, ''), COALESCE(bo.piece_rate, 0)
+		FROM work_orders wo
+		LEFT JOIN bom_operations bo ON bo.id = wo.operation_id
+		WHERE wo.id = $1 AND wo.tenant_id = $2
+	`, woID, tenantID).Scan(&poID, &orgID, &operationName, &pieceRate); err != nil || pieceRate <= 0 {
+		return
+	}
+
+	// Operator resolution order: latest employee-linked time log (459
+	// groundwork) → the completing user's employee record → the WO
+	// assignee's employee record.
+	var employeeID uuid.UUID
+	h.db.QueryRow(`
+		SELECT employee_id FROM work_order_time_logs
+		WHERE work_order_id = $1 AND tenant_id = $2 AND employee_id IS NOT NULL
+		ORDER BY start_time DESC LIMIT 1
+	`, woID, tenantID).Scan(&employeeID)
+	if employeeID == uuid.Nil && userID != uuid.Nil {
+		h.db.QueryRow(`SELECT employee_id FROM users WHERE id = $1 AND employee_id IS NOT NULL`, userID).Scan(&employeeID)
+	}
+	if employeeID == uuid.Nil {
+		h.db.QueryRow(`
+			SELECT u.employee_id FROM work_orders wo
+			JOIN users u ON u.id = wo.assigned_to
+			WHERE wo.id = $1 AND u.employee_id IS NOT NULL
+		`, woID).Scan(&employeeID)
+	}
+	if employeeID == uuid.Nil {
+		h.log.Info("recordPiecework: operation has piece_rate but no operator resolvable — skipping",
+			"wo_id", woID, "piece_rate", pieceRate)
+		return
+	}
+
+	if _, err := h.db.Exec(`
+		INSERT INTO production_piecework (
+			id, tenant_id, organization_id, work_order_id, production_order_id,
+			employee_id, operation_name, good_quantity, piece_rate, amount, work_date, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::date, $12)
+		ON CONFLICT (work_order_id, employee_id) DO NOTHING
+	`, uuid.New(), tenantID, orgID, woID, poID,
+		employeeID, operationName, goodQty, pieceRate, goodQty*pieceRate, now, now); err != nil {
+		h.log.Error("recordPiecework: insert failed", "error", err, "wo_id", woID)
+	} else {
+		h.log.Info("recordPiecework: ishbay row recorded",
+			"wo_id", woID, "employee_id", employeeID, "amount", goodQty*pieceRate)
+	}
+}
+
+// GetPieceworkSummary — GET /payroll/piecework?from&to&employee_id.
+// Per-employee ishbay summary for the HR/payroll handoff (B6): row counts,
+// good quantity and total amount per employee in the period. Default period
+// is the current month.
+func (h *Handler) GetPieceworkSummary(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	var orgArg interface{}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgArg = orgID
+	}
+
+	nowT := time.Now()
+	from := time.Date(nowT.Year(), nowT.Month(), 1, 0, 0, 0, 0, nowT.Location())
+	to := nowT
+	if s := c.Query("from"); s != "" {
+		if t, err := time.Parse("2006-01-02", s); err == nil {
+			from = t
+		}
+	}
+	if s := c.Query("to"); s != "" {
+		if t, err := time.Parse("2006-01-02", s); err == nil {
+			to = t.Add(24*time.Hour - time.Nanosecond)
+		}
+	}
+
+	query := `
+		SELECT pw.employee_id,
+		       COALESCE(e.first_name || ' ' || e.last_name, ''),
+		       COUNT(*),
+		       COALESCE(SUM(pw.good_quantity), 0),
+		       COALESCE(SUM(pw.amount), 0)
+		FROM production_piecework pw
+		LEFT JOIN employees e ON e.id = pw.employee_id
+		WHERE pw.tenant_id = $1
+		  AND pw.work_date >= $2::date AND pw.work_date <= $3::date
+		  AND (pw.organization_id IS NULL OR $4::uuid IS NULL OR pw.organization_id = $4)`
+	args := []interface{}{tenantID, from, to, orgArg}
+	if s := c.Query("employee_id"); s != "" {
+		if empID, err := uuid.Parse(s); err == nil {
+			query += " AND pw.employee_id = $5"
+			args = append(args, empID)
+		}
+	}
+	query += ` GROUP BY pw.employee_id, e.first_name, e.last_name
+	           ORDER BY SUM(pw.amount) DESC`
+
+	type pieceworkSummary struct {
+		EmployeeID   uuid.UUID `json:"employee_id"`
+		EmployeeName string    `json:"employee_name"`
+		Entries      int       `json:"entries"`
+		GoodQuantity float64   `json:"good_quantity"`
+		TotalAmount  float64   `json:"total_amount"`
+	}
+	summaries := []pieceworkSummary{}
+	totalAmount := 0.0
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to load piecework summary", "error", err)
+		response.InternalError(c, "Failed to load piecework summary")
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s pieceworkSummary
+		if rows.Scan(&s.EmployeeID, &s.EmployeeName, &s.Entries, &s.GoodQuantity, &s.TotalAmount) == nil {
+			totalAmount += s.TotalAmount
+			summaries = append(summaries, s)
+		}
+	}
+
+	response.Success(c, gin.H{
+		"employees":    summaries,
+		"total_amount": totalAmount,
+		"from":         from.Format("2006-01-02"),
+		"to":           to.Format("2006-01-02"),
+	})
 }

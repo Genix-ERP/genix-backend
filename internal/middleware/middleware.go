@@ -481,7 +481,7 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"organization":  {"organization", "department"},
 		"users":         {"user", "role"},
 		"tasks":         {"board", "column", "task"},
-		"manufacturing": {"production_orders", "work_orders", "work_centers", "transfers"},
+		"manufacturing": {"production_orders", "work_orders", "work_centers", "transfers", "equipment", "cost_calculations", "mrp", "quality_checks"},
 		"assets":        {"asset", "category", "depreciation"},
 		"expenses":      {"expense", "report", "category"},
 		"ai":            {"conversation"},

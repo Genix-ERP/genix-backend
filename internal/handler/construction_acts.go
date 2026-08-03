@@ -1449,6 +1449,25 @@ func (h *Handler) SignAct(c *gin.Context) {
 	h.logConstructionActivity(tenantID, projectID, userID, "act",
 		fmt.Sprintf("Akt imzolandi (%s): %s", req.Role, actName), "Act", actID)
 
+	// Workflow event — fires once per FULL signing (all required parties),
+	// not per individual signature, so rules don't spam on multi-role acts.
+	if newState == "signed" && currentState != "signed" {
+		var evActNumber, evProjName string
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(a.act_number::text, ''), COALESCE(p.name, '')
+			FROM construction_act a
+			LEFT JOIN construction_projects p ON p.id = a.project_id
+			WHERE a.id = $1 AND a.tenant_id = $2
+		`, actID, tenantID).Scan(&evActNumber, &evProjName)
+		h.EmitWorkflowEvent(tenantID, "construction.act_signed", map[string]interface{}{
+			"record_id":    strconv.FormatInt(actID, 10),
+			"act_number":   evActNumber,
+			"act_type":     actType,
+			"project_name": evProjName,
+			"signer_role":  req.Role,
+		})
+	}
+
 	// Notification: if ks2 and now fully signed, notify project manager
 	if newState == "signed" && (actType == "ks2" || actType == "ks3") {
 		var pmUserID uuid.UUID
@@ -1506,10 +1525,16 @@ func (h *Handler) CancelAct(c *gin.Context) {
 	}
 
 	var projectID int64
-	var currentState, actType string
+	var currentState, actType, cancelActNumber string
 	var subcontractID sql.NullInt64
-	err = h.db.QueryRow(`SELECT project_id, state, act_type, subcontract_id FROM construction_act WHERE id = $1 AND tenant_id = $2`,
-		actID, tenantID).Scan(&projectID, &currentState, &actType, &subcontractID)
+	var postedJE, postedCEL uuid.NullUUID
+	var postedAmount float64
+	err = h.db.QueryRow(`
+		SELECT project_id, state, act_type, subcontract_id, COALESCE(act_number::text, ''),
+		       journal_entry_id, expense_line_id, COALESCE(amount_total_with_vat, 0)
+		FROM construction_act WHERE id = $1 AND tenant_id = $2
+	`, actID, tenantID).Scan(&projectID, &currentState, &actType, &subcontractID,
+		&cancelActNumber, &postedJE, &postedCEL, &postedAmount)
 	if err != nil {
 		response.NotFound(c, "Act not found")
 		return
@@ -1522,12 +1547,116 @@ func (h *Handler) CancelAct(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
-	_, err = h.db.Exec(`
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to cancel act")
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`
 		UPDATE construction_act SET state = 'cancelled', rejection_reason = $1, updated_date = NOW()
-		WHERE id = $2 AND tenant_id = $3
+		WHERE id = $2 AND tenant_id = $3 AND state IN ('signed', 'approved')
 	`, req.RejectionReason, actID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to cancel act", "error", err)
+		response.InternalError(c, "Failed to cancel act")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.BadRequest(c, "Faqat imzolangan yoki tasdiqlangan aktlarni bekor qilish mumkin")
+		return
+	}
+
+	// ── S4 reversal: a POSTED sub act must not leave Dr 0810 / Cr 6010
+	// standing after cancel. Storno = a second, reversing entry (Dr 6010 /
+	// Cr 0810) in the same tx; the original entry and the act's links stay
+	// for the audit trail, the expense line flips to cancelled.
+	if postedJE.Valid && postedAmount > 0 {
+		// Load EVERY original line (retention split may have produced 3) and
+		// mirror each with sides swapped — the reversal stays correct no
+		// matter how the posting was shaped.
+		type origLine struct {
+			acct    uuid.UUID
+			contact uuid.NullUUID
+			desc    string
+			debit   float64
+			credit  float64
+		}
+		var jeOrgID uuid.NullUUID
+		var journalID uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT organization_id, journal_id FROM journal_entries WHERE id = $1 AND tenant_id = $2
+		`, postedJE.UUID, tenantID).Scan(&jeOrgID, &journalID); err != nil {
+			h.log.Error("Act cancel: original JE not found", "error", err, "act_id", actID)
+			response.InternalError(c, "Failed to reverse act posting")
+			return
+		}
+		origLines := []origLine{}
+		if lrows, err := h.db.Query(`
+			SELECT account_id, contact_id, COALESCE(description, ''), COALESCE(debit_amount, 0), COALESCE(credit_amount, 0)
+			FROM journal_entry_lines WHERE journal_entry_id = $1 ORDER BY line_number
+		`, postedJE.UUID); err == nil {
+			for lrows.Next() {
+				var l origLine
+				if lrows.Scan(&l.acct, &l.contact, &l.desc, &l.debit, &l.credit) == nil {
+					origLines = append(origLines, l)
+				}
+			}
+			lrows.Close()
+		}
+		if len(origLines) < 2 {
+			h.log.Error("Act cancel: original JE lines not found", "act_id", actID)
+			response.InternalError(c, "Failed to reverse act posting")
+			return
+		}
+
+		now := time.Now()
+		revID := uuid.New()
+		revNumber := fmt.Sprintf("SAKTR%06d", h.getNextJournalNumber(tx, journalID))
+		revDesc := fmt.Sprintf("Storno: sub akt %s — %s", cancelActNumber, req.RejectionReason)
+		if _, err := tx.Exec(`
+			INSERT INTO journal_entries (
+				id, tenant_id, organization_id, journal_id, entry_number,
+				entry_date, reference, description, source_type, source_id,
+				status, total_debit, total_credit, reversed_entry_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'construction_act_reversal', $9, 'posted', $10, $10, $11, $12, $12)
+		`, revID, tenantID, jeOrgID, journalID, revNumber,
+			now, cancelActNumber, revDesc, postedCEL, postedAmount, postedJE.UUID, now); err != nil {
+			h.log.Error("Act cancel: reversal JE failed", "error", err, "act_id", actID)
+			response.InternalError(c, "Failed to reverse act posting")
+			return
+		}
+		for i, l := range origLines {
+			if _, err := tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, contact_id, description, debit_amount, credit_amount, line_number, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			`, uuid.New(), revID, l.acct, l.contact, revDesc, l.credit, l.debit, i+1, now); err != nil {
+				h.log.Error("Act cancel: reversal line failed", "error", err, "act_id", actID)
+				response.InternalError(c, "Failed to reverse act posting")
+				return
+			}
+			if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`,
+				l.credit-l.debit, now, l.acct); err != nil {
+				response.InternalError(c, "Failed to reverse act posting")
+				return
+			}
+		}
+		if postedCEL.Valid {
+			if _, err := tx.Exec(`
+				UPDATE construction_expense_lines
+				SET status = 'cancelled', cancelled_reason = $1, cancelled_at = NOW(), updated_at = NOW()
+				WHERE id = $2 AND tenant_id = $3
+			`, req.RejectionReason, postedCEL.UUID, tenantID); err != nil {
+				h.log.Error("Act cancel: CEL flip failed", "error", err, "act_id", actID)
+				response.InternalError(c, "Failed to reverse act posting")
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit act cancel", "error", err)
 		response.InternalError(c, "Failed to cancel act")
 		return
 	}
@@ -1584,9 +1713,15 @@ func (h *Handler) ApproveConstructionAct(c *gin.Context) {
 	}
 
 	var projectID int64
-	var currentState string
-	err = h.db.QueryRow(`SELECT project_id, state FROM construction_act WHERE id = $1 AND tenant_id = $2`,
-		actID, tenantID).Scan(&projectID, &currentState)
+	var currentState, approveActNumber string
+	var subcontractID sql.NullInt64
+	var amountWithVat float64
+	var existingJE uuid.NullUUID
+	err = h.db.QueryRow(`
+		SELECT project_id, state, COALESCE(act_number::text, ''), subcontract_id,
+		       COALESCE(amount_total_with_vat, 0), journal_entry_id
+		FROM construction_act WHERE id = $1 AND tenant_id = $2
+	`, actID, tenantID).Scan(&projectID, &currentState, &approveActNumber, &subcontractID, &amountWithVat, &existingJE)
 	if err != nil {
 		response.NotFound(c, "Act not found")
 		return
@@ -1599,18 +1734,188 @@ func (h *Handler) ApproveConstructionAct(c *gin.Context) {
 
 	userID, _ := middleware.GetUserID(c)
 
-	_, err = h.db.Exec(`
+	var projOrgID uuid.NullUUID
+	_ = h.db.QueryRow(`SELECT organization_id FROM construction_projects WHERE id = $1 AND tenant_id = $2`,
+		projectID, tenantID).Scan(&projOrgID)
+	var orgPtr *uuid.UUID
+	if projOrgID.Valid && projOrgID.UUID != uuid.Nil {
+		orgPtr = &projOrgID.UUID
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to approve act")
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`
 		UPDATE construction_act SET state = 'approved', approved_by = $1, approved_date = NOW(), updated_date = NOW()
-		WHERE id = $2 AND tenant_id = $3
+		WHERE id = $2 AND tenant_id = $3 AND state IN ('draft', 'submitted')
 	`, userID, actID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to approve act", "error", err)
 		response.InternalError(c, "Failed to approve act")
 		return
 	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.BadRequest(c, "Only draft or submitted acts can be approved")
+		return
+	}
+
+	// ── S4 (developer-stsenariy): sub akt = xarajat-hujjat ──────────────
+	// A subcontractor act carries the developer's cost: Dr 0810 (WIP) /
+	// Cr 6010 (pudratchilar), in the SAME transaction as the approval and
+	// the construction_expense_lines row (the UUID bridge source_id points
+	// at). journal_entry_id doubles as the double-post guard. Own-forces
+	// acts (no subcontract) stay GL-free — internal volume control only.
+	// If the tenant's chart can't resolve 0810/6010 the approval proceeds
+	// without posting (logged) — an unconfigured books setup must not
+	// block site workflows; once the mapping exists the next act posts.
+	if subcontractID.Valid && subcontractID.Int64 > 0 && amountWithVat > 0 && !existingJE.Valid {
+		wipAcct := h.getConstructionMappedAccount(tenantID, orgPtr, "wip_0810", "tugallanmagan kapital", "0810")
+		apAcct := h.getConstructionMappedAccount(tenantID, orgPtr, "payables_6010", "mol yetkazib beruvchi", "6010")
+		if wipAcct != uuid.Nil && apAcct != uuid.Nil {
+			var partnerID uuid.NullUUID
+			var partnerName string
+			var retentionPct float64
+			_ = h.db.QueryRow(`SELECT partner_id, COALESCE(partner_name, ''), COALESCE(retention_pct, 0) FROM construction_subcontract WHERE id = $1 AND tenant_id = $2`,
+				subcontractID.Int64, tenantID).Scan(&partnerID, &partnerName, &retentionPct)
+
+			// ── S5: retention (kafolat ushlab qolish) ────────────────
+			// The credit splits only when the tenant's chart resolves a
+			// DISTINCT retention account (mapping key retention_6990,
+			// fallback 6990 "Boshqa kreditorlik"); otherwise the full
+			// amount stays on 6010 and retention_amount is still stored
+			// on the act for reporting.
+			retention := 0.0
+			var retAcct uuid.UUID
+			if retentionPct > 0 && retentionPct < 100 {
+				retention = math.Round(amountWithVat*retentionPct) / 100
+				retAcct = h.getConstructionMappedAccount(tenantID, orgPtr, "retention_6990", "boshqa kreditorlik", "6990")
+				if retAcct == uuid.Nil || retAcct == apAcct {
+					retAcct = uuid.Nil // no distinct account → no GL split
+				}
+			}
+
+			desc := fmt.Sprintf("Sub akt %s", approveActNumber)
+			if partnerName != "" {
+				desc += " — " + partnerName
+			}
+
+			var celID uuid.UUID
+			if err := tx.QueryRow(`
+				INSERT INTO construction_expense_lines (
+					tenant_id, organization_id, project_id, subcontract_id,
+					expense_date, description, amount, currency_code,
+					vendor_id, debit_account_id, credit_account_id,
+					status, approved_at, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, CURRENT_DATE, $5, $6, 'UZS', $7, $8, $9, 'approved', NOW(), $10, NOW(), NOW())
+				RETURNING id
+			`, tenantID, orgPtr, projectID, subcontractID.Int64, desc, amountWithVat,
+				partnerID, wipAcct, apAcct, uuidArg(userID)).Scan(&celID); err != nil {
+				h.log.Error("Sub act expense line failed", "error", err, "act_id", actID)
+				response.InternalError(c, "Failed to post act costs")
+				return
+			}
+
+			journalID := h.ensureConstructionJournal(tenantID, orgPtr)
+			if journalID == uuid.Nil {
+				h.log.Error("Sub act posting: no construction journal", "act_id", actID)
+				response.InternalError(c, "Failed to post act costs")
+				return
+			}
+			now := time.Now()
+			entryID := uuid.New()
+			entryNumber := fmt.Sprintf("SAKT%06d", h.getNextJournalNumber(tx, journalID))
+			if _, err := tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number,
+					entry_date, reference, description, source_type, source_id,
+					status, total_debit, total_credit, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'construction_act', $9, 'posted', $10, $10, $11, $11)
+			`, entryID, tenantID, orgPtr, journalID, entryNumber,
+				now, approveActNumber, desc, celID, amountWithVat, now); err != nil {
+				h.log.Error("Sub act JE header failed", "error", err, "act_id", actID)
+				response.InternalError(c, "Failed to post act costs")
+				return
+			}
+			// Line set: Dr WIP full; Cr 6010 net-of-retention; Cr retention
+			// account when the split applies (see retention block above).
+			type jeLine struct {
+				acct    uuid.UUID
+				contact interface{}
+				desc    string
+				debit   float64
+				credit  float64
+			}
+			apCredit := amountWithVat
+			lines := []jeLine{{wipAcct, nil, "Qurilish ishlari (sub akt)", amountWithVat, 0}}
+			if retAcct != uuid.Nil && retention > 0 {
+				apCredit = amountWithVat - retention
+				lines = append(lines,
+					jeLine{apAcct, partnerID, desc, 0, apCredit},
+					jeLine{retAcct, partnerID, desc + " (kafolat ushlab qolish)", 0, retention})
+			} else {
+				lines = append(lines, jeLine{apAcct, partnerID, desc, 0, apCredit})
+			}
+			for i, l := range lines {
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, contact_id, description, debit_amount, credit_amount, line_number, created_at)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				`, uuid.New(), entryID, l.acct, l.contact, l.desc, l.debit, l.credit, i+1, now); err != nil {
+					h.log.Error("Sub act JE line failed", "error", err, "act_id", actID)
+					response.InternalError(c, "Failed to post act costs")
+					return
+				}
+				if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`,
+					l.debit-l.credit, now, l.acct); err != nil {
+					h.log.Error("Sub act balance update failed", "error", err)
+					response.InternalError(c, "Failed to post act costs")
+					return
+				}
+			}
+			if _, err := tx.Exec(`UPDATE construction_expense_lines SET journal_entry_id = $1 WHERE id = $2`, entryID, celID); err != nil {
+				h.log.Error("Sub act CEL link failed", "error", err)
+				response.InternalError(c, "Failed to post act costs")
+				return
+			}
+			if _, err := tx.Exec(`UPDATE construction_act SET journal_entry_id = $1, expense_line_id = $2, retention_amount = $3 WHERE id = $4 AND tenant_id = $5`,
+				entryID, celID, retention, actID, tenantID); err != nil {
+				h.log.Error("Sub act link failed", "error", err)
+				response.InternalError(c, "Failed to post act costs")
+				return
+			}
+		} else {
+			h.log.Warn("Sub act approved WITHOUT posting — 0810/6010 unresolved in chart",
+				"act_id", actID, "tenant_id", tenantID)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit act approval", "error", err)
+		response.InternalError(c, "Failed to approve act")
+		return
+	}
 
 	h.logConstructionActivity(tenantID, projectID, userID, "act",
 		"Akt tasdiqlandi", "Act", actID)
+
+	var actNumber, actType, projName string
+	var actTotal float64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(a.act_number::text, ''), COALESCE(a.act_type, ''), COALESCE(a.amount_total_with_vat, 0), COALESCE(p.name, '')
+		FROM construction_act a
+		LEFT JOIN construction_projects p ON p.id = a.project_id
+		WHERE a.id = $1 AND a.tenant_id = $2
+	`, actID, tenantID).Scan(&actNumber, &actType, &actTotal, &projName)
+	h.EmitWorkflowEvent(tenantID, "construction.act_approved", map[string]interface{}{
+		"record_id":    strconv.FormatInt(actID, 10),
+		"act_number":   actNumber,
+		"act_type":     actType,
+		"project_name": projName,
+		"total_amount": actTotal,
+	})
 
 	response.Success(c, map[string]interface{}{
 		"id":      actID,

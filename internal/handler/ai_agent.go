@@ -325,6 +325,7 @@ var toolPerms = map[string][3]string{
 	"list_attendance":            {"hr", "attendance", "read"},
 	"list_payroll_periods":       {"hr", "payroll", "read"},
 	"list_projects":              {"construction", "project", "read"},
+	"construction_stats":         {"construction", "project", "read"},
 	"list_workflows":             {"workflow", "workflow", "read"},
 	// CRM routes are gated since migration 446 — the tools mirror that.
 	"list_leads":         {"crm", "lead", "read"},
