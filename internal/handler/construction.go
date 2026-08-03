@@ -75,8 +75,17 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
 		       COALESCE(w.name, '') as warehouse_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
-		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta,
-		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id), 0) as files_count
+		       COALESCE(
+		           NULLIF((SELECT SUM(el.total_amount)
+		                   FROM construction_estimate e
+		                   JOIN construction_estimate_line el ON el.estimate_id = e.id AND el.tenant_id = e.tenant_id
+		                   WHERE e.project_id = cp.id AND e.is_current
+		                     AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		                     AND COALESCE(el.resource_type, '') = ''
+		                     AND COALESCE(el.parent_line_id, 0) = 0), 0),
+		           (SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id),
+		           0) as total_smeta,
+		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id AND subcontract_id IS NULL), 0) as files_count
 		FROM construction_projects cp
 		LEFT JOIN employees pm ON pm.id = cp.project_manager_id
 		LEFT JOIN employees ce ON ce.id = cp.chief_engineer_id
@@ -214,8 +223,17 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 		       COALESCE(ce.first_name || ' ' || ce.last_name, '') as chief_engineer_name,
 		       COALESCE(w.name, '') as warehouse_name,
 		       COALESCE((SELECT COUNT(*) FROM smeta_sections WHERE project_id = cp.id), 0) as sections_count,
-		       COALESCE((SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id), 0) as total_smeta,
-		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id), 0) as files_count
+		       COALESCE(
+		           NULLIF((SELECT SUM(el.total_amount)
+		                   FROM construction_estimate e
+		                   JOIN construction_estimate_line el ON el.estimate_id = e.id AND el.tenant_id = e.tenant_id
+		                   WHERE e.project_id = cp.id AND e.is_current
+		                     AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		                     AND COALESCE(el.resource_type, '') = ''
+		                     AND COALESCE(el.parent_line_id, 0) = 0), 0),
+		           (SELECT SUM(total_cost) FROM smeta_sections WHERE project_id = cp.id),
+		           0) as total_smeta,
+		       COALESCE((SELECT COUNT(*) FROM project_files WHERE project_id = cp.id AND subcontract_id IS NULL), 0) as files_count
 		FROM construction_projects cp
 		LEFT JOIN employees pm ON pm.id = cp.project_manager_id
 		LEFT JOIN employees ce ON ce.id = cp.chief_engineer_id
@@ -307,6 +325,30 @@ func (h *Handler) GetConstructionProject(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Security BearerAuth
 // @Router /construction/projects [post]
+// writeConstructionAudit writes a construction audit_logs row (v2 pattern,
+// like writeLeadAudit / faAudit). Construction PKs are BIGINT while
+// audit_logs.entity_id is UUID, so entity_id stays NULL and the project id
+// travels inside the JSON payloads — the same trade-off the polymorphic
+// *_links tables make with their VARCHAR linked_id.
+func (h *Handler) writeConstructionAudit(tenantID, userID uuid.UUID, action string, projectID int64, oldValues, newValues map[string]interface{}) {
+	if newValues == nil {
+		newValues = map[string]interface{}{}
+	}
+	newValues["project_id"] = projectID
+	oldJSON, _ := json.Marshal(oldValues)
+	newJSON, _ := json.Marshal(newValues)
+	var userArg interface{}
+	if userID != uuid.Nil {
+		userArg = userID
+	}
+	if _, err := h.db.Exec(`
+		INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
+		VALUES ($1, $2, $3, $4, 'construction_project', NULL, $5, $6, NOW())
+	`, uuid.New(), tenantID, userArg, action, oldJSON, newJSON); err != nil {
+		h.log.Error("Failed to write construction audit log", "error", err, "project_id", projectID)
+	}
+}
+
 func (h *Handler) CreateConstructionProject(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -435,6 +477,17 @@ func (h *Handler) CreateConstructionProject(c *gin.Context) {
 		_, _ = h.db.Exec(`UPDATE construction_projects SET analytic_account_id = $1 WHERE id = $2`, analyticID, projectID)
 	}()
 
+	h.EmitWorkflowEvent(tenantID, "construction.project_created", map[string]interface{}{
+		"record_id": strconv.FormatInt(projectID, 10),
+		"code":      req.Code,
+		"name":      req.Name,
+		"status":    "draft",
+		"region":    req.Region,
+	})
+	h.writeConstructionAudit(tenantID, userID, "create", projectID, nil, map[string]interface{}{
+		"code": req.Code, "name": req.Name, "status": "draft",
+	})
+
 	response.Success(c, map[string]interface{}{
 		"id":           projectID,
 		"code":         req.Code,
@@ -527,14 +580,25 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 		args = append(args, *req.ContractAmount)
 	}
 	if req.Status != nil {
+		// Vocabulary backstop (matches migration 461's CHECK) so a bad
+		// status returns a clean 400 instead of a constraint 500.
+		switch *req.Status {
+		case "draft", "planning", "approved", "in_progress", "on_hold", "completed", "cancelled":
+		default:
+			response.BadRequest(c, "Invalid status: "+*req.Status)
+			return
+		}
 		argCount++
 		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
 		args = append(args, *req.Status)
 	}
+	// progress_percent writes are CLOSED (S1, docs/construction-roadmap.md):
+	// the card shows the computed cost-weighted readiness from /stats; the
+	// manual column stays readable as a legacy fallback only. Silently
+	// ignoring the field keeps old clients' payload shape working.
 	if req.ProgressPercent != nil {
-		argCount++
-		updates = append(updates, fmt.Sprintf("progress_percent = $%d", argCount))
-		args = append(args, *req.ProgressPercent)
+		h.log.Warn("progress_percent write ignored — readiness is computed from works",
+			"project_id", id, "tenant_id", tenantID)
 	}
 	if req.ProjectManagerID != nil && *req.ProjectManagerID != "" {
 		argCount++
@@ -635,6 +699,16 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 	}
 
 	if len(updates) == 0 {
+		// Payload contained only ignored fields (e.g. the closed
+		// progress_percent) — succeed as a no-op so legacy clients that
+		// still send it don't start erroring.
+		if req.ProgressPercent != nil {
+			response.Success(c, map[string]interface{}{
+				"id":      id,
+				"message": "No changes applied",
+			})
+			return
+		}
 		response.BadRequest(c, "No fields to update")
 		return
 	}
@@ -670,6 +744,27 @@ func (h *Handler) UpdateConstructionProject(c *gin.Context) {
 	if req.Status != nil && *req.Status == "completed" && previousStatus != "completed" {
 		go h.createProjectCompletionJournalEntry(tenantID, organizationID, id)
 	}
+
+	// Events + audit (v2 pattern). Name fetched fresh for the payload.
+	userID, _ := middleware.GetUserID(c)
+	if req.Status != nil && *req.Status != previousStatus {
+		var projName string
+		_ = h.db.QueryRow(`SELECT name FROM construction_projects WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&projName)
+		h.EmitWorkflowEvent(tenantID, "construction.project_status_changed", map[string]interface{}{
+			"record_id":  strconv.FormatInt(id, 10),
+			"name":       projName,
+			"old_status": previousStatus,
+			"new_status": *req.Status,
+		})
+	}
+	auditNew := map[string]interface{}{}
+	if req.Status != nil {
+		auditNew["status"] = *req.Status
+	}
+	if req.Name != nil {
+		auditNew["name"] = *req.Name
+	}
+	h.writeConstructionAudit(tenantID, userID, "update", id, map[string]interface{}{"status": previousStatus}, auditNew)
 
 	response.Success(c, map[string]interface{}{
 		"id":      id,
@@ -718,6 +813,9 @@ func (h *Handler) DeleteConstructionProject(c *gin.Context) {
 		response.NotFound(c, "Project not found")
 		return
 	}
+
+	deleteUserID, _ := middleware.GetUserID(c)
+	h.writeConstructionAudit(tenantID, deleteUserID, "delete", id, nil, nil)
 
 	response.Success(c, map[string]interface{}{
 		"message": "Project deleted successfully",
@@ -4004,6 +4102,14 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 		return
 	}
 
+	var mrProjName string
+	_ = h.db.QueryRow(`SELECT name FROM construction_projects WHERE id = $1 AND tenant_id = $2`, projectID, tenantID).Scan(&mrProjName)
+	h.EmitWorkflowEvent(tenantID, "construction.material_request_approved", map[string]interface{}{
+		"record_id":     strconv.FormatInt(requestID, 10),
+		"project_name":  mrProjName,
+		"total_expense": totalExpense,
+	})
+
 	response.Success(c, map[string]interface{}{
 		"message":       "Material request approved successfully",
 		"total_expense": totalExpense,
@@ -4944,6 +5050,16 @@ func (h *Handler) CommissionProject(c *gin.Context) {
 
 	h.logConstructionActivity(tenantID, projectID, userID, "project", fmt.Sprintf("Loyiha foydalanishga topshirildi (WIP: %.2f)", totalWIP), "Project", projectID)
 
+	var commissionedName string
+	_ = h.db.QueryRow(`SELECT name FROM construction_projects WHERE id = $1 AND tenant_id = $2`, projectID, tenantID).Scan(&commissionedName)
+	h.EmitWorkflowEvent(tenantID, "construction.project_commissioned", map[string]interface{}{
+		"record_id":          strconv.FormatInt(projectID, 10),
+		"name":               commissionedName,
+		"capitalized_amount": totalWIP,
+	})
+	h.writeConstructionAudit(tenantID, userID, "commission", projectID, map[string]interface{}{"status": projStatus},
+		map[string]interface{}{"status": "completed", "capitalized_amount": totalWIP})
+
 	// Register the capitalized building in the Aktivlar module so it appears in
 	// the register and starts depreciating (audit finding #10). No extra
 	// posting — the JE above already moved WIP to fixed assets.
@@ -5442,7 +5558,7 @@ func (h *Handler) ListProjectFiles(c *gin.Context) {
 	query := `
 		SELECT id, project_id, file_id, file_url, filename, file_size, mime_type, description, created_at, created_by
 		FROM project_files
-		WHERE tenant_id = $1 AND project_id = $2
+		WHERE tenant_id = $1 AND project_id = $2 AND subcontract_id IS NULL
 		ORDER BY created_at DESC`
 	args := []interface{}{tenantID, projectID}
 	if paginate {
@@ -5489,7 +5605,7 @@ func (h *Handler) ListProjectFiles(c *gin.Context) {
 		return
 	}
 	var total int
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM project_files WHERE tenant_id = $1 AND project_id = $2`, tenantID, projectID).Scan(&total)
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM project_files WHERE tenant_id = $1 AND project_id = $2 AND subcontract_id IS NULL`, tenantID, projectID).Scan(&total)
 	response.Paginated(c, files, page, pageSize, total)
 }
 
@@ -5566,7 +5682,7 @@ func (h *Handler) DeleteProjectFile(c *gin.Context) {
 	}
 
 	result, err := h.db.Exec(`
-		DELETE FROM project_files WHERE id = $1 AND tenant_id = $2
+		DELETE FROM project_files WHERE id = $1 AND tenant_id = $2 AND subcontract_id IS NULL
 	`, fileID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete project file", "error", err)

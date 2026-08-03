@@ -807,7 +807,7 @@ type WorkflowAction struct {
 func (h *Handler) CheckThresholdRules() {
 	rows, err := h.db.Query(`
 		SELECT DISTINCT tenant_id, trigger_event FROM workflow_rules
-		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale', 'purchase_order.delivery_overdue')
+		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale', 'purchase_order.delivery_overdue', 'construction.budget_overrun')
 		  AND is_active = true AND deleted_at IS NULL
 	`)
 	if err != nil {
@@ -845,7 +845,62 @@ func (h *Handler) CheckThresholdRules() {
 			h.checkStaleLeads(s.tenantID)
 		case "purchase_order.delivery_overdue":
 			h.checkOverduePurchaseDeliveries(s.tenantID)
+		case "construction.budget_overrun":
+			h.checkConstructionBudgetOverruns(s.tenantID)
 		}
+	}
+}
+
+// checkConstructionBudgetOverruns emits construction.budget_overrun for live
+// projects whose APPROVED object costs (construction_expense_lines — the
+// module's single cost register) exceed contract_amount. 7-day marker
+// cooldown per project: the alert re-arms weekly while the overrun persists
+// instead of firing every 15-minute scan.
+func (h *Handler) checkConstructionBudgetOverruns(tenantID uuid.UUID) {
+	rows, err := h.db.Query(`
+		SELECT p.id, p.name, p.contract_amount, COALESCE(SUM(cel.amount), 0) AS actual
+		FROM construction_projects p
+		JOIN construction_expense_lines cel
+		  ON cel.project_id = p.id AND cel.tenant_id = p.tenant_id
+		 AND cel.status = 'approved' AND cel.deleted_at IS NULL
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+		  AND COALESCE(p.contract_amount, 0) > 0
+		  AND COALESCE(p.status, '') NOT IN ('completed', 'cancelled')
+		GROUP BY p.id, p.name, p.contract_amount
+		HAVING COALESCE(SUM(cel.amount), 0) > p.contract_amount
+		LIMIT 200
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to check construction budget overruns", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var projectID int64
+		var name string
+		var budget, actual float64
+		if err := rows.Scan(&projectID, &name, &budget, &actual); err != nil {
+			continue
+		}
+		overrunPct := 0.0
+		if budget > 0 {
+			overrunPct = (actual - budget) / budget * 100
+		}
+		idStr := strconv.FormatInt(projectID, 10)
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: tenantID,
+			Event:    "construction.budget_overrun",
+			Data: map[string]interface{}{
+				"record_id":   idStr,
+				"name":        name,
+				"budget":      budget,
+				"actual":      actual,
+				"overrun_pct": overrunPct,
+			},
+			DedupeKey: idStr,
+			Cooldown:  7 * 24 * time.Hour,
+		})
 	}
 }
 

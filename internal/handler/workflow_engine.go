@@ -130,6 +130,27 @@ var workflowEventCatalog = map[string]workflowEventDef{
 		"book_value": 420000000.0, "sale_price": 500000000.0, "gain_loss": 80000000.0, "reason": "Yangisiga almashtirildi"}},
 	"assets.fully_depreciated": {Category: "assets", RelatedType: "fa_asset", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "inventory_number": "FA-000005", "asset_name": "Damas yuk mashinasi", "depreciable_base": 96000000.0}},
+	// Qurilish (construction) — added by the 2026-08-03 hardening
+	// (docs/construction-integration-map.md §3). record_id is the BIGINT
+	// project id as a string (construction PKs are not UUIDs).
+	"construction.project_created": {Category: "construction", RelatedType: "construction_project", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "42", "code": "QUR-2026-001", "name": "Yunusobod turar-joy majmuasi", "status": "draft", "region": "Toshkent shahri"}},
+	"construction.project_status_changed": {Category: "construction", RelatedType: "construction_project", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "42", "name": "Yunusobod turar-joy majmuasi", "old_status": "planning", "new_status": "in_progress"}},
+	"construction.project_commissioned": {Category: "construction", RelatedType: "construction_project", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "42", "name": "Yunusobod turar-joy majmuasi", "capitalized_amount": 12500000000.0}},
+	"construction.act_approved": {Category: "construction", RelatedType: "construction_act", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "17", "act_number": "F2-2026-07", "act_type": "forma2", "project_name": "Yunusobod turar-joy majmuasi", "total_amount": 4200000000.0}},
+	"construction.act_signed": {Category: "construction", RelatedType: "construction_act", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "17", "act_number": "F2-2026-07", "act_type": "forma2", "project_name": "Yunusobod turar-joy majmuasi", "signer_role": "client"}},
+	"construction.material_request_approved": {Category: "construction", RelatedType: "construction_material_request", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "31", "project_name": "Yunusobod turar-joy majmuasi", "total_expense": 185000000.0}},
+	// Scheduled: the 15-minute scanner compares approved object costs
+	// (construction_expense_lines) against contract_amount per live project;
+	// 7-day marker cooldown per project (workflow_rules.go
+	// checkConstructionBudgetOverruns).
+	"construction.budget_overrun": {Category: "construction", RelatedType: "construction_project", Scheduled: true, SampleData: map[string]interface{}{
+		"record_id": "42", "name": "Yunusobod turar-joy majmuasi", "budget": 48000000000.0, "actual": 51300000000.0, "overrun_pct": 6.9}},
 }
 
 // workflowActionTypes is the set of executable action types. Legacy types

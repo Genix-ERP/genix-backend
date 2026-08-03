@@ -80,6 +80,20 @@ BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'construction_site_warehouses') THEN
         EXECUTE 'DELETE FROM construction_site_warehouses WHERE project_id IN (SELECT id FROM construction_projects WHERE tenant_id = $1)' USING v_tid;
     END IF;
+    -- Demo construction portfolio (DEMO-QUR prefix, seeded by seed_demo.sql)
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'construction_expense_lines') THEN
+        EXECUTE 'DELETE FROM construction_expense_lines WHERE tenant_id = $1 AND project_id IN (SELECT id FROM construction_projects WHERE tenant_id = $1 AND code LIKE ''DEMO-QUR%'')' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'construction_estimate_line') THEN
+        EXECUTE 'DELETE FROM construction_estimate_line WHERE tenant_id = $1 AND estimate_id IN (SELECT e.id FROM construction_estimate e JOIN construction_projects p ON p.id = e.project_id WHERE p.tenant_id = $1 AND p.code LIKE ''DEMO-QUR%'')' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'construction_estimate') THEN
+        EXECUTE 'DELETE FROM construction_estimate WHERE tenant_id = $1 AND project_id IN (SELECT id FROM construction_projects WHERE tenant_id = $1 AND code LIKE ''DEMO-QUR%'')' USING v_tid;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'construction_buildings') THEN
+        EXECUTE 'DELETE FROM construction_buildings WHERE tenant_id = $1 AND project_id IN (SELECT id FROM construction_projects WHERE tenant_id = $1 AND code LIKE ''DEMO-QUR%'')' USING v_tid;
+    END IF;
+    EXECUTE 'DELETE FROM construction_projects WHERE tenant_id = $1 AND code LIKE ''DEMO-QUR%''' USING v_tid;
 
     -- === POS (references products, contacts, warehouses, payment_methods) ===
     IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'pos_payments') THEN
