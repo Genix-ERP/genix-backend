@@ -1544,6 +1544,68 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 			return
 		}
 
+		// Avans reclass (moliya audit §2.3). TT advance payments made BEFORE
+		// this accrual debited 9420 (cash-basis assumption in
+		// postTTSalaryPaymentJE); the accrual above debits 9420 for the FULL
+		// gross again, so without this step every avans is expensed twice and
+		// 6710 keeps a phantom credit. Reclassify those payments against the
+		// liability (Dt 6710 / Kt 9420) — net effect equals having paid the
+		// avans out of Wages Payable.
+		var avansTotal float64
+		_ = tx.QueryRow(`
+			SELECT COALESCE(SUM(je.total_debit), 0)
+			FROM journal_entries je
+			WHERE je.tenant_id = $1 AND je.source_type = 'payroll_payment'
+			  AND je.status = 'posted' AND je.deleted_at IS NULL
+			  AND je.reversed_entry_id IS NULL
+			  AND je.source_id IN (SELECT pe.id FROM payroll_entries pe
+			                       WHERE pe.payroll_period_id = $2 AND pe.tenant_id = $1)
+			  AND EXISTS (SELECT 1 FROM journal_entry_lines l
+			              JOIN accounts a2 ON a2.id = l.account_id
+			              WHERE l.journal_entry_id = je.id AND l.debit_amount > 0 AND a2.code = '9420')
+		`, tenantID, id).Scan(&avansTotal)
+		if avansTotal > 0 {
+			var orgVal interface{}
+			if orgIDPtr != nil {
+				orgVal = *orgIDPtr
+			}
+			reclassID := uuid.New()
+			reclassNumber := fmt.Sprintf("PAYRCL%05d", nextEntryNumberSeq(tx, tenantID, orgVal, "PAYRCL", 1))
+			if _, err = tx.Exec(`
+				INSERT INTO journal_entries (
+					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'payroll_avans_reclass', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
+				reclassID, tenantID, orgIDPtr, journalID, reclassNumber, now, periodName,
+				"Avans reklassifikatsiyasi: "+periodName, id.String(), avansTotal, userID, now,
+			); err != nil {
+				h.log.Error("Failed to create avans reclass journal entry", "error", err)
+				return
+			}
+			if _, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, 1, $3, 'Wages Payable (avans settled)', $4, 0, 1.0, $5)`,
+				uuid.New(), reclassID, payableAcct, avansTotal, now); err != nil {
+				h.log.Error("Failed to insert avans reclass debit line", "error", err)
+				return
+			}
+			if _, err = tx.Exec(`
+				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
+				VALUES ($1, $2, 2, $3, 'Salary Expense (avans reclassed)', 0, $4, 1.0, $5)`,
+				uuid.New(), reclassID, salaryAcct, avansTotal, now); err != nil {
+				h.log.Error("Failed to insert avans reclass credit line", "error", err)
+				return
+			}
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", avansTotal, now, payableAcct); err != nil {
+				h.log.Error("Failed to update payable balance for avans reclass", "error", err)
+				return
+			}
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", avansTotal, now, salaryAcct); err != nil {
+				h.log.Error("Failed to update salary balance for avans reclass", "error", err)
+				return
+			}
+		}
+
 		if err = tx.Commit(); err != nil {
 			h.log.Error("Failed to commit payroll journal entry", "error", err)
 		}

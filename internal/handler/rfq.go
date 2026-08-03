@@ -492,7 +492,7 @@ func (h *Handler) UpdateRFQ(c *gin.Context) {
 		return
 	}
 
-	_, err = h.db.Exec("UPDATE rfqs SET updated_at = $1 WHERE id = $2", time.Now(), id)
+	_, err = h.db.Exec("UPDATE rfqs SET updated_at = $1 WHERE id = $2 AND tenant_id = $3", time.Now(), id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to update RFQ", "error", err)
 		response.InternalError(c, "Failed to update RFQ")
@@ -791,7 +791,7 @@ func (h *Handler) OpenRFQ(c *gin.Context) {
 		return
 	}
 
-	_, err = h.db.Exec("UPDATE rfqs SET status = $1, updated_at = $2 WHERE id = $3", entity.RFQStatusOpen, time.Now(), id)
+	_, err = h.db.Exec("UPDATE rfqs SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", entity.RFQStatusOpen, time.Now(), id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to open RFQ", "error", err)
 		response.InternalError(c, "Failed to open RFQ")
