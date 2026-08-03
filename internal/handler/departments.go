@@ -375,6 +375,15 @@ func (h *Handler) DeleteDepartment(c *gin.Context) {
 		return
 	}
 
+	// Refuse deletion while employees are still assigned — otherwise they
+	// keep pointing at a soft-deleted row and render its stale name.
+	var refCount int
+	h.db.QueryRow(`SELECT COUNT(*) FROM employees WHERE tenant_id = $1 AND department_id = $2 AND deleted_at IS NULL`, tenantID, id).Scan(&refCount)
+	if refCount > 0 {
+		response.Conflict(c, fmt.Sprintf("Department has %d assigned employees; reassign them first", refCount))
+		return
+	}
+
 	query := `
 		UPDATE departments SET deleted_at = $1, updated_at = $1
 		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL

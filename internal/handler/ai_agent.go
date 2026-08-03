@@ -320,6 +320,7 @@ var toolPerms = map[string][3]string{
 	"list_production_orders":     {"manufacturing", "production_orders", "read"},
 	"list_work_orders":           {"manufacturing", "work_orders", "read"},
 	"find_employees":             {"hr", "employee", "read"},
+	"hr_stats":                   {"hr", "employee", "read"},
 	"list_leave_requests":        {"hr", "leave", "read"},
 	"list_attendance":            {"hr", "attendance", "read"},
 	"list_payroll_periods":       {"hr", "payroll", "read"},

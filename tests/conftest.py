@@ -77,6 +77,31 @@ def db_session(db_connection):
     db_connection.rollback()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_test_employees():
+    """Soft-delete employees created by the payroll suites after the session.
+
+    test_21/test_22 create employees with strictly-prefixed numbers
+    (EMP-T21-*/EMP-T22-*) and never remove them — before this fixture the
+    demo tenant had accumulated 267 'Test Payroll…' rows that polluted the
+    HR UI and its KPI numbers. Payroll entries/JEs referencing them are
+    intentionally left in place (suite accumulates those by design).
+    """
+    yield
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER,
+        password=DB_PASSWORD, dbname=DB_NAME,
+    )
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE employees SET deleted_at = NOW(), updated_at = NOW() "
+            "WHERE deleted_at IS NULL AND (employee_number LIKE 'EMP-T21-%' "
+            "OR employee_number LIKE 'EMP-T22-%' OR employee_number LIKE 'EMP-T23-%')"
+        )
+    conn.close()
+
+
 @pytest.fixture(scope="session")
 def db_read():
     """Read-only DB cursor for verification queries."""

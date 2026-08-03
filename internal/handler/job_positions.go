@@ -308,6 +308,14 @@ func (h *Handler) DeleteJobPosition(c *gin.Context) {
 		return
 	}
 
+	// Refuse deletion while employees still hold this position.
+	var refCount int
+	h.db.QueryRow(`SELECT COUNT(*) FROM employees WHERE tenant_id = $1 AND job_position_id = $2 AND deleted_at IS NULL`, tenantID, id).Scan(&refCount)
+	if refCount > 0 {
+		response.Conflict(c, fmt.Sprintf("Job position has %d assigned employees; reassign them first", refCount))
+		return
+	}
+
 	query := `
 		UPDATE job_positions SET deleted_at = $1, updated_at = $1
 		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
