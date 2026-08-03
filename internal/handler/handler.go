@@ -1192,6 +1192,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		payments.GET("", h.ListPayments)
 		payments.POST("", h.perm.Require("finance", "payment", "create"), h.CreatePayment)
+		// Partner register + reconciliation (must precede /:id so these literal
+		// paths aren't parsed as a payment UUID). Backend for the Reconcile tab.
+		payments.POST("/register", h.perm.Require("finance", "payment", "create"), h.RegisterPartnerPayment)
+		payments.GET("/partner-balances", h.GetPartnerBalances)
+		payments.GET("/partner-ledger", h.GetPartnerLedger)
+		payments.POST("/reconcile", h.perm.Require("finance", "payment", "create"), h.ReconcilePartnerCredit)
 		payments.GET("/:id", h.GetPayment)
 		payments.POST("/:id/confirm", h.perm.Require("finance", "payment", "approve"), h.ConfirmPayment)
 	}
