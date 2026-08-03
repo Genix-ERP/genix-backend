@@ -894,19 +894,27 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 	var vendorID uuid.UUID
 	var vendorName sql.NullString
 	var organizationID *uuid.UUID
+	var existingJEID *uuid.UUID
 	err = h.db.QueryRow(`
-		SELECT pi.status, pi.total_amount, pi.tax_amount, pi.subtotal, pi.vendor_id, c.name, pi.organization_id
+		SELECT pi.status, pi.total_amount, pi.tax_amount, pi.subtotal, pi.vendor_id, c.name, pi.organization_id, pi.journal_entry_id
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		WHERE pi.id = $1 AND pi.tenant_id = $2 AND pi.deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &totalAmount, &taxAmount, &subtotal, &vendorID, &vendorName, &organizationID)
+	).Scan(&currentStatus, &totalAmount, &taxAmount, &subtotal, &vendorID, &vendorName, &organizationID, &existingJEID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase invoice")
 		return
 	}
 	if currentStatus != "draft" && currentStatus != "confirmed" {
 		response.BadRequest(c, "Can only post invoices in draft or confirmed status")
+		return
+	}
+	// Double-post guard: bills created from a PO (CreateBillFromPO) arrive
+	// here already 'confirmed' WITH a journal entry attached. Posting again
+	// would book AP twice — the exact bug migration 422 had to reverse.
+	if existingJEID != nil && *existingJEID != uuid.Nil {
+		response.BadRequest(c, "ALREADY_POSTED: invoice already has a journal entry")
 		return
 	}
 

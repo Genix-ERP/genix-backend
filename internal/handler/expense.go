@@ -42,15 +42,16 @@ var expenseEditableStatuses = map[string]bool{
 var defaultExpenseCategories = []struct {
 	Code, Name, Description, Color, Icon string
 	Position                             int
+	GLCode                               string // 94xx leaf the category posts to (migration 448 mapping)
 }{
-	{"TRANSPORT", "Transport", "Yoqilg'i, taksi, yo'l xarajatlari", "#185FA5", "Car", 1},
-	{"IJARA", "Ijara", "Ofis va ombor ijarasi", "#534AB7", "Building2", 2},
-	{"KOMMUNAL", "Kommunal", "Elektr, suv, gaz, internet, aloqa", "#1D9E75", "Zap", 3},
-	{"OFIS", "Ofis xarajatlari", "Kanselyariya, jihozlar, xo'jalik buyumlari", "#EF9F27", "Briefcase", 4},
-	{"SAFAR", "Safar", "Xizmat safari, mehmonxona, chipta", "#0E9AA7", "Plane", 5},
-	{"REKLAMA", "Reklama", "Marketing va reklama xarajatlari", "#D9534F", "Megaphone", 6},
-	{"MATERIAL", "Materiallar", "Xom ashyo va materiallar", "#8A6D3B", "Package", 7},
-	{"BOSHQA", "Boshqa", "Boshqa turdagi xarajatlar", "#888780", "MoreHorizontal", 8},
+	{"TRANSPORT", "Transport", "Yoqilg'i, taksi, yo'l xarajatlari", "#185FA5", "Car", 1, "9490"},
+	{"IJARA", "Ijara", "Ofis va ombor ijarasi", "#534AB7", "Building2", 2, "9430"},
+	{"KOMMUNAL", "Kommunal", "Elektr, suv, gaz, internet, aloqa", "#1D9E75", "Zap", 3, "9440"},
+	{"OFIS", "Ofis xarajatlari", "Kanselyariya, jihozlar, xo'jalik buyumlari", "#EF9F27", "Briefcase", 4, "9450"},
+	{"SAFAR", "Safar", "Xizmat safari, mehmonxona, chipta", "#0E9AA7", "Plane", 5, "9490"},
+	{"REKLAMA", "Reklama", "Marketing va reklama xarajatlari", "#D9534F", "Megaphone", 6, "9480"},
+	{"MATERIAL", "Materiallar", "Xom ashyo va materiallar", "#8A6D3B", "Package", 7, "9410"},
+	{"BOSHQA", "Boshqa", "Boshqa turdagi xarajatlar", "#888780", "MoreHorizontal", 8, "9410"},
 }
 
 func (h *Handler) seedDefaultExpenseCategories(tenantID uuid.UUID) {
@@ -60,11 +61,22 @@ func (h *Handler) seedDefaultExpenseCategories(tenantID uuid.UUID) {
 		return
 	}
 	for _, d := range defaultExpenseCategories {
+		// Resolve the category's GL account in this tenant's chart (first
+		// organization wins — same order as the migration-448 backfill).
+		var accountID interface{}
+		var aid uuid.UUID
+		if err := h.db.QueryRow(`
+			SELECT id FROM accounts
+			WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL
+			  AND is_active = true AND is_leaf = true
+			ORDER BY created_at LIMIT 1`, tenantID, d.GLCode).Scan(&aid); err == nil {
+			accountID = aid
+		}
 		_, err := h.db.Exec(`
-			INSERT INTO expense_categories (tenant_id, code, name, description, is_active, color, icon, position, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, true, $5, $6, $7, NOW(), NOW())
+			INSERT INTO expense_categories (tenant_id, code, name, description, is_active, color, icon, position, account_id, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8, NOW(), NOW())
 			ON CONFLICT (tenant_id, code) DO NOTHING
-		`, tenantID, d.Code, d.Name, d.Description, d.Color, d.Icon, d.Position)
+		`, tenantID, d.Code, d.Name, d.Description, d.Color, d.Icon, d.Position, accountID)
 		if err != nil {
 			_ = err // best-effort
 		}
@@ -1806,6 +1818,24 @@ func (h *Handler) PayExpense(c *gin.Context) {
 		if catAccount.Valid {
 			if aid, err := uuid.Parse(catAccount.String); err == nil {
 				expenseAccountID = resolveLeafAccount(tx, aid)
+			}
+		}
+		// Categories are tenant-level but accounts are per-organization; if
+		// the mapped account belongs to a different org than this expense,
+		// re-resolve the same code inside the expense's org chart.
+		if expenseAccountID != uuid.Nil && orgIDPtr != nil {
+			var acctCode string
+			var acctOrg sql.NullString
+			_ = tx.QueryRow(`SELECT code, organization_id::text FROM accounts WHERE id = $1`, expenseAccountID).Scan(&acctCode, &acctOrg)
+			if acctOrg.Valid && acctOrg.String != orgIDPtr.String() && acctCode != "" {
+				var sameOrg uuid.UUID
+				if err := tx.QueryRow(`
+					SELECT id FROM accounts
+					WHERE tenant_id = $1 AND organization_id = $2 AND code = $3
+					  AND deleted_at IS NULL AND is_active = true AND is_leaf = true
+					LIMIT 1`, tenantID, *orgIDPtr, acctCode).Scan(&sameOrg); err == nil {
+					expenseAccountID = sameOrg
+				}
 			}
 		}
 	}

@@ -807,7 +807,7 @@ type WorkflowAction struct {
 func (h *Handler) CheckThresholdRules() {
 	rows, err := h.db.Query(`
 		SELECT DISTINCT tenant_id, trigger_event FROM workflow_rules
-		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale')
+		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale', 'purchase_order.delivery_overdue')
 		  AND is_active = true AND deleted_at IS NULL
 	`)
 	if err != nil {
@@ -843,7 +843,57 @@ func (h *Handler) CheckThresholdRules() {
 			h.checkExpiringContracts(s.tenantID)
 		case "lead.stale":
 			h.checkStaleLeads(s.tenantID)
+		case "purchase_order.delivery_overdue":
+			h.checkOverduePurchaseDeliveries(s.tenantID)
 		}
+	}
+}
+
+// checkOverduePurchaseDeliveries emits purchase_order.delivery_overdue for
+// open POs (approved/ordered/partial — keep in sync with openPOStatuses in
+// purchase_stats.go) whose expected_date has passed. The marker key includes
+// the expected_date so a rescheduled delivery re-arms the event; Cooldown 0
+// makes it once per crossing.
+func (h *Handler) checkOverduePurchaseDeliveries(tenantID uuid.UUID) {
+	rows, err := h.db.Query(`
+		SELECT po.id, po.order_number, COALESCE(ct.name, ''), po.expected_date,
+		       COALESCE(po.total_amount, 0)
+		FROM purchase_orders po
+		LEFT JOIN contacts ct ON ct.id = po.vendor_id
+		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
+		  AND po.status IN ('approved', 'ordered', 'partial')
+		  AND po.expected_date IS NOT NULL AND po.expected_date < CURRENT_DATE
+		LIMIT 500
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to check overdue purchase deliveries", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var poID uuid.UUID
+		var orderNumber, vendorName string
+		var expectedDate time.Time
+		var totalAmount float64
+		if err := rows.Scan(&poID, &orderNumber, &vendorName, &expectedDate, &totalAmount); err != nil {
+			continue
+		}
+		expStr := expectedDate.Format("2006-01-02")
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: tenantID,
+			Event:    "purchase_order.delivery_overdue",
+			Data: map[string]interface{}{
+				"record_id":     poID.String(),
+				"order_number":  orderNumber,
+				"vendor_name":   vendorName,
+				"expected_date": expStr,
+				"total_amount":  totalAmount,
+				"days_overdue":  int(time.Since(expectedDate).Hours() / 24),
+			},
+			DedupeKey: poID.String() + ":" + expStr,
+			Cooldown:  0, // one-shot per PO+expected_date crossing
+		})
 	}
 }
 

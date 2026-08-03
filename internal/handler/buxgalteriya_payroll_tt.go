@@ -747,7 +747,7 @@ func (h *Handler) postTTSalaryPaymentJE(tx *sql.Tx, tenantID uuid.UUID, orgIDPtr
 	_ = tx.QueryRow(`
 		SELECT COUNT(*) FROM journal_entries
 		WHERE tenant_id = $1 AND source_type = 'payroll' AND source_id = $2 AND status = 'posted' AND deleted_at IS NULL
-	`, tenantID, periodID.String()).Scan(&accrued)
+	`, tenantID, periodID.String).Scan(&accrued)
 
 	var debitAcct uuid.UUID
 	var debitDesc string
@@ -967,6 +967,75 @@ func (h *Handler) reverseTTSalaryPaymentJE(tx *sql.Tx, tenantID uuid.UUID, orgID
 	if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
 		h.log.Error("reverseTTSalaryPaymentJE: bump journal", "error", err)
 		return "Teskari yozuvni yaratib bo'lmadi"
+	}
+
+	// Counter-reclass (moliya audit §2.3). If this payment debited 9420
+	// (unaccrued avans) and the period was accrued AFTERWARDS, ProcessPayroll
+	// posted a reclass (Dt 6710 / Kt 9420) that included this payment's
+	// amount. Reversing only the payment would leave that reclass dangling —
+	// expense understated by the avans amount. Post a proportional counter
+	// entry to keep the reclass in step with the payments that still exist.
+	var was9420 bool
+	for _, l := range origLines {
+		var code string
+		_ = tx.QueryRow(`SELECT code FROM accounts WHERE id = $1`, l.accountID).Scan(&code)
+		if l.debit > 0 && code == "9420" {
+			was9420 = true
+			break
+		}
+	}
+	if was9420 {
+		var periodID sql.NullString
+		_ = tx.QueryRow(`SELECT payroll_period_id::text FROM payroll_entries WHERE id = $1 AND tenant_id = $2`, entryID, tenantID).Scan(&periodID)
+		if periodID.Valid {
+			var reclassID uuid.UUID
+			var payableAcct, salaryAcct uuid.UUID
+			err := tx.QueryRow(`
+				SELECT je.id,
+				       (SELECT l.account_id FROM journal_entry_lines l WHERE l.journal_entry_id = je.id AND l.debit_amount > 0 LIMIT 1),
+				       (SELECT l.account_id FROM journal_entry_lines l WHERE l.journal_entry_id = je.id AND l.credit_amount > 0 LIMIT 1)
+				FROM journal_entries je
+				WHERE je.tenant_id = $1 AND je.source_type = 'payroll_avans_reclass' AND je.source_id = $2
+				  AND je.status = 'posted' AND je.deleted_at IS NULL
+				ORDER BY je.created_at DESC LIMIT 1`, tenantID, periodID.String).Scan(&reclassID, &payableAcct, &salaryAcct)
+			if err == nil && payableAcct != uuid.Nil && salaryAcct != uuid.Nil {
+				counterID := uuid.New()
+				counterNumber := fmt.Sprintf("PAYRCL%05d", nextEntryNumberSeq(tx, tenantID, orgVal, "PAYRCL", 1))
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+						reference, description, source_type, source_id, exchange_rate,
+						total_debit, total_credit, status, created_by, created_at, updated_at
+					) VALUES ($1,$2,$3,$4,$5,$6,'counter',$7,'payroll_avans_reclass',$8,1.0,$9,$9,'posted',$10,$11,$11)`,
+					counterID, tenantID, orgIDPtr, journalID, counterNumber, now,
+					"Avans reklass teskarisi: "+origNumber, periodID.String, totalDebit, userID, now); err != nil {
+					h.log.Error("reverseTTSalaryPaymentJE: counter-reclass header", "error", err)
+					return "Teskari yozuvni yaratib bo'lmadi"
+				}
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+					VALUES ($1,$2,$3,'Salary Expense (reclass restored)',$4,0,1,$5)`,
+					uuid.New(), counterID, salaryAcct, totalDebit, now); err != nil {
+					h.log.Error("reverseTTSalaryPaymentJE: counter-reclass debit", "error", err)
+					return "Teskari yozuvni yaratib bo'lmadi"
+				}
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+					VALUES ($1,$2,$3,'Wages Payable (reclass restored)',0,$4,2,$5)`,
+					uuid.New(), counterID, payableAcct, totalDebit, now); err != nil {
+					h.log.Error("reverseTTSalaryPaymentJE: counter-reclass credit", "error", err)
+					return "Teskari yozuvni yaratib bo'lmadi"
+				}
+				if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalDebit, now, salaryAcct); err != nil {
+					h.log.Error("reverseTTSalaryPaymentJE: counter-reclass salary balance", "error", err)
+					return "Teskari yozuvni yaratib bo'lmadi"
+				}
+				if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalDebit, now, payableAcct); err != nil {
+					h.log.Error("reverseTTSalaryPaymentJE: counter-reclass payable balance", "error", err)
+					return "Teskari yozuvni yaratib bo'lmadi"
+				}
+			}
+		}
 	}
 	return ""
 }

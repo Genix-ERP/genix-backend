@@ -2672,14 +2672,14 @@ func (h *Handler) PostJournalEntry(c *gin.Context) {
 	}
 	rows.Close()
 
-	// Update each account balance
+	// Update each account balance. Convention is migration 407's uniform
+	// debit-positive (current_balance = SUM(debit) - SUM(credit)) for EVERY
+	// account nature — the same delta all module handlers apply. The old
+	// normal_balance-conditional sign flipped credit-normal accounts the
+	// other way, so every manually posted JE walked revenue/liability
+	// balances in the opposite direction from the recompute (audit §2.4).
 	for _, line := range lines {
-		var balanceChange float64
-		if line.normalBalance == "debit" {
-			balanceChange = line.debitAmount - line.creditAmount
-		} else {
-			balanceChange = line.creditAmount - line.debitAmount
-		}
+		balanceChange := line.debitAmount - line.creditAmount
 
 		_, err = tx.Exec(`
 			UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2
@@ -2878,14 +2878,10 @@ func (h *Handler) ResetJournalEntryToDraft(c *gin.Context) {
 	rows.Close()
 
 	// Un-apply the exact delta posting added: subtract balanceChange.
+	// Same uniform debit-positive convention as PostJournalEntry (407).
 	now := time.Now()
 	for _, line := range lines {
-		var balanceChange float64
-		if line.normalBalance == "debit" {
-			balanceChange = line.debitAmount - line.creditAmount
-		} else {
-			balanceChange = line.creditAmount - line.debitAmount
-		}
+		balanceChange := line.debitAmount - line.creditAmount
 
 		_, err = tx.Exec(`
 			UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2

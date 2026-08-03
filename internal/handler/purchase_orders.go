@@ -943,14 +943,19 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 	}
 	if input.Status != nil {
 		// Block statuses that must go through dedicated endpoints
-		// approved → POST /:id/approve (creates stock operations)
-		// received → POST /:id/receive (updates inventory)
+		// approved  → POST /:id/approve (creates stock operations)
+		// received  → POST /:id/receive (updates inventory)
+		// cancelled → POST /:id/cancel  (state-machine guard, stock check)
 		if *input.Status == "approved" {
 			response.BadRequest(c, "Use the approve endpoint to approve a purchase order")
 			return
 		}
 		if *input.Status == "received" {
 			response.BadRequest(c, "Use the receive endpoint to receive a purchase order")
+			return
+		}
+		if *input.Status == "cancelled" {
+			response.BadRequest(c, "Use the cancel endpoint to cancel a purchase order")
 			return
 		}
 		argCount++
@@ -1246,6 +1251,122 @@ func (h *Handler) DeletePurchaseOrder(c *gin.Context) {
 	response.NoContent(c)
 }
 
+// CancelPurchaseOrder cancels a purchase order with a state-machine guard.
+// Only orders with no received stock can be cancelled; the guarded UPDATE
+// carries the allowed source statuses so races collapse to zero rows.
+// Linked pending approval workflows and the draft receipt stock operation
+// are cancelled alongside.
+// @Summary Cancel purchase order
+// @Tags Purchase
+// @Param id path string true "Purchase order ID"
+// @Success 200 {object} response.Response
+// @Router /purchase/orders/{id}/cancel [post]
+func (h *Handler) CancelPurchaseOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	idStr := c.Param("id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		response.BadRequest(c, "Invalid purchase order ID")
+		return
+	}
+
+	var currentStatus string
+	var receivedQty float64
+	err = h.db.QueryRow(`
+		SELECT po.status, COALESCE((
+			SELECT SUM(pol.quantity_received) FROM purchase_order_lines pol
+			WHERE pol.purchase_order_id = po.id
+		), 0)
+		FROM purchase_orders po
+		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL
+	`, id, tenantID).Scan(&currentStatus, &receivedQty)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Purchase order")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to check purchase order", "error", err)
+		response.InternalError(c, "Failed to cancel purchase order")
+		return
+	}
+
+	if receivedQty > 0 || h.poStockReceivedVia(tenantID, id, "goods_receipt", "stock_operation", "purchase_order") {
+		response.BadRequest(c, "PO_HAS_RECEIPTS: order has received stock and cannot be cancelled")
+		return
+	}
+
+	now := time.Now()
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to cancel purchase order")
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.Exec(`
+		UPDATE purchase_orders
+		SET status = $1, updated_at = $2
+		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+		  AND status IN ('draft','pending_approval','approved','ordered')
+	`, entity.POStatusCancelled, now, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to cancel purchase order", "error", err)
+		response.InternalError(c, "Failed to cancel purchase order")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.BadRequest(c, "Order cannot be cancelled in current status")
+		return
+	}
+
+	if _, wfErr := tx.Exec(`
+		UPDATE approval_workflow_instances
+		SET status = 'cancelled', completed_at = $1, updated_at = $1
+		WHERE tenant_id = $2 AND document_type = 'purchase_order' AND document_id = $3 AND status = 'pending'
+	`, now, tenantID, id); wfErr != nil {
+		h.log.Warn("Failed to cancel pending workflows", "error", wfErr)
+	}
+
+	if _, opErr := tx.Exec(`
+		UPDATE stock_operations
+		SET state = 'cancelled', updated_at = $1
+		WHERE tenant_id = $2 AND source_type = 'purchase_order' AND source_id = $3
+		  AND state IN ('draft','in_progress','waiting') AND deleted_at IS NULL
+	`, now, tenantID, id); opErr != nil {
+		h.log.Warn("Failed to cancel linked stock operation", "error", opErr)
+	}
+
+	if err = tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to cancel purchase order")
+		return
+	}
+
+	response.Success(c, gin.H{"message": "Purchase order cancelled", "status": entity.POStatusCancelled})
+}
+
+// emitPOApprovalRequired fires the purchase_order.approval_required workflow
+// event when a PO lands in pending_approval (both the warn and route paths).
+func (h *Handler) emitPOApprovalRequired(tenantID, poID uuid.UUID, orderNumber string, totalAmount float64) {
+	go func() {
+		var vendorName string
+		h.db.QueryRow(`
+			SELECT COALESCE(c.name, '') FROM purchase_orders po
+			LEFT JOIN contacts c ON po.vendor_id = c.id WHERE po.id = $1
+		`, poID).Scan(&vendorName)
+		h.EmitWorkflowEvent(tenantID, "purchase_order.approval_required", map[string]interface{}{
+			"record_id":    poID.String(),
+			"order_number": orderNumber,
+			"vendor_name":  vendorName,
+			"total_amount": totalAmount,
+		})
+	}()
+}
+
 // SubmitPOForApproval submits a purchase order for approval (evaluates procurement rules)
 // SubmitPOForApproval godoc
 // @Summary Submit purchase order for approval
@@ -1320,6 +1441,7 @@ func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 			response.InternalError(c, "Failed to approve purchase order")
 			return
 		}
+		h.notifyPOApproved(tenantID, userID, id)
 		response.Success(c, gin.H{
 			"message":       "Purchase order auto-approved",
 			"status":        entity.POStatusApproved,
@@ -1342,6 +1464,7 @@ func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 			response.InternalError(c, "Failed to submit purchase order")
 			return
 		}
+		h.emitPOApprovalRequired(tenantID, id, orderNumber, totalAmount)
 		response.Success(c, gin.H{
 			"message": "Purchase order submitted for approval",
 			"status":  entity.POStatusPendingApproval,
@@ -1369,6 +1492,7 @@ func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 				return
 			}
 
+			h.emitPOApprovalRequired(tenantID, id, orderNumber, totalAmount)
 			response.Success(c, gin.H{
 				"message":     "Purchase order submitted for approval",
 				"status":      entity.POStatusPendingApproval,
@@ -1388,6 +1512,7 @@ func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 				response.InternalError(c, "Failed to submit purchase order")
 				return
 			}
+			h.emitPOApprovalRequired(tenantID, id, orderNumber, totalAmount)
 			response.Success(c, gin.H{
 				"message": "Purchase order submitted for approval",
 				"status":  entity.POStatusPendingApproval,
@@ -1396,8 +1521,10 @@ func (h *Handler) SubmitPOForApproval(c *gin.Context) {
 	}
 }
 
-// approvePOAndCreateReceipt is a shared helper that approves a PO and creates the stock receipt
-// operation in a single transaction. Used by both ApprovePurchaseOrder and SubmitPOForApproval (auto-approve).
+// approvePOAndCreateReceipt approves a PO and creates a DRAFT stock receipt
+// operation for the warehouse to process. It never moves stock itself —
+// inventory changes only on goods receipt / stock-op completion / POST /receive.
+// Used by both ApprovePurchaseOrder and SubmitPOForApproval (auto-approve).
 func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) error {
 	var orderNumber string
 	var vendorID uuid.UUID
@@ -1608,85 +1735,42 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 		poLineRows.Close()
 	}
 
-	// Auto-receive: directly add goods to inventory (1-step simplified flow)
-	{
-		var whID uuid.UUID
-		if warehouseID != nil {
-			whID = *warehouseID
-		} else {
-			// Fallback to first warehouse
-			h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&whID)
-		}
-
-		// Cross-path dedupe: skip if a goods receipt or receipt stock
-		// operation already put this PO's stock in (audit finding #4).
-		if h.poStockReceivedVia(tenantID, poID, "goods_receipt", "stock_operation", "purchase_order") {
-			h.log.Info("PO approve auto-receive skipped — stock already received via another path", "po_id", poID)
-			whID = uuid.Nil
-		}
-
-		if whID != uuid.Nil {
-			// Collect lines first, then apply in ONE tx (balance + ledger +
-			// lot per line via applyStockDelta — AVECO, no unit_cost overwrite)
-			type poRecvLine struct {
-				ProdID    uuid.UUID
-				Qty       float64
-				UnitPrice float64
-			}
-			var recvLines []poRecvLine
-			lineRows, _ := h.db.Query(`
-				SELECT pol.product_id, pol.quantity, pol.unit_price
-				FROM purchase_order_lines pol
-				WHERE pol.purchase_order_id = $1 AND pol.product_id IS NOT NULL
-			`, poID)
-			if lineRows != nil {
-				for lineRows.Next() {
-					var l poRecvLine
-					if lineRows.Scan(&l.ProdID, &l.Qty, &l.UnitPrice) == nil {
-						recvLines = append(recvLines, l)
-					}
-				}
-				lineRows.Close()
-			}
-
-			autoErr := func() error {
-				tx, txErr := h.db.Begin()
-				if txErr != nil {
-					return txErr
-				}
-				defer tx.Rollback()
-				for _, l := range recvLines {
-					if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
-						TenantID: tenantID, OrgID: orgID, ProductID: l.ProdID,
-						WarehouseID: whID, Qty: l.Qty, UnitCost: l.UnitPrice,
-						TxType: "receipt", RefType: "purchase_order", RefID: poID.String(),
-						Reason: "PO Auto-Receipt", ToWH: &whID, When: now,
-					}); dErr != nil {
-						return dErr
-					}
-					if _, lErr := tx.Exec(`INSERT INTO inventory_lots (id, tenant_id, product_id, warehouse_id, lot_number, received_date, initial_quantity, remaining_quantity, unit_cost, purchase_order_id, status, created_at, updated_at)
-						VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8, $9, 'available', $6, $6)`,
-						uuid.New(), tenantID, l.ProdID, whID, fmt.Sprintf("PO-%s", poID.String()[:8]), now, l.Qty, l.UnitPrice, poID); lErr != nil {
-						return lErr
-					}
-				}
-				return tx.Commit()
-			}()
-			if autoErr != nil {
-				h.log.Error("PO auto-receive stock movement failed; NOTHING moved", "error", autoErr, "po_id", poID)
-			}
-
-			// Update PO status to received
-			h.db.Exec(`UPDATE purchase_orders SET status = 'received', updated_at = NOW() WHERE id = $1 AND tenant_id = $2`, poID, tenantID)
-
-			// Update PO line quantities received
-			h.db.Exec(`UPDATE purchase_order_lines SET quantity_received = quantity WHERE purchase_order_id = $1`, poID)
-
-			h.log.Info("Auto-received PO goods into inventory", "po_id", poID, "warehouse_id", whID)
-		}
-	}
-
+	// Approval is NOT physical arrival (docs/xarid-audit.md finding #2).
+	// Stock enters only when goods actually arrive: via the draft receipt
+	// stock operation created above, a goods receipt, or POST /:id/receive.
 	return nil
+}
+
+// notifyPOApproved sends the approval notification and emits the
+// purchase_order.confirmed workflow event. Shared by ApprovePurchaseOrder
+// and the SubmitPOForApproval auto-approve path so both approval doors
+// produce the same signals.
+func (h *Handler) notifyPOApproved(tenantID, userID, poID uuid.UUID) {
+	go func() {
+		var poNumber, vendorName string
+		var totalAmt float64
+		h.db.QueryRow(`
+			SELECT po.order_number, COALESCE(c.name, ''), COALESCE(po.total_amount, 0)
+			FROM purchase_orders po LEFT JOIN contacts c ON po.vendor_id = c.id
+			WHERE po.id = $1`, poID).Scan(&poNumber, &vendorName, &totalAmt)
+		amountStr := fmt.Sprintf("%.0f", totalAmt)
+		h.createTranslatedNotification(tenantID, userID, "purchase_order_approved",
+			map[string]interface{}{
+				"order_id":     poID.String(),
+				"order_number": poNumber,
+				"vendor_name":  vendorName,
+				"amount":       totalAmt,
+			},
+			poNumber, vendorName, amountStr,
+		)
+
+		h.EmitWorkflowEvent(tenantID, "purchase_order.confirmed", map[string]interface{}{
+			"record_id":    poID.String(),
+			"order_number": poNumber,
+			"vendor_name":  vendorName,
+			"total_amount": totalAmt,
+		})
+	}()
 }
 
 // ApprovePurchaseOrder approves a purchase order (direct approval by authorized user)
@@ -1772,32 +1856,7 @@ func (h *Handler) ApprovePurchaseOrder(c *gin.Context) {
 		}
 	}()
 
-	// Notify: purchase order approved
-	go func() {
-		var poNumber, vendorName string
-		var totalAmt float64
-		h.db.QueryRow(`
-			SELECT po.order_number, COALESCE(c.name, ''), COALESCE(po.total_amount, 0)
-			FROM purchase_orders po LEFT JOIN contacts c ON po.vendor_id = c.id
-			WHERE po.id = $1`, id).Scan(&poNumber, &vendorName, &totalAmt)
-		amountStr := fmt.Sprintf("%.0f", totalAmt)
-		h.createTranslatedNotification(tenantID, userID, "purchase_order_approved",
-			map[string]interface{}{
-				"order_id":     id.String(),
-				"order_number": poNumber,
-				"vendor_name":  vendorName,
-				"amount":       totalAmt,
-			},
-			poNumber, vendorName, amountStr,
-		)
-
-		h.EmitWorkflowEvent(tenantID, "purchase_order.confirmed", map[string]interface{}{
-			"record_id":    id.String(),
-			"order_number": poNumber,
-			"vendor_name":  vendorName,
-			"total_amount": totalAmt,
-		})
-	}()
+	h.notifyPOApproved(tenantID, userID, id)
 
 	response.Success(c, gin.H{"message": "Purchase order approved successfully", "status": entity.POStatusApproved})
 }
@@ -1868,21 +1927,31 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 
 	now := time.Now()
 
-	// Update line items
+	// Update line items. The over-receipt cap lives INSIDE the UPDATE's
+	// WHERE so two concurrent receipts against the same line cannot
+	// jointly exceed the ordered quantity — the loser matches zero rows.
 	for _, line := range input.Lines {
 		lineID, err := uuid.Parse(line.LineID)
 		if err != nil {
 			continue
 		}
+		if line.QuantityReceived <= 0 {
+			continue
+		}
 
-		_, err = tx.Exec(`
+		res, err := tx.Exec(`
 			UPDATE purchase_order_lines
 			SET quantity_received = quantity_received + $1, updated_at = $2
 			WHERE id = $3 AND purchase_order_id = $4
+			  AND quantity_received + $1 <= quantity
 		`, line.QuantityReceived, now, lineID, id)
 		if err != nil {
 			h.log.Error("Failed to update line", "error", err)
 			response.InternalError(c, "Failed to receive purchase order")
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			response.BadRequest(c, "OVER_RECEIPT: received quantity exceeds ordered quantity")
 			return
 		}
 	}
@@ -1905,8 +1974,8 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 	}
 
 	_, err = tx.Exec(`
-		UPDATE purchase_orders SET status = $1, updated_at = $2 WHERE id = $3
-	`, newStatus, now, id)
+		UPDATE purchase_orders SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4
+	`, newStatus, now, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to update order status", "error", err)
 		response.InternalError(c, "Failed to receive purchase order")

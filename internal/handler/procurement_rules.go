@@ -807,7 +807,7 @@ func (h *Handler) ApproveWorkflowStep(c *gin.Context) {
 		}
 
 		// Approve the document
-		err = h.approveDocument(tx, wf.DocumentType, wf.DocumentID, userID, now)
+		err = h.approveDocument(tx, tenantID, wf.DocumentType, wf.DocumentID, userID, now)
 		if err != nil {
 			h.log.Error("Failed to approve document", "error", err)
 			response.InternalError(c, "Failed to approve document")
@@ -945,7 +945,7 @@ func (h *Handler) RejectWorkflowStep(c *gin.Context) {
 	}
 
 	// Reject the document (set back to draft or rejected status)
-	err = h.rejectDocument(tx, wf.DocumentType, wf.DocumentID, input.Comments, now)
+	err = h.rejectDocument(tx, tenantID, wf.DocumentType, wf.DocumentID, input.Comments, now)
 	if err != nil {
 		h.log.Error("Failed to reject document", "error", err)
 		response.InternalError(c, "Failed to reject document")
@@ -1119,34 +1119,34 @@ func (h *Handler) GetWorkflowByDocument(c *gin.Context) {
 // HELPER FUNCTIONS
 // =====================================================
 
-// approveDocument approves the underlying document
-func (h *Handler) approveDocument(tx *sql.Tx, documentType string, documentID uuid.UUID, userID uuid.UUID, now time.Time) error {
+// approveDocument approves the underlying document (tenant-scoped)
+func (h *Handler) approveDocument(tx *sql.Tx, tenantID uuid.UUID, documentType string, documentID uuid.UUID, userID uuid.UUID, now time.Time) error {
 	var query string
 	switch documentType {
 	case entity.DocumentTypePurchaseOrder:
-		query = `UPDATE purchase_orders SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2 WHERE id = $3`
+		query = `UPDATE purchase_orders SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2 WHERE id = $3 AND tenant_id = $4`
 	case entity.DocumentTypePurchaseRequisition:
-		query = `UPDATE purchase_requisitions SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2 WHERE id = $3`
+		query = `UPDATE purchase_requisitions SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2 WHERE id = $3 AND tenant_id = $4`
 	default:
 		return fmt.Errorf("unknown document type: %s", documentType)
 	}
 
-	_, err := tx.Exec(query, userID, now, documentID)
+	_, err := tx.Exec(query, userID, now, documentID, tenantID)
 	return err
 }
 
-// rejectDocument rejects the underlying document
-func (h *Handler) rejectDocument(tx *sql.Tx, documentType string, documentID uuid.UUID, reason string, now time.Time) error {
+// rejectDocument rejects the underlying document (tenant-scoped)
+func (h *Handler) rejectDocument(tx *sql.Tx, tenantID uuid.UUID, documentType string, documentID uuid.UUID, reason string, now time.Time) error {
 	var query string
 	switch documentType {
 	case entity.DocumentTypePurchaseOrder:
-		query = `UPDATE purchase_orders SET status = 'draft', notes = COALESCE(notes, '') || E'\nRejected: ' || $1, updated_at = $2 WHERE id = $3`
+		query = `UPDATE purchase_orders SET status = 'draft', notes = COALESCE(notes, '') || E'\nRejected: ' || $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`
 	case entity.DocumentTypePurchaseRequisition:
-		query = `UPDATE purchase_requisitions SET status = 'rejected', rejection_reason = $1, updated_at = $2 WHERE id = $3`
+		query = `UPDATE purchase_requisitions SET status = 'rejected', rejection_reason = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`
 	default:
 		return fmt.Errorf("unknown document type: %s", documentType)
 	}
 
-	_, err := tx.Exec(query, reason, now, documentID)
+	_, err := tx.Exec(query, reason, now, documentID, tenantID)
 	return err
 }
