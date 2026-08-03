@@ -10,8 +10,11 @@ deploy_main:
   script:
     - cd /home/ubuntu/genix-backend
     - git pull origin main
+    # Build BEFORE stopping the old container — a failed build used to run
+    # after `down`, leaving production dead until someone intervened.
+    - docker compose build
     - docker compose down
-    - docker compose up -d --build
+    - docker compose up -d
   environment:
     name: production
     url: https://api.genixerp.com
@@ -27,8 +30,9 @@ deploy_yuksalish:
     - git fetch origin
     - git checkout yuksalish
     - git pull origin yuksalish
+    - docker compose build
     - docker compose down
-    - docker compose up -d --build
+    - docker compose up -d
   environment:
     name: yuksalish
     url: https://api.yuksalish.group
