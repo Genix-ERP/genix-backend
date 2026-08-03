@@ -1202,6 +1202,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		payments.GET("", h.ListPayments)
 		payments.POST("", h.perm.Require("finance", "payment", "create"), h.CreatePayment)
+		// Solishtirish (partner reconciliation) — static paths, resolved by gin
+		// ahead of the /:id param route below.
+		payments.GET("/partner-balances", h.GetPartnerBalances)
+		payments.GET("/partner-ledger", h.GetPartnerLedger)
+		payments.POST("/reconcile", h.perm.Require("finance", "payment", "update"), h.ReconcilePartnerCredit)
 		payments.GET("/:id", h.GetPayment)
 		payments.POST("/:id/confirm", h.perm.Require("finance", "payment", "approve"), h.ConfirmPayment)
 	}
@@ -1586,8 +1591,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// Reports
-	// Dashboard
+	// Dashboard — top-products exposes tenant-wide sales revenue, so it needs
+	// the same gate as the sales stats it mirrors (was previously un-gated).
 	dashboard := rg.Group("/dashboard")
+	dashboard.Use(h.perm.Require("sales", "order", "read"))
 	{
 		dashboard.GET("/top-products", h.GetDashboardTopProducts)
 	}
@@ -1745,15 +1752,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		productionOrders.POST("", h.perm.Require("manufacturing", "production_orders", "create"), h.CreateProductionOrder)
 		productionOrders.GET("/schedule", h.GetProductionSchedule)
 		productionOrders.GET("/stats", h.GetManufacturingStats)
+		productionOrders.GET("/report", h.GetManufacturingReport)
 		productionOrders.GET("/:id", h.GetProductionOrder)
 		productionOrders.PUT("/:id", h.perm.Require("manufacturing", "production_orders", "update"), h.UpdateProductionOrder)
 		productionOrders.DELETE("/:id", h.perm.Require("manufacturing", "production_orders", "delete"), h.DeleteProductionOrder)
 		productionOrders.POST("/:id/confirm", h.perm.Require("manufacturing", "production_orders", "approve"), h.ConfirmProductionOrder)
-		productionOrders.POST("/:id/start", h.StartProductionOrder)
-		productionOrders.POST("/:id/pause", h.PauseProductionOrder)
-		productionOrders.POST("/:id/complete", h.CompleteProductionOrder)
-		productionOrders.POST("/:id/cancel", h.CancelProductionOrder)
-		productionOrders.POST("/:id/record-production", h.RecordProduction)
+		// Lifecycle actions move stock and post journal entries — read access
+		// is not enough (audit §2.11).
+		productionOrders.POST("/:id/start", h.perm.Require("manufacturing", "production_orders", "update"), h.StartProductionOrder)
+		productionOrders.POST("/:id/pause", h.perm.Require("manufacturing", "production_orders", "update"), h.PauseProductionOrder)
+		productionOrders.POST("/:id/complete", h.perm.Require("manufacturing", "production_orders", "update"), h.CompleteProductionOrder)
+		productionOrders.POST("/:id/cancel", h.perm.Require("manufacturing", "production_orders", "update"), h.CancelProductionOrder)
+		productionOrders.POST("/:id/record-production", h.perm.Require("manufacturing", "production_orders", "update"), h.RecordProduction)
 		productionOrders.POST("/:id/complete-split", h.perm.Require("manufacturing", "production_orders", "update"), h.CompleteSplitOutput)
 		productionOrders.GET("/:id/split-outputs", h.GetSplitOutputs)
 	}
@@ -1769,12 +1779,26 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.POST("/:id/pause", h.PauseWorkOrder)
 		workOrders.POST("/:id/complete", h.CompleteWorkOrder)
 		workOrders.POST("/:id/time", h.RecordWorkOrderTime)
+		// Quality capture (B5) — writes quality_checks; own resource gate
+		// (seeded in 011, granted to production_orders holders by 465).
+		workOrders.POST("/:id/quality-check", h.perm.Require("manufacturing", "quality_checks", "create"), h.CreateWorkOrderQualityCheck)
 		workOrders.GET("/:id/materials", h.ListWorkOrderMaterials)
 		workOrders.POST("/:id/materials", h.AddWorkOrderMaterial)
 		workOrders.DELETE("/:id/materials/:material_id", h.RemoveWorkOrderMaterial)
 		workOrders.GET("/:id/attachments", h.ListWorkOrderAttachments)
 		workOrders.POST("/:id/attachments", h.UploadWorkOrderAttachment)
 		workOrders.DELETE("/:id/attachments/:attachment_id", h.DeleteWorkOrderAttachment)
+	}
+
+	// MRP — netting engine + recommendation handoff (B1/B8). Permissions
+	// seeded by 011 (manufacturing:mrp), granted to production_orders
+	// holders by migration 463.
+	mrp := rg.Group("/mrp")
+	mrp.Use(h.perm.Require("manufacturing", "mrp", "read"))
+	{
+		mrp.GET("/recommendations", h.ListMRPRecommendations)
+		mrp.POST("/run", h.perm.Require("manufacturing", "mrp", "create"), h.RunMRP)
+		mrp.POST("/recommendations/:id/execute", h.perm.Require("manufacturing", "mrp", "update"), h.ExecuteMRPRecommendation)
 	}
 
 	// Manufacturing Transfers (Pick Components / Store Finished)
@@ -1786,18 +1810,19 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		mfgTransfers.POST("/:id/validate", h.perm.Require("manufacturing", "transfers", "update"), h.ValidateManufacturingTransfer)
 	}
 
-	// Equipment & Maintenance
+	// Equipment & Maintenance — gated by manufacturing:equipment (seeded in
+	// migration 011; the old work_centers gate conflated the two registers).
 	equipment := rg.Group("/equipment")
-	equipment.Use(h.perm.Require("manufacturing", "work_centers", "read"))
+	equipment.Use(h.perm.Require("manufacturing", "equipment", "read"))
 	{
 		equipment.GET("", h.ListEquipment)
-		equipment.POST("", h.perm.Require("manufacturing", "work_centers", "create"), h.CreateEquipment)
-		equipment.PUT("/:id", h.perm.Require("manufacturing", "work_centers", "update"), h.UpdateEquipment)
-		equipment.DELETE("/:id", h.perm.Require("manufacturing", "work_centers", "delete"), h.DeleteEquipment)
+		equipment.POST("", h.perm.Require("manufacturing", "equipment", "create"), h.CreateEquipment)
+		equipment.PUT("/:id", h.perm.Require("manufacturing", "equipment", "update"), h.UpdateEquipment)
+		equipment.DELETE("/:id", h.perm.Require("manufacturing", "equipment", "delete"), h.DeleteEquipment)
 		equipment.GET("/:id/maintenance", h.ListMaintenanceTasks)
-		equipment.POST("/:id/maintenance", h.perm.Require("manufacturing", "work_centers", "create"), h.CreateMaintenanceTask)
-		equipment.PUT("/:id/maintenance/:task_id", h.perm.Require("manufacturing", "work_centers", "update"), h.CompleteMaintenanceTask)
-		equipment.PATCH("/:id/maintenance/:task_id", h.perm.Require("manufacturing", "work_centers", "update"), h.UpdateMaintenanceTask)
+		equipment.POST("/:id/maintenance", h.perm.Require("manufacturing", "equipment", "create"), h.CreateMaintenanceTask)
+		equipment.PUT("/:id/maintenance/:task_id", h.perm.Require("manufacturing", "equipment", "update"), h.CompleteMaintenanceTask)
+		equipment.PATCH("/:id/maintenance/:task_id", h.perm.Require("manufacturing", "equipment", "update"), h.UpdateMaintenanceTask)
 	}
 
 	// Manufacturing Categories
@@ -1810,20 +1835,26 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		mfgCategories.DELETE("/:id", h.perm.Require("manufacturing", "work_centers", "delete"), h.DeleteManufacturingCategory)
 	}
 
-	// Cost Calculations
+	// Cost Calculations — reads keep the historical work_centers gate;
+	// mutations were completely ungated (audit §2.11) and now require the
+	// dedicated manufacturing:cost_calculations permissions (seeded in 459).
 	costCalcs := rg.Group("/cost-calculations")
 	costCalcs.Use(h.perm.Require("manufacturing", "work_centers", "read"))
 	{
 		costCalcs.GET("", h.ListCostCalculations)
-		costCalcs.POST("", h.CreateCostCalculation)
+		costCalcs.POST("", h.perm.Require("manufacturing", "cost_calculations", "create"), h.CreateCostCalculation)
 		costCalcs.GET("/:id", h.GetCostCalculation)
-		costCalcs.PUT("/:id", h.UpdateCostCalculation)
-		costCalcs.DELETE("/:id", h.DeleteCostCalculation)
+		costCalcs.PUT("/:id", h.perm.Require("manufacturing", "cost_calculations", "update"), h.UpdateCostCalculation)
+		costCalcs.DELETE("/:id", h.perm.Require("manufacturing", "cost_calculations", "delete"), h.DeleteCostCalculation)
 	}
 
 	// =====================================================
 	// ERP EXTENSIONS MODULE ROUTES
 	// =====================================================
+
+	// Ishbay (piece-rate) summary — the production_piecework HR handoff
+	// register (B6). Same gate as the payroll-periods group.
+	rg.GET("/payroll/piecework", h.perm.Require("hr", "payroll", "read"), h.GetPieceworkSummary)
 
 	// Payroll Periods
 	payrollPeriods := rg.Group("/payroll-periods")
@@ -2156,6 +2187,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	constructionProjects.Use(h.perm.Require("construction", "project", "read"))
 	{
 		constructionProjects.GET("", h.ListConstructionProjects)
+		// One-call, org-aware portfolio stats (v2 /stats contract)
+		constructionProjects.GET("/stats", h.GetConstructionProjectStats)
 		// Intercompany sales-order flow (moved from the retired /projects module)
 		constructionProjects.GET("/by-organization", h.ListConstructionProjectsByOrganization)
 		constructionProjects.POST("", h.perm.Require("construction", "project", "create"), h.CreateConstructionProject)
@@ -2315,6 +2348,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/reports/budget", h.GetStageBudgetReport)
 		constructionProjects.GET("/:id/reports/svod", h.GetSvodReport)
 		constructionProjects.GET("/:id/reports/material-consolidation", h.GetMaterialConsolidationReport)
+		constructionProjects.GET("/:id/reports/resource-consolidation", h.GetResourceConsolidationReport)
 		constructionProjects.GET("/:id/reports/materials", h.GetMaterialsReport)
 		constructionProjects.GET("/:id/reports/journal-entries", h.GetJournalEntriesReport)
 
@@ -2619,6 +2653,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		subcontracts.PUT("/:id", h.perm.Require("construction", "project", "update"), h.UpdateSubcontract)
 		subcontracts.DELETE("/:id", h.perm.Require("construction", "project", "delete"), h.DeleteSubcontract)
 		subcontracts.PUT("/:id/state", h.perm.Require("construction", "project", "update"), h.UpdateSubcontractState)
+		// File attachments (migration 463 — the SubcontractorsTab has called
+		// these since it shipped; they finally exist)
+		subcontracts.GET("/:id/files", h.ListSubcontractFiles)
+		subcontracts.POST("/:id/files", h.perm.Require("construction", "project", "update"), h.CreateSubcontractFile)
+		subcontracts.DELETE("/:id/files/:fileId", h.perm.Require("construction", "project", "update"), h.DeleteSubcontractFile)
 	}
 
 	// Act Types (user-manageable list of act types)

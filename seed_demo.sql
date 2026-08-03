@@ -1616,3 +1616,149 @@ BEGIN
     RAISE NOTICE '  Aktivlar v2 demo seed tayyor: 7 aktiv, 3 posted reglament, 1 sotish';
 END;
 $$;
+
+-- ============================================================================
+-- QURILISH: developer-stsenariy demo portfeli (2026-08-03 hardening)
+-- 3 loyiha: jarayonda (hisoblangan tayyorlik ~45%), rejalashtirish, tugallangan.
+-- Sanalar dinamik (CURRENT_DATE) — grafiklar doim tirik. Kod prefiksi DEMO-QUR
+-- qayta ishga tushirishda tozalash kaliti.
+-- ============================================================================
+DO $$
+DECLARE
+    v_tid  UUID := 'df372dc3-0b77-4ec6-aef3-c1145ecbeaac';
+    v_org  UUID;
+    v_user UUID;
+    v_p1 BIGINT; v_p2 BIGINT; v_p3 BIGINT;
+    v_b1 BIGINT; v_b3 BIGINT;
+    v_e1 BIGINT; v_e3 BIGINT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM tenants WHERE id = v_tid) THEN
+        RAISE NOTICE 'demo tenant yo''q — qurilish seed o''tkazib yuborildi';
+        RETURN;
+    END IF;
+    SELECT id INTO v_org  FROM organizations WHERE tenant_id = v_tid ORDER BY created_at LIMIT 1;
+    SELECT id INTO v_user FROM users         WHERE tenant_id = v_tid ORDER BY created_at LIMIT 1;
+
+    -- Qayta ishga tushirish uchun tozalash
+    DELETE FROM construction_expense_lines WHERE tenant_id = v_tid
+        AND project_id IN (SELECT id FROM construction_projects WHERE tenant_id = v_tid AND code LIKE 'DEMO-QUR%');
+    DELETE FROM construction_estimate_line WHERE tenant_id = v_tid
+        AND estimate_id IN (SELECT e.id FROM construction_estimate e
+                            JOIN construction_projects p ON p.id = e.project_id
+                            WHERE p.tenant_id = v_tid AND p.code LIKE 'DEMO-QUR%');
+    DELETE FROM construction_estimate WHERE tenant_id = v_tid
+        AND project_id IN (SELECT id FROM construction_projects WHERE tenant_id = v_tid AND code LIKE 'DEMO-QUR%');
+    DELETE FROM construction_buildings WHERE tenant_id = v_tid
+        AND project_id IN (SELECT id FROM construction_projects WHERE tenant_id = v_tid AND code LIKE 'DEMO-QUR%');
+    DELETE FROM construction_projects WHERE tenant_id = v_tid AND code LIKE 'DEMO-QUR%';
+
+    -- ── P1: Jarayonda — 9 qavatli turar-joy majmuasi ─────────────────────
+    INSERT INTO construction_projects (
+        tenant_id, organization_id, code, name, description,
+        address, city, district, region,
+        project_type, building_type, total_area, floors_count,
+        contract_amount, currency,
+        planned_start_date, planned_end_date, actual_start_date,
+        status, created_by, created_date, updated_date
+    ) VALUES (
+        v_tid, v_org, 'DEMO-QUR-001', 'Yunusobod City — A blok',
+        '9 qavatli monolit-karkas turar-joy majmuasi, 72 xonadon, yerto''la avtoturargohi bilan',
+        'Amir Temur ko''chasi 108', 'Toshkent', 'Yunusobod', 'Toshkent shahri',
+        'residential', 'monolit-karkas', 8640, 9,
+        48000000000, 'UZS',
+        CURRENT_DATE - INTERVAL '8 months', CURRENT_DATE + INTERVAL '10 months', CURRENT_DATE - INTERVAL '8 months',
+        'in_progress', v_user, NOW(), NOW()
+    ) RETURNING id INTO v_p1;
+
+    INSERT INTO construction_buildings (tenant_id, project_id, code, name, building_type, floors_count, total_area, apartments_count)
+    VALUES (v_tid, v_p1, 'A', 'A blok', 'residential', 9, 8640, 72)
+    RETURNING id INTO v_b1;
+
+    INSERT INTO construction_estimate (tenant_id, project_id, building_id, version, name, state, is_current, source_type, amount_direct, amount_total)
+    VALUES (v_tid, v_p1, v_b1, 1, 'A blok — ishchi smeta (edinich)', 'approved', true, 'edinich', 24189000000, 24189000000)
+    RETURNING id INTO v_e1;
+
+    -- Ishlar: resource_type='' + parent_line_id NULL = "ish" (works-filtr shartlari)
+    INSERT INTO construction_estimate_line
+        (tenant_id, estimate_id, name, uom, quantity, unit_rate, total_amount, done_quantity,
+         item_number, parent_item_number, resource_type, approval_status, sort_order)
+    VALUES
+        (v_tid, v_e1, 'Kotlovan qazish va tashish',        'м3', 12000, 45000,    540000000,  12000, '01-01', '01 Yer ishlari',      '', 'confirmed_engineer', 1),
+        (v_tid, v_e1, 'Poydevor monolit betoni M350',      'м3', 3800,  1200000,  4560000000, 3800,  '01-02', '01 Yer ishlari',      '', 'confirmed_engineer', 2),
+        (v_tid, v_e1, 'Kolonna va rigellar betoni',        'м3', 5200,  1350000,  7020000000, 2600,  '02-01', '02 Monolit karkas',   '', 'in_progress',        3),
+        (v_tid, v_e1, 'Qavatlararo monolit plita',         'м2', 8640,  850000,   7344000000, 2600,  '02-02', '02 Monolit karkas',   '', 'in_progress',        4),
+        (v_tid, v_e1, 'Fasad — ventfasad tizimi',          'м2', 6500,  600000,   3900000000, 0,     '03-01', '03 Tom va fasad',     '', 'pending',            5),
+        (v_tid, v_e1, 'Tom yopish (ruberoid + utepleniye)','м2', 1100,  750000,   825000000,  0,     '03-02', '03 Tom va fasad',     '', 'pending',            6);
+
+    -- Obyekt-xarajatlar (fakt): so'nggi 6 oyga taqsimlangan, approved
+    INSERT INTO construction_expense_lines
+        (tenant_id, organization_id, project_id, expense_date, description, amount, currency_code, status, approved_at, created_by)
+    VALUES
+        (v_tid, v_org, v_p1, CURRENT_DATE - INTERVAL '5 months', 'Armatura A500C partiyasi (450 t)',            2400000000, 'UZS', 'approved', NOW(), v_user),
+        (v_tid, v_org, v_p1, CURRENT_DATE - INTERVAL '4 months', 'Beton M350 yetkazmalari',                     3100000000, 'UZS', 'approved', NOW(), v_user),
+        (v_tid, v_org, v_p1, CURRENT_DATE - INTERVAL '3 months', 'Subpudrat: monolit ishlari (Forma-2 akt №3)', 4200000000, 'UZS', 'approved', NOW(), v_user),
+        (v_tid, v_org, v_p1, CURRENT_DATE - INTERVAL '2 months', 'Ish haqi — qurilish brigadalari',             1850000000, 'UZS', 'approved', NOW(), v_user),
+        (v_tid, v_org, v_p1, CURRENT_DATE - INTERVAL '1 month',  'Beton M350 yetkazmalari',                     2750000000, 'UZS', 'approved', NOW(), v_user),
+        (v_tid, v_org, v_p1, CURRENT_DATE - INTERVAL '5 days',   'Subpudrat: monolit ishlari (Forma-2 akt №4)', 3900000000, 'UZS', 'approved', NOW(), v_user);
+
+    -- ── P2: Rejalashtirish ───────────────────────────────────────────────
+    INSERT INTO construction_projects (
+        tenant_id, organization_id, code, name, description,
+        address, city, district, region,
+        project_type, building_type, total_area, floors_count,
+        contract_amount, currency,
+        planned_start_date, planned_end_date,
+        status, created_by, created_date, updated_date
+    ) VALUES (
+        v_tid, v_org, 'DEMO-QUR-002', 'Sergeli Riviera',
+        '12 qavatli 2 blokli turar-joy majmuasi, savdo birinchi qavat bilan',
+        'Yangi Sergeli ko''chasi 4A', 'Toshkent', 'Sergeli', 'Toshkent shahri',
+        'residential', 'monolit-karkas', 14200, 12,
+        30000000000, 'UZS',
+        CURRENT_DATE + INTERVAL '2 months', CURRENT_DATE + INTERVAL '26 months',
+        'planning', v_user, NOW(), NOW()
+    ) RETURNING id INTO v_p2;
+
+    -- ── P3: Tugallangan (kapitalizatsiyaga tayyor) ───────────────────────
+    INSERT INTO construction_projects (
+        tenant_id, organization_id, code, name, description,
+        address, city, district, region,
+        project_type, building_type, total_area, floors_count,
+        contract_amount, currency,
+        planned_start_date, planned_end_date, actual_start_date, actual_end_date,
+        status, created_by, created_date, updated_date
+    ) VALUES (
+        v_tid, v_org, 'DEMO-QUR-003', 'Chilonzor Residence — B blok',
+        '7 qavatli turar-joy binosi, 42 xonadon — foydalanishga topshirilgan',
+        'Bunyodkor shoh ko''chasi 27', 'Toshkent', 'Chilonzor', 'Toshkent shahri',
+        'residential', 'g''isht-monolit', 4830, 7,
+        12500000000, 'UZS',
+        CURRENT_DATE - INTERVAL '20 months', CURRENT_DATE - INTERVAL '2 months',
+        CURRENT_DATE - INTERVAL '20 months', CURRENT_DATE - INTERVAL '6 weeks',
+        'completed', v_user, NOW(), NOW()
+    ) RETURNING id INTO v_p3;
+
+    INSERT INTO construction_buildings (tenant_id, project_id, code, name, building_type, floors_count, total_area, apartments_count)
+    VALUES (v_tid, v_p3, 'B', 'B blok', 'residential', 7, 4830, 42)
+    RETURNING id INTO v_b3;
+
+    INSERT INTO construction_estimate (tenant_id, project_id, building_id, version, name, state, is_current, source_type, amount_direct, amount_total)
+    VALUES (v_tid, v_p3, v_b3, 1, 'B blok — ishchi smeta (edinich)', 'approved', true, 'edinich', 11400000000, 11400000000)
+    RETURNING id INTO v_e3;
+
+    INSERT INTO construction_estimate_line
+        (tenant_id, estimate_id, name, uom, quantity, unit_rate, total_amount, done_quantity,
+         item_number, parent_item_number, resource_type, approval_status, sort_order)
+    VALUES
+        (v_tid, v_e3, 'Qurilish-montaj ishlari (asosiy)', 'м2', 4830, 1900000, 9177000000, 4830, '01-01', '01 QMI', '', 'confirmed_engineer', 1),
+        (v_tid, v_e3, 'Pardozlash va kommunikatsiyalar',  'м2', 4830, 460000,  2221800000, 4830, '02-01', '02 Pardozlash', '', 'confirmed_engineer', 2);
+
+    INSERT INTO construction_expense_lines
+        (tenant_id, organization_id, project_id, expense_date, description, amount, currency_code, status, approved_at, created_by)
+    VALUES
+        (v_tid, v_org, v_p3, CURRENT_DATE - INTERVAL '4 months', 'QMI yakuniy bosqich (Forma-2 akt №11)', 6000000000, 'UZS', 'approved', NOW(), v_user),
+        (v_tid, v_org, v_p3, CURRENT_DATE - INTERVAL '2 months', 'Pardozlash va obodonlashtirish',        5400000000, 'UZS', 'approved', NOW(), v_user);
+
+    RAISE NOTICE '  Qurilish demo seed tayyor: 3 loyiha (jarayonda ~45%% tayyorlik, rejalashtirish, tugallangan)';
+END;
+$$;

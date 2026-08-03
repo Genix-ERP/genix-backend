@@ -69,6 +69,18 @@ func agentTools() []agentTool {
 			exec:        toolLowStock,
 		},
 		{
+			name:        "manufacturing_stats",
+			description: "Ishlab chiqarish KPIlari (joriy oy): buyurtmalar holati bo'yicha soni, yakunlangan, kechikkan, ishlab chiqarilgan/brak miqdori va brak foizi. Answers 'ishlab chiqarish qanday ketyapti'.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolManufacturingStats,
+		},
+		{
+			name:        "production_shortages",
+			description: "MRP-lite yetishmovchilik ro'yxati: tasdiqlangan/jarayondagi ishlab chiqarish buyurtmalari uchun yetishmayotgan komponentlar (BOM ehtiyoj − ombor − ochiq xarid). Answers 'nima yetishmayapti', 'nimani sotib olish kerak'.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolProductionShortages,
+		},
+		{
 			name:        "inventory_valuation",
 			description: "Total stock value and value per warehouse for the active company; answers 'omborda qancha pul turibdi'. Also returns the top products by value.",
 			parameters:  obj(map[string]interface{}{}),
@@ -131,6 +143,12 @@ func agentTools() []agentTool {
 			description: "List construction projects for the active company (code, name, client, status, contract amount, progress %).",
 			parameters:  obj(map[string]interface{}{"limit": intp("Max rows (default 10, max 50).")}),
 			exec:        toolListProjects,
+		},
+		{
+			name:        "construction_stats",
+			description: "Construction portfolio summary: project counts by status, contract total vs approved actual spend (obyekt xarajatlari), overdue projects, and the top budget-overrun projects with computed readiness. Answers 'qurilish qay ahvolda', 'qaysi loyihada byudjet oshyapti', 'nechta loyiha jarayonda', 'obyektlarga qancha sarflandi'.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolConstructionStats,
 		},
 		{
 			name:        "get_sales_order",
@@ -2560,4 +2578,216 @@ func toolListPurchaseReturns(h *Handler, c *gin.Context, tenantID uuid.UUID, org
 		}
 		return gin.H{"return_number": num, "supplier": sup, "date": dt, "status": st, "credit_value": total, "reason": reason}, true
 	})
+}
+
+// ── Manufacturing tools (Ishlab chiqarish v2, integration map §6 AI) ────
+
+// toolManufacturingStats — the KPI totals family from GetManufacturingStats
+// (manufacturing_stats.go), current month, read-only.
+func toolManufacturingStats(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	nowT := time.Now()
+	monthStart := time.Date(nowT.Year(), nowT.Month(), 1, 0, 0, 0, 0, nowT.Location())
+
+	var totalOrders, draftOrders, confirmedOrders, inProgressOrders, activeOrders int
+	var completedMonth, overdueOrders int
+	var qtyProduced, qtyScrapped float64
+	err := h.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status = 'draft'),
+			COUNT(*) FILTER (WHERE status = 'confirmed'),
+			COUNT(*) FILTER (WHERE status = 'in_progress'),
+			COUNT(*) FILTER (WHERE status IN ('in_progress', 'paused', 'packaging')),
+			COUNT(*) FILTER (WHERE status = 'completed' AND actual_end >= $3),
+			COUNT(*) FILTER (WHERE status IN ('draft', 'confirmed', 'ready', 'in_progress', 'paused', 'packaging')
+			                 AND scheduled_end IS NOT NULL AND scheduled_end < NOW()),
+			COALESCE(SUM(quantity_produced) FILTER (WHERE status = 'completed' AND actual_end >= $3), 0),
+			COALESCE(SUM(quantity_scrapped) FILTER (WHERE status = 'completed' AND actual_end >= $3), 0)
+		FROM production_orders
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR organization_id = $2)
+	`, tenantID, orgArg, monthStart).Scan(
+		&totalOrders, &draftOrders, &confirmedOrders, &inProgressOrders, &activeOrders,
+		&completedMonth, &overdueOrders, &qtyProduced, &qtyScrapped)
+	if err != nil {
+		return nil, err
+	}
+	scrapRate := 0.0
+	if qtyProduced+qtyScrapped > 0 {
+		scrapRate = qtyScrapped / (qtyProduced + qtyScrapped) * 100
+	}
+	return gin.H{
+		"total_orders":       totalOrders,
+		"draft":              draftOrders,
+		"confirmed":          confirmedOrders,
+		"in_progress":        inProgressOrders,
+		"active":             activeOrders,
+		"completed_month":    completedMonth,
+		"overdue":            overdueOrders,
+		"produced_month":     qtyProduced,
+		"scrapped_month":     qtyScrapped,
+		"scrap_rate_percent": scrapRate,
+	}, nil
+}
+
+// toolProductionShortages — the MRP-lite shortages query (same SQL as the
+// stats endpoint's shortages block): confirmed/in-progress MO BOM demand
+// minus on-hand minus open purchase quantity.
+func toolProductionShortages(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	rows, err := h.db.Query(`
+		WITH need AS (
+			SELECT bl.component_id AS product_id,
+			       SUM(bl.quantity
+			           * GREATEST(po.quantity_planned - COALESCE(po.quantity_produced, 0), 0)
+			           / GREATEST(COALESCE(pb.quantity, 1), 0.0001)
+			           * (1 + COALESCE(bl.scrap_percent, 0) / 100.0)) AS required
+			FROM production_orders po
+			JOIN product_boms pb ON pb.id = po.bom_id
+			JOIN bom_lines bl ON bl.bom_id = pb.id
+			JOIN products cp ON cp.id = bl.component_id AND COALESCE(cp.track_inventory, true)
+			WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
+			  AND po.status IN ('confirmed', 'in_progress')
+			  AND ($2::uuid IS NULL OR po.organization_id = $2)
+			GROUP BY bl.component_id
+		)
+		SELECT COALESCE(p.name, ''), n.required,
+		       COALESCE(oh.qty, 0) AS on_hand, COALESCE(oo.qty, 0) AS on_order,
+		       n.required - COALESCE(oh.qty, 0) - COALESCE(oo.qty, 0) AS missing
+		FROM need n
+		JOIN products p ON p.id = n.product_id
+		LEFT JOIN LATERAL (
+			SELECT SUM(i.quantity_on_hand) AS qty
+			FROM inventory i
+			JOIN warehouses w ON w.id = i.warehouse_id
+			WHERE i.tenant_id = $1 AND i.product_id = n.product_id
+			  AND w.deleted_at IS NULL
+			  AND ($2::uuid IS NULL OR w.organization_id = $2)
+		) oh ON true
+		LEFT JOIN LATERAL (
+			SELECT SUM(pol.quantity - COALESCE(pol.quantity_received, 0)) AS qty
+			FROM purchase_order_lines pol
+			JOIN purchase_orders p2 ON p2.id = pol.purchase_order_id
+			WHERE p2.tenant_id = $1 AND p2.deleted_at IS NULL
+			  AND p2.status IN ('approved', 'ordered', 'partial')
+			  AND pol.product_id = n.product_id
+			  AND ($2::uuid IS NULL OR p2.organization_id = $2)
+		) oo ON true
+		WHERE n.required - COALESCE(oh.qty, 0) - COALESCE(oo.qty, 0) > 0.0001
+		ORDER BY missing DESC
+		LIMIT 15
+	`, tenantID, orgArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []gin.H{}
+	for rows.Next() {
+		var name string
+		var required, onHand, onOrder, missing float64
+		if rows.Scan(&name, &required, &onHand, &onOrder, &missing) == nil {
+			out = append(out, gin.H{
+				"product": name, "required": required,
+				"on_hand": onHand, "on_order": onOrder, "missing": missing,
+			})
+		}
+	}
+	return out, nil
+}
+
+// toolConstructionStats mirrors GET /construction/projects/stats in compact
+// form for the AI agent (docs/construction-roadmap.md S7 phase 1): status
+// counts, contract vs approved actual, overdue count, and the projects whose
+// approved object costs are closest to / over their contract amount, each
+// with the cost-weighted readiness the portfolio cards show.
+func toolConstructionStats(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	byStatus := map[string]int{}
+	total := 0
+	var contractTotal float64
+	overdue := 0
+	rows, err := h.db.Query(`
+		SELECT COALESCE(status, 'draft'), COUNT(*), COALESCE(SUM(contract_amount), 0),
+		       COUNT(*) FILTER (WHERE planned_end_date IS NOT NULL AND planned_end_date < CURRENT_DATE
+		                        AND COALESCE(status, '') NOT IN ('completed', 'cancelled'))
+		FROM construction_projects
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id = $2)
+		GROUP BY 1`, tenantID, orgArg)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var status string
+		var cnt, od int
+		var sum float64
+		if rows.Scan(&status, &cnt, &sum, &od) == nil {
+			byStatus[status] = cnt
+			total += cnt
+			contractTotal += sum
+			overdue += od
+		}
+	}
+	rows.Close()
+
+	var actualTotal float64
+	_ = h.db.QueryRow(`
+		SELECT COALESCE(SUM(cel.amount), 0)
+		FROM construction_expense_lines cel
+		JOIN construction_projects p ON p.id = cel.project_id
+		WHERE cel.tenant_id = $1 AND cel.status = 'approved' AND cel.deleted_at IS NULL
+		  AND p.tenant_id = $1 AND p.deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR p.organization_id = $2)`, tenantID, orgArg).Scan(&actualTotal)
+
+	// Projects ranked by budget pressure (actual/contract), with readiness.
+	top := []gin.H{}
+	if prows, err := h.db.Query(`
+		WITH spend AS (
+			SELECT cel.project_id, SUM(cel.amount) AS actual
+			FROM construction_expense_lines cel
+			WHERE cel.tenant_id = $1 AND cel.status = 'approved' AND cel.deleted_at IS NULL
+			GROUP BY cel.project_id
+		), readiness AS (
+			SELECT e.project_id,
+			       CASE WHEN SUM(COALESCE(el.total_amount, 0)) > 0
+			            THEN SUM(COALESCE(el.total_amount, 0) * LEAST(COALESCE(el.done_quantity, 0) / NULLIF(
+			                 CASE WHEN COALESCE(el.imported_quantity, 0) > 0 THEN el.imported_quantity
+			                      WHEN COALESCE(el.original_quantity, 0) > 0 THEN el.original_quantity
+			                      ELSE COALESCE(el.quantity, 0) END, 0), 1))
+			                 / SUM(COALESCE(el.total_amount, 0)) * 100
+			            ELSE 0 END AS pct
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
+			WHERE el.tenant_id = $1 AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND COALESCE(el.resource_type, '') = '' AND COALESCE(el.parent_line_id, 0) = 0
+			GROUP BY e.project_id
+		)
+		SELECT p.name, COALESCE(p.status, ''), COALESCE(p.contract_amount, 0),
+		       COALESCE(s.actual, 0), COALESCE(r.pct, 0)
+		FROM construction_projects p
+		LEFT JOIN spend s ON s.project_id = p.id
+		LEFT JOIN readiness r ON r.project_id = p.id
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR p.organization_id = $2)
+		  AND COALESCE(s.actual, 0) > 0
+		ORDER BY CASE WHEN COALESCE(p.contract_amount, 0) > 0
+		              THEN COALESCE(s.actual, 0) / p.contract_amount ELSE 0 END DESC
+		LIMIT 8`, tenantID, orgArg); err == nil {
+		for prows.Next() {
+			var name, status string
+			var budget, actual, pct float64
+			if prows.Scan(&name, &status, &budget, &actual, &pct) == nil {
+				row := gin.H{"name": name, "status": status, "contract_amount": budget,
+					"actual_spend": actual, "readiness_pct": pct}
+				if budget > 0 {
+					row["budget_used_pct"] = actual / budget * 100
+				}
+				top = append(top, row)
+			}
+		}
+		prows.Close()
+	}
+
+	return gin.H{
+		"total_projects": total, "by_status": byStatus,
+		"contract_total": contractTotal, "actual_total": actualTotal,
+		"overdue_projects": overdue, "top_budget_pressure": top,
+	}, nil
 }

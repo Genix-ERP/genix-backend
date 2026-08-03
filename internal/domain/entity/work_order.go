@@ -219,6 +219,10 @@ type RecordWorkOrderTimeInput struct {
 	ScrapQuantity    float64    `json:"scrap_quantity,omitempty"`
 	ScrapReason      string     `json:"scrap_reason,omitempty"`
 	Notes            string     `json:"notes,omitempty"`
+	// EmployeeID links the log to the HR employee register (migration 459,
+	// payroll groundwork). Falls back server-side to the caller's linked
+	// employee when omitted.
+	EmployeeID *uuid.UUID `json:"employee_id,omitempty"`
 }
 
 // ValidateTransferInput for validating manufacturing transfers
