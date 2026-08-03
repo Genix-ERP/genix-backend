@@ -895,13 +895,15 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 	var vendorName sql.NullString
 	var organizationID *uuid.UUID
 	var existingJEID *uuid.UUID
+	var fxRate float64
 	err = h.db.QueryRow(`
-		SELECT pi.status, pi.total_amount, pi.tax_amount, pi.subtotal, pi.vendor_id, c.name, pi.organization_id, pi.journal_entry_id
+		SELECT pi.status, pi.total_amount, pi.tax_amount, pi.subtotal, pi.vendor_id, c.name, pi.organization_id, pi.journal_entry_id,
+		       COALESCE(NULLIF(pi.exchange_rate, 0), 1)
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		WHERE pi.id = $1 AND pi.tenant_id = $2 AND pi.deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &totalAmount, &taxAmount, &subtotal, &vendorID, &vendorName, &organizationID, &existingJEID)
+	).Scan(&currentStatus, &totalAmount, &taxAmount, &subtotal, &vendorID, &vendorName, &organizationID, &existingJEID, &fxRate)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase invoice")
 		return
@@ -1021,6 +1023,11 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 				description = fmt.Sprintf("Bill: %s", vendorName.String)
 			}
 
+			// Post BASE amounts using the invoice's locked FX rate (finding
+			// #8 — the GL used to book the nominal foreign amount at 1.0).
+			baseTotal := totalAmount * fxRate
+			baseTax := taxAmount * fxRate
+
 			journalEntryID := uuid.New()
 			_, err = tx.Exec(`
 				INSERT INTO journal_entries (
@@ -1028,7 +1035,7 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 				journalEntryID, tenantID, organizationID, purchaseJournalID, entryNumber, now, invoiceID.String()[:8], description,
-				"purchase_invoice", invoiceID.String(), 1.0, totalAmount, totalAmount, userID, now, now,
+				"purchase_invoice", invoiceID.String(), fxRate, baseTotal, baseTotal, userID, now, now,
 			)
 			if err != nil {
 				h.log.Error("Failed to create journal entry for posted invoice", "error", err)
@@ -1037,6 +1044,7 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 
 				// Debit: Stock Interim Receipt (per category) — clears the interim from goods receipt
 				for inputAcct, amount := range inputGrouped {
+					baseAmount := amount * fxRate
 					lineID := uuid.New()
 					tx.Exec(`
 						INSERT INTO journal_entry_lines (
@@ -1044,9 +1052,9 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 						lineID, journalEntryID, lineNumber, inputAcct, "Stock Interim Receipt",
-						amount, 0.0, 1.0, now,
+						baseAmount, 0.0, fxRate, now,
 					)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, inputAcct)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", baseAmount, now, inputAcct)
 					lineNumber++
 				}
 
@@ -1059,9 +1067,9 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 						taxLineID, journalEntryID, lineNumber, taxAccountID, "Input Tax",
-						taxAmount, 0.0, 1.0, now,
+						baseTax, 0.0, fxRate, now,
 					)
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", baseTax, now, taxAccountID)
 					lineNumber++
 				}
 
@@ -1073,9 +1081,11 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 					apLineID, journalEntryID, lineNumber, apAccountID, vendorID, "Accounts Payable",
-					0.0, totalAmount, 1.0, now,
+					0.0, baseTotal, fxRate, now,
 				)
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
+				// 448 convention: current_balance = SUM(debit) - SUM(credit)
+				// for EVERY account — a credit subtracts, payable included.
+				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", baseTotal, now, apAccountID)
 
 				// Update journal next number
 				tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", purchaseJournalID)
@@ -1162,12 +1172,17 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	if paymentAmount == 0 {
 		paymentAmount = totalAmount - amountPaid - input.WriteOffAmount
 	}
-
-	newAmountPaid := amountPaid + paymentAmount + input.WriteOffAmount
-	newStatus := "partial"
-	if newAmountPaid >= totalAmount {
-		newStatus = "paid"
-		newAmountPaid = totalAmount // Don't overpay
+	if paymentAmount < 0 || input.WriteOffAmount < 0 || paymentAmount+input.WriteOffAmount <= 0 {
+		response.BadRequest(c, "Payment amount must be positive")
+		return
+	}
+	// Over-payment guard: the old code display-capped amount_paid at
+	// total_amount but still posted the FULL payment into the GL, so AP
+	// went negative on an overpaid invoice.
+	increment := paymentAmount + input.WriteOffAmount
+	if increment > totalAmount-amountPaid+0.01 {
+		response.BadRequest(c, "OVER_PAYMENT: amount exceeds the invoice's remaining balance")
+		return
 	}
 
 	// Check lock date
@@ -1177,12 +1192,23 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	}
 
 	now := time.Now()
-	_, err = h.db.Exec(
-		"UPDATE purchase_invoices SET amount_paid = $1, status = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
-		newAmountPaid, newStatus, now, invoiceID, tenantID,
+	// The cap lives INSIDE the UPDATE's WHERE so two concurrent payments
+	// cannot jointly exceed the invoice total — the loser matches zero rows.
+	res, err := h.db.Exec(`
+		UPDATE purchase_invoices
+		SET amount_paid = amount_paid + $1,
+		    status = CASE WHEN amount_paid + $1 >= total_amount - 0.01 THEN 'paid' ELSE 'partial' END,
+		    updated_at = $2
+		WHERE id = $3 AND tenant_id = $4
+		  AND amount_paid + $1 <= total_amount + 0.01`,
+		increment, now, invoiceID, tenantID,
 	)
 	if err != nil {
 		response.InternalError(c, "Failed to record payment")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.BadRequest(c, "OVER_PAYMENT: amount exceeds the invoice's remaining balance")
 		return
 	}
 
@@ -1379,7 +1405,8 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 							writeOffLineID, journalEntryID, 3, otherIncomeID, "Payment Difference Write-off",
 							0.0, effectiveWriteOff, 1.0, now,
 						); err == nil {
-							_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", effectiveWriteOff, now, otherIncomeID)
+							// credit subtracts (448 convention)
+							_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", effectiveWriteOff, now, otherIncomeID)
 						}
 					}
 
@@ -1388,11 +1415,11 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 						_, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", payJournalID)
 					}
 					if err == nil {
-						// Debit AP (credit-normal: debit decreases) — includes write-off
-						_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID)
+						// Debit AP — 448 convention (balance = D - C): a debit ADDS
+						_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID)
 					}
 					if err == nil {
-						// Credit Cash/Bank (debit-normal: credit decreases)
+						// Credit Cash/Bank — a credit subtracts
 						_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
 					}
 

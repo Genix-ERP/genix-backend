@@ -97,6 +97,12 @@ func agentTools() []agentTool {
 			exec:        toolListVendorBills,
 		},
 		{
+			name:        "supplier_prices",
+			description: "Per-supplier prices and delivery KPIs for ONE product: negotiated price-list price, last purchase price and date, average delivery days. Answers 'sementni oxirgi marta kimdan necha pulga oldik', 'qaysi yetkazib beruvchi eng tez/arzon'.",
+			parameters:  obj(map[string]interface{}{"product": str("Part of the product name / SKU.")}, "product"),
+			exec:        toolSupplierPrices,
+		},
+		{
 			name:        "list_production_orders",
 			description: "List manufacturing/production orders (code, product, planned vs produced qty, status). Optional status filter.",
 			parameters:  obj(map[string]interface{}{"status": str("Optional status."), "limit": intp("Max rows (default 10, max 50).")}),
@@ -158,8 +164,8 @@ func agentTools() []agentTool {
 		},
 		{
 			name:        "list_fixed_assets",
-			description: "The fixed-asset register: code, name, category, acquisition cost, accumulated depreciation, current book value, status and custodian. Optional status filter (active, disposed, under_maintenance, written_off).",
-			parameters:  obj(map[string]interface{}{"status": str("Optional status filter."), "limit": intp("Max rows (default 15, max 50).")}),
+			description: "The fixed-asset (asosiy vositalar) register: inventory number, name, category, cost, accumulated depreciation, book value (qoldiq qiymat), status, responsible employee (javobgar shaxs) and location/construction object. Use for 'qoldiq qiymati qancha', 'qaysi texnika to'liq amortizatsiya bo'lgan', 'kimga qanday aktiv biriktirilgan'. Optional filters: status (draft, in_service, conserved, disposed) and query (name or inventory number).",
+			parameters:  obj(map[string]interface{}{"status": str("Optional status filter: draft, in_service, conserved, disposed."), "query": str("Optional search by name or inventory number."), "limit": intp("Max rows (default 15, max 50).")}),
 			exec:        toolListFixedAssets,
 		},
 		{
@@ -371,6 +377,21 @@ func agentTools() []agentTool {
 				}, "product", "quantity")},
 			}, "customer", "lines"),
 			exec: toolCreateSalesOrder,
+		},
+		{
+			name:        "create_quotation",
+			description: "Create a DRAFT sales quotation (taklif) for a customer with product lines. The user reviews it in the app, sends it and can convert it to an order with one click. Requires confirmation.",
+			mutating:    true,
+			parameters: obj(map[string]interface{}{
+				"customer":    str("Customer name (must already exist; use find_contacts first)."),
+				"valid_until": str("Optional validity date YYYY-MM-DD."),
+				"lines": map[string]interface{}{"type": "array", "description": "Quotation lines.", "items": obj(map[string]interface{}{
+					"product":    str("Product name (must exist)."),
+					"quantity":   map[string]interface{}{"type": "number", "description": "Quantity."},
+					"unit_price": map[string]interface{}{"type": "number", "description": "Optional unit price; defaults to the product's price."},
+				}, "product", "quantity")},
+			}, "customer", "lines"),
+			exec: toolCreateQuotation,
 		},
 		{
 			name:        "record_payment",
@@ -910,6 +931,65 @@ func toolCreateSalesOrder(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg
 	return gin.H{"order_number": num, "customer": custName, "lines": len(lines), "total": subtotal, "status": "draft"}, nil
 }
 
+func toolCreateQuotation(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	custID, custName, err := resolveContactID(h, tenantID, argStr(args, "customer"), "customer")
+	if err != nil {
+		return nil, err
+	}
+	lines, subtotal, err := parseLines(h, tenantID, args["lines"])
+	if err != nil {
+		return nil, err
+	}
+	var validUntil interface{}
+	if s := argStr(args, "valid_until"); s != "" {
+		if t, perr := time.Parse("2006-01-02", s); perr == nil {
+			validUntil = t
+		}
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Same QT series as the quotations handler (MAX+1 over sales_quotations)
+	var qtNum int64
+	_ = tx.QueryRow(`
+		SELECT COALESCE(MAX(CAST(SUBSTRING(quotation_number FROM 3) AS BIGINT)), 0) + 1
+		FROM sales_quotations
+		WHERE tenant_id = $1 AND quotation_number ~ '^QT[0-9]+$'`,
+		tenantID).Scan(&qtNum)
+	if qtNum < 1 {
+		qtNum = 1
+	}
+	num := fmt.Sprintf("QT%05d", qtNum)
+
+	qID := uuid.New()
+	if _, err := tx.Exec(`INSERT INTO sales_quotations
+		(id, tenant_id, organization_id, quotation_number, customer_id, customer_name,
+		 valid_until, subtotal, discount_percent, discount_amount, tax_percent, tax_amount,
+		 total_amount, status, notes, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,0,0,0,$8,'draft',$9,$10,now(),now())`,
+		qID, tenantID, orgArg, num, custID, custName, validUntil, subtotal, "Created by AI agent", userID); err != nil {
+		return nil, err
+	}
+	for i, l := range lines {
+		var productName string
+		_ = tx.QueryRow("SELECT COALESCE(name, '') FROM products WHERE id = $1", l.ProductID).Scan(&productName)
+		if _, err := tx.Exec(`INSERT INTO sales_quotation_items
+			(id, quotation_id, product_id, product_name, quantity, unit_price, total, sort_order, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())`,
+			uuid.New(), qID, l.ProductID, productName, l.Qty, l.Price, l.Total, i+1); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return gin.H{"quotation_number": num, "customer": custName, "lines": len(lines), "total": subtotal, "status": "draft (review and send in the app)"}, nil
+}
+
 func toolRecordPayment(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	dir := argStr(args, "direction")
 	typ, ctype := "receipt", "customer"
@@ -1124,6 +1204,85 @@ func toolListPurchaseOrders(h *Handler, c *gin.Context, tenantID uuid.UUID, orgA
 		}
 		return gin.H{"order_number": num, "vendor": vend, "status": st, "total": total, "date": dt}, true
 	})
+}
+
+// toolSupplierPrices answers "kimdan necha pulga olamiz": for one product it
+// merges the active vendor price list, the latest actual purchase price
+// (supplier_price_history) and delivery speed (completed goods receipts vs
+// order date) into one row per supplier, cheapest effective price first.
+func toolSupplierPrices(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	productID, productName, _, err := resolveProduct(h, tenantID, argStr(args, "product"))
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := h.db.Query(`
+		SELECT ct.id, ct.name,
+		       vp.price, vp.lead_time_days,
+		       hist.last_price, hist.last_date,
+		       gr.avg_days
+		FROM contacts ct
+		LEFT JOIN LATERAL (
+			SELECT v.price, v.lead_time_days FROM vendor_prices v
+			WHERE v.tenant_id = $1 AND v.vendor_id = ct.id AND v.product_id = $2
+			  AND v.is_active = true AND v.deleted_at IS NULL
+			ORDER BY v.valid_from DESC NULLS LAST LIMIT 1
+		) vp ON true
+		LEFT JOIN LATERAL (
+			SELECT sph.unit_price AS last_price, sph.effective_date AS last_date
+			FROM supplier_price_history sph
+			WHERE sph.tenant_id = $1 AND sph.vendor_id = ct.id AND sph.product_id = $2
+			ORDER BY sph.effective_date DESC LIMIT 1
+		) hist ON true
+		LEFT JOIN LATERAL (
+			SELECT AVG(g.receipt_date::date - po.order_date::date)::float AS avg_days
+			FROM goods_receipts g
+			JOIN purchase_orders po ON po.id = g.purchase_order_id
+			WHERE g.supplier_id = ct.id AND g.tenant_id = $1 AND g.status = 'completed' AND g.deleted_at IS NULL
+		) gr ON true
+		WHERE ct.tenant_id = $1 AND ct.type IN ('vendor', 'both') AND ct.deleted_at IS NULL
+		  AND (vp.price IS NOT NULL OR hist.last_price IS NOT NULL)
+		ORDER BY COALESCE(vp.price, hist.last_price) ASC
+		LIMIT 15
+	`, tenantID, productID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	list := []gin.H{}
+	for rows.Next() {
+		var vid uuid.UUID
+		var name string
+		var listPrice, lastPrice, avgDays *float64
+		var leadDays *int
+		var lastDate *time.Time
+		if rows.Scan(&vid, &name, &listPrice, &leadDays, &lastPrice, &lastDate, &avgDays) != nil {
+			continue
+		}
+		row := gin.H{"supplier": name}
+		if listPrice != nil {
+			row["pricelist_price"] = *listPrice
+		}
+		if lastPrice != nil {
+			row["last_purchase_price"] = *lastPrice
+		}
+		if lastDate != nil {
+			row["last_purchase_date"] = lastDate.Format("2006-01-02")
+		}
+		if leadDays != nil {
+			row["lead_time_days"] = *leadDays
+		}
+		if avgDays != nil {
+			row["avg_delivery_days"] = *avgDays
+		}
+		list = append(list, row)
+	}
+	if len(list) == 0 {
+		return gin.H{"product": productName, "suppliers": list,
+			"note": "no price data for this product yet (no price list entries or purchase history)"}, nil
+	}
+	return gin.H{"product": productName, "suppliers": list}, nil
 }
 
 func toolListVendorBills(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
@@ -1457,27 +1616,43 @@ func toolListBankAccounts(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg
 }
 
 func toolListFixedAssets(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	// Reads the unified fa_assets register (the legacy fixed_assets table was
+	// deprecated by migration 453; assets created in the module were invisible
+	// to the AI before this re-point — audit 2026-08-03).
 	limit := argInt(args, "limit", 15, 50)
 	status := argStr(args, "status")
-	qry := `SELECT COALESCE(asset_code,''), COALESCE(name,''), COALESCE(category_name,''), COALESCE(acquisition_cost,0),
-	               COALESCE(accumulated_depreciation,0), COALESCE(book_value, current_value, 0), COALESCE(status,''),
-	               COALESCE(custodian_name,''), COALESCE(location,'')
-	        FROM fixed_assets WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qry := `SELECT a.inventory_number, a.name, c.name_uz, a.cost,
+	               a.accumulated_depreciation, (a.cost - a.accumulated_depreciation), a.status::text,
+	               COALESCE(e.first_name || ' ' || e.last_name, ''), COALESCE(cp.name, COALESCE(a.location,'')),
+	               a.commissioning_date, a.useful_life_months
+	        FROM fa_assets a
+	        JOIN fa_categories c ON c.id = a.category_id
+	        LEFT JOIN employees e ON e.id = a.assigned_employee_id
+	        LEFT JOIN construction_projects cp ON cp.id = a.construction_object_id
+	        WHERE a.tenant_id=$1 AND a.deleted_at IS NULL AND ($2::uuid IS NULL OR a.organization_id=$2)`
 	qa := []interface{}{tenantID, orgArg}
 	if status != "" {
-		qry += " AND status=$3"
+		qry += " AND a.status::text=$3"
 		qa = append(qa, status)
 	}
-	qry += fmt.Sprintf(" ORDER BY acquisition_date DESC NULLS LAST LIMIT %d", limit)
+	if q := argStr(args, "query"); q != "" {
+		qa = append(qa, q)
+		qry += fmt.Sprintf(" AND (a.name ILIKE '%%'||$%d||'%%' OR a.inventory_number ILIKE '%%'||$%d||'%%')", len(qa), len(qa))
+	}
+	qry += fmt.Sprintf(" ORDER BY a.purchase_date DESC NULLS LAST LIMIT %d", limit)
 	rows, err := h.db.Query(qry, qa...)
 	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
 		var code, name, cat, st, custodian, loc string
 		var cost, accDep, bookVal float64
-		if r.Scan(&code, &name, &cat, &cost, &accDep, &bookVal, &st, &custodian, &loc) != nil {
+		var comm interface{}
+		var life int
+		if r.Scan(&code, &name, &cat, &cost, &accDep, &bookVal, &st, &custodian, &loc, &comm, &life) != nil {
 			return nil, false
 		}
-		return gin.H{"asset_code": code, "name": name, "category": cat, "acquisition_cost": cost,
-			"accumulated_depreciation": accDep, "book_value": bookVal, "status": st, "custodian": custodian, "location": loc}, true
+		return gin.H{"inventory_number": code, "name": name, "category": cat, "cost": cost,
+			"accumulated_depreciation": accDep, "book_value": bookVal, "status": st,
+			"responsible_employee": custodian, "location": loc, "commissioning_date": comm,
+			"useful_life_months": life}, true
 	})
 }
 

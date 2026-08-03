@@ -344,3 +344,112 @@ func (h *Handler) checkVendorBillsOverdue() {
 		h.log.Info("Vendor bill overdue notifications sent", "count", count)
 	}
 }
+
+// RunInvoiceOverdueScheduler starts a daily background job at 09:05 Tashkent time for
+// overdue CUSTOMER invoices — the receivables mirror of RunVendorBillOverdueScheduler.
+// Until now payables had a cron and receivables had nothing (savdo-audit §11).
+func (h *Handler) RunInvoiceOverdueScheduler(ctx context.Context) {
+	go func() {
+		loc, err := time.LoadLocation("Asia/Tashkent")
+		if err != nil {
+			loc = time.FixedZone("UZT", 5*60*60)
+		}
+		for {
+			now := time.Now().In(loc)
+			next := time.Date(now.Year(), now.Month(), now.Day(), 9, 5, 0, 0, loc)
+			if now.After(next) {
+				next = next.Add(24 * time.Hour)
+			}
+			select {
+			case <-time.After(next.Sub(now)):
+				h.checkCustomerInvoicesOverdue()
+			case <-ctx.Done():
+				h.log.Info("Customer invoice overdue scheduler stopped")
+				return
+			}
+		}
+	}()
+	h.log.Info("Customer invoice overdue scheduler started (daily at 09:05 Tashkent time)")
+}
+
+// checkCustomerInvoicesOverdue notifies once per overdue sales invoice using the
+// one-shot overdue_notified flag (migration 451), in each recipient's language via
+// the existing 'invoice_overdue' template (previously an orphan with no producer).
+func (h *Handler) checkCustomerInvoicesOverdue() {
+	now := time.Now()
+	count := 0
+
+	rows, err := h.db.Query(`
+		SELECT si.id, si.tenant_id, si.invoice_number, si.due_date,
+		       COALESCE(NULLIF(si.customer_name, ''), c.name, 'Noma''lum mijoz'),
+		       si.total_amount, si.amount_paid, si.created_by
+		FROM sales_invoices si
+		LEFT JOIN contacts c ON si.customer_id = c.id
+		WHERE si.due_date < CURRENT_DATE
+		  AND si.status IN ('sent', 'partial', 'overdue')
+		  AND si.amount_paid < si.total_amount
+		  AND COALESCE(si.overdue_notified, false) = false
+		  AND si.deleted_at IS NULL
+	`)
+	if err != nil {
+		h.log.Error("Failed to query overdue customer invoices", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			invoiceID    uuid.UUID
+			tenantID     uuid.UUID
+			number       string
+			dueDate      time.Time
+			customerName string
+			totalAmt     float64
+			amountPaid   float64
+			createdBy    *uuid.UUID
+		)
+		if err := rows.Scan(&invoiceID, &tenantID, &number, &dueDate, &customerName, &totalAmt, &amountPaid, &createdBy); err != nil {
+			continue
+		}
+
+		overdueDays := int(math.Floor(now.Sub(dueDate).Hours() / 24))
+		if overdueDays < 1 {
+			overdueDays = 1
+		}
+		data := map[string]interface{}{
+			"invoice_id":     invoiceID.String(),
+			"invoice_number": number,
+			"customer_name":  customerName,
+			"overdue_days":   overdueDays,
+			"amount_due":     totalAmt - amountPaid,
+		}
+
+		recipients := map[uuid.UUID]bool{}
+		if createdBy != nil {
+			recipients[*createdBy] = true
+		}
+		adminRows, _ := h.db.Query(`
+			SELECT tu.user_id FROM tenant_users tu
+			WHERE tu.tenant_id = $1 AND tu.role IN ('admin', 'owner') AND tu.deleted_at IS NULL
+		`, tenantID)
+		if adminRows != nil {
+			for adminRows.Next() {
+				var adminID uuid.UUID
+				if adminRows.Scan(&adminID) == nil {
+					recipients[adminID] = true
+				}
+			}
+			adminRows.Close()
+		}
+		for uid := range recipients {
+			h.createTranslatedNotification(tenantID, uid, "invoice_overdue", data, number, customerName)
+		}
+
+		h.db.Exec("UPDATE sales_invoices SET overdue_notified = true WHERE id = $1", invoiceID)
+		count++
+	}
+
+	if count > 0 {
+		h.log.Info("Customer invoice overdue notifications sent", "count", count)
+	}
+}

@@ -334,10 +334,40 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 		response.BadRequest(c, "Invalid invoice_date format, expected YYYY-MM-DD")
 		return
 	}
-	dueDate, err := time.Parse("2006-01-02", input.DueDate)
-	if err != nil {
-		response.BadRequest(c, "Invalid due_date format, expected YYYY-MM-DD")
-		return
+	// due_date: explicit value wins; otherwise derive it from the customer's payment
+	// term (payment_terms was a fully-seeded reference table nothing consumed —
+	// savdo-audit §5). Fallback: NET30.
+	var dueDate time.Time
+	if input.DueDate != "" {
+		dueDate, err = time.Parse("2006-01-02", input.DueDate)
+		if err != nil {
+			response.BadRequest(c, "Invalid due_date format, expected YYYY-MM-DD")
+			return
+		}
+	} else {
+		dueDate = invoiceDate.AddDate(0, 0, 30)
+		var termType string
+		var dueDays int
+		termErr := h.db.QueryRow(`
+			SELECT pt.term_type, COALESCE(pt.due_days, 0)
+			FROM contacts c
+			JOIN payment_terms pt ON pt.id = c.payment_term_id
+			WHERE c.id = $1 AND c.tenant_id = $2 AND pt.is_active = true`,
+			input.CustomerID, tenantID).Scan(&termType, &dueDays)
+		if termErr == nil {
+			switch termType {
+			case "immediate":
+				dueDate = invoiceDate
+			case "end_of_month":
+				firstOfNext := time.Date(invoiceDate.Year(), invoiceDate.Month(), 1, 0, 0, 0, 0, invoiceDate.Location()).AddDate(0, 1, 0)
+				dueDate = firstOfNext.AddDate(0, 0, -1+dueDays)
+			case "end_of_next_month":
+				firstOfNext2 := time.Date(invoiceDate.Year(), invoiceDate.Month(), 1, 0, 0, 0, 0, invoiceDate.Location()).AddDate(0, 2, 0)
+				dueDate = firstOfNext2.AddDate(0, 0, -1+dueDays)
+			default:
+				dueDate = invoiceDate.AddDate(0, 0, dueDays)
+			}
+		}
 	}
 
 	// Generate invoice number
@@ -432,19 +462,31 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 		}
 	}
 
-	// Insert sales invoice
+	// Header + lines in one transaction: previously bare h.db.Exec calls could leave a
+	// header with no lines, and customer_name was never written (the overdue scanner
+	// skipped such invoices).
+	var customerName string
+	_ = h.db.QueryRow("SELECT COALESCE(name, '') FROM contacts WHERE id = $1 AND tenant_id = $2", customerID, tenantID).Scan(&customerName)
+
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
 	query := `
 		INSERT INTO sales_invoices (
-			id, tenant_id, organization_id, invoice_number, customer_id, sales_order_id,
+			id, tenant_id, organization_id, invoice_number, customer_id, customer_name, sales_order_id,
 			invoice_date, due_date, billing_address, shipping_address,
 			currency_id, exchange_rate, subtotal, discount_amount,
 			tax_amount, total_amount, amount_paid, status,
 			reference, po_number, notes, terms_conditions,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`
 
-	_, err = h.db.Exec(query,
-		invoiceID, tenantID, orgID, invoiceNumber, customerID, salesOrderID,
+	_, err = tx.Exec(query,
+		invoiceID, tenantID, orgID, invoiceNumber, customerID, customerName, salesOrderID,
 		invoiceDate, dueDate, billingAddressJSON, shippingAddressJSON,
 		currencyID, exchangeRate, subtotal, discountAmount,
 		taxAmount, totalAmount, 0, entity.InvoiceStatusDraft,
@@ -492,11 +534,28 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 				tax_id, tax_amount, line_total, account_id, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
 
-		h.db.Exec(lineQuery,
+		if _, lineErr := tx.Exec(lineQuery,
 			lineID, invoiceID, salesOrderLineID, i+1, productID, line.Description,
 			line.Quantity, unitID, line.UnitPrice, line.DiscountAmount,
 			taxID, lineTaxAmounts[i], lineTotal, accountID, now,
-		)
+		); lineErr != nil {
+			h.log.Error("Failed to create sales invoice line", "error", lineErr, "line", i+1)
+			response.InternalError(c, "Failed to create sales invoice lines")
+			return
+		}
+		if salesOrderLineID != nil {
+			if _, qiErr := tx.Exec(
+				"UPDATE sales_order_lines SET quantity_invoiced = quantity_invoiced + $1, updated_at = $2 WHERE id = $3",
+				line.Quantity, now, *salesOrderLineID,
+			); qiErr != nil {
+				h.log.Error("CreateSalesInvoice: quantity_invoiced update failed", "error", qiErr)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit invoice")
+		return
 	}
 
 	// Return created invoice
@@ -541,6 +600,10 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	invoiceID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid invoice ID")
+		return
+	}
+	if !h.salesOrgScopeOK(c, "sales_invoices", invoiceID, tenantID) {
+		response.NotFound(c, "Sales invoice")
 		return
 	}
 
@@ -847,6 +910,10 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		response.BadRequest(c, "Invalid invoice ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_invoices", invoiceID, tenantID) {
+		response.NotFound(c, "Sales invoice")
+		return
+	}
 
 	var input struct {
 		DueDate         *string `json:"due_date,omitempty"`
@@ -908,27 +975,29 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("terms_conditions = $%d", argCount))
 		args = append(args, *input.TermsConditions)
 	}
-	if input.Status != nil {
-		// Validate status transition
-		validStatuses := map[string]bool{"draft": true, "sent": true, "paid": true, "cancelled": true}
-		if !validStatuses[*input.Status] {
-			response.BadRequest(c, "Invalid status")
+	if input.Status != nil && *input.Status != currentStatus {
+		// Manual status writes are restricted to cancellation. 'sent' must go through
+		// POST /:id/send (which posts the AR journal entry), and 'partial'/'paid' are
+		// derived from payments — a bare PUT must never fake either.
+		if *input.Status != "cancelled" {
+			response.BadRequest(c, "Only cancellation is allowed here; use /send to post the invoice, payments set partial/paid")
 			return
 		}
-		// Only allow draft -> sent, or sent -> paid transitions
-		if currentStatus == "draft" && (*input.Status != "sent" && *input.Status != "cancelled") {
-			response.BadRequest(c, "Draft invoices can only be sent or cancelled")
+		if currentStatus != "draft" && currentStatus != "sent" {
+			response.BadRequest(c, fmt.Sprintf("Cannot cancel an invoice in status '%s'", currentStatus))
+			return
+		}
+		// A posted invoice keeps a live AR entry — it must be reversed with a credit
+		// note, not silently cancelled.
+		var jeID sql.NullString
+		_ = h.db.QueryRow("SELECT journal_entry_id FROM sales_invoices WHERE id = $1 AND tenant_id = $2", invoiceID, tenantID).Scan(&jeID)
+		if jeID.Valid && jeID.String != "" {
+			response.BadRequest(c, "Invoice is posted to the ledger; create a credit note instead of cancelling")
 			return
 		}
 		argCount++
 		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
 		args = append(args, *input.Status)
-		// If sending, record sent_at
-		if *input.Status == "sent" {
-			argCount++
-			updates = append(updates, fmt.Sprintf("sent_at = $%d", argCount))
-			args = append(args, time.Now())
-		}
 	}
 
 	if len(updates) == 0 {
@@ -972,6 +1041,10 @@ func (h *Handler) DeleteSalesInvoice(c *gin.Context) {
 	invoiceID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid invoice ID")
+		return
+	}
+	if !h.salesOrgScopeOK(c, "sales_invoices", invoiceID, tenantID) {
+		response.NotFound(c, "Sales invoice")
 		return
 	}
 
@@ -1020,19 +1093,23 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		response.BadRequest(c, "Invalid invoice ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_invoices", invoiceID, tenantID) {
+		response.NotFound(c, "Sales invoice")
+		return
+	}
 
 	// Get invoice details
 	var currentStatus, invoiceNumber string
 	var customerID uuid.UUID
 	var organizationID *uuid.UUID
-	var salesOrderID sql.NullString
+	var salesOrderID, existingJEID sql.NullString
 	var totalAmount, taxAmount, subtotal float64
 	var invoiceDate time.Time
 	err = h.db.QueryRow(`
-		SELECT status, invoice_number, customer_id, organization_id, total_amount, tax_amount, subtotal, invoice_date, sales_order_id
+		SELECT status, invoice_number, customer_id, organization_id, total_amount, tax_amount, subtotal, invoice_date, sales_order_id, journal_entry_id
 		FROM sales_invoices WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		invoiceID, tenantID,
-	).Scan(&currentStatus, &invoiceNumber, &customerID, &organizationID, &totalAmount, &taxAmount, &subtotal, &invoiceDate, &salesOrderID)
+	).Scan(&currentStatus, &invoiceNumber, &customerID, &organizationID, &totalAmount, &taxAmount, &subtotal, &invoiceDate, &salesOrderID, &existingJEID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
 		return
@@ -1043,6 +1120,12 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	}
 	if currentStatus != string(entity.InvoiceStatusDraft) {
 		response.BadRequest(c, "Can only send invoices in draft status")
+		return
+	}
+	// Double-post guard: an invoice that already carries a journal entry must never
+	// post AR a second time, whatever its status claims.
+	if existingJEID.Valid && existingJEID.String != "" {
+		response.BadRequest(c, "ALREADY_POSTED: invoice already has a journal entry")
 		return
 	}
 
@@ -1149,7 +1232,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 		var cogsPosted int
 		tx.QueryRow(`
 			SELECT COUNT(*) FROM journal_entries je
-			JOIN stock_operations so ON so.id::text = je.source_id
+			JOIN stock_operations so ON so.id = je.source_id
 			WHERE je.source_type = 'stock_operation' AND je.status = 'posted' AND je.deleted_at IS NULL
 			  AND so.source_type = 'sales_order' AND so.source_id = $1
 			  AND so.direction = 'delivery' AND so.state = 'done'
@@ -1162,7 +1245,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 			tx.QueryRow(`
 				SELECT COUNT(*) FROM journal_entries je
 				WHERE je.source_type = 'sales_delivery' AND je.status = 'posted' AND je.deleted_at IS NULL
-				  AND je.source_id IN (SELECT id::text FROM sales_delivery_orders WHERE sales_order_id = $1)
+				  AND je.source_id IN (SELECT id FROM sales_delivery_orders WHERE sales_order_id = $1)
 			`, salesOrderID.String).Scan(&doCogs)
 			deliveryAlreadyPostedCOGS = doCogs > 0
 		}
@@ -1365,6 +1448,10 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		response.BadRequest(c, "Invalid invoice ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_invoices", invoiceID, tenantID) {
+		response.NotFound(c, "Sales invoice")
+		return
+	}
 
 	var input struct {
 		Amount         float64 `json:"amount" binding:"required,gt=0"`
@@ -1537,8 +1624,13 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		}
 	}
 
-	// Create GL entry if accounts exist
-	if cashJournalID != uuid.Nil && arAccountID != uuid.Nil && cashAccountID != uuid.Nil {
+	// A payment with no ledger entry is money that exists in Savdo but not in Moliya —
+	// refuse instead of silently skipping the GL block (audit §3a).
+	if cashJournalID == uuid.Nil || arAccountID == uuid.Nil || cashAccountID == uuid.Nil {
+		response.BadRequest(c, "Payment accounts not configured (cash/bank journal, AR 4010, cash 5010 / bank 5110) — payment not recorded")
+		return
+	}
+	{
 		// Generate entry number
 		prefix := ""
 		if numberPrefix.Valid {
@@ -1606,6 +1698,11 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			if writeOffAccountID == uuid.Nil {
 				writeOffAccountID = findAccount(tx, tenantID, organizationID, "miscellaneous expense", "9410")
 			}
+			// AR is credited the write-off above — a missing debit leg would leave the
+			// entry unbalanced, so the account is mandatory (audit §3c).
+			if writeOffAccountID == uuid.Nil {
+				glErr = fmt.Errorf("write-off account not found (9690/9410)")
+			}
 			if writeOffAccountID != uuid.Nil {
 				writeOffLineID := uuid.New()
 				_, glErr = tx.Exec(`
@@ -1631,6 +1728,9 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			}
 			if discountAccountID == uuid.Nil {
 				discountAccountID = findAccount(tx, tenantID, organizationID, "discount", "9310")
+			}
+			if discountAccountID == uuid.Nil {
+				glErr = fmt.Errorf("early-payment discount account not found (9310)")
 			}
 			if discountAccountID != uuid.Nil {
 				discountLineID := uuid.New()
@@ -1688,12 +1788,14 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			}
 		}
 
+		// A GL failure fails the whole payment: previously this rolled back to the
+		// savepoint and still marked the invoice paid (audit §3b).
 		if glErr != nil {
-			h.log.Error("GL posting failed in RecordPayment, rolling back GL only", "error", glErr, "invoice_id", invoiceID)
-			tx.Exec("ROLLBACK TO SAVEPOINT gl_posting")
-		} else {
-			tx.Exec("RELEASE SAVEPOINT gl_posting")
+			h.log.Error("GL posting failed in RecordPayment — payment rejected", "error", glErr, "invoice_id", invoiceID)
+			response.InternalError(c, "Payment ledger posting failed — payment not recorded")
+			return
 		}
+		tx.Exec("RELEASE SAVEPOINT gl_posting")
 	}
 
 	// Update invoice
@@ -1706,18 +1808,32 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		return
 	}
 
-	// Update related sales order's payment_status if invoice is linked to an order
+	// Update the linked order's payment_status and paid_amount from the aggregate of
+	// ALL its invoices (previously: status from this one invoice, paid_amount never).
 	var salesOrderID sql.NullString
 	tx.QueryRow(`SELECT sales_order_id FROM sales_invoices WHERE id = $1`, invoiceID).Scan(&salesOrderID)
 	if salesOrderID.Valid && salesOrderID.String != "" {
-		orderPaymentStatus := "partial"
-		if newStatus == entity.InvoiceStatusPaid {
-			orderPaymentStatus = "paid"
+		var orderTotal, orderPaid float64
+		aggErr := tx.QueryRow(`
+			SELECT so.total_amount,
+			       COALESCE((SELECT SUM(si.amount_paid) FROM sales_invoices si
+			                 WHERE si.sales_order_id = so.id AND si.deleted_at IS NULL
+			                   AND si.status NOT IN ('cancelled','void')), 0)
+			FROM sales_orders so WHERE so.id = $1 AND so.tenant_id = $2`,
+			salesOrderID.String, tenantID,
+		).Scan(&orderTotal, &orderPaid)
+		if aggErr == nil {
+			orderPaymentStatus := "unpaid"
+			if orderPaid >= orderTotal-0.01 && orderTotal > 0 {
+				orderPaymentStatus = "paid"
+			} else if orderPaid > 0 {
+				orderPaymentStatus = "partial"
+			}
+			tx.Exec(
+				"UPDATE sales_orders SET payment_status = $1, paid_amount = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
+				orderPaymentStatus, orderPaid, now, salesOrderID.String, tenantID,
+			)
 		}
-		tx.Exec(
-			"UPDATE sales_orders SET payment_status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
-			orderPaymentStatus, now, salesOrderID.String, tenantID,
-		)
 	}
 
 	// Commit transaction
@@ -1768,6 +1884,10 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 	invoiceID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid invoice ID")
+		return
+	}
+	if !h.salesOrgScopeOK(c, "sales_invoices", invoiceID, tenantID) {
+		response.NotFound(c, "Sales invoice")
 		return
 	}
 
@@ -1952,6 +2072,10 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	creditNoteID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid credit note ID")
+		return
+	}
+	if !h.salesOrgScopeOK(c, "sales_invoices", creditNoteID, tenantID) {
+		response.NotFound(c, "Sales invoice")
 		return
 	}
 
@@ -2276,7 +2400,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 			var cogsPosted int
 			h.db.QueryRow(`
 				SELECT COUNT(*) FROM journal_entries je
-				JOIN stock_operations so ON so.id::text = je.source_id
+				JOIN stock_operations so ON so.id = je.source_id
 				WHERE je.source_type = 'stock_operation' AND je.status = 'posted' AND je.deleted_at IS NULL
 				  AND so.source_type = 'sales_order' AND so.source_id = $1
 				  AND so.direction = 'delivery' AND so.state = 'done'
@@ -2288,7 +2412,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 				h.db.QueryRow(`
 					SELECT COUNT(*) FROM journal_entries je
 					WHERE je.source_type = 'sales_delivery' AND je.status = 'posted' AND je.deleted_at IS NULL
-					  AND je.source_id IN (SELECT id::text FROM sales_delivery_orders WHERE sales_order_id = $1)
+					  AND je.source_id IN (SELECT id FROM sales_delivery_orders WHERE sales_order_id = $1)
 				`, mi.SalesOrderID.String).Scan(&doCogs)
 				deliveryAlreadyPostedCOGS = doCogs > 0
 			}

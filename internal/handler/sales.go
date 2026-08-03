@@ -288,6 +288,8 @@ type SimpleSalesOrderInput struct {
 	SalesRepID      string                              `json:"sales_rep_id,omitempty"`
 	ProjectID       string                              `json:"project_id,omitempty"`
 	ProjectName     string                              `json:"project_name,omitempty"`
+	ContractID      string                              `json:"contract_id,omitempty"`
+	LeadID          string                              `json:"lead_id,omitempty"`
 	Lines           []entity.CreateSalesOrderLineInput  `json:"lines,omitempty"`
 
 	// Simplified frontend fields
@@ -443,6 +445,22 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		}
 	}
 
+	// Server-side discount cap (savdo-audit §5.1): the client's discount_amount was
+	// trusted verbatim. When the tenant configures a max %, exceeding it needs the
+	// sales:discount:approve permission (site admins/owners pass automatically).
+	if discountAmount > 0 && subtotal > 0 {
+		if capPct := h.salesMaxDiscountPct(tenantID); capPct >= 0 {
+			pct := discountAmount / subtotal * 100
+			if pct > capPct+0.01 && !h.perm.Can(c, "sales", "discount", "approve") {
+				c.JSON(422, gin.H{"success": false, "error": gin.H{
+					"code":    "DISCOUNT_LIMIT_EXCEEDED",
+					"message": fmt.Sprintf("Chegirma %.1f%% ruxsat etilgan maksimumdan (%.1f%%) oshadi", pct, capPct),
+				}})
+				return
+			}
+		}
+	}
+
 	// Marshal addresses to JSON - use nil for NULL in DB, or JSON string for value
 	var billingAddressJSON, shippingAddressJSON *string
 	if input.BillingAddress != nil {
@@ -502,17 +520,37 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		}
 	}
 
-	// Handle project_id
+	// Handle project link. Construction project ids are BIGSERIAL — a numeric
+	// input.ProjectID goes to construction_project_id (migration 452); a UUID goes
+	// to the legacy project_id column. The old code parsed everything as UUID and
+	// silently dropped construction links (savdo-audit §12).
 	var projectID *uuid.UUID
+	var constructionProjectID *int64
 	var projectName *string
 	if input.ProjectID != "" {
-		pid, pidErr := uuid.Parse(input.ProjectID)
-		if pidErr == nil {
+		if pid, pidErr := uuid.Parse(input.ProjectID); pidErr == nil {
 			projectID = &pid
+		} else if cpid, cerr := strconv.ParseInt(input.ProjectID, 10, 64); cerr == nil {
+			constructionProjectID = &cpid
 		}
 	}
 	if input.ProjectName != "" {
 		projectName = &input.ProjectName
+	}
+
+	// Contract link (443-era column, never written by sales until now)
+	var contractID *uuid.UUID
+	if input.ContractID != "" {
+		if cid, cerr := uuid.Parse(input.ContractID); cerr == nil {
+			contractID = &cid
+		}
+	}
+	// CRM lead back-link (migration 452)
+	var leadID *uuid.UUID
+	if input.LeadID != "" {
+		if lid, lerr := uuid.Parse(input.LeadID); lerr == nil {
+			leadID = &lid
+		}
 	}
 
 	// Insert sales order
@@ -523,9 +561,9 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			currency_id, exchange_rate, subtotal, discount_type, discount_value, discount_amount, discount_code,
 			tax_amount, shipping_amount, total_amount, status, payment_status, payment_terms,
 			reference, po_number, notes, internal_notes, warehouse_id, carrier, vehicle_number, sales_rep_id,
-			project_id, project_name,
+			project_id, project_name, construction_project_id, contract_id, lead_id,
 			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)`
 
 	// Handle discount code - use nil for empty string
 	var discountCode *string
@@ -577,7 +615,7 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			currencyID, 1.0, subtotal, input.DiscountType, input.DiscountValue, discountAmount, discountCode,
 			taxAmount, input.ShippingAmount, totalAmount, entity.OrderStatusDraft, entity.PaymentStatusUnpaid, input.PaymentTerms,
 			input.Reference, input.PONumber, input.Notes, input.InternalNotes, warehouseID, input.Carrier, input.VehicleNumber, salesRepID,
-			projectID, projectName,
+			projectID, projectName, constructionProjectID, contractID, leadID,
 			createdBy, now, now,
 		)
 		if err == nil {
@@ -736,6 +774,10 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		response.BadRequest(c, "Invalid order ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_orders", orderID, tenantID) {
+		response.NotFound(c, "Sales order")
+		return
+	}
 
 	// Get order with customer name
 	query := `
@@ -744,7 +786,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 			   so.currency_id, so.exchange_rate, so.subtotal, so.discount_type, so.discount_value, so.discount_amount,
 			   so.tax_amount, so.shipping_amount, so.total_amount, so.status, so.payment_status, so.payment_terms,
 			   so.reference, so.po_number, so.notes, so.internal_notes, so.warehouse_id, so.carrier, so.vehicle_number, so.sales_rep_id,
-			   so.project_id, so.project_name,
+			   so.project_id, so.project_name, so.construction_project_id, so.contract_id, so.lead_id, so.paid_amount,
 			   so.approved_by, so.approved_at, so.created_by, so.created_at, so.updated_at,
 			   COALESCE(c.name, '') as customer_name
 		FROM sales_orders so
@@ -753,7 +795,9 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 
 	var id, tenantIDScan, customerID uuid.UUID
 	var organizationID, contactPersonID, currencyID, warehouseID, carrier, vehicleNumber, salesRepID, approvedBy, createdBy sql.NullString
-	var projectIDStr, projectNameStr sql.NullString
+	var projectIDStr, projectNameStr, contractIDStr, leadIDStr sql.NullString
+	var constructionProjectID sql.NullInt64
+	var paidAmount float64
 	var orderNumber, customerName string
 	var orderDate time.Time
 	var expectedDate, approvedAt sql.NullTime
@@ -769,7 +813,7 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 		&currencyID, &exchangeRate, &subtotal, &discountType, &discountValue, &discountAmount,
 		&taxAmount, &shippingAmount, &totalAmount, &status, &paymentStatus, &paymentTerms,
 		&reference, &poNumber, &notes, &internalNotes, &warehouseID, &carrier, &vehicleNumber, &salesRepID,
-		&projectIDStr, &projectNameStr,
+		&projectIDStr, &projectNameStr, &constructionProjectID, &contractIDStr, &leadIDStr, &paidAmount,
 		&approvedBy, &approvedAt, &createdBy, &createdAt, &updatedAt,
 		&customerName,
 	)
@@ -849,6 +893,16 @@ func (h *Handler) GetSalesOrder(c *gin.Context) {
 	if projectNameStr.Valid {
 		order["project_name"] = projectNameStr.String
 	}
+	if constructionProjectID.Valid {
+		order["construction_project_id"] = constructionProjectID.Int64
+	}
+	if contractIDStr.Valid {
+		order["contract_id"] = contractIDStr.String
+	}
+	if leadIDStr.Valid {
+		order["lead_id"] = leadIDStr.String
+	}
+	order["paid_amount"] = paidAmount
 
 	// Get order lines with product name, unit name and packaging info
 	// alt_name: when this line's product has a search_key, look up the
@@ -989,6 +1043,10 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 	orderID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid order ID")
+		return
+	}
+	if !h.salesOrgScopeOK(c, "sales_orders", orderID, tenantID) {
+		response.NotFound(c, "Sales order")
 		return
 	}
 
@@ -1164,13 +1222,24 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		args = append(args, *input.VehicleNumber)
 	}
 	if input.ProjectID != nil {
-		argCount++
-		updates = append(updates, fmt.Sprintf("project_id = $%d", argCount))
-		if *input.ProjectID != "" {
-			pid, _ := uuid.Parse(*input.ProjectID)
-			args = append(args, pid)
-		} else {
+		// Numeric ids are construction projects (BIGSERIAL, migration 452); UUIDs go
+		// to the legacy column. The old code ignored the parse error and wrote the
+		// ZERO UUID for numeric ids (savdo-audit §12).
+		if *input.ProjectID == "" {
+			argCount++
+			updates = append(updates, fmt.Sprintf("project_id = $%d", argCount))
 			args = append(args, nil)
+			argCount++
+			updates = append(updates, fmt.Sprintf("construction_project_id = $%d", argCount))
+			args = append(args, nil)
+		} else if pid, pidErr := uuid.Parse(*input.ProjectID); pidErr == nil {
+			argCount++
+			updates = append(updates, fmt.Sprintf("project_id = $%d", argCount))
+			args = append(args, pid)
+		} else if cpid, cerr := strconv.ParseInt(*input.ProjectID, 10, 64); cerr == nil {
+			argCount++
+			updates = append(updates, fmt.Sprintf("construction_project_id = $%d", argCount))
+			args = append(args, cpid)
 		}
 	}
 	if input.ProjectName != nil {
@@ -1178,15 +1247,46 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("project_name = $%d", argCount))
 		args = append(args, *input.ProjectName)
 	}
+	if input.ContractID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contract_id = $%d", argCount))
+		if *input.ContractID != "" {
+			if cid, cerr := uuid.Parse(*input.ContractID); cerr == nil {
+				args = append(args, cid)
+			} else {
+				args = append(args, nil)
+			}
+		} else {
+			args = append(args, nil)
+		}
+	}
 	if input.Status != nil {
+		// Manual status writes are limited to the draft↔quotation pair. Every other
+		// transition has an owning flow — /confirm, /cancel, delivery validation
+		// (shipped/delivered), invoicing (processing). Free-form status was the
+		// module's main double-issue vector (audit §1, §2).
+		var curStatus string
+		_ = h.db.QueryRow(
+			`SELECT status FROM sales_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+			orderID, tenantID,
+		).Scan(&curStatus)
+		if *input.Status != curStatus {
+			allowed := (curStatus == "draft" && *input.Status == "quotation") ||
+				(curStatus == "quotation" && *input.Status == "draft")
+			if !allowed {
+				response.BadRequest(c, fmt.Sprintf("Status '%s' → '%s' cannot be set directly; use /confirm, /cancel or delivery validation", curStatus, *input.Status))
+				return
+			}
+		}
 		argCount++
 		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
 		args = append(args, *input.Status)
 	}
 	if input.PaymentStatus != nil {
-		argCount++
-		updates = append(updates, fmt.Sprintf("payment_status = $%d", argCount))
-		args = append(args, *input.PaymentStatus)
+		// Derived from invoice payments (RecordPayment / ConfirmPayment) — a manual
+		// write would fake money that finance has never seen.
+		response.BadRequest(c, "payment_status is derived from payments and cannot be set directly")
+		return
 	}
 
 	if len(updates) == 0 {
@@ -1627,6 +1727,10 @@ func (h *Handler) DeleteSalesOrder(c *gin.Context) {
 		response.BadRequest(c, "Invalid order ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_orders", orderID, tenantID) {
+		response.NotFound(c, "Sales order")
+		return
+	}
 
 	// Check if order is in draft status
 	var currentStatus string
@@ -1687,6 +1791,10 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		response.BadRequest(c, "Invalid order ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_orders", orderID, tenantID) {
+		response.NotFound(c, "Sales order")
+		return
+	}
 
 	// Get order details including warehouse_id and carrier for the delivery order
 	var currentStatus, orderNumber string
@@ -1712,12 +1820,42 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		response.InternalError(c, "Failed to fetch sales order")
 		return
 	}
-	if currentStatus != string(entity.OrderStatusDraft) {
-		response.BadRequest(c, "Can only confirm orders in draft status")
+	// 'quotation' is the Taklif stage of the same document — confirming it IS the
+	// one-click "Buyurtmaga aylantirish".
+	if currentStatus != string(entity.OrderStatusDraft) && currentStatus != "quotation" {
+		response.BadRequest(c, "Can only confirm orders in draft or quotation status")
 		return
 	}
 
 	now := time.Now()
+
+	// Credit control (savdo-audit §8/A): with this order, would the customer's
+	// unpaid balance exceed their limit? Policy 'block' refuses the confirm;
+	// 'warn' proceeds but emits the event + notification either way.
+	var orderTotal float64
+	_ = h.db.QueryRow("SELECT COALESCE(total_amount, 0) FROM sales_orders WHERE id = $1 AND tenant_id = $2",
+		orderID, tenantID).Scan(&orderTotal)
+	if cc := h.salesCreditCheck(tenantID, organizationID, customerID, orderTotal); cc.Exceeded {
+		go func() {
+			h.EmitWorkflowEvent(tenantID, "sales_order.credit_limit_exceeded", map[string]interface{}{
+				"record_id":     orderID.String(),
+				"order_number":  orderNumber,
+				"customer_name": customerName.String,
+				"amount":        orderTotal,
+				"outstanding":   cc.Outstanding,
+				"credit_limit":  cc.Limit,
+				"policy":        cc.Policy,
+			})
+		}()
+		if cc.Policy != "warn" {
+			c.JSON(422, gin.H{"success": false, "error": gin.H{
+				"code":    "CREDIT_LIMIT_EXCEEDED",
+				"message": fmt.Sprintf("Mijoz kredit limitidan oshadi: qarzdorlik %.0f + buyurtma %.0f > limit %.0f", cc.Outstanding, orderTotal, cc.Limit),
+				"details": gin.H{"outstanding": cc.Outstanding, "order_total": orderTotal, "credit_limit": cc.Limit},
+			}})
+			return
+		}
+	}
 
 	// Update sales order status to confirmed
 	_, err = h.db.Exec(
@@ -1731,7 +1869,7 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 
 	// Auto-create Delivery Order (Odoo-like behavior)
 	doID := uuid.New()
-	doNumber := "DO-" + time.Now().Format("20060102150405")
+	doNumber := nextDeliveryNumber(h.db, tenantID)
 
 	// Set delivery date to expected_date or today
 	deliveryDate := now
@@ -1810,11 +1948,14 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 		}
 	}
 
-	// Auto-create stock operations (delivery chain) — TT 12.3: SO → delivery via stock_operations
-	// For multi-step delivery: Pick → Pack → Ship (3-step) or Pick → Ship (2-step)
-	if chainErr := h.createDeliveryChainForSO(tenantID, orderID, organizationID, warehouseUUID, customerID, orderNumber, expectedDate, userID, now); chainErr != nil {
-		h.log.Error("Failed to create delivery chain for SO", "error", chainErr, "order_id", orderID, "warehouse_id", warehouseUUID)
-	}
+	// Savdo v2: the stock_operations Pick/Pack/Ship chain is no longer auto-created here.
+	// It was the second of THREE issue paths for the same order (audit §2) — the
+	// sales_delivery_orders document above is the single shipment document, and stock
+	// leaves only through its /validate.
+
+	// Phase 3: reserve the confirmed quantities so quantity_available reflects
+	// committed-but-unshipped orders (was: reservations never written at all).
+	h.reserveSalesOrderStock(tenantID, organizationID, orderID, warehouseUUID)
 
 	// Auto-create Production Orders for products with insufficient stock
 	h.autoCreateProductionOrders(tenantID, orderID, customerID, warehouseUUID, organizationID, userID, now)
@@ -1837,6 +1978,12 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 			custName = customerName.String
 		}
 		amountStr := fmt.Sprintf("%.0f", totalAmt)
+		h.EmitWorkflowEvent(tenantID, "sales_order.confirmed", map[string]interface{}{
+			"record_id":     orderID.String(),
+			"order_number":  orderNumber,
+			"customer_name": custName,
+			"amount":        totalAmt,
+		})
 		h.createTranslatedNotification(tenantID, userID, "sales_order_confirmed",
 			map[string]interface{}{
 				"order_id":      orderID.String(),
@@ -2233,6 +2380,10 @@ func (h *Handler) CancelSalesOrder(c *gin.Context) {
 		response.BadRequest(c, "Invalid order ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_orders", orderID, tenantID) {
+		response.NotFound(c, "Sales order")
+		return
+	}
 
 	// Check current status - can cancel draft or confirmed orders
 	var currentStatus string
@@ -2249,6 +2400,17 @@ func (h *Handler) CancelSalesOrder(c *gin.Context) {
 		response.BadRequest(c, "Cannot cancel delivered orders")
 		return
 	}
+	// Goods already left the warehouse → cancel would orphan the stock movement
+	// and its COGS; the exit for shipped goods is the sales-return flow.
+	var shippedLines int
+	_ = h.db.QueryRow(`
+		SELECT COUNT(*) FROM sales_order_lines
+		WHERE sales_order_id = $1 AND COALESCE(quantity_delivered, 0) > 0`,
+		orderID).Scan(&shippedLines)
+	if shippedLines > 0 {
+		response.BadRequest(c, "Order has shipped quantities — process a sales return instead of cancelling")
+		return
+	}
 
 	now := time.Now()
 	_, err = h.db.Exec(
@@ -2258,6 +2420,24 @@ func (h *Handler) CancelSalesOrder(c *gin.Context) {
 	if err != nil {
 		response.InternalError(c, "Failed to cancel sales order")
 		return
+	}
+
+	// Cancel the order's open (unshipped) delivery documents and free the
+	// confirm-time reservation.
+	h.db.Exec(`
+		UPDATE sales_delivery_orders SET status = 'cancelled', updated_at = $1
+		WHERE sales_order_id = $2 AND tenant_id = $3 AND status IN ('draft', 'ready') AND deleted_at IS NULL`,
+		now, orderID, tenantID)
+	var orderWH *uuid.UUID
+	var whStr sql.NullString
+	_ = h.db.QueryRow("SELECT warehouse_id FROM sales_orders WHERE id = $1", orderID).Scan(&whStr)
+	if whStr.Valid && whStr.String != "" {
+		if wid, werr := uuid.Parse(whStr.String); werr == nil {
+			orderWH = &wid
+		}
+	}
+	if currentStatus != string(entity.OrderStatusDraft) && currentStatus != "quotation" {
+		h.releaseSalesOrderReservation(tenantID, orderID, orderWH)
 	}
 
 	h.GetSalesOrder(c)
@@ -2292,6 +2472,10 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		response.BadRequest(c, "Invalid order ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_orders", orderID, tenantID) {
+		response.NotFound(c, "Sales order")
+		return
+	}
 
 	// Get order details with customer name
 	var customerID uuid.UUID
@@ -2303,17 +2487,18 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	var billingAddress, shippingAddress string
 	var currentStatus string
 	var customerName string
+	var orderContractID *uuid.UUID
 
 	err = h.db.QueryRow(`
 		SELECT so.customer_id, so.organization_id, so.order_number, COALESCE(so.subtotal, 0), COALESCE(so.discount_amount, 0), COALESCE(so.tax_amount, 0), COALESCE(so.shipping_amount, 0), COALESCE(so.total_amount, 0),
 		       COALESCE(so.payment_terms, 30), so.payment_term_id, COALESCE(so.billing_address::text, ''), COALESCE(so.shipping_address::text, ''), so.status,
-		       COALESCE(c.name, '')
+		       COALESCE(c.name, ''), so.contract_id
 		FROM sales_orders so
 		LEFT JOIN contacts c ON so.customer_id = c.id
 		WHERE so.id = $1 AND so.tenant_id = $2 AND so.deleted_at IS NULL`,
 		orderID, tenantID).Scan(
 		&customerID, &organizationID, &orderNumber, &subtotal, &discountAmount, &taxAmount, &shippingAmount, &totalAmount,
-		&paymentTerms, &orderPaymentTermID, &billingAddress, &shippingAddress, &currentStatus, &customerName,
+		&paymentTerms, &orderPaymentTermID, &billingAddress, &shippingAddress, &currentStatus, &customerName, &orderContractID,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales order")
@@ -2339,15 +2524,23 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		return
 	}
 
-	// Check if an invoice already exists for this order (prevent duplicates)
-	var existingInvoiceCount int
-	h.db.QueryRow(`
-		SELECT COUNT(*) FROM sales_invoices
-		WHERE sales_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status != 'cancelled'`,
-		orderID, tenantID).Scan(&existingInvoiceCount)
-	if existingInvoiceCount > 0 {
-		response.BadRequest(c, "An invoice already exists for this order")
-		return
+	// ?basis=delivered — invoice only what actually shipped and is not yet
+	// invoiced (delivered − invoiced per line). Multiple such invoices per order
+	// are legal; the per-line caps make double-billing impossible. The default
+	// (full-order) mode keeps its one-invoice guard.
+	deliveredBasis := strings.EqualFold(c.Query("basis"), "delivered")
+
+	if !deliveredBasis {
+		// Check if an invoice already exists for this order (prevent duplicates)
+		var existingInvoiceCount int
+		h.db.QueryRow(`
+			SELECT COUNT(*) FROM sales_invoices
+			WHERE sales_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status != 'cancelled'`,
+			orderID, tenantID).Scan(&existingInvoiceCount)
+		if existingInvoiceCount > 0 {
+			response.BadRequest(c, "An invoice already exists for this order (use ?basis=delivered for partial invoicing)")
+			return
+		}
 	}
 
 	invoiceID := uuid.New()
@@ -2465,37 +2658,8 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Create invoice (note: amount_due is a GENERATED column, don't insert into it)
-	h.log.Info("CreateInvoiceFromOrder: attempting INSERT",
-		"invoiceID", invoiceID,
-		"tenantID", tenantID,
-		"invoiceNumber", invoiceNumber,
-		"customerID", customerID,
-		"orderID", orderID)
-
-	_, err = tx.Exec(`
-		INSERT INTO sales_invoices (
-			id, tenant_id, organization_id, invoice_number, customer_id, customer_name, sales_order_id,
-			invoice_date, due_date, billing_address, shipping_address,
-			exchange_rate, subtotal, discount_amount, tax_amount, total_amount,
-			amount_paid, status, payment_term_id, early_discount_amount, early_discount_date,
-			created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
-		invoiceID, tenantID, organizationID, invoiceNumber, customerID, customerName, orderID,
-		now, dueDate, billingAddrParam, shippingAddrParam,
-		1.0, subtotal, discountAmount, taxAmount, totalAmount,
-		0, entity.InvoiceStatusSent, invoicePaymentTermID, earlyDiscountAmount, earlyDiscountDate,
-		createdBy, now, now,
-	)
-	if err != nil {
-		h.log.Error("CreateInvoiceFromOrder: INSERT failed", "error", err)
-		h.log.Error("Failed to create invoice", "error", err)
-		response.InternalError(c, "Failed to create invoice")
-		return
-	}
-	h.log.Info("CreateInvoiceFromOrder: INSERT succeeded")
-
-	// Copy order lines to invoice lines (join with products to get name if description is null)
+	// Fetch order lines BEFORE the invoice INSERT: delivered-basis invoices derive
+	// their header totals from the transformed line set.
 	type invoiceLineInfo struct {
 		OrderLineID uuid.UUID
 		LineNumber  int
@@ -2513,7 +2677,8 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	linesRows, err := tx.Query(`
 		SELECT sol.id, sol.line_number, sol.product_id, COALESCE(NULLIF(sol.description, ''), p.name) as description,
-		       sol.quantity, sol.unit_id, sol.unit_price, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total
+		       sol.quantity, sol.unit_id, sol.unit_price, sol.discount_amount, sol.tax_id, sol.tax_amount, sol.line_total,
+		       COALESCE(sol.quantity_delivered, 0), COALESCE(sol.quantity_invoiced, 0)
 		FROM sales_order_lines sol
 		LEFT JOIN products p ON p.id = sol.product_id
 		WHERE sol.sales_order_id = $1`, orderID)
@@ -2522,10 +2687,24 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	} else {
 		for linesRows.Next() {
 			var li invoiceLineInfo
+			var qtyDelivered, qtyInvoiced float64
 			if scanErr := linesRows.Scan(&li.OrderLineID, &li.LineNumber, &li.ProductID, &li.Description, &li.Quantity, &li.UnitID, &li.UnitPrice,
-				&li.Discount, &li.TaxID, &li.TaxAmount, &li.LineTotal); scanErr != nil {
+				&li.Discount, &li.TaxID, &li.TaxAmount, &li.LineTotal, &qtyDelivered, &qtyInvoiced); scanErr != nil {
 				h.log.Error("CreateInvoiceFromOrder: scan order line failed", "error", scanErr)
 				continue
+			}
+			if deliveredBasis {
+				qtyToInvoice := qtyDelivered - qtyInvoiced
+				if qtyToInvoice <= 0.0001 {
+					continue
+				}
+				if li.Quantity > 0 {
+					ratio := qtyToInvoice / li.Quantity
+					li.Discount = li.Discount * ratio
+					li.TaxAmount = li.TaxAmount * ratio
+					li.LineTotal = li.LineTotal * ratio
+				}
+				li.Quantity = qtyToInvoice
 			}
 			invoiceLineInfos = append(invoiceLineInfos, li)
 		}
@@ -2533,6 +2712,52 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 	}
 	h.log.Info("CreateInvoiceFromOrder: order lines fetched", "count", len(invoiceLineInfos))
 
+	if deliveredBasis {
+		if len(invoiceLineInfos) == 0 {
+			response.BadRequest(c, "Nothing delivered and uninvoiced on this order")
+			return
+		}
+		// Delivered-basis invoices carry LINE amounts only: header discount and
+		// shipping stay on the full-order invoice flow (documented in changelog).
+		subtotal, discountAmount, taxAmount, shippingAmount = 0, 0, 0, 0
+		for _, li := range invoiceLineInfos {
+			subtotal += li.LineTotal
+			taxAmount += li.TaxAmount
+		}
+		totalAmount = subtotal + taxAmount
+	}
+
+	// Create invoice (note: amount_due is a GENERATED column, don't insert into it)
+	h.log.Info("CreateInvoiceFromOrder: attempting INSERT",
+		"invoiceID", invoiceID,
+		"tenantID", tenantID,
+		"invoiceNumber", invoiceNumber,
+		"customerID", customerID,
+		"orderID", orderID)
+
+	_, err = tx.Exec(`
+		INSERT INTO sales_invoices (
+			id, tenant_id, organization_id, invoice_number, customer_id, customer_name, sales_order_id,
+			invoice_date, due_date, billing_address, shipping_address,
+			exchange_rate, subtotal, discount_amount, tax_amount, total_amount,
+			amount_paid, status, payment_term_id, early_discount_amount, early_discount_date,
+			contract_id, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)`,
+		invoiceID, tenantID, organizationID, invoiceNumber, customerID, customerName, orderID,
+		now, dueDate, billingAddrParam, shippingAddrParam,
+		1.0, subtotal, discountAmount, taxAmount, totalAmount,
+		0, entity.InvoiceStatusSent, invoicePaymentTermID, earlyDiscountAmount, earlyDiscountDate,
+		orderContractID, createdBy, now, now,
+	)
+	if err != nil {
+		h.log.Error("CreateInvoiceFromOrder: INSERT failed", "error", err)
+		h.log.Error("Failed to create invoice", "error", err)
+		response.InternalError(c, "Failed to create invoice")
+		return
+	}
+	h.log.Info("CreateInvoiceFromOrder: INSERT succeeded")
+
+	// Copy the (possibly delivered-basis-transformed) lines onto the invoice.
 	for _, li := range invoiceLineInfos {
 		invoiceLineID := uuid.New()
 		_, lineErr := tx.Exec(`
@@ -2545,6 +2770,15 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		)
 		if lineErr != nil {
 			h.log.Error("CreateInvoiceFromOrder: invoice line INSERT failed", "error", lineErr, "line_number", li.LineNumber, "product_id", li.ProductID)
+			continue
+		}
+		// Keep the three-quantity line view honest: quantity_invoiced was a dead column
+		// (INSERTed as 0, never UPDATEd) until migration 451 backfilled it.
+		if _, qiErr := tx.Exec(
+			"UPDATE sales_order_lines SET quantity_invoiced = quantity_invoiced + $1, updated_at = $2 WHERE id = $3",
+			li.Quantity, now, li.OrderLineID,
+		); qiErr != nil {
+			h.log.Error("CreateInvoiceFromOrder: quantity_invoiced update failed", "error", qiErr)
 		}
 	}
 
@@ -2626,7 +2860,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			var cogsPosted int
 			tx.QueryRow(`
 				SELECT COUNT(*) FROM journal_entries je
-				JOIN stock_operations so ON so.id::text = je.source_id
+				JOIN stock_operations so ON so.id = je.source_id
 				WHERE je.source_type = 'stock_operation' AND je.status = 'posted' AND je.deleted_at IS NULL
 				  AND so.source_type = 'sales_order' AND so.source_id = $1
 				  AND so.direction = 'delivery' AND so.state = 'done'
@@ -2638,7 +2872,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				tx.QueryRow(`
 					SELECT COUNT(*) FROM journal_entries je
 					WHERE je.source_type = 'sales_delivery' AND je.status = 'posted' AND je.deleted_at IS NULL
-					  AND je.source_id IN (SELECT id::text FROM sales_delivery_orders WHERE sales_order_id = $1)
+					  AND je.source_id IN (SELECT id FROM sales_delivery_orders WHERE sales_order_id = $1)
 				`, orderID.String()).Scan(&doCogs)
 				deliveryAlreadyPostedCOGS = doCogs > 0
 			}
@@ -2677,7 +2911,9 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			for _, amt := range cogsGrouped {
 				totalCogs += amt
 			}
-			totalDebit := totalAmount + totalCogs
+			// Debits: AR (net total) + contra-revenue discount + COGS.
+			// Credits: gross revenue + tax + shipping income + stock output.
+			totalDebit := totalAmount + discountAmount + totalCogs
 			totalCredit := totalDebit
 
 			// Create journal entry
@@ -2755,6 +2991,49 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 					h.log.Error("CreateInvoiceFromOrder: update tax account balance failed", "error", err, "taxAccountID", taxAccountID)
 				}
 				jeLineNumber++
+			}
+
+			// Debit: header discount as contra-revenue — AR is debited net of the
+			// discount while revenue is credited gross, so this leg balances the entry.
+			if discountAmount > 0 && fallbackRevenue != uuid.Nil {
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+					uuid.New(), jeID, jeLineNumber, fallbackRevenue, "Chegirma (kontra-daromad)",
+					discountAmount, 0.0, 1.0, now,
+				); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: discount journal line failed", "error", err)
+				}
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", discountAmount, now, fallbackRevenue); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: update discount account balance failed", "error", err)
+				}
+				jeLineNumber++
+			}
+
+			// Credit: shipping charged to the customer is sales income — it is part of
+			// the AR debit but was previously missing from the credit side. Posted to
+			// the main revenue account (not 9310) so the income statement's
+			// revenue/net-profit invariant keeps holding.
+			if shippingAmount > 0 {
+				shippingIncomeAcct := fallbackRevenue
+				if shippingIncomeAcct != uuid.Nil {
+					if _, err := tx.Exec(`
+						INSERT INTO journal_entry_lines (
+							id, journal_entry_id, line_number, account_id, description,
+							debit_amount, credit_amount, exchange_rate, created_at
+						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						uuid.New(), jeID, jeLineNumber, shippingIncomeAcct, "Yetkazib berish daromadi",
+						0.0, shippingAmount, 1.0, now,
+					); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: shipping income journal line failed", "error", err)
+					}
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", shippingAmount, now, shippingIncomeAcct); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: update shipping income balance failed", "error", err)
+					}
+					jeLineNumber++
+				}
 			}
 
 			// COGS entries

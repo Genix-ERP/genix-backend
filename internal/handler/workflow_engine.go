@@ -81,6 +81,11 @@ var workflowEventCatalog = map[string]workflowEventDef{
 		"record_id": "", "task_title": "Smeta tayyorlash", "board_name": "Qurilish obyekti", "due_date": "2026-07-30", "days_overdue": 2}},
 	"sales_order.created": {Category: "sales", RelatedType: "sales_order", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "order_number": "SO-2026-0107", "customer_name": "Qurilish Invest MChJ", "total_amount": 8400000.0}},
+	"sales_order.confirmed": {Category: "sales", RelatedType: "sales_order", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "order_number": "S00107", "customer_name": "Qurilish Invest MChJ", "amount": 8400000.0}},
+	"sales_order.credit_limit_exceeded": {Category: "sales", RelatedType: "sales_order", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "order_number": "S00107", "customer_name": "Qurilish Invest MChJ", "amount": 8400000.0,
+		"outstanding": 12000000.0, "credit_limit": 15000000.0, "policy": "block"}},
 	"payment.received": {Category: "sales", RelatedType: "sales_invoice", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "invoice_number": "INV-2026-0042", "customer_name": "Qurilish Invest MChJ", "amount": 4000000.0}},
 	"purchase_order.confirmed": {Category: "purchase", RelatedType: "purchase_order", Scheduled: false, SampleData: map[string]interface{}{
@@ -113,6 +118,16 @@ var workflowEventCatalog = map[string]workflowEventDef{
 		"record_id": "", "period_name": "Iyul 2026", "total_net": 45000000.0}},
 	"payroll.paid": {Category: "hr", RelatedType: "payroll_period", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "period_name": "Iyul 2026", "total_net": 45000000.0}},
+	// Aktivlar (fixed assets) — added by the 2026-08-03 rebuild.
+	"assets.commissioned": {Category: "assets", RelatedType: "fa_asset", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "inventory_number": "FA-000012", "asset_name": "Ekskavator CAT 320", "cost": 850000000.0}},
+	"assets.depreciation_posted": {Category: "assets", RelatedType: "fa_depreciation_run", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "period": "2026-07", "total_amount": 12400000.0, "asset_count": 8}},
+	"assets.disposed": {Category: "assets", RelatedType: "fa_asset", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "inventory_number": "FA-000012", "asset_name": "Ekskavator CAT 320", "disposal_type": "sale",
+		"book_value": 420000000.0, "sale_price": 500000000.0, "gain_loss": 80000000.0, "reason": "Yangisiga almashtirildi"}},
+	"assets.fully_depreciated": {Category: "assets", RelatedType: "fa_asset", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "inventory_number": "FA-000005", "asset_name": "Damas yuk mashinasi", "depreciable_base": 96000000.0}},
 }
 
 // workflowActionTypes is the set of executable action types. Legacy types

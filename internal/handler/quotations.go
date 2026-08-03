@@ -152,6 +152,10 @@ func (h *Handler) GetQuotation(c *gin.Context) {
 		response.BadRequest(c, "Invalid quotation ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_quotations", quotationID, tenantID) {
+		response.NotFound(c, "Quotation")
+		return
+	}
 
 	q, err := h.getQuotationByID(tenantID, quotationID)
 	if err != nil {
@@ -192,9 +196,19 @@ func (h *Handler) CreateQuotation(c *gin.Context) {
 
 	now := time.Now()
 	quotationID := uuid.New()
-	var qtCount int
-	h.db.QueryRow("SELECT COUNT(*) FROM quotations WHERE tenant_id = $1", tenantID).Scan(&qtCount)
-	quotationNumber := fmt.Sprintf("QT%05d", qtCount+1)
+	// MAX+1 over sales_quotations — the old COUNT(*) read the abandoned `quotations`
+	// table (always 0 → every quote got QT00001 and the second one hit the unique
+	// constraint), raced under concurrency, and reused numbers after soft-deletes.
+	var qtNum int64
+	h.db.QueryRow(`
+		SELECT COALESCE(MAX(CAST(SUBSTRING(quotation_number FROM 3) AS BIGINT)), 0) + 1
+		FROM sales_quotations
+		WHERE tenant_id = $1 AND quotation_number ~ '^QT[0-9]+$'`,
+		tenantID).Scan(&qtNum)
+	if qtNum < 1 {
+		qtNum = 1
+	}
+	quotationNumber := fmt.Sprintf("QT%05d", qtNum)
 
 	// Calculate totals
 	subtotal := 0.0
@@ -290,6 +304,10 @@ func (h *Handler) UpdateQuotation(c *gin.Context) {
 	quotationID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "Invalid quotation ID")
+		return
+	}
+	if !h.salesOrgScopeOK(c, "sales_quotations", quotationID, tenantID) {
+		response.NotFound(c, "Quotation")
 		return
 	}
 
@@ -496,6 +514,10 @@ func (h *Handler) DeleteQuotation(c *gin.Context) {
 		response.BadRequest(c, "Invalid quotation ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_quotations", quotationID, tenantID) {
+		response.NotFound(c, "Quotation")
+		return
+	}
 
 	now := time.Now()
 	result, err := h.db.Exec(
@@ -531,6 +553,10 @@ func (h *Handler) ConvertQuotationToOrder(c *gin.Context) {
 		response.BadRequest(c, "Invalid quotation ID")
 		return
 	}
+	if !h.salesOrgScopeOK(c, "sales_quotations", quotationID, tenantID) {
+		response.NotFound(c, "Quotation")
+		return
+	}
 
 	// Get quotation
 	q, err := h.getQuotationByID(tenantID, quotationID)
@@ -543,8 +569,12 @@ func (h *Handler) ConvertQuotationToOrder(c *gin.Context) {
 		return
 	}
 
-	if q.Status == "accepted" && q.ConvertedToOrder != nil {
-		response.BadRequest(c, "Quotation already converted to order: "+*q.ConvertedToOrder)
+	if q.ConvertedToOrder != nil || q.SalesOrderID != nil {
+		converted := ""
+		if q.ConvertedToOrder != nil {
+			converted = *q.ConvertedToOrder
+		}
+		response.BadRequest(c, "Quotation already converted to order: "+converted)
 		return
 	}
 
@@ -559,24 +589,80 @@ func (h *Handler) ConvertQuotationToOrder(c *gin.Context) {
 		response.BadRequest(c, "Quotation must have at least one item to convert to order")
 		return
 	}
+	// All-or-nothing: silently skipping product-less items left header totals
+	// disagreeing with the line sum (audit §8).
+	for _, item := range q.Items {
+		if item.ProductID == nil {
+			response.BadRequest(c, fmt.Sprintf("Quotation item '%s' has no product — cannot convert", item.ProductName))
+			return
+		}
+	}
+
+	// The quotation's org (fallback: request header org). The old INSERT dropped
+	// organization_id entirely, so converted orders vanished from org-scoped lists.
+	var orderOrgID *uuid.UUID
+	var qOrgID sql.NullString
+	_ = h.db.QueryRow(`SELECT organization_id FROM sales_quotations WHERE id = $1 AND tenant_id = $2`,
+		quotationID, tenantID).Scan(&qOrgID)
+	if qOrgID.Valid && qOrgID.String != "" {
+		if oid, oerr := uuid.Parse(qOrgID.String); oerr == nil {
+			orderOrgID = &oid
+		}
+	}
+	if orderOrgID == nil {
+		if headerOrg, orgOk := middleware.GetOrganizationID(c); orgOk && headerOrg != uuid.Nil {
+			ho := headerOrg
+			orderOrgID = &ho
+		}
+	}
 
 	now := time.Now()
 	orderID := uuid.New()
-	orderNumber := fmt.Sprintf("SO-%s-%s", now.Format("20060102"), uuid.New().String()[:6])
 
 	var createdBy *uuid.UUID
 	if userID != uuid.Nil {
 		createdBy = &userID
 	}
 
-	// Create sales order
-	_, err = h.db.Exec(`
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	// Same S00001 series as CreateSalesOrder — the old SO-YYYYMMDD-random format
+	// never sorted into the sequence. No deleted_at filter: soft-deleted rows still
+	// hold their numbers under the unique constraint.
+	nextOrderNumber := func() string {
+		var maxNum int64
+		if orderOrgID != nil {
+			tx.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM sales_orders
+				WHERE tenant_id = $1 AND organization_id = $2 AND order_number ~ '^S[0-9]+$'`,
+				tenantID, *orderOrgID).Scan(&maxNum)
+		} else {
+			tx.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM sales_orders
+				WHERE tenant_id = $1 AND organization_id IS NULL AND order_number ~ '^S[0-9]+$'`,
+				tenantID).Scan(&maxNum)
+		}
+		return fmt.Sprintf("S%05d", maxNum+1)
+	}
+	orderNumber := nextOrderNumber()
+
+	// Create sales order (org-scoped). The idempotent claim below runs in the same
+	// tx AFTER this insert (sales_order_id FK needs the row to exist); if the claim
+	// loses a concurrent race, the rollback discards this order too.
+	_, err = tx.Exec(`
 		INSERT INTO sales_orders (
-			id, tenant_id, order_number, customer_id,
+			id, tenant_id, organization_id, order_number, customer_id,
 			order_date, subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
 			status, payment_status, notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-		orderID, tenantID, orderNumber, q.CustomerID,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+		orderID, tenantID, orderOrgID, orderNumber, q.CustomerID,
 		now, q.Subtotal, q.DiscountAmount, q.TaxAmount, 0, q.TotalAmount,
 		"draft", "unpaid", q.Notes, createdBy, now, now,
 	)
@@ -588,32 +674,39 @@ func (h *Handler) ConvertQuotationToOrder(c *gin.Context) {
 
 	// Copy items to sales order lines
 	for i, item := range q.Items {
-		lineID := uuid.New()
-		// Skip items without product_id since sales_order_lines requires it
-		if item.ProductID == nil {
-			h.log.Warn("Skipping quotation item without product_id", "item_name", item.ProductName)
-			continue
-		}
 		lineTotal := item.Quantity * item.UnitPrice
-		_, err := h.db.Exec(`
+		if _, lerr := tx.Exec(`
 			INSERT INTO sales_order_lines (
 				id, sales_order_id, line_number, product_id, description, quantity, unit_price, line_total, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			lineID, orderID, i+1, item.ProductID, item.ProductName, item.Quantity, item.UnitPrice, lineTotal, now,
-		)
-		if err != nil {
-			h.log.Error("Failed to create sales order line", "error", err)
+			uuid.New(), orderID, i+1, item.ProductID, item.ProductName, item.Quantity, item.UnitPrice, lineTotal, now,
+		); lerr != nil {
+			h.log.Error("Failed to create sales order line", "error", lerr)
+			response.InternalError(c, "Failed to create sales order lines")
+			return
 		}
 	}
 
-	// Update quotation status
-	_, err = h.db.Exec(`
+	// Idempotent claim: a concurrent convert of the same quotation sees 0 rows
+	// here and rolls back its order.
+	claimRes, claimErr := tx.Exec(`
 		UPDATE sales_quotations SET status = 'accepted', converted_to_order = $1, sales_order_id = $2, updated_at = $3
-		WHERE id = $4 AND tenant_id = $5`,
+		WHERE id = $4 AND tenant_id = $5 AND sales_order_id IS NULL AND converted_to_order IS NULL`,
 		orderNumber, orderID, now, quotationID, tenantID,
 	)
-	if err != nil {
-		h.log.Error("Failed to update quotation status", "error", err)
+	if claimErr != nil {
+		h.log.Error("Failed to claim quotation for conversion", "error", claimErr)
+		response.InternalError(c, "Failed to update quotation")
+		return
+	}
+	if n, _ := claimRes.RowsAffected(); n == 0 {
+		response.BadRequest(c, "Quotation already converted to order")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit conversion")
+		return
 	}
 
 	// Return the quotation with updated status

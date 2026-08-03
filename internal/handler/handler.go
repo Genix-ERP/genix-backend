@@ -305,6 +305,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		leads.GET("/:id/audit-logs", h.GetLeadAuditLogs)
 		leads.GET("/:id/timeline", h.GetLeadTimeline)
 		leads.GET("/:id/tasks", h.ListLeadTasks)
+		leads.GET("/:id/sales-orders", h.ListLeadSalesOrders)
+		leads.POST("/:id/sales-order", h.perm.Require("sales", "order", "create"), h.CreateSalesOrderFromLead)
 		leads.PUT("/:id", h.perm.Require("crm", "lead", "update"), h.UpdateLead)
 		leads.DELETE("/:id", h.perm.Require("crm", "lead", "delete"), h.DeleteLead)
 		leads.POST("/:id/convert", h.perm.Require("crm", "lead", "update"), h.ConvertLead)
@@ -719,13 +721,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	salesOrders.Use(h.perm.Require("sales", "order", "read"))
 	{
 		salesOrders.GET("", h.ListSalesOrders)
+		salesOrders.GET("/stats", h.GetSalesOrderStats)
 		salesOrders.POST("", h.perm.Require("sales", "order", "create"), h.CreateSalesOrder)
 		salesOrders.GET("/:id", h.GetSalesOrder)
 		salesOrders.PUT("/:id", h.perm.Require("sales", "order", "update"), h.UpdateSalesOrder)
 		salesOrders.DELETE("/:id", h.perm.Require("sales", "order", "delete"), h.DeleteSalesOrder)
 		salesOrders.POST("/:id/confirm", h.perm.Require("sales", "order", "approve"), h.ConfirmSalesOrder)
-		salesOrders.POST("/:id/cancel", h.CancelSalesOrder)
-		salesOrders.POST("/:id/invoice", h.CreateInvoiceFromOrder)
+		salesOrders.POST("/:id/cancel", h.perm.Require("sales", "order", "update"), h.CancelSalesOrder)
+		salesOrders.POST("/:id/invoice", h.perm.Require("sales", "invoice", "create"), h.CreateInvoiceFromOrder)
 	}
 
 	// Sales Delivery Orders (outbound shipments from sales orders)
@@ -746,12 +749,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		invoices.GET("", h.ListSalesInvoices)
 		invoices.POST("", h.perm.Require("sales", "invoice", "create"), h.CreateSalesInvoice)
-		invoices.POST("/repair-revenue", h.perm.Require("sales", "invoice", "update"), h.RepairRevenueJournalEntries)
 		invoices.GET("/:id", h.GetSalesInvoice)
 		invoices.PUT("/:id", h.perm.Require("sales", "invoice", "update"), h.UpdateSalesInvoice)
 		invoices.DELETE("/:id", h.perm.Require("sales", "invoice", "delete"), h.DeleteSalesInvoice)
-		invoices.POST("/:id/send", h.SendInvoice)
-		invoices.POST("/:id/record-payment", h.RecordPayment)
+		invoices.POST("/:id/send", h.perm.Require("sales", "invoice", "update"), h.SendInvoice)
+		invoices.POST("/:id/record-payment", h.perm.Require("sales", "invoice", "update"), h.RecordPayment)
 		invoices.POST("/:id/credit-note", h.perm.Require("sales", "invoice", "create"), h.CreateCreditNote)
 		invoices.POST("/:id/confirm-credit-note", h.perm.Require("sales", "invoice", "update"), h.ConfirmCreditNote)
 	}
@@ -875,6 +877,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		purchaseOrders.GET("", h.ListPurchaseOrders)
 		purchaseOrders.GET("/stats", h.GetPurchaseOrderStats)
+		purchaseOrders.GET("/supplier-kpis", h.GetSupplierKPIs)
 		purchaseOrders.POST("", h.perm.Require("purchase", "order", "create"), h.CreatePurchaseOrder)
 		purchaseOrders.POST("/scan-receipt", h.perm.Require("purchase", "order", "create"), h.ScanPurchaseReceipt)
 		purchaseOrders.GET("/:id", h.GetPurchaseOrder)
@@ -1480,6 +1483,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Employee deductions
 		// Vazifalar integration — open tasks for the HR profile "Vazifalar" tab
 		employees.GET("/:id/tasks", h.ListEmployeeTasks)
+		employees.GET("/:id/assets", h.ListEmployeeAssets)
 
 		employees.GET("/:id/deductions", h.ListEmployeeDeductions)
 		employees.POST("/:id/deductions/:did/cancel", h.perm.Require("hr", "employee", "update"), h.CancelDeduction)
@@ -2028,51 +2032,31 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		taxSummary.GET("/combined", h.GetTaxSummaryCombined)
 	}
 
-	// Asset Categories
-	assetCategories := rg.Group("/asset-categories")
-	{
-		assetCategories.GET("", h.ListAssetCategories)
-		assetCategories.POST("", h.perm.Require("finance", "asset", "create"), h.CreateAssetCategory)
-		assetCategories.PUT("/:id", h.perm.Require("finance", "asset", "update"), h.UpdateAssetCategory)
-		assetCategories.DELETE("/:id", h.perm.Require("finance", "asset", "delete"), h.DeleteAssetCategory)
-	}
-
-	// Fixed Assets
-	fixedAssets := rg.Group("/fixed-assets")
-	fixedAssets.Use(h.perm.Require("finance", "asset", "read"))
-	{
-		fixedAssets.GET("", h.ListFixedAssets)
-		fixedAssets.GET("/dashboard", h.GetAssetDashboard)
-		fixedAssets.POST("", h.perm.Require("finance", "asset", "create"), h.CreateFixedAsset)
-		fixedAssets.GET("/:id", h.GetFixedAsset)
-		fixedAssets.PUT("/:id", h.perm.Require("finance", "asset", "update"), h.UpdateFixedAsset)
-		fixedAssets.DELETE("/:id", h.perm.Require("finance", "asset", "delete"), h.DeleteFixedAsset)
-		fixedAssets.POST("/:id/dispose", h.perm.Require("finance", "asset", "approve"), h.DisposeFixedAsset)
-		fixedAssets.GET("/:id/depreciation", h.GetDepreciationEntries)
-		fixedAssets.POST("/:id/maintenance", h.perm.Require("finance", "asset", "update"), h.RecordMaintenance)
-		fixedAssets.GET("/:id/maintenance", h.ListMaintenanceHistory)
-		fixedAssets.POST("/:id/payments", h.perm.Require("finance", "asset", "create"), h.RecordAssetPayment)
-		fixedAssets.GET("/:id/payments", h.ListAssetPayments)
-	}
-
-	// Run Depreciation (batch operation)
-	rg.POST("/run-depreciation", h.perm.Require("finance", "asset", "approve"), h.RunDepreciation)
-
 	// =====================================================
-	// FIXED ASSETS v2 — register, lifecycle, auto-depreciation (TZ v1.0)
+	// AKTIVLAR (FIXED ASSETS) — unified v2 register, lifecycle,
+	// auto-depreciation. The legacy /fixed-assets, /asset-categories and
+	// /run-depreciation routes were removed after the 453 data migration
+	// (audit 2026-08-03, docs/aktivlar-audit.md).
 	// =====================================================
 	assetsV2 := rg.Group("/assets")
 	assetsV2.Use(h.perm.Require("finance", "asset", "read"))
 	{
 		assetsV2.GET("", h.ListAssets)
+		assetsV2.GET("/stats", h.GetAssetStats)
+		assetsV2.GET("/reconcile", h.ReconcileAssets)
 		assetsV2.POST("", h.perm.Require("finance", "asset", "create"), h.CreateAsset)
+		assetsV2.POST("/from-po", h.perm.Require("finance", "asset", "create"), h.CreateAssetFromPO)
 		assetsV2.GET("/:id", h.GetAsset)
 		assetsV2.GET("/:id/schedule", h.GetAssetSchedule)
+		assetsV2.GET("/:id/entries", h.GetAssetEntries)
+		assetsV2.PATCH("/:id", h.perm.Require("finance", "asset", "update"), h.UpdateAssetInfo)
 		assetsV2.POST("/:id/commission", h.perm.Require("finance", "asset", "update"), h.CommissionAsset)
 		assetsV2.POST("/:id/conserve", h.perm.Require("finance", "asset", "update"), h.ConserveAsset)
 		assetsV2.POST("/:id/reactivate", h.perm.Require("finance", "asset", "update"), h.ReactivateAsset)
 		assetsV2.POST("/:id/dispose", h.perm.Require("finance", "asset", "approve"), h.DisposeAsset)
 		assetsV2.POST("/:id/change-params", h.perm.Require("finance", "asset", "update"), h.ChangeAssetParams)
+		assetsV2.POST("/:id/maintenance", h.perm.Require("finance", "asset", "update"), h.RecordAssetMaintenance)
+		assetsV2.GET("/:id/maintenance", h.ListAssetMaintenance)
 		// Per-asset GL override — gated by the dedicated accounting permission (§2.6).
 		assetsV2.PATCH("/:id/accounts", h.perm.Require("accounting", "asset_accounts", "override"), h.PatchAssetAccounts)
 	}
@@ -2080,6 +2064,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	depreciation := rg.Group("/depreciation/runs")
 	depreciation.Use(h.perm.Require("finance", "asset", "read"))
 	{
+		depreciation.GET("", h.ListDepreciationRuns)
 		depreciation.POST("", h.perm.Require("finance", "asset", "approve"), h.CreateDepreciationRunHandler)
 		depreciation.GET("/:id", h.GetDepreciationRun)
 		depreciation.POST("/:id/exclude", h.perm.Require("finance", "asset", "approve"), h.ExcludeFromRun)
@@ -2087,14 +2072,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		depreciation.POST("/:id/reverse", h.perm.Require("finance", "asset", "approve"), h.ReverseDepreciationRun)
 	}
 
-	// Asset account mapping (§2.5) — read for form population, edit gated by
-	// the accounting.edit_mapping permission.
+	// Asset account mapping (§2.5) — read for form population (still needs the
+	// module read permission: it exposes the tenant's chart mapping), edit gated
+	// by the accounting.edit_mapping permission.
 	assetMapping := rg.Group("/settings/asset-mapping")
+	assetMapping.Use(h.perm.Require("finance", "asset", "read"))
 	{
 		assetMapping.GET("", h.GetAssetMapping)
 		assetMapping.PUT("", h.perm.Require("accounting", "asset_mapping", "edit"), h.UpdateAssetMapping)
 	}
-	rg.GET("/asset-mapping/accounts", h.ListChartAccountsFiltered)
+	rg.GET("/asset-mapping/accounts", h.perm.Require("finance", "asset", "read"), h.ListChartAccountsFiltered)
 
 	// =====================================================
 	// VAZIFALAR (TASK MANAGEMENT) MODULE ROUTES

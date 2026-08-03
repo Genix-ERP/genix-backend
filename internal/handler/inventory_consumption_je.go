@@ -99,6 +99,27 @@ func (h *Handler) postInventoryConsumptionJE(q dbExecQuerier, args postInventory
 		return
 	}
 
+	// Header + both lines MUST share one transaction: the migration-416 balance
+	// trigger is deferred to COMMIT, so in autocommit mode the DR-line statement
+	// commits alone, fails the trigger, and leaves a posted ZERO-LINE entry (the
+	// exact bug class 416 was written to stop). Callers that pass h.db get a
+	// private tx here; callers already inside a tx are unaffected.
+	// *sql.Tx has no Begin method, so a caller already inside a tx never matches;
+	// both *sql.DB and the handler's *database.DB (embedded *sql.DB) do.
+	if db, isDB := q.(interface{ Begin() (*sql.Tx, error) }); isDB {
+		tx, txErr := db.Begin()
+		if txErr != nil {
+			h.log.Error("postInventoryConsumptionJE: begin tx failed", "error", txErr)
+			return
+		}
+		defer tx.Rollback()
+		h.postInventoryConsumptionJE(tx, args)
+		if cErr := tx.Commit(); cErr != nil {
+			h.log.Error("postInventoryConsumptionJE: commit failed", "error", cErr, "key", args.IdempotencyKey)
+		}
+		return
+	}
+
 	// ── Idempotency: skip if we've already posted this exact event. ──
 	// We tag the JE with the caller-supplied IdempotencyKey as the
 	// reference column. Re-runs (e.g. user double-clicks "Confirm
