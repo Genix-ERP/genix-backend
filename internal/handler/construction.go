@@ -4448,8 +4448,9 @@ func (h *Handler) CreateConstructionTeamMember(c *gin.Context) {
 		return
 	}
 
-	// Verify employee exists
-	err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM employees WHERE id = $1)", employeeUUID).Scan(&exists)
+	// Verify employee exists (tenant-scoped — a foreign tenant's employee
+	// id must not be attachable to this project's team)
+	err = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM employees WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)", employeeUUID, tenantID).Scan(&exists)
 	if err != nil || !exists {
 		response.NotFound(c, "Employee not found")
 		return

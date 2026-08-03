@@ -1189,6 +1189,33 @@ BEGIN
         LIMIT (5 - v_emp_count);
     END IF;
 
+    -- ── 1b. HR: bo'limlar/lavozimlar + biriktirish (migratsiya 458 bilan sinxron) ──
+    INSERT INTO departments (id, tenant_id, organization_id, code, name, is_active, created_at, updated_at)
+    VALUES
+        (uuid_generate_v4(), v_tid, v_org_id, 'MGMT',  'Boshqaruv',         true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'ACC',   'Buxgalteriya',      true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'SALES', 'Savdo bo''limi',    true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'CONST', 'Qurilish bo''limi', true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'PROD',  'Ishlab chiqarish',  true, NOW(), NOW())
+    ON CONFLICT (tenant_id, organization_id, code) DO NOTHING;
+
+    INSERT INTO job_positions (id, tenant_id, organization_id, code, name, is_active, created_at, updated_at)
+    VALUES
+        (uuid_generate_v4(), v_tid, v_org_id, 'CHENG',  'Bosh muhandis', true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'BUX',    'Buxgalter',     true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'PRORAB', 'Prorab',        true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'MEN',    'Menejer',       true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'USTA',   'Usta',          true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'ISH',    'Ishchi',        true, NOW(), NOW()),
+        (uuid_generate_v4(), v_tid, v_org_id, 'HRM',    'HR menejeri',   true, NOW(), NOW())
+    ON CONFLICT (tenant_id, code) DO NOTHING;
+
+    -- Bo'limsiz demo xodimlarni Ishlab chiqarishga biriktiramiz ("other" badge sizig'i bo'lmasin)
+    UPDATE employees e SET department_id = d.id, updated_at = NOW()
+    FROM departments d
+    WHERE d.tenant_id = v_tid AND d.organization_id = v_org_id AND d.code = 'PROD' AND d.deleted_at IS NULL
+      AND e.tenant_id = v_tid AND e.deleted_at IS NULL AND e.department_id IS NULL;
+
     -- ── 2. Payroll sozlamalari ──
     INSERT INTO payroll_settings (tenant_id, organization_id, advance_percent, currency, company_name, created_at, updated_at)
     VALUES (v_tid, v_org_id, 40, 'so''m', 'Demo Company', NOW(), NOW())

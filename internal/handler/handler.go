@@ -1469,6 +1469,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	employees.Use(h.perm.Require("hr", "employee", "read"))
 	{
 		employees.GET("", h.ListEmployees)
+		employees.GET("/stats", h.GetEmployeeStats)
 		employees.POST("", h.perm.Require("hr", "employee", "create"), h.CreateEmployee)
 		employees.GET("/:id", h.GetEmployee)
 		employees.PUT("/:id", h.perm.Require("hr", "employee", "update"), h.UpdateEmployee)

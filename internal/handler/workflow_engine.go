@@ -98,6 +98,8 @@ var workflowEventCatalog = map[string]workflowEventDef{
 		"record_id": "", "order_number": "PO-20260731-0003", "vendor_name": "Metall Servis", "expected_date": "2026-07-30", "days_overdue": 3}},
 	"employee.created": {Category: "hr", RelatedType: "employee", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "employee_name": "Dilshod Rahimov", "position": "Prorab"}},
+	"employee.terminated": {Category: "hr", RelatedType: "employee", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "employee_name": "Dilshod Rahimov"}},
 	"contracts.created": {Category: "contracts", RelatedType: "contract", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "", "contract_number": "CNT-2026-0014", "title": "Bosh pudrat shartnomasi", "contact_name": "Qurilish Invest MChJ", "value": 250000000.0, "direction": "income"}},
 	"contracts.status_changed": {Category: "contracts", RelatedType: "contract", Scheduled: false, SampleData: map[string]interface{}{

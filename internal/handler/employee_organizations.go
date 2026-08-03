@@ -118,13 +118,13 @@ func (h *Handler) ListOrganizationEmployees(c *gin.Context) {
 
 	query := `
 		SELECT eo.id, eo.tenant_id, eo.employee_id, eo.organization_id,
-		       e.full_name as employee_name,
+		       TRIM(COALESCE(e.first_name,'') || ' ' || COALESCE(e.last_name,'')) as employee_name,
 		       eo.role, eo.is_primary, eo.start_date, eo.end_date,
 		       eo.created_at, eo.updated_at
 		FROM employee_organizations eo
-		JOIN employees e ON e.id = eo.employee_id
+		JOIN employees e ON e.id = eo.employee_id AND e.deleted_at IS NULL
 		WHERE eo.tenant_id = $1 AND eo.organization_id = $2
-		ORDER BY eo.is_primary DESC, e.full_name ASC
+		ORDER BY eo.is_primary DESC, employee_name ASC
 	`
 
 	rows, err := h.db.Query(query, tenantID, orgID)
