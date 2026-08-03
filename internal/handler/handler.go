@@ -1221,6 +1221,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		taxes.DELETE("/:id", h.DeleteTaxRate)
 	}
 
+	// Tax constructor + catalog (genix_soliq_spec §2–3): catalog, versioned
+	// rates, per-tenant on/off toggles and the regime/threshold monitor.
+	// Reads use the accounting tax_report:read node; toggles/rate edits use
+	// tax_report:update (≈ tax.edit_rates).
+	taxCfg := rg.Group("/taxes")
+	taxCfg.Use(h.perm.Require("finance", "tax_report", "read"))
+	{
+		taxCfg.GET("/types", h.GetTaxTypes)
+		taxCfg.GET("/rates", h.GetTaxRates)
+		taxCfg.GET("/regime", h.GetTaxRegime)
+		taxCfg.GET("/settings", h.GetTaxSettings)
+		taxCfg.PUT("/settings", h.perm.Require("finance", "tax_report", "update"), h.UpdateTaxSetting)
+	}
+
 	// Currencies
 	currencies := rg.Group("/currencies")
 	{
