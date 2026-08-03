@@ -109,6 +109,8 @@ type UpdateEmployeeInput struct {
 	PerformanceScore *float64 `json:"performance_score,omitempty"`
 	TurnoverRisk     *string  `json:"turnover_risk,omitempty"`
 	Notes            *string  `json:"notes,omitempty"`
+	TerminationDate   *string `json:"termination_date,omitempty"`
+	TerminationReason *string `json:"termination_reason,omitempty"`
 }
 
 // EmployeeListFilter represents filters for listing employees

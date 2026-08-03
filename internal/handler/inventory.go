@@ -8795,9 +8795,9 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 			return
 		}
 
-		// Get employee name
+		// Get employee name (tenant-scoped)
 		var empName string
-		h.db.QueryRow("SELECT COALESCE(first_name || ' ' || last_name, first_name, '') FROM employees WHERE id=$1", employeeID).Scan(&empName)
+		h.db.QueryRow("SELECT COALESCE(first_name || ' ' || last_name, first_name, '') FROM employees WHERE id=$1 AND tenant_id=$2", employeeID, tenantID).Scan(&empName)
 
 		deductionResp = &entity.EmployeeDeduction{
 			ID:         deductionID,
