@@ -437,3 +437,115 @@ class TestPermissions:
     def test_admin_can_list_loans(self, api_client):
         r = api_client.get("/employee-loans")
         assert r.status_code == 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Avans reclass (moliya audit §2.3): an advance paid BEFORE the accrual
+# debits 9420 (cash-basis); ProcessPayroll must post a reclass
+# Dt 6710 / Kt 9420 for that amount so labor expense lands exactly once.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAvansReclass:
+    def test_process_reclasses_preaccrual_advance(self, api_client, db_read, tenant_id, accounts):
+        emp = _mk_employee(api_client, salary=2_000_000)
+        period = _mk_period(api_client, "T21RCL")
+        pid = period["id"]
+        r = api_client.post(f"/payroll-periods/{pid}/entries", json={
+            "employee_id": emp["id"],
+            "base_salary": 2_000_000,
+        })
+        assert r.status_code in (200, 201), r.text
+        entry = r.json().get("data", r.json())
+        eid = entry["id"]
+        advance = float(entry.get("advance_amount") or 0)
+        if advance <= 0:
+            # Classic create doesn't compute the advance split; a no-op update
+            # triggers the server-side recompute (base × advance_percent).
+            r = api_client.put(f"/payroll-periods/{pid}/entries/{eid}", json={})
+            assert r.status_code == 200, r.text
+            entry = r.json().get("data", r.json())
+            advance = float(entry.get("advance_amount") or 0)
+        if advance <= 0:
+            pytest.skip("no advance computed for entry (TT settings)")
+
+        _fund_cash_accounts(db_read, tenant_id, advance + 1_000_000)
+
+        # 1. Advance BEFORE accrual → payment JE debits 9420 (cash-basis mode).
+        r = api_client.post(f"/payroll/entries/{eid}/advance-paid", json={"paid": True, "day": 15})
+        assert r.status_code == 200, r.text
+        pay = [j for j in _je_rows(db_read, tenant_id, "payroll_payment", eid)
+               if j["reversed_entry_id"] is None]
+        assert pay, "advance payment JE missing"
+        pay_lines = _je_lines(db_read, pay[-1]["id"])
+        assert any(l["code"] == "9420" and float(l["debit_amount"]) > 0 for l in pay_lines), \
+            f"pre-accrual advance must debit 9420, got {[(l['code'], float(l['debit_amount'])) for l in pay_lines]}"
+
+        # 2. Accrue the period → exactly one reclass JE must fire.
+        r = api_client.post(f"/payroll-periods/{pid}/process", json={})
+        assert r.status_code == 200, r.text
+        reclass = [j for j in _je_rows(db_read, tenant_id, "payroll_avans_reclass", pid)
+                   if j["reversed_entry_id"] is None]
+        assert len(reclass) == 1, "processing must post exactly one avans reclass JE"
+        by_code = {l["code"]: l for l in _je_lines(db_read, reclass[0]["id"])}
+        assert float(by_code["6710"]["debit_amount"]) == pytest.approx(advance, abs=0.01), \
+            "reclass must debit 6710 for the advance amount"
+        assert float(by_code["9420"]["credit_amount"]) == pytest.approx(advance, abs=0.01), \
+            "reclass must credit 9420 for the advance amount"
+
+        # 3. Net 9420 across accrual + payment + reclass == gross: the labor
+        #    cost is expensed exactly once (the double-count guard).
+        gross = float(entry.get("gross_salary") or 2_000_000)
+        db_read.execute(
+            """SELECT COALESCE(SUM(l.debit_amount - l.credit_amount), 0) AS net
+               FROM journal_entry_lines l
+               JOIN journal_entries je ON je.id = l.journal_entry_id
+               JOIN accounts a ON a.id = l.account_id
+               WHERE je.tenant_id = %s AND a.code = '9420'
+                 AND je.status = 'posted' AND je.deleted_at IS NULL
+                 AND ((je.source_type IN ('payroll', 'payroll_avans_reclass') AND je.source_id::text = %s)
+                   OR (je.source_type = 'payroll_payment' AND je.source_id::text = %s))""",
+            (tenant_id, str(pid), str(eid)),
+        )
+        net_9420 = float(db_read.fetchone()["net"])
+        assert net_9420 == pytest.approx(gross, abs=0.01), \
+            f"labor expense must equal gross exactly once: 9420 net {net_9420} vs gross {gross}"
+
+    def test_unmark_after_accrual_posts_counter_reclass(self, api_client, db_read, tenant_id, accounts):
+        emp = _mk_employee(api_client, salary=1_800_000)
+        period = _mk_period(api_client, "T21RCC")
+        pid = period["id"]
+        r = api_client.post(f"/payroll-periods/{pid}/entries", json={
+            "employee_id": emp["id"],
+            "base_salary": 1_800_000,
+        })
+        assert r.status_code in (200, 201), r.text
+        entry = r.json().get("data", r.json())
+        eid = entry["id"]
+        advance = float(entry.get("advance_amount") or 0)
+        if advance <= 0:
+            r = api_client.put(f"/payroll-periods/{pid}/entries/{eid}", json={})
+            assert r.status_code == 200, r.text
+            entry = r.json().get("data", r.json())
+            advance = float(entry.get("advance_amount") or 0)
+        if advance <= 0:
+            pytest.skip("no advance computed for entry (TT settings)")
+        _fund_cash_accounts(db_read, tenant_id, advance + 1_000_000)
+
+        r = api_client.post(f"/payroll/entries/{eid}/advance-paid", json={"paid": True, "day": 10})
+        assert r.status_code == 200, r.text
+        r = api_client.post(f"/payroll-periods/{pid}/process", json={})
+        assert r.status_code == 200, r.text
+
+        # Un-mark the advance AFTER accrual: the payment JE gets reversed and
+        # a counter-reclass must restore 9420/6710 so the reclass doesn't dangle.
+        r = api_client.post(f"/payroll/entries/{eid}/advance-paid", json={"paid": False})
+        assert r.status_code == 200, r.text
+
+        rows = _je_rows(db_read, tenant_id, "payroll_avans_reclass", pid)
+        assert len(rows) == 2, f"expected reclass + counter-reclass, got {len(rows)}"
+        net = sum(
+            (1 if l["code"] == "6710" else 0) * (float(l["debit_amount"]) - float(l["credit_amount"]))
+            for j in rows for l in _je_lines(db_read, j["id"])
+        )
+        assert net == pytest.approx(0, abs=0.01), \
+            "counter-reclass must cancel the reclass on 6710 when the advance is unmarked"

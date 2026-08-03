@@ -874,6 +874,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	purchaseOrders.Use(h.perm.Require("purchase", "order", "read"))
 	{
 		purchaseOrders.GET("", h.ListPurchaseOrders)
+		purchaseOrders.GET("/stats", h.GetPurchaseOrderStats)
 		purchaseOrders.POST("", h.perm.Require("purchase", "order", "create"), h.CreatePurchaseOrder)
 		purchaseOrders.POST("/scan-receipt", h.perm.Require("purchase", "order", "create"), h.ScanPurchaseReceipt)
 		purchaseOrders.GET("/:id", h.GetPurchaseOrder)
@@ -881,7 +882,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseOrders.DELETE("/:id", h.perm.Require("purchase", "order", "delete"), h.DeletePurchaseOrder)
 		purchaseOrders.POST("/:id/submit", h.perm.Require("purchase", "order", "update"), h.SubmitPOForApproval)
 		purchaseOrders.POST("/:id/approve", h.perm.Require("purchase", "order", "approve"), h.ApprovePurchaseOrder)
-		purchaseOrders.POST("/:id/receive", h.ReceivePurchaseOrder)
+		purchaseOrders.POST("/:id/receive", h.perm.Require("purchase", "order", "update"), h.ReceivePurchaseOrder)
+		purchaseOrders.POST("/:id/cancel", h.perm.Require("purchase", "order", "update"), h.CancelPurchaseOrder)
 		purchaseOrders.POST("/:id/bill", h.perm.Require("purchase", "invoice", "create"), h.CreateBillFromPO)
 	}
 
@@ -897,7 +899,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseInvoices.DELETE("/:id", h.perm.Require("purchase", "invoice", "delete"), h.DeletePurchaseInvoice)
 		purchaseInvoices.POST("/:id/confirm", h.perm.Require("purchase", "invoice", "approve"), h.ConfirmPurchaseInvoice)
 		purchaseInvoices.POST("/:id/post", h.perm.Require("purchase", "invoice", "approve"), h.PostPurchaseInvoice)
-		purchaseInvoices.POST("/:id/pay", h.PayPurchaseInvoice)
+		purchaseInvoices.POST("/:id/pay", h.perm.Require("purchase", "invoice", "update"), h.PayPurchaseInvoice)
 		purchaseInvoices.POST("/:id/debit-note", h.perm.Require("purchase", "invoice", "create"), h.CreateDebitNote)
 		purchaseInvoices.POST("/:id/confirm-debit-note", h.perm.Require("purchase", "invoice", "approve"), h.ConfirmDebitNote)
 	}
@@ -1071,14 +1073,16 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		procurementRules.DELETE("/:id", h.perm.Require("purchase", "rule", "delete"), h.DeleteProcurementRule)
 	}
 
-	// Approval Workflows
+	// Approval Workflows — read gate on the group, approve permission on the
+	// mutating steps (they flip PO/requisition statuses; audit finding #3)
 	approvalWorkflows := rg.Group("/approval-workflows")
+	approvalWorkflows.Use(h.perm.Require("purchase", "order", "read"))
 	{
 		approvalWorkflows.GET("/my-approvals", h.GetMyPendingApprovals)
 		approvalWorkflows.GET("/by-document", h.GetWorkflowByDocument)
 		approvalWorkflows.GET("/:id", h.GetApprovalWorkflow)
-		approvalWorkflows.POST("/:id/approve", h.ApproveWorkflowStep)
-		approvalWorkflows.POST("/:id/reject", h.RejectWorkflowStep)
+		approvalWorkflows.POST("/:id/approve", h.perm.Require("purchase", "order", "approve"), h.ApproveWorkflowStep)
+		approvalWorkflows.POST("/:id/reject", h.perm.Require("purchase", "order", "approve"), h.RejectWorkflowStep)
 	}
 
 	// Dropshipping
@@ -1173,6 +1177,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	// and the auto-post code paths emit JE rows that the originating
 	// module sometimes needs to read back. Mutations stay gated.
 	journals := rg.Group("/journal-entries")
+	// Group-level read gate: JE lines carry salaries and partner terms, so
+	// listing/viewing them is finance-only, same standard as /payments.
+	journals.Use(h.perm.Require("finance", "journal", "read"))
 	{
 		journals.GET("", h.ListJournalEntries)
 		journals.POST("", h.perm.Require("finance", "journal", "create"), h.CreateJournalEntry)
@@ -1603,13 +1610,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	reports := rg.Group("/reports")
 	// sales-summary is accessible to sales users, not just finance
 	reports.GET("/sales-summary", h.perm.Require("sales", "order", "read"), h.GetSalesSummary)
-	// director-summary aggregates cross-org metrics in one call for the Director Dashboard.
-	// No extra permission beyond auth — the dashboard itself is gated by the installable app on the frontend.
-	reports.GET("/director-summary", h.GetDirectorSummary)
+	// director-summary aggregates cross-org finance metrics; frontend app-gating
+	// alone left it readable by any authenticated user, so require the same
+	// finance report permission as the rest of /reports (admins/owners bypass).
+	reports.GET("/director-summary", h.perm.Require("finance", "report", "read"), h.GetDirectorSummary)
 	reports.Use(h.perm.Require("finance", "report", "read"))
 	{
 		reports.GET("/balance-sheet", h.GetBalanceSheet)
 		reports.GET("/income-statement", h.GetIncomeStatement)
+		// One-call Moliya dashboard: totals, cash position + series, monthly
+		// flow, category-enriched expense breakdown, open AR/AP.
+		reports.GET("/finance-dashboard", h.GetFinanceDashboard)
 		reports.GET("/cash-flow", h.GetCashFlow)
 		reports.GET("/trial-balance", h.GetTrialBalance)
 		// ASQ per TT Buxgalteriya §6.1 — opening/turnover/closing + Excel export

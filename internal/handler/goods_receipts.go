@@ -378,7 +378,7 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 	}
 
 	// Update total quantity
-	h.db.Exec("UPDATE goods_receipts SET total_quantity = $1, updated_at = $2 WHERE id = $3", totalQty, now, grID)
+	h.db.Exec("UPDATE goods_receipts SET total_quantity = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", totalQty, now, grID, tenantID)
 
 	// Return created receipt
 	grResponse := map[string]interface{}{
@@ -775,7 +775,7 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 	now := time.Now()
 
 	// Update receipt status
-	_, err = h.db.Exec("UPDATE goods_receipts SET status = $1, updated_at = $2 WHERE id = $3", GRStatusCompleted, now, grID)
+	_, err = h.db.Exec("UPDATE goods_receipts SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", GRStatusCompleted, now, grID, tenantID)
 	if err != nil {
 		response.InternalError(c, "Failed to complete goods receipt")
 		return
@@ -797,12 +797,16 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 				continue
 			}
 
-			// Update PO line received quantity
+			// Update PO line received quantity (lines have no tenant_id —
+			// scope through the parent PO)
 			h.db.Exec(`
-				UPDATE purchase_order_lines
+				UPDATE purchase_order_lines pol
 				SET quantity_received = COALESCE(quantity_received, 0) + $1, updated_at = $2
-				WHERE id = $3`,
-				acceptedQty, now, poLineID,
+				WHERE pol.id = $3 AND EXISTS (
+					SELECT 1 FROM purchase_orders po
+					WHERE po.id = pol.purchase_order_id AND po.tenant_id = $4
+				)`,
+				acceptedQty, now, poLineID, tenantID,
 			)
 		}
 	}
@@ -834,7 +838,7 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 	if allReceived {
 		newPOStatus = "received"
 	}
-	h.db.Exec("UPDATE purchase_orders SET status = $1, updated_at = $2 WHERE id = $3", newPOStatus, now, purchaseOrderID)
+	h.db.Exec("UPDATE purchase_orders SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", newPOStatus, now, purchaseOrderID, tenantID)
 
 	// ============================================
 	// UPDATE INVENTORY FROM GOODS RECEIPT
@@ -1082,6 +1086,12 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 				debitAcct = findAccount(h.db, tenantID, orgIDPtr, "inventory", "1010")
 			}
 			if creditAcct == uuid.Nil {
+				// GRNI (6015), NOT AP (6010): the vendor bill credits 6010
+				// against a 6015 debit later. Crediting 6010 here too would
+				// book AP twice for one delivery (docs/xarid-audit.md #5).
+				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "stock interim", "6015")
+			}
+			if creditAcct == uuid.Nil {
 				creditAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
 			}
 			if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
@@ -1134,6 +1144,23 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 		}
 	}()
 
+	// The GR completing is the actual "goods arrived" moment — emit the
+	// workflow event here too, not only from POST /purchase-orders/:id/receive
+	// (docs/xarid-audit.md finding #7).
+	go func() {
+		var poNumber, vendorName, poStatus string
+		h.db.QueryRow(`
+			SELECT po.order_number, COALESCE(ct.name, ''), po.status
+			FROM purchase_orders po LEFT JOIN contacts ct ON po.vendor_id = ct.id
+			WHERE po.id = $1`, purchaseOrderID).Scan(&poNumber, &vendorName, &poStatus)
+		h.EmitWorkflowEvent(tenantID, "purchase_order.received", map[string]interface{}{
+			"record_id":    purchaseOrderID.String(),
+			"order_number": poNumber,
+			"vendor_name":  vendorName,
+			"status":       poStatus,
+		})
+	}()
+
 	h.GetGoodsReceipt(c)
 }
 
@@ -1163,7 +1190,7 @@ func (h *Handler) CancelGoodsReceipt(c *gin.Context) {
 		return
 	}
 
-	_, err = h.db.Exec("UPDATE goods_receipts SET status = $1, updated_at = $2 WHERE id = $3", GRStatusCancelled, time.Now(), grID)
+	_, err = h.db.Exec("UPDATE goods_receipts SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", GRStatusCancelled, time.Now(), grID, tenantID)
 	if err != nil {
 		response.InternalError(c, "Failed to cancel goods receipt")
 		return

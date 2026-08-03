@@ -1029,8 +1029,8 @@ func (h *Handler) ConvertPRToPO(c *gin.Context) {
 
 	// Update PR status
 	_, err = h.db.Exec(
-		"UPDATE purchase_requisitions SET status = $1, converted_to_po = $2, updated_at = $3 WHERE id = $4",
-		PRStatusConverted, poID, now, prID,
+		"UPDATE purchase_requisitions SET status = $1, converted_to_po = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
+		PRStatusConverted, poID, now, prID, tenantID,
 	)
 	if err != nil {
 		h.log.Error("Failed to update PR status", "error", err)

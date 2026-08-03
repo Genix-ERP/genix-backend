@@ -2160,22 +2160,30 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		return s
 	}
 
-	// 2. Revenue — scoped to the selected period window.
+	// 2. Revenue — from the posted ledger (revenue-category lines), the same
+	//    source Moliya's dashboard reads. The previous sales_invoices sum
+	//    disagreed with Moliya's numbers and counted unposted documents
+	//    (docs/moliya-audit.md §2.7 — one source of truth).
 	revRows, err := h.db.Query(`
-		SELECT organization_id, invoice_date, COALESCE(total_amount, 0)
-		FROM sales_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
-		  AND status NOT IN ('cancelled')
-		  AND COALESCE(invoice_type, 'invoice') = 'invoice'
-		  AND invoice_date >= $2 AND invoice_date < $3`,
+		SELECT je.organization_id, je.entry_date,
+		       SUM(l.credit_amount - l.debit_amount) AS amt
+		FROM journal_entry_lines l
+		JOIN journal_entries je ON je.id = l.journal_entry_id
+			AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.organization_id IS NOT NULL
+			AND je.entry_date >= $2 AND je.entry_date < $3
+		JOIN accounts a ON a.id = l.account_id AND a.tenant_id = $1 AND a.deleted_at IS NULL
+		JOIN account_types at ON at.id = a.account_type_id AND at.category = 'revenue'
+		WHERE je.tenant_id = $1
+		GROUP BY je.organization_id, je.entry_date`,
 		tenantID, rangeStart, rangeEnd,
 	)
 	if err == nil {
 		for revRows.Next() {
 			var orgID uuid.UUID
-			var invDate time.Time
+			var entryDate time.Time
 			var amt float64
-			if err := revRows.Scan(&orgID, &invDate, &amt); err != nil {
+			if err := revRows.Scan(&orgID, &entryDate, &amt); err != nil {
 				continue
 			}
 			s := touch(orgID.String())
@@ -2183,28 +2191,33 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 				continue
 			}
 			s.Revenue += amt
-			if idx := bucketIdx(invDate); idx >= 0 {
+			if idx := bucketIdx(entryDate); idx >= 0 {
 				s.MonthlyRevenue[idx] += amt
 			}
 		}
 		revRows.Close()
 	}
 
-	// 3. Expenses — scoped to the selected period window.
-	//    The donut breakdown is "current bucket" (latest = today's
-	//    period segment, e.g. this month / this quarter / this year).
-	//    v2: drafts and rejected/cancelled rows no longer count — the
-	//    director sees committed spending (submitted/approved/paid),
-	//    and total_amount (with tax) instead of the net amount.
+	// 3. Expenses — from the posted ledger (expense-category lines), so
+	//    payroll and COGS are included (the old expenses-table sum missed
+	//    both). The donut breakdown is "current bucket" and is
+	//    category-enriched: expense-sourced lines take their Xarajatlar
+	//    category name, everything else the GL account name.
 	expRows, err := h.db.Query(`
-		SELECT e.organization_id, COALESCE(e.total_amount, 0),
-		       COALESCE(ec.name, 'Other') AS category,
-		       e.expense_date
-		FROM expenses e
+		SELECT je.organization_id, je.entry_date,
+		       SUM(l.debit_amount - l.credit_amount) AS amt,
+		       COALESCE(ec.name, COALESCE(a.name_uz, a.name)) AS category
+		FROM journal_entry_lines l
+		JOIN journal_entries je ON je.id = l.journal_entry_id
+			AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.organization_id IS NOT NULL
+			AND je.entry_date >= $2 AND je.entry_date < $3
+		JOIN accounts a ON a.id = l.account_id AND a.tenant_id = $1 AND a.deleted_at IS NULL
+		JOIN account_types at ON at.id = a.account_type_id AND at.category = 'expense'
+		LEFT JOIN expenses e ON je.source_type = 'expense' AND e.id = je.source_id
 		LEFT JOIN expense_categories ec ON ec.id = e.category_id
-		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND e.organization_id IS NOT NULL
-		  AND e.status IN ('submitted', 'approved', 'paid')
-		  AND e.expense_date >= $2 AND e.expense_date < $3`,
+		WHERE je.tenant_id = $1
+		GROUP BY je.organization_id, je.entry_date, COALESCE(ec.name, COALESCE(a.name_uz, a.name))`,
 		tenantID, rangeStart, rangeEnd,
 	)
 	if err == nil {
@@ -2212,10 +2225,10 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		latestEnd := buckets[len(buckets)-1].end
 		for expRows.Next() {
 			var orgID uuid.UUID
+			var entryDate time.Time
 			var amt float64
 			var cat string
-			var expDate time.Time
-			if err := expRows.Scan(&orgID, &amt, &cat, &expDate); err != nil {
+			if err := expRows.Scan(&orgID, &entryDate, &amt, &cat); err != nil {
 				continue
 			}
 			s := touch(orgID.String())
@@ -2223,38 +2236,57 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 				continue
 			}
 			s.Expenses += amt
-			if !expDate.Before(latestStart) && expDate.Before(latestEnd) {
+			if !entryDate.Before(latestStart) && entryDate.Before(latestEnd) && amt > 0 {
 				s.ExpenseByCategory[cat] += amt
 			}
 		}
 		expRows.Close()
 	}
 
-	// 4. Debtors / Creditors from contacts.current_balance per org
+	// 4. Debtors / Creditors — open invoices minus payments (amount_due),
+	//    the same computation as AR/AP aging. contacts.current_balance was
+	//    a third balance store that could drift (docs/moliya-audit.md §2.7).
 	cRows, err := h.db.Query(`
-		SELECT organization_id,
-		       COALESCE(SUM(CASE WHEN current_balance > 0 THEN current_balance ELSE 0 END), 0) AS debtors,
-		       COALESCE(SUM(CASE WHEN current_balance < 0 THEN -current_balance ELSE 0 END), 0) AS creditors
-		FROM contacts
+		SELECT organization_id, COALESCE(SUM(amount_due), 0)
+		FROM sales_invoices
 		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
+		  AND status NOT IN ('draft', 'cancelled', 'void') AND amount_due > 0
 		GROUP BY organization_id`,
 		tenantID,
 	)
 	if err == nil {
 		for cRows.Next() {
 			var orgID uuid.UUID
-			var deb, cred float64
-			if err := cRows.Scan(&orgID, &deb, &cred); err != nil {
+			var deb float64
+			if err := cRows.Scan(&orgID, &deb); err != nil {
 				continue
 			}
-			s := touch(orgID.String())
-			if s == nil {
-				continue
+			if s := touch(orgID.String()); s != nil {
+				s.Debtors = deb
 			}
-			s.Debtors = deb
-			s.Creditors = cred
 		}
 		cRows.Close()
+	}
+	crRows, err := h.db.Query(`
+		SELECT organization_id, COALESCE(SUM(amount_due), 0)
+		FROM purchase_invoices
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
+		  AND status NOT IN ('draft', 'cancelled', 'void') AND amount_due > 0
+		GROUP BY organization_id`,
+		tenantID,
+	)
+	if err == nil {
+		for crRows.Next() {
+			var orgID uuid.UUID
+			var cred float64
+			if err := crRows.Scan(&orgID, &cred); err != nil {
+				continue
+			}
+			if s := touch(orgID.String()); s != nil {
+				s.Creditors = cred
+			}
+		}
+		crRows.Close()
 	}
 
 	// 5. Inventory — stock units + stock value + low-stock count via warehouse.organization_id
