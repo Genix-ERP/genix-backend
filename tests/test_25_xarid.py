@@ -281,10 +281,12 @@ class TestObjectCost:
         import psycopg2.extras
 
         # A minimal construction project via SQL (BIGSERIAL PK; the projects
-        # API needs a longer setup than this invariant deserves).
+        # API needs a longer setup than this invariant deserves). Status must
+        # come from the 461 vocabulary — legacy 'active' now violates
+        # chk_construction_project_status.
         db_read.execute(
             """INSERT INTO construction_projects (tenant_id, code, name, status)
-               VALUES (%s, %s, 'XARIDTEST obyekt', 'active')
+               VALUES (%s, %s, 'XARIDTEST obyekt', 'in_progress')
                RETURNING id""",
             (api_client.tenant_id, f"XRD-OBJ-{uuid.uuid4().hex[:6].upper()}"),
         )

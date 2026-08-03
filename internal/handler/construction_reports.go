@@ -1250,3 +1250,151 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 		},
 	})
 }
+
+// GET /construction/projects/:id/reports/resource-consolidation
+//
+// Plan/NORMA-based twin of GetMaterialConsolidationReport, feeding the
+// ResourceConsolidationModal (BudgetTab → "Resurs yig'indisi"): planned
+// normative quantities of EVERY resource kind aggregated per block, each
+// group tagged with its `type` so the UI can filter, and with the owning
+// subcontractor's name when the resource lives in a subcontract estimate.
+//
+// Type vocabulary (must match the modal's RES_TYPES):
+//   labor     — labor resources (resource_type labor-ish, or UOM contains ЧЕЛ)
+//   equipment — machines/mechanisms (resource_type machine-ish, or UOM МАШ)
+//   cable     — materials flagged material_type='cable' (migration 350)
+//   installed — materials flagged material_type='equipment' (оборудование)
+//   material  — everything else (material_type='standard' / untagged)
+//
+// Aggregation key: (building_id, subcontractor, type, name, uom, unit_rate).
+// NORMA quantity is the line's full planned quantity (no done_quantity
+// scaling — that is the Fakt report's job).
+func (h *Handler) GetResourceConsolidationReport(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	var projectName, projectAddress string
+	if err := h.db.QueryRow(`
+		SELECT COALESCE(name, ''), COALESCE(address, '')
+		  FROM construction_projects
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, projectID, tenantID).Scan(&projectName, &projectAddress); err != nil {
+		response.NotFound(c, "Project not found")
+		return
+	}
+
+	rows, err := h.db.Query(`
+		WITH resource_lines AS (
+		    SELECT
+		        e.building_id                    AS bid,
+		        COALESCE(sc.partner_name, sc.name, '') AS subcontractor,
+		        CASE
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('labor', 'mehnat', 'ish', 'ishchi', 'worker', 'трудовой', 'трудовые')
+		                 OR UPPER(COALESCE(s.uom, '')) LIKE '%ЧЕЛ%' THEN 'labor'
+		            WHEN LOWER(COALESCE(s.resource_type, '')) IN
+		                 ('equipment', 'mashina', 'masina', 'mexanizm', 'mexanizmlar', 'machinery', 'машина')
+		                 OR UPPER(COALESCE(s.uom, '')) LIKE '%МАШ%' THEN 'equipment'
+		            WHEN LOWER(COALESCE(s.material_type, 'standard')) = 'cable' THEN 'cable'
+		            WHEN LOWER(COALESCE(s.material_type, 'standard')) = 'equipment' THEN 'installed'
+		            ELSE 'material'
+		        END                              AS rtype,
+		        s.name                           AS name,
+		        COALESCE(s.uom, '')              AS uom,
+		        COALESCE(s.unit_rate, 0)         AS unit_rate,
+		        COALESCE(s.quantity, 0)          AS norma_quantity
+		    FROM construction_estimate_line s
+		    JOIN construction_estimate e
+		      ON e.id = s.estimate_id AND e.tenant_id = s.tenant_id
+		    LEFT JOIN construction_subcontract sc
+		      ON sc.id = e.subcontract_id AND sc.tenant_id = e.tenant_id
+		    WHERE e.project_id = $1
+		      AND e.tenant_id = $2
+		      AND s.tenant_id = $2
+		      AND s.parent_line_id IS NOT NULL
+		)
+		SELECT
+		    COALESCE(rl.bid, 0)                AS building_id,
+		    COALESCE(b.name, b.code, 'Umumiy') AS building_name,
+		    rl.subcontractor,
+		    rl.rtype,
+		    rl.name,
+		    rl.uom,
+		    rl.unit_rate,
+		    SUM(rl.norma_quantity)             AS norma_quantity
+		FROM resource_lines rl
+		LEFT JOIN construction_buildings b ON b.id = rl.bid
+		WHERE rl.norma_quantity > 0
+		GROUP BY rl.bid, b.id, b.name, b.code, b.sort_order,
+		         rl.subcontractor, rl.rtype, rl.name, rl.uom, rl.unit_rate
+		ORDER BY b.sort_order ASC NULLS LAST, b.id ASC NULLS LAST,
+		         rl.rtype ASC, UPPER(rl.name) ASC, rl.uom ASC, rl.unit_rate ASC
+	`, projectID, tenantID)
+	if err != nil {
+		h.log.Error("Failed to query resource consolidation", "error", err)
+		response.InternalError(c, "Failed to compute resource report")
+		return
+	}
+	defer rows.Close()
+
+	type rGroup struct {
+		Type          string  `json:"type"`
+		Subcontractor string  `json:"subcontractor,omitempty"`
+		Name          string  `json:"name"`
+		UOM           string  `json:"uom"`
+		UnitRate      float64 `json:"unit_rate"`
+		NormaQuantity float64 `json:"norma_quantity"`
+		NormaAmount   float64 `json:"norma_amount"`
+	}
+	type rBlock struct {
+		ID          int64    `json:"id"`
+		Name        string   `json:"name"`
+		Groups      []rGroup `json:"groups"`
+		TotalAmount float64  `json:"total_amount"`
+	}
+
+	blockOrder := []int64{}
+	blockMap := map[int64]*rBlock{}
+	for rows.Next() {
+		var bid int64
+		var bName, sub, rtype, name, uom string
+		var rate, qty float64
+		if err := rows.Scan(&bid, &bName, &sub, &rtype, &name, &uom, &rate, &qty); err != nil {
+			continue
+		}
+		blk, okB := blockMap[bid]
+		if !okB {
+			blk = &rBlock{ID: bid, Name: bName, Groups: []rGroup{}}
+			blockMap[bid] = blk
+			blockOrder = append(blockOrder, bid)
+		}
+		amount := qty * rate
+		blk.Groups = append(blk.Groups, rGroup{
+			Type: rtype, Subcontractor: sub, Name: name, UOM: uom,
+			UnitRate: rate, NormaQuantity: qty, NormaAmount: amount,
+		})
+		blk.TotalAmount += amount
+	}
+
+	blocks := make([]rBlock, 0, len(blockOrder))
+	grand := 0.0
+	for _, bid := range blockOrder {
+		blocks = append(blocks, *blockMap[bid])
+		grand += blockMap[bid].TotalAmount
+	}
+
+	response.Success(c, gin.H{
+		"project": gin.H{"id": projectID, "name": projectName, "address": projectAddress},
+		"blocks":  blocks,
+		"total":   gin.H{"total_amount": grand},
+	})
+}

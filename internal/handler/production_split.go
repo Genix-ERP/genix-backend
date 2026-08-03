@@ -495,12 +495,14 @@ func (h *Handler) consumeSplitMaterial(
 			entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
 			description := fmt.Sprintf("Split packaging material consumed — %s", poCode)
 
+			// Header totals mandatory (test_16 invariant) — one balanced pair.
 			if _, jeErr := tx.Exec(`
 				INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
-					entry_date, description, source_type, source_id, status, created_by, created_at, updated_at)
-				VALUES ($1,$2,$3,$4,$5,$6,$7,'split_material_consumption',$8,'posted',$9,$10,$10)
+					entry_date, description, source_type, source_id, status, total_debit, total_credit,
+					created_by, created_at, updated_at)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,'split_material_consumption',$8,'posted',$9,$9,$10,$11,$11)
 			`, entryID, tenantID, organizationID, journalID, entryNumber,
-				now, description, poID.String(), userID, now); jeErr != nil {
+				now, description, poID.String(), matTotalCost, userID, now); jeErr != nil {
 				h.log.Error("consumeSplitMaterial: insert journal entry failed", "error", jeErr)
 				return
 			}
@@ -551,6 +553,12 @@ func (h *Handler) createSplitOutputJournalEntry(
 	primaryProductID, userID uuid.UUID,
 	totalCost float64, now time.Time,
 ) {
+	// Nothing to post — avoid a 0-amount (or line-less) entry that would
+	// trip the migration-326 balance trigger or pollute the ledger.
+	if totalCost <= 0 {
+		return
+	}
+
 	// Prevent duplicates
 	var existing int
 	h.db.QueryRow(`
@@ -581,22 +589,27 @@ func (h *Handler) createSplitOutputJournalEntry(
 	h.db.QueryRow(`SELECT code FROM production_orders WHERE id = $1`, poID).Scan(&poCode)
 	h.db.QueryRow(`SELECT name FROM products WHERE id = $1`, primaryProductID).Scan(&productName)
 
-	entryID := uuid.New()
-	entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(h.db, tenantID, organizationID, "MFG", nextNumber))
-	description := fmt.Sprintf("Split output: %s — %s", poCode, productName)
-
 	tx, err := h.db.Begin()
 	if err != nil {
 		return
 	}
 	defer tx.Rollback()
 
+	entryID := uuid.New()
+	// Entry number computed on the tx so it sees entries created earlier in
+	// this transaction and stays consistent under concurrency.
+	entryNumber := fmt.Sprintf("MFG%06d", nextEntryNumberSeq(tx, tenantID, organizationID, "MFG", nextNumber))
+	description := fmt.Sprintf("Split output: %s — %s", poCode, productName)
+
+	// Header totals are mandatory (test_16 header-totals-match-lines
+	// invariant); the entry is a single Dr/Cr pair of totalCost each.
 	if _, err := tx.Exec(`
 		INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id, entry_number,
-			entry_date, description, source_type, source_id, status, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,'split_output_complete',$8,'posted',$9,$10,$10)
+			entry_date, description, source_type, source_id, status, total_debit, total_credit,
+			created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,'split_output_complete',$8,'posted',$9,$9,$10,$11,$11)
 	`, entryID, tenantID, organizationID, journalID, entryNumber,
-		now, description, poID.String(), userID, now); err != nil {
+		now, description, poID.String(), totalCost, userID, now); err != nil {
 		return
 	}
 
@@ -627,5 +640,7 @@ func (h *Handler) createSplitOutputJournalEntry(
 	if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id = $1`, journalID); err != nil {
 		return
 	}
-	tx.Commit()
+	if err := tx.Commit(); err != nil {
+		h.log.Error("createSplitOutputJournalEntry: commit failed", "error", err, "po_id", poID)
+	}
 }

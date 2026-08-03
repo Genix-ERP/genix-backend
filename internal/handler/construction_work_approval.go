@@ -68,8 +68,10 @@ func (h *Handler) resolveProjectRole(tenantID, userID uuid.UUID, projectID int64
 // per-project team rows AND the tenant-settings role lists, so a user
 // assigned to more than one role (e.g. both supervisor and engineer) gets
 // all of them. Deduped, returned in canonical order (foreman, supervisor,
-// engineer). An EMPTY slice means "no role assigned" — callers treat that
-// as tenant-admin/demo and skip the role gate.
+// engineer). An EMPTY slice means "no role assigned" — the works gate
+// (constructionWorkGateAllows) only lets tenant owners / site admins
+// through in that case; everyone else is denied until roles are assigned
+// in Settings → Construction or on the project team.
 func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int64) []string {
 	if userID == uuid.Nil {
 		return nil
@@ -180,6 +182,30 @@ func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int6
 		}
 	}
 	return out
+}
+
+// constructionWorkGateAllows authorises a works-workflow action.
+// Allowed when one of the caller's resolved project roles matches
+// requiredRole. An EMPTY role set no longer skips the gate: the legacy
+// "tenant-admin/demo" fallback is granted only to actual tenant admins
+// (JWT system admin, or users.role owner/site_admin) — a user who merely
+// holds construction:estimate:update but is not on the project team can
+// no longer confirm volumes.
+func (h *Handler) constructionWorkGateAllows(c *gin.Context, tenantID, userID uuid.UUID, projectID int64, requiredRole string) bool {
+	roles := h.resolveProjectRoles(tenantID, userID, projectID)
+	if len(roles) > 0 {
+		return roleSetHas(roles, requiredRole)
+	}
+	if claims, ok := middleware.GetClaims(c); ok && claims != nil && claims.IsSystemAdmin {
+		return true
+	}
+	var role sql.NullString
+	if err := h.db.QueryRow(
+		`SELECT role FROM users WHERE id = $1 AND tenant_id = $2`, userID, tenantID,
+	).Scan(&role); err != nil {
+		return false
+	}
+	return role.Valid && (role.String == "owner" || role.String == "site_admin")
 }
 
 // roleSetHas reports whether the resolved role set contains target.
@@ -308,11 +334,9 @@ func (h *Handler) UpdateWorkDoneQuantity(c *gin.Context) {
 		return
 	}
 
-	// Authorisation. Treat tenant admins (role "") as foreman so a
-	// freshly-imported project where roles haven't been assigned yet
-	// can still be exercised by the project owner.
-	roles := h.resolveProjectRoles(tenantID, userID, ctx.ProjectID)
-	if len(roles) > 0 && !roleSetHas(roles, "foreman") {
+	// Authorisation. Foreman only; with no roles assigned, only tenant
+	// owners / site admins keep the legacy fallback.
+	if !h.constructionWorkGateAllows(c, tenantID, userID, ctx.ProjectID, "foreman") {
 		response.Forbidden(c, "Only the project foreman can update done quantity")
 		return
 	}
@@ -596,10 +620,9 @@ func (h *Handler) transitionWork(
 	}
 
 	// Authorisation — the user may act if ANY of their assigned roles is the
-	// one this transition requires. Tenant admins (empty set) are permitted
-	// as a fallback — same logic as UpdateWorkDoneQuantity.
-	roles := h.resolveProjectRoles(tenantID, userID, ctx.ProjectID)
-	if len(roles) > 0 && !roleSetHas(roles, requiredRole) {
+	// one this transition requires; with no roles assigned, only tenant
+	// owners / site admins are permitted (same logic as UpdateWorkDoneQuantity).
+	if !h.constructionWorkGateAllows(c, tenantID, userID, ctx.ProjectID, requiredRole) {
 		response.Forbidden(c, "Action not allowed for your project role")
 		return
 	}
@@ -746,8 +769,7 @@ func (h *Handler) bulkWorksTransition(
 		return
 	}
 
-	roles := h.resolveProjectRoles(tenantID, userID, projectID)
-	if len(roles) > 0 && !roleSetHas(roles, requiredRole) {
+	if !h.constructionWorkGateAllows(c, tenantID, userID, projectID, requiredRole) {
 		response.Forbidden(c, "Action not allowed for your project role")
 		return
 	}
