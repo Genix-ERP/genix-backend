@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -50,8 +51,8 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 			   e.job_position_id, COALESCE(jp.name, '') as job_position_name,
 			   e.user_id
 		FROM employees e
-		LEFT JOIN departments d ON e.department_id = d.id
-		LEFT JOIN job_positions jp ON e.job_position_id = jp.id
+		LEFT JOIN departments d ON e.department_id = d.id AND d.deleted_at IS NULL
+		LEFT JOIN job_positions jp ON e.job_position_id = jp.id AND jp.deleted_at IS NULL
 		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM employees e WHERE e.tenant_id = $1 AND e.deleted_at IS NULL`
@@ -483,6 +484,14 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 		"position":      jobTitle,
 	})
 
+	if userID, uok := middleware.GetUserID(c); uok {
+		h.writeEmployeeAudit(tenantID, userID, "create", id, nil, map[string]interface{}{
+			"employee_number": employeeNumber,
+			"name":            strings.TrimSpace(firstName + " " + lastName),
+			"status":          status,
+		})
+	}
+
 	response.Created(c, emp.ToResponse())
 }
 
@@ -508,8 +517,8 @@ func (h *Handler) GetEmployee(c *gin.Context) {
 			   e.department_id, COALESCE(d.name, '') as department_name,
 			   e.job_position_id, COALESCE(jp.name, '') as job_position_name
 		FROM employees e
-		LEFT JOIN departments d ON e.department_id = d.id
-		LEFT JOIN job_positions jp ON e.job_position_id = jp.id
+		LEFT JOIN departments d ON e.department_id = d.id AND d.deleted_at IS NULL
+		LEFT JOIN job_positions jp ON e.job_position_id = jp.id AND jp.deleted_at IS NULL
 		WHERE e.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
 	`
 
@@ -603,11 +612,16 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 		return
 	}
 
-	// Debug: log job_position_id
-	if input.JobPositionID != nil {
-		h.log.Info("UpdateEmployee: job_position_id received", "value", *input.JobPositionID)
-	} else {
-		h.log.Info("UpdateEmployee: job_position_id is nil")
+	// Read the current status so termination fields and the
+	// employee.terminated event only fire on an actual transition.
+	var oldStatus string
+	var oldFirst, oldLast string
+	if err := h.db.QueryRow(
+		`SELECT status, first_name, COALESCE(last_name,'') FROM employees WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		id, tenantID,
+	).Scan(&oldStatus, &oldFirst, &oldLast); err == sql.ErrNoRows {
+		response.NotFound(c, "Employee")
+		return
 	}
 
 	// Build dynamic update query
@@ -652,6 +666,22 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 	}
 	if input.Status != nil {
 		addUpdate("status", *input.Status)
+		if *input.Status == "terminated" && oldStatus != "terminated" {
+			termDate := time.Now()
+			if input.TerminationDate != nil {
+				if parsed, perr := time.Parse("2006-01-02", *input.TerminationDate); perr == nil {
+					termDate = parsed
+				}
+			}
+			addUpdate("termination_date", termDate)
+			if input.TerminationReason != nil {
+				addUpdate("termination_reason", *input.TerminationReason)
+			}
+		} else if *input.Status != "terminated" && oldStatus == "terminated" {
+			// Re-hire / correction: clear termination fields
+			addUpdate("termination_date", nil)
+			addUpdate("termination_reason", nil)
+		}
 	}
 	if input.BaseSalary != nil {
 		addUpdate("base_salary", *input.BaseSalary)
@@ -775,6 +805,27 @@ func (h *Handler) UpdateEmployee(c *gin.Context) {
 		}
 	}
 
+	if userID, uok := middleware.GetUserID(c); uok {
+		newVals := map[string]interface{}{}
+		if input.Status != nil {
+			newVals["status"] = *input.Status
+		}
+		if input.BaseSalary != nil {
+			newVals["salary_changed"] = true
+		}
+		if input.DepartmentID != nil {
+			newVals["department_id"] = *input.DepartmentID
+		}
+		h.writeEmployeeAudit(tenantID, userID, "update", id, map[string]interface{}{"status": oldStatus}, newVals)
+	}
+
+	if input.Status != nil && *input.Status == "terminated" && oldStatus != "terminated" {
+		h.EmitWorkflowEvent(tenantID, "employee.terminated", map[string]interface{}{
+			"record_id":     id.String(),
+			"employee_name": strings.TrimSpace(oldFirst + " " + oldLast),
+		})
+	}
+
 	// Fetch updated employee
 	h.GetEmployee(c)
 }
@@ -817,16 +868,35 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 	// Delete linked user by employee_id
 	h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
 
-	// Also delete by email as fallback (covers cases where employee_id link was not set)
+	// Email fallback covers legacy rows where employee_id was never linked —
+	// but it must never remove a user that belongs to a DIFFERENT employee
+	// sharing the same mailbox.
 	if empEmail.Valid && empEmail.String != "" {
-		h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND email = $2`, tenantID, empEmail.String)
+		h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND email = $2 AND (employee_id IS NULL OR employee_id = $3)`, tenantID, empEmail.String, id)
 	}
 
 	// Clean up employee permissions and organization assignments
 	h.db.Exec(`DELETE FROM employee_module_permissions WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
 	h.db.Exec(`DELETE FROM employee_organizations WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
 
+	if userID, uok := middleware.GetUserID(c); uok {
+		h.writeEmployeeAudit(tenantID, userID, "delete", id, nil, nil)
+	}
+
 	response.NoContent(c)
+}
+
+// writeEmployeeAudit records an employee mutation in audit_logs (same
+// pattern as writeLeadAudit). Errors are logged, never surfaced.
+func (h *Handler) writeEmployeeAudit(tenantID, userID uuid.UUID, action string, employeeID uuid.UUID, oldValues, newValues map[string]interface{}) {
+	oldJSON, _ := json.Marshal(oldValues)
+	newJSON, _ := json.Marshal(newValues)
+	if _, err := h.db.Exec(`
+		INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
+		VALUES ($1, $2, $3, $4, 'employee', $5, $6, $7, NOW())
+	`, uuid.New(), tenantID, userID, action, employeeID, oldJSON, newJSON); err != nil {
+		h.log.Error("Failed to write employee audit log", "error", err, "employee_id", employeeID)
+	}
 }
 
 // Helper functions to parse stored JSON in notes field

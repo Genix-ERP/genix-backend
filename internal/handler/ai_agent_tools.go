@@ -115,6 +115,12 @@ func agentTools() []agentTool {
 			exec:        toolFindEmployees,
 		},
 		{
+			name:        "hr_stats",
+			description: "HR summary numbers: total/active/on-leave/terminated employees, hires and exits this month, active salary fund, headcount by department. Answers 'nechta xodim bor', 'bu oy nechta xodim olindi', 'maosh fondi qancha', 'qaysi bo'limda nechta xodim'.",
+			parameters:  obj(map[string]interface{}{}),
+			exec:        toolHRStats,
+		},
+		{
 			name:        "list_expenses",
 			description: "List recent expenses (amount, description, vendor/employee, status). Optional status filter.",
 			parameters:  obj(map[string]interface{}{"status": str("Optional status."), "limit": intp("Max rows (default 10, max 50).")}),
@@ -1338,7 +1344,7 @@ func toolFindEmployees(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg in
 	rows, err := h.db.Query(`
 		SELECT TRIM(COALESCE(first_name,'')||' '||COALESCE(last_name,'')), COALESCE(job_title,''), COALESCE(phone,''), COALESCE(status,'')
 		FROM employees
-		WHERE tenant_id=$1 AND ($3::uuid IS NULL OR organization_id=$3)
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($3::uuid IS NULL OR organization_id=$3)
 		  AND (COALESCE(first_name,'')||' '||COALESCE(last_name,'')) ILIKE '%'||$2||'%'
 		ORDER BY first_name ASC LIMIT 10`, tenantID, q, orgArg)
 	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
@@ -1348,6 +1354,46 @@ func toolFindEmployees(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg in
 		}
 		return gin.H{"name": name, "job_title": title, "phone": phone, "status": st}, true
 	})
+}
+
+func toolHRStats(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	var total, active, onLeave, terminated, hiredThisMonth, exitsThisMonth int
+	var salaryFund float64
+	err := h.db.QueryRow(`
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE status = 'active'),
+		       COUNT(*) FILTER (WHERE status = 'on_leave'),
+		       COUNT(*) FILTER (WHERE status = 'terminated'),
+		       COUNT(*) FILTER (WHERE date_trunc('month', hire_date) = date_trunc('month', CURRENT_DATE)),
+		       COUNT(*) FILTER (WHERE termination_date IS NOT NULL AND date_trunc('month', termination_date) = date_trunc('month', CURRENT_DATE)),
+		       COALESCE(SUM(base_salary) FILTER (WHERE status = 'active'), 0)
+		FROM employees
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id = $2)`,
+		tenantID, orgArg).Scan(&total, &active, &onLeave, &terminated, &hiredThisMonth, &exitsThisMonth, &salaryFund)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := h.db.Query(`
+		SELECT COALESCE(d.name, ''), COUNT(*) FROM employees e
+		LEFT JOIN departments d ON d.id = e.department_id AND d.deleted_at IS NULL
+		WHERE e.tenant_id = $1 AND e.deleted_at IS NULL AND ($2::uuid IS NULL OR e.organization_id = $2)
+		GROUP BY 1 ORDER BY 2 DESC LIMIT 10`, tenantID, orgArg)
+	depts := []gin.H{}
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			var cnt int
+			if rows.Scan(&name, &cnt) == nil {
+				depts = append(depts, gin.H{"department": name, "count": cnt})
+			}
+		}
+	}
+	return gin.H{
+		"total": total, "active": active, "on_leave": onLeave, "terminated": terminated,
+		"hired_this_month": hiredThisMonth, "exits_this_month": exitsThisMonth,
+		"salary_fund": salaryFund, "by_department": depts,
+	}, nil
 }
 
 func toolListExpenses(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
