@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,34 +18,30 @@ import (
 // Fixed Assets v1 — asset lifecycle + lifecycle postings (§4, §5, §9).
 // ============================================================================
 
-// Fixed posting accounts from the §5 templates (not type-dependent).
-const (
-	faAcctAcquisition = "0820" // capital investment: purchase lands here, cleared on commission
-	faAcctAP          = "6010" // accounts payable (supplier debt)
-	faAcctCash        = "5010"
-	faAcctBank        = "5110"
-	faAcctVATInput    = "4410"
-	faAcctDisposal    = "9210" // disposal of fixed assets
-)
+// Lifecycle posting accounts were hardcoded here (0820/6010/5010/5110/4410/9210)
+// until migration 453 moved them into fa_settings — see lifecycleAccounts().
 
 type createAssetInput struct {
-	Name              string  `json:"name"`
-	CategoryID        string  `json:"category_id"`
-	DepartmentID      string  `json:"department_id"`
-	SerialNumber      string  `json:"serial_number"`
-	Location          string  `json:"location"`
-	PurchaseDate      string  `json:"purchase_date"` // YYYY-MM-DD
-	Cost              float64 `json:"cost"`
-	SalvageValue      float64 `json:"salvage_value"`
-	UsefulLifeMonths  int     `json:"useful_life_months"`
-	Method            string  `json:"method"`
-	VatAmount         float64 `json:"vat_amount"`
-	SupplierID        string  `json:"supplier_id"`
-	PaymentMethod     string  `json:"payment_method"` // 'cash' | 'credit'
-	DocNumber         string  `json:"doc_number"`
-	DocDate           string  `json:"doc_date"`
-	CommissionNow     *bool   `json:"commission_now"`     // default true (§2.3 "darhol")
-	CommissioningDate string  `json:"commissioning_date"` // used when CommissionNow is false
+	Name                 string  `json:"name"`
+	CategoryID           string  `json:"category_id"`
+	DepartmentID         string  `json:"department_id"`
+	SerialNumber         string  `json:"serial_number"`
+	Location             string  `json:"location"`
+	PurchaseDate         string  `json:"purchase_date"` // YYYY-MM-DD
+	Cost                 float64 `json:"cost"`
+	SalvageValue         float64 `json:"salvage_value"`
+	UsefulLifeMonths     int     `json:"useful_life_months"`
+	Method               string  `json:"method"`
+	VatAmount            float64 `json:"vat_amount"`
+	SupplierID           string  `json:"supplier_id"`
+	PaymentMethod        string  `json:"payment_method"` // 'cash' | 'credit'
+	DocNumber            string  `json:"doc_number"`
+	DocDate              string  `json:"doc_date"`
+	CommissionNow        *bool   `json:"commission_now"`     // default true (§2.3 "darhol")
+	CommissioningDate    string  `json:"commissioning_date"` // honored for commission_now too
+	AssignedEmployeeID   string  `json:"assigned_employee_id"`
+	ConstructionObjectID string  `json:"construction_object_id"`
+	Notes                string  `json:"notes"`
 }
 
 // CreateAsset creates an asset (draft), posts the purchase (+VAT +payment), and
@@ -146,29 +143,39 @@ func (h *Handler) CreateAsset(c *gin.Context) {
 	if sid, err := uuid.Parse(in.SupplierID); err == nil {
 		supplierPtr = sid
 	}
+	var employeePtr, objectPtr interface{}
+	if eid, err := uuid.Parse(in.AssignedEmployeeID); err == nil {
+		employeePtr = eid
+	}
+	// construction_projects uses BIGSERIAL ids.
+	if oid, err := strconv.ParseInt(in.ConstructionObjectID, 10, 64); err == nil && oid > 0 {
+		objectPtr = oid
+	}
 
 	assetID := uuid.New()
 	_, err = tx.Exec(`
 		INSERT INTO fa_assets (
 			id, tenant_id, organization_id, inventory_number, name, category_id, department_id,
 			serial_number, location, purchase_date, cost, salvage_value, useful_life_months, method,
-			status, supplier_id, payment_method, doc_number, doc_date, created_by, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'draft',$15,$16,$17,$18,$19,NOW(),NOW())`,
+			status, supplier_id, payment_method, doc_number, doc_date,
+			assigned_employee_id, construction_object_id, notes, created_by, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'draft',$15,$16,$17,$18,$19,$20,$21,$22,NOW(),NOW())`,
 		assetID, tenantID, orgPtr, inv, strings.TrimSpace(in.Name), catID, deptID,
 		nullIfEmpty(in.SerialNumber), nullIfEmpty(in.Location), purchaseDate, in.Cost, in.SalvageValue,
 		in.UsefulLifeMonths, method, supplierPtr, nullIfEmpty(in.PaymentMethod), nullIfEmpty(in.DocNumber),
-		parseDatePtr(in.DocDate), userID)
+		parseDatePtr(in.DocDate), employeePtr, objectPtr, nullIfEmpty(in.Notes), userID)
 	if err != nil {
 		faErr(c, http.StatusInternalServerError, "SAVE_FAILED", "Aktivni saqlab bo'lmadi", "Не удалось сохранить актив")
 		return
 	}
 
+	acc := h.lifecycleAccounts(tenantID)
 	journalID, nextNum, prefix := faGetJournal(tx, tenantID)
 
-	// Purchase: Дт 0820 Кт 6010 (cost ex-VAT). Always booked, even for cash.
+	// Purchase: Дт acquisition (0820) Кт AP (6010), cost ex-VAT. Always booked.
 	if _, e := h.faPostJournal(tx, tenantID, orgPtr, journalID,
 		fmt.Sprintf("%s%06d", prefix, nextNum), inv+"-BUY", "Aktiv xaridi: "+in.Name, "asset_purchase", assetID, purchaseDate,
-		[]faJELine{{Code: faAcctAcquisition, Debit: in.Cost, Desc: "Kapital qo'yilma"}, {Code: faAcctAP, Credit: in.Cost, Desc: "Ta'minotchiga qarz"}}); e != nil {
+		[]faJELine{{Code: acc.Acquisition, Debit: in.Cost, Desc: "Kapital qo'yilma"}, {Code: acc.AP, Credit: in.Cost, Desc: "Ta'minotchiga qarz"}}); e != nil {
 		faErr(c, http.StatusBadRequest, "POSTING_FAILED", "Xarid provodkasi: "+e.Error(), "Проводка покупки: "+e.Error())
 		return
 	}
@@ -178,7 +185,7 @@ func (h *Handler) CreateAsset(c *gin.Context) {
 	if in.VatAmount > 0 {
 		if _, e := h.faPostJournal(tx, tenantID, orgPtr, journalID,
 			fmt.Sprintf("%s%06d", prefix, nextNum), inv+"-VAT", "QQS: "+in.Name, "asset_vat", assetID, purchaseDate,
-			[]faJELine{{Code: faAcctVATInput, Debit: in.VatAmount, Desc: "QQS hisobga olish"}, {Code: faAcctAP, Credit: in.VatAmount, Desc: "Ta'minotchiga qarz (QQS)"}}); e != nil {
+			[]faJELine{{Code: acc.VATInput, Debit: in.VatAmount, Desc: "QQS hisobga olish"}, {Code: acc.AP, Credit: in.VatAmount, Desc: "Ta'minotchiga qarz (QQS)"}}); e != nil {
 			faErr(c, http.StatusBadRequest, "POSTING_FAILED", "QQS provodkasi: "+e.Error(), "Проводка НДС: "+e.Error())
 			return
 		}
@@ -187,23 +194,29 @@ func (h *Handler) CreateAsset(c *gin.Context) {
 
 	// Payment (cash): Дт 6010 Кт 5010/5110. Credit purchase leaves debt on 6010.
 	if in.PaymentMethod == "cash" || in.PaymentMethod == "bank" {
-		payCredit := faAcctCash
+		payCredit := acc.Cash
 		if in.PaymentMethod == "bank" {
-			payCredit = faAcctBank
+			payCredit = acc.Bank
 		}
 		if _, e := h.faPostJournal(tx, tenantID, orgPtr, journalID,
 			fmt.Sprintf("%s%06d", prefix, nextNum), inv+"-PAY", "To'lov: "+in.Name, "asset_payment", assetID, purchaseDate,
-			[]faJELine{{Code: faAcctAP, Debit: in.Cost + in.VatAmount, Desc: "Qarz yopilishi"}, {Code: payCredit, Credit: in.Cost + in.VatAmount, Desc: "To'lov"}}); e != nil {
+			[]faJELine{{Code: acc.AP, Debit: in.Cost + in.VatAmount, Desc: "Qarz yopilishi"}, {Code: payCredit, Credit: in.Cost + in.VatAmount, Desc: "To'lov"}}); e != nil {
 			faErr(c, http.StatusBadRequest, "POSTING_FAILED", "To'lov provodkasi: "+e.Error(), "Проводка оплаты: "+e.Error())
 			return
 		}
 		nextNum++
 	}
 
-	// Immediate commission (§2.3): Дт asset_account Кт 0820, status -> in_service.
+	// Immediate commission (§2.3): Дт asset_account Кт acquisition, in_service.
+	// The commissioning date defaults to the purchase date but an explicit
+	// commissioning_date wins (audit: the form previously ignored it).
 	commissioned := false
 	if commissionNow {
-		if e := h.faCommissionInTx(tx, tenantID, orgPtr, assetID, in.Name, catAsset, in.Cost, purchaseDate, journalID, &nextNum, prefix); e != nil {
+		commDate := purchaseDate
+		if d, e := time.Parse("2006-01-02", in.CommissioningDate); e == nil {
+			commDate = d
+		}
+		if e := h.faCommissionInTx(tx, tenantID, orgPtr, assetID, in.Name, catAsset, acc.Acquisition, in.Cost, commDate, journalID, &nextNum, prefix); e != nil {
 			faErr(c, http.StatusBadRequest, "POSTING_FAILED", "Ishga tushirish: "+e.Error(), "Ввод в эксплуатацию: "+e.Error())
 			return
 		}
@@ -216,6 +229,11 @@ func (h *Handler) CreateAsset(c *gin.Context) {
 		return
 	}
 
+	if commissioned {
+		h.EmitWorkflowEvent(tenantID, "assets.commissioned", map[string]interface{}{
+			"record_id": assetID.String(), "inventory_number": inv, "asset_name": in.Name, "cost": in.Cost,
+		})
+	}
 	faOK(c, gin.H{"id": assetID, "inventory_number": inv, "status": statusOf(commissioned)})
 }
 
@@ -227,14 +245,14 @@ func statusOf(commissioned bool) string {
 }
 
 // faCommissionInTx books the commission entry and flips status to in_service.
-func (h *Handler) faCommissionInTx(tx *sql.Tx, tenantID uuid.UUID, orgPtr *uuid.UUID, assetID uuid.UUID, name, assetAccount string, cost float64, commDate time.Time, journalID uuid.UUID, nextNum *int, prefix string) error {
+func (h *Handler) faCommissionInTx(tx *sql.Tx, tenantID uuid.UUID, orgPtr *uuid.UUID, assetID uuid.UUID, name, assetAccount, acquisitionAccount string, cost float64, commDate time.Time, journalID uuid.UUID, nextNum *int, prefix string) error {
 	if _, e := h.faPostJournal(tx, tenantID, orgPtr, journalID,
 		fmt.Sprintf("%s%06d", prefix, *nextNum), "COMM", "Foydalanishga topshirish: "+name, "asset_commission", assetID, commDate,
-		[]faJELine{{Code: assetAccount, Debit: cost, Desc: "Asosiy vosita"}, {Code: faAcctAcquisition, Credit: cost, Desc: "Kapital qo'yilma yopilishi"}}); e != nil {
+		[]faJELine{{Code: assetAccount, Debit: cost, Desc: "Asosiy vosita"}, {Code: acquisitionAccount, Credit: cost, Desc: "Kapital qo'yilma yopilishi"}}); e != nil {
 		return e
 	}
 	*nextNum++
-	_, err := tx.Exec(`UPDATE fa_assets SET status='in_service', commissioning_date=$1, updated_at=NOW() WHERE id=$2`, commDate, assetID)
+	_, err := tx.Exec(`UPDATE fa_assets SET status='in_service', commissioning_date=$1, updated_at=NOW() WHERE id=$2 AND tenant_id=$3`, commDate, assetID, tenantID)
 	return err
 }
 
@@ -271,12 +289,13 @@ func (h *Handler) CommissionAsset(c *gin.Context) {
 		faErr(c, http.StatusBadRequest, "INVALID_STATUS", "Faqat qoralama aktivni ishga tushirish mumkin", "Ввести можно только черновик")
 		return
 	}
-	eff, err := h.effectiveAccountsForAsset(assetID)
+	eff, err := h.effectiveAccountsForAsset(tenantID, assetID)
 	if err != nil || eff.AssetCode == "" {
 		faErr(c, http.StatusBadRequest, "MAPPING_MISSING", "Aktiv hisobi sozlanmagan", "Счёт актива не настроен")
 		return
 	}
 	effAsset := eff.AssetCode
+	acc := h.lifecycleAccounts(tenantID)
 
 	commDate := time.Now()
 	if in.CommissioningDate != "" {
@@ -292,7 +311,7 @@ func (h *Handler) CommissionAsset(c *gin.Context) {
 	}
 	defer tx.Rollback()
 	journalID, nextNum, prefix := faGetJournal(tx, tenantID)
-	if e := h.faCommissionInTx(tx, tenantID, orgPtr, assetID, name, effAsset, cost, commDate, journalID, &nextNum, prefix); e != nil {
+	if e := h.faCommissionInTx(tx, tenantID, orgPtr, assetID, name, effAsset, acc.Acquisition, cost, commDate, journalID, &nextNum, prefix); e != nil {
 		faErr(c, http.StatusBadRequest, "POSTING_FAILED", "Ishga tushirish: "+e.Error(), "Ввод: "+e.Error())
 		return
 	}
@@ -301,6 +320,11 @@ func (h *Handler) CommissionAsset(c *gin.Context) {
 		faErr(c, http.StatusInternalServerError, "TX_FAILED", "Xatolik", "Ошибка")
 		return
 	}
+	var inv string
+	h.db.QueryRow(`SELECT inventory_number FROM fa_assets WHERE id=$1 AND tenant_id=$2`, assetID, tenantID).Scan(&inv)
+	h.EmitWorkflowEvent(tenantID, "assets.commissioned", map[string]interface{}{
+		"record_id": assetID.String(), "inventory_number": inv, "asset_name": name, "cost": cost,
+	})
 	faOK(c, gin.H{"id": assetID, "status": "in_service", "commissioning_date": commDate.Format("2006-01-02")})
 }
 
@@ -330,13 +354,22 @@ func (h *Handler) faSetStatus(c *gin.Context, from, to string) {
 }
 
 type disposeInput struct {
-	DisposalDate string `json:"disposal_date"`
-	Reason       string `json:"reason"`
+	DisposalDate string  `json:"disposal_date"`
+	DisposalType string  `json:"disposal_type"` // 'sale' | 'writeoff' (default)
+	SalePrice    float64 `json:"sale_price"`    // required when disposal_type='sale'
+	Reason       string  `json:"reason"`
 }
 
-// DisposeAsset tops up depreciation for the disposal month (§6.3) then writes the
-// asset off: Дт 9210 Кт asset_account (cost); Дт depreciation_account Кт 9210
-// (accumulated). Terminal (§4).
+// DisposeAsset tops up depreciation for the disposal month (§6.3) then retires
+// the asset through the disposal transit account (9210 by default):
+//
+//	Дт disposal            Кт asset_account       (cost)
+//	Дт depreciation_acct   Кт disposal            (accumulated)
+//	sale only: Дт receivable Кт disposal          (sale price)
+//	result:    Дт loss / Кт gain                  (closes the transit to zero)
+//
+// The transit account always nets to zero, so the gain/loss lands on the
+// tenant-configured result accounts. Terminal (§4).
 // POST /api/v1/assets/:id/dispose
 func (h *Handler) DisposeAsset(c *gin.Context) {
 	tenantID, _ := middleware.GetTenantID(c)
@@ -358,18 +391,23 @@ func (h *Handler) DisposeAsset(c *gin.Context) {
 			disposalDate = d
 		}
 	}
+	isSale := in.DisposalType == "sale"
+	if isSale && in.SalePrice <= 0 {
+		faErr(c, http.StatusBadRequest, "INVALID_SALE_PRICE", "Sotish narxi 0 dan katta bo'lishi kerak", "Цена продажи должна быть больше 0")
+		return
+	}
 	period := disposalDate.Format("2006-01")
 	if msg := h.checkPeriodLock(tenantID, disposalDate); msg != "" {
 		faErr(c, http.StatusBadRequest, "PERIOD_CLOSED", msg, msg)
 		return
 	}
 
-	var name, status string
+	var name, inv, status string
 	var cost, salvage, accumulated float64
 	var lifeMonths int
-	err = h.db.QueryRow(`SELECT name, status::text, cost, salvage_value, useful_life_months, accumulated_depreciation
+	err = h.db.QueryRow(`SELECT name, inventory_number, status::text, cost, salvage_value, useful_life_months, accumulated_depreciation
 		FROM fa_assets WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`, assetID, tenantID).
-		Scan(&name, &status, &cost, &salvage, &lifeMonths, &accumulated)
+		Scan(&name, &inv, &status, &cost, &salvage, &lifeMonths, &accumulated)
 	if err != nil {
 		faErr(c, http.StatusNotFound, "NOT_FOUND", "Aktiv topilmadi", "Актив не найден")
 		return
@@ -382,11 +420,12 @@ func (h *Handler) DisposeAsset(c *gin.Context) {
 		faErr(c, http.StatusBadRequest, "INVALID_STATUS", "Ishga tushmagan aktivni chiqarib bo'lmaydi", "Нельзя выбыть не введённый актив")
 		return
 	}
-	eff, err := h.effectiveAccountsForAsset(assetID)
+	eff, err := h.effectiveAccountsForAsset(tenantID, assetID)
 	if err != nil {
 		faErr(c, http.StatusInternalServerError, "MAPPING_MISSING", "Hisoblar topilmadi", "Счета не найдены")
 		return
 	}
+	acc := h.lifecycleAccounts(tenantID)
 
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -404,7 +443,7 @@ func (h *Handler) DisposeAsset(c *gin.Context) {
 			tenantID, assetID, period).Scan(&exists)
 		if !exists {
 			var priorPeriods int
-			tx.QueryRow(`SELECT COUNT(*) FROM fa_depreciation_entries WHERE asset_id=$1 AND status='active'`, assetID).Scan(&priorPeriods)
+			tx.QueryRow(`SELECT COUNT(*) FROM fa_depreciation_entries WHERE asset_id=$1 AND tenant_id=$2 AND status='active'`, assetID, tenantID).Scan(&priorPeriods)
 			amt := faAccrualAmount(cost, salvage, accumulated, lifeMonths, priorPeriods, rounding)
 			if amt > 0 {
 				jeID, e := h.faPostJournal(tx, tenantID, orgPtr, journalID,
@@ -426,20 +465,37 @@ func (h *Handler) DisposeAsset(c *gin.Context) {
 		}
 	}
 
-	// §5 disposal postings. Дт 9210 Кт asset (cost); Дт depreciation Кт 9210 (accum).
-	lines := []faJELine{{Code: faAcctDisposal, Debit: cost, Desc: "Chiqarish (balans qiymati)"}, {Code: eff.AssetCode, Credit: cost, Desc: "Asosiy vosita hisobdan chiqarish"}}
+	// §5 disposal postings through the transit account, closed to gain/loss so
+	// it always nets to zero. book value = cost − accumulated;
+	// result = sale price − book value (write-off: result = −book value).
+	bookValue := faRound(cost-accumulated, 2)
+	lines := []faJELine{{Code: acc.Disposal, Debit: cost, Desc: "Chiqarish (tannarx)"}, {Code: eff.AssetCode, Credit: cost, Desc: "Asosiy vosita hisobdan chiqarish"}}
 	if accumulated > 0 && eff.DepreciationCode != "" {
-		lines = append(lines, faJELine{Code: eff.DepreciationCode, Debit: accumulated, Desc: "Yig'ilgan amortizatsiya yopilishi"}, faJELine{Code: faAcctDisposal, Credit: accumulated, Desc: "Chiqarish"})
+		lines = append(lines, faJELine{Code: eff.DepreciationCode, Debit: accumulated, Desc: "Yig'ilgan amortizatsiya yopilishi"}, faJELine{Code: acc.Disposal, Credit: accumulated, Desc: "Chiqarish"})
+	}
+	result := -bookValue
+	if isSale {
+		lines = append(lines, faJELine{Code: acc.DisposalReceivable, Debit: in.SalePrice, Desc: "Sotish tushumi (debitor)"}, faJELine{Code: acc.Disposal, Credit: in.SalePrice, Desc: "Sotish"})
+		result = faRound(in.SalePrice-bookValue, 2)
+	}
+	if result > 0 {
+		lines = append(lines, faJELine{Code: acc.Disposal, Debit: result, Desc: "Chiqarish yakuni"}, faJELine{Code: acc.DisposalGain, Credit: result, Desc: "Chiqarishdan foyda"})
+	} else if result < 0 {
+		lines = append(lines, faJELine{Code: acc.DisposalLoss, Debit: -result, Desc: "Chiqarishdan zarar"}, faJELine{Code: acc.Disposal, Credit: -result, Desc: "Chiqarish yakuni"})
 	}
 	if _, e := h.faPostJournal(tx, tenantID, orgPtr, journalID,
-		fmt.Sprintf("%s%06d", prefix, nextNum), name+"-DISP", "Aktiv chiqarilishi: "+name, "asset_disposal", assetID, disposalDate, lines); e != nil {
+		fmt.Sprintf("%s%06d", prefix, nextNum), inv+"-DISP", "Aktiv chiqarilishi: "+name, "asset_disposal", assetID, disposalDate, lines); e != nil {
 		faErr(c, http.StatusBadRequest, "POSTING_FAILED", "Chiqarish: "+e.Error(), "Выбытие: "+e.Error())
 		return
 	}
 	nextNum++
 
-	if _, err := tx.Exec(`UPDATE fa_assets SET status='disposed', disposal_date=$1, notes=COALESCE(notes,'')||$2, updated_at=NOW() WHERE id=$3`,
-		disposalDate, "\nChiqarish sababi: "+in.Reason, assetID); err != nil {
+	var saleAmt interface{}
+	if isSale {
+		saleAmt = in.SalePrice
+	}
+	if _, err := tx.Exec(`UPDATE fa_assets SET status='disposed', disposal_date=$1, disposal_amount=$2, disposal_reason=$3, updated_at=NOW() WHERE id=$4 AND tenant_id=$5`,
+		disposalDate, saleAmt, nullIfEmpty(in.Reason), assetID, tenantID); err != nil {
 		faErr(c, http.StatusInternalServerError, "SAVE_FAILED", "Xatolik", "Ошибка")
 		return
 	}
@@ -448,7 +504,12 @@ func (h *Handler) DisposeAsset(c *gin.Context) {
 		faErr(c, http.StatusInternalServerError, "TX_FAILED", "Xatolik", "Ошибка")
 		return
 	}
-	faOK(c, gin.H{"id": assetID, "status": "disposed"})
+	h.EmitWorkflowEvent(tenantID, "assets.disposed", map[string]interface{}{
+		"record_id": assetID.String(), "inventory_number": inv, "asset_name": name,
+		"disposal_type": map[bool]string{true: "sale", false: "writeoff"}[isSale],
+		"book_value":    bookValue, "sale_price": in.SalePrice, "gain_loss": result, "reason": in.Reason,
+	})
+	faOK(c, gin.H{"id": assetID, "status": "disposed", "book_value": bookValue, "gain_loss": result})
 }
 
 type changeParamsInput struct {
@@ -629,7 +690,7 @@ func (h *Handler) GetAssetSchedule(c *gin.Context) {
 	sched := []row{}
 	acc := accumulated
 	var prior0 int
-	h.db.QueryRow(`SELECT COUNT(*) FROM fa_depreciation_entries WHERE asset_id=$1 AND status='active'`, assetID).Scan(&prior0)
+	h.db.QueryRow(`SELECT COUNT(*) FROM fa_depreciation_entries WHERE asset_id=$1 AND tenant_id=$2 AND status='active'`, assetID, tenantID).Scan(&prior0)
 	// Start from the month after commissioning (or now if not commissioned).
 	start := time.Now()
 	if commissioning.Valid {
@@ -642,7 +703,7 @@ func (h *Handler) GetAssetSchedule(c *gin.Context) {
 			break
 		}
 		acc += amt
-		sched = append(sched, row{Period: p.Format("2006-01"), Amount: amt, Accumulated: acc, BookValue: cost - acc})
+		sched = append(sched, row{Period: p.Format("2006-01"), Amount: amt, Accumulated: faRound(acc, 2), BookValue: faRound(cost-acc, 2)})
 		p = p.AddDate(0, 1, 0)
 	}
 	faOK(c, sched)
@@ -654,10 +715,13 @@ func (h *Handler) ListAssets(c *gin.Context) {
 	rows, err := h.db.Query(`
 		SELECT a.id, a.inventory_number, a.name, a.status::text, a.cost, a.salvage_value, a.useful_life_months,
 		       a.accumulated_depreciation, (a.cost - a.accumulated_depreciation) AS book_value,
-		       c.name_uz, d.name_uz, COALESCE(a.serial_number,''), a.purchase_date, a.commissioning_date
+		       a.category_id, c.name_uz, d.name_uz, COALESCE(a.serial_number,''), a.purchase_date, a.commissioning_date,
+		       COALESCE(e.first_name || ' ' || e.last_name, ''), COALESCE(cp.name, '')
 		FROM fa_assets a
 		JOIN fa_categories c ON c.id = a.category_id
 		JOIN fa_departments d ON d.id = a.department_id
+		LEFT JOIN employees e ON e.id = a.assigned_employee_id
+		LEFT JOIN construction_projects cp ON cp.id = a.construction_object_id
 		WHERE a.tenant_id=$1 AND a.deleted_at IS NULL
 		ORDER BY a.inventory_number`, tenantID)
 	if err != nil {
@@ -675,18 +739,22 @@ func (h *Handler) ListAssets(c *gin.Context) {
 		UsefulLifeMonths  int        `json:"useful_life_months"`
 		Accumulated       float64    `json:"accumulated_depreciation"`
 		BookValue         float64    `json:"book_value"`
+		CategoryID        string     `json:"category_id"`
 		CategoryName      string     `json:"category_name"`
 		DepartmentName    string     `json:"department_name"`
 		SerialNumber      string     `json:"serial_number"`
 		PurchaseDate      time.Time  `json:"purchase_date"`
 		CommissioningDate *time.Time `json:"commissioning_date"`
+		AssignedEmpName   string     `json:"assigned_employee_name"`
+		ObjectName        string     `json:"construction_object_name"`
 	}
 	out := []asset{}
 	for rows.Next() {
 		var a asset
 		var comm sql.NullTime
 		if rows.Scan(&a.ID, &a.InventoryNumber, &a.Name, &a.Status, &a.Cost, &a.SalvageValue, &a.UsefulLifeMonths,
-			&a.Accumulated, &a.BookValue, &a.CategoryName, &a.DepartmentName, &a.SerialNumber, &a.PurchaseDate, &comm) == nil {
+			&a.Accumulated, &a.BookValue, &a.CategoryID, &a.CategoryName, &a.DepartmentName, &a.SerialNumber,
+			&a.PurchaseDate, &comm, &a.AssignedEmpName, &a.ObjectName) == nil {
 			if comm.Valid {
 				a.CommissioningDate = &comm.Time
 			}
@@ -696,6 +764,112 @@ func (h *Handler) ListAssets(c *gin.Context) {
 	faOK(c, out)
 }
 
+type updateAssetInfoInput struct {
+	Name                 *string `json:"name"`
+	SerialNumber         *string `json:"serial_number"`
+	Location             *string `json:"location"`
+	Notes                *string `json:"notes"`
+	AssignedEmployeeID   *string `json:"assigned_employee_id"`   // "" clears
+	ConstructionObjectID *string `json:"construction_object_id"` // "" clears
+	DepartmentID         *string `json:"department_id"`
+}
+
+// UpdateAssetInfo patches the operational (non-financial) fields of an asset.
+// Financial parameters go through /change-params, GL accounts through
+// /accounts — this endpoint deliberately cannot touch money.
+// PATCH /api/v1/assets/:id
+func (h *Handler) UpdateAssetInfo(c *gin.Context) {
+	tenantID, _ := middleware.GetTenantID(c)
+	userID, _ := middleware.GetUserID(c)
+	assetID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		faErr(c, http.StatusBadRequest, "INVALID_INPUT", "ID noto'g'ri", "Некорректный ID")
+		return
+	}
+	var in updateAssetInfoInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		faErr(c, http.StatusBadRequest, "INVALID_INPUT", "Ma'lumot noto'g'ri", "Некорректные данные")
+		return
+	}
+	var exists bool
+	h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM fa_assets WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL)`, assetID, tenantID).Scan(&exists)
+	if !exists {
+		faErr(c, http.StatusNotFound, "NOT_FOUND", "Aktiv topilmadi", "Актив не найден")
+		return
+	}
+
+	sets := []string{}
+	args := []interface{}{}
+	arg := 1
+	addSet := func(col string, v interface{}) {
+		sets = append(sets, fmt.Sprintf("%s=$%d", col, arg))
+		args = append(args, v)
+		arg++
+	}
+	if in.Name != nil && strings.TrimSpace(*in.Name) != "" {
+		addSet("name", strings.TrimSpace(*in.Name))
+	}
+	if in.SerialNumber != nil {
+		addSet("serial_number", nullIfEmpty(*in.SerialNumber))
+	}
+	if in.Location != nil {
+		addSet("location", nullIfEmpty(*in.Location))
+	}
+	if in.Notes != nil {
+		addSet("notes", nullIfEmpty(*in.Notes))
+	}
+	if in.AssignedEmployeeID != nil {
+		if *in.AssignedEmployeeID == "" {
+			addSet("assigned_employee_id", nil)
+		} else if eid, e := uuid.Parse(*in.AssignedEmployeeID); e == nil {
+			var ok bool
+			h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM employees WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL)`, eid, tenantID).Scan(&ok)
+			if !ok {
+				faErr(c, http.StatusBadRequest, "INVALID_INPUT", "Xodim topilmadi", "Сотрудник не найден")
+				return
+			}
+			addSet("assigned_employee_id", eid)
+		}
+	}
+	if in.ConstructionObjectID != nil {
+		if *in.ConstructionObjectID == "" {
+			addSet("construction_object_id", nil)
+		} else if oid, e := strconv.ParseInt(*in.ConstructionObjectID, 10, 64); e == nil && oid > 0 {
+			var ok bool
+			h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM construction_projects WHERE id=$1 AND tenant_id=$2)`, oid, tenantID).Scan(&ok)
+			if !ok {
+				faErr(c, http.StatusBadRequest, "INVALID_INPUT", "Obyekt topilmadi", "Объект не найден")
+				return
+			}
+			addSet("construction_object_id", oid)
+		}
+	}
+	if in.DepartmentID != nil {
+		if did, e := uuid.Parse(*in.DepartmentID); e == nil {
+			var ok bool
+			h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM fa_departments WHERE id=$1 AND tenant_id=$2)`, did, tenantID).Scan(&ok)
+			if !ok {
+				faErr(c, http.StatusBadRequest, "INVALID_INPUT", "Bo'lim topilmadi", "Подразделение не найдено")
+				return
+			}
+			addSet("department_id", did)
+		}
+	}
+	if len(sets) == 0 {
+		faErr(c, http.StatusBadRequest, "NOTHING_TO_CHANGE", "O'zgartirish yo'q", "Нечего менять")
+		return
+	}
+	args = append(args, assetID, tenantID)
+	q := fmt.Sprintf("UPDATE fa_assets SET %s, updated_at=NOW() WHERE id=$%d AND tenant_id=$%d", strings.Join(sets, ", "), arg, arg+1)
+	if _, err := h.db.Exec(q, args...); err != nil {
+		faErr(c, http.StatusInternalServerError, "SAVE_FAILED", "Xatolik", "Ошибка")
+		return
+	}
+	h.faAudit(tenantID, userID, "fa_asset", assetID, "update_info", nil,
+		map[string]interface{}{"name": in.Name, "assigned_employee_id": in.AssignedEmployeeID, "construction_object_id": in.ConstructionObjectID, "department_id": in.DepartmentID})
+	faOK(c, gin.H{"id": assetID, "message": "Yangilandi"})
+}
+
 func (h *Handler) GetAsset(c *gin.Context) {
 	tenantID, _ := middleware.GetTenantID(c)
 	assetID, err := uuid.Parse(c.Param("id"))
@@ -703,31 +877,90 @@ func (h *Handler) GetAsset(c *gin.Context) {
 		faErr(c, http.StatusBadRequest, "INVALID_INPUT", "ID noto'g'ri", "Некорректный ID")
 		return
 	}
-	eff, _ := h.effectiveAccountsForAsset(assetID)
 	var out struct {
-		ID              string  `json:"id"`
-		InventoryNumber string  `json:"inventory_number"`
-		Name            string  `json:"name"`
-		Status          string  `json:"status"`
-		Cost            float64 `json:"cost"`
-		Salvage         float64 `json:"salvage_value"`
-		Life            int     `json:"useful_life_months"`
-		Accumulated     float64 `json:"accumulated_depreciation"`
-		CategoryID      string  `json:"category_id"`
-		DepartmentID    string  `json:"department_id"`
-		EffAsset        string  `json:"effective_asset_account"`
-		EffDepr         string  `json:"effective_depreciation_account"`
-		EffExpense      string  `json:"effective_expense_account"`
+		ID                string     `json:"id"`
+		InventoryNumber   string     `json:"inventory_number"`
+		Name              string     `json:"name"`
+		Status            string     `json:"status"`
+		Cost              float64    `json:"cost"`
+		Salvage           float64    `json:"salvage_value"`
+		Life              int        `json:"useful_life_months"`
+		Method            string     `json:"method"`
+		Accumulated       float64    `json:"accumulated_depreciation"`
+		BookValue         float64    `json:"book_value"`
+		CategoryID        string     `json:"category_id"`
+		CategoryName      string     `json:"category_name"`
+		DepartmentID      string     `json:"department_id"`
+		DepartmentName    string     `json:"department_name"`
+		SerialNumber      string     `json:"serial_number"`
+		Location          string     `json:"location"`
+		Notes             string     `json:"notes"`
+		PurchaseDate      *time.Time `json:"purchase_date"`
+		CommissioningDate *time.Time `json:"commissioning_date"`
+		DisposalDate      *time.Time `json:"disposal_date"`
+		DisposalAmount    *float64   `json:"disposal_amount"`
+		DisposalReason    string     `json:"disposal_reason"`
+		SupplierID        *string    `json:"supplier_id"`
+		SupplierName      string     `json:"supplier_name"`
+		DocNumber         string     `json:"doc_number"`
+		AssignedEmpID     *string    `json:"assigned_employee_id"`
+		AssignedEmpName   string     `json:"assigned_employee_name"`
+		ObjectID          *string    `json:"construction_object_id"`
+		ObjectName        string     `json:"construction_object_name"`
+		PurchaseOrderID   *string    `json:"purchase_order_id"`
+		EffAsset          string     `json:"effective_asset_account"`
+		EffDepr           string     `json:"effective_depreciation_account"`
+		EffExpense        string     `json:"effective_expense_account"`
 	}
-	err = h.db.QueryRow(`SELECT id, inventory_number, name, status::text, cost, salvage_value, useful_life_months,
-		accumulated_depreciation, category_id, department_id
-		FROM fa_assets WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`, assetID, tenantID).
+	var purchaseDate time.Time
+	var comm, disp sql.NullTime
+	var dispAmt sql.NullFloat64
+	var serial, location, notes, dispReason, supName, empName, objName, docNum sql.NullString
+	var supID, empID, objID, poID sql.NullString
+	err = h.db.QueryRow(`
+		SELECT a.id, a.inventory_number, a.name, a.status::text, a.cost, a.salvage_value, a.useful_life_months,
+		       a.method, a.accumulated_depreciation, a.category_id, c.name_uz, a.department_id, d.name_uz,
+		       a.serial_number, a.location, a.notes, a.purchase_date, a.commissioning_date,
+		       a.disposal_date, a.disposal_amount, a.disposal_reason,
+		       a.supplier_id::text, COALESCE(ct.name, ''), a.doc_number,
+		       a.assigned_employee_id::text, COALESCE(e.first_name || ' ' || e.last_name, ''),
+		       a.construction_object_id::text, COALESCE(cp.name, ''), a.purchase_order_id::text
+		FROM fa_assets a
+		JOIN fa_categories c ON c.id = a.category_id
+		JOIN fa_departments d ON d.id = a.department_id
+		LEFT JOIN contacts ct ON ct.id = a.supplier_id
+		LEFT JOIN employees e ON e.id = a.assigned_employee_id
+		LEFT JOIN construction_projects cp ON cp.id = a.construction_object_id
+		WHERE a.id=$1 AND a.tenant_id=$2 AND a.deleted_at IS NULL`, assetID, tenantID).
 		Scan(&out.ID, &out.InventoryNumber, &out.Name, &out.Status, &out.Cost, &out.Salvage, &out.Life,
-			&out.Accumulated, &out.CategoryID, &out.DepartmentID)
+			&out.Method, &out.Accumulated, &out.CategoryID, &out.CategoryName, &out.DepartmentID, &out.DepartmentName,
+			&serial, &location, &notes, &purchaseDate, &comm, &disp, &dispAmt, &dispReason,
+			&supID, &supName, &docNum, &empID, &empName, &objID, &objName, &poID)
 	if err != nil {
 		faErr(c, http.StatusNotFound, "NOT_FOUND", "Aktiv topilmadi", "Актив не найден")
 		return
 	}
+	out.BookValue = out.Cost - out.Accumulated
+	out.SerialNumber, out.Location, out.Notes = serial.String, location.String, notes.String
+	out.DisposalReason, out.SupplierName, out.DocNumber = dispReason.String, supName.String, docNum.String
+	out.AssignedEmpName, out.ObjectName = empName.String, objName.String
+	out.PurchaseDate = &purchaseDate
+	if comm.Valid {
+		out.CommissioningDate = &comm.Time
+	}
+	if disp.Valid {
+		out.DisposalDate = &disp.Time
+	}
+	if dispAmt.Valid {
+		out.DisposalAmount = &dispAmt.Float64
+	}
+	for src, dst := range map[*sql.NullString]**string{&supID: &out.SupplierID, &empID: &out.AssignedEmpID, &objID: &out.ObjectID, &poID: &out.PurchaseOrderID} {
+		if src.Valid && src.String != "" {
+			s := src.String
+			*dst = &s
+		}
+	}
+	eff, _ := h.effectiveAccountsForAsset(tenantID, assetID)
 	out.EffAsset, out.EffDepr, out.EffExpense = eff.AssetCode, eff.DepreciationCode, eff.ExpenseCode
 	faOK(c, out)
 }

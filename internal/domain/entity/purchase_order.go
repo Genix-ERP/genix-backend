@@ -23,36 +23,36 @@ const (
 
 // PurchaseOrder represents a purchase order
 type PurchaseOrder struct {
-	ID              uuid.UUID           `json:"id" db:"id"`
-	TenantID        uuid.UUID           `json:"tenant_id" db:"tenant_id"`
-	OrderNumber     string              `json:"order_number" db:"order_number"`
-	VendorID        uuid.UUID           `json:"vendor_id" db:"vendor_id"`
-	ContactPersonID *uuid.UUID          `json:"contact_person_id,omitempty" db:"contact_person_id"`
-	OrderDate       time.Time           `json:"order_date" db:"order_date"`
-	ExpectedDate    *time.Time          `json:"expected_date,omitempty" db:"expected_date"`
-	CurrencyID      *uuid.UUID          `json:"currency_id,omitempty" db:"currency_id"`
-	ExchangeRate    float64             `json:"exchange_rate" db:"exchange_rate"`
-	Subtotal        float64             `json:"subtotal" db:"subtotal"`
-	DiscountAmount  float64             `json:"discount_amount" db:"discount_amount"`
-	TaxAmount       float64             `json:"tax_amount" db:"tax_amount"`
-	ShippingAmount  float64             `json:"shipping_amount" db:"shipping_amount"`
-	TotalAmount     float64             `json:"total_amount" db:"total_amount"`
-	Status          PurchaseOrderStatus `json:"status" db:"status"`
-	PaymentStatus   PaymentStatus       `json:"payment_status" db:"payment_status"`
-	PaymentTerms    *int                `json:"payment_terms,omitempty" db:"payment_terms"`
-	References      json.RawMessage     `json:"references" db:"references"`
-	VendorReference *string             `json:"vendor_reference,omitempty" db:"vendor_reference"`
-	Notes           *string             `json:"notes,omitempty" db:"notes"`
-	InternalNotes   *string             `json:"internal_notes,omitempty" db:"internal_notes"`
+	ID               uuid.UUID           `json:"id" db:"id"`
+	TenantID         uuid.UUID           `json:"tenant_id" db:"tenant_id"`
+	OrderNumber      string              `json:"order_number" db:"order_number"`
+	VendorID         uuid.UUID           `json:"vendor_id" db:"vendor_id"`
+	ContactPersonID  *uuid.UUID          `json:"contact_person_id,omitempty" db:"contact_person_id"`
+	OrderDate        time.Time           `json:"order_date" db:"order_date"`
+	ExpectedDate     *time.Time          `json:"expected_date,omitempty" db:"expected_date"`
+	CurrencyID       *uuid.UUID          `json:"currency_id,omitempty" db:"currency_id"`
+	ExchangeRate     float64             `json:"exchange_rate" db:"exchange_rate"`
+	Subtotal         float64             `json:"subtotal" db:"subtotal"`
+	DiscountAmount   float64             `json:"discount_amount" db:"discount_amount"`
+	TaxAmount        float64             `json:"tax_amount" db:"tax_amount"`
+	ShippingAmount   float64             `json:"shipping_amount" db:"shipping_amount"`
+	TotalAmount      float64             `json:"total_amount" db:"total_amount"`
+	Status           PurchaseOrderStatus `json:"status" db:"status"`
+	PaymentStatus    PaymentStatus       `json:"payment_status" db:"payment_status"`
+	PaymentTerms     *int                `json:"payment_terms,omitempty" db:"payment_terms"`
+	References       json.RawMessage     `json:"references" db:"references"`
+	VendorReference  *string             `json:"vendor_reference,omitempty" db:"vendor_reference"`
+	Notes            *string             `json:"notes,omitempty" db:"notes"`
+	InternalNotes    *string             `json:"internal_notes,omitempty" db:"internal_notes"`
 	WarehouseID      *uuid.UUID          `json:"warehouse_id,omitempty" db:"warehouse_id"`
 	VehicleNumber    *string             `json:"vehicle_number,omitempty" db:"vehicle_number"`
 	RequiresShipping bool                `json:"requires_shipping" db:"requires_shipping"`
 	RequestedBy      *uuid.UUID          `json:"requested_by,omitempty" db:"requested_by"`
-	ApprovedBy      *uuid.UUID          `json:"approved_by,omitempty" db:"approved_by"`
-	ApprovedAt      *time.Time          `json:"approved_at,omitempty" db:"approved_at"`
-	CreatedAt       time.Time           `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time           `json:"updated_at" db:"updated_at"`
-	DeletedAt       sql.NullTime        `json:"-" db:"deleted_at"`
+	ApprovedBy       *uuid.UUID          `json:"approved_by,omitempty" db:"approved_by"`
+	ApprovedAt       *time.Time          `json:"approved_at,omitempty" db:"approved_at"`
+	CreatedAt        time.Time           `json:"created_at" db:"created_at"`
+	UpdatedAt        time.Time           `json:"updated_at" db:"updated_at"`
+	DeletedAt        sql.NullTime        `json:"-" db:"deleted_at"`
 
 	// Relationships
 	VendorName string              `json:"vendor_name,omitempty"`
@@ -93,25 +93,28 @@ type PurchaseOrderLine struct {
 
 // CreatePurchaseOrderInput represents input for creating a purchase order
 type CreatePurchaseOrderInput struct {
-	OrderNumber     string                         `json:"order_number,omitempty"`
-	VendorID        string                         `json:"vendor_id" binding:"required"`
-	ContactPersonID string                         `json:"contact_person_id,omitempty"`
-	OrderDate       string                         `json:"order_date,omitempty"`
-	ExpectedDate    string                         `json:"expected_date,omitempty"`
-	CurrencyID      string                         `json:"currency_id,omitempty"`
-	ExchangeRate    float64                        `json:"exchange_rate,omitempty"`
-	PaymentTerms    string                         `json:"payment_terms,omitempty"`
-	VendorReference string                         `json:"vendor_reference,omitempty"`
-	Notes           string                         `json:"notes,omitempty"`
-	InternalNotes   string                         `json:"internal_notes,omitempty"`
-	WarehouseID      string                         `json:"warehouse_id,omitempty"`
-	VehicleNumber    string                         `json:"vehicle_number,omitempty"`
-	RequiresShipping *bool                          `json:"requires_shipping,omitempty"`
-	ShippingAmount   float64                        `json:"shipping_amount,omitempty"`
-	Subtotal         float64                        `json:"subtotal,omitempty"`
-	TaxAmount        float64                        `json:"tax_amount,omitempty"`
-	TotalAmount      float64                        `json:"total_amount,omitempty"`
-	Lines            []CreatePurchaseOrderLineInput `json:"lines" binding:"required,min=1"`
+	OrderNumber      string  `json:"order_number,omitempty"`
+	VendorID         string  `json:"vendor_id" binding:"required"`
+	ContactPersonID  string  `json:"contact_person_id,omitempty"`
+	OrderDate        string  `json:"order_date,omitempty"`
+	ExpectedDate     string  `json:"expected_date,omitempty"`
+	CurrencyID       string  `json:"currency_id,omitempty"`
+	ExchangeRate     float64 `json:"exchange_rate,omitempty"`
+	PaymentTerms     string  `json:"payment_terms,omitempty"`
+	VendorReference  string  `json:"vendor_reference,omitempty"`
+	Notes            string  `json:"notes,omitempty"`
+	InternalNotes    string  `json:"internal_notes,omitempty"`
+	WarehouseID      string  `json:"warehouse_id,omitempty"`
+	VehicleNumber    string  `json:"vehicle_number,omitempty"`
+	RequiresShipping *bool   `json:"requires_shipping,omitempty"`
+	// Qurilish obyekti bog'i (migration 450): received lines feed the
+	// object's actual cost (construction_expense_lines).
+	ConstructionProjectID *int64                         `json:"construction_project_id,omitempty"`
+	ShippingAmount        float64                        `json:"shipping_amount,omitempty"`
+	Subtotal              float64                        `json:"subtotal,omitempty"`
+	TaxAmount             float64                        `json:"tax_amount,omitempty"`
+	TotalAmount           float64                        `json:"total_amount,omitempty"`
+	Lines                 []CreatePurchaseOrderLineInput `json:"lines" binding:"required,min=1"`
 }
 
 // CreatePurchaseOrderLineInput represents input for a line item
@@ -132,19 +135,20 @@ type CreatePurchaseOrderLineInput struct {
 
 // UpdatePurchaseOrderInput represents input for updating a purchase order
 type UpdatePurchaseOrderInput struct {
-	VendorID        *string                        `json:"vendor_id,omitempty"`
-	ContactPersonID *string                        `json:"contact_person_id,omitempty"`
-	ExpectedDate    *string                        `json:"expected_date,omitempty"`
-	PaymentTerms    *string                        `json:"payment_terms,omitempty"`
-	VendorReference *string                        `json:"vendor_reference,omitempty"`
-	Notes           *string                        `json:"notes,omitempty"`
-	InternalNotes   *string                        `json:"internal_notes,omitempty"`
-	WarehouseID      *string                        `json:"warehouse_id,omitempty"`
-	VehicleNumber    *string                        `json:"vehicle_number,omitempty"`
-	RequiresShipping *bool                          `json:"requires_shipping,omitempty"`
-	ShippingAmount   *float64                       `json:"shipping_amount,omitempty"`
-	Status           *string                        `json:"status,omitempty"`
-	Lines           []CreatePurchaseOrderLineInput `json:"lines,omitempty"`
+	ConstructionProjectID *int64                         `json:"construction_project_id,omitempty"`
+	VendorID              *string                        `json:"vendor_id,omitempty"`
+	ContactPersonID       *string                        `json:"contact_person_id,omitempty"`
+	ExpectedDate          *string                        `json:"expected_date,omitempty"`
+	PaymentTerms          *string                        `json:"payment_terms,omitempty"`
+	VendorReference       *string                        `json:"vendor_reference,omitempty"`
+	Notes                 *string                        `json:"notes,omitempty"`
+	InternalNotes         *string                        `json:"internal_notes,omitempty"`
+	WarehouseID           *string                        `json:"warehouse_id,omitempty"`
+	VehicleNumber         *string                        `json:"vehicle_number,omitempty"`
+	RequiresShipping      *bool                          `json:"requires_shipping,omitempty"`
+	ShippingAmount        *float64                       `json:"shipping_amount,omitempty"`
+	Status                *string                        `json:"status,omitempty"`
+	Lines                 []CreatePurchaseOrderLineInput `json:"lines,omitempty"`
 }
 
 // ReceivePurchaseOrderInput represents input for receiving a purchase order
@@ -171,29 +175,35 @@ type PurchaseOrderListFilter struct {
 
 // PurchaseOrderResponse represents the API response for a purchase order
 type PurchaseOrderResponse struct {
-	ID              uuid.UUID           `json:"id"`
-	OrderNumber     string              `json:"order_number"`
-	VendorID        uuid.UUID           `json:"vendor_id"`
-	VendorName      string              `json:"vendor_name"`
-	ContactPersonID *uuid.UUID          `json:"contact_person_id,omitempty"`
-	OrderDate       time.Time           `json:"order_date"`
-	ExpectedDate    *time.Time          `json:"expected_date,omitempty"`
-	Subtotal        float64             `json:"subtotal"`
-	DiscountAmount  float64             `json:"discount_amount"`
-	TaxAmount       float64             `json:"tax_amount"`
-	ShippingAmount  float64             `json:"shipping_amount"`
-	TotalAmount     float64             `json:"total_amount"`
-	Status          PurchaseOrderStatus `json:"status"`
-	PaymentStatus   PaymentStatus       `json:"payment_status"`
-	PaymentTerms    *int                `json:"payment_terms,omitempty"`
+	ID               uuid.UUID           `json:"id"`
+	OrderNumber      string              `json:"order_number"`
+	VendorID         uuid.UUID           `json:"vendor_id"`
+	VendorName       string              `json:"vendor_name"`
+	ContactPersonID  *uuid.UUID          `json:"contact_person_id,omitempty"`
+	OrderDate        time.Time           `json:"order_date"`
+	ExpectedDate     *time.Time          `json:"expected_date,omitempty"`
+	Subtotal         float64             `json:"subtotal"`
+	DiscountAmount   float64             `json:"discount_amount"`
+	TaxAmount        float64             `json:"tax_amount"`
+	ShippingAmount   float64             `json:"shipping_amount"`
+	TotalAmount      float64             `json:"total_amount"`
+	Status           PurchaseOrderStatus `json:"status"`
+	PaymentStatus    PaymentStatus       `json:"payment_status"`
+	PaymentTerms     *int                `json:"payment_terms,omitempty"`
 	VendorReference  *string             `json:"vendor_reference,omitempty"`
 	Notes            *string             `json:"notes,omitempty"`
 	VehicleNumber    *string             `json:"vehicle_number,omitempty"`
 	RequiresShipping bool                `json:"requires_shipping"`
-	Lines            []PurchaseOrderLine `json:"lines,omitempty"`
-	ApprovedAt       *time.Time          `json:"approved_at,omitempty"`
-	CreatedAt       time.Time           `json:"created_at"`
-	UpdatedAt       time.Time           `json:"updated_at"`
+	// Currency: stored since 002 but never read back until the Xarid v2
+	// audit (finding #8 — "decorative multi-currency").
+	CurrencyID            *uuid.UUID          `json:"currency_id,omitempty"`
+	CurrencyCode          string              `json:"currency_code,omitempty"`
+	ExchangeRate          float64             `json:"exchange_rate,omitempty"`
+	ConstructionProjectID *int64              `json:"construction_project_id,omitempty"`
+	Lines                 []PurchaseOrderLine `json:"lines,omitempty"`
+	ApprovedAt            *time.Time          `json:"approved_at,omitempty"`
+	CreatedAt             time.Time           `json:"created_at"`
+	UpdatedAt             time.Time           `json:"updated_at"`
 }
 
 // CreateDebitNoteInput represents input for creating a debit note from a purchase invoice

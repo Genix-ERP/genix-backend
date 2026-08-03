@@ -114,7 +114,7 @@ type faEffectiveAccounts struct {
 // effectiveAccountsForAsset joins an asset to its category + department and
 // applies per-asset overrides (§2.6). Missing pieces come back as empty strings
 // so callers can report precise "MAPPING_MISSING" reasons.
-func (h *Handler) effectiveAccountsForAsset(assetID uuid.UUID) (faEffectiveAccounts, error) {
+func (h *Handler) effectiveAccountsForAsset(tenantID, assetID uuid.UUID) (faEffectiveAccounts, error) {
 	var e faEffectiveAccounts
 	var catAsset, catDepr sql.NullString
 	var deptExpense sql.NullString
@@ -127,8 +127,8 @@ func (h *Handler) effectiveAccountsForAsset(assetID uuid.UUID) (faEffectiveAccou
 		FROM fa_assets a
 		JOIN fa_categories  c ON c.id = a.category_id
 		JOIN fa_departments d ON d.id = a.department_id
-		WHERE a.id = $1
-	`, assetID).Scan(&catAsset, &catDepr, &depreciable, &deptExpense, &ovAsset, &ovDepr, &ovExpense)
+		WHERE a.id = $1 AND a.tenant_id = $2
+	`, assetID, tenantID).Scan(&catAsset, &catDepr, &depreciable, &deptExpense, &ovAsset, &ovDepr, &ovExpense)
 	if err != nil {
 		return e, err
 	}
@@ -183,4 +183,37 @@ func (h *Handler) nextInventoryNumber(tx *sql.Tx, tenantID uuid.UUID) (string, e
 // faOK is a tiny success helper so we always emit a body (TZ §9 incident ref).
 func faOK(c *gin.Context, data interface{}) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// faLifecycleAccounts are the tenant-editable accounts used by lifecycle
+// postings (purchase, VAT, payment, commission clearing, disposal). Formerly
+// hardcoded constants in fa_assets.go; since migration 453 they live in
+// fa_settings with NSBU defaults.
+type faLifecycleAccounts struct {
+	Acquisition        string // 0810 kapital qo'yilma
+	AP                 string // 6010 ta'minotchilar
+	Cash               string // 5010
+	Bank               string // 5110
+	VATInput           string // 4410
+	Disposal           string // 9210 chiqib ketish (tranzit)
+	DisposalGain       string // 9310
+	DisposalLoss       string // 9490
+	DisposalReceivable string // 4790 (sotish tushumi)
+}
+
+// lifecycleAccounts loads the tenant's lifecycle accounts, falling back to the
+// NSBU defaults when the settings row is missing (pre-453 tenants get the row
+// via the migration; this is belt-and-braces).
+func (h *Handler) lifecycleAccounts(tenantID uuid.UUID) faLifecycleAccounts {
+	a := faLifecycleAccounts{
+		Acquisition: "0810", AP: "6010", Cash: "5010", Bank: "5110", VATInput: "4410",
+		Disposal: "9210", DisposalGain: "9310", DisposalLoss: "9490", DisposalReceivable: "4790",
+	}
+	h.db.QueryRow(`
+		SELECT acquisition_account, ap_account, cash_account, bank_account, vat_input_account,
+		       disposal_account, disposal_gain_account, disposal_loss_account, disposal_receivable_account
+		FROM fa_settings WHERE tenant_id = $1`, tenantID).
+		Scan(&a.Acquisition, &a.AP, &a.Cash, &a.Bank, &a.VATInput,
+			&a.Disposal, &a.DisposalGain, &a.DisposalLoss, &a.DisposalReceivable)
+	return a
 }

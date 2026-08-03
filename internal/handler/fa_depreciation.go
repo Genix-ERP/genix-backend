@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -93,10 +94,13 @@ func (h *Handler) createDepreciationRun(tenantID, userID uuid.UUID, period strin
 		return uuid.Nil, "PERIOD_CLOSED", msg
 	}
 
-	// One run per period. Posted -> conflict; draft -> replace.
+	// One LIVE run per period (456: reversed runs stay as audit history and do
+	// not block a re-run). Posted -> conflict; draft -> replace.
 	var existingID uuid.UUID
 	var existingStatus string
-	if h.db.QueryRow(`SELECT id, status FROM fa_depreciation_runs WHERE tenant_id=$1 AND period=$2`, tenantID, period).
+	if h.db.QueryRow(`SELECT id, status FROM fa_depreciation_runs
+		WHERE tenant_id=$1 AND period=$2 AND status <> 'reversed'
+		ORDER BY created_at DESC LIMIT 1`, tenantID, period).
 		Scan(&existingID, &existingStatus) == nil {
 		if existingStatus == "posted" {
 			return uuid.Nil, "RUN_ALREADY_POSTED", "Bu davr uchun reglament allaqachon o'tkazilgan. Avval revers qiling."
@@ -170,7 +174,7 @@ func (h *Handler) createDepreciationRun(tenantID, userID uuid.UUID, period strin
 		}
 
 		var priorPeriods int
-		h.db.QueryRow(`SELECT COUNT(*) FROM fa_depreciation_entries WHERE asset_id=$1 AND status='active'`, assetID).Scan(&priorPeriods)
+		h.db.QueryRow(`SELECT COUNT(*) FROM fa_depreciation_entries WHERE asset_id=$1 AND tenant_id=$2 AND status='active'`, assetID, tenantID).Scan(&priorPeriods)
 
 		amount := faAccrualAmount(cost, salvage, accumulated, life, priorPeriods, rounding)
 		if amount <= 0 {
@@ -313,8 +317,8 @@ func (h *Handler) ExcludeFromRun(c *gin.Context) {
 		return
 	}
 	var inv string
-	h.db.QueryRow(`SELECT inventory_number FROM fa_assets WHERE id=$1`, assetID).Scan(&inv)
-	h.db.Exec(`DELETE FROM fa_depreciation_entries WHERE run_id=$1 AND asset_id=$2 AND status='active'`, runID, assetID)
+	h.db.QueryRow(`SELECT inventory_number FROM fa_assets WHERE id=$1 AND tenant_id=$2`, assetID, tenantID).Scan(&inv)
+	h.db.Exec(`DELETE FROM fa_depreciation_entries WHERE run_id=$1 AND asset_id=$2 AND tenant_id=$3 AND status='active'`, runID, assetID, tenantID)
 	// Append to skipped.
 	var skippedJSON string
 	h.db.QueryRow(`SELECT skipped::text FROM fa_depreciation_runs WHERE id=$1`, runID).Scan(&skippedJSON)
@@ -405,7 +409,122 @@ func (h *Handler) postDepreciationRun(tenantID, userID uuid.UUID, runID uuid.UUI
 	if err := tx.Commit(); err != nil {
 		return "TX_FAILED", "Xatolik"
 	}
+
+	var grand float64
+	for _, e := range entries {
+		grand += e.amount
+	}
+	h.EmitWorkflowEvent(tenantID, "assets.depreciation_posted", map[string]interface{}{
+		"record_id": runID.String(), "period": period, "total_amount": faRound(grand, 2), "asset_count": len(entries),
+	})
+	// assets.fully_depreciated — fires exactly once: only for assets this run's
+	// entry pushed onto the salvage floor (before the entry they were below it).
+	frows, err := h.db.Query(`
+		SELECT a.id, a.inventory_number, a.name, a.cost - a.salvage_value
+		FROM fa_assets a
+		JOIN fa_depreciation_entries e ON e.asset_id = a.id AND e.run_id = $1 AND e.status = 'active'
+		WHERE a.tenant_id = $2
+		  AND a.accumulated_depreciation >= a.cost - a.salvage_value - 0.005
+		  AND a.accumulated_depreciation - e.amount < a.cost - a.salvage_value - 0.005`, runID, tenantID)
+	if err == nil {
+		for frows.Next() {
+			var id uuid.UUID
+			var inv, name string
+			var base float64
+			if frows.Scan(&id, &inv, &name, &base) == nil {
+				h.EmitWorkflowEvent(tenantID, "assets.fully_depreciated", map[string]interface{}{
+					"record_id": id.String(), "inventory_number": inv, "asset_name": name, "depreciable_base": faRound(base, 2),
+				})
+			}
+		}
+		frows.Close()
+	}
 	return "", ""
+}
+
+// ListDepreciationRuns returns the tenant's run journal (newest first) plus
+// gap detection: past months since the first commissioning that have no
+// posted run (§ Amortizatsiya tab; audit "unposted-gap warning").
+// GET /api/v1/depreciation/runs
+func (h *Handler) ListDepreciationRuns(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		faErr(c, http.StatusUnauthorized, "UNAUTHORIZED", "Tenant topilmadi", "Тенант не найден")
+		return
+	}
+	type run struct {
+		ID             string     `json:"id"`
+		Period         string     `json:"period"`
+		Status         string     `json:"status"`
+		Total          float64    `json:"total"`
+		LineCount      int        `json:"line_count"`
+		SkippedCount   int        `json:"skipped_count"`
+		CreatedAt      time.Time  `json:"created_at"`
+		PostedAt       *time.Time `json:"posted_at"`
+		PostedByName   string     `json:"posted_by_name"`
+		JournalEntryID *string    `json:"journal_entry_id"`
+	}
+	out := []run{}
+	rows, err := h.db.Query(`
+		SELECT r.id, r.period, r.status,
+		       COALESCE((SELECT SUM(e.amount) FROM fa_depreciation_entries e WHERE e.run_id = r.id AND e.status='active'), 0),
+		       COALESCE((SELECT COUNT(*) FROM fa_depreciation_entries e WHERE e.run_id = r.id AND e.status='active'), 0),
+		       COALESCE(jsonb_array_length(r.skipped), 0),
+		       r.created_at, r.posted_at, r.journal_entry_id::text,
+		       COALESCE(u.first_name || ' ' || u.last_name, '')
+		FROM fa_depreciation_runs r
+		LEFT JOIN users u ON u.id = r.posted_by
+		WHERE r.tenant_id = $1
+		ORDER BY r.period DESC`, tenantID)
+	if err != nil {
+		faErr(c, http.StatusInternalServerError, "QUERY_FAILED", "Xatolik", "Ошибка")
+		return
+	}
+	defer rows.Close()
+	postedPeriods := map[string]bool{}
+	for rows.Next() {
+		var r run
+		var postedAt sql.NullTime
+		var jeID sql.NullString
+		if rows.Scan(&r.ID, &r.Period, &r.Status, &r.Total, &r.LineCount, &r.SkippedCount,
+			&r.CreatedAt, &postedAt, &jeID, &r.PostedByName) == nil {
+			r.Period = strings.TrimSpace(r.Period)
+			if postedAt.Valid {
+				r.PostedAt = &postedAt.Time
+			}
+			if jeID.Valid && jeID.String != "" {
+				r.JournalEntryID = &jeID.String
+			}
+			if r.Status == "posted" {
+				postedPeriods[r.Period] = true
+			}
+			out = append(out, r)
+		}
+	}
+
+	// Gaps: months from (first commissioning month + 1) through last month with
+	// no posted run. Capped at 24 entries so an old tenant doesn't get a wall.
+	gaps := []string{}
+	var firstComm sql.NullString
+	h.db.QueryRow(`SELECT to_char(MIN(commissioning_date), 'YYYY-MM') FROM fa_assets
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND commissioning_date IS NOT NULL`, tenantID).Scan(&firstComm)
+	if firstComm.Valid && firstComm.String != "" {
+		if start, e := time.Parse("2006-01", firstComm.String); e == nil {
+			p := start.AddDate(0, 1, 0) // depreciation starts the month after commissioning
+			lastClosed := time.Now().AddDate(0, -1, 0).Format("2006-01")
+			for len(gaps) < 24 {
+				period := p.Format("2006-01")
+				if period > lastClosed {
+					break
+				}
+				if !postedPeriods[period] {
+					gaps = append(gaps, period)
+				}
+				p = p.AddDate(0, 1, 0)
+			}
+		}
+	}
+	faOK(c, gin.H{"runs": out, "unposted_gaps": gaps, "suggested_period": time.Now().AddDate(0, -1, 0).Format("2006-01")})
 }
 
 // PostDepreciationRun — POST /api/v1/depreciation/runs/:id/post

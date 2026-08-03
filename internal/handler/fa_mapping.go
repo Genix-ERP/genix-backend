@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"database/sql"
 	"net/http"
 	"strings"
 
@@ -37,6 +38,16 @@ type faSettingsDTO struct {
 	CronEnabled bool   `json:"cron_enabled"`
 	StartRule   string `json:"start_rule"`
 	Rounding    int    `json:"rounding"`
+	// Lifecycle accounts (migration 453) — NSBU defaults, tenant-editable.
+	AcquisitionAccount        string `json:"acquisition_account"`
+	APAccount                 string `json:"ap_account"`
+	CashAccount               string `json:"cash_account"`
+	BankAccount               string `json:"bank_account"`
+	VATInputAccount           string `json:"vat_input_account"`
+	DisposalAccount           string `json:"disposal_account"`
+	DisposalGainAccount       string `json:"disposal_gain_account"`
+	DisposalLossAccount       string `json:"disposal_loss_account"`
+	DisposalReceivableAccount string `json:"disposal_receivable_account"`
 }
 
 // GetAssetMapping returns the tenant's categories, departments and settings.
@@ -76,9 +87,20 @@ func (h *Handler) GetAssetMapping(c *gin.Context) {
 		drows.Close()
 	}
 
-	settings := faSettingsDTO{CronEnabled: true, StartRule: "next_month", Rounding: 2}
-	h.db.QueryRow(`SELECT auto_post, cron_enabled, start_rule, rounding FROM fa_settings WHERE tenant_id = $1`, tenantID).
-		Scan(&settings.AutoPost, &settings.CronEnabled, &settings.StartRule, &settings.Rounding)
+	settings := faSettingsDTO{
+		CronEnabled: true, StartRule: "next_month", Rounding: 2,
+		AcquisitionAccount: "0810", APAccount: "6010", CashAccount: "5010", BankAccount: "5110",
+		VATInputAccount: "4410", DisposalAccount: "9210", DisposalGainAccount: "9310",
+		DisposalLossAccount: "9490", DisposalReceivableAccount: "4790",
+	}
+	h.db.QueryRow(`SELECT auto_post, cron_enabled, start_rule, rounding,
+			acquisition_account, ap_account, cash_account, bank_account, vat_input_account,
+			disposal_account, disposal_gain_account, disposal_loss_account, disposal_receivable_account
+		FROM fa_settings WHERE tenant_id = $1`, tenantID).
+		Scan(&settings.AutoPost, &settings.CronEnabled, &settings.StartRule, &settings.Rounding,
+			&settings.AcquisitionAccount, &settings.APAccount, &settings.CashAccount, &settings.BankAccount,
+			&settings.VATInputAccount, &settings.DisposalAccount, &settings.DisposalGainAccount,
+			&settings.DisposalLossAccount, &settings.DisposalReceivableAccount)
 
 	faOK(c, gin.H{"categories": cats, "departments": depts, "settings": settings})
 }
@@ -174,13 +196,47 @@ func (h *Handler) UpdateAssetMapping(c *gin.Context) {
 		if s.StartRule == "" {
 			s.StartRule = "next_month"
 		}
+		// Lifecycle accounts: every non-empty code must be an active leaf in the
+		// tenant's chart (group whitelists don't apply — these span 08/60/50/51/
+		// 44/92/93/94/48). Empty values fall back to the NSBU defaults.
+		lc := map[string]*string{
+			"0810": &s.AcquisitionAccount, "6010": &s.APAccount, "5010": &s.CashAccount,
+			"5110": &s.BankAccount, "4410": &s.VATInputAccount, "9210": &s.DisposalAccount,
+			"9310": &s.DisposalGainAccount, "9490": &s.DisposalLossAccount, "4790": &s.DisposalReceivableAccount,
+		}
+		for def, field := range lc {
+			*field = strings.TrimSpace(*field)
+			if *field == "" {
+				*field = def
+				continue
+			}
+			var isLeaf sql.NullBool
+			err := h.db.QueryRow(`SELECT COALESCE(is_leaf, true) FROM accounts
+				WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL AND COALESCE(is_active, true) = true`,
+				tenantID, *field).Scan(&isLeaf)
+			if err != nil || !isLeaf.Bool {
+				faErr(c, http.StatusBadRequest, "ACCOUNT_NOT_FOUND",
+					"Hisob ("+*field+") ish rejasida topilmadi yoki guruh hisobi",
+					"Счёт ("+*field+") не найден или групповой")
+				return
+			}
+		}
 		_, err := tx.Exec(`
-			INSERT INTO fa_settings (tenant_id, auto_post, cron_enabled, start_rule, rounding, updated_at)
-			VALUES ($1,$2,$3,$4,$5,NOW())
+			INSERT INTO fa_settings (tenant_id, auto_post, cron_enabled, start_rule, rounding,
+				acquisition_account, ap_account, cash_account, bank_account, vat_input_account,
+				disposal_account, disposal_gain_account, disposal_loss_account, disposal_receivable_account, updated_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
 			ON CONFLICT (tenant_id) DO UPDATE SET
 				auto_post = EXCLUDED.auto_post, cron_enabled = EXCLUDED.cron_enabled,
-				start_rule = EXCLUDED.start_rule, rounding = EXCLUDED.rounding, updated_at = NOW()
-		`, tenantID, s.AutoPost, s.CronEnabled, s.StartRule, s.Rounding)
+				start_rule = EXCLUDED.start_rule, rounding = EXCLUDED.rounding,
+				acquisition_account = EXCLUDED.acquisition_account, ap_account = EXCLUDED.ap_account,
+				cash_account = EXCLUDED.cash_account, bank_account = EXCLUDED.bank_account,
+				vat_input_account = EXCLUDED.vat_input_account, disposal_account = EXCLUDED.disposal_account,
+				disposal_gain_account = EXCLUDED.disposal_gain_account, disposal_loss_account = EXCLUDED.disposal_loss_account,
+				disposal_receivable_account = EXCLUDED.disposal_receivable_account, updated_at = NOW()
+		`, tenantID, s.AutoPost, s.CronEnabled, s.StartRule, s.Rounding,
+			s.AcquisitionAccount, s.APAccount, s.CashAccount, s.BankAccount, s.VATInputAccount,
+			s.DisposalAccount, s.DisposalGainAccount, s.DisposalLossAccount, s.DisposalReceivableAccount)
 		if err != nil {
 			faErr(c, http.StatusInternalServerError, "SAVE_FAILED", "Sozlamalarni saqlab bo'lmadi", "Не удалось сохранить настройки")
 			return
