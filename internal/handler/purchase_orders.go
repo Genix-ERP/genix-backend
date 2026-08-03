@@ -65,9 +65,12 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 			   po.tax_amount, po.shipping_amount, po.total_amount, po.status,
 			   po.payment_status, po.payment_terms, po.vendor_reference, po.notes,
 			   po.vehicle_number, po.requires_shipping,
+			   po.currency_id, COALESCE(cur.code, ''), COALESCE(po.exchange_rate, 1),
+			   po.construction_project_id,
 			   po.approved_at, po.created_at, po.updated_at
 		FROM purchase_orders po
 		LEFT JOIN contacts c ON po.vendor_id = c.id
+		LEFT JOIN currencies cur ON cur.id = po.currency_id
 		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM purchase_orders po WHERE po.tenant_id = $1 AND po.deleted_at IS NULL`
@@ -156,6 +159,8 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 		var approvedAt sql.NullTime
 		var vendorID sql.NullString
 		var vendorName sql.NullString
+		var currencyID sql.NullString
+		var projectID sql.NullInt64
 
 		err := rows.Scan(
 			&po.ID, &po.OrderNumber, &vendorID, &vendorName,
@@ -163,11 +168,21 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 			&po.TaxAmount, &po.ShippingAmount, &po.TotalAmount, &po.Status,
 			&po.PaymentStatus, &paymentTerms, &vendorReference, &notes,
 			&vehicleNumberList, &po.RequiresShipping,
+			&currencyID, &po.CurrencyCode, &po.ExchangeRate,
+			&projectID,
 			&approvedAt, &po.CreatedAt, &po.UpdatedAt,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan purchase order", "error", err)
 			continue
+		}
+		if currencyID.Valid {
+			if cid, cErr := uuid.Parse(currencyID.String); cErr == nil {
+				po.CurrencyID = &cid
+			}
+		}
+		if projectID.Valid {
+			po.ConstructionProjectID = &projectID.Int64
 		}
 
 		if vendorID.Valid {
@@ -298,7 +313,27 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		}
 	}
 
+	// Lock the FX rate at order time (same pattern as CreatePurchaseInvoice).
+	// The old code silently defaulted a foreign-currency PO to rate 1.0
+	// (docs/xarid-audit.md finding #8).
 	exchangeRate := input.ExchangeRate
+	if exchangeRate == 0 && currencyID != nil {
+		var baseCurrencyID uuid.UUID
+		if h.db.QueryRow(`
+			SELECT id FROM currencies
+			WHERE (is_base_currency = true OR code = 'UZS') AND is_active = true
+			ORDER BY is_base_currency DESC LIMIT 1
+		`).Scan(&baseCurrencyID) == nil && baseCurrencyID != *currencyID {
+			var lockedRate float64
+			if h.db.QueryRow(`
+				SELECT rate FROM exchange_rates
+				WHERE from_currency_id = $1 AND to_currency_id = $2
+				ORDER BY effective_date DESC LIMIT 1
+			`, *currencyID, baseCurrencyID).Scan(&lockedRate) == nil && lockedRate > 0 {
+				exchangeRate = lockedRate
+			}
+		}
+	}
 	if exchangeRate == 0 {
 		exchangeRate = 1.0
 	}
@@ -416,8 +451,9 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			subtotal, discount_amount, tax_amount, shipping_amount, total_amount,
 			status, payment_status, payment_terms, vendor_reference,
 			notes, internal_notes, warehouse_id, vehicle_number, requires_shipping, requested_by,
+			construction_project_id,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 	`
 
 	maxAttempts := 5
@@ -432,6 +468,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 			subtotal, discountTotal, taxTotal, input.ShippingAmount, totalAmount,
 			entity.POStatusDraft, entity.PaymentStatusUnpaid, paymentTerms, vendorReference,
 			notes, internalNotes, warehouseID, vehicleNumber, requiresShipping, userID,
+			input.ConstructionProjectID,
 			now, now,
 		)
 		if err == nil {
@@ -556,21 +593,21 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	// Intercompany: SO will be created when PO is confirmed/approved, not at creation time
 
 	resp := &entity.PurchaseOrderResponse{
-		ID:              id,
-		OrderNumber:     orderNumber,
-		VendorID:        vendorID,
-		VendorName:      vendorName,
-		ContactPersonID: contactPersonID,
-		OrderDate:       orderDate,
-		ExpectedDate:    expectedDate,
-		Subtotal:        subtotal,
-		DiscountAmount:  discountTotal,
-		TaxAmount:       taxTotal,
-		ShippingAmount:  input.ShippingAmount,
-		TotalAmount:     totalAmount,
-		Status:          entity.POStatusDraft,
-		PaymentStatus:   entity.PaymentStatusUnpaid,
-		PaymentTerms:    &paymentTerms,
+		ID:               id,
+		OrderNumber:      orderNumber,
+		VendorID:         vendorID,
+		VendorName:       vendorName,
+		ContactPersonID:  contactPersonID,
+		OrderDate:        orderDate,
+		ExpectedDate:     expectedDate,
+		Subtotal:         subtotal,
+		DiscountAmount:   discountTotal,
+		TaxAmount:        taxTotal,
+		ShippingAmount:   input.ShippingAmount,
+		TotalAmount:      totalAmount,
+		Status:           entity.POStatusDraft,
+		PaymentStatus:    entity.PaymentStatusUnpaid,
+		PaymentTerms:     &paymentTerms,
 		VendorReference:  vendorReference,
 		Notes:            notes,
 		VehicleNumber:    vehicleNumber,
@@ -619,9 +656,12 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 			   po.total_amount, po.status, po.payment_status, po.payment_terms,
 			   po.vendor_reference, po.notes,
 			   po.vehicle_number, po.requires_shipping,
+			   po.currency_id, COALESCE(cur.code, ''), COALESCE(po.exchange_rate, 1),
+			   po.construction_project_id,
 			   po.approved_at, po.created_at, po.updated_at
 		FROM purchase_orders po
 		LEFT JOIN contacts c ON po.vendor_id = c.id
+		LEFT JOIN currencies cur ON cur.id = po.currency_id
 		WHERE po.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL
 	`
 
@@ -632,6 +672,8 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	var paymentTerms sql.NullInt32
 	var vendorReference, notes sql.NullString
 	var vehicleNumber sql.NullString
+	var currencyID sql.NullString
+	var projectID sql.NullInt64
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
 		&po.ID, &po.OrderNumber, &vendorID, &vendorName,
@@ -640,6 +682,8 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 		&po.TotalAmount, &po.Status, &po.PaymentStatus, &paymentTerms,
 		&vendorReference, &notes,
 		&vehicleNumber, &po.RequiresShipping,
+		&currencyID, &po.CurrencyCode, &po.ExchangeRate,
+		&projectID,
 		&approvedAt, &po.CreatedAt, &po.UpdatedAt,
 	)
 
@@ -684,6 +728,14 @@ func (h *Handler) GetPurchaseOrder(c *gin.Context) {
 	}
 	if vehicleNumber.Valid {
 		po.VehicleNumber = &vehicleNumber.String
+	}
+	if currencyID.Valid {
+		if cid, cErr := uuid.Parse(currencyID.String); cErr == nil {
+			po.CurrencyID = &cid
+		}
+	}
+	if projectID.Valid {
+		po.ConstructionProjectID = &projectID.Int64
 	}
 
 	// Get line items. alt_name pulls the counterparty's product name (the
@@ -928,6 +980,15 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 			args = append(args, wid)
 		} else {
 			args = append(args, nil)
+		}
+	}
+	if input.ConstructionProjectID != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("construction_project_id = $%d", argCount))
+		if *input.ConstructionProjectID == 0 {
+			args = append(args, nil) // 0 clears the link
+		} else {
+			args = append(args, *input.ConstructionProjectID)
 		}
 	}
 	if input.ContactPersonID != nil {
@@ -2057,6 +2118,7 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		h.log.Info("PO /receive: stock already received via goods receipt or stock operation — updating quantities/status only", "po_id", id)
 	}
 
+	var objectCostLines []poCostLine
 	for _, line := range input.Lines {
 		lineID, err := uuid.Parse(line.LineID)
 		if err != nil {
@@ -2143,7 +2205,18 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		}()
 		if lineErr != nil {
 			h.log.Error("Failed to receive PO line into stock", "error", lineErr, "po_id", id, "product_id", productID)
+		} else {
+			objectCostLines = append(objectCostLines, poCostLine{
+				ProductID: productID, Qty: line.QuantityReceived, UnitPrice: unitPrice,
+			})
 		}
+	}
+
+	// Object cost: a PO linked to a construction project contributes each
+	// received line to construction_expense_lines (migration 450).
+	if !skipStockUpdate {
+		recvUserID, _ := middleware.GetUserID(c)
+		h.addPOReceiptToObjectCost(tenantID, id, objectCostLines, recvUserID)
 	}
 
 	go func() {

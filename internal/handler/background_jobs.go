@@ -53,19 +53,11 @@ func StartBackgroundJobs(db *database.DB, log logger.Logger) {
 		}
 	}()
 
-	// Auto depreciation scheduler — runs every hour, processes on 1st of each month
-	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
-		defer ticker.Stop()
-
-		// Run once on startup after 2 minutes
-		time.Sleep(2 * time.Minute)
-		runAutoDepreciation(db, log)
-
-		for range ticker.C {
-			runAutoDepreciation(db, log)
-		}
-	}()
+	// NOTE: the legacy auto-depreciation job was removed (audit 2026-08-03,
+	// docs/aktivlar-audit.md finding #1): it depreciated the CURRENT month on
+	// the 1st (a month that hadn't happened yet) against the deprecated
+	// fixed_assets register, in parallel with the v2 RunDepreciationCron.
+	// Depreciation is now driven solely by fa_depreciation.go.
 
 	// CRM activity reminders — every minute, fires notifications when
 	// an activity's reminder_datetime has passed and reminder_sent is
@@ -99,7 +91,7 @@ func StartBackgroundJobs(db *database.DB, log logger.Logger) {
 		}
 	}()
 
-	log.Info("Background jobs started (step timeout checker every 15 min, reconciliation reminders every 1 hour, auto depreciation hourly, activity reminders every 1 min, overdue tasks hourly)")
+	log.Info("Background jobs started (step timeout checker every 15 min, reconciliation reminders every 1 hour, activity reminders every 1 min, overdue tasks hourly)")
 }
 
 // checkOverdueTasks finds open tasks whose due_date has passed and that have
@@ -509,222 +501,6 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 	}
 }
 
-// runAutoDepreciation runs monthly depreciation on the 1st of each month.
-// It checks all tenants' active assets and creates depreciation entries automatically.
-func runAutoDepreciation(db *database.DB, log logger.Logger) {
-	now := time.Now()
-
-	// Only run on the 1st day of the month (between midnight and 1am to allow hourly retries)
-	if now.Day() != 1 {
-		return
-	}
-
-	period := now.Format("2006-01")
-	deprDate := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
-	log.Info("Running auto depreciation", "period", period)
-
-	// Get all tenants that have active assets
-	tenantRows, err := db.Query(`
-		SELECT DISTINCT tenant_id FROM fixed_assets
-		WHERE status = 'active' AND deleted_at IS NULL AND remaining_months > 0
-	`)
-	if err != nil {
-		log.Error("Auto depreciation: failed to query tenants", "error", err)
-		return
-	}
-	defer tenantRows.Close()
-
-	totalProcessed := 0
-
-	for tenantRows.Next() {
-		var tenantID uuid.UUID
-		if err := tenantRows.Scan(&tenantID); err != nil {
-			continue
-		}
-
-		// Look up accounts for this tenant
-		deprExpenseAcct := findAccountBg(db, tenantID, "depreciation expense", "9470")
-		accumDeprAcct := findAccountBg(db, tenantID, "accumulated depreciation", "0200")
-		var journalID uuid.UUID
-		var nextNumber int
-		_ = db.QueryRow(`
-			SELECT id, COALESCE(next_number, 1)
-			FROM journals WHERE tenant_id = $1 AND code IN ('ASSET','MISC','GENERAL') AND deleted_at IS NULL
-			ORDER BY CASE code WHEN 'ASSET' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
-			tenantID).Scan(&journalID, &nextNumber)
-
-		// Get all active assets for this tenant
-		assetRows, err := db.Query(`
-			SELECT id, organization_id, acquisition_cost, salvage_value, useful_life_months, depreciation_method,
-				   accumulated_depreciation, COALESCE(current_value, acquisition_cost - accumulated_depreciation),
-				   COALESCE(remaining_months, useful_life_months), COALESCE(monthly_depr, 0)
-			FROM fixed_assets
-			WHERE tenant_id = $1 AND status = 'active' AND deleted_at IS NULL AND remaining_months > 0
-		`, tenantID)
-		if err != nil {
-			log.Error("Auto depreciation: failed to query assets", "tenant", tenantID, "error", err)
-			continue
-		}
-
-		for assetRows.Next() {
-			var assetID uuid.UUID
-			var orgID *uuid.UUID
-			var acquisitionCost, salvageValue, accumulatedDepr, curValue, monthlyDeprAmt float64
-			var usefulLifeMonths, remMonths int
-			var deprMethod string
-
-			if err := assetRows.Scan(&assetID, &orgID, &acquisitionCost, &salvageValue, &usefulLifeMonths,
-				&deprMethod, &accumulatedDepr, &curValue, &remMonths, &monthlyDeprAmt); err != nil {
-				continue
-			}
-
-			// Skip if already depreciated this period
-			var existingID uuid.UUID
-			if db.QueryRow("SELECT id FROM depreciation_entries WHERE asset_id = $1 AND period = $2", assetID, period).Scan(&existingID) == nil {
-				continue
-			}
-
-			// Calculate depreciation
-			depreciableAmount := acquisitionCost - salvageValue
-			remainingValue := depreciableAmount - accumulatedDepr
-			if remainingValue <= 0 {
-				continue
-			}
-
-			// Compute by the asset's method — same logic as RunDepreciation
-			// (fixed_asset.go). Declining-balance methods apply the rate to net
-			// book value (cost − accumulated) and must be recomputed each
-			// period, so the stored straight-line monthly_depr must not
-			// override them (that made every method behave straight-line).
-			var depAmount float64
-			nbv := acquisitionCost - accumulatedDepr
-			switch deprMethod {
-			case "declining_balance":
-				depAmount = nbv * (1.0 / float64(usefulLifeMonths))
-			case "double_declining":
-				depAmount = nbv * (2.0 / float64(usefulLifeMonths))
-			case "straight_line":
-				depAmount = depreciableAmount / float64(usefulLifeMonths)
-			default:
-				if monthlyDeprAmt > 0 {
-					depAmount = monthlyDeprAmt
-				} else {
-					depAmount = depreciableAmount / float64(usefulLifeMonths)
-				}
-			}
-
-			if depAmount > remainingValue {
-				depAmount = remainingValue
-			}
-
-			newAccumulated := accumulatedDepr + depAmount
-			newBookValue := acquisitionCost - newAccumulated
-			newRemaining := remMonths - 1
-			newCurrentValue := curValue - depAmount
-			var newMonthlyDepr float64
-			if newRemaining > 0 {
-				newMonthlyDepr = newCurrentValue / float64(newRemaining)
-			}
-
-			// Insert depreciation entry
-			entryID := uuid.New()
-			if _, err := db.Exec(`
-				INSERT INTO depreciation_entries (
-					id, tenant_id, organization_id, asset_id, period, depreciation_date, depreciation_amount,
-					accumulated_total, book_value_after, depreciation_method, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-				entryID, tenantID, orgID, assetID, period, deprDate, depAmount,
-				newAccumulated, newBookValue, deprMethod, now); err != nil {
-				log.Error("Auto depreciation: failed to insert entry", "asset", assetID, "error", err)
-				continue
-			}
-
-			// Update asset
-			db.Exec(`
-				UPDATE fixed_assets SET
-					accumulated_depreciation = $1, book_value = $2, current_value = $3,
-					remaining_months = $4, monthly_depr = $5, last_depr_date = $6, updated_at = $7
-				WHERE id = $8`,
-				newAccumulated, newBookValue, newCurrentValue, newRemaining, newMonthlyDepr, deprDate, now, assetID)
-
-			// Create journal entry (header + lines + balances in one tx; migration
-			// 416's deferred trigger rejects imbalanced single-line inserts).
-			if deprExpenseAcct != uuid.Nil && accumDeprAcct != uuid.Nil && journalID != uuid.Nil {
-				jeID := uuid.New()
-				entryNumber := fmt.Sprintf("DEP%06d", nextNumber)
-				nextNumber++
-
-				if tx, txErr := db.Begin(); txErr == nil {
-					committed := false
-					func() {
-						defer func() {
-							if !committed {
-								tx.Rollback()
-							}
-						}()
-						if _, e := tx.Exec(`
-							INSERT INTO journal_entries (
-								id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-								source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'depreciation', $9, 1.0, $10, $10, 'posted', $11, $11)`,
-							jeID, tenantID, orgID, journalID, entryNumber, deprDate,
-							period, fmt.Sprintf("Auto amortizatsiya %s", period),
-							assetID.String(), depAmount, now); e != nil {
-							return
-						}
-						if _, e := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-							VALUES ($1, $2, 1, $3, 'Amortizatsiya xarajati', $4, 0, 1.0, $5)`, uuid.New(), jeID, deprExpenseAcct, depAmount, now); e != nil {
-							return
-						}
-						if _, e := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-							VALUES ($1, $2, 2, $3, 'Yig''ilgan amortizatsiya', 0, $4, 1.0, $5)`, uuid.New(), jeID, accumDeprAcct, depAmount, now); e != nil {
-							return
-						}
-						// Debit-positive convention (migration 407): expense +, accumulated depreciation (contra-asset) −.
-						if _, e := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", depAmount, now, deprExpenseAcct); e != nil {
-							return
-						}
-						if _, e := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", depAmount, now, accumDeprAcct); e != nil {
-							return
-						}
-						if _, e := tx.Exec("UPDATE depreciation_entries SET journal_entry_id = $1 WHERE id = $2", jeID, entryID); e != nil {
-							return
-						}
-						if e := tx.Commit(); e == nil {
-							committed = true
-						}
-					}()
-				}
-			}
-
-			totalProcessed++
-		}
-		assetRows.Close()
-
-		// Update journal next_number
-		if journalID != uuid.Nil {
-			db.Exec("UPDATE journals SET next_number = $1, updated_at = $2 WHERE id = $3", nextNumber, now, journalID)
-		}
-	}
-
-	if totalProcessed > 0 {
-		log.Info("Auto depreciation completed", "period", period, "assets_processed", totalProcessed)
-	}
-}
-
-// findAccountBg is a background-job version of findAccount (no handler context needed)
-func findAccountBg(db *database.DB, tenantID uuid.UUID, nameLike, codeFallback string) uuid.UUID {
-	var id uuid.UUID
-	err := db.QueryRow(`
-		SELECT id FROM accounts
-		WHERE tenant_id = $1 AND deleted_at IS NULL AND (LOWER(name) LIKE '%' || $2 || '%' OR code = $3)
-		ORDER BY CASE WHEN code = $3 THEN 0 ELSE 1 END
-		LIMIT 1`, tenantID, nameLike, codeFallback).Scan(&id)
-	if err != nil {
-		return uuid.Nil
-	}
-	return id
-}
 
 // checkActivityReminders scans the `activities` table for any planned
 // activity whose reminder_datetime has passed and whose reminder_sent

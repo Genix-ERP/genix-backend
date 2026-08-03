@@ -988,10 +988,16 @@ func (h *Handler) checkInventoryThresholds(tenantID uuid.UUID) {
 // checkOverdueInvoices emits invoice.overdue once per invoice+rule (30-day
 // re-fire window covers the partial-payment → overdue-again edge case).
 func (h *Handler) checkOverdueInvoices(tenantID uuid.UUID) {
+	// 'partial' included: a partially-paid invoice past due is still overdue.
+	// customer_name COALESCEd from contacts — a NULL used to error the Scan and
+	// silently drop every invoice created via POST /sales-invoices (audit §11).
 	rows, err := h.db.Query(`
-		SELECT id, invoice_number, customer_name, total_amount, due_date
-		FROM sales_invoices
-		WHERE tenant_id = $1 AND status = 'sent' AND due_date < $2 AND deleted_at IS NULL
+		SELECT si.id, si.invoice_number, COALESCE(si.customer_name, c.name, ''), si.total_amount, si.due_date
+		FROM sales_invoices si
+		LEFT JOIN contacts c ON c.id = si.customer_id
+		WHERE si.tenant_id = $1 AND si.status IN ('sent', 'partial', 'overdue')
+		  AND si.amount_paid < si.total_amount
+		  AND si.due_date < $2 AND si.deleted_at IS NULL
 	`, tenantID, time.Now())
 	if err != nil {
 		h.log.Error("Failed to check overdue invoices", "error", err)

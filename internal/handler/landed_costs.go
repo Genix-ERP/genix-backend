@@ -786,30 +786,56 @@ func (h *Handler) ValidateLandedCost(c *gin.Context) {
 				continue
 			}
 
-			// Update inventory unit_cost
-			_, err = h.db.Exec(`
-				UPDATE inventory
-				SET unit_cost = $1, updated_at = $2
-				WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5`,
-				newUnitCost, now, tenantID, productID, whID,
-			)
-			if err != nil {
-				h.log.Error("Failed to update inventory cost", "error", err)
-			}
+			// Value-only adjustment: spread the allocated amount over the
+			// current on-hand quantity (unit_cost += allocated / on_hand).
+			// The old code blindly SET unit_cost = new_unit_cost, wiping the
+			// AVECO average for stock from OTHER receipts too
+			// (docs/xarid-audit.md finding #9). Balance update + self-contained
+			// ledger row (qty 0, value = allocated) share one transaction.
+			lcErr := func() error {
+				tx, txErr := h.db.Begin()
+				if txErr != nil {
+					return txErr
+				}
+				defer tx.Rollback()
 
-			// Create inventory transaction for audit
-			txID := uuid.New()
-			h.db.Exec(`
-				INSERT INTO inventory_transactions (
-					id, tenant_id, inventory_id, transaction_type, quantity,
-					unit_cost, total_cost, reference_type, reference_id,
-					reason, transaction_date, created_at
-				) SELECT $1, $2, id, 'adjustment', 0, $3, $4, 'landed_cost', $5,
-					'Landed cost allocation', $6, $6
-				FROM inventory
-				WHERE tenant_id = $2 AND product_id = $7 AND warehouse_id = $8`,
-				txID, tenantID, newUnitCost, totalAllocated, id, now, productID, whID,
-			)
+				var invID uuid.UUID
+				var onHand float64
+				if scanErr := tx.QueryRow(`
+					SELECT id, quantity_on_hand FROM inventory
+					WHERE tenant_id = $1 AND product_id = $2 AND warehouse_id = $3
+					FOR UPDATE`, tenantID, productID, whID,
+				).Scan(&invID, &onHand); scanErr != nil {
+					return scanErr
+				}
+				if onHand <= 0 {
+					return nil // no stock to carry the cost — skip, JE still books it
+				}
+
+				perUnit := totalAllocated / onHand
+				if _, uErr := tx.Exec(`
+					UPDATE inventory SET unit_cost = unit_cost + $1, updated_at = $2
+					WHERE id = $3`, perUnit, now, invID); uErr != nil {
+					return uErr
+				}
+
+				if _, iErr := tx.Exec(`
+					INSERT INTO inventory_transactions (
+						id, tenant_id, inventory_id, product_id, warehouse_id,
+						transaction_type, quantity, unit_cost, total_cost,
+						reference_type, reference_id, reason, transaction_date, created_at
+					) VALUES ($1, $2, $3, $4, $5, 'landed_cost', 0, $6, $7,
+						'landed_cost', $8, 'Landed cost allocation', $9, $9)`,
+					uuid.New(), tenantID, invID, productID, whID,
+					perUnit, totalAllocated, id, now); iErr != nil {
+					return iErr
+				}
+				return tx.Commit()
+			}()
+			if lcErr != nil && lcErr != sql.ErrNoRows {
+				h.log.Error("Failed to apply landed cost to inventory", "error", lcErr, "product_id", productID)
+			}
+			_ = newUnitCost // legacy per-allocation figure; valuation now derives from allocated/on_hand
 		}
 	}
 

@@ -718,76 +718,77 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 	items := h.loadSalesReturnItems(returnID)
 	var totalCostReversal float64
 
-	for _, item := range items {
-		productIDStr, okPid := item["product_id"].(string)
-		if !okPid || productIDStr == "" {
-			continue
-		}
-		productID, err := uuid.Parse(productIDStr)
-		if err != nil {
-			continue
-		}
-		quantity, _ := item["quantity"].(float64)
-		if quantity <= 0 {
-			continue
-		}
+	// Ombor v2: restock through applyStockDelta in ONE transaction. The old code
+	// picked a warehouse with a blind LIMIT 1 (no org, no ORDER BY), wrote balance
+	// and ledger in separate autocommit statements, and dropped the second error.
+	var orderWarehouseID uuid.UUID
+	if returnSalesOrderID.Valid && returnSalesOrderID.String != "" {
+		_ = h.db.QueryRow(`SELECT warehouse_id FROM sales_orders WHERE id = $1 AND tenant_id = $2`,
+			returnSalesOrderID.String, tenantID).Scan(&orderWarehouseID)
+	}
 
-		// Accumulate cost basis for COGS reversal journal
-		var costPrice float64
-		h.db.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, productID).Scan(&costPrice)
-		totalCostReversal += costPrice * quantity
+	restockErr := func() error {
+		tx, txErr := h.db.Begin()
+		if txErr != nil {
+			return txErr
+		}
+		defer tx.Rollback()
 
-		// Find or create inventory record for this product
-		var inventoryID, warehouseID uuid.UUID
-		var currentQty float64
-		invErr := h.db.QueryRow(`
-			SELECT id, quantity_on_hand, warehouse_id FROM inventory
-			WHERE tenant_id = $1 AND product_id = $2
-			LIMIT 1`,
-			tenantID, productID,
-		).Scan(&inventoryID, &currentQty, &warehouseID)
-
-		if invErr == sql.ErrNoRows {
-			inventoryID = uuid.New()
-			h.db.QueryRow("SELECT id FROM warehouses WHERE tenant_id = $1 LIMIT 1", tenantID).Scan(&warehouseID)
-			if warehouseID == uuid.Nil {
-				h.log.Warn("No warehouse found for inventory restock", "product_id", productID)
+		for _, item := range items {
+			productIDStr, okPid := item["product_id"].(string)
+			if !okPid || productIDStr == "" {
 				continue
 			}
-			_, err = h.db.Exec(`
-				INSERT INTO inventory (id, tenant_id, product_id, warehouse_id, quantity_on_hand, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $6)`,
-				inventoryID, tenantID, productID, warehouseID, quantity, now,
-			)
-			if err != nil {
-				h.log.Error("Failed to create inventory record on return approval", "error", err, "product_id", productID)
+			productID, perr := uuid.Parse(productIDStr)
+			if perr != nil {
 				continue
 			}
-		} else if invErr == nil {
-			_, err = h.db.Exec(`
-				UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, updated_at = $2
-				WHERE id = $3`,
-				quantity, now, inventoryID,
-			)
-			if err != nil {
-				h.log.Error("Failed to update inventory on return approval", "error", err, "inventory_id", inventoryID)
+			quantity, _ := item["quantity"].(float64)
+			if quantity <= 0 {
 				continue
 			}
-		} else {
-			h.log.Error("Inventory lookup failed on return approval", "error", invErr)
-			continue
-		}
 
-		// Audit trail row — unit_cost is the product's cost basis, not the
-		// sales price, so inventory valuation reports stay at cost.
-		txID := uuid.New()
-		h.db.Exec(`
-			INSERT INTO inventory_transactions (
-				id, tenant_id, inventory_id, transaction_type, quantity,
-				unit_cost, total_cost, reference_type, reference_id,
-				reason, transaction_date, created_at
-			) VALUES ($1, $2, $3, 'return', $4, $5, $6, 'sales_return', $7, 'Sales Return - Customer Return', $8, $8)
-		`, txID, tenantID, inventoryID, quantity, costPrice, quantity*costPrice, returnID, now)
+			var costPrice float64
+			tx.QueryRow(`SELECT COALESCE(cost_price, 0) FROM products WHERE id = $1`, productID).Scan(&costPrice)
+
+			// Warehouse: source order's → org-scoped row holding this product → any
+			// org warehouse. Never a blind cross-org LIMIT 1.
+			whID := orderWarehouseID
+			if whID == uuid.Nil {
+				_ = tx.QueryRow(`
+					SELECT warehouse_id FROM inventory
+					WHERE tenant_id = $1 AND product_id = $2
+					  AND ($3::uuid IS NULL OR organization_id = $3)
+					ORDER BY quantity_on_hand DESC LIMIT 1`,
+					tenantID, productID, returnOrgID).Scan(&whID)
+			}
+			if whID == uuid.Nil {
+				_ = tx.QueryRow(`
+					SELECT id FROM warehouses
+					WHERE tenant_id = $1 AND ($2::uuid IS NULL OR organization_id = $2) AND deleted_at IS NULL
+					ORDER BY created_at LIMIT 1`,
+					tenantID, returnOrgID).Scan(&whID)
+			}
+			if whID == uuid.Nil {
+				return fmt.Errorf("no warehouse available to restock product %s", productID)
+			}
+
+			if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
+				TenantID: tenantID, OrgID: returnOrgID, ProductID: productID,
+				WarehouseID: whID, Qty: quantity, UnitCost: costPrice,
+				TxType: "return", RefType: "sales_return", RefID: returnID.String(),
+				Reason: "Sales Return - Customer Return", ToWH: &whID,
+				CreatedBy: userID, When: now,
+			}); dErr != nil {
+				return dErr
+			}
+			totalCostReversal += costPrice * quantity
+		}
+		return tx.Commit()
+	}()
+	if restockErr != nil {
+		h.log.Error("Sales return restock failed; stock unchanged", "error", restockErr, "return_id", returnID)
+		totalCostReversal = 0 // no restock → no COGS reversal JE either
 	}
 
 	// Inventory/COGS reversal journal entry

@@ -4943,6 +4943,17 @@ func (h *Handler) CommissionProject(c *gin.Context) {
 
 	h.logConstructionActivity(tenantID, projectID, userID, "project", fmt.Sprintf("Loyiha foydalanishga topshirildi (WIP: %.2f)", totalWIP), "Project", projectID)
 
+	// Register the capitalized building in the Aktivlar module so it appears in
+	// the register and starts depreciating (audit finding #10). No extra
+	// posting — the JE above already moved WIP to fixed assets.
+	if commissionJEID != nil {
+		commDate, cdErr := time.Parse("2006-01-02", commissionDate)
+		if cdErr != nil {
+			commDate = now
+		}
+		h.faRegisterConstructionAsset(tenantID, orgIDPtr, projectID, totalWIP, commDate, faAcct)
+	}
+
 	result := map[string]interface{}{
 		"message":         "Project commissioned successfully",
 		"total_wip":       totalWIP,
@@ -5239,6 +5250,10 @@ func (h *Handler) createProjectCompletionJournalEntry(tenantID, organizationID u
 	}
 
 	h.log.Info("Created completion journal entry", "project_id", projectID, "entry_id", entryID, "amount", totalActualCost)
+
+	// Register the capitalized building in the Aktivlar module (no extra
+	// posting; see faRegisterConstructionAsset).
+	h.faRegisterConstructionAsset(tenantID, orgIDPtr, projectID, totalActualCost, now, fixedAssetAcct)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

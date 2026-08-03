@@ -2173,6 +2173,25 @@ func (h *Handler) CreateJournalEntry(c *gin.Context) {
 		return
 	}
 
+	// FA TZ §8.13: manual entries against accumulated-depreciation accounts
+	// (02xx/05xx) bypass the depreciation engine and desync the register — they
+	// require the dedicated accounting.depreciation.manual permission (seeded
+	// by migration 437, enforced here since the 2026-08-03 rebuild).
+	if !h.perm.Can(c, "accounting", "depreciation", "manual") {
+		for _, line := range input.Lines {
+			accID, parseErr := uuid.Parse(line.AccountID)
+			if parseErr != nil {
+				continue
+			}
+			var code string
+			if h.db.QueryRow(`SELECT code FROM accounts WHERE id = $1 AND tenant_id = $2`, accID, tenantID).Scan(&code) == nil &&
+				len(code) >= 2 && (code[:2] == "02" || code[:2] == "05") {
+				response.Forbidden(c, fmt.Sprintf("Amortizatsiya hisobiga (%s) qo'lda provodka uchun maxsus ruxsat kerak (accounting.depreciation.manual)", code))
+				return
+			}
+		}
+	}
+
 	// Resolve organization ID early (needed for entry number generation)
 	var orgID *uuid.UUID
 	if input.OrganizationID != "" {
