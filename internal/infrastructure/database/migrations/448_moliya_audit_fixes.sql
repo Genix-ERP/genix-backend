@@ -34,6 +34,16 @@
 --      their choice. New tenants get the same mapping from the Go lazy
 --      seed (expense.go seedDefaultExpenseCategories).
 
+-- Step 1 flips zero-line posted JEs to 'cancelled', which the TT 4.4 invariant
+-- trigger (migration 319/326) otherwise rejects ("posted entries cannot be
+-- reverted to draft/cancelled without a storno"). These are not real documents
+-- — they have no lines, so there is nothing to storno. Suppress triggers for
+-- this one-time cleanup transaction only, exactly as migration 422 does. This
+-- also lets step 2's balance recompute set absolute values without tripping the
+-- cash/bank non-negative guard. SET LOCAL auto-reverts at COMMIT; we also reset
+-- explicitly at the end. Requires superuser (POSTGRES_USER is one).
+SET LOCAL session_replication_role = 'replica';
+
 -- 1. Void zero-line posted JEs -------------------------------------------
 UPDATE journal_entries je
 SET status = 'cancelled', updated_at = NOW()
@@ -96,3 +106,7 @@ JOIN acct ON acct.code = m.acct_code
 WHERE ec.code = m.cat_code
   AND ec.tenant_id = acct.tenant_id
   AND ec.account_id IS NULL;
+
+-- Restore normal trigger behaviour for the remainder of the transaction (the
+-- schema_migrations insert). SET LOCAL would also auto-revert at COMMIT.
+SET LOCAL session_replication_role = DEFAULT;
