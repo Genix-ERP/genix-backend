@@ -340,15 +340,16 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 		SELECT
 			i.tenant_id,
 			i.customer_id,
-			SUM(i.total - COALESCE(i.paid_amount, 0)) as total_overdue,
+			SUM(i.total_amount - COALESCE(i.amount_paid, 0)) as total_overdue,
 			MIN(i.due_date) as oldest_due_date,
 			EXTRACT(DAY FROM CURRENT_DATE - MIN(i.due_date))::INTEGER as days_overdue,
 			'in_followup' as status
-		FROM invoices i
+		FROM sales_invoices i
 		WHERE i.tenant_id = $1
+		  AND i.deleted_at IS NULL
 		  AND i.status IN ('sent', 'partial')
 		  AND i.due_date < CURRENT_DATE
-		  AND i.total > COALESCE(i.paid_amount, 0)
+		  AND i.total_amount > COALESCE(i.amount_paid, 0)
 		GROUP BY i.tenant_id, i.customer_id
 		ON CONFLICT (tenant_id, customer_id)
 		DO UPDATE SET
@@ -405,7 +406,7 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 			cfs.current_level_id, fl.name as current_level_name, cfs.current_level_sequence,
 			cfs.total_overdue, cfs.oldest_due_date, cfs.days_overdue, cfs.status,
 			cfs.last_followup_date, cfs.next_followup_date, cfs.internal_notes,
-			(SELECT COUNT(*) FROM invoices WHERE customer_id = cfs.customer_id AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total > COALESCE(paid_amount, 0)) as overdue_invoice_count,
+			(SELECT COUNT(*) FROM sales_invoices WHERE customer_id = cfs.customer_id AND deleted_at IS NULL AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)) as overdue_invoice_count,
 			cfs.created_at, cfs.updated_at` + fromWhere + whereExtra +
 		" ORDER BY cfs.days_overdue DESC, cfs.total_overdue DESC"
 
@@ -558,9 +559,9 @@ func (h *Handler) GetCustomerFollowupDetails(c *gin.Context) {
 
 	// Get overdue invoices
 	invoiceRows, err := h.db.Query(`
-		SELECT id, invoice_number, issue_date, due_date, total, COALESCE(paid_amount, 0), total - COALESCE(paid_amount, 0) as balance
-		FROM invoices
-		WHERE tenant_id = $1 AND customer_id = $2 AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total > COALESCE(paid_amount, 0)
+		SELECT id, invoice_number, invoice_date, due_date, total_amount, COALESCE(amount_paid, 0), total_amount - COALESCE(amount_paid, 0) as balance
+		FROM sales_invoices
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND customer_id = $2 AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)
 		ORDER BY due_date ASC
 	`, tenantID, customerID)
 	if err != nil {
@@ -885,9 +886,9 @@ func (h *Handler) GetFollowupSummary(c *gin.Context) {
 
 	// Total overdue
 	h.db.QueryRow(`
-		SELECT COUNT(DISTINCT customer_id), COALESCE(SUM(total - COALESCE(paid_amount, 0)), 0), COUNT(*)
-		FROM invoices
-		WHERE tenant_id = $1 AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total > COALESCE(paid_amount, 0)
+		SELECT COUNT(DISTINCT customer_id), COALESCE(SUM(total_amount - COALESCE(amount_paid, 0)), 0), COUNT(*)
+		FROM sales_invoices
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)
 	`, tenantID).Scan(&summary.TotalCustomersOverdue, &summary.TotalOverdueAmount, &summary.OverdueInvoiceCount)
 
 	// Recent actions (last 7 days)
