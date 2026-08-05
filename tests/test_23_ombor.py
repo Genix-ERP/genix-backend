@@ -295,11 +295,24 @@ class TestValuation:
             "product_id": pid, "warehouse_id": warehouses[1],
             "quantity": 90, "unit_cost": 2000, "reason": "kirim B",
         })
-        r = api_client.get("/inventory/valuation", params={"limit": 200})
-        assert r.status_code == 200, r.text
-        payload = r.json()["data"]
-        items = payload.get("items") or payload.get("data") or payload
-        row = next((i for i in items if i.get("product_id") == pid), None)
+        # Valuation ORDER BY total_value DESC bilan sahifalanadi (limit cap
+        # 200); dev DB'da test-mahsulotlar yig'ilib 200 qatordan oshdi, shuning
+        # uchun kichik summali test qatori endi 1-sahifada bo'lmasligi mumkin —
+        # topilguncha sahifalab boramiz.
+        row = None
+        for page in range(1, 8):
+            r = api_client.get("/inventory/valuation", params={"limit": 200, "page": page})
+            assert r.status_code == 200, r.text
+            payload = r.json()["data"]
+            if isinstance(payload, dict):
+                items = payload.get("items") or payload.get("data") or []
+            else:
+                items = payload or []
+            if not isinstance(items, list) or not items:
+                break
+            row = next((i for i in items if i.get("product_id") == pid), None)
+            if row is not None:
+                break
         assert row is not None, "product missing from valuation"
         avg = float(row["average_cost"])
         assert abs(avg - 1900) < 1, f"average_cost {avg} is not quantity-weighted (expected 1900)"
