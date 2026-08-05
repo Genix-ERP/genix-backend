@@ -15,6 +15,32 @@ import (
 // Each key maps to a map[lang]template with %s placeholders.
 
 var notificationTemplates = map[string]map[string]struct{ Title, Message string }{
+	// ── Material zayavkalari (Qurilish v2) ──
+	"material_request_created": {
+		"en": {Title: "New material request", Message: "Material request %s (project %s) is waiting in the warehouse inbox"},
+		"uz": {Title: "Yangi material zayavkasi", Message: "%s zayavka (%s loyihasi) ombor inboxida kutmoqda"},
+		"ru": {Title: "Новая заявка на материалы", Message: "Заявка %s (проект %s) ожидает на складе"},
+	},
+	"material_request_issued": {
+		"en": {Title: "Materials issued", Message: "Materials for request %s have been issued from the warehouse"},
+		"uz": {Title: "Materiallar chiqarildi", Message: "%s zayavka bo'yicha materiallar omordan chiqarildi"},
+		"ru": {Title: "Материалы отпущены", Message: "Материалы по заявке %s отпущены со склада"},
+	},
+	"material_request_rejected": {
+		"en": {Title: "Material request rejected", Message: "Request %s was rejected: %s"},
+		"uz": {Title: "Zayavka rad etildi", Message: "%s zayavka rad etildi: %s"},
+		"ru": {Title: "Заявка отклонена", Message: "Заявка %s отклонена: %s"},
+	},
+	"material_request_purchase": {
+		"en": {Title: "Purchase requisition created", Message: "Material request %s: purchase requisition %s created"},
+		"uz": {Title: "Xarid so'rovi yaratildi", Message: "%s zayavka bo'yicha %s xarid so'rovi yaratildi"},
+		"ru": {Title: "Создана заявка на закупку", Message: "По заявке %s создана заявка на закупку %s"},
+	},
+	"material_request_arrived": {
+		"en": {Title: "Materials arrived", Message: "Materials for request %s arrived at the warehouse (%s) — ready to issue"},
+		"uz": {Title: "Material keldi", Message: "%s zayavka materiallari omborga kirim qilindi (%s) — chiqarishga tayyor"},
+		"ru": {Title: "Материалы поступили", Message: "Материалы по заявке %s поступили на склад (%s) — готовы к отпуску"},
+	},
 	// ── Sales Invoices ──
 	"invoice_sent": {
 		"en": {Title: "Invoice Sent", Message: "Invoice %s has been sent to %s for %s"},

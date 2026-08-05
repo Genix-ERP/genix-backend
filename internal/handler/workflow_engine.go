@@ -145,6 +145,14 @@ var workflowEventCatalog = map[string]workflowEventDef{
 		"record_id": "17", "act_number": "F2-2026-07", "act_type": "forma2", "project_name": "Yunusobod turar-joy majmuasi", "signer_role": "client"}},
 	"construction.material_request_approved": {Category: "construction", RelatedType: "construction_material_request", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "31", "project_name": "Yunusobod turar-joy majmuasi", "total_expense": 185000000.0}},
+	// Material zayavkalari v2 (migration 470): prorab zayavkasi → ombor
+	// inboxi → chiqim/xarid. record_id — BIGINT zayavka id (string).
+	"construction.material_request_created": {Category: "construction", RelatedType: "construction_material_request", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "31", "request_number": "MZ-2026-0001", "project_name": "Yunusobod turar-joy majmuasi", "priority": "urgent", "item_count": 3}},
+	"construction.material_request_issued": {Category: "construction", RelatedType: "construction_material_request", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "31", "request_number": "MZ-2026-0001", "project_name": "Yunusobod turar-joy majmuasi", "total_value": 18500000.0, "status": "issued"}},
+	"construction.material_request_rejected": {Category: "construction", RelatedType: "construction_material_request", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "31", "request_number": "MZ-2026-0001", "reason": "Smeta limitidan ortiq"}},
 	// Scheduled: the 15-minute scanner compares approved object costs
 	// (construction_expense_lines) against contract_amount per live project;
 	// 7-day marker cooldown per project (workflow_rules.go

@@ -2219,6 +2219,7 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		h.addPOReceiptToObjectCost(tenantID, id, objectCostLines, recvUserID)
 	}
 
+	notifyUserID, _ := middleware.GetUserID(c)
 	go func() {
 		var poNumber, vendorName string
 		h.db.QueryRow(`
@@ -2231,6 +2232,9 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 			"vendor_name":  vendorName,
 			"status":       newStatus,
 		})
+		// Yopiq halqa: shu PO'ga (xarid so'rovi orqali) bog'langan material
+		// zayavkalariga «material keldi — chiqarishga tayyor» signali.
+		h.notifyMaterialRequestsForPOReceipt(tenantID, id, poNumber, notifyUserID)
 	}()
 
 	response.Success(c, gin.H{
