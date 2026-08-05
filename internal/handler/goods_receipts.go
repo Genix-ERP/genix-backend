@@ -1157,6 +1157,7 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 	// The GR completing is the actual "goods arrived" moment — emit the
 	// workflow event here too, not only from POST /purchase-orders/:id/receive
 	// (docs/xarid-audit.md finding #7).
+	grNotifyUserID, _ := middleware.GetUserID(c)
 	go func() {
 		var poNumber, vendorName, poStatus string
 		h.db.QueryRow(`
@@ -1169,6 +1170,8 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 			"vendor_name":  vendorName,
 			"status":       poStatus,
 		})
+		// Yopiq halqa: kutayotgan material zayavkalariga avto-signal.
+		h.notifyMaterialRequestsForPOReceipt(tenantID, purchaseOrderID, poNumber, grNotifyUserID)
 	}()
 
 	h.GetGoodsReceipt(c)

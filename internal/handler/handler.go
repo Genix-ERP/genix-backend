@@ -2416,6 +2416,27 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		materialRequests.DELETE("/:id", h.perm.Require("construction", "projects", "delete"), h.DeleteMaterialRequest)
 	}
 
+	// Material zayavkalari v2 (migration 470): prorab → omborchi → xarid →
+	// kirim → chiqim → qabul. Read cross-granted to inventory/purchase users
+	// (crossModuleGrants); omborchi amallari inventory:stock:adjust bilan
+	// qo'shimcha gate'lanadi.
+	materialRequestsV2 := rg.Group("/construction/material-requests-v2")
+	materialRequestsV2.Use(h.perm.Require("construction", "material_request", "read"))
+	{
+		materialRequestsV2.GET("", h.ListMaterialRequestsV2)
+		materialRequestsV2.GET("/stats", h.GetMaterialRequestStatsV2)
+		materialRequestsV2.GET("/stock-check", h.MaterialRequestStockCheck)
+		materialRequestsV2.GET("/:id", h.GetMaterialRequestV2)
+		materialRequestsV2.POST("", h.perm.Require("construction", "material_request", "create"), h.CreateMaterialRequestV2)
+		materialRequestsV2.PUT("/:id", h.perm.Require("construction", "material_request", "update"), h.UpdateMaterialRequestV2)
+		materialRequestsV2.POST("/:id/cancel", h.perm.Require("construction", "material_request", "update"), h.CancelMaterialRequestV2)
+		materialRequestsV2.POST("/:id/accept", h.perm.Require("construction", "material_request", "update"), h.AcceptMaterialRequestV2)
+		materialRequestsV2.POST("/:id/review", h.perm.Require("inventory", "stock", "adjust"), h.ReviewMaterialRequestV2)
+		materialRequestsV2.POST("/:id/issue", h.perm.Require("inventory", "stock", "adjust"), h.IssueMaterialRequestV2)
+		materialRequestsV2.POST("/:id/send-to-purchase", h.perm.Require("inventory", "stock", "adjust"), h.SendMaterialRequestToPurchase)
+		materialRequestsV2.POST("/:id/reject", h.perm.Require("inventory", "stock", "adjust"), h.RejectMaterialRequestV2)
+	}
+
 	// Daily Reports (direct access)
 	dailyReports := rg.Group("/construction/daily-reports")
 	dailyReports.Use(h.perm.Require("construction", "reports", "read"))

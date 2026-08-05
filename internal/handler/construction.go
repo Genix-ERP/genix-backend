@@ -3472,6 +3472,15 @@ func (h *Handler) UpdateMaterialRequest(c *gin.Context) {
 		return
 	}
 
+	// v2 zayavkalar (flow='v2') yangi oqim endpointlari orqali boshqariladi —
+	// legacy PUT ularning normalizatsiyalangan qatorlarini buzadi.
+	var mrFlow string
+	_ = h.db.QueryRow(`SELECT COALESCE(flow, 'legacy') FROM construction_material_requests WHERE id = $1 AND tenant_id = $2`, requestID, tenantID).Scan(&mrFlow)
+	if mrFlow == mrFlowV2 {
+		response.BadRequest(c, "This is a v2 material request — use /construction/material-requests-v2 endpoints")
+		return
+	}
+
 	var req struct {
 		RequestDate  string      `json:"request_date"`
 		RequiredDate string      `json:"required_date"`
@@ -3551,6 +3560,14 @@ func (h *Handler) DeleteMaterialRequest(c *gin.Context) {
 		return
 	}
 
+	// v2 zayavkalar o'chirilmaydi — bekor qilish (cancel) oqimi bor.
+	var delFlow string
+	_ = h.db.QueryRow(`SELECT COALESCE(flow, 'legacy') FROM construction_material_requests WHERE id = $1 AND tenant_id = $2`, requestID, tenantID).Scan(&delFlow)
+	if delFlow == mrFlowV2 {
+		response.BadRequest(c, "This is a v2 material request — use /construction/material-requests-v2/:id/cancel")
+		return
+	}
+
 	query := `DELETE FROM construction_material_requests WHERE id = $1 AND tenant_id = $2`
 	result, err := h.db.Exec(query, requestID, tenantID)
 	if err != nil {
@@ -3612,7 +3629,14 @@ func (h *Handler) ApproveMaterialRequest(c *gin.Context) {
 
 	// Check if material request has a linked stock operation — approval must go through Stock Operations
 	var stockOpID uuid.NullUUID
-	h.db.QueryRow(`SELECT stock_operation_id FROM construction_material_requests WHERE id = $1 AND tenant_id = $2`, requestID, tenantID).Scan(&stockOpID)
+	var approveFlow string
+	h.db.QueryRow(`SELECT stock_operation_id, COALESCE(flow, 'legacy') FROM construction_material_requests WHERE id = $1 AND tenant_id = $2`, requestID, tenantID).Scan(&stockOpID, &approveFlow)
+	if approveFlow == mrFlowV2 {
+		// v2 oqimida chiqim omborchi tomonidan /issue orqali qilinadi —
+		// legacy approve qo'lda stok kamaytirib, ikkilangan xarajat yozadi.
+		response.BadRequest(c, "This is a v2 material request — use /construction/material-requests-v2/:id/issue")
+		return
+	}
 	if stockOpID.Valid && stockOpID.UUID != uuid.Nil {
 		response.BadRequest(c, "This material request has a linked delivery. Please confirm it through Stock Operations.")
 		return
