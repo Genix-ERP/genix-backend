@@ -53,45 +53,49 @@ func (h *Handler) ListPurchaseRequisitions(c *gin.Context) {
 
 	// Build query
 	baseQuery := `
-		SELECT id, tenant_id, pr_number, requested_by, department, request_date,
-			   required_date, status, priority, total_amount, purpose, notes,
-			   approved_by, approved_at, rejection_reason, converted_to_po,
-			   created_at, updated_at
-		FROM purchase_requisitions
-		WHERE tenant_id = $1 AND deleted_at IS NULL`
-	countQuery := `SELECT COUNT(*) FROM purchase_requisitions WHERE tenant_id = $1 AND deleted_at IS NULL`
+		SELECT pr.id, pr.tenant_id, pr.pr_number, pr.requested_by, pr.department, pr.request_date,
+			   pr.required_date, pr.status, pr.priority, pr.total_amount, pr.purpose, pr.notes,
+			   pr.approved_by, pr.approved_at, pr.rejection_reason, pr.converted_to_po,
+			   pr.created_at, pr.updated_at,
+			   pr.material_request_id, COALESCE(mr.request_number, ''),
+			   COALESCE(po.order_number, ''), COALESCE(po.status, '')
+		FROM purchase_requisitions pr
+		LEFT JOIN construction_material_requests mr ON mr.id = pr.material_request_id
+		LEFT JOIN purchase_orders po ON po.id = pr.converted_to_po
+		WHERE pr.tenant_id = $1 AND pr.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*) FROM purchase_requisitions pr WHERE pr.tenant_id = $1 AND pr.deleted_at IS NULL`
 	args := []interface{}{tenantID}
 	argCount := 1
 
 	// Filter by organization
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND pr.organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND pr.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
 	// Filter by status
 	if status := c.Query("status"); status != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND status = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND pr.status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND pr.status = $%d", argCount)
 		args = append(args, status)
 	}
 
 	// Filter by department
 	if dept := c.Query("department"); dept != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND department = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND department = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND pr.department = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND pr.department = $%d", argCount)
 		args = append(args, dept)
 	}
 
 	// Filter by priority
 	if priority := c.Query("priority"); priority != "" {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND priority = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND priority = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND pr.priority = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND pr.priority = $%d", argCount)
 		args = append(args, priority)
 	}
 
@@ -99,8 +103,8 @@ func (h *Handler) ListPurchaseRequisitions(c *gin.Context) {
 	if search := c.Query("search"); search != "" {
 		argCount++
 		searchPattern := "%" + strings.ToLower(search) + "%"
-		baseQuery += fmt.Sprintf(" AND (LOWER(pr_number) LIKE $%d OR LOWER(requested_by) LIKE $%d OR LOWER(department) LIKE $%d)", argCount, argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (LOWER(pr_number) LIKE $%d OR LOWER(requested_by) LIKE $%d OR LOWER(department) LIKE $%d)", argCount, argCount, argCount)
+		baseQuery += fmt.Sprintf(" AND (LOWER(pr.pr_number) LIKE $%d OR LOWER(pr.requested_by) LIKE $%d OR LOWER(pr.department) LIKE $%d)", argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(pr.pr_number) LIKE $%d OR LOWER(pr.requested_by) LIKE $%d OR LOWER(pr.department) LIKE $%d)", argCount, argCount, argCount)
 		args = append(args, searchPattern)
 	}
 
@@ -113,7 +117,7 @@ func (h *Handler) ListPurchaseRequisitions(c *gin.Context) {
 	}
 
 	// Add sorting and pagination
-	baseQuery += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	baseQuery += fmt.Sprintf(" ORDER BY pr.created_at DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
 	args = append(args, pageSize, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
@@ -134,12 +138,15 @@ func (h *Handler) ListPurchaseRequisitions(c *gin.Context) {
 		var requiredDate, approvedAt sql.NullTime
 		var totalAmount float64
 		var createdAt, updatedAt time.Time
+		var materialRequestID sql.NullInt64
+		var materialRequestNumber, poNumber, poStatus string
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &prNumber, &requestedBy, &department, &requestDate,
 			&requiredDate, &status, &priority, &totalAmount, &purpose, &notes,
 			&approvedBy, &approvedAt, &rejectionReason, &convertedToPO,
 			&createdAt, &updatedAt,
+			&materialRequestID, &materialRequestNumber, &poNumber, &poStatus,
 		)
 		if err != nil {
 			continue
@@ -156,6 +163,12 @@ func (h *Handler) ListPurchaseRequisitions(c *gin.Context) {
 			"total_amount": totalAmount,
 			"created_at":   createdAt,
 			"updated_at":   updatedAt,
+			"po_number":    poNumber,
+			"po_status":    poStatus,
+		}
+		if materialRequestID.Valid {
+			pr["material_request_id"] = materialRequestID.Int64
+			pr["material_request_number"] = materialRequestNumber
 		}
 
 		if department.Valid {
@@ -908,7 +921,13 @@ func (h *Handler) ConvertPRToPO(c *gin.Context) {
 	// Check status
 	var currentStatus string
 	var totalAmount float64
-	err = h.db.QueryRow("SELECT status, total_amount FROM purchase_requisitions WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", prID, tenantID).Scan(&currentStatus, &totalAmount)
+	var prOrgID uuid.NullUUID
+	var prRequiredDate sql.NullTime
+	var prMaterialRequestID sql.NullInt64
+	var prNumberStr string
+	err = h.db.QueryRow(`SELECT status, total_amount, organization_id, required_date, material_request_id, pr_number
+		FROM purchase_requisitions WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, prID, tenantID).
+		Scan(&currentStatus, &totalAmount, &prOrgID, &prRequiredDate, &prMaterialRequestID, &prNumberStr)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase requisition")
 		return
@@ -947,22 +966,39 @@ func (h *Handler) ConvertPRToPO(c *gin.Context) {
 	poID := uuid.New()
 	now := time.Now()
 
-	paymentTerms := input.PaymentTerms
-	if paymentTerms == "" {
-		paymentTerms = "net_30"
+	// purchase_orders.payment_terms is INTEGER (days); the legacy "net_30"
+	// string 500'ed on insert, so this endpoint never worked post-migration.
+	paymentDays := 30
+	if input.PaymentTerms != "" {
+		if n, err := strconv.Atoi(strings.TrimPrefix(input.PaymentTerms, "net_")); err == nil && n > 0 {
+			paymentDays = n
+		}
+	}
+
+	// PR'dan kelgan kontekstni PO'ga ko'chirish: organization_id (org-scoped
+	// ro'yxat/statslarda ko'rinishi uchun) va kerak-sana → expected_date.
+	var poOrgArg interface{}
+	if prOrgID.Valid {
+		poOrgArg = prOrgID.UUID
+	} else if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		poOrgArg = orgID
+	}
+	var poExpectedArg interface{}
+	if prRequiredDate.Valid {
+		poExpectedArg = prRequiredDate.Time
 	}
 
 	// Create PO
 	poQuery := `
 		INSERT INTO purchase_orders (
-			id, tenant_id, order_number, vendor_id, order_date, expected_date,
+			id, tenant_id, organization_id, order_number, vendor_id, order_date, expected_date,
 			subtotal, total_amount, status, payment_status, payment_terms,
 			requested_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`
 
 	_, err = h.db.Exec(poQuery,
-		poID, tenantID, poNumber, supplierID, now, nil,
-		totalAmount, totalAmount, "draft", "unpaid", paymentTerms,
+		poID, tenantID, poOrgArg, poNumber, supplierID, now, poExpectedArg,
+		totalAmount, totalAmount, "draft", "unpaid", paymentDays,
 		userID, now, now,
 	)
 	if err != nil {
@@ -971,10 +1007,13 @@ func (h *Handler) ConvertPRToPO(c *gin.Context) {
 		return
 	}
 
-	// Get PR lines and create PO lines
+	// Get PR lines and create PO lines. NULL-safe COALESCEs: approved_quantity
+	// and unit are nullable — a bare scan into float64/string errored and the
+	// `continue` silently dropped every line (PO ended up line-less).
 	linesQuery := `
-		SELECT id, product_id, product_name, product_code, description,
-			   quantity, unit, estimated_price, approved_quantity
+		SELECT id, product_id, COALESCE(product_name, ''), product_code, description,
+			   COALESCE(quantity, 0), COALESCE(unit, ''), COALESCE(estimated_price, 0),
+			   COALESCE(approved_quantity, 0)
 		FROM purchase_requisition_lines
 		WHERE requisition_id = $1`
 
@@ -1034,6 +1073,17 @@ func (h *Handler) ConvertPRToPO(c *gin.Context) {
 	)
 	if err != nil {
 		h.log.Error("Failed to update PR status", "error", err)
+	}
+
+	// Material zayavkasidan kelgan so'rov — zayavka timeline'iga PO yozuvi.
+	if prMaterialRequestID.Valid {
+		var mrProjectID int64
+		if err := h.db.QueryRow(`SELECT project_id FROM construction_material_requests WHERE id = $1 AND tenant_id = $2 AND flow = 'v2'`,
+			prMaterialRequestID.Int64, tenantID).Scan(&mrProjectID); err == nil {
+			h.mrV2Activity(tenantID, mrProjectID, userID, prMaterialRequestID.Int64, "po_created",
+				fmt.Sprintf("Buyurtma (PO) yaratildi: %s — %s", poNumber, supplierName),
+				map[string]interface{}{"purchase_order_id": poID, "po_number": poNumber, "pr_number": prNumberStr})
+		}
 	}
 
 	response.Success(c, map[string]interface{}{

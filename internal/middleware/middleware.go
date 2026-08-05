@@ -490,7 +490,7 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 		"workflow":      {"workflow"},
 		"contracts":     {"contract"},
 		"cargo":         {"shipment", "distribution", "cash"},
-		"construction":  {"project", "projects", "estimate", "smeta", "wbs", "daily_log", "reports"},
+		"construction":  {"project", "projects", "estimate", "smeta", "wbs", "daily_log", "reports", "material_request"},
 		"payroll":       {"payroll", "employee"},
 		"dashboard":     {"dashboard"},
 	}
@@ -499,9 +499,14 @@ func (pc *PermissionChecker) loadPermissions(ctx context.Context, tenantID, user
 	// they also need read access to supporting resources from other modules.
 	crossModuleGrants := map[string][]string{
 		"hr":            {"organization:department", "organization:organization", "users:role", "users:user"},
-		"inventory":     {"settings:tenant"},
+		// Omborchi «Kiruvchi zayavkalar» inboxini ko'rishi kerak (material
+		// zayavkalari v2) — chiqarish/rad amallari baribir inventory:stock:adjust
+		// bilan gate'langan.
+		"inventory":     {"settings:tenant", "construction:material_request"},
 		"sales":         {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "inventory:product_attribute", "users:user", "crm:contact"},
-		"purchase":      {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "users:user", "crm:contact"},
+		// Ta'minotchi zayavkadan kelgan xarid so'rovining manbasini ochib
+		// ko'ra olishi kerak (material zayavkalari v2).
+		"purchase":      {"settings:tenant", "inventory:product", "inventory:warehouse", "inventory:carrier", "inventory:product_variant", "users:user", "crm:contact", "construction:material_request"},
 		"finance":       {"settings:tenant"},
 		"manufacturing": {"inventory:product", "inventory:bom", "inventory:warehouse"},
 		"construction":  {"organization:organization", "hr:employee", "inventory:product", "inventory:warehouse"},
