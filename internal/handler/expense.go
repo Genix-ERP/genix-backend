@@ -55,9 +55,12 @@ var defaultExpenseCategories = []struct {
 }
 
 func (h *Handler) seedDefaultExpenseCategories(tenantID uuid.UUID) {
-	var count int
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM expense_categories WHERE tenant_id = $1`, tenantID).Scan(&count)
-	if count > 0 {
+	// EXISTS, not COUNT(*): this runs on every GET of a hot dropdown
+	// endpoint, and it only ever needs to know whether the table is empty.
+	// EXISTS stops at the first row; COUNT(*) reads all of them.
+	var seeded bool
+	_ = h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM expense_categories WHERE tenant_id = $1)`, tenantID).Scan(&seeded)
+	if seeded {
 		return
 	}
 	for _, d := range defaultExpenseCategories {

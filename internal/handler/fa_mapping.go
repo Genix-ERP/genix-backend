@@ -59,10 +59,25 @@ func (h *Handler) GetAssetMapping(c *gin.Context) {
 		return
 	}
 
+	// Deliberately NOT paginated. A single `meta` cannot describe two
+	// independent collections, so paging this would mean splitting it into
+	// /settings/asset-mapping/categories and /…/departments and leaving this
+	// route as a settings-only read — a breaking change to the web mapping
+	// screen and to PUT /settings/asset-mapping, which round-trips the same
+	// object. Both collections are dropdown sources, not feeds, and are
+	// bounded by the tenant's own hand-written chart-of-accounts mapping.
+	//
+	// is_active=true is the cheap mitigation: the client already filters on
+	// is_active locally, so this just moves that filter to where the rows are.
+	activeOnly := ""
+	if c.Query("is_active") == "true" {
+		activeOnly = " AND is_active = true"
+	}
+
 	cats := []faCategoryDTO{}
 	rows, err := h.db.Query(`
 		SELECT id, code, name_uz, COALESCE(name_ru,''), asset_account, COALESCE(depreciation_account,''), depreciable, is_active
-		FROM fa_categories WHERE tenant_id = $1 ORDER BY code`, tenantID)
+		FROM fa_categories WHERE tenant_id = $1`+activeOnly+` ORDER BY code`, tenantID)
 	if err == nil {
 		for rows.Next() {
 			var d faCategoryDTO
@@ -76,7 +91,7 @@ func (h *Handler) GetAssetMapping(c *gin.Context) {
 	depts := []faDepartmentDTO{}
 	drows, err := h.db.Query(`
 		SELECT id, code, name_uz, expense_account, is_active
-		FROM fa_departments WHERE tenant_id = $1 ORDER BY code`, tenantID)
+		FROM fa_departments WHERE tenant_id = $1`+activeOnly+` ORDER BY code`, tenantID)
 	if err == nil {
 		for drows.Next() {
 			var d faDepartmentDTO

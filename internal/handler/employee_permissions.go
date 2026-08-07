@@ -13,22 +13,22 @@ import (
 
 // ModulePermission represents a single module permission entry
 type ModulePermission struct {
-	ID         uuid.UUID `json:"id"`
-	ModuleID   string    `json:"module_id"`
-	CanCreate  bool      `json:"can_create"`
-	CanRead    bool      `json:"can_read"`
-	CanUpdate  bool      `json:"can_update"`
-	CanDelete  bool      `json:"can_delete"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID        uuid.UUID `json:"id"`
+	ModuleID  string    `json:"module_id"`
+	CanCreate bool      `json:"can_create"`
+	CanRead   bool      `json:"can_read"`
+	CanUpdate bool      `json:"can_update"`
+	CanDelete bool      `json:"can_delete"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // EmployeePermissionsResponse represents the full permissions for an employee
 type EmployeePermissionsResponse struct {
-	EmployeeID  uuid.UUID                     `json:"employee_id"`
-	RoleID      *uuid.UUID                    `json:"role_id,omitempty"`
-	RoleName    string                        `json:"role_name,omitempty"`
-	Permissions map[string]*ModulePermission  `json:"permissions"`
+	EmployeeID  uuid.UUID                    `json:"employee_id"`
+	RoleID      *uuid.UUID                   `json:"role_id,omitempty"`
+	RoleName    string                       `json:"role_name,omitempty"`
+	Permissions map[string]*ModulePermission `json:"permissions"`
 }
 
 // UpdateModulePermissionInput represents input for updating a single module permission
@@ -399,7 +399,7 @@ func (h *Handler) GetCurrentUserPermissions(c *gin.Context) {
 	// Note: "admin" role is NOT included - they should have module-based permissions like regular users
 	if role == "site_admin" || role == "owner" || role == "system_admin" {
 		response.Success(c, gin.H{
-			"is_admin": true,
+			"is_admin":    true,
 			"permissions": nil,
 		})
 		return
@@ -408,7 +408,7 @@ func (h *Handler) GetCurrentUserPermissions(c *gin.Context) {
 	// If no linked employee, return empty permissions
 	if !employeeID.Valid {
 		response.Success(c, gin.H{
-			"is_admin": false,
+			"is_admin":    false,
 			"permissions": map[string]interface{}{},
 		})
 		return
@@ -417,7 +417,7 @@ func (h *Handler) GetCurrentUserPermissions(c *gin.Context) {
 	empID, err := uuid.Parse(employeeID.String)
 	if err != nil {
 		response.Success(c, gin.H{
-			"is_admin": false,
+			"is_admin":    false,
 			"permissions": map[string]interface{}{},
 		})
 		return
@@ -480,6 +480,24 @@ func (h *Handler) GetCurrentUserPermissions(c *gin.Context) {
 }
 
 // GetCurrentUserOrganizations returns full organization details for the current user's employee
+// GetCurrentUserOrganizations — DO NOT PAGINATE THIS ENDPOINT.
+//
+// It is the org-switcher bootstrap, and the client resolves its persisted
+// selection by scanning the full array:
+//
+//	selected = organizations.where((org) => org.id == savedOrgId).firstOrNull;
+//	selected ??= organizations.firstOrNull;
+//
+// If the saved organization is not on page 1, firstOrNull silently reassigns
+// the user to a DIFFERENT company and persists that choice — every subsequent
+// request then carries the wrong X-Organization-Id. Paginating here is a
+// data-integrity bug, not a payload win.
+//
+// The list is also the smallest in the module: capped by the tenant's own
+// organization count for admins, and by the user's assignments otherwise.
+// If paging is ever genuinely needed, the unpaged full array must remain the
+// DEFAULT with paging strictly opt-in — the reverse of the house rule, for the
+// reason above.
 func (h *Handler) GetCurrentUserOrganizations(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {

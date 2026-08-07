@@ -23,8 +23,33 @@ func (h *Handler) ListDropshipOrders(c *gin.Context) {
 		return
 	}
 
+	// This handler had NO clamp of any kind, and the Atoi errors were dropped.
+	// ?page=0 gave offset = -limit, which Postgres rejects outright ("OFFSET
+	// must not be negative") -> 500; ?limit=0 or ?limit=abc gave limit = 0,
+	// which used to divide by zero building meta.total_pages; and ?limit=1000000
+	// was honoured verbatim and pulled the whole table.
+	//
+	// page_size is the primary name to match every other list in this module;
+	// limit stays as a deprecated alias so existing callers keep working.
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	if page < 1 {
+		page = 1
+	}
+
+	raw := c.Query("page_size")
+	if raw == "" {
+		raw = c.DefaultQuery("limit", "20")
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 1 {
+		limit = 20
+	}
+	// min(requested, cap) — NOT a fallback to the default. Falling back would
+	// give a client that asked for 200 fewer rows than asking for nothing.
+	if limit > 100 {
+		limit = 100
+	}
+
 	offset := (page - 1) * limit
 
 	var filter entity.DropshipOrderListFilter

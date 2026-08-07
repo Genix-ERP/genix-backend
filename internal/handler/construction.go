@@ -1074,13 +1074,34 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		LEFT JOIN (
 		    SELECT building_id, COUNT(*) AS cnt
 		    FROM building_files
+		    -- Scope the aggregate to THIS project's buildings. Without this the
+		    -- subquery grouped the entire tenant-wide building_files table on
+		    -- every project-detail open, just to read the handful of counts the
+		    -- page shows. The predicate is on building_id, so it sidesteps the
+		    -- UUID-vs-VARCHAR tenant_id mismatch described above while still
+		    -- narrowing the scan.
+		    WHERE building_id IN (
+		        SELECT id FROM construction_buildings WHERE project_id = $1 AND tenant_id = $2
+		    )
 		    GROUP BY building_id
 		) f ON f.building_id = b.id
 		WHERE b.project_id = $1 AND b.tenant_id = $2
 		ORDER BY COALESCE(b.sort_order, 0), b.code
 	`
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	// Opt-in paging, and deliberately NOT paged by default: this array is the
+	// source of the block-selector pills on the Bosqichlar, Byudjet and
+	// Xarajatlar tabs. A truncated array silently drops blocks from the pill
+	// row — the exact bug the building_id filters elsewhere were added to fix.
+	// A project has tens of buildings, not thousands.
+	bArgs := []interface{}{projectID, tenantID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		bArgs = append(bArgs, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, bArgs...)
 	if err != nil {
 		h.log.Error("Failed to query buildings", "error", err)
 		response.InternalError(c, "Failed to query buildings")
@@ -1111,7 +1132,20 @@ func (h *Handler) ListConstructionBuildings(c *gin.Context) {
 		buildings = append(buildings, b)
 	}
 
-	response.Success(c, buildings)
+	if !paginate {
+		response.Success(c, buildings)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_buildings WHERE project_id = $1 AND tenant_id = $2`,
+		projectID, tenantID,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count buildings", "error", err)
+		total = len(buildings)
+	}
+	response.Paginated(c, buildings, page, pageSize, total)
 }
 
 // CreateConstructionBuilding creates a new building
@@ -2197,7 +2231,17 @@ func (h *Handler) ListProjectVendors(c *gin.Context) {
 		ORDER BY pv.created_date DESC
 	`
 
-	rows, err := h.db.Query(query, projectID, tenantID)
+	// Opt-in paging. Both LEFT JOINs resolve vendor_name and are 1:1 on
+	// pv.vendor_id, so they cannot multiply rows — the COUNT can be taken on
+	// construction_project_vendors alone.
+	args := []interface{}{projectID, tenantID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query project vendors", "error", err)
 		response.InternalError(c, "Failed to query vendors")
@@ -2259,7 +2303,20 @@ func (h *Handler) ListProjectVendors(c *gin.Context) {
 		})
 	}
 
-	response.Success(c, vendors)
+	if !paginate {
+		response.Success(c, vendors)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_project_vendors WHERE project_id = $1 AND tenant_id = $2`,
+		projectID, tenantID,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count project vendors", "error", err)
+		total = len(vendors)
+	}
+	response.Paginated(c, vendors, page, pageSize, total)
 }
 
 // CreateProjectVendor adds a vendor to a project

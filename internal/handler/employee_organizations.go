@@ -71,7 +71,14 @@ func (h *Handler) ListEmployeeOrganizations(c *gin.Context) {
 		ORDER BY eo.is_primary DESC, o.name ASC
 	`
 
-	rows, err := h.db.Query(query, tenantID, employeeID)
+	args := []interface{}{tenantID, employeeID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list employee organizations", "error", err)
 		response.InternalServerError(c, "Failed to list employee organizations")
@@ -99,7 +106,20 @@ func (h *Handler) ListEmployeeOrganizations(c *gin.Context) {
 		assignments = []EmployeeOrganization{}
 	}
 
-	response.Success(c, assignments)
+	if !paginate {
+		response.Success(c, assignments)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM employee_organizations WHERE tenant_id = $1 AND employee_id = $2`,
+		tenantID, employeeID,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count employee organizations", "error", err)
+		total = len(assignments)
+	}
+	response.Paginated(c, assignments, page, pageSize, total)
 }
 
 // ListOrganizationEmployees returns all employees assigned to an organization
@@ -127,7 +147,14 @@ func (h *Handler) ListOrganizationEmployees(c *gin.Context) {
 		ORDER BY eo.is_primary DESC, employee_name ASC
 	`
 
-	rows, err := h.db.Query(query, tenantID, orgID)
+	args := []interface{}{tenantID, orgID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list organization employees", "error", err)
 		response.InternalServerError(c, "Failed to list organization employees")
@@ -155,7 +182,20 @@ func (h *Handler) ListOrganizationEmployees(c *gin.Context) {
 		assignments = []EmployeeOrganization{}
 	}
 
-	response.Success(c, assignments)
+	if !paginate {
+		response.Success(c, assignments)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM employee_organizations WHERE tenant_id = $1 AND organization_id = $2`,
+		tenantID, orgID,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count organization employees", "error", err)
+		total = len(assignments)
+	}
+	response.Paginated(c, assignments, page, pageSize, total)
 }
 
 // AssignEmployeeToOrganization assigns an employee to an organization

@@ -320,7 +320,9 @@ func (h *Handler) ListLandedCosts(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	var costs []LandedCost
+	// make(..., 0), not a nil slice: nil marshals as `null`, so an empty result
+	// broke any client doing `data as List`.
+	costs := make([]LandedCost, 0)
 	for rows.Next() {
 		var lc LandedCost
 		var poID, supplierID, createdBy, validatedBy sql.NullString

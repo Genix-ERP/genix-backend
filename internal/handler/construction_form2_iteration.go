@@ -3,13 +3,16 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -41,16 +44,16 @@ import (
 
 // Form2Iteration mirrors a row in construction_form2_iteration.
 type Form2Iteration struct {
-	ID            int64      `json:"id"`
-	TenantID      uuid.UUID  `json:"tenant_id"`
-	ProjectID     int64      `json:"project_id"`
-	IterationSeq  int        `json:"iteration_seq"`
-	Status        string     `json:"status"`
-	SnapshotID    *int64     `json:"snapshot_id,omitempty"`
-	OpenedAt      time.Time  `json:"opened_at"`
-	OpenedBy      *uuid.UUID `json:"opened_by,omitempty"`
-	FrozenAt      *time.Time `json:"frozen_at,omitempty"`
-	FrozenBy      *uuid.UUID `json:"frozen_by,omitempty"`
+	ID           int64      `json:"id"`
+	TenantID     uuid.UUID  `json:"tenant_id"`
+	ProjectID    int64      `json:"project_id"`
+	IterationSeq int        `json:"iteration_seq"`
+	Status       string     `json:"status"`
+	SnapshotID   *int64     `json:"snapshot_id,omitempty"`
+	OpenedAt     time.Time  `json:"opened_at"`
+	OpenedBy     *uuid.UUID `json:"opened_by,omitempty"`
+	FrozenAt     *time.Time `json:"frozen_at,omitempty"`
+	FrozenBy     *uuid.UUID `json:"frozen_by,omitempty"`
 }
 
 // Form2IterationLine is one row from construction_form2_iteration_line.
@@ -76,13 +79,24 @@ func (h *Handler) ListForm2Iterations(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	// Opt-in paging, selector-first like the buildings list: mobile renders
+	// these as a tab strip ("Forma 2 #1, #2, #3 (joriy)"), so a truncated array
+	// silently removes tabs rather than adding a second page.
+	query := `
 		SELECT id, tenant_id, project_id, iteration_seq, status,
 		       snapshot_id, opened_at, opened_by, frozen_at, frozen_by
 		FROM construction_form2_iteration
 		WHERE project_id = $1 AND tenant_id = $2
 		ORDER BY iteration_seq ASC
-	`, projectID, tenantID)
+	`
+	args := []interface{}{projectID, tenantID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list form2 iterations", "error", err, "project_id", projectID)
 		response.InternalError(c, "Failed to list iterations")
@@ -104,7 +118,20 @@ func (h *Handler) ListForm2Iterations(c *gin.Context) {
 		out = append(out, it)
 	}
 
-	response.Success(c, out)
+	if !paginate {
+		response.Success(c, out)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_form2_iteration WHERE project_id = $1 AND tenant_id = $2`,
+		projectID, tenantID,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count form2 iterations", "error", err)
+		total = len(out)
+	}
+	response.Paginated(c, out, page, pageSize, total)
 }
 
 // GetForm2IterationLines returns every line's period_fakt for one
@@ -143,11 +170,55 @@ func (h *Handler) GetForm2IterationLines(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	// line_ids narrows the response to the lines the caller actually renders.
+	// Mobile has been sending this parameter all along (smeta_management_service
+	// listForm2IterationLines) and it was silently ignored, so the Bosqichlar
+	// tab pulled every line of the iteration to display a handful.
+	linesQuery := `
 		SELECT iteration_id, estimate_line_id, period_fakt
 		FROM construction_form2_iteration_line
 		WHERE iteration_id = $1
-	`, iterID)
+	`
+	args := []interface{}{iterID}
+	countWhere := `WHERE iteration_id = $1`
+	countArgs := []interface{}{iterID}
+
+	if raw := strings.TrimSpace(c.Query("line_ids")); raw != "" {
+		lineIDs := make([]int64, 0, 16)
+		for _, tok := range strings.Split(raw, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			id, convErr := strconv.ParseInt(tok, 10, 64)
+			if convErr != nil {
+				response.BadRequest(c, "Invalid line_ids")
+				return
+			}
+			lineIDs = append(lineIDs, id)
+		}
+		// An explicitly-empty list means "no lines", not "all lines" — falling
+		// back to the full dump would be the opposite of what was asked.
+		if len(lineIDs) == 0 {
+			response.Success(c, make([]Form2IterationLine, 0))
+			return
+		}
+		args = append(args, pq.Array(lineIDs))
+		countArgs = append(countArgs, pq.Array(lineIDs))
+		linesQuery += " AND estimate_line_id = ANY($2)"
+		countWhere += " AND estimate_line_id = ANY($2)"
+	}
+
+	// Deterministic order so LIMIT/OFFSET pages cannot repeat or skip rows.
+	linesQuery += " ORDER BY estimate_line_id ASC"
+
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		linesQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(linesQuery, args...)
 	if err != nil {
 		h.log.Error("Failed to list iteration lines", "error", err, "iter_id", iterID)
 		response.InternalError(c, "Failed to list iteration lines")
@@ -166,7 +237,19 @@ func (h *Handler) GetForm2IterationLines(c *gin.Context) {
 		out = append(out, l)
 	}
 
-	response.Success(c, out)
+	if !paginate {
+		response.Success(c, out)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_form2_iteration_line `+countWhere, countArgs...,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count iteration lines", "error", err)
+		total = len(out)
+	}
+	response.Paginated(c, out, page, pageSize, total)
 }
 
 // CreateForm2IterationInput optionally carries the snapshot payload
@@ -442,25 +525,26 @@ func (h *Handler) CreateForm2Iteration(c *gin.Context) {
 // current empty period and resume editing the previous Forma 2.
 //
 // Route: DELETE /construction/projects/:id/form2-iterations/:iter_id
-//   (:iter_id must be the open iteration)
+//
+//	(:iter_id must be the open iteration)
 //
 // Deleting it:
-//   1. removes the open iteration (along with its iteration_line rows, via
-//      FK cascade),
-//   2. flips the previous frozen iteration (seq − 1) back to 'open' (clears
-//      frozen_at/by + snapshot_id), and
-//   3. deletes the construction_form2_snapshot row that froze it, so Formalar
-//      tarixi loses the corresponding entry.
+//  1. removes the open iteration (along with its iteration_line rows, via
+//     FK cascade),
+//  2. flips the previous frozen iteration (seq − 1) back to 'open' (clears
+//     frozen_at/by + snapshot_id), and
+//  3. deletes the construction_form2_snapshot row that froze it, so Formalar
+//     tarixi loses the corresponding entry.
 //
 // The "exactly one open iteration per project" invariant is preserved: we
 // delete one open and re-open one frozen in the same transaction.
 //
 // Guards:
-//   * the target must be the open iteration (you can't delete a frozen one
+//   - the target must be the open iteration (you can't delete a frozen one
 //     directly — delete the joriy to roll the chain back),
-//   * there must be a frozen predecessor to unfreeze (can't delete the very
+//   - there must be a frozen predecessor to unfreeze (can't delete the very
 //     first iteration when nothing is frozen), and
-//   * if the open iteration already has period_fakt entered on any line we
+//   - if the open iteration already has period_fakt entered on any line we
 //     refuse (409) so the foreman's new-period work isn't silently discarded.
 func (h *Handler) DeleteForm2Iteration(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)

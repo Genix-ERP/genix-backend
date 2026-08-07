@@ -69,7 +69,11 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 		FROM sales_delivery_orders sdo
 		LEFT JOIN warehouses w ON sdo.warehouse_id = w.id
 		WHERE sdo.tenant_id = $1 AND sdo.deleted_at IS NULL`
-	countQuery := `SELECT COUNT(*) FROM sales_delivery_orders WHERE tenant_id = $1 AND deleted_at IS NULL`
+	// Aliased `sdo` to stay textually parallel with baseQuery. Not a bug today
+	// — the count has no joins, so bare columns resolve fine — but it is a
+	// divergence waiting to break the first time someone adds a joined
+	// predicate to baseQuery and copy-pastes it down here.
+	countQuery := `SELECT COUNT(*) FROM sales_delivery_orders sdo WHERE sdo.tenant_id = $1 AND sdo.deleted_at IS NULL`
 	args := []interface{}{tenantID}
 	argCount := 1
 
@@ -77,7 +81,7 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND sdo.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sdo.organization_id = $%d", argCount)
 		args = append(args, orgID)
 	}
 
@@ -85,7 +89,7 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 	if status := c.Query("status"); status != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND sdo.status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND status = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sdo.status = $%d", argCount)
 		args = append(args, status)
 	}
 
@@ -93,7 +97,7 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 	if soID := c.Query("sales_order_id"); soID != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND sdo.sales_order_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND sales_order_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sdo.sales_order_id = $%d", argCount)
 		args = append(args, soID)
 	}
 
@@ -101,7 +105,7 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 	if customerID := c.Query("customer_id"); customerID != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND sdo.customer_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND customer_id = $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sdo.customer_id = $%d", argCount)
 		args = append(args, customerID)
 	}
 
@@ -109,13 +113,13 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 	if dateFrom := c.Query("date_from"); dateFrom != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND sdo.delivery_date >= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND delivery_date >= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sdo.delivery_date >= $%d", argCount)
 		args = append(args, dateFrom)
 	}
 	if dateTo := c.Query("date_to"); dateTo != "" {
 		argCount++
 		baseQuery += fmt.Sprintf(" AND sdo.delivery_date <= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND delivery_date <= $%d", argCount)
+		countQuery += fmt.Sprintf(" AND sdo.delivery_date <= $%d", argCount)
 		args = append(args, dateTo)
 	}
 
@@ -124,7 +128,7 @@ func (h *Handler) ListDeliveryOrders(c *gin.Context) {
 		argCount++
 		searchPattern := "%" + strings.ToLower(search) + "%"
 		baseQuery += fmt.Sprintf(" AND (LOWER(sdo.delivery_number) LIKE $%d OR LOWER(sdo.so_number) LIKE $%d OR LOWER(sdo.customer_name) LIKE $%d)", argCount, argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (LOWER(delivery_number) LIKE $%d OR LOWER(so_number) LIKE $%d OR LOWER(customer_name) LIKE $%d)", argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (LOWER(sdo.delivery_number) LIKE $%d OR LOWER(sdo.so_number) LIKE $%d OR LOWER(sdo.customer_name) LIKE $%d)", argCount, argCount, argCount)
 		args = append(args, searchPattern)
 	}
 

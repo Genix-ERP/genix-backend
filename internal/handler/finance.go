@@ -8310,31 +8310,54 @@ func (h *Handler) ListFiscalYears(c *gin.Context) {
 			fy.OrganizationID = &oid
 		}
 
-		// Load periods for this fiscal year
-		periodsQuery := `
+		fy.Periods = make([]entity.FiscalPeriod, 0)
+		fiscalYears = append(fiscalYears, &fy)
+	}
+	rows.Close()
+
+	// The periods used to be fetched with one query PER fiscal year, issued
+	// from inside the rows.Next() loop while the outer cursor was still open —
+	// so the handler held a second pooled connection for the whole scan. One
+	// bulk query after the cursor closes instead.
+	//
+	// include_periods=false lets a caller that only needs the year list skip
+	// this entirely. Default true, so existing callers are unchanged. Mobile
+	// currently fetches fiscal-years and fiscal-periods in parallel, which
+	// means every period is transferred twice; this is what lets it stop.
+	if c.Query("include_periods") != "false" && len(fiscalYears) > 0 {
+		yearIDs := make([]uuid.UUID, 0, len(fiscalYears))
+		byYear := map[uuid.UUID]*entity.FiscalYear{}
+		for _, fy := range fiscalYears {
+			yearIDs = append(yearIDs, fy.ID)
+			byYear[fy.ID] = fy
+		}
+
+		periodRows, perr := h.db.Query(`
 			SELECT id, fiscal_year_id, code, name, period_number, start_date, end_date, status, created_at, updated_at
 			FROM fiscal_periods
-			WHERE fiscal_year_id = $1
-			ORDER BY period_number ASC
-		`
-		periodRows, err := h.db.Query(periodsQuery, fy.ID)
-		if err == nil {
-			periods := make([]entity.FiscalPeriod, 0)
+			WHERE fiscal_year_id = ANY($1)
+			ORDER BY fiscal_year_id, period_number ASC
+		`, pq.Array(yearIDs))
+		if perr != nil {
+			// Previously the per-year error was swallowed and the year came back
+			// with no periods at all, indistinguishable from a year that has none.
+			h.log.Error("Failed to load fiscal periods", "error", perr)
+		} else {
 			for periodRows.Next() {
 				var fp entity.FiscalPeriod
-				err := periodRows.Scan(
+				if scanErr := periodRows.Scan(
 					&fp.ID, &fp.FiscalYearID, &fp.Code, &fp.Name, &fp.PeriodNumber,
 					&fp.StartDate, &fp.EndDate, &fp.Status, &fp.CreatedAt, &fp.UpdatedAt,
-				)
-				if err == nil {
-					periods = append(periods, fp)
+				); scanErr != nil {
+					h.log.Error("Failed to scan fiscal period", "error", scanErr)
+					continue
+				}
+				if fy, found := byYear[fp.FiscalYearID]; found {
+					fy.Periods = append(fy.Periods, fp)
 				}
 			}
 			periodRows.Close()
-			fy.Periods = periods
 		}
-
-		fiscalYears = append(fiscalYears, &fy)
 	}
 
 	response.Success(c, fiscalYears)

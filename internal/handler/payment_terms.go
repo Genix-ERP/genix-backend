@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -47,7 +48,21 @@ func (h *Handler) ListPaymentTerms(c *gin.Context) {
 		argIndex++
 	}
 
+	// The count must reproduce BOTH filters, and active_only is inlined as
+	// literal SQL while term_type is a bound param — mirroring only the bound
+	// one would report a total the page can never reach.
+	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM payment_terms"):]
+
 	query += " ORDER BY display_order ASC, name ASC"
+
+	// Opt-in paging: this feeds the payment-terms dropdown in the quotation
+	// template form, which needs the whole set when it sends no params.
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		query += " LIMIT $" + strconv.Itoa(argIndex) + " OFFSET $" + strconv.Itoa(argIndex+1)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -78,7 +93,17 @@ func (h *Handler) ListPaymentTerms(c *gin.Context) {
 		terms = []entity.PaymentTerm{}
 	}
 
-	response.Success(c, terms)
+	if !paginate {
+		response.Success(c, terms)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(countQuery, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count payment terms", "error", err)
+		total = len(terms)
+	}
+	response.Paginated(c, terms, page, pageSize, total)
 }
 
 // GetPaymentTerm returns a single payment term
