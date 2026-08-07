@@ -16,8 +16,11 @@ import (
 // posted ledger, scoped by tenant/org and the requested period:
 //
 //   - totals:            income / expense / net for the period
-//   - cash:              balance per CASH-type account as of period_to,
-//                        plus a daily cumulative series for the period
+//   - cash:              balance per cash/bank account as of period_to, plus a
+//                        daily cumulative series over the same account set.
+//                        Both use the shared definition in cash_balance.go —
+//                        the one /reports/cash-flow also calls, so the web card,
+//                        its chart, and the mobile card cannot disagree.
 //   - monthly:           income vs expense per month across the period
 //   - expense_breakdown: category-enriched — expense-sourced JE lines are
 //                        labelled by their Xarajatlar category (join via
@@ -88,38 +91,42 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 		Name    string  `json:"name"`
 		Balance float64 `json:"balance"`
 	}
-	cashAccounts := make([]cashAccount, 0, 4)
-	var cashTotal float64
-	cashArgs := []interface{}{tenantID, periodTo}
-	cashOrgFilter := ""
+	// Shared with /reports/cash-flow via cashBalancesAsOf (cash_balance.go) —
+	// the two used to compute this independently and disagreed for the same
+	// tenant and period. What changes here versus the old inline query: bank
+	// accounts join the set, accounts.opening_balance now counts, and orgs are
+	// scoped on the account rather than the journal entry. The figure will move
+	// for tenants that used opening balances or have bank-flagged accounts that
+	// are not typed CASH; that is the correction, not a regression.
+	cashScopeOrg := uuid.Nil
 	if orgScoped {
-		cashOrgFilter = " AND je.organization_id = $3"
-		cashArgs = append(cashArgs, orgID)
+		cashScopeOrg = orgID
 	}
-	cashRows, err := h.db.Query(`
-		SELECT a.code, COALESCE(a.name_uz, a.name), COALESCE(SUM(l.debit_amount - l.credit_amount), 0) AS bal
-		FROM accounts a
-		JOIN account_types at ON at.id = a.account_type_id AND at.code = 'CASH'
-		LEFT JOIN (
-			journal_entry_lines l
-			JOIN journal_entries je ON je.id = l.journal_entry_id
-				AND je.status = 'posted' AND je.deleted_at IS NULL
-				AND je.entry_date <= $2`+cashOrgFilter+`
-		) ON l.account_id = a.id
-		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true AND a.is_leaf = true
-		GROUP BY a.code, COALESCE(a.name_uz, a.name)
-		HAVING COALESCE(SUM(l.debit_amount - l.credit_amount), 0) <> 0
-		ORDER BY a.code
-	`, cashArgs...)
-	if err == nil {
-		for cashRows.Next() {
-			var ca cashAccount
-			if cashRows.Scan(&ca.Code, &ca.Name, &ca.Balance) == nil {
-				cashAccounts = append(cashAccounts, ca)
-				cashTotal += ca.Balance
-			}
+	cashAccounts := make([]cashAccount, 0, 4)
+	balances, cashTotal, err := h.cashBalancesAsOf(tenantID, cashScopeOrg, periodTo)
+	if err != nil {
+		h.log.Error("Failed to load cash position", "error", err)
+	}
+	// Merge accounts sharing a code before display. Codes are unique per
+	// (tenant, organization), so a tenant-wide (unscoped) request legitimately
+	// returns one 5010 per organization — and the web card keys these rows by
+	// code (FinanceDashboard.jsx), so emitting duplicates would collide. The
+	// helper stays honest and returns them separately; folding them is this
+	// card's concern. cashTotal is unaffected either way.
+	byCode := make(map[string]int, len(balances))
+	for _, b := range balances {
+		// Zero-balance accounts stay hidden from the per-account list, as
+		// before. cashTotal is computed over the whole set, so hiding them
+		// cannot make the rows and the total disagree.
+		if b.Balance == 0 {
+			continue
 		}
-		cashRows.Close()
+		if i, seen := byCode[b.Code]; seen {
+			cashAccounts[i].Balance += b.Balance
+			continue
+		}
+		byCode[b.Code] = len(cashAccounts)
+		cashAccounts = append(cashAccounts, cashAccount{Code: b.Code, Name: b.Name, Balance: b.Balance})
 	}
 
 	// ── 3. Monthly income vs expense across the period ──────────────────
@@ -191,21 +198,45 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 		Balance float64 `json:"balance"`
 	}
 	cashSeries := make([]cashPoint, 0, 62)
+	// Built on the SAME account set and the SAME formula as the cash KPI above
+	// (cashAccountSetSQL / cashBalancesAsOf in cash_balance.go), so the last
+	// point of this line equals the "Pul qoldig'i" figure on the same card.
+	// It previously used a third definition of its own — CASH-typed accounts
+	// only, with no is_leaf filter (so parent rollups double-counted their
+	// children), no is_active filter, and no opening_balance — which is why the
+	// chart and the number it sits under could not be reconciled. The comment
+	// above claimed the line "starts at the true opening balance"; it did not,
+	// because accounts.opening_balance was never in the query.
+	csOrgFilter := ""
+	csArgs := []interface{}{tenantID, periodFrom, periodTo}
+	if orgScoped {
+		csArgs = append(csArgs, orgID)
+		csOrgFilter = " AND a.organization_id = $4"
+	}
 	csRows, err := h.db.Query(`
-		WITH daily AS (
+		WITH acct AS (
+			SELECT a.id, a.opening_balance
+			FROM accounts a
+			JOIN account_types at ON at.id = a.account_type_id
+			WHERE`+cashAccountSetSQL+csOrgFilter+`
+		), base AS (
+			SELECT COALESCE(SUM(opening_balance), 0) AS ob FROM acct
+		), daily AS (
 			SELECT je.entry_date::date AS d, SUM(l.debit_amount - l.credit_amount) AS delta
 			FROM journal_entry_lines l
 			JOIN journal_entries je ON je.id = l.journal_entry_id
 				AND je.status = 'posted' AND je.deleted_at IS NULL
-				AND je.entry_date <= $3`+orgFilterJE+`
-			JOIN accounts a ON a.id = l.account_id AND a.tenant_id = $1 AND a.deleted_at IS NULL
-			JOIN account_types at ON at.id = a.account_type_id AND at.code = 'CASH'
+				AND je.entry_date <= $3
+			JOIN acct ON acct.id = l.account_id
 			GROUP BY 1
 		), cum AS (
-			SELECT d, SUM(delta) OVER (ORDER BY d) AS bal FROM daily
+			SELECT d, SUM(delta) OVER (ORDER BY d) AS running FROM daily
 		)
-		SELECT to_char(d, 'YYYY-MM-DD'), bal FROM cum WHERE d >= $2 ORDER BY d
-	`, jeArgs()...)
+		SELECT to_char(cum.d, 'YYYY-MM-DD'), base.ob + cum.running
+		FROM cum CROSS JOIN base
+		WHERE cum.d >= $2
+		ORDER BY cum.d
+	`, csArgs...)
 	if err == nil {
 		for csRows.Next() {
 			var cp cashPoint
