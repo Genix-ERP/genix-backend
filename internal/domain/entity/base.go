@@ -29,21 +29,38 @@ type AuditableEntity struct {
 
 // Pagination represents pagination parameters
 type Pagination struct {
-	Page     int `json:"page" form:"page"`
-	Limit    int `json:"limit" form:"limit"`
-	Total    int `json:"total"`
-	Pages    int `json:"pages"`
-	HasNext  bool `json:"has_next"`
-	HasPrev  bool `json:"has_prev"`
+	Page    int  `json:"page" form:"page"`
+	Limit   int  `json:"limit" form:"limit"`
+	Total   int  `json:"total"`
+	Pages   int  `json:"pages"`
+	HasNext bool `json:"has_next"`
+	HasPrev bool `json:"has_prev"`
 }
 
-// NewPagination creates a new pagination with defaults
+// DefaultPageLimit / MaxPageLimit are the shared paging defaults.
+const (
+	DefaultPageLimit = 20
+	MaxPageLimit     = 100
+)
+
+// NewPagination creates a new pagination with defaults.
+//
+// An over-cap request is CLAMPED DOWN TO THE CAP, not silently reset to the
+// default. The old `if limit < 1 || limit > 100 { limit = 20 }` meant a client
+// asking for 150 rows got 20 with no way to tell — and, worse, a handler that
+// legitimately serves more than the cap (ListAccounts serves up to 500) then
+// reported `limit: 20` in its meta for a 500-row page, so total_pages/has_next
+// were computed from the wrong page size. Callers that serve more than
+// MaxPageLimit should build the Pagination directly with their own limit.
 func NewPagination(page, limit int) *Pagination {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
-		limit = 20
+	if limit < 1 {
+		limit = DefaultPageLimit
+	}
+	if limit > MaxPageLimit {
+		limit = MaxPageLimit
 	}
 	return &Pagination{
 		Page:  page,
@@ -59,7 +76,13 @@ func (p *Pagination) Offset() int {
 // Calculate calculates pagination metadata
 func (p *Pagination) Calculate(total int) {
 	p.Total = total
-	p.Pages = (total + p.Limit - 1) / p.Limit
+	// Guard the division: callers may now construct a Pagination directly (to
+	// keep a limit above MaxPageLimit), and a zero Limit would panic here.
+	if p.Limit > 0 {
+		p.Pages = (total + p.Limit - 1) / p.Limit
+	} else {
+		p.Pages = 0
+	}
 	p.HasNext = p.Page < p.Pages
 	p.HasPrev = p.Page > 1
 }
