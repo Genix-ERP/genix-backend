@@ -1240,15 +1240,37 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// Currencies
+	// This group had NO permission middleware at all, on a table that was
+	// global to every tenant on the server — so any authenticated user could
+	// rename USD, deactivate a currency, or set a base currency, for everyone.
+	// The data half is fixed by migration 471 (per-tenant policy in
+	// tenant_currencies); this is the authorisation half.
+	//
+	// Only the WRITES are gated. The reads are left open on purpose: after the
+	// migration, GET /currencies returns ISO catalogue fields plus the calling
+	// tenant's own rates and its own active/base flags — there is nothing
+	// cross-tenant left in the response, so gating it would buy no security
+	// and would 403 sales and purchase users who need currency codes to render
+	// an order. (crossModuleGrants cannot express a read-only grant — it
+	// propagates the caller's own can_update — so granting them read would
+	// have handed them base-currency writes as well.)
+	//
+	// finance:currency:update is granted by migration 471 to every role that
+	// can already configure GL accounts, and employees with the finance module
+	// get it automatically: "currency" is already in loadPermissions'
+	// resourceMap for finance. Site admins and owners bypass as usual.
+	// Catalogue-level edits — a currency's name, symbol or decimal places, or
+	// adding a brand-new code — affect every tenant and are checked separately
+	// inside the handlers, where they require a platform administrator.
 	currencies := rg.Group("/currencies")
 	{
 		currencies.GET("", h.ListCurrencies)
-		currencies.POST("", h.CreateCurrency)
+		currencies.POST("", h.perm.Require("finance", "currency", "update"), h.CreateCurrency)
 		currencies.GET("/:code", h.GetCurrency)
-		currencies.PUT("/:code", h.UpdateCurrency)
-		currencies.DELETE("/:code", h.DeleteCurrency)
+		currencies.PUT("/:code", h.perm.Require("finance", "currency", "update"), h.UpdateCurrency)
+		currencies.DELETE("/:code", h.perm.Require("finance", "currency", "update"), h.DeleteCurrency)
 		currencies.GET("/:code/rate", h.GetExchangeRate)
-		currencies.POST("/:code/rate", h.SetExchangeRate)
+		currencies.POST("/:code/rate", h.perm.Require("finance", "currency", "update"), h.SetExchangeRate)
 	}
 
 	// Exchange Rates
