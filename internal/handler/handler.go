@@ -1749,6 +1749,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		notifications.GET("/unread-count", h.UnreadCount)
 		notifications.PUT("/:id/read", h.MarkNotificationRead)
 		notifications.DELETE("/:id", h.DeleteNotification)
+		// Clear-all. Registered as DELETE on the collection so it cannot
+		// collide with DELETE /:id.
+		notifications.DELETE("", h.ClearAllNotifications)
 		notifications.PUT("/read-all", h.MarkAllNotificationsRead)
 	}
 
