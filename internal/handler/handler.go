@@ -1363,6 +1363,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		bankImport.POST("", h.ImportBankStatement1C)
 		bankImport.GET("", h.ListBankImports)
+
+		// Excel vipiska (Turonbank format) — parse + auto-classify + review,
+		// then post or reject each line. Ported from the yuksalish branch,
+		// where these have been live; genix and sharja 404'd on all five.
+		//
+		// Gated per-route on finance:bank_account, not with a group-level
+		// Use(): the two routes above predate this and currently carry no
+		// gate at all, and silently tightening them is an unrelated
+		// regression that belongs in its own change.
+		bankImport.POST("/vipiska", h.perm.Require("finance", "bank_account", "update"), h.ImportBankVipiska)
+		bankImport.GET("/:id/transactions", h.perm.Require("finance", "bank_account", "read"), h.GetBankVipiskaTransactions)
+		bankImport.PUT("/lines/:lineId/accounts", h.perm.Require("finance", "bank_account", "update"), h.UpdateBankVipiskaLineAccounts)
+		bankImport.POST("/lines/:lineId/confirm", h.perm.Require("finance", "bank_account", "update"), h.ConfirmBankVipiskaLine)
+		bankImport.POST("/lines/:lineId/reject", h.perm.Require("finance", "bank_account", "update"), h.RejectBankVipiskaLine)
 	}
 
 	// E-invoice (TT Buxgalteriya §8.2)
