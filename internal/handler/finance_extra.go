@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,18 +24,28 @@ import (
 
 // ========== CASH REGISTERS ==========
 
-func (h *Handler) ListCashRegisters(c *gin.Context)  { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateCashRegister(c *gin.Context) { response.Created(c, gin.H{"message": "Cash register created"}) }
-func (h *Handler) GetCashRegister(c *gin.Context)    { response.NotFound(c, "Cash register") }
-func (h *Handler) UpdateCashRegister(c *gin.Context) { response.Success(c, gin.H{"message": "Cash register updated"}) }
+func (h *Handler) ListCashRegisters(c *gin.Context) { response.Success(c, []interface{}{}) }
+func (h *Handler) CreateCashRegister(c *gin.Context) {
+	response.Created(c, gin.H{"message": "Cash register created"})
+}
+func (h *Handler) GetCashRegister(c *gin.Context) { response.NotFound(c, "Cash register") }
+func (h *Handler) UpdateCashRegister(c *gin.Context) {
+	response.Success(c, gin.H{"message": "Cash register updated"})
+}
 
 // ========== CASH ORDERS (PKO/RKO) ==========
 
-func (h *Handler) ListCashOrders(c *gin.Context)   { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateCashOrder(c *gin.Context)  { response.Created(c, gin.H{"message": "Cash order created"}) }
-func (h *Handler) GetCashOrder(c *gin.Context)     { response.NotFound(c, "Cash order") }
-func (h *Handler) UpdateCashOrder(c *gin.Context)  { response.Success(c, gin.H{"message": "Cash order updated"}) }
-func (h *Handler) ConfirmCashOrder(c *gin.Context) { response.Success(c, gin.H{"message": "Cash order confirmed"}) }
+func (h *Handler) ListCashOrders(c *gin.Context) { response.Success(c, []interface{}{}) }
+func (h *Handler) CreateCashOrder(c *gin.Context) {
+	response.Created(c, gin.H{"message": "Cash order created"})
+}
+func (h *Handler) GetCashOrder(c *gin.Context) { response.NotFound(c, "Cash order") }
+func (h *Handler) UpdateCashOrder(c *gin.Context) {
+	response.Success(c, gin.H{"message": "Cash order updated"})
+}
+func (h *Handler) ConfirmCashOrder(c *gin.Context) {
+	response.Success(c, gin.H{"message": "Cash order confirmed"})
+}
 
 // ========== CASH BOOK ==========
 
@@ -143,6 +154,7 @@ func (h *Handler) SyncCurrencyRates(c *gin.Context) {
 		"source":       "CBU",
 	})
 }
+
 // RunCurrencySyncScheduler starts a background goroutine that syncs CBU rates daily at 09:00 Tashkent time
 func (h *Handler) RunCurrencySyncScheduler(ctx context.Context) {
 	go func() {
@@ -300,7 +312,9 @@ func (h *Handler) syncCBURatesForAllTenants() {
 	h.log.Info("Daily CBU sync completed", "tenants", len(tenantIDs), "total_rates_synced", totalSynced)
 }
 
-func (h *Handler) RevalueCurrency(c *gin.Context)   { response.Success(c, gin.H{"message": "Currency revaluation completed"}) }
+func (h *Handler) RevalueCurrency(c *gin.Context) {
+	response.Success(c, gin.H{"message": "Currency revaluation completed"})
+}
 func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -311,6 +325,52 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 	dateFrom := c.DefaultQuery("date_from", "2020-01-01")
 	dateTo := c.DefaultQuery("date_to", time.Now().Format("2006-01-02"))
 
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	where := ` WHERE ed.tenant_id = $1 AND ed.deleted_at IS NULL
+		  AND ed.period_start >= $2 AND ed.period_start <= $3`
+	args := []interface{}{tenantID, dateFrom, dateTo}
+	n := 3
+	if cur := strings.TrimSpace(c.Query("currency")); cur != "" {
+		n++
+		where += fmt.Sprintf(" AND COALESCE(cur.code,'') = $%d", n)
+		args = append(args, cur)
+	}
+	if dt := strings.TrimSpace(c.Query("diff_type")); dt != "" {
+		n++
+		where += fmt.Sprintf(" AND ed.diff_type = $%d", n)
+		args = append(args, dt)
+	}
+
+	const from = `
+		FROM exchange_diffs ed
+		LEFT JOIN currencies cur ON ed.currency_id = cur.id`
+
+	// Gains/losses are aggregated over the WHOLE filtered set, not the page —
+	// they used to be summed inside the row loop, which silently becomes
+	// page-only the moment LIMIT is introduced.
+	var total int
+	var totalGain, totalLoss float64
+	if err := h.db.QueryRow(`
+		SELECT COUNT(*),
+		       COALESCE(SUM(ed.amount_uzs) FILTER (WHERE ed.diff_type = 'positive'), 0),
+		       COALESCE(SUM(ed.amount_uzs) FILTER (WHERE ed.diff_type <> 'positive'), 0)`+
+		from+where, args...).Scan(&total, &totalGain, &totalLoss); err != nil {
+		h.log.Error("Failed to aggregate exchange diffs", "error", err)
+		response.InternalError(c, "Failed to list exchange diffs")
+		return
+	}
+
 	query := `
 		SELECT ed.id, ed.currency_id, COALESCE(cur.code, '') as currency_code,
 			   ed.amount_uzs, ed.diff_type, ed.period_start, ed.description,
@@ -319,14 +379,11 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 			   COALESCE(ed.counterparty_name, '') as counterparty_name,
 			   COALESCE(ed.foreign_amount, 0) as foreign_amount,
 			   COALESCE(ed.initial_rate, 0) as initial_rate,
-			   COALESCE(ed.final_rate, 0) as final_rate
-		FROM exchange_diffs ed
-		LEFT JOIN currencies cur ON ed.currency_id = cur.id
-		WHERE ed.tenant_id = $1 AND ed.deleted_at IS NULL
-		  AND ed.period_start >= $2 AND ed.period_start <= $3
-		ORDER BY ed.period_start DESC`
+			   COALESCE(ed.final_rate, 0) as final_rate` + from + where +
+		fmt.Sprintf(" ORDER BY ed.period_start DESC, ed.id DESC LIMIT %d OFFSET %d",
+			pageSize, (page-1)*pageSize)
 
-	rows, err := h.db.Query(query, tenantID, dateFrom, dateTo)
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list exchange diffs", "error", err)
 		response.InternalError(c, "Failed to list exchange diffs")
@@ -334,8 +391,7 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	var results []map[string]interface{}
-	var totalGain, totalLoss float64
+	results := make([]map[string]interface{}, 0)
 
 	for rows.Next() {
 		var edID, currencyID uuid.UUID
@@ -351,36 +407,46 @@ func (h *Handler) ListExchangeDiffs(c *gin.Context) {
 		}
 
 		item := map[string]interface{}{
-			"id":                edID.String(),
-			"currency_code":    currencyCode,
-			"amount":           amount,
-			"type":             diffType,
-			"date":             periodStart.Format("2006-01-02"),
-			"description":      description,
-			"created_at":       createdAt,
-			"document_number":  documentNumber,
-			"counterparty":     counterpartyName,
-			"foreign_amount":   foreignAmount,
-			"initial_rate":     initialRate,
-			"final_rate":       finalRate,
+			"id":              edID.String(),
+			"currency_code":   currencyCode,
+			"amount":          amount,
+			"type":            diffType,
+			"date":            periodStart.Format("2006-01-02"),
+			"description":     description,
+			"created_at":      createdAt,
+			"document_number": documentNumber,
+			"counterparty":    counterpartyName,
+			"foreign_amount":  foreignAmount,
+			"initial_rate":    initialRate,
+			"final_rate":      finalRate,
 		}
 		if journalEntryID.Valid {
 			item["journal_entry_id"] = journalEntryID.String
 		}
 		results = append(results, item)
-
-		if diffType == "positive" {
-			totalGain += amount
-		} else {
-			totalLoss += amount
-		}
 	}
 
-	response.Success(c, gin.H{
-		"items":      results,
-		"total_gain": totalGain,
-		"total_loss": totalLoss,
-		"net":        totalGain - totalLoss,
+	// `data` MUST be the array. It used to be an object ({items, total_gain…}),
+	// and the client's extractor only accepts a List — so it fell through to an
+	// empty list and the Kurs farqlari tab rendered blank on a healthy 200.
+	// Totals move to a `summary` sibling next to `meta`.
+	totalPages := 0
+	if pageSize > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    results,
+		"meta": gin.H{
+			"page": page, "limit": pageSize, "page_size": pageSize,
+			"total": total, "total_pages": totalPages,
+			"has_next": page < totalPages, "has_prev": page > 1,
+		},
+		"summary": gin.H{
+			"total_gain": totalGain,
+			"total_loss": totalLoss,
+			"net":        totalGain - totalLoss,
+		},
 	})
 }
 
@@ -565,7 +631,7 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"items":           items,
+		"items":             items,
 		"total_invoice_uzs": totalInvoiceUZS,
 		"total_current_uzs": totalCurrentUZS,
 		"total_diff":        totalDiff,
@@ -575,32 +641,32 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 // ========== RECONCILIATION ACTS (Akt sverka) ==========
 
 type reconciliationActResponse struct {
-	ID             uuid.UUID              `json:"id"`
-	PartnerID      uuid.UUID              `json:"partner_id"`
-	PartnerName    string                 `json:"partner_name"`
-	PeriodStart    string                 `json:"period_start"`
-	PeriodEnd      string                 `json:"period_end"`
-	OpeningBalance float64                `json:"opening_balance"`
-	OurDebitTotal  float64                `json:"our_debit_total"`
-	OurCreditTotal float64                `json:"our_credit_total"`
-	OurBalance     float64                `json:"our_balance"`
-	ClosingBalance float64                `json:"closing_balance"`
-	Status         string                 `json:"status"`
-	Notes          *string                `json:"notes"`
-	Lines          []reconciliationLine   `json:"lines,omitempty"`
-	CreatedAt      time.Time              `json:"created_at"`
+	ID             uuid.UUID            `json:"id"`
+	PartnerID      uuid.UUID            `json:"partner_id"`
+	PartnerName    string               `json:"partner_name"`
+	PeriodStart    string               `json:"period_start"`
+	PeriodEnd      string               `json:"period_end"`
+	OpeningBalance float64              `json:"opening_balance"`
+	OurDebitTotal  float64              `json:"our_debit_total"`
+	OurCreditTotal float64              `json:"our_credit_total"`
+	OurBalance     float64              `json:"our_balance"`
+	ClosingBalance float64              `json:"closing_balance"`
+	Status         string               `json:"status"`
+	Notes          *string              `json:"notes"`
+	Lines          []reconciliationLine `json:"lines,omitempty"`
+	CreatedAt      time.Time            `json:"created_at"`
 	// Response tracking
 	ResponseStatus *string    `json:"response_status,omitempty"`
 	RespondedAt    *time.Time `json:"responded_at,omitempty"`
 	DisputeNote    *string    `json:"dispute_note,omitempty"`
 	RespondentName *string    `json:"respondent_name,omitempty"`
-	SentAt          *time.Time `json:"sent_at,omitempty"`
-	SentVia         *string    `json:"sent_via,omitempty"`
-	SentTo          *string    `json:"sent_to,omitempty"`
-	DisputeAmount   *float64   `json:"dispute_amount,omitempty"`
-	ShareExpiresAt  *time.Time `json:"share_expires_at,omitempty"`
-	Reminder3dSent  bool       `json:"reminder_3d_sent"`
-	Reminder7dSent  bool       `json:"reminder_7d_sent"`
+	SentAt         *time.Time `json:"sent_at,omitempty"`
+	SentVia        *string    `json:"sent_via,omitempty"`
+	SentTo         *string    `json:"sent_to,omitempty"`
+	DisputeAmount  *float64   `json:"dispute_amount,omitempty"`
+	ShareExpiresAt *time.Time `json:"share_expires_at,omitempty"`
+	Reminder3dSent bool       `json:"reminder_3d_sent"`
+	Reminder7dSent bool       `json:"reminder_7d_sent"`
 }
 
 type reconciliationLineItem struct {
@@ -611,15 +677,15 @@ type reconciliationLineItem struct {
 }
 
 type reconciliationLine struct {
-	Date           string                  `json:"date"`
-	Document       string                  `json:"document"`
-	Description    string                  `json:"description"`
-	Debit          float64                 `json:"debit"`
-	Credit         float64                 `json:"credit"`
-	RunningBalance float64                 `json:"running_balance"`
-	SourceType     string                  `json:"source_type,omitempty"`
-	SourceID       *uuid.UUID              `json:"source_id,omitempty"`
-	VehicleNumber  string                  `json:"vehicle_number,omitempty"`
+	Date           string                   `json:"date"`
+	Document       string                   `json:"document"`
+	Description    string                   `json:"description"`
+	Debit          float64                  `json:"debit"`
+	Credit         float64                  `json:"credit"`
+	RunningBalance float64                  `json:"running_balance"`
+	SourceType     string                   `json:"source_type,omitempty"`
+	SourceID       *uuid.UUID               `json:"source_id,omitempty"`
+	VehicleNumber  string                   `json:"vehicle_number,omitempty"`
 	Items          []reconciliationLineItem `json:"items,omitempty"`
 }
 
@@ -711,12 +777,12 @@ func getUzDescription(sourceType, originalDescription string) string {
 		"purchase_return":          "Xariddan qaytarish",
 		"debit_note":               "Debet nota",
 		// Sotuv (Sales)
-		"sales_invoice":      "Sotuv fakturasi",
-		"sales_order":        "Sotuv buyurtmasi",
-		"sales_return":       "Sotuvdan qaytarish",
+		"sales_invoice":       "Sotuv fakturasi",
+		"sales_order":         "Sotuv buyurtmasi",
+		"sales_return":        "Sotuvdan qaytarish",
 		"sales_return_refund": "Sotuvdan qaytarish to'lovi",
-		"credit_note":        "Kredit nota",
-		"payment_receipt":    "To'lov qabul qilish",
+		"credit_note":         "Kredit nota",
+		"payment_receipt":     "To'lov qabul qilish",
 		// To'lovlar (Payments)
 		"payment": "To'lov",
 		// Ombor (Inventory)
@@ -752,9 +818,9 @@ func getUzDescription(sourceType, originalDescription string) string {
 		"advance_payment":  "Oldindan to'lov",
 		"refund":           "Qaytarish (refund)",
 		// Faktura (Invoice variants)
-		"invoice":         "Faktura",
-		"bill":            "Hisob-faktura",
-		"proforma":        "Proforma faktura",
+		"invoice":  "Faktura",
+		"bill":     "Hisob-faktura",
+		"proforma": "Proforma faktura",
 		// Boshqa (Other)
 		"expense":                      "Xarajat",
 		"landed_cost":                  "Qo'shimcha xarajat",
@@ -2300,11 +2366,15 @@ func (h *Handler) renderReconciliationEmailHTML(act reconciliationActResponse, l
 
 // ========== BUDGETS (extended) ==========
 
-func (h *Handler) ListBudgetsV2(c *gin.Context)        { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateBudgetV2(c *gin.Context)       { response.Created(c, gin.H{"message": "Budget created"}) }
-func (h *Handler) GetBudgetV2(c *gin.Context)          { response.NotFound(c, "Budget") }
-func (h *Handler) UpdateBudgetV2(c *gin.Context)       { response.Success(c, gin.H{"message": "Budget updated"}) }
-func (h *Handler) DeleteBudgetV2(c *gin.Context)       { response.NoContent(c) }
+func (h *Handler) ListBudgetsV2(c *gin.Context) { response.Success(c, []interface{}{}) }
+func (h *Handler) CreateBudgetV2(c *gin.Context) {
+	response.Created(c, gin.H{"message": "Budget created"})
+}
+func (h *Handler) GetBudgetV2(c *gin.Context) { response.NotFound(c, "Budget") }
+func (h *Handler) UpdateBudgetV2(c *gin.Context) {
+	response.Success(c, gin.H{"message": "Budget updated"})
+}
+func (h *Handler) DeleteBudgetV2(c *gin.Context) { response.NoContent(c) }
 
 func (h *Handler) GetConsolidatedBudget(c *gin.Context) {
 	response.Success(c, gin.H{"consolidated": []interface{}{}, "total_planned": 0, "total_actual": 0})
@@ -2318,4 +2388,3 @@ func nullStr(s string) interface{} {
 	}
 	return s
 }
-

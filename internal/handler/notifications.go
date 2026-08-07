@@ -3,6 +3,8 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -259,21 +261,46 @@ func (h *Handler) ListNotifications(c *gin.Context) {
 
 	isReadFilter := c.Query("is_read")
 
-	query := `
-		SELECT id, type, title, COALESCE(message, ''), COALESCE(data::text, '{}'),
-		       channel, priority, is_read, created_at, read_at
-		FROM notifications
-		WHERE tenant_id = $1 AND user_id = $2
-	`
+	// Was a hard `LIMIT 50` with no offset and no meta: notification 51 was
+	// unreachable by any client and nothing signalled the truncation.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	where := " WHERE tenant_id = $1 AND user_id = $2"
 	args := []interface{}{tenantID, userID}
 
 	if isReadFilter == "false" {
-		query += " AND is_read = false"
+		where += " AND is_read = false"
 	} else if isReadFilter == "true" {
-		query += " AND is_read = true"
+		where += " AND is_read = true"
+	}
+	if t := strings.TrimSpace(c.Query("type")); t != "" {
+		where += fmt.Sprintf(" AND type = $%d", len(args)+1)
+		args = append(args, t)
 	}
 
-	query += " ORDER BY created_at DESC LIMIT 50"
+	var total int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM notifications`+where, args...).Scan(&total); err != nil {
+		response.InternalError(c, "Failed to query notifications")
+		return
+	}
+
+	// `id DESC` tiebreaker: notifications created in one transaction share a
+	// timestamp, and without it rows shuffle between pages.
+	query := `
+		SELECT id, type, title, COALESCE(message, ''), COALESCE(data::text, '{}'),
+		       channel, priority, is_read, created_at, read_at
+		FROM notifications` + where +
+		fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT %d OFFSET %d", pageSize, (page-1)*pageSize)
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -282,13 +309,13 @@ func (h *Handler) ListNotifications(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	var notifications []map[string]interface{}
+	notifications := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var (
 			id, notifType, title, message, data, channel, priority string
-			isRead                                                  bool
-			createdAt                                               time.Time
-			readAt                                                  *time.Time
+			isRead                                                 bool
+			createdAt                                              time.Time
+			readAt                                                 *time.Time
 		)
 		if err := rows.Scan(&id, &notifType, &title, &message, &data, &channel, &priority, &isRead, &createdAt, &readAt); err != nil {
 			continue
@@ -312,7 +339,7 @@ func (h *Handler) ListNotifications(c *gin.Context) {
 	if notifications == nil {
 		notifications = []map[string]interface{}{}
 	}
-	response.Success(c, notifications)
+	response.Paginated(c, notifications, page, pageSize, total)
 }
 
 // UnreadCount returns the count of unread notifications for the current user

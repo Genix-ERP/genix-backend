@@ -3,6 +3,9 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -14,28 +17,28 @@ import (
 
 // TaxReportPeriod represents a tax reporting period
 type TaxReportPeriod struct {
-	ID                 uuid.UUID  `json:"id"`
-	TenantID           uuid.UUID  `json:"tenant_id"`
-	Name               string     `json:"name"`
-	PeriodType         string     `json:"period_type"`
-	StartDate          string     `json:"start_date"`
-	EndDate            string     `json:"end_date"`
-	Deadline           *string    `json:"deadline,omitempty"`
-	Status             string     `json:"status"`
-	TotalSales         float64    `json:"total_sales"`
-	TotalSalesTax      float64    `json:"total_sales_tax"`
-	TotalPurchases     float64    `json:"total_purchases"`
-	TotalPurchaseTax   float64    `json:"total_purchase_tax"`
-	NetTaxLiability    float64    `json:"net_tax_liability"`
-	FilingReference    *string    `json:"filing_reference,omitempty"`
-	FiledDate          *string    `json:"filed_date,omitempty"`
-	FiledByID          *uuid.UUID `json:"filed_by,omitempty"`
-	FiledByName        *string    `json:"filed_by_name,omitempty"`
-	Notes              *string    `json:"notes,omitempty"`
-	CreatedByID        *uuid.UUID `json:"created_by,omitempty"`
-	CreatedByName      *string    `json:"created_by_name,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	ID               uuid.UUID  `json:"id"`
+	TenantID         uuid.UUID  `json:"tenant_id"`
+	Name             string     `json:"name"`
+	PeriodType       string     `json:"period_type"`
+	StartDate        string     `json:"start_date"`
+	EndDate          string     `json:"end_date"`
+	Deadline         *string    `json:"deadline,omitempty"`
+	Status           string     `json:"status"`
+	TotalSales       float64    `json:"total_sales"`
+	TotalSalesTax    float64    `json:"total_sales_tax"`
+	TotalPurchases   float64    `json:"total_purchases"`
+	TotalPurchaseTax float64    `json:"total_purchase_tax"`
+	NetTaxLiability  float64    `json:"net_tax_liability"`
+	FilingReference  *string    `json:"filing_reference,omitempty"`
+	FiledDate        *string    `json:"filed_date,omitempty"`
+	FiledByID        *uuid.UUID `json:"filed_by,omitempty"`
+	FiledByName      *string    `json:"filed_by_name,omitempty"`
+	Notes            *string    `json:"notes,omitempty"`
+	CreatedByID      *uuid.UUID `json:"created_by,omitempty"`
+	CreatedByName    *string    `json:"created_by_name,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 // TaxReportLine represents a line item in a tax report
@@ -786,13 +789,13 @@ func (h *Handler) GetTaxReportSummary(c *gin.Context) {
 			"end_date":   endDate,
 		},
 		"sales": gin.H{
-			"total_amount":     totalSales,
-			"total_tax":        totalSalesTax,
+			"total_amount":      totalSales,
+			"total_tax":         totalSalesTax,
 			"transaction_count": salesCount,
 		},
 		"purchases": gin.H{
-			"total_amount":     totalPurchases,
-			"total_tax":        totalPurchaseTax,
+			"total_amount":      totalPurchases,
+			"total_tax":         totalPurchaseTax,
 			"transaction_count": purchaseCount,
 		},
 		"net_tax_liability": totalSalesTax - totalPurchaseTax,
@@ -815,7 +818,16 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 
 	startDate := c.Query("start_date")
 	endDate := c.Query("end_date")
-	txType := c.Query("type") // sales, purchases
+	// Accept both vocabularies: the client's chips send 'sale'/'purchase',
+	// this handler historically wanted 'sales'/'purchases'. Mismatched values
+	// used to silently select BOTH arms, so the chips looked broken.
+	txType := strings.ToLower(strings.TrimSpace(c.Query("type")))
+	switch txType {
+	case "sale":
+		txType = "sales"
+	case "purchase":
+		txType = "purchases"
+	}
 
 	// Build date filter clause and args dynamically
 	hasDates := startDate != "" && endDate != ""
@@ -875,7 +887,8 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 
 				tx := map[string]interface{}{
 					"id":                 id,
-					"transaction_type":   txTypeStr,
+					"transaction_type":   taxTxKind(txTypeStr),
+					"document_type":      txTypeStr,
 					"transaction_number": txNumber,
 					"transaction_date":   txDate.Format("2006-01-02"),
 					"party_type":         partyType,
@@ -945,7 +958,8 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 
 				tx := map[string]interface{}{
 					"id":                 id,
-					"transaction_type":   txTypeStr,
+					"transaction_type":   taxTxKind(txTypeStr),
+					"document_type":      txTypeStr,
 					"transaction_number": txNumber,
 					"transaction_date":   txDate.Format("2006-01-02"),
 					"party_type":         partyType,
@@ -968,7 +982,33 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 		}
 	}
 
-	response.Success(c, transactions)
+	// Both arms are ordered by date individually; sort the union so paging is
+	// meaningful, then slice. (Row counts here are bounded by the period filter.)
+	sort.SliceStable(transactions, func(i, j int) bool {
+		return fmt.Sprint(transactions[i]["transaction_date"]) > fmt.Sprint(transactions[j]["transaction_date"])
+	})
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	total := len(transactions)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	response.Paginated(c, transactions[start:end], page, pageSize, total)
 }
 
 // PayTaxPeriod records a tax payment for a period, creates journal entry, and marks period as paid
@@ -1210,4 +1250,18 @@ func (h *Handler) PayTaxPeriod(c *gin.Context) {
 		"amount":           period.NetTaxLiability,
 		"paid_at":          now,
 	})
+}
+
+// taxTxKind maps the internal document type to the transaction_type vocabulary
+// the clients filter on ('sale' / 'purchase'). The raw value stays available as
+// document_type so existing consumers of 'sales_invoice'/'purchase_invoice'
+// keep working.
+func taxTxKind(documentType string) string {
+	switch documentType {
+	case "sales_invoice":
+		return "sale"
+	case "purchase_invoice":
+		return "purchase"
+	}
+	return documentType
 }
