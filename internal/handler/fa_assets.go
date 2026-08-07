@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
+	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -712,18 +713,67 @@ func (h *Handler) GetAssetSchedule(c *gin.Context) {
 // ListAssets / GetAsset — read views over the register (§2.1).
 func (h *Handler) ListAssets(c *gin.Context) {
 	tenantID, _ := middleware.GetTenantID(c)
-	rows, err := h.db.Query(`
-		SELECT a.id, a.inventory_number, a.name, a.status::text, a.cost, a.salvage_value, a.useful_life_months,
-		       a.accumulated_depreciation, (a.cost - a.accumulated_depreciation) AS book_value,
-		       a.category_id, c.name_uz, d.name_uz, COALESCE(a.serial_number,''), a.purchase_date, a.commissioning_date,
-		       COALESCE(e.first_name || ' ' || e.last_name, ''), COALESCE(cp.name, '')
+
+	// Paging + filters. Previously this read zero query params and had no LIMIT,
+	// so the whole asset register shipped on every open and the client could
+	// neither page nor count (faOK carries no meta). Search and the status
+	// filter were both done in Dart over whatever had been downloaded.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 { // clamp to the cap, never fall back to the default
+		pageSize = 100
+	}
+
+	where := " WHERE a.tenant_id=$1 AND a.deleted_at IS NULL"
+	args := []interface{}{tenantID}
+	n := 1
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		n++
+		where += fmt.Sprintf(` AND (a.name ILIKE $%d OR a.inventory_number ILIKE $%d
+			OR COALESCE(a.serial_number,'') ILIKE $%d OR c.name_uz ILIKE $%d)`, n, n, n, n)
+		args = append(args, "%"+q+"%")
+	}
+	if st := strings.TrimSpace(c.Query("status")); st != "" && strings.ToLower(st) != "all" {
+		n++
+		where += fmt.Sprintf(" AND a.status::text = $%d", n)
+		args = append(args, st)
+	}
+	if cat := strings.TrimSpace(c.Query("category_id")); cat != "" {
+		if cid, e := uuid.Parse(cat); e == nil {
+			n++
+			where += fmt.Sprintf(" AND a.category_id = $%d", n)
+			args = append(args, cid)
+		}
+	}
+
+	// The COUNT must repeat both INNER JOINs — an asset whose category or
+	// department row was deleted is absent from the page, so counting off
+	// fa_assets alone would promise a page that never materialises.
+	const joins = `
 		FROM fa_assets a
 		JOIN fa_categories c ON c.id = a.category_id
 		JOIN fa_departments d ON d.id = a.department_id
 		LEFT JOIN employees e ON e.id = a.assigned_employee_id
-		LEFT JOIN construction_projects cp ON cp.id = a.construction_object_id
-		WHERE a.tenant_id=$1 AND a.deleted_at IS NULL
-		ORDER BY a.inventory_number`, tenantID)
+		LEFT JOIN construction_projects cp ON cp.id = a.construction_object_id`
+
+	var total int
+	if err := h.db.QueryRow(`SELECT COUNT(*)`+joins+where, args...).Scan(&total); err != nil {
+		faErr(c, http.StatusInternalServerError, "QUERY_FAILED", "Xatolik", "Ошибка")
+		return
+	}
+
+	rows, err := h.db.Query(fmt.Sprintf(`
+		SELECT a.id, a.inventory_number, a.name, a.status::text, a.cost, a.salvage_value, a.useful_life_months,
+		       a.accumulated_depreciation, (a.cost - a.accumulated_depreciation) AS book_value,
+		       a.category_id, c.name_uz, d.name_uz, COALESCE(a.serial_number,''), a.purchase_date, a.commissioning_date,
+		       COALESCE(e.first_name || ' ' || e.last_name, ''), COALESCE(cp.name, '')`+joins+where+`
+		ORDER BY a.inventory_number LIMIT %d OFFSET %d`, pageSize, (page-1)*pageSize), args...)
 	if err != nil {
 		faErr(c, http.StatusInternalServerError, "QUERY_FAILED", "Xatolik", "Ошибка")
 		return
@@ -761,7 +811,10 @@ func (h *Handler) ListAssets(c *gin.Context) {
 			out = append(out, a)
 		}
 	}
-	faOK(c, out)
+	// response.Paginated instead of faOK: the success body is byte-identical
+	// ({success, data}) and this is the only way the client gets a meta to page
+	// with. faOK stays for singletons and mutations across the fa_* module.
+	response.Paginated(c, out, page, pageSize, total)
 }
 
 type updateAssetInfoInput struct {
