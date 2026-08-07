@@ -321,12 +321,9 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	// (docs/xarid-audit.md finding #8).
 	exchangeRate := input.ExchangeRate
 	if exchangeRate == 0 && currencyID != nil {
-		var baseCurrencyID uuid.UUID
-		if h.db.QueryRow(`
-			SELECT id FROM currencies
-			WHERE (is_base_currency = true OR code = 'UZS') AND is_active = true
-			ORDER BY is_base_currency DESC LIMIT 1
-		`).Scan(&baseCurrencyID) == nil && baseCurrencyID != *currencyID {
+		// This tenant's base currency (currency_scope.go).
+		baseCurrencyID, baseErr := h.baseCurrencyID(tenantID)
+		if baseErr == nil && baseCurrencyID != uuid.Nil && baseCurrencyID != *currencyID {
 			var lockedRate float64
 			if h.db.QueryRow(`
 				SELECT rate FROM exchange_rates

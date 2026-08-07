@@ -819,6 +819,21 @@ func RequireSystemAdmin() gin.HandlerFunc {
 	}
 }
 
+// IsSystemAdmin reports whether the caller is a platform administrator.
+// The bool twin of RequireSystemAdmin, for handlers that need to branch on it
+// rather than reject outright — e.g. a route where the same verb means a
+// per-tenant action for ordinary users and a shared-catalogue edit for
+// platform admins. Fails closed: no claims, or claims of the wrong type,
+// means not an admin.
+func IsSystemAdmin(c *gin.Context) bool {
+	claims, exists := c.Get(ContextKeyClaims)
+	if !exists {
+		return false
+	}
+	jwtClaims, ok := claims.(*crypto.Claims)
+	return ok && jwtClaims.IsSystemAdmin
+}
+
 // GetUserID retrieves user ID from context
 func GetUserID(c *gin.Context) (uuid.UUID, bool) {
 	if id, exists := c.Get(ContextKeyUserID); exists {

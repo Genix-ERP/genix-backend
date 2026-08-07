@@ -5182,12 +5182,16 @@ func (h *Handler) ListCurrencies(c *gin.Context) {
 	// soft-deleted currency vanished with no way to reactivate it from any
 	// client. Now: is_active=true → active only, =false → inactive only,
 	// omitted → all.
+	//
+	// is_active and is_base_currency are now read from tenant_currencies, so
+	// this list describes THIS tenant's currency policy. COALESCE falls back to
+	// the catalogue flags for a currency the tenant has no row for yet.
 	activeFilter := ""
 	switch strings.ToLower(strings.TrimSpace(c.Query("is_active"))) {
 	case "true", "1":
-		activeFilter = " WHERE cur.is_active = true"
+		activeFilter = " WHERE COALESCE(tc.is_active, cur.is_active, true) = true"
 	case "false", "0":
-		activeFilter = " WHERE cur.is_active = false"
+		activeFilter = " WHERE COALESCE(tc.is_active, cur.is_active, true) = false"
 	}
 
 	// Each row carries its latest rate for THIS tenant, so the client no longer
@@ -5198,9 +5202,12 @@ func (h *Handler) ListCurrencies(c *gin.Context) {
 
 	query := `
 		SELECT cur.id, cur.code, cur.name, cur.symbol, cur.decimal_places,
-		       cur.is_base_currency, cur.is_active,
+		       COALESCE(tc.is_base_currency, cur.is_base_currency, false) AS is_base_currency,
+		       COALESCE(tc.is_active, cur.is_active, true) AS is_active,
 		       r.rate, r.effective_date, r.rate_change, r.rate_change_percent
 		FROM currencies cur
+		LEFT JOIN tenant_currencies tc
+		       ON tc.currency_id = cur.id AND tc.tenant_id = $1
 		LEFT JOIN LATERAL (
 			SELECT er.rate, er.effective_date,
 			       COALESCE(er.rate_change, 0) AS rate_change,
@@ -5208,12 +5215,12 @@ func (h *Handler) ListCurrencies(c *gin.Context) {
 			FROM exchange_rates er
 			WHERE er.tenant_id = $1
 			  AND er.from_currency_id = cur.id
-			  AND er.to_currency_id = (SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1)
+			  AND er.to_currency_id = ` + fmt.Sprintf(baseCurrencySubquery, "$1") + `
 			  AND er.effective_date <= CURRENT_DATE
 			ORDER BY er.effective_date DESC
 			LIMIT 1
 		) r ON TRUE` + activeFilter + `
-		ORDER BY cur.is_base_currency DESC, cur.code ASC
+		ORDER BY COALESCE(tc.is_base_currency, cur.is_base_currency, false) DESC, cur.code ASC
 	`
 
 	rows, err := h.db.Query(query, tenantID)
@@ -5274,11 +5281,17 @@ func (h *Handler) ListCurrencies(c *gin.Context) {
 func (h *Handler) GetCurrency(c *gin.Context) {
 	code := c.Param("code")
 
+	tenantID, _ := middleware.GetTenantID(c)
+
 	var cur entity.Currency
 	err := h.db.QueryRow(`
-		SELECT id, code, name, symbol, decimal_places, is_base_currency, is_active
-		FROM currencies WHERE code = $1
-	`, code).Scan(&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces, &cur.IsBaseCurrency, &cur.IsActive)
+		SELECT cur.id, cur.code, cur.name, cur.symbol, cur.decimal_places,
+		       COALESCE(tc.is_base_currency, cur.is_base_currency, false),
+		       COALESCE(tc.is_active, cur.is_active, true)
+		FROM currencies cur
+		LEFT JOIN tenant_currencies tc ON tc.currency_id = cur.id AND tc.tenant_id = $2
+		WHERE cur.code = $1
+	`, code, tenantID).Scan(&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces, &cur.IsBaseCurrency, &cur.IsActive)
 
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Currency")
@@ -5307,6 +5320,12 @@ func (h *Handler) GetCurrency(c *gin.Context) {
 // @Security BearerAuth
 // @Router /finance/currencies [post]
 func (h *Handler) CreateCurrency(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
 	var input entity.CreateCurrencyInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -5314,74 +5333,96 @@ func (h *Handler) CreateCurrency(c *gin.Context) {
 		return
 	}
 
-	// Check if currency code already exists (including inactive ones)
-	var existingID uuid.UUID
-	var isActive bool
-	err := h.db.QueryRow("SELECT id, is_active FROM currencies WHERE code = $1", input.Code).Scan(&existingID, &isActive)
+	code := strings.ToUpper(strings.TrimSpace(input.Code))
+	if code == "" {
+		response.BadRequest(c, "Currency code is required")
+		return
+	}
 
-	if err == nil {
-		// Currency exists
-		if isActive {
+	// Two different operations wear the same route.
+	//
+	// If the code is already in the catalogue, this is "start using EUR in my
+	// company" — a per-tenant action, and all it does is upsert this tenant's
+	// row. It must NOT touch the catalogue: the previous version reactivated
+	// the global row and overwrote its name/symbol/decimal_places with whatever
+	// the caller sent, so one tenant adding "EUR / Euro / €" could rename
+	// another tenant's EUR.
+	//
+	// If the code is new, this genuinely extends the shared ISO catalogue that
+	// every tenant on the server reads, so it is system-admin only.
+	var currencyID uuid.UUID
+	err := h.db.QueryRow("SELECT id FROM currencies WHERE code = $1", code).Scan(&currencyID)
+
+	switch {
+	case err == nil:
+		// Already in the catalogue — enable it for this tenant.
+		var alreadyActive bool
+		_ = h.db.QueryRow(`
+			SELECT COALESCE(tc.is_active, false)
+			FROM tenant_currencies tc
+			WHERE tc.tenant_id = $1 AND tc.currency_id = $2`,
+			tenantID, currencyID).Scan(&alreadyActive)
+		if alreadyActive {
 			response.BadRequest(c, "Currency with this code already exists")
 			return
 		}
-
-		// Currency exists but is inactive - reactivate it with new data
-		if input.IsBaseCurrency {
-			h.db.Exec("UPDATE currencies SET is_base_currency = false WHERE is_base_currency = true")
-		}
-
-		_, err = h.db.Exec(`
-			UPDATE currencies
-			SET name = $1, symbol = $2, decimal_places = $3, is_base_currency = $4, is_active = true
-			WHERE id = $5
-		`, input.Name, input.Symbol, input.DecimalPlaces, input.IsBaseCurrency, existingID)
-
-		if err != nil {
-			h.log.Error("Failed to reactivate currency", "error", err)
+		if aerr := h.setTenantCurrencyActive(tenantID, currencyID, true); aerr != nil {
+			h.log.Error("Failed to enable currency for tenant", "error", aerr)
 			response.InternalError(c, "Failed to create currency")
 			return
 		}
 
-		cur := entity.Currency{
-			ID:             existingID,
-			Code:           input.Code,
-			Name:           input.Name,
-			Symbol:         input.Symbol,
-			DecimalPlaces:  input.DecimalPlaces,
-			IsBaseCurrency: input.IsBaseCurrency,
-			IsActive:       true,
+	case err == sql.ErrNoRows:
+		// Not h.perm.Can: no tenant-level role should be able to write the
+		// shared catalogue, and Can() returns true for site admins and owners.
+		if !middleware.IsSystemAdmin(c) {
+			response.Forbidden(c, "This currency is not in the catalogue. Adding one affects every tenant and requires a platform administrator.")
+			return
+		}
+		currencyID = uuid.New()
+		if _, ierr := h.db.Exec(`
+			INSERT INTO currencies (id, code, name, symbol, decimal_places, is_base_currency, is_active)
+			VALUES ($1, $2, $3, $4, $5, false, true)
+		`, currencyID, code, input.Name, input.Symbol, input.DecimalPlaces); ierr != nil {
+			h.log.Error("Failed to create currency", "error", ierr)
+			response.InternalError(c, "Failed to create currency")
+			return
+		}
+		if aerr := h.setTenantCurrencyActive(tenantID, currencyID, true); aerr != nil {
+			h.log.Error("Failed to enable new currency for tenant", "error", aerr)
+			response.InternalError(c, "Failed to create currency")
+			return
 		}
 
-		response.Created(c, cur)
-		return
-	}
-
-	// Currency doesn't exist - create new one
-	if input.IsBaseCurrency {
-		h.db.Exec("UPDATE currencies SET is_base_currency = false WHERE is_base_currency = true")
-	}
-
-	id := uuid.New()
-	_, err = h.db.Exec(`
-		INSERT INTO currencies (id, code, name, symbol, decimal_places, is_base_currency, is_active)
-		VALUES ($1, $2, $3, $4, $5, $6, true)
-	`, id, input.Code, input.Name, input.Symbol, input.DecimalPlaces, input.IsBaseCurrency)
-
-	if err != nil {
-		h.log.Error("Failed to create currency", "error", err)
+	default:
+		h.log.Error("Failed to look up currency", "error", err)
 		response.InternalError(c, "Failed to create currency")
 		return
 	}
 
-	cur := entity.Currency{
-		ID:             id,
-		Code:           input.Code,
-		Name:           input.Name,
-		Symbol:         input.Symbol,
-		DecimalPlaces:  input.DecimalPlaces,
-		IsBaseCurrency: input.IsBaseCurrency,
-		IsActive:       true,
+	if input.IsBaseCurrency {
+		if berr := h.setTenantBaseCurrency(tenantID, currencyID); berr != nil {
+			h.log.Error("Failed to set base currency", "error", berr)
+			response.InternalError(c, "Failed to create currency")
+			return
+		}
+	}
+
+	// Echo the catalogue's values, not the caller's: for an existing code the
+	// name/symbol are whatever the catalogue already says, and returning the
+	// input would imply an edit that did not happen.
+	var cur entity.Currency
+	if serr := h.db.QueryRow(`
+		SELECT cur.id, cur.code, cur.name, cur.symbol, cur.decimal_places,
+		       COALESCE(tc.is_base_currency, false), COALESCE(tc.is_active, true)
+		FROM currencies cur
+		LEFT JOIN tenant_currencies tc ON tc.currency_id = cur.id AND tc.tenant_id = $2
+		WHERE cur.id = $1`, currencyID, tenantID).Scan(
+		&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces,
+		&cur.IsBaseCurrency, &cur.IsActive); serr != nil {
+		h.log.Error("Failed to reload currency", "error", serr)
+		response.InternalError(c, "Failed to create currency")
+		return
 	}
 
 	response.Created(c, cur)
@@ -5402,6 +5443,11 @@ func (h *Handler) CreateCurrency(c *gin.Context) {
 // @Security BearerAuth
 // @Router /finance/currencies/{code} [put]
 func (h *Handler) UpdateCurrency(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
 	code := c.Param("code")
 
 	var input entity.UpdateCurrencyInput
@@ -5411,13 +5457,15 @@ func (h *Handler) UpdateCurrency(c *gin.Context) {
 		return
 	}
 
-	// Check if currency exists
 	var cur entity.Currency
 	err := h.db.QueryRow(`
-		SELECT id, code, name, symbol, decimal_places, is_base_currency, is_active
-		FROM currencies WHERE code = $1
-	`, code).Scan(&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces, &cur.IsBaseCurrency, &cur.IsActive)
-
+		SELECT cur.id, cur.code, cur.name, cur.symbol, cur.decimal_places,
+		       COALESCE(tc.is_base_currency, cur.is_base_currency, false),
+		       COALESCE(tc.is_active, cur.is_active, true)
+		FROM currencies cur
+		LEFT JOIN tenant_currencies tc ON tc.currency_id = cur.id AND tc.tenant_id = $2
+		WHERE cur.code = $1
+	`, code, tenantID).Scan(&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces, &cur.IsBaseCurrency, &cur.IsActive)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Currency")
 		return
@@ -5428,36 +5476,73 @@ func (h *Handler) UpdateCurrency(c *gin.Context) {
 		return
 	}
 
-	// If setting as base currency, unset other base currencies
-	if input.IsBaseCurrency != nil && *input.IsBaseCurrency {
-		h.db.Exec("UPDATE currencies SET is_base_currency = false WHERE is_base_currency = true AND code != $1", code)
+	// The request carries two kinds of field and they have different blast
+	// radii, so they are authorised separately.
+	//
+	// name / symbol / decimal_places describe the currency itself and are
+	// shared by every tenant on the server — a tenant renaming "US Dollar" to
+	// "Dollar" changed it for everyone. Platform admins only.
+	catalogueEdit := (input.Name != nil && *input.Name != cur.Name) ||
+		(input.Symbol != nil && *input.Symbol != cur.Symbol) ||
+		(input.DecimalPlaces != nil && *input.DecimalPlaces != cur.DecimalPlaces)
+
+	if catalogueEdit {
+		if !middleware.IsSystemAdmin(c) {
+			response.Forbidden(c, "Currency name, symbol and decimal places are shared by every tenant and can only be changed by a platform administrator")
+			return
+		}
+		if input.Name != nil {
+			cur.Name = *input.Name
+		}
+		if input.Symbol != nil {
+			cur.Symbol = *input.Symbol
+		}
+		if input.DecimalPlaces != nil {
+			cur.DecimalPlaces = *input.DecimalPlaces
+		}
+		if _, uerr := h.db.Exec(`
+			UPDATE currencies SET name = $1, symbol = $2, decimal_places = $3 WHERE id = $4
+		`, cur.Name, cur.Symbol, cur.DecimalPlaces, cur.ID); uerr != nil {
+			h.log.Error("Failed to update currency catalogue", "error", uerr)
+			response.InternalError(c, "Failed to update currency")
+			return
+		}
 	}
 
-	// Update fields
-	if input.Name != nil {
-		cur.Name = *input.Name
-	}
-	if input.Symbol != nil {
-		cur.Symbol = *input.Symbol
-	}
-	if input.DecimalPlaces != nil {
-		cur.DecimalPlaces = *input.DecimalPlaces
-	}
-	if input.IsBaseCurrency != nil {
-		cur.IsBaseCurrency = *input.IsBaseCurrency
-	}
+	// is_active / is_base_currency are this tenant's own policy and land in
+	// tenant_currencies. Setting a base currency used to run
+	// `UPDATE currencies SET is_base_currency = false WHERE is_base_currency`
+	// with no tenant predicate, which re-based EVERY tenant on the server —
+	// silently changing what every other tenant's multi-currency documents were
+	// reported in.
 	if input.IsActive != nil {
+		// Refusing here rather than letting the tenant end up with no base at
+		// all: every exchange-rate lookup converts to the base currency, so a
+		// deactivated base makes each of them return nothing.
+		if !*input.IsActive && cur.IsBaseCurrency {
+			response.BadRequest(c, "Cannot deactivate the base currency")
+			return
+		}
+		if aerr := h.setTenantCurrencyActive(tenantID, cur.ID, *input.IsActive); aerr != nil {
+			h.log.Error("Failed to set currency active flag", "error", aerr)
+			response.InternalError(c, "Failed to update currency")
+			return
+		}
 		cur.IsActive = *input.IsActive
 	}
 
-	_, err = h.db.Exec(`
-		UPDATE currencies SET name = $1, symbol = $2, decimal_places = $3, is_base_currency = $4, is_active = $5
-		WHERE code = $6
-	`, cur.Name, cur.Symbol, cur.DecimalPlaces, cur.IsBaseCurrency, cur.IsActive, code)
-
-	if err != nil {
-		h.log.Error("Failed to update currency", "error", err)
-		response.InternalError(c, "Failed to update currency")
+	if input.IsBaseCurrency != nil && *input.IsBaseCurrency {
+		if berr := h.setTenantBaseCurrency(tenantID, cur.ID); berr != nil {
+			h.log.Error("Failed to set base currency", "error", berr)
+			response.InternalError(c, "Failed to update currency")
+			return
+		}
+		cur.IsBaseCurrency = true
+		cur.IsActive = true
+	} else if input.IsBaseCurrency != nil && !*input.IsBaseCurrency && cur.IsBaseCurrency {
+		// Clearing the base without naming a replacement would leave the tenant
+		// with none, and every rate lateral joins on it.
+		response.BadRequest(c, "Set another currency as base instead of clearing this one")
 		return
 	}
 
@@ -5477,11 +5562,25 @@ func (h *Handler) UpdateCurrency(c *gin.Context) {
 // @Security BearerAuth
 // @Router /finance/currencies/{code} [delete]
 func (h *Handler) DeleteCurrency(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
 	code := c.Param("code")
 
-	// Check if currency is base currency
+	// Deactivates the currency FOR THIS TENANT. It used to flip the catalogue's
+	// global is_active, which removed the currency from every other tenant's
+	// dropdowns; the catalogue row itself is never touched here, so historical
+	// documents in other tenants keep resolving their currency_id.
+	var currencyID uuid.UUID
 	var isBase bool
-	err := h.db.QueryRow("SELECT is_base_currency FROM currencies WHERE code = $1", code).Scan(&isBase)
+	err := h.db.QueryRow(`
+		SELECT cur.id, COALESCE(tc.is_base_currency, cur.is_base_currency, false)
+		FROM currencies cur
+		LEFT JOIN tenant_currencies tc ON tc.currency_id = cur.id AND tc.tenant_id = $2
+		WHERE cur.code = $1
+	`, code, tenantID).Scan(&currencyID, &isBase)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Currency")
 		return
@@ -5497,10 +5596,8 @@ func (h *Handler) DeleteCurrency(c *gin.Context) {
 		return
 	}
 
-	// Soft delete by setting is_active = false
-	_, err = h.db.Exec("UPDATE currencies SET is_active = false WHERE code = $1", code)
-	if err != nil {
-		h.log.Error("Failed to delete currency", "error", err)
+	if aerr := h.setTenantCurrencyActive(tenantID, currencyID, false); aerr != nil {
+		h.log.Error("Failed to delete currency", "error", aerr)
 		response.InternalError(c, "Failed to delete currency")
 		return
 	}
@@ -5547,9 +5644,8 @@ func (h *Handler) GetExchangeRate(c *gin.Context) {
 		return
 	}
 
-	// Get base currency
-	var baseCurrencyID uuid.UUID
-	h.db.QueryRow("SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1").Scan(&baseCurrencyID)
+	// This tenant's base currency (currency_scope.go).
+	baseCurrencyID, _ := h.baseCurrencyID(tenantID)
 
 	// Get latest rate on or before date
 	var rate float64
@@ -5647,18 +5743,11 @@ func (h *Handler) SetExchangeRate(c *gin.Context) {
 		return
 	}
 
-	// Get base currency (or use a default like UZS)
-	var baseCurrencyID uuid.UUID
-	err = h.db.QueryRow("SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1").Scan(&baseCurrencyID)
-	if err == sql.ErrNoRows {
-		// If no base currency set, try to use UZS
-		err = h.db.QueryRow("SELECT id FROM currencies WHERE code = 'UZS' LIMIT 1").Scan(&baseCurrencyID)
-		if err != nil {
-			// Use first currency as base
-			err = h.db.QueryRow("SELECT id FROM currencies LIMIT 1").Scan(&baseCurrencyID)
-		}
-	}
-	if err != nil {
+	// This tenant's base currency; the UZS fallback lives in the resolver.
+	// The tenant -> global -> UZS fallback chain now lives in the resolver
+	// (currency_scope.go), so the only remaining failure is an empty catalogue.
+	baseCurrencyID, err := h.baseCurrencyID(tenantID)
+	if err != nil || baseCurrencyID == uuid.Nil {
 		h.log.Error("Failed to get base currency", "error", err)
 		response.InternalError(c, "Failed to set exchange rate - no base currency")
 		return

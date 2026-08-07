@@ -64,12 +64,9 @@ func (h *Handler) SyncCurrencyRates(c *gin.Context) {
 		return
 	}
 
-	// Get base currency (UZS)
-	var baseCurrencyID uuid.UUID
-	err = h.db.QueryRow("SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1").Scan(&baseCurrencyID)
-	if err != nil {
-		err = h.db.QueryRow("SELECT id FROM currencies WHERE code = 'UZS' LIMIT 1").Scan(&baseCurrencyID)
-	}
+	// This tenant's base currency, not "whichever tenant last pressed
+	// set-as-base" — see currency_scope.go.
+	baseCurrencyID, err := h.baseCurrencyID(tenantID)
 	if err != nil {
 		h.log.Error("No base currency found", "error", err)
 		response.InternalError(c, "No base currency (UZS) found. Please create UZS currency first.")
@@ -225,30 +222,23 @@ func (h *Handler) syncCBURatesForAllTenants() {
 	}
 
 	for _, tenantID := range tenantIDs {
-		// Get base currency for this tenant
-		var baseCurrencyID uuid.UUID
-		err := h.db.QueryRow("SELECT id FROM currencies WHERE tenant_id = $1 AND is_base_currency = true LIMIT 1", tenantID).Scan(&baseCurrencyID)
-		if err != nil {
-			h.db.QueryRow("SELECT id FROM currencies WHERE tenant_id = $1 AND code = 'UZS' LIMIT 1", tenantID).Scan(&baseCurrencyID)
-		}
-		if baseCurrencyID == uuid.Nil {
+		// All three queries here used to filter `currencies WHERE tenant_id = $1`
+		// on a table that has no tenant_id column. Every one of them errored,
+		// the errors were discarded, baseCurrencyID stayed uuid.Nil and the loop
+		// hit `continue` — so the scheduled CBU rate sync has never written a
+		// single rate for any tenant since it was added. Only the manual
+		// SyncCurrencyRates button ever worked.
+		baseCurrencyID, baseErr := h.baseCurrencyID(tenantID)
+		if baseErr != nil || baseCurrencyID == uuid.Nil {
+			h.log.Error("CBU sync: no base currency for tenant", "tenant_id", tenantID, "error", baseErr)
 			continue
 		}
 
-		// ONE query: get all currencies for this tenant
-		currencyMap := make(map[string]uuid.UUID)
-		curRows, curErr := h.db.Query("SELECT id, code FROM currencies WHERE tenant_id = $1", tenantID)
+		currencyMap, curErr := h.tenantCurrencyIDs(tenantID)
 		if curErr != nil {
+			h.log.Error("CBU sync: failed to load tenant currencies", "tenant_id", tenantID, "error", curErr)
 			continue
 		}
-		for curRows.Next() {
-			var cid uuid.UUID
-			var code string
-			if err := curRows.Scan(&cid, &code); err == nil {
-				currencyMap[code] = cid
-			}
-		}
-		curRows.Close()
 
 		// Build batch INSERT with ON CONFLICT for exchange rates
 		var erValues []string
@@ -452,11 +442,16 @@ func (h *Handler) CurrencyDebtReport(c *gin.Context) {
 		Code       string
 		Rate       float64
 	}
+	// "Foreign" and "in use" are both per-tenant questions now: the base
+	// currency and the active set come from tenant_currencies, falling back to
+	// the catalogue flags for a currency this tenant has no row for.
 	rateRows, err := h.db.Query(`
 		SELECT DISTINCT ON (c.id) c.id, c.code, er.rate
 		FROM currencies c
+		LEFT JOIN tenant_currencies tc ON tc.currency_id = c.id AND tc.tenant_id = $1
 		JOIN exchange_rates er ON er.from_currency_id = c.id AND er.tenant_id = $1
-		WHERE c.is_base_currency = false AND c.is_active = true
+		WHERE COALESCE(tc.is_base_currency, c.is_base_currency, false) = false
+		  AND COALESCE(tc.is_active, c.is_active, true) = true
 		ORDER BY c.id, er.effective_date DESC
 	`, tenantID)
 	if err != nil {

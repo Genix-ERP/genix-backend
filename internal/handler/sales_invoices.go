@@ -447,11 +447,10 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	// Lock the exchange rate at invoice creation time
 	exchangeRate := 1.0
 	if currencyID != nil {
-		var baseCurrencyID uuid.UUID
-		errBase := h.db.QueryRow("SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1").Scan(&baseCurrencyID)
-		if errBase != nil {
-			h.db.QueryRow("SELECT id FROM currencies WHERE code = 'UZS' LIMIT 1").Scan(&baseCurrencyID)
-		}
+		// This tenant's base currency (currency_scope.go). Previously this read
+		// a global flag, so an invoice could be converted against another
+		// tenant's chosen base.
+		baseCurrencyID, _ := h.baseCurrencyID(tenantID)
 		if baseCurrencyID != uuid.Nil && *currencyID != baseCurrencyID {
 			var lockedRate float64
 			errRate := h.db.QueryRow(`
