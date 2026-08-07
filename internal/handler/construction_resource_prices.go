@@ -480,11 +480,11 @@ func (h *Handler) BulkUpdateResourcePrice(c *gin.Context) {
 		"Resurs narxi yangilandi", userID, userNameLog)
 
 	response.Success(c, gin.H{
-		"resource_name":   in.ResourceName,
-		"uom":             in.UOM,
-		"old_price":       oldPrice.Float64,
-		"new_price":       in.NewPrice,
-		"lines_updated":   updated,
+		"resource_name": in.ResourceName,
+		"uom":           in.UOM,
+		"old_price":     oldPrice.Float64,
+		"new_price":     in.NewPrice,
+		"lines_updated": updated,
 	})
 }
 
@@ -945,7 +945,36 @@ func (h *Handler) GetResourcePriceHistory(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	// Was a literal LIMIT 200 with no paging and no truncation signal — a
+	// heavily re-priced material silently stopped at its 200th change.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	// The count repeats all four predicates (including the case-insensitive
+	// name match and the null-safe uom compare) but drops the display-only
+	// users join.
+	var total int
+	if err := h.db.QueryRow(`
+		SELECT COUNT(*) FROM construction_resource_price_history h
+		WHERE h.tenant_id = $1 AND h.project_id = $2
+		  AND LOWER(h.resource_name) = LOWER($3)
+		  AND COALESCE(h.uom, '') = COALESCE($4, '')`,
+		tenantID, projectID, name, uom).Scan(&total); err != nil {
+		h.log.Error("Failed to count price history", "error", err)
+		response.InternalError(c, "Failed to load history")
+		return
+	}
+
+	rows, err := h.db.Query(fmt.Sprintf(`
 		SELECT h.id, h.old_price, h.new_price, h.changed_at,
 		       COALESCE(u.first_name || ' ' || u.last_name, ''), COALESCE(h.note, '')
 		FROM construction_resource_price_history h
@@ -954,9 +983,9 @@ func (h *Handler) GetResourcePriceHistory(c *gin.Context) {
 		  AND h.project_id = $2
 		  AND LOWER(h.resource_name) = LOWER($3)
 		  AND COALESCE(h.uom, '') = COALESCE($4, '')
-		ORDER BY h.changed_at DESC
-		LIMIT 200
-	`, tenantID, projectID, name, uom)
+		ORDER BY h.changed_at DESC, h.id DESC
+		LIMIT %d OFFSET %d
+	`, pageSize, (page-1)*pageSize), tenantID, projectID, name, uom)
 	if err != nil {
 		h.log.Error("Failed to load price history", "error", err)
 		response.InternalError(c, "Failed to load history")
@@ -965,12 +994,12 @@ func (h *Handler) GetResourcePriceHistory(c *gin.Context) {
 	defer rows.Close()
 
 	type histRow struct {
-		ID         int64     `json:"id"`
-		OldPrice   float64   `json:"old_price"`
-		NewPrice   float64   `json:"new_price"`
-		ChangedAt  time.Time `json:"changed_at"`
-		ChangedBy  string    `json:"changed_by_name"`
-		Note       string    `json:"note,omitempty"`
+		ID        int64     `json:"id"`
+		OldPrice  float64   `json:"old_price"`
+		NewPrice  float64   `json:"new_price"`
+		ChangedAt time.Time `json:"changed_at"`
+		ChangedBy string    `json:"changed_by_name"`
+		Note      string    `json:"note,omitempty"`
 	}
 	out := []histRow{}
 	for rows.Next() {
@@ -980,5 +1009,5 @@ func (h *Handler) GetResourcePriceHistory(c *gin.Context) {
 		}
 		out = append(out, h)
 	}
-	response.Success(c, out)
+	response.Paginated(c, out, page, pageSize, total)
 }
