@@ -25,7 +25,11 @@ CREATE INDEX IF NOT EXISTS idx_cash_transactions_register
 UPDATE cash_transactions ct
 SET cash_register_id = sole.id
 FROM (
-    SELECT cr.tenant_id, MIN(cr.id) AS id
+    -- (array_agg(...))[1], not MIN(cr.id): Postgres has no min() aggregate for
+    -- uuid, and `MIN(cr.id)` fails to PLAN — so it errors even when the table is
+    -- empty and no row would ever reach the aggregate. HAVING COUNT(*) = 1
+    -- guarantees a single element, so taking the first is exact, not arbitrary.
+    SELECT cr.tenant_id, (array_agg(cr.id))[1] AS id
     FROM cash_registers cr
     WHERE cr.deleted_at IS NULL AND cr.is_active = true
     GROUP BY cr.tenant_id
