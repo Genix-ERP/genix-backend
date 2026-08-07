@@ -103,11 +103,18 @@ func (h *Handler) ListExpenseCategories(c *gin.Context) {
 		       ec.account_id, ec.is_active, ec.created_at,
 		       COALESCE(ec.color, ''), COALESCE(ec.icon, ''), COALESCE(ec.position, 0),
 		       a.code, a.name,
-		       COALESCE((SELECT COUNT(*) FROM expenses e
-		                 WHERE e.category_id = ec.id AND e.tenant_id = ec.tenant_id
-		                   AND e.deleted_at IS NULL), 0) AS usage_count
+		       COALESCE(u.usage_count, 0) AS usage_count
 		FROM expense_categories ec
 		LEFT JOIN accounts a ON a.id = ec.account_id
+		-- One grouped pass instead of a correlated COUNT evaluated per category
+		-- row: the old form was O(categories x expenses) and grew forever with
+		-- the expenses table, on an endpoint whose main consumer is a dropdown.
+		LEFT JOIN (
+		    SELECT category_id, COUNT(*) AS usage_count
+		    FROM expenses
+		    WHERE tenant_id = $1 AND deleted_at IS NULL
+		    GROUP BY category_id
+		) u ON u.category_id = ec.id
 		WHERE ec.tenant_id = $1
 		ORDER BY COALESCE(ec.position, 0), ec.name
 	`

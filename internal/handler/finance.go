@@ -4800,6 +4800,16 @@ func (h *Handler) ListTaxRates(c *gin.Context) {
 		query += " AND is_active = true"
 	}
 
+	// tax_type was selected but never filtered on, so both settings screens
+	// fetched the whole table and filtered in Dart. COALESCE, not a plain
+	// equality: migration 034 added the column with DEFAULT 'sales' but its
+	// CHECK permits NULL, and the response already treats NULL as 'sales' — a
+	// bare `tax_type = $n` would silently drop those legacy rows.
+	if tt := strings.TrimSpace(c.Query("tax_type")); tt != "" {
+		args = append(args, tt)
+		query += fmt.Sprintf(" AND COALESCE(tax_type, 'sales') = $%d", len(args))
+	}
+
 	query += " ORDER BY code ASC"
 
 	rows, err := h.db.Query(query, args...)

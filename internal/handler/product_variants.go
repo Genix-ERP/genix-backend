@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -64,7 +65,10 @@ func (h *Handler) ListProductAttributes(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	var attributes []ProductAttribute
+	// make(...) not a nil slice: a nil slice marshals as `null`, not `[]`, so a
+	// tenant with no attributes broke clients doing `data as List`.
+	attributes := make([]ProductAttribute, 0)
+	attrIDs := []uuid.UUID{}
 	for rows.Next() {
 		var attr ProductAttribute
 		err := rows.Scan(&attr.ID, &attr.TenantID, &attr.Name, &attr.Code, &attr.DisplayType,
@@ -72,26 +76,36 @@ func (h *Handler) ListProductAttributes(c *gin.Context) {
 		if err != nil {
 			continue
 		}
+		attr.Values = []AttributeValue{}
+		attributes = append(attributes, attr)
+		attrIDs = append(attrIDs, attr.ID)
+	}
+	rows.Close()
 
-		// Fetch values for this attribute
-		valueRows, err := h.db.Query(`
+	// One query for every attribute's values instead of one per attribute
+	// (N attributes used to cost N+1 round trips).
+	if len(attrIDs) > 0 {
+		byAttr := map[uuid.UUID][]AttributeValue{}
+		if vr, verr := h.db.Query(`
 			SELECT id, tenant_id, attribute_id, name, code, html_color, sort_order, COALESCE(price_extra, 0), is_active, created_at
 			FROM product_attribute_values
-			WHERE attribute_id = $1 AND deleted_at IS NULL
+			WHERE attribute_id = ANY($1) AND deleted_at IS NULL
 			ORDER BY sort_order, name
-		`, attr.ID)
-		if err == nil {
-			for valueRows.Next() {
+		`, pq.Array(attrIDs)); verr == nil {
+			for vr.Next() {
 				var val AttributeValue
-				if err := valueRows.Scan(&val.ID, &val.TenantID, &val.AttributeID, &val.Name, &val.Code,
-					&val.HTMLColor, &val.SortOrder, &val.PriceExtra, &val.IsActive, &val.CreatedAt); err == nil {
-					attr.Values = append(attr.Values, val)
+				if vr.Scan(&val.ID, &val.TenantID, &val.AttributeID, &val.Name, &val.Code,
+					&val.HTMLColor, &val.SortOrder, &val.PriceExtra, &val.IsActive, &val.CreatedAt) == nil {
+					byAttr[val.AttributeID] = append(byAttr[val.AttributeID], val)
 				}
 			}
-			valueRows.Close()
+			vr.Close()
 		}
-
-		attributes = append(attributes, attr)
+		for i := range attributes {
+			if v, ok := byAttr[attributes[i].ID]; ok {
+				attributes[i].Values = v
+			}
+		}
 	}
 
 	response.Success(c, attributes)

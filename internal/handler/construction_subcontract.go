@@ -11,6 +11,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -73,6 +74,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 	defer rows.Close()
 
 	items := []map[string]interface{}{}
+	subcontractIDs := []int64{}
 	for rows.Next() {
 		var id, projectIDVal int64
 		var name string
@@ -103,33 +105,13 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			continue
 		}
 
-		// Get linked WBS IDs
+		// WBS and building links are fetched in two bulk queries AFTER this
+		// loop (see below). They used to be two queries per row — 2N+1 round
+		// trips — and, worse, both used `defer` INSIDE the loop, so every
+		// cursor stayed open until the handler returned.
+		subcontractIDs = append(subcontractIDs, id)
 		wbsIDs := []int64{}
-		wbsRows, err := h.db.Query(
-			`SELECT wbs_id FROM construction_subcontract_wbs WHERE subcontract_id = $1`, id)
-		if err == nil {
-			defer wbsRows.Close()
-			for wbsRows.Next() {
-				var wbsID int64
-				if wbsRows.Scan(&wbsID) == nil {
-					wbsIDs = append(wbsIDs, wbsID)
-				}
-			}
-		}
-
-		// Get linked building IDs
 		buildingIDs := []int64{}
-		bldRows, err := h.db.Query(
-			`SELECT building_id FROM construction_subcontract_buildings WHERE subcontract_id = $1`, id)
-		if err == nil {
-			defer bldRows.Close()
-			for bldRows.Next() {
-				var bldID int64
-				if bldRows.Scan(&bldID) == nil {
-					buildingIDs = append(buildingIDs, bldID)
-				}
-			}
-		}
 
 		var progressPct float64
 		if amount > 0 {
@@ -178,6 +160,45 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			"outstanding_amount":    outstandingAmount,
 			"progress_pct":          round2(progressPct),
 		})
+	}
+	rows.Close()
+
+	// Bulk-fetch both link tables for the whole page in one round trip each,
+	// then fan out by subcontract id.
+	if len(subcontractIDs) > 0 {
+		wbsByID := map[int64][]int64{}
+		if wr, werr := h.db.Query(
+			`SELECT subcontract_id, wbs_id FROM construction_subcontract_wbs WHERE subcontract_id = ANY($1)`,
+			pq.Array(subcontractIDs)); werr == nil {
+			for wr.Next() {
+				var sid, wid int64
+				if wr.Scan(&sid, &wid) == nil {
+					wbsByID[sid] = append(wbsByID[sid], wid)
+				}
+			}
+			wr.Close()
+		}
+		bldByID := map[int64][]int64{}
+		if br, berr := h.db.Query(
+			`SELECT subcontract_id, building_id FROM construction_subcontract_buildings WHERE subcontract_id = ANY($1)`,
+			pq.Array(subcontractIDs)); berr == nil {
+			for br.Next() {
+				var sid, bid int64
+				if br.Scan(&sid, &bid) == nil {
+					bldByID[sid] = append(bldByID[sid], bid)
+				}
+			}
+			br.Close()
+		}
+		for _, it := range items {
+			sid, _ := it["id"].(int64)
+			if v, ok := wbsByID[sid]; ok {
+				it["wbs_ids"] = v
+			}
+			if v, ok := bldByID[sid]; ok {
+				it["building_ids"] = v
+			}
+		}
 	}
 
 	response.Success(c, items)
