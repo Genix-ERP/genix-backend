@@ -48,25 +48,27 @@ func (h *Handler) ListJobPositions(c *gin.Context) {
 		return
 	}
 
-	query := `
-		SELECT id, tenant_id, organization_id, code, name, description, is_active, created_at, updated_at
-		FROM job_positions
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-		ORDER BY name ASC
-	`
+	where := " WHERE tenant_id = $1 AND deleted_at IS NULL"
 	args := []interface{}{tenantID}
 
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		query = `
-			SELECT id, tenant_id, organization_id, code, name, description, is_active, created_at, updated_at
-			FROM job_positions
-			WHERE tenant_id = $1 AND (organization_id = $2 OR organization_id IS NULL) AND deleted_at IS NULL
-			ORDER BY name ASC
-		`
 		args = append(args, orgID)
+		where = " WHERE tenant_id = $1 AND (organization_id = $2 OR organization_id IS NULL) AND deleted_at IS NULL"
 	}
 
-	rows, err := h.db.Query(query, args...)
+	query := `
+		SELECT id, tenant_id, organization_id, code, name, description, is_active, created_at, updated_at
+		FROM job_positions` + where + " ORDER BY name ASC"
+
+	// Opt-in paging — see ListDepartments.
+	paginate, page, pageSize, offset := optPagination(c)
+	queryArgs := args
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		queryArgs = append(append([]interface{}{}, args...), pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, queryArgs...)
 	if err != nil {
 		h.log.Error("Failed to list job positions", "error", err)
 		response.InternalError(c, "Failed to list job positions")
@@ -98,7 +100,17 @@ func (h *Handler) ListJobPositions(c *gin.Context) {
 		positions = append(positions, jp)
 	}
 
-	response.Success(c, positions)
+	if !paginate {
+		response.Success(c, positions)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM job_positions"+where, args...).Scan(&total); err != nil {
+		h.log.Error("Failed to count job positions", "error", err)
+		total = len(positions)
+	}
+	response.Paginated(c, positions, page, pageSize, total)
 }
 
 // CreateJobPosition creates a new job position

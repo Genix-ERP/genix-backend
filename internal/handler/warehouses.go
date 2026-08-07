@@ -1342,7 +1342,15 @@ func (h *Handler) ListAllLocations(c *gin.Context) {
 		args = append(args, "%"+search+"%")
 	}
 
+	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM warehouse_locations"):]
+
 	query += " ORDER BY w.code ASC, wl.code ASC"
+
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -1410,16 +1418,25 @@ func (h *Handler) ListAllLocations(c *gin.Context) {
 			WHERE location_id = ANY($1)
 			GROUP BY location_id
 		`
-		emptyRows, err := h.db.Query(emptyQuery, locationIDs)
-		if err == nil {
-			defer emptyRows.Close()
+		// pq.Array is required: a bare []uuid.UUID is not a driver.Value, so
+		// this Query always failed with "unsupported type". The error was
+		// swallowed by `if err == nil`, leaving IsEmpty at its false zero value
+		// for every row — i.e. the empty-location indicator has never once
+		// reported a location as empty.
+		emptyRows, err := h.db.Query(emptyQuery, pq.Array(locationIDs))
+		if err != nil {
+			h.log.Error("Failed to load location occupancy", "error", err)
+		} else {
 			inventoryMap := make(map[uuid.UUID]float64)
 			for emptyRows.Next() {
 				var locID uuid.UUID
 				var qty float64
-				emptyRows.Scan(&locID, &qty)
+				if scanErr := emptyRows.Scan(&locID, &qty); scanErr != nil {
+					continue
+				}
 				inventoryMap[locID] = qty
 			}
+			emptyRows.Close()
 			for _, loc := range locations {
 				qty, exists := inventoryMap[loc.ID]
 				loc.IsEmpty = !exists || qty == 0
@@ -1427,7 +1444,18 @@ func (h *Handler) ListAllLocations(c *gin.Context) {
 		}
 	}
 
-	response.Success(c, locations)
+	if !paginate {
+		response.Success(c, locations)
+		return
+	}
+
+	total := 0
+	// The count reuses the same arg list minus the LIMIT/OFFSET pair appended above.
+	if err := h.db.QueryRow(countQuery, args[:argCount]...).Scan(&total); err != nil {
+		h.log.Error("Failed to count locations", "error", err)
+		total = len(locations)
+	}
+	response.Paginated(c, locations, page, pageSize, total)
 }
 
 // =====================================================
@@ -1450,14 +1478,28 @@ func (h *Handler) ListOperationTypes(c *gin.Context) {
 			   COALESCE(ot.operation_type, '') as operation_type,
 			   ot.sequence,
 			   ot.color, ot.show_operations,
-			   COALESCE((SELECT COUNT(*) FROM stock_operations so WHERE so.operation_type_id = ot.id AND so.deleted_at IS NULL AND so.state = 'in_progress'), 0) as count_ready,
-			   COALESCE((SELECT COUNT(*) FROM stock_operations so WHERE so.operation_type_id = ot.id AND so.deleted_at IS NULL AND so.state NOT IN ('done','cancelled') AND so.scheduled_date < NOW()), 0) as count_late,
-			   COALESCE((SELECT COUNT(*) FROM stock_operations so WHERE so.operation_type_id = ot.id AND so.deleted_at IS NULL AND so.state IN ('draft','waiting')), 0) as count_waiting,
-			   COALESCE((SELECT COUNT(*) FROM stock_operations so WHERE so.operation_type_id = ot.id AND so.deleted_at IS NULL AND so.state = 'done'), 0) as count_done,
+			   COALESCE(cnt.count_ready, 0) as count_ready,
+			   COALESCE(cnt.count_late, 0) as count_late,
+			   COALESCE(cnt.count_waiting, 0) as count_waiting,
+			   COALESCE(cnt.count_done, 0) as count_done,
 			   ot.is_active, ot.created_at,
 			   w.name as warehouse_name
 		FROM warehouse_operation_types ot
 		JOIN warehouses w ON ot.warehouse_id = w.id
+		-- Four correlated COUNTs over stock_operations used to run once per
+		-- operation-type row, so the kanban header cost 4 x types full scans of
+		-- the busiest table in the system. One grouped pass with FILTER gives
+		-- the identical four numbers in a single scan.
+		LEFT JOIN (
+		    SELECT so.operation_type_id,
+		           COUNT(*) FILTER (WHERE so.state = 'in_progress') AS count_ready,
+		           COUNT(*) FILTER (WHERE so.state NOT IN ('done','cancelled') AND so.scheduled_date < NOW()) AS count_late,
+		           COUNT(*) FILTER (WHERE so.state IN ('draft','waiting')) AS count_waiting,
+		           COUNT(*) FILTER (WHERE so.state = 'done') AS count_done
+		    FROM stock_operations so
+		    WHERE so.deleted_at IS NULL
+		    GROUP BY so.operation_type_id
+		) cnt ON cnt.operation_type_id = ot.id
 		WHERE ot.tenant_id = $1 AND ot.deleted_at IS NULL AND w.deleted_at IS NULL
 	`
 	args := []interface{}{tenantID}
