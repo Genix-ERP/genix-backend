@@ -221,7 +221,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			).Scan(&journalCount)
 
 			needsAccountSeed := totalAccounts == 0 || groupAccounts < 30 // legacy orgs have 40 groups
-			needsJournalSeed := journalCount < 5                          // 11 defaults; under 5 means broken
+			needsJournalSeed := journalCount < 5                         // 11 defaults; under 5 means broken
 
 			if needsAccountSeed || needsJournalSeed {
 				var orgExists bool
@@ -398,7 +398,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		accounts = append(accounts, acc.ToResponse())
 	}
 
-	pagination := entity.NewPagination(page, limit)
+	// Build the meta from the limit this handler ACTUALLY served. ListAccounts
+	// allows up to 500 rows, which is above the shared MaxPageLimit, so running
+	// it back through NewPagination would re-clamp and report a page size we
+	// didn't use — making total_pages and has_next wrong for every consumer.
+	pagination := &entity.Pagination{Page: page, Limit: limit}
 	pagination.Calculate(total)
 
 	response.SuccessWithPagination(c, accounts, pagination)
@@ -4216,10 +4220,10 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	// Collect allocations first, then close rows before executing updates
 	// (lib/pq does not support interleaved queries on the same connection)
 	type allocation struct {
-		ID     uuid.UUID
+		ID      uuid.UUID
 		DocType string
-		DocID  uuid.UUID
-		Amount float64
+		DocID   uuid.UUID
+		Amount  float64
 	}
 	var allocations []allocation
 
@@ -4550,141 +4554,141 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				tx.Exec("UPDATE payments SET journal_entry_id = $1 WHERE id = $2", journalEntryID, id)
 
 				// --- Exchange difference calculation ---
-			// For each allocation, check if invoice has a foreign currency rate
-			// diff = allocation_amount_foreign * (invoice_rate - payment_rate)
-			var totalExchangeDiff float64
-			var totalForeignAmount float64
-			var weightedInvoiceRate float64
-			for _, a := range allocations {
-				var invoiceRate float64
-				var invoiceCurrencyID sql.NullString
-				if a.DocType == "sales_invoice" {
-					_ = tx.QueryRow(
-						`SELECT COALESCE(exchange_rate, 1), currency_id FROM sales_invoices WHERE id = $1`,
-						a.DocID,
-					).Scan(&invoiceRate, &invoiceCurrencyID)
-				} else if a.DocType == "purchase_invoice" {
-					_ = tx.QueryRow(
-						`SELECT COALESCE(exchange_rate, 1), currency_id FROM purchase_invoices WHERE id = $1`,
-						a.DocID,
-					).Scan(&invoiceRate, &invoiceCurrencyID)
-				}
-				if invoiceRate > 1 && paymentExchangeRate > 1 && invoiceRate != paymentExchangeRate {
-					// allocation amount is in foreign currency; diff in base currency (UZS)
-					diff := a.Amount * (paymentExchangeRate - invoiceRate)
-					totalExchangeDiff += diff
-					totalForeignAmount += a.Amount
-					weightedInvoiceRate += a.Amount * invoiceRate
-				}
-			}
-			// Calculate weighted average initial rate
-			if totalForeignAmount > 0 {
-				weightedInvoiceRate = weightedInvoiceRate / totalForeignAmount
-			}
-
-			if totalExchangeDiff != 0 {
-				// Find exchange gain/loss accounts.
-				// The sign is direction-dependent: for a receipt, payment rate >
-				// invoice rate (diff > 0) means MORE UZS received → gain; for an
-				// outbound payment the same positive diff means MORE UZS paid →
-				// LOSS, so the sign is interpreted in reverse.
-				var exchangeAccountID uuid.UUID
-				var exchangeDiffDesc string
-				var exchangeDiffType string
-				isGain := (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0)
-				if isGain {
-					// Exchange gain
-					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "9540")
-					exchangeDiffDesc = "Valyuta kursi bo'yicha foyda"
-					exchangeDiffType = "positive"
-				} else {
-					// Exchange loss
-					exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "9630")
-					exchangeDiffDesc = "Valyuta kursi bo'yicha zarar"
-					exchangeDiffType = "negative"
-				}
-
-				absDiff := totalExchangeDiff
-				if absDiff < 0 {
-					absDiff = -absDiff
-				}
-
-				if exchangeAccountID != uuid.Nil {
-					lineNum := 3
-					exchangeLineID := uuid.New()
-					if isGain {
-						// Gain: credit 9540 and debit-adjust line 1
-						// (receipt: cash received more in base currency;
-						// payment: AP relieved at the higher invoice rate)
-						tx.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, line_number, account_id, description,
-								debit_amount, credit_amount, exchange_rate, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-							exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
-							0.0, absDiff, 1.0, now,
-						)
-						tx.Exec("UPDATE journal_entry_lines SET debit_amount = debit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 1", absDiff, journalEntryID)
-						tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
-					} else {
-						// Loss: debit 9630 and credit-adjust line 2
-						// (receipt: cash received less in base currency than the AR relieved;
-						// payment: cash paid more in base currency)
-						tx.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, line_number, account_id, description,
-								debit_amount, credit_amount, exchange_rate, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-							exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
-							absDiff, 0.0, 1.0, now,
-						)
-						tx.Exec("UPDATE journal_entry_lines SET credit_amount = credit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 2", absDiff, journalEntryID)
-						tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
+				// For each allocation, check if invoice has a foreign currency rate
+				// diff = allocation_amount_foreign * (invoice_rate - payment_rate)
+				var totalExchangeDiff float64
+				var totalForeignAmount float64
+				var weightedInvoiceRate float64
+				for _, a := range allocations {
+					var invoiceRate float64
+					var invoiceCurrencyID sql.NullString
+					if a.DocType == "sales_invoice" {
+						_ = tx.QueryRow(
+							`SELECT COALESCE(exchange_rate, 1), currency_id FROM sales_invoices WHERE id = $1`,
+							a.DocID,
+						).Scan(&invoiceRate, &invoiceCurrencyID)
+					} else if a.DocType == "purchase_invoice" {
+						_ = tx.QueryRow(
+							`SELECT COALESCE(exchange_rate, 1), currency_id FROM purchase_invoices WHERE id = $1`,
+							a.DocID,
+						).Scan(&invoiceRate, &invoiceCurrencyID)
 					}
-					// Update exchange account balance
-					tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3",
-						func() float64 {
-							if isGain {
-								return -absDiff // credit-normal income (9540 credited)
-							}
-							return absDiff // debit-normal expense (9630 debited)
-						}(), now, exchangeAccountID)
+					if invoiceRate > 1 && paymentExchangeRate > 1 && invoiceRate != paymentExchangeRate {
+						// allocation amount is in foreign currency; diff in base currency (UZS)
+						diff := a.Amount * (paymentExchangeRate - invoiceRate)
+						totalExchangeDiff += diff
+						totalForeignAmount += a.Amount
+						weightedInvoiceRate += a.Amount * invoiceRate
+					}
+				}
+				// Calculate weighted average initial rate
+				if totalForeignAmount > 0 {
+					weightedInvoiceRate = weightedInvoiceRate / totalForeignAmount
+				}
 
-					// Record in exchange_diffs table
-					if paymentCurrencyID.Valid {
-						currencyUUID, _ := uuid.Parse(paymentCurrencyID.String)
-						if currencyUUID != uuid.Nil {
-							var edContactName string
-							var edCurrencyCode string
-							tx.QueryRow("SELECT name FROM contacts WHERE id = $1", contactID).Scan(&edContactName)
-							tx.QueryRow("SELECT code FROM currencies WHERE id = $1", currencyUUID).Scan(&edCurrencyCode)
+				if totalExchangeDiff != 0 {
+					// Find exchange gain/loss accounts.
+					// The sign is direction-dependent: for a receipt, payment rate >
+					// invoice rate (diff > 0) means MORE UZS received → gain; for an
+					// outbound payment the same positive diff means MORE UZS paid →
+					// LOSS, so the sign is interpreted in reverse.
+					var exchangeAccountID uuid.UUID
+					var exchangeDiffDesc string
+					var exchangeDiffType string
+					isGain := (paymentType == "receipt" && totalExchangeDiff > 0) || (paymentType != "receipt" && totalExchangeDiff < 0)
+					if isGain {
+						// Exchange gain
+						exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange gain", "9540")
+						exchangeDiffDesc = "Valyuta kursi bo'yicha foyda"
+						exchangeDiffType = "positive"
+					} else {
+						// Exchange loss
+						exchangeAccountID = findAccount(tx, tenantID, orgIDPtr, "foreign exchange loss", "9630")
+						exchangeDiffDesc = "Valyuta kursi bo'yicha zarar"
+						exchangeDiffType = "negative"
+					}
+
+					absDiff := totalExchangeDiff
+					if absDiff < 0 {
+						absDiff = -absDiff
+					}
+
+					if exchangeAccountID != uuid.Nil {
+						lineNum := 3
+						exchangeLineID := uuid.New()
+						if isGain {
+							// Gain: credit 9540 and debit-adjust line 1
+							// (receipt: cash received more in base currency;
+							// payment: AP relieved at the higher invoice rate)
 							tx.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, line_number, account_id, description,
+								debit_amount, credit_amount, exchange_rate, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+								exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
+								0.0, absDiff, 1.0, now,
+							)
+							tx.Exec("UPDATE journal_entry_lines SET debit_amount = debit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 1", absDiff, journalEntryID)
+							tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
+						} else {
+							// Loss: debit 9630 and credit-adjust line 2
+							// (receipt: cash received less in base currency than the AR relieved;
+							// payment: cash paid more in base currency)
+							tx.Exec(`
+							INSERT INTO journal_entry_lines (
+								id, journal_entry_id, line_number, account_id, description,
+								debit_amount, credit_amount, exchange_rate, created_at
+							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+								exchangeLineID, journalEntryID, lineNum, exchangeAccountID, exchangeDiffDesc,
+								absDiff, 0.0, 1.0, now,
+							)
+							tx.Exec("UPDATE journal_entry_lines SET credit_amount = credit_amount + $1 WHERE journal_entry_id = $2 AND line_number = 2", absDiff, journalEntryID)
+							tx.Exec("UPDATE journal_entries SET total_debit = total_debit + $1, total_credit = total_credit + $1 WHERE id = $2", absDiff, journalEntryID)
+						}
+						// Update exchange account balance
+						tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3",
+							func() float64 {
+								if isGain {
+									return -absDiff // credit-normal income (9540 credited)
+								}
+								return absDiff // debit-normal expense (9630 debited)
+							}(), now, exchangeAccountID)
+
+						// Record in exchange_diffs table
+						if paymentCurrencyID.Valid {
+							currencyUUID, _ := uuid.Parse(paymentCurrencyID.String)
+							if currencyUUID != uuid.Nil {
+								var edContactName string
+								var edCurrencyCode string
+								tx.QueryRow("SELECT name FROM contacts WHERE id = $1", contactID).Scan(&edContactName)
+								tx.QueryRow("SELECT code FROM currencies WHERE id = $1", currencyUUID).Scan(&edCurrencyCode)
+								tx.Exec(`
 								INSERT INTO exchange_diffs (id, tenant_id, organization_id, currency_id, amount_uzs, diff_type, period_start, period_end, journal_entry_id, description, created_by, created_at, updated_at,
 									document_number, counterparty_id, counterparty_name, foreign_amount, initial_rate, final_rate)
 								VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
 									$14, $15, $16, $17, $18, $19)`,
-								uuid.New(), tenantID, orgIDPtr, currencyUUID, absDiff, exchangeDiffType,
-								paymentDate, paymentDate, journalEntryID,
-								fmt.Sprintf("Kurs farqi — %s — %s — %s", paymentNumber, edCurrencyCode, paymentDate.Format("02.01.2006")),
-								userID, now, now,
-								paymentNumber, contactID, edContactName, totalForeignAmount, weightedInvoiceRate, paymentExchangeRate,
-							)
+									uuid.New(), tenantID, orgIDPtr, currencyUUID, absDiff, exchangeDiffType,
+									paymentDate, paymentDate, journalEntryID,
+									fmt.Sprintf("Kurs farqi — %s — %s — %s", paymentNumber, edCurrencyCode, paymentDate.Format("02.01.2006")),
+									userID, now, now,
+									paymentNumber, contactID, edContactName, totalForeignAmount, weightedInvoiceRate, paymentExchangeRate,
+								)
+							}
 						}
+
+						h.log.Info("Exchange difference recorded",
+							"payment_id", id, "diff", totalExchangeDiff, "type", exchangeDiffType,
+							"invoice_rate_sample", "varies", "payment_rate", paymentExchangeRate)
 					}
-
-					h.log.Info("Exchange difference recorded",
-						"payment_id", id, "diff", totalExchangeDiff, "type", exchangeDiffType,
-						"invoice_rate_sample", "varies", "payment_rate", paymentExchangeRate)
 				}
-			}
 
-			if jeOK {
-				tx.Exec("RELEASE SAVEPOINT create_payment_je")
-			} else {
-				// Drop the partial GL entry but keep the confirmation itself.
-				h.log.Error("Payment journal entry incomplete, rolling back GL entry", "payment_id", id)
-				tx.Exec("ROLLBACK TO SAVEPOINT create_payment_je")
-			}
+				if jeOK {
+					tx.Exec("RELEASE SAVEPOINT create_payment_je")
+				} else {
+					// Drop the partial GL entry but keep the confirmation itself.
+					h.log.Error("Payment journal entry incomplete, rolling back GL entry", "payment_id", id)
+					tx.Exec("ROLLBACK TO SAVEPOINT create_payment_je")
+				}
 			}
 		} else {
 			h.log.Warn("No suitable journal found for payment GL entry", "code", journalCode)
@@ -5680,16 +5684,16 @@ func (h *Handler) ListExchangeRates(c *gin.Context) {
 	defer rows.Close()
 
 	type ExchangeRateResponse struct {
-		ID                 uuid.UUID `json:"id"`
-		FromCurrency       string    `json:"from_currency"`
-		ToCurrency         string    `json:"to_currency"`
-		Rate               float64   `json:"rate"`
-		EffectiveDate      string    `json:"effective_date"`
-		Source             string    `json:"source"`
-		CreatedAt          time.Time `json:"created_at"`
-		PreviousRate       float64   `json:"previous_rate,omitempty"`
-		RateChange         float64   `json:"rate_change,omitempty"`
-		RateChangePercent  float64   `json:"rate_change_percent,omitempty"`
+		ID                uuid.UUID `json:"id"`
+		FromCurrency      string    `json:"from_currency"`
+		ToCurrency        string    `json:"to_currency"`
+		Rate              float64   `json:"rate"`
+		EffectiveDate     string    `json:"effective_date"`
+		Source            string    `json:"source"`
+		CreatedAt         time.Time `json:"created_at"`
+		PreviousRate      float64   `json:"previous_rate,omitempty"`
+		RateChange        float64   `json:"rate_change,omitempty"`
+		RateChangePercent float64   `json:"rate_change_percent,omitempty"`
 	}
 
 	rates := make([]ExchangeRateResponse, 0)
@@ -6560,19 +6564,19 @@ func (h *Handler) ListBankReconciliations(c *gin.Context) {
 	defer rows.Close()
 
 	type Reconciliation struct {
-		ID                    uuid.UUID  `json:"id"`
-		BankAccountID         uuid.UUID  `json:"bank_account_id"`
-		StatementDate         string     `json:"statement_date"`
-		StatementEndingBalance float64   `json:"statement_ending_balance"`
-		BookBalance           float64    `json:"book_balance"`
-		ReconciledBalance     *float64   `json:"reconciled_balance"`
-		Difference            *float64   `json:"difference"`
-		Status                string     `json:"status"`
-		CompletedAt           *time.Time `json:"completed_at"`
-		CompletedBy           *uuid.UUID `json:"completed_by"`
-		CompletedByName       string     `json:"completed_by_name"`
-		Notes                 *string    `json:"notes"`
-		CreatedAt             time.Time  `json:"created_at"`
+		ID                     uuid.UUID  `json:"id"`
+		BankAccountID          uuid.UUID  `json:"bank_account_id"`
+		StatementDate          string     `json:"statement_date"`
+		StatementEndingBalance float64    `json:"statement_ending_balance"`
+		BookBalance            float64    `json:"book_balance"`
+		ReconciledBalance      *float64   `json:"reconciled_balance"`
+		Difference             *float64   `json:"difference"`
+		Status                 string     `json:"status"`
+		CompletedAt            *time.Time `json:"completed_at"`
+		CompletedBy            *uuid.UUID `json:"completed_by"`
+		CompletedByName        string     `json:"completed_by_name"`
+		Notes                  *string    `json:"notes"`
+		CreatedAt              time.Time  `json:"created_at"`
 	}
 
 	reconciliations := make([]Reconciliation, 0)
@@ -6993,9 +6997,9 @@ func (h *Handler) UpdateBankReconciliation(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"message":           "Reconciliation updated",
-		"cleared_bank":      len(input.ClearedBankTransactions),
-		"cleared_journal":   len(input.ClearedJournalEntries),
+		"message":            "Reconciliation updated",
+		"cleared_bank":       len(input.ClearedBankTransactions),
+		"cleared_journal":    len(input.ClearedJournalEntries),
 		"reconciled_balance": clearedBookTotal,
 	})
 }
@@ -8250,13 +8254,13 @@ func (h *Handler) GetFiscalYear(c *gin.Context) {
 
 // CreateFiscalYearInput represents the input for creating a fiscal year
 type CreateFiscalYearInput struct {
-	Name           string    `json:"name" binding:"required"`
-	Code           string    `json:"code"`
-	StartDate      string    `json:"start_date" binding:"required"`
-	EndDate        string    `json:"end_date" binding:"required"`
-	OrganizationID *string   `json:"organization_id,omitempty"`
-	AutoGenerate   bool      `json:"auto_generate"`
-	PeriodType     string    `json:"period_type"` // monthly, quarterly
+	Name           string  `json:"name" binding:"required"`
+	Code           string  `json:"code"`
+	StartDate      string  `json:"start_date" binding:"required"`
+	EndDate        string  `json:"end_date" binding:"required"`
+	OrganizationID *string `json:"organization_id,omitempty"`
+	AutoGenerate   bool    `json:"auto_generate"`
+	PeriodType     string  `json:"period_type"` // monthly, quarterly
 }
 
 // CreateFiscalYear godoc
@@ -9076,29 +9080,29 @@ func (h *Handler) UnlockFiscalPeriod(c *gin.Context) {
 // ==================== BUDGETS ====================
 
 type CreateBudgetInput struct {
-	OrganizationID   *string  `json:"organization_id"`
-	FiscalYearID     string   `json:"fiscal_year_id" binding:"required"`
-	Code             string   `json:"code" binding:"required"`
-	Name             string   `json:"name" binding:"required"`
-	Description      *string  `json:"description"`
-	BudgetType       string   `json:"budget_type"` // expense, revenue, combined
-	TotalAmount      float64  `json:"total_amount"`
-	Status           string   `json:"status"`
-	StartDate        *string  `json:"start_date"`
-	EndDate          *string  `json:"end_date"`
-	WarningThreshold *float64 `json:"warning_threshold"`
+	OrganizationID   *string                 `json:"organization_id"`
+	FiscalYearID     string                  `json:"fiscal_year_id" binding:"required"`
+	Code             string                  `json:"code" binding:"required"`
+	Name             string                  `json:"name" binding:"required"`
+	Description      *string                 `json:"description"`
+	BudgetType       string                  `json:"budget_type"` // expense, revenue, combined
+	TotalAmount      float64                 `json:"total_amount"`
+	Status           string                  `json:"status"`
+	StartDate        *string                 `json:"start_date"`
+	EndDate          *string                 `json:"end_date"`
+	WarningThreshold *float64                `json:"warning_threshold"`
 	Lines            []CreateBudgetLineInput `json:"lines"`
 }
 
 type CreateBudgetLineInput struct {
-	BudgetID       string   `json:"budget_id" binding:"required"`
-	AccountID      string   `json:"account_id" binding:"required"`
-	FiscalPeriodID *string  `json:"fiscal_period_id"`
-	DepartmentID   *string  `json:"department_id"`
-	BudgetedAmount float64  `json:"budgeted_amount"`
-	PlannedAmount  float64  `json:"planned_amount"` // alias from frontend
-	ActualAmount   float64  `json:"actual_amount"`
-	Notes          *string  `json:"notes"`
+	BudgetID       string  `json:"budget_id" binding:"required"`
+	AccountID      string  `json:"account_id" binding:"required"`
+	FiscalPeriodID *string `json:"fiscal_period_id"`
+	DepartmentID   *string `json:"department_id"`
+	BudgetedAmount float64 `json:"budgeted_amount"`
+	PlannedAmount  float64 `json:"planned_amount"` // alias from frontend
+	ActualAmount   float64 `json:"actual_amount"`
+	Notes          *string `json:"notes"`
 }
 
 // ListBudgets godoc
@@ -11124,12 +11128,12 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	`, tenantID)
 
 	type AccountBalance struct {
-		ID           string  `json:"id"`
-		Code         string  `json:"code"`
-		Name         string  `json:"name"`
-		Currency     string  `json:"currency"`
-		Balance      float64 `json:"balance"`
-		IsNegative   bool    `json:"is_negative"`
+		ID         string  `json:"id"`
+		Code       string  `json:"code"`
+		Name       string  `json:"name"`
+		Currency   string  `json:"currency"`
+		Balance    float64 `json:"balance"`
+		IsNegative bool    `json:"is_negative"`
 	}
 
 	accountBalances := make([]AccountBalance, 0)
@@ -11242,11 +11246,11 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 
 	// 4. Build 30-day payment calendar
 	type CalendarDay struct {
-		Date           string  `json:"date"`
-		Inflows        float64 `json:"inflows"`
-		Outflows       float64 `json:"outflows"`
-		RunningBalance float64 `json:"running_balance"`
-		IsNegative     bool    `json:"is_negative"`
+		Date           string                   `json:"date"`
+		Inflows        float64                  `json:"inflows"`
+		Outflows       float64                  `json:"outflows"`
+		RunningBalance float64                  `json:"running_balance"`
+		IsNegative     bool                     `json:"is_negative"`
 		Events         []map[string]interface{} `json:"events,omitempty"`
 	}
 
@@ -11298,19 +11302,19 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"account_balances": accountBalances,
-		"total_cash":       totalCash,
-		"receivables":      receivables,
-		"payables":         payables,
+		"account_balances":  accountBalances,
+		"total_cash":        totalCash,
+		"receivables":       receivables,
+		"payables":          payables,
 		"total_receivables": totalReceivables,
 		"total_payables":    totalPayables,
-		"net_position":     totalCash + totalReceivables - totalPayables,
-		"calendar":         calendar,
+		"net_position":      totalCash + totalReceivables - totalPayables,
+		"calendar":          calendar,
 		"summary": gin.H{
-			"current_balance":     totalCash,
-			"expected_inflows":    totalReceivables,
-			"expected_outflows":   totalPayables,
-			"forecast_30d":        totalCash + totalReceivables - totalPayables,
+			"current_balance":   totalCash,
+			"expected_inflows":  totalReceivables,
+			"expected_outflows": totalPayables,
+			"forecast_30d":      totalCash + totalReceivables - totalPayables,
 			"has_negative_accounts": func() bool {
 				for _, ab := range accountBalances {
 					if ab.IsNegative {
@@ -11341,11 +11345,11 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 
 	// Get budget details
 	var budget struct {
-		ID        string  `json:"id"`
-		Name      string  `json:"name"`
-		StartDate string  `json:"start_date"`
-		EndDate   string  `json:"end_date"`
-		Type      string  `json:"type"`
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		StartDate string `json:"start_date"`
+		EndDate   string `json:"end_date"`
+		Type      string `json:"type"`
 	}
 	h.db.QueryRow(`
 		SELECT b.id::text, b.name,
@@ -11456,8 +11460,8 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 	_ = groupBy // TODO: implement groupBy logic
 
 	response.Success(c, gin.H{
-		"budget":    budget,
-		"items":     items,
+		"budget": budget,
+		"items":  items,
 		"totals": gin.H{
 			"planned_revenue":  totalPlannedRevenue,
 			"actual_revenue":   totalActualRevenue,
