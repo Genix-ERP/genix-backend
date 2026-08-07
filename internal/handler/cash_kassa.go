@@ -754,21 +754,16 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 	}
 	page, pageSize := kassaPaging(c)
 
-	where := " WHERE cb.tenant_id = $1"
-	args := []interface{}{tenantID}
+	// ── Which till ──────────────────────────────────────────────────────
 	registerID := c.Query("cash_register_id")
 	registerName := ""
 	registerCount := 0
 	if registerID == "" {
 		// Default to the tenant's first active register so the screen isn't
-		// empty when the client hasn't picked one yet.
-		//
-		// This fallback is silent by nature: with more than one kassa the
-		// caller gets ONE register's book and nothing in the payload said
-		// which, so the screen reads as "the cash book" while showing a single
-		// till. The resolved register is now echoed on every row (and its
-		// name), so a client can label the book and offer a switcher instead of
-		// quietly under-reporting.
+		// empty when the client hasn't picked one yet. The fallback is silent
+		// by nature — with several kassas the caller gets ONE till's book and
+		// nothing said which — so the resolved register rides on every row and
+		// a client can label the book and offer a switcher.
 		var rid uuid.UUID
 		var rname string
 		if e := h.db.QueryRow(`SELECT id, name FROM cash_registers
@@ -777,43 +772,68 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 			registerID = rid.String()
 			registerName = rname
 		}
+	} else if rid, e := uuid.Parse(registerID); e == nil {
+		_ = h.db.QueryRow(`SELECT name FROM cash_registers WHERE id=$1 AND tenant_id=$2`,
+			rid, tenantID).Scan(&registerName)
 	}
-	// How many active kassas exist, so the client can tell "this tenant has one
-	// till" from "you are looking at 1 of 4".
 	_ = h.db.QueryRow(`SELECT COUNT(*) FROM cash_registers
 		WHERE tenant_id=$1 AND deleted_at IS NULL AND is_active = true`, tenantID).Scan(&registerCount)
-	if registerName == "" && registerID != "" {
-		if rid, e := uuid.Parse(registerID); e == nil {
-			_ = h.db.QueryRow(`SELECT name FROM cash_registers WHERE id=$1 AND tenant_id=$2`,
-				rid, tenantID).Scan(&registerName)
-		}
+
+	// ── The book, DERIVED from the events (kassa_ledger.go) ─────────────
+	// Not read from the materialised cash_book_entries table: that table was
+	// only ever written by ConfirmCashOrder, so the book showed PKO/RKO orders
+	// and silently omitted every cash transaction — which is precisely why the
+	// web and mobile totals disagreed. Deriving also survives the hard DELETE
+	// on cash_transactions, which a running total in a side table cannot.
+	args := []interface{}{tenantID}
+
+	registerFilter := "TRUE"
+	if rid, e := uuid.Parse(registerID); e == nil {
+		args = append(args, rid)
+		registerFilter = fmt.Sprintf("mv.register_id = $%d", len(args))
 	}
-	if registerID != "" {
-		if rid, e := uuid.Parse(registerID); e == nil {
-			args = append(args, rid)
-			where += fmt.Sprintf(" AND cb.cash_register_id = $%d", len(args))
-		}
-	}
+
+	// The date window is applied ONLY in the outer select. Filtering before the
+	// window function would restart the running balance at zero on every page —
+	// the same "starts from 0 and drags every balance negative" failure the web
+	// balance chain had.
+	dateFilter := ""
 	if v := c.Query("date_from"); v != "" {
 		args = append(args, v)
-		where += fmt.Sprintf(" AND cb.entry_date >= $%d", len(args))
+		dateFilter += fmt.Sprintf(" AND d >= $%d", len(args))
 	}
 	if v := c.Query("date_to"); v != "" {
 		args = append(args, v)
-		where += fmt.Sprintf(" AND cb.entry_date <= $%d", len(args))
+		dateFilter += fmt.Sprintf(" AND d <= $%d", len(args))
 	}
 
+	book := `
+		WITH mv AS (` + kassaMovementSQL + `),
+		daily AS (
+			SELECT mv.d, SUM(mv.income) AS inc, SUM(mv.expense) AS exp
+			FROM mv WHERE ` + registerFilter + `
+			GROUP BY mv.d
+		),
+		cum AS (
+			SELECT d, inc, exp,
+			       COALESCE(SUM(inc - exp) OVER (
+			           ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+			       ), 0) AS opening
+			FROM daily
+		)
+		SELECT d, opening, inc, exp, opening + inc - exp AS closing
+		FROM cum
+		WHERE TRUE` + dateFilter
+
 	var total int
-	if err := h.db.QueryRow(`SELECT COUNT(*) FROM cash_book_entries cb`+where, args...).Scan(&total); err != nil {
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM (`+book+`) t`, args...).Scan(&total); err != nil {
 		h.log.Error("cash book count failed", "error", err)
 		response.InternalError(c, "Failed to load cash book")
 		return
 	}
 
-	rows, err := h.db.Query(fmt.Sprintf(`
-		SELECT cb.entry_date, cb.opening_balance, cb.total_income, cb.total_expense, cb.closing_balance
-		FROM cash_book_entries cb`+where+`
-		ORDER BY cb.entry_date DESC LIMIT %d OFFSET %d`, pageSize, (page-1)*pageSize), args...)
+	rows, err := h.db.Query(fmt.Sprintf(book+`
+		ORDER BY d DESC LIMIT %d OFFSET %d`, pageSize, (page-1)*pageSize), args...)
 	if err != nil {
 		h.log.Error("cash book query failed", "error", err)
 		response.InternalError(c, "Failed to load cash book")
@@ -831,9 +851,9 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 		out = append(out, gin.H{
 			"entry_date": d.Format("2006-01-02"), "opening_balance": opening,
 			"total_income": income, "total_expense": expense, "closing_balance": closing,
-			// Which till this row belongs to. Added per-row rather than as a
-			// sibling of `data` because `data` is a list in the shipped clients
-			// and turning it into an object would break them.
+			// Which till this row belongs to. Per-row rather than a sibling of
+			// `data`, because `data` is a list in the shipped clients and
+			// turning it into an object would break both.
 			"cash_register_id": registerID, "cash_register_name": registerName,
 			"active_register_count": registerCount,
 		})
