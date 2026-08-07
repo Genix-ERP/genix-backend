@@ -28,34 +28,34 @@ type AccountType struct {
 
 // Account represents a chart of accounts entry
 type Account struct {
-	ID               uuid.UUID    `json:"id" db:"id"`
-	TenantID         uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	OrganizationID   *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
-	ParentID         *uuid.UUID   `json:"parent_id,omitempty" db:"parent_id"`
-	AccountTypeID    uuid.UUID    `json:"account_type_id" db:"account_type_id"`
-	Code             string       `json:"code" db:"code"`
-	Name             string       `json:"name" db:"name"`
-	NameUz           *string      `json:"name_uz,omitempty" db:"name_uz"`
-	NameEn           *string      `json:"name_en,omitempty" db:"name_en"`
-	NameRu           *string      `json:"name_ru,omitempty" db:"name_ru"`
-	Description      *string      `json:"description,omitempty" db:"description"`
-	CurrencyID       *uuid.UUID   `json:"currency_id,omitempty" db:"currency_id"`
-	IsBankAccount    bool         `json:"is_bank_account" db:"is_bank_account"`
-	BankDetails      *string      `json:"bank_details,omitempty" db:"bank_details"` // JSON
-	IsControlAccount bool         `json:"is_control_account" db:"is_control_account"`
-	IsReconcilable   bool         `json:"is_reconcilable" db:"is_reconcilable"`
-	BudgetTracking   bool         `json:"budget_tracking" db:"budget_tracking"`
+	ID                 uuid.UUID    `json:"id" db:"id"`
+	TenantID           uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	OrganizationID     *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
+	ParentID           *uuid.UUID   `json:"parent_id,omitempty" db:"parent_id"`
+	AccountTypeID      uuid.UUID    `json:"account_type_id" db:"account_type_id"`
+	Code               string       `json:"code" db:"code"`
+	Name               string       `json:"name" db:"name"`
+	NameUz             *string      `json:"name_uz,omitempty" db:"name_uz"`
+	NameEn             *string      `json:"name_en,omitempty" db:"name_en"`
+	NameRu             *string      `json:"name_ru,omitempty" db:"name_ru"`
+	Description        *string      `json:"description,omitempty" db:"description"`
+	CurrencyID         *uuid.UUID   `json:"currency_id,omitempty" db:"currency_id"`
+	IsBankAccount      bool         `json:"is_bank_account" db:"is_bank_account"`
+	BankDetails        *string      `json:"bank_details,omitempty" db:"bank_details"` // JSON
+	IsControlAccount   bool         `json:"is_control_account" db:"is_control_account"`
+	IsReconcilable     bool         `json:"is_reconcilable" db:"is_reconcilable"`
+	BudgetTracking     bool         `json:"budget_tracking" db:"budget_tracking"`
 	InternalType       *string      `json:"internal_type,omitempty" db:"internal_type"`
 	IsLeaf             bool         `json:"is_leaf" db:"is_leaf"`
-	AccountNature      string       `json:"account_nature" db:"account_nature"` // ACTIVE, PASSIVE, ACTIVE_PASSIVE
+	AccountNature      string       `json:"account_nature" db:"account_nature"`             // ACTIVE, PASSIVE, ACTIVE_PASSIVE
 	AnalyticsTypes     *string      `json:"analytics_types,omitempty" db:"analytics_types"` // JSONB array
 	MandatoryAnalytics bool         `json:"mandatory_analytics" db:"mandatory_analytics"`
 	CurrentBalance     float64      `json:"current_balance" db:"current_balance"`
 	OpeningBalance     float64      `json:"opening_balance" db:"opening_balance"`
 	IsActive           bool         `json:"is_active" db:"is_active"`
-	CreatedAt        time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt        time.Time    `json:"updated_at" db:"updated_at"`
-	DeletedAt        sql.NullTime `json:"-" db:"deleted_at"`
+	CreatedAt          time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt          sql.NullTime `json:"-" db:"deleted_at"`
 
 	// Relationships (loaded separately)
 	AccountType *AccountType `json:"account_type,omitempty"`
@@ -65,62 +65,62 @@ type Account struct {
 
 // AccountResponse is the API response format for Account
 type AccountResponse struct {
-	ID               uuid.UUID        `json:"id"`
-	ParentID         *uuid.UUID       `json:"parent_id,omitempty"`
-	AccountTypeID    uuid.UUID        `json:"account_type_id"`
-	Code             string           `json:"code"`
-	Name             string           `json:"name"`
-	NameUz           *string          `json:"name_uz,omitempty"`
-	NameEn           *string          `json:"name_en,omitempty"`
-	NameRu           *string          `json:"name_ru,omitempty"`
-	Description      *string          `json:"description,omitempty"`
-	Category         string           `json:"category,omitempty"`
-	NormalBalance    string           `json:"normal_balance,omitempty"`
-	IsBankAccount    bool             `json:"is_bank_account"`
-	IsControlAccount bool             `json:"is_control_account"`
-	IsReconcilable   bool             `json:"is_reconcilable"`
-	BudgetTracking   bool             `json:"budget_tracking"`
-	InternalType       *string          `json:"internal_type,omitempty"`
-	IsLeaf             bool             `json:"is_leaf"`
-	AccountNature      string           `json:"account_nature"`
-	AnalyticsTypes     *string          `json:"analytics_types,omitempty"`
-	MandatoryAnalytics bool             `json:"mandatory_analytics"`
-	CurrentBalance     float64          `json:"current_balance"`
-	OpeningBalance     float64          `json:"opening_balance"`
-	IsActive           bool             `json:"is_active"`
-	CreatedAt          time.Time        `json:"created_at"`
-	UpdatedAt          time.Time        `json:"updated_at"`
-	AccountType        *AccountType     `json:"account_type,omitempty"`
+	ID                 uuid.UUID         `json:"id"`
+	ParentID           *uuid.UUID        `json:"parent_id,omitempty"`
+	AccountTypeID      uuid.UUID         `json:"account_type_id"`
+	Code               string            `json:"code"`
+	Name               string            `json:"name"`
+	NameUz             *string           `json:"name_uz,omitempty"`
+	NameEn             *string           `json:"name_en,omitempty"`
+	NameRu             *string           `json:"name_ru,omitempty"`
+	Description        *string           `json:"description,omitempty"`
+	Category           string            `json:"category,omitempty"`
+	NormalBalance      string            `json:"normal_balance,omitempty"`
+	IsBankAccount      bool              `json:"is_bank_account"`
+	IsControlAccount   bool              `json:"is_control_account"`
+	IsReconcilable     bool              `json:"is_reconcilable"`
+	BudgetTracking     bool              `json:"budget_tracking"`
+	InternalType       *string           `json:"internal_type,omitempty"`
+	IsLeaf             bool              `json:"is_leaf"`
+	AccountNature      string            `json:"account_nature"`
+	AnalyticsTypes     *string           `json:"analytics_types,omitempty"`
+	MandatoryAnalytics bool              `json:"mandatory_analytics"`
+	CurrentBalance     float64           `json:"current_balance"`
+	OpeningBalance     float64           `json:"opening_balance"`
+	IsActive           bool              `json:"is_active"`
+	CreatedAt          time.Time         `json:"created_at"`
+	UpdatedAt          time.Time         `json:"updated_at"`
+	AccountType        *AccountType      `json:"account_type,omitempty"`
 	Children           []AccountResponse `json:"children,omitempty"`
 }
 
 // ToResponse converts Account to AccountResponse
 func (a *Account) ToResponse() *AccountResponse {
 	resp := &AccountResponse{
-		ID:               a.ID,
-		ParentID:         a.ParentID,
-		AccountTypeID:    a.AccountTypeID,
-		Code:             a.Code,
-		Name:             a.Name,
-		NameUz:           a.NameUz,
-		NameEn:           a.NameEn,
-		NameRu:           a.NameRu,
-		Description:      a.Description,
-		IsBankAccount:    a.IsBankAccount,
-		IsControlAccount: a.IsControlAccount,
-		IsReconcilable:   a.IsReconcilable,
-		BudgetTracking:   a.BudgetTracking,
+		ID:                 a.ID,
+		ParentID:           a.ParentID,
+		AccountTypeID:      a.AccountTypeID,
+		Code:               a.Code,
+		Name:               a.Name,
+		NameUz:             a.NameUz,
+		NameEn:             a.NameEn,
+		NameRu:             a.NameRu,
+		Description:        a.Description,
+		IsBankAccount:      a.IsBankAccount,
+		IsControlAccount:   a.IsControlAccount,
+		IsReconcilable:     a.IsReconcilable,
+		BudgetTracking:     a.BudgetTracking,
 		InternalType:       a.InternalType,
 		IsLeaf:             a.IsLeaf,
 		AccountNature:      a.AccountNature,
 		AnalyticsTypes:     a.AnalyticsTypes,
 		MandatoryAnalytics: a.MandatoryAnalytics,
 		CurrentBalance:     a.CurrentBalance,
-		OpeningBalance:   a.OpeningBalance,
-		IsActive:         a.IsActive,
-		CreatedAt:        a.CreatedAt,
-		UpdatedAt:        a.UpdatedAt,
-		AccountType:      a.AccountType,
+		OpeningBalance:     a.OpeningBalance,
+		IsActive:           a.IsActive,
+		CreatedAt:          a.CreatedAt,
+		UpdatedAt:          a.UpdatedAt,
+		AccountType:        a.AccountType,
 	}
 	if a.AccountType != nil {
 		resp.Category = a.AccountType.Category
@@ -147,16 +147,16 @@ type CreateAccountInput struct {
 
 // UpdateAccountInput is the input for updating an account
 type UpdateAccountInput struct {
-	ParentID         *string  `json:"parent_id"`
-	Code             *string  `json:"code"`
-	Name             *string  `json:"name"`
-	Description      *string  `json:"description"`
-	InternalType     *string  `json:"internal_type"`
-	IsBankAccount    *bool    `json:"is_bank_account"`
-	IsReconcilable   *bool    `json:"is_reconcilable"`
-	IsControlAccount *bool    `json:"is_control_account"`
-	BudgetTracking   *bool    `json:"budget_tracking"`
-	IsActive         *bool    `json:"is_active"`
+	ParentID         *string `json:"parent_id"`
+	Code             *string `json:"code"`
+	Name             *string `json:"name"`
+	Description      *string `json:"description"`
+	InternalType     *string `json:"internal_type"`
+	IsBankAccount    *bool   `json:"is_bank_account"`
+	IsReconcilable   *bool   `json:"is_reconcilable"`
+	IsControlAccount *bool   `json:"is_control_account"`
+	BudgetTracking   *bool   `json:"budget_tracking"`
+	IsActive         *bool   `json:"is_active"`
 }
 
 // AccountListFilter is the filter for listing accounts
@@ -320,25 +320,25 @@ type JournalEntryLine struct {
 
 // JournalEntryResponse is the API response format
 type JournalEntryResponse struct {
-	ID              uuid.UUID            `json:"id"`
-	JournalID       uuid.UUID            `json:"journal_id"`
-	EntryNumber     string               `json:"entry_number"`
-	EntryDate       string               `json:"entry_date"`
-	Reference       *string              `json:"reference,omitempty"`
-	Description     *string              `json:"description,omitempty"`
-	SourceType      *string              `json:"source_type,omitempty"`
-	TotalDebit      float64              `json:"total_debit"`
-	TotalCredit     float64              `json:"total_credit"`
-	Status          string               `json:"status"`
-	PostedAt        *time.Time           `json:"posted_at,omitempty"`
-	ReversedEntryID *uuid.UUID           `json:"reversed_entry_id,omitempty"`
-	IsReversal      bool                 `json:"is_reversal"`
-	ReversalOfID    *uuid.UUID           `json:"reversal_of_id,omitempty"`
-	ReversalReason  *string              `json:"reversal_reason,omitempty"`
-	Tags            []string             `json:"tags,omitempty"`
-	CreatedAt       time.Time            `json:"created_at"`
-	Lines           []JournalEntryLine   `json:"lines,omitempty"`
-	Journal         *Journal             `json:"journal,omitempty"`
+	ID              uuid.UUID          `json:"id"`
+	JournalID       uuid.UUID          `json:"journal_id"`
+	EntryNumber     string             `json:"entry_number"`
+	EntryDate       string             `json:"entry_date"`
+	Reference       *string            `json:"reference,omitempty"`
+	Description     *string            `json:"description,omitempty"`
+	SourceType      *string            `json:"source_type,omitempty"`
+	TotalDebit      float64            `json:"total_debit"`
+	TotalCredit     float64            `json:"total_credit"`
+	Status          string             `json:"status"`
+	PostedAt        *time.Time         `json:"posted_at,omitempty"`
+	ReversedEntryID *uuid.UUID         `json:"reversed_entry_id,omitempty"`
+	IsReversal      bool               `json:"is_reversal"`
+	ReversalOfID    *uuid.UUID         `json:"reversal_of_id,omitempty"`
+	ReversalReason  *string            `json:"reversal_reason,omitempty"`
+	Tags            []string           `json:"tags,omitempty"`
+	CreatedAt       time.Time          `json:"created_at"`
+	Lines           []JournalEntryLine `json:"lines,omitempty"`
+	Journal         *Journal           `json:"journal,omitempty"`
 }
 
 // ToResponse converts JournalEntry to JournalEntryResponse
@@ -381,8 +381,8 @@ type CreateJournalEntryInput struct {
 
 // CreateJournalEntryLineInput is the input for a journal entry line
 type CreateJournalEntryLineInput struct {
-	AccountID    string  `json:"account_id" binding:"required"`
-	ContactID    *string `json:"contact_id"`
+	AccountID string  `json:"account_id" binding:"required"`
+	ContactID *string `json:"contact_id"`
 	// Analytics (subkonto) dimensions per TT Buxgalteriya 4.5
 	WarehouseID    *string  `json:"warehouse_id"`
 	EmployeeID     *string  `json:"employee_id"`
@@ -460,21 +460,21 @@ type PaymentAllocation struct {
 
 // PaymentResponse is the API response format
 type PaymentResponse struct {
-	ID              uuid.UUID           `json:"id"`
-	PaymentNumber   string              `json:"payment_number"`
-	Type            string              `json:"type"`
-	ContactID       uuid.UUID           `json:"contact_id"`
-	ContactName     string              `json:"contact_name,omitempty"`
-	PaymentDate     string              `json:"payment_date"`
-	Amount          float64             `json:"amount"`
-	Status          string              `json:"status"`
-	Reference       *string             `json:"reference,omitempty"`
-	Notes           *string             `json:"notes,omitempty"`
-	JournalID       string              `json:"journal_id,omitempty"`
-	JournalName     string              `json:"journal_name,omitempty"`
-	PaymentMethod   string              `json:"payment_method,omitempty"`
-	CreatedAt       time.Time           `json:"created_at"`
-	Allocations     []PaymentAllocation `json:"allocations,omitempty"`
+	ID            uuid.UUID           `json:"id"`
+	PaymentNumber string              `json:"payment_number"`
+	Type          string              `json:"type"`
+	ContactID     uuid.UUID           `json:"contact_id"`
+	ContactName   string              `json:"contact_name,omitempty"`
+	PaymentDate   string              `json:"payment_date"`
+	Amount        float64             `json:"amount"`
+	Status        string              `json:"status"`
+	Reference     *string             `json:"reference,omitempty"`
+	Notes         *string             `json:"notes,omitempty"`
+	JournalID     string              `json:"journal_id,omitempty"`
+	JournalName   string              `json:"journal_name,omitempty"`
+	PaymentMethod string              `json:"payment_method,omitempty"`
+	CreatedAt     time.Time           `json:"created_at"`
+	Allocations   []PaymentAllocation `json:"allocations,omitempty"`
 }
 
 // ToResponse converts Payment to PaymentResponse
@@ -632,21 +632,21 @@ type ExchangeRate struct {
 
 // BankAccount represents a bank account for the company
 type BankAccount struct {
-	ID              uuid.UUID    `json:"id" db:"id"`
-	TenantID        uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	OrganizationID  *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
-	Name            string       `json:"name" db:"name"`
-	BankName        string       `json:"bank_name" db:"bank_name"`
-	AccountNumber   string       `json:"account_number" db:"account_number"`
-	Currency        string       `json:"currency" db:"currency"`
-	AccountType     string       `json:"account_type" db:"account_type"` // checking, savings, etc.
-	Balance         float64      `json:"balance" db:"balance"`
-	IsActive        bool         `json:"is_active" db:"is_active"`
-	LastReconciled  *time.Time   `json:"last_reconciled,omitempty" db:"last_reconciled"`
-	AccountID       *uuid.UUID   `json:"account_id,omitempty" db:"account_id"` // Link to chart of accounts
-	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
-	DeletedAt       sql.NullTime `json:"-" db:"deleted_at"`
+	ID             uuid.UUID    `json:"id" db:"id"`
+	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
+	Name           string       `json:"name" db:"name"`
+	BankName       string       `json:"bank_name" db:"bank_name"`
+	AccountNumber  string       `json:"account_number" db:"account_number"`
+	Currency       string       `json:"currency" db:"currency"`
+	AccountType    string       `json:"account_type" db:"account_type"` // checking, savings, etc.
+	Balance        float64      `json:"balance" db:"balance"`
+	IsActive       bool         `json:"is_active" db:"is_active"`
+	LastReconciled *time.Time   `json:"last_reconciled,omitempty" db:"last_reconciled"`
+	AccountID      *uuid.UUID   `json:"account_id,omitempty" db:"account_id"` // Link to chart of accounts
+	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
 }
 
 // CreateBankAccountInput is the input for creating a bank account
@@ -728,19 +728,19 @@ type BankTransactionListFilter struct {
 
 // CashTransaction represents a cash register transaction
 type CashTransaction struct {
-	ID              uuid.UUID  `json:"id" db:"id"`
-	TenantID        uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	TransactionDate time.Time  `json:"transaction_date" db:"transaction_date"`
-	Type            string     `json:"type" db:"transaction_type"` // income, expense, transfer
-	Amount          float64    `json:"amount" db:"amount"`
-	Currency        string     `json:"currency" db:"currency"`
-	Description     string     `json:"description" db:"description"`
-	Category        string     `json:"category" db:"category"`
-	Reference       string     `json:"reference" db:"reference"`
-	Cashier         string     `json:"cashier" db:"cashier"`
-	Status          string     `json:"status" db:"status"` // draft, posted
-	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+	ID              uuid.UUID `json:"id" db:"id"`
+	TenantID        uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	TransactionDate time.Time `json:"transaction_date" db:"transaction_date"`
+	Type            string    `json:"type" db:"transaction_type"` // income, expense, transfer
+	Amount          float64   `json:"amount" db:"amount"`
+	Currency        string    `json:"currency" db:"currency"`
+	Description     string    `json:"description" db:"description"`
+	Category        string    `json:"category" db:"category"`
+	Reference       string    `json:"reference" db:"reference"`
+	Cashier         string    `json:"cashier" db:"cashier"`
+	Status          string    `json:"status" db:"status"` // draft, posted
+	CreatedAt       time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // CreateCashTransactionInput is the input for creating a cash transaction
@@ -782,38 +782,38 @@ type CashTransactionListFilter struct {
 
 // TrialBalanceReport represents trial balance data
 type TrialBalanceReport struct {
-	AsOfDate    string                  `json:"as_of_date"`
-	TotalDebit  float64                 `json:"total_debit"`
-	TotalCredit float64                 `json:"total_credit"`
-	IsBalanced  bool                    `json:"is_balanced"`
-	Accounts    []TrialBalanceAccount   `json:"accounts"`
+	AsOfDate    string                `json:"as_of_date"`
+	TotalDebit  float64               `json:"total_debit"`
+	TotalCredit float64               `json:"total_credit"`
+	IsBalanced  bool                  `json:"is_balanced"`
+	Accounts    []TrialBalanceAccount `json:"accounts"`
 }
 
 // TrialBalanceAccount represents a single account in trial balance
 type TrialBalanceAccount struct {
-	AccountID     uuid.UUID              `json:"account_id"`
-	AccountCode   string                 `json:"account_code"`
-	AccountName   string                 `json:"account_name"`
-	AccountNameUz string                 `json:"account_name_uz,omitempty"`
-	AccountNameEn string                 `json:"account_name_en,omitempty"`
-	AccountNameRu string                 `json:"account_name_ru,omitempty"`
-	Category      string                 `json:"category"`
-	DebitBalance  float64                `json:"debit_balance"`
-	CreditBalance float64                `json:"credit_balance"`
-	ParentID      *uuid.UUID             `json:"parent_id,omitempty"`
-	IsParent      bool                   `json:"is_parent,omitempty"`
-	Children      []TrialBalanceAccount  `json:"children,omitempty"`
+	AccountID     uuid.UUID             `json:"account_id"`
+	AccountCode   string                `json:"account_code"`
+	AccountName   string                `json:"account_name"`
+	AccountNameUz string                `json:"account_name_uz,omitempty"`
+	AccountNameEn string                `json:"account_name_en,omitempty"`
+	AccountNameRu string                `json:"account_name_ru,omitempty"`
+	Category      string                `json:"category"`
+	DebitBalance  float64               `json:"debit_balance"`
+	CreditBalance float64               `json:"credit_balance"`
+	ParentID      *uuid.UUID            `json:"parent_id,omitempty"`
+	IsParent      bool                  `json:"is_parent,omitempty"`
+	Children      []TrialBalanceAccount `json:"children,omitempty"`
 }
 
 // BalanceSheetReport represents balance sheet data
 type BalanceSheetReport struct {
-	AsOfDate        string              `json:"as_of_date"`
-	TotalAssets     float64             `json:"total_assets"`
-	TotalLiabilities float64            `json:"total_liabilities"`
-	TotalEquity     float64             `json:"total_equity"`
-	Assets          []BalanceSheetSection `json:"assets"`
-	Liabilities     []BalanceSheetSection `json:"liabilities"`
-	Equity          []BalanceSheetSection `json:"equity"`
+	AsOfDate         string                `json:"as_of_date"`
+	TotalAssets      float64               `json:"total_assets"`
+	TotalLiabilities float64               `json:"total_liabilities"`
+	TotalEquity      float64               `json:"total_equity"`
+	Assets           []BalanceSheetSection `json:"assets"`
+	Liabilities      []BalanceSheetSection `json:"liabilities"`
+	Equity           []BalanceSheetSection `json:"equity"`
 }
 
 // BalanceSheetSection represents a section in balance sheet
@@ -872,11 +872,29 @@ type GeneralLedgerReport struct {
 	// Report-level totals across every returned account. `closing_debit_total` and
 	// `closing_credit_total` should be equal in a balanced ledger — the frontend
 	// uses the delta as a visual integrity check ("Balance verification OK").
+	//
+	// NOTE: total_debit / total_credit are period-wide (every account matching the
+	// filters, ignoring LIMIT/OFFSET) so they don't shrink to the loaded page when
+	// the response is paginated. The opening/closing totals are still summed over
+	// the returned accounts, since they're derived from each account's running
+	// balance.
 	TotalOpening       float64 `json:"total_opening"`
 	TotalDebit         float64 `json:"total_debit"`
 	TotalCredit        float64 `json:"total_credit"`
 	ClosingDebitTotal  float64 `json:"closing_debit_total"`
 	ClosingCreditTotal float64 `json:"closing_credit_total"`
+
+	// Same period-wide figures in the nested shape the mobile summary strip
+	// reads. Always emitted.
+	Totals GeneralLedgerTotals `json:"totals"`
+}
+
+// GeneralLedgerTotals carries period-wide debit/credit totals for the WHOLE
+// filtered account set — not just the returned page — so the "Jami debet /
+// Jami kredit" strip stays correct once the account list is paginated.
+type GeneralLedgerTotals struct {
+	TotalDebit  float64 `json:"total_debit"`
+	TotalCredit float64 `json:"total_credit"`
 }
 
 // GeneralLedgerAccount represents an account in general ledger
@@ -887,15 +905,15 @@ type GeneralLedgerAccount struct {
 	// Trilingual names (migration 316). Returned alongside `account_name`
 	// so the frontend can pick the right label per user's language —
 	// mirrors the pattern used by Chart of Accounts (handler/finance.go::ListAccounts).
-	AccountNameUz string `json:"account_name_uz"`
-	AccountNameEn string `json:"account_name_en"`
-	AccountNameRu string `json:"account_name_ru"`
-	AccountType   string `json:"account_type"`
-	NormalBalance string `json:"normal_balance"`
-	OpeningBalance float64                    `json:"opening_balance"`
-	TotalDebit     float64                    `json:"total_debit"`
-	TotalCredit    float64                    `json:"total_credit"`
-	ClosingBalance float64                    `json:"closing_balance"`
+	AccountNameUz  string  `json:"account_name_uz"`
+	AccountNameEn  string  `json:"account_name_en"`
+	AccountNameRu  string  `json:"account_name_ru"`
+	AccountType    string  `json:"account_type"`
+	NormalBalance  string  `json:"normal_balance"`
+	OpeningBalance float64 `json:"opening_balance"`
+	TotalDebit     float64 `json:"total_debit"`
+	TotalCredit    float64 `json:"total_credit"`
+	ClosingBalance float64 `json:"closing_balance"`
 	// Closing balance split by side (migration: none — derived from NormalBalance
 	// + ClosingBalance at query time). An account's side is determined by its
 	// type's normal_balance:
@@ -921,59 +939,59 @@ type GeneralLedgerTransaction struct {
 
 // AccountCardReport represents hisob kartochkasi (account card) report
 type AccountCardReport struct {
-	AccountID      uuid.UUID              `json:"account_id"`
-	AccountCode    string                 `json:"account_code"`
-	AccountName    string                 `json:"account_name"`
-	AccountType    string                 `json:"account_type"`
-	PeriodFrom     string                 `json:"period_from"`
-	PeriodTo       string                 `json:"period_to"`
-	OpeningBalance float64                `json:"opening_balance"`
-	TotalDebit     float64                `json:"total_debit"`
-	TotalCredit    float64                `json:"total_credit"`
-	ClosingBalance float64                `json:"closing_balance"`
+	AccountID      uuid.UUID                `json:"account_id"`
+	AccountCode    string                   `json:"account_code"`
+	AccountName    string                   `json:"account_name"`
+	AccountType    string                   `json:"account_type"`
+	PeriodFrom     string                   `json:"period_from"`
+	PeriodTo       string                   `json:"period_to"`
+	OpeningBalance float64                  `json:"opening_balance"`
+	TotalDebit     float64                  `json:"total_debit"`
+	TotalCredit    float64                  `json:"total_credit"`
+	ClosingBalance float64                  `json:"closing_balance"`
 	Transactions   []AccountCardTransaction `json:"transactions"`
 }
 
 // AccountCardTransaction represents a single transaction in the account card
 type AccountCardTransaction struct {
-	Date               string  `json:"date"`
-	EntryID            string  `json:"entry_id"`
-	EntryNumber        string  `json:"entry_number"`
-	DocType            string  `json:"doc_type"`
-	Description        string  `json:"description"`
-	Reference          string  `json:"reference"`
-	CounterpartCode    string  `json:"counterpart_code"`
-	CounterpartName    string  `json:"counterpart_name"`
-	DebitAmount        float64 `json:"debit_amount"`
-	CreditAmount       float64 `json:"credit_amount"`
-	RunningBalance     float64 `json:"running_balance"`
-	ContactName        string  `json:"contact_name,omitempty"`
+	Date            string  `json:"date"`
+	EntryID         string  `json:"entry_id"`
+	EntryNumber     string  `json:"entry_number"`
+	DocType         string  `json:"doc_type"`
+	Description     string  `json:"description"`
+	Reference       string  `json:"reference"`
+	CounterpartCode string  `json:"counterpart_code"`
+	CounterpartName string  `json:"counterpart_name"`
+	DebitAmount     float64 `json:"debit_amount"`
+	CreditAmount    float64 `json:"credit_amount"`
+	RunningBalance  float64 `json:"running_balance"`
+	ContactName     string  `json:"contact_name,omitempty"`
 }
 
 // AgingReport represents aging report data (AR/AP)
 type AgingReport struct {
-	AsOfDate     string          `json:"as_of_date"`
-	ReportType   string          `json:"report_type"` // receivables, payables
-	TotalAmount  float64         `json:"total_amount"`
-	CurrentTotal float64         `json:"current_total"`
-	Days1To30    float64         `json:"days_1_to_30"`
-	Days31To60   float64         `json:"days_31_to_60"`
-	Days61To90   float64         `json:"days_61_to_90"`
-	Over90Days   float64         `json:"over_90_days"`
-	Contacts     []AgingContact  `json:"contacts"`
+	AsOfDate     string         `json:"as_of_date"`
+	ReportType   string         `json:"report_type"` // receivables, payables
+	TotalAmount  float64        `json:"total_amount"`
+	CurrentTotal float64        `json:"current_total"`
+	Days1To30    float64        `json:"days_1_to_30"`
+	Days31To60   float64        `json:"days_31_to_60"`
+	Days61To90   float64        `json:"days_61_to_90"`
+	Over90Days   float64        `json:"over_90_days"`
+	Contacts     []AgingContact `json:"contacts"`
 }
 
 // AgingContact represents a contact in aging report
 type AgingContact struct {
-	ContactID    uuid.UUID       `json:"contact_id"`
-	ContactName  string          `json:"contact_name"`
-	TotalAmount  float64         `json:"total_amount"`
-	Current      float64         `json:"current"`
-	Days1To30    float64         `json:"days_1_to_30"`
-	Days31To60   float64         `json:"days_31_to_60"`
-	Days61To90   float64         `json:"days_61_to_90"`
-	Over90Days   float64         `json:"over_90_days"`
-	Invoices     []AgingInvoice  `json:"invoices,omitempty"`
+	ContactID   uuid.UUID      `json:"contact_id"`
+	ContactName string         `json:"contact_name"`
+	TotalAmount float64        `json:"total_amount"`
+	Current     float64        `json:"current"`
+	Days1To30   float64        `json:"days_1_to_30"`
+	Days31To60  float64        `json:"days_31_to_60"`
+	Days61To90  float64        `json:"days_61_to_90"`
+	Over90Days  float64        `json:"over_90_days"`
+	Invoices    []AgingInvoice `json:"invoices,omitempty"`
 }
 
 // AgingInvoice represents an invoice in aging report
@@ -990,20 +1008,20 @@ type AgingInvoice struct {
 
 // CashFlowReport represents cash flow statement data
 type CashFlowReport struct {
-	PeriodFrom            string                 `json:"period_from"`
-	PeriodTo              string                 `json:"period_to"`
-	OpeningCashBalance    float64                `json:"opening_cash_balance"`
-	ClosingCashBalance    float64                `json:"closing_cash_balance"`
-	NetCashChange         float64                `json:"net_cash_change"`
-	OperatingActivities   CashFlowSection        `json:"operating_activities"`
-	InvestingActivities   CashFlowSection        `json:"investing_activities"`
-	FinancingActivities   CashFlowSection        `json:"financing_activities"`
+	PeriodFrom          string          `json:"period_from"`
+	PeriodTo            string          `json:"period_to"`
+	OpeningCashBalance  float64         `json:"opening_cash_balance"`
+	ClosingCashBalance  float64         `json:"closing_cash_balance"`
+	NetCashChange       float64         `json:"net_cash_change"`
+	OperatingActivities CashFlowSection `json:"operating_activities"`
+	InvestingActivities CashFlowSection `json:"investing_activities"`
+	FinancingActivities CashFlowSection `json:"financing_activities"`
 }
 
 // CashFlowSection represents a section in cash flow statement
 type CashFlowSection struct {
-	Total float64           `json:"total"`
-	Items []CashFlowItem    `json:"items"`
+	Total float64        `json:"total"`
+	Items []CashFlowItem `json:"items"`
 }
 
 // CashFlowItem represents an item in cash flow section
@@ -1018,16 +1036,16 @@ type CashFlowItem struct {
 
 // FiscalYear represents a fiscal year
 type FiscalYear struct {
-	ID             uuid.UUID    `json:"id" db:"id"`
-	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	OrganizationID *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
-	Code           string       `json:"code" db:"code"`
-	Name           string       `json:"name" db:"name"`
-	StartDate      time.Time    `json:"start_date" db:"start_date"`
-	EndDate        time.Time    `json:"end_date" db:"end_date"`
-	Status         string       `json:"status" db:"status"` // open, closed, locked
-	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
+	ID             uuid.UUID  `json:"id" db:"id"`
+	TenantID       uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	Code           string     `json:"code" db:"code"`
+	Name           string     `json:"name" db:"name"`
+	StartDate      time.Time  `json:"start_date" db:"start_date"`
+	EndDate        time.Time  `json:"end_date" db:"end_date"`
+	Status         string     `json:"status" db:"status"` // open, closed, locked
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships (loaded separately)
 	Periods []FiscalPeriod `json:"periods,omitempty"`
@@ -1035,16 +1053,16 @@ type FiscalYear struct {
 
 // FiscalPeriod represents a fiscal period within a fiscal year
 type FiscalPeriod struct {
-	ID            uuid.UUID `json:"id" db:"id"`
-	FiscalYearID  uuid.UUID `json:"fiscal_year_id" db:"fiscal_year_id"`
-	Code          string    `json:"code" db:"code"`
-	Name          string    `json:"name" db:"name"`
-	PeriodNumber  int       `json:"period_number" db:"period_number"`
-	StartDate     time.Time `json:"start_date" db:"start_date"`
-	EndDate       time.Time `json:"end_date" db:"end_date"`
-	Status        string    `json:"status" db:"status"` // open, closed, locked
-	CreatedAt     time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`
+	ID           uuid.UUID `json:"id" db:"id"`
+	FiscalYearID uuid.UUID `json:"fiscal_year_id" db:"fiscal_year_id"`
+	Code         string    `json:"code" db:"code"`
+	Name         string    `json:"name" db:"name"`
+	PeriodNumber int       `json:"period_number" db:"period_number"`
+	StartDate    time.Time `json:"start_date" db:"start_date"`
+	EndDate      time.Time `json:"end_date" db:"end_date"`
+	Status       string    `json:"status" db:"status"` // open, closed, locked
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // ==============================================
@@ -1070,22 +1088,22 @@ type Budget struct {
 	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
 	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
 
-	StartDate        *string  `json:"start_date,omitempty"`
-	EndDate          *string  `json:"end_date,omitempty"`
-	WarningThreshold float64  `json:"warning_threshold"`
+	StartDate        *string `json:"start_date,omitempty"`
+	EndDate          *string `json:"end_date,omitempty"`
+	WarningThreshold float64 `json:"warning_threshold"`
 
 	// New spec fields
-	Approach              string     `json:"approach" db:"approach"`                               // fixed, flexible, zero_based, rolling
-	Breakdown             string     `json:"breakdown" db:"breakdown"`                             // monthly, weekly, none
-	OverspendPolicy       string     `json:"overspend_policy" db:"overspend_policy"`               // warn, require_approval, block
-	ApprovalStatus        *string    `json:"approval_status,omitempty" db:"approval_status"`       // pending, approved, rejected
-	RollingHorizonMonths  int        `json:"rolling_horizon_months" db:"rolling_horizon_months"`
-	AutoExtend            bool       `json:"auto_extend" db:"auto_extend"`
-	ResponsibleUserID     *uuid.UUID `json:"responsible_user_id,omitempty" db:"responsible_user_id"`
-	DepartmentID          *uuid.UUID `json:"department_id,omitempty" db:"department_id"`
-	SubmittedBy           *uuid.UUID `json:"submitted_by,omitempty" db:"submitted_by"`
-	SubmittedAt           *time.Time `json:"submitted_at,omitempty" db:"submitted_at"`
-	RejectionReason       *string    `json:"rejection_reason,omitempty" db:"rejection_reason"`
+	Approach             string     `json:"approach" db:"approach"`                         // fixed, flexible, zero_based, rolling
+	Breakdown            string     `json:"breakdown" db:"breakdown"`                       // monthly, weekly, none
+	OverspendPolicy      string     `json:"overspend_policy" db:"overspend_policy"`         // warn, require_approval, block
+	ApprovalStatus       *string    `json:"approval_status,omitempty" db:"approval_status"` // pending, approved, rejected
+	RollingHorizonMonths int        `json:"rolling_horizon_months" db:"rolling_horizon_months"`
+	AutoExtend           bool       `json:"auto_extend" db:"auto_extend"`
+	ResponsibleUserID    *uuid.UUID `json:"responsible_user_id,omitempty" db:"responsible_user_id"`
+	DepartmentID         *uuid.UUID `json:"department_id,omitempty" db:"department_id"`
+	SubmittedBy          *uuid.UUID `json:"submitted_by,omitempty" db:"submitted_by"`
+	SubmittedAt          *time.Time `json:"submitted_at,omitempty" db:"submitted_at"`
+	RejectionReason      *string    `json:"rejection_reason,omitempty" db:"rejection_reason"`
 
 	// Relationships
 	Lines []BudgetLine `json:"lines,omitempty"`
@@ -1093,19 +1111,19 @@ type Budget struct {
 
 // BudgetLine represents a line item in a budget
 type BudgetLine struct {
-	ID              uuid.UUID  `json:"id" db:"id"`
-	BudgetID        uuid.UUID  `json:"budget_id" db:"budget_id"`
-	AccountID       uuid.UUID  `json:"account_id" db:"account_id"`
-	AccountName     string     `json:"account_name,omitempty"`
-	AccountCode     string     `json:"account_code,omitempty"`
-	FiscalPeriodID  *uuid.UUID `json:"fiscal_period_id,omitempty" db:"fiscal_period_id"`
-	DepartmentID    *uuid.UUID `json:"department_id,omitempty" db:"department_id"`
-	BudgetedAmount  float64    `json:"budgeted_amount" db:"budgeted_amount"`
-	ActualAmount    float64    `json:"actual_amount" db:"actual_amount"`
-	Variance        float64    `json:"variance" db:"variance"` // computed: budgeted - actual
-	Notes           *string    `json:"notes,omitempty" db:"notes"`
-	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+	ID             uuid.UUID  `json:"id" db:"id"`
+	BudgetID       uuid.UUID  `json:"budget_id" db:"budget_id"`
+	AccountID      uuid.UUID  `json:"account_id" db:"account_id"`
+	AccountName    string     `json:"account_name,omitempty"`
+	AccountCode    string     `json:"account_code,omitempty"`
+	FiscalPeriodID *uuid.UUID `json:"fiscal_period_id,omitempty" db:"fiscal_period_id"`
+	DepartmentID   *uuid.UUID `json:"department_id,omitempty" db:"department_id"`
+	BudgetedAmount float64    `json:"budgeted_amount" db:"budgeted_amount"`
+	ActualAmount   float64    `json:"actual_amount" db:"actual_amount"`
+	Variance       float64    `json:"variance" db:"variance"` // computed: budgeted - actual
+	Notes          *string    `json:"notes,omitempty" db:"notes"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Monthly period breakdown
 	Period1  float64 `json:"period_1" db:"period_1"`
@@ -1130,21 +1148,21 @@ type BudgetLine struct {
 	Justification *string `json:"justification,omitempty" db:"justification"`
 
 	// Line grouping
-	LineType     string  `json:"line_type" db:"line_type"`       // revenue, expense, investment
+	LineType     string  `json:"line_type" db:"line_type"` // revenue, expense, investment
 	CategoryName *string `json:"category_name,omitempty" db:"category_name"`
 }
 
 // BudgetCategory represents a user-visible budget category linked to accounts
 type BudgetCategory struct {
-	ID            uuid.UUID  `json:"id" db:"id"`
-	TenantID      uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	Name          string     `json:"name" db:"name"`
-	ParentID      *uuid.UUID `json:"parent_id,omitempty" db:"parent_id"`
-	LineType      string     `json:"line_type" db:"line_type"` // revenue, expense, investment
-	IsActive      bool       `json:"is_active" db:"is_active"`
-	SortOrder     int        `json:"sort_order" db:"sort_order"`
-	DefaultFormula *string   `json:"default_formula,omitempty" db:"default_formula"`
-	AccountIDs    []string   `json:"account_ids,omitempty"`
-	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
+	ID             uuid.UUID  `json:"id" db:"id"`
+	TenantID       uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Name           string     `json:"name" db:"name"`
+	ParentID       *uuid.UUID `json:"parent_id,omitempty" db:"parent_id"`
+	LineType       string     `json:"line_type" db:"line_type"` // revenue, expense, investment
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	SortOrder      int        `json:"sort_order" db:"sort_order"`
+	DefaultFormula *string    `json:"default_formula,omitempty" db:"default_formula"`
+	AccountIDs     []string   `json:"account_ids,omitempty"`
+	CreatedAt      time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at" db:"updated_at"`
 }

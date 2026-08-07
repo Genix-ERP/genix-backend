@@ -24,13 +24,22 @@ type ErrorInfo struct {
 }
 
 // Meta represents pagination and other metadata
+// Meta is the pagination envelope. NONE of these fields carry `omitempty`:
+// with it, Go drops a field when it is zero/false, so `has_next: false` and
+// `total: 0` vanished from the JSON and a client could not tell "last page"
+// from "field missing" — infinite scroll then either stopped early or looped.
+// Emit them unconditionally.
+//
+// `page_size` is the name mobile clients use; `limit` is kept alongside it for
+// the existing web callers. Both carry the same value.
 type Meta struct {
-	Page       int   `json:"page,omitempty"`
-	Limit      int   `json:"limit,omitempty"`
-	Total      int   `json:"total,omitempty"`
-	TotalPages int   `json:"total_pages,omitempty"`
-	HasNext    bool  `json:"has_next,omitempty"`
-	HasPrev    bool  `json:"has_prev,omitempty"`
+	Page       int  `json:"page"`
+	Limit      int  `json:"limit"`
+	PageSize   int  `json:"page_size"`
+	Total      int  `json:"total"`
+	TotalPages int  `json:"total_pages"`
+	HasNext    bool `json:"has_next"`
+	HasPrev    bool `json:"has_prev"`
 }
 
 // Success sends a successful response
@@ -46,6 +55,7 @@ func SuccessWithMeta(c *gin.Context, data interface{}, pagination *entity.Pagina
 	meta := &Meta{
 		Page:       pagination.Page,
 		Limit:      pagination.Limit,
+		PageSize:   pagination.Limit,
 		Total:      pagination.Total,
 		TotalPages: pagination.Pages,
 		HasNext:    pagination.HasNext,
@@ -66,14 +76,18 @@ func SuccessWithPagination(c *gin.Context, data interface{}, pagination *entity.
 
 // Paginated sends a successful response with pagination metadata from individual values
 func Paginated(c *gin.Context, data interface{}, page, limit, total int) {
-	totalPages := total / limit
-	if total%limit > 0 {
-		totalPages++
+	totalPages := 0
+	if limit > 0 {
+		totalPages = total / limit
+		if total%limit > 0 {
+			totalPages++
+		}
 	}
 
 	meta := &Meta{
 		Page:       page,
 		Limit:      limit,
+		PageSize:   limit,
 		Total:      total,
 		TotalPages: totalPages,
 		HasNext:    page < totalPages,
@@ -193,21 +207,21 @@ func InternalServerError(c *gin.Context, message string) {
 
 // Common error codes
 const (
-	ErrCodeBadRequest          = "BAD_REQUEST"
-	ErrCodeValidation          = "VALIDATION_ERROR"
-	ErrCodeUnauthorized        = "UNAUTHORIZED"
-	ErrCodeForbidden           = "FORBIDDEN"
-	ErrCodeNotFound            = "NOT_FOUND"
-	ErrCodeConflict            = "CONFLICT"
-	ErrCodeTooManyRequests     = "TOO_MANY_REQUESTS"
-	ErrCodeInternalError       = "INTERNAL_ERROR"
-	ErrCodeServiceUnavailable  = "SERVICE_UNAVAILABLE"
-	ErrCodeInvalidCredentials  = "INVALID_CREDENTIALS"
-	ErrCodeAccountLocked       = "ACCOUNT_LOCKED"
-	ErrCodeAccountDisabled     = "ACCOUNT_DISABLED"
-	ErrCodeTokenExpired        = "TOKEN_EXPIRED"
-	ErrCodeTokenInvalid        = "TOKEN_INVALID"
-	ErrCodeResourceExists      = "RESOURCE_EXISTS"
-	ErrCodeInsufficientStock   = "INSUFFICIENT_STOCK"
-	ErrCodeInvalidOperation    = "INVALID_OPERATION"
+	ErrCodeBadRequest         = "BAD_REQUEST"
+	ErrCodeValidation         = "VALIDATION_ERROR"
+	ErrCodeUnauthorized       = "UNAUTHORIZED"
+	ErrCodeForbidden          = "FORBIDDEN"
+	ErrCodeNotFound           = "NOT_FOUND"
+	ErrCodeConflict           = "CONFLICT"
+	ErrCodeTooManyRequests    = "TOO_MANY_REQUESTS"
+	ErrCodeInternalError      = "INTERNAL_ERROR"
+	ErrCodeServiceUnavailable = "SERVICE_UNAVAILABLE"
+	ErrCodeInvalidCredentials = "INVALID_CREDENTIALS"
+	ErrCodeAccountLocked      = "ACCOUNT_LOCKED"
+	ErrCodeAccountDisabled    = "ACCOUNT_DISABLED"
+	ErrCodeTokenExpired       = "TOKEN_EXPIRED"
+	ErrCodeTokenInvalid       = "TOKEN_INVALID"
+	ErrCodeResourceExists     = "RESOURCE_EXISTS"
+	ErrCodeInsufficientStock  = "INSUFFICIENT_STOCK"
+	ErrCodeInvalidOperation   = "INVALID_OPERATION"
 )

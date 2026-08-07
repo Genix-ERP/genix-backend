@@ -13,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
@@ -569,6 +570,8 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 	periodFrom := c.Query("period_from")
 	periodTo := c.Query("period_to")
 	accountID := c.Query("account_id")
+	accountType := strings.TrimSpace(c.Query("account_type"))
+	search := strings.TrimSpace(c.Query("search"))
 
 	now := time.Now()
 	if periodFrom == "" {
@@ -576,6 +579,81 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 	}
 	if periodTo == "" {
 		periodTo = now.Format("2006-01-02")
+	}
+
+	// Pagination is OPT-IN: it applies only when the caller actually asks for a
+	// page. Defaulting to a page size would silently truncate the existing web
+	// Bosh daftar screen, which fetches the whole ledger and has no paging UI.
+	// Mobile sends page + page_size=10 and therefore gets the paged shape with a
+	// `meta` envelope; everyone else keeps the full list and no `meta` (exactly
+	// the "meta absent → server sent everything" contract the client expects).
+	pageSizeRaw := c.Query("page_size")
+	if pageSizeRaw == "" {
+		pageSizeRaw = c.Query("limit")
+	}
+	paginate := c.Query("page") != "" || pageSizeRaw != ""
+	page, _ := strconv.Atoi(c.Query("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(pageSizeRaw)
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	// One WHERE clause shared by the count, the page query and the period-wide
+	// totals, so all three always agree on "which accounts match".
+	filter := " WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true"
+	args := []interface{}{tenantID}
+	argCount := 1
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		argCount++
+		filter += fmt.Sprintf(" AND a.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
+	if accountID != "" {
+		argCount++
+		filter += fmt.Sprintf(" AND a.id = $%d", argCount)
+		args = append(args, accountID)
+	}
+
+	// account_type filters on the account_types category ("asset", "liability",
+	// …). It used to be accepted and silently dropped, so the UI's type dropdown
+	// changed nothing.
+	if accountType != "" && strings.ToLower(accountType) != "all" {
+		argCount++
+		filter += fmt.Sprintf(" AND at.category = $%d", argCount)
+		args = append(args, accountType)
+	}
+
+	// search matches code or any of the trilingual names. Server-side so it
+	// searches the whole ledger, not just the page the client happens to hold.
+	if search != "" {
+		argCount++
+		filter += fmt.Sprintf(` AND (a.code ILIKE '%%' || $%d || '%%'
+			OR a.name ILIKE '%%' || $%d || '%%'
+			OR COALESCE(a.name_uz,'') ILIKE '%%' || $%d || '%%'
+			OR COALESCE(a.name_en,'') ILIKE '%%' || $%d || '%%'
+			OR COALESCE(a.name_ru,'') ILIKE '%%' || $%d || '%%')`,
+			argCount, argCount, argCount, argCount, argCount)
+		args = append(args, search)
+	}
+
+	const fromClause = ` FROM accounts a JOIN account_types at ON a.account_type_id = at.id`
+
+	// Total matching accounts — drives meta.total / total_pages.
+	total := 0
+	if paginate {
+		if err := h.db.QueryRow(`SELECT COUNT(*)`+fromClause+filter, args...).Scan(&total); err != nil {
+			h.log.Error("Failed to count general ledger accounts", "error", err)
+			response.InternalError(c, "Failed to generate general ledger")
+			return
+		}
 	}
 
 	// Get accounts to include. We pull `category` and `normal_balance` from
@@ -587,29 +665,16 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 		SELECT a.id, a.code, a.name,
 		       COALESCE(a.name_uz, ''), COALESCE(a.name_en, ''), COALESCE(a.name_ru, ''),
 		       a.opening_balance,
-		       COALESCE(at.category, ''), COALESCE(at.normal_balance, 'debit')
-		FROM accounts a
-		JOIN account_types at ON a.account_type_id = at.id
-		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
-	`
-	args := []interface{}{tenantID}
-	argCount := 1
+		       COALESCE(at.category, ''), COALESCE(at.normal_balance, 'debit')` +
+		fromClause + filter + " ORDER BY a.code"
 
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		accountQuery += fmt.Sprintf(" AND a.organization_id = $%d", argCount)
-		args = append(args, orgID)
+	pageArgs := args
+	if paginate {
+		accountQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+		pageArgs = append(append([]interface{}{}, args...), pageSize, (page-1)*pageSize)
 	}
 
-	if accountID != "" {
-		argCount++
-		accountQuery += fmt.Sprintf(" AND a.id = $%d", argCount)
-		args = append(args, accountID)
-	}
-
-	accountQuery += " ORDER BY a.code"
-
-	accountRows, err := h.db.Query(accountQuery, args...)
+	accountRows, err := h.db.Query(accountQuery, pageArgs...)
 	if err != nil {
 		h.log.Error("Failed to get accounts", "error", err)
 		response.InternalError(c, "Failed to generate general ledger")
@@ -618,6 +683,7 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 	defer accountRows.Close()
 
 	accounts := make([]entity.GeneralLedgerAccount, 0)
+	accountIDs := make([]string, 0)
 
 	for accountRows.Next() {
 		var acc entity.GeneralLedgerAccount
@@ -633,37 +699,42 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 		}
 		acc.AccountType = category
 		acc.NormalBalance = normalBalance
+		acc.Transactions = make([]entity.GeneralLedgerTransaction, 0)
 
-		// Get transactions for this account
-		txQuery := `
-			SELECT je.entry_date, je.entry_number, je.description, je.reference,
-				   jel.debit_amount, jel.credit_amount
+		accounts = append(accounts, acc)
+		accountIDs = append(accountIDs, acc.AccountID.String())
+	}
+
+	// Fetch every transaction for THIS PAGE of accounts in a single query and
+	// group in Go. Previously this ran one query per account — 163 round-trips
+	// for a 162-account tenant.
+	txByAccount := make(map[string][]entity.GeneralLedgerTransaction, len(accountIDs))
+	if len(accountIDs) > 0 {
+		txRows, txErr := h.db.Query(`
+			SELECT jel.account_id, je.entry_date, je.entry_number, je.description, je.reference,
+			       jel.debit_amount, jel.credit_amount
 			FROM journal_entry_lines jel
 			JOIN journal_entries je ON jel.journal_entry_id = je.id
-			WHERE jel.account_id = $1 AND je.tenant_id = $2
-				AND je.status = 'posted' AND je.deleted_at IS NULL
-				AND je.entry_date >= $3 AND je.entry_date <= $4
-			ORDER BY je.entry_date, je.entry_number
-		`
-
-		txRows, err := h.db.Query(txQuery, acc.AccountID, tenantID, periodFrom, periodTo)
-		if err != nil {
-			continue
+			WHERE jel.account_id = ANY($1::uuid[]) AND je.tenant_id = $2
+			  AND je.status = 'posted' AND je.deleted_at IS NULL
+			  AND je.entry_date >= $3 AND je.entry_date <= $4
+			ORDER BY jel.account_id, je.entry_date, je.entry_number
+		`, pq.Array(accountIDs), tenantID, periodFrom, periodTo)
+		if txErr != nil {
+			h.log.Error("Failed to get general ledger transactions", "error", txErr)
+			response.InternalError(c, "Failed to generate general ledger")
+			return
 		}
-
-		acc.Transactions = make([]entity.GeneralLedgerTransaction, 0)
-		runningBalance := acc.OpeningBalance
-
 		for txRows.Next() {
+			var accID uuid.UUID
 			var tx entity.GeneralLedgerTransaction
 			var entryDate time.Time
 			var desc, ref *string
 
-			err := txRows.Scan(&entryDate, &tx.EntryNumber, &desc, &ref, &tx.DebitAmount, &tx.CreditAmount)
-			if err != nil {
+			if err := txRows.Scan(&accID, &entryDate, &tx.EntryNumber, &desc, &ref,
+				&tx.DebitAmount, &tx.CreditAmount); err != nil {
 				continue
 			}
-
 			tx.Date = entryDate.Format("2006-01-02")
 			if desc != nil {
 				tx.Description = *desc
@@ -671,8 +742,20 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 			if ref != nil {
 				tx.Reference = *ref
 			}
+			key := accID.String()
+			txByAccount[key] = append(txByAccount[key], tx)
+		}
+		txRows.Close()
+	}
 
-			// Calculate running balance
+	// Walk each account's transactions in the query's per-account order and
+	// build the running balance exactly as the per-account loop used to.
+	for i := range accounts {
+		acc := &accounts[i]
+		normalBalance := acc.NormalBalance
+		runningBalance := acc.OpeningBalance
+
+		for _, tx := range txByAccount[acc.AccountID.String()] {
 			if normalBalance == "debit" {
 				runningBalance += tx.DebitAmount - tx.CreditAmount
 			} else {
@@ -684,7 +767,6 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 			acc.TotalCredit += tx.CreditAmount
 			acc.Transactions = append(acc.Transactions, tx)
 		}
-		txRows.Close()
 
 		acc.ClosingBalance = runningBalance
 		acc.TotalDebit = math.Round(acc.TotalDebit*100) / 100
@@ -713,31 +795,64 @@ func (h *Handler) GetGeneralLedger(c *gin.Context) {
 			}
 		}
 
-		accounts = append(accounts, acc)
 	}
 
 	// Report-level totals: frontend uses the debit/credit-closing difference as
-	// a balance-integrity check (shows red ≠ indicator when mismatched).
-	var totalOpening, totalDebit, totalCredit, closingDebit, closingCredit float64
+	// a balance-integrity check (shows red ≠ indicator when mismatched). These
+	// are summed over the accounts actually returned, since they're derived from
+	// each account's running balance.
+	var totalOpening, closingDebit, closingCredit float64
 	for _, a := range accounts {
 		totalOpening += a.OpeningBalance
-		totalDebit += a.TotalDebit
-		totalCredit += a.TotalCredit
 		closingDebit += a.ClosingDebit
 		closingCredit += a.ClosingCredit
 	}
+
+	// Period-wide debit/credit totals over EVERY account matching the filters,
+	// ignoring LIMIT/OFFSET. The summary strip must not shrink to the loaded
+	// page — so this is one aggregate over the same WHERE clause rather than a
+	// sum of what we happened to return.
+	var periodDebit, periodCredit float64
+	totalsArgs := append(append([]interface{}{}, args...), tenantID, periodFrom, periodTo)
+	totalsQuery := `
+		SELECT COALESCE(SUM(jel.debit_amount), 0), COALESCE(SUM(jel.credit_amount), 0)
+		FROM journal_entry_lines jel
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+		JOIN accounts a ON a.id = jel.account_id
+		JOIN account_types at ON a.account_type_id = at.id` + filter +
+		fmt.Sprintf(` AND je.tenant_id = $%d AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.entry_date >= $%d AND je.entry_date <= $%d`, argCount+1, argCount+2, argCount+3)
+	if err := h.db.QueryRow(totalsQuery, totalsArgs...).Scan(&periodDebit, &periodCredit); err != nil {
+		h.log.Error("Failed to compute general ledger period totals", "error", err)
+		// Non-fatal: fall back to the page's own sums rather than failing the report.
+		periodDebit, periodCredit = 0, 0
+		for _, a := range accounts {
+			periodDebit += a.TotalDebit
+			periodCredit += a.TotalCredit
+		}
+	}
+	periodDebit = math.Round(periodDebit*100) / 100
+	periodCredit = math.Round(periodCredit*100) / 100
 
 	report := entity.GeneralLedgerReport{
 		PeriodFrom:         periodFrom,
 		PeriodTo:           periodTo,
 		Accounts:           accounts,
 		TotalOpening:       math.Round(totalOpening*100) / 100,
-		TotalDebit:         math.Round(totalDebit*100) / 100,
-		TotalCredit:        math.Round(totalCredit*100) / 100,
+		TotalDebit:         periodDebit,
+		TotalCredit:        periodCredit,
 		ClosingDebitTotal:  math.Round(closingDebit*100) / 100,
 		ClosingCreditTotal: math.Round(closingCredit*100) / 100,
+		Totals: entity.GeneralLedgerTotals{
+			TotalDebit:  periodDebit,
+			TotalCredit: periodCredit,
+		},
 	}
 
+	if paginate {
+		response.Paginated(c, report, page, pageSize, total)
+		return
+	}
 	response.Success(c, report)
 }
 
