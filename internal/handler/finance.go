@@ -1265,6 +1265,23 @@ func (h *Handler) ListJournals(c *gin.Context) {
 		args = append(args, orgID)
 	}
 
+	// `search` and `type` were accepted by Gin and silently dropped — the client
+	// sends both and kept a client-side net that only ever saw loaded pages.
+	// These MUST go on whereExtra (not `query`), because the COUNT below is
+	// built from journalsBaseWhere+whereExtra; adding them to the page query
+	// alone would make total/has_next describe a different result set.
+	if search := strings.TrimSpace(c.Query("search")); search != "" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND (j.code ILIKE $%d OR j.name ILIKE $%d OR COALESCE(j.name_uz,'') ILIKE $%d)",
+			argCount, argCount, argCount)
+		args = append(args, "%"+search+"%")
+	}
+	if jType := strings.TrimSpace(c.Query("type")); jType != "" && strings.ToLower(jType) != "all" {
+		argCount++
+		whereExtra += fmt.Sprintf(" AND j.type = $%d", argCount)
+		args = append(args, jType)
+	}
+
 	query += whereExtra + " ORDER BY j.code ASC"
 	if paginate {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)

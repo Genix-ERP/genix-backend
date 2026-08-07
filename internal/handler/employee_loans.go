@@ -16,22 +16,22 @@ import (
 // --- Loan Data Types ---
 
 type LoanResponse struct {
-	ID              uuid.UUID        `json:"id"`
-	TenantID        uuid.UUID        `json:"tenant_id"`
-	OrganizationID  *uuid.UUID       `json:"organization_id"`
-	EmployeeID      uuid.UUID        `json:"employee_id"`
-	EmployeeName    string           `json:"employee_name"`
-	LoanNumber      string           `json:"loan_number"`
-	Amount          float64          `json:"amount"`
-	MonthlyPayment  float64          `json:"monthly_payment"`
-	DurationMonths  int              `json:"duration_months"`
-	PaidAmount      float64          `json:"paid_amount"`
-	RemainingAmount float64          `json:"remaining_amount"`
-	StartDate       string           `json:"start_date"`
-	EndDate         string           `json:"end_date"`
-	Reason          string           `json:"reason"`
-	Status          string           `json:"status"`
-	CreatedAt       time.Time        `json:"created_at"`
+	ID              uuid.UUID         `json:"id"`
+	TenantID        uuid.UUID         `json:"tenant_id"`
+	OrganizationID  *uuid.UUID        `json:"organization_id"`
+	EmployeeID      uuid.UUID         `json:"employee_id"`
+	EmployeeName    string            `json:"employee_name"`
+	LoanNumber      string            `json:"loan_number"`
+	Amount          float64           `json:"amount"`
+	MonthlyPayment  float64           `json:"monthly_payment"`
+	DurationMonths  int               `json:"duration_months"`
+	PaidAmount      float64           `json:"paid_amount"`
+	RemainingAmount float64           `json:"remaining_amount"`
+	StartDate       string            `json:"start_date"`
+	EndDate         string            `json:"end_date"`
+	Reason          string            `json:"reason"`
+	Status          string            `json:"status"`
+	CreatedAt       time.Time         `json:"created_at"`
 	Payments        []PaymentResponse `json:"payments,omitempty"`
 }
 
@@ -65,8 +65,12 @@ func (h *Handler) ListEmployeeLoans(c *gin.Context) {
 
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
-	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 20 }
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 20
+	}
 	offset := (page - 1) * limit
 
 	employeeFilter := c.Query("employee_id")
@@ -360,19 +364,44 @@ func (h *Handler) GetMyPayrollHistory(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	// Was a hard LIMIT 24 with no offset: an employee with more than two years
+	// of service could not reach their 25th payslip through any client.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	var total int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM payroll_entries pe
+		WHERE pe.employee_id = $1 AND pe.tenant_id = $2`, employeeID, tenantID).Scan(&total); err != nil {
+		h.log.Error("Failed to count payroll history", "error", err)
+		response.InternalError(c, "Failed to get payroll history")
+		return
+	}
+
+	// loan_deduction is a scalar subquery, not a LEFT JOIN: the join fanned out
+	// one row per paid loan repayment, so an entry with two repayments appeared
+	// twice AND reported only one repayment's amount.
+	rows, err := h.db.Query(fmt.Sprintf(`
 		SELECT pe.id, pp.period_name, pe.base_salary, pe.overtime_amount, pe.bonus, pe.allowances,
 			pe.gross_salary, pe.income_tax, pe.social_security, pe.pension, pe.other_deductions,
 			pe.total_deductions, pe.net_salary, pe.status, pe.payment_method,
 			pp.pay_date, pe.created_at,
-			COALESCE(elp.amount, 0) as loan_deduction
+			COALESCE((SELECT SUM(elp.amount) FROM employee_loan_payments elp
+			          WHERE elp.payroll_entry_id = pe.id AND elp.status = 'paid'), 0) as loan_deduction
 		FROM payroll_entries pe
 		JOIN payroll_periods pp ON pe.payroll_period_id = pp.id
-		LEFT JOIN employee_loan_payments elp ON elp.payroll_entry_id = pe.id AND elp.status = 'paid'
 		WHERE pe.employee_id = $1 AND pe.tenant_id = $2
-		ORDER BY pp.pay_date DESC
-		LIMIT 24
-	`, employeeID, tenantID)
+		ORDER BY pp.pay_date DESC, pe.id DESC
+		LIMIT %d OFFSET %d
+	`, pageSize, (page-1)*pageSize), employeeID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to get payroll history", "error", err)
 		response.InternalError(c, "Failed to get payroll history")
@@ -419,7 +448,7 @@ func (h *Handler) GetMyPayrollHistory(c *gin.Context) {
 		items = append(items, item)
 	}
 
-	response.Success(c, items)
+	response.Paginated(c, items, page, pageSize, total)
 }
 
 // --- Employee Self-Service: My Loan ---
