@@ -402,6 +402,39 @@ func (h *Handler) MarkAllNotificationsRead(c *gin.Context) {
 	response.Success(c, gin.H{"message": "All marked as read"})
 }
 
+// ClearAllNotifications deletes every notification belonging to the caller.
+// DELETE /notifications
+//
+// Scoped to tenant_id AND user_id, never tenant_id alone: this is "clear MY
+// notifications", and a tenant-wide delete would wipe every colleague's inbox
+// from one user's button press.
+func (h *Handler) ClearAllNotifications(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	if userID == uuid.Nil {
+		response.Unauthorized(c, "User not found")
+		return
+	}
+
+	result, err := h.db.Exec(`
+		DELETE FROM notifications WHERE tenant_id = $1 AND user_id = $2
+	`, tenantID, userID)
+	if err != nil {
+		h.log.Error("Failed to clear notifications", "error", err)
+		response.InternalServerError(c, "Failed to clear notifications")
+		return
+	}
+
+	// Clearing an already-empty inbox is a success, not a 404 — the caller
+	// asked for "none left" and there are none left.
+	cleared, _ := result.RowsAffected()
+	response.Success(c, gin.H{"message": "All notifications cleared", "cleared": cleared})
+}
+
 // DeleteNotification deletes a single notification
 func (h *Handler) DeleteNotification(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
