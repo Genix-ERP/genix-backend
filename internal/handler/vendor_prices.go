@@ -179,7 +179,9 @@ func (h *Handler) ListVendorPrices(c *gin.Context) {
 		records = append(records, &record)
 	}
 
-	response.Success(c, records)
+	// `total` is computed above and used to be thrown away, so the client got a
+	// bare array with no way to know a page 2 existed.
+	response.Paginated(c, records, page, limit, total)
 }
 
 // GetVendorPrice returns a single vendor price record

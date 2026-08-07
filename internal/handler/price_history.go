@@ -154,6 +154,14 @@ func (h *Handler) listPriceHistoryGrouped(c *gin.Context, tenantID uuid.UUID, pr
 	args := []interface{}{tenantID}
 	argCount := 1
 
+	// The paged (non-grouped) branch filters by organization_id; this one did
+	// not, so a multi-org tenant saw every organization's supplier prices here.
+	if orgID, okOrg := middleware.GetOrganizationID(c); okOrg && orgID != uuid.Nil {
+		argCount++
+		query += fmt.Sprintf(" AND ph.organization_id = $%d", argCount)
+		args = append(args, orgID)
+	}
+
 	if productID != "" {
 		if pid, err := uuid.Parse(productID); err == nil {
 			argCount++

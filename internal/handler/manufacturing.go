@@ -5657,14 +5657,44 @@ func (h *Handler) ListCostCalculations(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	// This was the only list handler in the module without an organization
+	// filter, so a multi-org tenant saw every org's costings. It also had no
+	// LIMIT — both fixed here.
+	where := " WHERE tenant_id = $1 AND deleted_at IS NULL"
+	args := []interface{}{tenantID}
+	if orgID, okOrg := middleware.GetOrganizationID(c); okOrg && orgID != uuid.Nil {
+		args = append(args, orgID)
+		where += fmt.Sprintf(" AND organization_id = $%d", len(args))
+	}
+	if s := strings.TrimSpace(c.Query("search")); s != "" {
+		args = append(args, "%"+s+"%")
+		where += fmt.Sprintf(" AND (name ILIKE $%d OR product_name ILIKE $%d)", len(args), len(args))
+	}
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	var total int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM cost_calculations`+where, args...).Scan(&total); err != nil {
+		response.InternalError(c, "Failed to fetch calculations")
+		return
+	}
+
+	rows, err := h.db.Query(fmt.Sprintf(`
 		SELECT id, name, product_name, quantity, profit_percent,
 		       material_cost, total_cost, total_with_profit,
 		       COALESCE(notes,''), created_at, updated_at
-		FROM cost_calculations
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-		ORDER BY created_at DESC
-	`, tenantID)
+		FROM cost_calculations`+where+`
+		ORDER BY created_at DESC LIMIT %d OFFSET %d`, pageSize, (page-1)*pageSize), args...)
 	if err != nil {
 		response.InternalError(c, "Failed to fetch calculations")
 		return
@@ -5687,7 +5717,7 @@ func (h *Handler) ListCostCalculations(c *gin.Context) {
 	if items == nil {
 		items = []costCalcResponse{}
 	}
-	response.Success(c, items)
+	response.Paginated(c, items, page, pageSize, total)
 }
 
 func (h *Handler) CreateCostCalculation(c *gin.Context) {
