@@ -41,19 +41,45 @@ func (h *Handler) ListPayrollPeriods(c *gin.Context) {
 	baseQuery := `
 		SELECT pp.id, pp.tenant_id, pp.period_code, pp.period_name, pp.start_date, pp.end_date, pp.pay_date,
 			   pp.status,
-			   COALESCE((SELECT SUM(pe.gross_salary) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.total_gross) as total_gross,
-			   COALESCE((SELECT SUM(pe.total_deductions) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.total_deductions) as total_deductions,
-			   COALESCE((SELECT SUM(pe.net_salary) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.total_net) as total_net,
-			   COALESCE((SELECT COUNT(*) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL), pp.employee_count) as employee_count,
+			   COALESCE(agg.gross, pp.total_gross) as total_gross,
+			   COALESCE(agg.deductions, pp.total_deductions) as total_deductions,
+			   COALESCE(agg.net, pp.total_net) as total_net,
+			   COALESCE(agg.headcount, pp.employee_count) as employee_count,
 			   pp.notes, pp.created_at,
-			   (SELECT pe.employee_name FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_name,
-			   (SELECT pe.employee_id FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_employee_id,
-			   (SELECT pe.id FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_entry_id,
-			   (SELECT COALESCE(pe.advance_paid, false) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_advance_paid,
-			   (SELECT pe.advance_paid_day FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_advance_paid_day,
-			   (SELECT COALESCE(pe.remainder_paid, false) FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_remainder_paid,
-			   (SELECT pe.remainder_paid_day FROM payroll_entries pe WHERE pe.payroll_period_id = pp.id AND pe.deleted_at IS NULL LIMIT 1) as first_remainder_paid_day
+			   fst.employee_name as first_employee_name,
+			   fst.employee_id as first_employee_id,
+			   fst.id as first_entry_id,
+			   COALESCE(fst.advance_paid, false) as first_advance_paid,
+			   fst.advance_paid_day as first_advance_paid_day,
+			   COALESCE(fst.remainder_paid, false) as first_remainder_paid,
+			   fst.remainder_paid_day as first_remainder_paid_day
 		FROM payroll_periods pp
+		-- Was eleven correlated subqueries over payroll_entries, each re-run for
+		-- every period row. Two single-pass joins now.
+		LEFT JOIN (
+		    SELECT payroll_period_id,
+		           SUM(gross_salary)     AS gross,
+		           SUM(total_deductions) AS deductions,
+		           SUM(net_salary)       AS net,
+		           COUNT(*)              AS headcount
+		    FROM payroll_entries
+		    WHERE deleted_at IS NULL
+		    GROUP BY payroll_period_id
+		) agg ON agg.payroll_period_id = pp.id
+		-- The seven first_* values were seven INDEPENDENT LIMIT 1 subqueries
+		-- with no ORDER BY, so Postgres was free to answer each from a
+		-- DIFFERENT entry: the card could show one employee's name next to
+		-- another's entry id and a third's advance flag. DISTINCT ON with an
+		-- explicit ORDER BY pins all seven to one entry, the same one on every
+		-- call.
+		LEFT JOIN (
+		    SELECT DISTINCT ON (payroll_period_id)
+		           payroll_period_id, id, employee_id, employee_name,
+		           advance_paid, advance_paid_day, remainder_paid, remainder_paid_day
+		    FROM payroll_entries
+		    WHERE deleted_at IS NULL
+		    ORDER BY payroll_period_id, id
+		) fst ON fst.payroll_period_id = pp.id
 		WHERE pp.tenant_id = $1 AND pp.deleted_at IS NULL
 	`
 	countQuery := `SELECT COUNT(*) FROM payroll_periods WHERE tenant_id = $1 AND deleted_at IS NULL`
