@@ -60,25 +60,61 @@ func (h *Handler) ListMaterialReservations(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argIdx := 2
 
+	// Filters accumulate into a shared fragment so the COUNT below is built
+	// from exactly the same predicates — otherwise `total` would report the
+	// tenant's whole reservation table while `data` shows one project's rows.
+	filter := ""
 	if projectIDStr != "" {
-		query += fmt.Sprintf(" AND mr.project_id = $%d", argIdx)
+		filter += fmt.Sprintf(" AND mr.project_id = $%d", argIdx)
 		pid, _ := strconv.ParseInt(projectIDStr, 10, 64)
 		args = append(args, pid)
 		argIdx++
 	}
 	if substageIDStr != "" {
-		query += fmt.Sprintf(" AND mr.substage_id = $%d", argIdx)
+		filter += fmt.Sprintf(" AND mr.substage_id = $%d", argIdx)
 		sid, _ := strconv.ParseInt(substageIDStr, 10, 64)
 		args = append(args, sid)
 		argIdx++
 	}
 	if status != "" {
-		query += fmt.Sprintf(" AND mr.status = $%d", argIdx)
+		filter += fmt.Sprintf(" AND mr.status = $%d", argIdx)
 		args = append(args, status)
 		argIdx++
 	}
+	query += filter
 
-	query += " ORDER BY mr.created_at DESC LIMIT 200"
+	// Was a literal `LIMIT 200` with no paging params: an approver on a busy
+	// project literally could not reach reservation 201, and with no meta there
+	// was nothing to drive a "load more". `limit` is accepted as an alias for
+	// page_size so the shipped mobile build keeps working mid-rollout.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	sizeRaw := c.Query("page_size")
+	if sizeRaw == "" {
+		sizeRaw = c.DefaultQuery("limit", "20")
+	}
+	pageSize, _ := strconv.Atoi(sizeRaw)
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	// The six LEFT JOINs are display-name lookups only — omit them from the count.
+	var total int
+	if err := h.db.QueryRow(
+		"SELECT COUNT(*) FROM material_reservations mr WHERE mr.tenant_id = $1 AND mr.deleted_at IS NULL"+filter,
+		args...).Scan(&total); err != nil {
+		h.log.Error("Failed to count reservations", "error", err)
+		response.InternalError(c, "Failed to list reservations")
+		return
+	}
+
+	query += fmt.Sprintf(" ORDER BY mr.created_at DESC, mr.id DESC LIMIT %d OFFSET %d",
+		pageSize, (page-1)*pageSize)
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -91,16 +127,16 @@ func (h *Handler) ListMaterialReservations(c *gin.Context) {
 	var reservations []map[string]interface{}
 	for rows.Next() {
 		var (
-			id, productID                            string
-			projectID, stageID, substageID           int64
-			warehouseID                              *string
-			quantity, unitCost, totalCost             float64
-			unit, status, notes                      string
-			requestedBy, approvedBy                  *string
-			requestedByName, approvedByName          string
+			id, productID                                string
+			projectID, stageID, substageID               int64
+			warehouseID                                  *string
+			quantity, unitCost, totalCost                float64
+			unit, status, notes                          string
+			requestedBy, approvedBy                      *string
+			requestedByName, approvedByName              string
 			productName, projectName, stageName, subName string
-			createdAt, updatedAt                     time.Time
-			approvedAt                               *time.Time
+			createdAt, updatedAt                         time.Time
+			approvedAt                                   *time.Time
 		)
 		if err := rows.Scan(
 			&id, &projectID, &stageID, &substageID,
@@ -123,21 +159,21 @@ func (h *Handler) ListMaterialReservations(c *gin.Context) {
 			"product_id":        productID,
 			"product_name":      productName,
 			"warehouse_id":      warehouseID,
-			"quantity":           quantity,
-			"unit":               unit,
-			"unit_cost":          unitCost,
-			"total_cost":         totalCost,
-			"status":             status,
-			"requested_by":       requestedBy,
-			"requested_by_name":  requestedByName,
-			"approved_by":        approvedBy,
-			"approved_by_name":   approvedByName,
-			"notes":              notes,
-			"created_at":         createdAt,
-			"updated_at":         updatedAt,
-			"project_name":       projectName,
-			"stage_name":         stageName,
-			"substage_name":      subName,
+			"quantity":          quantity,
+			"unit":              unit,
+			"unit_cost":         unitCost,
+			"total_cost":        totalCost,
+			"status":            status,
+			"requested_by":      requestedBy,
+			"requested_by_name": requestedByName,
+			"approved_by":       approvedBy,
+			"approved_by_name":  approvedByName,
+			"notes":             notes,
+			"created_at":        createdAt,
+			"updated_at":        updatedAt,
+			"project_name":      projectName,
+			"stage_name":        stageName,
+			"substage_name":     subName,
 		}
 		if approvedAt != nil {
 			r["approved_at"] = approvedAt
@@ -147,7 +183,7 @@ func (h *Handler) ListMaterialReservations(c *gin.Context) {
 	if reservations == nil {
 		reservations = []map[string]interface{}{}
 	}
-	response.Success(c, reservations)
+	response.Paginated(c, reservations, page, pageSize, total)
 }
 
 // ─── Create Reservation ──────────────────────────────────────────────────────
@@ -304,12 +340,12 @@ func (h *Handler) ApproveMaterialReservation(c *gin.Context) {
 
 	// Fetch reservation details
 	var (
-		productID, rTenantID uuid.UUID
-		warehouseID          *uuid.UUID
-		projectID, stageID   int64
+		productID, rTenantID          uuid.UUID
+		warehouseID                   *uuid.UUID
+		projectID, stageID            int64
 		quantity, unitCost, totalCost float64
-		unit, status         string
-		requestedBy          *uuid.UUID
+		unit, status                  string
+		requestedBy                   *uuid.UUID
 	)
 	err = h.db.QueryRow(`
 		SELECT product_id, tenant_id, warehouse_id, project_id, stage_id,
