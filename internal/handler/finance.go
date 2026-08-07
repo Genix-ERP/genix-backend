@@ -5138,14 +5138,46 @@ func (h *Handler) DeleteTaxRate(c *gin.Context) {
 // @Security BearerAuth
 // @Router /finance/currencies [get]
 func (h *Handler) ListCurrencies(c *gin.Context) {
+	// `is_active` used to be hardcoded to true, so an inactive currency could
+	// never be listed: the status filter's "Nofaol" tab was always empty and a
+	// soft-deleted currency vanished with no way to reactivate it from any
+	// client. Now: is_active=true → active only, =false → inactive only,
+	// omitted → all.
+	activeFilter := ""
+	switch strings.ToLower(strings.TrimSpace(c.Query("is_active"))) {
+	case "true", "1":
+		activeFilter = " WHERE cur.is_active = true"
+	case "false", "0":
+		activeFilter = " WHERE cur.is_active = false"
+	}
+
+	// Each row carries its latest rate for THIS tenant, so the client no longer
+	// needs a follow-up GET /currencies/{code}/rate per currency (a 1+N on every
+	// load and every refresh). exchange_rates is tenant-scoped; currencies is a
+	// global catalogue — hence the tenant filter lives inside the lateral.
+	tenantID, _ := middleware.GetTenantID(c)
+
 	query := `
-		SELECT id, code, name, symbol, decimal_places, is_base_currency, is_active
-		FROM currencies
-		WHERE is_active = true
-		ORDER BY is_base_currency DESC, code ASC
+		SELECT cur.id, cur.code, cur.name, cur.symbol, cur.decimal_places,
+		       cur.is_base_currency, cur.is_active,
+		       r.rate, r.effective_date, r.rate_change, r.rate_change_percent
+		FROM currencies cur
+		LEFT JOIN LATERAL (
+			SELECT er.rate, er.effective_date,
+			       COALESCE(er.rate_change, 0) AS rate_change,
+			       COALESCE(er.rate_change_percent, 0) AS rate_change_percent
+			FROM exchange_rates er
+			WHERE er.tenant_id = $1
+			  AND er.from_currency_id = cur.id
+			  AND er.to_currency_id = (SELECT id FROM currencies WHERE is_base_currency = true LIMIT 1)
+			  AND er.effective_date <= CURRENT_DATE
+			ORDER BY er.effective_date DESC
+			LIMIT 1
+		) r ON TRUE` + activeFilter + `
+		ORDER BY cur.is_base_currency DESC, cur.code ASC
 	`
 
-	rows, err := h.db.Query(query)
+	rows, err := h.db.Query(query, tenantID)
 	if err != nil {
 		h.log.Error("Failed to list currencies", "error", err)
 		response.InternalError(c, "Failed to list currencies")
@@ -5153,14 +5185,36 @@ func (h *Handler) ListCurrencies(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	currencies := make([]*entity.Currency, 0)
+	currencies := make([]gin.H, 0)
 	for rows.Next() {
 		var cur entity.Currency
-		err := rows.Scan(&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces, &cur.IsBaseCurrency, &cur.IsActive)
-		if err != nil {
+		var rate, rateChange, rateChangePct sql.NullFloat64
+		var effectiveDate sql.NullTime
+		if err := rows.Scan(&cur.ID, &cur.Code, &cur.Name, &cur.Symbol, &cur.DecimalPlaces,
+			&cur.IsBaseCurrency, &cur.IsActive,
+			&rate, &effectiveDate, &rateChange, &rateChangePct); err != nil {
 			continue
 		}
-		currencies = append(currencies, &cur)
+
+		row := gin.H{
+			"id": cur.ID, "code": cur.Code, "name": cur.Name, "symbol": cur.Symbol,
+			"decimal_places": cur.DecimalPlaces, "is_base_currency": cur.IsBaseCurrency,
+			"is_active": cur.IsActive,
+			// null (not 1.0) when this tenant has never recorded a rate — the
+			// client renders "—" rather than a fabricated parity.
+			"current_rate": nil, "rate_effective_date": nil,
+			"rate_change": 0.0, "rate_change_percent": 0.0,
+			"has_rate": rate.Valid,
+		}
+		if rate.Valid {
+			row["current_rate"] = rate.Float64
+			row["rate_change"] = rateChange.Float64
+			row["rate_change_percent"] = rateChangePct.Float64
+		}
+		if effectiveDate.Valid {
+			row["rate_effective_date"] = effectiveDate.Time.Format("2006-01-02")
+		}
+		currencies = append(currencies, row)
 	}
 
 	response.Success(c, currencies)
@@ -5467,21 +5521,32 @@ func (h *Handler) GetExchangeRate(c *gin.Context) {
 		ORDER BY effective_date DESC LIMIT 1
 	`, tenantID, currencyID, baseCurrencyID, date).Scan(&rate, &effectiveDate)
 
+	// `has_rate` distinguishes "no rate has ever been recorded" from "the rate
+	// genuinely is 1". The old code returned a bare 1.0 for both, which made
+	// every unrated currency render as 1.00 and — worse — let callers multiply
+	// by it, silently treating 1 USD as 1 UZS. `rate` keeps its 1.0 fallback so
+	// existing consumers don't break; branch on `has_rate` instead.
+	hasRate := true
 	if err == sql.ErrNoRows {
-		// Return default rate of 1.0 if no rate found
+		hasRate = false
 		rate = 1.0
-		effectiveDate = time.Now()
+		effectiveDate = time.Time{}
 	} else if err != nil {
 		h.log.Error("Failed to get exchange rate", "error", err)
 		response.InternalError(c, "Failed to get exchange rate")
 		return
 	}
 
-	response.Success(c, gin.H{
+	out := gin.H{
 		"currency_code":  code,
 		"rate":           rate,
-		"effective_date": effectiveDate.Format("2006-01-02"),
-	})
+		"has_rate":       hasRate,
+		"effective_date": nil,
+	}
+	if hasRate {
+		out["effective_date"] = effectiveDate.Format("2006-01-02")
+	}
+	response.Success(c, out)
 }
 
 // SetExchangeRate godoc
