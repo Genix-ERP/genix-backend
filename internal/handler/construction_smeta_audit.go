@@ -45,8 +45,9 @@ type SmetaAuditEntry struct {
 // query param is omitted, for an entire project). Newest first.
 //
 // Routes:
-//   GET /construction/estimates/:id/audit
-//   GET /construction/projects/:id/smeta-audit
+//
+//	GET /construction/estimates/:id/audit
+//	GET /construction/projects/:id/smeta-audit
 func (h *Handler) ListSmetaAudit(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -66,6 +67,28 @@ func (h *Handler) ListSmetaAudit(c *gin.Context) {
 	}
 	action := c.Query("action") // optional filter
 
+	// Shared WHERE so the page query and the COUNT can never diverge.
+	where := " WHERE tenant_id = $1 AND estimate_id = $2"
+	args := []interface{}{tenantID, estimateID}
+	if action != "" {
+		where += " AND action = $3"
+		args = append(args, action)
+	}
+
+	// Was LIMIT with no OFFSET and no meta: rows past `limit` were unreachable
+	// and the UI could not tell the list had been cut. ListProjectSmetaAudit in
+	// this same file already does page+offset+count — same shape here.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	var total int
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM construction_smeta_audit"+where, args...).Scan(&total); err != nil {
+		h.log.Error("Failed to count audit log", "error", err)
+		response.InternalError(c, "Failed to list audit log")
+		return
+	}
+
 	q := `
 		SELECT id, tenant_id, project_id, estimate_id,
 		       action, COALESCE(target, ''), line_id,
@@ -73,15 +96,9 @@ func (h *Handler) ListSmetaAudit(c *gin.Context) {
 		       COALESCE(description, ''),
 		       user_id, COALESCE(user_name, ''),
 		       created_at
-		FROM construction_smeta_audit
-		WHERE tenant_id = $1 AND estimate_id = $2
-	`
-	args := []interface{}{tenantID, estimateID}
-	if action != "" {
-		q += " AND action = $3"
-		args = append(args, action)
-	}
-	q += " ORDER BY created_at DESC LIMIT " + strconv.Itoa(limit)
+		FROM construction_smeta_audit` + where +
+		" ORDER BY created_at DESC, id DESC LIMIT " + strconv.Itoa(limit) +
+		" OFFSET " + strconv.Itoa((page-1)*limit)
 
 	rows, err := h.db.Query(q, args...)
 	if err != nil {
@@ -107,7 +124,7 @@ func (h *Handler) ListSmetaAudit(c *gin.Context) {
 		}
 		out = append(out, e)
 	}
-	response.Success(c, out)
+	response.Paginated(c, out, page, limit, total)
 }
 
 // ListProjectSmetaAudit returns the audit log for an entire project across

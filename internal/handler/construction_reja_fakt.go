@@ -634,10 +634,10 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 				defer lineRows.Close()
 				for lineRows.Next() {
 					var (
-						lineID                                                    int64
-						lineSortOrder                                             int
+						lineID                                                        int64
+						lineSortOrder                                                 int
 						lineItemNumber, lineName, lineUOM, parentItem, approvalStatus string
-						totalAmt, qty, doneQty, unitRate, subDerived              float64
+						totalAmt, qty, doneQty, unitRate, subDerived                  float64
 					)
 					if err := lineRows.Scan(&lineID, &lineSortOrder, &lineItemNumber, &lineName, &lineUOM, &parentItem,
 						&totalAmt, &qty, &doneQty, &unitRate, &approvalStatus, &subDerived); err != nil {
@@ -1769,29 +1769,53 @@ func (h *Handler) ListRejaFaktAudit(c *gin.Context) {
 		CreatedAt time.Time       `json:"created_at"`
 	}
 
-	var rows *sql.Rows
-	var qErr error
+	// The client sends `limit` (and now `page`); both were previously ignored
+	// and each branch truncated at a hardcoded 50/100 with no offset, so older
+	// rows were unreachable. `page_size` is accepted as an alias.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	limitRaw := c.Query("page_size")
+	if limitRaw == "" {
+		limitRaw = c.DefaultQuery("limit", "20")
+	}
+	limit, _ := strconv.Atoi(limitRaw)
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	offset := (page - 1) * limit
 
+	// Each branch keeps its own distinct WHERE; only the tail changes.
+	var where string
+	var args []interface{}
 	if itemType != "" && itemIDStr != "" {
 		itemID, _ := strconv.ParseInt(itemIDStr, 10, 64)
-		rows, qErr = h.db.Query(`
-			SELECT id, item_type, item_id, item_name, action, COALESCE(changes, '{}'), user_name, created_at
-			FROM construction_reja_fakt_audit
-			WHERE tenant_id = $1 AND item_type = $2 AND item_id = $3
-			ORDER BY created_at DESC LIMIT 50
-		`, tenantID, itemType, itemID)
+		where = " WHERE tenant_id = $1 AND item_type = $2 AND item_id = $3"
+		args = []interface{}{tenantID, itemType, itemID}
 	} else if subStageIDStr != "" {
 		subStageID, _ := strconv.ParseInt(subStageIDStr, 10, 64)
-		rows, qErr = h.db.Query(`
-			SELECT id, item_type, item_id, item_name, action, COALESCE(changes, '{}'), user_name, created_at
-			FROM construction_reja_fakt_audit
-			WHERE tenant_id = $1 AND sub_stage_id = $2
-			ORDER BY created_at DESC LIMIT 100
-		`, tenantID, subStageID)
+		where = " WHERE tenant_id = $1 AND sub_stage_id = $2"
+		args = []interface{}{tenantID, subStageID}
 	} else {
 		response.BadRequest(c, "Provide item_type+item_id or sub_stage_id")
 		return
 	}
+
+	var total int
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM construction_reja_fakt_audit"+where, args...).Scan(&total); err != nil {
+		h.log.Error("Failed to count audit log", "error", err)
+		response.InternalError(c, "Failed to list audit log")
+		return
+	}
+
+	rows, qErr := h.db.Query(fmt.Sprintf(`
+		SELECT id, item_type, item_id, item_name, action, COALESCE(changes, '{}'), user_name, created_at
+		FROM construction_reja_fakt_audit`+where+`
+		ORDER BY created_at DESC, id DESC LIMIT %d OFFSET %d`, limit, offset), args...)
 
 	if qErr != nil {
 		h.log.Error("Failed to list audit log", "error", qErr)
@@ -1809,5 +1833,5 @@ func (h *Handler) ListRejaFaktAudit(c *gin.Context) {
 		entries = append(entries, e)
 	}
 
-	response.Success(c, entries)
+	response.Paginated(c, entries, page, limit, total)
 }
