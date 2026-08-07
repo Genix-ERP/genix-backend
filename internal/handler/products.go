@@ -1354,9 +1354,17 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 			COALESCE(cos.stock_valuation_account_id, pc.stock_valuation_account_id) as stock_valuation_account_id,
 			COALESCE(cos.stock_input_account_id, pc.stock_input_account_id) as stock_input_account_id,
 			COALESCE(cos.stock_output_account_id, pc.stock_output_account_id) as stock_output_account_id,
-			(SELECT COUNT(*) FROM products
-			   WHERE category_id = pc.id AND tenant_id = pc.tenant_id AND deleted_at IS NULL) as product_count
+			COALESCE(pcnt.product_count, 0) as product_count
 		FROM product_categories pc
+		-- product_count was a correlated COUNT over products evaluated once per
+		-- category row: O(categories x products) on a screen that loads on every
+		-- catalogue visit. One grouped pass instead.
+		LEFT JOIN (
+		    SELECT category_id, COUNT(*) AS product_count
+		    FROM products
+		    WHERE tenant_id = $1 AND deleted_at IS NULL
+		    GROUP BY category_id
+		) pcnt ON pcnt.category_id = pc.id
 	`
 	args := []interface{}{tenantID}
 

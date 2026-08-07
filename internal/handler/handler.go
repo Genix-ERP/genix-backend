@@ -1207,6 +1207,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payments.POST("", h.perm.Require("finance", "payment", "create"), h.CreatePayment)
 		// Solishtirish (partner reconciliation) — static paths, resolved by gin
 		// ahead of the /:id param route below.
+		payments.GET("/summary", h.GetPaymentsSummary)
 		payments.GET("/partner-balances", h.GetPartnerBalances)
 		payments.GET("/partner-ledger", h.GetPartnerLedger)
 		payments.POST("/reconcile", h.perm.Require("finance", "payment", "update"), h.ReconcilePartnerCredit)
@@ -1553,6 +1554,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	workflows.Use(h.perm.Require("workflow", "workflow", "read"))
 	{
 		workflows.GET("", h.ListWorkflows)
+		workflows.GET("/summary", h.GetWorkflowsSummary)
 		workflows.POST("", h.perm.Require("workflow", "workflow", "create"), h.CreateWorkflow)
 		workflows.GET("/:id", h.GetWorkflow)
 		workflows.PUT("/:id", h.perm.Require("workflow", "workflow", "update"), h.UpdateWorkflow)
@@ -1879,6 +1881,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	payrollPeriods.Use(h.perm.Require("hr", "payroll", "read"))
 	{
 		payrollPeriods.GET("", h.ListPayrollPeriods)
+		payrollPeriods.GET("/summary", h.GetPayrollPeriodsSummary)
 		payrollPeriods.POST("", h.perm.Require("hr", "payroll", "create"), h.CreatePayrollPeriod)
 		payrollPeriods.GET("/:id", h.GetPayrollPeriod)
 		payrollPeriods.PUT("/:id", h.perm.Require("hr", "payroll", "update"), h.UpdatePayrollPeriod)

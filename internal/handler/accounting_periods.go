@@ -18,13 +18,24 @@ func (h *Handler) ListAccountingPeriods(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	// Opt-in paging: one row per month per tenant, so a company five years in
+	// has 60 and it only ever grows. The web period-lock screen sends no page
+	// params and still gets the full history.
+	query := `
 		SELECT id, tenant_id, name, start_date, end_date, is_locked,
 		       locked_by, locked_at, created_at, updated_at
 		FROM accounting_periods
 		WHERE tenant_id = $1
 		ORDER BY start_date ASC
-	`, tenantID)
+	`
+	args := []interface{}{tenantID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $2 OFFSET $3"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list accounting periods", "error", err)
 		response.InternalError(c, "Failed to list accounting periods")
@@ -60,7 +71,17 @@ func (h *Handler) ListAccountingPeriods(c *gin.Context) {
 		periods = append(periods, p)
 	}
 
-	response.Success(c, periods)
+	if !paginate {
+		response.Success(c, periods)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM accounting_periods WHERE tenant_id = $1`, tenantID).Scan(&total); err != nil {
+		h.log.Error("Failed to count accounting periods", "error", err)
+		total = len(periods)
+	}
+	response.Paginated(c, periods, page, pageSize, total)
 }
 
 // CreateAccountingPeriod creates a new accounting period
