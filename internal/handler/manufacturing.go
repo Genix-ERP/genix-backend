@@ -4545,7 +4545,18 @@ func (h *Handler) ListEquipment(c *gin.Context) {
 		query += fmt.Sprintf(" AND e.work_center_id = $%d", argCount)
 		args = append(args, workCenterID)
 	}
+	// Opt-in paging: this list grows with business activity, not with
+	// configuration, so it has no natural ceiling. Callers that send no page
+	// params still get the full list.
+	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM manufacturing_equipment"):]
 	query += " ORDER BY e.name ASC"
+
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -4661,7 +4672,17 @@ func (h *Handler) ListEquipment(c *gin.Context) {
 		equipment = append(equipment, e)
 	}
 
-	response.Success(c, equipment)
+	if !paginate {
+		response.Success(c, equipment)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(countQuery, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count equipment", "error", err)
+		total = len(equipment)
+	}
+	response.Paginated(c, equipment, page, pageSize, total)
 }
 
 func (h *Handler) CreateEquipment(c *gin.Context) {

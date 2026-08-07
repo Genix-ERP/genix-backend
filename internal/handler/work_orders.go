@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -942,7 +943,18 @@ func (h *Handler) ListManufacturingTransfers(c *gin.Context) {
 		argIdx++
 	}
 
+	// Opt-in paging: this list grows with business activity, not with
+	// configuration, so it has no natural ceiling. Callers that send no page
+	// params still get the full list.
+	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM manufacturing_transfers"):]
 	query += " ORDER BY mt.created_at DESC"
+
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -994,7 +1006,17 @@ func (h *Handler) ListManufacturingTransfers(c *gin.Context) {
 		transfers = append(transfers, t)
 	}
 
-	response.Success(c, gin.H{"data": transfers})
+	if !paginate {
+		response.Success(c, gin.H{"data": transfers})
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(countQuery, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count transfers", "error", err)
+		total = len(transfers)
+	}
+	response.Paginated(c, gin.H{"data": transfers}, page, pageSize, total)
 }
 
 // GetManufacturingTransfer returns a single manufacturing transfer with its lines

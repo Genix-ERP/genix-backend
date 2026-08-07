@@ -319,7 +319,17 @@ func (h *Handler) GetPartnerBalances(c *gin.Context) {
 		WHERE c.tenant_id=$1 AND (inv.cid IS NOT NULL OR pay.cid IS NOT NULL)
 		ORDER BY COALESCE(inv.due,0) DESC, name ASC`, contactCol, invTable, contactCol)
 
-	rows, err := h.db.Query(q, tenantID, orgArg, payType)
+	// Opt-in paging. One row per contact that has ever been invoiced or paid,
+	// so this grows with the customer/vendor book and never shrinks.
+	args := []interface{}{tenantID, orgArg, payType}
+	paginate, page, pageSize, offset := optPagination(c)
+	pagedQ := q
+	if paginate {
+		pagedQ += " LIMIT $4 OFFSET $5"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(pagedQ, args...)
 	if err != nil {
 		h.log.Error("partner balances", "error", err)
 		response.InternalError(c, "Failed to load partner balances")
@@ -338,7 +348,19 @@ func (h *Handler) GetPartnerBalances(c *gin.Context) {
 			})
 		}
 	}
-	response.Success(c, out)
+	if !paginate {
+		response.Success(c, out)
+		return
+	}
+
+	total := 0
+	// Counting over the CTE query itself keeps the count and the page in exact
+	// agreement; re-deriving the same filters by hand is how they drift apart.
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM (`+q+`) sub`, tenantID, orgArg, payType).Scan(&total); err != nil {
+		h.log.Error("Failed to count partner balances", "error", err)
+		total = len(out)
+	}
+	response.Paginated(c, out, page, pageSize, total)
 }
 
 // GetPartnerLedger returns one partner's open invoices/bills, their available
