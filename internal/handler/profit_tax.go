@@ -406,6 +406,16 @@ func (h *Handler) ListProfitTaxSnapshots(c *gin.Context) {
 		yearClause = " AND period_key LIKE $2"
 	}
 
+	// Opt-in paging: one snapshot per closed period, so this grows every month
+	// for the life of the tenant.
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	limitClause := ""
+	if paginate {
+		limitClause = fmt.Sprintf("LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
+
 	rows, err := h.db.Query(fmt.Sprintf(`
 		SELECT id, period_type, period_key, period_start, period_end,
 		       income, recognized_exp, unrecognized_exp,
@@ -415,7 +425,8 @@ func (h *Handler) ListProfitTaxSnapshots(c *gin.Context) {
 		WHERE tenant_id = $1
 		%s
 		ORDER BY period_start DESC
-	`, yearClause), args...)
+		%s
+	`, yearClause, limitClause), args...)
 	if err != nil {
 		h.log.Error("Failed to list profit-tax snapshots", "error", err)
 		response.InternalError(c, "Failed to list snapshots")
@@ -459,5 +470,18 @@ func (h *Handler) ListProfitTaxSnapshots(c *gin.Context) {
 		r.PeriodEnd = pe.Format("2006-01-02")
 		out = append(out, r)
 	}
-	response.Success(c, out)
+
+	if !paginate {
+		response.Success(c, out)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(fmt.Sprintf(
+		`SELECT COUNT(*) FROM profit_tax_calc WHERE tenant_id = $1 %s`, yearClause),
+		filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count profit-tax snapshots", "error", err)
+		total = len(out)
+	}
+	response.Paginated(c, out, page, pageSize, total)
 }

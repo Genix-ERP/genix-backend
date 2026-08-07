@@ -1474,18 +1474,52 @@ func (h *Handler) GetDropshippableProducts(c *gin.Context) {
 		return
 	}
 
-	rows, err := h.db.Query(`
+	// Products are shared across organizations and per-org availability lives in
+	// product_organization_settings, so an org-scoped caller must be joined the
+	// same way ListProducts joins it. Without this the dropship picker was the
+	// one product screen that showed every organization's catalogue.
+	args := []interface{}{tenantID}
+	orgJoin := " LEFT JOIN product_organization_settings pos ON false"
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		args = append(args, orgID)
+		orgJoin = fmt.Sprintf(
+			" INNER JOIN product_organization_settings pos ON pos.product_id = p.id AND pos.organization_id = $%d",
+			len(args))
+	}
+
+	baseFrom := `
+		FROM products p
+		LEFT JOIN contacts dv ON p.default_dropship_vendor_id = dv.id` + orgJoin + `
+		-- Three correlated subqueries over dropship_product_vendors — same table,
+		-- same predicate, three scans per product row. One grouped pass instead.
+		LEFT JOIN (
+		    SELECT product_id,
+		           COUNT(*)             AS available_vendors,
+		           MIN(vendor_price)    AS lowest_price,
+		           MIN(lead_time_days)  AS fastest_lead_time
+		    FROM dropship_product_vendors
+		    WHERE is_active = true
+		    GROUP BY product_id
+		) dv_agg ON dv_agg.product_id = p.id
+		WHERE p.tenant_id = $1 AND p.is_dropshippable = true AND p.deleted_at IS NULL`
+
+	query := `
 		SELECT
 			p.id, p.name, p.sku, p.is_dropshippable, p.dropship_only,
 			p.default_dropship_vendor_id, dv.name as default_vendor_name,
-			(SELECT COUNT(*) FROM dropship_product_vendors dpv WHERE dpv.product_id = p.id AND dpv.is_active = true) as available_vendors,
-			(SELECT MIN(vendor_price) FROM dropship_product_vendors dpv WHERE dpv.product_id = p.id AND dpv.is_active = true) as lowest_price,
-			(SELECT MIN(lead_time_days) FROM dropship_product_vendors dpv WHERE dpv.product_id = p.id AND dpv.is_active = true) as fastest_lead_time
-		FROM products p
-		LEFT JOIN contacts dv ON p.default_dropship_vendor_id = dv.id
-		WHERE p.tenant_id = $1 AND p.is_dropshippable = true AND p.deleted_at IS NULL
-		ORDER BY p.name
-	`, tenantID)
+			COALESCE(dv_agg.available_vendors, 0) as available_vendors,
+			dv_agg.lowest_price,
+			dv_agg.fastest_lead_time` + baseFrom + `
+		ORDER BY p.name`
+
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to query dropshippable products", "error", err)
 		response.InternalError(c, "Failed to fetch products")
@@ -1493,7 +1527,9 @@ func (h *Handler) GetDropshippableProducts(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	var products []entity.DropshipableProduct
+	// make(..., 0), not a nil slice: a nil slice marshals as `null`, which
+	// breaks any client that treats the payload as a list.
+	products := make([]entity.DropshipableProduct, 0)
 	for rows.Next() {
 		var p entity.DropshipableProduct
 		var defaultVendorName sql.NullString
@@ -1512,5 +1548,15 @@ func (h *Handler) GetDropshippableProducts(c *gin.Context) {
 		products = append(products, p)
 	}
 
-	response.Success(c, products)
+	if !paginate {
+		response.Success(c, products)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow("SELECT COUNT(*)"+baseFrom, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count dropshippable products", "error", err)
+		total = len(products)
+	}
+	response.Paginated(c, products, page, pageSize, total)
 }

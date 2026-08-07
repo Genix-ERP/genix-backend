@@ -162,7 +162,18 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 		args = append(args, year)
 	}
 
+	// Opt-in paging: this list grows with business activity, not with
+	// configuration, so it has no natural ceiling. Callers that send no page
+	// params still get the full list.
+	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM tax_report_periods"):]
 	query += " ORDER BY trp.start_date DESC"
+
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -229,7 +240,17 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 		periods = append(periods, p)
 	}
 
-	response.Success(c, periods)
+	if !paginate {
+		response.Success(c, periods)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(countQuery, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count tax report periods", "error", err)
+		total = len(periods)
+	}
+	response.Paginated(c, periods, page, pageSize, total)
 }
 
 // GetTaxReportPeriod returns a single tax report period with details
