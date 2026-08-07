@@ -5777,7 +5777,19 @@ func (h *Handler) ListExchangeRates(c *gin.Context) {
 		argIndex++
 	}
 
+	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM exchange_rates"):]
+
 	query += " ORDER BY er.effective_date DESC, fc.code ASC"
+
+	// Opt-in paging. exchange_rates gets a row per currency per day, so a
+	// tenant two years in with five currencies is already ~3.5k rows and the
+	// unfiltered list only ever grows.
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -5818,7 +5830,17 @@ func (h *Handler) ListExchangeRates(c *gin.Context) {
 		rates = append(rates, r)
 	}
 
-	response.Success(c, rates)
+	if !paginate {
+		response.Success(c, rates)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(countQuery, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count exchange rates", "error", err)
+		total = len(rates)
+	}
+	response.Paginated(c, rates, page, pageSize, total)
 }
 
 // =====================================================
@@ -5895,7 +5917,17 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 		argIndex++
 	}
 
+	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM bank_accounts"):]
+
 	query += " ORDER BY COALESCE(name, bank_name) ASC"
+
+	// Opt-in paging — see ListExchangeRates.
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argIndex, argIndex+1)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -5945,7 +5977,17 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 		accounts = append(accounts, acc)
 	}
 
-	response.Success(c, accounts)
+	if !paginate {
+		response.Success(c, accounts)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(countQuery, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count bank accounts", "error", err)
+		total = len(accounts)
+	}
+	response.Paginated(c, accounts, page, pageSize, total)
 }
 
 // GetBankAccount godoc
@@ -6659,7 +6701,17 @@ func (h *Handler) ListBankReconciliations(c *gin.Context) {
 		ORDER BY br.statement_date DESC, br.created_at DESC
 	`
 
-	rows, err := h.db.Query(query, tenantID, bankAccountID)
+	// Opt-in paging. One reconciliation session per statement per account, so
+	// an account reconciled monthly for five years is only 60 rows — but a
+	// daily-reconciled operating account is 1800 and unbounded.
+	args := []interface{}{tenantID, bankAccountID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $3 OFFSET $4"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list bank reconciliations", "error", err)
 		response.InternalError(c, "Failed to list bank reconciliations")
@@ -6697,7 +6749,20 @@ func (h *Handler) ListBankReconciliations(c *gin.Context) {
 		reconciliations = append(reconciliations, r)
 	}
 
-	response.Success(c, reconciliations)
+	if !paginate {
+		response.Success(c, reconciliations)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM bank_reconciliations WHERE tenant_id = $1 AND bank_account_id = $2`,
+		tenantID, bankAccountID,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count bank reconciliations", "error", err)
+		total = len(reconciliations)
+	}
+	response.Paginated(c, reconciliations, page, pageSize, total)
 }
 
 // CreateBankReconciliation godoc

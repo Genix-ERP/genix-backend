@@ -54,29 +54,34 @@ func (h *Handler) ListDepartments(c *gin.Context) {
 		return
 	}
 
-	query := `
-		SELECT id, tenant_id, organization_id, parent_id, code, name,
-		       manager_id, cost_center, is_active, created_at, updated_at
-		FROM departments
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-		ORDER BY name ASC
-	`
-
+	where := " WHERE tenant_id = $1 AND deleted_at IS NULL"
 	args := []interface{}{tenantID}
 
 	// Filter by organization if provided
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		query = `
-			SELECT id, tenant_id, organization_id, parent_id, code, name,
-			       manager_id, cost_center, is_active, created_at, updated_at
-			FROM departments
-			WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL
-			ORDER BY name ASC
-		`
 		args = append(args, orgID)
+		where += " AND organization_id = $2"
 	}
 
-	rows, err := h.db.Query(query, args...)
+	query := `
+		SELECT id, tenant_id, organization_id, parent_id, code, name,
+		       manager_id, cost_center, is_active, created_at, updated_at
+		FROM departments` + where + " ORDER BY name ASC"
+
+	// Opt-in paging: the web org chart still asks for the whole tree (no page
+	// params) and is unchanged; clients that do send page/limit stop pulling
+	// every department of a large tenant in one response.
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+	}
+
+	queryArgs := args
+	if paginate {
+		queryArgs = append(append([]interface{}{}, args...), pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, queryArgs...)
 	if err != nil {
 		h.log.Error("Failed to list departments", "error", err)
 		response.InternalError(c, "Failed to list departments")
@@ -115,7 +120,17 @@ func (h *Handler) ListDepartments(c *gin.Context) {
 		departments = append(departments, dept)
 	}
 
-	response.Success(c, departments)
+	if !paginate {
+		response.Success(c, departments)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow("SELECT COUNT(*) FROM departments"+where, args...).Scan(&total); err != nil {
+		h.log.Error("Failed to count departments", "error", err)
+		total = len(departments)
+	}
+	response.Paginated(c, departments, page, pageSize, total)
 }
 
 // CreateDepartment creates a new department
