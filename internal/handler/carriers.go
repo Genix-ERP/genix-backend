@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -76,7 +77,20 @@ func (h *Handler) ListCarriers(c *gin.Context) {
 		args = append(args, true)
 	}
 
+	// deleted_at IS NULL is already in the base WHERE and must stay in the
+	// count, or total includes tombstones the page can never show.
+	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM carriers"):]
+
 	query += " ORDER BY name ASC"
+
+	// Opt-in paging: also the carrier-name dropdown source on the
+	// delivery-order form, so the no-params path must stay a full list.
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -101,7 +115,17 @@ func (h *Handler) ListCarriers(c *gin.Context) {
 		carriers = append(carriers, carrier)
 	}
 
-	response.Success(c, carriers)
+	if !paginate {
+		response.Success(c, carriers)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(countQuery, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count carriers", "error", err)
+		total = len(carriers)
+	}
+	response.Paginated(c, carriers, page, pageSize, total)
 }
 
 // GetCarrier returns a single carrier by ID
@@ -356,4 +380,3 @@ func (h *Handler) DeleteCarrier(c *gin.Context) {
 
 	response.NoContent(c)
 }
-

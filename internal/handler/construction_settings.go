@@ -27,7 +27,10 @@ func (h *Handler) ListCostCategories(c *gin.Context) {
 	// Auto-seed defaults if none exist
 	h.seedDefaultCostCategories(tenantID)
 
-	rows, err := h.db.Query(`
+	// Opt-in paging. This is a settings dictionary of ~8-15 seeded rows and it
+	// feeds the expense-form category dropdown, which needs the full set — so
+	// the no-params path must keep returning everything.
+	query := `
 		SELECT cc.id, cc.tenant_id, cc.code, cc.name,
 		       cc.default_debit_account_id, cc.default_credit_account_id,
 		       cc.is_active, cc.created_at,
@@ -36,7 +39,15 @@ func (h *Handler) ListCostCategories(c *gin.Context) {
 		LEFT JOIN accounts a ON a.id = cc.default_debit_account_id
 		WHERE cc.tenant_id = $1 AND cc.is_active = true
 		ORDER BY cc.id ASC
-	`, tenantID)
+	`
+	args := []interface{}{tenantID}
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += " LIMIT $2 OFFSET $3"
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
 	if err != nil {
 		h.log.Error("Failed to list cost categories", "error", err)
 		response.InternalError(c, "Failed to list cost categories")
@@ -69,7 +80,21 @@ func (h *Handler) ListCostCategories(c *gin.Context) {
 		cats = append(cats, cat)
 	}
 
-	response.Success(c, cats)
+	if !paginate {
+		response.Success(c, cats)
+		return
+	}
+
+	total := 0
+	// is_active must be mirrored here or total counts rows the page can never show.
+	if err := h.db.QueryRow(
+		`SELECT COUNT(*) FROM construction_cost_categories WHERE tenant_id = $1 AND is_active = true`,
+		tenantID,
+	).Scan(&total); err != nil {
+		h.log.Error("Failed to count cost categories", "error", err)
+		total = len(cats)
+	}
+	response.Paginated(c, cats, page, pageSize, total)
 }
 
 // CreateCostCategory creates a new construction cost category
@@ -261,9 +286,12 @@ func (h *Handler) getConstructionMappedAccount(tenantID uuid.UUID, orgIDPtr *uui
 
 // seedDefaultCostCategories inserts default categories if none exist for a tenant
 func (h *Handler) seedDefaultCostCategories(tenantID uuid.UUID) {
-	var count int
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM construction_cost_categories WHERE tenant_id = $1`, tenantID).Scan(&count)
-	if count > 0 {
+	// EXISTS, not COUNT(*): this runs on every GET of a hot dropdown
+	// endpoint, and it only ever needs to know whether the table is empty.
+	// EXISTS stops at the first row; COUNT(*) reads all of them.
+	var seeded bool
+	_ = h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM construction_cost_categories WHERE tenant_id = $1)`, tenantID).Scan(&seeded)
+	if seeded {
 		return
 	}
 

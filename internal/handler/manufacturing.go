@@ -5286,7 +5286,28 @@ func (h *Handler) ListManufacturingCategories(c *gin.Context) {
 		args = append(args, orgID)
 	}
 
+	// Mobile only ever renders active categories, and three call sites fetch
+	// this with no params at all.
+	if c.Query("is_active") == "true" {
+		baseQuery += " AND is_active = true"
+	}
+
+	countQuery := "SELECT COUNT(*)" + baseQuery[strings.Index(baseQuery, "FROM manufacturing_categories"):]
+
 	baseQuery += " ORDER BY sort_order ASC, name ASC"
+
+	// Opt-in paging: this is a reference table backing dropdown chips, and
+	// three call sites depend on getting the whole set to resolve
+	// category_id -> name. The unpaged path keeps a hard LIMIT 500 so a
+	// pathological tenant still cannot pull an unbounded table.
+	paginate, page, pageSize, offset := optPagination(c)
+	filterArgs := append([]interface{}{}, args...)
+	if paginate {
+		baseQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	} else {
+		baseQuery += " LIMIT 500"
+	}
 
 	rows, err := h.db.Query(baseQuery, args...)
 	if err != nil {
@@ -5317,7 +5338,17 @@ func (h *Handler) ListManufacturingCategories(c *gin.Context) {
 		categories = append(categories, cat)
 	}
 
-	response.Success(c, categories)
+	if !paginate {
+		response.Success(c, categories)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(countQuery, filterArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count manufacturing categories", "error", err)
+		total = len(categories)
+	}
+	response.Paginated(c, categories, page, pageSize, total)
 }
 
 func (h *Handler) CreateManufacturingCategory(c *gin.Context) {
