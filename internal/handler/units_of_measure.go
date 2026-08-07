@@ -24,8 +24,11 @@ func (h *Handler) ListUnitsOfMeasure(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 200 {
+	if limit < 1 {
 		limit = 100
+	}
+	if limit > 200 {
+		limit = 200
 	}
 	offset := (page - 1) * limit
 

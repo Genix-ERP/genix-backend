@@ -50,8 +50,11 @@ func (h *Handler) ListInventory(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 10000 {
+	if limit < 1 {
 		limit = 100
+	}
+	if limit > 10000 {
+		limit = 10000
 	}
 	offset := (page - 1) * limit
 
@@ -318,8 +321,11 @@ func (h *Handler) GetInventorySummary(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -1110,8 +1116,11 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 10000 {
+	if limit < 1 {
 		limit = 1000
+	}
+	if limit > 10000 {
+		limit = 10000
 	}
 	offset := (page - 1) * limit
 
@@ -1346,8 +1355,11 @@ func (h *Handler) GetInventoryValuation(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 200 {
+	if limit < 1 {
 		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
 	}
 	offset := (page - 1) * limit
 
@@ -1673,8 +1685,11 @@ func (h *Handler) ListBOMs(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -3201,8 +3216,11 @@ func (h *Handler) ListScrapOrders(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -3912,8 +3930,11 @@ func (h *Handler) ListReorderRules(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -9069,8 +9090,11 @@ func (h *Handler) ListAllDeductions(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -9173,8 +9197,11 @@ func (h *Handler) ListInventoryLots(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 10000 {
+	if limit < 1 {
 		limit = 1000
+	}
+	if limit > 10000 {
+		limit = 10000
 	}
 	offset := (page - 1) * limit
 

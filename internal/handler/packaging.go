@@ -31,8 +31,11 @@ func (h *Handler) ListProductPackagings(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -568,8 +571,11 @@ func (h *Handler) ListPackageTypes(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -1006,8 +1012,11 @@ func (h *Handler) ListPackages(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 

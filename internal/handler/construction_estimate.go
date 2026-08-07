@@ -53,8 +53,11 @@ func (h *Handler) ListEstimates(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 200 {
+	if pageSize < 1 {
 		pageSize = 20
+	}
+	if pageSize > 200 {
+		pageSize = 200
 	}
 	offset := (page - 1) * pageSize
 
@@ -702,8 +705,11 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 5000 {
+	if pageSize < 1 {
 		pageSize = 20
+	}
+	if pageSize > 5000 {
+		pageSize = 5000
 	}
 	offset := (page - 1) * pageSize
 

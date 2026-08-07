@@ -32,8 +32,11 @@ func (h *Handler) ListLeaveRequests(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 500 {
+	if limit < 1 {
 		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	offset := (page - 1) * limit
 
@@ -476,8 +479,11 @@ func (h *Handler) ListLeaveBalances(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 500 {
+	if limit < 1 {
 		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	offset := (page - 1) * limit
 

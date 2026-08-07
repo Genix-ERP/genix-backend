@@ -31,8 +31,11 @@ func (h *Handler) ListCargoShipments(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
 	}
 
 	// Parse filters

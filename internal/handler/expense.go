@@ -639,8 +639,11 @@ func (h *Handler) ListExpenses(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 500 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	offset := (page - 1) * limit
 
