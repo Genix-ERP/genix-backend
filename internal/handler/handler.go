@@ -507,6 +507,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 		// Inventory Lots (Partiyalar) - lots are created automatically during Goods Receipt
 		inventory.GET("/lots", h.ListInventoryLots)
+		// Static sibling MUST precede /lots/:id, else "stats" is parsed as a lot UUID.
+		inventory.GET("/lots/stats", h.GetInventoryLotStats)
 		inventory.GET("/lots/:id", h.GetInventoryLot)
 		inventory.PUT("/lots/:id", h.perm.Require("inventory", "stock", "update"), h.UpdateInventoryLot)
 		inventory.DELETE("/lots/:id", h.perm.Require("inventory", "stock", "delete"), h.DeleteInventoryLot)
@@ -1128,6 +1130,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	accounts.Use(h.perm.Require("finance", "account", "read"))
 	{
 		accounts.GET("", h.ListAccounts)
+		accounts.GET("/summary", h.GetAccountsSummary)
 		accounts.GET("/next-code", h.GetNextAccountCode)
 		accounts.POST("", h.perm.Require("finance", "account", "create"), h.CreateAccount)
 		accounts.GET("/:id", h.GetAccount)
