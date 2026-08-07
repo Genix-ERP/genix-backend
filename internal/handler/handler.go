@@ -1415,6 +1415,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		cashOrders.GET("/:id", h.GetCashOrder)
 		cashOrders.PUT("/:id", h.perm.Require("finance", "cash", "update"), h.UpdateCashOrder)
 		cashOrders.POST("/:id/confirm", h.perm.Require("finance", "cash", "approve"), h.ConfirmCashOrder)
+		cashOrders.DELETE("/:id", h.perm.Require("finance", "cash", "delete"), h.DeleteCashOrder)
 	}
 
 	// Cash Book (Kassa kitob)

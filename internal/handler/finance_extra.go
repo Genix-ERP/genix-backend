@@ -22,34 +22,9 @@ import (
 	"github.com/lib/pq"
 )
 
-// ========== CASH REGISTERS ==========
-
-func (h *Handler) ListCashRegisters(c *gin.Context) { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateCashRegister(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Cash register created"})
-}
-func (h *Handler) GetCashRegister(c *gin.Context) { response.NotFound(c, "Cash register") }
-func (h *Handler) UpdateCashRegister(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Cash register updated"})
-}
-
-// ========== CASH ORDERS (PKO/RKO) ==========
-
-func (h *Handler) ListCashOrders(c *gin.Context) { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateCashOrder(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Cash order created"})
-}
-func (h *Handler) GetCashOrder(c *gin.Context) { response.NotFound(c, "Cash order") }
-func (h *Handler) UpdateCashOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Cash order updated"})
-}
-func (h *Handler) ConfirmCashOrder(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Cash order confirmed"})
-}
+// Cash registers / orders / cash book are implemented in cash_kassa.go.
 
 // ========== CASH BOOK ==========
-
-func (h *Handler) GetCashBook(c *gin.Context) { response.Success(c, []interface{}{}) }
 
 // ========== CURRENCY RATES SYNC ==========
 
