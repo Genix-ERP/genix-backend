@@ -740,13 +740,33 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	// U+203A, the app's path delimiter.
 	section := strings.TrimSpace(c.Query("section"))
 
+	// q — server-side search over the WHOLE estimate. Without it the client
+	// filtered `state.lines` (one 20-row page), so searching a 16 000-line
+	// estimate only matched whatever page happened to be loaded and the field
+	// read as broken. Ignored below 2 chars. Applies to the default (flat)
+	// branch; the section branch is the mobile Stage Works screen, which has
+	// no search box.
+	searchQ := strings.TrimSpace(c.Query("q"))
+	if searchQ == "" {
+		searchQ = strings.TrimSpace(c.Query("search"))
+	}
+	if len([]rune(searchQ)) < 2 {
+		searchQ = ""
+	}
+
 	var total int
 	var sectionIDs []int64 // this page's works + ALL their descendants
 	if section == "" {
-		h.db.QueryRow(
-			"SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2"+countFilter,
-			estimateID, tenantID,
-		).Scan(&total)
+		// countFilter uses un-aliased columns, so the q fragment must too.
+		cntQ := "SELECT COUNT(*) FROM construction_estimate_line WHERE estimate_id = $1 AND tenant_id = $2" + countFilter
+		cntArgs := []interface{}{estimateID, tenantID}
+		if searchQ != "" {
+			cntQ += ` AND (UPPER(COALESCE(name,'')) LIKE UPPER($3)
+				OR UPPER(COALESCE(code,'')) LIKE UPPER($3)
+				OR UPPER(COALESCE(item_number,'')) LIKE UPPER($3))`
+			cntArgs = append(cntArgs, "%"+searchQ+"%")
+		}
+		h.db.QueryRow(cntQ, cntArgs...).Scan(&total)
 	} else {
 		// Predicate that identifies a section's top-level works. countFilter
 		// uses the un-aliased is_manual column, matching these queries.
@@ -848,6 +868,15 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 	whereExtra := ""
 	limitClause := "\n\t\tLIMIT $3 OFFSET $4"
 	queryArgs := []interface{}{estimateID, tenantID, pageSize, offset, estProjectID, estBuildingArg}
+	// q is appended as the LAST argument so $1..$6 above keep their meaning and
+	// nothing has to be renumbered.
+	if section == "" && searchQ != "" {
+		whereExtra += fmt.Sprintf(` AND (UPPER(COALESCE(l.name,'')) LIKE UPPER($%d)
+			OR UPPER(COALESCE(l.code,'')) LIKE UPPER($%d)
+			OR UPPER(COALESCE(l.item_number,'')) LIKE UPPER($%d))`,
+			len(queryArgs)+1, len(queryArgs)+1, len(queryArgs)+1)
+		queryArgs = append(queryArgs, "%"+searchQ+"%")
+	}
 	if section != "" {
 		if len(sectionIDs) == 0 {
 			// No works on this page (or empty section) — return empty, keep meta.
@@ -1194,7 +1223,8 @@ func (h *Handler) ListProjectEstimateResources(c *gin.Context) {
 // so the warehouse reservation flow has a real product to bind to.
 //
 // Body: { name, uom, resource_type ('labor' | 'equipment' | 'material'),
-//         unit_price?, material_type? }
+//
+//	unit_price?, material_type? }
 func (h *Handler) CreateProjectResource(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1340,12 +1370,12 @@ func (h *Handler) CreateProjectResource(c *gin.Context) {
 	if rType == "material" {
 		h.autoCreateProductsFromEstimateLines(tenantID, orgID, userID,
 			[]entity.CreateEstimateLineInput{{
-				Name:         req.Name,
-				UOM:          req.UOM,
-				MaterialRate: matRate,
-				LaborRate:    labRate,
+				Name:          req.Name,
+				UOM:           req.UOM,
+				MaterialRate:  matRate,
+				LaborRate:     labRate,
 				EquipmentRate: eqRate,
-				ResourceType: rType,
+				ResourceType:  rType,
 			}})
 	}
 
@@ -1398,11 +1428,11 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 	// parent, auto-assign subline_seq + item_number, and re-derive quantity
 	// from parent.quantity × norm_rate. See migration 332.
 	var (
-		parentLineIDSQL   sql.NullInt64
-		parentItemNumber  = req.ParentItemNumber
-		parentQuantity    float64
-		sublineSeq        int
-		assignedItemNum   = req.ItemNumber
+		parentLineIDSQL  sql.NullInt64
+		parentItemNumber = req.ParentItemNumber
+		parentQuantity   float64
+		sublineSeq       int
+		assignedItemNum  = req.ItemNumber
 	)
 	// parent metadata for the YAKUNIY-trigger path below.
 	var parentApprovalStatus string
@@ -1742,16 +1772,16 @@ func (h *Handler) CreateEstimateLine(c *gin.Context) {
 // can call this unconditionally on every "+ Ish" / "+ Yangi qo'shimcha etap"
 // submission and let the backend decide whether cloning applies.
 //
-// Body: {
-//   source_code:        string  // required — the code to match against existing lines
-//   parent_line_id?:    int64   // attach the new line as a sub-stage of this work
-//   parent_item_number?: string // top-level: lands the new line under this section
-//   item_number?:       string  // explicit numbering (else auto-derived from parent)
-//   name?:              string  // overrides source's name
-//   uom?:               string  // overrides source's uom
-//   code?:              string  // overrides source's code on the new row (defaults to source_code)
-//   quantity?:          float64 // overrides quantity (defaults to 0)
-// }
+//	Body: {
+//	  source_code:        string  // required — the code to match against existing lines
+//	  parent_line_id?:    int64   // attach the new line as a sub-stage of this work
+//	  parent_item_number?: string // top-level: lands the new line under this section
+//	  item_number?:       string  // explicit numbering (else auto-derived from parent)
+//	  name?:              string  // overrides source's name
+//	  uom?:               string  // overrides source's uom
+//	  code?:              string  // overrides source's code on the new row (defaults to source_code)
+//	  quantity?:          float64 // overrides quantity (defaults to 0)
+//	}
 //
 // Returns: { id, cloned_resources, source_id?, source_name? }
 func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
@@ -1822,10 +1852,10 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 	//
 	// Case- and whitespace-insensitive comparison.
 	var (
-		srcID                                          int64
+		srcID                                         int64
 		srcName, srcUOM, srcResourceType, srcMaterial string
 		srcMatRate, srcLabRate, srcEqRate             float64
-		srcChildCount                                  int64
+		srcChildCount                                 int64
 	)
 	err = h.db.QueryRow(`
 		SELECT l.id,
@@ -1999,8 +2029,8 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 			return
 		}
 		type childRow struct {
-			Name, UOM, ResType, MatType                       string
-			MatRate, LabRate, EqRate, UnitRate, NormRate      float64
+			Name, UOM, ResType, MatType                  string
+			MatRate, LabRate, EqRate, UnitRate, NormRate float64
 		}
 		var children []childRow
 		for rows.Next() {
@@ -3775,9 +3805,9 @@ func (h *Handler) autoCreateProductsFromEstimateLines(tenantID, orgID, userID uu
 // number right next door.
 //
 // Idempotency:
-//   • only touches rows where unit_rate is currently 0, so manual edits
+//   - only touches rows where unit_rate is currently 0, so manual edits
 //     made from the Resurslar tab aren't overwritten.
-//   • only touches sub-lines (parent_line_id IS NOT NULL), never the
+//   - only touches sub-lines (parent_line_id IS NOT NULL), never the
 //     top-level work rows or the Ресурс lines themselves.
 //
 // Match key: case-insensitive name + uom. When several Ресурс estimates
