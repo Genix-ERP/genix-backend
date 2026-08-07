@@ -377,17 +377,35 @@ func (h *Handler) GetInventorySummary(c *gin.Context) {
 
 	baseQuery += " GROUP BY p.id, p.code, p.name, p.min_stock_level, p.reorder_point"
 
+	// ONE accumulated HAVING. These used to be two independent `+= " HAVING …"`
+	// appends, so sending low_stock=true&out_of_stock=true emitted
+	// "… HAVING … HAVING …" — a Postgres syntax error, i.e. a 500 on a
+	// combination the UI can produce.
+	havingParts := []string{}
 	if lowStock {
-		baseQuery += " HAVING COALESCE(SUM(i.quantity_available), 0) <= p.reorder_point AND COALESCE(SUM(i.quantity_available), 0) > 0"
+		havingParts = append(havingParts,
+			"COALESCE(SUM(i.quantity_available), 0) <= p.reorder_point AND COALESCE(SUM(i.quantity_available), 0) > 0")
 	}
-
 	if outOfStock {
-		baseQuery += " HAVING COALESCE(SUM(i.quantity_on_hand), 0) <= 0"
+		havingParts = append(havingParts, "COALESCE(SUM(i.quantity_on_hand), 0) <= 0")
+	}
+	having := ""
+	if len(havingParts) > 0 {
+		having = " HAVING " + strings.Join(havingParts, " AND ")
+		baseQuery += having
 	}
 
-	// Get count (simplified - count all products first)
+	// The count must see the HAVING too, or total/total_pages/has_next report
+	// the unfiltered product count whenever a stock filter is on. A HAVING can't
+	// be bolted onto a plain COUNT(*), so wrap the grouped query.
 	var total int
-	err := h.db.QueryRow(countQuery, args...).Scan(&total)
+	var err error
+	if having != "" {
+		wrapped := `SELECT COUNT(*) FROM (` + baseQuery + `) t`
+		err = h.db.QueryRow(wrapped, args...).Scan(&total)
+	} else {
+		err = h.db.QueryRow(countQuery, args...).Scan(&total)
+	}
 	if err != nil {
 		h.log.Error("Failed to count inventory summary", "error", err)
 		response.InternalError(c, "Failed to get inventory summary")
@@ -1052,9 +1070,9 @@ func (h *Handler) TransferInventory(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"message":     "Inventory transferred successfully",
-		"transfer_id": transferID,
-		"quantity":    input.Quantity,
+		"message":           "Inventory transferred successfully",
+		"transfer_id":       transferID,
+		"quantity":          input.Quantity,
 		"from_warehouse_id": fromWarehouseID,
 		"to_warehouse_id":   toWarehouseID,
 	})
@@ -1425,9 +1443,9 @@ func (h *Handler) GetInventoryValuation(c *gin.Context) {
 	pagination.Calculate(total)
 
 	response.SuccessWithPagination(c, gin.H{
-		"items":         valuations,
-		"total_value":   totalInventoryValue,
-		"currency":      "UZS", // TODO: Get from tenant settings
+		"items":       valuations,
+		"total_value": totalInventoryValue,
+		"currency":    "UZS", // TODO: Get from tenant settings
 	}, pagination)
 }
 
@@ -4431,19 +4449,19 @@ func (h *Handler) GetReorderAlerts(c *gin.Context) {
 	defer rows.Close()
 
 	type ReorderAlert struct {
-		RuleID           uuid.UUID  `json:"rule_id"`
-		ProductID        uuid.UUID  `json:"product_id"`
-		ProductCode      string     `json:"product_code"`
-		ProductName      string     `json:"product_name"`
-		WarehouseID      *uuid.UUID `json:"warehouse_id,omitempty"`
-		WarehouseName    string     `json:"warehouse_name,omitempty"`
-		CurrentStock     float64    `json:"current_stock"`
-		MinQty           float64    `json:"min_qty"`
-		ReorderQty       float64    `json:"reorder_qty"`
-		SuggestedOrderQty float64   `json:"suggested_order_qty"`
-		VendorID         *uuid.UUID `json:"vendor_id,omitempty"`
-		VendorName       string     `json:"vendor_name,omitempty"`
-		LeadTimeDays     int        `json:"lead_time_days"`
+		RuleID            uuid.UUID  `json:"rule_id"`
+		ProductID         uuid.UUID  `json:"product_id"`
+		ProductCode       string     `json:"product_code"`
+		ProductName       string     `json:"product_name"`
+		WarehouseID       *uuid.UUID `json:"warehouse_id,omitempty"`
+		WarehouseName     string     `json:"warehouse_name,omitempty"`
+		CurrentStock      float64    `json:"current_stock"`
+		MinQty            float64    `json:"min_qty"`
+		ReorderQty        float64    `json:"reorder_qty"`
+		SuggestedOrderQty float64    `json:"suggested_order_qty"`
+		VendorID          *uuid.UUID `json:"vendor_id,omitempty"`
+		VendorName        string     `json:"vendor_name,omitempty"`
+		LeadTimeDays      int        `json:"lead_time_days"`
 	}
 
 	alerts := make([]*ReorderAlert, 0)
@@ -4514,10 +4532,10 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 
 	// Parse input for optional filters
 	var input struct {
-		ProductIDs   []string `json:"product_ids"`
-		WarehouseID  string   `json:"warehouse_id"`
-		VendorID     string   `json:"vendor_id"`
-		RuleIDs      []string `json:"rule_ids"`
+		ProductIDs  []string `json:"product_ids"`
+		WarehouseID string   `json:"warehouse_id"`
+		VendorID    string   `json:"vendor_id"`
+		RuleIDs     []string `json:"rule_ids"`
 	}
 	c.ShouldBindJSON(&input)
 
@@ -4592,19 +4610,19 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 	defer rows.Close()
 
 	type ReplenishmentItem struct {
-		RuleID          uuid.UUID
-		ProductID       uuid.UUID
-		ProductCode     string
-		ProductName     string
-		WarehouseID     *uuid.UUID
-		MinQty          float64
-		MaxQty          float64
-		ReorderQty      float64
-		CurrentStock    float64
-		VendorID        *uuid.UUID
-		LeadTimeDays    int
-		AutoCreatePO    bool
-		OrderQty        float64
+		RuleID       uuid.UUID
+		ProductID    uuid.UUID
+		ProductCode  string
+		ProductName  string
+		WarehouseID  *uuid.UUID
+		MinQty       float64
+		MaxQty       float64
+		ReorderQty   float64
+		CurrentStock float64
+		VendorID     *uuid.UUID
+		LeadTimeDays int
+		AutoCreatePO bool
+		OrderQty     float64
 	}
 
 	items := make([]*ReplenishmentItem, 0)
@@ -4895,25 +4913,25 @@ func (h *Handler) GetReplenishmentPreview(c *gin.Context) {
 	defer rows.Close()
 
 	type ReplenishmentPreviewItem struct {
-		RuleID         uuid.UUID  `json:"rule_id"`
-		ProductID      uuid.UUID  `json:"product_id"`
-		ProductCode    string     `json:"product_code"`
-		ProductName    string     `json:"product_name"`
-		SKU            string     `json:"sku,omitempty"`
-		WarehouseID    *uuid.UUID `json:"warehouse_id,omitempty"`
-		WarehouseName  string     `json:"warehouse_name,omitempty"`
-		VendorID       *uuid.UUID `json:"vendor_id,omitempty"`
-		VendorName     string     `json:"vendor_name,omitempty"`
-		CurrentStock   float64    `json:"current_stock"`
-		MinQty         float64    `json:"min_qty"`
-		MaxQty         float64    `json:"max_qty"`
-		ReorderQty     float64    `json:"reorder_qty"`
-		SafetyStock    float64    `json:"safety_stock"`
-		SuggestedQty   float64    `json:"suggested_qty"`
-		UnitPrice      float64    `json:"unit_price"`
-		EstimatedCost  float64    `json:"estimated_cost"`
-		LeadTimeDays   int        `json:"lead_time_days"`
-		Status         string     `json:"status"` // "critical", "low", "reorder"
+		RuleID        uuid.UUID  `json:"rule_id"`
+		ProductID     uuid.UUID  `json:"product_id"`
+		ProductCode   string     `json:"product_code"`
+		ProductName   string     `json:"product_name"`
+		SKU           string     `json:"sku,omitempty"`
+		WarehouseID   *uuid.UUID `json:"warehouse_id,omitempty"`
+		WarehouseName string     `json:"warehouse_name,omitempty"`
+		VendorID      *uuid.UUID `json:"vendor_id,omitempty"`
+		VendorName    string     `json:"vendor_name,omitempty"`
+		CurrentStock  float64    `json:"current_stock"`
+		MinQty        float64    `json:"min_qty"`
+		MaxQty        float64    `json:"max_qty"`
+		ReorderQty    float64    `json:"reorder_qty"`
+		SafetyStock   float64    `json:"safety_stock"`
+		SuggestedQty  float64    `json:"suggested_qty"`
+		UnitPrice     float64    `json:"unit_price"`
+		EstimatedCost float64    `json:"estimated_cost"`
+		LeadTimeDays  int        `json:"lead_time_days"`
+		Status        string     `json:"status"` // "critical", "low", "reorder"
 	}
 
 	items := make([]*ReplenishmentPreviewItem, 0)
@@ -5599,9 +5617,9 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 
 	// Get lines with variance
 	type varianceLine struct {
-		ProductID  uuid.UUID
-		Variance   float64
-		UnitCost   float64
+		ProductID uuid.UUID
+		Variance  float64
+		UnitCost  float64
 	}
 
 	rows, err := h.db.Query(`
@@ -5679,8 +5697,8 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 				TenantID: tenantID, OrgID: orgIDPtr, ProductID: line.ProductID,
 				WarehouseID: warehouseID, Qty: line.Variance, UnitCost: line.UnitCost,
 				TxType: "count", RefType: "stock_count", RefID: countID.String(),
-				Reason: fmt.Sprintf("Stock count %s", countNumber),
-				Notes:  "Inventory count adjustment: " + countNumber,
+				Reason:    fmt.Sprintf("Stock count %s", countNumber),
+				Notes:     "Inventory count adjustment: " + countNumber,
 				CreatedBy: userID, When: now, AllowNeg: true,
 			}); dErr != nil {
 				return dErr
@@ -5814,8 +5832,8 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 
 	organizationID, hasOrg := middleware.GetOrganizationID(c)
 
-	direction := c.Query("direction")   // receipt, delivery, internal, write_off
-	state := c.Query("state")           // draft, in_progress, waiting, done, cancelled
+	direction := c.Query("direction") // receipt, delivery, internal, write_off
+	state := c.Query("state")         // draft, in_progress, waiting, done, cancelled
 	partnerID := c.Query("partner_id")
 	limit := 50
 
@@ -6445,9 +6463,9 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			c.JSON(422, gin.H{
 				"success":              false,
 				"message":              "Over-receipt detected. Confirm to proceed.",
-				"over_receipt_warning":  true,
-				"over_receipt_items":    overReceiptItems,
-				"under_receipt_items":   underReceiptItems,
+				"over_receipt_warning": true,
+				"over_receipt_items":   overReceiptItems,
+				"under_receipt_items":  underReceiptItems,
 			})
 			return
 		}
@@ -6508,8 +6526,8 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			}
 			if len(missingDocs) > 0 {
 				c.JSON(422, gin.H{
-					"success":          false,
-					"message":          "Required documents are missing",
+					"success":           false,
+					"message":           "Required documents are missing",
 					"missing_documents": missingDocs,
 				})
 				return
@@ -6530,10 +6548,10 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			WHERE id=$2 AND tenant_id=$3
 		`, now, id, tenantID)
 		response.Success(c, gin.H{
-			"state":            "awaiting_approval",
-			"current_step":     op.CurrentStep,
+			"state":             "awaiting_approval",
+			"current_step":      op.CurrentStep,
 			"approval_required": true,
-			"approval_role":    stepApprovalRole,
+			"approval_role":     stepApprovalRole,
 		})
 		return
 	}
@@ -6594,10 +6612,10 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					WHERE id=$2 AND tenant_id=$3
 				`, now, id, tenantID)
 				response.Success(c, gin.H{
-					"state":            "awaiting_approval",
-					"current_step":     op.CurrentStep,
+					"state":             "awaiting_approval",
+					"current_step":      op.CurrentStep,
 					"approval_required": true,
-					"reason":           "write_off_threshold_exceeded",
+					"reason":            "write_off_threshold_exceeded",
 				})
 				return
 			}
@@ -6617,149 +6635,149 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 			// Create journal entry if auto_post_accounting is enabled
 			var autoPost bool
-		var cfgJournalID, cfgDebitAcct, cfgCreditAcct *uuid.UUID
-		h.db.QueryRow(`
+			var cfgJournalID, cfgDebitAcct, cfgCreditAcct *uuid.UUID
+			h.db.QueryRow(`
 			SELECT wot.auto_post_accounting, wot.journal_id, wot.debit_account_id, wot.credit_account_id
 			FROM warehouse_operation_types wot
 			WHERE wot.id = $1 AND wot.tenant_id = $2
 		`, op.OpTypeID, tenantID).Scan(&autoPost, &cfgJournalID, &cfgDebitAcct, &cfgCreditAcct)
 
-		// Skip auto-posting for material_request deliveries — accounting happens when materials are used in construction stages
-	isMaterialRequestDelivery := op.SourceType != nil && *op.SourceType == "material_request" && op.Direction == "delivery"
+			// Skip auto-posting for material_request deliveries — accounting happens when materials are used in construction stages
+			isMaterialRequestDelivery := op.SourceType != nil && *op.SourceType == "material_request" && op.Direction == "delivery"
 
-	if autoPost && op.Direction != "internal" && !isMaterialRequestDelivery {
-			// Calculate total value from operation lines
-			var totalValue float64
-			h.db.QueryRow(`
+			if autoPost && op.Direction != "internal" && !isMaterialRequestDelivery {
+				// Calculate total value from operation lines
+				var totalValue float64
+				h.db.QueryRow(`
 				SELECT COALESCE(SUM(done_qty * unit_price), 0)
 				FROM stock_operation_lines
 				WHERE operation_id=$1 AND tenant_id=$2
 			`, id, tenantID).Scan(&totalValue)
 
-			if totalValue > 0 {
-				// Find journal
-				var journalID uuid.UUID
-				var nextNumber int
-				if cfgJournalID != nil && *cfgJournalID != uuid.Nil {
-					h.db.QueryRow("SELECT id, COALESCE(next_number,1) FROM journals WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", *cfgJournalID, tenantID).Scan(&journalID, &nextNumber)
-				}
-				if journalID == uuid.Nil {
-					h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
-				}
-
-				if journalID != uuid.Nil {
-					// Find accounts based on direction or configured values
-					var debitAcct, creditAcct uuid.UUID
-					if cfgDebitAcct != nil && *cfgDebitAcct != uuid.Nil {
-						debitAcct = *cfgDebitAcct
+				if totalValue > 0 {
+					// Find journal
+					var journalID uuid.UUID
+					var nextNumber int
+					if cfgJournalID != nil && *cfgJournalID != uuid.Nil {
+						h.db.QueryRow("SELECT id, COALESCE(next_number,1) FROM journals WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL", *cfgJournalID, tenantID).Scan(&journalID, &nextNumber)
 					}
-					if cfgCreditAcct != nil && *cfgCreditAcct != uuid.Nil {
-						creditAcct = *cfgCreditAcct
+					if journalID == uuid.Nil {
+						h.db.QueryRow(`SELECT id, COALESCE(next_number,1) FROM journals WHERE tenant_id=$1 AND code IN ('STOCK','INVENTORY','MISC','GENERAL') AND deleted_at IS NULL ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 WHEN 'MISC' THEN 2 ELSE 3 END LIMIT 1`, tenantID).Scan(&journalID, &nextNumber)
 					}
 
-					// Fallback: auto-detect accounts by direction
-					if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
-						switch op.Direction {
-						case "receipt":
-							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
-							}
-							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "6010")
+					if journalID != uuid.Nil {
+						// Find accounts based on direction or configured values
+						var debitAcct, creditAcct uuid.UUID
+						if cfgDebitAcct != nil && *cfgDebitAcct != uuid.Nil {
+							debitAcct = *cfgDebitAcct
+						}
+						if cfgCreditAcct != nil && *cfgCreditAcct != uuid.Nil {
+							creditAcct = *cfgCreditAcct
+						}
+
+						// Fallback: auto-detect accounts by direction
+						if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
+							switch op.Direction {
+							case "receipt":
+								if debitAcct == uuid.Nil {
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
+								}
 								if creditAcct == uuid.Nil {
-									creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "6010")
-								}
-							}
-						case "delivery":
-							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "9110")
-								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "9110")
-								}
-							}
-							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
-							}
-						case "write_off":
-							if debitAcct == uuid.Nil {
-								debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "9430")
-								if debitAcct == uuid.Nil {
-									debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "9420")
-								}
-							}
-							if creditAcct == uuid.Nil {
-								creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
-							}
-						}
-					}
-
-					if debitAcct != uuid.Nil && creditAcct != uuid.Nil {
-						entryID := uuid.New()
-						prefixMap := map[string]string{"receipt": "REC", "delivery": "DEL", "write_off": "WO"}
-						prefix := prefixMap[op.Direction]
-						if prefix == "" {
-							prefix = "STK"
-						}
-						entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
-
-						var opName string
-						h.db.QueryRow("SELECT name FROM stock_operations WHERE id=$1", id).Scan(&opName)
-						description := fmt.Sprintf("Stock Operation: %s", opName)
-
-						tx, txErr := h.db.Begin()
-						if txErr != nil {
-							h.log.Error("Failed to begin stock-operation journal tx", "error", txErr)
-						} else {
-							committed := false
-							func() {
-								defer func() {
-									if !committed {
-										tx.Rollback()
+									creditAcct = findAccount(h.db, tenantID, op.OrgID, "accounts payable", "6010")
+									if creditAcct == uuid.Nil {
+										creditAcct = findAccount(h.db, tenantID, op.OrgID, "vendor", "6010")
 									}
-								}()
+								}
+							case "delivery":
+								if debitAcct == uuid.Nil {
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "cost of goods", "9110")
+									if debitAcct == uuid.Nil {
+										debitAcct = findAccount(h.db, tenantID, op.OrgID, "cogs", "9110")
+									}
+								}
+								if creditAcct == uuid.Nil {
+									creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
+								}
+							case "write_off":
+								if debitAcct == uuid.Nil {
+									debitAcct = findAccount(h.db, tenantID, op.OrgID, "scrap", "9430")
+									if debitAcct == uuid.Nil {
+										debitAcct = findAccount(h.db, tenantID, op.OrgID, "inventory loss", "9420")
+									}
+								}
+								if creditAcct == uuid.Nil {
+									creditAcct = findAccount(h.db, tenantID, op.OrgID, "inventory", "1010")
+								}
+							}
+						}
 
-								if _, err := tx.Exec(`
+						if debitAcct != uuid.Nil && creditAcct != uuid.Nil {
+							entryID := uuid.New()
+							prefixMap := map[string]string{"receipt": "REC", "delivery": "DEL", "write_off": "WO"}
+							prefix := prefixMap[op.Direction]
+							if prefix == "" {
+								prefix = "STK"
+							}
+							entryNumber := fmt.Sprintf("%s%06d", prefix, nextNumber)
+
+							var opName string
+							h.db.QueryRow("SELECT name FROM stock_operations WHERE id=$1", id).Scan(&opName)
+							description := fmt.Sprintf("Stock Operation: %s", opName)
+
+							tx, txErr := h.db.Begin()
+							if txErr != nil {
+								h.log.Error("Failed to begin stock-operation journal tx", "error", txErr)
+							} else {
+								committed := false
+								func() {
+									defer func() {
+										if !committed {
+											tx.Rollback()
+										}
+									}()
+
+									if _, err := tx.Exec(`
 									INSERT INTO journal_entries (
 										id, tenant_id, organization_id, journal_id, entry_number, entry_date,
 										description, source_type, source_id, status, total_debit, total_credit,
 										created_by, created_at, updated_at
 									) VALUES ($1, $2, $3, $4, $5, $6, $7, 'stock_operation', $8, 'posted', $9, $9, $10, $11, $11)
 								`, entryID, tenantID, op.OrgID, journalID, entryNumber, now,
-									description, id.String(), totalValue, userID, now); err != nil {
-									h.log.Error("Failed to create stock-operation journal entry", "error", err)
-									return
-								}
-								if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
-									uuid.New(), entryID, debitAcct, description, totalValue, now); err != nil {
-									h.log.Error("Failed to insert stock-operation debit line", "error", err)
-									return
-								}
-								if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
-									uuid.New(), entryID, creditAcct, description, totalValue, now); err != nil {
-									h.log.Error("Failed to insert stock-operation credit line", "error", err)
-									return
-								}
-								if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalValue, now, debitAcct); err != nil {
-									h.log.Error("Failed to update debit account balance", "error", err)
-									return
-								}
-								if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, creditAcct); err != nil {
-									h.log.Error("Failed to update credit account balance", "error", err)
-									return
-								}
-								if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
-									h.log.Error("Failed to bump journal next_number", "error", err)
-									return
-								}
-								if _, err := tx.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, id); err != nil {
-									h.log.Error("Failed to mark stock operation posted", "error", err)
-									return
-								}
+										description, id.String(), totalValue, userID, now); err != nil {
+										h.log.Error("Failed to create stock-operation journal entry", "error", err)
+										return
+									}
+									if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, $5, 0, 1, $6)`,
+										uuid.New(), entryID, debitAcct, description, totalValue, now); err != nil {
+										h.log.Error("Failed to insert stock-operation debit line", "error", err)
+										return
+									}
+									if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at) VALUES ($1, $2, $3, $4, 0, $5, 2, $6)`,
+										uuid.New(), entryID, creditAcct, description, totalValue, now); err != nil {
+										h.log.Error("Failed to insert stock-operation credit line", "error", err)
+										return
+									}
+									if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalValue, now, debitAcct); err != nil {
+										h.log.Error("Failed to update debit account balance", "error", err)
+										return
+									}
+									if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalValue, now, creditAcct); err != nil {
+										h.log.Error("Failed to update credit account balance", "error", err)
+										return
+									}
+									if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+										h.log.Error("Failed to bump journal next_number", "error", err)
+										return
+									}
+									if _, err := tx.Exec("UPDATE stock_operations SET accounting_posted = true, journal_entry_id = $1, updated_at = $2 WHERE id = $3", entryID, now, id); err != nil {
+										h.log.Error("Failed to mark stock operation posted", "error", err)
+										return
+									}
 
-								// TT 12.3: Write-offs affect budget — update budget_lines.actual_amount
-								// for the debit account (expense account) if tracked in an active budget
-								if op.Direction == "write_off" && totalValue > 0 {
-									if _, err := tx.Exec(`
+									// TT 12.3: Write-offs affect budget — update budget_lines.actual_amount
+									// for the debit account (expense account) if tracked in an active budget
+									if op.Direction == "write_off" && totalValue > 0 {
+										if _, err := tx.Exec(`
 										UPDATE budget_lines bl
 										SET actual_amount = actual_amount + $1, updated_at = NOW()
 										FROM budgets b
@@ -6771,22 +6789,22 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 										  AND (b.start_date IS NULL OR b.start_date <= $4)
 										  AND (b.end_date IS NULL OR b.end_date >= $4)
 									`, totalValue, tenantID, debitAcct, now); err != nil {
-										h.log.Error("Failed to update budget actuals", "error", err)
-										return
+											h.log.Error("Failed to update budget actuals", "error", err)
+											return
+										}
 									}
-								}
 
-								if err := tx.Commit(); err != nil {
-									h.log.Error("Failed to commit stock-operation journal entry", "error", err)
-								} else {
-									committed = true
-								}
-							}()
+									if err := tx.Commit(); err != nil {
+										h.log.Error("Failed to commit stock-operation journal entry", "error", err)
+									} else {
+										committed = true
+									}
+								}()
+							}
 						}
 					}
 				}
 			}
-		}
 		}
 
 		// ── Inventory movement: adjust quantity_on_hand based on direction ──
@@ -7560,8 +7578,9 @@ func (h *Handler) completeLinkedReceiptOp(tenantID uuid.UUID, purchaseOrderID uu
 
 // postIntercompanyStockAccounting creates journal entries for intercompany stock operations.
 // Uses product category accounts per line:
-//   receipt → Debit StockValuation, Credit StockInput
-//   delivery → Debit ExpenseAccount(COGS), Credit StockValuation
+//
+//	receipt → Debit StockValuation, Credit StockInput
+//	delivery → Debit ExpenseAccount(COGS), Credit StockValuation
 func (h *Handler) postIntercompanyStockAccounting(tenantID uuid.UUID, opID uuid.UUID, orgID *uuid.UUID, direction string, now time.Time) {
 	// Get operation lines with product IDs
 	lineRows, _ := h.db.Query(`
@@ -8800,17 +8819,17 @@ func (h *Handler) AssignResponsible(c *gin.Context) {
 		h.db.QueryRow("SELECT COALESCE(first_name || ' ' || last_name, first_name, '') FROM employees WHERE id=$1 AND tenant_id=$2", employeeID, tenantID).Scan(&empName)
 
 		deductionResp = &entity.EmployeeDeduction{
-			ID:         deductionID,
-			TenantID:   tenantID,
-			EmployeeID: employeeID,
-			Amount:     shortageAmount,
-			Reason:     reason,
-			SourceType: "inventory_shortage",
-			SourceID:   &lineID,
-			Status:     "pending",
-			CreatedBy:  userID,
-			CreatedAt:  now,
-			UpdatedAt:  now,
+			ID:           deductionID,
+			TenantID:     tenantID,
+			EmployeeID:   employeeID,
+			Amount:       shortageAmount,
+			Reason:       reason,
+			SourceType:   "inventory_shortage",
+			SourceID:     &lineID,
+			Status:       "pending",
+			CreatedBy:    userID,
+			CreatedAt:    now,
+			UpdatedAt:    now,
 			EmployeeName: empName,
 		}
 		if orgIDPtr != nil {
@@ -9047,8 +9066,12 @@ func (h *Handler) ListAllDeductions(c *gin.Context) {
 	status := c.Query("status")
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 50 }
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
 	offset := (page - 1) * limit
 
 	query := `
@@ -9522,13 +9545,13 @@ func (h *Handler) DeleteInventoryLot(c *gin.Context) {
 //
 // Conceptually:
 //
-//   for each inventory_transactions row T with T.transaction_date <= as_of:
-//     signed_qty = T.quantity, signed according to T.transaction_type
-//     accumulate (T.inventory_id → product_id, warehouse_id):
-//       on_hand += signed_qty
-//       wac_basis += signed_qty * unit_cost  (only when signed_qty > 0)
-//       wac_units += signed_qty              (only when signed_qty > 0)
-//   unit_cost_at_date = wac_basis / wac_units   (Odoo's default WAC method)
+//	for each inventory_transactions row T with T.transaction_date <= as_of:
+//	  signed_qty = T.quantity, signed according to T.transaction_type
+//	  accumulate (T.inventory_id → product_id, warehouse_id):
+//	    on_hand += signed_qty
+//	    wac_basis += signed_qty * unit_cost  (only when signed_qty > 0)
+//	    wac_units += signed_qty              (only when signed_qty > 0)
+//	unit_cost_at_date = wac_basis / wac_units   (Odoo's default WAC method)
 //
 // All write paths in the codebase store `quantity` already signed (issue
 // rows have negative quantities — see sales_delivery.go ~line 998), but
@@ -9538,34 +9561,36 @@ func (h *Handler) DeleteInventoryLot(c *gin.Context) {
 // GET /api/v1/inventory/stock-at-date
 //
 // Query params:
-//   as_of            REQUIRED   YYYY-MM-DD or RFC3339. Interpreted as
-//                               end-of-day UTC when only the date part
-//                               is given so a transaction posted at
-//                               23:55 on the as_of day is still in scope.
-//   warehouse_id     optional   uuid — filter to a single warehouse.
-//   product_id       optional   uuid — filter to a single product.
-//   include_deleted  optional   "true"/"false", default "true". The
-//                               default is intentionally different from
-//                               the live products list because a date
-//                               report that hides deleted SKUs is
-//                               useless — that's the very thing the
-//                               user wants to see at this date.
+//
+//	as_of            REQUIRED   YYYY-MM-DD or RFC3339. Interpreted as
+//	                            end-of-day UTC when only the date part
+//	                            is given so a transaction posted at
+//	                            23:55 on the as_of day is still in scope.
+//	warehouse_id     optional   uuid — filter to a single warehouse.
+//	product_id       optional   uuid — filter to a single product.
+//	include_deleted  optional   "true"/"false", default "true". The
+//	                            default is intentionally different from
+//	                            the live products list because a date
+//	                            report that hides deleted SKUs is
+//	                            useless — that's the very thing the
+//	                            user wants to see at this date.
 //
 // Response:
-//   {
-//     "as_of": "2026-06-01T23:59:59Z",
-//     "warehouse_id": null,
-//     "include_deleted": true,
-//     "rows": [
-//       { "product_id":..., "product_code":"...", "product_name":"...",
-//         "is_deleted":false, "warehouse_id":..., "warehouse_name":"...",
-//         "quantity":12.5, "unit_cost":150000.0, "total_value":1875000.0,
-//         "current_sales_price":175000.0,
-//         "last_txn_date":"2026-05-28T10:11:00Z" },
-//       ...
-//     ],
-//     "totals": { "products": N, "quantity": Q, "total_value": V }
-//   }
+//
+//	{
+//	  "as_of": "2026-06-01T23:59:59Z",
+//	  "warehouse_id": null,
+//	  "include_deleted": true,
+//	  "rows": [
+//	    { "product_id":..., "product_code":"...", "product_name":"...",
+//	      "is_deleted":false, "warehouse_id":..., "warehouse_name":"...",
+//	      "quantity":12.5, "unit_cost":150000.0, "total_value":1875000.0,
+//	      "current_sales_price":175000.0,
+//	      "last_txn_date":"2026-05-28T10:11:00Z" },
+//	    ...
+//	  ],
+//	  "totals": { "products": N, "quantity": Q, "total_value": V }
+//	}
 func (h *Handler) GetStockAtDate(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -9674,7 +9699,8 @@ func parseAsOfDate(s string) (time.Time, error) {
 
 // stockAtDateQuery — see GetStockAtDate above for the full annotation.
 // Param order:  $1 tenantID  $2 as_of  $3 orgID  $4 warehouseID
-//               $5 productID $6 include_deleted
+//
+//	$5 productID $6 include_deleted
 const stockAtDateQuery = `
 WITH ledger AS (
     SELECT
@@ -9879,8 +9905,9 @@ func parseDayStart(s string) (time.Time, error) {
 
 // stockTurnoverQuery — see GetInventoryTurnover above.
 // Param order:  $1 tenantID  $2 date_from(start)  $3 date_to(end)
-//               $4 orgID      $5 warehouseID        $6 productID
-//               $7 include_deleted
+//
+//	$4 orgID      $5 warehouseID        $6 productID
+//	$7 include_deleted
 const stockTurnoverQuery = `
 WITH ledger AS (
     SELECT
