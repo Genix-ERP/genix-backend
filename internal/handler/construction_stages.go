@@ -507,8 +507,11 @@ func (h *Handler) GetConstructionStageWorks(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -1424,8 +1427,11 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 100 {
+	if pageSize < 1 {
 		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
 	}
 
 	// summary.buildings — distinct on_track items that have a building, counted,

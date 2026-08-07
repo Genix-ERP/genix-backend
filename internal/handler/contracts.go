@@ -165,8 +165,11 @@ func (h *Handler) ListContracts(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
 	}
 
 	where := []string{"c.tenant_id = $1", "c.deleted_at IS NULL"}

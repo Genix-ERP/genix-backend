@@ -29,8 +29,11 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 10000 {
+	if pageSize < 1 {
 		pageSize = 20
+	}
+	if pageSize > 10000 {
+		pageSize = 10000
 	}
 	offset := (page - 1) * pageSize
 

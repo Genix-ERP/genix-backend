@@ -34,8 +34,11 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	if limit < 1 || limit > 100 {
+	if limit < 1 {
 		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	offset := (page - 1) * limit
 
@@ -348,12 +351,18 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 
 	// Default step values (1-step operations)
 	receptionSteps := input.ReceptionSteps
-	if receptionSteps < 1 || receptionSteps > 3 {
+	if receptionSteps < 1 {
 		receptionSteps = 1
 	}
+	if receptionSteps > 3 {
+		receptionSteps = 3
+	}
 	deliverySteps := input.DeliverySteps
-	if deliverySteps < 1 || deliverySteps > 3 {
+	if deliverySteps < 1 {
 		deliverySteps = 1
+	}
+	if deliverySteps > 3 {
+		deliverySteps = 3
 	}
 
 	var orgIDPtr *uuid.UUID

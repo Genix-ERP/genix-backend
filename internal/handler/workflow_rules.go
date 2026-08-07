@@ -445,8 +445,11 @@ func (h *Handler) ListWorkflowLogs(c *gin.Context) {
 	}
 
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	if limit < 1 || limit > 200 {
+	if limit < 1 {
 		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
 	}
 
 	query := `
