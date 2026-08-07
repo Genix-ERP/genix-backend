@@ -8105,13 +8105,54 @@ func (h *Handler) CreateCashTransaction(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
-	// Prevent negative cash balance on expense
+	// Resolve which till this transaction moves money through. Explicit param
+	// wins; otherwise the tenant's only active register, matching GetCashBook's
+	// fallback. Left NULL when a tenant has several tills and named none —
+	// guessing would put real money in the wrong kassa's book.
+	var registerArg interface{}
+	if v := strings.TrimSpace(c.Query("cash_register_id")); v != "" {
+		if rid, e := uuid.Parse(v); e == nil {
+			registerArg = rid
+		}
+	}
+	if registerArg == nil {
+		var rid uuid.UUID
+		if e := h.db.QueryRow(`SELECT id FROM cash_registers
+			WHERE tenant_id=$1 AND deleted_at IS NULL AND is_active = true
+			ORDER BY name LIMIT 1`, tenantID).Scan(&rid); e == nil {
+			registerArg = rid
+		}
+	}
+
+	// Prevent negative cash balance on expense.
+	//
+	// This guard was broken in two independent ways and rejected EVERY expense:
+	//
+	//   * it filtered `deleted_at IS NULL`, and cash_transactions has no such
+	//     column (migration 004 defines the table; 036 adds only
+	//     category/cashier/currency). Postgres rejected the whole statement,
+	//     the error was discarded because the Scan result was never checked,
+	//     and cashBalance stayed at its zero value — so `0 < amount` was true
+	//     for every expense and the user saw "balans: 0.00" forever.
+	//
+	//   * it summed cash_transactions ONLY, so even working it would have
+	//     ignored every confirmed PKO/RKO order — the till could hold millions
+	//     in orders and still refuse a small expense.
+	//
+	// Now it reads the same union the cash book does (kassa_ledger.go), scoped
+	// to the till the money is actually leaving, and the error is no longer
+	// swallowed: a balance we could not compute must not read as zero.
 	if input.Type == "expense" {
-		var cashBalance float64
-		h.db.QueryRow(`
-			SELECT COALESCE(SUM(CASE WHEN transaction_type = 'income' THEN amount ELSE -amount END), 0)
-			FROM cash_transactions WHERE tenant_id = $1 AND status != 'cancelled' AND deleted_at IS NULL
-		`, tenantID).Scan(&cashBalance)
+		scope := ""
+		if rid, isUUID := registerArg.(uuid.UUID); isUUID {
+			scope = rid.String()
+		}
+		cashBalance, balErr := h.kassaBalance(tenantID, scope)
+		if balErr != nil {
+			h.log.Error("cash balance check failed", "error", balErr)
+			response.InternalError(c, "Failed to verify cash balance")
+			return
+		}
 		if cashBalance < input.Amount {
 			response.BadRequest(c, fmt.Sprintf("Kassada mablag' yetarli emas (balans: %.2f, so'ralgan: %.2f)", cashBalance, input.Amount))
 			return
@@ -8131,10 +8172,11 @@ func (h *Handler) CreateCashTransaction(c *gin.Context) {
 
 	_, err = h.db.Exec(`
 		INSERT INTO cash_transactions (id, tenant_id, organization_id, transaction_number, transaction_date, transaction_type,
-		                               amount, currency, description, category, reference, cashier, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $13)
+		                               amount, currency, description, category, reference, cashier, status,
+		                               cash_register_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'posted', $13, $14, $14)
 	`, id, tenantID, orgIDPtr, transactionNumber, transactionDate, input.Type, input.Amount, currency,
-		input.Description, input.Category, input.Reference, input.Cashier, now)
+		input.Description, input.Category, input.Reference, input.Cashier, registerArg, now)
 
 	if err != nil {
 		h.log.Error("Failed to create cash transaction", "error", err)
