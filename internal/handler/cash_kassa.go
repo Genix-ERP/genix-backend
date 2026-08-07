@@ -757,14 +757,35 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 	where := " WHERE cb.tenant_id = $1"
 	args := []interface{}{tenantID}
 	registerID := c.Query("cash_register_id")
+	registerName := ""
+	registerCount := 0
 	if registerID == "" {
 		// Default to the tenant's first active register so the screen isn't
 		// empty when the client hasn't picked one yet.
+		//
+		// This fallback is silent by nature: with more than one kassa the
+		// caller gets ONE register's book and nothing in the payload said
+		// which, so the screen reads as "the cash book" while showing a single
+		// till. The resolved register is now echoed on every row (and its
+		// name), so a client can label the book and offer a switcher instead of
+		// quietly under-reporting.
 		var rid uuid.UUID
-		if e := h.db.QueryRow(`SELECT id FROM cash_registers
+		var rname string
+		if e := h.db.QueryRow(`SELECT id, name FROM cash_registers
 			WHERE tenant_id=$1 AND deleted_at IS NULL AND is_active = true
-			ORDER BY name LIMIT 1`, tenantID).Scan(&rid); e == nil {
+			ORDER BY name LIMIT 1`, tenantID).Scan(&rid, &rname); e == nil {
 			registerID = rid.String()
+			registerName = rname
+		}
+	}
+	// How many active kassas exist, so the client can tell "this tenant has one
+	// till" from "you are looking at 1 of 4".
+	_ = h.db.QueryRow(`SELECT COUNT(*) FROM cash_registers
+		WHERE tenant_id=$1 AND deleted_at IS NULL AND is_active = true`, tenantID).Scan(&registerCount)
+	if registerName == "" && registerID != "" {
+		if rid, e := uuid.Parse(registerID); e == nil {
+			_ = h.db.QueryRow(`SELECT name FROM cash_registers WHERE id=$1 AND tenant_id=$2`,
+				rid, tenantID).Scan(&registerName)
 		}
 	}
 	if registerID != "" {
@@ -810,6 +831,11 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 		out = append(out, gin.H{
 			"entry_date": d.Format("2006-01-02"), "opening_balance": opening,
 			"total_income": income, "total_expense": expense, "closing_balance": closing,
+			// Which till this row belongs to. Added per-row rather than as a
+			// sibling of `data` because `data` is a list in the shipped clients
+			// and turning it into an object would break them.
+			"cash_register_id": registerID, "cash_register_name": registerName,
+			"active_register_count": registerCount,
 		})
 	}
 	response.Paginated(c, out, page, pageSize, total)
