@@ -875,43 +875,36 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 		periodTo = now.Format("2006-01-02")
 	}
 
-	// Get cash/bank account balances (opening balance).
-	// Aggregate per account FIRST (inner query), then sum across accounts —
-	// otherwise a.opening_balance, joined once per journal line, would be
-	// multiplied by each account's line count.
-	cashArgs := []interface{}{tenantID, periodFrom, periodTo}
-	cashOrgFilter := ""
+	// Cash position via the shared definition in cash_balance.go — the same
+	// helper /reports/finance-dashboard calls, so the two endpoints can no
+	// longer disagree. Replaces an inline query that omitted is_active and
+	// is_leaf (so deactivated accounts counted and every parent rollup
+	// double-counted its children) and signed its pre-period movement by
+	// at.normal_balance while its in-period movement was debit-positive, giving
+	// the two halves of one balance opposite signs on a credit-normal bank
+	// account.
+	cashOrg := uuid.Nil
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		cashOrgFilter = fmt.Sprintf(" AND a.organization_id = $%d", len(cashArgs)+1)
-		cashArgs = append(cashArgs, orgID)
+		cashOrg = orgID
 	}
-	cashQuery := `
-		SELECT
-			COALESCE(SUM(acct.opening_balance + acct.pre_movement), 0) as opening_balance,
-			COALESCE(SUM(acct.period_debits), 0) as period_debits,
-			COALESCE(SUM(acct.period_credits), 0) as period_credits
-		FROM (
-			SELECT a.id, a.opening_balance,
-				COALESCE(SUM(CASE WHEN je.entry_date < $2 THEN
-					CASE WHEN at.normal_balance = 'debit' THEN jel.debit_amount - jel.credit_amount
-					ELSE jel.credit_amount - jel.debit_amount END
-				ELSE 0 END), 0) as pre_movement,
-				COALESCE(SUM(CASE WHEN je.entry_date BETWEEN $2 AND $3 THEN jel.debit_amount ELSE 0 END), 0) as period_debits,
-				COALESCE(SUM(CASE WHEN je.entry_date BETWEEN $2 AND $3 THEN jel.credit_amount ELSE 0 END), 0) as period_credits
-			FROM accounts a
-			JOIN account_types at ON a.account_type_id = at.id
-			LEFT JOIN journal_entry_lines jel ON a.id = jel.account_id
-			LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id AND je.status = 'posted' AND je.deleted_at IS NULL
-			WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
-				AND (a.is_bank_account = true OR at.code IN ('CASH'))` + cashOrgFilter + `
-			GROUP BY a.id, a.opening_balance
-		) acct
-	`
 
-	var openingCash, periodDebits, periodCredits float64
-	err := h.db.QueryRow(cashQuery, cashArgs...).Scan(&openingCash, &periodDebits, &periodCredits)
+	// Opening = the position at the last instant before the period starts.
+	// Derived by asking for the balance as of the day before period_from rather
+	// than by subtracting in-period movement from the closing figure, so the
+	// two ends are computed the same way.
+	openingAsOf := periodFrom
+	if d, perr := time.Parse("2006-01-02", periodFrom); perr == nil {
+		openingAsOf = d.AddDate(0, 0, -1).Format("2006-01-02")
+	}
+
+	_, openingCash, err := h.cashBalancesAsOf(tenantID, cashOrg, openingAsOf)
 	if err != nil {
-		h.log.Error("Failed to get cash balances", "error", err)
+		h.log.Error("Failed to get opening cash balance", "error", err)
+	}
+
+	periodDebits, periodCredits, err := h.cashMovementBetween(tenantID, cashOrg, periodFrom, periodTo)
+	if err != nil {
+		h.log.Error("Failed to get cash movement", "error", err)
 	}
 
 	// Cash flow mapping by account code prefix
