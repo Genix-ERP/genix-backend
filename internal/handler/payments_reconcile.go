@@ -35,16 +35,34 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	}
 
 	var input struct {
-		ContactID   string  `json:"contact_id" binding:"required"`
-		Amount      float64 `json:"amount" binding:"required,gt=0"`
-		Direction   string  `json:"direction" binding:"required,oneof=customer vendor"`
-		PaymentDate string  `json:"payment_date,omitempty"`
-		Method      string  `json:"method,omitempty"` // cash | bank
-		Notes       string  `json:"notes,omitempty"`
+		ContactID    string  `json:"contact_id" binding:"required"`
+		Amount       float64 `json:"amount" binding:"required,gt=0"`
+		Direction    string  `json:"direction" binding:"required,oneof=customer vendor"`
+		PaymentDate  string  `json:"payment_date,omitempty"`
+		Method       string  `json:"method,omitempty"` // cash | bank
+		Notes        string  `json:"notes,omitempty"`
+		CurrencyID   string  `json:"currency_id,omitempty"`
+		ExchangeRate float64 `json:"exchange_rate,omitempty"`
+		JournalID    string  `json:"journal_id,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid input: "+err.Error())
 		return
+	}
+
+	// Normalised exactly as CreatePayment does, so the two write paths cannot
+	// record the same economic event differently. currency_id was hardcoded
+	// NULL and exchange_rate 1.0 here, so a USD payment was stored as if it
+	// were base currency and then disagreed with POST /payments.
+	exchangeRate := input.ExchangeRate
+	if exchangeRate <= 0 {
+		exchangeRate = 1.0
+	}
+	var currencyIDPtr *uuid.UUID
+	if input.CurrencyID != "" {
+		if parsed, perr := uuid.Parse(input.CurrencyID); perr == nil && parsed != uuid.Nil {
+			currencyIDPtr = &parsed
+		}
 	}
 	contactID, err := uuid.Parse(input.ContactID)
 	if err != nil {
@@ -114,10 +132,25 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	// Pick a journal (cash, then GENERAL, then any), scoped to org.
 	var journalID uuid.UUID
 	var prefix sql.NullString
-	_ = tx.QueryRow(`SELECT id, number_prefix FROM journals
-		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2 OR organization_id IS NULL)
-		ORDER BY CASE WHEN LOWER(COALESCE(type,''))='cash' THEN 0 WHEN code='GENERAL' THEN 1 ELSE 2 END LIMIT 1`,
-		tenantID, orgArg).Scan(&journalID, &prefix)
+
+	// The web modal makes Jurnal required and blocks submit without it, then
+	// this path threw the choice away — a tenant with two bank journals could
+	// not direct the payment. Prefer the caller's journal when it resolves to a
+	// live journal OF THIS TENANT; the tenant predicate is what stops the field
+	// becoming a cross-tenant write primitive, so it must not be dropped.
+	if input.JournalID != "" {
+		if parsed, perr := uuid.Parse(input.JournalID); perr == nil {
+			_ = tx.QueryRow(`SELECT id, number_prefix FROM journals
+				WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`,
+				parsed, tenantID).Scan(&journalID, &prefix)
+		}
+	}
+	if journalID == uuid.Nil {
+		_ = tx.QueryRow(`SELECT id, number_prefix FROM journals
+			WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2 OR organization_id IS NULL)
+			ORDER BY CASE WHEN LOWER(COALESCE(type,''))='cash' THEN 0 WHEN code='GENERAL' THEN 1 ELSE 2 END LIMIT 1`,
+			tenantID, orgArg).Scan(&journalID, &prefix)
+	}
 	if journalID == uuid.Nil {
 		response.BadRequest(c, "No journal is configured for this company.")
 		return
@@ -141,8 +174,8 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	jeID := uuid.New()
 	if _, err := tx.Exec(`INSERT INTO journal_entries
 		(id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description, source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'payment',$9,1.0,$10,$10,'posted',$11,$12,$12)`,
-		jeID, tenantID, orgArg, journalID, entryNumber, now, nullIfEmpty(input.Notes), desc, contactID.String(), input.Amount, userID, now); err != nil {
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'payment',$9,$13,$10,$10,'posted',$11,$12,$12)`,
+		jeID, tenantID, orgArg, journalID, entryNumber, now, nullIfEmpty(input.Notes), desc, contactID.String(), input.Amount, userID, now, exchangeRate); err != nil {
 		h.log.Error("register payment: JE header", "error", err)
 		response.InternalError(c, "Failed to post payment")
 		return
@@ -150,7 +183,7 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	jelInsert := func(acct uuid.UUID, contact interface{}, line int, debit, credit float64) error {
 		_, e := tx.Exec(`INSERT INTO journal_entry_lines
 			(id, journal_entry_id, line_number, account_id, contact_id, description, debit_amount, credit_amount, exchange_rate, created_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1.0,$9)`, uuid.New(), jeID, line, acct, contact, desc, debit, credit, now)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$10,$9)`, uuid.New(), jeID, line, acct, contact, desc, debit, credit, now, exchangeRate)
 		return e
 	}
 	var e1, e2 error
@@ -180,9 +213,9 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	paymentID := uuid.New()
 	if _, err := tx.Exec(`INSERT INTO payments
 		(id, tenant_id, organization_id, type, payment_number, contact_id, payment_date, amount, currency_id, exchange_rate, reference, notes, status, journal_entry_id, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,1.0,$9,$10,'confirmed',$11,$12,$13,$13)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$14,$15,$9,$10,'confirmed',$11,$12,$13,$13)`,
 		paymentID, tenantID, orgArg, pType, "PAY-"+entryNumber, contactID, now, input.Amount,
-		nullIfEmpty(input.Notes), nullIfEmpty(input.Notes), jeID, userID, now); err != nil {
+		nullIfEmpty(input.Notes), nullIfEmpty(input.Notes), jeID, userID, now, currencyIDPtr, exchangeRate); err != nil {
 		h.log.Error("register payment: payment row", "error", err)
 		response.InternalError(c, "Failed to record payment")
 		return
@@ -200,10 +233,24 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 		due    float64
 	}
 	var opens []openInv
+	// Only settle invoices denominated in the SAME currency as the payment.
+	//
+	// The loop below compares input.Amount against total_amount - amount_paid.
+	// Those are raw numbers with no currency attached, so allocating a 1,000 USD
+	// payment against a 1,000,000 UZS invoice would mark it 0.1% paid — the
+	// "compare like-for-like" rule, and the failure is silent because both sides
+	// are valid numbers. Non-matching invoices are simply left open and the
+	// money stays as credit_remaining, which is recoverable; a wrong allocation
+	// is not.
+	//
+	// IS NOT DISTINCT FROM, not '=': currency_id is nullable on both sides and
+	// `NULL = NULL` is NULL, so plain equality would refuse to settle the
+	// ordinary case where neither the payment nor the invoice names a currency.
 	rows, err := tx.Query(fmt.Sprintf(`SELECT id::text, invoice_number, total_amount - COALESCE(amount_paid,0) AS due
 		FROM %s WHERE %s=$1 AND tenant_id=$2 AND deleted_at IS NULL
 		  AND status NOT IN ('draft','cancelled') AND (total_amount - COALESCE(amount_paid,0)) > 0.001
-		ORDER BY invoice_date ASC, created_at ASC`, table, contactCol), contactID, tenantID)
+		  AND currency_id IS NOT DISTINCT FROM $3
+		ORDER BY invoice_date ASC, created_at ASC`, table, contactCol), contactID, tenantID, currencyIDPtr)
 	if err != nil {
 		h.log.Error("register payment: load open invoices", "error", err)
 		response.InternalError(c, "Failed to allocate payment")

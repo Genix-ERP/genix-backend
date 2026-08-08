@@ -1208,6 +1208,12 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Solishtirish (partner reconciliation) — static paths, resolved by gin
 		// ahead of the /:id param route below.
 		payments.GET("/summary", h.GetPaymentsSummary)
+		// Lost in merge 5cf27e9 (2026-08-03), which took the dev side of this
+		// block and dropped only /register — the handler has been dead code in
+		// the tree ever since, and the web create modal's DEFAULT path (no
+		// invoice selected) has 404'd on genix and sharja. Static, so gin
+		// resolves it ahead of the /:id param route below.
+		payments.POST("/register", h.perm.Require("finance", "payment", "create"), h.RegisterPartnerPayment)
 		payments.GET("/partner-balances", h.GetPartnerBalances)
 		payments.GET("/partner-ledger", h.GetPartnerLedger)
 		payments.POST("/reconcile", h.perm.Require("finance", "payment", "update"), h.ReconcilePartnerCredit)

@@ -3958,11 +3958,24 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		}
 	}
 
+	// payment_method_id was declared on CreatePaymentInput and never written, so
+	// the "To'lov usuli" dropdown both clients render was decorative. The column
+	// is a real FK (migration 002) and payment_methods is seeded per tenant
+	// (migration 154) and served by GET /payment-methods, so the field is wired
+	// up rather than deleted. Still nullable — callers that omit it are
+	// unaffected.
+	var paymentMethodIDPtr *uuid.UUID
+	if input.PaymentMethodID != nil && *input.PaymentMethodID != "" {
+		if parsed, perr := uuid.Parse(*input.PaymentMethodID); perr == nil && parsed != uuid.Nil {
+			paymentMethodIDPtr = &parsed
+		}
+	}
+
 	query := `
 		INSERT INTO payments (
 			id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
-			currency_id, exchange_rate, reference, notes, status, bank_account_id, journal_id, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			currency_id, exchange_rate, reference, notes, status, bank_account_id, journal_id, payment_method_id, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 	`
 
 	// Try inserting with incrementing payment number, retry on duplicate
@@ -3988,7 +4001,7 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 
 		_, err = h.db.Exec(query,
 			id, tenantID, orgIDPtr, paymentNumber, input.Type, contactID, paymentDate, input.Amount,
-			currencyIDPtr, exchangeRate, reference, notes, "draft", bankAccountID, journalIDPtr, userID, now, now)
+			currencyIDPtr, exchangeRate, reference, notes, "draft", bankAccountID, journalIDPtr, paymentMethodIDPtr, userID, now, now)
 
 		if err == nil {
 			break
