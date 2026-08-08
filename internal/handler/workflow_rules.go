@@ -1053,7 +1053,7 @@ func (h *Handler) checkOverdueInvoices(tenantID uuid.UUID) {
 		SELECT si.id, si.invoice_number, COALESCE(si.customer_name, c.name, ''), si.total_amount, si.due_date
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON c.id = si.customer_id
-		WHERE si.tenant_id = $1 AND si.status IN ('sent', 'partial', 'overdue')
+		WHERE si.tenant_id = $1 AND si.status IN ('sent', 'partial')
 		  AND si.amount_paid < si.total_amount
 		  AND si.due_date < $2 AND si.deleted_at IS NULL
 	`, tenantID, time.Now())

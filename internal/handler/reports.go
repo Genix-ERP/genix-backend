@@ -2838,7 +2838,7 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		SELECT COUNT(*), COALESCE(SUM(amount_due), 0)
 		FROM sales_invoices
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-		  AND status IN ('sent', 'partial', 'overdue') AND amount_due > 0
+		  AND status IN ('sent', 'partial') AND amount_due > 0
 		  AND due_date < CURRENT_DATE`,
 		tenantID).Scan(&salesOverdueCount, &salesOverdueSum)
 

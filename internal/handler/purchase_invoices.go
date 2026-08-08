@@ -46,76 +46,26 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			   c.name as vendor_name,
 			   pi.purchase_order_id, po.order_number as po_number,
 			   pi.goods_receipt_id, gr.gr_number as gr_number,
-			   COALESCE(pi.invoice_type, 'invoice') as invoice_type, pi.original_invoice_id, pi.reason
+			   COALESCE(pi.invoice_type, 'invoice') as invoice_type, pi.original_invoice_id, pi.reason,
+			   ` + invoiceOverdueSQL("pi") + ` AS is_overdue
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		LEFT JOIN purchase_orders po ON pi.purchase_order_id = po.id
 		LEFT JOIN goods_receipts gr ON pi.goods_receipt_id = gr.id
 		WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL`
-	countQuery := `SELECT COUNT(*) FROM purchase_invoices WHERE tenant_id = $1 AND deleted_at IS NULL`
+	// COUNT takes the SAME FROM and alias as the list, so the vendor-name search
+	// resolves and the two strings stay textually parallel — the old count used
+	// bare column names and no joins, which is how they drift.
+	countQuery := `SELECT COUNT(*)
+		FROM purchase_invoices pi
+		LEFT JOIN contacts c ON pi.vendor_id = c.id
+		WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL`
+
 	args := []interface{}{tenantID}
-	argCount := 1
-
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND pi.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND organization_id = $%d", argCount)
-		args = append(args, orgID)
-	}
-
-	// Filter by status
-	if status := c.Query("status"); status != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND pi.status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND status = $%d", argCount)
-		args = append(args, status)
-	}
-
-	// Filter by vendor_id
-	if vendorID := c.Query("vendor_id"); vendorID != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND pi.vendor_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND vendor_id = $%d", argCount)
-		args = append(args, vendorID)
-	}
-
-	// Filter by date range
-	if dateFrom := c.Query("date_from"); dateFrom != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND pi.invoice_date >= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND invoice_date >= $%d", argCount)
-		args = append(args, dateFrom)
-	}
-	if dateTo := c.Query("date_to"); dateTo != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND pi.invoice_date <= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND invoice_date <= $%d", argCount)
-		args = append(args, dateTo)
-	}
-
-	// Filter overdue invoices
-	if overdue := c.Query("overdue"); overdue == "true" {
-		baseQuery += " AND pi.due_date < CURRENT_DATE AND pi.status NOT IN ('paid', 'cancelled')"
-		countQuery += " AND due_date < CURRENT_DATE AND status NOT IN ('paid', 'cancelled')"
-	}
-
-	// Filter by invoice_type (invoice or debit_note)
-	if invoiceType := c.Query("invoice_type"); invoiceType != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND COALESCE(pi.invoice_type, 'invoice') = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND COALESCE(invoice_type, 'invoice') = $%d", argCount)
-		args = append(args, invoiceType)
-	}
-
-	// Search
-	if search := c.Query("search"); search != "" {
-		argCount++
-		searchPattern := "%" + strings.ToLower(search) + "%"
-		baseQuery += fmt.Sprintf(" AND (LOWER(pi.invoice_number) LIKE $%d OR LOWER(pi.vendor_invoice_number) LIKE $%d)", argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (LOWER(invoice_number) LIKE $%d OR LOWER(vendor_invoice_number) LIKE $%d)", argCount, argCount)
-		args = append(args, searchPattern)
-	}
+	where := purchaseInvoiceWhere(c, &args)
+	baseQuery += where
+	countQuery += where
+	argCount := len(args)
 
 	// Get total count
 	var total int
@@ -126,7 +76,11 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 	}
 
 	// Add sorting and pagination
-	baseQuery += fmt.Sprintf(" ORDER BY pi.created_at DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	// pi.id DESC tiebreaker: created_at is not unique — a seed, an import, or a
+	// PO->bill conversion writes several invoices in the same instant — and
+	// without a unique second key LIMIT/OFFSET may repeat a row on one page and
+	// skip another entirely.
+	baseQuery += fmt.Sprintf(" ORDER BY pi.created_at DESC, pi.id DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
 	args = append(args, pageSize, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
@@ -138,7 +92,6 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 	defer rows.Close()
 
 	var invoices []map[string]interface{}
-	today := time.Now().Truncate(24 * time.Hour)
 	for rows.Next() {
 		var id, tenantIDScan, vendorID uuid.UUID
 		var invoiceNumber, status, threeWayMatchStatus string
@@ -151,6 +104,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 		var poNumber, grNumber sql.NullString
 		var invoiceType string
 		var originalInvoiceID, reason sql.NullString
+		var isOverdue bool
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &invoiceNumber, &vendorID, &vendorInvoiceNumber,
@@ -161,16 +115,15 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			&purchaseOrderID, &poNumber,
 			&goodsReceiptID, &grNumber,
 			&invoiceType, &originalInvoiceID, &reason,
+			&isOverdue,
 		)
 		if err != nil {
 			continue
 		}
 
-		// Compute is_overdue: due_date < today AND status not paid/cancelled
-		isOverdue := false
-		if !dueDate.IsZero() && dueDate.Before(today) && status != "paid" && status != "cancelled" {
-			isOverdue = true
-		}
+		// is_overdue now arrives from SQL (invoiceOverdueSQL), the same
+		// expression the overdue=true filter uses, so the flag and the filter
+		// cannot disagree about the same row.
 
 		// amount_residual = total_amount - amount_paid (remaining unpaid)
 		amountResidual := totalAmount - amountPaid
@@ -179,26 +132,26 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 		}
 
 		invoice := map[string]interface{}{
-			"id":                    id.String(),
-			"tenant_id":             tenantIDScan.String(),
-			"invoice_number":        invoiceNumber,
-			"vendor_id":             vendorID.String(),
-			"partner_id":            vendorID.String(), // Alias for frontend compatibility
-			"invoice_date":          invoiceDate.Format("2006-01-02"),
-			"due_date":              dueDate.Format("2006-01-02"),
-			"subtotal":              subtotal,
-			"discount_amount":       discountAmount,
-			"tax_amount":            taxAmount,
-			"total_amount":          totalAmount,
-			"amount_paid":           amountPaid,
-			"amount_due":            amountDue,
-			"amount_residual":       amountResidual,
-			"is_overdue":            isOverdue,
-			"status":                status,
+			"id":                     id.String(),
+			"tenant_id":              tenantIDScan.String(),
+			"invoice_number":         invoiceNumber,
+			"vendor_id":              vendorID.String(),
+			"partner_id":             vendorID.String(), // Alias for frontend compatibility
+			"invoice_date":           invoiceDate.Format("2006-01-02"),
+			"due_date":               dueDate.Format("2006-01-02"),
+			"subtotal":               subtotal,
+			"discount_amount":        discountAmount,
+			"tax_amount":             taxAmount,
+			"total_amount":           totalAmount,
+			"amount_paid":            amountPaid,
+			"amount_due":             amountDue,
+			"amount_residual":        amountResidual,
+			"is_overdue":             isOverdue,
+			"status":                 status,
 			"three_way_match_status": threeWayMatchStatus,
-			"invoice_type":          invoiceType,
-			"created_at":            createdAt,
-			"updated_at":            updatedAt,
+			"invoice_type":           invoiceType,
+			"created_at":             createdAt,
+			"updated_at":             updatedAt,
 		}
 
 		if taxRateIDStr.Valid {
@@ -682,10 +635,10 @@ func (h *Handler) UpdatePurchaseInvoice(c *gin.Context) {
 	}
 
 	var input struct {
-		Status      string   `json:"status"`
-		Notes       string   `json:"notes"`
-		DueDate     string   `json:"due_date"`
-		AmountPaid  *float64 `json:"amount_paid"`
+		Status     string   `json:"status"`
+		Notes      string   `json:"notes"`
+		DueDate    string   `json:"due_date"`
+		AmountPaid *float64 `json:"amount_paid"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -1859,30 +1812,27 @@ func (h *Handler) GetPurchaseInvoiceStats(c *gin.Context) {
 		return
 	}
 
-	baseWhere := "WHERE tenant_id = $1 AND deleted_at IS NULL"
+	// The SAME filters the list applies, so the summary cards always describe
+	// the rows underneath them. This endpoint used to read only tenant and
+	// organization, so searching or filtering the list left the cards showing
+	// whole-tenant figures that could never be reconciled with what was visible.
 	args := []interface{}{tenantID}
-	argCount := 1
-
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		baseWhere += fmt.Sprintf(" AND organization_id = $%d", argCount)
-		args = append(args, orgID)
-	}
+	baseWhere := "WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL" + purchaseInvoiceWhere(c, &args)
 
 	query := fmt.Sprintf(`
 		SELECT
 			COUNT(*) AS total_count,
-			COALESCE(SUM(total_amount), 0) AS total_amount,
-			COUNT(*) FILTER (WHERE status NOT IN ('paid', 'cancelled') AND (amount_paid IS NULL OR amount_paid = 0)) AS unpaid_count,
-			COALESCE(SUM(total_amount - COALESCE(amount_paid, 0)) FILTER (WHERE status NOT IN ('paid', 'cancelled') AND (amount_paid IS NULL OR amount_paid = 0)), 0) AS unpaid_amount,
-			COUNT(*) FILTER (WHERE status NOT IN ('paid', 'cancelled') AND amount_paid > 0 AND amount_paid < total_amount) AS partial_count,
-			COALESCE(SUM(total_amount - COALESCE(amount_paid, 0)) FILTER (WHERE status NOT IN ('paid', 'cancelled') AND amount_paid > 0 AND amount_paid < total_amount), 0) AS partial_amount,
-			COUNT(*) FILTER (WHERE due_date < CURRENT_DATE AND status NOT IN ('paid', 'cancelled')) AS overdue_count,
-			COALESCE(SUM(total_amount - COALESCE(amount_paid, 0)) FILTER (WHERE due_date < CURRENT_DATE AND status NOT IN ('paid', 'cancelled')), 0) AS overdue_amount
-		FROM purchase_invoices
+			COALESCE(SUM(pi.total_amount), 0) AS total_amount,
+			COUNT(*) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND (pi.amount_paid IS NULL OR pi.amount_paid = 0)) AS unpaid_count,
+			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND (pi.amount_paid IS NULL OR pi.amount_paid = 0)), 0) AS unpaid_amount,
+			COUNT(*) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND pi.amount_paid > 0 AND pi.amount_paid < pi.total_amount) AS partial_count,
+			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND pi.amount_paid > 0 AND pi.amount_paid < pi.total_amount), 0) AS partial_amount,
+			COUNT(*) FILTER (WHERE %s) AS overdue_count,
+			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE %s), 0) AS overdue_amount
+		FROM purchase_invoices pi
+		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		%s
-	`, baseWhere)
+	`, invoiceOverdueSQL("pi"), invoiceOverdueSQL("pi"), baseWhere)
 
 	var totalCount int
 	var totalAmount, unpaidAmount, partialAmount, overdueAmount float64

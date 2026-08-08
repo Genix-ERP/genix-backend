@@ -386,7 +386,7 @@ func (h *Handler) checkCustomerInvoicesOverdue() {
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.due_date < CURRENT_DATE
-		  AND si.status IN ('sent', 'partial', 'overdue')
+		  AND si.status IN ('sent', 'partial')
 		  AND si.amount_paid < si.total_amount
 		  AND COALESCE(si.overdue_notified, false) = false
 		  AND si.deleted_at IS NULL
