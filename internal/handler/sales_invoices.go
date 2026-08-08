@@ -70,90 +70,28 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 				   JOIN payments p ON pa.payment_id = p.id
 				   JOIN journals j ON p.journal_id = j.id
 				   WHERE pa.document_id = si.id AND pa.document_type = 'sales_invoice' AND p.status = 'confirmed'
-			   ), '') as payment_journals_en
+			   ), '') as payment_journals_en,
+			   ` + invoiceOverdueSQL("si") + ` AS is_overdue,
+			   ` + invoiceDaysOverdueSQL("si") + ` AS days_overdue,
+			   (` + invoicePaymentStatusSQL("si") + `) AS payment_status
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		LEFT JOIN sales_orders so ON si.sales_order_id = so.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
-	countQuery := `SELECT COUNT(*) FROM sales_invoices si WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
+	countQuery := `SELECT COUNT(*)
+		FROM sales_invoices si
+		LEFT JOIN contacts c ON si.customer_id = c.id
+		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL`
 	args := []interface{}{tenantID}
-	argCount := 1
 
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND si.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND si.organization_id = $%d", argCount)
-		args = append(args, orgID)
-	}
-
-	// Comma-separated, matched with = ANY(): "Tasdiqlangan" in the UI means
-	// confirmed AND posted (a posted invoice is also confirmed), which a single
-	// `status = $n` cannot express. One value still behaves exactly as before.
-	if clause := invoiceStatusFilter(c.Query("status"), "si", &args); clause != "" {
-		argCount = len(args)
-		baseQuery += clause
-		countQuery += clause
-	}
-
-	// Filter by customer_id
-	if customerID := c.Query("customer_id"); customerID != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND si.customer_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND si.customer_id = $%d", argCount)
-		args = append(args, customerID)
-	}
-
-	// Filter by date range
-	if dateFrom := c.Query("date_from"); dateFrom != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND si.invoice_date >= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND si.invoice_date >= $%d", argCount)
-		args = append(args, dateFrom)
-	}
-	if dateTo := c.Query("date_to"); dateTo != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND si.invoice_date <= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND si.invoice_date <= $%d", argCount)
-		args = append(args, dateTo)
-	}
-
-	// Filter by due date range
-	if dueFrom := c.Query("due_from"); dueFrom != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND si.due_date >= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND si.due_date >= $%d", argCount)
-		args = append(args, dueFrom)
-	}
-	if dueTo := c.Query("due_to"); dueTo != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND si.due_date <= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND si.due_date <= $%d", argCount)
-		args = append(args, dueTo)
-	}
-
-	// Filter overdue invoices
-	if overdue := c.Query("overdue"); overdue == "true" {
-		baseQuery += " AND si.due_date < CURRENT_DATE AND si.status NOT IN ('paid', 'cancelled')"
-		countQuery += " AND si.due_date < CURRENT_DATE AND si.status NOT IN ('paid', 'cancelled')"
-	}
-
-	// Filter by invoice_type (invoice or credit_note)
-	if invoiceType := c.Query("invoice_type"); invoiceType != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND COALESCE(si.invoice_type, 'invoice') = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND COALESCE(si.invoice_type, 'invoice') = $%d", argCount)
-		args = append(args, invoiceType)
-	}
-
-	// Search - also search by customer name
-	if search := c.Query("search"); search != "" {
-		argCount++
-		searchPattern := "%" + strings.ToLower(search) + "%"
-		baseQuery += fmt.Sprintf(" AND (LOWER(si.invoice_number) LIKE $%d OR LOWER(si.reference) LIKE $%d OR LOWER(si.po_number) LIKE $%d OR LOWER(c.name) LIKE $%d)", argCount, argCount, argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (LOWER(si.invoice_number) LIKE $%d OR LOWER(si.reference) LIKE $%d OR LOWER(si.po_number) LIKE $%d)", argCount, argCount, argCount)
-		args = append(args, searchPattern)
-	}
+	// One predicate for the list, its COUNT and the AR summary — same reason
+	// purchaseInvoiceWhere exists. This also brings payment_status filtering,
+	// which the row field has always exposed but no query parameter could reach,
+	// so both clients were filtering a single loaded page instead.
+	where := salesInvoiceWhere(c, &args)
+	baseQuery += where
+	countQuery += where
+	argCount := len(args)
 
 	// Get total count
 	var total int
@@ -198,6 +136,9 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		var earlyDiscountDate sql.NullTime
 		var paymentJournals, paymentJournalsUz, paymentJournalsEn string
 		var orderNumber string
+		var isOverdue bool
+		var daysOverdue int
+		var paymentStatus string
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &organizationID, &invoiceNumber, &customerID, &salesOrderID,
@@ -211,41 +152,40 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			&paymentTermID, &earlyDiscountAmount, &earlyDiscountDate,
 			&orderNumber,
 			&paymentJournals, &paymentJournalsUz, &paymentJournalsEn,
+			&isOverdue, &daysOverdue, &paymentStatus,
 		)
 		if err != nil {
 			continue
 		}
 
-		// Determine payment status based on amounts
-		paymentStatus := "unpaid"
-		if amountPaid >= totalAmount && totalAmount > 0 {
-			paymentStatus = "paid"
-		} else if amountPaid > 0 {
-			paymentStatus = "partial"
-		}
+		// is_overdue, days_overdue and payment_status now arrive from SQL — the
+		// same expressions their filters use, so a row can never come back
+		// contradicting the filter that selected it.
 
 		invoice := map[string]interface{}{
-			"id":              id.String(),
-			"tenant_id":       tenantIDScan.String(),
-			"invoice_number":  invoiceNumber,
-			"customer_id":     customerID.String(),
-			"customer_name":   customerName,
-			"invoice_date":    invoiceDate.Format("2006-01-02"),
-			"due_date":        dueDate.Format("2006-01-02"),
-			"exchange_rate":   exchangeRate,
-			"subtotal":        subtotal,
-			"discount_amount": discountAmount,
-			"tax_amount":      taxAmount,
-			"total_amount":    totalAmount,
-			"amount_paid":     amountPaid,
-			"amount_due":      amountDue,
-			"balance":         amountDue, // Add balance as alias for amount_due for frontend compatibility
-			"status":          status,
-			"payment_status":  paymentStatus,
-			"invoice_type":      invoiceType,
-			"order_number":      orderNumber,
-			"created_at":        createdAt,
-			"updated_at":        updatedAt,
+			"id":                  id.String(),
+			"tenant_id":           tenantIDScan.String(),
+			"invoice_number":      invoiceNumber,
+			"customer_id":         customerID.String(),
+			"customer_name":       customerName,
+			"invoice_date":        invoiceDate.Format("2006-01-02"),
+			"due_date":            dueDate.Format("2006-01-02"),
+			"exchange_rate":       exchangeRate,
+			"subtotal":            subtotal,
+			"discount_amount":     discountAmount,
+			"tax_amount":          taxAmount,
+			"total_amount":        totalAmount,
+			"amount_paid":         amountPaid,
+			"amount_due":          amountDue,
+			"balance":             amountDue, // Add balance as alias for amount_due for frontend compatibility
+			"status":              status,
+			"payment_status":      paymentStatus,
+			"is_overdue":          isOverdue,
+			"days_overdue":        daysOverdue,
+			"invoice_type":        invoiceType,
+			"order_number":        orderNumber,
+			"created_at":          createdAt,
+			"updated_at":          updatedAt,
 			"payment_journals":    paymentJournals,
 			"payment_journals_uz": paymentJournalsUz,
 			"payment_journals_en": paymentJournalsEn,
@@ -509,7 +449,7 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	for i, line := range input.Lines {
 		lineID := uuid.New()
 
-		lineTotal := line.Quantity * line.UnitPrice - line.DiscountAmount
+		lineTotal := line.Quantity*line.UnitPrice - line.DiscountAmount
 
 		var productID, unitID, taxID, salesOrderLineID, accountID *uuid.UUID
 		if line.ProductID != "" {
@@ -1182,13 +1122,13 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 
 	// Get invoice lines for per-category accounting
 	type invoiceLineAcct struct {
-		ProductID    uuid.UUID
-		LineTotal    float64
-		Quantity     float64
-		CostPrice    float64
-		IncomeAcct   uuid.UUID
-		ExpenseAcct  uuid.UUID
-		OutputAcct   uuid.UUID
+		ProductID   uuid.UUID
+		LineTotal   float64
+		Quantity    float64
+		CostPrice   float64
+		IncomeAcct  uuid.UUID
+		ExpenseAcct uuid.UUID
+		OutputAcct  uuid.UUID
 	}
 	var invoiceLines []invoiceLineAcct
 	lineRows, lineErr := tx.Query(`
@@ -2355,13 +2295,13 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 
 		// Get invoice lines for COGS
 		type lineAcct struct {
-			ProductID  uuid.UUID
-			LineTotal  float64
-			Quantity   float64
-			CostPrice  float64
-			IncomeAcct uuid.UUID
+			ProductID   uuid.UUID
+			LineTotal   float64
+			Quantity    float64
+			CostPrice   float64
+			IncomeAcct  uuid.UUID
 			ExpenseAcct uuid.UUID
-			OutputAcct uuid.UUID
+			OutputAcct  uuid.UUID
 		}
 		var acctLines []lineAcct
 		lineRows, err := h.db.Query(`

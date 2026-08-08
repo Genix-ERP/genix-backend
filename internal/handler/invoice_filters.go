@@ -108,3 +108,97 @@ func purchaseInvoiceWhere(c *gin.Context, args *[]interface{}) string {
 	}
 	return where
 }
+
+// invoicePaymentStatusSQL is the ONE definition of payment_status, used both for
+// the row field and for the payment_status= filter.
+//
+// ListSalesInvoices computed this in Go and offered no way to filter on it, so
+// both clients filtered the loaded page instead — on mobile, with page_size 10,
+// "Qisman" searched ten invoices rather than the tenant's. Deriving the filter
+// from a second copy of the rule would recreate exactly the two-clocks bug that
+// invoiceOverdueSQL exists to prevent, so the predicate and the field are the
+// same expression.
+func invoicePaymentStatusSQL(alias string) string {
+	return fmt.Sprintf(`CASE
+		WHEN COALESCE(%s.amount_paid, 0) >= %s.total_amount AND %s.total_amount > 0 THEN 'paid'
+		WHEN COALESCE(%s.amount_paid, 0) > 0 THEN 'partial'
+		ELSE 'unpaid' END`, alias, alias, alias, alias)
+}
+
+// invoicePaymentStatusFilter matches a comma-separated payment_status list
+// against the expression above.
+func invoicePaymentStatusFilter(raw, alias string, args *[]interface{}) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parts := make([]string, 0, 3)
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			parts = append(parts, strings.ToLower(p))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	*args = append(*args, pq.Array(parts))
+	return fmt.Sprintf(" AND (%s) = ANY($%d)", invoicePaymentStatusSQL(alias), len(*args))
+}
+
+// invoiceDaysOverdueSQL is positive when an invoice is past due and NEGATIVE
+// when it is not yet due — the mobile card reads the sign to choose between
+// "N kun oldin" and "N kun qoldi". Same expression the aging reports use
+// (reports.go), against CURRENT_DATE rather than an as-of parameter.
+func invoiceDaysOverdueSQL(alias string) string {
+	return fmt.Sprintf("COALESCE((CURRENT_DATE - %s.due_date)::int, 0)", alias)
+}
+
+// salesInvoiceWhere is the sales twin of purchaseInvoiceWhere: one predicate for
+// the list, its COUNT and the AR summary, so the cards and the rows underneath
+// them always describe the same set.
+// Callers bind tenantID as $1 and must have `si` plus a `contacts c` join.
+func salesInvoiceWhere(c *gin.Context, args *[]interface{}) string {
+	where := ""
+
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		*args = append(*args, orgID)
+		where += fmt.Sprintf(" AND si.organization_id = $%d", len(*args))
+	}
+	where += invoiceStatusFilter(c.Query("status"), "si", args)
+	where += invoicePaymentStatusFilter(c.Query("payment_status"), "si", args)
+
+	if v := strings.TrimSpace(c.Query("customer_id")); v != "" {
+		*args = append(*args, v)
+		where += fmt.Sprintf(" AND si.customer_id = $%d", len(*args))
+	}
+	if v := strings.TrimSpace(c.Query("date_from")); v != "" {
+		*args = append(*args, v)
+		where += fmt.Sprintf(" AND si.invoice_date >= $%d", len(*args))
+	}
+	if v := strings.TrimSpace(c.Query("date_to")); v != "" {
+		*args = append(*args, v)
+		where += fmt.Sprintf(" AND si.invoice_date <= $%d", len(*args))
+	}
+	if v := strings.TrimSpace(c.Query("due_from")); v != "" {
+		*args = append(*args, v)
+		where += fmt.Sprintf(" AND si.due_date >= $%d", len(*args))
+	}
+	if v := strings.TrimSpace(c.Query("due_to")); v != "" {
+		*args = append(*args, v)
+		where += fmt.Sprintf(" AND si.due_date <= $%d", len(*args))
+	}
+	if c.Query("overdue") == "true" {
+		where += " AND " + invoiceOverdueSQL("si")
+	}
+	if v := strings.TrimSpace(c.Query("invoice_type")); v != "" {
+		*args = append(*args, v)
+		where += fmt.Sprintf(" AND COALESCE(si.invoice_type, 'invoice') = $%d", len(*args))
+	}
+	if v := strings.TrimSpace(c.Query("search")); v != "" {
+		*args = append(*args, "%"+strings.ToLower(v)+"%")
+		n := len(*args)
+		where += fmt.Sprintf(
+			" AND (LOWER(si.invoice_number) LIKE $%d OR LOWER(COALESCE(c.name,'')) LIKE $%d)", n, n)
+	}
+	return where
+}
