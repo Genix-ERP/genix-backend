@@ -750,6 +750,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	invoices.Use(h.perm.Require("sales", "invoice", "read"))
 	{
 		invoices.GET("", h.ListSalesInvoices)
+		// Static, so gin resolves it ahead of the /:id wildcard below — after
+		// /:id it would fall through to GetSalesInvoice with id="summary" and
+		// fail the uuid cast.
+		invoices.GET("/summary", h.GetSalesInvoicesSummary)
 		invoices.POST("", h.perm.Require("sales", "invoice", "create"), h.CreateSalesInvoice)
 		invoices.GET("/:id", h.GetSalesInvoice)
 		invoices.PUT("/:id", h.perm.Require("sales", "invoice", "update"), h.UpdateSalesInvoice)
@@ -758,6 +762,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		invoices.POST("/:id/record-payment", h.perm.Require("sales", "invoice", "update"), h.RecordPayment)
 		invoices.POST("/:id/credit-note", h.perm.Require("sales", "invoice", "create"), h.CreateCreditNote)
 		invoices.POST("/:id/confirm-credit-note", h.perm.Require("sales", "invoice", "update"), h.ConfirmCreditNote)
+	}
+
+	// Supplier stat cards. There is no /suppliers LIST endpoint — the clients
+	// read /contacts?type=vendor — but mobile is written against this path, and
+	// the handler scopes to the same rows (type IN ('vendor','both')).
+	suppliers := rg.Group("/suppliers")
+	suppliers.Use(h.perm.Require("purchase", "vendor", "read"))
+	{
+		suppliers.GET("/stats", h.GetSupplierStats)
 	}
 
 	// Sales Returns

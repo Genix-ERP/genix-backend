@@ -105,6 +105,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 		var invoiceType string
 		var originalInvoiceID, reason sql.NullString
 		var isOverdue bool
+		var daysOverdue int
 
 		err := rows.Scan(
 			&id, &tenantIDScan, &invoiceNumber, &vendorID, &vendorInvoiceNumber,
@@ -115,7 +116,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			&purchaseOrderID, &poNumber,
 			&goodsReceiptID, &grNumber,
 			&invoiceType, &originalInvoiceID, &reason,
-			&isOverdue,
+			&isOverdue, &daysOverdue,
 		)
 		if err != nil {
 			continue
@@ -147,6 +148,7 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			"amount_due":             amountDue,
 			"amount_residual":        amountResidual,
 			"is_overdue":             isOverdue,
+			"days_overdue":           daysOverdue,
 			"status":                 status,
 			"three_way_match_status": threeWayMatchStatus,
 			"invoice_type":           invoiceType,
@@ -409,7 +411,9 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 			   c.name as vendor_name,
 			   COALESCE(pi.invoice_type, 'invoice') as invoice_type, pi.original_invoice_id, pi.reason,
 			   pi.currency_id, COALESCE(pi.exchange_rate, 1) as exchange_rate,
-			   COALESCE(cur.code, '') as currency_code
+			   COALESCE(cur.code, '') as currency_code,
+			   ` + invoiceOverdueSQL("pi") + ` AS is_overdue,
+			   ` + invoiceDaysOverdueSQL("pi") + ` AS days_overdue
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		LEFT JOIN currencies cur ON pi.currency_id = cur.id
@@ -426,6 +430,10 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 	var piCurrencyID sql.NullString
 	var piExchangeRate float64
 	var piCurrencyCode string
+	// §5: the detail carried no is_overdue, so the sheet had to recompute it
+	// client-side and could contradict the list it was opened from.
+	var isOverdue bool
+	var daysOverdue int
 
 	err = h.db.QueryRow(query, invoiceID, tenantID).Scan(
 		&id, &tenantIDScan, &invoiceNumber, &vendorID, &vendorInvoiceNumber,
@@ -435,6 +443,7 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 		&vendorName,
 		&invoiceType, &originalInvoiceID, &reason,
 		&piCurrencyID, &piExchangeRate, &piCurrencyCode,
+		&isOverdue, &daysOverdue,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Purchase invoice")
@@ -463,6 +472,8 @@ func (h *Handler) GetPurchaseInvoice(c *gin.Context) {
 		"status":                 status,
 		"three_way_match_status": threeWayMatchStatus,
 		"invoice_type":           invoiceType,
+		"is_overdue":             isOverdue,
+		"days_overdue":           daysOverdue,
 		"created_at":             createdAt,
 		"updated_at":             updatedAt,
 	}
