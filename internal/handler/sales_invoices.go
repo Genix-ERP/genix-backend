@@ -87,12 +87,13 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 		args = append(args, orgID)
 	}
 
-	// Filter by status
-	if status := c.Query("status"); status != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND si.status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND si.status = $%d", argCount)
-		args = append(args, status)
+	// Comma-separated, matched with = ANY(): "Tasdiqlangan" in the UI means
+	// confirmed AND posted (a posted invoice is also confirmed), which a single
+	// `status = $n` cannot express. One value still behaves exactly as before.
+	if clause := invoiceStatusFilter(c.Query("status"), "si", &args); clause != "" {
+		argCount = len(args)
+		baseQuery += clause
+		countQuery += clause
 	}
 
 	// Filter by customer_id
@@ -163,7 +164,10 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 	}
 
 	// Add sorting and pagination
-	baseQuery += fmt.Sprintf(" ORDER BY si.created_at DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
+	// si.id DESC tiebreaker — created_at is not unique (seed, import, order->
+	// invoice conversion), and without a unique second key LIMIT/OFFSET repeats
+	// rows on one page and skips them on another.
+	baseQuery += fmt.Sprintf(" ORDER BY si.created_at DESC, si.id DESC LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
 	args = append(args, pageSize, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
@@ -2281,7 +2285,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 		WHERE si.tenant_id = $1
 			AND si.journal_entry_id IS NULL
 			AND si.invoice_number NOT LIKE 'CN-%'
-			AND si.status IN ('sent', 'paid', 'partial', 'partially_paid', 'overdue')
+			AND si.status IN ('sent', 'paid', 'partial', 'partially_paid')
 			AND si.deleted_at IS NULL
 		ORDER BY si.created_at
 	`, tenantID)
