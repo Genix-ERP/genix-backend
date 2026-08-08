@@ -9458,9 +9458,10 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		       b.budget_type, b.total_amount, b.status, b.approved_by, b.approved_at,
 		       b.created_by, b.created_at, b.updated_at,
 		       COALESCE(b.start_date, fy.start_date), COALESCE(b.end_date, fy.end_date),
-		       COALESCE(b.warning_threshold, 80)
+		       COALESCE(b.warning_threshold, 80),
+		       roll.planned, roll.actual
 		FROM budgets b
-		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
+		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id` + budgetRollupSQL + `
 		` + budgetsBaseWhere
 
 	args := []interface{}{tenantID}
@@ -9501,12 +9502,13 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		var approvedAt sql.NullTime
 		var startDate, endDate sql.NullString
 		var warningThreshold float64
+		var planned, actual float64
 
 		err := rows.Scan(
 			&b.ID, &b.TenantID, &orgID, &b.FiscalYearID, &b.Code, &b.Name, &desc,
 			&b.BudgetType, &b.TotalAmount, &b.Status, &approvedBy, &approvedAt,
 			&createdBy, &b.CreatedAt, &b.UpdatedAt,
-			&startDate, &endDate, &warningThreshold,
+			&startDate, &endDate, &warningThreshold, &planned, &actual,
 		)
 		if err != nil {
 			continue
@@ -9538,6 +9540,18 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		}
 		b.WarningThreshold = warningThreshold
 
+		// planned stays as-is (0 when the budget has no lines) so the client can
+		// tell "no lines" from "lines summing to zero" and fall back to
+		// total_amount itself. variance uses the fallback so it is never
+		// misleading: planned 0 minus a real actual would read as a huge overrun.
+		b.PlannedAmount = planned
+		b.ActualAmount = actual
+		effectivePlanned := planned
+		if effectivePlanned == 0 {
+			effectivePlanned = b.TotalAmount
+		}
+		b.Variance = effectivePlanned - actual
+
 		budgets = append(budgets, &b)
 	}
 
@@ -9547,6 +9561,9 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 	}
 
 	var total int
+	// No rollup in the count: LEFT JOIN LATERAL cannot change the row count, and
+	// running the journal aggregation just to discard it would double the cost
+	// of every paged request.
 	_ = h.db.QueryRow(`SELECT COUNT(*) FROM budgets b LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id `+budgetsBaseWhere+whereExtra, args[:argCount]...).Scan(&total)
 	response.Paginated(c, budgets, page, pageSize, total)
 }
@@ -10125,20 +10142,7 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		SELECT bl.id, bl.budget_id, bl.account_id, COALESCE(a.name, '') as account_name, COALESCE(a.code, '') as account_code,
 		       bl.fiscal_period_id, bl.department_id,
 		       bl.budgeted_amount,
-		       COALESCE((
-		           SELECT CASE
-		               WHEN COALESCE(bl.line_type, b.budget_type) = 'revenue' THEN SUM(jel.credit_amount) - SUM(jel.debit_amount)
-		               ELSE SUM(jel.debit_amount) - SUM(jel.credit_amount)
-		           END
-		           FROM journal_entry_lines jel
-		           JOIN journal_entries je ON jel.journal_entry_id = je.id
-		           WHERE jel.account_id = bl.account_id
-		             AND je.tenant_id = b.tenant_id
-		             AND je.status = 'posted'
-		             AND je.deleted_at IS NULL
-		             AND je.entry_date >= COALESCE(b.start_date, fy.start_date)
-		             AND je.entry_date <= COALESCE(b.end_date, fy.end_date)
-		       ), 0) as computed_actual,
+		       ` + budgetActualSQL + ` as computed_actual,
 		       bl.notes, COALESCE(bl.line_type, 'expense') as line_type, COALESCE(bl.category_name, '') as category_name,
 		       bl.created_at, bl.updated_at
 		` + budgetLinesFrom
@@ -11693,28 +11697,14 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 			a.name as account_name,
 			COALESCE(bl.line_type, 'expense') as line_type,
 			COALESCE(bl.budgeted_amount, 0) as planned,
-			COALESCE(
-				(SELECT
-					-- Revenue lines are credit-normal, so actual = credit - debit;
-					-- expense/other lines are debit-normal. Using a single
-					-- debit - credit made every revenue actual negative (always
-					-- "critical").
-					CASE WHEN COALESCE(bl.line_type, 'expense') = 'revenue'
-						THEN SUM(jl.credit_amount - jl.debit_amount)
-						ELSE SUM(jl.debit_amount - jl.credit_amount) END
-				 FROM journal_entry_lines jl
-				 JOIN journal_entries je ON je.id = jl.journal_entry_id
-				 WHERE jl.account_id = bl.account_id
-				   AND je.tenant_id = $2
-				   AND je.status = 'posted'
-				   AND je.entry_date >= $3::date
-				   AND je.entry_date <= $4::date), 0
-			) as actual
+			`+budgetActualSQL+` as actual
 		FROM budget_lines bl
+		JOIN budgets b ON b.id = bl.budget_id
+		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
 		JOIN accounts a ON a.id = bl.account_id
-		WHERE bl.budget_id = $1
+		WHERE bl.budget_id = $1 AND b.tenant_id = $2
 		ORDER BY bl.line_type DESC, a.code
-	`, budgetID, tenantID, budget.StartDate, budget.EndDate)
+	`, budgetID, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to get plan vs actual", "error", err)

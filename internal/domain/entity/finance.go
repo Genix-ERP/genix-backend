@@ -1092,6 +1092,14 @@ type Budget struct {
 	EndDate          *string `json:"end_date,omitempty"`
 	WarningThreshold float64 `json:"warning_threshold"`
 
+	// Rollups over the budget's lines, computed in ListBudgets so the list
+	// screen does not have to download every line to render a usage bar.
+	// PlannedAmount is 0 when the budget has no lines — the client falls back
+	// to TotalAmount; Variance already applies that fallback.
+	PlannedAmount float64 `json:"planned_amount"`
+	ActualAmount  float64 `json:"actual_amount"`
+	Variance      float64 `json:"variance"`
+
 	// New spec fields
 	Approach             string     `json:"approach" db:"approach"`                         // fixed, flexible, zero_based, rolling
 	Breakdown            string     `json:"breakdown" db:"breakdown"`                       // monthly, weekly, none
