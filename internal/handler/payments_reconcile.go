@@ -64,6 +64,13 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 			currencyIDPtr = &parsed
 		}
 	}
+
+	// The GL is kept in base currency, so the journal lines and account balances
+	// take the CONVERTED amount while payments.amount keeps what the partner
+	// actually handed over. Same convention and same direction as ConfirmPayment
+	// and purchase_invoices.go: base = amount * rate. Rate 1 (the ordinary
+	// same-currency case) leaves this untouched.
+	baseAmount := input.Amount * exchangeRate
 	contactID, err := uuid.Parse(input.ContactID)
 	if err != nil {
 		response.BadRequest(c, "Invalid contact_id")
@@ -175,7 +182,7 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	if _, err := tx.Exec(`INSERT INTO journal_entries
 		(id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description, source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'payment',$9,$13,$10,$10,'posted',$11,$12,$12)`,
-		jeID, tenantID, orgArg, journalID, entryNumber, now, nullIfEmpty(input.Notes), desc, contactID.String(), input.Amount, userID, now, exchangeRate); err != nil {
+		jeID, tenantID, orgArg, journalID, entryNumber, now, nullIfEmpty(input.Notes), desc, contactID.String(), baseAmount, userID, now, exchangeRate); err != nil {
 		h.log.Error("register payment: JE header", "error", err)
 		response.InternalError(c, "Failed to post payment")
 		return
@@ -188,11 +195,11 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	}
 	var e1, e2 error
 	if isCustomer {
-		e1 = jelInsert(cashAcct, nil, 1, input.Amount, 0)          // DR Cash
-		e2 = jelInsert(partnerAcct, contactID, 2, 0, input.Amount) // CR AR (partner)
+		e1 = jelInsert(cashAcct, nil, 1, baseAmount, 0)          // DR Cash
+		e2 = jelInsert(partnerAcct, contactID, 2, 0, baseAmount) // CR AR (partner)
 	} else {
-		e1 = jelInsert(partnerAcct, contactID, 1, input.Amount, 0) // DR AP (partner)
-		e2 = jelInsert(cashAcct, nil, 2, 0, input.Amount)          // CR Cash
+		e1 = jelInsert(partnerAcct, contactID, 1, baseAmount, 0) // DR AP (partner)
+		e2 = jelInsert(cashAcct, nil, 2, 0, baseAmount)          // CR Cash
 	}
 	if e1 != nil || e2 != nil {
 		h.log.Error("register payment: JE lines", "e1", e1, "e2", e2)
@@ -201,11 +208,11 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	}
 	// Account balances (cash debit-normal; AR debit-normal; AP credit-normal).
 	if isCustomer {
-		tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, input.Amount, now, cashAcct)
-		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, input.Amount, now, partnerAcct)
+		tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, baseAmount, now, cashAcct)
+		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, baseAmount, now, partnerAcct)
 	} else {
-		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, input.Amount, now, partnerAcct)
-		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, input.Amount, now, cashAcct)
+		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, baseAmount, now, partnerAcct)
+		tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, baseAmount, now, cashAcct)
 	}
 	tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id=$1`, journalID)
 

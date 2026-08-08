@@ -4207,6 +4207,20 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	`, id, tenantID).Scan(&status, &paymentType, &amount, &contactID, &orgID, &paymentMethodID, &paymentDate, &paymentNumber, &bankAccountIDStr, &storedJournalID,
 		&paymentExchangeRate, &paymentCurrencyID)
 
+	// The GL is kept in the tenant's base currency, so every amount that reaches
+	// journal_entry_lines or accounts.current_balance must be converted first.
+	// paymentExchangeRate was already read here and then never used in any
+	// arithmetic: a 1,000 USD payment at 12,115 debited the cash account 1,000,
+	// understating it by four orders of magnitude.
+	//
+	// base = amount * rate is the convention already used by
+	// purchase_invoices.go (baseAmount := amount * fxRate), finance_extra.go
+	// (invoiceUZS := amountDue * exchangeRate) and the exchange-difference block
+	// below (diff in base = a.Amount * rate delta) — three independent sites, so
+	// the direction is established, not guessed. A same-currency payment has
+	// rate 1 and is unchanged by the multiply.
+	baseAmount := amount * paymentExchangeRate
+
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Payment")
 		return
@@ -4373,14 +4387,19 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 	// Check cash/bank account balance for outbound payments
 	if cashAccountID != uuid.Nil && paymentType == "payment" {
 		_ = tx.QueryRow("SELECT COALESCE(current_balance, 0) FROM accounts WHERE id = $1", cashAccountID).Scan(&cashAccountBalance)
-		if cashAccountBalance < amount {
+		// Like-for-like: current_balance is in base currency, so it must be
+		// compared against the CONVERTED amount. Comparing it against the raw
+		// foreign amount made the guard meaningless — a 1,000 USD payment sailed
+		// past a 5,000,000 UZS balance that could not actually cover the
+		// 12,115,000 it needed.
+		if cashAccountBalance < baseAmount {
 			tx.Rollback()
 			var accountName, accountCode string
 			h.db.QueryRow("SELECT name, code FROM accounts WHERE id = $1", cashAccountID).Scan(&accountName, &accountCode)
 			response.BadRequest(c, fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas. Joriy balans: %s, kerakli summa: %s",
 				accountName, accountCode,
 				fmt.Sprintf("%.2f", cashAccountBalance),
-				fmt.Sprintf("%.2f", amount)))
+				fmt.Sprintf("%.2f", baseAmount)))
 			return
 		}
 	}
@@ -4496,7 +4515,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15, $16)`,
 				journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, paymentDate, paymentNumber, description,
-				sourceType, id.String(), 1.0, amount, amount, userID, now, now,
+				sourceType, id.String(), paymentExchangeRate, baseAmount, baseAmount, userID, now, now,
 			)
 
 			if jeErr != nil {
@@ -4518,7 +4537,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
 						line1ID, journalEntryID, 1, cashAccountID, debitDesc,
-						amount, 0.0, 1.0, now,
+						baseAmount, 0.0, paymentExchangeRate, now,
 					); lErr != nil {
 						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 1, "account_id", cashAccountID)
 						jeOK = false
@@ -4530,7 +4549,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 						line2ID, journalEntryID, 2, counterAccountID, contactID, creditDesc,
-						0.0, amount, 1.0, now,
+						0.0, baseAmount, paymentExchangeRate, now,
 					); lErr != nil {
 						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 2, "account_id", counterAccountID)
 						jeOK = false
@@ -4538,13 +4557,13 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 					// Update account balances
 					// Cash: debit-normal, debit increases balance
-					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID); balErr != nil {
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", baseAmount, now, cashAccountID); balErr != nil {
 						h.log.Error("Failed to update cash account balance (receipt)", "error", balErr, "account_id", cashAccountID, "amount", amount)
 					} else {
 						h.log.Info("Receipt: cash account balance updated", "account_id", cashAccountID, "amount", amount)
 					}
 					// AR: debit-normal, credit decreases balance
-					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID); balErr != nil {
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", baseAmount, now, counterAccountID); balErr != nil {
 						h.log.Error("Failed to update AR account balance (receipt)", "error", balErr, "account_id", counterAccountID, "amount", amount)
 					}
 				} else {
@@ -4558,7 +4577,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 						line1ID, journalEntryID, 1, counterAccountID, contactID, debitDesc,
-						amount, 0.0, 1.0, now,
+						baseAmount, 0.0, paymentExchangeRate, now,
 					); lErr != nil {
 						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 1, "account_id", counterAccountID)
 						jeOK = false
@@ -4570,7 +4589,7 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8, $9)`,
 						line2ID, journalEntryID, 2, cashAccountID, creditDesc,
-						0.0, amount, 1.0, now,
+						0.0, baseAmount, paymentExchangeRate, now,
 					); lErr != nil {
 						h.log.Error("Failed to insert payment JE line", "error", lErr, "line", 2, "account_id", cashAccountID)
 						jeOK = false
@@ -4578,11 +4597,11 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 
 					// Update account balances
 					// AP: credit-normal, debit decreases balance (we're paying off liability)
-					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, counterAccountID); balErr != nil {
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", baseAmount, now, counterAccountID); balErr != nil {
 						h.log.Error("Failed to update AP account balance (payment)", "error", balErr, "account_id", counterAccountID, "amount", amount)
 					}
 					// Cash: debit-normal, credit decreases balance
-					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, cashAccountID); balErr != nil {
+					if _, balErr := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", baseAmount, now, cashAccountID); balErr != nil {
 						h.log.Error("Failed to update cash account balance (payment)", "error", balErr, "account_id", cashAccountID, "amount", amount)
 					} else {
 						h.log.Info("Payment: cash account balance updated", "account_id", cashAccountID, "amount", -amount)
