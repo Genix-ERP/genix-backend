@@ -1404,6 +1404,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	budgets := rg.Group("/budgets")
 	{
 		budgets.GET("", h.ListBudgets)
+		// Static, so it resolves ahead of the sibling /:id wildcard. The four
+		// summary cards must not be assembled from a paginated list — with a
+		// page in hand the totals would describe the page, not the tenant.
+		budgets.GET("/summary", h.GetBudgetsSummary)
 		budgets.POST("", h.CreateBudget)
 		budgets.GET("/:id", h.GetBudget)
 		budgets.PUT("/:id", h.UpdateBudget)
