@@ -69,6 +69,12 @@ func (h *Handler) GetEstimateSummary(c *gin.Context) {
 		return
 	}
 
+	// Pul-yig'ma — sof-prorab rolga 403 (conventions §4).
+	if h.constructionPriceRestrictedForEstimate(c, tenantID, estimateID) {
+		response.Forbidden(c, "Price data is hidden for your project role")
+		return
+	}
+
 	out := EstimateSummary{EstimateID: estimateID}
 	err = h.db.QueryRow(`
 		WITH l AS (

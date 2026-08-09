@@ -92,6 +92,11 @@ func (h *Handler) GetRejaFakt(c *gin.Context) {
 		return
 	}
 
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
+		return
+	}
+
 	// Optional filters
 	stageFilter := c.Query("stage_id")
 	statusFilter := c.Query("status")

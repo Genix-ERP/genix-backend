@@ -337,9 +337,16 @@ func (h *Handler) GetPartnerBalances(c *gin.Context) {
 	if orgID != uuid.Nil {
 		orgArg = orgID
 	}
+	// direction kontrakti (test_30): faqat customer/vendor (bo'sh = customer);
+	// noto'g'ri qiymat jimgina customer bo'lib ketmasin — 400.
 	direction := c.Query("direction")
-	if direction != "vendor" {
+	switch direction {
+	case "", "customer":
 		direction = "customer"
+	case "vendor":
+	default:
+		response.BadRequest(c, "direction must be 'customer' or 'vendor'")
+		return
 	}
 	invTable, contactCol, payType, _ := partnerDocConfig(direction)
 
@@ -436,9 +443,16 @@ func (h *Handler) GetPartnerLedger(c *gin.Context) {
 		response.BadRequest(c, "Invalid contact_id")
 		return
 	}
+	// direction kontrakti (test_30): faqat customer/vendor (bo'sh = customer);
+	// noto'g'ri qiymat jimgina customer bo'lib ketmasin — 400.
 	direction := c.Query("direction")
-	if direction != "vendor" {
+	switch direction {
+	case "", "customer":
 		direction = "customer"
+	case "vendor":
+	default:
+		response.BadRequest(c, "direction must be 'customer' or 'vendor'")
+		return
 	}
 	invTable, contactCol, payType, _ := partnerDocConfig(direction)
 

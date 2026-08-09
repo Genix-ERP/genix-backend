@@ -2397,6 +2397,18 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.GET("/:id/progress-summary", h.GetProgressSummary)
 		constructionProjects.GET("/:id/gantt", h.GetGanttData)
 
+		// Progress v2 — YAGONA progress-dvigatel (F1, qurilish-v2/conventions.md §2):
+		// Umumiy ko'rinish, Bosqichlar, kartalar — hamma shu manbadan o'qiydi.
+		constructionProjects.GET("/:id/progress", h.GetProjectProgressV2)
+
+		// Ish grafigi (Gantt v2) — smeta ishlari ustidagi grafik (migration 471).
+		// O'qish group-gate (project:read); yozish estimate:update — smeta bilan
+		// bir xil huquq, chunki bu o'sha ish qatorlarining vaqt ko'rinishi.
+		constructionProjects.GET("/:id/schedule", h.GetWorkSchedule)
+		constructionProjects.POST("/:id/schedule/bulk", h.perm.Require("construction", "estimate", "update"), h.BulkUpdateWorkSchedule)
+		constructionProjects.POST("/:id/schedule/baseline", h.perm.Require("construction", "estimate", "update"), h.FreezeScheduleBaseline)
+		constructionProjects.POST("/:id/dependencies", h.perm.Require("construction", "estimate", "update"), h.CreateWorkDependency)
+
 		// Subcontracts
 		constructionProjects.GET("/:id/subcontracts", h.ListSubcontracts)
 		constructionProjects.POST("/:id/subcontracts", h.perm.Require("construction", "project", "update"), h.CreateSubcontract)
@@ -2638,6 +2650,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		works.POST("/:id/confirm-engineer", h.ConfirmWorkEngineer)
 		works.POST("/:id/reject-engineer", h.RejectWorkEngineer)
 		works.POST("/bulk-confirm-engineer", h.BulkConfirmEngineer)
+		// Ish grafigi: sana o'zgartirish + FS-propagatsiya (bitta tx).
+		works.PUT("/:id/schedule", h.UpdateWorkSchedule)
+	}
+
+	// Ish grafigi bog'liqliklari (FS) — o'chirish global id orqali.
+	scheduleDeps := rg.Group("/construction/schedule-dependencies")
+	scheduleDeps.Use(h.perm.Require("construction", "estimate", "update"))
+	{
+		scheduleDeps.DELETE("/:id", h.DeleteWorkDependency)
 	}
 
 	// Estimate Summary (direct access)
