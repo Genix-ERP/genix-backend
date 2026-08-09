@@ -159,6 +159,15 @@ var workflowEventCatalog = map[string]workflowEventDef{
 	// checkConstructionBudgetOverruns).
 	"construction.budget_overrun": {Category: "construction", RelatedType: "construction_project", Scheduled: true, SampleData: map[string]interface{}{
 		"record_id": "42", "name": "Yunusobod turar-joy majmuasi", "budget": 48000000000.0, "actual": 51300000000.0, "overrun_pct": 6.9}},
+	// Ish grafigi (Gantt v2, migration 471). record_id — loyiha BIGINT id
+	// (string); ish qatori id'si data.work_id da. Overdue — scheduled skaner
+	// (checkConstructionWorkOverdue): sched_end o'tgan + progress < 100;
+	// DedupeKey = work_id:sched_end, shuning uchun qayta rejalashtirilgan ish
+	// yana kuzatuvga tushadi. Completed — injener yakuniy tasdig'ida jonli emit.
+	"construction.work_overdue": {Category: "construction", RelatedType: "construction_project", Scheduled: true, SampleData: map[string]interface{}{
+		"record_id": "42", "work_id": "1207", "work_name": "G'isht terish, 3-qavat", "project_name": "Yunusobod turar-joy majmuasi", "sched_end": "2026-08-01", "progress_pct": 60.0}},
+	"construction.work_completed": {Category: "construction", RelatedType: "construction_project", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "42", "work_id": "1207", "work_name": "G'isht terish, 3-qavat", "project_name": "Yunusobod turar-joy majmuasi", "done_quantity": 650.0}},
 }
 
 // workflowActionTypes is the set of executable action types. Legacy types
