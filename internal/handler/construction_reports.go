@@ -30,6 +30,11 @@ func (h *Handler) GetProjectSummaryReport(c *gin.Context) {
 		return
 	}
 
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
+		return
+	}
+
 	// Total costs
 	var totalActual float64
 	_ = h.db.QueryRow(`
@@ -192,6 +197,11 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
 		return
 	}
 
@@ -650,6 +660,11 @@ func (h *Handler) GetJournalEntriesReport(c *gin.Context) {
 		return
 	}
 
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
+		return
+	}
+
 	// Collect journal entry IDs linked to expense lines for this project
 	query := `
 		SELECT je.id, je.entry_number, je.entry_date, je.description,
@@ -657,7 +672,7 @@ func (h *Handler) GetJournalEntriesReport(c *gin.Context) {
 		       je.created_at
 		FROM journal_entries je
 		WHERE je.tenant_id = $1
-		  AND je.source_type IN ('construction_expense','construction_expense_reversal','project_commission','material_request')
+		  AND je.source_type IN ('construction_expense','construction_expense_reversal','project_commission','material_request','construction_act')
 		  AND je.id IN (
 		      SELECT journal_entry_id FROM construction_expense_lines
 		      WHERE project_id = $2 AND tenant_id = $1 AND deleted_at IS NULL AND journal_entry_id IS NOT NULL
@@ -782,6 +797,11 @@ func (h *Handler) GetSvodReport(c *gin.Context) {
 	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
 		return
 	}
 

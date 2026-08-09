@@ -2471,15 +2471,35 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		topRows.Close()
 	}
 
-	// 8. Construction projects per org (active/in-progress) — for Активные объекты
+	// 8. Construction projects per org (active/in-progress) — for Активные объекты.
+	// Progress — smeta ishlaridan hisoblangan cost-weighted tayyorlik (stats
+	// bilan bir xil formula); ishlar bo'lmasa manual progress_percent fallback.
+	// Manual ustunning yozuv yo'li yopilgan (6-to'plam) — undan to'g'ridan-
+	// to'g'ri o'qish doim 0 ko'rsatardi.
 	projRows, err := h.db.Query(`
-		SELECT id, organization_id, COALESCE(code, ''), COALESCE(name, ''),
-		       COALESCE(status, ''), COALESCE(progress_percent, 0),
-		       COALESCE(contract_amount, 0)
-		FROM construction_projects
-		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
-		  AND COALESCE(status, '') NOT IN ('cancelled', 'archived')
-		ORDER BY organization_id, progress_percent DESC, id`,
+		SELECT p.id, p.organization_id, COALESCE(p.code, ''), COALESCE(p.name, ''),
+		       COALESCE(p.status, ''),
+		       COALESCE(r.readiness_pct, COALESCE(p.progress_percent, 0)) AS progress,
+		       COALESCE(p.contract_amount, 0)
+		FROM construction_projects p
+		LEFT JOIN LATERAL (
+			SELECT CASE WHEN SUM(COALESCE(el.total_amount, 0)) > 0
+			            THEN SUM(COALESCE(el.total_amount, 0) * LEAST(COALESCE(el.done_quantity, 0) / NULLIF(CASE
+			                     WHEN COALESCE(el.imported_quantity, 0) > 0 THEN el.imported_quantity
+			                     WHEN COALESCE(el.original_quantity, 0) > 0 THEN el.original_quantity
+			                     ELSE COALESCE(el.quantity, 0) END, 0), 1))
+			                 / SUM(COALESCE(el.total_amount, 0)) * 100
+			       END AS readiness_pct
+			FROM construction_estimate_line el
+			JOIN construction_estimate e ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
+			WHERE e.project_id = p.id AND el.tenant_id = p.tenant_id
+			  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND COALESCE(el.resource_type, '') = ''
+			  AND COALESCE(el.parent_line_id, 0) = 0
+		) r ON true
+		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL AND p.organization_id IS NOT NULL
+		  AND COALESCE(p.status, '') NOT IN ('cancelled', 'archived')
+		ORDER BY p.organization_id, progress DESC, p.id`,
 		tenantID,
 	)
 	if err == nil {

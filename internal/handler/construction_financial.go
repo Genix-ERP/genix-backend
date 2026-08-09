@@ -29,6 +29,11 @@ func (h *Handler) GetProjectPnL(c *gin.Context) {
 		return
 	}
 
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
+		return
+	}
+
 	// Get project financial basics
 	var contractAmount, progressPercent sql.NullFloat64
 	h.db.QueryRow(`
@@ -58,12 +63,17 @@ func (h *Handler) GetProjectPnL(c *gin.Context) {
 		WHERE el.project_id = $1 AND el.tenant_id = $2 AND el.status = 'approved' AND el.deleted_at IS NULL
 	`, projectID, tenantID).Scan(&materialCost, &laborCost, &equipmentCost, &subcontractCost, &otherCost)
 
-	// Add approved KS-2 acts to subcontract cost
+	// Add approved KS-2 acts to subcontract cost. Since migration 466 an
+	// approved sub-act also writes its own construction_expense_lines row
+	// (expense_line_id back-link) — those are already inside the CEL sum
+	// above, so only count acts WITHOUT a CEL bridge here (double-count fix,
+	// docs/qurilish-audit.md §2).
 	var ks2Total float64
 	h.db.QueryRow(`
 		SELECT COALESCE(SUM(amount_total), 0)
 		FROM construction_act
 		WHERE project_id = $1 AND tenant_id = $2 AND act_type = 'ks2' AND state = 'approved'
+		  AND expense_line_id IS NULL
 	`, projectID, tenantID).Scan(&ks2Total)
 	subcontractCost += ks2Total
 
@@ -117,6 +127,11 @@ func (h *Handler) GetBudgetVsActualByWBS(c *gin.Context) {
 	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
 		return
 	}
 
@@ -213,6 +228,11 @@ func (h *Handler) GetCostTrend(c *gin.Context) {
 		return
 	}
 
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
+		return
+	}
+
 	query := `
 		SELECT DATE_TRUNC('month', el.expense_date) as month,
 		       SUM(el.amount) as total,
@@ -262,6 +282,11 @@ func (h *Handler) GetPaymentSchedule(c *gin.Context) {
 	projectID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		response.BadRequest(c, "Invalid project ID")
+		return
+	}
+
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
 		return
 	}
 

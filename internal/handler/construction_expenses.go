@@ -70,6 +70,11 @@ func (h *Handler) ListExpenseLines(c *gin.Context) {
 		return
 	}
 
+	// Pul-hisobot — sof-prorab rolga 403 (conventions §4).
+	if h.denyPriceRestricted(c, tenantID, projectID) {
+		return
+	}
+
 	query := `
 		SELECT el.id, el.tenant_id, el.project_id,
 		       el.stage_id, s.name,
