@@ -810,7 +810,7 @@ type WorkflowAction struct {
 func (h *Handler) CheckThresholdRules() {
 	rows, err := h.db.Query(`
 		SELECT DISTINCT tenant_id, trigger_event FROM workflow_rules
-		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale', 'purchase_order.delivery_overdue', 'construction.budget_overrun')
+		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale', 'purchase_order.delivery_overdue', 'construction.budget_overrun', 'construction.work_overdue')
 		  AND is_active = true AND deleted_at IS NULL
 	`)
 	if err != nil {
@@ -850,6 +850,8 @@ func (h *Handler) CheckThresholdRules() {
 			h.checkOverduePurchaseDeliveries(s.tenantID)
 		case "construction.budget_overrun":
 			h.checkConstructionBudgetOverruns(s.tenantID)
+		case "construction.work_overdue":
+			h.checkConstructionWorkOverdue(s.tenantID)
 		}
 	}
 }
@@ -903,6 +905,74 @@ func (h *Handler) checkConstructionBudgetOverruns(tenantID uuid.UUID) {
 			},
 			DedupeKey: idStr,
 			Cooldown:  7 * 24 * time.Hour,
+		})
+	}
+}
+
+// checkConstructionWorkOverdue emits construction.work_overdue for scheduled
+// smeta works (Ish grafigi, migration 471) whose sched_end has passed while
+// progress < 100 (done_quantity below the resolved plan quantity) on live
+// projects. DedupeKey includes sched_end so a rescheduled work re-arms the
+// event; Cooldown 0 = once per crossing (same convention as
+// purchase_order.delivery_overdue).
+func (h *Handler) checkConstructionWorkOverdue(tenantID uuid.UUID) {
+	rows, err := h.db.Query(`
+		SELECT el.id, COALESCE(el.name, ''), el.sched_end, e.project_id, p.name,
+		       CASE
+		           WHEN COALESCE(el.imported_quantity, 0) > 0 THEN el.imported_quantity
+		           WHEN COALESCE(el.original_quantity, 0) > 0 THEN el.original_quantity
+		           ELSE COALESCE(el.quantity, 0)
+		       END AS plan_qty,
+		       COALESCE(el.done_quantity, 0)
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
+		JOIN construction_projects p ON p.id = e.project_id AND p.tenant_id = el.tenant_id
+		WHERE el.tenant_id = $1
+		  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		  AND COALESCE(el.resource_type, '') = ''
+		  AND COALESCE(el.parent_line_id, 0) = 0
+		  AND el.sched_end IS NOT NULL AND el.sched_end < CURRENT_DATE
+		  AND COALESCE(el.done_quantity, 0) < CASE
+		           WHEN COALESCE(el.imported_quantity, 0) > 0 THEN el.imported_quantity
+		           WHEN COALESCE(el.original_quantity, 0) > 0 THEN el.original_quantity
+		           ELSE COALESCE(el.quantity, 0)
+		       END
+		  AND p.deleted_at IS NULL
+		  AND COALESCE(p.status, '') NOT IN ('completed', 'cancelled')
+		LIMIT 500
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to check construction work overdue", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var workID, projectID int64
+		var workName, projectName string
+		var schedEnd time.Time
+		var planQty, doneQty float64
+		if err := rows.Scan(&workID, &workName, &schedEnd, &projectID, &projectName, &planQty, &doneQty); err != nil {
+			continue
+		}
+		progress := 0.0
+		if planQty > 0 {
+			progress = doneQty / planQty * 100
+		}
+		endStr := schedEnd.Format("2006-01-02")
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: tenantID,
+			Event:    "construction.work_overdue",
+			Data: map[string]interface{}{
+				"record_id":    strconv.FormatInt(projectID, 10),
+				"work_id":      strconv.FormatInt(workID, 10),
+				"work_name":    workName,
+				"project_name": projectName,
+				"sched_end":    endStr,
+				"progress_pct": progress,
+			},
+			DedupeKey: strconv.FormatInt(workID, 10) + ":" + endStr,
+			Cooldown:  0,
 		})
 	}
 }

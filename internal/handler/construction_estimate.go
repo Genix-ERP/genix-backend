@@ -1074,6 +1074,24 @@ func (h *Handler) ListEstimateLines(c *gin.Context) {
 		h.log.Error("Failed to load resource topups", "error", terr)
 	}
 
+	// Sof-prorab narx ko'rmaydi — pul maydonlari 0 bilan ketadi
+	// (conventions §4; smeta-id → loyiha orqali rol hal qilinadi).
+	if h.constructionPriceRestrictedForEstimate(c, tenantID, estimateID) {
+		for i := range lines {
+			lines[i].MaterialRate = 0
+			lines[i].LaborRate = 0
+			lines[i].EquipmentRate = 0
+			lines[i].UnitRate = 0
+			lines[i].TotalAmount = 0
+			lines[i].ActualAmount = 0
+			lines[i].OriginalUnitRate = 0
+			lines[i].ImportedTotal = sql.NullFloat64{}
+			for j := range lines[i].Topups {
+				lines[i].Topups[j].NewPrice = 0
+			}
+		}
+	}
+
 	response.Paginated(c, lines, page, pageSize, total)
 }
 

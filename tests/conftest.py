@@ -124,7 +124,17 @@ def db_read():
 # ============================================
 
 class APIClient:
-    """Test API client with authentication."""
+    """Test API client with authentication.
+
+    429 retry: the API rate limit is 1000 req/min per user and a full-suite
+    run now makes ~1000+ requests in seconds, so the alphabetically-last test
+    files started failing with spurious 429s. Mirror the frontend client's
+    behaviour: bounded retry with a pause, so throttling never masquerades
+    as a real assertion failure.
+    """
+
+    RETRY_429 = 3
+    RETRY_PAUSE = 8  # seconds — long enough for the per-minute window to breathe
 
     def __init__(self, base_url, token=None, tenant_id=None, org_id=None):
         self.base_url = base_url
@@ -144,20 +154,30 @@ class APIClient:
             headers["X-Organization-ID"] = self.org_id
         self.session.headers.update(headers)
 
+    def _request(self, method, path, **kwargs):
+        import time as _time
+        resp = self.session.request(method, f"{self.base_url}{path}", **kwargs)
+        for _ in range(self.RETRY_429):
+            if resp.status_code != 429:
+                break
+            _time.sleep(self.RETRY_PAUSE)
+            resp = self.session.request(method, f"{self.base_url}{path}", **kwargs)
+        return resp
+
     def get(self, path, params=None):
-        return self.session.get(f"{self.base_url}{path}", params=params)
+        return self._request("GET", path, params=params)
 
     def post(self, path, json=None):
-        return self.session.post(f"{self.base_url}{path}", json=json)
+        return self._request("POST", path, json=json)
 
     def put(self, path, json=None):
-        return self.session.put(f"{self.base_url}{path}", json=json)
+        return self._request("PUT", path, json=json)
 
     def delete(self, path):
-        return self.session.delete(f"{self.base_url}{path}")
+        return self._request("DELETE", path)
 
     def patch(self, path, json=None):
-        return self.session.patch(f"{self.base_url}{path}", json=json)
+        return self._request("PATCH", path, json=json)
 
 
 @pytest.fixture(scope="session")

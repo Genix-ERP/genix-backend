@@ -43,6 +43,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		       COALESCE(s.bank_name, ''), COALESCE(s.bank_account, ''),
 		       COALESCE(s.mfo, ''), COALESCE(s.stir, ''), COALESCE(s.okonh, ''),
 		       COALESCE(s.director_name, ''), COALESCE(s.chief_accountant_name, ''),
+		       COALESCE(s.contract_number, ''),
 		       s.created_by, s.created_date, s.updated_date,
 		       COALESCE(acts.completed_amount, 0) as completed_amount,
 		       COALESCE(acts.paid_amount, 0) as paid_amount
@@ -86,6 +87,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 		var retentionPct, rating float64
 		var contactPerson, contactPhone sql.NullString
 		var address, phone, bankName, bankAccount, mfo, stir, okonh, directorName, chiefAccName string
+		var contractNumber string
 		var createdBy uuid.NullUUID
 		var createdDate, updatedDate time.Time
 		var state string
@@ -98,6 +100,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			&contactPerson, &contactPhone, &notes,
 			&address, &phone, &bankName, &bankAccount,
 			&mfo, &stir, &okonh, &directorName, &chiefAccName,
+			&contractNumber,
 			&createdBy, &createdDate, &updatedDate,
 			&completedAmount, &paidAmount,
 		); err != nil {
@@ -151,6 +154,7 @@ func (h *Handler) ListSubcontracts(c *gin.Context) {
 			"okonh":                 okonh,
 			"director_name":         directorName,
 			"chief_accountant_name": chiefAccName,
+			"contract_number":       contractNumber,
 			"created_date":          createdDate,
 			"updated_date":          updatedDate,
 			"wbs_ids":               wbsIDs,
@@ -229,6 +233,8 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		ContactPerson   string  `json:"contact_person"`
 		ContactPhone    string  `json:"contact_phone"`
 		Notes           string  `json:"notes"`
+		// Shartnoma raqami — 472-gacha jimgina yo'qolardi (audit bug-fix).
+		ContractNumber  string  `json:"contract_number"`
 		WBSIDs          []int64 `json:"wbs_ids"`
 		BuildingIDs     []int64 `json:"building_ids"`
 		// Forma 2/3 identity block
@@ -275,10 +281,10 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 			amount, currency, start_date, end_date, retention_pct,
 			state, rating, contact_person, contact_phone, notes,
 			address, phone, bank_name, bank_account, mfo, stir, okonh,
-			director_name, chief_accountant_name,
+			director_name, chief_accountant_name, contract_number,
 			created_by, created_date, updated_date
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'draft', 0, $11, $12, $13,
-			$14, $15, $16, $17, $18, $19, $20, $21, $22,
+			$14, $15, $16, $17, $18, $19, $20, $21, $22, $24,
 			$23, NOW(), NOW())
 		RETURNING id
 	`, tenantID, projectID, nullStringFromVal(req.PartnerName), name, nullStringFromVal(req.WorkDescription),
@@ -289,7 +295,7 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		nullStringFromVal(req.BankName), nullStringFromVal(req.BankAccount),
 		nullStringFromVal(req.MFO), nullStringFromVal(req.STIR), nullStringFromVal(req.OKONH),
 		nullStringFromVal(req.DirectorName), nullStringFromVal(req.ChiefAccountantName),
-		userID,
+		userID, nullStringFromVal(req.ContractNumber),
 	).Scan(&id)
 
 	if err != nil {
@@ -465,6 +471,7 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 		ContactPerson   *string  `json:"contact_person"`
 		ContactPhone    *string  `json:"contact_phone"`
 		Notes           *string  `json:"notes"`
+		ContractNumber  *string  `json:"contract_number"`
 		WBSIDs          []int64  `json:"wbs_ids"`
 		BuildingIDs     []int64  `json:"building_ids"`
 		// Forma 2/3 identity block
@@ -549,6 +556,11 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("notes = $%d", argCount))
 		args = append(args, nullStringFromVal(*req.Notes))
+	}
+	if req.ContractNumber != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contract_number = $%d", argCount))
+		args = append(args, nullStringFromVal(*req.ContractNumber))
 	}
 	if req.Address != nil {
 		argCount++

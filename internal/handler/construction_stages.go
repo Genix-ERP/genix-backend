@@ -278,6 +278,24 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 		}
 	}
 
+	// Sof-prorab pul ko'rmaydi — bosqich byudjeti/fakt/resurs-summalari 0
+	// bilan ketadi (conventions §4, server-side stripping).
+	stagesPriceHidden := h.constructionPriceRestricted(c, tenantID, projectID)
+	if stagesPriceHidden {
+		for i := range stages {
+			stages[i].PlannedBudget = 0
+			stages[i].ActualAmount = 0
+			stages[i].MaterialTotal = 0
+			stages[i].EquipmentTotal = 0
+			stages[i].LaborTotal = 0
+			for j := range stages[i].SubStages {
+				stages[i].SubStages[j].MaterialTotal = 0
+				stages[i].SubStages[j].EquipmentTotal = 0
+				stages[i].SubStages[j].LaborTotal = 0
+			}
+		}
+	}
+
 	// Legacy / web path: no pagination params → full array, exactly as before
 	// (now with sub_stages embedded too).
 	if !paginate {
@@ -319,6 +337,9 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 			     WHERE s.project_id=$1 AND s.tenant_id=$2`+buildingClause+`)
 		`, countArgs...).Scan(&stageCount, &planned, &actual, &material)
 		if err == nil {
+			if stagesPriceHidden {
+				planned, actual, material = 0, 0, 0
+			}
 			summary = &gin.H{
 				"total_stages":          stageCount,
 				"total_planned_budget":  planned,
@@ -587,6 +608,8 @@ func (h *Handler) GetConstructionStageWorks(c *gin.Context) {
 	}
 
 	works := []Work{}
+	// Sof-prorab narx ko'rmaydi (conventions §4) — server-side stripping.
+	priceHidden := h.constructionPriceRestricted(c, tenantID, projectID)
 	for rows.Next() {
 		var w Work
 		if err := rows.Scan(&w.ID, &w.Name, &w.UOM, &w.ItemNumber,
@@ -596,6 +619,10 @@ func (h *Handler) GetConstructionStageWorks(c *gin.Context) {
 			h.log.Error("stage works: failed to scan", "error", err)
 			continue
 		}
+		if priceHidden {
+			w.UnitRate, w.TotalAmount = 0, 0
+			w.MaterialRate, w.LaborRate, w.EquipmentRate = 0, 0, 0
+		}
 		works = append(works, w)
 	}
 
@@ -604,8 +631,9 @@ func (h *Handler) GetConstructionStageWorks(c *gin.Context) {
 		totalPages = (total + limit - 1) / limit
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"data":    works,
+		"success":      true,
+		"data":         works,
+		"price_hidden": priceHidden,
 		"meta": gin.H{
 			"page": page, "limit": limit, "total": total,
 			"total_pages": totalPages,

@@ -119,11 +119,16 @@ func (h *Handler) resolveProjectRoles(tenantID, userID uuid.UUID, projectID int6
 
 	// Step 1: per-project team roles — match by employee_id OR the employee's
 	// linked user_id, so it works regardless of which id the row was keyed on.
+	// NOTE: construction_project_team has NO tenant_id column — tenant scoping
+	// goes through the project row. (The old `pt.tenant_id = $1` predicate made
+	// this query error out silently, so team-based roles NEVER resolved and
+	// only the tenant_settings path worked — qurilish-v2 audit fix.)
 	if rows, err := h.db.Query(`
 		SELECT pt.role
 		FROM construction_project_team pt
+		JOIN construction_projects p ON p.id = pt.project_id AND p.tenant_id = $1
 		LEFT JOIN employees e ON e.id = pt.employee_id
-		WHERE pt.tenant_id = $1 AND pt.project_id = $2
+		WHERE pt.project_id = $2
 		  AND COALESCE(pt.status, 'active') = 'active'
 		  AND (pt.employee_id = $3 OR pt.employee_id = $4 OR e.user_id = $3)
 	`, tenantID, projectID, userID, employeeID); err == nil {
@@ -702,6 +707,21 @@ func (h *Handler) transitionWork(
 		if ctx.Status == "submitted" {
 			h.cancelMaterialsForWork(tenantID, lineID)
 		}
+	}
+
+	// Injener yakuniy tasdig'i = ish yakunlandi (Ish jarayonlari uchun jonli
+	// event; record_id — loyiha id, ish qatori data.work_id da).
+	if newStatus == "confirmed_engineer" {
+		var projectName string
+		_ = h.db.QueryRow(`SELECT COALESCE(name, '') FROM construction_projects WHERE id = $1 AND tenant_id = $2`,
+			ctx.ProjectID, tenantID).Scan(&projectName)
+		h.EmitWorkflowEvent(tenantID, "construction.work_completed", map[string]interface{}{
+			"record_id":     strconv.FormatInt(ctx.ProjectID, 10),
+			"work_id":       strconv.FormatInt(lineID, 10),
+			"work_name":     ctx.Name,
+			"project_name":  projectName,
+			"done_quantity": ctx.DoneQty,
+		})
 	}
 
 	response.Success(c, gin.H{
