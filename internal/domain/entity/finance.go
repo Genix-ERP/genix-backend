@@ -647,6 +647,11 @@ type BankAccount struct {
 	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
 	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
 	DeletedAt       sql.NullTime `json:"-" db:"deleted_at"`
+	// Computed (list endpoint only): SUM(debit-credit) of posted JE lines
+	// on the linked GL account — the Moliya v2 balance truth. The mutable
+	// Balance column above is legacy and slated for removal.
+	LedgerBalance   float64      `json:"ledger_balance" db:"-"`
+	GLLinked        bool         `json:"gl_linked" db:"-"` // account_id IS NOT NULL
 }
 
 // CreateBankAccountInput is the input for creating a bank account

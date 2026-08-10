@@ -1526,13 +1526,11 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		return
 	}
 
-	// Total credited: payment + write-off + early discount
+	// Total credited: payment + write-off + early discount. The resulting
+	// amount_paid/status are computed atomically inside the guarded invoice
+	// UPDATE below, not here, so concurrent payments cannot both claim the
+	// same remaining balance.
 	totalCredited := input.Amount + input.WriteOffAmount + earlyDiscountApplied
-	newAmountPaid := amountPaid + totalCredited
-	newStatus := entity.InvoiceStatusPartial
-	if newAmountPaid >= totalAmount {
-		newStatus = entity.InvoiceStatusPaid
-	}
 
 	// Check lock date
 	if errMsg := h.checkLockDate(tenantID, paymentDate); errMsg != "" {
@@ -1798,13 +1796,26 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		tx.Exec("RELEASE SAVEPOINT gl_posting")
 	}
 
-	// Update invoice
-	_, err = tx.Exec(
-		"UPDATE sales_invoices SET amount_paid = $1, status = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5",
-		newAmountPaid, newStatus, now, invoiceID, tenantID,
+	// Update invoice — guarded, INCREMENTAL claim on the remaining balance
+	// (mirrors the purchase-side pattern). The cap lives in the UPDATE's
+	// WHERE so two concurrent payments cannot jointly exceed the invoice
+	// total: the loser matches zero rows and its payment JE rolls back with
+	// the tx instead of over-crediting 4010.
+	claimRes, err := tx.Exec(`
+		UPDATE sales_invoices
+		SET amount_paid = amount_paid + $1,
+		    status = CASE WHEN amount_paid + $1 >= total_amount - 0.01 THEN 'paid' ELSE 'partial' END,
+		    updated_at = $2
+		WHERE id = $3 AND tenant_id = $4
+		  AND amount_paid + $1 <= total_amount + 0.01`,
+		totalCredited, now, invoiceID, tenantID,
 	)
 	if err != nil {
 		response.InternalError(c, "Failed to record payment")
+		return
+	}
+	if n, _ := claimRes.RowsAffected(); n == 0 {
+		response.BadRequest(c, "OVER_PAYMENT: amount exceeds the invoice's remaining balance")
 		return
 	}
 
