@@ -59,10 +59,22 @@ func invoiceStatusFilter(raw, alias string, args *[]interface{}) string {
 // the flag disagree about the same invoice — the list would return a row
 // flagged is_overdue:false. Deriving both from this expression removes the
 // second clock entirely.
+// D3: an invoice is overdue only when money is actually still owed. The
+// predicate had no amount test, so a settled or zero-total invoice past its due
+// date counted as overdue while being excluded from open_invoices (which
+// requires a residual) — that is the "Muddati o'tgan 18 / Ochiq 17" mismatch on
+// the AR cards, and it made overdue_invoices not a subset of open_invoices.
+//
+// The test is on the RESIDUAL, not on total_amount > 0. total_amount > 0 would
+// still count an invoice paid in full whose status was never moved off 'sent' —
+// a real data state, since status and amount_paid are written by different
+// paths. Residual covers both that and the zero-total case.
 func invoiceOverdueSQL(alias string) string {
 	return fmt.Sprintf(
-		"(%s.due_date IS NOT NULL AND %s.due_date < CURRENT_DATE AND %s.status NOT IN ('paid', 'cancelled'))",
-		alias, alias, alias)
+		"(%s.due_date IS NOT NULL AND %s.due_date < CURRENT_DATE"+
+			" AND %s.status NOT IN ('paid', 'cancelled')"+
+			" AND (%s.total_amount - COALESCE(%s.amount_paid, 0)) > 0)",
+		alias, alias, alias, alias, alias)
 }
 
 // purchaseInvoiceWhere builds the predicate shared by ListPurchaseInvoices, its
