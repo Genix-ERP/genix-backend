@@ -23,8 +23,15 @@ import (
 // credits, so filtering rows out beforehand would change what the remaining
 // numbers mean. Search and paging are presentation over a finished report.
 
-// agingFilterSortPage narrows a finished contact list by `search`, orders it,
-// and returns the requested page.
+// agingFilterSortPage narrows a finished contact list by `search`, RECOMPUTES
+// the grand totals over what survived, orders the list, and returns the
+// requested page.
+//
+// The totals describe the whole FILTERED set — not the whole ledger, and not the
+// page. That distinction is the point: search "Tesla" and the table shows
+// Tesla's rows, so cards still describing the entire tenant are the web's A6
+// defect moved server-side. Paging, by contrast, must NOT narrow them: a page is
+// a window on the same filtered set.
 //
 // Paging is OPT-IN: with no `page` and no `page_size` the full list comes back,
 // exactly as before. That matters because both shipped clients render whatever
@@ -33,7 +40,7 @@ import (
 // three separately-deployed backends.
 //
 // The returned meta is nil when the caller did not opt in.
-func agingFilterSortPage(c *gin.Context, contacts []entity.AgingContact) ([]entity.AgingContact, *entity.AgingMeta) {
+func agingFilterSortPage(c *gin.Context, contacts []entity.AgingContact) ([]entity.AgingContact, agingTotals, *entity.AgingMeta) {
 	if q := strings.TrimSpace(c.Query("search")); q != "" {
 		needle := strings.ToLower(q)
 		kept := make([]entity.AgingContact, 0, len(contacts))
@@ -43,6 +50,20 @@ func agingFilterSortPage(c *gin.Context, contacts []entity.AgingContact) ([]enti
 			}
 		}
 		contacts = kept
+	}
+
+	// Summed from the surviving contacts. This is the same arithmetic the
+	// handler already does to build its grand totals (it accumulates from the
+	// same per-contact buckets after FIFO), so an unfiltered call reproduces
+	// them exactly — it is not a second, divergent definition.
+	var tot agingTotals
+	for _, ct := range contacts {
+		tot.Current += ct.Current
+		tot.Days1To30 += ct.Days1To30
+		tot.Days31To60 += ct.Days31To60
+		tot.Days61To90 += ct.Days61To90
+		tot.Over90Days += ct.Over90Days
+		tot.TotalAmount += ct.TotalAmount
 	}
 
 	// Largest balance first — the order both screens want by default — with the
@@ -57,7 +78,7 @@ func agingFilterSortPage(c *gin.Context, contacts []entity.AgingContact) ([]enti
 
 	pageStr, sizeStr := c.Query("page"), c.Query("page_size")
 	if pageStr == "" && sizeStr == "" {
-		return contacts, nil
+		return contacts, tot, nil
 	}
 
 	page, _ := strconv.Atoi(pageStr)
@@ -83,9 +104,14 @@ func agingFilterSortPage(c *gin.Context, contacts []entity.AgingContact) ([]enti
 		end = total
 	}
 
-	return contacts[start:end], &entity.AgingMeta{
+	return contacts[start:end], tot, &entity.AgingMeta{
 		Page: page, PageSize: size, Total: total, TotalPages: totalPages,
 	}
+}
+
+// agingTotals carries the six grand figures over the filtered set.
+type agingTotals struct {
+	Current, Days1To30, Days31To60, Days61To90, Over90Days, TotalAmount float64
 }
 
 // agingPercentages returns each bucket's share of the positive total.
@@ -104,7 +130,18 @@ func agingPercentages(current, d1, d2, d3, over90 float64) *entity.AgingPercenta
 	if denom <= 0 {
 		return nil
 	}
-	pct := func(v float64) float64 { return math.Round((v/denom)*1000) / 10 }
+	// The denominator is the positive total, i.e. the debt outstanding, so only
+	// a positive bucket has a share OF it. A negative bucket holds net credit
+	// and contributes nothing to the debt — reported as 0 rather than as the
+	// arithmetically-consistent but unreadable negative share (a -79m bucket
+	// against a 32.5m denominator renders as "-243.0%" on a card). No
+	// information is lost: the amount beside it already carries the sign.
+	pct := func(v float64) float64 {
+		if v <= 0 {
+			return 0
+		}
+		return math.Round((v/denom)*1000) / 10
+	}
 	return &entity.AgingPercentages{
 		Current:    pct(current),
 		Days1To30:  pct(d1),

@@ -1147,11 +1147,13 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 	// ── Step 2: Fetch ALL confirmed payments as negative entries (like Odoo) ──
 	payQuery := `
 		SELECT p.id, p.payment_number, p.payment_date, p.amount,
-		       c.id as contact_id, c.name as contact_name,
+		       COALESCE(c.id, p.contact_id) as contact_id,
+		       COALESCE(c.name, '—') as contact_name,
 		       ($2::date - p.payment_date)::int as days_since
 		FROM payments p
-		JOIN contacts c ON p.contact_id = c.id
+		LEFT JOIN contacts c ON p.contact_id = c.id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+		  AND p.contact_id IS NOT NULL
 		  AND p.type = 'receipt' AND p.status = 'confirmed'
 		  AND p.payment_date <= $2::date
 	`
@@ -1383,20 +1385,24 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 	// Search/sort/page the finished list. The totals above are computed over the
 	// whole ledger and are NOT recomputed from the page — that is the whole
 	// point of returning them.
-	pagedContacts, agingMeta := agingFilterSortPage(c, contacts)
+	// Search narrows the totals with the rows; paging does not. `agingTot` is
+	// the filtered set's figures — identical to the accumulators above when no
+	// search is given.
+	pagedContacts, agingTot, agingMeta := agingFilterSortPage(c, contacts)
 
 	report := entity.AgingReport{
 		AsOfDate:     asOfDate,
 		ReportType:   "receivables",
-		TotalAmount:  math.Round(totalAmount*100) / 100,
-		CurrentTotal: math.Round(currentTotal*100) / 100,
-		Days1To30:    math.Round(days1To30*100) / 100,
-		Days31To60:   math.Round(days31To60*100) / 100,
-		Days61To90:   math.Round(days61To90*100) / 100,
-		Over90Days:   math.Round(over90Days*100) / 100,
-		Percentages:  agingPercentages(currentTotal, days1To30, days31To60, days61To90, over90Days),
-		Contacts:     pagedContacts,
-		Meta:         agingMeta,
+		TotalAmount:  math.Round(agingTot.TotalAmount*100) / 100,
+		CurrentTotal: math.Round(agingTot.Current*100) / 100,
+		Days1To30:    math.Round(agingTot.Days1To30*100) / 100,
+		Days31To60:   math.Round(agingTot.Days31To60*100) / 100,
+		Days61To90:   math.Round(agingTot.Days61To90*100) / 100,
+		Over90Days:   math.Round(agingTot.Over90Days*100) / 100,
+		Percentages: agingPercentages(agingTot.Current, agingTot.Days1To30,
+			agingTot.Days31To60, agingTot.Days61To90, agingTot.Over90Days),
+		Contacts: pagedContacts,
+		Meta:     agingMeta,
 	}
 
 	response.Success(c, report)
@@ -1515,11 +1521,13 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 	// ── Step 2: Fetch ALL confirmed vendor payments as negative entries ──
 	payQuery := `
 		SELECT p.id, p.payment_number, p.payment_date, p.amount,
-		       c.id as contact_id, c.name as contact_name,
+		       COALESCE(c.id, p.contact_id) as contact_id,
+		       COALESCE(c.name, '—') as contact_name,
 		       ($2::date - p.payment_date)::int as days_since
 		FROM payments p
-		JOIN contacts c ON p.contact_id = c.id
+		LEFT JOIN contacts c ON p.contact_id = c.id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
+		  AND p.contact_id IS NOT NULL
 		  AND p.type = 'payment' AND p.status = 'confirmed'
 		  AND p.payment_date <= $2::date
 	`
@@ -1761,20 +1769,24 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 	// Search/sort/page the finished list. The totals above are computed over the
 	// whole ledger and are NOT recomputed from the page — that is the whole
 	// point of returning them.
-	pagedContacts, agingMeta := agingFilterSortPage(c, contacts)
+	// Search narrows the totals with the rows; paging does not. `agingTot` is
+	// the filtered set's figures — identical to the accumulators above when no
+	// search is given.
+	pagedContacts, agingTot, agingMeta := agingFilterSortPage(c, contacts)
 
 	report := entity.AgingReport{
 		AsOfDate:     asOfDate,
 		ReportType:   "payables",
-		TotalAmount:  math.Round(totalAmount*100) / 100,
-		CurrentTotal: math.Round(currentTotal*100) / 100,
-		Days1To30:    math.Round(days1To30*100) / 100,
-		Days31To60:   math.Round(days31To60*100) / 100,
-		Days61To90:   math.Round(days61To90*100) / 100,
-		Over90Days:   math.Round(over90Days*100) / 100,
-		Percentages:  agingPercentages(currentTotal, days1To30, days31To60, days61To90, over90Days),
-		Contacts:     pagedContacts,
-		Meta:         agingMeta,
+		TotalAmount:  math.Round(agingTot.TotalAmount*100) / 100,
+		CurrentTotal: math.Round(agingTot.Current*100) / 100,
+		Days1To30:    math.Round(agingTot.Days1To30*100) / 100,
+		Days31To60:   math.Round(agingTot.Days31To60*100) / 100,
+		Days61To90:   math.Round(agingTot.Days61To90*100) / 100,
+		Over90Days:   math.Round(agingTot.Over90Days*100) / 100,
+		Percentages: agingPercentages(agingTot.Current, agingTot.Days1To30,
+			agingTot.Days31To60, agingTot.Days61To90, agingTot.Over90Days),
+		Contacts: pagedContacts,
+		Meta:     agingMeta,
 	}
 
 	response.Success(c, report)
