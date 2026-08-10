@@ -1601,26 +1601,33 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		}
 	}
 
-	// Get default account IDs — lookup by name first, then code fallback
-	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
-	// Post directly to Cash/Bank based on payment method
-	var cashAccountID uuid.UUID
-	if input.PaymentMethod == "cash" {
-		cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
-		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
-		}
-	} else {
-		cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
-		if cashAccountID == uuid.Nil {
-			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
-		}
+	arAccountID := h.resolveReceivableAccount(tx, tenantID, organizationID)
+
+	// The settlement account comes from the JOURNAL first.
+	//
+	// It used to be guessed — findAccount by the English name "bank account"
+	// and the single code "5110". A tenant whose chart says "5100 · Bank hisob
+	// raqamlari" matched neither, so every payment was refused while the bank
+	// journal they had just selected carried that exact account on it. The
+	// journal is what knows where it settles; asking it removes the guess.
+	cashAccountID := h.resolveJournalSettlementAccount(tx, tenantID, cashJournalID)
+	if cashAccountID == uuid.Nil {
+		cashAccountID = h.settlementAccountFallback(tx, tenantID, organizationID, input.PaymentMethod)
 	}
 
-	// A payment with no ledger entry is money that exists in Savdo but not in Moliya —
-	// refuse instead of silently skipping the GL block (audit §3a).
-	if cashJournalID == uuid.Nil || arAccountID == uuid.Nil || cashAccountID == uuid.Nil {
-		response.BadRequest(c, "Payment accounts not configured (cash/bank journal, AR 4010, cash 5010 / bank 5110) — payment not recorded")
+	// A payment with no ledger entry is money that exists in Savdo but not in
+	// Moliya — refuse instead of silently skipping the GL block (audit §3a).
+	// The message names only what is actually missing, so it reads as an
+	// instruction rather than a list of everything that might have been wrong.
+	if missing := missingPaymentAccounts(cashJournalID, arAccountID, cashAccountID); len(missing) > 0 {
+		// When the journal DOES carry an account that simply cannot be posted
+		// to, say that instead — telling someone to fill in a field they have
+		// already filled in is worse than saying nothing.
+		if diag := h.journalAccountDiagnostic(tx, tenantID, cashJournalID); diag != "" {
+			response.BadRequest(c, "To'lov qayd etilmadi — "+diag)
+			return
+		}
+		response.BadRequest(c, "To'lov qayd etilmadi — sozlanmagan: "+strings.Join(missing, "; "))
 		return
 	}
 	{
