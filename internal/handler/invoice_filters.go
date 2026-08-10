@@ -88,6 +88,11 @@ func purchaseInvoiceWhere(c *gin.Context, args *[]interface{}) string {
 		where += fmt.Sprintf(" AND pi.organization_id = $%d", len(*args))
 	}
 	where += invoiceStatusFilter(c.Query("status"), "pi", args)
+	// The AP screen has a payment-status chip and, like the sales list before it,
+	// had no parameter to express it — so it filtered whatever page happened to
+	// be loaded. With page_size defaulting to 20, picking "To'langan" searched
+	// twenty bills instead of the tenant's. Same expression as the row field.
+	where += invoicePaymentStatusFilter(c.Query("payment_status"), "pi", args)
 
 	if v := strings.TrimSpace(c.Query("vendor_id")); v != "" {
 		*args = append(*args, v)

@@ -66,15 +66,7 @@ func agingFilterSortPage(c *gin.Context, contacts []entity.AgingContact) ([]enti
 		tot.TotalAmount += ct.TotalAmount
 	}
 
-	// Largest balance first — the order both screens want by default — with the
-	// name as a stable tiebreaker so LIMIT/OFFSET pages cannot repeat or skip a
-	// contact when several share a balance.
-	sort.SliceStable(contacts, func(i, j int) bool {
-		if contacts[i].TotalAmount != contacts[j].TotalAmount {
-			return contacts[i].TotalAmount > contacts[j].TotalAmount
-		}
-		return contacts[i].ContactName < contacts[j].ContactName
-	})
+	agingSort(c, contacts)
 
 	pageStr, sizeStr := c.Query("page"), c.Query("page_size")
 	if pageStr == "" && sizeStr == "" {
@@ -107,6 +99,61 @@ func agingFilterSortPage(c *gin.Context, contacts []entity.AgingContact) ([]enti
 	return contacts[start:end], tot, &entity.AgingMeta{
 		Page: page, PageSize: size, Total: total, TotalPages: totalPages,
 	}
+}
+
+// agingBucketOf maps a `sort` value to the field it orders by. Keyed on the
+// JSON names the response already uses, so a client sorts by the name it just
+// rendered rather than by a second private vocabulary.
+var agingSortFields = map[string]func(entity.AgingContact) float64{
+	"current":       func(a entity.AgingContact) float64 { return a.Current },
+	"days_1_to_30":  func(a entity.AgingContact) float64 { return a.Days1To30 },
+	"days_31_to_60": func(a entity.AgingContact) float64 { return a.Days31To60 },
+	"days_61_to_90": func(a entity.AgingContact) float64 { return a.Days61To90 },
+	"over_90_days":  func(a entity.AgingContact) float64 { return a.Over90Days },
+	"total_amount":  func(a entity.AgingContact) float64 { return a.TotalAmount },
+}
+
+// agingSort orders the contact list in place.
+//
+// It has to happen on the server now that the list is paginated: sorting a
+// single page client-side reorders twenty partners and calls the result "the
+// largest debts", which is worse than not offering the control at all. The
+// default — largest balance first — is what both screens showed before.
+//
+// Every comparison falls back to the contact name, so ties order identically on
+// every request. Without that, LIMIT/OFFSET over an unstable order repeats a
+// contact on one page and drops another entirely, and the two pages are taken
+// by separate requests so the instability is invisible to the client.
+func agingSort(c *gin.Context, contacts []entity.AgingContact) {
+	field := strings.TrimSpace(strings.ToLower(c.Query("sort")))
+	desc := !strings.EqualFold(strings.TrimSpace(c.Query("order")), "asc")
+
+	if field == "contact_name" || field == "name" {
+		sort.SliceStable(contacts, func(i, j int) bool {
+			if desc {
+				return contacts[i].ContactName > contacts[j].ContactName
+			}
+			return contacts[i].ContactName < contacts[j].ContactName
+		})
+		return
+	}
+
+	// An unknown or empty sort falls back to total_amount rather than 400ing:
+	// the parameter is presentation, and a typo should not take the report down.
+	get, ok := agingSortFields[field]
+	if !ok {
+		get = agingSortFields["total_amount"]
+	}
+	sort.SliceStable(contacts, func(i, j int) bool {
+		a, b := get(contacts[i]), get(contacts[j])
+		if a != b {
+			if desc {
+				return a > b
+			}
+			return a < b
+		}
+		return contacts[i].ContactName < contacts[j].ContactName
+	})
 }
 
 // agingTotals carries the six grand figures over the filtered set.
