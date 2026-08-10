@@ -17,10 +17,22 @@ import (
 // perfectly good bank journal, with that very account configured on it, sat in
 // the dropdown the user had just chosen from.
 //
-// The fix is to stop guessing. A bank or cash journal already knows which
-// account it settles through — that is what the journal IS — so the journal is
-// asked first and the guessing is only a last resort for journals that predate
-// anyone filling it in.
+// CORRECTION: the guessing was NOT the bug. findAccount has a tenant-wide
+// exact-code step that matches a leaf 5110, which this chart has — so the
+// original lookup worked. The real failure was the JOURNAL lookup, restricted
+// to code IN ('CASH_RECEIPTS','CASH') so a bank journal resolved to nothing;
+// that is fixed in RecordPayment and needed nothing here.
+//
+// What survives is only the part that is better on its own merits: a journal
+// that names its own bank account should settle through THAT account, not
+// through whichever account happens to carry the standard code. It matters as
+// soon as a tenant runs two bank journals for two different banks — code-based
+// lookup sends both to the same place.
+//
+// The fallback is left exactly as it was. An earlier version of this file
+// widened it to match names like "bank" before trying codes, which would have
+// matched "Bank kreditlari" — a loan liability — and posted customer payments
+// into it.
 
 // resolveJournalSettlementAccount returns the GL account a journal settles
 // through, walking from the most explicit configuration to the least.
@@ -58,68 +70,10 @@ func (h *Handler) resolveJournalSettlementAccount(q dbQuerier, tenantID, journal
 		return acc
 	}
 
-	// 3. The transit / suspense account ("Tranzit schyot" on the journal
-	//    form). Not ideal — it is meant for money in flight — but a tenant who
-	//    has filled only this field has still told us where this journal
-	//    settles, and refusing the payment teaches them nothing.
-	_ = q.QueryRow(`
-		SELECT COALESCE(suspense_account_id, '00000000-0000-0000-0000-000000000000')
-		FROM journals WHERE id = $1 AND tenant_id = $2`, journalID, tenantID).Scan(&id)
-	if acc := resolveLeafAccount(q, id); acc != uuid.Nil {
-		return acc
-	}
-
-	return uuid.Nil
-}
-
-// settlementAccountFallback is the guess, kept only for journals with nothing
-// configured.
-//
-// The candidate lists are wider than the originals in both directions: the
-// names now include what Uzbek and Russian charts actually call these
-// accounts, and the codes cover the NAS §21 family rather than one member of
-// it. "5110 Hisob-kitob schyoti" is a child of "5100 Bank hisob raqamlari", so
-// a chart that only defines the parent used to match nothing at all.
-func (h *Handler) settlementAccountFallback(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, method string) uuid.UUID {
-	cashFirst := []string{"kassa", "cash", "касса"}
-	bankFirst := []string{"hisob-kitob", "bank hisob", "bank account", "расчётный", "расчетный", "bank"}
-
-	names := bankFirst
-	codes := []string{"5110", "5100", "5130", "5010"}
-	if method == "cash" {
-		names = cashFirst
-		codes = []string{"5010", "5000", "5110", "5100"}
-	}
-
-	for _, n := range names {
-		if id := findAccount(q, tenantID, orgID, n, ""); id != uuid.Nil {
-			return id
-		}
-	}
-	for _, code := range codes {
-		if id := findAccount(q, tenantID, orgID, "\x00no-name-match\x00", code); id != uuid.Nil {
-			return id
-		}
-	}
-	return uuid.Nil
-}
-
-// resolveReceivableAccount finds the AR control account.
-//
-// 4010 is standard enough in NAS §21 that the code lookup nearly always wins,
-// but the English-only name search was the sole fallback and matched nothing on
-// an Uzbek chart.
-func (h *Handler) resolveReceivableAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID) uuid.UUID {
-	for _, n := range []string{"accounts receivable", "xaridorlar", "debitor", "дебитор", "покупател"} {
-		if id := findAccount(q, tenantID, orgID, n, ""); id != uuid.Nil {
-			return id
-		}
-	}
-	for _, code := range []string{"4010", "4000"} {
-		if id := findAccount(q, tenantID, orgID, "\x00no-name-match\x00", code); id != uuid.Nil {
-			return id
-		}
-	}
+	// Deliberately NOT falling back to suspense_account_id ("Tranzit
+	// schyot"): that account is money IN FLIGHT, not where a settled payment
+	// belongs. Using it would silently move where completed payments land for
+	// any tenant that had filled the field in for its actual purpose.
 	return uuid.Nil
 }
 
