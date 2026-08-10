@@ -1046,11 +1046,13 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 	// ── Step 1: Fetch ALL invoices (full total_amount, not net) ──
 	query := `
 		SELECT si.id, si.invoice_number, si.invoice_date, si.due_date, si.total_amount,
-			   c.id as contact_id, c.name as contact_name,
+			   COALESCE(c.id, si.customer_id) as contact_id,
+			   COALESCE(c.name, si.customer_name, '—') as contact_name,
 			   ($2::date - si.due_date)::int as days_overdue
 		FROM sales_invoices si
-		JOIN contacts c ON si.customer_id = c.id
+		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
+			AND si.customer_id IS NOT NULL
 			AND si.status NOT IN ('cancelled')
 			AND si.total_amount > 0
 			AND COALESCE(si.invoice_type, 'invoice') = 'invoice'
@@ -1378,6 +1380,11 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		contacts = append(contacts, *c)
 	}
 
+	// Search/sort/page the finished list. The totals above are computed over the
+	// whole ledger and are NOT recomputed from the page — that is the whole
+	// point of returning them.
+	pagedContacts, agingMeta := agingFilterSortPage(c, contacts)
+
 	report := entity.AgingReport{
 		AsOfDate:     asOfDate,
 		ReportType:   "receivables",
@@ -1387,7 +1394,9 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		Days31To60:   math.Round(days31To60*100) / 100,
 		Days61To90:   math.Round(days61To90*100) / 100,
 		Over90Days:   math.Round(over90Days*100) / 100,
-		Contacts:     contacts,
+		Percentages:  agingPercentages(currentTotal, days1To30, days31To60, days61To90, over90Days),
+		Contacts:     pagedContacts,
+		Meta:         agingMeta,
 	}
 
 	response.Success(c, report)
@@ -1409,11 +1418,13 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 	// ── Step 1: Fetch ALL vendor invoices (full total_amount) ──
 	query := `
 		SELECT pi.id, pi.invoice_number, pi.invoice_date, pi.due_date, pi.total_amount,
-			   c.id as contact_id, c.name as contact_name,
+			   COALESCE(c.id, pi.vendor_id) as contact_id,
+			   COALESCE(c.name, '—') as contact_name,
 			   ($2::date - pi.due_date)::int as days_overdue
 		FROM purchase_invoices pi
-		JOIN contacts c ON pi.vendor_id = c.id
+		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL
+			AND pi.vendor_id IS NOT NULL
 			AND pi.status NOT IN ('cancelled')
 			AND pi.total_amount > 0
 			AND pi.invoice_date <= $2::date
@@ -1569,7 +1580,89 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		}
 	}
 
-	// ── Step 3: FIFO-apply vendor payments against oldest vendor invoices ──
+	// ── Step 3: Subtract CREDITED purchase returns ──
+	//
+	// The AR twin exists; the AP side never had one, so a vendor invoice that
+	// was returned and credited stayed fully payable in aging on all three apps.
+	//
+	// This is deliberately NOT a copy of the AR step — purchase_returns has a
+	// different shape and a different vocabulary, and reusing AR's would have
+	// been a 500 on a missing column plus a silently wrong status filter:
+	//   * amount is total_value, not total_amount (which does not exist here),
+	//     preferring credit_amount when the supplier's credit note names a
+	//     different figure than the goods were valued at;
+	//   * the party is supplier_id, not customer_id;
+	//   * status 'completed' does not exist in this vocabulary at all.
+	//
+	// Recognised at 'credited' only. Until the supplier issues the credit note
+	// the goods may be back but the liability is not reduced, and 'credited' is
+	// exactly the state that says it was — recognising at 'approved' would
+	// understate payables for every return the supplier later rejects.
+	prQuery := `
+		SELECT pr.id, pr.return_number,
+		       COALESCE(pr.credit_note_date, pr.approved_at::date, pr.return_date),
+		       COALESCE(NULLIF(pr.credit_amount, 0), pr.total_value),
+		       pr.supplier_id, COALESCE(c.name, '') as contact_name
+		FROM purchase_returns pr
+		LEFT JOIN contacts c ON pr.supplier_id = c.id
+		WHERE pr.tenant_id = $1 AND pr.deleted_at IS NULL
+		  AND pr.status = 'credited'
+		  AND pr.supplier_id IS NOT NULL
+		  AND COALESCE(pr.credit_note_date, pr.approved_at::date, pr.return_date) <= $2::date
+	`
+	prArgs := []interface{}{tenantID, asOfDate}
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		prQuery += " AND pr.organization_id = $3"
+		prArgs = append(prArgs, orgID)
+	}
+	prRows, prErr := h.db.Query(prQuery, prArgs...)
+	if prErr != nil {
+		h.log.Error("aging payables: purchase returns step failed", "error", prErr)
+	} else {
+		defer prRows.Close()
+		for prRows.Next() {
+			var retID, contactID uuid.UUID
+			var retNumber, contactName string
+			var retDate time.Time
+			var amount float64
+			if err := prRows.Scan(&retID, &retNumber, &retDate, &amount, &contactID, &contactName); err != nil {
+				h.log.Error("aging payables: scan purchase return", "error", err)
+				continue
+			}
+			if amount <= 0 {
+				continue
+			}
+			negativeAmount := -amount
+			contact, exists := contactMap[contactID]
+			if !exists {
+				if !contactHasInvoices[contactID] {
+					continue
+				}
+				contact = &entity.AgingContact{
+					ContactID:   contactID,
+					ContactName: contactName,
+					Invoices:    make([]entity.AgingInvoice, 0),
+				}
+				contactMap[contactID] = contact
+			}
+			contact.Current += negativeAmount
+			currentTotal += negativeAmount
+			contact.Invoices = append(contact.Invoices, entity.AgingInvoice{
+				InvoiceID:     retID,
+				InvoiceNumber: "CN-" + retNumber,
+				InvoiceDate:   retDate.Format("2006-01-02"),
+				DueDate:       retDate.Format("2006-01-02"),
+				TotalAmount:   negativeAmount,
+				AmountDue:     negativeAmount,
+				DaysOverdue:   0,
+				AgingBucket:   "current",
+			})
+			contact.TotalAmount += negativeAmount
+			totalAmount += negativeAmount
+		}
+	}
+
+	// ── Step 4: FIFO-apply vendor credits against oldest vendor invoices ──
 	totalAmount = 0
 	currentTotal = 0
 	days1To30 = 0
@@ -1665,6 +1758,11 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		contacts = append(contacts, *c)
 	}
 
+	// Search/sort/page the finished list. The totals above are computed over the
+	// whole ledger and are NOT recomputed from the page — that is the whole
+	// point of returning them.
+	pagedContacts, agingMeta := agingFilterSortPage(c, contacts)
+
 	report := entity.AgingReport{
 		AsOfDate:     asOfDate,
 		ReportType:   "payables",
@@ -1674,7 +1772,9 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		Days31To60:   math.Round(days31To60*100) / 100,
 		Days61To90:   math.Round(days61To90*100) / 100,
 		Over90Days:   math.Round(over90Days*100) / 100,
-		Contacts:     contacts,
+		Percentages:  agingPercentages(currentTotal, days1To30, days31To60, days61To90, over90Days),
+		Contacts:     pagedContacts,
+		Meta:         agingMeta,
 	}
 
 	response.Success(c, report)
