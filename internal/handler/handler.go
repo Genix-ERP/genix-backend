@@ -1540,6 +1540,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	reconciliation.Use(h.perm.Require("finance", "reconciliation", "read"))
 	{
 		reconciliation.GET("", h.ListReconciliationActs)
+		// Registered before /:id, matching /payments/summary above — a static
+		// segment beside a wildcard sibling.
+		reconciliation.GET("/summary", h.GetReconciliationSummary)
 		reconciliation.POST("", h.perm.Require("finance", "reconciliation", "create"), h.CreateReconciliationAct)
 		reconciliation.POST("/bulk-generate", h.perm.Require("finance", "reconciliation", "create"), h.BulkGenerateReconciliation)
 		reconciliation.GET("/:id", h.GetReconciliationAct)
