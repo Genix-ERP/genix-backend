@@ -593,26 +593,66 @@ func TestTenantResolver_InvalidUUID(t *testing.T) {
 	_ = w
 }
 
+// OrganizationResolver now takes a database handle and VERIFIES that the
+// organization named in the header belongs to the caller's tenant before
+// trusting it.
+//
+// This test used to assert the opposite — that the header alone set the
+// organization — which is exactly the behaviour that change removed: a client
+// could name any organization it liked and have every org-scoped query
+// silently answer for it. The assertion is inverted to pin the new guarantee,
+// because a test that still demanded the old one would have to be deleted the
+// moment anyone read it.
 func TestOrganizationResolver(t *testing.T) {
-	router := gin.New()
-	router.Use(OrganizationResolver())
+	run := func(t *testing.T, header string) (string, bool) {
+		t.Helper()
+		router := gin.New()
+		// nil handle: nothing can be verified against it, so nothing may be
+		// trusted. Same path a request takes before authentication has put a
+		// tenant in the context.
+		router.Use(OrganizationResolver(nil))
 
-	var gotOrgID string
-	router.GET("/test", func(c *gin.Context) {
-		if v, ok := c.Get(ContextKeyOrganizationID); ok {
-			gotOrgID = v.(string)
+		var gotOrgID string
+		var wasSet bool
+		router.GET("/test", func(c *gin.Context) {
+			if v, ok := c.Get(ContextKeyOrganizationID); ok {
+				gotOrgID, wasSet = v.(string), true
+			}
+			c.String(http.StatusOK, "ok")
+		})
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		if header != "" {
+			req.Header.Set("X-Organization-ID", header)
 		}
-		c.String(http.StatusOK, "ok")
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request should still be served, got %d", w.Code)
+		}
+		return gotOrgID, wasSet
+	}
+
+	t.Run("unverifiable header is not trusted", func(t *testing.T) {
+		got, wasSet := run(t, "880e8400-e29b-41d4-a716-446655440000")
+		if wasSet {
+			t.Errorf("organization must not be set from an unverified header, got %q", got)
+		}
 	})
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("X-Organization-ID", "880e8400-e29b-41d4-a716-446655440000")
-	router.ServeHTTP(w, req)
+	t.Run("malformed header is ignored", func(t *testing.T) {
+		if _, wasSet := run(t, "not-a-uuid"); wasSet {
+			t.Error("a malformed organization header must be ignored, not trusted")
+		}
+	})
 
-	if gotOrgID != "880e8400-e29b-41d4-a716-446655440000" {
-		t.Errorf("org ID = %q, want %q", gotOrgID, "880e8400-e29b-41d4-a716-446655440000")
-	}
+	t.Run("absent header is not an error", func(t *testing.T) {
+		// The middleware must let an org-less request through — most endpoints
+		// are tenant-scoped only.
+		if _, wasSet := run(t, ""); wasSet {
+			t.Error("no header means no organization")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

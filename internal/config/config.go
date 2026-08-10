@@ -361,15 +361,39 @@ func (c *Config) Validate() error {
 	if c.Database.DBName == "" {
 		return fmt.Errorf("database name is required")
 	}
-	if c.App.Env == "production" {
-		if c.JWT.SecretKey == "" || c.JWT.SecretKey == "your-super-secret-key-change-in-production" {
-			return fmt.Errorf("JWT secret key must be set in production")
+	// SEC-07 (docs/admin-panel/audit.md): the same JWT_SECRET_KEY signs
+	// platform-admin (is_system_admin) tokens, so a known/default secret lets
+	// anyone forge a super-admin token. Fail closed on the default or a weak
+	// secret for EVERY deployed environment — not just production. Only explicit
+	// local development/test may fall back to the default (and is warned loudly
+	// at startup, see UsesInsecureDefaultSecret / cmd/api).
+	if !c.IsLocalDevEnv() {
+		if c.UsesInsecureDefaultSecret() {
+			return fmt.Errorf("JWT_SECRET_KEY must be set to a strong unique value (env=%q); the built-in default is not allowed outside local development/test", c.App.Env)
 		}
 		if len(c.JWT.SecretKey) < 32 {
-			return fmt.Errorf("JWT secret key must be at least 32 characters in production")
+			return fmt.Errorf("JWT secret key must be at least 32 characters")
 		}
 	}
 	return nil
+}
+
+// IsLocalDevEnv reports whether the app is running in an explicit local
+// development/test environment (where the default JWT secret is tolerated).
+func (c *Config) IsLocalDevEnv() bool {
+	switch c.App.Env {
+	case "development", "test", "local", "":
+		return true
+	default:
+		return false
+	}
+}
+
+// UsesInsecureDefaultSecret reports whether the JWT secret is unset or the
+// well-known built-in default. Callers should refuse to run (non-dev) or warn
+// prominently (dev).
+func (c *Config) UsesInsecureDefaultSecret() bool {
+	return c.JWT.SecretKey == "" || c.JWT.SecretKey == "your-super-secret-key-change-in-production"
 }
 
 // DSN returns the PostgreSQL connection string

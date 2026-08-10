@@ -247,10 +247,16 @@ func (h *Handler) Register(c *gin.Context) {
 		},
 	})
 
+	// F3 (docs/admin-panel/audit.md): new companies enter the trial lifecycle
+	// (trialing + trial_ends_at + account_clear_at) instead of being created
+	// permanently 'active'/'free' with NULL dates (which meant unlimited free
+	// access forever and dead trial stats).
+	regTrialEnds := time.Now().AddDate(0, 0, 7)
+	regClearAt := regTrialEnds.AddDate(0, 0, 30)
 	_, err = tx.Exec(`
-		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status)
-		VALUES ($1, $2, $3, $4, 'free', 'active')
-	`, tenantID, input.TenantCode, input.TenantName, defaultSettings)
+		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status, trial_ends_at, account_clear_at)
+		VALUES ($1, $2, $3, $4, 'free', 'trialing', $5, $6)
+	`, tenantID, input.TenantCode, input.TenantName, defaultSettings, regTrialEnds, regClearAt)
 	if err != nil {
 		h.log.Error("Failed to create tenant", "error", err)
 		response.InternalServerError(c, "")
@@ -344,6 +350,14 @@ func (h *Handler) Register(c *gin.Context) {
 		response.InternalServerError(c, "")
 		return
 	}
+
+	// SEC-02: track the refresh token so it is revocable (Logout) and so refresh
+	// rotation can invalidate the prior token, exactly like the Login path.
+	h.db.Exec(`
+		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, userID, crypto.HashToken(tokenPair.RefreshToken), []byte(`{}`), c.ClientIP(),
+		tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
 
 	// Build response - tenant owners are NOT system admins but have owner role
 	ownerRoleDesc := "Tenant owner with full access"
@@ -735,8 +749,14 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	// Validate refresh token
-	tokenPair, err := h.jwtManager.RefreshTokens(input.RefreshToken)
+	// SEC-02 (docs/admin-panel/audit.md): do NOT re-mint privilege straight from
+	// the presented token's claims. Validate the signature, then (1) confirm the
+	// stored refresh_tokens row exists and is not revoked/expired — so Logout and
+	// admin offboarding actually cut a session off — and (2) re-read
+	// is_system_admin + is_active + deleted_at from the DB, so a demoted or
+	// deactivated admin cannot renew super-admin indefinitely. Finally rotate the
+	// refresh token (revoke the old row, store the new hash).
+	claims, err := h.jwtManager.ValidateRefreshToken(input.RefreshToken)
 	if err != nil {
 		if err == crypto.ErrTokenExpired {
 			response.Error(c, http.StatusUnauthorized, response.ErrCodeTokenExpired, "Refresh token has expired")
@@ -746,11 +766,76 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
+	// (1) Honor revocation. Login-issued tokens are tracked in refresh_tokens;
+	// if a row exists for this token it must be live (not revoked/expired) — this
+	// is what makes Logout and admin offboarding actually cut a session. Some
+	// mint paths (e.g. self-service register) don't store a row; those tokens are
+	// tolerated here (nothing to revoke) but still go through the DB privilege
+	// re-check below and are tracked from this rotation onward.
+	presentedHash := crypto.HashToken(input.RefreshToken)
+	var storedID uuid.UUID
+	err = h.db.QueryRow(`SELECT id FROM refresh_tokens WHERE token_hash = $1`, presentedHash).Scan(&storedID)
+	hasRow := err == nil
+	if hasRow {
+		var live bool
+		h.db.QueryRow(`
+			SELECT revoked_at IS NULL AND expires_at > NOW()
+			FROM refresh_tokens WHERE id = $1
+		`, storedID).Scan(&live)
+		if !live {
+			response.Error(c, http.StatusUnauthorized, response.ErrCodeTokenInvalid, "Refresh token is no longer valid")
+			return
+		}
+	}
+
+	// (2) Re-load the current privilege/active state from the DB (fail closed).
+	var (
+		freshEmail    string
+		isSystemAdmin bool
+		isActive      bool
+	)
+	err = h.db.QueryRow(`
+		SELECT COALESCE(email, ''), is_system_admin, is_active
+		FROM users
+		WHERE id = $1 AND deleted_at IS NULL
+	`, claims.UserID).Scan(&freshEmail, &isSystemAdmin, &isActive)
+	if err != nil || !isActive {
+		// User was deleted or deactivated — kill every session for them.
+		h.db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, claims.UserID)
+		response.Error(c, http.StatusUnauthorized, response.ErrCodeTokenInvalid, "Account is no longer active")
+		return
+	}
+
+	// Mint a fresh pair on the SAME session, carrying DB-fresh privilege.
+	accessToken, expiresAt, err := h.jwtManager.GenerateAccessToken(claims.UserID, claims.TenantID, freshEmail, isSystemAdmin, claims.SessionID)
+	if err != nil {
+		h.log.Error("Failed to generate access token on refresh", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+	newRefreshToken, _, err := h.jwtManager.GenerateRefreshToken(claims.UserID, claims.TenantID, freshEmail, isSystemAdmin, claims.SessionID)
+	if err != nil {
+		h.log.Error("Failed to generate refresh token on refresh", "error", err)
+		response.InternalServerError(c, "")
+		return
+	}
+
+	// Rotate: revoke the old row (if tracked), store the new hash so future
+	// refreshes are tracked and revocable.
+	if hasRow {
+		h.db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`, storedID)
+	}
+	newHash := crypto.HashToken(newRefreshToken)
+	h.db.Exec(`
+		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
+		VALUES ($1, $2, $3, $4, $5)
+	`, claims.UserID, newHash, []byte(`{}`), c.ClientIP(), expiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+
 	response.Success(c, gin.H{
-		"access_token":  tokenPair.AccessToken,
-		"refresh_token": tokenPair.RefreshToken,
-		"expires_at":    tokenPair.ExpiresAt,
-		"token_type":    tokenPair.TokenType,
+		"access_token":  accessToken,
+		"refresh_token": newRefreshToken,
+		"expires_at":    expiresAt,
+		"token_type":    "Bearer",
 	})
 }
 
@@ -1993,10 +2078,16 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 		},
 	})
 
+	// F3 (docs/admin-panel/audit.md): new companies enter the trial lifecycle
+	// (trialing + trial_ends_at + account_clear_at) instead of being created
+	// permanently 'active'/'free' with NULL dates (which meant unlimited free
+	// access forever and dead trial stats).
+	regTrialEnds := time.Now().AddDate(0, 0, 7)
+	regClearAt := regTrialEnds.AddDate(0, 0, 30)
 	_, err = tx.Exec(`
-		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status)
-		VALUES ($1, $2, $3, $4, 'free', 'active')
-	`, tenantID, input.TenantCode, input.TenantName, defaultSettings)
+		INSERT INTO tenants (id, code, name, settings, subscription_plan, subscription_status, trial_ends_at, account_clear_at)
+		VALUES ($1, $2, $3, $4, 'free', 'trialing', $5, $6)
+	`, tenantID, input.TenantCode, input.TenantName, defaultSettings, regTrialEnds, regClearAt)
 	if err != nil {
 		h.log.Error("Failed to create tenant", "error", err)
 		response.InternalServerError(c, "")

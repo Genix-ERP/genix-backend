@@ -18,6 +18,16 @@ const (
 	TokenTypeRefresh TokenType = "refresh"
 )
 
+// Token scope marks which plane a token belongs to (SEC-03,
+// docs/admin-panel/audit.md). It is derived from is_system_admin at mint time
+// and lets the admin choke point reject a token that carries the tenant scope,
+// as defence-in-depth beyond the isa flag. Legacy tokens minted before this
+// field existed carry an empty scope and are tolerated by RequireSystemAdmin.
+const (
+	ScopeTenant   = "tenant"
+	ScopePlatform = "platform"
+)
+
 // Claims represents JWT claims
 type Claims struct {
 	jwt.RegisteredClaims
@@ -25,8 +35,20 @@ type Claims struct {
 	TenantID      uuid.UUID `json:"tid"`
 	Email         string    `json:"email"`
 	IsSystemAdmin bool      `json:"isa"`
+	Scope         string    `json:"scp,omitempty"`
 	TokenType     TokenType `json:"type"`
 	SessionID     string    `json:"sid"`
+
+	// Platform control-plane identity (Phase 3). Present only on tokens minted by
+	// /platform/auth/login. PlatformRole drives the capability matrix.
+	PlatformUserID *uuid.UUID `json:"puid,omitempty"`
+	PlatformRole   string     `json:"prole,omitempty"`
+
+	// Impersonation (Phase 3). Present only on short-lived tokens minted by
+	// /admin/impersonate. ImpersonatedBy is the platform user acting; ReadOnly
+	// forbids mutations (tex_podderjka).
+	ImpersonatedBy *uuid.UUID `json:"imp,omitempty"`
+	ReadOnly       bool       `json:"ro,omitempty"`
 }
 
 // JWTManager handles JWT operations
@@ -97,6 +119,11 @@ func (m *JWTManager) generateToken(userID, tenantID uuid.UUID, email string, isS
 
 	expiresAt := now.Add(expiry)
 
+	scope := ScopeTenant
+	if isSystemAdmin {
+		scope = ScopePlatform
+	}
+
 	claims := &Claims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        uuid.New().String(),
@@ -111,6 +138,7 @@ func (m *JWTManager) generateToken(userID, tenantID uuid.UUID, email string, isS
 		TenantID:      tenantID,
 		Email:         email,
 		IsSystemAdmin: isSystemAdmin,
+		Scope:         scope,
 		TokenType:     tokenType,
 		SessionID:     sessionID,
 	}
@@ -122,6 +150,108 @@ func (m *JWTManager) generateToken(userID, tenantID uuid.UUID, email string, isS
 	}
 
 	return tokenString, expiresAt, nil
+}
+
+// GeneratePlatformTokenPair mints access+refresh tokens for a PLATFORM staff
+// user (Phase 3). The tokens carry the platform user id + role and the platform
+// scope; IsSystemAdmin is set true so the existing RequireSystemAdmin choke
+// point accepts them, while RequireCapability reads PlatformRole.
+func (m *JWTManager) GeneratePlatformTokenPair(platformUserID uuid.UUID, email, role string) (*TokenPair, error) {
+	sessionID, err := GenerateRandomString(32)
+	if err != nil {
+		return nil, err
+	}
+	access, expiresAt, err := m.generatePlatformToken(platformUserID, email, role, sessionID, TokenTypeAccess)
+	if err != nil {
+		return nil, err
+	}
+	refresh, _, err := m.generatePlatformToken(platformUserID, email, role, sessionID, TokenTypeRefresh)
+	if err != nil {
+		return nil, err
+	}
+	return &TokenPair{AccessToken: access, RefreshToken: refresh, ExpiresAt: expiresAt, TokenType: "Bearer"}, nil
+}
+
+func (m *JWTManager) generatePlatformToken(platformUserID uuid.UUID, email, role, sessionID string, tokenType TokenType) (string, time.Time, error) {
+	now := time.Now()
+	var expiry time.Duration
+	switch tokenType {
+	case TokenTypeAccess:
+		// Short platform session (Phase 2 target: ~12h). Capped below the tenant
+		// 24h default; a stolen platform token has a smaller window.
+		expiry = 12 * time.Hour
+	case TokenTypeRefresh:
+		expiry = m.config.RefreshTokenExpiry
+	default:
+		return "", time.Time{}, errors.New("invalid token type")
+	}
+	expiresAt := now.Add(expiry)
+	pid := platformUserID
+	claims := &Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.New().String(),
+			Subject:   platformUserID.String(),
+			Issuer:    m.config.Issuer,
+			Audience:  jwt.ClaimStrings{m.config.Audience},
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
+		},
+		UserID:         platformUserID,
+		TenantID:       uuid.Nil,
+		Email:          email,
+		IsSystemAdmin:  true,
+		Scope:          ScopePlatform,
+		TokenType:      tokenType,
+		SessionID:      sessionID,
+		PlatformUserID: &pid,
+		PlatformRole:   role,
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(m.config.SecretKey))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return signed, expiresAt, nil
+}
+
+// GenerateImpersonationToken mints a SHORT-LIVED tenant-scoped access token that
+// lets a platform user act inside a tenant (Phase 3). ttl is capped at 1h.
+// readOnly marks the token so mutating requests are rejected downstream.
+func (m *JWTManager) GenerateImpersonationToken(targetUserID, tenantID uuid.UUID, email string, impersonatedBy uuid.UUID, readOnly bool, ttl time.Duration) (string, time.Time, error) {
+	if ttl <= 0 || ttl > time.Hour {
+		ttl = time.Hour
+	}
+	now := time.Now()
+	expiresAt := now.Add(ttl)
+	imp := impersonatedBy
+	sessionID, _ := GenerateRandomString(16)
+	claims := &Claims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.New().String(),
+			Subject:   targetUserID.String(),
+			Issuer:    m.config.Issuer,
+			Audience:  jwt.ClaimStrings{m.config.Audience},
+			IssuedAt:  jwt.NewNumericDate(now),
+			NotBefore: jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
+		},
+		UserID:         targetUserID,
+		TenantID:       tenantID,
+		Email:          email,
+		IsSystemAdmin:  false,
+		Scope:          ScopeTenant,
+		TokenType:      TokenTypeAccess,
+		SessionID:      sessionID,
+		ImpersonatedBy: &imp,
+		ReadOnly:       readOnly,
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(m.config.SecretKey))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return signed, expiresAt, nil
 }
 
 // ValidateToken validates a JWT token and returns its claims

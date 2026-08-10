@@ -191,6 +191,9 @@ func (h *Handler) TenderAdminVerifyCompany(c *gin.Context) {
 		status = "rejected"
 	}
 
+	h.writePlatformAudit(c, "tender.company.verify", "company", companyID.String(), nil, nil,
+		map[string]interface{}{"is_verified": input.Verified, "status": status, "reason": input.Reason})
+
 	response.Success(c, map[string]interface{}{"id": companyID, "status": status})
 }
 
@@ -234,6 +237,15 @@ func (h *Handler) TenderAdminUpdateUser(c *gin.Context) {
 		response.InternalServerError(c, "Failed to update user")
 		return
 	}
+
+	after := map[string]interface{}{}
+	if input.Role != "" {
+		after["role"] = input.Role
+	}
+	if input.IsVerified != nil {
+		after["is_verified"] = *input.IsVerified
+	}
+	h.writePlatformAudit(c, "tender.user.update", "company", companyID.String(), nil, nil, after)
 
 	response.Success(c, map[string]interface{}{"id": companyID, "message": "User updated"})
 }

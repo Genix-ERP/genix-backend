@@ -193,6 +193,7 @@ var workflowActionTypes = map[string]bool{
 	"create_task":         true,
 	"update_field":        true,
 	"send_telegram":       true,
+	"run_ai_agent":        true, // headless read-only agent run → notification
 	// legacy aliases still present in stored rules
 	"update_status":        true,
 	"update_task_priority": true,
@@ -674,6 +675,8 @@ func (h *Handler) executeWorkflowAction(ctx workflowEventCtx, ruleID uuid.UUID, 
 	case "update_task_priority":
 		cfg := map[string]interface{}{"target": "tasks", "field": "priority", "value": action.Config["priority"]}
 		return h.wfActionUpdateField(ctx, cfg)
+	case "run_ai_agent":
+		return h.wfActionRunAIAgent(ctx, ruleName, action.Config)
 	case "send_telegram":
 		return "", fmt.Errorf("telegram_not_configured")
 	case "create_record":
@@ -1013,6 +1016,13 @@ func validateWorkflowRuleConfig(triggerEvent string, conditions, actions json.Ra
 				field, _ := a.Config["field"].(string)
 				if allowed, ok := workflowUpdatableFields[target]; !ok || !allowed[field] {
 					return "", false, fmt.Errorf("action %d (update_field): %s.%s is not an allowed target", i+1, target, field)
+				}
+			case "run_ai_agent":
+				if prompt, _ := a.Config["prompt"].(string); strings.TrimSpace(prompt) == "" {
+					return "", false, fmt.Errorf("action %d (run_ai_agent): prompt is required", i+1)
+				}
+				if agent, _ := a.Config["agent"].(string); agent != "" && findAgentDef(agent) == nil {
+					return "", false, fmt.Errorf("action %d (run_ai_agent): unknown agent %q", i+1, agent)
 				}
 			}
 		}

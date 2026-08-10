@@ -230,5 +230,11 @@ func (h *Handler) UpsertMobileVersion(c *gin.Context) {
 		return
 	}
 
+	h.writePlatformAudit(c, "mobile_version.upsert", "mobile_version", platform, nil, nil,
+		map[string]interface{}{
+			"latest_version": in.LatestVersion, "min_version": in.MinVersion,
+			"force_update": in.ForceUpdate, "is_active": isActive,
+		})
+
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Mobile version updated", "platform": platform})
 }

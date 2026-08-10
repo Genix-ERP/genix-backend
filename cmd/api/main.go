@@ -54,6 +54,13 @@ func main() {
 	log := logger.NewLogger(cfg.Log.Level, cfg.Log.Format)
 	log.Info("Starting GenixERP Backend", "version", "2.0.0", "env", cfg.App.Env)
 
+	// SEC-07 (docs/admin-panel/audit.md): the default JWT secret is only tolerated
+	// in local dev/test — and even there it is a liability because the same key
+	// signs platform-admin tokens. Warn loudly so it is never mistaken for safe.
+	if cfg.UsesInsecureDefaultSecret() {
+		log.Warn("INSECURE JWT_SECRET_KEY: using the built-in default. Anyone who knows it can forge an is_system_admin token. Set a strong unique JWT_SECRET_KEY. (Refused automatically outside local dev/test.)", "env", cfg.App.Env)
+	}
+
 	// Set Gin mode
 	if cfg.App.Env == "production" {
 		gin.SetMode(gin.ReleaseMode)

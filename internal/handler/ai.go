@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -82,6 +83,20 @@ func detectLanguage(message string) string {
 	return "" // Could not detect with confidence
 }
 
+// tenantAILimiters caches one RateLimiter per tenant so AI_RATE_LIMIT_PER_MIN
+// actually limits (a per-request limiter counts every request as its first —
+// audit C10).
+var tenantAILimiters sync.Map // uuid.UUID -> *ai.RateLimiter
+
+func tenantAILimiter(tenantID uuid.UUID, perMin int) *ai.RateLimiter {
+	if v, ok := tenantAILimiters.Load(tenantID); ok {
+		return v.(*ai.RateLimiter)
+	}
+	limiter := ai.NewRateLimiter(perMin)
+	actual, _ := tenantAILimiters.LoadOrStore(tenantID, limiter)
+	return actual.(*ai.RateLimiter)
+}
+
 // getAIService builds the AI client for a tenant, using that tenant's own
 // provider/model/key/endpoint from Admin → AI settings when configured, and
 // falling back to the server-wide env config otherwise. Pass uuid.Nil for the
@@ -95,18 +110,18 @@ func (h *Handler) getAIService(tenantID uuid.UUID) *AIService {
 	}
 	return &AIService{
 		client:      ai.NewClient(cfg),
-		rateLimiter: ai.NewRateLimiter(cfg.RateLimitPerMin),
+		rateLimiter: tenantAILimiter(tenantID, cfg.RateLimitPerMin),
 	}
 }
 
-// AIChatRequest represents a chat request
+// AIChatRequest represents a chat request. LEGACY endpoint kept for backward
+// compatibility; the agentic POST /ai/agent is the primary surface.
+// system_prompt/model/max_tokens are NO LONGER accepted from the client — an
+// authenticated user could otherwise use the server's API key as an
+// unrestricted LLM proxy (audit C5).
 type AIChatRequest struct {
-	Message      string                 `json:"message" binding:"required"`
-	Context      map[string]interface{} `json:"context,omitempty"`
-	SystemPrompt string                 `json:"system_prompt,omitempty"`
-	Model        string                 `json:"model,omitempty"`
-	MaxTokens    int                    `json:"max_tokens,omitempty"`
-	Temperature  float64                `json:"temperature,omitempty"`
+	Message string                 `json:"message" binding:"required"`
+	Context map[string]interface{} `json:"context,omitempty"`
 }
 
 // AIChat handles AI chat requests
@@ -119,6 +134,9 @@ func (h *Handler) AIChat(c *gin.Context) {
 	}
 
 	tenantID, _ := middleware.GetTenantID(c)
+	if h.aiQuotaExceeded(c, tenantID) {
+		return
+	}
 	aiService := h.getAIService(tenantID)
 
 	// If no AI API key configured, return demo response
@@ -151,11 +169,8 @@ func (h *Handler) AIChat(c *gin.Context) {
 	// Build messages
 	messages := []ai.Message{}
 
-	// Add system prompt
-	systemPrompt := req.SystemPrompt
-	if systemPrompt == "" {
-		systemPrompt = h.getDefaultSystemPrompt(req.Context)
-	}
+	// System prompt is always server-owned (never client-supplied).
+	systemPrompt := h.getDefaultSystemPrompt(req.Context)
 
 	// Detect language from the actual message
 	detectedLang := detectLanguage(req.Message)
@@ -174,12 +189,9 @@ func (h *Handler) AIChat(c *gin.Context) {
 		Content: req.Message,
 	})
 
-	// Create chat request
+	// Create chat request — model/limits come from tenant/env config only.
 	chatReq := &ai.ChatRequest{
-		Model:       req.Model,
-		Messages:    messages,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
+		Messages: messages,
 	}
 
 	// Call AI
@@ -203,6 +215,10 @@ func (h *Handler) AIChat(c *gin.Context) {
 		})
 		return
 	}
+
+	// Count against the tenant's monthly quota + usage dashboard.
+	userID, _ := middleware.GetUserID(c)
+	h.logAIUsage(tenantID.String(), userID.String(), "chat", chatResp.Model, chatResp.Usage.PromptTokens, chatResp.Usage.CompletionTokens)
 
 	response.Success(c, gin.H{
 		"message": gin.H{
@@ -393,48 +409,172 @@ func (h *Handler) GetAICapabilities(c *gin.Context) {
 }
 
 // ========== Conversations ==========
+// Server-side thread persistence over the ai_conversations / ai_messages
+// tables (present since migration 001, unused until the AI Yordamchi rebuild).
+// Threads are scoped to tenant + owning user.
 
-// ListAIConversations lists AI conversations (stub - would need database implementation)
+// ListAIConversations lists the caller's conversations, newest first.
 func (h *Handler) ListAIConversations(c *gin.Context) {
-	// TODO: Implement with database
-	response.Success(c, []interface{}{})
+	tenantID, _ := middleware.GetTenantID(c)
+	userID, _ := middleware.GetUserID(c)
+	rows, err := h.db.Query(`SELECT id, COALESCE(title,''), COALESCE(context,'{}'), created_at, updated_at
+	      FROM ai_conversations
+	     WHERE tenant_id = $1 AND user_id = $2 AND is_archived = false
+	     ORDER BY updated_at DESC LIMIT 50`, tenantID, userID)
+	if err != nil {
+		h.log.Error("failed to list AI conversations", "error", err)
+		response.Success(c, []interface{}{})
+		return
+	}
+	defer rows.Close()
+	items := make([]gin.H, 0, 50)
+	for rows.Next() {
+		var id uuid.UUID
+		var title string
+		var contextJSON []byte
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(&id, &title, &contextJSON, &createdAt, &updatedAt); err != nil {
+			continue
+		}
+		var ctxMap map[string]interface{}
+		_ = json.Unmarshal(contextJSON, &ctxMap)
+		items = append(items, gin.H{"id": id, "title": title, "context": ctxMap, "created_at": createdAt, "updated_at": updatedAt})
+	}
+	response.Success(c, items)
 }
 
-// CreateAIConversation creates a new AI conversation
+// CreateAIConversation creates a new conversation thread.
 func (h *Handler) CreateAIConversation(c *gin.Context) {
+	tenantID, _ := middleware.GetTenantID(c)
+	userID, _ := middleware.GetUserID(c)
 	var input entity.CreateConversationInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid request")
 		return
 	}
-
-	// TODO: Save to database
-	conversation := gin.H{
-		"id":         uuid.New().String(),
-		"title":      input.Title,
-		"context":    input.Context,
-		"created_at": time.Now(),
+	ctxJSON, _ := json.Marshal(input.Context)
+	if len(ctxJSON) == 0 || string(ctxJSON) == "null" {
+		ctxJSON = []byte("{}")
 	}
-
-	response.Created(c, conversation)
+	id := uuid.New()
+	_, err := h.db.Exec(`INSERT INTO ai_conversations (id, tenant_id, user_id, title, context)
+	                     VALUES ($1,$2,$3,$4,$5)`, id, tenantID, userID, input.Title, ctxJSON)
+	if err != nil {
+		h.log.Error("failed to create AI conversation", "error", err)
+		response.InternalError(c, "Failed to create conversation")
+		return
+	}
+	response.Created(c, gin.H{"id": id, "title": input.Title, "context": input.Context, "created_at": time.Now()})
 }
 
-// GetAIConversation gets an AI conversation by ID
+// GetAIConversation returns a conversation and its messages.
 func (h *Handler) GetAIConversation(c *gin.Context) {
-	// TODO: Implement with database
-	response.NotFound(c, "Conversation")
+	tenantID, _ := middleware.GetTenantID(c)
+	userID, _ := middleware.GetUserID(c)
+	convID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid conversation id")
+		return
+	}
+	var title string
+	var createdAt time.Time
+	err = h.db.QueryRow(`SELECT COALESCE(title,''), created_at FROM ai_conversations
+	     WHERE id = $1 AND tenant_id = $2 AND user_id = $3`, convID, tenantID, userID).
+		Scan(&title, &createdAt)
+	if err != nil {
+		response.NotFound(c, "Conversation")
+		return
+	}
+	rows, err := h.db.Query(`SELECT id, role, content, COALESCE(metadata,'{}'), created_at
+	      FROM ai_messages WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT 200`, convID)
+	msgs := make([]gin.H, 0, 50)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var id uuid.UUID
+			var role, content string
+			var metaJSON []byte
+			var msgAt time.Time
+			if err := rows.Scan(&id, &role, &content, &metaJSON, &msgAt); err != nil {
+				continue
+			}
+			var meta map[string]interface{}
+			_ = json.Unmarshal(metaJSON, &meta)
+			msgs = append(msgs, gin.H{"id": id, "role": role, "content": content, "metadata": meta, "created_at": msgAt})
+		}
+	}
+	response.Success(c, gin.H{"id": convID, "title": title, "created_at": createdAt, "messages": msgs})
 }
 
-// DeleteAIConversation deletes an AI conversation
+// DeleteAIConversation deletes a conversation (messages cascade).
 func (h *Handler) DeleteAIConversation(c *gin.Context) {
-	// TODO: Implement with database
+	tenantID, _ := middleware.GetTenantID(c)
+	userID, _ := middleware.GetUserID(c)
+	convID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid conversation id")
+		return
+	}
+	_, err = h.db.Exec(`DELETE FROM ai_conversations WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
+		convID, tenantID, userID)
+	if err != nil {
+		h.log.Error("failed to delete AI conversation", "error", err)
+		response.InternalError(c, "Failed to delete conversation")
+		return
+	}
 	response.NoContent(c)
 }
 
-// AddAIMessage adds a message to a conversation
+// AddAIMessage appends a message to a conversation and bumps its recency.
+// The first user message becomes the thread title when none is set.
 func (h *Handler) AddAIMessage(c *gin.Context) {
-	// TODO: Implement with database
-	response.Created(c, gin.H{"message": "Message added"})
+	tenantID, _ := middleware.GetTenantID(c)
+	userID, _ := middleware.GetUserID(c)
+	convID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid conversation id")
+		return
+	}
+	var input struct {
+		Role     string                 `json:"role" binding:"required"`
+		Content  string                 `json:"content" binding:"required"`
+		Metadata map[string]interface{} `json:"metadata"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid request")
+		return
+	}
+	if input.Role != "user" && input.Role != "assistant" && input.Role != "system" {
+		response.BadRequest(c, "Invalid role")
+		return
+	}
+	// Ownership check.
+	var one int
+	if err := h.db.QueryRow(`SELECT 1 FROM ai_conversations WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		convID, tenantID, userID).Scan(&one); err != nil {
+		response.NotFound(c, "Conversation")
+		return
+	}
+	metaJSON, _ := json.Marshal(input.Metadata)
+	if len(metaJSON) == 0 || string(metaJSON) == "null" {
+		metaJSON = []byte("{}")
+	}
+	id := uuid.New()
+	_, err = h.db.Exec(`INSERT INTO ai_messages (id, conversation_id, role, content, metadata)
+	                    VALUES ($1,$2,$3,$4,$5)`, id, convID, input.Role, input.Content, metaJSON)
+	if err != nil {
+		h.log.Error("failed to add AI message", "error", err)
+		response.InternalError(c, "Failed to add message")
+		return
+	}
+	title := strings.TrimSpace(input.Content)
+	if len(title) > 80 {
+		title = title[:80]
+	}
+	_, _ = h.db.Exec(`UPDATE ai_conversations SET updated_at = NOW(),
+	        title = CASE WHEN COALESCE(title,'') = '' AND $2 = 'user' THEN $3 ELSE title END
+	     WHERE id = $1`, convID, input.Role, title)
+	response.Created(c, gin.H{"id": id})
 }
 
 // ========== Prompts ==========
@@ -648,21 +788,23 @@ Rules:
 
 Analyze the invoice image and return the extracted data as JSON:`
 
-	// Create chat request with image
+	// Attach the ACTUAL image to the request (audit C2: it used to be
+	// validated but never sent, so the model hallucinated extractions).
+	// The client renders it provider-specifically (Anthropic image block /
+	// OpenAI image_url data URI). Model comes from the tenant's config.
 	messages := []ai.Message{
 		{
 			Role:    "user",
 			Content: extractionPrompt,
+			Images: []ai.ImageAttachment{
+				{MediaType: req.MimeType, DataBase64: req.ImageBase64},
+			},
 		},
 	}
 
-	// For OpenAI with vision capability, we need to use a specific format
-	// For now, we'll use the text-based prompt approach
 	chatReq := &ai.ChatRequest{
-		Model:       "gpt-4o", // Use vision-capable model
-		Messages:    messages,
-		MaxTokens:   2000,
-		Temperature: 0.1, // Low temperature for consistent extraction
+		Messages:  messages,
+		MaxTokens: 2000,
 	}
 
 	// Call AI
