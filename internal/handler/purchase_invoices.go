@@ -47,7 +47,8 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			   pi.purchase_order_id, po.order_number as po_number,
 			   pi.goods_receipt_id, gr.gr_number as gr_number,
 			   COALESCE(pi.invoice_type, 'invoice') as invoice_type, pi.original_invoice_id, pi.reason,
-			   ` + invoiceOverdueSQL("pi") + ` AS is_overdue
+			   ` + invoiceOverdueSQL("pi") + ` AS is_overdue,
+			   ` + invoiceDaysOverdueSQL("pi") + ` AS days_overdue
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		LEFT JOIN purchase_orders po ON pi.purchase_order_id = po.id
@@ -119,6 +120,12 @@ func (h *Handler) ListPurchaseInvoices(c *gin.Context) {
 			&isOverdue, &daysOverdue,
 		)
 		if err != nil {
+			// A scan error here is a SELECT/destination mismatch, not bad data:
+			// it fails identically on every row and returns an empty list with
+			// a 200. Silence is exactly how `days_overdue` shipped missing from
+			// the projection while the Scan expected it — the endpoint answered
+			// "no invoices" for two days. Log it; do not swallow it.
+			h.log.Error("Failed to scan purchase invoice row — list will be short or empty", "error", err)
 			continue
 		}
 

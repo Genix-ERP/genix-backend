@@ -155,6 +155,12 @@ func (h *Handler) ListSalesInvoices(c *gin.Context) {
 			&isOverdue, &daysOverdue, &paymentStatus,
 		)
 		if err != nil {
+			// A scan error here is a SELECT/destination mismatch, not bad data:
+			// it fails identically on every row and returns an empty list with
+			// a 200. Silence is exactly how `days_overdue` shipped missing from
+			// the projection while the Scan expected it — the endpoint answered
+			// "no invoices" for two days. Log it; do not swallow it.
+			h.log.Error("Failed to scan sales invoice row — list will be short or empty", "error", err)
 			continue
 		}
 
