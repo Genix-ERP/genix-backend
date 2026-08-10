@@ -139,6 +139,9 @@ func (h *Handler) GetConstructionProjectStats(c *gin.Context) {
 		ID           int64   `json:"id"`
 		ReadinessPct float64 `json:"readiness_pct"`
 		ActualAmount float64 `json:"actual_amount"`
+		// Muddati o'tgan ishlar soni (Ish grafigi, migration 471) — portfel
+		// kartasidagi qizil chip + KPI-strip uchun.
+		OverdueWorks int `json:"overdue_works"`
 	}
 	perByID := map[int64]*perProject{}
 	if rows, err := h.db.Query(`
@@ -205,6 +208,41 @@ func (h *Handler) GetConstructionProjectStats(c *gin.Context) {
 		}
 		rows.Close()
 	}
+	// Muddati o'tgan ishlar (Ish grafigi): sched_end o'tgan + bajarilish
+	// to'liq emas — skaner predikati bilan bir xil (workflow_rules.go).
+	if rows, err := h.db.Query(`
+		SELECT e.project_id, COUNT(*)
+		FROM construction_estimate_line el
+		JOIN construction_estimate e ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
+		JOIN construction_projects p ON p.id = e.project_id AND p.tenant_id = el.tenant_id
+		WHERE el.tenant_id = $1
+		  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		  AND COALESCE(el.resource_type, '') = ''
+		  AND COALESCE(el.parent_line_id, 0) = 0
+		  AND el.sched_end IS NOT NULL AND el.sched_end < CURRENT_DATE
+		  AND COALESCE(el.done_quantity, 0) < CASE
+		        WHEN COALESCE(el.imported_quantity, 0) > 0 THEN el.imported_quantity
+		        WHEN COALESCE(el.original_quantity, 0) > 0 THEN el.original_quantity
+		        ELSE COALESCE(el.quantity, 0) END
+		  AND p.deleted_at IS NULL
+		  AND ($2::uuid IS NULL OR p.organization_id = $2)
+		GROUP BY e.project_id
+		LIMIT 500
+	`, tenantID, orgArg); err == nil {
+		for rows.Next() {
+			var id int64
+			var n int
+			if rows.Scan(&id, &n) == nil {
+				if pp, okPP := perByID[id]; okPP {
+					pp.OverdueWorks = n
+				} else {
+					perByID[id] = &perProject{ID: id, OverdueWorks: n}
+				}
+			}
+		}
+		rows.Close()
+	}
+
 	per := make([]perProject, 0, len(perByID))
 	for _, pp := range perByID {
 		per = append(per, *pp)

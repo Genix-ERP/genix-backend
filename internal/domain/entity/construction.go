@@ -900,6 +900,9 @@ type CreateDailyReportInput struct {
 	Visitors          string                   `json:"visitors"`
 	ReportedBy        int64                    `json:"reported_by"`
 	Photos            []map[string]interface{} `json:"photos"`
+	// Bajarilgan hajm (migration 473) — web-jurnal endi hajm saqlaydi.
+	QuantityDone float64 `json:"quantity_done"`
+	UOM          string  `json:"uom"`
 }
 
 // =====================================================

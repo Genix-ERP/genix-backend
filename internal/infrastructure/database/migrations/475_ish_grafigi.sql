@@ -1,5 +1,14 @@
 -- 471_ish_grafigi.sql — Ish grafigi (Gantt) v2, S8 birinchi bosqich.
 --
+-- RENUMBERED 471 -> 475. The original number collided with a migration already
+-- on main, and schema_migrations.version is a PRIMARY KEY: two files sharing a
+-- version both land in `pending`, both apply, and the second INSERT violates
+-- the key — so RunMigrations returns an error and the API crash-loops on boot.
+-- On a database that had already recorded that version, the loser is instead
+-- skipped forever and its columns silently never appear. Every statement here
+-- is ADD COLUMN IF NOT EXISTS, so running under the new number is a no-op
+-- wherever it somehow already ran.
+--
 -- Gectaro modeli: smeta va grafik BITTA ish ro'yxatining ikki ko'rinishi.
 -- Shuning uchun sana maydonlari to'g'ridan-to'g'ri ish qatorlariga
 -- (construction_estimate_line, ish = resource_type='' AND parent_line_id=0)

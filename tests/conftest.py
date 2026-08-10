@@ -133,8 +133,8 @@ class APIClient:
     as a real assertion failure.
     """
 
-    RETRY_429 = 3
-    RETRY_PAUSE = 8  # seconds — long enough for the per-minute window to breathe
+    RETRY_429 = 4
+    RETRY_PAUSE = 18  # seconds — 4×18s spans a full 60s rate-limit window
 
     def __init__(self, base_url, token=None, tenant_id=None, org_id=None):
         self.base_url = base_url

@@ -277,3 +277,83 @@ def test_subcontract_contract_number_roundtrip(api_client, proj):
     resp = api_client.get(f"/construction/projects/{proj['id']}/subcontracts")
     updated = next(s for s in resp.json()["data"] if s["id"] == mine["id"])
     assert updated.get("contract_number") == "№ 13/2026-T33"
+
+
+# ─── 4. Follow-up funksiyalar (2026-08-09, portfel-turkum) ───────────────
+
+def test_stats_per_project_has_overdue_works(api_client, proj):
+    """Ish grafigi kechikkan ishi stats.per_project.overdue_works'da sanaladi."""
+    # B ishiga o'tgan sana beramiz (done < plan) — overdue predikatiga tushadi.
+    resp = api_client.post(f"/construction/projects/{proj['id']}/schedule/bulk", json={
+        "items": [{"line_id": proj["works"]["C"],
+                   "sched_start": "2026-07-01", "sched_end": "2026-07-02"}]})
+    assert resp.status_code == 200, resp.text
+
+    resp = api_client.get("/construction/projects/stats")
+    assert resp.status_code == 200, resp.text
+    per = resp.json()["data"].get("per_project") or []
+    mine = next((p for p in per if p.get("id") == proj["id"]), None)
+    assert mine is not None
+    assert "overdue_works" in mine
+    assert mine["overdue_works"] >= 1, mine
+
+
+def test_daily_log_quantity_roundtrip(api_client, proj):
+    """Web jurnal yozuvi endi bajarilgan hajmni saqlaydi (KS-2 manbasi)."""
+    resp = api_client.post(f"/construction/projects/{proj['id']}/daily-logs", json={
+        "date": "2026-08-09",
+        "description": "Beton quyildi (T33)",
+        "workers_count": 5,
+        "quantity_done": 12.5,
+        "uom": "m3",
+    })
+    assert resp.status_code in (200, 201), resp.text
+
+    resp = api_client.get(f"/construction/projects/{proj['id']}/daily-logs")
+    assert resp.status_code == 200, resp.text
+    logs = resp.json()["data"]
+    if isinstance(logs, dict):
+        logs = logs.get("items") or logs.get("logs") or []
+    mine = next((l for l in logs if (l.get("description") or "").startswith("Beton quyildi (T33)")), None)
+    assert mine is not None, "created log not found in list"
+    assert abs(float(mine.get("quantity_done") or 0) - 12.5) < 0.001, mine
+
+
+def test_catalog_has_stage_budget_exceeded(api_client):
+    resp = api_client.get("/workflow-events")
+    assert resp.status_code == 200, resp.text
+    names = set()
+    stack = [resp.json()["data"]]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            for k in ("event", "name"):
+                if isinstance(cur.get(k), str):
+                    names.add(cur[k])
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    assert "construction.stage_budget_exceeded" in names
+
+
+def test_daily_report_quantity_roundtrip(api_client, proj):
+    """Web-modal yozadigan daily-REPORTS yo'li ham hajmni saqlaydi (473)."""
+    resp = api_client.post(f"/construction/projects/{proj['id']}/daily-reports", json={
+        "report_date": "2026-08-09",
+        "work_summary": "Armatura bog'lash (T33-DR)",
+        "workers_count": 4,
+        "quantity_done": 3.75,
+        "uom": "t",
+    })
+    assert resp.status_code in (200, 201), resp.text
+
+    resp = api_client.get(f"/construction/projects/{proj['id']}/daily-reports")
+    assert resp.status_code == 200, resp.text
+    reports = resp.json()["data"]
+    if isinstance(reports, dict):
+        reports = reports.get("items") or []
+    mine = next((r for r in reports
+                 if (r.get("work_summary") or "").startswith("Armatura bog'lash (T33-DR)")), None)
+    assert mine is not None, "created report not found"
+    assert abs(float(mine.get("quantity_done") or 0) - 3.75) < 0.001, mine
+    assert mine.get("uom") == "t"

@@ -168,6 +168,13 @@ var workflowEventCatalog = map[string]workflowEventDef{
 		"record_id": "42", "work_id": "1207", "work_name": "G'isht terish, 3-qavat", "project_name": "Yunusobod turar-joy majmuasi", "sched_end": "2026-08-01", "progress_pct": 60.0}},
 	"construction.work_completed": {Category: "construction", RelatedType: "construction_project", Scheduled: false, SampleData: map[string]interface{}{
 		"record_id": "42", "work_id": "1207", "work_name": "G'isht terish, 3-qavat", "project_name": "Yunusobod turar-joy majmuasi", "done_quantity": 650.0}},
+	// Bosqich-darajali byudjet-oshish (qurilish-v2): fakt = approved CEL
+	// (stage_id bo'yicha), reja = shu bo'lim ishlarining total_amount jamlanmasi
+	// (Byudjet tabidagi threshold-legenda bilan bir xil manba). DedupeKey =
+	// stage id, 7-kunlik cooldown — oshish saqlanarkan haftada bir qayta ogohlantiradi.
+	"construction.stage_budget_exceeded": {Category: "construction", RelatedType: "construction_project", Scheduled: true, SampleData: map[string]interface{}{
+		"record_id": "42", "stage_id": "6", "stage_name": "Poydevor", "project_name": "Yunusobod turar-joy majmuasi",
+		"plan": 1516198360.0, "actual": 1620000000.0, "exceed_pct": 6.8}},
 }
 
 // workflowActionTypes is the set of executable action types. Legacy types

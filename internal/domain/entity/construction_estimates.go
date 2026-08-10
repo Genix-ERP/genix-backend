@@ -482,6 +482,11 @@ type ConstructionDailyLog struct {
 	UpdatedDate time.Time `json:"updated_date" db:"updated_date"`
 
 	// Computed
+	// Bajarilgan hajm (qurilish-v2 fix) — KS-2 avto-generatsiya manbasi.
+	QuantityDone float64        `json:"quantity_done" db:"quantity_done"`
+	UOM          sql.NullString `json:"uom" db:"uom"`
+	WBSID        sql.NullInt64  `json:"wbs_id" db:"wbs_id"`
+
 	BuildingName       string  `json:"building_name,omitempty" db:"building_name"`
 	StageName          string  `json:"stage_name,omitempty" db:"stage_name"`
 	StageProgress      float64 `json:"stage_progress" db:"stage_progress"`
@@ -507,6 +512,9 @@ func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
 		ReportedBy     interface{} `json:"reported_by"`
 		CreatedDate    time.Time   `json:"created_date"`
 		UpdatedDate    time.Time   `json:"updated_date"`
+		QuantityDone   float64     `json:"quantity_done"`
+		UOM            interface{} `json:"uom"`
+		WBSID          interface{} `json:"wbs_id"`
 		BuildingName       string      `json:"building_name,omitempty"`
 		StageName          string      `json:"stage_name,omitempty"`
 		StageProgress      float64     `json:"stage_progress"`
@@ -529,6 +537,9 @@ func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
 		ReportedBy:         nullUUIDValue(d.ReportedBy),
 		CreatedDate:        d.CreatedDate,
 		UpdatedDate:        d.UpdatedDate,
+		QuantityDone:       d.QuantityDone,
+		UOM:                nullStringValue(d.UOM),
+		WBSID:              nullInt64Value(d.WBSID),
 		BuildingName:       d.BuildingName,
 		StageName:          d.StageName,
 		StageProgress:      d.StageProgress,
@@ -548,6 +559,13 @@ type CreateDailyLogInput struct {
 	Weather        string  `json:"weather"`
 	Description    string  `json:"description"`
 	Issues         string  `json:"issues"`
+	// Bajarilgan hajm (qurilish-v2 audit fix): web-forma bu maydonlarni
+	// yozmasdi, shuning uchun UI orqali kiritilgan jurnal yozuvlari KS-2
+	// avto-generatsiyaga 0 hissa qo'shardi. WBSID ixtiyoriy — KS-2 wbs_id
+	// bo'yicha yig'adi.
+	QuantityDone float64 `json:"quantity_done"`
+	UOM          string  `json:"uom"`
+	WBSID        int64   `json:"wbs_id"`
 }
 
 type UpdateDailyLogInput struct {
