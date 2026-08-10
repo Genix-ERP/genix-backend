@@ -125,31 +125,49 @@ type SyncRatesInput struct {
 // RECONCILIATION ACT (Akt sverka)
 // ============================================
 
+// ReconciliationAct is NOT the wire format. Every reconciliation endpoint
+// marshals handler.reconciliationActResponse instead, and nothing in the
+// codebase references this type — verified with
+// `grep -rn 'entity.ReconciliationAct\b' internal/`.
+//
+// PartnerDebitTotal, PartnerCreditTotal, PartnerBalance and Difference used to
+// be declared here. They were removed rather than implemented:
+//
+//   - No handler has ever emitted them, so no client has ever received one.
+//   - A mobile client nonetheless parsed all four, got the zero value, and
+//     rendered "Farq: 0 so'm" beside a green checkmark on every single act.
+//     That is not "the two sides agree" — it is "no such field", shown to the
+//     user as a settled fact.
+//   - Populating them honestly needs the counterparty to enter THEIR ledger.
+//     The share link (SharedReconciliation) lets a partner confirm or dispute
+//     an act; it has no way to submit their own debit and credit totals. There
+//     is no data to fill these from.
+//
+// The database columns from migration 125_reconciliation_acts.sql are left
+// alone — dropping columns is not reversible and is a separate decision. If a
+// two-sided comparison is ever wanted, it starts with a way for the partner to
+// enter their side, and the fields come back then.
 type ReconciliationAct struct {
-	ID                uuid.UUID    `json:"id" db:"id"`
-	TenantID          uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	OrganizationID    *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
-	PartnerID         uuid.UUID    `json:"partner_id" db:"partner_id"`
-	PartnerName       string       `json:"partner_name,omitempty" db:"-"`
-	PeriodStart       string       `json:"period_start" db:"period_start"`
-	PeriodEnd         string       `json:"period_end" db:"period_end"`
-	OpeningBalance    float64      `json:"opening_balance" db:"opening_balance"`
-	OurDebitTotal     float64      `json:"our_debit_total" db:"our_debit_total"`
-	OurCreditTotal    float64      `json:"our_credit_total" db:"our_credit_total"`
-	OurBalance        float64      `json:"our_balance" db:"our_balance"`
-	PartnerDebitTotal float64      `json:"partner_debit_total" db:"partner_debit_total"`
-	PartnerCreditTotal float64     `json:"partner_credit_total" db:"partner_credit_total"`
-	PartnerBalance    float64      `json:"partner_balance" db:"partner_balance"`
-	Difference        float64      `json:"difference" db:"difference"`
-	Status            string       `json:"status" db:"status"`
-	Notes             string       `json:"notes,omitempty" db:"notes"`
-	ConfirmedAt       *time.Time   `json:"confirmed_at,omitempty" db:"confirmed_at"`
-	ConfirmedBy       *uuid.UUID   `json:"confirmed_by,omitempty" db:"confirmed_by"`
-	CreatedBy         *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt         time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt         time.Time    `json:"updated_at" db:"updated_at"`
-	DeletedAt         sql.NullTime `json:"-" db:"deleted_at"`
-	Lines             []ReconciliationLine `json:"lines,omitempty" db:"-"`
+	ID             uuid.UUID            `json:"id" db:"id"`
+	TenantID       uuid.UUID            `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID           `json:"organization_id,omitempty" db:"organization_id"`
+	PartnerID      uuid.UUID            `json:"partner_id" db:"partner_id"`
+	PartnerName    string               `json:"partner_name,omitempty" db:"-"`
+	PeriodStart    string               `json:"period_start" db:"period_start"`
+	PeriodEnd      string               `json:"period_end" db:"period_end"`
+	OpeningBalance float64              `json:"opening_balance" db:"opening_balance"`
+	OurDebitTotal  float64              `json:"our_debit_total" db:"our_debit_total"`
+	OurCreditTotal float64              `json:"our_credit_total" db:"our_credit_total"`
+	OurBalance     float64              `json:"our_balance" db:"our_balance"`
+	Status         string               `json:"status" db:"status"`
+	Notes          string               `json:"notes,omitempty" db:"notes"`
+	ConfirmedAt    *time.Time           `json:"confirmed_at,omitempty" db:"confirmed_at"`
+	ConfirmedBy    *uuid.UUID           `json:"confirmed_by,omitempty" db:"confirmed_by"`
+	CreatedBy      *uuid.UUID           `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt      time.Time            `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time            `json:"updated_at" db:"updated_at"`
+	DeletedAt      sql.NullTime         `json:"-" db:"deleted_at"`
+	Lines          []ReconciliationLine `json:"lines,omitempty" db:"-"`
 }
 
 type ReconciliationLine struct {

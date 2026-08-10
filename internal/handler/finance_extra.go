@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -2371,22 +2372,9 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 
 	paginate, page, pageSize, offset := optPagination(c)
 
-	baseWhere := " WHERE ra.tenant_id = $1 AND ra.deleted_at IS NULL"
-	whereExtra := ""
-	args := []interface{}{tenantID}
-	argCount := 1
-
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		whereExtra += fmt.Sprintf(" AND ra.organization_id = $%d", argCount)
-		args = append(args, orgID)
-	}
-
-	if status := c.Query("status"); status != "" {
-		argCount++
-		whereExtra += fmt.Sprintf(" AND ra.status = $%d", argCount)
-		args = append(args, status)
-	}
+	// Filter, FROM clause and count all come from one place, so the total in
+	// the pagination footer always describes the rows the pages contain.
+	where, args, argCount := reconciliationWhere(c, tenantID, true)
 
 	query := `
 		SELECT ra.id, ra.partner_id, COALESCE(ct.name, '') as partner_name,
@@ -2396,8 +2384,7 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 			   ra.response_status, ra.responded_at, ra.dispute_note, ra.respondent_name,
 			   ra.sent_at, ra.sent_via, ra.sent_to,
 			   COALESCE(ra.reminder_3d_sent, false), COALESCE(ra.reminder_7d_sent, false)
-		FROM reconciliation_acts ra
-		LEFT JOIN contacts ct ON ra.partner_id = ct.id` + baseWhere + whereExtra + " ORDER BY ra.created_at DESC"
+		` + reconciliationFromSQL + where + " ORDER BY ra.created_at DESC"
 
 	if paginate {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
@@ -2488,8 +2475,10 @@ func (h *Handler) ListReconciliationActs(c *gin.Context) {
 		return
 	}
 
+	// Same FROM as the rows — the join to contacts must be here, because the
+	// search filter references ct.name.
 	var total int
-	_ = h.db.QueryRow("SELECT COUNT(*) FROM reconciliation_acts ra"+baseWhere+whereExtra, args[:argCount]...).Scan(&total)
+	_ = h.db.QueryRow("SELECT COUNT(*)"+reconciliationFromSQL+where, args[:argCount]...).Scan(&total)
 	response.Paginated(c, acts, page, pageSize, total)
 }
 
@@ -2625,36 +2614,13 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 		return
 	}
 
-	var act reconciliationActResponse
-	var notes sql.NullString
-	var periodStart, periodEnd time.Time
-	var responseStatus, disputeNote, respondentName, sentVia, sentTo sql.NullString
-	var respondedAt, sentAt, actShareExpiresAt sql.NullTime
-	var actDisputeAmount sql.NullFloat64
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
 
-	err = h.db.QueryRow(`
-		SELECT ra.id, ra.partner_id, COALESCE(ct.name, '') as partner_name,
-			   ra.period_start, ra.period_end,
-			   ra.opening_balance, ra.our_debit_total, ra.our_credit_total, ra.our_balance,
-			   ra.status, ra.notes, ra.created_at,
-			   ra.response_status, ra.responded_at, ra.dispute_note, ra.respondent_name,
-			   ra.sent_at, ra.sent_via, ra.sent_to,
-			   ra.dispute_amount, ra.share_expires_at,
-			   COALESCE(ra.reminder_3d_sent, false), COALESCE(ra.reminder_7d_sent, false)
-		FROM reconciliation_acts ra
-		LEFT JOIN contacts ct ON ra.partner_id = ct.id
-		WHERE ra.id = $1 AND ra.tenant_id = $2 AND ra.deleted_at IS NULL
-	`, id, tenantID).Scan(
-		&act.ID, &act.PartnerID, &act.PartnerName,
-		&periodStart, &periodEnd,
-		&act.OpeningBalance, &act.OurDebitTotal, &act.OurCreditTotal, &act.OurBalance,
-		&act.Status, &notes, &act.CreatedAt,
-		&responseStatus, &respondedAt, &disputeNote, &respondentName,
-		&sentAt, &sentVia, &sentTo,
-		&actDisputeAmount, &actShareExpiresAt,
-		&act.Reminder3dSent, &act.Reminder7dSent,
-	)
-	if err == sql.ErrNoRows {
+	act, err := h.loadReconciliationAct(tenantID, id, orgIDPtr)
+	if errors.Is(err, errReconciliationNotFound) {
 		response.NotFound(c, "Reconciliation act")
 		return
 	}
@@ -2662,59 +2628,6 @@ func (h *Handler) GetReconciliationAct(c *gin.Context) {
 		h.log.Error("Failed to get reconciliation act", "error", err)
 		response.InternalError(c, "Failed to get reconciliation act")
 		return
-	}
-
-	act.PeriodStart = periodStart.Format("2006-01-02")
-	act.PeriodEnd = periodEnd.Format("2006-01-02")
-	act.ClosingBalance = act.OpeningBalance + act.OurDebitTotal - act.OurCreditTotal
-	if notes.Valid {
-		act.Notes = &notes.String
-	}
-	if responseStatus.Valid {
-		act.ResponseStatus = &responseStatus.String
-	}
-	if respondedAt.Valid {
-		act.RespondedAt = &respondedAt.Time
-	}
-	if disputeNote.Valid {
-		act.DisputeNote = &disputeNote.String
-	}
-	if respondentName.Valid {
-		act.RespondentName = &respondentName.String
-	}
-	if sentAt.Valid {
-		act.SentAt = &sentAt.Time
-	}
-	if sentVia.Valid {
-		act.SentVia = &sentVia.String
-	}
-	if sentTo.Valid {
-		act.SentTo = &sentTo.String
-	}
-	if actDisputeAmount.Valid {
-		act.DisputeAmount = &actDisputeAmount.Float64
-	}
-	if actShareExpiresAt.Valid {
-		act.ShareExpiresAt = &actShareExpiresAt.Time
-	}
-
-	// Fetch LIVE transaction data from journal entries — always recompute totals
-	// so the act reflects the current state of journal entries (not stale stored values).
-	var orgIDPtr *uuid.UUID
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		orgIDPtr = &orgID
-	}
-
-	liveOpening, lines, liveDebit, liveCredit, linesErr := h.computeReconciliationData(tenantID, act.PartnerID, orgIDPtr, act.PeriodStart, act.PeriodEnd)
-	if linesErr != nil {
-		h.log.Error("Failed to fetch reconciliation lines", "error", linesErr)
-	} else {
-		act.Lines = lines
-		act.OpeningBalance = liveOpening
-		act.OurDebitTotal = liveDebit
-		act.OurCreditTotal = liveCredit
-		act.OurBalance = liveOpening + liveDebit - liveCredit
-		act.ClosingBalance = act.OurBalance
 	}
 
 	response.Success(c, act)
@@ -2808,7 +2721,23 @@ func (h *Handler) UpdateReconciliationAct(c *gin.Context) {
 		return
 	}
 
-	response.Success(c, gin.H{"message": "Reconciliation act updated"})
+	// Return the act, not {"message": "..."}. Create and refresh both return
+	// one, and a client with no reason to expect otherwise parsed this message
+	// object AS an act — which blanked the record on screen the moment anyone
+	// confirmed it. A write that answers with the thing it wrote cannot be
+	// misread that way, and it saves both clients a refetch.
+	var orgIDPtr *uuid.UUID
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		orgIDPtr = &orgID
+	}
+	act, loadErr := h.loadReconciliationAct(tenantID, id, orgIDPtr)
+	if loadErr != nil {
+		h.log.Error("Failed to reload act after update", "error", loadErr, "act_id", id)
+		response.InternalError(c, "Failed to update reconciliation act")
+		return
+	}
+
+	response.Success(c, act)
 }
 
 // RefreshReconciliationAct recalculates the act from live journal entry data.
@@ -2855,7 +2784,9 @@ func (h *Handler) RefreshReconciliationAct(c *gin.Context) {
 	pStart := periodStart.Format("2006-01-02")
 	pEnd := periodEnd.Format("2006-01-02")
 
-	openingBalance, lines, totalDebit, totalCredit, compErr := h.computeReconciliationData(tenantID, partnerID, orgIDPtr, pStart, pEnd)
+	// Lines are discarded here: loadReconciliationAct recomputes them for the
+	// response. These totals are what gets written to the row.
+	openingBalance, _, totalDebit, totalCredit, compErr := h.computeReconciliationData(tenantID, partnerID, orgIDPtr, pStart, pEnd)
 	if compErr != nil {
 		h.log.Error("Failed to compute refresh data", "error", compErr)
 		response.InternalError(c, "Failed to compute reconciliation data")
@@ -2875,23 +2806,17 @@ func (h *Handler) RefreshReconciliationAct(c *gin.Context) {
 		return
 	}
 
-	var partnerName string
-	_ = h.db.QueryRow("SELECT COALESCE(name, '') FROM contacts WHERE id = $1", partnerID).Scan(&partnerName)
-
-	act := reconciliationActResponse{
-		ID:             id,
-		PartnerID:      partnerID,
-		PartnerName:    partnerName,
-		PeriodStart:    pStart,
-		PeriodEnd:      pEnd,
-		OpeningBalance: openingBalance,
-		OurDebitTotal:  totalDebit,
-		OurCreditTotal: totalCredit,
-		OurBalance:     ourBalance,
-		ClosingBalance: ourBalance,
-		Status:         "draft",
-		Lines:          lines,
-		CreatedAt:      time.Now(),
+	// Re-read the row rather than assembling a response from the values just
+	// computed. The hand-built struct that used to live here hard-coded
+	// Status: "draft" and CreatedAt: time.Now(), so refreshing a confirmed act
+	// reported it back as a new draft — and silently dropped notes, the
+	// sent/response tracking and both reminder flags, because a literal can
+	// only carry the fields whoever wrote it remembered.
+	act, loadErr := h.loadReconciliationAct(tenantID, id, orgIDPtr)
+	if loadErr != nil {
+		h.log.Error("Failed to reload act after refresh", "error", loadErr, "act_id", id)
+		response.InternalError(c, "Failed to refresh reconciliation act")
+		return
 	}
 
 	response.Success(c, act)
