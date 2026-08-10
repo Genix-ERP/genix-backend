@@ -378,7 +378,14 @@ func (h *Handler) GetPartnerBalances(c *gin.Context) {
 		LEFT JOIN inv ON inv.cid=c.id
 		LEFT JOIN pay ON pay.cid=c.id
 		WHERE c.tenant_id=$1 AND (inv.cid IS NOT NULL OR pay.cid IS NOT NULL)
-		ORDER BY COALESCE(inv.due,0) DESC, name ASC`, contactCol, invTable, contactCol)
+		-- c.id is the tiebreaker, and it is not cosmetic. Ordering by
+		-- (due, name) alone is not a total order: two contacts with the same
+		-- due and the same name — duplicate contacts do occur in real books —
+		-- have an order Postgres is free to choose, and it may choose
+		-- differently for the LIMIT/OFFSET of page 1 than for page 2. One
+		-- partner then appears on both pages and another appears on neither.
+		-- Nothing errors and nothing is logged; a row simply goes missing.
+		ORDER BY COALESCE(inv.due,0) DESC, name ASC, c.id ASC`, contactCol, invTable, contactCol)
 
 	// Opt-in paging. One row per contact that has ever been invoiced or paid,
 	// so this grows with the customer/vendor book and never shrinks.
