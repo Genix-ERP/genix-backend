@@ -1216,7 +1216,13 @@ func (h *Handler) checkOverdueInvoices(tenantID uuid.UUID) {
 		SELECT si.id, si.invoice_number, COALESCE(si.customer_name, c.name, ''), si.total_amount, si.due_date
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON c.id = si.customer_id
-		WHERE si.tenant_id = $1 AND si.status IN ('sent', 'partial')
+		-- 'overdue' is included on purpose. Nothing WRITES that status any
+		-- more — overdue is a predicate over due_date and the residual, not a
+		-- stored value — but migration 451's CHECK still permits it, so a
+		-- legacy row can carry it. Such an invoice is unpaid and past due by
+		-- every other clause here, and dropping the status from the filter
+		-- would silently stop its reminders. Taken from dev.
+		WHERE si.tenant_id = $1 AND si.status IN ('sent', 'partial', 'overdue')
 		  AND si.amount_paid < si.total_amount
 		  AND si.due_date < $2 AND si.deleted_at IS NULL
 	`, tenantID, time.Now())
