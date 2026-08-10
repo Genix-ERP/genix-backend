@@ -495,6 +495,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.POST("/transfer", h.perm.Require("inventory", "stock", "transfer"), h.TransferInventory)
 		inventory.GET("/movements", h.ListInventoryMovements)
 		inventory.GET("/valuation", h.GetInventoryValuation)
+		// §1.3 "Ombor ↔ buxgalteriya solishtiruvi" — layers vs the ledger.
+		inventory.GET("/valuation/reconciliation", h.GetStockValuationReconciliation)
 		inventory.GET("/cogs", h.GetCOGSData)
 		// As-of date stock report — replays inventory_transactions up to
 		// the chosen date so the user can see what each warehouse held
