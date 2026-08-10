@@ -32,11 +32,41 @@ DECLARE
   v_leftover int;
   v_dr numeric;
   v_cr numeric;
+  v_dr_before numeric;
+  v_cr_before numeric;
 BEGIN
   SELECT id INTO v_tenant FROM tenants WHERE code = 'demo';
   IF v_tenant IS NULL THEN
     RAISE NOTICE '474: no demo tenant, nothing to clean';
     RETURN;
+  END IF;
+
+  -- The trial balance BEFORE anything is touched.
+  --
+  -- The first version of this migration asserted Dr = Cr afterwards, full stop.
+  -- That held on the dev database it was written against and crash-looped
+  -- production, where the demo tenant's ledger was ALREADY out of balance by
+  -- 154 285,7142 before this file ran — 1 080 000 / 7, a pre-existing entry
+  -- split into sevenths whose rounding remainder was dropped.
+  --
+  -- The assertion was answering the wrong question. This migration deletes
+  -- journal entries TOGETHER WITH all of their lines, which is balance-neutral
+  -- by construction, so it cannot create an imbalance and has no business
+  -- refusing to run because of one it inherited. What it must guarantee is that
+  -- it does not make things worse — so the check below compares the imbalance
+  -- before and after and requires it to be unchanged. A pre-existing gap is
+  -- reported as a warning and left alone: inventing a balancing entry in
+  -- someone's ledger without knowing what caused the gap would be worse than
+  -- the gap.
+  SELECT COALESCE(SUM(jel.debit_amount), 0), COALESCE(SUM(jel.credit_amount), 0)
+    INTO v_dr_before, v_cr_before
+  FROM journal_entry_lines jel
+  JOIN journal_entries je ON je.id = jel.journal_entry_id
+  WHERE je.tenant_id = v_tenant AND je.status = 'posted' AND je.deleted_at IS NULL;
+
+  IF v_dr_before <> v_cr_before THEN
+    RAISE WARNING '474: demo trial balance was ALREADY out of balance before cleanup by % (Dr % <> Cr %) — pre-existing, not caused here; investigate separately',
+      v_dr_before - v_cr_before, v_dr_before, v_cr_before;
   END IF;
 
   -- Target graph -------------------------------------------------------
@@ -50,9 +80,16 @@ BEGIN
     WHERE tenant_id = v_tenant
       AND bank_account_id IN (SELECT id FROM tmp_test_bank_accounts);
 
+  -- Scoped to the demo tenant at the source. The entry delete below carries
+  -- `AND tenant_id = v_tenant` while the LINE delete cannot, so without this
+  -- an entry belonging to another tenant would lose its lines and survive as
+  -- an empty shell — which the balance check would not catch, since an entry
+  -- with no lines sums to 0 = 0.
   CREATE TEMP TABLE tmp_test_jes ON COMMIT DROP AS
-    SELECT DISTINCT journal_entry_id AS id FROM tmp_test_payments
-    WHERE journal_entry_id IS NOT NULL;
+    SELECT DISTINCT p.journal_entry_id AS id
+    FROM tmp_test_payments p
+    JOIN journal_entries je ON je.id = p.journal_entry_id
+    WHERE p.journal_entry_id IS NOT NULL AND je.tenant_id = v_tenant;
 
   SELECT count(*) INTO v_je_count FROM tmp_test_jes;
   RAISE NOTICE '474: % test bank accounts, % payments, % journal entries',
@@ -129,8 +166,15 @@ BEGIN
   FROM journal_entry_lines jel
   JOIN journal_entries je ON je.id = jel.journal_entry_id
   WHERE je.tenant_id = v_tenant AND je.status = 'posted' AND je.deleted_at IS NULL;
-  IF v_dr <> v_cr THEN
-    RAISE EXCEPTION '474: demo trial balance broken after cleanup: Dr % <> Cr %', v_dr, v_cr;
+  -- The property that actually belongs to this migration: it changed nothing
+  -- about the books. Entries and their lines are deleted together, so the
+  -- difference must come out exactly as it went in. If it moved, the delete
+  -- caught something it should not have — lines without their entry, or an
+  -- entry belonging to another tenant — and the transaction must roll back.
+  IF (v_dr - v_cr) <> (v_dr_before - v_cr_before) THEN
+    RAISE EXCEPTION '474: cleanup changed the demo trial balance: was Dr % <> Cr % (%), now Dr % <> Cr % (%)',
+      v_dr_before, v_cr_before, v_dr_before - v_cr_before,
+      v_dr, v_cr, v_dr - v_cr;
   END IF;
 
   SELECT count(*) INTO v_leftover FROM bank_accounts
@@ -139,6 +183,6 @@ BEGIN
     RAISE EXCEPTION '474: % active Test Bank UZS accounts survived cleanup', v_leftover;
   END IF;
 
-  RAISE NOTICE '474: cleanup complete, trial balance Dr = Cr = %', v_dr;
+  RAISE NOTICE '474: cleanup complete, trial balance Dr % / Cr % (unchanged by this migration)', v_dr, v_cr;
 END
 $cleanup$;
