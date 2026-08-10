@@ -504,6 +504,13 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.GET("/valuation", h.GetInventoryValuation)
 		// §1.3 "Ombor ↔ buxgalteriya solishtiruvi" — layers vs the ledger.
 		inventory.GET("/valuation/reconciliation", h.GetStockValuationReconciliation)
+		// §3.4 Zaxiralar bahosi, and the cost side of tannarx/marja.
+		inventory.GET("/valuation/report", h.GetStockValuationReport)
+		inventory.GET("/valuation/margin", h.GetStockMarginReport)
+		// §6 Qoldiqlarni kiritish — the changeover gate. POST locks every
+		// affected category's method, so it needs warehouse-manage.
+		inventory.GET("/valuation/opening-balance", h.GetStockOpeningPreview)
+		inventory.POST("/valuation/opening-balance", h.perm.Require("inventory", "warehouse", "manage"), h.PostStockOpeningBalance)
 		inventory.GET("/cogs", h.GetCOGSData)
 		// As-of date stock report — replays inventory_transactions up to
 		// the chosen date so the user can see what each warehouse held

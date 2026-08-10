@@ -325,30 +325,33 @@ func StandardRevaluation(qtyOnHand *big.Rat, oldCost, newCost int64) int64 {
 	return roundHalfUp(d)
 }
 
-// RescaleLayersToStandard rewrites open layers to a new standard price so that
-// Σ remaining_value stays equal to Q × standard — the §1.3 invariant, which
-// must hold immediately after a revaluation and not only in general.
+// RescaleLayersToTotal distributes `total` across the open layers in proportion
+// to quantity, so Σ remaining_value comes out at exactly `total`.
+//
+// This is what keeps §1.3 true for the two methods whose cost does NOT come
+// from the layers themselves. Under standard costing the stock is worth
+// Q × standard by definition, and under AVCO it is worth the running
+// avco_value; in both cases the layers are drained FIFO for the audit trail, so
+// without a rescale their sum would be the FIFO value and disagree with both
+// the ledger and the method's own definition of stock value.
 //
 // The last open layer absorbs the rounding remainder for the same reason a full
 // consumption takes the whole layer: distributing it evenly would leave the sum
 // a tiyin or two away from the posting.
-func RescaleLayersToStandard(layers []Layer, newCost int64) {
+func RescaleLayersToTotal(layers []Layer, total int64) {
 	SortLayersFIFO(layers)
 
-	total := new(big.Rat)
+	qtyTotal := new(big.Rat)
 	lastOpen := -1
 	for i := range layers {
 		if layers[i].RemainingQty.Sign() > 0 {
-			total.Add(total, layers[i].RemainingQty)
+			qtyTotal.Add(qtyTotal, layers[i].RemainingQty)
 			lastOpen = i
 		}
 	}
 	if lastOpen < 0 {
 		return
 	}
-
-	std := new(big.Rat).SetInt64(newCost)
-	target := roundHalfUp(new(big.Rat).Mul(std, total))
 
 	assigned := int64(0)
 	for i := range layers {
@@ -357,13 +360,36 @@ func RescaleLayersToStandard(layers []Layer, newCost int64) {
 			continue
 		}
 		if i == lastOpen {
-			layers[i].RemainingValue = target - assigned
+			layers[i].RemainingValue = total - assigned
 			continue
 		}
-		v := roundHalfUp(new(big.Rat).Mul(std, layers[i].RemainingQty))
+		v := proportion(layers[i].RemainingQty, qtyTotal, total)
 		layers[i].RemainingValue = v
 		assigned += v
 	}
+}
+
+// RescaleLayersToStandard rewrites open layers to a new standard price so that
+// Σ remaining_value equals Q × standard.
+//
+// Expressed in terms of RescaleLayersToTotal rather than repeating the
+// distribution, so a fix to the rounding rule cannot land in one and not the
+// other.
+func RescaleLayersToStandard(layers []Layer, newCost int64) {
+	qtyTotal := new(big.Rat)
+	for i := range layers {
+		if layers[i].RemainingQty.Sign() > 0 {
+			qtyTotal.Add(qtyTotal, layers[i].RemainingQty)
+		}
+	}
+	if qtyTotal.Sign() == 0 {
+		for i := range layers {
+			layers[i].RemainingValue = 0
+		}
+		return
+	}
+	std := new(big.Rat).SetInt64(newCost)
+	RescaleLayersToTotal(layers, roundHalfUp(new(big.Rat).Mul(std, qtyTotal)))
 }
 
 // StockValue is Σ remaining_value over the open layers — the number that must
