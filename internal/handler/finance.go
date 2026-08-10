@@ -3669,92 +3669,23 @@ func (h *Handler) ListPayments(c *gin.Context) {
 	}
 	offset := (page - 1) * limit
 
-	// Parse filters
-	paymentType := c.Query("type")
-	status := c.Query("status")
-	contactID := c.Query("contact_id")
-	dateFrom := c.Query("date_from")
-	dateTo := c.Query("date_to")
-	method := c.Query("method")
-	search := c.Query("search")
+	// One predicate for the list, its COUNT and /payments/stats (paymentsWhere).
+	// It used to be built twice — appended to the SELECT and again to the COUNT,
+	// with the argument list threaded through both by hand — which is exactly
+	// the shape that lets a filter reach the rows but not the count.
+	args := []interface{}{tenantID}
+	where := paymentsWhere(c, &args)
 
+	// contact_name is COALESCEd because contacts is now a LEFT JOIN: a payment
+	// whose contact row had gone missing used to drop out of the list, the count
+	// and every total at once, silently reducing the money the screen reported.
 	baseQuery := `
 		SELECT p.id, p.payment_number, p.type, p.contact_id, p.payment_date, p.amount,
 			   p.status, p.reference, p.notes, p.created_at,
-			   c.name as contact_name, p.journal_id, COALESCE(j.name, '') as journal_name,
+			   COALESCE(c.name, '—') as contact_name, p.journal_id, COALESCE(j.name, '') as journal_name,
 			   COALESCE(CASE WHEN j.type = 'cash' THEN 'cash' WHEN j.type = 'bank' THEN 'bank_transfer' ELSE '' END, '') as payment_method
-		FROM payments p
-		JOIN contacts c ON p.contact_id = c.id
-		LEFT JOIN journals j ON p.journal_id = j.id
-		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
-	`
-	countQuery := `SELECT COUNT(*) FROM payments p JOIN contacts c ON p.contact_id = c.id LEFT JOIN journals j ON p.journal_id = j.id WHERE p.tenant_id = $1 AND p.deleted_at IS NULL`
-
-	args := []interface{}{tenantID}
-	argCount := 1
-
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.organization_id = $%d", argCount)
-		args = append(args, orgID)
-	}
-
-	if paymentType != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND p.type = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.type = $%d", argCount)
-		args = append(args, paymentType)
-	}
-
-	if status != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND p.status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.status = $%d", argCount)
-		args = append(args, status)
-	}
-
-	if contactID != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND p.contact_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.contact_id = $%d", argCount)
-		args = append(args, contactID)
-	}
-
-	if dateFrom != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND p.payment_date >= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.payment_date >= $%d", argCount)
-		args = append(args, dateFrom)
-	}
-
-	if dateTo != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND p.payment_date <= $%d", argCount)
-		countQuery += fmt.Sprintf(" AND p.payment_date <= $%d", argCount)
-		args = append(args, dateTo)
-	}
-
-	// Filter by payment method (journal type: cash or bank)
-	if method != "" {
-		if method == "cash" {
-			baseQuery += " AND j.type = 'cash'"
-			countQuery += " AND j.type = 'cash'"
-		} else if method == "bank_transfer" {
-			baseQuery += " AND j.type = 'bank'"
-			countQuery += " AND j.type = 'bank'"
-		}
-	}
-
-	// Search by reference, payment number, or contact name
-	if search != "" {
-		argCount++
-		searchClause := fmt.Sprintf(" AND (p.reference ILIKE $%d OR p.payment_number ILIKE $%d OR c.name ILIKE $%d)", argCount, argCount, argCount)
-		baseQuery += searchClause
-		countQuery += searchClause
-		args = append(args, "%"+search+"%")
-	}
+		` + paymentsFromSQL + where
+	countQuery := `SELECT COUNT(*)` + paymentsFromSQL + where
 
 	var total int
 	err := h.db.QueryRow(countQuery, args...).Scan(&total)
