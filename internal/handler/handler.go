@@ -409,6 +409,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		products.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateProduct)
 		products.POST("/:id/generate-search-key", h.perm.Require("inventory", "product", "update"), h.GenerateProductSearchKey)
 		products.DELETE("/:id", h.perm.Require("inventory", "product", "delete"), h.DeleteProduct)
+		// Standart narx. The PUT is a revaluation document, not a field edit —
+		// it moves money — so it needs the warehouse-manage right rather than
+		// product-update.
+		products.GET("/:id/standard-cost", h.GetProductStandardCost)
+		products.PUT("/:id/standard-cost", h.perm.Require("inventory", "warehouse", "manage"), h.UpdateProductStandardCost)
 		products.GET("/:id/packaging-materials", h.ListProductPackagingMaterials)
 		products.POST("/:id/packaging-materials", h.SaveProductPackagingMaterials)
 		products.DELETE("/:id/packaging-materials/:materialId", h.DeleteProductPackagingMaterial)
