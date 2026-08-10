@@ -807,7 +807,7 @@ type WorkflowAction struct {
 func (h *Handler) CheckThresholdRules() {
 	rows, err := h.db.Query(`
 		SELECT DISTINCT tenant_id, trigger_event FROM workflow_rules
-		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale', 'purchase_order.delivery_overdue', 'construction.budget_overrun', 'construction.work_overdue')
+		WHERE trigger_event IN ('inventory.low_stock', 'inventory.transfer_stuck', 'invoice.overdue', 'task.overdue', 'contracts.expiring_soon', 'lead.stale', 'purchase_order.delivery_overdue', 'construction.budget_overrun', 'construction.work_overdue', 'construction.stage_budget_exceeded')
 		  AND is_active = true AND deleted_at IS NULL
 	`)
 	if err != nil {
@@ -849,6 +849,8 @@ func (h *Handler) CheckThresholdRules() {
 			h.checkConstructionBudgetOverruns(s.tenantID)
 		case "construction.work_overdue":
 			h.checkConstructionWorkOverdue(s.tenantID)
+		case "construction.stage_budget_exceeded":
+			h.checkConstructionStageBudgetExceeded(s.tenantID)
 		}
 	}
 }
@@ -970,6 +972,84 @@ func (h *Handler) checkConstructionWorkOverdue(tenantID uuid.UUID) {
 			},
 			DedupeKey: strconv.FormatInt(workID, 10) + ":" + endStr,
 			Cooldown:  0,
+		})
+	}
+}
+
+// checkConstructionStageBudgetExceeded emits construction.stage_budget_exceeded
+// when a stage's APPROVED CEL spend exceeds its plan (the section works'
+// total_amount rollup — same source as the Byudjet tab threshold legend).
+// Plan matching mirrors GetConstructionStageWorks: section leaf == stage name.
+// DedupeKey = stage id, 7-day cooldown (project-level budget_overrun bilan
+// bir xil konventsiya — oshish saqlanarkan haftada bir qayta ogohlantiradi).
+func (h *Handler) checkConstructionStageBudgetExceeded(tenantID uuid.UUID) {
+	rows, err := h.db.Query(`
+		WITH plan AS (
+			SELECT s.id AS stage_id,
+			       COALESCE(SUM(el.total_amount), 0) AS plan_amount
+			FROM construction_stages s
+			JOIN construction_projects p ON p.id = s.project_id AND p.tenant_id = $1
+			LEFT JOIN construction_estimate e
+			  ON e.project_id = s.project_id AND e.tenant_id = $1
+			 AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			 AND (s.building_id IS NULL OR e.building_id = s.building_id)
+			LEFT JOIN construction_estimate_line el
+			  ON el.estimate_id = e.id AND el.tenant_id = $1
+			 AND COALESCE(el.resource_type, '') = ''
+			 AND COALESCE(el.parent_line_id, 0) = 0
+			 AND s.name = ANY(string_to_array(el.parent_item_number, ' › '))
+			WHERE s.tenant_id = $1 AND p.deleted_at IS NULL
+			  AND COALESCE(p.status, '') NOT IN ('completed', 'cancelled')
+			GROUP BY s.id
+		),
+		fakt AS (
+			SELECT cel.stage_id, COALESCE(SUM(cel.amount), 0) AS actual_amount
+			FROM construction_expense_lines cel
+			WHERE cel.tenant_id = $1 AND cel.status = 'approved'
+			  AND cel.deleted_at IS NULL AND cel.stage_id IS NOT NULL
+			GROUP BY cel.stage_id
+		)
+		SELECT s.id, s.name, s.project_id, p.name, plan.plan_amount, fakt.actual_amount
+		FROM construction_stages s
+		JOIN construction_projects p ON p.id = s.project_id AND p.tenant_id = $1
+		JOIN plan ON plan.stage_id = s.id
+		JOIN fakt ON fakt.stage_id = s.id
+		WHERE s.tenant_id = $1
+		  AND plan.plan_amount > 0
+		  AND fakt.actual_amount > plan.plan_amount
+		LIMIT 200
+	`, tenantID)
+	if err != nil {
+		h.log.Error("Failed to check stage budget exceeded", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var stageID, projectID int64
+		var stageName, projectName string
+		var plan, actual float64
+		if err := rows.Scan(&stageID, &stageName, &projectID, &projectName, &plan, &actual); err != nil {
+			continue
+		}
+		exceedPct := 0.0
+		if plan > 0 {
+			exceedPct = (actual - plan) / plan * 100
+		}
+		h.runWorkflowEvent(workflowEventCtx{
+			TenantID: tenantID,
+			Event:    "construction.stage_budget_exceeded",
+			Data: map[string]interface{}{
+				"record_id":    strconv.FormatInt(projectID, 10),
+				"stage_id":     strconv.FormatInt(stageID, 10),
+				"stage_name":   stageName,
+				"project_name": projectName,
+				"plan":         plan,
+				"actual":       actual,
+				"exceed_pct":   exceedPct,
+			},
+			DedupeKey: "stage:" + strconv.FormatInt(stageID, 10),
+			Cooldown:  7 * 24 * time.Hour,
 		})
 	}
 }

@@ -89,6 +89,7 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 		       d.date, d.end_date,
 		       d.workers_count, d.expected_budget, d.weather, d.description, d.issues,
 		       d.reported_by, d.created_date, d.updated_date,
+		       COALESCE(d.quantity_done, 0), d.uom, d.wbs_id,
 		       COALESCE(b.name, '') as building_name,
 		       COALESCE(s.name, '') as stage_name,
 		       COALESCE(
@@ -155,6 +156,7 @@ func (h *Handler) ListConstructionDailyLogs(c *gin.Context) {
 			&item.Date, &item.EndDate,
 			&item.WorkersCount, &item.ExpectedBudget, &item.Weather, &item.Description, &item.Issues,
 			&item.ReportedBy, &item.CreatedDate, &item.UpdatedDate,
+			&item.QuantityDone, &item.UOM, &item.WBSID,
 			&item.BuildingName, &item.StageName, &item.StageProgress, &item.StagePlannedBudget, &item.StageMaterialTotal, &item.ReportedName,
 		); err != nil {
 			h.log.Error("Failed to scan daily log", "error", err)
@@ -195,13 +197,15 @@ func (h *Handler) CreateConstructionDailyLog(c *gin.Context) {
 			tenant_id, project_id, building_id, stage_id,
 			date, end_date, workers_count, expected_budget,
 			weather, description, issues,
+			quantity_done, uom, wbs_id,
 			reported_by, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW())
 		RETURNING id
 	`, tenantID, projectID, nullInt64FromVal(req.BuildingID), nullInt64FromVal(req.StageID),
 		req.Date, nullStringFromVal(req.EndDate),
 		req.WorkersCount, req.ExpectedBudget, nullStringFromVal(req.Weather),
 		nullStringFromVal(req.Description), nullStringFromVal(req.Issues),
+		req.QuantityDone, nullStringFromVal(req.UOM), nullInt64FromVal(req.WBSID),
 		userID,
 	).Scan(&logID)
 
