@@ -696,6 +696,11 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 					description = "Inventory Adjustment"
 				}
 
+				// source_id = the inventory_transactions row id (NOT the inventory
+				// balance-row id): every adjustment JE then maps 1:1 to its stock
+				// movement, so (source_type, source_id) dedupe scans work — with
+				// the balance-row id, distinct adjustments on the same product/
+				// warehouse were indistinguishable from double-posts.
 				tx.Exec(`
 					INSERT INTO journal_entries (
 						id, tenant_id, organization_id, journal_id, entry_number,
@@ -703,7 +708,7 @@ func (h *Handler) AdjustInventory(c *gin.Context) {
 						created_at, updated_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, 'inventory_adjustment', $8, 'posted', $9, $9, $10, $10)
 				`, entryID, tenantID, organizationID, journalID, entryNumber,
-					now, description, inventoryID.String(), totalCost, now)
+					now, description, transactionID.String(), totalCost, now)
 
 				var debitAcct, creditAcct uuid.UUID
 				var debitDesc, creditDesc string
@@ -6627,7 +6632,17 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		// Skip auto-posting for material_request deliveries — accounting happens when materials are used in construction stages
 	isMaterialRequestDelivery := op.SourceType != nil && *op.SourceType == "material_request" && op.Direction == "delivery"
 
-	if autoPost && op.Direction != "internal" && !isMaterialRequestDelivery {
+	// DOUBLE-COUNT GUARD: a receipt that traces to a purchase order must NOT
+	// auto-post Dr 1010 / Cr 6010 here — the purchase invoice (bill) for the
+	// same PO posts its own JE, so both firing books the vendor payable twice
+	// for the same goods (audit Part B, D-7: REC000547 vs its PO's bill JE).
+	// For PO-sourced receipts the bill is THE accounting document; skip.
+	isPOReceipt := op.SourceType != nil && *op.SourceType == "purchase_order" && op.Direction == "receipt"
+	if isPOReceipt && autoPost {
+		h.log.Info("Skipping stock-operation JE for PO-sourced receipt (bill is the accounting document)", "operation_id", id)
+	}
+
+	if autoPost && op.Direction != "internal" && !isMaterialRequestDelivery && !isPOReceipt {
 			// Calculate total value from operation lines
 			var totalValue float64
 			h.db.QueryRow(`

@@ -175,6 +175,15 @@ var workflowEventCatalog = map[string]workflowEventDef{
 	"construction.stage_budget_exceeded": {Category: "construction", RelatedType: "construction_project", Scheduled: true, SampleData: map[string]interface{}{
 		"record_id": "42", "stage_id": "6", "stage_name": "Poydevor", "project_name": "Yunusobod turar-joy majmuasi",
 		"plan": 1516198360.0, "actual": 1620000000.0, "exceed_pct": 6.8}},
+	// Moliya (Byudjetlar, 2026-08-10 v2): faol byudjet chizig'ining fakti
+	// (posted JEL dan hisoblangan) rejadan oshganda bir marta yonadi. Marker —
+	// budget_lines.exceeded_notified_at (migratsiya 477): kesishishda atomik
+	// qo'yiladi, fakt reja ostiga qaytsa tozalanadi (qayta qurollanadi). Emit
+	// nuqtalari: ListBudgetLines / GetBudgetPlanVsActual (finance.go,
+	// checkBudgetLineExceeded). Revenue chiziqlar chiqarilmaydi.
+	"finance.budget_exceeded": {Category: "finance", RelatedType: "budget", Scheduled: false, SampleData: map[string]interface{}{
+		"record_id": "", "budget_name": "2026 xarajatlar byudjeti", "line_id": "", "account_code": "9430",
+		"account_name": "Ijara xarajatlari", "category_name": "Ijara", "planned": 120000000.0, "actual": 131500000.0, "pct": 109.6}},
 }
 
 // workflowActionTypes is the set of executable action types. Legacy types

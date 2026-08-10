@@ -491,7 +491,9 @@ func (h *Handler) checkLockDate(tenantID uuid.UUID, entryDate time.Time) string 
 }
 
 // checkPeriodLock checks if the entry date falls in a locked or closed fiscal period
-// or in a locked accounting period
+// or in a locked accounting period. When no fiscal_periods row covers the date,
+// fiscal_years.status is the fallback so a closed year with no child periods
+// still blocks postings (migration 478 mirrors this at the DB layer).
 func (h *Handler) checkPeriodLock(tenantID uuid.UUID, entryDate time.Time) string {
 	// Check fiscal periods
 	var periodStatus sql.NullString
@@ -499,11 +501,23 @@ func (h *Handler) checkPeriodLock(tenantID uuid.UUID, entryDate time.Time) strin
 		SELECT fp.status FROM fiscal_periods fp
 		JOIN fiscal_years fy ON fp.fiscal_year_id = fy.id
 		WHERE fy.tenant_id = $1 AND $2 BETWEEN fp.start_date AND fp.end_date
+		ORDER BY fp.start_date DESC
 		LIMIT 1
 	`, tenantID, entryDate).Scan(&periodStatus)
 	if err == nil && periodStatus.Valid {
 		if periodStatus.String == "locked" || periodStatus.String == "closed" {
 			return fmt.Sprintf("This period is %s. Contact admin to unlock.", periodStatus.String)
+		}
+	} else {
+		var yearStatus sql.NullString
+		err = h.db.QueryRow(`
+			SELECT status FROM fiscal_years
+			WHERE tenant_id = $1 AND $2 BETWEEN start_date AND end_date
+			ORDER BY start_date DESC
+			LIMIT 1
+		`, tenantID, entryDate).Scan(&yearStatus)
+		if err == nil && yearStatus.Valid && yearStatus.String == "closed" {
+			return "Moliyaviy yil yopilgan. Yozuv o'tkazish uchun yilni qayta oching."
 		}
 	}
 

@@ -307,7 +307,18 @@ def journals(db_read, tenant_id):
 
 @pytest.fixture(scope="session")
 def test_supplier(api_client, db_read, tenant_id):
-    """Test supplier (yetkazuvchi)."""
+    """Test supplier (yetkazuvchi). Reuse-first + teardown — the old create-always
+    fixture leaked one 'Test Yetkazuvchi MChJ' per session (107 by 2026-08-10,
+    docs/moliya-v2/audit.md §2); cleaned up by migration 474."""
+    db_read.execute(
+        "SELECT id, name, type FROM contacts WHERE tenant_id = %s AND name = 'Test Yetkazuvchi MChJ' AND deleted_at IS NULL LIMIT 1",
+        (tenant_id,)
+    )
+    row = db_read.fetchone()
+    if row:
+        yield dict(row)
+        return
+
     code = f"SUP-TEST-{uuid.uuid4().hex[:6].upper()}"
     resp = api_client.post("/contacts", json={
         "type": "vendor",
@@ -319,7 +330,10 @@ def test_supplier(api_client, db_read, tenant_id):
     })
     if resp.status_code in (200, 201):
         data = resp.json().get("data", resp.json())
-        return data
+        yield data
+        if data.get("id"):
+            api_client.delete(f"/contacts/{data['id']}")
+        return
     # Fallback: find existing
     db_read.execute(
         "SELECT id, name, type FROM contacts WHERE tenant_id = %s AND type IN ('vendor','supplier') AND deleted_at IS NULL LIMIT 1",
@@ -327,13 +341,23 @@ def test_supplier(api_client, db_read, tenant_id):
     )
     row = db_read.fetchone()
     if row:
-        return dict(row)
+        yield dict(row)
+        return
     pytest.skip("Cannot create or find test supplier")
 
 
 @pytest.fixture(scope="session")
 def test_customer(api_client, db_read, tenant_id):
-    """Test customer (xaridor)."""
+    """Test customer (xaridor). Reuse-first + teardown (see test_supplier)."""
+    db_read.execute(
+        "SELECT id, name, type FROM contacts WHERE tenant_id = %s AND name = 'Test Xaridor MChJ' AND deleted_at IS NULL LIMIT 1",
+        (tenant_id,)
+    )
+    row = db_read.fetchone()
+    if row:
+        yield dict(row)
+        return
+
     code = f"CUS-TEST-{uuid.uuid4().hex[:6].upper()}"
     resp = api_client.post("/contacts", json={
         "type": "customer",
@@ -345,14 +369,18 @@ def test_customer(api_client, db_read, tenant_id):
     })
     if resp.status_code in (200, 201):
         data = resp.json().get("data", resp.json())
-        return data
+        yield data
+        if data.get("id"):
+            api_client.delete(f"/contacts/{data['id']}")
+        return
     db_read.execute(
         "SELECT id, name, type FROM contacts WHERE tenant_id = %s AND type = 'customer' AND deleted_at IS NULL LIMIT 1",
         (tenant_id,)
     )
     row = db_read.fetchone()
     if row:
-        return dict(row)
+        yield dict(row)
+        return
     pytest.skip("Cannot create or find test customer")
 
 
@@ -362,10 +390,18 @@ def test_customer(api_client, db_read, tenant_id):
 
 @pytest.fixture(scope="session")
 def test_bank_account(api_client, db_read, tenant_id, accounts):
-    """Test bank account (UZS)."""
-    # Find bank GL account (1100 or similar)
-    bank_account = accounts.get("1100") or accounts.get("5110")
-    account_id = str(bank_account["id"]) if bank_account else None
+    """Test bank account (UZS). Reuse-first + teardown — the old create-always
+    fixture leaked one 'Test Bank UZS' per session (67 by 2026-08-10, all with
+    account_id NULL so payments fell back to 5110; docs/moliya-v2/audit.md §2).
+    Cleaned up by migration 474."""
+    db_read.execute(
+        "SELECT ba.* FROM bank_accounts ba WHERE ba.tenant_id = %s AND ba.name = 'Test Bank UZS' AND ba.is_active = true AND ba.deleted_at IS NULL LIMIT 1",
+        (tenant_id,)
+    )
+    row = db_read.fetchone()
+    if row:
+        yield dict(row)
+        return
 
     resp = api_client.post("/bank-accounts", json={
         "name": "Test Bank UZS",
@@ -377,14 +413,18 @@ def test_bank_account(api_client, db_read, tenant_id, accounts):
     })
     if resp.status_code in (200, 201):
         data = resp.json().get("data", resp.json())
-        return data
+        yield data
+        if data.get("id"):
+            api_client.delete(f"/bank-accounts/{data['id']}")
+        return
     db_read.execute(
         "SELECT ba.* FROM bank_accounts ba WHERE ba.tenant_id = %s AND ba.is_active = true AND ba.deleted_at IS NULL LIMIT 1",
         (tenant_id,)
     )
     row = db_read.fetchone()
     if row:
-        return dict(row)
+        yield dict(row)
+        return
     pytest.skip("Cannot create or find test bank account")
 
 

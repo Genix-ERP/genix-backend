@@ -555,12 +555,19 @@ func (h *Handler) ReverseDepreciationRun(c *gin.Context) {
 		return
 	}
 	var period, status string
-	if h.db.QueryRow(`SELECT period, status FROM fa_depreciation_runs WHERE id=$1 AND tenant_id=$2`, runID, tenantID).Scan(&period, &status) != nil {
+	var runJE uuid.NullUUID
+	if h.db.QueryRow(`SELECT period, status, journal_entry_id FROM fa_depreciation_runs WHERE id=$1 AND tenant_id=$2`, runID, tenantID).Scan(&period, &status, &runJE) != nil {
 		faErr(c, http.StatusNotFound, "NOT_FOUND", "Reglament topilmadi", "Регламент не найден")
 		return
 	}
 	if status != "posted" {
 		faErr(c, http.StatusBadRequest, "INVALID_STATUS", "Faqat o'tkazilgan reglamentni revers qilish mumkin", "Реверсировать можно только проведённый")
+		return
+	}
+	// A run without a JE has nothing in the GL to offset — a storno here would
+	// corrupt the 02xx contra-asset balances (audit D-1, migration 475).
+	if !runJE.Valid {
+		faErr(c, http.StatusBadRequest, "NO_JOURNAL_ENTRY", "Bu reglament GLga o'tkazilmagan — revers qilib bo'lmaydi", "Регламент не проведён в ГК — реверс невозможен")
 		return
 	}
 	if msg := h.faPeriodOpen(tenantID, period); msg != "" {

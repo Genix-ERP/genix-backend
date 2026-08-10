@@ -1192,29 +1192,12 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 	}
 
 	now := time.Now()
-	// The cap lives INSIDE the UPDATE's WHERE so two concurrent payments
-	// cannot jointly exceed the invoice total — the loser matches zero rows.
-	res, err := h.db.Exec(`
-		UPDATE purchase_invoices
-		SET amount_paid = amount_paid + $1,
-		    status = CASE WHEN amount_paid + $1 >= total_amount - 0.01 THEN 'paid' ELSE 'partial' END,
-		    updated_at = $2
-		WHERE id = $3 AND tenant_id = $4
-		  AND amount_paid + $1 <= total_amount + 0.01`,
-		increment, now, invoiceID, tenantID,
-	)
-	if err != nil {
-		response.InternalError(c, "Failed to record payment")
-		return
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		response.BadRequest(c, "OVER_PAYMENT: amount exceeds the invoice's remaining balance")
-		return
-	}
 
-	// Payment record details. The payments/payment_allocations INSERTs happen
-	// inside the journal-entry transaction below so the payment, its
-	// allocation, the JE and the balance updates commit (or roll back) together.
+	// Payment record details. The invoice amount_paid/status UPDATE, the
+	// payments/payment_allocations INSERTs, the JE and the balance updates
+	// all happen in ONE transaction below so a vendor payment can never mark
+	// the invoice paid without its ledger entry (or vice versa). Mirrors the
+	// expense /pay reference pattern.
 	paymentID := uuid.New()
 	paymentNumber := fmt.Sprintf("PAY-%s", now.Format("20060102150405"))
 
@@ -1266,202 +1249,245 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 				`SELECT id, COALESCE(next_number, 1), number_prefix FROM journals WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY is_default DESC LIMIT 1`,
 				tenantID,
 			).Scan(&payJournalID, &nextNumber, &numberPrefix)
-			if err != nil {
-				h.log.Error("No journal found at all for payment", "tenant_id", tenantID, "error", err)
-			}
+		}
+	}
+	if err != nil {
+		h.log.Error("No journal found at all for payment", "tenant_id", tenantID, "error", err)
+		response.InternalError(c, "Failed to record payment: no journal configured for vendor payments")
+		return
+	}
+
+	// ONE transaction: invoice claim + JE + lines + balances + payment +
+	// allocation. A JE failure must fail the request — a vendor payment may
+	// never mark the invoice paid without its ledger entry.
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to begin vendor payment tx", "error", txErr)
+		response.InternalError(c, "Failed to record payment")
+		return
+	}
+	defer tx.Rollback()
+
+	apAcctID := findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
+	if apAcctID == uuid.Nil {
+		apAcctID = findAccount(tx, tenantID, organizationID, "kreditorlar", "6010")
+	}
+	if apAcctID == uuid.Nil {
+		apAcctID = findAccount(tx, tenantID, organizationID, "payable", "6010")
+	}
+	if apAcctID == uuid.Nil {
+		apAcctID = findAccount(tx, tenantID, organizationID, "kreditorlik", "6010")
+	}
+	// Select credit account based on payment method
+	var cashAcctID uuid.UUID
+	switch input.PaymentMethod {
+	case "cash":
+		cashAcctID = findAccount(tx, tenantID, organizationID, "cash", "5010")
+		if cashAcctID == uuid.Nil {
+			cashAcctID = findAccount(tx, tenantID, organizationID, "kassa", "5010")
+		}
+	default: // bank, card
+		cashAcctID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
+		if cashAcctID == uuid.Nil {
+			cashAcctID = findAccount(tx, tenantID, organizationID, "bank hisobi", "5110")
+		}
+	}
+	if cashAcctID == uuid.Nil {
+		// Final fallback
+		cashAcctID = findAccount(tx, tenantID, organizationID, "outstanding payments", "5110")
+	}
+
+	if apAcctID == uuid.Nil || cashAcctID == uuid.Nil {
+		h.log.Error("GL accounts not found for vendor payment", "tenant_id", tenantID, "org_id", organizationID,
+			"payment_method", input.PaymentMethod, "ap_found", apAcctID != uuid.Nil, "cash_found", cashAcctID != uuid.Nil)
+		response.BadRequest(c, "Cannot resolve GL accounts for vendor payment (AP 6010 or kassa/bank 5010/5110)")
+		return
+	}
+
+	prefix := ""
+	if numberPrefix.Valid {
+		prefix = numberPrefix.String
+	}
+	entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(tx, tenantID, organizationID, prefix, nextNumber))
+	description := fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
+	if vendorName.Valid && vendorName.String != "" {
+		description = fmt.Sprintf("Payment for invoice %s — %s", invoiceID.String()[:8], vendorName.String)
+	}
+
+	var contactUUID uuid.UUID
+	if vendorID.Valid {
+		contactUUID, _ = uuid.Parse(vendorID.String)
+	}
+	var contactVal interface{}
+	if contactUUID != uuid.Nil {
+		contactVal = contactUUID
+	}
+
+	journalEntryID := uuid.New()
+
+	// Resolve the write-off income account up front. If a write-off is
+	// requested but no income account exists, treat write-off as 0 so the
+	// JE stays balanced (DR AP = CR Cash) rather than being rejected by
+	// the deferred balance trigger and lost entirely.
+	var otherIncomeID uuid.UUID
+	effectiveWriteOff := 0.0
+	if input.WriteOffAmount > 0 {
+		otherIncomeID = findAccount(tx, tenantID, organizationID, "other income", "9310")
+		if otherIncomeID == uuid.Nil {
+			otherIncomeID = findAccount(tx, tenantID, organizationID, "payment difference write-off", "9690")
+		}
+		if otherIncomeID != uuid.Nil {
+			effectiveWriteOff = input.WriteOffAmount
+		} else {
+			h.log.Warn("Write-off requested but no income account found; posting payment without write-off", "invoice_id", invoiceID)
+		}
+	}
+	apDebitAmount := paymentAmount + effectiveWriteOff
+	jeTotal := apDebitAmount
+	// The invoice increment mirrors exactly what the JE debits off AP, so
+	// document and ledger cannot drift apart when the write-off account is
+	// missing.
+	increment = paymentAmount + effectiveWriteOff
+
+	// Guarded claim on the invoice, INSIDE the JE transaction. The cap lives
+	// in the UPDATE's WHERE so two concurrent payments cannot jointly exceed
+	// the invoice total — the loser matches zero rows and its JE rolls back
+	// with it.
+	res, err := tx.Exec(`
+		UPDATE purchase_invoices
+		SET amount_paid = amount_paid + $1,
+		    status = CASE WHEN amount_paid + $1 >= total_amount - 0.01 THEN 'paid' ELSE 'partial' END,
+		    updated_at = $2
+		WHERE id = $3 AND tenant_id = $4
+		  AND amount_paid + $1 <= total_amount + 0.01`,
+		increment, now, invoiceID, tenantID,
+	)
+	if err != nil {
+		h.log.Error("Failed to claim invoice balance for payment", "error", err)
+		response.InternalError(c, "Failed to record payment")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.BadRequest(c, "OVER_PAYMENT: amount exceeds the invoice's remaining balance")
+		return
+	}
+
+	if _, err = tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15)`,
+		journalEntryID, tenantID, organizationID, payJournalID, entryNumber, now, invoiceID.String()[:8], description,
+		"purchase_invoice_payment", invoiceID.String(), 1.0, jeTotal, jeTotal, now, now,
+	); err != nil {
+		h.log.Error("Failed to create journal entry for payment", "error", err)
+		response.InternalError(c, "Failed to post vendor payment journal entry")
+		return
+	}
+
+	// Debit AP (payment + write-off reduces AP)
+	if _, err = tx.Exec(`
+		INSERT INTO journal_entry_lines (
+			id, journal_entry_id, line_number, account_id, contact_id, description,
+			debit_amount, credit_amount, exchange_rate, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		uuid.New(), journalEntryID, 1, apAcctID, contactVal, "Accounts Payable",
+		apDebitAmount, 0.0, 1.0, now,
+	); err != nil {
+		h.log.Error("Failed to insert AP debit line for vendor payment", "error", err)
+		response.InternalError(c, "Failed to post vendor payment journal entry")
+		return
+	}
+
+	// Credit Cash/Outstanding Payments
+	if _, err = tx.Exec(`
+		INSERT INTO journal_entry_lines (
+			id, journal_entry_id, line_number, account_id, description,
+			debit_amount, credit_amount, exchange_rate, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		uuid.New(), journalEntryID, 2, cashAcctID, "Outstanding Payment",
+		0.0, paymentAmount, 1.0, now,
+	); err != nil {
+		h.log.Error("Failed to insert cash credit line for vendor payment", "error", err)
+		response.InternalError(c, "Failed to post vendor payment journal entry")
+		return
+	}
+
+	// Write-off line: CR Other Income (vendor owes less = gain for us)
+	if effectiveWriteOff > 0 {
+		if _, err = tx.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, description,
+				debit_amount, credit_amount, exchange_rate, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			uuid.New(), journalEntryID, 3, otherIncomeID, "Payment Difference Write-off",
+			0.0, effectiveWriteOff, 1.0, now,
+		); err != nil {
+			h.log.Error("Failed to insert write-off line for vendor payment", "error", err)
+			response.InternalError(c, "Failed to post vendor payment journal entry")
+			return
+		}
+		// credit subtracts (448 convention)
+		if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", effectiveWriteOff, now, otherIncomeID); err != nil {
+			h.log.Error("Failed to update write-off account balance", "error", err)
+			response.InternalError(c, "Failed to post vendor payment journal entry")
+			return
 		}
 	}
 
-	if err == nil {
-		apAcctID := findAccount(h.db, tenantID, organizationID, "accounts payable", "6010")
-		if apAcctID == uuid.Nil {
-			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlar", "6010")
-		}
-		if apAcctID == uuid.Nil {
-			apAcctID = findAccount(h.db, tenantID, organizationID, "payable", "6010")
-		}
-		if apAcctID == uuid.Nil {
-			apAcctID = findAccount(h.db, tenantID, organizationID, "kreditorlik", "6010")
-		}
-		// Select credit account based on payment method
-		var cashAcctID uuid.UUID
-		switch input.PaymentMethod {
-		case "cash":
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "cash", "5010")
-			if cashAcctID == uuid.Nil {
-				cashAcctID = findAccount(h.db, tenantID, organizationID, "kassa", "5010")
-			}
-		default: // bank, card
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "5110")
-			if cashAcctID == uuid.Nil {
-				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank account", "5110")
-			}
-			if cashAcctID == uuid.Nil {
-				cashAcctID = findAccount(h.db, tenantID, organizationID, "bank hisobi", "5110")
-			}
-		}
-		if cashAcctID == uuid.Nil {
-			// Final fallback
-			cashAcctID = findAccount(h.db, tenantID, organizationID, "outstanding payments", "5110")
-		}
-
-		if apAcctID == uuid.Nil {
-			h.log.Error("AP account not found for vendor payment", "tenant_id", tenantID, "org_id", organizationID)
-		}
-		if cashAcctID == uuid.Nil {
-			h.log.Error("Cash/Bank account not found for vendor payment", "tenant_id", tenantID, "org_id", organizationID, "payment_method", input.PaymentMethod)
-		}
-		if apAcctID != uuid.Nil && cashAcctID != uuid.Nil {
-			prefix := ""
-			if numberPrefix.Valid {
-				prefix = numberPrefix.String
-			}
-			entryNumber := fmt.Sprintf("%s%06d", prefix, nextEntryNumberSeq(h.db, tenantID, organizationID, prefix, nextNumber))
-			description := fmt.Sprintf("Payment for invoice %s", invoiceID.String()[:8])
-			if vendorName.Valid && vendorName.String != "" {
-				description = fmt.Sprintf("Payment for invoice %s — %s", invoiceID.String()[:8], vendorName.String)
-			}
-
-			var contactUUID uuid.UUID
-			if vendorID.Valid {
-				contactUUID, _ = uuid.Parse(vendorID.String)
-			}
-
-			journalEntryID := uuid.New()
-
-			// Resolve the write-off income account up front. If a write-off is
-			// requested but no income account exists, treat write-off as 0 so the
-			// JE stays balanced (DR AP = CR Cash) rather than being rejected by
-			// the deferred balance trigger and lost entirely.
-			var otherIncomeID uuid.UUID
-			effectiveWriteOff := 0.0
-			if input.WriteOffAmount > 0 {
-				otherIncomeID = findAccount(h.db, tenantID, organizationID, "other income", "9310")
-				if otherIncomeID == uuid.Nil {
-					otherIncomeID = findAccount(h.db, tenantID, organizationID, "payment difference write-off", "9690")
-				}
-				if otherIncomeID != uuid.Nil {
-					effectiveWriteOff = input.WriteOffAmount
-				} else {
-					h.log.Warn("Write-off requested but no income account found; posting payment without write-off", "invoice_id", invoiceID)
-				}
-			}
-			apDebitAmount := paymentAmount + effectiveWriteOff
-			jeTotal := apDebitAmount
-
-			// Header + all lines + balance updates in ONE transaction (migration 416).
-			tx, txErr := h.db.Begin()
-			if txErr != nil {
-				h.log.Error("Failed to begin payment journal tx", "error", txErr)
-			} else {
-				committed := false
-				defer func() {
-					if !committed {
-						tx.Rollback()
-					}
-				}()
-
-				if _, err = tx.Exec(`
-					INSERT INTO journal_entries (
-						id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
-						source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'posted', $14, $15)`,
-					journalEntryID, tenantID, organizationID, payJournalID, entryNumber, now, invoiceID.String()[:8], description,
-					"purchase_invoice_payment", invoiceID.String(), 1.0, jeTotal, jeTotal, now, now,
-				); err != nil {
-					h.log.Error("Failed to create journal entry for payment", "error", err)
-				} else {
-					// Debit AP (payment + write-off reduces AP)
-					apLineID := uuid.New()
-					_, err = tx.Exec(`
-						INSERT INTO journal_entry_lines (
-							id, journal_entry_id, line_number, account_id, contact_id, description,
-							debit_amount, credit_amount, exchange_rate, created_at
-						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-						apLineID, journalEntryID, 1, apAcctID, contactUUID, "Accounts Payable",
-						apDebitAmount, 0.0, 1.0, now,
-					)
-					// Credit Cash/Outstanding Payments
-					if err == nil {
-						cashLineID := uuid.New()
-						_, err = tx.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, line_number, account_id, description,
-								debit_amount, credit_amount, exchange_rate, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-							cashLineID, journalEntryID, 2, cashAcctID, "Outstanding Payment",
-							0.0, paymentAmount, 1.0, now,
-						)
-					}
-
-					// Write-off line: CR Other Income (vendor owes less = gain for us)
-					if err == nil && effectiveWriteOff > 0 {
-						writeOffLineID := uuid.New()
-						if _, err = tx.Exec(`
-							INSERT INTO journal_entry_lines (
-								id, journal_entry_id, line_number, account_id, description,
-								debit_amount, credit_amount, exchange_rate, created_at
-							) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-							writeOffLineID, journalEntryID, 3, otherIncomeID, "Payment Difference Write-off",
-							0.0, effectiveWriteOff, 1.0, now,
-						); err == nil {
-							// credit subtracts (448 convention)
-							_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", effectiveWriteOff, now, otherIncomeID)
-						}
-					}
-
-					// Update journal next number + account balances
-					if err == nil {
-						_, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", payJournalID)
-					}
-					if err == nil {
-						// Debit AP — 448 convention (balance = D - C): a debit ADDS
-						_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID)
-					}
-					if err == nil {
-						// Credit Cash/Bank — a credit subtracts
-						_, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID)
-					}
-
-					// Payment record + allocation in the same tx so they only
-					// commit together with the journal entry.
-					// Only create payment if we have a valid contact_id (required by schema)
-					if err == nil {
-						if contactUUID != uuid.Nil {
-							if _, err = tx.Exec(`
-								INSERT INTO payments (
-									id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
-									exchange_rate, reference, notes, status, created_at, updated_at
-								) VALUES ($1, $2, $3, $4, 'payment', $5, $6, $7, 1, $8, $9, 'confirmed', $10, $10)
-							`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, description, now); err != nil {
-								h.log.Error("Failed to create payment record", "error", err)
-							} else {
-								// Payment allocation linking payment to this invoice
-								allocID := uuid.New()
-								if _, err = tx.Exec(`
-									INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
-									VALUES ($1, $2, 'purchase_invoice', $3, $4, $5)
-								`, allocID, paymentID, invoiceID, paymentAmount, now); err != nil {
-									h.log.Error("Failed to create payment allocation", "error", err)
-								}
-							}
-						} else {
-							h.log.Warn("Cannot create payment record: no vendor_id on invoice", "invoice_id", invoiceID)
-						}
-					}
-
-					if err != nil {
-						h.log.Error("Failed to post vendor payment journal entry", "error", err)
-					} else if err = tx.Commit(); err != nil {
-						h.log.Error("Failed to commit vendor payment journal entry", "error", err)
-					} else {
-						committed = true
-						h.log.Info("Vendor payment posted", "payment_id", paymentID, "invoice_id", invoiceID, "ap_account", apAcctID, "cash_account", cashAcctID, "amount", paymentAmount)
-					}
-				}
-			}
-		}
+	// Update journal next number + account balances
+	if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1 WHERE id = $1", payJournalID); err != nil {
+		h.log.Error("Failed to bump journal next_number for vendor payment", "error", err)
+		response.InternalError(c, "Failed to post vendor payment journal entry")
+		return
 	}
+	// Debit AP — 448 convention (balance = D - C): a debit ADDS
+	if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", apDebitAmount, now, apAcctID); err != nil {
+		h.log.Error("Failed to update AP balance for vendor payment", "error", err)
+		response.InternalError(c, "Failed to post vendor payment journal entry")
+		return
+	}
+	// Credit Cash/Bank — a credit subtracts
+	if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", paymentAmount, now, cashAcctID); err != nil {
+		h.log.Error("Failed to update cash balance for vendor payment", "error", err)
+		response.InternalError(c, "Failed to post vendor payment journal entry")
+		return
+	}
+
+	// Payment record + allocation in the same tx so they only commit
+	// together with the journal entry and the invoice status.
+	// Only create payment if we have a valid contact_id (required by schema)
+	if contactUUID != uuid.Nil {
+		if _, err = tx.Exec(`
+			INSERT INTO payments (
+				id, tenant_id, organization_id, payment_number, type, contact_id, payment_date, amount,
+				exchange_rate, reference, notes, status, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, 'payment', $5, $6, $7, 1, $8, $9, 'confirmed', $10, $10)
+		`, paymentID, tenantID, organizationID, paymentNumber, contactUUID, now, paymentAmount, reference, description, now); err != nil {
+			h.log.Error("Failed to create payment record", "error", err)
+			response.InternalError(c, "Failed to record payment")
+			return
+		}
+		// Payment allocation linking payment to this invoice
+		allocID := uuid.New()
+		if _, err = tx.Exec(`
+			INSERT INTO payment_allocations (id, payment_id, document_type, document_id, amount, created_at)
+			VALUES ($1, $2, 'purchase_invoice', $3, $4, $5)
+		`, allocID, paymentID, invoiceID, paymentAmount, now); err != nil {
+			h.log.Error("Failed to create payment allocation", "error", err)
+			response.InternalError(c, "Failed to record payment")
+			return
+		}
+	} else {
+		h.log.Warn("Cannot create payment record: no vendor_id on invoice", "invoice_id", invoiceID)
+	}
+
+	if err = tx.Commit(); err != nil {
+		h.log.Error("Failed to commit vendor payment", "error", err)
+		response.InternalError(c, "Failed to post vendor payment journal entry")
+		return
+	}
+	h.log.Info("Vendor payment posted", "payment_id", paymentID, "invoice_id", invoiceID, "ap_account", apAcctID, "cash_account", cashAcctID, "amount", paymentAmount)
 
 	h.GetPurchaseInvoice(c)
 }
