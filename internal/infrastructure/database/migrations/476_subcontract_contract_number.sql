@@ -1,0 +1,17 @@
+-- 472_subcontract_contract_number.sql — qurilish-v2 audit bug-fix.
+--
+-- RENUMBERED 472 -> 476. The original number collided with a migration already
+-- on main, and schema_migrations.version is a PRIMARY KEY: two files sharing a
+-- version both land in `pending`, both apply, and the second INSERT violates
+-- the key — so RunMigrations returns an error and the API crash-loops on boot.
+-- On a database that had already recorded that version, the loser is instead
+-- skipped forever and its columns silently never appear. Every statement here
+-- is ADD COLUMN IF NOT EXISTS, so running under the new number is a no-op
+-- wherever it somehow already ran.
+--
+-- SubcontractorsTab formasi «Shartnoma raqami» (contract_number) yuboradi,
+-- lekin backend struct'da ham, jadvalda ham maydon yo'q edi — qiymat
+-- ShouldBindJSON tomonidan jimgina tashlab yuborilardi (foydalanuvchi
+-- kiritadi, saqlanadi deb o'ylaydi, aslida yo'qoladi). Ustun qo'shiladi;
+-- handler structlariga maydon shu turkumda qo'shildi.
+ALTER TABLE construction_subcontract ADD COLUMN IF NOT EXISTS contract_number VARCHAR(100);
