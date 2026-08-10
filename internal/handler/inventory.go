@@ -6591,6 +6591,36 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 	var newState string
 	if isLastStep {
+		// Received quantity defaults to the expected quantity.
+		//
+		// THE BUG THIS FIXES: every line of the stock apply below is filtered
+		// by `done_qty > 0`, and nothing on the server ever set done_qty. The
+		// browser patched it in a SEPARATE request immediately before calling
+		// this endpoint — and swallowed that request's failure into a
+		// console.error. So a receipt whose patch did not land (a failed
+		// request, a stale line list, any caller that is not that one screen)
+		// completed with status "Bajarildi", reported success, and moved no
+		// stock at all. REC-2026-00020: 22 units accepted, 0 on hand.
+		//
+		// The rule is the same one the browser applied, moved to where it
+		// cannot be skipped: a line the user never touched receives what was
+		// expected. A user who genuinely received a different amount edits the
+		// line first, and done_qty > 0 is then left alone.
+		if res, dErr := h.db.Exec(`
+			UPDATE stock_operation_lines
+			SET done_qty = expected_qty, updated_at = $1
+			WHERE operation_id = $2 AND tenant_id = $3
+			  AND COALESCE(done_qty, 0) = 0 AND expected_qty > 0
+		`, now, id, tenantID); dErr != nil {
+			// Surfaced, not logged: continuing here is what produced a
+			// completed document with no stock behind it.
+			h.log.Error("Failed to default done_qty from expected_qty", "error", dErr, "op_id", id)
+			response.InternalError(c, "Failed to prepare operation lines")
+			return
+		} else if n, _ := res.RowsAffected(); n > 0 {
+			h.log.Info("Defaulted done_qty to expected_qty", "op_id", id, "lines", n)
+		}
+
 		// Write-off approval rules check (TT §5.3)
 		if op.Direction == "write_off" && op.State != "awaiting_approval" {
 			var approvalRule string
@@ -6671,20 +6701,20 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			// Skip auto-posting for material_request deliveries — accounting happens when materials are used in construction stages
 			isMaterialRequestDelivery := op.SourceType != nil && *op.SourceType == "material_request" && op.Direction == "delivery"
 
-	// DOUBLE-COUNT GUARD: a receipt that traces to a purchase order must NOT
-	// auto-post Dr 1010 / Cr 6010 here — the purchase invoice (bill) for the
-	// same PO posts its own JE, so both firing books the vendor payable twice
-	// for the same goods (audit Part B, D-7: REC000547 vs its PO's bill JE).
-	// For PO-sourced receipts the bill is THE accounting document; skip.
-	isPOReceipt := op.SourceType != nil && *op.SourceType == "purchase_order" && op.Direction == "receipt"
-	if isPOReceipt && autoPost {
-		h.log.Info("Skipping stock-operation JE for PO-sourced receipt (bill is the accounting document)", "operation_id", id)
-	}
+			// DOUBLE-COUNT GUARD: a receipt that traces to a purchase order must NOT
+			// auto-post Dr 1010 / Cr 6010 here — the purchase invoice (bill) for the
+			// same PO posts its own JE, so both firing books the vendor payable twice
+			// for the same goods (audit Part B, D-7: REC000547 vs its PO's bill JE).
+			// For PO-sourced receipts the bill is THE accounting document; skip.
+			isPOReceipt := op.SourceType != nil && *op.SourceType == "purchase_order" && op.Direction == "receipt"
+			if isPOReceipt && autoPost {
+				h.log.Info("Skipping stock-operation JE for PO-sourced receipt (bill is the accounting document)", "operation_id", id)
+			}
 
-	if autoPost && op.Direction != "internal" && !isMaterialRequestDelivery && !isPOReceipt {
-			// Calculate total value from operation lines
-			var totalValue float64
-			h.db.QueryRow(`
+			if autoPost && op.Direction != "internal" && !isMaterialRequestDelivery && !isPOReceipt {
+				// Calculate total value from operation lines
+				var totalValue float64
+				h.db.QueryRow(`
 				SELECT COALESCE(SUM(done_qty * unit_price), 0)
 				FROM stock_operation_lines
 				WHERE operation_id=$1 AND tenant_id=$2
