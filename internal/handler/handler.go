@@ -1822,6 +1822,13 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 		// Current platform user + capabilities, and the read-only role matrix.
 		admin.GET("/platform/me", h.GetPlatformMe)
+
+		// Two-factor enrolment. Every route acts on the CALLER's own account —
+		// enrolling someone else's second factor is not administration, it is
+		// a way to take their account — so none of them takes a user id.
+		admin.POST("/platform/totp/begin", h.BeginPlatformTOTPEnrollment)
+		admin.POST("/platform/totp/confirm", h.ConfirmPlatformTOTPEnrollment)
+		admin.DELETE("/platform/totp", h.DisablePlatformTOTP)
 		admin.GET("/role-matrix", h.GetRoleMatrix)
 
 		admin.DELETE("/users/:id", middleware.RequireCapability(middleware.CapCompanyBlock), h.DeleteSystemUser)

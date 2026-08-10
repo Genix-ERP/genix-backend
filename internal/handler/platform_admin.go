@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"net/http"
 	"strings"
 	"time"
 
@@ -30,12 +31,12 @@ func (h *Handler) PlatformLogin(c *gin.Context) {
 	}
 
 	var (
-		id           uuid.UUID
-		hash, role   string
-		first, last  string
-		isActive     bool
-		totpEnabled  bool
-		totpSecret   sql.NullString
+		id          uuid.UUID
+		hash, role  string
+		first, last string
+		isActive    bool
+		totpEnabled bool
+		totpSecret  sql.NullString
 	)
 	err := h.db.QueryRow(`
 		SELECT id, password_hash, role, first_name, last_name, is_active, totp_enabled, totp_secret
@@ -62,11 +63,25 @@ func (h *Handler) PlatformLogin(c *gin.Context) {
 		return
 	}
 
-	// TOTP step-up when enrolled. (Enrollment endpoint TODO; enforcement is here
-	// so a platform user with 2FA on cannot log in without the code.)
+	// TOTP step-up when enrolled.
+	//
+	// The error carries a machine-readable code. It used to be a plain 401 with
+	// the message "Valid 2FA code required", which left the login form matching
+	// on that English text to decide whether to show the code field — a check
+	// that works right up until someone translates the string, and then breaks
+	// login for every user with 2FA on.
+	//
+	// TOTP_REQUIRED and TOTP_INVALID are deliberately distinct: the first means
+	// "show me the code box", the second means "that code was wrong". Collapsing
+	// them would make a mistyped code look like a fresh prompt with no
+	// explanation of why nothing happened.
 	if totpEnabled && totpSecret.Valid && totpSecret.String != "" {
-		if input.TOTPCode == "" || !crypto.VerifyTOTP(totpSecret.String, input.TOTPCode) {
-			response.Unauthorized(c, "Valid 2FA code required")
+		if input.TOTPCode == "" {
+			response.Error(c, http.StatusUnauthorized, "TOTP_REQUIRED", "Ikki bosqichli kod talab qilinadi")
+			return
+		}
+		if !crypto.VerifyTOTP(totpSecret.String, input.TOTPCode) {
+			response.Error(c, http.StatusUnauthorized, "TOTP_INVALID", "Kod noto'g'ri yoki muddati o'tgan")
 			return
 		}
 	}
