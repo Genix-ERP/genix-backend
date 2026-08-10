@@ -632,26 +632,26 @@ type ExchangeRate struct {
 
 // BankAccount represents a bank account for the company
 type BankAccount struct {
-	ID              uuid.UUID    `json:"id" db:"id"`
-	TenantID        uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	OrganizationID  *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
-	Name            string       `json:"name" db:"name"`
-	BankName        string       `json:"bank_name" db:"bank_name"`
-	AccountNumber   string       `json:"account_number" db:"account_number"`
-	Currency        string       `json:"currency" db:"currency"`
-	AccountType     string       `json:"account_type" db:"account_type"` // checking, savings, etc.
-	Balance         float64      `json:"balance" db:"balance"`
-	IsActive        bool         `json:"is_active" db:"is_active"`
-	LastReconciled  *time.Time   `json:"last_reconciled,omitempty" db:"last_reconciled"`
-	AccountID       *uuid.UUID   `json:"account_id,omitempty" db:"account_id"` // Link to chart of accounts
-	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
-	DeletedAt       sql.NullTime `json:"-" db:"deleted_at"`
+	ID             uuid.UUID    `json:"id" db:"id"`
+	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
+	Name           string       `json:"name" db:"name"`
+	BankName       string       `json:"bank_name" db:"bank_name"`
+	AccountNumber  string       `json:"account_number" db:"account_number"`
+	Currency       string       `json:"currency" db:"currency"`
+	AccountType    string       `json:"account_type" db:"account_type"` // checking, savings, etc.
+	Balance        float64      `json:"balance" db:"balance"`
+	IsActive       bool         `json:"is_active" db:"is_active"`
+	LastReconciled *time.Time   `json:"last_reconciled,omitempty" db:"last_reconciled"`
+	AccountID      *uuid.UUID   `json:"account_id,omitempty" db:"account_id"` // Link to chart of accounts
+	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
 	// Computed (list endpoint only): SUM(debit-credit) of posted JE lines
 	// on the linked GL account — the Moliya v2 balance truth. The mutable
 	// Balance column above is legacy and slated for removal.
-	LedgerBalance   float64      `json:"ledger_balance" db:"-"`
-	GLLinked        bool         `json:"gl_linked" db:"-"` // account_id IS NOT NULL
+	LedgerBalance float64 `json:"ledger_balance" db:"-"`
+	GLLinked      bool    `json:"gl_linked" db:"-"` // account_id IS NOT NULL
 }
 
 // CreateBankAccountInput is the input for creating a bank account
@@ -984,6 +984,35 @@ type AgingReport struct {
 	Days61To90   float64        `json:"days_61_to_90"`
 	Over90Days   float64        `json:"over_90_days"`
 	Contacts     []AgingContact `json:"contacts"`
+
+	// B3 — bucket shares, computed here because once the contact list is
+	// paginated a client holding one page cannot compute a share of the whole.
+	// null when the denominator is not positive: a share of a negative base is
+	// not meaningful, and the web's `total > 0 ? … : '0.0'` guard printed a
+	// confident 0.0% next to a 32-million bucket whenever credits outweighed
+	// invoices. The clients render "—" for null.
+	Percentages *AgingPercentages `json:"percentages"`
+
+	// B2 — present only when the caller opted into paging. The totals above
+	// always describe the WHOLE filtered set, never the page.
+	Meta *AgingMeta `json:"meta,omitempty"`
+}
+
+// AgingPercentages is each bucket's share of the positive total.
+type AgingPercentages struct {
+	Current    float64 `json:"current"`
+	Days1To30  float64 `json:"days_1_to_30"`
+	Days31To60 float64 `json:"days_31_to_60"`
+	Days61To90 float64 `json:"days_61_to_90"`
+	Over90Days float64 `json:"over_90_days"`
+}
+
+// AgingMeta describes the contact page when paging was requested.
+type AgingMeta struct {
+	Page       int `json:"page"`
+	PageSize   int `json:"page_size"`
+	Total      int `json:"total"`
+	TotalPages int `json:"total_pages"`
 }
 
 // AgingContact represents a contact in aging report
