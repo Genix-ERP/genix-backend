@@ -2555,6 +2555,7 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		       COALESCE(dr.photos, '[]'::jsonb),
 		       dr.reported_by, dr.verified_by, dr.verification_status,
 		       dr.created_date, dr.updated_date,
+		       COALESCE(dr.quantity_done, 0), dr.uom,
 		       COALESCE(e.first_name || ' ' || e.last_name, '') as reporter_name,
 		       COALESCE(v.first_name || ' ' || v.last_name, '') as verifier_name
 		FROM construction_daily_reports dr
@@ -2589,6 +2590,8 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		var reportedBy, verifiedBy sql.NullString
 		var createdDate, updatedDate time.Time
 		var reporterName, verifierName string
+		var quantityDone float64
+		var uom sql.NullString
 
 		if err := rows.Scan(
 			&id, &tenantIDVal, &projectIDVal, &reportDate,
@@ -2598,6 +2601,7 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 			&photos,
 			&reportedBy, &verifiedBy, &verificationStatus,
 			&createdDate, &updatedDate,
+			&quantityDone, &uom,
 			&reporterName, &verifierName,
 		); err != nil {
 			h.log.Error("Failed to scan daily report", "error", err, "id", id)
@@ -2628,6 +2632,8 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 			"verification_status": nullStringValue(verificationStatus),
 			"created_date":        createdDate,
 			"updated_date":        updatedDate,
+			"quantity_done":       quantityDone,
+			"uom":                 nullStringValue(uom),
 			"reporter_name":       reporterName,
 			"verifier_name":       verifierName,
 		})
@@ -2686,8 +2692,8 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 			weather_morning, weather_afternoon, temperature_min, temperature_max,
 			work_summary, issues_encountered, safety_notes,
 			workers_count, workers_details, equipment_used, materials_received, visitors,
-			photos, reported_by, verification_status, created_date, updated_date
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending', NOW(), NOW())
+			photos, reported_by, quantity_done, uom, verification_status, created_date, updated_date
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, 'pending', NOW(), NOW())
 		RETURNING id
 	`
 
@@ -2722,6 +2728,7 @@ func (h *Handler) CreateDailyReport(c *gin.Context) {
 		req.WorkersCount, workersDetailsJSON, equipmentUsedJSON, materialsReceivedJSON, visitorsJSON,
 		photosJSON,
 		nil, // reported_by
+		req.QuantityDone, nullString(req.UOM),
 	).Scan(&reportID)
 	if err != nil {
 		h.log.Error("Failed to create daily report", "error", err)
@@ -2881,6 +2888,8 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 		EquipmentUsed     string                   `json:"equipment_used"`
 		MaterialsReceived string                   `json:"materials_received"`
 		Photos            []map[string]interface{} `json:"photos"`
+		QuantityDone      float64                  `json:"quantity_done"`
+		UOM               string                   `json:"uom"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -2903,6 +2912,8 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 		    equipment_used = COALESCE(NULLIF($11, ''), '[]')::jsonb,
 		    materials_received = COALESCE(NULLIF($12, ''), '[]')::jsonb,
 		    photos = $13::jsonb,
+		    quantity_done = $16,
+		    uom = $17,
 		    updated_date = NOW()
 		WHERE id = $14 AND tenant_id = $15
 	`
@@ -2934,6 +2945,7 @@ func (h *Handler) UpdateDailyReport(c *gin.Context) {
 		nullString(req.WorkSummary), nullString(req.IssuesEncountered), nullString(req.SafetyNotes),
 		req.WorkersCount, workersDetailsJSON, equipmentUsedJSON, materialsReceivedJSON,
 		photosJSON, reportID, tenantID,
+		req.QuantityDone, nullString(req.UOM),
 	)
 	if err != nil {
 		h.log.Error("Failed to update daily report", "error", err)
