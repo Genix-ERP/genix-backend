@@ -42,38 +42,13 @@ type statusBucket struct {
 	Value float64 `json:"value"`
 }
 
-// summaryScope builds the tenant/organization predicate shared by the summary
-// queries. alias is the table alias used in the caller's FROM clause.
-func summaryScope(c *gin.Context, alias string, args *[]interface{}) (string, bool) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		return "", false
-	}
-	*args = append(*args, tenantID)
-	where := fmt.Sprintf(" WHERE %s.tenant_id = $%d AND %s.deleted_at IS NULL", alias, len(*args), alias)
-
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		*args = append(*args, orgID)
-		where += fmt.Sprintf(" AND %s.organization_id = $%d", alias, len(*args))
-	}
-	return where, true
-}
-
-// dateRange appends the caller's date_from/date_to filters against column.
-// Empty values are skipped, so an unfiltered summary covers all time exactly
-// like an unfiltered list.
-func dateRange(c *gin.Context, column string, args *[]interface{}) string {
-	clause := ""
-	if v := strings.TrimSpace(c.Query("date_from")); v != "" {
-		*args = append(*args, v)
-		clause += fmt.Sprintf(" AND %s >= $%d", column, len(*args))
-	}
-	if v := strings.TrimSpace(c.Query("date_to")); v != "" {
-		*args = append(*args, v)
-		clause += fmt.Sprintf(" AND %s <= $%d", column, len(*args))
-	}
-	return clause
-}
+// summaryScope and dateRange used to live here. They were the generic
+// tenant/org and date predicates for this family of endpoints, and only
+// GetPaymentsSummary ever used them — as its own third copy of a predicate the
+// payment list already owned. Now that it shares paymentsWhere, and the other
+// two summaries scope themselves (workflows has no organization_id at all),
+// nothing called them. Removed rather than left as helpers that describe a
+// sharing that is not happening.
 
 // statusRollup runs one grouped query and returns the per-status buckets plus
 // the totals across every status. The query must select exactly three columns:
@@ -123,36 +98,32 @@ func (h *Handler) statusRollup(query string, args []interface{}) (map[string]sta
 // @Param contact_id query string false "Filter by contact"
 // @Param date_from query string false "Payment date from (YYYY-MM-DD)"
 // @Param date_to query string false "Payment date to (YYYY-MM-DD)"
+// @Param method query string false "cash or bank_transfer"
+// @Param search query string false "Reference, payment number or contact name"
 // @Success 200 {object} response.Response
 // @Security BearerAuth
 // @Router /payments/summary [get]
+//
+// Takes exactly the filters ListPayments takes, through the same paymentsWhere
+// and the same FROM. It used to carry its own copy of the predicate that knew
+// only type, status, contact_id and the date range — so filtering the list by
+// payment method, or searching it by contact name, left the cards describing a
+// different set of payments than the rows beneath them.
+//
+// That also brings the LEFT JOIN on contacts: a payment whose contact row had
+// gone missing was dropped by the INNER JOIN here as well, quietly shrinking
+// every total on the screen.
 func (h *Handler) GetPaymentsSummary(c *gin.Context) {
-	args := []interface{}{}
-	where, ok := summaryScope(c, "p", &args)
-	if !ok {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
 		response.Unauthorized(c, "Tenant not found")
 		return
 	}
-
-	if v := strings.TrimSpace(c.Query("type")); v != "" {
-		args = append(args, v)
-		where += fmt.Sprintf(" AND p.type = $%d", len(args))
-	}
-	if v := strings.TrimSpace(c.Query("status")); v != "" {
-		args = append(args, v)
-		where += fmt.Sprintf(" AND p.status = $%d", len(args))
-	}
-	if v := strings.TrimSpace(c.Query("contact_id")); v != "" {
-		if contactID, err := uuid.Parse(v); err == nil {
-			args = append(args, contactID)
-			where += fmt.Sprintf(" AND p.contact_id = $%d", len(args))
-		}
-	}
-	where += dateRange(c, "p.payment_date", &args)
+	args := []interface{}{tenantID}
+	where := paymentsFromSQL + paymentsWhere(c, &args)
 
 	byStatus, totalPayments, totalAmount, err := h.statusRollup(`
-		SELECT p.status, COUNT(*), COALESCE(SUM(p.amount), 0)
-		FROM payments p`+where+`
+		SELECT p.status, COUNT(*), COALESCE(SUM(p.amount), 0)`+where+`
 		GROUP BY p.status`, args)
 	if err != nil {
 		h.log.Error("Failed to build payments summary", "error", err)
@@ -169,8 +140,7 @@ func (h *Handler) GetPaymentsSummary(c *gin.Context) {
 		SELECT COALESCE(SUM(p.amount) FILTER (WHERE p.type = 'receipt'), 0),
 		       COALESCE(SUM(p.amount) FILTER (WHERE p.type = 'payment'), 0),
 		       COUNT(*) FILTER (WHERE p.type = 'receipt'),
-		       COUNT(*) FILTER (WHERE p.type = 'payment')
-		FROM payments p`+where, args...).Scan(
+		       COUNT(*) FILTER (WHERE p.type = 'payment')`+where, args...).Scan(
 		&receiptAmount, &paymentAmount, &receiptCount, &paymentCount); err != nil {
 		h.log.Error("Failed to build payments summary totals", "error", err)
 		response.InternalError(c, "Failed to build payments summary")
