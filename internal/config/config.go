@@ -244,7 +244,11 @@ func Load() (*Config, error) {
 			Audience:           getEnv("JWT_AUDIENCE", "genixerp-api"),
 		},
 		CORS: CORSConfig{
-			AllowedOrigins:   getEnvAsSlice("CORS_ALLOWED_ORIGINS", []string{"http://localhost:5173", "http://localhost:3000", "http://localhost:3001", "https://app.genixerp.com", "https://genixerp.com", "https://my.yuksalish.group", "http://my.yuksalish.group"}),
+			// The control plane (genix/admin-panel) is a SEPARATE origin, so it
+			// has to be listed here or every request from it fails CORS before
+			// it reaches a handler — which looks like a broken login rather
+			// than a configuration gap. localhost:5174 is its dev port.
+			AllowedOrigins:   getEnvAsSlice("CORS_ALLOWED_ORIGINS", []string{"http://localhost:5173", "http://localhost:5174", "http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "https://app.genixerp.com", "https://admin.genixerp.com", "https://genixerp.com", "https://my.yuksalish.group", "http://my.yuksalish.group"}),
 			AllowedMethods:   getEnvAsSlice("CORS_ALLOWED_METHODS", []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}),
 			AllowedHeaders:   getEnvAsSlice("CORS_ALLOWED_HEADERS", []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Request-ID", "X-Tenant-ID", "X-Organization-ID"}),
 			ExposedHeaders:   getEnvAsSlice("CORS_EXPOSED_HEADERS", []string{"Content-Length", "X-Request-ID"}),
