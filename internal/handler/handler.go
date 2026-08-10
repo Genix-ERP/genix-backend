@@ -423,6 +423,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	categories := rg.Group("/product-categories")
 	{
 		categories.GET("", h.ListProductCategories)
+		// §2.1 — whether the valuation method can still be changed, and why not.
+		categories.GET("/:id/method-lock", h.GetCategoryMethodLock)
 		categories.POST("", h.CreateProductCategory)
 		categories.GET("/:id", h.GetProductCategory)
 		categories.PUT("/:id", h.UpdateProductCategory)

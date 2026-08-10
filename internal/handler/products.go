@@ -305,33 +305,33 @@ func (h *Handler) ListProducts(c *gin.Context) {
 
 		resp := &entity.ProductResponse{
 			ID:                 p.ID,
-			CategoryID:        p.CategoryID,
-			Type:              p.Type,
-			Code:              p.Code,
-			SKU:               p.SKU,
-			Barcode:           p.Barcode,
-			SearchKey:         p.SearchKey,
-			Name:              p.Name,
-			Description:       p.Description,
-			UnitID:            parsedUnitID,
-			UnitName:          unitName,
-			UnitCode:          unitCode,
-			PurchaseUnitID:    parsedPurchaseUnitID,
-			PurchaseUnitName:  purchaseUnitName,
-			SalesUnitID:       parsedSalesUnitID,
-			SalesUnitName:     salesUnitName,
-			CostPrice:         p.CostPrice,
-			ListPrice:         p.ListPrice,
-			IsStockable:       p.IsStockable,
-			TrackInventory:    p.TrackInventory,
-			MinStockLevel:     p.MinStockLevel,
-			IsPurchasable:     p.IsPurchasable,
-			IsSellable:        p.IsSellable,
-			CanBeSold:         p.CanBeSold,
-			CanBePurchased:    p.CanBePurchased,
-			AvailableInPOS:    p.AvailableInPOS,
-			CanBeExpensed:     p.CanBeExpensed,
-			CanBeRented:       p.CanBeRented,
+			CategoryID:         p.CategoryID,
+			Type:               p.Type,
+			Code:               p.Code,
+			SKU:                p.SKU,
+			Barcode:            p.Barcode,
+			SearchKey:          p.SearchKey,
+			Name:               p.Name,
+			Description:        p.Description,
+			UnitID:             parsedUnitID,
+			UnitName:           unitName,
+			UnitCode:           unitCode,
+			PurchaseUnitID:     parsedPurchaseUnitID,
+			PurchaseUnitName:   purchaseUnitName,
+			SalesUnitID:        parsedSalesUnitID,
+			SalesUnitName:      salesUnitName,
+			CostPrice:          p.CostPrice,
+			ListPrice:          p.ListPrice,
+			IsStockable:        p.IsStockable,
+			TrackInventory:     p.TrackInventory,
+			MinStockLevel:      p.MinStockLevel,
+			IsPurchasable:      p.IsPurchasable,
+			IsSellable:         p.IsSellable,
+			CanBeSold:          p.CanBeSold,
+			CanBePurchased:     p.CanBePurchased,
+			AvailableInPOS:     p.AvailableInPOS,
+			CanBeExpensed:      p.CanBeExpensed,
+			CanBeRented:        p.CanBeRented,
 			CanBeSubcontracted: p.CanBeSubcontracted,
 			IsOverheadExpense:  p.IsOverheadExpense,
 			IsManufacturable:   p.IsManufacturable,
@@ -353,10 +353,22 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			}
 		}
 
-		if weight.Valid { v := weight.Float64; resp.Weight = &v }
-		if length.Valid { v := length.Float64; resp.Length = &v }
-		if width.Valid  { v := width.Float64;  resp.Width  = &v }
-		if height.Valid { v := height.Float64; resp.Height = &v }
+		if weight.Valid {
+			v := weight.Float64
+			resp.Weight = &v
+		}
+		if length.Valid {
+			v := length.Float64
+			resp.Length = &v
+		}
+		if width.Valid {
+			v := width.Float64
+			resp.Width = &v
+		}
+		if height.Valid {
+			v := height.Float64
+			resp.Height = &v
+		}
 
 		// Parse tags
 		if len(tags) > 0 {
@@ -872,10 +884,22 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		}
 	}
 
-	if weight.Valid { v := weight.Float64; resp.Weight = &v }
-	if length.Valid { v := length.Float64; resp.Length = &v }
-	if width.Valid  { v := width.Float64;  resp.Width  = &v }
-	if height.Valid { v := height.Float64; resp.Height = &v }
+	if weight.Valid {
+		v := weight.Float64
+		resp.Weight = &v
+	}
+	if length.Valid {
+		v := length.Float64
+		resp.Length = &v
+	}
+	if width.Valid {
+		v := width.Float64
+		resp.Width = &v
+	}
+	if height.Valid {
+		v := height.Float64
+		resp.Height = &v
+	}
 
 	if len(tags) > 0 {
 		json.Unmarshal(tags, &resp.Tags)
@@ -957,6 +981,17 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 			addUpdate("category_id", nil)
 		} else {
 			cid, _ := uuid.Parse(*input.CategoryID)
+			// §2.3: without this the method lock is worth nothing — a product
+			// locked to FIFO could be moved into an AVCO category in two clicks
+			// and its history reinterpreted anyway.
+			if reason, gerr := h.guardProductCategoryChange(h.db, tenantID, id, cid); gerr != nil {
+				h.log.Error("Failed to check category change", "error", gerr)
+				response.InternalError(c, "Failed to check category change")
+				return
+			} else if reason != "" {
+				response.BadRequest(c, reason)
+				return
+			}
 			addUpdate("category_id", cid)
 		}
 	}
@@ -1110,8 +1145,12 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 		// clause doesn't mention list_price, it means the JSON didn't
 		// bind into input.ListPrice for some reason.
 		var inCost, inList interface{} = "<nil>", "<nil>"
-		if input.CostPrice != nil { inCost = *input.CostPrice }
-		if input.ListPrice != nil { inList = *input.ListPrice }
+		if input.CostPrice != nil {
+			inCost = *input.CostPrice
+		}
+		if input.ListPrice != nil {
+			inList = *input.ListPrice
+		}
 		h.log.Info("UpdateProduct: products UPDATE",
 			"product_id", id.String(),
 			"input_cost_price", inCost,
@@ -1171,8 +1210,12 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 			// passed to Postgres. Remove once the price-stuck bug is
 			// understood.
 			var costVal, listVal interface{} = "<nil>", "<nil>"
-			if orgUpdates.costPrice != nil { costVal = *orgUpdates.costPrice }
-			if orgUpdates.listPrice != nil { listVal = *orgUpdates.listPrice }
+			if orgUpdates.costPrice != nil {
+				costVal = *orgUpdates.costPrice
+			}
+			if orgUpdates.listPrice != nil {
+				listVal = *orgUpdates.listPrice
+			}
 			h.log.Info("UpdateProduct: pos upsert",
 				"product_id", id.String(),
 				"target_org_id", targetOrgID.String(),
@@ -1453,15 +1496,15 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 	}
 
 	type Input struct {
-		ParentID               string  `json:"parent_id,omitempty"`
-		Code                   string  `json:"code" binding:"required,min=1,max=50"`
-		Name                   string  `json:"name" binding:"required,min=1,max=255"`
-		Description            string  `json:"description,omitempty"`
-		IncomeAccountID        *string `json:"income_account_id,omitempty"`
-		ExpenseAccountID       *string `json:"expense_account_id,omitempty"`
+		ParentID                string  `json:"parent_id,omitempty"`
+		Code                    string  `json:"code" binding:"required,min=1,max=50"`
+		Name                    string  `json:"name" binding:"required,min=1,max=255"`
+		Description             string  `json:"description,omitempty"`
+		IncomeAccountID         *string `json:"income_account_id,omitempty"`
+		ExpenseAccountID        *string `json:"expense_account_id,omitempty"`
 		StockValuationAccountID *string `json:"stock_valuation_account_id,omitempty"`
-		StockInputAccountID    *string `json:"stock_input_account_id,omitempty"`
-		StockOutputAccountID   *string `json:"stock_output_account_id,omitempty"`
+		StockInputAccountID     *string `json:"stock_input_account_id,omitempty"`
+		StockOutputAccountID    *string `json:"stock_output_account_id,omitempty"`
 	}
 
 	var input Input
@@ -1659,6 +1702,8 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 		StockValuationAccountID *string `json:"stock_valuation_account_id"`
 		StockInputAccountID     *string `json:"stock_input_account_id"`
 		StockOutputAccountID    *string `json:"stock_output_account_id"`
+		CostVarianceAccountID   *string `json:"cost_variance_account_id"`
+		CostMethod              *string `json:"cost_method"`
 	}
 
 	var input Input
@@ -1740,6 +1785,43 @@ func (h *Handler) UpdateProductCategory(c *gin.Context) {
 		addUpdate("stock_output_account_id", val)
 		stockOutAcct = val
 		hasAccountUpdates = true
+	}
+	if val, provided := parseOptionalUUID(input.CostVarianceAccountID); provided {
+		addUpdate("cost_variance_account_id", val)
+		hasAccountUpdates = true
+	}
+
+	// Baholash usuli (plan §2.1). The lock is enforced HERE, not only by a
+	// disabled field in the UI — a disabled input protects nobody coming in
+	// through the API, an import or a bulk edit, which is exactly what §2.1
+	// says. Empty string means "inherit the company policy".
+	if input.CostMethod != nil {
+		method := strings.TrimSpace(*input.CostMethod)
+		if method != "" {
+			parsed, perr := ParseCostMethod(method)
+			if perr != nil {
+				// LIFO lands here: prohibited by BHMS No. 4 / IAS 2, and
+				// reported rather than silently ignored.
+				response.BadRequest(c, perr.Error())
+				return
+			}
+			method = string(parsed)
+		}
+		reason, gerr := h.guardCategoryMethodChange(h.db, tenantID, id, method)
+		if gerr != nil {
+			h.log.Error("Failed to check method lock", "error", gerr)
+			response.InternalError(c, "Failed to check valuation method lock")
+			return
+		}
+		if reason != "" {
+			response.BadRequest(c, reason)
+			return
+		}
+		if method == "" {
+			addUpdate("cost_method", nil)
+		} else {
+			addUpdate("cost_method", method)
+		}
 	}
 
 	if len(updates) == 0 {
@@ -1933,16 +2015,17 @@ type BulkCreateProductsInput struct {
 }
 
 type BulkProductOutcome struct {
-	Row     int    `json:"row"`           // 1-based row index in the request
-	Name    string `json:"name"`
-	Status  string `json:"status"`        // "created" | "skipped" | "failed"
-	Reason  string `json:"reason,omitempty"`
-	ID      string `json:"id,omitempty"`
+	Row    int    `json:"row"` // 1-based row index in the request
+	Name   string `json:"name"`
+	Status string `json:"status"` // "created" | "skipped" | "failed"
+	Reason string `json:"reason,omitempty"`
+	ID     string `json:"id,omitempty"`
 }
 
 // slugifyProductCode mirrors the simple slugifier the frontend uses so a
 // row that omits `code` gets a deterministic auto-generated value:
-//   row.name.toUpperCase().replace(/\s+/g, '-').substring(0, 50).
+//
+//	row.name.toUpperCase().replace(/\s+/g, '-').substring(0, 50).
 func slugifyProductCode(name string) string {
 	upper := strings.ToUpper(strings.TrimSpace(name))
 	// collapse whitespace runs to a single dash
@@ -2088,8 +2171,8 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 	// the deleted product on a name match instead of trying to insert
 	// over its zombie code.
 	type existingRow struct {
-		id        uuid.UUID
-		deleted   bool
+		id      uuid.UUID
+		deleted bool
 	}
 	existingNamesLower := make(map[string]existingRow) // name(lower) → row
 	existingCodes := make(map[string]bool)
@@ -2214,24 +2297,36 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 			args := []interface{}{}
 			argN := 1
 			addStr := func(col, val string) {
-				if val == "" { return }
+				if val == "" {
+					return
+				}
 				sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
-				args = append(args, val); argN++
+				args = append(args, val)
+				argN++
 			}
 			addStrPtr := func(col string, v *string) {
-				if v == nil { return }
+				if v == nil {
+					return
+				}
 				sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
-				args = append(args, *v); argN++
+				args = append(args, *v)
+				argN++
 			}
 			addF64Ptr := func(col string, v *float64) {
-				if v == nil { return }
+				if v == nil {
+					return
+				}
 				sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
-				args = append(args, *v); argN++
+				args = append(args, *v)
+				argN++
 			}
 			addIntPtr := func(col string, v *int) {
-				if v == nil { return }
+				if v == nil {
+					return
+				}
 				sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
-				args = append(args, *v); argN++
+				args = append(args, *v)
+				argN++
 			}
 
 			// Plain strings — only when non-empty so blank Excel cells
@@ -2247,7 +2342,8 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 			if catID := strings.TrimSpace(p.CategoryID); catID != "" {
 				if cid, err := uuid.Parse(catID); err == nil {
 					sets = append(sets, fmt.Sprintf("category_id = $%d", argN))
-					args = append(args, cid); argN++
+					args = append(args, cid)
+					argN++
 				}
 			} else if catName := strings.TrimSpace(p.Category); catName != "" {
 				var cid uuid.UUID
@@ -2258,7 +2354,8 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 					tenantID, catName,
 				).Scan(&cid); err == nil {
 					sets = append(sets, fmt.Sprintf("category_id = $%d", argN))
-					args = append(args, cid); argN++
+					args = append(args, cid)
+					argN++
 				}
 			}
 
@@ -2270,14 +2367,16 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 			if p.Tags != nil {
 				if tagsJSON, jerr := json.Marshal(p.Tags); jerr == nil {
 					sets = append(sets, fmt.Sprintf("tags = $%d", argN))
-					args = append(args, tagsJSON); argN++
+					args = append(args, tagsJSON)
+					argN++
 				}
 			}
 
 			// is_active is a pointer so we can distinguish absent vs false.
 			if p.IsActive != nil {
 				sets = append(sets, fmt.Sprintf("is_active = $%d", argN))
-				args = append(args, *p.IsActive); argN++
+				args = append(args, *p.IsActive)
+				argN++
 			}
 
 			// Cost / list price — non-pointer floats. Only write if
@@ -2286,11 +2385,13 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 			// set a price to 0 can use the single-product edit form.
 			if p.CostPrice > 0 {
 				sets = append(sets, fmt.Sprintf("cost_price = $%d", argN))
-				args = append(args, p.CostPrice); argN++
+				args = append(args, p.CostPrice)
+				argN++
 			}
 			if p.ListPrice > 0 {
 				sets = append(sets, fmt.Sprintf("list_price = $%d", argN))
-				args = append(args, p.ListPrice); argN++
+				args = append(args, p.ListPrice)
+				argN++
 			}
 
 			// Pointer-typed extension fields.
@@ -2333,7 +2434,8 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 
 			// Always bump updated_at, then add the WHERE args.
 			sets = append(sets, fmt.Sprintf("updated_at = $%d", argN))
-			args = append(args, time.Now()); argN++
+			args = append(args, time.Now())
+			argN++
 			args = append(args, productID, tenantID)
 
 			query := fmt.Sprintf(
@@ -2394,12 +2496,24 @@ func (h *Handler) BulkCreateProducts(c *gin.Context) {
 			if orgID != uuid.Nil && (p.CostPrice > 0 || p.ListPrice > 0 || p.MinPrice != nil ||
 				p.MinStockLevel != nil || p.ReorderPoint != nil || p.ReorderQuantity != nil) {
 				var costArg, listArg, minPriceArg, minStockArg, reorderPtArg, reorderQtyArg interface{}
-				if p.CostPrice > 0 { costArg = p.CostPrice }
-				if p.ListPrice > 0 { listArg = p.ListPrice }
-				if p.MinPrice != nil { minPriceArg = *p.MinPrice }
-				if p.MinStockLevel != nil { minStockArg = *p.MinStockLevel }
-				if p.ReorderPoint != nil { reorderPtArg = *p.ReorderPoint }
-				if p.ReorderQuantity != nil { reorderQtyArg = *p.ReorderQuantity }
+				if p.CostPrice > 0 {
+					costArg = p.CostPrice
+				}
+				if p.ListPrice > 0 {
+					listArg = p.ListPrice
+				}
+				if p.MinPrice != nil {
+					minPriceArg = *p.MinPrice
+				}
+				if p.MinStockLevel != nil {
+					minStockArg = *p.MinStockLevel
+				}
+				if p.ReorderPoint != nil {
+					reorderPtArg = *p.ReorderPoint
+				}
+				if p.ReorderQuantity != nil {
+					reorderQtyArg = *p.ReorderQuantity
+				}
 
 				if _, posErr := h.db.Exec(`
 					INSERT INTO product_organization_settings (tenant_id, product_id, organization_id,
