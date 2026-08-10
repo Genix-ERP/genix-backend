@@ -632,21 +632,26 @@ type ExchangeRate struct {
 
 // BankAccount represents a bank account for the company
 type BankAccount struct {
-	ID             uuid.UUID    `json:"id" db:"id"`
-	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	OrganizationID *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
-	Name           string       `json:"name" db:"name"`
-	BankName       string       `json:"bank_name" db:"bank_name"`
-	AccountNumber  string       `json:"account_number" db:"account_number"`
-	Currency       string       `json:"currency" db:"currency"`
-	AccountType    string       `json:"account_type" db:"account_type"` // checking, savings, etc.
-	Balance        float64      `json:"balance" db:"balance"`
-	IsActive       bool         `json:"is_active" db:"is_active"`
-	LastReconciled *time.Time   `json:"last_reconciled,omitempty" db:"last_reconciled"`
-	AccountID      *uuid.UUID   `json:"account_id,omitempty" db:"account_id"` // Link to chart of accounts
-	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
-	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
+	ID              uuid.UUID    `json:"id" db:"id"`
+	TenantID        uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	OrganizationID  *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
+	Name            string       `json:"name" db:"name"`
+	BankName        string       `json:"bank_name" db:"bank_name"`
+	AccountNumber   string       `json:"account_number" db:"account_number"`
+	Currency        string       `json:"currency" db:"currency"`
+	AccountType     string       `json:"account_type" db:"account_type"` // checking, savings, etc.
+	Balance         float64      `json:"balance" db:"balance"`
+	IsActive        bool         `json:"is_active" db:"is_active"`
+	LastReconciled  *time.Time   `json:"last_reconciled,omitempty" db:"last_reconciled"`
+	AccountID       *uuid.UUID   `json:"account_id,omitempty" db:"account_id"` // Link to chart of accounts
+	CreatedAt       time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt       time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt       sql.NullTime `json:"-" db:"deleted_at"`
+	// Computed (list endpoint only): SUM(debit-credit) of posted JE lines
+	// on the linked GL account — the Moliya v2 balance truth. The mutable
+	// Balance column above is legacy and slated for removal.
+	LedgerBalance   float64      `json:"ledger_balance" db:"-"`
+	GLLinked        bool         `json:"gl_linked" db:"-"` // account_id IS NOT NULL
 }
 
 // CreateBankAccountInput is the input for creating a bank account

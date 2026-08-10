@@ -1234,14 +1234,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		payments.POST("/:id/confirm", h.perm.Require("finance", "payment", "approve"), h.ConfirmPayment)
 	}
 
-	// Tax Rates
+	// Tax Rates. Reads stay open (reference data for invoice forms);
+	// mutations are finance-only (same node as the tax constructor below).
 	taxes := rg.Group("/tax-rates")
 	{
 		taxes.GET("", h.ListTaxRates)
-		taxes.POST("", h.CreateTaxRate)
+		taxes.POST("", h.perm.Require("finance", "tax_report", "create"), h.CreateTaxRate)
 		taxes.GET("/:id", h.GetTaxRate)
-		taxes.PUT("/:id", h.UpdateTaxRate)
-		taxes.DELETE("/:id", h.DeleteTaxRate)
+		taxes.PUT("/:id", h.perm.Require("finance", "tax_report", "update"), h.UpdateTaxRate)
+		taxes.DELETE("/:id", h.perm.Require("finance", "tax_report", "delete"), h.DeleteTaxRate)
 	}
 
 	// Tax constructor + catalog (genix_soliq_spec §2–3): catalog, versioned
@@ -1335,52 +1336,59 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		cashTransactions.DELETE("/:id", h.perm.Require("finance", "cash_transaction", "delete"), h.DeleteCashTransaction)
 	}
 
-	// Fiscal Years
+	// Fiscal Years. Period management gates: create/update/delete follow the
+	// journal-definition nodes; close (the privileged accounting operation)
+	// requires posting authority (finance:journal:post).
 	fiscalYears := rg.Group("/fiscal-years")
 	{
 		fiscalYears.GET("", h.ListFiscalYears)
-		fiscalYears.POST("", h.CreateFiscalYear)
+		fiscalYears.POST("", h.perm.Require("finance", "journal", "create"), h.CreateFiscalYear)
 		fiscalYears.GET("/:id", h.GetFiscalYear)
-		fiscalYears.PUT("/:id", h.UpdateFiscalYear)
-		fiscalYears.POST("/:id/close", h.CloseFiscalYear)
-		fiscalYears.DELETE("/:id", h.DeleteFiscalYear)
+		fiscalYears.PUT("/:id", h.perm.Require("finance", "journal", "update"), h.UpdateFiscalYear)
+		fiscalYears.POST("/:id/close", h.perm.Require("finance", "journal", "post"), h.CloseFiscalYear)
+		fiscalYears.DELETE("/:id", h.perm.Require("finance", "journal", "delete"), h.DeleteFiscalYear)
 	}
 
-	// Fiscal Periods
+	// Fiscal Periods — same gating scheme as fiscal years.
 	fiscalPeriods := rg.Group("/fiscal-periods")
 	{
 		fiscalPeriods.GET("", h.ListFiscalPeriods)
-		fiscalPeriods.POST("", h.CreateFiscalPeriod)
-		fiscalPeriods.POST("/batch", h.BatchCreateFiscalPeriods)
-		fiscalPeriods.POST("/:id/close", h.CloseFiscalPeriod)
-		fiscalPeriods.POST("/:id/reopen", h.ReopenFiscalPeriod)
-		fiscalPeriods.POST("/:id/lock", h.LockFiscalPeriod)
-		fiscalPeriods.POST("/:id/unlock", h.UnlockFiscalPeriod)
+		fiscalPeriods.POST("", h.perm.Require("finance", "journal", "create"), h.CreateFiscalPeriod)
+		fiscalPeriods.POST("/batch", h.perm.Require("finance", "journal", "create"), h.BatchCreateFiscalPeriods)
+		fiscalPeriods.POST("/:id/close", h.perm.Require("finance", "journal", "post"), h.CloseFiscalPeriod)
+		fiscalPeriods.POST("/:id/reopen", h.perm.Require("finance", "journal", "post"), h.ReopenFiscalPeriod)
+		fiscalPeriods.POST("/:id/lock", h.perm.Require("finance", "journal", "post"), h.LockFiscalPeriod)
+		fiscalPeriods.POST("/:id/unlock", h.perm.Require("finance", "journal", "post"), h.UnlockFiscalPeriod)
 	}
 
-	// Accounting Periods
+	// Accounting Periods — same gating scheme as fiscal periods.
 	periods := rg.Group("/accounting-periods")
 	{
 		periods.GET("", h.ListAccountingPeriods)
-		periods.POST("", h.CreateAccountingPeriod)
-		periods.POST("/auto-create", h.AutoCreatePeriods)
-		periods.POST("/:id/lock", h.LockAccountingPeriod)
-		periods.POST("/:id/unlock", h.UnlockAccountingPeriod)
+		periods.POST("", h.perm.Require("finance", "journal", "create"), h.CreateAccountingPeriod)
+		periods.POST("/auto-create", h.perm.Require("finance", "journal", "create"), h.AutoCreatePeriods)
+		periods.POST("/:id/lock", h.perm.Require("finance", "journal", "post"), h.LockAccountingPeriod)
+		periods.POST("/:id/unlock", h.perm.Require("finance", "journal", "post"), h.UnlockAccountingPeriod)
 	}
 
-	// Period Close Procedure (TT Buxgalteriya §4.3)
+	// Period Close Procedure (TT Buxgalteriya §4.3). /run executes
+	// fn_close_accounting_period and posts the closing journal entry — the
+	// most privileged accounting operation — so it (and reopen) require
+	// posting authority.
 	periodClose := rg.Group("/period-close")
 	{
-		periodClose.POST("/run", h.ClosePeriod)
+		periodClose.POST("/run", h.perm.Require("finance", "journal", "post"), h.ClosePeriod)
 		periodClose.GET("", h.ListClosings)
+		periodClose.GET("/checklist", h.GetCloseChecklist)
 		periodClose.GET("/:id", h.GetClosing)
-		periodClose.POST("/:id/reopen", h.ReopenPeriod)
+		periodClose.POST("/:id/reopen", h.perm.Require("finance", "journal", "post"), h.ReopenPeriod)
 	}
 
-	// Bank Statement Import (TT Buxgalteriya §8.1 Bank-mijoz) — 1C format
+	// Bank Statement Import (TT Buxgalteriya §8.1 Bank-mijoz) — 1C format.
+	// Import mutates bank data; same node as the per-account /import route.
 	bankImport := rg.Group("/bank-statement-imports")
 	{
-		bankImport.POST("", h.ImportBankStatement1C)
+		bankImport.POST("", h.perm.Require("finance", "bank_account", "update"), h.ImportBankStatement1C)
 		bankImport.GET("", h.ListBankImports)
 
 		// Excel vipiska (Turonbank format) — parse + auto-classify + review,
@@ -1398,28 +1406,35 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		bankImport.POST("/lines/:lineId/reject", h.perm.Require("finance", "bank_account", "update"), h.RejectBankVipiskaLine)
 	}
 
-	// E-invoice (TT Buxgalteriya §8.2)
+	// E-invoice (TT Buxgalteriya §8.2). Approve/reject link e-invoices to
+	// purchase/sales invoices (accounting documents) and send/sync talk to
+	// the provider — buxgalter-level operations. No dedicated einvoice
+	// resource exists in the perm vocabulary, so the journal nodes carry it:
+	// sync (fetches rows) = create; approve/reject/send = posting authority.
 	einvoices := rg.Group("/einvoices")
 	{
 		einvoices.POST("/ingest", h.IngestEInvoice)
 		einvoices.GET("", h.ListEInvoices)
-		einvoices.POST("/:id/approve", h.ApproveEInvoice)
-		einvoices.POST("/:id/reject", h.RejectEInvoice)
+		einvoices.POST("/:id/approve", h.perm.Require("finance", "journal", "post"), h.ApproveEInvoice)
+		einvoices.POST("/:id/reject", h.perm.Require("finance", "journal", "post"), h.RejectEInvoice)
 		// Provider adapter calls
-		einvoices.POST("/sync", h.SyncEInvoices)
-		einvoices.POST("/:id/send", h.SendEInvoice)
+		einvoices.POST("/sync", h.perm.Require("finance", "journal", "create"), h.SyncEInvoices)
+		einvoices.POST("/:id/send", h.perm.Require("finance", "journal", "post"), h.SendEInvoice)
 	}
 
-	// Webhook subscriptions (TT Buxgalteriya §7.4)
+	// Webhook subscriptions (TT Buxgalteriya §7.4) — tenant-level integration
+	// settings (subscriptions carry endpoint URLs/secrets), so the whole group
+	// is settings-gated.
 	hooks := rg.Group("/webhook-subscriptions")
+	hooks.Use(h.perm.Require("settings", "tenant", "read"))
 	{
-		hooks.POST("", h.CreateWebhookSubscription)
+		hooks.POST("", h.perm.Require("settings", "tenant", "update"), h.CreateWebhookSubscription)
 		hooks.GET("", h.ListWebhookSubscriptions)
-		hooks.DELETE("/:id", h.DeleteWebhookSubscription)
+		hooks.DELETE("/:id", h.perm.Require("settings", "tenant", "update"), h.DeleteWebhookSubscription)
 		hooks.GET("/:id/deliveries", h.ListWebhookDeliveries)
 	}
 
-	// Budgets
+	// Budgets (legacy group; mutations share the /budget v2 permission nodes)
 	budgets := rg.Group("/budgets")
 	{
 		budgets.GET("", h.ListBudgets)
@@ -1427,20 +1442,20 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// summary cards must not be assembled from a paginated list — with a
 		// page in hand the totals would describe the page, not the tenant.
 		budgets.GET("/summary", h.GetBudgetsSummary)
-		budgets.POST("", h.CreateBudget)
+		budgets.POST("", h.perm.Require("finance", "budget", "create"), h.CreateBudget)
 		budgets.GET("/:id", h.GetBudget)
-		budgets.PUT("/:id", h.UpdateBudget)
-		budgets.DELETE("/:id", h.DeleteBudget)
-		budgets.POST("/:id/activate", h.ActivateBudget)
+		budgets.PUT("/:id", h.perm.Require("finance", "budget", "update"), h.UpdateBudget)
+		budgets.DELETE("/:id", h.perm.Require("finance", "budget", "delete"), h.DeleteBudget)
+		budgets.POST("/:id/activate", h.perm.Require("finance", "budget", "update"), h.ActivateBudget)
 	}
 
-	// Budget Lines
+	// Budget Lines (legacy group; same nodes as /budget/:id/lines)
 	budgetLines := rg.Group("/budget-lines")
 	{
 		budgetLines.GET("", h.ListBudgetLines)
-		budgetLines.POST("", h.CreateBudgetLine)
-		budgetLines.PUT("/:id", h.UpdateBudgetLine)
-		budgetLines.DELETE("/:id", h.DeleteBudgetLine)
+		budgetLines.POST("", h.perm.Require("finance", "budget", "create"), h.CreateBudgetLine)
+		budgetLines.PUT("/:id", h.perm.Require("finance", "budget", "update"), h.UpdateBudgetLine)
+		budgetLines.DELETE("/:id", h.perm.Require("finance", "budget", "delete"), h.DeleteBudgetLine)
 	}
 
 	// Recurring Journal Entries
@@ -1475,11 +1490,17 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		cashOrders.GET("/:id", h.GetCashOrder)
 		cashOrders.PUT("/:id", h.perm.Require("finance", "cash", "update"), h.UpdateCashOrder)
 		cashOrders.POST("/:id/confirm", h.perm.Require("finance", "cash", "approve"), h.ConfirmCashOrder)
-		cashOrders.DELETE("/:id", h.perm.Require("finance", "cash", "delete"), h.DeleteCashOrder)
+		// No hard DELETE: under the Moliya v2 kassa engine a confirmed order is
+		// immutable and is reversed by storno (POST /:id/cancel), never removed.
+		// The old DeleteCashOrder went with cash_kassa.go.
+		cashOrders.POST("/:id/cancel", h.perm.Require("finance", "cash", "update"), h.CancelCashOrder)
 	}
 
 	// Cash Book (Kassa kitob)
 	rg.GET("/cash/book", h.perm.Require("finance", "cash", "read"), h.GetCashBook)
+
+	// Cash balance — the single-cash-engine surface (ledger CASH accounts)
+	rg.GET("/cash/balance", h.perm.Require("finance", "cash", "read"), h.GetCashBalance)
 
 	// Currency Rates Sync & Revaluation
 	currencyOps := rg.Group("/currency")
@@ -1507,18 +1528,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		reconciliation.POST("/:id/remind", h.perm.Require("finance", "reconciliation", "update"), h.SendReconciliationReminder)
 	}
 
-	// Budgets (Byudjetlashtirish)
+	// Budgets (Byudjetlashtirish). CRUD lives on the legacy /budgets group —
+	// the V2 CRUD stubs that fake-succeeded were removed (moliya-v2 audit §6);
+	// only the real members of this group remain.
 	budget := rg.Group("/budget")
 	budget.Use(h.perm.Require("finance", "budget", "read"))
 	{
-		budget.GET("", h.ListBudgetsV2)
-		budget.POST("", h.perm.Require("finance", "budget", "create"), h.CreateBudgetV2)
-		budget.GET("/consolidated", h.GetConsolidatedBudget)
 		budget.GET("/cash-flow", h.GetBudgetCashFlow)
 		budget.GET("/plan-vs-actual", h.GetBudgetPlanVsActual)
-		budget.GET("/:id", h.GetBudgetV2)
-		budget.PUT("/:id", h.perm.Require("finance", "budget", "update"), h.UpdateBudgetV2)
-		budget.DELETE("/:id", h.perm.Require("finance", "budget", "delete"), h.DeleteBudgetV2)
 		budget.POST("/:id/submit", h.perm.Require("finance", "budget", "update"), h.SubmitBudgetForApproval)
 		budget.POST("/:id/approve", h.perm.Require("finance", "budget", "update"), h.ApproveBudget)
 		budget.POST("/:id/reject", h.perm.Require("finance", "budget", "update"), h.RejectBudget)
@@ -1692,6 +1709,7 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// One-call Moliya dashboard: totals, cash position + series, monthly
 		// flow, category-enriched expense breakdown, open AR/AP.
 		reports.GET("/finance-dashboard", h.GetFinanceDashboard)
+		reports.GET("/finance-kpis", h.GetFinanceKPIs)
 		reports.GET("/cash-flow", h.GetCashFlow)
 		reports.GET("/trial-balance", h.GetTrialBalance)
 		// ASQ per TT Buxgalteriya §6.1 — opening/turnover/closing + Excel export

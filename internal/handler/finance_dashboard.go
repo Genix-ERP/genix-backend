@@ -22,6 +22,9 @@ import (
 //                        the one /reports/cash-flow also calls, so the web card,
 //                        its chart, and the mobile card cannot disagree.
 //   - monthly:           income vs expense per month across the period
+//   - trend:             income/expense/net per month, rolling last 6 full
+//                        months + current month-to-date, independent of the
+//                        requested period (conventions.md §4)
 //   - expense_breakdown: category-enriched — expense-sourced JE lines are
 //                        labelled by their Xarajatlar category (join via
 //                        source_id), everything else by GL account name,
@@ -159,6 +162,57 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 		monthRows.Close()
 	}
 
+	// ── 3b. Rolling trend: last 6 FULL months + current month-to-date,
+	//      INDEPENDENT of the requested period — the trend chart keeps a
+	//      rolling window while the cards obey the period filter (fixes
+	//      "chart shows one month" when the period is a single month).
+	//      Months with no postings are zero-filled for a stable axis. ────
+	type trendPoint struct {
+		Month   string  `json:"month"`
+		Income  float64 `json:"income"`
+		Expense float64 `json:"expense"`
+		Net     float64 `json:"net"`
+	}
+	trendStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).AddDate(0, -6, 0)
+	trend := make([]trendPoint, 0, 7)
+	trendIdx := make(map[string]int, 7)
+	for i := 0; i < 7; i++ {
+		ym := trendStart.AddDate(0, i, 0).Format("2006-01")
+		trendIdx[ym] = len(trend)
+		trend = append(trend, trendPoint{Month: ym})
+	}
+	trendArgs := []interface{}{tenantID, trendStart.Format("2006-01-02"), now.Format("2006-01-02")}
+	if orgScoped {
+		trendArgs = append(trendArgs, orgID)
+	}
+	trendRows, err := h.db.Query(`
+		SELECT to_char(je.entry_date, 'YYYY-MM') AS ym,
+			COALESCE(SUM(CASE WHEN at.category = 'revenue' THEN l.credit_amount - l.debit_amount ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN at.category = 'expense' THEN l.debit_amount - l.credit_amount ELSE 0 END), 0)
+		FROM journal_entry_lines l
+		JOIN journal_entries je ON je.id = l.journal_entry_id
+			AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.entry_date >= $2 AND je.entry_date <= $3`+orgFilterJE+`
+		JOIN accounts a ON a.id = l.account_id AND a.tenant_id = $1 AND a.deleted_at IS NULL
+		JOIN account_types at ON at.id = a.account_type_id
+		WHERE at.category IN ('revenue', 'expense')
+		GROUP BY 1 ORDER BY 1
+	`, trendArgs...)
+	if err == nil {
+		for trendRows.Next() {
+			var ym string
+			var income, expense float64
+			if trendRows.Scan(&ym, &income, &expense) == nil {
+				if i, ok := trendIdx[ym]; ok {
+					trend[i].Income = income
+					trend[i].Expense = expense
+					trend[i].Net = income - expense
+				}
+			}
+		}
+		trendRows.Close()
+	}
+
 	// ── 4. Expense breakdown, category-enriched ─────────────────────────
 	type breakdownItem struct {
 		Label  string  `json:"label"`
@@ -286,6 +340,7 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 		"cash_balance":      cashTotal,
 		"cash_accounts":     cashAccounts,
 		"monthly":           monthly,
+		"trend":             trend,
 		"expense_breakdown": breakdown,
 		"cash_series":       cashSeries,
 		"receivables": gin.H{

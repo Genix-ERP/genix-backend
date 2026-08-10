@@ -224,6 +224,98 @@ func (h *Handler) GetClosing(c *gin.Context) {
 	response.Success(c, summary)
 }
 
+// GetCloseChecklist previews what would block or should precede a period close
+// for the given range: draft entries (fn_close_accounting_period hard-fails on
+// them), months with no posted depreciation run, and vipiska imports with
+// unmatched lines. GET /finance/periods/close-checklist?period_start&period_end
+func (h *Handler) GetCloseChecklist(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	periodStart := c.Query("period_start")
+	periodEnd := c.Query("period_end")
+	if _, err := time.Parse("2006-01-02", periodStart); err != nil {
+		response.BadRequest(c, "period_start (YYYY-MM-DD) is required")
+		return
+	}
+	if _, err := time.Parse("2006-01-02", periodEnd); err != nil {
+		response.BadRequest(c, "period_end (YYYY-MM-DD) is required")
+		return
+	}
+
+	var draftCount int
+	var draftSum float64
+	_ = h.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(total_debit), 0)
+		FROM journal_entries
+		WHERE tenant_id = $1 AND status = 'draft' AND deleted_at IS NULL
+		  AND entry_date >= $2 AND entry_date <= $3
+	`, tenantID, periodStart, periodEnd).Scan(&draftCount, &draftSum)
+
+	// Months in the range with no posted depreciation run (only meaningful for
+	// tenants that own depreciable assets).
+	missingDepMonths := make([]string, 0, 4)
+	var hasAssets bool
+	_ = h.db.QueryRow(`
+		SELECT EXISTS (SELECT 1 FROM fa_assets
+			WHERE tenant_id = $1 AND deleted_at IS NULL AND status = 'in_service')
+	`, tenantID).Scan(&hasAssets)
+	if hasAssets {
+		rows, err := h.db.Query(`
+			SELECT to_char(m, 'YYYY-MM')
+			FROM generate_series(date_trunc('month', $2::date),
+			                     date_trunc('month', $3::date), interval '1 month') AS m
+			WHERE NOT EXISTS (
+				SELECT 1 FROM fa_depreciation_runs r
+				WHERE r.tenant_id = $1 AND r.period = to_char(m, 'YYYY-MM')
+				  AND r.status = 'posted'
+			)
+			ORDER BY 1
+		`, tenantID, periodStart, periodEnd)
+		if err == nil {
+			for rows.Next() {
+				var ym string
+				if rows.Scan(&ym) == nil {
+					missingDepMonths = append(missingDepMonths, ym)
+				}
+			}
+			rows.Close()
+		}
+	}
+
+	var unmatchedImports, unmatchedLines int
+	_ = h.db.QueryRow(`
+		SELECT COUNT(*), COALESCE(SUM(unmatched_count), 0)
+		FROM bank_statement_imports
+		WHERE tenant_id = $1 AND statement_date >= $2 AND statement_date <= $3
+		  AND COALESCE(unmatched_count, 0) > 0
+	`, tenantID, periodStart, periodEnd).Scan(&unmatchedImports, &unmatchedLines)
+
+	var periodStatus sql.NullString
+	_ = h.db.QueryRow(`
+		SELECT fp.status
+		FROM fiscal_periods fp
+		JOIN fiscal_years fy ON fy.id = fp.fiscal_year_id
+		WHERE fy.tenant_id = $1 AND fp.start_date <= $2::date AND fp.end_date >= $2::date
+		ORDER BY fp.start_date DESC LIMIT 1
+	`, tenantID, periodStart).Scan(&periodStatus)
+
+	ready := draftCount == 0 && len(missingDepMonths) == 0
+	response.Success(c, gin.H{
+		"period_start":                periodStart,
+		"period_end":                  periodEnd,
+		"period_status":               periodStatus.String,
+		"draft_entries":               draftCount,
+		"draft_entries_total":         draftSum,
+		"missing_depreciation_months": missingDepMonths,
+		"unmatched_vipiska_imports":   unmatchedImports,
+		"unmatched_vipiska_lines":     unmatchedLines,
+		"ready":                       ready,
+	})
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

@@ -47,12 +47,13 @@ import (
 //
 // CONTRACT: this fragment hardcodes $1 for the tenant id, so every query that
 // embeds it must bind the tenant as its first parameter.
-const cashAccountSetSQL = `
+// Built from cashAccountPredicate (cash_engine.go) so there is exactly ONE
+// definition of "is this account cash?" in the codebase. This adds only the
+// tenant/soft-delete scoping the predicate deliberately leaves to its caller.
+var cashAccountSetSQL = `
 	a.tenant_id = $1
 	AND a.deleted_at IS NULL
-	AND a.is_active = true
-	AND a.is_leaf = true
-	AND (at.code = 'CASH' OR a.is_bank_account = true)`
+	AND ` + cashAccountPredicate("a", "at")
 
 // cashAccountBalance is one cash/bank account and its balance as of a date.
 type cashAccountBalance struct {

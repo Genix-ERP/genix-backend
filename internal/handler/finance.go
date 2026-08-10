@@ -5994,14 +5994,25 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 		return
 	}
 
+	// ledger_balance is the Moliya v2 truth (posted JE lines on the linked
+	// GL account); the legacy mutable balance column stays until the
+	// frontend migrates off it.
 	query := `
 		SELECT id, tenant_id, organization_id, COALESCE(name, bank_name) as name, bank_name,
 		       COALESCE(account_number, '') as account_number,
 		       COALESCE(currency, 'UZS') as currency, COALESCE(account_type, 'checking') as account_type,
 		       COALESCE(balance, 0) as balance, COALESCE(is_active, true) as is_active,
 		       last_reconciled,
-		       account_id, created_at, updated_at
-		FROM bank_accounts
+		       account_id, created_at, updated_at,
+		       COALESCE(lb.bal, 0) as ledger_balance
+		FROM bank_accounts ba
+		LEFT JOIN LATERAL (
+			SELECT SUM(l.debit_amount - l.credit_amount) AS bal
+			FROM journal_entry_lines l
+			JOIN journal_entries je ON je.id = l.journal_entry_id
+				AND je.status = 'posted' AND je.deleted_at IS NULL AND je.tenant_id = ba.tenant_id
+			WHERE l.account_id = ba.account_id
+		) lb ON true
 		WHERE tenant_id = $1 AND deleted_at IS NULL
 	`
 	args := []interface{}{tenantID}
@@ -6069,11 +6080,13 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 			&acc.ID, &acc.TenantID, &organizationID, &name, &acc.BankName,
 			&accountNumber, &acc.Currency, &acc.AccountType, &acc.Balance,
 			&acc.IsActive, &lastReconciled, &accountID, &acc.CreatedAt, &acc.UpdatedAt,
+			&acc.LedgerBalance,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan bank account", "error", err)
 			continue
 		}
+		acc.GLLinked = accountID.Valid
 
 		if name.Valid {
 			acc.Name = name.String
@@ -8695,6 +8708,27 @@ func (h *Handler) CreateFiscalYear(c *gin.Context) {
 		return
 	}
 
+	// Auto-create the monthly periods: period locking is only enforceable when
+	// rows exist (moliya-v2 audit §5 — both period tables were empty DB-wide,
+	// so no close/lock had any effect). Same generation as migration 478's
+	// backfill; uq_fiscal_periods_year_number makes it idempotent.
+	if _, err := h.db.Exec(`
+		INSERT INTO fiscal_periods (id, fiscal_year_id, code, name, period_number,
+		                            start_date, end_date, status, created_at, updated_at)
+		SELECT uuid_generate_v4(), $1,
+		       to_char(m.month_start, 'YYYY-MM'),
+		       to_char(m.month_start, 'TMMon YYYY'),
+		       row_number() OVER (ORDER BY m.month_start)::int,
+		       m.month_start::date,
+		       LEAST((m.month_start + interval '1 month' - interval '1 day')::date, $3::date),
+		       'open', NOW(), NOW()
+		FROM generate_series(date_trunc('month', $2::date),
+		                     date_trunc('month', $3::date), interval '1 month') AS m(month_start)
+		ON CONFLICT (fiscal_year_id, period_number) DO NOTHING
+	`, id, startDate, endDate); err != nil {
+		h.log.Error("CreateFiscalYear: month auto-create failed", "error", err)
+	}
+
 	fy := &entity.FiscalYear{
 		ID:             id,
 		TenantID:       tenantID,
@@ -9435,29 +9469,87 @@ func (h *Handler) UnlockFiscalPeriod(c *gin.Context) {
 // ==================== BUDGETS ====================
 
 type CreateBudgetInput struct {
-	OrganizationID   *string                 `json:"organization_id"`
-	FiscalYearID     string                  `json:"fiscal_year_id" binding:"required"`
-	Code             string                  `json:"code" binding:"required"`
-	Name             string                  `json:"name" binding:"required"`
-	Description      *string                 `json:"description"`
-	BudgetType       string                  `json:"budget_type"` // expense, revenue, combined
-	TotalAmount      float64                 `json:"total_amount"`
-	Status           string                  `json:"status"`
-	StartDate        *string                 `json:"start_date"`
-	EndDate          *string                 `json:"end_date"`
-	WarningThreshold *float64                `json:"warning_threshold"`
+	OrganizationID   *string  `json:"organization_id"`
+	FiscalYearID     string   `json:"fiscal_year_id" binding:"required"`
+	Code             string   `json:"code" binding:"required"`
+	Name             string   `json:"name" binding:"required"`
+	Description      *string  `json:"description"`
+	BudgetType       string   `json:"budget_type"` // expense, revenue, combined
+	TotalAmount      float64  `json:"total_amount"`
+	Status           string   `json:"status"`
+	StartDate        *string  `json:"start_date"`
+	EndDate          *string  `json:"end_date"`
+	WarningThreshold *float64 `json:"warning_threshold"`
+	// Wizard settings (migration 141 columns — were silently dropped before
+	// the 2026-08-10 Moliya v2 fix)
+	Approach             string  `json:"approach"`         // fixed, flexible, zero_based, rolling
+	Breakdown            string  `json:"breakdown"`        // monthly, weekly, none
+	OverspendPolicy      string  `json:"overspend_policy"` // warn, require_approval, block
+	RollingHorizonMonths *int    `json:"rolling_horizon_months"`
+	AutoExtend           *bool   `json:"auto_extend"`
+	ResponsibleUserID    *string `json:"responsible_user_id"`
+	DepartmentID         *string `json:"department_id"`
+	Category             *string `json:"category"`
 	Lines            []CreateBudgetLineInput `json:"lines"`
 }
 
 type CreateBudgetLineInput struct {
-	BudgetID       string  `json:"budget_id" binding:"required"`
-	AccountID      string  `json:"account_id" binding:"required"`
-	FiscalPeriodID *string `json:"fiscal_period_id"`
-	DepartmentID   *string `json:"department_id"`
-	BudgetedAmount float64 `json:"budgeted_amount"`
-	PlannedAmount  float64 `json:"planned_amount"` // alias from frontend
-	ActualAmount   float64 `json:"actual_amount"`
-	Notes          *string `json:"notes"`
+	BudgetID       string   `json:"budget_id" binding:"required"`
+	AccountID      string   `json:"account_id" binding:"required"`
+	FiscalPeriodID *string  `json:"fiscal_period_id"`
+	DepartmentID   *string  `json:"department_id"`
+	BudgetedAmount float64  `json:"budgeted_amount"`
+	PlannedAmount  float64  `json:"planned_amount"` // alias from frontend
+	ActualAmount   float64  `json:"actual_amount"`
+	Notes          *string  `json:"notes"`
+	// Migration 141 line fields the wizard sends (were silently dropped
+	// before the 2026-08-10 Moliya v2 fix)
+	LineType      string   `json:"line_type"` // revenue, expense, investment
+	CategoryName  *string  `json:"category_name"`
+	Justification *string  `json:"justification"`
+	FormulaType   *string  `json:"formula_type"`
+	FormulaValue  *float64 `json:"formula_value"`
+	FormulaCap    *float64 `json:"formula_cap"`
+	Period1       float64  `json:"period_1"`
+	Period2       float64  `json:"period_2"`
+	Period3       float64  `json:"period_3"`
+	Period4       float64  `json:"period_4"`
+	Period5       float64  `json:"period_5"`
+	Period6       float64  `json:"period_6"`
+	Period7       float64  `json:"period_7"`
+	Period8       float64  `json:"period_8"`
+	Period9       float64  `json:"period_9"`
+	Period10      float64  `json:"period_10"`
+	Period11      float64  `json:"period_11"`
+	Period12      float64  `json:"period_12"`
+}
+
+// budgetLineTypeOrDefault normalizes the wizard's line_type; empty means expense.
+func budgetLineTypeOrDefault(lt string) string {
+	if lt == "" {
+		return "expense"
+	}
+	return lt
+}
+
+// strPtrOrNil maps nil/empty *string inputs to SQL NULL.
+func strPtrOrNil(s *string) interface{} {
+	if s == nil || *s == "" {
+		return nil
+	}
+	return *s
+}
+
+// uuidPtrFromStr parses an optional UUID string; nil/empty/invalid become nil.
+func uuidPtrFromStr(s *string) *uuid.UUID {
+	if s == nil || *s == "" {
+		return nil
+	}
+	id, err := uuid.Parse(*s)
+	if err != nil {
+		return nil
+	}
+	return &id
 }
 
 // ListBudgets godoc
@@ -9836,13 +9928,43 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 		warningThreshold = *input.WarningThreshold
 	}
 
+	// Wizard settings (migration 141) — normalize to schema defaults
+	approach := input.Approach
+	if approach == "" {
+		approach = "fixed"
+	}
+	breakdown := input.Breakdown
+	if breakdown == "" {
+		breakdown = "monthly"
+	}
+	overspendPolicy := input.OverspendPolicy
+	if overspendPolicy == "" {
+		overspendPolicy = "warn"
+	}
+	rollingHorizon := 3
+	if input.RollingHorizonMonths != nil && *input.RollingHorizonMonths > 0 {
+		rollingHorizon = *input.RollingHorizonMonths
+	}
+	autoExtend := true
+	if input.AutoExtend != nil {
+		autoExtend = *input.AutoExtend
+	}
+	responsibleUserID := uuidPtrFromStr(input.ResponsibleUserID)
+	budgetDeptID := uuidPtrFromStr(input.DepartmentID)
+
 	_, err = h.db.Exec(`
 		INSERT INTO budgets (id, tenant_id, organization_id, fiscal_year_id, code, name, description,
 		                    budget_type, total_amount, status, start_date, end_date, warning_threshold,
+		                    approach, breakdown, overspend_policy, rolling_horizon_months, auto_extend,
+		                    responsible_user_id, department_id, category,
 		                    created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+		        $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 	`, id, tenantID, orgID, fiscalYearID, input.Code, input.Name, input.Description,
-		budgetType, input.TotalAmount, status, startDate, endDate, warningThreshold, userID, now, now)
+		budgetType, input.TotalAmount, status, startDate, endDate, warningThreshold,
+		approach, breakdown, overspendPolicy, rollingHorizon, autoExtend,
+		responsibleUserID, budgetDeptID, strPtrOrNil(input.Category),
+		userID, now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create budget", "error", err)
@@ -9868,10 +9990,21 @@ func (h *Handler) CreateBudget(c *gin.Context) {
 
 			_, err = h.db.Exec(`
 				INSERT INTO budget_lines (id, budget_id, account_id, fiscal_period_id, department_id,
-				                         budgeted_amount, actual_amount, notes, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				                         budgeted_amount, actual_amount, notes,
+				                         line_type, category_name, justification,
+				                         formula_type, formula_value, formula_cap,
+				                         period_1, period_2, period_3, period_4, period_5, period_6,
+				                         period_7, period_8, period_9, period_10, period_11, period_12,
+				                         created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+				        $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 			`, lineID, id, accountID, fiscalPeriodID, deptID,
-				lineInput.BudgetedAmount, lineInput.ActualAmount, lineInput.Notes, now, now)
+				lineInput.BudgetedAmount, lineInput.ActualAmount, lineInput.Notes,
+				budgetLineTypeOrDefault(lineInput.LineType), strPtrOrNil(lineInput.CategoryName), strPtrOrNil(lineInput.Justification),
+				strPtrOrNil(lineInput.FormulaType), lineInput.FormulaValue, lineInput.FormulaCap,
+				lineInput.Period1, lineInput.Period2, lineInput.Period3, lineInput.Period4, lineInput.Period5, lineInput.Period6,
+				lineInput.Period7, lineInput.Period8, lineInput.Period9, lineInput.Period10, lineInput.Period11, lineInput.Period12,
+				now, now)
 
 			if err != nil {
 				h.log.Error("Failed to create budget line", "error", err)
@@ -9974,11 +10107,23 @@ func (h *Handler) UpdateBudget(c *gin.Context) {
 		    start_date = COALESCE($6, start_date), end_date = COALESCE($7, end_date),
 		    warning_threshold = COALESCE($8, warning_threshold),
 		    status = $9, fiscal_year_id = $10,
-		    updated_at = $11
-		WHERE id = $12 AND tenant_id = $13 AND deleted_at IS NULL
+		    approach = COALESCE(NULLIF($11, ''), approach),
+		    breakdown = COALESCE(NULLIF($12, ''), breakdown),
+		    overspend_policy = COALESCE(NULLIF($13, ''), overspend_policy),
+		    rolling_horizon_months = COALESCE($14, rolling_horizon_months),
+		    auto_extend = COALESCE($15, auto_extend),
+		    responsible_user_id = COALESCE($16, responsible_user_id),
+		    department_id = COALESCE($17, department_id),
+		    category = COALESCE($18, category),
+		    updated_at = $19
+		WHERE id = $20 AND tenant_id = $21 AND deleted_at IS NULL
 	`, input.Code, input.Name, input.Description, input.BudgetType, input.TotalAmount,
 		startDate, endDate, input.WarningThreshold,
-		status, input.FiscalYearID, now, id, tenantID)
+		status, input.FiscalYearID,
+		input.Approach, input.Breakdown, input.OverspendPolicy,
+		input.RollingHorizonMonths, input.AutoExtend,
+		uuidPtrFromStr(input.ResponsibleUserID), uuidPtrFromStr(input.DepartmentID), strPtrOrNil(input.Category),
+		now, id, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to update budget", "error", err)
@@ -10138,6 +10283,48 @@ func (h *Handler) ActivateBudget(c *gin.Context) {
 
 // ==================== BUDGET LINES ====================
 
+// checkBudgetLineExceeded emits finance.budget_exceeded exactly once per
+// crossing of a budget line's ledger fakt over its plan. The marker column
+// budget_lines.exceeded_notified_at (migration 477) carries the state: it is
+// set atomically when the crossing is first observed (the claim UPDATE guards
+// concurrent readers) and cleared when the actual drops back under plan, which
+// re-arms the alert. Called from the fakt recomputation points
+// (ListBudgetLines, GetBudgetPlanVsActual). Only active budgets alert.
+func (h *Handler) checkBudgetLineExceeded(tenantID uuid.UUID, budgetStatus, budgetID, budgetName, lineID, accountCode, accountName, categoryName string, planned, actual float64, notifiedAt sql.NullTime) {
+	if budgetStatus != "active" || planned <= 0 {
+		return
+	}
+	if actual <= planned {
+		if notifiedAt.Valid {
+			// dropped back under plan — re-arm for the next crossing
+			_, _ = h.db.Exec(`UPDATE budget_lines SET exceeded_notified_at = NULL WHERE id = $1`, lineID)
+		}
+		return
+	}
+	if notifiedAt.Valid {
+		return // this crossing was already notified
+	}
+	res, err := h.db.Exec(`UPDATE budget_lines SET exceeded_notified_at = NOW() WHERE id = $1 AND exceeded_notified_at IS NULL`, lineID)
+	if err != nil {
+		h.log.Error("budget_exceeded marker claim failed", "error", err, "line_id", lineID)
+		return
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return // a concurrent reader claimed this crossing first
+	}
+	h.EmitWorkflowEvent(tenantID, "finance.budget_exceeded", map[string]interface{}{
+		"record_id":     budgetID,
+		"budget_name":   budgetName,
+		"line_id":       lineID,
+		"account_code":  accountCode,
+		"account_name":  accountName,
+		"category_name": categoryName,
+		"planned":       planned,
+		"actual":        actual,
+		"pct":           math.Round(actual/planned*1000) / 10,
+	})
+}
+
 // ListBudgetLines godoc
 // @Summary List budget lines
 // @Description Get a list of budget lines for a specific budget
@@ -10176,6 +10363,10 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		       bl.budgeted_amount,
 		       ` + budgetActualSQL + ` as computed_actual,
 		       bl.notes, COALESCE(bl.line_type, 'expense') as line_type, COALESCE(bl.category_name, '') as category_name,
+		       bl.justification,
+		       bl.period_1, bl.period_2, bl.period_3, bl.period_4, bl.period_5, bl.period_6,
+		       bl.period_7, bl.period_8, bl.period_9, bl.period_10, bl.period_11, bl.period_12,
+		       bl.exceeded_notified_at, b.name as budget_name, b.status as budget_status,
 		       bl.created_at, bl.updated_at
 		` + budgetLinesFrom
 
@@ -10205,15 +10396,20 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 	lines := make([]*entity.BudgetLine, 0)
 	for rows.Next() {
 		var line entity.BudgetLine
-		var fiscalPeriodID, deptID, notes sql.NullString
+		var fiscalPeriodID, deptID, notes, justification sql.NullString
 		var computedActual float64
-		var categoryName string
+		var categoryName, budgetName, budgetStatus string
+		var exceededAt sql.NullTime
 
 		err := rows.Scan(
 			&line.ID, &line.BudgetID, &line.AccountID, &line.AccountName, &line.AccountCode,
 			&fiscalPeriodID, &deptID,
 			&line.BudgetedAmount, &computedActual,
 			&notes, &line.LineType, &categoryName,
+			&justification,
+			&line.Period1, &line.Period2, &line.Period3, &line.Period4, &line.Period5, &line.Period6,
+			&line.Period7, &line.Period8, &line.Period9, &line.Period10, &line.Period11, &line.Period12,
+			&exceededAt, &budgetName, &budgetStatus,
 			&line.CreatedAt, &line.UpdatedAt,
 		)
 		if err != nil {
@@ -10226,6 +10422,17 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 		line.Variance = line.BudgetedAmount - line.ActualAmount
 		if categoryName != "" {
 			line.CategoryName = &categoryName
+		}
+		if justification.Valid {
+			line.Justification = &justification.String
+		}
+
+		// finance.budget_exceeded — once per crossing (marker in migration 477).
+		// Revenue lines are excluded: fakt above plan is achievement there.
+		if line.LineType != "revenue" {
+			h.checkBudgetLineExceeded(tenantID, budgetStatus, line.BudgetID.String(), budgetName,
+				line.ID.String(), line.AccountCode, line.AccountName, categoryName,
+				line.BudgetedAmount, line.ActualAmount, exceededAt)
 		}
 
 		if fiscalPeriodID.Valid {
@@ -10325,10 +10532,21 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 
 	_, err = h.db.Exec(`
 		INSERT INTO budget_lines (id, budget_id, account_id, fiscal_period_id, department_id,
-		                         budgeted_amount, actual_amount, notes, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		                         budgeted_amount, actual_amount, notes,
+		                         line_type, category_name, justification,
+		                         formula_type, formula_value, formula_cap,
+		                         period_1, period_2, period_3, period_4, period_5, period_6,
+		                         period_7, period_8, period_9, period_10, period_11, period_12,
+		                         created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+		        $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
 	`, id, budgetID, accountID, fiscalPeriodID, deptID,
-		budgetedAmount, input.ActualAmount, input.Notes, now, now)
+		budgetedAmount, input.ActualAmount, input.Notes,
+		budgetLineTypeOrDefault(input.LineType), strPtrOrNil(input.CategoryName), strPtrOrNil(input.Justification),
+		strPtrOrNil(input.FormulaType), input.FormulaValue, input.FormulaCap,
+		input.Period1, input.Period2, input.Period3, input.Period4, input.Period5, input.Period6,
+		input.Period7, input.Period8, input.Period9, input.Period10, input.Period11, input.Period12,
+		now, now)
 
 	if err != nil {
 		h.log.Error("Failed to create budget line", "error", err)
@@ -10338,16 +10556,23 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 
 	// Fetch created line
 	var line entity.BudgetLine
-	var fpIDStr, deptIDStr, notesStr sql.NullString
+	var fpIDStr, deptIDStr, notesStr, categoryStr, justificationStr sql.NullString
 
 	err = h.db.QueryRow(`
 		SELECT id, budget_id, account_id, fiscal_period_id, department_id,
-		       budgeted_amount, actual_amount, variance, notes, created_at, updated_at
+		       budgeted_amount, actual_amount, variance, notes,
+		       COALESCE(line_type, 'expense'), category_name, justification,
+		       period_1, period_2, period_3, period_4, period_5, period_6,
+		       period_7, period_8, period_9, period_10, period_11, period_12,
+		       created_at, updated_at
 		FROM budget_lines
 		WHERE id = $1
 	`, id).Scan(
 		&line.ID, &line.BudgetID, &line.AccountID, &fpIDStr, &deptIDStr,
 		&line.BudgetedAmount, &line.ActualAmount, &line.Variance, &notesStr,
+		&line.LineType, &categoryStr, &justificationStr,
+		&line.Period1, &line.Period2, &line.Period3, &line.Period4, &line.Period5, &line.Period6,
+		&line.Period7, &line.Period8, &line.Period9, &line.Period10, &line.Period11, &line.Period12,
 		&line.CreatedAt, &line.UpdatedAt,
 	)
 
@@ -10361,6 +10586,12 @@ func (h *Handler) CreateBudgetLine(c *gin.Context) {
 	}
 	if notesStr.Valid {
 		line.Notes = &notesStr.String
+	}
+	if categoryStr.Valid {
+		line.CategoryName = &categoryStr.String
+	}
+	if justificationStr.Valid {
+		line.Justification = &justificationStr.String
 	}
 
 	response.Success(c, line)
@@ -10415,11 +10646,29 @@ func (h *Handler) UpdateBudgetLine(c *gin.Context) {
 		return
 	}
 
+	// Accept either budgeted_amount or planned_amount from frontend
+	updBudgetedAmount := input.BudgetedAmount
+	if updBudgetedAmount == 0 && input.PlannedAmount > 0 {
+		updBudgetedAmount = input.PlannedAmount
+	}
+
 	result, err := h.db.Exec(`
 		UPDATE budget_lines
-		SET budgeted_amount = $1, actual_amount = $2, notes = $3, updated_at = $4
-		WHERE id = $5
-	`, input.BudgetedAmount, input.ActualAmount, input.Notes, now, id)
+		SET budgeted_amount = $1, actual_amount = $2, notes = $3,
+		    line_type = $4, category_name = $5, justification = $6,
+		    formula_type = $7, formula_value = $8, formula_cap = $9,
+		    period_1 = $10, period_2 = $11, period_3 = $12, period_4 = $13,
+		    period_5 = $14, period_6 = $15, period_7 = $16, period_8 = $17,
+		    period_9 = $18, period_10 = $19, period_11 = $20, period_12 = $21,
+		    updated_at = $22
+		WHERE id = $23
+	`, updBudgetedAmount, input.ActualAmount, input.Notes,
+		budgetLineTypeOrDefault(input.LineType), strPtrOrNil(input.CategoryName), strPtrOrNil(input.Justification),
+		strPtrOrNil(input.FormulaType), input.FormulaValue, input.FormulaCap,
+		input.Period1, input.Period2, input.Period3, input.Period4,
+		input.Period5, input.Period6, input.Period7, input.Period8,
+		input.Period9, input.Period10, input.Period11, input.Period12,
+		now, id)
 
 	if err != nil {
 		h.log.Error("Failed to update budget line", "error", err)
@@ -10435,16 +10684,23 @@ func (h *Handler) UpdateBudgetLine(c *gin.Context) {
 
 	// Fetch updated line
 	var line entity.BudgetLine
-	var fpIDStr, deptIDStr, notesStr sql.NullString
+	var fpIDStr, deptIDStr, notesStr, categoryStr, justificationStr sql.NullString
 
 	err = h.db.QueryRow(`
 		SELECT id, budget_id, account_id, fiscal_period_id, department_id,
-		       budgeted_amount, actual_amount, variance, notes, created_at, updated_at
+		       budgeted_amount, actual_amount, variance, notes,
+		       COALESCE(line_type, 'expense'), category_name, justification,
+		       period_1, period_2, period_3, period_4, period_5, period_6,
+		       period_7, period_8, period_9, period_10, period_11, period_12,
+		       created_at, updated_at
 		FROM budget_lines
 		WHERE id = $1
 	`, id).Scan(
 		&line.ID, &line.BudgetID, &line.AccountID, &fpIDStr, &deptIDStr,
 		&line.BudgetedAmount, &line.ActualAmount, &line.Variance, &notesStr,
+		&line.LineType, &categoryStr, &justificationStr,
+		&line.Period1, &line.Period2, &line.Period3, &line.Period4, &line.Period5, &line.Period6,
+		&line.Period7, &line.Period8, &line.Period9, &line.Period10, &line.Period11, &line.Period12,
 		&line.CreatedAt, &line.UpdatedAt,
 	)
 
@@ -10458,6 +10714,12 @@ func (h *Handler) UpdateBudgetLine(c *gin.Context) {
 	}
 	if notesStr.Valid {
 		line.Notes = &notesStr.String
+	}
+	if categoryStr.Valid {
+		line.CategoryName = &categoryStr.String
+	}
+	if justificationStr.Valid {
+		line.Justification = &justificationStr.String
 	}
 
 	response.Success(c, line)
@@ -10842,6 +11104,28 @@ func (h *Handler) CreateRecurringJournalTemplate(c *gin.Context) {
 	}
 	if math.Abs(totalDebit-totalCredit) > 0.01 {
 		response.BadRequest(c, "Debits and credits must be equal")
+		return
+	}
+
+	// Leaf-account + mandatory-analytics validation (TT §4.2/§4.5) — same
+	// rules as manual JE create, so a bad template fails here with a readable
+	// error instead of an opaque DB-trigger 500 at generate time.
+	vLines := make([]entity.CreateJournalEntryLineInput, 0, len(input.Lines))
+	for _, line := range input.Lines {
+		vl := entity.CreateJournalEntryLineInput{
+			AccountID:    line.AccountID,
+			Description:  line.Description,
+			DebitAmount:  line.DebitAmount,
+			CreditAmount: line.CreditAmount,
+		}
+		if line.ContactID != "" {
+			cid := line.ContactID
+			vl.ContactID = &cid
+		}
+		vLines = append(vLines, vl)
+	}
+	if msg := h.validateJournalLines(tenantID, vLines); msg != "" {
+		response.BadRequest(c, msg)
 		return
 	}
 
@@ -11272,6 +11556,41 @@ func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 		lines = append(lines, l)
 	}
 
+	// Validate template lines at generate time too (TT §4.2/§4.5): the chart
+	// may have changed since the template was created (account demoted to a
+	// group, analytics made mandatory), and auto_post skips the manual post
+	// pipeline that would otherwise catch it.
+	vLines := make([]entity.CreateJournalEntryLineInput, 0, len(lines))
+	for _, l := range lines {
+		vl := entity.CreateJournalEntryLineInput{
+			AccountID:    l.AccountID.String(),
+			DebitAmount:  l.DebitAmount,
+			CreditAmount: l.CreditAmount,
+		}
+		if l.ContactID != nil {
+			cid := l.ContactID.String()
+			vl.ContactID = &cid
+		}
+		vLines = append(vLines, vl)
+	}
+	if msg := h.validateJournalLines(tenantID, vLines); msg != "" {
+		response.BadRequest(c, msg)
+		return
+	}
+
+	// Header totals are re-derived from the LIVE lines (a template's stored
+	// totals can drift after line edits); an imbalanced set must not reach
+	// the ledger.
+	var liveDebit, liveCredit float64
+	for _, l := range lines {
+		liveDebit += l.DebitAmount
+		liveCredit += l.CreditAmount
+	}
+	if math.Abs(liveDebit-liveCredit) > 0.01 {
+		response.BadRequest(c, "Template lines are not balanced (debits must equal credits)")
+		return
+	}
+
 	// Journal's counter/prefix seed the shared entry-number helper below
 	var journalNextNumber int
 	var journalNumberPrefix sql.NullString
@@ -11307,15 +11626,19 @@ func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 		description = *template.Description
 	}
 
+	// source_type/source_id make generated entries traceable and visible to
+	// the (source_type, source_id) duplicate scans; source_id = template id.
 	var journalEntryID uuid.UUID
 	err = tx.QueryRow(`
 		INSERT INTO journal_entries (
 			tenant_id, organization_id, journal_id, entry_number, entry_date,
-			description, reference, status, total_debit, total_credit, created_by
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			description, reference, status, total_debit, total_credit, created_by,
+			source_type, source_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'recurring_journal', $12)
 		RETURNING id
 	`, tenantID, template.OrgID, template.JournalID, entryNumber, entryDate.Format("2006-01-02"),
-		description, template.Reference, status, template.TotalDebit, template.TotalCredit, nullIfEmpty(userID)).Scan(&journalEntryID)
+		description, template.Reference, status, liveDebit, liveCredit, nullIfEmpty(userID),
+		template.ID).Scan(&journalEntryID)
 
 	if err != nil {
 		h.log.Error("Failed to create journal entry", "error", err)
@@ -11338,30 +11661,15 @@ func (h *Handler) GenerateRecurringJournalEntry(c *gin.Context) {
 	}
 
 	// auto_post writes the entry directly as 'posted', so account balances must
-	// be applied here too — same convention as PostJournalEntry (debit-normal:
-	// +debit −credit; credit-normal: +credit −debit).
+	// be applied here too. Uniform debit-positive convention (migration 407,
+	// same as PostJournalEntry): delta = debit − credit for EVERY account
+	// class — no normal-balance conditional.
 	if template.AutoPost {
 		for _, line := range lines {
-			var normalBalance string
-			if err = tx.QueryRow(`
-				SELECT at.normal_balance FROM accounts a
-				JOIN account_types at ON a.account_type_id = at.id
-				WHERE a.id = $1
-			`, line.AccountID).Scan(&normalBalance); err != nil {
-				h.log.Error("Failed to get account normal balance", "error", err, "account_id", line.AccountID)
-				response.InternalError(c, "Failed to create journal entry")
-				return
-			}
-
-			balanceChange := line.DebitAmount - line.CreditAmount
-			if normalBalance != "debit" {
-				balanceChange = line.CreditAmount - line.DebitAmount
-			}
-
 			if _, err = tx.Exec(`
 				UPDATE accounts SET current_balance = current_balance + $1, updated_at = NOW()
 				WHERE id = $2
-			`, balanceChange, line.AccountID); err != nil {
+			`, line.DebitAmount-line.CreditAmount, line.AccountID); err != nil {
 				h.log.Error("Failed to update account balance", "error", err, "account_id", line.AccountID)
 				response.InternalError(c, "Failed to create journal entry")
 				return
@@ -11470,21 +11778,39 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 		return
 	}
 
-	// 1. Current cash balances per account
+	// 1. Current cash balances — ledger balances of CASH-type accounts
+	// (account_types.code = 'CASH': 5010 kassa, 5110 hisob-kitob schyoti, …)
+	// computed from posted journal entries (the single cash engine,
+	// docs/moliya-v2/conventions.md §2). The previous query referenced the
+	// non-existent accounts.account_type / currency_code columns and a
+	// US-GAAP chart ('1%' codes), and the error was swallowed — the BDDS
+	// view rendered zeros forever.
 	accountRows, err := h.db.Query(`
-		SELECT a.id, a.code, a.name, a.currency_code,
-		       COALESCE(SUM(jl.debit_amount - jl.credit_amount), 0) as balance
+		SELECT a.id, a.code, a.name, COALESCE(cur.code, 'UZS') as currency,
+		       COALESCE((
+		           SELECT SUM(jl.debit_amount - jl.credit_amount)
+		           FROM journal_entry_lines jl
+		           JOIN journal_entries je ON je.id = jl.journal_entry_id
+		           WHERE jl.account_id = a.id
+		             AND je.tenant_id = a.tenant_id
+		             AND je.status = 'posted'
+		             AND je.deleted_at IS NULL
+		       ), 0) as balance
 		FROM accounts a
-		LEFT JOIN journal_entry_lines jl ON jl.account_id = a.id
-		LEFT JOIN journal_entries je ON je.id = jl.journal_entry_id AND je.status = 'posted' AND je.tenant_id = $1
-		WHERE a.tenant_id = $1 AND a.account_type IN ('asset', 'cash', 'bank')
-		  AND a.code LIKE '1%'
+		JOIN account_types at2 ON at2.id = a.account_type_id
+		LEFT JOIN currencies cur ON cur.id = a.currency_id
+		WHERE a.tenant_id = $1
+		  AND at2.code = 'CASH'
 		  AND a.is_active = true
-		GROUP BY a.id, a.code, a.name, a.currency_code
-		HAVING COALESCE(SUM(jl.debit_amount - jl.credit_amount), 0) != 0
-		   OR a.code LIKE '101%' OR a.code LIKE '102%'
+		  AND a.deleted_at IS NULL
+		  AND a.is_leaf = true
 		ORDER BY a.code
 	`, tenantID)
+	if err != nil {
+		h.log.Error("BDDS cash balances query failed", "error", err)
+		response.InternalError(c, "BDDS: kassa qoldiqlarini o'qishda xatolik: "+err.Error())
+		return
+	}
 
 	type AccountBalance struct {
 		ID         string  `json:"id"`
@@ -11498,39 +11824,48 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	accountBalances := make([]AccountBalance, 0)
 	var totalCash float64
 
-	if err == nil {
-		defer accountRows.Close()
-		for accountRows.Next() {
-			var ab AccountBalance
-			var currency sql.NullString
-			accountRows.Scan(&ab.ID, &ab.Code, &ab.Name, &currency, &ab.Balance)
-			if currency.Valid {
-				ab.Currency = currency.String
-			} else {
-				ab.Currency = "UZS"
-			}
-			ab.IsNegative = ab.Balance < 0
-			totalCash += ab.Balance
-			accountBalances = append(accountBalances, ab)
+	defer accountRows.Close()
+	for accountRows.Next() {
+		var ab AccountBalance
+		if err := accountRows.Scan(&ab.ID, &ab.Code, &ab.Name, &ab.Currency, &ab.Balance); err != nil {
+			h.log.Error("BDDS cash balance scan failed", "error", err)
+			continue
 		}
+		// Hide empty auxiliary cash accounts; kassa (5010) and hisob-kitob
+		// schyoti (5110) are always shown.
+		if ab.Balance == 0 && ab.Code != "5010" && ab.Code != "5110" {
+			continue
+		}
+		ab.IsNegative = ab.Balance < 0
+		totalCash += ab.Balance
+		accountBalances = append(accountBalances, ab)
 	}
 
-	// 2. Expected receipts (unpaid customer invoices due in next 30 days)
+	// 2. Expected receipts — open sales_invoices due within 30 days (incl.
+	// overdue). The previous query referenced the non-existent
+	// customer_invoices table and the error was swallowed.
 	receiptRows, err := h.db.Query(`
-		SELECT ci.id, ci.invoice_number, c.name as counterparty,
-		       (ci.total_amount - COALESCE(ci.amount_paid, 0)) as amount,
-		       ci.due_date,
-		       CASE WHEN ci.due_date < CURRENT_DATE THEN 'overdue'
-		            WHEN ci.due_date <= CURRENT_DATE + 7 THEN 'due_soon'
+		SELECT si.id, si.invoice_number,
+		       COALESCE(NULLIF(si.customer_name, ''), c.name, '') as counterparty,
+		       si.amount_due as amount, si.due_date,
+		       CASE WHEN si.due_date < CURRENT_DATE THEN 'overdue'
+		            WHEN si.due_date <= CURRENT_DATE + 7 THEN 'due_soon'
 		            ELSE 'upcoming' END as urgency
-		FROM customer_invoices ci
-		JOIN contacts c ON c.id = ci.customer_id
-		WHERE ci.tenant_id = $1
-		  AND ci.status IN ('sent', 'partial')
-		  AND ci.due_date <= CURRENT_DATE + 30
-		ORDER BY ci.due_date ASC
+		FROM sales_invoices si
+		LEFT JOIN contacts c ON c.id = si.customer_id
+		WHERE si.tenant_id = $1
+		  AND si.deleted_at IS NULL
+		  AND si.status NOT IN ('draft', 'cancelled', 'void')
+		  AND si.amount_due > 0
+		  AND si.due_date <= CURRENT_DATE + 30
+		ORDER BY si.due_date ASC
 		LIMIT 50
 	`, tenantID)
+	if err != nil {
+		h.log.Error("BDDS receivables query failed", "error", err)
+		response.InternalError(c, "BDDS: kutilayotgan tushumlarni o'qishda xatolik: "+err.Error())
+		return
+	}
 
 	type ReceivableItem struct {
 		ID           string  `json:"id"`
@@ -11545,35 +11880,45 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	receivables := make([]ReceivableItem, 0)
 	var totalReceivables float64
 
-	if err == nil {
-		defer receiptRows.Close()
-		for receiptRows.Next() {
-			var r ReceivableItem
-			var dueDate time.Time
-			receiptRows.Scan(&r.ID, &r.Reference, &r.Counterparty, &r.Amount, &dueDate, &r.Urgency)
-			r.DueDate = dueDate.Format("2006-01-02")
-			r.Type = "invoice"
-			totalReceivables += r.Amount
-			receivables = append(receivables, r)
+	defer receiptRows.Close()
+	for receiptRows.Next() {
+		var r ReceivableItem
+		var dueDate time.Time
+		if err := receiptRows.Scan(&r.ID, &r.Reference, &r.Counterparty, &r.Amount, &dueDate, &r.Urgency); err != nil {
+			h.log.Error("BDDS receivable scan failed", "error", err)
+			continue
 		}
+		r.DueDate = dueDate.Format("2006-01-02")
+		r.Type = "invoice"
+		totalReceivables += r.Amount
+		receivables = append(receivables, r)
 	}
 
-	// 3. Expected payments (unpaid vendor bills due in next 30 days)
+	// 3. Expected payments — open purchase_invoices due within 30 days (incl.
+	// overdue). The previous query referenced the non-existent vendor_bills
+	// table and the error was swallowed.
 	payableRows, err := h.db.Query(`
-		SELECT vb.id, vb.bill_number, c.name as counterparty,
-		       (vb.total_amount - COALESCE(vb.amount_paid, 0)) as amount,
-		       vb.due_date,
-		       CASE WHEN vb.due_date < CURRENT_DATE THEN 'overdue'
-		            WHEN vb.due_date <= CURRENT_DATE + 7 THEN 'due_soon'
+		SELECT pi.id, pi.invoice_number,
+		       COALESCE(NULLIF(pi.supplier_name, ''), c.name, '') as counterparty,
+		       pi.amount_due as amount, pi.due_date,
+		       CASE WHEN pi.due_date < CURRENT_DATE THEN 'overdue'
+		            WHEN pi.due_date <= CURRENT_DATE + 7 THEN 'due_soon'
 		            ELSE 'upcoming' END as urgency
-		FROM vendor_bills vb
-		JOIN contacts c ON c.id = vb.vendor_id
-		WHERE vb.tenant_id = $1
-		  AND vb.status IN ('received', 'partial')
-		  AND vb.due_date <= CURRENT_DATE + 30
-		ORDER BY vb.due_date ASC
+		FROM purchase_invoices pi
+		LEFT JOIN contacts c ON c.id = pi.vendor_id
+		WHERE pi.tenant_id = $1
+		  AND pi.deleted_at IS NULL
+		  AND pi.status NOT IN ('draft', 'cancelled', 'void')
+		  AND pi.amount_due > 0
+		  AND pi.due_date <= CURRENT_DATE + 30
+		ORDER BY pi.due_date ASC
 		LIMIT 50
 	`, tenantID)
+	if err != nil {
+		h.log.Error("BDDS payables query failed", "error", err)
+		response.InternalError(c, "BDDS: kutilayotgan to'lovlarni o'qishda xatolik: "+err.Error())
+		return
+	}
 
 	type PayableItem struct {
 		ID           string  `json:"id"`
@@ -11589,18 +11934,19 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	payables := make([]PayableItem, 0)
 	var totalPayables float64
 
-	if err == nil {
-		defer payableRows.Close()
-		for payableRows.Next() {
-			var p PayableItem
-			var dueDate time.Time
-			payableRows.Scan(&p.ID, &p.Reference, &p.Counterparty, &p.Amount, &dueDate, &p.Urgency)
-			p.DueDate = dueDate.Format("2006-01-02")
-			p.CanPostpone = true // Vendor bills can typically be negotiated
-			p.Priority = "medium"
-			totalPayables += p.Amount
-			payables = append(payables, p)
+	defer payableRows.Close()
+	for payableRows.Next() {
+		var p PayableItem
+		var dueDate time.Time
+		if err := payableRows.Scan(&p.ID, &p.Reference, &p.Counterparty, &p.Amount, &dueDate, &p.Urgency); err != nil {
+			h.log.Error("BDDS payable scan failed", "error", err)
+			continue
 		}
+		p.DueDate = dueDate.Format("2006-01-02")
+		p.CanPostpone = true // supplier invoices can typically be negotiated
+		p.Priority = "medium"
+		totalPayables += p.Amount
+		payables = append(payables, p)
 	}
 
 	// 4. Build 30-day payment calendar
@@ -11704,21 +12050,22 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 
 	// Get budget details
 	var budget struct {
-		ID        string `json:"id"`
-		Name      string `json:"name"`
-		StartDate string `json:"start_date"`
-		EndDate   string `json:"end_date"`
-		Type      string `json:"type"`
+		ID        string  `json:"id"`
+		Name      string  `json:"name"`
+		StartDate string  `json:"start_date"`
+		EndDate   string  `json:"end_date"`
+		Type      string  `json:"type"`
+		Status    string  `json:"status"`
 	}
 	h.db.QueryRow(`
 		SELECT b.id::text, b.name,
 		       COALESCE(b.start_date, fy.start_date::text),
 		       COALESCE(b.end_date, fy.end_date::text),
-		       b.budget_type
+		       b.budget_type, b.status
 		FROM budgets b
 		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
 		WHERE b.id = $1 AND b.tenant_id = $2
-	`, budgetID, tenantID).Scan(&budget.ID, &budget.Name, &budget.StartDate, &budget.EndDate, &budget.Type)
+	`, budgetID, tenantID).Scan(&budget.ID, &budget.Name, &budget.StartDate, &budget.EndDate, &budget.Type, &budget.Status)
 
 	// Get budget lines with actual amounts from journal entries
 	rows, err := h.db.Query(`
@@ -11729,7 +12076,8 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 			a.name as account_name,
 			COALESCE(bl.line_type, 'expense') as line_type,
 			COALESCE(bl.budgeted_amount, 0) as planned,
-			`+budgetActualSQL+` as actual
+			`+budgetActualSQL+` as actual,
+			bl.exceeded_notified_at
 		FROM budget_lines bl
 		JOIN budgets b ON b.id = bl.budget_id
 		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
@@ -11764,8 +12112,17 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 
 	for rows.Next() {
 		var item LineItem
+		var exceededAt sql.NullTime
 		rows.Scan(&item.ID, &item.Category, &item.AccountCode, &item.AccountName,
-			&item.LineType, &item.Planned, &item.Actual)
+			&item.LineType, &item.Planned, &item.Actual, &exceededAt)
+
+		// finance.budget_exceeded — once per crossing (marker in migration 477).
+		// Revenue lines are excluded: fakt above plan is achievement there.
+		if item.LineType != "revenue" {
+			h.checkBudgetLineExceeded(tenantID, budget.Status, budget.ID, budget.Name,
+				item.ID, item.AccountCode, item.AccountName, item.Category,
+				item.Planned, item.Actual, exceededAt)
+		}
 
 		item.Variance = item.Planned - item.Actual
 		if item.Planned != 0 {

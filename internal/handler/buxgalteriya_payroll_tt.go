@@ -744,10 +744,13 @@ func (h *Handler) postTTSalaryPaymentJE(tx *sql.Tx, tenantID uuid.UUID, orgIDPtr
 
 	// Debit account: 6710 if the period is accrued, else 9420 (simple mode).
 	var accrued int
-	_ = tx.QueryRow(`
+	if err := tx.QueryRow(`
 		SELECT COUNT(*) FROM journal_entries
 		WHERE tenant_id = $1 AND source_type = 'payroll' AND source_id = $2 AND status = 'posted' AND deleted_at IS NULL
-	`, tenantID, periodID.String).Scan(&accrued)
+	`, tenantID, periodID.String()).Scan(&accrued); err != nil {
+		h.log.Error("postTTSalaryPaymentJE: accrual check", "error", err)
+		return "Davr holatini tekshirib bo'lmadi"
+	}
 
 	var debitAcct uuid.UUID
 	var debitDesc string
