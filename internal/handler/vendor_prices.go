@@ -27,8 +27,12 @@ type VendorPriceResponse struct {
 	ValidUntil   *time.Time `json:"valid_until,omitempty"`
 	Notes        *string    `json:"notes,omitempty"`
 	IsActive     bool       `json:"is_active"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// C3: emitted from SQL so vendor_price_entity.dart can drop its
+	// DateTime.now() comparison. NULL valid_until means "no expiry", which is
+	// false here rather than null — an open-ended price is not expired.
+	IsExpired bool      `json:"is_expired"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // CreateVendorPriceInput represents input for creating a vendor price
@@ -89,6 +93,7 @@ func (h *Handler) ListVendorPrices(c *gin.Context) {
 			   COALESCE(vp.min_quantity, 1) as min_quantity,
 			   COALESCE(vp.lead_time_days, 0) as lead_time_days,
 			   vp.valid_from, vp.valid_until, vp.notes, vp.is_active,
+			   ` + dateExpiredSQL("vp.valid_until") + ` AS is_expired,
 			   vp.created_at, vp.updated_at
 		FROM vendor_prices vp
 		LEFT JOIN contacts v ON vp.vendor_id = v.id
@@ -162,6 +167,7 @@ func (h *Handler) ListVendorPrices(c *gin.Context) {
 			&record.Price, &record.Currency,
 			&record.MinQuantity, &record.LeadTimeDays,
 			&validFrom, &validUntil, &notes, &record.IsActive,
+			&record.IsExpired,
 			&record.CreatedAt, &record.UpdatedAt,
 		)
 		if err != nil {

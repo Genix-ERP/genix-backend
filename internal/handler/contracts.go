@@ -27,7 +27,9 @@ import (
 
 // contractSelectColumns is the shared projection for list/get so both scan
 // through scanContractRow.
-const contractSelectColumns = `
+// var, not const: the days-remaining expression comes from the shared helper
+// rather than a second literal copy of the same rule.
+var contractSelectColumns = `
 	c.id, c.contract_number, c.title, c.vendor_id, COALESCE(v.name, c.vendor_name, ''),
 	c.direction, c.contract_type, c.status, c.start_date, c.end_date, c.signed_date,
 	COALESCE(c.value, 0), COALESCE(c.currency, 'UZS'), c.terms, c.description,
@@ -36,7 +38,10 @@ const contractSelectColumns = `
 	TRIM(COALESCE(e.first_name, '') || ' ' || COALESCE(e.last_name, '')),
 	c.archived_at, c.created_by, c.created_at, c.updated_at,
 	COALESCE(am.delta_sum, 0), COALESCE(am.cnt, 0), COALESCE(cf.cnt, 0),
-	COALESCE(inv.paid_total, 0)`
+	COALESCE(inv.paid_total, 0),
+	` + dateDaysRemainingSQL("c.end_date") + `,
+	CASE WHEN c.status = 'active' AND c.end_date IS NOT NULL AND c.end_date < CURRENT_DATE
+	     THEN 'expired' ELSE c.status END`
 
 const contractFromClause = `
 	FROM procurement_contracts c
@@ -64,18 +69,20 @@ const contractFromClause = `
 // scanContractRow scans one row of the shared projection into a response.
 func scanContractRow(scan func(dest ...interface{}) error) (*entity.ContractResponse, error) {
 	var (
-		r              entity.ContractResponse
-		vendorID       sql.NullString
-		endDate        sql.NullTime
-		signedDate     sql.NullTime
-		terms          sql.NullString
-		description    sql.NullString
-		notes          sql.NullString
-		responsibleID  sql.NullString
-		archivedAt     sql.NullTime
-		createdBy      sql.NullString
-		amendmentDelta float64
-		direction      string
+		r               entity.ContractResponse
+		vendorID        sql.NullString
+		endDate         sql.NullTime
+		signedDate      sql.NullTime
+		terms           sql.NullString
+		description     sql.NullString
+		notes           sql.NullString
+		responsibleID   sql.NullString
+		archivedAt      sql.NullTime
+		createdBy       sql.NullString
+		amendmentDelta  float64
+		direction       string
+		daysToExpiry    sql.NullInt64
+		effectiveStatus string
 	)
 	err := scan(
 		&r.ID, &r.ContractNumber, &r.Title, &vendorID, &r.VendorName,
@@ -86,6 +93,7 @@ func scanContractRow(scan func(dest ...interface{}) error) (*entity.ContractResp
 		&archivedAt, &createdBy, &r.CreatedAt, &r.UpdatedAt,
 		&amendmentDelta, &r.AmendmentCount, &r.FileCount,
 		&r.PaidTotal,
+		&daysToExpiry, &effectiveStatus,
 	)
 	if err != nil {
 		return nil, err
@@ -99,11 +107,21 @@ func scanContractRow(scan func(dest ...interface{}) error) (*entity.ContractResp
 	if endDate.Valid {
 		d := endDate.Time
 		r.EndDate = &d
-		// Calendar-day difference (both truncated to dates).
-		today := time.Now().Truncate(24 * time.Hour)
-		days := int(d.Truncate(24*time.Hour).Sub(today).Hours() / 24)
-		r.DaysToExpiry = &days
 	}
+	// days_to_expiry now comes from SQL (dateDaysRemainingSQL) rather than
+	// time.Now().Truncate(24h), which is midnight UTC because Truncate measures
+	// from the zero instant — a second clock that only agrees with the database
+	// while the session is also UTC. NULL end_date stays nil ("muddatsiz").
+	if daysToExpiry.Valid {
+		v := int(daysToExpiry.Int64)
+		r.DaysToExpiry = &v
+		r.DaysUntilExpiry = &v
+	}
+	// effective_status folds "active but past its end date reads as expired"
+	// into the response. That rule lived in Dart (contract_entity.dart), which
+	// made it a business rule in a client; `status` still carries the stored
+	// value so nothing that needs the raw one is broken.
+	r.EffectiveStatus = effectiveStatus
 	if signedDate.Valid {
 		d := signedDate.Time
 		r.SignedDate = &d

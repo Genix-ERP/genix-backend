@@ -33,7 +33,9 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 		SELECT id, tenant_id, code, name, description, discount_type, discount_value,
 			   min_order_amount, max_discount_amount, usage_limit, usage_per_customer, used_count,
 			   applies_to, applicable_products, applicable_categories, applicable_customers,
-			   new_customers_only, valid_from, valid_until, status, created_at, updated_at
+			   new_customers_only, valid_from, valid_until, status, created_at, updated_at,
+			   ` + dateExpiredSQL("valid_until") + ` AS is_expired,
+			   ` + dateDaysRemainingSQL("valid_until") + ` AS days_remaining
 		FROM discounts
 		WHERE tenant_id = $1 AND deleted_at IS NULL`
 	countQuery := `SELECT COUNT(*) FROM discounts WHERE tenant_id = $1 AND deleted_at IS NULL`
@@ -83,6 +85,8 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 	now := time.Now()
 
 	for rows.Next() {
+		var isExpired bool
+		var daysRemaining sql.NullInt64
 		var id, tenantIDScan uuid.UUID
 		var code, name, discountType, appliesTo, status string
 		var description sql.NullString
@@ -100,6 +104,7 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 			&minOrderAmount, &maxDiscountAmount, &usageLimit, &usagePerCustomer, &usedCount,
 			&appliesTo, &applicableProducts, &applicableCategories, &applicableCustomers,
 			&newCustomersOnly, &validFrom, &validUntil, &status, &createdAt, &updatedAt,
+			&isExpired, &daysRemaining,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan discount", "error", err)
@@ -108,7 +113,10 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 
 		// Auto-update status if expired
 		actualStatus := status
-		if status == "active" && validUntil.Before(now) {
+		// isExpired comes from SQL now (dateExpiredSQL), the same CURRENT_DATE
+		// the emitted is_expired field uses — so the status shown and the flag
+		// beside it can never disagree.
+		if status == "active" && isExpired {
 			actualStatus = "expired"
 			// Update in database
 			h.db.Exec("UPDATE discounts SET status = 'expired', updated_at = $1 WHERE id = $2", now, id)
@@ -126,9 +134,18 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 			"new_customers_only": newCustomersOnly,
 			"valid_from":         validFrom.Format("2006-01-02"),
 			"valid_until":        validUntil.Format("2006-01-02"),
+			"is_expired":         isExpired,
 			"status":             actualStatus,
 			"created_at":         createdAt,
 			"updated_at":         updatedAt,
+		}
+
+		// NULL valid_until means "no expiry" — emitted as null rather than 0,
+		// which would read as "expires today".
+		if daysRemaining.Valid {
+			discount["days_remaining"] = daysRemaining.Int64
+		} else {
+			discount["days_remaining"] = nil
 		}
 
 		if description.Valid {
@@ -264,23 +281,23 @@ func (h *Handler) CreateDiscount(c *gin.Context) {
 	}
 
 	var input struct {
-		Code               string   `json:"code" binding:"required"`
-		Name               string   `json:"name" binding:"required"`
-		Description        string   `json:"description"`
-		DiscountType       string   `json:"discount_type" binding:"required"` // percentage, fixed_amount
-		DiscountValue      float64  `json:"discount_value"`
-		MinOrderAmount     float64  `json:"min_order_amount"`
-		MaxDiscountAmount  *float64 `json:"max_discount_amount"`
-		UsageLimit         *int     `json:"usage_limit"`
-		UsagePerCustomer   *int     `json:"usage_per_customer"`
-		AppliesTo          string   `json:"applies_to"` // all, specific_products, specific_categories, specific_customers
-		ApplicableProducts []string `json:"applicable_products"`
+		Code                 string   `json:"code" binding:"required"`
+		Name                 string   `json:"name" binding:"required"`
+		Description          string   `json:"description"`
+		DiscountType         string   `json:"discount_type" binding:"required"` // percentage, fixed_amount
+		DiscountValue        float64  `json:"discount_value"`
+		MinOrderAmount       float64  `json:"min_order_amount"`
+		MaxDiscountAmount    *float64 `json:"max_discount_amount"`
+		UsageLimit           *int     `json:"usage_limit"`
+		UsagePerCustomer     *int     `json:"usage_per_customer"`
+		AppliesTo            string   `json:"applies_to"` // all, specific_products, specific_categories, specific_customers
+		ApplicableProducts   []string `json:"applicable_products"`
 		ApplicableCategories []string `json:"applicable_categories"`
-		ApplicableCustomers []string `json:"applicable_customers"`
-		NewCustomersOnly   bool     `json:"new_customers_only"`
-		ValidFrom          string   `json:"valid_from" binding:"required"`
-		ValidUntil         string   `json:"valid_until" binding:"required"`
-		Status             string   `json:"status"`
+		ApplicableCustomers  []string `json:"applicable_customers"`
+		NewCustomersOnly     bool     `json:"new_customers_only"`
+		ValidFrom            string   `json:"valid_from" binding:"required"`
+		ValidUntil           string   `json:"valid_until" binding:"required"`
+		Status               string   `json:"status"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -350,23 +367,23 @@ func (h *Handler) CreateDiscount(c *gin.Context) {
 	}
 
 	response.Created(c, map[string]interface{}{
-		"id":                 discountID.String(),
-		"code":               input.Code,
-		"name":               input.Name,
-		"description":        input.Description,
-		"discount_type":      input.DiscountType,
-		"discount_value":     input.DiscountValue,
-		"min_order_amount":   input.MinOrderAmount,
+		"id":                  discountID.String(),
+		"code":                input.Code,
+		"name":                input.Name,
+		"description":         input.Description,
+		"discount_type":       input.DiscountType,
+		"discount_value":      input.DiscountValue,
+		"min_order_amount":    input.MinOrderAmount,
 		"max_discount_amount": input.MaxDiscountAmount,
-		"usage_limit":        input.UsageLimit,
-		"usage_per_customer": input.UsagePerCustomer,
-		"used_count":         0,
-		"applies_to":         input.AppliesTo,
-		"new_customers_only": input.NewCustomersOnly,
-		"valid_from":         input.ValidFrom,
-		"valid_until":        input.ValidUntil,
-		"status":             input.Status,
-		"created_at":         now,
+		"usage_limit":         input.UsageLimit,
+		"usage_per_customer":  input.UsagePerCustomer,
+		"used_count":          0,
+		"applies_to":          input.AppliesTo,
+		"new_customers_only":  input.NewCustomersOnly,
+		"valid_from":          input.ValidFrom,
+		"valid_until":         input.ValidUntil,
+		"status":              input.Status,
+		"created_at":          now,
 	})
 }
 
@@ -385,20 +402,20 @@ func (h *Handler) UpdateDiscount(c *gin.Context) {
 	}
 
 	var input struct {
-		Code               *string  `json:"code"`
-		Name               *string  `json:"name"`
-		Description        *string  `json:"description"`
-		DiscountType       *string  `json:"discount_type"`
-		DiscountValue      *float64 `json:"discount_value"`
-		MinOrderAmount     *float64 `json:"min_order_amount"`
-		MaxDiscountAmount  *float64 `json:"max_discount_amount"`
-		UsageLimit         *int     `json:"usage_limit"`
-		UsagePerCustomer   *int     `json:"usage_per_customer"`
-		AppliesTo          *string  `json:"applies_to"`
-		NewCustomersOnly   *bool    `json:"new_customers_only"`
-		ValidFrom          *string  `json:"valid_from"`
-		ValidUntil         *string  `json:"valid_until"`
-		Status             *string  `json:"status"`
+		Code              *string  `json:"code"`
+		Name              *string  `json:"name"`
+		Description       *string  `json:"description"`
+		DiscountType      *string  `json:"discount_type"`
+		DiscountValue     *float64 `json:"discount_value"`
+		MinOrderAmount    *float64 `json:"min_order_amount"`
+		MaxDiscountAmount *float64 `json:"max_discount_amount"`
+		UsageLimit        *int     `json:"usage_limit"`
+		UsagePerCustomer  *int     `json:"usage_per_customer"`
+		AppliesTo         *string  `json:"applies_to"`
+		NewCustomersOnly  *bool    `json:"new_customers_only"`
+		ValidFrom         *string  `json:"valid_from"`
+		ValidUntil        *string  `json:"valid_until"`
+		Status            *string  `json:"status"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -747,4 +764,3 @@ func (h *Handler) UseDiscountCode(c *gin.Context) {
 
 	response.Success(c, map[string]string{"message": "Discount usage recorded"})
 }
-
