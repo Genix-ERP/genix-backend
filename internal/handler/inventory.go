@@ -6937,9 +6937,55 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 		movesStock := (warehouseID != uuid.Nil && (op.Direction == "delivery" || op.Direction == "receipt" || op.Direction == "write_off")) ||
 			(op.Direction == "internal" && srcWH != uuid.Nil && dstWH != uuid.Nil && srcWH != dstWH)
-		if op.Direction == "internal" && (srcWH == uuid.Nil || dstWH == uuid.Nil || srcWH == dstWH) {
-			h.log.Warn("Internal stock operation without resolvable src/dst warehouses — no stock moved",
-				"op_id", id, "src_wh", srcWH, "dst_wh", dstWH)
+
+		// ── A document that cannot move stock must not report success ──
+		//
+		// Until now an unresolvable warehouse produced nothing but a log line:
+		// markDoneAndPostJE() ran regardless, so the operation showed
+		// "Bajarildi" with the full quantity while quantity_on_hand never
+		// changed. Worse, the document was then 'done' and could not be
+		// re-advanced, so the only cure was editing the database by hand.
+		//
+		// This is the same shape as the done_qty bug fixed earlier: a receipt
+		// that completes and moves nothing. The quantity gate is closed now;
+		// this closes the warehouse gate behind it.
+		expectsStockMove := op.Direction == "receipt" || op.Direction == "delivery" ||
+			op.Direction == "write_off" || op.Direction == "internal"
+		if !skipInventory && expectsStockMove && !movesStock {
+			reason := "operatsiya turiga ombor biriktirilmagan"
+			if op.Direction == "internal" {
+				reason = "ko'chirish uchun manba yoki qabul qiluvchi ombor aniqlanmadi"
+			}
+			h.log.Warn("Stock operation cannot move stock — refusing to complete it",
+				"op_id", id, "direction", op.Direction, "op_type_id", op.OpTypeID,
+				"warehouse_id", warehouseID, "src_wh", srcWH, "dst_wh", dstWH)
+			h.rollbackStep(id, op.CurrentStep, tenantID)
+			c.JSON(422, gin.H{
+				"success": false,
+				"message": "Zaxira o'zgarmaydi — " + reason + ". " +
+					"Ombor sozlamalarida operatsiya turiga ombor tanlang va qaytadan tasdiqlang.",
+			})
+			return
+		}
+
+		// ── Stock that lands where the reader cannot see it ──
+		//
+		// Writing succeeds, the ledger balances, and the product page still
+		// shows Qoldiq 0, because every read filters on the warehouse's
+		// organization. Refusing while the step can still be rolled back is
+		// the only outcome that leaves the user something to act on.
+		if !skipInventory && movesStock {
+			targets := []uuid.UUID{warehouseID}
+			if op.Direction == "internal" {
+				targets = []uuid.UUID{srcWH, dstWH}
+			}
+			if why := h.checkStockVisible(c, tenantID, targets...); why != "" {
+				h.log.Warn("Stock operation would write invisible stock — refusing",
+					"op_id", id, "direction", op.Direction, "reason", why)
+				h.rollbackStep(id, op.CurrentStep, tenantID)
+				c.JSON(422, gin.H{"success": false, "message": why})
+				return
+			}
 		}
 
 		type movedLine struct {
@@ -7101,11 +7147,7 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			if moveErr != nil {
 				// Put the step back so the operation can be re-advanced after
 				// the stock problem is fixed.
-				h.db.Exec(`
-					UPDATE stock_operation_step_log
-					SET state='ready', completed_at=NULL, completed_by=NULL
-					WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
-				`, id, op.CurrentStep, tenantID)
+				h.rollbackStep(id, op.CurrentStep, tenantID)
 				if errors.Is(moveErr, errInsufficientStock) {
 					c.JSON(422, gin.H{
 						"success": false,

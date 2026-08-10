@@ -62,11 +62,21 @@ func (h *Handler) ListWarehouses(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argCount := 1
 
-	// Filter by organization
+	// Filter by organization.
+	//
+	// Warehouses with NO organization are included deliberately. They are
+	// broken — nothing they hold is visible anywhere, because every read
+	// compares against an organization and NULL matches none — and hiding them
+	// here made the break unfixable: the warehouse could not be listed, so it
+	// could not be opened, so its organization could never be filled in. Saving
+	// one from this list adopts it into the current organization
+	// (see UpdateWarehouse), which is the repair.
+	//
+	// This is tenant-scoped, so it exposes nothing across tenants.
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		argCount++
-		baseQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND w.organization_id = $%d", argCount)
+		baseQuery += fmt.Sprintf(" AND (w.organization_id = $%d OR w.organization_id IS NULL)", argCount)
+		countQuery += fmt.Sprintf(" AND (w.organization_id = $%d OR w.organization_id IS NULL)", argCount)
 		args = append(args, orgID)
 	}
 
@@ -295,6 +305,20 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 
 	// Get organization ID from context
 	orgID, _ := middleware.GetOrganizationID(c)
+
+	// A request without an organization header used to store NULL here, which
+	// is the one value that makes a warehouse permanently unusable: every read
+	// filters `w.organization_id = <active org>` and NULL matches none of them.
+	// The warehouse then accepts goods and hides them — exactly how a receipt
+	// came to read "Bajarildi 200 Dona" over a product reading "Qoldiq 0".
+	if orgID == uuid.Nil {
+		resolved, msg := h.resolveOwningOrganization(tenantID)
+		if msg != "" {
+			response.BadRequest(c, msg)
+			return
+		}
+		orgID = resolved
+	}
 
 	// Check for duplicate code within same organization
 	var codeExists bool
@@ -611,6 +635,24 @@ func (h *Handler) UpdateWarehouse(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("%s = $%d", field, argCount))
 		args = append(args, value)
+	}
+
+	// Adopt an orphaned warehouse into the organization the user is working in.
+	//
+	// Only NULL → set. Moving a warehouse that already belongs to one company
+	// into another would carry all of its stock and history across with it, and
+	// that is never something a rename or an address edit should do quietly.
+	// Filling in a blank, by contrast, is pure repair: until it happens, nothing
+	// in the warehouse is visible to anyone.
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		var currentOrg *uuid.UUID
+		if err := h.db.QueryRow(
+			`SELECT organization_id FROM warehouses WHERE id = $1 AND tenant_id = $2`,
+			id, tenantID).Scan(&currentOrg); err == nil && currentOrg == nil {
+			addUpdate("organization_id", orgID)
+			h.log.Info("Adopting organization-less warehouse into active organization",
+				"warehouse_id", id, "organization_id", orgID)
+		}
 	}
 
 	if input.Name != nil {
