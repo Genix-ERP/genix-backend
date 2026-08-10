@@ -1601,18 +1601,29 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		}
 	}
 
-	arAccountID := h.resolveReceivableAccount(tx, tenantID, organizationID)
+	arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 
-	// The settlement account comes from the JOURNAL first.
+	// Prefer the account the JOURNAL names, and only then fall back to the
+	// lookup that has always been here.
 	//
-	// It used to be guessed — findAccount by the English name "bank account"
-	// and the single code "5110". A tenant whose chart says "5100 · Bank hisob
-	// raqamlari" matched neither, so every payment was refused while the bank
-	// journal they had just selected carried that exact account on it. The
-	// journal is what knows where it settles; asking it removes the guess.
+	// The fallback is unchanged on purpose: it works. findAccount reaches a
+	// tenant-wide exact-code step that matches a leaf 5110, which this chart
+	// has. The journal-first step is an improvement for a different reason —
+	// two bank journals for two different banks should not both settle through
+	// whichever account carries the standard code.
 	cashAccountID := h.resolveJournalSettlementAccount(tx, tenantID, cashJournalID)
 	if cashAccountID == uuid.Nil {
-		cashAccountID = h.settlementAccountFallback(tx, tenantID, organizationID, input.PaymentMethod)
+		if input.PaymentMethod == "cash" {
+			cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
+			if cashAccountID == uuid.Nil {
+				cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
+			}
+		} else {
+			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
+			if cashAccountID == uuid.Nil {
+				cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
+			}
+		}
 	}
 
 	// A payment with no ledger entry is money that exists in Savdo but not in
