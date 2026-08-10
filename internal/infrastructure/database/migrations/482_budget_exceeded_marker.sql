@@ -1,0 +1,15 @@
+-- 477_budget_exceeded_marker.sql — Moliya v2 (Byudjetlar).
+--
+-- RENUMBERED 477 -> 482 during the dev merge. The original number was already
+-- taken on main, and schema_migrations.version is a PRIMARY KEY: two files at
+-- one version both enter `pending`, both apply, and the second INSERT violates
+-- the key — RunMigrations then fails and the API crash-loops on boot. On a
+-- database that already recorded that version the loser is skipped forever
+-- instead, and its schema change silently never lands.
+--
+-- finance.budget_exceeded hodisasi "bir kesishishga bir marta" yonishi uchun
+-- marker: chiziq fakti (posted JEL dan hisoblangan) rejadan oshganda
+-- exceeded_notified_at qo'yiladi va hodisa emit qilinadi; fakt yana reja
+-- ostiga tushsa marker tozalanadi (qayta qurollanadi). Tekshiruv nuqtalari:
+-- ListBudgetLines va GetBudgetPlanVsActual (finance.go, checkBudgetLineExceeded).
+ALTER TABLE budget_lines ADD COLUMN IF NOT EXISTS exceeded_notified_at TIMESTAMPTZ;

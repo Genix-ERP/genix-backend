@@ -392,9 +392,10 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 			wasAlreadyPaid = curStatus == "paid"
 		}
 
-		// Balance guard (same standard as expenses' /pay), checked BEFORE the
-		// status flip since the flip and the JE below aren't atomic. Without
-		// it, paying periods drives the kassa/bank cache negative.
+		// Balance guard (same standard as expenses' /pay), checked up front so
+		// an obviously unfunded payment fails fast. The flip and the JE below
+		// now commit in one tx. Without this, paying periods drives the
+		// kassa/bank cache negative.
 		if !wasAlreadyPaid {
 			var totalNet float64
 			var orgStr sql.NullString
@@ -449,8 +450,20 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 		RETURNING id
 	`, strings.Join(updates, ", "), argCount-1, argCount)
 
+	// The status UPDATE and (on the first transition into 'paid') the payment
+	// JE commit together in ONE transaction: a period marked paid without its
+	// cash-leg JE would be unrecoverable, because wasAlreadyPaid skips the JE
+	// on every later PUT (moliya audit, finding 7).
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to begin payroll period update tx", "error", txErr)
+		response.InternalError(c, "Failed to update payroll period")
+		return
+	}
+	defer tx.Rollback()
+
 	var returnedID uuid.UUID
-	if err := h.db.QueryRow(query, args...).Scan(&returnedID); err == sql.ErrNoRows {
+	if err := tx.QueryRow(query, args...).Scan(&returnedID); err == sql.ErrNoRows {
 		response.NotFound(c, "Payroll period")
 		return
 	} else if err != nil {
@@ -460,66 +473,70 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 	}
 
 	// If marking as paid, create payment journal entry (Dt: Wages Payable / Kt: Cash or Bank)
+	emitPaid := false
+	var periodName string
+	var totalNet float64
 	if input.Status != nil && *input.Status == "paid" && !wasAlreadyPaid {
 		userID, _ := middleware.GetUserID(c)
 		orgID, _ := middleware.GetOrganizationID(c)
 		now := time.Now()
 
-		// Belt-and-braces idempotency: skip if a payment JE for this period
-		// already exists (e.g. the period was paid, reopened, and re-paid).
+		// Belt-and-braces idempotency: skip the JE if a payment JE for this
+		// period already exists (e.g. the period was paid, reopened, re-paid).
 		var existingJE int
-		h.db.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND source_type = 'payroll_payment' AND source_id = $2 AND status = 'posted'`, tenantID, id.String()).Scan(&existingJE)
-		if existingJE > 0 {
-			h.GetPayrollPeriod(c)
-			return
-		}
-
-		var periodName string
-		var orgIDStr sql.NullString
-		var totalNet float64
-		h.db.QueryRow(`SELECT period_name, organization_id, COALESCE(total_net, 0) FROM payroll_periods WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&periodName, &orgIDStr, &totalNet)
-		if orgIDStr.Valid {
-			if parsed, err2 := uuid.Parse(orgIDStr.String); err2 == nil {
-				orgID = parsed
-			}
-		}
-
-		var orgIDPtr *uuid.UUID
-		if orgID != uuid.Nil {
-			orgIDPtr = &orgID
-		}
-
-		if totalNet > 0 {
-			// Determine payment account based on payment method
-			paymentMethod := "cash"
-			if input.PaymentMethod != nil {
-				paymentMethod = *input.PaymentMethod
-			}
-
-			var paymentAcct uuid.UUID
-			var paymentAcctDesc string
-			if paymentMethod == "card" || paymentMethod == "bank_transfer" {
-				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "bank account", "5110")
-				paymentAcctDesc = "Bank Account"
-			} else {
-				paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
-				if paymentAcct == uuid.Nil {
-					paymentAcct = findAccount(h.db, tenantID, orgIDPtr, "kassa", "5010")
+		tx.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND source_type = 'payroll_payment' AND source_id = $2 AND status = 'posted'`, tenantID, id.String()).Scan(&existingJE)
+		if existingJE == 0 {
+			var orgIDStr sql.NullString
+			tx.QueryRow(`SELECT period_name, organization_id, COALESCE(total_net, 0) FROM payroll_periods WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&periodName, &orgIDStr, &totalNet)
+			if orgIDStr.Valid {
+				if parsed, err2 := uuid.Parse(orgIDStr.String); err2 == nil {
+					orgID = parsed
 				}
-				paymentAcctDesc = "Cash"
 			}
 
-			// Wages payable account (liability cleared)
-			wagesPayableAcct := findAccount(h.db, tenantID, orgIDPtr, "wages payable", "6710")
-			if wagesPayableAcct == uuid.Nil {
-				wagesPayableAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
+			var orgIDPtr *uuid.UUID
+			if orgID != uuid.Nil {
+				orgIDPtr = &orgID
 			}
 
-			if paymentAcct != uuid.Nil && wagesPayableAcct != uuid.Nil {
+			if totalNet > 0 {
+				// Determine payment account based on payment method
+				paymentMethod := "cash"
+				if input.PaymentMethod != nil {
+					paymentMethod = *input.PaymentMethod
+				}
+
+				var paymentAcct uuid.UUID
+				var paymentAcctDesc string
+				if paymentMethod == "card" || paymentMethod == "bank_transfer" {
+					paymentAcct = findAccount(tx, tenantID, orgIDPtr, "bank account", "5110")
+					paymentAcctDesc = "Bank Account"
+				} else {
+					paymentAcct = findAccount(tx, tenantID, orgIDPtr, "cash", "5010")
+					if paymentAcct == uuid.Nil {
+						paymentAcct = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
+					}
+					paymentAcctDesc = "Cash"
+				}
+
+				// Wages payable account (liability cleared)
+				wagesPayableAcct := findAccount(tx, tenantID, orgIDPtr, "wages payable", "6710")
+				if wagesPayableAcct == uuid.Nil {
+					wagesPayableAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
+				}
+
+				// Missing accounts/journal must FAIL the request (rolling the
+				// 'paid' status back) — silently skipping the JE would lose
+				// the payment from the ledger forever.
+				if paymentAcct == uuid.Nil || wagesPayableAcct == uuid.Nil {
+					response.BadRequest(c, "Cannot resolve GL accounts for salary payment (kassa/bank 5010/5110 or payable 6710/6010)")
+					return
+				}
+
 				var journalID uuid.UUID
 				var nextNumber int
 				// Try journal marked as payroll journal first
-				h.db.QueryRow(`
+				tx.QueryRow(`
 					SELECT id, COALESCE(next_number, 1) FROM journals
 					WHERE tenant_id = $1 AND COALESCE(is_payroll_journal, false) = true
 					  AND COALESCE(is_active, true) = true AND deleted_at IS NULL
@@ -527,81 +544,86 @@ func (h *Handler) UpdatePayrollPeriod(c *gin.Context) {
 					tenantID).Scan(&journalID, &nextNumber)
 				// Fallback to legacy PAYROLL/MISC/GENERAL code lookup
 				if journalID == uuid.Nil {
-					h.db.QueryRow(`
+					tx.QueryRow(`
 						SELECT id, COALESCE(next_number, 1) FROM journals
 						WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
 						ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
 						tenantID).Scan(&journalID, &nextNumber)
 				}
+				if journalID == uuid.Nil {
+					response.BadRequest(c, "No PAYROLL/MISC/GENERAL journal found for this tenant")
+					return
+				}
 
-				if journalID != uuid.Nil {
-					jeID := uuid.New()
-					entryNumber := fmt.Sprintf("PAYPMT%05d", nextNumber)
-					description := fmt.Sprintf("Salary Payment: %s (%s)", periodName, paymentMethod)
+				jeID := uuid.New()
+				entryNumber := fmt.Sprintf("PAYPMT%05d", nextNumber)
+				description := fmt.Sprintf("Salary Payment: %s (%s)", periodName, paymentMethod)
 
-					// Post header + both lines + balance updates in ONE transaction so
-					// the deferred balance-check trigger sees the complete, balanced JE
-					// at COMMIT. Wrapped in an IIFE so a failure rolls back (via defer)
-					// and control still falls through to h.GetPayrollPeriod(c) below.
-					func() {
-						tx, txErr := h.db.Begin()
-						if txErr != nil {
-							h.log.Error("Failed to begin payroll payment tx", "error", txErr)
-							return
-						}
-						defer tx.Rollback()
+				// Header + both lines + balance updates in the SAME tx as the
+				// status flip so the deferred balance-check trigger sees the
+				// complete, balanced JE at COMMIT and a failure leaves the
+				// period unpaid (retryable).
+				if _, err := tx.Exec(`
+					INSERT INTO journal_entries (
+						id, tenant_id, organization_id, journal_id, entry_number, entry_date,
+						description, source_type, source_id, exchange_rate,
+						total_debit, total_credit, status, created_by, created_at, updated_at
+					) VALUES ($1,$2,$3,$4,$5,$6,$7,'payroll_payment',$8,1.0,$9,$9,'posted',$10,$11,$11)`,
+					jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
+					description, id.String(), totalNet, userID, now); err != nil {
+					h.log.Error("Failed to create payroll payment journal entry", "error", err)
+					response.InternalError(c, "Failed to post salary payment journal entry")
+					return
+				}
 
-						if _, err := tx.Exec(`
-							INSERT INTO journal_entries (
-								id, tenant_id, organization_id, journal_id, entry_number, entry_date,
-								description, source_type, source_id, exchange_rate,
-								total_debit, total_credit, status, created_by, created_at, updated_at
-							) VALUES ($1,$2,$3,$4,$5,$6,$7,'payroll_payment',$8,1.0,$9,$9,'posted',$10,$11,$11)`,
-							jeID, tenantID, orgIDPtr, journalID, entryNumber, now,
-							description, id.String(), totalNet, userID, now); err != nil {
-							h.log.Error("Failed to create payroll payment journal entry", "error", err)
-							return
-						}
+				// Dt: Wages Payable (liability cleared)
+				if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+					VALUES ($1,$2,$3,'Wages Payable',$4,0,1,$5)`,
+					uuid.New(), jeID, wagesPayableAcct, totalNet, now); err != nil {
+					h.log.Error("Failed to insert wages payable line", "error", err)
+					response.InternalError(c, "Failed to post salary payment journal entry")
+					return
+				}
+				// Debit leg: balance convention is SUM(debit) - SUM(credit)
+				// (migration 407), so a debit ADDS to the stored balance.
+				if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalNet, now, wagesPayableAcct); err != nil {
+					h.log.Error("Failed to update wages payable balance", "error", err)
+					response.InternalError(c, "Failed to post salary payment journal entry")
+					return
+				}
 
-						// Dt: Wages Payable (liability cleared)
-						if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-							VALUES ($1,$2,$3,'Wages Payable',$4,0,1,$5)`,
-							uuid.New(), jeID, wagesPayableAcct, totalNet, now); err != nil {
-							h.log.Error("Failed to insert wages payable line", "error", err)
-							return
-						}
-						// Debit leg: balance convention is SUM(debit) - SUM(credit)
-						// (migration 407), so a debit ADDS to the stored balance.
-						if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalNet, now, wagesPayableAcct); err != nil {
-							h.log.Error("Failed to update wages payable balance", "error", err)
-							return
-						}
+				// Kt: Cash or Bank (money goes out)
+				if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
+					VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
+					uuid.New(), jeID, paymentAcct, paymentAcctDesc, totalNet, now); err != nil {
+					h.log.Error("Failed to insert cash/bank line", "error", err)
+					response.InternalError(c, "Failed to post salary payment journal entry")
+					return
+				}
+				if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, paymentAcct); err != nil {
+					h.log.Error("Failed to update cash/bank balance", "error", err)
+					response.InternalError(c, "Failed to post salary payment journal entry")
+					return
+				}
 
-						// Kt: Cash or Bank (money goes out)
-						if _, err := tx.Exec(`INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-							VALUES ($1,$2,$3,$4,0,$5,2,$6)`,
-							uuid.New(), jeID, paymentAcct, paymentAcctDesc, totalNet, now); err != nil {
-							h.log.Error("Failed to insert cash/bank line", "error", err)
-							return
-						}
-						if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, totalNet, now, paymentAcct); err != nil {
-							h.log.Error("Failed to update cash/bank balance", "error", err)
-							return
-						}
-
-						if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
-							h.log.Error("Failed to bump journal next_number for payroll payment", "error", err)
-							return
-						}
-
-						if err := tx.Commit(); err != nil {
-							h.log.Error("Failed to commit payroll payment journal entry", "error", err)
-						}
-					}()
+				if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
+					h.log.Error("Failed to bump journal next_number for payroll payment", "error", err)
+					response.InternalError(c, "Failed to post salary payment journal entry")
+					return
 				}
 			}
-		}
 
+			emitPaid = true
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit payroll period update", "error", err)
+		response.InternalError(c, "Failed to update payroll period")
+		return
+	}
+
+	if emitPaid {
 		h.EmitWorkflowEvent(tenantID, "payroll.paid", map[string]interface{}{
 			"record_id":   id.String(),
 			"period_name": periodName,
@@ -1319,9 +1341,10 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 	now := time.Now()
 
 	// Idempotency: processing posts the accrual JE, so a period may only be
-	// processed once. Re-posting would duplicate salary expense (migration 360
-	// added taxes_journal_entry_id for this; the JE-existence check below is
-	// the working guard).
+	// processed once. "Processed" means the accrual JE actually EXISTS —
+	// status alone is not proof, because a historical failure could have
+	// approved the period without posting the JE; such periods must stay
+	// retryable instead of being poisoned forever (moliya audit, finding 3).
 	var curStatus string
 	if err := h.db.QueryRow(`SELECT status FROM payroll_periods WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, id, tenantID).Scan(&curStatus); err != nil {
 		if err == sql.ErrNoRows {
@@ -1334,7 +1357,32 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 	}
 	var accrualJEs int
 	h.db.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND source_type = 'payroll' AND source_id = $2 AND status = 'posted'`, tenantID, id.String()).Scan(&accrualJEs)
-	if curStatus == "approved" || curStatus == "paid" || accrualJEs > 0 {
+	if curStatus == "paid" || accrualJEs > 0 {
+		response.Success(c, gin.H{"message": "Payroll already processed"})
+		return
+	}
+
+	// Status flips + accrual JE + avans reclass all happen in ONE
+	// transaction: if the JE cannot be posted, the approval rolls back and
+	// /process can simply be retried.
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to begin payroll processing tx", "error", txErr)
+		response.InternalError(c, "Failed to process payroll")
+		return
+	}
+	defer tx.Rollback()
+
+	// Serialize concurrent /process calls on the period row and re-check the
+	// accrual-JE guard under the lock (check-then-act race fix).
+	var periodName string
+	var orgID sql.NullString
+	if err := tx.QueryRow(`SELECT period_name, organization_id FROM payroll_periods WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL FOR UPDATE`, id, tenantID).Scan(&periodName, &orgID); err != nil {
+		h.log.Error("Failed to lock payroll period", "error", err)
+		response.InternalError(c, "Failed to process payroll")
+		return
+	}
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM journal_entries WHERE tenant_id = $1 AND source_type = 'payroll' AND source_id = $2 AND status = 'posted'`, tenantID, id.String()).Scan(&accrualJEs); err == nil && accrualJEs > 0 {
 		response.Success(c, gin.H{"message": "Payroll already processed"})
 		return
 	}
@@ -1344,7 +1392,7 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		UPDATE payroll_entries SET status = 'approved', updated_at = $1
 		WHERE payroll_period_id = $2 AND tenant_id = $3 AND status = 'pending'
 	`
-	if _, err := h.db.Exec(entryQuery, now, id, tenantID); err != nil {
+	if _, err := tx.Exec(entryQuery, now, id, tenantID); err != nil {
 		h.log.Error("Failed to process payroll entries", "error", err)
 		response.InternalError(c, "Failed to process payroll")
 		return
@@ -1355,31 +1403,22 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		UPDATE payroll_periods SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2
 		WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
 	`
-	if _, err := h.db.Exec(periodQuery, userID, now, id, tenantID); err != nil {
+	if _, err := tx.Exec(periodQuery, userID, now, id, tenantID); err != nil {
 		h.log.Error("Failed to update payroll period status", "error", err)
 		response.InternalError(c, "Failed to process payroll")
 		return
 	}
 
 	// ============================================
-	// CREATE JOURNAL ENTRY FOR PAYROLL
+	// CREATE JOURNAL ENTRY FOR PAYROLL (same tx as the status flips)
 	// ============================================
-	func() {
-		// Get period details and total gross salary
-		var periodName string
-		var orgID sql.NullString
-		h.db.QueryRow(`SELECT period_name, organization_id FROM payroll_periods WHERE id = $1`, id).Scan(&periodName, &orgID)
+	var totalGross float64
+	tx.QueryRow(`
+		SELECT COALESCE(SUM(gross_salary), 0)
+		FROM payroll_entries WHERE payroll_period_id = $1 AND tenant_id = $2`,
+		id, tenantID).Scan(&totalGross)
 
-		var totalGross float64
-		h.db.QueryRow(`
-			SELECT COALESCE(SUM(gross_salary), 0)
-			FROM payroll_entries WHERE payroll_period_id = $1 AND tenant_id = $2`,
-			id, tenantID).Scan(&totalGross)
-
-		if totalGross <= 0 {
-			return
-		}
-
+	if totalGross > 0 {
 		var orgIDPtr *uuid.UUID
 		if orgID.Valid {
 			if parsedOrgID, err := uuid.Parse(orgID.String); err == nil {
@@ -1387,15 +1426,17 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 			}
 		}
 
-		// Look up journal
+		// Look up journal — a missing journal must FAIL the request (and roll
+		// back the approval), not silently skip the accrual.
 		var journalID uuid.UUID
 		var nextNumber int
-		err := h.db.QueryRow(`
+		if err := tx.QueryRow(`
 			SELECT id, COALESCE(next_number, 1)
 			FROM journals WHERE tenant_id = $1 AND code IN ('PAYROLL','MISC','GENERAL') AND deleted_at IS NULL
 			ORDER BY CASE code WHEN 'PAYROLL' THEN 0 WHEN 'MISC' THEN 1 ELSE 2 END LIMIT 1`,
-			tenantID).Scan(&journalID, &nextNumber)
-		if err != nil {
+			tenantID).Scan(&journalID, &nextNumber); err != nil {
+			h.log.Error("Payroll accrual failed: no PAYROLL/MISC/GENERAL journal", "error", err, "period_id", id)
+			response.BadRequest(c, "No PAYROLL/MISC/GENERAL journal found for this tenant")
 			return
 		}
 
@@ -1404,22 +1445,23 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		description := "Payroll: " + periodName
 
 		// Debit: Salary Expense
-		salaryAcct := findAccount(h.db, tenantID, orgIDPtr, "salaries", "9420")
+		salaryAcct := findAccount(tx, tenantID, orgIDPtr, "salaries", "9420")
 		if salaryAcct == uuid.Nil {
-			salaryAcct = findAccount(h.db, tenantID, orgIDPtr, "salary", "9420")
+			salaryAcct = findAccount(tx, tenantID, orgIDPtr, "salary", "9420")
 		}
 		// Credit: Wages Payable (6710); fall back to AP (6010). No cash
 		// fallback — crediting 5010 for an accrual would misstate cash.
-		payableAcct := findAccount(h.db, tenantID, orgIDPtr, "wages payable", "6710")
+		payableAcct := findAccount(tx, tenantID, orgIDPtr, "wages payable", "6710")
 		if payableAcct == uuid.Nil {
-			payableAcct = findAccount(h.db, tenantID, orgIDPtr, "accounts payable", "6010")
+			payableAcct = findAccount(tx, tenantID, orgIDPtr, "accounts payable", "6010")
 		}
 
 		if salaryAcct == uuid.Nil || payableAcct == uuid.Nil {
-			h.log.Error("Payroll accrual JE skipped: required GL account not found",
+			h.log.Error("Payroll accrual failed: required GL account not found",
 				"salary_account_found", salaryAcct != uuid.Nil,
 				"payable_account_found", payableAcct != uuid.Nil,
 				"period_id", id)
+			response.BadRequest(c, "Cannot resolve GL accounts for payroll accrual (salary 9420 or payable 6710/6010)")
 			return
 		}
 
@@ -1437,7 +1479,7 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 		totalEmployeeTaxWithdrawn := 0.0                  // reduces Wages Payable
 		totalEmployerTaxExpense := 0.0                    // adds to total_debit / total_credit
 
-		taxRows, _ := h.db.Query(`
+		taxRows, _ := tx.Query(`
 			SELECT
 				pet.payer_snapshot,
 				pet.amount,
@@ -1530,16 +1572,11 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 			totalCredit += ln.credit
 		}
 
-		// Post header + all lines + balance updates in ONE transaction so the
-		// deferred balance-check trigger sees the complete, balanced JE at COMMIT.
-		tx, txErr := h.db.Begin()
-		if txErr != nil {
-			h.log.Error("Failed to begin payroll accrual tx", "error", txErr)
-			return
-		}
-		defer tx.Rollback()
-
-		if _, err = tx.Exec(`
+		// Post header + all lines + balance updates in the SAME transaction as
+		// the status flips so the deferred balance-check trigger sees the
+		// complete, balanced JE at COMMIT and a failure leaves the period
+		// unprocessed (retryable).
+		if _, err := tx.Exec(`
 			INSERT INTO journal_entries (
 				id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 				source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
@@ -1548,11 +1585,12 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 			id.String(), totalDebit, totalCredit, userID, now,
 		); err != nil {
 			h.log.Error("Failed to create payroll journal entry", "error", err)
+			response.InternalError(c, "Failed to post payroll accrual journal entry")
 			return
 		}
 
 		for i, ln := range lines {
-			if _, err = tx.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
@@ -1560,16 +1598,19 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 				uuid.New(), journalEntryID, i+1, ln.accountID, ln.description, ln.debit, ln.credit, now,
 			); err != nil {
 				h.log.Error("Failed to insert payroll journal line", "error", err)
+				response.InternalError(c, "Failed to post payroll accrual journal entry")
 				return
 			}
-			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", ln.debit-ln.credit, now, ln.accountID); err != nil {
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", ln.debit-ln.credit, now, ln.accountID); err != nil {
 				h.log.Error("Failed to update account balance for payroll accrual", "error", err)
+				response.InternalError(c, "Failed to post payroll accrual journal entry")
 				return
 			}
 		}
 
-		if _, err = tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+		if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
 			h.log.Error("Failed to bump journal next_number for payroll accrual", "error", err)
+			response.InternalError(c, "Failed to post payroll accrual journal entry")
 			return
 		}
 
@@ -1600,7 +1641,7 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 			}
 			reclassID := uuid.New()
 			reclassNumber := fmt.Sprintf("PAYRCL%05d", nextEntryNumberSeq(tx, tenantID, orgVal, "PAYRCL", 1))
-			if _, err = tx.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entries (
 					id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
 					source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
@@ -1609,40 +1650,46 @@ func (h *Handler) ProcessPayroll(c *gin.Context) {
 				"Avans reklassifikatsiyasi: "+periodName, id.String(), avansTotal, userID, now,
 			); err != nil {
 				h.log.Error("Failed to create avans reclass journal entry", "error", err)
+				response.InternalError(c, "Failed to post payroll accrual journal entry")
 				return
 			}
-			if _, err = tx.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
 				VALUES ($1, $2, 1, $3, 'Wages Payable (avans settled)', $4, 0, 1.0, $5)`,
 				uuid.New(), reclassID, payableAcct, avansTotal, now); err != nil {
 				h.log.Error("Failed to insert avans reclass debit line", "error", err)
+				response.InternalError(c, "Failed to post payroll accrual journal entry")
 				return
 			}
-			if _, err = tx.Exec(`
+			if _, err := tx.Exec(`
 				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
 				VALUES ($1, $2, 2, $3, 'Salary Expense (avans reclassed)', 0, $4, 1.0, $5)`,
 				uuid.New(), reclassID, salaryAcct, avansTotal, now); err != nil {
 				h.log.Error("Failed to insert avans reclass credit line", "error", err)
+				response.InternalError(c, "Failed to post payroll accrual journal entry")
 				return
 			}
-			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", avansTotal, now, payableAcct); err != nil {
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", avansTotal, now, payableAcct); err != nil {
 				h.log.Error("Failed to update payable balance for avans reclass", "error", err)
+				response.InternalError(c, "Failed to post payroll accrual journal entry")
 				return
 			}
-			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", avansTotal, now, salaryAcct); err != nil {
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", avansTotal, now, salaryAcct); err != nil {
 				h.log.Error("Failed to update salary balance for avans reclass", "error", err)
+				response.InternalError(c, "Failed to post payroll accrual journal entry")
 				return
 			}
 		}
+	}
 
-		if err = tx.Commit(); err != nil {
-			h.log.Error("Failed to commit payroll journal entry", "error", err)
-		}
-	}()
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit payroll processing", "error", err)
+		response.InternalError(c, "Failed to process payroll")
+		return
+	}
 
-	var periodName string
 	var totalNet float64
-	h.db.QueryRow(`SELECT period_name, COALESCE(total_net, 0) FROM payroll_periods WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&periodName, &totalNet)
+	h.db.QueryRow(`SELECT COALESCE(total_net, 0) FROM payroll_periods WHERE id = $1 AND tenant_id = $2`, id, tenantID).Scan(&totalNet)
 	h.EmitWorkflowEvent(tenantID, "payroll.period_confirmed", map[string]interface{}{
 		"record_id":   id.String(),
 		"period_name": periodName,

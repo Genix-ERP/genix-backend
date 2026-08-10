@@ -22,9 +22,1335 @@ import (
 	"github.com/lib/pq"
 )
 
-// Cash registers / orders / cash book are implemented in cash_kassa.go.
+// ========== KASSA (cash registers, PKO/RKO orders, cash book) ==========
+//
+// Moliya v2 single cash engine (docs/moliya-v2/conventions.md §2): every
+// kassa surface reads the POSTED ledger — journal_entry_lines over the
+// register's 50xx account — never the cash_transactions shadow table and
+// never a mutable balance column. Confirming a PKO/RKO posts a balanced
+// JE in one tx (PKO: Dr kassa / Cr counter; RKO: Dr counter / Cr kassa)
+// with source_type='cash_order'. Confirmed orders are immutable: storno
+// is done by creating the opposite order, never by editing or reversing
+// the confirmed document in place.
 
-// ========== CASH BOOK ==========
+// ledgerAccountBalance returns SUM(debit-credit) of posted, non-deleted
+// journal entry lines for one account — the only balance definition the
+// kassa module is allowed to use.
+func ledgerAccountBalance(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, accountID uuid.UUID) float64 {
+	query := `
+		SELECT COALESCE(SUM(l.debit_amount - l.credit_amount), 0)
+		FROM journal_entry_lines l
+		JOIN journal_entries je ON je.id = l.journal_entry_id
+		WHERE l.account_id = $1 AND je.tenant_id = $2
+		  AND je.status = 'posted' AND je.deleted_at IS NULL`
+	args := []interface{}{accountID, tenantID}
+	if orgID != nil {
+		query += " AND je.organization_id = $3"
+		args = append(args, *orgID)
+	}
+	var bal float64
+	_ = q.QueryRow(query, args...).Scan(&bal)
+	return bal
+}
+
+// registerCashAccount resolves the GL account a register posts to: its
+// linked account_id walked down to a leaf, else the tenant's 5010 kassa.
+func registerCashAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, registerID uuid.UUID) uuid.UUID {
+	var linked sql.NullString
+	_ = q.QueryRow(`SELECT account_id::text FROM cash_registers WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		registerID, tenantID).Scan(&linked)
+	if linked.Valid {
+		if aid, err := uuid.Parse(linked.String); err == nil {
+			if leaf := resolveLeafAccount(q, aid); leaf != uuid.Nil {
+				return leaf
+			}
+		}
+	}
+	if id := findAccount(q, tenantID, orgID, "kassa", "5010"); id != uuid.Nil {
+		return id
+	}
+	return findAccount(q, tenantID, orgID, "cash", "5010")
+}
+
+// resolveCounterAccount validates an explicit counter account reference
+// (id preferred, code fallback) down to a tenant-owned, active leaf.
+// Returns uuid.Nil with nil error when neither reference was supplied.
+func resolveCounterAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, accountID, accountCode string) (uuid.UUID, error) {
+	if accountID != "" {
+		aid, err := uuid.Parse(accountID)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("invalid account_id")
+		}
+		var belongs bool
+		if err := q.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND is_active = true)`,
+			aid, tenantID,
+		).Scan(&belongs); err != nil || !belongs {
+			return uuid.Nil, fmt.Errorf("account not found in this tenant")
+		}
+		if leaf := resolveLeafAccount(q, aid); leaf != uuid.Nil {
+			return leaf, nil
+		}
+		return uuid.Nil, fmt.Errorf("account is a group account with no leaf descendant")
+	}
+	if accountCode != "" {
+		var id uuid.UUID
+		if orgID != nil {
+			_ = q.QueryRow(
+				`SELECT id FROM accounts WHERE tenant_id = $1 AND (organization_id = $2 OR organization_id IS NULL) AND code = $3
+				   AND deleted_at IS NULL AND is_active = true AND COALESCE(is_leaf, true) = true LIMIT 1`,
+				tenantID, *orgID, accountCode).Scan(&id)
+		}
+		if id == uuid.Nil {
+			_ = q.QueryRow(
+				`SELECT id FROM accounts WHERE tenant_id = $1 AND code = $2
+				   AND deleted_at IS NULL AND is_active = true AND COALESCE(is_leaf, true) = true LIMIT 1`,
+				tenantID, accountCode).Scan(&id)
+		}
+		if id == uuid.Nil {
+			return uuid.Nil, fmt.Errorf("account code %s not found", accountCode)
+		}
+		return id, nil
+	}
+	return uuid.Nil, nil
+}
+
+func middlewareOrgPtr(c *gin.Context) *uuid.UUID {
+	if orgID, ok := middleware.GetOrganizationID(c); ok && orgID != uuid.Nil {
+		return &orgID
+	}
+	return nil
+}
+
+const cashRegisterSelect = `
+	SELECT cr.id, cr.name, COALESCE(cr.code, ''), cr.currency, COALESCE(cr.limit_amount, 0),
+	       COALESCE(cr.is_active, true), cr.account_id::text,
+	       COALESCE(a.code, ''), COALESCE(a.name_uz, a.name, ''), COALESCE(lb.bal, 0), cr.created_at
+	FROM cash_registers cr
+	LEFT JOIN accounts a ON a.id = cr.account_id
+	LEFT JOIN LATERAL (
+		SELECT SUM(l.debit_amount - l.credit_amount) AS bal
+		FROM journal_entry_lines l
+		JOIN journal_entries je ON je.id = l.journal_entry_id
+			AND je.status = 'posted' AND je.deleted_at IS NULL AND je.tenant_id = cr.tenant_id
+		WHERE l.account_id = cr.account_id
+	) lb ON true`
+
+func scanCashRegister(rows interface {
+	Scan(dest ...interface{}) error
+}) (gin.H, error) {
+	var id uuid.UUID
+	var name, code, currency, accountCode, accountName string
+	var limitAmount, ledgerBalance float64
+	var isActive bool
+	var accountID sql.NullString
+	var createdAt time.Time
+	if err := rows.Scan(&id, &name, &code, &currency, &limitAmount, &isActive,
+		&accountID, &accountCode, &accountName, &ledgerBalance, &createdAt); err != nil {
+		return nil, err
+	}
+	item := gin.H{
+		"id":             id.String(),
+		"name":           name,
+		"code":           code,
+		"currency":       currency,
+		"limit_amount":   limitAmount,
+		"is_active":      isActive,
+		"account_code":   accountCode,
+		"account_name":   accountName,
+		"ledger_balance": ledgerBalance,
+		"created_at":     createdAt,
+	}
+	if accountID.Valid {
+		item["account_id"] = accountID.String
+	}
+	return item, nil
+}
+
+func (h *Handler) ListCashRegisters(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	query := cashRegisterSelect + ` WHERE cr.tenant_id = $1 AND cr.deleted_at IS NULL`
+	args := []interface{}{tenantID}
+	if orgID := middlewareOrgPtr(c); orgID != nil {
+		query += " AND (cr.organization_id = $2 OR cr.organization_id IS NULL)"
+		args = append(args, *orgID)
+	}
+	query += " ORDER BY cr.created_at ASC"
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list cash registers", "error", err)
+		response.InternalError(c, "Failed to list cash registers")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]gin.H, 0)
+	for rows.Next() {
+		item, scanErr := scanCashRegister(rows)
+		if scanErr != nil {
+			h.log.Error("Failed to scan cash register", "error", scanErr)
+			continue
+		}
+		items = append(items, item)
+	}
+	response.Success(c, items)
+}
+
+type cashRegisterInput struct {
+	Name        string  `json:"name"`
+	Code        string  `json:"code"`
+	Currency    string  `json:"currency"`
+	LimitAmount float64 `json:"limit_amount"`
+	AccountID   string  `json:"account_id"`
+	AccountCode string  `json:"account_code"`
+	IsActive    *bool   `json:"is_active"`
+}
+
+func (h *Handler) CreateCashRegister(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	orgIDPtr := middlewareOrgPtr(c)
+
+	var input cashRegisterInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+	if strings.TrimSpace(input.Name) == "" {
+		response.BadRequest(c, "name is required")
+		return
+	}
+	if input.Currency == "" {
+		input.Currency = "UZS"
+	}
+
+	accountID, err := resolveCounterAccount(h.db, tenantID, orgIDPtr, input.AccountID, input.AccountCode)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if accountID == uuid.Nil {
+		// Default GL link: the tenant's 5010 kassa leaf.
+		accountID = findAccount(h.db, tenantID, orgIDPtr, "kassa", "5010")
+		if accountID == uuid.Nil {
+			accountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+		}
+	}
+
+	var accountVal interface{}
+	if accountID != uuid.Nil {
+		accountVal = accountID
+	}
+	var orgVal interface{}
+	if orgIDPtr != nil {
+		orgVal = *orgIDPtr
+	}
+
+	id := uuid.New()
+	_, err = h.db.Exec(`
+		INSERT INTO cash_registers (id, tenant_id, organization_id, name, code, currency, limit_amount, account_id, is_active, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9)`,
+		id, tenantID, orgVal, strings.TrimSpace(input.Name), nullStr(input.Code), input.Currency,
+		input.LimitAmount, accountVal, userID)
+	if err != nil {
+		if pqErr, isPq := err.(*pq.Error); isPq && pqErr.Code == "23505" {
+			response.Conflict(c, "Cash register code already exists")
+			return
+		}
+		h.log.Error("Failed to create cash register", "error", err)
+		response.InternalError(c, "Failed to create cash register")
+		return
+	}
+
+	row := h.db.QueryRow(cashRegisterSelect+` WHERE cr.id = $1 AND cr.tenant_id = $2`, id, tenantID)
+	item, scanErr := scanCashRegister(row)
+	if scanErr != nil {
+		response.Created(c, gin.H{"id": id.String()})
+		return
+	}
+	response.Created(c, item)
+}
+
+func (h *Handler) GetCashRegister(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	row := h.db.QueryRow(cashRegisterSelect+` WHERE cr.id = $1 AND cr.tenant_id = $2 AND cr.deleted_at IS NULL`, id, tenantID)
+	item, scanErr := scanCashRegister(row)
+	if scanErr != nil {
+		response.NotFound(c, "Cash register")
+		return
+	}
+	response.Success(c, item)
+}
+
+func (h *Handler) UpdateCashRegister(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var input cashRegisterInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	sets := []string{"updated_at = NOW()"}
+	args := []interface{}{}
+	argN := 0
+	addSet := func(col string, val interface{}) {
+		argN++
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
+		args = append(args, val)
+	}
+	if strings.TrimSpace(input.Name) != "" {
+		addSet("name", strings.TrimSpace(input.Name))
+	}
+	if input.Code != "" {
+		addSet("code", input.Code)
+	}
+	if input.Currency != "" {
+		addSet("currency", input.Currency)
+	}
+	if input.LimitAmount > 0 {
+		addSet("limit_amount", input.LimitAmount)
+	}
+	if input.IsActive != nil {
+		addSet("is_active", *input.IsActive)
+	}
+	if input.AccountID != "" || input.AccountCode != "" {
+		accountID, resolveErr := resolveCounterAccount(h.db, tenantID, middlewareOrgPtr(c), input.AccountID, input.AccountCode)
+		if resolveErr != nil {
+			response.BadRequest(c, resolveErr.Error())
+			return
+		}
+		addSet("account_id", accountID)
+	}
+
+	query := fmt.Sprintf(`UPDATE cash_registers SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL`,
+		strings.Join(sets, ", "), argN+1, argN+2)
+	args = append(args, id, tenantID)
+
+	res, err := h.db.Exec(query, args...)
+	if err != nil {
+		if pqErr, isPq := err.(*pq.Error); isPq && pqErr.Code == "23505" {
+			response.Conflict(c, "Cash register code already exists")
+			return
+		}
+		h.log.Error("Failed to update cash register", "error", err)
+		response.InternalError(c, "Failed to update cash register")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.NotFound(c, "Cash register")
+		return
+	}
+
+	row := h.db.QueryRow(cashRegisterSelect+` WHERE cr.id = $1 AND cr.tenant_id = $2`, id, tenantID)
+	item, scanErr := scanCashRegister(row)
+	if scanErr != nil {
+		response.Success(c, gin.H{"id": id.String()})
+		return
+	}
+	response.Success(c, item)
+}
+
+// ========== CASH ORDERS (PKO/RKO) ==========
+
+const cashOrderSelect = `
+	SELECT co.id, co.order_number, co.order_type, co.order_date, co.amount, co.currency, co.status,
+	       COALESCE(co.description, ''), co.cash_register_id, COALESCE(cr.name, ''),
+	       co.partner_id::text, COALESCE(ct.name, ''), COALESCE(co.counterparty_name, ''),
+	       co.account_id::text, COALESCE(a.code, ''), COALESCE(a.name_uz, a.name, ''),
+	       co.journal_entry_id::text, COALESCE(je.entry_number, ''), co.created_at
+	FROM cash_orders co
+	LEFT JOIN cash_registers cr ON cr.id = co.cash_register_id
+	LEFT JOIN contacts ct ON ct.id = co.partner_id
+	LEFT JOIN accounts a ON a.id = co.account_id
+	LEFT JOIN journal_entries je ON je.id = co.journal_entry_id`
+
+func scanCashOrder(rows interface {
+	Scan(dest ...interface{}) error
+}) (gin.H, error) {
+	var id, registerID uuid.UUID
+	var orderNumber, orderType, currency, status, description, registerName, partnerName, counterpartyName string
+	var accountCode, accountName, entryNumber string
+	var partnerID, accountID, journalEntryID sql.NullString
+	var orderDate, createdAt time.Time
+	var amount float64
+	if err := rows.Scan(&id, &orderNumber, &orderType, &orderDate, &amount, &currency, &status,
+		&description, &registerID, &registerName, &partnerID, &partnerName, &counterpartyName,
+		&accountID, &accountCode, &accountName, &journalEntryID, &entryNumber, &createdAt); err != nil {
+		return nil, err
+	}
+	item := gin.H{
+		"id":                id.String(),
+		"order_number":      orderNumber,
+		"order_type":        orderType,
+		"order_date":        orderDate.Format("2006-01-02"),
+		"amount":            amount,
+		"currency":          currency,
+		"status":            status,
+		"description":       description,
+		"register_id":       registerID.String(),
+		"register_name":     registerName,
+		"partner_name":      partnerName,
+		"counterparty_name": counterpartyName,
+		"account_code":      accountCode,
+		"account_name":      accountName,
+		"entry_number":      entryNumber,
+		"created_at":        createdAt,
+	}
+	if partnerID.Valid {
+		item["partner_id"] = partnerID.String
+	}
+	if accountID.Valid {
+		item["account_id"] = accountID.String
+	}
+	if journalEntryID.Valid {
+		item["journal_entry_id"] = journalEntryID.String
+	}
+	return item, nil
+}
+
+func (h *Handler) ListCashOrders(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	paginate, page, pageSize, offset := optPagination(c)
+
+	where := ` WHERE co.tenant_id = $1 AND co.deleted_at IS NULL`
+	args := []interface{}{tenantID}
+	argN := 1
+	addFilter := func(cond string, val interface{}) {
+		argN++
+		where += fmt.Sprintf(" AND "+cond, argN)
+		args = append(args, val)
+	}
+
+	if orgID := middlewareOrgPtr(c); orgID != nil {
+		addFilter("(co.organization_id = $%d OR co.organization_id IS NULL)", *orgID)
+	}
+	orderType := c.Query("type")
+	if orderType == "" {
+		orderType = c.Query("order_type")
+	}
+	if orderType != "" {
+		addFilter("co.order_type = $%d", strings.ToLower(orderType))
+	}
+	if status := c.Query("status"); status != "" {
+		addFilter("co.status = $%d", status)
+	}
+	if dateFrom := c.Query("date_from"); dateFrom != "" {
+		addFilter("co.order_date >= $%d", dateFrom)
+	}
+	if dateTo := c.Query("date_to"); dateTo != "" {
+		addFilter("co.order_date <= $%d", dateTo)
+	}
+	registerID := c.Query("register_id")
+	if registerID == "" {
+		registerID = c.Query("cash_register_id")
+	}
+	if registerID != "" {
+		rid, err := uuid.Parse(registerID)
+		if err != nil {
+			response.BadRequest(c, "Invalid register_id")
+			return
+		}
+		addFilter("co.cash_register_id = $%d", rid)
+	}
+
+	query := cashOrderSelect + where + " ORDER BY co.order_date DESC, co.created_at DESC"
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argN+1, argN+2)
+		args = append(args, pageSize, offset)
+	}
+
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.Error("Failed to list cash orders", "error", err)
+		response.InternalError(c, "Failed to list cash orders")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]gin.H, 0)
+	for rows.Next() {
+		item, scanErr := scanCashOrder(rows)
+		if scanErr != nil {
+			h.log.Error("Failed to scan cash order", "error", scanErr)
+			continue
+		}
+		items = append(items, item)
+	}
+
+	if !paginate {
+		response.Success(c, items)
+		return
+	}
+	var total int
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM cash_orders co"+where, args[:argN]...).Scan(&total)
+	response.Paginated(c, items, page, pageSize, total)
+}
+
+type cashOrderInput struct {
+	Type             string  `json:"type"`
+	OrderType        string  `json:"order_type"`
+	RegisterID       string  `json:"register_id"`
+	CashRegisterID   string  `json:"cash_register_id"`
+	Amount           float64 `json:"amount"`
+	Currency         string  `json:"currency"`
+	PartnerID        string  `json:"partner_id"`
+	CounterpartyName string  `json:"counterparty_name"`
+	AccountID        string  `json:"account_id"`
+	AccountCode      string  `json:"account_code"`
+	Description      string  `json:"description"`
+	Date             string  `json:"date"`
+	OrderDate        string  `json:"order_date"`
+}
+
+// ensureDefaultCashRegister returns an active register for the tenant,
+// creating "Asosiy kassa" (linked to 5010) on first use so the Kassa tab
+// works without a manual setup step.
+func (h *Handler) ensureDefaultCashRegister(tenantID uuid.UUID, orgIDPtr *uuid.UUID, userID uuid.UUID) (uuid.UUID, error) {
+	var id uuid.UUID
+	query := `SELECT id FROM cash_registers WHERE tenant_id = $1 AND deleted_at IS NULL AND COALESCE(is_active, true) = true`
+	args := []interface{}{tenantID}
+	if orgIDPtr != nil {
+		query += ` ORDER BY CASE WHEN organization_id = $2 THEN 0 ELSE 1 END, created_at ASC LIMIT 1`
+		args = append(args, *orgIDPtr)
+	} else {
+		query += ` ORDER BY created_at ASC LIMIT 1`
+	}
+	if err := h.db.QueryRow(query, args...).Scan(&id); err == nil && id != uuid.Nil {
+		return id, nil
+	}
+
+	accountID := findAccount(h.db, tenantID, orgIDPtr, "kassa", "5010")
+	if accountID == uuid.Nil {
+		accountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+	}
+	var accountVal interface{}
+	if accountID != uuid.Nil {
+		accountVal = accountID
+	}
+	var orgVal interface{}
+	if orgIDPtr != nil {
+		orgVal = *orgIDPtr
+	}
+
+	id = uuid.New()
+	_, err := h.db.Exec(`
+		INSERT INTO cash_registers (id, tenant_id, organization_id, name, code, currency, account_id, created_by)
+		VALUES ($1, $2, $3, 'Asosiy kassa', 'KASSA', 'UZS', $4, $5)
+		ON CONFLICT (tenant_id, code) DO NOTHING`,
+		id, tenantID, orgVal, accountVal, userID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	// ON CONFLICT means a concurrent request (or a soft-deleted register
+	// holding the code) won — fall back to whichever row owns 'KASSA'.
+	var winner uuid.UUID
+	if scanErr := h.db.QueryRow(
+		`SELECT id FROM cash_registers WHERE tenant_id = $1 AND code = 'KASSA' AND deleted_at IS NULL LIMIT 1`,
+		tenantID).Scan(&winner); scanErr == nil && winner != uuid.Nil {
+		return winner, nil
+	}
+	// Code is held by a soft-deleted row: create without a code (nullable,
+	// unique constraint allows multiple NULLs).
+	id = uuid.New()
+	if _, err := h.db.Exec(`
+		INSERT INTO cash_registers (id, tenant_id, organization_id, name, currency, account_id, created_by)
+		VALUES ($1, $2, $3, 'Asosiy kassa', 'UZS', $4, $5)`,
+		id, tenantID, orgVal, accountVal, userID); err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
+}
+
+func (h *Handler) CreateCashOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+	orgIDPtr := middlewareOrgPtr(c)
+
+	var input cashOrderInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	orderType := strings.ToLower(input.Type)
+	if orderType == "" {
+		orderType = strings.ToLower(input.OrderType)
+	}
+	if orderType != "pko" && orderType != "rko" {
+		response.BadRequest(c, "type must be 'pko' or 'rko'")
+		return
+	}
+	if input.Amount <= 0 {
+		response.BadRequest(c, "amount must be positive")
+		return
+	}
+	if strings.TrimSpace(input.Description) == "" {
+		response.BadRequest(c, "description is required")
+		return
+	}
+	if input.Currency == "" {
+		input.Currency = "UZS"
+	}
+
+	orderDate := time.Now()
+	dateStr := input.Date
+	if dateStr == "" {
+		dateStr = input.OrderDate
+	}
+	if dateStr != "" {
+		parsed, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			response.BadRequest(c, "Invalid date format (expected YYYY-MM-DD)")
+			return
+		}
+		orderDate = parsed
+	}
+
+	// Register: explicit, else the tenant's default kassa.
+	var registerID uuid.UUID
+	registerRef := input.RegisterID
+	if registerRef == "" {
+		registerRef = input.CashRegisterID
+	}
+	if registerRef != "" {
+		rid, err := uuid.Parse(registerRef)
+		if err != nil {
+			response.BadRequest(c, "Invalid register_id")
+			return
+		}
+		var exists bool
+		if err := h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM cash_registers WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND COALESCE(is_active, true) = true)`,
+			rid, tenantID).Scan(&exists); err != nil || !exists {
+			response.BadRequest(c, "Cash register not found")
+			return
+		}
+		registerID = rid
+	} else {
+		rid, err := h.ensureDefaultCashRegister(tenantID, orgIDPtr, userID)
+		if err != nil || rid == uuid.Nil {
+			h.log.Error("Failed to resolve default cash register", "error", err)
+			response.InternalError(c, "Failed to resolve cash register")
+			return
+		}
+		registerID = rid
+	}
+
+	var partnerVal interface{}
+	if input.PartnerID != "" {
+		pid, err := uuid.Parse(input.PartnerID)
+		if err != nil {
+			response.BadRequest(c, "Invalid partner_id")
+			return
+		}
+		var exists bool
+		if err := h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM contacts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)`,
+			pid, tenantID).Scan(&exists); err != nil || !exists {
+			response.BadRequest(c, "Partner not found")
+			return
+		}
+		partnerVal = pid
+	}
+
+	// Counter account is optional on a draft; confirm requires it.
+	counterID, err := resolveCounterAccount(h.db, tenantID, orgIDPtr, input.AccountID, input.AccountCode)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
+	}
+	var accountVal interface{}
+	if counterID != uuid.Nil {
+		accountVal = counterID
+	}
+	var orgVal interface{}
+	if orgIDPtr != nil {
+		orgVal = *orgIDPtr
+	}
+
+	// Server-side numbering: PKO-YYYY-NNNN / RKO-YYYY-NNNN per tenant per
+	// year. The MAX+1 is computed inside the INSERT ... SELECT so two
+	// concurrent creates race only at the unique index
+	// (tenant_id, order_number); on 23505 we recompute and retry.
+	numPrefix := fmt.Sprintf("%s-%s-", strings.ToUpper(orderType), orderDate.Format("2006"))
+	id := uuid.New()
+	var orderNumber string
+	var insertErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		insertErr = h.db.QueryRow(`
+			INSERT INTO cash_orders (id, tenant_id, organization_id, cash_register_id, order_number, order_type,
+				order_date, amount, currency, partner_id, account_id, description, counterparty_name, status, created_by)
+			SELECT $1, $2, $3, $4,
+			       $5 || LPAD((COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(SUBSTRING(order_number FROM CHAR_LENGTH($5::text) + 1), '[^0-9]', '', 'g'), '') AS BIGINT)), 0) + 1)::text, 4, '0'),
+			       $6, $7, $8, $9, $10, $11, $12, $13, 'draft', $14
+			FROM cash_orders
+			WHERE tenant_id = $2 AND order_number LIKE $5 || '%'
+			RETURNING order_number`,
+			id, tenantID, orgVal, registerID, numPrefix, orderType, orderDate.Format("2006-01-02"),
+			input.Amount, input.Currency, partnerVal, accountVal,
+			strings.TrimSpace(input.Description), nullStr(strings.TrimSpace(input.CounterpartyName)), userID,
+		).Scan(&orderNumber)
+		if insertErr == nil {
+			break
+		}
+		if pqErr, isPq := insertErr.(*pq.Error); isPq && pqErr.Code == "23505" {
+			continue
+		}
+		break
+	}
+	if insertErr != nil {
+		h.log.Error("Failed to create cash order", "error", insertErr)
+		response.InternalError(c, "Failed to create cash order")
+		return
+	}
+
+	row := h.db.QueryRow(cashOrderSelect+` WHERE co.id = $1 AND co.tenant_id = $2`, id, tenantID)
+	item, scanErr := scanCashOrder(row)
+	if scanErr != nil {
+		response.Created(c, gin.H{"id": id.String(), "order_number": orderNumber, "status": "draft"})
+		return
+	}
+	response.Created(c, item)
+}
+
+func (h *Handler) GetCashOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	row := h.db.QueryRow(cashOrderSelect+` WHERE co.id = $1 AND co.tenant_id = $2 AND co.deleted_at IS NULL`, id, tenantID)
+	item, scanErr := scanCashOrder(row)
+	if scanErr != nil {
+		response.NotFound(c, "Cash order")
+		return
+	}
+	response.Success(c, item)
+}
+
+func (h *Handler) UpdateCashOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	var input cashOrderInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+
+	orgIDPtr := middlewareOrgPtr(c)
+	sets := []string{"updated_at = NOW()"}
+	args := []interface{}{}
+	argN := 0
+	addSet := func(col string, val interface{}) {
+		argN++
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, argN))
+		args = append(args, val)
+	}
+
+	if input.Amount > 0 {
+		addSet("amount", input.Amount)
+	}
+	if strings.TrimSpace(input.Description) != "" {
+		addSet("description", strings.TrimSpace(input.Description))
+	}
+	if input.CounterpartyName != "" {
+		addSet("counterparty_name", strings.TrimSpace(input.CounterpartyName))
+	}
+	dateStr := input.Date
+	if dateStr == "" {
+		dateStr = input.OrderDate
+	}
+	if dateStr != "" {
+		parsed, parseErr := time.Parse("2006-01-02", dateStr)
+		if parseErr != nil {
+			response.BadRequest(c, "Invalid date format (expected YYYY-MM-DD)")
+			return
+		}
+		addSet("order_date", parsed.Format("2006-01-02"))
+	}
+	if input.PartnerID != "" {
+		pid, parseErr := uuid.Parse(input.PartnerID)
+		if parseErr != nil {
+			response.BadRequest(c, "Invalid partner_id")
+			return
+		}
+		addSet("partner_id", pid)
+	}
+	if input.AccountID != "" || input.AccountCode != "" {
+		counterID, resolveErr := resolveCounterAccount(h.db, tenantID, orgIDPtr, input.AccountID, input.AccountCode)
+		if resolveErr != nil {
+			response.BadRequest(c, resolveErr.Error())
+			return
+		}
+		addSet("account_id", counterID)
+	}
+	registerRef := input.RegisterID
+	if registerRef == "" {
+		registerRef = input.CashRegisterID
+	}
+	if registerRef != "" {
+		rid, parseErr := uuid.Parse(registerRef)
+		if parseErr != nil {
+			response.BadRequest(c, "Invalid register_id")
+			return
+		}
+		var exists bool
+		if err := h.db.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM cash_registers WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)`,
+			rid, tenantID).Scan(&exists); err != nil || !exists {
+			response.BadRequest(c, "Cash register not found")
+			return
+		}
+		addSet("cash_register_id", rid)
+	}
+
+	// Drafts only — a confirmed order is an accounting document.
+	query := fmt.Sprintf(`UPDATE cash_orders SET %s WHERE id = $%d AND tenant_id = $%d AND deleted_at IS NULL AND status = 'draft'`,
+		strings.Join(sets, ", "), argN+1, argN+2)
+	args = append(args, id, tenantID)
+
+	res, err := h.db.Exec(query, args...)
+	if err != nil {
+		h.log.Error("Failed to update cash order", "error", err)
+		response.InternalError(c, "Failed to update cash order")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var status string
+		if scanErr := h.db.QueryRow(`SELECT status FROM cash_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+			id, tenantID).Scan(&status); scanErr != nil {
+			response.NotFound(c, "Cash order")
+			return
+		}
+		response.BadRequest(c, fmt.Sprintf("Only draft orders can be edited (current status: %s)", status))
+		return
+	}
+
+	row := h.db.QueryRow(cashOrderSelect+` WHERE co.id = $1 AND co.tenant_id = $2`, id, tenantID)
+	item, scanErr := scanCashOrder(row)
+	if scanErr != nil {
+		response.Success(c, gin.H{"id": id.String()})
+		return
+	}
+	response.Success(c, item)
+}
+
+// ConfirmCashOrder posts the order to the ledger in ONE transaction:
+// a race-safe draft→confirmed claim, then a balanced JE
+// (PKO: Dr kassa / Cr counter; RKO: Dr counter / Cr kassa) with
+// source_type='cash_order'. The deferred trg_check_je_balance trigger
+// re-verifies balance at commit.
+func (h *Handler) ConfirmCashOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	userID, _ := middleware.GetUserID(c)
+
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to begin cash order confirm tx", "error", txErr)
+		response.InternalError(c, "Failed to confirm cash order")
+		return
+	}
+	defer tx.Rollback()
+
+	// Once-only guard: the row claim locks the order; a concurrent confirm
+	// blocks here and then matches 0 rows.
+	var orderNumber, orderType, currency, description string
+	var orderDate time.Time
+	var amount float64
+	var registerID uuid.UUID
+	var partnerIDStr, counterIDStr, orgIDStr, counterpartyName sql.NullString
+	err = tx.QueryRow(`
+		UPDATE cash_orders SET status = 'confirmed', cashier_id = $3, updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status = 'draft'
+		RETURNING order_number, order_type, order_date, amount, currency, description,
+		          cash_register_id, partner_id::text, account_id::text, organization_id::text, counterparty_name`,
+		id, tenantID, userID,
+	).Scan(&orderNumber, &orderType, &orderDate, &amount, &currency, &description,
+		&registerID, &partnerIDStr, &counterIDStr, &orgIDStr, &counterpartyName)
+	if err == sql.ErrNoRows {
+		var status string
+		if scanErr := h.db.QueryRow(`SELECT status FROM cash_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+			id, tenantID).Scan(&status); scanErr != nil {
+			response.NotFound(c, "Cash order")
+			return
+		}
+		response.BadRequest(c, fmt.Sprintf("Invalid transition: cash order is '%s', expected 'draft'", status))
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to claim cash order for confirm", "error", err)
+		response.InternalError(c, "Failed to confirm cash order")
+		return
+	}
+
+	// The ledger is UZS-denominated; posting a foreign-currency face
+	// amount as base would corrupt cash balances. Multi-currency kassa
+	// needs rate handling — out of scope for v2.
+	if currency != "UZS" {
+		response.BadRequest(c, "Only UZS cash orders can be confirmed")
+		return
+	}
+
+	var orgIDPtr *uuid.UUID
+	if orgIDStr.Valid {
+		if parsed, parseErr := uuid.Parse(orgIDStr.String); parseErr == nil {
+			orgIDPtr = &parsed
+		}
+	}
+
+	cashAccountID := registerCashAccount(tx, tenantID, orgIDPtr, registerID)
+	if cashAccountID == uuid.Nil {
+		response.BadRequest(c, "Cannot resolve kassa GL account (5010) for this register")
+		return
+	}
+
+	if !counterIDStr.Valid {
+		response.BadRequest(c, "Counter account is required to confirm (set account_id on the order)")
+		return
+	}
+	counterID, parseErr := uuid.Parse(counterIDStr.String)
+	if parseErr != nil {
+		response.BadRequest(c, "Invalid counter account on the order")
+		return
+	}
+	var counterIsLeaf bool
+	if err := tx.QueryRow(
+		`SELECT COALESCE(is_leaf, true) FROM accounts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND is_active = true`,
+		counterID, tenantID).Scan(&counterIsLeaf); err != nil {
+		response.BadRequest(c, "Counter account not found in this tenant")
+		return
+	}
+	if !counterIsLeaf {
+		response.BadRequest(c, "Counter account must be a leaf account")
+		return
+	}
+	if counterID == cashAccountID {
+		response.BadRequest(c, "Counter account cannot be the register's own cash account")
+		return
+	}
+
+	// Sufficiency guard for outflows reads the LEDGER balance of the
+	// register's cash account — never the cash_transactions shadow table.
+	if orderType == "rko" {
+		available := ledgerAccountBalance(tx, tenantID, orgIDPtr, cashAccountID)
+		if available < amount {
+			response.BadRequest(c, fmt.Sprintf("Kassada mablag' yetarli emas (ledger balans: %.2f, kerak: %.2f)", available, amount))
+			return
+		}
+	}
+
+	// Journal: the cash journal by type, code CASH fallback.
+	var journalID uuid.UUID
+	var nextNumber int
+	if err := tx.QueryRow(`
+		SELECT id, COALESCE(next_number, 1) FROM journals
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND (type = 'cash' OR code = 'CASH')
+		ORDER BY CASE WHEN type = 'cash' THEN 0 ELSE 1 END LIMIT 1`,
+		tenantID).Scan(&journalID, &nextNumber); err != nil {
+		response.BadRequest(c, "No cash journal (type 'cash' / code CASH) found for this tenant")
+		return
+	}
+
+	docLabel := "PKO"
+	if orderType == "rko" {
+		docLabel = "RKO"
+	}
+	jeDescription := docLabel + " " + orderNumber + ": " + description
+	entryNumber := fmt.Sprintf("KAS%06d", nextEntryNumberSeq(tx, tenantID, orgIDPtr, "KAS", nextNumber))
+	journalEntryID := uuid.New()
+	now := time.Now()
+
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'cash_order', $9, 1.0, $10, $10, 'posted', $11, $12, $12)`,
+		journalEntryID, tenantID, orgIDPtr, journalID, entryNumber, orderDate.Format("2006-01-02"),
+		orderNumber, jeDescription, id, amount, userID, now,
+	); err != nil {
+		h.log.Error("Failed to create cash order JE", "error", err)
+		response.InternalError(c, "Failed to post journal entry")
+		return
+	}
+
+	drAccount, crAccount := cashAccountID, counterID
+	if orderType == "rko" {
+		drAccount, crAccount = counterID, cashAccountID
+	}
+	// Only the counter line carries the contact: reconciliation acts sum
+	// every line with contact_id, so tagging the cash line too would make
+	// the partner's debit and credit cancel out.
+	var drContact, crContact interface{}
+	if partnerIDStr.Valid {
+		if pid, pidErr := uuid.Parse(partnerIDStr.String); pidErr == nil {
+			if orderType == "rko" {
+				drContact = pid
+			} else {
+				crContact = pid
+			}
+		}
+	}
+	lineDesc := description
+	if counterpartyName.Valid && counterpartyName.String != "" {
+		lineDesc = counterpartyName.String + ": " + description
+	}
+
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entry_lines (
+			id, journal_entry_id, line_number, account_id, contact_id, description,
+			debit_amount, credit_amount, exchange_rate, created_at
+		) VALUES ($1, $2, 1, $3, $4, $5, $6, 0, 1.0, $7)`,
+		uuid.New(), journalEntryID, drAccount, drContact, lineDesc, amount, now,
+	); err != nil {
+		h.log.Error("Failed to insert cash order debit line", "error", err)
+		response.InternalError(c, "Failed to post journal entry")
+		return
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entry_lines (
+			id, journal_entry_id, line_number, account_id, contact_id, description,
+			debit_amount, credit_amount, exchange_rate, created_at
+		) VALUES ($1, $2, 2, $3, $4, $5, 0, $6, 1.0, $7)`,
+		uuid.New(), journalEntryID, crAccount, crContact, lineDesc, amount, now,
+	); err != nil {
+		h.log.Error("Failed to insert cash order credit line", "error", err)
+		response.InternalError(c, "Failed to post journal entry")
+		return
+	}
+
+	// Keep accounts.current_balance in sync (debit-positive), same as the
+	// expense /pay reference path.
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`,
+		amount, now, drAccount); err != nil {
+		h.log.Error("Failed to update debit account balance", "error", err)
+		response.InternalError(c, "Failed to post journal entry")
+		return
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`,
+		amount, now, crAccount); err != nil {
+		h.log.Error("Failed to update credit account balance", "error", err)
+		response.InternalError(c, "Failed to post journal entry")
+		return
+	}
+	if _, err := tx.Exec(`UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2`, now, journalID); err != nil {
+		h.log.Error("Failed to bump journal next_number", "error", err)
+		response.InternalError(c, "Failed to post journal entry")
+		return
+	}
+
+	if _, err := tx.Exec(`UPDATE cash_orders SET journal_entry_id = $1 WHERE id = $2`, journalEntryID, id); err != nil {
+		h.log.Error("Failed to link JE to cash order", "error", err)
+		response.InternalError(c, "Failed to confirm cash order")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit cash order confirm", "error", err)
+		response.InternalError(c, "Failed to confirm cash order")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"id":               id.String(),
+		"order_number":     orderNumber,
+		"order_type":       orderType,
+		"status":           "confirmed",
+		"amount":           amount,
+		"journal_entry_id": journalEntryID.String(),
+		"entry_number":     entryNumber,
+	})
+}
+
+// CancelCashOrder cancels a DRAFT order. Confirmed orders are immutable —
+// their money movement lives in the ledger; undoing one means creating
+// the opposite order (storno), not mutating this document.
+func (h *Handler) CancelCashOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid ID")
+		return
+	}
+
+	res, err := h.db.Exec(`
+		UPDATE cash_orders SET status = 'cancelled', updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status = 'draft'`,
+		id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to cancel cash order", "error", err)
+		response.InternalError(c, "Failed to cancel cash order")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var status string
+		if scanErr := h.db.QueryRow(`SELECT status FROM cash_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+			id, tenantID).Scan(&status); scanErr != nil {
+			response.NotFound(c, "Cash order")
+			return
+		}
+		if status == "confirmed" {
+			response.BadRequest(c, "Confirmed orders are immutable — create an opposite order (storno) instead")
+			return
+		}
+		response.BadRequest(c, fmt.Sprintf("Invalid transition: cash order is '%s', expected 'draft'", status))
+		return
+	}
+	response.Success(c, gin.H{"id": id.String(), "status": "cancelled"})
+}
+
+// ========== CASH BOOK (Kassa kitobi) ==========
+
+// GetCashBook derives the daily opening/income/expense/closing series
+// from posted JE lines on the register's cash account.
+func (h *Handler) GetCashBook(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	orgIDPtr := middlewareOrgPtr(c)
+
+	now := time.Now()
+	dateFrom := c.DefaultQuery("date_from", time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02"))
+	dateTo := c.DefaultQuery("date_to", now.Format("2006-01-02"))
+
+	var accountID uuid.UUID
+	registerRef := c.Query("register_id")
+	if registerRef == "" {
+		registerRef = c.Query("cash_register_id")
+	}
+	if registerRef != "" {
+		rid, err := uuid.Parse(registerRef)
+		if err != nil {
+			response.BadRequest(c, "Invalid register_id")
+			return
+		}
+		accountID = registerCashAccount(h.db, tenantID, orgIDPtr, rid)
+	} else {
+		accountID = findAccount(h.db, tenantID, orgIDPtr, "kassa", "5010")
+		if accountID == uuid.Nil {
+			accountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+		}
+	}
+	if accountID == uuid.Nil {
+		response.BadRequest(c, "Cannot resolve kassa GL account (5010)")
+		return
+	}
+
+	var accountCode, accountName string
+	_ = h.db.QueryRow(`SELECT code, COALESCE(name_uz, name, '') FROM accounts WHERE id = $1`, accountID).Scan(&accountCode, &accountName)
+
+	openingQuery := `
+		SELECT COALESCE(SUM(l.debit_amount - l.credit_amount), 0)
+		FROM journal_entry_lines l
+		JOIN journal_entries je ON je.id = l.journal_entry_id
+		WHERE l.account_id = $1 AND je.tenant_id = $2
+		  AND je.status = 'posted' AND je.deleted_at IS NULL AND je.entry_date < $3`
+	openingArgs := []interface{}{accountID, tenantID, dateFrom}
+	dailyQuery := `
+		SELECT je.entry_date, COALESCE(SUM(l.debit_amount), 0), COALESCE(SUM(l.credit_amount), 0)
+		FROM journal_entry_lines l
+		JOIN journal_entries je ON je.id = l.journal_entry_id
+		WHERE l.account_id = $1 AND je.tenant_id = $2
+		  AND je.status = 'posted' AND je.deleted_at IS NULL
+		  AND je.entry_date >= $3 AND je.entry_date <= $4`
+	dailyArgs := []interface{}{accountID, tenantID, dateFrom, dateTo}
+	if orgIDPtr != nil {
+		openingQuery += " AND je.organization_id = $4"
+		openingArgs = append(openingArgs, *orgIDPtr)
+		dailyQuery += " AND je.organization_id = $5"
+		dailyArgs = append(dailyArgs, *orgIDPtr)
+	}
+	dailyQuery += " GROUP BY je.entry_date ORDER BY je.entry_date"
+
+	var opening float64
+	if err := h.db.QueryRow(openingQuery, openingArgs...).Scan(&opening); err != nil {
+		h.log.Error("Failed to compute cash book opening", "error", err)
+		response.InternalError(c, "Failed to compute cash book")
+		return
+	}
+
+	rows, err := h.db.Query(dailyQuery, dailyArgs...)
+	if err != nil {
+		h.log.Error("Failed to query cash book days", "error", err)
+		response.InternalError(c, "Failed to compute cash book")
+		return
+	}
+	defer rows.Close()
+
+	days := make([]gin.H, 0)
+	running := opening
+	var totalIncome, totalExpense float64
+	for rows.Next() {
+		var day time.Time
+		var income, expense float64
+		if err := rows.Scan(&day, &income, &expense); err != nil {
+			continue
+		}
+		dayOpening := running
+		running += income - expense
+		totalIncome += income
+		totalExpense += expense
+		days = append(days, gin.H{
+			"date":    day.Format("2006-01-02"),
+			"opening": dayOpening,
+			"income":  income,
+			"expense": expense,
+			"closing": running,
+		})
+	}
+
+	response.Success(c, gin.H{
+		"account_id":      accountID.String(),
+		"account_code":    accountCode,
+		"account_name":    accountName,
+		"date_from":       dateFrom,
+		"date_to":         dateTo,
+		"opening_balance": opening,
+		"days":            days,
+		"total_income":    totalIncome,
+		"total_expense":   totalExpense,
+		"closing_balance": running,
+	})
+}
+
+// ========== CASH BALANCE (single cash engine surface) ==========
+
+// GetCashBalance returns the ledger balance of every CASH-type leaf
+// account plus the total — the same SQL shape as the finance dashboard's
+// cash card, so the Kassa tab and the dashboard can never disagree.
+func (h *Handler) GetCashBalance(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	asOf := c.DefaultQuery("as_of", time.Now().Format("2006-01-02"))
+	args := []interface{}{tenantID, asOf}
+	orgFilter := ""
+	if orgID := middlewareOrgPtr(c); orgID != nil {
+		orgFilter = " AND je.organization_id = $3"
+		args = append(args, *orgID)
+	}
+
+	rows, err := h.db.Query(`
+		SELECT a.id, a.code, COALESCE(a.name_uz, a.name), COALESCE(SUM(l.debit_amount - l.credit_amount), 0) AS bal
+		FROM accounts a
+		JOIN account_types at ON at.id = a.account_type_id AND at.code = 'CASH'
+		LEFT JOIN (
+			journal_entry_lines l
+			JOIN journal_entries je ON je.id = l.journal_entry_id
+				AND je.status = 'posted' AND je.deleted_at IS NULL
+				AND je.entry_date <= $2`+orgFilter+`
+		) ON l.account_id = a.id
+		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true AND a.is_leaf = true
+		GROUP BY a.id, a.code, COALESCE(a.name_uz, a.name)
+		ORDER BY a.code`, args...)
+	if err != nil {
+		h.log.Error("Failed to compute cash balance", "error", err)
+		response.InternalError(c, "Failed to compute cash balance")
+		return
+	}
+	defer rows.Close()
+
+	accounts := make([]gin.H, 0)
+	var total float64
+	for rows.Next() {
+		var accID uuid.UUID
+		var code, name string
+		var balance float64
+		if err := rows.Scan(&accID, &code, &name, &balance); err != nil {
+			continue
+		}
+		kind := "bank"
+		if strings.HasPrefix(code, "50") {
+			kind = "cash"
+		}
+		accounts = append(accounts, gin.H{
+			"account_id": accID.String(),
+			"code":       code,
+			"name":       name,
+			"balance":    balance,
+			"kind":       kind,
+		})
+		total += balance
+	}
+
+	response.Success(c, gin.H{
+		"total":    total,
+		"as_of":    asOf,
+		"accounts": accounts,
+	})
+}
 
 // ========== CURRENCY RATES SYNC ==========
 
@@ -2334,21 +3660,9 @@ func (h *Handler) renderReconciliationEmailHTML(act reconciliationActResponse, l
 	)
 }
 
-// ========== BUDGETS (extended) ==========
-
-func (h *Handler) ListBudgetsV2(c *gin.Context) { response.Success(c, []interface{}{}) }
-func (h *Handler) CreateBudgetV2(c *gin.Context) {
-	response.Created(c, gin.H{"message": "Budget created"})
-}
-func (h *Handler) GetBudgetV2(c *gin.Context) { response.NotFound(c, "Budget") }
-func (h *Handler) UpdateBudgetV2(c *gin.Context) {
-	response.Success(c, gin.H{"message": "Budget updated"})
-}
-func (h *Handler) DeleteBudgetV2(c *gin.Context) { response.NoContent(c) }
-
-func (h *Handler) GetConsolidatedBudget(c *gin.Context) {
-	response.Success(c, gin.H{"consolidated": []interface{}{}, "total_planned": 0, "total_actual": 0})
-}
+// The V2 budget CRUD stubs (ListBudgetsV2 & co.) are gone: they returned
+// hardcoded fake successes and their routes were removed from handler.go
+// (moliya-v2 audit §6). Budget CRUD lives on the legacy /budgets group.
 
 // helpers
 

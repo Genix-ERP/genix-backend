@@ -63,16 +63,20 @@ func (h *Handler) accountBalanceByPattern(
 	tenantID uuid.UUID, orgID *uuid.UUID, pattern string, endDate time.Time,
 ) (debit float64, credit float64, err error) {
 
+	// Inner joins with the entry filters in WHERE: putting the posted/date
+	// filters on a chained LEFT JOIN only nulls the je columns while the line
+	// amounts still aggregate, silently summing draft/deleted/future entries
+	// into every forma line (same leak class GetTrialBalance documents).
 	q := `
 		SELECT COALESCE(SUM(jel.debit_amount), 0),
 		       COALESCE(SUM(jel.credit_amount), 0)
 		FROM accounts a
-		LEFT JOIN journal_entry_lines jel ON jel.account_id = a.id
-		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
-			AND je.status = 'posted' AND je.deleted_at IS NULL
-			AND je.entry_date <= $3
+		JOIN journal_entry_lines jel ON jel.account_id = a.id
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
-		  AND a.code LIKE $2`
+		  AND a.code LIKE $2
+		  AND je.status = 'posted' AND je.deleted_at IS NULL
+		  AND je.entry_date <= $3`
 	args := []interface{}{tenantID, pattern, endDate.Format("2006-01-02")}
 	if orgID != nil && *orgID != uuid.Nil {
 		q += " AND a.organization_id = $4"

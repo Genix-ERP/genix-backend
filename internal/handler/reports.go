@@ -218,7 +218,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		LEFT JOIN journal_entries je ON jel.journal_entry_id = je.id
 			AND je.status = 'posted' AND je.entry_date <= $2 AND je.deleted_at IS NULL
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
-			AND at.category IN ('asset', 'liability', 'equity', 'revenue', 'expense')
+			AND at.category IN ('asset', 'contra_asset', 'liability', 'equity', 'revenue', 'expense')
 	`
 	args := []interface{}{tenantID, asOfDate}
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
@@ -227,7 +227,7 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 	}
 	query += `
 		GROUP BY a.id, a.code, a.name, a.name_uz, a.name_en, a.name_ru, at.category, at.normal_balance, a.opening_balance
-		ORDER BY at.category, a.code
+		ORDER BY a.code
 	`
 
 	rows, err := h.db.Query(query, args...)
@@ -292,9 +292,12 @@ func (h *Handler) GetBalanceSheet(c *gin.Context) {
 		// correctly: assets are debit-positive (a credit-normal contra-asset like
 		// accumulated depreciation reduces total assets instead of inflating it);
 		// liabilities and equity are credit-positive (a debit-normal contra-equity
-		// reduces equity).
+		// reduces equity). contra_asset (eskirish 0220/0230/0250/0260) belongs
+		// INSIDE the assets section as a negative line (BHMS presentation) —
+		// dropping the category from the query broke A = L + E by exactly the
+		// accumulated-depreciation balance.
 		switch category {
-		case "asset":
+		case "asset", "contra_asset":
 			sectionVal := openingBalance + debitSum - creditSum
 			acc.Balance = math.Round(sectionVal*100) / 100
 			assetAccounts = append(assetAccounts, acc)
@@ -907,32 +910,41 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 		h.log.Error("Failed to get cash movement", "error", err)
 	}
 
-	// Cash flow mapping by account code prefix
-	// Operating: 1100 (AR), 2000 (AP), 4xxx (Revenue), 5xxx (COGS), 6xxx (OpEx), 7900 (Other)
-	// Investing: 1500 (Fixed Assets), 1510 (Depreciation), 1600 (Intangible/Investments)
-	// Financing: 2100-2500 (Loans), 3xxx (Equity), 7000 (Interest)
+	// Flows are derived ONLY from entries that touch a cash account (EXISTS on a
+	// canonical cash line), taking the NON-cash counter-lines of those entries.
+	// Sweeping every posted entry instead reported pure accruals — payroll
+	// accrual, depreciation Dr 9420 / Cr 0220 — as cash flows; the sections only
+	// summed to the net change via the double-entry identity. Restricted to
+	// cash-touching entries, sum(credit-debit) over the counter-lines equals the
+	// entries' cash delta exactly, so the sections now reconcile line by line.
 	cfQuery := `
 		SELECT
 			a.code,
 			COALESCE(NULLIF(a.name_uz, ''), a.name) as display_name,
 			COALESCE(SUM(jel.debit_amount), 0) as total_debit,
-			COALESCE(SUM(jel.credit_amount), 0) as total_credit,
-			at.normal_balance
+			COALESCE(SUM(jel.credit_amount), 0) as total_credit
 		FROM accounts a
 		JOIN account_types at ON a.account_type_id = at.id
 		JOIN journal_entry_lines jel ON a.id = jel.account_id
 		JOIN journal_entries je ON jel.journal_entry_id = je.id
 			AND je.status = 'posted' AND je.entry_date BETWEEN $2 AND $3 AND je.deleted_at IS NULL
 		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
-			AND at.code NOT IN ('CASH')
-			AND a.is_bank_account = false
+			AND NOT ` + cashAccountPredicate("a", "at") + `
+			AND EXISTS (
+				SELECT 1 FROM journal_entry_lines cl
+				JOIN accounts ca ON ca.id = cl.account_id
+				JOIN account_types cat ON cat.id = ca.account_type_id
+				WHERE cl.journal_entry_id = je.id
+					AND ca.deleted_at IS NULL
+					AND ` + cashAccountPredicate("ca", "cat") + `
+			)
 	`
 	cfArgs := []interface{}{tenantID, periodFrom, periodTo}
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
 		cfQuery += fmt.Sprintf(" AND a.organization_id = $%d", len(cfArgs)+1)
 		cfArgs = append(cfArgs, orgID)
 	}
-	cfQuery += " GROUP BY a.code, a.name, a.name_uz, at.normal_balance ORDER BY a.code"
+	cfQuery += " GROUP BY a.code, a.name, a.name_uz ORDER BY a.code"
 
 	rows, err := h.db.Query(cfQuery, cfArgs...)
 	if err != nil {
@@ -947,19 +959,16 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 	if rows != nil {
 		defer rows.Close()
 		for rows.Next() {
-			var code, name, normalBalance string
+			var code, name string
 			var debit, credit float64
-			if err := rows.Scan(&code, &name, &debit, &credit, &normalBalance); err != nil {
+			if err := rows.Scan(&code, &name, &debit, &credit); err != nil {
 				continue
 			}
 
 			// Cash impact of a counter-account is always (credit - debit),
 			// regardless of the account's own normal balance: a credit on the
 			// other side means cash came in (Dr cash / Cr revenue), a debit
-			// means cash went out (Dr expense / Cr cash). The previous
-			// normal-balance branch inverted the sign for every debit-normal
-			// account, making expenses and asset purchases look like inflows.
-			_ = normalBalance
+			// means cash went out (Dr expense / Cr cash).
 			amount := credit - debit
 
 			if math.Abs(amount) < 0.01 {
@@ -971,39 +980,24 @@ func (h *Handler) GetCashFlow(c *gin.Context) {
 				Amount:      math.Round(amount*100) / 100,
 			}
 
-			// Categorize by account code (Uzbekistan NAS chart of accounts)
-			// NAS classification for cash flow statement:
-			// Investing: 0100-0899 (fixed/intangible assets, investments, capital expenditures)
-			// Financing: 6000-6999 (current liabilities), 7000-7999 (long-term liabilities), 8000-8999 (equity)
-			// Operating: everything else (revenue, COGS, OpEx, AR, AP, etc.)
+			// Categorize by BHMS account code:
+			// Investing: 0xxx (fixed/intangible assets, capital investments 0810,
+			//   long-term investments 06xx) and 55xx (short-term fin. investments).
+			// Financing: real debt and equity only — 62xx/68xx short-term loans,
+			//   78xx/79xx long-term loans, 8xxx equity. The rest of 6xxx (AP 6010/
+			//   6015, taxes 64xx, wages 6710, other 69xx) is working capital →
+			//   operating, NOT financing.
+			// Operating: everything else (AR/AP, inventory, wages, taxes, 9xxx).
 			switch {
-			case code >= "0100" && code <= "0899":
-				// Fixed assets (01xx-04xx), intangible assets (04xx),
-				// long-term investments (06xx), equipment (08xx) → investing
+			case strings.HasPrefix(code, "0"), strings.HasPrefix(code, "55"):
 				investingItems = append(investingItems, item)
 				investingTotal += amount
-			case code >= "0400" && code <= "0499":
-				// Intangible assets (04xx) → investing
-				investingItems = append(investingItems, item)
-				investingTotal += amount
-			case code >= "0600" && code <= "0699":
-				// Long-term investments (06xx) → investing
-				investingItems = append(investingItems, item)
-				investingTotal += amount
-			case code >= "6000" && code <= "6999":
-				// Current liabilities / accounts payable (60xx-69xx) → financing
-				financingItems = append(financingItems, item)
-				financingTotal += amount
-			case code >= "7000" && code <= "7999":
-				// Long-term liabilities (70xx-79xx) → financing
-				financingItems = append(financingItems, item)
-				financingTotal += amount
-			case code >= "8000" && code <= "8999":
-				// Equity accounts (80xx-89xx) → financing
+			case strings.HasPrefix(code, "62"), strings.HasPrefix(code, "68"),
+				strings.HasPrefix(code, "78"), strings.HasPrefix(code, "79"),
+				strings.HasPrefix(code, "8"):
 				financingItems = append(financingItems, item)
 				financingTotal += amount
 			default:
-				// Everything else → operating (AR, AP, revenue, COGS, OpEx, etc.)
 				operatingItems = append(operatingItems, item)
 				operatingTotal += amount
 			}

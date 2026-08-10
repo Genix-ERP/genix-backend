@@ -48,6 +48,11 @@ class TestCreateBudget:
         data = resp.json().get("data", resp.json())
         assert float(data.get("total_amount", 0)) == 100000000
 
+        # Teardown: the suite left one 'Test Byudjet' per run in the dev DB
+        # (65 by 2026-08-10, migration 474 cleaned them) — delete what we made.
+        if data.get("id"):
+            api_client.delete(f"/budgets/{data['id']}")
+
 
 class TestVarianceCalculation:
     """12.3 - Reja va fakt farqi."""
@@ -101,9 +106,11 @@ class TestBudgetCRUD:
         resp = api_client.get("/budgets")
         assert resp.status_code == 200
 
-    def test_list_budgets_v2(self, api_client):
+    def test_list_budgets_v2_decommissioned(self, api_client):
+        """The V2 CRUD stubs fake-succeeded (always []) and were removed in
+        Moliya v2 — GET /budget must no longer answer 200. CRUD is /budgets."""
         resp = api_client.get("/budget")
-        assert resp.status_code == 200
+        assert resp.status_code in (404, 501)
 
     def test_budget_lines(self, api_client, db_read, tenant_id):
         """Byudjet satrlari."""
