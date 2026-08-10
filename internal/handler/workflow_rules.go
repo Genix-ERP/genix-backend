@@ -656,6 +656,19 @@ func (h *Handler) TestWorkflowRule(c *gin.Context) {
 				p.Preview = fmt.Sprintf("%s.%s = %v", target, field, renderWorkflowTemplate(fmt.Sprintf("%v", a.Config["value"]), data))
 			case "update_status":
 				p.Preview = fmt.Sprintf("%v.status = %v", a.Config["table"], a.Config["status"])
+			case "run_ai_agent":
+				agentKey, _ := a.Config["agent"].(string)
+				if agentKey == "" {
+					agentKey = "orchestrator"
+				}
+				prompt, _ := a.Config["prompt"].(string)
+				recipients, rErr := h.resolveWorkflowRecipients(tenantID, a.Config)
+				if rErr != nil {
+					p.Error = rErr.Error()
+				}
+				// Preview only — no model call: show the rendered prompt + fan-out.
+				p.Preview = fmt.Sprintf("AI (%s): %s (→ %d recipient(s), read-only run)",
+					agentKey, renderWorkflowTemplate(prompt, data), len(recipients))
 			case "send_telegram":
 				p.Error = "telegram_not_configured"
 			default:
