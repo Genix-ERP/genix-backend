@@ -117,6 +117,64 @@ func TestAgingPagePastEndDoesNotPanic(t *testing.T) {
 	}
 }
 
+// varied builds contacts whose buckets differ, so a sort has something to do.
+func varied() []entity.AgingContact {
+	return []entity.AgingContact{
+		{ContactName: "Beta", Current: 5, Over90Days: 300, TotalAmount: 305},
+		{ContactName: "Alfa", Current: 90, Over90Days: 10, TotalAmount: 100},
+		{ContactName: "Gamma", Current: 50, Over90Days: 200, TotalAmount: 250},
+	}
+}
+
+func names(cs []entity.AgingContact) []string {
+	out := make([]string, len(cs))
+	for i, c := range cs {
+		out[i] = c.ContactName
+	}
+	return out
+}
+
+func eq(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Sorting has to happen server-side once the list is paginated: reordering the
+// twenty rows of one page and labelling the result "largest debts" is worse
+// than offering no control at all.
+func TestAgingSortByBucket(t *testing.T) {
+	got, _, _ := agingFilterSortPage(agingCtx("sort=over_90_days"), varied())
+	if want := []string{"Beta", "Gamma", "Alfa"}; !eq(names(got), want) {
+		t.Fatalf("90+ descending: want %v, got %v", want, names(got))
+	}
+	got, _, _ = agingFilterSortPage(agingCtx("sort=over_90_days&order=asc"), varied())
+	if want := []string{"Alfa", "Gamma", "Beta"}; !eq(names(got), want) {
+		t.Fatalf("90+ ascending: want %v, got %v", want, names(got))
+	}
+}
+
+func TestAgingSortByName(t *testing.T) {
+	got, _, _ := agingFilterSortPage(agingCtx("sort=contact_name&order=asc"), varied())
+	if want := []string{"Alfa", "Beta", "Gamma"}; !eq(names(got), want) {
+		t.Fatalf("want %v, got %v", want, names(got))
+	}
+}
+
+// A typo in a presentation parameter must not take the report down.
+func TestAgingSortUnknownFieldFallsBackToTotal(t *testing.T) {
+	got, _, _ := agingFilterSortPage(agingCtx("sort=nonsense"), varied())
+	if want := []string{"Beta", "Gamma", "Alfa"}; !eq(names(got), want) {
+		t.Fatalf("unknown sort must behave like the default: want %v, got %v", want, names(got))
+	}
+}
+
 // Equal balances must order deterministically, or LIMIT/OFFSET pages can repeat
 // one contact and skip another.
 func TestAgingSortIsStableOnTiedBalances(t *testing.T) {
