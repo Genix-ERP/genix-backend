@@ -1415,9 +1415,15 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 
 	var input struct {
-		Amount         float64 `json:"amount" binding:"required,gt=0"`
-		PaymentDate    string  `json:"payment_date" binding:"required"`
-		PaymentMethod  string  `json:"payment_method,omitempty"`
+		Amount        float64 `json:"amount" binding:"required,gt=0"`
+		PaymentDate   string  `json:"payment_date" binding:"required"`
+		PaymentMethod string  `json:"payment_method,omitempty"`
+		// The dialog has always asked which journal to post to. It was never
+		// sent, so this handler guessed — and guessed only at CASH-coded
+		// journals, which is why a tenant whose only settlement journal is a
+		// bank one got "Payment accounts not configured" no matter what they
+		// picked.
+		JournalID      string  `json:"journal_id,omitempty"`
 		Reference      string  `json:"reference,omitempty"`
 		Notes          string  `json:"notes,omitempty"`
 		WriteOffAmount float64 `json:"write_off_amount,omitempty"`
@@ -1509,10 +1515,30 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Get Cash Receipts Journal ID — prefer org-specific, then tenant-wide
+	// Journal for the receipt.
+	//
+	// The user's explicit choice wins. Only when nothing was sent do we fall
+	// back to looking one up — and that lookup is no longer restricted to
+	// CASH_RECEIPTS/CASH: a tenant settling through a bank journal has no such
+	// row, so the old code found nothing and refused the payment with a
+	// message about unconfigured accounts, while a perfectly good bank journal
+	// sat in the dropdown the user had just used.
 	var cashJournalID uuid.UUID
 	var numberPrefix sql.NullString
-	if organizationID != nil {
+	if input.JournalID != "" {
+		if jid, jerr := uuid.Parse(input.JournalID); jerr == nil {
+			// Scoped to the tenant so a journal id cannot be borrowed from
+			// another one, and to settlement types so a payment cannot be
+			// posted through a sales or purchase journal.
+			_ = tx.QueryRow(`
+				SELECT id, number_prefix FROM journals
+				WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+				  AND (type IN ('cash', 'bank') OR code IN ('CASH_RECEIPTS', 'CASH', 'BANK'))`,
+				jid, tenantID,
+			).Scan(&cashJournalID, &numberPrefix)
+		}
+	}
+	if cashJournalID == uuid.Nil && organizationID != nil {
 		_ = tx.QueryRow(`
 			SELECT id, number_prefix
 			FROM journals WHERE tenant_id = $1 AND organization_id = $2 AND code IN ('CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL
@@ -1521,10 +1547,18 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		).Scan(&cashJournalID, &numberPrefix)
 	}
 	if cashJournalID == uuid.Nil {
+		// Cash-receipt journals first, then any settlement journal. Preferring
+		// the specific one keeps existing tenants posting exactly where they
+		// did before; the widened arm only rescues tenants that would
+		// otherwise have been refused outright.
 		_ = tx.QueryRow(`
 			SELECT id, number_prefix
-			FROM journals WHERE tenant_id = $1 AND code IN ('CASH_RECEIPTS', 'CASH') AND deleted_at IS NULL
-			ORDER BY CASE WHEN code = 'CASH_RECEIPTS' THEN 0 ELSE 1 END LIMIT 1`,
+			FROM journals
+			WHERE tenant_id = $1 AND deleted_at IS NULL
+			  AND (code IN ('CASH_RECEIPTS', 'CASH') OR type IN ('cash', 'bank'))
+			ORDER BY CASE WHEN code = 'CASH_RECEIPTS' THEN 0
+			              WHEN code = 'CASH' THEN 1
+			              WHEN type = 'bank' THEN 2 ELSE 3 END LIMIT 1`,
 			tenantID,
 		).Scan(&cashJournalID, &numberPrefix)
 	}
