@@ -202,3 +202,27 @@ func salesInvoiceWhere(c *gin.Context, args *[]interface{}) string {
 	}
 	return where
 }
+
+// Date-derived fields for the non-invoice lists.
+//
+// discounts, contracts and vendor_prices each had their expiry rule written a
+// third time in Dart against DateTime.now(). These emit it from SQL so the
+// clients render a field instead — the same reason invoiceOverdueSQL exists,
+// and the same CURRENT_DATE clock, so a tenant cannot see one list agree with
+// the server and another disagree.
+
+// dateExpiredSQL is true once `column` is strictly in the past. A NULL date
+// means "no expiry", which is false rather than NULL — an open-ended discount
+// is not expired, and leaving it NULL would make the client handle a third
+// state that has no meaning here.
+func dateExpiredSQL(column string) string {
+	return fmt.Sprintf("(%s IS NOT NULL AND %s < CURRENT_DATE)", column, column)
+}
+
+// dateDaysRemainingSQL counts days until `column`: positive while it is still
+// in the future, 0 on the day itself, negative once past. NULL when there is no
+// date at all, which the clients must render as "no expiry" rather than 0 —
+// zero would read as "expires today".
+func dateDaysRemainingSQL(column string) string {
+	return fmt.Sprintf("(%s - CURRENT_DATE)::int", column)
+}

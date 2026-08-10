@@ -53,11 +53,11 @@ func (h *Handler) GetSalesInvoicesSummary(c *gin.Context) {
 	overdue := invoiceOverdueSQL("si")
 
 	var out struct {
-		TotalReceivable float64 `json:"total_receivable"`
-		OverdueAmount   float64 `json:"overdue_amount"`
-		OverdueInvoices int     `json:"overdue_invoices"`
-		OpenInvoices    int     `json:"open_invoices"`
-		AvgDaysToPay    float64 `json:"avg_days_to_pay"`
+		TotalReceivable float64  `json:"total_receivable"`
+		OverdueAmount   float64  `json:"overdue_amount"`
+		OverdueInvoices int      `json:"overdue_invoices"`
+		OpenInvoices    int      `json:"open_invoices"`
+		AvgDaysToPay    *float64 `json:"avg_days_to_pay"`
 		Aging           struct {
 			Current    float64 `json:"current"`
 			Days1To30  float64 `json:"days_1_30"`
@@ -86,15 +86,24 @@ func (h *Handler) GetSalesInvoicesSummary(c *gin.Context) {
 			-- settled it, over invoices that are actually paid. The web derived
 			-- this from updated_at, which any edit moves — so an invoice touched
 			-- months later reported months to pay.
-			(SELECT AVG(d)::float FROM (
-				SELECT MAX(p.payment_date)::date - si2.invoice_date AS d
-				FROM sales_invoices si2
-				JOIN payment_allocations pa ON pa.document_id = si2.id AND pa.document_type = 'sales_invoice'
-				JOIN payments p ON p.id = pa.payment_id AND p.status = 'confirmed' AND p.deleted_at IS NULL
-				WHERE si2.tenant_id = $1 AND si2.deleted_at IS NULL
-				  AND COALESCE(si2.amount_paid, 0) >= si2.total_amount AND si2.total_amount > 0
-				GROUP BY si2.id, si2.invoice_date
-			) paid_invoices)
+			--
+			-- B1: computed over the SAME rows as the five figures above rather
+			-- than a second, tenant-wide scan. Its own subquery only filtered
+			-- tenant + deleted_at, so applying a date range or a search left five
+			-- cards describing the filtered set and this one describing the whole
+			-- tenant — the a60cb5b §2 defect surviving inside a single column —
+			-- and it mixed organizations, having no organization_id predicate at
+			-- all. Correlating on si.id ties it to the outer WHERE, so every
+			-- filter reaches it for free and can never be forgotten again.
+			AVG((
+				SELECT MAX(p.payment_date)::date - si.invoice_date
+				FROM payment_allocations pa
+				JOIN payments p ON p.id = pa.payment_id
+				                AND p.status = 'confirmed' AND p.deleted_at IS NULL
+				WHERE pa.document_id = si.id AND pa.document_type = 'sales_invoice'
+			)) FILTER (
+				WHERE COALESCE(si.amount_paid, 0) >= si.total_amount AND si.total_amount > 0
+			)
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		`+where, args...).Scan(
@@ -106,7 +115,15 @@ func (h *Handler) GetSalesInvoicesSummary(c *gin.Context) {
 		response.InternalError(c, "Failed to build receivables summary")
 		return
 	}
-	out.AvgDaysToPay = avgDays.Float64
+	// B2: NULL stays null in the payload. AVG over an empty set is NULL, and
+	// collapsing that to 0 made "no fully-paid invoice has a confirmed payment
+	// allocation" indistinguishable from "invoices are paid the same day" — the
+	// card read 0 when the honest answer was "unknown". The client renders the
+	// same placeholder it uses for any absent field.
+	if avgDays.Valid {
+		v := avgDays.Float64
+		out.AvgDaysToPay = &v
+	}
 
 	response.Success(c, out)
 }

@@ -563,7 +563,9 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 			   si.journal_entry_id, si.sent_at, si.viewed_at, si.created_by, si.created_at, si.updated_at,
 			   COALESCE(c.name, si.customer_name, '') as customer_name,
 			   COALESCE(si.invoice_type, 'invoice') as invoice_type, si.original_invoice_id, si.reason,
-			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date
+			   si.payment_term_id, COALESCE(si.early_discount_amount, 0), si.early_discount_date,
+			   ` + invoiceOverdueSQL("si") + ` AS is_overdue,
+			   ` + invoiceDaysOverdueSQL("si") + ` AS days_overdue
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.id = $1 AND si.tenant_id = $2 AND si.deleted_at IS NULL`
@@ -581,6 +583,10 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 	var invoiceType string
 	var originalInvoiceID sql.NullString
 	var reason sql.NullString
+	// A2: the detail carried neither field, so the sheet could not show the
+	// overdue badge that the list row already drives.
+	var isOverdue bool
+	var daysOverdue int
 	var getPaymentTermID sql.NullString
 	var getEarlyDiscountAmount float64
 	var getEarlyDiscountDate sql.NullTime
@@ -595,6 +601,7 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		&customerName,
 		&invoiceType, &originalInvoiceID, &reason,
 		&getPaymentTermID, &getEarlyDiscountAmount, &getEarlyDiscountDate,
+		&isOverdue, &daysOverdue,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
@@ -633,6 +640,8 @@ func (h *Handler) GetSalesInvoice(c *gin.Context) {
 		"status":          status,
 		"payment_status":  paymentStatus,
 		"invoice_type":    invoiceType,
+		"is_overdue":      isOverdue,
+		"days_overdue":    daysOverdue,
 		"created_at":      createdAt,
 		"updated_at":      updatedAt,
 	}

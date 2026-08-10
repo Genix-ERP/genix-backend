@@ -138,12 +138,19 @@ type ContractResponse struct {
 	ResponsibleEmployeeID   *uuid.UUID        `json:"responsible_employee_id,omitempty"`
 	ResponsibleEmployeeName string            `json:"responsible_employee_name,omitempty"`
 	DaysToExpiry            *int              `json:"days_to_expiry,omitempty"` // nil = muddatsiz
-	AmendmentCount          int               `json:"amendment_count"`
-	FileCount               int               `json:"file_count"`
-	ArchivedAt              *time.Time        `json:"archived_at,omitempty"`
-	CreatedBy               *uuid.UUID        `json:"created_by,omitempty"`
-	CreatedAt               time.Time         `json:"created_at"`
-	UpdatedAt               time.Time         `json:"updated_at"`
+	// days_until_expiry is the same value under the name the mobile client
+	// reads. Both are emitted because days_to_expiry already ships and the web
+	// may bind to it; one of the two would silently blank a client.
+	DaysUntilExpiry *int `json:"days_until_expiry,omitempty"`
+	// EffectiveStatus applies "active + past end_date reads as expired". Status
+	// keeps the stored value.
+	EffectiveStatus string     `json:"effective_status"`
+	AmendmentCount  int        `json:"amendment_count"`
+	FileCount       int        `json:"file_count"`
+	ArchivedAt      *time.Time `json:"archived_at,omitempty"`
+	CreatedBy       *uuid.UUID `json:"created_by,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // ContractAmendment — ilova / qo'shimcha kelishuv (child of a contract).

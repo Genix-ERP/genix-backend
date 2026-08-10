@@ -1839,21 +1839,34 @@ func (h *Handler) GetPurchaseInvoiceStats(c *gin.Context) {
 			COUNT(*) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND pi.amount_paid > 0 AND pi.amount_paid < pi.total_amount) AS partial_count,
 			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND pi.amount_paid > 0 AND pi.amount_paid < pi.total_amount), 0) AS partial_amount,
 			COUNT(*) FILTER (WHERE %s) AS overdue_count,
-			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE %s), 0) AS overdue_amount
+			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE %s), 0) AS overdue_amount,
+			-- A1: the AP tab's "Jami to'lov" and "Tasdiqlash kutilmoqda" cards.
+			-- outstanding_amount is the residual (total - paid), NOT the stored
+			-- amount_due column: unpaid_amount and partial_amount above already
+			-- use the residual form, and amount_due is not maintained on every
+			-- write path, which is why the web card reading it can drift from
+			-- the list beneath it.
+			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0))
+			         FILTER (WHERE pi.status NOT IN ('paid', 'cancelled')), 0) AS outstanding_amount,
+			-- The card is labelled "pending approval" but there is no approval
+			-- workflow (see the pending_approval question); draft is what "not
+			-- yet confirmed" actually means in this schema.
+			COUNT(*) FILTER (WHERE pi.status = 'draft') AS draft_count
 		FROM purchase_invoices pi
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		%s
 	`, invoiceOverdueSQL("pi"), invoiceOverdueSQL("pi"), baseWhere)
 
 	var totalCount int
-	var totalAmount, unpaidAmount, partialAmount, overdueAmount float64
-	var unpaidCount, partialCount, overdueCount int
+	var totalAmount, unpaidAmount, partialAmount, overdueAmount, outstandingAmount float64
+	var unpaidCount, partialCount, overdueCount, draftCount int
 
 	err := h.db.QueryRow(query, args...).Scan(
 		&totalCount, &totalAmount,
 		&unpaidCount, &unpaidAmount,
 		&partialCount, &partialAmount,
 		&overdueCount, &overdueAmount,
+		&outstandingAmount, &draftCount,
 	)
 	if err != nil {
 		h.log.Error("Failed to fetch purchase invoice stats", "error", err)
@@ -1870,5 +1883,8 @@ func (h *Handler) GetPurchaseInvoiceStats(c *gin.Context) {
 		"partial_amount": partialAmount,
 		"overdue_count":  overdueCount,
 		"overdue_amount": overdueAmount,
+
+		"outstanding_amount": outstandingAmount,
+		"draft_count":        draftCount,
 	})
 }
