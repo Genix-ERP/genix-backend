@@ -502,6 +502,32 @@ func agentTools() []agentTool {
 			}, "name", "status"),
 			exec: toolSetWorkflowStatus,
 		},
+		{
+			name:        "list_tasks",
+			description: "List kanban board tasks (Vazifalar): title, board, column/status, priority, due date, assignees. Filter by board name, column/status name or assignee name.",
+			parameters: obj(map[string]interface{}{
+				"board":    str("Optional board name filter (partial match)."),
+				"status":   str("Optional column/status name filter (partial match, e.g. 'Bajarilmoqda')."),
+				"assignee": str("Optional assignee (employee) name filter."),
+				"overdue":  map[string]interface{}{"type": "boolean", "description": "Only tasks past their due date and not done."},
+				"limit":    intp("Max rows (default 20)."),
+			}),
+			exec: toolListTasks,
+		},
+		{
+			name:        "create_task",
+			description: "Create a kanban board task (Vazifalar) in the first column of a board. Requires confirmation.",
+			mutating:    true,
+			parameters: obj(map[string]interface{}{
+				"title":       str("Task title."),
+				"description": str("Optional details."),
+				"board":       str("Board name (optional — defaults to the company's first board)."),
+				"priority":    map[string]interface{}{"type": "string", "enum": []string{"low", "normal", "high", "urgent"}, "description": "Default normal."},
+				"due_date":    str("Optional due date YYYY-MM-DD."),
+				"assignee":    str("Optional assignee: employee name (resolved to a real employee)."),
+			}, "title"),
+			exec: toolCreateTask,
+		},
 	}
 }
 
@@ -1407,11 +1433,21 @@ func toolHRStats(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interfac
 			}
 		}
 	}
-	return gin.H{
+	out := gin.H{
 		"total": total, "active": active, "on_leave": onLeave, "terminated": terminated,
 		"hired_this_month": hiredThisMonth, "exits_this_month": exitsThisMonth,
-		"salary_fund": salaryFund, "by_department": depts,
-	}, nil
+		"by_department": depts,
+	}
+	// The company-wide salary fund is payroll data, not headcount data. The
+	// tool itself is gated hr:employee:read, which construction users hold via
+	// crossModuleGrants — so a prorab could read the whole salary fund through
+	// here (audit C7). Include it only for callers who could open payroll.
+	if h.perm == nil || h.perm.Can(c, "hr", "payroll", "read") {
+		out["salary_fund"] = salaryFund
+	} else {
+		out["salary_fund_note"] = "hidden: requires hr:payroll:read"
+	}
+	return out, nil
 }
 
 func toolListExpenses(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
@@ -1419,10 +1455,10 @@ func toolListExpenses(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg int
 	status := argStr(args, "status")
 	qry := `SELECT COALESCE(expense_number,''), COALESCE(description,''), COALESCE(NULLIF(vendor_name,''), employee_name, ''),
 	               COALESCE(total_amount, amount, 0), COALESCE(status,''), expense_date
-	        FROM expenses WHERE tenant_id=$1 AND deleted_at IS NULL`
-	qa := []interface{}{tenantID}
+	        FROM expenses WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)`
+	qa := []interface{}{tenantID, orgArg}
 	if status != "" {
-		qry += " AND status=$2"
+		qry += " AND status=$3"
 		qa = append(qa, status)
 	}
 	qry += fmt.Sprintf(" ORDER BY expense_date DESC NULLS LAST LIMIT %d", limit)
@@ -1662,20 +1698,38 @@ func toolSalesSummary(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg int
 }
 
 func toolListBankAccounts(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	// Balances come from the posted ledger over each account's linked GL
+	// account — bank_accounts.balance is a dead, never-ledger-synced column
+	// that must not be quoted as money (Moliya v2 invariant; audit C9).
+	// Unlinked bank accounts report 0 with a note instead of the dead column.
 	rows, err := h.db.Query(`
-		SELECT COALESCE(NULLIF(name,''), bank_name, ''), COALESCE(bank_name,''), COALESCE(account_number,''),
-		       COALESCE(currency,'UZS'), COALESCE(account_type,''), COALESCE(balance,0)
-		FROM bank_accounts
-		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2)
-		  AND COALESCE(is_active,true)=true
-		ORDER BY balance DESC`, tenantID, orgArg)
+		SELECT COALESCE(NULLIF(ba.name,''), ba.bank_name, ''), COALESCE(ba.bank_name,''),
+		       COALESCE(ba.account_number,''), COALESCE(ba.currency,'UZS'), COALESCE(ba.account_type,''),
+		       ba.account_id IS NOT NULL,
+		       COALESCE((
+		           SELECT SUM(l.debit_amount - l.credit_amount)
+		           FROM journal_entry_lines l
+		           JOIN journal_entries je ON je.id = l.journal_entry_id
+		               AND je.status = 'posted' AND je.deleted_at IS NULL
+		               AND ($2::uuid IS NULL OR je.organization_id = $2)
+		           WHERE l.account_id = ba.account_id
+		       ), 0)
+		FROM bank_accounts ba
+		WHERE ba.tenant_id=$1 AND ba.deleted_at IS NULL AND ($2::uuid IS NULL OR ba.organization_id=$2)
+		  AND COALESCE(ba.is_active,true)=true
+		ORDER BY 7 DESC`, tenantID, orgArg)
 	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
 		var name, bank, acct, cur, atype string
+		var linked bool
 		var bal float64
-		if r.Scan(&name, &bank, &acct, &cur, &atype, &bal) != nil {
+		if r.Scan(&name, &bank, &acct, &cur, &atype, &linked, &bal) != nil {
 			return nil, false
 		}
-		return gin.H{"name": name, "bank": bank, "account_number": acct, "currency": cur, "type": atype, "balance": bal}, true
+		item := gin.H{"name": name, "bank": bank, "account_number": acct, "currency": cur, "type": atype, "balance": bal}
+		if !linked {
+			item["note"] = "not linked to a GL account — ledger balance unavailable"
+		}
+		return item, true
 	})
 }
 
@@ -1758,12 +1812,12 @@ func toolGetContract(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg inte
 		return nil, fmt.Errorf("contract_number is required")
 	}
 	var (
-		id                                       uuid.UUID
-		title, vendor, direction, status, cur    string
-		value, effective, paid                   float64
-		start                                    interface{}
-		end, signed                              interface{}
-		respName                                 sql.NullString
+		id                                    uuid.UUID
+		title, vendor, direction, status, cur string
+		value, effective, paid                float64
+		start                                 interface{}
+		end, signed                           interface{}
+		respName                              sql.NullString
 	)
 	err := h.db.QueryRow(`
 		SELECT c.id, COALESCE(c.title,''), COALESCE(v.name, c.vendor_name, ''), COALESCE(c.direction,'expense'),
@@ -2066,16 +2120,20 @@ func toolListPayments(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg int
 func toolListQuotations(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	limit := argInt(args, "limit", 10, 50)
 	status := argStr(args, "status")
-	qry := `SELECT q.quotation_number, COALESCE(q.title,''), COALESCE(v.name,''), COALESCE(q.status,''),
-	               COALESCE(q.total_amount,0), q.quotation_date, q.expiry_date
-	        FROM quotations q LEFT JOIN contacts v ON v.id=q.contact_id
+	// Reads sales_quotations — the table create_quotation writes and the Savdo
+	// module uses. The legacy `quotations` table is a different register; the
+	// old read there meant the agent could never find its own quotations
+	// (audit C12).
+	qry := `SELECT q.quotation_number, '' AS title, COALESCE(q.customer_name, v.name, ''), COALESCE(q.status,''),
+	               COALESCE(q.total_amount,0), q.created_at, q.valid_until
+	        FROM sales_quotations q LEFT JOIN contacts v ON v.id=q.customer_id
 	        WHERE q.tenant_id=$1 AND q.deleted_at IS NULL AND ($2::uuid IS NULL OR q.organization_id=$2)`
 	qa := []interface{}{tenantID, orgArg}
 	if status != "" {
 		qry += " AND q.status=$3"
 		qa = append(qa, status)
 	}
-	qry += fmt.Sprintf(" ORDER BY q.quotation_date DESC NULLS LAST LIMIT %d", limit)
+	qry += fmt.Sprintf(" ORDER BY q.created_at DESC NULLS LAST LIMIT %d", limit)
 	rows, err := h.db.Query(qry, qa...)
 	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
 		var num, title, cust, st string
@@ -2329,6 +2387,8 @@ func toolListLeaveRequests(h *Handler, c *gin.Context, tenantID uuid.UUID, orgAr
 
 func toolListAttendance(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	limit := argInt(args, "limit", 15, 50)
+	// attendance_records has no organization_id column — tenant-only scope by
+	// schema (verified against information_schema, audit C16).
 	rows, err := h.db.Query(fmt.Sprintf(`
 		SELECT COALESCE(employee_name,''), date, clock_in, clock_out, COALESCE(status,''), COALESCE(department,'')
 		FROM attendance_records WHERE tenant_id=$1 AND deleted_at IS NULL
@@ -2799,4 +2859,176 @@ func toolConstructionStats(h *Handler, c *gin.Context, tenantID uuid.UUID, orgAr
 		"contract_total": contractTotal, "actual_total": actualTotal,
 		"overdue_projects": overdue, "top_budget_pressure": top,
 	}, nil
+}
+
+// ---- Vazifalar (kanban tasks) ---------------------------------------------
+
+func toolListTasks(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	limit := argInt(args, "limit", 20, 50)
+	board := argStr(args, "board")
+	status := argStr(args, "status")
+	assignee := argStr(args, "assignee")
+	overdue, _ := args["overdue"].(bool)
+
+	qry := `SELECT t.title, COALESCE(t.priority,'normal'), t.due_date,
+	               COALESCE(tc.name,''), tc.is_done_column, tb.name,
+	               COALESCE((SELECT string_agg(e.first_name || ' ' || e.last_name, ', ')
+	                         FROM task_assignees ta JOIN employees e ON e.id = ta.employee_id
+	                         WHERE ta.task_id = t.id), '')
+	        FROM tasks t
+	        JOIN task_boards tb ON tb.id = t.board_id AND tb.archived_at IS NULL
+	        JOIN task_columns tc ON tc.id = t.column_id
+	        WHERE t.tenant_id = $1 AND t.archived_at IS NULL
+	          AND ($2::uuid IS NULL OR tb.organization_id = $2)`
+	qa := []interface{}{tenantID, orgArg}
+	if board != "" {
+		qa = append(qa, "%"+board+"%")
+		qry += fmt.Sprintf(" AND tb.name ILIKE $%d", len(qa))
+	}
+	if status != "" {
+		qa = append(qa, "%"+status+"%")
+		qry += fmt.Sprintf(" AND tc.name ILIKE $%d", len(qa))
+	}
+	if assignee != "" {
+		qa = append(qa, "%"+assignee+"%")
+		qry += fmt.Sprintf(` AND EXISTS (SELECT 1 FROM task_assignees ta
+		        JOIN employees e ON e.id = ta.employee_id
+		        WHERE ta.task_id = t.id AND (e.first_name || ' ' || e.last_name) ILIKE $%d)`, len(qa))
+	}
+	if overdue {
+		qry += " AND t.due_date < CURRENT_DATE AND tc.is_done_column = false AND t.completed_at IS NULL"
+	}
+	qry += fmt.Sprintf(" ORDER BY t.due_date ASC NULLS LAST, t.created_at DESC LIMIT %d", limit)
+
+	rows, err := h.db.Query(qry, qa...)
+	return rowsToList(rows, err, func(r *sql.Rows) (gin.H, bool) {
+		var title, prio, col, boardName, assignees string
+		var done bool
+		var due interface{}
+		if r.Scan(&title, &prio, &due, &col, &done, &boardName, &assignees) != nil {
+			return nil, false
+		}
+		return gin.H{"title": title, "priority": prio, "due_date": due, "status": col,
+			"done": done, "board": boardName, "assignees": assignees}, true
+	})
+}
+
+// toolCreateTask mirrors CreateBoardTask's conventions: target column = the
+// board's first column, position = MAX+1 within the column, assignee must be a
+// live employee, and the create lands in task_activity.
+func toolCreateTask(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
+	title := strings.TrimSpace(argStr(args, "title"))
+	if title == "" {
+		return nil, fmt.Errorf("title is required")
+	}
+	priority := argStr(args, "priority")
+	if priority == "" {
+		priority = "normal"
+	}
+	if !boardTaskPriorities[priority] {
+		return nil, fmt.Errorf("invalid priority (low|normal|high|urgent)")
+	}
+
+	// Resolve board: by name, else the tenant's first live board.
+	boardName := argStr(args, "board")
+	var boardID uuid.UUID
+	var resolvedBoard string
+	var err error
+	if boardName != "" {
+		err = h.db.QueryRow(`SELECT id, name FROM task_boards
+		        WHERE tenant_id = $1 AND archived_at IS NULL AND name ILIKE $2
+		          AND ($3::uuid IS NULL OR organization_id = $3)
+		        ORDER BY created_at LIMIT 1`, tenantID, "%"+boardName+"%", orgArg).Scan(&boardID, &resolvedBoard)
+	} else {
+		err = h.db.QueryRow(`SELECT id, name FROM task_boards
+		        WHERE tenant_id = $1 AND archived_at IS NULL
+		          AND ($2::uuid IS NULL OR organization_id = $2)
+		        ORDER BY created_at LIMIT 1`, tenantID, orgArg).Scan(&boardID, &resolvedBoard)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("board topilmadi — avval Vazifalar bo'limida doska yarating")
+	}
+
+	var columnID uuid.UUID
+	var columnName string
+	if err := h.db.QueryRow(`SELECT id, name FROM task_columns
+	        WHERE board_id = $1 ORDER BY position LIMIT 1`, boardID).Scan(&columnID, &columnName); err != nil {
+		return nil, fmt.Errorf("doskada ustunlar yo'q")
+	}
+
+	var dueArg interface{}
+	if due := argStr(args, "due_date"); due != "" {
+		d, err := time.Parse("2006-01-02", due)
+		if err != nil {
+			return nil, fmt.Errorf("due_date formati noto'g'ri (YYYY-MM-DD)")
+		}
+		dueArg = d
+	}
+
+	// Optional assignee: must resolve to exactly one live employee.
+	var assigneeID uuid.UUID
+	var assigneeName string
+	if a := argStr(args, "assignee"); a != "" {
+		rows, err := h.db.Query(`SELECT id, first_name || ' ' || last_name FROM employees
+		        WHERE tenant_id = $1 AND deleted_at IS NULL
+		          AND (first_name || ' ' || last_name) ILIKE $2 LIMIT 2`, tenantID, "%"+a+"%")
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		matches := 0
+		for rows.Next() {
+			matches++
+			if matches == 1 {
+				if err := rows.Scan(&assigneeID, &assigneeName); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if matches == 0 {
+			return nil, fmt.Errorf("xodim topilmadi: %s", a)
+		}
+		if matches > 1 {
+			return nil, fmt.Errorf("bir nechta xodim mos keldi (%s) — aniqroq ism yozing", a)
+		}
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	taskID := uuid.New()
+	var createdBy interface{}
+	if userID != uuid.Nil {
+		createdBy = userID
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO tasks (id, tenant_id, board_id, column_id, title, description, priority,
+		                   due_date, position, created_by)
+		SELECT $1, $2, $3, $4, $5, NULLIF($6,''), $7, $8, COALESCE(MAX(position) + 1, 0), $9
+		FROM tasks WHERE column_id = $4
+	`, taskID, tenantID, boardID, columnID, title, argStr(args, "description"), priority, dueArg, createdBy); err != nil {
+		return nil, err
+	}
+	if assigneeID != uuid.Nil {
+		if _, err := tx.Exec(`INSERT INTO task_assignees (task_id, employee_id, tenant_id, assigned_by)
+		        VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`, taskID, assigneeID, tenantID, createdBy); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	h.logTaskActivity(tenantID, taskID, userID, "AI Yordamchi", "created",
+		nil, map[string]interface{}{"title": title, "via": "ai_agent"})
+
+	out := gin.H{"task_id": taskID, "title": title, "board": resolvedBoard,
+		"column": columnName, "priority": priority}
+	if assigneeName != "" {
+		out["assignee"] = assigneeName
+	}
+	return out, nil
 }

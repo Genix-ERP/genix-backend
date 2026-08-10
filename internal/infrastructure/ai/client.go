@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/config"
@@ -46,6 +47,11 @@ const (
 	ProviderLocal     Provider = "local"
 )
 
+// defaultAnthropicModel is used when the tenant/env config leaves the model
+// blank on the anthropic provider. claude-opus-5 is the current Opus-tier
+// model; older dated claude-3-* ids are retired and 404.
+const defaultAnthropicModel = "claude-opus-5"
+
 // Client represents an AI client interface
 type Client interface {
 	Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
@@ -64,15 +70,25 @@ type ChatRequest struct {
 	Tools       []Tool     `json:"tools,omitempty"`     // modern function/tool calling
 }
 
+// ImageAttachment is a base64 image attached to a user message (vision).
+// Rendered provider-specifically: Anthropic image blocks / OpenAI image_url
+// data URIs. Never serialized directly.
+type ImageAttachment struct {
+	MediaType  string `json:"-"` // e.g. image/jpeg, image/png, application/pdf
+	DataBase64 string `json:"-"`
+}
+
 // Message represents a chat message. For the agent loop it also carries an
 // assistant's tool_calls (when the model wants to call tools) and, on a tool
-// result message, the tool_call_id it answers.
+// result message, the tool_call_id it answers. Images may be attached to user
+// messages for vision requests.
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	Name       string     `json:"name,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role       string            `json:"role"`
+	Content    string            `json:"content"`
+	Name       string            `json:"name,omitempty"`
+	ToolCalls  []ToolCall        `json:"tool_calls,omitempty"`
+	ToolCallID string            `json:"tool_call_id,omitempty"`
+	Images     []ImageAttachment `json:"-"`
 }
 
 // Function represents a callable function's schema.
@@ -108,9 +124,11 @@ type ChatResponse struct {
 
 // Usage represents token usage
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens             int `json:"prompt_tokens"`
+	CompletionTokens         int `json:"completion_tokens"`
+	TotalTokens              int `json:"total_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 // FunctionCall represents a function call made by the AI
@@ -127,7 +145,11 @@ type StreamChunk struct {
 	FinishReason string `json:"finish_reason,omitempty"`
 }
 
-// OpenAIClient implements the Client interface for OpenAI
+// ==========================================================================
+// OpenAI client
+// ==========================================================================
+
+// OpenAIClient implements the Client interface for OpenAI-compatible endpoints.
 type OpenAIClient struct {
 	config     config.AIConfig
 	httpClient *http.Client
@@ -143,6 +165,40 @@ func NewOpenAIClient(cfg config.AIConfig) *OpenAIClient {
 	}
 }
 
+// openaiRenderMessage renders one Message. Plain messages keep the historical
+// {role, content} string shape; user messages with images become the vision
+// content-array shape.
+func openaiRenderMessage(msg Message) map[string]interface{} {
+	m := map[string]interface{}{"role": msg.Role}
+	if len(msg.Images) > 0 && msg.Role == "user" {
+		parts := make([]map[string]interface{}, 0, len(msg.Images)+1)
+		for _, img := range msg.Images {
+			parts = append(parts, map[string]interface{}{
+				"type": "image_url",
+				"image_url": map[string]interface{}{
+					"url": "data:" + img.MediaType + ";base64," + img.DataBase64,
+				},
+			})
+		}
+		if msg.Content != "" {
+			parts = append(parts, map[string]interface{}{"type": "text", "text": msg.Content})
+		}
+		m["content"] = parts
+	} else {
+		m["content"] = msg.Content
+	}
+	if msg.Name != "" {
+		m["name"] = msg.Name
+	}
+	if len(msg.ToolCalls) > 0 {
+		m["tool_calls"] = msg.ToolCalls
+	}
+	if msg.ToolCallID != "" {
+		m["tool_call_id"] = msg.ToolCallID
+	}
+	return m
+}
+
 // Chat sends a chat completion request to OpenAI
 func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	if req.Model == "" {
@@ -155,10 +211,14 @@ func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 		req.Temperature = c.config.Temperature
 	}
 
-	// Build OpenAI request
+	msgs := make([]map[string]interface{}, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		msgs = append(msgs, openaiRenderMessage(m))
+	}
+
 	openaiReq := map[string]interface{}{
 		"model":       req.Model,
-		"messages":    req.Messages,
+		"messages":    msgs,
 		"max_tokens":  req.MaxTokens,
 		"temperature": req.Temperature,
 	}
@@ -231,13 +291,12 @@ func (c *OpenAIClient) Chat(ctx context.Context, req *ChatRequest) (*ChatRespons
 	}, nil
 }
 
-// ChatStream sends a streaming chat request
+// ChatStream is a non-streaming fallback: it performs a blocking Chat and
+// emits the whole answer as one chunk. Real SSE streaming is not implemented.
 func (c *OpenAIClient) ChatStream(ctx context.Context, req *ChatRequest) (<-chan StreamChunk, error) {
 	req.Stream = true
 	ch := make(chan StreamChunk)
 
-	// Implementation would use SSE for streaming
-	// For now, return a simple implementation
 	go func() {
 		defer close(ch)
 		resp, err := c.Chat(ctx, req)
@@ -261,7 +320,12 @@ func (c *OpenAIClient) CountTokens(text string) int {
 	return len(text) / 4
 }
 
-// AnthropicClient implements the Client interface for Anthropic
+// ==========================================================================
+// Anthropic client
+// ==========================================================================
+
+// AnthropicClient implements the Client interface for Anthropic's Messages
+// API, including tool use (the agent loop), vision and prompt caching.
 type AnthropicClient struct {
 	config     config.AIConfig
 	httpClient *http.Client
@@ -277,41 +341,207 @@ func NewAnthropicClient(cfg config.AIConfig) *AnthropicClient {
 	}
 }
 
-// Chat sends a chat completion request to Anthropic
-func (c *AnthropicClient) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
-	if req.Model == "" {
-		req.Model = "claude-3-opus-20240229"
-	}
-	if req.MaxTokens == 0 {
-		req.MaxTokens = c.config.MaxTokens
-	}
+// anthropic wire types -----------------------------------------------------
 
-	// Convert messages to Anthropic format
-	var systemPrompt string
-	var messages []map[string]string
+type anthropicCacheControl struct {
+	Type string `json:"type"` // "ephemeral"
+}
 
-	for _, msg := range req.Messages {
-		if msg.Role == "system" {
-			systemPrompt = msg.Content
-			continue
+type anthropicTextBlock struct {
+	Type         string                 `json:"type"` // "text"
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+type anthropicTool struct {
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description"`
+	InputSchema  map[string]interface{} `json:"input_schema"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+// anthropicContentBlock is a request-side content block (only the fields we
+// emit; the union is discriminated by Type).
+type anthropicContentBlock struct {
+	Type string `json:"type"`
+	// text
+	Text string `json:"text,omitempty"`
+	// image
+	Source *anthropicImageSource `json:"source,omitempty"`
+	// tool_use
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Input json.RawMessage `json:"input,omitempty"`
+	// tool_result
+	ToolUseID string `json:"tool_use_id,omitempty"`
+	Content   string `json:"content,omitempty"`
+}
+
+type anthropicImageSource struct {
+	Type      string `json:"type"` // "base64"
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+type anthropicMessage struct {
+	Role    string                  `json:"role"` // "user" | "assistant"
+	Content []anthropicContentBlock `json:"content"`
+}
+
+type anthropicRequest struct {
+	Model     string               `json:"model"`
+	MaxTokens int                  `json:"max_tokens"`
+	System    []anthropicTextBlock `json:"system,omitempty"`
+	Messages  []anthropicMessage   `json:"messages"`
+	Tools     []anthropicTool      `json:"tools,omitempty"`
+}
+
+type anthropicResponse struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	Content []struct {
+		Type  string          `json:"type"`
+		Text  string          `json:"text"`
+		ID    string          `json:"id"`
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+	} `json:"content"`
+	StopReason string `json:"stop_reason"`
+	Usage      struct {
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	} `json:"usage"`
+}
+
+// buildAnthropicMessages translates the provider-neutral message list into
+// Anthropic's format:
+//   - "system" messages are collected into the top-level system param
+//   - assistant tool_calls become tool_use content blocks
+//   - "tool" result messages become tool_result blocks; consecutive tool
+//     results are merged into ONE user message (the API requires all results
+//     for a turn in the single following user message)
+//   - user images become image blocks before the text
+func buildAnthropicMessages(in []Message) (system []anthropicTextBlock, out []anthropicMessage) {
+	var pendingToolResults []anthropicContentBlock
+	flushToolResults := func() {
+		if len(pendingToolResults) > 0 {
+			out = append(out, anthropicMessage{Role: "user", Content: pendingToolResults})
+			pendingToolResults = nil
 		}
-		messages = append(messages, map[string]string{
-			"role":    msg.Role,
-			"content": msg.Content,
+	}
+
+	for _, msg := range in {
+		switch msg.Role {
+		case "system":
+			flushToolResults()
+			if strings.TrimSpace(msg.Content) != "" {
+				system = append(system, anthropicTextBlock{Type: "text", Text: msg.Content})
+			}
+		case "tool":
+			pendingToolResults = append(pendingToolResults, anthropicContentBlock{
+				Type:      "tool_result",
+				ToolUseID: msg.ToolCallID,
+				Content:   msg.Content,
+			})
+		case "assistant":
+			flushToolResults()
+			blocks := make([]anthropicContentBlock, 0, len(msg.ToolCalls)+1)
+			if strings.TrimSpace(msg.Content) != "" {
+				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: msg.Content})
+			}
+			for _, tc := range msg.ToolCalls {
+				input := json.RawMessage(tc.Function.Arguments)
+				if !json.Valid(input) || len(input) == 0 {
+					input = json.RawMessage("{}")
+				}
+				blocks = append(blocks, anthropicContentBlock{
+					Type:  "tool_use",
+					ID:    tc.ID,
+					Name:  tc.Function.Name,
+					Input: input,
+				})
+			}
+			if len(blocks) == 0 {
+				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: ""})
+			}
+			out = append(out, anthropicMessage{Role: "assistant", Content: blocks})
+		default: // "user"
+			flushToolResults()
+			blocks := make([]anthropicContentBlock, 0, len(msg.Images)+1)
+			for _, img := range msg.Images {
+				blocks = append(blocks, anthropicContentBlock{
+					Type: "image",
+					Source: &anthropicImageSource{
+						Type:      "base64",
+						MediaType: img.MediaType,
+						Data:      img.DataBase64,
+					},
+				})
+			}
+			if msg.Content != "" || len(blocks) == 0 {
+				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: msg.Content})
+			}
+			out = append(out, anthropicMessage{Role: "user", Content: blocks})
+		}
+	}
+	flushToolResults()
+	return system, out
+}
+
+// Chat sends a chat completion request to Anthropic's Messages API with full
+// tool-use support and prompt caching (breakpoints on the last tool and the
+// system prompt, so the stable prefix is cached across agent-loop iterations).
+func (c *AnthropicClient) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
+	model := req.Model
+	if model == "" {
+		model = c.config.Model
+	}
+	if model == "" {
+		model = defaultAnthropicModel
+	}
+	maxTokens := req.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = c.config.MaxTokens
+	}
+	if maxTokens == 0 {
+		maxTokens = 4096
+	}
+
+	system, messages := buildAnthropicMessages(req.Messages)
+
+	// Cache breakpoint 1: the last tool definition (tools render before
+	// system, so this caches the whole tool list).
+	tools := make([]anthropicTool, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		params := t.Function.Parameters
+		if params == nil {
+			params = map[string]interface{}{"type": "object"}
+		}
+		tools = append(tools, anthropicTool{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			InputSchema: params,
 		})
 	}
-
-	anthropicReq := map[string]interface{}{
-		"model":      req.Model,
-		"messages":   messages,
-		"max_tokens": req.MaxTokens,
+	if len(tools) > 0 {
+		tools[len(tools)-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+	}
+	// Cache breakpoint 2: the system prompt (caches tools + system together).
+	if len(system) > 0 {
+		system[len(system)-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
 	}
 
-	if systemPrompt != "" {
-		anthropicReq["system"] = systemPrompt
+	anthReq := anthropicRequest{
+		Model:     model,
+		MaxTokens: maxTokens,
+		System:    system,
+		Messages:  messages,
+		Tools:     tools,
 	}
 
-	body, err := json.Marshal(anthropicReq)
+	body, err := json.Marshal(anthReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
@@ -344,46 +574,59 @@ func (c *AnthropicClient) Chat(ctx context.Context, req *ChatRequest) (*ChatResp
 		return nil, fmt.Errorf("API error: %s - %s", resp.Status, string(bodyBytes))
 	}
 
-	var anthropicResp struct {
-		ID      string `json:"id"`
-		Model   string `json:"model"`
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
-		StopReason string `json:"stop_reason"`
-		Usage      struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&anthropicResp); err != nil {
+	var anthResp anthropicResponse
+	if err := json.NewDecoder(resp.Body).Decode(&anthResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	content := ""
-	if len(anthropicResp.Content) > 0 {
-		content = anthropicResp.Content[0].Text
+	var textParts []string
+	var toolCalls []ToolCall
+	for _, block := range anthResp.Content {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				textParts = append(textParts, block.Text)
+			}
+		case "tool_use":
+			args := "{}"
+			if len(block.Input) > 0 {
+				args = string(block.Input)
+			}
+			toolCalls = append(toolCalls, ToolCall{
+				ID:   block.ID,
+				Type: "function",
+				Function: FunctionCall{
+					Name:      block.Name,
+					Arguments: args,
+				},
+			})
+		}
+	}
+
+	msg := Message{
+		Role:      "assistant",
+		Content:   strings.Join(textParts, "\n"),
+		ToolCalls: toolCalls,
 	}
 
 	return &ChatResponse{
-		ID:    anthropicResp.ID,
-		Model: anthropicResp.Model,
-		Message: Message{
-			Role:    "assistant",
-			Content: content,
-		},
+		ID:      anthResp.ID,
+		Model:   anthResp.Model,
+		Message: msg,
 		Usage: Usage{
-			PromptTokens:     anthropicResp.Usage.InputTokens,
-			CompletionTokens: anthropicResp.Usage.OutputTokens,
-			TotalTokens:      anthropicResp.Usage.InputTokens + anthropicResp.Usage.OutputTokens,
+			PromptTokens:             anthResp.Usage.InputTokens,
+			CompletionTokens:         anthResp.Usage.OutputTokens,
+			TotalTokens:              anthResp.Usage.InputTokens + anthResp.Usage.OutputTokens,
+			CacheCreationInputTokens: anthResp.Usage.CacheCreationInputTokens,
+			CacheReadInputTokens:     anthResp.Usage.CacheReadInputTokens,
 		},
-		FinishReason: anthropicResp.StopReason,
+		FinishReason: anthResp.StopReason,
+		ToolCalls:    toolCalls,
 	}, nil
 }
 
-// ChatStream sends a streaming chat request
+// ChatStream is a non-streaming fallback: it performs a blocking Chat and
+// emits the whole answer as one chunk. Real SSE streaming is not implemented.
 func (c *AnthropicClient) ChatStream(ctx context.Context, req *ChatRequest) (<-chan StreamChunk, error) {
 	ch := make(chan StreamChunk)
 

@@ -512,6 +512,8 @@ func (h *Handler) CleanExpiredTenants(c *gin.Context) {
 	h.log.Info("CleanExpiredTenants completed",
 		"trial_expired", trialExpired, "sub_expired", subExpired,
 		"deactivated", deactivated, "deleted", deleted)
+	h.writePlatformAudit(c, "tenant.clean_expired", "tenant", "", nil, nil,
+		map[string]interface{}{"trial_expired": trialExpired, "sub_expired": subExpired, "deactivated": deactivated})
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":        true,

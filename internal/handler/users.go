@@ -946,8 +946,9 @@ func (h *Handler) ActivateTenantSubscription(c *gin.Context) {
 	}
 
 	var input struct {
-		PaidUsers int `json:"paid_users"`
-		Months    int `json:"months"`
+		PaidUsers int    `json:"paid_users"`
+		Months    int    `json:"months"`
+		PlanCode  string `json:"plan_code"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		response.BadRequest(c, "Invalid input")
@@ -959,6 +960,10 @@ func (h *Handler) ActivateTenantSubscription(c *gin.Context) {
 	if input.Months < 1 {
 		input.Months = 1
 	}
+	// F2: use the chosen plan from the catalog instead of hardcoding 'professional'.
+	if input.PlanCode == "" {
+		input.PlanCode = "professional"
+	}
 
 	now := time.Now()
 	endDate := now.AddDate(0, input.Months, 0)
@@ -966,14 +971,14 @@ func (h *Handler) ActivateTenantSubscription(c *gin.Context) {
 	_, err = h.db.Exec(`
 		UPDATE tenants
 		SET subscription_status = 'active',
-		    subscription_plan = 'professional',
+		    subscription_plan = $4,
 		    paid_users = $1,
 		    is_active = true,
 		    trial_ends_at = NULL,
 		    account_clear_at = $2,
 		    updated_at = NOW()
 		WHERE id = $3
-	`, input.PaidUsers, endDate, tenantID)
+	`, input.PaidUsers, endDate, tenantID, input.PlanCode)
 	if err != nil {
 		h.log.Error("Failed to activate tenant subscription", "error", err)
 		response.InternalServerError(c, "Failed to activate subscription")
@@ -981,6 +986,11 @@ func (h *Handler) ActivateTenantSubscription(c *gin.Context) {
 	}
 
 	h.log.Info("Tenant subscription manually activated", "tenant_id", tenantID, "paid_users", input.PaidUsers, "months", input.Months, "ends_at", endDate)
+	h.writePlatformAudit(c, "tenant.activate", "tenant", tenantID.String(), &tenantID, nil,
+		map[string]interface{}{
+			"subscription_status": "active", "subscription_plan": input.PlanCode,
+			"paid_users": input.PaidUsers, "months": input.Months, "account_clear_at": endDate,
+		})
 	response.Success(c, gin.H{
 		"message":    "Subscription activated",
 		"paid_users": input.PaidUsers,
@@ -1214,6 +1224,9 @@ func (h *Handler) DeleteSystemUser(c *gin.Context) {
 	}
 
 	h.log.Info("System admin deleted user", "deleted_user_id", parsedID, "email", email)
+	h.writePlatformAudit(c, "user.delete", "user", parsedID.String(), nil,
+		map[string]interface{}{"email": email, "is_active": true},
+		map[string]interface{}{"deleted_at": now, "is_active": false})
 
 	response.Success(c, map[string]interface{}{
 		"message": "User deleted successfully",

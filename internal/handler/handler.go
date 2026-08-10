@@ -89,8 +89,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		// Protected routes (authentication required)
 		protected := v1.Group("")
 		protected.Use(middleware.Auth(h.jwtManager))
+		// Read-only support impersonation (tex_podderjka) may never mutate tenant
+		// data — reject non-GET requests carrying a read-only impersonation token.
+		protected.Use(middleware.BlockReadOnlyImpersonationMutations())
 		protected.Use(middleware.TenantResolver())
-		protected.Use(middleware.OrganizationResolver())
+		protected.Use(middleware.OrganizationResolver(h.db))
 		protected.Use(middleware.TrialCheck(h.db))
 		h.registerProtectedRoutes(protected)
 	}
@@ -120,6 +123,10 @@ func (h *Handler) registerPublicRoutes(rg *gin.RouterGroup) {
 		auth.GET("/validate-invite", h.ValidateInvite) // Public - validate invite token
 		auth.POST("/accept-invite", h.AcceptInvite)    // Public - accept invite and set password
 	}
+
+	// Platform (control-plane) staff login — separate identity (platform_users),
+	// issues a platform-scoped token. Public endpoint (validates credentials).
+	rg.POST("/platform/auth/login", h.PlatformLogin)
 
 	// Public info
 	rg.GET("/info", h.GetAPIInfo)
@@ -1603,6 +1610,13 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// confirmation (executed via /ai/agent/execute after user approval).
 		ai.POST("/agent", h.AIAgentChat)
 		ai.POST("/agent/execute", h.AIAgentExecute)
+		// Agent catalog + Agent Studio (per-module agents; settings are
+		// tenant-admin-gated like the AI provider settings).
+		ai.GET("/agents", h.ListAIAgents)
+		ai.PUT("/agents/:key", h.perm.Require("settings", "tenant", "update"), h.UpdateAIAgentSettings)
+		ai.GET("/actions", h.perm.Require("settings", "tenant", "read"), h.ListAIActionLog)
+		// Voice input: server-side Whisper proxy (openai provider required).
+		ai.POST("/transcribe", h.TranscribeAudio)
 		ai.GET("/conversations", h.ListAIConversations)
 		ai.POST("/conversations", h.CreateAIConversation)
 		ai.GET("/conversations/:id", h.GetAIConversation)
@@ -1699,12 +1713,39 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	admin := rg.Group("/admin")
 	admin.Use(middleware.RequireSystemAdmin())
 	{
-		admin.GET("/users", h.ListAllSystemUsers)
-		admin.GET("/tenants", h.ListAllTenants)
-		admin.GET("/tenants/:id", h.GetTenantDetails)
-		admin.PUT("/tenants/:id/activate", h.ActivateTenantSubscription)
-		admin.DELETE("/users/:id", h.DeleteSystemUser)
-		admin.POST("/clean-expired-tenants", h.CleanExpiredTenants)
+		// Company registry (view).
+		admin.GET("/users", middleware.RequireCapability(middleware.CapCompanyView), h.ListAllSystemUsers)
+		admin.GET("/tenants", middleware.RequireCapability(middleware.CapCompanyView), h.ListAllTenants)
+		admin.GET("/tenants/:id", middleware.RequireCapability(middleware.CapCompanyView), h.GetTenantDetails)
+		// SaaS overview (platform-wide aggregates + MRR) — fixes the client-side stats bug.
+		admin.GET("/stats", middleware.RequireCapability(middleware.CapCompanyView), h.GetPlatformStats)
+
+		// Onboarding — "Yangi kompaniya ochish".
+		admin.POST("/tenants", middleware.RequireCapability(middleware.CapCompanyCreate), h.CreatePlatformTenant)
+
+		// Subscription / lifecycle.
+		admin.PUT("/tenants/:id/activate", middleware.RequireCapability(middleware.CapSubscription), h.ActivateTenantSubscription)
+		admin.PUT("/tenants/:id/status", middleware.RequireCapability(middleware.CapCompanyBlock), h.SetTenantStatus)
+		admin.POST("/clean-expired-tenants", middleware.RequireCapability(middleware.CapSubscription), h.CleanExpiredTenants)
+
+		// Plan catalog.
+		admin.GET("/plans", middleware.RequireCapability(middleware.CapCompanyView), h.ListPlatformPlans)
+		admin.PUT("/plans/:code", middleware.RequireCapability(middleware.CapPlansEdit), h.UpsertPlatformPlan)
+
+		// Impersonation (capability checked inside the handler: full vs read-only).
+		admin.POST("/impersonate", h.Impersonate)
+
+		// Platform staff management (super_admin only).
+		admin.GET("/platform-users", middleware.RequireCapability(middleware.CapPlatformUserMgmt), h.ListPlatformUsers)
+		admin.POST("/platform-users", middleware.RequireCapability(middleware.CapPlatformUserMgmt), h.CreatePlatformUser)
+		admin.PUT("/platform-users/:id", middleware.RequireCapability(middleware.CapPlatformUserMgmt), h.UpdatePlatformUser)
+		admin.DELETE("/platform-users/:id", middleware.RequireCapability(middleware.CapPlatformUserMgmt), h.DeletePlatformUser)
+
+		// Current platform user + capabilities, and the read-only role matrix.
+		admin.GET("/platform/me", h.GetPlatformMe)
+		admin.GET("/role-matrix", h.GetRoleMatrix)
+
+		admin.DELETE("/users/:id", middleware.RequireCapability(middleware.CapCompanyBlock), h.DeleteSystemUser)
 
 		// Mobile app version gate — global config (one app for all tenants),
 		// managed from Settings → "Mobile App". Read/write is system-admin only
@@ -1724,6 +1765,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// Use to pinpoint which org / product is driving any gap.
 		// Read-only, system-admin gated by the parent group.
 		admin.GET("/inventory-reconcile", h.GetInventoryReconcile)
+
+		// /admin/audit-log — append-only platform super-admin audit trail
+		// (SEC-05). Shown in the panel under Sozlamalar → Audit. Read-only,
+		// system-admin gated by the parent group.
+		admin.GET("/audit-log", h.ListPlatformAuditLog)
 	}
 
 	// Audit Logs

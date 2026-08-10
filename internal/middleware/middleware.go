@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/config"
@@ -311,14 +312,47 @@ func TenantResolver() gin.HandlerFunc {
 	}
 }
 
-// OrganizationResolver middleware resolves organization from header
-func OrganizationResolver() gin.HandlerFunc {
+// orgTenantCache caches verified org→tenant memberships ("orgID|tenantID").
+// Membership never changes for a live org (orgs don't move between tenants),
+// so positive results are safe to cache for the process lifetime.
+var orgTenantCache sync.Map
+
+// OrganizationResolver middleware resolves the organization from the
+// X-Organization-ID header. The header is client-supplied, so the org must
+// belong to the caller's tenant — otherwise a forged header would stamp
+// writes with a foreign organization_id (AI audit 2026-08-10). A mismatched
+// header is IGNORED (treated as "no active organization") rather than
+// rejected, so a stale header after a tenant switch degrades gracefully.
+func OrganizationResolver(db *database.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		orgID := c.GetHeader("X-Organization-ID")
-		if orgID != "" {
-			if _, err := uuid.Parse(orgID); err == nil {
-				c.Set(ContextKeyOrganizationID, orgID)
-			}
+		if orgID == "" {
+			c.Next()
+			return
+		}
+		if _, err := uuid.Parse(orgID); err != nil {
+			c.Next()
+			return
+		}
+		tenantID := c.GetString(ContextKeyTenantID)
+		if tenantID == "" || db == nil {
+			c.Next()
+			return
+		}
+		cacheKey := orgID + "|" + tenantID
+		if _, ok := orgTenantCache.Load(cacheKey); ok {
+			c.Set(ContextKeyOrganizationID, orgID)
+			c.Next()
+			return
+		}
+		var one int
+		err := db.QueryRow(
+			`SELECT 1 FROM organizations WHERE id = $1 AND tenant_id = $2`,
+			orgID, tenantID,
+		).Scan(&one)
+		if err == nil {
+			orgTenantCache.Store(cacheKey, struct{}{})
+			c.Set(ContextKeyOrganizationID, orgID)
 		}
 		c.Next()
 	}
@@ -810,6 +844,18 @@ func RequireSystemAdmin() gin.HandlerFunc {
 
 		jwtClaims, ok := claims.(*crypto.Claims)
 		if !ok || !jwtClaims.IsSystemAdmin {
+			response.Forbidden(c, "System administrator access required")
+			c.Abort()
+			return
+		}
+
+		// SEC-03 (docs/admin-panel/audit.md): defence-in-depth on the single
+		// admin choke point. A platform-admin token carries the platform scope;
+		// a tenant token carries the tenant scope. Reject anything explicitly
+		// scoped to the tenant plane even if the isa flag were somehow set.
+		// Legacy tokens minted before the scope field existed carry an empty
+		// scope and are still accepted (transition window).
+		if jwtClaims.Scope == crypto.ScopeTenant {
 			response.Forbidden(c, "System administrator access required")
 			c.Abort()
 			return

@@ -109,9 +109,16 @@ func (h *Handler) RegisterTenderRoutes(r *gin.Engine) {
 	// =============================================
 	// ADMIN ROUTES
 	// =============================================
+	// SEC-01 (docs/admin-panel/audit.md): this group administers the WHOLE
+	// tender platform (verify companies, change roles, dump every company's
+	// INN/phone, CRUD the catalog). It previously ran behind middleware.Auth
+	// only — the role check below was commented out — so any authenticated
+	// JWT, including a lowest-privilege ERP tenant user (both planes share one
+	// signing key + Auth middleware), could administer it. Gate it on the
+	// platform super-admin flag (is_system_admin). A finer-grained tender-admin
+	// role can be layered on later without reopening the hole.
 	admin := protected.Group("/admin")
-	// Note: In production, add admin role check middleware here
-	// admin.Use(h.perm.Require("tender", "admin", "read"))
+	admin.Use(middleware.RequireSystemAdmin())
 	{
 		admin.GET("/stats", h.TenderAdminDashboard)
 		admin.GET("/users", h.TenderAdminListUsers)
