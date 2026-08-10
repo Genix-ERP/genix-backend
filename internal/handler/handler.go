@@ -1251,6 +1251,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		// resolves it ahead of the /:id param route below.
 		payments.POST("/register", h.perm.Require("finance", "payment", "create"), h.RegisterPartnerPayment)
 		payments.GET("/partner-balances", h.GetPartnerBalances)
+		// One level below an existing static node, so it introduces no new
+		// static-vs-param ambiguity beyond the /payments/summary vs
+		// /payments/:id pattern this router already resolves.
+		payments.GET("/partner-balances/summary", h.GetPartnerBalancesSummary)
 		payments.GET("/partner-ledger", h.GetPartnerLedger)
 		payments.POST("/reconcile", h.perm.Require("finance", "payment", "update"), h.ReconcilePartnerCredit)
 		payments.GET("/:id", h.GetPayment)

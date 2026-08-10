@@ -10,6 +10,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -326,17 +327,20 @@ func partnerDocConfig(direction string) (invTable, contactCol, payType, docType 
 // GetPartnerBalances returns, per customer or vendor, their invoiced / paid /
 // due totals plus any unallocated payment credit (Odoo-style partner list).
 // Query: ?direction=customer|vendor
-func (h *Handler) GetPartnerBalances(c *gin.Context) {
-	tenantID, ok := middleware.GetTenantID(c)
-	if !ok || tenantID == uuid.Nil {
-		response.Unauthorized(c, "Tenant not found")
-		return
-	}
+// partnerBalancesQuery builds the filtered CTE that the list, its count and
+// the summary all run over.
+//
+// One builder rather than three copies: the summary must narrow with exactly
+// the same filters as the rows, or the cards report totals for a set the user
+// is not looking at. Returns the query without ORDER BY (callers append it),
+// its argument list, and a message when the request itself is invalid.
+func partnerBalancesQuery(c *gin.Context, tenantID uuid.UUID) (string, []interface{}, string) {
 	orgID, _ := middleware.GetOrganizationID(c)
 	var orgArg interface{}
 	if orgID != uuid.Nil {
 		orgArg = orgID
 	}
+
 	// direction kontrakti (test_30): faqat customer/vendor (bo'sh = customer);
 	// noto'g'ri qiymat jimgina customer bo'lib ketmasin — 400.
 	direction := c.Query("direction")
@@ -345,10 +349,36 @@ func (h *Handler) GetPartnerBalances(c *gin.Context) {
 		direction = "customer"
 	case "vendor":
 	default:
-		response.BadRequest(c, "direction must be 'customer' or 'vendor'")
-		return
+		return "", nil, "direction must be 'customer' or 'vendor'"
 	}
 	invTable, contactCol, payType, _ := partnerDocConfig(direction)
+
+	// Partner-name search. nil becomes SQL NULL, matching how orgArg is
+	// handled above, so the predicate is a no-op when nothing was asked for
+	// and there is one query rather than two.
+	//
+	// c.name only. The web screen searches the same single field
+	// (Reconcile.jsx), and widening this to phone or INN here alone would mean
+	// the same query returns different partners depending on which app asked.
+	// If it should cover more, all three change together.
+	//
+	// Caller-supplied % and _ stay meaningful as wildcards — matching the
+	// other ILIKE searches in this codebase rather than inventing an escaping
+	// rule that holds in one endpoint only.
+	var searchArg interface{}
+	if s := strings.TrimSpace(c.Query("search")); s != "" {
+		searchArg = "%" + s + "%"
+	}
+
+	// Partners that can actually be reconciled: money owed AND unused credit
+	// sitting against the same contact.
+	//
+	// The 0.001 threshold is fixed by the clients, not chosen here: the mobile
+	// card draws its "SOLISHTIRISH MUMKIN" badge at exactly this cutoff. A
+	// different threshold on either side means ticking the filter makes a
+	// badged row disappear from the list — an inconsistency the user sees
+	// directly, on the same screen, in the same moment.
+	onlyReconcilable := c.Query("only_reconcilable") == "true"
 
 	q := fmt.Sprintf(`
 		WITH inv AS (
@@ -378,26 +408,57 @@ func (h *Handler) GetPartnerBalances(c *gin.Context) {
 		LEFT JOIN inv ON inv.cid=c.id
 		LEFT JOIN pay ON pay.cid=c.id
 		WHERE c.tenant_id=$1 AND (inv.cid IS NOT NULL OR pay.cid IS NOT NULL)
-		-- c.id is the tiebreaker, and it is not cosmetic. Ordering by
-		-- (due, name) alone is not a total order: two contacts with the same
-		-- due and the same name — duplicate contacts do occur in real books —
-		-- have an order Postgres is free to choose, and it may choose
-		-- differently for the LIMIT/OFFSET of page 1 than for page 2. One
-		-- partner then appears on both pages and another appears on neither.
-		-- Nothing errors and nothing is logged; a row simply goes missing.
-		ORDER BY COALESCE(inv.due,0) DESC, name ASC, c.id ASC`, contactCol, invTable, contactCol)
+		  AND ($4::text IS NULL OR c.name ILIKE $4)
+		  AND ($5::bool IS NOT TRUE OR (
+		        COALESCE(inv.due,0) > 0.001
+		        AND GREATEST(COALESCE(pay.ptotal,0)-COALESCE(pay.allocated,0),0) > 0.001
+		      ))`, contactCol, invTable, contactCol)
+
+	return q, []interface{}{tenantID, orgArg, payType, searchArg, onlyReconcilable}, ""
+}
+
+// partnerBalancesOrder is appended for the row list only. It is deliberately
+// not part of partnerBalancesQuery: COUNT and SUM do not need it, and a
+// subquery carrying an ORDER BY invites someone to assume the aggregate
+// respects it.
+//
+// c.id is the tiebreaker, and it is not cosmetic. Ordering by (due, name)
+// alone is not a total order: two contacts with the same due and the same name
+// — duplicate contacts do occur in real books — have an order Postgres is free
+// to choose, and it may choose differently for the LIMIT/OFFSET of page 1 than
+// for page 2. One partner then appears on both pages and another appears on
+// neither. Nothing errors and nothing is logged; a row simply goes missing.
+const partnerBalancesOrder = `
+		ORDER BY COALESCE(inv.due,0) DESC, name ASC, c.id ASC`
+
+func (h *Handler) GetPartnerBalances(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	q, args, errMsg := partnerBalancesQuery(c, tenantID)
+	if errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
 
 	// Opt-in paging. One row per contact that has ever been invoiced or paid,
 	// so this grows with the customer/vendor book and never shrinks.
-	args := []interface{}{tenantID, orgArg, payType}
+	//
+	// Opt-in is a contract, not a default worth revisiting: the web screen
+	// calls this with no page parameters and expects a bare array. Making
+	// paging mandatory would silently truncate it to the first page.
 	paginate, page, pageSize, offset := optPagination(c)
-	pagedQ := q
+	pagedQ := q + partnerBalancesOrder
+	pagedArgs := args
 	if paginate {
-		pagedQ += " LIMIT $4 OFFSET $5"
-		args = append(args, pageSize, offset)
+		pagedQ += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		pagedArgs = append(append([]interface{}{}, args...), pageSize, offset)
 	}
 
-	rows, err := h.db.Query(pagedQ, args...)
+	rows, err := h.db.Query(pagedQ, pagedArgs...)
 	if err != nil {
 		h.log.Error("partner balances", "error", err)
 		response.InternalError(c, "Failed to load partner balances")
@@ -423,12 +484,66 @@ func (h *Handler) GetPartnerBalances(c *gin.Context) {
 
 	total := 0
 	// Counting over the CTE query itself keeps the count and the page in exact
-	// agreement; re-deriving the same filters by hand is how they drift apart.
-	if err := h.db.QueryRow(`SELECT COUNT(*) FROM (`+q+`) sub`, tenantID, orgArg, payType).Scan(&total); err != nil {
+	// agreement — including the search and only_reconcilable filters, which are
+	// inside q. A count that ignored them would leave has_next permanently
+	// true and a paginating client scrolling through empty pages forever.
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM (`+q+`) sub`, args...).Scan(&total); err != nil {
 		h.log.Error("Failed to count partner balances", "error", err)
 		total = len(out)
 	}
 	response.Paginated(c, out, page, pageSize, total)
+}
+
+// GetPartnerBalancesSummary godoc
+// @Summary Totals for the Solishtirish summary cards
+// @Tags Payments
+// @Produce json
+// @Success 200 {object} response.Response
+// @Security BearerAuth
+// @Router /payments/partner-balances/summary [get]
+//
+// Accepts the same direction/search/only_reconcilable filters as the list, and
+// must: the cards sit above the rows, so a summary that ignored the search
+// would report one set of totals over a different set of rows. A paginating
+// client cannot compute these itself without summing only the pages it has
+// loaded — which is what the mobile app was doing, producing totals that grew
+// as the user scrolled.
+func (h *Handler) GetPartnerBalancesSummary(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	q, args, errMsg := partnerBalancesQuery(c, tenantID)
+	if errMsg != "" {
+		response.BadRequest(c, errMsg)
+		return
+	}
+
+	// The sub-select names its columns positionally, so the aggregate refers to
+	// them by the aliases the inner SELECT assigns.
+	var totalDue, totalCredit float64
+	var reconcilableCount, partnerCount int
+	err := h.db.QueryRow(`
+		SELECT COALESCE(SUM(due),0),
+		       COALESCE(SUM(credit),0),
+		       COUNT(*) FILTER (WHERE due > 0.001 AND credit > 0.001),
+		       COUNT(*)
+		FROM (`+q+`) sub(contact_id, name, invoiced, paid, due, credit)`, args...).
+		Scan(&totalDue, &totalCredit, &reconcilableCount, &partnerCount)
+	if err != nil {
+		h.log.Error("Failed to summarise partner balances", "error", err)
+		response.InternalError(c, "Failed to summarise partner balances")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"total_due":          totalDue,
+		"total_credit":       totalCredit,
+		"reconcilable_count": reconcilableCount,
+		"partner_count":      partnerCount,
+	})
 }
 
 // GetPartnerLedger returns one partner's open invoices/bills, their available
