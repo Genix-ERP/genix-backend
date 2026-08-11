@@ -2561,7 +2561,10 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			WHERE sales_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND status != 'cancelled'`,
 			orderID, tenantID).Scan(&existingInvoiceCount)
 		if existingInvoiceCount > 0 {
-			response.BadRequest(c, "An invoice already exists for this order (use ?basis=delivered for partial invoicing)")
+			// Same flow, same rule as the delivered-basis refusals below:
+			// user-facing text is Uzbek, and no query-string advice — the
+			// ?basis=delivered hint meant nothing to the person reading it.
+			response.BadRequest(c, "Bu buyurtma uchun hisob-faktura allaqachon mavjud")
 			return
 		}
 	}
@@ -2697,6 +2700,9 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		LineTotal   float64
 	}
 	var invoiceLineInfos []invoiceLineInfo
+	// Summed during the scan so the delivered-basis refusal below can say
+	// WHICH of its two causes applies instead of one English catch-all.
+	var totalDelivered, totalInvoiced float64
 
 	linesRows, err := tx.Query(`
 		SELECT sol.id, sol.line_number, sol.product_id, COALESCE(NULLIF(sol.description, ''), p.name) as description,
@@ -2717,6 +2723,8 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 				continue
 			}
 			if deliveredBasis {
+				totalDelivered += qtyDelivered
+				totalInvoiced += qtyInvoiced
 				qtyToInvoice := qtyDelivered - qtyInvoiced
 				if qtyToInvoice <= 0.0001 {
 					continue
@@ -2737,7 +2745,16 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 	if deliveredBasis {
 		if len(invoiceLineInfos) == 0 {
-			response.BadRequest(c, "Nothing delivered and uninvoiced on this order")
+			// User-facing refusals in this flow are Uzbek (the same toast shows
+			// "To'lov qayd etilmadi — ..."); this one had shipped in English.
+			// The single catch-all also hid which of two very different
+			// situations the user was in — nothing shipped yet, versus
+			// everything shipped already invoiced — so say the right one.
+			if totalDelivered <= 0.0001 {
+				response.BadRequest(c, "Bu buyurtmada hali hech narsa yetkazib berilmagan — avval yetkazib berishni tasdiqlang")
+			} else {
+				response.BadRequest(c, "Yetkazib berilganlarning hammasi allaqachon hisob-faktura qilingan")
+			}
 			return
 		}
 		// Delivered-basis invoices carry LINE amounts only: header discount and
