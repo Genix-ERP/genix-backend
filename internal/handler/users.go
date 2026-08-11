@@ -1158,11 +1158,14 @@ func (h *Handler) GetTenantDetails(c *gin.Context) {
 		PS          *string   `json:"ps,omitempty"`
 		ReceiptURL  *string   `json:"receipt_url,omitempty"`
 		PaymentTime *string   `json:"payment_time,omitempty"`
+		Method      string    `json:"method"`
+		Note        string    `json:"note,omitempty"`
 		CreatedAt   time.Time `json:"created_at"`
 	}
 	payments := []PaymentRow{}
 	prows, err := h.db.Query(`
-		SELECT id, plan, amount_uzs, status, invoice_id, card_pan, ps, receipt_url, payment_time, created_at
+		SELECT id, plan, amount_uzs, status, invoice_id, card_pan, ps, receipt_url, payment_time, created_at,
+		       COALESCE(method, 'multicard'), COALESCE(note, '')
 		FROM subscription_payments
 		WHERE tenant_id = $1
 		ORDER BY created_at DESC LIMIT 200`, tenantID)
@@ -1171,7 +1174,7 @@ func (h *Handler) GetTenantDetails(c *gin.Context) {
 		for prows.Next() {
 			var p PaymentRow
 			var card, ps, rurl, pt sql.NullString
-			if err := prows.Scan(&p.ID, &p.Plan, &p.AmountUZS, &p.Status, &p.InvoiceID, &card, &ps, &rurl, &pt, &p.CreatedAt); err == nil {
+			if err := prows.Scan(&p.ID, &p.Plan, &p.AmountUZS, &p.Status, &p.InvoiceID, &card, &ps, &rurl, &pt, &p.CreatedAt, &p.Method, &p.Note); err == nil {
 				if card.Valid {
 					p.CardPan = &card.String
 				}
