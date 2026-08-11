@@ -76,7 +76,9 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 		LEFT JOIN currencies cur ON cur.id = po.currency_id
 		WHERE po.tenant_id = $1 AND po.deleted_at IS NULL
 	`
-	countQuery := `SELECT COUNT(*) FROM purchase_orders po WHERE po.tenant_id = $1 AND po.deleted_at IS NULL`
+	// The search filter below references c.name, so the count query needs the
+	// same contacts join (contacts.id is unique — the join can't multiply rows).
+	countQuery := `SELECT COUNT(*) FROM purchase_orders po LEFT JOIN contacts c ON po.vendor_id = c.id WHERE po.tenant_id = $1 AND po.deleted_at IS NULL`
 
 	args := []interface{}{tenantID}
 	argCount := 1
@@ -272,6 +274,16 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		h.log.Error("Failed to verify vendor", "error", err)
 		response.InternalError(c, "Failed to create purchase order")
 		return
+	}
+
+	// purchase_order_lines.product_id is NOT NULL — reject bad lines before the
+	// header INSERT (which runs outside the line tx) so they can't 500 mid-create
+	// and leak an orphaned zero-line draft.
+	for i, line := range input.Lines {
+		if _, perr := uuid.Parse(line.ProductID); perr != nil {
+			response.BadRequest(c, fmt.Sprintf("Line %d: product_id is required", i+1))
+			return
+		}
 	}
 
 	id := uuid.New()
@@ -489,10 +501,21 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		return
 	}
 
+	// The header row above lives outside the line tx; if anything below fails,
+	// delete it so we don't leak an orphaned zero-line draft. Callers must roll
+	// back the tx first — the uncommitted lines FK-reference the header, so the
+	// DELETE would otherwise block on our own transaction.
+	cleanupHeader := func() {
+		if _, delErr := h.db.Exec(`DELETE FROM purchase_orders WHERE id = $1`, id); delErr != nil {
+			h.log.Error("Failed to clean up orphaned purchase order header", "error", delErr, "po_id", id)
+		}
+	}
+
 	// Transaction now covers line-item inserts only.
 	tx, err := h.db.Begin()
 	if err != nil {
 		h.log.Error("Failed to start transaction", "error", err)
+		cleanupHeader()
 		response.InternalError(c, "Failed to create purchase order")
 		return
 	}
@@ -558,6 +581,8 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		)
 		if err != nil {
 			h.log.Error("Failed to insert purchase order line", "error", err)
+			tx.Rollback()
+			cleanupHeader()
 			response.InternalError(c, "Failed to create purchase order")
 			return
 		}
@@ -586,6 +611,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 
 	if err = tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
+		cleanupHeader()
 		response.InternalError(c, "Failed to create purchase order")
 		return
 	}
