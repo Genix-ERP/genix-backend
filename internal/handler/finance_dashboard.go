@@ -332,15 +332,7 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 		       COUNT(*) FILTER (WHERE due > 0.005),
 		       COALESCE(SUM(overdue) FILTER (WHERE overdue > 0.005), 0),
 		       COUNT(*) FILTER (WHERE overdue > 0.005)
-		FROM (
-		    SELECT SUM(amount_due) AS due,
-		           SUM(CASE WHEN due_date < CURRENT_DATE THEN amount_due ELSE 0 END) AS overdue
-		    FROM sales_invoices
-		    WHERE tenant_id = $1 AND deleted_at IS NULL
-		      AND customer_id IS NOT NULL
-		      AND status NOT IN ('draft', 'cancelled', 'void')`+orgFilterInv+`
-		    GROUP BY customer_id
-		) p
+		FROM (`+partnerNetDue("sales_invoices", "customer_id", "", orgFilterInv)+`) p
 	`, invArgs...).Scan(&arTotal, &arPartners, &arOverdue, &arOverduePartners)
 
 	var apTotal, apOverdue float64
@@ -350,15 +342,7 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 		       COUNT(*) FILTER (WHERE due > 0.005),
 		       COALESCE(SUM(overdue) FILTER (WHERE overdue > 0.005), 0),
 		       COUNT(*) FILTER (WHERE overdue > 0.005)
-		FROM (
-		    SELECT SUM(amount_due) AS due,
-		           SUM(CASE WHEN due_date < CURRENT_DATE THEN amount_due ELSE 0 END) AS overdue
-		    FROM purchase_invoices
-		    WHERE tenant_id = $1 AND deleted_at IS NULL
-		      AND vendor_id IS NOT NULL
-		      AND status NOT IN ('draft', 'cancelled', 'void')`+orgFilterInv+`
-		    GROUP BY vendor_id
-		) p
+		FROM (`+partnerNetDue("purchase_invoices", "vendor_id", "", orgFilterInv)+`) p
 	`, invArgs...).Scan(&apTotal, &apPartners, &apOverdue, &apOverduePartners)
 
 	response.Success(c, gin.H{

@@ -2482,11 +2482,15 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 	// 4. Debtors / Creditors — open invoices minus payments (amount_due),
 	//    the same computation as AR/AP aging. contacts.current_balance was
 	//    a third balance store that could drift (docs/moliya-audit.md §2.7).
+	// Netted per partner within each organization, then summed — the same
+	// definition the finance dashboard card uses (debt_definition.go). The
+	// previous `amount_due > 0` filtered invoice by invoice, so an overpaid
+	// invoice was dropped instead of offsetting what the same customer still
+	// owed, and the director's figure exceeded the finance panel's for the
+	// same tenant.
 	cRows, err := h.db.Query(`
-		SELECT organization_id, COALESCE(SUM(amount_due), 0)
-		FROM sales_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
-		  AND status NOT IN ('draft', 'cancelled', 'void') AND amount_due > 0
+		SELECT organization_id, COALESCE(SUM(due) FILTER (WHERE due > 0.005), 0)
+		FROM (`+partnerNetDue("sales_invoices", "customer_id", "organization_id", " AND organization_id IS NOT NULL")+`) p
 		GROUP BY organization_id`,
 		tenantID,
 	)
@@ -2504,10 +2508,8 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		cRows.Close()
 	}
 	crRows, err := h.db.Query(`
-		SELECT organization_id, COALESCE(SUM(amount_due), 0)
-		FROM purchase_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL AND organization_id IS NOT NULL
-		  AND status NOT IN ('draft', 'cancelled', 'void') AND amount_due > 0
+		SELECT organization_id, COALESCE(SUM(due) FILTER (WHERE due > 0.005), 0)
+		FROM (`+partnerNetDue("purchase_invoices", "vendor_id", "organization_id", " AND organization_id IS NOT NULL")+`) p
 		GROUP BY organization_id`,
 		tenantID,
 	)
@@ -2972,13 +2974,31 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		  AND status NOT IN ('cancelled', 'quotation')
 		  AND order_date >= $2 AND order_date < $3`,
 		tenantID, rangeStart, rangeEnd).Scan(&salesOrdersCount, &salesOrdersSum)
+	// Two different questions, so two queries rather than one pair of numbers
+	// that half-answers both.
+	//
+	// overdue_invoices counts INVOICES — that is what the field is called and
+	// what the screen shows — so it stays at invoice level.
+	//
+	// overdue_receivables is money, and money nets per partner, matching the
+	// dashboard's `overdue`. A customer sitting in credit overall contributes
+	// nothing to the amount even while their overdue invoices are still
+	// counted, which is both true statements at once.
+	//
+	// The status filter was IN ('sent','partial') — a fourth vocabulary, and
+	// the only one that dropped invoices whose status is literally 'overdue'
+	// out of the overdue figure.
 	h.db.QueryRow(`
-		SELECT COUNT(*), COALESCE(SUM(amount_due), 0)
+		SELECT COUNT(*)
 		FROM sales_invoices
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-		  AND status IN ('sent', 'partial') AND amount_due > 0
+		  AND `+debtStatusFilter+` AND amount_due > 0
 		  AND due_date < CURRENT_DATE`,
-		tenantID).Scan(&salesOverdueCount, &salesOverdueSum)
+		tenantID).Scan(&salesOverdueCount)
+	h.db.QueryRow(`
+		SELECT COALESCE(SUM(overdue) FILTER (WHERE overdue > 0.005), 0)
+		FROM (`+partnerNetDue("sales_invoices", "customer_id", "", "")+`) p`,
+		tenantID).Scan(&salesOverdueSum)
 
 	// Aktivlar bloki (aktivlar-audit §10): the director saw no fixed-asset
 	// numbers at all — NBV, this-month depreciation and the fleet status were
