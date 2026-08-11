@@ -30,8 +30,13 @@ var ContractTransitions = map[ContractStatus][]ContractStatus{
 	ContractStatusSigning:     {ContractStatusNegotiation, ContractStatusActive, ContractStatusCancelled},
 	ContractStatusActive:      {ContractStatusCompleted, ContractStatusCancelled},
 	ContractStatusExpired:     {ContractStatusActive, ContractStatusCompleted, ContractStatusCancelled},
-	ContractStatusCompleted:   {},
-	ContractStatusCancelled:   {ContractStatusDraft},
+	// Completed used to be terminal ({}), which made a mis-click permanent:
+	// the status dropdown simply disappeared (manual test report BUG-02).
+	// Cancelled has always allowed a way back (→ draft); completed now allows
+	// reopening to active for the same reason — mistakes and contracts that
+	// genuinely resume. The UI asks for confirmation before completing.
+	ContractStatusCompleted: {ContractStatusActive},
+	ContractStatusCancelled: {ContractStatusDraft},
 }
 
 // CanTransition reports whether from → to is an allowed status change.

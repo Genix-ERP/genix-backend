@@ -3019,9 +3019,25 @@ func (h *Handler) GetDirectorSummary(c *gin.Context) {
 		WHERE tenant_id = $1 AND status = 'active' AND journal_entry_id IS NOT NULL
 		  AND period = to_char(NOW(), 'YYYY-MM')`, tenantID).Scan(&assetsMonthDepr)
 
+	// Latest USD→UZS rate, so the panel's Som/USD toggle has something to
+	// convert with. The toggle shipped as pure decoration — state was set and
+	// never read (manual test report BUG-03). 0 = no rate configured; the
+	// client keeps the toggle disabled in that case rather than dividing by
+	// a guess.
+	var usdRate float64
+	h.db.QueryRow(`
+		SELECT er.rate
+		FROM exchange_rates er
+		JOIN currencies cf ON cf.id = er.from_currency_id
+		JOIN currencies ct ON ct.id = er.to_currency_id
+		WHERE er.tenant_id = $1 AND cf.code = 'USD' AND ct.code = 'UZS'
+		ORDER BY er.effective_date DESC, er.created_at DESC LIMIT 1`,
+		tenantID).Scan(&usdRate)
+
 	response.Success(c, gin.H{
 		"companies":    companies,
 		"month_labels": labels,
+		"usd_rate":     usdRate,
 		"sales": gin.H{
 			"orders_count":        salesOrdersCount,
 			"orders_sum":          round2(salesOrdersSum),
