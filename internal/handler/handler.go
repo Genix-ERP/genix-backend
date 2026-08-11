@@ -1958,6 +1958,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.GET("", h.ListWorkOrders)
 		workOrders.POST("", h.perm.Require("manufacturing", "work_orders", "create"), h.CreateWorkOrder)
 		workOrders.GET("/:id", h.GetWorkOrder)
+		// Operator assignment from the shop floor. The frontend has called
+		// this since ShopFloorControl existed; there was no route, so the
+		// assign button 404ed silently.
+		workOrders.PUT("/:id", h.perm.Require("manufacturing", "work_orders", "update"), h.UpdateWorkOrder)
 		workOrders.POST("/:id/start", h.StartWorkOrder)
 		workOrders.POST("/:id/pause", h.PauseWorkOrder)
 		workOrders.POST("/:id/complete", h.CompleteWorkOrder)

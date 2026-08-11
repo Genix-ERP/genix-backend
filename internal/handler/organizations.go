@@ -382,10 +382,70 @@ func (h *Handler) CreateOrganization(c *gin.Context) {
 		// Don't fail the organization creation, just log the error
 	}
 
-	// Create default Warehouse for the new organization
-	if err := h.createDefaultWarehouse(tenantID, orgID, input.Code); err != nil {
-		h.log.Error("Failed to create default warehouse", "error", err, "org_id", orgID)
-		// Don't fail the organization creation, just log the error
+	// Adopt the tenant's organization-less warehouses before inventing a new
+	// one.
+	//
+	// Every onboarding flow (auth registration x3, platform onboarding) creates
+	// a bootstrap warehouse BEFORE any organization exists, so its
+	// organization_id is NULL — and every stock read filters
+	// `w.organization_id = $org`, which NULL never satisfies. The result was
+	// one permanently invisible warehouse per company, wearing the
+	// "warehouse_no_company" badge from the day the company was created, while
+	// this function opened a second, parallel "Main Warehouse" next to it.
+	//
+	// At first-organization time the adoption is unambiguous: there is exactly
+	// one organization the orphans could belong to. Row-by-row with a
+	// duplicate-code guard, because UNIQUE(tenant_id, organization_id, code)
+	// does not constrain NULL-org rows — two orphans may legally share a code
+	// and would collide on the way in (the same trap migration 490 hit in
+	// production).
+	adopted := 0
+	var orgCount int
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM organizations WHERE tenant_id = $1`, tenantID).Scan(&orgCount); err == nil && orgCount == 1 {
+		rows, qErr := h.db.Query(`
+			SELECT id, code FROM warehouses
+			WHERE tenant_id = $1 AND organization_id IS NULL AND deleted_at IS NULL
+			ORDER BY created_at, id`, tenantID)
+		if qErr == nil {
+			type wh struct {
+				id   uuid.UUID
+				code string
+			}
+			var orphans []wh
+			for rows.Next() {
+				var w wh
+				if rows.Scan(&w.id, &w.code) == nil {
+					orphans = append(orphans, w)
+				}
+			}
+			rows.Close()
+			taken := map[string]bool{}
+			for _, w := range orphans {
+				if taken[w.code] {
+					h.log.Warn("Orphan warehouse not adopted: duplicate code", "warehouse_id", w.id, "code", w.code)
+					continue
+				}
+				if _, execErr := h.db.Exec(`
+					UPDATE warehouses SET organization_id = $1, updated_at = NOW()
+					WHERE id = $2 AND tenant_id = $3 AND organization_id IS NULL`,
+					orgID, w.id, tenantID); execErr != nil {
+					h.log.Error("Failed to adopt orphan warehouse", "error", execErr, "warehouse_id", w.id)
+					continue
+				}
+				taken[w.code] = true
+				adopted++
+			}
+		}
+	}
+
+	// Create default Warehouse only when nothing was adopted — otherwise the
+	// company starts with the bootstrap warehouse AND a second empty "Main
+	// Warehouse" beside it.
+	if adopted == 0 {
+		if err := h.createDefaultWarehouse(tenantID, orgID, input.Code); err != nil {
+			h.log.Error("Failed to create default warehouse", "error", err, "org_id", orgID)
+			// Don't fail the organization creation, just log the error
+		}
 	}
 
 	// Backfill product_organization_settings so existing products are visible in the new org
