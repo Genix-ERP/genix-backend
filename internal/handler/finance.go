@@ -5982,7 +5982,7 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 
 	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM bank_accounts"):]
 
-	query += " ORDER BY COALESCE(name, bank_name) ASC"
+	query += " ORDER BY COALESCE(name, bank_name) ASC, ba.id ASC"
 
 	// Opt-in paging — see ListExchangeRates.
 	paginate, page, pageSize, offset := optPagination(c)

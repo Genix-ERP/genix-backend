@@ -105,11 +105,11 @@ func (h *Handler) ListTenderProducts(c *gin.Context) {
 
 	switch ordering {
 	case "price":
-		query += " ORDER BY p.price ASC"
+		query += " ORDER BY p.price ASC, p.id ASC"
 	case "-price":
-		query += " ORDER BY p.price DESC"
+		query += " ORDER BY p.price DESC, p.id ASC"
 	case "rating":
-		query += " ORDER BY cp.rating DESC"
+		query += " ORDER BY cp.rating DESC, p.id ASC"
 	case "created_at":
 		query += " ORDER BY p.created_at ASC"
 	default:

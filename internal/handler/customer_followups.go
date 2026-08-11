@@ -342,7 +342,13 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 			i.customer_id,
 			SUM(i.total_amount - COALESCE(i.amount_paid, 0)) as total_overdue,
 			MIN(i.due_date) as oldest_due_date,
-			EXTRACT(DAY FROM CURRENT_DATE - MIN(i.due_date))::INTEGER as days_overdue,
+			-- date - date is already an INTEGER number of days in Postgres, so
+			-- EXTRACT(DAY FROM ...) over it fails outright:
+			--   pq: function pg_catalog.extract(unknown, integer) does not exist
+			-- This statement therefore never ran, and customer_followup_status
+			-- was never refreshed — the dunning screen showed whatever was last
+			-- written by hand, or nothing.
+			(CURRENT_DATE - MIN(i.due_date))::INTEGER as days_overdue,
 			'in_followup' as status
 		FROM sales_invoices i
 		WHERE i.tenant_id = $1
@@ -408,7 +414,12 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 			cfs.last_followup_date, cfs.next_followup_date, cfs.internal_notes,
 			(SELECT COUNT(*) FROM sales_invoices WHERE customer_id = cfs.customer_id AND deleted_at IS NULL AND status NOT IN ('draft', 'cancelled', 'void') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)) as overdue_invoice_count,
 			cfs.created_at, cfs.updated_at` + fromWhere + whereExtra +
-		" ORDER BY cfs.days_overdue DESC, cfs.total_overdue DESC"
+		// cfs.id is the tiebreaker. days_overdue and total_overdue are both
+		// non-unique, so without it the order is not total and Postgres may
+		// resolve equal rows differently for page 1's LIMIT/OFFSET than for
+		// page 2's — one customer appears on both pages, another on neither,
+		// with no error and nothing in the log.
+		" ORDER BY cfs.days_overdue DESC, cfs.total_overdue DESC, cfs.id ASC"
 
 	if paginate {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)

@@ -166,7 +166,7 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 	// configuration, so it has no natural ceiling. Callers that send no page
 	// params still get the full list.
 	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM tax_report_periods"):]
-	query += " ORDER BY trp.start_date DESC"
+	query += " ORDER BY trp.start_date DESC, trp.id ASC"
 
 	paginate, page, pageSize, offset := optPagination(c)
 	filterArgs := append([]interface{}{}, args...)

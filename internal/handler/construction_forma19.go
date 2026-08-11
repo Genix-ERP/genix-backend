@@ -65,7 +65,7 @@ func (h *Handler) ListForma19(c *gin.Context) {
 		}
 	}
 
-	query += whereExtra + " ORDER BY a.created_date DESC"
+	query += whereExtra + " ORDER BY a.created_date DESC, a.id ASC"
 	if paginate {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
 		args = append(args, pageSize, offset)

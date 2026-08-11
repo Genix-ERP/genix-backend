@@ -81,7 +81,7 @@ func (h *Handler) ListCarriers(c *gin.Context) {
 	// count, or total includes tombstones the page can never show.
 	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM carriers"):]
 
-	query += " ORDER BY name ASC"
+	query += " ORDER BY name ASC, id ASC"
 
 	// Opt-in paging: also the carrier-name dropdown source on the
 	// delivery-order form, so the no-params path must stay a full list.

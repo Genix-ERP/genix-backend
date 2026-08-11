@@ -69,7 +69,7 @@ func (h *Handler) ListUnitsOfMeasure(c *gin.Context) {
 		return
 	}
 
-	baseQuery += " ORDER BY category ASC, conversion_factor ASC, name ASC"
+	baseQuery += " ORDER BY category ASC, conversion_factor ASC, name ASC, id ASC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)

@@ -218,7 +218,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	}
 
 	// Add ordering and pagination
-	baseQuery += " ORDER BY p.name ASC"
+	baseQuery += " ORDER BY p.name ASC, p.id ASC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)

@@ -829,7 +829,10 @@ func (h *Handler) GetOpportunityStats(c *gin.Context) {
 			) as win_rate,
 			COALESCE(AVG(expected_revenue), 0) as average_deal_size,
 			COALESCE(
-				AVG(EXTRACT(DAY FROM (actual_close_date - created_at::date))) FILTER (WHERE stage = 'closed_won'),
+				-- Both operands are DATE, so the subtraction already yields an
+				-- INTEGER day count; EXTRACT over an integer is not a function
+				-- Postgres has, and the whole stats query errored out.
+				AVG(actual_close_date - created_at::date) FILTER (WHERE stage = 'closed_won'),
 				0
 			)::int as average_sales_cycle
 		FROM opportunities

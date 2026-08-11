@@ -105,7 +105,7 @@ func (h *Handler) ListAttendanceRecords(c *gin.Context) {
 	if sortOrder != "ASC" && sortOrder != "DESC" {
 		sortOrder = "DESC"
 	}
-	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortBy, sortOrder)
+	baseQuery += fmt.Sprintf(" ORDER BY %s %s, id ASC", sortBy, sortOrder)
 
 	// Add pagination
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
