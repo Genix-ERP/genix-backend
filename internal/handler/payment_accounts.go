@@ -130,3 +130,65 @@ func missingPaymentAccounts(journal, ar, cash uuid.UUID) []string {
 	}
 	return missing
 }
+
+// ensureDefaultChart seeds the standard UzNAS chart (and default journals)
+// for a tenant whose essential-account lookup has just failed.
+//
+// The lazy seeding this mirrors lives in ListAccounts: the chart appears the
+// first time someone opens Moliya → Hisoblar rejasi. A tenant who goes
+// straight to selling never opens that screen — their first contact with the
+// chart of accounts was "To'lov qayd etilmadi — sozlanmagan: debitorlik
+// schyoti (4010)", an error naming an account the system itself was supposed
+// to have created. Posting sites call this when a required account resolves
+// to nothing, then retry the lookup once.
+//
+// Both seeders are idempotent (ON CONFLICT on (tenant, org, code)), so
+// calling this against a partially hand-built chart only fills the gaps and
+// never duplicates or overwrites. It seeds h.db-side, outside the caller's
+// open transaction — READ COMMITTED means the caller's retry sees the
+// committed rows.
+//
+// Returns false when there is no organization to seed under (the chart is
+// org-scoped) or nothing was attempted.
+func (h *Handler) ensureDefaultChart(tenantID uuid.UUID, orgID *uuid.UUID) bool {
+	if tenantID == uuid.Nil {
+		return false
+	}
+	target := uuid.Nil
+	if orgID != nil {
+		target = *orgID
+	}
+	if target == uuid.Nil {
+		// Documents posted without an organization still need the chart to
+		// exist somewhere findAccount's tenant-wide steps can see: the
+		// tenant's oldest organization, matching what onboarding seeds.
+		_ = h.db.QueryRow(`
+			SELECT id FROM organizations
+			WHERE tenant_id = $1 AND deleted_at IS NULL
+			ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&target)
+		if target == uuid.Nil {
+			return false
+		}
+	}
+
+	if err := h.createDefaultChartOfAccounts(tenantID, target); err != nil {
+		h.log.Warn("self-heal chart seeding failed", "error", err, "tenant_id", tenantID, "org_id", target)
+		return false
+	}
+
+	// Same journal guard as ListAccounts: under 5 means broken (11 defaults).
+	var journalCount int
+	_ = h.db.QueryRow(`
+		SELECT COUNT(*) FROM journals
+		WHERE tenant_id = $1 AND organization_id = $2 AND deleted_at IS NULL`,
+		tenantID, target).Scan(&journalCount)
+	if journalCount < 5 {
+		if err := h.createDefaultJournals(tenantID, target); err != nil {
+			h.log.Warn("self-heal journal seeding failed", "error", err, "tenant_id", tenantID, "org_id", target)
+		}
+	}
+
+	h.log.Info("self-healed missing chart of accounts at posting time",
+		"tenant_id", tenantID, "org_id", target)
+	return true
+}

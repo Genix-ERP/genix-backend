@@ -1127,6 +1127,12 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 	if arAccountID == uuid.Nil {
 		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
 	}
+	// 3. Self-heal: the chart is lazily seeded on first open of Hisoblar
+	//    rejasi; a tenant that started selling before ever opening that screen
+	//    has no 4010 through no fault of their own. Seed and look once more.
+	if arAccountID == uuid.Nil && h.ensureDefaultChart(tenantID, organizationID) {
+		arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
+	}
 	if arAccountID == uuid.Nil {
 		h.log.Error("AR account not found", "tenant_id", tenantID)
 		response.InternalError(c, "Accounts Receivable account (4010) not found. Please configure chart of accounts.")
@@ -1622,6 +1628,25 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 			cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
 			if cashAccountID == uuid.Nil {
 				cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
+			}
+		}
+	}
+
+	// Missing accounts are the system's own gap, not the user's: the chart is
+	// lazily seeded when Hisoblar rejasi is first opened, and a tenant that
+	// went straight to selling never opened it. Seed and retry before
+	// refusing.
+	if arAccountID == uuid.Nil || cashAccountID == uuid.Nil {
+		if h.ensureDefaultChart(tenantID, organizationID) {
+			if arAccountID == uuid.Nil {
+				arAccountID = findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
+			}
+			if cashAccountID == uuid.Nil {
+				if input.PaymentMethod == "cash" {
+					cashAccountID = findAccount(tx, tenantID, organizationID, "cash", "5010")
+				} else {
+					cashAccountID = findAccount(tx, tenantID, organizationID, "bank account", "5110")
+				}
 			}
 		}
 	}

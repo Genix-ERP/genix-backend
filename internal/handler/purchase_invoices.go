@@ -933,6 +933,12 @@ func (h *Handler) PostPurchaseInvoice(c *gin.Context) {
 		if apAccountID == uuid.Nil {
 			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
 		}
+		// 3. Self-heal a never-seeded chart (same rescue as the sales side) —
+		//    without it, the AP leg below is skipped SILENTLY and the bill
+		//    posts with no journal entry at all.
+		if apAccountID == uuid.Nil && h.ensureDefaultChart(tenantID, organizationID) {
+			apAccountID = findAccount(tx, tenantID, organizationID, "accounts payable", "6010")
+		}
 		taxAccountID := findAccount(tx, tenantID, organizationID, "soliqlar bo'yicha bo'nak", "4410")
 
 		// Get invoice lines for per-category accounting
