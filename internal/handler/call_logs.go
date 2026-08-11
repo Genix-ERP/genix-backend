@@ -141,7 +141,7 @@ func (h *Handler) ListCallLogs(c *gin.Context) {
 	}
 
 	// Add ordering and pagination
-	baseQuery += " ORDER BY cl.call_start_time DESC"
+	baseQuery += " ORDER BY cl.call_start_time DESC, cl.id ASC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)

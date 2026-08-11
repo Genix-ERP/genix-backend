@@ -1416,7 +1416,7 @@ func (h *Handler) GetInventoryValuation(c *gin.Context) {
 	}
 
 	baseQuery += " GROUP BY p.id, p.code, p.name, pc.name, p.cost_price"
-	baseQuery += " ORDER BY total_value DESC"
+	baseQuery += " ORDER BY total_value DESC, p.id ASC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	// Get count

@@ -39,7 +39,7 @@ func (h *Handler) ListProjectMaterials(c *gin.Context) {
 		       0) as assigned_quantity
 		FROM construction_project_materials pm
 		WHERE pm.tenant_id = $1 AND pm.project_id = $2
-		ORDER BY pm.product_name`
+		ORDER BY pm.product_name, pm.id ASC`
 	args := []interface{}{tenantID, projectID}
 	if paginate {
 		query += " LIMIT $3 OFFSET $4"

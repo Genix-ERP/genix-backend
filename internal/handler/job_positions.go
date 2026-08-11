@@ -58,7 +58,7 @@ func (h *Handler) ListJobPositions(c *gin.Context) {
 
 	query := `
 		SELECT id, tenant_id, organization_id, code, name, description, is_active, created_at, updated_at
-		FROM job_positions` + where + " ORDER BY name ASC"
+		FROM job_positions` + where + " ORDER BY name ASC, id ASC"
 
 	// Opt-in paging — see ListDepartments.
 	paginate, page, pageSize, offset := optPagination(c)

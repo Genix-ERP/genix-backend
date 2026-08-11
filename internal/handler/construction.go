@@ -138,7 +138,7 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 	}
 
 	// Add ordering and pagination
-	baseQuery += " ORDER BY cp.created_date DESC"
+	baseQuery += " ORDER BY cp.created_date DESC, cp.id ASC"
 	pagination := entity.NewPagination(page, limit)
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", pagination.Limit, pagination.Offset())
 
@@ -2227,7 +2227,7 @@ func (h *Handler) ListProjectVendors(c *gin.Context) {
 		LEFT JOIN contacts c ON c.id = pv.vendor_id
 		LEFT JOIN organizations o ON o.id = pv.vendor_id
 		WHERE pv.project_id = $1 AND pv.tenant_id = $2
-		ORDER BY pv.created_date DESC
+		ORDER BY pv.created_date DESC, pv.id ASC
 	`
 
 	// Opt-in paging. Both LEFT JOINs resolve vendor_name and are 1:1 on
@@ -2621,7 +2621,7 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		LEFT JOIN employees e ON e.id = dr.reported_by
 		LEFT JOIN employees v ON v.id = dr.verified_by
 		WHERE dr.project_id = $1 AND dr.tenant_id = $2
-		ORDER BY dr.report_date DESC`
+		ORDER BY dr.report_date DESC, dr.id ASC`
 	paginate, page, pageSize, offset := optPagination(c)
 	args := []interface{}{projectID, tenantID}
 	if paginate {
@@ -3125,7 +3125,7 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		LEFT JOIN construction_subcontract sc ON sc.id = mr.subcontract_id
 		LEFT JOIN construction_buildings bld ON bld.id = mr.building_id
 		WHERE mr.project_id = $1 AND mr.tenant_id = $2
-		ORDER BY mr.request_date DESC`
+		ORDER BY mr.request_date DESC, mr.id ASC`
 	paginate, page, pageSize, offset := optPagination(c)
 	args := []interface{}{projectID, tenantID}
 	if paginate {
@@ -4258,7 +4258,7 @@ func (h *Handler) ListDeliveries(c *gin.Context) {
 		LEFT JOIN organizations o ON o.id = pv.vendor_id
 		LEFT JOIN employees e ON e.id = d.received_by
 		WHERE d.project_id = $1 AND d.tenant_id = $2
-		ORDER BY d.delivery_date DESC`
+		ORDER BY d.delivery_date DESC, d.id ASC`
 	paginate, page, pageSize, offset := optPagination(c)
 	args := []interface{}{projectID, tenantID}
 	if paginate {

@@ -401,9 +401,9 @@ func (h *Handler) ListProductVariants(c *gin.Context) {
 	if productID != "" {
 		args = append(args, productID)
 		whereExtra += fmt.Sprintf(" AND pv.product_id = $%d", len(args))
-		orderBy = " ORDER BY pv.variant_name"
+		orderBy = " ORDER BY pv.variant_name, pv.id ASC"
 	} else {
-		orderBy = " ORDER BY p.name, pv.variant_name"
+		orderBy = " ORDER BY p.name, pv.variant_name, pv.id ASC"
 	}
 
 	baseQuery += whereExtra

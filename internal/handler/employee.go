@@ -109,7 +109,7 @@ func (h *Handler) ListEmployees(c *gin.Context) {
 	if sortOrder != "ASC" && sortOrder != "DESC" {
 		sortOrder = "DESC"
 	}
-	baseQuery += fmt.Sprintf(" ORDER BY e.%s %s", sortBy, sortOrder)
+	baseQuery += fmt.Sprintf(" ORDER BY e.%s %s, e.id ASC", sortBy, sortOrder)
 
 	// Add pagination
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)

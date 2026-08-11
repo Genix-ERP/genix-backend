@@ -66,15 +66,15 @@ func (h *Handler) ListSuppliers(c *gin.Context) {
 
 	switch ordering {
 	case "rating":
-		query += " ORDER BY cp.rating ASC"
+		query += " ORDER BY cp.rating ASC, cp.id ASC"
 	case "-rating":
-		query += " ORDER BY cp.rating DESC"
+		query += " ORDER BY cp.rating DESC, cp.id ASC"
 	case "name":
-		query += " ORDER BY cp.company_name ASC"
+		query += " ORDER BY cp.company_name ASC, cp.id ASC"
 	case "won_count":
-		query += " ORDER BY cp.won_count DESC"
+		query += " ORDER BY cp.won_count DESC, cp.id ASC"
 	default:
-		query += " ORDER BY cp.rating DESC"
+		query += " ORDER BY cp.rating DESC, cp.id ASC"
 	}
 
 	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", qIdx, qIdx+1)

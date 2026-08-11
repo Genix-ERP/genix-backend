@@ -698,7 +698,7 @@ func (h *Handler) ListPayrollEntries(c *gin.Context) {
 			   payment_method, bank_account, status, notes, created_at
 		FROM payroll_entries
 		WHERE payroll_period_id = $1 AND tenant_id = $2
-		ORDER BY employee_name
+		ORDER BY employee_name, id ASC
 	`
 
 	args := []interface{}{id, tenantID}
