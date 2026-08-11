@@ -941,6 +941,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		purchaseInvoices.POST("/:id/confirm", h.perm.Require("purchase", "invoice", "approve"), h.ConfirmPurchaseInvoice)
 		purchaseInvoices.POST("/:id/post", h.perm.Require("purchase", "invoice", "approve"), h.PostPurchaseInvoice)
 		purchaseInvoices.POST("/:id/pay", h.perm.Require("purchase", "invoice", "update"), h.PayPurchaseInvoice)
+		// Un-post back to draft. VendorBills has had this button since the
+		// screen was built; the route never existed, so it 404ed. Same
+		// permission tier as posting — it edits the same books in reverse.
+		purchaseInvoices.POST("/:id/reset-to-draft", h.perm.Require("purchase", "invoice", "approve"), h.ResetPurchaseInvoiceToDraft)
 		purchaseInvoices.POST("/:id/debit-note", h.perm.Require("purchase", "invoice", "create"), h.CreateDebitNote)
 		purchaseInvoices.POST("/:id/confirm-debit-note", h.perm.Require("purchase", "invoice", "approve"), h.ConfirmDebitNote)
 	}
@@ -1959,8 +1963,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		workOrders.POST("", h.perm.Require("manufacturing", "work_orders", "create"), h.CreateWorkOrder)
 		workOrders.GET("/:id", h.GetWorkOrder)
 		// Operator assignment from the shop floor. The frontend has called
-		// this since ShopFloorControl existed; there was no route, so the
-		// assign button 404ed silently.
+		// this since ShopFloorControl existed; without the route the assign
+		// button 404ed silently.
 		workOrders.PUT("/:id", h.perm.Require("manufacturing", "work_orders", "update"), h.UpdateWorkOrder)
 		workOrders.POST("/:id/start", h.StartWorkOrder)
 		workOrders.POST("/:id/pause", h.PauseWorkOrder)

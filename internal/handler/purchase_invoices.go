@@ -1987,3 +1987,180 @@ func (h *Handler) GetPurchaseInvoiceStats(c *gin.Context) {
 		"draft_count":        draftCount,
 	})
 }
+
+// ResetPurchaseInvoiceToDraft un-posts a vendor bill back to draft so it can
+// be edited or deleted.
+//
+// VendorBills has shown its superadmin-only RotateCcw button since the bill
+// screen was built, calling POST /purchase-invoices/:id/reset-to-draft — and
+// no such route existed, so the button 404ed every time. The journal-entries
+// sibling (ResetJournalEntryToDraft) did exist; this follows its shape.
+//
+// Two things distinguish it from that sibling:
+//
+//   - The journal entry is soft-deleted, not left as a draft. Re-posting the
+//     bill creates a fresh entry, and PostPurchaseInvoice's double-post guard
+//     refuses any invoice whose journal_entry_id is set — so the link must be
+//     cleared, and a cleared link to a live draft entry would strand it in the
+//     journal list with no owner.
+//
+//   - Paid bills are refused outright (the UI hides the button once
+//     amount_paid > 0; enforce it server-side too). Un-posting AP that a
+//     payment has already offset would double-count the payment's effect.
+func (h *Handler) ResetPurchaseInvoiceToDraft(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Invalid tenant")
+		return
+	}
+
+	invoiceID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid invoice ID")
+		return
+	}
+
+	var status string
+	var amountPaid float64
+	var jeID *uuid.UUID
+	err = h.db.QueryRow(`
+		SELECT status, COALESCE(amount_paid, 0), journal_entry_id
+		FROM purchase_invoices
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		invoiceID, tenantID,
+	).Scan(&status, &amountPaid, &jeID)
+	if err == sql.ErrNoRows {
+		response.NotFound(c, "Purchase invoice")
+		return
+	}
+	if err != nil {
+		h.log.Error("Failed to load purchase invoice", "error", err, "invoice_id", invoiceID)
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+
+	if status == "draft" {
+		response.BadRequest(c, "Invoice is already in draft status")
+		return
+	}
+	if status == "cancelled" {
+		response.BadRequest(c, "A cancelled invoice cannot be reset to draft")
+		return
+	}
+	if amountPaid > 0.005 {
+		response.BadRequest(c, "Invoice has recorded payments; remove them first")
+		return
+	}
+
+	// Same period rules as posting: cannot un-post into a locked period. The
+	// journal entry's date is the one the books were affected on.
+	var entryDate time.Time
+	var jeStatus string
+	if jeID != nil && *jeID != uuid.Nil {
+		err = h.db.QueryRow(`
+			SELECT status, entry_date FROM journal_entries
+			WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+			*jeID, tenantID,
+		).Scan(&jeStatus, &entryDate)
+		if err == sql.ErrNoRows {
+			// Link points at a deleted entry — nothing to un-apply.
+			jeID = nil
+		} else if err != nil {
+			h.log.Error("Failed to load journal entry", "error", err, "journal_entry_id", *jeID)
+			response.InternalError(c, "Failed to reset invoice")
+			return
+		} else {
+			if errMsg := h.checkLockDate(tenantID, entryDate); errMsg != "" {
+				response.BadRequest(c, errMsg)
+				return
+			}
+			if errMsg := h.checkPeriodLock(tenantID, entryDate); errMsg != "" {
+				response.BadRequest(c, errMsg)
+				return
+			}
+		}
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+	defer tx.Rollback()
+
+	now := time.Now()
+
+	if jeID != nil && *jeID != uuid.Nil {
+		// Un-apply the balance deltas posting added, but only if the entry is
+		// actually posted — a draft entry never touched the balances.
+		if jeStatus == "posted" {
+			rows, qErr := tx.Query(`
+				SELECT account_id, debit_amount, credit_amount
+				FROM journal_entry_lines
+				WHERE journal_entry_id = $1`, *jeID)
+			if qErr != nil {
+				h.log.Error("Failed to load journal lines", "error", qErr, "journal_entry_id", *jeID)
+				response.InternalError(c, "Failed to reset invoice")
+				return
+			}
+			type delta struct {
+				accountID uuid.UUID
+				change    float64
+			}
+			var deltas []delta
+			for rows.Next() {
+				var accountID uuid.UUID
+				var debit, credit float64
+				if sErr := rows.Scan(&accountID, &debit, &credit); sErr == nil {
+					// Uniform debit-positive convention (448): posting added
+					// debit - credit, so subtract it back.
+					deltas = append(deltas, delta{accountID, debit - credit})
+				}
+			}
+			rows.Close()
+			for _, d := range deltas {
+				if _, uErr := tx.Exec(`
+					UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2
+					WHERE id = $3`, d.change, now, d.accountID); uErr != nil {
+					h.log.Error("Failed to un-apply account balance", "error", uErr, "account_id", d.accountID)
+					response.InternalError(c, "Failed to reset invoice")
+					return
+				}
+			}
+		}
+
+		// Soft-delete the entry and its trace; re-posting builds a new one.
+		if _, dErr := tx.Exec(`
+			UPDATE journal_entries SET deleted_at = $1, updated_at = $1
+			WHERE id = $2 AND tenant_id = $3`, now, *jeID, tenantID); dErr != nil {
+			h.log.Error("Failed to delete journal entry", "error", dErr, "journal_entry_id", *jeID)
+			response.InternalError(c, "Failed to reset invoice")
+			return
+		}
+	}
+
+	res, err := tx.Exec(`
+		UPDATE purchase_invoices
+		SET status = 'draft', journal_entry_id = NULL, updated_at = $1
+		WHERE id = $2 AND tenant_id = $3 AND status = $4`,
+		now, invoiceID, tenantID, status,
+	)
+	if err != nil {
+		h.log.Error("Failed to reset invoice status", "error", err, "invoice_id", invoiceID)
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Status changed between our read and this write — bail rather than
+		// resetting a bill someone just paid or cancelled.
+		response.BadRequest(c, "Invoice status changed; reload and try again")
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to reset invoice")
+		return
+	}
+
+	h.GetPurchaseInvoice(c)
+}
