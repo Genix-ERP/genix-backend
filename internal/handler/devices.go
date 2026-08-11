@@ -92,7 +92,9 @@ func (h *Handler) UnregisterDevice(c *gin.Context) {
 		response.BadRequest(c, "token is required")
 		return
 	}
-	h.db.Exec(`DELETE FROM device_tokens WHERE token = $1 AND user_id = $2`, token, userID)
+	if _, execErr := h.db.Exec(`DELETE FROM device_tokens WHERE token = $1 AND user_id = $2`, token, userID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE device_tokens", "error", execErr)
+	}
 	response.Success(c, gin.H{"message": "Device unregistered"})
 }
 
@@ -158,7 +160,9 @@ func (h *Handler) pushToUser(tenantID, userID uuid.UUID, title, body string, dat
 	// Prune tokens FCM told us are dead so we stop trying them.
 	for _, r := range results {
 		if r.Unregister {
-			h.db.Exec(`DELETE FROM device_tokens WHERE token = $1`, r.Token)
+			if _, execErr := h.db.Exec(`DELETE FROM device_tokens WHERE token = $1`, r.Token); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "DELETE device_tokens", "error", execErr)
+			}
 		}
 	}
 }

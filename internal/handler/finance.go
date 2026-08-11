@@ -53,10 +53,12 @@ func (h *Handler) logJournalEntryAction(tenantID, userID, entryID uuid.UUID, act
 	}
 	oldJSON, _ := json.Marshal(map[string]interface{}{"status": oldStatus})
 	newJSON, _ := json.Marshal(newValues)
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
 		VALUES ($1, $2, $3, $4, 'journal_entry', $5, $6, $7, $8)
-	`, uuid.New(), tenantID, userID, action, entryID, oldJSON, newJSON, time.Now())
+	`, uuid.New(), tenantID, userID, action, entryID, oldJSON, newJSON, time.Now()); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT audit_logs", "error", execErr)
+	}
 }
 
 // nullIfEmpty returns nil for empty strings, otherwise returns the string pointer
@@ -6719,9 +6721,11 @@ func (h *Handler) ReconcileBankTransaction(c *gin.Context) {
 	}
 
 	// Update last reconciled date on bank account
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE bank_accounts SET last_reconciled = $1, updated_at = $1 WHERE id = $2 AND tenant_id = $3
-	`, now, bankAccountID, tenantID)
+	`, now, bankAccountID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE bank_accounts", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Transaction reconciled successfully"})
 }
@@ -7315,11 +7319,13 @@ func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 	}
 
 	// Update bank account last reconciled
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE bank_accounts
 		SET last_reconciled = $1, last_reconciled_balance = $2, updated_at = $3
 		WHERE id = $4 AND tenant_id = $5
-	`, statementDate, statementBalance, now, bankAccountID, tenantID)
+	`, statementDate, statementBalance, now, bankAccountID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE bank_accounts", "error", execErr)
+	}
 
 	// Create clearing entries for outstanding accounts (2-step payment posting)
 	h.createOutstandingClearingEntries(tenantID, userID, bankAccountID, reconciliationID, statementDate, now)
@@ -7733,14 +7739,18 @@ func (h *Handler) DeleteBankReconciliation(c *gin.Context) {
 	}
 
 	// Reset related bank transactions
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE bank_transactions
 		SET is_reconciled = false, reconciliation_id = NULL, reconciled_date = NULL, status = 'unmatched'
 		WHERE reconciliation_id = $1
-	`, reconciliationID)
+	`, reconciliationID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE bank_transactions", "error", execErr)
+	}
 
 	// Delete reconciliation items
-	h.db.Exec(`DELETE FROM bank_reconciliation_items WHERE reconciliation_id = $1`, reconciliationID)
+	if _, execErr := h.db.Exec(`DELETE FROM bank_reconciliation_items WHERE reconciliation_id = $1`, reconciliationID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE bank_reconciliation_items", "error", execErr)
+	}
 
 	// Delete reconciliation
 	_, err = h.db.Exec(`DELETE FROM bank_reconciliations WHERE id = $1 AND tenant_id = $2`, reconciliationID, tenantID)

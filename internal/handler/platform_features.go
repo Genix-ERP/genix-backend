@@ -487,10 +487,12 @@ func (h *Handler) Impersonate(c *gin.Context) {
 	newVals, _ := json.Marshal(map[string]interface{}{
 		"by": "Genix support", "reason": in.Reason, "read_only": readOnly,
 	})
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, new_values, created_at)
 		VALUES ($1, $2, $3, 'support_access', 'impersonation', $4, $5, NOW())
-	`, uuid.New(), tenantID, actorID, ownerID, newVals)
+	`, uuid.New(), tenantID, actorID, ownerID, newVals); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT audit_logs", "error", execErr)
+	}
 
 	response.Success(c, gin.H{
 		"access_token": token,

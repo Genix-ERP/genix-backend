@@ -599,14 +599,18 @@ func (h *Handler) CreateProductVariant(c *gin.Context) {
 		if err != nil {
 			continue
 		}
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO product_variant_attribute_values (id, variant_id, template_attribute_value_id, created_at)
 			VALUES ($1, $2, $3, $4)
-		`, uuid.New(), variantID, valID, now)
+		`, uuid.New(), variantID, valID, now); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT product_variant_attribute_values", "error", execErr)
+		}
 	}
 
 	// Update product to has_variants = true
-	h.db.Exec("UPDATE products SET has_variants = true WHERE id = $1", productID)
+	if _, execErr := h.db.Exec("UPDATE products SET has_variants = true WHERE id = $1", productID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE products", "error", execErr)
+	}
 
 	response.Success(c, map[string]interface{}{
 		"id":           variantID,
@@ -849,10 +853,12 @@ func (h *Handler) GenerateProductVariants(c *gin.Context) {
 
 		// Link attribute values
 		for _, ptavID := range ptavIDs {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO product_variant_attribute_values (id, variant_id, template_attribute_value_id, created_at)
 				VALUES ($1, $2, $3, $4)
-			`, uuid.New(), variantID, ptavID, now)
+			`, uuid.New(), variantID, ptavID, now); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT product_variant_attribute_values", "error", execErr)
+			}
 		}
 
 		createdCount++
@@ -860,7 +866,9 @@ func (h *Handler) GenerateProductVariants(c *gin.Context) {
 
 	// Update product has_variants flag
 	if createdCount > 0 {
-		h.db.Exec("UPDATE products SET has_variants = true WHERE id = $1", productID)
+		if _, execErr := h.db.Exec("UPDATE products SET has_variants = true WHERE id = $1", productID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE products", "error", execErr)
+		}
 	}
 
 	response.Success(c, map[string]interface{}{
@@ -936,11 +944,15 @@ func (h *Handler) AddProductAttribute(c *gin.Context) {
 		var priceExtra float64
 		h.db.QueryRow(`SELECT COALESCE(price_extra, 0) FROM product_attribute_values WHERE id = $1`, valID).Scan(&priceExtra)
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO product_template_attribute_values (id, tenant_id, product_template_attribute_id, attribute_value_id, price_extra, is_active, created_at)
 			VALUES ($1, $2, $3, $4, $5, true, $6)
 			ON CONFLICT (product_template_attribute_id, attribute_value_id) DO NOTHING
-		`, uuid.New(), tenantID, ptaID, valID, priceExtra, now)
+		`, uuid.New(), tenantID, ptaID, valID, priceExtra, now); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT product_template_attribute_values", "error", execErr)
+
+		}
 	}
 
 	response.Success(c, map[string]interface{}{

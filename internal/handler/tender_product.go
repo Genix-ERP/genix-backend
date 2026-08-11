@@ -218,7 +218,9 @@ func (h *Handler) GetTenderProduct(c *gin.Context) {
 	}
 
 	// Increment view count
-	h.db.Exec(`UPDATE tender_products SET view_count = view_count + 1 WHERE id = $1`, productID)
+	if _, execErr := h.db.Exec(`UPDATE tender_products SET view_count = view_count + 1 WHERE id = $1`, productID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE tender_products", "error", execErr)
+	}
 
 	response.Success(c, p)
 }

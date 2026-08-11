@@ -181,11 +181,13 @@ func (h *Handler) ensureDefaultLandedCostTypes(tenantID uuid.UUID) {
 
 	for _, dt := range defaultTypes {
 		id := uuid.New()
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO landed_cost_types (id, tenant_id, name, code, description, default_allocation_method, is_active, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, true, $7, $7)`,
 			id, tenantID, dt.Name, dt.Code, dt.Description, dt.Method, now,
-		)
+		); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT landed_cost_types", "error", execErr)
+		}
 	}
 }
 
@@ -510,7 +512,7 @@ func (h *Handler) CreateLandedCost(c *gin.Context) {
 			currency = lineInput.Currency
 		}
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO landed_cost_lines (
 				id, landed_cost_id, line_number, cost_type_id, cost_type_name,
 				vendor_id, vendor_name, amount, currency, reference,
@@ -519,7 +521,11 @@ func (h *Handler) CreateLandedCost(c *gin.Context) {
 			lineID, id, i+1, costTypeID, lineInput.CostTypeName,
 			vendorID, lineInput.VendorName, lineInput.Amount, currency, lineInput.Reference,
 			lineInput.AllocationMethod, lineInput.Notes, now,
-		)
+		); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT landed_cost_lines", "error", execErr)
+
+		}
 	}
 
 	// Calculate and create allocations

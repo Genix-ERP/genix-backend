@@ -679,12 +679,16 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 				warehouse_id, notes, packaging_id, packaging_qty, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)`
 
-		h.db.Exec(lineQuery,
+		if _, execErr := h.db.Exec(lineQuery,
 			lineID, orderID, i+1, productID, line.Description,
 			line.Quantity, unitID, line.UnitPrice, line.DiscountType, line.DiscountValue, lineDiscount,
 			taxID, 0.0, lineTotal-lineDiscount, 0.0, 0.0,
 			lineWarehouseID, line.Notes, packagingID, line.PackagingQty, now, now,
-		)
+		); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+
+		}
 	}
 
 	// Intercompany: PO will be created when SO is confirmed, not at creation time
@@ -1427,11 +1431,13 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 					for i, l := range lines {
 						solIDs[i] = l.LineID
 					}
-					h.db.Exec(`
+					if _, execErr := h.db.Exec(`
 						UPDATE sales_order_lines
 						SET quantity_delivered = quantity, updated_at = $1
 						WHERE id = ANY($2)
-					`, now, pq.Array(solIDs))
+					`, now, pq.Array(solIDs)); execErr != nil {
+						h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE sales_order_lines", "error", execErr)
+					}
 
 					// Balance + ledger now land in ONE transaction via
 					// applyStockDelta (docs/ombor-audit.md finding #1): either
@@ -1478,22 +1484,26 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 			}
 
 			// Also update any draft delivery orders to shipped
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE sales_delivery_orders
 				SET status = 'shipped', updated_at = $1
 				WHERE sales_order_id = $2 AND tenant_id = $3 AND status != 'shipped' AND deleted_at IS NULL
-			`, now, orderID, tenantID)
+			`, now, orderID, tenantID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE sales_delivery_orders", "error", execErr)
+			}
 
 			h.log.Info("Inventory decreased from SO shipped", "so_id", orderID)
 		}
 
 		// Also mark related stock operation as done
 		if !stockOpDone {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE stock_operations SET state = 'done', done_at = $1, updated_at = $1
 				WHERE source_type = 'sales_order' AND source_id = $2 AND tenant_id = $3
 				  AND state != 'done' AND state != 'cancelled' AND deleted_at IS NULL
-			`, now, orderID, tenantID)
+			`, now, orderID, tenantID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+			}
 		}
 
 		// ============================================
@@ -2118,13 +2128,15 @@ func (h *Handler) createDeliveryChainForSO(
 
 		// Create lines
 		for _, l := range soLines {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO stock_operation_lines (
 					id, tenant_id, operation_id, product_id,
 					expected_qty, done_qty, uom, unit_price,
 					quality_status, created_at, updated_at
 				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,0,$5,$6,'good',$7,$7)
-			`, tenantID, opID, l.ProductID, l.Qty, l.UOM, l.UnitPrice, now)
+			`, tenantID, opID, l.ProductID, l.Qty, l.UOM, l.UnitPrice, now); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_lines", "error", execErr)
+			}
 		}
 
 		// Create initial step log
@@ -2136,11 +2148,13 @@ func (h *Handler) createDeliveryChainForSO(
 			SELECT id, name FROM operation_type_steps
 			WHERE operation_type_id = $1 AND tenant_id = $2 ORDER BY sequence LIMIT 1
 		`, opTypeID, tenantID).Scan(&firstStep.ID, &firstStep.Name); stepErr == nil {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO stock_operation_step_log (
 					id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
 				) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
-			`, tenantID, opID, firstStep.ID, firstStep.Name, now)
+			`, tenantID, opID, firstStep.ID, firstStep.Name, now); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_step_log", "error", execErr)
+			}
 		}
 		return opID
 	}
@@ -2213,10 +2227,12 @@ func (h *Handler) syncIntercompanySOConfirmToPO(tenantID uuid.UUID, soID uuid.UU
 	linkedPOID := link.SourceDocumentID
 
 	// Update the linked PO status to approved (shown as "Confirmed" in UI)
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE purchase_orders SET status = 'approved', updated_at = $1
 		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status = 'ordered'
-	`, now, linkedPOID, tenantID)
+	`, now, linkedPOID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+	}
 
 	// Create receipt stock op for the linked PO (buyer side)
 	h.createReceiptStockOpForPO(tenantID, linkedPOID, now)
@@ -2339,7 +2355,7 @@ func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.
 		var woCount int
 		h.db.QueryRow(`SELECT COUNT(*) FROM work_orders WHERE production_order_id = $1 AND tenant_id = $2 AND deleted_at IS NULL`, moID, tenantID).Scan(&woCount)
 		if woCount == 0 {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO work_orders (
 					id, tenant_id, organization_id, production_order_id, code, name,
 					sequence, status, quantity_to_produce, uom, created_by, created_at, updated_at
@@ -2348,7 +2364,9 @@ func (h *Handler) autoCreateProductionOrders(tenantID, orderID, customerID uuid.
 				fmt.Sprintf("%s-1", moCode),
 				fmt.Sprintf("%s - Ishlab chiqarish", line.Name),
 				deficit, line.UOM, userID, now,
-			)
+			); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT work_orders", "error", execErr)
+			}
 		}
 
 		h.log.Info("Auto MO: created production order",
@@ -2427,10 +2445,12 @@ func (h *Handler) CancelSalesOrder(c *gin.Context) {
 
 	// Cancel the order's open (unshipped) delivery documents and free the
 	// confirm-time reservation.
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE sales_delivery_orders SET status = 'cancelled', updated_at = $1
 		WHERE sales_order_id = $2 AND tenant_id = $3 AND status IN ('draft', 'ready') AND deleted_at IS NULL`,
-		now, orderID, tenantID)
+		now, orderID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE sales_delivery_orders", "error", execErr)
+	}
 	var orderWH *uuid.UUID
 	var whStr sql.NullString
 	_ = h.db.QueryRow("SELECT warehouse_id FROM sales_orders WHERE id = $1", orderID).Scan(&whStr)

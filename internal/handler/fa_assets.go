@@ -1026,8 +1026,10 @@ func (h *Handler) faAudit(tenantID, userID uuid.UUID, entityType string, entityI
 	if userID != uuid.Nil {
 		uid = userID
 	}
-	h.db.Exec(`INSERT INTO audit_logs (tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,NOW())`, tenantID, uid, action, entityType, entityID, string(ob), string(nb))
+	if _, execErr := h.db.Exec(`INSERT INTO audit_logs (tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,NOW())`, tenantID, uid, action, entityType, entityID, string(ob), string(nb)); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT audit_logs", "error", execErr)
+	}
 }
 
 func parseDatePtr(s string) interface{} {

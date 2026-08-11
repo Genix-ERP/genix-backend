@@ -55,11 +55,15 @@ func (h *Handler) GetSubscriptionStatus(c *gin.Context) {
 	now := time.Now()
 
 	if status == "trialing" && trialEndsAt.Valid && now.After(trialEndsAt.Time) {
-		h.db.Exec(`UPDATE tenants SET subscription_status = 'past_due' WHERE id = $1`, tenantID)
+		if _, execErr := h.db.Exec(`UPDATE tenants SET subscription_status = 'past_due' WHERE id = $1`, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE tenants", "error", execErr)
+		}
 		status = "past_due"
 	}
 	if accountClearAt.Valid && now.After(accountClearAt.Time) && status != "active" {
-		h.db.Exec(`UPDATE tenants SET subscription_status = 'expired', is_active = false WHERE id = $1`, tenantID)
+		if _, execErr := h.db.Exec(`UPDATE tenants SET subscription_status = 'expired', is_active = false WHERE id = $1`, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE tenants", "error", execErr)
+		}
 		status = "expired"
 		isActive = false
 	}
@@ -259,7 +263,7 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 	}
 
 	// Update payment record
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE subscription_payments
 		SET status       = $2,
 		    billing_id   = $3,
@@ -270,7 +274,9 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 		    updated_at   = NOW()
 		WHERE invoice_id = $1
 	`, payload.InvoiceID, payload.Status, payload.BillingID,
-		payload.CardPan, payload.PS, payload.CardToken, payload.PaymentTime)
+		payload.CardPan, payload.PS, payload.CardToken, payload.PaymentTime); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE subscription_payments", "error", execErr)
+	}
 
 	// Only activate on final success
 	if payload.Status == "success" {
@@ -292,7 +298,7 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 			endDate = now.AddDate(0, 1, 0) // +1 month
 		}
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE tenants
 			SET subscription_status = 'active',
 			    subscription_plan   = 'professional',
@@ -302,7 +308,11 @@ func (h *Handler) MulticardWebhook(c *gin.Context) {
 			    account_clear_at    = $3,
 			    updated_at          = NOW()
 			WHERE id = $1
-		`, tenantID, paidUsers, endDate)
+		`, tenantID, paidUsers, endDate); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE tenants", "error", execErr)
+
+		}
 
 		h.log.Info("Subscription activated via Multicard",
 			"tenant_id", tenantID, "plan", plan, "paid_users", paidUsers, "ends_at", endDate, "invoice", payload.InvoiceID)
@@ -364,7 +374,7 @@ func (h *Handler) VerifyPayment(c *gin.Context) {
 		"status", ps.Status, "billing_id", ps.BillingID, "amount", ps.Amount)
 
 	// Update our record with the latest status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE subscription_payments
 		SET status       = $2,
 		    billing_id   = $3,
@@ -374,7 +384,9 @@ func (h *Handler) VerifyPayment(c *gin.Context) {
 		    payment_time = $7,
 		    updated_at   = NOW()
 		WHERE invoice_id = $1
-	`, input.InvoiceID, ps.Status, ps.BillingID, ps.CardPan, ps.PS, ps.CardToken, ps.PaymentTime)
+	`, input.InvoiceID, ps.Status, ps.BillingID, ps.CardPan, ps.PS, ps.CardToken, ps.PaymentTime); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE subscription_payments", "error", execErr)
+	}
 
 	if ps.Status == "success" {
 		var paidUsers int
@@ -393,7 +405,7 @@ func (h *Handler) VerifyPayment(c *gin.Context) {
 			endDate = now.AddDate(0, 1, 0)
 		}
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE tenants
 			SET subscription_status = 'active',
 			    subscription_plan   = 'professional',
@@ -403,7 +415,11 @@ func (h *Handler) VerifyPayment(c *gin.Context) {
 			    account_clear_at    = $3,
 			    updated_at          = NOW()
 			WHERE id = $1
-		`, tenantID, paidUsers, endDate)
+		`, tenantID, paidUsers, endDate); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE tenants", "error", execErr)
+
+		}
 		h.log.Info("VerifyPayment: subscription activated", "tenant_id", tenantID, "plan", plan, "ends_at", endDate)
 	}
 

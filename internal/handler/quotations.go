@@ -423,7 +423,9 @@ func (h *Handler) UpdateQuotation(c *gin.Context) {
 		args = append(args, totalAmount)
 
 		// Delete old items and insert new ones
-		h.db.Exec("DELETE FROM sales_quotation_items WHERE quotation_id = $1", quotationID)
+		if _, execErr := h.db.Exec("DELETE FROM sales_quotation_items WHERE quotation_id = $1", quotationID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE sales_quotation_items", "error", execErr)
+		}
 
 		for i, item := range *input.Items {
 			itemID := uuid.New()
@@ -436,12 +438,16 @@ func (h *Handler) UpdateQuotation(c *gin.Context) {
 			}
 			itemTotal := item.Quantity * item.UnitPrice
 
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO sales_quotation_items (
 					id, quotation_id, product_id, product_name, quantity, unit_price, total, sort_order, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 				itemID, quotationID, productID, item.ProductName, item.Quantity, item.UnitPrice, itemTotal, i, now,
-			)
+			); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT sales_quotation_items", "error", execErr)
+
+			}
 		}
 	} else if input.DiscountPercent != nil || input.TaxPercent != nil {
 		// Recalculate if only discount/tax changed

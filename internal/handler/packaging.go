@@ -1414,7 +1414,9 @@ func (h *Handler) DeletePackage(c *gin.Context) {
 	}
 
 	// Delete contents first
-	h.db.Exec("DELETE FROM package_contents WHERE package_id = $1", id)
+	if _, execErr := h.db.Exec("DELETE FROM package_contents WHERE package_id = $1", id); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE package_contents", "error", execErr)
+	}
 
 	// Delete package
 	query := `DELETE FROM packages WHERE id = $1 AND tenant_id = $2`

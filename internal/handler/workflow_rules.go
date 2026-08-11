@@ -1701,20 +1701,28 @@ func (h *Handler) autoReplenishForTenant(tenantID uuid.UUID) {
 
 		// ONE INSERT for all purchase_order_lines
 		if len(lineValues) > 0 {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO purchase_order_lines (
 					id, purchase_order_id, line_number, product_id, description, quantity,
 					unit_price, discount_amount, tax_amount, line_total, warehouse_id,
 					quantity_received, quantity_invoiced, reorder_rule_id, created_at, updated_at
-				) VALUES `+strings.Join(lineValues, ","), lineArgs...)
+				) VALUES `+strings.Join(lineValues, ","), lineArgs...); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT purchase_order_lines", "error", execErr)
+			}
 		}
 
 		// ONE UPDATE for all reorder_rules
 		if len(ruleIDs) > 0 {
-			h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id = ANY($2)`, now, pq.Array(ruleIDs))
+			if _, execErr := h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id = ANY($2)`, now, pq.Array(ruleIDs)); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE reorder_rules", "error", execErr)
+			}
 		}
 
-		h.db.Exec(`UPDATE purchase_orders SET subtotal=$1, total_amount=$1, updated_at=$2 WHERE id=$3`, subtotal, now, poID)
+		if _, execErr := h.db.Exec(`UPDATE purchase_orders SET subtotal=$1, total_amount=$1, updated_at=$2 WHERE id=$3`, subtotal, now, poID); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+
+		}
 		ordersCreated++
 		h.log.Info("Auto replenishment: created PO", "order_number", orderNumber, "vendor_id", vidStr, "lines", len(group), "tenant_id", tenantID)
 	}
@@ -1779,20 +1787,28 @@ func (h *Handler) autoReplenishForTenant(tenantID uuid.UUID) {
 
 			// ONE INSERT for all purchase_order_lines
 			if len(nvLineValues) > 0 {
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO purchase_order_lines (
 						id, purchase_order_id, line_number, product_id, description, quantity,
 						unit_price, discount_amount, tax_amount, line_total, warehouse_id,
 						quantity_received, quantity_invoiced, reorder_rule_id, created_at, updated_at
-					) VALUES `+strings.Join(nvLineValues, ","), nvLineArgs...)
+					) VALUES `+strings.Join(nvLineValues, ","), nvLineArgs...); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT purchase_order_lines", "error", execErr)
+				}
 			}
 
 			// ONE UPDATE for all reorder_rules
 			if len(nvRuleIDs) > 0 {
-				h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id = ANY($2)`, now, pq.Array(nvRuleIDs))
+				if _, execErr := h.db.Exec(`UPDATE reorder_rules SET last_triggered_at=$1, updated_at=$1 WHERE id = ANY($2)`, now, pq.Array(nvRuleIDs)); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE reorder_rules", "error", execErr)
+				}
 			}
 
-			h.db.Exec(`UPDATE purchase_orders SET subtotal=$1, total_amount=$1, updated_at=$2 WHERE id=$3`, subtotal, now, poID)
+			if _, execErr := h.db.Exec(`UPDATE purchase_orders SET subtotal=$1, total_amount=$1, updated_at=$2 WHERE id=$3`, subtotal, now, poID); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+
+			}
 			ordersCreated++
 			h.log.Info("Auto replenishment: created no-vendor PO", "order_number", orderNumber, "lines", len(noVendorItems), "tenant_id", tenantID)
 		}

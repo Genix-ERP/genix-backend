@@ -350,7 +350,9 @@ func (h *Handler) InitiateCall(c *gin.Context) {
 		h.log.Error("Failed to create call log", "error", err)
 	}
 	if leadIDPtr != nil {
-		h.db.Exec(`UPDATE leads SET last_activity_at = NOW() WHERE id = $1 AND tenant_id = $2`, *leadIDPtr, tenantID)
+		if _, execErr := h.db.Exec(`UPDATE leads SET last_activity_at = NOW() WHERE id = $1 AND tenant_id = $2`, *leadIDPtr, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE leads", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{
@@ -675,7 +677,9 @@ func (h *Handler) PBXWebhook(c *gin.Context) {
 			h.log.Info("PBX webhook created call log", "id", newID, "event", event, "call_sid", callSID, "direction", direction, "lead_matched", leadID != nil)
 			// a real call is activity on the lead
 			if leadID != nil {
-				h.db.Exec(`UPDATE leads SET last_activity_at = NOW() WHERE id = $1 AND tenant_id = $2`, *leadID, tenantID)
+				if _, execErr := h.db.Exec(`UPDATE leads SET last_activity_at = NOW() WHERE id = $1 AND tenant_id = $2`, *leadID, tenantID); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE leads", "error", execErr)
+				}
 			}
 		}
 	}

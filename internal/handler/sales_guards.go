@@ -276,10 +276,12 @@ func (h *Handler) releaseSalesOrderReservation(tenantID uuid.UUID, orderID uuid.
 		if wh == nil || l.Qty <= 0 {
 			continue
 		}
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE inventory SET quantity_reserved = GREATEST(0, quantity_reserved - $1), updated_at = $2
 			WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5`,
-			l.Qty, now, tenantID, l.ProductID, *wh)
+			l.Qty, now, tenantID, l.ProductID, *wh); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE inventory", "error", execErr)
+		}
 	}
 }
 

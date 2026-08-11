@@ -425,10 +425,14 @@ func (h *Handler) executeWorkflowRule(ctx workflowEventCtx, ruleID uuid.UUID, ru
 
 	h.logWorkflowRun(ctx, ruleID, executedActions, condResults, status, lastError, time.Since(started))
 
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE workflow_rules SET last_triggered_at = NOW(), trigger_count = trigger_count + 1
 		WHERE id = $1
-	`, ruleID)
+	`, ruleID); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE workflow_rules", "error", execErr)
+
+	}
 
 	if status == "failed" && h.workflowRuleOverRate(ruleID) {
 		h.autoPauseWorkflowRule(ctx.TenantID, ruleID, ruleName, createdBy, "failure_storm")
@@ -894,10 +898,12 @@ func (h *Handler) wfActionCreateTask(ctx workflowEventCtx, ruleID uuid.UUID, rul
 	}
 
 	for _, empID := range assignees {
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO task_assignees (task_id, employee_id, tenant_id)
 			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
-		`, taskID, empID, ctx.TenantID)
+		`, taskID, empID, ctx.TenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT task_assignees", "error", execErr)
+		}
 	}
 
 	h.logTaskActivity(ctx.TenantID, taskID, uuid.Nil, "Avtomatlashtirish · "+ruleName, "created",

@@ -355,10 +355,12 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 	}
 
 	// Log time start - use migration 010 columns: worker_id, worker_name
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO work_order_time_logs (id, tenant_id, work_order_id, start_time, log_type, worker_id, worker_name, notes)
 		VALUES ($1, $2, $3, $4, 'work', $5, $6, $7)
-	`, uuid.New(), tenantID, woID, now, operatorID, operatorName, input.Notes)
+	`, uuid.New(), tenantID, woID, now, operatorID, operatorName, input.Notes); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT work_order_time_logs", "error", execErr)
+	}
 
 	// Get production_order_id for this work order
 	var poID uuid.UUID
@@ -369,7 +371,9 @@ func (h *Handler) StartWorkOrder(c *gin.Context) {
 		var poStatus string
 		h.db.QueryRow(`SELECT status FROM production_orders WHERE id = $1 AND tenant_id = $2`, poID, tenantID).Scan(&poStatus)
 		if poStatus != "in_progress" {
-			h.db.Exec(`UPDATE production_orders SET status = 'in_progress', actual_start = $1, updated_at = $1 WHERE id = $2 AND tenant_id = $3`, now, poID, tenantID)
+			if _, execErr := h.db.Exec(`UPDATE production_orders SET status = 'in_progress', actual_start = $1, updated_at = $1 WHERE id = $2 AND tenant_id = $3`, now, poID, tenantID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+			}
 			// Consume BOM materials if not already consumed
 			h.consumeBOMComponents(poID, tenantID, operatorID, now)
 		}
@@ -442,11 +446,13 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	h.recordPiecework(tenantID, woID, userID, input.QuantityProduced, now)
 
 	// Log time end - use migration 010 columns: duration_hours
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE work_order_time_logs
 		SET end_time = $1, duration_hours = $2, notes = $3
 		WHERE work_order_id = $4 AND end_time IS NULL
-	`, now, durationHours, input.Notes, woID)
+	`, now, durationHours, input.Notes, woID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE work_order_time_logs", "error", execErr)
+	}
 
 	// Update work center utilization
 	var wcIDStr sql.NullString
@@ -471,8 +477,10 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				if utilization > 100 {
 					utilization = 100
 				}
-				h.db.Exec(`UPDATE work_centers SET current_utilization = $1 WHERE id = $2 AND tenant_id = $3`,
-					utilization, workCenterID, tenantID)
+				if _, execErr := h.db.Exec(`UPDATE work_centers SET current_utilization = $1 WHERE id = $2 AND tenant_id = $3`,
+					utilization, workCenterID, tenantID); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE work_centers", "error", execErr)
+				}
 			}
 		}
 	}
@@ -512,27 +520,35 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 	}
 	h.log.Info("CompleteWorkOrder: progress", "totalWOs", totalWOs, "completedWOs", completedWOs, "progressPct", progressPct, "nextErr", nextErr)
 
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE production_orders SET progress_percent = $1, updated_at = $2
 		WHERE id = $3 AND tenant_id = $4
-	`, progressPct, now, productionOrderID, tenantID)
+	`, progressPct, now, productionOrderID, tenantID); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+
+	}
 
 	if nextErr == nil {
 		h.log.Info("CompleteWorkOrder: advancing to next WO", "next_wo_id", nextWoID, "next_sequence", nextSequence)
 		// Mark next work order as ready — worker must press Start manually
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE work_orders
 			SET status = 'ready', updated_at = $1
 			WHERE id = $2 AND tenant_id = $3
-		`, now, nextWoID, tenantID)
+		`, now, nextWoID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE work_orders", "error", execErr)
+		}
 
 		// Advance production order stage to next operation
 		nextStage := fmt.Sprintf("op_%d", nextSequence)
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE production_orders
 			SET current_stage = $1, updated_at = $2
 			WHERE id = $3 AND tenant_id = $4
-		`, nextStage, now, productionOrderID, tenantID)
+		`, nextStage, now, productionOrderID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+		}
 	} else {
 		// No more work orders — check if all completed
 		var incompleteCount int
@@ -594,13 +610,15 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 					shortfallReasonSQL = ", shortfall_reason = $6"
 					shortfallArgs = append(shortfallArgs, input.ShortfallReason)
 				}
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					UPDATE production_orders
 					SET status = 'completed', current_stage = 'done', progress_percent = 100,
 					    quantity_produced = $1, good_quantity = $1, reject_quantity = $2,
 					    actual_end = $3, updated_at = $3`+shortfallReasonSQL+`
 					WHERE id = $4 AND tenant_id = $5
-				`, shortfallArgs...)
+				`, shortfallArgs...); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+				}
 
 				// Add finished goods to inventory (last step's good output)
 				unitCost := h.receiveFinishedGoods(productionOrderID, tenantID, userID, lastWoProduced, now)
@@ -609,11 +627,13 @@ func (h *Handler) CompleteWorkOrder(c *gin.Context) {
 				// Set material_cost and actual_cost on the production order
 				totalCost := unitCost * (lastWoProduced + totalScrapped)
 				if totalCost > 0 {
-					h.db.Exec(`
+					if _, execErr := h.db.Exec(`
 						UPDATE production_orders
 						SET material_cost = $1, actual_cost = $1, updated_at = $2
 						WHERE id = $3 AND tenant_id = $4
-					`, totalCost, now, productionOrderID, tenantID)
+					`, totalCost, now, productionOrderID, tenantID); execErr != nil {
+						h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+					}
 				}
 
 				// Move scrapped items to scrap warehouse
@@ -814,11 +834,13 @@ func (h *Handler) RecordWorkOrderTime(c *gin.Context) {
 
 	// Update work order quantity produced if provided
 	if input.QuantityProduced > 0 {
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE work_orders
 			SET quantity_produced = quantity_produced + $1
 			WHERE id = $2 AND tenant_id = $3
-		`, input.QuantityProduced, woID, tenantID)
+		`, input.QuantityProduced, woID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE work_orders", "error", execErr)
+		}
 	}
 
 	response.Created(c, gin.H{
@@ -859,11 +881,13 @@ func (h *Handler) PauseWorkOrder(c *gin.Context) {
 	now := time.Now()
 
 	// End current time log - use migration 010 columns: duration_hours
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE work_order_time_logs
 		SET end_time = $1, duration_hours = EXTRACT(EPOCH FROM ($1 - start_time)) / 3600
 		WHERE work_order_id = $2 AND end_time IS NULL
-	`, now, woID)
+	`, now, woID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE work_order_time_logs", "error", execErr)
+	}
 
 	// Update status to paused (migration 010 valid status)
 	_, err = h.db.Exec("UPDATE work_orders SET status = 'paused' WHERE id = $1 AND tenant_id = $2", woID, tenantID)
@@ -876,10 +900,12 @@ func (h *Handler) PauseWorkOrder(c *gin.Context) {
 	// Log pause - use migration 010 columns: worker_id, worker_name, duration_hours
 	var userName string
 	h.db.QueryRow("SELECT COALESCE(first_name || ' ' || last_name, email) FROM users WHERE id = $1", userID).Scan(&userName)
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO work_order_time_logs (id, tenant_id, work_order_id, start_time, end_time, duration_hours, log_type, worker_id, worker_name)
 		VALUES ($1, $2, $3, $4, $4, 0, 'pause', $5, $6)
-	`, uuid.New(), tenantID, woID, now, userID, userName)
+	`, uuid.New(), tenantID, woID, now, userID, userName); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT work_order_time_logs", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Work order paused"})
 }
@@ -1178,20 +1204,24 @@ func (h *Handler) ValidateManufacturingTransfer(c *gin.Context) {
 	// Update line quantities if provided
 	for _, line := range input.Lines {
 		lineID, _ := uuid.Parse(line.LineID)
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE manufacturing_transfer_lines
 			SET quantity_done = $1, lot_number = $2, serial_number = $3
 			WHERE id = $4 AND manufacturing_transfer_id = $5
-		`, line.QuantityDone, line.LotNumber, line.SerialNumber, lineID, transferID)
+		`, line.QuantityDone, line.LotNumber, line.SerialNumber, lineID, transferID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE manufacturing_transfer_lines", "error", execErr)
+		}
 	}
 
 	// If no lines provided, set quantity_done = quantity_demanded for all lines
 	if len(input.Lines) == 0 {
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE manufacturing_transfer_lines
 			SET quantity_done = quantity_demanded
 			WHERE manufacturing_transfer_id = $1
-		`, transferID)
+		`, transferID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE manufacturing_transfer_lines", "error", execErr)
+		}
 	}
 
 	// Update transfer status
@@ -1664,10 +1694,14 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 	}
 	// Update product's cost_price with the calculated manufacturing cost (both tables)
 	if unitCost > 0 {
-		h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID)
+		if _, execErr := h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`, unitCost, now, productID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE products", "error", execErr)
+		}
 		if organizationID != nil {
-			h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
-				unitCost, now, productID, *organizationID)
+			if _, execErr := h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+				unitCost, now, productID, *organizationID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_organization_settings", "error", execErr)
+			}
 		}
 	}
 
@@ -1681,7 +1715,9 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 			bomID, *organizationID,
 		).Scan(&bomWhID) == nil {
 			warehouseID = &bomWhID
-			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, bomWhID, poID, tenantID)
+			if _, execErr := h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, bomWhID, poID, tenantID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+			}
 			h.log.Info("receiveFinishedGoods: warehouse from BOM", "warehouse_id", bomWhID, "po_id", poID)
 		}
 	}
@@ -1689,7 +1725,9 @@ func (h *Handler) receiveFinishedGoods(poID, tenantID, userID uuid.UUID, produce
 		var firstWH uuid.UUID
 		if h.db.QueryRow(`SELECT id FROM warehouses WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1`, tenantID).Scan(&firstWH) == nil {
 			warehouseID = &firstWH
-			h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, poID, tenantID)
+			if _, execErr := h.db.Exec(`UPDATE production_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, poID, tenantID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+			}
 			h.log.Info("receiveFinishedGoods: auto-assigned warehouse", "warehouse_id", firstWH, "po_id", poID)
 		} else {
 			h.log.Warn("receiveFinishedGoods: no warehouse found, skipping inventory", "po_id", poID)
@@ -2769,7 +2807,9 @@ func (h *Handler) DeleteWorkOrderAttachment(c *gin.Context) {
 
 	// Remove the backing file row from the database
 	if storagePath != "" {
-		h.db.Exec(`DELETE FROM uploaded_files WHERE id = $1`, storagePath)
+		if _, execErr := h.db.Exec(`DELETE FROM uploaded_files WHERE id = $1`, storagePath); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE uploaded_files", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Attachment deleted"})
