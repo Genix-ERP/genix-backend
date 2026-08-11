@@ -365,6 +365,15 @@ func (h *Handler) createInvoiceAndPostIssuance(
 	if revenueAccountID == uuid.Nil {
 		revenueAccountID = findAccount(tx, tenantID, orgPtr, "sales revenue", "9010")
 	}
+	// Self-heal a never-seeded chart before giving up on the GL leg.
+	if (arAccountID == uuid.Nil || revenueAccountID == uuid.Nil) && h.ensureDefaultChart(tenantID, orgPtr) {
+		if arAccountID == uuid.Nil {
+			arAccountID = findAccount(tx, tenantID, orgPtr, "accounts receivable", "4010")
+		}
+		if revenueAccountID == uuid.Nil {
+			revenueAccountID = findAccount(tx, tenantID, orgPtr, "sales revenue", "9010")
+		}
+	}
 	if arAccountID == uuid.Nil || revenueAccountID == uuid.Nil {
 		h.log.Error("full-order: cannot resolve AR/Revenue; invoice GL not posted", "ar", arAccountID, "rev", revenueAccountID)
 		// No GL movement, but keep the denormalized customer balance honest.

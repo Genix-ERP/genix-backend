@@ -73,6 +73,20 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 		return append(args, extra...)
 	}
 
+	// Lazy repair, same read-side pattern ListAccounts uses to seed the chart:
+	// invoices issued while the tenant had no chart carry no journal entry, so
+	// this dashboard showed Daromad 0 against a full invoice list. Post the
+	// missing issuance entries now, before the queries below read the ledger —
+	// the visit that would show the wrong zero is the one that repairs it.
+	// For healthy tenants the guard is a single indexed count returning 0.
+	var backfillOrg *uuid.UUID
+	if orgScoped {
+		backfillOrg = &orgID
+	}
+	if n := h.countUnpostedSalesInvoices(tenantID, backfillOrg); n > 0 {
+		h.backfillSalesInvoiceJournalEntries(tenantID, backfillOrg, 200)
+	}
+
 	// ── 1. Period totals ────────────────────────────────────────────────
 	var totalIncome, totalExpense float64
 	_ = h.db.QueryRow(`
