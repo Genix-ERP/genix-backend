@@ -175,13 +175,26 @@ func (h *Handler) ListCashRegisters(c *gin.Context) {
 		return
 	}
 
-	query := cashRegisterSelect + ` WHERE cr.tenant_id = $1 AND cr.deleted_at IS NULL`
+	where := ` WHERE cr.tenant_id = $1 AND cr.deleted_at IS NULL`
 	args := []interface{}{tenantID}
 	if orgID := middlewareOrgPtr(c); orgID != nil {
-		query += " AND (cr.organization_id = $2 OR cr.organization_id IS NULL)"
+		where += " AND (cr.organization_id = $2 OR cr.organization_id IS NULL)"
 		args = append(args, *orgID)
 	}
-	query += " ORDER BY cr.created_at ASC"
+
+	// Opt-in paging: the mobile app already sends page/page_size and was
+	// silently handed the whole list; the web sends neither and must keep
+	// getting it, so no default page size is imposed on either. created_at
+	// alone is not a total order — seeded registers share a timestamp to
+	// the microsecond — so id breaks the tie and no row can land on two
+	// pages or on none.
+	countArgs := append([]interface{}{}, args...)
+	query := cashRegisterSelect + where + " ORDER BY cr.created_at ASC, cr.id ASC"
+	paginate, page, pageSize, offset := optPagination(c)
+	if paginate {
+		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+		args = append(args, pageSize, offset)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -200,7 +213,87 @@ func (h *Handler) ListCashRegisters(c *gin.Context) {
 		}
 		items = append(items, item)
 	}
-	response.Success(c, items)
+
+	if !paginate {
+		response.Success(c, items)
+		return
+	}
+
+	total := 0
+	if err := h.db.QueryRow(`SELECT COUNT(*) FROM cash_registers cr`+where, countArgs...).Scan(&total); err != nil {
+		h.log.Error("Failed to count cash registers", "error", err)
+		total = len(items)
+	}
+	response.Paginated(c, items, page, pageSize, total)
+}
+
+// defaultCashRegisterAccount resolves the 5010 kassa leaf a new register
+// links to when the caller names no account_id/account_code. It returns
+// uuid.Nil when the tenant has no such leaf, and an error when it has more
+// than one candidate — the caller must then demand an explicit account.
+//
+// The old default was findAccount(h.db, ..., "kassa", "5010"), which puts
+// LIMIT 1 on every one of its six strategies. That is a coin flip here:
+// this tenant has NINE "5010 Kassa" leaves, one per branch. A register that
+// drew another branch's leaf is not a visible error — cashRegisterSelect's
+// LATERAL join reads the same account_id it was linked to, so the register
+// reports a perfectly consistent balance that happens to include the other
+// branch's PKO/RKO movements.
+//
+// Priority mirrors findAccount's: the request's own organization first,
+// then leaves shared across the tenant (organization_id IS NULL). It never
+// falls through to another organization's leaf — binding branch A's kassa
+// to branch B's GL account is the exact failure this replaces.
+func defaultCashRegisterAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID) (uuid.UUID, error) {
+	// COUNT with MIN(id) rather than LIMIT 1: the count is the answer here,
+	// and the id is only usable when the count says it is unambiguous.
+	const base = `
+		SELECT COUNT(*), MIN(id::text) FROM accounts
+		WHERE tenant_id = $1 AND code LIKE $2 AND deleted_at IS NULL
+		  AND is_active = true AND COALESCE(is_leaf, true) = true`
+
+	candidates := func(orgClause string, args ...interface{}) (int, uuid.UUID) {
+		var n int
+		var idStr sql.NullString
+		if err := q.QueryRow(base+orgClause, args...).Scan(&n, &idStr); err != nil {
+			return 0, uuid.Nil
+		}
+		if n != 1 || !idStr.Valid {
+			return n, uuid.Nil
+		}
+		id, err := uuid.Parse(idStr.String)
+		if err != nil {
+			return n, uuid.Nil
+		}
+		return n, id
+	}
+
+	// The count in the message is the count within the scope that was
+	// searched, so a caller who sees "2" and looks at their own branch's
+	// chart of accounts finds two rows, not nine.
+	ambiguous := func(n int, scope string) error {
+		return fmt.Errorf("account_id is required: %s has %d 5010 kassa leaf accounts, pick one", scope, n)
+	}
+
+	if orgID != nil {
+		if n, id := candidates(" AND organization_id = $3", tenantID, "5010%", *orgID); n > 0 {
+			if n > 1 {
+				return uuid.Nil, ambiguous(n, "this organization")
+			}
+			return id, nil
+		}
+		n, id := candidates(" AND organization_id IS NULL", tenantID, "5010%")
+		if n > 1 {
+			return uuid.Nil, ambiguous(n, "this tenant")
+		}
+		return id, nil
+	}
+
+	n, id := candidates("", tenantID, "5010%")
+	if n > 1 {
+		return uuid.Nil, ambiguous(n, "this tenant")
+	}
+	return id, nil
 }
 
 type cashRegisterInput struct {
@@ -241,10 +334,15 @@ func (h *Handler) CreateCashRegister(c *gin.Context) {
 		return
 	}
 	if accountID == uuid.Nil {
-		// Default GL link: the tenant's 5010 kassa leaf.
-		accountID = findAccount(h.db, tenantID, orgIDPtr, "kassa", "5010")
-		if accountID == uuid.Nil {
-			accountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+		// Default GL link: the tenant's 5010 kassa leaf, but only when there
+		// is exactly one to mean. More than one and the register is created
+		// without a GL link at all rather than guessed at — see
+		// defaultCashRegisterAccount. Zero leaves still creates the register
+		// with account_id NULL, as before.
+		accountID, err = defaultCashRegisterAccount(h.db, tenantID, orgIDPtr)
+		if err != nil {
+			response.BadRequest(c, err.Error())
+			return
 		}
 	}
 
@@ -1288,6 +1386,15 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 // GetCashBalance returns the ledger balance of every CASH-type leaf
 // account plus the total — the same SQL shape as the finance dashboard's
 // cash card, so the Kassa tab and the dashboard can never disagree.
+//
+// Every row carries a `kind` derived from its account code, and the
+// response carries one subtotal per kind. Neither is a client's job: the
+// web's "Kassa balansi" card filtered kind == 'cash' and reduced in the
+// browser, so the rule "what counts as kassa" lived in JavaScript — and
+// the tag it filtered on called every 50xx account cash, bank and currency
+// accounts included. One tenant, one label: -467.4 mln on web (5010 + 5020
+// + 5030) against 0 so'm on mobile (one register's 5010). The rule lives
+// here now, and the number the card shows is a field, not a reduce.
 func (h *Handler) GetCashBalance(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -1324,7 +1431,7 @@ func (h *Handler) GetCashBalance(c *gin.Context) {
 	defer rows.Close()
 
 	accounts := make([]gin.H, 0)
-	var total float64
+	var total, cashTotal, bankTotal, currencyTotal float64
 	for rows.Next() {
 		var accID uuid.UUID
 		var code, name string
@@ -1332,9 +1439,22 @@ func (h *Handler) GetCashBalance(c *gin.Context) {
 		if err := rows.Scan(&accID, &code, &name, &balance); err != nil {
 			continue
 		}
-		kind := "bank"
-		if strings.HasPrefix(code, "50") {
+		// The tag is the account code, one plan-of-accounts line each: 5010
+		// kassa, 5020 bank hisobi, 5030 valyuta hisobi. It used to be
+		// HasPrefix(code, "50"), which swallowed all three into "cash" —
+		// that is what put the bank accounts inside the Kassa card while
+		// the Bank hisobvaraqlari tab showed the same money next to it.
+		kind := "other"
+		switch {
+		case strings.HasPrefix(code, "5010"):
 			kind = "cash"
+			cashTotal += balance
+		case strings.HasPrefix(code, "5020"):
+			kind = "bank"
+			bankTotal += balance
+		case strings.HasPrefix(code, "5030"):
+			kind = "currency"
+			currencyTotal += balance
 		}
 		accounts = append(accounts, gin.H{
 			"account_id": accID.String(),
@@ -1346,10 +1466,20 @@ func (h *Handler) GetCashBalance(c *gin.Context) {
 		total += balance
 	}
 
+	// total stays what it was — every CASH-type leaf, the figure the
+	// dashboard card and the KPI endpoint are pinned to (test_34_moliya_v2).
+	// A CASH-type account whose code starts with neither 5010, 5020 nor
+	// 5030 lands in "other": it counts toward total and toward no subtotal,
+	// deliberately, so cash + bank + currency < total is a visible signal
+	// that the tenant's plan of accounts has a line nobody classified —
+	// rather than a silent reassignment into whichever subtotal is nearest.
 	response.Success(c, gin.H{
-		"total":    total,
-		"as_of":    asOf,
-		"accounts": accounts,
+		"total":          total,
+		"cash_total":     cashTotal,
+		"bank_total":     bankTotal,
+		"currency_total": currencyTotal,
+		"as_of":          asOf,
+		"accounts":       accounts,
 	})
 }
 
