@@ -2817,9 +2817,32 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 		tenantID,
 	).Scan(&salesJournalID, &numberPrefix)
 
+	// Self-heal a never-seeded chart before skipping. This block used to be
+	// skipped SILENTLY for a tenant with no SALES journal or no 4010 — every
+	// invoice came out 'sent' with no ledger trace, which is why such a
+	// tenant's dashboard showed Daromad 0 while their invoice list carried
+	// millions. (The screenshot that surfaced it: EVROPLIT, 11.1 mln overdue,
+	// income 0.)
+	if journalErr != nil || findAccount(tx, tenantID, organizationID, "accounts receivable", "4010") == uuid.Nil {
+		if h.ensureDefaultChart(tenantID, organizationID) {
+			journalErr = tx.QueryRow(`
+				SELECT id, number_prefix
+				FROM journals WHERE tenant_id = $1 AND code IN ('SALES', 'SAL') AND deleted_at IS NULL`,
+				tenantID,
+			).Scan(&salesJournalID, &numberPrefix)
+		}
+	}
+
 	if journalErr == nil {
 		// Find AR account
 		arAccountID := findAccount(tx, tenantID, organizationID, "accounts receivable", "4010")
+
+		if arAccountID == uuid.Nil {
+			// Loudly, not silently: the invoice still saves, but someone must
+			// know its ledger leg is missing.
+			h.log.Error("CreateInvoiceFromOrder: AR account missing even after chart self-heal; invoice saved WITHOUT journal entry",
+				"tenant_id", tenantID, "invoice_id", invoiceID)
+		}
 
 		if arAccountID != uuid.Nil {
 			taxAccountID := findAccount(tx, tenantID, organizationID, "QQS bo'yicha qarz", "6420")

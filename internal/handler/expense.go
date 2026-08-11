@@ -1884,6 +1884,17 @@ func (h *Handler) PayExpense(c *gin.Context) {
 		}
 	}
 
+	// Self-heal a never-seeded chart before refusing (same rescue as
+	// record-payment on the sales side).
+	if (expenseAccountID == uuid.Nil || creditAccountID == uuid.Nil) && h.ensureDefaultChart(tenantID, orgIDPtr) {
+		if expenseAccountID == uuid.Nil {
+			expenseAccountID = findAccount(tx, tenantID, orgIDPtr, "operating expense", "9410")
+		}
+		if creditAccountID == uuid.Nil && input.PaymentAccountID == "" {
+			creditAccountID = findAccount(tx, tenantID, orgIDPtr, "kassa", "5010")
+		}
+	}
+
 	if expenseAccountID == uuid.Nil || creditAccountID == uuid.Nil {
 		response.BadRequest(c, "Cannot resolve GL accounts for payment (expense 9410 or kassa/bank 5010)")
 		return
@@ -1902,11 +1913,15 @@ func (h *Handler) PayExpense(c *gin.Context) {
 	// used, so expense entries stay in one journal across the migration).
 	var journalID uuid.UUID
 	var nextNumber int
-	if err := tx.QueryRow(`
+	journalQ := `
 		SELECT id, COALESCE(next_number, 1)
 		FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
-		ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`,
-		tenantID).Scan(&journalID, &nextNumber); err != nil {
+		ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`
+	err = tx.QueryRow(journalQ, tenantID).Scan(&journalID, &nextNumber)
+	if err != nil && h.ensureDefaultChart(tenantID, orgIDPtr) {
+		err = tx.QueryRow(journalQ, tenantID).Scan(&journalID, &nextNumber)
+	}
+	if err != nil {
 		response.BadRequest(c, "No MISC/GENERAL journal found for this tenant")
 		return
 	}
