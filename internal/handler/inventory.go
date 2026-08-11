@@ -2113,7 +2113,9 @@ func (h *Handler) CreateBOM(c *gin.Context) {
 		}
 		// Set warehouse after if column exists
 		if warehouseID != nil {
-			h.db.Exec(`UPDATE product_boms SET warehouse_id = $1 WHERE id = $2`, warehouseID, bomID)
+			if _, execErr := h.db.Exec(`UPDATE product_boms SET warehouse_id = $1 WHERE id = $2`, warehouseID, bomID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_boms", "error", execErr)
+			}
 		}
 	}
 
@@ -2264,8 +2266,10 @@ func (h *Handler) UpdateBOM(c *gin.Context) {
 
 		// If setting as default, unset others
 		if *input.IsDefault {
-			h.db.Exec("UPDATE product_boms SET is_default = false WHERE product_id = $1 AND tenant_id = $2 AND id != $3",
-				productID, tenantID, bomID)
+			if _, execErr := h.db.Exec("UPDATE product_boms SET is_default = false WHERE product_id = $1 AND tenant_id = $2 AND id != $3",
+				productID, tenantID, bomID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_boms", "error", execErr)
+			}
 		}
 	}
 	if input.Notes != nil {
@@ -2455,7 +2459,9 @@ func (h *Handler) CreateBOMLine(c *gin.Context) {
 	}
 
 	// Update BOM timestamp
-	h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", now, bomID)
+	if _, execErr := h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", now, bomID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_boms", "error", execErr)
+	}
 
 	response.Created(c, gin.H{
 		"id":          lineID,
@@ -2522,7 +2528,9 @@ func (h *Handler) DeleteBOMLine(c *gin.Context) {
 	}
 
 	// Update BOM timestamp
-	h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", time.Now(), bomID)
+	if _, execErr := h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", time.Now(), bomID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_boms", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "BOM line deleted successfully"})
 }
@@ -2825,7 +2833,9 @@ func (h *Handler) CreateBOMOperation(c *gin.Context) {
 	}
 
 	// Update BOM timestamp
-	h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", now, bomID)
+	if _, execErr := h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", now, bomID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_boms", "error", execErr)
+	}
 
 	response.Created(c, gin.H{
 		"id":       id,
@@ -2995,7 +3005,9 @@ func (h *Handler) UpdateBOMOperation(c *gin.Context) {
 	}
 
 	// Update BOM timestamp
-	h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", time.Now(), bomID)
+	if _, execErr := h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", time.Now(), bomID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_boms", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "BOM operation updated successfully"})
 }
@@ -3048,7 +3060,9 @@ func (h *Handler) DeleteBOMOperation(c *gin.Context) {
 	}
 
 	// Detach any work orders referencing this operation before deleting
-	h.db.Exec("UPDATE work_orders SET operation_id = NULL WHERE operation_id = $1", operationID)
+	if _, execErr := h.db.Exec("UPDATE work_orders SET operation_id = NULL WHERE operation_id = $1", operationID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE work_orders", "error", execErr)
+	}
 
 	result, err := h.db.Exec("DELETE FROM bom_operations WHERE id = $1 AND bom_id = $2", operationID, bomID)
 	if err != nil {
@@ -3064,7 +3078,9 @@ func (h *Handler) DeleteBOMOperation(c *gin.Context) {
 	}
 
 	// Update BOM timestamp
-	h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", time.Now(), bomID)
+	if _, execErr := h.db.Exec("UPDATE product_boms SET updated_at = $1 WHERE id = $2", time.Now(), bomID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_boms", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "BOM operation deleted successfully"})
 }
@@ -4799,10 +4815,12 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 		}
 
 		// Update purchase order totals
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE purchase_orders SET subtotal = $1, total_amount = $1, updated_at = $2
 			WHERE id = $3
-		`, subtotal, time.Now(), poID)
+		`, subtotal, time.Now(), poID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+		}
 
 		ordersCreated++
 		orderIDs = append(orderIDs, poID)
@@ -4867,10 +4885,14 @@ func (h *Handler) RunReplenishment(c *gin.Context) {
 				lineNumber++
 			}
 
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE purchase_orders SET subtotal = $1, total_amount = $1, updated_at = $2
 				WHERE id = $3
-			`, subtotal, time.Now(), poID)
+			`, subtotal, time.Now(), poID); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+
+			}
 
 			ordersCreated++
 			orderIDs = append(orderIDs, poID)
@@ -5597,7 +5619,9 @@ func (h *Handler) RecordCountLine(c *gin.Context) {
 	}
 
 	// Update count status to in_progress if still draft
-	h.db.Exec("UPDATE stock_counts SET status = 'in_progress', started_at = COALESCE(started_at, $1), started_by = COALESCE(started_by, $2), updated_at = $1 WHERE id = $3 AND status = 'draft'", now, userID, countID)
+	if _, execErr := h.db.Exec("UPDATE stock_counts SET status = 'in_progress', started_at = COALESCE(started_at, $1), started_by = COALESCE(started_by, $2), updated_at = $1 WHERE id = $3 AND status = 'draft'", now, userID, countID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_counts", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Count recorded"})
 }
@@ -5840,8 +5864,12 @@ func (h *Handler) DeleteStockCount(c *gin.Context) {
 	}
 
 	// Delete lines first, then header
-	h.db.Exec("DELETE FROM stock_count_lines WHERE stock_count_id = $1", id)
-	h.db.Exec("DELETE FROM stock_counts WHERE id = $1 AND tenant_id = $2", id, tenantID)
+	if _, execErr := h.db.Exec("DELETE FROM stock_count_lines WHERE stock_count_id = $1", id); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE stock_count_lines", "error", execErr)
+	}
+	if _, execErr := h.db.Exec("DELETE FROM stock_counts WHERE id = $1 AND tenant_id = $2", id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE stock_counts", "error", execErr)
+	}
 
 	response.NoContent(c)
 }
@@ -6280,7 +6308,7 @@ func (h *Handler) CreateStockOperation(c *gin.Context) {
 		if qs == "" {
 			qs = "good"
 		}
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO stock_operation_lines (
 				id, tenant_id, operation_id, product_id,
 				expected_qty, done_qty, uom, unit_price,
@@ -6293,7 +6321,9 @@ func (h *Handler) CreateStockOperation(c *gin.Context) {
 			l.ExpectedQty, l.DoneQty, uom, l.UnitPrice,
 			l.LotNumber, l.ExpiryDate, qs,
 			l.WriteOffReason, l.Note, now,
-		)
+		); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_lines", "error", execErr)
+		}
 	}
 
 	// Create initial step log for step 1
@@ -6311,11 +6341,15 @@ func (h *Handler) CreateStockOperation(c *gin.Context) {
 		firstStepName = firstStep.Name
 	}
 
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO stock_operation_step_log (
 			id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
 		) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
-	`, tenantID, id, firstStep.ID, firstStepName, now)
+	`, tenantID, id, firstStep.ID, firstStepName, now); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_step_log", "error", execErr)
+
+	}
 
 	response.Created(c, map[string]interface{}{
 		"id":   id,
@@ -6563,16 +6597,20 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 	if stepRequiresApproval && op.State != "awaiting_approval" {
 		// Set step to awaiting_approval instead of completed
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE stock_operation_step_log
 			SET state='awaiting_approval', completed_at=NULL, completed_by=NULL
 			WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
-		`, id, op.CurrentStep, tenantID)
-		h.db.Exec(`
+		`, id, op.CurrentStep, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_step_log", "error", execErr)
+		}
+		if _, execErr := h.db.Exec(`
 			UPDATE stock_operations
 			SET state='awaiting_approval', updated_at=$1
 			WHERE id=$2 AND tenant_id=$3
-		`, now, id, tenantID)
+		`, now, id, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+		}
 		response.Success(c, gin.H{
 			"state":             "awaiting_approval",
 			"current_step":      op.CurrentStep,
@@ -6583,11 +6621,13 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 	}
 
 	// Mark current step as completed
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operation_step_log
 		SET state='completed', completed_at=$1, completed_by=$2
 		WHERE operation_id=$3 AND step_sequence=$4 AND tenant_id=$5
-	`, now, userID, id, op.CurrentStep, tenantID)
+	`, now, userID, id, op.CurrentStep, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_step_log", "error", execErr)
+	}
 
 	var newState string
 	if isLastStep {
@@ -6657,16 +6697,20 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			}
 
 			if needsApproval {
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					UPDATE stock_operation_step_log
 					SET state='awaiting_approval', completed_at=NULL
 					WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
-				`, id, op.CurrentStep, tenantID)
-				h.db.Exec(`
+				`, id, op.CurrentStep, tenantID); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_step_log", "error", execErr)
+				}
+				if _, execErr := h.db.Exec(`
 					UPDATE stock_operations
 					SET state='awaiting_approval', updated_at=$1
 					WHERE id=$2 AND tenant_id=$3
-				`, now, id, tenantID)
+				`, now, id, tenantID); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+				}
 				response.Success(c, gin.H{
 					"state":             "awaiting_approval",
 					"current_step":      op.CurrentStep,
@@ -6683,11 +6727,13 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		// failed halfway.
 		markDoneAndPostJE := func() {
 			newState = "done"
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE stock_operations
 				SET state='done', done_at=$1, updated_at=$1
 				WHERE id=$2 AND tenant_id=$3
-			`, now, id, tenantID)
+			`, now, id, tenantID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+			}
 
 			// Create journal entry if auto_post_accounting is enabled
 			var autoPost bool
@@ -7184,11 +7230,13 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					var prodID uuid.UUID
 					var doneQty float64
 					if err := opLines.Scan(&prodID, &doneQty); err == nil {
-						h.db.Exec(`
+						if _, execErr := h.db.Exec(`
 							UPDATE purchase_order_lines
 							SET quantity_received = $1, updated_at = $2
 							WHERE purchase_order_id = $3 AND product_id = $4
-						`, doneQty, now, *op.SourceID, prodID)
+						`, doneQty, now, *op.SourceID, prodID); execErr != nil {
+							h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_order_lines", "error", execErr)
+						}
 					}
 				}
 			}
@@ -7204,10 +7252,12 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			if totalReceived >= totalQty {
 				poStatus = "received"
 			}
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE purchase_orders SET status = $1, updated_at = $2
 				WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
-			`, poStatus, now, *op.SourceID, tenantID)
+			`, poStatus, now, *op.SourceID, tenantID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+			}
 
 			// Intercompany: update linked SO to "delivered" when PO is fully received
 			if poStatus == "received" {
@@ -7218,10 +7268,12 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 					linkedSOID = &link.LinkedDocumentID
 				}
 				if linkedSOID != nil {
-					h.db.Exec(`
+					if _, execErr := h.db.Exec(`
 						UPDATE sales_orders SET status = 'delivered', updated_at = $1
 						WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL AND status != 'delivered'
-					`, now, *linkedSOID, tenantID)
+					`, now, *linkedSOID, tenantID); execErr != nil {
+						h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE sales_orders", "error", execErr)
+					}
 
 					// Also complete the delivery stock operation linked to this SO
 					h.completeLinkedDeliveryOp(tenantID, *linkedSOID, now)
@@ -7253,10 +7305,12 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 			}
 			if linkedPOID != nil {
 				// Always update PO status to received
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					UPDATE purchase_orders SET status = 'received', updated_at = $1
 					WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-				`, now, *linkedPOID, tenantID)
+				`, now, *linkedPOID, tenantID); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+				}
 				// Try to complete receipt stock op + inventory if it exists
 				h.completeLinkedReceiptOp(tenantID, *linkedPOID, now)
 				h.log.Info("Intercompany: SO delivery done, updated linked PO", "so_id", *op.SourceID, "po_id", *linkedPOID)
@@ -7276,10 +7330,12 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 				ORDER BY wot.sequence ASC LIMIT 1
 			`, *op.SourceID, tenantID).Scan(&nextOpID)
 			if err == nil && nextOpID != uuid.Nil {
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					UPDATE stock_operations SET state = 'draft', updated_at = $1
 					WHERE id = $2 AND tenant_id = $3
-				`, now, nextOpID, tenantID)
+				`, now, nextOpID, tenantID); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+				}
 				h.log.Info("Delivery chain: activated next operation", "completed_op", id, "next_op", nextOpID, "so_id", *op.SourceID)
 			}
 		}
@@ -7323,17 +7379,23 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 		if nextStepAutoProced {
 			nextStepState = "in_progress"
 		}
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO stock_operation_step_log (
 				id, tenant_id, operation_id, step_id, step_sequence, step_name, state, started_at, created_at
 			) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$5,$6,$7,$7)
-		`, tenantID, id, nextStepDef.ID, nextStep, nextStepName, nextStepState, now)
+		`, tenantID, id, nextStepDef.ID, nextStep, nextStepName, nextStepState, now); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_step_log", "error", execErr)
+		}
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE stock_operations
 			SET current_step=$1, state=$2, updated_at=$3
 			WHERE id=$4 AND tenant_id=$5
-		`, nextStep, newState, now, id, tenantID)
+		`, nextStep, newState, now, id, tenantID); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+
+		}
 	}
 
 	response.Success(c, map[string]interface{}{
@@ -7363,18 +7425,22 @@ func (h *Handler) completeLinkedDeliveryOp(tenantID uuid.UUID, salesOrderID uuid
 	}
 
 	// Set done_qty = expected_qty for all lines
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operation_lines
 		SET done_qty = expected_qty, updated_at = $1
 		WHERE operation_id = $2 AND tenant_id = $3
-	`, now, opID, tenantID)
+	`, now, opID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_lines", "error", execErr)
+	}
 
 	// Mark operation as done
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operations
 		SET state = 'done', done_at = $1, updated_at = $1
 		WHERE id = $2 AND tenant_id = $3
-	`, now, opID, tenantID)
+	`, now, opID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+	}
 
 	// Deduct inventory from selling org's warehouse
 	var warehouseID uuid.UUID
@@ -7423,18 +7489,22 @@ func (h *Handler) completeLinkedDeliveryOp(tenantID uuid.UUID, salesOrderID uuid
 				}
 
 				// Decrease inventory
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					UPDATE inventory SET quantity_on_hand = quantity_on_hand - $1, last_movement_date = $2, updated_at = $2 WHERE id = $3
-				`, doneQty, now, invID)
+				`, doneQty, now, invID); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE inventory", "error", execErr)
+				}
 
 				// Create inventory transaction record
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO inventory_transactions (
 						id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
 						unit_cost, total_cost, from_warehouse_id,
 						reference_type, reference_id, notes, transaction_date, created_at
 					) VALUES ($1, $2, $3, $4, 'issue', $5, $6, $7, $8, 'stock_operation', $9, 'Intercompany delivery', $10, $10)
-				`, uuid.New(), tenantID, orgID, invID, -doneQty, unitPrice, math.Abs(doneQty)*unitPrice, warehouseID, opID.String(), now)
+				`, uuid.New(), tenantID, orgID, invID, -doneQty, unitPrice, math.Abs(doneQty)*unitPrice, warehouseID, opID.String(), now); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT inventory_transactions", "error", execErr)
+				}
 			}
 		}
 	}
@@ -7551,13 +7621,15 @@ func (h *Handler) createReceiptStockOpForPO(tenantID uuid.UUID, purchaseOrderID 
 			var qty, unitPrice float64
 			var uom string
 			if rows.Scan(&productID, &qty, &unitPrice, &uom) == nil {
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO stock_operation_lines (
 						id, tenant_id, operation_id, product_id,
 						expected_qty, done_qty, uom, unit_price,
 						quality_status, created_at, updated_at
 					) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
-				`, tenantID, opID, productID, qty, uom, unitPrice, now)
+				`, tenantID, opID, productID, qty, uom, unitPrice, now); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_lines", "error", execErr)
+				}
 			}
 		}
 	}
@@ -7596,24 +7668,30 @@ func (h *Handler) completeLinkedReceiptOp(tenantID uuid.UUID, purchaseOrderID uu
 	}
 
 	// Set done_qty = expected_qty for all lines
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operation_lines
 		SET done_qty = expected_qty, updated_at = $1
 		WHERE operation_id = $2 AND tenant_id = $3
-	`, now, opID, tenantID)
+	`, now, opID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_lines", "error", execErr)
+	}
 
 	// Mark operation as done
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operations
 		SET state = 'done', done_at = $1, updated_at = $1
 		WHERE id = $2 AND tenant_id = $3
-	`, now, opID, tenantID)
+	`, now, opID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+	}
 
 	// Update PO status to received
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE purchase_orders SET status = 'received', updated_at = $1
 		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-	`, now, purchaseOrderID, tenantID)
+	`, now, purchaseOrderID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+	}
 
 	// Increase inventory in buying org's warehouse
 	var warehouseID uuid.UUID
@@ -7662,18 +7740,22 @@ func (h *Handler) completeLinkedReceiptOp(tenantID uuid.UUID, purchaseOrderID uu
 				}
 
 				// Increase inventory
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					UPDATE inventory SET quantity_on_hand = quantity_on_hand + $1, unit_cost = $4, last_movement_date = $2, updated_at = $2 WHERE id = $3
-				`, doneQty, now, invID, unitPrice)
+				`, doneQty, now, invID, unitPrice); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE inventory", "error", execErr)
+				}
 
 				// Create inventory transaction record
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO inventory_transactions (
 						id, tenant_id, organization_id, inventory_id, transaction_type, quantity,
 						unit_cost, total_cost, to_warehouse_id,
 						reference_type, reference_id, notes, transaction_date, created_at
 					) VALUES ($1, $2, $3, $4, 'receipt', $5, $6, $7, $8, 'stock_operation', $9, 'Intercompany receipt', $10, $10)
-				`, uuid.New(), tenantID, orgID, invID, doneQty, unitPrice, doneQty*unitPrice, warehouseID, opID.String(), now)
+				`, uuid.New(), tenantID, orgID, invID, doneQty, unitPrice, doneQty*unitPrice, warehouseID, opID.String(), now); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT inventory_transactions", "error", execErr)
+				}
 			}
 		}
 	}
@@ -7866,11 +7948,13 @@ func (h *Handler) completeMaterialRequestFromStockOp(tenantID uuid.UUID, stockOp
 	}
 
 	// Update material request status to approved
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE construction_material_requests
 		SET status = 'approved', approved_by = $1, approval_date = $2, updated_date = $2
 		WHERE id = $3 AND tenant_id = $4
-	`, approverEmployeeID, now, requestID, tenantID)
+	`, approverEmployeeID, now, requestID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_material_requests", "error", execErr)
+	}
 
 	// Parse items for expense tracking
 	var items []map[string]interface{}
@@ -7931,7 +8015,7 @@ func (h *Handler) completeMaterialRequestFromStockOp(tenantID uuid.UUID, stockOp
 		}
 
 		// Upsert project materials
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO construction_project_materials
 				(tenant_id, project_id, product_id, product_name, uom, approved_quantity, unit_cost, created_date, updated_date)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
@@ -7941,17 +8025,21 @@ func (h *Handler) completeMaterialRequestFromStockOp(tenantID uuid.UUID, stockOp
 				    product_name = CASE WHEN EXCLUDED.product_name != '' THEN EXCLUDED.product_name ELSE construction_project_materials.product_name END,
 				    uom = CASE WHEN EXCLUDED.uom != '' THEN EXCLUDED.uom ELSE construction_project_materials.uom END,
 				    updated_date = EXCLUDED.updated_date
-		`, tenantID, projectID, productIDStr, productName, uom, qty, unitCost, now)
+		`, tenantID, projectID, productIDStr, productName, uom, qty, unitCost, now); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_project_materials", "error", execErr)
+		}
 	}
 
 	// Record construction cost tracking
 	if totalExpense > 0 {
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO construction_cost_tracking (
 				tenant_id, project_id, tracking_date, actual_cost, notes, created_date
 			) VALUES ($1, $2, $3, $4, $5, NOW())
 		`, tenantID, projectID, now.Format("2006-01-02"), totalExpense,
-			fmt.Sprintf("Material Request #%d delivered via stock operation", requestID))
+			fmt.Sprintf("Material Request #%d delivered via stock operation", requestID)); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_cost_tracking", "error", execErr)
+		}
 	}
 }
 
@@ -7990,11 +8078,13 @@ func (h *Handler) ApproveStockOperationStep(c *gin.Context) {
 	}
 
 	// Mark step as approved
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operation_step_log
 		SET approved_by=$1
 		WHERE operation_id=$2 AND step_sequence=$3 AND tenant_id=$4
-	`, userID, id, currentStep, tenantID)
+	`, userID, id, currentStep, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_step_log", "error", execErr)
+	}
 
 	// Now advance the operation — since state is 'awaiting_approval',
 	// the advance handler will skip the approval check and proceed to completion
@@ -8046,18 +8136,22 @@ func (h *Handler) RejectStockOperationStep(c *gin.Context) {
 	now := time.Now()
 
 	// Set step_log to rejected with reason, then back to ready for re-work
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operation_step_log
 		SET state='ready', rejection_reason=$1, approved_by=NULL, completed_by=$2
 		WHERE operation_id=$3 AND step_sequence=$4 AND tenant_id=$5
-	`, input.Reason, userID, id, currentStep, tenantID)
+	`, input.Reason, userID, id, currentStep, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_step_log", "error", execErr)
+	}
 
 	// Return operation to in_progress state
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operations
 		SET state='in_progress', updated_at=$1
 		WHERE id=$2 AND tenant_id=$3
-	`, now, id, tenantID)
+	`, now, id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+	}
 
 	response.Success(c, map[string]interface{}{
 		"state":        "in_progress",
@@ -8092,12 +8186,14 @@ func (h *Handler) AddStepDocument(c *gin.Context) {
 	}
 
 	// Append document to the step_log's documents JSONB array
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operation_step_log
 		SET documents = COALESCE(documents, '[]'::jsonb) || $1::jsonb
 		WHERE operation_id=$2 AND step_sequence=$3 AND tenant_id=$4
 	`, fmt.Sprintf(`[{"type":"%s","url":"%s","name":"%s"}]`, input.DocumentType, input.DocumentURL, input.FileName),
-		id, stepSeq, tenantID)
+		id, stepSeq, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_step_log", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Document attached"})
 }
@@ -8128,7 +8224,9 @@ func (h *Handler) CancelStockOperation(c *gin.Context) {
 	}
 
 	now := time.Now()
-	h.db.Exec("UPDATE stock_operations SET state='cancelled', updated_at=$1 WHERE id=$2 AND tenant_id=$3", now, id, tenantID)
+	if _, execErr := h.db.Exec("UPDATE stock_operations SET state='cancelled', updated_at=$1 WHERE id=$2 AND tenant_id=$3", now, id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+	}
 
 	response.Success(c, map[string]string{"state": "cancelled"})
 }
@@ -8159,7 +8257,9 @@ func (h *Handler) ValidateStockOperation(c *gin.Context) {
 	}
 
 	now := time.Now()
-	h.db.Exec("UPDATE stock_operations SET state='in_progress', updated_at=$1 WHERE id=$2 AND tenant_id=$3", now, id, tenantID)
+	if _, execErr := h.db.Exec("UPDATE stock_operations SET state='in_progress', updated_at=$1 WHERE id=$2 AND tenant_id=$3", now, id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+	}
 
 	response.Success(c, map[string]string{"state": "in_progress"})
 }
@@ -8337,7 +8437,9 @@ func (h *Handler) UpdateStockOperationLines(c *gin.Context) {
 		args = append(args, lineID, opID, tenantID)
 		query := fmt.Sprintf("UPDATE stock_operation_lines SET %s WHERE id=$%d AND operation_id=$%d AND tenant_id=$%d",
 			strings.Join(sets, ", "), idx, idx+1, idx+2)
-		h.db.Exec(query, args...)
+		if _, execErr := h.db.Exec(query, args...); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+		}
 	}
 
 	response.Success(c, map[string]string{"status": "updated"})
@@ -8567,7 +8669,7 @@ func (h *Handler) CreateBackorder(c *gin.Context) {
 
 	// Create backorder lines
 	for _, l := range lines {
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO stock_operation_lines (
 				id, tenant_id, operation_id, product_id,
 				expected_qty, done_qty, uom, unit_price,
@@ -8577,7 +8679,9 @@ func (h *Handler) CreateBackorder(c *gin.Context) {
 			tenantID, backorderID, l.ProductID,
 			l.RemainingQty, l.UOM, l.UnitPrice,
 			l.LotNumber, l.QualityStatus, l.Note, now,
-		)
+		); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_lines", "error", execErr)
+		}
 	}
 
 	// Create initial step log
@@ -8594,15 +8698,19 @@ func (h *Handler) CreateBackorder(c *gin.Context) {
 	if err == nil {
 		firstStepName = firstStep.Name
 	}
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO stock_operation_step_log (
 			id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
 		) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
-	`, tenantID, backorderID, firstStep.ID, firstStepName, now)
+	`, tenantID, backorderID, firstStep.ID, firstStepName, now); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_step_log", "error", execErr)
+	}
 
 	// Mark the original as having a backorder
-	h.db.Exec("UPDATE stock_operations SET backorder_id=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
-		backorderID, now, id, tenantID)
+	if _, execErr := h.db.Exec("UPDATE stock_operations SET backorder_id=$1, updated_at=$2 WHERE id=$3 AND tenant_id=$4",
+		backorderID, now, id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+	}
 
 	response.Created(c, map[string]interface{}{
 		"id":   backorderID,
@@ -8717,7 +8825,9 @@ func (h *Handler) SaveOperationTypeSteps(c *gin.Context) {
 	now := time.Now()
 
 	// Delete old steps
-	h.db.Exec("DELETE FROM operation_type_steps WHERE operation_type_id=$1 AND tenant_id=$2", opTypeID, tenantID)
+	if _, execErr := h.db.Exec("DELETE FROM operation_type_steps WHERE operation_type_id=$1 AND tenant_id=$2", opTypeID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE operation_type_steps", "error", execErr)
+	}
 
 	for i, s := range steps {
 		seq := s.Sequence
@@ -8741,7 +8851,7 @@ func (h *Handler) SaveOperationTypeSteps(c *gin.Context) {
 				destLoc = &parsed
 			}
 		}
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO operation_type_steps (
 				id, tenant_id, operation_type_id, sequence, name,
 				source_location_id, dest_location_id,
@@ -8755,7 +8865,9 @@ func (h *Handler) SaveOperationTypeSteps(c *gin.Context) {
 			s.ResponsibleRole, s.RequiresApproval, s.ApprovalRole,
 			s.AutoProceed, s.MaxDurationHours, onTimeout, s.Instructions,
 			now,
-		)
+		); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT operation_type_steps", "error", execErr)
+		}
 	}
 
 	response.Success(c, map[string]interface{}{"saved": len(steps)})

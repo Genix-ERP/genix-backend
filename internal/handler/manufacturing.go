@@ -2535,7 +2535,9 @@ func (h *Handler) ConfirmProductionOrder(c *gin.Context) {
 		// We still update production_orders.material_cost here because
 		// other parts of the UI read that planned figure.
 		if totalMaterialCost > 0 {
-			h.db.Exec(`UPDATE production_orders SET material_cost = $1 WHERE id = $2`, totalMaterialCost, id)
+			if _, execErr := h.db.Exec(`UPDATE production_orders SET material_cost = $1 WHERE id = $2`, totalMaterialCost, id); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+			}
 			h.log.Info("Confirm: skipped planned-cost journal (would double-count on complete)", "order_id", id, "planned_material_cost", totalMaterialCost)
 		} else {
 			h.log.Warn("Total material cost is 0 for confirmed production order", "order_id", id)
@@ -3001,12 +3003,14 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			if poProductName != "" {
 				woName = poProductName + " - Ishlab chiqarish"
 			}
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO work_orders (
 					id, tenant_id, organization_id, production_order_id, code, name, sequence,
 					quantity_to_produce, uom, status, created_by, created_at, updated_at
 				) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 'pcs', 'pending', $8, $9, $9)
-			`, uuid.New(), tenantID, poOrgID, id, fmt.Sprintf("WO-%s-1", id.String()[:12]), woName, qty, userID, now)
+			`, uuid.New(), tenantID, poOrgID, id, fmt.Sprintf("WO-%s-1", id.String()[:12]), woName, qty, userID, now); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT work_orders", "error", execErr)
+			}
 		}
 	}
 
@@ -3101,12 +3105,14 @@ func (h *Handler) PauseProductionOrder(c *gin.Context) {
 	}
 
 	// --- Pause all in-progress work orders for this production order ---
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE work_orders
 		SET status = 'paused', updated_at = $1
 		WHERE production_order_id = $2 AND tenant_id = $3
 			AND deleted_at IS NULL AND status = 'in_progress'
-	`, now, id, tenantID)
+	`, now, id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE work_orders", "error", execErr)
+	}
 
 	h.GetProductionOrder(c)
 }
@@ -5111,8 +5117,10 @@ func (h *Handler) CreateMaintenanceTask(c *gin.Context) {
 	}
 
 	// Update next_maintenance_date on the equipment
-	h.db.Exec("UPDATE manufacturing_equipment SET next_maintenance_date = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
-		input.ScheduledDate, now, equipID, tenantID)
+	if _, execErr := h.db.Exec("UPDATE manufacturing_equipment SET next_maintenance_date = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+		input.ScheduledDate, now, equipID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE manufacturing_equipment", "error", execErr)
+	}
 
 	response.Created(c, gin.H{"id": id, "status": "scheduled"})
 }
@@ -5165,8 +5173,10 @@ func (h *Handler) CompleteMaintenanceTask(c *gin.Context) {
 	}
 
 	// Update last_maintenance_date on equipment
-	h.db.Exec("UPDATE manufacturing_equipment SET last_maintenance_date = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
-		today, now, equipID, tenantID)
+	if _, execErr := h.db.Exec("UPDATE manufacturing_equipment SET last_maintenance_date = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
+		today, now, equipID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE manufacturing_equipment", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Maintenance task completed"})
 }
@@ -5841,11 +5851,13 @@ func (h *Handler) CreateCostCalculation(c *gin.Context) {
 		if line.Unit == "" {
 			line.Unit = "pcs"
 		}
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO cost_calculation_lines
 			  (id, calculation_id, tenant_id, product_id, product_name, quantity, unit, unit_cost, total_cost)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		`, lineID, id, tenantID, productID, line.ProductName, line.Quantity, line.Unit, line.UnitCost, line.TotalCost)
+		`, lineID, id, tenantID, productID, line.ProductName, line.Quantity, line.Unit, line.UnitCost, line.TotalCost); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT cost_calculation_lines", "error", execErr)
+		}
 	}
 
 	response.Created(c, gin.H{"id": id.String()})
@@ -5949,7 +5961,9 @@ func (h *Handler) UpdateCostCalculation(c *gin.Context) {
 	}
 
 	// Replace lines
-	h.db.Exec("DELETE FROM cost_calculation_lines WHERE calculation_id=$1", id)
+	if _, execErr := h.db.Exec("DELETE FROM cost_calculation_lines WHERE calculation_id=$1", id); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE cost_calculation_lines", "error", execErr)
+	}
 	for _, line := range req.Lines {
 		lineID := uuid.New()
 		var productID interface{}
@@ -5961,11 +5975,13 @@ func (h *Handler) UpdateCostCalculation(c *gin.Context) {
 		if line.Unit == "" {
 			line.Unit = "pcs"
 		}
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO cost_calculation_lines
 			  (id, calculation_id, tenant_id, product_id, product_name, quantity, unit, unit_cost, total_cost)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		`, lineID, id, tenantID, productID, line.ProductName, line.Quantity, line.Unit, line.UnitCost, line.TotalCost)
+		`, lineID, id, tenantID, productID, line.ProductName, line.Quantity, line.Unit, line.UnitCost, line.TotalCost); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT cost_calculation_lines", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Updated"})
@@ -5982,6 +5998,8 @@ func (h *Handler) DeleteCostCalculation(c *gin.Context) {
 		response.BadRequest(c, "Invalid ID")
 		return
 	}
-	h.db.Exec(`UPDATE cost_calculations SET deleted_at=NOW() WHERE id=$1 AND tenant_id=$2`, id, tenantID)
+	if _, execErr := h.db.Exec(`UPDATE cost_calculations SET deleted_at=NOW() WHERE id=$1 AND tenant_id=$2`, id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE cost_calculations", "error", execErr)
+	}
 	response.Success(c, gin.H{"message": "Deleted"})
 }

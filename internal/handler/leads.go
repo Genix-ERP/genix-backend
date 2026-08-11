@@ -1129,10 +1129,12 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 		userID, _ := middleware.GetUserID(c)
 		oldJSON, _ := json.Marshal(oldValues)
 		newJSON, _ := json.Marshal(newValues)
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
 			VALUES ($1, $2, $3, 'update', 'lead', $4, $5, $6, $7)
-		`, uuid.New(), tenantID, userID, id, oldJSON, newJSON, time.Now())
+		`, uuid.New(), tenantID, userID, id, oldJSON, newJSON, time.Now()); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT audit_logs", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Lead updated successfully"})

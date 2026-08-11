@@ -1638,10 +1638,12 @@ func (h *Handler) logRejaFaktAudit(tenantID uuid.UUID, projectID int64, itemType
 		h.db.QueryRow(`SELECT COALESCE(name, email, '') FROM users WHERE id = $1`, userID).Scan(&userName)
 	}
 	changesJSON, _ := json.Marshal(changes)
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO construction_reja_fakt_audit (tenant_id, project_id, item_type, item_id, item_name, sub_stage_id, action, changes, user_id, user_name)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, tenantID, projectID, itemType, itemID, itemName, subStageID, action, changesJSON, userID, userName)
+	`, tenantID, projectID, itemType, itemID, itemName, subStageID, action, changesJSON, userID, userName); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_reja_fakt_audit", "error", execErr)
+	}
 }
 
 func (h *Handler) getProjectIDForSubStage(subStageID int64) int64 {

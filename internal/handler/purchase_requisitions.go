@@ -337,11 +337,15 @@ func (h *Handler) CreatePurchaseRequisition(c *gin.Context) {
 
 		totalPrice := line.Quantity * line.EstimatedPrice
 
-		h.db.Exec(lineQuery,
+		if _, execErr := h.db.Exec(lineQuery,
 			lineID, prID, productID, line.ProductName, line.ProductCode, line.Description,
 			line.Quantity, unit, line.EstimatedPrice, totalPrice, preferredVendor, line.VendorName,
 			line.Specifications, now, now,
-		)
+		); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+
+		}
 	}
 
 	// Return created requisition
@@ -846,7 +850,9 @@ func (h *Handler) ApprovePurchaseRequisition(c *gin.Context) {
 		if err != nil {
 			continue
 		}
-		h.db.Exec("UPDATE purchase_requisition_lines SET approved_quantity = $1, updated_at = $2 WHERE id = $3", line.ApprovedQuantity, now, lineID)
+		if _, execErr := h.db.Exec("UPDATE purchase_requisition_lines SET approved_quantity = $1, updated_at = $2 WHERE id = $3", line.ApprovedQuantity, now, lineID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_requisition_lines", "error", execErr)
+		}
 	}
 
 	// Cancel any pending workflow for this document
@@ -1065,7 +1071,11 @@ func (h *Handler) ConvertPRToPO(c *gin.Context) {
 
 			lineTotal := qty * estimatedPrice
 
-			h.db.Exec(poLineQuery, poLineID, poID, lineNum, prodID, desc, qty, estimatedPrice, lineTotal, now, now)
+			if _, execErr := h.db.Exec(poLineQuery, poLineID, poID, lineNum, prodID, desc, qty, estimatedPrice, lineTotal, now, now); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+
+			}
 		}
 	}
 

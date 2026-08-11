@@ -1419,7 +1419,9 @@ func (h *Handler) ConfirmBlanketOrderRelease(c *gin.Context) {
 	h.db.QueryRow("SELECT remaining_value FROM blanket_orders WHERE id = $1", blanketOrderID).Scan(&remainingValue)
 
 	if remainingValue <= 0 {
-		h.db.Exec("UPDATE blanket_orders SET status = 'completed', updated_at = $1 WHERE id = $2", time.Now(), blanketOrderID)
+		if _, execErr := h.db.Exec("UPDATE blanket_orders SET status = 'completed', updated_at = $1 WHERE id = $2", time.Now(), blanketOrderID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE blanket_orders", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Release confirmed successfully", "status": "confirmed"})

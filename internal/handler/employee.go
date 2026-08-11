@@ -450,14 +450,16 @@ func (h *Handler) CreateEmployee(c *gin.Context) {
 				e := input.Email
 				emailVal = &e
 			}
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE users
 				   SET employee_id = $1,
 				       phone       = COALESCE($2, phone),
 				       email       = COALESCE($3, email),
 				       updated_at  = $4
 				 WHERE id = $5
-			`, id, phoneVal, emailVal, now, existingUserID)
+			`, id, phoneVal, emailVal, now, existingUserID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE users", "error", execErr)
+			}
 		}
 	}
 
@@ -869,18 +871,26 @@ func (h *Handler) DeleteEmployee(c *gin.Context) {
 	}
 
 	// Delete linked user by employee_id
-	h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
+	if _, execErr := h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE users", "error", execErr)
+	}
 
 	// Email fallback covers legacy rows where employee_id was never linked —
 	// but it must never remove a user that belongs to a DIFFERENT employee
 	// sharing the same mailbox.
 	if empEmail.Valid && empEmail.String != "" {
-		h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND email = $2 AND (employee_id IS NULL OR employee_id = $3)`, tenantID, empEmail.String, id)
+		if _, execErr := h.db.Exec(`DELETE FROM users WHERE tenant_id = $1 AND email = $2 AND (employee_id IS NULL OR employee_id = $3)`, tenantID, empEmail.String, id); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE users", "error", execErr)
+		}
 	}
 
 	// Clean up employee permissions and organization assignments
-	h.db.Exec(`DELETE FROM employee_module_permissions WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
-	h.db.Exec(`DELETE FROM employee_organizations WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id)
+	if _, execErr := h.db.Exec(`DELETE FROM employee_module_permissions WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE employee_module_permissions", "error", execErr)
+	}
+	if _, execErr := h.db.Exec(`DELETE FROM employee_organizations WHERE tenant_id = $1 AND employee_id = $2`, tenantID, id); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE employee_organizations", "error", execErr)
+	}
 
 	if userID, uok := middleware.GetUserID(c); uok {
 		h.writeEmployeeAudit(tenantID, userID, "delete", id, nil, nil)

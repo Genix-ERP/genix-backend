@@ -762,15 +762,21 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 
 					if !shouldKeep {
 						// Soft-delete this vendor contact
-						h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE id = $1`, contactID)
+						if _, execErr := h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE id = $1`, contactID); execErr != nil {
+							h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE contacts", "error", execErr)
+						}
 						// Also soft-delete the corresponding customer contact
 						if matchedSourceOrgID != nil {
-							h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE tenant_id = $1 AND organization_id = $2 AND type = 'customer' AND source_organization_id = $3 AND deleted_at IS NULL`,
-								parsedTenantID, *matchedSourceOrgID, orgID)
+							if _, execErr := h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE tenant_id = $1 AND organization_id = $2 AND type = 'customer' AND source_organization_id = $3 AND deleted_at IS NULL`,
+								parsedTenantID, *matchedSourceOrgID, orgID); execErr != nil {
+								h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE contacts", "error", execErr)
+							}
 						} else {
 							// Old-style: delete customer by name match
-							h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE tenant_id = $1 AND type = 'customer' AND name = $2 AND source_organization_id IS NULL AND deleted_at IS NULL`,
-								parsedTenantID, org.Name)
+							if _, execErr := h.db.Exec(`UPDATE contacts SET deleted_at = NOW() WHERE tenant_id = $1 AND type = 'customer' AND name = $2 AND source_organization_id IS NULL AND deleted_at IS NULL`,
+								parsedTenantID, org.Name); execErr != nil {
+								h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE contacts", "error", execErr)
+							}
 						}
 					}
 				}
@@ -1223,7 +1229,7 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 	// 4000, etc.) using the SAME logic migration 317 applied to legacy
 	// orgs. Idempotent — only touches rows where parent_id IS NULL.
 	// Link 4-char leaves to 4-char "X000" group: e.g. 1010 → 1000.
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE accounts a SET parent_id = g.id
 		FROM accounts g
 		WHERE a.organization_id = $2 AND g.organization_id = $2
@@ -1234,9 +1240,11 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		  AND LENGTH(a.code) = 4
 		  AND g.code = LEFT(a.code, 2) || '00'
 		  AND a.id != g.id
-	`, tenantID, orgID)
+	`, tenantID, orgID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE accounts", "error", execErr)
+	}
 	// Link section groups (0100, 0200, ...) to section header (0000).
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE accounts a SET parent_id = g.id
 		FROM accounts g
 		WHERE a.organization_id = $2 AND g.organization_id = $2
@@ -1247,9 +1255,11 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		  AND g.code = '0000'
 		  AND a.id != g.id
 		  AND a.code != '0000'
-	`, tenantID, orgID)
+	`, tenantID, orgID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE accounts", "error", execErr)
+	}
 	// Link sub-section groups (e.g. 6100, 6200) to section header (6000).
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE accounts a SET parent_id = g.id
 		FROM accounts g
 		WHERE a.organization_id = $2 AND g.organization_id = $2
@@ -1261,19 +1271,23 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		  AND a.id != g.id
 		  AND a.code != LEFT(a.code, 1) || '000'
 		  AND EXISTS (SELECT 1 FROM accounts WHERE code = LEFT(a.code, 1) || '000' AND organization_id = $2 AND tenant_id = $1 AND deleted_at IS NULL)
-	`, tenantID, orgID)
+	`, tenantID, orgID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE accounts", "error", execErr)
+	}
 	// Mark any account that now has children as non-leaf.
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE accounts a SET is_leaf = false
 		WHERE a.tenant_id = $1 AND a.organization_id = $2 AND a.deleted_at IS NULL
 		  AND EXISTS (
 		    SELECT 1 FROM accounts c
 		    WHERE c.parent_id = a.id AND c.deleted_at IS NULL
 		  )
-	`, tenantID, orgID)
+	`, tenantID, orgID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE accounts", "error", execErr)
+	}
 
 	// Set parent_id for inventory sub-accounts (1310/1320/1330/1340 → parent 1300)
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE accounts SET parent_id = (
 			SELECT id FROM accounts a2
 			WHERE a2.tenant_id = accounts.tenant_id AND a2.organization_id = accounts.organization_id
@@ -1281,7 +1295,9 @@ func (h *Handler) createDefaultChartOfAccounts(tenantID, orgID uuid.UUID) error 
 		)
 		WHERE tenant_id = $1 AND organization_id = $2
 		AND code IN ('1310', '1320', '1330', '1340') AND parent_id IS NULL
-	`, tenantID, orgID)
+	`, tenantID, orgID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE accounts", "error", execErr)
+	}
 
 	h.log.Info("Created default chart of accounts", "tenant_id", tenantID, "org_id", orgID,
 		"leaf_count", len(defaultAccounts), "group_count", len(groupAccounts))
@@ -1511,11 +1527,15 @@ func (h *Handler) createDefaultPaymentMethods(tenantID, orgID uuid.UUID) {
 			outstandingAcct = cashAccountID
 		}
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO journal_payment_methods (id, tenant_id, journal_id, payment_method_id, direction, name, outstanding_account_id, is_active, created_at)
 			VALUES (gen_random_uuid(), $1, $2, $3, $4, '', $5, true, $6)
 			ON CONFLICT (journal_id, payment_method_id, direction) DO NOTHING
-		`, tenantID, journalID, pmID, link.direction, outstandingAcct, now)
+		`, tenantID, journalID, pmID, link.direction, outstandingAcct, now); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT journal_payment_methods", "error", execErr)
+
+		}
 	}
 
 	h.log.Info("Created default payment methods", "tenant_id", tenantID, "count", len(defaultPMs))

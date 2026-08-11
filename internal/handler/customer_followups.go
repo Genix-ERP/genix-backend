@@ -748,13 +748,15 @@ func (h *Handler) CreateFollowupAction(c *gin.Context) {
 	}
 
 	// Update customer followup status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE customer_followup_status SET
 			last_followup_date = CURRENT_TIMESTAMP,
 			current_level_id = COALESCE($3, current_level_id),
 			updated_at = CURRENT_TIMESTAMP
 		WHERE tenant_id = $1 AND customer_id = $2
-	`, tenantID, req.CustomerID, req.LevelID)
+	`, tenantID, req.CustomerID, req.LevelID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE customer_followup_status", "error", execErr)
+	}
 
 	response.Created(c, gin.H{
 		"id":           id,
@@ -815,10 +817,12 @@ func (h *Handler) CreatePaymentPromise(c *gin.Context) {
 	}
 
 	// Also record as followup action
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO followup_actions (tenant_id, customer_id, action_type, total_amount, description, performed_by)
 		VALUES ($1, $2, 'payment_promise', $3, $4, $5)
-	`, tenantID, req.CustomerID, req.PromisedAmount, fmt.Sprintf("Payment promise for %s", req.PromisedDate), userID)
+	`, tenantID, req.CustomerID, req.PromisedAmount, fmt.Sprintf("Payment promise for %s", req.PromisedDate), userID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT followup_actions", "error", execErr)
+	}
 
 	response.Created(c, gin.H{
 		"id":         id,
@@ -966,31 +970,37 @@ func (h *Handler) SendFollowupReminder(c *gin.Context) {
 
 	if req.SendEmail && emailSubject.Valid && customerEmail != "" {
 		// Record email action (actual sending would be handled by email service)
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO followup_actions (tenant_id, customer_id, level_id, level_name, action_type, total_amount, recipient, subject, body, status, performed_by)
 			VALUES ($1, $2, $3, $4, 'email_sent', $5, $6, $7, $8, 'sent', $9)
-		`, tenantID, req.CustomerID, req.LevelID, level.Name, totalOverdue, customerEmail, emailSubject.String, emailBody.String, userID)
+		`, tenantID, req.CustomerID, req.LevelID, level.Name, totalOverdue, customerEmail, emailSubject.String, emailBody.String, userID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT followup_actions", "error", execErr)
+		}
 		actionsRecorded++
 	}
 
 	if req.SendSMS {
 		// Record SMS action
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO followup_actions (tenant_id, customer_id, level_id, level_name, action_type, total_amount, status, performed_by)
 			VALUES ($1, $2, $3, $4, 'sms_sent', $5, 'sent', $6)
-		`, tenantID, req.CustomerID, req.LevelID, level.Name, totalOverdue, userID)
+		`, tenantID, req.CustomerID, req.LevelID, level.Name, totalOverdue, userID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT followup_actions", "error", execErr)
+		}
 		actionsRecorded++
 	}
 
 	// Update customer followup status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE customer_followup_status SET
 			current_level_id = $3,
 			current_level_sequence = (SELECT sequence FROM followup_levels WHERE id = $3),
 			last_followup_date = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE tenant_id = $1 AND customer_id = $2
-	`, tenantID, req.CustomerID, req.LevelID)
+	`, tenantID, req.CustomerID, req.LevelID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE customer_followup_status", "error", execErr)
+	}
 
 	response.Success(c, gin.H{
 		"message":          "Follow-up reminder sent",

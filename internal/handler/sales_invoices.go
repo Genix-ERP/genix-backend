@@ -2017,14 +2017,16 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 				id, _ := uuid.Parse(*line.TaxID)
 				taxID = &id
 			}
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO sales_invoice_lines (
 					id, sales_invoice_id, line_number, product_id, description,
 					quantity, unit_price, discount_amount, tax_id, tax_amount, line_total, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 0, $9, $10)`,
 				lineID, creditNoteID, i+1, productID, line.Description,
 				line.Quantity, line.UnitPrice, taxID, lineTotal, now,
-			)
+			); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT sales_invoice_lines", "error", execErr)
+			}
 		}
 	} else {
 		// Copy lines from original invoice
@@ -2041,14 +2043,16 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 				var qty, unitPrice, discAmt, taxAmt, lineTotal float64
 				rows.Scan(&productID, &desc, &qty, &unitID, &unitPrice, &discAmt, &taxID, &taxAmt, &lineTotal, &accountID)
 				lineID := uuid.New()
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO sales_invoice_lines (
 						id, sales_invoice_id, line_number, product_id, description,
 						quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount, line_total, account_id, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
 					lineID, creditNoteID, lineNum, productID, desc,
 					qty, unitID, unitPrice, discAmt, taxID, taxAmt, lineTotal, accountID, now,
-				)
+				); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT sales_invoice_lines", "error", execErr)
+				}
 				lineNum++
 			}
 		}

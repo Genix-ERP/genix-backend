@@ -90,16 +90,22 @@ func (h *Handler) sendReconciliationAutoReminders() {
 					"partner_name":      partnerName,
 					"days":              3,
 				})
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 					VALUES ($1, $2, $3, 'reconciliation_reminder', $4, $5, $6::jsonb, 'in_app', 'normal', $7)
 				`, uuid.New(), tenantID, *createdBy,
 					"Akt sverka javobsiz",
 					partnerName+" hali akt sverkaga javob bermadi (3 kun)",
-					string(notifData), now)
+					string(notifData), now); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT notifications", "error", execErr)
+				}
 			}
 
-			h.db.Exec("UPDATE reconciliation_acts SET reminder_3d_sent = true WHERE id = $1", actID)
+			if _, execErr := h.db.Exec("UPDATE reconciliation_acts SET reminder_3d_sent = true WHERE id = $1", actID); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE reconciliation_acts", "error", execErr)
+
+			}
 			count++
 		}
 	}
@@ -145,13 +151,15 @@ func (h *Handler) sendReconciliationAutoReminders() {
 
 			// Notify creator
 			if createdBy != nil {
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 					VALUES ($1, $2, $3, 'reconciliation_no_response', $4, $5, $6::jsonb, 'in_app', 'high', $7)
 				`, uuid.New(), tenantID, *createdBy,
 					"Akt sverka javobsiz — eslatma yuboring",
 					partnerName+" 7 kun davomida akt sverkaga javob bermadi",
-					string(notifData7d), now)
+					string(notifData7d), now); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT notifications", "error", execErr)
+				}
 			}
 
 			// Notify admins
@@ -163,20 +171,24 @@ func (h *Handler) sendReconciliationAutoReminders() {
 				for adminRows.Next() {
 					var adminID uuid.UUID
 					if adminRows.Scan(&adminID) == nil && (createdBy == nil || adminID != *createdBy) {
-						h.db.Exec(`
+						if _, execErr := h.db.Exec(`
 							INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 							VALUES ($1, $2, $3, 'reconciliation_no_response', $4, $5, $6::jsonb, 'in_app', 'high', $7)
 						`, uuid.New(), tenantID, adminID,
 							"Akt sverka javobsiz — eslatma yuboring",
 							partnerName+" 7 kun davomida akt sverkaga javob bermadi",
-							string(notifData7d), now)
+							string(notifData7d), now); execErr != nil {
+							h.log.Error("write failed (was silently discarded)", "stmt", "INSERT notifications", "error", execErr)
+						}
 					}
 				}
 				adminRows.Close()
 			}
 
 			// Auto-set status to no_response
-			h.db.Exec("UPDATE reconciliation_acts SET response_status = 'no_response', reminder_7d_sent = true WHERE id = $1", actID)
+			if _, execErr := h.db.Exec("UPDATE reconciliation_acts SET response_status = 'no_response', reminder_7d_sent = true WHERE id = $1", actID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE reconciliation_acts", "error", execErr)
+			}
 			count++
 		}
 	}
@@ -194,10 +206,14 @@ func (h *Handler) sendReconciliationReminderEmail(tenantID, actID uuid.UUID, sen
 		token = *shareToken
 	} else {
 		token = uuid.New().String()[:8] + uuid.New().String()[:8]
-		h.db.Exec(`UPDATE reconciliation_acts SET share_token = $1, share_expires_at = NOW() + INTERVAL '24 hours' WHERE id = $2 AND tenant_id = $3`, token, actID, tenantID)
+		if _, execErr := h.db.Exec(`UPDATE reconciliation_acts SET share_token = $1, share_expires_at = NOW() + INTERVAL '24 hours' WHERE id = $2 AND tenant_id = $3`, token, actID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE reconciliation_acts", "error", execErr)
+		}
 	}
 	// Always refresh expiry
-	h.db.Exec(`UPDATE reconciliation_acts SET share_expires_at = NOW() + INTERVAL '24 hours' WHERE id = $1 AND tenant_id = $2`, actID, tenantID)
+	if _, execErr := h.db.Exec(`UPDATE reconciliation_acts SET share_expires_at = NOW() + INTERVAL '24 hours' WHERE id = $1 AND tenant_id = $2`, actID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE reconciliation_acts", "error", execErr)
+	}
 
 	shareURL := fmt.Sprintf("%s/shared/reconciliation/%s", h.config.App.FrontendURL, token)
 
@@ -311,10 +327,12 @@ func (h *Handler) checkVendorBillsOverdue() {
 
 		// Notify the bill creator
 		if createdBy != nil {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 				VALUES ($1, $2, $3, 'vendor_bill_overdue', $4, $5, $6::jsonb, 'in_app', 'high', $7)
-			`, uuid.New(), tenantID, *createdBy, title, message, notifData, now)
+			`, uuid.New(), tenantID, *createdBy, title, message, notifData, now); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT notifications", "error", execErr)
+			}
 		}
 
 		// Also notify admins
@@ -326,17 +344,21 @@ func (h *Handler) checkVendorBillsOverdue() {
 			for adminRows.Next() {
 				var adminID uuid.UUID
 				if adminRows.Scan(&adminID) == nil && (createdBy == nil || adminID != *createdBy) {
-					h.db.Exec(`
+					if _, execErr := h.db.Exec(`
 						INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at)
 						VALUES ($1, $2, $3, 'vendor_bill_overdue', $4, $5, $6::jsonb, 'in_app', 'high', $7)
-					`, uuid.New(), tenantID, adminID, title, message, notifData, now)
+					`, uuid.New(), tenantID, adminID, title, message, notifData, now); execErr != nil {
+						h.log.Error("write failed (was silently discarded)", "stmt", "INSERT notifications", "error", execErr)
+					}
 				}
 			}
 			adminRows.Close()
 		}
 
 		// Mark as notified so we don't re-notify
-		h.db.Exec("UPDATE purchase_invoices SET overdue_notified = true WHERE id = $1", invoiceID)
+		if _, execErr := h.db.Exec("UPDATE purchase_invoices SET overdue_notified = true WHERE id = $1", invoiceID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_invoices", "error", execErr)
+		}
 		count++
 	}
 
@@ -445,7 +467,11 @@ func (h *Handler) checkCustomerInvoicesOverdue() {
 			h.createTranslatedNotification(tenantID, uid, "invoice_overdue", data, number, customerName)
 		}
 
-		h.db.Exec("UPDATE sales_invoices SET overdue_notified = true WHERE id = $1", invoiceID)
+		if _, execErr := h.db.Exec("UPDATE sales_invoices SET overdue_notified = true WHERE id = $1", invoiceID); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE sales_invoices", "error", execErr)
+
+		}
 		count++
 	}
 

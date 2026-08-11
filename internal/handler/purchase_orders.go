@@ -1785,11 +1785,15 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 					tenantID, pid).Scan(&fifoCost) != nil || fifoCost <= 0 {
 					fifoCost = uprice
 				}
-				h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-					fifoCost, now, pid, tenantID)
+				if _, execErr := h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+					fifoCost, now, pid, tenantID); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE products", "error", execErr)
+				}
 				if orgID != nil {
-					h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
-						fifoCost, now, pid, *orgID)
+					if _, execErr := h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
+						fifoCost, now, pid, *orgID); execErr != nil {
+						h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_organization_settings", "error", execErr)
+					}
 				}
 			}
 		}
@@ -2061,19 +2065,25 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		`, id, tenantID).Scan(&opID)
 		if err == nil {
 			// Update operation lines done_qty from PO lines
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE stock_operation_lines sol
 				SET done_qty = pol.quantity_received, updated_at = $1
 				FROM purchase_order_lines pol
 				WHERE sol.operation_id = $2 AND sol.tenant_id = $3
 				  AND sol.product_id = pol.product_id AND pol.purchase_order_id = $4
-			`, now, opID, tenantID, id)
+			`, now, opID, tenantID, id); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_lines", "error", execErr)
+			}
 
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE stock_operations
 				SET state = 'done', done_at = $1, updated_at = $1
 				WHERE id = $2 AND tenant_id = $3
-			`, now, opID, tenantID)
+			`, now, opID, tenantID); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operations", "error", execErr)
+
+			}
 		}
 	}
 
@@ -2105,7 +2115,9 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 		}
 		if firstWH != "" {
 			poWarehouseID = sql.NullString{String: firstWH, Valid: true}
-			h.db.Exec(`UPDATE purchase_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, id, tenantID)
+			if _, execErr := h.db.Exec(`UPDATE purchase_orders SET warehouse_id = $1 WHERE id = $2 AND tenant_id = $3`, firstWH, id, tenantID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+			}
 		}
 	}
 

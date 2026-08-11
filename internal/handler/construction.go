@@ -1258,7 +1258,9 @@ func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 	req.Code = tryCode
 
 	// Update project buildings count
-	h.db.Exec(`UPDATE construction_projects SET buildings_count = buildings_count + 1, updated_date = NOW() WHERE id = $1`, projectID)
+	if _, execErr := h.db.Exec(`UPDATE construction_projects SET buildings_count = buildings_count + 1, updated_date = NOW() WHERE id = $1`, projectID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_projects", "error", execErr)
+	}
 
 	response.Created(c, map[string]interface{}{
 		"id":           buildingID,
@@ -1440,7 +1442,9 @@ func (h *Handler) DeleteConstructionBuilding(c *gin.Context) {
 	}
 
 	// Update project buildings count
-	h.db.Exec(`UPDATE construction_projects SET buildings_count = GREATEST(0, buildings_count - 1), updated_date = NOW() WHERE id = $1`, projectID)
+	if _, execErr := h.db.Exec(`UPDATE construction_projects SET buildings_count = GREATEST(0, buildings_count - 1), updated_date = NOW() WHERE id = $1`, projectID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_projects", "error", execErr)
+	}
 
 	response.Success(c, map[string]interface{}{"message": "Building deleted successfully"})
 }
@@ -2096,7 +2100,9 @@ func (h *Handler) updateSmetaSectionTotals(sectionID int64) {
 			updated_date = NOW()
 		WHERE id = $1
 	`
-	h.db.Exec(query, sectionID)
+	if _, execErr := h.db.Exec(query, sectionID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+	}
 }
 
 // Helper functions for extracting values from sql.Null* types
@@ -3323,8 +3329,10 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	var stockOpID *uuid.UUID
 	stockOpID = h.createDeliveryForMaterialRequest(tenantID, organizationID, requestID, requestNumber, itemsJSON)
 	if stockOpID != nil {
-		h.db.Exec(`UPDATE construction_material_requests SET stock_operation_id = $1 WHERE id = $2 AND tenant_id = $3`,
-			stockOpID, requestID, tenantID)
+		if _, execErr := h.db.Exec(`UPDATE construction_material_requests SET stock_operation_id = $1 WHERE id = $2 AND tenant_id = $3`,
+			stockOpID, requestID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_material_requests", "error", execErr)
+		}
 	}
 
 	// Auto-create expense line for material request
@@ -3361,26 +3369,30 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 				// Billed to subcontractor — supplier_name = subcontractor partner_name
 				var scPartnerName string
 				h.db.QueryRow(`SELECT COALESCE(partner_name, name) FROM construction_subcontract WHERE id = $1`, req.SubcontractID).Scan(&scPartnerName)
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO construction_expense_lines (
 						tenant_id, organization_id, project_id, stage_id, expense_date, description,
 						amount, currency_code, subcontract_id, material_request_id,
 						supplier_name, status, created_by, created_at, updated_at
 					) VALUES ($1, $2, $3, $11, $4, $5, $6, 'UZS', $7, $8, $9, 'draft', $10, NOW(), NOW())
 				`, tenantID, organizationID, projectID, requestDate, expDesc,
-					totalAmount, req.SubcontractID, requestID, scPartnerName, userID, stageIDInsert)
+					totalAmount, req.SubcontractID, requestID, scPartnerName, userID, stageIDInsert); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_expense_lines", "error", execErr)
+				}
 			} else {
 				// No subcontractor — supplier is the company itself
 				var orgName string
 				h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, organizationID).Scan(&orgName)
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO construction_expense_lines (
 						tenant_id, organization_id, project_id, stage_id, expense_date, description,
 						amount, currency_code, material_request_id,
 						supplier_name, status, created_by, created_at, updated_at
 					) VALUES ($1, $2, $3, $10, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
 				`, tenantID, organizationID, projectID, requestDate, expDesc,
-					totalAmount, requestID, orgName, userID, stageIDInsert)
+					totalAmount, requestID, orgName, userID, stageIDInsert); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_expense_lines", "error", execErr)
+				}
 			}
 		}
 	}
@@ -3480,13 +3492,17 @@ func (h *Handler) createDeliveryForMaterialRequest(tenantID uuid.UUID, organizat
 				uom = "unit"
 			}
 
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO stock_operation_lines (
 					id, tenant_id, operation_id, product_id,
 					expected_qty, done_qty, uom, unit_price,
 					quality_status, created_at, updated_at
 				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
-			`, tenantID, opID, productID, qty, uom, unitCost, now)
+			`, tenantID, opID, productID, qty, uom, unitCost, now); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_lines", "error", execErr)
+
+			}
 		}
 	}
 
@@ -3505,11 +3521,15 @@ func (h *Handler) createDeliveryForMaterialRequest(tenantID uuid.UUID, organizat
 		firstStepName = firstStep.Name
 	}
 
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO stock_operation_step_log (
 			id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
 		) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
-	`, tenantID, opID, firstStep.ID, firstStepName, now)
+	`, tenantID, opID, firstStep.ID, firstStepName, now); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_step_log", "error", execErr)
+
+	}
 
 	return &opID
 }

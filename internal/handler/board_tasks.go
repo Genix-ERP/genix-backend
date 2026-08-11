@@ -1165,7 +1165,9 @@ func (h *Handler) DeleteTaskAttachment(c *gin.Context) {
 		return
 	}
 	if storagePath != "" {
-		h.db.Exec(`DELETE FROM uploaded_files WHERE id = $1`, storagePath)
+		if _, execErr := h.db.Exec(`DELETE FROM uploaded_files WHERE id = $1`, storagePath); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE uploaded_files", "error", execErr)
+		}
 	}
 	response.Success(c, gin.H{"deleted": true})
 }

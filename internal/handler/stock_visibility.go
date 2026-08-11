@@ -124,9 +124,11 @@ func (h *Handler) resolveOwningOrganization(tenantID uuid.UUID) (uuid.UUID, stri
 // operation is left half-advanced: not done, but not re-runnable either, which
 // is how a receipt becomes permanently stuck at "Bajarildi" with no stock.
 func (h *Handler) rollbackStep(operationID uuid.UUID, step int, tenantID uuid.UUID) {
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE stock_operation_step_log
 		SET state='ready', completed_at=NULL, completed_by=NULL
 		WHERE operation_id=$1 AND step_sequence=$2 AND tenant_id=$3
-	`, operationID, step, tenantID)
+	`, operationID, step, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE stock_operation_step_log", "error", execErr)
+	}
 }

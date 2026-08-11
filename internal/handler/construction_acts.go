@@ -1438,7 +1438,9 @@ func (h *Handler) SignAct(c *gin.Context) {
 	}
 
 	if newState == "signed" {
-		h.db.Exec(`UPDATE construction_act SET state = 'signed', updated_date = NOW() WHERE id = $1`, actID)
+		if _, execErr := h.db.Exec(`UPDATE construction_act SET state = 'signed', updated_date = NOW() WHERE id = $1`, actID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_act", "error", execErr)
+		}
 	}
 
 	// Get act name for logging
@@ -2381,7 +2383,7 @@ func (h *Handler) recalculateForma3(tenantID uuid.UUID, projectID int64, subcont
 		}
 
 		vatAmt := periodAmt * 0.12
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE construction_act SET
 				amount_total = $1, vat_amount = $2, amount_total_with_vat = $3,
 				cumul_from_start = $4, cumul_from_year_start = $5,
@@ -2390,7 +2392,9 @@ func (h *Handler) recalculateForma3(tenantID uuid.UUID, projectID int64, subcont
 			WHERE id = $7
 		`, periodAmt, vatAmt, periodAmt+vatAmt,
 			cumulFromStart, cumulYear, cumulFromStart-periodAmt,
-			ks3ID)
+			ks3ID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_act", "error", execErr)
+		}
 	}
 }
 
@@ -2575,8 +2579,10 @@ func (h *Handler) UpdateActLine(c *gin.Context) {
 	h.db.QueryRow(`SELECT COALESCE(vat_pct, 12) FROM construction_act WHERE id = $1`, actID).Scan(&vatPct)
 	vatAmt := totalAmt * vatPct / 100
 	totalWithVat := totalAmt + vatAmt
-	h.db.Exec(`UPDATE construction_act SET amount_total = $1, vat_amount = $2, amount_total_with_vat = $3 WHERE id = $4`,
-		totalAmt, vatAmt, totalWithVat, actID)
+	if _, execErr := h.db.Exec(`UPDATE construction_act SET amount_total = $1, vat_amount = $2, amount_total_with_vat = $3 WHERE id = $4`,
+		totalAmt, vatAmt, totalWithVat, actID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_act", "error", execErr)
+	}
 
 	response.Success(c, map[string]interface{}{"message": "Line updated"})
 }
@@ -2608,7 +2614,11 @@ func (h *Handler) DeleteConstructionAct(c *gin.Context) {
 		return
 	}
 
-	h.db.Exec(`DELETE FROM construction_act_line WHERE act_id = $1`, actID)
+	if _, execErr := h.db.Exec(`DELETE FROM construction_act_line WHERE act_id = $1`, actID); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE construction_act_line", "error", execErr)
+
+	}
 	_, err = h.db.Exec(`DELETE FROM construction_act WHERE id = $1 AND tenant_id = $2`, actID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete act", "error", err)

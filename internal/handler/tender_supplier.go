@@ -433,13 +433,15 @@ func (h *Handler) AddSupplierReview(c *gin.Context) {
 	}
 
 	// Update supplier's average rating
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE tender_company_profiles SET
 			rating = (SELECT COALESCE(AVG(overall_rating), 0) FROM tender_reviews WHERE supplier_id = $1 AND is_visible = true),
 			review_count = (SELECT COUNT(*) FROM tender_reviews WHERE supplier_id = $1 AND is_visible = true),
 			updated_at = NOW()
 		WHERE user_id = $1
-	`, supplierID)
+	`, supplierID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE tender_company_profiles", "error", execErr)
+	}
 
 	response.Created(c, map[string]interface{}{"id": reviewID})
 }
