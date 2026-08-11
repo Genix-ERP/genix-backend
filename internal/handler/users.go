@@ -870,7 +870,12 @@ func (h *Handler) ListAllTenants(c *gin.Context) {
 		args = append(args, "%"+search+"%")
 		argIdx++
 	}
-	if statusFilter != "" && statusFilter != "all" {
+	// "blocked" is not a subscription_status — it is is_active = false. Passing
+	// it through as one matched nothing, so the admin panel's Bloklangan filter
+	// returned an empty list that read as "no blocked companies".
+	if statusFilter == "blocked" {
+		query += " AND t.is_active = false"
+	} else if statusFilter != "" && statusFilter != "all" {
 		query += " AND t.subscription_status = $" + itoa(argIdx)
 		args = append(args, statusFilter)
 		argIdx++
