@@ -1053,7 +1053,14 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		LEFT JOIN contacts c ON si.customer_id = c.id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
 			AND si.customer_id IS NOT NULL
-			AND si.status NOT IN ('cancelled')
+			-- 'draft' excluded, matching the rest of the finance layer
+			-- (finance_dashboard.go, finance_kpis.go, payments_reconcile.go,
+			-- tax_reports.go, nds_tax.go). Aging was the only query that
+			-- counted an unconfirmed draft as a receivable, so this screen
+			-- and the dashboard card reported different debt for one tenant.
+			-- Both status columns DEFAULT to 'draft' (migrations 002, 004),
+			-- so the exposure is every invoice nobody has advanced yet.
+			AND si.status NOT IN ('draft', 'cancelled', 'void')
 			AND si.total_amount > 0
 			AND COALESCE(si.invoice_type, 'invoice') = 'invoice'
 			AND si.invoice_date <= $2::date
@@ -1154,7 +1161,10 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		LEFT JOIN contacts c ON p.contact_id = c.id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
 		  AND p.contact_id IS NOT NULL
-		  AND p.type = 'receipt' AND p.status = 'confirmed'
+		  -- 'posted' included: payments_reconcile.go treats both as real
+		  -- money, so a posted receipt showed as credit on Solishtirish and
+		  -- was invisible here — the same payment, two answers.
+		  AND p.type = 'receipt' AND p.status IN ('confirmed', 'posted')
 		  AND p.payment_date <= $2::date
 	`
 	payArgs := []interface{}{tenantID, asOfDate}
@@ -1431,7 +1441,8 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		LEFT JOIN contacts c ON pi.vendor_id = c.id
 		WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL
 			AND pi.vendor_id IS NOT NULL
-			AND pi.status NOT IN ('cancelled')
+			-- Same as the AR side above: a draft bill is not yet a payable.
+			AND pi.status NOT IN ('draft', 'cancelled', 'void')
 			AND pi.total_amount > 0
 			AND pi.invoice_date <= $2::date
 	`
@@ -1528,7 +1539,8 @@ func (h *Handler) GetAgingPayables(c *gin.Context) {
 		LEFT JOIN contacts c ON p.contact_id = c.id
 		WHERE p.tenant_id = $1 AND p.deleted_at IS NULL
 		  AND p.contact_id IS NOT NULL
-		  AND p.type = 'payment' AND p.status = 'confirmed'
+		  -- Same vocabulary as the AR side and payments_reconcile.go.
+		  AND p.type = 'payment' AND p.status IN ('confirmed', 'posted')
 		  AND p.payment_date <= $2::date
 	`
 	payArgs := []interface{}{tenantID, asOfDate}

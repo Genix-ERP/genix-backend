@@ -17,21 +17,21 @@ import (
 //
 //   - totals:            income / expense / net for the period
 //   - cash:              balance per cash/bank account as of period_to, plus a
-//                        daily cumulative series over the same account set.
-//                        Both use the shared definition in cash_balance.go —
-//                        the one /reports/cash-flow also calls, so the web card,
-//                        its chart, and the mobile card cannot disagree.
+//     daily cumulative series over the same account set.
+//     Both use the shared definition in cash_balance.go —
+//     the one /reports/cash-flow also calls, so the web card,
+//     its chart, and the mobile card cannot disagree.
 //   - monthly:           income vs expense per month across the period
 //   - trend:             income/expense/net per month, rolling last 6 full
-//                        months + current month-to-date, independent of the
-//                        requested period (conventions.md §4)
+//     months + current month-to-date, independent of the
+//     requested period (conventions.md §4)
 //   - expense_breakdown: category-enriched — expense-sourced JE lines are
-//                        labelled by their Xarajatlar category (join via
-//                        source_id), everything else by GL account name,
-//                        so history posted into the 9410 fallback still
-//                        splits into real categories
+//     labelled by their Xarajatlar category (join via
+//     source_id), everything else by GL account name,
+//     so history posted into the 9410 fallback still
+//     splits into real categories
 //   - receivables/payables: open invoice totals (invoice minus payments —
-//                        never a manually maintained balance)
+//     never a manually maintained balance)
 //
 // Defaults to the current month when no period is given.
 func (h *Handler) GetFinanceDashboard(c *gin.Context) {
@@ -306,30 +306,60 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 	if orgScoped {
 		invArgs = append(invArgs, orgID)
 	}
+	// The filter is on the PARTNER's net balance, not on each invoice.
+	//
+	// `AND amount_due > 0` per row looks like "only the ones still owed", but
+	// amount_due is generated as total_amount - amount_paid and nothing caps
+	// amount_paid (sales_invoices.go, purchase_invoices.go and
+	// payments_reconcile.go all do `amount_paid = amount_paid + $1`). An
+	// overpaid invoice therefore has a NEGATIVE amount_due and the row is
+	// discarded outright — so a customer who overpaid invoice A and still owes
+	// on invoice B was reported at B's full value, with A's credit nowhere.
+	// The card overstated the debt, and did so silently.
+	//
+	// Grouping by partner first and filtering on the total also makes the
+	// count mean what the label says. COUNT(DISTINCT customer_id) over
+	// invoice rows counts partners who have at least one qualifying INVOICE,
+	// which is not the same set the sum is taken over — "(2 mijoz)" beside a
+	// figure covering a different two.
+	//
+	// The 0.005 epsilon matches the `due` definition in payments_reconcile.go
+	// rather than testing > 0 on a float sum.
 	var arTotal, arOverdue float64
 	var arPartners, arOverduePartners int
 	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(amount_due), 0),
-		       COUNT(DISTINCT customer_id),
-		       COALESCE(SUM(CASE WHEN due_date < CURRENT_DATE THEN amount_due ELSE 0 END), 0),
-		       COUNT(DISTINCT CASE WHEN due_date < CURRENT_DATE THEN customer_id END)
-		FROM sales_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-		  AND status NOT IN ('draft', 'cancelled', 'void')
-		  AND amount_due > 0`+orgFilterInv+`
+		SELECT COALESCE(SUM(due) FILTER (WHERE due > 0.005), 0),
+		       COUNT(*) FILTER (WHERE due > 0.005),
+		       COALESCE(SUM(overdue) FILTER (WHERE overdue > 0.005), 0),
+		       COUNT(*) FILTER (WHERE overdue > 0.005)
+		FROM (
+		    SELECT SUM(amount_due) AS due,
+		           SUM(CASE WHEN due_date < CURRENT_DATE THEN amount_due ELSE 0 END) AS overdue
+		    FROM sales_invoices
+		    WHERE tenant_id = $1 AND deleted_at IS NULL
+		      AND customer_id IS NOT NULL
+		      AND status NOT IN ('draft', 'cancelled', 'void')`+orgFilterInv+`
+		    GROUP BY customer_id
+		) p
 	`, invArgs...).Scan(&arTotal, &arPartners, &arOverdue, &arOverduePartners)
 
 	var apTotal, apOverdue float64
-	var apPartners int
+	var apPartners, apOverduePartners int
 	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(amount_due), 0),
-		       COUNT(DISTINCT vendor_id),
-		       COALESCE(SUM(CASE WHEN due_date < CURRENT_DATE THEN amount_due ELSE 0 END), 0)
-		FROM purchase_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-		  AND status NOT IN ('draft', 'cancelled', 'void')
-		  AND amount_due > 0`+orgFilterInv+`
-	`, invArgs...).Scan(&apTotal, &apPartners, &apOverdue)
+		SELECT COALESCE(SUM(due) FILTER (WHERE due > 0.005), 0),
+		       COUNT(*) FILTER (WHERE due > 0.005),
+		       COALESCE(SUM(overdue) FILTER (WHERE overdue > 0.005), 0),
+		       COUNT(*) FILTER (WHERE overdue > 0.005)
+		FROM (
+		    SELECT SUM(amount_due) AS due,
+		           SUM(CASE WHEN due_date < CURRENT_DATE THEN amount_due ELSE 0 END) AS overdue
+		    FROM purchase_invoices
+		    WHERE tenant_id = $1 AND deleted_at IS NULL
+		      AND vendor_id IS NOT NULL
+		      AND status NOT IN ('draft', 'cancelled', 'void')`+orgFilterInv+`
+		    GROUP BY vendor_id
+		) p
+	`, invArgs...).Scan(&apTotal, &apPartners, &apOverdue, &apOverduePartners)
 
 	response.Success(c, gin.H{
 		"period_from":       periodFrom,
@@ -353,6 +383,9 @@ func (h *Handler) GetFinanceDashboard(c *gin.Context) {
 			"total":    apTotal,
 			"partners": apPartners,
 			"overdue":  apOverdue,
+			// New field, symmetric with receivables. Additive: no client reads
+			// it yet, so nothing changes until one chooses to.
+			"overdue_partners": apOverduePartners,
 		},
 	})
 }
