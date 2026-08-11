@@ -38,6 +38,18 @@ import "fmt"
 // should reference this constant rather than writing either form by hand.
 const debtStatusFilter = `status NOT IN ('draft', 'cancelled', 'void')`
 
+// debtStatusFilterFor is debtStatusFilter qualified with a table alias, for
+// the queries that join a second table and cannot name a bare column.
+//
+// It qualifies textually, so debtStatusFilter must stay a single predicate over
+// the bare `status` column — a second column mentioned in that constant would
+// come out unqualified here and fail (or, worse, resolve against the joined
+// table). Adding one means giving this function a real body, not a longer
+// constant.
+func debtStatusFilterFor(alias string) string {
+	return alias + "." + debtStatusFilter
+}
+
 // partnerNetDue builds a subquery of one row per partner, carrying that
 // partner's net `due` and net `overdue`.
 //

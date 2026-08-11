@@ -69,12 +69,26 @@ func invoiceStatusFilter(raw, alias string, args *[]interface{}) string {
 // still count an invoice paid in full whose status was never moved off 'sent' —
 // a real data state, since status and amount_paid are written by different
 // paths. Residual covers both that and the zero-total case.
+//
+// B1: the status list is debtStatusFilter, not a locally written NOT IN
+// ('paid', 'cancelled'). That local list included 'draft' — a status both
+// invoice tables DEFAULT to — so an unconfirmed bill past its due date counted
+// as overdue here while /reports/finance-dashboard, which uses
+// debtStatusFilter, left it out of "Siz qarzdorsiz" entirely. One invoice, two
+// screens, opposite answers.
+//
+// Dropping 'paid' from the exclusion costs nothing: a settled row's residual is
+// already <= 0 and fails the test below. What it does buy is the row whose
+// amount_paid never reached total_amount while its status was moved to 'paid'
+// anyway — money genuinely still owed, which the old list hid. Same reasoning
+// as the residual note above: the amounts are the truth, the status column is
+// the vocabulary.
 func invoiceOverdueSQL(alias string) string {
 	return fmt.Sprintf(
-		"(%s.due_date IS NOT NULL AND %s.due_date < CURRENT_DATE"+
-			" AND %s.status NOT IN ('paid', 'cancelled')"+
-			" AND (%s.total_amount - COALESCE(%s.amount_paid, 0)) > 0)",
-		alias, alias, alias, alias, alias)
+		"(%[1]s.due_date IS NOT NULL AND %[1]s.due_date < CURRENT_DATE"+
+			" AND %[2]s"+
+			" AND (%[1]s.total_amount - COALESCE(%[1]s.amount_paid, 0)) > 0)",
+		alias, debtStatusFilterFor(alias))
 }
 
 // purchaseInvoiceWhere builds the predicate shared by ListPurchaseInvoices, its
@@ -109,6 +123,7 @@ func purchaseInvoiceWhere(c *gin.Context, args *[]interface{}) string {
 	if c.Query("overdue") == "true" {
 		where += " AND " + invoiceOverdueSQL("pi")
 	}
+	where += invoiceDebtFilter(c, "pi")
 	if v := strings.TrimSpace(c.Query("invoice_type")); v != "" {
 		*args = append(*args, v)
 		where += fmt.Sprintf(" AND COALESCE(pi.invoice_type, 'invoice') = $%d", len(*args))
@@ -124,6 +139,34 @@ func purchaseInvoiceWhere(c *gin.Context, args *[]interface{}) string {
 			n, n, n)
 	}
 	return where
+}
+
+// invoiceDebtFilter renders the optional `debt=true` scope: only the documents
+// the debt cards count.
+//
+// It exists because sharing invoicePaymentStatusSQL between the cards and the
+// payment_status= filter — B3 — does not on its own make them return the same
+// rows. The cards apply a SECOND predicate, debtStatusFilter, which the filter
+// had no way to express: "To'lanmagan: 1" opened a list of 4, the extra three
+// being a draft, a cancellation and a void that the card is right to leave out.
+// Widening the payment-status filter to match was not an option — a user asking
+// for paid invoices wants the cancelled ones that were paid too, and that filter
+// is also what the AR/AP screens' own chips use.
+//
+// So the card links with `payment_status=unpaid&debt=true` and the rule stays on
+// this side. Same shape as `overdue=true` directly above, and for the same
+// reason: a card-shaped predicate belongs in the query string, not re-typed as a
+// status list in the browser, where it would drift the moment the vocabulary
+// changes (migration 478 already retired 'pending_approval' and 'approved' out
+// from under one screen that had hard-coded them).
+//
+// Absent or anything but "true", this adds nothing — every existing caller keeps
+// its current result set.
+func invoiceDebtFilter(c *gin.Context, alias string) string {
+	if c.Query("debt") != "true" {
+		return ""
+	}
+	return " AND " + debtStatusFilterFor(alias)
 }
 
 // invoicePaymentStatusSQL is the ONE definition of payment_status, used both for
@@ -207,6 +250,7 @@ func salesInvoiceWhere(c *gin.Context, args *[]interface{}) string {
 	if c.Query("overdue") == "true" {
 		where += " AND " + invoiceOverdueSQL("si")
 	}
+	where += invoiceDebtFilter(c, "si")
 	if v := strings.TrimSpace(c.Query("invoice_type")); v != "" {
 		*args = append(*args, v)
 		where += fmt.Sprintf(" AND COALESCE(si.invoice_type, 'invoice') = $%d", len(*args))
