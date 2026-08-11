@@ -727,19 +727,23 @@ func (h *Handler) MarkDropshipShipped(c *gin.Context) {
 	}
 
 	// Update lines status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE dropship_order_lines
 		SET status = 'shipped', quantity_shipped = quantity, updated_at = $1
 		WHERE dropship_order_id = $2
-	`, now, orderID)
+	`, now, orderID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE dropship_order_lines", "error", execErr)
+	}
 
 	// Update related sales order line statuses
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE sales_order_lines sol
 		SET dropship_status = 'shipped'
 		FROM dropship_order_lines dol
 		WHERE dol.sales_order_line_id = sol.id AND dol.dropship_order_id = $1
-	`, orderID)
+	`, orderID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE sales_order_lines", "error", execErr)
+	}
 
 	h.GetDropshipOrder(c)
 }
@@ -778,19 +782,23 @@ func (h *Handler) MarkDropshipDelivered(c *gin.Context) {
 	}
 
 	// Update lines status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE dropship_order_lines
 		SET status = 'delivered', quantity_delivered = quantity, updated_at = $1
 		WHERE dropship_order_id = $2
-	`, now, orderID)
+	`, now, orderID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE dropship_order_lines", "error", execErr)
+	}
 
 	// Update related sales order line statuses
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE sales_order_lines sol
 		SET dropship_status = 'delivered', quantity_delivered = sol.quantity
 		FROM dropship_order_lines dol
 		WHERE dol.sales_order_line_id = sol.id AND dol.dropship_order_id = $1
-	`, orderID)
+	`, orderID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE sales_order_lines", "error", execErr)
+	}
 
 	h.GetDropshipOrder(c)
 }
@@ -829,19 +837,23 @@ func (h *Handler) CancelDropshipOrder(c *gin.Context) {
 	}
 
 	// Update lines status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE dropship_order_lines
 		SET status = 'cancelled', updated_at = $1
 		WHERE dropship_order_id = $2
-	`, now, orderID)
+	`, now, orderID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE dropship_order_lines", "error", execErr)
+	}
 
 	// Reset sales order line dropship status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE sales_order_lines sol
 		SET is_dropship = false, dropship_status = NULL, dropship_vendor_id = NULL
 		FROM dropship_order_lines dol
 		WHERE dol.sales_order_line_id = sol.id AND dol.dropship_order_id = $1
-	`, orderID)
+	`, orderID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE sales_order_lines", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Dropship order cancelled"})
 }
@@ -1352,9 +1364,11 @@ func (h *Handler) CreateDropshipProductVendor(c *gin.Context) {
 	}
 
 	// Also mark the product as dropshippable
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE products SET is_dropshippable = true WHERE id = $1
-	`, productID)
+	`, productID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE products", "error", execErr)
+	}
 
 	response.Created(c, gin.H{"id": id, "message": "Product linked to vendor"})
 }

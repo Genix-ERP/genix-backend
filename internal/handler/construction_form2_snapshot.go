@@ -54,8 +54,8 @@ type Form2Snapshot struct {
 
 // CreateForm2SnapshotInput is the request body for POST .../snapshots.
 type CreateForm2SnapshotInput struct {
-	PeriodFrom        *string         `json:"period_from"`        // ISO date "YYYY-MM-DD" or null
-	PeriodTo          *string         `json:"period_to"`          //
+	PeriodFrom        *string         `json:"period_from"` // ISO date "YYYY-MM-DD" or null
+	PeriodTo          *string         `json:"period_to"`   //
 	OtherCostsPct     float64         `json:"other_costs_pct"`
 	UseVat            *bool           `json:"use_vat"`
 	TotalWithVat      float64         `json:"total_with_vat"`

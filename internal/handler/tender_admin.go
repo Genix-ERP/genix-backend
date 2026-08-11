@@ -34,18 +34,18 @@ func (h *Handler) TenderAdminDashboard(c *gin.Context) {
 	h.db.QueryRow(`SELECT COUNT(*) FROM tender_company_profiles WHERE created_at >= NOW() - INTERVAL '7 days' AND deleted_at IS NULL`).Scan(&newCompaniesThisWeek)
 
 	response.Success(c, gin.H{
-		"total_companies":        totalCompanies,
-		"total_buyers":           totalBuyers,
-		"total_suppliers":        totalSuppliers,
-		"total_tenders":          totalTenders,
-		"active_tenders":         activeTenders,
-		"completed_tenders":      completedTenders,
-		"total_bids":             totalBids,
-		"total_products":         totalProducts,
-		"total_reviews":          totalReviews,
-		"pending_verifications":  pendingVerifications,
-		"tenders_this_week":      tendersThisWeek,
-		"bids_this_week":         bidsThisWeek,
+		"total_companies":         totalCompanies,
+		"total_buyers":            totalBuyers,
+		"total_suppliers":         totalSuppliers,
+		"total_tenders":           totalTenders,
+		"active_tenders":          activeTenders,
+		"completed_tenders":       completedTenders,
+		"total_bids":              totalBids,
+		"total_products":          totalProducts,
+		"total_reviews":           totalReviews,
+		"pending_verifications":   pendingVerifications,
+		"tenders_this_week":       tendersThisWeek,
+		"bids_this_week":          bidsThisWeek,
 		"new_companies_this_week": newCompaniesThisWeek,
 	})
 }
@@ -517,4 +517,3 @@ func (h *Handler) TenderAdminReports(c *gin.Context) {
 		})
 	}
 }
-

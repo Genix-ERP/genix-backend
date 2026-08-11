@@ -383,19 +383,25 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 			returnReason = input.ReturnReason
 		}
 
-		h.db.Exec(lineQuery,
+		if _, execErr := h.db.Exec(lineQuery,
 			lineID, returnID, poLineID, grLineID, productID, lineInput.ProductName,
 			lineInput.ProductCode, lineInput.ReturnQuantity, unit, lineInput.UnitPrice, totalPrice,
 			returnReason, lineInput.ReasonDetails, lineInput.BatchNumber, lineInput.SerialNumbers,
 			lineInput.Condition, lineInput.Notes, now, now,
-		)
+		); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+
+		}
 
 		totalQty += lineInput.ReturnQuantity
 		totalValue += totalPrice
 	}
 
 	// Update totals
-	h.db.Exec("UPDATE purchase_returns SET total_quantity = $1, total_value = $2, updated_at = $3 WHERE id = $4", totalQty, totalValue, now, returnID)
+	if _, execErr := h.db.Exec("UPDATE purchase_returns SET total_quantity = $1, total_value = $2, updated_at = $3 WHERE id = $4", totalQty, totalValue, now, returnID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_returns", "error", execErr)
+	}
 
 	// Return created return
 	retResponse := map[string]interface{}{
@@ -1146,7 +1152,9 @@ func (h *Handler) ReceivePurchaseReturn(c *gin.Context) {
 	now := time.Now()
 
 	// Mark all lines as received back
-	h.db.Exec("UPDATE purchase_return_lines SET received_back = true, updated_at = $1 WHERE return_id = $2", now, returnID)
+	if _, execErr := h.db.Exec("UPDATE purchase_return_lines SET received_back = true, updated_at = $1 WHERE return_id = $2", now, returnID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_return_lines", "error", execErr)
+	}
 
 	// Update return status
 	_, err = h.db.Exec(
@@ -1207,7 +1215,9 @@ func (h *Handler) ApplyCreditNote(c *gin.Context) {
 	now := time.Now()
 
 	// Mark all lines as credit applied
-	h.db.Exec("UPDATE purchase_return_lines SET credit_applied = true, updated_at = $1 WHERE return_id = $2", now, returnID)
+	if _, execErr := h.db.Exec("UPDATE purchase_return_lines SET credit_applied = true, updated_at = $1 WHERE return_id = $2", now, returnID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_return_lines", "error", execErr)
+	}
 
 	// Update return with credit info
 	_, err = h.db.Exec(`

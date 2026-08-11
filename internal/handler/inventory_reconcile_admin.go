@@ -313,7 +313,7 @@ func (h *Handler) GetInventoryReconcile(c *gin.Context) {
 			  AND COALESCE(w.warehouse_type, 'regular') <> 'scrap'
 			  AND i.quantity_on_hand > 0
 			GROUP BY p.id, p.code, p.name
-			ORDER BY total_value DESC
+			ORDER BY total_value DESC, p.id ASC
 			LIMIT $3
 		`
 		prodRows, err := h.db.Query(topQuery, entry.TenantID, entry.OrganizationID, topN)

@@ -68,7 +68,7 @@ func (h *Handler) ListEmployeeOrganizations(c *gin.Context) {
 		FROM employee_organizations eo
 		JOIN organizations o ON o.id = eo.organization_id
 		WHERE eo.tenant_id = $1 AND eo.employee_id = $2
-		ORDER BY eo.is_primary DESC, o.name ASC
+		ORDER BY eo.is_primary DESC, o.name ASC, eo.id ASC
 	`
 
 	args := []interface{}{tenantID, employeeID}
@@ -144,7 +144,7 @@ func (h *Handler) ListOrganizationEmployees(c *gin.Context) {
 		FROM employee_organizations eo
 		JOIN employees e ON e.id = eo.employee_id AND e.deleted_at IS NULL
 		WHERE eo.tenant_id = $1 AND eo.organization_id = $2
-		ORDER BY eo.is_primary DESC, employee_name ASC
+		ORDER BY eo.is_primary DESC, employee_name ASC, eo.id ASC
 	`
 
 	args := []interface{}{tenantID, orgID}

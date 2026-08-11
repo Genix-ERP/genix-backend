@@ -274,13 +274,13 @@ func normaliseRole(s string) string {
 // transition: the estimate id, project id, current status, plan + done
 // quantity, and the line's display name.
 type workCtx struct {
-	LineID         int64
-	EstimateID     int64
-	ProjectID      int64
-	Status         string
-	PlanQty        float64
-	DoneQty        float64
-	Name           string
+	LineID     int64
+	EstimateID int64
+	ProjectID  int64
+	Status     string
+	PlanQty    float64
+	DoneQty    float64
+	Name       string
 }
 
 func (h *Handler) loadWorkContext(tenantID uuid.UUID, lineID int64) (*workCtx, error) {

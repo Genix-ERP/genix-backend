@@ -138,7 +138,7 @@ func (h *Handler) ListConstructionProjects(c *gin.Context) {
 	}
 
 	// Add ordering and pagination
-	baseQuery += " ORDER BY cp.created_date DESC"
+	baseQuery += " ORDER BY cp.created_date DESC, cp.id ASC"
 	pagination := entity.NewPagination(page, limit)
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", pagination.Limit, pagination.Offset())
 
@@ -968,10 +968,10 @@ func (h *Handler) GetConstructionProjectDashboard(c *gin.Context) {
 			var createdAt time.Time
 			if err := activityRows.Scan(&actionType, &description, &createdAt, &userName); err == nil {
 				recentActivity = append(recentActivity, map[string]interface{}{
-					"type":     actionType,
-					"text":     description,
-					"user":     userName,
-					"date":     createdAt,
+					"type": actionType,
+					"text": description,
+					"user": userName,
+					"date": createdAt,
 				})
 			}
 		}
@@ -1258,7 +1258,9 @@ func (h *Handler) CreateConstructionBuilding(c *gin.Context) {
 	req.Code = tryCode
 
 	// Update project buildings count
-	h.db.Exec(`UPDATE construction_projects SET buildings_count = buildings_count + 1, updated_date = NOW() WHERE id = $1`, projectID)
+	if _, execErr := h.db.Exec(`UPDATE construction_projects SET buildings_count = buildings_count + 1, updated_date = NOW() WHERE id = $1`, projectID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_projects", "error", execErr)
+	}
 
 	response.Created(c, map[string]interface{}{
 		"id":           buildingID,
@@ -1440,7 +1442,9 @@ func (h *Handler) DeleteConstructionBuilding(c *gin.Context) {
 	}
 
 	// Update project buildings count
-	h.db.Exec(`UPDATE construction_projects SET buildings_count = GREATEST(0, buildings_count - 1), updated_date = NOW() WHERE id = $1`, projectID)
+	if _, execErr := h.db.Exec(`UPDATE construction_projects SET buildings_count = GREATEST(0, buildings_count - 1), updated_date = NOW() WHERE id = $1`, projectID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_projects", "error", execErr)
+	}
 
 	response.Success(c, map[string]interface{}{"message": "Building deleted successfully"})
 }
@@ -2096,9 +2100,10 @@ func (h *Handler) updateSmetaSectionTotals(sectionID int64) {
 			updated_date = NOW()
 		WHERE id = $1
 	`
-	h.db.Exec(query, sectionID)
+	if _, execErr := h.db.Exec(query, sectionID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+	}
 }
-
 
 // Helper functions for extracting values from sql.Null* types
 func nullStringValue(ns sql.NullString) interface{} {
@@ -2228,7 +2233,7 @@ func (h *Handler) ListProjectVendors(c *gin.Context) {
 		LEFT JOIN contacts c ON c.id = pv.vendor_id
 		LEFT JOIN organizations o ON o.id = pv.vendor_id
 		WHERE pv.project_id = $1 AND pv.tenant_id = $2
-		ORDER BY pv.created_date DESC
+		ORDER BY pv.created_date DESC, pv.id ASC
 	`
 
 	// Opt-in paging. Both LEFT JOINs resolve vendor_name and are 1:1 on
@@ -2419,9 +2424,9 @@ func (h *Handler) CreateProjectVendor(c *gin.Context) {
 	}
 
 	response.Created(c, map[string]interface{}{
-		"id":         vendorRecordID,
-		"vendor_id":  vendorUUID,
-		"message":    "Vendor added to project successfully",
+		"id":        vendorRecordID,
+		"vendor_id": vendorUUID,
+		"message":   "Vendor added to project successfully",
 	})
 }
 
@@ -2622,7 +2627,7 @@ func (h *Handler) ListDailyReports(c *gin.Context) {
 		LEFT JOIN employees e ON e.id = dr.reported_by
 		LEFT JOIN employees v ON v.id = dr.verified_by
 		WHERE dr.project_id = $1 AND dr.tenant_id = $2
-		ORDER BY dr.report_date DESC`
+		ORDER BY dr.report_date DESC, dr.id ASC`
 	paginate, page, pageSize, offset := optPagination(c)
 	args := []interface{}{projectID, tenantID}
 	if paginate {
@@ -2842,27 +2847,27 @@ func (h *Handler) GetDailyReport(c *gin.Context) {
 	`
 
 	var report struct {
-		ID                 int64          `json:"id"`
-		TenantID           uuid.UUID      `json:"tenant_id"`
-		ProjectID          int64          `json:"project_id"`
-		ReportDate         time.Time      `json:"report_date"`
-		WeatherMorning     sql.NullString `json:"weather_morning"`
-		WeatherAfternoon   sql.NullString `json:"weather_afternoon"`
+		ID                 int64           `json:"id"`
+		TenantID           uuid.UUID       `json:"tenant_id"`
+		ProjectID          int64           `json:"project_id"`
+		ReportDate         time.Time       `json:"report_date"`
+		WeatherMorning     sql.NullString  `json:"weather_morning"`
+		WeatherAfternoon   sql.NullString  `json:"weather_afternoon"`
 		TemperatureMin     sql.NullFloat64 `json:"temperature_min"`
 		TemperatureMax     sql.NullFloat64 `json:"temperature_max"`
-		WorkSummary        sql.NullString `json:"work_summary"`
-		IssuesEncountered  sql.NullString `json:"issues_encountered"`
-		SafetyNotes        sql.NullString `json:"safety_notes"`
-		WorkersCount       sql.NullInt64  `json:"workers_count"`
-		WorkersDetails     sql.NullString `json:"workers_details"`
-		EquipmentUsed      sql.NullString `json:"equipment_used"`
-		MaterialsReceived  sql.NullString `json:"materials_received"`
-		VerificationStatus sql.NullString `json:"verification_status"`
-		VerifiedBy         sql.NullInt64  `json:"verified_by"`
-		VerifiedAt         sql.NullTime   `json:"verified_at"`
-		VerifierNotes      sql.NullString `json:"verifier_notes"`
-		CreatedDate        time.Time      `json:"created_date"`
-		UpdatedDate        time.Time      `json:"updated_date"`
+		WorkSummary        sql.NullString  `json:"work_summary"`
+		IssuesEncountered  sql.NullString  `json:"issues_encountered"`
+		SafetyNotes        sql.NullString  `json:"safety_notes"`
+		WorkersCount       sql.NullInt64   `json:"workers_count"`
+		WorkersDetails     sql.NullString  `json:"workers_details"`
+		EquipmentUsed      sql.NullString  `json:"equipment_used"`
+		MaterialsReceived  sql.NullString  `json:"materials_received"`
+		VerificationStatus sql.NullString  `json:"verification_status"`
+		VerifiedBy         sql.NullInt64   `json:"verified_by"`
+		VerifiedAt         sql.NullTime    `json:"verified_at"`
+		VerifierNotes      sql.NullString  `json:"verifier_notes"`
+		CreatedDate        time.Time       `json:"created_date"`
+		UpdatedDate        time.Time       `json:"updated_date"`
 	}
 
 	err = h.db.QueryRow(query, reportID, tenantID).Scan(
@@ -3126,7 +3131,7 @@ func (h *Handler) ListMaterialRequests(c *gin.Context) {
 		LEFT JOIN construction_subcontract sc ON sc.id = mr.subcontract_id
 		LEFT JOIN construction_buildings bld ON bld.id = mr.building_id
 		WHERE mr.project_id = $1 AND mr.tenant_id = $2
-		ORDER BY mr.request_date DESC`
+		ORDER BY mr.request_date DESC, mr.id ASC`
 	paginate, page, pageSize, offset := optPagination(c)
 	args := []interface{}{projectID, tenantID}
 	if paginate {
@@ -3324,8 +3329,10 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	var stockOpID *uuid.UUID
 	stockOpID = h.createDeliveryForMaterialRequest(tenantID, organizationID, requestID, requestNumber, itemsJSON)
 	if stockOpID != nil {
-		h.db.Exec(`UPDATE construction_material_requests SET stock_operation_id = $1 WHERE id = $2 AND tenant_id = $3`,
-			stockOpID, requestID, tenantID)
+		if _, execErr := h.db.Exec(`UPDATE construction_material_requests SET stock_operation_id = $1 WHERE id = $2 AND tenant_id = $3`,
+			stockOpID, requestID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_material_requests", "error", execErr)
+		}
 	}
 
 	// Auto-create expense line for material request
@@ -3362,35 +3369,39 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 				// Billed to subcontractor — supplier_name = subcontractor partner_name
 				var scPartnerName string
 				h.db.QueryRow(`SELECT COALESCE(partner_name, name) FROM construction_subcontract WHERE id = $1`, req.SubcontractID).Scan(&scPartnerName)
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO construction_expense_lines (
 						tenant_id, organization_id, project_id, stage_id, expense_date, description,
 						amount, currency_code, subcontract_id, material_request_id,
 						supplier_name, status, created_by, created_at, updated_at
 					) VALUES ($1, $2, $3, $11, $4, $5, $6, 'UZS', $7, $8, $9, 'draft', $10, NOW(), NOW())
 				`, tenantID, organizationID, projectID, requestDate, expDesc,
-					totalAmount, req.SubcontractID, requestID, scPartnerName, userID, stageIDInsert)
+					totalAmount, req.SubcontractID, requestID, scPartnerName, userID, stageIDInsert); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_expense_lines", "error", execErr)
+				}
 			} else {
 				// No subcontractor — supplier is the company itself
 				var orgName string
 				h.db.QueryRow(`SELECT COALESCE(name, '') FROM organizations WHERE id = $1`, organizationID).Scan(&orgName)
-				h.db.Exec(`
+				if _, execErr := h.db.Exec(`
 					INSERT INTO construction_expense_lines (
 						tenant_id, organization_id, project_id, stage_id, expense_date, description,
 						amount, currency_code, material_request_id,
 						supplier_name, status, created_by, created_at, updated_at
 					) VALUES ($1, $2, $3, $10, $4, $5, $6, 'UZS', $7, $8, 'draft', $9, NOW(), NOW())
 				`, tenantID, organizationID, projectID, requestDate, expDesc,
-					totalAmount, requestID, orgName, userID, stageIDInsert)
+					totalAmount, requestID, orgName, userID, stageIDInsert); execErr != nil {
+					h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_expense_lines", "error", execErr)
+				}
 			}
 		}
 	}
 
 	response.Created(c, map[string]interface{}{
-		"id":                requestID,
-		"request_number":    requestNumber,
+		"id":                 requestID,
+		"request_number":     requestNumber,
 		"stock_operation_id": stockOpID,
-		"message":           "Material request created successfully",
+		"message":            "Material request created successfully",
 	})
 }
 
@@ -3481,13 +3492,17 @@ func (h *Handler) createDeliveryForMaterialRequest(tenantID uuid.UUID, organizat
 				uom = "unit"
 			}
 
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO stock_operation_lines (
 					id, tenant_id, operation_id, product_id,
 					expected_qty, done_qty, uom, unit_price,
 					quality_status, created_at, updated_at
 				) VALUES (uuid_generate_v4(),$1,$2,$3,$4,$4,$5,$6,'good',$7,$7)
-			`, tenantID, opID, productID, qty, uom, unitCost, now)
+			`, tenantID, opID, productID, qty, uom, unitCost, now); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_lines", "error", execErr)
+
+			}
 		}
 	}
 
@@ -3506,11 +3521,15 @@ func (h *Handler) createDeliveryForMaterialRequest(tenantID uuid.UUID, organizat
 		firstStepName = firstStep.Name
 	}
 
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO stock_operation_step_log (
 			id, tenant_id, operation_id, step_id, step_sequence, step_name, state, created_at
 		) VALUES (uuid_generate_v4(),$1,$2,$3,1,$4,'ready',$5)
-	`, tenantID, opID, firstStep.ID, firstStepName, now)
+	`, tenantID, opID, firstStep.ID, firstStepName, now); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT stock_operation_step_log", "error", execErr)
+
+	}
 
 	return &opID
 }
@@ -4259,7 +4278,7 @@ func (h *Handler) ListDeliveries(c *gin.Context) {
 		LEFT JOIN organizations o ON o.id = pv.vendor_id
 		LEFT JOIN employees e ON e.id = d.received_by
 		WHERE d.project_id = $1 AND d.tenant_id = $2
-		ORDER BY d.delivery_date DESC`
+		ORDER BY d.delivery_date DESC, d.id ASC`
 	paginate, page, pageSize, offset := optPagination(c)
 	args := []interface{}{projectID, tenantID}
 	if paginate {
@@ -5230,10 +5249,10 @@ func (h *Handler) GetConstructionPortfolioDashboard(c *gin.Context) {
 	`, tenantID)
 
 	type ProjectBar struct {
-		ID      int64   `json:"id"`
-		Name    string  `json:"name"`
-		Budget  float64 `json:"budget"`
-		Actual  float64 `json:"actual"`
+		ID     int64   `json:"id"`
+		Name   string  `json:"name"`
+		Budget float64 `json:"budget"`
+		Actual float64 `json:"actual"`
 	}
 	perProject := []ProjectBar{}
 	if err == nil {
@@ -5826,19 +5845,20 @@ func (h *Handler) DeleteProjectFile(c *gin.Context) {
 //
 // What gets reset (vs. preserved)
 // -------------------------------
-//   Preserved on every line: name, uom, quantity, rates (material / labor /
-//     equipment), unit_rate, total_amount, code, item_number, resource_type,
-//     parent_item_number, parent_line_id (REMAPPED to the new line id),
-//     norm_rate, subline_seq, quantity_override, material_type,
-//     original_quantity, original_unit_rate, imported_quantity,
-//     imported_total, sort_order, is_manual, wbs_id.
 //
-//   Reset to defaults: actual_amount, done_quantity, approval_status,
-//     period_fakt, created_date, updated_date. The clone is a fresh build —
-//     FAKT progress on the source must not bleed into the target's
-//     dashboard, Form 2, or Reja vs Fakt summary. Matches the user's
-//     explicit decision to NOT clone FAKT data when this feature was
-//     scoped.
+//	Preserved on every line: name, uom, quantity, rates (material / labor /
+//	  equipment), unit_rate, total_amount, code, item_number, resource_type,
+//	  parent_item_number, parent_line_id (REMAPPED to the new line id),
+//	  norm_rate, subline_seq, quantity_override, material_type,
+//	  original_quantity, original_unit_rate, imported_quantity,
+//	  imported_total, sort_order, is_manual, wbs_id.
+//
+//	Reset to defaults: actual_amount, done_quantity, approval_status,
+//	  period_fakt, created_date, updated_date. The clone is a fresh build —
+//	  FAKT progress on the source must not bleed into the target's
+//	  dashboard, Form 2, or Reja vs Fakt summary. Matches the user's
+//	  explicit decision to NOT clone FAKT data when this feature was
+//	  scoped.
 //
 // What is NOT cloned
 // ------------------
@@ -5865,7 +5885,8 @@ func (h *Handler) DeleteProjectFile(c *gin.Context) {
 // drawings to the source, ready for the user to start work.
 //
 // 200: { new_building: { id, name, code, … }, estimates_created,
-//        lines_created, stages_created, files_created }
+//
+//	lines_created, stages_created, files_created }
 //
 // (The body parameter `source_building_id` and the old "fail if target
 // not empty" check from the previous implementation are no longer
@@ -6444,11 +6465,11 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 	`, projectID)
 
 	response.Success(c, gin.H{
-		"message":           "Building duplicated",
-		"estimates_created": estimatesCreated,
-		"lines_created":     linesCreated,
-		"stages_created":    stagesCreated,
-		"files_created":     filesCreated,
+		"message":            "Building duplicated",
+		"estimates_created":  estimatesCreated,
+		"lines_created":      linesCreated,
+		"stages_created":     stagesCreated,
+		"files_created":      filesCreated,
 		"source_building_id": sourceBuildingID,
 		"new_building": gin.H{
 			"id":   targetBuildingID,

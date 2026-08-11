@@ -234,9 +234,9 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		ContactPhone    string  `json:"contact_phone"`
 		Notes           string  `json:"notes"`
 		// Shartnoma raqami — 472-gacha jimgina yo'qolardi (audit bug-fix).
-		ContractNumber  string  `json:"contract_number"`
-		WBSIDs          []int64 `json:"wbs_ids"`
-		BuildingIDs     []int64 `json:"building_ids"`
+		ContractNumber string  `json:"contract_number"`
+		WBSIDs         []int64 `json:"wbs_ids"`
+		BuildingIDs    []int64 `json:"building_ids"`
 		// Forma 2/3 identity block
 		Address             string `json:"address"`
 		Phone               string `json:"phone"`
@@ -306,14 +306,18 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 
 	// Link WBS items
 	for _, wbsID := range req.WBSIDs {
-		h.db.Exec(`INSERT INTO construction_subcontract_wbs (subcontract_id, wbs_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-			id, wbsID)
+		if _, execErr := h.db.Exec(`INSERT INTO construction_subcontract_wbs (subcontract_id, wbs_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+			id, wbsID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_subcontract_wbs", "error", execErr)
+		}
 	}
 
 	// Link buildings
 	for _, bldID := range req.BuildingIDs {
-		h.db.Exec(`INSERT INTO construction_subcontract_buildings (subcontract_id, building_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-			id, bldID)
+		if _, execErr := h.db.Exec(`INSERT INTO construction_subcontract_buildings (subcontract_id, building_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+			id, bldID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_subcontract_buildings", "error", execErr)
+		}
 	}
 
 	h.logConstructionActivity(tenantID, projectID, userID, "team",
@@ -638,19 +642,27 @@ func (h *Handler) UpdateSubcontract(c *gin.Context) {
 
 	// Update WBS links if provided
 	if req.WBSIDs != nil {
-		h.db.Exec(`DELETE FROM construction_subcontract_wbs WHERE subcontract_id = $1`, subID)
+		if _, execErr := h.db.Exec(`DELETE FROM construction_subcontract_wbs WHERE subcontract_id = $1`, subID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE construction_subcontract_wbs", "error", execErr)
+		}
 		for _, wbsID := range req.WBSIDs {
-			h.db.Exec(`INSERT INTO construction_subcontract_wbs (subcontract_id, wbs_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-				subID, wbsID)
+			if _, execErr := h.db.Exec(`INSERT INTO construction_subcontract_wbs (subcontract_id, wbs_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+				subID, wbsID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_subcontract_wbs", "error", execErr)
+			}
 		}
 	}
 
 	// Update building links if provided
 	if req.BuildingIDs != nil {
-		h.db.Exec(`DELETE FROM construction_subcontract_buildings WHERE subcontract_id = $1`, subID)
+		if _, execErr := h.db.Exec(`DELETE FROM construction_subcontract_buildings WHERE subcontract_id = $1`, subID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE construction_subcontract_buildings", "error", execErr)
+		}
 		for _, bldID := range req.BuildingIDs {
-			h.db.Exec(`INSERT INTO construction_subcontract_buildings (subcontract_id, building_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-				subID, bldID)
+			if _, execErr := h.db.Exec(`INSERT INTO construction_subcontract_buildings (subcontract_id, building_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+				subID, bldID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_subcontract_buildings", "error", execErr)
+			}
 		}
 	}
 
@@ -694,8 +706,14 @@ func (h *Handler) DeleteSubcontract(c *gin.Context) {
 		return
 	}
 
-	h.db.Exec(`DELETE FROM construction_subcontract_wbs WHERE subcontract_id = $1`, subID)
-	h.db.Exec(`DELETE FROM construction_subcontract_buildings WHERE subcontract_id = $1`, subID)
+	if _, execErr := h.db.Exec(`DELETE FROM construction_subcontract_wbs WHERE subcontract_id = $1`, subID); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE construction_subcontract_wbs", "error", execErr)
+
+	}
+	if _, execErr := h.db.Exec(`DELETE FROM construction_subcontract_buildings WHERE subcontract_id = $1`, subID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE construction_subcontract_buildings", "error", execErr)
+	}
 	_, err = h.db.Exec(`DELETE FROM construction_subcontract WHERE id = $1 AND tenant_id = $2`, subID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete subcontract", "error", err)

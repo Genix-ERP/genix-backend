@@ -306,11 +306,13 @@ func (h *Handler) CreatePipeline(c *gin.Context) {
 			// per-pipeline stage codes must stay unique per (tenant, type, org);
 			// suffix additional pipelines' codes with a short pipeline marker
 			code := s.Code + "_" + id.String()[:4]
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO pipeline_stages (id, tenant_id, name, code, sequence, probability, is_won, is_lost, color, is_active, pipeline_type, organization_id, pipeline_id, created_at, updated_at)
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, 'lead', $10, $11, NOW(), NOW())
 				ON CONFLICT DO NOTHING
-			`, uuid.New(), tenantID, s.Name, code, i, s.Prob, s.Won, s.Lost, s.Color, orgID, id)
+			`, uuid.New(), tenantID, s.Name, code, i, s.Prob, s.Won, s.Lost, s.Color, orgID, id); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT pipeline_stages", "error", execErr)
+			}
 		}
 	}
 	response.Created(c, gin.H{"id": id, "name": input.Name})
@@ -339,11 +341,13 @@ func (h *Handler) UpdatePipeline(c *gin.Context) {
 	}
 	if input.IsDefault != nil && *input.IsDefault {
 		// single default per (tenant, org) — clear siblings first
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE pipelines SET is_default = false
 			WHERE tenant_id = $1 AND is_default = true
 			  AND organization_id IS NOT DISTINCT FROM (SELECT organization_id FROM pipelines WHERE id = $2)
-		`, tenantID, id)
+		`, tenantID, id); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE pipelines", "error", execErr)
+		}
 	}
 	updates := []string{"updated_at = NOW()"}
 	args := []interface{}{}
@@ -404,7 +408,9 @@ func (h *Handler) DeletePipeline(c *gin.Context) {
 		response.BadRequest(c, "Cannot delete the default pipeline")
 		return
 	}
-	h.db.Exec(`DELETE FROM pipeline_stages WHERE pipeline_id = $1 AND tenant_id = $2`, id, tenantID)
+	if _, execErr := h.db.Exec(`DELETE FROM pipeline_stages WHERE pipeline_id = $1 AND tenant_id = $2`, id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE pipeline_stages", "error", execErr)
+	}
 	res, err := h.db.Exec(`DELETE FROM pipelines WHERE id = $1 AND tenant_id = $2`, id, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete pipeline", "error", err)
@@ -500,8 +506,10 @@ func (h *Handler) ListLostReasons(c *gin.Context) {
 	}
 	if len(reasons) == 0 {
 		for i, name := range defaultLostReasons {
-			h.db.Exec(`INSERT INTO lost_reasons (id, tenant_id, name, position) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
-				uuid.New(), tenantID, name, i)
+			if _, execErr := h.db.Exec(`INSERT INTO lost_reasons (id, tenant_id, name, position) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+				uuid.New(), tenantID, name, i); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT lost_reasons", "error", execErr)
+			}
 		}
 		if reasons, err = load(); err != nil {
 			response.InternalError(c, "Failed to list lost reasons")

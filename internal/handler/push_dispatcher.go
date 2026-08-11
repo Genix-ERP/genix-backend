@@ -33,7 +33,9 @@ func (h *Handler) dispatchPendingPush() {
 	// When push isn't configured, just mark the pending rows processed so they
 	// don't accumulate — enabling FCM later then won't backfill a backlog.
 	if !h.fcm.Enabled() {
-		h.db.Exec(`UPDATE notifications SET push_sent_at = NOW() WHERE push_sent_at IS NULL`)
+		if _, execErr := h.db.Exec(`UPDATE notifications SET push_sent_at = NOW() WHERE push_sent_at IS NULL`); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE notifications", "error", execErr)
+		}
 		return
 	}
 
@@ -80,6 +82,8 @@ func (h *Handler) dispatchPendingPush() {
 		// Mark processed regardless of per-token delivery outcome: pushToUser is
 		// best-effort and prunes dead tokens itself, so we never want to retry
 		// this row and risk duplicate deliveries.
-		h.db.Exec(`UPDATE notifications SET push_sent_at = NOW() WHERE id = $1`, p.id)
+		if _, execErr := h.db.Exec(`UPDATE notifications SET push_sent_at = NOW() WHERE id = $1`, p.id); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE notifications", "error", execErr)
+		}
 	}
 }

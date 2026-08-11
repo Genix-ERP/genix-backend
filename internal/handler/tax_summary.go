@@ -61,11 +61,11 @@ func (h *Handler) GetTaxSummaryCombined(c *gin.Context) {
 	// Sum payroll_entry_taxes (the snapshot table introduced by
 	// migration 330). Grouped by tax code so the UI can label each bar.
 	type payrollBucket struct {
-		Code    string  `json:"code"`
-		Name    string  `json:"name"`
-		Rate    float64 `json:"rate"`
-		Amount  float64 `json:"amount"`
-		Payer   string  `json:"payer"` // "employee" | "employer"
+		Code   string  `json:"code"`
+		Name   string  `json:"name"`
+		Rate   float64 `json:"rate"`
+		Amount float64 `json:"amount"`
+		Payer  string  `json:"payer"` // "employee" | "employer"
 	}
 	payrollBuckets := []payrollBucket{}
 	var totalEmployeeWithhold, totalEmployerContrib float64
@@ -166,27 +166,27 @@ func (h *Handler) GetTaxSummaryCombined(c *gin.Context) {
 		"period_end":   end.Format("2006-01-02"),
 
 		"payroll": gin.H{
-			"buckets":            payrollBuckets,
-			"employee_withhold":  round2(totalEmployeeWithhold),
-			"employer_contrib":   round2(totalEmployerContrib),
+			"buckets":           payrollBuckets,
+			"employee_withhold": round2(totalEmployeeWithhold),
+			"employer_contrib":  round2(totalEmployerContrib),
 		},
 
 		"nds": gin.H{
-			"rate":          ndsRate,
-			"realizatsiya":  round2(salesTax),
-			"zachet":        round2(purchaseTax),
-			"balansi":       ndsBalance,
-			"payable":       ndsBalance > 0,
+			"rate":         ndsRate,
+			"realizatsiya": round2(salesTax),
+			"zachet":       round2(purchaseTax),
+			"balansi":      ndsBalance,
+			"payable":      ndsBalance > 0,
 		},
 
 		"profit": gin.H{
-			"rate":             profitRate,
-			"income":           round2(income),
-			"recognized":       round2(recognized),
-			"unrecognized":     round2(unrecognized),
-			"tax_base":         round2(taxBase),
-			"tax_amount":       profitTaxAmount,
-			"income_source":    ternaryString(manualIncome > 0, "manual", "ledger"),
+			"rate":          profitRate,
+			"income":        round2(income),
+			"recognized":    round2(recognized),
+			"unrecognized":  round2(unrecognized),
+			"tax_base":      round2(taxBase),
+			"tax_amount":    profitTaxAmount,
+			"income_source": ternaryString(manualIncome > 0, "manual", "ledger"),
 		},
 
 		"turnover": gin.H{

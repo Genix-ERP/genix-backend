@@ -75,7 +75,8 @@ func (h *Handler) loadCredentials(tenantID uuid.UUID, orgID *uuid.UUID, provider
 // SyncEInvoices pulls incoming invoices from the configured provider and
 // ingests each one through the same path as manual POST /einvoices/ingest.
 // Body:
-//   { "provider": "didox", "days_back": 7 }
+//
+//	{ "provider": "didox", "days_back": 7 }
 func (h *Handler) SyncEInvoices(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -185,11 +186,11 @@ func (h *Handler) SyncEInvoices(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"provider":      body.Provider,
-		"fetched":       len(invoices),
-		"ingested":      ingested,
-		"duplicates":    duplicates,
-		"days_back":     body.DaysBack,
+		"provider":   body.Provider,
+		"fetched":    len(invoices),
+		"ingested":   ingested,
+		"duplicates": duplicates,
+		"days_back":  body.DaysBack,
 	})
 }
 
@@ -247,11 +248,11 @@ func (h *Handler) SendEInvoice(c *gin.Context) {
 		FactureType:    strOrEmpty(inv.FactureType),
 		DocumentNumber: strOrEmpty(inv.DocumentNumber),
 		SellerTIN:      strOrEmpty(inv.SellerTIN), SellerName: strOrEmpty(inv.SellerName),
-		BuyerTIN:       strOrEmpty(inv.BuyerTIN),  BuyerName: strOrEmpty(inv.BuyerName),
-		TotalAmount:    inv.TotalAmount,
-		TaxAmount:      inv.TaxAmount,
-		TotalWithTax:   inv.TotalWithTax,
-		Currency:       inv.Currency,
+		BuyerTIN: strOrEmpty(inv.BuyerTIN), BuyerName: strOrEmpty(inv.BuyerName),
+		TotalAmount:  inv.TotalAmount,
+		TaxAmount:    inv.TaxAmount,
+		TotalWithTax: inv.TotalWithTax,
+		Currency:     inv.Currency,
 	}
 	if inv.DocumentDate != nil {
 		if t, perr := time.Parse("2006-01-02", *inv.DocumentDate); perr == nil {

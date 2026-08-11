@@ -838,11 +838,11 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 
 	// Build availability map for partial delivery
 	type stockInfo struct {
-		InventoryID  uuid.UUID
-		Available    float64
-		UnitCost     float64
-		WarehouseID  string
-		ProductName  string
+		InventoryID uuid.UUID
+		Available   float64
+		UnitCost    float64
+		WarehouseID string
+		ProductName string
 	}
 	stockMap := make(map[uuid.UUID]stockInfo) // keyed by product_id
 

@@ -673,10 +673,12 @@ func (h *Handler) UpdateWarehouse(c *gin.Context) {
 	if input.IsDefault != nil {
 		// If setting as default, unset other defaults first
 		if *input.IsDefault {
-			h.db.Exec(
+			if _, execErr := h.db.Exec(
 				"UPDATE warehouses SET is_default = false WHERE tenant_id = $1 AND is_default = true AND id != $2",
 				tenantID, id,
-			)
+			); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE warehouses", "error", execErr)
+			}
 		}
 		addUpdate("is_default", *input.IsDefault)
 	}
@@ -745,10 +747,12 @@ func (h *Handler) UpdateWarehouse(c *gin.Context) {
 		).Scan(&whCode, &recSteps, &delSteps, &whOrgID)
 
 		// Soft-delete old auto-generated operation types and recreate
-		h.db.Exec(
+		if _, execErr := h.db.Exec(
 			"DELETE FROM warehouse_operation_types WHERE warehouse_id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
 			id, tenantID,
-		)
+		); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE warehouse_operation_types", "error", execErr)
+		}
 		h.createDefaultOperationTypes(tenantID, id, whCode, recSteps, delSteps, whOrgID)
 	}
 
@@ -815,10 +819,12 @@ func (h *Handler) DeleteWarehouse(c *gin.Context) {
 	}
 
 	// Also soft-delete associated locations
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE warehouse_locations SET deleted_at = $1, updated_at = $1
 		WHERE warehouse_id = $2 AND deleted_at IS NULL
-	`, time.Now(), id)
+	`, time.Now(), id); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE warehouse_locations", "error", execErr)
+	}
 
 	response.NoContent(c)
 }

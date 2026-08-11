@@ -1129,10 +1129,12 @@ func (h *Handler) UpdateLead(c *gin.Context) {
 		userID, _ := middleware.GetUserID(c)
 		oldJSON, _ := json.Marshal(oldValues)
 		newJSON, _ := json.Marshal(newValues)
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, entity_id, old_values, new_values, created_at)
 			VALUES ($1, $2, $3, 'update', 'lead', $4, $5, $6, $7)
-		`, uuid.New(), tenantID, userID, id, oldJSON, newJSON, time.Now())
+		`, uuid.New(), tenantID, userID, id, oldJSON, newJSON, time.Now()); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT audit_logs", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Lead updated successfully"})
@@ -1249,12 +1251,12 @@ func (h *Handler) GetLeadStats(c *gin.Context) {
 
 // ConvertLeadInput represents input for converting a lead
 type ConvertLeadInput struct {
-	CreateContact     bool   `json:"create_contact"`
-	CreateOpportunity bool   `json:"create_opportunity"`
-	ContactType       string `json:"contact_type,omitempty"`       // customer, vendor, partner
-	OpportunityName   string `json:"opportunity_name,omitempty"`
+	CreateContact     bool    `json:"create_contact"`
+	CreateOpportunity bool    `json:"create_opportunity"`
+	ContactType       string  `json:"contact_type,omitempty"` // customer, vendor, partner
+	OpportunityName   string  `json:"opportunity_name,omitempty"`
 	ExpectedRevenue   float64 `json:"expected_revenue,omitempty"`
-	ExpectedCloseDate string `json:"expected_close_date,omitempty"`
+	ExpectedCloseDate string  `json:"expected_close_date,omitempty"`
 }
 
 // ConvertLead converts a lead to a contact and/or opportunity
@@ -1582,14 +1584,14 @@ func (h *Handler) GetLeadAuditLogs(c *gin.Context) {
 // POST /api/v1/public/leads
 func (h *Handler) PublicCreateLead(c *gin.Context) {
 	var input struct {
-		TenantCode  string  `json:"tenant_code" binding:"required"`
-		ContactName string  `json:"contact_name" binding:"required"`
-		Email       string  `json:"email"`
-		Phone       string  `json:"phone"`
-		CompanyName string  `json:"company_name"`
-		Notes       string  `json:"notes"`
-		Source      string  `json:"source"`
-		PageURL     string  `json:"page_url"`
+		TenantCode  string `json:"tenant_code" binding:"required"`
+		ContactName string `json:"contact_name" binding:"required"`
+		Email       string `json:"email"`
+		Phone       string `json:"phone"`
+		CompanyName string `json:"company_name"`
+		Notes       string `json:"notes"`
+		Source      string `json:"source"`
+		PageURL     string `json:"page_url"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(400, gin.H{"success": false, "error": "tenant_code and contact_name are required"})

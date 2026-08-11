@@ -38,7 +38,7 @@ import (
 // ---------------------------------------------------------------------------
 
 // getOrInitPayrollSettings returns the tenant's payroll settings, inserting a
-// default row (40% / so'm / '') if none exists yet.
+// default row (40% / so'm / ”) if none exists yet.
 func (h *Handler) getOrInitPayrollSettings(tenantID uuid.UUID) (*entity.PayrollSettings, error) {
 	var s entity.PayrollSettings
 	err := h.db.QueryRow(`
@@ -400,8 +400,8 @@ func (h *Handler) respondPayrollPeriodWithEntries(c *gin.Context, tenantID, peri
 		p.Notes = &notes.String
 	}
 	response.Success(c, gin.H{
-		"period":          p.ToResponse(),
-		"newly_created":   created,
+		"period":        p.ToResponse(),
+		"newly_created": created,
 	})
 }
 
@@ -621,18 +621,18 @@ func (h *Handler) ExportPayrollBackup(c *gin.Context) {
 		ORDER BY start_date DESC
 	`, tenantID)
 	type periodOut struct {
-		ID            uuid.UUID          `json:"id"`
-		PeriodCode    string             `json:"period_code"`
-		PeriodName    string             `json:"period_name"`
-		StartDate     string             `json:"start_date"`
-		EndDate       string             `json:"end_date"`
-		PayDate       string             `json:"pay_date"`
-		Status        string             `json:"status"`
-		TotalGross    float64            `json:"total_gross"`
-		TotalNet      float64            `json:"total_net"`
-		EmployeeCount int                `json:"employee_count"`
-		CreatedAt     time.Time          `json:"created_at"`
-		Entries       []gin.H            `json:"entries"`
+		ID            uuid.UUID `json:"id"`
+		PeriodCode    string    `json:"period_code"`
+		PeriodName    string    `json:"period_name"`
+		StartDate     string    `json:"start_date"`
+		EndDate       string    `json:"end_date"`
+		PayDate       string    `json:"pay_date"`
+		Status        string    `json:"status"`
+		TotalGross    float64   `json:"total_gross"`
+		TotalNet      float64   `json:"total_net"`
+		EmployeeCount int       `json:"employee_count"`
+		CreatedAt     time.Time `json:"created_at"`
+		Entries       []gin.H   `json:"entries"`
 	}
 	var periods []periodOut
 	if periodRows != nil {
@@ -674,15 +674,15 @@ func (h *Handler) ExportPayrollBackup(c *gin.Context) {
 			if err := eRows.Scan(&id, &empID, &name, &pos, &salary, &adv, &rem,
 				&ap, &apd, &rp, &rpd); err == nil {
 				row := gin.H{
-					"id":                 id,
-					"employee_id":        empID,
-					"employee_name":      name,
-					"position_snapshot":  pos,
-					"salary":             salary,
-					"advance_amount":     adv,
-					"remainder_amount":   rem,
-					"advance_paid":       ap,
-					"remainder_paid":     rp,
+					"id":                id,
+					"employee_id":       empID,
+					"employee_name":     name,
+					"position_snapshot": pos,
+					"salary":            salary,
+					"advance_amount":    adv,
+					"remainder_amount":  rem,
+					"advance_paid":      ap,
+					"remainder_paid":    rp,
 				}
 				if apd.Valid {
 					row["advance_paid_day"] = int(apd.Int64)

@@ -177,13 +177,15 @@ func (h *Handler) CreateSubStageMaterial(c *gin.Context) {
 	`, subStageID).Scan(&projectID, &buildingID, &wbsID, &orgID)
 	if err == nil && projectID > 0 {
 		userID, _ := middleware.GetUserID(c)
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO construction_material_usage (
 				tenant_id, project_id, building_id, wbs_id, product_id, product_name, uom, quantity_used,
 				usage_date, recorded_by, notes, sub_stage_material_id, created_date, updated_date
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_DATE, $9, $10, $11, NOW(), NOW())
 		`, tenantID, projectID, buildingID, wbsID, nullStringFromVal(req.ProductID), req.ProductName, req.UOM, req.Quantity,
-			userID, "Material assigned to stage", id)
+			userID, "Material assigned to stage", id); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT construction_material_usage", "error", execErr)
+		}
 
 		// Create accounting entry: Debit 5100 (Direct Materials) / Credit 1300 (Inventory)
 		// This records the expense when materials are actually used in a construction stage
@@ -328,10 +330,12 @@ func (h *Handler) UpdateSubStageMaterial(c *gin.Context) {
 	}
 
 	// Sync linked material usage record
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE construction_material_usage SET quantity_used = $1, updated_date = NOW()
 		WHERE sub_stage_material_id = $2 AND tenant_id = $3
-	`, qty, id, tenantID)
+	`, qty, id, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_material_usage", "error", execErr)
+	}
 
 	response.Success(c, map[string]interface{}{"id": id})
 }

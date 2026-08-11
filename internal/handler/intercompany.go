@@ -1582,12 +1582,12 @@ func (h *Handler) GetIntercompanyBalances(c *gin.Context) {
 	defer rows.Close()
 
 	type OrgPair struct {
-		OrgID        uuid.UUID
-		OrgName      string
-		PartnerID    uuid.UUID
-		PartnerName  string
-		Receivable   float64
-		Payable      float64
+		OrgID       uuid.UUID
+		OrgName     string
+		PartnerID   uuid.UUID
+		PartnerName string
+		Receivable  float64
+		Payable     float64
 	}
 
 	// Group by org pair

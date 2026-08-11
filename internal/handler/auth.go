@@ -353,11 +353,13 @@ func (h *Handler) Register(c *gin.Context) {
 
 	// SEC-02: track the refresh token so it is revocable (Logout) and so refresh
 	// rotation can invalidate the prior token, exactly like the Login path.
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
 		VALUES ($1, $2, $3, $4, $5)
 	`, userID, crypto.HashToken(tokenPair.RefreshToken), []byte(`{}`), c.ClientIP(),
-		tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+		tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry)); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT refresh_tokens", "error", execErr)
+	}
 
 	// Build response - tenant owners are NOT system admins but have owner role
 	ownerRoleDesc := "Tenant owner with full access"
@@ -467,9 +469,9 @@ func (h *Handler) Login(c *gin.Context) {
 	// autocomplete with different casing — e.g. "User@Mail.com" vs
 	// "user@mail.com"). Using LOWER() on both sides.
 	lookupValue := strings.ToLower(input.Email)
-	lookupClause := "LOWER(email) = $1"        // for queries where users is unaliased
-	lookupClauseU := "LOWER(u.email) = $1"     // for queries where users is aliased as u
-	lookupClauseTenant := "LOWER(email) = $2"  // for tenant-scoped query (param $2)
+	lookupClause := "LOWER(email) = $1"       // for queries where users is unaliased
+	lookupClauseU := "LOWER(u.email) = $1"    // for queries where users is aliased as u
+	lookupClauseTenant := "LOWER(email) = $2" // for tenant-scoped query (param $2)
 	if loginByPhone {
 		// Send the LAST 9 digits as the parameter — already normalized
 		// to digits-only by normalizePhone() above; truncate here.
@@ -650,12 +652,14 @@ func (h *Handler) Login(c *gin.Context) {
 	valid, err := crypto.VerifyPassword(input.Password, user.PasswordHash)
 	if err != nil || !valid {
 		// Increment failed login attempts
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE users SET
 				failed_login_attempts = failed_login_attempts + 1,
 				locked_until = CASE WHEN failed_login_attempts >= 4 THEN NOW() + INTERVAL '15 minutes' ELSE locked_until END
 			WHERE id = $1
-		`, user.ID)
+		`, user.ID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE users", "error", execErr)
+		}
 
 		response.Error(c, http.StatusUnauthorized, response.ErrCodeInvalidCredentials, "Invalid email or password")
 		return
@@ -663,13 +667,15 @@ func (h *Handler) Login(c *gin.Context) {
 
 	// Reset failed login attempts and update last login
 	now := time.Now()
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE users SET
 			failed_login_attempts = 0,
 			locked_until = NULL,
 			last_login_at = $1
 		WHERE id = $2
-	`, now, user.ID)
+	`, now, user.ID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE users", "error", execErr)
+	}
 
 	// Generate tokens
 	tokenPair, err := h.jwtManager.GenerateTokenPair(user.ID, user.TenantID, user.Email, user.IsSystemAdmin)
@@ -685,10 +691,14 @@ func (h *Handler) Login(c *gin.Context) {
 		"user_agent": c.GetHeader("User-Agent"),
 	})
 
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
 		VALUES ($1, $2, $3, $4, $5)
-	`, user.ID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+	`, user.ID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry)); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT refresh_tokens", "error", execErr)
+
+	}
 
 	user.LastLoginAt = &now
 
@@ -801,7 +811,9 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 	`, claims.UserID).Scan(&freshEmail, &isSystemAdmin, &isActive)
 	if err != nil || !isActive {
 		// User was deleted or deactivated — kill every session for them.
-		h.db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, claims.UserID)
+		if _, execErr := h.db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1 AND revoked_at IS NULL`, claims.UserID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE refresh_tokens", "error", execErr)
+		}
 		response.Error(c, http.StatusUnauthorized, response.ErrCodeTokenInvalid, "Account is no longer active")
 		return
 	}
@@ -823,13 +835,17 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 	// Rotate: revoke the old row (if tracked), store the new hash so future
 	// refreshes are tracked and revocable.
 	if hasRow {
-		h.db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`, storedID)
+		if _, execErr := h.db.Exec(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1`, storedID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE refresh_tokens", "error", execErr)
+		}
 	}
 	newHash := crypto.HashToken(newRefreshToken)
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
 		VALUES ($1, $2, $3, $4, $5)
-	`, claims.UserID, newHash, []byte(`{}`), c.ClientIP(), expiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+	`, claims.UserID, newHash, []byte(`{}`), c.ClientIP(), expiresAt.Add(h.config.JWT.RefreshTokenExpiry)); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT refresh_tokens", "error", execErr)
+	}
 
 	response.Success(c, gin.H{
 		"access_token":  accessToken,
@@ -848,10 +864,12 @@ func (h *Handler) Logout(c *gin.Context) {
 	}
 
 	// Revoke all refresh tokens for this session
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE refresh_tokens SET revoked_at = NOW()
 		WHERE user_id = $1 AND revoked_at IS NULL
-	`, claims.UserID)
+	`, claims.UserID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE refresh_tokens", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Logged out successfully"})
 }
@@ -990,10 +1008,14 @@ func (h *Handler) UpdateCurrentUser(c *gin.Context) {
 
 	// Sync phone/email changes to linked employee record
 	if input.Phone != nil {
-		h.db.Exec("UPDATE employees SET phone = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", *input.Phone, claims.UserID)
+		if _, execErr := h.db.Exec("UPDATE employees SET phone = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", *input.Phone, claims.UserID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE employees", "error", execErr)
+		}
 	}
 	if input.Email != nil {
-		h.db.Exec("UPDATE employees SET email = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", *input.Email, claims.UserID)
+		if _, execErr := h.db.Exec("UPDATE employees SET email = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", *input.Email, claims.UserID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE employees", "error", execErr)
+		}
 	}
 
 	// Return updated user
@@ -1051,7 +1073,9 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 	}
 
 	// Revoke all refresh tokens
-	h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", claims.UserID)
+	if _, execErr := h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", claims.UserID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE refresh_tokens", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Password changed successfully"})
 }
@@ -1162,7 +1186,9 @@ func (h *Handler) ResetPassword(c *gin.Context) {
 	}
 
 	// Revoke all refresh tokens for security
-	h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", userID)
+	if _, execErr := h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", userID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE refresh_tokens", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Password reset successfully"})
 }
@@ -1209,11 +1235,13 @@ func (h *Handler) SendPasswordResetOTP(c *gin.Context) {
 	fmt.Printf("[OTP-DEBUG] Found employee: %s for phone: %s\n", employeeID, phone)
 
 	// Invalidate any existing OTPs for this phone and purpose
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE phone_verification_otps
 		SET verified_at = NOW()
 		WHERE phone = $1 AND purpose = $2 AND verified_at IS NULL
-	`, phone, input.Purpose)
+	`, phone, input.Purpose); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE phone_verification_otps", "error", execErr)
+	}
 
 	// Generate 6-digit OTP code
 	otpCode := generateOTPCode()
@@ -1306,7 +1334,9 @@ func (h *Handler) VerifyPasswordResetOTP(c *gin.Context) {
 	}
 
 	if storedCode != input.OTPCode {
-		h.db.Exec("UPDATE phone_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID)
+		if _, execErr := h.db.Exec("UPDATE phone_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE phone_verification_otps", "error", execErr)
+		}
 		response.BadRequest(c, "Invalid OTP code")
 		return
 	}
@@ -1441,10 +1471,14 @@ func (h *Handler) ResetPasswordWithPhone(c *gin.Context) {
 	}
 
 	// Revoke all refresh tokens for security
-	h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", userID)
+	if _, execErr := h.db.Exec("UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = $1", userID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE refresh_tokens", "error", execErr)
+	}
 
 	// Invalidate the used OTP
-	h.db.Exec("UPDATE phone_verification_otps SET verified_at = NOW() WHERE phone = $1 AND purpose = 'password_reset' AND verified_at IS NULL", phone)
+	if _, execErr := h.db.Exec("UPDATE phone_verification_otps SET verified_at = NOW() WHERE phone = $1 AND purpose = 'password_reset' AND verified_at IS NULL", phone); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE phone_verification_otps", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"message": "Password set successfully"})
 }
@@ -1690,10 +1724,12 @@ func (h *Handler) AcceptInvite(c *gin.Context) {
 	deviceInfo, _ := json.Marshal(map[string]string{
 		"user_agent": c.GetHeader("User-Agent"),
 	})
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
 		VALUES ($1, $2, $3, $4, $5)
-	`, userID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+	`, userID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry)); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT refresh_tokens", "error", execErr)
+	}
 
 	// Get tenant info
 	var tenantCode, tenantName string
@@ -1935,7 +1971,9 @@ func (h *Handler) VerifyOTP(c *gin.Context) {
 	// Verify OTP code
 	if storedCode != input.OTPCode {
 		// Increment attempts
-		h.db.Exec("UPDATE email_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID)
+		if _, execErr := h.db.Exec("UPDATE email_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE email_verification_otps", "error", execErr)
+		}
 		response.BadRequest(c, "Invalid OTP code")
 		return
 	}
@@ -2444,16 +2482,22 @@ func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, pict
 
 	// Link Google ID if not already linked, and update avatar if missing
 	if !googleID.Valid || googleID.String == "" {
-		h.db.Exec("UPDATE users SET google_id = $1, auth_provider = CASE WHEN auth_provider = 'local' AND password_hash IS NULL THEN 'google' ELSE auth_provider END WHERE id = $2", googleSub, user.ID)
+		if _, execErr := h.db.Exec("UPDATE users SET google_id = $1, auth_provider = CASE WHEN auth_provider = 'local' AND password_hash IS NULL THEN 'google' ELSE auth_provider END WHERE id = $2", googleSub, user.ID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE users", "error", execErr)
+		}
 	}
 	if (user.AvatarURL == nil || *user.AvatarURL == "") && picture != "" {
-		h.db.Exec("UPDATE users SET avatar_url = $1 WHERE id = $2", picture, user.ID)
+		if _, execErr := h.db.Exec("UPDATE users SET avatar_url = $1 WHERE id = $2", picture, user.ID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE users", "error", execErr)
+		}
 		user.AvatarURL = &picture
 	}
 
 	// Update last login
 	now := time.Now()
-	h.db.Exec("UPDATE users SET last_login_at = $1 WHERE id = $2", now, user.ID)
+	if _, execErr := h.db.Exec("UPDATE users SET last_login_at = $1 WHERE id = $2", now, user.ID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE users", "error", execErr)
+	}
 	user.LastLoginAt = &now
 
 	// Generate tokens
@@ -2469,10 +2513,12 @@ func (h *Handler) googleLoginExistingUser(c *gin.Context, email, googleSub, pict
 	deviceInfo, _ := json.Marshal(map[string]string{
 		"user_agent": c.GetHeader("User-Agent"),
 	})
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
 		VALUES ($1, $2, $3, $4, $5)
-	`, user.ID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+	`, user.ID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry)); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT refresh_tokens", "error", execErr)
+	}
 
 	// Load roles
 	rows, err := h.db.Query(`
@@ -2636,10 +2682,12 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 	deviceInfo, _ := json.Marshal(map[string]string{
 		"user_agent": c.GetHeader("User-Agent"),
 	})
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, device_info, ip_address, expires_at)
 		VALUES ($1, $2, $3, $4, $5)
-	`, userID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry))
+	`, userID, tokenHash, deviceInfo, c.ClientIP(), tokenPair.ExpiresAt.Add(h.config.JWT.RefreshTokenExpiry)); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT refresh_tokens", "error", execErr)
+	}
 
 	ownerRoleDesc := "Tenant owner with full access"
 	var avatarPtr *string
@@ -2767,7 +2815,9 @@ func (h *Handler) UpdateCurrentUserEmail(c *gin.Context) {
 	}
 
 	// Sync email to linked employee record
-	h.db.Exec("UPDATE employees SET email = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", input.Email, claims.UserID)
+	if _, execErr := h.db.Exec("UPDATE employees SET email = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", input.Email, claims.UserID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE employees", "error", execErr)
+	}
 
 	h.GetCurrentUser(c)
 }
@@ -2793,10 +2843,12 @@ func (h *Handler) SendPhoneOTP(c *gin.Context) {
 	expiresAt := time.Now().Add(5 * time.Minute)
 
 	// Invalidate previous phone OTPs for this user
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE email_verification_otps SET verified_at = NOW()
 		WHERE email = $1 AND purpose = 'phone_change' AND verified_at IS NULL
-	`, claims.UserID.String())
+	`, claims.UserID.String()); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE email_verification_otps", "error", execErr)
+	}
 
 	// Store OTP (reuse email_verification_otps table, use userID as "email" key)
 	_, err := h.db.Exec(`
@@ -2879,13 +2931,17 @@ func (h *Handler) VerifyPhoneOTP(c *gin.Context) {
 		return
 	}
 	if storedCode != input.OTPCode {
-		h.db.Exec("UPDATE email_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID)
+		if _, execErr := h.db.Exec("UPDATE email_verification_otps SET attempts = attempts + 1 WHERE id = $1", otpID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE email_verification_otps", "error", execErr)
+		}
 		response.BadRequest(c, "Invalid OTP code")
 		return
 	}
 
 	// Mark OTP as verified
-	h.db.Exec("UPDATE email_verification_otps SET verified_at = NOW() WHERE id = $1", otpID)
+	if _, execErr := h.db.Exec("UPDATE email_verification_otps SET verified_at = NOW() WHERE id = $1", otpID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE email_verification_otps", "error", execErr)
+	}
 
 	// Update the user's phone number
 	_, err = h.db.Exec("UPDATE users SET phone = $1, updated_at = NOW() WHERE id = $2", input.Phone, claims.UserID)
@@ -2896,7 +2952,9 @@ func (h *Handler) VerifyPhoneOTP(c *gin.Context) {
 	}
 
 	// Sync phone to linked employee record
-	h.db.Exec("UPDATE employees SET phone = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", input.Phone, claims.UserID)
+	if _, execErr := h.db.Exec("UPDATE employees SET phone = $1, updated_at = NOW() WHERE user_id = $2 AND deleted_at IS NULL", input.Phone, claims.UserID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE employees", "error", execErr)
+	}
 
 	// Return the updated user
 	h.GetCurrentUser(c)

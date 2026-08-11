@@ -1049,7 +1049,7 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 	}
 
 	response.Created(c, gin.H{
-		"message":          "Purchase Order created successfully from RFQ",
+		"message":           "Purchase Order created successfully from RFQ",
 		"purchase_order_id": poID,
 		"order_number":      poNumber,
 		"rfq_number":        rfq.RFQNumber,

@@ -14,53 +14,53 @@ import (
 
 // BlanketOrder represents a blanket order (standing order / call-off contract)
 type BlanketOrder struct {
-	ID                    uuid.UUID              `json:"id"`
-	TenantID              uuid.UUID              `json:"tenant_id"`
-	BlanketNumber         string                 `json:"blanket_number"`
-	Title                 string                 `json:"title"`
-	Description           string                 `json:"description,omitempty"`
-	VendorID              *uuid.UUID             `json:"vendor_id,omitempty"`
-	VendorName            string                 `json:"vendor_name,omitempty"`
-	StartDate             string                 `json:"start_date"`
-	EndDate               string                 `json:"end_date"`
-	AgreementType         string                 `json:"agreement_type"` // quantity or value
-	TotalValue            float64                `json:"total_value"`
-	ReleasedValue         float64                `json:"released_value"`
-	RemainingValue        float64                `json:"remaining_value"`
-	Currency              string                 `json:"currency"`
-	PaymentTerms          string                 `json:"payment_terms,omitempty"`
-	DeliveryTerms         string                 `json:"delivery_terms,omitempty"`
-	Incoterms             string                 `json:"incoterms,omitempty"`
-	WarehouseID           *uuid.UUID             `json:"warehouse_id,omitempty"`
-	WarehouseName         string                 `json:"warehouse_name,omitempty"`
-	Status                string                 `json:"status"`
-	RequiresApproval      bool                   `json:"requires_approval"`
-	ApprovedBy            *uuid.UUID             `json:"approved_by,omitempty"`
-	ApprovedAt            *time.Time             `json:"approved_at,omitempty"`
-	TermsConditions       string                 `json:"terms_conditions,omitempty"`
-	SpecialInstructions   string                 `json:"special_instructions,omitempty"`
-	MinReleaseValue       *float64               `json:"min_release_value,omitempty"`
-	MaxReleaseValue       *float64               `json:"max_release_value,omitempty"`
-	ReleaseFrequency      string                 `json:"release_frequency,omitempty"`
-	AutoRelease           bool                   `json:"auto_release"`
-	NextReleaseDate       *string                `json:"next_release_date,omitempty"`
-	PriceAdjustmentAllowed bool                  `json:"price_adjustment_allowed"`
-	MaxPriceIncreasePercent *float64             `json:"max_price_increase_percent,omitempty"`
-	ExpiryAlertDays       int                    `json:"expiry_alert_days"`
-	LowQuantityAlertPercent *float64             `json:"low_quantity_alert_percent,omitempty"`
-	Notes                 string                 `json:"notes,omitempty"`
-	Lines                 []BlanketOrderLine     `json:"lines,omitempty"`
-	Releases              []BlanketOrderRelease  `json:"releases,omitempty"`
-	CreatedBy             *uuid.UUID             `json:"created_by,omitempty"`
-	CreatedAt             time.Time              `json:"created_at"`
-	UpdatedAt             time.Time              `json:"updated_at"`
+	ID                      uuid.UUID             `json:"id"`
+	TenantID                uuid.UUID             `json:"tenant_id"`
+	BlanketNumber           string                `json:"blanket_number"`
+	Title                   string                `json:"title"`
+	Description             string                `json:"description,omitempty"`
+	VendorID                *uuid.UUID            `json:"vendor_id,omitempty"`
+	VendorName              string                `json:"vendor_name,omitempty"`
+	StartDate               string                `json:"start_date"`
+	EndDate                 string                `json:"end_date"`
+	AgreementType           string                `json:"agreement_type"` // quantity or value
+	TotalValue              float64               `json:"total_value"`
+	ReleasedValue           float64               `json:"released_value"`
+	RemainingValue          float64               `json:"remaining_value"`
+	Currency                string                `json:"currency"`
+	PaymentTerms            string                `json:"payment_terms,omitempty"`
+	DeliveryTerms           string                `json:"delivery_terms,omitempty"`
+	Incoterms               string                `json:"incoterms,omitempty"`
+	WarehouseID             *uuid.UUID            `json:"warehouse_id,omitempty"`
+	WarehouseName           string                `json:"warehouse_name,omitempty"`
+	Status                  string                `json:"status"`
+	RequiresApproval        bool                  `json:"requires_approval"`
+	ApprovedBy              *uuid.UUID            `json:"approved_by,omitempty"`
+	ApprovedAt              *time.Time            `json:"approved_at,omitempty"`
+	TermsConditions         string                `json:"terms_conditions,omitempty"`
+	SpecialInstructions     string                `json:"special_instructions,omitempty"`
+	MinReleaseValue         *float64              `json:"min_release_value,omitempty"`
+	MaxReleaseValue         *float64              `json:"max_release_value,omitempty"`
+	ReleaseFrequency        string                `json:"release_frequency,omitempty"`
+	AutoRelease             bool                  `json:"auto_release"`
+	NextReleaseDate         *string               `json:"next_release_date,omitempty"`
+	PriceAdjustmentAllowed  bool                  `json:"price_adjustment_allowed"`
+	MaxPriceIncreasePercent *float64              `json:"max_price_increase_percent,omitempty"`
+	ExpiryAlertDays         int                   `json:"expiry_alert_days"`
+	LowQuantityAlertPercent *float64              `json:"low_quantity_alert_percent,omitempty"`
+	Notes                   string                `json:"notes,omitempty"`
+	Lines                   []BlanketOrderLine    `json:"lines,omitempty"`
+	Releases                []BlanketOrderRelease `json:"releases,omitempty"`
+	CreatedBy               *uuid.UUID            `json:"created_by,omitempty"`
+	CreatedAt               time.Time             `json:"created_at"`
+	UpdatedAt               time.Time             `json:"updated_at"`
 
 	// Computed fields
-	TotalAgreedQuantity   float64                `json:"total_agreed_quantity,omitempty"`
-	TotalReleasedQuantity float64                `json:"total_released_quantity,omitempty"`
-	UtilizationPercent    float64                `json:"utilization_percent,omitempty"`
-	DaysRemaining         int                    `json:"days_remaining,omitempty"`
-	ReleaseCount          int                    `json:"release_count,omitempty"`
+	TotalAgreedQuantity   float64 `json:"total_agreed_quantity,omitempty"`
+	TotalReleasedQuantity float64 `json:"total_released_quantity,omitempty"`
+	UtilizationPercent    float64 `json:"utilization_percent,omitempty"`
+	DaysRemaining         int     `json:"days_remaining,omitempty"`
+	ReleaseCount          int     `json:"release_count,omitempty"`
 }
 
 // BlanketOrderLine represents a line item in a blanket order
@@ -93,27 +93,27 @@ type BlanketOrderLine struct {
 
 // BlanketOrderRelease represents a release (call-off) against a blanket order
 type BlanketOrderRelease struct {
-	ID              uuid.UUID                  `json:"id"`
-	TenantID        uuid.UUID                  `json:"tenant_id"`
-	BlanketOrderID  uuid.UUID                  `json:"blanket_order_id"`
-	ReleaseNumber   string                     `json:"release_number"`
-	ReleaseDate     string                     `json:"release_date"`
-	ExpectedDate    *string                    `json:"expected_date,omitempty"`
-	PurchaseOrderID *uuid.UUID                 `json:"purchase_order_id,omitempty"`
-	PONumber        string                     `json:"po_number,omitempty"`
-	Status          string                     `json:"status"`
-	Subtotal        float64                    `json:"subtotal"`
-	DiscountAmount  float64                    `json:"discount_amount"`
-	TaxAmount       float64                    `json:"tax_amount"`
-	TotalAmount     float64                    `json:"total_amount"`
-	ShippingAddress map[string]interface{}     `json:"shipping_address,omitempty"`
-	ShippingMethod  string                     `json:"shipping_method,omitempty"`
-	TrackingNumber  string                     `json:"tracking_number,omitempty"`
-	Notes           string                     `json:"notes,omitempty"`
-	Lines           []BlanketOrderReleaseLine  `json:"lines,omitempty"`
-	CreatedBy       *uuid.UUID                 `json:"created_by,omitempty"`
-	CreatedAt       time.Time                  `json:"created_at"`
-	UpdatedAt       time.Time                  `json:"updated_at"`
+	ID              uuid.UUID                 `json:"id"`
+	TenantID        uuid.UUID                 `json:"tenant_id"`
+	BlanketOrderID  uuid.UUID                 `json:"blanket_order_id"`
+	ReleaseNumber   string                    `json:"release_number"`
+	ReleaseDate     string                    `json:"release_date"`
+	ExpectedDate    *string                   `json:"expected_date,omitempty"`
+	PurchaseOrderID *uuid.UUID                `json:"purchase_order_id,omitempty"`
+	PONumber        string                    `json:"po_number,omitempty"`
+	Status          string                    `json:"status"`
+	Subtotal        float64                   `json:"subtotal"`
+	DiscountAmount  float64                   `json:"discount_amount"`
+	TaxAmount       float64                   `json:"tax_amount"`
+	TotalAmount     float64                   `json:"total_amount"`
+	ShippingAddress map[string]interface{}    `json:"shipping_address,omitempty"`
+	ShippingMethod  string                    `json:"shipping_method,omitempty"`
+	TrackingNumber  string                    `json:"tracking_number,omitempty"`
+	Notes           string                    `json:"notes,omitempty"`
+	Lines           []BlanketOrderReleaseLine `json:"lines,omitempty"`
+	CreatedBy       *uuid.UUID                `json:"created_by,omitempty"`
+	CreatedAt       time.Time                 `json:"created_at"`
+	UpdatedAt       time.Time                 `json:"updated_at"`
 }
 
 // BlanketOrderReleaseLine represents a line item in a release
@@ -614,28 +614,28 @@ func (h *Handler) CreateBlanketOrder(c *gin.Context) {
 	}
 
 	var input struct {
-		Title               string  `json:"title" binding:"required"`
-		Description         string  `json:"description"`
-		VendorID            string  `json:"vendor_id"`
-		VendorName          string  `json:"vendor_name"`
-		StartDate           string  `json:"start_date" binding:"required"`
-		EndDate             string  `json:"end_date" binding:"required"`
-		AgreementType       string  `json:"agreement_type"`
-		TotalValue          float64 `json:"total_value"`
-		Currency            string  `json:"currency"`
-		PaymentTerms        string  `json:"payment_terms"`
-		DeliveryTerms       string  `json:"delivery_terms"`
-		Incoterms           string  `json:"incoterms"`
-		WarehouseID         string  `json:"warehouse_id"`
-		RequiresApproval    bool    `json:"requires_approval"`
-		TermsConditions     string  `json:"terms_conditions"`
-		SpecialInstructions string  `json:"special_instructions"`
+		Title               string   `json:"title" binding:"required"`
+		Description         string   `json:"description"`
+		VendorID            string   `json:"vendor_id"`
+		VendorName          string   `json:"vendor_name"`
+		StartDate           string   `json:"start_date" binding:"required"`
+		EndDate             string   `json:"end_date" binding:"required"`
+		AgreementType       string   `json:"agreement_type"`
+		TotalValue          float64  `json:"total_value"`
+		Currency            string   `json:"currency"`
+		PaymentTerms        string   `json:"payment_terms"`
+		DeliveryTerms       string   `json:"delivery_terms"`
+		Incoterms           string   `json:"incoterms"`
+		WarehouseID         string   `json:"warehouse_id"`
+		RequiresApproval    bool     `json:"requires_approval"`
+		TermsConditions     string   `json:"terms_conditions"`
+		SpecialInstructions string   `json:"special_instructions"`
 		MinReleaseValue     *float64 `json:"min_release_value"`
 		MaxReleaseValue     *float64 `json:"max_release_value"`
-		ReleaseFrequency    string  `json:"release_frequency"`
-		AutoRelease         bool    `json:"auto_release"`
-		ExpiryAlertDays     int     `json:"expiry_alert_days"`
-		Notes               string  `json:"notes"`
+		ReleaseFrequency    string   `json:"release_frequency"`
+		AutoRelease         bool     `json:"auto_release"`
+		ExpiryAlertDays     int      `json:"expiry_alert_days"`
+		Notes               string   `json:"notes"`
 		Lines               []struct {
 			ProductID       string   `json:"product_id"`
 			ProductName     string   `json:"product_name"`
@@ -1059,12 +1059,12 @@ func (h *Handler) CreateBlanketOrderRelease(c *gin.Context) {
 	}
 
 	var input struct {
-		ReleaseDate     string `json:"release_date"`
-		ExpectedDate    string `json:"expected_date"`
+		ReleaseDate     string                 `json:"release_date"`
+		ExpectedDate    string                 `json:"expected_date"`
 		ShippingAddress map[string]interface{} `json:"shipping_address"`
-		ShippingMethod  string `json:"shipping_method"`
-		Notes           string `json:"notes"`
-		CreatePO        bool   `json:"create_po"`
+		ShippingMethod  string                 `json:"shipping_method"`
+		Notes           string                 `json:"notes"`
+		CreatePO        bool                   `json:"create_po"`
 		Lines           []struct {
 			BlanketLineID string  `json:"blanket_line_id" binding:"required"`
 			Quantity      float64 `json:"quantity" binding:"required"`
@@ -1419,7 +1419,9 @@ func (h *Handler) ConfirmBlanketOrderRelease(c *gin.Context) {
 	h.db.QueryRow("SELECT remaining_value FROM blanket_orders WHERE id = $1", blanketOrderID).Scan(&remainingValue)
 
 	if remainingValue <= 0 {
-		h.db.Exec("UPDATE blanket_orders SET status = 'completed', updated_at = $1 WHERE id = $2", time.Now(), blanketOrderID)
+		if _, execErr := h.db.Exec("UPDATE blanket_orders SET status = 'completed', updated_at = $1 WHERE id = $2", time.Now(), blanketOrderID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE blanket_orders", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Release confirmed successfully", "status": "confirmed"})

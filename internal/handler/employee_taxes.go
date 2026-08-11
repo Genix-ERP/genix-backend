@@ -479,11 +479,11 @@ func (h *Handler) PreviewPayrollTaxes(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"applied":           applied,
-		"total_employee":    totals.Employee,
-		"total_employer":    totals.Employer,
-		"gross":             input.BaseSalary + input.OvertimeAmount + input.Bonus + input.Allowances,
-		"net":               math.Round((input.BaseSalary+input.OvertimeAmount+input.Bonus+input.Allowances)-totals.Employee),
+		"applied":        applied,
+		"total_employee": totals.Employee,
+		"total_employer": totals.Employer,
+		"gross":          input.BaseSalary + input.OvertimeAmount + input.Bonus + input.Allowances,
+		"net":            math.Round((input.BaseSalary + input.OvertimeAmount + input.Bonus + input.Allowances) - totals.Employee),
 	})
 }
 
@@ -635,13 +635,13 @@ func (h *Handler) GetEmployeeTaxReport(c *gin.Context) {
 // ─────────────────────────────────────────────────────────────────────
 
 type recordEmployeeTaxPaymentInput struct {
-	TaxCode        string  `json:"tax_code" binding:"required"`
-	PeriodStart    string  `json:"period_start" binding:"required"` // YYYY-MM-DD
-	PeriodEnd      string  `json:"period_end" binding:"required"`
-	Amount         float64 `json:"amount" binding:"required,gt=0"`
-	PaymentMethod  string  `json:"payment_method"`
-	BankAccountID  string  `json:"bank_account_id"` // optional: Cr account override
-	Note           string  `json:"note"`
+	TaxCode       string  `json:"tax_code" binding:"required"`
+	PeriodStart   string  `json:"period_start" binding:"required"` // YYYY-MM-DD
+	PeriodEnd     string  `json:"period_end" binding:"required"`
+	Amount        float64 `json:"amount" binding:"required,gt=0"`
+	PaymentMethod string  `json:"payment_method"`
+	BankAccountID string  `json:"bank_account_id"` // optional: Cr account override
+	Note          string  `json:"note"`
 }
 
 // RecordEmployeeTaxPayment POST /employee-taxes/payments

@@ -244,11 +244,11 @@ func (h *Handler) CalculateAllPayroll(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"period_id":          periodID,
-		"employees_total":    len(employees),
-		"created":            len(createdIDs),
-		"skipped_existing":   skippedExisting,
-		"failed":             failed,
-		"entry_ids":          createdIDs,
+		"period_id":        periodID,
+		"employees_total":  len(employees),
+		"created":          len(createdIDs),
+		"skipped_existing": skippedExisting,
+		"failed":           failed,
+		"entry_ids":        createdIDs,
 	})
 }

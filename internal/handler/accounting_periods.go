@@ -26,7 +26,7 @@ func (h *Handler) ListAccountingPeriods(c *gin.Context) {
 		       locked_by, locked_at, created_at, updated_at
 		FROM accounting_periods
 		WHERE tenant_id = $1
-		ORDER BY start_date ASC
+		ORDER BY start_date ASC, id ASC
 	`
 	args := []interface{}{tenantID}
 	paginate, page, pageSize, offset := optPagination(c)

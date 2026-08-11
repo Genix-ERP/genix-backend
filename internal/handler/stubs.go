@@ -71,13 +71,19 @@ func (h *Handler) ListPermissions(c *gin.Context) {
 
 // ========== SETTINGS ==========
 
-func (h *Handler) GetSettings(c *gin.Context)    { response.Success(c, gin.H{"settings": map[string]interface{}{}}) }
-func (h *Handler) UpdateSettings(c *gin.Context) { response.Success(c, gin.H{"message": "Settings updated"}) }
+func (h *Handler) GetSettings(c *gin.Context) {
+	response.Success(c, gin.H{"settings": map[string]interface{}{}})
+}
+func (h *Handler) UpdateSettings(c *gin.Context) {
+	response.Success(c, gin.H{"message": "Settings updated"})
+}
 
 // ========== AUDIT LOGS ==========
 
-func (h *Handler) ListAuditLogs(c *gin.Context)   { response.Success(c, []interface{}{}) }
-func (h *Handler) ExportAuditLogs(c *gin.Context) { response.Success(c, gin.H{"url": "/exports/audit_logs.csv"}) }
+func (h *Handler) ListAuditLogs(c *gin.Context) { response.Success(c, []interface{}{}) }
+func (h *Handler) ExportAuditLogs(c *gin.Context) {
+	response.Success(c, gin.H{"url": "/exports/audit_logs.csv"})
+}
 
 // ========== NOTIFICATIONS ==========
 // Real implementations in notifications.go

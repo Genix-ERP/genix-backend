@@ -193,10 +193,12 @@ func (h *Handler) createNotification(tenantID, userID uuid.UUID, notifType, titl
 	// only handles notifications inserted by paths that DON'T push, i.e.
 	// background_jobs.go / scheduler_reminders.go).
 	now := time.Now()
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO notifications (id, tenant_id, user_id, type, title, message, data, channel, priority, created_at, push_sent_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'in_app', 'normal', $8, $8)
-	`, uuid.New(), tenantID, userID, notifType, title, message, dataJSON, now)
+	`, uuid.New(), tenantID, userID, notifType, title, message, dataJSON, now); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT notifications", "error", execErr)
+	}
 
 	// Fan out a mobile push (async, best-effort). No-op when FCM isn't
 	// configured or the user has no registered device.
@@ -377,10 +379,14 @@ func (h *Handler) MarkNotificationRead(c *gin.Context) {
 		return
 	}
 
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE notifications SET is_read = true, read_at = $1
 		WHERE id = $2 AND tenant_id = $3 AND user_id = $4
-	`, time.Now(), id, tenantID, userID)
+	`, time.Now(), id, tenantID, userID); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE notifications", "error", execErr)
+
+	}
 
 	response.Success(c, gin.H{"message": "Marked as read"})
 }
@@ -394,10 +400,14 @@ func (h *Handler) MarkAllNotificationsRead(c *gin.Context) {
 	}
 	userID, _ := middleware.GetUserID(c)
 
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE notifications SET is_read = true, read_at = $1
 		WHERE tenant_id = $2 AND user_id = $3 AND is_read = false
-	`, time.Now(), tenantID, userID)
+	`, time.Now(), tenantID, userID); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE notifications", "error", execErr)
+
+	}
 
 	response.Success(c, gin.H{"message": "All marked as read"})
 }

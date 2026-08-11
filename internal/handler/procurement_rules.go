@@ -835,9 +835,9 @@ func (h *Handler) ApproveWorkflowStep(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"message":    "Step approved successfully",
-		"completed":  isComplete,
-		"next_step":  wf.CurrentStep + 1,
+		"message":     "Step approved successfully",
+		"completed":   isComplete,
+		"next_step":   wf.CurrentStep + 1,
 		"total_steps": wf.TotalSteps,
 	})
 }
@@ -996,7 +996,7 @@ func (h *Handler) GetMyPendingApprovals(c *gin.Context) {
 		FROM approval_workflow_instances w
 		JOIN approval_workflow_steps s ON s.workflow_id = w.id AND s.step_number = w.current_step
 		WHERE w.tenant_id = $1 AND w.status = 'pending' AND s.approver_id = $2 AND s.status = 'pending'
-		ORDER BY w.started_at DESC
+		ORDER BY w.started_at DESC, w.id ASC
 		LIMIT $3 OFFSET $4
 	`
 

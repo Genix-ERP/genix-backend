@@ -1586,7 +1586,7 @@ func (h *Handler) syncCBURatesForAllTenants() {
 
 		// ONE INSERT for all exchange rates with previous_rate tracking
 		if len(erValues) > 0 {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO exchange_rates (id, tenant_id, from_currency_id, to_currency_id, rate, effective_date, source)
 				VALUES `+strings.Join(erValues, ",")+`
 				ON CONFLICT (tenant_id, from_currency_id, to_currency_id, effective_date)
@@ -1596,7 +1596,9 @@ func (h *Handler) syncCBURatesForAllTenants() {
 					rate_change_percent = CASE WHEN exchange_rates.rate > 0 THEN ((EXCLUDED.rate - exchange_rates.rate) / exchange_rates.rate) * 100 ELSE 0 END,
 					rate = EXCLUDED.rate,
 					source = 'CBU'
-			`, erArgs...)
+			`, erArgs...); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT exchange_rates", "error", execErr)
+			}
 		}
 		totalSynced += synced
 	}

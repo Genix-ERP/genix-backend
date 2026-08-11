@@ -30,13 +30,13 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 type taxReportEmployeeXML struct {
-	XMLName      xml.Name `xml:"Employee"`
-	EmployeeID   string   `xml:"EmployeeId,omitempty"`
-	Name         string   `xml:"Name"`
-	Position     string   `xml:"Position,omitempty"`
-	EntryCount   int      `xml:"EntryCount"`
-	BaseAmount   float64  `xml:"BaseAmount"`
-	TaxAmount    float64  `xml:"TaxAmount"`
+	XMLName    xml.Name `xml:"Employee"`
+	EmployeeID string   `xml:"EmployeeId,omitempty"`
+	Name       string   `xml:"Name"`
+	Position   string   `xml:"Position,omitempty"`
+	EntryCount int      `xml:"EntryCount"`
+	BaseAmount float64  `xml:"BaseAmount"`
+	TaxAmount  float64  `xml:"TaxAmount"`
 }
 
 type taxReportXML struct {

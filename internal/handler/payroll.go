@@ -698,7 +698,7 @@ func (h *Handler) ListPayrollEntries(c *gin.Context) {
 			   payment_method, bank_account, status, notes, created_at
 		FROM payroll_entries
 		WHERE payroll_period_id = $1 AND tenant_id = $2
-		ORDER BY employee_name
+		ORDER BY employee_name, id ASC
 	`
 
 	args := []interface{}{id, tenantID}
@@ -955,13 +955,17 @@ func (h *Handler) CreatePayrollEntry(c *gin.Context) {
 
 				if remainingAmount > 0 {
 					// Reduce original deduction to the portion that will be deducted
-					h.db.Exec(`UPDATE employee_deductions SET amount=$1, updated_at=$2 WHERE id=$3`, deductedAmount, now, d.ID)
+					if _, execErr := h.db.Exec(`UPDATE employee_deductions SET amount=$1, updated_at=$2 WHERE id=$3`, deductedAmount, now, d.ID); execErr != nil {
+						h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE employee_deductions", "error", execErr)
+					}
 
 					// Create new pending deduction for the remainder
-					h.db.Exec(`
+					if _, execErr := h.db.Exec(`
 						INSERT INTO employee_deductions (id, tenant_id, organization_id, employee_id, amount, reason, source_type, source_id, status, created_by, created_at, updated_at)
 						VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10, $10)
-					`, uuid.New(), tenantID, orgIDPtr, employeeID, remainingAmount, d.Reason+" (qoldiq)", d.SourceType, d.SourceID, userID, now)
+					`, uuid.New(), tenantID, orgIDPtr, employeeID, remainingAmount, d.Reason+" (qoldiq)", d.SourceType, d.SourceID, userID, now); execErr != nil {
+						h.log.Error("write failed (was silently discarded)", "stmt", "INSERT employee_deductions", "error", execErr)
+					}
 				}
 			}
 		}
@@ -1032,7 +1036,9 @@ func (h *Handler) updatePayrollPeriodTotals(periodID, tenantID uuid.UUID) {
 			updated_at = $2
 		WHERE id = $1 AND tenant_id = $3
 	`
-	h.db.Exec(query, periodID, time.Now(), tenantID)
+	if _, execErr := h.db.Exec(query, periodID, time.Now(), tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+	}
 }
 
 // UpdatePayrollEntry updates a single payroll entry for a given period.

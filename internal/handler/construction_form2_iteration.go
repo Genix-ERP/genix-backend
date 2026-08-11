@@ -87,7 +87,7 @@ func (h *Handler) ListForm2Iterations(c *gin.Context) {
 		       snapshot_id, opened_at, opened_by, frozen_at, frozen_by
 		FROM construction_form2_iteration
 		WHERE project_id = $1 AND tenant_id = $2
-		ORDER BY iteration_seq ASC
+		ORDER BY iteration_seq ASC, id ASC
 	`
 	args := []interface{}{projectID, tenantID}
 	paginate, page, pageSize, offset := optPagination(c)

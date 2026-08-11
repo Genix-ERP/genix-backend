@@ -34,13 +34,13 @@ func approxEqual(a, b float64) bool {
 // computeEmployeeTaxesForEntry but factored as a pure function so we can
 // test §11 scenarios 1–4 in isolation.
 type payrollExpectation struct {
-	gross         float64
-	ndfl          float64
-	profsoyuz     float64
-	inps          float64
-	esp           float64
-	netto         float64
-	companyTotal  float64
+	gross        float64
+	ndfl         float64
+	profsoyuz    float64
+	inps         float64
+	esp          float64
+	netto        float64
+	companyTotal float64
 }
 
 func payroll(fot, ndflPct, profPct, inpsPct, espPct float64) payrollExpectation {
@@ -162,11 +162,11 @@ func TestTZ_Section11_NdsBalance(t *testing.T) {
 // these assertions.
 func TestTZ_Section53_DividendBreakdown(t *testing.T) {
 	cases := []struct {
-		name           string
-		amount         float64
-		ratePct        float64
-		wantTax        float64
-		wantNet        float64
+		name    string
+		amount  float64
+		ratePct float64
+		wantTax float64
+		wantNet float64
 	}{
 		{"§5.3 example: 10 mln × 5%", 10_000_000, 5, 500_000, 9_500_000},
 		{"§5.3 1 mln × 5%", 1_000_000, 5, 50_000, 950_000},
