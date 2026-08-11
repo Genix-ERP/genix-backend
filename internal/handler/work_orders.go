@@ -3087,3 +3087,66 @@ func (h *Handler) GetPieceworkSummary(c *gin.Context) {
 		"to":           to.Format("2006-01-02"),
 	})
 }
+
+// UpdateWorkOrder handles the one field the shop-floor screen edits: which
+// operator the work order is assigned to.
+//
+// The frontend has sent PUT /work-orders/:id { operator_id } from the
+// operator-assignment dialog since ShopFloorControl was built, and no route
+// existed — the button 404ed every time. The audit's wiring diff is what
+// surfaced it.
+//
+// It writes assigned_to, not the operator_id column: both exist (migration
+// 123 added operator_id and nothing writes it), but every read in this file
+// projects `wo.assigned_to AS operator_id` — so assigned_to is the value the
+// client reads back, and writing anywhere else would make the update look
+// like it silently failed.
+func (h *Handler) UpdateWorkOrder(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "Invalid work order ID")
+		return
+	}
+
+	var in struct {
+		OperatorID *string `json:"operator_id"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		response.BadRequest(c, "Invalid input")
+		return
+	}
+	if in.OperatorID == nil {
+		response.BadRequest(c, "operator_id is required")
+		return
+	}
+
+	// Empty string clears the assignment; anything else must be a valid user.
+	var operator interface{}
+	if *in.OperatorID != "" {
+		opID, err := uuid.Parse(*in.OperatorID)
+		if err != nil {
+			response.BadRequest(c, "Invalid operator_id")
+			return
+		}
+		operator = opID
+	}
+
+	res, err := h.db.Exec(`
+		UPDATE work_orders SET assigned_to = $1, updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3`, operator, id, tenantID)
+	if err != nil {
+		h.log.Error("Failed to assign work order operator", "error", err, "work_order_id", id)
+		response.InternalError(c, "Failed to update work order")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		response.NotFound(c, "Work order")
+		return
+	}
+	response.Success(c, gin.H{"id": id, "operator_id": in.OperatorID})
+}

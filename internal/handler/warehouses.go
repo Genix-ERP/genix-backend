@@ -353,10 +353,18 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 		}
 	}
 
-	// Serialize address
-	var addressJSON []byte
+	// Serialize address.
+	//
+	// interface{} nil, not a nil []byte: lib/pq encodes a nil byte slice as
+	// the EMPTY STRING, not NULL, and jsonb rejects '' with "invalid input
+	// syntax for type json" — so creating a warehouse without an address
+	// 500ed every time. Verified against Postgres statement logs: the failing
+	// parameter was literally $6 = ''.
+	var addressArg interface{}
 	if input.Address != nil {
-		addressJSON, _ = json.Marshal(input.Address)
+		if b, mErr := json.Marshal(input.Address); mErr == nil {
+			addressArg = b
+		}
 	}
 
 	id := uuid.New()
@@ -406,7 +414,7 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 	`
 
 	err = h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, input.Code, input.Name, addressJSON, managerID, input.IsDefault, true, warehouseType, receptionSteps, deliverySteps, now, now,
+		id, tenantID, orgIDPtr, input.Code, input.Name, addressArg, managerID, input.IsDefault, true, warehouseType, receptionSteps, deliverySteps, now, now,
 	).Scan(&id)
 
 	if err != nil {
@@ -423,8 +431,15 @@ func (h *Handler) CreateWarehouse(c *gin.Context) {
 	h.createDefaultOperationTypes(tenantID, id, input.Code, receptionSteps, deliverySteps, orgIDPtr)
 
 	resp := &entity.Warehouse{
-		ID:             id,
-		TenantID:       tenantID,
+		ID:       id,
+		TenantID: tenantID,
+		// This was missing, and it is the bug the user actually SAW: the row
+		// was stored with the right organization, but the create response
+		// carried no organization_id, the frontend appends the response to
+		// its list, and the fresh warehouse wore the "kompaniyasiz" badge
+		// until the next reload — while opening and re-saving "fixed" it only
+		// because the update path refetches.
+		OrganizationID: orgIDPtr,
 		Code:           input.Code,
 		Name:           input.Name,
 		Address:        input.Address,
@@ -659,8 +674,11 @@ func (h *Handler) UpdateWarehouse(c *gin.Context) {
 		addUpdate("name", *input.Name)
 	}
 	if input.Address != nil {
-		addressJSON, _ := json.Marshal(input.Address)
-		addUpdate("address", addressJSON)
+		// Same nil-slice trap as CreateWarehouse: marshal errors must not
+		// turn into a '' written to a jsonb column.
+		if addressJSON, mErr := json.Marshal(input.Address); mErr == nil {
+			addUpdate("address", addressJSON)
+		}
 	}
 	if input.ManagerID != nil {
 		if *input.ManagerID == "" {
