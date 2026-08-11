@@ -5925,64 +5925,29 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 		return
 	}
 
-	// ledger_balance is the Moliya v2 truth (posted JE lines on the linked
-	// GL account); the legacy mutable balance column stays until the
-	// frontend migrates off it.
+	// Balance definition and account scoping both live in bank_balance.go, so
+	// this list and the summary cards above it cannot drift apart.
+	// ledger_balance is the Moliya v2 truth: posted JE lines on the linked GL
+	// account. It is now the only balance the list ships.
+	where, args, argIndex := bankAccountScope(c, tenantID, filter)
+	from := `
+		FROM bank_accounts ba` + bankLedgerBalanceJoin + `
+		WHERE ` + where
+
+	// No `balance`: the list ships one balance, and it is the ledger's. The
+	// legacy opening-balance column is detail-only now (entity.BankAccount).
 	query := `
-		SELECT id, tenant_id, organization_id, COALESCE(name, bank_name) as name, bank_name,
-		       COALESCE(account_number, '') as account_number,
-		       COALESCE(currency, 'UZS') as currency, COALESCE(account_type, 'checking') as account_type,
-		       COALESCE(balance, 0) as balance, COALESCE(is_active, true) as is_active,
-		       last_reconciled,
-		       account_id, created_at, updated_at,
-		       COALESCE(lb.bal, 0) as ledger_balance
-		FROM bank_accounts ba
-		LEFT JOIN LATERAL (
-			SELECT SUM(l.debit_amount - l.credit_amount) AS bal
-			FROM journal_entry_lines l
-			JOIN journal_entries je ON je.id = l.journal_entry_id
-				AND je.status = 'posted' AND je.deleted_at IS NULL AND je.tenant_id = ba.tenant_id
-			WHERE l.account_id = ba.account_id
-		) lb ON true
-		WHERE tenant_id = $1 AND deleted_at IS NULL
-	`
-	args := []interface{}{tenantID}
-	argIndex := 2
+		SELECT ba.id, ba.tenant_id, ba.organization_id, COALESCE(ba.name, ba.bank_name) as name, ba.bank_name,
+		       COALESCE(ba.account_number, '') as account_number,
+		       COALESCE(ba.currency, 'UZS') as currency, COALESCE(ba.account_type, 'checking') as account_type,
+		       COALESCE(ba.is_active, true) as is_active,
+		       ba.last_reconciled,
+		       ba.account_id, ba.created_at, ba.updated_at,
+		       COALESCE(lb.bal, 0) as ledger_balance` + from
 
-	// Filter by organization
-	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		query += fmt.Sprintf(" AND organization_id = $%d", argIndex)
-		args = append(args, orgID)
-		argIndex++
-	}
+	countQuery := "SELECT COUNT(*)" + from
 
-	if filter.Search != "" {
-		query += fmt.Sprintf(" AND (COALESCE(name, bank_name) ILIKE $%d OR bank_name ILIKE $%d OR account_number ILIKE $%d)", argIndex, argIndex, argIndex)
-		args = append(args, "%"+filter.Search+"%")
-		argIndex++
-	}
-
-	if filter.Currency != "" {
-		query += fmt.Sprintf(" AND COALESCE(currency, 'UZS') = $%d", argIndex)
-		args = append(args, filter.Currency)
-		argIndex++
-	}
-
-	if filter.AccountType != "" {
-		query += fmt.Sprintf(" AND COALESCE(account_type, 'checking') = $%d", argIndex)
-		args = append(args, filter.AccountType)
-		argIndex++
-	}
-
-	if filter.IsActive != nil {
-		query += fmt.Sprintf(" AND COALESCE(is_active, true) = $%d", argIndex)
-		args = append(args, *filter.IsActive)
-		argIndex++
-	}
-
-	countQuery := "SELECT COUNT(*)" + query[strings.Index(query, "FROM bank_accounts"):]
-
-	query += " ORDER BY COALESCE(name, bank_name) ASC"
+	query += " ORDER BY COALESCE(ba.name, ba.bank_name) ASC"
 
 	// Opt-in paging — see ListExchangeRates.
 	paginate, page, pageSize, offset := optPagination(c)
@@ -6009,7 +5974,7 @@ func (h *Handler) ListBankAccounts(c *gin.Context) {
 
 		err := rows.Scan(
 			&acc.ID, &acc.TenantID, &organizationID, &name, &acc.BankName,
-			&accountNumber, &acc.Currency, &acc.AccountType, &acc.Balance,
+			&accountNumber, &acc.Currency, &acc.AccountType,
 			&acc.IsActive, &lastReconciled, &accountID, &acc.CreatedAt, &acc.UpdatedAt,
 			&acc.LedgerBalance,
 		)
@@ -6085,20 +6050,31 @@ func (h *Handler) GetBankAccount(c *gin.Context) {
 	var organizationID, accountID sql.NullString
 	var lastReconciled sql.NullTime
 	var name, accountNumber sql.NullString
+	// The detail response is where the opening balance still belongs: it is what
+	// the edit form prefills its "Boshlang'ich balans" field from, and the form
+	// PUTs the value straight back — a missing balance here would silently reset
+	// the stored figure to 0 on the next save.
+	var balance float64
 
+	// ledger_balance/gl_linked come along for the same reason the list carries
+	// them: this is the payload a detail screen renders, and it is also what
+	// UpdateBankAccount returns — a client that folds that response back into
+	// its list would otherwise watch the edited row's balance drop to 0.
 	err := h.db.QueryRow(`
-		SELECT id, tenant_id, organization_id, COALESCE(name, bank_name) as name, bank_name,
-		       COALESCE(account_number, '') as account_number,
-		       COALESCE(currency, 'UZS') as currency, COALESCE(account_type, 'checking') as account_type,
-		       COALESCE(balance, 0) as balance, COALESCE(is_active, true) as is_active,
-		       COALESCE(last_reconciled, last_reconciled_date) as last_reconciled,
-		       account_id, created_at, updated_at
-		FROM bank_accounts
-		WHERE id = $1 AND tenant_id = $2 AND (deleted_at IS NULL OR deleted_at IS NULL)
+		SELECT ba.id, ba.tenant_id, ba.organization_id, COALESCE(ba.name, ba.bank_name) as name, ba.bank_name,
+		       COALESCE(ba.account_number, '') as account_number,
+		       COALESCE(ba.currency, 'UZS') as currency, COALESCE(ba.account_type, 'checking') as account_type,
+		       COALESCE(ba.balance, 0) as balance, COALESCE(ba.is_active, true) as is_active,
+		       COALESCE(ba.last_reconciled, ba.last_reconciled_date) as last_reconciled,
+		       ba.account_id, ba.created_at, ba.updated_at,
+		       COALESCE(lb.bal, 0) as ledger_balance
+		FROM bank_accounts ba`+bankLedgerBalanceJoin+`
+		WHERE ba.id = $1 AND ba.tenant_id = $2 AND ba.deleted_at IS NULL
 	`, id, tenantID).Scan(
 		&acc.ID, &acc.TenantID, &organizationID, &name, &acc.BankName,
-		&accountNumber, &acc.Currency, &acc.AccountType, &acc.Balance,
+		&accountNumber, &acc.Currency, &acc.AccountType, &balance,
 		&acc.IsActive, &lastReconciled, &accountID, &acc.CreatedAt, &acc.UpdatedAt,
+		&acc.LedgerBalance,
 	)
 
 	if err == sql.ErrNoRows {
@@ -6130,6 +6106,8 @@ func (h *Handler) GetBankAccount(c *gin.Context) {
 	if lastReconciled.Valid {
 		acc.LastReconciled = &lastReconciled.Time
 	}
+	acc.Balance = &balance
+	acc.GLLinked = accountID.Valid
 
 	response.Success(c, acc)
 }
@@ -6214,11 +6192,15 @@ func (h *Handler) CreateBankAccount(c *gin.Context) {
 		AccountNumber: input.AccountNumber,
 		Currency:      input.Currency,
 		AccountType:   input.AccountType,
-		Balance:       input.Balance,
+		Balance:       &input.Balance,
 		IsActive:      true,
 		AccountID:     accountID,
 		CreatedAt:     now,
 		UpdatedAt:     now,
+		// A brand-new account has no posted journal entries behind it, so its
+		// ledger balance is genuinely 0 — but say whether there is a GL account
+		// to accumulate one, so the client can mark the row like the list does.
+		GLLinked: accountID != nil,
 	}
 
 	response.Created(c, acc)

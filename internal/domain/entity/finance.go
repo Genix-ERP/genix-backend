@@ -632,15 +632,25 @@ type ExchangeRate struct {
 
 // BankAccount represents a bank account for the company
 type BankAccount struct {
-	ID             uuid.UUID    `json:"id" db:"id"`
-	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	OrganizationID *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
-	Name           string       `json:"name" db:"name"`
-	BankName       string       `json:"bank_name" db:"bank_name"`
-	AccountNumber  string       `json:"account_number" db:"account_number"`
-	Currency       string       `json:"currency" db:"currency"`
-	AccountType    string       `json:"account_type" db:"account_type"` // checking, savings, etc.
-	Balance        float64      `json:"balance" db:"balance"`
+	ID             uuid.UUID  `json:"id" db:"id"`
+	TenantID       uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	Name           string     `json:"name" db:"name"`
+	BankName       string     `json:"bank_name" db:"bank_name"`
+	AccountNumber  string     `json:"account_number" db:"account_number"`
+	Currency       string     `json:"currency" db:"currency"`
+	AccountType    string     `json:"account_type" db:"account_type"` // checking, savings, etc.
+	// Balance is the opening figure the create form writes once — a mutable
+	// column nothing keeps current. It is NOT what the account holds; see
+	// LedgerBalance. Only the detail and create responses set it, because it is
+	// only ever needed to prefill the edit form: on the list it sat next to
+	// ledger_balance looking equally authoritative, and the mobile app read it
+	// and showed 0 so'm on a screen where the web showed 153.3 mln.
+	//
+	// A pointer with omitempty rather than a plain float64: nil leaves the key
+	// out of the list payload entirely. Zeroing it instead would ship
+	// `"balance": 0`, which is the wrong number rather than no number.
+	Balance        *float64     `json:"balance,omitempty" db:"balance"`
 	IsActive       bool         `json:"is_active" db:"is_active"`
 	LastReconciled *time.Time   `json:"last_reconciled,omitempty" db:"last_reconciled"`
 	AccountID      *uuid.UUID   `json:"account_id,omitempty" db:"account_id"` // Link to chart of accounts
