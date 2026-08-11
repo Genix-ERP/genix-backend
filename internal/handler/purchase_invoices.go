@@ -1854,6 +1854,89 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 	h.GetPurchaseInvoice(c)
 }
 
+// purchaseInvoiceStatsQuery renders the vendor-bill card query over an
+// already-built WHERE clause. Split out of the handler so the definitions below
+// can be pinned without a database or a gin context — see
+// purchase_invoice_stats_test.go. Column order is part of the contract: the
+// caller Scans positionally.
+//
+// Three shared definitions, none of them re-spelled here:
+//
+//	owed     — debtStatusFilter, the same vocabulary
+//	           /reports/finance-dashboard uses. B1: this used to be a local
+//	           NOT IN ('paid', 'cancelled'), which counts 'draft'. One
+//	           unconfirmed bill therefore raised "To'lanmagan", "Jami to'lov"
+//	           and "Muddati o'tgan" while ALSO being counted in "Tasdiqlash
+//	           kutilmoqda" one card to the right — the same document twice in
+//	           one row of cards — and stayed out of the dashboard's "Siz
+//	           qarzdorsiz" the whole time.
+//
+//	payState — invoicePaymentStatusSQL, the same expression the row field and
+//	           the payment_status= filter are built from. B3: the local
+//	           version was a second spelling that disagreed on the edges — a
+//	           zero-total document with money against it, an overpayment, a
+//	           NULL amount_paid — so a bill could be "Qisman" in the list and
+//	           counted nowhere on the cards.
+//
+//	           This alone does NOT make a card and its click-through return
+//	           the same rows, and the numbers here say so: unpaid_count 1
+//	           against 4 rows for payment_status=unpaid, the extra three being
+//	           a draft, a cancellation and a void. The cards carry `owed` as
+//	           well, and the filter had no way to say it — see
+//	           invoiceDebtFilter, which is the other half.
+//
+//	residual — total - paid, derived rather than read from amount_due, which
+//	           is not maintained on every write path.
+func purchaseInvoiceStatsQuery(baseWhere string) string {
+	owed := debtStatusFilterFor("pi")
+	payState := "(" + invoicePaymentStatusSQL("pi") + ")"
+	const residual = "(pi.total_amount - COALESCE(pi.amount_paid, 0))"
+	overdue := invoiceOverdueSQL("pi")
+
+	return fmt.Sprintf(`
+		SELECT
+			-- total_count / total_amount count DOCUMENTS, not debt: every row the
+			-- filters matched, drafts and cancelled ones included. That is what
+			-- "Jami hisob-fakturalar" and "Jami summa" say on the card, and it is
+			-- the only pair here that is not a debt figure.
+			COUNT(*) AS total_count,
+			COALESCE(SUM(pi.total_amount), 0) AS total_amount,
+			COUNT(*) FILTER (WHERE %[1]s AND %[2]s = 'unpaid') AS unpaid_count,
+			COALESCE(SUM(%[3]s) FILTER (WHERE %[1]s AND %[2]s = 'unpaid'), 0) AS unpaid_amount,
+			COUNT(*) FILTER (WHERE %[1]s AND %[2]s = 'partial') AS partial_count,
+			COALESCE(SUM(%[3]s) FILTER (WHERE %[1]s AND %[2]s = 'partial'), 0) AS partial_amount,
+			-- B2: the Xaridlar module's "To'langan" card, which had to compute
+			-- this in the browser and got NaN for its trouble (it summed a
+			-- paid_amount key the API has never sent — the field is
+			-- amount_paid). The two halves answer different questions on purpose:
+			-- paid_count counts documents settled in full, paid_amount is money
+			-- actually paid across every document in scope, partial payments
+			-- included, so it pairs with total_amount above. total_amount -
+			-- paid_amount is therefore the document-side remainder, which is NOT
+			-- outstanding_amount below — that one is debt, and drops drafts and
+			-- cancellations.
+			COUNT(*) FILTER (WHERE %[2]s = 'paid') AS paid_count,
+			COALESCE(SUM(COALESCE(pi.amount_paid, 0)), 0) AS paid_amount,
+			COUNT(*) FILTER (WHERE %[4]s) AS overdue_count,
+			COALESCE(SUM(%[3]s) FILTER (WHERE %[4]s), 0) AS overdue_amount,
+			-- A1: the AP tab's "Jami to'lov" and "Tasdiqlash kutilmoqda" cards.
+			-- No residual > 0 test: an overpaid bill carries a negative residual
+			-- and must net against the rest, exactly as partnerNetDue nets per
+			-- partner. Under the old status list such a row was usually marked
+			-- 'paid' and vanished from this sum instead of reducing it.
+			COALESCE(SUM(%[3]s) FILTER (WHERE %[1]s), 0) AS outstanding_amount,
+			-- The card is labelled "pending approval" but there is no approval
+			-- workflow (see the pending_approval question); draft is what "not
+			-- yet confirmed" actually means in this schema. With B1 this is now
+			-- disjoint from the three debt figures above, so a draft is counted
+			-- here and nowhere else.
+			COUNT(*) FILTER (WHERE pi.status = 'draft') AS draft_count
+		FROM purchase_invoices pi
+		LEFT JOIN contacts c ON pi.vendor_id = c.id
+		%[5]s
+	`, owed, payState, residual, overdue, baseWhere)
+}
+
 // GetPurchaseInvoiceStats returns summary statistics for vendor bills
 func (h *Handler) GetPurchaseInvoiceStats(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -1867,43 +1950,18 @@ func (h *Handler) GetPurchaseInvoiceStats(c *gin.Context) {
 	// organization, so searching or filtering the list left the cards showing
 	// whole-tenant figures that could never be reconciled with what was visible.
 	args := []interface{}{tenantID}
-	baseWhere := "WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL" + purchaseInvoiceWhere(c, &args)
-
-	query := fmt.Sprintf(`
-		SELECT
-			COUNT(*) AS total_count,
-			COALESCE(SUM(pi.total_amount), 0) AS total_amount,
-			COUNT(*) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND (pi.amount_paid IS NULL OR pi.amount_paid = 0)) AS unpaid_count,
-			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND (pi.amount_paid IS NULL OR pi.amount_paid = 0)), 0) AS unpaid_amount,
-			COUNT(*) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND pi.amount_paid > 0 AND pi.amount_paid < pi.total_amount) AS partial_count,
-			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE pi.status NOT IN ('paid', 'cancelled') AND pi.amount_paid > 0 AND pi.amount_paid < pi.total_amount), 0) AS partial_amount,
-			COUNT(*) FILTER (WHERE %s) AS overdue_count,
-			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0)) FILTER (WHERE %s), 0) AS overdue_amount,
-			-- A1: the AP tab's "Jami to'lov" and "Tasdiqlash kutilmoqda" cards.
-			-- outstanding_amount is the residual (total - paid), NOT the stored
-			-- amount_due column: unpaid_amount and partial_amount above already
-			-- use the residual form, and amount_due is not maintained on every
-			-- write path, which is why the web card reading it can drift from
-			-- the list beneath it.
-			COALESCE(SUM(pi.total_amount - COALESCE(pi.amount_paid, 0))
-			         FILTER (WHERE pi.status NOT IN ('paid', 'cancelled')), 0) AS outstanding_amount,
-			-- The card is labelled "pending approval" but there is no approval
-			-- workflow (see the pending_approval question); draft is what "not
-			-- yet confirmed" actually means in this schema.
-			COUNT(*) FILTER (WHERE pi.status = 'draft') AS draft_count
-		FROM purchase_invoices pi
-		LEFT JOIN contacts c ON pi.vendor_id = c.id
-		%s
-	`, invoiceOverdueSQL("pi"), invoiceOverdueSQL("pi"), baseWhere)
+	query := purchaseInvoiceStatsQuery(
+		"WHERE pi.tenant_id = $1 AND pi.deleted_at IS NULL" + purchaseInvoiceWhere(c, &args))
 
 	var totalCount int
-	var totalAmount, unpaidAmount, partialAmount, overdueAmount, outstandingAmount float64
-	var unpaidCount, partialCount, overdueCount, draftCount int
+	var totalAmount, unpaidAmount, partialAmount, paidAmount, overdueAmount, outstandingAmount float64
+	var unpaidCount, partialCount, paidCount, overdueCount, draftCount int
 
 	err := h.db.QueryRow(query, args...).Scan(
 		&totalCount, &totalAmount,
 		&unpaidCount, &unpaidAmount,
 		&partialCount, &partialAmount,
+		&paidCount, &paidAmount,
 		&overdueCount, &overdueAmount,
 		&outstandingAmount, &draftCount,
 	)
@@ -1920,6 +1978,8 @@ func (h *Handler) GetPurchaseInvoiceStats(c *gin.Context) {
 		"unpaid_amount":  unpaidAmount,
 		"partial_count":  partialCount,
 		"partial_amount": partialAmount,
+		"paid_count":     paidCount,
+		"paid_amount":    paidAmount,
 		"overdue_count":  overdueCount,
 		"overdue_amount": overdueAmount,
 
