@@ -172,7 +172,7 @@ func TestUnauthorized(t *testing.T) {
 		expectedMessage string
 	}{
 		{"custom message", "token expired", "token expired"},
-		{"empty message uses default", "", "Authentication required"},
+		{"empty message uses default", "", "Avval tizimga kiring"},
 	}
 
 	for _, tt := range tests {
@@ -208,7 +208,7 @@ func TestForbidden(t *testing.T) {
 		expectedMessage string
 	}{
 		{"custom message", "not allowed", "not allowed"},
-		{"empty message uses default", "", "Access denied"},
+		{"empty message uses default", "", "Bu amal uchun sizga ruxsat berilmagan"},
 	}
 
 	for _, tt := range tests {
@@ -243,8 +243,8 @@ func TestNotFound(t *testing.T) {
 		resource        string
 		expectedMessage string
 	}{
-		{"with resource name", "User", "User not found"},
-		{"empty resource uses default", "", "Resource not found"},
+		{"with resource name", "User", "Foydalanuvchi topilmadi"},
+		{"empty resource uses default", "", "Ma'lumot topilmadi"},
 	}
 
 	for _, tt := range tests {
@@ -280,7 +280,7 @@ func TestInternalError(t *testing.T) {
 		expectedMessage string
 	}{
 		{"custom message", "database failure", "database failure"},
-		{"empty message uses default", "", "An unexpected error occurred"},
+		{"empty message uses default", "", "Nimadir xato ketdi — qaytadan urinib ko'ring"},
 	}
 
 	for _, tt := range tests {

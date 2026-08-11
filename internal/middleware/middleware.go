@@ -178,8 +178,10 @@ func Timeout(timeout time.Duration) gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusGatewayTimeout, gin.H{
 				"success": false,
 				"error": gin.H{
-					"code":    "TIMEOUT",
-					"message": "Request timeout",
+					"code": "TIMEOUT",
+					// The one error emitted outside the response package, so
+					// it carries its Uzbek itself.
+					"message": "So'rov vaqti tugadi — qaytadan urinib ko'ring",
 				},
 			})
 		}

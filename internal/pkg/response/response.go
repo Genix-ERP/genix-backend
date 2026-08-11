@@ -2,6 +2,7 @@ package response
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
 	"github.com/gin-gonic/gin"
@@ -119,13 +120,16 @@ func NoContent(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// Error sends an error response
+// Error sends an error response. The message is translated to Uzbek at this
+// boundary (translate.go) — handlers keep writing canonical English (which
+// the logs get verbatim), the user sees Uzbek, and error CODES pass through
+// untouched so clients that switch on them keep working.
 func Error(c *gin.Context, statusCode int, code, message string) {
 	c.JSON(statusCode, Response{
 		Success: false,
 		Error: &ErrorInfo{
 			Code:    code,
-			Message: message,
+			Message: translateUserMessage(message),
 		},
 	})
 }
@@ -136,7 +140,7 @@ func ErrorWithDetails(c *gin.Context, statusCode int, code, message string, deta
 		Success: false,
 		Error: &ErrorInfo{
 			Code:    code,
-			Message: message,
+			Message: translateUserMessage(message),
 			Details: details,
 		},
 	})
@@ -163,11 +167,20 @@ func Forbidden(c *gin.Context, message string) {
 	Error(c, http.StatusForbidden, "FORBIDDEN", message)
 }
 
-// NotFound sends a 404 Not Found response
+// NotFound sends a 404 Not Found response.
+//
+// Some callers pass a bare resource name ("Warehouse"), others pass a full
+// sentence ("Project not found", "Payment not found or already paid") — the
+// old unconditional `+ " not found"` turned the latter into "Project not
+// found not found". Append only when the caller didn't already say it.
 func NotFound(c *gin.Context, resource string) {
 	message := "Resource not found"
 	if resource != "" {
-		message = resource + " not found"
+		if strings.Contains(strings.ToLower(resource), "not found") {
+			message = resource
+		} else {
+			message = resource + " not found"
+		}
 	}
 	Error(c, http.StatusNotFound, "NOT_FOUND", message)
 }
@@ -183,7 +196,7 @@ func ConflictWithData(c *gin.Context, code, message string, data interface{}) {
 		Success: false,
 		Error: &ErrorInfo{
 			Code:    code,
-			Message: message,
+			Message: translateUserMessage(message),
 			Data:    data,
 		},
 	})
