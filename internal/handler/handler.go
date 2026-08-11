@@ -1332,6 +1332,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		bankAccounts.GET("", h.ListBankAccounts)
 		bankAccounts.POST("", h.perm.Require("finance", "bank_account", "create"), h.CreateBankAccount)
+		// Totals for the cards above the list. Static, so gin resolves it
+		// ahead of the /:id param route below — same ordering as
+		// /payments/partner-balances/summary above.
+		bankAccounts.GET("/summary", h.GetBankAccountsSummary)
 		bankAccounts.GET("/:id", h.GetBankAccount)
 		bankAccounts.PUT("/:id", h.perm.Require("finance", "bank_account", "update"), h.UpdateBankAccount)
 		bankAccounts.DELETE("/:id", h.perm.Require("finance", "bank_account", "delete"), h.DeleteBankAccount)
