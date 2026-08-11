@@ -23,6 +23,7 @@ import (
 // @Param date_from query string false "Invoice date from (YYYY-MM-DD)"
 // @Param date_to query string false "Invoice date to (YYYY-MM-DD)"
 // @Param overdue query bool false "Only overdue invoices"
+// @Param debt query bool false "Only documents that count as debt (excludes draft, cancelled, void)"
 // @Param search query string false "Invoice number or customer name"
 // @Success 200 {object} response.Response
 // @Security BearerAuth
