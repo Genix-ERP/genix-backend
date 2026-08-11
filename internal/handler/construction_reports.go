@@ -128,10 +128,10 @@ func (h *Handler) GetProjectSummaryReport(c *gin.Context) {
 		LIMIT 10
 	`, projectID, tenantID)
 	type MaterialLine struct {
-		Name      string   `json:"name"`
-		Quantity  *float64 `json:"quantity"`
-		AvgPrice  *float64 `json:"avg_price"`
-		Total     float64  `json:"total"`
+		Name     string   `json:"name"`
+		Quantity *float64 `json:"quantity"`
+		AvgPrice *float64 `json:"avg_price"`
+		Total    float64  `json:"total"`
 	}
 	top10Materials := []MaterialLine{}
 	if top10MatRows != nil {
@@ -551,9 +551,9 @@ func (h *Handler) GetStageBudgetReport(c *gin.Context) {
 	}
 
 	response.Success(c, map[string]interface{}{
-		"rows":          budgetRows,
-		"total_planned": totalPlanned,
-		"total_actual":  totalActual,
+		"rows":           budgetRows,
+		"total_planned":  totalPlanned,
+		"total_actual":   totalActual,
 		"total_variance": totalPlanned - totalActual,
 	})
 }
@@ -744,10 +744,10 @@ func (h *Handler) GetJournalEntriesReport(c *gin.Context) {
 // 12-line layout. Each building gets four cost rows split between PLAN
 // and FAKT so the frontend can toggle between modes:
 //
-//   • R4 — installed equipment / furniture / inventory ("оборудование")
-//   • R5 — labor wages ("з/плата рабочих")
-//   • R6 — machine ops ("эксплуатация машин и механизмов")
-//   • R7 — building materials ("строительные материалы")
+//   - R4 — installed equipment / furniture / inventory ("оборудование")
+//   - R5 — labor wages ("з/плата рабочих")
+//   - R6 — machine ops ("эксплуатация машин и механизмов")
+//   - R7 — building materials ("строительные материалы")
 //
 // Rows 8 (direct subtotal), 9 (overhead %), 10 (insurance %), 11
 // (subtotal), 12 (VAT), 13 (current price), 14 (PQ-161), 15 (grand
@@ -759,30 +759,33 @@ func (h *Handler) GetJournalEntriesReport(c *gin.Context) {
 // =================
 //
 // In GenixERP each top-level work (parent_line_id IS NULL,
-// resource_type = '') in a Единич estimate decomposes into
+// resource_type = ”) in a Единич estimate decomposes into
 // sub-resources (parent_line_id > 0) tagged with resource_type
 // ∈ {labor, equipment, material, ...}. Sub.total_amount is the
 // per-unit-of-parent cost contribution × parent.quantity, i.e. the
 // sub already encodes the parent's planned scale.
 //
 // PLAN per (building, resource_class):
-//   sum(sub.total_amount) grouped by classify(sub.resource_type)
+//
+//	sum(sub.total_amount) grouped by classify(sub.resource_type)
 //
 // FAKT per (building, resource_class):
-//   sub.total_amount × (parent.done_quantity / parent.quantity)
-//   When parent.quantity is 0 (Единич template-mode imports), we
-//   fall back to original_quantity (the import-time anchor).
-//   When parent.done_quantity is 0 (work not started), FAKT is 0.
+//
+//	sub.total_amount × (parent.done_quantity / parent.quantity)
+//	When parent.quantity is 0 (Единич template-mode imports), we
+//	fall back to original_quantity (the import-time anchor).
+//	When parent.done_quantity is 0 (work not started), FAKT is 0.
 //
 // Resource type classification (case-insensitive, tolerant of
 // Russian / Uzbek-Latin variants):
-//   labor    = labor, mehnat, ish, ishchi, worker, трудовой
-//   machine  = equipment, mashina, mexanizm, machinery
-//   material = material, materialy, mat
-//   else     = "equipment" bucket (R4 — installed equipment /
-//              furniture / inventory). This rescues lines in
-//              engineering-system estimates whose authors typed
-//              non-standard resource_types like "оборудование".
+//
+//	labor    = labor, mehnat, ish, ishchi, worker, трудовой
+//	machine  = equipment, mashina, mexanizm, machinery
+//	material = material, materialy, mat
+//	else     = "equipment" bucket (R4 — installed equipment /
+//	           furniture / inventory). This rescues lines in
+//	           engineering-system estimates whose authors typed
+//	           non-standard resource_types like "оборудование".
 //
 // Reference: matches the structure of "Жилдом Саттепо Авеню Блок 1.xlsx"
 // resource sheet's three subtotal rows (G14 labor, G69 machines, G296
@@ -911,16 +914,16 @@ func (h *Handler) GetSvodReport(c *gin.Context) {
 	defer rows.Close()
 
 	type buildingRow struct {
-		ID             int64   `json:"id"`
-		Name           string  `json:"name"`
-		LaborPlan      float64 `json:"labor_plan"`
-		MachinePlan    float64 `json:"machine_plan"`
-		MaterialPlan   float64 `json:"material_plan"`
-		EquipmentPlan  float64 `json:"equipment_plan"`
-		LaborFakt      float64 `json:"labor_fakt"`
-		MachineFakt    float64 `json:"machine_fakt"`
-		MaterialFakt   float64 `json:"material_fakt"`
-		EquipmentFakt  float64 `json:"equipment_fakt"`
+		ID            int64   `json:"id"`
+		Name          string  `json:"name"`
+		LaborPlan     float64 `json:"labor_plan"`
+		MachinePlan   float64 `json:"machine_plan"`
+		MaterialPlan  float64 `json:"material_plan"`
+		EquipmentPlan float64 `json:"equipment_plan"`
+		LaborFakt     float64 `json:"labor_fakt"`
+		MachineFakt   float64 `json:"machine_fakt"`
+		MaterialFakt  float64 `json:"material_fakt"`
+		EquipmentFakt float64 `json:"equipment_fakt"`
 	}
 	var buildings []buildingRow
 	for rows.Next() {
@@ -962,7 +965,8 @@ func (h *Handler) GetSvodReport(c *gin.Context) {
 //
 // Aggregation key
 // ───────────────
-//   (building_id, name (case-insensitive), uom, unit_rate)
+//
+//	(building_id, name (case-insensitive), uom, unit_rate)
 //
 // So two lines with the same name + uom but DIFFERENT unit_rate
 // produce two separate output rows, each with its own consumed
@@ -980,24 +984,24 @@ func (h *Handler) GetSvodReport(c *gin.Context) {
 // Output shape
 // ────────────
 //
-//   {
-//     project: {id, name, address},
-//     blocks: [
-//       {
-//         id, name,
-//         groups: [{
-//             name, uom, unit_rate,
-//             fakt_quantity, fakt_amount,
-//             topups: [{extra_quantity, new_price, amount, ordered_at, note}]
-//         }],
-//         total_amount
-//       }
-//     ],
-//     total: {
-//       groups: [...same shape, aggregated across blocks],
-//       total_amount
-//     }
-//   }
+//	{
+//	  project: {id, name, address},
+//	  blocks: [
+//	    {
+//	      id, name,
+//	      groups: [{
+//	          name, uom, unit_rate,
+//	          fakt_quantity, fakt_amount,
+//	          topups: [{extra_quantity, new_price, amount, ordered_at, note}]
+//	      }],
+//	      total_amount
+//	    }
+//	  ],
+//	  total: {
+//	    groups: [...same shape, aggregated across blocks],
+//	    total_amount
+//	  }
+//	}
 //
 // "Block #0" is reserved for lines whose estimate has no building_id —
 // the modal renders these under "Umumiy" so the user can see them.
@@ -1280,11 +1284,12 @@ func (h *Handler) GetMaterialConsolidationReport(c *gin.Context) {
 // subcontractor's name when the resource lives in a subcontract estimate.
 //
 // Type vocabulary (must match the modal's RES_TYPES):
-//   labor     — labor resources (resource_type labor-ish, or UOM contains ЧЕЛ)
-//   equipment — machines/mechanisms (resource_type machine-ish, or UOM МАШ)
-//   cable     — materials flagged material_type='cable' (migration 350)
-//   installed — materials flagged material_type='equipment' (оборудование)
-//   material  — everything else (material_type='standard' / untagged)
+//
+//	labor     — labor resources (resource_type labor-ish, or UOM contains ЧЕЛ)
+//	equipment — machines/mechanisms (resource_type machine-ish, or UOM МАШ)
+//	cable     — materials flagged material_type='cable' (migration 350)
+//	installed — materials flagged material_type='equipment' (оборудование)
+//	material  — everything else (material_type='standard' / untagged)
 //
 // Aggregation key: (building_id, subcontractor, type, name, uom, unit_rate).
 // NORMA quantity is the line's full planned quantity (no done_quantity

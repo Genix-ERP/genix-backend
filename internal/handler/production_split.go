@@ -245,10 +245,10 @@ func (h *Handler) CompleteSplitOutput(c *gin.Context) {
 	`, totalFinishedCost, now, poID, tenantID)
 
 	response.Success(c, gin.H{
-		"message":      "Split output completed",
-		"outputs":      outputs,
-		"total_cost":   totalFinishedCost,
-		"cost_per_kg":  costPerKg,
+		"message":     "Split output completed",
+		"outputs":     outputs,
+		"total_cost":  totalFinishedCost,
+		"cost_per_kg": costPerKg,
 	})
 }
 

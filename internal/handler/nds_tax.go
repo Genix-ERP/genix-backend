@@ -118,9 +118,9 @@ func (h *Handler) GetNdsTax(c *gin.Context) {
 
 		// TZ §5.1 field names, both in machine and TZ form so the UI can
 		// label them however it wants.
-		"realizatsiya": round2(salesTax),     // output VAT
-		"zachet":       round2(purchaseTax),  // input VAT
-		"balansi":      balance,              // net payable
+		"realizatsiya": round2(salesTax),    // output VAT
+		"zachet":       round2(purchaseTax), // input VAT
+		"balansi":      balance,             // net payable
 		"payable":      balance > 0,
 
 		// Context for the UI.

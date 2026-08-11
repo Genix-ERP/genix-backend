@@ -249,19 +249,19 @@ func (h *Handler) CreateAttendanceRecord(c *gin.Context) {
 	}
 
 	rec := &entity.AttendanceRecord{
-		ID:             id,
-		TenantID:       tenantID,
-		EmployeeID:     employeeID,
-		EmployeeName:   employeeName,
-		Department:     department,
-		Date:           date,
-		ClockIn:        clockIn,
-		ClockOut:       clockOut,
-		Status:         input.Status,
-		BreakDuration:  input.BreakDuration,
-		Notes:          notes,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		ID:            id,
+		TenantID:      tenantID,
+		EmployeeID:    employeeID,
+		EmployeeName:  employeeName,
+		Department:    department,
+		Date:          date,
+		ClockIn:       clockIn,
+		ClockOut:      clockOut,
+		Status:        input.Status,
+		BreakDuration: input.BreakDuration,
+		Notes:         notes,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 
 	response.Created(c, rec.ToResponse())

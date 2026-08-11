@@ -17,43 +17,43 @@ import (
 // =====================================================
 
 type expenseLine struct {
-	ID                  string   `json:"id"`
-	TenantID            string   `json:"tenant_id"`
-	ProjectID           int64    `json:"project_id"`
-	StageID             *int64   `json:"stage_id"`
-	StageName           *string  `json:"stage_name"`
-	WbsID               *int64   `json:"wbs_id"`
-	CostCategoryID      *int64   `json:"cost_category_id"`
-	CostCategoryName    *string  `json:"cost_category_name"`
-	ExpenseDate         string   `json:"expense_date"`
-	Description         string   `json:"description"`
-	ProductID           *string  `json:"product_id"`
-	ProductName         *string  `json:"product_name"`
-	Quantity            *float64 `json:"quantity"`
-	Uom                 *string  `json:"uom"`
-	UnitPrice           *float64 `json:"unit_price"`
-	Amount              float64  `json:"amount"`
-	CurrencyCode        string   `json:"currency_code"`
-	VendorID            *string  `json:"vendor_id"`
-	VendorName          *string  `json:"vendor_name"`
-	DebitAccountID      *string  `json:"debit_account_id"`
-	DebitAccountCode    *string  `json:"debit_account_code"`
-	CreditAccountID     *string  `json:"credit_account_id"`
-	CreditAccountCode   *string  `json:"credit_account_code"`
-	AnalyticAccountID   *string  `json:"analytic_account_id"`
-	JournalEntryID      *string  `json:"journal_entry_id"`
-	DocumentURL         *string  `json:"document_url"`
-	Status              string   `json:"status"`
-	ApprovedBy          *string  `json:"approved_by"`
-	ApprovedAt          *string  `json:"approved_at"`
-	CancelledReason     *string  `json:"cancelled_reason"`
-	CreatedBy           *string  `json:"created_by"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
-	SubcontractID       *int64   `json:"subcontract_id"`
-	SubcontractName     *string  `json:"subcontract_name"`
-	MaterialRequestID   *int64   `json:"material_request_id"`
-	SupplierName        *string  `json:"supplier_name"`
+	ID                string    `json:"id"`
+	TenantID          string    `json:"tenant_id"`
+	ProjectID         int64     `json:"project_id"`
+	StageID           *int64    `json:"stage_id"`
+	StageName         *string   `json:"stage_name"`
+	WbsID             *int64    `json:"wbs_id"`
+	CostCategoryID    *int64    `json:"cost_category_id"`
+	CostCategoryName  *string   `json:"cost_category_name"`
+	ExpenseDate       string    `json:"expense_date"`
+	Description       string    `json:"description"`
+	ProductID         *string   `json:"product_id"`
+	ProductName       *string   `json:"product_name"`
+	Quantity          *float64  `json:"quantity"`
+	Uom               *string   `json:"uom"`
+	UnitPrice         *float64  `json:"unit_price"`
+	Amount            float64   `json:"amount"`
+	CurrencyCode      string    `json:"currency_code"`
+	VendorID          *string   `json:"vendor_id"`
+	VendorName        *string   `json:"vendor_name"`
+	DebitAccountID    *string   `json:"debit_account_id"`
+	DebitAccountCode  *string   `json:"debit_account_code"`
+	CreditAccountID   *string   `json:"credit_account_id"`
+	CreditAccountCode *string   `json:"credit_account_code"`
+	AnalyticAccountID *string   `json:"analytic_account_id"`
+	JournalEntryID    *string   `json:"journal_entry_id"`
+	DocumentURL       *string   `json:"document_url"`
+	Status            string    `json:"status"`
+	ApprovedBy        *string   `json:"approved_by"`
+	ApprovedAt        *string   `json:"approved_at"`
+	CancelledReason   *string   `json:"cancelled_reason"`
+	CreatedBy         *string   `json:"created_by"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	SubcontractID     *int64    `json:"subcontract_id"`
+	SubcontractName   *string   `json:"subcontract_name"`
+	MaterialRequestID *int64    `json:"material_request_id"`
+	SupplierName      *string   `json:"supplier_name"`
 }
 
 // ListExpenseLines returns expense lines for a project
@@ -268,22 +268,22 @@ func (h *Handler) CreateExpenseLine(c *gin.Context) {
 	}
 
 	var req struct {
-		StageID        int64   `json:"stage_id"`
-		WbsID          int64   `json:"wbs_id"`
-		CostCategoryID int64   `json:"cost_category_id"`
-		ExpenseDate    string  `json:"expense_date" binding:"required"`
-		Description    string  `json:"description" binding:"required"`
-		ProductID      string  `json:"product_id"`
-		Quantity       float64 `json:"quantity"`
-		Uom            string  `json:"uom"`
-		UnitPrice      float64 `json:"unit_price"`
-		Amount         float64 `json:"amount" binding:"required"`
-		CurrencyCode   string  `json:"currency_code"`
-		VendorID       string  `json:"vendor_id"`
-		DebitAccountID  string `json:"debit_account_id"`
-		CreditAccountID string `json:"credit_account_id"`
-		DocumentURL    string  `json:"document_url"`
-		SupplierName   string  `json:"supplier_name"`
+		StageID         int64   `json:"stage_id"`
+		WbsID           int64   `json:"wbs_id"`
+		CostCategoryID  int64   `json:"cost_category_id"`
+		ExpenseDate     string  `json:"expense_date" binding:"required"`
+		Description     string  `json:"description" binding:"required"`
+		ProductID       string  `json:"product_id"`
+		Quantity        float64 `json:"quantity"`
+		Uom             string  `json:"uom"`
+		UnitPrice       float64 `json:"unit_price"`
+		Amount          float64 `json:"amount" binding:"required"`
+		CurrencyCode    string  `json:"currency_code"`
+		VendorID        string  `json:"vendor_id"`
+		DebitAccountID  string  `json:"debit_account_id"`
+		CreditAccountID string  `json:"credit_account_id"`
+		DocumentURL     string  `json:"document_url"`
+		SupplierName    string  `json:"supplier_name"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)

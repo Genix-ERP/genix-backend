@@ -14,11 +14,11 @@ var startTime = time.Now()
 
 // HealthStatus represents the health check response
 type HealthStatus struct {
-	Status    string            `json:"status"`
-	Timestamp time.Time         `json:"timestamp"`
-	Version   string            `json:"version"`
-	Uptime    string            `json:"uptime"`
-	Checks    map[string]Check  `json:"checks,omitempty"`
+	Status    string           `json:"status"`
+	Timestamp time.Time        `json:"timestamp"`
+	Version   string           `json:"version"`
+	Uptime    string           `json:"uptime"`
+	Checks    map[string]Check `json:"checks,omitempty"`
 }
 
 // Check represents an individual health check

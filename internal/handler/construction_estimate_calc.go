@@ -39,7 +39,7 @@ type stageProgressWork struct {
 	Code         string  `json:"code"`
 	Name         string  `json:"name"`
 	UOM          string  `json:"uom"`
-	Quantity     float64 `json:"quantity"`      // resolved plan qty (imported/original/quantity)
+	Quantity     float64 `json:"quantity"` // resolved plan qty (imported/original/quantity)
 	DoneQuantity float64 `json:"done_quantity"`
 	TotalAmount  float64 `json:"total_amount"`
 	ProgressPct  float64 `json:"progress_pct"`
@@ -228,8 +228,9 @@ type forma2Summary struct {
 // grand total. Mirrors Form2Preview.jsx buildSummary().
 //
 // Query params:
-//   other_pct — "прочие" percentage (default 0)
-//   vat       — "true" to apply 12% VAT (default false)
+//
+//	other_pct — "прочие" percentage (default 0)
+//	vat       — "true" to apply 12% VAT (default false)
 //
 // Route: GET /construction/estimates/:id/forma2-summary
 func (h *Handler) GetEstimateForma2Summary(c *gin.Context) {

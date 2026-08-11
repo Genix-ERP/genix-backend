@@ -968,10 +968,10 @@ func (h *Handler) GetConstructionProjectDashboard(c *gin.Context) {
 			var createdAt time.Time
 			if err := activityRows.Scan(&actionType, &description, &createdAt, &userName); err == nil {
 				recentActivity = append(recentActivity, map[string]interface{}{
-					"type":     actionType,
-					"text":     description,
-					"user":     userName,
-					"date":     createdAt,
+					"type": actionType,
+					"text": description,
+					"user": userName,
+					"date": createdAt,
 				})
 			}
 		}
@@ -2099,7 +2099,6 @@ func (h *Handler) updateSmetaSectionTotals(sectionID int64) {
 	h.db.Exec(query, sectionID)
 }
 
-
 // Helper functions for extracting values from sql.Null* types
 func nullStringValue(ns sql.NullString) interface{} {
 	if ns.Valid {
@@ -2419,9 +2418,9 @@ func (h *Handler) CreateProjectVendor(c *gin.Context) {
 	}
 
 	response.Created(c, map[string]interface{}{
-		"id":         vendorRecordID,
-		"vendor_id":  vendorUUID,
-		"message":    "Vendor added to project successfully",
+		"id":        vendorRecordID,
+		"vendor_id": vendorUUID,
+		"message":   "Vendor added to project successfully",
 	})
 }
 
@@ -2842,27 +2841,27 @@ func (h *Handler) GetDailyReport(c *gin.Context) {
 	`
 
 	var report struct {
-		ID                 int64          `json:"id"`
-		TenantID           uuid.UUID      `json:"tenant_id"`
-		ProjectID          int64          `json:"project_id"`
-		ReportDate         time.Time      `json:"report_date"`
-		WeatherMorning     sql.NullString `json:"weather_morning"`
-		WeatherAfternoon   sql.NullString `json:"weather_afternoon"`
+		ID                 int64           `json:"id"`
+		TenantID           uuid.UUID       `json:"tenant_id"`
+		ProjectID          int64           `json:"project_id"`
+		ReportDate         time.Time       `json:"report_date"`
+		WeatherMorning     sql.NullString  `json:"weather_morning"`
+		WeatherAfternoon   sql.NullString  `json:"weather_afternoon"`
 		TemperatureMin     sql.NullFloat64 `json:"temperature_min"`
 		TemperatureMax     sql.NullFloat64 `json:"temperature_max"`
-		WorkSummary        sql.NullString `json:"work_summary"`
-		IssuesEncountered  sql.NullString `json:"issues_encountered"`
-		SafetyNotes        sql.NullString `json:"safety_notes"`
-		WorkersCount       sql.NullInt64  `json:"workers_count"`
-		WorkersDetails     sql.NullString `json:"workers_details"`
-		EquipmentUsed      sql.NullString `json:"equipment_used"`
-		MaterialsReceived  sql.NullString `json:"materials_received"`
-		VerificationStatus sql.NullString `json:"verification_status"`
-		VerifiedBy         sql.NullInt64  `json:"verified_by"`
-		VerifiedAt         sql.NullTime   `json:"verified_at"`
-		VerifierNotes      sql.NullString `json:"verifier_notes"`
-		CreatedDate        time.Time      `json:"created_date"`
-		UpdatedDate        time.Time      `json:"updated_date"`
+		WorkSummary        sql.NullString  `json:"work_summary"`
+		IssuesEncountered  sql.NullString  `json:"issues_encountered"`
+		SafetyNotes        sql.NullString  `json:"safety_notes"`
+		WorkersCount       sql.NullInt64   `json:"workers_count"`
+		WorkersDetails     sql.NullString  `json:"workers_details"`
+		EquipmentUsed      sql.NullString  `json:"equipment_used"`
+		MaterialsReceived  sql.NullString  `json:"materials_received"`
+		VerificationStatus sql.NullString  `json:"verification_status"`
+		VerifiedBy         sql.NullInt64   `json:"verified_by"`
+		VerifiedAt         sql.NullTime    `json:"verified_at"`
+		VerifierNotes      sql.NullString  `json:"verifier_notes"`
+		CreatedDate        time.Time       `json:"created_date"`
+		UpdatedDate        time.Time       `json:"updated_date"`
 	}
 
 	err = h.db.QueryRow(query, reportID, tenantID).Scan(
@@ -3387,10 +3386,10 @@ func (h *Handler) CreateMaterialRequest(c *gin.Context) {
 	}
 
 	response.Created(c, map[string]interface{}{
-		"id":                requestID,
-		"request_number":    requestNumber,
+		"id":                 requestID,
+		"request_number":     requestNumber,
 		"stock_operation_id": stockOpID,
-		"message":           "Material request created successfully",
+		"message":            "Material request created successfully",
 	})
 }
 
@@ -5230,10 +5229,10 @@ func (h *Handler) GetConstructionPortfolioDashboard(c *gin.Context) {
 	`, tenantID)
 
 	type ProjectBar struct {
-		ID      int64   `json:"id"`
-		Name    string  `json:"name"`
-		Budget  float64 `json:"budget"`
-		Actual  float64 `json:"actual"`
+		ID     int64   `json:"id"`
+		Name   string  `json:"name"`
+		Budget float64 `json:"budget"`
+		Actual float64 `json:"actual"`
 	}
 	perProject := []ProjectBar{}
 	if err == nil {
@@ -5826,19 +5825,20 @@ func (h *Handler) DeleteProjectFile(c *gin.Context) {
 //
 // What gets reset (vs. preserved)
 // -------------------------------
-//   Preserved on every line: name, uom, quantity, rates (material / labor /
-//     equipment), unit_rate, total_amount, code, item_number, resource_type,
-//     parent_item_number, parent_line_id (REMAPPED to the new line id),
-//     norm_rate, subline_seq, quantity_override, material_type,
-//     original_quantity, original_unit_rate, imported_quantity,
-//     imported_total, sort_order, is_manual, wbs_id.
 //
-//   Reset to defaults: actual_amount, done_quantity, approval_status,
-//     period_fakt, created_date, updated_date. The clone is a fresh build —
-//     FAKT progress on the source must not bleed into the target's
-//     dashboard, Form 2, or Reja vs Fakt summary. Matches the user's
-//     explicit decision to NOT clone FAKT data when this feature was
-//     scoped.
+//	Preserved on every line: name, uom, quantity, rates (material / labor /
+//	  equipment), unit_rate, total_amount, code, item_number, resource_type,
+//	  parent_item_number, parent_line_id (REMAPPED to the new line id),
+//	  norm_rate, subline_seq, quantity_override, material_type,
+//	  original_quantity, original_unit_rate, imported_quantity,
+//	  imported_total, sort_order, is_manual, wbs_id.
+//
+//	Reset to defaults: actual_amount, done_quantity, approval_status,
+//	  period_fakt, created_date, updated_date. The clone is a fresh build —
+//	  FAKT progress on the source must not bleed into the target's
+//	  dashboard, Form 2, or Reja vs Fakt summary. Matches the user's
+//	  explicit decision to NOT clone FAKT data when this feature was
+//	  scoped.
 //
 // What is NOT cloned
 // ------------------
@@ -5865,7 +5865,8 @@ func (h *Handler) DeleteProjectFile(c *gin.Context) {
 // drawings to the source, ready for the user to start work.
 //
 // 200: { new_building: { id, name, code, … }, estimates_created,
-//        lines_created, stages_created, files_created }
+//
+//	lines_created, stages_created, files_created }
 //
 // (The body parameter `source_building_id` and the old "fail if target
 // not empty" check from the previous implementation are no longer
@@ -6444,11 +6445,11 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 	`, projectID)
 
 	response.Success(c, gin.H{
-		"message":           "Building duplicated",
-		"estimates_created": estimatesCreated,
-		"lines_created":     linesCreated,
-		"stages_created":    stagesCreated,
-		"files_created":     filesCreated,
+		"message":            "Building duplicated",
+		"estimates_created":  estimatesCreated,
+		"lines_created":      linesCreated,
+		"stages_created":     stagesCreated,
+		"files_created":      filesCreated,
 		"source_building_id": sourceBuildingID,
 		"new_building": gin.H{
 			"id":   targetBuildingID,

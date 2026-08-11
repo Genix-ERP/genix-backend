@@ -516,10 +516,10 @@ func (h *Handler) CleanExpiredTenants(c *gin.Context) {
 		map[string]interface{}{"trial_expired": trialExpired, "sub_expired": subExpired, "deactivated": deactivated})
 
 	c.JSON(http.StatusOK, gin.H{
-		"success":        true,
-		"trial_expired":  trialExpired,
-		"sub_expired":    subExpired,
-		"deactivated":    deactivated,
+		"success":         true,
+		"trial_expired":   trialExpired,
+		"sub_expired":     subExpired,
+		"deactivated":     deactivated,
 		"tenants_deleted": deleted,
 	})
 }

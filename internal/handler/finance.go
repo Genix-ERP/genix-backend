@@ -9413,26 +9413,26 @@ type CreateBudgetInput struct {
 	WarningThreshold *float64 `json:"warning_threshold"`
 	// Wizard settings (migration 141 columns — were silently dropped before
 	// the 2026-08-10 Moliya v2 fix)
-	Approach             string  `json:"approach"`         // fixed, flexible, zero_based, rolling
-	Breakdown            string  `json:"breakdown"`        // monthly, weekly, none
-	OverspendPolicy      string  `json:"overspend_policy"` // warn, require_approval, block
-	RollingHorizonMonths *int    `json:"rolling_horizon_months"`
-	AutoExtend           *bool   `json:"auto_extend"`
-	ResponsibleUserID    *string `json:"responsible_user_id"`
-	DepartmentID         *string `json:"department_id"`
-	Category             *string `json:"category"`
-	Lines            []CreateBudgetLineInput `json:"lines"`
+	Approach             string                  `json:"approach"`         // fixed, flexible, zero_based, rolling
+	Breakdown            string                  `json:"breakdown"`        // monthly, weekly, none
+	OverspendPolicy      string                  `json:"overspend_policy"` // warn, require_approval, block
+	RollingHorizonMonths *int                    `json:"rolling_horizon_months"`
+	AutoExtend           *bool                   `json:"auto_extend"`
+	ResponsibleUserID    *string                 `json:"responsible_user_id"`
+	DepartmentID         *string                 `json:"department_id"`
+	Category             *string                 `json:"category"`
+	Lines                []CreateBudgetLineInput `json:"lines"`
 }
 
 type CreateBudgetLineInput struct {
-	BudgetID       string   `json:"budget_id" binding:"required"`
-	AccountID      string   `json:"account_id" binding:"required"`
-	FiscalPeriodID *string  `json:"fiscal_period_id"`
-	DepartmentID   *string  `json:"department_id"`
-	BudgetedAmount float64  `json:"budgeted_amount"`
-	PlannedAmount  float64  `json:"planned_amount"` // alias from frontend
-	ActualAmount   float64  `json:"actual_amount"`
-	Notes          *string  `json:"notes"`
+	BudgetID       string  `json:"budget_id" binding:"required"`
+	AccountID      string  `json:"account_id" binding:"required"`
+	FiscalPeriodID *string `json:"fiscal_period_id"`
+	DepartmentID   *string `json:"department_id"`
+	BudgetedAmount float64 `json:"budgeted_amount"`
+	PlannedAmount  float64 `json:"planned_amount"` // alias from frontend
+	ActualAmount   float64 `json:"actual_amount"`
+	Notes          *string `json:"notes"`
 	// Migration 141 line fields the wizard sends (were silently dropped
 	// before the 2026-08-10 Moliya v2 fix)
 	LineType      string   `json:"line_type"` // revenue, expense, investment
@@ -11981,12 +11981,12 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 
 	// Get budget details
 	var budget struct {
-		ID        string  `json:"id"`
-		Name      string  `json:"name"`
-		StartDate string  `json:"start_date"`
-		EndDate   string  `json:"end_date"`
-		Type      string  `json:"type"`
-		Status    string  `json:"status"`
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		StartDate string `json:"start_date"`
+		EndDate   string `json:"end_date"`
+		Type      string `json:"type"`
+		Status    string `json:"status"`
 	}
 	h.db.QueryRow(`
 		SELECT b.id::text, b.name,

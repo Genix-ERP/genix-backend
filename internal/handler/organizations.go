@@ -35,15 +35,15 @@ type Organization struct {
 	CreatedAt          time.Time              `json:"created_at"`
 	UpdatedAt          time.Time              `json:"updated_at"`
 	// Extended fields for Uzbekistan business requirements
-	OKED                  *string `json:"oked,omitempty"`
-	BankAccount           *string `json:"bank_account,omitempty"`
-	BankMFO               *string `json:"bank_mfo,omitempty"`
-	BankName              *string `json:"bank_name,omitempty"`
-	IsVATPayer            bool    `json:"is_vat_payer"`
-	TaxRegime             *string `json:"tax_regime,omitempty"`
-	ActivityStatus        *string `json:"activity_status,omitempty"`
-	BusinessGroup         *string `json:"business_group,omitempty"`
-	IntercompanyRelations *string `json:"intercompany_relations,omitempty"`
+	OKED                  *string  `json:"oked,omitempty"`
+	BankAccount           *string  `json:"bank_account,omitempty"`
+	BankMFO               *string  `json:"bank_mfo,omitempty"`
+	BankName              *string  `json:"bank_name,omitempty"`
+	IsVATPayer            bool     `json:"is_vat_payer"`
+	TaxRegime             *string  `json:"tax_regime,omitempty"`
+	ActivityStatus        *string  `json:"activity_status,omitempty"`
+	BusinessGroup         *string  `json:"business_group,omitempty"`
+	IntercompanyRelations *string  `json:"intercompany_relations,omitempty"`
 	DirectorName          *string  `json:"director_name,omitempty"`
 	DirectorPhone         *string  `json:"director_phone,omitempty"`
 	LegalAddress          *string  `json:"legal_address,omitempty"`
@@ -897,7 +897,7 @@ func (h *Handler) InitializeOrganizationAccounts(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"message": "Default chart of accounts and journals created successfully",
+		"message":         "Default chart of accounts and journals created successfully",
 		"organization_id": orgID,
 	})
 }
@@ -1432,9 +1432,9 @@ func (h *Handler) createDefaultPaymentMethods(tenantID, orgID uuid.UUID) {
 	now := time.Now()
 
 	defaultPMs := []struct {
-		code    string
-		name    string
-		pmType  string
+		code   string
+		name   string
+		pmType string
 	}{
 		{"CASH", "Cash", "cash"},
 		{"BANK", "Bank Transfer", "bank_transfer"},
@@ -1525,6 +1525,7 @@ func (h *Handler) createDefaultPaymentMethods(tenantID, orgID uuid.UUID) {
 // When creating Company B and selecting Company A:
 //   - A becomes a vendor (supplier) in B
 //   - B becomes a customer (client) in A
+//
 // intercompanyOrgInfo holds organization fields needed for creating intercompany contacts
 type intercompanyOrgInfo struct {
 	Name         string

@@ -93,14 +93,14 @@ func (h *Handler) GetTurnoverTax(c *gin.Context) {
 	taxAmount := round2(turnover * rate / 100)
 
 	response.Success(c, gin.H{
-		"period_type":   periodType,
-		"period_key":    periodKey,
-		"period_start":  start.Format("2006-01-02"),
-		"period_end":    end.Format("2006-01-02"),
-		"turnover":      round2(turnover),
-		"rate":          rate,
-		"tax_amount":    taxAmount,
-		"entry_count":   entryCount,
+		"period_type":     periodType,
+		"period_key":      periodKey,
+		"period_start":    start.Format("2006-01-02"),
+		"period_end":      end.Format("2006-01-02"),
+		"turnover":        round2(turnover),
+		"rate":            rate,
+		"tax_amount":      taxAmount,
+		"entry_count":     entryCount,
 		"regime_conflict": hasActiveVAT, // true = tenant has NDS active too; §5.2 violated
 	})
 }

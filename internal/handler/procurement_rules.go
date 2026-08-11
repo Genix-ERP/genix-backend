@@ -835,9 +835,9 @@ func (h *Handler) ApproveWorkflowStep(c *gin.Context) {
 	}
 
 	response.Success(c, gin.H{
-		"message":    "Step approved successfully",
-		"completed":  isComplete,
-		"next_step":  wf.CurrentStep + 1,
+		"message":     "Step approved successfully",
+		"completed":   isComplete,
+		"next_step":   wf.CurrentStep + 1,
 		"total_steps": wf.TotalSteps,
 	})
 }

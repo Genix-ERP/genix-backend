@@ -133,12 +133,12 @@ func (h *Handler) CreatePlatformTenant(c *gin.Context) {
 			"plan": in.PlanCode, "trial_days": in.TrialDays})
 
 	response.Created(c, gin.H{
-		"tenant_id":    tenantID,
-		"owner_id":     ownerID,
-		"status":       "trialing",
+		"tenant_id":     tenantID,
+		"owner_id":      ownerID,
+		"status":        "trialing",
 		"trial_ends_at": trialEnds,
-		"invite_token": inviteToken,
-		"invite_link":  "/accept-invite?token=" + inviteToken,
+		"invite_token":  inviteToken,
+		"invite_link":   "/accept-invite?token=" + inviteToken,
 	})
 }
 
@@ -211,17 +211,17 @@ func (h *Handler) ListPlatformPlans(c *gin.Context) {
 	}
 	defer rows.Close()
 	type Plan struct {
-		Code         string          `json:"code"`
-		DisplayName  string          `json:"display_name"`
-		PricePerUser int64           `json:"price_per_user_monthly"`
-		IncludedUsers int            `json:"included_users"`
-		MaxUsers     *int            `json:"max_users"`
-		AIQuota      *int            `json:"ai_quota"`
-		Features     json.RawMessage `json:"features"`
-		TrialDays    int             `json:"trial_days"`
-		GraceDays    int             `json:"grace_days"`
-		IsActive     bool            `json:"is_active"`
-		SortOrder    int             `json:"sort_order"`
+		Code          string          `json:"code"`
+		DisplayName   string          `json:"display_name"`
+		PricePerUser  int64           `json:"price_per_user_monthly"`
+		IncludedUsers int             `json:"included_users"`
+		MaxUsers      *int            `json:"max_users"`
+		AIQuota       *int            `json:"ai_quota"`
+		Features      json.RawMessage `json:"features"`
+		TrialDays     int             `json:"trial_days"`
+		GraceDays     int             `json:"grace_days"`
+		IsActive      bool            `json:"is_active"`
+		SortOrder     int             `json:"sort_order"`
 	}
 	var out []Plan
 	for rows.Next() {
@@ -252,14 +252,14 @@ func (h *Handler) ListPlatformPlans(c *gin.Context) {
 func (h *Handler) UpsertPlatformPlan(c *gin.Context) {
 	code := c.Param("code")
 	var in struct {
-		DisplayName  *string `json:"display_name"`
-		PricePerUser *int64  `json:"price_per_user_monthly"`
-		IncludedUsers *int   `json:"included_users"`
-		MaxUsers     *int    `json:"max_users"`
-		AIQuota      *int    `json:"ai_quota"`
-		TrialDays    *int    `json:"trial_days"`
-		GraceDays    *int    `json:"grace_days"`
-		IsActive     *bool   `json:"is_active"`
+		DisplayName   *string `json:"display_name"`
+		PricePerUser  *int64  `json:"price_per_user_monthly"`
+		IncludedUsers *int    `json:"included_users"`
+		MaxUsers      *int    `json:"max_users"`
+		AIQuota       *int    `json:"ai_quota"`
+		TrialDays     *int    `json:"trial_days"`
+		GraceDays     *int    `json:"grace_days"`
+		IsActive      *bool   `json:"is_active"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
 		response.BadRequest(c, "Invalid input")

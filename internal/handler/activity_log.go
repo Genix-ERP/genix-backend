@@ -16,21 +16,21 @@ import (
 // =====================================================
 
 type ActivityLog struct {
-	ID           int64             `json:"id" db:"id"`
-	TenantID     uuid.UUID         `json:"tenant_id" db:"tenant_id"`
-	ModelName    string            `json:"model_name" db:"model_name"`
-	RecordID     int64             `json:"record_id" db:"record_id"`
-	ActivityType string            `json:"activity_type" db:"activity_type"`
-	Title        string            `json:"title" db:"title"`
-	Description  string            `json:"description" db:"description"`
-	FieldChanges json.RawMessage   `json:"field_changes" db:"field_changes"`
-	OldStatus    string            `json:"old_status" db:"old_status"`
-	NewStatus    string            `json:"new_status" db:"new_status"`
-	UserID       *uuid.UUID        `json:"user_id" db:"user_id"`
-	UserName     string            `json:"user_name" db:"user_name"`
-	CreatedAt    time.Time         `json:"created_at" db:"created_at"`
-	RelatedModel string            `json:"related_model" db:"related_model"`
-	RelatedID    int64             `json:"related_id" db:"related_id"`
+	ID           int64           `json:"id" db:"id"`
+	TenantID     uuid.UUID       `json:"tenant_id" db:"tenant_id"`
+	ModelName    string          `json:"model_name" db:"model_name"`
+	RecordID     int64           `json:"record_id" db:"record_id"`
+	ActivityType string          `json:"activity_type" db:"activity_type"`
+	Title        string          `json:"title" db:"title"`
+	Description  string          `json:"description" db:"description"`
+	FieldChanges json.RawMessage `json:"field_changes" db:"field_changes"`
+	OldStatus    string          `json:"old_status" db:"old_status"`
+	NewStatus    string          `json:"new_status" db:"new_status"`
+	UserID       *uuid.UUID      `json:"user_id" db:"user_id"`
+	UserName     string          `json:"user_name" db:"user_name"`
+	CreatedAt    time.Time       `json:"created_at" db:"created_at"`
+	RelatedModel string          `json:"related_model" db:"related_model"`
+	RelatedID    int64           `json:"related_id" db:"related_id"`
 }
 
 type RecordComment struct {
@@ -266,9 +266,9 @@ func (h *Handler) CreateComment(c *gin.Context) {
 	}
 
 	var req struct {
-		Content   string   `json:"content" binding:"required"`
-		ParentID  *int64   `json:"parent_id"`
-		Mentions  []string `json:"mentions"`
+		Content  string   `json:"content" binding:"required"`
+		ParentID *int64   `json:"parent_id"`
+		Mentions []string `json:"mentions"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		h.log.Error("Invalid input", "error", err)

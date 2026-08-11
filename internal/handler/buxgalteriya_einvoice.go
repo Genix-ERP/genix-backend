@@ -27,27 +27,27 @@ import (
 
 // EInvoice is the API-facing shape.
 type EInvoice struct {
-	ID                uuid.UUID       `json:"id"`
-	Provider          string          `json:"provider"`
-	Direction         string          `json:"direction"`
-	ProviderDocID     *string         `json:"provider_doc_id,omitempty"`
-	FactureType       *string         `json:"facture_type,omitempty"`
-	DocumentNumber    *string         `json:"document_number,omitempty"`
-	DocumentDate      *string         `json:"document_date,omitempty"`
-	SellerTIN         *string         `json:"seller_tin,omitempty"`
-	SellerName        *string         `json:"seller_name,omitempty"`
-	BuyerTIN          *string         `json:"buyer_tin,omitempty"`
-	BuyerName         *string         `json:"buyer_name,omitempty"`
-	TotalAmount       float64         `json:"total_amount"`
-	TaxAmount         float64         `json:"tax_amount"`
-	TotalWithTax      float64         `json:"total_with_tax"`
-	Currency          string          `json:"currency"`
-	Status            string          `json:"status"`
-	LinkedContactID   *uuid.UUID      `json:"linked_contact_id,omitempty"`
-	LinkedJournalEntryID *uuid.UUID   `json:"linked_journal_entry_id,omitempty"`
-	ErrorMessage      *string         `json:"error_message,omitempty"`
-	Lines             []EInvoiceLine  `json:"lines,omitempty"`
-	CreatedAt         time.Time       `json:"created_at"`
+	ID                   uuid.UUID      `json:"id"`
+	Provider             string         `json:"provider"`
+	Direction            string         `json:"direction"`
+	ProviderDocID        *string        `json:"provider_doc_id,omitempty"`
+	FactureType          *string        `json:"facture_type,omitempty"`
+	DocumentNumber       *string        `json:"document_number,omitempty"`
+	DocumentDate         *string        `json:"document_date,omitempty"`
+	SellerTIN            *string        `json:"seller_tin,omitempty"`
+	SellerName           *string        `json:"seller_name,omitempty"`
+	BuyerTIN             *string        `json:"buyer_tin,omitempty"`
+	BuyerName            *string        `json:"buyer_name,omitempty"`
+	TotalAmount          float64        `json:"total_amount"`
+	TaxAmount            float64        `json:"tax_amount"`
+	TotalWithTax         float64        `json:"total_with_tax"`
+	Currency             string         `json:"currency"`
+	Status               string         `json:"status"`
+	LinkedContactID      *uuid.UUID     `json:"linked_contact_id,omitempty"`
+	LinkedJournalEntryID *uuid.UUID     `json:"linked_journal_entry_id,omitempty"`
+	ErrorMessage         *string        `json:"error_message,omitempty"`
+	Lines                []EInvoiceLine `json:"lines,omitempty"`
+	CreatedAt            time.Time      `json:"created_at"`
 }
 
 type EInvoiceLine struct {
@@ -65,18 +65,19 @@ type EInvoiceLine struct {
 // IngestEInvoice accepts a provider payload (already parsed XML→JSON) and
 // saves it to einvoices / einvoice_lines for buxgalter review.
 // Body:
-//   {
-//     "provider": "didox",
-//     "direction": "incoming",
-//     "provider_doc_id": "…",
-//     "document_number": "HF-12345",
-//     "document_date": "2026-04-01",
-//     "seller_tin": "302345678", "seller_name": "LLC Supplier",
-//     "buyer_tin":  "302999999", "buyer_name": "LLC Ours",
-//     "total_amount": 10000, "tax_amount": 1200, "total_with_tax": 11200,
-//     "currency": "UZS",
-//     "lines": [ { ... } ]
-//   }
+//
+//	{
+//	  "provider": "didox",
+//	  "direction": "incoming",
+//	  "provider_doc_id": "…",
+//	  "document_number": "HF-12345",
+//	  "document_date": "2026-04-01",
+//	  "seller_tin": "302345678", "seller_name": "LLC Supplier",
+//	  "buyer_tin":  "302999999", "buyer_name": "LLC Ours",
+//	  "total_amount": 10000, "tax_amount": 1200, "total_with_tax": 11200,
+//	  "currency": "UZS",
+//	  "lines": [ { ... } ]
+//	}
 func (h *Handler) IngestEInvoice(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -262,9 +263,9 @@ func (h *Handler) ApproveEInvoice(c *gin.Context) {
 	}
 
 	var body struct {
-		LinkedContactID          *string `json:"linked_contact_id"`
-		LinkedPurchaseInvoiceID  *string `json:"linked_purchase_invoice_id"`
-		LinkedSalesInvoiceID     *string `json:"linked_sales_invoice_id"`
+		LinkedContactID         *string `json:"linked_contact_id"`
+		LinkedPurchaseInvoiceID *string `json:"linked_purchase_invoice_id"`
+		LinkedSalesInvoiceID    *string `json:"linked_sales_invoice_id"`
 	}
 	_ = c.ShouldBindJSON(&body)
 

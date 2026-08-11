@@ -12,21 +12,21 @@ import (
 //
 // Returns a pivoted, ready-to-export view of a single payroll period:
 //
-//   {
-//     "period":      { id, code, name, start_date, end_date, status },
-//     "tax_columns": [ { code, name, rate, payer, base_type }, … ],
-//     "rows": [
-//       { entry_id, employee_name, position,
-//         base_salary, overtime_amount, bonus, allowances,
-//         fot (= gross_salary),
-//         total_employee_tax, total_employer_tax,
-//         netto, employer_cost,
-//         taxes: { NDFL: 2400000, PROFSOYUZ: 200000, … }
-//       }, …
-//     ],
-//     "totals": { fot, total_employee_tax, total_employer_tax, netto,
-//                 employer_cost, taxes: { NDFL: …, … } }
-//   }
+//	{
+//	  "period":      { id, code, name, start_date, end_date, status },
+//	  "tax_columns": [ { code, name, rate, payer, base_type }, … ],
+//	  "rows": [
+//	    { entry_id, employee_name, position,
+//	      base_salary, overtime_amount, bonus, allowances,
+//	      fot (= gross_salary),
+//	      total_employee_tax, total_employer_tax,
+//	      netto, employer_cost,
+//	      taxes: { NDFL: 2400000, PROFSOYUZ: 200000, … }
+//	    }, …
+//	  ],
+//	  "totals": { fot, total_employee_tax, total_employer_tax, netto,
+//	              employer_cost, taxes: { NDFL: …, … } }
+//	}
 //
 // Tax columns are discovered from whatever payroll_entry_taxes snapshots
 // actually exist for this period (one DISTINCT query), so the vedomost

@@ -521,4 +521,3 @@ func (h *Handler) ListTenderRegions(c *gin.Context) {
 
 	response.Success(c, regions)
 }
-

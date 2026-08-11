@@ -171,12 +171,12 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 	}
 
 	type Stage struct {
-		ID             int64      `json:"id"`
-		TenantID       string     `json:"tenant_id"`
-		ProjectID      int64      `json:"project_id"`
-		BuildingID     *int64     `json:"building_id"`
-		BuildingName   *string    `json:"building_name"`
-		Name           string     `json:"name"`
+		ID           int64   `json:"id"`
+		TenantID     string  `json:"tenant_id"`
+		ProjectID    int64   `json:"project_id"`
+		BuildingID   *int64  `json:"building_id"`
+		BuildingName *string `json:"building_name"`
+		Name         string  `json:"name"`
 		// SectionKey is the estimate-line parent_item_number this stage groups.
 		// Mobile uses it to map a Bosqichlar stage to its works. stage.name is
 		// set by SmetaImportModal to the section leaf the backend already matches
@@ -381,12 +381,12 @@ func (h *Handler) ListConstructionStages(c *gin.Context) {
 // project (all blocks' Единич estimates), not the single active block:
 //
 //   - blocks_count            COUNT of construction_buildings for the project
-//                             (no soft-delete column on that table).
+//     (no soft-delete column on that table).
 //   - works_count / budget /  derived from "work" estimate-lines in the project's
 //     block_readiness_percent edinich estimates. A work = a top-level row with no
-//                             resource_type (resource_type='' AND parent_line_id=0).
-//                             Scoping to edinich-only avoids double-counting the
-//                             same work across the Единич + ВОР sheets.
+//     resource_type (resource_type=” AND parent_line_id=0).
+//     Scoping to edinich-only avoids double-counting the
+//     same work across the Единич + ВОР sheets.
 //   - stages_count            distinct section path (parent_item_number) of works.
 //
 // Planned qty per work follows the web priority (imported → original → quantity).
@@ -482,7 +482,7 @@ func (h *Handler) GetConstructionStagesOverview(c *gin.Context) {
 // Bosqichlar stage, paginated. GET /construction/stages/:id/works?page=&limit=
 //
 // A stage's works are estimate lines (construction_estimate_line) with no
-// resource_type and no parent (resource_type='' AND parent_line_id=0) in the
+// resource_type and no parent (resource_type=” AND parent_line_id=0) in the
 // project's edinich estimates, whose section leaf matches the stage name. The
 // leaf strips a "СЕКЦИЯ №N ›" prefix exactly like the web StagesTabV2 and the
 // reja-fakt handler, so this is robust regardless of whether parent_item_number
@@ -1280,20 +1280,20 @@ func (h *Handler) GetProjectInProgressItems(c *gin.Context) {
 	defer rows.Close()
 
 	type Item struct {
-		Source       string   `json:"source"`
-		ID           int64    `json:"id"`
-		ParentID     *int64   `json:"parent_id"`
-		ParentName   *string  `json:"parent_name"`
-		Name         string   `json:"name"`
-		Status       string   `json:"status"`
-		PlannedStart *string  `json:"planned_start"`
-		PlannedEnd   *string  `json:"planned_end"`
-		ActualStart  *string  `json:"actual_start"`
-		ActualEnd    *string  `json:"actual_end"`
-		BuildingName *string  `json:"building_name"`
-		BuildingID   *int64   `json:"building_id"`
-		ProgressPct  float64  `json:"progress_pct"`
-		Bucket       string   `json:"bucket"` // on_track | behind
+		Source       string  `json:"source"`
+		ID           int64   `json:"id"`
+		ParentID     *int64  `json:"parent_id"`
+		ParentName   *string `json:"parent_name"`
+		Name         string  `json:"name"`
+		Status       string  `json:"status"`
+		PlannedStart *string `json:"planned_start"`
+		PlannedEnd   *string `json:"planned_end"`
+		ActualStart  *string `json:"actual_start"`
+		ActualEnd    *string `json:"actual_end"`
+		BuildingName *string `json:"building_name"`
+		BuildingID   *int64  `json:"building_id"`
+		ProgressPct  float64 `json:"progress_pct"`
+		Bucket       string  `json:"bucket"` // on_track | behind
 	}
 
 	now := time.Now()
