@@ -1811,6 +1811,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 		// Subscription / lifecycle.
 		admin.PUT("/tenants/:id/activate", middleware.RequireCapability(middleware.CapSubscription), h.ActivateTenantSubscription)
+		// Cash / bank transfer. Records the money AND extends the period in one
+		// transaction — see subscription_manual_payment.go.
+		admin.POST("/tenants/:id/payments", middleware.RequireCapability(middleware.CapSubscription), h.RecordManualSubscriptionPayment)
 		admin.PUT("/tenants/:id/status", middleware.RequireCapability(middleware.CapCompanyBlock), h.SetTenantStatus)
 		admin.POST("/clean-expired-tenants", middleware.RequireCapability(middleware.CapSubscription), h.CleanExpiredTenants)
 
