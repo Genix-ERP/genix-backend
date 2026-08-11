@@ -66,15 +66,15 @@ func (h *Handler) ListSuppliers(c *gin.Context) {
 
 	switch ordering {
 	case "rating":
-		query += " ORDER BY cp.rating ASC"
+		query += " ORDER BY cp.rating ASC, cp.id ASC"
 	case "-rating":
-		query += " ORDER BY cp.rating DESC"
+		query += " ORDER BY cp.rating DESC, cp.id ASC"
 	case "name":
-		query += " ORDER BY cp.company_name ASC"
+		query += " ORDER BY cp.company_name ASC, cp.id ASC"
 	case "won_count":
-		query += " ORDER BY cp.won_count DESC"
+		query += " ORDER BY cp.won_count DESC, cp.id ASC"
 	default:
-		query += " ORDER BY cp.rating DESC"
+		query += " ORDER BY cp.rating DESC, cp.id ASC"
 	}
 
 	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", qIdx, qIdx+1)
@@ -433,13 +433,15 @@ func (h *Handler) AddSupplierReview(c *gin.Context) {
 	}
 
 	// Update supplier's average rating
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE tender_company_profiles SET
 			rating = (SELECT COALESCE(AVG(overall_rating), 0) FROM tender_reviews WHERE supplier_id = $1 AND is_visible = true),
 			review_count = (SELECT COUNT(*) FROM tender_reviews WHERE supplier_id = $1 AND is_visible = true),
 			updated_at = NOW()
 		WHERE user_id = $1
-	`, supplierID)
+	`, supplierID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE tender_company_profiles", "error", execErr)
+	}
 
 	response.Created(c, map[string]interface{}{"id": reviewID})
 }
@@ -521,4 +523,3 @@ func (h *Handler) ListTenderRegions(c *gin.Context) {
 
 	response.Success(c, regions)
 }
-

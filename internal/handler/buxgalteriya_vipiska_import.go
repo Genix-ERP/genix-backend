@@ -333,7 +333,7 @@ func (h *Handler) GetBankVipiskaTransactions(c *gin.Context) {
 		       COALESCE(c.name,'')
 		FROM bank_statement_transactions t
 		LEFT JOIN contacts c ON c.id = t.matched_contact_id
-		WHERE t.import_id=$1 ORDER BY t.line_number ASC`
+		WHERE t.import_id=$1 ORDER BY t.line_number ASC, t.id ASC`
 	args := []interface{}{importID}
 	paginate, page, pageSize, offset := optPagination(c)
 	if paginate {

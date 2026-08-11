@@ -91,7 +91,7 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 		}
 	}
 
-	query += whereExtra + " ORDER BY a.created_date DESC"
+	query += whereExtra + " ORDER BY a.created_date DESC, a.id ASC"
 	if paginate {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
 		args = append(args, pageSize, offset)
@@ -149,44 +149,44 @@ func (h *Handler) ListConstructionActs(c *gin.Context) {
 		}
 
 		item := map[string]interface{}{
-			"id":                     id,
-			"name":                   name,
-			"act_type":               actTypeVal,
-			"project_id":             projectIDVal,
-			"subcontract_id":         nullInt64Val(subcontractID),
-			"subcontract_name":       subcontractName,
-			"building_id":            nullInt64Val(buildingID),
-			"building_name":          buildingName,
-			"building_code":          buildingCode,
-			"period_from":            nullTimeVal(periodFrom),
-			"period_to":              nullTimeVal(periodTo),
-			"amount_total":           amountTotal,
-			"currency":               currency,
-			"state":                  stateVal,
-			"approved_by":            nullUUIDVal(approvedBy),
-			"approved_name":          approvedName,
-			"approved_date":          nullTimeVal(approvedDate),
-			"rejection_reason":       nullStringVal(rejectionReason),
-			"ks2_source_id":          nullInt64Val(ks2SourceID),
-			"notes":                  nullStringVal(notes),
-			"created_by":             nullUUIDVal(createdBy),
-			"created_name":           createdName,
-			"created_date":           createdDate,
-			"updated_date":           updatedDate,
-			"act_number":             nullInt64Val(actNumber),
-			"vat_pct":                nullFloat64Val(vatPct),
-			"vat_amount":             nullFloat64Val(vatAmount),
-			"amount_total_with_vat":  nullFloat64Val(amountTotalWithVat),
-			"signed_contractor_at":   nullTimeVal(signedContractorAt),
-			"signed_client_at":       nullTimeVal(signedClientAt),
-			"stage_id":               nullInt64Val(stageID),
-			"location_axes":          nullStringVal(locationAxes),
-			"works_start_date":       nullTimeVal(worksStartDate),
-			"works_end_date":         nullTimeVal(worksEndDate),
-			"signed_designer_at":     nullTimeVal(signedDesignerAt),
-			"signed_gasn_at":         nullTimeVal(signedGasnAt),
-			"cumul_from_start":       nullFloat64Val(cumulFromStart),
-			"cumul_from_year_start":  nullFloat64Val(cumulFromYearStart),
+			"id":                    id,
+			"name":                  name,
+			"act_type":              actTypeVal,
+			"project_id":            projectIDVal,
+			"subcontract_id":        nullInt64Val(subcontractID),
+			"subcontract_name":      subcontractName,
+			"building_id":           nullInt64Val(buildingID),
+			"building_name":         buildingName,
+			"building_code":         buildingCode,
+			"period_from":           nullTimeVal(periodFrom),
+			"period_to":             nullTimeVal(periodTo),
+			"amount_total":          amountTotal,
+			"currency":              currency,
+			"state":                 stateVal,
+			"approved_by":           nullUUIDVal(approvedBy),
+			"approved_name":         approvedName,
+			"approved_date":         nullTimeVal(approvedDate),
+			"rejection_reason":      nullStringVal(rejectionReason),
+			"ks2_source_id":         nullInt64Val(ks2SourceID),
+			"notes":                 nullStringVal(notes),
+			"created_by":            nullUUIDVal(createdBy),
+			"created_name":          createdName,
+			"created_date":          createdDate,
+			"updated_date":          updatedDate,
+			"act_number":            nullInt64Val(actNumber),
+			"vat_pct":               nullFloat64Val(vatPct),
+			"vat_amount":            nullFloat64Val(vatAmount),
+			"amount_total_with_vat": nullFloat64Val(amountTotalWithVat),
+			"signed_contractor_at":  nullTimeVal(signedContractorAt),
+			"signed_client_at":      nullTimeVal(signedClientAt),
+			"stage_id":              nullInt64Val(stageID),
+			"location_axes":         nullStringVal(locationAxes),
+			"works_start_date":      nullTimeVal(worksStartDate),
+			"works_end_date":        nullTimeVal(worksEndDate),
+			"signed_designer_at":    nullTimeVal(signedDesignerAt),
+			"signed_gasn_at":        nullTimeVal(signedGasnAt),
+			"cumul_from_start":      nullFloat64Val(cumulFromStart),
+			"cumul_from_year_start": nullFloat64Val(cumulFromYearStart),
 		}
 
 		items = append(items, item)
@@ -219,29 +219,29 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 	}
 
 	var req struct {
-		ActType          string  `json:"act_type" binding:"required"`
-		SubcontractID    int64   `json:"subcontract_id"`
-		PeriodFrom       string  `json:"period_from"`
-		PeriodTo         string  `json:"period_to"`
-		Notes            string  `json:"notes"`
-		VatPct           float64 `json:"vat_pct"`
+		ActType       string  `json:"act_type" binding:"required"`
+		SubcontractID int64   `json:"subcontract_id"`
+		PeriodFrom    string  `json:"period_from"`
+		PeriodTo      string  `json:"period_to"`
+		Notes         string  `json:"notes"`
+		VatPct        float64 `json:"vat_pct"`
 		// Forma 2 cost-split aggregates (optional — if omitted we derive from lines)
-		F2LaborTotal       float64 `json:"f2_labor_total"`
-		F2EquipmentTotal   float64 `json:"f2_equipment_total"`
-		F2MaterialsTotal   float64 `json:"f2_materials_total"`
-		F2CablesTotal      float64 `json:"f2_cables_total"`
-		F2TransportPct     float64 `json:"f2_transport_pct"`
-		F2OtherPct         float64 `json:"f2_other_pct"`
-		F2MaterialsReturn  float64 `json:"f2_materials_returned"`
-		PeriodMonthFrom    int     `json:"period_month_from"`
-		PeriodMonthTo      int     `json:"period_month_to"`
-		PeriodYear         int     `json:"period_year"`
+		F2LaborTotal      float64 `json:"f2_labor_total"`
+		F2EquipmentTotal  float64 `json:"f2_equipment_total"`
+		F2MaterialsTotal  float64 `json:"f2_materials_total"`
+		F2CablesTotal     float64 `json:"f2_cables_total"`
+		F2TransportPct    float64 `json:"f2_transport_pct"`
+		F2OtherPct        float64 `json:"f2_other_pct"`
+		F2MaterialsReturn float64 `json:"f2_materials_returned"`
+		PeriodMonthFrom   int     `json:"period_month_from"`
+		PeriodMonthTo     int     `json:"period_month_to"`
+		PeriodYear        int     `json:"period_year"`
 		// Forma 19 fields
-		StageID          int64   `json:"stage_id"`
-		LocationAxes     string  `json:"location_axes"`
-		DrawingReference string  `json:"drawing_reference"`
-		WorksStartDate   string  `json:"works_start_date"`
-		WorksEndDate     string  `json:"works_end_date"`
+		StageID          int64  `json:"stage_id"`
+		LocationAxes     string `json:"location_axes"`
+		DrawingReference string `json:"drawing_reference"`
+		WorksStartDate   string `json:"works_start_date"`
+		WorksEndDate     string `json:"works_end_date"`
 		Photos           []struct {
 			URL      string `json:"url"`
 			Filename string `json:"filename"`
@@ -251,14 +251,14 @@ func (h *Handler) CreateConstructionAct(c *gin.Context) {
 			CertificateURL string `json:"certificate_url"`
 		} `json:"materials_json"`
 		Lines []struct {
-			WBSID             int64   `json:"wbs_id"`
-			EstimateLineID    int64   `json:"estimate_line_id"`
-			Name              string  `json:"name"`
-			UOM               string  `json:"uom"`
-			Quantity          float64 `json:"quantity"`
-			QtySmeta          float64 `json:"qty_smeta"`
-			UnitRate          float64 `json:"unit_rate"`
-			Note              string  `json:"note"`
+			WBSID          int64   `json:"wbs_id"`
+			EstimateLineID int64   `json:"estimate_line_id"`
+			Name           string  `json:"name"`
+			UOM            string  `json:"uom"`
+			Quantity       float64 `json:"quantity"`
+			QtySmeta       float64 `json:"qty_smeta"`
+			UnitRate       float64 `json:"unit_rate"`
+			Note           string  `json:"note"`
 			// Forma 2 per-line hierarchy + cost split (all optional)
 			LineNumberDisplay string  `json:"line_number_display"`
 			IsSectionHeader   bool    `json:"is_section_header"`
@@ -842,7 +842,7 @@ func (h *Handler) AutoGenerateKS2(c *gin.Context) {
 
 	var req struct {
 		SubcontractID             int64  `json:"subcontract_id"`
-		BuildingID                int64  `json:"building_id"`            // 0 = all buildings (project-wide)
+		BuildingID                int64  `json:"building_id"` // 0 = all buildings (project-wide)
 		PeriodFrom                string `json:"period_from" binding:"required"`
 		PeriodTo                  string `json:"period_to" binding:"required"`
 		ClientName                string `json:"client_name"`
@@ -1438,7 +1438,9 @@ func (h *Handler) SignAct(c *gin.Context) {
 	}
 
 	if newState == "signed" {
-		h.db.Exec(`UPDATE construction_act SET state = 'signed', updated_date = NOW() WHERE id = $1`, actID)
+		if _, execErr := h.db.Exec(`UPDATE construction_act SET state = 'signed', updated_date = NOW() WHERE id = $1`, actID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_act", "error", execErr)
+		}
 	}
 
 	// Get act name for logging
@@ -2381,7 +2383,7 @@ func (h *Handler) recalculateForma3(tenantID uuid.UUID, projectID int64, subcont
 		}
 
 		vatAmt := periodAmt * 0.12
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE construction_act SET
 				amount_total = $1, vat_amount = $2, amount_total_with_vat = $3,
 				cumul_from_start = $4, cumul_from_year_start = $5,
@@ -2390,7 +2392,9 @@ func (h *Handler) recalculateForma3(tenantID uuid.UUID, projectID int64, subcont
 			WHERE id = $7
 		`, periodAmt, vatAmt, periodAmt+vatAmt,
 			cumulFromStart, cumulYear, cumulFromStart-periodAmt,
-			ks3ID)
+			ks3ID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_act", "error", execErr)
+		}
 	}
 }
 
@@ -2575,8 +2579,10 @@ func (h *Handler) UpdateActLine(c *gin.Context) {
 	h.db.QueryRow(`SELECT COALESCE(vat_pct, 12) FROM construction_act WHERE id = $1`, actID).Scan(&vatPct)
 	vatAmt := totalAmt * vatPct / 100
 	totalWithVat := totalAmt + vatAmt
-	h.db.Exec(`UPDATE construction_act SET amount_total = $1, vat_amount = $2, amount_total_with_vat = $3 WHERE id = $4`,
-		totalAmt, vatAmt, totalWithVat, actID)
+	if _, execErr := h.db.Exec(`UPDATE construction_act SET amount_total = $1, vat_amount = $2, amount_total_with_vat = $3 WHERE id = $4`,
+		totalAmt, vatAmt, totalWithVat, actID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE construction_act", "error", execErr)
+	}
 
 	response.Success(c, map[string]interface{}{"message": "Line updated"})
 }
@@ -2608,7 +2614,11 @@ func (h *Handler) DeleteConstructionAct(c *gin.Context) {
 		return
 	}
 
-	h.db.Exec(`DELETE FROM construction_act_line WHERE act_id = $1`, actID)
+	if _, execErr := h.db.Exec(`DELETE FROM construction_act_line WHERE act_id = $1`, actID); execErr != nil {
+
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE construction_act_line", "error", execErr)
+
+	}
 	_, err = h.db.Exec(`DELETE FROM construction_act WHERE id = $1 AND tenant_id = $2`, actID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete act", "error", err)

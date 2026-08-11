@@ -218,7 +218,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	}
 
 	// Add ordering and pagination
-	baseQuery += " ORDER BY p.name ASC"
+	baseQuery += " ORDER BY p.name ASC, p.id ASC"
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
@@ -1297,21 +1297,27 @@ func (h *Handler) UpdateProduct(c *gin.Context) {
 			}
 		}
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			DELETE FROM product_organization_settings
 			WHERE product_id = $1 AND tenant_id = $2
 			  AND organization_id <> ALL($3)
-		`, id, tenantID, pq.Array(orgIDsToKeep))
+		`, id, tenantID, pq.Array(orgIDsToKeep)); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE product_organization_settings", "error", execErr)
+
+		}
 
 		for _, parsedOrgID := range orgIDsToKeep {
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO product_organization_settings (
 					tenant_id, product_id, organization_id,
 					cost_price, list_price, min_price,
 					min_stock_level, reorder_point, reorder_quantity
 				) VALUES ($1, $2, $3, 0, 0, 0, 0, 0, 0)
 				ON CONFLICT (product_id, organization_id) DO NOTHING
-			`, tenantID, id, parsedOrgID)
+			`, tenantID, id, parsedOrgID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT product_organization_settings", "error", execErr)
+			}
 		}
 	}
 

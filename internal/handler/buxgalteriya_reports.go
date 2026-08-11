@@ -55,18 +55,18 @@ type trialBalanceRow struct {
 }
 
 type trialBalanceResp struct {
-	PeriodFrom            string            `json:"period_from"`
-	PeriodTo              string            `json:"period_to"`
-	Accounts              []trialBalanceRow `json:"accounts"`
-	TotalOpeningDebit     float64           `json:"total_opening_debit"`
-	TotalOpeningCredit    float64           `json:"total_opening_credit"`
-	TotalTurnoverDebit    float64           `json:"total_turnover_debit"`
-	TotalTurnoverCredit   float64           `json:"total_turnover_credit"`
-	TotalClosingDebit     float64           `json:"total_closing_debit"`
-	TotalClosingCredit    float64           `json:"total_closing_credit"`
-	TurnoverIsBalanced    bool              `json:"turnover_is_balanced"`
-	OpeningIsBalanced     bool              `json:"opening_is_balanced"`
-	ClosingIsBalanced     bool              `json:"closing_is_balanced"`
+	PeriodFrom          string            `json:"period_from"`
+	PeriodTo            string            `json:"period_to"`
+	Accounts            []trialBalanceRow `json:"accounts"`
+	TotalOpeningDebit   float64           `json:"total_opening_debit"`
+	TotalOpeningCredit  float64           `json:"total_opening_credit"`
+	TotalTurnoverDebit  float64           `json:"total_turnover_debit"`
+	TotalTurnoverCredit float64           `json:"total_turnover_credit"`
+	TotalClosingDebit   float64           `json:"total_closing_debit"`
+	TotalClosingCredit  float64           `json:"total_closing_credit"`
+	TurnoverIsBalanced  bool              `json:"turnover_is_balanced"`
+	OpeningIsBalanced   bool              `json:"opening_is_balanced"`
+	ClosingIsBalanced   bool              `json:"closing_is_balanced"`
 }
 
 // GetTrialBalanceWithTurnover returns the TT §6.1 structure.
@@ -430,10 +430,10 @@ func bxgRound2(v float64) float64 {
 // ---------------------------------------------------------------------------
 
 type monthlyTurnover struct {
-	Year          int     `json:"year"`
-	Month         int     `json:"month"`
-	Label         string  `json:"label"` // "2026-01"
-	DebitTurnover float64 `json:"debit_turnover"`
+	Year           int     `json:"year"`
+	Month          int     `json:"month"`
+	Label          string  `json:"label"` // "2026-01"
+	DebitTurnover  float64 `json:"debit_turnover"`
 	CreditTurnover float64 `json:"credit_turnover"`
 }
 

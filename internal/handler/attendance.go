@@ -105,7 +105,7 @@ func (h *Handler) ListAttendanceRecords(c *gin.Context) {
 	if sortOrder != "ASC" && sortOrder != "DESC" {
 		sortOrder = "DESC"
 	}
-	baseQuery += fmt.Sprintf(" ORDER BY %s %s", sortBy, sortOrder)
+	baseQuery += fmt.Sprintf(" ORDER BY %s %s, id ASC", sortBy, sortOrder)
 
 	// Add pagination
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
@@ -249,19 +249,19 @@ func (h *Handler) CreateAttendanceRecord(c *gin.Context) {
 	}
 
 	rec := &entity.AttendanceRecord{
-		ID:             id,
-		TenantID:       tenantID,
-		EmployeeID:     employeeID,
-		EmployeeName:   employeeName,
-		Department:     department,
-		Date:           date,
-		ClockIn:        clockIn,
-		ClockOut:       clockOut,
-		Status:         input.Status,
-		BreakDuration:  input.BreakDuration,
-		Notes:          notes,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		ID:            id,
+		TenantID:      tenantID,
+		EmployeeID:    employeeID,
+		EmployeeName:  employeeName,
+		Department:    department,
+		Date:          date,
+		ClockIn:       clockIn,
+		ClockOut:      clockOut,
+		Status:        input.Status,
+		BreakDuration: input.BreakDuration,
+		Notes:         notes,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 
 	response.Created(c, rec.ToResponse())

@@ -106,8 +106,12 @@ func (h *Handler) createDepreciationRun(tenantID, userID uuid.UUID, period strin
 			return uuid.Nil, "RUN_ALREADY_POSTED", "Bu davr uchun reglament allaqachon o'tkazilgan. Avval revers qiling."
 		}
 		if existingStatus == "draft" {
-			h.db.Exec(`DELETE FROM fa_depreciation_entries WHERE run_id=$1`, existingID)
-			h.db.Exec(`DELETE FROM fa_depreciation_runs WHERE id=$1`, existingID)
+			if _, execErr := h.db.Exec(`DELETE FROM fa_depreciation_entries WHERE run_id=$1`, existingID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "DELETE fa_depreciation_entries", "error", execErr)
+			}
+			if _, execErr := h.db.Exec(`DELETE FROM fa_depreciation_runs WHERE id=$1`, existingID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "DELETE fa_depreciation_runs", "error", execErr)
+			}
 		}
 	}
 
@@ -191,7 +195,9 @@ func (h *Handler) createDepreciationRun(tenantID, userID uuid.UUID, period strin
 	}
 
 	sb, _ := json.Marshal(skipped)
-	h.db.Exec(`UPDATE fa_depreciation_runs SET skipped=$1::jsonb WHERE id=$2`, string(sb), runID)
+	if _, execErr := h.db.Exec(`UPDATE fa_depreciation_runs SET skipped=$1::jsonb WHERE id=$2`, string(sb), runID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE fa_depreciation_runs", "error", execErr)
+	}
 	return runID, "", ""
 }
 
@@ -318,7 +324,9 @@ func (h *Handler) ExcludeFromRun(c *gin.Context) {
 	}
 	var inv string
 	h.db.QueryRow(`SELECT inventory_number FROM fa_assets WHERE id=$1 AND tenant_id=$2`, assetID, tenantID).Scan(&inv)
-	h.db.Exec(`DELETE FROM fa_depreciation_entries WHERE run_id=$1 AND asset_id=$2 AND tenant_id=$3 AND status='active'`, runID, assetID, tenantID)
+	if _, execErr := h.db.Exec(`DELETE FROM fa_depreciation_entries WHERE run_id=$1 AND asset_id=$2 AND tenant_id=$3 AND status='active'`, runID, assetID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE fa_depreciation_entries", "error", execErr)
+	}
 	// Append to skipped.
 	var skippedJSON string
 	h.db.QueryRow(`SELECT skipped::text FROM fa_depreciation_runs WHERE id=$1`, runID).Scan(&skippedJSON)
@@ -326,7 +334,9 @@ func (h *Handler) ExcludeFromRun(c *gin.Context) {
 	json.Unmarshal([]byte(skippedJSON), &skipped)
 	skipped = append(skipped, faSkip{assetID.String(), inv, "manual_exclude: " + in.Comment})
 	sb, _ := json.Marshal(skipped)
-	h.db.Exec(`UPDATE fa_depreciation_runs SET skipped=$1::jsonb WHERE id=$2`, string(sb), runID)
+	if _, execErr := h.db.Exec(`UPDATE fa_depreciation_runs SET skipped=$1::jsonb WHERE id=$2`, string(sb), runID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE fa_depreciation_runs", "error", execErr)
+	}
 	faOK(c, gin.H{"message": "Aktiv chiqarildi"})
 }
 

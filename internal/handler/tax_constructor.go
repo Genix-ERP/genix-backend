@@ -267,11 +267,13 @@ func (h *Handler) UpdateTaxSetting(c *gin.Context) {
 		return
 	}
 	// Best-effort audit trail (§2: each toggle → audit log).
-	h.db.Exec(`INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, new_values, created_at)
+	if _, execErr := h.db.Exec(`INSERT INTO audit_logs (id, tenant_id, user_id, action, entity_type, new_values, created_at)
 		VALUES ($1,$2,$3,$4,'tax_setting',$5::jsonb,now())`,
 		uuid.New(), tenantID, userID,
 		map[bool]string{true: "tax_enabled", false: "tax_disabled"}[in.Enabled],
-		fmt.Sprintf(`{"tax_code":%q,"enabled":%v,"valid_from":%q,"rate_variant":%q}`, in.TaxCode, in.Enabled, validFrom.Format("2006-01-02"), variant))
+		fmt.Sprintf(`{"tax_code":%q,"enabled":%v,"valid_from":%q,"rate_variant":%q}`, in.TaxCode, in.Enabled, validFrom.Format("2006-01-02"), variant)); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT audit_logs", "error", execErr)
+	}
 
 	response.Success(c, gin.H{"tax_code": in.TaxCode, "enabled": in.Enabled, "valid_from": validFrom.Format("2006-01-02"), "rate_variant": variant})
 }

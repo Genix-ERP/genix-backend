@@ -80,7 +80,7 @@ func (h *Handler) ListCargoShipments(c *gin.Context) {
 	}
 
 	// Add ordering and pagination
-	baseQuery += " ORDER BY created_date DESC"
+	baseQuery += " ORDER BY created_date DESC, id ASC"
 	pagination := entity.NewPagination(page, limit)
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", pagination.Limit, pagination.Offset())
 

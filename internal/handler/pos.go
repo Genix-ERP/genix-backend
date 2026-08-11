@@ -120,23 +120,23 @@ type POSOrder struct {
 }
 
 type POSOrderLine struct {
-	ID              uuid.UUID  `json:"id"`
-	OrderID         uuid.UUID  `json:"order_id"`
-	LineNumber      int        `json:"line_number"`
-	ProductID       uuid.UUID  `json:"product_id"`
-	ProductName     string     `json:"product_name"`
-	ProductCode     string     `json:"product_code,omitempty"`
-	Barcode         string     `json:"barcode,omitempty"`
-	Quantity        float64    `json:"quantity"`
-	UnitPrice       float64    `json:"unit_price"`
-	DiscountPercent float64    `json:"discount_percent"`
-	DiscountAmount  float64    `json:"discount_amount"`
-	TaxPercent      float64    `json:"tax_percent"`
-	TaxAmount       float64    `json:"tax_amount"`
-	LineTotal       float64    `json:"line_total"`
-	UnitCost        float64    `json:"unit_cost,omitempty"`
-	Notes           string     `json:"notes,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
+	ID              uuid.UUID `json:"id"`
+	OrderID         uuid.UUID `json:"order_id"`
+	LineNumber      int       `json:"line_number"`
+	ProductID       uuid.UUID `json:"product_id"`
+	ProductName     string    `json:"product_name"`
+	ProductCode     string    `json:"product_code,omitempty"`
+	Barcode         string    `json:"barcode,omitempty"`
+	Quantity        float64   `json:"quantity"`
+	UnitPrice       float64   `json:"unit_price"`
+	DiscountPercent float64   `json:"discount_percent"`
+	DiscountAmount  float64   `json:"discount_amount"`
+	TaxPercent      float64   `json:"tax_percent"`
+	TaxAmount       float64   `json:"tax_amount"`
+	LineTotal       float64   `json:"line_total"`
+	UnitCost        float64   `json:"unit_cost,omitempty"`
+	Notes           string    `json:"notes,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type POSPayment struct {
@@ -1227,22 +1227,22 @@ func (h *Handler) GetSessionSummary(c *gin.Context) {
 	sessionID := c.Param("id")
 
 	type SessionSummary struct {
-		SessionID          uuid.UUID `json:"session_id"`
-		SessionNumber      string    `json:"session_number"`
-		OpenedAt           time.Time `json:"opened_at"`
+		SessionID          uuid.UUID  `json:"session_id"`
+		SessionNumber      string     `json:"session_number"`
+		OpenedAt           time.Time  `json:"opened_at"`
 		ClosedAt           *time.Time `json:"closed_at,omitempty"`
-		Status             string    `json:"status"`
-		OpeningBalance     float64   `json:"opening_balance"`
-		TotalSales         float64   `json:"total_sales"`
-		TotalRefunds       float64   `json:"total_refunds"`
-		NetSales           float64   `json:"net_sales"`
-		TotalCashPayments  float64   `json:"total_cash_payments"`
-		TotalCardPayments  float64   `json:"total_card_payments"`
-		TotalOtherPayments float64   `json:"total_other_payments"`
-		OrderCount         int       `json:"order_count"`
-		ExpectedBalance    float64   `json:"expected_balance"`
-		ClosingBalance     *float64  `json:"closing_balance,omitempty"`
-		Difference         *float64  `json:"difference,omitempty"`
+		Status             string     `json:"status"`
+		OpeningBalance     float64    `json:"opening_balance"`
+		TotalSales         float64    `json:"total_sales"`
+		TotalRefunds       float64    `json:"total_refunds"`
+		NetSales           float64    `json:"net_sales"`
+		TotalCashPayments  float64    `json:"total_cash_payments"`
+		TotalCardPayments  float64    `json:"total_card_payments"`
+		TotalOtherPayments float64    `json:"total_other_payments"`
+		OrderCount         int        `json:"order_count"`
+		ExpectedBalance    float64    `json:"expected_balance"`
+		ClosingBalance     *float64   `json:"closing_balance,omitempty"`
+		Difference         *float64   `json:"difference,omitempty"`
 	}
 
 	query := `

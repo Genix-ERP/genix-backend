@@ -152,7 +152,7 @@ func (h *Handler) salesCreditCheck(tenantID uuid.UUID, orgID *uuid.UUID, custome
 		SELECT COALESCE(SUM(amount_due), 0)
 		FROM sales_invoices
 		WHERE tenant_id = $1 AND customer_id = $2 AND deleted_at IS NULL
-		  AND status IN ('sent', 'partial') AND amount_due > 0
+		  AND status NOT IN ('draft', 'cancelled', 'void') AND amount_due > 0
 		  AND ($3::uuid IS NULL OR organization_id = $3)`,
 		tenantID, customerID, orgArg,
 	).Scan(&res.Outstanding)
@@ -276,10 +276,12 @@ func (h *Handler) releaseSalesOrderReservation(tenantID uuid.UUID, orderID uuid.
 		if wh == nil || l.Qty <= 0 {
 			continue
 		}
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE inventory SET quantity_reserved = GREATEST(0, quantity_reserved - $1), updated_at = $2
 			WHERE tenant_id = $3 AND product_id = $4 AND warehouse_id = $5`,
-			l.Qty, now, tenantID, l.ProductID, *wh)
+			l.Qty, now, tenantID, l.ProductID, *wh); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE inventory", "error", execErr)
+		}
 	}
 }
 

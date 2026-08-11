@@ -457,15 +457,15 @@ func (h *Handler) renderForma19HTML(actID int64, tenantID uuid.UUID, projectName
 // standardises Forma 2 / 3 / 19; acceptance and defect acts are
 // project-specific, so we emit a neutral document with:
 //
-//   • Header titled per act type ("AKT QABUL QILISH" / "NUQSONLAR
+//   - Header titled per act type ("AKT QABUL QILISH" / "NUQSONLAR
 //     AKTI"), localized in Russian below.
-//   • Project info block (name, address, period).
-//   • Notes section (act.notes) — typically the acceptance criteria
+//   - Project info block (name, address, period).
+//   - Notes section (act.notes) — typically the acceptance criteria
 //     or the defect description the user entered.
-//   • Line items table (if any rows are linked) — uses the same
+//   - Line items table (if any rows are linked) — uses the same
 //     construction_act_line layout the other forms use.
-//   • Amount-total line.
-//   • Two-column signature block for contractor + client.
+//   - Amount-total line.
+//   - Two-column signature block for contractor + client.
 //
 // This keeps the user from hitting the "PDF eksport qo'llab-quvvatlanmaydi"
 // 400 they used to get for these types.
@@ -540,19 +540,19 @@ func (h *Handler) renderGenericActHTML(actID int64, tenantID uuid.UUID, actType,
 	if err == nil {
 		defer rows.Close()
 		lineRows := make([]struct {
-			name      string
-			uom       string
-			quantity  float64
-			unitRate  float64
-			totalAmt  float64
+			name     string
+			uom      string
+			quantity float64
+			unitRate float64
+			totalAmt float64
 		}, 0)
 		for rows.Next() {
 			var r struct {
-				name      string
-				uom       string
-				quantity  float64
-				unitRate  float64
-				totalAmt  float64
+				name     string
+				uom      string
+				quantity float64
+				unitRate float64
+				totalAmt float64
 			}
 			if scanErr := rows.Scan(&r.name, &r.uom, &r.quantity, &r.unitRate, &r.totalAmt); scanErr == nil {
 				lineRows = append(lineRows, r)

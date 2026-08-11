@@ -284,10 +284,12 @@ func (h *Handler) CreateMaterialReservation(c *gin.Context) {
 
 	// Update inventory quantity_reserved
 	if warehouseID != nil {
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE inventory SET quantity_reserved = quantity_reserved + $1, updated_at = $2
 			WHERE product_id = $3 AND warehouse_id = $4 AND tenant_id = $5
-		`, req.Quantity, now, productID, warehouseID, tenantID)
+		`, req.Quantity, now, productID, warehouseID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE inventory", "error", execErr)
+		}
 	}
 
 	// Notify inventory users that a material reservation is pending.
@@ -587,19 +589,23 @@ func (h *Handler) RejectMaterialReservation(c *gin.Context) {
 	now := time.Now()
 
 	// Update status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE material_reservations
 		SET status = 'rejected', approved_by = $1, updated_at = $2
 		WHERE id = $3
-	`, userID, now, resID)
+	`, userID, now, resID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE material_reservations", "error", execErr)
+	}
 
 	// Release reserved quantity
 	if warehouseID != nil {
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE inventory
 			SET quantity_reserved = GREATEST(quantity_reserved - $1, 0), updated_at = $2
 			WHERE product_id = $3 AND warehouse_id = $4 AND tenant_id = $5
-		`, quantity, now, productID, warehouseID, tenantID)
+		`, quantity, now, productID, warehouseID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE inventory", "error", execErr)
+		}
 	}
 
 	// Notify requester
@@ -647,15 +653,19 @@ func (h *Handler) DeleteMaterialReservation(c *gin.Context) {
 	}
 
 	now := time.Now()
-	h.db.Exec(`UPDATE material_reservations SET deleted_at = $1 WHERE id = $2`, now, resID)
+	if _, execErr := h.db.Exec(`UPDATE material_reservations SET deleted_at = $1 WHERE id = $2`, now, resID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE material_reservations", "error", execErr)
+	}
 
 	// Release reserved quantity if was pending
 	if status == "pending" && warehouseID != nil {
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE inventory
 			SET quantity_reserved = GREATEST(quantity_reserved - $1, 0), updated_at = $2
 			WHERE product_id = $3 AND warehouse_id = $4 AND tenant_id = $5
-		`, quantity, now, productID, warehouseID, tenantID)
+		`, quantity, now, productID, warehouseID, tenantID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE inventory", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Reservation deleted"})

@@ -119,7 +119,9 @@ func (h *Handler) ListDiscounts(c *gin.Context) {
 		if status == "active" && isExpired {
 			actualStatus = "expired"
 			// Update in database
-			h.db.Exec("UPDATE discounts SET status = 'expired', updated_at = $1 WHERE id = $2", now, id)
+			if _, execErr := h.db.Exec("UPDATE discounts SET status = 'expired', updated_at = $1 WHERE id = $2", now, id); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE discounts", "error", execErr)
+			}
 		}
 
 		discount := map[string]interface{}{
@@ -760,7 +762,9 @@ func (h *Handler) UseDiscountCode(c *gin.Context) {
 	}
 
 	// Increment used_count
-	h.db.Exec("UPDATE discounts SET used_count = used_count + 1, updated_at = $1 WHERE id = $2", now, discountID)
+	if _, execErr := h.db.Exec("UPDATE discounts SET used_count = used_count + 1, updated_at = $1 WHERE id = $2", now, discountID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE discounts", "error", execErr)
+	}
 
 	response.Success(c, map[string]string{"message": "Discount usage recorded"})
 }

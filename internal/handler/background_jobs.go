@@ -501,7 +501,6 @@ func checkReconciliationReminders(db *database.DB, log logger.Logger) {
 	}
 }
 
-
 // checkActivityReminders scans the `activities` table for any planned
 // activity whose reminder_datetime has passed and whose reminder_sent
 // flag is still false, then inserts an in-app notification for the
@@ -711,9 +710,9 @@ func checkContractExpiryNotifications(db *database.DB, log logger.Logger) {
 	var contracts []row
 	for rows.Next() {
 		var (
-			r          row
-			userID     *uuid.UUID
-			createdBy  *uuid.UUID
+			r         row
+			userID    *uuid.UUID
+			createdBy *uuid.UUID
 		)
 		if err := rows.Scan(&r.id, &r.tenantID, &r.contractNumber, &r.title, &r.endDate, &r.daysLeft, &userID, &createdBy); err != nil {
 			continue

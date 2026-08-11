@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -180,11 +181,13 @@ func (h *Handler) ensureDefaultLandedCostTypes(tenantID uuid.UUID) {
 
 	for _, dt := range defaultTypes {
 		id := uuid.New()
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO landed_cost_types (id, tenant_id, name, code, description, default_allocation_method, is_active, created_at, updated_at)
 			VALUES ($1, $2, $3, $4, $5, $6, true, $7, $7)`,
 			id, tenantID, dt.Name, dt.Code, dt.Description, dt.Method, now,
-		)
+		); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT landed_cost_types", "error", execErr)
+		}
 	}
 }
 
@@ -509,7 +512,7 @@ func (h *Handler) CreateLandedCost(c *gin.Context) {
 			currency = lineInput.Currency
 		}
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO landed_cost_lines (
 				id, landed_cost_id, line_number, cost_type_id, cost_type_name,
 				vendor_id, vendor_name, amount, currency, reference,
@@ -518,7 +521,11 @@ func (h *Handler) CreateLandedCost(c *gin.Context) {
 			lineID, id, i+1, costTypeID, lineInput.CostTypeName,
 			vendorID, lineInput.VendorName, lineInput.Amount, currency, lineInput.Reference,
 			lineInput.AllocationMethod, lineInput.Notes, now,
-		)
+		); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT landed_cost_lines", "error", execErr)
+
+		}
 	}
 
 	// Calculate and create allocations
@@ -1084,7 +1091,28 @@ func (h *Handler) calculateLandedCostAllocations(lcID, grID uuid.UUID, defaultMe
 			continue
 		}
 
-		// Calculate allocation for each GR line
+		// The allocated parts must add back up to `amount`.
+		//
+		// Each part is amount * share (or amount / n), stored in a column with
+		// 4 decimal places. Rounding each part on its own leaves a remainder:
+		// 1 080 000 split equally 7 ways is 154 285.7142857..., stored as
+		// 154 285.7143, and seven of those come to 1 080 000.0001. The cost
+		// carried on the receipt then no longer equals the cost that was
+		// charged for it — a small, permanent discrepancy that surfaces only
+		// when someone reconciles inventory against the ledger.
+		//
+		// So every part is rounded first, then the leftover is put on the
+		// largest part. Largest-remainder because it distorts that line least
+		// in relative terms and because it is deterministic — the same input
+		// always produces the same split.
+		type allocation struct {
+			line    grLineData
+			base    float64
+			percent float64
+			amount  float64
+		}
+		allocs := make([]allocation, 0, len(lines))
+
 		for _, grLine := range lines {
 			var allocBase, allocPercent, allocAmount float64
 
@@ -1114,14 +1142,39 @@ func (h *Handler) calculateLandedCostAllocations(lcID, grID uuid.UUID, defaultMe
 				}
 			}
 
+			allocs = append(allocs, allocation{
+				line:    grLine,
+				base:    allocBase,
+				percent: allocPercent,
+				amount:  roundLandedCost(allocAmount),
+			})
+		}
+
+		// Put the rounding remainder on the largest part.
+		if len(allocs) > 0 {
+			var sum float64
+			largest := 0
+			for i, a := range allocs {
+				sum += a.amount
+				if a.amount > allocs[largest].amount {
+					largest = i
+				}
+			}
+			if diff := roundLandedCost(amount - sum); diff != 0 {
+				allocs[largest].amount = roundLandedCost(allocs[largest].amount + diff)
+			}
+		}
+
+		for _, a := range allocs {
+			grLine := a.line
 			newUnitCost := grLine.UnitPrice
 			if grLine.Quantity > 0 {
-				newUnitCost = (grLine.TotalValue + allocAmount) / grLine.Quantity
+				newUnitCost = (grLine.TotalValue + a.amount) / grLine.Quantity
 			}
-			newTotalCost := grLine.TotalValue + allocAmount
+			newTotalCost := grLine.TotalValue + a.amount
 
 			allocID := uuid.New()
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO landed_cost_allocations (
 					id, landed_cost_id, landed_cost_line_id, goods_receipt_line_id,
 					product_id, product_name, quantity, original_unit_cost, original_total_cost,
@@ -1130,11 +1183,24 @@ func (h *Handler) calculateLandedCostAllocations(lcID, grID uuid.UUID, defaultMe
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
 				allocID, lcID, lcLineID, grLine.ID,
 				grLine.ProductID, grLine.ProductName, grLine.Quantity, grLine.UnitPrice, grLine.TotalValue,
-				allocBase, allocPercent, allocAmount,
+				a.base, a.percent, a.amount,
 				newUnitCost, newTotalCost, now,
-			)
+			); execErr != nil {
+				// Was discarded entirely. A dropped allocation row means the
+				// receipt silently keeps its pre-landed-cost valuation.
+				h.log.Error("Failed to insert landed cost allocation",
+					"error", execErr, "landed_cost_id", lcID, "gr_line_id", grLine.ID)
+			}
 		}
 	}
+}
+
+// roundLandedCost rounds to the 4 decimal places landed_cost_allocations
+// stores (DECIMAL(20,4)), half away from zero. Rounding in Go to the column's
+// own scale is what makes the reconciliation above meaningful: without it the
+// parts are reconciled at one precision and stored at another.
+func roundLandedCost(v float64) float64 {
+	return math.Round(v*10000) / 10000
 }
 
 // GetGRForLandedCost returns GR data for creating landed cost
@@ -1213,10 +1279,10 @@ func (h *Handler) GetGRForLandedCost(c *gin.Context) {
 		LIMIT 1`, id, tenantID).Scan(&existingLC)
 
 	result := map[string]interface{}{
-		"goods_receipt":      gr,
-		"lines":              lines,
-		"has_landed_cost":    existingLC.Valid,
-		"existing_lc_id":     existingLC.String,
+		"goods_receipt":   gr,
+		"lines":           lines,
+		"has_landed_cost": existingLC.Valid,
+		"existing_lc_id":  existingLC.String,
 	}
 
 	response.Success(c, result)

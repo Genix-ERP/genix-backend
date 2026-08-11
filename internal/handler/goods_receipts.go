@@ -370,18 +370,24 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 			unit = "pcs"
 		}
 
-		h.db.Exec(lineQuery,
+		if _, execErr := h.db.Exec(lineQuery,
 			lineID, grID, poLineID, productID, lineInput.ProductName,
 			lineInput.ProductCode, lineInput.OrderedQuantity, lineInput.ReceivedQuantity, unit, lineInput.UnitPrice,
 			QualityStatusPending, lineInput.BatchNumber, expiryDate, lineInput.SerialNumbers,
 			lineInput.StorageLocation, lineInput.Notes, now, now,
-		)
+		); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
+
+		}
 
 		totalQty += lineInput.ReceivedQuantity
 	}
 
 	// Update total quantity
-	h.db.Exec("UPDATE goods_receipts SET total_quantity = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", totalQty, now, grID, tenantID)
+	if _, execErr := h.db.Exec("UPDATE goods_receipts SET total_quantity = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", totalQty, now, grID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE goods_receipts", "error", execErr)
+	}
 
 	// Return created receipt
 	grResponse := map[string]interface{}{
@@ -708,12 +714,16 @@ func (h *Handler) InspectGoodsReceipt(c *gin.Context) {
 			allFailed = false
 		}
 
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			UPDATE goods_receipt_lines
 			SET accepted_quantity = $1, rejected_quantity = $2, quality_status = $3, rejection_reason = $4, updated_at = $5
 			WHERE id = $6`,
 			lineInspection.AcceptedQuantity, lineInspection.RejectedQuantity, lineQualityStatus, lineInspection.RejectionReason, now, lineID,
-		)
+		); execErr != nil {
+
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE goods_receipt_lines", "error", execErr)
+
+		}
 
 		totalAccepted += lineInspection.AcceptedQuantity
 		totalRejected += lineInspection.RejectedQuantity
@@ -728,7 +738,7 @@ func (h *Handler) InspectGoodsReceipt(c *gin.Context) {
 	}
 
 	// Update receipt - set status to "inspecting" (ready to be completed)
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE goods_receipts
 		SET status = $1, quality_status = $2, inspected_by = $3, inspected_at = $4,
 			inspection_notes = $5, accepted_quantity = $6, rejected_quantity = $7, updated_at = $8
@@ -736,7 +746,9 @@ func (h *Handler) InspectGoodsReceipt(c *gin.Context) {
 		GRStatusInspecting, overallQuality, input.InspectedBy, now,
 		input.InspectionNotes, totalAccepted, totalRejected, now,
 		grID, tenantID,
-	)
+	); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE goods_receipts", "error", execErr)
+	}
 
 	h.GetGoodsReceipt(c)
 }
@@ -802,7 +814,7 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 
 			// Update PO line received quantity (lines have no tenant_id —
 			// scope through the parent PO)
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				UPDATE purchase_order_lines pol
 				SET quantity_received = COALESCE(quantity_received, 0) + $1, updated_at = $2
 				WHERE pol.id = $3 AND EXISTS (
@@ -810,7 +822,9 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 					WHERE po.id = pol.purchase_order_id AND po.tenant_id = $4
 				)`,
 				acceptedQty, now, poLineID, tenantID,
-			)
+			); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_order_lines", "error", execErr)
+			}
 		}
 	}
 
@@ -841,7 +855,9 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 	if allReceived {
 		newPOStatus = "received"
 	}
-	h.db.Exec("UPDATE purchase_orders SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", newPOStatus, now, purchaseOrderID, tenantID)
+	if _, execErr := h.db.Exec("UPDATE purchase_orders SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", newPOStatus, now, purchaseOrderID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_orders", "error", execErr)
+	}
 
 	// ============================================
 	// UPDATE INVENTORY FROM GOODS RECEIPT

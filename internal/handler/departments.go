@@ -66,7 +66,7 @@ func (h *Handler) ListDepartments(c *gin.Context) {
 	query := `
 		SELECT id, tenant_id, organization_id, parent_id, code, name,
 		       manager_id, cost_center, is_active, created_at, updated_at
-		FROM departments` + where + " ORDER BY name ASC"
+		FROM departments` + where + " ORDER BY name ASC, id ASC"
 
 	// Opt-in paging: the web org chart still asks for the whole tree (no page
 	// params) and is unchanged; clients that do send page/limit stop pulling

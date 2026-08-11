@@ -65,7 +65,7 @@ func (h *Handler) ListForma19(c *gin.Context) {
 		}
 	}
 
-	query += whereExtra + " ORDER BY a.created_date DESC"
+	query += whereExtra + " ORDER BY a.created_date DESC, a.id ASC"
 	if paginate {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
 		args = append(args, pageSize, offset)
@@ -810,20 +810,32 @@ func (h *Handler) ApproveForma19(c *gin.Context) {
 			}
 
 			// Dt 2930 Construction expense
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
 				VALUES ($1, $2, 1, $3, $4, $5, 0, 1.0, $6)`,
-				uuid.New(), journalEntryID, debitAccountID, description, amount, now)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, debitAccountID)
+				uuid.New(), journalEntryID, debitAccountID, description, amount, now); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT journal_entry_lines", "error", execErr)
+			}
+			if _, execErr := h.db.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, debitAccountID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE accounts", "error", execErr)
+			}
 
 			// Kt 1310 Raw materials
-			h.db.Exec(`
+			if _, execErr := h.db.Exec(`
 				INSERT INTO journal_entry_lines (id, journal_entry_id, line_number, account_id, description, debit_amount, credit_amount, exchange_rate, created_at)
 				VALUES ($1, $2, 2, $3, $4, 0, $5, 1.0, $6)`,
-				uuid.New(), journalEntryID, creditAccountID, description, amount, now)
-			h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, creditAccountID)
+				uuid.New(), journalEntryID, creditAccountID, description, amount, now); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT journal_entry_lines", "error", execErr)
+			}
+			if _, execErr := h.db.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, creditAccountID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE accounts", "error", execErr)
+			}
 
-			h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID)
+			if _, execErr := h.db.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); execErr != nil {
+
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE journals", "error", execErr)
+
+			}
 			nextNumber++
 		}
 

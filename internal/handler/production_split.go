@@ -237,18 +237,20 @@ func (h *Handler) CompleteSplitOutput(c *gin.Context) {
 	}
 
 	// Mark production order as completed
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE production_orders
 		SET status = 'completed', current_stage = 'done', progress_percent = 100,
 		    actual_cost = $1, material_cost = $1, updated_at = $2
 		WHERE id = $3 AND tenant_id = $4
-	`, totalFinishedCost, now, poID, tenantID)
+	`, totalFinishedCost, now, poID, tenantID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE production_orders", "error", execErr)
+	}
 
 	response.Success(c, gin.H{
-		"message":      "Split output completed",
-		"outputs":      outputs,
-		"total_cost":   totalFinishedCost,
-		"cost_per_kg":  costPerKg,
+		"message":     "Split output completed",
+		"outputs":     outputs,
+		"total_cost":  totalFinishedCost,
+		"cost_per_kg": costPerKg,
 	})
 }
 

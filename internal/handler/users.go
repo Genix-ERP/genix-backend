@@ -193,7 +193,9 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		if err != nil {
 			continue
 		}
-		h.db.Exec("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", userID, roleID)
+		if _, execErr := h.db.Exec("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", userID, roleID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT user_roles", "error", execErr)
+		}
 	}
 
 	response.Created(c, gin.H{"id": userID})
@@ -201,11 +203,11 @@ func (h *Handler) CreateUser(c *gin.Context) {
 
 // credentialsTranslation holds translated credential message templates
 type credentialsTranslation struct {
-	SMSTemplate   string // %s = password
-	EmailSubject  string // %s = tenant name
-	EmailTitle    string
-	EmailBody     string // %s = tenant name, %s = email, %s = password
-	EmailWarning  string
+	SMSTemplate  string // %s = password
+	EmailSubject string // %s = tenant name
+	EmailTitle   string
+	EmailBody    string // %s = tenant name, %s = email, %s = password
+	EmailWarning string
 }
 
 var credentialsTranslations = map[string]credentialsTranslation{
@@ -515,13 +517,17 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 
 	// Update roles if provided
 	if len(input.RoleIDs) > 0 {
-		h.db.Exec("DELETE FROM user_roles WHERE user_id = $1", userID)
+		if _, execErr := h.db.Exec("DELETE FROM user_roles WHERE user_id = $1", userID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "DELETE user_roles", "error", execErr)
+		}
 		for _, roleIDStr := range input.RoleIDs {
 			roleID, err := uuid.Parse(roleIDStr)
 			if err != nil {
 				continue
 			}
-			h.db.Exec("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", userID, roleID)
+			if _, execErr := h.db.Exec("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", userID, roleID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "INSERT user_roles", "error", execErr)
+			}
 		}
 	}
 
@@ -551,8 +557,12 @@ func (h *Handler) DeleteUser(c *gin.Context) {
 
 	// Hard delete user to free up the email for reuse
 	// First delete related records
-	h.db.Exec("DELETE FROM user_roles WHERE user_id = $1", userID)
-	h.db.Exec("DELETE FROM refresh_tokens WHERE user_id = $1", userID)
+	if _, execErr := h.db.Exec("DELETE FROM user_roles WHERE user_id = $1", userID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE user_roles", "error", execErr)
+	}
+	if _, execErr := h.db.Exec("DELETE FROM refresh_tokens WHERE user_id = $1", userID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE refresh_tokens", "error", execErr)
+	}
 
 	result, err := h.db.Exec(
 		"DELETE FROM users WHERE id = $1 AND tenant_id = $2",
@@ -608,13 +618,17 @@ func (h *Handler) AssignRoles(c *gin.Context) {
 	}
 
 	// Remove existing roles and assign new ones
-	h.db.Exec("DELETE FROM user_roles WHERE user_id = $1", userID)
+	if _, execErr := h.db.Exec("DELETE FROM user_roles WHERE user_id = $1", userID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "DELETE user_roles", "error", execErr)
+	}
 	for _, roleIDStr := range input.RoleIDs {
 		roleID, err := uuid.Parse(roleIDStr)
 		if err != nil {
 			continue
 		}
-		h.db.Exec("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", userID, roleID)
+		if _, execErr := h.db.Exec("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", userID, roleID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT user_roles", "error", execErr)
+		}
 	}
 
 	response.Success(c, gin.H{"message": "Roles assigned successfully"})
@@ -809,13 +823,15 @@ func (h *Handler) ListAllSystemUsers(c *gin.Context) {
 // GET /admin/tenants
 func (h *Handler) ListAllTenants(c *gin.Context) {
 	// Auto-expire trials that have passed their trial_ends_at
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE tenants SET subscription_status = 'past_due'
 		WHERE deleted_at IS NULL
 		  AND subscription_status = 'trialing'
 		  AND trial_ends_at IS NOT NULL
 		  AND trial_ends_at < NOW()
-	`)
+	`); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE tenants", "error", execErr)
+	}
 
 	search := c.Query("search")
 	statusFilter := c.Query("status") // active, trialing, past_due, expired
@@ -1058,15 +1074,15 @@ func (h *Handler) GetTenantDetails(c *gin.Context) {
 
 	// Users list
 	type UserRow struct {
-		ID         uuid.UUID  `json:"id"`
-		FirstName  string     `json:"first_name"`
-		LastName   string     `json:"last_name"`
-		Email      *string    `json:"email,omitempty"`
-		Phone      *string    `json:"phone,omitempty"`
-		IsActive   bool       `json:"is_active"`
-		LastLogin  *time.Time `json:"last_login,omitempty"`
-		CreatedAt  time.Time  `json:"created_at"`
-		RoleName   *string    `json:"role_name,omitempty"`
+		ID        uuid.UUID  `json:"id"`
+		FirstName string     `json:"first_name"`
+		LastName  string     `json:"last_name"`
+		Email     *string    `json:"email,omitempty"`
+		Phone     *string    `json:"phone,omitempty"`
+		IsActive  bool       `json:"is_active"`
+		LastLogin *time.Time `json:"last_login,omitempty"`
+		CreatedAt time.Time  `json:"created_at"`
+		RoleName  *string    `json:"role_name,omitempty"`
 	}
 	urows, err := h.db.Query(`
 		SELECT u.id, COALESCE(u.first_name,''), COALESCE(u.last_name,''),
@@ -1142,11 +1158,14 @@ func (h *Handler) GetTenantDetails(c *gin.Context) {
 		PS          *string   `json:"ps,omitempty"`
 		ReceiptURL  *string   `json:"receipt_url,omitempty"`
 		PaymentTime *string   `json:"payment_time,omitempty"`
+		Method      string    `json:"method"`
+		Note        string    `json:"note,omitempty"`
 		CreatedAt   time.Time `json:"created_at"`
 	}
 	payments := []PaymentRow{}
 	prows, err := h.db.Query(`
-		SELECT id, plan, amount_uzs, status, invoice_id, card_pan, ps, receipt_url, payment_time, created_at
+		SELECT id, plan, amount_uzs, status, invoice_id, card_pan, ps, receipt_url, payment_time, created_at,
+		       COALESCE(method, 'multicard'), COALESCE(note, '')
 		FROM subscription_payments
 		WHERE tenant_id = $1
 		ORDER BY created_at DESC LIMIT 200`, tenantID)
@@ -1155,7 +1174,7 @@ func (h *Handler) GetTenantDetails(c *gin.Context) {
 		for prows.Next() {
 			var p PaymentRow
 			var card, ps, rurl, pt sql.NullString
-			if err := prows.Scan(&p.ID, &p.Plan, &p.AmountUZS, &p.Status, &p.InvoiceID, &card, &ps, &rurl, &pt, &p.CreatedAt); err == nil {
+			if err := prows.Scan(&p.ID, &p.Plan, &p.AmountUZS, &p.Status, &p.InvoiceID, &card, &ps, &rurl, &pt, &p.CreatedAt, &p.Method, &p.Note); err == nil {
 				if card.Valid {
 					p.CardPan = &card.String
 				}

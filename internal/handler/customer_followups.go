@@ -17,43 +17,43 @@ import (
 // =====================================================
 
 type FollowupLevel struct {
-	ID            uuid.UUID  `json:"id"`
-	TenantID      uuid.UUID  `json:"tenant_id"`
-	Name          string     `json:"name"`
-	Sequence      int        `json:"sequence"`
-	DelayDays     int        `json:"delay_days"`
-	SendEmail     bool       `json:"send_email"`
-	SendSMS       bool       `json:"send_sms"`
-	SendLetter    bool       `json:"send_letter"`
-	EmailSubject  *string    `json:"email_subject,omitempty"`
-	EmailBody     *string    `json:"email_body,omitempty"`
-	SMSBody       *string    `json:"sms_body,omitempty"`
-	LetterBody    *string    `json:"letter_body,omitempty"`
-	BlockSales    bool       `json:"block_sales"`
-	AddLateFee    bool       `json:"add_late_fee"`
-	LateFeeType   *string    `json:"late_fee_type,omitempty"`
-	LateFeeValue  float64    `json:"late_fee_value"`
-	IsActive      bool       `json:"is_active"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	Name         string    `json:"name"`
+	Sequence     int       `json:"sequence"`
+	DelayDays    int       `json:"delay_days"`
+	SendEmail    bool      `json:"send_email"`
+	SendSMS      bool      `json:"send_sms"`
+	SendLetter   bool      `json:"send_letter"`
+	EmailSubject *string   `json:"email_subject,omitempty"`
+	EmailBody    *string   `json:"email_body,omitempty"`
+	SMSBody      *string   `json:"sms_body,omitempty"`
+	LetterBody   *string   `json:"letter_body,omitempty"`
+	BlockSales   bool      `json:"block_sales"`
+	AddLateFee   bool      `json:"add_late_fee"`
+	LateFeeType  *string   `json:"late_fee_type,omitempty"`
+	LateFeeValue float64   `json:"late_fee_value"`
+	IsActive     bool      `json:"is_active"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type FollowupLevelRequest struct {
-	Name         string   `json:"name" binding:"required"`
-	Sequence     int      `json:"sequence"`
-	DelayDays    int      `json:"delay_days"`
-	SendEmail    bool     `json:"send_email"`
-	SendSMS      bool     `json:"send_sms"`
-	SendLetter   bool     `json:"send_letter"`
-	EmailSubject *string  `json:"email_subject,omitempty"`
-	EmailBody    *string  `json:"email_body,omitempty"`
-	SMSBody      *string  `json:"sms_body,omitempty"`
-	LetterBody   *string  `json:"letter_body,omitempty"`
-	BlockSales   bool     `json:"block_sales"`
-	AddLateFee   bool     `json:"add_late_fee"`
-	LateFeeType  *string  `json:"late_fee_type,omitempty"`
-	LateFeeValue float64  `json:"late_fee_value"`
-	IsActive     *bool    `json:"is_active,omitempty"`
+	Name         string  `json:"name" binding:"required"`
+	Sequence     int     `json:"sequence"`
+	DelayDays    int     `json:"delay_days"`
+	SendEmail    bool    `json:"send_email"`
+	SendSMS      bool    `json:"send_sms"`
+	SendLetter   bool    `json:"send_letter"`
+	EmailSubject *string `json:"email_subject,omitempty"`
+	EmailBody    *string `json:"email_body,omitempty"`
+	SMSBody      *string `json:"sms_body,omitempty"`
+	LetterBody   *string `json:"letter_body,omitempty"`
+	BlockSales   bool    `json:"block_sales"`
+	AddLateFee   bool    `json:"add_late_fee"`
+	LateFeeType  *string `json:"late_fee_type,omitempty"`
+	LateFeeValue float64 `json:"late_fee_value"`
+	IsActive     *bool   `json:"is_active,omitempty"`
 }
 
 // ListFollowupLevels returns all follow-up levels for the tenant
@@ -292,32 +292,32 @@ func (h *Handler) DeleteFollowupLevel(c *gin.Context) {
 // =====================================================
 
 type CustomerFollowupStatus struct {
-	ID                    uuid.UUID  `json:"id"`
-	TenantID              uuid.UUID  `json:"tenant_id"`
-	CustomerID            uuid.UUID  `json:"customer_id"`
-	CustomerName          string     `json:"customer_name"`
-	CustomerEmail         *string    `json:"customer_email,omitempty"`
-	CustomerPhone         *string    `json:"customer_phone,omitempty"`
-	CurrentLevelID        *uuid.UUID `json:"current_level_id,omitempty"`
-	CurrentLevelName      *string    `json:"current_level_name,omitempty"`
-	CurrentLevelSequence  int        `json:"current_level_sequence"`
-	TotalOverdue          float64    `json:"total_overdue"`
-	OldestDueDate         *time.Time `json:"oldest_due_date,omitempty"`
-	DaysOverdue           int        `json:"days_overdue"`
-	Status                string     `json:"status"`
-	LastFollowupDate      *time.Time `json:"last_followup_date,omitempty"`
-	NextFollowupDate      *time.Time `json:"next_followup_date,omitempty"`
-	InternalNotes         *string    `json:"internal_notes,omitempty"`
-	OverdueInvoiceCount   int        `json:"overdue_invoice_count"`
-	CreatedAt             time.Time  `json:"created_at"`
-	UpdatedAt             time.Time  `json:"updated_at"`
+	ID                   uuid.UUID  `json:"id"`
+	TenantID             uuid.UUID  `json:"tenant_id"`
+	CustomerID           uuid.UUID  `json:"customer_id"`
+	CustomerName         string     `json:"customer_name"`
+	CustomerEmail        *string    `json:"customer_email,omitempty"`
+	CustomerPhone        *string    `json:"customer_phone,omitempty"`
+	CurrentLevelID       *uuid.UUID `json:"current_level_id,omitempty"`
+	CurrentLevelName     *string    `json:"current_level_name,omitempty"`
+	CurrentLevelSequence int        `json:"current_level_sequence"`
+	TotalOverdue         float64    `json:"total_overdue"`
+	OldestDueDate        *time.Time `json:"oldest_due_date,omitempty"`
+	DaysOverdue          int        `json:"days_overdue"`
+	Status               string     `json:"status"`
+	LastFollowupDate     *time.Time `json:"last_followup_date,omitempty"`
+	NextFollowupDate     *time.Time `json:"next_followup_date,omitempty"`
+	InternalNotes        *string    `json:"internal_notes,omitempty"`
+	OverdueInvoiceCount  int        `json:"overdue_invoice_count"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
 type CustomerFollowupFilter struct {
-	Status       string `form:"status"`
-	Search       string `form:"search"`
-	MinOverdue   *float64 `form:"min_overdue"`
-	LevelID      string `form:"level_id"`
+	Status     string   `form:"status"`
+	Search     string   `form:"search"`
+	MinOverdue *float64 `form:"min_overdue"`
+	LevelID    string   `form:"level_id"`
 }
 
 // ListCustomerFollowups returns all customers with overdue amounts
@@ -342,12 +342,18 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 			i.customer_id,
 			SUM(i.total_amount - COALESCE(i.amount_paid, 0)) as total_overdue,
 			MIN(i.due_date) as oldest_due_date,
-			EXTRACT(DAY FROM CURRENT_DATE - MIN(i.due_date))::INTEGER as days_overdue,
+			-- date - date is already an INTEGER number of days in Postgres, so
+			-- EXTRACT(DAY FROM ...) over it fails outright:
+			--   pq: function pg_catalog.extract(unknown, integer) does not exist
+			-- This statement therefore never ran, and customer_followup_status
+			-- was never refreshed — the dunning screen showed whatever was last
+			-- written by hand, or nothing.
+			(CURRENT_DATE - MIN(i.due_date))::INTEGER as days_overdue,
 			'in_followup' as status
 		FROM sales_invoices i
 		WHERE i.tenant_id = $1
 		  AND i.deleted_at IS NULL
-		  AND i.status IN ('sent', 'partial')
+		  AND i.status NOT IN ('draft', 'cancelled', 'void')
 		  AND i.due_date < CURRENT_DATE
 		  AND i.total_amount > COALESCE(i.amount_paid, 0)
 		GROUP BY i.tenant_id, i.customer_id
@@ -406,9 +412,14 @@ func (h *Handler) ListCustomerFollowups(c *gin.Context) {
 			cfs.current_level_id, fl.name as current_level_name, cfs.current_level_sequence,
 			cfs.total_overdue, cfs.oldest_due_date, cfs.days_overdue, cfs.status,
 			cfs.last_followup_date, cfs.next_followup_date, cfs.internal_notes,
-			(SELECT COUNT(*) FROM sales_invoices WHERE customer_id = cfs.customer_id AND deleted_at IS NULL AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)) as overdue_invoice_count,
+			(SELECT COUNT(*) FROM sales_invoices WHERE customer_id = cfs.customer_id AND deleted_at IS NULL AND status NOT IN ('draft', 'cancelled', 'void') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)) as overdue_invoice_count,
 			cfs.created_at, cfs.updated_at` + fromWhere + whereExtra +
-		" ORDER BY cfs.days_overdue DESC, cfs.total_overdue DESC"
+		// cfs.id is the tiebreaker. days_overdue and total_overdue are both
+		// non-unique, so without it the order is not total and Postgres may
+		// resolve equal rows differently for page 1's LIMIT/OFFSET than for
+		// page 2's — one customer appears on both pages, another on neither,
+		// with no error and nothing in the log.
+		" ORDER BY cfs.days_overdue DESC, cfs.total_overdue DESC, cfs.id ASC"
 
 	if paginate {
 		query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", argCount+1, argCount+2)
@@ -561,7 +572,7 @@ func (h *Handler) GetCustomerFollowupDetails(c *gin.Context) {
 	invoiceRows, err := h.db.Query(`
 		SELECT id, invoice_number, invoice_date, due_date, total_amount, COALESCE(amount_paid, 0), total_amount - COALESCE(amount_paid, 0) as balance
 		FROM sales_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL AND customer_id = $2 AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND customer_id = $2 AND status NOT IN ('draft', 'cancelled', 'void') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)
 		ORDER BY due_date ASC
 	`, tenantID, customerID)
 	if err != nil {
@@ -600,15 +611,15 @@ func (h *Handler) GetCustomerFollowupDetails(c *gin.Context) {
 	defer actionRows.Close()
 
 	type FollowupActionSummary struct {
-		ID          uuid.UUID  `json:"id"`
-		LevelName   *string    `json:"level_name,omitempty"`
-		ActionType  string     `json:"action_type"`
-		TotalAmount *float64   `json:"total_amount,omitempty"`
-		Description *string    `json:"description,omitempty"`
-		Recipient   *string    `json:"recipient,omitempty"`
-		Subject     *string    `json:"subject,omitempty"`
-		Status      string     `json:"status"`
-		PerformedAt time.Time  `json:"performed_at"`
+		ID          uuid.UUID `json:"id"`
+		LevelName   *string   `json:"level_name,omitempty"`
+		ActionType  string    `json:"action_type"`
+		TotalAmount *float64  `json:"total_amount,omitempty"`
+		Description *string   `json:"description,omitempty"`
+		Recipient   *string   `json:"recipient,omitempty"`
+		Subject     *string   `json:"subject,omitempty"`
+		Status      string    `json:"status"`
+		PerformedAt time.Time `json:"performed_at"`
 	}
 
 	var actions []FollowupActionSummary
@@ -737,13 +748,15 @@ func (h *Handler) CreateFollowupAction(c *gin.Context) {
 	}
 
 	// Update customer followup status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE customer_followup_status SET
 			last_followup_date = CURRENT_TIMESTAMP,
 			current_level_id = COALESCE($3, current_level_id),
 			updated_at = CURRENT_TIMESTAMP
 		WHERE tenant_id = $1 AND customer_id = $2
-	`, tenantID, req.CustomerID, req.LevelID)
+	`, tenantID, req.CustomerID, req.LevelID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE customer_followup_status", "error", execErr)
+	}
 
 	response.Created(c, gin.H{
 		"id":           id,
@@ -804,10 +817,12 @@ func (h *Handler) CreatePaymentPromise(c *gin.Context) {
 	}
 
 	// Also record as followup action
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		INSERT INTO followup_actions (tenant_id, customer_id, action_type, total_amount, description, performed_by)
 		VALUES ($1, $2, 'payment_promise', $3, $4, $5)
-	`, tenantID, req.CustomerID, req.PromisedAmount, fmt.Sprintf("Payment promise for %s", req.PromisedDate), userID)
+	`, tenantID, req.CustomerID, req.PromisedAmount, fmt.Sprintf("Payment promise for %s", req.PromisedDate), userID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "INSERT followup_actions", "error", execErr)
+	}
 
 	response.Created(c, gin.H{
 		"id":         id,
@@ -880,7 +895,7 @@ func (h *Handler) GetFollowupSummary(c *gin.Context) {
 			Count     int     `json:"count"`
 			Amount    float64 `json:"amount"`
 		} `json:"customers_by_level"`
-		RecentActions int `json:"recent_actions"`
+		RecentActions   int `json:"recent_actions"`
 		PendingPromises int `json:"pending_promises"`
 	}
 
@@ -888,7 +903,7 @@ func (h *Handler) GetFollowupSummary(c *gin.Context) {
 	h.db.QueryRow(`
 		SELECT COUNT(DISTINCT customer_id), COALESCE(SUM(total_amount - COALESCE(amount_paid, 0)), 0), COUNT(*)
 		FROM sales_invoices
-		WHERE tenant_id = $1 AND deleted_at IS NULL AND status IN ('sent', 'partial') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND status NOT IN ('draft', 'cancelled', 'void') AND due_date < CURRENT_DATE AND total_amount > COALESCE(amount_paid, 0)
 	`, tenantID).Scan(&summary.TotalCustomersOverdue, &summary.TotalOverdueAmount, &summary.OverdueInvoiceCount)
 
 	// Recent actions (last 7 days)
@@ -915,10 +930,10 @@ func (h *Handler) SendFollowupReminder(c *gin.Context) {
 	userID, _ := middleware.GetUserID(c)
 
 	var req struct {
-		CustomerID uuid.UUID  `json:"customer_id" binding:"required"`
-		LevelID    uuid.UUID  `json:"level_id" binding:"required"`
-		SendEmail  bool       `json:"send_email"`
-		SendSMS    bool       `json:"send_sms"`
+		CustomerID uuid.UUID `json:"customer_id" binding:"required"`
+		LevelID    uuid.UUID `json:"level_id" binding:"required"`
+		SendEmail  bool      `json:"send_email"`
+		SendSMS    bool      `json:"send_sms"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "Invalid request body")
@@ -955,31 +970,37 @@ func (h *Handler) SendFollowupReminder(c *gin.Context) {
 
 	if req.SendEmail && emailSubject.Valid && customerEmail != "" {
 		// Record email action (actual sending would be handled by email service)
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO followup_actions (tenant_id, customer_id, level_id, level_name, action_type, total_amount, recipient, subject, body, status, performed_by)
 			VALUES ($1, $2, $3, $4, 'email_sent', $5, $6, $7, $8, 'sent', $9)
-		`, tenantID, req.CustomerID, req.LevelID, level.Name, totalOverdue, customerEmail, emailSubject.String, emailBody.String, userID)
+		`, tenantID, req.CustomerID, req.LevelID, level.Name, totalOverdue, customerEmail, emailSubject.String, emailBody.String, userID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT followup_actions", "error", execErr)
+		}
 		actionsRecorded++
 	}
 
 	if req.SendSMS {
 		// Record SMS action
-		h.db.Exec(`
+		if _, execErr := h.db.Exec(`
 			INSERT INTO followup_actions (tenant_id, customer_id, level_id, level_name, action_type, total_amount, status, performed_by)
 			VALUES ($1, $2, $3, $4, 'sms_sent', $5, 'sent', $6)
-		`, tenantID, req.CustomerID, req.LevelID, level.Name, totalOverdue, userID)
+		`, tenantID, req.CustomerID, req.LevelID, level.Name, totalOverdue, userID); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "INSERT followup_actions", "error", execErr)
+		}
 		actionsRecorded++
 	}
 
 	// Update customer followup status
-	h.db.Exec(`
+	if _, execErr := h.db.Exec(`
 		UPDATE customer_followup_status SET
 			current_level_id = $3,
 			current_level_sequence = (SELECT sequence FROM followup_levels WHERE id = $3),
 			last_followup_date = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE tenant_id = $1 AND customer_id = $2
-	`, tenantID, req.CustomerID, req.LevelID)
+	`, tenantID, req.CustomerID, req.LevelID); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE customer_followup_status", "error", execErr)
+	}
 
 	response.Success(c, gin.H{
 		"message":          "Follow-up reminder sent",

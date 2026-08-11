@@ -124,11 +124,11 @@ func (h *Handler) ListTenders(c *gin.Context) {
 	// Ordering
 	switch ordering {
 	case "deadline":
-		query += " ORDER BY t.deadline ASC"
+		query += " ORDER BY t.deadline ASC, t.id ASC"
 	case "-deadline":
-		query += " ORDER BY t.deadline DESC"
+		query += " ORDER BY t.deadline DESC, t.id ASC"
 	case "bid_count":
-		query += " ORDER BY t.bid_count DESC"
+		query += " ORDER BY t.bid_count DESC, t.id ASC"
 	case "created_at":
 		query += " ORDER BY t.created_at ASC"
 	default:

@@ -128,14 +128,14 @@ func (h *Handler) ListWebhookSubscriptions(c *gin.Context) {
 	out := make([]gin.H, 0)
 	for rows.Next() {
 		var (
-			id                       uuid.UUID
-			name, url                string
-			events                   []string
-			isActive                 bool
-			maxRetries, timeoutMS    int
-			lastTriggeredAt          *time.Time
-			lastStatus               *string
-			createdAt                time.Time
+			id                    uuid.UUID
+			name, url             string
+			events                []string
+			isActive              bool
+			maxRetries, timeoutMS int
+			lastTriggeredAt       *time.Time
+			lastStatus            *string
+			createdAt             time.Time
 		)
 		if err := rows.Scan(&id, &name, &url, pq.Array(&events), &isActive,
 			&maxRetries, &timeoutMS, &lastTriggeredAt, &lastStatus, &createdAt); err != nil {
@@ -216,14 +216,14 @@ func (h *Handler) ListWebhookDeliveries(c *gin.Context) {
 	out := make([]gin.H, 0)
 	for rows.Next() {
 		var (
-			id                        uuid.UUID
-			eventName, status         string
-			attempt                   int
-			respStatus                *int
-			durationMS                *int
-			errorMessage              *string
-			createdAt                 time.Time
-			completedAt               *time.Time
+			id                uuid.UUID
+			eventName, status string
+			attempt           int
+			respStatus        *int
+			durationMS        *int
+			errorMessage      *string
+			createdAt         time.Time
+			completedAt       *time.Time
 		)
 		if err := rows.Scan(&id, &eventName, &attempt, &respStatus, &status,
 			&durationMS, &errorMessage, &createdAt, &completedAt); err != nil {
@@ -289,11 +289,11 @@ func (h *Handler) DispatchWebhookEvent(
 
 	eventID := uuid.New()
 	body, err := json.Marshal(gin.H{
-		"event":      eventName,
-		"event_id":   eventID,
-		"tenant_id":  tenantID,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339Nano),
-		"data":       payload,
+		"event":     eventName,
+		"event_id":  eventID,
+		"tenant_id": tenantID,
+		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+		"data":      payload,
 	})
 	if err != nil {
 		h.log.Error("DispatchWebhookEvent: marshal failed", "error", err)

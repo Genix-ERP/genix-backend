@@ -188,7 +188,7 @@ func (h *Handler) ListTasks(c *gin.Context) {
 	if !allowedSorts[sortBy] {
 		sortBy = "due_date"
 	}
-	baseQuery += fmt.Sprintf(" ORDER BY t.%s %s NULLS LAST", sortBy, sortOrder)
+	baseQuery += fmt.Sprintf(" ORDER BY t.%s %s NULLS LAST, t.id ASC", sortBy, sortOrder)
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)

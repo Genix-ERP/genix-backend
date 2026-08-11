@@ -92,7 +92,9 @@ func (h *Handler) PlatformLogin(c *gin.Context) {
 		response.InternalServerError(c, "")
 		return
 	}
-	h.db.Exec(`UPDATE platform_users SET last_login_at = NOW() WHERE id = $1`, id)
+	if _, execErr := h.db.Exec(`UPDATE platform_users SET last_login_at = NOW() WHERE id = $1`, id); execErr != nil {
+		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE platform_users", "error", execErr)
+	}
 	h.writePlatformAudit(c, "platform.login", "platform_user", id.String(), nil, nil,
 		map[string]interface{}{"email": input.Email, "role": role})
 
@@ -250,14 +252,20 @@ func (h *Handler) UpdatePlatformUser(c *gin.Context) {
 			response.BadRequest(c, "Invalid role")
 			return
 		}
-		h.db.Exec(`UPDATE platform_users SET role = $1, updated_at = NOW() WHERE id = $2`, *in.Role, id)
+		if _, execErr := h.db.Exec(`UPDATE platform_users SET role = $1, updated_at = NOW() WHERE id = $2`, *in.Role, id); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE platform_users", "error", execErr)
+		}
 	}
 	if in.IsActive != nil {
-		h.db.Exec(`UPDATE platform_users SET is_active = $1, updated_at = NOW() WHERE id = $2`, *in.IsActive, id)
+		if _, execErr := h.db.Exec(`UPDATE platform_users SET is_active = $1, updated_at = NOW() WHERE id = $2`, *in.IsActive, id); execErr != nil {
+			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE platform_users", "error", execErr)
+		}
 	}
 	if in.Password != nil && len(*in.Password) >= 8 {
 		if hash, err := crypto.HashPassword(*in.Password); err == nil {
-			h.db.Exec(`UPDATE platform_users SET password_hash = $1, updated_at = NOW() WHERE id = $2`, hash, id)
+			if _, execErr := h.db.Exec(`UPDATE platform_users SET password_hash = $1, updated_at = NOW() WHERE id = $2`, hash, id); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE platform_users", "error", execErr)
+			}
 		}
 	}
 	h.writePlatformAudit(c, "platform_user.update", "platform_user", id.String(), nil, nil,
