@@ -151,7 +151,11 @@ type CreateCargoShipmentRequest struct {
 	InsuranceCost   float64                     `json:"insurance_cost"`
 	OtherCost       float64                     `json:"other_cost"`
 	Notes           string                      `json:"notes"`
-	Items           []CreateShipmentItemRequest `json:"items" binding:"required,min=1"`
+	// `dive` matters: without it the validator never enters the slice, so the
+	// per-item `required` tags below were decorative — a shipment whose items
+	// carried no name and no price was accepted and stored as zeros, which is
+	// how BUG-01's broken rows got into the database in the first place.
+	Items []CreateShipmentItemRequest `json:"items" binding:"required,min=1,dive"`
 }
 
 // CreateShipmentItemRequest represents request to create a shipment item
