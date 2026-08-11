@@ -41,11 +41,23 @@ func getDefaultAdminSettings() AdminSettingsResponse {
 				"website":    "",
 			},
 			"localization": map[string]interface{}{
-				"language":    "en",
-				"timezone":    "Asia/Tashkent",
-				"currency":    "UZS",
-				"date_format": "DD/MM/YYYY",
-				"time_format": "24h",
+				"language": "en",
+				"timezone": "Asia/Tashkent",
+				"currency": "UZS",
+				// currency_symbol/currency_position were absent here while the
+				// frontend reads both (useCurrencyFormatter) and supplies its
+				// own fallbacks. So the defaults lived on one side only: a
+				// tenant that never opened the settings screen got the
+				// frontend's idea of them, and anything that wrote the
+				// localization block back without these keys silently dropped
+				// them. Same values the frontend defaults to, so no tenant's
+				// display changes.
+				"currency_symbol":     "so'm",
+				"currency_position":   "after",
+				"decimal_separator":   ",",
+				"thousands_separator": " ",
+				"date_format":         "DD/MM/YYYY",
+				"time_format":         "24h",
 			},
 			"fiscal": map[string]interface{}{
 				"fiscal_year_start": "01-01",
