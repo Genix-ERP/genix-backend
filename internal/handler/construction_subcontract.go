@@ -234,9 +234,9 @@ func (h *Handler) CreateSubcontract(c *gin.Context) {
 		ContactPhone    string  `json:"contact_phone"`
 		Notes           string  `json:"notes"`
 		// Shartnoma raqami — 472-gacha jimgina yo'qolardi (audit bug-fix).
-		ContractNumber  string  `json:"contract_number"`
-		WBSIDs          []int64 `json:"wbs_ids"`
-		BuildingIDs     []int64 `json:"building_ids"`
+		ContractNumber string  `json:"contract_number"`
+		WBSIDs         []int64 `json:"wbs_ids"`
+		BuildingIDs    []int64 `json:"building_ids"`
 		// Forma 2/3 identity block
 		Address             string `json:"address"`
 		Phone               string `json:"phone"`

@@ -69,9 +69,9 @@ func getDefaultAdminSettings() AdminSettingsResponse {
 				"auto_confirm":  false,
 			},
 			"pricing": map[string]interface{}{
-				"strategy":     "standard",
+				"strategy":       "standard",
 				"allow_discount": true,
-				"max_discount": 20,
+				"max_discount":   20,
 			},
 			"payment": map[string]interface{}{
 				"default_terms": "net_30",
@@ -98,14 +98,14 @@ func getDefaultAdminSettings() AdminSettingsResponse {
 				"require_multi_quotes": false,
 			},
 			"vendor": map[string]interface{}{
-				"rating_enabled":      true,
+				"rating_enabled":        true,
 				"default_payment_terms": "net_30",
 			},
 		},
 		Manufacturing: map[string]interface{}{
 			"planning": map[string]interface{}{
-				"method":   "mrp",
-				"horizon":  30,
+				"method":  "mrp",
+				"horizon": 30,
 			},
 			"work_center": map[string]interface{}{
 				"default_efficiency": 100,

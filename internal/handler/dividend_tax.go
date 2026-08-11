@@ -109,26 +109,28 @@ func (h *Handler) ComputeDividendTax(c *gin.Context) {
 // lookups, no silent "use whatever's configured" fallbacks that could
 // post to the wrong account without anyone noticing.
 type DividendDistributionInput struct {
-	Amount                    float64 `json:"amount" binding:"required"`
-	ShareholderName           string  `json:"shareholder_name" binding:"required"`
-	DistributionDate          string  `json:"distribution_date"` // YYYY-MM-DD, defaults to today
-	RetainedEarningsAccountID string  `json:"retained_earnings_account_id" binding:"required"`
-	CashAccountID             string  `json:"cash_account_id" binding:"required"`
-	TaxLiabilityAccountID     string  `json:"tax_liability_account_id"` // optional: defaults to DIVIDEND rate's account_id
+	Amount                    float64  `json:"amount" binding:"required"`
+	ShareholderName           string   `json:"shareholder_name" binding:"required"`
+	DistributionDate          string   `json:"distribution_date"` // YYYY-MM-DD, defaults to today
+	RetainedEarningsAccountID string   `json:"retained_earnings_account_id" binding:"required"`
+	CashAccountID             string   `json:"cash_account_id" binding:"required"`
+	TaxLiabilityAccountID     string   `json:"tax_liability_account_id"` // optional: defaults to DIVIDEND rate's account_id
 	Rate                      *float64 `json:"rate,omitempty"`           // optional override
-	Notes                     string  `json:"notes,omitempty"`
+	Notes                     string   `json:"notes,omitempty"`
 }
 
 // CreateDividendDistribution posts the dividend journal entry per TZ §5.3.
 //
 // Journal entry shape:
-//   Dr Retained Earnings        = gross_amount
-//   Cr Cash / Bank              = net_to_shareholder
-//   Cr Tax Liability            = tax_amount           (5% withheld)
+//
+//	Dr Retained Earnings        = gross_amount
+//	Cr Cash / Bank              = net_to_shareholder
+//	Cr Tax Liability            = tax_amount           (5% withheld)
 //
 // Source fields on the journal:
-//   source_type = 'dividend_distribution'
-//   reference   = shareholder name (searchable in the GL)
+//
+//	source_type = 'dividend_distribution'
+//	reference   = shareholder name (searchable in the GL)
 //
 // Rate resolution: explicit override → company_tax_rates(dividend) → 5%.
 // Tax liability account: explicit override → company_tax_rates(dividend).account_id.

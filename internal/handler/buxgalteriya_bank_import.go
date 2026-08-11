@@ -62,8 +62,8 @@ type parsedBankTxn struct {
 	// Raw payer/recipient parties. Direction and the counterparty are resolved
 	// from these at end-of-document by matching against our own account, so
 	// that our own INN/account is never mistaken for the counterparty's.
-	payerName, payerINN, payerAccount             string
-	recipientName, recipientINN, recipientAccount string
+	payerName, payerINN, payerAccount                string
+	recipientName, recipientINN, recipientAccount    string
 	payerBank, payerBIC, recipientBank, recipientBIC string
 }
 
@@ -258,13 +258,13 @@ func (h *Handler) ListBankImports(c *gin.Context) {
 	out := make([]gin.H, 0)
 	for rows.Next() {
 		var (
-			id                                                                 uuid.UUID
-			fileName                                                           string
-			stmtDate                                                           *time.Time
-			opening, closing, totalCredit, totalDebit                          float64
-			txnCount, matched, unmatched                                       int
-			status                                                             string
-			importedAt                                                         time.Time
+			id                                        uuid.UUID
+			fileName                                  string
+			stmtDate                                  *time.Time
+			opening, closing, totalCredit, totalDebit float64
+			txnCount, matched, unmatched              int
+			status                                    string
+			importedAt                                time.Time
 		)
 		if err := rows.Scan(&id, &fileName, &stmtDate, &opening, &closing,
 			&totalCredit, &totalDebit, &txnCount, &matched, &unmatched,
@@ -311,10 +311,10 @@ func parseBankClientTxt(content string) ([]parsedBankTxn, bankStatementMeta, []s
 	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
 
 	var (
-		inDoc       bool
-		cur         parsedBankTxn
-		myAccount   string       // "РасчСчет=" from file header identifies our account
-		lineNumber  int
+		inDoc      bool
+		cur        parsedBankTxn
+		myAccount  string // "РасчСчет=" from file header identifies our account
+		lineNumber int
 	)
 
 	for scanner.Scan() {

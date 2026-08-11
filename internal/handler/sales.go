@@ -265,35 +265,35 @@ func (h *Handler) ListSalesOrders(c *gin.Context) {
 // SimpleSalesOrderInput represents a simplified input for creating sales orders from frontend
 type SimpleSalesOrderInput struct {
 	// Standard API fields
-	OrganizationID  string                              `json:"organization_id,omitempty"`
-	CustomerID      string                              `json:"customer_id,omitempty"`
-	ContactPersonID string                              `json:"contact_person_id,omitempty"`
-	OrderDate       string                              `json:"order_date"`
-	ExpectedDate    string                              `json:"expected_date,omitempty"`
-	DeliveryDate    string                              `json:"delivery_date,omitempty"`
-	BillingAddress  *entity.Address                     `json:"billing_address,omitempty"`
-	ShippingAddress *entity.Address                     `json:"shipping_address,omitempty"`
-	CurrencyID      string                              `json:"currency_id,omitempty"`
-	DiscountType    string                              `json:"discount_type,omitempty"`
-	DiscountValue   float64                             `json:"discount_value,omitempty"`
-	DiscountAmount  float64                             `json:"discount_amount,omitempty"`
-	DiscountCode    string                              `json:"discount_code,omitempty"`
-	ShippingAmount  float64                             `json:"shipping_amount,omitempty"`
-	ShippingCost    float64                             `json:"shipping_cost,omitempty"`
-	PaymentTerms    int                                 `json:"payment_terms,omitempty"`
-	Reference       string                              `json:"reference,omitempty"`
-	PONumber        string                              `json:"po_number,omitempty"`
-	Notes           string                              `json:"notes,omitempty"`
-	InternalNotes   string                              `json:"internal_notes,omitempty"`
-	WarehouseID     string                              `json:"warehouse_id,omitempty"`
-	Carrier         string                              `json:"carrier,omitempty"`
-	VehicleNumber   string                              `json:"vehicle_number,omitempty"`
-	SalesRepID      string                              `json:"sales_rep_id,omitempty"`
-	ProjectID       string                              `json:"project_id,omitempty"`
-	ProjectName     string                              `json:"project_name,omitempty"`
-	ContractID      string                              `json:"contract_id,omitempty"`
-	LeadID          string                              `json:"lead_id,omitempty"`
-	Lines           []entity.CreateSalesOrderLineInput  `json:"lines,omitempty"`
+	OrganizationID  string                             `json:"organization_id,omitempty"`
+	CustomerID      string                             `json:"customer_id,omitempty"`
+	ContactPersonID string                             `json:"contact_person_id,omitempty"`
+	OrderDate       string                             `json:"order_date"`
+	ExpectedDate    string                             `json:"expected_date,omitempty"`
+	DeliveryDate    string                             `json:"delivery_date,omitempty"`
+	BillingAddress  *entity.Address                    `json:"billing_address,omitempty"`
+	ShippingAddress *entity.Address                    `json:"shipping_address,omitempty"`
+	CurrencyID      string                             `json:"currency_id,omitempty"`
+	DiscountType    string                             `json:"discount_type,omitempty"`
+	DiscountValue   float64                            `json:"discount_value,omitempty"`
+	DiscountAmount  float64                            `json:"discount_amount,omitempty"`
+	DiscountCode    string                             `json:"discount_code,omitempty"`
+	ShippingAmount  float64                            `json:"shipping_amount,omitempty"`
+	ShippingCost    float64                            `json:"shipping_cost,omitempty"`
+	PaymentTerms    int                                `json:"payment_terms,omitempty"`
+	Reference       string                             `json:"reference,omitempty"`
+	PONumber        string                             `json:"po_number,omitempty"`
+	Notes           string                             `json:"notes,omitempty"`
+	InternalNotes   string                             `json:"internal_notes,omitempty"`
+	WarehouseID     string                             `json:"warehouse_id,omitempty"`
+	Carrier         string                             `json:"carrier,omitempty"`
+	VehicleNumber   string                             `json:"vehicle_number,omitempty"`
+	SalesRepID      string                             `json:"sales_rep_id,omitempty"`
+	ProjectID       string                             `json:"project_id,omitempty"`
+	ProjectName     string                             `json:"project_name,omitempty"`
+	ContractID      string                             `json:"contract_id,omitempty"`
+	LeadID          string                             `json:"lead_id,omitempty"`
+	Lines           []entity.CreateSalesOrderLineInput `json:"lines,omitempty"`
 
 	// Simplified frontend fields
 	OrderNumber   string  `json:"order_number,omitempty"`
@@ -1522,9 +1522,9 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 
 			// Get SO lines with cost price for stock movement JE
 			type soLineAcct struct {
-				ProductID  uuid.UUID
-				CostAmount float64
-				OutputAcct uuid.UUID
+				ProductID     uuid.UUID
+				CostAmount    float64
+				OutputAcct    uuid.UUID
 				ValuationAcct uuid.UUID
 			}
 			var soLines []soLineAcct
@@ -2806,13 +2806,13 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 
 			// Get invoice lines for per-category accounting
 			type invoiceLineAcct struct {
-				ProductID  uuid.UUID
-				LineTotal  float64
-				Quantity   float64
-				CostPrice  float64
-				IncomeAcct uuid.UUID
+				ProductID   uuid.UUID
+				LineTotal   float64
+				Quantity    float64
+				CostPrice   float64
+				IncomeAcct  uuid.UUID
 				ExpenseAcct uuid.UUID
-				OutputAcct uuid.UUID
+				OutputAcct  uuid.UUID
 			}
 			var acctLines []invoiceLineAcct
 			acctRows, acctErr := tx.Query(`
@@ -2943,141 +2943,141 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 			jeLineNumber := 1
 			if jeErr == nil {
 
-			// Debit: Accounts Receivable
-			_, arErr := tx.Exec(`
+				// Debit: Accounts Receivable
+				_, arErr := tx.Exec(`
 				INSERT INTO journal_entry_lines (
 					id, journal_entry_id, line_number, account_id, contact_id, description,
 					debit_amount, credit_amount, exchange_rate, created_at
 				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-				uuid.New(), jeID, jeLineNumber, arAccountID, customerID, "Accounts Receivable",
-				totalAmount, 0.0, 1.0, now,
-			)
-			if arErr != nil {
-				h.log.Error("CreateInvoiceFromOrder: AR journal line failed", "error", arErr, "arAccountID", arAccountID)
-			}
-			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID); err != nil {
-				h.log.Error("CreateInvoiceFromOrder: update AR account balance failed", "error", err, "arAccountID", arAccountID)
-			}
-			jeLineNumber++
-
-			// Credit: Revenue per category
-			for incomeAcct, amount := range revenueGrouped {
-				if _, err := tx.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-					uuid.New(), jeID, jeLineNumber, incomeAcct, "Sales Revenue",
-					0.0, amount, 1.0, now,
-				); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: revenue journal line failed", "error", err, "incomeAcct", incomeAcct, "amount", amount)
+					uuid.New(), jeID, jeLineNumber, arAccountID, customerID, "Accounts Receivable",
+					totalAmount, 0.0, 1.0, now,
+				)
+				if arErr != nil {
+					h.log.Error("CreateInvoiceFromOrder: AR journal line failed", "error", arErr, "arAccountID", arAccountID)
 				}
-				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: update revenue account balance failed", "error", err, "incomeAcct", incomeAcct)
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: update AR account balance failed", "error", err, "arAccountID", arAccountID)
 				}
 				jeLineNumber++
-			}
 
-			// Credit: Tax Payable
-			if taxAccountID != uuid.Nil && taxAmount > 0 {
-				if _, err := tx.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-					uuid.New(), jeID, jeLineNumber, taxAccountID, "Sales Tax Payable",
-					0.0, taxAmount, 1.0, now,
-				); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: tax payable journal line failed", "error", err, "taxAccountID", taxAccountID)
-				}
-				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: update tax account balance failed", "error", err, "taxAccountID", taxAccountID)
-				}
-				jeLineNumber++
-			}
-
-			// Debit: header discount as contra-revenue — AR is debited net of the
-			// discount while revenue is credited gross, so this leg balances the entry.
-			if discountAmount > 0 && fallbackRevenue != uuid.Nil {
-				if _, err := tx.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-					uuid.New(), jeID, jeLineNumber, fallbackRevenue, "Chegirma (kontra-daromad)",
-					discountAmount, 0.0, 1.0, now,
-				); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: discount journal line failed", "error", err)
-				}
-				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", discountAmount, now, fallbackRevenue); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: update discount account balance failed", "error", err)
-				}
-				jeLineNumber++
-			}
-
-			// Credit: shipping charged to the customer is sales income — it is part of
-			// the AR debit but was previously missing from the credit side. Posted to
-			// the main revenue account (not 9310) so the income statement's
-			// revenue/net-profit invariant keeps holding.
-			if shippingAmount > 0 {
-				shippingIncomeAcct := fallbackRevenue
-				if shippingIncomeAcct != uuid.Nil {
+				// Credit: Revenue per category
+				for incomeAcct, amount := range revenueGrouped {
 					if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						uuid.New(), jeID, jeLineNumber, incomeAcct, "Sales Revenue",
+						0.0, amount, 1.0, now,
+					); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: revenue journal line failed", "error", err, "incomeAcct", incomeAcct, "amount", amount)
+					}
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: update revenue account balance failed", "error", err, "incomeAcct", incomeAcct)
+					}
+					jeLineNumber++
+				}
+
+				// Credit: Tax Payable
+				if taxAccountID != uuid.Nil && taxAmount > 0 {
+					if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						uuid.New(), jeID, jeLineNumber, taxAccountID, "Sales Tax Payable",
+						0.0, taxAmount, 1.0, now,
+					); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: tax payable journal line failed", "error", err, "taxAccountID", taxAccountID)
+					}
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: update tax account balance failed", "error", err, "taxAccountID", taxAccountID)
+					}
+					jeLineNumber++
+				}
+
+				// Debit: header discount as contra-revenue — AR is debited net of the
+				// discount while revenue is credited gross, so this leg balances the entry.
+				if discountAmount > 0 && fallbackRevenue != uuid.Nil {
+					if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						uuid.New(), jeID, jeLineNumber, fallbackRevenue, "Chegirma (kontra-daromad)",
+						discountAmount, 0.0, 1.0, now,
+					); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: discount journal line failed", "error", err)
+					}
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", discountAmount, now, fallbackRevenue); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: update discount account balance failed", "error", err)
+					}
+					jeLineNumber++
+				}
+
+				// Credit: shipping charged to the customer is sales income — it is part of
+				// the AR debit but was previously missing from the credit side. Posted to
+				// the main revenue account (not 9310) so the income statement's
+				// revenue/net-profit invariant keeps holding.
+				if shippingAmount > 0 {
+					shippingIncomeAcct := fallbackRevenue
+					if shippingIncomeAcct != uuid.Nil {
+						if _, err := tx.Exec(`
 						INSERT INTO journal_entry_lines (
 							id, journal_entry_id, line_number, account_id, description,
 							debit_amount, credit_amount, exchange_rate, created_at
 						) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-						uuid.New(), jeID, jeLineNumber, shippingIncomeAcct, "Yetkazib berish daromadi",
-						0.0, shippingAmount, 1.0, now,
-					); err != nil {
-						h.log.Error("CreateInvoiceFromOrder: shipping income journal line failed", "error", err)
+							uuid.New(), jeID, jeLineNumber, shippingIncomeAcct, "Yetkazib berish daromadi",
+							0.0, shippingAmount, 1.0, now,
+						); err != nil {
+							h.log.Error("CreateInvoiceFromOrder: shipping income journal line failed", "error", err)
+						}
+						if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", shippingAmount, now, shippingIncomeAcct); err != nil {
+							h.log.Error("CreateInvoiceFromOrder: update shipping income balance failed", "error", err)
+						}
+						jeLineNumber++
 					}
-					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", shippingAmount, now, shippingIncomeAcct); err != nil {
-						h.log.Error("CreateInvoiceFromOrder: update shipping income balance failed", "error", err)
+				}
+
+				// COGS entries
+				for pair, costAmount := range cogsGrouped {
+					// Debit: COGS
+					if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						uuid.New(), jeID, jeLineNumber, pair.Expense, "Cost of Goods Sold",
+						costAmount, 0.0, 1.0, now,
+					); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: COGS journal line failed", "error", err, "expenseAcct", pair.Expense)
+					}
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Expense); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: update COGS account balance failed", "error", err, "expenseAcct", pair.Expense)
+					}
+					jeLineNumber++
+
+					// Credit: Stock Interim Delivery
+					if _, err := tx.Exec(`
+					INSERT INTO journal_entry_lines (
+						id, journal_entry_id, line_number, account_id, description,
+						debit_amount, credit_amount, exchange_rate, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						uuid.New(), jeID, jeLineNumber, pair.Output, "Stock Interim Delivery",
+						0.0, costAmount, 1.0, now,
+					); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: stock output journal line failed", "error", err, "outputAcct", pair.Output)
+					}
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output); err != nil {
+						h.log.Error("CreateInvoiceFromOrder: update stock output balance failed", "error", err, "outputAcct", pair.Output)
 					}
 					jeLineNumber++
 				}
-			}
 
-			// COGS entries
-			for pair, costAmount := range cogsGrouped {
-				// Debit: COGS
-				if _, err := tx.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-					uuid.New(), jeID, jeLineNumber, pair.Expense, "Cost of Goods Sold",
-					costAmount, 0.0, 1.0, now,
-				); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: COGS journal line failed", "error", err, "expenseAcct", pair.Expense)
+				// Link JE to invoice
+				if _, err := tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, sent_at = $2 WHERE id = $3", jeID, now, invoiceID); err != nil {
+					h.log.Error("CreateInvoiceFromOrder: link JE to invoice failed", "error", err)
 				}
-				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Expense); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: update COGS account balance failed", "error", err, "expenseAcct", pair.Expense)
-				}
-				jeLineNumber++
-
-				// Credit: Stock Interim Delivery
-				if _, err := tx.Exec(`
-					INSERT INTO journal_entry_lines (
-						id, journal_entry_id, line_number, account_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-					uuid.New(), jeID, jeLineNumber, pair.Output, "Stock Interim Delivery",
-					0.0, costAmount, 1.0, now,
-				); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: stock output journal line failed", "error", err, "outputAcct", pair.Output)
-				}
-				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output); err != nil {
-					h.log.Error("CreateInvoiceFromOrder: update stock output balance failed", "error", err, "outputAcct", pair.Output)
-				}
-				jeLineNumber++
-			}
-
-			// Link JE to invoice
-			if _, err := tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1, sent_at = $2 WHERE id = $3", jeID, now, invoiceID); err != nil {
-				h.log.Error("CreateInvoiceFromOrder: link JE to invoice failed", "error", err)
-			}
 			} // end if jeErr == nil
 		}
 	}

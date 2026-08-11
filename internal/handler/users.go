@@ -201,11 +201,11 @@ func (h *Handler) CreateUser(c *gin.Context) {
 
 // credentialsTranslation holds translated credential message templates
 type credentialsTranslation struct {
-	SMSTemplate   string // %s = password
-	EmailSubject  string // %s = tenant name
-	EmailTitle    string
-	EmailBody     string // %s = tenant name, %s = email, %s = password
-	EmailWarning  string
+	SMSTemplate  string // %s = password
+	EmailSubject string // %s = tenant name
+	EmailTitle   string
+	EmailBody    string // %s = tenant name, %s = email, %s = password
+	EmailWarning string
 }
 
 var credentialsTranslations = map[string]credentialsTranslation{
@@ -1058,15 +1058,15 @@ func (h *Handler) GetTenantDetails(c *gin.Context) {
 
 	// Users list
 	type UserRow struct {
-		ID         uuid.UUID  `json:"id"`
-		FirstName  string     `json:"first_name"`
-		LastName   string     `json:"last_name"`
-		Email      *string    `json:"email,omitempty"`
-		Phone      *string    `json:"phone,omitempty"`
-		IsActive   bool       `json:"is_active"`
-		LastLogin  *time.Time `json:"last_login,omitempty"`
-		CreatedAt  time.Time  `json:"created_at"`
-		RoleName   *string    `json:"role_name,omitempty"`
+		ID        uuid.UUID  `json:"id"`
+		FirstName string     `json:"first_name"`
+		LastName  string     `json:"last_name"`
+		Email     *string    `json:"email,omitempty"`
+		Phone     *string    `json:"phone,omitempty"`
+		IsActive  bool       `json:"is_active"`
+		LastLogin *time.Time `json:"last_login,omitempty"`
+		CreatedAt time.Time  `json:"created_at"`
+		RoleName  *string    `json:"role_name,omitempty"`
 	}
 	urows, err := h.db.Query(`
 		SELECT u.id, COALESCE(u.first_name,''), COALESCE(u.last_name,''),

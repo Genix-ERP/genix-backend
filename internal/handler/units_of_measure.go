@@ -443,4 +443,3 @@ func (h *Handler) DeleteUnitOfMeasure(c *gin.Context) {
 
 	response.Success(c, map[string]interface{}{"message": "Unit of measure deleted"})
 }
-

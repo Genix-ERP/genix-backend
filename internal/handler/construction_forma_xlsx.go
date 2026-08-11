@@ -196,37 +196,37 @@ type forma2Data struct {
 }
 
 type forma3Data struct {
-	Client                    forma2Party
-	Contractor                forma2Party
-	ProjectName               string
-	CertNumber                string
-	CertDate                  time.Time
-	PeriodMonthFromName       string
-	PeriodMonthToName         string
-	ContractNumber            string
-	ContractDate              time.Time
+	Client                     forma2Party
+	Contractor                 forma2Party
+	ProjectName                string
+	CertNumber                 string
+	CertDate                   time.Time
+	PeriodMonthFromName        string
+	PeriodMonthToName          string
+	ContractNumber             string
+	ContractDate               time.Time
 	TotalContractValueThousand float64 // in тыс. сум
-	Rows                      []forma3Row
-	TotalWithoutVAT           float64 // тыс. сум
+	Rows                       []forma3Row
+	TotalWithoutVAT            float64 // тыс. сум
 }
 
 type forma3Row struct {
-	No                 int
-	Name               string
-	UOM                string
-	VolumeTotal        float64
-	VolumeCurrentYear  float64
-	ValueTotal         float64
-	ValueCurrentYear   float64
-	DoneFromStartQty   float64
-	DoneFromStartPct   float64
-	DoneFromStartVal   float64
-	DoneFromYearQty    float64
-	DoneFromYearPct    float64
-	DoneFromYearVal    float64
-	DoneThisPeriodQty  float64
-	DoneThisPeriodPct  float64
-	DoneThisPeriodVal  float64
+	No                int
+	Name              string
+	UOM               string
+	VolumeTotal       float64
+	VolumeCurrentYear float64
+	ValueTotal        float64
+	ValueCurrentYear  float64
+	DoneFromStartQty  float64
+	DoneFromStartPct  float64
+	DoneFromStartVal  float64
+	DoneFromYearQty   float64
+	DoneFromYearPct   float64
+	DoneFromYearVal   float64
+	DoneThisPeriodQty float64
+	DoneThisPeriodPct float64
+	DoneThisPeriodVal float64
 }
 
 // --- Data loading -----------------------------------------------------------
@@ -453,16 +453,16 @@ func (h *Handler) loadForma3Data(actID int64, tenantID uuid.UUID) (*forma3Data, 
 	// Convert to тыс. сум (thousands).
 	valThousand := amountTotal.Float64 / 1000.0
 	d.Rows = append(d.Rows, forma3Row{
-		No:                 1,
-		Name:               d.ProjectName,
-		UOM:                "",
-		VolumeTotal:        valThousand,
-		VolumeCurrentYear:  valThousand,
-		ValueTotal:         valThousand,
-		ValueCurrentYear:   valThousand,
-		DoneFromStartVal:   valThousand,
-		DoneFromYearVal:    valThousand,
-		DoneThisPeriodVal:  valThousand,
+		No:                1,
+		Name:              d.ProjectName,
+		UOM:               "",
+		VolumeTotal:       valThousand,
+		VolumeCurrentYear: valThousand,
+		ValueTotal:        valThousand,
+		ValueCurrentYear:  valThousand,
+		DoneFromStartVal:  valThousand,
+		DoneFromYearVal:   valThousand,
+		DoneThisPeriodVal: valThousand,
 	})
 	d.TotalWithoutVAT = valThousand
 

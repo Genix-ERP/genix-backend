@@ -486,12 +486,12 @@ func (h *Handler) GetPurchaseRequisition(c *gin.Context) {
 			}
 
 			line := map[string]interface{}{
-				"id":               lineID.String(),
-				"product_name":     productName,
-				"quantity":         quantity,
-				"unit":             unit,
-				"estimated_price":  estimatedPrice,
-				"total_price":      totalPrice,
+				"id":                lineID.String(),
+				"product_name":      productName,
+				"quantity":          quantity,
+				"unit":              unit,
+				"estimated_price":   estimatedPrice,
+				"total_price":       totalPrice,
 				"approved_quantity": approvedQty,
 			}
 

@@ -23,10 +23,10 @@ import (
 // PBXConfig represents the PBX configuration for a tenant
 type PBXConfig struct {
 	Enabled      bool   `json:"enabled"`
-	Provider     string `json:"provider"`      // "onlinepbx"
-	Domain       string `json:"domain"`        // e.g., "pbx36019.onpbx.ru"
+	Provider     string `json:"provider"` // "onlinepbx"
+	Domain       string `json:"domain"`   // e.g., "pbx36019.onpbx.ru"
 	APIKey       string `json:"api_key"`
-	Extension    string `json:"extension"`     // Default extension
+	Extension    string `json:"extension"` // Default extension
 	CallerID     string `json:"caller_id"`
 	WebhookToken string `json:"webhook_token"` // Token for verifying webhook calls (set in OnlinePBX panel)
 }

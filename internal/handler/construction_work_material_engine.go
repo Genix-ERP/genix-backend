@@ -382,14 +382,14 @@ func (h *Handler) finaliseMaterialsForWork(tenantID, userID uuid.UUID, projectID
 	// section→stage lookup AND the work-level expense line at the end.
 	// Pulling once here keeps the inner loop compact.
 	var (
-		workName       string
-		workUOM        string
-		sectionPath    sql.NullString
-		workQty        float64
-		workDone       float64
-		workUnitRate   float64
-		workTotalAmt   float64
-		workOrgID      sql.NullString
+		workName     string
+		workUOM      string
+		sectionPath  sql.NullString
+		workQty      float64
+		workDone     float64
+		workUnitRate float64
+		workTotalAmt float64
+		workOrgID    sql.NullString
 	)
 	// `organization_id` lives on construction_projects, not on
 	// construction_estimate. Joining through the project keeps the
@@ -1084,9 +1084,9 @@ func (h *Handler) cancelMaterialsForWork(tenantID uuid.UUID, workID int64) {
 // here because both events have already passed for the parent work.
 //
 // We do the minimum needed for the page to be self-consistent:
-//   • inventory of the matching product is decremented by `consumed`
+//   - inventory of the matching product is decremented by `consumed`
 //     (allowed to go negative — same policy as finaliseMaterialsForWork)
-//   • a single approved expense_line is written for `consumed × unit_rate`
+//   - a single approved expense_line is written for `consumed × unit_rate`
 //     so the Moliya → Xarajatlar feed and Byudjet Fakt totals reflect
 //     the new resource's cost
 //

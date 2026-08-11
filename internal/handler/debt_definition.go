@@ -29,6 +29,13 @@ import "fmt"
 // rather than comparing a float sum against zero.
 
 // debtStatusFilter is the status vocabulary shared by every debt query.
+//
+// Eight queries in sales_stats, sales_guards, customer_followups and
+// scheduler_reminders used to spell the inverse — `status IN ('sent',
+// 'partial')` — which silently omits any status outside that pair, including
+// 'overdue', a value the sales_invoices schema comment names as valid and no
+// CHECK constraint forbids. They now all use this list. New debt queries
+// should reference this constant rather than writing either form by hand.
 const debtStatusFilter = `status NOT IN ('draft', 'cancelled', 'void')`
 
 // partnerNetDue builds a subquery of one row per partner, carrying that

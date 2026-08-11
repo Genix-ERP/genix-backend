@@ -40,12 +40,13 @@ type fxAdjustResult struct {
 // (gain) or 9630 (loss).
 //
 // Arguments:
-//   tx           — the open transaction (same one the caller is about to commit)
-//   tenantID     — tenant scope for account lookup
-//   orgID        — organization to scope the FX accounts (nullable)
-//   entryID      — journal_entries.id the caller just created
-//   nextLineNum  — line_number to use (caller's lines are 1..N, this is N+1)
-//   now          — timestamp for created_at
+//
+//	tx           — the open transaction (same one the caller is about to commit)
+//	tenantID     — tenant scope for account lookup
+//	orgID        — organization to scope the FX accounts (nullable)
+//	entryID      — journal_entries.id the caller just created
+//	nextLineNum  — line_number to use (caller's lines are 1..N, this is N+1)
+//	now          — timestamp for created_at
 //
 // Returns (result, error). result.AppendedLine is false when no adjustment was
 // needed. The caller should update total_debit/total_credit on the header using

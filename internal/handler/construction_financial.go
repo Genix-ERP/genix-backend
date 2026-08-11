@@ -98,14 +98,14 @@ func (h *Handler) GetProjectPnL(c *gin.Context) {
 	remainingBudget := estimateAmount - actualCost
 
 	response.Success(c, map[string]interface{}{
-		"contract_amount":        contract,
-		"estimate_amount":        estimateAmount,
-		"actual_cost":            actualCost,
-		"remaining_budget":       remainingBudget,
+		"contract_amount":         contract,
+		"estimate_amount":         estimateAmount,
+		"actual_cost":             actualCost,
+		"remaining_budget":        remainingBudget,
 		"estimated_at_completion": estimatedAtCompletion,
-		"profit_forecast":        profitForecast,
-		"margin_pct":             round2(marginPct),
-		"progress_percent":       progress,
+		"profit_forecast":         profitForecast,
+		"margin_pct":              round2(marginPct),
+		"progress_percent":        progress,
 		"cost_breakdown": map[string]interface{}{
 			"material":    materialCost,
 			"labor":       laborCost,

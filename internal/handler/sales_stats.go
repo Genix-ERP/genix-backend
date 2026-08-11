@@ -85,7 +85,7 @@ func (h *Handler) GetSalesOrderStats(c *gin.Context) {
 		       COUNT(*) FILTER (WHERE due_date < CURRENT_DATE)
 		FROM sales_invoices
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-		  AND status IN ('sent', 'partial') AND amount_due > 0
+		  AND status NOT IN ('draft', 'cancelled', 'void') AND amount_due > 0
 		  AND ($2::uuid IS NULL OR organization_id = $2)
 	`, tenantID, orgArg).Scan(&unpaidTotal, &unpaidOver30, &overdueInvoiceCount)
 
@@ -228,7 +228,7 @@ func (h *Handler) GetSalesOrderStats(c *gin.Context) {
 		FROM sales_invoices si
 		LEFT JOIN contacts c ON c.id = si.customer_id
 		WHERE si.tenant_id = $1 AND si.deleted_at IS NULL
-		  AND si.status IN ('sent', 'partial') AND si.amount_due > 0
+		  AND si.status NOT IN ('draft', 'cancelled', 'void') AND si.amount_due > 0
 		  AND si.due_date < CURRENT_DATE
 		  AND ($2::uuid IS NULL OR si.organization_id = $2)
 		ORDER BY si.due_date ASC LIMIT 10

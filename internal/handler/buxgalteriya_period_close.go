@@ -30,22 +30,22 @@ type closePeriodInput struct {
 }
 
 type periodClosingSummary struct {
-	ID                     uuid.UUID  `json:"id"`
-	PeriodStart            string     `json:"period_start"`
-	PeriodEnd              string     `json:"period_end"`
-	Status                 string     `json:"status"`
-	TotalDebit             float64    `json:"total_debit"`
-	TotalCredit            float64    `json:"total_credit"`
-	IsBalanced             bool       `json:"is_balanced"`
-	DraftEntryCount        int        `json:"draft_entry_count"`
-	PnlDebit               float64    `json:"pnl_debit"`
-	PnlCredit              float64    `json:"pnl_credit"`
-	NetProfit              float64    `json:"net_profit"`
-	ClosingJournalEntryID  *uuid.UUID `json:"closing_journal_entry_id,omitempty"`
-	StartedAt              time.Time  `json:"started_at"`
-	CompletedAt            *time.Time `json:"completed_at,omitempty"`
-	StartedBy              *uuid.UUID `json:"started_by,omitempty"`
-	Checks                 []periodClosingCheck `json:"checks,omitempty"`
+	ID                    uuid.UUID            `json:"id"`
+	PeriodStart           string               `json:"period_start"`
+	PeriodEnd             string               `json:"period_end"`
+	Status                string               `json:"status"`
+	TotalDebit            float64              `json:"total_debit"`
+	TotalCredit           float64              `json:"total_credit"`
+	IsBalanced            bool                 `json:"is_balanced"`
+	DraftEntryCount       int                  `json:"draft_entry_count"`
+	PnlDebit              float64              `json:"pnl_debit"`
+	PnlCredit             float64              `json:"pnl_credit"`
+	NetProfit             float64              `json:"net_profit"`
+	ClosingJournalEntryID *uuid.UUID           `json:"closing_journal_entry_id,omitempty"`
+	StartedAt             time.Time            `json:"started_at"`
+	CompletedAt           *time.Time           `json:"completed_at,omitempty"`
+	StartedBy             *uuid.UUID           `json:"started_by,omitempty"`
+	Checks                []periodClosingCheck `json:"checks,omitempty"`
 }
 
 type periodClosingCheck struct {

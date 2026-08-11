@@ -380,9 +380,9 @@ func (h *Handler) UpdateCompanyTaxRate(c *gin.Context) {
 	// rate/name still produce the correct projection.
 	if effectiveApplies == "sales" {
 		var (
-			refCode string
-			refName string
-			refRate float64
+			refCode   string
+			refName   string
+			refRate   float64
 			refActive bool
 		)
 		if err := h.db.QueryRow(`

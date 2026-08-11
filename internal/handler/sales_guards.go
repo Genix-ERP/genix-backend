@@ -152,7 +152,7 @@ func (h *Handler) salesCreditCheck(tenantID uuid.UUID, orgID *uuid.UUID, custome
 		SELECT COALESCE(SUM(amount_due), 0)
 		FROM sales_invoices
 		WHERE tenant_id = $1 AND customer_id = $2 AND deleted_at IS NULL
-		  AND status IN ('sent', 'partial') AND amount_due > 0
+		  AND status NOT IN ('draft', 'cancelled', 'void') AND amount_due > 0
 		  AND ($3::uuid IS NULL OR organization_id = $3)`,
 		tenantID, customerID, orgArg,
 	).Scan(&res.Outstanding)
