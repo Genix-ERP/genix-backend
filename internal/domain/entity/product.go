@@ -268,6 +268,10 @@ type ProductResponse struct {
 	IsManufacturable   bool      `json:"is_manufacturable"`
 	AutoManufacture    bool      `json:"auto_manufacture"`
 	HasVariants        bool      `json:"has_variants"`
+	// VariantCount is the number of live variants. The clients used to count
+	// this from the variants they had loaded, so a paginated client showed
+	// "0 variant" next to a product it had just labelled "Variantli".
+	VariantCount       int       `json:"variant_count"`
 	HasDelivery        bool      `json:"has_delivery"`
 	DeliveryPrice      float64   `json:"delivery_price"`
 	Weight             *float64  `json:"weight,omitempty"`
