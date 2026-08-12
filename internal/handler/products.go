@@ -102,7 +102,9 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			   pc.code as category_code, pc.name as category_name,
 			   COALESCE(u.name, '') as unit_name, COALESCE(u.code, '') as unit_code,
 			   p.purchase_unit_id, COALESCE(pu.name, '') as purchase_unit_name,
-			   p.sales_unit_id, COALESCE(su.name, '') as sales_unit_name
+			   p.sales_unit_id, COALESCE(su.name, '') as sales_unit_name,
+			   COALESCE((SELECT COUNT(*) FROM product_variants pv
+			             WHERE pv.product_id = p.id AND pv.deleted_at IS NULL), 0) as variant_count
 		FROM products p
 		LEFT JOIN product_categories pc ON p.category_id = pc.id
 		LEFT JOIN units_of_measure u ON p.unit_id = u.id
@@ -261,6 +263,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 		var salesUnitID sql.NullString
 		var salesUnitName string
 		var weight, length, width, height sql.NullFloat64
+		var variantCount int
 
 		err := rows.Scan(
 			&p.ID, &p.TenantID, &categoryID, &p.Type, &p.Code, &sku, &barcode, &searchKey,
@@ -280,6 +283,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			&unitName, &unitCode,
 			&purchaseUnitID, &purchaseUnitName,
 			&salesUnitID, &salesUnitName,
+			&variantCount,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan product", "error", err)
@@ -355,6 +359,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			IsManufacturable:   p.IsManufacturable,
 			AutoManufacture:    p.AutoManufacture,
 			HasVariants:        p.HasVariants,
+			VariantCount:       variantCount,
 			HasDelivery:        p.HasDelivery,
 			DeliveryPrice:      p.DeliveryPrice,
 			IsActive:           p.IsActive,
@@ -791,7 +796,9 @@ func (h *Handler) GetProduct(c *gin.Context) {
 			   COALESCE(p.image_url, '') as image_url,
 			   COALESCE(p.inventory_type, 'trade') as inventory_type,
 			   p.created_at, p.updated_at,
-			   pc.id as category_id_rel, pc.code as category_code, pc.name as category_name
+			   pc.id as category_id_rel, pc.code as category_code, pc.name as category_name,
+			   COALESCE((SELECT COUNT(*) FROM product_variants pv
+			             WHERE pv.product_id = p.id AND pv.deleted_at IS NULL), 0) as variant_count
 		FROM products p
 		LEFT JOIN product_categories pc ON p.category_id = pc.id
 	`
@@ -813,6 +820,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 	var imageURL string
 	var inventoryType string
 	var weight, length, width, height sql.NullFloat64
+	var variantCount int
 
 	err = h.db.QueryRow(query, queryArgs...).Scan(
 		&p.ID, &p.TenantID, &categoryIDStr, &p.Type, &p.Code, &sku, &barcode, &searchKey,
@@ -829,6 +837,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		&inventoryType,
 		&p.CreatedAt, &p.UpdatedAt,
 		&categoryIDRel, &categoryCode, &categoryName,
+		&variantCount,
 	)
 
 	if err == sql.ErrNoRows {
@@ -863,6 +872,7 @@ func (h *Handler) GetProduct(c *gin.Context) {
 		IsManufacturable:   p.IsManufacturable,
 		AutoManufacture:    p.AutoManufacture,
 		HasVariants:        p.HasVariants,
+		VariantCount:       variantCount,
 		HasDelivery:        p.HasDelivery,
 		DeliveryPrice:      p.DeliveryPrice,
 		IsActive:           p.IsActive,
