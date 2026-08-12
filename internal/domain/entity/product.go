@@ -258,26 +258,30 @@ type ProductResponse struct {
 	IsPurchasable    bool             `json:"is_purchasable"`
 	IsSellable       bool             `json:"is_sellable"`
 	// Module visibility fields
-	CanBeSold          bool        `json:"can_be_sold"`
-	CanBePurchased     bool        `json:"can_be_purchased"`
-	AvailableInPOS     bool        `json:"available_in_pos"`
-	CanBeExpensed      bool        `json:"can_be_expensed"`
-	CanBeRented        bool        `json:"can_be_rented"`
-	CanBeSubcontracted bool        `json:"can_be_subcontracted"`
-	IsOverheadExpense  bool        `json:"is_overhead_expense"`
-	IsManufacturable   bool        `json:"is_manufacturable"`
-	AutoManufacture    bool        `json:"auto_manufacture"`
-	HasVariants        bool        `json:"has_variants"`
-	HasDelivery        bool        `json:"has_delivery"`
-	DeliveryPrice      float64     `json:"delivery_price"`
-	Weight             *float64    `json:"weight,omitempty"`
-	Length             *float64    `json:"length,omitempty"`
-	Width              *float64    `json:"width,omitempty"`
-	Height             *float64    `json:"height,omitempty"`
-	IsActive           bool        `json:"is_active"`
-	Tags               []string    `json:"tags"`
-	ImageURL           string      `json:"image_url"`
-	OrganizationIDs    []uuid.UUID `json:"organization_ids"`
-	CreatedAt          time.Time   `json:"created_at"`
-	UpdatedAt          time.Time   `json:"updated_at"`
+	CanBeSold          bool `json:"can_be_sold"`
+	CanBePurchased     bool `json:"can_be_purchased"`
+	AvailableInPOS     bool `json:"available_in_pos"`
+	CanBeExpensed      bool `json:"can_be_expensed"`
+	CanBeRented        bool `json:"can_be_rented"`
+	CanBeSubcontracted bool `json:"can_be_subcontracted"`
+	IsOverheadExpense  bool `json:"is_overhead_expense"`
+	IsManufacturable   bool `json:"is_manufacturable"`
+	AutoManufacture    bool `json:"auto_manufacture"`
+	HasVariants        bool `json:"has_variants"`
+	// VariantCount is the number of live variants. The clients used to count
+	// this from the variants they had loaded, so a paginated client showed
+	// "0 variant" next to a product it had just labelled "Variantli".
+	VariantCount    int         `json:"variant_count"`
+	HasDelivery     bool        `json:"has_delivery"`
+	DeliveryPrice   float64     `json:"delivery_price"`
+	Weight          *float64    `json:"weight,omitempty"`
+	Length          *float64    `json:"length,omitempty"`
+	Width           *float64    `json:"width,omitempty"`
+	Height          *float64    `json:"height,omitempty"`
+	IsActive        bool        `json:"is_active"`
+	Tags            []string    `json:"tags"`
+	ImageURL        string      `json:"image_url"`
+	OrganizationIDs []uuid.UUID `json:"organization_ids"`
+	CreatedAt       time.Time   `json:"created_at"`
+	UpdatedAt       time.Time   `json:"updated_at"`
 }
