@@ -409,6 +409,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	products.Use(h.perm.Require("inventory", "product", "read"))
 	{
 		products.GET("", h.ListProducts)
+		// Summary-card counts, same filters as the list — registered before
+		// /:id so "stats" is not parsed as a product UUID.
+		products.GET("/stats", h.GetProductStats)
 		products.POST("", h.perm.Require("inventory", "product", "create"), h.CreateProduct)
 		products.POST("/bulk", h.perm.Require("inventory", "product", "create"), h.BulkCreateProducts)
 		products.GET("/by-search-key", h.FindProductsBySearchKey)
