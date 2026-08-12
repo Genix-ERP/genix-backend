@@ -1393,6 +1393,20 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 	includeInactive := c.Query("include_inactive") == "true"
 	flat := c.Query("flat") == "true"
 
+	// Pagination applies to the flat list only: in tree mode a child could land
+	// on a different page than its parent. With no `page` the old behaviour is
+	// kept, so the category pickers still receive the whole list.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "0"))
+	paginate := flat && page > 0
+	limit, _ := strconv.Atoi(c.DefaultQuery("page_size", c.DefaultQuery("limit", "20")))
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	search := strings.TrimSpace(c.Query("search"))
+
 	// Categories are shared across orgs; account mappings come from category_organization_settings
 	orgID, _ := middleware.GetOrganizationID(c)
 
@@ -1436,7 +1450,29 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 		query += " AND pc.is_active = true"
 	}
 
+	if search != "" {
+		query += fmt.Sprintf(" AND (pc.code ILIKE $%d OR pc.name ILIKE $%d)",
+			len(args)+1, len(args)+1)
+		args = append(args, "%"+search+"%")
+	}
+
+	// COUNT shares the WHERE clause, so it is taken here — before ORDER BY and
+	// LIMIT are appended to `query`.
+	var total int
+	if paginate {
+		countQuery := "SELECT COUNT(*) FROM (" + query + ") counted"
+		if err := h.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
+			h.log.Error("Failed to count product categories", "error", err)
+			response.InternalError(c, "Failed to list product categories")
+			return
+		}
+	}
+
 	query += " ORDER BY pc.code ASC"
+
+	if paginate {
+		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, (page-1)*limit)
+	}
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -1474,6 +1510,10 @@ func (h *Handler) ListProductCategories(c *gin.Context) {
 	}
 
 	if flat {
+		if paginate {
+			response.Paginated(c, categories, page, limit, total)
+			return
+		}
 		response.Success(c, categories)
 		return
 	}
