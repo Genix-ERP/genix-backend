@@ -15,6 +15,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/infrastructure/database"
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/logger"
+	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
 
 	_ "github.com/genixerp/genix-backend/docs" // swagger docs
@@ -101,6 +102,15 @@ func main() {
 	router.Use(middleware.CORS(cfg.CORS))
 	router.Use(middleware.RateLimiter(cfg.RateLimit, redisClient))
 	router.Use(middleware.SecurityHeaders())
+	// Compress JSON responses. The heavy construction endpoints
+	// (ListEstimateLines with page_size=5000) return multi-MB payloads
+	// that shrink ~10x under gzip; without this they went over the wire
+	// raw unless a fronting proxy happened to compress. Already-compressed
+	// binary formats are excluded so we don't waste CPU re-deflating them.
+	router.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedExtensions([]string{
+		".png", ".gif", ".jpeg", ".jpg", ".webp", ".ico",
+		".zip", ".gz", ".xlsx", ".pdf",
+	})))
 	router.Use(middleware.Timeout(cfg.App.RequestTimeout))
 
 	// Health check endpoints (no auth required)
