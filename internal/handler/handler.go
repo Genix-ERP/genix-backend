@@ -615,6 +615,8 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	{
 		productVariants.GET("", h.ListProductVariants)
 		productVariants.POST("", h.perm.Require("inventory", "product_variant", "create"), h.CreateProductVariant)
+		// Before /:id — gin would otherwise bind "stats" as the id.
+		productVariants.GET("/stats", h.GetProductVariantStats)
 		productVariants.GET("/:id", h.GetProductVariant)
 		productVariants.PUT("/:id", h.perm.Require("inventory", "product_variant", "update"), h.UpdateProductVariant)
 		productVariants.DELETE("/:id", h.perm.Require("inventory", "product_variant", "delete"), h.DeleteProductVariant)
